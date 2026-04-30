@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  cobot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: cobot:latest
+    runtime: nvidia
+    network_mode: host
+    privileged: true
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - ROS_DOMAIN_ID=0
+    volumes:
+      - /dev:/dev
+      - /opt/cobot:/opt/cobot
+      - ./src:/cobot_ws/src
+    command: >
+      ros2 launch cobot_bringup isaac_ros_full.launch.py
+    restart: unless-stopped
+
+  dashboard:
+    image: cobot:latest
+    runtime: nvidia
+    network_mode: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    command: >
+      ros2 run cobot_dashboard dashboard_server
+    restart: unless-stopped
+    depends_on: [cobot]

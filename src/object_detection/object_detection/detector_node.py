@@ -12,6 +12,13 @@ try:
 except ImportError:
     CV_BRIDGE_AVAILABLE = False
 
+# ── Backend selection: TensorRT → Ultralytics → warn ─────────────────────────
+try:
+    from object_detection.trt_engine import TRTEngine, TRT_AVAILABLE, load_engine
+except ImportError:
+    TRT_AVAILABLE = False
+    load_engine = lambda _: None  # noqa: E731
+
 try:
     from ultralytics import YOLO
     ULTRALYTICS_AVAILABLE = True
@@ -23,63 +30,121 @@ class DetectorNode(Node):
     def __init__(self):
         super().__init__('detector_node')
 
-        self.declare_parameter('model_path', '/opt/cobot/models/yolov8n.pt')
-        self.declare_parameter('confidence_threshold', 0.5)
-        self.declare_parameter('nms_threshold', 0.4)
-        self.declare_parameter('target_classes', ['bottle', 'box', 'cup', 'tool', 'person'])
-        self.declare_parameter('use_tensorrt', False)
-        self.declare_parameter('device', 'cuda:0')
+        self.declare_parameter('model_path',            '/opt/cobot/models/yolov8n.pt')
+        self.declare_parameter('engine_path',           '/opt/cobot/models/yolov8n.engine')
+        self.declare_parameter('confidence_threshold',  0.5)
+        self.declare_parameter('nms_threshold',         0.4)
+        self.declare_parameter('target_classes',        ['bottle','box','cup','tool','person'])
+        self.declare_parameter('device',                'cuda:0')
+        self.declare_parameter('input_width',           640)
+        self.declare_parameter('input_height',          640)
 
-        self.model_path = self.get_parameter('model_path').value
-        self.conf_thresh = self.get_parameter('confidence_threshold').value
-        self.target_classes = self.get_parameter('target_classes').value
-        self.device = self.get_parameter('device').value
+        self.model_path    = self.get_parameter('model_path').value
+        self.engine_path   = self.get_parameter('engine_path').value
+        self.conf_thresh   = self.get_parameter('confidence_threshold').value
+        self.nms_thresh    = self.get_parameter('nms_threshold').value
+        self.target_classes= self.get_parameter('target_classes').value
+        self.device        = self.get_parameter('device').value
+        iw = self.get_parameter('input_width').value
+        ih = self.get_parameter('input_height').value
 
-        if self.model_path.endswith('.engine'):
-            self.set_parameters([rclpy.parameter.Parameter(
-                'use_tensorrt', rclpy.Parameter.Type.BOOL, True)])
+        self.bridge       = CvBridge() if CV_BRIDGE_AVAILABLE else None
+        self.trt_engine   = None
+        self.yolo_model   = None
+        self.camera_info  = None
+        self._backend     = 'none'
 
-        self.bridge = CvBridge() if CV_BRIDGE_AVAILABLE else None
-        self.model = None
-        self.camera_info = None
-        self._load_model()
+        self._load_model(iw, ih)
 
         self.det_pub = self.create_publisher(Detection3DArray, '/perception/detections', 10)
 
-        rgb_sub = message_filters.Subscriber(self, Image, '/cam0/color/image_raw')
-        depth_sub = message_filters.Subscriber(self, Image, '/cam0/depth/image_rect_raw')
-        self.sync = message_filters.ApproximateTimeSynchronizer(
-            [rgb_sub, depth_sub], queue_size=10, slop=0.05)
-        self.sync.registerCallback(self.detection_callback)
+        if CV_BRIDGE_AVAILABLE:
+            rgb_sub   = message_filters.Subscriber(self, Image, '/cam0/color/image_raw')
+            depth_sub = message_filters.Subscriber(self, Image, '/cam0/depth/image_rect_raw')
+            self.sync = message_filters.ApproximateTimeSynchronizer(
+                [rgb_sub, depth_sub], queue_size=10, slop=0.05)
+            self.sync.registerCallback(self.detection_callback)
 
         self.create_subscription(CameraInfo, '/cam0/color/camera_info',
                                  self._camera_info_cb, 10)
 
-        self._det_count = 0
-        self._last_log = self.get_clock().now()
+        self._last_log    = self.get_clock().now()
         self._last_classes: list = []
-        self.get_logger().info('detector_node started')
+        self.get_logger().info(f'detector_node started | backend={self._backend}')
 
-    def _load_model(self):
-        if not ULTRALYTICS_AVAILABLE:
-            self.get_logger().warn('ultralytics not installed — detections disabled')
-            return
-        if not os.path.exists(self.model_path):
-            self.get_logger().warn(
-                f'Model not found at {self.model_path} — run scripts/download_model.py')
-            self.create_timer(5.0, self._retry_load)
-            return
-        try:
-            self.model = YOLO(self.model_path)
-            self.get_logger().info(f'YOLO model loaded from {self.model_path}')
-        except Exception as e:
-            self.get_logger().error(f'Failed to load model: {e}')
+    # ── Model loading ─────────────────────────────────────────────────────────
 
-    def _retry_load(self):
-        if self.model is not None:
+    def _load_model(self, iw: int, ih: int):
+        # 1. Try TensorRT .engine first
+        if TRT_AVAILABLE and os.path.exists(self.engine_path):
+            try:
+                self.trt_engine = TRTEngine(self.engine_path, (ih, iw))
+                self._backend   = 'tensorrt'
+                self.get_logger().info(f'TensorRT engine loaded: {self.engine_path}')
+                return
+            except Exception as e:
+                self.get_logger().warn(f'TRT load failed ({e}) — falling back to Ultralytics')
+
+        # 2. Try Ultralytics .pt
+        if ULTRALYTICS_AVAILABLE and os.path.exists(self.model_path):
+            try:
+                self.yolo_model = YOLO(self.model_path)
+                self._backend   = 'ultralytics'
+                self.get_logger().info(f'Ultralytics YOLO loaded: {self.model_path}')
+                return
+            except Exception as e:
+                self.get_logger().error(f'YOLO load failed: {e}')
+
+        # 3. Neither available
+        hint = (
+            f'No model found. '
+            f'TRT: run scripts/export_trt.py → {self.engine_path}  '
+            f'or  PT: run scripts/download_model.py → {self.model_path}'
+        )
+        self.get_logger().warn(hint)
+        self.create_timer(10.0, self._retry_load_timer)
+
+    def _retry_load_timer(self):
+        if self._backend != 'none':
             return
-        if os.path.exists(self.model_path):
-            self._load_model()
+        if TRT_AVAILABLE and os.path.exists(self.engine_path):
+            self._load_model(640, 640)
+        elif ULTRALYTICS_AVAILABLE and os.path.exists(self.model_path):
+            self._load_model(640, 640)
+
+    # ── Inference ─────────────────────────────────────────────────────────────
+
+    def _run_inference(self, bgr_img) -> list:
+        """Returns list of (class_name, conf, x1, y1, x2, y2)."""
+        results = []
+
+        if self._backend == 'tensorrt' and self.trt_engine:
+            boxes, scores, class_ids = self.trt_engine.infer(
+                bgr_img, self.conf_thresh, self.nms_thresh)
+            # TRT class IDs are raw integers — map via COCO names
+            coco_names = self._coco_names()
+            for box, sc, cid in zip(boxes, scores, class_ids):
+                name = coco_names.get(int(cid), str(cid))
+                if self.target_classes and name not in self.target_classes:
+                    continue
+                results.append((name, float(sc),
+                                 box[0], box[1], box[2], box[3]))
+
+        elif self._backend == 'ultralytics' and self.yolo_model:
+            preds = self.yolo_model(bgr_img, conf=self.conf_thresh, verbose=False)
+            for pred in preds:
+                if pred.boxes is None:
+                    continue
+                for box in pred.boxes:
+                    cls_name = self.yolo_model.names[int(box.cls[0])]
+                    if self.target_classes and cls_name not in self.target_classes:
+                        continue
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    results.append((cls_name, float(box.conf[0]),
+                                    x1, y1, x2, y2))
+        return results
+
+    # ── ROS callback ──────────────────────────────────────────────────────────
 
     def _camera_info_cb(self, msg: CameraInfo):
         self.camera_info = msg
@@ -87,92 +152,91 @@ class DetectorNode(Node):
     def _pixel_to_3d(self, cx, cy, depth_m):
         if self.camera_info is None:
             return None
-        fx = self.camera_info.k[0]
-        fy = self.camera_info.k[4]
-        ppx = self.camera_info.k[2]
-        ppy = self.camera_info.k[5]
+        fx = self.camera_info.k[0]; fy = self.camera_info.k[4]
+        ppx = self.camera_info.k[2]; ppy = self.camera_info.k[5]
         if fx == 0 or fy == 0:
             return None
-        x = (cx - ppx) * depth_m / fx
-        y = (cy - ppy) * depth_m / fy
-        z = depth_m
-        return (x, y, z)
+        return (
+            (cx - ppx) * depth_m / fx,
+            (cy - ppy) * depth_m / fy,
+            depth_m,
+        )
 
     def detection_callback(self, rgb_msg: Image, depth_msg: Image):
-        if self.model is None or not CV_BRIDGE_AVAILABLE:
+        if self._backend == 'none' or self.bridge is None:
             return
 
         try:
-            rgb_img = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
-            depth_img = self.bridge.imgmsg_to_cv2(depth_msg, '32FC1')
+            bgr   = self.bridge.imgmsg_to_cv2(rgb_msg,   'bgr8')
+            depth = self.bridge.imgmsg_to_cv2(depth_msg, '32FC1')
         except Exception as e:
-            self.get_logger().warn(f'cv_bridge error: {e}')
+            self.get_logger().warn(f'cv_bridge: {e}')
             return
 
-        results = self.model(rgb_img, conf=self.conf_thresh, verbose=False)
-        det_array = Detection3DArray()
-        det_array.header.frame_id = 'cam0_link'
-        det_array.header.stamp = self.get_clock().now().to_msg()
+        det_list = self._run_inference(bgr)
 
-        detected_classes = []
-        for result in results:
-            if result.boxes is None:
+        arr = Detection3DArray()
+        arr.header.frame_id = 'cam0_link'
+        arr.header.stamp    = self.get_clock().now().to_msg()
+        detected_classes    = []
+
+        h_img, w_img = depth.shape[:2]
+        fx = self.camera_info.k[0] if self.camera_info else 500.0
+        fy = self.camera_info.k[4] if self.camera_info else 500.0
+
+        for cls_name, conf, x1, y1, x2, y2 in det_list:
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+            cx = max(0, min(cx, w_img - 1))
+            cy = max(0, min(cy, h_img - 1))
+
+            dv = float(depth[cy, cx])
+            if not np.isfinite(dv) or dv <= 0:
+                dv = 1.0
+
+            pos = self._pixel_to_3d(cx, cy, dv)
+            if pos is None:
                 continue
-            for box in result.boxes:
-                cls_id = int(box.cls[0])
-                cls_name = self.model.names.get(cls_id, str(cls_id))
-                if self.target_classes and cls_name not in self.target_classes:
-                    continue
-                conf = float(box.conf[0])
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                cx = int((x1 + x2) / 2)
-                cy = int((y1 + y2) / 2)
 
-                h, w = depth_img.shape[:2]
-                cx = max(0, min(cx, w - 1))
-                cy = max(0, min(cy, h - 1))
-                depth_val = float(depth_img[cy, cx])
-                if np.isnan(depth_val) or depth_val <= 0:
-                    depth_val = 1.0
+            det = Detection3D()
+            det.header = arr.header
+            hyp = ObjectHypothesisWithPose()
+            hyp.hypothesis.class_id = cls_name
+            hyp.hypothesis.score    = conf
+            hyp.pose.pose.position.x = pos[0]
+            hyp.pose.pose.position.y = pos[1]
+            hyp.pose.pose.position.z = pos[2]
+            det.results.append(hyp)
 
-                pos_3d = self._pixel_to_3d(cx, cy, depth_val)
-                if pos_3d is None:
-                    continue
+            bw = (x2 - x1) * dv / fx
+            bh = (y2 - y1) * dv / fy
+            det.bbox.center.position.x = pos[0]
+            det.bbox.center.position.y = pos[1]
+            det.bbox.center.position.z = pos[2]
+            det.bbox.size.x = float(bw)
+            det.bbox.size.y = float(bh)
+            det.bbox.size.z = 0.1
 
-                det = Detection3D()
-                det.header = det_array.header
-                hyp = ObjectHypothesisWithPose()
-                hyp.hypothesis.class_id = cls_name
-                hyp.hypothesis.score = conf
-                hyp.pose.pose.position.x = pos_3d[0]
-                hyp.pose.pose.position.y = pos_3d[1]
-                hyp.pose.pose.position.z = pos_3d[2]
-                det.results.append(hyp)
+            arr.detections.append(det)
+            detected_classes.append(cls_name)
 
-                bbox_w = (x2 - x1) * depth_val / max(
-                    self.camera_info.k[0] if self.camera_info else 500, 1)
-                bbox_h = (y2 - y1) * depth_val / max(
-                    self.camera_info.k[4] if self.camera_info else 500, 1)
-                det.bbox.center.position.x = pos_3d[0]
-                det.bbox.center.position.y = pos_3d[1]
-                det.bbox.center.position.z = pos_3d[2]
-                det.bbox.size.x = bbox_w
-                det.bbox.size.y = bbox_h
-                det.bbox.size.z = 0.1
-
-                det_array.detections.append(det)
-                detected_classes.append(cls_name)
-
-        self.det_pub.publish(det_array)
-        self._det_count = len(det_array.detections)
-        self._last_classes = detected_classes
+        self.det_pub.publish(arr)
 
         now = self.get_clock().now()
-        dt = (now - self._last_log).nanoseconds / 1e9
-        if dt >= 1.0:
+        if (now - self._last_log).nanoseconds / 1e9 >= 1.0:
             self.get_logger().info(
-                f'Detected {self._det_count} objects: {self._last_classes}')
+                f'[{self._backend}] Detected {len(arr.detections)}: {detected_classes}')
             self._last_log = now
+
+    @staticmethod
+    def _coco_names() -> dict:
+        return {
+            0:'person',1:'bicycle',2:'car',3:'motorcycle',4:'airplane',5:'bus',
+            6:'train',7:'truck',8:'boat',39:'bottle',41:'cup',56:'chair',
+            57:'couch',58:'potted plant',59:'bed',60:'dining table',
+            63:'laptop',64:'mouse',65:'remote',66:'keyboard',67:'cell phone',
+            73:'book',74:'clock',75:'vase',76:'scissors',77:'teddy bear',
+        }
 
 
 def main(args=None):
