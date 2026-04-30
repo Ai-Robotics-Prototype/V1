@@ -1,0 +1,8 @@
+language_node:
+  ros__parameters:
+    ollama_host: "http://localhost:11434"
+    model_name: "llama3.1:8b"
+    max_tokens: 512
+    temperature: 0.1
+    context_window_objects: 10
+    timeout_s: 10.0

@@ -1,0 +1,10 @@
+task_planner_node:
+  ros__parameters:
+    home_position: [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
+    pick_height_offset_m: 0.15
+    place_position:
+      x: 0.5
+      y: 0.0
+      z: 0.3
+    task_timeout_s: 30.0
+    idle_check_rate_hz: 2.0

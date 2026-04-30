@@ -1,0 +1,81 @@
+<?xml version="1.0"?>
+<!-- Replace with actual URDF from cobot supplier -->
+<robot name="cobot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <link name="base_link">
+    <visual>
+      <geometry><box size="0.1 0.1 0.05"/></geometry>
+    </visual>
+  </link>
+
+  <xacro:macro name="arm_link" params="name">
+    <link name="${name}">
+      <visual>
+        <geometry><cylinder radius="0.03" length="0.2"/></geometry>
+      </visual>
+    </link>
+  </xacro:macro>
+
+  <xacro:arm_link name="link_1"/>
+  <xacro:arm_link name="link_2"/>
+  <xacro:arm_link name="link_3"/>
+  <xacro:arm_link name="link_4"/>
+  <xacro:arm_link name="link_5"/>
+  <xacro:arm_link name="link_6"/>
+
+  <joint name="joint_1" type="revolute">
+    <parent link="base_link"/><child link="link_1"/>
+    <origin xyz="0 0 0.05"/><axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="100" velocity="1.0"/>
+  </joint>
+  <joint name="joint_2" type="revolute">
+    <parent link="link_1"/><child link="link_2"/>
+    <origin xyz="0 0 0.2"/><axis xyz="0 1 0"/>
+    <limit lower="-3.14" upper="3.14" effort="100" velocity="1.0"/>
+  </joint>
+  <joint name="joint_3" type="revolute">
+    <parent link="link_2"/><child link="link_3"/>
+    <origin xyz="0 0 0.2"/><axis xyz="0 1 0"/>
+    <limit lower="-3.14" upper="3.14" effort="100" velocity="1.0"/>
+  </joint>
+  <joint name="joint_4" type="revolute">
+    <parent link="link_3"/><child link="link_4"/>
+    <origin xyz="0 0 0.2"/><axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="100" velocity="1.0"/>
+  </joint>
+  <joint name="joint_5" type="revolute">
+    <parent link="link_4"/><child link="link_5"/>
+    <origin xyz="0 0 0.15"/><axis xyz="0 1 0"/>
+    <limit lower="-3.14" upper="3.14" effort="100" velocity="1.0"/>
+  </joint>
+  <joint name="joint_6" type="revolute">
+    <parent link="link_5"/><child link="link_6"/>
+    <origin xyz="0 0 0.1"/><axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="100" velocity="1.0"/>
+  </joint>
+
+  <link name="tool0"/>
+  <joint name="tool0_joint" type="fixed">
+    <parent link="link_6"/><child link="tool0"/>
+    <origin xyz="0 0 0.05"/>
+  </joint>
+
+  <link name="lidar_link"/>
+  <joint name="lidar_joint" type="fixed">
+    <parent link="base_link"/><child link="lidar_link"/>
+    <origin xyz="0 0 0.5"/>
+  </joint>
+
+  <link name="cam0_link"/>
+  <joint name="cam0_joint" type="fixed">
+    <parent link="base_link"/><child link="cam0_link"/>
+    <origin xyz="0.3 0.1 0.4" rpy="0 0.3 0"/>
+  </joint>
+
+  <link name="cam1_link"/>
+  <joint name="cam1_joint" type="fixed">
+    <parent link="base_link"/><child link="cam1_link"/>
+    <origin xyz="0.3 -0.1 0.4" rpy="0 0.3 0"/>
+  </joint>
+
+</robot>
