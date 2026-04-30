@@ -99,6 +99,24 @@ def generate_launch_description():
             output='screen',
         ),
 
+        # ── Robot driver (TCP/IP to physical arm) ────────────────────────────
+        Node(
+            package='robot_driver',
+            executable='robot_driver_node',
+            name='robot_driver_node',
+            parameters=[os.path.join(config_dir, 'robot_driver.yaml')],
+            output='screen',
+        ),
+
+        # ── Gripper driver ───────────────────────────────────────────────────
+        Node(
+            package='gripper_driver',
+            executable='gripper_node',
+            name='gripper_node',
+            parameters=[os.path.join(config_dir, 'gripper.yaml')],
+            output='screen',
+        ),
+
         # ── Task planner ─────────────────────────────────────────────────────
         Node(
             package='task_planner',

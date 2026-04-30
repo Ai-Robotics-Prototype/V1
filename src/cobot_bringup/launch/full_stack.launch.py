@@ -16,11 +16,13 @@ def generate_launch_description():
     config_dir = os.path.join(bringup_dir, 'config')
 
     return LaunchDescription([
-        DeclareLaunchArgument('robot_model', default_value='ur5e'),
-        DeclareLaunchArgument('use_fake_hardware', default_value='false'),
-        DeclareLaunchArgument('launch_dashboard', default_value='true'),
-        DeclareLaunchArgument('launch_fleet', default_value='false'),
-        DeclareLaunchArgument('log_level', default_value='info'),
+        DeclareLaunchArgument('robot_model',       default_value='generic'),
+        DeclareLaunchArgument('robot_brand',       default_value='generic'),
+        DeclareLaunchArgument('robot_ip',          default_value='192.168.1.10'),
+        DeclareLaunchArgument('use_fake_hardware',  default_value='false'),
+        DeclareLaunchArgument('launch_dashboard',   default_value='true'),
+        DeclareLaunchArgument('launch_fleet',       default_value='false'),
+        DeclareLaunchArgument('log_level',          default_value='info'),
 
         # Static transforms (placeholder identity)
         Node(
@@ -62,6 +64,18 @@ def generate_launch_description():
             package='safety_monitor', executable='safety_monitor_node',
             name='safety_monitor_node', output='screen',
             parameters=[os.path.join(config_dir, 'safety.yaml')],
+        ),
+        # ── Robot driver (TCP/IP to physical arm) ────────────────────────────
+        Node(
+            package='robot_driver', executable='robot_driver_node',
+            name='robot_driver_node', output='screen',
+            parameters=[os.path.join(config_dir, 'robot_driver.yaml')],
+        ),
+        # ── Gripper driver ───────────────────────────────────────────────────
+        Node(
+            package='gripper_driver', executable='gripper_node',
+            name='gripper_node', output='screen',
+            parameters=[os.path.join(config_dir, 'gripper.yaml')],
         ),
         Node(
             package='task_planner', executable='task_planner_node',

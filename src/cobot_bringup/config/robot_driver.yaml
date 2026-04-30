@@ -1,0 +1,33 @@
+robot_driver_node:
+  ros__parameters:
+    # ── CHANGE THESE for your robot ──────────────────────────────────────────
+    brand:      "generic"    # xarm | jaka | dobot | generic | fake
+    robot_ip:   "192.168.1.100"
+    robot_port: 0            # 0 = auto-probe common ports
+
+    # ── Robot model ──────────────────────────────────────────────────────────
+    dof: 6
+    joint_names:
+      - "joint_1"
+      - "joint_2"
+      - "joint_3"
+      - "joint_4"
+      - "joint_5"
+      - "joint_6"
+
+    # Home position (radians) — update for your robot's safe home pose
+    home_joints: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]
+
+    # ── Motion limits ─────────────────────────────────────────────────────────
+    max_speed_scale: 1.0         # Hard cap on speed (0–1). Set < 1 during commissioning.
+
+    # ── Timing ───────────────────────────────────────────────────────────────
+    state_rate_hz: 50.0
+    reconnect_interval_s: 5.0
+
+# ── Brand-specific notes ─────────────────────────────────────────────────────
+# xArm:   brand=xarm,   robot_port=18333,  pip install xArm-Python-SDK
+# JAKA:   brand=jaka,   robot_port=10000
+# Dobot:  brand=dobot,  robot_port=29999,  also opens port 30003 automatically
+# Others: brand=generic, robot_port=0 (auto-probe)
+# No robot yet / testing: brand=fake
