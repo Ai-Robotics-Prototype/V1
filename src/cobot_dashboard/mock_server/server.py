@@ -436,7 +436,8 @@ async def stream_cam1():
 @app.post("/cmd/estop")
 async def cmd_estop(request: Request):
     body = await request.json()
-    active = bool(body.get("active", True))
+    active   = bool(body.get("active", True))
+    override = bool(body.get("override", False))   # red-zone override flag
     if active:
         was_running = STATE["task"]["running"]
         STATE["safety"]["estop"] = True
@@ -444,14 +445,22 @@ async def cmd_estop(request: Request):
         STATE["task"]["running"] = False
         if was_running:
             STATE["task"]["state"] = "PAUSED"
-    else:
-        if STATE["safety"]["zone"] != "GREEN":
-            return JSONResponse(
-                {"error": "Cannot release estop: zone is not GREEN"},
-                status_code=400,
-            )
+        return {"ok": True, "safety": STATE["safety"]}
+    # Release path
+    zone = STATE["safety"]["zone"]
+    if zone != "GREEN" and not override:
+        return JSONResponse(
+            {"error": f"Cannot release estop: zone is {zone}. Use override=true to force."},
+            status_code=400,
+        )
+    if override and zone != "GREEN":
+        # Log clearly — override in non-green zone
+        print(f"[ESTOP OVERRIDE] Released in {zone} zone ({STATE['safety']['human_proximity']:.2f} m)")
         STATE["safety"]["estop"] = False
-        STATE["safety"]["speed_scale"] = 1.0
+        STATE["safety"]["speed_scale"] = 0.0   # keep speed at 0 — zone logic restores it
+        return {"ok": True, "override": True, "zone": zone, "safety": STATE["safety"]}
+    STATE["safety"]["estop"] = False
+    STATE["safety"]["speed_scale"] = 1.0
     return {"ok": True, "safety": STATE["safety"]}
 
 

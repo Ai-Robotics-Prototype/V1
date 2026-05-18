@@ -190,6 +190,12 @@ const storeDefinition = (set, get) => ({
     get().sendCommand('estop', { active: false })
   },
 
+  overrideEstop() {
+    // Bypass zone check — operator has manually verified area is clear.
+    // Speed stays at 0 until zone naturally returns to GREEN.
+    get().sendCommand('estop', { active: false, override: true })
+  },
+
   // ---------------------------------------------------------------------------
   // Task commands
   // ---------------------------------------------------------------------------
