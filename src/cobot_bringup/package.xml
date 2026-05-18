@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>cobot_bringup</name>
+  <version>0.1.0</version>
+  <description>Launch files, URDF, and config for the cobot stack</description>
+  <maintainer email="robot@roboai.com">cobot</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>perception_fusion</exec_depend>
+  <exec_depend>object_detection</exec_depend>
+  <exec_depend>human_safety</exec_depend>
+  <exec_depend>scene_graph</exec_depend>
+  <exec_depend>language_interface</exec_depend>
+  <exec_depend>task_planner</exec_depend>
+  <exec_depend>safety_monitor</exec_depend>
+  <exec_depend>fleet_agent</exec_depend>
+  <exec_depend>cobot_dashboard</exec_depend>
+  <exec_depend>robot_driver</exec_depend>
+  <exec_depend>gripper_driver</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
