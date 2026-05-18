@@ -107,16 +107,23 @@ async def simulation_loop():
         proximity = 1.2 + math.sin(t / 8.0)
         STATE["safety"]["human_proximity"] = round(proximity, 3)
 
+        # Zone always reflects actual proximity (informational, independent of estop latch)
+        if proximity > 1.2:
+            STATE["safety"]["zone"] = "GREEN"
+        elif proximity >= 0.6:
+            STATE["safety"]["zone"] = "YELLOW"
+        else:
+            STATE["safety"]["zone"] = "RED"
+
         if not STATE["safety"]["estop"]:
+            # Speed scale tracks zone when estop is not active
             if proximity > 1.2:
-                STATE["safety"]["zone"] = "GREEN"
                 STATE["safety"]["speed_scale"] = 1.0
             elif proximity >= 0.6:
-                STATE["safety"]["zone"] = "YELLOW"
                 STATE["safety"]["speed_scale"] = 0.25
             else:
-                STATE["safety"]["zone"] = "RED"
                 STATE["safety"]["speed_scale"] = 0.0
+                # Auto-latch estop only when not already active
                 if proximity < 0.3:
                     STATE["safety"]["estop"] = True
                     STATE["task"]["running"] = False

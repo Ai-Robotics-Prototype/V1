@@ -28,7 +28,8 @@ export default function EStopOverlay() {
   }, [estop, canRelease])
 
   // Pointer-down: start hold timer
-  const startHold = useCallback(() => {
+  const startHold = useCallback((e) => {
+    e.currentTarget.setPointerCapture(e.pointerId)   // keep pointer even if cursor leaves circle
     holdStart.current = performance.now()
     setHolding(true)
 
