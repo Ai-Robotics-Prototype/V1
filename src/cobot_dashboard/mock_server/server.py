@@ -104,7 +104,9 @@ async def simulation_loop():
         joints = list(STATE["joints"]["positions"])
 
         # --- Proximity + zone ---
-        proximity = 1.2 + math.sin(t / 8.0)
+        # Stays in GREEN (1.6–2.4 m) — simulates no person nearby.
+        # E-Stop can still be triggered manually via the toolbar button.
+        proximity = 2.0 + 0.4 * math.sin(t / 10.0)
         STATE["safety"]["human_proximity"] = round(proximity, 3)
 
         # Zone always reflects actual proximity (informational, independent of estop latch)
