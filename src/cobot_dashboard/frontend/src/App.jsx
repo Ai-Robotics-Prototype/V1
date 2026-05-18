@@ -1,100 +1,60 @@
 import { useEffect } from 'react'
-import { useStore } from './store'
-import SafetyBanner  from './components/SafetyBanner'
-import TopBar        from './components/TopBar'
-import EStopButton   from './components/EStopButton'
-import CameraPanel   from './components/CameraPanel'
-import LidarPanel    from './components/LidarPanel'
-import DetectionsPanel  from './components/DetectionsPanel'
-import SceneGraphPanel  from './components/SceneGraphPanel'
-import RobotControls    from './components/RobotControls'
+import { useStore } from './store/useStore'
+import TopBar from './components/TopBar'
+import SideNav from './components/SideNav'
+import StatusBar from './components/StatusBar'
+import ToastContainer from './components/ToastContainer'
+import EStopOverlay from './components/EStopOverlay'
+import MonitorLayout from './layouts/MonitorLayout'
+import ProgramLayout from './layouts/ProgramLayout'
+import View3DLayout from './layouts/View3DLayout'
+import SensorsLayout from './layouts/SensorsLayout'
+import ConfigureLayout from './layouts/ConfigureLayout'
 
-const s = {
-  root: {
-    display: 'flex',
-    flexDirection: 'column',
-    height: '100%',
-    background: 'var(--bg-app)',
-    overflow: 'hidden',
-  },
-  body: {
-    flex: 1,
-    display: 'flex',
-    overflow: 'hidden',
-    gap: 1,
-  },
-  // Left column: camera / lidar / split view
-  left: {
-    flex: 1,
-    display: 'flex',
-    flexDirection: 'column',
-    overflow: 'hidden',
-    minWidth: 0,
-  },
-  // Right column: controls + side panels
-  right: {
-    width: 320,
-    flexShrink: 0,
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 1,
-    overflow: 'hidden',
-    background: 'var(--bg-panel)',
-    borderLeft: '1px solid var(--border)',
-  },
-  rightScroll: {
-    flex: 1,
-    overflowY: 'auto',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 1,
-  },
+const gridStyle = {
+  display: 'grid',
+  gridTemplateAreas: '"topbar topbar" "sidenav content" "sidenav statusbar"',
+  gridTemplateColumns: '64px 1fr',
+  gridTemplateRows: '48px 1fr 36px',
+  height: '100vh',
+  overflow: 'hidden',
+  background: 'var(--bg-app)',
 }
 
 export default function App() {
-  const { connectWebSockets, activeView, mode } = useStore()
+  const connectWS = useStore((s) => s.connectWS)
+  const activeTab = useStore((s) => s.activeTab)
 
-  useEffect(() => { connectWebSockets() }, [])
+  useEffect(() => {
+    connectWS()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const layoutMap = {
+    monitor:   <MonitorLayout />,
+    program:   <ProgramLayout />,
+    '3dview':  <View3DLayout />,
+    sensors:   <SensorsLayout />,
+    configure: <ConfigureLayout />,
+  }
 
   return (
-    <div style={s.root}>
-      <SafetyBanner />
-      <TopBar />
-
-      <div style={s.body}>
-        {/* ── left: visual panels ─────────────────────────────── */}
-        <div style={s.left}>
-          {activeView === 'camera' && <CameraPanel view="single-cam0" />}
-          {activeView === 'lidar'  && <LidarPanel />}
-          {activeView === 'split'  && (
-            <div style={{ display:'flex', flex:1, overflow:'hidden', height:'100%' }}>
-              <div style={{ flex:1 }}><CameraPanel view="single-cam0" /></div>
-              <div style={{ flex:1, borderLeft:'1px solid var(--border)' }}>
-                <CameraPanel view="single-cam1" />
-              </div>
-            </div>
-          )}
-          {activeView === 'scene' && (
-            <div style={{ display:'flex', flex:1, overflow:'hidden', height:'100%' }}>
-              <div style={{ flex:1 }}><LidarPanel /></div>
-              <div style={{ flex:1, borderLeft:'1px solid var(--border)' }}>
-                <CameraPanel view="single-cam0" />
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* ── right: controls + data panels ───────────────────── */}
-        <div style={s.right}>
-          <RobotControls />
-          <div style={s.rightScroll}>
-            <DetectionsPanel />
-            <SceneGraphPanel />
-          </div>
-        </div>
+    <div style={gridStyle}>
+      <div style={{ gridArea: 'topbar' }}>
+        <TopBar />
+      </div>
+      <div style={{ gridArea: 'sidenav', borderRight: '1px solid var(--border)', background: 'var(--bg-panel)' }}>
+        <SideNav />
+      </div>
+      <div style={{ gridArea: 'content', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+        {layoutMap[activeTab] ?? <MonitorLayout />}
+      </div>
+      <div style={{ gridArea: 'statusbar' }}>
+        <StatusBar />
       </div>
 
-      <EStopButton />
+      <ToastContainer />
+      <EStopOverlay />
     </div>
   )
 }

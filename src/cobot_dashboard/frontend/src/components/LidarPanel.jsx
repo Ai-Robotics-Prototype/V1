@@ -1,175 +1,282 @@
-import { useRef, useMemo, useEffect } from 'react'
+import { useRef, useEffect, useState, useCallback } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
-import { OrbitControls, Grid } from '@react-three/drei'
+import { OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
-import { useStore } from '../store'
-import { useState } from 'react'
+import { useStore } from '../store/useStore'
 
-// Height-based colour: blue(low)→green→yellow→red(high)
-function heightColor(z, zMin = -0.1, zMax = 0.9) {
-  const t = Math.max(0, Math.min(1, (z - zMin) / (zMax - zMin)))
-  if (t < 0.33) {
-    const f = t / 0.33
-    return new THREE.Color(0, f, 1 - f)
-  } else if (t < 0.66) {
-    const f = (t - 0.33) / 0.33
-    return new THREE.Color(f, 1, 0)
-  } else {
-    const f = (t - 0.66) / 0.34
-    return new THREE.Color(1, 1 - f, 0)
-  }
+const HOST     = typeof window !== 'undefined' ? window.location.host : 'localhost:8080'
+const WS_PROTO = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws'
+
+// Height-based color ramp
+function heightColor(z) {
+  if (z < 0.1)  return new THREE.Color(0.15, 0.35, 0.85)  // blue — floor
+  if (z < 0.5)  return new THREE.Color(0.15, 0.75, 0.5)   // teal
+  if (z < 1.0)  return new THREE.Color(0.85, 0.75, 0.1)   // yellow
+  return         new THREE.Color(0.85, 0.25, 0.15)          // red — high
 }
 
-function PointCloud() {
-  const { lidarPoints } = useStore()
-  const ref = useRef()
+// Point cloud that reads from a ref (no React re-render per frame)
+function PointCloud({ pointsRef }) {
+  const meshRef  = useRef()
+  const geoRef   = useRef(new THREE.BufferGeometry())
 
-  const { positions, colors } = useMemo(() => {
-    const pts = lidarPoints
+  useFrame(() => {
+    const pts = pointsRef.current
+    if (!pts || pts.length === 0) return
+
     const positions = new Float32Array(pts.length * 3)
     const colors    = new Float32Array(pts.length * 3)
-    pts.forEach((p, i) => {
-      positions[i*3]   = p.x
-      positions[i*3+1] = p.z  // z-up → y-up in Three.js
-      positions[i*3+2] = p.y
-      const c = heightColor(p.z)
-      colors[i*3]   = c.r
-      colors[i*3+1] = c.g
-      colors[i*3+2] = c.b
-    })
-    return { positions, colors }
-  }, [lidarPoints])
+
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i]
+      // LiDAR: x=right, y=forward, z=up → Three.js: x, y=up, z
+      positions[i * 3]     = p[0]
+      positions[i * 3 + 1] = p[2]   // z-up → y-up
+      positions[i * 3 + 2] = p[1]
+      const c = heightColor(p[2])
+      colors[i * 3]     = c.r
+      colors[i * 3 + 1] = c.g
+      colors[i * 3 + 2] = c.b
+    }
+
+    const geo = geoRef.current
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    geo.setAttribute('color',    new THREE.BufferAttribute(colors,    3))
+    geo.computeBoundingSphere()
+
+    if (meshRef.current) {
+      meshRef.current.geometry = geo
+    }
+  })
 
   return (
-    <points ref={ref}>
-      <bufferGeometry>
-        <bufferAttribute attach="attributes-position" args={[positions, 3]} />
-        <bufferAttribute attach="attributes-color"    args={[colors, 3]} />
-      </bufferGeometry>
-      <pointsMaterial size={0.02} vertexColors sizeAttenuation />
+    <points ref={meshRef}>
+      <primitive object={geoRef.current} attach="geometry" />
+      <pointsMaterial size={0.025} vertexColors sizeAttenuation />
     </points>
   )
 }
 
+// Safety rings with active-zone pulse
 function SafetyRings({ zone }) {
+  const opacityRef = useRef({ 0.3: 0.5, 0.6: 0.5, 1.2: 0.5 })
+  const meshRefs   = { 0.3: useRef(), 0.6: useRef(), 1.2: useRef() }
+
+  useFrame(({ clock }) => {
+    const t     = clock.getElapsedTime()
+    const pulse = 0.3 + 0.25 * (0.5 + 0.5 * Math.sin(t * 3))
+
+    const activeR = zone === 'RED' ? 0.3 : zone === 'YELLOW' ? 0.6 : 1.2
+    for (const [r, ref] of Object.entries(meshRefs)) {
+      if (ref.current) {
+        ref.current.material.opacity = parseFloat(r) === activeR ? pulse : 0.08
+      }
+    }
+  })
+
   const rings = [
-    { r: 1.2, color: '#00C47A', opacity: 0.06 },
-    { r: 0.6, color: '#F5A623', opacity: 0.10 },
-    { r: 0.3, color: '#FF3B3B', opacity: 0.18 },
+    { r: 1.2, color: '#22C55E' },
+    { r: 0.6, color: '#EAB308' },
+    { r: 0.3, color: '#EF4444' },
   ]
-  const activeR = zone === 'RED' ? 0.3 : zone === 'YELLOW' ? 0.6 : null
 
   return (
     <>
-      {rings.map(({ r, color, opacity }) => (
-        <mesh key={r} position={[0, 0.01, 0]} rotation={[-Math.PI/2, 0, 0]}>
-          <ringGeometry args={[r - 0.015, r, 64]} />
-          <meshBasicMaterial
-            color={color}
-            opacity={activeR === r ? opacity * 3 : opacity}
-            transparent side={THREE.DoubleSide}
-          />
+      {rings.map(({ r, color }) => (
+        <mesh key={r} ref={meshRefs[r]} position={[0, 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+          <torusGeometry args={[r, 0.015, 8, 64]} />
+          <meshBasicMaterial color={color} transparent opacity={0.3} />
         </mesh>
       ))}
     </>
   )
 }
 
-function RobotMarker() {
-  return (
-    <mesh position={[0, 0.45, 0]}>
-      <cylinderGeometry args={[0.15, 0.15, 0.9, 16]} />
-      <meshStandardMaterial color="#555" />
-    </mesh>
-  )
-}
-
-function Scene({ topView }) {
-  const { robotState } = useStore()
-  const zone = robotState?.safety?.zone ?? 'GREEN'
+// Camera preset controller
+function CameraController({ preset }) {
   const { camera } = useThree()
 
   useEffect(() => {
-    if (topView) {
-      camera.position.set(0, 6, 0)
+    if (preset === 'top') {
+      camera.position.set(0, 6, 0.001)
       camera.lookAt(0, 0, 0)
     } else {
-      camera.position.set(0, 3, 4)
+      camera.position.set(3, 4, 5)
       camera.lookAt(0, 0, 0)
     }
-  }, [topView, camera])
+  }, [preset, camera])
 
+  return null
+}
+
+function Scene({ pointsRef, zone, preset }) {
   return (
     <>
-      <ambientLight intensity={0.4} />
-      <directionalLight position={[2, 4, 2]} intensity={0.8} />
-      <Grid
-        args={[4, 4]}
-        cellSize={0.2} cellThickness={0.4}
-        cellColor="#242428" sectionColor="#2A2A2E"
-        sectionSize={1} position={[0, 0, 0]}
-      />
+      <ambientLight intensity={0.3} />
+      <directionalLight position={[3, 5, 3]} intensity={0.6} />
+
+      {/* Floor grid */}
+      <gridHelper args={[6, 12, '#1A1A1E', '#141416']} position={[0, 0, 0]} />
+
+      {/* Robot marker */}
+      <mesh position={[0, 0.025, 0]}>
+        <cylinderGeometry args={[0.08, 0.08, 0.05, 16]} />
+        <meshStandardMaterial color="#3B82F6" />
+      </mesh>
+
+      {/* Safety rings */}
       <SafetyRings zone={zone} />
-      <RobotMarker />
-      <PointCloud />
-      <OrbitControls enableDamping dampingFactor={0.08} makeDefault />
+
+      {/* Point cloud */}
+      <PointCloud pointsRef={pointsRef} />
+
+      <CameraController preset={preset} />
+      <OrbitControls enableDamping dampingFactor={0.08} />
     </>
   )
 }
 
 export default function LidarPanel() {
-  const { lidarWsStatus } = useStore()
-  const [topView, setTopView] = useState(false)
-  const offline = lidarWsStatus === 'disconnected'
+  const zone          = useStore((s) => s.safety.zone)
+  const lidarWsStatus = useStore((s) => s.lidarWsStatus)
+
+  const pointsRef = useRef([])
+  const wsRef     = useRef(null)
+  const [preset, setPreset] = useState('3d')
+  const [wsConnected, setWsConnected] = useState(false)
+
+  // Direct WS connection — bypasses store to avoid re-render storm
+  useEffect(() => {
+    let retryTimer = null
+    let retryCount = 0
+
+    function connect() {
+      const ws = new WebSocket(`${WS_PROTO}://${HOST}/ws/lidar`)
+      wsRef.current = ws
+
+      ws.onopen = () => {
+        setWsConnected(true)
+        retryCount = 0
+      }
+
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data)
+          pointsRef.current = msg.points ?? []
+        } catch (_) {}
+      }
+
+      ws.onerror = () => {}
+
+      ws.onclose = () => {
+        setWsConnected(false)
+        retryCount++
+        const delay = Math.min(1000 * Math.pow(2, retryCount), 10000)
+        retryTimer = setTimeout(connect, delay)
+      }
+    }
+
+    connect()
+
+    return () => {
+      clearTimeout(retryTimer)
+      if (wsRef.current) {
+        wsRef.current.onclose = null
+        wsRef.current.close()
+      }
+    }
+  }, [])
+
+  const offline = !wsConnected
 
   return (
-    <div style={styles.wrap}>
-      <Canvas camera={{ position: [0, 3, 4], fov: 50 }}>
-        <Scene topView={topView} />
+    <div style={{ position: 'relative', width: '100%', height: '100%', background: '#08090c' }}>
+      <Canvas
+        camera={{ position: [3, 4, 5], fov: 50 }}
+        gl={{ antialias: false, powerPreference: 'high-performance' }}
+      >
+        <Scene pointsRef={pointsRef} zone={zone} preset={preset} />
       </Canvas>
 
-      {offline && (
-        <div style={styles.offline}>
-          <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>LiDAR offline</span>
-        </div>
-      )}
-
-      <div style={styles.toggle}>
-        {['3D', 'Top'].map(v => (
+      {/* View buttons */}
+      <div style={{
+        position: 'absolute',
+        top: 10,
+        right: 10,
+        display: 'flex',
+        gap: 2,
+        background: 'rgba(14,14,18,0.85)',
+        borderRadius: 6,
+        padding: 3,
+        border: '1px solid var(--border)',
+      }}>
+        {['3D', 'Top'].map((v) => (
           <button
             key={v}
-            onClick={() => setTopView(v === 'Top')}
+            onClick={() => setPreset(v.toLowerCase())}
             style={{
-              ...styles.toggleBtn,
-              ...(topView === (v === 'Top') ? styles.toggleActive : {}),
+              background: preset === v.toLowerCase() ? 'var(--bg-hover)' : 'transparent',
+              color: preset === v.toLowerCase() ? 'var(--text-primary)' : 'var(--text-secondary)',
+              border: 'none',
+              padding: '3px 10px',
+              borderRadius: 4,
+              fontSize: 12,
+              cursor: 'pointer',
             }}
           >
             {v}
           </button>
         ))}
       </div>
+
+      {/* Zone legend */}
+      <div style={{
+        position: 'absolute',
+        bottom: 10,
+        left: 10,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 3,
+        background: 'rgba(14,14,18,0.85)',
+        padding: '6px 10px',
+        borderRadius: 6,
+        border: '1px solid var(--border)',
+        fontSize: 10,
+        color: 'var(--text-secondary)',
+      }}>
+        {[['#22C55E', '> 1.2 m', 'GREEN'], ['#EAB308', '0.6–1.2 m', 'YELLOW'], ['#EF4444', '< 0.6 m', 'RED']].map(
+          ([color, range, label]) => (
+            <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: color, display: 'inline-block' }} />
+              <span>{label} {range}</span>
+            </div>
+          )
+        )}
+      </div>
+
+      {/* Offline overlay */}
+      {offline && (
+        <div style={{
+          position: 'absolute',
+          inset: 0,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          pointerEvents: 'none',
+          background: 'rgba(0,0,0,0.3)',
+        }}>
+          <div style={{
+            background: 'rgba(14,14,18,0.9)',
+            border: '1px solid var(--border)',
+            borderRadius: 8,
+            padding: '10px 18px',
+            fontSize: 13,
+            color: 'var(--text-muted)',
+          }}>
+            📡 LiDAR offline — reconnecting…
+          </div>
+        </div>
+      )}
     </div>
   )
-}
-
-const styles = {
-  wrap: { position:'relative', width:'100%', height:'100%', background:'#0A0A0B' },
-  offline: {
-    position: 'absolute', inset: 0,
-    display: 'flex', alignItems: 'center', justifyContent: 'center',
-    pointerEvents: 'none',
-  },
-  toggle: {
-    position: 'absolute', top: 10, right: 10,
-    display: 'flex', gap: 2,
-    background: 'rgba(20,20,22,0.8)',
-    borderRadius: 6, padding: 3,
-  },
-  toggleBtn: {
-    background: 'transparent', color: 'var(--text-secondary)',
-    padding: '3px 10px', borderRadius: 4, fontSize: 12,
-  },
-  toggleActive: {
-    background: 'var(--bg-hover)', color: 'var(--text-primary)',
-  },
 }

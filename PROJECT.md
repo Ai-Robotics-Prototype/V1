@@ -264,30 +264,68 @@ Motion is executed by publishing `PoseStamped` to `/task/target_pose` →
 
 ## Dashboard
 
-### ROS2 server (`cobot_dashboard/dashboard_server.py`)
-- FastAPI + WebSocket, port 8080
-- Bridges ROS2 topics to WebSocket clients
-- Serves static frontend files
+### Start (dev — Windows WSL)
+```bash
+cd ~/cobot_ws/src/cobot_dashboard/mock_server
+bash run.sh          # creates venv, installs deps, starts on :8080
+# Open: http://$(hostname -I | awk '{print $1}'):8080
+```
+
+### Frontend dev server (hot reload)
+```bash
+cd ~/cobot_ws/src/cobot_dashboard/frontend
+npm run dev          # Vite on :5173, proxies API to :8080
+```
+
+### Jetson deploy
+```bash
+git pull
+colcon build --symlink-install
+ros2 launch cobot_bringup full_stack.launch.py
+# Dashboard auto-starts on :8080
+```
 
 ### Mock server (`cobot_dashboard/mock_server/server.py`)
-- **Standalone FastAPI — zero ROS2 dependency**
-- Identical API/WebSocket/MJPEG interface as ROS2 server
-- Run: `python3 server.py` (port 8080)
-
-Endpoints:
+Standalone FastAPI — zero ROS2. Full simulation: safety zones, joints,
+task state machine, MJPEG cameras, LiDAR point cloud.
 
 | Endpoint | Description |
 |---|---|
-| `WS /ws/state` | 25 Hz — safety, joints, task, detections, scene_graph |
-| `WS /ws/lidar` | 10 Hz — 3500-point cloud JSON |
-| `GET /stream/cam0` | MJPEG 15 fps |
-| `GET /stream/cam1` | MJPEG 15 fps |
-| `POST /cmd/estop` | `{"active": true\|false}` |
-| `POST /cmd/task` | `{"command": "go"\|"pause"\|"home"}` |
-| `POST /cmd/voice` | `{"text": "..."}` |
-| `POST /cmd/jog` | `{"joint": N, "delta": rad}` |
-| `GET /health` | `{"status":"ok","ros":false,"mock":true}` |
-| `GET /api/config` | Robot config values |
+| `WS /ws/state` | 25 Hz — safety, joints, task, detections, scene_graph, gripper, program |
+| `WS /ws/lidar` | 10 Hz — 3500-point cloud `[{x,y,z,i}]` |
+| `GET /stream/cam0` | MJPEG 15 fps, Pillow-generated with bbox overlays |
+| `GET /stream/cam1` | MJPEG 15 fps, slightly offset angle |
+| `POST /cmd/estop` | `{"active":bool}` — latched, release requires GREEN zone |
+| `POST /cmd/task` | `{"command":"run\|pause\|resume\|home\|cancel"}` |
+| `POST /cmd/jog` | `{"joint":0-5,"delta":rad}` — safety gated |
+| `POST /cmd/gripper` | `{"action":"open\|close","width_mm":float}` |
+| `POST /cmd/voice` | `{"text":"..."}` — keyword parsing → state mutations |
+| `POST /cmd/program/add` | `{"type","label","detail"}` |
+| `POST /cmd/program/remove` | `{"id":int}` |
+| `POST /cmd/program/reorder` | `{"ids":[int,...]}` |
+| `GET /health` | `{"status":"ok","ros":false,"mock":true,"uptime_s":f}` |
+| `GET /api/state` | Full STATE snapshot |
+| `GET /api/config` | Robot config |
+
+### Frontend (`cobot_dashboard/frontend/`)
+React 18 + Vite + Three.js + Zustand. Tabs: Monitor, Program, 3D View, Sensors, Configure.
+
+| Component | Description |
+|---|---|
+| `TopBar` | Tabs, WS status + latency, inline E-Stop confirm |
+| `SideNav` | View switcher (Camera/LiDAR/Arm/Split/Scene/Safety) |
+| `MonitorLayout` | Camera/LiDAR viewport + ControlStrip + ProgramPanel |
+| `ControlStrip` | Run/Pause/Home buttons, joint grid, jog (engineer), detections |
+| `ProgramPanel` | Drag-to-reorder steps, add/delete, voice input bar |
+| `CameraPanel` | MJPEG stream + SVG detection bbox overlay + FPS badge |
+| `LidarPanel` | Three.js point cloud, safety rings, orbit controls |
+| `ArmViewer3D` | 6-DOF kinematic arm, lerped angles, camera presets |
+| `EStopOverlay` | Full-screen block when estop, release only in GREEN zone |
+| `ToastContainer` | Slide-in success/error/warning toasts, 3s auto-dismiss |
+| `StatusBar` | Live telemetry bar: state, zone, proximity, WS latency |
+| `SensorsLayout` | 2×2 grid: cam0, cam1, lidar, scene graph table |
+| `View3DLayout` | Full ArmViewer3D + joint readout + camera presets |
+| `ConfigureLayout` | Brand/IP/port, safety zones, mode toggle |
 
 ### WebSocket state message schema (25 Hz)
 ```json
@@ -556,3 +594,4 @@ GitHub Actions: `.github/workflows/build_check.yml`
 4. **Mock server = identical API** — frontend works against mock server with zero code changes on deploy to Jetson.
 5. **GPU optional** — every GPU path has a CPU fallback. Stack runs on any Linux machine for development.
 6. **ESTOP is latched** — RED zone or watchdog timeout sets estop. Requires explicit service call + GREEN zone to release. This is intentional for safety.
+
