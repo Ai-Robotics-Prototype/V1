@@ -1,0 +1,11 @@
+gripper_node:
+  ros__parameters:
+    # ── CHANGE THESE for your gripper ─────────────────────────────────────────
+    brand:          "fake"      # dh | robotiq | xarm | fake
+    gripper_ip:     "192.168.1.100"
+    gripper_port:   0           # 0 = use brand default (DH=6000, Robotiq=502)
+
+    open_position:  0.0         # 0.0 = fully open
+    close_position: 1.0         # 1.0 = fully closed
+    speed:          0.5         # 0.0–1.0
+    force:          0.5         # 0.0–1.0

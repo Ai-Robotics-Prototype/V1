@@ -1,0 +1,30 @@
+[submodule "src/diagnostics"]
+	path = src/diagnostics
+	url = https://github.com/ros2/diagnostics.git
+[submodule "src/ouster-ros"]
+	path = src/ouster-ros
+	url = https://github.com/ouster-lidar/ouster-ros.git
+[submodule "src/pcl_msgs"]
+	path = src/pcl_msgs
+	url = https://github.com/ros-perception/pcl_msgs.git
+[submodule "src/perception_pcl"]
+	path = src/perception_pcl
+	url = https://github.com/ros-perception/perception_pcl.git
+[submodule "src/negotiated"]
+	path = src/negotiated
+	url = https://github.com/osrf/negotiated.git
+[submodule "src/realsense-ros"]
+	path = src/realsense-ros
+	url = https://github.com/IntelRealSense/realsense-ros.git
+[submodule "src/isaac_ros_common"]
+	path = src/isaac_ros_common
+	url = https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_common.git
+[submodule "src/isaac_ros_nitros"]
+	path = src/isaac_ros_nitros
+	url = https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_nitros.git
+[submodule "src/isaac_ros_nvblox"]
+	path = src/isaac_ros_nvblox
+	url = https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_nvblox.git
+[submodule "src/isaac_ros_object_detection"]
+	path = src/isaac_ros_object_detection
+	url = https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_object_detection.git

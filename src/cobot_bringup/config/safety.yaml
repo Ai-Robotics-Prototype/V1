@@ -1,0 +1,20 @@
+human_safety_node:
+  ros__parameters:
+    zone_green_m: 1.2
+    zone_yellow_m: 0.6
+    zone_red_m: 0.3
+    skeleton_model: "mediapipe"
+    tcp_frame: "tool0"
+    publish_rate_hz: 50.0
+    no_detection_safe_distance: 5.0
+
+safety_monitor_node:
+  ros__parameters:
+    watchdog_timeout_s: 1.0
+    estop_latch: true
+    speed_green: 1.0
+    speed_yellow: 0.25
+    speed_red: 0.0
+    zone_green_m: 1.2
+    zone_yellow_m: 0.6
+    zone_red_m: 0.3

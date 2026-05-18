@@ -1,0 +1,51 @@
+# Isaac ROS nvblox parameters — used by both the nvblox_node composition
+# and the occupancy_map_node wrapper.
+# Full parameter list: https://nvidia-isaac-ros.github.io/repositories_and_packages/isaac_ros_nvblox
+
+occupancy_map_node:
+  ros__parameters:
+    voxel_size: 0.05          # 5 cm voxels — good balance for cobot workspace
+    max_range: 4.0            # metres — covers full arm reach + safety margin
+    map_frame: "map"
+    decay_rate: 0.95
+    use_color: false
+    publish_esdf: true
+    esdf_max_distance_m: 2.0
+
+# nvblox_node parameters (Isaac ROS NvbloxNode — loaded when nvblox_ros is present)
+nvblox_node:
+  ros__parameters:
+    # Core
+    voxel_size: 0.05
+    max_ray_length_m: 4.0
+
+    # TSDF integration
+    tsdf_integrator_max_weight: 100.0
+    tsdf_integrator_truncation_distance_vox: 4.0
+
+    # Occupancy
+    occupancy_integrator_max_weight: 10.0
+    free_region_occupancy_probability: 0.3
+    occupied_region_occupancy_probability: 0.85
+
+    # ESDF
+    esdf_integrator_max_distance_m: 2.0
+    esdf_integrator_min_weight: 1.0
+
+    # Mesh
+    mesh_integrator_min_weight: 1.0
+    mesh_integrator_weld_vertices: true
+
+    # Mapping mode: static | dynamic
+    mapping_type: "static_tsdf"
+
+    # Frames
+    global_frame: "map"
+
+    # Timing
+    esdf_update_rate_hz: 5.0
+    mesh_update_rate_hz: 2.0
+    occupancy_publication_rate_hz: 5.0
+
+    # GPU streams
+    num_cameras: 2

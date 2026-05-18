@@ -1,0 +1,18 @@
+experience_logger_node:
+  ros__parameters: {}
+
+upload_agent_node:
+  ros__parameters:
+    upload_url: "https://your-api.example.com/experiences"
+    api_key_path: "/opt/cobot/fleet_api_key.txt"
+    upload_hour: 2
+    max_file_age_days: 30
+    enabled: false
+
+update_agent_node:
+  ros__parameters:
+    update_url: "https://your-api.example.com/models/latest"
+    current_model_version_path: "/opt/cobot/models/version.txt"
+    models_dir: "/opt/cobot/models/"
+    check_interval_s: 3600.0
+    enabled: false

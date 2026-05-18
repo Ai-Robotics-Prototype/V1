@@ -1,0 +1,9 @@
+cuda_pointcloud_node:
+  ros__parameters:
+    voxel_size: 0.025
+    min_range: 0.2
+    max_range: 5.0
+    target_frame: "base_link"
+    estimate_normals: false
+    k_neighbours: 20
+    max_points: 500000

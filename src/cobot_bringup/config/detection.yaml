@@ -1,0 +1,13 @@
+detector_node:
+  ros__parameters:
+    model_path: "/opt/cobot/models/yolov8n.pt"
+    confidence_threshold: 0.5
+    nms_threshold: 0.4
+    target_classes:
+      - "bottle"
+      - "box"
+      - "cup"
+      - "tool"
+      - "person"
+    use_tensorrt: false
+    device: "cuda:0"
