@@ -525,14 +525,7 @@ tr:hover td{background:var(--hover)}
 <div id="disc-banner">⚠ DISCONNECTED — retrying…</div>
 <div id="toast-wrap"></div>
 
-<!-- Three.js + OrbitControls from CDN -->
-<script>window._threeLoaded = false; window._orbitLoaded = false;</script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"
-  onload="window._threeLoaded = true;"
-  onerror="(function(){var c=document.getElementById('viewer-container');if(c)c.innerHTML='<div style=\'padding:24px;color:#999;font-size:12px;text-align:center;margin-top:30px\'>⚠ 3D viewer unavailable<br><small>Three.js could not be loaded — check network</small></div>';console.error('Three.js CDN failed');})()"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"
-  onload="window._orbitLoaded = true;"
-  onerror="console.warn('OrbitControls CDN failed, using fallback orbit')"></script>
+<!-- No external scripts required — viewer uses Canvas 2D -->
 
 <script>
 'use strict';
@@ -656,319 +649,188 @@ function updatePendant() {
     ? S.human_proximity.toFixed(2)+' m' : '— m';
 }
 
-// ── 3D Viewer ─────────────────────────────────────────────────────────────────
+// ── 2D Robot Viewer (Canvas 2D — no WebGL required) ──────────────────────────
 let threeReady = false;
-let scene, camera, renderer, controls;
-let jointGroups = [];      // [j1..j6] Object3D
-let tcpMesh;
-let safetyZones = [];      // [{mesh,label,mat}]
-let trailLine, trailPts=[], trailBuf;
-let pickMarker3D=null, placeMarker3D=null;
+let armCanvas2D = null, armCtx2D = null;
 let curAngles=[0,0,0,0,0,0], tgtAngles=[0,0,0,0,0,0];
 let fpsFrames=0, fpsClock=0;
-let _threeRetries = 0;
+let trail2D = [];
 
-function initThree() {
+function init2DViewer() {
   const container = document.getElementById('viewer-container');
-  if (!window._threeLoaded || typeof THREE === 'undefined') {
-    _threeRetries++;
-    if (_threeRetries > 25) {
-      if (container && !container.querySelector('canvas')) {
-        container.innerHTML = '<div style="padding:24px;color:#999;font-size:12px;text-align:center;margin-top:30px">⚠ 3D viewer unavailable<br><small>Three.js could not be loaded</small></div>';
-      }
-      return;
-    }
-    setTimeout(initThree, 200);
-    return;
-  }
+  if (!container) return;
 
-  const W = container.offsetWidth;
-  const H = container.offsetHeight;
-  if (W < 50 || H < 50) { setTimeout(initThree, 100); return; }
+  armCanvas2D = document.createElement('canvas');
+  armCanvas2D.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;display:block;';
+  container.insertBefore(armCanvas2D, container.firstChild);
 
-  // ── Renderer ──
-  renderer = new THREE.WebGLRenderer({ antialias: true });
-  renderer.setSize(W, H);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.shadowMap.enabled = true;
-  renderer.setClearColor(0xF8F8FA);
-  renderer.domElement.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;display:block;';
-  container.appendChild(renderer.domElement);
-
-  // ── Scene ──
-  scene = new THREE.Scene();
-  scene.background = new THREE.Color(0xF8F8FA);
-
-  // ── Camera ──
-  camera = new THREE.PerspectiveCamera(50, W/H, 0.01, 100);
-  camera.position.set(0.8, 0.6, 0.8);
-  camera.lookAt(0, 0.3, 0);
-
-  // ── Lights ──
-  scene.add(new THREE.AmbientLight(0xFFFFFF, 0.7));
-  const sun = new THREE.DirectionalLight(0xFFFFFF, 0.8);
-  sun.position.set(5, 10, 5); sun.castShadow = true;
-  sun.shadow.mapSize.set(1024, 1024);
-  scene.add(sun);
-  const fill = new THREE.DirectionalLight(0xEEF0FF, 0.25);
-  fill.position.set(-4, 2, -3); scene.add(fill);
-
-  // ── Grid ──
-  scene.add(new THREE.GridHelper(4, 40, 0xCCCCCC, 0xEEEEEE));
-
-  // ── Safety zones ──
-  const ZONES = [
-    {inner:1.0,outer:1.2,col:0x00A86B,label:'GREEN'},
-    {inner:0.5,outer:0.6,col:0xF59E0B,label:'YELLOW'},
-    {inner:0.25,outer:0.3,col:0xDC2626,label:'RED'},
-  ];
-  ZONES.forEach(z => {
-    const geo = new THREE.RingGeometry(z.inner, z.outer, 64);
-    const mat = new THREE.MeshBasicMaterial({
-      color:z.col, side:THREE.DoubleSide, transparent:true, opacity:0.15 });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.rotation.x = -Math.PI/2; mesh.position.y = 0.001;
-    scene.add(mesh);
-    safetyZones.push({mesh, mat, label:z.label});
-  });
-
-  // ── Workspace envelope ──
-  const env = new THREE.Mesh(
-    new THREE.SphereGeometry(0.85, 24, 24),
-    new THREE.MeshBasicMaterial({color:0x0066FF,wireframe:true,transparent:true,opacity:0.04}));
-  env.position.y = 0.3; scene.add(env);
-
-  // ── Robot arm ──
-  buildRobotArm();
-
-  // ── TCP trail ──
-  const MAX_TRAIL = 100;
-  trailBuf = new Float32Array(MAX_TRAIL * 3);
-  const tGeo = new THREE.BufferGeometry();
-  tGeo.setAttribute('position', new THREE.BufferAttribute(trailBuf, 3));
-  tGeo.setDrawRange(0, 0);
-  trailLine = new THREE.Line(tGeo,
-    new THREE.LineBasicMaterial({color:0x0066FF,transparent:true,opacity:0.35}));
-  scene.add(trailLine);
-
-  // ── OrbitControls ──
-  if (typeof THREE.OrbitControls !== 'undefined') {
-    controls = new THREE.OrbitControls(camera, renderer.domElement);
-    controls.target.set(0, 0.3, 0);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.05;
-    controls.minDistance = 0.3;
-    controls.maxDistance = 4;
-  } else {
-    // Minimal fallback orbit (drag-rotate, scroll-zoom)
-    console.warn('OrbitControls not loaded, using fallback');
-    initFallbackOrbit(renderer.domElement, camera, {x:0,y:0.3,z:0});
-  }
-
-  // ── Resize ──
-  const ro = new ResizeObserver(() => {
-    const W2 = container.offsetWidth, H2 = container.offsetHeight;
-    if (!W2||!H2) return;
-    renderer.setSize(W2, H2);
-    camera.aspect = W2/H2;
-    camera.updateProjectionMatrix();
-  });
-  ro.observe(container);
-
+  const resize = () => {
+    armCanvas2D.width  = container.offsetWidth  || 400;
+    armCanvas2D.height = container.offsetHeight || 300;
+  };
+  new ResizeObserver(resize).observe(container);
+  resize();
+  armCtx2D = armCanvas2D.getContext('2d');
   threeReady = true;
 
-  // ── Animation loop ──
-  (function animate(t) {
-    requestAnimationFrame(animate);
-    if (controls) controls.update();
-
-    // Smooth joint lerp
-    let moved = false;
-    for (let i=0;i<6;i++) {
+  (function loop(now) {
+    requestAnimationFrame(loop);
+    for (let i = 0; i < 6; i++) {
       const d = tgtAngles[i] - curAngles[i];
-      if (Math.abs(d) > 0.0004) { curAngles[i] += d*0.15; moved = true; }
+      if (Math.abs(d) > 0.0004) curAngles[i] += d * 0.15;
     }
-    if (moved) applyJoints(curAngles);
-
-    // Zone pulse
-    safetyZones.forEach(z => {
-      if (z.active) z.mat.opacity = 0.25 + Math.sin(t*0.003)*0.1;
-    });
-
+    draw2DArm();
     fpsFrames++;
-    if (t - fpsClock > 1000) {
-      document.getElementById('fps-lbl').textContent = fpsFrames + ' fps';
-      fpsFrames = 0; fpsClock = t;
+    if (now - fpsClock > 1000) {
+      const el = document.getElementById('fps-lbl');
+      if (el) el.textContent = fpsFrames + ' fps';
+      fpsFrames = 0; fpsClock = now;
     }
-
-    renderer.render(scene, camera);
   })(0);
 }
 
-function buildRobotArm() {
-  const phong = (c,s=40) => new THREE.MeshPhongMaterial({color:c,shininess:s});
-  const cyl   = (r,h,segs=16) => new THREE.CylinderGeometry(r,r,h,segs);
+function draw2DArm() {
+  const ctx = armCtx2D;
+  if (!ctx) return;
+  const W = armCanvas2D.width, H = armCanvas2D.height;
+  if (!W || !H) return;
 
-  // robotRoot sits at world origin
-  const root = new THREE.Object3D();
-  scene.add(root);
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#F8F8FA'; ctx.fillRect(0, 0, W, H);
 
-  // J1 — base rotation (Y axis)
-  const j1 = new THREE.Object3D(); root.add(j1);
+  // Grid
+  ctx.strokeStyle = 'rgba(0,0,0,0.045)'; ctx.lineWidth = 1;
+  for (let x = 0; x < W; x += 40) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for (let y = 0; y < H; y += 40) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
 
-  // Base cylinder at bottom of J1
-  const baseMesh = new THREE.Mesh(cyl(0.08,0.06,32), phong(0xC8C8CC,60));
-  baseMesh.position.y = 0.03; baseMesh.castShadow = true; j1.add(baseMesh);
+  const bx = W/2, by = H * 0.80;
+  const SCALE = Math.min(W, H) * 0.52;
 
-  // J2 — shoulder (Z axis), offset up by 0.06 (height of base)
-  const j2 = new THREE.Object3D(); j2.position.y = 0.06; j1.add(j2);
+  // Safety zone rings (side-view half-circles)
+  [
+    [1.2,'rgba(0,168,107,0.07)','rgba(0,168,107,0.28)'],
+    [0.6,'rgba(245,158,11,0.08)','rgba(245,158,11,0.32)'],
+    [0.3,'rgba(220,38,38,0.09)','rgba(220,38,38,0.38)'],
+  ].forEach(([r,fill,stroke]) => {
+    ctx.beginPath(); ctx.arc(bx, by, r*SCALE, Math.PI, 0);
+    ctx.fillStyle = fill; ctx.fill();
+    ctx.strokeStyle = stroke; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.fillStyle = stroke; ctx.font = '9px monospace';
+    ctx.fillText(r+'m', bx + r*SCALE + 3, by - 4);
+  });
 
-  // Upper arm cylinder: h=0.32, base at j2 origin → centre at y=0.16
-  const uaMesh = new THREE.Mesh(cyl(0.04,0.32), phong(0x7A7A82));
-  uaMesh.position.y = 0.16; uaMesh.castShadow = true; j2.add(uaMesh);
-  // Shoulder visual sphere
-  j2.add((() => { const m=new THREE.Mesh(new THREE.SphereGeometry(0.05,12,12),phong(0x5A5A62)); return m; })());
+  // Floor line
+  ctx.strokeStyle = 'rgba(0,0,0,0.12)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, by); ctx.lineTo(W, by); ctx.stroke();
 
-  // J3 — elbow (Z axis), offset up 0.32 from J2
-  const j3 = new THREE.Object3D(); j3.position.y = 0.32; j2.add(j3);
+  // Compute arm positions
+  const pts = armFK2D(curAngles, bx, by, SCALE);
+  const tcp = pts[pts.length - 1];
 
-  const faMesh = new THREE.Mesh(cyl(0.035,0.26), phong(0x8A8A92));
-  faMesh.position.y = 0.13; faMesh.castShadow = true; j3.add(faMesh);
-  j3.add((() => { const m=new THREE.Mesh(new THREE.SphereGeometry(0.043,12,12),phong(0x6A6A72)); return m; })());
-
-  // J4 — wrist1 (Z axis), offset up 0.26 from J3
-  const j4 = new THREE.Object3D(); j4.position.y = 0.26; j3.add(j4);
-
-  const w1Mesh = new THREE.Mesh(cyl(0.03,0.12), phong(0x9A9AA2));
-  w1Mesh.position.y = 0.06; j4.add(w1Mesh);
-  j4.add((() => { const m=new THREE.Mesh(new THREE.SphereGeometry(0.037,12,12),phong(0x7A7A82)); return m; })());
-
-  // J5 — wrist2 (Y axis), offset up 0.12 from J4
-  const j5 = new THREE.Object3D(); j5.position.y = 0.12; j4.add(j5);
-
-  const w2Mesh = new THREE.Mesh(cyl(0.025,0.10), phong(0xAAAAAA));
-  w2Mesh.position.y = 0.05; j5.add(w2Mesh);
-  j5.add((() => { const m=new THREE.Mesh(new THREE.SphereGeometry(0.031,12,12),phong(0x8A8A92)); return m; })());
-
-  // J6 — flange (Z axis), offset up 0.10 from J5
-  const j6 = new THREE.Object3D(); j6.position.y = 0.10; j5.add(j6);
-
-  const flMesh = new THREE.Mesh(cyl(0.04,0.04,32), phong(0xC0C0C8,80));
-  flMesh.position.y = 0.02; j6.add(flMesh);
-
-  // TCP indicator — red sphere
-  tcpMesh = new THREE.Mesh(
-    new THREE.SphereGeometry(0.015,12,12),
-    new THREE.MeshPhongMaterial({color:0xDC2626,emissive:0xAA0000,shininess:60}));
-  tcpMesh.position.y = 0.05; j6.add(tcpMesh);
-
-  jointGroups = [j1, j2, j3, j4, j5, j6];
-}
-
-function applyJoints(a) {
-  if (!jointGroups.length) return;
-  // Per spec: J1=Y, J2=Z, J3=Z, J4=Z, J5=Y, J6=Z
-  jointGroups[0].rotation.y = a[0];
-  jointGroups[1].rotation.z = a[1];
-  jointGroups[2].rotation.z = a[2];
-  jointGroups[3].rotation.z = a[3];
-  jointGroups[4].rotation.y = a[4];
-  jointGroups[5].rotation.z = a[5];
-
-  // Update TCP trail
-  if (tcpMesh) {
-    const wp = new THREE.Vector3();
-    tcpMesh.getWorldPosition(wp);
-    trailPts.push([wp.x,wp.y,wp.z]);
-    if (trailPts.length > 100) trailPts.shift();
-    trailPts.forEach(([x,y,z],i) => {
-      trailBuf[i*3]=x; trailBuf[i*3+1]=y; trailBuf[i*3+2]=z;
-    });
-    trailLine.geometry.attributes.position.needsUpdate = true;
-    trailLine.geometry.setDrawRange(0, trailPts.length);
+  // TCP trail
+  trail2D.push({x: tcp.x, y: tcp.y});
+  if (trail2D.length > 80) trail2D.shift();
+  for (let i = 1; i < trail2D.length; i++) {
+    ctx.strokeStyle = `rgba(0,102,255,${(i/trail2D.length)*0.22})`;
+    ctx.lineWidth = 1.5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(trail2D[i-1].x, trail2D[i-1].y);
+    ctx.lineTo(trail2D[i].x, trail2D[i].y); ctx.stroke();
   }
 
+  // Links
+  const lC = ['#4A4A52','#5A5A62','#6A6A72','#7A7A82','#9A9AA2','#AAAAAA'];
+  const lW = [16, 14, 12, 10, 8, 8];
+  for (let i = 0; i < pts.length - 1; i++) {
+    ctx.beginPath(); ctx.moveTo(pts[i].x, pts[i].y); ctx.lineTo(pts[i+1].x, pts[i+1].y);
+    ctx.strokeStyle = lC[Math.min(i, lC.length-1)];
+    ctx.lineWidth   = lW[Math.min(i, lW.length-1)];
+    ctx.lineCap = 'round'; ctx.stroke();
+  }
+
+  // Joint circles
+  pts.forEach(({x,y}, i) => {
+    if (i === 0) return;
+    const r = i === pts.length-1 ? 5 : Math.max(4, 10 - i);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2);
+    ctx.fillStyle = '#666'; ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 1.5; ctx.stroke();
+  });
+
+  // TCP dot (red)
+  ctx.beginPath(); ctx.arc(tcp.x, tcp.y, 6, 0, Math.PI*2);
+  ctx.fillStyle = '#DC2626'; ctx.fill();
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+
+  // Base block
+  ctx.fillStyle = '#888';
+  if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(bx-22, by, 44, 10, 3); ctx.fill(); }
+  else { ctx.fillRect(bx-22, by, 44, 10); }
+  ctx.fillStyle = '#666';
+  if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(bx-15, by+10, 30, 7, 2); ctx.fill(); }
+  else { ctx.fillRect(bx-15, by+10, 30, 7); }
+
+  // Saved point markers
+  const sp = S.saved_points || {};
+  if (sp.pick  && sp.pick.pose)  drawMarker2D(ctx, sp.pick.pose,  bx, by, SCALE, '#00A86B', sp.pick.name  || 'Pick');
+  if (sp.place && sp.place.pose) drawMarker2D(ctx, sp.place.pose, bx, by, SCALE, '#0066FF', sp.place.name || 'Place');
+
   // Overlays
-  const degs = a.map(r=>(r*180/Math.PI).toFixed(1));
-  document.getElementById('ojv').innerHTML = degs.map((d,i)=>`J${i+1}: ${d}°`).join('<br>');
+  const degs = curAngles.map(r => (r*180/Math.PI).toFixed(1));
+  const ojv = document.getElementById('ojv');
+  if (ojv) ojv.innerHTML = degs.map((d,i) => `J${i+1}: ${d}°`).join('<br>');
   const t = S.tcp_pose;
-  document.getElementById('otv').innerHTML =
+  const otv = document.getElementById('otv');
+  if (otv) otv.innerHTML =
     `X: ${t.x.toFixed(1)}<br>Y: ${t.y.toFixed(1)}<br>Z: ${t.z.toFixed(1)}<br>` +
     `Rx: ${t.rx.toFixed(2)}°<br>Ry: ${t.ry.toFixed(2)}°<br>Rz: ${t.rz.toFixed(2)}°`;
+}
+
+function armFK2D(a, bx, by, scale) {
+  // Simplified 2D side-view FK — UR5e link lengths (metres)
+  const [j1, j2, j3, j4, j5] = a;
+  const c1 = Math.cos(j1);
+  let x = bx, y = by, theta = Math.PI / 2;
+  const pts = [];
+  pts.push({x, y});
+  // Base riser
+  y -= 0.163 * scale; pts.push({x, y});
+  // Upper arm
+  theta += j2;
+  x += 0.425 * Math.cos(theta) * scale * c1; y -= 0.425 * Math.sin(theta) * scale; pts.push({x, y});
+  // Forearm
+  theta += j3;
+  x += 0.392 * Math.cos(theta) * scale * c1; y -= 0.392 * Math.sin(theta) * scale; pts.push({x, y});
+  // Wrist 1
+  theta += j4;
+  x += 0.133 * Math.cos(theta) * scale * c1; y -= 0.133 * Math.sin(theta) * scale; pts.push({x, y});
+  // Wrist 2 (partial out-of-plane)
+  theta += (j5 || 0) * 0.5;
+  x += 0.100 * Math.cos(theta) * scale * c1; y -= 0.100 * Math.sin(theta) * scale; pts.push({x, y});
+  // Flange / TCP
+  x += 0.100 * Math.cos(theta) * scale * c1; y -= 0.100 * Math.sin(theta) * scale; pts.push({x, y});
+  return pts;
+}
+
+function drawMarker2D(ctx, pose, bx, by, scale, color, label) {
+  const px = bx + (pose.x / 1000) * scale * 0.4;
+  const py = by - (pose.z / 1000) * scale;
+  ctx.globalAlpha = 0.7;
+  ctx.beginPath(); ctx.arc(px, py, 6, 0, Math.PI*2);
+  ctx.fillStyle = color; ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = color; ctx.font = 'bold 10px system-ui';
+  ctx.fillText(label, px + 8, py - 3);
+  ctx.globalAlpha = 0.25; ctx.strokeStyle = color; ctx.lineWidth = 1;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px, by); ctx.stroke();
+  ctx.setLineDash([]); ctx.globalAlpha = 1;
 }
 
 function updateViewer3D() {
   if (!threeReady) return;
   const pos = S.joint_positions;
-  for (let i=0;i<6;i++) tgtAngles[i] = pos[i]||0;
-
-  safetyZones.forEach(z => {
-    z.active = (z.label === S.safety_zone);
-    if (!z.active) z.mat.opacity = 0.15;
-  });
-
-  updatePointMarkers();
-}
-
-function updatePointMarkers() {
-  // Simple marker at pick/place positions (small sphere + vertical line)
-  // We'd need FK to compute world positions — for now remove and readd from tcp_pose
-  const sp = S.saved_points || {};
-
-  if (pickMarker3D) { scene.remove(pickMarker3D); pickMarker3D=null; }
-  if (placeMarker3D){ scene.remove(placeMarker3D); placeMarker3D=null; }
-
-  if (sp.pick && sp.pick.pose) {
-    pickMarker3D = makeMarker(0x00A86B, sp.pick.name||'Pick');
-    scene.add(pickMarker3D);
-  }
-  if (sp.place && sp.place.pose) {
-    placeMarker3D = makeMarker(0x0066FF, sp.place.name||'Place');
-    placeMarker3D.position.x = 0.1;
-    scene.add(placeMarker3D);
-  }
-}
-
-function makeMarker(col, label) {
-  const g = new THREE.Object3D();
-  const sphere = new THREE.Mesh(
-    new THREE.SphereGeometry(0.025,12,12),
-    new THREE.MeshPhongMaterial({color:col,emissive:col,opacity:0.8,transparent:true}));
-  sphere.position.y = 0.025;
-  g.add(sphere);
-  // Vertical line down to floor
-  const lGeo = new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(0,0,0), new THREE.Vector3(0,0.025,0)]);
-  g.add(new THREE.Line(lGeo, new THREE.LineBasicMaterial({color:col,transparent:true,opacity:0.5})));
-  return g;
-}
-
-// Minimal fallback orbit if OrbitControls didn't load
-function initFallbackOrbit(canvas, cam, target) {
-  let drag=false, lx=0, ly=0;
-  const t = new THREE.Vector3(target.x,target.y,target.z);
-  let theta=Math.atan2(cam.position.x-t.x, cam.position.z-t.z);
-  let phi=Math.acos(Math.min(1,(cam.position.y-t.y)/cam.position.distanceTo(t)));
-  let rad=cam.position.distanceTo(t);
-  function upd(){
-    phi=Math.max(.05,Math.min(Math.PI*.47,phi));
-    cam.position.set(t.x+rad*Math.sin(phi)*Math.sin(theta),
-                     t.y+rad*Math.cos(phi),
-                     t.z+rad*Math.sin(phi)*Math.cos(theta));
-    cam.lookAt(t);
-  }
-  canvas.addEventListener('mousedown',e=>{drag=true;lx=e.clientX;ly=e.clientY});
-  document.addEventListener('mouseup',()=>drag=false);
-  document.addEventListener('mousemove',e=>{
-    if(!drag)return;
-    theta-=(e.clientX-lx)*.005; phi+=(e.clientY-ly)*.005;
-    lx=e.clientX;ly=e.clientY; upd();
-  });
-  canvas.addEventListener('wheel',e=>{
-    rad=Math.max(.4,Math.min(4,rad+e.deltaY*.003)); upd(); e.preventDefault();
-  },{passive:false});
-  canvas.addEventListener('contextmenu',e=>e.preventDefault());
-  upd();
+  for (let i = 0; i < 6; i++) tgtAngles[i] = pos[i] || 0;
 }
 
 // ── Saved points UI ───────────────────────────────────────────────────────────
@@ -1511,7 +1373,7 @@ document.addEventListener('DOMContentLoaded', () => {
   renderTree();
   renderSavedPoints();
   wsConnect();
-  setTimeout(initThree, 150);
+  init2DViewer();
 });
 </script>
 </body>

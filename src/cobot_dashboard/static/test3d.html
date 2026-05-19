@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>3D Test</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#222; }
+#c { width:100vw; height:100vh; display:block; }
+#status { position:fixed; top:10px; left:10px; color:#fff;
+  font:14px monospace; background:rgba(0,0,0,0.7); padding:8px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="status">Loading...</div>
+<script>
+var s = document.getElementById('status');
+
+// Step 1: load Three.js
+s.textContent = 'Loading Three.js...';
+var script = document.createElement('script');
+script.src = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';
+script.onload = function() {
+  s.textContent = 'Three.js loaded. Building scene...';
+  try {
+    var canvas = document.getElementById('c');
+    var renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x334455);
+
+    var scene = new THREE.Scene();
+    var camera = new THREE.PerspectiveCamera(
+      60, window.innerWidth/window.innerHeight, 0.1, 100
+    );
+    camera.position.set(2, 2, 2);
+    camera.lookAt(0, 0, 0);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    var dl = new THREE.DirectionalLight(0xffffff, 0.8);
+    dl.position.set(5, 10, 5);
+    scene.add(dl);
+
+    // Red box at center
+    var box = new THREE.Mesh(
+      new THREE.BoxGeometry(0.5, 0.5, 0.5),
+      new THREE.MeshPhongMaterial({ color: 0xff3333 })
+    );
+    scene.add(box);
+
+    // Grid
+    scene.add(new THREE.GridHelper(4, 20));
+
+    var frame = 0;
+    function animate() {
+      requestAnimationFrame(animate);
+      box.rotation.y += 0.01;
+      renderer.render(scene, camera);
+      frame++;
+      s.textContent = 'WORKING — frame ' + frame +
+        ' | WebGL: ' + renderer.capabilities.isWebGL2;
+    }
+    animate();
+
+  } catch(e) {
+    s.textContent = 'WebGL ERROR: ' + e.message +
+      ' — Dashboard will use Canvas 2D fallback instead.';
+    // Canvas 2D fallback test
+    var c2 = document.getElementById('c');
+    var ctx = c2.getContext('2d');
+    c2.width = window.innerWidth; c2.height = window.innerHeight;
+    ctx.fillStyle = '#334455'; ctx.fillRect(0,0,c2.width,c2.height);
+    ctx.strokeStyle='#4488aa'; ctx.lineWidth=1;
+    for(var i=0;i<c2.width;i+=60){ctx.beginPath();ctx.moveTo(i,0);ctx.lineTo(i,c2.height);ctx.stroke();}
+    for(var j=0;j<c2.height;j+=60){ctx.beginPath();ctx.moveTo(0,j);ctx.lineTo(c2.width,j);ctx.stroke();}
+    var bx=c2.width/2, by=c2.height*0.7, sc=Math.min(c2.width,c2.height)*0.25;
+    // Simple arm diagram
+    ctx.strokeStyle='#aabbcc'; ctx.lineWidth=10; ctx.lineCap='round';
+    ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(bx,by-sc*0.4); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(bx,by-sc*0.4); ctx.lineTo(bx+sc*0.6,by-sc*0.9); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(bx+sc*0.6,by-sc*0.9); ctx.lineTo(bx+sc*0.9,by-sc*0.7); ctx.stroke();
+    ctx.fillStyle='#ff4444'; ctx.beginPath(); ctx.arc(bx+sc*0.9,by-sc*0.7,8,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#888'; ctx.fillRect(bx-30,by,60,12);
+    ctx.fillStyle='#aaaacc'; ctx.font='bold 16px monospace';
+    ctx.fillText('Canvas 2D — WebGL unavailable', bx-160, by+50);
+  }
+};
+script.onerror = function() {
+  s.textContent = 'FAILED — Three.js CDN unreachable. Dashboard uses Canvas 2D (no CDN needed).';
+};
+document.head.appendChild(script);
+</script>
+</body>
+</html>
