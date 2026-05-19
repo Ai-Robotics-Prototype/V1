@@ -1,0 +1,1263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>RoboAi Controller — Cobot 01</title>
+<style>
+/* ── Design system ────────────────────────────────────────────────────────── */
+:root {
+  --bg-app:        #F5F5F7;
+  --bg-panel:      #FFFFFF;
+  --bg-surface:    #F0F0F2;
+  --bg-hover:      #E8E8EA;
+  --border:        rgba(0,0,0,.10);
+  --border-focus:  rgba(0,0,0,.25);
+  --text-primary:  #1A1A1C;
+  --text-secondary:#5A5A62;
+  --text-muted:    #9A9AA2;
+  --accent:        #0066FF;
+  --zone-green:    #00A86B;
+  --zone-yellow:   #F59E0B;
+  --zone-red:      #DC2626;
+  --estop-red:     #B91C1C;
+  --shadow-sm:     0 1px 3px rgba(0,0,0,.08);
+  --shadow-md:     0 4px 12px rgba(0,0,0,.10);
+  --r-panel:       10px;
+  --r-btn:         8px;
+  --r-input:       6px;
+}
+*, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+  background: var(--bg-app);
+  color: var(--text-primary);
+  height: 100vh;
+  overflow: hidden;
+  font-size: 13px;
+}
+button { cursor:pointer; font-family:inherit; }
+input, select { font-family:inherit; }
+::-webkit-scrollbar { width:4px; height:4px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:rgba(0,0,0,.15); border-radius:2px; }
+
+/* ── App shell ────────────────────────────────────────────────────────────── */
+#app { display:grid; grid-template-rows:52px 1fr; height:100vh; }
+
+/* ── Header ───────────────────────────────────────────────────────────────── */
+#hdr {
+  background:var(--bg-panel);
+  border-bottom:1px solid var(--border);
+  box-shadow:var(--shadow-sm);
+  display:flex; align-items:center; gap:10px; padding:0 14px;
+  z-index:200; position:relative;
+}
+.brand { font-size:16px; font-weight:800; color:var(--text-primary); letter-spacing:-.5px; }
+.brand em { color:var(--accent); font-style:normal; }
+.robot-name { font-size:12px; color:var(--text-muted); font-weight:500; padding-left:4px; border-left:1px solid var(--border); margin-left:2px; }
+.mode-tabs { display:flex; background:var(--bg-surface); border-radius:7px; padding:2px; margin-left:8px; }
+.mode-tab {
+  padding:4px 12px; border-radius:5px; border:none; background:transparent;
+  font-size:11px; font-weight:600; color:var(--text-muted); transition:all .15s;
+}
+.mode-tab.active { background:var(--bg-panel); color:var(--text-primary); box-shadow:var(--shadow-sm); }
+.hdr-spacer { flex:1; }
+#conn-indicator { display:flex; align-items:center; gap:5px; }
+#conn-dot { width:7px; height:7px; border-radius:50%; background:var(--text-muted); }
+#conn-dot.ok  { background:var(--zone-green); box-shadow:0 0 5px var(--zone-green); }
+#conn-dot.err { background:var(--zone-red); }
+#conn-label { font-size:11px; color:var(--text-muted); font-weight:500; }
+.zone-badge {
+  padding:3px 10px; border-radius:20px; font-size:11px; font-weight:700;
+  letter-spacing:.05em; background:var(--bg-surface); color:var(--text-muted);
+}
+.zone-badge.GREEN  { background:rgba(0,168,107,.12); color:var(--zone-green); }
+.zone-badge.YELLOW { background:rgba(245,158,11,.12); color:var(--zone-yellow); }
+.zone-badge.RED    { background:rgba(220,38,38,.12);  color:var(--zone-red); }
+.hdr-estop {
+  padding:7px 16px; border-radius:7px; border:2px solid var(--estop-red);
+  background:var(--estop-red); color:#fff; font-size:12px; font-weight:800;
+  letter-spacing:.06em; transition:all .15s;
+}
+.hdr-estop:hover { background:#991b1b; border-color:#991b1b; }
+.hdr-estop.active { animation:estop-pulse 1s ease infinite; }
+@keyframes estop-pulse {
+  0%,100% { box-shadow:0 0 0 0 rgba(185,28,28,.5); }
+  50%      { box-shadow:0 0 0 8px rgba(185,28,28,0); }
+}
+
+/* ── Main grid ────────────────────────────────────────────────────────────── */
+#grid {
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  grid-template-rows:1fr 1fr;
+  gap:8px; padding:8px;
+  min-height:0;
+}
+/* Mode variants */
+.mode-operator #p-viewer,
+.mode-operator #p-program { display:none; }
+.mode-operator #grid {
+  grid-template-columns:1fr 1fr;
+  grid-template-rows:1fr;
+}
+
+/* ── Panel shell ──────────────────────────────────────────────────────────── */
+.panel {
+  background:var(--bg-panel);
+  border-radius:var(--r-panel);
+  box-shadow:var(--shadow-sm);
+  border:1px solid var(--border);
+  display:flex; flex-direction:column;
+  min-height:0; overflow:hidden;
+}
+.panel-hdr {
+  padding:9px 13px;
+  border-bottom:1px solid var(--border);
+  display:flex; align-items:center; justify-content:space-between;
+  flex-shrink:0;
+}
+.panel-title { font-size:10px; font-weight:700; letter-spacing:.09em; text-transform:uppercase; color:var(--text-secondary); }
+.panel-body  { flex:1; overflow:auto; min-height:0; }
+
+/* ── Buttons ──────────────────────────────────────────────────────────────── */
+.btn {
+  padding:7px 14px; border-radius:var(--r-btn); border:1px solid var(--border);
+  background:var(--bg-surface); color:var(--text-primary); font-size:12px; font-weight:600;
+  transition:background .12s; user-select:none;
+}
+.btn:hover:not(:disabled) { background:var(--bg-hover); }
+.btn:active:not(:disabled) { transform:scale(.97); }
+.btn:disabled { opacity:.4; cursor:not-allowed; }
+.btn-primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+.btn-primary:hover:not(:disabled) { background:#0055dd; }
+.btn-danger  { background:var(--zone-red); color:#fff; border-color:var(--zone-red); }
+.btn-sm { padding:5px 10px; font-size:11px; border-radius:6px; }
+.jog-btn {
+  width:38px; height:38px; border-radius:8px; border:1px solid var(--border);
+  background:var(--bg-surface); color:var(--text-primary); font-size:17px; font-weight:700;
+  display:flex; align-items:center; justify-content:center;
+  user-select:none; -webkit-user-select:none; flex-shrink:0;
+}
+.jog-btn:active { background:var(--accent); color:#fff; border-color:var(--accent); }
+
+/* ── 3D Viewer panel ──────────────────────────────────────────────────────── */
+#p-viewer { position:relative; }
+#viewer-container { flex:1; position:relative; min-height:0; overflow:hidden; }
+#gl { width:100%; height:100%; display:block; }
+.viewer-overlay {
+  position:absolute; background:rgba(255,255,255,.85); backdrop-filter:blur(6px);
+  border-radius:6px; padding:6px 9px; font-size:10px; font-family:monospace;
+  color:var(--text-primary); border:1px solid var(--border);
+  pointer-events:none; line-height:1.6;
+}
+#joints-overlay  { bottom:10px; left:10px; }
+#tcp-overlay     { bottom:10px; right:10px; }
+#fps-overlay     { top:10px; right:10px; font-size:10px; }
+.ov-label { color:var(--text-muted); font-size:9px; }
+
+/* ── Teach pendant panel ─────────────────────────────────────────────────── */
+#p-pendant .panel-body { padding:0; }
+.pendant-scroll { padding:10px; overflow-y:auto; height:100%; }
+.section-label {
+  font-size:9px; font-weight:700; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--text-muted); margin:12px 0 6px; padding-bottom:4px; border-bottom:1px solid var(--border);
+}
+.section-label:first-child { margin-top:0; }
+
+/* Joint rows */
+.joint-row {
+  display:flex; align-items:center; gap:6px; margin-bottom:5px; flex-wrap:nowrap;
+}
+.j-label { font-size:11px; font-weight:700; color:var(--text-secondary); min-width:20px; flex-shrink:0; }
+.j-gauge-wrap { position:relative; width:32px; height:32px; flex-shrink:0; }
+.j-gauge-wrap svg { width:32px; height:32px; }
+.j-value { font-size:11px; font-family:monospace; color:var(--text-primary); min-width:52px; text-align:center; }
+.j-speed-wrap { flex:1; display:flex; align-items:center; gap:4px; }
+.j-speed { width:100%; cursor:pointer; accent-color:var(--accent); }
+.j-speed-val { font-size:10px; color:var(--text-muted); min-width:28px; text-align:right; }
+
+/* TCP jog */
+.tcp-jog-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:4px; margin-bottom:6px; }
+.tcp-jog-label { font-size:10px; color:var(--text-muted); text-align:center; font-weight:600; }
+.tcp-speed-row { display:flex; align-items:center; gap:6px; margin-bottom:6px; }
+.tcp-pose-display {
+  display:grid; grid-template-columns:repeat(6,1fr); gap:3px; margin-bottom:6px;
+}
+.pose-cell { background:var(--bg-surface); border-radius:4px; padding:3px 4px; text-align:center; }
+.pose-cell .pc-label { font-size:8px; color:var(--text-muted); }
+.pose-cell .pc-val   { font-size:10px; font-family:monospace; font-weight:600; }
+
+/* Quick actions */
+.quick-grid { display:grid; grid-template-columns:1fr 1fr; gap:4px; margin-bottom:6px; }
+.quick-btn  { padding:8px 6px; font-size:11px; border-radius:8px; border:1px solid var(--border); background:var(--bg-surface); text-align:center; font-weight:600; }
+.quick-btn:hover { background:var(--bg-hover); }
+
+/* Safety bar */
+.safety-bar {
+  background:var(--bg-surface); border-radius:8px; padding:10px 12px;
+  border:1px solid var(--border);
+}
+.safety-zone-pill {
+  text-align:center; font-size:14px; font-weight:800; letter-spacing:.06em;
+  padding:8px; border-radius:6px; margin-bottom:8px;
+  background:rgba(154,154,162,.12); color:var(--text-secondary);
+}
+.safety-zone-pill.GREEN  { background:rgba(0,168,107,.12); color:var(--zone-green); }
+.safety-zone-pill.YELLOW { background:rgba(245,158,11,.12); color:var(--zone-yellow); }
+.safety-zone-pill.RED    { background:rgba(220,38,38,.12);  color:var(--zone-red); }
+.safety-metrics { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:8px; }
+.sm-item { background:var(--bg-panel); border-radius:6px; padding:6px 8px; border:1px solid var(--border); }
+.sm-label { font-size:9px; color:var(--text-muted); font-weight:600; letter-spacing:.06em; text-transform:uppercase; }
+.sm-value { font-size:14px; font-weight:700; font-family:monospace; margin-top:2px; }
+.speed-track { width:100%; height:5px; background:var(--bg-surface); border-radius:3px; overflow:hidden; margin-top:4px; }
+#speed-fill  { height:100%; background:var(--zone-green); border-radius:3px; transition:width .4s; }
+.estop-main-btn {
+  width:100%; padding:12px; border-radius:8px; border:none;
+  background:var(--estop-red); color:#fff; font-size:14px; font-weight:800;
+  letter-spacing:.08em; transition:background .15s;
+}
+.estop-main-btn:hover { background:#991b1b; }
+.estop-main-btn.active { animation:estop-pulse 1s ease infinite; }
+
+/* ── Camera panel ─────────────────────────────────────────────────────────── */
+#p-camera .panel-body { display:flex; flex-direction:column; padding:0; }
+.cam-wrap { flex:1; position:relative; background:#000; min-height:0; overflow:hidden; }
+#cam-img { width:100%; height:100%; object-fit:contain; display:block; }
+#cam-canvas { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+#cam-offline {
+  position:absolute; inset:0; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:8px; background:#111;
+  color:var(--text-muted); font-size:13px;
+}
+#cam-offline.hidden { display:none; }
+.cam-spinner { width:30px; height:30px; border:3px solid #333; border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+.cam-controls {
+  padding:6px 10px; border-top:1px solid var(--border); display:flex; gap:6px; align-items:center;
+  flex-shrink:0;
+}
+.cam-toggle { padding:4px 10px; font-size:11px; border-radius:5px; border:1px solid var(--border); background:var(--bg-surface); }
+.cam-toggle.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+.scene-table-wrap { max-height:160px; overflow-y:auto; flex-shrink:0; border-top:1px solid var(--border); }
+.scene-table { width:100%; border-collapse:collapse; font-size:11px; }
+.scene-table th { padding:5px 8px; text-align:left; font-size:9px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--text-muted); background:var(--bg-surface); position:sticky; top:0; }
+.scene-table td { padding:4px 8px; border-bottom:1px solid var(--border); }
+.scene-table tr:hover td { background:var(--bg-hover); }
+.grasp-dot { width:6px; height:6px; border-radius:50%; background:var(--text-muted); display:inline-block; }
+.grasp-dot.yes { background:var(--zone-green); }
+
+/* ── Program builder panel ────────────────────────────────────────────────── */
+#p-program .panel-body { display:flex; flex-direction:column; padding:0; min-height:0; }
+.prog-layout { flex:1; display:grid; grid-template-columns:1fr 140px; min-height:0; overflow:hidden; }
+.prog-tree-col { overflow-y:auto; padding:8px; border-right:1px solid var(--border); }
+.prog-step {
+  display:flex; align-items:center; gap:6px; padding:8px 10px; border-radius:8px;
+  border:1px solid var(--border); margin-bottom:4px; background:var(--bg-panel);
+  cursor:grab; transition:box-shadow .15s;
+}
+.prog-step.dragging { opacity:.5; }
+.prog-step.drag-over { border-color:var(--accent); box-shadow:0 0 0 2px rgba(0,102,255,.15); }
+.prog-step.executing { background:rgba(0,102,255,.06); border-color:var(--accent); }
+.step-num { font-size:10px; color:var(--text-muted); font-weight:700; min-width:16px; }
+.step-icon { font-size:14px; }
+.step-label { flex:1; font-size:12px; font-weight:500; }
+.step-del { width:20px; height:20px; border-radius:4px; border:none; background:transparent; color:var(--text-muted); font-size:14px; display:flex; align-items:center; justify-content:center; }
+.step-del:hover { background:var(--zone-red); color:#fff; }
+.prog-empty { text-align:center; color:var(--text-muted); font-size:12px; padding:20px 0; }
+.step-library { overflow-y:auto; padding:6px; background:var(--bg-surface); }
+.lib-title { font-size:9px; font-weight:700; letter-spacing:.08em; color:var(--text-muted); text-transform:uppercase; margin-bottom:6px; padding:0 2px; }
+.lib-btn {
+  width:100%; text-align:left; padding:6px 8px; border-radius:6px; border:1px solid var(--border);
+  background:var(--bg-panel); font-size:11px; margin-bottom:3px; font-weight:500;
+}
+.lib-btn:hover { background:var(--bg-hover); border-color:var(--border-focus); }
+.prog-controls {
+  padding:8px 10px; border-top:1px solid var(--border); display:flex; gap:6px; flex-shrink:0; align-items:center;
+}
+.prog-name-input {
+  flex:1; padding:6px 8px; border-radius:6px; border:1px solid var(--border); font-size:12px;
+  background:var(--bg-surface);
+}
+.prog-name-input:focus { outline:none; border-color:var(--border-focus); }
+
+/* ── Toast / banners ──────────────────────────────────────────────────────── */
+#toast-wrap { position:fixed; bottom:20px; right:20px; display:flex; flex-direction:column; gap:6px; z-index:9999; }
+.toast {
+  padding:10px 16px; border-radius:8px; font-size:12px; font-weight:600;
+  background:#1A1A1C; color:#fff; box-shadow:var(--shadow-md);
+  animation:toast-in .2s ease;
+}
+@keyframes toast-in { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
+#disc-banner {
+  position:fixed; top:52px; left:0; right:0; z-index:500;
+  background:var(--zone-red); color:#fff; text-align:center; padding:6px;
+  font-size:12px; font-weight:700; letter-spacing:.04em; display:none;
+}
+
+/* ── Responsive ───────────────────────────────────────────────────────────── */
+@media (max-width:768px) {
+  #grid { grid-template-columns:1fr; grid-template-rows:repeat(4,50vh); height:auto; }
+  body { overflow:auto; }
+  #app { height:auto; }
+  .panel-body { max-height:50vh; }
+}
+@media (max-width:1024px) and (min-width:769px) {
+  #grid { grid-template-columns:1fr 1fr; grid-template-rows:1fr 1fr; }
+}
+</style>
+</head>
+<body>
+<div id="app">
+
+<!-- ── Header ── -->
+<header id="hdr">
+  <div class="brand">Robo<em>Ai</em></div>
+  <div class="robot-name">Cobot 01</div>
+  <div class="mode-tabs">
+    <button class="mode-tab" onclick="setMode('operator')">Operator</button>
+    <button class="mode-tab active" onclick="setMode('engineer')">Engineer</button>
+    <button class="mode-tab" onclick="setMode('admin')">Admin</button>
+  </div>
+  <div class="hdr-spacer"></div>
+  <div id="conn-indicator">
+    <div id="conn-dot" class="err"></div>
+    <span id="conn-label">Disconnected</span>
+  </div>
+  <span id="zone-badge-hdr" class="zone-badge">UNKNOWN</span>
+  <button class="hdr-estop" id="hdr-estop" onclick="cmdEstop()">⬛ E-STOP</button>
+</header>
+
+<!-- ── 4-panel grid ── -->
+<div id="grid">
+
+  <!-- ── PANEL 1: 3D Viewer ── -->
+  <section class="panel" id="p-viewer">
+    <div class="panel-hdr">
+      <span class="panel-title">3D Robot Viewer</span>
+      <span id="fps-label" style="font-size:10px;color:var(--text-muted);">— fps</span>
+    </div>
+    <div id="viewer-container" style="flex:1;position:relative;min-height:0;">
+      <canvas id="gl"></canvas>
+      <div class="viewer-overlay" id="joints-overlay">
+        <div class="ov-label">JOINTS (deg)</div>
+        <div id="ov-joints">—</div>
+      </div>
+      <div class="viewer-overlay" id="tcp-overlay">
+        <div class="ov-label">TCP POSITION</div>
+        <div id="ov-tcp">—</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── PANEL 2: Teach Pendant ── -->
+  <section class="panel" id="p-pendant">
+    <div class="panel-hdr">
+      <span class="panel-title">Teach Pendant</span>
+    </div>
+    <div class="panel-body">
+      <div class="pendant-scroll">
+
+        <!-- A: Joint jog -->
+        <div class="section-label">Joint Space</div>
+        <div id="joint-rows"></div>
+
+        <!-- B: TCP jog -->
+        <div class="section-label">Cartesian Space</div>
+        <div class="tcp-pose-display" id="tcp-display">
+          <div class="pose-cell"><div class="pc-label">X mm</div><div class="pc-val" id="tcp-x">0</div></div>
+          <div class="pose-cell"><div class="pc-label">Y mm</div><div class="pc-val" id="tcp-y">0</div></div>
+          <div class="pose-cell"><div class="pc-label">Z mm</div><div class="pc-val" id="tcp-z">0</div></div>
+          <div class="pose-cell"><div class="pc-label">Rx°</div><div class="pc-val" id="tcp-rx">0</div></div>
+          <div class="pose-cell"><div class="pc-label">Ry°</div><div class="pc-val" id="tcp-ry">0</div></div>
+          <div class="pose-cell"><div class="pc-label">Rz°</div><div class="pc-val" id="tcp-rz">0</div></div>
+        </div>
+        <div class="tcp-jog-label" style="margin-bottom:3px;font-size:10px;color:var(--text-muted);">Translation</div>
+        <div class="tcp-jog-grid">
+          <button class="jog-btn" data-axis="dx" data-dir="-1">X−</button>
+          <button class="jog-btn" data-axis="dy" data-dir="-1">Y−</button>
+          <button class="jog-btn" data-axis="dz" data-dir="-1">Z−</button>
+          <button class="jog-btn" data-axis="dx" data-dir="1">X+</button>
+          <button class="jog-btn" data-axis="dy" data-dir="1">Y+</button>
+          <button class="jog-btn" data-axis="dz" data-dir="1">Z+</button>
+        </div>
+        <div class="tcp-jog-label" style="margin:6px 0 3px;font-size:10px;color:var(--text-muted);">Rotation</div>
+        <div class="tcp-jog-grid">
+          <button class="jog-btn" data-axis="drx" data-dir="-1">Rx−</button>
+          <button class="jog-btn" data-axis="dry" data-dir="-1">Ry−</button>
+          <button class="jog-btn" data-axis="drz" data-dir="-1">Rz−</button>
+          <button class="jog-btn" data-axis="drx" data-dir="1">Rx+</button>
+          <button class="jog-btn" data-axis="dry" data-dir="1">Ry+</button>
+          <button class="jog-btn" data-axis="drz" data-dir="1">Rz+</button>
+        </div>
+        <div class="tcp-speed-row" style="margin-top:6px;">
+          <span style="font-size:10px;color:var(--text-muted);">TCP speed</span>
+          <input type="range" id="tcp-speed-slider" min="1" max="250" value="10" style="flex:1;accent-color:var(--accent);">
+          <span id="tcp-speed-val" style="font-size:11px;font-family:monospace;min-width:48px;">10 mm/s</span>
+        </div>
+
+        <!-- C: Quick actions -->
+        <div class="section-label">Quick Actions</div>
+        <div class="quick-grid">
+          <button class="quick-btn" onclick="cmdHome()">🏠 Home</button>
+          <button class="quick-btn" onclick="cmdSetPick()">📍 Set Pick</button>
+          <button class="quick-btn" onclick="cmdSetPlace()">📦 Set Place</button>
+          <button class="quick-btn" onclick="promptWaypoint()">➕ Waypoint</button>
+          <button class="quick-btn" onclick="voiceCommand()" style="grid-column:span 2;">🎤 Voice Command</button>
+        </div>
+
+        <!-- D: Safety status -->
+        <div class="section-label">Safety Status</div>
+        <div class="safety-bar">
+          <div class="safety-zone-pill" id="safety-pill">UNKNOWN</div>
+          <div class="safety-metrics">
+            <div class="sm-item">
+              <div class="sm-label">Proximity</div>
+              <div class="sm-value" id="prox-val">— m</div>
+            </div>
+            <div class="sm-item">
+              <div class="sm-label">Speed Scale</div>
+              <div class="sm-value" id="speed-val-d">0%</div>
+              <div class="speed-track"><div id="speed-fill" style="width:0%"></div></div>
+            </div>
+          </div>
+          <button class="estop-main-btn" id="estop-main" onclick="cmdEstop()">⬛ E-STOP</button>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ── PANEL 3: Camera ── -->
+  <section class="panel" id="p-camera">
+    <div class="panel-hdr">
+      <span class="panel-title">Camera Feed</span>
+      <div style="display:flex;gap:4px;">
+        <button class="cam-toggle active" id="cam-color-btn" onclick="switchCam('color')">Color</button>
+        <button class="cam-toggle" id="cam-depth-btn" onclick="switchCam('depth')">Depth</button>
+      </div>
+    </div>
+    <div class="panel-body" style="display:flex;flex-direction:column;">
+      <div class="cam-wrap" id="cam-wrap">
+        <img id="cam-img" alt="camera" src="/stream/cam0">
+        <canvas id="cam-canvas"></canvas>
+        <div id="cam-offline" class="hidden">
+          <div class="cam-spinner"></div>
+          <span>Waiting for camera…</span>
+        </div>
+      </div>
+      <div class="scene-table-wrap">
+        <table class="scene-table">
+          <thead>
+            <tr><th>Object</th><th>Class</th><th>Dist (m)</th><th>Conf</th><th>Grasp</th></tr>
+          </thead>
+          <tbody id="scene-tbody">
+            <tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:8px;">No objects detected</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── PANEL 4: Program Builder ── -->
+  <section class="panel" id="p-program">
+    <div class="panel-hdr">
+      <span class="panel-title">Program Builder</span>
+      <span id="prog-step-count" style="font-size:10px;color:var(--text-muted);">0 steps</span>
+    </div>
+    <div class="panel-body">
+      <div class="prog-layout">
+        <!-- Tree -->
+        <div class="prog-tree-col" id="prog-tree">
+          <div class="prog-empty" id="prog-empty">No steps yet — add from the library →</div>
+        </div>
+        <!-- Library -->
+        <div class="step-library">
+          <div class="lib-title">Step Library</div>
+          <button class="lib-btn" onclick="addStep('home','🏠 Move to Home')">🏠 Home</button>
+          <button class="lib-btn" onclick="addStep('pick','📍 Move to Pick')">📍 Pick</button>
+          <button class="lib-btn" onclick="addStep('place','📦 Move to Place')">📦 Place</button>
+          <button class="lib-btn" onclick="addStep('waypoint','📌 Go to Waypoint')">📌 Waypoint</button>
+          <button class="lib-btn" onclick="addStep('grip_close','✊ Gripper Close')">✊ Close</button>
+          <button class="lib-btn" onclick="addStep('grip_open','✋ Gripper Open')">✋ Open</button>
+          <button class="lib-btn" onclick="addStep('wait','⏱ Wait (1s)')">⏱ Wait</button>
+          <button class="lib-btn" onclick="addStep('loop','🔁 Loop ×3')">🔁 Loop</button>
+          <button class="lib-btn" onclick="addStep('if_detect','🔍 If Detected')">🔍 If Det.</button>
+        </div>
+      </div>
+      <div class="prog-controls">
+        <input class="prog-name-input" id="prog-name" placeholder="Program name…" value="program_1">
+        <button class="btn btn-primary btn-sm" onclick="runProgram()">▶ Run</button>
+        <button class="btn btn-sm" onclick="pauseProgram()">⏸</button>
+        <button class="btn btn-sm" onclick="stopProgram()">⏹</button>
+        <button class="btn btn-sm" onclick="saveProgram()">💾</button>
+      </div>
+    </div>
+  </section>
+
+</div><!-- #grid -->
+</div><!-- #app -->
+
+<!-- Disconnect banner -->
+<div id="disc-banner">⚠ DISCONNECTED — retrying…</div>
+
+<!-- Toast container -->
+<div id="toast-wrap"></div>
+
+<!-- Three.js from CDN -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+'use strict';
+
+// ── Constants / helpers ──────────────────────────────────────────────────────
+const api = {
+  post: (url, body={}) => fetch(url, {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+  }),
+};
+
+function toast(msg, ms=2500) {
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = msg;
+  document.getElementById('toast-wrap').appendChild(el);
+  setTimeout(() => el.remove(), ms);
+}
+
+// ── App state ────────────────────────────────────────────────────────────────
+let S = {
+  connected: false,
+  safety_zone: 'UNKNOWN',
+  speed_scale: 0,
+  estop: true,
+  human_proximity: 99,
+  task_state: 'IDLE',
+  joint_positions: [0,0,0,0,0,0],
+  joint_velocities: [0,0,0,0,0,0],
+  tcp_pose: {x:0,y:0,z:300,rx:0,ry:0,rz:0},
+  detections: [],
+  scene_objects: [],
+};
+
+// ── Mode ─────────────────────────────────────────────────────────────────────
+let currentMode = 'engineer';
+function setMode(m) {
+  currentMode = m;
+  document.querySelectorAll('.mode-tab').forEach(t =>
+    t.classList.toggle('active', t.textContent.toLowerCase() === m));
+  const grid = document.getElementById('grid');
+  grid.className = '';
+  if (m === 'operator') {
+    document.getElementById('p-viewer').style.display  = 'none';
+    document.getElementById('p-program').style.display = 'none';
+    grid.style.gridTemplateRows = '1fr';
+  } else {
+    document.getElementById('p-viewer').style.display  = '';
+    document.getElementById('p-program').style.display = '';
+    grid.style.gridTemplateRows = '';
+  }
+}
+
+// ── WebSocket ────────────────────────────────────────────────────────────────
+let ws, wsDelay = 1000, heartbeat;
+
+function wsConnect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => {
+    S.connected = true;
+    wsDelay = 1000;
+    document.getElementById('conn-dot').className   = 'ok';
+    document.getElementById('conn-label').textContent = 'Connected';
+    document.getElementById('disc-banner').style.display = 'none';
+    toast('✓ Connected', 1800);
+    heartbeat = setInterval(() => ws.send(JSON.stringify({type:'ping'})), 5000);
+  };
+
+  ws.onmessage = ({data}) => {
+    try { applyState(JSON.parse(data)); } catch(_) {}
+  };
+
+  ws.onclose = ws.onerror = () => {
+    S.connected = false;
+    clearInterval(heartbeat);
+    document.getElementById('conn-dot').className   = 'err';
+    document.getElementById('conn-label').textContent = 'Disconnected';
+    document.getElementById('disc-banner').style.display = 'block';
+    setTimeout(wsConnect, wsDelay);
+    wsDelay = Math.min(wsDelay * 1.5, 10000);
+  };
+}
+
+function applyState(d) {
+  Object.assign(S, d);
+  updateHeader();
+  updatePendant();
+  updateViewer3D();
+  updateCamera();
+  updateSceneTable();
+}
+
+// ── Header update ────────────────────────────────────────────────────────────
+function updateHeader() {
+  const z = S.safety_zone;
+  const badge = document.getElementById('zone-badge-hdr');
+  badge.textContent = z;
+  badge.className = 'zone-badge ' + z;
+
+  const estopBtns = document.querySelectorAll('.hdr-estop, #estop-main');
+  estopBtns.forEach(b => {
+    b.classList.toggle('active', S.estop);
+    b.textContent = S.estop ? '▪ STOPPED' : '⬛ E-STOP';
+  });
+}
+
+// ── Teach Pendant update ─────────────────────────────────────────────────────
+function updatePendant() {
+  const p = S.tcp_pose;
+  document.getElementById('tcp-x').textContent  = p.x.toFixed(1);
+  document.getElementById('tcp-y').textContent  = p.y.toFixed(1);
+  document.getElementById('tcp-z').textContent  = p.z.toFixed(1);
+  document.getElementById('tcp-rx').textContent = p.rx.toFixed(2);
+  document.getElementById('tcp-ry').textContent = p.ry.toFixed(2);
+  document.getElementById('tcp-rz').textContent = p.rz.toFixed(2);
+
+  // Joint values + gauges
+  S.joint_positions.forEach((rad, i) => {
+    const deg = (rad * 180 / Math.PI).toFixed(1);
+    const v = document.getElementById(`jval-${i}`);
+    if (v) v.textContent = deg + '°';
+    const arc = document.getElementById(`jarc-${i}`);
+    if (arc) {
+      const pct = ((rad + Math.PI) / (2 * Math.PI));
+      const dashArr = 80;
+      const dashOff = dashArr * (1 - pct);
+      arc.style.strokeDashoffset = dashOff;
+    }
+  });
+
+  // Safety
+  const z = S.safety_zone;
+  const pill = document.getElementById('safety-pill');
+  pill.textContent = z;
+  pill.className = 'safety-zone-pill ' + z;
+
+  const pct = Math.round(S.speed_scale * 100);
+  document.getElementById('speed-val-d').textContent = pct + '%';
+  document.getElementById('speed-fill').style.width  = pct + '%';
+
+  const proximity = S.human_proximity < 50 ? S.human_proximity.toFixed(2) + ' m' : '— m';
+  document.getElementById('prox-val').textContent = proximity;
+}
+
+// ── 3D Viewer ─────────────────────────────────────────────────────────────────
+let THREE_READY = false;
+let threeScene, threeCamera, threeRenderer;
+let robotJoints = {j:[null,null,null,null,null,null]};
+let safetyZones = [];
+let tcpSphere;
+let tcpTrailPoints = [];
+let tcpTrailLine;
+let pickMarker, placeMarker;
+let currentJointAngles = [0,0,0,0,0,0];
+let targetJointAngles  = [0,0,0,0,0,0];
+let frameCount = 0, fpsClock = 0;
+
+function initThree() {
+  if (typeof THREE === 'undefined') {
+    setTimeout(initThree, 300);
+    return;
+  }
+  THREE_READY = true;
+
+  const container = document.getElementById('viewer-container');
+  const W = container.clientWidth  || 400;
+  const H = container.clientHeight || 300;
+
+  threeRenderer = new THREE.WebGLRenderer({ canvas: document.getElementById('gl'), antialias: true });
+  threeRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  threeRenderer.setSize(W, H);
+  threeRenderer.shadowMap.enabled = true;
+  threeRenderer.setClearColor(0xF8F8FA);
+
+  threeScene  = new THREE.Scene();
+  threeCamera = new THREE.PerspectiveCamera(50, W/H, 0.01, 50);
+  threeCamera.position.set(0.9, 0.7, 0.9);
+  threeCamera.lookAt(0, 0.3, 0);
+
+  // Lights
+  threeScene.add(new THREE.AmbientLight(0xFFFFFF, 0.65));
+  const sun = new THREE.DirectionalLight(0xFFFFFF, 0.85);
+  sun.position.set(5, 10, 5);
+  sun.castShadow = true;
+  sun.shadow.mapSize.width = sun.shadow.mapSize.height = 1024;
+  threeScene.add(sun);
+  threeScene.add(new THREE.DirectionalLight(0xEEF4FF, 0.25).position.set(-3,-2,-3) && new THREE.DirectionalLight(0xEEF4FF, 0.25));
+
+  // Grid
+  const grid = new THREE.GridHelper(6, 30, 0xBBBBBB, 0xDDDDDD);
+  threeScene.add(grid);
+
+  // Safety zone rings
+  const zoneConfigs = [
+    { r:1.2, col:0x00A86B, label:'GREEN'  },
+    { r:0.6, col:0xF59E0B, label:'YELLOW' },
+    { r:0.3, col:0xDC2626, label:'RED'    },
+  ];
+  zoneConfigs.forEach(z => {
+    const geo  = new THREE.CircleGeometry(z.r, 64);
+    const mat  = new THREE.MeshBasicMaterial({ color:z.col, side:THREE.DoubleSide, transparent:true, opacity:0.06 });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.rotation.x = -Math.PI/2;
+    mesh.position.y = 0.001;
+    threeScene.add(mesh);
+
+    const rGeo  = new THREE.RingGeometry(z.r - 0.015, z.r, 64);
+    const rMat  = new THREE.MeshBasicMaterial({ color:z.col, side:THREE.DoubleSide, transparent:true, opacity:0.4 });
+    const rMesh = new THREE.Mesh(rGeo, rMat);
+    rMesh.rotation.x = -Math.PI/2;
+    rMesh.position.y = 0.002;
+    threeScene.add(rMesh);
+
+    safetyZones.push({ mesh, mat, label:z.label });
+  });
+
+  // Workspace envelope (wireframe sphere)
+  const envMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(0.85, 24, 24),
+    new THREE.MeshBasicMaterial({ color:0x0066FF, wireframe:true, transparent:true, opacity:0.04 })
+  );
+  envMesh.position.y = 0.3;
+  threeScene.add(envMesh);
+
+  // Build robot arm
+  buildRobot();
+
+  // TCP trail
+  const trailGeo = new THREE.BufferGeometry();
+  const trailBuf = new Float32Array(150);
+  trailGeo.setAttribute('position', new THREE.BufferAttribute(trailBuf, 3));
+  trailGeo.setDrawRange(0, 0);
+  tcpTrailLine = new THREE.Line(trailGeo,
+    new THREE.LineBasicMaterial({ color:0x0066FF, transparent:true, opacity:0.35 }));
+  threeScene.add(tcpTrailLine);
+
+  // Orbit controls
+  initOrbitControls(document.getElementById('gl'), threeCamera, new THREE.Vector3(0,0.3,0));
+
+  // Resize
+  const ro = new ResizeObserver(() => {
+    const W2 = container.clientWidth, H2 = container.clientHeight;
+    if (!W2 || !H2) return;
+    threeRenderer.setSize(W2, H2);
+    threeCamera.aspect = W2/H2;
+    threeCamera.updateProjectionMatrix();
+  });
+  ro.observe(container);
+
+  // Animate
+  (function animate(t) {
+    requestAnimationFrame(animate);
+
+    // Smooth joint interpolation
+    let changed = false;
+    for (let i=0;i<6;i++) {
+      const d = targetJointAngles[i] - currentJointAngles[i];
+      if (Math.abs(d) > 0.0005) { currentJointAngles[i] += d*0.25; changed = true; }
+    }
+    if (changed) applyRobotJoints(currentJointAngles);
+
+    // Zone pulse animation
+    const pulse = 0.06 + Math.sin(t*0.002)*0.02;
+    safetyZones.forEach(z => {
+      if (z.active) z.mat.opacity = 0.18 + Math.sin(t*0.003)*0.06;
+    });
+
+    // FPS
+    frameCount++;
+    if (t - fpsClock > 1000) {
+      document.getElementById('fps-label').textContent = frameCount + ' fps';
+      frameCount = 0; fpsClock = t;
+    }
+
+    threeRenderer.render(threeScene, threeCamera);
+  })(0);
+}
+
+function buildRobot() {
+  const mat = (c,shine=30) => new THREE.MeshPhongMaterial({ color:c, shininess:shine });
+  const cyl = (r,h,s=16) => new THREE.CylinderGeometry(r, r, h, s);
+
+  // Base plate
+  const base = new THREE.Mesh(cyl(0.09,0.06,32), mat(0xC8C8CC,60));
+  base.position.y = 0.03; base.castShadow = true;
+  threeScene.add(base);
+
+  // J1: base rotation (Y axis)
+  const j1 = new THREE.Object3D(); j1.position.y = 0.06; threeScene.add(j1);
+
+  // Shoulder block
+  const sh = new THREE.Mesh(new THREE.BoxGeometry(0.08,0.18,0.08), mat(0x4A4A52));
+  sh.position.y = 0.09; sh.castShadow = true; j1.add(sh);
+
+  // J2: shoulder (Z axis — lifts upper arm)
+  const j2 = new THREE.Object3D(); j2.position.y = 0.18; j1.add(j2);
+
+  // Upper arm
+  const ua = new THREE.Mesh(cyl(0.042,0.32), mat(0x6A6A72));
+  ua.position.y = 0.16; ua.castShadow = true; j2.add(ua);
+  // Joint visual sphere
+  const js2 = new THREE.Mesh(new THREE.SphereGeometry(0.05,12,12), mat(0x5A5A62));
+  j2.add(js2);
+
+  // J3: elbow (Z axis)
+  const j3 = new THREE.Object3D(); j3.position.y = 0.32; j2.add(j3);
+
+  // Forearm
+  const fa = new THREE.Mesh(cyl(0.036,0.26), mat(0x7A7A82));
+  fa.position.y = 0.13; fa.castShadow = true; j3.add(fa);
+  const js3 = new THREE.Mesh(new THREE.SphereGeometry(0.044,12,12), mat(0x6A6A72));
+  j3.add(js3);
+
+  // J4: wrist 1 (Z axis)
+  const j4 = new THREE.Object3D(); j4.position.y = 0.26; j3.add(j4);
+
+  const w1 = new THREE.Mesh(cyl(0.032,0.12), mat(0x8A8A92));
+  w1.position.y = 0.06; j4.add(w1);
+  const js4 = new THREE.Mesh(new THREE.SphereGeometry(0.038,12,12), mat(0x7A7A82));
+  j4.add(js4);
+
+  // J5: wrist 2 (Y axis)
+  const j5 = new THREE.Object3D(); j5.position.y = 0.12; j4.add(j5);
+
+  const w2 = new THREE.Mesh(cyl(0.028,0.10), mat(0x9A9AA2));
+  w2.position.y = 0.05; j5.add(w2);
+  const js5 = new THREE.Mesh(new THREE.SphereGeometry(0.034,12,12), mat(0x8A8A92));
+  j5.add(js5);
+
+  // J6: flange (Z axis)
+  const j6 = new THREE.Object3D(); j6.position.y = 0.10; j5.add(j6);
+
+  const fl = new THREE.Mesh(cyl(0.045,0.04,32), mat(0xC0C0C8,80));
+  fl.position.y = 0.02; j6.add(fl);
+
+  // TCP indicator
+  tcpSphere = new THREE.Mesh(
+    new THREE.SphereGeometry(0.016,12,12),
+    new THREE.MeshPhongMaterial({ color:0xFF3B3B, emissive:0xAA1111, shininess:60 })
+  );
+  tcpSphere.position.y = 0.055;
+  j6.add(tcpSphere);
+
+  robotJoints.j = [j1, j2, j3, j4, j5, j6];
+}
+
+// Apply joint angles (radians) to the Three.js hierarchy
+function applyRobotJoints(angles) {
+  robotJoints.j[0].rotation.y =  angles[0];
+  robotJoints.j[1].rotation.z =  angles[1];
+  robotJoints.j[2].rotation.z =  angles[2];
+  robotJoints.j[3].rotation.z =  angles[3];
+  robotJoints.j[4].rotation.y =  angles[4];
+  robotJoints.j[5].rotation.z =  angles[5];
+
+  // Update TCP trail (world position of tcpSphere)
+  const pos = new THREE.Vector3();
+  tcpSphere.getWorldPosition(pos);
+  tcpTrailPoints.push([pos.x, pos.y, pos.z]);
+  if (tcpTrailPoints.length > 50) tcpTrailPoints.shift();
+
+  const arr = tcpTrailLine.geometry.attributes.position.array;
+  tcpTrailPoints.forEach(([x,y,z], i) => { arr[i*3]=x; arr[i*3+1]=y; arr[i*3+2]=z; });
+  tcpTrailLine.geometry.attributes.position.needsUpdate = true;
+  tcpTrailLine.geometry.setDrawRange(0, tcpTrailPoints.length);
+
+  // Overlay text
+  const degs = angles.map(r => (r*180/Math.PI).toFixed(1));
+  document.getElementById('ov-joints').innerHTML =
+    degs.map((d,i) => `J${i+1}: ${d}°`).join('<br>');
+
+  const t = S.tcp_pose;
+  document.getElementById('ov-tcp').innerHTML =
+    `X: ${t.x.toFixed(1)} mm<br>Y: ${t.y.toFixed(1)} mm<br>Z: ${t.z.toFixed(1)} mm<br>` +
+    `Rx: ${t.rx.toFixed(2)}°<br>Ry: ${t.ry.toFixed(2)}°<br>Rz: ${t.rz.toFixed(2)}°`;
+}
+
+function updateViewer3D() {
+  if (!THREE_READY) return;
+
+  // Update target angles for smooth interpolation
+  const positions = S.joint_positions;
+  for (let i=0;i<6;i++) targetJointAngles[i] = positions[i] || 0;
+
+  // Safety zone highlight
+  safetyZones.forEach(z => {
+    z.active = (z.label === S.safety_zone);
+    z.mat.opacity = z.active ? 0.18 : 0.06;
+  });
+}
+
+// ── Minimal orbit controls ────────────────────────────────────────────────────
+function initOrbitControls(canvas, camera, target) {
+  let dragging=false, lastX=0, lastY=0;
+  let theta = Math.atan2(camera.position.x - target.x, camera.position.z - target.z);
+  let phi   = Math.acos(Math.min(1, (camera.position.y - target.y) / camera.position.distanceTo(target)));
+  let radius = camera.position.distanceTo(target);
+
+  function update() {
+    phi = Math.max(0.05, Math.min(Math.PI*0.48, phi));
+    camera.position.x = target.x + radius * Math.sin(phi) * Math.sin(theta);
+    camera.position.y = target.y + radius * Math.cos(phi);
+    camera.position.z = target.z + radius * Math.sin(phi) * Math.cos(theta);
+    camera.lookAt(target);
+  }
+
+  canvas.addEventListener('mousedown',  e => { dragging=true; lastX=e.clientX; lastY=e.clientY; });
+  canvas.addEventListener('touchstart', e => { dragging=true; lastX=e.touches[0].clientX; lastY=e.touches[0].clientY; }, {passive:true});
+  document.addEventListener('mouseup',   () => dragging=false);
+  document.addEventListener('touchend',  () => dragging=false);
+
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    theta -= (e.clientX-lastX)*0.005;
+    phi   += (e.clientY-lastY)*0.005;
+    lastX=e.clientX; lastY=e.clientY;
+    update();
+  });
+  document.addEventListener('touchmove', e => {
+    if (!dragging) return;
+    theta -= (e.touches[0].clientX-lastX)*0.006;
+    phi   += (e.touches[0].clientY-lastY)*0.006;
+    lastX=e.touches[0].clientX; lastY=e.touches[0].clientY;
+    update();
+  }, {passive:true});
+
+  canvas.addEventListener('wheel', e => {
+    radius = Math.max(0.5, Math.min(4, radius + e.deltaY*0.003));
+    update();
+    e.preventDefault();
+  }, {passive:false});
+
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  update();
+}
+
+// ── Camera feed ────────────────────────────────────────────────────────────────
+let camConnected = false;
+let camRetry = null;
+let camCanvas, camCtx;
+let camMode = 'color';
+
+function initCamera() {
+  const img    = document.getElementById('cam-img');
+  const offline = document.getElementById('cam-offline');
+  camCanvas    = document.getElementById('cam-canvas');
+  camCtx       = camCanvas.getContext('2d');
+
+  img.onload = () => {
+    camConnected = true;
+    offline.classList.add('hidden');
+    if (camRetry) { clearTimeout(camRetry); camRetry=null; }
+    // Sync canvas size
+    camCanvas.width  = img.naturalWidth  || img.clientWidth;
+    camCanvas.height = img.naturalHeight || img.clientHeight;
+  };
+  img.onerror = () => {
+    camConnected = false;
+    offline.classList.remove('hidden');
+    camRetry = setTimeout(() => {
+      img.src = (camMode==='color' ? '/stream/cam0' : '/stream/cam0_depth') + '?t=' + Date.now();
+    }, 2000);
+  };
+  img.src = '/stream/cam0';
+}
+
+function switchCam(mode) {
+  camMode = mode;
+  document.getElementById('cam-color-btn').classList.toggle('active', mode==='color');
+  document.getElementById('cam-depth-btn').classList.toggle('active', mode==='depth');
+  const img = document.getElementById('cam-img');
+  img.src = (mode==='color' ? '/stream/cam0' : '/stream/cam0_depth') + '?t='+Date.now();
+}
+
+function updateCamera() {
+  if (!camCtx) return;
+  const img = document.getElementById('cam-img');
+  const W = img.clientWidth, H = img.clientHeight;
+  if (!W || !H) return;
+  camCanvas.width = W; camCanvas.height = H;
+  camCtx.clearRect(0,0,W,H);
+
+  S.detections.forEach(det => {
+    const bb = det.bbox || det.box;
+    if (!bb) return;
+    const [bx,by,bw,bh] = bb;
+    const sx = W / (det.img_width  || 640);
+    const sy = H / (det.img_height || 480);
+    const x=bx*sx, y=by*sy, w=bw*sx, h=bh*sy;
+
+    camCtx.strokeStyle = '#0066FF'; camCtx.lineWidth=2;
+    camCtx.strokeRect(x,y,w,h);
+
+    const label = `${det.class||det.label||'?'} ${Math.round((det.confidence||det.conf||0)*100)}%`;
+    camCtx.fillStyle='rgba(0,102,255,0.82)';
+    camCtx.fillRect(x, y-18, Math.min(label.length*7+8, 160), 18);
+    camCtx.fillStyle='#fff'; camCtx.font='bold 11px system-ui';
+    camCtx.fillText(label, x+4, y-5);
+  });
+}
+
+function updateSceneTable() {
+  const tbody = document.getElementById('scene-tbody');
+  if (!S.scene_objects || !S.scene_objects.length) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:8px;">No objects detected</td></tr>';
+    return;
+  }
+  tbody.innerHTML = S.scene_objects.slice(0,12).map(o => `
+    <tr>
+      <td>${escHtml(o.id||o.name||'?')}</td>
+      <td>${escHtml(o.class||o.label||'?')}</td>
+      <td>${(o.distance||o.dist||0).toFixed(2)}</td>
+      <td>${Math.round((o.confidence||o.conf||0)*100)}%</td>
+      <td><span class="grasp-dot ${o.graspable?'yes':''}"></span></td>
+    </tr>`).join('');
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Teach Pendant — Joint Jog ─────────────────────────────────────────────────
+let jogIntervalId = null;
+let tcpJogIntervalId = null;
+let tcpJogSpeed = 10;
+
+function buildJointRows() {
+  const container = document.getElementById('joint-rows');
+  [0,1,2,3,4,5].forEach(i => {
+    const row = document.createElement('div');
+    row.className = 'joint-row';
+    row.innerHTML = `
+      <span class="j-label">J${i+1}</span>
+      <div class="j-gauge-wrap">
+        <svg viewBox="0 0 32 32">
+          <circle cx="16" cy="16" r="12" fill="none" stroke="#E8E8EA" stroke-width="3"/>
+          <circle id="jarc-${i}" cx="16" cy="16" r="12" fill="none" stroke="var(--accent)"
+            stroke-width="3" stroke-dasharray="75" stroke-dashoffset="37.5"
+            stroke-linecap="round" transform="rotate(-90 16 16)"/>
+        </svg>
+      </div>
+      <button class="jog-btn" data-joint="${i}" data-dir="-1">−</button>
+      <span class="j-value" id="jval-${i}">0.0°</span>
+      <button class="jog-btn" data-joint="${i}" data-dir="1">+</button>
+      <div class="j-speed-wrap">
+        <input type="range" class="j-speed" id="jspd-${i}" min="1" max="100" value="10">
+        <span class="j-speed-val" id="jspd-val-${i}">10%</span>
+      </div>`;
+    container.appendChild(row);
+
+    document.getElementById(`jspd-${i}`).addEventListener('input', function() {
+      document.getElementById(`jspd-val-${i}`).textContent = this.value + '%';
+    });
+  });
+
+  // Attach hold-to-jog events to all jog buttons
+  document.querySelectorAll('[data-joint]').forEach(btn => {
+    const start = () => {
+      const joint = +btn.dataset.joint, dir = +btn.dataset.dir;
+      const speed = (+document.getElementById(`jspd-${joint}`).value) / 100;
+      clearInterval(jogIntervalId);
+      api.post('/cmd/jog', {joint, direction:dir, speed});
+      jogIntervalId = setInterval(() => api.post('/cmd/jog', {joint, direction:dir, speed}), 100);
+    };
+    const stop  = () => clearInterval(jogIntervalId);
+    btn.addEventListener('mousedown',  start);
+    btn.addEventListener('mouseup',    stop);
+    btn.addEventListener('mouseleave', stop);
+    btn.addEventListener('touchstart', e => { e.preventDefault(); start(); }, {passive:false});
+    btn.addEventListener('touchend',   stop);
+  });
+}
+
+// TCP jog hold behaviour
+function buildTCPJog() {
+  document.getElementById('tcp-speed-slider').addEventListener('input', function() {
+    tcpJogSpeed = +this.value;
+    document.getElementById('tcp-speed-val').textContent = this.value + ' mm/s';
+  });
+
+  document.querySelectorAll('[data-axis]').forEach(btn => {
+    const start = () => {
+      const axis = btn.dataset.axis, dir = +btn.dataset.dir;
+      const delta = {};
+      // Rotation axes in degrees, translation in mm
+      if (axis.startsWith('dr')) { delta[axis] = dir * 2; }
+      else { delta[axis] = dir * tcpJogSpeed * 0.1; }
+      clearInterval(tcpJogIntervalId);
+      api.post('/cmd/move_tcp', delta);
+      tcpJogIntervalId = setInterval(() => api.post('/cmd/move_tcp', delta), 100);
+    };
+    const stop = () => clearInterval(tcpJogIntervalId);
+    btn.addEventListener('mousedown',  start);
+    btn.addEventListener('mouseup',    stop);
+    btn.addEventListener('mouseleave', stop);
+    btn.addEventListener('touchstart', e => { e.preventDefault(); start(); }, {passive:false});
+    btn.addEventListener('touchend',   stop);
+  });
+}
+
+// ── Quick actions ────────────────────────────────────────────────────────────
+async function cmdEstop() {
+  if (S.estop) {
+    await api.post('/cmd/resume');
+    toast('✓ E-Stop cleared');
+  } else {
+    await api.post('/cmd/estop');
+    toast('⚠ E-Stop triggered');
+  }
+}
+
+async function cmdHome()      { await api.post('/cmd/home'); toast('→ Moving to home'); }
+async function cmdSetPick()   { const r=await (await api.post('/cmd/set_pick')).json(); toast(`📍 Pick set: ${r.pick?.z?.toFixed(0)}mm`); }
+async function cmdSetPlace()  { const r=await (await api.post('/cmd/set_place')).json(); toast(`📦 Place set: ${r.place?.z?.toFixed(0)}mm`); }
+
+function promptWaypoint() {
+  const name = prompt('Waypoint name:');
+  if (!name) return;
+  api.post('/cmd/add_waypoint', {name}).then(() => toast(`📌 Waypoint "${name}" saved`));
+}
+
+async function voiceCommand() {
+  if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) {
+    const text = prompt('Voice command:');
+    if (text) { await api.post('/cmd/voice', {text}); toast(`🎤 "${text}"`); }
+    return;
+  }
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const sr = new SR();
+  sr.onresult = async e => {
+    const text = e.results[0][0].transcript;
+    await api.post('/cmd/voice', {text});
+    toast(`🎤 "${text}"`);
+  };
+  sr.start();
+}
+
+// ── Program Builder ───────────────────────────────────────────────────────────
+let programSteps = [];
+let executingStep = -1;
+let dragSrcIdx = -1;
+
+const STEP_DEFAULTS = {
+  home:       { icon:'🏠', label:'Move to Home' },
+  pick:       { icon:'📍', label:'Move to Pick' },
+  place:      { icon:'📦', label:'Move to Place' },
+  waypoint:   { icon:'📌', label:'Go to Waypoint' },
+  grip_close: { icon:'✊', label:'Gripper Close' },
+  grip_open:  { icon:'✋', label:'Gripper Open' },
+  wait:       { icon:'⏱', label:'Wait (1s)', params:{seconds:1} },
+  loop:       { icon:'🔁', label:'Loop ×3', params:{count:3} },
+  if_detect:  { icon:'🔍', label:'If Object Detected', params:{class:'person'} },
+};
+
+function addStep(type, labelOverride) {
+  const def = STEP_DEFAULTS[type] || {icon:'❓', label:type};
+  programSteps.push({ type, icon:def.icon, label:labelOverride||def.label, params:def.params||{} });
+  renderProgramTree();
+}
+
+function renderProgramTree() {
+  const tree = document.getElementById('prog-tree');
+  const empty = document.getElementById('prog-empty');
+  document.getElementById('prog-step-count').textContent = programSteps.length + ' step' + (programSteps.length===1?'':'s');
+
+  if (!programSteps.length) {
+    tree.innerHTML = '';
+    tree.appendChild(empty);
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+
+  // Keep drag-drop listeners by rebuilding DOM
+  const html = programSteps.map((s,i) => `
+    <div class="prog-step ${i===executingStep?'executing':''}"
+         draggable="true" data-idx="${i}">
+      <span class="step-num">${i+1}</span>
+      <span class="step-icon">${s.icon}</span>
+      <span class="step-label">${escHtml(s.label)}</span>
+      <button class="step-del" onclick="removeStep(${i})" title="Remove">×</button>
+    </div>`).join('');
+
+  tree.innerHTML = html + (empty.outerHTML || '');
+  document.getElementById('prog-empty').style.display = 'none';
+
+  // Drag-and-drop reorder
+  tree.querySelectorAll('.prog-step').forEach(el => {
+    el.addEventListener('dragstart', e => {
+      dragSrcIdx = +el.dataset.idx;
+      el.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    el.addEventListener('dragend', () => el.classList.remove('dragging'));
+    el.addEventListener('dragover', e => {
+      e.preventDefault();
+      el.classList.add('drag-over');
+    });
+    el.addEventListener('dragleave', () => el.classList.remove('drag-over'));
+    el.addEventListener('drop', e => {
+      e.preventDefault();
+      el.classList.remove('drag-over');
+      const dst = +el.dataset.idx;
+      if (dragSrcIdx !== dst) {
+        const moved = programSteps.splice(dragSrcIdx, 1)[0];
+        programSteps.splice(dst, 0, moved);
+        renderProgramTree();
+      }
+    });
+  });
+}
+
+function removeStep(idx) {
+  programSteps.splice(idx, 1);
+  renderProgramTree();
+}
+
+async function runProgram() {
+  if (!programSteps.length) { toast('Add steps first'); return; }
+  await api.post('/cmd/run_program', {program: programSteps});
+  toast('▶ Program running…');
+  // Animate step highlights
+  executingStep = 0;
+  renderProgramTree();
+  const interval = setInterval(() => {
+    executingStep++;
+    if (executingStep >= programSteps.length) { executingStep=-1; clearInterval(interval); }
+    renderProgramTree();
+  }, 1200);
+}
+
+async function pauseProgram() { await api.post('/cmd/task', {command:'PAUSE'}); toast('⏸ Paused'); }
+async function stopProgram()  { await api.post('/cmd/task', {command:'STOP'}); executingStep=-1; renderProgramTree(); toast('⏹ Stopped'); }
+
+async function saveProgram() {
+  const name = document.getElementById('prog-name').value.trim() || 'program_1';
+  await api.post('/cmd/save_program', {name, program:programSteps});
+  toast(`💾 Saved "${name}"`);
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  buildJointRows();
+  buildTCPJog();
+  initCamera();
+  renderProgramTree();
+  wsConnect();
+  // Defer Three.js until layout is ready
+  setTimeout(initThree, 100);
+});
+</script>
+</body>
+</html>
