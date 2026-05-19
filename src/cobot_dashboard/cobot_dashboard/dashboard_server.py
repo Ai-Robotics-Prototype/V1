@@ -31,6 +31,25 @@ try:
 except ImportError:
     _CV2 = False
 
+# ── Grey placeholder JPEG (shown when no camera frame is available) ────────────
+_GREY_FRAME: bytes = b''
+
+def _init_grey_frame() -> None:
+    global _GREY_FRAME
+    if not _CV2:
+        return
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+    img[:] = 45
+    cv2.putText(img, 'No Camera Signal', (162, 225),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (130, 130, 130), 2)
+    cv2.putText(img, '/cam0/color/image_raw', (192, 268),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (90, 90, 90), 1)
+    ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 60])
+    if ok:
+        _GREY_FRAME = bytes(buf)
+
+_init_grey_frame()
+
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
     from fastapi.requests import Request
@@ -408,15 +427,28 @@ if _FASTAPI:
         async def _gen():
             try:
                 while True:
-                    with _frame_lock: frame = _latest_frame
+                    with _frame_lock:
+                        frame = _latest_frame or _GREY_FRAME
                     if frame:
-                        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                               + frame + b'\r\n')
+                        part = (b'--frame\r\n'
+                                b'Content-Type: image/jpeg\r\n'
+                                b'Content-Length: ' + str(len(frame)).encode() + b'\r\n'
+                                b'\r\n'
+                                + frame + b'\r\n')
+                        yield part
                     await asyncio.sleep(0.067)
-            except GeneratorExit: pass
-        return StreamingResponse(_gen(),
+            except GeneratorExit:
+                pass
+        return StreamingResponse(
+            _gen(),
             media_type='multipart/x-mixed-replace; boundary=frame',
-            headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no','Connection':'keep-alive'})
+            headers={
+                'Cache-Control': 'no-cache, no-store',
+                'X-Accel-Buffering': 'no',
+                'Connection': 'keep-alive',
+                'Pragma': 'no-cache',
+            }
+        )
 
     # ── E-stop / resume ────────────────────────────────────────────────────
     @app.post('/cmd/estop')

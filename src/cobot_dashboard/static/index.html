@@ -97,7 +97,7 @@ input,select,textarea{font-family:inherit;font-size:inherit}
 .vov{position:absolute;background:rgba(255,255,255,.88);backdrop-filter:blur(6px);
   border-radius:6px;padding:6px 9px;font-size:10px;font-family:monospace;
   color:var(--t1);border:1px solid var(--bd);pointer-events:none;line-height:1.65;
-  max-width:160px}
+  max-width:160px;z-index:1}
 #jov{bottom:8px;left:8px}
 #tov{bottom:8px;right:8px}
 #fov{top:8px;right:8px;font-size:10px;line-height:1.4}
@@ -429,6 +429,10 @@ tr:hover td{background:var(--hover)}
   <section class="panel" id="p-camera">
     <div class="ph">
       <span class="pt">Camera Feed</span>
+      <span style="display:flex;align-items:center;gap:4px;font-size:10px;color:var(--tm);margin-right:4px">
+        <span id="cam-live-dot" style="width:7px;height:7px;border-radius:50%;background:var(--tm);display:inline-block;transition:all .4s"></span>
+        <span id="cam-live-lbl">Offline</span>
+      </span>
       <div style="display:flex;gap:4px">
         <button class="ctog active" id="camColor" onclick="switchCam('color')">Color</button>
         <button class="ctog" id="camDepth" onclick="switchCam('depth')">Depth</button>
@@ -522,10 +526,13 @@ tr:hover td{background:var(--hover)}
 <div id="toast-wrap"></div>
 
 <!-- Three.js + OrbitControls from CDN -->
+<script>window._threeLoaded = false; window._orbitLoaded = false;</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"
-  onerror="console.error('Three.js CDN failed')"></script>
+  onload="window._threeLoaded = true;"
+  onerror="(function(){var c=document.getElementById('viewer-container');if(c)c.innerHTML='<div style=\'padding:24px;color:#999;font-size:12px;text-align:center;margin-top:30px\'>⚠ 3D viewer unavailable<br><small>Three.js could not be loaded — check network</small></div>';console.error('Three.js CDN failed');})()"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"
-  onerror="console.error('OrbitControls CDN failed')"></script>
+  onload="window._orbitLoaded = true;"
+  onerror="console.warn('OrbitControls CDN failed, using fallback orbit')"></script>
 
 <script>
 'use strict';
@@ -659,11 +666,22 @@ let trailLine, trailPts=[], trailBuf;
 let pickMarker3D=null, placeMarker3D=null;
 let curAngles=[0,0,0,0,0,0], tgtAngles=[0,0,0,0,0,0];
 let fpsFrames=0, fpsClock=0;
+let _threeRetries = 0;
 
 function initThree() {
-  if (typeof THREE === 'undefined') { setTimeout(initThree, 200); return; }
-
   const container = document.getElementById('viewer-container');
+  if (!window._threeLoaded || typeof THREE === 'undefined') {
+    _threeRetries++;
+    if (_threeRetries > 25) {
+      if (container && !container.querySelector('canvas')) {
+        container.innerHTML = '<div style="padding:24px;color:#999;font-size:12px;text-align:center;margin-top:30px">⚠ 3D viewer unavailable<br><small>Three.js could not be loaded</small></div>';
+      }
+      return;
+    }
+    setTimeout(initThree, 200);
+    return;
+  }
+
   const W = container.offsetWidth;
   const H = container.offsetHeight;
   if (W < 50 || H < 50) { setTimeout(initThree, 100); return; }
@@ -684,6 +702,7 @@ function initThree() {
   // ── Camera ──
   camera = new THREE.PerspectiveCamera(50, W/H, 0.01, 100);
   camera.position.set(0.8, 0.6, 0.8);
+  camera.lookAt(0, 0.3, 0);
 
   // ── Lights ──
   scene.add(new THREE.AmbientLight(0xFFFFFF, 0.7));
@@ -1156,17 +1175,43 @@ async function voiceCommand() {
 let camMode='color', detEnabled=true, camRetry=null;
 let contCtx, detCtx;
 
+function setLiveDot(live) {
+  const dot = document.getElementById('cam-live-dot');
+  const lbl = document.getElementById('cam-live-lbl');
+  if (dot) {
+    dot.style.background   = live ? 'var(--g)' : 'var(--tm)';
+    dot.style.boxShadow    = live ? '0 0 5px var(--g)' : 'none';
+  }
+  if (lbl) lbl.textContent = live ? 'LIVE' : 'Offline';
+}
+
 function initCamera() {
   const img = document.getElementById('camImg');
   const off = document.getElementById('cam-offline');
   contCtx = document.getElementById('cCont').getContext('2d');
   detCtx  = document.getElementById('cDets').getContext('2d');
+  let lastLoad = 0;
 
-  img.onload = () => { off.classList.add('h'); if(camRetry){clearTimeout(camRetry);camRetry=null;} };
+  img.onload = () => {
+    lastLoad = Date.now();
+    off.classList.add('h');
+    if (camRetry) { clearTimeout(camRetry); camRetry = null; }
+    setLiveDot(true);
+  };
   img.onerror = () => {
     off.classList.remove('h');
-    camRetry = setTimeout(()=>{ img.src='/stream/cam0?t='+Date.now(); },2000);
+    setLiveDot(false);
+    camRetry = setTimeout(() => { img.src = '/stream/cam0?t=' + Date.now(); }, 2000);
   };
+
+  // Reconnect if stream stalls (no new onload in 3s)
+  setInterval(() => {
+    if (lastLoad > 0 && Date.now() - lastLoad > 3000) {
+      setLiveDot(false);
+      img.src = '/stream/cam0?t=' + Date.now();
+    }
+  }, 2500);
+
   img.src = '/stream/cam0';
 }
 
@@ -1299,13 +1344,12 @@ function addStep(type) {
 
 function renderTree() {
   const tree  = document.getElementById('progTree');
-  const empty = document.getElementById('progEmpty');
   document.getElementById('stepCount').textContent = programSteps.length+' step'+(programSteps.length===1?'':'s');
 
   if (!programSteps.length) {
-    tree.innerHTML=''; tree.appendChild(empty); empty.style.display=''; return;
+    tree.innerHTML = '<div class="prog-empty">← Add steps from the library</div>';
+    return;
   }
-  empty.style.display='none';
 
   tree.innerHTML = programSteps.map((s,i) => {
     let extraHTML = '';
