@@ -2,309 +2,306 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>RoboAi Controller — Cobot 01</title>
 <style>
-/* ── Design system ────────────────────────────────────────────────────────── */
+/* ── Design system ────────────────────────────────────────────────────── */
 :root {
-  --bg-app:        #F5F5F7;
-  --bg-panel:      #FFFFFF;
-  --bg-surface:    #F0F0F2;
-  --bg-hover:      #E8E8EA;
-  --border:        rgba(0,0,0,.10);
-  --border-focus:  rgba(0,0,0,.25);
-  --text-primary:  #1A1A1C;
-  --text-secondary:#5A5A62;
-  --text-muted:    #9A9AA2;
-  --accent:        #0066FF;
-  --zone-green:    #00A86B;
-  --zone-yellow:   #F59E0B;
-  --zone-red:      #DC2626;
-  --estop-red:     #B91C1C;
-  --shadow-sm:     0 1px 3px rgba(0,0,0,.08);
-  --shadow-md:     0 4px 12px rgba(0,0,0,.10);
-  --r-panel:       10px;
-  --r-btn:         8px;
-  --r-input:       6px;
+  --bg:        #F5F5F7;  --panel:     #FFFFFF;  --surf:   #F0F0F2;
+  --hover:     #E8E8EA;  --bd:        rgba(0,0,0,.10);
+  --bdf:       rgba(0,0,0,.25);
+  --t1:        #1A1A1C;  --t2:        #5A5A62;  --tm:     #9A9AA2;
+  --acc:       #0066FF;
+  --g:         #00A86B;  --y:         #F59E0B;  --r:      #DC2626;
+  --er:        #B91C1C;
+  --sh1:       0 1px 3px rgba(0,0,0,.08);
+  --sh2:       0 4px 12px rgba(0,0,0,.10);
 }
-*, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
-body {
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
-  background: var(--bg-app);
-  color: var(--text-primary);
-  height: 100vh;
-  overflow: hidden;
-  font-size: 13px;
-}
-button { cursor:pointer; font-family:inherit; }
-input, select { font-family:inherit; }
-::-webkit-scrollbar { width:4px; height:4px; }
-::-webkit-scrollbar-track { background:transparent; }
-::-webkit-scrollbar-thumb { background:rgba(0,0,0,.15); border-radius:2px; }
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",sans-serif;
+  background:var(--bg);color:var(--t1);height:100vh;overflow:hidden;font-size:13px}
+button{cursor:pointer;font-family:inherit;font-size:inherit}
+input,select,textarea{font-family:inherit;font-size:inherit}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(0,0,0,.15);border-radius:2px}
 
-/* ── App shell ────────────────────────────────────────────────────────────── */
-#app { display:grid; grid-template-rows:52px 1fr; height:100vh; }
+/* ── App layout ───────────────────────────────────────────────────────── */
+#app{display:grid;grid-template-rows:52px 1fr;height:100vh}
 
-/* ── Header ───────────────────────────────────────────────────────────────── */
-#hdr {
-  background:var(--bg-panel);
-  border-bottom:1px solid var(--border);
-  box-shadow:var(--shadow-sm);
-  display:flex; align-items:center; gap:10px; padding:0 14px;
-  z-index:200; position:relative;
-}
-.brand { font-size:16px; font-weight:800; color:var(--text-primary); letter-spacing:-.5px; }
-.brand em { color:var(--accent); font-style:normal; }
-.robot-name { font-size:12px; color:var(--text-muted); font-weight:500; padding-left:4px; border-left:1px solid var(--border); margin-left:2px; }
-.mode-tabs { display:flex; background:var(--bg-surface); border-radius:7px; padding:2px; margin-left:8px; }
-.mode-tab {
-  padding:4px 12px; border-radius:5px; border:none; background:transparent;
-  font-size:11px; font-weight:600; color:var(--text-muted); transition:all .15s;
-}
-.mode-tab.active { background:var(--bg-panel); color:var(--text-primary); box-shadow:var(--shadow-sm); }
-.hdr-spacer { flex:1; }
-#conn-indicator { display:flex; align-items:center; gap:5px; }
-#conn-dot { width:7px; height:7px; border-radius:50%; background:var(--text-muted); }
-#conn-dot.ok  { background:var(--zone-green); box-shadow:0 0 5px var(--zone-green); }
-#conn-dot.err { background:var(--zone-red); }
-#conn-label { font-size:11px; color:var(--text-muted); font-weight:500; }
-.zone-badge {
-  padding:3px 10px; border-radius:20px; font-size:11px; font-weight:700;
-  letter-spacing:.05em; background:var(--bg-surface); color:var(--text-muted);
-}
-.zone-badge.GREEN  { background:rgba(0,168,107,.12); color:var(--zone-green); }
-.zone-badge.YELLOW { background:rgba(245,158,11,.12); color:var(--zone-yellow); }
-.zone-badge.RED    { background:rgba(220,38,38,.12);  color:var(--zone-red); }
-.hdr-estop {
-  padding:7px 16px; border-radius:7px; border:2px solid var(--estop-red);
-  background:var(--estop-red); color:#fff; font-size:12px; font-weight:800;
-  letter-spacing:.06em; transition:all .15s;
-}
-.hdr-estop:hover { background:#991b1b; border-color:#991b1b; }
-.hdr-estop.active { animation:estop-pulse 1s ease infinite; }
-@keyframes estop-pulse {
-  0%,100% { box-shadow:0 0 0 0 rgba(185,28,28,.5); }
-  50%      { box-shadow:0 0 0 8px rgba(185,28,28,0); }
-}
+/* ── Header ───────────────────────────────────────────────────────────── */
+#hdr{background:var(--panel);border-bottom:1px solid var(--bd);box-shadow:var(--sh1);
+  display:flex;align-items:center;gap:8px;padding:0 12px;z-index:200;position:relative;
+  flex-shrink:0}
+.brand{font-size:16px;font-weight:800;letter-spacing:-.4px}
+.brand em{color:var(--acc);font-style:normal}
+.robot-nm{font-size:11px;color:var(--tm);border-left:1px solid var(--bd);
+  padding-left:8px;margin-left:2px}
+.mode-tabs{display:flex;background:var(--surf);border-radius:7px;padding:2px;margin-left:6px}
+.mtab{padding:4px 11px;border-radius:5px;border:none;background:transparent;
+  font-size:11px;font-weight:600;color:var(--tm);transition:all .15s}
+.mtab.active{background:var(--panel);color:var(--t1);box-shadow:var(--sh1)}
+.hdr-sp{flex:1}
+.hdr-btn{padding:5px 11px;border-radius:7px;border:1px solid var(--bd);background:var(--surf);
+  font-size:11px;font-weight:600;color:var(--t2);transition:background .12s}
+.hdr-btn:hover{background:var(--hover)}
+.conn-wrap{display:flex;align-items:center;gap:5px}
+#cDot{width:7px;height:7px;border-radius:50%;background:var(--tm);transition:all .3s}
+#cDot.ok{background:var(--g);box-shadow:0 0 5px var(--g)}
+#cDot.err{background:var(--r)}
+#cLbl{font-size:11px;color:var(--tm);font-weight:500}
+.zbadge{padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.05em;
+  background:var(--surf);color:var(--tm);transition:all .3s}
+.zbadge.GREEN {background:rgba(0,168,107,.12);color:var(--g)}
+.zbadge.YELLOW{background:rgba(245,158,11,.12);color:var(--y)}
+.zbadge.RED   {background:rgba(220,38,38,.12);color:var(--r)}
+.estop-hdr{padding:7px 14px;border-radius:7px;border:2px solid var(--er);
+  background:var(--er);color:#fff;font-size:12px;font-weight:800;letter-spacing:.06em;
+  transition:all .15s}
+.estop-hdr:hover{background:#991b1b;border-color:#991b1b}
+.estop-hdr.active{animation:ep 1s ease infinite}
+@keyframes ep{0%,100%{box-shadow:0 0 0 0 rgba(185,28,28,.5)}50%{box-shadow:0 0 0 8px rgba(185,28,28,0)}}
 
-/* ── Main grid ────────────────────────────────────────────────────────────── */
-#grid {
-  display:grid;
-  grid-template-columns:1fr 1fr;
-  grid-template-rows:1fr 1fr;
-  gap:8px; padding:8px;
-  min-height:0;
-}
-/* Mode variants */
-.mode-operator #p-viewer,
-.mode-operator #p-program { display:none; }
-.mode-operator #grid {
-  grid-template-columns:1fr 1fr;
-  grid-template-rows:1fr;
-}
+/* ── Grid ─────────────────────────────────────────────────────────────── */
+#grid{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;
+  gap:8px;padding:8px;min-height:0}
 
-/* ── Panel shell ──────────────────────────────────────────────────────────── */
-.panel {
-  background:var(--bg-panel);
-  border-radius:var(--r-panel);
-  box-shadow:var(--shadow-sm);
-  border:1px solid var(--border);
-  display:flex; flex-direction:column;
-  min-height:0; overflow:hidden;
-}
-.panel-hdr {
-  padding:9px 13px;
-  border-bottom:1px solid var(--border);
-  display:flex; align-items:center; justify-content:space-between;
-  flex-shrink:0;
-}
-.panel-title { font-size:10px; font-weight:700; letter-spacing:.09em; text-transform:uppercase; color:var(--text-secondary); }
-.panel-body  { flex:1; overflow:auto; min-height:0; }
+/* ── Panel ─────────────────────────────────────────────────────────────── */
+.panel{background:var(--panel);border-radius:10px;box-shadow:var(--sh1);
+  border:1px solid var(--bd);display:flex;flex-direction:column;
+  min-height:0;overflow:hidden}
+.ph{padding:9px 13px;border-bottom:1px solid var(--bd);display:flex;
+  align-items:center;justify-content:space-between;flex-shrink:0}
+.pt{font-size:10px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--t2)}
+.pb{flex:1;overflow:auto;min-height:0}
 
-/* ── Buttons ──────────────────────────────────────────────────────────────── */
-.btn {
-  padding:7px 14px; border-radius:var(--r-btn); border:1px solid var(--border);
-  background:var(--bg-surface); color:var(--text-primary); font-size:12px; font-weight:600;
-  transition:background .12s; user-select:none;
-}
-.btn:hover:not(:disabled) { background:var(--bg-hover); }
-.btn:active:not(:disabled) { transform:scale(.97); }
-.btn:disabled { opacity:.4; cursor:not-allowed; }
-.btn-primary { background:var(--accent); color:#fff; border-color:var(--accent); }
-.btn-primary:hover:not(:disabled) { background:#0055dd; }
-.btn-danger  { background:var(--zone-red); color:#fff; border-color:var(--zone-red); }
-.btn-sm { padding:5px 10px; font-size:11px; border-radius:6px; }
-.jog-btn {
-  width:38px; height:38px; border-radius:8px; border:1px solid var(--border);
-  background:var(--bg-surface); color:var(--text-primary); font-size:17px; font-weight:700;
-  display:flex; align-items:center; justify-content:center;
-  user-select:none; -webkit-user-select:none; flex-shrink:0;
-}
-.jog-btn:active { background:var(--accent); color:#fff; border-color:var(--accent); }
+/* ── Buttons ──────────────────────────────────────────────────────────── */
+.btn{padding:6px 12px;border-radius:8px;border:1px solid var(--bd);background:var(--surf);
+  color:var(--t1);font-weight:600;transition:background .12s;user-select:none}
+.btn:hover:not(:disabled){background:var(--hover)}
+.btn:active:not(:disabled){transform:scale(.97)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-p{background:var(--acc);color:#fff;border-color:var(--acc)}
+.btn-p:hover:not(:disabled){background:#0055dd}
+.btn-d{background:var(--r);color:#fff;border-color:var(--r)}
+.btn-sm{padding:4px 9px;font-size:11px;border-radius:6px}
+.btn-xs{padding:3px 7px;font-size:10px;border-radius:5px}
+.jbtn{width:36px;height:36px;border-radius:7px;border:1px solid var(--bd);
+  background:var(--surf);color:var(--t1);font-size:16px;font-weight:700;
+  display:flex;align-items:center;justify-content:center;user-select:none;
+  -webkit-user-select:none;flex-shrink:0;transition:all .1s}
+.jbtn:active{background:var(--acc);color:#fff;border-color:var(--acc)}
 
-/* ── 3D Viewer panel ──────────────────────────────────────────────────────── */
-#p-viewer { position:relative; }
-#viewer-container { flex:1; position:relative; min-height:0; overflow:hidden; }
-#gl { width:100%; height:100%; display:block; }
-.viewer-overlay {
-  position:absolute; background:rgba(255,255,255,.85); backdrop-filter:blur(6px);
-  border-radius:6px; padding:6px 9px; font-size:10px; font-family:monospace;
-  color:var(--text-primary); border:1px solid var(--border);
-  pointer-events:none; line-height:1.6;
-}
-#joints-overlay  { bottom:10px; left:10px; }
-#tcp-overlay     { bottom:10px; right:10px; }
-#fps-overlay     { top:10px; right:10px; font-size:10px; }
-.ov-label { color:var(--text-muted); font-size:9px; }
+/* ── 3D Viewer ─────────────────────────────────────────────────────────── */
+#viewer-container{flex:1;position:relative;overflow:hidden;min-height:150px;background:#F8F8FA}
+.vov{position:absolute;background:rgba(255,255,255,.88);backdrop-filter:blur(6px);
+  border-radius:6px;padding:6px 9px;font-size:10px;font-family:monospace;
+  color:var(--t1);border:1px solid var(--bd);pointer-events:none;line-height:1.65;
+  max-width:160px}
+#jov{bottom:8px;left:8px}
+#tov{bottom:8px;right:8px}
+#fov{top:8px;right:8px;font-size:10px;line-height:1.4}
+.ov-lbl{color:var(--tm);font-size:9px;letter-spacing:.04em;text-transform:uppercase}
 
-/* ── Teach pendant panel ─────────────────────────────────────────────────── */
-#p-pendant .panel-body { padding:0; }
-.pendant-scroll { padding:10px; overflow-y:auto; height:100%; }
-.section-label {
-  font-size:9px; font-weight:700; letter-spacing:.1em; text-transform:uppercase;
-  color:var(--text-muted); margin:12px 0 6px; padding-bottom:4px; border-bottom:1px solid var(--border);
-}
-.section-label:first-child { margin-top:0; }
+/* ── Pendant ───────────────────────────────────────────────────────────── */
+.pscroll{padding:10px;overflow-y:auto;height:100%}
+.slbl{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--tm);margin:10px 0 5px;padding-bottom:4px;border-bottom:1px solid var(--bd)}
+.slbl:first-child{margin-top:0}
 
 /* Joint rows */
-.joint-row {
-  display:flex; align-items:center; gap:6px; margin-bottom:5px; flex-wrap:nowrap;
-}
-.j-label { font-size:11px; font-weight:700; color:var(--text-secondary); min-width:20px; flex-shrink:0; }
-.j-gauge-wrap { position:relative; width:32px; height:32px; flex-shrink:0; }
-.j-gauge-wrap svg { width:32px; height:32px; }
-.j-value { font-size:11px; font-family:monospace; color:var(--text-primary); min-width:52px; text-align:center; }
-.j-speed-wrap { flex:1; display:flex; align-items:center; gap:4px; }
-.j-speed { width:100%; cursor:pointer; accent-color:var(--accent); }
-.j-speed-val { font-size:10px; color:var(--text-muted); min-width:28px; text-align:right; }
+.jrow{display:flex;align-items:center;gap:5px;margin-bottom:4px}
+.jlbl{font-size:11px;font-weight:700;color:var(--t2);min-width:20px;flex-shrink:0}
+.jg{width:30px;height:30px;flex-shrink:0}
+.jg svg{width:30px;height:30px}
+.jval{font-size:11px;font-family:monospace;min-width:52px;text-align:center}
+.jspw{flex:1;display:flex;align-items:center;gap:3px}
+.jspw input[type=range]{width:100%;accent-color:var(--acc)}
+.jspv{font-size:9px;color:var(--tm);min-width:24px;text-align:right}
 
-/* TCP jog */
-.tcp-jog-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:4px; margin-bottom:6px; }
-.tcp-jog-label { font-size:10px; color:var(--text-muted); text-align:center; font-weight:600; }
-.tcp-speed-row { display:flex; align-items:center; gap:6px; margin-bottom:6px; }
-.tcp-pose-display {
-  display:grid; grid-template-columns:repeat(6,1fr); gap:3px; margin-bottom:6px;
-}
-.pose-cell { background:var(--bg-surface); border-radius:4px; padding:3px 4px; text-align:center; }
-.pose-cell .pc-label { font-size:8px; color:var(--text-muted); }
-.pose-cell .pc-val   { font-size:10px; font-family:monospace; font-weight:600; }
+/* TCP jog grid */
+.tcpg{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;margin-bottom:4px}
+.tcplbl{font-size:10px;color:var(--tm);font-weight:600}
+.tcpd{display:grid;grid-template-columns:repeat(6,1fr);gap:2px;margin-bottom:5px}
+.tcpdc{background:var(--surf);border-radius:4px;padding:3px;text-align:center}
+.tcpdc .dl{font-size:8px;color:var(--tm)}
+.tcpdc .dv{font-size:10px;font-family:monospace;font-weight:700}
+.tcpsr{display:flex;align-items:center;gap:5px;margin-bottom:5px}
+.tcpsr input[type=range]{flex:1;accent-color:var(--acc)}
 
 /* Quick actions */
-.quick-grid { display:grid; grid-template-columns:1fr 1fr; gap:4px; margin-bottom:6px; }
-.quick-btn  { padding:8px 6px; font-size:11px; border-radius:8px; border:1px solid var(--border); background:var(--bg-surface); text-align:center; font-weight:600; }
-.quick-btn:hover { background:var(--bg-hover); }
+.qg{display:grid;grid-template-columns:1fr 1fr;gap:3px;margin-bottom:6px}
+.qbtn{padding:7px 5px;font-size:11px;border-radius:7px;border:1px solid var(--bd);
+  background:var(--surf);text-align:center;font-weight:600}
+.qbtn:hover{background:var(--hover)}
+
+/* Saved points */
+.pt-card{background:var(--surf);border:1px solid var(--bd);border-radius:8px;
+  padding:8px 10px;margin-bottom:5px;transition:border-color .15s}
+.pt-card.teaching{border-color:var(--acc);background:rgba(0,102,255,.04)}
+.pt-card-top{display:flex;align-items:center;gap:6px}
+.pt-icon{font-size:14px;flex-shrink:0}
+.pt-name{flex:1;font-size:12px;font-weight:600;cursor:pointer}
+.pt-name:hover{color:var(--acc)}
+.pt-name-input{flex:1;font-size:12px;font-weight:600;border:1px solid var(--acc);
+  border-radius:4px;padding:2px 6px;outline:none;background:var(--panel)}
+.pt-pose{font-size:10px;color:var(--tm);font-family:monospace;margin-top:3px}
+.pt-btns{display:flex;gap:3px;margin-top:5px}
 
 /* Safety bar */
-.safety-bar {
-  background:var(--bg-surface); border-radius:8px; padding:10px 12px;
-  border:1px solid var(--border);
-}
-.safety-zone-pill {
-  text-align:center; font-size:14px; font-weight:800; letter-spacing:.06em;
-  padding:8px; border-radius:6px; margin-bottom:8px;
-  background:rgba(154,154,162,.12); color:var(--text-secondary);
-}
-.safety-zone-pill.GREEN  { background:rgba(0,168,107,.12); color:var(--zone-green); }
-.safety-zone-pill.YELLOW { background:rgba(245,158,11,.12); color:var(--zone-yellow); }
-.safety-zone-pill.RED    { background:rgba(220,38,38,.12);  color:var(--zone-red); }
-.safety-metrics { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:8px; }
-.sm-item { background:var(--bg-panel); border-radius:6px; padding:6px 8px; border:1px solid var(--border); }
-.sm-label { font-size:9px; color:var(--text-muted); font-weight:600; letter-spacing:.06em; text-transform:uppercase; }
-.sm-value { font-size:14px; font-weight:700; font-family:monospace; margin-top:2px; }
-.speed-track { width:100%; height:5px; background:var(--bg-surface); border-radius:3px; overflow:hidden; margin-top:4px; }
-#speed-fill  { height:100%; background:var(--zone-green); border-radius:3px; transition:width .4s; }
-.estop-main-btn {
-  width:100%; padding:12px; border-radius:8px; border:none;
-  background:var(--estop-red); color:#fff; font-size:14px; font-weight:800;
-  letter-spacing:.08em; transition:background .15s;
-}
-.estop-main-btn:hover { background:#991b1b; }
-.estop-main-btn.active { animation:estop-pulse 1s ease infinite; }
+.sfbar{background:var(--surf);border-radius:8px;padding:9px 11px;border:1px solid var(--bd)}
+.sfpill{text-align:center;font-size:14px;font-weight:800;letter-spacing:.06em;
+  padding:7px;border-radius:6px;margin-bottom:7px;background:rgba(154,154,162,.1);color:var(--t2)}
+.sfpill.GREEN {background:rgba(0,168,107,.12);color:var(--g)}
+.sfpill.YELLOW{background:rgba(245,158,11,.12);color:var(--y)}
+.sfpill.RED   {background:rgba(220,38,38,.12);color:var(--r)}
+.sfm{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:7px}
+.sfmi{background:var(--panel);border-radius:6px;padding:6px 8px;border:1px solid var(--bd)}
+.sfmi .sl{font-size:9px;color:var(--tm);font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+.sfmi .sv{font-size:14px;font-weight:700;font-family:monospace;margin-top:2px}
+.spt{width:100%;height:5px;background:var(--surf);border-radius:3px;overflow:hidden;margin-top:3px}
+#spf{height:100%;background:var(--g);border-radius:3px;transition:width .4s}
+.estop-main{width:100%;padding:11px;border-radius:8px;border:none;background:var(--er);
+  color:#fff;font-size:13px;font-weight:800;letter-spacing:.08em;transition:background .15s}
+.estop-main:hover{background:#991b1b}
+.estop-main.active{animation:ep 1s ease infinite}
 
-/* ── Camera panel ─────────────────────────────────────────────────────────── */
-#p-camera .panel-body { display:flex; flex-direction:column; padding:0; }
-.cam-wrap { flex:1; position:relative; background:#000; min-height:0; overflow:hidden; }
-#cam-img { width:100%; height:100%; object-fit:contain; display:block; }
-#cam-canvas { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
-#cam-offline {
-  position:absolute; inset:0; display:flex; flex-direction:column;
-  align-items:center; justify-content:center; gap:8px; background:#111;
-  color:var(--text-muted); font-size:13px;
-}
-#cam-offline.hidden { display:none; }
-.cam-spinner { width:30px; height:30px; border:3px solid #333; border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite; }
-@keyframes spin { to { transform:rotate(360deg); } }
-.cam-controls {
-  padding:6px 10px; border-top:1px solid var(--border); display:flex; gap:6px; align-items:center;
-  flex-shrink:0;
-}
-.cam-toggle { padding:4px 10px; font-size:11px; border-radius:5px; border:1px solid var(--border); background:var(--bg-surface); }
-.cam-toggle.active { background:var(--accent); color:#fff; border-color:var(--accent); }
-.scene-table-wrap { max-height:160px; overflow-y:auto; flex-shrink:0; border-top:1px solid var(--border); }
-.scene-table { width:100%; border-collapse:collapse; font-size:11px; }
-.scene-table th { padding:5px 8px; text-align:left; font-size:9px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--text-muted); background:var(--bg-surface); position:sticky; top:0; }
-.scene-table td { padding:4px 8px; border-bottom:1px solid var(--border); }
-.scene-table tr:hover td { background:var(--bg-hover); }
-.grasp-dot { width:6px; height:6px; border-radius:50%; background:var(--text-muted); display:inline-block; }
-.grasp-dot.yes { background:var(--zone-green); }
+/* ── Teach mode banner ─────────────────────────────────────────────────── */
+#teach-banner{display:none;position:absolute;top:0;left:0;right:0;z-index:100;
+  background:var(--acc);color:#fff;padding:8px 12px;border-radius:0 0 8px 8px;
+  font-size:12px;font-weight:600}
+#teach-banner.show{display:flex;align-items:center;gap:8px}
+#teach-banner .tbb-msg{flex:1}
+#teach-confirm{padding:7px 14px;border-radius:6px;border:none;background:#fff;
+  color:var(--acc);font-weight:800;font-size:12px}
+#teach-cancel{padding:7px 14px;border-radius:6px;border:none;background:rgba(255,255,255,.25);
+  color:#fff;font-weight:700;font-size:12px}
 
-/* ── Program builder panel ────────────────────────────────────────────────── */
-#p-program .panel-body { display:flex; flex-direction:column; padding:0; min-height:0; }
-.prog-layout { flex:1; display:grid; grid-template-columns:1fr 140px; min-height:0; overflow:hidden; }
-.prog-tree-col { overflow-y:auto; padding:8px; border-right:1px solid var(--border); }
-.prog-step {
-  display:flex; align-items:center; gap:6px; padding:8px 10px; border-radius:8px;
-  border:1px solid var(--border); margin-bottom:4px; background:var(--bg-panel);
-  cursor:grab; transition:box-shadow .15s;
-}
-.prog-step.dragging { opacity:.5; }
-.prog-step.drag-over { border-color:var(--accent); box-shadow:0 0 0 2px rgba(0,102,255,.15); }
-.prog-step.executing { background:rgba(0,102,255,.06); border-color:var(--accent); }
-.step-num { font-size:10px; color:var(--text-muted); font-weight:700; min-width:16px; }
-.step-icon { font-size:14px; }
-.step-label { flex:1; font-size:12px; font-weight:500; }
-.step-del { width:20px; height:20px; border-radius:4px; border:none; background:transparent; color:var(--text-muted); font-size:14px; display:flex; align-items:center; justify-content:center; }
-.step-del:hover { background:var(--zone-red); color:#fff; }
-.prog-empty { text-align:center; color:var(--text-muted); font-size:12px; padding:20px 0; }
-.step-library { overflow-y:auto; padding:6px; background:var(--bg-surface); }
-.lib-title { font-size:9px; font-weight:700; letter-spacing:.08em; color:var(--text-muted); text-transform:uppercase; margin-bottom:6px; padding:0 2px; }
-.lib-btn {
-  width:100%; text-align:left; padding:6px 8px; border-radius:6px; border:1px solid var(--border);
-  background:var(--bg-panel); font-size:11px; margin-bottom:3px; font-weight:500;
-}
-.lib-btn:hover { background:var(--bg-hover); border-color:var(--border-focus); }
-.prog-controls {
-  padding:8px 10px; border-top:1px solid var(--border); display:flex; gap:6px; flex-shrink:0; align-items:center;
-}
-.prog-name-input {
-  flex:1; padding:6px 8px; border-radius:6px; border:1px solid var(--border); font-size:12px;
-  background:var(--bg-surface);
-}
-.prog-name-input:focus { outline:none; border-color:var(--border-focus); }
+/* ── Camera panel ──────────────────────────────────────────────────────── */
+#p-camera .pb{display:flex;flex-direction:column}
+.cam-wrap{flex:1;position:relative;background:#111;overflow:hidden;min-height:120px}
+#cam-img{width:100%;height:100%;object-fit:contain;display:block}
+.cam-wrap canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+#cam-offline{position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:8px;background:#111;color:var(--tm)}
+#cam-offline.h{display:none}
+.cspin{width:28px;height:28px;border:3px solid #333;border-top-color:var(--acc);
+  border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.cam-ctrl{padding:5px 10px;border-top:1px solid var(--bd);display:flex;
+  align-items:center;gap:5px;flex-shrink:0}
+.ctog{padding:3px 9px;font-size:11px;border-radius:5px;border:1px solid var(--bd);background:var(--surf);font-weight:600}
+.ctog.active{background:var(--acc);color:#fff;border-color:var(--acc)}
+.det-toggle{padding:3px 9px;font-size:11px;border-radius:5px;border:1px solid var(--bd);background:var(--surf);font-weight:600}
+.det-toggle.active{background:rgba(0,168,107,.15);color:var(--g);border-color:var(--g)}
+.det-sp{flex:1}
+.det-list-wrap{max-height:100px;overflow-y:auto;flex-shrink:0;border-top:1px solid var(--bd);
+  display:none}
+.det-list-wrap.show{display:block}
+.det-list{padding:4px 8px}
+.det-item{display:flex;align-items:center;gap:6px;padding:3px 0;border-bottom:1px solid var(--bd)}
+.det-item:last-child{border-bottom:none}
+.di-lbl{flex:1;font-size:11px;font-weight:600}
+.di-cnt{font-size:10px;color:var(--tm)}
+.di-conf{font-size:10px;font-family:monospace;color:var(--t2)}
+.scene-wrap{max-height:130px;overflow-y:auto;flex-shrink:0;border-top:1px solid var(--bd)}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th{padding:4px 8px;text-align:left;font-size:9px;font-weight:700;
+  letter-spacing:.06em;text-transform:uppercase;color:var(--tm);
+  background:var(--surf);position:sticky;top:0}
+td{padding:3px 8px;border-bottom:1px solid var(--bd)}
+tr:hover td{background:var(--hover)}
+.gdot{width:6px;height:6px;border-radius:50%;background:var(--tm);display:inline-block}
+.gdot.y{background:var(--g)}
 
-/* ── Toast / banners ──────────────────────────────────────────────────────── */
-#toast-wrap { position:fixed; bottom:20px; right:20px; display:flex; flex-direction:column; gap:6px; z-index:9999; }
-.toast {
-  padding:10px 16px; border-radius:8px; font-size:12px; font-weight:600;
-  background:#1A1A1C; color:#fff; box-shadow:var(--shadow-md);
-  animation:toast-in .2s ease;
-}
-@keyframes toast-in { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
-#disc-banner {
-  position:fixed; top:52px; left:0; right:0; z-index:500;
-  background:var(--zone-red); color:#fff; text-align:center; padding:6px;
-  font-size:12px; font-weight:700; letter-spacing:.04em; display:none;
-}
+/* ── Program builder ───────────────────────────────────────────────────── */
+#p-program .pb{display:flex;flex-direction:column}
+.prog-lay{flex:1;display:grid;grid-template-columns:1fr 130px;min-height:0;overflow:hidden}
+.prog-tree{overflow-y:auto;padding:6px;border-right:1px solid var(--bd)}
+.prog-step{display:flex;align-items:flex-start;gap:5px;padding:7px 9px;border-radius:7px;
+  border:1px solid var(--bd);margin-bottom:3px;background:var(--panel);cursor:grab;
+  transition:border-color .15s;position:relative}
+.prog-step.dragging{opacity:.45}
+.prog-step.drag-over{border-color:var(--acc);box-shadow:0 0 0 2px rgba(0,102,255,.15)}
+.prog-step.executing{background:rgba(0,102,255,.06);border-color:var(--acc)}
+.sn{font-size:10px;color:var(--tm);font-weight:700;min-width:14px;flex-shrink:0;padding-top:1px}
+.si{font-size:13px;flex-shrink:0}
+.sc{flex:1;min-width:0}
+.sl2{font-size:11px;font-weight:600;line-height:1.4}
+.step-del{position:absolute;top:4px;right:4px;width:18px;height:18px;border-radius:4px;
+  border:none;background:transparent;color:var(--tm);font-size:13px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center}
+.step-del:hover{background:var(--r);color:#fff}
 
-/* ── Responsive ───────────────────────────────────────────────────────────── */
-@media (max-width:768px) {
-  #grid { grid-template-columns:1fr; grid-template-rows:repeat(4,50vh); height:auto; }
-  body { overflow:auto; }
-  #app { height:auto; }
-  .panel-body { max-height:50vh; }
-}
-@media (max-width:1024px) and (min-width:769px) {
-  #grid { grid-template-columns:1fr 1fr; grid-template-rows:1fr 1fr; }
+/* Wait step inline input */
+.wait-input{width:52px;border:1px solid var(--bd);border-radius:4px;padding:1px 4px;
+  font-size:11px;font-family:monospace;text-align:center;background:var(--surf)}
+.wait-input:focus{outline:none;border-color:var(--acc)}
+
+/* Pick variable step */
+.pv-row{display:flex;align-items:center;gap:4px;margin-top:3px;flex-wrap:wrap}
+.pv-sel{padding:2px 4px;border-radius:4px;border:1px solid var(--bd);background:var(--surf);
+  font-size:10px;font-weight:600}
+.pv-num{width:44px;padding:2px 4px;border-radius:4px;border:1px solid var(--bd);
+  background:var(--surf);font-size:10px;text-align:center}
+
+.step-lib{overflow-y:auto;padding:5px;background:var(--surf)}
+.lib-t{font-size:9px;font-weight:700;letter-spacing:.08em;color:var(--tm);
+  text-transform:uppercase;margin-bottom:5px;padding:0 2px}
+.lbtn{width:100%;text-align:left;padding:5px 7px;border-radius:5px;border:1px solid var(--bd);
+  background:var(--panel);font-size:11px;margin-bottom:2px;font-weight:500}
+.lbtn:hover{background:var(--hover)}
+
+.prog-ctrl{padding:7px 10px;border-top:1px solid var(--bd);display:flex;gap:5px;
+  flex-shrink:0;align-items:center}
+.prog-nm{flex:1;padding:5px 8px;border-radius:6px;border:1px solid var(--bd);
+  font-size:12px;background:var(--surf)}
+.prog-nm:focus{outline:none;border-color:var(--bdf)}
+.prog-empty{text-align:center;color:var(--tm);font-size:12px;padding:18px 0}
+
+/* ── Program Library overlay ───────────────────────────────────────────── */
+#lib-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:500;
+  align-items:flex-start;justify-content:center;padding-top:40px}
+#lib-overlay.show{display:flex}
+#lib-modal{background:var(--panel);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.25);
+  width:900px;max-width:96vw;max-height:82vh;display:flex;flex-direction:column;overflow:hidden}
+.lib-hdr{padding:14px 18px;border-bottom:1px solid var(--bd);display:flex;
+  align-items:center;gap:10px;flex-shrink:0}
+.lib-hdr h2{font-size:16px;font-weight:700}
+.lib-search{flex:1;padding:7px 12px;border-radius:8px;border:1px solid var(--bd);
+  font-size:13px;background:var(--surf)}
+.lib-search:focus{outline:none;border-color:var(--bdf)}
+.lib-body{flex:1;overflow-y:auto;padding:16px}
+.lib-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+@media(max-width:700px){.lib-grid{grid-template-columns:1fr}}
+.prog-card{background:var(--panel);border:1px solid var(--bd);border-radius:10px;
+  padding:14px;box-shadow:var(--sh1);transition:box-shadow .15s}
+.prog-card:hover{box-shadow:var(--sh2)}
+.pc-name{font-size:14px;font-weight:700;margin-bottom:4px}
+.pc-meta{font-size:11px;color:var(--tm);margin-bottom:8px;line-height:1.5}
+.pc-tags{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px}
+.pc-tag{padding:2px 7px;border-radius:12px;background:var(--surf);font-size:10px;
+  font-weight:600;color:var(--t2)}
+.pc-btns{display:flex;gap:5px}
+.lib-empty{text-align:center;color:var(--tm);padding:40px;grid-column:1/-1}
+
+/* ── Disconnect banner ─────────────────────────────────────────────────── */
+#disc-banner{position:fixed;top:52px;left:0;right:0;z-index:400;
+  background:var(--r);color:#fff;text-align:center;padding:5px;
+  font-size:12px;font-weight:700;letter-spacing:.04em;display:none}
+
+/* ── Toast ─────────────────────────────────────────────────────────────── */
+#toast-wrap{position:fixed;bottom:16px;right:16px;display:flex;flex-direction:column;
+  gap:5px;z-index:9999}
+.toast{padding:9px 15px;border-radius:8px;font-size:12px;font-weight:600;
+  background:#1A1A1C;color:#fff;box-shadow:var(--sh2);animation:ti .2s ease}
+@keyframes ti{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+/* ── Responsive ─────────────────────────────────────────────────────────── */
+@media(max-width:768px){
+  #grid{grid-template-columns:1fr;grid-template-rows:auto;height:auto}
+  #app{height:auto}body{overflow:auto}
+  .pb{max-height:55vh}
 }
 </style>
 </head>
@@ -314,19 +311,19 @@ input, select { font-family:inherit; }
 <!-- ── Header ── -->
 <header id="hdr">
   <div class="brand">Robo<em>Ai</em></div>
-  <div class="robot-name">Cobot 01</div>
+  <div class="robot-nm">Cobot 01</div>
   <div class="mode-tabs">
-    <button class="mode-tab" onclick="setMode('operator')">Operator</button>
-    <button class="mode-tab active" onclick="setMode('engineer')">Engineer</button>
-    <button class="mode-tab" onclick="setMode('admin')">Admin</button>
+    <button class="mtab" onclick="setMode('operator')">Operator</button>
+    <button class="mtab active" onclick="setMode('engineer')">Engineer</button>
+    <button class="mtab" onclick="setMode('admin')">Admin</button>
   </div>
-  <div class="hdr-spacer"></div>
-  <div id="conn-indicator">
-    <div id="conn-dot" class="err"></div>
-    <span id="conn-label">Disconnected</span>
+  <div class="hdr-sp"></div>
+  <button class="hdr-btn" onclick="openLibrary()">📚 Programs</button>
+  <div class="conn-wrap">
+    <div id="cDot" class="err"></div><span id="cLbl">Disconnected</span>
   </div>
-  <span id="zone-badge-hdr" class="zone-badge">UNKNOWN</span>
-  <button class="hdr-estop" id="hdr-estop" onclick="cmdEstop()">⬛ E-STOP</button>
+  <span id="zbadge" class="zbadge">UNKNOWN</span>
+  <button class="estop-hdr" id="hdrEstop" onclick="cmdEstop()">⬛ E-STOP</button>
 </header>
 
 <!-- ── 4-panel grid ── -->
@@ -334,95 +331,94 @@ input, select { font-family:inherit; }
 
   <!-- ── PANEL 1: 3D Viewer ── -->
   <section class="panel" id="p-viewer">
-    <div class="panel-hdr">
-      <span class="panel-title">3D Robot Viewer</span>
-      <span id="fps-label" style="font-size:10px;color:var(--text-muted);">— fps</span>
+    <div class="ph">
+      <span class="pt">3D Robot Viewer</span>
+      <span id="fps-lbl" style="font-size:10px;color:var(--tm)">— fps</span>
     </div>
-    <div id="viewer-container" style="flex:1;position:relative;min-height:0;">
-      <canvas id="gl"></canvas>
-      <div class="viewer-overlay" id="joints-overlay">
-        <div class="ov-label">JOINTS (deg)</div>
-        <div id="ov-joints">—</div>
-      </div>
-      <div class="viewer-overlay" id="tcp-overlay">
-        <div class="ov-label">TCP POSITION</div>
-        <div id="ov-tcp">—</div>
+    <div id="viewer-container">
+      <!-- Three.js appends canvas here -->
+      <div class="vov" id="jov"><div class="ov-lbl">Joints (deg)</div><div id="ojv">—</div></div>
+      <div class="vov" id="tov"><div class="ov-lbl">TCP Position</div><div id="otv">—</div></div>
+      <div class="vov" id="fov" style="padding:4px 8px;font-size:9px;line-height:1.3">
+        <div class="ov-lbl">WORKSPACE</div>
+        <div id="owv" style="color:var(--t2)">Reach 850mm</div>
       </div>
     </div>
   </section>
 
   <!-- ── PANEL 2: Teach Pendant ── -->
-  <section class="panel" id="p-pendant">
-    <div class="panel-hdr">
-      <span class="panel-title">Teach Pendant</span>
+  <section class="panel" id="p-pendant" style="position:relative">
+    <div class="ph"><span class="pt">Teach Pendant</span></div>
+    <!-- Teach mode banner (inside pendant panel) -->
+    <div id="teach-banner">
+      <span class="tbb-msg" id="teach-msg">Teaching…</span>
+      <button id="teach-confirm" onclick="confirmTeach()">✓ Confirm Position</button>
+      <button id="teach-cancel" onclick="cancelTeach()">✕ Cancel</button>
     </div>
-    <div class="panel-body">
-      <div class="pendant-scroll">
+    <div class="pb">
+      <div class="pscroll">
 
-        <!-- A: Joint jog -->
-        <div class="section-label">Joint Space</div>
+        <div class="slbl">Joint Space</div>
         <div id="joint-rows"></div>
 
-        <!-- B: TCP jog -->
-        <div class="section-label">Cartesian Space</div>
-        <div class="tcp-pose-display" id="tcp-display">
-          <div class="pose-cell"><div class="pc-label">X mm</div><div class="pc-val" id="tcp-x">0</div></div>
-          <div class="pose-cell"><div class="pc-label">Y mm</div><div class="pc-val" id="tcp-y">0</div></div>
-          <div class="pose-cell"><div class="pc-label">Z mm</div><div class="pc-val" id="tcp-z">0</div></div>
-          <div class="pose-cell"><div class="pc-label">Rx°</div><div class="pc-val" id="tcp-rx">0</div></div>
-          <div class="pose-cell"><div class="pc-label">Ry°</div><div class="pc-val" id="tcp-ry">0</div></div>
-          <div class="pose-cell"><div class="pc-label">Rz°</div><div class="pc-val" id="tcp-rz">0</div></div>
+        <div class="slbl">Cartesian Space</div>
+        <div class="tcpd">
+          <div class="tcpdc"><div class="dl">X mm</div><div class="dv" id="tx">0</div></div>
+          <div class="tcpdc"><div class="dl">Y mm</div><div class="dv" id="ty">0</div></div>
+          <div class="tcpdc"><div class="dl">Z mm</div><div class="dv" id="tz">0</div></div>
+          <div class="tcpdc"><div class="dl">Rx°</div><div class="dv" id="trx">0</div></div>
+          <div class="tcpdc"><div class="dl">Ry°</div><div class="dv" id="try_">0</div></div>
+          <div class="tcpdc"><div class="dl">Rz°</div><div class="dv" id="trz">0</div></div>
         </div>
-        <div class="tcp-jog-label" style="margin-bottom:3px;font-size:10px;color:var(--text-muted);">Translation</div>
-        <div class="tcp-jog-grid">
-          <button class="jog-btn" data-axis="dx" data-dir="-1">X−</button>
-          <button class="jog-btn" data-axis="dy" data-dir="-1">Y−</button>
-          <button class="jog-btn" data-axis="dz" data-dir="-1">Z−</button>
-          <button class="jog-btn" data-axis="dx" data-dir="1">X+</button>
-          <button class="jog-btn" data-axis="dy" data-dir="1">Y+</button>
-          <button class="jog-btn" data-axis="dz" data-dir="1">Z+</button>
+        <div class="tcplbl" style="margin-bottom:3px;font-size:9px;color:var(--tm)">Translation</div>
+        <div class="tcpg">
+          <button class="jbtn" data-axis="dx" data-dir="-1">X−</button>
+          <button class="jbtn" data-axis="dy" data-dir="-1">Y−</button>
+          <button class="jbtn" data-axis="dz" data-dir="-1">Z−</button>
+          <button class="jbtn" data-axis="dx" data-dir="1">X+</button>
+          <button class="jbtn" data-axis="dy" data-dir="1">Y+</button>
+          <button class="jbtn" data-axis="dz" data-dir="1">Z+</button>
         </div>
-        <div class="tcp-jog-label" style="margin:6px 0 3px;font-size:10px;color:var(--text-muted);">Rotation</div>
-        <div class="tcp-jog-grid">
-          <button class="jog-btn" data-axis="drx" data-dir="-1">Rx−</button>
-          <button class="jog-btn" data-axis="dry" data-dir="-1">Ry−</button>
-          <button class="jog-btn" data-axis="drz" data-dir="-1">Rz−</button>
-          <button class="jog-btn" data-axis="drx" data-dir="1">Rx+</button>
-          <button class="jog-btn" data-axis="dry" data-dir="1">Ry+</button>
-          <button class="jog-btn" data-axis="drz" data-dir="1">Rz+</button>
+        <div class="tcplbl" style="margin:5px 0 3px;font-size:9px;color:var(--tm)">Rotation</div>
+        <div class="tcpg">
+          <button class="jbtn" data-axis="drx" data-dir="-1">Rx−</button>
+          <button class="jbtn" data-axis="dry" data-dir="-1">Ry−</button>
+          <button class="jbtn" data-axis="drz" data-dir="-1">Rz−</button>
+          <button class="jbtn" data-axis="drx" data-dir="1">Rx+</button>
+          <button class="jbtn" data-axis="dry" data-dir="1">Ry+</button>
+          <button class="jbtn" data-axis="drz" data-dir="1">Rz+</button>
         </div>
-        <div class="tcp-speed-row" style="margin-top:6px;">
-          <span style="font-size:10px;color:var(--text-muted);">TCP speed</span>
-          <input type="range" id="tcp-speed-slider" min="1" max="250" value="10" style="flex:1;accent-color:var(--accent);">
-          <span id="tcp-speed-val" style="font-size:11px;font-family:monospace;min-width:48px;">10 mm/s</span>
-        </div>
-
-        <!-- C: Quick actions -->
-        <div class="section-label">Quick Actions</div>
-        <div class="quick-grid">
-          <button class="quick-btn" onclick="cmdHome()">🏠 Home</button>
-          <button class="quick-btn" onclick="cmdSetPick()">📍 Set Pick</button>
-          <button class="quick-btn" onclick="cmdSetPlace()">📦 Set Place</button>
-          <button class="quick-btn" onclick="promptWaypoint()">➕ Waypoint</button>
-          <button class="quick-btn" onclick="voiceCommand()" style="grid-column:span 2;">🎤 Voice Command</button>
+        <div class="tcpsr">
+          <span style="font-size:9px;color:var(--tm)">TCP speed</span>
+          <input type="range" id="tcpSpd" min="1" max="250" value="10">
+          <span id="tcpSpdV" style="font-size:10px;font-family:monospace;min-width:48px">10 mm/s</span>
         </div>
 
-        <!-- D: Safety status -->
-        <div class="section-label">Safety Status</div>
-        <div class="safety-bar">
-          <div class="safety-zone-pill" id="safety-pill">UNKNOWN</div>
-          <div class="safety-metrics">
-            <div class="sm-item">
-              <div class="sm-label">Proximity</div>
-              <div class="sm-value" id="prox-val">— m</div>
+        <div class="slbl">Saved Points</div>
+        <div id="saved-pts-list"></div>
+        <div class="qg">
+          <button class="qbtn" onclick="cmdHome()">🏠 Home</button>
+          <button class="qbtn" onclick="cmdSetPick()">📍 Set Pick Here</button>
+          <button class="qbtn" onclick="cmdSetPlace()">📦 Set Place Here</button>
+          <button class="qbtn" onclick="promptWaypoint()">➕ Add Waypoint</button>
+          <button class="qbtn" onclick="voiceCommand()" style="grid-column:span 2">🎤 Voice Command</button>
+        </div>
+
+        <div class="slbl">Safety Status</div>
+        <div class="sfbar">
+          <div class="sfpill" id="sfpill">UNKNOWN</div>
+          <div class="sfm">
+            <div class="sfmi">
+              <div class="sl">Proximity</div>
+              <div class="sv" id="pxv">— m</div>
             </div>
-            <div class="sm-item">
-              <div class="sm-label">Speed Scale</div>
-              <div class="sm-value" id="speed-val-d">0%</div>
-              <div class="speed-track"><div id="speed-fill" style="width:0%"></div></div>
+            <div class="sfmi">
+              <div class="sl">Speed Scale</div>
+              <div class="sv" id="spdv">0%</div>
+              <div class="spt"><div id="spf" style="width:0%"></div></div>
             </div>
           </div>
-          <button class="estop-main-btn" id="estop-main" onclick="cmdEstop()">⬛ E-STOP</button>
+          <button class="estop-main" id="esMain" onclick="cmdEstop()">⬛ E-STOP</button>
         </div>
 
       </div>
@@ -431,29 +427,36 @@ input, select { font-family:inherit; }
 
   <!-- ── PANEL 3: Camera ── -->
   <section class="panel" id="p-camera">
-    <div class="panel-hdr">
-      <span class="panel-title">Camera Feed</span>
-      <div style="display:flex;gap:4px;">
-        <button class="cam-toggle active" id="cam-color-btn" onclick="switchCam('color')">Color</button>
-        <button class="cam-toggle" id="cam-depth-btn" onclick="switchCam('depth')">Depth</button>
+    <div class="ph">
+      <span class="pt">Camera Feed</span>
+      <div style="display:flex;gap:4px">
+        <button class="ctog active" id="camColor" onclick="switchCam('color')">Color</button>
+        <button class="ctog" id="camDepth" onclick="switchCam('depth')">Depth</button>
       </div>
     </div>
-    <div class="panel-body" style="display:flex;flex-direction:column;">
-      <div class="cam-wrap" id="cam-wrap">
-        <img id="cam-img" alt="camera" src="/stream/cam0">
-        <canvas id="cam-canvas"></canvas>
-        <div id="cam-offline" class="hidden">
-          <div class="cam-spinner"></div>
+    <div class="pb">
+      <div class="cam-wrap" id="camWrap">
+        <img id="camImg" alt="camera" src="/stream/cam0">
+        <canvas id="cCont"></canvas>
+        <canvas id="cDets"></canvas>
+        <div id="cam-offline" class="h">
+          <div class="cspin"></div>
           <span>Waiting for camera…</span>
         </div>
       </div>
-      <div class="scene-table-wrap">
-        <table class="scene-table">
-          <thead>
-            <tr><th>Object</th><th>Class</th><th>Dist (m)</th><th>Conf</th><th>Grasp</th></tr>
-          </thead>
-          <tbody id="scene-tbody">
-            <tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:8px;">No objects detected</td></tr>
+      <div class="cam-ctrl">
+        <button class="det-toggle active" id="detToggle" onclick="toggleDetections()">🔍 Detect</button>
+        <div class="det-sp"></div>
+        <span id="detCount" style="font-size:10px;color:var(--tm)">0 objects</span>
+      </div>
+      <div class="det-list-wrap show" id="detListWrap">
+        <div class="det-list" id="detList"></div>
+      </div>
+      <div class="scene-wrap">
+        <table>
+          <thead><tr><th>Object</th><th>Class</th><th>Dist m</th><th>Conf</th><th>Grasp</th></tr></thead>
+          <tbody id="scTbody">
+            <tr><td colspan="5" style="text-align:center;color:var(--tm);padding:6px">No objects</td></tr>
           </tbody>
         </table>
       </div>
@@ -462,36 +465,35 @@ input, select { font-family:inherit; }
 
   <!-- ── PANEL 4: Program Builder ── -->
   <section class="panel" id="p-program">
-    <div class="panel-hdr">
-      <span class="panel-title">Program Builder</span>
-      <span id="prog-step-count" style="font-size:10px;color:var(--text-muted);">0 steps</span>
+    <div class="ph">
+      <span class="pt">Program Builder</span>
+      <span id="stepCount" style="font-size:10px;color:var(--tm)">0 steps</span>
     </div>
-    <div class="panel-body">
-      <div class="prog-layout">
-        <!-- Tree -->
-        <div class="prog-tree-col" id="prog-tree">
-          <div class="prog-empty" id="prog-empty">No steps yet — add from the library →</div>
+    <div class="pb">
+      <div class="prog-lay">
+        <div class="prog-tree" id="progTree">
+          <div class="prog-empty" id="progEmpty">← Add steps from the library</div>
         </div>
-        <!-- Library -->
-        <div class="step-library">
-          <div class="lib-title">Step Library</div>
-          <button class="lib-btn" onclick="addStep('home','🏠 Move to Home')">🏠 Home</button>
-          <button class="lib-btn" onclick="addStep('pick','📍 Move to Pick')">📍 Pick</button>
-          <button class="lib-btn" onclick="addStep('place','📦 Move to Place')">📦 Place</button>
-          <button class="lib-btn" onclick="addStep('waypoint','📌 Go to Waypoint')">📌 Waypoint</button>
-          <button class="lib-btn" onclick="addStep('grip_close','✊ Gripper Close')">✊ Close</button>
-          <button class="lib-btn" onclick="addStep('grip_open','✋ Gripper Open')">✋ Open</button>
-          <button class="lib-btn" onclick="addStep('wait','⏱ Wait (1s)')">⏱ Wait</button>
-          <button class="lib-btn" onclick="addStep('loop','🔁 Loop ×3')">🔁 Loop</button>
-          <button class="lib-btn" onclick="addStep('if_detect','🔍 If Detected')">🔍 If Det.</button>
+        <div class="step-lib">
+          <div class="lib-t">Steps</div>
+          <button class="lbtn" onclick="addStep('home')">🏠 Home</button>
+          <button class="lbtn" onclick="addStep('pick')">📍 Pick</button>
+          <button class="lbtn" onclick="addStep('place')">📦 Place</button>
+          <button class="lbtn" onclick="addStep('waypoint')">📌 Waypoint</button>
+          <button class="lbtn" onclick="addStep('pick_variable')">🎯 Pick Object</button>
+          <button class="lbtn" onclick="addStep('grip_close')">✊ Close Grip</button>
+          <button class="lbtn" onclick="addStep('grip_open')">✋ Open Grip</button>
+          <button class="lbtn" onclick="addStep('wait')">⏱ Wait</button>
+          <button class="lbtn" onclick="addStep('loop')">🔁 Loop</button>
+          <button class="lbtn" onclick="addStep('if_detect')">🔍 If Detected</button>
         </div>
       </div>
-      <div class="prog-controls">
-        <input class="prog-name-input" id="prog-name" placeholder="Program name…" value="program_1">
-        <button class="btn btn-primary btn-sm" onclick="runProgram()">▶ Run</button>
+      <div class="prog-ctrl">
+        <input class="prog-nm" id="progName" value="program_1" placeholder="Program name…">
+        <button class="btn btn-p btn-sm" onclick="runProgram()">▶ Run</button>
         <button class="btn btn-sm" onclick="pauseProgram()">⏸</button>
         <button class="btn btn-sm" onclick="stopProgram()">⏹</button>
-        <button class="btn btn-sm" onclick="saveProgram()">💾</button>
+        <button class="btn btn-sm" onclick="saveProgram()">💾 Save</button>
       </div>
     </div>
   </section>
@@ -499,95 +501,98 @@ input, select { font-family:inherit; }
 </div><!-- #grid -->
 </div><!-- #app -->
 
-<!-- Disconnect banner -->
-<div id="disc-banner">⚠ DISCONNECTED — retrying…</div>
+<!-- ── Program Library overlay ── -->
+<div id="lib-overlay" onclick="closeLibraryBg(event)">
+  <div id="lib-modal">
+    <div class="lib-hdr">
+      <h2>📚 Program Library</h2>
+      <input class="lib-search" id="libSearch" placeholder="Search programs…" oninput="renderLibrary()">
+      <button class="btn btn-p btn-sm" onclick="newProgram()">+ New</button>
+      <button class="btn btn-sm" onclick="closeLibrary()">✕ Close</button>
+    </div>
+    <div class="lib-body">
+      <div class="lib-grid" id="libGrid">
+        <div class="lib-empty">No programs saved yet</div>
+      </div>
+    </div>
+  </div>
+</div>
 
-<!-- Toast container -->
+<div id="disc-banner">⚠ DISCONNECTED — retrying…</div>
 <div id="toast-wrap"></div>
 
-<!-- Three.js from CDN -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<!-- Three.js + OrbitControls from CDN -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"
+  onerror="console.error('Three.js CDN failed')"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"
+  onerror="console.error('OrbitControls CDN failed')"></script>
+
 <script>
 'use strict';
-
-// ── Constants / helpers ──────────────────────────────────────────────────────
+// ── API helpers ───────────────────────────────────────────────────────────────
 const api = {
-  post: (url, body={}) => fetch(url, {
-    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
-  }),
+  post: (url, body={}) => fetch(url, {method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}),
+  get:  (url)          => fetch(url),
+  put:  (url, body={}) => fetch(url, {method:'PUT',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}),
+  del:  (url)          => fetch(url, {method:'DELETE'}),
 };
 
-function toast(msg, ms=2500) {
+function toast(msg, ms=2400) {
   const el = document.createElement('div');
-  el.className = 'toast';
-  el.textContent = msg;
+  el.className = 'toast'; el.textContent = msg;
   document.getElementById('toast-wrap').appendChild(el);
   setTimeout(() => el.remove(), ms);
 }
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
 
-// ── App state ────────────────────────────────────────────────────────────────
+// ── App state ─────────────────────────────────────────────────────────────────
 let S = {
-  connected: false,
-  safety_zone: 'UNKNOWN',
-  speed_scale: 0,
-  estop: true,
-  human_proximity: 99,
-  task_state: 'IDLE',
-  joint_positions: [0,0,0,0,0,0],
-  joint_velocities: [0,0,0,0,0,0],
-  tcp_pose: {x:0,y:0,z:300,rx:0,ry:0,rz:0},
-  detections: [],
-  scene_objects: [],
+  safety_zone:'UNKNOWN', speed_scale:0, estop:true, human_proximity:99,
+  task_state:'IDLE', joint_positions:[0,0,0,0,0,0], joint_velocities:[0,0,0,0,0,0],
+  tcp_pose:{x:0,y:0,z:300,rx:0,ry:0,rz:0},
+  detections:[], scene_objects:[], contours:[], saved_points:{},
 };
+let pickVarClasses = [];   // classes added as pick variables
 
-// ── Mode ─────────────────────────────────────────────────────────────────────
-let currentMode = 'engineer';
+// ── Mode ──────────────────────────────────────────────────────────────────────
 function setMode(m) {
-  currentMode = m;
-  document.querySelectorAll('.mode-tab').forEach(t =>
+  document.querySelectorAll('.mtab').forEach(t =>
     t.classList.toggle('active', t.textContent.toLowerCase() === m));
-  const grid = document.getElementById('grid');
-  grid.className = '';
-  if (m === 'operator') {
-    document.getElementById('p-viewer').style.display  = 'none';
-    document.getElementById('p-program').style.display = 'none';
-    grid.style.gridTemplateRows = '1fr';
+  const hide = m === 'operator';
+  document.getElementById('p-viewer').style.display  = hide ? 'none' : '';
+  document.getElementById('p-program').style.display = hide ? 'none' : '';
+  if (hide) {
+    document.getElementById('grid').style.gridTemplateRows = '1fr';
   } else {
-    document.getElementById('p-viewer').style.display  = '';
-    document.getElementById('p-program').style.display = '';
-    grid.style.gridTemplateRows = '';
+    document.getElementById('grid').style.gridTemplateRows = '';
   }
 }
 
-// ── WebSocket ────────────────────────────────────────────────────────────────
-let ws, wsDelay = 1000, heartbeat;
-
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+let ws, wsDelay=1000, hbInterval;
 function wsConnect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws`);
-
   ws.onopen = () => {
-    S.connected = true;
-    wsDelay = 1000;
-    document.getElementById('conn-dot').className   = 'ok';
-    document.getElementById('conn-label').textContent = 'Connected';
+    S.connected = true; wsDelay = 1000;
+    document.getElementById('cDot').className = 'ok';
+    document.getElementById('cLbl').textContent = 'Connected';
     document.getElementById('disc-banner').style.display = 'none';
-    toast('✓ Connected', 1800);
-    heartbeat = setInterval(() => ws.send(JSON.stringify({type:'ping'})), 5000);
+    toast('✓ Connected', 1600);
+    hbInterval = setInterval(() => ws.readyState===1 && ws.send(JSON.stringify({type:'ping'})), 5000);
   };
-
-  ws.onmessage = ({data}) => {
-    try { applyState(JSON.parse(data)); } catch(_) {}
-  };
-
+  ws.onmessage = ({data}) => { try { applyState(JSON.parse(data)); } catch(_){} };
   ws.onclose = ws.onerror = () => {
-    S.connected = false;
-    clearInterval(heartbeat);
-    document.getElementById('conn-dot').className   = 'err';
-    document.getElementById('conn-label').textContent = 'Disconnected';
+    S.connected = false; clearInterval(hbInterval);
+    document.getElementById('cDot').className = 'err';
+    document.getElementById('cLbl').textContent = 'Disconnected';
     document.getElementById('disc-banner').style.display = 'block';
     setTimeout(wsConnect, wsDelay);
-    wsDelay = Math.min(wsDelay * 1.5, 10000);
+    wsDelay = Math.min(wsDelay*1.6, 12000);
   };
 }
 
@@ -595,657 +600,863 @@ function applyState(d) {
   Object.assign(S, d);
   updateHeader();
   updatePendant();
-  updateViewer3D();
-  updateCamera();
+  if (threeReady) updateViewer3D();
+  updateDetections();
+  updateContours();
   updateSceneTable();
+  if (d.saved_points) renderSavedPoints();
 }
 
-// ── Header update ────────────────────────────────────────────────────────────
+// ── Header ────────────────────────────────────────────────────────────────────
 function updateHeader() {
   const z = S.safety_zone;
-  const badge = document.getElementById('zone-badge-hdr');
-  badge.textContent = z;
-  badge.className = 'zone-badge ' + z;
-
-  const estopBtns = document.querySelectorAll('.hdr-estop, #estop-main');
-  estopBtns.forEach(b => {
-    b.classList.toggle('active', S.estop);
-    b.textContent = S.estop ? '▪ STOPPED' : '⬛ E-STOP';
+  const b = document.getElementById('zbadge');
+  b.textContent = z; b.className = 'zbadge ' + z;
+  [document.getElementById('hdrEstop'), document.getElementById('esMain')].forEach(btn => {
+    btn.classList.toggle('active', S.estop);
+    btn.textContent = S.estop ? '▪ STOPPED' : '⬛ E-STOP';
   });
 }
 
-// ── Teach Pendant update ─────────────────────────────────────────────────────
+// ── Pendant ───────────────────────────────────────────────────────────────────
 function updatePendant() {
   const p = S.tcp_pose;
-  document.getElementById('tcp-x').textContent  = p.x.toFixed(1);
-  document.getElementById('tcp-y').textContent  = p.y.toFixed(1);
-  document.getElementById('tcp-z').textContent  = p.z.toFixed(1);
-  document.getElementById('tcp-rx').textContent = p.rx.toFixed(2);
-  document.getElementById('tcp-ry').textContent = p.ry.toFixed(2);
-  document.getElementById('tcp-rz').textContent = p.rz.toFixed(2);
+  document.getElementById('tx').textContent  = p.x.toFixed(1);
+  document.getElementById('ty').textContent  = p.y.toFixed(1);
+  document.getElementById('tz').textContent  = p.z.toFixed(1);
+  document.getElementById('trx').textContent = p.rx.toFixed(2);
+  document.getElementById('try_').textContent= p.ry.toFixed(2);
+  document.getElementById('trz').textContent = p.rz.toFixed(2);
 
-  // Joint values + gauges
   S.joint_positions.forEach((rad, i) => {
-    const deg = (rad * 180 / Math.PI).toFixed(1);
-    const v = document.getElementById(`jval-${i}`);
+    const deg = (rad*180/Math.PI).toFixed(1);
+    const v = document.getElementById(`jv${i}`);
     if (v) v.textContent = deg + '°';
-    const arc = document.getElementById(`jarc-${i}`);
+    const arc = document.getElementById(`ja${i}`);
     if (arc) {
-      const pct = ((rad + Math.PI) / (2 * Math.PI));
-      const dashArr = 80;
-      const dashOff = dashArr * (1 - pct);
-      arc.style.strokeDashoffset = dashOff;
+      const pct = ((rad + Math.PI) / (2*Math.PI));
+      arc.style.strokeDashoffset = 75*(1-pct);
     }
   });
 
-  // Safety
   const z = S.safety_zone;
-  const pill = document.getElementById('safety-pill');
-  pill.textContent = z;
-  pill.className = 'safety-zone-pill ' + z;
-
-  const pct = Math.round(S.speed_scale * 100);
-  document.getElementById('speed-val-d').textContent = pct + '%';
-  document.getElementById('speed-fill').style.width  = pct + '%';
-
-  const proximity = S.human_proximity < 50 ? S.human_proximity.toFixed(2) + ' m' : '— m';
-  document.getElementById('prox-val').textContent = proximity;
+  const pill = document.getElementById('sfpill');
+  pill.textContent = z; pill.className = 'sfpill ' + z;
+  const pct = Math.round(S.speed_scale*100);
+  document.getElementById('spdv').textContent = pct + '%';
+  document.getElementById('spf').style.width  = pct + '%';
+  document.getElementById('pxv').textContent  = S.human_proximity<50
+    ? S.human_proximity.toFixed(2)+' m' : '— m';
 }
 
 // ── 3D Viewer ─────────────────────────────────────────────────────────────────
-let THREE_READY = false;
-let threeScene, threeCamera, threeRenderer;
-let robotJoints = {j:[null,null,null,null,null,null]};
-let safetyZones = [];
-let tcpSphere;
-let tcpTrailPoints = [];
-let tcpTrailLine;
-let pickMarker, placeMarker;
-let currentJointAngles = [0,0,0,0,0,0];
-let targetJointAngles  = [0,0,0,0,0,0];
-let frameCount = 0, fpsClock = 0;
+let threeReady = false;
+let scene, camera, renderer, controls;
+let jointGroups = [];      // [j1..j6] Object3D
+let tcpMesh;
+let safetyZones = [];      // [{mesh,label,mat}]
+let trailLine, trailPts=[], trailBuf;
+let pickMarker3D=null, placeMarker3D=null;
+let curAngles=[0,0,0,0,0,0], tgtAngles=[0,0,0,0,0,0];
+let fpsFrames=0, fpsClock=0;
 
 function initThree() {
-  if (typeof THREE === 'undefined') {
-    setTimeout(initThree, 300);
-    return;
-  }
-  THREE_READY = true;
+  if (typeof THREE === 'undefined') { setTimeout(initThree, 200); return; }
 
   const container = document.getElementById('viewer-container');
-  const W = container.clientWidth  || 400;
-  const H = container.clientHeight || 300;
+  const W = container.offsetWidth;
+  const H = container.offsetHeight;
+  if (W < 50 || H < 50) { setTimeout(initThree, 100); return; }
 
-  threeRenderer = new THREE.WebGLRenderer({ canvas: document.getElementById('gl'), antialias: true });
-  threeRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  threeRenderer.setSize(W, H);
-  threeRenderer.shadowMap.enabled = true;
-  threeRenderer.setClearColor(0xF8F8FA);
+  // ── Renderer ──
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(W, H);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.setClearColor(0xF8F8FA);
+  renderer.domElement.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;display:block;';
+  container.appendChild(renderer.domElement);
 
-  threeScene  = new THREE.Scene();
-  threeCamera = new THREE.PerspectiveCamera(50, W/H, 0.01, 50);
-  threeCamera.position.set(0.9, 0.7, 0.9);
-  threeCamera.lookAt(0, 0.3, 0);
+  // ── Scene ──
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xF8F8FA);
 
-  // Lights
-  threeScene.add(new THREE.AmbientLight(0xFFFFFF, 0.65));
-  const sun = new THREE.DirectionalLight(0xFFFFFF, 0.85);
-  sun.position.set(5, 10, 5);
-  sun.castShadow = true;
-  sun.shadow.mapSize.width = sun.shadow.mapSize.height = 1024;
-  threeScene.add(sun);
-  threeScene.add(new THREE.DirectionalLight(0xEEF4FF, 0.25).position.set(-3,-2,-3) && new THREE.DirectionalLight(0xEEF4FF, 0.25));
+  // ── Camera ──
+  camera = new THREE.PerspectiveCamera(50, W/H, 0.01, 100);
+  camera.position.set(0.8, 0.6, 0.8);
 
-  // Grid
-  const grid = new THREE.GridHelper(6, 30, 0xBBBBBB, 0xDDDDDD);
-  threeScene.add(grid);
+  // ── Lights ──
+  scene.add(new THREE.AmbientLight(0xFFFFFF, 0.7));
+  const sun = new THREE.DirectionalLight(0xFFFFFF, 0.8);
+  sun.position.set(5, 10, 5); sun.castShadow = true;
+  sun.shadow.mapSize.set(1024, 1024);
+  scene.add(sun);
+  const fill = new THREE.DirectionalLight(0xEEF0FF, 0.25);
+  fill.position.set(-4, 2, -3); scene.add(fill);
 
-  // Safety zone rings
-  const zoneConfigs = [
-    { r:1.2, col:0x00A86B, label:'GREEN'  },
-    { r:0.6, col:0xF59E0B, label:'YELLOW' },
-    { r:0.3, col:0xDC2626, label:'RED'    },
+  // ── Grid ──
+  scene.add(new THREE.GridHelper(4, 40, 0xCCCCCC, 0xEEEEEE));
+
+  // ── Safety zones ──
+  const ZONES = [
+    {inner:1.0,outer:1.2,col:0x00A86B,label:'GREEN'},
+    {inner:0.5,outer:0.6,col:0xF59E0B,label:'YELLOW'},
+    {inner:0.25,outer:0.3,col:0xDC2626,label:'RED'},
   ];
-  zoneConfigs.forEach(z => {
-    const geo  = new THREE.CircleGeometry(z.r, 64);
-    const mat  = new THREE.MeshBasicMaterial({ color:z.col, side:THREE.DoubleSide, transparent:true, opacity:0.06 });
+  ZONES.forEach(z => {
+    const geo = new THREE.RingGeometry(z.inner, z.outer, 64);
+    const mat = new THREE.MeshBasicMaterial({
+      color:z.col, side:THREE.DoubleSide, transparent:true, opacity:0.15 });
     const mesh = new THREE.Mesh(geo, mat);
-    mesh.rotation.x = -Math.PI/2;
-    mesh.position.y = 0.001;
-    threeScene.add(mesh);
-
-    const rGeo  = new THREE.RingGeometry(z.r - 0.015, z.r, 64);
-    const rMat  = new THREE.MeshBasicMaterial({ color:z.col, side:THREE.DoubleSide, transparent:true, opacity:0.4 });
-    const rMesh = new THREE.Mesh(rGeo, rMat);
-    rMesh.rotation.x = -Math.PI/2;
-    rMesh.position.y = 0.002;
-    threeScene.add(rMesh);
-
-    safetyZones.push({ mesh, mat, label:z.label });
+    mesh.rotation.x = -Math.PI/2; mesh.position.y = 0.001;
+    scene.add(mesh);
+    safetyZones.push({mesh, mat, label:z.label});
   });
 
-  // Workspace envelope (wireframe sphere)
-  const envMesh = new THREE.Mesh(
+  // ── Workspace envelope ──
+  const env = new THREE.Mesh(
     new THREE.SphereGeometry(0.85, 24, 24),
-    new THREE.MeshBasicMaterial({ color:0x0066FF, wireframe:true, transparent:true, opacity:0.04 })
-  );
-  envMesh.position.y = 0.3;
-  threeScene.add(envMesh);
+    new THREE.MeshBasicMaterial({color:0x0066FF,wireframe:true,transparent:true,opacity:0.04}));
+  env.position.y = 0.3; scene.add(env);
 
-  // Build robot arm
-  buildRobot();
+  // ── Robot arm ──
+  buildRobotArm();
 
-  // TCP trail
-  const trailGeo = new THREE.BufferGeometry();
-  const trailBuf = new Float32Array(150);
-  trailGeo.setAttribute('position', new THREE.BufferAttribute(trailBuf, 3));
-  trailGeo.setDrawRange(0, 0);
-  tcpTrailLine = new THREE.Line(trailGeo,
-    new THREE.LineBasicMaterial({ color:0x0066FF, transparent:true, opacity:0.35 }));
-  threeScene.add(tcpTrailLine);
+  // ── TCP trail ──
+  const MAX_TRAIL = 100;
+  trailBuf = new Float32Array(MAX_TRAIL * 3);
+  const tGeo = new THREE.BufferGeometry();
+  tGeo.setAttribute('position', new THREE.BufferAttribute(trailBuf, 3));
+  tGeo.setDrawRange(0, 0);
+  trailLine = new THREE.Line(tGeo,
+    new THREE.LineBasicMaterial({color:0x0066FF,transparent:true,opacity:0.35}));
+  scene.add(trailLine);
 
-  // Orbit controls
-  initOrbitControls(document.getElementById('gl'), threeCamera, new THREE.Vector3(0,0.3,0));
+  // ── OrbitControls ──
+  if (typeof THREE.OrbitControls !== 'undefined') {
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0.3, 0);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.minDistance = 0.3;
+    controls.maxDistance = 4;
+  } else {
+    // Minimal fallback orbit (drag-rotate, scroll-zoom)
+    console.warn('OrbitControls not loaded, using fallback');
+    initFallbackOrbit(renderer.domElement, camera, {x:0,y:0.3,z:0});
+  }
 
-  // Resize
+  // ── Resize ──
   const ro = new ResizeObserver(() => {
-    const W2 = container.clientWidth, H2 = container.clientHeight;
-    if (!W2 || !H2) return;
-    threeRenderer.setSize(W2, H2);
-    threeCamera.aspect = W2/H2;
-    threeCamera.updateProjectionMatrix();
+    const W2 = container.offsetWidth, H2 = container.offsetHeight;
+    if (!W2||!H2) return;
+    renderer.setSize(W2, H2);
+    camera.aspect = W2/H2;
+    camera.updateProjectionMatrix();
   });
   ro.observe(container);
 
-  // Animate
+  threeReady = true;
+
+  // ── Animation loop ──
   (function animate(t) {
     requestAnimationFrame(animate);
+    if (controls) controls.update();
 
-    // Smooth joint interpolation
-    let changed = false;
+    // Smooth joint lerp
+    let moved = false;
     for (let i=0;i<6;i++) {
-      const d = targetJointAngles[i] - currentJointAngles[i];
-      if (Math.abs(d) > 0.0005) { currentJointAngles[i] += d*0.25; changed = true; }
+      const d = tgtAngles[i] - curAngles[i];
+      if (Math.abs(d) > 0.0004) { curAngles[i] += d*0.15; moved = true; }
     }
-    if (changed) applyRobotJoints(currentJointAngles);
+    if (moved) applyJoints(curAngles);
 
-    // Zone pulse animation
-    const pulse = 0.06 + Math.sin(t*0.002)*0.02;
+    // Zone pulse
     safetyZones.forEach(z => {
-      if (z.active) z.mat.opacity = 0.18 + Math.sin(t*0.003)*0.06;
+      if (z.active) z.mat.opacity = 0.25 + Math.sin(t*0.003)*0.1;
     });
 
-    // FPS
-    frameCount++;
+    fpsFrames++;
     if (t - fpsClock > 1000) {
-      document.getElementById('fps-label').textContent = frameCount + ' fps';
-      frameCount = 0; fpsClock = t;
+      document.getElementById('fps-lbl').textContent = fpsFrames + ' fps';
+      fpsFrames = 0; fpsClock = t;
     }
 
-    threeRenderer.render(threeScene, threeCamera);
+    renderer.render(scene, camera);
   })(0);
 }
 
-function buildRobot() {
-  const mat = (c,shine=30) => new THREE.MeshPhongMaterial({ color:c, shininess:shine });
-  const cyl = (r,h,s=16) => new THREE.CylinderGeometry(r, r, h, s);
+function buildRobotArm() {
+  const phong = (c,s=40) => new THREE.MeshPhongMaterial({color:c,shininess:s});
+  const cyl   = (r,h,segs=16) => new THREE.CylinderGeometry(r,r,h,segs);
 
-  // Base plate
-  const base = new THREE.Mesh(cyl(0.09,0.06,32), mat(0xC8C8CC,60));
-  base.position.y = 0.03; base.castShadow = true;
-  threeScene.add(base);
+  // robotRoot sits at world origin
+  const root = new THREE.Object3D();
+  scene.add(root);
 
-  // J1: base rotation (Y axis)
-  const j1 = new THREE.Object3D(); j1.position.y = 0.06; threeScene.add(j1);
+  // J1 — base rotation (Y axis)
+  const j1 = new THREE.Object3D(); root.add(j1);
 
-  // Shoulder block
-  const sh = new THREE.Mesh(new THREE.BoxGeometry(0.08,0.18,0.08), mat(0x4A4A52));
-  sh.position.y = 0.09; sh.castShadow = true; j1.add(sh);
+  // Base cylinder at bottom of J1
+  const baseMesh = new THREE.Mesh(cyl(0.08,0.06,32), phong(0xC8C8CC,60));
+  baseMesh.position.y = 0.03; baseMesh.castShadow = true; j1.add(baseMesh);
 
-  // J2: shoulder (Z axis — lifts upper arm)
-  const j2 = new THREE.Object3D(); j2.position.y = 0.18; j1.add(j2);
+  // J2 — shoulder (Z axis), offset up by 0.06 (height of base)
+  const j2 = new THREE.Object3D(); j2.position.y = 0.06; j1.add(j2);
 
-  // Upper arm
-  const ua = new THREE.Mesh(cyl(0.042,0.32), mat(0x6A6A72));
-  ua.position.y = 0.16; ua.castShadow = true; j2.add(ua);
-  // Joint visual sphere
-  const js2 = new THREE.Mesh(new THREE.SphereGeometry(0.05,12,12), mat(0x5A5A62));
-  j2.add(js2);
+  // Upper arm cylinder: h=0.32, base at j2 origin → centre at y=0.16
+  const uaMesh = new THREE.Mesh(cyl(0.04,0.32), phong(0x7A7A82));
+  uaMesh.position.y = 0.16; uaMesh.castShadow = true; j2.add(uaMesh);
+  // Shoulder visual sphere
+  j2.add((() => { const m=new THREE.Mesh(new THREE.SphereGeometry(0.05,12,12),phong(0x5A5A62)); return m; })());
 
-  // J3: elbow (Z axis)
+  // J3 — elbow (Z axis), offset up 0.32 from J2
   const j3 = new THREE.Object3D(); j3.position.y = 0.32; j2.add(j3);
 
-  // Forearm
-  const fa = new THREE.Mesh(cyl(0.036,0.26), mat(0x7A7A82));
-  fa.position.y = 0.13; fa.castShadow = true; j3.add(fa);
-  const js3 = new THREE.Mesh(new THREE.SphereGeometry(0.044,12,12), mat(0x6A6A72));
-  j3.add(js3);
+  const faMesh = new THREE.Mesh(cyl(0.035,0.26), phong(0x8A8A92));
+  faMesh.position.y = 0.13; faMesh.castShadow = true; j3.add(faMesh);
+  j3.add((() => { const m=new THREE.Mesh(new THREE.SphereGeometry(0.043,12,12),phong(0x6A6A72)); return m; })());
 
-  // J4: wrist 1 (Z axis)
+  // J4 — wrist1 (Z axis), offset up 0.26 from J3
   const j4 = new THREE.Object3D(); j4.position.y = 0.26; j3.add(j4);
 
-  const w1 = new THREE.Mesh(cyl(0.032,0.12), mat(0x8A8A92));
-  w1.position.y = 0.06; j4.add(w1);
-  const js4 = new THREE.Mesh(new THREE.SphereGeometry(0.038,12,12), mat(0x7A7A82));
-  j4.add(js4);
+  const w1Mesh = new THREE.Mesh(cyl(0.03,0.12), phong(0x9A9AA2));
+  w1Mesh.position.y = 0.06; j4.add(w1Mesh);
+  j4.add((() => { const m=new THREE.Mesh(new THREE.SphereGeometry(0.037,12,12),phong(0x7A7A82)); return m; })());
 
-  // J5: wrist 2 (Y axis)
+  // J5 — wrist2 (Y axis), offset up 0.12 from J4
   const j5 = new THREE.Object3D(); j5.position.y = 0.12; j4.add(j5);
 
-  const w2 = new THREE.Mesh(cyl(0.028,0.10), mat(0x9A9AA2));
-  w2.position.y = 0.05; j5.add(w2);
-  const js5 = new THREE.Mesh(new THREE.SphereGeometry(0.034,12,12), mat(0x8A8A92));
-  j5.add(js5);
+  const w2Mesh = new THREE.Mesh(cyl(0.025,0.10), phong(0xAAAAAA));
+  w2Mesh.position.y = 0.05; j5.add(w2Mesh);
+  j5.add((() => { const m=new THREE.Mesh(new THREE.SphereGeometry(0.031,12,12),phong(0x8A8A92)); return m; })());
 
-  // J6: flange (Z axis)
+  // J6 — flange (Z axis), offset up 0.10 from J5
   const j6 = new THREE.Object3D(); j6.position.y = 0.10; j5.add(j6);
 
-  const fl = new THREE.Mesh(cyl(0.045,0.04,32), mat(0xC0C0C8,80));
-  fl.position.y = 0.02; j6.add(fl);
+  const flMesh = new THREE.Mesh(cyl(0.04,0.04,32), phong(0xC0C0C8,80));
+  flMesh.position.y = 0.02; j6.add(flMesh);
 
-  // TCP indicator
-  tcpSphere = new THREE.Mesh(
-    new THREE.SphereGeometry(0.016,12,12),
-    new THREE.MeshPhongMaterial({ color:0xFF3B3B, emissive:0xAA1111, shininess:60 })
-  );
-  tcpSphere.position.y = 0.055;
-  j6.add(tcpSphere);
+  // TCP indicator — red sphere
+  tcpMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(0.015,12,12),
+    new THREE.MeshPhongMaterial({color:0xDC2626,emissive:0xAA0000,shininess:60}));
+  tcpMesh.position.y = 0.05; j6.add(tcpMesh);
 
-  robotJoints.j = [j1, j2, j3, j4, j5, j6];
+  jointGroups = [j1, j2, j3, j4, j5, j6];
 }
 
-// Apply joint angles (radians) to the Three.js hierarchy
-function applyRobotJoints(angles) {
-  robotJoints.j[0].rotation.y =  angles[0];
-  robotJoints.j[1].rotation.z =  angles[1];
-  robotJoints.j[2].rotation.z =  angles[2];
-  robotJoints.j[3].rotation.z =  angles[3];
-  robotJoints.j[4].rotation.y =  angles[4];
-  robotJoints.j[5].rotation.z =  angles[5];
+function applyJoints(a) {
+  if (!jointGroups.length) return;
+  // Per spec: J1=Y, J2=Z, J3=Z, J4=Z, J5=Y, J6=Z
+  jointGroups[0].rotation.y = a[0];
+  jointGroups[1].rotation.z = a[1];
+  jointGroups[2].rotation.z = a[2];
+  jointGroups[3].rotation.z = a[3];
+  jointGroups[4].rotation.y = a[4];
+  jointGroups[5].rotation.z = a[5];
 
-  // Update TCP trail (world position of tcpSphere)
-  const pos = new THREE.Vector3();
-  tcpSphere.getWorldPosition(pos);
-  tcpTrailPoints.push([pos.x, pos.y, pos.z]);
-  if (tcpTrailPoints.length > 50) tcpTrailPoints.shift();
+  // Update TCP trail
+  if (tcpMesh) {
+    const wp = new THREE.Vector3();
+    tcpMesh.getWorldPosition(wp);
+    trailPts.push([wp.x,wp.y,wp.z]);
+    if (trailPts.length > 100) trailPts.shift();
+    trailPts.forEach(([x,y,z],i) => {
+      trailBuf[i*3]=x; trailBuf[i*3+1]=y; trailBuf[i*3+2]=z;
+    });
+    trailLine.geometry.attributes.position.needsUpdate = true;
+    trailLine.geometry.setDrawRange(0, trailPts.length);
+  }
 
-  const arr = tcpTrailLine.geometry.attributes.position.array;
-  tcpTrailPoints.forEach(([x,y,z], i) => { arr[i*3]=x; arr[i*3+1]=y; arr[i*3+2]=z; });
-  tcpTrailLine.geometry.attributes.position.needsUpdate = true;
-  tcpTrailLine.geometry.setDrawRange(0, tcpTrailPoints.length);
-
-  // Overlay text
-  const degs = angles.map(r => (r*180/Math.PI).toFixed(1));
-  document.getElementById('ov-joints').innerHTML =
-    degs.map((d,i) => `J${i+1}: ${d}°`).join('<br>');
-
+  // Overlays
+  const degs = a.map(r=>(r*180/Math.PI).toFixed(1));
+  document.getElementById('ojv').innerHTML = degs.map((d,i)=>`J${i+1}: ${d}°`).join('<br>');
   const t = S.tcp_pose;
-  document.getElementById('ov-tcp').innerHTML =
-    `X: ${t.x.toFixed(1)} mm<br>Y: ${t.y.toFixed(1)} mm<br>Z: ${t.z.toFixed(1)} mm<br>` +
+  document.getElementById('otv').innerHTML =
+    `X: ${t.x.toFixed(1)}<br>Y: ${t.y.toFixed(1)}<br>Z: ${t.z.toFixed(1)}<br>` +
     `Rx: ${t.rx.toFixed(2)}°<br>Ry: ${t.ry.toFixed(2)}°<br>Rz: ${t.rz.toFixed(2)}°`;
 }
 
 function updateViewer3D() {
-  if (!THREE_READY) return;
+  if (!threeReady) return;
+  const pos = S.joint_positions;
+  for (let i=0;i<6;i++) tgtAngles[i] = pos[i]||0;
 
-  // Update target angles for smooth interpolation
-  const positions = S.joint_positions;
-  for (let i=0;i<6;i++) targetJointAngles[i] = positions[i] || 0;
-
-  // Safety zone highlight
   safetyZones.forEach(z => {
     z.active = (z.label === S.safety_zone);
-    z.mat.opacity = z.active ? 0.18 : 0.06;
+    if (!z.active) z.mat.opacity = 0.15;
   });
+
+  updatePointMarkers();
 }
 
-// ── Minimal orbit controls ────────────────────────────────────────────────────
-function initOrbitControls(canvas, camera, target) {
-  let dragging=false, lastX=0, lastY=0;
-  let theta = Math.atan2(camera.position.x - target.x, camera.position.z - target.z);
-  let phi   = Math.acos(Math.min(1, (camera.position.y - target.y) / camera.position.distanceTo(target)));
-  let radius = camera.position.distanceTo(target);
+function updatePointMarkers() {
+  // Simple marker at pick/place positions (small sphere + vertical line)
+  // We'd need FK to compute world positions — for now remove and readd from tcp_pose
+  const sp = S.saved_points || {};
 
-  function update() {
-    phi = Math.max(0.05, Math.min(Math.PI*0.48, phi));
-    camera.position.x = target.x + radius * Math.sin(phi) * Math.sin(theta);
-    camera.position.y = target.y + radius * Math.cos(phi);
-    camera.position.z = target.z + radius * Math.sin(phi) * Math.cos(theta);
-    camera.lookAt(target);
+  if (pickMarker3D) { scene.remove(pickMarker3D); pickMarker3D=null; }
+  if (placeMarker3D){ scene.remove(placeMarker3D); placeMarker3D=null; }
+
+  if (sp.pick && sp.pick.pose) {
+    pickMarker3D = makeMarker(0x00A86B, sp.pick.name||'Pick');
+    scene.add(pickMarker3D);
+  }
+  if (sp.place && sp.place.pose) {
+    placeMarker3D = makeMarker(0x0066FF, sp.place.name||'Place');
+    placeMarker3D.position.x = 0.1;
+    scene.add(placeMarker3D);
+  }
+}
+
+function makeMarker(col, label) {
+  const g = new THREE.Object3D();
+  const sphere = new THREE.Mesh(
+    new THREE.SphereGeometry(0.025,12,12),
+    new THREE.MeshPhongMaterial({color:col,emissive:col,opacity:0.8,transparent:true}));
+  sphere.position.y = 0.025;
+  g.add(sphere);
+  // Vertical line down to floor
+  const lGeo = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0,0,0), new THREE.Vector3(0,0.025,0)]);
+  g.add(new THREE.Line(lGeo, new THREE.LineBasicMaterial({color:col,transparent:true,opacity:0.5})));
+  return g;
+}
+
+// Minimal fallback orbit if OrbitControls didn't load
+function initFallbackOrbit(canvas, cam, target) {
+  let drag=false, lx=0, ly=0;
+  const t = new THREE.Vector3(target.x,target.y,target.z);
+  let theta=Math.atan2(cam.position.x-t.x, cam.position.z-t.z);
+  let phi=Math.acos(Math.min(1,(cam.position.y-t.y)/cam.position.distanceTo(t)));
+  let rad=cam.position.distanceTo(t);
+  function upd(){
+    phi=Math.max(.05,Math.min(Math.PI*.47,phi));
+    cam.position.set(t.x+rad*Math.sin(phi)*Math.sin(theta),
+                     t.y+rad*Math.cos(phi),
+                     t.z+rad*Math.sin(phi)*Math.cos(theta));
+    cam.lookAt(t);
+  }
+  canvas.addEventListener('mousedown',e=>{drag=true;lx=e.clientX;ly=e.clientY});
+  document.addEventListener('mouseup',()=>drag=false);
+  document.addEventListener('mousemove',e=>{
+    if(!drag)return;
+    theta-=(e.clientX-lx)*.005; phi+=(e.clientY-ly)*.005;
+    lx=e.clientX;ly=e.clientY; upd();
+  });
+  canvas.addEventListener('wheel',e=>{
+    rad=Math.max(.4,Math.min(4,rad+e.deltaY*.003)); upd(); e.preventDefault();
+  },{passive:false});
+  canvas.addEventListener('contextmenu',e=>e.preventDefault());
+  upd();
+}
+
+// ── Saved points UI ───────────────────────────────────────────────────────────
+let teachingPoint = null;  // {id, name, type}
+
+function renderSavedPoints() {
+  const list  = document.getElementById('saved-pts-list');
+  const sp    = S.saved_points || {};
+  const items = [];
+
+  if (sp.pick)  items.push({id:'pick',  type:'pick',     name:sp.pick.name||'Pick 1',   icon:'📍', pose:sp.pick.pose});
+  if (sp.place) items.push({id:'place', type:'place',    name:sp.place.name||'Place 1', icon:'📦', pose:sp.place.pose});
+  (sp.waypoints||[]).forEach(wp => items.push({id:wp.id,type:'waypoint',name:wp.name,icon:'📌',pose:wp.pose}));
+
+  if (!items.length) {
+    list.innerHTML = '<div style="font-size:11px;color:var(--tm);margin-bottom:6px">No saved points yet</div>';
+    return;
   }
 
-  canvas.addEventListener('mousedown',  e => { dragging=true; lastX=e.clientX; lastY=e.clientY; });
-  canvas.addEventListener('touchstart', e => { dragging=true; lastX=e.touches[0].clientX; lastY=e.touches[0].clientY; }, {passive:true});
-  document.addEventListener('mouseup',   () => dragging=false);
-  document.addEventListener('touchend',  () => dragging=false);
-
-  document.addEventListener('mousemove', e => {
-    if (!dragging) return;
-    theta -= (e.clientX-lastX)*0.005;
-    phi   += (e.clientY-lastY)*0.005;
-    lastX=e.clientX; lastY=e.clientY;
-    update();
-  });
-  document.addEventListener('touchmove', e => {
-    if (!dragging) return;
-    theta -= (e.touches[0].clientX-lastX)*0.006;
-    phi   += (e.touches[0].clientY-lastY)*0.006;
-    lastX=e.touches[0].clientX; lastY=e.touches[0].clientY;
-    update();
-  }, {passive:true});
-
-  canvas.addEventListener('wheel', e => {
-    radius = Math.max(0.5, Math.min(4, radius + e.deltaY*0.003));
-    update();
-    e.preventDefault();
-  }, {passive:false});
-
-  canvas.addEventListener('contextmenu', e => e.preventDefault());
-  update();
+  list.innerHTML = items.map(p => {
+    const poseStr = p.pose
+      ? `X:${p.pose.x?.toFixed(0)||0} Y:${p.pose.y?.toFixed(0)||0} Z:${p.pose.z?.toFixed(0)||0}`
+      : 'not taught';
+    const isTeaching = teachingPoint && teachingPoint.id === p.id;
+    return `
+    <div class="pt-card ${isTeaching?'teaching':''}" id="ptcard-${p.id}">
+      <div class="pt-card-top">
+        <span class="pt-icon">${p.icon}</span>
+        <span class="pt-name" id="ptname-${p.id}"
+          onclick="startRename('${p.id}','${esc(p.name)}','${p.type}')">${esc(p.name)}</span>
+        <div style="display:flex;gap:3px">
+          <button class="btn btn-xs" onclick="startTeach('${p.id}','${esc(p.name)}','${p.type}')"
+            title="Teach position">Teach</button>
+          <button class="btn btn-xs" onclick="startRename('${p.id}','${esc(p.name)}','${p.type}')"
+            title="Rename">✏</button>
+          <button class="btn btn-xs" style="color:var(--r)"
+            onclick="deletePoint('${p.id}','${p.type}')" title="Delete">🗑</button>
+        </div>
+      </div>
+      <div class="pt-pose">${poseStr}</div>
+    </div>`;
+  }).join('');
 }
 
-// ── Camera feed ────────────────────────────────────────────────────────────────
-let camConnected = false;
-let camRetry = null;
-let camCanvas, camCtx;
-let camMode = 'color';
+function startRename(id, currentName, type) {
+  const nameEl = document.getElementById(`ptname-${id}`);
+  if (!nameEl) return;
+  const input = document.createElement('input');
+  input.className = 'pt-name-input';
+  input.value = currentName;
+  nameEl.replaceWith(input);
+  input.focus(); input.select();
+
+  const commit = () => {
+    const newName = input.value.trim();
+    if (newName && newName !== currentName) {
+      api.post('/cmd/rename_point', {old_name:currentName, new_name:newName,
+        point_id:id}).then(() => toast(`✓ Renamed to "${newName}"`));
+    }
+    // restore (WS update will re-render)
+    const span = document.createElement('span');
+    span.className='pt-name'; span.id=`ptname-${id}`;
+    span.textContent = newName||currentName;
+    span.onclick=()=>startRename(id,newName||currentName,type);
+    input.replaceWith(span);
+  };
+  input.addEventListener('keydown', e => {
+    if (e.key==='Enter') { e.preventDefault(); commit(); }
+    if (e.key==='Escape'){ e.preventDefault(); input.replaceWith(nameEl); }
+  });
+  input.addEventListener('blur', commit);
+}
+
+function startTeach(id, name, type) {
+  teachingPoint = {id, name, type};
+  document.getElementById('teach-msg').textContent =
+    `Teaching "${name}" — jog robot to position, then confirm`;
+  document.getElementById('teach-banner').classList.add('show');
+  renderSavedPoints();
+  toast(`🎯 Teaching mode: ${name}`);
+}
+
+async function confirmTeach() {
+  if (!teachingPoint) return;
+  const {id, name, type} = teachingPoint;
+  const r = await api.post('/cmd/teach_point', {point_id:id, point_name:name});
+  const d = await r.json();
+  const p = d.pose || S.tcp_pose;
+  document.getElementById('teach-msg').textContent =
+    `✓ "${name}" set at X:${p.x?.toFixed(0)} Y:${p.y?.toFixed(0)} Z:${p.z?.toFixed(0)}mm`;
+  toast(`✓ ${name} position saved`);
+  setTimeout(cancelTeach, 3000);
+}
+
+function cancelTeach() {
+  teachingPoint = null;
+  document.getElementById('teach-banner').classList.remove('show');
+  renderSavedPoints();
+}
+
+async function deletePoint(id, type) {
+  if (!confirm('Delete this point?')) return;
+  await api.post('/cmd/delete_point', {point_id:id, point_type:type});
+  toast('🗑 Point deleted');
+}
+
+// ── Jog interactivity ─────────────────────────────────────────────────────────
+let jogIv=null, tcpJogIv=null, tcpSpeed=10;
+
+function buildJointRows() {
+  const c = document.getElementById('joint-rows');
+  for (let i=0;i<6;i++) {
+    const row = document.createElement('div');
+    row.className = 'jrow';
+    row.innerHTML = `
+      <span class="jlbl">J${i+1}</span>
+      <div class="jg"><svg viewBox="0 0 30 30">
+        <circle cx="15" cy="15" r="11" fill="none" stroke="#E8E8EA" stroke-width="3"/>
+        <circle id="ja${i}" cx="15" cy="15" r="11" fill="none" stroke="var(--acc)"
+          stroke-width="3" stroke-dasharray="75" stroke-dashoffset="37"
+          stroke-linecap="round" transform="rotate(-90 15 15)"/>
+      </svg></div>
+      <button class="jbtn" data-j="${i}" data-d="-1">−</button>
+      <span class="jval" id="jv${i}">0.0°</span>
+      <button class="jbtn" data-j="${i}" data-d="1">+</button>
+      <div class="jspw">
+        <input type="range" class="jspw" id="jspd${i}" min="1" max="100" value="10">
+        <span class="jspv" id="jspdv${i}">10%</span>
+      </div>`;
+    c.appendChild(row);
+    document.getElementById(`jspd${i}`).addEventListener('input', function() {
+      document.getElementById(`jspdv${i}`).textContent = this.value+'%';
+    });
+  }
+  document.querySelectorAll('[data-j]').forEach(btn => {
+    const go = () => {
+      const j=+btn.dataset.j, dir=+btn.dataset.d;
+      const spd=(+document.getElementById(`jspd${j}`).value)/100;
+      clearInterval(jogIv);
+      api.post('/cmd/jog',{joint:j,direction:dir,speed:spd});
+      jogIv = setInterval(()=>api.post('/cmd/jog',{joint:j,direction:dir,speed:spd}),100);
+    };
+    const stop = () => clearInterval(jogIv);
+    btn.addEventListener('mousedown', go);
+    btn.addEventListener('mouseup',   stop);
+    btn.addEventListener('mouseleave',stop);
+    btn.addEventListener('touchstart',e=>{e.preventDefault();go();},{passive:false});
+    btn.addEventListener('touchend',  stop);
+  });
+}
+
+function buildTCPJog() {
+  document.getElementById('tcpSpd').addEventListener('input', function() {
+    tcpSpeed = +this.value;
+    document.getElementById('tcpSpdV').textContent = this.value+' mm/s';
+  });
+  document.querySelectorAll('[data-axis]').forEach(btn => {
+    const go = () => {
+      const ax=btn.dataset.axis, dir=+btn.dataset.dir;
+      const d={};
+      if (ax.startsWith('dr')) d[ax] = dir*2;
+      else d[ax] = dir*tcpSpeed*0.1;
+      clearInterval(tcpJogIv);
+      api.post('/cmd/move_tcp',d);
+      tcpJogIv = setInterval(()=>api.post('/cmd/move_tcp',d),100);
+    };
+    const stop = () => clearInterval(tcpJogIv);
+    btn.addEventListener('mousedown', go);
+    btn.addEventListener('mouseup',   stop);
+    btn.addEventListener('mouseleave',stop);
+    btn.addEventListener('touchstart',e=>{e.preventDefault();go();},{passive:false});
+    btn.addEventListener('touchend',  stop);
+  });
+}
+
+// ── Quick actions ─────────────────────────────────────────────────────────────
+async function cmdEstop() {
+  if (S.estop) { await api.post('/cmd/resume'); toast('✓ E-Stop cleared'); }
+  else         { await api.post('/cmd/estop');  toast('⚠ E-Stop triggered'); }
+}
+async function cmdHome()     { await api.post('/cmd/home'); toast('→ Homing…'); }
+async function cmdSetPick()  { const r=await (await api.post('/cmd/set_pick')).json(); toast(`📍 Pick saved`); }
+async function cmdSetPlace() { await api.post('/cmd/set_place'); toast(`📦 Place saved`); }
+function promptWaypoint() {
+  const n = prompt('Waypoint name:');
+  if (n) api.post('/cmd/add_waypoint',{name:n}).then(()=>toast(`📌 "${n}" saved`));
+}
+async function voiceCommand() {
+  if (window.SpeechRecognition || window.webkitSpeechRecognition) {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const sr = new SR();
+    sr.onresult = async e => {
+      const txt = e.results[0][0].transcript;
+      await api.post('/cmd/voice',{text:txt}); toast(`🎤 "${txt}"`);
+    };
+    sr.start();
+  } else {
+    const t = prompt('Voice command:');
+    if (t) { await api.post('/cmd/voice',{text:t}); toast(`🎤 "${t}"`); }
+  }
+}
+
+// ── Camera feed ───────────────────────────────────────────────────────────────
+let camMode='color', detEnabled=true, camRetry=null;
+let contCtx, detCtx;
 
 function initCamera() {
-  const img    = document.getElementById('cam-img');
-  const offline = document.getElementById('cam-offline');
-  camCanvas    = document.getElementById('cam-canvas');
-  camCtx       = camCanvas.getContext('2d');
+  const img = document.getElementById('camImg');
+  const off = document.getElementById('cam-offline');
+  contCtx = document.getElementById('cCont').getContext('2d');
+  detCtx  = document.getElementById('cDets').getContext('2d');
 
-  img.onload = () => {
-    camConnected = true;
-    offline.classList.add('hidden');
-    if (camRetry) { clearTimeout(camRetry); camRetry=null; }
-    // Sync canvas size
-    camCanvas.width  = img.naturalWidth  || img.clientWidth;
-    camCanvas.height = img.naturalHeight || img.clientHeight;
-  };
+  img.onload = () => { off.classList.add('h'); if(camRetry){clearTimeout(camRetry);camRetry=null;} };
   img.onerror = () => {
-    camConnected = false;
-    offline.classList.remove('hidden');
-    camRetry = setTimeout(() => {
-      img.src = (camMode==='color' ? '/stream/cam0' : '/stream/cam0_depth') + '?t=' + Date.now();
-    }, 2000);
+    off.classList.remove('h');
+    camRetry = setTimeout(()=>{ img.src='/stream/cam0?t='+Date.now(); },2000);
   };
   img.src = '/stream/cam0';
 }
 
-function switchCam(mode) {
-  camMode = mode;
-  document.getElementById('cam-color-btn').classList.toggle('active', mode==='color');
-  document.getElementById('cam-depth-btn').classList.toggle('active', mode==='depth');
-  const img = document.getElementById('cam-img');
-  img.src = (mode==='color' ? '/stream/cam0' : '/stream/cam0_depth') + '?t='+Date.now();
+function switchCam(m) {
+  camMode = m;
+  document.getElementById('camColor').classList.toggle('active', m==='color');
+  document.getElementById('camDepth').classList.toggle('active', m==='depth');
+  const img = document.getElementById('camImg');
+  img.src = (m==='color'?'/stream/cam0':'/stream/cam0_depth')+'?t='+Date.now();
 }
 
-function updateCamera() {
-  if (!camCtx) return;
-  const img = document.getElementById('cam-img');
-  const W = img.clientWidth, H = img.clientHeight;
-  if (!W || !H) return;
-  camCanvas.width = W; camCanvas.height = H;
-  camCtx.clearRect(0,0,W,H);
+function toggleDetections() {
+  detEnabled = !detEnabled;
+  const btn = document.getElementById('detToggle');
+  btn.classList.toggle('active', detEnabled);
+  document.getElementById('detListWrap').classList.toggle('show', detEnabled);
+  if (!detEnabled) {
+    contCtx.clearRect(0,0,9999,9999);
+    detCtx.clearRect(0,0,9999,9999);
+  }
+}
 
-  S.detections.forEach(det => {
-    const bb = det.bbox || det.box;
+function updateContours() {
+  if (!detEnabled || !S.contours?.length) return;
+  const wrap = document.getElementById('camWrap');
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  if (!W||!H) return;
+  const c = document.getElementById('cCont');
+  c.width=W; c.height=H;
+  contCtx.clearRect(0,0,W,H);
+  contCtx.strokeStyle='#00FF88'; contCtx.lineWidth=1.5;
+  S.contours.forEach(ct => {
+    if (!ct.points||ct.points.length<3) return;
+    contCtx.beginPath();
+    contCtx.moveTo(ct.points[0][0]*W, ct.points[0][1]*H);
+    for (let i=1;i<ct.points.length;i++)
+      contCtx.lineTo(ct.points[i][0]*W, ct.points[i][1]*H);
+    contCtx.closePath(); contCtx.stroke();
+  });
+}
+
+function updateDetections() {
+  if (!detEnabled) return;
+  const wrap = document.getElementById('camWrap');
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  if (!W||!H) return;
+  const c = document.getElementById('cDets');
+  c.width=W; c.height=H;
+  detCtx.clearRect(0,0,W,H);
+
+  const dets = S.detections||[];
+  dets.forEach(det => {
+    const bb = det.bbox||det.box;
     if (!bb) return;
     const [bx,by,bw,bh] = bb;
-    const sx = W / (det.img_width  || 640);
-    const sy = H / (det.img_height || 480);
+    const sx=W/(det.img_width||640), sy=H/(det.img_height||480);
     const x=bx*sx, y=by*sy, w=bw*sx, h=bh*sy;
-
-    camCtx.strokeStyle = '#0066FF'; camCtx.lineWidth=2;
-    camCtx.strokeRect(x,y,w,h);
-
-    const label = `${det.class||det.label||'?'} ${Math.round((det.confidence||det.conf||0)*100)}%`;
-    camCtx.fillStyle='rgba(0,102,255,0.82)';
-    camCtx.fillRect(x, y-18, Math.min(label.length*7+8, 160), 18);
-    camCtx.fillStyle='#fff'; camCtx.font='bold 11px system-ui';
-    camCtx.fillText(label, x+4, y-5);
+    detCtx.strokeStyle='#0066FF'; detCtx.lineWidth=2;
+    detCtx.strokeRect(x,y,w,h);
+    const lbl=`${det.class||det.label||'?'} ${Math.round((det.confidence||det.conf||0)*100)}%`;
+    detCtx.fillStyle='rgba(0,102,255,.85)';
+    detCtx.fillRect(x,y-18,Math.min(lbl.length*7+8,180),18);
+    detCtx.fillStyle='#fff'; detCtx.font='bold 11px system-ui';
+    detCtx.fillText(lbl,x+4,y-5);
   });
+
+  // Identified objects list
+  const classMap = {};
+  dets.forEach(d=>{ const cl=d.class||d.label||'?'; classMap[cl]=(classMap[cl]||0)+1; });
+  const listEl = document.getElementById('detList');
+  document.getElementById('detCount').textContent = dets.length+' object'+(dets.length===1?'':'s');
+  listEl.innerHTML = Object.entries(classMap).map(([cls,cnt])=>
+    `<div class="det-item">
+      <span class="di-lbl">${esc(cls)}</span>
+      <span class="di-cnt">×${cnt}</span>
+      <button class="btn btn-xs" onclick="addPickVar('${esc(cls)}')" title="Add as pick variable">☆ Pick</button>
+    </div>`).join('');
+}
+
+function addPickVar(cls) {
+  if (!pickVarClasses.includes(cls)) { pickVarClasses.push(cls); toast(`✓ "${cls}" added as pick variable`); }
 }
 
 function updateSceneTable() {
-  const tbody = document.getElementById('scene-tbody');
-  if (!S.scene_objects || !S.scene_objects.length) {
-    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:8px;">No objects detected</td></tr>';
+  const tb = document.getElementById('scTbody');
+  const objs = S.scene_objects||[];
+  if (!objs.length) {
+    tb.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--tm);padding:6px">No objects</td></tr>';
     return;
   }
-  tbody.innerHTML = S.scene_objects.slice(0,12).map(o => `
-    <tr>
-      <td>${escHtml(o.id||o.name||'?')}</td>
-      <td>${escHtml(o.class||o.label||'?')}</td>
-      <td>${(o.distance||o.dist||0).toFixed(2)}</td>
-      <td>${Math.round((o.confidence||o.conf||0)*100)}%</td>
-      <td><span class="grasp-dot ${o.graspable?'yes':''}"></span></td>
-    </tr>`).join('');
+  tb.innerHTML = objs.slice(0,12).map(o=>`
+    <tr><td>${esc(o.id||o.name||'?')}</td><td>${esc(o.class||o.label||'?')}</td>
+    <td>${(o.distance||o.dist||0).toFixed(2)}</td>
+    <td>${Math.round((o.confidence||o.conf||0)*100)}%</td>
+    <td><span class="gdot ${o.graspable?'y':''}"></span></td></tr>`).join('');
 }
 
-function escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
+// ── Program builder ───────────────────────────────────────────────────────────
+let programSteps=[], execStep=-1, dragSrc=-1;
 
-// ── Teach Pendant — Joint Jog ─────────────────────────────────────────────────
-let jogIntervalId = null;
-let tcpJogIntervalId = null;
-let tcpJogSpeed = 10;
-
-function buildJointRows() {
-  const container = document.getElementById('joint-rows');
-  [0,1,2,3,4,5].forEach(i => {
-    const row = document.createElement('div');
-    row.className = 'joint-row';
-    row.innerHTML = `
-      <span class="j-label">J${i+1}</span>
-      <div class="j-gauge-wrap">
-        <svg viewBox="0 0 32 32">
-          <circle cx="16" cy="16" r="12" fill="none" stroke="#E8E8EA" stroke-width="3"/>
-          <circle id="jarc-${i}" cx="16" cy="16" r="12" fill="none" stroke="var(--accent)"
-            stroke-width="3" stroke-dasharray="75" stroke-dashoffset="37.5"
-            stroke-linecap="round" transform="rotate(-90 16 16)"/>
-        </svg>
-      </div>
-      <button class="jog-btn" data-joint="${i}" data-dir="-1">−</button>
-      <span class="j-value" id="jval-${i}">0.0°</span>
-      <button class="jog-btn" data-joint="${i}" data-dir="1">+</button>
-      <div class="j-speed-wrap">
-        <input type="range" class="j-speed" id="jspd-${i}" min="1" max="100" value="10">
-        <span class="j-speed-val" id="jspd-val-${i}">10%</span>
-      </div>`;
-    container.appendChild(row);
-
-    document.getElementById(`jspd-${i}`).addEventListener('input', function() {
-      document.getElementById(`jspd-val-${i}`).textContent = this.value + '%';
-    });
-  });
-
-  // Attach hold-to-jog events to all jog buttons
-  document.querySelectorAll('[data-joint]').forEach(btn => {
-    const start = () => {
-      const joint = +btn.dataset.joint, dir = +btn.dataset.dir;
-      const speed = (+document.getElementById(`jspd-${joint}`).value) / 100;
-      clearInterval(jogIntervalId);
-      api.post('/cmd/jog', {joint, direction:dir, speed});
-      jogIntervalId = setInterval(() => api.post('/cmd/jog', {joint, direction:dir, speed}), 100);
-    };
-    const stop  = () => clearInterval(jogIntervalId);
-    btn.addEventListener('mousedown',  start);
-    btn.addEventListener('mouseup',    stop);
-    btn.addEventListener('mouseleave', stop);
-    btn.addEventListener('touchstart', e => { e.preventDefault(); start(); }, {passive:false});
-    btn.addEventListener('touchend',   stop);
-  });
-}
-
-// TCP jog hold behaviour
-function buildTCPJog() {
-  document.getElementById('tcp-speed-slider').addEventListener('input', function() {
-    tcpJogSpeed = +this.value;
-    document.getElementById('tcp-speed-val').textContent = this.value + ' mm/s';
-  });
-
-  document.querySelectorAll('[data-axis]').forEach(btn => {
-    const start = () => {
-      const axis = btn.dataset.axis, dir = +btn.dataset.dir;
-      const delta = {};
-      // Rotation axes in degrees, translation in mm
-      if (axis.startsWith('dr')) { delta[axis] = dir * 2; }
-      else { delta[axis] = dir * tcpJogSpeed * 0.1; }
-      clearInterval(tcpJogIntervalId);
-      api.post('/cmd/move_tcp', delta);
-      tcpJogIntervalId = setInterval(() => api.post('/cmd/move_tcp', delta), 100);
-    };
-    const stop = () => clearInterval(tcpJogIntervalId);
-    btn.addEventListener('mousedown',  start);
-    btn.addEventListener('mouseup',    stop);
-    btn.addEventListener('mouseleave', stop);
-    btn.addEventListener('touchstart', e => { e.preventDefault(); start(); }, {passive:false});
-    btn.addEventListener('touchend',   stop);
-  });
-}
-
-// ── Quick actions ────────────────────────────────────────────────────────────
-async function cmdEstop() {
-  if (S.estop) {
-    await api.post('/cmd/resume');
-    toast('✓ E-Stop cleared');
-  } else {
-    await api.post('/cmd/estop');
-    toast('⚠ E-Stop triggered');
-  }
-}
-
-async function cmdHome()      { await api.post('/cmd/home'); toast('→ Moving to home'); }
-async function cmdSetPick()   { const r=await (await api.post('/cmd/set_pick')).json(); toast(`📍 Pick set: ${r.pick?.z?.toFixed(0)}mm`); }
-async function cmdSetPlace()  { const r=await (await api.post('/cmd/set_place')).json(); toast(`📦 Place set: ${r.place?.z?.toFixed(0)}mm`); }
-
-function promptWaypoint() {
-  const name = prompt('Waypoint name:');
-  if (!name) return;
-  api.post('/cmd/add_waypoint', {name}).then(() => toast(`📌 Waypoint "${name}" saved`));
-}
-
-async function voiceCommand() {
-  if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) {
-    const text = prompt('Voice command:');
-    if (text) { await api.post('/cmd/voice', {text}); toast(`🎤 "${text}"`); }
-    return;
-  }
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  const sr = new SR();
-  sr.onresult = async e => {
-    const text = e.results[0][0].transcript;
-    await api.post('/cmd/voice', {text});
-    toast(`🎤 "${text}"`);
-  };
-  sr.start();
-}
-
-// ── Program Builder ───────────────────────────────────────────────────────────
-let programSteps = [];
-let executingStep = -1;
-let dragSrcIdx = -1;
-
-const STEP_DEFAULTS = {
-  home:       { icon:'🏠', label:'Move to Home' },
-  pick:       { icon:'📍', label:'Move to Pick' },
-  place:      { icon:'📦', label:'Move to Place' },
-  waypoint:   { icon:'📌', label:'Go to Waypoint' },
-  grip_close: { icon:'✊', label:'Gripper Close' },
-  grip_open:  { icon:'✋', label:'Gripper Open' },
-  wait:       { icon:'⏱', label:'Wait (1s)', params:{seconds:1} },
-  loop:       { icon:'🔁', label:'Loop ×3', params:{count:3} },
-  if_detect:  { icon:'🔍', label:'If Object Detected', params:{class:'person'} },
+const STEP_DEF = {
+  home:         {icon:'🏠', label:'Move to Home'},
+  pick:         {icon:'📍', label:'Move to Pick'},
+  place:        {icon:'📦', label:'Move to Place'},
+  waypoint:     {icon:'📌', label:'Go to Waypoint'},
+  pick_variable:{icon:'🎯', label:'Pick Object', extra:'variable'},
+  grip_close:   {icon:'✊', label:'Gripper Close'},
+  grip_open:    {icon:'✋', label:'Gripper Open'},
+  wait:         {icon:'⏱', label:'Wait', extra:'wait'},
+  loop:         {icon:'🔁', label:'Loop ×3', params:{count:3}},
+  if_detect:    {icon:'🔍', label:'If Object Detected', params:{class:'person'}},
 };
 
-function addStep(type, labelOverride) {
-  const def = STEP_DEFAULTS[type] || {icon:'❓', label:type};
-  programSteps.push({ type, icon:def.icon, label:labelOverride||def.label, params:def.params||{} });
-  renderProgramTree();
+function addStep(type) {
+  const def = STEP_DEF[type]||{icon:'❓',label:type};
+  const step = {
+    type, icon:def.icon, label:def.label,
+    params: {...(def.params||{})},
+  };
+  if (type === 'wait')         step.duration_seconds = 1.0;
+  if (type === 'pick_variable') {
+    step.object_class     = pickVarClasses[0]||'';
+    step.source           = 'camera';
+    step.approach_height_mm = 50;
+    step.grasp_offset     = {x:0,y:0,z:0};
+  }
+  programSteps.push(step);
+  renderTree();
 }
 
-function renderProgramTree() {
-  const tree = document.getElementById('prog-tree');
-  const empty = document.getElementById('prog-empty');
-  document.getElementById('prog-step-count').textContent = programSteps.length + ' step' + (programSteps.length===1?'':'s');
+function renderTree() {
+  const tree  = document.getElementById('progTree');
+  const empty = document.getElementById('progEmpty');
+  document.getElementById('stepCount').textContent = programSteps.length+' step'+(programSteps.length===1?'':'s');
 
   if (!programSteps.length) {
-    tree.innerHTML = '';
-    tree.appendChild(empty);
-    empty.style.display = '';
-    return;
+    tree.innerHTML=''; tree.appendChild(empty); empty.style.display=''; return;
   }
-  empty.style.display = 'none';
+  empty.style.display='none';
 
-  // Keep drag-drop listeners by rebuilding DOM
-  const html = programSteps.map((s,i) => `
-    <div class="prog-step ${i===executingStep?'executing':''}"
-         draggable="true" data-idx="${i}">
-      <span class="step-num">${i+1}</span>
-      <span class="step-icon">${s.icon}</span>
-      <span class="step-label">${escHtml(s.label)}</span>
-      <button class="step-del" onclick="removeStep(${i})" title="Remove">×</button>
-    </div>`).join('');
+  tree.innerHTML = programSteps.map((s,i) => {
+    let extraHTML = '';
+    if (s.type === 'wait') {
+      extraHTML = `<div style="margin-top:3px;display:flex;align-items:center;gap:4px">
+        <input class="wait-input" type="number" min="0.1" max="999" step="0.1"
+          value="${s.duration_seconds||1}" oninput="setWait(${i},this.value)">
+        <span style="font-size:10px;color:var(--tm)">seconds</span>
+      </div>`;
+    } else if (s.type === 'pick_variable') {
+      const options = [...new Set([...pickVarClasses,...(S.scene_objects||[]).map(o=>o.class||o.label||'?')])]
+        .map(c=>`<option value="${esc(c)}" ${c===s.object_class?'selected':''}>${esc(c)}</option>`).join('');
+      extraHTML = `<div class="pv-row">
+        <span style="font-size:10px;color:var(--tm)">Pick</span>
+        <select class="pv-sel" onchange="setPVClass(${i},this.value)">
+          ${options||'<option value="">Select class</option>'}
+        </select>
+        <span style="font-size:10px;color:var(--tm)">↑</span>
+        <input class="pv-num" type="number" min="0" max="500" value="${s.approach_height_mm||50}"
+          oninput="setPVApproach(${i},this.value)" title="Approach height mm">
+        <span style="font-size:9px;color:var(--tm)">mm</span>
+      </div>`;
+    }
+    const displayLabel = s.type==='wait'
+      ? `⏱ Wait ${s.duration_seconds||1}s`
+      : s.type==='pick_variable'
+        ? `🎯 Pick ${s.object_class||'…'} (nearest)`
+        : `${s.icon} ${s.label}`;
 
-  tree.innerHTML = html + (empty.outerHTML || '');
-  document.getElementById('prog-empty').style.display = 'none';
+    return `<div class="prog-step ${i===execStep?'executing':''}" draggable="true" data-i="${i}">
+      <span class="sn">${i+1}</span>
+      <span class="si">${s.icon}</span>
+      <div class="sc">
+        <div class="sl2">${esc(displayLabel.replace(s.icon+' ',''))}</div>
+        ${extraHTML}
+      </div>
+      <button class="step-del" onclick="removeStep(${i})">×</button>
+    </div>`;
+  }).join('');
 
-  // Drag-and-drop reorder
+  // D&D
   tree.querySelectorAll('.prog-step').forEach(el => {
-    el.addEventListener('dragstart', e => {
-      dragSrcIdx = +el.dataset.idx;
-      el.classList.add('dragging');
-      e.dataTransfer.effectAllowed = 'move';
-    });
-    el.addEventListener('dragend', () => el.classList.remove('dragging'));
-    el.addEventListener('dragover', e => {
-      e.preventDefault();
-      el.classList.add('drag-over');
-    });
-    el.addEventListener('dragleave', () => el.classList.remove('drag-over'));
+    el.addEventListener('dragstart', e => { dragSrc=+el.dataset.i; el.classList.add('dragging'); e.dataTransfer.effectAllowed='move'; });
+    el.addEventListener('dragend',   ()=>el.classList.remove('dragging'));
+    el.addEventListener('dragover',  e=>{ e.preventDefault(); el.classList.add('drag-over'); });
+    el.addEventListener('dragleave', ()=>el.classList.remove('drag-over'));
     el.addEventListener('drop', e => {
-      e.preventDefault();
-      el.classList.remove('drag-over');
-      const dst = +el.dataset.idx;
-      if (dragSrcIdx !== dst) {
-        const moved = programSteps.splice(dragSrcIdx, 1)[0];
-        programSteps.splice(dst, 0, moved);
-        renderProgramTree();
-      }
+      e.preventDefault(); el.classList.remove('drag-over');
+      const dst=+el.dataset.i;
+      if(dragSrc!==dst){ const m=programSteps.splice(dragSrc,1)[0]; programSteps.splice(dst,0,m); renderTree(); }
     });
   });
 }
 
-function removeStep(idx) {
-  programSteps.splice(idx, 1);
-  renderProgramTree();
-}
+function setWait(i, v)       { programSteps[i].duration_seconds = +v||1; renderTree(); }
+function setPVClass(i, v)    { programSteps[i].object_class = v; }
+function setPVApproach(i, v) { programSteps[i].approach_height_mm = +v||50; }
+function removeStep(i)       { programSteps.splice(i,1); renderTree(); }
 
 async function runProgram() {
   if (!programSteps.length) { toast('Add steps first'); return; }
-  await api.post('/cmd/run_program', {program: programSteps});
-  toast('▶ Program running…');
-  // Animate step highlights
-  executingStep = 0;
-  renderProgramTree();
-  const interval = setInterval(() => {
-    executingStep++;
-    if (executingStep >= programSteps.length) { executingStep=-1; clearInterval(interval); }
-    renderProgramTree();
-  }, 1200);
+  await api.post('/cmd/run_program', {program:programSteps});
+  toast('▶ Running…'); execStep=0; renderTree();
+  const iv = setInterval(()=>{
+    execStep++; if(execStep>=programSteps.length){execStep=-1;clearInterval(iv);}
+    renderTree();
+  },1200);
 }
-
-async function pauseProgram() { await api.post('/cmd/task', {command:'PAUSE'}); toast('⏸ Paused'); }
-async function stopProgram()  { await api.post('/cmd/task', {command:'STOP'}); executingStep=-1; renderProgramTree(); toast('⏹ Stopped'); }
+async function pauseProgram(){ await api.post('/cmd/task',{command:'PAUSE'}); toast('⏸ Paused'); }
+async function stopProgram() { await api.post('/cmd/task',{command:'STOP'}); execStep=-1; renderTree(); toast('⏹ Stopped'); }
 
 async function saveProgram() {
-  const name = document.getElementById('prog-name').value.trim() || 'program_1';
-  await api.post('/cmd/save_program', {name, program:programSteps});
-  toast(`💾 Saved "${name}"`);
+  const name = document.getElementById('progName').value.trim()||'program_1';
+  const r = await api.post('/api/programs', {name, steps:programSteps});
+  if (r.ok) { toast(`💾 Saved "${name}"`); libProgs=null; }
+  else      toast('Save failed');
+}
+
+// ── Program Library ───────────────────────────────────────────────────────────
+let libProgs = null;
+
+async function openLibrary() {
+  document.getElementById('lib-overlay').classList.add('show');
+  await loadLibrary();
+}
+function closeLibrary() { document.getElementById('lib-overlay').classList.remove('show'); }
+function closeLibraryBg(e) { if(e.target.id==='lib-overlay') closeLibrary(); }
+
+async function loadLibrary() {
+  const r = await api.get('/api/programs');
+  libProgs = r.ok ? await r.json() : [];
+  renderLibrary();
+}
+
+function renderLibrary() {
+  const q    = document.getElementById('libSearch').value.toLowerCase();
+  const grid = document.getElementById('libGrid');
+  const list = (libProgs||[]).filter(p=>!q||p.name.toLowerCase().includes(q));
+
+  if (!list.length) {
+    grid.innerHTML='<div class="lib-empty">No programs found</div>'; return;
+  }
+  grid.innerHTML = list.map(p => {
+    const tags = (p.tags||[]).map(t=>`<span class="pc-tag">${esc(t)}</span>`).join('');
+    const lr   = p.last_run ? new Date(p.last_run).toLocaleString() : 'Never run';
+    return `<div class="prog-card">
+      <div class="pc-name">${esc(p.name)}</div>
+      <div class="pc-meta">
+        ${p.steps?.length||0} steps · ${p.estimated_cycle_time_s||0}s est.<br>
+        Last run: ${lr} · ×${p.run_count||0}
+      </div>
+      ${tags?`<div class="pc-tags">${tags}</div>`:''}
+      <div class="pc-btns">
+        <button class="btn btn-p btn-sm" onclick="libRun('${p.id}')">▶ Run</button>
+        <button class="btn btn-sm" onclick="libEdit('${p.id}')">✏ Edit</button>
+        <button class="btn btn-sm" onclick="libDup('${p.id}')">⧉ Dup</button>
+        <button class="btn btn-sm" style="color:var(--r)" onclick="libDel('${p.id}')">🗑</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function newProgram() {
+  const name = prompt('Program name:','New Program'); if(!name) return;
+  const r = await api.post('/api/programs',{name,steps:[]});
+  if(r.ok){ toast(`✓ "${name}" created`); await loadLibrary(); }
+}
+
+async function libRun(id) {
+  await api.post(`/api/programs/${id}/run`);
+  toast('▶ Program running…'); closeLibrary();
+}
+
+async function libEdit(id) {
+  const r = await api.get(`/api/programs/${id}`);
+  if (!r.ok) return;
+  const p = await r.json();
+  programSteps = p.steps||[];
+  document.getElementById('progName').value = p.name;
+  renderTree(); closeLibrary(); toast(`✏ Editing "${p.name}"`);
+}
+
+async function libDup(id) {
+  const r = await api.post(`/api/programs/${id}/duplicate`);
+  if(r.ok){ toast('⧉ Duplicated'); await loadLibrary(); }
+}
+
+async function libDel(id) {
+  if(!confirm('Delete this program?')) return;
+  await api.del(`/api/programs/${id}`);
+  toast('🗑 Deleted'); await loadLibrary();
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -1253,10 +1464,10 @@ document.addEventListener('DOMContentLoaded', () => {
   buildJointRows();
   buildTCPJog();
   initCamera();
-  renderProgramTree();
+  renderTree();
+  renderSavedPoints();
   wsConnect();
-  // Defer Three.js until layout is ready
-  setTimeout(initThree, 100);
+  setTimeout(initThree, 150);
 });
 </script>
 </body>

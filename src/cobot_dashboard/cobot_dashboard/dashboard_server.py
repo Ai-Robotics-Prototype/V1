@@ -1,6 +1,7 @@
 """
-RoboAi Controller Dashboard — Professional Backend
+RoboAi Controller Dashboard — Professional Backend v3
 FastAPI + WebSocket + ROS2
+Fixes: point management, program library, contour detection, teach mode
 """
 from __future__ import annotations
 
@@ -11,7 +12,9 @@ import math
 import os
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -45,11 +48,24 @@ logging.basicConfig(
 log = logging.getLogger('dashboard')
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-_HERE = Path(os.path.dirname(os.path.abspath(__file__)))
-_DATA_DIR = Path('/opt/cobot/dashboard')
-_DATA_DIR.mkdir(parents=True, exist_ok=True)
-_WAYPOINTS_FILE = _DATA_DIR / 'waypoints.json'
-_PROGRAMS_FILE  = _DATA_DIR / 'programs.json'
+_HERE        = Path(os.path.dirname(os.path.abspath(__file__)))
+_CAL_DIR     = Path('/opt/cobot/calibration')
+_PROG_DIR    = Path('/opt/cobot/programs')
+_CAL_DIR.mkdir(parents=True, exist_ok=True)
+_PROG_DIR.mkdir(parents=True, exist_ok=True)
+_SAVED_POINTS_FILE = _CAL_DIR / 'saved_points.json'
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _load_json(path: Path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception:
+        pass
+    return default
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 _state: Dict[str, Any] = {
@@ -60,46 +76,95 @@ _state: Dict[str, Any] = {
     'task_state':       'IDLE',
     'joint_positions':  [0.0] * 6,
     'joint_velocities': [0.0] * 6,
-    'joint_names':      [f'joint_{i+1}' for i in range(6)],
     'tcp_pose':         {'x': 0.0, 'y': 0.0, 'z': 300.0,
                          'rx': 0.0, 'ry': 0.0, 'rz': 0.0},
     'detections':       [],
     'scene_objects':    [],
+    'contours':         [],
+    'saved_points':     {},   # broadcast to frontend
 }
 _state_lock = threading.Lock()
 
 _latest_frame: bytes = b''
 _frame_lock = threading.Lock()
 _camera_active = False
+_contour_tick  = 0          # throttle contour detection to every 3 frames
 
 _ros_node: 'DashboardNode | None' = None
 
-# ── Persistent data ───────────────────────────────────────────────────────────
-def _load_json(path: Path, default):
-    try:
-        if path.exists():
-            return json.loads(path.read_text())
-    except Exception:
-        pass
-    return default
-
-_waypoints: Dict[str, Any] = _load_json(_WAYPOINTS_FILE, {})
-_programs:  Dict[str, List] = _load_json(_PROGRAMS_FILE,  {})
+# ── Saved points ──────────────────────────────────────────────────────────────
+_DEFAULT_SAVED_POINTS: Dict[str, Any] = {
+    'pick':      None,   # {"name": str, "pose": {x,y,z,rx,ry,rz}}
+    'place':     None,
+    'waypoints': [],     # [{"id": str, "name": str, "pose": {...}}, ...]
+}
+_saved_points: Dict[str, Any] = _load_json(_SAVED_POINTS_FILE, _DEFAULT_SAVED_POINTS)
 _data_lock = threading.Lock()
 
-def _save_waypoints():
+def _save_saved_points() -> None:
     try:
         with _data_lock:
-            _WAYPOINTS_FILE.write_text(json.dumps(_waypoints, indent=2))
+            _SAVED_POINTS_FILE.write_text(json.dumps(_saved_points, indent=2))
+        # Mirror into broadcast state
+        with _state_lock:
+            _state['saved_points'] = _saved_points_summary()
     except Exception as e:
-        log.warning(f'save_waypoints: {e}')
+        log.warning(f'save_saved_points: {e}')
 
-def _save_programs():
-    try:
-        with _data_lock:
-            _PROGRAMS_FILE.write_text(json.dumps(_programs, indent=2))
-    except Exception as e:
-        log.warning(f'save_programs: {e}')
+def _saved_points_summary() -> Dict:
+    """Compact version for WS broadcast."""
+    with _data_lock:
+        return {
+            'pick':      _saved_points.get('pick'),
+            'place':     _saved_points.get('place'),
+            'waypoints': list(_saved_points.get('waypoints', [])),
+        }
+
+# ── Program library ───────────────────────────────────────────────────────────
+def _estimate_cycle_s(steps: List[Dict]) -> float:
+    total = 0.0
+    for s in steps:
+        t = s.get('type', '')
+        if t in ('home', 'pick', 'place', 'waypoint', 'pick_variable'):
+            total += 3.0
+        elif t in ('grip_open', 'grip_close'):
+            total += 0.5
+        elif t == 'wait':
+            total += float(s.get('duration_seconds', 1.0))
+        elif t == 'loop':
+            total += 1.0
+        else:
+            total += 1.0
+    return round(total, 1)
+
+def _list_programs() -> List[Dict]:
+    progs = []
+    for f in _PROG_DIR.glob('*.json'):
+        try:
+            progs.append(json.loads(f.read_text()))
+        except Exception:
+            pass
+    return sorted(progs, key=lambda p: p.get('created_at', ''), reverse=True)
+
+def _get_program(pid: str) -> Optional[Dict]:
+    f = _PROG_DIR / f'{pid}.json'
+    if f.exists():
+        try:
+            return json.loads(f.read_text())
+        except Exception:
+            pass
+    return None
+
+def _write_program(prog: Dict) -> None:
+    f = _PROG_DIR / f'{prog["id"]}.json'
+    f.write_text(json.dumps(prog, indent=2))
+
+def _delete_program(pid: str) -> bool:
+    f = _PROG_DIR / f'{pid}.json'
+    if f.exists():
+        f.unlink()
+        return True
+    return False
 
 # ── QoS ───────────────────────────────────────────────────────────────────────
 _CAM_QOS = QoSProfile(
@@ -109,61 +174,74 @@ _CAM_QOS = QoSProfile(
 )
 
 # ── Forward kinematics (UR5e DH parameters) ───────────────────────────────────
-# Returns TCP pose {x,y,z in mm, rx,ry,rz in degrees}
 def _compute_tcp_pose(joints: List[float]) -> Dict[str, float]:
     a     = [0.0,    -0.4250, -0.3922, 0.0,    0.0,    0.0]
     d     = [0.1625,  0.0,     0.0,    0.1333, 0.0997, 0.0996]
     alpha = [math.pi/2, 0.0, 0.0, math.pi/2, -math.pi/2, 0.0]
 
-    def dh_matrix(theta: float, a_i: float, d_i: float, alpha_i: float):
-        ct, st = math.cos(theta), math.sin(theta)
-        ca, sa = math.cos(alpha_i), math.sin(alpha_i)
-        return [
-            [ct, -st*ca,  st*sa, a_i*ct],
-            [st,  ct*ca, -ct*sa, a_i*st],
-            [0.0, sa,     ca,    d_i],
-            [0.0, 0.0,    0.0,   1.0],
-        ]
+    def dh(th, ai, di, alp):
+        ct, st = math.cos(th), math.sin(th)
+        ca, sa = math.cos(alp), math.sin(alp)
+        return [[ct,-st*ca, st*sa,ai*ct],
+                [st, ct*ca,-ct*sa,ai*st],
+                [0,  sa,    ca,   di],
+                [0,  0,     0,    1]]
 
-    def mat4_mul(A, B):
+    def mm(A, B):
         C = [[0.0]*4 for _ in range(4)]
         for i in range(4):
             for j in range(4):
                 for k in range(4):
-                    C[i][j] += A[i][k] * B[k][j]
+                    C[i][j] += A[i][k]*B[k][j]
         return C
 
-    q = list(joints[:6]) + [0.0] * max(0, 6 - len(joints))
-    T = [[1.0,0,0,0],[0,1.0,0,0],[0,0,1.0,0],[0,0,0,1.0]]
+    q = list(joints[:6]) + [0.0]*(6-len(joints))
+    T = [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]
     for i in range(6):
-        T = mat4_mul(T, dh_matrix(q[i], a[i], d[i], alpha[i]))
+        T = mm(T, dh(q[i], a[i], d[i], alpha[i]))
 
     x, y, z = T[0][3], T[1][3], T[2][3]
-    r11, r21, r31 = T[0][0], T[1][0], T[2][0]
+    r31, r11, r21 = T[2][0], T[0][0], T[1][0]
     r32, r33 = T[2][1], T[2][2]
     ry = math.atan2(-r31, math.sqrt(r11**2 + r21**2))
-    cos_ry = math.cos(ry)
-    if abs(cos_ry) > 1e-6:
-        rz = math.atan2(r21 / cos_ry, r11 / cos_ry)
-        rx = math.atan2(r32 / cos_ry, r33 / cos_ry)
-    else:
-        rz, rx = 0.0, math.atan2(-T[1][2], T[1][1])
+    cr = math.cos(ry)
+    rz = math.atan2(r21/cr, r11/cr) if abs(cr) > 1e-6 else 0.0
+    rx = math.atan2(r32/cr, r33/cr) if abs(cr) > 1e-6 else 0.0
 
-    return {
-        'x':  round(x * 1000, 1),
-        'y':  round(y * 1000, 1),
-        'z':  round(z * 1000, 1),
-        'rx': round(math.degrees(rx), 2),
-        'ry': round(math.degrees(ry), 2),
-        'rz': round(math.degrees(rz), 2),
-    }
+    return {'x':  round(x*1000,1), 'y':  round(y*1000,1), 'z':  round(z*1000,1),
+            'rx': round(math.degrees(rx),2), 'ry': round(math.degrees(ry),2),
+            'rz': round(math.degrees(rz),2)}
 
+# ── Contour detection ─────────────────────────────────────────────────────────
+def _detect_contours(img_bgr) -> List[Dict]:
+    """Edge + contour detection on BGR frame. Returns normalised polygon list."""
+    try:
+        h, w = img_bgr.shape[:2]
+        gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges   = cv2.Canny(blurred, 50, 150)
+        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        result  = []
+        for cnt in cnts:
+            area = cv2.contourArea(cnt)
+            if area < 500:
+                continue
+            peri  = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.02*peri, True)
+            pts   = [[float(p[0][0])/w, float(p[0][1])/h]
+                     for p in approx if len(approx) >= 3]
+            if len(pts) >= 3:
+                result.append({'points': pts, 'area': int(area)})
+            if len(result) >= 25:
+                break
+        return result
+    except Exception:
+        return []
 
 # ── ROS2 node ─────────────────────────────────────────────────────────────────
 class DashboardNode(Node):
     def __init__(self) -> None:
         super().__init__('dashboard_server')
-
         self._estop_pub = self.create_publisher(Bool,   '/safety/estop',  10)
         self._task_pub  = self.create_publisher(String, '/task/command',   10)
 
@@ -177,11 +255,15 @@ class DashboardNode(Node):
         self.create_subscription(String,     '/perception/detections',   self._on_detections,10)
         self.create_subscription(String,     '/perception/scene_graph',  self._on_scene,     10)
 
+        # Seed saved_points into broadcast state
+        with _state_lock:
+            _state['saved_points'] = _saved_points_summary()
+
         self.get_logger().info('Dashboard node ready')
 
-    # ── image ──
+    # ── Image ──────────────────────────────────────────────────────────────
     def _on_image(self, msg: Image) -> None:
-        global _latest_frame, _camera_active
+        global _latest_frame, _camera_active, _contour_tick
         if not _CV2:
             return
         try:
@@ -189,54 +271,54 @@ class DashboardNode(Node):
             img = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(
                 msg.height, msg.width, channels)
             enc = msg.encoding.lower()
-            if enc == 'rgb8':
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            elif enc == 'rgba8':
-                img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-            elif enc == 'bgra8':
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            elif enc == 'mono8':
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            if enc == 'rgb8':   img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            elif enc == 'rgba8':img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+            elif enc == 'bgra8':img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            elif enc == 'mono8':img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
             ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if ok:
                 with _frame_lock:
-                    _latest_frame = bytes(buf)
-                    _camera_active = True
+                    _latest_frame   = bytes(buf)
+                    _camera_active  = True
+
+            # Contour detection — every 3rd frame (~10Hz at 30Hz input)
+            _contour_tick += 1
+            if _contour_tick % 3 == 0:
+                contours = _detect_contours(img)
+                with _state_lock:
+                    _state['contours'] = contours
+
         except Exception as exc:
             self.get_logger().debug(f'image encode: {exc}')
 
-    # ── simple topic callbacks ──
-    def _on_zone(self, msg: String) -> None:
-        with _state_lock:
-            _state['safety_zone'] = msg.data.strip().upper()
+    # ── Topic callbacks ────────────────────────────────────────────────────
+    def _on_zone(self, msg):
+        with _state_lock: _state['safety_zone'] = msg.data.strip().upper()
 
-    def _on_speed(self, msg: Float32) -> None:
-        with _state_lock:
-            _state['speed_scale'] = float(msg.data)
+    def _on_speed(self, msg):
+        with _state_lock: _state['speed_scale'] = float(msg.data)
 
-    def _on_estop_rx(self, msg: Bool) -> None:
-        with _state_lock:
-            _state['estop'] = bool(msg.data)
+    def _on_estop_rx(self, msg):
+        with _state_lock: _state['estop'] = bool(msg.data)
 
-    def _on_proximity(self, msg: Float32) -> None:
-        with _state_lock:
-            _state['human_proximity'] = float(msg.data)
+    def _on_proximity(self, msg):
+        with _state_lock: _state['human_proximity'] = float(msg.data)
 
-    def _on_task(self, msg: String) -> None:
-        with _state_lock:
-            _state['task_state'] = msg.data.strip()
+    def _on_task(self, msg):
+        with _state_lock: _state['task_state'] = msg.data.strip()
 
-    def _on_joints(self, msg: JointState) -> None:
-        positions  = list(msg.position)
-        velocities = list(msg.velocity) if msg.velocity else [0.0] * len(positions)
-        tcp = _compute_tcp_pose(positions)
+    def _on_joints(self, msg):
+        pos = list(msg.position)
+        vel = list(msg.velocity) if msg.velocity else [0.0]*len(pos)
+        tcp = _compute_tcp_pose(pos)
         with _state_lock:
             _state['joint_names']      = list(msg.name)
-            _state['joint_positions']  = positions
-            _state['joint_velocities'] = velocities
+            _state['joint_positions']  = pos
+            _state['joint_velocities'] = vel
             _state['tcp_pose']         = tcp
 
-    def _on_detections(self, msg: String) -> None:
+    def _on_detections(self, msg):
         try:
             parsed = json.loads(msg.data)
             with _state_lock:
@@ -244,7 +326,7 @@ class DashboardNode(Node):
         except Exception:
             pass
 
-    def _on_scene(self, msg: String) -> None:
+    def _on_scene(self, msg):
         try:
             parsed = json.loads(msg.data)
             objs = parsed if isinstance(parsed, list) else parsed.get('objects', [])
@@ -253,18 +335,16 @@ class DashboardNode(Node):
         except Exception:
             pass
 
-    # ── publishers ──
+    # ── Publishers ─────────────────────────────────────────────────────────
     def publish_estop(self, active: bool) -> None:
-        b = Bool()
-        b.data = active
+        b = Bool(); b.data = active
         self._estop_pub.publish(b)
-        with _state_lock:
-            _state['estop'] = active
-        self.get_logger().warning(f'E-STOP {"TRIGGERED" if active else "CLEARED"} via dashboard')
+        with _state_lock: _state['estop'] = active
+        lvl = logging.WARNING if active else logging.INFO
+        self.get_logger().log(lvl, f'E-STOP {"TRIGGERED" if active else "CLEARED"}')
 
     def publish_task(self, command: str) -> None:
-        s = String()
-        s.data = command
+        s = String(); s.data = command
         self._task_pub.publish(s)
 
 
@@ -274,7 +354,6 @@ if _FASTAPI:
     _ws_clients: Set[WebSocket] = set()
 
     async def _broadcast_loop() -> None:
-        """10 Hz state broadcast to all connected WebSocket clients."""
         while True:
             if _ws_clients:
                 with _state_lock:
@@ -289,19 +368,19 @@ if _FASTAPI:
                         'tcp_pose':         _state['tcp_pose'],
                         'detections':       _state['detections'],
                         'scene_objects':    _state['scene_objects'],
+                        'contours':         _state['contours'],
+                        'saved_points':     _state['saved_points'],
                         'timestamp':        time.time(),
                     })
                 dead: Set[WebSocket] = set()
                 for ws in list(_ws_clients):
-                    try:
-                        await ws.send_text(payload)
-                    except Exception:
-                        dead.add(ws)
+                    try:     await ws.send_text(payload)
+                    except:  dead.add(ws)
                 _ws_clients.difference_update(dead)
             await asyncio.sleep(0.1)
 
     @asynccontextmanager
-    async def _lifespan(application: FastAPI):
+    async def _lifespan(app: FastAPI):
         asyncio.create_task(_broadcast_loop())
         log.info('Broadcast loop started (10 Hz)')
         yield
@@ -309,164 +388,296 @@ if _FASTAPI:
     app = FastAPI(title='RoboAi Dashboard', lifespan=_lifespan,
                   docs_url=None, redoc_url=None)
 
-    # ── Health / config ────────────────────────────────────────────────────────
-
+    # ── Health / config ────────────────────────────────────────────────────
     @app.get('/health')
     async def health():
-        with _frame_lock:
-            cam = _camera_active
-        return JSONResponse({'status': 'ok', 'camera': cam, 'ros': _ros_node is not None})
+        with _frame_lock: cam = _camera_active
+        return JSONResponse({'status':'ok','camera':cam,'ros':_ros_node is not None})
 
     @app.get('/api/robot/config')
     async def robot_config():
-        with _data_lock:
-            wp = dict(_waypoints)
-            pg = list(_programs.keys())
         return JSONResponse({
-            'robot_name': 'Cobot 01',
-            'dof': 6,
-            'waypoints': wp,
-            'programs': pg,
+            'robot_name': 'Cobot 01', 'dof': 6,
+            'saved_points': _saved_points_summary(),
+            'programs': [p['name'] for p in _list_programs()],
         })
 
-    # ── MJPEG stream ───────────────────────────────────────────────────────────
-
+    # ── MJPEG stream ───────────────────────────────────────────────────────
     @app.get('/stream/cam0')
     async def stream_cam0():
-        async def _mjpeg():
+        async def _gen():
             try:
                 while True:
-                    with _frame_lock:
-                        frame = _latest_frame
+                    with _frame_lock: frame = _latest_frame
                     if frame:
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n'
+                        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
                                + frame + b'\r\n')
-                    await asyncio.sleep(0.067)   # ~15 fps
-            except GeneratorExit:
-                pass
-        return StreamingResponse(
-            _mjpeg(),
+                    await asyncio.sleep(0.067)
+            except GeneratorExit: pass
+        return StreamingResponse(_gen(),
             media_type='multipart/x-mixed-replace; boundary=frame',
-            headers={
-                'Cache-Control': 'no-cache, no-store, must-revalidate',
-                'Pragma':        'no-cache',
-                'Connection':    'keep-alive',
-                'X-Accel-Buffering': 'no',
-            },
-        )
+            headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no','Connection':'keep-alive'})
 
-    # ── Commands ───────────────────────────────────────────────────────────────
-
+    # ── E-stop / resume ────────────────────────────────────────────────────
     @app.post('/cmd/estop')
     async def cmd_estop():
         if not _ros_node:
-            return JSONResponse({'status': 'error', 'detail': 'ROS not ready'}, status_code=503)
+            return JSONResponse({'status':'error','detail':'ROS not ready'}, status_code=503)
         _ros_node.publish_estop(True)
-        return JSONResponse({'status': 'ok', 'estop': True})
+        return JSONResponse({'status':'ok','estop':True})
 
     @app.post('/cmd/resume')
     async def cmd_resume():
         if not _ros_node:
-            return JSONResponse({'status': 'error', 'detail': 'ROS not ready'}, status_code=503)
+            return JSONResponse({'status':'error','detail':'ROS not ready'}, status_code=503)
         _ros_node.publish_estop(False)
-        return JSONResponse({'status': 'ok', 'estop': False})
+        return JSONResponse({'status':'ok','estop':False})
 
+    # ── Jog / move ─────────────────────────────────────────────────────────
     @app.post('/cmd/task')
     async def cmd_task(request: Request):
         body = await request.json()
-        cmd = str(body.get('command', '')).strip()
+        cmd  = str(body.get('command','')).strip()
         if not cmd:
-            return JSONResponse({'status': 'error', 'detail': 'command required'}, status_code=400)
-        if _ros_node:
-            _ros_node.publish_task(cmd)
-        return JSONResponse({'status': 'ok', 'command': cmd})
+            return JSONResponse({'status':'error','detail':'command required'}, status_code=400)
+        if _ros_node: _ros_node.publish_task(cmd)
+        return JSONResponse({'status':'ok','command':cmd})
 
     @app.post('/cmd/jog')
     async def cmd_jog(request: Request):
         body = await request.json()
-        joint     = int(body.get('joint', 0))
-        direction = float(body.get('direction', 0))
-        speed     = float(body.get('speed', 0.05))
         if _ros_node:
             _ros_node.publish_task(json.dumps({
-                'type': 'jog_joint', 'joint': joint,
-                'direction': direction, 'speed': speed,
+                'type':'jog_joint','joint':int(body.get('joint',0)),
+                'direction':float(body.get('direction',0)),
+                'speed':float(body.get('speed',0.05)),
             }))
-        return JSONResponse({'status': 'ok'})
+        return JSONResponse({'status':'ok'})
 
     @app.post('/cmd/move_tcp')
     async def cmd_move_tcp(request: Request):
         body = await request.json()
-        if _ros_node:
-            _ros_node.publish_task(json.dumps({'type': 'move_tcp', **body}))
-        return JSONResponse({'status': 'ok'})
+        if _ros_node: _ros_node.publish_task(json.dumps({'type':'move_tcp',**body}))
+        return JSONResponse({'status':'ok'})
 
     @app.post('/cmd/home')
     async def cmd_home():
-        if _ros_node:
-            _ros_node.publish_task('HOME')
-        return JSONResponse({'status': 'ok'})
+        if _ros_node: _ros_node.publish_task('HOME')
+        return JSONResponse({'status':'ok'})
+
+    # ── Saved-point management ─────────────────────────────────────────────
+    @app.get('/api/saved_points')
+    async def get_saved_points():
+        return JSONResponse(_saved_points_summary())
 
     @app.post('/cmd/set_pick')
     async def cmd_set_pick():
-        with _state_lock:
-            tcp = dict(_state['tcp_pose'])
+        with _state_lock: tcp = dict(_state['tcp_pose'])
         with _data_lock:
-            _waypoints['pick'] = tcp
-        _save_waypoints()
-        return JSONResponse({'status': 'ok', 'pick': tcp})
+            _saved_points['pick'] = {
+                'name': _saved_points.get('pick',{}).get('name','Pick 1') if _saved_points.get('pick') else 'Pick 1',
+                'pose': tcp,
+            }
+        _save_saved_points()
+        return JSONResponse({'status':'ok','pick':_saved_points['pick']})
 
     @app.post('/cmd/set_place')
     async def cmd_set_place():
-        with _state_lock:
-            tcp = dict(_state['tcp_pose'])
+        with _state_lock: tcp = dict(_state['tcp_pose'])
         with _data_lock:
-            _waypoints['place'] = tcp
-        _save_waypoints()
-        return JSONResponse({'status': 'ok', 'place': tcp})
+            _saved_points['place'] = {
+                'name': _saved_points.get('place',{}).get('name','Place 1') if _saved_points.get('place') else 'Place 1',
+                'pose': tcp,
+            }
+        _save_saved_points()
+        return JSONResponse({'status':'ok','place':_saved_points['place']})
 
     @app.post('/cmd/add_waypoint')
     async def cmd_add_waypoint(request: Request):
         body = await request.json()
-        name = str(body.get('name', '')).strip()
+        name = str(body.get('name','')).strip()
         if not name:
-            return JSONResponse({'status': 'error', 'detail': 'name required'}, status_code=400)
-        with _state_lock:
-            tcp = dict(_state['tcp_pose'])
+            return JSONResponse({'status':'error','detail':'name required'}, status_code=400)
+        with _state_lock: tcp = dict(_state['tcp_pose'])
+        wp_id = f'wp_{uuid.uuid4().hex[:8]}'
         with _data_lock:
-            _waypoints[name] = tcp
-        _save_waypoints()
-        return JSONResponse({'status': 'ok', 'name': name, 'tcp': tcp})
+            _saved_points.setdefault('waypoints',[]).append(
+                {'id': wp_id, 'name': name, 'pose': tcp})
+        _save_saved_points()
+        return JSONResponse({'status':'ok','id':wp_id,'name':name,'pose':tcp})
 
+    @app.post('/cmd/rename_point')
+    async def cmd_rename_point(request: Request):
+        body = await request.json()
+        old  = str(body.get('old_name','')).strip()
+        new  = str(body.get('new_name','')).strip()
+        pid  = str(body.get('point_id','')).strip()   # optional ID for waypoints
+        if not new:
+            return JSONResponse({'status':'error','detail':'new_name required'}, status_code=400)
+        with _data_lock:
+            if old == 'pick' or (pid == 'pick'):
+                if _saved_points.get('pick'): _saved_points['pick']['name'] = new
+            elif old == 'place' or (pid == 'place'):
+                if _saved_points.get('place'): _saved_points['place']['name'] = new
+            else:
+                found = False
+                for wp in _saved_points.get('waypoints',[]):
+                    if wp.get('id') == pid or wp.get('name') == old:
+                        wp['name'] = new; found = True; break
+                if not found:
+                    return JSONResponse({'status':'error','detail':'point not found'}, status_code=404)
+        _save_saved_points()
+        return JSONResponse({'status':'ok','old_name':old,'new_name':new})
+
+    @app.post('/cmd/delete_point')
+    async def cmd_delete_point(request: Request):
+        body  = await request.json()
+        pid   = str(body.get('point_id','')).strip()
+        ptype = str(body.get('point_type','')).strip()   # pick|place|waypoint
+        with _data_lock:
+            if ptype == 'pick':
+                _saved_points['pick'] = None
+            elif ptype == 'place':
+                _saved_points['place'] = None
+            else:
+                _saved_points['waypoints'] = [
+                    wp for wp in _saved_points.get('waypoints',[])
+                    if wp.get('id') != pid]
+        _save_saved_points()
+        return JSONResponse({'status':'ok'})
+
+    @app.post('/cmd/teach_point')
+    async def cmd_teach_point(request: Request):
+        body       = await request.json()
+        point_name = str(body.get('point_name','')).strip()
+        point_id   = str(body.get('point_id','')).strip()
+        tcp_pose   = body.get('tcp_pose', None)
+        if not point_name:
+            return JSONResponse({'status':'error','detail':'point_name required'}, status_code=400)
+        if tcp_pose is None:
+            with _state_lock: tcp_pose = dict(_state['tcp_pose'])
+        with _data_lock:
+            if point_id == 'pick' or point_name == (_saved_points.get('pick') or {}).get('name',''):
+                _saved_points.setdefault('pick', {})
+                _saved_points['pick'] = {'name': point_name, 'pose': tcp_pose}
+            elif point_id == 'place' or point_name == (_saved_points.get('place') or {}).get('name',''):
+                _saved_points['place'] = {'name': point_name, 'pose': tcp_pose}
+            else:
+                updated = False
+                for wp in _saved_points.get('waypoints',[]):
+                    if wp.get('id') == point_id or wp.get('name') == point_name:
+                        wp['pose'] = tcp_pose; updated = True; break
+                if not updated:
+                    _saved_points.setdefault('waypoints',[]).append(
+                        {'id': point_id or f'wp_{uuid.uuid4().hex[:8]}',
+                         'name': point_name, 'pose': tcp_pose})
+        _save_saved_points()
+        if _ros_node:
+            _ros_node.publish_task(json.dumps({
+                'type':'set_point','name':point_name,'pose':tcp_pose}))
+        return JSONResponse({'status':'ok','point_name':point_name,'pose':tcp_pose})
+
+    # ── Run / voice ────────────────────────────────────────────────────────
     @app.post('/cmd/run_program')
     async def cmd_run_program(request: Request):
-        body = await request.json()
-        program = body.get('program', [])
+        body    = await request.json()
+        program = body.get('program',[])
+        prog_id = str(body.get('program_id','')).strip()
+        if prog_id:
+            prog = _get_program(prog_id)
+            if prog:
+                program = prog.get('steps',[])
+                prog['last_run']  = _now_iso()
+                prog['run_count'] = prog.get('run_count',0) + 1
+                _write_program(prog)
         if _ros_node:
-            _ros_node.publish_task(json.dumps({'type': 'run_program', 'steps': program}))
-        return JSONResponse({'status': 'ok', 'steps': len(program)})
-
-    @app.post('/cmd/save_program')
-    async def cmd_save_program(request: Request):
-        body = await request.json()
-        name    = str(body.get('name', 'default')).strip() or 'default'
-        program = body.get('program', [])
-        with _data_lock:
-            _programs[name] = program
-        _save_programs()
-        return JSONResponse({'status': 'ok', 'name': name, 'steps': len(program)})
+            _ros_node.publish_task(json.dumps({'type':'run_program','steps':program}))
+        return JSONResponse({'status':'ok','steps':len(program)})
 
     @app.post('/cmd/voice')
     async def cmd_voice(request: Request):
         body = await request.json()
-        text = str(body.get('text', '')).strip()
+        text = str(body.get('text','')).strip()
         if _ros_node and text:
-            _ros_node.publish_task(json.dumps({'type': 'voice', 'text': text}))
-        return JSONResponse({'status': 'ok', 'text': text})
+            _ros_node.publish_task(json.dumps({'type':'voice','text':text}))
+        return JSONResponse({'status':'ok','text':text})
 
-    # ── WebSocket ──────────────────────────────────────────────────────────────
+    # ── Program library CRUD ───────────────────────────────────────────────
+    @app.get('/api/programs')
+    async def list_programs():
+        return JSONResponse(_list_programs())
 
+    @app.get('/api/programs/{pid}')
+    async def get_program(pid: str):
+        prog = _get_program(pid)
+        if not prog:
+            return JSONResponse({'status':'error','detail':'not found'}, status_code=404)
+        return JSONResponse(prog)
+
+    @app.post('/api/programs')
+    async def create_program(request: Request):
+        body  = await request.json()
+        steps = body.get('steps',[])
+        prog  = {
+            'id':                   str(uuid.uuid4()),
+            'name':                 str(body.get('name','New Program')).strip(),
+            'tags':                 body.get('tags',[]),
+            'steps':                steps,
+            'created_at':           _now_iso(),
+            'last_run':             None,
+            'run_count':            0,
+            'estimated_cycle_time_s': _estimate_cycle_s(steps),
+        }
+        _write_program(prog)
+        return JSONResponse(prog, status_code=201)
+
+    @app.put('/api/programs/{pid}')
+    async def update_program(pid: str, request: Request):
+        prog = _get_program(pid)
+        if not prog:
+            return JSONResponse({'status':'error','detail':'not found'}, status_code=404)
+        body = await request.json()
+        if 'name'  in body: prog['name']  = str(body['name']).strip()
+        if 'tags'  in body: prog['tags']  = body['tags']
+        if 'steps' in body:
+            prog['steps'] = body['steps']
+            prog['estimated_cycle_time_s'] = _estimate_cycle_s(body['steps'])
+        _write_program(prog)
+        return JSONResponse(prog)
+
+    @app.delete('/api/programs/{pid}')
+    async def delete_program(pid: str):
+        if _delete_program(pid):
+            return JSONResponse({'status':'ok'})
+        return JSONResponse({'status':'error','detail':'not found'}, status_code=404)
+
+    @app.post('/api/programs/{pid}/run')
+    async def run_program_by_id(pid: str):
+        prog = _get_program(pid)
+        if not prog:
+            return JSONResponse({'status':'error','detail':'not found'}, status_code=404)
+        prog['last_run']  = _now_iso()
+        prog['run_count'] = prog.get('run_count',0) + 1
+        _write_program(prog)
+        if _ros_node:
+            _ros_node.publish_task(json.dumps({'type':'run_program','steps':prog['steps']}))
+        return JSONResponse({'status':'ok','steps':len(prog['steps'])})
+
+    @app.post('/api/programs/{pid}/duplicate')
+    async def duplicate_program(pid: str):
+        prog = _get_program(pid)
+        if not prog:
+            return JSONResponse({'status':'error','detail':'not found'}, status_code=404)
+        new_prog = dict(prog)
+        new_prog['id']         = str(uuid.uuid4())
+        new_prog['name']       = prog['name'] + ' (copy)'
+        new_prog['created_at'] = _now_iso()
+        new_prog['last_run']   = None
+        new_prog['run_count']  = 0
+        _write_program(new_prog)
+        return JSONResponse(new_prog, status_code=201)
+
+    # ── WebSocket ──────────────────────────────────────────────────────────
     @app.websocket('/ws')
     async def ws_endpoint(ws: WebSocket):
         await ws.accept()
@@ -478,19 +689,14 @@ if _FASTAPI:
                     try:
                         msg = json.loads(raw)
                         if msg.get('type') == 'ping':
-                            await ws.send_text(json.dumps({'type': 'pong'}))
-                    except Exception:
-                        pass
-                except asyncio.TimeoutError:
-                    pass
-        except WebSocketDisconnect:
-            pass
-        except Exception:
-            pass
-        finally:
-            _ws_clients.discard(ws)
+                            await ws.send_text(json.dumps({'type':'pong'}))
+                    except Exception: pass
+                except asyncio.TimeoutError: pass
+        except WebSocketDisconnect: pass
+        except Exception: pass
+        finally: _ws_clients.discard(ws)
 
-    # ── Static files (mount LAST so API routes take precedence) ───────────────
+    # ── Static files ───────────────────────────────────────────────────────
     _STATIC = os.path.normpath(
         os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'static'))
 
@@ -499,54 +705,34 @@ if _FASTAPI:
         log.info(f'Static files → {_STATIC}')
     else:
         log.warning(f'Static dir not found: {_STATIC}')
-
         @app.get('/')
         async def no_frontend():
-            return JSONResponse({'error': 'frontend missing',
-                                 'hint': f'create {_STATIC}/index.html'})
+            return JSONResponse({'error':'frontend missing'})
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-
-def _spin_ros(node: Node) -> None:
-    rclpy.spin(node)
-
+def _spin_ros(node): rclpy.spin(node)
 
 def main(args=None) -> None:
     global _ros_node
-
     if not _FASTAPI:
-        print('Install: pip install fastapi "uvicorn[standard]"')
-        return
-
+        print('Install: pip install fastapi "uvicorn[standard]"'); return
     if not _CV2:
-        log.warning('cv2 unavailable — camera stream will be empty')
-
+        log.warning('cv2 unavailable — camera stream + contours disabled')
     if 'CYCLONEDDS_URI' not in os.environ:
         cdds = '/opt/cobot/cyclonedds.xml'
         if os.path.exists(cdds):
             os.environ['CYCLONEDDS_URI'] = f'file://{cdds}'
             log.info(f'CYCLONEDDS_URI → {os.environ["CYCLONEDDS_URI"]}')
-
     rclpy.init(args=args)
     _ros_node = DashboardNode()
-
-    ros_thread = threading.Thread(target=_spin_ros, args=(_ros_node,),
-                                  daemon=True, name='ros-spin')
-    ros_thread.start()
-    log.info('ROS2 spin thread started')
+    threading.Thread(target=_spin_ros, args=(_ros_node,), daemon=True, name='ros-spin').start()
     log.info('Dashboard at http://0.0.0.0:8080')
-
     try:
-        uvicorn.run(app, host='0.0.0.0', port=8080, log_level='warning',
-                    access_log=False)
-    except KeyboardInterrupt:
-        pass
+        uvicorn.run(app, host='0.0.0.0', port=8080, log_level='warning', access_log=False)
+    except KeyboardInterrupt: pass
     finally:
-        _ros_node.destroy_node()
-        rclpy.shutdown()
+        _ros_node.destroy_node(); rclpy.shutdown()
         log.info('Dashboard stopped')
 
-
-if __name__ == '__main__':
-    main()
+if __name__ == '__main__': main()
