@@ -100,40 +100,24 @@ def export(args):
     print(f'  Size    : {size_mb:.1f} MB')
     print(f'  Elapsed : {elapsed:.1f} s')
 
-    # Quick latency benchmark
+    # Quick latency benchmark via ultralytics TRT backend
     print('\nRunning 100-iteration latency benchmark...')
     import numpy as np
     try:
-        import pycuda.driver as cuda
-        import pycuda.autoinit  # noqa: F401
-        import tensorrt as trt
-
-        logger  = trt.Logger(trt.Logger.WARNING)
-        runtime = trt.Runtime(logger)
-        with open(engine_path, 'rb') as f:
-            engine = runtime.deserialize_cuda_engine(f.read())
-        ctx = engine.create_execution_context()
-
-        dummy = np.random.rand(1, 3, args.imgsz, args.imgsz).astype(np.float16
-                               if args.fp16 else np.float32)
-        d_in  = cuda.mem_alloc(dummy.nbytes)
-        cuda.memcpy_htod(d_in, dummy)
-
-        # Warmup
+        from ultralytics import YOLO as _YOLO
+        _m = _YOLO(engine_path, task='detect')
+        _dummy = np.random.randint(0, 255, (args.imgsz, args.imgsz, 3), dtype=np.uint8)
         for _ in range(10):
-            ctx.execute_v2([int(d_in)])
-
-        times = []
+            _m.predict(_dummy, verbose=False)
+        _times = []
         for _ in range(100):
-            t = time.monotonic()
-            ctx.execute_v2([int(d_in)])
-            times.append((time.monotonic() - t) * 1e3)
-
-        times = sorted(times)
-        print(f'  Latency  p50={times[49]:.2f}ms  p95={times[94]:.2f}ms  '
-              f'p99={times[98]:.2f}ms')
-        print(f'  FPS (1/p50): {1000/times[49]:.1f}')
-        d_in.free()
+            _t = time.monotonic()
+            _m.predict(_dummy, verbose=False)
+            _times.append((time.monotonic() - _t) * 1e3)
+        _times.sort()
+        print(f'  Latency  p50={_times[49]:.2f}ms  p95={_times[94]:.2f}ms  '
+              f'p99={_times[98]:.2f}ms')
+        print(f'  FPS (1/p50): {1000/_times[49]:.1f}')
     except Exception as e:
         print(f'  Benchmark skipped: {e}')
 
