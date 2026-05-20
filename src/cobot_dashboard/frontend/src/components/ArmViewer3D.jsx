@@ -6,10 +6,10 @@ import { useStore } from '../store/useStore'
 
 // ── Camera preset positions ────────────────────────────────────────────────────
 const CAM_PRESETS = {
-  front: { pos: [0.2, 0.3, 1.4],  tgt: [0.2, 0.1, 0] },
-  side:  { pos: [1.4, 0.3, 0.2],  tgt: [0.2, 0.1, 0] },
-  top:   { pos: [0.2, 1.8, 0.001],tgt: [0.2, 0, 0]   },
-  iso:   { pos: [0.8, 0.5, 1.0],  tgt: [0.2, 0.1, 0] },
+  front: { pos: [0.15, 0.3,  1.3],  tgt: [0.15, 0.15, 0] },
+  side:  { pos: [1.3,  0.3,  0.15], tgt: [0.15, 0.15, 0] },
+  top:   { pos: [0.15, 1.6,  0.01], tgt: [0.15, 0.15, 0] },
+  iso:   { pos: [0.6,  0.5,  0.9],  tgt: [0.15, 0.15, 0] },
 }
 
 // ── Material factory ──────────────────────────────────────────────────────────
@@ -324,7 +324,7 @@ export default function ArmViewer3D() {
         <JointOverlay />
 
         <Canvas
-          camera={{ position: [0.3, 0.4, 1.0], fov: 55, near: 0.01, far: 50 }}
+          camera={{ position: [0.6, 0.5, 0.9], fov: 55, near: 0.01, far: 50 }}
           style={{ background: '#111114' }}
           gl={{ antialias: true, powerPreference: 'default' }}
         >
@@ -353,7 +353,7 @@ export default function ArmViewer3D() {
 
           <OrbitControls
             makeDefault
-            target={[0.2, 0.1, 0]}
+            target={[0.15, 0.15, 0]}
             enableDamping
             dampingFactor={0.07}
             minDistance={0.4}

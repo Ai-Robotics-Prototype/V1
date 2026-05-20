@@ -1,14 +1,58 @@
-import { useEffect } from 'react'
-import { useStore }  from './store/useStore'
-import Header        from './components/Header'
-import SafetyPanel   from './components/SafetyPanel'
-import CameraFeed    from './components/CameraFeed'
-import ArmViewer3D   from './components/ArmViewer3D'
-import RobotControls from './components/RobotControls'
+import { useEffect, useState } from 'react'
+import { useStore }       from './store/useStore'
+import Header             from './components/Header'
+import SafetyBanner       from './components/SafetyBanner'
+import SafetyPanel        from './components/SafetyPanel'
+import CameraFeed         from './components/CameraFeed'
+import ArmViewer3D        from './components/ArmViewer3D'
+import RobotControls      from './components/RobotControls'
+import ControlStrip       from './components/ControlStrip'
+import ProgramPanel       from './components/ProgramPanel'
+import FaultPanel         from './components/FaultPanel'
+import ConfigureLayout    from './layouts/ConfigureLayout'
 
+// ── Toast notifications ────────────────────────────────────────────────────────
+function ToastStack() {
+  const toasts      = useStore((s) => s.toasts)
+  const dismissToast = useStore((s) => s.dismissToast)
+
+  useEffect(() => {
+    const timers = toasts.map((t) =>
+      setTimeout(() => dismissToast(t.id), 3000)
+    )
+    return () => timers.forEach(clearTimeout)
+  }, [toasts, dismissToast])
+
+  if (!toasts.length) return null
+
+  const COLORS = { success: 'var(--green)', error: 'var(--red)', info: 'var(--accent)' }
+
+  return (
+    <div style={{
+      position: 'fixed', bottom: 16, left: '50%', transform: 'translateX(-50%)',
+      zIndex: 600, display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'center',
+    }}>
+      {toasts.map((t) => (
+        <div key={t.id} style={{
+          padding: '8px 16px', borderRadius: 8, fontSize: 12,
+          background: 'var(--panel)', border: `1px solid ${COLORS[t.type] || 'var(--bd)'}`,
+          color: 'var(--t1)', boxShadow: 'var(--sh)',
+          animation: 'toastIn .2s ease',
+        }}>
+          {t.message}
+        </div>
+      ))}
+      <style>{`@keyframes toastIn { from { opacity:0; transform:translateY(8px); } }`}</style>
+    </div>
+  )
+}
+
+// ── Main App ───────────────────────────────────────────────────────────────────
 export default function App() {
   const connectWS = useStore((s) => s.connectWS)
   const mode      = useStore((s) => s.mode)
+
+  const [showConfigure, setShowConfigure] = useState(false)
 
   useEffect(() => { connectWS() }, [connectWS])
 
@@ -19,104 +63,47 @@ export default function App() {
       background: 'var(--bg)', color: 'var(--t1)',
       fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
     }}>
-      <Header />
+      <Header onConfigure={() => setShowConfigure(true)} />
+      <SafetyBanner />
 
       <div style={{
-        flex: 1, overflow: 'hidden',
+        flex: 1, overflow: 'hidden', minHeight: 0,
         display: 'grid',
         gridTemplateColumns: mode === 'engineer'
-          ? '260px 1fr 280px'
-          : '260px 1fr',
-        gridTemplateRows: '1fr',
-        gap: 10, padding: 10,
+          ? '240px 1fr 270px'
+          : '240px 1fr',
+        gap: 8, padding: 8,
       }}>
-        {/* Left column: safety + controls */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, overflow: 'auto', minHeight: 0 }}>
+        {/* Left column */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, overflow: 'auto', minHeight: 0 }}>
           <SafetyPanel />
-          <RobotControls />
+          <ControlStrip />
+          {mode !== 'engineer' && <RobotControls />}
         </div>
 
-        {/* Center: 3D arm + camera */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, overflow: 'hidden', minHeight: 0 }}>
+        {/* Center column */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, overflow: 'hidden', minHeight: 0 }}>
           <div style={{ flex: 1, minHeight: 0 }}>
             <ArmViewer3D />
           </div>
-          <div style={{ flexShrink: 0, height: 220 }}>
+          <div style={{ flexShrink: 0, height: 210 }}>
             <CameraFeed />
           </div>
         </div>
 
-        {/* Right column: engineer extras */}
+        {/* Right column (engineer) */}
         {mode === 'engineer' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, overflow: 'auto', minHeight: 0 }}>
-            <SceneGraph />
-            <LogPanel />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, overflow: 'hidden', minHeight: 0 }}>
+            <RobotControls />
+            <ProgramPanel />
           </div>
         )}
       </div>
-    </div>
-  )
-}
 
-function SceneGraph() {
-  const objects = useStore((s) => s.sceneGraph.objects)
-
-  return (
-    <div style={{
-      background: 'var(--panel)', border: '1px solid var(--bd)',
-      borderRadius: 10, padding: 14,
-    }}>
-      <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '.1em',
-        textTransform: 'uppercase', color: 'var(--tm)', marginBottom: 10 }}>
-        Scene Graph
-      </div>
-      {objects.length === 0 ? (
-        <div style={{ fontSize: 11, color: 'var(--tm)', textAlign: 'center', padding: '16px 0' }}>
-          No objects detected
-        </div>
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          {objects.slice(0, 12).map((obj, i) => (
-            <div key={i} style={{
-              display: 'flex', justifyContent: 'space-between',
-              padding: '5px 8px', borderRadius: 5,
-              background: 'var(--surf)', fontSize: 11,
-            }}>
-              <span style={{ color: 'var(--t2)' }}>{obj.label ?? `obj_${i}`}</span>
-              <span style={{ fontFamily: 'monospace', color: 'var(--acc)' }}>
-                {obj.confidence != null ? `${(obj.confidence * 100).toFixed(0)}%` : ''}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function LogPanel() {
-  const task = useStore((s) => s.task)
-
-  return (
-    <div style={{
-      background: 'var(--panel)', border: '1px solid var(--bd)',
-      borderRadius: 10, padding: 14, flex: 1, minHeight: 0,
-      display: 'flex', flexDirection: 'column',
-    }}>
-      <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '.1em',
-        textTransform: 'uppercase', color: 'var(--tm)', marginBottom: 10 }}>
-        Task Log
-      </div>
-      <div style={{
-        flex: 1, fontFamily: 'monospace', fontSize: 10,
-        color: 'var(--tm)', overflowY: 'auto',
-        lineHeight: 1.6,
-      }}>
-        <div style={{ color: task.running ? 'var(--g)' : 'var(--tm)' }}>
-          state: {task.state}
-        </div>
-        {task.paused && <div style={{ color: 'var(--y)' }}>PAUSED</div>}
-      </div>
+      {/* Floating overlays */}
+      <FaultPanel />
+      <ToastStack />
+      {showConfigure && <ConfigureLayout onClose={() => setShowConfigure(false)} />}
     </div>
   )
 }

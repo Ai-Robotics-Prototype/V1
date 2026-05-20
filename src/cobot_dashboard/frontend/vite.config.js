@@ -15,8 +15,7 @@ export default defineConfig({
     },
   },
   build: {
-    // Build directly into the directory the FastAPI server already serves
-    outDir: '../static',
-    emptyOutDir: false,   // keep three.min.js / OrbitControls.js alongside
+    outDir: 'dist',
+    emptyOutDir: true,
   },
 })

@@ -1,770 +1,896 @@
 """
-RoboAi Controller Dashboard — Professional Backend v3
-FastAPI + WebSocket + ROS2
-Fixes: point management, program library, contour detection, teach mode
+RoboAi Dashboard Server v2 — Commercial production build.
+Works with ROS2 on Jetson and standalone (simulation mode) for development.
 """
-from __future__ import annotations
+import asyncio, collections, json, math, os, random, struct, threading, time
+from typing import Optional
 
-import asyncio
-import json
-import logging
-import math
-import os
-import threading
-import time
-import uuid
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
-
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import Image, JointState
-from std_msgs.msg import Bool, Float32, String
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 try:
-    import numpy as np
-    import cv2
-    _CV2 = True
+    import rclpy
+    from rclpy.node import Node
+    from std_msgs.msg import String, Bool, Float32
+    from sensor_msgs.msg import JointState, PointCloud2
+    from geometry_msgs.msg import PoseStamped
+    ROS2 = True
 except ImportError:
-    _CV2 = False
-
-# ── Grey placeholder JPEG (shown when no camera frame is available) ────────────
-_GREY_FRAME: bytes = b''
-
-def _init_grey_frame() -> None:
-    global _GREY_FRAME
-    if not _CV2:
-        return
-    img = np.zeros((480, 640, 3), dtype=np.uint8)
-    img[:] = 45
-    cv2.putText(img, 'No Camera Signal', (162, 225),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (130, 130, 130), 2)
-    cv2.putText(img, '/cam0/color/image_raw', (192, 268),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (90, 90, 90), 1)
-    ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 60])
-    if ok:
-        _GREY_FRAME = bytes(buf)
-
-_init_grey_frame()
+    ROS2 = False
+    Node = object
 
 try:
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-    from fastapi.requests import Request
-    from fastapi.responses import JSONResponse, StreamingResponse
-    from fastapi.staticfiles import StaticFiles
-    import uvicorn
-    _FASTAPI = True
-except ImportError:
-    _FASTAPI = False
+    import cv2, numpy as np
+    CV2 = True
+except Exception:
+    CV2 = False
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s  %(levelname)-7s  %(name)s  %(message)s',
-)
-log = logging.getLogger('dashboard')
+THIS_DIR     = os.path.dirname(os.path.abspath(__file__))
+DIST_DIR     = os.path.normpath(os.path.join(THIS_DIR, '..', 'frontend', 'dist'))
+INDEX_HTML   = os.path.join(DIST_DIR, 'index.html')
+PROGRAMS_DIR = '/opt/cobot/programs'
+POINTS_FILE  = '/opt/cobot/calibration/saved_points.json'
+os.makedirs(PROGRAMS_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(POINTS_FILE), exist_ok=True)
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-_HERE        = Path(os.path.dirname(os.path.abspath(__file__)))
-_CAL_DIR     = Path('/opt/cobot/calibration')
-_PROG_DIR    = Path('/opt/cobot/programs')
-_CAL_DIR.mkdir(parents=True, exist_ok=True)
-_PROG_DIR.mkdir(parents=True, exist_ok=True)
-_SAVED_POINTS_FILE = _CAL_DIR / 'saved_points.json'
+JOINT_LIMITS = [
+    (-3.14159,  3.14159), (-3.14159, 0.0),
+    (-2.35619,  2.35619), (-3.14159, 3.14159),
+    (-2.09440,  2.09440), (-6.28318, 6.28318),
+]
+HOME        = [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]
+MAX_TORQUES = [150, 150, 150, 28, 28, 28]
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def _load_json(path: Path, default):
+ERROR_MESSAGES = {
+    0: 'No fault',           1: 'Joint limit exceeded',
+    2: 'Collision detected', 3: 'Communication timeout',
+    4: 'Overheat',           5: 'Power fault',
+}
+
+
+def _load_points():
     try:
-        if path.exists():
-            return json.loads(path.read_text())
+        if os.path.exists(POINTS_FILE):
+            with open(POINTS_FILE) as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+            # Migrate old dict format {pick, place, waypoints} → flat list
+            pts = []
+            if isinstance(data, dict):
+                for key in ('pick', 'place'):
+                    v = data.get(key)
+                    if v and isinstance(v, dict):
+                        pts.append({'name': v.get('name', key), 'joint_positions': [], 'tcp_pose': v.get('pose'), 'created_at': time.time()})
+                for wp in data.get('waypoints', []):
+                    pts.append({'name': wp.get('name', 'wp'), 'joint_positions': [], 'tcp_pose': wp.get('pose'), 'created_at': time.time()})
+            return pts
     except Exception:
         pass
-    return default
+    return []
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
-# ── Shared state ──────────────────────────────────────────────────────────────
-_state: Dict[str, Any] = {
-    'safety_zone':      'UNKNOWN',
-    'speed_scale':       0.0,
-    'estop':             True,
-    'human_proximity':   99.0,
-    'task_state':       'IDLE',
-    'joint_positions':  [0.0] * 6,
-    'joint_velocities': [0.0] * 6,
-    'tcp_pose':         {'x': 0.0, 'y': 0.0, 'z': 300.0,
-                         'rx': 0.0, 'ry': 0.0, 'rz': 0.0},
-    'detections':       [],
-    'scene_objects':    [],
-    'contours':         [],
-    'saved_points':     {},   # broadcast to frontend
-}
-_state_lock = threading.Lock()
-
-_latest_frame: bytes = b''
-_frame_lock = threading.Lock()
-_camera_active = False
-_contour_tick  = 0          # throttle contour detection to every 3 frames
-
-_ros_node: 'DashboardNode | None' = None
-
-# ── Saved points ──────────────────────────────────────────────────────────────
-_DEFAULT_SAVED_POINTS: Dict[str, Any] = {
-    'pick':      None,   # {"name": str, "pose": {x,y,z,rx,ry,rz}}
-    'place':     None,
-    'waypoints': [],     # [{"id": str, "name": str, "pose": {...}}, ...]
-}
-_saved_points: Dict[str, Any] = _load_json(_SAVED_POINTS_FILE, _DEFAULT_SAVED_POINTS)
-_data_lock = threading.Lock()
-
-def _save_saved_points() -> None:
+def _save_points(pts):
     try:
-        with _data_lock:
-            _SAVED_POINTS_FILE.write_text(json.dumps(_saved_points, indent=2))
-        # Mirror into broadcast state
-        with _state_lock:
-            _state['saved_points'] = _saved_points_summary()
-    except Exception as e:
-        log.warning(f'save_saved_points: {e}')
+        with open(POINTS_FILE, 'w') as f:
+            json.dump(pts, f, indent=2)
+    except Exception:
+        pass
 
-def _saved_points_summary() -> Dict:
-    """Compact version for WS broadcast."""
-    with _data_lock:
-        return {
-            'pick':      _saved_points.get('pick'),
-            'place':     _saved_points.get('place'),
-            'waypoints': list(_saved_points.get('waypoints', [])),
-        }
 
-# ── Program library ───────────────────────────────────────────────────────────
-def _estimate_cycle_s(steps: List[Dict]) -> float:
-    total = 0.0
-    for s in steps:
-        t = s.get('type', '')
-        if t in ('home', 'pick', 'place', 'waypoint', 'pick_variable'):
-            total += 3.0
-        elif t in ('grip_open', 'grip_close'):
-            total += 0.5
-        elif t == 'wait':
-            total += float(s.get('duration_seconds', 1.0))
-        elif t == 'loop':
-            total += 1.0
+def _default_state():
+    return {
+        't': 0,
+        'safety': {
+            'zone': 'GREEN', 'speed_scale': 1.0,
+            'estop': False,  'human_proximity': 2.4,
+        },
+        'joints': {
+            'names':      ['J1', 'J2', 'J3', 'J4', 'J5', 'J6'],
+            'positions':  list(HOME),
+            'velocities': [0.0] * 6,
+            'torques':    [0.0] * 6,
+        },
+        'task': {
+            'state': 'IDLE', 'target': None,
+            'program_step': 0, 'program_total': 0,
+            'running': False, 'paused': False,
+            'task_count': 0,  'success_count': 0,
+        },
+        'tcp_pose':    [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+        'detections':  [],
+        'scene_graph': {'objects': []},
+        'gripper':     {'state': 'open', 'position_mm': 85.0},
+        'program':     {'steps': [], 'name': 'Program 1'},
+        'robot': {
+            'connected': False, 'brand': 'generic',
+            'ip': '192.168.1.10', 'error_code': 0, 'mode': 'idle',
+        },
+        'saved_points': _load_points(),
+        'system': {
+            'ros2': ROS2, 'mock': not ROS2,
+            'uptime_s': 0, 'start_time': time.time(),
+        },
+        'speed_override': 100,
+    }
+
+
+STATE      = _default_state()
+STATE_LOCK = threading.Lock()
+START_TIME = time.time()
+_state_qs: list = []
+_lidar_qs: list = []
+_ws_lock        = threading.Lock()
+_event_log      = collections.deque(maxlen=500)
+_event_loop     = None
+_sim_t          = 0.0
+_cam_frames     = {0: None, 1: None}
+_cam_lock       = threading.Lock()
+
+
+def log_event(etype, detail, user='operator'):
+    _event_log.appendleft({
+        'ts': time.time(), 'time': time.strftime('%H:%M:%S'),
+        'type': etype, 'detail': detail, 'user': user,
+    })
+
+
+def _sim_tick():
+    global _sim_t
+    _sim_t += 0.04
+    with STATE_LOCK:
+        if STATE['safety']['estop']:
+            return
+        prox = 1.2 + math.sin(_sim_t / 8.0) * 1.0
+        STATE['safety']['human_proximity'] = round(prox, 3)
+        ovr = STATE['speed_override'] / 100.0
+        if prox > 1.2:
+            STATE['safety']['zone'] = 'GREEN'
+            STATE['safety']['speed_scale'] = round(1.0 * ovr, 3)
+        elif prox > 0.6:
+            STATE['safety']['zone'] = 'YELLOW'
+            STATE['safety']['speed_scale'] = round(0.25 * ovr, 3)
         else:
-            total += 1.0
-    return round(total, 1)
+            STATE['safety']['zone'] = 'RED'
+            STATE['safety']['speed_scale'] = 0.0
+        if not STATE['task']['running']:
+            for i in range(6):
+                b = HOME[i]
+                d = math.sin(_sim_t * (0.3 + i * 0.1)) * 0.04
+                lo, hi = JOINT_LIMITS[i]
+                STATE['joints']['positions'][i] = round(max(lo, min(hi, b + d)), 4)
+            STATE['joints']['torques'] = [
+                round(math.sin(_sim_t * (i + 1)) * 5, 2) for i in range(6)
+            ]
+        j = STATE['joints']['positions']
+        STATE['tcp_pose'] = [
+            round(math.cos(j[0]) * (0.42 * math.cos(j[1]) + 0.38 * math.cos(j[1] + j[2])), 3),
+            round(0.16 + 0.42 * (-math.sin(j[1])) + 0.38 * (-math.sin(j[1] + j[2])), 3),
+            round(math.sin(j[0]) * (0.42 * math.cos(j[1]) + 0.38 * math.cos(j[1] + j[2])), 3),
+            0.0, 0.0, 0.0,
+        ]
+        STATE['system']['uptime_s'] = round(time.time() - START_TIME, 1)
+        STATE['t'] = int(time.time() * 1000)
 
-def _list_programs() -> List[Dict]:
-    progs = []
-    for f in _PROG_DIR.glob('*.json'):
-        try:
-            progs.append(json.loads(f.read_text()))
-        except Exception:
-            pass
-    return sorted(progs, key=lambda p: p.get('created_at', ''), reverse=True)
 
-def _get_program(pid: str) -> Optional[Dict]:
-    f = _PROG_DIR / f'{pid}.json'
-    if f.exists():
-        try:
-            return json.loads(f.read_text())
-        except Exception:
-            pass
-    return None
-
-def _write_program(prog: Dict) -> None:
-    f = _PROG_DIR / f'{prog["id"]}.json'
-    f.write_text(json.dumps(prog, indent=2))
-
-def _delete_program(pid: str) -> bool:
-    f = _PROG_DIR / f'{pid}.json'
-    if f.exists():
-        f.unlink()
-        return True
-    return False
-
-# ── QoS ───────────────────────────────────────────────────────────────────────
-_CAM_QOS = QoSProfile(
-    depth=1,
-    reliability=ReliabilityPolicy.BEST_EFFORT,
-    durability=DurabilityPolicy.VOLATILE,
+app = FastAPI(title='RoboAi Dashboard', version='2.0.0')
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=['*'], allow_methods=['*'], allow_headers=['*'],
 )
 
-# ── Forward kinematics (UR5e DH parameters) ───────────────────────────────────
-def _compute_tcp_pose(joints: List[float]) -> Dict[str, float]:
-    a     = [0.0,    -0.4250, -0.3922, 0.0,    0.0,    0.0]
-    d     = [0.1625,  0.0,     0.0,    0.1333, 0.0997, 0.0996]
-    alpha = [math.pi/2, 0.0, 0.0, math.pi/2, -math.pi/2, 0.0]
 
-    def dh(th, ai, di, alp):
-        ct, st = math.cos(th), math.sin(th)
-        ca, sa = math.cos(alp), math.sin(alp)
-        return [[ct,-st*ca, st*sa,ai*ct],
-                [st, ct*ca,-ct*sa,ai*st],
-                [0,  sa,    ca,   di],
-                [0,  0,     0,    1]]
+# ── Pydantic models ────────────────────────────────────────────────────────────
+class EstopCmd(BaseModel):
+    active: bool
+    override: bool = False
 
-    def mm(A, B):
-        C = [[0.0]*4 for _ in range(4)]
-        for i in range(4):
-            for j in range(4):
-                for k in range(4):
-                    C[i][j] += A[i][k]*B[k][j]
-        return C
+class TaskCmd(BaseModel):
+    command: str
 
-    q = list(joints[:6]) + [0.0]*(6-len(joints))
-    T = [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]
-    for i in range(6):
-        T = mm(T, dh(q[i], a[i], d[i], alpha[i]))
+class JogCmd(BaseModel):
+    joint: int
+    delta: float
 
-    x, y, z = T[0][3], T[1][3], T[2][3]
-    r31, r11, r21 = T[2][0], T[0][0], T[1][0]
-    r32, r33 = T[2][1], T[2][2]
-    ry = math.atan2(-r31, math.sqrt(r11**2 + r21**2))
-    cr = math.cos(ry)
-    rz = math.atan2(r21/cr, r11/cr) if abs(cr) > 1e-6 else 0.0
-    rx = math.atan2(r32/cr, r33/cr) if abs(cr) > 1e-6 else 0.0
+class JointsCmd(BaseModel):
+    positions: list
 
-    return {'x':  round(x*1000,1), 'y':  round(y*1000,1), 'z':  round(z*1000,1),
-            'rx': round(math.degrees(rx),2), 'ry': round(math.degrees(ry),2),
-            'rz': round(math.degrees(rz),2)}
+class GripperCmd(BaseModel):
+    action: str
+    width_mm: Optional[float] = None
 
-# ── Contour detection ─────────────────────────────────────────────────────────
-def _detect_contours(img_bgr) -> List[Dict]:
-    """Edge + contour detection on BGR frame. Returns normalised polygon list."""
-    try:
-        h, w = img_bgr.shape[:2]
-        gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges   = cv2.Canny(blurred, 50, 150)
-        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        result  = []
-        for cnt in cnts:
-            area = cv2.contourArea(cnt)
-            if area < 500:
-                continue
-            peri  = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.02*peri, True)
-            pts   = [[float(p[0][0])/w, float(p[0][1])/h]
-                     for p in approx if len(approx) >= 3]
-            if len(pts) >= 3:
-                result.append({'points': pts, 'area': int(area)})
-            if len(result) >= 25:
-                break
-        return result
-    except Exception:
-        return []
+class VoiceCmd(BaseModel):
+    text: str
 
-# ── ROS2 node ─────────────────────────────────────────────────────────────────
-class DashboardNode(Node):
-    def __init__(self) -> None:
-        super().__init__('dashboard_server')
-        self._estop_pub = self.create_publisher(Bool,   '/safety/estop',  10)
-        self._task_pub  = self.create_publisher(String, '/task/command',   10)
+class TeachPointCmd(BaseModel):
+    name: str
+    joint_positions: list
+    tcp_pose: Optional[dict] = None
 
-        self.create_subscription(Image,      '/cam0/color/image_raw',    self._on_image,     _CAM_QOS)
-        self.create_subscription(String,     '/safety/zone',             self._on_zone,      10)
-        self.create_subscription(Float32,    '/safety/speed_scale',      self._on_speed,     10)
-        self.create_subscription(Bool,       '/safety/estop',            self._on_estop_rx,  10)
-        self.create_subscription(Float32,    '/safety/human_proximity',  self._on_proximity, 10)
-        self.create_subscription(String,     '/task/state',              self._on_task,      10)
-        self.create_subscription(JointState, '/joint_states',            self._on_joints,    10)
-        self.create_subscription(String,     '/perception/detections',   self._on_detections,10)
-        self.create_subscription(String,     '/perception/scene_graph',  self._on_scene,     10)
+class GoToPointCmd(BaseModel):
+    name: str
 
-        # Seed saved_points into broadcast state
-        with _state_lock:
-            _state['saved_points'] = _saved_points_summary()
+class SpeedCmd(BaseModel):
+    percent: int
 
-        self.get_logger().info('Dashboard node ready')
-
-    # ── Image ──────────────────────────────────────────────────────────────
-    def _on_image(self, msg: Image) -> None:
-        global _latest_frame, _camera_active, _contour_tick
-        if not _CV2:
-            return
-        try:
-            channels = len(msg.data) // (msg.height * msg.width)
-            img = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(
-                msg.height, msg.width, channels)
-            enc = msg.encoding.lower()
-            if enc == 'rgb8':   img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            elif enc == 'rgba8':img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-            elif enc == 'bgra8':img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            elif enc == 'mono8':img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-
-            ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if ok:
-                with _frame_lock:
-                    _latest_frame   = bytes(buf)
-                    _camera_active  = True
-
-            # Contour detection — every 3rd frame (~10Hz at 30Hz input)
-            _contour_tick += 1
-            if _contour_tick % 3 == 0:
-                contours = _detect_contours(img)
-                with _state_lock:
-                    _state['contours'] = contours
-
-        except Exception as exc:
-            self.get_logger().debug(f'image encode: {exc}')
-
-    # ── Topic callbacks ────────────────────────────────────────────────────
-    def _on_zone(self, msg):
-        with _state_lock: _state['safety_zone'] = msg.data.strip().upper()
-
-    def _on_speed(self, msg):
-        with _state_lock: _state['speed_scale'] = float(msg.data)
-
-    def _on_estop_rx(self, msg):
-        with _state_lock: _state['estop'] = bool(msg.data)
-
-    def _on_proximity(self, msg):
-        with _state_lock: _state['human_proximity'] = float(msg.data)
-
-    def _on_task(self, msg):
-        with _state_lock: _state['task_state'] = msg.data.strip()
-
-    def _on_joints(self, msg):
-        pos = list(msg.position)
-        vel = list(msg.velocity) if msg.velocity else [0.0]*len(pos)
-        tcp = _compute_tcp_pose(pos)
-        with _state_lock:
-            _state['joint_names']      = list(msg.name)
-            _state['joint_positions']  = pos
-            _state['joint_velocities'] = vel
-            _state['tcp_pose']         = tcp
-
-    def _on_detections(self, msg):
-        try:
-            parsed = json.loads(msg.data)
-            with _state_lock:
-                _state['detections'] = parsed if isinstance(parsed, list) else []
-        except Exception:
-            pass
-
-    def _on_scene(self, msg):
-        try:
-            parsed = json.loads(msg.data)
-            objs = parsed if isinstance(parsed, list) else parsed.get('objects', [])
-            with _state_lock:
-                _state['scene_objects'] = objs
-        except Exception:
-            pass
-
-    # ── Publishers ─────────────────────────────────────────────────────────
-    def publish_estop(self, active: bool) -> None:
-        b = Bool(); b.data = active
-        self._estop_pub.publish(b)
-        with _state_lock: _state['estop'] = active
-        lvl = logging.WARNING if active else logging.INFO
-        self.get_logger().log(lvl, f'E-STOP {"TRIGGERED" if active else "CLEARED"}')
-
-    def publish_task(self, command: str) -> None:
-        s = String(); s.data = command
-        self._task_pub.publish(s)
+class ProgramSaveCmd(BaseModel):
+    name: str
+    steps: list
 
 
-# ── FastAPI application ───────────────────────────────────────────────────────
-if _FASTAPI:
-
-    _ws_clients: Set[WebSocket] = set()
-
-    async def _broadcast_loop() -> None:
-        while True:
-            if _ws_clients:
-                with _state_lock:
-                    payload = json.dumps({
-                        'safety_zone':      _state['safety_zone'],
-                        'speed_scale':      _state['speed_scale'],
-                        'estop':            _state['estop'],
-                        'human_proximity':  _state['human_proximity'],
-                        'task_state':       _state['task_state'],
-                        'joint_positions':  _state['joint_positions'],
-                        'joint_velocities': _state['joint_velocities'],
-                        'tcp_pose':         _state['tcp_pose'],
-                        'detections':       _state['detections'],
-                        'scene_objects':    _state['scene_objects'],
-                        'contours':         _state['contours'],
-                        'saved_points':     _state['saved_points'],
-                        'timestamp':        time.time(),
-                    })
-                dead: Set[WebSocket] = set()
-                for ws in list(_ws_clients):
-                    try:     await ws.send_text(payload)
-                    except:  dead.add(ws)
-                _ws_clients.difference_update(dead)
-            await asyncio.sleep(0.1)
-
-    @asynccontextmanager
-    async def _lifespan(app: FastAPI):
-        asyncio.create_task(_broadcast_loop())
-        log.info('Broadcast loop started (10 Hz)')
-        yield
-
-    app = FastAPI(title='RoboAi Dashboard', lifespan=_lifespan,
-                  docs_url=None, redoc_url=None)
-
-    # ── Health / config ────────────────────────────────────────────────────
-    @app.get('/health')
-    async def health():
-        with _frame_lock: cam = _camera_active
-        return JSONResponse({'status':'ok','camera':cam,'ros':_ros_node is not None})
-
-    @app.get('/api/robot/config')
-    async def robot_config():
-        return JSONResponse({
-            'robot_name': 'Cobot 01', 'dof': 6,
-            'saved_points': _saved_points_summary(),
-            'programs': [p['name'] for p in _list_programs()],
-        })
-
-    # ── MJPEG stream ───────────────────────────────────────────────────────
-    @app.get('/stream/cam0')
-    async def stream_cam0():
-        async def _gen():
+# ── Internal helpers ──────────────────────────────────────────────────────────
+def _push_to_queues(qs, payload):
+    with _ws_lock:
+        queues = list(qs)
+    if _event_loop:
+        for q in queues:
             try:
-                while True:
-                    with _frame_lock:
-                        frame = _latest_frame or _GREY_FRAME
-                    if frame:
-                        part = (b'--frame\r\n'
-                                b'Content-Type: image/jpeg\r\n'
-                                b'Content-Length: ' + str(len(frame)).encode() + b'\r\n'
-                                b'\r\n'
-                                + frame + b'\r\n')
-                        yield part
-                    await asyncio.sleep(0.067)
-            except GeneratorExit:
+                _event_loop.call_soon_threadsafe(q.put_nowait, payload)
+            except Exception:
                 pass
-        return StreamingResponse(
-            _gen(),
-            media_type='multipart/x-mixed-replace; boundary=frame',
-            headers={
-                'Cache-Control': 'no-cache, no-store',
-                'X-Accel-Buffering': 'no',
-                'Connection': 'keep-alive',
-                'Pragma': 'no-cache',
-            }
-        )
 
-    # ── E-stop / resume ────────────────────────────────────────────────────
-    @app.post('/cmd/estop')
-    async def cmd_estop():
-        if not _ros_node:
-            return JSONResponse({'status':'error','detail':'ROS not ready'}, status_code=503)
-        _ros_node.publish_estop(True)
-        return JSONResponse({'status':'ok','estop':True})
 
-    @app.post('/cmd/resume')
-    async def cmd_resume():
-        if not _ros_node:
-            return JSONResponse({'status':'error','detail':'ROS not ready'}, status_code=503)
-        _ros_node.publish_estop(False)
-        return JSONResponse({'status':'ok','estop':False})
+def _gen_placeholder_frame(cam_id):
+    if not CV2:
+        return None
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    frame[:] = (10, 13, 18)
+    for x in range(0, 640, 60):
+        cv2.line(frame, (x, 0), (x, 480), (20, 25, 35), 1)
+    for y in range(0, 480, 60):
+        cv2.line(frame, (0, y), (640, y), (20, 25, 35), 1)
+    with STATE_LOCK:
+        dets = list(STATE['detections'])
+    for det in dets:
+        bbox = det.get('bbox_px')
+        if bbox:
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            cls   = det.get('class_name', '')
+            score = det.get('score', 0)
+            color = (239, 68, 68) if cls == 'person' else (59, 130, 246)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, f'{cls} {score:.2f}', (x1, max(y1 - 5, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+    ts = time.strftime('%H:%M:%S')
+    cv2.putText(frame, f'CAM {cam_id} | {ts}', (8, 472),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (60, 70, 80), 1)
+    ret, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    return buf.tobytes() if ret else None
 
-    # ── Jog / move ─────────────────────────────────────────────────────────
-    @app.post('/cmd/task')
-    async def cmd_task(request: Request):
-        body = await request.json()
-        cmd  = str(body.get('command','')).strip()
-        if not cmd:
-            return JSONResponse({'status':'error','detail':'command required'}, status_code=400)
-        if _ros_node: _ros_node.publish_task(cmd)
-        return JSONResponse({'status':'ok','command':cmd})
 
-    @app.post('/cmd/jog')
-    async def cmd_jog(request: Request):
-        body = await request.json()
-        if _ros_node:
-            _ros_node.publish_task(json.dumps({
-                'type':'jog_joint','joint':int(body.get('joint',0)),
-                'direction':float(body.get('direction',0)),
-                'speed':float(body.get('speed',0.05)),
-            }))
-        return JSONResponse({'status':'ok'})
+async def _mjpeg(cam_id):
+    while True:
+        with _cam_lock:
+            frame_data = _cam_frames.get(cam_id)
+        if frame_data is not None and CV2:
+            ret, buf = cv2.imencode('.jpg', frame_data, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            if ret:
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                       + buf.tobytes() + b'\r\n')
+        else:
+            data = _gen_placeholder_frame(cam_id)
+            if data:
+                yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + data + b'\r\n'
+        await asyncio.sleep(1 / 15)
 
-    @app.post('/cmd/move_tcp')
-    async def cmd_move_tcp(request: Request):
-        body = await request.json()
-        if _ros_node: _ros_node.publish_task(json.dumps({'type':'move_tcp',**body}))
-        return JSONResponse({'status':'ok'})
 
-    @app.post('/cmd/home')
-    async def cmd_home():
-        if _ros_node: _ros_node.publish_task('HOME')
-        return JSONResponse({'status':'ok'})
+def _sim_lidar():
+    pts = []
+    for _ in range(2800):
+        a = random.uniform(0, math.pi * 2)
+        r = 0.3 + random.random() ** 0.6 * 2.2
+        pts.append({
+            'x': round(r * math.cos(a), 3),
+            'y': round(random.uniform(0, 0.05), 3),
+            'z': round(r * math.sin(a), 3),
+            'i': round(random.random(), 2),
+        })
+    return pts
 
-    # ── Saved-point management ─────────────────────────────────────────────
-    @app.get('/api/saved_points')
-    async def get_saved_points():
-        return JSONResponse(_saved_points_summary())
 
-    @app.post('/cmd/set_pick')
-    async def cmd_set_pick():
-        with _state_lock: tcp = dict(_state['tcp_pose'])
-        with _data_lock:
-            _saved_points['pick'] = {
-                'name': _saved_points.get('pick',{}).get('name','Pick 1') if _saved_points.get('pick') else 'Pick 1',
-                'pose': tcp,
-            }
-        _save_saved_points()
-        return JSONResponse({'status':'ok','pick':_saved_points['pick']})
-
-    @app.post('/cmd/set_place')
-    async def cmd_set_place():
-        with _state_lock: tcp = dict(_state['tcp_pose'])
-        with _data_lock:
-            _saved_points['place'] = {
-                'name': _saved_points.get('place',{}).get('name','Place 1') if _saved_points.get('place') else 'Place 1',
-                'pose': tcp,
-            }
-        _save_saved_points()
-        return JSONResponse({'status':'ok','place':_saved_points['place']})
-
-    @app.post('/cmd/add_waypoint')
-    async def cmd_add_waypoint(request: Request):
-        body = await request.json()
-        name = str(body.get('name','')).strip()
-        if not name:
-            return JSONResponse({'status':'error','detail':'name required'}, status_code=400)
-        with _state_lock: tcp = dict(_state['tcp_pose'])
-        wp_id = f'wp_{uuid.uuid4().hex[:8]}'
-        with _data_lock:
-            _saved_points.setdefault('waypoints',[]).append(
-                {'id': wp_id, 'name': name, 'pose': tcp})
-        _save_saved_points()
-        return JSONResponse({'status':'ok','id':wp_id,'name':name,'pose':tcp})
-
-    @app.post('/cmd/rename_point')
-    async def cmd_rename_point(request: Request):
-        body = await request.json()
-        old  = str(body.get('old_name','')).strip()
-        new  = str(body.get('new_name','')).strip()
-        pid  = str(body.get('point_id','')).strip()   # optional ID for waypoints
-        if not new:
-            return JSONResponse({'status':'error','detail':'new_name required'}, status_code=400)
-        with _data_lock:
-            if old == 'pick' or (pid == 'pick'):
-                if _saved_points.get('pick'): _saved_points['pick']['name'] = new
-            elif old == 'place' or (pid == 'place'):
-                if _saved_points.get('place'): _saved_points['place']['name'] = new
-            else:
-                found = False
-                for wp in _saved_points.get('waypoints',[]):
-                    if wp.get('id') == pid or wp.get('name') == old:
-                        wp['name'] = new; found = True; break
-                if not found:
-                    return JSONResponse({'status':'error','detail':'point not found'}, status_code=404)
-        _save_saved_points()
-        return JSONResponse({'status':'ok','old_name':old,'new_name':new})
-
-    @app.post('/cmd/delete_point')
-    async def cmd_delete_point(request: Request):
-        body  = await request.json()
-        pid   = str(body.get('point_id','')).strip()
-        ptype = str(body.get('point_type','')).strip()   # pick|place|waypoint
-        with _data_lock:
-            if ptype == 'pick':
-                _saved_points['pick'] = None
-            elif ptype == 'place':
-                _saved_points['place'] = None
-            else:
-                _saved_points['waypoints'] = [
-                    wp for wp in _saved_points.get('waypoints',[])
-                    if wp.get('id') != pid]
-        _save_saved_points()
-        return JSONResponse({'status':'ok'})
-
-    @app.post('/cmd/teach_point')
-    async def cmd_teach_point(request: Request):
-        body       = await request.json()
-        point_name = str(body.get('point_name','')).strip()
-        point_id   = str(body.get('point_id','')).strip()
-        tcp_pose   = body.get('tcp_pose', None)
-        if not point_name:
-            return JSONResponse({'status':'error','detail':'point_name required'}, status_code=400)
-        if tcp_pose is None:
-            with _state_lock: tcp_pose = dict(_state['tcp_pose'])
-        with _data_lock:
-            if point_id == 'pick' or point_name == (_saved_points.get('pick') or {}).get('name',''):
-                _saved_points.setdefault('pick', {})
-                _saved_points['pick'] = {'name': point_name, 'pose': tcp_pose}
-            elif point_id == 'place' or point_name == (_saved_points.get('place') or {}).get('name',''):
-                _saved_points['place'] = {'name': point_name, 'pose': tcp_pose}
-            else:
-                updated = False
-                for wp in _saved_points.get('waypoints',[]):
-                    if wp.get('id') == point_id or wp.get('name') == point_name:
-                        wp['pose'] = tcp_pose; updated = True; break
-                if not updated:
-                    _saved_points.setdefault('waypoints',[]).append(
-                        {'id': point_id or f'wp_{uuid.uuid4().hex[:8]}',
-                         'name': point_name, 'pose': tcp_pose})
-        _save_saved_points()
-        if _ros_node:
-            _ros_node.publish_task(json.dumps({
-                'type':'set_point','name':point_name,'pose':tcp_pose}))
-        return JSONResponse({'status':'ok','point_name':point_name,'pose':tcp_pose})
-
-    # ── Run / voice ────────────────────────────────────────────────────────
-    @app.post('/cmd/run_program')
-    async def cmd_run_program(request: Request):
-        body    = await request.json()
-        program = body.get('program',[])
-        prog_id = str(body.get('program_id','')).strip()
-        if prog_id:
-            prog = _get_program(prog_id)
-            if prog:
-                program = prog.get('steps',[])
-                prog['last_run']  = _now_iso()
-                prog['run_count'] = prog.get('run_count',0) + 1
-                _write_program(prog)
-        if _ros_node:
-            _ros_node.publish_task(json.dumps({'type':'run_program','steps':program}))
-        return JSONResponse({'status':'ok','steps':len(program)})
-
-    @app.post('/cmd/voice')
-    async def cmd_voice(request: Request):
-        body = await request.json()
-        text = str(body.get('text','')).strip()
-        if _ros_node and text:
-            _ros_node.publish_task(json.dumps({'type':'voice','text':text}))
-        return JSONResponse({'status':'ok','text':text})
-
-    # ── Program library CRUD ───────────────────────────────────────────────
-    @app.get('/api/programs')
-    async def list_programs():
-        return JSONResponse(_list_programs())
-
-    @app.get('/api/programs/{pid}')
-    async def get_program(pid: str):
-        prog = _get_program(pid)
-        if not prog:
-            return JSONResponse({'status':'error','detail':'not found'}, status_code=404)
-        return JSONResponse(prog)
-
-    @app.post('/api/programs')
-    async def create_program(request: Request):
-        body  = await request.json()
-        steps = body.get('steps',[])
-        prog  = {
-            'id':                   str(uuid.uuid4()),
-            'name':                 str(body.get('name','New Program')).strip(),
-            'tags':                 body.get('tags',[]),
-            'steps':                steps,
-            'created_at':           _now_iso(),
-            'last_run':             None,
-            'run_count':            0,
-            'estimated_cycle_time_s': _estimate_cycle_s(steps),
-        }
-        _write_program(prog)
-        return JSONResponse(prog, status_code=201)
-
-    @app.put('/api/programs/{pid}')
-    async def update_program(pid: str, request: Request):
-        prog = _get_program(pid)
-        if not prog:
-            return JSONResponse({'status':'error','detail':'not found'}, status_code=404)
-        body = await request.json()
-        if 'name'  in body: prog['name']  = str(body['name']).strip()
-        if 'tags'  in body: prog['tags']  = body['tags']
-        if 'steps' in body:
-            prog['steps'] = body['steps']
-            prog['estimated_cycle_time_s'] = _estimate_cycle_s(body['steps'])
-        _write_program(prog)
-        return JSONResponse(prog)
-
-    @app.delete('/api/programs/{pid}')
-    async def delete_program(pid: str):
-        if _delete_program(pid):
-            return JSONResponse({'status':'ok'})
-        return JSONResponse({'status':'error','detail':'not found'}, status_code=404)
-
-    @app.post('/api/programs/{pid}/run')
-    async def run_program_by_id(pid: str):
-        prog = _get_program(pid)
-        if not prog:
-            return JSONResponse({'status':'error','detail':'not found'}, status_code=404)
-        prog['last_run']  = _now_iso()
-        prog['run_count'] = prog.get('run_count',0) + 1
-        _write_program(prog)
-        if _ros_node:
-            _ros_node.publish_task(json.dumps({'type':'run_program','steps':prog['steps']}))
-        return JSONResponse({'status':'ok','steps':len(prog['steps'])})
-
-    @app.post('/api/programs/{pid}/duplicate')
-    async def duplicate_program(pid: str):
-        prog = _get_program(pid)
-        if not prog:
-            return JSONResponse({'status':'error','detail':'not found'}, status_code=404)
-        new_prog = dict(prog)
-        new_prog['id']         = str(uuid.uuid4())
-        new_prog['name']       = prog['name'] + ' (copy)'
-        new_prog['created_at'] = _now_iso()
-        new_prog['last_run']   = None
-        new_prog['run_count']  = 0
-        _write_program(new_prog)
-        return JSONResponse(new_prog, status_code=201)
-
-    # ── WebSocket ──────────────────────────────────────────────────────────
-    @app.websocket('/ws')
-    async def ws_endpoint(ws: WebSocket):
-        await ws.accept()
-        _ws_clients.add(ws)
-        try:
-            while True:
+async def _sim_broadcast():
+    while True:
+        _sim_tick()
+        with STATE_LOCK:
+            payload = json.dumps(STATE)
+        with _ws_lock:
+            qs = list(_state_qs)
+        for q in qs:
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
                 try:
-                    raw = await asyncio.wait_for(ws.receive_text(), timeout=30.0)
-                    try:
-                        msg = json.loads(raw)
-                        if msg.get('type') == 'ping':
-                            await ws.send_text(json.dumps({'type':'pong'}))
-                    except Exception: pass
-                except asyncio.TimeoutError: pass
-        except WebSocketDisconnect: pass
-        except Exception: pass
-        finally: _ws_clients.discard(ws)
-
-    # ── Static files ───────────────────────────────────────────────────────
-    _STATIC = os.path.normpath(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'static'))
-
-    if os.path.isdir(_STATIC):
-        app.mount('/', StaticFiles(directory=_STATIC, html=True), name='static')
-        log.info(f'Static files → {_STATIC}')
-    else:
-        log.warning(f'Static dir not found: {_STATIC}')
-        @app.get('/')
-        async def no_frontend():
-            return JSONResponse({'error':'frontend missing'})
+                    q.get_nowait()
+                    q.put_nowait(payload)
+                except Exception:
+                    pass
+        await asyncio.sleep(0.04)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-def _spin_ros(node): rclpy.spin(node)
+# ── ROS2 node (skipped when ROS2 unavailable) ─────────────────────────────────
+_ros_node = None
 
-def main(args=None) -> None:
-    global _ros_node
-    if not _FASTAPI:
-        print('Install: pip install fastapi "uvicorn[standard]"'); return
-    if not _CV2:
-        log.warning('cv2 unavailable — camera stream + contours disabled')
-    if 'CYCLONEDDS_URI' not in os.environ:
-        cdds = '/opt/cobot/cyclonedds.xml'
-        if os.path.exists(cdds):
-            os.environ['CYCLONEDDS_URI'] = f'file://{cdds}'
-            log.info(f'CYCLONEDDS_URI → {os.environ["CYCLONEDDS_URI"]}')
-    rclpy.init(args=args)
-    _ros_node = DashboardNode()
-    threading.Thread(target=_spin_ros, args=(_ros_node,), daemon=True, name='ros-spin').start()
-    log.info('Dashboard at http://0.0.0.0:8080')
+if ROS2:
+    class DashboardNode(Node):
+        def __init__(self):
+            super().__init__('dashboard_server')
+            for topic, mtype, cb in [
+                ('/safety/status',       String,     self._on_safety),
+                ('/task/status',         String,     self._on_task),
+                ('/perception/scene_graph', String,  self._on_scene),
+                ('/perception/detections',  String,  self._on_detections),
+            ]:
+                self.create_subscription(mtype, topic, cb, 10)
+            self.create_subscription(JointState, '/joint_states',      self._on_joints,  10)
+            self.create_subscription(Bool,        '/safety/estop',      self._on_estop,   10)
+            self.create_subscription(Float32,     '/safety/speed_scale',self._on_speed,   10)
+            self.create_subscription(PointCloud2, '/perception/fused_cloud', self._on_lidar, 10)
+            self.task_pub  = self.create_publisher(String, '/task/command', 10)
+            self.estop_pub = self.create_publisher(Bool,   '/safety/estop', 10)
+            self.create_timer(0.04, self._broadcast)
+            self.get_logger().info('DashboardNode running on :8080')
+
+        def _on_safety(self, msg):
+            try:
+                d = json.loads(msg.data)
+                with STATE_LOCK:
+                    s = STATE['safety']
+                    s.update({k: d[k] for k in ['zone', 'speed_scale', 'estop'] if k in d})
+                    if 'proximity_m' in d:
+                        s['human_proximity'] = d['proximity_m']
+            except Exception:
+                pass
+
+        def _on_task(self, msg):
+            try:
+                d = json.loads(msg.data)
+                with STATE_LOCK:
+                    t = STATE['task']
+                    for k in ['state', 'target', 'task_count', 'success_count']:
+                        if k in d: t[k] = d[k]
+                    t['running'] = d.get('state') == 'RUNNING'
+                    t['paused']  = d.get('state') == 'PAUSED'
+            except Exception:
+                pass
+
+        def _on_scene(self, msg):
+            try:
+                with STATE_LOCK:
+                    STATE['scene_graph'] = json.loads(msg.data)
+            except Exception:
+                pass
+
+        def _on_detections(self, msg):
+            try:
+                with STATE_LOCK:
+                    STATE['detections'] = json.loads(msg.data).get('detections', [])
+            except Exception:
+                pass
+
+        def _on_joints(self, msg):
+            with STATE_LOCK:
+                j = STATE['joints']
+                j['names']     = list(msg.name)
+                j['positions'] = list(msg.position)
+                if msg.velocity: j['velocities'] = list(msg.velocity)
+                if msg.effort:   j['torques']    = list(msg.effort)
+                STATE['robot']['connected'] = True
+
+        def _on_estop(self, msg):
+            with STATE_LOCK:
+                STATE['safety']['estop'] = msg.data
+                if msg.data: STATE['safety']['speed_scale'] = 0.0
+
+        def _on_speed(self, msg):
+            with STATE_LOCK:
+                STATE['safety']['speed_scale'] = msg.data
+
+        def _on_lidar(self, msg):
+            pts = _pc2_to_list(msg)
+            payload = json.dumps({'points': pts})
+            _push_to_queues(_lidar_qs, payload)
+
+        def _broadcast(self):
+            with STATE_LOCK:
+                STATE['t'] = int(time.time() * 1000)
+                payload = json.dumps(STATE)
+            _push_to_queues(_state_qs, payload)
+
+        def pub_estop(self, v):
+            msg = Bool(); msg.data = v
+            self.estop_pub.publish(msg)
+
+        def pub_task(self, data):
+            msg = String(); msg.data = json.dumps(data)
+            self.task_pub.publish(msg)
+
+
+def _pc2_to_list(msg, max_pts=3500):
+    pts, step, data = [], msg.point_step, msg.data
+    total = len(data) // step
+    for i in random.sample(range(total), min(max_pts, total)):
+        try:
+            x, y, z = struct.unpack_from('fff', data, i * step)
+            inten = struct.unpack_from('f', data, i * step + 12)[0]
+            if not all(math.isfinite(v) for v in [x, y, z]): continue
+            if abs(x) > 50 or abs(y) > 50 or abs(z) > 20:   continue
+            if x == 0 and y == 0 and z == 0:                  continue
+            pts.append({
+                'x': round(x, 3), 'y': round(y, 3), 'z': round(z, 3),
+                'i': round(min(max(inten / 255, 0), 1), 2),
+            })
+        except Exception:
+            continue
+    return pts
+
+
+# ── Startup ────────────────────────────────────────────────────────────────────
+@app.on_event('startup')
+async def _startup():
+    global _event_loop
+    _event_loop = asyncio.get_event_loop()
+    if not ROS2:
+        asyncio.create_task(_sim_broadcast())
+
+
+# ── WebSockets ─────────────────────────────────────────────────────────────────
+@app.websocket('/ws/state')
+async def ws_state(ws: WebSocket):
+    await ws.accept()
+    q = asyncio.Queue(maxsize=4)
+    with _ws_lock: _state_qs.append(q)
     try:
-        uvicorn.run(app, host='0.0.0.0', port=8080, log_level='warning', access_log=False)
-    except KeyboardInterrupt: pass
+        with STATE_LOCK:
+            await ws.send_text(json.dumps(STATE))
+        while True:
+            try:
+                msg = await asyncio.wait_for(q.get(), timeout=2.0)
+                await ws.send_text(msg)
+            except asyncio.TimeoutError:
+                await ws.send_text('{"ping":true}')
+    except (WebSocketDisconnect, Exception):
+        pass
     finally:
-        _ros_node.destroy_node(); rclpy.shutdown()
-        log.info('Dashboard stopped')
+        with _ws_lock:
+            if q in _state_qs: _state_qs.remove(q)
 
-if __name__ == '__main__': main()
+
+@app.websocket('/ws/lidar')
+async def ws_lidar(ws: WebSocket):
+    await ws.accept()
+    q = asyncio.Queue(maxsize=3)
+    with _ws_lock: _lidar_qs.append(q)
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(q.get(), timeout=1.0)
+                await ws.send_text(msg)
+            except asyncio.TimeoutError:
+                await ws.send_text(json.dumps({'points': _sim_lidar()}))
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        with _ws_lock:
+            if q in _lidar_qs: _lidar_qs.remove(q)
+
+
+# ── MJPEG streams ──────────────────────────────────────────────────────────────
+@app.get('/stream/cam0')
+async def stream_cam0():
+    return StreamingResponse(
+        _mjpeg(0),
+        media_type='multipart/x-mixed-replace; boundary=frame',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )
+
+
+@app.get('/stream/cam1')
+async def stream_cam1():
+    return StreamingResponse(
+        _mjpeg(1),
+        media_type='multipart/x-mixed-replace; boundary=frame',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )
+
+
+@app.get('/stream/annotated')
+async def stream_annotated():
+    return StreamingResponse(
+        _mjpeg(0),
+        media_type='multipart/x-mixed-replace; boundary=frame',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )
+
+
+# ── Health / state ─────────────────────────────────────────────────────────────
+@app.get('/health')
+async def health():
+    with STATE_LOCK:
+        return {
+            'status': 'ok', 'ros': ROS2, 'mock': not ROS2,
+            'uptime_s': STATE['system']['uptime_s'],
+            'state_clients': len(_state_qs), 'lidar_clients': len(_lidar_qs),
+        }
+
+
+@app.get('/api/state')
+async def api_state():
+    with STATE_LOCK:
+        return dict(STATE)
+
+
+@app.get('/api/config')
+async def api_config():
+    with STATE_LOCK:
+        return {'robot': dict(STATE['robot']), 'safety': dict(STATE['safety'])}
+
+
+@app.get('/api/saved_points')
+async def api_saved_points():
+    with STATE_LOCK:
+        return STATE['saved_points']
+
+
+@app.get('/api/log')
+async def api_log():
+    return list(_event_log)
+
+
+@app.get('/api/programs')
+async def api_programs():
+    result = []
+    for f in os.listdir(PROGRAMS_DIR):
+        if f.endswith('.json'):
+            try:
+                with open(os.path.join(PROGRAMS_DIR, f)) as fp:
+                    d = json.load(fp)
+                result.append({
+                    'name': d.get('name', f[:-5]),
+                    'step_count': len(d.get('steps', [])),
+                    'file': f,
+                })
+            except Exception:
+                pass
+    return result
+
+
+@app.get('/api/programs/{name}')
+async def api_program_load(name: str):
+    path = os.path.join(PROGRAMS_DIR, f'{name}.json')
+    if not os.path.exists(path):
+        return JSONResponse(status_code=404, content={'error': 'Not found'})
+    with open(path) as f:
+        return json.load(f)
+
+
+# ── Commands ───────────────────────────────────────────────────────────────────
+@app.post('/cmd/estop')
+async def cmd_estop(body: EstopCmd):
+    with STATE_LOCK:
+        if body.active:
+            STATE['safety']['estop']       = True
+            STATE['safety']['speed_scale'] = 0.0
+            STATE['task']['running']       = False
+            STATE['task']['state']         = 'PAUSED'
+        else:
+            zone = STATE['safety']['zone']
+            if zone != 'GREEN' and not body.override:
+                return JSONResponse(
+                    status_code=400,
+                    content={'ok': False, 'error': f'Zone is {zone} — must be GREEN to release'},
+                )
+            STATE['safety']['estop'] = False
+            if zone == 'GREEN':
+                STATE['safety']['speed_scale'] = STATE['speed_override'] / 100.0
+        safety = dict(STATE['safety'])
+    if _ros_node: _ros_node.pub_estop(body.active)
+    log_event('ESTOP', f'active={body.active}')
+    return {'ok': True, 'safety': safety}
+
+
+@app.post('/cmd/resume')
+async def cmd_resume():
+    return await cmd_estop(EstopCmd(active=False))
+
+
+@app.post('/cmd/task')
+async def cmd_task(body: TaskCmd):
+    cmd = body.command.lower()
+    with STATE_LOCK:
+        if STATE['safety']['estop'] and cmd not in ('cancel', 'stop', 'home'):
+            return JSONResponse(status_code=400, content={'ok': False, 'error': 'E-Stop active'})
+        t = STATE['task']
+        if cmd in ('run', 'go'):
+            if t['running'] and not t['paused']:
+                return JSONResponse(status_code=400, content={'ok': False, 'error': 'Already running'})
+            t['running'] = True; t['paused'] = False; t['state'] = 'APPROACH'
+        elif cmd == 'pause':
+            t['paused'] = True; t['state'] = 'PAUSED'
+        elif cmd == 'resume':
+            if STATE['safety']['estop']:
+                return JSONResponse(status_code=400, content={'ok': False, 'error': 'E-Stop active'})
+            t['paused'] = False; t['state'] = 'APPROACH'
+        elif cmd == 'home':
+            t['running'] = False; t['paused'] = False; t['state'] = 'HOME'
+            STATE['joints']['positions'] = list(HOME)
+        elif cmd in ('cancel', 'stop'):
+            t['running'] = False; t['paused'] = False; t['state'] = 'IDLE'
+        task = dict(t)
+    if _ros_node: _ros_node.pub_task({'command': body.command})
+    log_event('TASK', f'command={body.command}')
+    return {'ok': True, 'task': task}
+
+
+@app.post('/cmd/home')
+async def cmd_home():
+    return await cmd_task(TaskCmd(command='home'))
+
+
+@app.post('/cmd/jog')
+async def cmd_jog(body: JogCmd):
+    with STATE_LOCK:
+        if STATE['safety']['estop']:
+            return JSONResponse(status_code=400, content={'ok': False, 'error': 'E-Stop active'})
+        if STATE['safety']['zone'] not in ('GREEN', 'YELLOW'):
+            return JSONResponse(
+                status_code=400,
+                content={'ok': False, 'error': f"Zone is {STATE['safety']['zone']} — jog requires GREEN"},
+            )
+        if not (0 <= body.joint <= 5):
+            return JSONResponse(status_code=400, content={'ok': False, 'error': f'Invalid joint {body.joint}'})
+        if abs(body.delta) > 0.5236:
+            return JSONResponse(status_code=400, content={'ok': False, 'error': 'Delta too large (max 30°)'})
+        lo, hi = JOINT_LIMITS[body.joint]
+        cur = STATE['joints']['positions'][body.joint]
+        new = round(max(lo, min(hi, cur + body.delta)), 4)
+        STATE['joints']['positions'][body.joint] = new
+        positions = list(STATE['joints']['positions'])
+    if _ros_node: _ros_node.pub_task({'type': 'jog_joint', 'joint': body.joint, 'position': new})
+    log_event('JOG', f'J{body.joint + 1} delta={body.delta:.4f} new={new:.4f}')
+    return {'ok': True, 'joints': {'positions': positions}, 'joint': body.joint, 'new_position': new}
+
+
+@app.post('/cmd/joints')
+async def cmd_joints(body: JointsCmd):
+    if len(body.positions) != 6:
+        return JSONResponse(status_code=400, content={'ok': False, 'error': 'Need 6 positions'})
+    clamped = [
+        round(max(JOINT_LIMITS[i][0], min(JOINT_LIMITS[i][1], float(p))), 4)
+        for i, p in enumerate(body.positions)
+    ]
+    with STATE_LOCK:
+        if STATE['safety']['estop']:
+            return JSONResponse(status_code=400, content={'ok': False, 'error': 'E-Stop active'})
+        STATE['joints']['positions'] = clamped
+    if _ros_node: _ros_node.pub_task({'type': 'move_joints', 'positions': clamped})
+    log_event('JOINTS', f'positions={clamped}')
+    return {'ok': True, 'joints': {'positions': clamped}}
+
+
+@app.post('/cmd/gripper')
+async def cmd_gripper(body: GripperCmd):
+    with STATE_LOCK:
+        if STATE['safety']['estop']:
+            return JSONResponse(status_code=400, content={'ok': False, 'error': 'E-Stop active'})
+        if body.action == 'open':
+            STATE['gripper'] = {'state': 'open', 'position_mm': 85.0}
+        elif body.action == 'close':
+            STATE['gripper'] = {'state': 'closed', 'position_mm': 0.0}
+        elif body.width_mm is not None:
+            mm = max(0.0, min(85.0, float(body.width_mm)))
+            STATE['gripper'] = {'state': 'open' if mm > 5 else 'closed', 'position_mm': mm}
+        gripper = dict(STATE['gripper'])
+    log_event('GRIPPER', f'action={body.action}')
+    return {'ok': True, 'gripper': gripper}
+
+
+@app.post('/cmd/voice')
+async def cmd_voice(body: VoiceCmd):
+    text     = body.text.lower().strip()
+    response = 'Command received'
+    if 'estop' in text or 'emergency' in text:
+        await cmd_estop(EstopCmd(active=True));          response = 'E-Stop triggered'
+    elif 'home' in text:
+        await cmd_task(TaskCmd(command='home'));          response = 'Moving to home'
+    elif 'pause' in text:
+        await cmd_task(TaskCmd(command='pause'));         response = 'Paused'
+    elif 'resume' in text or 'continue' in text:
+        await cmd_task(TaskCmd(command='resume'));        response = 'Resuming'
+    elif 'run' in text or 'start' in text or 'go' in text:
+        await cmd_task(TaskCmd(command='run'));           response = 'Running'
+    elif 'stop' in text or 'cancel' in text:
+        await cmd_task(TaskCmd(command='cancel'));        response = 'Stopped'
+    elif 'open' in text and 'gripper' in text:
+        await cmd_gripper(GripperCmd(action='open'));    response = 'Gripper opened'
+    elif 'close' in text and 'gripper' in text:
+        await cmd_gripper(GripperCmd(action='close'));   response = 'Gripper closed'
+    if _ros_node: _ros_node.pub_task({'type': 'voice', 'text': body.text})
+    log_event('VOICE', f'"{body.text}" → {response}')
+    return {'ok': True, 'response': response, 'input': body.text}
+
+
+@app.post('/cmd/speed_override')
+async def cmd_speed_override(body: SpeedCmd):
+    pct = max(0, min(100, body.percent))
+    with STATE_LOCK:
+        STATE['speed_override'] = pct
+        if not STATE['safety']['estop'] and STATE['safety']['zone'] == 'GREEN':
+            STATE['safety']['speed_scale'] = pct / 100.0
+    log_event('SPEED_OVERRIDE', f'{pct}%')
+    return {'ok': True, 'speed_override': pct}
+
+
+@app.post('/cmd/teach_point')
+async def cmd_teach_point(body: TeachPointCmd):
+    with STATE_LOCK:
+        pts = [p for p in STATE['saved_points'] if p.get('name') != body.name]
+        pt  = {
+            'name': body.name, 'joint_positions': body.joint_positions,
+            'tcp_pose': body.tcp_pose, 'created_at': time.time(),
+        }
+        pts.append(pt)
+        STATE['saved_points'] = pts
+    _save_points(pts)
+    log_event('TEACH_POINT', f'saved "{body.name}"')
+    return {'ok': True, 'point': pt, 'total': len(pts)}
+
+
+@app.post('/cmd/go_to_point')
+async def cmd_go_to_point(body: GoToPointCmd):
+    with STATE_LOCK:
+        pts = STATE['saved_points']
+    pt = next((p for p in pts if p.get('name') == body.name), None)
+    if not pt:
+        return JSONResponse(status_code=404, content={'ok': False, 'error': f'Point {body.name!r} not found'})
+    joints = pt.get('joint_positions')
+    if joints and len(joints) == 6:
+        log_event('GO_TO_POINT', f'"{body.name}"')
+        return await cmd_joints(JointsCmd(positions=joints))
+    return JSONResponse(status_code=400, content={'ok': False, 'error': 'No joint positions saved for this point'})
+
+
+@app.delete('/cmd/saved_point/{name}')
+async def delete_saved_point(name: str):
+    with STATE_LOCK:
+        pts = [p for p in STATE['saved_points'] if p.get('name') != name]
+        STATE['saved_points'] = pts
+    _save_points(pts)
+    return {'ok': True, 'remaining': len(pts)}
+
+
+@app.post('/cmd/pick')
+async def cmd_pick(body: dict):
+    with STATE_LOCK:
+        if STATE['safety']['estop']:
+            return JSONResponse(status_code=400, content={'ok': False, 'error': 'E-Stop active'})
+        STATE['task']['state']  = 'SELECT_TARGET'
+        STATE['task']['target'] = body.get('class_name', 'unknown')
+    if _ros_node:
+        _ros_node.pub_task({'command': 'pick', 'object_id': body.get('object_id'),
+                            'class_name': body.get('class_name')})
+    log_event('PICK', f"class={body.get('class_name')} id={body.get('object_id')}")
+    return {'ok': True}
+
+
+@app.post('/cmd/clear_error')
+async def cmd_clear_error():
+    with STATE_LOCK:
+        STATE['robot']['error_code'] = 0
+    log_event('CLEAR_ERROR', 'error cleared')
+    return {'ok': True}
+
+
+@app.post('/cmd/program/save')
+async def program_save(body: ProgramSaveCmd):
+    path = os.path.join(PROGRAMS_DIR, f'{body.name}.json')
+    data = {'name': body.name, 'steps': body.steps, 'saved_at': time.time()}
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+    with STATE_LOCK:
+        STATE['program']['name']  = body.name
+        STATE['program']['steps'] = body.steps
+    log_event('PROGRAM_SAVE', f'"{body.name}" {len(body.steps)} steps')
+    return {'ok': True, 'name': body.name, 'step_count': len(body.steps)}
+
+
+@app.post('/cmd/program/load/{name}')
+async def program_load(name: str):
+    path = os.path.join(PROGRAMS_DIR, f'{name}.json')
+    if not os.path.exists(path):
+        return JSONResponse(status_code=404, content={'ok': False, 'error': 'Not found'})
+    with open(path) as f:
+        data = json.load(f)
+    with STATE_LOCK:
+        STATE['program']['name']  = data.get('name', name)
+        STATE['program']['steps'] = data.get('steps', [])
+    log_event('PROGRAM_LOAD', f'"{name}"')
+    return {'ok': True, 'program': dict(STATE['program'])}
+
+
+@app.post('/cmd/program/add')
+async def program_add(body: dict):
+    with STATE_LOCK:
+        steps   = STATE['program']['steps']
+        new_id  = max((s['id'] for s in steps), default=0) + 1
+        step    = {
+            'id': new_id, 'type': body.get('type', 'move'),
+            'label': body.get('label', 'Step'), 'detail': body.get('detail', ''),
+            'status': 'pending',
+        }
+        steps.append(step)
+        program = dict(STATE['program'])
+    return {'ok': True, 'program': program}
+
+
+@app.post('/cmd/program/remove')
+async def program_remove(body: dict):
+    sid = body.get('id')
+    with STATE_LOCK:
+        STATE['program']['steps'] = [s for s in STATE['program']['steps'] if s['id'] != sid]
+        program = dict(STATE['program'])
+    return {'ok': True, 'program': program}
+
+
+@app.post('/cmd/program/reorder')
+async def program_reorder(body: dict):
+    ids = body.get('ids', [])
+    with STATE_LOCK:
+        by_id = {s['id']: s for s in STATE['program']['steps']}
+        STATE['program']['steps'] = [by_id[i] for i in ids if i in by_id]
+        program = dict(STATE['program'])
+    return {'ok': True, 'program': program}
+
+
+# ── Run program ────────────────────────────────────────────────────────────────
+@app.post('/cmd/run_program')
+async def cmd_run_program(body: dict):
+    prog_name = body.get('name', '')
+    with STATE_LOCK:
+        steps = STATE['program']['steps']
+    if _ros_node:
+        _ros_node.pub_task({'type': 'run_program', 'steps': steps})
+    log_event('PROGRAM_RUN', f'"{prog_name}" {len(steps)} steps')
+    return {'ok': True, 'steps': len(steps)}
+
+
+# ── Static file serving (SPA) ──────────────────────────────────────────────────
+_assets_dir = os.path.join(DIST_DIR, 'assets')
+if os.path.isdir(_assets_dir):
+    app.mount('/assets', StaticFiles(directory=_assets_dir), name='assets')
+
+
+@app.get('/{full_path:path}')
+async def spa(full_path: str):
+    candidate = os.path.join(DIST_DIR, full_path)
+    if os.path.isfile(candidate):
+        return FileResponse(candidate)
+    if os.path.isfile(INDEX_HTML):
+        return FileResponse(INDEX_HTML)
+    return JSONResponse(
+        status_code=503,
+        content={'error': 'Frontend not built', 'fix': 'cd frontend && npm run build'},
+    )
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+def _spin(node):
+    rclpy.spin(node)
+
+
+def main(args=None):
+    global _ros_node
+    import uvicorn
+    if ROS2:
+        rclpy.init(args=args)
+        _ros_node = DashboardNode()
+        threading.Thread(target=_spin, args=(_ros_node,), daemon=True).start()
+    else:
+        print('[RoboAi] ROS2 not available — simulation mode')
+    uvicorn.run(app, host='0.0.0.0', port=8080, log_level='warning')
+
+
+if __name__ == '__main__':
+    main()

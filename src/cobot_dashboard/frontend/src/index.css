@@ -1,6 +1,7 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
+  /* Core palette */
   --bg:      #0A0A0B;
   --panel:   #141416;
   --surf:    #1C1C20;
@@ -15,6 +16,34 @@
   --y:       #F5A623;
   --r:       #FF3B3B;
   --sh:      0 4px 16px rgba(0,0,0,.5);
+
+  /* Aliases for new component naming convention */
+  --bg-panel:       var(--panel);
+  --bg-surface:     var(--surf);
+  --bg-hover:       rgba(255,255,255,.05);
+  --bg-active:      rgba(255,255,255,.10);
+  --border:         var(--bd);
+  --border-focus:   var(--bdf);
+  --text-primary:   var(--t1);
+  --text-secondary: var(--t2);
+  --text-muted:     var(--tm);
+  --accent:         var(--acc);
+  --accent-dim:     rgba(59,130,246,.15);
+  --accent-border:  rgba(59,130,246,.30);
+  --green:          var(--g);
+  --green-dim:      rgba(0,196,122,.15);
+  --yellow:         var(--y);
+  --red:            var(--r);
+  --zone-red:       var(--r);
+  --purple:         #A855F7;
+
+  /* Border radii */
+  --radius-sm: 5px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  /* Typography */
+  --font-mono: ui-monospace, 'JetBrains Mono', 'SF Mono', monospace;
 }
 
 html, body, #root {
@@ -30,6 +59,10 @@ button {
   cursor: pointer;
   font-family: inherit;
   font-size: inherit;
+}
+
+input[type="range"] {
+  accent-color: var(--acc);
 }
 
 ::-webkit-scrollbar { width: 4px; }

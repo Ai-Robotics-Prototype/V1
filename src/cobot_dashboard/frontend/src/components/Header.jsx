@@ -2,21 +2,15 @@ import { useStore } from '../store/useStore'
 
 const Z_COLORS = { GREEN: '#00C47A', YELLOW: '#F5A623', RED: '#FF3B3B', UNKNOWN: '#606070' }
 
-export default function Header() {
-  const connected   = useStore((s) => s.connected)
-  const safety      = useStore((s) => s.safety)
-  const task        = useStore((s) => s.task)
-  const mode        = useStore((s) => s.mode)
-  const setMode     = useStore((s) => s.setMode)
-  const sendCommand = useStore((s) => s.sendCommand)
-
-  async function handleEstop() {
-    if (safety.estop) {
-      await sendCommand('resume', {})
-    } else {
-      await sendCommand('estop', {})
-    }
-  }
+export default function Header({ onConfigure }) {
+  const connected     = useStore((s) => s.connected)
+  const safety        = useStore((s) => s.safety)
+  const task          = useStore((s) => s.task)
+  const mode          = useStore((s) => s.mode)
+  const system        = useStore((s) => s.system)
+  const setMode       = useStore((s) => s.setMode)
+  const triggerEstop  = useStore((s) => s.triggerEstop)
+  const releaseEstop  = useStore((s) => s.releaseEstop)
 
   const zColor = Z_COLORS[safety.zone] ?? Z_COLORS.UNKNOWN
 
@@ -54,6 +48,17 @@ export default function Header() {
 
       <div style={{ flex: 1 }} />
 
+      {/* System mode badge */}
+      {system.mock && (
+        <div style={{
+          padding: '2px 8px', borderRadius: 10, fontSize: 9, fontWeight: 700,
+          background: 'rgba(168,85,247,.15)', color: '#A855F7',
+          letterSpacing: '.05em',
+        }}>
+          SIM
+        </div>
+      )}
+
       {/* Safety zone badge */}
       <div style={{
         padding: '3px 10px', borderRadius: 20, fontSize: 10, fontWeight: 700,
@@ -72,23 +77,36 @@ export default function Header() {
       <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
         <div style={{
           width: 7, height: 7, borderRadius: '50%', transition: 'all .3s',
-          background:   connected ? 'var(--g)' : 'var(--r)',
-          boxShadow:    connected ? '0 0 6px var(--g)' : 'none',
+          background: connected ? 'var(--g)' : 'var(--r)',
+          boxShadow:  connected ? '0 0 6px var(--g)' : 'none',
         }} />
         <span style={{ fontSize: 10, color: 'var(--tm)' }}>
           {connected ? 'Live' : 'Offline'}
         </span>
       </div>
 
+      {/* Configure button */}
+      {onConfigure && (
+        <button onClick={onConfigure} style={{
+          padding: '5px 10px', borderRadius: 7, border: '1px solid var(--bd)',
+          background: 'transparent', color: 'var(--tm)', fontSize: 11,
+          cursor: 'pointer',
+        }}>
+          ⚙
+        </button>
+      )}
+
       {/* E-STOP */}
-      <button onClick={handleEstop} style={{
-        padding: '7px 14px', borderRadius: 7, border: '2px solid',
-        fontSize: 12, fontWeight: 800, letterSpacing: '.06em', transition: 'all .15s',
-        borderColor: safety.estop ? '#991b1b' : 'var(--r)',
-        background:  safety.estop ? '#991b1b' : 'var(--r)',
-        color: '#fff',
-        animation: safety.estop ? 'estopPulse 1s ease infinite' : 'none',
-      }}>
+      <button
+        onClick={() => safety.estop ? releaseEstop() : triggerEstop()}
+        style={{
+          padding: '7px 14px', borderRadius: 7, border: '2px solid',
+          fontSize: 12, fontWeight: 800, letterSpacing: '.06em', transition: 'all .15s',
+          borderColor: safety.estop ? '#991b1b' : 'var(--r)',
+          background:  safety.estop ? '#991b1b' : 'var(--r)',
+          color: '#fff',
+          animation: safety.estop ? 'estopPulse 1s ease infinite' : 'none',
+        }}>
         {safety.estop ? '▪ STOPPED' : '⬛ E-STOP'}
       </button>
 
