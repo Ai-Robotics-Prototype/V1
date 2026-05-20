@@ -99,6 +99,55 @@ Latch reset: requires zone=GREEN + service call `/safety/reset_estop`.
 | feature/safety-person2 | Person 2 | human_safety, scene_graph, safety_monitor |
 | feature/robot-person3 | Person 3 | task_planner, language_interface, fleet_agent, bringup |
 
+## Dashboard v2 — Commercial Features
+
+URL: http://192.168.1.246:8080
+Start: `cd /home/teddy/cobot_ws && python3 src/cobot_dashboard/cobot_dashboard/dashboard_server.py`
+Build: `cd src/cobot_dashboard/frontend && npm run build` (outputs to `frontend/dist/`)
+
+Works without ROS2 (simulation mode — oscillating joints, safety zone cycling).
+
+### Working endpoints
+```
+POST /cmd/estop          — trigger / release with zone check (body: {active:bool})
+POST /cmd/task           — run/pause/resume/home/cancel (body: {command:str})
+POST /cmd/home           — alias for /cmd/task {command:"home"}
+POST /cmd/resume         — alias for /cmd/estop {active:false}
+POST /cmd/jog            — single joint jog (body: {joint:0-5, delta:rad})
+POST /cmd/joints         — set all 6 joints at once (body: {positions:[6]})
+POST /cmd/gripper        — open/close/width (body: {action:str, width_mm?:float})
+POST /cmd/voice          — NLP command parsing (body: {text:str})
+POST /cmd/speed_override — 0-100% speed scaling (body: {percent:int})
+POST /cmd/teach_point    — save named point to disk
+POST /cmd/go_to_point    — move to saved point
+POST /cmd/pick           — pick detected object
+POST /cmd/clear_error    — clear robot fault
+POST /cmd/program/save   — save named program to disk
+POST /cmd/program/load/{name}
+POST /cmd/program/add|remove|reorder
+GET  /api/state          — full state snapshot
+GET  /api/log            — audit trail (last 500 events)
+GET  /api/saved_points   — all teach points
+GET  /api/programs       — saved program list
+GET  /stream/cam0        — MJPEG camera stream
+GET  /stream/cam1        — MJPEG camera stream
+WS   /ws/state           — 25 Hz state broadcast (nested JSON)
+WS   /ws/lidar           — 10 Hz pointcloud
+```
+
+### Saved data
+- Teach points: `/opt/cobot/calibration/saved_points.json`
+- Programs: `/opt/cobot/programs/*.json`
+- Audit log: in-memory, 500 events, export via Configure → Log tab
+
+### Frontend components
+- `SafetyBanner` — zone/estop strip below header
+- `ControlStrip` — speed override slider, TCP position, gripper, joint bars + torque bars
+- `ProgramPanel` — program builder with save/load/run
+- `FaultPanel`   — floating fault/estop overlay
+- `ConfigureLayout` — modal with Status / Safety / Audit Log tabs
+- `ArmViewer3D`  — R3F arm with correct J4/J6 rotation.y kinematics
+
 ## Quick Commands
 
 ```bash
