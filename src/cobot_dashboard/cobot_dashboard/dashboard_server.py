@@ -23,6 +23,12 @@ except ImportError:
     Node = object
 
 try:
+    from livox_ros_driver2.msg import CustomMsg as LivoxCustomMsg
+    LIVOX = True
+except ImportError:
+    LIVOX = False
+
+try:
     import numpy as np
     from PIL import Image as PILImage
     import io as _io
@@ -119,7 +125,7 @@ def _default_state():
         'speed_override': 100,
         'perception': {
             'fps': 0.0, 'det_count': 0, 'inference_ms': 0.0,
-            'annotated_active': False, 'classes': {},
+            'annotated_active': False, 'classes': {}, 'tracker_count': 0,
         },
         'language': {
             'last_text': '', 'last_response': '', 'listening': False,
@@ -351,6 +357,9 @@ if ROS2:
             self.create_subscription(PointCloud2, '/perception/fused_cloud', self._on_lidar, 10)
             self.create_subscription(PointCloud2, '/ouster/points',          self._on_lidar, 10)
             self.create_subscription(PointCloud2, '/lidar/points',           self._on_lidar, 10)
+            if LIVOX:
+                self.create_subscription(LivoxCustomMsg, '/livox/lidar',
+                                         self._on_livox, 10)
             self.create_subscription(Image, '/cam0/cam0/color/image_raw',
                                      lambda msg: self._on_camera(msg, 0), 10)
             self.create_subscription(Image, '/cam1/cam1/color/image_raw',
@@ -387,8 +396,36 @@ if ROS2:
 
         def _on_scene(self, msg):
             try:
-                with STATE_LOCK:
-                    STATE['scene_graph'] = json.loads(msg.data)
+                raw = json.loads(msg.data)
+                # scene_graph_node publishes a dict keyed by track_id — convert to list
+                if isinstance(raw, dict) and 'objects' not in raw:
+                    obj_list = []
+                    for track_id, obj in raw.items():
+                        pos = obj.get('position', {})
+                        if isinstance(pos, dict):
+                            pos_arr = [round(pos.get('x', 0.0), 3),
+                                       round(pos.get('y', 0.0), 3),
+                                       round(pos.get('z', 0.0), 3)]
+                        elif isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                            pos_arr = [round(float(pos[i]), 3) for i in range(3)]
+                        else:
+                            pos_arr = [0.0, 0.0, 0.0]
+                        obj_list.append({
+                            'id':        track_id,
+                            'class_name': obj.get('class_id', obj.get('class_name', 'object')),
+                            'score':     round(obj.get('confidence', obj.get('score', 1.0)), 3),
+                            'position':  pos_arr,
+                            'last_seen': obj.get('last_seen', 0.0),
+                            'pickable':  obj.get('class_id', '') not in ('person',),
+                        })
+                    with STATE_LOCK:
+                        STATE['scene_graph'] = {'objects': obj_list}
+                        STATE['perception']['tracker_count'] = len(obj_list)
+                else:
+                    objects = raw.get('objects', []) if isinstance(raw, dict) else []
+                    with STATE_LOCK:
+                        STATE['scene_graph'] = {'objects': objects}
+                        STATE['perception']['tracker_count'] = len(objects)
             except Exception:
                 pass
 
@@ -486,6 +523,27 @@ if ROS2:
                 _lidar_pts = pts
             payload = json.dumps({'points': pts})
             _push_to_queues(_lidar_qs, payload)
+
+        def _on_livox(self, msg):
+            global _lidar_pts
+            try:
+                pts = []
+                for p in msg.points:
+                    if p.x == 0.0 and p.y == 0.0 and p.z == 0.0:
+                        continue
+                    pts.append([round(float(p.x), 3),
+                                 round(float(p.y), 3),
+                                 round(float(p.z), 3),
+                                 float(p.reflectivity) / 255.0])
+                if len(pts) > 8000:
+                    step = len(pts) // 8000
+                    pts  = pts[::step]
+                with _lidar_lock:
+                    _lidar_pts = pts
+                payload = json.dumps({'points': pts})
+                _push_to_queues(_lidar_qs, payload)
+            except Exception:
+                pass
 
         def _broadcast(self):
             with STATE_LOCK:

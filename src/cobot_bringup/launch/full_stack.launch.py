@@ -4,8 +4,9 @@ from launch.actions import (
     DeclareLaunchArgument, GroupAction, IncludeLaunchDescription,
     LogInfo, OpaqueFunction,
 )
-from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
@@ -23,6 +24,54 @@ def generate_launch_description():
         DeclareLaunchArgument('launch_dashboard',   default_value='true'),
         DeclareLaunchArgument('launch_fleet',       default_value='false'),
         DeclareLaunchArgument('log_level',          default_value='info'),
+        # LiDAR source: set use_ouster:=true OR use_livox:=true (mutually exclusive)
+        DeclareLaunchArgument('use_ouster',  default_value='false',
+                              description='Launch Ouster OS1 bridge (UDP 56201)'),
+        DeclareLaunchArgument('use_livox',   default_value='false',
+                              description='Launch Livox MID-360 driver'),
+        # Camera bringup
+        DeclareLaunchArgument('use_cameras', default_value='true',
+                              description='Launch RealSense cameras'),
+
+        LogInfo(msg=[
+            'RoboAi full stack — sensors: '
+            'ouster=', LaunchConfiguration('use_ouster'),
+            ' livox=', LaunchConfiguration('use_livox'),
+            ' cameras=', LaunchConfiguration('use_cameras'),
+            ' dashboard=', LaunchConfiguration('launch_dashboard'),
+            ' fleet=', LaunchConfiguration('launch_fleet'),
+        ]),
+
+        # ── Ouster OS1 bridge (use_ouster:=true) ────────────────────────────
+        Node(
+            package='cobot_bringup', executable='ouster_bridge',
+            name='ouster_bridge', output='screen',
+            condition=IfCondition(LaunchConfiguration('use_ouster')),
+        ),
+
+        # ── Livox MID-360 driver (use_livox:=true) ──────────────────────────
+        Node(
+            package='livox_ros_driver2', executable='livox_ros_driver2_node',
+            name='livox_lidar_publisher', output='screen',
+            condition=IfCondition(LaunchConfiguration('use_livox')),
+            parameters=[
+                {'xfer_format': 0},
+                {'multi_topic': 0},
+                {'data_src': 0},
+                {'publish_freq': 10.0},
+                {'output_data_type': 0},
+                {'frame_id': 'lidar_link'},
+                {'user_config_path': os.path.join(config_dir, 'mid360_config.json')},
+            ],
+            remappings=[('/livox/lidar', '/lidar/points')],
+        ),
+
+        # ── RealSense cameras (use_cameras:=true) ───────────────────────────
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(bringup_dir, 'launch', 'cameras.launch.py')),
+            condition=IfCondition(LaunchConfiguration('use_cameras')),
+        ),
 
         # Static transforms (placeholder identity)
         Node(

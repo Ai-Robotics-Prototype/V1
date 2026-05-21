@@ -24,6 +24,7 @@ function XYZBar({ value, color }) {
 export default function SceneGraphPanel() {
   const sceneGraph  = useStore((s) => s.sceneGraph)
   const sendCommand = useStore((s) => s.sendCommand)
+  const perception  = useStore((s) => s.perception)
   const objects     = sceneGraph?.objects ?? []
 
   return (
@@ -49,6 +50,11 @@ export default function SceneGraphPanel() {
         }}>
           {objects.length} tracked
         </span>
+        {(perception?.tracker_count ?? 0) > 0 && (
+          <span style={{ fontSize: 9, color: 'var(--accent)' }}>
+            · {perception.tracker_count} active
+          </span>
+        )}
       </div>
 
       <div style={{ flex: 1, overflowY: 'auto', padding: 6 }}>
@@ -60,7 +66,8 @@ export default function SceneGraphPanel() {
           const pos  = obj.position || obj.pos_3d || [0, 0, 0]
           const [x, y, z] = pos
           const cls      = obj.class_name || obj.class || 'object'
-          const conf     = obj.score != null ? Math.round(obj.score * 100) : null
+          const conf     = (obj.score ?? obj.confidence) != null
+            ? Math.round((obj.score ?? obj.confidence) * 100) : null
           const pickable = obj.pickable !== false
 
           return (

@@ -5,18 +5,25 @@ export default function LidarPanel() {
   const canvasRef = useRef(null)
   const ptsRef    = useRef([])
   const detsRef   = useRef([])
+  const objsRef   = useRef([])
   const [live,    setLive]  = useState(false)
   const [ptCount, setPtCnt] = useState(0)
   const [hz,      setHz]    = useState(0)
   const [range,   setRange] = useState(6)
 
-  // Keep detsRef in sync with store without re-running effect
+  const sceneObjects = useStore((s) => s.sceneGraph?.objects ?? [])
+
+  // Keep refs in sync with store without re-running draw effect
   useEffect(() => {
     return useStore.subscribe(
       (state) => state.detections,
       (dets) => { detsRef.current = dets || [] }
     )
   }, [])
+
+  useEffect(() => {
+    objsRef.current = sceneObjects
+  }, [sceneObjects])
 
   // ResizeObserver: keep canvas pixel dims matched to container
   useEffect(() => {
@@ -162,6 +169,49 @@ export default function LidarPanel() {
       ctx.fillStyle = '#fff'
       ctx.beginPath(); ctx.arc(cx, cy, 2, 0, Math.PI * 2); ctx.fill()
 
+      // Scene graph object overlays
+      const OBJ_COLORS = {
+        bottle:'#2563EB', box:'#16A34A', person:'#DC2626',
+        cup:'#D97706', chair:'#7C3AED', default:'#0EA5E9',
+      }
+      const sceneObjs = objsRef.current || []
+      for (const obj of sceneObjs) {
+        const pos = obj.position
+        if (!Array.isArray(pos) || pos.length < 3) continue
+        const [ox_m, , oz_m] = pos
+        const sx = cx + ox_m * scale
+        const sy = cy - oz_m * scale
+        if (sx < -20 || sx > W + 20 || sy < -20 || sy > H + 20) continue
+        const cls   = obj.class_name || 'object'
+        const color = OBJ_COLORS[cls] || OBJ_COLORS.default
+        const conf  = obj.score != null ? Math.round(obj.score * 100) : null
+        ctx.save()
+        if (cls === 'person') {
+          const pulse = 0.7 + 0.3 * Math.sin(Date.now() * 0.004)
+          ctx.globalAlpha = pulse
+          ctx.fillStyle = color
+          ctx.beginPath(); ctx.arc(sx, sy, 9, 0, Math.PI * 2); ctx.fill()
+          ctx.globalAlpha = 1
+          ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke()
+        } else {
+          const sz = 9
+          ctx.fillStyle = color
+          ctx.fillRect(sx - sz/2, sy - sz/2, sz, sz)
+          ctx.strokeStyle = '#fff'; ctx.lineWidth = 1
+          ctx.strokeRect(sx - sz/2, sy - sz/2, sz, sz)
+        }
+        const labelText = conf ? `${cls} ${conf}%` : cls
+        ctx.font = 'bold 9px sans-serif'
+        ctx.textAlign = 'center'
+        const tw = ctx.measureText(labelText).width
+        ctx.fillStyle = 'rgba(0,0,0,0.65)'
+        ctx.fillRect(sx - tw/2 - 2, sy - 20, tw + 4, 13)
+        ctx.fillStyle = color
+        ctx.textBaseline = 'bottom'
+        ctx.fillText(labelText, sx, sy - 8)
+        ctx.restore()
+      }
+
       // North label
       ctx.fillStyle   = '#6B7280'
       ctx.font        = `${Math.max(9, Math.floor(W * 0.025))}px sans-serif`
@@ -198,6 +248,11 @@ export default function LidarPanel() {
         <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>
           {ptCount.toLocaleString()} pts
         </span>
+        {sceneObjects.length > 0 && (
+          <span style={{ fontSize: 9, color: 'var(--accent)' }}>
+            · {sceneObjects.length} obj{sceneObjects.length !== 1 ? 's' : ''}
+          </span>
+        )}
 
         {hz > 0 && (
           <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>

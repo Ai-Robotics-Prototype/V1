@@ -108,21 +108,16 @@ export default function CameraPanel({ cam }) {
         </span>
 
         {cam === 0 && (perception?.fps ?? 0) > 0 && (
-          <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', color: 'var(--accent)' }}>
-            {perception.fps.toFixed(1)} fps
-          </span>
-        )}
-        {cam === 0 && (perception?.inference_ms ?? 0) > 0 && (
-          <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
-            {perception.inference_ms.toFixed(0)}ms
+          <span style={{
+            fontSize: 9, fontFamily: 'var(--font-mono)', color: 'var(--accent)',
+            padding: '1px 5px', borderRadius: 4, background: 'var(--accent-dim)',
+          }}>
+            {perception.fps.toFixed(1)}fps · {perception.inference_ms?.toFixed(0)}ms
           </span>
         )}
         {cam === 0 && (perception?.det_count ?? 0) > 0 && (
-          <span style={{
-            fontSize: 9, padding: '1px 5px', borderRadius: 6,
-            background: 'var(--accent-dim)', color: 'var(--accent)',
-          }}>
-            {perception.det_count} obj
+          <span style={{ fontSize: 9, color: 'var(--green)', fontFamily: 'var(--font-mono)' }}>
+            {perception.det_count} det
           </span>
         )}
 
@@ -159,14 +154,18 @@ export default function CameraPanel({ cam }) {
             position: 'absolute', bottom: 6, left: 6,
             display: 'flex', flexWrap: 'wrap', gap: 3, pointerEvents: 'none',
           }}>
-            {classEntries.map(([cls, cnt]) => (
-              <span key={cls} style={{
-                fontSize: 8, padding: '1px 5px', borderRadius: 4,
-                background: 'rgba(0,0,0,0.65)', color: '#fff',
-              }}>
-                {cls} ×{cnt}
-              </span>
-            ))}
+            {classEntries.slice(0, 5).map(([cls, cnt]) => {
+              const color = CLASS_COLORS[cls] || CLASS_COLORS.default
+              return (
+                <span key={cls} style={{
+                  fontSize: 9, padding: '1px 6px', borderRadius: 8,
+                  background: 'rgba(0,0,0,0.70)',
+                  color, border: `1px solid ${color}55`, fontWeight: 700,
+                }}>
+                  {cls} ×{cnt}
+                </span>
+              )
+            })}
           </div>
         )}
 
