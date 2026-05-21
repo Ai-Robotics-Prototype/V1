@@ -1,12 +1,22 @@
 import { useEffect, useRef, useState } from 'react'
+import { useStore } from '../store/useStore'
 
 export default function LidarPanel() {
   const canvasRef = useRef(null)
   const ptsRef    = useRef([])
-  const [live,    setLive]   = useState(false)
-  const [ptCount, setPtCnt]  = useState(0)
-  const [hz,      setHz]     = useState(0)
-  const [range,   setRange]  = useState(6)
+  const detsRef   = useRef([])
+  const [live,    setLive]  = useState(false)
+  const [ptCount, setPtCnt] = useState(0)
+  const [hz,      setHz]    = useState(0)
+  const [range,   setRange] = useState(6)
+
+  // Keep detsRef in sync with store without re-running effect
+  useEffect(() => {
+    return useStore.subscribe(
+      (state) => state.detections,
+      (dets) => { detsRef.current = dets || [] }
+    )
+  }, [])
 
   // ResizeObserver: keep canvas pixel dims matched to container
   useEffect(() => {
@@ -27,7 +37,7 @@ export default function LidarPanel() {
 
   useEffect(() => {
     let ws, rafId, dead = false
-    let lastFlush = performance.now()
+    let lastFlush  = performance.now()
     let flushCount = 0
 
     function connect() {
@@ -96,13 +106,9 @@ export default function LidarPanel() {
         if (rr < 2) continue
         ctx.save()
         ctx.setLineDash([4, 3])
-        ctx.beginPath()
-        ctx.arc(cx, cy, rr, 0, Math.PI * 2)
-        ctx.fillStyle   = ring.fill
-        ctx.fill()
-        ctx.strokeStyle = ring.line
-        ctx.lineWidth   = 1
-        ctx.stroke()
+        ctx.beginPath(); ctx.arc(cx, cy, rr, 0, Math.PI * 2)
+        ctx.fillStyle   = ring.fill; ctx.fill()
+        ctx.strokeStyle = ring.line; ctx.lineWidth = 1; ctx.stroke()
         ctx.restore()
       }
 
@@ -126,6 +132,28 @@ export default function LidarPanel() {
 
         ctx.fillStyle = `rgb(${r},${g},${b})`
         ctx.fillRect(sx - 1, sy - 1, 2, 2)
+      }
+
+      // Detection object overlays
+      const dets = detsRef.current
+      for (const det of dets) {
+        const pos = det.pos_3d || det.position
+        if (!pos || pos.length < 3) continue
+        const [dx, , dz] = pos   // top-down: x=lateral, z=forward
+        const ox = cx + dx * scale
+        const oy = cy - dz * scale
+        if (ox < 0 || ox > W || oy < 0 || oy > H) continue
+        const cls   = det.class_name || 'object'
+        const color = cls === 'person' ? '#DC2626' : '#2563EB'
+        ctx.save()
+        ctx.beginPath(); ctx.arc(ox, oy, 5, 0, Math.PI * 2)
+        ctx.fillStyle = color + '33'; ctx.fill()
+        ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke()
+        ctx.fillStyle = color
+        ctx.font = `${Math.max(8, Math.floor(W * 0.022))}px sans-serif`
+        ctx.textAlign = 'center'
+        ctx.fillText(cls[0].toUpperCase(), ox, oy + 3)
+        ctx.restore()
       }
 
       // Robot origin

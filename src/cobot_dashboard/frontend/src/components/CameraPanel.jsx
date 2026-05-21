@@ -1,8 +1,6 @@
 import { useState, useRef, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 
-// Pinhole projection using D435i defaults
-const FX = 615, FY = 615, CX = 320, CY = 240
 const IMG_W = 640, IMG_H = 480
 
 const CLASS_COLORS = {
@@ -10,59 +8,31 @@ const CLASS_COLORS = {
   cup: '#D97706', default: '#7C3AED',
 }
 
-function project3D(x, y, z) {
-  if (!z || z <= 0) return null
-  return {
-    u: (FX * x / z + CX) / IMG_W,
-    v: (FY * y / z + CY) / IMG_H,
-  }
-}
-
-function DetectionOverlay({ detections, camId }) {
+function DetectionOverlay({ detections }) {
   if (!detections || !detections.length) return null
-
   return (
     <svg
       style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}
       viewBox="0 0 1 1" preserveAspectRatio="none"
     >
       {detections.map((det, i) => {
-        // Support bbox_px[x1,y1,x2,y2] from detector or position[x,y,z] from scene graph
-        let x, y, w, h
-        if (det.bbox_px && det.bbox_px.length >= 4) {
-          const [x1, y1, x2, y2] = det.bbox_px
-          x = x1 / IMG_W
-          y = y1 / IMG_H
-          w = (x2 - x1) / IMG_W
-          h = (y2 - y1) / IMG_H
-        } else if (det.position && det.position.length >= 3) {
-          const p = project3D(...det.position)
-          if (!p) return null
-          w = 0.08; h = 0.1
-          x = p.u - w / 2; y = p.v - h / 2
-        } else {
-          return null
-        }
-        const cls   = det.class_name || det.class || 'object'
+        if (!det.bbox_px || det.bbox_px.length < 4) return null
+        const [x1, y1, x2, y2] = det.bbox_px
+        const x = x1 / IMG_W, y = y1 / IMG_H
+        const w = (x2 - x1) / IMG_W, h = (y2 - y1) / IMG_H
+        const cls   = det.class_name || 'object'
         const color = CLASS_COLORS[cls] || CLASS_COLORS.default
         const conf  = det.score != null ? Math.round(det.score * 100) : null
-
         return (
           <g key={i}>
-            <rect
-              x={x} y={y} width={w} height={h}
+            <rect x={x} y={y} width={w} height={h}
               fill="none" stroke={color} strokeWidth={0.003}
-              vectorEffect="non-scaling-stroke"
-            />
-            <rect
-              x={x} y={Math.max(0, y - 0.035)} width={Math.min(w, 0.18)} height={0.032}
-              fill={color} opacity={0.85}
-            />
-            <text
-              x={x + 0.005} y={Math.max(0, y - 0.006)}
+              vectorEffect="non-scaling-stroke" />
+            <rect x={x} y={Math.max(0, y - 0.035)} width={Math.min(w, 0.18)} height={0.032}
+              fill={color} opacity={0.85} />
+            <text x={x + 0.005} y={Math.max(0, y - 0.006)}
               fontSize={0.025} fill="#fff" fontFamily="Inter, sans-serif"
-              style={{ dominantBaseline: 'middle' }}
-            >
+              dominantBaseline="middle">
               {cls}{conf !== null ? ` ${conf}%` : ''}
             </text>
           </g>
@@ -74,20 +44,21 @@ function DetectionOverlay({ detections, camId }) {
 
 export default function CameraPanel({ cam }) {
   const detections = useStore((s) => s.detections)
-  const [live,    setLive]    = useState(false)
-  const [fps,     setFps]     = useState(0)
-  const [retry,   setRetry]   = useState(0)
+  const perception = useStore((s) => s.perception)
+  const [live,  setLive]  = useState(false)
+  const [fps,   setFps]   = useState(0)
+  const [retry, setRetry] = useState(0)
   const lastLoadRef = useRef(0)
   const fpsCountRef = useRef(0)
   const fpsTimerRef = useRef(null)
   const imgRef      = useRef(null)
 
-  const src   = `/stream/cam${cam}`
-  const label = `CAM ${cam}`
+  const useAnnotated = cam === 0 && perception?.annotated_active
+  const src          = useAnnotated ? '/stream/annotated' : `/stream/cam${cam}`
+  const label        = `CAM ${cam}`
 
   const onLoad = useCallback(() => {
-    setLive(true)
-    setRetry(0)
+    setLive(true); setRetry(0)
     const now = Date.now()
     if (lastLoadRef.current) {
       fpsCountRef.current++
@@ -103,14 +74,16 @@ export default function CameraPanel({ cam }) {
   }, [])
 
   const onError = useCallback(() => {
-    setLive(false)
-    setRetry((r) => r + 1)
+    setLive(false); setRetry((r) => r + 1)
     const delay = Math.min(retry * 800, 5000)
     if (fpsTimerRef.current) clearTimeout(fpsTimerRef.current)
     fpsTimerRef.current = setTimeout(() => {
       if (imgRef.current) imgRef.current.src = `${src}?t=${Date.now()}`
     }, delay)
   }, [src, retry])
+
+  const classes      = cam === 0 ? (perception?.classes || {}) : {}
+  const classEntries = Object.entries(classes)
 
   return (
     <div style={{
@@ -131,14 +104,31 @@ export default function CameraPanel({ cam }) {
           fontSize: 9, fontWeight: 700, letterSpacing: '.1em',
           textTransform: 'uppercase', color: 'var(--text-muted)',
         }}>
-          {label}
+          {label}{useAnnotated ? ' · AI' : ''}
         </span>
+
+        {cam === 0 && (perception?.fps ?? 0) > 0 && (
+          <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', color: 'var(--accent)' }}>
+            {perception.fps.toFixed(1)} fps
+          </span>
+        )}
+        {cam === 0 && (perception?.inference_ms ?? 0) > 0 && (
+          <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
+            {perception.inference_ms.toFixed(0)}ms
+          </span>
+        )}
+        {cam === 0 && (perception?.det_count ?? 0) > 0 && (
+          <span style={{
+            fontSize: 9, padding: '1px 5px', borderRadius: 6,
+            background: 'var(--accent-dim)', color: 'var(--accent)',
+          }}>
+            {perception.det_count} obj
+          </span>
+        )}
+
         <span style={{ flex: 1 }} />
         {live && fps > 0 && (
-          <span style={{
-            fontSize: 9, fontFamily: 'var(--font-mono)',
-            color: 'var(--text-muted)',
-          }}>
+          <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
             {fps} fps
           </span>
         )}
@@ -159,12 +149,27 @@ export default function CameraPanel({ cam }) {
           alt={label}
           onLoad={onLoad}
           onError={onError}
-          style={{
-            width: '100%', height: '100%',
-            objectFit: 'cover', display: 'block',
-          }}
+          style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
         />
-        <DetectionOverlay detections={detections} camId={cam} />
+        {!useAnnotated && cam === 0 && <DetectionOverlay detections={detections} />}
+
+        {/* Class count pills — bottom-left when detections active */}
+        {classEntries.length > 0 && (
+          <div style={{
+            position: 'absolute', bottom: 6, left: 6,
+            display: 'flex', flexWrap: 'wrap', gap: 3, pointerEvents: 'none',
+          }}>
+            {classEntries.map(([cls, cnt]) => (
+              <span key={cls} style={{
+                fontSize: 8, padding: '1px 5px', borderRadius: 4,
+                background: 'rgba(0,0,0,0.65)', color: '#fff',
+              }}>
+                {cls} ×{cnt}
+              </span>
+            ))}
+          </div>
+        )}
+
         {!live && (
           <div style={{
             position: 'absolute', inset: 0,

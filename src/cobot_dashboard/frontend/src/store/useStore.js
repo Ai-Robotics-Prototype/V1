@@ -46,6 +46,18 @@ export const useStore = create((set, get) => ({
   detections:   [],
   sceneGraph:   { objects: [] },
 
+  perception: {
+    fps: 0, det_count: 0, inference_ms: 0,
+    annotated_active: false, classes: {},
+  },
+  language: {
+    last_text: '', last_response: '', listening: false,
+    model_name: 'llama3.1:8b',
+  },
+  fleet: {
+    enabled: false, upload_hour: 2, last_upload: null, logs_mb: 0,
+  },
+
   gripper:      { state: 'open', position_mm: 85 },
   program:      { steps: [], name: 'Program 1' },
   robot:        { connected: false, brand: 'generic', ip: '192.168.1.10', error_code: 0, mode: 'idle' },
@@ -169,6 +181,9 @@ export const useStore = create((set, get) => ({
           sceneGraph:   d.scene_graph
             ? { objects: d.scene_graph.objects ?? [] }
             : get().sceneGraph,
+          perception:   d.perception   ?? get().perception,
+          language:     d.language     ?? get().language,
+          fleet:        d.fleet        ?? get().fleet,
           gripper:      d.gripper      ?? get().gripper,
           program:      d.program      ?? get().program,
           robot:        d.robot        ?? get().robot,

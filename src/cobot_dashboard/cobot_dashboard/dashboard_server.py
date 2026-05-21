@@ -117,6 +117,17 @@ def _default_state():
             'uptime_s': 0, 'start_time': time.time(),
         },
         'speed_override': 100,
+        'perception': {
+            'fps': 0.0, 'det_count': 0, 'inference_ms': 0.0,
+            'annotated_active': False, 'classes': {},
+        },
+        'language': {
+            'last_text': '', 'last_response': '', 'listening': False,
+            'model_name': 'llama3.1:8b',
+        },
+        'fleet': {
+            'enabled': False, 'upload_hour': 2, 'last_upload': None, 'logs_mb': 0.0,
+        },
     }
 
 
@@ -330,8 +341,10 @@ if ROS2:
                 ('/task/status',         String,     self._on_task),
                 ('/perception/scene_graph', String,  self._on_scene),
                 ('/perception/detections',  String,  self._on_detections),
+                ('/language/response',   String,     self._on_lang_response),
             ]:
                 self.create_subscription(mtype, topic, cb, 10)
+            self._lang_pub = self.create_publisher(String, '/language/text_command', 10)
             self.create_subscription(JointState, '/joint_states',      self._on_joints,  10)
             self.create_subscription(Bool,        '/safety/estop',      self._on_estop,   10)
             self.create_subscription(Float32,     '/safety/speed_scale',self._on_speed,   10)
@@ -381,10 +394,27 @@ if ROS2:
 
         def _on_detections(self, msg):
             try:
+                data = json.loads(msg.data)
+                dets = data.get('detections', [])
+                classes = {}
+                for d in dets:
+                    cn = d.get('class_name', 'unknown')
+                    classes[cn] = classes.get(cn, 0) + 1
                 with STATE_LOCK:
-                    STATE['detections'] = json.loads(msg.data).get('detections', [])
+                    STATE['detections'] = dets
+                    STATE['perception']['det_count'] = len(dets)
+                    STATE['perception']['classes']   = classes
+                    if data.get('inference_ms'):
+                        STATE['perception']['inference_ms'] = data['inference_ms']
+                    if data.get('fps'):
+                        STATE['perception']['fps'] = data['fps']
             except Exception:
                 pass
+
+        def _on_lang_response(self, msg):
+            with STATE_LOCK:
+                STATE['language']['last_response'] = msg.data
+                STATE['language']['listening'] = False
 
         def _on_joints(self, msg):
             with STATE_LOCK:
@@ -444,6 +474,8 @@ if ROS2:
                     return
                 with _cam_lock:
                     _annotated_frame = jpeg
+                with STATE_LOCK:
+                    STATE['perception']['annotated_active'] = True
             except Exception:
                 pass
 
@@ -783,6 +815,36 @@ async def cmd_voice(body: VoiceCmd):
     if _ros_node: _ros_node.pub_task({'type': 'voice', 'text': body.text})
     log_event('VOICE', f'"{body.text}" → {response}')
     return {'ok': True, 'response': response, 'input': body.text}
+
+
+@app.post('/cmd/voice_ros')
+async def cmd_voice_ros(body: VoiceCmd):
+    with STATE_LOCK:
+        STATE['language']['last_text'] = body.text
+        STATE['language']['listening'] = True
+    if _ros_node and hasattr(_ros_node, '_lang_pub'):
+        msg = String(); msg.data = body.text
+        _ros_node._lang_pub.publish(msg)
+    log_event('VOICE_ROS', f'"{body.text}"')
+    return {'ok': True, 'text': body.text}
+
+
+@app.get('/api/fleet')
+async def api_fleet():
+    logs_mb = 0.0
+    try:
+        log_dir = '/opt/cobot/logs'
+        if os.path.isdir(log_dir):
+            for fn in os.listdir(log_dir):
+                fp = os.path.join(log_dir, fn)
+                if os.path.isfile(fp):
+                    logs_mb += os.path.getsize(fp)
+            logs_mb = round(logs_mb / (1024 * 1024), 2)
+    except Exception:
+        pass
+    with STATE_LOCK:
+        STATE['fleet']['logs_mb'] = logs_mb
+        return dict(STATE['fleet'])
 
 
 @app.post('/cmd/speed_override')

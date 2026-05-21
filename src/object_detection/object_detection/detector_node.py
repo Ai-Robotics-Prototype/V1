@@ -331,8 +331,10 @@ class DetectorNode(Node):
             t, scale, pad_x, pad_y = _preprocess(rgb_np)
             t = t.to(self._device)
 
+            t0 = time.time()
             with torch.no_grad():
                 preds = self._model(t)
+            inference_ms = round((time.time() - t0) * 1000, 1)
 
             raw_preds = preds[0] if isinstance(preds, (list, tuple)) else preds
             h, w = rgb_np.shape[:2]
@@ -354,8 +356,17 @@ class DetectorNode(Node):
                 det['timestamp']  = time.time()
                 self._det_id += 1
 
-            # Publish detection JSON
-            payload = json.dumps({'detections': dets, 'count': len(dets)})
+            # Publish detection JSON (with inference timing)
+            self._frame_cnt += 1
+            now = time.time()
+            elapsed = now - self._last_log
+            fps_val  = round(self._frame_cnt / elapsed, 1) if elapsed > 0 else 0.0
+            payload = json.dumps({
+                'detections':   dets,
+                'count':        len(dets),
+                'inference_ms': inference_ms,
+                'fps':          fps_val,
+            })
             smsg = String(); smsg.data = payload
             self._det_pub.publish(smsg)
 
@@ -365,12 +376,9 @@ class DetectorNode(Node):
                 imsg = _jpeg_to_image_msg(jpeg, 'cam0_link', stamp)
                 self._ann_pub.publish(imsg)
 
-            self._frame_cnt += 1
-            now = time.time()
             if now - self._last_log >= 2.0:
-                fps = self._frame_cnt / (now - self._last_log)
                 self.get_logger().info(
-                    f'[detector] {len(dets)} dets  {fps:.1f} fps')
+                    f'[detector] {len(dets)} dets  {fps_val:.1f} fps  {inference_ms:.0f}ms')
                 self._frame_cnt = 0
                 self._last_log  = now
 

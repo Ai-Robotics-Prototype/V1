@@ -1,7 +1,10 @@
-import CameraPanel  from '../components/CameraPanel'
-import LidarPanel   from '../components/LidarPanel'
-import ProgramPanel from '../components/ProgramPanel'
-import ControlStrip from '../components/ControlStrip'
+import CameraPanel      from '../components/CameraPanel'
+import LidarPanel       from '../components/LidarPanel'
+import ProgramPanel     from '../components/ProgramPanel'
+import ControlStrip     from '../components/ControlStrip'
+import SceneGraphPanel  from '../components/SceneGraphPanel'
+import TaskFlowPanel    from '../components/TaskFlowPanel'
+import VoiceCommandBar  from '../components/VoiceCommandBar'
 
 export default function MonitorLayout() {
   return (
@@ -9,24 +12,31 @@ export default function MonitorLayout() {
       display: 'flex', flexDirection: 'column',
       height: '100%', overflow: 'hidden', padding: 8, gap: 8,
     }}>
-      {/* Main three-column area */}
+      {/* Main 4-column area */}
       <div style={{
         flex: 1, minHeight: 0,
         display: 'grid',
-        gridTemplateColumns: '1fr 30% 20%',
+        gridTemplateColumns: '1fr 1fr 28% 18%',
         gap: 8,
       }}>
-        {/* Left 50%: dual cameras side by side */}
-        <div style={{ display: 'flex', gap: 8, overflow: 'hidden', minWidth: 0 }}>
-          <CameraPanel cam={0} />
-          <CameraPanel cam={1} />
-        </div>
+        {/* CAM 0 */}
+        <CameraPanel cam={0} />
 
-        {/* Middle 30%: LiDAR top-down */}
+        {/* CAM 1 */}
+        <CameraPanel cam={1} />
+
+        {/* LiDAR top-down */}
         <LidarPanel />
 
-        {/* Right 20%: Program builder */}
-        <ProgramPanel />
+        {/* Right column: AI panels stacked */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, overflow: 'hidden', minWidth: 0 }}>
+          <SceneGraphPanel />
+          <TaskFlowPanel />
+          <VoiceCommandBar />
+          <div style={{ flex: 1, minHeight: 0 }}>
+            <ProgramPanel />
+          </div>
+        </div>
       </div>
 
       {/* Bottom: ControlStrip full width */}
