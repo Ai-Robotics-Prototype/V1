@@ -1,0 +1,9 @@
+ouster/os_driver:
+  ros__parameters:
+    sensor_hostname: '192.168.1.150'
+    lidar_mode: '1024x20'
+    point_type: xyzi
+    attempt_reconnect: true
+    dormant_period_between_reconnects: 2.0
+    max_range: 50.0
+    viz: false
