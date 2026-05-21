@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>WebGL Diagnostic</title>
+<style>body{font:14px monospace;background:#111;color:#0f0;padding:20px}
+.ok{color:#0f0}.fail{color:#f44}.warn{color:#fa0}</style>
+</head>
+<body>
+<h2>WebGL Diagnostic</h2>
+<div id="out"></div>
+<canvas id="c" width="400" height="300"
+  style="border:1px solid #333;margin-top:16px;display:block"></canvas>
+<script>
+var out = document.getElementById('out');
+function log(msg, cls) {
+  var d = document.createElement('div');
+  d.className = cls||''; d.textContent = msg;
+  out.appendChild(d);
+}
+
+var canvas = document.getElementById('c');
+
+// Test 1: webgl
+log('Testing WebGL 1...');
+var gl = null;
+try {
+  gl = canvas.getContext('webgl') ||
+       canvas.getContext('experimental-webgl');
+  if (gl) log('✓ WebGL 1: WORKS — ' + gl.getParameter(gl.RENDERER), 'ok');
+  else log('✗ WebGL 1: getContext returned null', 'fail');
+} catch(e) { log('✗ WebGL 1 exception: ' + e.message, 'fail'); }
+
+// Test 2: webgl with options
+log('Testing WebGL 1 with failIfMajorPerformanceCaveat:false...');
+try {
+  var c2 = document.createElement('canvas');
+  var gl2 = c2.getContext('webgl', {
+    failIfMajorPerformanceCaveat: false,
+    powerPreference: 'low-power',
+    antialias: false,
+    depth: true,
+    stencil: false,
+    alpha: false,
+    premultipliedAlpha: false,
+    preserveDrawingBuffer: false,
+  });
+  if (gl2) log('✓ WebGL 1 (options): WORKS — ' + gl2.getParameter(gl2.RENDERER), 'ok');
+  else log('✗ WebGL 1 (options): null', 'fail');
+} catch(e) { log('✗ WebGL 1 (options) exception: ' + e.message, 'fail'); }
+
+// Test 3: webgl2
+log('Testing WebGL 2...');
+try {
+  var c3 = document.createElement('canvas');
+  var gl3 = c3.getContext('webgl2');
+  if (gl3) log('✓ WebGL 2: WORKS — ' + gl3.getParameter(gl3.RENDERER), 'ok');
+  else log('✗ WebGL 2: null', 'fail');
+} catch(e) { log('✗ WebGL 2 exception: ' + e.message, 'fail'); }
+
+// Test 4: Canvas 2D
+log('Testing Canvas 2D...');
+try {
+  var c4 = document.createElement('canvas');
+  var ctx = c4.getContext('2d');
+  if (ctx) log('✓ Canvas 2D: WORKS', 'ok');
+  else log('✗ Canvas 2D: null', 'fail');
+} catch(e) { log('✗ Canvas 2D exception: ' + e.message, 'fail'); }
+
+// Test 5: OffscreenCanvas + WebGL
+log('Testing OffscreenCanvas...');
+try {
+  if (typeof OffscreenCanvas !== 'undefined') {
+    var oc = new OffscreenCanvas(100, 100);
+    var gl5 = oc.getContext('webgl');
+    if (gl5) log('✓ OffscreenCanvas WebGL: WORKS', 'ok');
+    else log('✗ OffscreenCanvas WebGL: null', 'fail');
+  } else {
+    log('~ OffscreenCanvas: not supported', 'warn');
+  }
+} catch(e) { log('✗ OffscreenCanvas exception: ' + e.message, 'fail'); }
+
+// Test 6: Draw something with whatever works
+log('--- Drawing test ---');
+if (gl) {
+  gl.viewport(0, 0, 400, 300);
+  gl.clearColor(0.2, 0.4, 0.6, 1.0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  log('✓ WebGL draw: blue canvas below', 'ok');
+} else {
+  var ctx2d = canvas.getContext('2d');
+  if (ctx2d) {
+    ctx2d.fillStyle = '#334';
+    ctx2d.fillRect(0,0,400,300);
+    ctx2d.fillStyle = '#4af';
+    ctx2d.font = 'bold 20px monospace';
+    ctx2d.fillText('Canvas 2D works', 80, 150);
+    log('✓ Canvas 2D draw: works (see canvas below)', 'ok');
+  }
+}
+
+// Test 7: User agent
+log('Browser: ' + navigator.userAgent, 'warn');
+log('Platform: ' + navigator.platform, 'warn');
+</script>
+</body>
+</html>
