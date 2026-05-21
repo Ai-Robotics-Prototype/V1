@@ -99,7 +99,31 @@ Latch reset: requires zone=GREEN + service call `/safety/reset_estop`.
 | feature/safety-person2 | Person 2 | human_safety, scene_graph, safety_monitor |
 | feature/robot-person3 | Person 3 | task_planner, language_interface, fleet_agent, bringup |
 
-## Dashboard v2 — Commercial Features
+## Dashboard v3 — WORKING
+
+URL: http://192.168.1.246:8080
+Theme: white/light, Standard Bots layout — NO 3D arm viewer
+Start server:  `python3 src/cobot_dashboard/cobot_dashboard/dashboard_server.py`
+Start cameras: `ros2 launch cobot_bringup cameras.launch.py`
+Start LiDAR:   `python3 src/cobot_bringup/scripts/ouster_bridge.py`
+Build frontend: `cd src/cobot_dashboard/frontend && npm run build` (outputs to `frontend/dist/`)
+
+Camera topics: /cam0/cam0/color/image_raw, /cam1/cam1/color/image_raw (serials 134322070161, 101622073355)
+LiDAR:   Ouster at 192.168.1.150 UDP 56201 → bridge at src/cobot_bringup/scripts/ouster_bridge.py
+eth0 must be 192.168.1.200/24 — set automatically by ouster_bridge.py
+cv2 BROKEN — Pillow used for all image encoding (numpy for array ops)
+Removed: 3D arm viewer (ArmViewer3D), dark theme, broken store imports
+
+Frontend layout (MonitorLayout):
+  Left 50%: dual camera feeds (CameraPanel cam=0, CameraPanel cam=1) with SVG detection overlay
+  Middle 30%: LiDAR 2D canvas top-down view with safety rings
+  Right 20%: ProgramPanel drag-drop builder with voice bar
+  Bottom: ControlStrip (RunControl | JointPositions | DetectedObjects)
+
+Store actions added: runProgram, pauseProgram, resumeProgram, cancelProgram,
+  openGripper, closeGripper, sendVoice, enableJog (30s auto-disable), reorderSteps
+
+## Dashboard v2 — Commercial Features (superseded by v3)
 
 URL: http://192.168.1.246:8080
 Start: `cd /home/teddy/cobot_ws && python3 src/cobot_dashboard/cobot_dashboard/dashboard_server.py`

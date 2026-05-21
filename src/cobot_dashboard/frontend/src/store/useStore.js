@@ -1,24 +1,28 @@
 import { create } from 'zustand'
 
 const JOINT_LIMITS = [
-  [-Math.PI,      Math.PI],
-  [-Math.PI,      0],
-  [-2.35619,      2.35619],
-  [-Math.PI,      Math.PI],
-  [-2.09440,      2.09440],
-  [-2 * Math.PI,  2 * Math.PI],
+  [-Math.PI,     Math.PI],
+  [-Math.PI,     0],
+  [-2.35619,     2.35619],
+  [-Math.PI,     Math.PI],
+  [-2.09440,     2.09440],
+  [-2 * Math.PI, 2 * Math.PI],
 ]
+
+let _jogTimer = null
 
 export const useStore = create((set, get) => ({
   // ── Connection ────────────────────────────────────────────────────────────
-  connected: false,
+  connected:  false,
+  wsStatus:   'connecting',
+  wsLatency:  0,
 
   // ── Robot state (mirrors server broadcast) ────────────────────────────────
   safety: {
     zone:            'UNKNOWN',
-    speed_scale:      0,
-    estop:            true,
-    human_proximity:  99,
+    speed_scale:     0,
+    estop:           true,
+    human_proximity: 99,
   },
 
   joints: {
@@ -32,16 +36,15 @@ export const useStore = create((set, get) => ({
     state:   'IDLE',
     running: false,
     paused:  false,
+    program_step:  0,
+    program_total: 0,
   },
 
-  // tcp_pose: [x,y,z,rx,ry,rz] in metres (sim) / mm (ROS FK)
-  tcp_pose: [0, 0, 0.5, 0, 0, 0],
+  tcp_pose:   [0, 0, 0.5, 0, 0, 0],
+  tcpPose:    { x: 0, y: 0, z: 0.5, rx: 0, ry: 0, rz: 0 },
 
-  // tcpPose: object form kept for legacy RobotControls TcpPose sub-component
-  tcpPose: { x: 0, y: 0, z: 0.5, rx: 0, ry: 0, rz: 0 },
-
-  detections:  [],
-  sceneGraph:  { objects: [] },
+  detections:   [],
+  sceneGraph:   { objects: [] },
 
   gripper:      { state: 'open', position_mm: 85 },
   program:      { steps: [], name: 'Program 1' },
@@ -54,15 +57,25 @@ export const useStore = create((set, get) => ({
   mode:          'operator',
   jogEnabled:    false,
   selectedJoint: 0,
+  activeTab:     'monitor',
 
   // ── Toast notifications ───────────────────────────────────────────────────
   toasts: [],
 
   // ── UI actions ────────────────────────────────────────────────────────────
   setMode:          (mode)  => set({ mode }),
-  enableJog:        ()      => set({ jogEnabled: true }),
-  disableJog:       ()      => set({ jogEnabled: false }),
+  setActiveTab:     (tab)   => set({ activeTab: tab }),
   setSelectedJoint: (j)     => set({ selectedJoint: j }),
+
+  enableJog: () => {
+    if (_jogTimer) clearTimeout(_jogTimer)
+    set({ jogEnabled: true })
+    _jogTimer = setTimeout(() => set({ jogEnabled: false }), 30000)
+  },
+  disableJog: () => {
+    if (_jogTimer) { clearTimeout(_jogTimer); _jogTimer = null }
+    set({ jogEnabled: false })
+  },
 
   addToast: (message, type = 'info') => set((s) => ({
     toasts: [...s.toasts.slice(-3), { id: Date.now(), message, type }],
@@ -71,16 +84,28 @@ export const useStore = create((set, get) => ({
     toasts: s.toasts.filter((t) => t.id !== id),
   })),
 
-  // ── E-Stop shortcuts ──────────────────────────────────────────────────────
-  triggerEstop: async () => {
-    return get().sendCommand('estop', { active: true })
+  // ── Program step management ───────────────────────────────────────────────
+  addProgramStep: async (step) => {
+    return get().sendCommand('program/add', step)
   },
-  releaseEstop: async () => {
-    return get().sendCommand('estop', { active: false })
+  removeProgramStep: async (id) => {
+    return get().sendCommand('program/remove', { id })
   },
-  homeRobot: async () => {
-    return get().sendCommand('task', { command: 'home' })
+  reorderSteps: async (ids) => {
+    return get().sendCommand('program/reorder', { ids })
   },
+
+  // ── Robot commands ────────────────────────────────────────────────────────
+  triggerEstop:  async () => get().sendCommand('estop',          { active: true }),
+  releaseEstop:  async () => get().sendCommand('estop',          { active: false }),
+  homeRobot:     async () => get().sendCommand('task',           { command: 'home' }),
+  runProgram:    async () => get().sendCommand('task',           { command: 'run' }),
+  pauseProgram:  async () => get().sendCommand('task',           { command: 'pause' }),
+  resumeProgram: async () => get().sendCommand('task',           { command: 'resume' }),
+  cancelProgram: async () => get().sendCommand('task',           { command: 'cancel' }),
+  openGripper:   async () => get().sendCommand('gripper',        { action: 'open' }),
+  closeGripper:  async () => get().sendCommand('gripper',        { action: 'close' }),
+  sendVoice:     async (text) => get().sendCommand('voice',      { text }),
 
   // ── Generic HTTP command wrapper ──────────────────────────────────────────
   sendCommand: async (endpoint, body) => {
@@ -97,8 +122,9 @@ export const useStore = create((set, get) => ({
     }
   },
 
-  // ── Optimistic jog with server sync ──────────────────────────────────────
+  // ── Optimistic jog with 30s guard ─────────────────────────────────────────
   jogJoint: async (joint, deltaRad) => {
+    if (!get().jogEnabled) return { ok: false, error: 'Jog not enabled' }
     const positions = [...get().joints.positions]
     const [lo, hi]  = JOINT_LIMITS[joint]
     positions[joint] = Math.max(lo, Math.min(hi, positions[joint] + deltaRad))
@@ -115,10 +141,11 @@ export const useStore = create((set, get) => ({
   connectWS: () => {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     const ws    = new WebSocket(`${proto}://${location.host}/ws/state`)
+    const _t0   = Date.now()
 
-    ws.onopen  = () => set({ connected: true })
+    ws.onopen  = () => set({ connected: true,  wsStatus: 'connected',   wsLatency: Date.now() - _t0 })
     ws.onclose = () => {
-      set({ connected: false })
+      set({ connected: false, wsStatus: 'reconnecting' })
       setTimeout(() => get().connectWS(), 2000)
     }
     ws.onerror = () => ws.close()
@@ -128,19 +155,20 @@ export const useStore = create((set, get) => ({
         const d = JSON.parse(data)
         if (d.ping) return
 
-        // tcp_pose arrives as [x,y,z,rx,ry,rz] array
         const tcp = Array.isArray(d.tcp_pose) ? d.tcp_pose : null
 
         set({
-          safety:       d.safety      ?? get().safety,
-          joints:       d.joints      ?? get().joints,
-          task:         d.task        ?? get().task,
-          tcp_pose:     tcp           ?? get().tcp_pose,
-          tcpPose:      tcp ? { x: tcp[0], y: tcp[1], z: tcp[2], rx: tcp[3], ry: tcp[4], rz: tcp[5] }
-                            : get().tcpPose,
-          detections:   d.detections  ?? get().detections,
-          sceneGraph:   d.scene_graph ? { objects: d.scene_graph.objects ?? [] }
-                                      : get().sceneGraph,
+          safety:       d.safety       ?? get().safety,
+          joints:       d.joints       ?? get().joints,
+          task:         d.task         ?? get().task,
+          tcp_pose:     tcp            ?? get().tcp_pose,
+          tcpPose:      tcp
+            ? { x: tcp[0], y: tcp[1], z: tcp[2], rx: tcp[3], ry: tcp[4], rz: tcp[5] }
+            : get().tcpPose,
+          detections:   d.detections   ?? get().detections,
+          sceneGraph:   d.scene_graph
+            ? { objects: d.scene_graph.objects ?? [] }
+            : get().sceneGraph,
           gripper:      d.gripper      ?? get().gripper,
           program:      d.program      ?? get().program,
           robot:        d.robot        ?? get().robot,
@@ -151,11 +179,13 @@ export const useStore = create((set, get) => ({
       } catch (_) {}
     }
 
-    // Keep-alive ping every 5 s
     const hb = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN)
         ws.send(JSON.stringify({ type: 'ping' }))
     }, 5000)
     ws.addEventListener('close', () => clearInterval(hb))
   },
+
+  // Alias for backward compat
+  connectWebSockets: () => get().connectWS(),
 }))

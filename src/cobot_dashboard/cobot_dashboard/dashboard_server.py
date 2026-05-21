@@ -15,7 +15,7 @@ try:
     import rclpy
     from rclpy.node import Node
     from std_msgs.msg import String, Bool, Float32
-    from sensor_msgs.msg import JointState, PointCloud2
+    from sensor_msgs.msg import JointState, PointCloud2, Image
     from geometry_msgs.msg import PoseStamped
     ROS2 = True
 except ImportError:
@@ -23,10 +23,12 @@ except ImportError:
     Node = object
 
 try:
-    import cv2, numpy as np
-    CV2 = True
+    import numpy as np
+    from PIL import Image as PILImage
+    import io as _io
+    IMAGING = True
 except Exception:
-    CV2 = False
+    IMAGING = False
 
 THIS_DIR     = os.path.dirname(os.path.abspath(__file__))
 DIST_DIR     = os.path.normpath(os.path.join(THIS_DIR, '..', 'frontend', 'dist'))
@@ -233,43 +235,29 @@ def _push_to_queues(qs, payload):
                 pass
 
 
+def _encode_jpeg(rgb_bytes, w, h):
+    buf = _io.BytesIO()
+    PILImage.frombytes('RGB', (w, h), rgb_bytes).save(buf, 'JPEG', quality=75)
+    return buf.getvalue()
+
+
 def _gen_placeholder_frame(cam_id):
-    if not CV2:
+    if not IMAGING:
         return None
-    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    frame[:] = (10, 13, 18)
-    for x in range(0, 640, 60):
-        cv2.line(frame, (x, 0), (x, 480), (20, 25, 35), 1)
-    for y in range(0, 480, 60):
-        cv2.line(frame, (0, y), (640, y), (20, 25, 35), 1)
-    with STATE_LOCK:
-        dets = list(STATE['detections'])
-    for det in dets:
-        bbox = det.get('bbox_px')
-        if bbox:
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            cls   = det.get('class_name', '')
-            score = det.get('score', 0)
-            color = (239, 68, 68) if cls == 'person' else (59, 130, 246)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, f'{cls} {score:.2f}', (x1, max(y1 - 5, 15)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-    ts = time.strftime('%H:%M:%S')
-    cv2.putText(frame, f'CAM {cam_id} | {ts}', (8, 472),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (60, 70, 80), 1)
-    ret, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-    return buf.tobytes() if ret else None
+    arr = np.full((480, 640, 3), (18, 13, 10), dtype=np.uint8)
+    img = PILImage.fromarray(arr, 'RGB')
+    buf = _io.BytesIO()
+    img.save(buf, 'JPEG', quality=60)
+    return buf.getvalue()
 
 
 async def _mjpeg(cam_id):
     while True:
         with _cam_lock:
             frame_data = _cam_frames.get(cam_id)
-        if frame_data is not None and CV2:
-            ret, buf = cv2.imencode('.jpg', frame_data, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            if ret:
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                       + buf.tobytes() + b'\r\n')
+        if frame_data is not None:
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                   + frame_data + b'\r\n')
         else:
             data = _gen_placeholder_frame(cam_id)
             if data:
@@ -328,6 +316,11 @@ if ROS2:
             self.create_subscription(Bool,        '/safety/estop',      self._on_estop,   10)
             self.create_subscription(Float32,     '/safety/speed_scale',self._on_speed,   10)
             self.create_subscription(PointCloud2, '/perception/fused_cloud', self._on_lidar, 10)
+            self.create_subscription(PointCloud2, '/ouster/points', self._on_lidar, 10)
+            self.create_subscription(Image, '/cam0/cam0/color/image_raw',
+                                     lambda msg: self._on_camera(msg, 0), 10)
+            self.create_subscription(Image, '/cam1/cam1/color/image_raw',
+                                     lambda msg: self._on_camera(msg, 1), 10)
             self.task_pub  = self.create_publisher(String, '/task/command', 10)
             self.estop_pub = self.create_publisher(Bool,   '/safety/estop', 10)
             self.create_timer(0.04, self._broadcast)
@@ -388,6 +381,29 @@ if ROS2:
             with STATE_LOCK:
                 STATE['safety']['speed_scale'] = msg.data
 
+        def _on_camera(self, msg, cam_id):
+            if not IMAGING:
+                return
+            try:
+                enc  = msg.encoding
+                h, w = msg.height, msg.width
+                raw  = bytes(msg.data)
+                if enc == 'rgb8':
+                    jpeg = _encode_jpeg(raw, w, h)
+                elif enc == 'bgr8':
+                    arr  = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)
+                    jpeg = _encode_jpeg(arr[:, :, ::-1].tobytes(), w, h)
+                elif enc == 'mono8':
+                    arr  = np.frombuffer(raw, dtype=np.uint8).reshape(h, w)
+                    rgb  = np.stack([arr, arr, arr], axis=2).tobytes()
+                    jpeg = _encode_jpeg(rgb, w, h)
+                else:
+                    return
+                with _cam_lock:
+                    _cam_frames[cam_id] = jpeg
+            except Exception:
+                pass
+
         def _on_lidar(self, msg):
             pts = _pc2_to_list(msg)
             payload = json.dumps({'points': pts})
@@ -409,18 +425,25 @@ if ROS2:
 
 
 def _pc2_to_list(msg, max_pts=3500):
+    fo = {f.name: f.offset for f in msg.fields}
+    ox = fo.get('x', 0)
+    oy = fo.get('y', 4)
+    oz = fo.get('z', 8)
+    oi = fo.get('intensity', fo.get('i', fo.get('signal', 12)))
     pts, step, data = [], msg.point_step, msg.data
     total = len(data) // step
     for i in random.sample(range(total), min(max_pts, total)):
         try:
-            x, y, z = struct.unpack_from('fff', data, i * step)
-            inten = struct.unpack_from('f', data, i * step + 12)[0]
+            x = struct.unpack_from('f', data, i * step + ox)[0]
+            y = struct.unpack_from('f', data, i * step + oy)[0]
+            z = struct.unpack_from('f', data, i * step + oz)[0]
+            inten = struct.unpack_from('f', data, i * step + oi)[0]
             if not all(math.isfinite(v) for v in [x, y, z]): continue
-            if abs(x) > 50 or abs(y) > 50 or abs(z) > 20:   continue
+            if abs(x) > 50 or abs(y) > 50 or abs(z) > 50:   continue
             if x == 0 and y == 0 and z == 0:                  continue
             pts.append({
                 'x': round(x, 3), 'y': round(y, 3), 'z': round(z, 3),
-                'i': round(min(max(inten / 255, 0), 1), 2),
+                'i': round(min(max(inten / 255.0, 0.0), 1.0), 2),
             })
         except Exception:
             continue
@@ -430,10 +453,9 @@ def _pc2_to_list(msg, max_pts=3500):
 # ── Startup ────────────────────────────────────────────────────────────────────
 @app.on_event('startup')
 async def _startup():
-    global _event_loop
-    _event_loop = asyncio.get_event_loop()
-    if not ROS2:
-        asyncio.create_task(_sim_broadcast())
+    # _event_loop and sim broadcast are wired in main()/_run().
+    # This hook is kept as an extension point.
+    pass
 
 
 # ── WebSockets ─────────────────────────────────────────────────────────────────
@@ -881,15 +903,29 @@ def _spin(node):
 
 
 def main(args=None):
-    global _ros_node
+    global _ros_node, _event_loop
     import uvicorn
+
     if ROS2:
         rclpy.init(args=args)
         _ros_node = DashboardNode()
         threading.Thread(target=_spin, args=(_ros_node,), daemon=True).start()
     else:
         print('[RoboAi] ROS2 not available — simulation mode')
-    uvicorn.run(app, host='0.0.0.0', port=8080, log_level='warning')
+
+    config = uvicorn.Config(app, host='0.0.0.0', port=8080, log_level='info', loop='asyncio')
+    server = uvicorn.Server(config)
+
+    async def _run():
+        global _event_loop
+        _event_loop = asyncio.get_running_loop()
+        if not ROS2:
+            asyncio.create_task(_sim_broadcast())
+        elif _ros_node:
+            _ros_node._loop = _event_loop
+        await server.serve()
+
+    asyncio.run(_run())
 
 
 if __name__ == '__main__':
