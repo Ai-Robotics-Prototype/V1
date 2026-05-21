@@ -125,12 +125,15 @@ STATE_LOCK = threading.Lock()
 START_TIME = time.time()
 _state_qs: list = []
 _lidar_qs: list = []
-_ws_lock        = threading.Lock()
-_event_log      = collections.deque(maxlen=500)
-_event_loop     = None
-_sim_t          = 0.0
-_cam_frames     = {0: None, 1: None}
-_cam_lock       = threading.Lock()
+_ws_lock         = threading.Lock()
+_event_log       = collections.deque(maxlen=500)
+_event_loop      = None
+_sim_t           = 0.0
+_cam_frames      = {0: None, 1: None}
+_cam_lock        = threading.Lock()
+_annotated_frame = None
+_lidar_pts: list = []
+_lidar_lock      = threading.Lock()
 
 
 def log_event(etype, detail, user='operator'):
@@ -265,6 +268,23 @@ async def _mjpeg(cam_id):
         await asyncio.sleep(1 / 15)
 
 
+async def _mjpeg_annotated():
+    while True:
+        with _cam_lock:
+            frame_data = _annotated_frame
+        if frame_data is not None:
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                   + frame_data + b'\r\n')
+        else:
+            # Fall back to cam0 raw
+            with _cam_lock:
+                raw = _cam_frames.get(0)
+            data = raw or _gen_placeholder_frame(0)
+            if data:
+                yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + data + b'\r\n'
+        await asyncio.sleep(1 / 15)
+
+
 def _sim_lidar():
     pts = []
     for _ in range(2800):
@@ -316,11 +336,14 @@ if ROS2:
             self.create_subscription(Bool,        '/safety/estop',      self._on_estop,   10)
             self.create_subscription(Float32,     '/safety/speed_scale',self._on_speed,   10)
             self.create_subscription(PointCloud2, '/perception/fused_cloud', self._on_lidar, 10)
-            self.create_subscription(PointCloud2, '/ouster/points', self._on_lidar, 10)
+            self.create_subscription(PointCloud2, '/ouster/points',          self._on_lidar, 10)
+            self.create_subscription(PointCloud2, '/lidar/points',           self._on_lidar, 10)
             self.create_subscription(Image, '/cam0/cam0/color/image_raw',
                                      lambda msg: self._on_camera(msg, 0), 10)
             self.create_subscription(Image, '/cam1/cam1/color/image_raw',
                                      lambda msg: self._on_camera(msg, 1), 10)
+            self.create_subscription(Image, '/perception/annotated_image',
+                                     self._on_annotated, 5)
             self.task_pub  = self.create_publisher(String, '/task/command', 10)
             self.estop_pub = self.create_publisher(Bool,   '/safety/estop', 10)
             self.create_timer(0.04, self._broadcast)
@@ -404,8 +427,31 @@ if ROS2:
             except Exception:
                 pass
 
+        def _on_annotated(self, msg):
+            global _annotated_frame
+            if not IMAGING:
+                return
+            try:
+                enc = msg.encoding
+                raw = bytes(msg.data)
+                h, w = msg.height, msg.width
+                if enc == 'rgb8':
+                    jpeg = _encode_jpeg(raw, w, h)
+                elif enc == 'bgr8':
+                    arr  = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)
+                    jpeg = _encode_jpeg(arr[:, :, ::-1].tobytes(), w, h)
+                else:
+                    return
+                with _cam_lock:
+                    _annotated_frame = jpeg
+            except Exception:
+                pass
+
         def _on_lidar(self, msg):
+            global _lidar_pts
             pts = _pc2_to_list(msg)
+            with _lidar_lock:
+                _lidar_pts = pts
             payload = json.dumps({'points': pts})
             _push_to_queues(_lidar_qs, payload)
 
@@ -491,7 +537,12 @@ async def ws_lidar(ws: WebSocket):
                 msg = await asyncio.wait_for(q.get(), timeout=1.0)
                 await ws.send_text(msg)
             except asyncio.TimeoutError:
-                await ws.send_text(json.dumps({'points': _sim_lidar()}))
+                with _lidar_lock:
+                    cached = list(_lidar_pts)
+                if cached:
+                    await ws.send_text(json.dumps({'points': cached}))
+                else:
+                    await ws.send_text(json.dumps({'points': _sim_lidar()}))
     except (WebSocketDisconnect, Exception):
         pass
     finally:
@@ -521,7 +572,7 @@ async def stream_cam1():
 @app.get('/stream/annotated')
 async def stream_annotated():
     return StreamingResponse(
-        _mjpeg(0),
+        _mjpeg_annotated(),
         media_type='multipart/x-mixed-replace; boundary=frame',
         headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
     )

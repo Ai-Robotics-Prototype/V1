@@ -1,16 +1,34 @@
 import { useEffect, useRef, useState } from 'react'
 
-const CANVAS_PX = 400
-
 export default function LidarPanel() {
   const canvasRef = useRef(null)
   const ptsRef    = useRef([])
   const [live,    setLive]   = useState(false)
   const [ptCount, setPtCnt]  = useState(0)
+  const [hz,      setHz]     = useState(0)
   const [range,   setRange]  = useState(6)
+
+  // ResizeObserver: keep canvas pixel dims matched to container
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const parent = canvas.parentElement
+    if (!parent) return
+    const ro = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect
+      canvas.width  = Math.max(1, Math.floor(width))
+      canvas.height = Math.max(1, Math.floor(height))
+    })
+    ro.observe(parent)
+    canvas.width  = parent.offsetWidth  || 400
+    canvas.height = parent.offsetHeight || 400
+    return () => ro.disconnect()
+  }, [])
 
   useEffect(() => {
     let ws, rafId, dead = false
+    let lastFlush = performance.now()
+    let flushCount = 0
 
     function connect() {
       if (dead) return
@@ -24,6 +42,13 @@ export default function LidarPanel() {
           const d = JSON.parse(data)
           ptsRef.current = d.points || []
           setPtCnt(ptsRef.current.length)
+          flushCount++
+          if (flushCount >= 10) {
+            const now = performance.now()
+            setHz(Math.round(10000 / Math.max(1, now - lastFlush)))
+            lastFlush  = now
+            flushCount = 0
+          }
         } catch (_) {}
       }
     }
@@ -33,14 +58,15 @@ export default function LidarPanel() {
       if (!canvas) { rafId = requestAnimationFrame(draw); return }
       const ctx   = canvas.getContext('2d')
       const W = canvas.width, H = canvas.height
+      if (!W || !H) { rafId = requestAnimationFrame(draw); return }
       const cx = W / 2, cy = H / 2
-      const scale = W / (range * 2)
+      const scale = Math.min(W, H) / (range * 2)
 
-      // White background
+      // Background
       ctx.fillStyle = '#FFFFFF'
       ctx.fillRect(0, 0, W, H)
 
-      // Grid lines every 1m — light grey
+      // Grid
       ctx.strokeStyle = '#E5E7EB'
       ctx.lineWidth   = 1
       for (let m = 1; m <= range; m++) {
@@ -54,54 +80,65 @@ export default function LidarPanel() {
       }
       // Crosshair
       ctx.strokeStyle = '#D1D5DB'
-      ctx.lineWidth   = 1
       ctx.beginPath()
       ctx.moveTo(cx, 0); ctx.lineTo(cx, H)
       ctx.moveTo(0, cy); ctx.lineTo(W, cy)
       ctx.stroke()
 
-      // Safety rings
+      // Safety rings (dashed)
       const rings = [
-        { r: 1.2, color: 'rgba(22,163,74,0.25)',   lineColor: '#16A34A' },
-        { r: 0.6, color: 'rgba(217,119,6,0.30)',   lineColor: '#D97706' },
-        { r: 0.3, color: 'rgba(220,38,38,0.35)',   lineColor: '#DC2626' },
+        { r: 1.2, fill: 'rgba(22,163,74,0.15)',  line: '#16A34A' },
+        { r: 0.6, fill: 'rgba(217,119,6,0.25)',  line: '#D97706' },
+        { r: 0.3, fill: 'rgba(220,38,38,0.30)',  line: '#DC2626' },
       ]
       for (const ring of rings) {
         const rr = ring.r * scale
         if (rr < 2) continue
+        ctx.save()
+        ctx.setLineDash([4, 3])
         ctx.beginPath()
         ctx.arc(cx, cy, rr, 0, Math.PI * 2)
-        ctx.fillStyle   = ring.color
+        ctx.fillStyle   = ring.fill
         ctx.fill()
-        ctx.strokeStyle = ring.lineColor
+        ctx.strokeStyle = ring.line
         ctx.lineWidth   = 1
         ctx.stroke()
+        ctx.restore()
       }
 
-      // Points — colour by height (p.y = vertical in sensor frame)
+      // Points — support both array [x,y,z,i] and object {x,y,z}
       const pts = ptsRef.current
       for (let k = 0; k < pts.length; k++) {
-        const p = pts[k]
-        const px = cx + p.x * scale
-        const py = cy - p.z * scale     // top-down: forward=up on screen
-        if (px < 0 || px > W || py < 0 || py > H) continue
+        const p  = pts[k]
+        const px = Array.isArray(p) ? p[0] : p.x
+        const pz = Array.isArray(p) ? p[1] : p.z   // forward axis
+        const py = Array.isArray(p) ? p[2] : p.y   // height
+        const sx = cx + px * scale
+        const sy = cy - pz * scale                  // top-down: forward=up
+        if (sx < 0 || sx > W || sy < 0 || sy > H) continue
 
         let r, g, b
-        const h = p.y ?? 0
-        if (h < 0.1)      { r = 180; g = 200; b = 240 }   // light blue  — floor
-        else if (h < 0.5) { r = 100; g = 200; b = 150 }   // green       — low objects
-        else if (h < 1.0) { r = 240; g = 180; b = 60  }   // yellow      — tall objects
-        else               { r = 220; g = 80;  b = 80  }   // red         — very tall
+        const h = py ?? 0
+        if      (h < 0.1) { r = 180; g = 200; b = 240 }
+        else if (h < 0.5) { r = 100; g = 200; b = 150 }
+        else if (h < 1.0) { r = 240; g = 180; b =  60 }
+        else               { r = 220; g =  80; b =  80 }
 
         ctx.fillStyle = `rgb(${r},${g},${b})`
-        ctx.fillRect(px - 1, py - 1, 2, 2)
+        ctx.fillRect(sx - 1, sy - 1, 2, 2)
       }
 
       // Robot origin
       ctx.fillStyle = '#2563EB'
-      ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI * 2); ctx.fill()
+      ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI * 2); ctx.fill()
       ctx.fillStyle = '#fff'
-      ctx.beginPath(); ctx.arc(cx, cy, 1.5, 0, Math.PI * 2); ctx.fill()
+      ctx.beginPath(); ctx.arc(cx, cy, 2, 0, Math.PI * 2); ctx.fill()
+
+      // North label
+      ctx.fillStyle   = '#6B7280'
+      ctx.font        = `${Math.max(9, Math.floor(W * 0.025))}px sans-serif`
+      ctx.textAlign   = 'center'
+      ctx.fillText('N', cx, 10)
 
       rafId = requestAnimationFrame(draw)
     }
@@ -128,24 +165,29 @@ export default function LidarPanel() {
         <span style={{
           fontSize: 9, fontWeight: 700, letterSpacing: '.1em',
           textTransform: 'uppercase', color: 'var(--text-muted)',
-        }}>
-          LiDAR
-        </span>
+        }}>LiDAR</span>
+
         <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>
           {ptCount.toLocaleString()} pts
         </span>
 
+        {hz > 0 && (
+          <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>
+            {hz} Hz
+          </span>
+        )}
+
         {/* Range selector */}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 3 }}>
-          {[3, 6, 12].map((r) => (
+          {[6, 12, 25].map((r) => (
             <button
               key={r}
               onClick={() => setRange(r)}
               style={{
                 fontSize: 9, padding: '2px 7px', borderRadius: 5,
-                border: range === r ? '1px solid var(--accent)' : '1px solid var(--border)',
-                background: range === r ? 'var(--accent-dim)' : 'transparent',
-                color: range === r ? 'var(--accent)' : 'var(--text-muted)',
+                border:     range === r ? '1px solid var(--accent)' : '1px solid var(--border)',
+                background: range === r ? 'var(--accent-dim)'       : 'transparent',
+                color:      range === r ? 'var(--accent)'           : 'var(--text-muted)',
                 cursor: 'pointer',
               }}
             >
@@ -156,8 +198,8 @@ export default function LidarPanel() {
 
         <span style={{
           fontSize: 9, fontWeight: 700, padding: '1px 6px', borderRadius: 8,
-          background: live ? 'var(--green-dim)' : 'var(--bg-surface)',
-          color:      live ? 'var(--green)'     : 'var(--text-muted)',
+          background: live ? 'var(--green-dim)'   : 'var(--bg-surface)',
+          color:      live ? 'var(--green)'       : 'var(--text-muted)',
         }}>
           {live ? 'LIVE' : 'SIM'}
         </span>
@@ -165,16 +207,23 @@ export default function LidarPanel() {
 
       {/* Canvas */}
       <div style={{
-        flex: 1, minHeight: 0,
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        padding: 4, background: 'var(--bg-app)',
+        flex: 1, minHeight: 0, position: 'relative',
+        background: 'var(--bg-app)',
       }}>
         <canvas
           ref={canvasRef}
-          width={CANVAS_PX}
-          height={CANVAS_PX}
-          style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
+          style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', display: 'block' }}
         />
+        {!live && (
+          <div style={{
+            position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)',
+            fontSize: 9, color: 'var(--text-muted)',
+            background: 'rgba(255,255,255,0.85)', padding: '2px 8px', borderRadius: 6,
+            pointerEvents: 'none',
+          }}>
+            simulation
+          </div>
+        )}
       </div>
     </div>
   )
