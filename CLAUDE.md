@@ -155,8 +155,9 @@ GET  /api/saved_points   — all teach points
 GET  /api/programs       — saved program list
 GET  /stream/cam0        — MJPEG camera stream
 GET  /stream/cam1        — MJPEG camera stream
+GET  /stream/annotated   — MJPEG annotated detection overlay from detector_node
 WS   /ws/state           — 25 Hz state broadcast (nested JSON)
-WS   /ws/lidar           — 10 Hz pointcloud
+WS   /ws/lidar           — 10 Hz pointcloud (real if /lidar/points live, else sim)
 ```
 
 ### Saved data
@@ -170,7 +171,26 @@ WS   /ws/lidar           — 10 Hz pointcloud
 - `ProgramPanel` — program builder with save/load/run
 - `FaultPanel`   — floating fault/estop overlay
 - `ConfigureLayout` — modal with Status / Safety / Audit Log tabs
-- `ArmViewer3D`  — R3F arm with correct J4/J6 rotation.y kinematics
+- `ArmViewer3D`  — R3F arm with correct J4/J6 rotation.y kinematics (not used in current layout)
+
+### Perception stack
+
+| Node | Launch | Notes |
+|------|--------|-------|
+| detector_node | `python3 src/object_detection/object_detection/detector_node.py` | YOLOv8n CUDA, cv2 stub required, ~5fps on Jetson |
+| ouster_bridge | `python3 src/cobot_bringup/scripts/ouster_bridge.py [port]` | UDP 56201, auto-detects beam/header format |
+
+**cv2 is broken on this Jetson** — all image code uses Pillow + numpy only.
+**onnxruntime crashes** — use TRT engine or ultralytics .pt via cv2 stub.
+**pycuda broken** — use `torch` for CUDA ops.
+**Isaac ROS requires JetPack 6** — DO NOT install on this JetPack 5.1.2 system.
+
+Detection JSON format (`/perception/detections`):
+```json
+{"detections": [{"id": int, "class_id": int, "class_name": str, "score": float,
+  "bbox_px": [x1,y1,x2,y2], "depth_m": float, "pos_3d": [x,y,z],
+  "distance_m": float, "pickable": bool, "timestamp": float}]}
+```
 
 ## Quick Commands
 
