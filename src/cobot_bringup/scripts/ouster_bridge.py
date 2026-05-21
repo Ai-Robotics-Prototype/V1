@@ -34,9 +34,13 @@ ALT_BY_BEAMS = {
 
 
 def set_eth0():
-    import fcntl
+    import ctypes, fcntl
     SIOCSIFADDR    = 0x8916
     SIOCSIFNETMASK = 0x891c
+    SIOCADDRT      = 0x890B
+    SIOCDELRT      = 0x890C
+    RTF_UP         = 0x0001
+    RTF_HOST       = 0x0004
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def psa(a):
@@ -44,15 +48,43 @@ def set_eth0():
         return struct.pack('2sH4s8s', b'\x02\x00', 0, socket.inet_aton(a), b'\x00' * 8)
 
     try:
+        # /32 netmask: avoids adding a /24 subnet route that hijacks LAN traffic
         fcntl.ioctl(s.fileno(), SIOCSIFADDR,
                     struct.pack('16s', b'eth0') + psa('192.168.1.200'))
         fcntl.ioctl(s.fileno(), SIOCSIFNETMASK,
-                    struct.pack('16s', b'eth0') + psa('255.255.255.0'))
-        print('eth0=192.168.1.200/24')
+                    struct.pack('16s', b'eth0') + psa('255.255.255.255'))
+        print('eth0=192.168.1.200/32')
     except Exception as e:
         print(f'eth0 ioctl: {e}')
-    finally:
-        s.close()
+
+    # Remove any stale broad /24 route on eth0 (may exist from prior run with /24 mask)
+    def rtentry(dst, gw, mask, flags, dev):
+        dev_buf = ctypes.create_string_buffer(dev.encode() + b'\x00')
+        dev_ptr = ctypes.addressof(dev_buf)
+        buf = bytearray(120)
+        buf[8:24]  = psa(dst)
+        buf[24:40] = psa(gw)
+        buf[40:56] = psa(mask)
+        buf[56:58] = struct.pack('H', flags)
+        buf[88:96] = struct.pack('Q', dev_ptr)
+        return bytes(buf), dev_buf
+
+    try:
+        rt, db = rtentry('192.168.1.0', '0.0.0.0', '255.255.255.0', RTF_UP, 'eth0')
+        fcntl.ioctl(s.fileno(), SIOCDELRT, bytearray(rt))
+        print('eth0: removed stale /24 route')
+    except Exception:
+        pass  # route may not exist
+
+    # Add specific host route so LiDAR (192.168.1.150) is reachable via eth0
+    try:
+        rt, db = rtentry('192.168.1.150', '0.0.0.0', '255.255.255.255', RTF_UP | RTF_HOST, 'eth0')
+        fcntl.ioctl(s.fileno(), SIOCADDRT, bytearray(rt))
+        print('eth0: added 192.168.1.150/32 host route')
+    except Exception as e:
+        print(f'eth0 lidar route: {e}')
+
+    s.close()
 
 
 def configure_ouster(lidar_ip='192.168.1.150', our_ip='192.168.1.200', udp_port=56201):
