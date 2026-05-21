@@ -27,16 +27,14 @@ function DetectionOverlay({ detections, camId }) {
       viewBox="0 0 1 1" preserveAspectRatio="none"
     >
       {detections.map((det, i) => {
-        // Support both bbox[x,y,w,h] and position[x,y,z]
+        // Support bbox_px[x1,y1,x2,y2] from detector or position[x,y,z] from scene graph
         let x, y, w, h
-        if (det.bbox && det.bbox.length >= 4) {
-          [x, y, w, h] = det.bbox.map((v, i2) => i2 < 2 ? v / IMG_W : v / IMG_H)
-          if (i2 >= 2) { w = det.bbox[2] / IMG_W; h = det.bbox[3] / IMG_H }
-          // recalc properly
-          x = det.bbox[0] / IMG_W
-          y = det.bbox[1] / IMG_H
-          w = det.bbox[2] / IMG_W
-          h = det.bbox[3] / IMG_H
+        if (det.bbox_px && det.bbox_px.length >= 4) {
+          const [x1, y1, x2, y2] = det.bbox_px
+          x = x1 / IMG_W
+          y = y1 / IMG_H
+          w = (x2 - x1) / IMG_W
+          h = (y2 - y1) / IMG_H
         } else if (det.position && det.position.length >= 3) {
           const p = project3D(...det.position)
           if (!p) return null
@@ -47,7 +45,7 @@ function DetectionOverlay({ detections, camId }) {
         }
         const cls   = det.class_name || det.class || 'object'
         const color = CLASS_COLORS[cls] || CLASS_COLORS.default
-        const conf  = det.confidence ? Math.round(det.confidence * 100) : null
+        const conf  = det.score != null ? Math.round(det.score * 100) : null
 
         return (
           <g key={i}>

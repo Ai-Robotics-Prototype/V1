@@ -470,7 +470,7 @@ if ROS2:
             self.task_pub.publish(msg)
 
 
-def _pc2_to_list(msg, max_pts=3500):
+def _pc2_to_list(msg, max_pts=8000):
     fo = {f.name: f.offset for f in msg.fields}
     ox = fo.get('x', 0)
     oy = fo.get('y', 4)

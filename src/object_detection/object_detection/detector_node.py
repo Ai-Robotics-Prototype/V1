@@ -4,7 +4,7 @@ YOLOv8 detector node — Pillow + numpy only (no cv2/CvBridge).
 Publishes JSON String to /perception/detections and annotated Image to
 /perception/annotated_image.
 """
-import io, json, math, sys, threading, time, types
+import io, json, math, os, sys, threading, time, types
 import numpy as np
 
 # ── cv2 stub (ultralytics imports cv2 at module level; cv2 is broken here) ─────
@@ -41,7 +41,7 @@ _make_cv2_stub()
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 
 try:
@@ -205,7 +205,7 @@ class DetectorNode(Node):
         super().__init__('detector_node')
 
         self.declare_parameter('model_path',           '/opt/cobot/models/yolov8n.pt')
-        self.declare_parameter('confidence_threshold', 0.45)
+        self.declare_parameter('confidence_threshold', 0.35)
         self.declare_parameter('nms_threshold',        0.45)
         self.declare_parameter('device',               'cuda:0')
 
@@ -225,12 +225,15 @@ class DetectorNode(Node):
         self.create_subscription(Image, '/cam0/cam0/color/image_raw',         self._on_rgb,   5)
         self.create_subscription(Image, '/cam0/cam0/aligned_depth_to_color/image_raw',
                                  self._on_depth, 5)
+        self.create_subscription(CameraInfo, '/cam0/cam0/color/camera_info',
+                                 self._on_camera_info, 1)
 
         self._depth_arr = None
         self._depth_fx  = 615.0
         self._depth_fy  = 615.0
         self._depth_cx  = 320.0
         self._depth_cy  = 240.0
+        self._intrinsics_set = False
 
         self._last_log  = time.time()
         self._frame_cnt = 0
@@ -245,7 +248,25 @@ class DetectorNode(Node):
             return
         try:
             from ultralytics import YOLO
-            model = YOLO(self._pt_path)
+            engine_path = self._pt_path.replace('.pt', '.engine')
+            loaded_path = self._pt_path
+            model = None
+
+            # Try TRT engine first; validate that model.model is a usable nn.Module
+            if os.path.exists(engine_path):
+                try:
+                    m = YOLO(engine_path)
+                    net_test = m.model
+                    net_test.eval()  # raises if TRT returns a non-Module (e.g. str)
+                    model = m
+                    loaded_path = engine_path
+                    self.get_logger().info(f'TRT engine validated: {engine_path}')
+                except Exception as e:
+                    self.get_logger().warn(f'TRT engine unusable ({e}), falling back to .pt')
+
+            if model is None:
+                model = YOLO(self._pt_path)
+
             self._names = model.names
             net = model.model
             net.eval()
@@ -254,11 +275,20 @@ class DetectorNode(Node):
             self._model = net
             self._ready = True
             self.get_logger().info(
-                f'YOLOv8 loaded on {self._device} — {len(self._names)} classes')
+                f'YOLOv8 loaded from {loaded_path} on {self._device} — {len(self._names)} classes')
         except Exception as e:
             self.get_logger().error(f'Model load failed: {e}')
 
     # ── ROS callbacks ──────────────────────────────────────────────────────────
+    def _on_camera_info(self, msg):
+        if not self._intrinsics_set:
+            k = msg.k  # row-major 3x3
+            self._depth_fx = float(k[0])
+            self._depth_fy = float(k[4])
+            self._depth_cx = float(k[2])
+            self._depth_cy = float(k[5])
+            self._intrinsics_set = True
+
     def _on_depth(self, msg):
         try:
             enc = msg.encoding

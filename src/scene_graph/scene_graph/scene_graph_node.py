@@ -1,10 +1,10 @@
 import json
 import time
 import uuid
+from typing import Dict, List
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
-from vision_msgs.msg import Detection3DArray
 import numpy as np
 
 try:
@@ -101,9 +101,9 @@ class SceneGraphNode(Node):
         self.min_conf = self.get_parameter('min_confidence').value
         rate = self.get_parameter('publish_rate_hz').value
 
-        self.tracks: list[Track] = []
+        self.tracks: List[Track] = []
 
-        self.create_subscription(Detection3DArray, '/perception/detections',
+        self.create_subscription(String, '/perception/detections',
                                  self._detection_cb, 10)
         self.graph_pub = self.create_publisher(String, '/perception/scene_graph', 10)
         self.create_timer(1.0 / rate, self._publish_graph)
@@ -113,25 +113,27 @@ class SceneGraphNode(Node):
             self.get_logger().warn('filterpy not available — using simple position tracking')
         self.get_logger().info('scene_graph_node started')
 
-    def _detection_cb(self, msg: Detection3DArray):
+    def _detection_cb(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            return
+        dets = data.get('detections', [])
         now = time.time()
 
         for track in self.tracks:
             track.predict()
 
         matched = set()
-        for det in msg.detections:
-            if not det.results:
-                continue
-            result = det.results[0]
-            cls_id = result.hypothesis.class_id
-            conf = result.hypothesis.score
+        for det in dets:
+            cls_id = det.get('class_name', str(det.get('class_id', 'unknown')))
+            conf   = float(det.get('score', 0.0))
             if conf < self.min_conf:
                 continue
-
-            pos = det.bbox.center.position
-            det_pos = (pos.x, pos.y, pos.z)
-            frame = msg.header.frame_id
+            pos_3d = det.get('pos_3d')
+            if not pos_3d or len(pos_3d) < 3:
+                continue
+            det_pos = (float(pos_3d[0]), float(pos_3d[1]), float(pos_3d[2]))
 
             best_track = None
             best_dist = self.assoc_dist
@@ -139,7 +141,7 @@ class SceneGraphNode(Node):
                 if i in matched:
                     continue
                 tp = track.position
-                dist = np.linalg.norm(np.array(det_pos) - np.array(tp))
+                dist = float(np.linalg.norm(np.array(det_pos) - np.array(tp)))
                 if dist < best_dist:
                     best_dist = dist
                     best_track = i
@@ -148,7 +150,7 @@ class SceneGraphNode(Node):
                 self.tracks[best_track].update(det_pos, conf)
                 matched.add(best_track)
             else:
-                self.tracks.append(Track(cls_id, det_pos, conf, frame))
+                self.tracks.append(Track(cls_id, det_pos, conf, 'cam0_link'))
 
         self.tracks = [t for t in self.tracks if (now - t.last_seen) < self.max_age]
 
@@ -161,7 +163,7 @@ class SceneGraphNode(Node):
         now = self.get_clock().now()
         dt = (now - self._last_log).nanoseconds / 1e9
         if dt >= 0.5:
-            class_counts: dict = {}
+            class_counts: Dict[str, int] = {}
             for t in self.tracks:
                 class_counts[t.class_id] = class_counts.get(t.class_id, 0) + 1
             self.get_logger().info(f'Tracking {len(self.tracks)} objects: {class_counts}')

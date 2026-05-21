@@ -40,7 +40,8 @@ def set_eth0():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def psa(a):
-        return struct.pack('2s14s', b'\x02\x00', socket.inet_aton(a) + b'\x00' * 10)
+        # sockaddr_in: 2-byte family + 2-byte port + 4-byte addr + 8-byte pad = 16 bytes
+        return struct.pack('2sH4s8s', b'\x02\x00', 0, socket.inet_aton(a), b'\x00' * 8)
 
     try:
         fcntl.ioctl(s.fileno(), SIOCSIFADDR,
@@ -54,17 +55,73 @@ def set_eth0():
         s.close()
 
 
+def configure_ouster(lidar_ip='192.168.1.150', our_ip='192.168.1.200', udp_port=56201):
+    """Try to configure Ouster UDP dest via TCP (7501) then HTTP (80). Falls back gracefully."""
+    # Method 1: legacy TCP command interface
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3.0)
+        s.connect((lidar_ip, 7501))
+        for cmd in [f'set_config_param udp_dest {our_ip}',
+                    f'set_config_param udp_port_lidar {udp_port}',
+                    'reinitialize']:
+            s.sendall((cmd + '\n').encode())
+            try:
+                resp = s.recv(256).decode(errors='ignore').strip()
+            except Exception:
+                resp = '?'
+            print(f'[ouster] {cmd!r} → {resp!r}')
+        s.close()
+        print('[ouster] configured via TCP 7501')
+        time.sleep(2.0)
+        return True
+    except Exception as e:
+        print(f'[ouster] TCP 7501: {e}')
+
+    # Method 2: HTTP REST API (firmware ≥ 2.0)
+    try:
+        import http.client as _hc, json as _json
+        conn = _hc.HTTPConnection(lidar_ip, 80, timeout=3)
+        conn.request('GET', '/api/v1/sensor/config')
+        r = conn.getresponse(); r.read()
+        if r.status == 200:
+            body = _json.dumps({'udp_dest': our_ip, 'udp_port_lidar': udp_port})
+            conn.request('PUT', '/api/v1/sensor/config', body=body,
+                         headers={'Content-Type': 'application/json'})
+            r2 = conn.getresponse(); r2.read()
+            print(f'[ouster] HTTP config PUT → {r2.status}')
+            conn.request('POST', '/api/v1/system/reinitialize')
+            r3 = conn.getresponse(); r3.read()
+            print(f'[ouster] HTTP reinit → {r3.status}')
+            conn.close()
+            time.sleep(2.0)
+            return True
+    except Exception as e:
+        print(f'[ouster] HTTP 80: {e}')
+
+    print('[ouster] config unavailable — binding UDP directly (eth0 fix may be enough)')
+    return False
+
+
 def detect_format(data):
     """Auto-detect Ouster packet format from packet size."""
     n = len(data)
-    for n_beams in [32, 64, 16, 128]:
-        for hdr in [16, 32]:
-            for px in [12, 16, 8]:
-                if n >= hdr and (n - hdr) % (n_beams * px) == 0:
-                    cols = (n - hdr) // (n_beams * px)
-                    if 1 <= cols <= 32:
-                        return hdr, n_beams, px
-    return 16, 32, 12  # fallback
+    # Try with assumed 16-byte header first, in priority order
+    body = n - 16
+    if body > 0:
+        for n_beams, px in [(32, 12), (32, 16), (64, 12), (16, 12), (32, 8)]:
+            if body % (n_beams * px) == 0:
+                cols = body // (n_beams * px)
+                if 1 <= cols <= 32:
+                    return 16, n_beams, px
+    # Fallback: brute-force header sizes
+    for hdr in [16, 32, 12]:
+        for n_beams, px in [(32, 12), (32, 16), (64, 12), (16, 12), (32, 8)]:
+            if n > hdr and (n - hdr) % (n_beams * px) == 0:
+                cols = (n - hdr) // (n_beams * px)
+                if 1 <= cols <= 32:
+                    return hdr, n_beams, px
+    return 16, 32, 12
 
 
 class OusterBridge(Node):
@@ -75,10 +132,13 @@ class OusterBridge(Node):
         self._lock  = threading.Lock()
         self._fid   = -1
         self._last  = time.time()
+        self._last_flush = time.time()
         self._fmt   = None   # (hdr, n_beams, px_size) — detected on first packet
         self._flush_count = 0
+        self._FLUSH_INTERVAL = 0.5  # flush at least every 500ms (handles stopped-motor case)
 
         set_eth0()
+        configure_ouster()
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -95,6 +155,11 @@ class OusterBridge(Node):
                 data, _ = self._sock.recvfrom(65535)
                 self._parse(data)
             except socket.timeout:
+                # Flush on timeout if we have accumulated data (handles stopped-motor mode)
+                with self._lock:
+                    if self._buf and (time.time() - self._last_flush) >= self._FLUSH_INTERVAL:
+                        self._flush()
+                        self._buf = []
                 continue
             except Exception as e:
                 self.get_logger().debug(str(e))
@@ -140,12 +205,13 @@ class OusterBridge(Node):
                     float(sig),
                 ))
 
+            now = time.time()
             with self._lock:
                 self._buf.extend(pts)
-                if fid != self._fid:
+                if fid != self._fid or (now - self._last_flush) >= self._FLUSH_INTERVAL:
                     self._flush()
                     self._fid  = fid
-                    self._buf  = list(pts)
+                    self._buf  = []
         except Exception as e:
             self.get_logger().debug(str(e))
 
@@ -174,6 +240,7 @@ class OusterBridge(Node):
             msg.data = arr.tobytes()
             self.pub.publish(msg)
 
+            self._last_flush = time.time()
             self._flush_count += 1
             if self._flush_count % 20 == 0:
                 hz = 20.0 / max(time.time() - self._last, 0.001)

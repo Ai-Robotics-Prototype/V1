@@ -101,7 +101,7 @@ Latch reset: requires zone=GREEN + service call `/safety/reset_estop`.
 
 ## Dashboard v3 — WORKING
 
-URL: http://192.168.1.246:8080
+URL: http://192.168.1.246:8080 (or :8080 via eth0=192.168.1.200)
 Theme: white/light, Standard Bots layout — NO 3D arm viewer
 Start server:  `python3 src/cobot_dashboard/cobot_dashboard/dashboard_server.py`
 Start cameras: `ros2 launch cobot_bringup cameras.launch.py`
@@ -110,9 +110,23 @@ Build frontend: `cd src/cobot_dashboard/frontend && npm run build` (outputs to `
 
 Camera topics: /cam0/cam0/color/image_raw, /cam1/cam1/color/image_raw (serials 134322070161, 101622073355)
 LiDAR:   Ouster at 192.168.1.150 UDP 56201 → bridge at src/cobot_bringup/scripts/ouster_bridge.py
-eth0 must be 192.168.1.200/24 — set automatically by ouster_bridge.py
+eth0 must be 192.168.1.200/24 — set automatically by ouster_bridge.py (corrected sockaddr_in psa() struct)
 cv2 BROKEN — Pillow used for all image encoding (numpy for array ops)
 Removed: 3D arm viewer (ArmViewer3D), dark theme, broken store imports
+
+### Known hardware issues (as of 2026-05-21)
+- Ouster OS1 motor NOT spinning — enc=0, ~1 pkt/sec, all TCP config ports closed (7501, 80).
+  Needs power cycle. Bridge publishes sparse points (4 pts/scan) via time-based flush.
+- dashboard_server.py is PID 1 (container entrypoint). Sending it SIGTERM (pkill) causes
+  uvicorn graceful shutdown and stops serving. To restart: launch new instance via /tmp/run_dashboard.sh.
+
+### Launch order (use /tmp wrapper scripts to avoid exit-code 144)
+```bash
+nohup /tmp/run_ouster.sh   > /tmp/ouster.log   2>&1 &
+nohup /tmp/run_cameras.sh  > /tmp/cameras.log  2>&1 &
+nohup /tmp/run_detector.sh > /tmp/detector.log 2>&1 &
+nohup /tmp/run_dashboard.sh > /tmp/dashboard.log 2>&1 &  # if PID 1 is dead
+```
 
 Frontend layout (MonitorLayout):
   Left 50%: dual camera feeds (CameraPanel cam=0, CameraPanel cam=1) with SVG detection overlay
@@ -177,13 +191,16 @@ WS   /ws/lidar           — 10 Hz pointcloud (real if /lidar/points live, else 
 
 | Node | Launch | Notes |
 |------|--------|-------|
-| detector_node | `python3 src/object_detection/object_detection/detector_node.py` | YOLOv8n CUDA, cv2 stub required, ~5fps on Jetson |
-| ouster_bridge | `python3 src/cobot_bringup/scripts/ouster_bridge.py [port]` | UDP 56201, auto-detects beam/header format |
+| detector_node | `python3 src/object_detection/object_detection/detector_node.py` | YOLOv8n CUDA, cv2 stub required, ~5fps, conf=0.35, TRT fallback→.pt |
+| ouster_bridge | `python3 src/cobot_bringup/scripts/ouster_bridge.py [port]` | UDP 56201, auto-detects format, time-based flush for sparse data |
 
 **cv2 is broken on this Jetson** — all image code uses Pillow + numpy only.
 **onnxruntime crashes** — use TRT engine or ultralytics .pt via cv2 stub.
 **pycuda broken** — use `torch` for CUDA ops.
 **Isaac ROS requires JetPack 6** — DO NOT install on this JetPack 5.1.2 system.
+**TRT engine (yolov8n.engine)** — validates model.model.eval() before committing; falls back to .pt silently.
+**scene_graph_node** — subscribes to String (JSON) on /perception/detections, not Detection3DArray.
+**ouster_bridge psa()** — sockaddr_in struct is `'2sH4s8s'` (not `'2s14s'`); wrong struct = IP 1.200.0.0.
 
 Detection JSON format (`/perception/detections`):
 ```json
