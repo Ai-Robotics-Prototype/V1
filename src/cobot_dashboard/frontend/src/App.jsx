@@ -108,7 +108,7 @@ export default function App() {
       <SafetyBanner />
 
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
-        <SideNav />
+        <SideNav tab={tab} onTabChange={setTab} />
         <main style={{ flex: 1, overflow: 'hidden', minWidth: 0 }}>
           {tab === 'monitor'   && <MonitorLayout />}
           {tab === 'scene'     && <ScenePanel />}

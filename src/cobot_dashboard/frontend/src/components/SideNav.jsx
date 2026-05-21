@@ -1,15 +1,12 @@
-import { useState } from 'react'
-
 const NAV_ITEMS = [
-  { id: 'cameras', icon: '📷', label: 'Cameras'  },
-  { id: 'lidar',   icon: '🔵', label: 'LiDAR'    },
-  { id: 'scene',   icon: '🗂',  label: 'Scene'    },
-  { id: 'safety',  icon: '🛡',  label: 'Safety'   },
+  { id: 'monitor',   icon: '◫',  label: 'Monitor'   },
+  { id: 'scene',     icon: '⬡',  label: 'Scene'     },
+  { id: 'sensors',   icon: '◉',  label: 'Sensors'   },
+  { id: 'program',   icon: '≡',  label: 'Program'   },
+  { id: 'configure', icon: '⚙',  label: 'Configure' },
 ]
 
-export default function SideNav() {
-  const [active, setActive] = useState('cameras')
-
+export default function SideNav({ tab, onTabChange }) {
   return (
     <aside style={{
       width: 48, flexShrink: 0,
@@ -19,18 +16,18 @@ export default function SideNav() {
       paddingTop: 8, paddingBottom: 8, gap: 4,
     }}>
       {NAV_ITEMS.map((item) => {
-        const isActive = active === item.id
+        const isActive = tab === item.id
         return (
           <button
             key={item.id}
-            onClick={() => setActive(item.id)}
+            onClick={() => onTabChange(item.id)}
             title={item.label}
             style={{
               width: 36, height: 36, borderRadius: 'var(--radius-md)',
               border: 'none',
               background: isActive ? 'var(--accent-dim)' : 'transparent',
               color: isActive ? 'var(--accent)' : 'var(--text-muted)',
-              fontSize: 16, cursor: 'pointer',
+              fontSize: 17, cursor: 'pointer',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
               transition: 'all .15s',
             }}
@@ -39,21 +36,6 @@ export default function SideNav() {
           </button>
         )
       })}
-
-      <div style={{ flex: 1 }} />
-
-      {/* Settings */}
-      <button
-        title="Settings"
-        style={{
-          width: 36, height: 36, borderRadius: 'var(--radius-md)',
-          border: 'none', background: 'transparent',
-          color: 'var(--text-muted)', fontSize: 16, cursor: 'pointer',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}
-      >
-        ⚙
-      </button>
     </aside>
   )
 }
