@@ -99,18 +99,21 @@ Latch reset: requires zone=GREEN + service call `/safety/reset_estop`.
 | feature/safety-person2 | Person 2 | human_safety, scene_graph, safety_monitor |
 | feature/robot-person3 | Person 3 | task_planner, language_interface, fleet_agent, bringup |
 
-## Dashboard v3 — WORKING (as of 2026-05-21, commit b8bb99a)
+## Dashboard v3 — WORKING (as of 2026-05-21, commit 5bc7286)
 
 URL: http://192.168.1.246:8080 (or :8080 via eth0=192.168.1.200)
 Theme: white/light, 4-column layout — NO 3D arm viewer
 Start server:  `python3 src/cobot_dashboard/cobot_dashboard/dashboard_server.py`
 Start cameras: `ros2 launch cobot_bringup cameras.launch.py`
-Start LiDAR:   `python3 src/cobot_bringup/scripts/ouster_bridge.py`
+Start Ouster:  `python3 src/cobot_bringup/scripts/ouster_bridge.py`
+Full stack:    `ros2 launch cobot_bringup full_stack.launch.py use_ouster:=true use_cameras:=true`
 Build frontend: `cd src/cobot_dashboard/frontend && npm run build` (outputs to `frontend/dist/`)
 
 Camera topics: /cam0/cam0/color/image_raw, /cam1/cam1/color/image_raw (serials 134322070161, 101622073355)
-LiDAR:   Ouster at 192.168.1.150 UDP 56201 → bridge at src/cobot_bringup/scripts/ouster_bridge.py
-eth0 must be 192.168.1.200/24 — set automatically by ouster_bridge.py (corrected sockaddr_in psa() struct)
+LiDAR (Ouster): 192.168.1.150 UDP 56201 → bridge at src/cobot_bringup/scripts/ouster_bridge.py
+LiDAR (Livox):  /livox/lidar CustomMsg → dashboard subscribes directly (LIVOX import fallback)
+eth0 must be 192.168.1.200/32 (NOT /24!) — set automatically by ouster_bridge.py
+  /32 mask + explicit host route prevents routing bug that hijacks wlan0 LAN traffic
 cv2 BROKEN — Pillow used for all image encoding (numpy for array ops)
 Removed: 3D arm viewer (ArmViewer3D), dark theme, broken store imports
 
@@ -120,13 +123,23 @@ Removed: 3D arm viewer (ArmViewer3D), dark theme, broken store imports
 - dashboard_server.py is PID 1 (container entrypoint). Sending it SIGTERM (pkill) causes
   uvicorn graceful shutdown and stops serving. To restart: launch new instance via /tmp/run_dashboard.sh.
 
-### NVIDIA AI stack status (as of 2026-05-21)
-- Ollama installed: /usr/local/bin/ollama — run `ollama serve &` then `ollama pull llama3.1:8b`
-- openai-whisper installed (pip) — for future audio transcription node
-- TRT re-export: running background job exports yolov8n.pt → yolov8n.engine with TRT 8.5.2.2
-  Output: /opt/cobot/models/yolov8n.engine (replaces the mismatched prior engine)
+### NVIDIA AI stack status (as of 2026-05-21) — ALL VERIFIED
+- Ollama: /usr/local/bin/ollama — serving llama3.1:8b (`ollama serve &`)
+- TRT engine: /opt/cobot/models/yolov8n.engine (8.1MB FP16, exported 2026-05-21 ~813s)
+  Generated via: `simplify=False` export to avoid onnxruntime SIGABRT on this Jetson
+  Use in detector: set MODEL_PATH=/opt/cobot/models/yolov8n.engine
+- openai-whisper: `whisper.load_model('base')` confirmed working (100 languages)
 - Language topics: /language/text_command (pub) → language_node, /language/response (sub)
 - Dashboard exposes: POST /cmd/voice_ros (publishes to ROS), GET /api/fleet
+
+### full_stack.launch.py args
+```
+use_ouster:=true/false   — launch Ouster OS1 UDP bridge (default: false)
+use_livox:=true/false    — launch Livox MID-360 driver (default: false)
+use_cameras:=true/false  — launch RealSense D435i pair (default: true)
+launch_dashboard:=true   — launch dashboard_server (default: true)
+launch_fleet:=false      — launch fleet agent nodes (default: false)
+```
 
 ### Launch order (use /tmp wrapper scripts to avoid exit-code 144)
 ```bash
@@ -139,27 +152,32 @@ nohup /tmp/run_dashboard.sh > /tmp/dashboard.log 2>&1 &  # if PID 1 is dead
 
 Frontend layout (MonitorLayout — 4-column):
   Col 1: CameraPanel cam=0 — annotated stream when detector active, AI fps/ms/class-count pills
+          (class pills use CLASS_COLORS: per-class colored text + border, max 5 shown)
   Col 2: CameraPanel cam=1 — raw stream
-  Col 3: LidarPanel — top-down canvas with safety rings + detection object overlays
+  Col 3: LidarPanel — top-down canvas with safety rings + detection overlays + scene graph objects
+          (scene graph objects: pulsing circle for person, colored square for others, label pill)
   Col 4: Right column stacked:
-    - SceneGraphPanel — tracked objects, XYZ bars, Pick buttons
+    - SceneGraphPanel — tracked objects, XYZ bars, Pick buttons, tracker_count badge
     - TaskFlowPanel   — 9-state visual indicator (IDLE→HOME)
     - VoiceCommandBar — text input → /cmd/voice_ros (ROS) or /cmd/voice (local NLP)
     - ProgramPanel    — drag-drop program builder
   Bottom: ControlStrip (RunControl | JointPositions | DetectedObjects)
 
-State keys added to /api/state and WS /ws/state broadcast:
-  perception: {fps, det_count, inference_ms, annotated_active, classes}
+State keys in /api/state and WS /ws/state broadcast:
+  perception: {fps, det_count, inference_ms, annotated_active, classes, tracker_count}
   language:   {last_text, last_response, listening, model_name}
   fleet:      {enabled, upload_hour, last_upload, logs_mb}
 
-Store fields added: perception, language, fleet (all wired from WebSocket broadcast)
-Store actions added: runProgram, pauseProgram, resumeProgram, cancelProgram,
+Store fields: perception, language, fleet (all wired from WebSocket broadcast)
+Store actions: runProgram, pauseProgram, resumeProgram, cancelProgram,
   openGripper, closeGripper, sendVoice, enableJog (30s auto-disable), reorderSteps
 
-detection JSON (/perception/detections) now includes:
+detection JSON (/perception/detections) includes:
   inference_ms: float — per-frame GPU inference time in milliseconds
   fps: float — rolling detector frame rate
+
+scene_graph_node publishes dict keyed by track_id → dashboard _on_scene converts to:
+  {objects: [{id, class_name, score, position:[x,y,z], last_seen, pickable}]}
 
 ## Dashboard v2 — Commercial Features (superseded by v3)
 
