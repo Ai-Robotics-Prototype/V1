@@ -99,10 +99,10 @@ Latch reset: requires zone=GREEN + service call `/safety/reset_estop`.
 | feature/safety-person2 | Person 2 | human_safety, scene_graph, safety_monitor |
 | feature/robot-person3 | Person 3 | task_planner, language_interface, fleet_agent, bringup |
 
-## Dashboard v3 — WORKING
+## Dashboard v3 — WORKING (as of 2026-05-21, commit b8bb99a)
 
 URL: http://192.168.1.246:8080 (or :8080 via eth0=192.168.1.200)
-Theme: white/light, Standard Bots layout — NO 3D arm viewer
+Theme: white/light, 4-column layout — NO 3D arm viewer
 Start server:  `python3 src/cobot_dashboard/cobot_dashboard/dashboard_server.py`
 Start cameras: `ros2 launch cobot_bringup cameras.launch.py`
 Start LiDAR:   `python3 src/cobot_bringup/scripts/ouster_bridge.py`
@@ -120,22 +120,46 @@ Removed: 3D arm viewer (ArmViewer3D), dark theme, broken store imports
 - dashboard_server.py is PID 1 (container entrypoint). Sending it SIGTERM (pkill) causes
   uvicorn graceful shutdown and stops serving. To restart: launch new instance via /tmp/run_dashboard.sh.
 
+### NVIDIA AI stack status (as of 2026-05-21)
+- Ollama installed: /usr/local/bin/ollama — run `ollama serve &` then `ollama pull llama3.1:8b`
+- openai-whisper installed (pip) — for future audio transcription node
+- TRT re-export: running background job exports yolov8n.pt → yolov8n.engine with TRT 8.5.2.2
+  Output: /opt/cobot/models/yolov8n.engine (replaces the mismatched prior engine)
+- Language topics: /language/text_command (pub) → language_node, /language/response (sub)
+- Dashboard exposes: POST /cmd/voice_ros (publishes to ROS), GET /api/fleet
+
 ### Launch order (use /tmp wrapper scripts to avoid exit-code 144)
 ```bash
+ollama serve > /tmp/ollama.log 2>&1 &           # start LLM backend
 nohup /tmp/run_ouster.sh   > /tmp/ouster.log   2>&1 &
 nohup /tmp/run_cameras.sh  > /tmp/cameras.log  2>&1 &
 nohup /tmp/run_detector.sh > /tmp/detector.log 2>&1 &
 nohup /tmp/run_dashboard.sh > /tmp/dashboard.log 2>&1 &  # if PID 1 is dead
 ```
 
-Frontend layout (MonitorLayout):
-  Left 50%: dual camera feeds (CameraPanel cam=0, CameraPanel cam=1) with SVG detection overlay
-  Middle 30%: LiDAR 2D canvas top-down view with safety rings
-  Right 20%: ProgramPanel drag-drop builder with voice bar
+Frontend layout (MonitorLayout — 4-column):
+  Col 1: CameraPanel cam=0 — annotated stream when detector active, AI fps/ms/class-count pills
+  Col 2: CameraPanel cam=1 — raw stream
+  Col 3: LidarPanel — top-down canvas with safety rings + detection object overlays
+  Col 4: Right column stacked:
+    - SceneGraphPanel — tracked objects, XYZ bars, Pick buttons
+    - TaskFlowPanel   — 9-state visual indicator (IDLE→HOME)
+    - VoiceCommandBar — text input → /cmd/voice_ros (ROS) or /cmd/voice (local NLP)
+    - ProgramPanel    — drag-drop program builder
   Bottom: ControlStrip (RunControl | JointPositions | DetectedObjects)
 
+State keys added to /api/state and WS /ws/state broadcast:
+  perception: {fps, det_count, inference_ms, annotated_active, classes}
+  language:   {last_text, last_response, listening, model_name}
+  fleet:      {enabled, upload_hour, last_upload, logs_mb}
+
+Store fields added: perception, language, fleet (all wired from WebSocket broadcast)
 Store actions added: runProgram, pauseProgram, resumeProgram, cancelProgram,
   openGripper, closeGripper, sendVoice, enableJog (30s auto-disable), reorderSteps
+
+detection JSON (/perception/detections) now includes:
+  inference_ms: float — per-frame GPU inference time in milliseconds
+  fps: float — rolling detector frame rate
 
 ## Dashboard v2 — Commercial Features (superseded by v3)
 
