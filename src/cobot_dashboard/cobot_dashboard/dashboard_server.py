@@ -521,8 +521,10 @@ if ROS2:
             pts = _pc2_to_list(msg)
             with _lidar_lock:
                 _lidar_pts = pts
-            payload = json.dumps({'points': pts})
-            _push_to_queues(_lidar_qs, payload)
+            # Only push to WS clients when we have real data (motor spinning)
+            if len(pts) >= 50:
+                payload = json.dumps({'points': pts})
+                _push_to_queues(_lidar_qs, payload)
 
         def _on_livox(self, msg):
             global _lidar_pts
@@ -629,7 +631,9 @@ async def ws_lidar(ws: WebSocket):
             except asyncio.TimeoutError:
                 with _lidar_lock:
                     cached = list(_lidar_pts)
-                if cached:
+                # Use real data only if it has enough points to be useful;
+                # otherwise fall back to simulation so the map is never blank
+                if len(cached) >= 50:
                     await ws.send_text(json.dumps({'points': cached}))
                 else:
                     await ws.send_text(json.dumps({'points': _sim_lidar()}))

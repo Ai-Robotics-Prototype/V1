@@ -8,6 +8,7 @@ import FaultPanel           from './components/FaultPanel'
 import CameraPanel          from './components/CameraPanel'
 import LidarPanel           from './components/LidarPanel'
 import ProgramPanel         from './components/ProgramPanel'
+import ScenePanel           from './components/ScenePanel'
 import MonitorLayout        from './layouts/MonitorLayout'
 import ConfigureLayout      from './layouts/ConfigureLayout'
 
@@ -110,6 +111,7 @@ export default function App() {
         <SideNav />
         <main style={{ flex: 1, overflow: 'hidden', minWidth: 0 }}>
           {tab === 'monitor'   && <MonitorLayout />}
+          {tab === 'scene'     && <ScenePanel />}
           {tab === 'program'   && <ProgramLayout />}
           {tab === 'sensors'   && <SensorsLayout />}
           {tab === 'configure' && <ConfigureLayout onClose={() => setTab('monitor')} />}
