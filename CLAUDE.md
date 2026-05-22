@@ -123,7 +123,7 @@ Removed: 3D arm viewer (ArmViewer3D), dark theme, broken store imports
 - dashboard_server.py is PID 1 (container entrypoint). Sending it SIGTERM (pkill) causes
   uvicorn graceful shutdown and stops serving. To restart: launch new instance via /tmp/run_dashboard.sh.
 
-### NVIDIA AI stack status (as of 2026-05-21) — ALL VERIFIED
+### NVIDIA AI stack status (as of 2026-05-22) — ALL VERIFIED
 - Ollama: /usr/local/bin/ollama — serving llama3.1:8b (`ollama serve &`)
 - TRT engine: /opt/cobot/models/yolov8n.engine (8.1MB FP16, exported 2026-05-21 ~813s)
   Generated via: `simplify=False` export to avoid onnxruntime SIGABRT on this Jetson
@@ -240,15 +240,18 @@ WS   /ws/lidar           — 10 Hz pointcloud (real if /lidar/points live, else 
 **onnxruntime crashes** — use TRT engine or ultralytics .pt via cv2 stub.
 **pycuda broken** — use `torch` for CUDA ops.
 **Isaac ROS requires JetPack 6** — DO NOT install on this JetPack 5.1.2 system.
-**TRT engine (yolov8n.engine)** — validates model.model.eval() before committing; falls back to .pt silently.
+**TRT engine (yolov8n.engine)** — load via `AutoBackend(model=path, device=..., fp16=True)` NOT `YOLO(path).model.eval()`. YOLO(engine).model is a lazy string, not nn.Module. Falls back to .pt silently.
+**RealSense depth** — camera publishes `depth/image_rect_raw` (raw, not aligned) reliably. `aligned_depth_to_color/image_raw` is unreliable (often 0 Hz). Detector uses raw depth as fallback.
+**RealSense QoS** — ALL camera subscriptions must use `ReliabilityPolicy.BEST_EFFORT` (or it works with RELIABLE publisher too — BEST_EFFORT subscriber + RELIABLE publisher is compatible in ROS2 DDS).
+**sensor_fusion_node** — timer-driven at 15Hz; LiDAR required, cameras optional. No ApproximateTimeSynchronizer (blocks when cameras absent).
 **scene_graph_node** — subscribes to String (JSON) on /perception/detections, not Detection3DArray.
 **ouster_bridge psa()** — sockaddr_in struct is `'2sH4s8s'` (not `'2s14s'`); wrong struct = IP 1.200.0.0.
 
 Detection JSON format (`/perception/detections`):
 ```json
 {"detections": [{"id": int, "class_id": int, "class_name": str, "score": float,
-  "bbox_px": [x1,y1,x2,y2], "depth_m": float, "pos_3d": [x,y,z],
-  "distance_m": float, "pickable": bool, "timestamp": float}]}
+  "bbox_px": [x1,y1,x2,y2], "depth_m": float, "pos_3d": [x,y,z] or null,
+  "distance_m": float, "pickable": bool, "has_3d": bool, "timestamp": float}]}
 ```
 
 ## Quick Commands
