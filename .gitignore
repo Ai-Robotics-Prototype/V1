@@ -4,3 +4,4 @@ log/
 *.pyc
 __pycache__/
 .colcon_install_layout
+core
