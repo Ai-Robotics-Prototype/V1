@@ -29,6 +29,12 @@ except ImportError:
     LIVOX = False
 
 try:
+    from nvblox_msgs.msg import Mesh as NvbloxMesh, DistanceMapSlice
+    NVBLOX = True
+except ImportError:
+    NVBLOX = False
+
+try:
     import numpy as np
     from PIL import Image as PILImage
     import io as _io
@@ -133,6 +139,10 @@ def _default_state():
         },
         'fleet': {
             'enabled': False, 'upload_hour': 2, 'last_upload': None, 'logs_mb': 0.0,
+        },
+        'nvblox': {
+            'active': False, 'mesh_verts': 0, 'mesh_tris': 0, 'mesh_blocks': 0,
+            'last_stamp': None,
         },
     }
 
@@ -360,6 +370,15 @@ if ROS2:
             if LIVOX:
                 self.create_subscription(LivoxCustomMsg, '/livox/lidar',
                                          self._on_livox, 10)
+            if NVBLOX:
+                self.create_subscription(NvbloxMesh, '/nvblox_node/mesh',
+                                         self._on_nvblox_mesh, 5)
+                self.create_subscription(DistanceMapSlice, '/nvblox_node/esdf_slice',
+                                         self._on_esdf_slice, 5)
+                self.get_logger().info('nvblox mesh + ESDF subscriptions active')
+            else:
+                self.get_logger().warn(
+                    'nvblox_msgs not available — build nvblox_msgs first')
             self.create_subscription(Image, '/cam0/cam0/color/image_raw',
                                      lambda msg: self._on_camera(msg, 0), 10)
             self.create_subscription(Image, '/cam1/cam1/color/image_raw',
@@ -544,6 +563,53 @@ if ROS2:
                     _lidar_pts = pts
                 payload = json.dumps({'points': pts})
                 _push_to_queues(_lidar_qs, payload)
+            except Exception:
+                pass
+
+        def _on_nvblox_mesh(self, msg):
+            try:
+                total_verts = 0
+                total_tris  = 0
+                blocks_out  = []
+                for block in msg.blocks:
+                    verts = [[round(v.x, 3), round(v.y, 3), round(v.z, 3)]
+                             for v in block.vertices]
+                    if not verts:
+                        continue
+                    # flat int32[] triangles → [[i,j,k],...]
+                    t = block.triangles
+                    tris = [[int(t[i]), int(t[i+1]), int(t[i+2])]
+                            for i in range(0, len(t) - 2, 3)]
+                    colors = [[round(c.r, 2), round(c.g, 2), round(c.b, 2)]
+                              for c in block.colors] if block.colors else []
+                    total_verts += len(verts)
+                    total_tris  += len(tris)
+                    blocks_out.append({'v': verts, 'f': tris, 'c': colors})
+
+                with STATE_LOCK:
+                    STATE['nvblox']['active']       = True
+                    STATE['nvblox']['mesh_verts']   = total_verts
+                    STATE['nvblox']['mesh_tris']    = total_tris
+                    STATE['nvblox']['mesh_blocks']  = len(msg.blocks)
+                    STATE['nvblox']['last_stamp']   = (
+                        msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9)
+
+                if total_verts > 0:
+                    payload = json.dumps({
+                        'type': 'mesh', 'clear': bool(msg.clear),
+                        'blocks': blocks_out,
+                        'total_verts': total_verts, 'total_tris': total_tris,
+                    })
+                    _push_to_queues(_lidar_qs, payload)
+            except Exception:
+                pass
+
+        def _on_esdf_slice(self, msg):
+            try:
+                with STATE_LOCK:
+                    STATE['nvblox']['esdf_res']    = round(msg.resolution, 4)
+                    STATE['nvblox']['esdf_width']  = msg.width
+                    STATE['nvblox']['esdf_height'] = msg.height
             except Exception:
                 pass
 

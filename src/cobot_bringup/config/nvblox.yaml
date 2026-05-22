@@ -1,0 +1,52 @@
+# nvblox v2.1.0 config for RoboAi cobot workspace
+# Hardware: Ouster OS1-32 LiDAR + RealSense D435i cam0 (primary depth source)
+# Platform: Jetson AGX Orin (sm_87), JetPack 5.1.2 / CUDA 11.4
+# Workspace: ~2m radius cobot cell, stationary robot
+
+nvblox_node:
+  ros__parameters:
+
+    # ── Core ───────────────────────────────────────────────────────────────────
+    voxel_size: 0.05              # 5cm voxels
+    mapping_type: "static_tsdf"
+    compute_mesh: true
+    compute_esdf: true
+    publish_esdf_distance_slice: true
+
+    # ── Sensor flags ───────────────────────────────────────────────────────────
+    use_depth: true
+    use_color: true
+    use_lidar: true
+
+    # ── LiDAR (Ouster OS1-32) ─────────────────────────────────────────────────
+    lidar_width: 1024
+    lidar_height: 32
+    use_non_equal_vertical_fov_lidar_params: true
+    min_angle_below_zero_elevation_rad: -0.3927   # -22.5°
+    max_angle_above_zero_elevation_rad: 0.3927    # +22.5°
+
+    # ── Rates ─────────────────────────────────────────────────────────────────
+    max_depth_update_hz: 15.0
+    max_color_update_hz: 5.0
+    max_lidar_update_hz: 10.0
+    mesh_update_rate_hz: 5.0
+    esdf_update_rate_hz: 10.0
+
+    # ── ESDF ──────────────────────────────────────────────────────────────────
+    esdf_2d: false                # full 3D ESDF
+    esdf_2d_min_height: 0.0
+    esdf_2d_max_height: 1.5
+    esdf_slice_height: 0.5
+
+    # ── Map clearing ──────────────────────────────────────────────────────────
+    map_clearing_radius_m: 3.0
+    map_clearing_frame_id: "base_link"
+
+    # ── QoS ───────────────────────────────────────────────────────────────────
+    depth_qos: "SENSOR_DATA"
+    color_qos: "SENSOR_DATA"
+    pointcloud_qos: "SENSOR_DATA"
+
+    # ── Frames ────────────────────────────────────────────────────────────────
+    global_frame: "map"
+    pose_frame: "base_link"

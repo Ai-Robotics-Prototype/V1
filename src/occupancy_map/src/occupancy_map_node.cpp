@@ -63,6 +63,18 @@ public:
     mesh_pub_   = create_publisher<visualization_msgs::msg::MarkerArray>("/map/mesh_markers", 10);
     status_pub_ = create_publisher<std_msgs::msg::String>("/map/status", 2);
 
+    // Relay nvblox occupancy grid → /map/occupancy (when nvblox is running)
+    nvblox_grid_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+      "/nvblox_node/static_map_slice", 10,
+      [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+        grid_pub_->publish(*msg);
+        nvblox_relayed_frames_++;
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+          "Relaying nvblox occupancy: %dx%d @ %.3fm/cell  (frame %u)",
+          msg->info.width, msg->info.height, msg->info.resolution,
+          nvblox_relayed_frames_);
+      });
+
     stats_timer_ = create_wall_timer(
       std::chrono::seconds(1),
       [this]{ publish_status(); });
@@ -117,18 +129,20 @@ private:
   bool         publish_esdf_;
 
   // Counters
-  uint32_t pc_frames_    = 0;
-  uint32_t depth_frames_ = 0;
+  uint32_t pc_frames_             = 0;
+  uint32_t depth_frames_          = 0;
+  uint32_t nvblox_relayed_frames_ = 0;
 
   // TF
   std::shared_ptr<tf2_ros::Buffer>            tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   // ROS I/O
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr  pc_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr        depth_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr   info_sub_;
-  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr      grid_pub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr    pc_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr          depth_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr     info_sub_;
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr     nvblox_grid_sub_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr        grid_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr mesh_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr             status_pub_;
   rclcpp::TimerBase::SharedPtr                                    stats_timer_;

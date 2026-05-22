@@ -32,12 +32,16 @@ def generate_launch_description():
         # Camera bringup
         DeclareLaunchArgument('use_cameras', default_value='true',
                               description='Launch RealSense cameras'),
+        # 3D reconstruction
+        DeclareLaunchArgument('launch_nvblox', default_value='false',
+                              description='Launch nvblox GPU 3D reconstruction'),
 
         LogInfo(msg=[
             'RoboAi full stack — sensors: '
             'ouster=', LaunchConfiguration('use_ouster'),
             ' livox=', LaunchConfiguration('use_livox'),
             ' cameras=', LaunchConfiguration('use_cameras'),
+            ' nvblox=', LaunchConfiguration('launch_nvblox'),
             ' dashboard=', LaunchConfiguration('launch_dashboard'),
             ' fleet=', LaunchConfiguration('launch_fleet'),
         ]),
@@ -73,6 +77,13 @@ def generate_launch_description():
             condition=IfCondition(LaunchConfiguration('use_cameras')),
         ),
 
+        # Static map → base_link transform (stationary robot — no SLAM needed)
+        Node(
+            package='tf2_ros', executable='static_transform_publisher',
+            name='map_to_base_link_tf', output='screen',
+            arguments=['0', '0', '0', '0', '0', '0', 'map', 'base_link'],
+        ),
+
         # Static transforms (placeholder identity)
         Node(
             package='tf2_ros', executable='static_transform_publisher',
@@ -88,6 +99,23 @@ def generate_launch_description():
             package='tf2_ros', executable='static_transform_publisher',
             name='cam1_tf', output='screen',
             arguments=['0.3', '-0.1', '0.4', '0', '0.3', '0', 'base_link', 'cam1_link'],
+        ),
+
+        # ── nvblox GPU 3D reconstruction ────────────────────────────────────────
+        # v2.1.0: single camera, topics: depth/image, color/image, pointcloud
+        # Remapped to cam0 raw depth (aligned_depth unreliable) + lidar/points
+        Node(
+            package='nvblox_ros', executable='nvblox_node',
+            name='nvblox_node', output='screen',
+            parameters=[os.path.join(config_dir, 'nvblox.yaml')],
+            remappings=[
+                ('depth/image',       '/cam0/cam0/depth/image_rect_raw'),
+                ('depth/camera_info', '/cam0/cam0/depth/camera_info'),
+                ('color/image',       '/cam0/cam0/color/image_raw'),
+                ('color/camera_info', '/cam0/cam0/color/camera_info'),
+                ('pointcloud',        '/lidar/points'),
+            ],
+            condition=IfCondition(LaunchConfiguration('launch_nvblox')),
         ),
 
         Node(

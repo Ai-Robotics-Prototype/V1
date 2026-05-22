@@ -45,6 +45,15 @@ class SafetyMonitorNode(Node):
         self.create_subscription(String, '/safety/zone', self._zone_cb, 10)
         self.create_subscription(JointState, '/joint_states', self._joint_cb, 10)
 
+        self._esdf_slice = None
+        try:
+            from nvblox_msgs.msg import DistanceMapSlice
+            self.create_subscription(DistanceMapSlice, '/nvblox_node/esdf_slice',
+                                     self._on_esdf_slice, 5)
+            self.get_logger().info('nvblox ESDF slice subscription active')
+        except ImportError:
+            self.get_logger().warn('nvblox_msgs not found — ESDF obstacle checking disabled')
+
         self.create_service(Trigger, '/safety/reset_estop', self._reset_estop_cb)
 
         self.create_timer(0.02, self._control_loop)
@@ -71,6 +80,23 @@ class SafetyMonitorNode(Node):
 
     def _zone_cb(self, msg: String):
         self._zone = msg.data
+
+    def _on_esdf_slice(self, msg):
+        self._esdf_slice = msg
+
+    def esdf_distance_at(self, x_m, y_m):
+        """Distance to nearest obstacle at (x_m, y_m) metres. Returns None if unavailable."""
+        s = self._esdf_slice
+        if s is None:
+            return None
+        gx = int((x_m - s.origin.x) / s.resolution)
+        gy = int((y_m - s.origin.y) / s.resolution)
+        if gx < 0 or gx >= s.width or gy < 0 or gy >= s.height:
+            return None
+        val = s.data[gy * s.width + gx]
+        if val < -900:   # nvblox uses -1000 for unknown cells
+            return None
+        return float(val)
 
     def _joint_cb(self, msg: JointState):
         pass

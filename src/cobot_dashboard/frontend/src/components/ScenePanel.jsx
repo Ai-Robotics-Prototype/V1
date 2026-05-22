@@ -11,11 +11,13 @@ export default function ScenePanel() {
   const canvasRef  = useRef(null)
   const accumRef   = useRef([])
   const objsRef    = useRef([])
+  const meshRef    = useRef({ tris: [], dirty: false, clear: false })
   const [live,     setLive]   = useState(false)
   const [ptCount,  setPtCnt]  = useState(0)
   const [hz,       setHz]     = useState(0)
   const [range,    setRange]  = useState(12)
   const [stats,    setStats]  = useState({ min_h: 0, max_h: 0, spread: 0 })
+  const [meshInfo, setMeshInfo] = useState({ verts: 0, tris: 0, active: false })
 
   const sceneObjects = useStore((s) => s.sceneGraph?.objects ?? [])
   const perception   = useStore((s) => s.perception)
@@ -54,14 +56,46 @@ export default function ScenePanel() {
       ws.onerror = () => ws.close()
       ws.onmessage = ({ data }) => {
         try {
-          const incoming = JSON.parse(data).points || []
+          const d = JSON.parse(data)
+
+          // ── nvblox mesh update ─────────────────────────────────────────────
+          if (d.type === 'mesh') {
+            const m = meshRef.current
+            if (d.clear) m.tris = []
+            for (const block of (d.blocks || [])) {
+              const verts = block.v   // [[x,y,z],...]
+              const faces = block.f   // [[i,j,k],...]
+              const colors = block.c  // [[r,g,b],...] or []
+              for (let fi = 0; fi < faces.length; fi++) {
+                const [i, j, k] = faces[fi]
+                if (i >= verts.length || j >= verts.length || k >= verts.length) continue
+                const c = colors && colors[i] ? colors[i] : null
+                m.tris.push({
+                  ax: verts[i][0], az: verts[i][2],
+                  bx: verts[j][0], bz: verts[j][2],
+                  cx: verts[k][0], cz: verts[k][2],
+                  h:  (verts[i][1] + verts[j][1] + verts[k][1]) / 3,
+                  r: c ? Math.round(c[0] * 255) : null,
+                  g: c ? Math.round(c[1] * 255) : null,
+                  b: c ? Math.round(c[2] * 255) : null,
+                })
+              }
+            }
+            // Cap mesh buffer to avoid memory explosion
+            if (m.tris.length > 80000) m.tris = m.tris.slice(-80000)
+            m.dirty = true
+            setMeshInfo({ verts: d.total_verts, tris: d.total_tris, active: true })
+            return
+          }
+
+          // ── point cloud update ─────────────────────────────────────────────
+          const incoming = d.points || []
           const acc = accumRef.current
           for (const p of incoming) acc.push(p)
           if (acc.length > MAX_PTS) acc.splice(0, acc.length - MAX_PTS)
           accumRef.current = acc
           setPtCnt(acc.length)
 
-          // Compute height stats for legend
           if (incoming.length > 10) {
             let minH = Infinity, maxH = -Infinity
             for (const p of incoming) {
@@ -170,6 +204,34 @@ export default function ScenePanel() {
         ctx.fillRect(sx - 1, sy - 1, 2, 2)
       }
 
+      // ── nvblox mesh triangles (top-down projection, x-z plane) ─────────────
+      const mesh = meshRef.current
+      if (mesh.tris.length > 0) {
+        ctx.save()
+        ctx.globalAlpha = 0.45
+        for (const t of mesh.tris) {
+          // Height → color (same palette as point cloud)
+          let r, g, b
+          const h = t.h
+          if (t.r !== null) { r = t.r; g = t.g; b = t.b }
+          else if (h < 0.1) { r = 148; g = 173; b = 220 }
+          else if (h < 0.5) { r =  60; g = 175; b = 120 }
+          else if (h < 1.0) { r = 220; g = 155; b =  35 }
+          else               { r = 205; g =  60; b =  60 }
+          ctx.fillStyle   = `rgb(${r},${g},${b})`
+          ctx.strokeStyle = `rgba(${r},${g},${b},0.3)`
+          ctx.lineWidth   = 0.5
+          ctx.beginPath()
+          ctx.moveTo(cx + t.ax * scale, cy - t.az * scale)
+          ctx.lineTo(cx + t.bx * scale, cy - t.bz * scale)
+          ctx.lineTo(cx + t.cx * scale, cy - t.cz * scale)
+          ctx.closePath()
+          ctx.fill()
+          ctx.stroke()
+        }
+        ctx.restore()
+      }
+
       // Detection overlays
       for (const det of detections) {
         const pos = det.pos_3d || det.position
@@ -270,7 +332,12 @@ export default function ScenePanel() {
     return () => { dead = true; cancelAnimationFrame(rafId); if (ws) ws.close() }
   }, [range])
 
-  const clearMap = () => { accumRef.current = []; setPtCnt(0) }
+  const clearMap = () => {
+    accumRef.current = []
+    meshRef.current = { tris: [], dirty: false, clear: false }
+    setPtCnt(0)
+    setMeshInfo({ verts: 0, tris: 0, active: false })
+  }
 
   return (
     <div style={{
@@ -301,6 +368,11 @@ export default function ScenePanel() {
           {sceneObjects.length > 0 && (
             <span style={{ fontSize: 9, color: 'var(--accent)', fontWeight: 600 }}>
               · {sceneObjects.length} tracked
+            </span>
+          )}
+          {meshInfo.active && (
+            <span style={{ fontSize: 9, color: '#7C3AED', fontWeight: 600 }}>
+              · mesh {(meshInfo.verts / 1000).toFixed(1)}k v / {(meshInfo.tris / 1000).toFixed(1)}k t
             </span>
           )}
 
