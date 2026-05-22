@@ -41,6 +41,7 @@ _make_cv2_stub()
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 
@@ -222,21 +223,43 @@ class DetectorNode(Node):
         self._det_pub  = self.create_publisher(String, '/perception/detections',     10)
         self._ann_pub  = self.create_publisher(Image,  '/perception/annotated_image', 10)
 
-        self.create_subscription(Image, '/cam0/cam0/color/image_raw',         self._on_rgb,   5)
-        self.create_subscription(Image, '/cam0/cam0/aligned_depth_to_color/image_raw',
-                                 self._on_depth, 5)
+        # RealSense publishes sensor topics as BEST_EFFORT — must match or messages are silently dropped
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
+
+        # RealSense launched with namespace=cam0 → node also uses cam0 → /cam0/cam0/*
+        self.create_subscription(Image,      '/cam0/cam0/color/image_raw',
+                                 self._on_rgb,         sensor_qos)
+        self.create_subscription(Image,      '/cam0/cam0/aligned_depth_to_color/image_raw',
+                                 self._on_depth,       sensor_qos)
+        # Fallback: non-aligned depth in case aligned stream is not enabled
+        self.create_subscription(Image,      '/cam0/cam0/depth/image_rect_raw',
+                                 self._on_depth,       sensor_qos)
         self.create_subscription(CameraInfo, '/cam0/cam0/color/camera_info',
-                                 self._on_camera_info, 1)
+                                 self._on_camera_info, sensor_qos)
 
         self._depth_arr = None
         self._depth_fx  = 615.0
         self._depth_fy  = 615.0
         self._depth_cx  = 320.0
         self._depth_cy  = 240.0
-        self._intrinsics_set = False
+        self._intrinsics_set     = False
+        self._depth_warn_logged  = False
 
         self._last_log  = time.time()
         self._frame_cnt = 0
+        self._rgb_count = 0
+
+        self.get_logger().info(
+            'detector_node subscribing to:\n'
+            '  RGB:   /cam0/cam0/color/image_raw\n'
+            '  Depth: /cam0/cam0/aligned_depth_to_color/image_raw '
+            '(fallback: /cam0/cam0/depth/image_rect_raw)\n'
+            '  Info:  /cam0/cam0/color/camera_info'
+        )
 
         threading.Thread(target=self._load, daemon=True).start()
         self.get_logger().info('detector_node starting (model load in background)')
@@ -247,35 +270,56 @@ class DetectorNode(Node):
             self.get_logger().error('torch or PIL not available')
             return
         try:
-            from ultralytics import YOLO
-            engine_path = self._pt_path.replace('.pt', '.engine')
-            loaded_path = self._pt_path
-            model = None
+            cfg_path = self._pt_path
+            if cfg_path.endswith('.engine'):
+                engine_path = cfg_path
+                pt_path = cfg_path.replace('.engine', '.pt')
+            else:
+                pt_path = cfg_path
+                engine_path = cfg_path.replace('.pt', '.engine')
 
-            # Try TRT engine first; validate that model.model is a usable nn.Module
+            model = None
+            loaded_path = None
+
+            # TRT: use AutoBackend directly — YOLO(engine).model is a lazy string, not nn.Module
             if os.path.exists(engine_path):
                 try:
-                    m = YOLO(engine_path)
-                    net_test = m.model
-                    net_test.eval()  # raises if TRT returns a non-Module (e.g. str)
-                    model = m
+                    from ultralytics.nn.autobackend import AutoBackend
+                    ab = AutoBackend(
+                        model=engine_path,
+                        device=torch.device(self._device),
+                        fp16=True, verbose=False,
+                    )
+                    ab.eval()
+                    model = ab
                     loaded_path = engine_path
-                    self.get_logger().info(f'TRT engine validated: {engine_path}')
+                    names = getattr(ab, 'names', {})
+                    self._names = names if isinstance(names, dict) else {i: n for i, n in enumerate(names)}
+                    self.get_logger().info(f'TRT engine loaded via AutoBackend: {engine_path}')
                 except Exception as e:
-                    self.get_logger().warn(f'TRT engine unusable ({e}), falling back to .pt')
+                    self.get_logger().warn(f'TRT engine failed ({e}), trying .pt fallback')
 
             if model is None:
-                model = YOLO(self._pt_path)
+                if not os.path.exists(pt_path):
+                    self.get_logger().error(
+                        f'No usable model: engine={engine_path} pt={pt_path}')
+                    return
+                from ultralytics import YOLO
+                m = YOLO(pt_path)
+                self._names = m.names if hasattr(m, 'names') else {}
+                net = m.model
+                net.eval()
+                if torch.cuda.is_available():
+                    net = net.to(self._device)
+                model = net
+                loaded_path = pt_path
+                self.get_logger().info(f'YOLOv8 .pt loaded: {pt_path}')
 
-            self._names = model.names
-            net = model.model
-            net.eval()
-            if torch.cuda.is_available():
-                net = net.to(self._device)
-            self._model = net
+            self._model = model
             self._ready = True
             self.get_logger().info(
-                f'YOLOv8 loaded from {loaded_path} on {self._device} — {len(self._names)} classes')
+                f'Detector ready on {self._device} — {len(self._names)} classes '
+                f'({loaded_path})')
         except Exception as e:
             self.get_logger().error(f'Model load failed: {e}')
 
@@ -303,6 +347,12 @@ class DetectorNode(Node):
             pass
 
     def _on_rgb(self, msg):
+        self._rgb_count += 1
+        if self._rgb_count % 30 == 1:
+            self.get_logger().info(
+                f'RGB frames received: {self._rgb_count} '
+                f'(model ready: {self._ready})'
+            )
         if not self._ready:
             return
         try:
@@ -341,19 +391,40 @@ class DetectorNode(Node):
             dets = _postprocess(raw_preds, scale, pad_x, pad_y, w, h,
                                 self._conf_thr, self._nms_thr)
 
-            # Enrich with depth
+            # Depth readiness warning (once)
+            if self._depth_arr is None and not self._depth_warn_logged:
+                self.get_logger().warn(
+                    'No depth frames received — detections will have no 3D position. '
+                    'Check /cam0/cam0/aligned_depth_to_color/image_raw is publishing.'
+                )
+                self._depth_warn_logged = True
+            elif self._depth_arr is not None and not self._intrinsics_set:
+                self.get_logger().warn(
+                    'Depth arriving but camera_info not received — '
+                    'using default intrinsics. Check /cam0/color/camera_info.'
+                )
+
+            # Enrich with depth — mark has_3d=False when depth unavailable
             for det in dets:
                 x1, y1, x2, y2 = det['bbox_px']
-                cx = int((x1 + x2) / 2)
-                cy = int((y1 + y2) / 2)
-                depth_m = self._sample_depth(cx, cy)
-                pos_3d  = self._deproject(cx, cy, depth_m)
-                det['id']         = self._det_id
-                det['depth_m']    = depth_m
-                det['pos_3d']     = pos_3d
-                det['distance_m'] = round(math.sqrt(sum(v**2 for v in pos_3d)), 3)
-                det['pickable']   = det['class_name'] not in ('person',) and depth_m < 1.5
-                det['timestamp']  = time.time()
+                cx_px = int((x1 + x2) / 2)
+                cy_px = int((y1 + y2) / 2)
+                depth_m = self._sample_depth(cx_px, cy_px)
+                det['id'] = self._det_id
+                if depth_m is None:
+                    det['depth_m']    = -1.0
+                    det['pos_3d']     = None
+                    det['distance_m'] = -1.0
+                    det['pickable']   = False
+                    det['has_3d']     = False
+                else:
+                    pos_3d = self._deproject(cx_px, cy_px, depth_m)
+                    det['depth_m']    = depth_m
+                    det['pos_3d']     = pos_3d
+                    det['distance_m'] = round(math.sqrt(sum(v**2 for v in pos_3d)), 3)
+                    det['pickable']   = det['class_name'] not in ('person',) and depth_m < 1.5
+                    det['has_3d']     = True
+                det['timestamp'] = time.time()
                 self._det_id += 1
 
             # Publish detection JSON (with inference timing)
@@ -385,17 +456,19 @@ class DetectorNode(Node):
         except Exception as e:
             self.get_logger().warn(f'infer: {e}')
 
-    def _sample_depth(self, px, py):
+    def _sample_depth(self, px, py, patch=7):
+        """Median of a patch to reject holes/noise. Returns metres or None."""
         d = self._depth_arr
         if d is None:
-            return 1.0
+            return None
         h, w = d.shape
-        px = max(0, min(px, w - 1))
-        py = max(0, min(py, h - 1))
-        val = float(d[py, px])
-        if not math.isfinite(val) or val <= 0:
-            return 1.0
-        return round(val, 3)
+        x0 = max(0, px - patch); x1 = min(w, px + patch + 1)
+        y0 = max(0, py - patch); y1 = min(h, py + patch + 1)
+        region = d[y0:y1, x0:x1]
+        valid = region[(region > 0.1) & (region < 6.0) & np.isfinite(region)]
+        if len(valid) < 3:
+            return None
+        return float(np.median(valid))
 
     def _deproject(self, px, py, depth_m):
         x = (px - self._depth_cx) * depth_m / self._depth_fx

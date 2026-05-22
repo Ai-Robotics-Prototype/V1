@@ -93,7 +93,7 @@ class SceneGraphNode(Node):
 
         self.declare_parameter('max_track_age_s', 5.0)
         self.declare_parameter('association_distance_m', 0.3)
-        self.declare_parameter('min_confidence', 0.4)
+        self.declare_parameter('min_confidence', 0.35)
         self.declare_parameter('publish_rate_hz', 10.0)
 
         self.max_age = self.get_parameter('max_track_age_s').value
@@ -130,8 +130,13 @@ class SceneGraphNode(Node):
             conf   = float(det.get('score', 0.0))
             if conf < self.min_conf:
                 continue
+            # Skip detections with no valid 3D position
+            has_3d = det.get('has_3d', True)   # default True for backward compat
             pos_3d = det.get('pos_3d')
-            if not pos_3d or len(pos_3d) < 3:
+            if not has_3d or pos_3d is None or len(pos_3d) < 3:
+                self.get_logger().debug(
+                    f"Detection {det.get('class_name','?')} skipped — no 3D position"
+                )
                 continue
             det_pos = (float(pos_3d[0]), float(pos_3d[1]), float(pos_3d[2]))
 

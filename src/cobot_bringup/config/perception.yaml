@@ -1,9 +1,11 @@
 sensor_fusion_node:
   ros__parameters:
-    voxel_size: 0.025
+    voxel_size: 0.05       # 5cm — fast enough for CPU numpy fallback
     max_range: 5.0
-    min_range: 0.2
+    min_range: 0.1         # catch nearby objects (was 0.2)
+    publish_hz: 15.0
     lidar_frame: "lidar_link"
     cam0_frame: "cam0_link"
     cam1_frame: "cam1_link"
     target_frame: "base_link"
+    estimate_normals: false
