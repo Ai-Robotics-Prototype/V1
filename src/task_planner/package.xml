@@ -4,7 +4,7 @@
   <name>task_planner</name>
   <version>0.1.0</version>
   <description>Pick-and-place state machine task planner</description>
-  <maintainer email="robot@cobot">cobot</maintainer>
+  <maintainer email="robot@cobot.local">cobot</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>

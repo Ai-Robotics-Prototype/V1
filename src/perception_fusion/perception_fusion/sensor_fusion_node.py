@@ -1,4 +1,5 @@
 import struct
+import threading
 import time
 import rclpy
 from rclpy.node import Node
@@ -113,13 +114,16 @@ class SensorFusionNode(Node):
 
         self.fused_pub = self.create_publisher(PointCloud2, '/perception/fused_cloud', 10)
 
-        lidar_sub = message_filters.Subscriber(self, PointCloud2, '/lidar/points')
-        cam0_sub  = message_filters.Subscriber(self, PointCloud2, '/cam0/depth/points')
-        cam1_sub  = message_filters.Subscriber(self, PointCloud2, '/cam1/depth/points')
+        self._lock      = threading.Lock()
+        self._lidar_msg = None
+        self._cam0_msg  = None
+        self._cam1_msg  = None
 
-        self.sync = message_filters.ApproximateTimeSynchronizer(
-            [lidar_sub, cam0_sub, cam1_sub], queue_size=10, slop=0.05)
-        self.sync.registerCallback(self.fusion_callback)
+        self.create_subscription(PointCloud2, '/lidar/points',      self._on_lidar, 10)
+        self.create_subscription(PointCloud2, '/cam0/depth/points', self._on_cam0,  10)
+        self.create_subscription(PointCloud2, '/cam1/depth/points', self._on_cam1,  10)
+
+        self.create_timer(1.0 / 15.0, self._fuse_and_publish)
 
         self._hz_count  = 0
         self._last_log  = self.get_clock().now()
@@ -143,24 +147,41 @@ class SensorFusionNode(Node):
                 throttle_duration_sec=2.0)
             return msg
 
-    def fusion_callback(self, lidar_msg, cam0_msg, cam1_msg):
+    def _on_lidar(self, msg: PointCloud2):
+        with self._lock:
+            self._lidar_msg = msg
+
+    def _on_cam0(self, msg: PointCloud2):
+        with self._lock:
+            self._cam0_msg = msg
+
+    def _on_cam1(self, msg: PointCloud2):
+        with self._lock:
+            self._cam1_msg = msg
+
+    def _fuse_and_publish(self):
+        with self._lock:
+            lidar_msg = self._lidar_msg
+            cam0_msg  = self._cam0_msg
+            cam1_msg  = self._cam1_msg
+
+        if lidar_msg is None:
+            return
+
         t0 = time.monotonic()
 
-        lidar_t = self._try_transform(lidar_msg)
-        cam0_t  = self._try_transform(cam0_msg)
-        cam1_t  = self._try_transform(cam1_msg)
+        clouds = [pc2_to_numpy(self._try_transform(lidar_msg))]
+        if cam0_msg is not None:
+            clouds.append(pc2_to_numpy(self._try_transform(cam0_msg)))
+        if cam1_msg is not None:
+            clouds.append(pc2_to_numpy(self._try_transform(cam1_msg)))
 
-        pts_lidar = pc2_to_numpy(lidar_t)
-        pts_cam0  = pc2_to_numpy(cam0_t)
-        pts_cam1  = pc2_to_numpy(cam1_t)
-
-        # GPU concat → range filter → voxel downsample
-        merged   = concat_clouds([pts_lidar, pts_cam0, pts_cam1])
+        merged   = concat_clouds(clouds)
         filtered = range_filter(merged, self.min_range, self.max_range)
         voxeled  = voxel_downsample(filtered, self.voxel_size)
 
         if self.do_normals and len(voxeled) > 0:
-            estimate_normals(voxeled)  # result discarded here; wire to pub if needed
+            estimate_normals(voxeled)
 
         out_msg = numpy_to_pc2(
             voxeled, self.target_frame, self.get_clock().now().to_msg())
@@ -172,9 +193,10 @@ class SensorFusionNode(Node):
         if dt >= 1.0:
             ms  = (time.monotonic() - t0) * 1e3
             hz  = self._hz_count / dt
+            cams = sum(1 for m in (cam0_msg, cam1_msg) if m is not None)
             self.get_logger().info(
                 f'Fused cloud: {len(voxeled)} pts at {hz:.1f} Hz | {ms:.1f} ms/frame '
-                f'({get_backend()})')
+                f'({get_backend()}) cams={cams}/2')
             self._hz_count = 0
             self._last_log = now
 

@@ -4,7 +4,7 @@
   <name>fleet_agent</name>
   <version>0.1.0</version>
   <description>Experience logging, OTA model updates, and cloud sync</description>
-  <maintainer email="robot@cobot">cobot</maintainer>
+  <maintainer email="robot@cobot.local">cobot</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>

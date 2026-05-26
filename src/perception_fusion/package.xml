@@ -4,7 +4,7 @@
   <name>perception_fusion</name>
   <version>0.1.0</version>
   <description>LiDAR + RGBD sensor fusion node</description>
-  <maintainer email="robot@cobot">cobot</maintainer>
+  <maintainer email="robot@cobot.local">cobot</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>

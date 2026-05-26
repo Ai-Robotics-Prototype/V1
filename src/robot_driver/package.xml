@@ -8,7 +8,7 @@
     Publishes joint states and TF. Accepts pose and joint commands.
     Swap brand via the 'brand' ROS parameter — no code changes needed.
   </description>
-  <maintainer email="robot@cobot">cobot</maintainer>
+  <maintainer email="robot@cobot.local">cobot</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>

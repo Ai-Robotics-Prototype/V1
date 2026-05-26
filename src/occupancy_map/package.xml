@@ -4,7 +4,7 @@
   <name>occupancy_map</name>
   <version>0.1.0</version>
   <description>GPU-accelerated 3D occupancy map via Isaac ROS nvblox</description>
-  <maintainer email="robot@cobot">cobot</maintainer>
+  <maintainer email="robot@cobot.local">cobot</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclcpp</depend>
@@ -14,9 +14,6 @@
   <depend>geometry_msgs</depend>
   <depend>tf2_ros</depend>
   <depend>visualization_msgs</depend>
-
-  <!-- nvblox_ros from Isaac ROS — optional, graceful fallback if absent -->
-  <depend condition="$NVBLOX_ENABLED">nvblox_ros</depend>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <test_depend>ament_lint_auto</test_depend>

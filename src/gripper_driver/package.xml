@@ -8,7 +8,7 @@
     Supports DH-Robotics (AG-95, PGC series), Robotiq 2F,
     xArm built-in gripper, and a fake/simulated gripper.
   </description>
-  <maintainer email="robot@cobot">cobot</maintainer>
+  <maintainer email="robot@cobot.local">cobot</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>

@@ -4,7 +4,7 @@
   <name>cobot_bringup</name>
   <version>0.1.0</version>
   <description>Launch files, URDF, and config for the cobot stack</description>
-  <maintainer email="robot@cobot">cobot</maintainer>
+  <maintainer email="robot@cobot.local">cobot</maintainer>
   <license>Apache-2.0</license>
 
   <exec_depend>perception_fusion</exec_depend>

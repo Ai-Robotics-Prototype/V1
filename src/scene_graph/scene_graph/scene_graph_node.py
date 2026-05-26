@@ -133,6 +133,9 @@ class SceneGraphNode(Node):
             det_pos = (pos.x, pos.y, pos.z)
             frame = msg.header.frame_id
 
+            if det_pos[2] <= 0.0:
+                continue
+
             best_track = None
             best_dist = self.assoc_dist
             for i, track in enumerate(self.tracks):
