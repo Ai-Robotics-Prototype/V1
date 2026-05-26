@@ -1,5 +1,5 @@
 import { motion, AnimatePresence } from 'framer-motion'
-import { useStore } from '../store'
+import { useStore } from '../store/useStore'
 
 function fmtAge(ms) {
   if (ms > 1000) return { text: '>1s', old: true }
@@ -7,8 +7,7 @@ function fmtAge(ms) {
 }
 
 export default function SceneGraphPanel() {
-  const { robotState } = useStore()
-  const objects = robotState?.scene_graph?.objects ?? []
+  const objects = useStore((s) => s.scene_graph.objects)
 
   return (
     <div style={styles.panel}>
@@ -32,8 +31,9 @@ export default function SceneGraphPanel() {
             <tbody>
               <AnimatePresence initial={false}>
                 {objects.map(obj => {
-                  const age = fmtAge(obj.last_seen_ms)
-                  const [x, y, z] = obj.pos ?? [0, 0, 0]
+                  const age = fmtAge(obj.last_seen_ms ?? 0)
+                  const pos = obj.position ?? [0, 0, 0]
+                  const [x, y, z] = pos
                   return (
                     <motion.tr
                       key={obj.id}
@@ -43,14 +43,14 @@ export default function SceneGraphPanel() {
                       transition={{ duration: 0.6 }}
                     >
                       <td style={styles.td}>{obj.id}</td>
-                      <td style={styles.td}>{obj.class}</td>
-                      <td style={styles.tdNum}>{x.toFixed(2)} m</td>
-                      <td style={styles.tdNum}>{y.toFixed(2)} m</td>
-                      <td style={styles.tdNum}>{z.toFixed(2)} m</td>
+                      <td style={styles.td}>{obj.class_name}</td>
+                      <td style={styles.tdNum}>{(x ?? 0).toFixed(2)} m</td>
+                      <td style={styles.tdNum}>{(y ?? 0).toFixed(2)} m</td>
+                      <td style={styles.tdNum}>{(z ?? 0).toFixed(2)} m</td>
                       <td style={{ ...styles.tdNum, color: age.old ? 'var(--zone-red)' : 'var(--text-secondary)' }}>
                         {age.text}
                       </td>
-                      <td style={styles.tdNum}>{(obj.confidence * 100).toFixed(0)}%</td>
+                      <td style={styles.tdNum}>{((obj.score ?? obj.confidence ?? 0) * 100).toFixed(0)}%</td>
                     </motion.tr>
                   )
                 })}

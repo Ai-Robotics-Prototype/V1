@@ -42,8 +42,8 @@ STATE = {
     ],
     "scene_graph": {
         "objects": [
-            {"id": "obj_001", "class": "bottle", "pos": [0.4, 0.2, 0.8], "last_seen_ms": 120, "confidence": 0.94},
-            {"id": "obj_002", "class": "box", "pos": [-0.3, 0.1, 0.6], "last_seen_ms": 85, "confidence": 0.87},
+            {"id": "obj_001", "class_name": "bottle", "position": [0.4, 0.2, 0.8], "last_seen_ms": 120, "score": 0.94},
+            {"id": "obj_002", "class_name": "box",    "position": [-0.3, 0.1, 0.6], "last_seen_ms": 85,  "score": 0.87},
         ]
     },
     "gripper": {"state": "open", "position_mm": 85.0},
@@ -224,9 +224,9 @@ async def simulation_loop():
 
         # --- Scene graph drift ---
         for obj in STATE["scene_graph"]["objects"]:
-            obj["pos"][0] += random.uniform(-0.002, 0.002)
-            obj["pos"][1] += random.uniform(-0.002, 0.002)
-            obj["pos"][2] += random.uniform(-0.001, 0.001)
+            obj["position"][0] += random.uniform(-0.002, 0.002)
+            obj["position"][1] += random.uniform(-0.002, 0.002)
+            obj["position"][2] += random.uniform(-0.001, 0.001)
             obj["last_seen_ms"] += int(1000 / 25)
 
         # --- Broadcast state ---
@@ -254,28 +254,24 @@ def _generate_lidar_frame(t: float) -> dict:
     points = []
     # Floor plane
     for _ in range(200):
-        x = random.uniform(-3, 3)
-        y = random.uniform(-3, 3)
-        z = random.uniform(-0.05, 0.05)
-        points.append([x, y, z])
+        points.append({"x": round(random.uniform(-3, 3), 3),
+                        "y": round(random.uniform(-3, 3), 3),
+                        "z": round(random.uniform(-0.05, 0.05), 3)})
     # Walls / objects
     for _ in range(80):
         angle = random.uniform(0, 2 * math.pi)
         r = random.uniform(0.8, 2.5)
-        x = r * math.cos(angle)
-        y = r * math.sin(angle)
-        z = random.uniform(0.0, 1.5)
-        points.append([x, y, z])
+        points.append({"x": round(r * math.cos(angle), 3),
+                        "y": round(r * math.sin(angle), 3),
+                        "z": round(random.uniform(0.0, 1.5), 3)})
     # Moving person blob
     px = 1.5 * math.cos(t * 0.4)
     py = 1.5 * math.sin(t * 0.4)
     for _ in range(30):
-        points.append([
-            px + random.gauss(0, 0.05),
-            py + random.gauss(0, 0.05),
-            random.uniform(0.0, 1.7),
-        ])
-    return {"points": points, "t": time.time() * 1000}
+        points.append({"x": round(px + random.gauss(0, 0.05), 3),
+                        "y": round(py + random.gauss(0, 0.05), 3),
+                        "z": round(random.uniform(0.0, 1.7), 3)})
+    return {"points": points, "live": False, "t": time.time() * 1000}
 
 
 # ---------------------------------------------------------------------------

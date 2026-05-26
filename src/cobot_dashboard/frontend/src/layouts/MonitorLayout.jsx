@@ -9,8 +9,9 @@ import ControlStrip from '../components/ControlStrip'
 function SceneGraphPanel() {
   const objects = useStore((s) => s.scene_graph.objects)
 
-  function dist(pos) {
-    return Math.sqrt(pos[0] ** 2 + pos[1] ** 2 + pos[2] ** 2).toFixed(2)
+  function dist(position) {
+    const [px, py, pz] = position ?? [0, 0, 0]
+    return Math.sqrt(px ** 2 + py ** 2 + pz ** 2).toFixed(2)
   }
 
   return (
@@ -30,11 +31,11 @@ function SceneGraphPanel() {
           {objects.map((obj) => (
             <tr key={obj.id} style={{ borderBottom: '1px solid var(--border)' }}>
               <td style={{ padding: '4px 6px', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{obj.id}</td>
-              <td style={{ padding: '4px 6px', textTransform: 'uppercase', fontWeight: 500, color: 'var(--text-primary)' }}>{obj.class}</td>
+              <td style={{ padding: '4px 6px', textTransform: 'uppercase', fontWeight: 500, color: 'var(--text-primary)' }}>{obj.class_name}</td>
               <td style={{ padding: '4px 6px', fontFamily: 'var(--font-mono)', fontSize: 10 }}>
-                ({obj.pos[0].toFixed(2)}, {obj.pos[1].toFixed(2)}, {obj.pos[2].toFixed(2)})
+                {(() => { const [px, py, pz] = obj.position ?? [0,0,0]; return `(${px.toFixed(2)}, ${py.toFixed(2)}, ${pz.toFixed(2)})` })()}
               </td>
-              <td style={{ padding: '4px 6px', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{dist(obj.pos)} m</td>
+              <td style={{ padding: '4px 6px', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{dist(obj.position)} m</td>
               <td style={{ padding: '4px 6px', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{(obj.confidence * 100).toFixed(0)}%</td>
             </tr>
           ))}

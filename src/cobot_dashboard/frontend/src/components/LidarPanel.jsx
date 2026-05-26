@@ -30,10 +30,10 @@ function PointCloud({ pointsRef }) {
     for (let i = 0; i < pts.length; i++) {
       const p = pts[i]
       // LiDAR: x=right, y=forward, z=up → Three.js: x, y=up, z
-      positions[i * 3]     = p[0]
-      positions[i * 3 + 1] = p[2]   // z-up → y-up
-      positions[i * 3 + 2] = p[1]
-      const c = heightColor(p[2])
+      positions[i * 3]     = p.x
+      positions[i * 3 + 1] = p.z   // z-up → y-up
+      positions[i * 3 + 2] = p.y
+      const c = heightColor(p.z)
       colors[i * 3]     = c.r
       colors[i * 3 + 1] = c.g
       colors[i * 3 + 2] = c.b
@@ -92,6 +92,26 @@ function SafetyRings({ zone }) {
   )
 }
 
+// Scene object markers (box wireframes at each detected object's position)
+function ObjectMarkers({ objects }) {
+  if (!objects || objects.length === 0) return null
+  return (
+    <>
+      {objects.map((obj) => {
+        const pos = obj.position ?? [0, 0, 0]
+        return (
+          <group key={obj.id} position={[pos[0], pos[2], pos[1]]}>
+            <mesh>
+              <boxGeometry args={[0.15, 0.15, 0.15]} />
+              <meshBasicMaterial color="#3B82F6" wireframe />
+            </mesh>
+          </group>
+        )
+      })}
+    </>
+  )
+}
+
 // Camera preset controller
 function CameraController({ preset }) {
   const { camera } = useThree()
@@ -109,7 +129,7 @@ function CameraController({ preset }) {
   return null
 }
 
-function Scene({ pointsRef, zone, preset }) {
+function Scene({ pointsRef, zone, preset, sceneObjects }) {
   return (
     <>
       <ambientLight intensity={0.3} />
@@ -130,6 +150,9 @@ function Scene({ pointsRef, zone, preset }) {
       {/* Point cloud */}
       <PointCloud pointsRef={pointsRef} />
 
+      {/* Scene object overlays */}
+      <ObjectMarkers objects={sceneObjects} />
+
       <CameraController preset={preset} />
       <OrbitControls enableDamping dampingFactor={0.08} />
     </>
@@ -139,11 +162,13 @@ function Scene({ pointsRef, zone, preset }) {
 export default function LidarPanel() {
   const zone          = useStore((s) => s.safety.zone)
   const lidarWsStatus = useStore((s) => s.lidarWsStatus)
+  const sceneObjects  = useStore((s) => s.scene_graph.objects)
 
   const pointsRef = useRef([])
   const wsRef     = useRef(null)
-  const [preset, setPreset] = useState('3d')
+  const [preset,      setPreset]      = useState('3d')
   const [wsConnected, setWsConnected] = useState(false)
+  const [isLive,      setIsLive]      = useState(false)
 
   // Direct WS connection — bypasses store to avoid re-render storm
   useEffect(() => {
@@ -163,6 +188,7 @@ export default function LidarPanel() {
         try {
           const msg = JSON.parse(ev.data)
           pointsRef.current = msg.points ?? []
+          setIsLive(msg.live ?? false)
         } catch (_) {}
       }
 
@@ -195,7 +221,7 @@ export default function LidarPanel() {
         camera={{ position: [3, 4, 5], fov: 50 }}
         gl={{ antialias: false, powerPreference: 'high-performance' }}
       >
-        <Scene pointsRef={pointsRef} zone={zone} preset={preset} />
+        <Scene pointsRef={pointsRef} zone={zone} preset={preset} sceneObjects={sceneObjects} />
       </Canvas>
 
       {/* View buttons */}
@@ -227,6 +253,24 @@ export default function LidarPanel() {
             {v}
           </button>
         ))}
+      </div>
+
+      {/* Live / Sim badge */}
+      <div style={{
+        position: 'absolute',
+        top: 10,
+        left: 10,
+        background: isLive ? 'rgba(34,197,94,0.12)' : 'rgba(234,179,8,0.12)',
+        border: `1px solid ${isLive ? '#22C55E' : '#EAB308'}`,
+        color: isLive ? '#22C55E' : '#EAB308',
+        borderRadius: 4,
+        padding: '2px 8px',
+        fontSize: 10,
+        fontWeight: 600,
+        letterSpacing: '0.08em',
+        pointerEvents: 'none',
+      }}>
+        {isLive ? '● LIVE' : '◌ SIM'}
       </div>
 
       {/* Zone legend */}
