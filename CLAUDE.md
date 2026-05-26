@@ -115,3 +115,44 @@ ros2 service call /safety/reset_estop std_srvs/srv/Trigger
 # Language test
 bash scripts/test_language.sh
 ```
+
+## Current Status — May 2026 (JetPack 6 Fresh Install)
+
+### Complete
+- JetPack 6.2.2 flashed (Ubuntu 22.04, CUDA 12.6, L4T R36.5.0)
+- ROS2 Humble installed natively (no Docker needed)
+- All 14 packages building cleanly (including CUDA C++ kernels)
+- Isaac ROS NITROS 3.2.5 installed via apt
+- YOLOv8n model at /opt/cobot/models/yolov8n.pt
+- Ollama 0.24.0 + Llama 3.1 8B running on :11434
+- Whisper base model installed
+- Dashboard mock server on :8080 (systemd auto-start: roboai-dashboard.service)
+- Frontend built and served: http://localhost:8080
+- 3D point cloud viewer operational (react-three-fiber, OrbitControls)
+- Camera MJPEG streams with detection overlays (cam0, cam1)
+- All dashboard controls working (estop, task, jog, gripper, voice)
+
+### Needs Hardware
+- RealSense D435i cameras → /cam0 and /cam1 topics
+- Ouster LiDAR → /lidar/points topic
+- Robot arm (brand TBD) → configure cobot_bringup/config/robot_driver.yaml
+- Extrinsic calibration (cameras + LiDAR)
+- Safety zone testing with real human proximity
+- First autonomous pick/place run
+
+### Key Commands
+```bash
+# Dashboard
+sudo systemctl start roboai-dashboard   # start
+curl http://localhost:8080/health        # verify
+journalctl -u roboai-dashboard -f       # logs
+
+# ROS2 workspace
+source /opt/ros/humble/setup.bash
+source ~/cobot_ws/install/setup.bash
+colcon build --symlink-install
+ros2 launch cobot_bringup full_stack.launch.py
+
+# Language interface
+bash scripts/test_language.sh
+```
