@@ -40,6 +40,13 @@ class DepthSegmentNode(Node):
         self.declare_parameter('erode_kernel',       3)
         self.declare_parameter('dilate_kernel',      5)
         self.declare_parameter('publish_rate_hz',    15.0)
+        # Per-camera topics so one node can serve cam0 and another cam1
+        self.declare_parameter('depth_topic',      '/cam0/cam0/aligned_depth_to_color/image_raw')
+        self.declare_parameter('color_topic',      '/cam0/cam0/color/image_raw')
+        self.declare_parameter('info_topic',       '/cam0/cam0/color/camera_info')
+        self.declare_parameter('detections_topic', '/perception/detections_3d')
+        self.declare_parameter('annotated_topic',  '/perception/annotated_image')
+        self.declare_parameter('frame_id',         'cam0_color_optical_frame')
 
         self.max_depth   = float(self.get_parameter('max_depth_m').value)
         self.min_area    = int(self.get_parameter('min_object_area_px').value)
@@ -47,6 +54,12 @@ class DepthSegmentNode(Node):
         self.erode_k     = int(self.get_parameter('erode_kernel').value)
         self.dilate_k    = int(self.get_parameter('dilate_kernel').value)
         rate             = float(self.get_parameter('publish_rate_hz').value)
+        depth_topic      = self.get_parameter('depth_topic').value
+        color_topic      = self.get_parameter('color_topic').value
+        info_topic       = self.get_parameter('info_topic').value
+        det_topic        = self.get_parameter('detections_topic').value
+        ann_topic        = self.get_parameter('annotated_topic').value
+        self.frame_id    = self.get_parameter('frame_id').value
 
         # Latest inputs (written by callbacks, read by the timer)
         self._depth_m   = None     # HxW float32 metres
@@ -56,18 +69,12 @@ class DepthSegmentNode(Node):
         self._uv_cache  = None     # cached pixel grids keyed by (h, w)
 
         # RealSense images are BEST_EFFORT — must match QoS or no frames arrive
-        self.create_subscription(
-            Image, '/cam0/cam0/aligned_depth_to_color/image_raw',
-            self._on_depth, qos_profile_sensor_data)
-        self.create_subscription(
-            Image, '/cam0/cam0/color/image_raw',
-            self._on_color, qos_profile_sensor_data)
-        self.create_subscription(
-            CameraInfo, '/cam0/cam0/color/camera_info',
-            self._on_info, qos_profile_sensor_data)
+        self.create_subscription(Image, depth_topic, self._on_depth, qos_profile_sensor_data)
+        self.create_subscription(Image, color_topic, self._on_color, qos_profile_sensor_data)
+        self.create_subscription(CameraInfo, info_topic, self._on_info, qos_profile_sensor_data)
 
-        self.det_pub = self.create_publisher(Detection3DArray, '/perception/detections_3d', 10)
-        self.ann_pub = self.create_publisher(Image, '/perception/annotated_image', 5)
+        self.det_pub = self.create_publisher(Detection3DArray, det_topic, 10)
+        self.ann_pub = self.create_publisher(Image, ann_topic, 5)
 
         self.create_timer(1.0 / max(rate, 1.0), self._process)
         self._log_count = 0
@@ -216,7 +223,7 @@ class DepthSegmentNode(Node):
         stamp = self._depth_hdr.stamp if self._depth_hdr else self.get_clock().now().to_msg()
         arr = Detection3DArray()
         arr.header.stamp = stamp
-        arr.header.frame_id = 'cam0_color_optical_frame'
+        arr.header.frame_id = self.frame_id
         for o in objects:
             det = Detection3D()
             det.header = arr.header
@@ -253,7 +260,7 @@ class DepthSegmentNode(Node):
             draw.text((x0 + 2, max(0, y0 - 12)), label, fill=(255, 255, 255))
         msg = Image()
         msg.header.stamp = self._depth_hdr.stamp if self._depth_hdr else self.get_clock().now().to_msg()
-        msg.header.frame_id = 'cam0_color_optical_frame'
+        msg.header.frame_id = self.frame_id
         msg.height = h
         msg.width = w
         msg.encoding = 'rgb8'

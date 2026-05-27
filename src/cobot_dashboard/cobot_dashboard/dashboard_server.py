@@ -87,8 +87,9 @@ STATE = {
 _cam_frames: dict = {0: None, 1: None}
 _cam_lock = threading.Lock()
 
-# Latest annotated frame from detector
+# Latest annotated frame from detector (cam0 + cam1)
 _annotated_frame: bytes = None
+_annotated_frame_cam1: bytes = None
 _annotated_lock = threading.Lock()
 
 # Latest parsed LiDAR scan
@@ -330,9 +331,11 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             self.get_logger().warn("vision_msgs not available — detection3d subscription skipped")
         self.create_subscription(JointState, "/joint_states",            self._on_joint_states,   10)
 
-        # Annotated image from detector
+        # Annotated image from detector (cam0 + cam1)
         self.create_subscription(Image, "/perception/annotated_image",
                                  self._on_annotated, 2)
+        self.create_subscription(Image, "/perception/annotated_image_cam1",
+                                 self._on_annotated_cam1, 2)
 
         # Cameras — double namespace because realsense2_camera is launched with
         # name=cam0 inside namespace cam0, producing /cam0/cam0/... topics.
@@ -461,6 +464,13 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             global _annotated_frame
             with _annotated_lock:
                 _annotated_frame = jpeg
+
+    def _on_annotated_cam1(self, msg):
+        jpeg = _ros_image_to_jpeg(msg)
+        if jpeg:
+            global _annotated_frame_cam1
+            with _annotated_lock:
+                _annotated_frame_cam1 = jpeg
 
     def _on_joint_states(self, msg):
         with _state_lock:
@@ -683,8 +693,23 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/stream/cam1")
     async def stream_cam1():
-        return StreamingResponse(_mjpeg_gen(1),
-                                  media_type="multipart/x-mixed-replace; boundary=frame")
+        async def _gen():
+            while True:
+                try:
+                    with _annotated_lock:
+                        frame = _annotated_frame_cam1
+                    if not frame:
+                        with _cam_lock:
+                            frame = _cam_frames.get(1)
+                    if not frame:
+                        frame = _sim_camera_frame(1)
+                    if frame:
+                        yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                               + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
+                    await asyncio.sleep(1 / 15)
+                except Exception:
+                    break
+        return StreamingResponse(_gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
     @app.get("/stream/annotated")
     async def stream_annotated():

@@ -66,13 +66,14 @@ def generate_launch_description():
             namespace='cam1',
             parameters=[{
                 'serial_no':                       ParameterValue(LaunchConfiguration('cam1_serial'), value_type=str),
-                # cam1 = COLOUR ONLY. Both D435i share one USB3 controller; running
-                # depth on both oversubscribes it and depth times out. Detection
-                # uses only cam0 depth, so disabling cam1 depth frees the bandwidth.
-                'enable_depth':                    False,
-                'align_depth.enable':              False,
+                # cam1: colour + depth for detection. IR streams OFF (as on cam0)
+                # so both cameras' depth fits on the shared USB3 controller.
+                'align_depth.enable':              True,
                 'pointcloud.enable':               False,
+                'depth_module.depth_profile':      '640x480x30',
                 'rgb_camera.color_profile':        '640x480x30',
+                'enable_infra1':                   False,
+                'enable_infra2':                   False,
                 'enable_gyro':                     False,
                 'enable_accel':                    False,
                 'initial_reset':                   True,
