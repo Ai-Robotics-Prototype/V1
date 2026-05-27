@@ -108,26 +108,70 @@ _going_home: bool = False
 # PIL helpers
 # ---------------------------------------------------------------------------
 
+_enc_warned: set = set()
+_enc_error_count: int = 0
+
+
+def _log_unknown_enc(enc: str):
+    if enc not in _enc_warned:
+        _enc_warned.add(enc)
+        print(f"[dashboard] Unknown camera encoding: {enc!r} — frame dropped", flush=True)
+
+
+def _log_encode_error(err: str):
+    global _enc_error_count
+    _enc_error_count += 1
+    if _enc_error_count <= 5 or _enc_error_count % 100 == 0:
+        print(f"[dashboard] Camera encode error #{_enc_error_count}: {err}", flush=True)
+
+
 def _ros_image_to_jpeg(msg) -> bytes:
     if not PIL_AVAILABLE:
         return b""
     try:
         enc = msg.encoding
-        raw = bytes(msg.data)
+        w, h = msg.width, msg.height
+        # Force a contiguous bytes copy — ROS2 data may be a memoryview
+        raw = bytes(bytearray(msg.data))
+        expected_rgb  = w * h * 3
+        expected_mono = w * h
+
         if enc == "rgb8":
-            img = PilImage.frombytes("RGB", (msg.width, msg.height), raw)
+            if len(raw) < expected_rgb:
+                return b""
+            img = PilImage.frombytes("RGB", (w, h), raw[:expected_rgb])
         elif enc == "bgr8":
-            img = PilImage.frombytes("RGB", (msg.width, msg.height), raw)
+            if len(raw) < expected_rgb:
+                return b""
+            img = PilImage.frombytes("RGB", (w, h), raw[:expected_rgb])
             r, g, b = img.split()
             img = PilImage.merge("RGB", (b, g, r))
         elif enc in ("mono8", "8UC1"):
-            img = PilImage.frombytes("L", (msg.width, msg.height), raw).convert("RGB")
+            if len(raw) < expected_mono:
+                return b""
+            img = PilImage.frombytes("L", (w, h), raw[:expected_mono]).convert("RGB")
+        elif enc == "yuyv":
+            try:
+                import numpy as np
+                arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 2)
+                y = arr[:, :, 0].astype(np.float32)
+                u = arr[:, :, 1].astype(np.float32) - 128
+                r_ch = np.clip(y + 1.402 * u, 0, 255).astype(np.uint8)
+                g_ch = np.clip(y - 0.344 * u, 0, 255).astype(np.uint8)
+                b_ch = np.clip(y + 1.772 * u, 0, 255).astype(np.uint8)
+                img = PilImage.fromarray(
+                    __import__('numpy').stack([r_ch, g_ch, b_ch], axis=2), "RGB")
+            except Exception:
+                return b""
         else:
+            _log_unknown_enc(enc)
             return b""
+
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=75)
+        img.save(buf, format="JPEG", quality=80)
         return buf.getvalue()
-    except Exception:
+    except Exception as e:
+        _log_encode_error(str(e))
         return b""
 
 
@@ -290,10 +334,12 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self.create_subscription(Image, "/perception/annotated_image",
                                  self._on_annotated, 2)
 
-        # Cameras (small queue — only latest frame matters)
-        self.create_subscription(Image, "/cam0/color/image_raw",
+        # Cameras — double namespace because realsense2_camera is launched with
+        # name=cam0 inside namespace cam0, producing /cam0/cam0/... topics.
+        # Confirmed from session log May 21 2026.
+        self.create_subscription(Image, "/cam0/cam0/color/image_raw",
                                  lambda m: self._on_camera(0, m), 2)
-        self.create_subscription(Image, "/cam1/color/image_raw",
+        self.create_subscription(Image, "/cam1/cam1/color/image_raw",
                                  lambda m: self._on_camera(1, m), 2)
 
         # LiDAR — prefer fused cloud; fall back to raw
@@ -410,6 +456,23 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         if jpeg:
             with _cam_lock:
                 _cam_frames[cam_id] = jpeg
+            attr = f"_cam{cam_id}_logged"
+            if not getattr(self, attr, False):
+                setattr(self, attr, True)
+                self.get_logger().info(
+                    f"Camera {cam_id} first frame: "
+                    f"{msg.width}x{msg.height} enc={msg.encoding} "
+                    f"jpeg={len(jpeg)}B"
+                )
+        else:
+            attr = f"_cam{cam_id}_fail_logged"
+            if not getattr(self, attr, False):
+                setattr(self, attr, True)
+                self.get_logger().warn(
+                    f"Camera {cam_id} encode failed: "
+                    f"{msg.width}x{msg.height} enc={msg.encoding} "
+                    f"data_len={len(msg.data)}"
+                )
 
     # ---- LiDAR ----
 
@@ -825,8 +888,8 @@ if FASTAPI_AVAILABLE:
     async def api_config():
         return {
             "robot": {"brand": "generic", "dof": 6, "payload_kg": 5.0, "reach_mm": 850},
-            "cameras": [{"id": 0, "topic": "/cam0/color/image_raw", "fps": 15},
-                        {"id": 1, "topic": "/cam1/color/image_raw", "fps": 15}],
+            "cameras": [{"id": 0, "topic": "/cam0/cam0/color/image_raw", "fps": 15},
+                        {"id": 1, "topic": "/cam1/cam1/color/image_raw", "fps": 15}],
             "safety": {"zone_red_m": 0.3, "zone_yellow_m": 0.6, "zone_green_m": 1.2},
             "version": "1.0.0-production",
         }
