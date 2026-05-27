@@ -46,6 +46,10 @@ def generate_launch_description():
                 'pointcloud.enable':               True,
                 'depth_module.depth_profile':      '640x480x30',
                 'rgb_camera.color_profile':        '640x480x30',
+                # Disable the two 848x480x30 IR streams — they saturate the USB3
+                # controller and starve the depth stream (depth never arrives).
+                'enable_infra1':                   False,
+                'enable_infra2':                   False,
                 'enable_gyro':                     False,
                 'enable_accel':                    False,
                 'initial_reset':                   True,
@@ -62,9 +66,12 @@ def generate_launch_description():
             namespace='cam1',
             parameters=[{
                 'serial_no':                       ParameterValue(LaunchConfiguration('cam1_serial'), value_type=str),
-                'align_depth.enable':              True,
-                'pointcloud.enable':               True,
-                'depth_module.depth_profile':      '640x480x30',
+                # cam1 = COLOUR ONLY. Both D435i share one USB3 controller; running
+                # depth on both oversubscribes it and depth times out. Detection
+                # uses only cam0 depth, so disabling cam1 depth frees the bandwidth.
+                'enable_depth':                    False,
+                'align_depth.enable':              False,
+                'pointcloud.enable':               False,
                 'rgb_camera.color_profile':        '640x480x30',
                 'enable_gyro':                     False,
                 'enable_accel':                    False,
