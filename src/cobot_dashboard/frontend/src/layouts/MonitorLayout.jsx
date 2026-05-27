@@ -36,7 +36,7 @@ function SceneGraphPanel() {
                 {(() => { const [px, py, pz] = obj.position ?? [0,0,0]; return `(${px.toFixed(2)}, ${py.toFixed(2)}, ${pz.toFixed(2)})` })()}
               </td>
               <td style={{ padding: '4px 6px', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{dist(obj.position)} m</td>
-              <td style={{ padding: '4px 6px', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{(obj.confidence * 100).toFixed(0)}%</td>
+              <td style={{ padding: '4px 6px', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{((obj.score ?? obj.confidence ?? 0) * 100).toFixed(0)}%</td>
             </tr>
           ))}
         </tbody>

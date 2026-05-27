@@ -18,7 +18,7 @@ function SceneGraphTable() {
     return ms > 1000
   }
 
-  const sorted = [...objects].sort((a, b) => b.confidence - a.confidence)
+  const sorted = [...objects].sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
 
   return (
     <div style={{
@@ -65,8 +65,10 @@ function SceneGraphTable() {
           </thead>
           <tbody>
             {sorted.map((obj) => {
-              const d   = dist(obj.pos)
-              const old = isOld(obj.last_seen_ms)
+              const pos   = obj.position ?? [0, 0, 0]
+              const conf  = obj.score ?? obj.confidence ?? 0
+              const d     = dist(pos)
+              const old   = isOld(obj.last_seen_ms)
               return (
                 <tr
                   key={obj.id}
@@ -76,10 +78,10 @@ function SceneGraphTable() {
                     {obj.id}
                   </td>
                   <td style={{ padding: '5px 8px', textTransform: 'uppercase', fontWeight: 500, color: 'var(--text-primary)', fontSize: 11 }}>
-                    {obj.class}
+                    {obj.class_name}
                   </td>
                   <td style={{ padding: '5px 8px', fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-secondary)' }}>
-                    ({obj.pos[0].toFixed(3)},&nbsp;{obj.pos[1].toFixed(3)},&nbsp;{obj.pos[2].toFixed(3)})
+                    ({pos[0].toFixed(3)},&nbsp;{pos[1].toFixed(3)},&nbsp;{pos[2].toFixed(3)})
                   </td>
                   <td style={{ padding: '5px 8px', fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-primary)', fontVariantNumeric: 'tabular-nums' }}>
                     {d.toFixed(2)} m
@@ -91,14 +93,14 @@ function SceneGraphTable() {
                     <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                       <div style={{ width: 48, height: 3, background: 'var(--bg-active)', borderRadius: 2, overflow: 'hidden' }}>
                         <div style={{
-                          width: `${obj.confidence * 100}%`,
+                          width: `${conf * 100}%`,
                           height: '100%',
-                          background: obj.confidence > 0.8 ? 'var(--green)' : 'var(--yellow)',
+                          background: conf > 0.8 ? 'var(--green)' : 'var(--yellow)',
                           borderRadius: 2,
                         }} />
                       </div>
                       <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)', fontVariantNumeric: 'tabular-nums' }}>
-                        {(obj.confidence * 100).toFixed(0)}%
+                        {(conf * 100).toFixed(0)}%
                       </span>
                     </div>
                   </td>
