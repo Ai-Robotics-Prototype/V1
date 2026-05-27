@@ -59,19 +59,18 @@ class DetectorNode(Node):
         self.det_pub = self.create_publisher(Detection3DArray, '/perception/detections_3d', 10)
         self.ann_pub = self.create_publisher(Image, '/perception/annotated_image', 5)
 
-        if CV_BRIDGE_AVAILABLE:
-            rgb_sub   = message_filters.Subscriber(self, Image, '/cam0/color/image_raw')
-            depth_sub = message_filters.Subscriber(self, Image, '/cam0/depth/image_rect_raw')
-            self.sync = message_filters.ApproximateTimeSynchronizer(
-                [rgb_sub, depth_sub], queue_size=10, slop=0.05)
-            self.sync.registerCallback(self.detection_callback)
-        else:
-            self.get_logger().warn(
-                'cv_bridge not available — using PIL fallback (RGB only, no depth)')
-            self.create_subscription(
-                Image, '/cam0/color/image_raw', self._pil_callback, 5)
+        # Always subscribe to RGB for inference — depth sync would block if depth not flowing
+        self.create_subscription(
+            Image, '/cam0/cam0/color/image_raw', self._pil_callback, 5)
 
-        self.create_subscription(CameraInfo, '/cam0/color/camera_info',
+        # Subscribe to depth separately for optional 3D enrichment
+        if CV_BRIDGE_AVAILABLE:
+            self._latest_depth = None
+            self._depth_lock = __import__('threading').Lock()
+            self.create_subscription(
+                Image, '/cam0/cam0/depth/image_rect_raw', self._on_depth, 5)
+
+        self.create_subscription(CameraInfo, '/cam0/cam0/color/camera_info',
                                  self._camera_info_cb, 10)
 
         self._last_log    = self.get_clock().now()
@@ -151,6 +150,14 @@ class DetectorNode(Node):
         return results
 
     # ── ROS callback ──────────────────────────────────────────────────────────
+
+    def _on_depth(self, msg):
+        try:
+            depth = self.bridge.imgmsg_to_cv2(msg, '32FC1')
+            with self._depth_lock:
+                self._latest_depth = depth
+        except Exception:
+            pass
 
     def _camera_info_cb(self, msg: CameraInfo):
         self.camera_info = msg

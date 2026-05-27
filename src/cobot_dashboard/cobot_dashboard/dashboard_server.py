@@ -644,8 +644,23 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/stream/cam0")
     async def stream_cam0():
-        return StreamingResponse(_mjpeg_gen(0),
-                                  media_type="multipart/x-mixed-replace; boundary=frame")
+        async def _gen():
+            while True:
+                try:
+                    with _annotated_lock:
+                        frame = _annotated_frame
+                    if not frame:
+                        with _cam_lock:
+                            frame = _cam_frames.get(0)
+                    if not frame:
+                        frame = _sim_camera_frame(0)
+                    if frame:
+                        yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                               + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
+                    await asyncio.sleep(1 / 15)
+                except Exception:
+                    break
+        return StreamingResponse(_gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
     @app.get("/stream/cam1")
     async def stream_cam1():
