@@ -19,6 +19,7 @@ setup(
     entry_points={
         'console_scripts': [
             'detector_node = object_detection.detector_node:main',
+            'depth_detector_node = object_detection.depth_detector_node:main',
         ],
     },
 )

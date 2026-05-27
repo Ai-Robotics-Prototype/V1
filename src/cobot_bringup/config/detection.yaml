@@ -1,13 +1,109 @@
-detector_node:
+# Isaac ROS YOLOv8 pipeline parameters
+# tensor_rt node: ONNX path → auto-generates TRT engine on first run
+tensor_rt:
   ros__parameters:
-    model_path: "/opt/cobot/models/yolov8n.pt"
+    model_file_path: "/opt/cobot/models/yolov8n.onnx"
+    engine_file_path: "/opt/cobot/models/yolov8n.plan"
+    input_tensor_names: ["input_tensor"]
+    input_binding_names: ["images"]
+    output_tensor_names: ["output_tensor"]
+    output_binding_names: ["output0"]
+    verbose: false
+    force_engine_update: false
+
+# YOLOv8 decoder
+yolov8_decoder_node:
+  ros__parameters:
     confidence_threshold: 0.35
-    nms_threshold: 0.4
-    target_classes:
-      - "bottle"
-      - "box"
-      - "cup"
-      - "tool"
-      - "person"
-    use_tensorrt: false
-    device: "cuda:0"
+    nms_threshold: 0.45
+
+# DNN image encoder (resize + normalise to 640×640 float tensor)
+yolov8_encoder:
+  ros__parameters:
+    network_image_width: 640
+    network_image_height: 640
+    image_mean: [0.0, 0.0, 0.0]
+    image_stddev: [1.0, 1.0, 1.0]
+
+# COCO 80-class labels (index = class id)
+coco_labels:
+  - person
+  - bicycle
+  - car
+  - motorcycle
+  - airplane
+  - bus
+  - train
+  - truck
+  - boat
+  - traffic light
+  - fire hydrant
+  - stop sign
+  - parking meter
+  - bench
+  - bird
+  - cat
+  - dog
+  - horse
+  - sheep
+  - cow
+  - elephant
+  - bear
+  - zebra
+  - giraffe
+  - backpack
+  - umbrella
+  - handbag
+  - tie
+  - suitcase
+  - frisbee
+  - skis
+  - snowboard
+  - sports ball
+  - kite
+  - baseball bat
+  - baseball glove
+  - skateboard
+  - surfboard
+  - tennis racket
+  - bottle
+  - wine glass
+  - cup
+  - fork
+  - knife
+  - spoon
+  - bowl
+  - banana
+  - apple
+  - sandwich
+  - orange
+  - broccoli
+  - carrot
+  - hot dog
+  - pizza
+  - donut
+  - cake
+  - chair
+  - couch
+  - potted plant
+  - bed
+  - dining table
+  - toilet
+  - tv
+  - laptop
+  - mouse
+  - remote
+  - keyboard
+  - cell phone
+  - microwave
+  - oven
+  - toaster
+  - sink
+  - refrigerator
+  - book
+  - clock
+  - vase
+  - scissors
+  - teddy bear
+  - hair drier
+  - toothbrush

@@ -13,7 +13,8 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+from launch_ros.actions import ComposableNodeContainer, Node
+from launch_ros.descriptions import ComposableNode
 from ament_index_python.packages import get_package_share_directory
 
 
@@ -23,6 +24,105 @@ def _pkg_available(pkg: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _detection_nodes(config_dir: str) -> list:
+    """Return Isaac ROS composable pipeline, or fall back to plain detector_node."""
+    isaac_ok = (
+        _pkg_available('isaac_ros_dnn_image_encoder')
+        and _pkg_available('isaac_ros_tensor_rt')
+        and _pkg_available('isaac_ros_yolov8')
+    )
+
+    if not isaac_ok:
+        return [Node(
+            package='object_detection',
+            executable='detector_node',
+            name='detector_node',
+            parameters=[os.path.join(config_dir, 'detection.yaml')],
+            output='screen',
+        )]
+
+    encoder_dir = get_package_share_directory('isaac_ros_dnn_image_encoder')
+
+    # 1. ImageFormatConverter: bgr8 → rgb8
+    fmt_converter = ComposableNode(
+        name='image_format_converter',
+        package='isaac_ros_image_proc',
+        plugin='nvidia::isaac_ros::image_proc::ImageFormatConverterNode',
+        parameters=[{'encoding_desired': 'rgb8', 'image_width': 640, 'image_height': 480}],
+        remappings=[
+            ('image_raw', '/cam0/cam0/color/image_raw'),
+            ('image', '/cam0/cam0/color/image_rgb'),
+        ],
+    )
+
+    # 2. TensorRT inference
+    tensor_rt = ComposableNode(
+        name='tensor_rt',
+        package='isaac_ros_tensor_rt',
+        plugin='nvidia::isaac_ros::dnn_inference::TensorRTNode',
+        parameters=[{
+            'model_file_path':    '/opt/cobot/models/yolov8n.onnx',
+            'engine_file_path':   '/opt/cobot/models/yolov8n.plan',
+            'input_tensor_names':  ['input_tensor'],
+            'input_binding_names': ['images'],
+            'output_tensor_names':  ['output_tensor'],
+            'output_binding_names': ['output0'],
+            'verbose':             False,
+            'force_engine_update': False,
+        }],
+    )
+
+    # 3. YOLOv8 decoder → /detections (Detection2DArray)
+    yolov8_decoder = ComposableNode(
+        name='yolov8_decoder_node',
+        package='isaac_ros_yolov8',
+        plugin='nvidia::isaac_ros::yolov8::YoloV8DecoderNode',
+        parameters=[{
+            'confidence_threshold': 0.35,
+            'nms_threshold':        0.45,
+        }],
+    )
+
+    container = ComposableNodeContainer(
+        name='yolov8_container',
+        namespace='',
+        package='rclcpp_components',
+        executable='component_container_mt',
+        composable_node_descriptions=[fmt_converter, tensor_rt, yolov8_decoder],
+        output='screen',
+    )
+
+    # DNN image encoder: resizes rgb8 → 640×640 float tensor
+    encoder_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(encoder_dir, 'launch', 'dnn_image_encoder.launch.py')),
+        launch_arguments={
+            'input_image_width':  '640',
+            'input_image_height': '480',
+            'network_image_width':  '640',
+            'network_image_height': '640',
+            'image_mean':   '[0.0, 0.0, 0.0]',
+            'image_stddev': '[1.0, 1.0, 1.0]',
+            'attach_to_shared_component_container': 'True',
+            'component_container_name': 'yolov8_container',
+            'dnn_image_encoder_namespace': 'yolov8_encoder',
+            'image_input_topic':    '/cam0/cam0/color/image_rgb',
+            'camera_info_input_topic': '/cam0/cam0/color/camera_info',
+            'tensor_output_topic':  '/tensor_pub',
+        }.items(),
+    )
+
+    # 4. depth_detector_node: Detection2DArray + depth → Detection3DArray
+    depth_detector = Node(
+        package='object_detection',
+        executable='depth_detector_node',
+        name='depth_detector_node',
+        output='screen',
+    )
+
+    return [container, encoder_launch, depth_detector]
 
 
 def generate_launch_description():
@@ -58,14 +158,9 @@ def generate_launch_description():
             output='screen',
         ),
 
-        # ── Object detection (TRT or Ultralytics) ────────────────────────────
-        Node(
-            package='object_detection',
-            executable='detector_node',
-            name='detector_node',
-            parameters=[os.path.join(config_dir, 'detection.yaml')],
-            output='screen',
-        ),
+        # ── Object detection ─────────────────────────────────────────────────
+        # Isaac ROS GPU pipeline when packages available; fallback to CPU node.
+        *_detection_nodes(config_dir),
 
         # ── Human safety ─────────────────────────────────────────────────────
         Node(
