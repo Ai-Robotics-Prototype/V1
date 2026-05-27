@@ -12,6 +12,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -33,7 +34,7 @@ def generate_launch_description():
             name='cam0',
             namespace='cam0',
             parameters=[{
-                'serial_no':                  LaunchConfiguration('cam0_serial'),
+                'serial_no':                  ParameterValue(LaunchConfiguration('cam0_serial'), value_type=str),
                 'align_depth.enable':         LaunchConfiguration('align_depth'),
                 'pointcloud.enable':          LaunchConfiguration('pointcloud'),
                 'depth_module.depth_profile': '640x480x30',
@@ -51,7 +52,7 @@ def generate_launch_description():
             name='cam1',
             namespace='cam1',
             parameters=[{
-                'serial_no':                  LaunchConfiguration('cam1_serial'),
+                'serial_no':                  ParameterValue(LaunchConfiguration('cam1_serial'), value_type=str),
                 'align_depth.enable':         LaunchConfiguration('align_depth'),
                 'pointcloud.enable':          LaunchConfiguration('pointcloud'),
                 'depth_module.depth_profile': '640x480x30',
