@@ -26,12 +26,26 @@ def _pkg_available(pkg: str) -> bool:
         return False
 
 
+def _so_available(*libs: str) -> bool:
+    """Return True only if every named shared library resolves at runtime."""
+    import ctypes
+    for lib in libs:
+        try:
+            ctypes.CDLL(lib)
+        except OSError:
+            return False
+    return True
+
+
 def _detection_nodes(config_dir: str) -> list:
     """Return Isaac ROS composable pipeline, or fall back to plain detector_node."""
+    # Packages must be installed AND their CUDA/VPI runtime libs must resolve.
     isaac_ok = (
         _pkg_available('isaac_ros_dnn_image_encoder')
         and _pkg_available('isaac_ros_tensor_rt')
         and _pkg_available('isaac_ros_yolov8')
+        and _so_available('libnvvpi.so.3', 'libnvToolsExt.so.1',
+                          'libnvdla_compiler.so', 'libcvcuda.so.0')
     )
 
     if not isaac_ok:
@@ -139,6 +153,13 @@ def generate_launch_description():
         DeclareLaunchArgument('log_level',          default_value='info'),
 
         # ── Static transforms ────────────────────────────────────────────────
+        # odom→base_link identity keeps nvblox happy when SLAM is not running
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='odom_base_tf', output='screen',
+             arguments=['0','0','0','0','0','0','odom','base_link']),
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='map_odom_tf', output='screen',
+             arguments=['0','0','0','0','0','0','map','odom']),
         Node(package='tf2_ros', executable='static_transform_publisher',
              name='lidar_tf', output='screen',
              arguments=['0','0','0.5','0','0','0','base_link','lidar_link']),

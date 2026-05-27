@@ -59,7 +59,8 @@ class OusterBridge(Node):
 
     def run(self):
         try:
-            from ouster.sdk import client
+            import ouster.sdk as ouster_sdk
+            from ouster.sdk.core import XYZLut
         except ImportError:
             self.get_logger().fatal(
                 "ouster-sdk not installed. Run: pip3 install ouster-sdk"
@@ -67,23 +68,20 @@ class OusterBridge(Node):
             return
 
         try:
-            sensor_config = client.SensorConfig()
-            sensor_config.udp_dest = "192.168.1.200"
-
-            with client.Sensor(self._host, 7502, 7503, config=sensor_config) as source:
+            self.get_logger().info("Opening sensor source …")
+            with ouster_sdk.open_source(self._host, sensor_idx=0) as source:
                 self.get_logger().info("Connected. Streaming scans …")
                 metadata = source.metadata
-                xyzlut   = client.XYZLut(metadata)
-                scans    = client.Scans(source)
+                xyzlut   = XYZLut(metadata)
 
-                for scan in scans:
+                for scan in source:
                     if not rclpy.ok():
                         break
 
-                    xyz = xyzlut(scan)                          # (H, W, 3)
-                    pts = xyz.reshape(-1, 3).astype(np.float32) # (N, 3)
+                    xyz = xyzlut(scan)                           # (H, W, 3)
+                    pts = xyz.reshape(-1, 3).astype(np.float32)  # (N, 3)
 
-                    # Drop invalid returns (all-zero points from Ouster)
+                    # Drop invalid returns (all-zero points)
                     valid = np.any(pts != 0, axis=1)
                     pts   = pts[valid]
 

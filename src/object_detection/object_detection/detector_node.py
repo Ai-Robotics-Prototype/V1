@@ -56,8 +56,9 @@ class DetectorNode(Node):
 
         self._load_model(iw, ih)
 
-        self.det_pub = self.create_publisher(Detection3DArray, '/perception/detections_3d', 10)
-        self.ann_pub = self.create_publisher(Image, '/perception/annotated_image', 5)
+        self.det_pub  = self.create_publisher(Detection3DArray, '/perception/detections_3d', 10)
+        self.det_pub2 = self.create_publisher(Detection3DArray, '/perception/detections', 10)
+        self.ann_pub  = self.create_publisher(Image, '/perception/annotated_image', 5)
 
         # Always subscribe to RGB for inference — depth sync would block if depth not flowing
         self.create_subscription(
@@ -234,6 +235,7 @@ class DetectorNode(Node):
             detected_classes.append(cls_name)
 
         self.det_pub.publish(arr)
+        self.det_pub2.publish(arr)
 
         now = self.get_clock().now()
         if (now - self._last_log).nanoseconds / 1e9 >= 1.0:
@@ -298,6 +300,7 @@ class DetectorNode(Node):
                 det.bbox.size.z = 0.1
                 arr.detections.append(det)
             self.det_pub.publish(arr)
+            self.det_pub2.publish(arr)
 
             # Annotated image
             draw = ImageDraw.Draw(pil_img)
