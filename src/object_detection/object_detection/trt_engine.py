@@ -94,6 +94,11 @@ class TRTEngine:
             entry = {'name': name, 'shape': shape, 'dtype': dtype,
                      'host': host_mem, 'device': device_mem}
 
+            # TensorRT 10.x execute_async_v3 requires explicit tensor addresses
+            # (the v2 bindings-list API is gone). Addresses are fixed for the
+            # life of the engine, so bind them once here.
+            self._context.set_tensor_address(name, int(device_mem))
+
             if self._engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
                 self._inputs.append(entry)
             else:
@@ -165,13 +170,14 @@ class TRTEngine:
         if len(scores) == 0:
             return np.zeros((0,4)), np.zeros(0), np.zeros(0, dtype=np.int32)
 
-        # cxcywh (normalised input res) → xyxy (original pixels)
+        # YOLOv8 ONNX export emits cx,cy,w,h in INPUT-pixel space (0..input_w).
+        # Scale straight from input pixels to original-image pixels.
         sx = orig_w / self.input_w
         sy = orig_h / self.input_h
-        bx1 = (boxes_raw[:, 0] - boxes_raw[:, 2] / 2) * self.input_w * sx
-        by1 = (boxes_raw[:, 1] - boxes_raw[:, 3] / 2) * self.input_h * sy
-        bx2 = (boxes_raw[:, 0] + boxes_raw[:, 2] / 2) * self.input_w * sx
-        by2 = (boxes_raw[:, 1] + boxes_raw[:, 3] / 2) * self.input_h * sy
+        bx1 = (boxes_raw[:, 0] - boxes_raw[:, 2] / 2) * sx
+        by1 = (boxes_raw[:, 1] - boxes_raw[:, 3] / 2) * sy
+        bx2 = (boxes_raw[:, 0] + boxes_raw[:, 2] / 2) * sx
+        by2 = (boxes_raw[:, 1] + boxes_raw[:, 3] / 2) * sy
         boxes_px = np.stack([bx1, by1, bx2, by2], axis=1).astype(np.float32)
 
         # NMS per class

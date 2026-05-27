@@ -6,4 +6,10 @@ __pycache__/
 *.engine
 *.onnx
 *.gguf
+*.pt
 .claude/
+
+# Large Isaac ROS quickstart assets (e.g. 1.6 GB visual_slam rosbag) — not source
+isaac_ros_assets/
+# Generated frontend build output (produced by `npm run build`)
+src/cobot_dashboard/mock_server/static/

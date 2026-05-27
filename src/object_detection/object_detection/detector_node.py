@@ -22,8 +22,12 @@ except ImportError:
 try:
     from ultralytics import YOLO
     ULTRALYTICS_AVAILABLE = True
-except ImportError:
+except Exception:
+    # Not just ImportError: a torch/torchvision ABI mismatch raises RuntimeError
+    # ("operator torchvision::nms does not exist") at import time. Swallow it so
+    # the node can still run on the TensorRT backend.
     ULTRALYTICS_AVAILABLE = False
+    YOLO = None
 
 
 class DetectorNode(Node):
@@ -260,22 +264,12 @@ class DetectorNode(Node):
             else:
                 return
 
-            img_np = np.array(pil_img)
-            boxes_list = []
-            if self.yolo_model is not None:
-                results = self.yolo_model(img_np, conf=self.conf_thresh, verbose=False)
-                if results and len(results) > 0:
-                    r = results[0]
-                    if r.boxes is not None:
-                        for box in r.boxes:
-                            x1, y1, x2, y2 = box.xyxy[0].tolist()
-                            sc = float(box.conf[0])
-                            cid = int(box.cls[0])
-                            cname = r.names.get(cid, str(cid))
-                            if self.target_classes and cname not in self.target_classes:
-                                continue
-                            if sc >= self.conf_thresh:
-                                boxes_list.append((cname, sc, x1, y1, x2, y2))
+            img_np = np.array(pil_img)             # RGB
+            bgr = img_np[:, :, ::-1].copy()        # BGR for _run_inference (TRT or Ultralytics)
+            # Route through _run_inference so the TensorRT GPU backend is used
+            # when loaded; falls back to Ultralytics otherwise. Returns
+            # (class_name, conf, x1, y1, x2, y2) already filtered by target_classes.
+            boxes_list = self._run_inference(bgr)
 
             arr = Detection3DArray()
             arr.header.stamp = rgb_msg.header.stamp

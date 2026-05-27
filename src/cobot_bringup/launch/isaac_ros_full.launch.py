@@ -129,10 +129,16 @@ def _detection_nodes(config_dir: str) -> list:
     )
 
     # 4. depth_detector_node: Detection2DArray + depth → Detection3DArray
+    # Wire it to the Isaac decoder (which publishes /detections_output) and to
+    # the dashboard's Detection3DArray topic (/perception/detections_3d).
     depth_detector = Node(
         package='object_detection',
         executable='depth_detector_node',
         name='depth_detector_node',
+        remappings=[
+            ('/detections', '/detections_output'),
+            ('/perception/detections', '/perception/detections_3d'),
+        ],
         output='screen',
     )
 

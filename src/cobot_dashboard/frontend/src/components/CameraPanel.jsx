@@ -38,13 +38,22 @@ function DetectionOverlay({ detections }) {
       preserveAspectRatio="xMidYMid meet"
     >
       {detections.map((det) => {
-        if (det.z <= 0) return null
-        const c = project(det.x, det.y, det.z)
-        if (!c) return null
-        const bw = Math.max((FX * det.w) / det.z, 8)
-        const bh = Math.max((FY * det.h) / det.z, 8)
-        const x0 = c.u - bw / 2
-        const y0 = c.v - bh / 2
+        let x0, y0, bw, bh
+        if (det.bbox_px && det.bbox_px.length === 4) {
+          // Pixel coordinates (image space) — render directly into the viewBox
+          const [x1, y1, x2, y2] = det.bbox_px
+          x0 = x1; y0 = y1; bw = x2 - x1; bh = y2 - y1
+        } else if (det.z > 0) {
+          // Metric 3D coordinates — project through the pinhole model
+          const c = project(det.x, det.y, det.z)
+          if (!c) return null
+          bw = Math.max((FX * det.w) / det.z, 8)
+          bh = Math.max((FY * det.h) / det.z, 8)
+          x0 = c.u - bw / 2
+          y0 = c.v - bh / 2
+        } else {
+          return null
+        }
         const col = classColor(det.class_name)
         const label = `${det.class_name} ${(det.score * 100).toFixed(0)}%`
 

@@ -45,7 +45,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _START_TIME = time.time()
-_THIS_DIR = Path(__file__).parent
+_THIS_DIR = Path(__file__).resolve().parent
 _STATIC_DIR = _THIS_DIR.parent / "mock_server" / "static"
 
 # ---------------------------------------------------------------------------
@@ -423,16 +423,35 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             score = float(result.hypothesis.score)
             pos = det.bbox.center.position
             size = det.bbox.size
-            dets.append({
-                "id":         str(id(det)),
-                "class_name": class_name,
-                "score":      round(score, 3),
-                "x":          round(pos.x, 3),
-                "y":          round(pos.y, 3),
-                "z":          round(pos.z, 3),
-                "w":          round(size.x, 3),
-                "h":          round(size.y, 3),
-            })
+            # The active detector (_pil_callback) writes PIXEL coordinates into
+            # bbox.center; a depth-aware detector would write METRES. Heuristic:
+            # |x| or |y| > 10 → pixels (image space), else metric 3D.
+            if abs(pos.x) > 10 or abs(pos.y) > 10:
+                dets.append({
+                    "id":         str(id(det)),
+                    "class_name": class_name,
+                    "score":      round(score, 3),
+                    "bbox_px": [
+                        round(pos.x - size.x / 2, 1),
+                        round(pos.y - size.y / 2, 1),
+                        round(pos.x + size.x / 2, 1),
+                        round(pos.y + size.y / 2, 1),
+                    ],
+                    "x": 0, "y": 0, "z": 1.0,
+                    "w":          round(size.x, 3),
+                    "h":          round(size.y, 3),
+                })
+            else:
+                dets.append({
+                    "id":         str(id(det)),
+                    "class_name": class_name,
+                    "score":      round(score, 3),
+                    "x":          round(pos.x, 3),
+                    "y":          round(pos.y, 3),
+                    "z":          round(pos.z, 3),
+                    "w":          round(size.x, 3),
+                    "h":          round(size.y, 3),
+                })
         with _state_lock:
             STATE["detections"] = dets
 
