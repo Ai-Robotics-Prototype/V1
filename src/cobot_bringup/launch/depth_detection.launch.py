@@ -24,10 +24,10 @@ from launch_ros.actions import Node
 def generate_launch_description():
     args = [
         DeclareLaunchArgument('max_depth_m',        default_value='3.0'),
-        DeclareLaunchArgument('min_object_area_px', default_value='200'),
-        DeclareLaunchArgument('floor_tolerance_m',  default_value='0.02'),
+        DeclareLaunchArgument('min_object_area_px', default_value='100'),
+        DeclareLaunchArgument('floor_tolerance_m',  default_value='0.015'),
         DeclareLaunchArgument('erode_kernel',       default_value='2'),
-        DeclareLaunchArgument('dilate_kernel',      default_value='7'),
+        DeclareLaunchArgument('dilate_kernel',      default_value='9'),
         DeclareLaunchArgument('publish_rate_hz',    default_value='15.0'),
     ]
 

@@ -155,7 +155,10 @@ export default function CameraPanel({ cam = 0 }) {
               display: 'block',
             }}
           />
-          <DetectionOverlay detections={detections} />
+          {/* Boxes + distance labels are drawn server-side into the annotated
+              MJPEG stream (consistent green, both cameras). The old client-side
+              SVG overlay was removed — it rendered cam0 detections (grey, no
+              distance) on both panels, causing inconsistent boxes. */}
 
           {/* FPS badge */}
           <div style={{

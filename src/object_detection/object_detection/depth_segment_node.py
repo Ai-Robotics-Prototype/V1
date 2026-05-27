@@ -41,10 +41,11 @@ class DepthSegmentNode(Node):
         super().__init__('depth_segment_node')
 
         self.declare_parameter('max_depth_m',        3.0)
-        self.declare_parameter('min_object_area_px', 200)
-        self.declare_parameter('floor_tolerance_m',  0.02)
+        self.declare_parameter('min_object_area_px', 100)
+        self.declare_parameter('floor_tolerance_m',  0.015)
         self.declare_parameter('erode_kernel',       2)
-        self.declare_parameter('dilate_kernel',      7)
+        self.declare_parameter('dilate_kernel',      9)
+        self.declare_parameter('edge_threshold_m',   0.05)
         self.declare_parameter('publish_rate_hz',    15.0)
         self.declare_parameter('bbox_pad_px',        5)
         # Per-camera topics so one node can serve cam0 and another cam1
@@ -60,6 +61,7 @@ class DepthSegmentNode(Node):
         self.floor_tol   = float(self.get_parameter('floor_tolerance_m').value)
         self.erode_k     = int(self.get_parameter('erode_kernel').value)
         self.dilate_k    = int(self.get_parameter('dilate_kernel').value)
+        self.edge_thresh = float(self.get_parameter('edge_threshold_m').value)
         self.pad         = int(self.get_parameter('bbox_pad_px').value)
         rate             = float(self.get_parameter('publish_rate_hz').value)
         depth_topic      = self.get_parameter('depth_topic').value
@@ -163,6 +165,14 @@ class DepthSegmentNode(Node):
 
     # ── Component extraction (single scale) ────────────────────────────────────
 
+    def _dilate(self, mask, k):
+        # iterations with the default 3x3 structuring element ≈ k-px growth, but
+        # much cheaper than a single (k x k) structure on a full frame.
+        return ndimage.binary_dilation(mask, iterations=max(1, k // 2))
+
+    def _erode(self, mask, k):
+        return ndimage.binary_erosion(mask, iterations=max(1, k // 2))
+
     def _components(self, mask, scale):
         """Return list of full-resolution bboxes (x0,y0,x1,y1) from a binary mask.
         `scale` = downsample factor the mask was taken at (bbox coords *scale)."""
@@ -246,15 +256,22 @@ class DepthSegmentNode(Node):
             return
         a, b, c = plane
         plane_z = a * X + b * Y + c
-        foreground = valid & (depth < (plane_z - self.floor_tol))
+        # (a) planar background subtraction: pixels nearer than the surface
+        plane_fg = valid & (depth < (plane_z - self.floor_tol))
+        # (b) depth edges: a sharp depth discontinuity marks an object boundary
+        # even when the height above the surface is tiny. Fill invalid pixels
+        # with the plane depth first, so data holes don't create spurious edges.
+        depth_filled = np.where(valid, depth, plane_z).astype(np.float32)
+        gmag = np.hypot(ndimage.sobel(depth_filled, axis=0, mode='nearest'),
+                        ndimage.sobel(depth_filled, axis=1, mode='nearest'))
+        edge_fg = valid & (gmag > self.edge_thresh)
+        foreground = plane_fg | edge_fg
 
-        # Morphological open: erode then dilate (fill gaps within objects)
-        if self.erode_k > 1:
-            foreground = ndimage.binary_erosion(
-                foreground, structure=np.ones((self.erode_k, self.erode_k)))
-        if self.dilate_k > 1:
-            foreground = ndimage.binary_dilation(
-                foreground, structure=np.ones((self.dilate_k, self.dilate_k)))
+        # Closing (dilate->erode) fills gaps in/between fragments; fill enclosed
+        # edge contours; THEN opening (erode->dilate) removes speckle noise.
+        foreground = self._erode(self._dilate(foreground, self.dilate_k), self.dilate_k)
+        foreground = ndimage.binary_fill_holes(foreground)
+        foreground = self._dilate(self._erode(foreground, self.erode_k), self.erode_k)
 
         # Multi-scale connected components: full res + 2x block-OR downsample
         bboxes = self._components(foreground, scale=1)
@@ -325,11 +342,7 @@ class DepthSegmentNode(Node):
 
     @staticmethod
     def _dist_color(z):
-        if z < 1.0:
-            return (34, 197, 94)    # green  < 1m
-        if z <= 2.0:
-            return (234, 179, 8)    # yellow 1-2m
-        return (239, 68, 68)        # red    > 2m
+        return (0, 255, 0)  # consistent green (#00FF00) for every box + label
 
     def _publish_annotated(self, objects, h, w):
         rgb = self._color_rgb
