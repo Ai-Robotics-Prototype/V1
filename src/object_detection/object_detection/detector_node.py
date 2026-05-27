@@ -56,7 +56,8 @@ class DetectorNode(Node):
 
         self._load_model(iw, ih)
 
-        self.det_pub = self.create_publisher(Detection3DArray, '/perception/detections', 10)
+        self.det_pub = self.create_publisher(Detection3DArray, '/perception/detections_3d', 10)
+        self.ann_pub = self.create_publisher(Image, '/perception/annotated_image', 5)
 
         if CV_BRIDGE_AVAILABLE:
             rgb_sub   = message_filters.Subscriber(self, Image, '/cam0/color/image_raw')
@@ -64,6 +65,11 @@ class DetectorNode(Node):
             self.sync = message_filters.ApproximateTimeSynchronizer(
                 [rgb_sub, depth_sub], queue_size=10, slop=0.05)
             self.sync.registerCallback(self.detection_callback)
+        else:
+            self.get_logger().warn(
+                'cv_bridge not available — using PIL fallback (RGB only, no depth)')
+            self.create_subscription(
+                Image, '/cam0/color/image_raw', self._pil_callback, 5)
 
         self.create_subscription(CameraInfo, '/cam0/color/camera_info',
                                  self._camera_info_cb, 10)
@@ -227,6 +233,87 @@ class DetectorNode(Node):
             self.get_logger().info(
                 f'[{self._backend}] Detected {len(arr.detections)}: {detected_classes}')
             self._last_log = now
+
+    def _pil_callback(self, rgb_msg: Image):
+        """PIL-based detection callback used when cv_bridge is unavailable."""
+        try:
+            from PIL import Image as PILImage, ImageDraw
+            raw = bytes(rgb_msg.data)
+            enc = rgb_msg.encoding
+            w, h = rgb_msg.width, rgb_msg.height
+
+            if enc == 'rgb8':
+                pil_img = PILImage.frombytes('RGB', (w, h), raw)
+            elif enc == 'bgr8':
+                pil_img = PILImage.frombytes('RGB', (w, h), raw)
+                r, g, b = pil_img.split()
+                pil_img = PILImage.merge('RGB', (b, g, r))
+            else:
+                return
+
+            img_np = np.array(pil_img)
+            boxes_list = []
+            if self.yolo_model is not None:
+                results = self.yolo_model(img_np, conf=self.conf_thresh, verbose=False)
+                if results and len(results) > 0:
+                    r = results[0]
+                    if r.boxes is not None:
+                        for box in r.boxes:
+                            x1, y1, x2, y2 = box.xyxy[0].tolist()
+                            sc = float(box.conf[0])
+                            cid = int(box.cls[0])
+                            cname = r.names.get(cid, str(cid))
+                            if self.target_classes and cname not in self.target_classes:
+                                continue
+                            if sc >= self.conf_thresh:
+                                boxes_list.append((cname, sc, x1, y1, x2, y2))
+
+            arr = Detection3DArray()
+            arr.header.stamp = rgb_msg.header.stamp
+            arr.header.frame_id = 'cam0_color_optical_frame'
+            for cname, sc, x1, y1, x2, y2 in boxes_list:
+                det = Detection3D()
+                det.header = arr.header
+                hyp = ObjectHypothesisWithPose()
+                hyp.hypothesis.class_id = cname
+                hyp.hypothesis.score = sc
+                cx_px = (x1 + x2) / 2
+                cy_px = (y1 + y2) / 2
+                hyp.pose.pose.position.x = cx_px
+                hyp.pose.pose.position.y = cy_px
+                hyp.pose.pose.position.z = 1.0
+                det.results.append(hyp)
+                det.bbox.center.position.x = cx_px
+                det.bbox.center.position.y = cy_px
+                det.bbox.center.position.z = 1.0
+                det.bbox.size.x = float(x2 - x1)
+                det.bbox.size.y = float(y2 - y1)
+                det.bbox.size.z = 0.1
+                arr.detections.append(det)
+            self.det_pub.publish(arr)
+
+            # Annotated image
+            draw = ImageDraw.Draw(pil_img)
+            COLOR_MAP = {'person': (239, 68, 68), 'bottle': (59, 130, 246),
+                         'box': (34, 197, 94), 'cup': (234, 179, 8)}
+            for cname, sc, x1, y1, x2, y2 in boxes_list:
+                col = COLOR_MAP.get(cname, (155, 155, 155))
+                draw.rectangle([x1, y1, x2, y2], outline=col, width=2)
+                draw.rectangle([x1, y1 - 14, x1 + len(cname) * 7 + 35, y1], fill=col)
+                draw.text((x1 + 2, y1 - 13), f'{cname} {sc:.0%}', fill=(255, 255, 255))
+
+            ann_raw = pil_img.tobytes()
+            ann_msg = Image()
+            ann_msg.header = rgb_msg.header
+            ann_msg.height = h
+            ann_msg.width = w
+            ann_msg.encoding = 'rgb8'
+            ann_msg.step = w * 3
+            ann_msg.data = list(ann_raw)
+            self.ann_pub.publish(ann_msg)
+
+        except Exception as e:
+            self.get_logger().debug(f'PIL callback error: {e}')
 
     @staticmethod
     def _coco_names() -> dict:

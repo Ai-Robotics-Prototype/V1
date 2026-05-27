@@ -87,6 +87,10 @@ STATE = {
 _cam_frames: dict = {0: None, 1: None}
 _cam_lock = threading.Lock()
 
+# Latest annotated frame from detector
+_annotated_frame: bytes = None
+_annotated_lock = threading.Lock()
+
 # Latest parsed LiDAR scan
 _lidar_state: dict = {"pts": [], "live": False}
 _lidar_lock = threading.Lock()
@@ -268,10 +272,23 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self.create_subscription(Bool,    "/safety/estop",           self._on_estop,           10)
 
         # Task + perception
-        self.create_subscription(String,    "/task/status",              self._on_task_status,  10)
-        self.create_subscription(String,    "/perception/scene_graph",   self._on_scene_graph,  10)
-        self.create_subscription(String,    "/perception/detections",    self._on_detections,   10)
-        self.create_subscription(JointState, "/joint_states",            self._on_joint_states, 10)
+        self.create_subscription(String,    "/task/status",              self._on_task_status,    10)
+        self.create_subscription(String,    "/perception/scene_graph",   self._on_scene_graph,    10)
+        # String fallback — scene_graph_node may republish detections as JSON
+        self.create_subscription(String,    "/perception/detections",    self._on_detections_str, 10)
+        # Real Detection3DArray from detector_node
+        try:
+            from vision_msgs.msg import Detection3DArray
+            self.create_subscription(Detection3DArray, "/perception/detections_3d",
+                                     self._on_detections_3d, 5)
+            self.get_logger().info("Detection3DArray subscription ready")
+        except ImportError:
+            self.get_logger().warn("vision_msgs not available — detection3d subscription skipped")
+        self.create_subscription(JointState, "/joint_states",            self._on_joint_states,   10)
+
+        # Annotated image from detector
+        self.create_subscription(Image, "/perception/annotated_image",
+                                 self._on_annotated, 2)
 
         # Cameras (small queue — only latest frame matters)
         self.create_subscription(Image, "/cam0/color/image_raw",
@@ -340,13 +357,45 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         except Exception:
             pass
 
-    def _on_detections(self, msg):
+    def _on_detections_str(self, msg):
+        """JSON String fallback — some nodes republish detections as JSON."""
         try:
             dets = json.loads(msg.data)
             with _state_lock:
                 STATE["detections"] = dets if isinstance(dets, list) else []
         except Exception:
             pass
+
+    def _on_detections_3d(self, msg):
+        """Parse Detection3DArray from detector_node into dashboard format."""
+        dets = []
+        for det in msg.detections:
+            if not det.results:
+                continue
+            result = det.results[0]
+            class_name = str(result.hypothesis.class_id)
+            score = float(result.hypothesis.score)
+            pos = det.bbox.center.position
+            size = det.bbox.size
+            dets.append({
+                "id":         str(id(det)),
+                "class_name": class_name,
+                "score":      round(score, 3),
+                "x":          round(pos.x, 3),
+                "y":          round(pos.y, 3),
+                "z":          round(pos.z, 3),
+                "w":          round(size.x, 3),
+                "h":          round(size.y, 3),
+            })
+        with _state_lock:
+            STATE["detections"] = dets
+
+    def _on_annotated(self, msg):
+        jpeg = _ros_image_to_jpeg(msg)
+        if jpeg:
+            global _annotated_frame
+            with _annotated_lock:
+                _annotated_frame = jpeg
 
     def _on_joint_states(self, msg):
         with _state_lock:
@@ -542,8 +591,23 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/stream/annotated")
     async def stream_annotated():
-        return StreamingResponse(_mjpeg_gen(0),
-                                  media_type="multipart/x-mixed-replace; boundary=frame")
+        async def _gen():
+            while True:
+                try:
+                    with _annotated_lock:
+                        frame = _annotated_frame
+                    if not frame:
+                        with _cam_lock:
+                            frame = _cam_frames.get(0)
+                    if not frame:
+                        frame = _sim_camera_frame(0)
+                    if frame:
+                        yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                               + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
+                    await asyncio.sleep(1 / 15)
+                except Exception:
+                    break
+        return StreamingResponse(_gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
     # ------------------------------------------------------------------
     # Command endpoints
