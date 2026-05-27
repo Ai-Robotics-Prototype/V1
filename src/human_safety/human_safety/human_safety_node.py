@@ -69,8 +69,8 @@ class HumanSafetyNode(Node):
         self.marker_pub = self.create_publisher(MarkerArray, '/safety/skeleton_markers', 10)
 
         if CV_BRIDGE_AVAILABLE:
-            cam0_sub = message_filters.Subscriber(self, Image, '/cam0/color/image_raw')
-            cam1_sub = message_filters.Subscriber(self, Image, '/cam1/color/image_raw')
+            cam0_sub = message_filters.Subscriber(self, Image, '/cam0/cam0/color/image_raw')
+            cam1_sub = message_filters.Subscriber(self, Image, '/cam1/cam1/color/image_raw')
             self.sync = message_filters.ApproximateTimeSynchronizer(
                 [cam0_sub, cam1_sub], queue_size=5, slop=0.1)
             self.sync.registerCallback(self.image_callback)

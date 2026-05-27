@@ -162,10 +162,10 @@ def generate_launch_description():
                 'base_frame': 'base_link',
             }],
             remappings=[
-                ('stereo_camera/left/image',  '/cam0/color/image_raw'),
-                ('stereo_camera/right/image', '/cam1/color/image_raw'),
-                ('stereo_camera/left/camera_info',  '/cam0/color/camera_info'),
-                ('stereo_camera/right/camera_info', '/cam1/color/camera_info'),
+                ('stereo_camera/left/image',  '/cam0/cam0/color/image_raw'),
+                ('stereo_camera/right/image', '/cam1/cam1/color/image_raw'),
+                ('stereo_camera/left/camera_info',  '/cam0/cam0/color/camera_info'),
+                ('stereo_camera/right/camera_info', '/cam1/cam1/color/camera_info'),
             ],
             output='screen',
             condition=IfCondition(LaunchConfiguration('launch_slam')),
@@ -182,8 +182,8 @@ def generate_launch_description():
                 'size': 0.162,
             }],
             remappings=[
-                ('image', '/cam0/color/image_raw'),
-                ('camera_info', '/cam0/color/camera_info'),
+                ('image', '/cam0/cam0/color/image_raw'),
+                ('camera_info', '/cam0/cam0/color/camera_info'),
             ],
             output='screen',
         ))

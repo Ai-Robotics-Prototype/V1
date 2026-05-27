@@ -88,7 +88,10 @@ export default function StatusBar() {
 
       {/* Right side: version */}
       <Block style={{ borderRight: 'none', borderLeft: '1px solid var(--border)', color: 'var(--text-muted)' }}>
-        v1.0.0-mock
+        {typeof __COMMIT__ !== 'undefined' ? `build ${__COMMIT__}` : 'dev'}
+        {typeof __BUILD_TIME__ !== 'undefined' && (
+          <span style={{ marginLeft: 6, opacity: 0.6 }}>{__BUILD_TIME__}</span>
+        )}
       </Block>
     </div>
   )

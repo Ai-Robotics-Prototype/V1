@@ -51,11 +51,11 @@ public:
       [this](sensor_msgs::msg::PointCloud2::SharedPtr m){ pc_callback(m); });
 
     depth_sub_ = create_subscription<sensor_msgs::msg::Image>(
-      "/cam0/depth/image_rect_raw", rclcpp::SensorDataQoS(),
+      "/cam0/cam0/aligned_depth_to_color/image_raw", rclcpp::SensorDataQoS(),
       [this](sensor_msgs::msg::Image::SharedPtr m){ depth_callback(m); });
 
     info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
-      "/cam0/depth/camera_info", 10,
+      "/cam0/cam0/aligned_depth_to_color/camera_info", 10,
       [this](sensor_msgs::msg::CameraInfo::SharedPtr m){ cam_info_ = m; });
 
     // Publishers

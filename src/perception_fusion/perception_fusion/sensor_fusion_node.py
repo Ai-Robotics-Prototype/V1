@@ -120,8 +120,8 @@ class SensorFusionNode(Node):
         self._cam1_msg  = None
 
         self.create_subscription(PointCloud2, '/lidar/points',      self._on_lidar, 10)
-        self.create_subscription(PointCloud2, '/cam0/depth/points', self._on_cam0,  10)
-        self.create_subscription(PointCloud2, '/cam1/depth/points', self._on_cam1,  10)
+        self.create_subscription(PointCloud2, '/cam0/cam0/depth/points', self._on_cam0,  10)
+        self.create_subscription(PointCloud2, '/cam1/cam1/depth/points', self._on_cam1,  10)
 
         self.create_timer(1.0 / 15.0, self._fuse_and_publish)
 

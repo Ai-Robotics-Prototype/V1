@@ -58,8 +58,8 @@ public:
     fused_pub_ = create_publisher<PointCloud2>("/perception/fused_cloud_gpu", 10);
 
     lidar_sub_.subscribe(this, "/lidar/points");
-    cam0_sub_.subscribe(this,  "/cam0/depth/points");
-    cam1_sub_.subscribe(this,  "/cam1/depth/points");
+    cam0_sub_.subscribe(this,  "/cam0/cam0/depth/points");
+    cam1_sub_.subscribe(this,  "/cam1/cam1/depth/points");
 
     sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
       SyncPolicy(10), lidar_sub_, cam0_sub_, cam1_sub_);
