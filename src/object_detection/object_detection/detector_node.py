@@ -4,6 +4,7 @@ from rclpy.node import Node
 import message_filters
 from sensor_msgs.msg import Image, CameraInfo
 from vision_msgs.msg import Detection3DArray, Detection3D, ObjectHypothesisWithPose
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 import numpy as np
 
 try:
@@ -38,7 +39,11 @@ class DetectorNode(Node):
         self.declare_parameter('engine_path',           '/opt/cobot/models/yolov8n.engine')
         self.declare_parameter('confidence_threshold',  0.5)
         self.declare_parameter('nms_threshold',         0.4)
-        self.declare_parameter('target_classes',        ['bottle','box','cup','tool','person'])
+        # Empty default = detect ALL classes (no filtering). An empty list needs
+        # an explicit type descriptor — rclpy can't infer type from [].
+        self.declare_parameter(
+            'target_classes', [],
+            ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY))
         self.declare_parameter('device',                'cuda:0')
         self.declare_parameter('input_width',           640)
         self.declare_parameter('input_height',          640)

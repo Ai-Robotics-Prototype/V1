@@ -14,7 +14,7 @@ tensor_rt:
 # YOLOv8 decoder
 yolov8_decoder_node:
   ros__parameters:
-    confidence_threshold: 0.35
+    confidence_threshold: 0.20
     nms_threshold: 0.45
 
 # DNN image encoder (resize + normalise to 640x640 float tensor)
@@ -29,13 +29,8 @@ yolov8_encoder:
 detector_node:
   ros__parameters:
     model_path: "/opt/cobot/models/yolov8n.pt"
-    confidence_threshold: 0.35
+    confidence_threshold: 0.20
     nms_threshold: 0.4
-    target_classes:
-      - "bottle"
-      - "box"
-      - "cup"
-      - "tool"
-      - "person"
+    target_classes: []   # empty = detect ALL classes (no filtering)
     use_tensorrt: false
     device: "cuda:0"

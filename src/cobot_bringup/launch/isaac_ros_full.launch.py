@@ -94,7 +94,7 @@ def _detection_nodes(config_dir: str) -> list:
         package='isaac_ros_yolov8',
         plugin='nvidia::isaac_ros::yolov8::YoloV8DecoderNode',
         parameters=[{
-            'confidence_threshold': 0.35,
+            'confidence_threshold': 0.20,
             'nms_threshold':        0.45,
         }],
     )
