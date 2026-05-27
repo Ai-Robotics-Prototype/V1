@@ -23,11 +23,11 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     args = [
-        DeclareLaunchArgument('max_depth_m',        default_value='2.0'),
-        DeclareLaunchArgument('min_object_area_px', default_value='500'),
+        DeclareLaunchArgument('max_depth_m',        default_value='3.0'),
+        DeclareLaunchArgument('min_object_area_px', default_value='200'),
         DeclareLaunchArgument('floor_tolerance_m',  default_value='0.02'),
-        DeclareLaunchArgument('erode_kernel',       default_value='3'),
-        DeclareLaunchArgument('dilate_kernel',      default_value='5'),
+        DeclareLaunchArgument('erode_kernel',       default_value='2'),
+        DeclareLaunchArgument('dilate_kernel',      default_value='7'),
         DeclareLaunchArgument('publish_rate_hz',    default_value='15.0'),
     ]
 
