@@ -535,6 +535,7 @@ class DepthSegmentNode(Node):
                 'euler':    (0.0, 0.0, 0.0),
                 'corners':  None,
                 'obb':      False,
+                '_pts3d':   cluster,
             }
         centroid, size_3d, R = cls._fit_obb(cluster)
         quat, euler = cls._rmat_to_quat_euler(R)
@@ -547,6 +548,7 @@ class DepthSegmentNode(Node):
             'euler':    euler,
             'corners':  corners,
             'obb':      True,
+            '_pts3d':   cluster,
         }
 
     @staticmethod
@@ -561,6 +563,91 @@ class DepthSegmentNode(Node):
         local = signs * h
         world = local @ R.T + centroid
         return world
+
+    def _merge_overlapping_detections(self, dets, w_img, h_img,
+                                      iou_thr: float = 0.15,
+                                      dist_thr_px: float = 30.0,
+                                      depth_thr_m: float = 0.06):
+        """Coalesce post-OBB detections that visibly cover the same object.
+
+        Two detections are linked when EITHER their 2D bboxes overlap
+        (IoU > iou_thr) OR their pixel centroids are within dist_thr_px
+        AND their depths are within depth_thr_m. The depth gate stops
+        stacked-at-different-ranges objects from collapsing into one.
+        Links are resolved transitively via union-find so a long chain of
+        ring arcs (A overlaps B overlaps C ...) all end up in the same
+        group. Each group's bbox becomes the union and the OBB is
+        re-fitted on the concatenated source point cloud.
+        """
+        n = len(dets)
+        if n <= 1:
+            return dets
+
+        # Pre-compute pixel centroids and centred-z values.
+        bb = [d['bbox_px'] for d in dets]
+        cen = [((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5) for b in bb]
+        zs  = [d['pos'][2] for d in dets]
+
+        # Union-find for transitive merging.
+        parent = list(range(n))
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if find(i) == find(j):
+                    continue
+                iou = self._iou(bb[i], bb[j])
+                dist = ((cen[i][0] - cen[j][0]) ** 2
+                        + (cen[i][1] - cen[j][1]) ** 2) ** 0.5
+                depth_diff = abs(zs[i] - zs[j])
+                if iou > iou_thr or (dist < dist_thr_px and depth_diff < depth_thr_m):
+                    union(i, j)
+
+        groups = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+
+        merged = []
+        for group in groups.values():
+            if len(group) == 1:
+                merged.append(dets[group[0]])
+                continue
+            clouds = [dets[g].get('_pts3d') for g in group]
+            clouds = [c for c in clouds if c is not None and c.shape[0] > 0]
+            bx0 = max(0,     min(dets[g]['bbox_px'][0] for g in group))
+            by0 = max(0,     min(dets[g]['bbox_px'][1] for g in group))
+            bx1 = min(w_img, max(dets[g]['bbox_px'][2] for g in group))
+            by1 = min(h_img, max(dets[g]['bbox_px'][3] for g in group))
+            if clouds:
+                combined = np.concatenate(clouds, axis=0)
+                centroid, size_3d, R = self._fit_obb(combined)
+                quat, euler = self._rmat_to_quat_euler(R)
+                corners = self._obb_corners(centroid, size_3d, R)
+                merged.append({
+                    'bbox_px':       (int(bx0), int(by0), int(bx1), int(by1)),
+                    'pos':           (float(centroid[0]), float(centroid[1]), float(centroid[2])),
+                    'size_3d':       (float(size_3d[0]), float(size_3d[1]), float(size_3d[2])),
+                    'quat':          tuple(float(q) for q in quat),
+                    'euler':         euler,
+                    'corners':       corners,
+                    'obb':           True,
+                    '_pts3d':        combined,
+                    '_merged_from':  len(group),
+                })
+            else:
+                base = dict(dets[group[0]])
+                base['bbox_px']      = (int(bx0), int(by0), int(bx1), int(by1))
+                base['_merged_from'] = len(group)
+                merged.append(base)
+        return merged
 
     def _temporal_filter(self):
         """Keep objects present in >=2 of the last 3 frames (flicker + dropout)."""
@@ -651,6 +738,12 @@ class DepthSegmentNode(Node):
         boundary = (np.hypot(gx, gy) > self.split_thresh) & valid
         boundary = ndimage.binary_dilation(boundary, iterations=1)
         foreground = foreground & ~boundary
+        # Re-fill enclosed holes that the carving just opened. For a ring
+        # the inner depth edge gets carved, leaving the centre disconnected;
+        # fill_holes only fills regions FULLY surrounded by foreground, so
+        # two distinct objects with a carved gap that touches the image
+        # border stay split — only ring-style enclosed holes are restored.
+        foreground = ndimage.binary_fill_holes(foreground)
 
         # Multi-scale connected components: full res + 2x block-OR downsample
         bboxes = self._components(foreground, scale=1)
@@ -725,6 +818,7 @@ class DepthSegmentNode(Node):
                     'euler':    (0.0, 0.0, 0.0),
                     'corners':  None,
                     'obb':      False,
+                    '_pts3d':   pts3d,
                 })
                 continue
 
@@ -739,7 +833,14 @@ class DepthSegmentNode(Node):
                 'euler':    euler,
                 'corners':  corners,
                 'obb':      True,
+                '_pts3d':   pts3d,
             })
+
+        # Final safety net: merge any remaining overlapping or near-coincident
+        # detections, re-fitting the OBB on the union of their point clouds.
+        # Catches ring/donut shapes where the depth-gap carving still splits
+        # the annulus into arcs despite the post-carving fill_holes.
+        objects = self._merge_overlapping_detections(objects, w, h)
 
         self._history.append(objects)
         self._emit(h, w)
