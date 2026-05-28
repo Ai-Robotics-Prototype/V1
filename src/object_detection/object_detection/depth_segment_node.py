@@ -55,6 +55,8 @@ class DepthSegmentNode(Node):
         self.declare_parameter('rgb_edge_threshold', 30.0)
         self.declare_parameter('merge_edge_dist_px', 20)
         self.declare_parameter('merge_iou_thr',      0.1)
+        self.declare_parameter('split_threshold_m',  0.01)
+        self.declare_parameter('max_bbox_area_px',   40000)
         self.declare_parameter('publish_rate_hz',    15.0)
         self.declare_parameter('bbox_pad_px',        5)
         # Per-camera topics so one node can serve cam0 and another cam1
@@ -74,6 +76,8 @@ class DepthSegmentNode(Node):
         self.rgb_edge_thresh = float(self.get_parameter('rgb_edge_threshold').value)
         self.merge_edge_px = int(self.get_parameter('merge_edge_dist_px').value)
         self.merge_iou_thr = float(self.get_parameter('merge_iou_thr').value)
+        self.split_thresh  = float(self.get_parameter('split_threshold_m').value)
+        self.max_bbox_area = int(self.get_parameter('max_bbox_area_px').value)
         self.pad         = int(self.get_parameter('bbox_pad_px').value)
         rate             = float(self.get_parameter('publish_rate_hz').value)
         depth_topic      = self.get_parameter('depth_topic').value
@@ -315,56 +319,94 @@ class DepthSegmentNode(Node):
 
     @classmethod
     def _fit_obb(cls, points: np.ndarray):
-        """Yaw-only OBB for tabletop scenes.
+        """Yaw-only OBB for tabletop scenes via convex hull + rotating calipers.
 
-        2D PCA in the camera's X/Y plane gives the in-plane rotation
-        (the only angle a top-down gripper actually needs); the Z extent
-        comes straight from the cloud's depth range. The returned R is a
-        pure rotation about the camera Z axis.
+        On the 2D (X,Y) projection of the cleaned cloud, the minimum-area
+        bounding rectangle aligned with one of the hull's edges gives the
+        tightest possible rectangle. Z extent is the cloud's depth range.
+        R is a pure rotation about camera Z; roll = pitch = 0.
 
-        If any extent falls outside [_OBB_MIN_DIM, _OBB_MAX_DIM] the OBB
-        is discarded and an axis-aligned bbox is returned instead, with
-        each dimension clamped to that same range. Returns
+        Degenerate inputs (too few or collinear points) fall back to an
+        axis-aligned bbox. Dimensions are clamped to [_OBB_MIN_DIM,
+        _OBB_MAX_DIM] in the same fallback path. Returns
         (centroid[3], size[3], R[3,3]).
         """
-        # 2D PCA on (X, Y) only.
+        from scipy.spatial import ConvexHull
+        from scipy.spatial.qhull import QhullError
+
+        def _aabb_fallback():
+            mn3, mx3 = points.min(axis=0), points.max(axis=0)
+            c = ((mn3 + mx3) * 0.5).astype(np.float32)
+            s = (mx3 - mn3).astype(np.float32)
+            s = np.clip(s, cls._OBB_MIN_DIM, cls._OBB_MAX_DIM)
+            return c, s, np.eye(3, dtype=np.float32)
+
+        if points.shape[0] < 10:
+            return _aabb_fallback()
+
         pxy = points[:, :2]
-        centroid_xy = pxy.mean(axis=0)
-        centred = pxy - centroid_xy
-        cov2 = np.cov(centred.T)
-        evals, evecs = np.linalg.eigh(cov2)
-        evecs = evecs[:, np.argsort(evals)[::-1]]
-        proj = centred @ evecs
-        mn = proj.min(axis=0)
-        mx = proj.max(axis=0)
-        size_xy = mx - mn
-        offset_xy = (mn + mx) * 0.5
-        centroid_xy = centroid_xy + evecs @ offset_xy
+        try:
+            hull = ConvexHull(pxy)
+        except (QhullError, ValueError):
+            return _aabb_fallback()
+        hpts = pxy[hull.vertices]
+        if len(hpts) < 3:
+            return _aabb_fallback()
+
+        # Rotating calipers: each candidate orientation is aligned with one
+        # of the hull's edges; the minimum-area AABB over hpts in that
+        # rotated frame defines the rectangle.
+        best_area = float('inf')
+        best = None
+        n_h = len(hpts)
+        for i in range(n_h):
+            edge = hpts[(i + 1) % n_h] - hpts[i]
+            angle = math.atan2(float(edge[1]), float(edge[0]))
+            ca = math.cos(-angle); sa = math.sin(-angle)
+            rot_into_local = np.array([[ca, -sa], [sa, ca]], dtype=np.float64)
+            # row-vector convention: local = world @ rot_into_local.T
+            rotated = hpts @ rot_into_local.T
+            mn = rotated.min(axis=0)
+            mx = rotated.max(axis=0)
+            area = float((mx[0] - mn[0]) * (mx[1] - mn[1]))
+            if area < best_area:
+                best_area = area
+                best = (angle, mn, mx)
+
+        angle, mn_loc, mx_loc = best
+        # Recover centroid in world XY from the rectangle's local centre.
+        centroid_local = (mn_loc + mx_loc) * 0.5
+        ca = math.cos(angle); sa = math.sin(angle)
+        centroid_xy = np.array([
+            ca * centroid_local[0] - sa * centroid_local[1],
+            sa * centroid_local[0] + ca * centroid_local[1],
+        ])
+
+        size_xy = mx_loc - mn_loc
+        # Convention: first dim = longer XY extent.
+        if size_xy[0] < size_xy[1]:
+            size_xy = size_xy[::-1]
+            angle += math.pi / 2.0
 
         z = points[:, 2]
         z_min, z_max = float(z.min()), float(z.max())
-        size_z = max(z_max - z_min, 0.01)
+        size_z = max(z_max - z_min, 0.005)
         centroid_z = 0.5 * (z_min + z_max)
 
         centroid = np.array([centroid_xy[0], centroid_xy[1], centroid_z], dtype=np.float32)
         size_3d = np.array([size_xy[0], size_xy[1], size_z], dtype=np.float32)
 
-        yaw = math.atan2(float(evecs[1, 0]), float(evecs[0, 0]))
-        cy_, sy_ = math.cos(yaw), math.sin(yaw)
+        cy_, sy_ = math.cos(angle), math.sin(angle)
         R = np.array([
             [cy_, -sy_, 0.0],
             [sy_,  cy_, 0.0],
             [0.0,  0.0, 1.0],
         ], dtype=np.float32)
 
-        # FIX 4: sanity-clamp. If any dim is implausible for a tabletop
-        # object, fall back to a min-max AABB clamped into range.
+        # Sanity-clamp: ridiculous extents trip the AABB fallback so we
+        # never publish a 40 cm "object".
         if (size_3d > cls._OBB_MAX_DIM).any() or (size_3d < cls._OBB_MIN_DIM).any():
-            mn3, mx3 = points.min(axis=0), points.max(axis=0)
-            size_3d = (mx3 - mn3).astype(np.float32)
-            centroid = ((mx3 + mn3) * 0.5).astype(np.float32)
-            R = np.eye(3, dtype=np.float32)
-            size_3d = np.clip(size_3d, cls._OBB_MIN_DIM, cls._OBB_MAX_DIM)
+            return _aabb_fallback()
 
         return centroid, size_3d, R
 
@@ -389,6 +431,77 @@ class DepthSegmentNode(Node):
             roll = math.atan2(float(R[2, 1]), float(R[2, 2]))
             yaw  = math.atan2(float(R[1, 0]), float(R[0, 0]))
         return quat.astype(np.float32), (roll, pitch, yaw)
+
+    @staticmethod
+    def _kmeans_split(pts: np.ndarray, bbox_area: int):
+        """Split an oversized cloud into <=5 clusters via XY-plane k-means.
+
+        Returns (cluster_pts_list, fitted) where each element is an Nx3
+        sub-cloud. Returns ([], False) if scipy.cluster.vq is unavailable
+        or kmeans fails / would leave empty clusters; the caller should
+        then fall back to single-OBB handling.
+        """
+        try:
+            from scipy.cluster.vq import kmeans2
+        except ImportError:
+            return [], False
+        k = max(2, bbox_area // 15000)
+        k = min(k, 5)
+        if pts.shape[0] < k * 5:
+            return [], False
+        try:
+            _, labels = kmeans2(pts[:, :2].astype(np.float64), k,
+                                minit='points', seed=0)
+        except Exception:
+            return [], False
+        clusters = [pts[labels == kid] for kid in range(k)]
+        clusters = [c for c in clusters if c.shape[0] >= 10]
+        return clusters, len(clusters) >= 2
+
+    @classmethod
+    def _build_obj_from_cluster(cls, cluster: np.ndarray,
+                                fx: float, fy: float, cx: float, cy: float,
+                                w: int, h: int):
+        """Build a detection dict from a 3D point cluster (used by k-means
+        split). Reconstructs bbox_px by projecting cluster points back to
+        the image plane. Returns None if the cluster is too sparse."""
+        if cluster.shape[0] < 5:
+            return None
+        # Project to pixel coordinates for bbox_px.
+        z = cluster[:, 2]
+        z_safe = np.where(z > 0.01, z, 0.01)
+        us = fx * cluster[:, 0] / z_safe + cx
+        vs = fy * cluster[:, 1] / z_safe + cy
+        bx0 = int(max(0, math.floor(float(us.min()))))
+        by0 = int(max(0, math.floor(float(vs.min()))))
+        bx1 = int(min(w, math.ceil(float(us.max()))))
+        by1 = int(min(h, math.ceil(float(vs.max()))))
+        if bx1 <= bx0 or by1 <= by0:
+            return None
+        if cluster.shape[0] < 20:
+            centroid = cluster.mean(axis=0)
+            extents = cluster.max(axis=0) - cluster.min(axis=0)
+            return {
+                'bbox_px':  (bx0, by0, bx1, by1),
+                'pos':      tuple(float(v) for v in centroid),
+                'size_3d':  tuple(float(v) for v in extents.clip(0.005, None)),
+                'quat':     (0.0, 0.0, 0.0, 1.0),
+                'euler':    (0.0, 0.0, 0.0),
+                'corners':  None,
+                'obb':      False,
+            }
+        centroid, size_3d, R = cls._fit_obb(cluster)
+        quat, euler = cls._rmat_to_quat_euler(R)
+        corners = cls._obb_corners(centroid, size_3d, R)
+        return {
+            'bbox_px':  (bx0, by0, bx1, by1),
+            'pos':      (float(centroid[0]), float(centroid[1]), float(centroid[2])),
+            'size_3d':  (float(size_3d[0]), float(size_3d[1]), float(size_3d[2])),
+            'quat':     tuple(float(q) for q in quat),
+            'euler':    euler,
+            'corners':  corners,
+            'obb':      True,
+        }
 
     @staticmethod
     def _obb_corners(centroid: np.ndarray, size: np.ndarray, R: np.ndarray):
@@ -484,6 +597,15 @@ class DepthSegmentNode(Node):
         foreground = ndimage.binary_fill_holes(foreground)
         foreground = self._dilate(self._erode(foreground, self.erode_k), self.erode_k)
 
+        # Carve depth-discontinuity boundaries OUT of the foreground so
+        # neighbouring objects whose 2D masks touch get split. Uses true
+        # per-pixel depth derivatives (np.gradient), not sobel-scaled
+        # values — threshold is "metres per pixel".
+        gy, gx = np.gradient(depth_filled)
+        boundary = (np.hypot(gx, gy) > self.split_thresh) & valid
+        boundary = ndimage.binary_dilation(boundary, iterations=1)
+        foreground = foreground & ~boundary
+
         # Multi-scale connected components: full res + 2x block-OR downsample
         bboxes = self._components(foreground, scale=1)
         h2, w2 = h // 2, w // 2
@@ -500,6 +622,7 @@ class DepthSegmentNode(Node):
             x1 = min(w, x1 + self.pad); y1 = min(h, y1 + self.pad)
             sub_d = depth[y0:y1, x0:x1]
             sub_fg = foreground[y0:y1, x0:x1]
+            bbox_area = (x1 - x0) * (y1 - y0)
 
             # Vectorised deprojection of every foreground pixel in the bbox
             # whose depth is valid, *after* mask erosion (to drop edge
@@ -509,6 +632,19 @@ class DepthSegmentNode(Node):
             pts3d = self._refine_object_points(
                 sub_d, sub_fg.astype(bool), fx, fy, cx - x0, cy - y0,
             )
+
+            # FIX B: oversized bbox — try k-means split before treating
+            # it as one object. If splitting yields >=2 reasonable
+            # clusters, emit each as its own detection and skip the
+            # single-object handling below.
+            if bbox_area > self.max_bbox_area and pts3d.shape[0] >= 40:
+                clusters, ok = self._kmeans_split(pts3d, bbox_area)
+                if ok:
+                    for c in clusters:
+                        d = self._build_obj_from_cluster(c, fx, fy, cx, cy, w, h)
+                        if d is not None:
+                            objects.append(d)
+                    continue
             # Cheap fallback for nearly-empty masks: use any valid depth
             # in the bbox so we still emit a 2D detection.
             if pts3d.shape[0] < 5:
@@ -654,13 +790,12 @@ class DepthSegmentNode(Node):
                 if proj is not None:
                     self._draw_obb_wireframe(draw, proj, (0, 220, 255))
 
-            # Tilt: report the dominant deviation from camera-axis-aligned in
-            # degrees. abs() of the largest euler component.
-            tilt_deg = max(abs(roll), abs(pitch), abs(yaw)) * 180.0 / math.pi
-            # Size in cm (rounded) — small objects in mm-ish range get sane labels.
-            scm = (int(round(sx * 100)), int(round(sy * 100)), int(round(sz * 100)))
-
-            label = f'{pz:.2f}m  tilt {tilt_deg:.0f}°  {scm[0]}x{scm[1]}x{scm[2]}cm'
+            # Yaw is the only meaningful rotation (yaw-only OBB); size
+            # collapsed to the two XY dims for a top-down read.
+            yaw_deg = yaw * 180.0 / math.pi
+            w_cm = int(round(sx * 100))
+            h_cm = int(round(sy * 100))
+            label = f'{pz:.2f}m  {w_cm}×{h_cm}cm  yaw:{yaw_deg:+.0f}°'
             tw = len(label) * 6 + 6
             draw.rectangle([x0, max(0, y0 - 13), x0 + tw, y0], fill=col)
             draw.text((x0 + 2, max(0, y0 - 12)), label, fill=(255, 255, 255))
