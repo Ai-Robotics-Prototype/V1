@@ -236,6 +236,53 @@ function SceneObjects({ objects }) {
 // Backwards-compat alias used by Scene below.
 const ObjectMarkers = SceneObjects
 
+// Stereo-verified placed objects from /perception/placed_objects.
+// position_lidar carries the surface-anchored XYZ (camera XY + LiDAR
+// Z). We render the box AT that position with its real size — the
+// publisher chose center_z = surface + height/2 so the box bottom sits
+// exactly on the point-cloud surface.
+//   green solid wireframe : both cameras agreed (verified)
+//   amber dashed-look     : only one camera saw it
+function PlacedObjects({ objects }) {
+  if (!objects || objects.length === 0) return null
+  return (
+    <>
+      {objects.map((o, i) => {
+        const pos = o.position_lidar
+        if (!pos || pos.length < 3) return null
+        const [tx, ty, tz] = lidarToThree(pos[0], pos[1], pos[2])
+        const size = o.size && o.size.length >= 3 ? o.size : [0.05, 0.05, 0.05]
+        const W = Math.max(0.01, size[0])
+        const D = Math.max(0.01, size[1])
+        const H = Math.max(0.01, size[2])
+        const yawDeg = (o.orientation && o.orientation.length >= 3) ? o.orientation[2] : 0
+        const yaw = yawDeg * Math.PI / 180
+        const verified = !!o.verified
+        // Green for stereo-verified, amber for single-camera, grey if
+        // the LiDAR couldn't anchor it (surface_unknown).
+        const color = o.surface_unknown ? '#9CA3AF'
+                       : verified         ? '#16A34A'
+                       :                    '#F59E0B'
+        return (
+          <group key={o.id ?? i} position={[tx, ty, tz]} rotation={[0, yaw, 0]}>
+            {/* Solid translucent box for verified, wireframe-only for single-cam */}
+            {verified && (
+              <mesh>
+                <boxGeometry args={[W, H, D]} />
+                <meshStandardMaterial color={color} transparent opacity={0.30} />
+              </mesh>
+            )}
+            <lineSegments>
+              <edgesGeometry args={[new THREE.BoxGeometry(W, H, D)]} />
+              <lineBasicMaterial color={color} linewidth={2} />
+            </lineSegments>
+          </group>
+        )
+      })}
+    </>
+  )
+}
+
 // Real-time 3D detections from /perception/detections_3d (depth_segment_node).
 //
 // Detections are published in livox_frame (ROS: X=forward, Y=left, Z=up).
@@ -444,7 +491,7 @@ function CameraController({ preset }) {
   return null
 }
 
-function Scene({ pointsRef, meshRef, meshWireRef, zone, preset, sceneObjects, detections, grasps }) {
+function Scene({ pointsRef, meshRef, meshWireRef, zone, preset, sceneObjects, detections, grasps, placedObjects }) {
   return (
     <>
       <color attach="background" args={['#0A0A0B']} />
@@ -464,6 +511,7 @@ function Scene({ pointsRef, meshRef, meshWireRef, zone, preset, sceneObjects, de
       <ReconstructionMesh meshRef={meshRef} meshWireRef={meshWireRef} />
       <ObjectMarkers objects={sceneObjects} />
       <DetectionMarkers detections={detections} />
+      <PlacedObjects objects={placedObjects} />
       <GraspMarkers grasps={grasps} />
 
       <CameraController preset={preset} />
@@ -479,6 +527,7 @@ export default function LidarPanel() {
   // stay on the camera feeds, never in the 3D view.
   const detections   = useStore((s) => s.lidar_objects)
   const grasps       = useStore((s) => s.grasp_poses)
+  const placedObjects = useStore((s) => s.placed_objects)
 
   const pointsRef   = useRef([])
   const meshRef     = useRef(null)
@@ -590,6 +639,7 @@ export default function LidarPanel() {
           sceneObjects={sceneObjects}
           detections={detections}
           grasps={grasps}
+          placedObjects={placedObjects}
         />
       </Canvas>
 

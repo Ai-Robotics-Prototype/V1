@@ -22,6 +22,7 @@ setup(
             'depth_detector_node = object_detection.depth_detector_node:main',
             'depth_segment_node = object_detection.depth_segment_node:main',
             'lidar_detector_node = object_detection.lidar_detector_node:main',
+            'stereo_verifier_node = object_detection.stereo_verifier_node:main',
             'grasp_planner = object_detection.grasp_planner:main',
         ],
     },

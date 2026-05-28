@@ -71,6 +71,7 @@ STATE = {
     },
     "detections": [],
     "lidar_objects": [],
+    "placed_objects": [],
     "scene_graph": {"objects": []},
     "grasp_poses": [],
     "reconstruction": {"active": False, "voxels_occupied": 0, "mesh_triangles": 0},
@@ -378,6 +379,10 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self.create_subscription(String, "/grasp/candidates",
                                  self._on_grasp_candidates, 5)
 
+        # Stereo-verified objects with LiDAR-anchored Z (JSON String).
+        self.create_subscription(String, "/perception/placed_objects",
+                                 self._on_placed_objects, 5)
+
         # Annotated image from detector (cam0 + cam1)
         self.create_subscription(Image, "/perception/annotated_image",
                                  self._on_annotated, 2)
@@ -581,6 +586,36 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 })
         with _state_lock:
             STATE["detections"] = dets
+
+    def _on_placed_objects(self, msg):
+        """Stereo-verified, LiDAR-anchored objects (JSON String from
+        stereo_verifier_node). Stored as-is in STATE so the dashboard
+        can render verified/unverified with different styling."""
+        try:
+            payload = json.loads(msg.data)
+        except Exception:
+            return
+        objs = payload.get('objects', []) or []
+        # Keep only the fields the frontend needs (pass through most).
+        out = []
+        for o in objs:
+            out.append({
+                'id':              o.get('id'),
+                'source':          o.get('source'),
+                'verified':        bool(o.get('verified', False)),
+                'position_lidar':  o.get('position_lidar') or [0, 0, 0],
+                'position_cam0':   o.get('position_cam0'),
+                'position_cam1':   o.get('position_cam1'),
+                'surface_z':       o.get('surface_z'),
+                'surface_unknown': bool(o.get('surface_unknown', False)),
+                'size':            o.get('size') or [0.05, 0.05, 0.05],
+                'orientation':     o.get('orientation') or [0, 0, 0],
+                'quat':            o.get('quat') or [0, 0, 0, 1],
+                'class_name':      o.get('class_name'),
+                'confidence':      o.get('confidence', 0.0),
+            })
+        with _state_lock:
+            STATE['placed_objects'] = out
 
     def _on_grasp_candidates(self, msg):
         """Parse grasp_planner JSON and reshape for the dashboard store."""
