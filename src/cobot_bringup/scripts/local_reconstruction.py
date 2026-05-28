@@ -21,6 +21,7 @@ import struct
 
 import numpy as np
 import rclpy
+from scipy import ndimage
 from geometry_msgs.msg import Point
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -62,10 +63,24 @@ def _decode_xyz(msg: PointCloud2) -> np.ndarray:
 
 
 def _height_color(z: float):
-    if z < 0.1: return (0.15, 0.35, 0.85)   # blue
-    if z < 0.5: return (0.15, 0.75, 0.50)   # green
-    if z < 1.0: return (0.85, 0.75, 0.10)   # yellow
-    return        (0.85, 0.25, 0.15)        # red
+    # Light-themed palette: legible on both dark and white backgrounds.
+    if z < 0.1: return (0.753, 0.769, 0.800)   # #C0C4CC light grey  — floor
+    if z < 0.8: return (0.576, 0.773, 0.992)   # #93C5FD light blue  — table
+    if z < 1.5: return (0.525, 0.937, 0.675)   # #86EFAC light green — object
+    return        (0.992, 0.902, 0.541)        # #FDE68A light amber — above
+
+def _height_color_arr(zs: np.ndarray) -> np.ndarray:
+    """Vectorised height-band palette — Nx3 float colours for an N-vector of z."""
+    cols = np.empty((zs.shape[0], 3), dtype=np.float32)
+    a = zs < 0.1
+    b = (~a) & (zs < 0.8)
+    c = (~a) & (~b) & (zs < 1.5)
+    d = ~(a | b | c)
+    cols[a] = (0.753, 0.769, 0.800)
+    cols[b] = (0.576, 0.773, 0.992)
+    cols[c] = (0.525, 0.937, 0.675)
+    cols[d] = (0.992, 0.902, 0.541)
+    return cols
 
 
 class LocalReconstruction(Node):
@@ -75,11 +90,14 @@ class LocalReconstruction(Node):
         self.declare_parameter('input_topic',        '/lidar/points_dense')
         self.declare_parameter('grid_resolution_m',  0.02)
         self.declare_parameter('grid_half_extent_m', 1.5)
-        self.declare_parameter('occupancy_threshold', 0.5)
+        self.declare_parameter('occupancy_threshold', 0.7)
         self.declare_parameter('decay_rate',         0.995)
         self.declare_parameter('update_rate',        0.2)     # one-shot weight per point
         self.declare_parameter('publish_hz',         2.0)
         self.declare_parameter('max_triangles_json', 5000)
+        self.declare_parameter('mesh_radius_m',      1.5)
+        self.declare_parameter('min_neighbours',     3)
+        self.declare_parameter('min_cluster_voxels', 20)
         self.declare_parameter('frame_id',           'livox_frame')
 
         input_topic           = self.get_parameter('input_topic').value
@@ -89,6 +107,9 @@ class LocalReconstruction(Node):
         self.decay            = float(self.get_parameter('decay_rate').value)
         self.update_rate      = float(self.get_parameter('update_rate').value)
         self.max_tri_json     = int(self.get_parameter('max_triangles_json').value)
+        self.mesh_radius      = float(self.get_parameter('mesh_radius_m').value)
+        self.min_neighbours   = int(self.get_parameter('min_neighbours').value)
+        self.min_cluster      = int(self.get_parameter('min_cluster_voxels').value)
         self.frame_id         = str(self.get_parameter('frame_id').value)
         rate                  = float(self.get_parameter('publish_hz').value)
 
@@ -131,26 +152,53 @@ class LocalReconstruction(Node):
         idx = idx[in_range]
         if idx.size == 0:
             return
-        # EMA bump toward 1.0. Using fancy indexing — duplicate (i,j,k)
-        # entries from multiple points hitting the same voxel collapse
-        # to a single bump per timer fire, which is what we want.
         i, j, k = idx[:, 0], idx[:, 1], idx[:, 2]
         cur = self._grid[i, j, k]
         self._grid[i, j, k] = (1.0 - self.update_rate) * cur + self.update_rate
         self._frames_seen += 1
+
+        # Strip noise voxels: anything occupied with fewer than
+        # min_neighbours occupied neighbours in a 3x3x3 box gets zeroed.
+        # uniform_filter(size=3) averages over 27 cells, so multiply to
+        # get the count. Threshold is "min_neighbours + self".
+        occ_mask = self._grid > self.occ_thresh
+        if occ_mask.any():
+            n_count = ndimage.uniform_filter(
+                occ_mask.astype(np.float32), size=3) * 27.0
+            isolated = (self._grid > 0.0) & (n_count < (self.min_neighbours + 1))
+            self._grid[isolated] = 0.0
+
+            # Drop tiny isolated clusters. Re-mask after the isolated-voxel
+            # cull so we don't waste a labelling pass on stale single
+            # voxels.
+            if self.min_cluster > 1:
+                occ_mask = self._grid > self.occ_thresh
+                if occ_mask.any():
+                    labeled, n_labels = ndimage.label(
+                        occ_mask, structure=np.ones((3, 3, 3)))
+                    if n_labels > 0:
+                        counts = np.bincount(labeled.ravel())
+                        too_small = counts < self.min_cluster
+                        too_small[0] = False  # never zero the background label
+                        if too_small.any():
+                            self._grid[too_small[labeled]] = 0.0
 
     # ── Mesh extraction ───────────────────────────────────────────────
 
     def _extract_mesh(self):
         """Return (verts[N,3], tris[M,3]) in world coordinates. Falls back to
         surface-voxel centres + empty tris if skimage is unavailable or
-        the level set is degenerate."""
+        the level set is degenerate. Vertices farther than mesh_radius_m
+        from the origin are dropped, and triangles referencing any
+        dropped vertex go with them."""
         if marching_cubes is None:
             occupied = self._grid > self.occ_thresh
             if not occupied.any():
                 return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.int32)
             coords = np.argwhere(occupied)
             verts = coords.astype(np.float32) * self.res - self.half + self.res * 0.5
+            r = np.linalg.norm(verts, axis=1)
+            verts = verts[r < self.mesh_radius]
             return verts, np.zeros((0, 3), dtype=np.int32)
         try:
             verts, faces, _, _ = marching_cubes(
@@ -159,10 +207,21 @@ class LocalReconstruction(Node):
             )
         except (ValueError, RuntimeError):
             return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.int32)
-        # marching_cubes returns coordinates in (i*res, j*res, k*res) — shift
-        # to world frame.
         verts = verts.astype(np.float32) - self.half
-        return verts, faces.astype(np.int32)
+        faces = faces.astype(np.int32)
+        # Near-field crop: keep only vertices within mesh_radius_m of the
+        # origin, drop triangles that reference any cropped vertex, and
+        # remap the remaining face indices.
+        r = np.linalg.norm(verts, axis=1)
+        keep = r < self.mesh_radius
+        if not keep.all():
+            keep_idx = np.where(keep)[0]
+            remap = -np.ones(verts.shape[0], dtype=np.int64)
+            remap[keep_idx] = np.arange(keep_idx.size)
+            tri_keep = keep[faces].all(axis=1)
+            faces = remap[faces[tri_keep]].astype(np.int32)
+            verts = verts[keep_idx]
+        return verts, faces
 
     # ── Publishing ────────────────────────────────────────────────────
 
@@ -229,6 +288,13 @@ class LocalReconstruction(Node):
             verts_out = verts
             tris_out = tris
 
+        # Per-vertex height-band colour. Two decimal places is sufficient
+        # for an 8-bit channel after the dashboard multiplies by 255.
+        if verts_out.shape[0] > 0:
+            cols = _height_color_arr(verts_out[:, 2])
+            colors_json = [[round(float(c), 2) for c in v] for v in cols.tolist()]
+        else:
+            colors_json = []
         payload = {
             'frame_id':   self.frame_id,
             'n_vertices': int(verts_out.shape[0]),
@@ -237,6 +303,7 @@ class LocalReconstruction(Node):
             # Round to mm; full float would double the payload size.
             'vertices':   [[round(float(v), 3) for v in p] for p in verts_out.tolist()],
             'triangles':  tris_out.astype(np.int32).tolist(),
+            'colors':     colors_json,
         }
         s = String()
         s.data = json.dumps(payload)

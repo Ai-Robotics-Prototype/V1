@@ -22,9 +22,10 @@ from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 
 # Standard optical -> ROS quaternion: rotation that takes a vector in the
 # camera optical frame (X-right, Y-down, Z-forward) and re-expresses it
-# in the ROS body frame (X-forward, Y-left, Z-up). q and -q are the same
-# rotation; either sign is correct.
-_OPTICAL_TO_ROS_Q = (0.5, -0.5, 0.5, 0.5)
+# in the ROS body frame (X-forward, Y-left, Z-up). This produces the
+# rotation matrix [[0,0,1],[-1,0,0],[0,-1,0]]. Note the qw sign matters
+# — (0.5,-0.5,0.5,+0.5) is a different rotation (cam X -> lidar +Z).
+_OPTICAL_TO_ROS_Q = (0.5, -0.5, 0.5, -0.5)
 
 _CONFIG_CANDIDATES = [
     '/home/teddy/cobot_ws/install/cobot_bringup/share/cobot_bringup/config/sensor_transforms.yaml',

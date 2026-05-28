@@ -44,7 +44,11 @@ _CUBE_EDGES = ((0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
                (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7))
 
 # Standard optical -> ROS quaternion (xyzw) — matches sensor_tf_publisher.
-_OPTICAL_TO_ROS_Q = (0.5, -0.5, 0.5, 0.5)
+# Produces R = [[0,0,1],[-1,0,0],[0,-1,0]] which maps cam X->lidar -Y,
+# cam Y->lidar -Z, cam Z->lidar +X. The qw sign matters: +0.5 yields a
+# different rotation (cam X->lidar +Z) that treats the camera as
+# pointing DOWN, not forward.
+_OPTICAL_TO_ROS_Q = (0.5, -0.5, 0.5, -0.5)
 
 _SENSOR_YAML_CANDIDATES = [
     '/home/teddy/cobot_ws/install/cobot_bringup/share/cobot_bringup/config/sensor_transforms.yaml',

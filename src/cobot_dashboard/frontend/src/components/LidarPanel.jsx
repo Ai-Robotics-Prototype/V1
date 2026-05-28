@@ -179,26 +179,35 @@ function ReconstructionMesh({ meshRef }) {
     if (!data) return
     const verts = data.vertices
     const tris  = data.triangles
+    const cols  = data.colors  // server-side per-vertex colours, optional
     if (!verts || !tris) return
 
     const N = verts.length
     const positions = new Float32Array(N * 3)
     const colors    = new Float32Array(N * 3)
+    const haveCols  = Array.isArray(cols) && cols.length === N
     for (let i = 0; i < N; i++) {
       const v = verts[i]
       positions[i * 3]     = v[0]
       positions[i * 3 + 1] = v[2]   // z-up -> y-up
       positions[i * 3 + 2] = v[1]
-      const c = (function () {
+      if (haveCols) {
+        const c = cols[i]
+        colors[i * 3]     = c[0]
+        colors[i * 3 + 1] = c[1]
+        colors[i * 3 + 2] = c[2]
+      } else {
+        // Local fallback palette — same bands as the server.
         const z = v[2]
-        if (z < 0.1) return [0.15, 0.35, 0.85]
-        if (z < 0.5) return [0.15, 0.75, 0.50]
-        if (z < 1.0) return [0.85, 0.75, 0.10]
-        return         [0.85, 0.25, 0.15]
-      })()
-      colors[i * 3]     = c[0]
-      colors[i * 3 + 1] = c[1]
-      colors[i * 3 + 2] = c[2]
+        let c
+        if (z < 0.1)      c = [0.753, 0.769, 0.800]   // light grey
+        else if (z < 0.8) c = [0.576, 0.773, 0.992]   // light blue
+        else if (z < 1.5) c = [0.525, 0.937, 0.675]   // light green
+        else              c = [0.992, 0.902, 0.541]   // light amber
+        colors[i * 3]     = c[0]
+        colors[i * 3 + 1] = c[1]
+        colors[i * 3 + 2] = c[2]
+      }
     }
 
     const M = tris.length
