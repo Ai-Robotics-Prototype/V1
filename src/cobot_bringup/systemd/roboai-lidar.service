@@ -1,5 +1,5 @@
 [Unit]
-Description=RoboAi Ouster LiDAR Bridge
+Description=RoboAi Livox MID-360 LiDAR
 After=network-online.target
 Wants=network-online.target
 
@@ -8,14 +8,15 @@ Type=simple
 User=teddy
 WorkingDirectory=/home/teddy/cobot_ws
 # Network setup runs as root via the '+' prefix so no sudoers entry is needed.
-# We use a /32 + host route (not /24) because the Jetson WiFi is also on
-# 192.168.1.0/24 — installing /24 on eno1 would hijack SSH return traffic.
+# We use 192.168.1.200/32 + a host route — the Jetson WiFi (wlP1p1s0) is
+# also on 192.168.1.0/24; installing /24 on eno1 would hijack SSH return
+# traffic. The Livox MID-360 is at 192.168.1.150 (verified by arp-scan).
 ExecStartPre=+/sbin/ip link set eno1 up
 ExecStartPre=+/bin/sh -c '/sbin/ip addr replace 192.168.1.200/32 dev eno1'
-ExecStartPre=+/bin/sh -c '/sbin/ip route replace 192.168.1.100/32 dev eno1'
-ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && python3 /home/teddy/cobot_ws/src/cobot_bringup/scripts/ouster_bridge.py'
+ExecStartPre=+/bin/sh -c '/sbin/ip route replace 192.168.1.150/32 dev eno1'
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 launch livox_ros_driver2 msg_MID360_launch.py'
 Restart=always
-RestartSec=10
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

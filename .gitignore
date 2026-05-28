@@ -13,3 +13,8 @@ __pycache__/
 isaac_ros_assets/
 # Generated frontend build output (produced by `npm run build`)
 src/cobot_dashboard/mock_server/static/
+
+# Third-party Livox driver + SDK — cloned and configured by
+# scripts/install_livox.sh, not vendored in this repo.
+src/Livox-SDK2/
+src/livox_ros_driver2/
