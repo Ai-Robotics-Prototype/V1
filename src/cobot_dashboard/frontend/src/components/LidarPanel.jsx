@@ -175,6 +175,79 @@ function DetectionMarkers({ detections }) {
   )
 }
 
+// Reconstruction mesh from /ws/mesh: BufferGeometry built from the
+// vertices/triangles JSON, height-based vertex colours, semi-transparent
+// overlay on top of the raw point cloud. Uses the same axis convention
+// as the point cloud (z-up in LiDAR frame -> y-up in three.js).
+function ReconstructionMesh({ meshRef }) {
+  const groupRef = useRef()
+  useFrame(() => {
+    const data = meshRef.current
+    if (!data) return
+    const verts = data.vertices
+    const tris  = data.triangles
+    if (!verts || !tris) return
+
+    const N = verts.length
+    const positions = new Float32Array(N * 3)
+    const colors    = new Float32Array(N * 3)
+    for (let i = 0; i < N; i++) {
+      const v = verts[i]
+      positions[i * 3]     = v[0]
+      positions[i * 3 + 1] = v[2]   // z-up -> y-up
+      positions[i * 3 + 2] = v[1]
+      const c = (function () {
+        const z = v[2]
+        if (z < 0.1) return [0.15, 0.35, 0.85]
+        if (z < 0.5) return [0.15, 0.75, 0.50]
+        if (z < 1.0) return [0.85, 0.75, 0.10]
+        return         [0.85, 0.25, 0.15]
+      })()
+      colors[i * 3]     = c[0]
+      colors[i * 3 + 1] = c[1]
+      colors[i * 3 + 2] = c[2]
+    }
+
+    const M = tris.length
+    const index = new Uint32Array(M * 3)
+    for (let i = 0; i < M; i++) {
+      const t = tris[i]
+      index[i * 3]     = t[0]
+      index[i * 3 + 1] = t[1]
+      index[i * 3 + 2] = t[2]
+    }
+
+    const geo = new THREE.BufferGeometry()
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    geo.setAttribute('color',    new THREE.BufferAttribute(colors, 3))
+    geo.setIndex(new THREE.BufferAttribute(index, 1))
+    geo.computeVertexNormals()
+
+    if (groupRef.current) {
+      // Dispose any previous geometry so we don't leak GPU memory.
+      while (groupRef.current.children.length > 0) {
+        const child = groupRef.current.children[0]
+        if (child.geometry) child.geometry.dispose()
+        groupRef.current.remove(child)
+      }
+      const mesh = new THREE.Mesh(
+        geo,
+        new THREE.MeshStandardMaterial({
+          vertexColors: true,
+          transparent: true,
+          opacity: 0.55,
+          side: THREE.DoubleSide,
+          flatShading: true,
+        }),
+      )
+      groupRef.current.add(mesh)
+    }
+
+    meshRef.current = null  // consume so we don't rebuild every frame
+  })
+  return <group ref={groupRef} />
+}
+
 // Grasp pose markers: short downward arrow at the grasp centre + two
 // jaw segments showing the gripper opening width.
 function GraspMarkers({ grasps }) {
@@ -237,7 +310,7 @@ function CameraController({ preset }) {
   return null
 }
 
-function Scene({ pointsRef, zone, preset, sceneObjects, detections, grasps }) {
+function Scene({ pointsRef, meshRef, zone, preset, sceneObjects, detections, grasps }) {
   return (
     <>
       <color attach="background" args={['#0A0A0B']} />
@@ -254,6 +327,7 @@ function Scene({ pointsRef, zone, preset, sceneObjects, detections, grasps }) {
 
       <SafetyRings zone={zone} />
       <PointCloud pointsRef={pointsRef} />
+      <ReconstructionMesh meshRef={meshRef} />
       <ObjectMarkers objects={sceneObjects} />
       <DetectionMarkers detections={detections} />
       <GraspMarkers grasps={grasps} />
@@ -271,11 +345,14 @@ export default function LidarPanel() {
   const grasps       = useStore((s) => s.grasp_poses)
 
   const pointsRef = useRef([])
+  const meshRef   = useRef(null)
   const wsRef     = useRef(null)
-  const [preset,      setPreset]      = useState('3d')
-  const [wsConnected, setWsConnected] = useState(false)
-  const [isLive,      setIsLive]      = useState(false)
-  const [pointCount,  setPointCount]  = useState(0)
+  const meshWsRef = useRef(null)
+  const [preset,       setPreset]       = useState('3d')
+  const [wsConnected,  setWsConnected]  = useState(false)
+  const [isLive,       setIsLive]       = useState(false)
+  const [pointCount,   setPointCount]   = useState(0)
+  const [meshTriCount, setMeshTriCount] = useState(0)
 
   useEffect(() => {
     let retryTimer = null
@@ -320,6 +397,37 @@ export default function LidarPanel() {
     }
   }, [])
 
+  // Separate WS for the reconstruction mesh — 2 Hz updates, lazy attach.
+  useEffect(() => {
+    let retryTimer = null
+    let retryCount = 0
+    function connect() {
+      const ws = new WebSocket(`${WS_PROTO}://${HOST}/ws/mesh`)
+      meshWsRef.current = ws
+      ws.onmessage = (ev) => {
+        try {
+          const d = JSON.parse(ev.data)
+          meshRef.current = d
+          setMeshTriCount(d.n_tris ?? (d.triangles ? d.triangles.length : 0))
+        } catch (_) {}
+      }
+      ws.onerror = () => {}
+      ws.onclose = () => {
+        retryCount++
+        const delay = Math.min(1000 * Math.pow(2, retryCount), 10000)
+        retryTimer = setTimeout(connect, delay)
+      }
+    }
+    connect()
+    return () => {
+      clearTimeout(retryTimer)
+      if (meshWsRef.current) {
+        meshWsRef.current.onclose = null
+        meshWsRef.current.close()
+      }
+    }
+  }, [])
+
   const offline = !wsConnected
 
   // Dark-on-dark overlay chrome (LiDAR panel only — the rest of the
@@ -336,6 +444,7 @@ export default function LidarPanel() {
       >
         <Scene
           pointsRef={pointsRef}
+          meshRef={meshRef}
           zone={zone}
           preset={preset}
           sceneObjects={sceneObjects}
@@ -386,6 +495,15 @@ export default function LidarPanel() {
         }}>
           {pointCount.toLocaleString()} pts
         </div>
+        {meshTriCount > 0 && (
+          <div style={{
+            background: overlayBg, border: overlayBorder, color: '#9AA0AC',
+            borderRadius: 4, padding: '2px 8px', fontSize: 10, fontWeight: 500,
+            letterSpacing: '0.04em',
+          }}>
+            mesh {meshTriCount.toLocaleString()}△
+          </div>
+        )}
       </div>
 
       {/* Zone legend */}

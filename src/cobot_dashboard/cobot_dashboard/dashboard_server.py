@@ -72,6 +72,7 @@ STATE = {
     "detections": [],
     "scene_graph": {"objects": []},
     "grasp_poses": [],
+    "reconstruction": {"active": False, "voxels_occupied": 0, "mesh_triangles": 0},
     "gripper": {"state": "open", "position_mm": 85.0},
     "program": {
         "steps": [
@@ -97,9 +98,15 @@ _annotated_lock = threading.Lock()
 _lidar_state: dict = {"pts": [], "live": False}
 _lidar_lock = threading.Lock()
 
+# Latest reconstruction mesh (JSON, forwarded verbatim to /ws/mesh)
+_mesh_state: dict = {"payload": None, "n_tris": 0, "n_vertices": 0,
+                     "n_occupied": 0, "t": 0.0}
+_mesh_lock = threading.Lock()
+
 # WebSocket client queues
 _state_clients: dict = {}
 _lidar_clients: dict = {}
+_mesh_clients:  dict = {}
 _ws_lock = threading.Lock()
 
 # Program simulation state
@@ -193,7 +200,7 @@ def _sim_camera_frame(cam: int) -> bytes:
 # PointCloud2 helpers
 # ---------------------------------------------------------------------------
 
-def _parse_pointcloud2(msg, max_points: int = 4096) -> list:
+def _parse_pointcloud2(msg, max_points: int = 15000) -> list:
     fields = {f.name: f for f in msg.fields}
     if not all(k in fields for k in ("x", "y", "z")):
         return []
@@ -350,15 +357,22 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self.create_subscription(Image, "/cam1/cam1/color/image_raw",
                                  lambda m: self._on_camera(1, m), 2)
 
-        # LiDAR priority: accumulated > fused > raw. Lower-priority handlers
-        # bail out if a higher-priority source has produced data recently.
-        self._lidar_last = {"acc": 0.0, "fused": 0.0, "raw": 0.0}
+        # LiDAR priority: dense > accumulated > fused > raw. Lower-priority
+        # handlers bail out if any higher-priority source produced data in
+        # the last second.
+        self._lidar_last = {"dense": 0.0, "acc": 0.0, "fused": 0.0, "raw": 0.0}
+        self.create_subscription(PointCloud2, "/lidar/points_dense",
+                                 self._on_lidar_dense, 2)
         self.create_subscription(PointCloud2, "/lidar/points_accumulated",
                                  self._on_lidar_accum, 2)
         self.create_subscription(PointCloud2, "/perception/fused_cloud",
                                  self._on_lidar_fused, 2)
         self.create_subscription(PointCloud2, "/lidar/points",
                                  self._on_lidar_raw, 2)
+
+        # Local TSDF reconstruction mesh — JSON String from local_reconstruction.
+        self.create_subscription(String, "/reconstruction/mesh_json",
+                                 self._on_mesh_json, 2)
 
         self.get_logger().info("DashboardServer ready")
 
@@ -574,7 +588,17 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
     def _lidar_stale(self, key: str, max_age_s: float = 1.0) -> bool:
         return (time.time() - self._lidar_last[key]) > max_age_s
 
+    def _on_lidar_dense(self, msg):
+        pts = _parse_pointcloud2(msg, max_points=15000)
+        if pts:
+            self._lidar_last["dense"] = time.time()
+            with _lidar_lock:
+                _lidar_state["pts"]  = pts
+                _lidar_state["live"] = True
+
     def _on_lidar_accum(self, msg):
+        if not self._lidar_stale("dense"):
+            return
         pts = _parse_pointcloud2(msg, max_points=8192)
         if pts:
             self._lidar_last["acc"] = time.time()
@@ -583,7 +607,7 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 _lidar_state["live"] = True
 
     def _on_lidar_fused(self, msg):
-        if not self._lidar_stale("acc"):
+        if not (self._lidar_stale("dense") and self._lidar_stale("acc")):
             return
         pts = _parse_pointcloud2(msg)
         if pts:
@@ -593,7 +617,8 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 _lidar_state["live"] = True
 
     def _on_lidar_raw(self, msg):
-        if not (self._lidar_stale("acc") and self._lidar_stale("fused")):
+        if not (self._lidar_stale("dense") and self._lidar_stale("acc")
+                and self._lidar_stale("fused")):
             return
         pts = _parse_pointcloud2(msg)
         if pts:
@@ -601,6 +626,25 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             with _lidar_lock:
                 _lidar_state["pts"]  = pts
                 _lidar_state["live"] = True
+
+    def _on_mesh_json(self, msg):
+        """Cache the latest reconstruction mesh for /ws/mesh broadcasts."""
+        try:
+            payload = json.loads(msg.data)
+        except Exception:
+            return
+        with _mesh_lock:
+            _mesh_state["payload"]   = msg.data         # forward verbatim
+            _mesh_state["n_tris"]    = int(payload.get("n_tris", 0))
+            _mesh_state["n_vertices"] = int(payload.get("n_vertices", 0))
+            _mesh_state["n_occupied"] = int(payload.get("n_occupied", 0))
+            _mesh_state["t"]         = time.time()
+        with _state_lock:
+            STATE["reconstruction"] = {
+                "active":          True,
+                "voxels_occupied": _mesh_state["n_occupied"],
+                "mesh_triangles":  _mesh_state["n_tris"],
+            }
 
     # ---- Service helpers ----
 
@@ -653,13 +697,33 @@ if FASTAPI_AVAILABLE:
     async def _broadcast_loop():
         state_hz  = 25
         lidar_hz  = 15
+        mesh_hz   = 2
         state_dt  = 1.0 / state_hz
         lidar_dt  = 1.0 / lidar_hz
+        mesh_dt   = 1.0 / mesh_hz
         next_state = time.time()
         next_lidar = time.time()
+        next_mesh  = time.time()
+        _last_mesh_t = 0.0
 
         while True:
             now = time.time()
+
+            if now >= next_mesh:
+                with _mesh_lock:
+                    payload = _mesh_state["payload"]
+                    mesh_t  = _mesh_state["t"]
+                if payload and mesh_t > _last_mesh_t:
+                    _last_mesh_t = mesh_t
+                    with _ws_lock:
+                        clients = list(_mesh_clients.items())
+                    for ws, q in clients:
+                        if q.qsize() < 2:
+                            try:
+                                await q.put(payload)
+                            except Exception:
+                                pass
+                next_mesh = now + mesh_dt
 
             if now >= next_state:
                 with _state_lock:
@@ -732,6 +796,31 @@ if FASTAPI_AVAILABLE:
         finally:
             with _ws_lock:
                 _lidar_clients.pop(websocket, None)
+
+    @app.websocket("/ws/mesh")
+    async def ws_mesh(websocket: WebSocket):
+        await websocket.accept()
+        q: asyncio.Queue = asyncio.Queue(maxsize=2)
+        with _ws_lock:
+            _mesh_clients[websocket] = q
+        # Immediately push the latest cached mesh if we have one so the
+        # client doesn't have to wait for the next reconstruction tick.
+        with _mesh_lock:
+            cached = _mesh_state["payload"]
+        if cached:
+            try:
+                await websocket.send_text(cached)
+            except Exception:
+                pass
+        try:
+            while True:
+                txt = await q.get()
+                await websocket.send_text(txt)
+        except (WebSocketDisconnect, Exception):
+            pass
+        finally:
+            with _ws_lock:
+                _mesh_clients.pop(websocket, None)
 
     # ------------------------------------------------------------------
     # MJPEG camera streams
@@ -1002,20 +1091,26 @@ if FASTAPI_AVAILABLE:
     @app.get("/health")
     async def health():
         with _ws_lock:
-            ns = len(_state_clients)
-            nl = len(_lidar_clients)
+            ns  = len(_state_clients)
+            nl  = len(_lidar_clients)
+            nm  = len(_mesh_clients)
         with _cam_lock:
             have_cam0 = _cam_frames[0] is not None
             have_cam1 = _cam_frames[1] is not None
         with _lidar_lock:
             lidar_live = _lidar_state["live"]
             lidar_pts  = len(_lidar_state["pts"])
+        with _mesh_lock:
+            mesh_age = round(time.time() - _mesh_state["t"], 2) \
+                if _mesh_state["t"] > 0 else None
+            mesh_tris = _mesh_state["n_tris"]
         return {
             "status": "ok", "ros": RCLPY_AVAILABLE, "mock": False,
             "uptime_s": round(time.time() - _START_TIME, 1),
-            "clients_state": ns, "clients_lidar": nl,
+            "clients_state": ns, "clients_lidar": nl, "clients_mesh": nm,
             "cam0_live": have_cam0, "cam1_live": have_cam1,
             "lidar_live": lidar_live, "lidar_pts": lidar_pts,
+            "mesh_age_s": mesh_age, "mesh_tris": mesh_tris,
         }
 
     @app.get("/api/state")
