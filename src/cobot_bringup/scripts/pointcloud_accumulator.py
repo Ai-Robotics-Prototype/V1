@@ -95,7 +95,7 @@ class PointCloudAccumulator(Node):
         self.declare_parameter('input_topic',            '/lidar/points')
         self.declare_parameter('output_topic',           '/lidar/points_dense')
         self.declare_parameter('near_range_m',           1.0)
-        self.declare_parameter('near_accumulate_frames', 20)
+        self.declare_parameter('near_accumulate_frames', 50)
         self.declare_parameter('far_accumulate_frames',  5)
         self.declare_parameter('near_voxel_m',           0.005)
         self.declare_parameter('far_voxel_m',            0.03)

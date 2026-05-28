@@ -186,7 +186,7 @@ function DetectionMarkers({ detections }) {
 // vertices/triangles JSON, height-based vertex colours, semi-transparent
 // overlay on top of the raw point cloud. Uses the same axis convention
 // as the point cloud (z-up in LiDAR frame -> y-up in three.js).
-function ReconstructionMesh({ meshRef }) {
+function ReconstructionMesh({ meshRef, meshWireRef }) {
   const groupRef = useRef()
   useFrame(() => {
     const data = meshRef.current
@@ -252,9 +252,10 @@ function ReconstructionMesh({ meshRef }) {
         new THREE.MeshStandardMaterial({
           vertexColors: true,
           transparent: true,
-          opacity: 0.55,
+          opacity: 0.75,
           side: THREE.DoubleSide,
-          flatShading: true,
+          flatShading: false,
+          wireframe: meshWireRef.current === true,
         }),
       )
       groupRef.current.add(mesh)
@@ -321,7 +322,7 @@ function CameraController({ preset }) {
   return null
 }
 
-function Scene({ pointsRef, meshRef, zone, preset, sceneObjects, detections, grasps }) {
+function Scene({ pointsRef, meshRef, meshWireRef, zone, preset, sceneObjects, detections, grasps }) {
   return (
     <>
       <color attach="background" args={['#0A0A0B']} />
@@ -338,7 +339,7 @@ function Scene({ pointsRef, meshRef, zone, preset, sceneObjects, detections, gra
 
       <SafetyRings zone={zone} />
       <PointCloud pointsRef={pointsRef} />
-      <ReconstructionMesh meshRef={meshRef} />
+      <ReconstructionMesh meshRef={meshRef} meshWireRef={meshWireRef} />
       <ObjectMarkers objects={sceneObjects} />
       <DetectionMarkers detections={detections} />
       <GraspMarkers grasps={grasps} />
@@ -357,15 +358,18 @@ export default function LidarPanel() {
   const detections   = useStore((s) => s.lidar_objects)
   const grasps       = useStore((s) => s.grasp_poses)
 
-  const pointsRef = useRef([])
-  const meshRef   = useRef(null)
-  const wsRef     = useRef(null)
-  const meshWsRef = useRef(null)
+  const pointsRef   = useRef([])
+  const meshRef     = useRef(null)
+  const meshWireRef = useRef(false)
+  const wsRef       = useRef(null)
+  const meshWsRef   = useRef(null)
   const [preset,       setPreset]       = useState('3d')
+  const [wireframe,    setWireframe]    = useState(false)
   const [wsConnected,  setWsConnected]  = useState(false)
   const [isLive,       setIsLive]       = useState(false)
   const [pointCount,   setPointCount]   = useState(0)
   const [meshTriCount, setMeshTriCount] = useState(0)
+  useEffect(() => { meshWireRef.current = wireframe }, [wireframe])
 
   useEffect(() => {
     let retryTimer = null
@@ -458,6 +462,7 @@ export default function LidarPanel() {
         <Scene
           pointsRef={pointsRef}
           meshRef={meshRef}
+          meshWireRef={meshWireRef}
           zone={zone}
           preset={preset}
           sceneObjects={sceneObjects}
@@ -485,6 +490,18 @@ export default function LidarPanel() {
             {v}
           </button>
         ))}
+        <button
+          onClick={() => setWireframe((w) => !w)}
+          title="Toggle mesh wireframe"
+          style={{
+            background: wireframe ? 'rgba(255,255,255,0.10)' : 'transparent',
+            color: wireframe ? '#E6E8EE' : '#9AA0AC',
+            border: 'none', padding: '3px 10px', borderRadius: 4, fontSize: 12,
+            marginLeft: 4,
+          }}
+        >
+          Wire
+        </button>
       </div>
 
       {/* Live / Sim badge + point count */}
