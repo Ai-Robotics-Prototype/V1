@@ -107,22 +107,48 @@ function ObjectMarkers({ objects }) {
 
 // Real-time 3D detections from /perception/detections_3d (depth_segment_node).
 //
-// Detections are now published in livox_frame (ROS: X=forward, Y=left,
-// Z=up). PointCloud uses the mapping  three.x = lidar.x,
-// three.y = lidar.z, three.z = lidar.y  — we match it here so detection
-// markers and points coexist in the same world.
+// Detections are published in livox_frame (ROS: X=forward, Y=left, Z=up).
+// PointCloud uses the mapping  three.x = lidar.x, three.y = lidar.z,
+// three.z = lidar.y  — we match it here so markers and points share a
+// world. OBB orientations are also in livox_frame; we extract the yaw
+// component (rotation about lidar Z, which is three.js Y) and re-build a
+// three.js-Y rotation — the y/z swap from lidar to three.js is a
+// reflection, not a pure rotation, so the lidar quaternion can't be
+// reused verbatim.
 //
-// OBB orientations are also in livox_frame; for the yaw-only quaternions
-// we publish, the rotation is about lidar Z, which is three.js Y. We
-// extract the yaw component and re-build a three.js-Y rotation, which
-// avoids the parity issue of the y/z axis swap (it's a reflection, not
-// a pure rotation, so we can't reuse the lidar quaternion verbatim).
-function DetectionMarkers({ detections }) {
+// HEIGHT ANCHORING: the OBB centroid Z is the geometric centre of the
+// VISIBLE point cloud from the camera (the foreground mask excludes
+// table-plane pixels), so it tracks each object's individual centre
+// rather than a consistent surface. To make boxes sit on the actual
+// LiDAR surface regardless of OBB noise or partial occlusion, we ignore
+// the centroid's vertical component and instead find the median Z of
+// LiDAR points within `floor_radius_xy` of the box's (x, y). The box
+// bottom is anchored at that median.
+function DetectionMarkers({ detections, pointsRef }) {
   if (!detections || detections.length === 0) return null
   function bandColor(maxDim) {
     if (maxDim < 0.05) return '#16A34A'   // small (<5cm): green
     if (maxDim < 0.15) return '#1D6FD8'   // medium: blue
     return '#DC2626'                       // large (>=15cm): red
+  }
+  // Find the local floor under (x, y): median Z of LiDAR points within a
+  // small XY disc. Falls back to the detection's centroid Z (less the
+  // box half-height) so we still render something if no LiDAR coverage.
+  function localFloorZ(x, y, fallback) {
+    const points = pointsRef && pointsRef.current
+    if (!points || points.length === 0) return fallback
+    const R = 0.08
+    const R2 = R * R
+    const zs = []
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i]
+      const dx = p.x - x
+      const dy = p.y - y
+      if (dx * dx + dy * dy < R2) zs.push(p.z)
+    }
+    if (zs.length < 5) return fallback
+    zs.sort((a, b) => a - b)
+    return zs[zs.length >> 1]   // median
   }
   return (
     <>
@@ -130,27 +156,28 @@ function DetectionMarkers({ detections }) {
         if (det.bbox_px || det.x == null || det.y == null || det.z == null) return null
         if (Math.abs(det.x) > 10 || Math.abs(det.y) > 10 || Math.abs(det.z) > 10) return null
 
-        const W = Math.max(0.01, det.w ?? 0.05)  // longest XY in OBB local frame
-        const D = Math.max(0.01, det.h ?? 0.05)  // shorter XY ("h" in dashboard JSON)
-        const H = Math.max(0.01, det.d ?? 0.05)  // Z extent       ("d" in dashboard JSON)
+        const W = Math.max(0.01, det.w ?? 0.05)
+        const D = Math.max(0.01, det.h ?? 0.05)
+        const H = Math.max(0.01, det.d ?? 0.05)
         const color = bandColor(Math.max(W, D, H))
 
-        // Extract yaw from the lidar-frame quaternion (rotation about Z).
-        // For yaw-only quats (qx≈qy≈0): yaw = 2 * atan2(qz, qw). Use the
-        // general formula so residual roll/pitch noise doesn't break us.
         let yaw = 0
         if (det.quat && det.quat.length === 4) {
           const [qx, qy, qz, qw] = det.quat
           yaw = Math.atan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
         }
 
-        // boxGeometry args are (extent along three.X, .Y, .Z).
-        // OBB axes in lidar at identity: W along lidar.X (-> three.X),
-        // D along lidar.Y (-> three.Z), H along lidar.Z (-> three.Y).
+        // Anchor the box bottom to the local LiDAR floor under (x, y).
+        // three.js Y is lidar Z (up); box bottom at three.y = floor_z,
+        // so the group's centre y = floor_z + H/2.
+        const fallbackFloor = det.z - H / 2
+        const floor = localFloorZ(det.x, det.y, fallbackFloor)
+        const centerY = floor + H / 2
+
         return (
           <group
             key={det.id ?? i}
-            position={[det.x, det.z, det.y]}
+            position={[det.x, centerY, det.y]}
             rotation={[0, yaw, 0]}
           >
             <mesh>
@@ -330,7 +357,7 @@ function Scene({ pointsRef, meshRef, zone, preset, sceneObjects, detections, gra
       <PointCloud pointsRef={pointsRef} />
       <ReconstructionMesh meshRef={meshRef} />
       <ObjectMarkers objects={sceneObjects} />
-      <DetectionMarkers detections={detections} />
+      <DetectionMarkers detections={detections} pointsRef={pointsRef} />
       <GraspMarkers grasps={grasps} />
 
       <CameraController preset={preset} />
