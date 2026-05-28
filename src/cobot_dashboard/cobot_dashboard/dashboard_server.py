@@ -421,6 +421,7 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
 
     def _on_detections_3d(self, msg):
         """Parse Detection3DArray from detector_node into dashboard format."""
+        import math as _m
         dets = []
         for det in msg.detections:
             if not det.results:
@@ -429,10 +430,10 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             class_name = str(result.hypothesis.class_id)
             score = float(result.hypothesis.score)
             pos = det.bbox.center.position
+            ori = det.bbox.center.orientation
             size = det.bbox.size
-            # The active detector (_pil_callback) writes PIXEL coordinates into
-            # bbox.center; a depth-aware detector would write METRES. Heuristic:
-            # |x| or |y| > 10 → pixels (image space), else metric 3D.
+            # Pixel-coord legacy detections (|x|/|y| > 10) only carry 2D info.
+            # Metric detections carry full OBB (quaternion + 3D size).
             if abs(pos.x) > 10 or abs(pos.y) > 10:
                 dets.append({
                     "id":         str(id(det)),
@@ -449,15 +450,39 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                     "h":          round(size.y, 3),
                 })
             else:
+                # Quaternion (xyzw) -> ZYX intrinsic Tait-Bryan (roll/pitch/yaw).
+                qx, qy, qz, qw = ori.x, ori.y, ori.z, ori.w
+                # R[2,0] = 2(qx*qz - qw*qy);  R[2,1] = 2(qy*qz + qw*qx)
+                # R[2,2] = 1 - 2(qx*qx + qy*qy)
+                # R[1,0] = 2(qx*qy + qw*qz);  R[0,0] = 1 - 2(qy*qy + qz*qz)
+                r20 = 2.0 * (qx * qz - qw * qy)
+                r21 = 2.0 * (qy * qz + qw * qx)
+                r22 = 1.0 - 2.0 * (qx * qx + qy * qy)
+                r10 = 2.0 * (qx * qy + qw * qz)
+                r00 = 1.0 - 2.0 * (qy * qy + qz * qz)
+                pitch = _m.asin(max(-1.0, min(1.0, -r20)))
+                roll  = _m.atan2(r21, r22)
+                yaw   = _m.atan2(r10, r00)
+                roll_deg, pitch_deg, yaw_deg = (
+                    _m.degrees(roll), _m.degrees(pitch), _m.degrees(yaw)
+                )
                 dets.append({
                     "id":         str(id(det)),
                     "class_name": class_name,
                     "score":      round(score, 3),
-                    "x":          round(pos.x, 3),
-                    "y":          round(pos.y, 3),
-                    "z":          round(pos.z, 3),
-                    "w":          round(size.x, 3),
-                    "h":          round(size.y, 3),
+                    "x":          round(pos.x, 4),
+                    "y":          round(pos.y, 4),
+                    "z":          round(pos.z, 4),
+                    "w":          round(size.x, 4),
+                    "h":          round(size.y, 4),
+                    "d":          round(size.z, 4),
+                    "roll":       round(roll_deg, 1),
+                    "pitch":      round(pitch_deg, 1),
+                    "yaw":        round(yaw_deg, 1),
+                    "quat":       [round(qx, 4), round(qy, 4),
+                                   round(qz, 4), round(qw, 4)],
+                    "size_3d":    [round(size.x, 4), round(size.y, 4),
+                                   round(size.z, 4)],
                 })
         with _state_lock:
             STATE["detections"] = dets

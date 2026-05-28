@@ -26,6 +26,7 @@ Publishes (topics are parameters; one instance per camera):
 Dependencies: numpy, scipy, PIL only. No cv2, no torch, no ultralytics.
 """
 import collections
+import math
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -33,7 +34,12 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, CameraInfo
 from vision_msgs.msg import Detection3DArray, Detection3D, ObjectHypothesisWithPose
 from scipy import ndimage
+from scipy.spatial.transform import Rotation as _SR
 from PIL import Image as PILImage, ImageDraw
+
+# 12 edges of a unit cube, as pairs of corner indices (binary xyz).
+_CUBE_EDGES = ((0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
+               (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7))
 
 
 class DepthSegmentNode(Node):
@@ -243,6 +249,88 @@ class DepthSegmentNode(Node):
                 i += 1
         return [tuple(b) for b in boxes]
 
+    # ── OBB extraction ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _deproject_mask(depth, mask, fx, fy, cx, cy):
+        """Vectorised deprojection of every masked pixel with valid depth.
+
+        depth and mask have the same HxW shape (already cropped to a bbox).
+        Returns Nx3 float32 of (X, Y, Z) in the camera frame; empty if none.
+        """
+        valid = mask & np.isfinite(depth) & (depth > 0.0)
+        ys, xs = np.nonzero(valid)
+        if ys.size == 0:
+            return np.empty((0, 3), dtype=np.float32)
+        z = depth[ys, xs].astype(np.float32)
+        x = (xs.astype(np.float32) - cx) * z / fx
+        y = (ys.astype(np.float32) - cy) * z / fy
+        return np.stack([x, y, z], axis=1)
+
+    @staticmethod
+    def _fit_obb(points: np.ndarray):
+        """PCA-based oriented bbox from an Nx3 point cloud.
+
+        Returns (centroid[3], size[3], R[3,3]) where R's columns are the
+        principal axes sorted by descending eigenvalue (R[:,0] is the
+        longest extent's direction). R is right-handed (det=+1).
+        """
+        centroid = points.mean(axis=0)
+        centred = points - centroid
+        # np.cov wants observations along columns
+        cov = np.cov(centred.T)
+        # eigh returns ascending eigenvalues for symmetric input
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        order = np.argsort(eigvals)[::-1]
+        eigvecs = eigvecs[:, order]
+        # Ensure right-handed: if det<0, flip the last column.
+        if np.linalg.det(eigvecs) < 0:
+            eigvecs[:, 2] *= -1
+        # Project points onto the principal axes; extent is max-min along each.
+        projected = centred @ eigvecs
+        mn = projected.min(axis=0)
+        mx = projected.max(axis=0)
+        size = (mx - mn).astype(np.float32)
+        # Recentre to the true geometric centre of the projected cloud.
+        offset = (mx + mn) * 0.5
+        centroid = centroid + eigvecs @ offset
+        return centroid.astype(np.float32), size, eigvecs.astype(np.float32)
+
+    @staticmethod
+    def _rmat_to_quat_euler(R: np.ndarray):
+        """Convert 3x3 rotation matrix to (quat_xyzw, (roll, pitch, yaw)) in radians.
+
+        Euler convention matches the task spec: ZYX intrinsic / XYZ extrinsic.
+            pitch = asin(-R[2,0])
+            roll  = atan2(R[2,1], R[2,2])
+            yaw   = atan2(R[1,0], R[0,0])
+        """
+        quat = _SR.from_matrix(R).as_quat()  # xyzw
+        # Clamp to avoid NaN from numerical drift outside [-1, 1]
+        sin_pitch = max(-1.0, min(1.0, float(-R[2, 0])))
+        pitch = math.asin(sin_pitch)
+        # If pitch is near ±π/2 the other two angles couple; fall back to yaw=0.
+        if abs(abs(pitch) - math.pi / 2) < 1e-3:
+            roll = math.atan2(-R[1, 2], R[1, 1])
+            yaw = 0.0
+        else:
+            roll = math.atan2(float(R[2, 1]), float(R[2, 2]))
+            yaw  = math.atan2(float(R[1, 0]), float(R[0, 0]))
+        return quat.astype(np.float32), (roll, pitch, yaw)
+
+    @staticmethod
+    def _obb_corners(centroid: np.ndarray, size: np.ndarray, R: np.ndarray):
+        """Return the 8 corners (8x3) of the OBB defined by (centroid, size, R)."""
+        h = size * 0.5
+        signs = np.array([(sx, sy, sz)
+                          for sx in (-1.0, 1.0)
+                          for sy in (-1.0, 1.0)
+                          for sz in (-1.0, 1.0)], dtype=np.float32)
+        # local-frame corners → world-frame: c + R @ (sign * h)
+        local = signs * h
+        world = local @ R.T + centroid
+        return world
+
     def _temporal_filter(self):
         """Keep objects present in >=2 of the last 3 frames (flicker + dropout)."""
         frames = list(self._history)
@@ -333,24 +421,68 @@ class DepthSegmentNode(Node):
         # Coalesce fragments of the same object (overlap OR near-touching edges)
         bboxes = self._merge_nearby(bboxes)
 
-        # Build per-object detections (tight bbox + pad, median depth, 3D)
+        # Build per-object detections (tight bbox + pad, 3D OBB via PCA)
         objects = []
         for (x0, y0, x1, y1) in bboxes:
             x0 = max(0, x0 - self.pad); y0 = max(0, y0 - self.pad)
             x1 = min(w, x1 + self.pad); y1 = min(h, y1 + self.pad)
             sub_d = depth[y0:y1, x0:x1]
             sub_fg = foreground[y0:y1, x0:x1]
-            rd = sub_d[sub_fg & (sub_d > 0) & np.isfinite(sub_d)]
-            if rd.size == 0:
+
+            # Vectorised deprojection of every foreground pixel in the bbox
+            # whose depth is valid. Indices are local to the bbox, so we
+            # offset cx/cy by (x0, y0) to keep coordinates in the full image.
+            pts3d = self._deproject_mask(
+                sub_d, sub_fg.astype(bool), fx, fy, cx - x0, cy - y0,
+            )
+            # Cheap fallback for nearly-empty masks: use any valid depth
+            # in the bbox so we still emit a 2D detection.
+            if pts3d.shape[0] < 5:
                 rd = sub_d[(sub_d > 0) & np.isfinite(sub_d)]
-            if rd.size == 0:
+                if rd.size == 0:
+                    continue
+                zc = float(np.median(rd))
+                ucen, vcen = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+                objects.append({
+                    'bbox_px':  (int(x0), int(y0), int(x1), int(y1)),
+                    'pos':      (float((ucen - cx) * zc / fx),
+                                 float((vcen - cy) * zc / fy), zc),
+                    'size_3d':  (float((x1 - x0) * zc / fx),
+                                 float((y1 - y0) * zc / fy), 0.05),
+                    'quat':     (0.0, 0.0, 0.0, 1.0),
+                    'euler':    (0.0, 0.0, 0.0),
+                    'corners':  None,
+                    'obb':      False,
+                })
                 continue
-            zc = float(np.median(rd))
-            ucen, vcen = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+
+            # Fewer than 20 points => OBB will be noisy; degrade to an
+            # axis-aligned bbox derived from the same point set.
+            if pts3d.shape[0] < 20:
+                centroid = pts3d.mean(axis=0)
+                extents = pts3d.max(axis=0) - pts3d.min(axis=0)
+                objects.append({
+                    'bbox_px':  (int(x0), int(y0), int(x1), int(y1)),
+                    'pos':      tuple(float(v) for v in centroid),
+                    'size_3d':  tuple(float(v) for v in extents.clip(0.01, None)),
+                    'quat':     (0.0, 0.0, 0.0, 1.0),
+                    'euler':    (0.0, 0.0, 0.0),
+                    'corners':  None,
+                    'obb':      False,
+                })
+                continue
+
+            centroid, size_3d, R = self._fit_obb(pts3d)
+            quat, euler = self._rmat_to_quat_euler(R)
+            corners = self._obb_corners(centroid, size_3d, R)
             objects.append({
-                'bbox_px': (int(x0), int(y0), int(x1), int(y1)),
-                'pos': (float((ucen - cx) * zc / fx), float((vcen - cy) * zc / fy), zc),
-                'size_m': ((x1 - x0) * zc / fx, (y1 - y0) * zc / fy),
+                'bbox_px':  (int(x0), int(y0), int(x1), int(y1)),
+                'pos':      (float(centroid[0]), float(centroid[1]), float(centroid[2])),
+                'size_3d':  (float(size_3d[0]), float(size_3d[1]), float(size_3d[2])),
+                'quat':     tuple(float(q) for q in quat),
+                'euler':    euler,
+                'corners':  corners,
+                'obb':      True,
             })
 
         self._history.append(objects)
@@ -379,16 +511,26 @@ class DepthSegmentNode(Node):
             hyp.hypothesis.class_id = 'object'
             hyp.hypothesis.score = 1.0
             px, py, pz = o['pos']
+            qx, qy, qz, qw = o['quat']
+            sx, sy, sz = o['size_3d']
             hyp.pose.pose.position.x = px
             hyp.pose.pose.position.y = py
             hyp.pose.pose.position.z = pz
+            hyp.pose.pose.orientation.x = qx
+            hyp.pose.pose.orientation.y = qy
+            hyp.pose.pose.orientation.z = qz
+            hyp.pose.pose.orientation.w = qw
             det.results.append(hyp)
-            det.bbox.center.position.x = px
-            det.bbox.center.position.y = py
-            det.bbox.center.position.z = pz
-            det.bbox.size.x = float(o['size_m'][0])
-            det.bbox.size.y = float(o['size_m'][1])
-            det.bbox.size.z = 0.05
+            det.bbox.center.position.x    = px
+            det.bbox.center.position.y    = py
+            det.bbox.center.position.z    = pz
+            det.bbox.center.orientation.x = qx
+            det.bbox.center.orientation.y = qy
+            det.bbox.center.orientation.z = qz
+            det.bbox.center.orientation.w = qw
+            det.bbox.size.x = float(sx)
+            det.bbox.size.y = float(sy)
+            det.bbox.size.z = float(sz)
             arr.detections.append(det)
         self.det_pub.publish(arr)
         self._publish_annotated(objects, h, w)
@@ -396,6 +538,25 @@ class DepthSegmentNode(Node):
     @staticmethod
     def _dist_color(z):
         return (0, 255, 0)  # consistent green (#00FF00) for every box + label
+
+    def _project(self, pts3d: np.ndarray, w: int, h: int):
+        """Project Nx3 camera-frame points to (u, v) pixels. Returns Nx2."""
+        if self._K is None or pts3d.size == 0:
+            return None
+        fx, fy, cx, cy = self._K
+        z = pts3d[:, 2]
+        # Behind-camera points produce huge garbage; clamp to a small +ve depth.
+        z_safe = np.where(z > 0.01, z, 0.01)
+        u = fx * pts3d[:, 0] / z_safe + cx
+        v = fy * pts3d[:, 1] / z_safe + cy
+        return np.stack([u, v], axis=1)
+
+    def _draw_obb_wireframe(self, draw, corners_2d, color):
+        for a, b in _CUBE_EDGES:
+            u0, v0 = corners_2d[a]
+            u1, v1 = corners_2d[b]
+            draw.line([(float(u0), float(v0)), (float(u1), float(v1))],
+                      fill=color, width=2)
 
     def _publish_annotated(self, objects, h, w):
         rgb = self._color_rgb
@@ -405,12 +566,31 @@ class DepthSegmentNode(Node):
         draw = ImageDraw.Draw(img)
         for o in objects:
             x0, y0, x1, y1 = o['bbox_px']
-            z = o['pos'][2]
-            col = self._dist_color(z)
+            px, py, pz = o['pos']
+            sx, sy, sz = o['size_3d']
+            roll, pitch, yaw = o['euler']
+            col = self._dist_color(pz)
+
+            # 2D bbox in green
             draw.rectangle([x0, y0, x1, y1], outline=col, width=2)
-            label = f'{z:.2f}m'
-            draw.rectangle([x0, max(0, y0 - 13), x0 + len(label) * 6 + 6, y0], fill=col)
+
+            # Cyan OBB wireframe (projected from the 8 3D corners).
+            if o.get('obb') and o.get('corners') is not None:
+                proj = self._project(o['corners'], w, h)
+                if proj is not None:
+                    self._draw_obb_wireframe(draw, proj, (0, 220, 255))
+
+            # Tilt: report the dominant deviation from camera-axis-aligned in
+            # degrees. abs() of the largest euler component.
+            tilt_deg = max(abs(roll), abs(pitch), abs(yaw)) * 180.0 / math.pi
+            # Size in cm (rounded) — small objects in mm-ish range get sane labels.
+            scm = (int(round(sx * 100)), int(round(sy * 100)), int(round(sz * 100)))
+
+            label = f'{pz:.2f}m  tilt {tilt_deg:.0f}°  {scm[0]}x{scm[1]}x{scm[2]}cm'
+            tw = len(label) * 6 + 6
+            draw.rectangle([x0, max(0, y0 - 13), x0 + tw, y0], fill=col)
             draw.text((x0 + 2, max(0, y0 - 12)), label, fill=(255, 255, 255))
+
         msg = Image()
         msg.header.stamp = self._depth_hdr.stamp if self._depth_hdr else self.get_clock().now().to_msg()
         msg.header.frame_id = self.frame_id
