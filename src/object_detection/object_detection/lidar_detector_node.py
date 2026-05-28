@@ -64,12 +64,15 @@ def _decode_xyz(msg: PointCloud2) -> np.ndarray:
 
 # ── RANSAC plane fit ────────────────────────────────────────────────────
 
-def _ransac_plane(points: np.ndarray, iterations: int, threshold: float):
-    """Fit a plane via RANSAC; returns (normal[3], d, inlier_mask).
+def _ransac_plane(points: np.ndarray, iterations: int, threshold: float,
+                  min_normal_z: float = 0.8):
+    """Fit a HORIZONTAL plane via RANSAC; returns (normal[3], d, inlier_mask).
 
-    Plane equation: normal · p + d = 0. After the inlier-refit step the
-    normal is forced to point along +Z (since "up" in livox_frame is +Z
-    and we want the half-space ABOVE the table to be positive)."""
+    Plane equation: normal · p + d = 0. Iterations where the candidate
+    plane's normal isn't mostly vertical (|normal.z| < min_normal_z) are
+    rejected — without this constraint, the dominant surface in a room
+    is often a wall, and the table objects get swallowed by "above-plane"
+    classification. 0.8 allows ~36° tilt but rejects walls."""
     n = points.shape[0]
     if n < 3:
         return None
@@ -86,6 +89,9 @@ def _ransac_plane(points: np.ndarray, iterations: int, threshold: float):
         if nl < 1e-8:
             continue
         normal = normal / nl
+        # Horizontal-plane constraint: skip walls / vertical surfaces.
+        if abs(float(normal[2])) < min_normal_z:
+            continue
         d = -float(np.dot(normal, p1))
         dists = np.abs(points @ normal + d)
         inliers = dists < threshold
@@ -163,6 +169,7 @@ class LidarDetector(Node):
         self.declare_parameter('voxel_size_m',               0.01)
         self.declare_parameter('max_detection_height_m',     0.5)
         self.declare_parameter('max_range_m',                1.5)
+        self.declare_parameter('min_plane_normal_z',         0.8)
         self.declare_parameter('publish_hz',                 5.0)
         self.declare_parameter('frame_id',                   'livox_frame')
 
@@ -175,6 +182,7 @@ class LidarDetector(Node):
         self.voxel        = float(self.get_parameter('voxel_size_m').value)
         self.max_height   = float(self.get_parameter('max_detection_height_m').value)
         self.max_range    = float(self.get_parameter('max_range_m').value)
+        self.min_normal_z = float(self.get_parameter('min_plane_normal_z').value)
         self.frame_id     = str(self.get_parameter('frame_id').value)
         rate              = float(self.get_parameter('publish_hz').value)
 
@@ -224,7 +232,8 @@ class LidarDetector(Node):
             ransac_pts = pts[sub]
         else:
             ransac_pts = pts
-        plane = _ransac_plane(ransac_pts, self.ransac_iters, self.plane_thresh)
+        plane = _ransac_plane(ransac_pts, self.ransac_iters, self.plane_thresh,
+                               min_normal_z=self.min_normal_z)
         if plane is None:
             self._publish_empty(stamp)
             return

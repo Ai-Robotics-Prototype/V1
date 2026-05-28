@@ -352,7 +352,9 @@ function Scene({ pointsRef, meshRef, zone, preset, sceneObjects, detections, gra
 export default function LidarPanel() {
   const zone         = useStore((s) => s.safety.zone)
   const sceneObjects = useStore((s) => s.scene_graph.objects)
-  const detections   = useStore((s) => s.detections)
+  // LiDAR-derived 3D objects only. Camera detections (s.detections)
+  // stay on the camera feeds, never in the 3D view.
+  const detections   = useStore((s) => s.lidar_objects)
   const grasps       = useStore((s) => s.grasp_poses)
 
   const pointsRef = useRef([])

@@ -70,6 +70,7 @@ STATE = {
         "paused": False,
     },
     "detections": [],
+    "lidar_objects": [],
     "scene_graph": {"objects": []},
     "grasp_poses": [],
     "reconstruction": {"active": False, "voxels_occupied": 0, "mesh_triangles": 0},
@@ -329,18 +330,22 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self.create_subscription(String,    "/perception/scene_graph",   self._on_scene_graph,    10)
         # String fallback — scene_graph_node may republish detections as JSON
         self.create_subscription(String,    "/perception/detections",    self._on_detections_str, 10)
-        # Detection sources: LiDAR-primary is preferred when available
-        # (object centroids are ground truth in livox_frame); camera-based
-        # detections are kept as a fallback for when the LiDAR detector
-        # hasn't produced data recently.
+        # Detection sources are now SEPARATE:
+        #   STATE["lidar_objects"]  <- /perception/lidar_detections    (3D view)
+        #   STATE["detections"]     <- /perception/detections_3d       (camera feeds)
+        # Camera detections used to bleed into the 3D view; transforming them
+        # from cam frame to lidar frame was never accurate enough. The 3D
+        # view now reads lidar_objects exclusively — those are extracted
+        # FROM the same cloud being displayed, so they align by construction.
         try:
             from vision_msgs.msg import Detection3DArray
-            self._det_source_last = {"lidar": 0.0, "cam": 0.0}
             self.create_subscription(Detection3DArray, "/perception/lidar_detections",
                                      self._on_detections_lidar, 5)
             self.create_subscription(Detection3DArray, "/perception/detections_3d",
                                      self._on_detections_3d, 5)
-            self.get_logger().info("Detection3DArray subscriptions ready (lidar > cam)")
+            self.get_logger().info(
+                "Detection3DArray subs ready: lidar->STATE.lidar_objects, "
+                "cam->STATE.detections (3D view reads lidar_objects only)")
         except ImportError:
             self.get_logger().warn("vision_msgs not available — detection3d subscription skipped")
         self.create_subscription(JointState, "/joint_states",            self._on_joint_states,   10)
@@ -445,19 +450,48 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             pass
 
     def _on_detections_lidar(self, msg):
-        """LiDAR-primary detection source (preferred)."""
-        self._det_source_last["lidar"] = time.time()
-        self._publish_detections(msg)
+        """LiDAR detector — populates STATE['lidar_objects'] for the 3D view.
+
+        Positions are already in livox_frame (same frame as the point
+        cloud the dashboard renders), so no transform is involved. The
+        publisher arranges bbox.center.z and bbox.size.z so that
+        center.z - size.z/2 = cluster min_z, i.e. the box bottom sits
+        on the lowest physical point of the cluster.
+        """
+        out = []
+        for det in msg.detections:
+            if not det.results:
+                continue
+            res = det.results[0]
+            p = det.bbox.center.position
+            s = det.bbox.size
+            ori = det.bbox.center.orientation
+            out.append({
+                "id":         str(id(det)),
+                "class_name": str(res.hypothesis.class_id),
+                "score":      round(float(res.hypothesis.score), 3),
+                "x":          round(float(p.x), 4),
+                "y":          round(float(p.y), 4),
+                "z":          round(float(p.z), 4),
+                # Box bottom/top derived from the publisher's convention.
+                "min_z":      round(float(p.z) - float(s.z) / 2.0, 4),
+                "max_z":      round(float(p.z) + float(s.z) / 2.0, 4),
+                "w":          round(float(s.x), 4),
+                "h":          round(float(s.y), 4),
+                "d":          round(float(s.z), 4),
+                "quat":       [round(float(ori.x), 4), round(float(ori.y), 4),
+                               round(float(ori.z), 4), round(float(ori.w), 4)],
+            })
+        with _state_lock:
+            STATE["lidar_objects"] = out
 
     def _on_detections_3d(self, msg):
-        """Camera-based detector — only used when lidar is stale (>1 s)."""
-        if (time.time() - self._det_source_last.get("lidar", 0.0)) < 1.0:
-            return
-        self._det_source_last["cam"] = time.time()
+        """Camera-based detector — stays in STATE['detections'] for the
+        camera-feed overlays. NOT used by the 3D LiDAR view."""
         self._publish_detections(msg)
 
     def _publish_detections(self, msg):
-        """Parse Detection3DArray into the dashboard's STATE format."""
+        """Parse Detection3DArray into STATE['detections'] (camera path)."""
         import math as _m
         dets = []
         for det in msg.detections:
