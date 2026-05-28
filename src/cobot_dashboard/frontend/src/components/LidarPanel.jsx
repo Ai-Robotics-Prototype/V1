@@ -7,12 +7,12 @@ import { useStore } from '../store/useStore'
 const HOST     = typeof window !== 'undefined' ? window.location.host : 'localhost:8080'
 const WS_PROTO = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws'
 
-// Height-based ramp tuned for legibility on the light theme background.
+// Height-based ramp tuned for legibility on the dark panel background.
 function heightColor(z) {
-  if (z < 0.1) return new THREE.Color(0.05, 0.20, 0.55)  // navy — floor
-  if (z < 0.5) return new THREE.Color(0.05, 0.50, 0.45)  // teal
-  if (z < 1.0) return new THREE.Color(0.80, 0.55, 0.05)  // amber
-  return         new THREE.Color(0.78, 0.15, 0.10)         // red — high
+  if (z < 0.1) return new THREE.Color(0.15, 0.35, 0.85)  // blue — floor
+  if (z < 0.5) return new THREE.Color(0.15, 0.75, 0.50)  // teal
+  if (z < 1.0) return new THREE.Color(0.85, 0.75, 0.10)  // yellow
+  return         new THREE.Color(0.85, 0.25, 0.15)         // orange/red — high
 }
 
 function PointCloud({ pointsRef }) {
@@ -240,11 +240,11 @@ function CameraController({ preset }) {
 function Scene({ pointsRef, zone, preset, sceneObjects, detections, grasps }) {
   return (
     <>
-      <color attach="background" args={['#F0F2F5']} />
-      <ambientLight intensity={0.7} />
-      <directionalLight position={[3, 5, 3]} intensity={0.5} />
+      <color attach="background" args={['#0A0A0B']} />
+      <ambientLight intensity={0.4} />
+      <directionalLight position={[3, 5, 3]} intensity={0.6} />
 
-      <gridHelper args={[6, 12, '#9CA3AF', '#D0D4DC']} position={[0, 0, 0]} />
+      <gridHelper args={[6, 12, '#1e2030', '#1e2030']} position={[0, 0, 0]} />
 
       {/* Robot footprint marker */}
       <mesh position={[0, 0.025, 0]}>
@@ -322,13 +322,14 @@ export default function LidarPanel() {
 
   const offline = !wsConnected
 
-  // Light-theme inline styles for the overlay chrome
-  const overlayBg = 'rgba(255,255,255,0.92)'
-  const overlayBorder = '1px solid var(--border)'
-  const overlayText = 'var(--text-primary)'
+  // Dark-on-dark overlay chrome (LiDAR panel only — the rest of the
+  // dashboard stays on the light theme).
+  const overlayBg = 'rgba(14,14,18,0.85)'
+  const overlayBorder = '1px solid rgba(255,255,255,0.12)'
+  const overlayText = '#E6E8EE'
 
   return (
-    <div style={{ position: 'relative', width: '100%', height: '100%', background: 'var(--bg-app)' }}>
+    <div style={{ position: 'relative', width: '100%', height: '100%', background: '#0A0A0B' }}>
       <Canvas
         camera={{ position: [3, 4, 5], fov: 50 }}
         gl={{ antialias: true, powerPreference: 'high-performance' }}
@@ -354,8 +355,8 @@ export default function LidarPanel() {
             key={v}
             onClick={() => setPreset(v.toLowerCase())}
             style={{
-              background: preset === v.toLowerCase() ? 'var(--bg-hover)' : 'transparent',
-              color: preset === v.toLowerCase() ? 'var(--text-primary)' : 'var(--text-secondary)',
+              background: preset === v.toLowerCase() ? 'rgba(255,255,255,0.10)' : 'transparent',
+              color: preset === v.toLowerCase() ? '#E6E8EE' : '#9AA0AC',
               border: 'none', padding: '3px 10px', borderRadius: 4, fontSize: 12,
             }}
           >
@@ -379,7 +380,7 @@ export default function LidarPanel() {
           {isLive ? '● LIVE' : '◌ SIM'}
         </div>
         <div style={{
-          background: overlayBg, border: overlayBorder, color: 'var(--text-secondary)',
+          background: overlayBg, border: overlayBorder, color: '#9AA0AC',
           borderRadius: 4, padding: '2px 8px', fontSize: 10, fontWeight: 500,
           letterSpacing: '0.04em',
         }}>
@@ -409,12 +410,12 @@ export default function LidarPanel() {
         <div style={{
           position: 'absolute', inset: 0,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
-          pointerEvents: 'none', background: 'rgba(240,242,245,0.6)',
+          pointerEvents: 'none', background: 'rgba(0,0,0,0.45)',
         }}>
           <div style={{
             background: overlayBg, border: overlayBorder, borderRadius: 8,
-            padding: '10px 18px', fontSize: 13, color: 'var(--text-muted)',
-            boxShadow: 'var(--shadow-md)',
+            padding: '10px 18px', fontSize: 13, color: '#9AA0AC',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
           }}>
             LiDAR offline — reconnecting…
           </div>
