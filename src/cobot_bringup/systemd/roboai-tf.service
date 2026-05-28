@@ -1,0 +1,15 @@
+[Unit]
+Description=RoboAi Sensor TF Publisher (livox_frame -> cameras)
+After=network.target
+Before=roboai-depth-segment.service
+
+[Service]
+Type=simple
+User=teddy
+WorkingDirectory=/home/teddy/cobot_ws
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && python3 /home/teddy/cobot_ws/src/cobot_bringup/scripts/sensor_tf_publisher.py'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

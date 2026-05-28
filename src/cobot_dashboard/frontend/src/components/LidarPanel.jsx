@@ -107,17 +107,18 @@ function ObjectMarkers({ objects }) {
 
 // Real-time 3D detections from /perception/detections_3d (depth_segment_node).
 //
-// The camera frame is X=right, Y=down, Z=forward. The LiDAR panel's
-// world is X=right, Y=up, Z=back. We map camera (X, Y, Z) → world
-// (X, -Y, Z) so an object in front of the camera ends up in front of
-// the floor cylinder marker (and a Y-down camera object is Y-up here).
+// Detections are now published in livox_frame (ROS: X=forward, Y=left,
+// Z=up). PointCloud uses the mapping  three.x = lidar.x,
+// three.y = lidar.z, three.z = lidar.y  — we match it here so detection
+// markers and points coexist in the same world.
 //
-// The OBB quaternion lives in camera frame; converting it to the panel's
-// frame is the same 180° rotation about the X axis. Pre-multiplying by
-// qFix = (1, 0, 0, 0) (xyzw) does that.
+// OBB orientations are also in livox_frame; for the yaw-only quaternions
+// we publish, the rotation is about lidar Z, which is three.js Y. We
+// extract the yaw component and re-build a three.js-Y rotation, which
+// avoids the parity issue of the y/z axis swap (it's a reflection, not
+// a pure rotation, so we can't reuse the lidar quaternion verbatim).
 function DetectionMarkers({ detections }) {
   if (!detections || detections.length === 0) return null
-  // Size-band colours (object scale, longest dimension).
   function bandColor(maxDim) {
     if (maxDim < 0.05) return '#16A34A'   // small (<5cm): green
     if (maxDim < 0.15) return '#1D6FD8'   // medium: blue
@@ -128,44 +129,36 @@ function DetectionMarkers({ detections }) {
       {detections.map((det, i) => {
         if (det.bbox_px || det.x == null || det.y == null || det.z == null) return null
         if (Math.abs(det.x) > 10 || Math.abs(det.y) > 10 || Math.abs(det.z) > 10) return null
-        if (det.z <= 0) return null
 
-        const sx = Math.max(0.01, det.w ?? 0.05)
-        const sy = Math.max(0.01, det.h ?? 0.05)
-        const sz = Math.max(0.01, det.d ?? 0.05)
-        const color = bandColor(Math.max(sx, sy, sz))
+        const W = Math.max(0.01, det.w ?? 0.05)  // longest XY in OBB local frame
+        const D = Math.max(0.01, det.h ?? 0.05)  // shorter XY ("h" in dashboard JSON)
+        const H = Math.max(0.01, det.d ?? 0.05)  // Z extent       ("d" in dashboard JSON)
+        const color = bandColor(Math.max(W, D, H))
 
-        // Compose (180° rotation about X) ∘ (OBB orientation in camera frame).
-        // Quaternion product (xyzw):  q1 * q2 with q1 = qFix.
-        let qx, qy, qz, qw
+        // Extract yaw from the lidar-frame quaternion (rotation about Z).
+        // For yaw-only quats (qx≈qy≈0): yaw = 2 * atan2(qz, qw). Use the
+        // general formula so residual roll/pitch noise doesn't break us.
+        let yaw = 0
         if (det.quat && det.quat.length === 4) {
-          const [ox, oy, oz, ow] = det.quat
-          // qFix = (1, 0, 0, 0); product simplifies:
-          //   x' =  qw_fix*x  + qx_fix*w + qy_fix*z - qz_fix*y
-          //      =  1*ox + 1*ow + 0 - 0
-          // Stay with the explicit formula for clarity:
-          const fx = 1, fy = 0, fz = 0, fw = 0
-          qx =  fw*ox + fx*ow + fy*oz - fz*oy
-          qy =  fw*oy - fx*oz + fy*ow + fz*ox
-          qz =  fw*oz + fx*oy - fy*ox + fz*ow
-          qw =  fw*ow - fx*ox - fy*oy - fz*oz
-        } else {
-          qx = 0; qy = 0; qz = 0; qw = 1
+          const [qx, qy, qz, qw] = det.quat
+          yaw = Math.atan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
         }
 
-        // OBB local size order from the publisher: x=longest, y=next, z=smallest.
+        // boxGeometry args are (extent along three.X, .Y, .Z).
+        // OBB axes in lidar at identity: W along lidar.X (-> three.X),
+        // D along lidar.Y (-> three.Z), H along lidar.Z (-> three.Y).
         return (
           <group
             key={det.id ?? i}
-            position={[det.x, -det.y, det.z]}
-            quaternion={[qx, qy, qz, qw]}
+            position={[det.x, det.z, det.y]}
+            rotation={[0, yaw, 0]}
           >
             <mesh>
-              <boxGeometry args={[sx, sy, sz]} />
+              <boxGeometry args={[W, H, D]} />
               <meshStandardMaterial color={color} transparent opacity={0.35} />
             </mesh>
             <lineSegments>
-              <edgesGeometry args={[new THREE.BoxGeometry(sx, sy, sz)]} />
+              <edgesGeometry args={[new THREE.BoxGeometry(W, H, D)]} />
               <lineBasicMaterial color={color} linewidth={2} />
             </lineSegments>
           </group>
@@ -262,13 +255,12 @@ function GraspMarkers({ grasps }) {
         const lowConf = (g.confidence ?? 1) < 0.7
         const color = lowConf ? '#CA8A04' : '#16A34A'
 
-        // Camera-optical (x right, y down, z forward) -> panel world
-        // (x right, y up, z back). Same convention as DetectionMarkers.
+        // Grasp positions live in livox_frame now (forwarded from
+        // depth_segment_node via grasp_planner). Map to the same three.js
+        // convention the PointCloud uses.
         const px = g.x
-        const py = -g.y
-        const pz = g.z
-        // Approach is the camera "above" direction (-z in optical), which
-        // maps to -z in the panel world too. Arrow drops onto the object.
+        const py = g.z       // lidar Z (up) -> three.js Y (up)
+        const pz = g.y       // lidar Y (left) -> three.js Z (back)
         return (
           <group key={g.object_id ?? i} position={[px, py, pz]} rotation={[0, yaw, 0]}>
             {/* approach arrow (small downward shaft) */}

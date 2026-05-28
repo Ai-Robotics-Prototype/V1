@@ -27,8 +27,10 @@ Dependencies: numpy, scipy, PIL only. No cv2, no torch, no ultralytics.
 """
 import collections
 import math
+import os
 import numpy as np
 import rclpy
+import yaml
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, CameraInfo
@@ -40,6 +42,42 @@ from PIL import Image as PILImage, ImageDraw
 # 12 edges of a unit cube, as pairs of corner indices (binary xyz).
 _CUBE_EDGES = ((0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
                (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7))
+
+# Standard optical -> ROS quaternion (xyzw) — matches sensor_tf_publisher.
+_OPTICAL_TO_ROS_Q = (0.5, -0.5, 0.5, 0.5)
+
+_SENSOR_YAML_CANDIDATES = [
+    '/home/teddy/cobot_ws/install/cobot_bringup/share/cobot_bringup/config/sensor_transforms.yaml',
+    '/home/teddy/cobot_ws/src/cobot_bringup/config/sensor_transforms.yaml',
+]
+
+
+def _load_cam_to_lidar(frame_id: str, logger):
+    """Return (R[3,3], t[3]) that maps a point from `frame_id` (camera-
+    optical) into livox_frame. Falls back to identity translation +
+    standard optical-to-ROS rotation if the YAML is missing."""
+    key = 'cam0_to_lidar' if 'cam0' in frame_id else (
+          'cam1_to_lidar' if 'cam1' in frame_id else None)
+    cfg = {}
+    used = None
+    for p in _SENSOR_YAML_CANDIDATES:
+        if os.path.isfile(p):
+            try:
+                with open(p, 'r') as f:
+                    cfg = yaml.safe_load(f) or {}
+                used = p
+                break
+            except Exception as e:
+                logger.warn(f'failed to read {p}: {e}')
+    block = (cfg.get(key) or {}) if key else {}
+    trans = block.get('translation') or [0.0, 0.0, 0.0]
+    quat  = block.get('rotation')    or list(_OPTICAL_TO_ROS_Q)
+    R_mat = _SR.from_quat(quat).as_matrix().astype(np.float64)
+    t_vec = np.asarray(trans, dtype=np.float64).reshape(3)
+    logger.info(
+        f'cam_to_lidar({key!r}) from {used or "fallback"}: '
+        f't={t_vec.tolist()} q={quat}')
+    return R_mat, t_vec, np.asarray(quat, dtype=np.float64)
 
 
 class DepthSegmentNode(Node):
@@ -103,12 +141,20 @@ class DepthSegmentNode(Node):
         self.det_pub = self.create_publisher(Detection3DArray, det_topic, 10)
         self.ann_pub = self.create_publisher(Image, ann_topic, 5)
 
+        # Camera-optical -> LiDAR transform. Centroids and OBB rotations are
+        # converted with this before publishing Detection3D so consumers
+        # (dashboard, grasp planner) see a single coherent frame.
+        self._R_lc, self._t_lc, self._q_lc = _load_cam_to_lidar(
+            self.frame_id, self.get_logger())
+        self._lidar_frame_id = 'livox_frame'
+
         self.create_timer(1.0 / max(rate, 1.0), self._process)
         self._log_count = 0
         self.get_logger().info(
             f'depth_segment_node started | max_depth={self.max_depth}m '
             f'min_area={self.min_area}px erode={self.erode_k} dilate={self.dilate_k} '
-            f'floor_tol={self.floor_tol}m rate={rate}Hz')
+            f'floor_tol={self.floor_tol}m rate={rate}Hz '
+            f'publishing in {self._lidar_frame_id}')
 
     # ── Callbacks ───────────────────────────────────────────────────────────
 
@@ -709,19 +755,35 @@ class DepthSegmentNode(Node):
 
     # ── Publishing ────────────────────────────────────────────────────────────
 
+    def _cam_to_lidar(self, pos_cam, quat_cam_xyzw):
+        """Transform a (position, quaternion) pair from this node's camera-
+        optical frame into the LiDAR frame using the loaded R_lc / t_lc."""
+        p_cam = np.asarray(pos_cam, dtype=np.float64).reshape(3)
+        p_lid = (self._R_lc @ p_cam) + self._t_lc
+        # World rotation = R_lc * R_obj  (the OBB's orientation expressed
+        # in the LiDAR frame). Compose quaternions via scipy.
+        q_lid = (_SR.from_quat(self._q_lc) * _SR.from_quat(quat_cam_xyzw)).as_quat()
+        return p_lid, q_lid
+
     def _publish(self, objects, h, w):
         stamp = self._depth_hdr.stamp if self._depth_hdr else self.get_clock().now().to_msg()
         arr = Detection3DArray()
         arr.header.stamp = stamp
-        arr.header.frame_id = self.frame_id
+        # Detections are reframed into livox_frame so the dashboard /
+        # grasp planner / any other consumer see a single coherent
+        # world frame. The annotated image still uses cam-frame data
+        # for projection (kept in `corners`).
+        arr.header.frame_id = self._lidar_frame_id
         for o in objects:
             det = Detection3D()
             det.header = arr.header
             hyp = ObjectHypothesisWithPose()
             hyp.hypothesis.class_id = 'object'
             hyp.hypothesis.score = 1.0
-            px, py, pz = o['pos']
-            qx, qy, qz, qw = o['quat']
+            p_lid, q_lid = self._cam_to_lidar(o['pos'], o['quat'])
+            px, py, pz = float(p_lid[0]), float(p_lid[1]), float(p_lid[2])
+            qx, qy, qz, qw = (float(q_lid[0]), float(q_lid[1]),
+                              float(q_lid[2]), float(q_lid[3]))
             sx, sy, sz = o['size_3d']
             hyp.pose.pose.position.x = px
             hyp.pose.pose.position.y = py

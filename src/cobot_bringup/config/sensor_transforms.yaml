@@ -1,0 +1,27 @@
+# Sensor frame transforms — livox_frame is the root.
+#
+# Each block is "this sensor's pose in the LiDAR frame":
+#     translation: where the sensor sits relative to the LiDAR origin
+#         x  = forward distance (LiDAR +X)
+#         y  = left distance    (LiDAR +Y)
+#         z  = height           (LiDAR +Z)
+#     rotation: quaternion (qx, qy, qz, qw) that takes a vector expressed in
+#         the sensor's own frame and re-expresses it in the LiDAR frame.
+#
+# The default rotation below is the standard camera-optical -> ROS body
+# transform (optical X-right, Y-down, Z-forward  ->  ROS X-forward, Y-left,
+# Z-up). It is correct for a camera that points along the LiDAR's +X axis
+# (i.e. "forward"). For a top-down camera, the rotation needs an extra 90°
+# pitch — refine with scripts/align_sensors.py.
+#
+# Refine these numbers physically (tape measure) or with
+#   ros2 launch cobot_bringup calibrate.launch.py   (AprilTag, when ready)
+#   python3 scripts/align_sensors.py                (interactive tweaker)
+
+cam0_to_lidar:
+  translation: [0.0, 0.05, 0.05]
+  rotation:    [0.5, -0.5, 0.5, 0.5]
+
+cam1_to_lidar:
+  translation: [0.0, -0.05, 0.05]
+  rotation:    [0.5, -0.5, 0.5, 0.5]
