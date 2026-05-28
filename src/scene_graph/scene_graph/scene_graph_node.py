@@ -91,20 +91,27 @@ class SceneGraphNode(Node):
     def __init__(self):
         super().__init__('scene_graph_node')
 
-        self.declare_parameter('max_track_age_s', 5.0)
-        self.declare_parameter('association_distance_m', 0.3)
-        self.declare_parameter('min_confidence', 0.4)
-        self.declare_parameter('publish_rate_hz', 10.0)
+        self.declare_parameter('max_track_age_s',        5.0)
+        self.declare_parameter('association_distance_m', 0.15)
+        self.declare_parameter('min_confidence',         0.2)
+        self.declare_parameter('publish_rate_hz',        10.0)
+        # Now prefers the LiDAR-primary detection topic (positions are
+        # ground-truth in livox_frame). The old '/perception/detections'
+        # default was never connected to any current publisher.
+        self.declare_parameter('detections_topic',
+                                '/perception/lidar_detections')
 
-        self.max_age = self.get_parameter('max_track_age_s').value
+        self.max_age    = self.get_parameter('max_track_age_s').value
         self.assoc_dist = self.get_parameter('association_distance_m').value
-        self.min_conf = self.get_parameter('min_confidence').value
-        rate = self.get_parameter('publish_rate_hz').value
+        self.min_conf   = self.get_parameter('min_confidence').value
+        rate            = self.get_parameter('publish_rate_hz').value
+        det_topic       = str(self.get_parameter('detections_topic').value)
 
         self.tracks: list[Track] = []
 
-        self.create_subscription(Detection3DArray, '/perception/detections',
+        self.create_subscription(Detection3DArray, det_topic,
                                  self._detection_cb, 10)
+        self.get_logger().info(f'subscribing to {det_topic}')
         self.graph_pub = self.create_publisher(String, '/perception/scene_graph', 10)
         self.create_timer(1.0 / rate, self._publish_graph)
 
@@ -133,8 +140,10 @@ class SceneGraphNode(Node):
             det_pos = (pos.x, pos.y, pos.z)
             frame = msg.header.frame_id
 
-            if det_pos[2] <= 0.0:
-                continue
+            # Note: an earlier "z > 0" gate was removed — the LiDAR
+            # detector publishes positions in livox_frame where the
+            # table sits at z ≈ 0 (sometimes slightly negative).
+            # Filtering on Z dropped every real object on the table.
 
             best_track = None
             best_dist = self.assoc_dist
