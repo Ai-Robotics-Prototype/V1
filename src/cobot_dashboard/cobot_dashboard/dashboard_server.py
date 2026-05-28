@@ -286,13 +286,37 @@ def _normalise_scene_graph(raw) -> dict:
             position = list(pos)
         else:
             position = [0, 0, 0]
-        objs.append({
-            "id": str(uid),
-            "class_name": obj.get("class_id") or obj.get("class_name") or obj.get("class", ""),
-            "score": obj.get("confidence", 0.0),
-            "position": [round(float(p), 3) for p in position],
+        # Velocity may arrive as dict or list; flatten to list either way.
+        vel_raw = obj.get("velocity", [0.0, 0.0, 0.0])
+        if isinstance(vel_raw, dict):
+            velocity = [vel_raw.get("x", 0), vel_raw.get("y", 0), vel_raw.get("z", 0)]
+        elif isinstance(vel_raw, (list, tuple)):
+            velocity = list(vel_raw)
+        else:
+            velocity = [0.0, 0.0, 0.0]
+        out = {
+            "id":          str(uid),
+            "class_name":  obj.get("class_id") or obj.get("class_name") or obj.get("class", ""),
+            "score":       obj.get("confidence", 0.0),
+            "position":    [round(float(p), 3) for p in position],
             "last_seen_ms": int(obj.get("age_s", 0) * 1000),
-        })
+            "velocity":    [round(float(v), 4) for v in velocity],
+            "speed_mps":   round(float(obj.get("speed_mps", 0.0)), 4),
+            "is_moving":   bool(obj.get("is_moving", False)),
+        }
+        # Optional motion+orientation fields (only present from the new node).
+        if "size" in obj:
+            out["size"] = [round(float(v), 4) for v in (obj["size"] or [0, 0, 0])]
+        if "quat" in obj:
+            out["quat"] = [round(float(v), 4) for v in (obj["quat"] or [0, 0, 0, 1])]
+        if "orientation_deg" in obj:
+            out["orientation"] = [round(float(v), 1) for v in (obj["orientation_deg"] or [0, 0, 0])]
+        if "path" in obj:
+            out["path"] = [
+                [round(float(p[0]), 3), round(float(p[1]), 3), round(float(p[2]), 3)]
+                for p in (obj["path"] or [])
+            ]
+        objs.append(out)
     return {"objects": objs}
 
 # ---------------------------------------------------------------------------

@@ -23,7 +23,7 @@ export default function SceneGraphPanel() {
           <table style={styles.table}>
             <thead>
               <tr>
-                {['ID','Class','X','Y','Z','Age','Conf'].map(h => (
+                {['ID','Class','X','Y','Z','Yaw','Speed','Status','Age','Conf'].map(h => (
                   <th key={h} style={styles.th}>{h}</th>
                 ))}
               </tr>
@@ -34,6 +34,13 @@ export default function SceneGraphPanel() {
                   const age = fmtAge(obj.last_seen_ms ?? 0)
                   const pos = obj.position ?? [0, 0, 0]
                   const [x, y, z] = pos
+                  const yaw = obj.orientation && obj.orientation.length >= 3
+                    ? obj.orientation[2] : null
+                  const speedMps = obj.speed_mps ?? 0
+                  const moving = !!obj.is_moving
+                  const status = age.old ? 'LOST' : (moving ? 'MOVING' : 'STATIC')
+                  const statusColor = age.old ? 'var(--zone-red)'
+                    : moving ? '#F59E0B' : '#16A34A'
                   return (
                     <motion.tr
                       key={obj.id}
@@ -42,11 +49,20 @@ export default function SceneGraphPanel() {
                       animate={{ backgroundColor: 'rgba(0,0,0,0)' }}
                       transition={{ duration: 0.6 }}
                     >
-                      <td style={styles.td}>{obj.id}</td>
+                      <td style={styles.td}>{(obj.id || '').slice(0, 8)}</td>
                       <td style={styles.td}>{obj.class_name}</td>
                       <td style={styles.tdNum}>{(x ?? 0).toFixed(2)} m</td>
                       <td style={styles.tdNum}>{(y ?? 0).toFixed(2)} m</td>
                       <td style={styles.tdNum}>{(z ?? 0).toFixed(2)} m</td>
+                      <td style={styles.tdNum}>
+                        {yaw == null ? '—' : `${yaw.toFixed(0)}°`}
+                      </td>
+                      <td style={styles.tdNum}>
+                        {moving ? `${(speedMps * 100).toFixed(1)} cm/s` : '—'}
+                      </td>
+                      <td style={{ ...styles.tdNum, color: statusColor, fontWeight: 600 }}>
+                        {status}
+                      </td>
                       <td style={{ ...styles.tdNum, color: age.old ? 'var(--zone-red)' : 'var(--text-secondary)' }}>
                         {age.text}
                       </td>

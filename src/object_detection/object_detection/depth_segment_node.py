@@ -957,9 +957,25 @@ class DepthSegmentNode(Node):
                 if proj is not None:
                     self._draw_obb_wireframe(draw, proj, (0, 220, 255))
 
+            # Cyan orientation arrow at the bbox centre, pointing along
+            # the OBB's yaw. Image-frame angle = the OBB's yaw component
+            # (rotation about cam-Z = optical axis = image normal).
+            yaw_deg = yaw * 180.0 / math.pi
+            cx_box = (x0 + x1) * 0.5
+            cy_box = (y0 + y1) * 0.5
+            arrow_len = max(x1 - x0, y1 - y0) * 0.4
+            ex = cx_box + arrow_len * math.cos(yaw)
+            ey = cy_box + arrow_len * math.sin(yaw)
+            cyan = (0, 220, 255)
+            draw.line([(cx_box, cy_box), (ex, ey)], fill=cyan, width=2)
+            head = max(6.0, arrow_len * 0.20)
+            for a in (yaw + 2.6, yaw - 2.6):
+                draw.line([(ex, ey),
+                           (ex - head * math.cos(a), ey - head * math.sin(a))],
+                          fill=cyan, width=2)
+
             # Yaw is the only meaningful rotation (yaw-only OBB); size
             # collapsed to the two XY dims for a top-down read.
-            yaw_deg = yaw * 180.0 / math.pi
             w_cm = int(round(sx * 100))
             h_cm = int(round(sy * 100))
             label = f'{pz:.2f}m  {w_cm}×{h_cm}cm  yaw:{yaw_deg:+.0f}°'

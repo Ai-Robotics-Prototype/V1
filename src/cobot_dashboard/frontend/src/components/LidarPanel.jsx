@@ -94,25 +94,147 @@ function SafetyRings({ zone }) {
   )
 }
 
-// Scene-graph object markers (Kalman-tracked objects).
-function ObjectMarkers({ objects }) {
+// Scene-graph tracked objects: orientation arrow + motion trail + velocity vector.
+// Reads from STATE.scene_graph.objects (persistent track IDs); the per-frame
+// raw LiDAR detections are rendered separately by DetectionMarkers.
+function SceneObjects({ objects }) {
   if (!objects || objects.length === 0) return null
   return (
     <>
-      {objects.map((obj) => {
-        const pos = obj.position ?? [0, 0, 0]
+      {objects.map((obj, idx) => {
+        const pos = obj.position
+        if (!pos || pos.length < 3) return null
+        const [tx, ty, tz] = lidarToThree(pos[0], pos[1], pos[2])
+        const size = obj.size && obj.size.length >= 3 ? obj.size : [0.05, 0.05, 0.05]
+        const W = Math.max(0.01, size[0])
+        const D = Math.max(0.01, size[1])
+        const H = Math.max(0.01, size[2])
+
+        // Orientation: prefer the published euler[2] (yaw, degrees); fall
+        // back to extracting from the quaternion if only that's present.
+        let yawRad = 0
+        if (obj.orientation && obj.orientation.length >= 3) {
+          yawRad = obj.orientation[2] * Math.PI / 180
+        } else if (obj.quat && obj.quat.length === 4) {
+          const [qx, qy, qz, qw] = obj.quat
+          yawRad = Math.atan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
+        }
+
+        const speed = obj.speed_mps || 0
+        const moving = !!obj.is_moving
+
+        // Box colour: green static / orange moving.
+        const boxColor = moving ? '#F59E0B' : '#16A34A'
+
+        // Orientation arrow — in three.js world (Y up), placed slightly
+        // above the box centre, length scaled by the larger XY extent.
+        const arrowLen = Math.max(W, D) * 0.9 + 0.04
+        const arrowEnd = [
+          tx + Math.cos(yawRad) * arrowLen,
+          ty + H * 0.5 + 0.01,
+          tz - Math.sin(yawRad) * arrowLen,
+        ]
+
+        // Motion trail.
+        const path = obj.path
+        let trailPositions = null
+        let trailColors = null
+        if (path && path.length >= 2) {
+          trailPositions = new Float32Array(path.length * 3)
+          trailColors    = new Float32Array(path.length * 3)
+          for (let i = 0; i < path.length; i++) {
+            const p = path[i]
+            const [px, py, pz] = lidarToThree(p[0], p[1], p[2])
+            trailPositions[i * 3]     = px
+            trailPositions[i * 3 + 1] = py + 0.005    // float just above floor
+            trailPositions[i * 3 + 2] = pz
+            const t = i / (path.length - 1)             // 0=oldest, 1=newest
+            // Fade from dark to cyan along the trail.
+            trailColors[i * 3]     = 0.0
+            trailColors[i * 3 + 1] = 0.4 + 0.6 * t
+            trailColors[i * 3 + 2] = 0.5 + 0.5 * t
+          }
+        }
+
+        // Velocity vector — fixed-length 10 cm direction line if moving.
+        let velSeg = null
+        if (moving && obj.velocity && obj.velocity.length >= 3) {
+          const v = obj.velocity
+          const vmag = Math.hypot(v[0], v[1], v[2])
+          if (vmag > 1e-4) {
+            const vlen = Math.min(0.15, vmag * 5.0)
+            const vx = v[0] / vmag * vlen
+            const vy = v[1] / vmag * vlen
+            const vz = v[2] / vmag * vlen
+            const [evx, evy, evz] = lidarToThree(pos[0] + vx, pos[1] + vy, pos[2] + vz)
+            velSeg = new Float32Array([tx, ty + H * 0.5 + 0.04, tz, evx, evy + H * 0.5 + 0.04, evz])
+          }
+        }
+
+        const yawDeg = (yawRad * 180 / Math.PI).toFixed(0)
+
         return (
-          <group key={obj.id} position={[pos[0], pos[2], pos[1]]}>
-            <mesh>
-              <boxGeometry args={[0.15, 0.15, 0.15]} />
-              <meshBasicMaterial color="#1D6FD8" wireframe />
+          <group key={obj.id ?? idx}>
+            {/* Wireframe box at the track centre */}
+            <group position={[tx, ty, tz]} rotation={[0, yawRad, 0]}>
+              <lineSegments>
+                <edgesGeometry args={[new THREE.BoxGeometry(W, H, D)]} />
+                <lineBasicMaterial color={boxColor} linewidth={2} />
+              </lineSegments>
+            </group>
+
+            {/* Orientation arrow: line from box centre out by arrowLen */}
+            <line>
+              <bufferGeometry
+                onUpdate={(g) => g.setAttribute('position',
+                  new THREE.BufferAttribute(new Float32Array([
+                    tx, ty + H * 0.5 + 0.01, tz,
+                    arrowEnd[0], arrowEnd[1], arrowEnd[2],
+                  ]), 3))}
+              />
+              <lineBasicMaterial color="#22D3EE" linewidth={2} />
+            </line>
+            {/* Cone arrowhead */}
+            <mesh
+              position={arrowEnd}
+              rotation={[0, yawRad - Math.PI / 2, 0]}
+            >
+              <coneGeometry args={[0.012, 0.03, 8]} />
+              <meshBasicMaterial color="#22D3EE" />
             </mesh>
+
+            {/* Motion trail */}
+            {trailPositions && (
+              <line>
+                <bufferGeometry
+                  onUpdate={(g) => {
+                    g.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3))
+                    g.setAttribute('color',    new THREE.BufferAttribute(trailColors, 3))
+                  }}
+                />
+                <lineBasicMaterial vertexColors transparent opacity={0.85} />
+              </line>
+            )}
+
+            {/* Velocity vector — short red line above the box */}
+            {velSeg && (
+              <line>
+                <bufferGeometry
+                  onUpdate={(g) => g.setAttribute('position',
+                    new THREE.BufferAttribute(velSeg, 3))}
+                />
+                <lineBasicMaterial color="#EF4444" linewidth={3} />
+              </line>
+            )}
           </group>
         )
       })}
     </>
   )
 }
+
+// Backwards-compat alias used by Scene below.
+const ObjectMarkers = SceneObjects
 
 // Real-time 3D detections from /perception/detections_3d (depth_segment_node).
 //
