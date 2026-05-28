@@ -3,8 +3,9 @@ project(cobot_bringup)
 
 find_package(ament_cmake REQUIRED)
 
-install(DIRECTORY launch config urdf
+install(DIRECTORY launch config urdf scripts
   DESTINATION share/${PROJECT_NAME}
+  USE_SOURCE_PERMISSIONS
 )
 
 if(BUILD_TESTING)

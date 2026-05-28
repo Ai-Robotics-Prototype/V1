@@ -345,7 +345,11 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self.create_subscription(Image, "/cam1/cam1/color/image_raw",
                                  lambda m: self._on_camera(1, m), 2)
 
-        # LiDAR — prefer fused cloud; fall back to raw
+        # LiDAR priority: accumulated > fused > raw. Lower-priority handlers
+        # bail out if a higher-priority source has produced data recently.
+        self._lidar_last = {"acc": 0.0, "fused": 0.0, "raw": 0.0}
+        self.create_subscription(PointCloud2, "/lidar/points_accumulated",
+                                 self._on_lidar_accum, 2)
         self.create_subscription(PointCloud2, "/perception/fused_cloud",
                                  self._on_lidar_fused, 2)
         self.create_subscription(PointCloud2, "/lidar/points",
@@ -505,19 +509,33 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
 
     # ---- LiDAR ----
 
-    def _on_lidar_fused(self, msg):
-        pts = _parse_pointcloud2(msg)
+    def _lidar_stale(self, key: str, max_age_s: float = 1.0) -> bool:
+        return (time.time() - self._lidar_last[key]) > max_age_s
+
+    def _on_lidar_accum(self, msg):
+        pts = _parse_pointcloud2(msg, max_points=8192)
         if pts:
+            self._lidar_last["acc"] = time.time()
             with _lidar_lock:
                 _lidar_state["pts"]  = pts
                 _lidar_state["live"] = True
-            self._have_fused = True
 
-    def _on_lidar_raw(self, msg):
-        if self._have_fused:
+    def _on_lidar_fused(self, msg):
+        if not self._lidar_stale("acc"):
             return
         pts = _parse_pointcloud2(msg)
         if pts:
+            self._lidar_last["fused"] = time.time()
+            with _lidar_lock:
+                _lidar_state["pts"]  = pts
+                _lidar_state["live"] = True
+
+    def _on_lidar_raw(self, msg):
+        if not (self._lidar_stale("acc") and self._lidar_stale("fused")):
+            return
+        pts = _parse_pointcloud2(msg)
+        if pts:
+            self._lidar_last["raw"] = time.time()
             with _lidar_lock:
                 _lidar_state["pts"]  = pts
                 _lidar_state["live"] = True

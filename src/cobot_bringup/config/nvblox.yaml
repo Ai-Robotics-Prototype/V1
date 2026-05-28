@@ -1,0 +1,57 @@
+/**:
+  ros__parameters:
+    cuda_stream_type: 1
+
+    # Map
+    voxel_size: 0.05
+    num_cameras: 2
+    use_tf_transforms: true
+    mapping_type: "static_tsdf"
+    global_frame: "map"
+
+    # Rates
+    tick_period_ms: 10
+    integrate_depth_rate_hz: 30.0
+    integrate_color_rate_hz: 5.0
+    integrate_lidar_rate_hz: 10.0
+    update_mesh_rate_hz: 5.0
+    update_esdf_rate_hz: 5.0
+    publish_layer_rate_hz: 5.0
+    publish_debug_vis_rate_hz: 1.0
+    decay_tsdf_rate_hz: 5.0
+    decay_dynamic_occupancy_rate_hz: 10.0
+    clear_map_outside_radius_rate_hz: 1.0
+
+    # ESDF
+    esdf_mode: "2d"
+    publish_esdf_distance_slice: true
+
+    # Inputs
+    use_color: true
+    use_depth: true
+    # Livox MID-360 is non-repetitive — point count varies each frame, so
+    # nvblox's fixed-grid (lidar_width × lidar_height) projection model
+    # rejects it with "LiDAR intrinsics are inconsistent". We integrate the
+    # two RealSense depth streams instead; the Livox cloud stays available
+    # on /lidar/points_accumulated for the dashboard 3D view.
+    use_lidar: false
+    lidar_width: 100
+    lidar_height: 100
+    lidar_min_valid_range_m: 0.1
+    lidar_max_valid_range_m: 30.0
+    use_non_equal_vertical_fov_lidar_params: false
+
+    maximum_input_queue_length: 10
+
+    map_clearing_radius_m: 3.0
+    map_clearing_frame_id: "base_link"
+
+    input_qos: "SENSOR_DATA"
+
+    esdf_slice_bounds_visualization_attachment_frame_id: "base_link"
+    esdf_slice_bounds_visualization_side_length: 6.0
+    workspace_height_bounds_visualization_attachment_frame_id: "base_link"
+    workspace_height_bounds_visualization_side_length: 6.0
+    layer_visualization_min_tsdf_weight: 0.1
+    layer_visualization_exclusion_height_m: 2.0
+    layer_visualization_exclusion_radius_m: 3.0
