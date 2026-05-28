@@ -1,0 +1,462 @@
+{
+  "name": "ur5e",
+  "root_link": "world",
+  "links": [
+    {
+      "name": "world",
+      "mesh": null,
+      "visual_xyz": [
+        0,
+        0,
+        0
+      ],
+      "visual_rpy": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "base_link",
+      "mesh": null,
+      "visual_xyz": [
+        0,
+        0,
+        0
+      ],
+      "visual_rpy": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "base_link_inertia",
+      "mesh": "/robot_model/glb/base.glb",
+      "visual_xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "visual_rpy": [
+        0.0,
+        0.0,
+        3.141592653589793
+      ]
+    },
+    {
+      "name": "shoulder_link",
+      "mesh": "/robot_model/glb/shoulder.glb",
+      "visual_xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "visual_rpy": [
+        0.0,
+        0.0,
+        3.141592653589793
+      ]
+    },
+    {
+      "name": "upper_arm_link",
+      "mesh": "/robot_model/glb/upperarm.glb",
+      "visual_xyz": [
+        0.0,
+        0.0,
+        0.138
+      ],
+      "visual_rpy": [
+        1.5707963267948966,
+        0.0,
+        -1.5707963267948966
+      ]
+    },
+    {
+      "name": "forearm_link",
+      "mesh": "/robot_model/glb/forearm.glb",
+      "visual_xyz": [
+        0.0,
+        0.0,
+        0.007
+      ],
+      "visual_rpy": [
+        1.5707963267948966,
+        0.0,
+        -1.5707963267948966
+      ]
+    },
+    {
+      "name": "wrist_1_link",
+      "mesh": "/robot_model/glb/wrist1.glb",
+      "visual_xyz": [
+        0.0,
+        0.0,
+        -0.127
+      ],
+      "visual_rpy": [
+        1.5707963267948966,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "name": "wrist_2_link",
+      "mesh": "/robot_model/glb/wrist2.glb",
+      "visual_xyz": [
+        0.0,
+        0.0,
+        -0.0997
+      ],
+      "visual_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "name": "wrist_3_link",
+      "mesh": "/robot_model/glb/wrist3.glb",
+      "visual_xyz": [
+        0.0,
+        0.0,
+        -0.0989
+      ],
+      "visual_rpy": [
+        1.5707963267948966,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "name": "ft_frame",
+      "mesh": null,
+      "visual_xyz": [
+        0,
+        0,
+        0
+      ],
+      "visual_rpy": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "base",
+      "mesh": null,
+      "visual_xyz": [
+        0,
+        0,
+        0
+      ],
+      "visual_rpy": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "flange",
+      "mesh": null,
+      "visual_xyz": [
+        0,
+        0,
+        0
+      ],
+      "visual_rpy": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "tool0",
+      "mesh": null,
+      "visual_xyz": [
+        0,
+        0,
+        0
+      ],
+      "visual_rpy": [
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "joints": [
+    {
+      "name": "base_joint",
+      "type": "fixed",
+      "parent": "world",
+      "child": "base_link",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        1,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "base_link-base_link_inertia",
+      "type": "fixed",
+      "parent": "base_link",
+      "child": "base_link_inertia",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        3.141592653589793
+      ],
+      "axis": [
+        1,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "shoulder_pan_joint",
+      "type": "revolute",
+      "parent": "base_link_inertia",
+      "child": "shoulder_link",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        0.1625
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "lower": -6.283185307179586,
+      "upper": 6.283185307179586
+    },
+    {
+      "name": "shoulder_lift_joint",
+      "type": "revolute",
+      "parent": "shoulder_link",
+      "child": "upper_arm_link",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "origin_rpy": [
+        1.570796327,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "lower": -6.283185307179586,
+      "upper": 6.283185307179586
+    },
+    {
+      "name": "elbow_joint",
+      "type": "revolute",
+      "parent": "upper_arm_link",
+      "child": "forearm_link",
+      "origin_xyz": [
+        -0.425,
+        0.0,
+        0.0
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "lower": -3.141592653589793,
+      "upper": 3.141592653589793
+    },
+    {
+      "name": "wrist_1_joint",
+      "type": "revolute",
+      "parent": "forearm_link",
+      "child": "wrist_1_link",
+      "origin_xyz": [
+        -0.3922,
+        0.0,
+        0.1333
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "lower": -6.283185307179586,
+      "upper": 6.283185307179586
+    },
+    {
+      "name": "wrist_2_joint",
+      "type": "revolute",
+      "parent": "wrist_1_link",
+      "child": "wrist_2_link",
+      "origin_xyz": [
+        0.0,
+        -0.0997,
+        -2.044881182297852e-11
+      ],
+      "origin_rpy": [
+        1.570796327,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "lower": -6.283185307179586,
+      "upper": 6.283185307179586
+    },
+    {
+      "name": "wrist_3_joint",
+      "type": "revolute",
+      "parent": "wrist_2_link",
+      "child": "wrist_3_link",
+      "origin_xyz": [
+        0.0,
+        0.0996,
+        -2.042830148012698e-11
+      ],
+      "origin_rpy": [
+        1.570796326589793,
+        3.141592653589793,
+        3.141592653589793
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "lower": -6.283185307179586,
+      "upper": 6.283185307179586
+    },
+    {
+      "name": "wrist_3_link-ft_frame",
+      "type": "fixed",
+      "parent": "wrist_3_link",
+      "child": "ft_frame",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "origin_rpy": [
+        3.141592653589793,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        1,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "base_link-base_fixed_joint",
+      "type": "fixed",
+      "parent": "base_link",
+      "child": "base",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        3.141592653589793
+      ],
+      "axis": [
+        1,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "wrist_3-flange",
+      "type": "fixed",
+      "parent": "wrist_3_link",
+      "child": "flange",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "origin_rpy": [
+        0.0,
+        -1.5707963267948966,
+        -1.5707963267948966
+      ],
+      "axis": [
+        1,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "flange-tool0",
+      "type": "fixed",
+      "parent": "flange",
+      "child": "tool0",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "origin_rpy": [
+        1.5707963267948966,
+        0.0,
+        1.5707963267948966
+      ],
+      "axis": [
+        1,
+        0,
+        0
+      ]
+    }
+  ],
+  "joint_order": [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint"
+  ]
+}
