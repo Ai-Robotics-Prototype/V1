@@ -329,12 +329,18 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self.create_subscription(String,    "/perception/scene_graph",   self._on_scene_graph,    10)
         # String fallback — scene_graph_node may republish detections as JSON
         self.create_subscription(String,    "/perception/detections",    self._on_detections_str, 10)
-        # Real Detection3DArray from detector_node
+        # Detection sources: LiDAR-primary is preferred when available
+        # (object centroids are ground truth in livox_frame); camera-based
+        # detections are kept as a fallback for when the LiDAR detector
+        # hasn't produced data recently.
         try:
             from vision_msgs.msg import Detection3DArray
+            self._det_source_last = {"lidar": 0.0, "cam": 0.0}
+            self.create_subscription(Detection3DArray, "/perception/lidar_detections",
+                                     self._on_detections_lidar, 5)
             self.create_subscription(Detection3DArray, "/perception/detections_3d",
                                      self._on_detections_3d, 5)
-            self.get_logger().info("Detection3DArray subscription ready")
+            self.get_logger().info("Detection3DArray subscriptions ready (lidar > cam)")
         except ImportError:
             self.get_logger().warn("vision_msgs not available — detection3d subscription skipped")
         self.create_subscription(JointState, "/joint_states",            self._on_joint_states,   10)
@@ -438,8 +444,20 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         except Exception:
             pass
 
+    def _on_detections_lidar(self, msg):
+        """LiDAR-primary detection source (preferred)."""
+        self._det_source_last["lidar"] = time.time()
+        self._publish_detections(msg)
+
     def _on_detections_3d(self, msg):
-        """Parse Detection3DArray from detector_node into dashboard format."""
+        """Camera-based detector — only used when lidar is stale (>1 s)."""
+        if (time.time() - self._det_source_last.get("lidar", 0.0)) < 1.0:
+            return
+        self._det_source_last["cam"] = time.time()
+        self._publish_detections(msg)
+
+    def _publish_detections(self, msg):
+        """Parse Detection3DArray into the dashboard's STATE format."""
         import math as _m
         dets = []
         for det in msg.detections:

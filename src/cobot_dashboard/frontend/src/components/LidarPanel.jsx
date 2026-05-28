@@ -7,6 +7,14 @@ import { useStore } from '../store/useStore'
 const HOST     = typeof window !== 'undefined' ? window.location.host : 'localhost:8080'
 const WS_PROTO = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws'
 
+// Single source of truth for livox_frame (ROS: X=forward, Y=left, Z=up)
+// to three.js (X=right, Y=up, Z=toward camera). The PointCloud, mesh,
+// detections, and grasps all use this — they must, or 3D objects from
+// different streams end up rendered at inconsistent positions.
+function lidarToThree(x, y, z) {
+  return [x, z, y]
+}
+
 // Height-based ramp tuned for legibility on the dark panel background.
 function heightColor(z) {
   if (z < 0.1) return new THREE.Color(0.15, 0.35, 0.85)  // blue — floor
@@ -28,9 +36,10 @@ function PointCloud({ pointsRef }) {
 
     for (let i = 0; i < pts.length; i++) {
       const p = pts[i]
-      positions[i * 3]     = p.x
-      positions[i * 3 + 1] = p.z
-      positions[i * 3 + 2] = p.y
+      const [tx, ty, tz] = lidarToThree(p.x, p.y, p.z)
+      positions[i * 3]     = tx
+      positions[i * 3 + 1] = ty
+      positions[i * 3 + 2] = tz
       const c = heightColor(p.z)
       colors[i * 3]     = c.r
       colors[i * 3 + 1] = c.g
@@ -116,39 +125,21 @@ function ObjectMarkers({ objects }) {
 // reflection, not a pure rotation, so the lidar quaternion can't be
 // reused verbatim.
 //
-// HEIGHT ANCHORING: the OBB centroid Z is the geometric centre of the
-// VISIBLE point cloud from the camera (the foreground mask excludes
-// table-plane pixels), so it tracks each object's individual centre
-// rather than a consistent surface. To make boxes sit on the actual
-// LiDAR surface regardless of OBB noise or partial occlusion, we ignore
-// the centroid's vertical component and instead find the median Z of
-// LiDAR points within `floor_radius_xy` of the box's (x, y). The box
-// bottom is anchored at that median.
-function DetectionMarkers({ detections, pointsRef }) {
+// Detections are positioned at the published centroid using the shared
+// lidarToThree mapping — identical to PointCloud, mesh, and grasps. The
+// publisher's bbox.center.z and bbox.size.z are constructed so that the
+// box bottom (center.z - size.z/2) sits at the cluster's lowest point,
+// which for the lidar_detector is on the table.
+//
+// The previous floor-anchor heuristic (median Z of nearby LiDAR points)
+// was broken: for LiDAR-primary detections the cluster's own points
+// are nearby, so the median lands MID-OBJECT instead of on the floor.
+function DetectionMarkers({ detections }) {
   if (!detections || detections.length === 0) return null
   function bandColor(maxDim) {
     if (maxDim < 0.05) return '#16A34A'   // small (<5cm): green
     if (maxDim < 0.15) return '#1D6FD8'   // medium: blue
     return '#DC2626'                       // large (>=15cm): red
-  }
-  // Find the local floor under (x, y): median Z of LiDAR points within a
-  // small XY disc. Falls back to the detection's centroid Z (less the
-  // box half-height) so we still render something if no LiDAR coverage.
-  function localFloorZ(x, y, fallback) {
-    const points = pointsRef && pointsRef.current
-    if (!points || points.length === 0) return fallback
-    const R = 0.08
-    const R2 = R * R
-    const zs = []
-    for (let i = 0; i < points.length; i++) {
-      const p = points[i]
-      const dx = p.x - x
-      const dy = p.y - y
-      if (dx * dx + dy * dy < R2) zs.push(p.z)
-    }
-    if (zs.length < 5) return fallback
-    zs.sort((a, b) => a - b)
-    return zs[zs.length >> 1]   // median
   }
   return (
     <>
@@ -167,17 +158,13 @@ function DetectionMarkers({ detections, pointsRef }) {
           yaw = Math.atan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
         }
 
-        // Anchor the box bottom to the local LiDAR floor under (x, y).
-        // three.js Y is lidar Z (up); box bottom at three.y = floor_z,
-        // so the group's centre y = floor_z + H/2.
-        const fallbackFloor = det.z - H / 2
-        const floor = localFloorZ(det.x, det.y, fallbackFloor)
-        const centerY = floor + H / 2
+        // Direct centroid mapping — shared with PointCloud and Mesh.
+        const [tx, ty, tz] = lidarToThree(det.x, det.y, det.z)
 
         return (
           <group
             key={det.id ?? i}
-            position={[det.x, centerY, det.y]}
+            position={[tx, ty, tz]}
             rotation={[0, yaw, 0]}
           >
             <mesh>
@@ -215,9 +202,10 @@ function ReconstructionMesh({ meshRef }) {
     const haveCols  = Array.isArray(cols) && cols.length === N
     for (let i = 0; i < N; i++) {
       const v = verts[i]
-      positions[i * 3]     = v[0]
-      positions[i * 3 + 1] = v[2]   // z-up -> y-up
-      positions[i * 3 + 2] = v[1]
+      const [tx, ty, tz] = lidarToThree(v[0], v[1], v[2])
+      positions[i * 3]     = tx
+      positions[i * 3 + 1] = ty
+      positions[i * 3 + 2] = tz
       if (haveCols) {
         const c = cols[i]
         colors[i * 3]     = c[0]
@@ -291,12 +279,7 @@ function GraspMarkers({ grasps }) {
         const lowConf = (g.confidence ?? 1) < 0.7
         const color = lowConf ? '#CA8A04' : '#16A34A'
 
-        // Grasp positions live in livox_frame now (forwarded from
-        // depth_segment_node via grasp_planner). Map to the same three.js
-        // convention the PointCloud uses.
-        const px = g.x
-        const py = g.z       // lidar Z (up) -> three.js Y (up)
-        const pz = g.y       // lidar Y (left) -> three.js Z (back)
+        const [px, py, pz] = lidarToThree(g.x, g.y, g.z)
         return (
           <group key={g.object_id ?? i} position={[px, py, pz]} rotation={[0, yaw, 0]}>
             {/* approach arrow (small downward shaft) */}
@@ -357,7 +340,7 @@ function Scene({ pointsRef, meshRef, zone, preset, sceneObjects, detections, gra
       <PointCloud pointsRef={pointsRef} />
       <ReconstructionMesh meshRef={meshRef} />
       <ObjectMarkers objects={sceneObjects} />
-      <DetectionMarkers detections={detections} pointsRef={pointsRef} />
+      <DetectionMarkers detections={detections} />
       <GraspMarkers grasps={grasps} />
 
       <CameraController preset={preset} />
