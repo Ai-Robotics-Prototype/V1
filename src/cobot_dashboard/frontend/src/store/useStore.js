@@ -38,6 +38,7 @@ const storeDefinition = (set, get) => ({
   },
   detections: [],
   scene_graph: { objects: [] },
+  grasp_poses: [],
   gripper: { state: 'open', position_mm: 85 },
   program: { steps: [] },
 
@@ -91,6 +92,7 @@ const storeDefinition = (set, get) => ({
           task: msg.task ?? get().task,
           detections: msg.detections ?? get().detections,
           scene_graph: msg.scene_graph ?? get().scene_graph,
+          grasp_poses: msg.grasp_poses ?? get().grasp_poses,
           gripper: msg.gripper ?? get().gripper,
           program: msg.program ?? get().program,
           wsLatency: latency,

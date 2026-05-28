@@ -175,6 +175,54 @@ function DetectionMarkers({ detections }) {
   )
 }
 
+// Grasp pose markers: short downward arrow at the grasp centre + two
+// jaw segments showing the gripper opening width.
+function GraspMarkers({ grasps }) {
+  if (!grasps || grasps.length === 0) return null
+  return (
+    <>
+      {grasps.map((g, i) => {
+        if (g.x == null || g.y == null || g.z == null) return null
+        if (Math.abs(g.x) > 10 || Math.abs(g.y) > 10) return null
+        const width = Math.max(0.005, Math.min(0.1, g.gripper_width_m ?? 0.05))
+        const yaw   = g.grasp_yaw_rad ?? 0
+        const lowConf = (g.confidence ?? 1) < 0.7
+        const color = lowConf ? '#CA8A04' : '#16A34A'
+
+        // Camera-optical (x right, y down, z forward) -> panel world
+        // (x right, y up, z back). Same convention as DetectionMarkers.
+        const px = g.x
+        const py = -g.y
+        const pz = g.z
+        // Approach is the camera "above" direction (-z in optical), which
+        // maps to -z in the panel world too. Arrow drops onto the object.
+        return (
+          <group key={g.object_id ?? i} position={[px, py, pz]} rotation={[0, yaw, 0]}>
+            {/* approach arrow (small downward shaft) */}
+            <mesh position={[0, 0.05, 0]}>
+              <cylinderGeometry args={[0.003, 0.003, 0.10, 8]} />
+              <meshStandardMaterial color={color} />
+            </mesh>
+            <mesh position={[0, 0, 0]} rotation={[Math.PI, 0, 0]}>
+              <coneGeometry args={[0.008, 0.02, 12]} />
+              <meshStandardMaterial color={color} />
+            </mesh>
+            {/* two jaw segments, perpendicular to the approach */}
+            <mesh position={[+width / 2, 0.01, 0]}>
+              <boxGeometry args={[0.004, 0.025, 0.02]} />
+              <meshStandardMaterial color={color} />
+            </mesh>
+            <mesh position={[-width / 2, 0.01, 0]}>
+              <boxGeometry args={[0.004, 0.025, 0.02]} />
+              <meshStandardMaterial color={color} />
+            </mesh>
+          </group>
+        )
+      })}
+    </>
+  )
+}
+
 function CameraController({ preset }) {
   const { camera } = useThree()
   useEffect(() => {
@@ -189,7 +237,7 @@ function CameraController({ preset }) {
   return null
 }
 
-function Scene({ pointsRef, zone, preset, sceneObjects, detections }) {
+function Scene({ pointsRef, zone, preset, sceneObjects, detections, grasps }) {
   return (
     <>
       <color attach="background" args={['#F0F2F5']} />
@@ -208,6 +256,7 @@ function Scene({ pointsRef, zone, preset, sceneObjects, detections }) {
       <PointCloud pointsRef={pointsRef} />
       <ObjectMarkers objects={sceneObjects} />
       <DetectionMarkers detections={detections} />
+      <GraspMarkers grasps={grasps} />
 
       <CameraController preset={preset} />
       <OrbitControls enableDamping dampingFactor={0.08} />
@@ -219,6 +268,7 @@ export default function LidarPanel() {
   const zone         = useStore((s) => s.safety.zone)
   const sceneObjects = useStore((s) => s.scene_graph.objects)
   const detections   = useStore((s) => s.detections)
+  const grasps       = useStore((s) => s.grasp_poses)
 
   const pointsRef = useRef([])
   const wsRef     = useRef(null)
@@ -289,6 +339,7 @@ export default function LidarPanel() {
           preset={preset}
           sceneObjects={sceneObjects}
           detections={detections}
+          grasps={grasps}
         />
       </Canvas>
 

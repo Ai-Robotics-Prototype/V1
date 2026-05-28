@@ -71,6 +71,7 @@ STATE = {
     },
     "detections": [],
     "scene_graph": {"objects": []},
+    "grasp_poses": [],
     "gripper": {"state": "open", "position_mm": 85.0},
     "program": {
         "steps": [
@@ -331,6 +332,10 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             self.get_logger().warn("vision_msgs not available — detection3d subscription skipped")
         self.create_subscription(JointState, "/joint_states",            self._on_joint_states,   10)
 
+        # Grasp planner output (JSON String — full per-candidate metadata).
+        self.create_subscription(String, "/grasp/candidates",
+                                 self._on_grasp_candidates, 5)
+
         # Annotated image from detector (cam0 + cam1)
         self.create_subscription(Image, "/perception/annotated_image",
                                  self._on_annotated, 2)
@@ -486,6 +491,38 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 })
         with _state_lock:
             STATE["detections"] = dets
+
+    def _on_grasp_candidates(self, msg):
+        """Parse grasp_planner JSON and reshape for the dashboard store."""
+        try:
+            payload = json.loads(msg.data)
+        except Exception:
+            return
+        out = []
+        for c in payload.get('candidates', []) or []:
+            pg = c.get('pre_grasp', {})
+            gr = c.get('grasp', {})
+            pos = gr.get('position') or [0, 0, 0]
+            pre = pg.get('position') or pos
+            quat = gr.get('orientation') or [0, 0, 0, 1]
+            out.append({
+                'object_id':       c.get('object_id'),
+                'class_name':      c.get('class_name'),
+                'confidence':      c.get('confidence'),
+                'x':               round(float(pos[0]), 4),
+                'y':               round(float(pos[1]), 4),
+                'z':               round(float(pos[2]), 4),
+                'pre_x':           round(float(pre[0]), 4),
+                'pre_y':           round(float(pre[1]), 4),
+                'pre_z':           round(float(pre[2]), 4),
+                'quat':            [round(float(q), 4) for q in quat],
+                'gripper_width_m': c.get('gripper_width_m'),
+                'object_yaw_rad':  c.get('object_yaw_rad'),
+                'grasp_yaw_rad':   c.get('grasp_yaw_rad'),
+                'approach_along_long': c.get('approach_along_long'),
+            })
+        with _state_lock:
+            STATE['grasp_poses'] = out
 
     def _on_annotated(self, msg):
         jpeg = _ros_image_to_jpeg(msg)
