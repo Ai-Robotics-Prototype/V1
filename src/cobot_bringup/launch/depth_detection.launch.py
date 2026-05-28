@@ -24,7 +24,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     args = [
         DeclareLaunchArgument('max_depth_m',        default_value='3.0'),
-        DeclareLaunchArgument('min_object_area_px', default_value='100'),
+        DeclareLaunchArgument('min_object_area_px', default_value='50'),
         DeclareLaunchArgument('floor_tolerance_m',  default_value='0.015'),
         DeclareLaunchArgument('erode_kernel',       default_value='2'),
         DeclareLaunchArgument('dilate_kernel',      default_value='9'),

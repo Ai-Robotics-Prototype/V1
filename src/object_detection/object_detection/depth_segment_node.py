@@ -41,11 +41,14 @@ class DepthSegmentNode(Node):
         super().__init__('depth_segment_node')
 
         self.declare_parameter('max_depth_m',        3.0)
-        self.declare_parameter('min_object_area_px', 100)
+        self.declare_parameter('min_object_area_px', 50)
         self.declare_parameter('floor_tolerance_m',  0.015)
         self.declare_parameter('erode_kernel',       2)
         self.declare_parameter('dilate_kernel',      9)
         self.declare_parameter('edge_threshold_m',   0.05)
+        self.declare_parameter('rgb_edge_threshold', 30.0)
+        self.declare_parameter('merge_edge_dist_px', 20)
+        self.declare_parameter('merge_iou_thr',      0.1)
         self.declare_parameter('publish_rate_hz',    15.0)
         self.declare_parameter('bbox_pad_px',        5)
         # Per-camera topics so one node can serve cam0 and another cam1
@@ -62,6 +65,9 @@ class DepthSegmentNode(Node):
         self.erode_k     = int(self.get_parameter('erode_kernel').value)
         self.dilate_k    = int(self.get_parameter('dilate_kernel').value)
         self.edge_thresh = float(self.get_parameter('edge_threshold_m').value)
+        self.rgb_edge_thresh = float(self.get_parameter('rgb_edge_threshold').value)
+        self.merge_edge_px = int(self.get_parameter('merge_edge_dist_px').value)
+        self.merge_iou_thr = float(self.get_parameter('merge_iou_thr').value)
         self.pad         = int(self.get_parameter('bbox_pad_px').value)
         rate             = float(self.get_parameter('publish_rate_hz').value)
         depth_topic      = self.get_parameter('depth_topic').value
@@ -203,6 +209,40 @@ class DepthSegmentNode(Node):
                 kept.append(b)
         return kept
 
+    @staticmethod
+    def _edge_dist(a, b):
+        """Minimum edge-to-edge separation between two bboxes (0 if overlapping)."""
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        dx = max(0, max(bx0 - ax1, ax0 - bx1))
+        dy = max(0, max(by0 - ay1, ay0 - by1))
+        return (dx * dx + dy * dy) ** 0.5
+
+    def _merge_nearby(self, bboxes):
+        """Union-merge bboxes that overlap (IoU > merge_iou_thr) or whose edges
+        are within merge_edge_px of each other. Fixes single objects fragmented
+        into multiple components."""
+        boxes = [list(b) for b in bboxes]
+        changed = True
+        while changed:
+            changed = False
+            i = 0
+            while i < len(boxes):
+                j = i + 1
+                while j < len(boxes):
+                    if (self._iou(boxes[i], boxes[j]) > self.merge_iou_thr or
+                            self._edge_dist(boxes[i], boxes[j]) < self.merge_edge_px):
+                        boxes[i] = [min(boxes[i][0], boxes[j][0]),
+                                    min(boxes[i][1], boxes[j][1]),
+                                    max(boxes[i][2], boxes[j][2]),
+                                    max(boxes[i][3], boxes[j][3])]
+                        del boxes[j]
+                        changed = True
+                    else:
+                        j += 1
+                i += 1
+        return [tuple(b) for b in boxes]
+
     def _temporal_filter(self):
         """Keep objects present in >=2 of the last 3 frames (flicker + dropout)."""
         frames = list(self._history)
@@ -267,6 +307,17 @@ class DepthSegmentNode(Node):
         edge_fg = valid & (gmag > self.edge_thresh)
         foreground = plane_fg | edge_fg
 
+        # (c) RGB edges: catches flat dark objects that have minimal depth
+        # difference from the surface but visible colour/texture boundaries.
+        rgb = self._color_rgb
+        if rgb is not None and rgb.shape[0] == h and rgb.shape[1] == w:
+            gray = (0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1]
+                    + 0.114 * rgb[:, :, 2]).astype(np.float32)
+            rgb_gmag = np.hypot(ndimage.sobel(gray, axis=0, mode='nearest'),
+                                ndimage.sobel(gray, axis=1, mode='nearest'))
+            rgb_edge_fg = valid & (rgb_gmag > self.rgb_edge_thresh)
+            foreground = foreground | rgb_edge_fg
+
         # Closing (dilate->erode) fills gaps in/between fragments; fill enclosed
         # edge contours; THEN opening (erode->dilate) removes speckle noise.
         foreground = self._erode(self._dilate(foreground, self.dilate_k), self.dilate_k)
@@ -279,6 +330,8 @@ class DepthSegmentNode(Node):
         fg2 = foreground[:h2 * 2, :w2 * 2].reshape(h2, 2, w2, 2).any(axis=(1, 3))
         bboxes += self._components(fg2, scale=2)
         bboxes = self._merge_iou(bboxes, thr=0.5)
+        # Coalesce fragments of the same object (overlap OR near-touching edges)
+        bboxes = self._merge_nearby(bboxes)
 
         # Build per-object detections (tight bbox + pad, median depth, 3D)
         objects = []
