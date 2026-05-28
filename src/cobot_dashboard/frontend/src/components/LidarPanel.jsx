@@ -23,41 +23,85 @@ function heightColor(z) {
   return         new THREE.Color(0.85, 0.25, 0.15)         // orange/red — high
 }
 
+// Pre-allocated point cloud renderer. Buffers are sized once at mount
+// for MAX_PTS and reused every frame — `needsUpdate=true` + setDrawRange
+// avoids allocating new ArrayBuffers / BufferAttributes on the hot path.
+// Consumes the dashboard's flat-array payload (msg.p = interleaved
+// float32 XYZ, msg.n = point count). Falls back to the legacy list-of-
+// dicts payload if the server is still on the old format.
+const MAX_PTS = 8192
 function PointCloud({ pointsRef }) {
-  const meshRef = useRef()
-  const geoRef  = useRef(new THREE.BufferGeometry())
+  const meshRef    = useRef()
+  const geoRef     = useRef(new THREE.BufferGeometry())
+  const posBufRef  = useRef(new Float32Array(MAX_PTS * 3))
+  const colBufRef  = useRef(new Float32Array(MAX_PTS * 3))
+
+  useEffect(() => {
+    const geo = geoRef.current
+    geo.setAttribute('position', new THREE.BufferAttribute(posBufRef.current, 3))
+    geo.setAttribute('color',    new THREE.BufferAttribute(colBufRef.current, 3))
+    geo.setDrawRange(0, 0)
+  }, [])
 
   useFrame(() => {
-    const pts = pointsRef.current
-    if (!pts || pts.length === 0) return
+    const data = pointsRef.current
+    if (!data) return
 
-    const positions = new Float32Array(pts.length * 3)
-    const colors    = new Float32Array(pts.length * 3)
+    const positions = posBufRef.current
+    const colors    = colBufRef.current
+    let n = 0
 
-    for (let i = 0; i < pts.length; i++) {
-      const p = pts[i]
-      const [tx, ty, tz] = lidarToThree(p.x, p.y, p.z)
-      positions[i * 3]     = tx
-      positions[i * 3 + 1] = ty
-      positions[i * 3 + 2] = tz
-      const c = heightColor(p.z)
-      colors[i * 3]     = c.r
-      colors[i * 3 + 1] = c.g
-      colors[i * 3 + 2] = c.b
+    // Flat-array format from the new dashboard.
+    if (Array.isArray(data.p) && typeof data.n === 'number') {
+      const p = data.p
+      n = Math.min(data.n, MAX_PTS)
+      for (let i = 0; i < n; i++) {
+        const px = p[i * 3]
+        const py = p[i * 3 + 1]
+        const pz = p[i * 3 + 2]
+        // lidarToThree mapping inlined: (x, y, z) -> (x, z, y)
+        positions[i * 3]     = px
+        positions[i * 3 + 1] = pz
+        positions[i * 3 + 2] = py
+        const c = heightColor(pz)
+        colors[i * 3]     = c.r
+        colors[i * 3 + 1] = c.g
+        colors[i * 3 + 2] = c.b
+      }
+    } else if (Array.isArray(data) || Array.isArray(data.points)) {
+      // Legacy {x, y, z} dict array.
+      const pts = Array.isArray(data) ? data : data.points
+      n = Math.min(pts.length, MAX_PTS)
+      for (let i = 0; i < n; i++) {
+        const q = pts[i]
+        positions[i * 3]     = q.x
+        positions[i * 3 + 1] = q.z
+        positions[i * 3 + 2] = q.y
+        const c = heightColor(q.z)
+        colors[i * 3]     = c.r
+        colors[i * 3 + 1] = c.g
+        colors[i * 3 + 2] = c.b
+      }
+    } else {
+      return
     }
 
     const geo = geoRef.current
-    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
-    geo.setAttribute('color',    new THREE.BufferAttribute(colors,    3))
-    geo.computeBoundingSphere()
-
-    if (meshRef.current) meshRef.current.geometry = geo
+    geo.setDrawRange(0, n)
+    geo.attributes.position.needsUpdate = true
+    geo.attributes.color.needsUpdate    = true
+    // Skip computeBoundingSphere — wastes CPU; OrbitControls already
+    // knows where to look and frustum culling is unnecessary here.
   })
 
   return (
     <points ref={meshRef}>
       <primitive object={geoRef.current} attach="geometry" />
-      <pointsMaterial size={0.025} vertexColors sizeAttenuation />
+      <pointsMaterial
+        size={2.0}
+        vertexColors
+        sizeAttenuation={false}
+      />
     </points>
   )
 }
@@ -558,9 +602,11 @@ export default function LidarPanel() {
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data)
-          pointsRef.current = msg.points ?? []
+          // New flat-array format: {p: [...], n: N, live, t}
+          // Legacy:                 {points: [{x,y,z},...], live, count, t}
+          pointsRef.current = msg
           setIsLive(msg.live ?? false)
-          setPointCount(msg.count ?? pointsRef.current.length)
+          setPointCount(msg.n ?? msg.count ?? (msg.points ? msg.points.length : 0))
         } catch (_) {}
       }
 
