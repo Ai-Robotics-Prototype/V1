@@ -1,0 +1,15 @@
+[Unit]
+Description=RoboAi nvblox GPU Reconstruction
+After=roboai-cameras.service roboai-lidar.service roboai-accumulator.service roboai-tf.service
+Wants=roboai-cameras.service roboai-lidar.service roboai-accumulator.service
+
+[Service]
+Type=simple
+User=teddy
+WorkingDirectory=/home/teddy/cobot_ws
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 launch cobot_bringup nvblox.launch.py'
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

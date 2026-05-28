@@ -1,16 +1,31 @@
-"""LiDAR-perception bringup: point cloud accumulator + nvblox TSDF/mesh.
+"""nvblox GPU TSDF reconstruction + nvblox→/ws/mesh JSON adapter.
 
-Pipeline:
-    /lidar/points (Livox MID-360)
-        |
-        v
-    pointcloud_accumulator  ->  /lidar/points_accumulated
-        |
-        v
-    nvblox_node  ->  /nvblox_node/mesh, /nvblox_node/static_esdf_pointcloud
+Pipeline (the accumulator + LiDAR driver are separate services):
 
-Static TFs are identity placeholders. Replace once the rig is extrinsically
-calibrated. The robot is stationary, so map = base_link.
+    /lidar/points_dense                          (roboai-accumulator)
+    /cam0/cam0/aligned_depth_to_color/image_raw  (roboai-cameras)
+    /cam0/cam0/color/image_raw                   (roboai-cameras)
+                  │
+                  v
+          nvblox_node  (GPU TSDF + marching cubes)
+                  │
+        /nvblox_node/mesh   (nvblox_msgs/Mesh)
+                  │
+                  v
+        nvblox_mesh_adapter  (per-block flatten + height colours
+                              + LiDAR-detection highlight + decimation)
+                  │
+        /reconstruction/mesh_json   (std_msgs/String)
+                  │
+                  v
+          dashboard /ws/mesh  →  LidarPanel ReconstructionMesh
+
+Static TFs published here are the missing parts of the tree:
+    livox_frame -> base_link  (identity — LiDAR is on the robot base)
+    map         -> livox_frame (identity — stationary setup, no odom)
+
+The cam0/cam1 TFs are published by roboai-tf (sensor_tf_publisher.py);
+DON'T duplicate them here or cam0 would have two parents.
 
     ros2 launch cobot_bringup nvblox.launch.py
 """
@@ -33,43 +48,45 @@ def _static_tf(parent: str, child: str) -> Node:
 def generate_launch_description():
     share = get_package_share_directory('cobot_bringup')
     cfg = os.path.join(share, 'config', 'nvblox.yaml')
-    accumulator_py = os.path.join(share, 'scripts', 'pointcloud_accumulator.py')
-
-    # cobot_bringup is ament_cmake (not a Python package), so scripts/ is
-    # installed under share/ rather than as a ROS executable. Invoke via
-    # python3 with the absolute path.
-    accumulator = ExecuteProcess(
-        cmd=['python3', accumulator_py, '--ros-args',
-             '-p', 'input_topic:=/lidar/points',
-             '-p', 'output_topic:=/lidar/points_accumulated',
-             '-p', 'window_size:=5',
-             '-p', 'voxel_size_m:=0.02',
-             '-p', 'publish_rate_hz:=10.0'],
-        output='screen',
-    )
+    adapter_py = os.path.join(share, 'scripts', 'nvblox_mesh_adapter.py')
 
     nvblox = Node(
         package='nvblox_ros', executable='nvblox_node',
         name='nvblox_node', output='screen',
         parameters=[cfg],
         remappings=[
-            ('pointcloud',                 '/lidar/points_accumulated'),
+            ('pointcloud',                 '/lidar/points_dense'),
             ('camera_0/depth/image',       '/cam0/cam0/aligned_depth_to_color/image_raw'),
-            ('camera_0/depth/camera_info', '/cam0/cam0/color/camera_info'),
+            ('camera_0/depth/camera_info', '/cam0/cam0/aligned_depth_to_color/camera_info'),
             ('camera_0/color/image',       '/cam0/cam0/color/image_raw'),
             ('camera_0/color/camera_info', '/cam0/cam0/color/camera_info'),
-            ('camera_1/depth/image',       '/cam1/cam1/aligned_depth_to_color/image_raw'),
-            ('camera_1/depth/camera_info', '/cam1/cam1/color/camera_info'),
-            ('camera_1/color/image',       '/cam1/cam1/color/image_raw'),
-            ('camera_1/color/camera_info', '/cam1/cam1/color/camera_info'),
         ],
     )
 
+    # Adapter converts the block-based nvblox mesh into the same JSON
+    # payload the dashboard /ws/mesh already understands.
+    adapter = ExecuteProcess(
+        cmd=['python3', adapter_py, '--ros-args',
+             '-p', 'mesh_topic:=/nvblox_node/mesh',
+             '-p', 'output_topic:=/reconstruction/mesh_json',
+             '-p', 'detections_topic:=/perception/lidar_detections',
+             '-p', 'max_triangles_json:=10000',
+             '-p', 'mesh_radius_m:=2.0',
+             '-p', 'object_highlight_radius_m:=0.05'],
+        output='screen',
+    )
+
     return LaunchDescription([
-        accumulator,
-        _static_tf('map',        'base_link'),
-        _static_tf('base_link',  'livox_frame'),
-        _static_tf('base_link',  'cam0_color_optical_frame'),
-        _static_tf('base_link',  'cam1_color_optical_frame'),
+        _static_tf('map',         'livox_frame'),
+        _static_tf('livox_frame', 'base_link'),
+        # RealSense publishes depth/color with header.frame_id =
+        # "camera_color_optical_frame" (the driver's default, despite the
+        # ROS namespace), but sensor_tf_publisher publishes the
+        # prefixed cam0_color_optical_frame. Bridge them so nvblox can
+        # resolve the depth frame against the TF tree — without this,
+        # every depth frame is silently dropped.
+        _static_tf('cam0_color_optical_frame', 'camera_color_optical_frame'),
+        _static_tf('cam0_color_optical_frame', 'camera_depth_optical_frame'),
         nvblox,
+        adapter,
     ])
