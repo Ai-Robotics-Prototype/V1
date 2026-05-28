@@ -267,34 +267,106 @@ class DepthSegmentNode(Node):
         y = (ys.astype(np.float32) - cy) * z / fy
         return np.stack([x, y, z], axis=1)
 
-    @staticmethod
-    def _fit_obb(points: np.ndarray):
-        """PCA-based oriented bbox from an Nx3 point cloud.
+    # OBB sanity limits (metres) for tabletop objects.
+    _OBB_MIN_DIM = 0.005
+    _OBB_MAX_DIM = 0.30
 
-        Returns (centroid[3], size[3], R[3,3]) where R's columns are the
-        principal axes sorted by descending eigenvalue (R[:,0] is the
-        longest extent's direction). R is right-handed (det=+1).
+    @staticmethod
+    def _refine_object_points(sub_d: np.ndarray, sub_fg: np.ndarray,
+                              fx: float, fy: float, cx_loc: float, cy_loc: float):
+        """Erode mask, deproject, drop table-plane points, drop outliers.
+
+        Returns the Nx3 cleaned cloud (may be empty). All operations are
+        defensive — every shrinking step falls back if it would leave
+        too few points for the next stage.
         """
-        centroid = points.mean(axis=0)
-        centred = points - centroid
-        # np.cov wants observations along columns
-        cov = np.cov(centred.T)
-        # eigh returns ascending eigenvalues for symmetric input
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        order = np.argsort(eigvals)[::-1]
-        eigvecs = eigvecs[:, order]
-        # Ensure right-handed: if det<0, flip the last column.
-        if np.linalg.det(eigvecs) < 0:
-            eigvecs[:, 2] *= -1
-        # Project points onto the principal axes; extent is max-min along each.
-        projected = centred @ eigvecs
-        mn = projected.min(axis=0)
-        mx = projected.max(axis=0)
-        size = (mx - mn).astype(np.float32)
-        # Recentre to the true geometric centre of the projected cloud.
-        offset = (mx + mn) * 0.5
-        centroid = centroid + eigvecs @ offset
-        return centroid.astype(np.float32), size, eigvecs.astype(np.float32)
+        # FIX 1: erode 2 px to drop edge-contamination pixels that often
+        # straddle the object / table boundary.
+        tight = ndimage.binary_erosion(sub_fg, iterations=2)
+        if tight.sum() < 5:
+            tight = sub_fg
+        pts = DepthSegmentNode._deproject_mask(
+            sub_d, tight.astype(bool), fx, fy, cx_loc, cy_loc,
+        )
+        if pts.shape[0] < 5:
+            return pts
+
+        # FIX 2: drop points within 5 mm of the deepest pixel (those are
+        # the table itself peeking through), AND drop points further than
+        # median + 2 cm (background behind the object).
+        z = pts[:, 2]
+        max_z = float(z.max())
+        median_z = float(np.median(z))
+        keep = (z < (max_z - 0.005)) & (z < (median_z + 0.02))
+        if keep.sum() >= 5:
+            pts = pts[keep]
+
+        # FIX 3: statistical outlier removal — distance from centroid
+        # above median + 1.5σ is dropped.
+        if pts.shape[0] >= 5:
+            c = pts.mean(axis=0)
+            d = np.linalg.norm(pts - c, axis=1)
+            mdist = float(np.median(d))
+            sdist = float(d.std()) + 1e-9
+            inl = d < (mdist + 1.5 * sdist)
+            if inl.sum() >= 5:
+                pts = pts[inl]
+        return pts
+
+    @classmethod
+    def _fit_obb(cls, points: np.ndarray):
+        """Yaw-only OBB for tabletop scenes.
+
+        2D PCA in the camera's X/Y plane gives the in-plane rotation
+        (the only angle a top-down gripper actually needs); the Z extent
+        comes straight from the cloud's depth range. The returned R is a
+        pure rotation about the camera Z axis.
+
+        If any extent falls outside [_OBB_MIN_DIM, _OBB_MAX_DIM] the OBB
+        is discarded and an axis-aligned bbox is returned instead, with
+        each dimension clamped to that same range. Returns
+        (centroid[3], size[3], R[3,3]).
+        """
+        # 2D PCA on (X, Y) only.
+        pxy = points[:, :2]
+        centroid_xy = pxy.mean(axis=0)
+        centred = pxy - centroid_xy
+        cov2 = np.cov(centred.T)
+        evals, evecs = np.linalg.eigh(cov2)
+        evecs = evecs[:, np.argsort(evals)[::-1]]
+        proj = centred @ evecs
+        mn = proj.min(axis=0)
+        mx = proj.max(axis=0)
+        size_xy = mx - mn
+        offset_xy = (mn + mx) * 0.5
+        centroid_xy = centroid_xy + evecs @ offset_xy
+
+        z = points[:, 2]
+        z_min, z_max = float(z.min()), float(z.max())
+        size_z = max(z_max - z_min, 0.01)
+        centroid_z = 0.5 * (z_min + z_max)
+
+        centroid = np.array([centroid_xy[0], centroid_xy[1], centroid_z], dtype=np.float32)
+        size_3d = np.array([size_xy[0], size_xy[1], size_z], dtype=np.float32)
+
+        yaw = math.atan2(float(evecs[1, 0]), float(evecs[0, 0]))
+        cy_, sy_ = math.cos(yaw), math.sin(yaw)
+        R = np.array([
+            [cy_, -sy_, 0.0],
+            [sy_,  cy_, 0.0],
+            [0.0,  0.0, 1.0],
+        ], dtype=np.float32)
+
+        # FIX 4: sanity-clamp. If any dim is implausible for a tabletop
+        # object, fall back to a min-max AABB clamped into range.
+        if (size_3d > cls._OBB_MAX_DIM).any() or (size_3d < cls._OBB_MIN_DIM).any():
+            mn3, mx3 = points.min(axis=0), points.max(axis=0)
+            size_3d = (mx3 - mn3).astype(np.float32)
+            centroid = ((mx3 + mn3) * 0.5).astype(np.float32)
+            R = np.eye(3, dtype=np.float32)
+            size_3d = np.clip(size_3d, cls._OBB_MIN_DIM, cls._OBB_MAX_DIM)
+
+        return centroid, size_3d, R
 
     @staticmethod
     def _rmat_to_quat_euler(R: np.ndarray):
@@ -430,9 +502,11 @@ class DepthSegmentNode(Node):
             sub_fg = foreground[y0:y1, x0:x1]
 
             # Vectorised deprojection of every foreground pixel in the bbox
-            # whose depth is valid. Indices are local to the bbox, so we
-            # offset cx/cy by (x0, y0) to keep coordinates in the full image.
-            pts3d = self._deproject_mask(
+            # whose depth is valid, *after* mask erosion (to drop edge
+            # contamination), table-plane removal, and a 1.5σ outlier
+            # cull. Indices are local to the bbox, so cx/cy are offset by
+            # (x0, y0) to keep coordinates in the full image.
+            pts3d = self._refine_object_points(
                 sub_d, sub_fg.astype(bool), fx, fy, cx - x0, cy - y0,
             )
             # Cheap fallback for nearly-empty masks: use any valid depth
