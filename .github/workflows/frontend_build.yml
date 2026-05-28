@@ -1,0 +1,42 @@
+name: Frontend Build
+
+on:
+  push:
+    paths:
+      - 'src/cobot_dashboard/frontend/src/**'
+      - 'src/cobot_dashboard/frontend/package.json'
+      - 'src/cobot_dashboard/frontend/vite.config.js'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: src/cobot_dashboard/frontend/package-lock.json
+
+      - name: Install
+        working-directory: src/cobot_dashboard/frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: src/cobot_dashboard/frontend
+        run: npm run build
+
+      - name: Commit built files
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'ci: rebuild dashboard frontend [${{ github.sha }}]'
+          file_pattern: 'src/cobot_dashboard/mock_server/static/**'
+          commit_user_name: 'github-actions[bot]'
+          commit_user_email: 'github-actions[bot]@users.noreply.github.com'
