@@ -29,7 +29,7 @@ function heightColor(z) {
 // Consumes the dashboard's flat-array payload (msg.p = interleaved
 // float32 XYZ, msg.n = point count). Falls back to the legacy list-of-
 // dicts payload if the server is still on the old format.
-const MAX_PTS = 49152
+const MAX_PTS = 65536
 function PointCloud({ pointsRef }) {
   const meshRef    = useRef()
   const geoRef     = useRef(new THREE.BufferGeometry())
@@ -116,9 +116,9 @@ function PointCloud({ pointsRef }) {
     <points ref={meshRef}>
       <primitive object={geoRef.current} attach="geometry" />
       <pointsMaterial
-        size={2.0}
+        size={0.004}
         vertexColors
-        sizeAttenuation={false}
+        sizeAttenuation={true}
       />
     </points>
   )
