@@ -14,7 +14,7 @@ Params (all overridable from a launch file or service unit):
     input_topic              /lidar/points
     output_topic             /lidar/points_dense
     near_range_m             1.0
-    near_accumulate_frames   20
+    near_accumulate_frames   50
     far_accumulate_frames    5
     near_voxel_m             0.005
     far_voxel_m              0.03
@@ -95,14 +95,11 @@ class PointCloudAccumulator(Node):
         self.declare_parameter('input_topic',            '/lidar/points')
         self.declare_parameter('output_topic',           '/lidar/points_dense')
         self.declare_parameter('near_range_m',           1.0)
-        # Smaller windows = lower latency. 15 near frames at 10 Hz = 1.5 s
-        # of accumulated sweep; the Livox non-repetitive pattern fills the
-        # near workspace fast enough that going higher mostly adds lag.
-        self.declare_parameter('near_accumulate_frames', 15)
-        self.declare_parameter('far_accumulate_frames',  3)
+        self.declare_parameter('near_accumulate_frames', 50)
+        self.declare_parameter('far_accumulate_frames',  5)
         self.declare_parameter('near_voxel_m',           0.005)
         self.declare_parameter('far_voxel_m',            0.03)
-        self.declare_parameter('publish_hz',             20.0)
+        self.declare_parameter('publish_hz',             10.0)
         self.declare_parameter('frame_id',               '')
 
         input_topic  = self.get_parameter('input_topic').value

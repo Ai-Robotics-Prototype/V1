@@ -218,7 +218,7 @@ except ImportError:
         return json.dumps(obj)
 
 
-def _parse_pointcloud2(msg, max_points: int = 8000):
+def _parse_pointcloud2(msg, max_points: int = 15000):
     """Vectorised PointCloud2 decode → flat float32 ndarray (3N,) in
     interleaved XYZ order. Returns an empty ndarray on failure.
 
@@ -259,12 +259,10 @@ def _parse_pointcloud2(msg, max_points: int = 8000):
     if xyz.shape[0] > max_points:
         stride = xyz.shape[0] // max_points
         xyz = xyz[::stride][:max_points]
-    # mm-precision rounding for compact JSON (3 chars per coord after dot).
-    xyz = _np.round(xyz, 3).astype(_np.float32, copy=False)
-    return xyz.reshape(-1).copy()
+    return xyz.reshape(-1).astype(_np.float32, copy=False).copy()
 
 
-def _parse_pointcloud2_legacy(msg, max_points: int = 8000) -> list:
+def _parse_pointcloud2_legacy(msg, max_points: int = 15000) -> list:
     """Original Python-loop decoder — kept for the unusual field layout
     or when numpy is unavailable. Still returns list-of-dicts for
     compatibility, but _build_lidar_payload normalises both shapes."""
@@ -771,7 +769,7 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         return bool(pts)
 
     def _on_lidar_dense(self, msg):
-        pts = _parse_pointcloud2(msg, max_points=8000)
+        pts = _parse_pointcloud2(msg, max_points=15000)
         if self._pts_not_empty(pts):
             self._lidar_last["dense"] = time.time()
             with _lidar_lock:
@@ -781,7 +779,7 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
     def _on_lidar_accum(self, msg):
         if not self._lidar_stale("dense"):
             return
-        pts = _parse_pointcloud2(msg, max_points=8000)
+        pts = _parse_pointcloud2(msg, max_points=15000)
         if self._pts_not_empty(pts):
             self._lidar_last["acc"] = time.time()
             with _lidar_lock:
@@ -878,7 +876,7 @@ if FASTAPI_AVAILABLE:
 
     async def _broadcast_loop():
         state_hz  = 25
-        lidar_hz  = 20
+        lidar_hz  = 10
         mesh_hz   = 2
         state_dt  = 1.0 / state_hz
         lidar_dt  = 1.0 / lidar_hz
