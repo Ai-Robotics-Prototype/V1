@@ -29,7 +29,7 @@ function heightColor(z) {
 // Consumes the dashboard's flat-array payload (msg.p = interleaved
 // float32 XYZ, msg.n = point count). Falls back to the legacy list-of-
 // dicts payload if the server is still on the old format.
-const MAX_PTS = 16384
+const MAX_PTS = 49152
 function PointCloud({ pointsRef }) {
   const meshRef    = useRef()
   const geoRef     = useRef(new THREE.BufferGeometry())
@@ -51,8 +51,26 @@ function PointCloud({ pointsRef }) {
     const colors    = colBufRef.current
     let n = 0
 
+    // Binary wire format: { binary: true, floats: Float32Array, n }
+    // floats are interleaved XYZ in LiDAR frame; map (x, y, z) -> (x, z, y).
+    if (data.binary && data.floats) {
+      const f = data.floats
+      n = Math.min(data.n, MAX_PTS)
+      for (let i = 0; i < n; i++) {
+        const px = f[i * 3]
+        const py = f[i * 3 + 1]
+        const pz = f[i * 3 + 2]
+        positions[i * 3]     = px
+        positions[i * 3 + 1] = pz
+        positions[i * 3 + 2] = py
+        const c = heightColor(pz)
+        colors[i * 3]     = c.r
+        colors[i * 3 + 1] = c.g
+        colors[i * 3 + 2] = c.b
+      }
+    }
     // Flat-array format from the new dashboard.
-    if (Array.isArray(data.p) && typeof data.n === 'number') {
+    else if (Array.isArray(data.p) && typeof data.n === 'number') {
       const p = data.p
       n = Math.min(data.n, MAX_PTS)
       for (let i = 0; i < n; i++) {
@@ -592,6 +610,7 @@ export default function LidarPanel() {
 
     function connect() {
       const ws = new WebSocket(`${WS_PROTO}://${HOST}/ws/lidar`)
+      ws.binaryType = 'arraybuffer'
       wsRef.current = ws
 
       ws.onopen = () => {
@@ -600,14 +619,26 @@ export default function LidarPanel() {
       }
 
       ws.onmessage = (ev) => {
-        try {
-          const msg = JSON.parse(ev.data)
-          // New flat-array format: {p: [...], n: N, live, t}
-          // Legacy:                 {points: [{x,y,z},...], live, count, t}
-          pointsRef.current = msg
-          setIsLive(msg.live ?? false)
-          setPointCount(msg.n ?? msg.count ?? (msg.points ? msg.points.length : 0))
-        } catch (_) {}
+        const data = ev.data
+        if (data instanceof ArrayBuffer) {
+          // Binary: 4-byte LE uint32 count, then count*3 float32 XYZ.
+          const view   = new DataView(data)
+          const count  = view.getUint32(0, true)
+          const floats = count > 0 ? new Float32Array(data, 4, count * 3) : new Float32Array(0)
+          pointsRef.current = { binary: true, floats, n: count }
+          // Binary wire format drops the live/t fields; assume live while
+          // frames are arriving (the WS itself is the liveness signal).
+          setIsLive(count > 0)
+          setPointCount(count)
+        } else {
+          try {
+            const msg = JSON.parse(data)
+            // Legacy JSON fallback for compatibility.
+            pointsRef.current = msg
+            setIsLive(msg.live ?? false)
+            setPointCount(msg.n ?? msg.count ?? (msg.points ? msg.points.length : 0))
+          } catch (_) {}
+        }
       }
 
       ws.onerror = () => {}

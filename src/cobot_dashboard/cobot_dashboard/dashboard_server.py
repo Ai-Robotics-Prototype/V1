@@ -218,7 +218,7 @@ except ImportError:
         return json.dumps(obj)
 
 
-def _parse_pointcloud2(msg, max_points: int = 15000):
+def _parse_pointcloud2(msg, max_points: int = 40000):
     """Vectorised PointCloud2 decode → flat float32 ndarray (3N,) in
     interleaved XYZ order. Returns an empty ndarray on failure.
 
@@ -262,7 +262,7 @@ def _parse_pointcloud2(msg, max_points: int = 15000):
     return xyz.reshape(-1).astype(_np.float32, copy=False).copy()
 
 
-def _parse_pointcloud2_legacy(msg, max_points: int = 15000) -> list:
+def _parse_pointcloud2_legacy(msg, max_points: int = 40000) -> list:
     """Original Python-loop decoder — kept for the unusual field layout
     or when numpy is unavailable. Still returns list-of-dicts for
     compatibility, but _build_lidar_payload normalises both shapes."""
@@ -769,7 +769,7 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         return bool(pts)
 
     def _on_lidar_dense(self, msg):
-        pts = _parse_pointcloud2(msg, max_points=15000)
+        pts = _parse_pointcloud2(msg, max_points=40000)
         if self._pts_not_empty(pts):
             self._lidar_last["dense"] = time.time()
             with _lidar_lock:
@@ -779,7 +779,7 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
     def _on_lidar_accum(self, msg):
         if not self._lidar_stale("dense"):
             return
-        pts = _parse_pointcloud2(msg, max_points=15000)
+        pts = _parse_pointcloud2(msg, max_points=40000)
         if self._pts_not_empty(pts):
             self._lidar_last["acc"] = time.time()
             with _lidar_lock:
@@ -923,39 +923,35 @@ if FASTAPI_AVAILABLE:
             if now >= next_lidar:
                 with _lidar_lock:
                     pts  = _lidar_state["pts"]   # no copy — readers can't mutate
-                    live = _lidar_state["live"]
-                # Flat interleaved float32 payload:
-                #   {"p": [x0, y0, z0, x1, y1, z1, ...], "n": N, ...}
-                # cuts the JSON by ~3x vs list-of-{"x","y","z"} dicts, and
-                # orjson serialises numpy arrays natively.
+                # Binary wire format: 4-byte LE uint32 count + N*12 bytes of
+                # interleaved float32 XYZ. ~3x smaller than the JSON flat
+                # array at 40k points (480 KB vs ~1.5 MB).
                 if _np is not None and isinstance(pts, _np.ndarray):
                     n = pts.size // 3
-                    payload = {"p": pts, "n": int(n),
-                                "live": bool(live),
-                                "t": now * 1000}
+                    arr = pts[:n * 3].astype(_np.float32, copy=False)
                 elif pts:
-                    # Legacy list-of-dicts fallback (slow path or sim).
-                    flat = []
-                    for p in pts:
-                        flat.append(p["x"]); flat.append(p["y"]); flat.append(p["z"])
-                    payload = {"p": flat, "n": len(pts),
-                                "live": bool(live),
-                                "t": now * 1000}
+                    arr = _np.asarray(
+                        [c for p in pts for c in (p["x"], p["y"], p["z"])],
+                        dtype=_np.float32,
+                    ) if _np is not None else None
+                    n = (len(arr) // 3) if arr is not None else 0
                 else:
                     sim = _sim_lidar_frame(now - _START_TIME)
-                    flat = []
-                    for p in sim:
-                        flat.append(p["x"]); flat.append(p["y"]); flat.append(p["z"])
-                    payload = {"p": flat, "n": len(sim),
-                                "live": False,
-                                "t": now * 1000}
-                lidar_txt = _json_dumps(payload)
+                    arr = _np.asarray(
+                        [c for p in sim for c in (p["x"], p["y"], p["z"])],
+                        dtype=_np.float32,
+                    ) if _np is not None else None
+                    n = (len(arr) // 3) if arr is not None else 0
+                if arr is None or n == 0:
+                    lidar_payload = struct.pack('<I', 0)
+                else:
+                    lidar_payload = struct.pack('<I', n) + arr.tobytes()
                 with _ws_lock:
                     clients = list(_lidar_clients.items())
                 for ws, q in clients:
                     if q.qsize() < 2:
                         try:
-                            await q.put(lidar_txt)
+                            await q.put(('binary', lidar_payload))
                         except Exception:
                             pass
                 next_lidar = now + lidar_dt
@@ -990,8 +986,11 @@ if FASTAPI_AVAILABLE:
             _lidar_clients[websocket] = q
         try:
             while True:
-                txt = await q.get()
-                await websocket.send_text(txt)
+                item = await q.get()
+                if isinstance(item, tuple) and item and item[0] == 'binary':
+                    await websocket.send_bytes(item[1])
+                else:
+                    await websocket.send_text(item)
         except (WebSocketDisconnect, Exception):
             pass
         finally:
