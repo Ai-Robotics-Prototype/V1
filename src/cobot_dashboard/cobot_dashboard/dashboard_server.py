@@ -549,7 +549,12 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         publisher arranges bbox.center.z and bbox.size.z so that
         center.z - size.z/2 = cluster min_z, i.e. the box bottom sits
         on the lowest physical point of the cluster.
+
+        Sanity filter: drop low-confidence, non-finite, or far-out-of-
+        workspace boxes so over-segmented noise clusters don't pollute
+        the 3D view.
         """
+        import math as _m
         out = []
         for det in msg.detections:
             if not det.results:
@@ -558,6 +563,13 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             p = det.bbox.center.position
             s = det.bbox.size
             ori = det.bbox.center.orientation
+            score = float(res.hypothesis.score)
+            if score < 0.5:
+                continue
+            if not (_m.isfinite(p.x) and _m.isfinite(p.y) and _m.isfinite(p.z)):
+                continue
+            if abs(p.x) > 5.0 or abs(p.y) > 5.0 or abs(p.z) > 5.0:
+                continue
             out.append({
                 "id":         str(id(det)),
                 "class_name": str(res.hypothesis.class_id),
