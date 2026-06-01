@@ -26,6 +26,7 @@ Publishes (topics are parameters; one instance per camera):
 Dependencies: numpy, scipy, PIL only. No cv2, no torch, no ultralytics.
 """
 import collections
+import json
 import math
 import os
 import numpy as np
@@ -34,6 +35,7 @@ import yaml
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import String
 from vision_msgs.msg import Detection3DArray, Detection3D, ObjectHypothesisWithPose
 
 try:
@@ -152,6 +154,14 @@ class DepthSegmentNode(Node):
 
         self.det_pub = self.create_publisher(Detection3DArray, det_topic, 10)
         self.ann_pub = self.create_publisher(Image, ann_topic, 5)
+
+        # Detection-mode toggle (published by dashboard /cmd/detection_mode).
+        # "all" passes every stable segment through; "library" drops
+        # everything that didn't match a CAD part.
+        self._detection_mode = 'all'
+        self.create_subscription(
+            String, '/perception/detection_mode',
+            self._on_detection_mode, 10)
 
         # Camera-optical -> LiDAR transform. Centroids and OBB rotations are
         # converted with this before publishing Detection3D so consumers
@@ -864,6 +874,16 @@ class DepthSegmentNode(Node):
         if self._log_count % 30 == 0:
             self.get_logger().info(f'{len(self._temporal_filter())} object(s) detected')
 
+    def _on_detection_mode(self, msg):
+        try:
+            data = json.loads(msg.data) if msg.data else {}
+            mode = str(data.get('detection_mode') or 'all')
+            if mode in ('all', 'library') and mode != self._detection_mode:
+                self._detection_mode = mode
+                self.get_logger().info(f'detection mode -> {mode}')
+        except Exception:
+            pass
+
     def _emit(self, h, w):
         """Apply temporal smoothing, match against the parts library,
         then publish detections + annotated image."""
@@ -926,6 +946,12 @@ class DepthSegmentNode(Node):
         # world frame. The annotated image still uses cam-frame data
         # for projection (kept in `corners`).
         arr.header.frame_id = self._lidar_frame_id
+        # Detection-mode gate: "library" drops everything that didn't
+        # match a CAD entry; "all" keeps every stable detection.
+        if getattr(self, '_detection_mode', 'all') == 'library':
+            objects = [o for o in objects
+                       if o.get('part_name')
+                       and float(o.get('match_score') or 0.0) >= 0.5]
         for o in objects:
             det = Detection3D()
             det.header = arr.header

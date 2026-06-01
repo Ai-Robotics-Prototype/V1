@@ -103,9 +103,53 @@ function DetectionOverlay({ detections }) {
   )
 }
 
+function DetectionModeToggle() {
+  const mode    = useStore((s) => s.detectionMode || 'all')
+  const setMode = useStore((s) => s.setDetectionMode)
+  const pill = (active, accent) => ({
+    padding: '5px 12px',
+    fontSize: 11,
+    fontWeight: 600,
+    border: 'none',
+    borderRadius: 17,
+    cursor: 'pointer',
+    background: active ? accent : 'transparent',
+    color:      active ? '#fff' : 'rgba(255,255,255,0.7)',
+    transition: 'all 150ms',
+  })
+  // Click-stop so the toggle doesn't trigger the outer panel's
+  // setView({cam}) handler (single-camera focus mode).
+  const stop = (e) => e.stopPropagation()
+  return (
+    <div onClick={stop}
+      style={{
+        position: 'absolute', top: 8, left: '50%', transform: 'translateX(-50%)',
+        display: 'flex', gap: 0, padding: 3,
+        background: 'rgba(15,17,22,0.85)',
+        border: '1px solid rgba(255,255,255,0.12)',
+        borderRadius: 20,
+        zIndex: 5,
+        backdropFilter: 'blur(6px)',
+      }}
+    >
+      <button onClick={() => setMode('all')}     style={pill(mode === 'all',     'rgba(34,197,94,0.85)')}>
+        All Objects
+      </button>
+      <button onClick={() => setMode('library')} style={pill(mode === 'library', '#3B82F6')}>
+        Library Parts
+      </button>
+    </div>
+  )
+}
+
 export default function CameraPanel({ cam = 0 }) {
-  const detections = useStore((s) => s.detections)
-  const setView    = useStore((s) => s.setView)
+  const detections    = useStore((s) => s.detections)
+  const setView       = useStore((s) => s.setView)
+  const detectionMode = useStore((s) => s.detectionMode || 'all')
+
+  const visibleDetections = detectionMode === 'library'
+    ? detections.filter(d => d.part_name && Number(d.match_score) >= 0.5)
+    : detections
 
   const [online, setOnline]     = useState(true)
   const [fps, setFps]           = useState(null)
@@ -168,6 +212,23 @@ export default function CameraPanel({ cam = 0 }) {
               MJPEG stream (consistent green, both cameras). The old client-side
               SVG overlay was removed — it rendered cam0 detections (grey, no
               distance) on both panels, causing inconsistent boxes. */}
+
+          {/* Detection mode toggle (rendered on cam0 only so the two panels
+              don't both stack the same control on top of each other). */}
+          {cam === 0 && <DetectionModeToggle />}
+
+          {/* Library-mode banner */}
+          {detectionMode === 'library' && (
+            <div style={{
+              position: 'absolute', top: 44, left: '50%', transform: 'translateX(-50%)',
+              background: 'rgba(59,130,246,0.9)', color: '#fff',
+              fontSize: 10, fontWeight: 600, letterSpacing: '0.04em',
+              padding: '3px 10px', borderRadius: 12,
+              pointerEvents: 'none', zIndex: 5,
+            }}>
+              LIBRARY MODE — {visibleDetections.length} part{visibleDetections.length !== 1 ? 's' : ''} matched
+            </div>
+          )}
 
           {/* FPS badge */}
           <div style={{

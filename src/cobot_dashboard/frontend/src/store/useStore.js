@@ -37,6 +37,15 @@ const storeDefinition = (set, get) => ({
     paused: false,
   },
   detections: [],
+  detectionMode: 'all',
+  setDetectionMode: (mode) => {
+    set({ detectionMode: mode })
+    fetch('/cmd/detection_mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    }).catch(() => {})
+  },
   lidar_objects: [],
   placed_objects: [],
   scene_graph: { objects: [] },
@@ -93,6 +102,10 @@ const storeDefinition = (set, get) => ({
           joints: msg.joints ?? get().joints,
           task: msg.task ?? get().task,
           detections: msg.detections ?? get().detections,
+          // Server publishes detection_mode in STATE; keep the store
+          // in sync so a fresh page-load picks up whatever mode was
+          // last set, even if this client didn't toggle it.
+          detectionMode: msg.detection_mode ?? get().detectionMode,
           lidar_objects: msg.lidar_objects ?? get().lidar_objects,
           placed_objects: msg.placed_objects ?? get().placed_objects,
           scene_graph: msg.scene_graph ?? get().scene_graph,

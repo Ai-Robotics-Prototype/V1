@@ -88,6 +88,10 @@ STATE = {
     # LLM-generated pick/place program (populated by auto_program_node)
     "auto_program": {"steps": [], "scene_size": 0, "t": 0.0},
     "auto_status":  {"state": "IDLE", "error": None, "n_steps": 0, "t": 0.0},
+    # Camera detection mode — broadcast to depth_segment_node, which
+    # filters its detections accordingly. "all" emits every segment,
+    # "library" emits only parts that matched the CAD library.
+    "detection_mode": "all",
 }
 
 # Latest JPEG bytes per camera (None = no real frame yet)
@@ -407,6 +411,8 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self._voice_pub = self.create_publisher(String, "/task/voice_command", 10)
         self._generate_program_pub = self.create_publisher(
             String, "/task/generate_program", 5)
+        self._detection_mode_pub = self.create_publisher(
+            String, "/perception/detection_mode", 5)
 
         # Auto-program subscriber (LLM-generated pick/place steps)
         self.create_subscription(String, "/task/auto_program",
@@ -1240,6 +1246,25 @@ if FASTAPI_AVAILABLE:
             _ros_node.publish_task_command(command)
         with _state_lock:
             return {"ok": True, "task": copy.deepcopy(STATE["task"])}
+
+    @app.post("/cmd/detection_mode")
+    async def cmd_detection_mode(request: Request):
+        """Switch depth_segment between 'all' and 'library'."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        mode = str(body.get("mode") or "all")
+        if mode not in ("all", "library"):
+            return JSONResponse({"error": f"unknown mode {mode!r}"}, status_code=400)
+        if _ros_node is None or _ros_node._detection_mode_pub is None:
+            return JSONResponse({"error": "ROS node not ready"}, status_code=503)
+        m = String()
+        m.data = json.dumps({"detection_mode": mode})
+        _ros_node._detection_mode_pub.publish(m)
+        with _state_lock:
+            STATE["detection_mode"] = mode
+        return {"ok": True, "mode": mode}
 
     @app.post("/cmd/generate_program")
     async def cmd_generate_program(request: Request):

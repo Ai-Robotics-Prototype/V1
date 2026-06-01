@@ -394,34 +394,46 @@ function JointPositions() {
 
 // Column 3: Detected objects
 function DetectedObjects() {
-  const detections = useStore((s) => s.detections)
+  const detections    = useStore((s) => s.detections)
+  const detectionMode = useStore((s) => s.detectionMode || 'all')
 
   const CLASS_COLORS = {
     bottle: 'var(--accent)',
     box:    'var(--green)',
     person: 'var(--red)',
   }
+  const MATCHED_COLOR = '#3B82F6'
 
   function dist(det) {
     return Math.sqrt(det.x ** 2 + det.y ** 2 + det.z ** 2)
   }
 
-  const sorted = [...detections].sort((a, b) => dist(a) - dist(b))
+  const filtered = detectionMode === 'library'
+    ? detections.filter(d => d.part_name && Number(d.match_score) >= 0.5)
+    : detections
+  const sorted = [...filtered].sort((a, b) => dist(a) - dist(b))
 
   return (
     <div style={{ width: 200, flexShrink: 0, padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 4, overflowY: 'auto' }}>
-      <div style={{ fontSize: 9, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-muted)', marginBottom: 2 }}>
-        Detected Objects
+      <div style={{ fontSize: 9, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-muted)', marginBottom: 2, display: 'flex', justifyContent: 'space-between' }}>
+        <span>Detected Objects</span>
+        {detectionMode === 'library' && (
+          <span style={{ color: MATCHED_COLOR, fontWeight: 600 }}>LIB</span>
+        )}
       </div>
 
       {sorted.length === 0 ? (
         <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', marginTop: 16 }}>
-          No objects detected
+          {detectionMode === 'library' ? 'No library parts in view' : 'No objects detected'}
         </div>
       ) : (
         sorted.map((det) => {
-          const d     = dist(det)
-          const color = CLASS_COLORS[det.class_name] ?? 'var(--text-muted)'
+          const d        = dist(det)
+          const isMatch  = det.part_name && Number(det.match_score) >= 0.5
+          const color    = isMatch ? MATCHED_COLOR : (CLASS_COLORS[det.class_name] ?? 'var(--text-muted)')
+          const label    = isMatch ? det.part_name : (det.class_name || 'object')
+          const barPct   = isMatch ? Math.round((det.match_score ?? 0) * 100)
+                                   : Math.round((det.score       ?? 0) * 100)
           return (
             <div key={det.id} style={{
               background: 'var(--bg-surface)',
@@ -437,12 +449,14 @@ function DetectedObjects() {
                 width: 6, height: 6, borderRadius: '50%', background: color, display: 'inline-block', flexShrink: 0,
               }} />
               <span style={{
-                fontSize: 11, textTransform: 'uppercase', fontWeight: 500, color, width: 50, flexShrink: 0,
-              }}>
-                {det.class_name}
+                fontSize: 11, textTransform: isMatch ? 'none' : 'uppercase',
+                fontWeight: 500, color, width: 64, flexShrink: 0,
+                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }} title={label}>
+                {label}
               </span>
               <div style={{ flex: 1, height: 3, background: 'var(--bg-active)', borderRadius: 2, overflow: 'hidden' }}>
-                <div style={{ width: `${Math.round(det.score * 100)}%`, height: '100%', background: color, borderRadius: 2 }} />
+                <div style={{ width: `${barPct}%`, height: '100%', background: color, borderRadius: 2 }} />
               </div>
               <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', fontVariantNumeric: 'tabular-nums', color: 'var(--text-secondary)', flexShrink: 0 }}>
                 {d.toFixed(2)} m
