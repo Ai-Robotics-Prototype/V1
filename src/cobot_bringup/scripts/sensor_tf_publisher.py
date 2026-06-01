@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
-"""Broadcast static TFs from livox_frame to the camera optical frames.
+"""Broadcast TFs from livox_frame to the camera optical frames.
 
 Reads src/cobot_bringup/config/sensor_transforms.yaml (or the installed
 copy under share/cobot_bringup/config/) on startup and publishes one
-static transform per camera. Missing or unreadable YAML falls back to
-the standard optical->ROS rotation with zero translation so the rest of
+transform per camera. Missing or unreadable YAML falls back to the
+standard optical->ROS rotation with zero translation so the rest of
 the stack can still come up.
+
+The transforms ARE physically static (cameras don't move), but this
+node uses the dynamic TransformBroadcaster + a periodic timer rather
+than StaticTransformBroadcaster. Reason: StaticTransformBroadcaster
+publishes once on /tf_static with TRANSIENT_LOCAL durability, but the
+local DDS implementation has been losing those messages for nodes that
+subscribe after the publisher (perception_fusion was hitting this for
+days). Re-broadcasting at 0.5 Hz on /tf is verbose but reliable.
 
 TF tree:
     livox_frame ─┬─ cam0_color_optical_frame
@@ -17,7 +25,7 @@ import rclpy
 import yaml
 from geometry_msgs.msg import TransformStamped
 from rclpy.node import Node
-from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
+from tf2_ros import TransformBroadcaster
 
 
 # Standard optical -> ROS quaternion: rotation that takes a vector in the
@@ -68,26 +76,37 @@ def _make_tf(stamp, child, translation, rotation) -> TransformStamped:
 class SensorTFPublisher(Node):
     def __init__(self):
         super().__init__('sensor_tf_publisher')
-        self._br = StaticTransformBroadcaster(self)
+        self._br = TransformBroadcaster(self)
         cfg, src = _load_config(self.get_logger())
 
-        stamp = self.get_clock().now().to_msg()
-        tfs = []
+        self._entries = []
         for key, child in [('cam0_to_lidar', 'cam0_color_optical_frame'),
                            ('cam1_to_lidar', 'cam1_color_optical_frame')]:
             block = cfg.get(key) or {}
             trans = block.get('translation') or [0.0, 0.0, 0.0]
             rot   = block.get('rotation')    or list(_OPTICAL_TO_ROS_Q)
-            tfs.append(_make_tf(stamp, child, trans, rot))
+            self._entries.append((child, trans, rot))
             self.get_logger().info(
                 f'livox_frame -> {child}: '
                 f't=[{trans[0]:+.3f},{trans[1]:+.3f},{trans[2]:+.3f}] '
                 f'q=[{rot[0]:+.3f},{rot[1]:+.3f},{rot[2]:+.3f},{rot[3]:+.3f}]')
 
+        # Re-broadcast every 2 s so late-joining subscribers receive the
+        # transforms even when /tf_static didn't get through. Stamped
+        # with current time on each tick so TF doesn't discard them as
+        # stale.
+        self._broadcast_now()
+        self.create_timer(2.0, self._broadcast_now)
+        self.get_logger().info(
+            f'broadcasting {len(self._entries)} TF(s) at 0.5 Hz'
+            + (f' from {src}' if src else ''))
+
+    def _broadcast_now(self):
+        stamp = self.get_clock().now().to_msg()
+        tfs = [_make_tf(stamp, child, trans, rot)
+               for child, trans, rot in self._entries]
         if tfs:
             self._br.sendTransform(tfs)
-        self.get_logger().info(f'published {len(tfs)} static TF(s)'
-                               + (f' from {src}' if src else ''))
 
 
 def main(args=None):

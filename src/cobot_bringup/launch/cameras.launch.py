@@ -73,7 +73,7 @@ def generate_launch_description():
                 # cam1: colour + depth for detection. IR streams OFF (as on cam0)
                 # so both cameras' depth fits on the shared USB3 controller.
                 'align_depth.enable':              True,
-                'pointcloud.enable':               False,
+                'pointcloud__neon_.enable':        True,
                 'depth_module.depth_profile':      '640x480x30',
                 'rgb_camera.color_profile':        '640x480x30',
                 'enable_infra1':                   False,

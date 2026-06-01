@@ -1,17 +1,63 @@
+import os
 import struct
 import threading
 import time
+
+import numpy as np
 import rclpy
+import yaml
 from rclpy.node import Node
 from rclpy.time import Duration
 import message_filters
 from sensor_msgs.msg import PointCloud2, PointField
-import numpy as np
 
 from perception_fusion.cuda_fusion import (
     concat_clouds, range_filter, voxel_downsample,
     estimate_normals, get_backend, CUPY_AVAILABLE,
 )
+
+
+# Search paths for the camera-extrinsics yaml. Same list as
+# sensor_tf_publisher.py uses so behaviour stays consistent.
+_TF_YAML_CANDIDATES = [
+    '/home/teddy/cobot_ws/install/cobot_bringup/share/cobot_bringup/config/sensor_transforms.yaml',
+    '/home/teddy/cobot_ws/src/cobot_bringup/config/sensor_transforms.yaml',
+]
+_OPTICAL_TO_ROS_Q = (0.5, -0.5, 0.5, -0.5)
+
+
+def _quat_to_R(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    """Quaternion (x, y, z, w) -> 3x3 rotation matrix (float32)."""
+    return np.array([
+        [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)    ],
+        [2*(qx*qy + qz*qw),     1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)    ],
+        [2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw),     1 - 2*(qx*qx + qy*qy)],
+    ], dtype=np.float32)
+
+
+def _load_cam_transforms():
+    """Return {'cam0': (R, t), 'cam1': (R, t)} read from the yaml.
+    Falls back to identity translation + optical-to-ROS rotation if
+    the file is missing."""
+    cfg = {}
+    for path in _TF_YAML_CANDIDATES:
+        if os.path.isfile(path):
+            try:
+                with open(path) as f:
+                    cfg = yaml.safe_load(f) or {}
+                break
+            except Exception:
+                continue
+    out = {}
+    for key, label in [('cam0_to_lidar', 'cam0'), ('cam1_to_lidar', 'cam1')]:
+        block = cfg.get(key) or {}
+        trans = block.get('translation') or [0.0, 0.0, 0.0]
+        rot   = block.get('rotation')    or list(_OPTICAL_TO_ROS_Q)
+        out[label] = (
+            _quat_to_R(*rot),
+            np.asarray(trans, dtype=np.float32),
+        )
+    return out
 
 try:
     from tf2_ros import Buffer, TransformListener
@@ -107,6 +153,18 @@ class SensorFusionNode(Node):
             self.tf_buffer = None
             self.get_logger().warn('tf2_ros not available — transforms disabled')
 
+        # Camera extrinsics are read from sensor_transforms.yaml directly
+        # rather than relying on the TF tree. The static_transform_broadcaster
+        # used by sensor_tf_publisher.py publishes once at boot, and any node
+        # that joins later (e.g. this one after a restart) often misses the
+        # /tf_static message via DDS. Loading the yaml here bypasses that
+        # entirely for the static camera mounts.
+        self._cam_tf = _load_cam_transforms()
+        for name, (R, t) in self._cam_tf.items():
+            self.get_logger().info(
+                f'cam extrinsic loaded: {name} t={t.tolist()} '
+                f'R[0]={R[0].tolist()}')
+
         self.fused_pub = self.create_publisher(PointCloud2, '/perception/fused_cloud', 10)
 
         self._lock      = threading.Lock()
@@ -144,6 +202,16 @@ class SensorFusionNode(Node):
                 throttle_duration_sec=2.0)
             return msg
 
+    def _cam_to_lidar(self, pts: np.ndarray, cam: str) -> np.ndarray:
+        """Apply the static camera->lidar transform loaded from yaml.
+        pts is (N, 3) in the camera optical frame; returns (N, 3) in
+        livox_frame. Bypasses the TF tree so we're robust to the
+        /tf_static late-join issue."""
+        if pts.shape[0] == 0:
+            return pts
+        R, t = self._cam_tf[cam]
+        return (pts @ R.T + t).astype(np.float32, copy=False)
+
     def _on_lidar(self, msg: PointCloud2):
         with self._lock:
             self._lidar_msg = msg
@@ -168,10 +236,17 @@ class SensorFusionNode(Node):
         t0 = time.monotonic()
 
         clouds = [pc2_to_numpy(self._try_transform(lidar_msg))]
+        n_lidar = len(clouds[0])
+        n_cam0 = n_cam1 = 0
         if cam0_msg is not None:
-            clouds.append(pc2_to_numpy(self._try_transform(cam0_msg)))
+            c = self._cam_to_lidar(pc2_to_numpy(cam0_msg), 'cam0')
+            n_cam0 = len(c)
+            clouds.append(c)
         if cam1_msg is not None:
-            clouds.append(pc2_to_numpy(self._try_transform(cam1_msg)))
+            c = self._cam_to_lidar(pc2_to_numpy(cam1_msg), 'cam1')
+            n_cam1 = len(c)
+            clouds.append(c)
+        self._dbg_counts = (n_lidar, n_cam0, n_cam1)
 
         merged   = concat_clouds(clouds)
         filtered = range_filter(merged, self.min_range, self.max_range)
@@ -191,9 +266,11 @@ class SensorFusionNode(Node):
             ms  = (time.monotonic() - t0) * 1e3
             hz  = self._hz_count / dt
             cams = sum(1 for m in (cam0_msg, cam1_msg) if m is not None)
+            counts = getattr(self, '_dbg_counts', (0, 0, 0))
             self.get_logger().info(
                 f'Fused cloud: {len(voxeled)} pts at {hz:.1f} Hz | {ms:.1f} ms/frame '
-                f'({get_backend()}) cams={cams}/2')
+                f'({get_backend()}) cams={cams}/2 '
+                f'pre-voxel: lidar={counts[0]} cam0={counts[1]} cam1={counts[2]}')
             self._hz_count = 0
             self._last_log = now
 
