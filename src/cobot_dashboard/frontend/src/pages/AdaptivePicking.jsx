@@ -29,50 +29,82 @@ const FRONT_OPTIONS = [
 
 function PartModel3D({ url, rotation, frontAngle }) {
   const groupRef = useRef()
-  const [geo, setGeo] = useState(null)
+  const meshRef  = useRef(null)
+  const [ready, setReady] = useState(false)
 
+  // Load the STL, build the mesh, and attach it imperatively to the
+  // group. Imperative attach guarantees the mesh is in the scene graph
+  // by the time the rotation effect's Box3 measurement runs — JSX
+  // children + ref + effect ordering was unreliable on the first frame.
   useEffect(() => {
-    if (!url) { setGeo(null); return }
+    setReady(false)
+    if (!url || !groupRef.current) return
+    // Tear down any previous mesh
+    if (meshRef.current) {
+      groupRef.current.remove(meshRef.current)
+      meshRef.current.geometry?.dispose()
+      meshRef.current.material?.dispose()
+      meshRef.current = null
+    }
     const loader = new STLLoader()
-    loader.load(url, (g) => {
-      g.computeVertexNormals()
-      g.center()
-      g.computeBoundingBox()
-      const b = g.boundingBox
-      const max = Math.max(b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z)
-      if (max > 0) g.scale(0.4 / max, 0.4 / max, 0.4 / max)
-      setGeo(g)
-    }, undefined, (err) => console.warn('STL load failed:', err))
+    loader.load(
+      url,
+      (g) => {
+        g.computeVertexNormals()
+        g.center()
+        g.computeBoundingBox()
+        const b = g.boundingBox
+        const max = Math.max(b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z)
+        if (max > 0) g.scale(0.4 / max, 0.4 / max, 0.4 / max)
+        // Matte material — metallic on a white background with no env
+        // map ends up reading near-black. roughness=0.65 keeps a hint
+        // of specular without needing an environment.
+        const mat = new THREE.MeshStandardMaterial({
+          color:     '#9aa3b2',
+          metalness: 0.05,
+          roughness: 0.65,
+        })
+        const mesh = new THREE.Mesh(g, mat)
+        mesh.castShadow = true
+        mesh.receiveShadow = true
+        meshRef.current = mesh
+        if (groupRef.current) {
+          groupRef.current.add(mesh)
+          setReady(true)
+        }
+      },
+      undefined,
+      (err) => console.warn('STL load failed:', err),
+    )
+    return () => {
+      if (groupRef.current && meshRef.current) {
+        groupRef.current.remove(meshRef.current)
+      }
+      meshRef.current?.geometry?.dispose()
+      meshRef.current?.material?.dispose()
+      meshRef.current = null
+    }
   }, [url])
 
+  // Apply rotation + snap bottom to Y=0. Runs once when `ready` flips
+  // true (first frame the mesh is in the group) and on every
+  // rotation/frontAngle change after that.
   useEffect(() => {
-    if (!groupRef.current || !geo) return
-    // Apply surface rotation; yaw on the WORLD Y axis layered on top so
-    // selecting a front direction rotates the standing part in place.
+    if (!groupRef.current || !ready) return
     groupRef.current.rotation.set(
       rotation[0],
       rotation[1] + (frontAngle * Math.PI / 180),
       rotation[2],
     )
-    // Recompute the rotated AABB and shift the group up so the lowest
-    // point of the model sits exactly on Y=0 (the grid). Reset position
-    // first so the next bbox call reflects only the rotation.
     groupRef.current.position.set(0, 0, 0)
     groupRef.current.updateMatrixWorld(true)
     const box = new THREE.Box3().setFromObject(groupRef.current)
     if (isFinite(box.min.y)) {
       groupRef.current.position.y = -box.min.y
     }
-  }, [rotation, frontAngle, geo])
+  }, [rotation, frontAngle, ready])
 
-  if (!geo) return null
-  return (
-    <group ref={groupRef}>
-      <mesh geometry={geo} castShadow receiveShadow>
-        <meshStandardMaterial color="#A8B0C0" metalness={0.5} roughness={0.35} />
-      </mesh>
-    </group>
-  )
+  return <group ref={groupRef} />
 }
 
 // ── Gripper previews (world-space, sits above the part) ─────────────

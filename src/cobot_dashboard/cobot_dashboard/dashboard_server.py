@@ -1430,16 +1430,10 @@ if FASTAPI_AVAILABLE:
                 except OSError:
                     pass
 
-        # Copy STL into the dashboard's static dir for the browser to fetch
-        try:
-            stl_src = os.path.join('/opt/cobot/parts/stl', part_data['stl_file'])
-            stl_dst_dir = os.path.join(str(_STATIC_DIR), 'parts')
-            os.makedirs(stl_dst_dir, exist_ok=True)
-            if os.path.exists(stl_src):
-                import shutil as _sh
-                _sh.copy2(stl_src, os.path.join(stl_dst_dir, part_data['stl_file']))
-        except Exception:
-            pass
+        # No static-dir copy. STL is served directly from
+        # /opt/cobot/parts/stl/<file> via the /parts route below — a
+        # static-dir copy would get wiped by every `npm run build`
+        # (vite clears its outDir before writing).
 
         return {
             "ok":           True,
@@ -1593,6 +1587,23 @@ if FASTAPI_AVAILABLE:
         if os.path.isfile(idx):
             return FileResponse(idx)
         return JSONResponse({"detail": "Frontend not built — run: cd frontend && npm run build"}, status_code=404)
+
+    @app.get("/parts/{filename:path}")
+    async def serve_part_asset(filename: str):
+        """Serve uploaded part files (.stl, .step) from /opt/cobot/parts.
+        Looking up by extension keeps the route URL stable — the
+        frontend just fetches /parts/<file>.stl regardless of where it
+        lives on disk."""
+        if '..' in filename or filename.startswith('/'):
+            return JSONResponse({"detail": "bad path"}, status_code=400)
+        ext = os.path.splitext(filename)[1].lower().lstrip('.')
+        subdir = {'stl': 'stl', 'step': 'step', 'stp': 'step'}.get(ext)
+        if not subdir:
+            return JSONResponse({"detail": "unsupported"}, status_code=415)
+        path = os.path.join('/opt/cobot/parts', subdir, filename)
+        if not os.path.isfile(path):
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        return FileResponse(path)
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
