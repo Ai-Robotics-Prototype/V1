@@ -6,6 +6,7 @@ const TOP_ITEMS = [
   { icon: '🦾', label: 'Arm',    view: 'arm' },
   { icon: '⊞',  label: 'Split',  view: 'split' },
   { icon: '🗂',  label: 'Scene',  view: 'scene' },
+  { icon: '📦', label: 'Parts',  view: 'parts' },
 ]
 
 const MID_ITEMS = [

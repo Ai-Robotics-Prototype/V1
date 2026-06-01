@@ -4,6 +4,7 @@ import LidarPanel from '../components/LidarPanel'
 import ArmViewer3D from '../components/ArmViewer3D'
 import ProgramPanel from '../components/ProgramPanel'
 import ControlStrip from '../components/ControlStrip'
+import PartsLibrary from '../components/PartsLibrary'
 
 // Scene graph panel (compact table view for 'scene' mode)
 function SceneGraphPanel() {
@@ -157,6 +158,7 @@ function ViewportArea() {
   if (activeView === 'lidar') return <div style={sharedStyle}><LidarPanel /></div>
   if (activeView === 'arm')   return <div style={sharedStyle}><ArmViewer3D /></div>
   if (activeView === 'scene') return <div style={sharedStyle}><SceneGraphPanel /></div>
+  if (activeView === 'parts') return <div style={sharedStyle}><PartsLibrary /></div>
   if (activeView === 'safety') return <div style={sharedStyle}><SafetyView /></div>
 
   // Default: split

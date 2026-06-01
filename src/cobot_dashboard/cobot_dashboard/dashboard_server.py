@@ -1486,6 +1486,74 @@ if FASTAPI_AVAILABLE:
             return {"matched": False}
         return {"matched": True, "part": match, "score": score}
 
+    @app.put("/api/parts/{part_id}/config")
+    async def api_parts_config(part_id: str, request: Request):
+        """Update part orientation, surface choice, and grasp settings."""
+        import numpy as _np
+        meta_path = f'/opt/cobot/parts/metadata/{part_id}.json'
+        if not os.path.isfile(meta_path):
+            return JSONResponse({"error": "part not found"}, status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        with open(meta_path) as f:
+            part = json.load(f)
+
+        # Persist the operator-chosen configuration
+        part['name']            = str(body.get('name') or part.get('name'))
+        part['table_surface']   = str(body.get('table_surface') or '+Z up')
+        part['table_rotation']  = list(body.get('table_rotation') or [0.0, 0.0, 0.0])
+        part['front_direction'] = str(body.get('front_direction') or '↑ Forward')
+        part['front_angle_deg'] = float(body.get('front_angle_deg') or 0.0)
+        grasp_in = body.get('grasp') or {}
+        part['grasp'] = {
+            **(part.get('grasp') or {}),
+            'approach':         str(grasp_in.get('approach') or 'top_down'),
+            'gripper_width_cm': float(grasp_in.get('gripper_width_cm') or 5.0),
+            'pick_offset_cm':   float(grasp_in.get('pick_offset_cm') or 2.0),
+        }
+
+        # Derive footprint + standing height under the chosen rotation.
+        rot = part['table_rotation']
+        cr, sr = _np.cos(rot[0]), _np.sin(rot[0])
+        cp, sp = _np.cos(rot[1]), _np.sin(rot[1])
+        cy, sy = _np.cos(rot[2]), _np.sin(rot[2])
+        Rx = _np.array([[1,0,0],[0,cr,-sr],[0,sr,cr]])
+        Ry = _np.array([[cp,0,sp],[0,1,0],[-sp,0,cp]])
+        Rz = _np.array([[cy,-sy,0],[sy,cy,0],[0,0,1]])
+        R = Rz @ Ry @ Rx
+        ex = part.get('extents_m') or [0.0, 0.0, 0.0]
+        corners = _np.array([
+            [sx*ex[0]/2, sy*ex[1]/2, sz*ex[2]/2]
+            for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)])
+        rotated = corners @ R.T
+        part['table_height_m'] = round(float(rotated[:, 2].ptp()), 4)
+        part['footprint_cm']   = [
+            round(float(rotated[:, 0].ptp()) * 100, 1),
+            round(float(rotated[:, 1].ptp()) * 100, 1),
+        ]
+
+        with open(meta_path, 'w') as f:
+            json.dump(part, f, indent=2)
+
+        # Also update the compact index entry's name
+        try:
+            from object_detection.part_library import LIBRARY_INDEX
+            with open(LIBRARY_INDEX) as f:
+                idx = json.load(f) or {'parts': []}
+            for p in idx.get('parts') or []:
+                if p.get('id') == part_id:
+                    p['name'] = part['name']
+                    p['grasp'] = part['grasp']
+                    break
+            with open(LIBRARY_INDEX, 'w') as f:
+                json.dump(idx, f, indent=2)
+        except Exception:
+            pass
+
+        return {"ok": True, "part": part}
+
     @app.get("/api/config")
     async def api_config():
         return {
