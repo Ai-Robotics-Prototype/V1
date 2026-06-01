@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useStore } from '../store/useStore'
 
 const RAD = (deg) => (deg * Math.PI) / 180
@@ -396,6 +396,38 @@ function JointPositions() {
 function DetectedObjects() {
   const detections    = useStore((s) => s.detections)
   const detectionMode = useStore((s) => s.detectionMode || 'all')
+  const [parts, setParts]                 = useState([])
+  const [teachOpenFor, setTeachOpenFor]   = useState(null)   // detection.id
+  const [teachStatus,  setTeachStatus]    = useState(null)   // {id, text}
+
+  useEffect(() => {
+    let cancelled = false
+    function pull() {
+      fetch('/api/parts').then(r => r.json()).then(d => {
+        if (!cancelled) setParts(d.parts || [])
+      }).catch(() => {})
+    }
+    pull()
+    const t = setInterval(pull, 5000)
+    return () => { cancelled = true; clearInterval(t) }
+  }, [])
+
+  async function teachAs(detIndex, partId) {
+    setTeachStatus({ id: teachOpenFor, text: '…' })
+    try {
+      const r = await fetch(`/api/parts/${partId}/teach`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ detection_index: detIndex }),
+      })
+      const d = await r.json()
+      setTeachStatus({ id: teachOpenFor, text: r.ok ? 'taught ✓' : (d.error || 'failed') })
+    } catch (e) {
+      setTeachStatus({ id: teachOpenFor, text: 'failed' })
+    }
+    setTeachOpenFor(null)
+    setTimeout(() => setTeachStatus(null), 1500)
+  }
 
   const CLASS_COLORS = {
     bottle: 'var(--accent)',
@@ -411,7 +443,10 @@ function DetectedObjects() {
   const filtered = detectionMode === 'library'
     ? detections.filter(d => d.part_name && Number(d.match_score) >= 0.70)
     : detections
-  const sorted = [...filtered].sort((a, b) => dist(a) - dist(b))
+  // Stable index into the source `detections` array — depth_segment
+  // captures by that index when the teach command lands.
+  const indexed = filtered.map(d => ({ ...d, _index: detections.indexOf(d) }))
+  const sorted  = [...indexed].sort((a, b) => dist(a) - dist(b))
 
   return (
     <div style={{ width: 200, flexShrink: 0, padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 4, overflowY: 'auto' }}>
@@ -440,6 +475,8 @@ function DetectedObjects() {
           const label    = misalign ? `${baseLabel}  rotate ${yawErr.toFixed(0)}°` : baseLabel
           const barPct   = isMatch ? Math.round((det.match_score ?? 0) * 100)
                                    : Math.round((det.score       ?? 0) * 100)
+          const teachOpen = teachOpenFor === det.id
+          const teachMsg  = teachStatus && teachStatus.id === det.id ? teachStatus.text : null
           return (
             <div key={det.id} style={{
               background: 'var(--bg-surface)',
@@ -447,26 +484,58 @@ function DetectedObjects() {
               borderRadius: 'var(--radius-md)',
               padding: '5px 7px',
               display: 'flex',
-              alignItems: 'center',
-              gap: 6,
+              flexDirection: 'column',
+              gap: 4,
               animation: 'none',
             }}>
-              <span style={{
-                width: 6, height: 6, borderRadius: '50%', background: color, display: 'inline-block', flexShrink: 0,
-              }} />
-              <span style={{
-                fontSize: 11, textTransform: isMatch ? 'none' : 'uppercase',
-                fontWeight: 500, color, width: 64, flexShrink: 0,
-                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-              }} title={label}>
-                {label}
-              </span>
-              <div style={{ flex: 1, height: 3, background: 'var(--bg-active)', borderRadius: 2, overflow: 'hidden' }}>
-                <div style={{ width: `${barPct}%`, height: '100%', background: color, borderRadius: 2 }} />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{
+                  width: 6, height: 6, borderRadius: '50%', background: color, display: 'inline-block', flexShrink: 0,
+                }} />
+                <span style={{
+                  fontSize: 11, textTransform: isMatch ? 'none' : 'uppercase',
+                  fontWeight: 500, color, flex: 1, minWidth: 0,
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                }} title={label}>
+                  {label}
+                </span>
+                <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', fontVariantNumeric: 'tabular-nums', color: 'var(--text-secondary)', flexShrink: 0 }}>
+                  {d.toFixed(2)} m
+                </span>
               </div>
-              <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', fontVariantNumeric: 'tabular-nums', color: 'var(--text-secondary)', flexShrink: 0 }}>
-                {d.toFixed(2)} m
-              </span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div style={{ flex: 1, height: 3, background: 'var(--bg-active)', borderRadius: 2, overflow: 'hidden' }}>
+                  <div style={{ width: `${barPct}%`, height: '100%', background: color, borderRadius: 2 }} />
+                </div>
+                {teachMsg ? (
+                  <span style={{ fontSize: 9, color: 'var(--text-secondary)' }}>{teachMsg}</span>
+                ) : teachOpen ? (
+                  <select autoFocus
+                    onChange={(e) => { if (e.target.value) teachAs(det._index, e.target.value) }}
+                    onBlur={() => setTeachOpenFor(null)}
+                    style={{
+                      fontSize: 9, padding: '1px 4px',
+                      background: 'var(--bg-app)', color: 'var(--text-primary)',
+                      border: '1px solid var(--border)', borderRadius: 3,
+                      maxWidth: 90,
+                    }}
+                    defaultValue=""
+                  >
+                    <option value="" disabled>part…</option>
+                    {parts.map(p => (
+                      <option key={p.id} value={p.id}>{p.name}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <button onClick={() => setTeachOpenFor(det.id)}
+                    style={{
+                      fontSize: 9, padding: '1px 6px', cursor: 'pointer',
+                      background: 'transparent', color: 'var(--text-muted)',
+                      border: '1px solid var(--border)', borderRadius: 10,
+                    }}
+                  >teach…</button>
+                )}
+              </div>
             </div>
           )
         })

@@ -163,6 +163,19 @@ class DepthSegmentNode(Node):
             String, '/perception/detection_mode',
             self._on_detection_mode, 10)
 
+        # Teach-mode: operator presses "teach as <part>" against a live
+        # detection; depth_segment captures the cropped depth + mask
+        # of that detection and persists it under
+        # /opt/cobot/parts/teach/<part_id>/ref_NNN.npz. _match_by_teach
+        # then uses real captured profiles instead of synthetic CAD
+        # silhouettes.
+        self._last_objects = []     # latest stable detection list (with crops)
+        self._teach_refs   = {}     # part_id -> [ {depth, mask, size_m} ]
+        self._load_teach_refs()
+        self.create_subscription(
+            String, '/perception/teach_command',
+            self._on_teach_command, 10)
+
         # Camera-optical -> LiDAR transform. Centroids and OBB rotations are
         # converted with this before publishing Detection3D so consumers
         # (dashboard, grasp planner) see a single coherent frame.
@@ -653,6 +666,16 @@ class DepthSegmentNode(Node):
                 centroid, size_3d, R = self._fit_obb(combined)
                 quat, euler = self._rmat_to_quat_euler(R)
                 corners = self._obb_corners(centroid, size_3d, R)
+                # Carry mask_2d / depth_2d forward from the largest
+                # input so the merged detection still has a per-object
+                # crop available to the teach-capture and shape
+                # matchers. Picks the member with the most foreground
+                # pixels.
+                src_idx = max(
+                    group,
+                    key=lambda g: int(np.sum(dets[g].get('mask_2d')))
+                    if isinstance(dets[g].get('mask_2d'), np.ndarray) else 0,
+                )
                 merged.append({
                     'bbox_px':       (int(bx0), int(by0), int(bx1), int(by1)),
                     'pos':           (float(centroid[0]), float(centroid[1]), float(centroid[2])),
@@ -663,6 +686,8 @@ class DepthSegmentNode(Node):
                     'obb':           True,
                     '_pts3d':        combined,
                     '_merged_from':  len(group),
+                    'mask_2d':       dets[src_idx].get('mask_2d'),
+                    'depth_2d':      dets[src_idx].get('depth_2d'),
                 })
             else:
                 base = dict(dets[group[0]])
@@ -861,6 +886,7 @@ class DepthSegmentNode(Node):
                 'obb':      True,
                 '_pts3d':   pts3d,
                 'mask_2d':  np.ascontiguousarray(sub_fg, dtype=bool),
+                'depth_2d': np.ascontiguousarray(sub_d,  dtype=np.float32),
             })
 
         # Final safety net: merge any remaining overlapping or near-coincident
@@ -875,6 +901,178 @@ class DepthSegmentNode(Node):
         self._log_count += 1
         if self._log_count % 30 == 0:
             self.get_logger().info(f'{len(self._temporal_filter())} object(s) detected')
+
+    # ── Teach-mode helpers ──────────────────────────────────────────────────
+
+    def _teach_dir(self, part_id):
+        return os.path.join('/opt/cobot/parts/teach', str(part_id))
+
+    def _load_teach_refs(self):
+        """Read every /opt/cobot/parts/teach/<id>/*.npz back into memory."""
+        self._teach_refs = {}
+        base = '/opt/cobot/parts/teach'
+        if not os.path.isdir(base):
+            return
+        for pid in os.listdir(base):
+            pdir = os.path.join(base, pid)
+            if not os.path.isdir(pdir):
+                continue
+            refs = []
+            for fn in sorted(os.listdir(pdir)):
+                if not fn.endswith('.npz'):
+                    continue
+                try:
+                    z = np.load(os.path.join(pdir, fn))
+                    refs.append({
+                        'depth':  np.asarray(z['depth'],  dtype=np.float32),
+                        'mask':   np.asarray(z['mask'],   dtype=bool),
+                        'size_m': np.asarray(z['size_m'], dtype=np.float32),
+                    })
+                except Exception:
+                    continue
+            if refs:
+                self._teach_refs[pid] = refs
+        if self._teach_refs:
+            self.get_logger().info(
+                'teach refs loaded: '
+                + ', '.join(f'{k}({len(v)})' for k, v in self._teach_refs.items())
+            )
+
+    def _on_teach_command(self, msg):
+        try:
+            cmd = json.loads(msg.data) if msg.data else {}
+        except Exception:
+            return
+        action = cmd.get('action')
+        if action == 'reload':
+            self._load_teach_refs()
+            return
+        if action != 'teach':
+            return
+        part_id = cmd.get('part_id')
+        if not part_id:
+            self.get_logger().warn('teach: missing part_id')
+            return
+        if not self._last_objects:
+            self.get_logger().warn('teach: no recent detections')
+            return
+        idx = int(cmd.get('detection_index') or 0)
+        if idx < 0 or idx >= len(self._last_objects):
+            idx = 0
+        det = self._last_objects[idx]
+        mask  = det.get('mask_2d')
+        depth = det.get('depth_2d')
+        size  = det.get('size_3d') or (0.05, 0.05, 0.05)
+        if mask is None or depth is None or not np.any(mask):
+            self.get_logger().warn('teach: detection has no mask/depth')
+            return
+        try:
+            d_std, m_std = self._normalise_for_match(depth, mask)
+        except Exception as e:
+            self.get_logger().error(f'teach: normalise failed: {e}')
+            return
+
+        os.makedirs(self._teach_dir(part_id), exist_ok=True)
+        existing = sum(1 for f in os.listdir(self._teach_dir(part_id)) if f.endswith('.npz'))
+        out_path = os.path.join(self._teach_dir(part_id), f'ref_{existing:03d}.npz')
+        try:
+            np.savez_compressed(
+                out_path,
+                depth=d_std.astype(np.float32),
+                mask=m_std.astype(bool),
+                size_m=np.asarray(size, dtype=np.float32),
+            )
+        except Exception as e:
+            self.get_logger().error(f'teach: save failed: {e}')
+            return
+        self._load_teach_refs()
+        n = len(self._teach_refs.get(part_id, []))
+        self.get_logger().info(f'teach: saved {out_path} (part now has {n} refs)')
+
+    @staticmethod
+    def _normalise_for_match(depth_crop, mask_crop, target=64):
+        """Resize crop to target x target, normalise depth within the
+        mask to [0, 1]. Returns (depth_std, mask_std)."""
+        from scipy.ndimage import zoom
+        h, w = mask_crop.shape[:2]
+        if h == 0 or w == 0:
+            return (np.zeros((target, target), dtype=np.float32),
+                    np.zeros((target, target), dtype=bool))
+        fy = target / float(h); fx = target / float(w)
+        d  = zoom(depth_crop.astype(np.float32), (fy, fx), order=1)
+        m  = zoom(mask_crop.astype(np.float32),  (fy, fx), order=1) > 0.5
+        valid = m & np.isfinite(d) & (d > 0)
+        if valid.any():
+            dmin = float(d[valid].min())
+            dmax = float(d[valid].max())
+            if dmax > dmin:
+                d = (d - dmin) / (dmax - dmin)
+            else:
+                d = np.zeros_like(d)
+        d[~m] = 0.0
+        return d.astype(np.float32), m
+
+    def _match_by_teach(self, depth_crop, mask_crop, obb_size):
+        """Match against taught references. Returns (name, id, score)
+        or ('unknown', None, 0). Scoring blends mask IoU + depth NCC
+        + size-ratio; final threshold 0.55."""
+        if not self._teach_refs:
+            return 'unknown', None, 0.0
+        if depth_crop is None or mask_crop is None or not np.any(mask_crop):
+            return 'unknown', None, 0.0
+
+        try:
+            det_d, det_m = self._normalise_for_match(depth_crop, mask_crop)
+        except Exception:
+            return 'unknown', None, 0.0
+        det_sorted = sorted([float(s) for s in obb_size], reverse=True)
+
+        best_name, best_id, best_score = 'unknown', None, 0.0
+        for pid, refs in self._teach_refs.items():
+            for ref in refs:
+                ref_sorted = sorted([float(s) for s in ref['size_m']], reverse=True)
+                size_ratios = [min(d, r) / max(d, r, 1e-3)
+                               for d, r in zip(det_sorted, ref_sorted)]
+                if any(r < 0.5 for r in size_ratios):
+                    continue
+                size_score = sum(size_ratios) / 3.0
+
+                ref_m = ref['mask']
+                if ref_m.shape != det_m.shape:
+                    continue
+                inter = int(np.sum(det_m & ref_m))
+                union = int(np.sum(det_m | ref_m))
+                if union == 0:
+                    continue
+                mask_iou = inter / union
+
+                overlap = det_m & ref_m
+                if int(np.sum(overlap)) < 100:
+                    continue
+                a = det_d[overlap]
+                b = ref['depth'][overlap]
+                a_mean, b_mean = float(a.mean()), float(b.mean())
+                a_std,  b_std  = float(a.std()),  float(b.std())
+                if a_std < 0.01 or b_std < 0.01:
+                    ncc = mask_iou
+                else:
+                    ncc = float(np.mean((a - a_mean) * (b - b_mean)) / (a_std * b_std))
+                    ncc = max(0.0, ncc)
+
+                score = ncc * 0.40 + mask_iou * 0.30 + size_score * 0.30
+                if score > best_score:
+                    best_score = score
+                    best_id    = pid
+                    meta_path  = f'/opt/cobot/parts/metadata/{pid}.json'
+                    try:
+                        with open(meta_path) as fp:
+                            best_name = json.load(fp).get('name') or pid
+                    except Exception:
+                        best_name = pid
+
+        if best_score < 0.55:
+            return 'unknown', None, 0.0
+        return best_name, best_id, round(best_score, 3)
 
     def _on_detection_mode(self, msg):
         try:
@@ -891,6 +1089,10 @@ class DepthSegmentNode(Node):
         then publish detections + annotated image."""
         stable = self._temporal_filter()
         self._match_parts(stable)
+        # Keep the latest stable list around so a teach command can
+        # capture the user's chosen detection without needing the
+        # caller to ship the full mask + depth crops over HTTP.
+        self._last_objects = stable
         self._publish(stable, h, w)
 
     # ── Library matching helpers ──────────────────────────────────────────────
@@ -1033,6 +1235,48 @@ class DepthSegmentNode(Node):
             aspect = float(bw) / float(bh)
             sx, sy, sz = o.get('size_3d') or (0.05, 0.05, 0.05)
             size_m = [float(sx), float(sy), float(sz)]
+
+            # 0) Taught references (PRIMARY when any exist). Real
+            # camera samples beat synthetic CAD renders for noisy
+            # tabletop depth — and they fix the false-positive class
+            # the CAD-only path latched onto. Skip the CAD methods
+            # entirely once any reference is on disk for any part.
+            teach_name, teach_id, teach_score = self._match_by_teach(
+                depth, mask, size_m)
+            if self._teach_refs:
+                if teach_name != 'unknown':
+                    o['part_name']        = teach_name
+                    o['part_id']          = teach_id
+                    o['match_score']      = float(teach_score)
+                    o['match_yaw']        = 0.0
+                else:
+                    o['part_name']        = None
+                    o['part_id']          = None
+                    o['match_score']      = 0.0
+                    o['match_yaw']        = 0.0
+                # Position verification against saved metadata
+                if teach_name != 'unknown' and teach_id:
+                    part_meta = next((p for p in library_parts
+                                      if p.get('id') == teach_id), None)
+                    if part_meta is not None:
+                        _, _, yaw_rad = o.get('euler') or (0.0, 0.0, 0.0)
+                        ok, yaw_err, surf_ok = self._verify_position(
+                            part_meta, yaw_rad, size_m)
+                        o['position_correct'] = bool(ok)
+                        o['yaw_error_deg']    = float(yaw_err)
+                        o['surface_ok']       = bool(surf_ok)
+                        o['position_status']  = 'CORRECT' if ok else 'MISALIGNED'
+                    else:
+                        o['position_correct'] = None
+                        o['yaw_error_deg']    = 0.0
+                        o['surface_ok']       = None
+                        o['position_status']  = ''
+                else:
+                    o['position_correct'] = None
+                    o['yaw_error_deg']    = 0.0
+                    o['surface_ok']       = None
+                    o['position_status']  = ''
+                continue
 
             # 1) Silhouette (shape-based)
             sil_name, sil_id, sil_score, sil_yaw = None, None, 0.0, 0.0

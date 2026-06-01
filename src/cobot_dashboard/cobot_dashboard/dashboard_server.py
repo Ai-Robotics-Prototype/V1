@@ -413,6 +413,8 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             String, "/task/generate_program", 5)
         self._detection_mode_pub = self.create_publisher(
             String, "/perception/detection_mode", 5)
+        self._teach_cmd_pub = self.create_publisher(
+            String, "/perception/teach_command", 10)
 
         # Auto-program subscriber (LLM-generated pick/place steps)
         self.create_subscription(String, "/task/auto_program",
@@ -1502,7 +1504,57 @@ if FASTAPI_AVAILABLE:
     @app.get("/api/parts")
     async def api_parts_list():
         from object_detection.part_library import get_all_parts
-        return {"parts": get_all_parts()}
+        parts = get_all_parts()
+        # Annotate each entry with its current taught-sample count so
+        # the library UI can show "Not taught yet" / "N taught samples".
+        teach_base = '/opt/cobot/parts/teach'
+        for p in parts:
+            d = os.path.join(teach_base, p.get('id') or '')
+            try:
+                p['teach_count'] = sum(
+                    1 for f in os.listdir(d) if f.endswith('.npz')
+                ) if os.path.isdir(d) else 0
+            except OSError:
+                p['teach_count'] = 0
+        return {"parts": parts}
+
+    @app.post("/api/parts/{part_id}/teach")
+    async def api_parts_teach(part_id: str, request: Request):
+        """Tell depth_segment_node to grab the latest detection (or
+        the one at detection_index) and store it as a teach reference
+        for this part. Body: {"detection_index": int (optional)}."""
+        meta_path = f'/opt/cobot/parts/metadata/{part_id}.json'
+        if not os.path.isfile(meta_path):
+            return JSONResponse({"error": "part not found"}, status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        det_idx = int(body.get('detection_index') or 0)
+        if _ros_node is None or _ros_node._teach_cmd_pub is None:
+            return JSONResponse({"error": "ROS node not ready"}, status_code=503)
+        m = String()
+        m.data = json.dumps({
+            'action':           'teach',
+            'part_id':          part_id,
+            'detection_index':  det_idx,
+        })
+        _ros_node._teach_cmd_pub.publish(m)
+        return {"ok": True, "status": "teaching", "part_id": part_id}
+
+    @app.post("/api/parts/{part_id}/teach_clear")
+    async def api_parts_teach_clear(part_id: str):
+        """Delete every taught reference for this part."""
+        import shutil as _sh
+        teach_dir = f'/opt/cobot/parts/teach/{part_id}'
+        if os.path.isdir(teach_dir):
+            _sh.rmtree(teach_dir, ignore_errors=True)
+        # Notify depth_segment_node so it can reload its in-memory cache
+        if _ros_node and _ros_node._teach_cmd_pub:
+            m = String()
+            m.data = json.dumps({'action': 'reload'})
+            _ros_node._teach_cmd_pub.publish(m)
+        return {"ok": True}
 
     @app.get("/api/parts/{part_id}")
     async def api_parts_get(part_id: str):

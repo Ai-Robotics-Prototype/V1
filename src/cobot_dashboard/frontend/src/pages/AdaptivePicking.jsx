@@ -937,6 +937,14 @@ export default function AdaptivePicking() {
                       part.grasp?.approach === 'top_down' ? '↓ top' : '→ side'
                     } grasp
                   </div>
+                  <div style={{
+                    fontSize: 10, marginTop: 2,
+                    color: part.teach_count > 0 ? '#22c55e' : 'var(--text-muted, #9ca3af)',
+                  }}>
+                    {part.teach_count > 0
+                      ? `${part.teach_count} taught sample${part.teach_count > 1 ? 's' : ''}`
+                      : 'Not taught yet — click "Teach as…" on a detection'}
+                  </div>
                   {(ops.length > 0 || part.program_name) && (
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginTop: 4 }}>
                       {ops.map((op) => {
