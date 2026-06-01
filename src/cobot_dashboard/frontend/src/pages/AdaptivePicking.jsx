@@ -46,7 +46,7 @@ function PartModel3D({ url, rotation, frontAngle }) {
   }, [url])
 
   useEffect(() => {
-    if (!groupRef.current) return
+    if (!groupRef.current || !geo) return
     // Apply surface rotation; yaw on the WORLD Y axis layered on top so
     // selecting a front direction rotates the standing part in place.
     groupRef.current.rotation.set(
@@ -54,7 +54,16 @@ function PartModel3D({ url, rotation, frontAngle }) {
       rotation[1] + (frontAngle * Math.PI / 180),
       rotation[2],
     )
-  }, [rotation, frontAngle])
+    // Recompute the rotated AABB and shift the group up so the lowest
+    // point of the model sits exactly on Y=0 (the grid). Reset position
+    // first so the next bbox call reflects only the rotation.
+    groupRef.current.position.set(0, 0, 0)
+    groupRef.current.updateMatrixWorld(true)
+    const box = new THREE.Box3().setFromObject(groupRef.current)
+    if (isFinite(box.min.y)) {
+      groupRef.current.position.y = -box.min.y
+    }
+  }, [rotation, frontAngle, geo])
 
   if (!geo) return null
   return (
@@ -95,7 +104,7 @@ function FingerGripperPreview({ settings }) {
       {/* Approach arrow */}
       <mesh position={[0, 0.12, 0]} rotation={[Math.PI, 0, 0]}>
         <coneGeometry args={[0.015 * VIEWER_SCALE, 0.04 * VIEWER_SCALE, 8]} />
-        <meshBasicMaterial color="#22C55E" />
+        <meshBasicMaterial color="#16A34A" />
       </mesh>
     </group>
   )
@@ -148,7 +157,7 @@ function SuctionCupPreview({ settings }) {
       {/* Approach arrow */}
       <mesh position={[0, 0.14, 0]} rotation={[Math.PI, 0, 0]}>
         <coneGeometry args={[0.015 * VIEWER_SCALE, 0.04 * VIEWER_SCALE, 8]} />
-        <meshBasicMaterial color="#22C55E" />
+        <meshBasicMaterial color="#16A34A" />
       </mesh>
     </group>
   )
@@ -162,15 +171,18 @@ function GripperPreview3D({ type, settings }) {
 function PartCanvas({ url, rotation, frontAngle, gripperType, graspSettings }) {
   return (
     <Canvas shadows camera={{ position: [1.0, 0.8, 1.0], fov: 38 }}
-            style={{ width: '100%', height: '100%' }}>
-      <ambientLight intensity={0.5} />
-      <directionalLight position={[3, 5, 3]} intensity={0.7} castShadow />
-      <directionalLight position={[-3, 4, -2]} intensity={0.25} />
+            style={{ width: '100%', height: '100%', background: '#FFFFFF' }}>
+      {/* Brighter lighting so metallic surfaces read against white. */}
+      <ambientLight intensity={0.75} />
+      <directionalLight position={[3, 5, 3]} intensity={0.9} castShadow
+                        shadow-mapSize={[1024, 1024]} />
+      <directionalLight position={[-3, 4, -2]} intensity={0.35} />
+      {/* Ground plane carries only the shadow — keeps the floor white. */}
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.001, 0]} receiveShadow>
         <planeGeometry args={[2, 2]} />
-        <meshStandardMaterial color="#1e2030" />
+        <shadowMaterial opacity={0.18} />
       </mesh>
-      <gridHelper args={[2, 20, '#2a3040', '#1e2030']} />
+      <gridHelper args={[2, 20, '#D0D4DC', '#E8EAF0']} />
       {/* Front-direction marker (always renders flat to the table). */}
       <group rotation={[0, -(frontAngle * Math.PI / 180), 0]}>
         <mesh position={[0, 0.005, -0.4]} rotation={[-Math.PI / 2, 0, 0]}>
@@ -277,19 +289,21 @@ function PartConfigurator({ partId, onSave, onDelete }) {
   return (
     <div style={{ display: 'flex', height: '100%', minHeight: 0 }}>
       {/* 3D viewer — 60% */}
-      <div style={{ flex: 3, background: '#0a0a12', position: 'relative' }}>
+      <div style={{ flex: 3, background: '#FFFFFF', position: 'relative' }}>
         <PartCanvas url={stlUrl} rotation={rotation} frontAngle={frontAngle}
                     gripperType={gripperType} graspSettings={grasp} />
         <div style={{
           position: 'absolute', top: 12, left: 12,
-          background: 'rgba(0,0,0,0.6)', color: '#fff',
+          background: 'rgba(255,255,255,0.85)', color: '#111827',
           padding: '6px 12px', borderRadius: 6,
           fontSize: 14, fontWeight: 600,
+          border: '1px solid rgba(0,0,0,0.06)',
         }}>{part.name}</div>
         <div style={{
           position: 'absolute', bottom: 12, left: 12,
-          background: 'rgba(0,0,0,0.6)', color: 'var(--text-muted, #9ca3af)',
+          background: 'rgba(255,255,255,0.85)', color: '#374151',
           padding: '4px 10px', borderRadius: 4, fontSize: 11,
+          border: '1px solid rgba(0,0,0,0.06)',
         }}>
           {ex[0]}×{ex[1]}×{ex[2]} cm · {part.vertices} verts
           {part.volume_cm3 ? ` · ${part.volume_cm3} cm³` : ''}
