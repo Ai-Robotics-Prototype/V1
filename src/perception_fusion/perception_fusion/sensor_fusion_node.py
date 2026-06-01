@@ -158,12 +158,20 @@ class SensorFusionNode(Node):
         self.declare_parameter('min_range',     0.2)
         self.declare_parameter('target_frame',  'base_link')
         self.declare_parameter('estimate_normals', False)
+        # Camera depth points are included by default. Set to False to
+        # publish a LiDAR-only fused cloud — useful while camera
+        # extrinsics are being aligned (misaligned cam clouds look like
+        # vertical walls in the 3D view).
+        self.declare_parameter('use_cam0',      True)
+        self.declare_parameter('use_cam1',      True)
 
         self.voxel_size     = self.get_parameter('voxel_size').value
         self.max_range      = self.get_parameter('max_range').value
         self.min_range      = self.get_parameter('min_range').value
         self.target_frame   = self.get_parameter('target_frame').value
         self.do_normals     = self.get_parameter('estimate_normals').value
+        self.use_cam0       = bool(self.get_parameter('use_cam0').value)
+        self.use_cam1       = bool(self.get_parameter('use_cam1').value)
 
         if TF2_AVAILABLE:
             self.tf_buffer   = Buffer()
@@ -257,11 +265,11 @@ class SensorFusionNode(Node):
         clouds = [pc2_to_numpy(self._try_transform(lidar_msg))]
         n_lidar = len(clouds[0])
         n_cam0 = n_cam1 = 0
-        if cam0_msg is not None:
+        if self.use_cam0 and cam0_msg is not None:
             c = self._cam_to_lidar(pc2_to_numpy(cam0_msg), 'cam0')
             n_cam0 = len(c)
             clouds.append(c)
-        if cam1_msg is not None:
+        if self.use_cam1 and cam1_msg is not None:
             c = self._cam_to_lidar(pc2_to_numpy(cam1_msg), 'cam1')
             n_cam1 = len(c)
             clouds.append(c)

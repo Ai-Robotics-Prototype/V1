@@ -7,7 +7,7 @@ Wants=roboai-cameras.service roboai-lidar.service
 Type=simple
 User=teddy
 WorkingDirectory=/home/teddy/cobot_ws
-ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 run perception_fusion sensor_fusion_node --ros-args -p voxel_size:=0.005 -p max_range:=5.0 -p min_range:=0.15 -p target_frame:=livox_frame'
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 run perception_fusion sensor_fusion_node --ros-args -p voxel_size:=0.005 -p max_range:=5.0 -p min_range:=0.15 -p target_frame:=livox_frame -p use_cam0:=false -p use_cam1:=false'
 Restart=always
 RestartSec=5
 

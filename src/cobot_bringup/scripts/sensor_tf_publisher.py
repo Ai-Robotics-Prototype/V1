@@ -21,11 +21,61 @@ TF tree:
 """
 import os
 
+import numpy as np
 import rclpy
 import yaml
 from geometry_msgs.msg import TransformStamped
 from rclpy.node import Node
 from tf2_ros import TransformBroadcaster
+
+
+def _quat_to_R(qx, qy, qz, qw):
+    return np.array([
+        [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)    ],
+        [2*(qx*qy + qz*qw),     1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)    ],
+        [2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw),     1 - 2*(qx*qx + qy*qy)],
+    ], dtype=np.float64)
+
+
+def _rpy_to_R(roll_deg, pitch_deg, yaw_deg):
+    r = np.deg2rad(roll_deg);  p = np.deg2rad(pitch_deg);  y = np.deg2rad(yaw_deg)
+    cr, sr = np.cos(r), np.sin(r)
+    cp, sp = np.cos(p), np.sin(p)
+    cy, sy = np.cos(y), np.sin(y)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr,  cr]], dtype=np.float64)
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]], dtype=np.float64)
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0,  0, 1]], dtype=np.float64)
+    return Rz @ Ry @ Rx
+
+
+def _R_to_quat(R):
+    """3x3 rotation matrix -> (qx, qy, qz, qw). Shepperd's method."""
+    tr = R[0, 0] + R[1, 1] + R[2, 2]
+    if tr > 0:
+        s = np.sqrt(tr + 1.0) * 2
+        qw = 0.25 * s
+        qx = (R[2, 1] - R[1, 2]) / s
+        qy = (R[0, 2] - R[2, 0]) / s
+        qz = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+        qw = (R[2, 1] - R[1, 2]) / s
+        qx = 0.25 * s
+        qy = (R[0, 1] + R[1, 0]) / s
+        qz = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+        qw = (R[0, 2] - R[2, 0]) / s
+        qx = (R[0, 1] + R[1, 0]) / s
+        qy = 0.25 * s
+        qz = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+        qw = (R[1, 0] - R[0, 1]) / s
+        qx = (R[0, 2] + R[2, 0]) / s
+        qy = (R[1, 2] + R[2, 1]) / s
+        qz = 0.25 * s
+    return float(qx), float(qy), float(qz), float(qw)
 
 
 # Standard optical -> ROS quaternion: rotation that takes a vector in the
@@ -79,17 +129,26 @@ class SensorTFPublisher(Node):
         self._br = TransformBroadcaster(self)
         cfg, src = _load_config(self.get_logger())
 
+        # Compose base quaternion + rpy_correction so the TF tree matches
+        # what perception_fusion does in numpy. Without this, nvblox's
+        # depth integration was tilted by the missing 70-deg pitch.
         self._entries = []
         for key, child in [('cam0_to_lidar', 'cam0_color_optical_frame'),
                            ('cam1_to_lidar', 'cam1_color_optical_frame')]:
             block = cfg.get(key) or {}
-            trans = block.get('translation') or [0.0, 0.0, 0.0]
-            rot   = block.get('rotation')    or list(_OPTICAL_TO_ROS_Q)
-            self._entries.append((child, trans, rot))
+            trans = block.get('translation')    or [0.0, 0.0, 0.0]
+            rot   = block.get('rotation')       or list(_OPTICAL_TO_ROS_Q)
+            rpy   = block.get('rpy_correction') or [0.0, 0.0, 0.0]
+            R_base = _quat_to_R(*rot)
+            R_trim = _rpy_to_R(*rpy)
+            R_total = R_trim @ R_base
+            q_total = _R_to_quat(R_total)
+            self._entries.append((child, trans, q_total))
             self.get_logger().info(
                 f'livox_frame -> {child}: '
                 f't=[{trans[0]:+.3f},{trans[1]:+.3f},{trans[2]:+.3f}] '
-                f'q=[{rot[0]:+.3f},{rot[1]:+.3f},{rot[2]:+.3f},{rot[3]:+.3f}]')
+                f'q=[{q_total[0]:+.3f},{q_total[1]:+.3f},{q_total[2]:+.3f},{q_total[3]:+.3f}] '
+                f'(base+rpy={rpy})')
 
         # Re-broadcast every 2 s so late-joining subscribers receive the
         # transforms even when /tf_static didn't get through. Stamped

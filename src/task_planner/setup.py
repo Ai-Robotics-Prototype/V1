@@ -19,6 +19,7 @@ setup(
     entry_points={
         'console_scripts': [
             'task_planner_node = task_planner.task_planner_node:main',
+            'auto_program_node = task_planner.auto_program_node:main',
         ],
     },
 )

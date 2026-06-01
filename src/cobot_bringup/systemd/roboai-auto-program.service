@@ -1,0 +1,15 @@
+[Unit]
+Description=RoboAi Autonomous Task Generator (LLM-driven pick/place planner)
+After=roboai-scene-graph.service
+Wants=roboai-scene-graph.service
+
+[Service]
+Type=simple
+User=teddy
+WorkingDirectory=/home/teddy/cobot_ws
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 run task_planner auto_program_node'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

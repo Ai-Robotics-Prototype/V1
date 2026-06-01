@@ -85,6 +85,9 @@ STATE = {
             {"id": 5, "type": "move",    "label": "Place at target", "detail": "X: 0.30 Y: −0.20 Z: 0.40", "status": "pending"},
         ]
     },
+    # LLM-generated pick/place program (populated by auto_program_node)
+    "auto_program": {"steps": [], "scene_size": 0, "t": 0.0},
+    "auto_status":  {"state": "IDLE", "error": None, "n_steps": 0, "t": 0.0},
 }
 
 # Latest JPEG bytes per camera (None = no real frame yet)
@@ -402,6 +405,14 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         # Publishers
         self._task_pub = self.create_publisher(String, "/task/command", 10)
         self._voice_pub = self.create_publisher(String, "/task/voice_command", 10)
+        self._generate_program_pub = self.create_publisher(
+            String, "/task/generate_program", 5)
+
+        # Auto-program subscriber (LLM-generated pick/place steps)
+        self.create_subscription(String, "/task/auto_program",
+                                 self._on_auto_program, 5)
+        self.create_subscription(String, "/task/auto_status",
+                                 self._on_auto_status, 5)
 
         # Service client
         self._estop_client = self.create_client(Trigger, "/safety/reset_estop")
@@ -688,6 +699,35 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             })
         with _state_lock:
             STATE['placed_objects'] = out
+
+    def _on_auto_program(self, msg):
+        """LLM-generated pick/place steps from auto_program_node."""
+        try:
+            payload = json.loads(msg.data) if msg.data else {}
+        except json.JSONDecodeError:
+            return
+        steps = payload.get('steps') or []
+        if not isinstance(steps, list):
+            return
+        with _state_lock:
+            STATE['auto_program'] = {
+                'steps':      steps,
+                'scene_size': int(payload.get('scene_size', 0)),
+                't':          float(payload.get('t', time.time())),
+            }
+
+    def _on_auto_status(self, msg):
+        try:
+            payload = json.loads(msg.data) if msg.data else {}
+        except json.JSONDecodeError:
+            return
+        with _state_lock:
+            STATE['auto_status'] = {
+                'state':   str(payload.get('state', 'IDLE')),
+                'error':   payload.get('error'),
+                'n_steps': int(payload.get('n_steps', 0)),
+                't':       float(payload.get('t', time.time())),
+            }
 
     def _on_grasp_candidates(self, msg):
         """Parse grasp_planner JSON and reshape for the dashboard store."""
@@ -1186,6 +1226,18 @@ if FASTAPI_AVAILABLE:
             _ros_node.publish_task_command(command)
         with _state_lock:
             return {"ok": True, "task": copy.deepcopy(STATE["task"])}
+
+    @app.post("/cmd/generate_program")
+    async def cmd_generate_program(request: Request):
+        """Trigger auto_program_node to scan the scene and call the LLM."""
+        if _ros_node is None or _ros_node._generate_program_pub is None:
+            return JSONResponse({"error": "ROS node not ready"}, status_code=503)
+        m = String()
+        m.data = "generate"
+        _ros_node._generate_program_pub.publish(m)
+        with _state_lock:
+            return {"ok": True, "status": "generating",
+                    "auto_status": copy.deepcopy(STATE.get("auto_status", {}))}
 
     @app.post("/cmd/jog")
     async def cmd_jog(request: Request):
