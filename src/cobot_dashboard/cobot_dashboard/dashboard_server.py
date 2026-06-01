@@ -1507,12 +1507,26 @@ if FASTAPI_AVAILABLE:
         part['front_direction'] = str(body.get('front_direction') or '↑ Forward')
         part['front_angle_deg'] = float(body.get('front_angle_deg') or 0.0)
         grasp_in = body.get('grasp') or {}
-        part['grasp'] = {
-            **(part.get('grasp') or {}),
-            'approach':         str(grasp_in.get('approach') or 'top_down'),
-            'gripper_width_cm': float(grasp_in.get('gripper_width_cm') or 5.0),
-            'pick_offset_cm':   float(grasp_in.get('pick_offset_cm') or 2.0),
+        prev = part.get('grasp') or {}
+        gripper_type = str(grasp_in.get('gripper_type') or prev.get('gripper_type') or 'finger')
+        merged = {
+            **prev,
+            'gripper_type':     gripper_type,
+            'approach':         str(grasp_in.get('approach') or prev.get('approach') or 'top_down'),
+            'gripper_width_cm': float(grasp_in.get('gripper_width_cm') or prev.get('gripper_width_cm') or 5.0),
+            'pick_offset_cm':   float(grasp_in.get('pick_offset_cm')   or prev.get('pick_offset_cm')   or 2.0),
         }
+        if gripper_type == 'finger':
+            merged['finger_depth_cm'] = float(
+                grasp_in.get('finger_depth_cm') or prev.get('finger_depth_cm') or 3.0)
+        else:  # suction
+            merged['cup_diameter_mm']  = float(
+                grasp_in.get('cup_diameter_mm') or prev.get('cup_diameter_mm') or 30.0)
+            merged['num_cups']         = int(
+                grasp_in.get('num_cups')        or prev.get('num_cups')        or 1)
+            merged['vacuum_threshold'] = float(
+                grasp_in.get('vacuum_threshold') or prev.get('vacuum_threshold') or 70.0)
+        part['grasp'] = merged
 
         # Derive footprint + standing height under the chosen rotation.
         rot = part['table_rotation']
