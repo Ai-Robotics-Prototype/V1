@@ -1480,6 +1480,89 @@ if FASTAPI_AVAILABLE:
             return {"matched": False}
         return {"matched": True, "part": match, "score": score}
 
+    @app.put("/api/parts/{part_id}/tags")
+    async def api_parts_tags(part_id: str, request: Request):
+        """Update operation tags, program link, station, priority, notes."""
+        meta_path = f'/opt/cobot/parts/metadata/{part_id}.json'
+        if not os.path.isfile(meta_path):
+            return JSONResponse({"error": "part not found"}, status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        with open(meta_path) as f:
+            part = json.load(f)
+
+        ops = body.get('operations') or []
+        if not isinstance(ops, list):
+            ops = []
+        part['operations']   = [str(o) for o in ops]
+        part['program_id']   = body.get('program_id') or None
+        part['program_name'] = str(body.get('program_name') or '')
+        part['station']      = str(body.get('station') or '')
+        try:
+            prio = int(body.get('priority') or 3)
+        except (TypeError, ValueError):
+            prio = 3
+        part['priority'] = max(1, min(5, prio))
+        part['notes']    = str(body.get('notes') or '')
+
+        with open(meta_path, 'w') as f:
+            json.dump(part, f, indent=2)
+
+        # Mirror into the compact index entry
+        try:
+            from object_detection.part_library import LIBRARY_INDEX
+            with open(LIBRARY_INDEX) as f:
+                idx = json.load(f) or {'parts': []}
+            for p in idx.get('parts') or []:
+                if p.get('id') == part_id:
+                    p['operations']   = part['operations']
+                    p['program_id']   = part['program_id']
+                    p['program_name'] = part['program_name']
+                    p['station']      = part['station']
+                    p['priority']     = part['priority']
+                    break
+            with open(LIBRARY_INDEX, 'w') as f:
+                json.dump(idx, f, indent=2)
+        except Exception:
+            pass
+
+        return {"ok": True, "part": part}
+
+    @app.get("/api/programs")
+    async def api_programs_list():
+        """List robot programs available to link parts to. Includes a
+        small set of built-in defaults plus any JSON in /opt/cobot/programs/."""
+        defaults = [
+            {'id': 'pick_and_place',   'name': 'Pick and Place',   'steps': 5},
+            {'id': 'pick_and_sort',    'name': 'Pick and Sort',    'steps': 7},
+            {'id': 'pick_and_inspect', 'name': 'Pick and Inspect', 'steps': 6},
+            {'id': 'assembly_insert',  'name': 'Assembly Insert',  'steps': 8},
+            {'id': 'palletize',        'name': 'Palletize',        'steps': 4},
+            {'id': 'depalletize',      'name': 'Depalletize',      'steps': 4},
+        ]
+        programs = list(defaults)
+        prog_dir = '/opt/cobot/programs'
+        try:
+            os.makedirs(prog_dir, exist_ok=True)
+            for fn in sorted(os.listdir(prog_dir)):
+                if not fn.endswith('.json'):
+                    continue
+                try:
+                    with open(os.path.join(prog_dir, fn)) as fp:
+                        prog = json.load(fp)
+                    programs.append({
+                        'id':    fn[:-5],
+                        'name':  prog.get('name') or fn[:-5],
+                        'steps': len(prog.get('steps') or []),
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return {"programs": programs}
+
     @app.put("/api/parts/{part_id}/config")
     async def api_parts_config(part_id: str, request: Request):
         """Update part orientation, surface choice, and grasp settings."""
