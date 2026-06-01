@@ -155,7 +155,7 @@ export default function CameraPanel({ cam = 0 }) {
   const detectionMode = useStore((s) => s.detectionMode || 'all')
 
   const visibleDetections = detectionMode === 'library'
-    ? detections.filter(d => d.part_name && Number(d.match_score) >= 0.5)
+    ? detections.filter(d => d.part_name && Number(d.match_score) >= 0.70)
     : detections
 
   const [online, setOnline]     = useState(true)

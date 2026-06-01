@@ -409,7 +409,7 @@ function DetectedObjects() {
   }
 
   const filtered = detectionMode === 'library'
-    ? detections.filter(d => d.part_name && Number(d.match_score) >= 0.5)
+    ? detections.filter(d => d.part_name && Number(d.match_score) >= 0.70)
     : detections
   const sorted = [...filtered].sort((a, b) => dist(a) - dist(b))
 
@@ -429,7 +429,7 @@ function DetectedObjects() {
       ) : (
         sorted.map((det) => {
           const d        = dist(det)
-          const isMatch  = det.part_name && Number(det.match_score) >= 0.5
+          const isMatch  = det.part_name && Number(det.match_score) >= 0.70
           const posOk    = det.position_correct
           const misalign = isMatch && posOk === false
           const color    = misalign ? '#F97316'

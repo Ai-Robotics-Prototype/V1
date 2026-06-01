@@ -916,8 +916,12 @@ class DepthSegmentNode(Node):
 
     @staticmethod
     def _match_by_size(obb_size_m, library_parts):
-        """Rank parts by per-dimension ratio; sorted-dim comparison so
-        the part's orientation in the camera frame doesn't matter."""
+        """Rank parts by per-dimension ratio (sorted-dim, so the
+        part's orientation in the camera doesn't matter). HARD floor:
+        every individual ratio must clear 0.70 or the candidate is
+        rejected — otherwise an 8x4x2 cm part trivially "matches" a
+        3x2x1 cm part on the average. Final mean ratio must clear
+        0.75 to be returned."""
         det = sorted([float(s) for s in obb_size_m], reverse=True)
         best_part, best_score = None, 0.0
         for part in library_parts:
@@ -926,11 +930,13 @@ class DepthSegmentNode(Node):
                 continue
             part_sorted = sorted(ext, reverse=True)
             ratios = [min(d, p) / max(d, p) for d, p in zip(det, part_sorted)]
+            if any(r < 0.70 for r in ratios):
+                continue
             s = sum(ratios) / 3.0
-            if s > best_score and s > 0.6:
+            if s > best_score:
                 best_score = s
                 best_part  = part
-        if best_part:
+        if best_part and best_score >= 0.75:
             return best_part.get('name'), best_part.get('id'), round(best_score, 3)
         return None, None, 0.0
 
@@ -963,11 +969,16 @@ class DepthSegmentNode(Node):
             part_sorted = sorted(ext, reverse=True)
             sz_ratios = [min(d, p) / max(d, p) for d, p in zip(det_sorted, part_sorted)]
             sz_score = sum(sz_ratios) / 3.0
+            # Hard size floor mirrors _match_by_size — depth profile
+            # alone can't rescue a poor dimensional match.
+            sz_ratios = [min(d, p) / max(d, p) for d, p in zip(det_sorted, part_sorted)]
+            if any(r < 0.70 for r in sz_ratios):
+                continue
             s = h_ratio * 0.4 + sz_score * 0.6
-            if s > best_score and s > 0.5:
+            if s > best_score:
                 best_score = s
                 best_part  = part
-        if best_part:
+        if best_part and best_score >= 0.70:
             return best_part.get('name'), best_part.get('id'), round(best_score, 3)
         return None, None, 0.0
 
@@ -1050,7 +1061,20 @@ class DepthSegmentNode(Node):
                 (dp_name,  dp_id,  dp_score),
             ]
             best_name, best_id, best_score = max(candidates, key=lambda c: c[2])
-            if best_name is None or best_score < 0.5:
+
+            # Consensus requirement — with only one part in the library,
+            # the size matcher will happily latch onto ~anything that's
+            # in the same order of magnitude. Require 2+ methods to
+            # agree on the same part above 0.5, OR a single method
+            # with a very strong score (>=0.85). Otherwise reject.
+            agreeing = sum(
+                1 for c in candidates
+                if c[0] == best_name and c[0] is not None and c[2] > 0.5
+            )
+            confident_single = (agreeing == 1 and best_score >= 0.85)
+            accept = (agreeing >= 2) or confident_single
+
+            if best_name is None or not accept or best_score < 0.70:
                 o['part_name']        = None
                 o['part_id']          = None
                 o['match_score']      = 0.0
@@ -1061,9 +1085,8 @@ class DepthSegmentNode(Node):
                 o['position_status']  = ''
                 continue
 
-            # Consensus boost — when 2+ methods agree on the same part
-            # and clear the floor, push the score up by 15 %.
-            agreeing = sum(1 for c in candidates if c[0] == best_name and c[2] > 0.4)
+            # Consensus boost — 2+ agreeing methods bumps the reported
+            # confidence by 15 %, capped at 1.0.
             if agreeing >= 2:
                 best_score = min(best_score * 1.15, 1.0)
 
@@ -1113,7 +1136,7 @@ class DepthSegmentNode(Node):
         if getattr(self, '_detection_mode', 'all') == 'library':
             objects = [o for o in objects
                        if o.get('part_name')
-                       and float(o.get('match_score') or 0.0) >= 0.5]
+                       and float(o.get('match_score') or 0.0) >= 0.70]
         for o in objects:
             det = Detection3D()
             det.header = arr.header

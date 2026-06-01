@@ -19,7 +19,7 @@ except ImportError:
 
 LIBRARY_DIR    = '/opt/cobot/parts'
 LIBRARY_INDEX  = os.path.join(LIBRARY_DIR, 'index.json')
-MIN_MATCH_SCORE = 0.5
+MIN_MATCH_SCORE = 0.70
 
 _parts_cache: Optional[list] = None
 _cache_mtime: float = 0.0
