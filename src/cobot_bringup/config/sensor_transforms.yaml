@@ -5,23 +5,32 @@
 #         x  = forward distance (LiDAR +X)
 #         y  = left distance    (LiDAR +Y)
 #         z  = height           (LiDAR +Z)
-#     rotation: quaternion (qx, qy, qz, qw) that takes a vector expressed in
-#         the sensor's own frame and re-expresses it in the LiDAR frame.
-#
-# The default rotation below is the standard camera-optical -> ROS body
-# transform (optical X-right, Y-down, Z-forward  ->  ROS X-forward, Y-left,
-# Z-up). It is correct for a camera that points along the LiDAR's +X axis
-# (i.e. "forward"). For a top-down camera, the rotation needs an extra 90°
-# pitch — refine with scripts/align_sensors.py.
+#     rotation: quaternion (qx, qy, qz, qw) for the BASE optical->ROS
+#         rotation. The downward-looking variant is (0.5,-0.5,0.5,0.5);
+#         the forward-looking variant is (0.5,-0.5,0.5,-0.5). Pick the
+#         one closest to the camera's actual orientation, then trim
+#         with rpy_correction below.
+#     rpy_correction: small Euler-angle nudge applied AFTER the base
+#         rotation, in degrees (roll, pitch, yaw). Use this for the
+#         physical tilt of the ball-joint clamp — don't try to encode
+#         large rotations into the quaternion above; let this field
+#         handle the trim.
 #
 # Refine these numbers physically (tape measure) or with
-#   ros2 launch cobot_bringup calibrate.launch.py   (AprilTag, when ready)
-#   python3 scripts/align_sensors.py                (interactive tweaker)
+#   python3 scripts/interactive_align.py [cam0_to_lidar|cam1_to_lidar]
+
+# Cameras mounted on ball-joint clamps at the table edge, both
+# pointing down at ~70 deg from horizontal toward the workspace.
+# Base rotation is the downward-looking optical->ROS quaternion;
+# rpy_correction trims the remaining tilt (90 - 70 = 20 deg) about
+# the roll axis.
 
 cam0_to_lidar:
-  translation: [0.0, 0.05, -0.11]
-  rotation:    [0.5, -0.5, 0.5, -0.5]
+  translation:    [0.30, 0.05, 0.25]
+  rotation:       [0.5, -0.5, 0.5, 0.5]
+  rpy_correction: [-20.0, 0.0, 0.0]
 
 cam1_to_lidar:
-  translation: [0.0, -0.05, -0.11]
-  rotation:    [0.5, -0.5, 0.5, -0.5]
+  translation:    [0.10, 0.15, 0.25]
+  rotation:       [0.5, -0.5, 0.5, 0.5]
+  rpy_correction: [-20.0, 0.0, 0.0]

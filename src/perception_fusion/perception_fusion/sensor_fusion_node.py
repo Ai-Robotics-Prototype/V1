@@ -35,10 +35,26 @@ def _quat_to_R(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
     ], dtype=np.float32)
 
 
+def _rpy_to_R(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
+    """Intrinsic ZYX (yaw, pitch, roll) Euler angles (deg) -> 3x3 matrix.
+    Same convention used by ros2 and most robotics tooling: a vector is
+    rotated first by roll about X, then pitch about Y, then yaw about Z."""
+    r = np.deg2rad(roll_deg);  p = np.deg2rad(pitch_deg);  y = np.deg2rad(yaw_deg)
+    cr, sr = np.cos(r), np.sin(r)
+    cp, sp = np.cos(p), np.sin(p)
+    cy, sy = np.cos(y), np.sin(y)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr,  cr]], dtype=np.float32)
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]], dtype=np.float32)
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0,  0, 1]], dtype=np.float32)
+    return Rz @ Ry @ Rx
+
+
 def _load_cam_transforms():
     """Return {'cam0': (R, t), 'cam1': (R, t)} read from the yaml.
-    Falls back to identity translation + optical-to-ROS rotation if
-    the file is missing."""
+    The full rotation is R_rpy @ R_base — base optical->ROS quaternion,
+    then a small Euler-angle trim from `rpy_correction` for camera tilt.
+    Falls back to identity translation + standard optical->ROS rotation
+    when the yaml is missing."""
     cfg = {}
     for path in _TF_YAML_CANDIDATES:
         if os.path.isfile(path):
@@ -51,10 +67,13 @@ def _load_cam_transforms():
     out = {}
     for key, label in [('cam0_to_lidar', 'cam0'), ('cam1_to_lidar', 'cam1')]:
         block = cfg.get(key) or {}
-        trans = block.get('translation') or [0.0, 0.0, 0.0]
-        rot   = block.get('rotation')    or list(_OPTICAL_TO_ROS_Q)
+        trans = block.get('translation')    or [0.0, 0.0, 0.0]
+        rot   = block.get('rotation')       or list(_OPTICAL_TO_ROS_Q)
+        rpy   = block.get('rpy_correction') or [0.0, 0.0, 0.0]
+        R_base = _quat_to_R(*rot)
+        R_trim = _rpy_to_R(*rpy)
         out[label] = (
-            _quat_to_R(*rot),
+            (R_trim @ R_base).astype(np.float32, copy=False),
             np.asarray(trans, dtype=np.float32),
         )
     return out
