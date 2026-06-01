@@ -825,6 +825,7 @@ class DepthSegmentNode(Node):
                     'corners':  None,
                     'obb':      False,
                     'mask_2d':  np.ascontiguousarray(sub_fg, dtype=bool),
+                    'depth_2d': np.ascontiguousarray(sub_d, dtype=np.float32),
                 })
                 continue
 
@@ -843,6 +844,7 @@ class DepthSegmentNode(Node):
                     'obb':      False,
                     '_pts3d':   pts3d,
                     'mask_2d':  np.ascontiguousarray(sub_fg, dtype=bool),
+                    'depth_2d': np.ascontiguousarray(sub_d, dtype=np.float32),
                 })
                 continue
 
@@ -891,39 +893,199 @@ class DepthSegmentNode(Node):
         self._match_parts(stable)
         self._publish(stable, h, w)
 
+    # ── Library matching helpers ──────────────────────────────────────────────
+
+    @staticmethod
+    def _load_library_parts():
+        """List of full metadata dicts from /opt/cobot/parts/metadata/.
+        Re-reads on every call — tiny library, negligible cost."""
+        try:
+            from object_detection.part_library import get_all_parts
+        except Exception:
+            return []
+        parts = []
+        for entry in get_all_parts():
+            mp = f"/opt/cobot/parts/metadata/{entry.get('id', '')}.json"
+            if os.path.isfile(mp):
+                try:
+                    with open(mp) as f:
+                        parts.append(json.load(f))
+                except Exception:
+                    pass
+        return parts
+
+    @staticmethod
+    def _match_by_size(obb_size_m, library_parts):
+        """Rank parts by per-dimension ratio; sorted-dim comparison so
+        the part's orientation in the camera frame doesn't matter."""
+        det = sorted([float(s) for s in obb_size_m], reverse=True)
+        best_part, best_score = None, 0.0
+        for part in library_parts:
+            ext = [e / 100.0 for e in (part.get('extents_cm') or [0, 0, 0])]
+            if not all(e > 0.001 for e in ext):
+                continue
+            part_sorted = sorted(ext, reverse=True)
+            ratios = [min(d, p) / max(d, p) for d, p in zip(det, part_sorted)]
+            s = sum(ratios) / 3.0
+            if s > best_score and s > 0.6:
+                best_score = s
+                best_part  = part
+        if best_part:
+            return best_part.get('name'), best_part.get('id'), round(best_score, 3)
+        return None, None, 0.0
+
+    @staticmethod
+    def _match_by_depth_profile(depth_crop, mask_crop, obb_size_m, library_parts):
+        """Use the depth range of the object (its standing height) plus
+        the sorted-dim size comparison. Independent of camera yaw and
+        robust to mild lighting changes."""
+        if depth_crop is None or mask_crop is None:
+            return None, None, 0.0
+        try:
+            valid = mask_crop & (depth_crop > 0.0) & np.isfinite(depth_crop)
+            if not valid.any():
+                return None, None, 0.0
+            obj_depths = depth_crop[valid]
+            height = float(obj_depths.max() - obj_depths.min())
+            if height < 0.002:
+                return None, None, 0.0
+        except Exception:
+            return None, None, 0.0
+
+        det_sorted = sorted([float(s) for s in obb_size_m], reverse=True)
+        best_part, best_score = None, 0.0
+        for part in library_parts:
+            ext = [e / 100.0 for e in (part.get('extents_cm') or [0, 0, 0])]
+            if not all(e > 0.001 for e in ext):
+                continue
+            part_height = min(ext)
+            h_ratio = min(height, part_height) / max(height, part_height)
+            part_sorted = sorted(ext, reverse=True)
+            sz_ratios = [min(d, p) / max(d, p) for d, p in zip(det_sorted, part_sorted)]
+            sz_score = sum(sz_ratios) / 3.0
+            s = h_ratio * 0.4 + sz_score * 0.6
+            if s > best_score and s > 0.5:
+                best_score = s
+                best_part  = part
+        if best_part:
+            return best_part.get('name'), best_part.get('id'), round(best_score, 3)
+        return None, None, 0.0
+
+    @staticmethod
+    def _verify_position(part_meta, yaw_rad, obb_size_m):
+        """Compare detected yaw + standing height against the part's
+        saved configuration. Returns (position_correct, yaw_err_deg,
+        surface_ok). Tolerant defaults when the operator hasn't yet
+        configured the part (front_angle_deg / table_height_m missing)."""
+        try:
+            yaw_deg = (math.degrees(float(yaw_rad)) + 180.0) % 180.0
+        except Exception:
+            yaw_deg = 0.0
+        try:
+            expected_yaw = float(part_meta.get('front_angle_deg') or 0.0) % 180.0
+        except Exception:
+            expected_yaw = 0.0
+        yaw_err = abs(yaw_deg - expected_yaw)
+        if yaw_err > 90.0:
+            yaw_err = 180.0 - yaw_err
+        yaw_ok = yaw_err < 20.0
+
+        ext_m = part_meta.get('extents_m') or []
+        expected_height = float(
+            part_meta.get('table_height_m')
+            or (min(ext_m) if ext_m else 0.0)
+            or 0.0
+        )
+        actual_height = float(min(obb_size_m)) if obb_size_m else 0.0
+        if expected_height < 1e-4 or actual_height < 1e-4:
+            surface_ok = True  # no reference -> don't penalise
+        else:
+            h_ratio = min(actual_height, expected_height) / max(actual_height, expected_height)
+            surface_ok = h_ratio > 0.7
+        return (yaw_ok and surface_ok), round(yaw_err, 1), surface_ok
+
     def _match_parts(self, objects):
-        """For each stable detection, call the parts-library shape
-        matcher and stash part_name/part_id/match_score onto the dict.
-        No-op if shape_matcher isn't importable or no parts are
-        registered — the matcher itself returns (None, 0, 0) in that
-        case and we fall through to the unmatched branch downstream."""
-        if not _MATCHER_OK:
+        """Three-method library matching with consensus boost +
+        position verification. Silhouette-only matches were too noisy
+        on real cluttered camera data; adding size and depth-profile
+        as independent voters and boosting agreement makes the live
+        recognition reliable."""
+        if not objects:
             return
+        library_parts = self._load_library_parts()
         for o in objects:
-            try:
-                mask = o.get('mask_2d')
-                bbox = o.get('bbox_px') or (0, 0, 0, 0)
-                bw = max(1, bbox[2] - bbox[0])
-                bh = max(1, bbox[3] - bbox[1])
-                aspect = float(bw) / float(bh)
-                sx, sy, sz = o.get('size_3d') or (0.05, 0.05, 0.05)
-                match, score, yaw_deg = _match_part(
-                    detection_mask=mask if mask is not None else None,
-                    detection_size_m=[float(sx), float(sy), float(sz)],
-                    detection_aspect=aspect,
-                )
-            except Exception:
-                match, score, yaw_deg = None, 0.0, 0.0
-            if match is not None and score >= 0.5:
-                o['part_name']   = str(match.get('name') or 'part')
-                o['part_id']     = str(match.get('id') or '')
-                o['match_score'] = float(score)
-                o['match_yaw']   = float(yaw_deg)
+            mask  = o.get('mask_2d')
+            depth = o.get('depth_2d')
+            bbox  = o.get('bbox_px') or (0, 0, 0, 0)
+            bw    = max(1, bbox[2] - bbox[0])
+            bh    = max(1, bbox[3] - bbox[1])
+            aspect = float(bw) / float(bh)
+            sx, sy, sz = o.get('size_3d') or (0.05, 0.05, 0.05)
+            size_m = [float(sx), float(sy), float(sz)]
+
+            # 1) Silhouette (shape-based)
+            sil_name, sil_id, sil_score, sil_yaw = None, None, 0.0, 0.0
+            if _MATCHER_OK and mask is not None and mask.any():
+                try:
+                    match, score, yawd = _match_part(
+                        detection_mask=mask, detection_size_m=size_m,
+                        detection_aspect=aspect,
+                    )
+                    if match is not None:
+                        sil_name  = match.get('name'); sil_id = match.get('id')
+                        sil_score = float(score);     sil_yaw = float(yawd)
+                except Exception:
+                    pass
+
+            # 2) Size-ratio (dimension comparison)
+            sz_name, sz_id, sz_score = self._match_by_size(size_m, library_parts)
+
+            # 3) Depth-profile (standing height + dimension blend)
+            dp_name, dp_id, dp_score = self._match_by_depth_profile(
+                depth, mask, size_m, library_parts)
+
+            candidates = [
+                (sil_name, sil_id, sil_score),
+                (sz_name,  sz_id,  sz_score),
+                (dp_name,  dp_id,  dp_score),
+            ]
+            best_name, best_id, best_score = max(candidates, key=lambda c: c[2])
+            if best_name is None or best_score < 0.5:
+                o['part_name']        = None
+                o['part_id']          = None
+                o['match_score']      = 0.0
+                o['match_yaw']        = 0.0
+                o['position_correct'] = None
+                o['yaw_error_deg']    = 0.0
+                o['surface_ok']       = None
+                o['position_status']  = ''
+                continue
+
+            # Consensus boost — when 2+ methods agree on the same part
+            # and clear the floor, push the score up by 15 %.
+            agreeing = sum(1 for c in candidates if c[0] == best_name and c[2] > 0.4)
+            if agreeing >= 2:
+                best_score = min(best_score * 1.15, 1.0)
+
+            o['part_name']   = str(best_name)
+            o['part_id']     = str(best_id) if best_id else None
+            o['match_score'] = float(round(best_score, 3))
+            o['match_yaw']   = float(sil_yaw)
+
+            # Position verification against the operator-saved config
+            part_meta = next((p for p in library_parts if p.get('id') == best_id), None)
+            if part_meta is not None:
+                roll, pitch, yaw_rad = o.get('euler') or (0.0, 0.0, 0.0)
+                ok, yaw_err, surf_ok = self._verify_position(part_meta, yaw_rad, size_m)
+                o['position_correct'] = bool(ok)
+                o['yaw_error_deg']    = float(yaw_err)
+                o['surface_ok']       = bool(surf_ok)
+                o['position_status']  = 'CORRECT' if ok else 'MISALIGNED'
             else:
-                o['part_name']   = None
-                o['part_id']     = None
-                o['match_score'] = 0.0
-                o['match_yaw']   = 0.0
+                o['position_correct'] = None
+                o['yaw_error_deg']    = 0.0
+                o['surface_ok']       = None
+                o['position_status']  = ''
 
     # ── Publishing ────────────────────────────────────────────────────────────
 
@@ -957,7 +1119,13 @@ class DepthSegmentNode(Node):
             det.header = arr.header
             hyp = ObjectHypothesisWithPose()
             if o.get('part_name'):
-                hyp.hypothesis.class_id = f"part:{o['part_name']}"
+                # Encode "part:NAME:C|M|U:yaw_err" — single string the
+                # dashboard parses back into part_name/position_correct/
+                # yaw_error_deg, since Detection3D has no spare fields.
+                pos = o.get('position_correct')
+                status = 'C' if pos is True else ('M' if pos is False else 'U')
+                yaw_err = float(o.get('yaw_error_deg') or 0.0)
+                hyp.hypothesis.class_id = f"part:{o['part_name']}:{status}:{yaw_err:.1f}"
                 hyp.hypothesis.score    = float(o.get('match_score') or 0.0)
             else:
                 hyp.hypothesis.class_id = 'object'
@@ -1023,12 +1191,16 @@ class DepthSegmentNode(Node):
             px, py, pz = o['pos']
             sx, sy, sz = o['size_3d']
             roll, pitch, yaw = o['euler']
-            matched = bool(o.get('part_name'))
-            # Matched parts get a blue box (#3B82F6); unmatched stay
-            # green (#00FF00). Distance/quality colouring is dropped in
-            # favour of the matched/unmatched binary so the operator
-            # can read "is this in the library?" at a glance.
-            col = (59, 130, 246) if matched else self._dist_color(pz)
+            matched   = bool(o.get('part_name'))
+            pos_ok    = o.get('position_correct')
+            # Three-way colour code: blue = matched + correctly placed,
+            # orange = matched but yaw/surface off, green = unknown.
+            if matched and pos_ok:
+                col = (59, 130, 246)    # blue
+            elif matched:
+                col = (249, 115, 22)    # orange
+            else:
+                col = self._dist_color(pz)
 
             # 2D bbox
             draw.rectangle([x0, y0, x1, y1], outline=col, width=2)
@@ -1062,7 +1234,11 @@ class DepthSegmentNode(Node):
             h_cm = int(round(sy * 100))
             if matched:
                 pct = int(round(float(o.get('match_score') or 0) * 100))
-                label = f"{o['part_name']} ({pct}%)  {pz:.2f}m"
+                if pos_ok:
+                    label = f"{o['part_name']} ({pct}%) ✓  {pz:.2f}m"
+                else:
+                    yaw_err = float(o.get('yaw_error_deg') or 0.0)
+                    label = f"{o['part_name']} ({pct}%) ⚠ yaw:{yaw_err:.0f}° off"
             else:
                 label = f'{pz:.2f}m  {w_cm}×{h_cm}cm  yaw:{yaw_deg:+.0f}°'
             tw = len(label) * 6 + 6

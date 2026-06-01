@@ -430,8 +430,14 @@ function DetectedObjects() {
         sorted.map((det) => {
           const d        = dist(det)
           const isMatch  = det.part_name && Number(det.match_score) >= 0.5
-          const color    = isMatch ? MATCHED_COLOR : (CLASS_COLORS[det.class_name] ?? 'var(--text-muted)')
-          const label    = isMatch ? det.part_name : (det.class_name || 'object')
+          const posOk    = det.position_correct
+          const misalign = isMatch && posOk === false
+          const color    = misalign ? '#F97316'
+                          : isMatch ? MATCHED_COLOR
+                          : (CLASS_COLORS[det.class_name] ?? 'var(--text-muted)')
+          const baseLabel = isMatch ? det.part_name : (det.class_name || 'object')
+          const yawErr   = Number(det.yaw_error_deg ?? 0)
+          const label    = misalign ? `${baseLabel}  rotate ${yawErr.toFixed(0)}°` : baseLabel
           const barPct   = isMatch ? Math.round((det.match_score ?? 0) * 100)
                                    : Math.round((det.score       ?? 0) * 100)
           return (

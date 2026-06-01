@@ -619,15 +619,25 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             class_name = str(result.hypothesis.class_id)
             score = float(result.hypothesis.score)
             # depth_segment_node encodes part-library matches as
-            # class_id="part:<name>" with score=match_score. Pull the
-            # part name out for downstream UI; keep class_name="part"
-            # so existing class-colour logic still works.
-            part_name = None
-            match_score = 0.0
+            # "part:NAME:STATUS:YAW_ERR" where STATUS is C (correct),
+            # M (misaligned), or U (unverified — no metadata to check
+            # against). Parse them back into top-level detection
+            # fields the frontend can branch on.
+            part_name        = None
+            match_score      = 0.0
+            position_correct = None
+            yaw_error_deg    = 0.0
             if class_name.startswith('part:'):
-                part_name = class_name[5:]
+                parts_split = class_name.split(':', 3)
+                part_name   = parts_split[1] if len(parts_split) > 1 else None
+                status_ch   = parts_split[2] if len(parts_split) > 2 else 'U'
+                try:
+                    yaw_error_deg = float(parts_split[3]) if len(parts_split) > 3 else 0.0
+                except ValueError:
+                    yaw_error_deg = 0.0
+                position_correct = {'C': True, 'M': False}.get(status_ch)  # None for 'U'
                 match_score = score
-                class_name = 'part'
+                class_name  = 'part'
             pos = det.bbox.center.position
             ori = det.bbox.center.orientation
             size = det.bbox.size
@@ -638,8 +648,10 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                     "id":          str(id(det)),
                     "class_name":  class_name,
                     "score":       round(score, 3),
-                    "part_name":   part_name,
-                    "match_score": round(match_score, 3) if part_name else 0,
+                    "part_name":        part_name,
+                    "match_score":      round(match_score, 3) if part_name else 0,
+                    "position_correct": position_correct,
+                    "yaw_error_deg":    round(yaw_error_deg, 1) if part_name else 0,
                     "bbox_px": [
                         round(pos.x - size.x / 2, 1),
                         round(pos.y - size.y / 2, 1),
@@ -671,8 +683,10 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                     "id":          str(id(det)),
                     "class_name":  class_name,
                     "score":       round(score, 3),
-                    "part_name":   part_name,
-                    "match_score": round(match_score, 3) if part_name else 0,
+                    "part_name":        part_name,
+                    "match_score":      round(match_score, 3) if part_name else 0,
+                    "position_correct": position_correct,
+                    "yaw_error_deg":    round(yaw_error_deg, 1) if part_name else 0,
                     "x":          round(pos.x, 4),
                     "y":          round(pos.y, 4),
                     "z":          round(pos.z, 4),
