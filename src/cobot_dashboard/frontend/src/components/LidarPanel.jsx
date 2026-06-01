@@ -571,10 +571,15 @@ function Scene({ pointsRef, meshRef, meshWireRef, zone, preset, sceneObjects, de
       <SafetyRings zone={zone} />
       <PointCloud pointsRef={pointsRef} />
       <ReconstructionMesh meshRef={meshRef} meshWireRef={meshWireRef} />
+      {/* Detection/object boxes disabled — lidar_detector over-segments
+          noise into ~22 spurious clusters and the other sources weren't
+          calibrated against the live cloud. Re-enable per-source after
+          calibration is verified.
       <ObjectMarkers objects={sceneObjects} />
       <DetectionMarkers detections={detections} />
       <PlacedObjects objects={placedObjects} />
       <GraspMarkers grasps={grasps} />
+      */}
 
       <CameraController preset={preset} />
       <OrbitControls enableDamping dampingFactor={0.08} />

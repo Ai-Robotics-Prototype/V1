@@ -542,18 +542,15 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             pass
 
     def _on_detections_lidar(self, msg):
-        """LiDAR detector — populates STATE['lidar_objects'] for the 3D view.
+        """LiDAR detector callback — disabled.
 
-        Positions are already in livox_frame (same frame as the point
-        cloud the dashboard renders), so no transform is involved. The
-        publisher arranges bbox.center.z and bbox.size.z so that
-        center.z - size.z/2 = cluster min_z, i.e. the box bottom sits
-        on the lowest physical point of the cluster.
-
-        Sanity filter: drop low-confidence, non-finite, or far-out-of-
-        workspace boxes so over-segmented noise clusters don't pollute
-        the 3D view.
+        The lidar_detector node over-segments noise into 22 spurious
+        clusters per cycle. The service is stopped + disabled at the
+        systemd level (roboai-lidar-detect); this callback is a no-op
+        as belt+suspenders in case anything else publishes the topic.
+        STATE['lidar_objects'] stays at its initial [].
         """
+        return
         import math as _m
         out = []
         for det in msg.detections:
