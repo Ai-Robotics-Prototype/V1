@@ -31,7 +31,7 @@ except ImportError:
     PIL_AVAILABLE = False
 
 try:
-    from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
@@ -1385,6 +1385,106 @@ if FASTAPI_AVAILABLE:
     async def api_state():
         with _state_lock:
             return copy.deepcopy(STATE)
+
+    # ------------------------------------------------------------------
+    # Parts library — STEP file upload + metadata
+    # ------------------------------------------------------------------
+
+    @app.post("/api/parts/upload")
+    async def api_parts_upload(file: UploadFile = File(...)):
+        """Accept a .step/.stp upload, parse it, persist metadata, and
+        copy a rendered .stl into the dashboard's static dir so the
+        browser can fetch it for 3D preview."""
+        import tempfile
+        if not file.filename or not file.filename.lower().endswith(('.step', '.stp')):
+            return JSONResponse(
+                {"error": "Only .step / .stp files accepted"},
+                status_code=400)
+
+        suffix = os.path.splitext(file.filename)[1] or '.step'
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+        # Rename so the .stl that the parser writes lands next to a
+        # human-friendly name, not a tempfile prefix.
+        nice_path = os.path.join(
+            os.path.dirname(tmp_path),
+            os.path.basename(file.filename))
+        try:
+            os.replace(tmp_path, nice_path)
+        except OSError:
+            nice_path = tmp_path
+
+        try:
+            from object_detection.step_parser import parse_step_file
+            from object_detection.part_library import add_part
+            part_data = parse_step_file(nice_path)
+            add_part(nice_path, part_data)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+        finally:
+            for p in (nice_path, os.path.splitext(nice_path)[0] + '.stl'):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except OSError:
+                    pass
+
+        # Copy STL into the dashboard's static dir for the browser to fetch
+        try:
+            stl_src = os.path.join('/opt/cobot/parts/stl', part_data['stl_file'])
+            stl_dst_dir = os.path.join(str(_STATIC_DIR), 'parts')
+            os.makedirs(stl_dst_dir, exist_ok=True)
+            if os.path.exists(stl_src):
+                import shutil as _sh
+                _sh.copy2(stl_src, os.path.join(stl_dst_dir, part_data['stl_file']))
+        except Exception:
+            pass
+
+        return {
+            "ok":           True,
+            "part_id":      part_data['id'],
+            "name":         part_data['name'],
+            "extents_cm":   part_data['extents_cm'],
+            "grasp":        part_data['grasp'],
+            "vertices":     part_data['vertices'],
+            "faces":        part_data['faces'],
+            "stl_url":      f"/parts/{part_data['stl_file']}",
+        }
+
+    @app.get("/api/parts")
+    async def api_parts_list():
+        from object_detection.part_library import get_all_parts
+        return {"parts": get_all_parts()}
+
+    @app.get("/api/parts/{part_id}")
+    async def api_parts_get(part_id: str):
+        from object_detection.part_library import get_part
+        part = get_part(part_id)
+        if not part:
+            return JSONResponse({"error": "part not found"}, status_code=404)
+        return part
+
+    @app.delete("/api/parts/{part_id}")
+    async def api_parts_delete(part_id: str):
+        from object_detection.part_library import delete_part
+        ok = delete_part(part_id)
+        if not ok:
+            return JSONResponse({"error": "part not found"}, status_code=404)
+        return {"ok": True}
+
+    @app.post("/api/parts/match")
+    async def api_parts_match(request: Request):
+        from object_detection.part_library import match_detection_to_part
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        size = body.get("size_m") or body.get("extents_m") or []
+        match, score = match_detection_to_part(list(size))
+        if match is None:
+            return {"matched": False}
+        return {"matched": True, "part": match, "score": score}
 
     @app.get("/api/config")
     async def api_config():
