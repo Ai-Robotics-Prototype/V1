@@ -612,6 +612,16 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             result = det.results[0]
             class_name = str(result.hypothesis.class_id)
             score = float(result.hypothesis.score)
+            # depth_segment_node encodes part-library matches as
+            # class_id="part:<name>" with score=match_score. Pull the
+            # part name out for downstream UI; keep class_name="part"
+            # so existing class-colour logic still works.
+            part_name = None
+            match_score = 0.0
+            if class_name.startswith('part:'):
+                part_name = class_name[5:]
+                match_score = score
+                class_name = 'part'
             pos = det.bbox.center.position
             ori = det.bbox.center.orientation
             size = det.bbox.size
@@ -619,9 +629,11 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             # Metric detections carry full OBB (quaternion + 3D size).
             if abs(pos.x) > 10 or abs(pos.y) > 10:
                 dets.append({
-                    "id":         str(id(det)),
-                    "class_name": class_name,
-                    "score":      round(score, 3),
+                    "id":          str(id(det)),
+                    "class_name":  class_name,
+                    "score":       round(score, 3),
+                    "part_name":   part_name,
+                    "match_score": round(match_score, 3) if part_name else 0,
                     "bbox_px": [
                         round(pos.x - size.x / 2, 1),
                         round(pos.y - size.y / 2, 1),
@@ -650,9 +662,11 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                     _m.degrees(roll), _m.degrees(pitch), _m.degrees(yaw)
                 )
                 dets.append({
-                    "id":         str(id(det)),
-                    "class_name": class_name,
-                    "score":      round(score, 3),
+                    "id":          str(id(det)),
+                    "class_name":  class_name,
+                    "score":       round(score, 3),
+                    "part_name":   part_name,
+                    "match_score": round(match_score, 3) if part_name else 0,
                     "x":          round(pos.x, 4),
                     "y":          round(pos.y, 4),
                     "z":          round(pos.z, 4),

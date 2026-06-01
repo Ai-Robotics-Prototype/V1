@@ -35,6 +35,14 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, CameraInfo
 from vision_msgs.msg import Detection3DArray, Detection3D, ObjectHypothesisWithPose
+
+try:
+    from object_detection.shape_matcher import match_detection as _match_part
+    _MATCHER_OK = True
+except ImportError:
+    _MATCHER_OK = False
+    def _match_part(*_a, **_kw):
+        return None, 0.0, 0.0
 from scipy import ndimage
 from scipy.spatial.transform import Rotation as _SR
 from PIL import Image as PILImage, ImageDraw
@@ -806,6 +814,7 @@ class DepthSegmentNode(Node):
                     'euler':    (0.0, 0.0, 0.0),
                     'corners':  None,
                     'obb':      False,
+                    'mask_2d':  np.ascontiguousarray(sub_fg, dtype=bool),
                 })
                 continue
 
@@ -823,6 +832,7 @@ class DepthSegmentNode(Node):
                     'corners':  None,
                     'obb':      False,
                     '_pts3d':   pts3d,
+                    'mask_2d':  np.ascontiguousarray(sub_fg, dtype=bool),
                 })
                 continue
 
@@ -838,6 +848,7 @@ class DepthSegmentNode(Node):
                 'corners':  corners,
                 'obb':      True,
                 '_pts3d':   pts3d,
+                'mask_2d':  np.ascontiguousarray(sub_fg, dtype=bool),
             })
 
         # Final safety net: merge any remaining overlapping or near-coincident
@@ -854,9 +865,45 @@ class DepthSegmentNode(Node):
             self.get_logger().info(f'{len(self._temporal_filter())} object(s) detected')
 
     def _emit(self, h, w):
-        """Apply temporal smoothing, then publish detections + annotated image."""
+        """Apply temporal smoothing, match against the parts library,
+        then publish detections + annotated image."""
         stable = self._temporal_filter()
+        self._match_parts(stable)
         self._publish(stable, h, w)
+
+    def _match_parts(self, objects):
+        """For each stable detection, call the parts-library shape
+        matcher and stash part_name/part_id/match_score onto the dict.
+        No-op if shape_matcher isn't importable or no parts are
+        registered — the matcher itself returns (None, 0, 0) in that
+        case and we fall through to the unmatched branch downstream."""
+        if not _MATCHER_OK:
+            return
+        for o in objects:
+            try:
+                mask = o.get('mask_2d')
+                bbox = o.get('bbox_px') or (0, 0, 0, 0)
+                bw = max(1, bbox[2] - bbox[0])
+                bh = max(1, bbox[3] - bbox[1])
+                aspect = float(bw) / float(bh)
+                sx, sy, sz = o.get('size_3d') or (0.05, 0.05, 0.05)
+                match, score, yaw_deg = _match_part(
+                    detection_mask=mask if mask is not None else None,
+                    detection_size_m=[float(sx), float(sy), float(sz)],
+                    detection_aspect=aspect,
+                )
+            except Exception:
+                match, score, yaw_deg = None, 0.0, 0.0
+            if match is not None and score >= 0.5:
+                o['part_name']   = str(match.get('name') or 'part')
+                o['part_id']     = str(match.get('id') or '')
+                o['match_score'] = float(score)
+                o['match_yaw']   = float(yaw_deg)
+            else:
+                o['part_name']   = None
+                o['part_id']     = None
+                o['match_score'] = 0.0
+                o['match_yaw']   = 0.0
 
     # ── Publishing ────────────────────────────────────────────────────────────
 
@@ -883,8 +930,12 @@ class DepthSegmentNode(Node):
             det = Detection3D()
             det.header = arr.header
             hyp = ObjectHypothesisWithPose()
-            hyp.hypothesis.class_id = 'object'
-            hyp.hypothesis.score = 1.0
+            if o.get('part_name'):
+                hyp.hypothesis.class_id = f"part:{o['part_name']}"
+                hyp.hypothesis.score    = float(o.get('match_score') or 0.0)
+            else:
+                hyp.hypothesis.class_id = 'object'
+                hyp.hypothesis.score    = 1.0
             p_lid, q_lid = self._cam_to_lidar(o['pos'], o['quat'])
             px, py, pz = float(p_lid[0]), float(p_lid[1]), float(p_lid[2])
             qx, qy, qz, qw = (float(q_lid[0]), float(q_lid[1]),
@@ -946,9 +997,14 @@ class DepthSegmentNode(Node):
             px, py, pz = o['pos']
             sx, sy, sz = o['size_3d']
             roll, pitch, yaw = o['euler']
-            col = self._dist_color(pz)
+            matched = bool(o.get('part_name'))
+            # Matched parts get a blue box (#3B82F6); unmatched stay
+            # green (#00FF00). Distance/quality colouring is dropped in
+            # favour of the matched/unmatched binary so the operator
+            # can read "is this in the library?" at a glance.
+            col = (59, 130, 246) if matched else self._dist_color(pz)
 
-            # 2D bbox in green
+            # 2D bbox
             draw.rectangle([x0, y0, x1, y1], outline=col, width=2)
 
             # Cyan OBB wireframe (projected from the 8 3D corners).
@@ -978,7 +1034,11 @@ class DepthSegmentNode(Node):
             # collapsed to the two XY dims for a top-down read.
             w_cm = int(round(sx * 100))
             h_cm = int(round(sy * 100))
-            label = f'{pz:.2f}m  {w_cm}×{h_cm}cm  yaw:{yaw_deg:+.0f}°'
+            if matched:
+                pct = int(round(float(o.get('match_score') or 0) * 100))
+                label = f"{o['part_name']} ({pct}%)  {pz:.2f}m"
+            else:
+                label = f'{pz:.2f}m  {w_cm}×{h_cm}cm  yaw:{yaw_deg:+.0f}°'
             tw = len(label) * 6 + 6
             draw.rectangle([x0, max(0, y0 - 13), x0 + tw, y0], fill=col)
             draw.text((x0 + 2, max(0, y0 - 12)), label, fill=(255, 255, 255))

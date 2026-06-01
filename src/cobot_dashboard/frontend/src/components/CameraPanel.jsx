@@ -54,8 +54,17 @@ function DetectionOverlay({ detections }) {
         } else {
           return null
         }
-        const col = classColor(det.class_name)
-        const label = `${det.class_name} ${(det.score * 100).toFixed(0)}%`
+        // Matched parts (depth_segment_node found a CAD library hit)
+        // get the blue accent; everything else falls back to the
+        // class-colour palette. Label shows the part name + match %.
+        const matched = !!det.part_name
+        const col = matched ? '#3B82F6' : classColor(det.class_name)
+        const pct = matched
+          ? Math.round((det.match_score ?? det.score) * 100)
+          : Math.round((det.score ?? 0) * 100)
+        const label = matched
+          ? `${det.part_name} (${pct}%)`
+          : `${det.class_name} ${pct}%`
 
         return (
           <g key={det.id} style={{ transition: 'opacity 150ms' }}>
