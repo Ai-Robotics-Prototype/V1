@@ -218,7 +218,7 @@ except ImportError:
         return json.dumps(obj)
 
 
-def _parse_pointcloud2(msg, max_points: int = 50000):
+def _parse_pointcloud2(msg, max_points: int = 80000):
     """Vectorised PointCloud2 decode → flat float32 ndarray (3N,) in
     interleaved XYZ order. Returns an empty ndarray on failure.
 
@@ -262,7 +262,7 @@ def _parse_pointcloud2(msg, max_points: int = 50000):
     return xyz.reshape(-1).astype(_np.float32, copy=False).copy()
 
 
-def _parse_pointcloud2_legacy(msg, max_points: int = 50000) -> list:
+def _parse_pointcloud2_legacy(msg, max_points: int = 80000) -> list:
     """Original Python-loop decoder — kept for the unusual field layout
     or when numpy is unavailable. Still returns list-of-dicts for
     compatibility, but _build_lidar_payload normalises both shapes."""
@@ -777,8 +777,21 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             return pts.size > 0
         return bool(pts)
 
+    # Priority: fused (LiDAR + cameras, ~80k pts) > dense (LiDAR-only
+    # accumulator, ~50k pts) > accumulated > raw. Each lower tier only
+    # writes if every higher tier is stale.
+    def _on_lidar_fused(self, msg):
+        pts = _parse_pointcloud2(msg, max_points=80000)
+        if self._pts_not_empty(pts):
+            self._lidar_last["fused"] = time.time()
+            with _lidar_lock:
+                _lidar_state["pts"]  = pts
+                _lidar_state["live"] = True
+
     def _on_lidar_dense(self, msg):
-        pts = _parse_pointcloud2(msg, max_points=50000)
+        if not self._lidar_stale("fused"):
+            return
+        pts = _parse_pointcloud2(msg, max_points=80000)
         if self._pts_not_empty(pts):
             self._lidar_last["dense"] = time.time()
             with _lidar_lock:
@@ -786,30 +799,20 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 _lidar_state["live"] = True
 
     def _on_lidar_accum(self, msg):
-        if not self._lidar_stale("dense"):
+        if not (self._lidar_stale("fused") and self._lidar_stale("dense")):
             return
-        pts = _parse_pointcloud2(msg, max_points=50000)
+        pts = _parse_pointcloud2(msg, max_points=80000)
         if self._pts_not_empty(pts):
             self._lidar_last["acc"] = time.time()
             with _lidar_lock:
                 _lidar_state["pts"]  = pts
                 _lidar_state["live"] = True
 
-    def _on_lidar_fused(self, msg):
-        if not (self._lidar_stale("dense") and self._lidar_stale("acc")):
-            return
-        pts = _parse_pointcloud2(msg)
-        if self._pts_not_empty(pts):
-            self._lidar_last["fused"] = time.time()
-            with _lidar_lock:
-                _lidar_state["pts"]  = pts
-                _lidar_state["live"] = True
-
     def _on_lidar_raw(self, msg):
-        if not (self._lidar_stale("dense") and self._lidar_stale("acc")
-                and self._lidar_stale("fused")):
+        if not (self._lidar_stale("fused") and self._lidar_stale("dense")
+                and self._lidar_stale("acc")):
             return
-        pts = _parse_pointcloud2(msg)
+        pts = _parse_pointcloud2(msg, max_points=80000)
         if self._pts_not_empty(pts):
             self._lidar_last["raw"] = time.time()
             with _lidar_lock:

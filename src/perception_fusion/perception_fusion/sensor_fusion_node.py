@@ -24,33 +24,28 @@ except ImportError:
 # ── PointCloud2 ↔ numpy helpers ───────────────────────────────────────────────
 
 def pc2_to_numpy(msg: PointCloud2) -> np.ndarray:
-    """Extract XYZ(+intensity) into (N,3) or (N,4) float32 array."""
+    """Extract XYZ into an (N, 3) float32 array. Drops intensity/rgb/etc.
+    so heterogeneous sources (LiDAR with intensity, RealSense with rgb)
+    can be concatenated without shape mismatches downstream."""
     n = msg.width * msg.height
     if n == 0:
         return np.zeros((0, 3), dtype=np.float32)
 
     fields = {f.name: f for f in msg.fields}
-    has_i  = 'intensity' in fields
-    cols   = 4 if has_i else 3
-    pts    = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-
     step   = msg.point_step
     off_x  = fields['x'].offset
     off_y  = fields['y'].offset
     off_z  = fields['z'].offset
-    off_i  = fields['intensity'].offset if has_i else 0
 
-    out = np.empty((n, cols), dtype=np.float32)
+    out = np.empty((n, 3), dtype=np.float32)
     raw = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(n, step)
 
     out[:, 0] = np.frombuffer(raw[:, off_x:off_x+4].tobytes(), dtype=np.float32)
     out[:, 1] = np.frombuffer(raw[:, off_y:off_y+4].tobytes(), dtype=np.float32)
     out[:, 2] = np.frombuffer(raw[:, off_z:off_z+4].tobytes(), dtype=np.float32)
-    if has_i:
-        out[:, 3] = np.frombuffer(raw[:, off_i:off_i+4].tobytes(), dtype=np.float32)
 
     # Drop NaN/Inf
-    mask = np.isfinite(out[:, :3]).all(axis=1)
+    mask = np.isfinite(out).all(axis=1)
     return out[mask]
 
 
@@ -119,9 +114,11 @@ class SensorFusionNode(Node):
         self._cam0_msg  = None
         self._cam1_msg  = None
 
-        self.create_subscription(PointCloud2, '/lidar/points',      self._on_lidar, 10)
-        self.create_subscription(PointCloud2, '/cam0/cam0/depth/points', self._on_cam0,  10)
-        self.create_subscription(PointCloud2, '/cam1/cam1/depth/points', self._on_cam1,  10)
+        # cam0 publishes /cam0/cam0/depth/color/points when
+        # pointcloud__neon_.enable=true; cam1 is symmetric.
+        self.create_subscription(PointCloud2, '/lidar/points',                  self._on_lidar, 10)
+        self.create_subscription(PointCloud2, '/cam0/cam0/depth/color/points',  self._on_cam0,  10)
+        self.create_subscription(PointCloud2, '/cam1/cam1/depth/color/points',  self._on_cam1,  10)
 
         self.create_timer(1.0 / 15.0, self._fuse_and_publish)
 

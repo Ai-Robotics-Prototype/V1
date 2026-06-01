@@ -43,7 +43,11 @@ def generate_launch_description():
             parameters=[{
                 'serial_no':                       ParameterValue(LaunchConfiguration('cam0_serial'), value_type=str),
                 'align_depth.enable':              True,
-                'pointcloud.enable':               True,
+                # realsense2_camera exposes the pointcloud filter under
+                # `pointcloud__neon_.*` (the dot in `pointcloud.neon` is
+                # serialised as __ in the ROS2 param tree). Setting
+                # `pointcloud.enable` is silently ignored.
+                'pointcloud__neon_.enable':        True,
                 'depth_module.depth_profile':      '640x480x30',
                 'rgb_camera.color_profile':        '640x480x30',
                 # Disable the two 848x480x30 IR streams — they saturate the USB3
