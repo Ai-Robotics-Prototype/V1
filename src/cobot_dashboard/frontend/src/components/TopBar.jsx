@@ -2,11 +2,12 @@ import { useState } from 'react'
 import { useStore } from '../store/useStore'
 
 const TABS = [
-  { id: 'monitor',   label: 'Monitor' },
-  { id: 'program',   label: 'Program' },
-  { id: '3dview',    label: '3D View' },
-  { id: 'sensors',   label: 'Sensors' },
-  { id: 'configure', label: 'Configure' },
+  { id: 'monitor',          label: 'Monitor' },
+  { id: 'program',          label: 'Program' },
+  { id: '3dview',           label: '3D View' },
+  { id: 'sensors',          label: 'Sensors' },
+  { id: 'adaptive_picking', label: 'Adaptive Picking' },
+  { id: 'configure',        label: 'Configure' },
 ]
 
 const WS_DOT = {

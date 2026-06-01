@@ -10,6 +10,7 @@ import ProgramLayout from './layouts/ProgramLayout'
 import View3DLayout from './layouts/View3DLayout'
 import SensorsLayout from './layouts/SensorsLayout'
 import ConfigureLayout from './layouts/ConfigureLayout'
+import AdaptivePicking from './pages/AdaptivePicking'
 
 class ErrorBoundary extends Component {
   constructor(props) {
@@ -75,11 +76,12 @@ export default function App() {
   }, [])
 
   const layoutMap = {
-    monitor:   <MonitorLayout />,
-    program:   <ProgramLayout />,
-    '3dview':  <View3DLayout />,
-    sensors:   <SensorsLayout />,
-    configure: <ConfigureLayout />,
+    monitor:          <MonitorLayout />,
+    program:          <ProgramLayout />,
+    '3dview':         <View3DLayout />,
+    sensors:          <SensorsLayout />,
+    adaptive_picking: <AdaptivePicking />,
+    configure:        <ConfigureLayout />,
   }
 
   return (
