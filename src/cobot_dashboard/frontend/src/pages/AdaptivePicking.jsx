@@ -758,6 +758,459 @@ function PartConfigurator({ partId, onSave, onDelete }) {
   )
 }
 
+// ── Teaching wizard ──────────────────────────────────────────────────
+//
+// Operators were never finding the tiny "teach as <part>" button on the
+// detections panel. This wizard walks them through 4 angles of the same
+// part, posting to /api/parts/:id/teach for each one. depth_segment_node
+// stores the resulting .npz fingerprints under /opt/cobot/parts/teach/:id
+// and api_parts_list counts them back to render the green "Taught" pill.
+
+function TeachWizard({ part, onClose, onComplete }) {
+  const [step, setStep]                       = useState(0)
+  const [captures, setCaptures]               = useState([])
+  const [capturing, setCapturing]             = useState(false)
+  const [error, setError]                     = useState(null)
+  const [liveDetections, setLiveDetections]   = useState([])
+  const [selectedDetection, setSelectedDet]   = useState(null)
+  const [cameraTick, setCameraTick]           = useState(Date.now())
+
+  // Poll live detections from dashboard state at 2 Hz.
+  useEffect(() => {
+    let cancelled = false
+    const tick = async () => {
+      try {
+        const res = await fetch('/api/state')
+        const data = await res.json()
+        if (!cancelled) setLiveDetections(data.detections || [])
+      } catch { /* network blip — keep last list */ }
+    }
+    tick()
+    const interval = setInterval(tick, 500)
+    return () => { cancelled = true; clearInterval(interval) }
+  }, [])
+
+  // Refresh the camera snapshot every 250 ms. We can't use /stream/cam0
+  // directly as an <img src> because the MJPEG stream blocks rendering
+  // of detection-box overlays at the same time; the still-image refresh
+  // is just as smooth at 4 Hz and keeps the box coordinates aligned.
+  useEffect(() => {
+    const id = setInterval(() => setCameraTick(Date.now()), 250)
+    return () => clearInterval(id)
+  }, [])
+
+  async function captureTeach(detectionIndex) {
+    setCapturing(true)
+    setError(null)
+    try {
+      const res = await fetch(`/api/parts/${part.id}/teach`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          detection_index: detectionIndex,
+          action: 'teach',
+          part_id: part.id,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && (data.ok || data.status)) {
+        setCaptures(prev => [...prev, {
+          step,
+          angle: (step - 1) * 90,
+          timestamp: Date.now(),
+        }])
+      } else {
+        setError(data.error || `Capture failed (HTTP ${res.status})`)
+      }
+    } catch (e) {
+      setError(e.message || 'Network error')
+    }
+    setCapturing(false)
+  }
+
+  const totalSteps = 6
+
+  const stepContent = {
+    0: {
+      title:      'Teach Part Recognition',
+      subtitle:   `Teaching: ${part.name}`,
+      instruction:
+        'This wizard will guide you through teaching the robot to recognise this part. ' +
+        'You will show the part to the camera from 4 different angles so the robot ' +
+        'can identify it reliably.',
+      detail: part.extents_cm
+        ? `Part dimensions: ${part.extents_cm[0]}×${part.extents_cm[1]}×${part.extents_cm[2]} cm`
+        : null,
+      showCamera: false,
+      action: { label: 'Start Teaching →', onClick: () => setStep(1) },
+    },
+    1: {
+      title:       'Angle 1 of 4 — Front (0°)',
+      subtitle:    'Place the part in front of Camera 0',
+      instruction:
+        '1. Place the part on the table in its normal orientation\n' +
+        '2. Make sure the ENTIRE part is visible in the camera\n' +
+        '3. Click on the detection box that matches this part\n' +
+        '4. Then click "Capture" to teach this angle',
+      showCamera: true,
+    },
+    2: {
+      title:       'Angle 2 of 4 — Right (90°)',
+      subtitle:    'Rotate the part 90° clockwise',
+      instruction:
+        '1. Rotate the part approximately 90° clockwise on the table\n' +
+        '2. Wait for the detection box to appear\n' +
+        '3. Click the detection box for this part\n' +
+        '4. Click "Capture"',
+      showCamera: true,
+    },
+    3: {
+      title:       'Angle 3 of 4 — Back (180°)',
+      subtitle:    'Rotate another 90° (now 180° from start)',
+      instruction:
+        '1. Rotate the part another 90° clockwise\n' +
+        '2. The part should now be facing backwards from the starting position\n' +
+        '3. Click the detection box and capture',
+      showCamera: true,
+    },
+    4: {
+      title:       'Angle 4 of 4 — Left (270°)',
+      subtitle:    'Rotate another 90° (now 270° from start)',
+      instruction:
+        '1. Rotate the part one more 90° clockwise\n' +
+        '2. This is the last angle to teach\n' +
+        '3. Click the detection box and capture',
+      showCamera: true,
+    },
+    5: {
+      title:    'Teaching Complete!',
+      subtitle: `${captures.length} angle${captures.length === 1 ? '' : 's'} captured for ${part.name}`,
+      instruction: captures.length >= 3
+        ? 'Teaching was successful. The robot can now recognise this part from ' +
+          'multiple angles. You can close this wizard and test recognition on the ' +
+          'Monitor tab.'
+        : `Only ${captures.length} angle(s) captured. For reliable recognition, ` +
+          'teach at least 3 angles. You can go back and capture more.',
+      showCamera: false,
+      action: {
+        label:   captures.length >= 3 ? 'Done ✓' : 'Close Anyway',
+        onClick: () => { onComplete?.(); onClose?.() },
+      },
+    },
+  }
+
+  const current = stepContent[step] || stepContent[0]
+
+  return (
+    <div style={{
+      position: 'absolute', inset: 0,
+      background: 'var(--bg-app)', zIndex: 50,
+      display: 'flex', flexDirection: 'column', overflow: 'hidden',
+    }}>
+      {/* Header */}
+      <div style={{
+        padding: '12px 20px', borderBottom: '1px solid var(--border)',
+        display: 'flex', alignItems: 'center', gap: 16,
+        background: 'var(--bg-panel)',
+      }}>
+        <button onClick={onClose} style={{
+          background: 'none', border: 'none', cursor: 'pointer',
+          fontSize: 18, color: 'var(--text-muted)', padding: '4px 8px',
+        }}>✕</button>
+
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-primary)' }}>
+            {current.title}
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+            {current.subtitle}
+          </div>
+        </div>
+
+        {/* Progress dots */}
+        <div style={{ display: 'flex', gap: 6 }}>
+          {Array.from({ length: totalSteps }).map((_, i) => (
+            <div key={i} style={{
+              width: i === step ? 24 : 8, height: 8, borderRadius: 4,
+              background: i < step ? 'var(--green)'
+                : i === step ? 'var(--accent)'
+                : 'var(--bg-active)',
+              transition: 'all 200ms',
+            }} />
+          ))}
+        </div>
+
+        <div style={{
+          fontSize: 12, color: 'var(--text-muted)',
+          minWidth: 80, textAlign: 'right',
+        }}>
+          {captures.length} captured
+        </div>
+      </div>
+
+      {/* Body */}
+      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+        {current.showCamera ? (
+          <>
+            {/* Camera + overlay (3/5) */}
+            <div style={{
+              flex: 3, position: 'relative', background: '#111',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}>
+              <img
+                src={`/stream/cam0?t=${cameraTick}`}
+                alt="cam0"
+                style={{
+                  maxWidth: '100%', maxHeight: '100%', objectFit: 'contain',
+                }}
+              />
+
+              {/* Detection overlay — clickable boxes. The detector
+                  publishes bbox_px in 640×480 pixel coords; we render as
+                  % so the overlay scales with the contain-fit image. */}
+              {liveDetections.map((det, i) => {
+                if (!det.bbox_px) return null
+                const [x1, y1, x2, y2] = det.bbox_px
+                const isSelected = selectedDetection === i
+                return (
+                  <div
+                    key={i}
+                    onClick={() => setSelectedDet(i)}
+                    style={{
+                      position: 'absolute',
+                      left:   `${(x1 / 640) * 100}%`,
+                      top:    `${(y1 / 480) * 100}%`,
+                      width:  `${((x2 - x1) / 640) * 100}%`,
+                      height: `${((y2 - y1) / 480) * 100}%`,
+                      border:    isSelected ? '3px solid #3B82F6' : '2px solid #22C55E',
+                      background: isSelected ? 'rgba(59,130,246,0.15)' : 'rgba(34,197,94,0.08)',
+                      borderRadius: 4, cursor: 'pointer',
+                      transition: 'all 150ms',
+                    }}
+                  >
+                    {isSelected && (
+                      <div style={{
+                        position: 'absolute', top: -22, left: 0,
+                        background: '#3B82F6', color: '#fff',
+                        fontSize: 10, fontWeight: 600,
+                        padding: '2px 8px', borderRadius: 4, whiteSpace: 'nowrap',
+                      }}>
+                        ✓ Selected — click Capture
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+
+              {liveDetections.length === 0 && (
+                <div style={{
+                  position: 'absolute', bottom: 20, left: '50%',
+                  transform: 'translateX(-50%)',
+                  background: 'rgba(0,0,0,0.7)', color: '#FCD34D',
+                  padding: '8px 16px', borderRadius: 8, fontSize: 13,
+                }}>
+                  No objects detected — place the part in view of Camera 0
+                </div>
+              )}
+            </div>
+
+            {/* Right panel — instructions + capture (2/5) */}
+            <div style={{
+              flex: 2, padding: 24,
+              display: 'flex', flexDirection: 'column', gap: 16,
+              background: 'var(--bg-panel)', borderLeft: '1px solid var(--border)',
+            }}>
+              {/* Angle indicator */}
+              <div style={{ display: 'flex', justifyContent: 'center', gap: 12 }}>
+                {[0, 90, 180, 270].map((angle, i) => {
+                  const stepNum  = i + 1
+                  const captured = captures.some(c => c.step === stepNum)
+                  const isCurrent = step === stepNum
+                  return (
+                    <div key={angle} style={{
+                      width: 56, height: 56, borderRadius: '50%',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      background: captured ? 'var(--green-dim)'
+                        : isCurrent ? 'var(--accent-dim)'
+                        : 'var(--bg-surface)',
+                      border: captured ? '2px solid var(--green)'
+                        : isCurrent ? '2px solid var(--accent)'
+                        : '2px solid var(--border)',
+                    }}>
+                      <div style={{
+                        fontSize: 14, fontWeight: 700,
+                        color: captured ? 'var(--green)'
+                          : isCurrent ? 'var(--accent)'
+                          : 'var(--text-muted)',
+                      }}>
+                        {captured ? '✓' : `${angle}°`}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* Instructions */}
+              <div style={{
+                background: 'var(--bg-surface)',
+                borderRadius: 'var(--radius-md)', padding: 16,
+              }}>
+                <div style={{
+                  fontSize: 13, fontWeight: 600,
+                  color: 'var(--text-primary)', marginBottom: 8,
+                }}>
+                  Instructions
+                </div>
+                {current.instruction.split('\n').map((line, i) => (
+                  <div key={i} style={{
+                    fontSize: 12, color: 'var(--text-secondary)',
+                    marginBottom: 4,
+                  }}>
+                    {line}
+                  </div>
+                ))}
+              </div>
+
+              <div style={{
+                background: 'var(--accent-dim)',
+                border: '1px solid var(--accent-border)',
+                borderRadius: 'var(--radius-md)', padding: 12,
+                fontSize: 12, color: 'var(--accent)',
+              }}>
+                💡 Place the part 40–60 cm from the camera for best results.
+                The distance will be recorded as a reference.
+              </div>
+
+              {error && (
+                <div style={{
+                  background: 'var(--red-dim)', border: '1px solid var(--red)',
+                  borderRadius: 'var(--radius-md)', padding: 12,
+                  fontSize: 12, color: 'var(--red)',
+                }}>
+                  {error}
+                </div>
+              )}
+
+              <button
+                onClick={() => {
+                  if (selectedDetection === null) return
+                  captureTeach(selectedDetection).then(() => {
+                    setSelectedDet(null)
+                    if (step < 4) {
+                      setTimeout(() => setStep(step + 1), 800)
+                    } else {
+                      setStep(5)
+                    }
+                  })
+                }}
+                disabled={selectedDetection === null || capturing}
+                style={{
+                  padding: '14px 24px', fontSize: 15, fontWeight: 700,
+                  background: selectedDetection !== null ? 'var(--accent)' : 'var(--bg-active)',
+                  color:      selectedDetection !== null ? '#fff'           : 'var(--text-muted)',
+                  border: 'none', borderRadius: 'var(--radius-lg)',
+                  cursor: selectedDetection !== null ? 'pointer' : 'default',
+                  transition: 'all 200ms',
+                }}
+              >
+                {capturing ? '⏳ Capturing…'
+                  : selectedDetection === null ? 'Select an object in the camera first'
+                  : `📸 Capture Angle ${step} of 4`}
+              </button>
+
+              {/* Navigation */}
+              <div style={{ display: 'flex', gap: 8, marginTop: 'auto' }}>
+                {step > 1 && (
+                  <button
+                    onClick={() => setStep(step - 1)}
+                    style={{
+                      padding: '8px 16px', fontSize: 12,
+                      background: 'var(--bg-surface)', color: 'var(--text-secondary)',
+                      border: '1px solid var(--border)',
+                      borderRadius: 'var(--radius-md)', cursor: 'pointer',
+                    }}
+                  >
+                    ← Back
+                  </button>
+                )}
+                <button
+                  onClick={() => step < 5 ? setStep(step + 1) : (onComplete?.(), onClose?.())}
+                  style={{
+                    padding: '8px 16px', fontSize: 12,
+                    background: 'transparent', color: 'var(--text-muted)',
+                    border: '1px solid var(--border)',
+                    borderRadius: 'var(--radius-md)', cursor: 'pointer',
+                    marginLeft: 'auto',
+                  }}
+                >
+                  {step < 4 ? 'Skip this angle →' : step === 4 ? 'Finish →' : 'Close'}
+                </button>
+              </div>
+            </div>
+          </>
+        ) : (
+          /* Intro and review screens */
+          <div style={{
+            flex: 1, display: 'flex', flexDirection: 'column',
+            alignItems: 'center', justifyContent: 'center',
+            padding: 40, gap: 24, textAlign: 'center',
+          }}>
+            <div style={{ fontSize: 48 }}>
+              {step === 0 ? '🎯' : captures.length >= 3 ? '✅' : '⚠️'}
+            </div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--text-primary)' }}>
+              {current.title}
+            </div>
+            <div style={{
+              fontSize: 14, color: 'var(--text-secondary)',
+              maxWidth: 500, whiteSpace: 'pre-wrap',
+            }}>
+              {current.instruction}
+            </div>
+            {current.detail && (
+              <div style={{
+                fontSize: 13, color: 'var(--text-muted)',
+                background: 'var(--bg-surface)',
+                padding: '8px 16px', borderRadius: 'var(--radius-md)',
+              }}>
+                {current.detail}
+              </div>
+            )}
+            {step === 5 && captures.length > 0 && (
+              <div style={{ display: 'flex', gap: 12 }}>
+                {captures.map((c, i) => (
+                  <div key={i} style={{
+                    width: 60, height: 60, borderRadius: '50%',
+                    background: 'var(--green-dim)',
+                    border: '2px solid var(--green)',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 12, fontWeight: 700, color: 'var(--green)',
+                  }}>
+                    {c.angle}°
+                  </div>
+                ))}
+              </div>
+            )}
+            {current.action && (
+              <button
+                onClick={current.action.onClick}
+                style={{
+                  padding: '14px 32px', fontSize: 15, fontWeight: 700,
+                  background: 'var(--accent)', color: '#fff',
+                  border: 'none', borderRadius: 'var(--radius-lg)',
+                  cursor: 'pointer',
+                }}
+              >
+                {current.action.label}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ── Page ─────────────────────────────────────────────────────────────
 
 export default function AdaptivePicking() {
@@ -766,6 +1219,7 @@ export default function AdaptivePicking() {
   const [uploading, setUploading]       = useState(false)
   const [uploadError, setUploadError]   = useState(null)
   const [filterOp, setFilterOp]         = useState(null)
+  const [teachingPart, setTeachingPart] = useState(null)
   const fileInputRef = useRef(null)
 
   const filteredParts = filterOp
@@ -821,10 +1275,11 @@ export default function AdaptivePicking() {
   }
 
   return (
-    <div style={{
-      display: 'flex', height: '100%',
-      background: 'var(--bg-app)', overflow: 'hidden',
-    }}>
+    <div style={{ position: 'relative', height: '100%' }}>
+      <div style={{
+        display: 'flex', height: '100%',
+        background: 'var(--bg-app)', overflow: 'hidden',
+      }}>
       {/* LEFT — Parts library list (fixed 280px) */}
       <div style={{
         width: 280, flexShrink: 0, display: 'flex', flexDirection: 'column',
@@ -915,6 +1370,7 @@ export default function AdaptivePicking() {
               const active = selectedPart === part.id
               const ex = part.extents_cm || [0, 0, 0]
               const ops = part.operations || []
+              const taught = (part.teach_count || 0) > 0
               return (
                 <div key={part.id} onClick={() => setSelected(part.id)}
                   style={{
@@ -926,9 +1382,54 @@ export default function AdaptivePicking() {
                   }}
                 >
                   <div style={{
-                    fontSize: 13, fontWeight: 500,
-                    color: active ? '#60a5fa' : 'var(--text-primary)',
-                  }}>{part.name}</div>
+                    display: 'flex', alignItems: 'center', gap: 6,
+                  }}>
+                    <div style={{
+                      flex: 1, minWidth: 0,
+                      fontSize: 13, fontWeight: 500,
+                      color: active ? '#60a5fa' : 'var(--text-primary)',
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    }}>{part.name}</div>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setTeachingPart(part)
+                      }}
+                      style={{
+                        padding: '4px 10px', fontSize: 11, fontWeight: 600,
+                        background: taught ? 'var(--green-dim)' : 'var(--accent)',
+                        color:      taught ? 'var(--green)'    : '#fff',
+                        border: 'none',
+                        borderRadius: 'var(--radius-sm)',
+                        cursor: 'pointer',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {taught ? `Taught (${part.teach_count})` : 'Teach'}
+                    </button>
+                    {taught && (
+                      <button
+                        onClick={async (e) => {
+                          e.stopPropagation()
+                          if (!confirm(
+                            `Clear all ${part.teach_count} taught samples for ${part.name}?`
+                          )) return
+                          try {
+                            await fetch(`/api/parts/${part.id}/teach_clear`, { method: 'POST' })
+                          } catch { /* ignore */ }
+                          refresh()
+                        }}
+                        style={{
+                          padding: '4px 8px', fontSize: 10,
+                          background: 'var(--red-dim)', color: 'var(--red)',
+                          border: 'none', borderRadius: 'var(--radius-sm)',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </div>
                   <div style={{
                     fontSize: 11, marginTop: 2,
                     color: 'var(--text-muted, #9ca3af)',
@@ -939,11 +1440,11 @@ export default function AdaptivePicking() {
                   </div>
                   <div style={{
                     fontSize: 10, marginTop: 2,
-                    color: part.teach_count > 0 ? '#22c55e' : 'var(--text-muted, #9ca3af)',
+                    color: taught ? '#22c55e' : 'var(--text-muted, #9ca3af)',
                   }}>
-                    {part.teach_count > 0
+                    {taught
                       ? `${part.teach_count} taught sample${part.teach_count > 1 ? 's' : ''}`
-                      : 'Not taught yet — click "Teach as…" on a detection'}
+                      : 'Not taught yet — click "Teach" to start the wizard'}
                   </div>
                   {(ops.length > 0 || part.program_name) && (
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginTop: 4 }}>
@@ -989,6 +1490,18 @@ export default function AdaptivePicking() {
           </div>
         )}
       </div>
+      </div>
+
+      {/* Teaching wizard overlay — sits above the entire page when
+          teachingPart is set. Closing or completing refreshes the parts
+          list so the new teach_count is picked up. */}
+      {teachingPart && (
+        <TeachWizard
+          part={teachingPart}
+          onClose={() => { setTeachingPart(null); refresh() }}
+          onComplete={() => refresh()}
+        />
+      )}
     </div>
   )
 }
