@@ -149,35 +149,49 @@ function PartModel3D({ url, rotation, frontAngle, onFaceClick }) {
   )
 }
 
-// ── Pick-direction arrow (world-space, sits above the part) ─────────
+// ── Pick-direction arrow (unified: button mode or face-click mode) ──
 
-function PickDirectionArrow({ approach, partExtents, offsetCm }) {
-  const length = Math.max(...(partExtents || [0.05, 0.05, 0.05])) * 3
-  const offsetM = ((offsetCm ?? 2) / 100) * 2.5  // cm → viewer units
+function PickArrow({ approach, offsetCm, faceNormal, facePoint }) {
+  const offset = ((offsetCm || 2) / 100) * 2.5
 
-  let rotation = [0, 0, 0]
-  let position = [0, 0.05 + offsetM, 0]
+  const { position, quaternion } = useMemo(() => {
+    if (faceNormal && facePoint) {
+      const n = new THREE.Vector3(faceNormal[0], faceNormal[1], faceNormal[2]).normalize()
+      const standoff = 0.05 + offset
+      const p = new THREE.Vector3(
+        facePoint[0] + n.x * standoff,
+        facePoint[1] + n.y * standoff,
+        facePoint[2] + n.z * standoff,
+      )
+      const defaultDir = new THREE.Vector3(0, -1, 0)
+      const targetDir  = n.clone().negate()
+      const q = new THREE.Quaternion().setFromUnitVectors(defaultDir, targetDir)
+      return { position: [p.x, p.y, p.z], quaternion: q }
+    }
 
-  if (approach === 'top_down') {
-    rotation = [Math.PI, 0, 0]
-    position = [0, 0.05 + offsetM, 0]
-  } else if (approach === 'side') {
-    rotation = [0, 0, Math.PI / 2]
-    position = [0.05 + offsetM, 0.1, 0]
-  } else if (approach === 'angled') {
-    rotation = [Math.PI * 0.75, 0, 0]
-    const d = offsetM * 0.7071
-    position = [d, 0.05 + d, 0]
-  }
+    const idQ = new THREE.Quaternion()
+    if (approach === 'side') {
+      const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 2)
+      return { position: [0.15 + offset, 0.08, 0], quaternion: q }
+    }
+    if (approach === 'angled') {
+      const d = offset * 0.7071
+      const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 4)
+      return { position: [0.1 + d, 0.15 + d, 0], quaternion: q }
+    }
+    return { position: [0, 0.1 + offset, 0], quaternion: idQ }
+  }, [approach, offset, faceNormal, facePoint])
 
   return (
-    <group position={position} rotation={rotation}>
-      <mesh position={[0, length / 2, 0]}>
-        <cylinderGeometry args={[0.008, 0.008, length, 8]} />
+    <group position={position} quaternion={quaternion}>
+      {/* Shaft sits above the cone, both inside a group whose origin is the tip. */}
+      <mesh position={[0, 0.06, 0]}>
+        <cylinderGeometry args={[0.004, 0.004, 0.12, 8]} />
         <meshStandardMaterial color="#16A34A" />
       </mesh>
-      <mesh position={[0, 0, 0]}>
-        <coneGeometry args={[0.025, 0.06, 12]} />
+      {/* Cone tip points in -Y (toward the surface in local frame). */}
+      <mesh position={[0, -0.005, 0]} rotation={[Math.PI, 0, 0]}>
+        <coneGeometry args={[0.016, 0.035, 12]} />
         <meshStandardMaterial color="#16A34A" />
       </mesh>
     </group>
@@ -186,8 +200,8 @@ function PickDirectionArrow({ approach, partExtents, offsetCm }) {
 
 // ── Green disc marking the clicked face ─────────────────────────────
 
-function SelectedFaceHighlight({ point, normal }) {
-  const quat = useMemo(() => {
+function FaceHighlight({ point, normal }) {
+  const quaternion = useMemo(() => {
     if (!normal) return new THREE.Quaternion()
     const up = new THREE.Vector3(0, 1, 0)
     const n  = new THREE.Vector3(normal[0], normal[1], normal[2]).normalize()
@@ -195,45 +209,10 @@ function SelectedFaceHighlight({ point, normal }) {
   }, [normal])
   if (!point || !normal) return null
   return (
-    <mesh position={point} quaternion={quat}>
-      <circleGeometry args={[0.03, 32]} />
-      <meshBasicMaterial color="#16A34A" transparent opacity={0.5} side={THREE.DoubleSide} />
+    <mesh position={point} quaternion={quaternion}>
+      <circleGeometry args={[0.025, 32]} />
+      <meshBasicMaterial color="#16A34A" transparent opacity={0.4} side={THREE.DoubleSide} />
     </mesh>
-  )
-}
-
-// ── Approach arrow pointing along the clicked face's normal ─────────
-
-function PickArrowFromNormal({ normal, point, offsetCm }) {
-  const offsetM = ((offsetCm ?? 2) / 100) * 2.5  // cm → viewer units
-  const { start, quaternion } = useMemo(() => {
-    const n = new THREE.Vector3(normal[0], normal[1], normal[2]).normalize()
-    const standoff = 0.05 + offsetM
-    const s = new THREE.Vector3(
-      point[0] + n.x * standoff,
-      point[1] + n.y * standoff,
-      point[2] + n.z * standoff,
-    )
-    const defaultDir = new THREE.Vector3(0, -1, 0)
-    const targetDir  = n.clone().negate()
-    const q = new THREE.Quaternion().setFromUnitVectors(defaultDir, targetDir)
-    return { start: s, quaternion: q }
-  }, [normal, point, offsetM])
-
-  if (!normal || !point) return null
-  return (
-    <group position={[start.x, start.y, start.z]} quaternion={quaternion}>
-      {/* Shaft */}
-      <mesh position={[0, 0.06, 0]}>
-        <cylinderGeometry args={[0.004, 0.004, 0.12, 8]} />
-        <meshStandardMaterial color="#16A34A" />
-      </mesh>
-      {/* Cone head pointing toward the surface (downward in local frame) */}
-      <mesh position={[0, -0.01, 0]} rotation={[Math.PI, 0, 0]}>
-        <coneGeometry args={[0.016, 0.035, 12]} />
-        <meshStandardMaterial color="#16A34A" />
-      </mesh>
-    </group>
   )
 }
 
@@ -270,13 +249,14 @@ function PartCanvas({ url, rotation, frontAngle, approach, partExtents, selected
           onFaceClick={onFaceClick}
         />
       </Suspense>
-      {selectedFace ? (
-        <>
-          <SelectedFaceHighlight point={selectedFace.point} normal={selectedFace.normal} />
-          <PickArrowFromNormal  normal={selectedFace.normal} point={selectedFace.point} offsetCm={offsetCm} />
-        </>
-      ) : (
-        <PickDirectionArrow approach={approach || 'top_down'} partExtents={partExtents} offsetCm={offsetCm} />
+      <PickArrow
+        approach={approach || 'top_down'}
+        offsetCm={offsetCm}
+        faceNormal={selectedFace?.normal || null}
+        facePoint={selectedFace?.point || null}
+      />
+      {selectedFace && (
+        <FaceHighlight point={selectedFace.point} normal={selectedFace.normal} />
       )}
       <OrbitControls enableDamping dampingFactor={0.08} />
     </Canvas>
