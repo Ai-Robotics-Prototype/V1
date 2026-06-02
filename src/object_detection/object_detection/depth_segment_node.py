@@ -190,6 +190,11 @@ class DepthSegmentNode(Node):
         # silhouettes.
         self._last_objects = []     # latest stable detection list (with crops)
         self._teach_refs   = {}     # part_id -> [ {depth, mask, size_m} ]
+        # While the teach wizard is open the operator is showing the part
+        # from different angles; the matcher would happily false-positive
+        # off those frames, so we short-circuit recognition entirely until
+        # the wizard tells us it's done.
+        self._teach_mode   = False
         self._load_teach_refs()
         self.create_subscription(
             String, '/perception/teach_command',
@@ -1157,6 +1162,14 @@ class DepthSegmentNode(Node):
         if action == 'reload':
             self._load_teach_refs()
             return
+        if action == 'start_teach':
+            self._teach_mode = True
+            self.get_logger().info('TEACH MODE ON — recognition suppressed')
+            return
+        if action == 'stop_teach':
+            self._teach_mode = False
+            self.get_logger().info('TEACH MODE OFF — recognition resumed')
+            return
         if action != 'teach':
             return
 
@@ -1835,6 +1848,22 @@ class DepthSegmentNode(Node):
         same features extract_geometric_features() computed when the
         STEP file was uploaded."""
         if not objects:
+            return
+        if self._teach_mode:
+            # Wizard is showing the part from various angles — suppress
+            # recognition entirely so the operator sees clean green boxes.
+            for o in objects:
+                o['part_name']        = None
+                o['part_id']          = None
+                o['match_score']      = 0.0
+                o['match_yaw']        = 0.0
+                o['position_correct'] = None
+                o['yaw_error_deg']    = 0.0
+                o['surface_ok']       = None
+                o['position_status']  = ''
+                o['_holes']           = []
+                o['_match_reason']    = ''
+                o['_match_source']    = ''
             return
         library_parts = self._load_library_parts()
         for o in objects:

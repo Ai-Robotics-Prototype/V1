@@ -1575,6 +1575,26 @@ if FASTAPI_AVAILABLE:
             "captured":    after > before,
         }
 
+    @app.post("/api/teach_mode/start")
+    async def api_teach_mode_start():
+        """Tell depth_segment_node to suppress recognition while the
+        teach wizard is open. Returns 200 even when ROS isn't ready —
+        the wizard still works, recognition just keeps running."""
+        if _ros_node and _ros_node._teach_cmd_pub:
+            m = String()
+            m.data = json.dumps({'action': 'start_teach'})
+            _ros_node._teach_cmd_pub.publish(m)
+        return {"ok": True, "teach_mode": True}
+
+    @app.post("/api/teach_mode/stop")
+    async def api_teach_mode_stop():
+        """Re-enable recognition after the teach wizard closes."""
+        if _ros_node and _ros_node._teach_cmd_pub:
+            m = String()
+            m.data = json.dumps({'action': 'stop_teach'})
+            _ros_node._teach_cmd_pub.publish(m)
+        return {"ok": True, "teach_mode": False}
+
     @app.post("/api/parts/{part_id}/teach_clear")
     async def api_parts_teach_clear(part_id: str):
         """Delete every taught reference for this part."""

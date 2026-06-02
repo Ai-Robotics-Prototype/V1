@@ -564,6 +564,16 @@ function TeachWizard({ part, onClose, onComplete }) {
     w: 640, h: 480, offX: 0, offY: 0,
   })
 
+  // Tell depth_segment_node to suppress part recognition while the
+  // wizard is open — otherwise the matcher would false-positive off the
+  // operator showing the part from random angles.
+  useEffect(() => {
+    fetch('/api/teach_mode/start', { method: 'POST' }).catch(() => {})
+    return () => {
+      fetch('/api/teach_mode/stop', { method: 'POST' }).catch(() => {})
+    }
+  }, [])
+
   // Poll live detections from dashboard state at 2 Hz.
   useEffect(() => {
     let cancelled = false
