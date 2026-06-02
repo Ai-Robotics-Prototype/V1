@@ -904,6 +904,13 @@ class DepthSegmentNode(Node):
         # the annulus into arcs despite the post-carving fill_holes.
         objects = self._merge_overlapping_detections(objects, w, h)
 
+        # Drop detections smaller than 1.5 cm on their longest XY axis.
+        # Below that they're table scratches / noise, not pickable parts.
+        def _big_enough(o):
+            sx, sy, _ = o.get('size_3d') or (0.0, 0.0, 0.0)
+            return max(float(sx), float(sy)) >= 0.015
+        objects = [o for o in objects if _big_enough(o)]
+
         # Attach RGB crops once for every detection (used by teach
         # capture + matching). Doing it here covers all build paths
         # (main OBB, small-points fallback, kmeans clusters, merged).
@@ -929,7 +936,12 @@ class DepthSegmentNode(Node):
         return os.path.join('/opt/cobot/parts/teach', str(part_id))
 
     def _load_teach_refs(self):
-        """Read every /opt/cobot/parts/teach/<id>/*.npz back into memory."""
+        """Read every /opt/cobot/parts/teach/<id>/*.npz back into memory.
+
+        The new teach format stores full-resolution color, depth, mask,
+        a binary edge map, a 200-point contour, hole count + positions,
+        the OBB size, and the operator-supplied orientation tag. The
+        matcher uses the edge + contour + size triple as hard gates."""
         self._teach_refs = {}
         base = '/opt/cobot/parts/teach'
         if not os.path.isdir(base):
@@ -943,15 +955,27 @@ class DepthSegmentNode(Node):
                 if not fn.endswith('.npz'):
                     continue
                 try:
-                    z = np.load(os.path.join(pdir, fn))
+                    z = np.load(os.path.join(pdir, fn), allow_pickle=True)
+                    files = set(z.files)
                     ref = {
-                        'depth':  np.asarray(z['depth'],  dtype=np.float32),
-                        'mask':   np.asarray(z['mask'],   dtype=bool),
-                        'size_m': np.asarray(z['size_m'], dtype=np.float32),
-                        'gray':   None,
+                        'size_m':   np.asarray(z['size_m'], dtype=np.float32)
+                                    if 'size_m' in files
+                                    else np.array([0.05, 0.05, 0.05], dtype=np.float32),
+                        'mask':     np.asarray(z['mask'], dtype=bool)
+                                    if 'mask' in files else None,
+                        'depth':    np.asarray(z['depth'], dtype=np.float32)
+                                    if 'depth' in files else None,
+                        'edges':    np.asarray(z['edges'], dtype=np.uint8)
+                                    if 'edges' in files else None,
+                        'contour':  np.asarray(z['contour'], dtype=np.float32)
+                                    if 'contour' in files else None,
+                        'color':    np.asarray(z['color'], dtype=np.uint8)
+                                    if 'color' in files else None,
+                        'num_holes': int(z['num_holes'])
+                                     if 'num_holes' in files else 0,
+                        'orientation': str(z['orientation'])
+                                       if 'orientation' in files else 'pickable',
                     }
-                    if 'gray' in z.files:
-                        ref['gray'] = np.asarray(z['gray'], dtype=np.float32)
                     refs.append(ref)
                 except Exception:
                     continue
@@ -959,13 +983,21 @@ class DepthSegmentNode(Node):
                 self._teach_refs[pid] = refs
         if self._teach_refs:
             self.get_logger().info(
-                'teach refs loaded: '
+                'teach refs: '
                 + ', '.join(
-                    f'{k}({len(v)}, rgb={"yes" if any(r["gray"] is not None for r in v) else "no"})'
+                    f'{k}({len(v)} refs, edges='
+                    f'{"y" if any(r.get("edges") is not None for r in v) else "n"})'
                     for k, v in self._teach_refs.items())
             )
 
     def _on_teach_command(self, msg):
+        """Capture the selected detection as a teach reference.
+
+        Stores FULL-resolution crops (no 64x64 downsample) plus a Sobel
+        edge map, a 200-point normalized contour, and depth-based hole
+        count + positions. The matcher relies on edge + contour for
+        discrimination — the old grayscale-NCC-on-tiny-blobs approach
+        matched anything that was vaguely the right colour."""
         try:
             cmd = json.loads(msg.data) if msg.data else {}
         except Exception:
@@ -976,78 +1008,144 @@ class DepthSegmentNode(Node):
             return
         if action != 'teach':
             return
-        part_id = cmd.get('part_id')
-        if not part_id:
-            self.get_logger().warn('teach: missing part_id')
-            return
-        if not self._last_objects:
-            self.get_logger().warn('teach: no recent detections')
-            return
-        idx = int(cmd.get('detection_index') or 0)
-        if idx < 0 or idx >= len(self._last_objects):
-            idx = 0
-        det = self._last_objects[idx]
-        mask  = det.get('mask_2d')
-        depth = det.get('depth_2d')
-        color = det.get('color_crop')
-        size  = det.get('size_3d') or (0.05, 0.05, 0.05)
-        if mask is None or depth is None or not np.any(mask):
-            self.get_logger().warn('teach: detection has no mask/depth')
-            return
-        try:
-            d_std, m_std = self._normalise_for_match(depth, mask)
-        except Exception as e:
-            self.get_logger().error(f'teach: normalise failed: {e}')
-            return
 
-        # RGB is far more distinctive than depth on small metal parts.
-        # Resize to 64x64, take grayscale, normalise to [0,1] per-crop so
-        # lighting drift across teach sessions doesn't blow up the NCC.
-        gray_64 = None
-        color_64 = None
-        if color is not None and color.size > 0:
-            try:
-                from scipy.ndimage import zoom as _zoom
-                ch, cw = color.shape[:2]
-                if ch > 0 and cw > 0:
-                    fy = 64.0 / float(ch); fx = 64.0 / float(cw)
-                    if color.ndim == 3:
-                        color_64 = _zoom(color.astype(np.float32), (fy, fx, 1), order=1)
-                        gray_64  = color_64.mean(axis=2)
-                    else:
-                        gray_64  = _zoom(color.astype(np.float32), (fy, fx), order=1)
-                    g_min = float(gray_64.min()); g_max = float(gray_64.max())
-                    if g_max > g_min:
-                        gray_64 = (gray_64 - g_min) / (g_max - g_min)
-                    else:
-                        gray_64 = np.zeros_like(gray_64)
-            except Exception as e:
-                self.get_logger().warn(f'teach: gray prep failed: {e}')
-                gray_64 = None
-                color_64 = None
-
-        os.makedirs(self._teach_dir(part_id), exist_ok=True)
-        existing = sum(1 for f in os.listdir(self._teach_dir(part_id)) if f.endswith('.npz'))
-        out_path = os.path.join(self._teach_dir(part_id), f'ref_{existing:03d}.npz')
         try:
-            save_kwargs = {
-                'depth':  d_std.astype(np.float32),
-                'mask':   m_std.astype(bool),
-                'size_m': np.asarray(size, dtype=np.float32),
+            part_id = cmd.get('part_id')
+            if not part_id:
+                self.get_logger().warn('teach: missing part_id')
+                return
+            if not self._last_objects:
+                self.get_logger().warn('teach: no recent detections')
+                return
+            det_idx = int(cmd.get('detection_index') or 0)
+            if det_idx < 0 or det_idx >= len(self._last_objects):
+                det_idx = 0
+            orientation = str(cmd.get('orientation') or 'pickable')
+
+            det = self._last_objects[det_idx]
+            mask_crop  = det.get('mask_2d')
+            depth_crop = det.get('depth_2d')
+            color_crop = det.get('color_crop')
+            size_3d    = det.get('size_3d') or (0.05, 0.05, 0.05)
+
+            if mask_crop is None or not np.any(mask_crop):
+                self.get_logger().warn('teach: detection has no mask')
+                return
+
+            crop_h, crop_w = mask_crop.shape[:2]
+            if crop_h < 30 or crop_w < 30:
+                self.get_logger().warn('teach: crop too small')
+                return
+
+            size_m  = np.asarray(size_3d, dtype=np.float32)
+            yaw_deg = 0.0
+            euler = det.get('euler')
+            if euler:
+                yaw_deg = float(euler[2]) * 180.0 / np.pi
+
+            from scipy.ndimage import (
+                sobel as _sobel, gaussian_filter, binary_erosion,
+                label as _label, binary_fill_holes,
+            )
+
+            # ── Edge map (Sobel on smoothed grayscale, thresholded) ──
+            edge_binary = None
+            if color_crop is not None and color_crop.size > 0:
+                gray = (np.mean(color_crop.astype(np.float32), axis=2)
+                        if color_crop.ndim == 3
+                        else color_crop.astype(np.float32))
+                gray_smooth = gaussian_filter(gray, sigma=1.0)
+                ex = _sobel(gray_smooth, axis=1)
+                ey = _sobel(gray_smooth, axis=0)
+                edges = np.sqrt(ex * ex + ey * ey)
+                e_max = float(edges.max())
+                if e_max > 0:
+                    edges = edges / e_max
+                edge_binary = (edges > 0.15).astype(np.uint8)
+
+            # ── Contour: mask outline as a normalised 200-point cloud ──
+            contour_points = None
+            if mask_crop.any():
+                eroded = binary_erosion(mask_crop, iterations=1)
+                contour_mask = mask_crop & ~eroded
+                cy, cx = np.where(contour_mask)
+                if len(cy) > 10:
+                    contour_points = np.column_stack([
+                        cx.astype(np.float32) / max(crop_w, 1),
+                        cy.astype(np.float32) / max(crop_h, 1),
+                    ]).astype(np.float32)
+                    if len(contour_points) > 200:
+                        idx = np.linspace(0, len(contour_points) - 1, 200, dtype=int)
+                        contour_points = contour_points[idx]
+
+            # ── Hole features from depth (deep regions inside mask) ──
+            num_holes = 0
+            hole_positions = []
+            if depth_crop is not None:
+                valid = mask_crop & (depth_crop > 0) & np.isfinite(depth_crop)
+                if valid.any():
+                    obj_median = float(np.median(depth_crop[valid]))
+                    deep = mask_crop & (depth_crop > obj_median + 0.01) & (depth_crop > 0)
+                    filled = binary_fill_holes(mask_crop)
+                    hole_candidates = filled & (~mask_crop | deep)
+                    labeled, n = _label(hole_candidates)
+                    for h in range(1, n + 1):
+                        hy, hx = np.where(labeled == h)
+                        area = len(hy)
+                        if area > 30:
+                            num_holes += 1
+                            hole_positions.append([
+                                float(np.mean(hx)) / max(crop_w, 1),
+                                float(np.mean(hy)) / max(crop_h, 1),
+                                float(np.sqrt(area / np.pi)) / max(crop_w, crop_h),
+                            ])
+
+            teach_dir = self._teach_dir(part_id)
+            os.makedirs(teach_dir, exist_ok=True)
+            existing = sum(1 for f in os.listdir(teach_dir) if f.endswith('.npz'))
+            ref_id = existing
+
+            save_data = {
+                'size_m':      size_m,
+                'yaw_deg':     np.float32(yaw_deg),
+                'orientation': orientation,
+                'crop_shape':  np.array([crop_h, crop_w], dtype=np.int32),
+                'num_holes':   np.int32(num_holes),
             }
-            if gray_64 is not None:
-                save_kwargs['gray'] = gray_64.astype(np.float32)
-            if color_64 is not None:
-                save_kwargs['color'] = np.clip(color_64, 0, 255).astype(np.uint8)
-            np.savez_compressed(out_path, **save_kwargs)
+            if color_crop is not None:
+                save_data['color'] = color_crop.astype(np.uint8)
+            if depth_crop is not None:
+                save_data['depth'] = depth_crop.astype(np.float32)
+            if mask_crop is not None:
+                save_data['mask'] = mask_crop.astype(bool)
+            if edge_binary is not None:
+                save_data['edges'] = edge_binary.astype(np.uint8)
+            if contour_points is not None:
+                save_data['contour'] = contour_points
+            if hole_positions:
+                save_data['hole_positions'] = np.array(hole_positions, dtype=np.float32)
+
+            out_path = os.path.join(teach_dir, f'ref_{ref_id:03d}.npz')
+            np.savez_compressed(out_path, **save_data)
+
+            # Save a PNG preview alongside for sanity-checking from disk.
+            if color_crop is not None:
+                try:
+                    PILImage.fromarray(color_crop).save(
+                        os.path.join(teach_dir, f'ref_{ref_id:03d}.png'))
+                except Exception:
+                    pass
+
+            self.get_logger().info(
+                f'TAUGHT {part_id} ref#{ref_id}: {crop_w}x{crop_h}px, '
+                f'size={[round(float(s) * 100, 1) for s in size_m]}cm, '
+                f'holes={num_holes}, orientation={orientation}')
+
+            self._load_teach_refs()
         except Exception as e:
-            self.get_logger().error(f'teach: save failed: {e}')
-            return
-        self._load_teach_refs()
-        n = len(self._teach_refs.get(part_id, []))
-        has_rgb = 'yes' if gray_64 is not None else 'no'
-        self.get_logger().info(
-            f'teach: saved {out_path} (part now has {n} refs, rgb={has_rgb})')
+            self.get_logger().error(f'teach failed: {e}')
+            import traceback
+            traceback.print_exc()
 
     @staticmethod
     def _normalise_for_match(depth_crop, mask_crop, target=64):
@@ -1073,140 +1171,207 @@ class DepthSegmentNode(Node):
         return d.astype(np.float32), m
 
     def _match_by_teach(self, depth_crop, mask_crop, obb_size, color_crop=None):
-        """Match against taught references. RGB grayscale NCC dominates
-        because depth on small metal parts is too noisy to discriminate;
-        mask IoU + depth NCC + size act as supporting signals. Each
-        candidate is scored across 4 mask/RGB rotations to absorb yaw
-        ambiguity from the OBB fit. Returns (name, id, score) or
-        ('unknown', None, 0); threshold 0.55."""
+        """Match a live detection against taught references using three
+        hard gates — size, contour shape, edge pattern. ALL must pass.
+
+        Gate 1 — Size: each of the top-two OBB dims within 40% of ref.
+        Gate 2 — Contour: Hu-moment distance over the mask outline,
+                 best over 4 rotations, must score >= 0.30.
+        Gate 3 — Edges: Sobel edge map (48x48) NCC, best over 4
+                 rotations, must score >= 0.20.
+        Gate 4 — Holes: small +/- bonus, not a hard cut.
+
+        Final combined score has to clear 0.55 to match."""
         if not self._teach_refs:
-            return 'unknown', None, 0.0
-        if depth_crop is None or mask_crop is None or not np.any(mask_crop):
-            return 'unknown', None, 0.0
+            return 'unknown', None, 0
 
-        try:
-            det_d, det_m = self._normalise_for_match(depth_crop, mask_crop)
-        except Exception:
-            return 'unknown', None, 0.0
+        if mask_crop is None or mask_crop.shape[0] < 25 or mask_crop.shape[1] < 25:
+            return 'unknown', None, 0
 
-        # Per-crop grayscale, normalised to [0,1] so lighting drift
-        # between teach and runtime doesn't dominate the NCC.
-        det_g = None
+        fill = float(np.sum(mask_crop)) / max(mask_crop.size, 1)
+        if fill < 0.10:
+            return 'unknown', None, 0
+
+        crop_h, crop_w = mask_crop.shape[:2]
+
+        from scipy.ndimage import (
+            sobel as _sobel, gaussian_filter, binary_erosion,
+            label as _label, binary_fill_holes, zoom as _zoom,
+        )
+
+        # ── Detection edge map ────────────────────────────────────────
+        det_edges = None
         if color_crop is not None and color_crop.size > 0:
-            try:
-                from scipy.ndimage import zoom as _zoom
-                ch, cw = color_crop.shape[:2]
-                if ch > 0 and cw > 0:
-                    fy = 64.0 / float(ch); fx = 64.0 / float(cw)
-                    if color_crop.ndim == 3:
-                        g = color_crop.astype(np.float32).mean(axis=2)
-                    else:
-                        g = color_crop.astype(np.float32)
-                    g64 = _zoom(g, (fy, fx), order=1)
-                    g_min = float(g64.min()); g_max = float(g64.max())
-                    if g_max > g_min:
-                        det_g = (g64 - g_min) / (g_max - g_min)
-                    else:
-                        det_g = np.zeros_like(g64)
-            except Exception:
-                det_g = None
+            gray = (np.mean(color_crop.astype(np.float32), axis=2)
+                    if color_crop.ndim == 3
+                    else color_crop.astype(np.float32))
+            gray_smooth = gaussian_filter(gray, sigma=1.0)
+            ex = _sobel(gray_smooth, axis=1)
+            ey = _sobel(gray_smooth, axis=0)
+            edge_mag = np.sqrt(ex * ex + ey * ey)
+            e_max = float(edge_mag.max())
+            if e_max > 0:
+                edge_mag = edge_mag / e_max
+            det_edges = (edge_mag > 0.15).astype(np.float32)
 
-        det_sorted = sorted([float(s) for s in obb_size], reverse=True)
+        # ── Detection contour ─────────────────────────────────────────
+        det_contour = None
+        if mask_crop.any():
+            eroded = binary_erosion(mask_crop, iterations=1)
+            contour_mask = mask_crop & ~eroded
+            cy, cx = np.where(contour_mask)
+            if len(cy) > 10:
+                det_contour = np.column_stack([
+                    cx.astype(np.float32) / max(crop_w, 1),
+                    cy.astype(np.float32) / max(crop_h, 1),
+                ])
+                if len(det_contour) > 200:
+                    idx = np.linspace(0, len(det_contour) - 1, 200, dtype=int)
+                    det_contour = det_contour[idx]
 
-        best_name, best_id, best_score = 'unknown', None, 0.0
-        best_breakdown = (0.0, 0.0, 0.0, 0.0)  # gray, iou, depth, size
-        for pid, refs in self._teach_refs.items():
+        # ── Detection hole count ──────────────────────────────────────
+        det_holes = 0
+        if depth_crop is not None and mask_crop is not None:
+            valid = mask_crop & (depth_crop > 0) & np.isfinite(depth_crop)
+            if valid.any():
+                med = float(np.median(depth_crop[valid]))
+                deep = mask_crop & (depth_crop > med + 0.01) & (depth_crop > 0)
+                filled = binary_fill_holes(mask_crop)
+                hole_cand = filled & (~mask_crop | deep)
+                _, n = _label(hole_cand)
+                det_holes = int(n)
+
+        def _hu_from_contour(pts):
+            cx_m = pts[:, 0].mean()
+            cy_m = pts[:, 1].mean()
+            dx = pts[:, 0] - cx_m
+            dy = pts[:, 1] - cy_m
+            n = len(pts)
+            mu20 = float(np.sum(dx * dx) / n)
+            mu02 = float(np.sum(dy * dy) / n)
+            mu11 = float(np.sum(dx * dy) / n)
+            return np.array(
+                [mu20 + mu02, (mu20 - mu02) ** 2 + 4 * mu11 ** 2],
+                dtype=np.float64)
+
+        best_name = 'unknown'
+        best_id   = None
+        best_score = 0.0
+        best_breakdown = (0.0, 0.0, 0.0, 0)  # size, contour, edge, holes
+
+        for part_id, refs in self._teach_refs.items():
             for ref in refs:
-                ref_sorted = sorted([float(s) for s in ref['size_m']], reverse=True)
-                size_ratios = [min(d, r) / max(d, r, 1e-3)
+                ref_size = ref.get('size_m', np.array([0.05, 0.05, 0.05]))
+                ref_size_list = ref_size.tolist() if hasattr(ref_size, 'tolist') else list(ref_size)
+
+                # ── GATE 1: SIZE — top two dims within 40% ───────────
+                det_sorted = sorted([float(s) for s in obb_size[:2]], reverse=True)
+                ref_sorted = sorted([float(s) for s in ref_size_list[:2]], reverse=True)
+                size_ratios = [min(d, r) / max(d, r, 0.001)
                                for d, r in zip(det_sorted, ref_sorted)]
-                if any(r < 0.5 for r in size_ratios):
+                if any(r < 0.60 for r in size_ratios):
                     continue
-                size_score = sum(size_ratios) / 3.0
+                size_score = sum(size_ratios) / len(size_ratios)
 
-                ref_m = ref['mask']
-                if ref_m.shape != det_m.shape:
-                    continue
-                ref_d = ref['depth']
-                ref_g = ref.get('gray')
+                # ── GATE 2: CONTOUR (Hu-moment distance, 4 rotations) ─
+                contour_score = 0.0
+                ref_contour = ref.get('contour')
+                if (det_contour is not None and ref_contour is not None
+                        and len(ref_contour) > 5):
+                    ref_hu = _hu_from_contour(ref_contour)
+                    ref_log = np.sign(ref_hu) * np.log10(np.abs(ref_hu) + 1e-10)
 
-                # Try all 4 rotations of the DETECTION crops against the
-                # fixed reference. The OBB fit can flip yaw 90°/180° on
-                # symmetric parts, so picking the best rotation prevents
-                # a correct match from being thrown out.
-                mask_iou_best = 0.0
-                depth_best    = 0.0
-                gray_best     = 0.0
-                for rot in range(4):
-                    m_rot = np.rot90(det_m, rot)
-                    d_rot = np.rot90(det_d, rot)
-                    inter = int(np.sum(m_rot & ref_m))
-                    union = int(np.sum(m_rot | ref_m))
-                    if union == 0:
-                        continue
-                    iou = inter / union
-                    if iou > mask_iou_best:
-                        mask_iou_best = iou
-
-                    overlap = m_rot & ref_m
-                    if int(np.sum(overlap)) >= 100:
-                        a = d_rot[overlap]; b = ref_d[overlap]
-                        a_s = float(a.std()); b_s = float(b.std())
-                        if a_s > 0.01 and b_s > 0.01:
-                            ncc = float(np.mean(
-                                (a - float(a.mean())) * (b - float(b.mean()))
-                            ) / (a_s * b_s))
-                            if ncc > depth_best:
-                                depth_best = ncc
-
-                    if det_g is not None and ref_g is not None:
-                        g_rot = np.rot90(det_g, rot)
-                        a = g_rot.ravel(); b = ref_g.ravel()
-                        a_s = float(a.std()); b_s = float(b.std())
-                        if a_s > 0.02 and b_s > 0.02:
-                            ncc = float(np.mean(
-                                (a - float(a.mean())) * (b - float(b.mean()))
-                            ) / (a_s * b_s))
-                            if ncc > gray_best:
-                                gray_best = ncc
-
-                depth_score = max(0.0, depth_best)
-                gray_score  = max(0.0, gray_best)
-
-                if det_g is not None and ref_g is not None:
-                    # RGB available on both sides — weight it heavily;
-                    # depth is the least-reliable channel for small parts.
-                    score = (gray_score   * 0.45 +
-                             mask_iou_best * 0.20 +
-                             depth_score   * 0.10 +
-                             size_score    * 0.25)
+                    for rot in range(4):
+                        if rot == 0:
+                            pts = det_contour
+                        elif rot == 1:
+                            pts = np.column_stack([1.0 - det_contour[:, 1], det_contour[:, 0]])
+                        elif rot == 2:
+                            pts = np.column_stack([1.0 - det_contour[:, 0], 1.0 - det_contour[:, 1]])
+                        else:
+                            pts = np.column_stack([det_contour[:, 1], 1.0 - det_contour[:, 0]])
+                        hu = _hu_from_contour(pts)
+                        log_hu = np.sign(hu) * np.log10(np.abs(hu) + 1e-10)
+                        dist = float(np.sum(np.abs(log_hu - ref_log)))
+                        score = max(0.0, 1.0 - dist / 5.0)
+                        if score > contour_score:
+                            contour_score = score
                 else:
-                    # Legacy ref (or detection has no colour) — fall back
-                    # to the original depth+mask+size blend.
-                    score = (mask_iou_best * 0.35 +
-                             depth_score   * 0.30 +
-                             size_score    * 0.35)
+                    contour_score = 0.5  # can't compare — neutral
+
+                if contour_score < 0.30:
+                    continue
+
+                # ── GATE 3: EDGE PATTERN (NCC on 48x48 maps) ──────────
+                edge_score = 0.0
+                ref_edges = ref.get('edges')
+                if det_edges is not None and ref_edges is not None:
+                    target = 48
+                    try:
+                        ref_e = _zoom(ref_edges.astype(np.float32),
+                                      (target / ref_edges.shape[0],
+                                       target / ref_edges.shape[1]), order=0)
+                        det_e = _zoom(det_edges.astype(np.float32),
+                                      (target / det_edges.shape[0],
+                                       target / det_edges.shape[1]), order=0)
+                        for rot in range(4):
+                            rotated = np.rot90(det_e, rot)
+                            a = ref_e.flatten()
+                            b = rotated.flatten()
+                            a_m, a_s = float(a.mean()), float(a.std())
+                            b_m, b_s = float(b.mean()), float(b.std())
+                            if a_s > 0.02 and b_s > 0.02:
+                                ncc = float(np.mean(
+                                    (a - a_m) * (b - b_m)
+                                ) / (a_s * b_s))
+                                if ncc > edge_score:
+                                    edge_score = max(0.0, ncc)
+                    except Exception:
+                        pass
+                else:
+                    edge_score = 0.5  # can't compare — neutral
+
+                if edge_score < 0.20:
+                    continue
+
+                # ── GATE 4: HOLE COUNT (bonus / penalty, not required) ─
+                hole_bonus = 0.0
+                ref_holes = int(ref.get('num_holes', 0) or 0)
+                if ref_holes == det_holes:
+                    hole_bonus = 0.1
+                elif abs(ref_holes - det_holes) > 1:
+                    hole_bonus = -0.1
+
+                # ── Combined score ────────────────────────────────────
+                score = (size_score    * 0.30 +
+                         contour_score * 0.30 +
+                         edge_score    * 0.30 +
+                         0.10) + hole_bonus  # 0.10 base for passing gates
+                score = min(1.0, max(0.0, score))
 
                 if score > best_score:
                     best_score = score
-                    best_id    = pid
-                    best_breakdown = (gray_score, mask_iou_best, depth_score, size_score)
-                    meta_path  = f'/opt/cobot/parts/metadata/{pid}.json'
-                    try:
-                        with open(meta_path) as fp:
-                            best_name = json.load(fp).get('name') or pid
-                    except Exception:
-                        best_name = pid
+                    best_id    = part_id
+                    best_breakdown = (size_score, contour_score, edge_score, det_holes)
+                    meta_path  = f'/opt/cobot/parts/metadata/{part_id}.json'
+                    if os.path.exists(meta_path):
+                        try:
+                            with open(meta_path) as fp:
+                                best_name = json.load(fp).get('name') or part_id
+                        except Exception:
+                            best_name = part_id
+                    else:
+                        best_name = part_id
 
         if best_score > 0.30:
-            g, m, d, sz = best_breakdown
+            sz, cn, ed, hl = best_breakdown
             self.get_logger().info(
                 f'TEACH_MATCH: {best_name} score={best_score:.2f} '
-                f'gray={g:.2f} mask_iou={m:.2f} depth={d:.2f} size={sz:.2f}',
+                f'size={sz:.2f} contour={cn:.2f} edges={ed:.2f} holes={hl}',
                 throttle_duration_sec=3.0)
 
         if best_score < 0.55:
-            return 'unknown', None, 0.0
+            return 'unknown', None, 0
         return best_name, best_id, round(best_score, 3)
 
     def _on_detection_mode(self, msg):

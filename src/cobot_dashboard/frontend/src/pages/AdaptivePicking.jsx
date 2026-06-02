@@ -774,6 +774,10 @@ function TeachWizard({ part, onClose, onComplete }) {
   const [liveDetections, setLiveDetections]   = useState([])
   const [selectedDetection, setSelectedDet]   = useState(null)
   const [flashGreen, setFlashGreen]           = useState(false)
+  // 'pickable' = part lying as it should be picked
+  // 'flipped'  = part upside-down (robot must flip before pick)
+  // 'on_side'  = part on its side (robot must reorient before pick)
+  const [orientation, setOrientation]         = useState('pickable')
   // Rendered image bounds inside the camera pane. The MJPEG stream is
   // 640×480 native; the <img> uses object-fit:contain so the actual
   // drawn area is letterboxed inside its container. Detection boxes
@@ -843,6 +847,7 @@ function TeachWizard({ part, onClose, onComplete }) {
           detection_index: idx,
           action: 'teach',
           part_id: part.id,
+          orientation,
         }),
       })
       const data = await res.json().catch(() => ({}))
@@ -1172,6 +1177,56 @@ function TeachWizard({ part, onClose, onComplete }) {
                   {error}
                 </div>
               )}
+
+              {/* Orientation selector — operator picks how the part is
+                  currently presented so the robot knows whether it can
+                  be picked directly, must be flipped first, or has
+                  fallen on its side. The tag rides along on the teach
+                  POST and is stored in the .npz; the matcher returns it
+                  alongside the match so the task planner can branch. */}
+              <div style={{
+                display: 'flex', flexDirection: 'column', gap: 6,
+                background: 'var(--bg-surface)', borderRadius: 'var(--radius-md)',
+                padding: 12,
+              }}>
+                <div style={{
+                  fontSize: 12, fontWeight: 600,
+                  color: 'var(--text-primary)',
+                }}>
+                  Part orientation
+                </div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  {[
+                    { id: 'pickable', label: 'Pickable',  hint: 'Ready to grasp' },
+                    { id: 'flipped',  label: 'Flipped',   hint: 'Upside-down'    },
+                    { id: 'on_side',  label: 'On Side',   hint: 'Lying on side'  },
+                  ].map(opt => {
+                    const active = orientation === opt.id
+                    return (
+                      <button
+                        key={opt.id}
+                        onClick={() => setOrientation(opt.id)}
+                        title={opt.hint}
+                        style={{
+                          flex: 1,
+                          padding: '8px 6px',
+                          fontSize: 12,
+                          fontWeight: active ? 700 : 500,
+                          background: active ? 'var(--accent)' : 'var(--bg-panel)',
+                          color: active ? '#fff' : 'var(--text-secondary)',
+                          border: active
+                            ? '1px solid var(--accent)'
+                            : '1px solid var(--border)',
+                          borderRadius: 'var(--radius-md)',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        {opt.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
 
               {/* BIG CAPTURE BUTTON — prominent, centred. Enabled as
                   soon as we have any detections (no need to click a

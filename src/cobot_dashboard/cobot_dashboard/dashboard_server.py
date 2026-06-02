@@ -1536,6 +1536,9 @@ if FASTAPI_AVAILABLE:
         except Exception:
             body = {}
         det_idx = int(body.get('detection_index') or 0)
+        orientation = str(body.get('orientation') or 'pickable')
+        if orientation not in ('pickable', 'flipped', 'on_side'):
+            orientation = 'pickable'
         if _ros_node is None or _ros_node._teach_cmd_pub is None:
             return JSONResponse({"error": "ROS node not ready"}, status_code=503)
 
@@ -1549,13 +1552,14 @@ if FASTAPI_AVAILABLE:
 
         _ros_node.get_logger().info(
             f'TEACH: part_id={part_id} detection_index={det_idx} '
-            f'(before={before})'
+            f'orientation={orientation} (before={before})'
         )
         m = String()
         m.data = json.dumps({
             'action':           'teach',
             'part_id':          part_id,
             'detection_index':  det_idx,
+            'orientation':      orientation,
         })
         _ros_node._teach_cmd_pub.publish(m)
 
