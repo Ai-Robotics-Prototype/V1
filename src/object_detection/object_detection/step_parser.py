@@ -266,6 +266,146 @@ def _generate_silhouettes(mesh, output_dir: str, part_id: str,
     return silhouettes
 
 
+# 6 viewing directions for orientation-aware template rendering.
+# Each rotates the mesh so the named face points UP (+Z), so a top-down
+# camera then sees that face. `label` tells the picker whether the part
+# is in a usable orientation.
+import math as _math
+
+_RECOG_ORIENTATIONS = (
+    {'name': 'top',    'label': 'pickable', 'rotation': (0.0,          0.0,            0.0)},
+    {'name': 'bottom', 'label': 'flipped',  'rotation': (_math.pi,     0.0,            0.0)},
+    {'name': 'right',  'label': 'on_side',  'rotation': (0.0,         -_math.pi / 2.0, 0.0)},
+    {'name': 'left',   'label': 'on_side',  'rotation': (0.0,          _math.pi / 2.0, 0.0)},
+    {'name': 'front',  'label': 'on_side',  'rotation': ( _math.pi / 2.0, 0.0,         0.0)},
+    {'name': 'back',   'label': 'on_side',  'rotation': (-_math.pi / 2.0, 0.0,         0.0)},
+)
+
+
+def generate_recognition_templates(mesh, output_dir: str, part_id: str,
+                                   yaw_steps: int = 12, img_size: int = 128,
+                                   margin: int = 8):
+    """Render a CAD mesh from 6 viewing directions × `yaw_steps` yaws.
+
+    Each template is a (mask, edges, dims) tuple stored in a single
+    .npz under `output_dir`. The orientation label propagates through
+    matching so the runtime can tell the operator whether the part is
+    pickable, flipped (upside down), or on its side.
+
+    Default 6 × 12 = 72 templates per part.
+
+    Returns a summary dict with template count + per-orientation counts.
+    """
+    if not _PIL_OK:
+        return {'num_templates': 0, 'template_file': None, 'orientations': {}}
+
+    os.makedirs(output_dir, exist_ok=True)
+    from scipy.ndimage import sobel as _sobel, binary_erosion
+
+    all_templates = []
+
+    for orient in _RECOG_ORIENTATIONS:
+        rot_mat = trimesh.transformations.euler_matrix(
+            float(orient['rotation'][0]),
+            float(orient['rotation'][1]),
+            float(orient['rotation'][2]))
+        oriented = mesh.copy()
+        oriented.apply_transform(rot_mat)
+
+        verts = oriented.vertices
+        if len(verts) == 0:
+            continue
+        x_range = float(verts[:, 0].max() - verts[:, 0].min()) or 1e-3
+        y_range = float(verts[:, 1].max() - verts[:, 1].min()) or 1e-3
+        scale = (img_size - 2 * margin) / max(x_range, y_range)
+
+        for yi in range(yaw_steps):
+            yaw_deg = yi * (360.0 / yaw_steps)
+            yaw_mat = trimesh.transformations.rotation_matrix(
+                np.radians(yaw_deg), [0, 0, 1])
+            rotated = oriented.copy()
+            rotated.apply_transform(yaw_mat)
+
+            v = rotated.vertices
+            x = v[:, 0]; y = v[:, 1]; z = v[:, 2]
+            px = ((x - x.min()) * scale + margin).astype(int).clip(0, img_size - 1)
+            py = ((y - y.min()) * scale + margin).astype(int).clip(0, img_size - 1)
+
+            mask_img = Image.new('L', (img_size, img_size), 0)
+            mask_draw = ImageDraw.Draw(mask_img)
+            for face in rotated.faces:
+                pts = [(int(px[fi]), int(py[fi])) for fi in face]
+                mask_draw.polygon(pts, fill=255)
+            mask = np.asarray(mask_img) > 127
+            if not mask.any():
+                continue
+
+            # Top-down height map (max z per pixel), normalised to [0,1]
+            height_map = np.zeros((img_size, img_size), dtype=np.float32)
+            np.maximum.at(height_map, (py, px), z - z.min())
+            h_max = float(height_map.max())
+            if h_max > 0:
+                height_map = height_map / h_max
+            height_map[~mask] = 0.0
+
+            mf = mask.astype(np.float32)
+            mask_edges = (np.sqrt(_sobel(mf, axis=0) ** 2
+                                  + _sobel(mf, axis=1) ** 2) > 0.1)
+            h_edges = (np.sqrt(_sobel(height_map, axis=0) ** 2
+                               + _sobel(height_map, axis=1) ** 2) > 0.05)
+            edges = (mask_edges | h_edges).astype(np.uint8)
+
+            rows = np.any(mask, axis=1)
+            cols = np.any(mask, axis=0)
+            if not (rows.any() and cols.any()):
+                continue
+            r0, r1 = np.where(rows)[0][[0, -1]]
+            c0, c1 = np.where(cols)[0][[0, -1]]
+            h_px = int(r1 - r0 + 1)
+            w_px = int(c1 - c0 + 1)
+            width_m = w_px / scale
+            height_m = h_px / scale
+            aspect = w_px / max(h_px, 1)
+            fill = float(np.sum(mask)) / max(w_px * h_px, 1)
+
+            all_templates.append({
+                'orient_name':  orient['name'],
+                'orient_label': orient['label'],
+                'yaw_deg':      float(yaw_deg),
+                'mask':         mask,
+                'edges':        edges,
+                'width_m':      round(float(width_m), 4),
+                'height_m':     round(float(height_m), 4),
+                'aspect':       round(float(aspect), 3),
+                'fill':         round(float(fill), 3),
+            })
+
+    save_dict = {'num_templates': np.int32(len(all_templates))}
+    for i, t in enumerate(all_templates):
+        save_dict[f't{i}_orient']   = t['orient_name']
+        save_dict[f't{i}_label']    = t['orient_label']
+        save_dict[f't{i}_yaw']      = np.float32(t['yaw_deg'])
+        save_dict[f't{i}_mask']     = t['mask']
+        save_dict[f't{i}_edges']    = t['edges']
+        save_dict[f't{i}_width_m']  = np.float32(t['width_m'])
+        save_dict[f't{i}_height_m'] = np.float32(t['height_m'])
+        save_dict[f't{i}_aspect']   = np.float32(t['aspect'])
+        save_dict[f't{i}_fill']     = np.float32(t['fill'])
+
+    save_path = os.path.join(output_dir, f'{part_id}_templates.npz')
+    np.savez_compressed(save_path, **save_dict)
+
+    orient_counts: dict = {}
+    for t in all_templates:
+        orient_counts[t['orient_name']] = orient_counts.get(t['orient_name'], 0) + 1
+
+    return {
+        'num_templates': len(all_templates),
+        'template_file': f'{part_id}_templates.npz',
+        'orientations':  orient_counts,
+    }
+
+
 def parse_step_file(step_path: str) -> dict:
     """Parse a STEP file and return a dict with all the planner-relevant
     geometry. Raises ValueError on parse failure."""
@@ -330,6 +470,16 @@ def parse_step_file(step_path: str) -> dict:
     except Exception:
         silhouettes = []
 
+    # 6 orientations × 12 yaws = 72 templates for orientation-aware
+    # recognition (pickable / flipped / on_side).
+    templates_dir = '/opt/cobot/parts/templates'
+    try:
+        templates_info = generate_recognition_templates(
+            mesh, templates_dir, file_hash)
+    except Exception:
+        templates_info = {'num_templates': 0, 'template_file': None,
+                          'orientations': {}}
+
     try:
         geometric_features = extract_geometric_features(mesh)
     except Exception:
@@ -362,5 +512,6 @@ def parse_step_file(step_path: str) -> dict:
         'hull_verts':     hull.vertices.tolist(),
         'hull_faces':     hull.faces.tolist(),
         'silhouettes':    silhouettes,
+        'templates':      templates_info,
         'geometric_features': geometric_features,
     }

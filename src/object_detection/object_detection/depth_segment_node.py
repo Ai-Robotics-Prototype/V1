@@ -190,12 +190,14 @@ class DepthSegmentNode(Node):
         # silhouettes.
         self._last_objects = []     # latest stable detection list (with crops)
         self._teach_refs   = {}     # part_id -> [ {depth, mask, size_m} ]
+        self._templates    = {}     # part_id -> {name, templates:[...]}
         # While the teach wizard is open the operator is showing the part
         # from different angles; the matcher would happily false-positive
         # off those frames, so we short-circuit recognition entirely until
         # the wizard tells us it's done.
         self._teach_mode   = False
         self._load_teach_refs()
+        self._load_templates()
         self.create_subscription(
             String, '/perception/teach_command',
             self._on_teach_command, 10)
@@ -1452,6 +1454,195 @@ class DepthSegmentNode(Node):
         d[~m] = 0.0
         return d.astype(np.float32), m
 
+    # ── CAD recognition templates (6 orientations × 12 yaws) ───────────
+
+    def _load_templates(self):
+        """Load /opt/cobot/parts/templates/<part_id>_templates.npz files.
+
+        Each file holds N templates (default 72 = 6 orientations × 12
+        yaws). Mapping is keyed by part_id (hash) and includes the part
+        name resolved from the metadata json.
+        """
+        self._templates = {}
+        tdir = '/opt/cobot/parts/templates'
+        mdir = '/opt/cobot/parts/metadata'
+        if not os.path.isdir(tdir):
+            return
+        for fn in sorted(os.listdir(tdir)):
+            if not fn.endswith('_templates.npz'):
+                continue
+            part_id = fn[:-len('_templates.npz')]
+            try:
+                z = np.load(os.path.join(tdir, fn), allow_pickle=True)
+                n = int(z['num_templates'])
+                tpls = []
+                for i in range(n):
+                    tpls.append({
+                        'orient_name':  str(z[f't{i}_orient']),
+                        'orient_label': str(z[f't{i}_label']),
+                        'yaw_deg':      float(z[f't{i}_yaw']),
+                        'mask':         np.asarray(z[f't{i}_mask'], dtype=bool),
+                        'edges':        np.asarray(z[f't{i}_edges'], dtype=np.uint8),
+                        'width_m':      float(z[f't{i}_width_m']),
+                        'height_m':     float(z[f't{i}_height_m']),
+                        'aspect':       float(z[f't{i}_aspect']),
+                    })
+            except Exception as e:
+                self.get_logger().warn(
+                    f'template load failed for {part_id}: {e}', once=True)
+                continue
+            # Look up the part name from metadata json (falls back to id).
+            name = part_id
+            meta_path = os.path.join(mdir, f'{part_id}.json')
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path) as fp:
+                        name = json.load(fp).get('name') or part_id
+                except Exception:
+                    pass
+            self._templates[part_id] = {'name': name, 'templates': tpls}
+        if self._templates:
+            self.get_logger().info(
+                'templates: '
+                + ', '.join(f'{v["name"]}({len(v["templates"])})'
+                            for v in self._templates.values()))
+
+    def _match_by_templates(self, mask_crop, obb_size, color_crop=None):
+        """Match a detection against all CAD-derived templates.
+
+        Returns (part_name, part_id, score, yaw_deg, orient_label).
+        orient_label is 'pickable', 'flipped', 'on_side', or None.
+        """
+        if not self._templates:
+            return None, None, 0.0, 0.0, None
+        if mask_crop is None or mask_crop.shape[0] < 20 or mask_crop.shape[1] < 20:
+            return None, None, 0.0, 0.0, None
+        if not np.any(mask_crop):
+            return None, None, 0.0, 0.0, None
+        det_max_dim = (max(float(obb_size[0]), float(obb_size[1]))
+                       if obb_size is not None and len(obb_size) >= 2 else 0.0)
+        if det_max_dim < 0.015:
+            return None, None, 0.0, 0.0, None
+
+        from scipy.ndimage import (
+            sobel as _sobel, gaussian_filter, zoom as _zoom)
+
+        det_edges = None
+        if color_crop is not None and color_crop.size > 0:
+            gray = (np.mean(color_crop.astype(np.float32), axis=2)
+                    if color_crop.ndim == 3
+                    else color_crop.astype(np.float32))
+            gs = gaussian_filter(gray, sigma=1.0)
+            emag = np.sqrt(_sobel(gs, axis=0) ** 2 + _sobel(gs, axis=1) ** 2)
+            emax = float(emag.max())
+            det_edges = ((emag / emax > 0.15).astype(np.float32)
+                         if emax > 0 else np.zeros_like(gray, dtype=np.float32))
+
+        det_h, det_w = mask_crop.shape[:2]
+        det_s_sorted = sorted(
+            [float(obb_size[0]), float(obb_size[1])], reverse=True)
+        det_asp = det_s_sorted[0] / max(det_s_sorted[1], 0.001)
+
+        best_score  = 0.0
+        best_part_id = None
+        best_name   = None
+        best_yaw    = 0.0
+        best_orient = None
+        best_bd     = (0.0, 0.0, 0.0)
+
+        for part_id, entry in self._templates.items():
+            name = entry['name']
+            for t in entry['templates']:
+                ref_s = sorted(
+                    [float(t['width_m']), float(t['height_m'])], reverse=True)
+                if ref_s[0] < 1e-4:
+                    continue
+                r0 = (min(det_s_sorted[0], ref_s[0])
+                      / max(det_s_sorted[0], ref_s[0], 0.001))
+                r1 = (min(det_s_sorted[1], ref_s[1])
+                      / max(det_s_sorted[1], ref_s[1], 0.001))
+                if r0 < 0.55 or r1 < 0.55:
+                    continue
+                ref_asp = ref_s[0] / max(ref_s[1], 0.001)
+                asp_r = (min(det_asp, ref_asp)
+                         / max(det_asp, ref_asp, 0.001))
+                if asp_r < 0.55:
+                    continue
+                size_score = (r0 + r1 + asp_r) / 3.0
+
+                ref_mask = t['mask']
+                ref_h, ref_w = ref_mask.shape[:2]
+                fy = ref_h / max(det_h, 1)
+                fx = ref_w / max(det_w, 1)
+                try:
+                    det_mask_scaled = (_zoom(mask_crop.astype(np.float32),
+                                             (fy, fx), order=0) > 0.5)
+                except Exception:
+                    continue
+
+                # Best of 4 rotations; templates already cover 12 yaws so
+                # a 4-rotation sweep is enough to align with any one of them.
+                mask_iou = 0.0
+                for rot in range(4):
+                    rm = np.rot90(det_mask_scaled, rot)
+                    mh = min(rm.shape[0], ref_mask.shape[0])
+                    mw = min(rm.shape[1], ref_mask.shape[1])
+                    rm_c = rm[:mh, :mw]
+                    rf_c = ref_mask[:mh, :mw]
+                    inter = float(np.sum(rm_c & rf_c))
+                    union = float(np.sum(rm_c | rf_c))
+                    iou = inter / max(union, 1.0)
+                    if iou > mask_iou:
+                        mask_iou = iou
+
+                edge_score = 0.0
+                ref_edges = t['edges']
+                if det_edges is not None and ref_edges is not None:
+                    try:
+                        de_scaled = _zoom(det_edges, (fy, fx), order=0)
+                        re = ref_edges.astype(np.float32)
+                        for rot in range(4):
+                            dr = np.rot90(de_scaled, rot)
+                            mh = min(dr.shape[0], re.shape[0])
+                            mw = min(dr.shape[1], re.shape[1])
+                            a = re[:mh, :mw].flatten()
+                            b = dr[:mh, :mw].flatten()
+                            if a.size < 100 or a.size != b.size:
+                                continue
+                            a_m, a_s = float(a.mean()), float(a.std())
+                            b_m, b_s = float(b.mean()), float(b.std())
+                            if a_s > 0.02 and b_s > 0.02:
+                                ncc = float(np.mean(
+                                    (a - a_m) * (b - b_m)
+                                ) / (a_s * b_s))
+                                if ncc > edge_score:
+                                    edge_score = max(0.0, ncc)
+                    except Exception:
+                        pass
+
+                score = (size_score * 0.40
+                         + mask_iou  * 0.30
+                         + edge_score * 0.30)
+                if score > best_score:
+                    best_score   = score
+                    best_part_id = part_id
+                    best_name    = name
+                    best_yaw     = t['yaw_deg']
+                    best_orient  = t['orient_label']
+                    best_bd      = (size_score, mask_iou, edge_score)
+
+        if best_part_id is not None and best_score > 0.30:
+            sz, iou, ed = best_bd
+            self.get_logger().info(
+                f'TEMPLATE_MATCH: {best_name} score={best_score:.2f} '
+                f'orient={best_orient} yaw={best_yaw:.0f}° '
+                f'size={sz:.2f} iou={iou:.2f} edges={ed:.2f}',
+                throttle_duration_sec=2.0)
+        if best_score < 0.55:
+            return None, None, 0.0, 0.0, None
+        return (best_name, best_part_id, round(best_score, 3),
+                best_yaw, best_orient)
+
     def _match_by_teach(self, depth_crop, mask_crop, obb_size, color_crop=None):
         """Scale-aware teach matching.
 
@@ -1948,76 +2139,28 @@ class DepthSegmentNode(Node):
                 o['_match_reason']    = ''
                 o['_match_source']    = ''
             return
-        library_parts = self._load_library_parts()
         for o in objects:
             mask  = o.get('mask_2d')
-            depth = o.get('depth_2d')
-            bbox  = o.get('bbox_px') or (0, 0, 0, 0)
-            bw    = max(1, bbox[2] - bbox[0])
-            bh    = max(1, bbox[3] - bbox[1])
-            aspect = float(bw) / float(bh)
             sx, sy, sz = o.get('size_3d') or (0.05, 0.05, 0.05)
             size_m = [float(sx), float(sy), float(sz)]
 
-            # 1) Geometry match against CAD library.
-            det_features = self._extract_detection_features(depth, mask)
-            geo_name, geo_id, geo_score, geo_reason = None, None, 0.0, ''
-            if _MATCHER_OK and det_features:
-                try:
-                    match, score, reason = _match_geometry(det_features, size_m)
-                    if match is not None:
-                        geo_name   = match.get('name')
-                        geo_id     = match.get('id')
-                        geo_score  = float(score)
-                        geo_reason = str(reason)
-                except Exception as e:
-                    self.get_logger().warn(f'match_geometry failed: {e}', once=True)
+            # Template matching is the SOLE recognition path. Templates
+            # are CAD-derived from 6 viewing directions × 12 yaws so a
+            # match also tells us whether the part is pickable, flipped
+            # (upside down), or on its side.
+            tpl_name, tpl_id, tpl_score, tpl_yaw, tpl_orient = (
+                self._match_by_templates(
+                    mask, size_m, color_crop=o.get('color_crop')))
 
-            # 2) Teach-mode match — kept as a parallel matcher because
-            # an operator capture often beats CAD on noisy small parts.
-            # Pass the RGB crop so the matcher's gray NCC fires.
-            teach_name, teach_id, teach_score = self._match_by_teach(
-                depth, mask, size_m, color_crop=o.get('color_crop'))
+            best_name, best_id, best_score = tpl_name, tpl_id, tpl_score
+            match_source = 'template' if tpl_name else ''
 
-            # Higher score wins. CAD is preferred on ties to bias toward
-            # the structurally-defined match when both fire equally.
-            if geo_score >= teach_score and geo_name:
-                best_name, best_id, best_score = geo_name, geo_id, geo_score
-                match_source = 'cad'
-            elif teach_score > 0 and teach_name != 'unknown':
-                best_name, best_id, best_score = teach_name, teach_id, teach_score
-                match_source = 'teach'
-            else:
-                best_name, best_id, best_score = None, None, 0.0
-                match_source = ''
-
-            # Diagnostic logging — anything that even comes close is
-            # worth logging so we can see WHY false positives happen.
-            if best_score > 0.3:
-                gf_holes = 0
-                if best_id:
-                    pm = next((p for p in library_parts
-                               if p.get('id') == best_id), None)
-                    if pm:
-                        gf_holes = int(
-                            (pm.get('geometric_features') or {})
-                            .get('num_holes', 0) or 0
-                        )
-                self.get_logger().info(
-                    f'MATCH: {best_name} score={best_score:.2f} '
-                    f'src={match_source} '
-                    f'holes:{det_features.get("num_holes", 0)}vs{gf_holes} '
-                    f'size:{[round(s * 100, 1) for s in size_m]}cm '
-                    f'reason:{geo_reason}',
-                    throttle_duration_sec=2.0,
-                )
-
-            # Stash hole list + reason for annotation drawing.
-            o['_holes']        = det_features.get('holes', []) if det_features else []
-            o['_match_reason'] = geo_reason
+            o['_holes']        = []
+            o['_match_reason'] = ''
             o['_match_source'] = match_source
+            o['orientation']   = tpl_orient
 
-            if best_name is None or best_score < 0.50:
+            if best_name is None or best_score < 0.55:
                 o['part_name']        = None
                 o['part_id']          = None
                 o['match_score']      = 0.0
@@ -2031,22 +2174,17 @@ class DepthSegmentNode(Node):
             o['part_name']   = str(best_name)
             o['part_id']     = str(best_id) if best_id else None
             o['match_score'] = float(round(best_score, 3))
-            o['match_yaw']   = 0.0
-
-            # Position verification against the operator-saved config.
-            part_meta = next((p for p in library_parts if p.get('id') == best_id), None)
-            if part_meta is not None:
-                _roll, _pitch, yaw_rad = o.get('euler') or (0.0, 0.0, 0.0)
-                ok, yaw_err, surf_ok = self._verify_position(part_meta, yaw_rad, size_m)
-                o['position_correct'] = bool(ok)
-                o['yaw_error_deg']    = float(yaw_err)
-                o['surface_ok']       = bool(surf_ok)
-                o['position_status']  = 'CORRECT' if ok else 'MISALIGNED'
-            else:
-                o['position_correct'] = None
-                o['yaw_error_deg']    = 0.0
-                o['surface_ok']       = None
-                o['position_status']  = ''
+            o['match_yaw']   = float(tpl_yaw)
+            # The 6-orientation tag IS the position verdict: 'pickable'
+            # means the part is right-side up. Anything else needs to be
+            # re-oriented before picking.
+            o['position_correct'] = (tpl_orient == 'pickable')
+            o['yaw_error_deg']    = 0.0
+            o['surface_ok']       = (tpl_orient == 'pickable')
+            o['position_status']  = (
+                'PICKABLE' if tpl_orient == 'pickable'
+                else ('FLIPPED' if tpl_orient == 'flipped'
+                      else ('ON_SIDE' if tpl_orient == 'on_side' else '')))
 
     # ── Publishing ────────────────────────────────────────────────────────────
 
@@ -2208,14 +2346,21 @@ class DepthSegmentNode(Node):
             px, py, pz = o['pos']
             sx, sy, sz = o['size_3d']
             roll, pitch, yaw = o['euler']
-            matched   = bool(o.get('part_name'))
-            pos_ok    = o.get('position_correct')
-            # Three-way colour code: blue = matched + correctly placed,
-            # orange = matched but yaw/surface off, green = unknown.
-            if matched and pos_ok:
+            matched     = bool(o.get('part_name'))
+            orientation = o.get('orientation')  # 'pickable' / 'flipped' / 'on_side' / None
+            # Four-state colour code from the orientation tag:
+            #   blue    — matched + pickable (right-side up)
+            #   red     — matched + flipped (upside down)
+            #   orange  — matched + on side (needs reorienting)
+            #   green   — no template match
+            if matched and orientation == 'pickable':
                 col = (59, 130, 246)    # blue
-            elif matched:
+            elif matched and orientation == 'flipped':
+                col = (220, 38, 38)     # red
+            elif matched and orientation == 'on_side':
                 col = (249, 115, 22)    # orange
+            elif matched:
+                col = (249, 115, 22)    # orange (matched, orientation unknown)
             else:
                 col = self._dist_color(pz)
 
@@ -2271,12 +2416,17 @@ class DepthSegmentNode(Node):
             if matched:
                 pct = int(round(float(o.get('match_score') or 0) * 100))
                 hole_tag = f' [{n_holes}h]' if n_holes else ''
-                if pos_ok:
-                    label = f"{o['part_name']} ({pct}%){hole_tag} ✓ {pz:.2f}m"
-                else:
-                    yaw_err = float(o.get('yaw_error_deg') or 0.0)
+                if orientation == 'pickable':
                     label = (f"{o['part_name']} ({pct}%){hole_tag} "
-                             f"⚠ yaw:{yaw_err:.0f}°")
+                             f"✓ pickable")
+                elif orientation == 'flipped':
+                    label = (f"{o['part_name']} ({pct}%){hole_tag} "
+                             f"⚠ FLIPPED")
+                elif orientation == 'on_side':
+                    label = (f"{o['part_name']} ({pct}%){hole_tag} "
+                             f"⚠ ON SIDE")
+                else:
+                    label = f"{o['part_name']} ({pct}%){hole_tag} {pz:.2f}m"
             else:
                 label = f'{pz:.2f}m {w_cm}×{h_cm}cm yaw:{yaw_deg:+.0f}°'
             label_font = _ANNOT_FONT if matched else _ANNOT_FONT_SMALL
