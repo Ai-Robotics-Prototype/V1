@@ -151,36 +151,22 @@ function PartModel3D({ url, rotation, frontAngle, onFaceClick }) {
 
 // ── Pick-direction arrow (unified: button mode or face-click mode) ──
 
-function PickArrow({ approach, offsetCm, faceNormal, facePoint }) {
+function PickArrow({ offsetCm, faceNormal, facePoint }) {
   const offset = ((offsetCm || 2) / 100) * 2.5
 
   const { position, quaternion } = useMemo(() => {
-    if (faceNormal && facePoint) {
-      const n = new THREE.Vector3(faceNormal[0], faceNormal[1], faceNormal[2]).normalize()
-      const standoff = 0.05 + offset
-      const p = new THREE.Vector3(
-        facePoint[0] + n.x * standoff,
-        facePoint[1] + n.y * standoff,
-        facePoint[2] + n.z * standoff,
-      )
-      const defaultDir = new THREE.Vector3(0, -1, 0)
-      const targetDir  = n.clone().negate()
-      const q = new THREE.Quaternion().setFromUnitVectors(defaultDir, targetDir)
-      return { position: [p.x, p.y, p.z], quaternion: q }
-    }
-
-    const idQ = new THREE.Quaternion()
-    if (approach === 'side') {
-      const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 2)
-      return { position: [0.15 + offset, 0.08, 0], quaternion: q }
-    }
-    if (approach === 'angled') {
-      const d = offset * 0.7071
-      const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 4)
-      return { position: [0.1 + d, 0.15 + d, 0], quaternion: q }
-    }
-    return { position: [0, 0.1 + offset, 0], quaternion: idQ }
-  }, [approach, offset, faceNormal, facePoint])
+    const n = new THREE.Vector3(faceNormal[0], faceNormal[1], faceNormal[2]).normalize()
+    const standoff = 0.05 + offset
+    const p = new THREE.Vector3(
+      facePoint[0] + n.x * standoff,
+      facePoint[1] + n.y * standoff,
+      facePoint[2] + n.z * standoff,
+    )
+    const defaultDir = new THREE.Vector3(0, -1, 0)
+    const targetDir  = n.clone().negate()
+    const q = new THREE.Quaternion().setFromUnitVectors(defaultDir, targetDir)
+    return { position: [p.x, p.y, p.z], quaternion: q }
+  }, [offset, faceNormal, facePoint])
 
   return (
     <group position={position} quaternion={quaternion}>
@@ -249,14 +235,15 @@ function PartCanvas({ url, rotation, frontAngle, approach, partExtents, selected
           onFaceClick={onFaceClick}
         />
       </Suspense>
-      <PickArrow
-        approach={approach || 'top_down'}
-        offsetCm={offsetCm}
-        faceNormal={selectedFace?.normal || null}
-        facePoint={selectedFace?.point || null}
-      />
       {selectedFace && (
-        <FaceHighlight point={selectedFace.point} normal={selectedFace.normal} />
+        <>
+          <PickArrow
+            offsetCm={offsetCm}
+            faceNormal={selectedFace.normal}
+            facePoint={selectedFace.point}
+          />
+          <FaceHighlight point={selectedFace.point} normal={selectedFace.normal} />
+        </>
       )}
       <OrbitControls enableDamping dampingFactor={0.08} />
     </Canvas>
@@ -626,33 +613,21 @@ function PartConfigurator({ partId, onSave, onDelete }) {
           </div>
         </div>
 
-        {/* Pick approach */}
+        {/* Pick direction */}
         <div>
           <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 10 }}>
-            Pick Approach
+            Pick Direction
           </div>
 
-          {/* Hint: click-to-select-face on the 3D model */}
-          <div style={{
-            fontSize: 11, color: 'var(--accent)',
-            background: 'var(--accent-dim)',
-            padding: '8px 12px', borderRadius: 'var(--radius-sm)',
-            marginBottom: 12,
-            display: 'flex', alignItems: 'center', gap: 8,
-          }}>
-            <span>💡</span>
-            <span>Click a face on the 3D model to set the pick direction, or use the buttons below.</span>
-          </div>
-
-          {selectedFace && (
+          {selectedFace ? (
             <div style={{
               display: 'flex', alignItems: 'center', gap: 8,
-              marginBottom: 12, padding: '6px 12px',
+              padding: '8px 12px', marginBottom: 12,
               background: 'var(--green-dim)',
               borderRadius: 'var(--radius-sm)', fontSize: 12,
             }}>
               <span style={{ color: 'var(--green)', fontWeight: 600 }}>
-                ✓ Face selected — approach: {grasp.approach}
+                ✓ Pick face selected
               </span>
               <button
                 onClick={resetSelectedFace}
@@ -667,37 +642,17 @@ function PartConfigurator({ partId, onSave, onDelete }) {
                 Reset
               </button>
             </div>
-          )}
-
-          <div style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 6 }}>Direction</div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6 }}>
-              {[
-                { value: 'top_down', label: '↓ Top Down' },
-                { value: 'side',     label: '→ Side'     },
-                { value: 'angled',   label: '↘ Angled'   },
-              ].map(opt => {
-                const active = grasp.approach === opt.value
-                return (
-                  <button key={opt.value}
-                    onClick={() => setGrasp({ ...grasp, approach: opt.value })}
-                    style={{
-                      padding: '10px 8px',
-                      fontSize: 12,
-                      fontWeight: active ? 700 : 400,
-                      background: active ? 'var(--accent-dim)' : 'var(--bg-surface)',
-                      color:      active ? 'var(--accent)'     : 'var(--text-secondary)',
-                      border:     active ? '2px solid var(--accent)' : '1px solid var(--border)',
-                      borderRadius: 'var(--radius-sm)',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    {opt.label}
-                  </button>
-                )
-              })}
+          ) : (
+            <div style={{
+              padding: '10px 12px', marginBottom: 12,
+              background: 'var(--accent-dim)',
+              border: '1px solid var(--accent-border)',
+              borderRadius: 'var(--radius-sm)',
+              fontSize: 12, color: 'var(--accent)',
+            }}>
+              👆 Click a face on the 3D model to set where the gripper approaches from
             </div>
-          </div>
+          )}
 
           <div>
             <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>
