@@ -773,8 +773,15 @@ function TeachWizard({ part, onClose, onComplete }) {
   const [error, setError]                     = useState(null)
   const [liveDetections, setLiveDetections]   = useState([])
   const [selectedDetection, setSelectedDet]   = useState(null)
-  const [cameraTick, setCameraTick]           = useState(Date.now())
   const [flashGreen, setFlashGreen]           = useState(false)
+  // Rendered image bounds inside the camera pane. The MJPEG stream is
+  // 640×480 native; the <img> uses object-fit:contain so the actual
+  // drawn area is letterboxed inside its container. Detection boxes
+  // need to be positioned against the *drawn* area, not the container.
+  const imgRef                                = useRef(null)
+  const [imgBounds, setImgBounds]             = useState({
+    w: 640, h: 480, offX: 0, offY: 0,
+  })
 
   // Poll live detections from dashboard state at 2 Hz.
   useEffect(() => {
@@ -791,37 +798,69 @@ function TeachWizard({ part, onClose, onComplete }) {
     return () => { cancelled = true; clearInterval(interval) }
   }, [])
 
-  // Refresh the camera snapshot every 250 ms. We can't use /stream/cam0
-  // directly as an <img src> because the MJPEG stream blocks rendering
-  // of detection-box overlays at the same time; the still-image refresh
-  // is just as smooth at 4 Hz and keeps the box coordinates aligned.
+  // Track the rendered image area so overlays line up with object-fit:contain.
   useEffect(() => {
-    const id = setInterval(() => setCameraTick(Date.now()), 250)
-    return () => clearInterval(id)
-  }, [])
+    const updateBounds = () => {
+      const el = imgRef.current
+      if (!el || !el.parentElement) return
+      const c = el.parentElement.getBoundingClientRect()
+      const natW = 640, natH = 480
+      const scale = Math.min(c.width / natW, c.height / natH)
+      const renderedW = natW * scale
+      const renderedH = natH * scale
+      setImgBounds({
+        w: renderedW,
+        h: renderedH,
+        offX: (c.width - renderedW) / 2,
+        offY: (c.height - renderedH) / 2,
+      })
+    }
+    updateBounds()
+    let observer = null
+    if (imgRef.current?.parentElement && 'ResizeObserver' in window) {
+      observer = new ResizeObserver(updateBounds)
+      observer.observe(imgRef.current.parentElement)
+    }
+    window.addEventListener('resize', updateBounds)
+    return () => {
+      observer?.disconnect()
+      window.removeEventListener('resize', updateBounds)
+    }
+  }, [step])
 
   async function captureTeach(detectionIndex) {
     setCapturing(true)
     setError(null)
+    let ok = false
     try {
+      // If nothing selected, idx=0 — depth_segment_node treats index 0
+      // as the first (typically nearest/largest) detection.
+      const idx = detectionIndex ?? 0
       const res = await fetch(`/api/parts/${part.id}/teach`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          detection_index: detectionIndex,
+          detection_index: idx,
           action: 'teach',
           part_id: part.id,
         }),
       })
       const data = await res.json().catch(() => ({}))
-      if (res.ok && (data.ok || data.status)) {
+      if (res.ok && data.captured === false) {
+        // Endpoint succeeded but no file appeared — depth_segment_node
+        // didn't have a usable detection. Tell the user to wait.
+        setError('No object captured — make sure the part is in view '
+          + 'and a green box is visible, then try again.')
+      } else if (res.ok && (data.ok || data.status)) {
         setCaptures(prev => [...prev, {
           step,
           angle: (step - 1) * 90,
           timestamp: Date.now(),
+          teach_count: data.teach_count,
         }])
         setFlashGreen(true)
         setTimeout(() => setFlashGreen(false), 600)
+        ok = true
       } else {
         setError(data.error || `Capture failed (HTTP ${res.status})`)
       }
@@ -829,6 +868,7 @@ function TeachWizard({ part, onClose, onComplete }) {
       setError(e.message || 'Network error')
     }
     setCapturing(false)
+    return ok
   }
 
   const totalSteps = 6
@@ -963,34 +1003,57 @@ function TeachWizard({ part, onClose, onComplete }) {
               transition: 'border-color 200ms',
             }}>
               <img
-                src={`/stream/cam0?t=${cameraTick}`}
+                ref={imgRef}
+                src="/stream/cam0"
                 alt="cam0"
                 style={{
-                  maxWidth: '100%', maxHeight: '100%', objectFit: 'contain',
+                  width: '100%', height: '100%', objectFit: 'contain',
+                }}
+                onLoad={() => {
+                  // Trigger a re-measure once the MJPEG kicks off.
+                  const el = imgRef.current
+                  if (!el?.parentElement) return
+                  const c = el.parentElement.getBoundingClientRect()
+                  const scale = Math.min(c.width / 640, c.height / 480)
+                  setImgBounds({
+                    w: 640 * scale, h: 480 * scale,
+                    offX: (c.width - 640 * scale) / 2,
+                    offY: (c.height - 480 * scale) / 2,
+                  })
                 }}
               />
 
-              {/* Detection overlay — clickable boxes. The detector
-                  publishes bbox_px in 640×480 pixel coords; we render as
-                  % so the overlay scales with the contain-fit image. */}
+              {/* Detection overlay — clickable boxes positioned against
+                  the actual drawn image area (object-fit:contain leaves
+                  letterbox margins on whichever axis isn't constrained). */}
               {liveDetections.map((det, i) => {
-                if (!det.bbox_px) return null
-                const [x1, y1, x2, y2] = det.bbox_px
+                const bp = det.bbox_px
+                if (!bp || bp.length < 4) return null
+                const [x1, y1, x2, y2] = bp
+                const left   = imgBounds.offX + (x1 / 640) * imgBounds.w
+                const top    = imgBounds.offY + (y1 / 480) * imgBounds.h
+                const width  = ((x2 - x1) / 640) * imgBounds.w
+                const height = ((y2 - y1) / 480) * imgBounds.h
                 const isSelected = selectedDetection === i
                 return (
                   <div
                     key={i}
-                    onClick={() => setSelectedDet(i)}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      setSelectedDet(isSelected ? null : i)
+                    }}
                     style={{
                       position: 'absolute',
-                      left:   `${(x1 / 640) * 100}%`,
-                      top:    `${(y1 / 480) * 100}%`,
-                      width:  `${((x2 - x1) / 640) * 100}%`,
-                      height: `${((y2 - y1) / 480) * 100}%`,
+                      left:   `${left}px`,
+                      top:    `${top}px`,
+                      width:  `${width}px`,
+                      height: `${height}px`,
                       border:    isSelected ? '3px solid #3B82F6' : '2px solid #22C55E',
-                      background: isSelected ? 'rgba(59,130,246,0.15)' : 'rgba(34,197,94,0.08)',
+                      background: isSelected ? 'rgba(59,130,246,0.20)' : 'rgba(34,197,94,0.08)',
                       borderRadius: 4, cursor: 'pointer',
-                      transition: 'all 150ms',
+                      transition: 'border-color 150ms, background 150ms',
+                      zIndex: 10,
+                      pointerEvents: 'auto',
                     }}
                   >
                     {isSelected && (
@@ -1000,7 +1063,7 @@ function TeachWizard({ part, onClose, onComplete }) {
                         fontSize: 10, fontWeight: 600,
                         padding: '2px 8px', borderRadius: 4, whiteSpace: 'nowrap',
                       }}>
-                        ✓ Selected — click Capture
+                        ✓ Selected
                       </div>
                     )}
                   </div>
@@ -1110,7 +1173,10 @@ function TeachWizard({ part, onClose, onComplete }) {
                 </div>
               )}
 
-              {/* BIG CAPTURE BUTTON — prominent, centred */}
+              {/* BIG CAPTURE BUTTON — prominent, centred. Enabled as
+                  soon as we have any detections (no need to click a
+                  box first); selecting a box just overrides which
+                  detection index is captured. */}
               <div style={{
                 padding: '16px 24px',
                 display: 'flex',
@@ -1126,84 +1192,61 @@ function TeachWizard({ part, onClose, onComplete }) {
                   Step {step} of 4 — {['', 'Front (0°)', 'Right (90°)', 'Back (180°)', 'Left (270°)'][step]}
                 </div>
 
-                <button
-                  onClick={() => {
-                    if (selectedDetection !== null) {
-                      captureTeach(selectedDetection).then(() => {
-                        setSelectedDet(null)
-                        if (step < 4) {
-                          setTimeout(() => setStep(step + 1), 800)
-                        } else {
-                          setStep(5)
-                        }
-                      })
+                {(() => {
+                  const hasDetections = liveDetections.length > 0
+                  const canCapture    = hasDetections && !capturing
+                  const doCapture = async () => {
+                    const idx = selectedDetection ?? 0
+                    const ok = await captureTeach(idx)
+                    if (ok) {
+                      setSelectedDet(null)
+                      if (step < 4) setTimeout(() => setStep(step + 1), 800)
+                      else setStep(5)
                     }
-                  }}
-                  disabled={selectedDetection === null || capturing}
-                  style={{
-                    width: 80,
-                    height: 80,
-                    borderRadius: '50%',
-                    border: selectedDetection !== null ? '4px solid var(--accent)' : '4px solid var(--border)',
-                    background: capturing ? 'var(--accent)'
-                      : selectedDetection !== null ? '#fff' : 'var(--bg-surface)',
-                    cursor: selectedDetection !== null ? 'pointer' : 'default',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    transition: 'all 200ms',
-                    boxShadow: selectedDetection !== null ? '0 0 0 4px var(--accent-dim)' : 'none',
-                  }}
-                >
-                  {capturing ? (
-                    <div style={{ fontSize: 24, color: '#fff' }}>⏳</div>
-                  ) : (
-                    <div style={{
-                      width: 56,
-                      height: 56,
-                      borderRadius: '50%',
-                      background: selectedDetection !== null ? 'var(--accent)' : 'var(--bg-active)',
-                      transition: 'all 200ms',
-                    }} />
-                  )}
-                </button>
+                  }
+                  return (
+                    <>
+                      <button
+                        onClick={() => { if (canCapture) doCapture() }}
+                        disabled={!canCapture}
+                        style={{
+                          padding: '16px 36px',
+                          fontSize: 15,
+                          fontWeight: 700,
+                          background: canCapture ? 'var(--accent)' : 'var(--bg-surface)',
+                          color: canCapture ? '#fff' : 'var(--text-muted)',
+                          border: 'none',
+                          borderRadius: 'var(--radius-lg)',
+                          cursor: canCapture ? 'pointer' : 'not-allowed',
+                          boxShadow: canCapture ? '0 4px 12px rgba(29,111,216,0.35)' : 'none',
+                          minWidth: 260,
+                          transition: 'all 150ms',
+                        }}
+                      >
+                        {capturing
+                          ? '⏳ Capturing…'
+                          : !hasDetections
+                            ? 'Waiting for object…'
+                            : selectedDetection !== null
+                              ? `📸 Capture Selected (Angle ${step}/4)`
+                              : `📸 Capture Nearest (Angle ${step}/4)`}
+                      </button>
 
-                <div style={{
-                  fontSize: 13,
-                  color: selectedDetection !== null ? 'var(--accent)' : 'var(--text-muted)',
-                  fontWeight: 500,
-                  textAlign: 'center',
-                }}>
-                  {capturing ? 'Capturing...'
-                    : selectedDetection === null
-                      ? 'Select an object in the camera view above ↑'
-                      : 'Tap the button to capture this angle'}
-                </div>
-
-                {selectedDetection !== null && !capturing && (
-                  <button
-                    onClick={() => {
-                      captureTeach(selectedDetection).then(() => {
-                        setSelectedDet(null)
-                        if (step < 4) setTimeout(() => setStep(step + 1), 800)
-                        else setStep(5)
-                      })
-                    }}
-                    style={{
-                      padding: '10px 32px',
-                      fontSize: 14,
-                      fontWeight: 700,
-                      background: 'var(--accent)',
-                      color: '#fff',
-                      border: 'none',
-                      borderRadius: 'var(--radius-lg)',
-                      cursor: 'pointer',
-                      boxShadow: 'var(--shadow-md)',
-                    }}
-                  >
-                    📸 Capture & Next →
-                  </button>
-                )}
+                      <div style={{
+                        fontSize: 12,
+                        color: 'var(--text-muted)',
+                        textAlign: 'center',
+                        maxWidth: 280,
+                      }}>
+                        {!hasDetections
+                          ? 'Place the part in front of Camera 0. Detection boxes appear here when one is seen.'
+                          : selectedDetection !== null
+                            ? 'Click the box again to deselect, or tap Capture.'
+                            : `${liveDetections.length} object${liveDetections.length === 1 ? '' : 's'} detected — tap a green box to choose, or just press Capture to teach the nearest.`}
+                      </div>
+                    </>
+                  )
+                })()}
               </div>
 
               {/* Navigation */}

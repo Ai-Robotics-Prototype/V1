@@ -1522,7 +1522,12 @@ if FASTAPI_AVAILABLE:
     async def api_parts_teach(part_id: str, request: Request):
         """Tell depth_segment_node to grab the latest detection (or
         the one at detection_index) and store it as a teach reference
-        for this part. Body: {"detection_index": int (optional)}."""
+        for this part. Body: {"detection_index": int (optional)}.
+
+        Waits ~600 ms after publishing so we can count the .npz files
+        on disk and return the new count — the wizard uses this to
+        confirm the capture actually landed instead of trusting the
+        202-style ack alone."""
         meta_path = f'/opt/cobot/parts/metadata/{part_id}.json'
         if not os.path.isfile(meta_path):
             return JSONResponse({"error": "part not found"}, status_code=404)
@@ -1533,6 +1538,19 @@ if FASTAPI_AVAILABLE:
         det_idx = int(body.get('detection_index') or 0)
         if _ros_node is None or _ros_node._teach_cmd_pub is None:
             return JSONResponse({"error": "ROS node not ready"}, status_code=503)
+
+        teach_dir = f'/opt/cobot/parts/teach/{part_id}'
+        def _count():
+            try:
+                return sum(1 for f in os.listdir(teach_dir) if f.endswith('.npz'))
+            except OSError:
+                return 0
+        before = _count()
+
+        _ros_node.get_logger().info(
+            f'TEACH: part_id={part_id} detection_index={det_idx} '
+            f'(before={before})'
+        )
         m = String()
         m.data = json.dumps({
             'action':           'teach',
@@ -1540,7 +1558,18 @@ if FASTAPI_AVAILABLE:
             'detection_index':  det_idx,
         })
         _ros_node._teach_cmd_pub.publish(m)
-        return {"ok": True, "status": "teaching", "part_id": part_id}
+
+        # Give depth_segment_node a moment to write the .npz.
+        import asyncio as _asyncio
+        await _asyncio.sleep(0.6)
+        after = _count()
+        return {
+            "ok":          True,
+            "status":      "captured" if after > before else "no_capture",
+            "part_id":     part_id,
+            "teach_count": after,
+            "captured":    after > before,
+        }
 
     @app.post("/api/parts/{part_id}/teach_clear")
     async def api_parts_teach_clear(part_id: str):
