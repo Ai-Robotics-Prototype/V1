@@ -151,25 +151,27 @@ function PartModel3D({ url, rotation, frontAngle, onFaceClick }) {
 
 // ── Pick-direction arrow (world-space, sits above the part) ─────────
 
-function PickDirectionArrow({ approach, partExtents }) {
+function PickDirectionArrow({ approach, partExtents, offsetCm }) {
   const length = Math.max(...(partExtents || [0.05, 0.05, 0.05])) * 3
+  const offsetM = ((offsetCm ?? 2) / 100) * 2.5  // cm → viewer units
 
   let rotation = [0, 0, 0]
-  let offset   = [0, 0.4, 0]
+  let position = [0, 0.05 + offsetM, 0]
 
   if (approach === 'top_down') {
     rotation = [Math.PI, 0, 0]
-    offset   = [0, 0.35, 0]
+    position = [0, 0.05 + offsetM, 0]
   } else if (approach === 'side') {
     rotation = [0, 0, Math.PI / 2]
-    offset   = [0.35, 0.1, 0]
+    position = [0.05 + offsetM, 0.1, 0]
   } else if (approach === 'angled') {
     rotation = [Math.PI * 0.75, 0, 0]
-    offset   = [0.15, 0.3, 0]
+    const d = offsetM * 0.7071
+    position = [d, 0.05 + d, 0]
   }
 
   return (
-    <group position={offset} rotation={rotation}>
+    <group position={position} rotation={rotation}>
       <mesh position={[0, length / 2, 0]}>
         <cylinderGeometry args={[0.008, 0.008, length, 8]} />
         <meshStandardMaterial color="#16A34A" />
@@ -202,20 +204,21 @@ function SelectedFaceHighlight({ point, normal }) {
 
 // ── Approach arrow pointing along the clicked face's normal ─────────
 
-function PickArrowFromNormal({ normal, point }) {
+function PickArrowFromNormal({ normal, point, offsetCm }) {
+  const offsetM = ((offsetCm ?? 2) / 100) * 2.5  // cm → viewer units
   const { start, quaternion } = useMemo(() => {
     const n = new THREE.Vector3(normal[0], normal[1], normal[2]).normalize()
-    // Stand off 0.25 along the surface normal; arrow points back into surface.
+    const standoff = 0.05 + offsetM
     const s = new THREE.Vector3(
-      point[0] + n.x * 0.25,
-      point[1] + n.y * 0.25,
-      point[2] + n.z * 0.25,
+      point[0] + n.x * standoff,
+      point[1] + n.y * standoff,
+      point[2] + n.z * standoff,
     )
     const defaultDir = new THREE.Vector3(0, -1, 0)
     const targetDir  = n.clone().negate()
     const q = new THREE.Quaternion().setFromUnitVectors(defaultDir, targetDir)
     return { start: s, quaternion: q }
-  }, [normal, point])
+  }, [normal, point, offsetM])
 
   if (!normal || !point) return null
   return (
@@ -230,16 +233,11 @@ function PickArrowFromNormal({ normal, point }) {
         <coneGeometry args={[0.016, 0.035, 12]} />
         <meshStandardMaterial color="#16A34A" />
       </mesh>
-      {/* Ring at the contact point */}
-      <mesh position={[0, -0.03, 0]} rotation={[Math.PI / 2, 0, 0]}>
-        <torusGeometry args={[0.012, 0.002, 8, 16]} />
-        <meshStandardMaterial color="#16A34A" />
-      </mesh>
     </group>
   )
 }
 
-function PartCanvas({ url, rotation, frontAngle, approach, partExtents, selectedFace, onFaceClick }) {
+function PartCanvas({ url, rotation, frontAngle, approach, partExtents, selectedFace, onFaceClick, offsetCm }) {
   return (
     <Canvas shadows camera={{ position: [1.0, 0.8, 1.0], fov: 38 }}
             style={{ width: '100%', height: '100%', background: '#FFFFFF' }}>
@@ -275,10 +273,10 @@ function PartCanvas({ url, rotation, frontAngle, approach, partExtents, selected
       {selectedFace ? (
         <>
           <SelectedFaceHighlight point={selectedFace.point} normal={selectedFace.normal} />
-          <PickArrowFromNormal  normal={selectedFace.normal} point={selectedFace.point} />
+          <PickArrowFromNormal  normal={selectedFace.normal} point={selectedFace.point} offsetCm={offsetCm} />
         </>
       ) : (
-        <PickDirectionArrow approach={approach || 'top_down'} partExtents={partExtents} />
+        <PickDirectionArrow approach={approach || 'top_down'} partExtents={partExtents} offsetCm={offsetCm} />
       )}
       <OrbitControls enableDamping dampingFactor={0.08} />
     </Canvas>
@@ -566,7 +564,8 @@ function PartConfigurator({ partId, onSave, onDelete }) {
       <div style={{ flex: 3, background: '#FFFFFF', position: 'relative' }}>
         <PartCanvas url={stlUrl} rotation={rotation} frontAngle={frontAngle}
                     approach={grasp.approach} partExtents={part?.extents_m}
-                    selectedFace={selectedFace} onFaceClick={handleFaceClick} />
+                    selectedFace={selectedFace} onFaceClick={handleFaceClick}
+                    offsetCm={grasp.pick_offset_cm} />
         <div style={{
           position: 'absolute', top: 12, left: 12,
           background: 'rgba(255,255,255,0.85)', color: '#111827',
