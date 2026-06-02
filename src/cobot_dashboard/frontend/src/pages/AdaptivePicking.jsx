@@ -250,154 +250,6 @@ function PartCanvas({ url, rotation, frontAngle, approach, partExtents, selected
   )
 }
 
-// ── Tagging components (operations, program, station, notes) ────────
-
-const OP_COLORS = {
-  pick:         '#16A34A',
-  place:        '#2563EB',
-  insert:       '#9333EA',
-  inspect:      '#CA8A04',
-  sort:         '#0891B2',
-  assemble:     '#DC2626',
-  package:      '#7C3AED',
-  machine_tend: '#4B5563',
-}
-
-const ALL_OPS = [
-  { id: 'pick',         label: 'Pick',         icon: '🤏' },
-  { id: 'place',        label: 'Place',        icon: '📍' },
-  { id: 'insert',       label: 'Insert',       icon: '🔩' },
-  { id: 'inspect',      label: 'Inspect',      icon: '🔍' },
-  { id: 'sort',         label: 'Sort',         icon: '📊' },
-  { id: 'assemble',     label: 'Assemble',     icon: '🔧' },
-  { id: 'package',      label: 'Package',      icon: '📦' },
-  { id: 'machine_tend', label: 'Machine Tend', icon: '🏭' },
-]
-
-function OperationTags({ selected, onChange }) {
-  const toggle = (id) =>
-    onChange(selected.includes(id) ? selected.filter(o => o !== id) : [...selected, id])
-  return (
-    <div>
-      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 6 }}>
-        Operations
-      </div>
-      <div style={{ fontSize: 11, color: 'var(--text-muted, #9ca3af)', marginBottom: 8 }}>
-        What will the robot do with this part? Select all that apply.
-      </div>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-        {ALL_OPS.map((op) => {
-          const c = OP_COLORS[op.id] || '#666'
-          const active = selected.includes(op.id)
-          return (
-            <button key={op.id} onClick={() => toggle(op.id)}
-              style={{
-                padding: '6px 10px', fontSize: 11, cursor: 'pointer',
-                display: 'flex', alignItems: 'center', gap: 4, borderRadius: 20,
-                background: active ? `${c}28`               : 'var(--bg-surface)',
-                color:      active ? c                       : 'var(--text-muted, #9ca3af)',
-                border:     active ? `1px solid ${c}80`      : '1px solid var(--border)',
-                fontWeight: active ? 600 : 400,
-              }}
-            >
-              <span>{op.icon}</span><span>{op.label}</span>
-            </button>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-function ProgramLinker({ programId, onChange }) {
-  const [programs, setPrograms] = useState([])
-  useEffect(() => {
-    fetch('/api/programs')
-      .then(r => r.json())
-      .then(d => setPrograms(d.programs || []))
-      .catch(() => setPrograms([]))
-  }, [])
-  return (
-    <div>
-      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 6 }}>
-        Robot Program
-      </div>
-      <div style={{ fontSize: 11, color: 'var(--text-muted, #9ca3af)', marginBottom: 8 }}>
-        Link this part to a specific robot program
-      </div>
-      <select value={programId || ''}
-        onChange={(e) => {
-          const id = e.target.value || null
-          const prog = id ? programs.find((p) => p.id === id) : null
-          onChange(id, prog?.name || '')
-        }}
-        style={{
-          width: '100%', padding: 8, fontSize: 12,
-          background: 'var(--bg-surface)', color: 'var(--text-primary)',
-          border: '1px solid var(--border)', borderRadius: 'var(--radius-sm, 4px)',
-        }}
-      >
-        <option value="">No program linked</option>
-        {programs.map((p) => (
-          <option key={p.id} value={p.id}>
-            {p.name} ({p.steps} steps)
-          </option>
-        ))}
-      </select>
-    </div>
-  )
-}
-
-function StationPriority({ station, priority, onStationChange, onPriorityChange }) {
-  return (
-    <div style={{ display: 'flex', gap: 12 }}>
-      <div style={{ flex: 1 }}>
-        <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>Station</div>
-        <input type="text" value={station}
-          onChange={(e) => onStationChange(e.target.value)}
-          placeholder="e.g. Station A"
-          style={{
-            width: '100%', padding: 8, fontSize: 12,
-            background: 'var(--bg-surface)', color: 'var(--text-primary)',
-            border: '1px solid var(--border)', borderRadius: 'var(--radius-sm, 4px)',
-          }}
-        />
-      </div>
-      <div style={{ width: 120 }}>
-        <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>
-          Priority: {priority}
-        </div>
-        <input type="range" min="1" max="5" step="1" value={priority}
-          onChange={(e) => onPriorityChange(parseInt(e.target.value, 10))}
-          style={{ width: '100%' }}
-        />
-        <div style={{
-          display: 'flex', justifyContent: 'space-between',
-          fontSize: 9, color: 'var(--text-muted, #9ca3af)',
-        }}><span>High</span><span>Low</span></div>
-      </div>
-    </div>
-  )
-}
-
-function PartNotes({ notes, onChange }) {
-  return (
-    <div>
-      <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>Notes</div>
-      <textarea value={notes} rows={3}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder="Any special handling instructions…"
-        style={{
-          width: '100%', padding: 8, fontSize: 12, resize: 'vertical',
-          background: 'var(--bg-surface)', color: 'var(--text-primary)',
-          border: '1px solid var(--border)', borderRadius: 'var(--radius-sm, 4px)',
-          fontFamily: 'inherit',
-        }}
-      />
-    </div>
-  )
-}
-
 // ── Configurator ─────────────────────────────────────────────────────
 
 function PartConfigurator({ partId, onSave, onDelete }) {
@@ -406,12 +258,6 @@ function PartConfigurator({ partId, onSave, onDelete }) {
   const [rotation, setRotation]   = useState(SURFACE_OPTIONS[0].rotation)
   const [frontDir, setFrontDir]   = useState(FRONT_OPTIONS[0].label)
   const [frontAngle, setFAng]     = useState(0)
-  const [operations,  setOperations]  = useState([])
-  const [programId,   setProgramId]   = useState(null)
-  const [programName, setProgramName] = useState('')
-  const [station,     setStation]     = useState('')
-  const [priority,    setPriority]    = useState(3)
-  const [notes,       setNotes]       = useState('')
   const [grasp, setGrasp]         = useState({
     approach:       'top_down',
     pick_offset_cm: 2.0,
@@ -419,6 +265,7 @@ function PartConfigurator({ partId, onSave, onDelete }) {
   // selectedFace = { normal: [x,y,z], point: [x,y,z], approach: 'top_down'|'side'|'angled' }
   const [selectedFace, setSelectedFace] = useState(null)
   const [saving, setSaving]       = useState(false)
+  const [saveStatus, setSaveStatus] = useState(null)  // null | 'saved' | error string
 
   const handleFaceClick = (faceData) => {
     setSelectedFace(faceData)
@@ -448,12 +295,6 @@ function PartConfigurator({ partId, onSave, onDelete }) {
         if (d.table_rotation)  setRotation(d.table_rotation)
         if (d.front_direction) setFrontDir(d.front_direction)
         if (d.front_angle_deg !== undefined) setFAng(d.front_angle_deg)
-        if (Array.isArray(d.operations))     setOperations(d.operations)
-        if (d.program_id)                    setProgramId(d.program_id)
-        if (d.program_name)                  setProgramName(d.program_name)
-        if (d.station)                       setStation(d.station)
-        if (typeof d.priority === 'number')  setPriority(d.priority)
-        if (d.notes)                         setNotes(d.notes)
         if (d.grasp) {
           const g = {
             approach:       d.grasp.approach || 'top_down',
@@ -474,9 +315,10 @@ function PartConfigurator({ partId, onSave, onDelete }) {
   }, [partId])
 
   async function save() {
+    if (!partId) return
     setSaving(true)
     try {
-      const cfgRes = await fetch(`/api/parts/${partId}/config`, {
+      const res = await fetch(`/api/parts/${partId}/config`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -488,27 +330,20 @@ function PartConfigurator({ partId, onSave, onDelete }) {
           grasp: { ...grasp },
         }),
       })
-      const tagRes = await fetch(`/api/parts/${partId}/tags`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          operations,
-          program_id:   programId,
-          program_name: programName,
-          station,
-          priority,
-          notes,
-        }),
-      })
-      const cfgD = await cfgRes.json()
-      const tagD = await tagRes.json()
-      if (cfgRes.ok && tagRes.ok) {
-        // tagRes is freshest — it overwrote the same file last.
-        setPart(tagD.part || cfgD.part)
+      const data = await res.json().catch(() => ({}))
+      if (res.ok) {
+        if (data.part) setPart(data.part)
+        setSaveStatus('saved')
+        setTimeout(() => setSaveStatus(null), 2000)
         onSave?.()
       } else {
-        console.warn('save error:', cfgD.error || tagD.error)
+        const msg = data.error || `HTTP ${res.status}`
+        setSaveStatus(`error: ${msg}`)
+        setTimeout(() => setSaveStatus(null), 3000)
       }
+    } catch (e) {
+      setSaveStatus(`error: ${e.message}`)
+      setTimeout(() => setSaveStatus(null), 3000)
     } finally {
       setSaving(false)
     }
@@ -666,22 +501,6 @@ function PartConfigurator({ partId, onSave, onDelete }) {
           </div>
         </div>
 
-        {/* Operation tags */}
-        <OperationTags selected={operations} onChange={setOperations} />
-
-        {/* Robot program link */}
-        <ProgramLinker programId={programId}
-          onChange={(id, name) => { setProgramId(id); setProgramName(name) }}
-        />
-
-        {/* Station + priority */}
-        <StationPriority station={station} priority={priority}
-          onStationChange={setStation} onPriorityChange={setPriority}
-        />
-
-        {/* Free-text notes */}
-        <PartNotes notes={notes} onChange={setNotes} />
-
         {/* Actions */}
         <div style={{
           display: 'flex', gap: 8,
@@ -689,10 +508,22 @@ function PartConfigurator({ partId, onSave, onDelete }) {
           borderTop: '1px solid var(--border)',
         }}>
           <button onClick={save} disabled={saving} style={{
-            flex: 1, padding: 10, fontSize: 13, fontWeight: 600, cursor: 'pointer',
-            background: 'rgba(34,197,94,0.18)', color: '#22c55e',
-            border: '1px solid rgba(34,197,94,0.6)', borderRadius: 'var(--radius-md, 6px)',
-          }}>{saving ? 'Saving…' : 'Save Configuration'}</button>
+            flex: 1, padding: 10, fontSize: 13, fontWeight: 600,
+            cursor: saving ? 'wait' : 'pointer',
+            background: saveStatus === 'saved' ? 'rgba(34,197,94,0.32)'
+                      : saveStatus && saveStatus.startsWith('error') ? 'rgba(239,68,68,0.18)'
+                      : 'rgba(34,197,94,0.18)',
+            color: saveStatus && saveStatus.startsWith('error') ? '#ef4444' : '#22c55e',
+            border: saveStatus && saveStatus.startsWith('error')
+              ? '1px solid rgba(239,68,68,0.6)'
+              : '1px solid rgba(34,197,94,0.6)',
+            borderRadius: 'var(--radius-md, 6px)',
+          }}>
+            {saving ? 'Saving…'
+              : saveStatus === 'saved' ? '✓ Saved!'
+              : saveStatus && saveStatus.startsWith('error') ? saveStatus
+              : 'Save Configuration'}
+          </button>
           <button onClick={onDelete} style={{
             padding: '10px 16px', fontSize: 13, cursor: 'pointer',
             background: 'rgba(239,68,68,0.12)', color: '#ef4444',
