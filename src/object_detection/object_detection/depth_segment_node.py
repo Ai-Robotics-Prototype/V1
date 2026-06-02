@@ -2122,6 +2122,62 @@ class DepthSegmentNode(Node):
             draw.line([(float(u0), float(v0)), (float(u1), float(v1))],
                       fill=color, width=3)
 
+    @staticmethod
+    def _min_area_rect_2d(mask, offset_x=0, offset_y=0):
+        """Minimum-area rotated rectangle around a 2D binary mask.
+
+        Returns 4 corner points (4x2) in full-image coordinates, or None
+        if the mask is too sparse / degenerate. Computed in pixel space
+        via convex hull + rotating calipers — no 3D projection, so no
+        depth-noise offset between box and actual silhouette.
+        """
+        from scipy.spatial import ConvexHull
+        from scipy.spatial.qhull import QhullError
+
+        ys, xs = np.where(mask)
+        if xs.size < 5:
+            return None
+        pts = np.column_stack(
+            [xs + offset_x, ys + offset_y]).astype(np.float64)
+        try:
+            hull = ConvexHull(pts)
+        except (QhullError, ValueError):
+            return None
+        hpts = pts[hull.vertices]
+        if len(hpts) < 3:
+            return None
+
+        best_area = float('inf')
+        best_corners = None
+        n_h = len(hpts)
+        for i in range(n_h):
+            edge = hpts[(i + 1) % n_h] - hpts[i]
+            angle = math.atan2(float(edge[1]), float(edge[0]))
+            ca = math.cos(-angle)
+            sa = math.sin(-angle)
+            rotated = np.column_stack([
+                hpts[:, 0] * ca - hpts[:, 1] * sa,
+                hpts[:, 0] * sa + hpts[:, 1] * ca,
+            ])
+            mn = rotated.min(axis=0)
+            mx = rotated.max(axis=0)
+            area = float((mx[0] - mn[0]) * (mx[1] - mn[1]))
+            if area > 0 and area < best_area:
+                best_area = area
+                corners_rot = np.array([
+                    [mn[0], mn[1]],
+                    [mx[0], mn[1]],
+                    [mx[0], mx[1]],
+                    [mn[0], mx[1]],
+                ])
+                ca_back = math.cos(angle)
+                sa_back = math.sin(angle)
+                best_corners = np.column_stack([
+                    corners_rot[:, 0] * ca_back - corners_rot[:, 1] * sa_back,
+                    corners_rot[:, 0] * sa_back + corners_rot[:, 1] * ca_back,
+                ])
+        return best_corners
+
     def _publish_annotated(self, objects, h, w):
         rgb = self._color_rgb
         if rgb is None or rgb.shape[0] != h or rgb.shape[1] != w:
@@ -2144,72 +2200,72 @@ class DepthSegmentNode(Node):
             else:
                 col = self._dist_color(pz)
 
-            # Full 3D OBB wireframe (12 edges) in the detection color
-            # IS the primary box — no separate axis-aligned rect, no
-            # separate cyan overlay. Falls back to a slightly-inset
-            # axis-aligned rect only when the detection has no OBB.
-            obb_proj = None
-            if o.get('obb') and o.get('corners') is not None:
-                obb_proj = self._project(np.asarray(o['corners']), w, h)
-                if obb_proj is not None:
-                    self._draw_obb_wireframe(draw, obb_proj, col)
-            if obb_proj is None:
-                draw.rectangle(
-                    [x0 + 2, y0 + 2, x1 - 2, y1 - 2],
-                    outline=col, width=2)
+            # Pixel-space minimum-area rotated rectangle around the
+            # cleaned mask. Drawing from mask pixels (not from projected
+            # 3D corners) means the box always sits exactly on the
+            # silhouette regardless of depth noise. The 3D OBB is still
+            # what gets published for grasp planning.
+            mask_2d = o.get('mask_2d')
+            rect_corners = None
+            if mask_2d is not None and mask_2d.any():
+                rect_corners = self._min_area_rect_2d(
+                    mask_2d, offset_x=x0, offset_y=y0)
 
-            # Cyan orientation arrow at the bbox centre, pointing along
-            # the OBB's yaw. Image-frame angle = the OBB's yaw component
-            # (rotation about cam-Z = optical axis = image normal).
+            if rect_corners is not None:
+                for i in range(4):
+                    p1 = (int(round(rect_corners[i][0])),
+                          int(round(rect_corners[i][1])))
+                    p2 = (int(round(rect_corners[(i + 1) % 4][0])),
+                          int(round(rect_corners[(i + 1) % 4][1])))
+                    draw.line([p1, p2], fill=col, width=3)
+                top_y = int(np.min(rect_corners[:, 1]))
+                left_x = int(np.min(rect_corners[:, 0]))
+                cx_box = float(np.mean(rect_corners[:, 0]))
+                cy_box = float(np.mean(rect_corners[:, 1]))
+            else:
+                draw.rectangle(
+                    [x0 + 1, y0 + 1, x1 - 1, y1 - 1],
+                    outline=col, width=2)
+                top_y = y0
+                left_x = x0
+                cx_box = (x0 + x1) * 0.5
+                cy_box = (y0 + y1) * 0.5
+
+            # Cyan orientation arrow at the rect centre, pointing along
+            # the OBB yaw (rotation about cam-Z = optical axis).
             yaw_deg = yaw * 180.0 / math.pi
-            cx_box = (x0 + x1) * 0.5
-            cy_box = (y0 + y1) * 0.5
-            arrow_len = max(x1 - x0, y1 - y0) * 0.4
+            arrow_len = max(x1 - x0, y1 - y0) * 0.35
             ex = cx_box + arrow_len * math.cos(yaw)
             ey = cy_box + arrow_len * math.sin(yaw)
             cyan = (0, 220, 255)
             draw.line([(cx_box, cy_box), (ex, ey)], fill=cyan, width=2)
-            head = max(6.0, arrow_len * 0.20)
+            head = max(5.0, arrow_len * 0.18)
             for a in (yaw + 2.6, yaw - 2.6):
                 draw.line([(ex, ey),
                            (ex - head * math.cos(a), ey - head * math.sin(a))],
                           fill=cyan, width=2)
 
-            # Yaw is the only meaningful rotation (yaw-only OBB); size
-            # collapsed to the two XY dims for a top-down read.
             w_cm = int(round(sx * 100))
             h_cm = int(round(sy * 100))
             holes = o.get('_holes') or []
             n_holes = len(holes)
             if matched:
                 pct = int(round(float(o.get('match_score') or 0) * 100))
-                hole_tag = f' [{n_holes} holes]' if n_holes else ''
+                hole_tag = f' [{n_holes}h]' if n_holes else ''
                 if pos_ok:
-                    label = f"{o['part_name']} ({pct}%){hole_tag} ✓  {pz:.2f}m"
+                    label = f"{o['part_name']} ({pct}%){hole_tag} ✓ {pz:.2f}m"
                 else:
                     yaw_err = float(o.get('yaw_error_deg') or 0.0)
                     label = (f"{o['part_name']} ({pct}%){hole_tag} "
-                             f"⚠ yaw:{yaw_err:.0f}° off")
+                             f"⚠ yaw:{yaw_err:.0f}°")
             else:
-                label = f'{pz:.2f}m  {w_cm}×{h_cm}cm  yaw:{yaw_deg:+.0f}°'
-            # Matched parts get the bigger bold font; unknown objects use
-            # a slightly smaller regular font. Both labels sit in a
-            # solid-filled rectangle so they read against any background.
+                label = f'{pz:.2f}m {w_cm}×{h_cm}cm yaw:{yaw_deg:+.0f}°'
             label_font = _ANNOT_FONT if matched else _ANNOT_FONT_SMALL
             bbox_text = draw.textbbox((0, 0), label, font=label_font)
             tw = bbox_text[2] - bbox_text[0] + 8
             th = bbox_text[3] - bbox_text[1] + 6
-            # Anchor the label at the top-left of the projected OBB so it
-            # sits above the actual rotated box, not above an inflated
-            # axis-aligned bbox.
-            if obb_proj is not None:
-                top_y = float(np.min(obb_proj[:, 1]))
-                left_x = float(np.min(obb_proj[:, 0]))
-                label_x = max(0, int(left_x))
-                label_y = max(0, int(top_y) - th - 2)
-            else:
-                label_x = x0
-                label_y = max(0, y0 - th - 2)
+            label_x = max(0, int(left_x))
+            label_y = max(0, int(top_y) - th - 2)
             draw.rectangle([label_x, label_y, label_x + tw, label_y + th],
                            fill=col)
             draw.text((label_x + 4, label_y + 2), label,
