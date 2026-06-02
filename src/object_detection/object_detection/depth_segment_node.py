@@ -119,7 +119,7 @@ class DepthSegmentNode(Node):
         self.declare_parameter('split_threshold_m',  0.01)
         self.declare_parameter('max_bbox_area_px',   40000)
         self.declare_parameter('publish_rate_hz',    15.0)
-        self.declare_parameter('bbox_pad_px',        5)
+        self.declare_parameter('bbox_pad_px',        2)
         # Per-camera topics so one node can serve cam0 and another cam1
         self.declare_parameter('depth_topic',      '/cam0/cam0/aligned_depth_to_color/image_raw')
         self.declare_parameter('color_topic',      '/cam0/cam0/color/image_raw')
@@ -2101,7 +2101,7 @@ class DepthSegmentNode(Node):
             u0, v0 = corners_2d[a]
             u1, v1 = corners_2d[b]
             draw.line([(float(u0), float(v0)), (float(u1), float(v1))],
-                      fill=color, width=2)
+                      fill=color, width=3)
 
     def _publish_annotated(self, objects, h, w):
         rgb = self._color_rgb
@@ -2125,42 +2125,19 @@ class DepthSegmentNode(Node):
             else:
                 col = self._dist_color(pz)
 
-            # Rotated 2D bbox that follows the OBB orientation. Prefer
-            # the OBB's bottom face (corners with sz=-1) projected to
-            # image space — that's the tightest 4-point quad. Falls back
-            # to rotating the axis-aligned bbox by yaw if no OBB exists.
-            drew_rotated = False
-            corners_3d = o.get('corners')
-            if corners_3d is not None and len(corners_3d) == 8:
-                proj = self._project(np.asarray(corners_3d), w, h)
-                if proj is not None:
-                    # Indices [0, 2, 6, 4] walk the bottom face in order.
-                    face = [proj[i] for i in (0, 2, 6, 4)]
-                    for i in range(4):
-                        p1 = (int(face[i][0]),       int(face[i][1]))
-                        p2 = (int(face[(i + 1) % 4][0]),
-                              int(face[(i + 1) % 4][1]))
-                        draw.line([p1, p2], fill=col, width=3)
-                    drew_rotated = True
-            if not drew_rotated:
-                yaw_draw = (o.get('euler') or (0.0, 0.0, 0.0))[2]
-                cx_b = (x0 + x1) * 0.5
-                cy_b = (y0 + y1) * 0.5
-                hw = (x1 - x0) * 0.5
-                hh = (y1 - y0) * 0.5
-                cs = math.cos(yaw_draw)
-                sn = math.sin(yaw_draw)
-                quad = [
-                    (cx_b + hw * cs - hh * sn, cy_b + hw * sn + hh * cs),
-                    (cx_b - hw * cs - hh * sn, cy_b - hw * sn + hh * cs),
-                    (cx_b - hw * cs + hh * sn, cy_b - hw * sn - hh * cs),
-                    (cx_b + hw * cs + hh * sn, cy_b + hw * sn - hh * cs),
-                ]
-                for i in range(4):
-                    p1 = (int(quad[i][0]),       int(quad[i][1]))
-                    p2 = (int(quad[(i + 1) % 4][0]),
-                          int(quad[(i + 1) % 4][1]))
-                    draw.line([p1, p2], fill=col, width=3)
+            # Full 3D OBB wireframe (12 edges) in the detection color
+            # IS the primary box — no separate axis-aligned rect, no
+            # separate cyan overlay. Falls back to a slightly-inset
+            # axis-aligned rect only when the detection has no OBB.
+            obb_proj = None
+            if o.get('obb') and o.get('corners') is not None:
+                obb_proj = self._project(np.asarray(o['corners']), w, h)
+                if obb_proj is not None:
+                    self._draw_obb_wireframe(draw, obb_proj, col)
+            if obb_proj is None:
+                draw.rectangle(
+                    [x0 + 2, y0 + 2, x1 - 2, y1 - 2],
+                    outline=col, width=2)
 
             # Cyan orientation arrow at the bbox centre, pointing along
             # the OBB's yaw. Image-frame angle = the OBB's yaw component
@@ -2203,9 +2180,20 @@ class DepthSegmentNode(Node):
             bbox_text = draw.textbbox((0, 0), label, font=label_font)
             tw = bbox_text[2] - bbox_text[0] + 8
             th = bbox_text[3] - bbox_text[1] + 6
-            label_y = max(0, y0 - th - 2)
-            draw.rectangle([x0, label_y, x0 + tw, label_y + th], fill=col)
-            draw.text((x0 + 4, label_y + 2), label,
+            # Anchor the label at the top-left of the projected OBB so it
+            # sits above the actual rotated box, not above an inflated
+            # axis-aligned bbox.
+            if obb_proj is not None:
+                top_y = float(np.min(obb_proj[:, 1]))
+                left_x = float(np.min(obb_proj[:, 0]))
+                label_x = max(0, int(left_x))
+                label_y = max(0, int(top_y) - th - 2)
+            else:
+                label_x = x0
+                label_y = max(0, y0 - th - 2)
+            draw.rectangle([label_x, label_y, label_x + tw, label_y + th],
+                           fill=col)
+            draw.text((label_x + 4, label_y + 2), label,
                       fill=(255, 255, 255), font=label_font)
 
             # Hole markers — small cyan circles at each detected hole.
