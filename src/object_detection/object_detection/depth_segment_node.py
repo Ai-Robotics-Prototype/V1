@@ -1017,7 +1017,26 @@ class DepthSegmentNode(Node):
             x1 = min(w, xmax_img + tight_pad)
             y1 = min(h, ymax_img + tight_pad)
             sub_d = depth[y0:y1, x0:x1]
-            sub_fg = foreground[y0:y1, x0:x1]
+            # Recompute the single-component clean mask in the *tight*
+            # bbox so the deprojection only sees this object's pixels —
+            # not morphological inflation, not neighbouring blobs that
+            # leak in via foreground's dilate/fill_holes steps.
+            sub_fg_raw = foreground[y0:y1, x0:x1]
+            sub_labeled_t, sub_count_t = ndimage.label(sub_fg_raw)
+            if sub_count_t == 0:
+                continue
+            if sub_count_t > 1:
+                sizes_t = ndimage.sum(
+                    sub_fg_raw, sub_labeled_t, range(1, sub_count_t + 1))
+                sub_fg = sub_labeled_t == (int(np.argmax(sizes_t)) + 1)
+            else:
+                sub_fg = sub_fg_raw.astype(bool)
+            sub_fg = ndimage.binary_opening(
+                sub_fg, structure=np.ones((3, 3), dtype=bool), iterations=1)
+            sub_fg = ndimage.binary_closing(
+                sub_fg, structure=np.ones((3, 3), dtype=bool), iterations=1)
+            if not sub_fg.any():
+                sub_fg = sub_fg_raw.astype(bool)
             bbox_area = (x1 - x0) * (y1 - y0)
 
             # Vectorised deprojection of every foreground pixel in the bbox
