@@ -27,7 +27,7 @@ def generate_launch_description():
         DeclareLaunchArgument('min_object_area_px', default_value='50'),
         DeclareLaunchArgument('floor_tolerance_m',  default_value='0.015'),
         DeclareLaunchArgument('erode_kernel',       default_value='2'),
-        DeclareLaunchArgument('dilate_kernel',      default_value='9'),
+        DeclareLaunchArgument('dilate_kernel',      default_value='7'),
         DeclareLaunchArgument('publish_rate_hz',    default_value='15.0'),
     ]
 

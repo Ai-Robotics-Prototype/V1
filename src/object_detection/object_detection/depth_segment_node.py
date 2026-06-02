@@ -111,7 +111,7 @@ class DepthSegmentNode(Node):
         self.declare_parameter('min_object_area_px', 50)
         self.declare_parameter('floor_tolerance_m',  0.015)
         self.declare_parameter('erode_kernel',       2)
-        self.declare_parameter('dilate_kernel',      9)
+        self.declare_parameter('dilate_kernel',      7)
         self.declare_parameter('edge_threshold_m',   0.05)
         self.declare_parameter('rgb_edge_threshold', 30.0)
         self.declare_parameter('merge_edge_dist_px', 20)
@@ -969,8 +969,53 @@ class DepthSegmentNode(Node):
         # Build per-object detections (tight bbox + pad, 3D OBB via PCA)
         objects = []
         for (x0, y0, x1, y1) in bboxes:
-            x0 = max(0, x0 - self.pad); y0 = max(0, y0 - self.pad)
-            x1 = min(w, x1 + self.pad); y1 = min(h, y1 + self.pad)
+            # Recover the largest connected component within the (possibly
+            # merged) bbox, then clean it with a 3x3 opening + closing so
+            # speckle pixels don't inflate the box. The bbox finally
+            # reported is the *cleaned* mask's extent, not the raw
+            # component-stats slice.
+            sub_fg_initial = foreground[y0:y1, x0:x1]
+            if not sub_fg_initial.any():
+                continue
+            sub_labeled, sub_count = ndimage.label(sub_fg_initial)
+            if sub_count == 0:
+                continue
+            if sub_count > 1:
+                sizes = ndimage.sum(
+                    sub_fg_initial, sub_labeled, range(1, sub_count + 1))
+                largest = int(np.argmax(sizes)) + 1
+                component_mask = sub_labeled == largest
+            else:
+                component_mask = sub_fg_initial.astype(bool)
+
+            clean_mask = ndimage.binary_opening(
+                component_mask, structure=np.ones((3, 3), dtype=bool),
+                iterations=1)
+            clean_mask = ndimage.binary_closing(
+                clean_mask, structure=np.ones((3, 3), dtype=bool),
+                iterations=1)
+
+            sub_labeled2, sub_count2 = ndimage.label(clean_mask)
+            if sub_count2 == 0:
+                continue
+            if sub_count2 > 1:
+                sizes2 = ndimage.sum(
+                    clean_mask, sub_labeled2, range(1, sub_count2 + 1))
+                largest2 = int(np.argmax(sizes2)) + 1
+                clean_mask = sub_labeled2 == largest2
+
+            obj_pixels_y, obj_pixels_x = np.where(clean_mask)
+            if obj_pixels_y.size == 0:
+                continue
+            tight_pad = 3
+            xmin_img = x0 + int(obj_pixels_x.min())
+            ymin_img = y0 + int(obj_pixels_y.min())
+            xmax_img = x0 + int(obj_pixels_x.max()) + 1
+            ymax_img = y0 + int(obj_pixels_y.max()) + 1
+            x0 = max(0, xmin_img - tight_pad)
+            y0 = max(0, ymin_img - tight_pad)
+            x1 = min(w, xmax_img + tight_pad)
+            y1 = min(h, ymax_img + tight_pad)
             sub_d = depth[y0:y1, x0:x1]
             sub_fg = foreground[y0:y1, x0:x1]
             bbox_area = (x1 - x0) * (y1 - y0)
@@ -2116,12 +2161,6 @@ class DepthSegmentNode(Node):
                     p2 = (int(quad[(i + 1) % 4][0]),
                           int(quad[(i + 1) % 4][1]))
                     draw.line([p1, p2], fill=col, width=3)
-
-            # Cyan OBB wireframe (projected from the 8 3D corners).
-            if o.get('obb') and o.get('corners') is not None:
-                proj = self._project(o['corners'], w, h)
-                if proj is not None:
-                    self._draw_obb_wireframe(draw, proj, (0, 220, 255))
 
             # Cyan orientation arrow at the bbox centre, pointing along
             # the OBB's yaw. Image-frame angle = the OBB's yaw component
