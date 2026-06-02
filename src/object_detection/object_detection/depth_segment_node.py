@@ -1276,19 +1276,74 @@ class DepthSegmentNode(Node):
         features['holes'] = holes
         features['num_holes'] = int(num_holes)
 
-        # 2) Resize to 32x32 for matcher consumption.
-        fy = 32.0 / mask_crop.shape[0]
-        fx = 32.0 / mask_crop.shape[1]
+        # 1b) Depth-discontinuity hole detection — a through-hole shows
+        # up as the table surface peeking through the object outline,
+        # i.e. a sharp depth increase relative to the object median.
+        # The mask alone misses these because the depth there is valid.
+        if valid.any() and height_range > 0.003:
+            obj_median_depth = float(np.median(depth_crop[valid]))
+            deep_mask = (mask_crop
+                         & (depth_crop > obj_median_depth + 0.015)
+                         & (depth_crop > 0))
+            deep_filled = _fill(mask_crop)
+            deep_voids = deep_filled & deep_mask
+
+            if deep_voids.any():
+                labeled_deep, num_deep = _label(deep_voids)
+                for h in range(1, int(num_deep) + 1):
+                    hy, hx = np.where(labeled_deep == h)
+                    area = int(len(hy))
+                    if area < 20:
+                        continue
+                    cy = float(np.mean(hy)) / mask_crop.shape[0]
+                    cx = float(np.mean(hx)) / mask_crop.shape[1]
+                    radius = float(np.sqrt(area / np.pi)) / max(mask_crop.shape)
+
+                    is_dup = False
+                    for existing in holes:
+                        ec = existing['center']
+                        dist = ((cx - ec[0]) ** 2 + (cy - ec[1]) ** 2) ** 0.5
+                        if dist < 0.1:
+                            is_dup = True
+                            break
+                    if is_dup:
+                        continue
+                    holes.append({
+                        'center':      [round(cx, 3), round(cy, 3)],
+                        'radius_norm': round(radius, 4),
+                        'area_norm':   round(area / max(mask_crop.size, 1), 4),
+                    })
+                    num_holes += 1
+
+            features['holes'] = holes
+            features['num_holes'] = int(num_holes)
+
+        # 2) Pad to a square BEFORE resizing to 32x32 so the camera crop
+        # keeps its aspect ratio (the CAD side also pads to square). A
+        # rectangular crop zoomed straight to 32x32 stretches the part
+        # and tanks the height-map NCC.
+        h_crop, w_crop = mask_crop.shape[:2]
+        max_dim = max(h_crop, w_crop)
+        pad_y = (max_dim - h_crop) // 2
+        pad_x = (max_dim - w_crop) // 2
+
+        norm_depth_sq = np.zeros((max_dim, max_dim), dtype=np.float32)
+        norm_depth_sq[pad_y:pad_y + h_crop, pad_x:pad_x + w_crop] = norm_depth
+        mask_sq = np.zeros((max_dim, max_dim), dtype=bool)
+        mask_sq[pad_y:pad_y + h_crop, pad_x:pad_x + w_crop] = mask_crop
+
+        fy = 32.0 / max_dim
+        fx = 32.0 / max_dim
         try:
-            height_32 = _zoom(norm_depth, (fy, fx), order=1)
+            height_32 = _zoom(norm_depth_sq, (fy, fx), order=1)
             features['height_map_32'] = height_32
         except Exception:
             pass
 
         # 3) Edge map (depth discontinuities) — same as CAD side.
         try:
-            edge_x = _sobel(norm_depth, axis=1)
-            edge_y = _sobel(norm_depth, axis=0)
+            edge_x = _sobel(norm_depth_sq, axis=1)
+            edge_y = _sobel(norm_depth_sq, axis=0)
             edge_mag = np.sqrt(edge_x ** 2 + edge_y ** 2)
             edge_32 = _zoom(edge_mag, (fy, fx), order=1)
             features['edge_map_32'] = edge_32
@@ -1297,7 +1352,7 @@ class DepthSegmentNode(Node):
 
         # 4) Outline at 32x32 for downstream debug / future use.
         try:
-            outline_32 = _zoom(mask_crop.astype(float), (fy, fx), order=0) > 0.5
+            outline_32 = _zoom(mask_sq.astype(float), (fy, fx), order=0) > 0.5
             features['outline_32'] = outline_32
         except Exception:
             pass
@@ -1368,6 +1423,27 @@ class DepthSegmentNode(Node):
             else:
                 best_name, best_id, best_score = None, None, 0.0
                 match_source = ''
+
+            # Diagnostic logging — anything that even comes close is
+            # worth logging so we can see WHY false positives happen.
+            if best_score > 0.3:
+                gf_holes = 0
+                if best_id:
+                    pm = next((p for p in library_parts
+                               if p.get('id') == best_id), None)
+                    if pm:
+                        gf_holes = int(
+                            (pm.get('geometric_features') or {})
+                            .get('num_holes', 0) or 0
+                        )
+                self.get_logger().info(
+                    f'MATCH: {best_name} score={best_score:.2f} '
+                    f'src={match_source} '
+                    f'holes:{det_features.get("num_holes", 0)}vs{gf_holes} '
+                    f'size:{[round(s * 100, 1) for s in size_m]}cm '
+                    f'reason:{geo_reason}',
+                    throttle_duration_sec=2.0,
+                )
 
             # Stash hole list + reason for annotation drawing.
             o['_holes']        = det_features.get('holes', []) if det_features else []

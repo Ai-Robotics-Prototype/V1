@@ -218,19 +218,36 @@ def match_geometry(
         scores['aspect'] = (min(cad_aspect, det_aspect)
                             / max(cad_aspect, det_aspect, 0.01))
 
+        # If both CAD and detection are very flat, height/edge maps are
+        # useless (both are mostly zero so NCC noise dominates).
+        cad_height_range = float(gf.get('height_range', 0) or 0)
+        det_height_range = float(det_features.get('height_range', 0) or 0)
+        flat_object = (cad_height_range < 0.005 and det_height_range < 0.005)
+
         # WEIGHTED TOTAL — holes carry the most weight; only the keys
         # that actually have a score contribute, and the denominator is
         # the sum of *used* weights (so a part with no holes isn't
         # punished for missing hole_pattern/hole_size).
-        weights = {
-            'holes':        0.25,
-            'hole_pattern': 0.15,
-            'hole_size':    0.05,
-            'height':       0.20,
-            'edges':        0.10,
-            'size':         0.15,
-            'aspect':       0.10,
-        }
+        if flat_object:
+            scores.pop('height', None)
+            scores.pop('edges', None)
+            weights = {
+                'holes':        0.35,
+                'hole_pattern': 0.15,
+                'hole_size':    0.05,
+                'size':         0.30,
+                'aspect':       0.15,
+            }
+        else:
+            weights = {
+                'holes':        0.25,
+                'hole_pattern': 0.15,
+                'hole_size':    0.05,
+                'height':       0.20,
+                'edges':        0.10,
+                'size':         0.15,
+                'aspect':       0.10,
+            }
         total = 0.0; used = 0.0
         for key, w in weights.items():
             if key in scores:
@@ -245,12 +262,33 @@ def match_geometry(
         if scores.get('holes', 0.0) < 0.1 and (cad_holes_n > 0 or det_holes_n > 0):
             total *= 0.3
 
+        # HARD REJECT: CAD has holes but the camera sees none. Holes are
+        # the most distinctive feature; if the part should have visible
+        # holes and we see none, it's not this part — unless the part is
+        # tiny enough that the holes may be sub-pixel.
+        if cad_holes_n > 0 and det_holes_n == 0:
+            part_area = float(gf.get('part_width_m', 0.05) or 0.05) * \
+                        float(gf.get('part_height_m', 0.05) or 0.05)
+            if part_area > 0.001:  # > 10 cm² — holes should be visible
+                total = 0.0
+                reasons.append('REJECT:holes_missing')
+
         if total > best_score:
             best_score  = total
             best_part   = part
             best_reason = ' '.join(reasons)
 
-    if best_part is None or best_score < MIN_MATCH_SCORE:
+    # Dynamic threshold based on library size — a single-part library has
+    # no competition to filter out weak matches, so raise the bar.
+    num_parts = len(parts)
+    if num_parts <= 1:
+        effective_threshold = 0.70
+    elif num_parts <= 3:
+        effective_threshold = 0.60
+    else:
+        effective_threshold = MIN_MATCH_SCORE
+
+    if best_part is None or best_score < effective_threshold:
         return None, 0.0, ''
     return best_part, round(best_score, 3), best_reason
 
