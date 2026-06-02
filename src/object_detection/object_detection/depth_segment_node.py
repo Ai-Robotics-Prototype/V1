@@ -155,6 +155,16 @@ class DepthSegmentNode(Node):
         self._K         = None     # (fx, fy, cx, cy)
         self._uv_cache  = None     # cached pixel grids keyed by (h, w)
         self._history   = collections.deque(maxlen=3)  # last 3 frames of detections
+        self._depth_buffer = collections.deque(maxlen=3)  # temporal noise-reduce raw depth
+
+        # Per-detection EMA tracker — matches new detections to a track from
+        # the previous frame by IoU and smooths bbox / pos / size / yaw so
+        # the annotation stops bouncing across small depth-noise changes.
+        self._tracks = {}          # track_id -> {bbox, pos, size_3d, yaw, missing_count}
+        self._next_track_id = 0
+        self._ema_alpha = 0.3      # 70% old + 30% new
+        self._track_iou_thr = 0.3
+        self._track_max_missing = 5
 
         # RealSense images are BEST_EFFORT — must match QoS or no frames arrive
         self.create_subscription(Image, depth_topic, self._on_depth, qos_profile_sensor_data)
@@ -211,7 +221,19 @@ class DepthSegmentNode(Node):
         else:
             self.get_logger().warn(f'unexpected depth encoding: {msg.encoding}', once=True)
             return
-        self._depth_m = d
+        # Average the last few raw depth frames so per-pixel speckle
+        # doesn't flicker pixels in and out of the foreground mask.
+        # Invalid samples (<= 0 or NaN) are excluded per-pixel.
+        self._depth_buffer.append(d)
+        if len(self._depth_buffer) >= 2:
+            stack = np.stack(list(self._depth_buffer), axis=0)
+            ok = np.isfinite(stack) & (stack > 0.0)
+            cnt = ok.sum(axis=0)
+            num = np.where(ok, stack, 0.0).sum(axis=0)
+            avg = np.where(cnt > 0, num / np.maximum(cnt, 1), 0.0).astype(np.float32)
+            self._depth_m = avg
+        else:
+            self._depth_m = d
         self._depth_hdr = msg.header
 
     def _on_color(self, msg: Image):
@@ -705,6 +727,131 @@ class DepthSegmentNode(Node):
                 merged.append(base)
         return merged
 
+    def _update_tracks(self, detections):
+        """Match detections to existing tracks by IoU and exponential-
+        moving-average smooth bbox / pos / size / yaw across frames.
+
+        Each frame's segmentation is independent and small depth noise
+        shifts the bbox by several pixels; without this stage the
+        annotation jitters even when the scene is static. Tracks are
+        kept for `_track_max_missing` empty frames before being culled
+        so a single bad frame doesn't drop the track.
+        """
+        used_tracks = set()
+        a = self._ema_alpha
+
+        for det in detections:
+            bbox = det.get('bbox_px')
+            if not bbox or len(bbox) < 4:
+                continue
+            x1, y1, x2, y2 = [float(b) for b in bbox]
+
+            # Best IoU match against unclaimed tracks.
+            best_tid = None
+            best_iou = self._track_iou_thr
+            for tid, track in self._tracks.items():
+                if tid in used_tracks:
+                    continue
+                tb = track['bbox']
+                ix1 = max(x1, tb[0]); iy1 = max(y1, tb[1])
+                ix2 = min(x2, tb[2]); iy2 = min(y2, tb[3])
+                inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                if inter <= 0:
+                    continue
+                area_a = (x2 - x1) * (y2 - y1)
+                area_b = (tb[2] - tb[0]) * (tb[3] - tb[1])
+                union = area_a + area_b - inter
+                iou = inter / max(union, 1e-6)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_tid = tid
+
+            if best_tid is None:
+                # Initialise a fresh track from the current detection.
+                tid = self._next_track_id
+                self._next_track_id += 1
+                eu = det.get('euler') or (0.0, 0.0, 0.0)
+                self._tracks[tid] = {
+                    'bbox':    (x1, y1, x2, y2),
+                    'pos':     det.get('pos') or (0.0, 0.0, 0.0),
+                    'size_3d': det.get('size_3d') or (0.05, 0.05, 0.05),
+                    'yaw':     float(eu[2]),
+                    'missing_count': 0,
+                }
+                det['_track_id'] = tid
+                used_tracks.add(tid)
+                continue
+
+            # Smooth into the existing track.
+            track = self._tracks[best_tid]
+            ob = track['bbox']
+            sm_bbox = (
+                ob[0] * (1 - a) + x1 * a,
+                ob[1] * (1 - a) + y1 * a,
+                ob[2] * (1 - a) + x2 * a,
+                ob[3] * (1 - a) + y2 * a,
+            )
+            track['bbox'] = sm_bbox
+            track['missing_count'] = 0
+
+            if det.get('pos'):
+                op = track.get('pos') or det['pos']
+                np_pos = det['pos']
+                track['pos'] = tuple(
+                    o * (1 - a) + n * a for o, n in zip(op, np_pos))
+
+            if det.get('size_3d'):
+                os3 = track.get('size_3d') or det['size_3d']
+                ns3 = det['size_3d']
+                track['size_3d'] = tuple(
+                    o * (1 - a) + n * a for o, n in zip(os3, ns3))
+
+            eu = det.get('euler') or (0.0, 0.0, 0.0)
+            old_yaw = track.get('yaw', float(eu[2]))
+            diff = float(eu[2]) - old_yaw
+            # Wrap to (-pi, pi] so smoothing doesn't tear at the seam.
+            while diff > math.pi:  diff -= 2.0 * math.pi
+            while diff < -math.pi: diff += 2.0 * math.pi
+            track['yaw'] = old_yaw + diff * a
+
+            # Push smoothed values back onto the detection so everything
+            # downstream — matching, publishing, drawing — sees them.
+            det['bbox_px'] = tuple(int(round(v)) for v in sm_bbox)
+            det['pos']     = track['pos']
+            det['size_3d'] = track['size_3d']
+            det['euler']   = (eu[0], eu[1], track['yaw'])
+            det['_track_id'] = best_tid
+
+            # Rebuild corners + quat from the smoothed yaw so the
+            # rotated 2D bbox we draw and the 3D pose we publish are
+            # consistent with the smoothed state.
+            cy_, sy_ = math.cos(track['yaw']), math.sin(track['yaw'])
+            R_s = np.array([
+                [cy_, -sy_, 0.0],
+                [sy_,  cy_, 0.0],
+                [0.0,  0.0, 1.0],
+            ], dtype=np.float32)
+            centroid_s = np.asarray(track['pos'], dtype=np.float32)
+            size_s     = np.asarray(track['size_3d'], dtype=np.float32)
+            det['corners'] = self._obb_corners(centroid_s, size_s, R_s)
+            quat_s, _ = self._rmat_to_quat_euler(R_s)
+            det['quat'] = tuple(float(q) for q in quat_s)
+
+            used_tracks.add(best_tid)
+
+        # Age out tracks that didn't get a match this frame.
+        to_remove = []
+        for tid, track in self._tracks.items():
+            if tid in used_tracks:
+                continue
+            track['missing_count'] = track.get('missing_count', 0) + 1
+            if track['missing_count'] > self._track_max_missing:
+                to_remove.append(tid)
+        for tid in to_remove:
+            del self._tracks[tid]
+
+        return detections
+
     def _temporal_filter(self):
         """Keep objects present in >=2 of the last 3 frames (flicker + dropout)."""
         frames = list(self._history)
@@ -785,6 +932,10 @@ class DepthSegmentNode(Node):
         foreground = self._erode(self._dilate(foreground, self.dilate_k), self.dilate_k)
         foreground = ndimage.binary_fill_holes(foreground)
         foreground = self._dilate(self._erode(foreground, self.erode_k), self.erode_k)
+        # Stabilise mask edges: a small 5x5 closing fills 1-2 px gaps that
+        # appear and disappear across frames and otherwise wobble the bbox.
+        foreground = ndimage.binary_closing(
+            foreground, structure=np.ones((5, 5), dtype=bool), iterations=1)
 
         # Carve depth-discontinuity boundaries OUT of the foreground so
         # neighbouring objects whose 2D masks touch get split. Uses true
@@ -1388,6 +1539,9 @@ class DepthSegmentNode(Node):
         """Apply temporal smoothing, match against the parts library,
         then publish detections + annotated image."""
         stable = self._temporal_filter()
+        # IoU-based tracker smooths bbox / pos / size / yaw so the
+        # annotation doesn't bounce while the scene is static.
+        stable = self._update_tracks(stable)
         self._match_parts(stable)
         # Keep the latest stable list around so a teach command can
         # capture the user's chosen detection without needing the
@@ -1897,8 +2051,42 @@ class DepthSegmentNode(Node):
             else:
                 col = self._dist_color(pz)
 
-            # 2D bbox
-            draw.rectangle([x0, y0, x1, y1], outline=col, width=3)
+            # Rotated 2D bbox that follows the OBB orientation. Prefer
+            # the OBB's bottom face (corners with sz=-1) projected to
+            # image space — that's the tightest 4-point quad. Falls back
+            # to rotating the axis-aligned bbox by yaw if no OBB exists.
+            drew_rotated = False
+            corners_3d = o.get('corners')
+            if corners_3d is not None and len(corners_3d) == 8:
+                proj = self._project(np.asarray(corners_3d), w, h)
+                if proj is not None:
+                    # Indices [0, 2, 6, 4] walk the bottom face in order.
+                    face = [proj[i] for i in (0, 2, 6, 4)]
+                    for i in range(4):
+                        p1 = (int(face[i][0]),       int(face[i][1]))
+                        p2 = (int(face[(i + 1) % 4][0]),
+                              int(face[(i + 1) % 4][1]))
+                        draw.line([p1, p2], fill=col, width=3)
+                    drew_rotated = True
+            if not drew_rotated:
+                yaw_draw = (o.get('euler') or (0.0, 0.0, 0.0))[2]
+                cx_b = (x0 + x1) * 0.5
+                cy_b = (y0 + y1) * 0.5
+                hw = (x1 - x0) * 0.5
+                hh = (y1 - y0) * 0.5
+                cs = math.cos(yaw_draw)
+                sn = math.sin(yaw_draw)
+                quad = [
+                    (cx_b + hw * cs - hh * sn, cy_b + hw * sn + hh * cs),
+                    (cx_b - hw * cs - hh * sn, cy_b - hw * sn + hh * cs),
+                    (cx_b - hw * cs + hh * sn, cy_b - hw * sn - hh * cs),
+                    (cx_b + hw * cs + hh * sn, cy_b + hw * sn - hh * cs),
+                ]
+                for i in range(4):
+                    p1 = (int(quad[i][0]),       int(quad[i][1]))
+                    p2 = (int(quad[(i + 1) % 4][0]),
+                          int(quad[(i + 1) % 4][1]))
+                    draw.line([p1, p2], fill=col, width=3)
 
             # Cyan OBB wireframe (projected from the 8 3D corners).
             if o.get('obb') and o.get('corners') is not None:
