@@ -28,6 +28,116 @@ except ImportError:
     _SCIPY_OK = False
 
 
+# ── CAD geometric features used for live camera matching ──────────────
+
+def extract_geometric_features(mesh, img_size: int = 128) -> dict:
+    """Top-down geometric fingerprint of a CAD mesh.
+
+    Produces the same descriptors the live depth_segment_node extracts
+    from a per-detection depth crop, so the matcher can compare them
+    directly: hole count + relative geometry, normalised top-down
+    height map, edge map, outline, aspect, symmetry, scale."""
+    from scipy.ndimage import (
+        binary_fill_holes as _fill,
+        label as _label,
+        sobel as _sobel,
+        zoom as _zoom,
+    )
+
+    features: dict = {}
+    verts = np.asarray(mesh.vertices)
+    if verts.size == 0:
+        return features
+    x = verts[:, 0]; y = verts[:, 1]; z = verts[:, 2]
+
+    x_range = float(x.max() - x.min()) or 1e-3
+    y_range = float(y.max() - y.min()) or 1e-3
+    scale = (img_size - 10) / max(x_range, y_range)
+
+    px = ((x - x.min()) * scale + 5).astype(int).clip(0, img_size - 1)
+    py = ((y - y.min()) * scale + 5).astype(int).clip(0, img_size - 1)
+
+    height_map = np.full((img_size, img_size), -np.inf, dtype=np.float64)
+    min_height_map = np.full((img_size, img_size), np.inf, dtype=np.float64)
+    # Vectorised max/min via np.maximum.at / np.minimum.at — same effect
+    # as the per-vertex loop in the spec but ~100x faster on real meshes.
+    np.maximum.at(height_map, (py, px), z)
+    np.minimum.at(min_height_map, (py, px), z)
+
+    valid = height_map > -np.inf
+    if valid.any():
+        h_min = float(height_map[valid].min())
+        h_max = float(height_map[valid].max())
+        if h_max > h_min:
+            norm_height = (height_map - h_min) / (h_max - h_min)
+            norm_height[~valid] = 0.0
+        else:
+            norm_height = np.zeros_like(height_map)
+    else:
+        h_min = 0.0; h_max = 0.0
+        norm_height = np.zeros((img_size, img_size), dtype=np.float64)
+
+    outline = valid
+    filled = _fill(outline)
+    hole_mask = filled & ~outline
+    labeled_holes, num_holes = _label(hole_mask)
+
+    holes = []
+    for h in range(1, num_holes + 1):
+        hy, hx = np.where(labeled_holes == h)
+        area = int(len(hy))
+        cy = float(np.mean(hy)) / img_size
+        cx = float(np.mean(hx)) / img_size
+        radius = float(np.sqrt(area / np.pi)) / img_size
+        holes.append({
+            'center':     [round(cx, 3), round(cy, 3)],
+            'radius_norm': round(radius, 4),
+            'area_norm':   round(area / (img_size * img_size), 4),
+        })
+    features['holes'] = holes
+    features['num_holes'] = int(num_holes)
+
+    target = 32
+    height_32 = _zoom(norm_height, target / img_size, order=1)
+    features['height_map_32'] = np.round(height_32, 4).tolist()
+
+    edge_x = _sobel(norm_height, axis=1)
+    edge_y = _sobel(norm_height, axis=0)
+    edge_mag = np.sqrt(edge_x ** 2 + edge_y ** 2)
+    edge_32 = _zoom(edge_mag, target / img_size, order=1)
+    features['edge_map_32'] = np.round(edge_32, 4).tolist()
+
+    outline_32 = _zoom(outline.astype(float), target / img_size, order=0) > 0.5
+    features['outline_32'] = outline_32.tolist()
+
+    if valid.any():
+        heights = height_map[valid]
+        features['height_mean']  = round(float(np.mean(heights)), 4)
+        features['height_std']   = round(float(np.std(heights)), 4)
+        features['height_range'] = round(float(h_max - h_min), 4)
+
+    rows = np.any(outline, axis=1)
+    cols = np.any(outline, axis=0)
+    if rows.any() and cols.any():
+        rh = int(np.where(rows)[0][-1] - np.where(rows)[0][0] + 1)
+        rw = int(np.where(cols)[0][-1] - np.where(cols)[0][0] + 1)
+        features['aspect_ratio'] = round(rw / max(rh, 1), 3)
+
+        # IoU of foreground vs its flip — bounded to [0, 1]. The spec
+        # used `outline == fliplr` over the whole grid which counted
+        # matching empty-background pixels and produced values >> 1.
+        lr = np.fliplr(outline); ud = np.flipud(outline)
+        lr_sym = float(np.sum(outline & lr)) / max(int(np.sum(outline | lr)), 1)
+        ud_sym = float(np.sum(outline & ud)) / max(int(np.sum(outline | ud)), 1)
+        features['symmetry_lr'] = round(lr_sym, 3)
+        features['symmetry_ud'] = round(ud_sym, 3)
+
+    features['scale_m_per_px'] = round(1.0 / scale, 6)
+    features['part_width_m']   = round(x_range, 4)
+    features['part_height_m']  = round(y_range, 4)
+    return features
+
+
 # ── Shape descriptors used for camera-to-CAD matching ──────────────────
 
 def _hu_moments(mask: np.ndarray) -> np.ndarray:
@@ -220,6 +330,11 @@ def parse_step_file(step_path: str) -> dict:
     except Exception:
         silhouettes = []
 
+    try:
+        geometric_features = extract_geometric_features(mesh)
+    except Exception:
+        geometric_features = {}
+
     return {
         'id':                file_hash,
         'name':              os.path.splitext(os.path.basename(step_path))[0],
@@ -247,4 +362,5 @@ def parse_step_file(step_path: str) -> dict:
         'hull_verts':     hull.vertices.tolist(),
         'hull_faces':     hull.faces.tolist(),
         'silhouettes':    silhouettes,
+        'geometric_features': geometric_features,
     }

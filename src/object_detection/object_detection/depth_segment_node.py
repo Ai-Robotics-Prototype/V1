@@ -39,12 +39,12 @@ from std_msgs.msg import String
 from vision_msgs.msg import Detection3DArray, Detection3D, ObjectHypothesisWithPose
 
 try:
-    from object_detection.shape_matcher import match_detection as _match_part
+    from object_detection.shape_matcher import match_geometry as _match_geometry
     _MATCHER_OK = True
 except ImportError:
     _MATCHER_OK = False
-    def _match_part(*_a, **_kw):
-        return None, 0.0, 0.0
+    def _match_geometry(*_a, **_kw):
+        return None, 0.0, ''
 from scipy import ndimage
 from scipy.spatial.transform import Rotation as _SR
 from PIL import Image as PILImage, ImageDraw
@@ -1217,12 +1217,114 @@ class DepthSegmentNode(Node):
             surface_ok = h_ratio > 0.7
         return (yaw_ok and surface_ok), round(yaw_err, 1), surface_ok
 
+    @staticmethod
+    def _extract_detection_features(depth_crop, mask_crop):
+        """Same geometric fingerprint extract_geometric_features() builds
+        from a CAD mesh — but starting from a camera depth crop.
+
+        Camera depth gets flipped before normalising (smaller depth =
+        closer to camera = higher physical surface), so the resulting
+        height-map shares its sign convention with the CAD top-down
+        height-map. Without the flip the NCC against the CAD reference
+        is negative and the geometry matcher truncates it to 0.
+        """
+        from scipy.ndimage import (
+            sobel as _sobel,
+            binary_fill_holes as _fill,
+            label as _label,
+            zoom as _zoom,
+        )
+
+        features: dict = {}
+        if depth_crop is None or mask_crop is None:
+            return features
+        if mask_crop.shape[0] < 5 or mask_crop.shape[1] < 5:
+            return features
+
+        valid = mask_crop & (depth_crop > 0) & np.isfinite(depth_crop)
+        if not valid.any():
+            return features
+
+        d_min = float(depth_crop[valid].min())
+        d_max = float(depth_crop[valid].max())
+        height_range = d_max - d_min
+
+        if height_range < 0.001:
+            norm_depth = np.zeros_like(depth_crop, dtype=np.float32)
+        else:
+            # Invert: nearest-to-camera (smallest depth) maps to 1,
+            # furthest to 0 — matches the CAD top-down convention.
+            norm_depth = ((d_max - depth_crop) / height_range).astype(np.float32)
+            norm_depth[~valid] = 0.0
+
+        # 1) Holes from internal voids in the mask.
+        filled = _fill(mask_crop)
+        internal_voids = filled & ~mask_crop
+        labeled_holes, num_holes = _label(internal_voids)
+        holes = []
+        for h in range(1, int(num_holes) + 1):
+            hy, hx = np.where(labeled_holes == h)
+            area = int(len(hy))
+            cy = float(np.mean(hy)) / mask_crop.shape[0]
+            cx = float(np.mean(hx)) / mask_crop.shape[1]
+            radius = float(np.sqrt(area / np.pi)) / max(mask_crop.shape)
+            holes.append({
+                'center':      [round(cx, 3), round(cy, 3)],
+                'radius_norm': round(radius, 4),
+                'area_norm':   round(area / max(mask_crop.size, 1), 4),
+            })
+        features['holes'] = holes
+        features['num_holes'] = int(num_holes)
+
+        # 2) Resize to 32x32 for matcher consumption.
+        fy = 32.0 / mask_crop.shape[0]
+        fx = 32.0 / mask_crop.shape[1]
+        try:
+            height_32 = _zoom(norm_depth, (fy, fx), order=1)
+            features['height_map_32'] = height_32
+        except Exception:
+            pass
+
+        # 3) Edge map (depth discontinuities) — same as CAD side.
+        try:
+            edge_x = _sobel(norm_depth, axis=1)
+            edge_y = _sobel(norm_depth, axis=0)
+            edge_mag = np.sqrt(edge_x ** 2 + edge_y ** 2)
+            edge_32 = _zoom(edge_mag, (fy, fx), order=1)
+            features['edge_map_32'] = edge_32
+        except Exception:
+            pass
+
+        # 4) Outline at 32x32 for downstream debug / future use.
+        try:
+            outline_32 = _zoom(mask_crop.astype(float), (fy, fx), order=0) > 0.5
+            features['outline_32'] = outline_32
+        except Exception:
+            pass
+
+        heights = depth_crop[valid]
+        features['height_std']   = round(float(np.std(heights)), 4)
+        features['height_range'] = round(float(height_range), 4)
+
+        rows = np.any(mask_crop, axis=1)
+        cols = np.any(mask_crop, axis=0)
+        if rows.any() and cols.any():
+            rh = int(np.where(rows)[0][-1] - np.where(rows)[0][0] + 1)
+            rw = int(np.where(cols)[0][-1] - np.where(cols)[0][0] + 1)
+            features['aspect_ratio'] = round(rw / max(rh, 1), 3)
+            lr = np.fliplr(mask_crop)
+            lr_sym = float(np.sum(mask_crop == lr)) / max(int(np.sum(mask_crop | lr)), 1)
+            features['symmetry_lr'] = round(lr_sym, 3)
+
+        return features
+
     def _match_parts(self, objects):
-        """Three-method library matching with consensus boost +
-        position verification. Silhouette-only matches were too noisy
-        on real cluttered camera data; adding size and depth-profile
-        as independent voters and boosting agreement makes the live
-        recognition reliable."""
+        """CAD-geometry recognition against the parts library, with
+        teach-mode references as a parallel matcher; whichever scores
+        higher wins. Geometry comparison is on hole count + pattern,
+        top-down height profile, edge profile, size and aspect — the
+        same features extract_geometric_features() computed when the
+        STEP file was uploaded."""
         if not objects:
             return
         library_parts = self._load_library_parts()
@@ -1236,89 +1338,43 @@ class DepthSegmentNode(Node):
             sx, sy, sz = o.get('size_3d') or (0.05, 0.05, 0.05)
             size_m = [float(sx), float(sy), float(sz)]
 
-            # 0) Taught references (PRIMARY when any exist). Real
-            # camera samples beat synthetic CAD renders for noisy
-            # tabletop depth — and they fix the false-positive class
-            # the CAD-only path latched onto. Skip the CAD methods
-            # entirely once any reference is on disk for any part.
+            # 1) Geometry match against CAD library.
+            det_features = self._extract_detection_features(depth, mask)
+            geo_name, geo_id, geo_score, geo_reason = None, None, 0.0, ''
+            if _MATCHER_OK and det_features:
+                try:
+                    match, score, reason = _match_geometry(det_features, size_m)
+                    if match is not None:
+                        geo_name   = match.get('name')
+                        geo_id     = match.get('id')
+                        geo_score  = float(score)
+                        geo_reason = str(reason)
+                except Exception as e:
+                    self.get_logger().warn(f'match_geometry failed: {e}', once=True)
+
+            # 2) Teach-mode match — kept as a parallel matcher because
+            # an operator capture often beats CAD on noisy small parts.
             teach_name, teach_id, teach_score = self._match_by_teach(
                 depth, mask, size_m)
-            if self._teach_refs:
-                if teach_name != 'unknown':
-                    o['part_name']        = teach_name
-                    o['part_id']          = teach_id
-                    o['match_score']      = float(teach_score)
-                    o['match_yaw']        = 0.0
-                else:
-                    o['part_name']        = None
-                    o['part_id']          = None
-                    o['match_score']      = 0.0
-                    o['match_yaw']        = 0.0
-                # Position verification against saved metadata
-                if teach_name != 'unknown' and teach_id:
-                    part_meta = next((p for p in library_parts
-                                      if p.get('id') == teach_id), None)
-                    if part_meta is not None:
-                        _, _, yaw_rad = o.get('euler') or (0.0, 0.0, 0.0)
-                        ok, yaw_err, surf_ok = self._verify_position(
-                            part_meta, yaw_rad, size_m)
-                        o['position_correct'] = bool(ok)
-                        o['yaw_error_deg']    = float(yaw_err)
-                        o['surface_ok']       = bool(surf_ok)
-                        o['position_status']  = 'CORRECT' if ok else 'MISALIGNED'
-                    else:
-                        o['position_correct'] = None
-                        o['yaw_error_deg']    = 0.0
-                        o['surface_ok']       = None
-                        o['position_status']  = ''
-                else:
-                    o['position_correct'] = None
-                    o['yaw_error_deg']    = 0.0
-                    o['surface_ok']       = None
-                    o['position_status']  = ''
-                continue
 
-            # 1) Silhouette (shape-based)
-            sil_name, sil_id, sil_score, sil_yaw = None, None, 0.0, 0.0
-            if _MATCHER_OK and mask is not None and mask.any():
-                try:
-                    match, score, yawd = _match_part(
-                        detection_mask=mask, detection_size_m=size_m,
-                        detection_aspect=aspect,
-                    )
-                    if match is not None:
-                        sil_name  = match.get('name'); sil_id = match.get('id')
-                        sil_score = float(score);     sil_yaw = float(yawd)
-                except Exception:
-                    pass
+            # Higher score wins. CAD is preferred on ties to bias toward
+            # the structurally-defined match when both fire equally.
+            if geo_score >= teach_score and geo_name:
+                best_name, best_id, best_score = geo_name, geo_id, geo_score
+                match_source = 'cad'
+            elif teach_score > 0 and teach_name != 'unknown':
+                best_name, best_id, best_score = teach_name, teach_id, teach_score
+                match_source = 'teach'
+            else:
+                best_name, best_id, best_score = None, None, 0.0
+                match_source = ''
 
-            # 2) Size-ratio (dimension comparison)
-            sz_name, sz_id, sz_score = self._match_by_size(size_m, library_parts)
+            # Stash hole list + reason for annotation drawing.
+            o['_holes']        = det_features.get('holes', []) if det_features else []
+            o['_match_reason'] = geo_reason
+            o['_match_source'] = match_source
 
-            # 3) Depth-profile (standing height + dimension blend)
-            dp_name, dp_id, dp_score = self._match_by_depth_profile(
-                depth, mask, size_m, library_parts)
-
-            candidates = [
-                (sil_name, sil_id, sil_score),
-                (sz_name,  sz_id,  sz_score),
-                (dp_name,  dp_id,  dp_score),
-            ]
-            best_name, best_id, best_score = max(candidates, key=lambda c: c[2])
-
-            # Consensus requirement — with only one part in the library,
-            # the size matcher will happily latch onto ~anything that's
-            # in the same order of magnitude. Require 2+ methods to
-            # agree on the same part above 0.5, OR a single method
-            # with a very strong score (>=0.85). Otherwise reject.
-            agreeing = sum(
-                1 for c in candidates
-                if c[0] == best_name and c[0] is not None and c[2] > 0.5
-            )
-            confident_single = (agreeing == 1 and best_score >= 0.85)
-            accept = (agreeing >= 2) or confident_single
-
-            if best_name is None or not accept or best_score < 0.70:
+            if best_name is None or best_score < 0.50:
                 o['part_name']        = None
                 o['part_id']          = None
                 o['match_score']      = 0.0
@@ -1329,20 +1385,15 @@ class DepthSegmentNode(Node):
                 o['position_status']  = ''
                 continue
 
-            # Consensus boost — 2+ agreeing methods bumps the reported
-            # confidence by 15 %, capped at 1.0.
-            if agreeing >= 2:
-                best_score = min(best_score * 1.15, 1.0)
-
             o['part_name']   = str(best_name)
             o['part_id']     = str(best_id) if best_id else None
             o['match_score'] = float(round(best_score, 3))
-            o['match_yaw']   = float(sil_yaw)
+            o['match_yaw']   = 0.0
 
-            # Position verification against the operator-saved config
+            # Position verification against the operator-saved config.
             part_meta = next((p for p in library_parts if p.get('id') == best_id), None)
             if part_meta is not None:
-                roll, pitch, yaw_rad = o.get('euler') or (0.0, 0.0, 0.0)
+                _roll, _pitch, yaw_rad = o.get('euler') or (0.0, 0.0, 0.0)
                 ok, yaw_err, surf_ok = self._verify_position(part_meta, yaw_rad, size_m)
                 o['position_correct'] = bool(ok)
                 o['yaw_error_deg']    = float(yaw_err)
@@ -1499,18 +1550,37 @@ class DepthSegmentNode(Node):
             # collapsed to the two XY dims for a top-down read.
             w_cm = int(round(sx * 100))
             h_cm = int(round(sy * 100))
+            holes = o.get('_holes') or []
+            n_holes = len(holes)
             if matched:
                 pct = int(round(float(o.get('match_score') or 0) * 100))
+                hole_tag = f' [{n_holes} holes]' if n_holes else ''
                 if pos_ok:
-                    label = f"{o['part_name']} ({pct}%) ✓  {pz:.2f}m"
+                    label = f"{o['part_name']} ({pct}%){hole_tag} ✓  {pz:.2f}m"
                 else:
                     yaw_err = float(o.get('yaw_error_deg') or 0.0)
-                    label = f"{o['part_name']} ({pct}%) ⚠ yaw:{yaw_err:.0f}° off"
+                    label = (f"{o['part_name']} ({pct}%){hole_tag} "
+                             f"⚠ yaw:{yaw_err:.0f}° off")
             else:
                 label = f'{pz:.2f}m  {w_cm}×{h_cm}cm  yaw:{yaw_deg:+.0f}°'
             tw = len(label) * 6 + 6
             draw.rectangle([x0, max(0, y0 - 13), x0 + tw, y0], fill=col)
             draw.text((x0 + 2, max(0, y0 - 12)), label, fill=(255, 255, 255))
+
+            # Hole markers — small cyan circles at each detected hole.
+            # Hole coordinates are normalised to the detection mask
+            # crop, so project them onto the 2D bbox.
+            if matched and holes:
+                bw_px = max(1, x1 - x0)
+                bh_px = max(1, y1 - y0)
+                for hole in holes:
+                    c = hole.get('center') or [0.5, 0.5]
+                    r = float(hole.get('radius_norm') or 0.02)
+                    hx = x0 + float(c[0]) * bw_px
+                    hy = y0 + float(c[1]) * bh_px
+                    rr = max(3.0, r * max(bw_px, bh_px))
+                    draw.ellipse([hx - rr, hy - rr, hx + rr, hy + rr],
+                                 outline=(0, 220, 255), width=2)
 
         msg = Image()
         msg.header.stamp = self._depth_hdr.stamp if self._depth_hdr else self.get_clock().now().to_msg()
