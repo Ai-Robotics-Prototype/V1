@@ -774,6 +774,7 @@ function TeachWizard({ part, onClose, onComplete }) {
   const [liveDetections, setLiveDetections]   = useState([])
   const [selectedDetection, setSelectedDet]   = useState(null)
   const [cameraTick, setCameraTick]           = useState(Date.now())
+  const [flashGreen, setFlashGreen]           = useState(false)
 
   // Poll live detections from dashboard state at 2 Hz.
   useEffect(() => {
@@ -819,6 +820,8 @@ function TeachWizard({ part, onClose, onComplete }) {
           angle: (step - 1) * 90,
           timestamp: Date.now(),
         }])
+        setFlashGreen(true)
+        setTimeout(() => setFlashGreen(false), 600)
       } else {
         setError(data.error || `Capture failed (HTTP ${res.status})`)
       }
@@ -956,6 +959,8 @@ function TeachWizard({ part, onClose, onComplete }) {
             <div style={{
               flex: 3, position: 'relative', background: '#111',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
+              border: flashGreen ? '4px solid var(--green)' : '4px solid transparent',
+              transition: 'border-color 200ms',
             }}>
               <img
                 src={`/stream/cam0?t=${cameraTick}`}
@@ -1010,6 +1015,20 @@ function TeachWizard({ part, onClose, onComplete }) {
                   padding: '8px 16px', borderRadius: 8, fontSize: 13,
                 }}>
                   No objects detected — place the part in view of Camera 0
+                </div>
+              )}
+
+              {flashGreen && (
+                <div style={{
+                  position: 'absolute',
+                  top: '50%', left: '50%',
+                  transform: 'translate(-50%, -50%)',
+                  background: 'rgba(22, 163, 74, 0.9)',
+                  color: '#fff',
+                  fontSize: 24, fontWeight: 700,
+                  padding: '16px 32px', borderRadius: 12, zIndex: 60,
+                }}>
+                  ✓ Captured!
                 </div>
               )}
             </div>
@@ -1091,32 +1110,101 @@ function TeachWizard({ part, onClose, onComplete }) {
                 </div>
               )}
 
-              <button
-                onClick={() => {
-                  if (selectedDetection === null) return
-                  captureTeach(selectedDetection).then(() => {
-                    setSelectedDet(null)
-                    if (step < 4) {
-                      setTimeout(() => setStep(step + 1), 800)
-                    } else {
-                      setStep(5)
+              {/* BIG CAPTURE BUTTON — prominent, centred */}
+              <div style={{
+                padding: '16px 24px',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                gap: 12,
+              }}>
+                <div style={{
+                  fontSize: 14,
+                  fontWeight: 600,
+                  color: 'var(--text-primary)',
+                }}>
+                  Step {step} of 4 — {['', 'Front (0°)', 'Right (90°)', 'Back (180°)', 'Left (270°)'][step]}
+                </div>
+
+                <button
+                  onClick={() => {
+                    if (selectedDetection !== null) {
+                      captureTeach(selectedDetection).then(() => {
+                        setSelectedDet(null)
+                        if (step < 4) {
+                          setTimeout(() => setStep(step + 1), 800)
+                        } else {
+                          setStep(5)
+                        }
+                      })
                     }
-                  })
-                }}
-                disabled={selectedDetection === null || capturing}
-                style={{
-                  padding: '14px 24px', fontSize: 15, fontWeight: 700,
-                  background: selectedDetection !== null ? 'var(--accent)' : 'var(--bg-active)',
-                  color:      selectedDetection !== null ? '#fff'           : 'var(--text-muted)',
-                  border: 'none', borderRadius: 'var(--radius-lg)',
-                  cursor: selectedDetection !== null ? 'pointer' : 'default',
-                  transition: 'all 200ms',
-                }}
-              >
-                {capturing ? '⏳ Capturing…'
-                  : selectedDetection === null ? 'Select an object in the camera first'
-                  : `📸 Capture Angle ${step} of 4`}
-              </button>
+                  }}
+                  disabled={selectedDetection === null || capturing}
+                  style={{
+                    width: 80,
+                    height: 80,
+                    borderRadius: '50%',
+                    border: selectedDetection !== null ? '4px solid var(--accent)' : '4px solid var(--border)',
+                    background: capturing ? 'var(--accent)'
+                      : selectedDetection !== null ? '#fff' : 'var(--bg-surface)',
+                    cursor: selectedDetection !== null ? 'pointer' : 'default',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    transition: 'all 200ms',
+                    boxShadow: selectedDetection !== null ? '0 0 0 4px var(--accent-dim)' : 'none',
+                  }}
+                >
+                  {capturing ? (
+                    <div style={{ fontSize: 24, color: '#fff' }}>⏳</div>
+                  ) : (
+                    <div style={{
+                      width: 56,
+                      height: 56,
+                      borderRadius: '50%',
+                      background: selectedDetection !== null ? 'var(--accent)' : 'var(--bg-active)',
+                      transition: 'all 200ms',
+                    }} />
+                  )}
+                </button>
+
+                <div style={{
+                  fontSize: 13,
+                  color: selectedDetection !== null ? 'var(--accent)' : 'var(--text-muted)',
+                  fontWeight: 500,
+                  textAlign: 'center',
+                }}>
+                  {capturing ? 'Capturing...'
+                    : selectedDetection === null
+                      ? 'Select an object in the camera view above ↑'
+                      : 'Tap the button to capture this angle'}
+                </div>
+
+                {selectedDetection !== null && !capturing && (
+                  <button
+                    onClick={() => {
+                      captureTeach(selectedDetection).then(() => {
+                        setSelectedDet(null)
+                        if (step < 4) setTimeout(() => setStep(step + 1), 800)
+                        else setStep(5)
+                      })
+                    }}
+                    style={{
+                      padding: '10px 32px',
+                      fontSize: 14,
+                      fontWeight: 700,
+                      background: 'var(--accent)',
+                      color: '#fff',
+                      border: 'none',
+                      borderRadius: 'var(--radius-lg)',
+                      cursor: 'pointer',
+                      boxShadow: 'var(--shadow-md)',
+                    }}
+                  >
+                    📸 Capture & Next →
+                  </button>
+                )}
+              </div>
 
               {/* Navigation */}
               <div style={{ display: 'flex', gap: 8, marginTop: 'auto' }}>

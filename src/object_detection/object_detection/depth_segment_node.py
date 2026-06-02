@@ -47,7 +47,16 @@ except ImportError:
         return None, 0.0, ''
 from scipy import ndimage
 from scipy.spatial.transform import Rotation as _SR
-from PIL import Image as PILImage, ImageDraw
+from PIL import Image as PILImage, ImageDraw, ImageFont
+
+try:
+    _ANNOT_FONT = ImageFont.truetype(
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 16)
+    _ANNOT_FONT_SMALL = ImageFont.truetype(
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 13)
+except Exception:
+    _ANNOT_FONT = ImageFont.load_default()
+    _ANNOT_FONT_SMALL = _ANNOT_FONT
 
 # 12 edges of a unit cube, as pairs of corner indices (binary xyz).
 _CUBE_EDGES = ((0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
@@ -1597,7 +1606,7 @@ class DepthSegmentNode(Node):
                 col = self._dist_color(pz)
 
             # 2D bbox
-            draw.rectangle([x0, y0, x1, y1], outline=col, width=2)
+            draw.rectangle([x0, y0, x1, y1], outline=col, width=3)
 
             # Cyan OBB wireframe (projected from the 8 3D corners).
             if o.get('obb') and o.get('corners') is not None:
@@ -1639,9 +1648,17 @@ class DepthSegmentNode(Node):
                              f"⚠ yaw:{yaw_err:.0f}° off")
             else:
                 label = f'{pz:.2f}m  {w_cm}×{h_cm}cm  yaw:{yaw_deg:+.0f}°'
-            tw = len(label) * 6 + 6
-            draw.rectangle([x0, max(0, y0 - 13), x0 + tw, y0], fill=col)
-            draw.text((x0 + 2, max(0, y0 - 12)), label, fill=(255, 255, 255))
+            # Matched parts get the bigger bold font; unknown objects use
+            # a slightly smaller regular font. Both labels sit in a
+            # solid-filled rectangle so they read against any background.
+            label_font = _ANNOT_FONT if matched else _ANNOT_FONT_SMALL
+            bbox_text = draw.textbbox((0, 0), label, font=label_font)
+            tw = bbox_text[2] - bbox_text[0] + 8
+            th = bbox_text[3] - bbox_text[1] + 6
+            label_y = max(0, y0 - th - 2)
+            draw.rectangle([x0, label_y, x0 + tw, label_y + th], fill=col)
+            draw.text((x0 + 4, label_y + 2), label,
+                      fill=(255, 255, 255), font=label_font)
 
             # Hole markers — small cyan circles at each detected hole.
             # Hole coordinates are normalised to the detection mask
