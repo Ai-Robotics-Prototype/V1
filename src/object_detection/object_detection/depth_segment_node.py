@@ -1179,6 +1179,16 @@ class DepthSegmentNode(Node):
                 try:
                     z = np.load(os.path.join(pdir, fn), allow_pickle=True)
                     files = set(z.files)
+                    color_arr = (np.asarray(z['color'], dtype=np.uint8)
+                                 if 'color' in files else None)
+                    if 'gray' in files:
+                        gray_arr = np.asarray(z['gray'], dtype=np.float32)
+                    elif color_arr is not None:
+                        gray_arr = (np.mean(color_arr.astype(np.float32), axis=2)
+                                    if color_arr.ndim == 3
+                                    else color_arr.astype(np.float32))
+                    else:
+                        gray_arr = None
                     ref = {
                         'size_m':   np.asarray(z['size_m'], dtype=np.float32)
                                     if 'size_m' in files
@@ -1191,8 +1201,8 @@ class DepthSegmentNode(Node):
                                     if 'edges' in files else None,
                         'contour':  np.asarray(z['contour'], dtype=np.float32)
                                     if 'contour' in files else None,
-                        'color':    np.asarray(z['color'], dtype=np.uint8)
-                                    if 'color' in files else None,
+                        'color':    color_arr,
+                        'gray':     gray_arr,
                         'num_holes': int(z['num_holes'])
                                      if 'num_holes' in files else 0,
                         'orientation': str(z['orientation'])
@@ -1398,6 +1408,12 @@ class DepthSegmentNode(Node):
             }
             if ref_color is not None:
                 save_data['color'] = ref_color.astype(np.uint8)
+                # Grayscale at full reference resolution — used for
+                # physical-scale NCC by the simple _match_part path.
+                gray_ref = (np.mean(ref_color.astype(np.float32), axis=2)
+                            if ref_color.ndim == 3
+                            else ref_color.astype(np.float32))
+                save_data['gray'] = gray_ref.astype(np.float32)
             if ref_depth is not None:
                 save_data['depth'] = ref_depth.astype(np.float32)
             save_data['mask'] = ref_mask.astype(bool)
@@ -2114,13 +2130,195 @@ class DepthSegmentNode(Node):
 
         return features
 
+    def _load_step_dims(self):
+        """Return {part_id: sorted_top_2_extents_m} parsed from
+        /opt/cobot/parts/index.json. The STEP-derived extents are the
+        EXACT ground-truth dimensions and feed the strict size gate."""
+        out = {}
+        path = '/opt/cobot/parts/index.json'
+        if not os.path.isfile(path):
+            return out
+        try:
+            with open(path) as f:
+                idx = json.load(f)
+            for p in idx.get('parts', []):
+                ext = p.get('extents_cm') or []
+                if len(ext) < 2:
+                    continue
+                top2 = sorted([float(ext[0]) / 100.0,
+                               float(ext[1]) / 100.0,
+                               (float(ext[2]) / 100.0 if len(ext) >= 3 else 0.0)],
+                              reverse=True)[:2]
+                out[p['id']] = top2
+        except Exception:
+            pass
+        return out
+
+    def _match_part(self, mask_crop, obb_size, color_crop=None,
+                    depth_crop=None):
+        """Reliable per-detection matcher.
+
+        Two stages:
+          1) STEP-file dimension gate — exact ground-truth extents from
+             /opt/cobot/parts/index.json. Each XY dim must be within 50%
+             of the part's two largest CAD extents and aspect within 50%.
+             Eliminates impossible candidates before any image work.
+          2) Grayscale NCC at the SAME physical resolution as each teach
+             reference, best of 4 rotations.
+
+        Final score is `size * 0.50 + ncc * 0.50`. Threshold 0.60.
+
+        Falls back to CAD-template matching when no teach refs exist
+        (or none for a given part_id) — that path also supplies the
+        orientation tag (pickable / flipped / on_side).
+
+        Returns (name|'unknown', id|None, score, orientation|'').
+        """
+        # If absolutely no teach refs anywhere, lean entirely on templates.
+        if not self._teach_refs:
+            n, pid, s, _y, o = self._match_by_templates(
+                mask_crop, obb_size, color_crop)
+            return (n or 'unknown'), pid, s, (o or '')
+
+        if mask_crop is None or color_crop is None:
+            return 'unknown', None, 0.0, ''
+        crop_h, crop_w = mask_crop.shape[:2]
+        if crop_h < 25 or crop_w < 25:
+            return 'unknown', None, 0.0, ''
+
+        det_max_dim = (max(float(obb_size[0]), float(obb_size[1]))
+                       if obb_size is not None and len(obb_size) >= 2 else 0.0)
+        if det_max_dim < 0.015:
+            return 'unknown', None, 0.0, ''
+
+        det_s = sorted([float(obb_size[0]), float(obb_size[1])], reverse=True)
+        det_asp = det_s[0] / max(det_s[1], 0.001)
+
+        # Detection grayscale at native resolution.
+        if color_crop.ndim == 3:
+            det_gray = np.mean(color_crop.astype(np.float32), axis=2)
+        else:
+            det_gray = color_crop.astype(np.float32)
+
+        # Physical scale of THIS detection. Median depth over the mask
+        # → fx / depth = px/m → /100 = px/cm.
+        if (depth_crop is not None and mask_crop is not None
+                and np.any(mask_crop)):
+            valid = mask_crop & (depth_crop > 0) & np.isfinite(depth_crop)
+            if valid.any():
+                det_distance = float(np.median(depth_crop[valid]))
+            else:
+                det_distance = 0.5
+        else:
+            det_distance = 0.5
+        fx_val = self._K[0] if self._K else 600.0
+        det_px_per_cm = (fx_val / max(det_distance, 1e-3)) / 100.0
+
+        step_dims = self._load_step_dims()
+
+        from scipy.ndimage import zoom as _zoom
+
+        best_score = 0.0
+        best_id    = None
+        best_name  = 'unknown'
+
+        for part_id, refs in self._teach_refs.items():
+            # ── Size gate from STEP dimensions ─────────────────────────
+            sd = step_dims.get(part_id)
+            if sd is not None:
+                r0 = min(det_s[0], sd[0]) / max(det_s[0], sd[0], 0.001)
+                r1 = min(det_s[1], sd[1]) / max(det_s[1], sd[1], 0.001)
+                step_asp = sd[0] / max(sd[1], 0.001)
+                asp_r = (min(det_asp, step_asp)
+                         / max(det_asp, step_asp, 0.001))
+                if r0 < 0.50 or r1 < 0.50 or asp_r < 0.50:
+                    continue
+                size_score = (r0 + r1 + asp_r) / 3.0
+            else:
+                size_score = 0.5  # no STEP record — neutral
+
+            # ── Physical-scale NCC against each ref ────────────────────
+            best_ref_ncc = 0.0
+            for ref in refs:
+                ref_gray = ref.get('gray')
+                ref_px_per_cm = float(ref.get('px_per_cm', 10.0) or 10.0)
+                if ref_gray is None or ref_px_per_cm <= 0:
+                    continue
+                ref_h, ref_w = ref_gray.shape[:2]
+
+                # Scale detection so 1 cm on the part takes the same
+                # pixel count as it does in the reference.
+                phys_scale = ref_px_per_cm / max(det_px_per_cm, 0.1)
+                target_h = int(round(crop_h * phys_scale))
+                target_w = int(round(crop_w * phys_scale))
+                if (target_h < 20 or target_w < 20
+                        or target_h > 300 or target_w > 300):
+                    continue
+                try:
+                    det_scaled = _zoom(
+                        det_gray,
+                        (target_h / crop_h, target_w / crop_w), order=1)
+                except Exception:
+                    continue
+
+                for rot in range(4):
+                    dr = np.rot90(det_scaled, rot) if rot else det_scaled
+                    mh = min(dr.shape[0], ref_h)
+                    mw = min(dr.shape[1], ref_w)
+                    if mh < 15 or mw < 15:
+                        continue
+                    a = ref_gray[:mh, :mw].flatten()
+                    b = dr[:mh, :mw].flatten()
+                    if a.size != b.size or a.size < 100:
+                        continue
+                    a_m, a_s = float(a.mean()), float(a.std())
+                    b_m, b_s = float(b.mean()), float(b.std())
+                    if a_s < 1.0 or b_s < 1.0:
+                        continue  # flat / featureless — can't trust
+                    ncc = float(np.mean(
+                        (a - a_m) * (b - b_m)
+                    ) / (a_s * b_s))
+                    if ncc > best_ref_ncc:
+                        best_ref_ncc = max(0.0, ncc)
+
+            combined = size_score * 0.50 + best_ref_ncc * 0.50
+            self.get_logger().info(
+                f'PART_MATCH: {part_id[:8]} '
+                f'det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm] '
+                f'step={[round(sd[0]*100,1), round(sd[1]*100,1)] if sd else "N/A"} '
+                f'size={size_score:.2f} ncc={best_ref_ncc:.2f} '
+                f'total={combined:.2f}',
+                throttle_duration_sec=3.0)
+
+            if combined > best_score:
+                best_score = combined
+                best_id    = part_id
+                meta_path  = f'/opt/cobot/parts/metadata/{part_id}.json'
+                if os.path.isfile(meta_path):
+                    try:
+                        with open(meta_path) as fp:
+                            best_name = json.load(fp).get('name') or part_id
+                    except Exception:
+                        best_name = part_id
+                else:
+                    best_name = part_id
+
+        # If we found a teach match, use it (no orientation — operator
+        # captures don't carry orientation tags). If we didn't, try the
+        # template path so orientation/CAD-only parts still match.
+        if best_score >= 0.60 and best_id is not None:
+            return best_name, best_id, round(best_score, 3), ''
+
+        n, pid, s, _y, o = self._match_by_templates(
+            mask_crop, obb_size, color_crop)
+        if n and s >= 0.55:
+            return n, pid, s, (o or '')
+        return 'unknown', None, 0.0, ''
+
     def _match_parts(self, objects):
-        """CAD-geometry recognition against the parts library, with
-        teach-mode references as a parallel matcher; whichever scores
-        higher wins. Geometry comparison is on hole count + pattern,
-        top-down height profile, edge profile, size and aspect — the
-        same features extract_geometric_features() computed when the
-        STEP file was uploaded."""
+        """Two-stage recognition: STEP dimension gate + physical-scale
+        NCC against teach refs, with CAD-template matching as fallback
+        for parts the operator hasn't taught."""
         if not objects:
             return
         if self._teach_mode:
@@ -2135,32 +2333,29 @@ class DepthSegmentNode(Node):
                 o['yaw_error_deg']    = 0.0
                 o['surface_ok']       = None
                 o['position_status']  = ''
+                o['orientation']      = None
                 o['_holes']           = []
                 o['_match_reason']    = ''
                 o['_match_source']    = ''
             return
         for o in objects:
             mask  = o.get('mask_2d')
+            depth = o.get('depth_2d')
             sx, sy, sz = o.get('size_3d') or (0.05, 0.05, 0.05)
             size_m = [float(sx), float(sy), float(sz)]
+            color_crop = o.get('color_crop')
 
-            # Template matching is the SOLE recognition path. Templates
-            # are CAD-derived from 6 viewing directions × 12 yaws so a
-            # match also tells us whether the part is pickable, flipped
-            # (upside down), or on its side.
-            tpl_name, tpl_id, tpl_score, tpl_yaw, tpl_orient = (
-                self._match_by_templates(
-                    mask, size_m, color_crop=o.get('color_crop')))
-
-            best_name, best_id, best_score = tpl_name, tpl_id, tpl_score
-            match_source = 'template' if tpl_name else ''
+            name, pid, score, orient = self._match_part(
+                mask, size_m, color_crop=color_crop, depth_crop=depth)
+            matched = (name and name != 'unknown')
 
             o['_holes']        = []
             o['_match_reason'] = ''
-            o['_match_source'] = match_source
-            o['orientation']   = tpl_orient
+            o['_match_source'] = ('teach' if matched and not orient
+                                  else ('template' if matched else ''))
+            o['orientation']   = orient or None
 
-            if best_name is None or best_score < 0.55:
+            if not matched:
                 o['part_name']        = None
                 o['part_id']          = None
                 o['match_score']      = 0.0
@@ -2171,20 +2366,20 @@ class DepthSegmentNode(Node):
                 o['position_status']  = ''
                 continue
 
-            o['part_name']   = str(best_name)
-            o['part_id']     = str(best_id) if best_id else None
-            o['match_score'] = float(round(best_score, 3))
-            o['match_yaw']   = float(tpl_yaw)
-            # The 6-orientation tag IS the position verdict: 'pickable'
-            # means the part is right-side up. Anything else needs to be
-            # re-oriented before picking.
-            o['position_correct'] = (tpl_orient == 'pickable')
+            o['part_name']   = str(name)
+            o['part_id']     = str(pid) if pid else None
+            o['match_score'] = float(round(score, 3))
+            o['match_yaw']   = 0.0
+            # When the template path supplied orient, encode the
+            # pickable / flipped / on_side verdict. Teach-only matches
+            # have no orientation info — treat as unknown.
+            o['position_correct'] = (orient == 'pickable') if orient else None
             o['yaw_error_deg']    = 0.0
-            o['surface_ok']       = (tpl_orient == 'pickable')
+            o['surface_ok']       = (orient == 'pickable') if orient else None
             o['position_status']  = (
-                'PICKABLE' if tpl_orient == 'pickable'
-                else ('FLIPPED' if tpl_orient == 'flipped'
-                      else ('ON_SIDE' if tpl_orient == 'on_side' else '')))
+                'PICKABLE' if orient == 'pickable'
+                else ('FLIPPED' if orient == 'flipped'
+                      else ('ON_SIDE' if orient == 'on_side' else '')))
 
     # ── Publishing ────────────────────────────────────────────────────────────
 
