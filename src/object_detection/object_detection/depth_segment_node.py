@@ -904,6 +904,18 @@ class DepthSegmentNode(Node):
         # the annulus into arcs despite the post-carving fill_holes.
         objects = self._merge_overlapping_detections(objects, w, h)
 
+        # Attach RGB crops once for every detection (used by teach
+        # capture + matching). Doing it here covers all build paths
+        # (main OBB, small-points fallback, kmeans clusters, merged).
+        rgb_full = self._color_rgb
+        if rgb_full is not None and rgb_full.shape[0] == h and rgb_full.shape[1] == w:
+            for o in objects:
+                bx0, by0, bx1, by1 = o['bbox_px']
+                bx0 = max(0, int(bx0)); by0 = max(0, int(by0))
+                bx1 = min(w, int(bx1)); by1 = min(h, int(by1))
+                if bx1 > bx0 and by1 > by0:
+                    o['color_crop'] = rgb_full[by0:by1, bx0:bx1].copy()
+
         self._history.append(objects)
         self._emit(h, w)
 
@@ -932,11 +944,15 @@ class DepthSegmentNode(Node):
                     continue
                 try:
                     z = np.load(os.path.join(pdir, fn))
-                    refs.append({
+                    ref = {
                         'depth':  np.asarray(z['depth'],  dtype=np.float32),
                         'mask':   np.asarray(z['mask'],   dtype=bool),
                         'size_m': np.asarray(z['size_m'], dtype=np.float32),
-                    })
+                        'gray':   None,
+                    }
+                    if 'gray' in z.files:
+                        ref['gray'] = np.asarray(z['gray'], dtype=np.float32)
+                    refs.append(ref)
                 except Exception:
                     continue
             if refs:
@@ -944,7 +960,9 @@ class DepthSegmentNode(Node):
         if self._teach_refs:
             self.get_logger().info(
                 'teach refs loaded: '
-                + ', '.join(f'{k}({len(v)})' for k, v in self._teach_refs.items())
+                + ', '.join(
+                    f'{k}({len(v)}, rgb={"yes" if any(r["gray"] is not None for r in v) else "no"})'
+                    for k, v in self._teach_refs.items())
             )
 
     def _on_teach_command(self, msg):
@@ -971,6 +989,7 @@ class DepthSegmentNode(Node):
         det = self._last_objects[idx]
         mask  = det.get('mask_2d')
         depth = det.get('depth_2d')
+        color = det.get('color_crop')
         size  = det.get('size_3d') or (0.05, 0.05, 0.05)
         if mask is None or depth is None or not np.any(mask):
             self.get_logger().warn('teach: detection has no mask/depth')
@@ -981,22 +1000,54 @@ class DepthSegmentNode(Node):
             self.get_logger().error(f'teach: normalise failed: {e}')
             return
 
+        # RGB is far more distinctive than depth on small metal parts.
+        # Resize to 64x64, take grayscale, normalise to [0,1] per-crop so
+        # lighting drift across teach sessions doesn't blow up the NCC.
+        gray_64 = None
+        color_64 = None
+        if color is not None and color.size > 0:
+            try:
+                from scipy.ndimage import zoom as _zoom
+                ch, cw = color.shape[:2]
+                if ch > 0 and cw > 0:
+                    fy = 64.0 / float(ch); fx = 64.0 / float(cw)
+                    if color.ndim == 3:
+                        color_64 = _zoom(color.astype(np.float32), (fy, fx, 1), order=1)
+                        gray_64  = color_64.mean(axis=2)
+                    else:
+                        gray_64  = _zoom(color.astype(np.float32), (fy, fx), order=1)
+                    g_min = float(gray_64.min()); g_max = float(gray_64.max())
+                    if g_max > g_min:
+                        gray_64 = (gray_64 - g_min) / (g_max - g_min)
+                    else:
+                        gray_64 = np.zeros_like(gray_64)
+            except Exception as e:
+                self.get_logger().warn(f'teach: gray prep failed: {e}')
+                gray_64 = None
+                color_64 = None
+
         os.makedirs(self._teach_dir(part_id), exist_ok=True)
         existing = sum(1 for f in os.listdir(self._teach_dir(part_id)) if f.endswith('.npz'))
         out_path = os.path.join(self._teach_dir(part_id), f'ref_{existing:03d}.npz')
         try:
-            np.savez_compressed(
-                out_path,
-                depth=d_std.astype(np.float32),
-                mask=m_std.astype(bool),
-                size_m=np.asarray(size, dtype=np.float32),
-            )
+            save_kwargs = {
+                'depth':  d_std.astype(np.float32),
+                'mask':   m_std.astype(bool),
+                'size_m': np.asarray(size, dtype=np.float32),
+            }
+            if gray_64 is not None:
+                save_kwargs['gray'] = gray_64.astype(np.float32)
+            if color_64 is not None:
+                save_kwargs['color'] = np.clip(color_64, 0, 255).astype(np.uint8)
+            np.savez_compressed(out_path, **save_kwargs)
         except Exception as e:
             self.get_logger().error(f'teach: save failed: {e}')
             return
         self._load_teach_refs()
         n = len(self._teach_refs.get(part_id, []))
-        self.get_logger().info(f'teach: saved {out_path} (part now has {n} refs)')
+        has_rgb = 'yes' if gray_64 is not None else 'no'
+        self.get_logger().info(
+            f'teach: saved {out_path} (part now has {n} refs, rgb={has_rgb})')
 
     @staticmethod
     def _normalise_for_match(depth_crop, mask_crop, target=64):
@@ -1021,10 +1072,13 @@ class DepthSegmentNode(Node):
         d[~m] = 0.0
         return d.astype(np.float32), m
 
-    def _match_by_teach(self, depth_crop, mask_crop, obb_size):
-        """Match against taught references. Returns (name, id, score)
-        or ('unknown', None, 0). Scoring blends mask IoU + depth NCC
-        + size-ratio; final threshold 0.55."""
+    def _match_by_teach(self, depth_crop, mask_crop, obb_size, color_crop=None):
+        """Match against taught references. RGB grayscale NCC dominates
+        because depth on small metal parts is too noisy to discriminate;
+        mask IoU + depth NCC + size act as supporting signals. Each
+        candidate is scored across 4 mask/RGB rotations to absorb yaw
+        ambiguity from the OBB fit. Returns (name, id, score) or
+        ('unknown', None, 0); threshold 0.55."""
         if not self._teach_refs:
             return 'unknown', None, 0.0
         if depth_crop is None or mask_crop is None or not np.any(mask_crop):
@@ -1034,9 +1088,33 @@ class DepthSegmentNode(Node):
             det_d, det_m = self._normalise_for_match(depth_crop, mask_crop)
         except Exception:
             return 'unknown', None, 0.0
+
+        # Per-crop grayscale, normalised to [0,1] so lighting drift
+        # between teach and runtime doesn't dominate the NCC.
+        det_g = None
+        if color_crop is not None and color_crop.size > 0:
+            try:
+                from scipy.ndimage import zoom as _zoom
+                ch, cw = color_crop.shape[:2]
+                if ch > 0 and cw > 0:
+                    fy = 64.0 / float(ch); fx = 64.0 / float(cw)
+                    if color_crop.ndim == 3:
+                        g = color_crop.astype(np.float32).mean(axis=2)
+                    else:
+                        g = color_crop.astype(np.float32)
+                    g64 = _zoom(g, (fy, fx), order=1)
+                    g_min = float(g64.min()); g_max = float(g64.max())
+                    if g_max > g_min:
+                        det_g = (g64 - g_min) / (g_max - g_min)
+                    else:
+                        det_g = np.zeros_like(g64)
+            except Exception:
+                det_g = None
+
         det_sorted = sorted([float(s) for s in obb_size], reverse=True)
 
         best_name, best_id, best_score = 'unknown', None, 0.0
+        best_breakdown = (0.0, 0.0, 0.0, 0.0)  # gray, iou, depth, size
         for pid, refs in self._teach_refs.items():
             for ref in refs:
                 ref_sorted = sorted([float(s) for s in ref['size_m']], reverse=True)
@@ -1049,35 +1127,83 @@ class DepthSegmentNode(Node):
                 ref_m = ref['mask']
                 if ref_m.shape != det_m.shape:
                     continue
-                inter = int(np.sum(det_m & ref_m))
-                union = int(np.sum(det_m | ref_m))
-                if union == 0:
-                    continue
-                mask_iou = inter / union
+                ref_d = ref['depth']
+                ref_g = ref.get('gray')
 
-                overlap = det_m & ref_m
-                if int(np.sum(overlap)) < 100:
-                    continue
-                a = det_d[overlap]
-                b = ref['depth'][overlap]
-                a_mean, b_mean = float(a.mean()), float(b.mean())
-                a_std,  b_std  = float(a.std()),  float(b.std())
-                if a_std < 0.01 or b_std < 0.01:
-                    ncc = mask_iou
+                # Try all 4 rotations of the DETECTION crops against the
+                # fixed reference. The OBB fit can flip yaw 90°/180° on
+                # symmetric parts, so picking the best rotation prevents
+                # a correct match from being thrown out.
+                mask_iou_best = 0.0
+                depth_best    = 0.0
+                gray_best     = 0.0
+                for rot in range(4):
+                    m_rot = np.rot90(det_m, rot)
+                    d_rot = np.rot90(det_d, rot)
+                    inter = int(np.sum(m_rot & ref_m))
+                    union = int(np.sum(m_rot | ref_m))
+                    if union == 0:
+                        continue
+                    iou = inter / union
+                    if iou > mask_iou_best:
+                        mask_iou_best = iou
+
+                    overlap = m_rot & ref_m
+                    if int(np.sum(overlap)) >= 100:
+                        a = d_rot[overlap]; b = ref_d[overlap]
+                        a_s = float(a.std()); b_s = float(b.std())
+                        if a_s > 0.01 and b_s > 0.01:
+                            ncc = float(np.mean(
+                                (a - float(a.mean())) * (b - float(b.mean()))
+                            ) / (a_s * b_s))
+                            if ncc > depth_best:
+                                depth_best = ncc
+
+                    if det_g is not None and ref_g is not None:
+                        g_rot = np.rot90(det_g, rot)
+                        a = g_rot.ravel(); b = ref_g.ravel()
+                        a_s = float(a.std()); b_s = float(b.std())
+                        if a_s > 0.02 and b_s > 0.02:
+                            ncc = float(np.mean(
+                                (a - float(a.mean())) * (b - float(b.mean()))
+                            ) / (a_s * b_s))
+                            if ncc > gray_best:
+                                gray_best = ncc
+
+                depth_score = max(0.0, depth_best)
+                gray_score  = max(0.0, gray_best)
+
+                if det_g is not None and ref_g is not None:
+                    # RGB available on both sides — weight it heavily;
+                    # depth is the least-reliable channel for small parts.
+                    score = (gray_score   * 0.45 +
+                             mask_iou_best * 0.20 +
+                             depth_score   * 0.10 +
+                             size_score    * 0.25)
                 else:
-                    ncc = float(np.mean((a - a_mean) * (b - b_mean)) / (a_std * b_std))
-                    ncc = max(0.0, ncc)
+                    # Legacy ref (or detection has no colour) — fall back
+                    # to the original depth+mask+size blend.
+                    score = (mask_iou_best * 0.35 +
+                             depth_score   * 0.30 +
+                             size_score    * 0.35)
 
-                score = ncc * 0.40 + mask_iou * 0.30 + size_score * 0.30
                 if score > best_score:
                     best_score = score
                     best_id    = pid
+                    best_breakdown = (gray_score, mask_iou_best, depth_score, size_score)
                     meta_path  = f'/opt/cobot/parts/metadata/{pid}.json'
                     try:
                         with open(meta_path) as fp:
                             best_name = json.load(fp).get('name') or pid
                     except Exception:
                         best_name = pid
+
+        if best_score > 0.30:
+            g, m, d, sz = best_breakdown
+            self.get_logger().info(
+                f'TEACH_MATCH: {best_name} score={best_score:.2f} '
+                f'gray={g:.2f} mask_iou={m:.2f} depth={d:.2f} size={sz:.2f}',
+                throttle_duration_sec=3.0)
 
         if best_score < 0.55:
             return 'unknown', None, 0.0
@@ -1418,8 +1544,9 @@ class DepthSegmentNode(Node):
 
             # 2) Teach-mode match — kept as a parallel matcher because
             # an operator capture often beats CAD on noisy small parts.
+            # Pass the RGB crop so the matcher's gray NCC fires.
             teach_name, teach_id, teach_score = self._match_by_teach(
-                depth, mask, size_m)
+                depth, mask, size_m, color_crop=o.get('color_crop'))
 
             # Higher score wins. CAD is preferred on ties to bias toward
             # the structurally-defined match when both fire equally.
