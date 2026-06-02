@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef, Suspense } from 'react'
-import { Canvas } from '@react-three/fiber'
+import { useState, useEffect, useRef, useMemo, useCallback, Suspense } from 'react'
+import { Canvas, useThree } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader'
@@ -27,10 +27,45 @@ const FRONT_OPTIONS = [
 
 // ── 3D model loaded from STL ─────────────────────────────────────────
 
-function PartModel3D({ url, rotation, frontAngle }) {
+function PartModel3D({ url, rotation, frontAngle, onFaceClick }) {
   const groupRef = useRef()
   const meshRef  = useRef(null)
   const [ready, setReady] = useState(false)
+  const { raycaster, camera, pointer } = useThree()
+
+  // Raycast on click to find which face of the model was hit. The face
+  // normal (in world space) becomes the operator's chosen pick approach.
+  const handleClick = useCallback(() => {
+    if (!groupRef.current || !onFaceClick) return
+    const meshes = []
+    groupRef.current.traverse(child => {
+      if (child.isMesh) meshes.push(child)
+    })
+    if (meshes.length === 0) return
+    raycaster.setFromCamera(pointer, camera)
+    const intersects = raycaster.intersectObjects(meshes, true)
+    if (intersects.length === 0) return
+    const hit = intersects[0]
+    if (!hit.face) return
+    const normal = hit.face.normal.clone()
+    normal.transformDirection(hit.object.matrixWorld)
+    normal.normalize()
+    // Approach type comes from how vertical the surface normal is:
+    //   |y| > 0.7 → top/bottom face  → top_down
+    //   |y| < 0.3 → vertical face    → side
+    //   between  → angled face       → angled
+    const ay = Math.abs(normal.y)
+    const approach = ay > 0.7 ? 'top_down' : ay < 0.3 ? 'side' : 'angled'
+    onFaceClick({
+      normal: [normal.x, normal.y, normal.z],
+      point:  [hit.point.x, hit.point.y, hit.point.z],
+      approach,
+    })
+  }, [raycaster, camera, pointer, onFaceClick])
+
+  // Reset cursor on unmount so it doesn't get stuck as 'crosshair' if
+  // the user closes the configurator mid-hover.
+  useEffect(() => () => { document.body.style.cursor = 'default' }, [])
 
   // Load the STL, build the mesh, and attach it imperatively to the
   // group. Imperative attach guarantees the mesh is in the scene graph
@@ -104,7 +139,14 @@ function PartModel3D({ url, rotation, frontAngle }) {
     }
   }, [rotation, frontAngle, ready])
 
-  return <group ref={groupRef} />
+  return (
+    <group
+      ref={groupRef}
+      onClick={handleClick}
+      onPointerOver={() => { if (onFaceClick) document.body.style.cursor = 'crosshair' }}
+      onPointerOut={() => { document.body.style.cursor = 'default' }}
+    />
+  )
 }
 
 // ── Pick-direction arrow (world-space, sits above the part) ─────────
@@ -140,7 +182,64 @@ function PickDirectionArrow({ approach, partExtents }) {
   )
 }
 
-function PartCanvas({ url, rotation, frontAngle, approach, partExtents }) {
+// ── Green disc marking the clicked face ─────────────────────────────
+
+function SelectedFaceHighlight({ point, normal }) {
+  const quat = useMemo(() => {
+    if (!normal) return new THREE.Quaternion()
+    const up = new THREE.Vector3(0, 1, 0)
+    const n  = new THREE.Vector3(normal[0], normal[1], normal[2]).normalize()
+    return new THREE.Quaternion().setFromUnitVectors(up, n)
+  }, [normal])
+  if (!point || !normal) return null
+  return (
+    <mesh position={point} quaternion={quat}>
+      <circleGeometry args={[0.03, 32]} />
+      <meshBasicMaterial color="#16A34A" transparent opacity={0.5} side={THREE.DoubleSide} />
+    </mesh>
+  )
+}
+
+// ── Approach arrow pointing along the clicked face's normal ─────────
+
+function PickArrowFromNormal({ normal, point }) {
+  const { start, quaternion } = useMemo(() => {
+    const n = new THREE.Vector3(normal[0], normal[1], normal[2]).normalize()
+    // Stand off 0.25 along the surface normal; arrow points back into surface.
+    const s = new THREE.Vector3(
+      point[0] + n.x * 0.25,
+      point[1] + n.y * 0.25,
+      point[2] + n.z * 0.25,
+    )
+    const defaultDir = new THREE.Vector3(0, -1, 0)
+    const targetDir  = n.clone().negate()
+    const q = new THREE.Quaternion().setFromUnitVectors(defaultDir, targetDir)
+    return { start: s, quaternion: q }
+  }, [normal, point])
+
+  if (!normal || !point) return null
+  return (
+    <group position={[start.x, start.y, start.z]} quaternion={quaternion}>
+      {/* Shaft */}
+      <mesh position={[0, 0.06, 0]}>
+        <cylinderGeometry args={[0.004, 0.004, 0.12, 8]} />
+        <meshStandardMaterial color="#16A34A" />
+      </mesh>
+      {/* Cone head pointing toward the surface (downward in local frame) */}
+      <mesh position={[0, -0.01, 0]} rotation={[Math.PI, 0, 0]}>
+        <coneGeometry args={[0.016, 0.035, 12]} />
+        <meshStandardMaterial color="#16A34A" />
+      </mesh>
+      {/* Ring at the contact point */}
+      <mesh position={[0, -0.03, 0]} rotation={[Math.PI / 2, 0, 0]}>
+        <torusGeometry args={[0.012, 0.002, 8, 16]} />
+        <meshStandardMaterial color="#16A34A" />
+      </mesh>
+    </group>
+  )
+}
+
+function PartCanvas({ url, rotation, frontAngle, approach, partExtents, selectedFace, onFaceClick }) {
   return (
     <Canvas shadows camera={{ position: [1.0, 0.8, 1.0], fov: 38 }}
             style={{ width: '100%', height: '100%', background: '#FFFFFF' }}>
@@ -166,9 +265,21 @@ function PartCanvas({ url, rotation, frontAngle, approach, partExtents }) {
         <axesHelper args={[0.18]} />
       </group>
       <Suspense fallback={null}>
-        <PartModel3D url={url} rotation={rotation} frontAngle={frontAngle} />
+        <PartModel3D
+          url={url}
+          rotation={rotation}
+          frontAngle={frontAngle}
+          onFaceClick={onFaceClick}
+        />
       </Suspense>
-      <PickDirectionArrow approach={approach || 'top_down'} partExtents={partExtents} />
+      {selectedFace ? (
+        <>
+          <SelectedFaceHighlight point={selectedFace.point} normal={selectedFace.normal} />
+          <PickArrowFromNormal  normal={selectedFace.normal} point={selectedFace.point} />
+        </>
+      ) : (
+        <PickDirectionArrow approach={approach || 'top_down'} partExtents={partExtents} />
+      )}
       <OrbitControls enableDamping dampingFactor={0.08} />
     </Canvas>
   )
@@ -340,7 +451,27 @@ function PartConfigurator({ partId, onSave, onDelete }) {
     approach:       'top_down',
     pick_offset_cm: 2.0,
   })
+  // selectedFace = { normal: [x,y,z], point: [x,y,z], approach: 'top_down'|'side'|'angled' }
+  const [selectedFace, setSelectedFace] = useState(null)
   const [saving, setSaving]       = useState(false)
+
+  const handleFaceClick = (faceData) => {
+    setSelectedFace(faceData)
+    setGrasp(prev => ({
+      ...prev,
+      approach:    faceData.approach,
+      pick_normal: faceData.normal,
+      pick_point:  faceData.point,
+    }))
+  }
+
+  const resetSelectedFace = () => {
+    setSelectedFace(null)
+    setGrasp(prev => {
+      const { pick_normal: _pn, pick_point: _pp, ...rest } = prev
+      return rest
+    })
+  }
 
   useEffect(() => {
     fetch(`/api/parts/${partId}`)
@@ -359,10 +490,20 @@ function PartConfigurator({ partId, onSave, onDelete }) {
         if (typeof d.priority === 'number')  setPriority(d.priority)
         if (d.notes)                         setNotes(d.notes)
         if (d.grasp) {
-          setGrasp({
+          const g = {
             approach:       d.grasp.approach || 'top_down',
             pick_offset_cm: d.grasp.pick_offset_cm ?? 2.0,
-          })
+          }
+          if (Array.isArray(d.grasp.pick_normal) && Array.isArray(d.grasp.pick_point)) {
+            g.pick_normal = d.grasp.pick_normal
+            g.pick_point  = d.grasp.pick_point
+            setSelectedFace({
+              normal:   d.grasp.pick_normal,
+              point:    d.grasp.pick_point,
+              approach: g.approach,
+            })
+          }
+          setGrasp(g)
         }
       })
   }, [partId])
@@ -424,7 +565,8 @@ function PartConfigurator({ partId, onSave, onDelete }) {
       {/* 3D viewer — 60% */}
       <div style={{ flex: 3, background: '#FFFFFF', position: 'relative' }}>
         <PartCanvas url={stlUrl} rotation={rotation} frontAngle={frontAngle}
-                    approach={grasp.approach} partExtents={part?.extents_m} />
+                    approach={grasp.approach} partExtents={part?.extents_m}
+                    selectedFace={selectedFace} onFaceClick={handleFaceClick} />
         <div style={{
           position: 'absolute', top: 12, left: 12,
           background: 'rgba(255,255,255,0.85)', color: '#111827',
@@ -510,6 +652,43 @@ function PartConfigurator({ partId, onSave, onDelete }) {
           <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 10 }}>
             Pick Approach
           </div>
+
+          {/* Hint: click-to-select-face on the 3D model */}
+          <div style={{
+            fontSize: 11, color: 'var(--accent)',
+            background: 'var(--accent-dim)',
+            padding: '8px 12px', borderRadius: 'var(--radius-sm)',
+            marginBottom: 12,
+            display: 'flex', alignItems: 'center', gap: 8,
+          }}>
+            <span>💡</span>
+            <span>Click a face on the 3D model to set the pick direction, or use the buttons below.</span>
+          </div>
+
+          {selectedFace && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              marginBottom: 12, padding: '6px 12px',
+              background: 'var(--green-dim)',
+              borderRadius: 'var(--radius-sm)', fontSize: 12,
+            }}>
+              <span style={{ color: 'var(--green)', fontWeight: 600 }}>
+                ✓ Face selected — approach: {grasp.approach}
+              </span>
+              <button
+                onClick={resetSelectedFace}
+                style={{
+                  marginLeft: 'auto',
+                  padding: '2px 8px', fontSize: 10,
+                  background: 'transparent', color: 'var(--text-muted)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 'var(--radius-sm)', cursor: 'pointer',
+                }}
+              >
+                Reset
+              </button>
+            </div>
+          )}
 
           <div style={{ marginBottom: 16 }}>
             <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 6 }}>Direction</div>
