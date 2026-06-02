@@ -107,100 +107,40 @@ function PartModel3D({ url, rotation, frontAngle }) {
   return <group ref={groupRef} />
 }
 
-// ── Gripper previews (world-space, sits above the part) ─────────────
+// ── Pick-direction arrow (world-space, sits above the part) ─────────
 
-const APPROACH_HEIGHT = 0.35   // world Y above the table
-const VIEWER_SCALE    = 2.5    // cm/mm -> viewer-units multiplier
+function PickDirectionArrow({ approach, partExtents }) {
+  const length = Math.max(...(partExtents || [0.05, 0.05, 0.05])) * 3
 
-function FingerGripperPreview({ settings }) {
-  const width    = ((settings.gripper_width_cm ?? 5) / 100) * VIEWER_SCALE
-  const depth    = ((settings.finger_depth_cm   ?? 3) / 100) * VIEWER_SCALE
-  const thick    = 0.015 * VIEWER_SCALE
-  const halfOpen = width / 2
-  return (
-    <group position={[0, APPROACH_HEIGHT, 0]}>
-      {/* Mount plate */}
-      <mesh position={[0, 0.04, 0]}>
-        <boxGeometry args={[width * 1.2, 0.02 * VIEWER_SCALE, depth * 0.8]} />
-        <meshStandardMaterial color="#404550" metalness={0.7} roughness={0.3} />
-      </mesh>
-      {/* Fingers */}
-      <mesh position={[-halfOpen, -0.02, 0]}>
-        <boxGeometry args={[thick, 0.06 * VIEWER_SCALE, depth]} />
-        <meshStandardMaterial color="#606876" metalness={0.6} roughness={0.35} />
-      </mesh>
-      <mesh position={[halfOpen, -0.02, 0]}>
-        <boxGeometry args={[thick, 0.06 * VIEWER_SCALE, depth]} />
-        <meshStandardMaterial color="#606876" metalness={0.6} roughness={0.35} />
-      </mesh>
-      {/* Approach arrow */}
-      <mesh position={[0, 0.12, 0]} rotation={[Math.PI, 0, 0]}>
-        <coneGeometry args={[0.015 * VIEWER_SCALE, 0.04 * VIEWER_SCALE, 8]} />
-        <meshBasicMaterial color="#16A34A" />
-      </mesh>
-    </group>
-  )
-}
+  let rotation = [0, 0, 0]
+  let offset   = [0, 0.4, 0]
 
-function SuctionCupPreview({ settings }) {
-  const cupDiameter = ((settings.cup_diameter_mm ?? 30) / 1000) * VIEWER_SCALE
-  const numCups     = settings.num_cups ?? 1
-  const cupRadius   = cupDiameter / 2
-
-  const cupPositions = []
-  if (numCups === 1) {
-    cupPositions.push([0, 0, 0])
-  } else if (numCups === 2) {
-    cupPositions.push([-cupDiameter * 0.8, 0, 0])
-    cupPositions.push([ cupDiameter * 0.8, 0, 0])
-  } else if (numCups === 4) {
-    cupPositions.push([-cupDiameter * 0.8, 0, -cupDiameter * 0.8])
-    cupPositions.push([ cupDiameter * 0.8, 0, -cupDiameter * 0.8])
-    cupPositions.push([-cupDiameter * 0.8, 0,  cupDiameter * 0.8])
-    cupPositions.push([ cupDiameter * 0.8, 0,  cupDiameter * 0.8])
+  if (approach === 'top_down') {
+    rotation = [Math.PI, 0, 0]
+    offset   = [0, 0.35, 0]
+  } else if (approach === 'side') {
+    rotation = [0, 0, Math.PI / 2]
+    offset   = [0.35, 0.1, 0]
+  } else if (approach === 'angled') {
+    rotation = [Math.PI * 0.75, 0, 0]
+    offset   = [0.15, 0.3, 0]
   }
-  const plateR = Math.max(cupDiameter * 1.5, cupDiameter * 0.8 * Math.SQRT2 + cupRadius)
 
   return (
-    <group position={[0, APPROACH_HEIGHT, 0]}>
-      {/* Vacuum manifold */}
-      <mesh position={[0, 0.04, 0]}>
-        <cylinderGeometry args={[plateR, plateR, 0.015 * VIEWER_SCALE, 24]} />
-        <meshStandardMaterial color="#404550" metalness={0.7} roughness={0.3} />
+    <group position={offset} rotation={rotation}>
+      <mesh position={[0, length / 2, 0]}>
+        <cylinderGeometry args={[0.008, 0.008, length, 8]} />
+        <meshStandardMaterial color="#16A34A" />
       </mesh>
-      {/* Vacuum tube */}
-      <mesh position={[0, 0.08, 0]}>
-        <cylinderGeometry args={[0.006 * VIEWER_SCALE, 0.006 * VIEWER_SCALE, 0.06 * VIEWER_SCALE, 12]} />
-        <meshStandardMaterial color="#505560" metalness={0.5} roughness={0.4} />
-      </mesh>
-      {/* Cups */}
-      {cupPositions.map((pos, i) => (
-        <group key={i} position={pos}>
-          <mesh position={[0, -0.01, 0]}>
-            <cylinderGeometry args={[cupRadius, cupRadius * 0.7, 0.025 * VIEWER_SCALE, 16]} />
-            <meshStandardMaterial color="#2563EB" transparent opacity={0.85} roughness={0.7} />
-          </mesh>
-          <mesh position={[0, -0.025, 0]}>
-            <torusGeometry args={[cupRadius, 0.003 * VIEWER_SCALE, 8, 24]} />
-            <meshStandardMaterial color="#1D4ED8" roughness={0.6} />
-          </mesh>
-        </group>
-      ))}
-      {/* Approach arrow */}
-      <mesh position={[0, 0.14, 0]} rotation={[Math.PI, 0, 0]}>
-        <coneGeometry args={[0.015 * VIEWER_SCALE, 0.04 * VIEWER_SCALE, 8]} />
-        <meshBasicMaterial color="#16A34A" />
+      <mesh position={[0, 0, 0]}>
+        <coneGeometry args={[0.025, 0.06, 12]} />
+        <meshStandardMaterial color="#16A34A" />
       </mesh>
     </group>
   )
 }
 
-function GripperPreview3D({ type, settings }) {
-  if (type === 'suction') return <SuctionCupPreview settings={settings} />
-  return <FingerGripperPreview settings={settings} />
-}
-
-function PartCanvas({ url, rotation, frontAngle, gripperType, graspSettings }) {
+function PartCanvas({ url, rotation, frontAngle, approach, partExtents }) {
   return (
     <Canvas shadows camera={{ position: [1.0, 0.8, 1.0], fov: 38 }}
             style={{ width: '100%', height: '100%', background: '#FFFFFF' }}>
@@ -228,7 +168,7 @@ function PartCanvas({ url, rotation, frontAngle, gripperType, graspSettings }) {
       <Suspense fallback={null}>
         <PartModel3D url={url} rotation={rotation} frontAngle={frontAngle} />
       </Suspense>
-      {gripperType && <GripperPreview3D type={gripperType} settings={graspSettings || {}} />}
+      <PickDirectionArrow approach={approach || 'top_down'} partExtents={partExtents} />
       <OrbitControls enableDamping dampingFactor={0.08} />
     </Canvas>
   )
@@ -396,15 +336,9 @@ function PartConfigurator({ partId, onSave, onDelete }) {
   const [station,     setStation]     = useState('')
   const [priority,    setPriority]    = useState(3)
   const [notes,       setNotes]       = useState('')
-  const [gripperType, setGripperType] = useState('finger')
   const [grasp, setGrasp]         = useState({
-    approach:         'top_down',
-    gripper_width_cm: 5.0,
-    pick_offset_cm:   2.0,
-    finger_depth_cm:  3.0,
-    cup_diameter_mm:  30,
-    num_cups:         1,
-    vacuum_threshold: 70,
+    approach:       'top_down',
+    pick_offset_cm: 2.0,
   })
   const [saving, setSaving]       = useState(false)
 
@@ -425,16 +359,9 @@ function PartConfigurator({ partId, onSave, onDelete }) {
         if (typeof d.priority === 'number')  setPriority(d.priority)
         if (d.notes)                         setNotes(d.notes)
         if (d.grasp) {
-          if (d.grasp.gripper_type) setGripperType(d.grasp.gripper_type)
           setGrasp({
-            approach:         d.grasp.approach || 'top_down',
-            gripper_width_cm: d.grasp.gripper_width_cm
-              ?? ((d.grasp.gripper_opening_m ?? 0.05) * 100),
-            pick_offset_cm:   d.grasp.pick_offset_cm ?? 2.0,
-            finger_depth_cm:  d.grasp.finger_depth_cm ?? 3.0,
-            cup_diameter_mm:  d.grasp.cup_diameter_mm ?? 30,
-            num_cups:         d.grasp.num_cups ?? 1,
-            vacuum_threshold: d.grasp.vacuum_threshold ?? 70,
+            approach:       d.grasp.approach || 'top_down',
+            pick_offset_cm: d.grasp.pick_offset_cm ?? 2.0,
           })
         }
       })
@@ -452,7 +379,7 @@ function PartConfigurator({ partId, onSave, onDelete }) {
           table_rotation:  rotation,
           front_direction: frontDir,
           front_angle_deg: frontAngle,
-          grasp: { ...grasp, gripper_type: gripperType },
+          grasp: { ...grasp },
         }),
       })
       const tagRes = await fetch(`/api/parts/${partId}/tags`, {
@@ -497,7 +424,7 @@ function PartConfigurator({ partId, onSave, onDelete }) {
       {/* 3D viewer — 60% */}
       <div style={{ flex: 3, background: '#FFFFFF', position: 'relative' }}>
         <PartCanvas url={stlUrl} rotation={rotation} frontAngle={frontAngle}
-                    gripperType={gripperType} graspSettings={grasp} />
+                    approach={grasp.approach} partExtents={part?.extents_m} />
         <div style={{
           position: 'absolute', top: 12, left: 12,
           background: 'rgba(255,255,255,0.85)', color: '#111827',
@@ -578,142 +505,48 @@ function PartConfigurator({ partId, onSave, onDelete }) {
           </div>
         </div>
 
-        {/* Gripper type */}
+        {/* Pick approach */}
         <div>
           <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 10 }}>
-            Gripper Type
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-            {[
-              { type: 'finger',  label: 'Finger Gripper', icon: '🤏',
-                desc: 'Two parallel jaws. Rigid parts with flat sides.' },
-              { type: 'suction', label: 'Suction Cup',    icon: '🔵',
-                desc: 'Vacuum. Flat, smooth, non-porous surfaces.' },
-            ].map((opt) => {
-              const active = gripperType === opt.type
-              return (
-                <button key={opt.type} onClick={() => setGripperType(opt.type)}
-                  style={{
-                    padding: '14px 12px', cursor: 'pointer', textAlign: 'center',
-                    background: active ? 'rgba(59,130,246,0.18)' : 'var(--bg-surface)',
-                    border:     active ? '2px solid rgba(59,130,246,0.7)' : '2px solid var(--border)',
-                    borderRadius: 'var(--radius-md, 6px)',
-                  }}
-                >
-                  <div style={{ fontSize: 28, marginBottom: 6 }}>{opt.icon}</div>
-                  <div style={{
-                    fontSize: 12, fontWeight: 600,
-                    color: active ? '#60a5fa' : 'var(--text-primary)',
-                  }}>{opt.label}</div>
-                  <div style={{ fontSize: 10, color: 'var(--text-muted, #9ca3af)', marginTop: 4 }}>
-                    {opt.desc}
-                  </div>
-                </button>
-              )
-            })}
-          </div>
-        </div>
-
-        {/* Grasp settings */}
-        <div>
-          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 10 }}>
-            Grasp Settings
+            Pick Approach
           </div>
 
-          <div style={{ marginBottom: 12 }}>
-            <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>
-              Approach
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 6 }}>Direction</div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6 }}>
+              {[
+                { value: 'top_down', label: '↓ Top Down' },
+                { value: 'side',     label: '→ Side'     },
+                { value: 'angled',   label: '↘ Angled'   },
+              ].map(opt => {
+                const active = grasp.approach === opt.value
+                return (
+                  <button key={opt.value}
+                    onClick={() => setGrasp({ ...grasp, approach: opt.value })}
+                    style={{
+                      padding: '10px 8px',
+                      fontSize: 12,
+                      fontWeight: active ? 700 : 400,
+                      background: active ? 'var(--accent-dim)' : 'var(--bg-surface)',
+                      color:      active ? 'var(--accent)'     : 'var(--text-secondary)',
+                      border:     active ? '2px solid var(--accent)' : '1px solid var(--border)',
+                      borderRadius: 'var(--radius-sm)',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {opt.label}
+                  </button>
+                )
+              })}
             </div>
-            <select value={grasp.approach}
-              onChange={(e) => setGrasp({ ...grasp, approach: e.target.value })}
-              style={{
-                width: '100%', padding: 8, fontSize: 12,
-                background: 'var(--bg-surface)', color: 'var(--text-primary)',
-                border: '1px solid var(--border)', borderRadius: 'var(--radius-sm, 4px)',
-              }}
-            >
-              <option value="top_down">Top down (↓)</option>
-              <option value="side">Side approach (→)</option>
-              <option value="angled">Angled (↘ 45°)</option>
-            </select>
           </div>
 
-          {gripperType === 'finger' ? (
-            <>
-              <div style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>
-                  Gripper opening: {grasp.gripper_width_cm.toFixed(1)} cm
-                </div>
-                <input type="range" min="0.5" max="15" step="0.1"
-                  value={grasp.gripper_width_cm}
-                  onChange={(e) => setGrasp({ ...grasp, gripper_width_cm: parseFloat(e.target.value) })}
-                  style={{ width: '100%' }}
-                />
-              </div>
-              <div style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>
-                  Finger depth: {(grasp.finger_depth_cm ?? 3).toFixed(1)} cm
-                </div>
-                <input type="range" min="1" max="8" step="0.5"
-                  value={grasp.finger_depth_cm ?? 3}
-                  onChange={(e) => setGrasp({ ...grasp, finger_depth_cm: parseFloat(e.target.value) })}
-                  style={{ width: '100%' }}
-                />
-              </div>
-            </>
-          ) : (
-            <>
-              <div style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>
-                  Cup diameter: {(grasp.cup_diameter_mm ?? 30).toFixed(0)} mm
-                </div>
-                <input type="range" min="10" max="80" step="5"
-                  value={grasp.cup_diameter_mm ?? 30}
-                  onChange={(e) => setGrasp({ ...grasp, cup_diameter_mm: parseFloat(e.target.value) })}
-                  style={{ width: '100%' }}
-                />
-              </div>
-              <div style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>
-                  Number of cups
-                </div>
-                <div style={{ display: 'flex', gap: 6 }}>
-                  {[1, 2, 4].map((n) => {
-                    const active = (grasp.num_cups ?? 1) === n
-                    return (
-                      <button key={n}
-                        onClick={() => setGrasp({ ...grasp, num_cups: n })}
-                        style={{
-                          flex: 1, padding: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer',
-                          background: active ? 'rgba(59,130,246,0.18)' : 'var(--bg-surface)',
-                          color:      active ? '#60a5fa' : 'var(--text-secondary)',
-                          border:     active ? '1px solid rgba(59,130,246,0.6)' : '1px solid var(--border)',
-                          borderRadius: 'var(--radius-sm, 4px)',
-                        }}
-                      >{n} cup{n > 1 ? 's' : ''}</button>
-                    )
-                  })}
-                </div>
-              </div>
-              <div style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>
-                  Vacuum threshold: {(grasp.vacuum_threshold ?? 70).toFixed(0)}%
-                </div>
-                <input type="range" min="30" max="95" step="5"
-                  value={grasp.vacuum_threshold ?? 70}
-                  onChange={(e) => setGrasp({ ...grasp, vacuum_threshold: parseFloat(e.target.value) })}
-                  style={{ width: '100%' }}
-                />
-              </div>
-            </>
-          )}
-
-          <div style={{ marginBottom: 12 }}>
+          <div>
             <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>
-              Pick height offset: {grasp.pick_offset_cm.toFixed(1)} cm
+              Approach Height: {(grasp.pick_offset_cm ?? 2).toFixed(1)} cm above part
             </div>
-            <input type="range" min="0" max="10" step="0.5"
-              value={grasp.pick_offset_cm}
+            <input type="range" min="0.5" max="15" step="0.5"
+              value={grasp.pick_offset_cm ?? 2}
               onChange={(e) => setGrasp({ ...grasp, pick_offset_cm: parseFloat(e.target.value) })}
               style={{ width: '100%' }}
             />
