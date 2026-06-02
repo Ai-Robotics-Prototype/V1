@@ -124,6 +124,26 @@ def match_geometry(
         if not gf:
             continue
 
+        # SIZE GATE — runs FIRST so impossible candidates skip the
+        # expensive NCC / hole pattern work. Sorted XY dims each within
+        # 50%, aspect ratio within 50%. A 18cm bar cannot match a 4cm
+        # block; this is the same arithmetic that proves it.
+        cad_w = float(gf.get('part_width_m')  or 0.05)
+        cad_h = float(gf.get('part_height_m') or 0.05)
+        cad_s = sorted([cad_w, cad_h], reverse=True)
+        det_s = det_sorted_xy
+        if det_s[0] < 1e-6 or cad_s[0] < 1e-6:
+            continue
+        r0 = min(det_s[0], cad_s[0]) / max(det_s[0], cad_s[0], 0.001)
+        r1 = min(det_s[1], cad_s[1]) / max(det_s[1], cad_s[1], 0.001)
+        if r0 < 0.50 or r1 < 0.50:
+            continue
+        cad_aspect_pre = cad_s[0] / max(cad_s[1], 0.001)
+        det_aspect_pre = det_s[0] / max(det_s[1], 0.001)
+        if (min(det_aspect_pre, cad_aspect_pre)
+                / max(det_aspect_pre, cad_aspect_pre, 0.001)) < 0.50:
+            continue
+
         scores: dict = {}
         reasons: list = []
 

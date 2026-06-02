@@ -1420,6 +1420,13 @@ class DepthSegmentNode(Node):
         if fill < 0.10:
             return 'unknown', None, 0
 
+        # Absolute size sanity: < 1.5 cm on both XY dims is segmentation
+        # noise, never a real part. Bail before doing any per-ref work.
+        det_max_dim = (max(float(obb_size[0]), float(obb_size[1]))
+                       if obb_size is not None and len(obb_size) >= 2 else 0.0)
+        if det_max_dim < 0.015:
+            return 'unknown', None, 0
+
         crop_h, crop_w = mask_crop.shape[:2]
 
         from scipy.ndimage import (
@@ -1492,14 +1499,38 @@ class DepthSegmentNode(Node):
                 ref_size = ref.get('size_m', np.array([0.05, 0.05, 0.05]))
                 ref_size_list = ref_size.tolist() if hasattr(ref_size, 'tolist') else list(ref_size)
 
-                # ── GATE 1: SIZE — top two dims within 40% ───────────
-                det_sorted = sorted([float(s) for s in obb_size[:2]], reverse=True)
-                ref_sorted = sorted([float(s) for s in ref_size_list[:2]], reverse=True)
-                size_ratios = [min(d, r) / max(d, r, 0.001)
-                               for d, r in zip(det_sorted, ref_sorted)]
-                if any(r < 0.60 for r in size_ratios):
+                # ── GATE 1: SIZE — bulletproof, runs first. ───────────
+                # Each XY dim within 50%, aspect ratio within 50%, area
+                # within 3x. Cheap arithmetic — must happen BEFORE the
+                # contour / NCC work below.
+                det_s = sorted([float(obb_size[0]), float(obb_size[1])],
+                               reverse=True)
+                ref_s = sorted([float(ref_size_list[0]),
+                                float(ref_size_list[1])], reverse=True)
+                r0 = min(det_s[0], ref_s[0]) / max(det_s[0], ref_s[0], 0.001)
+                r1 = min(det_s[1], ref_s[1]) / max(det_s[1], ref_s[1], 0.001)
+                det_aspect = det_s[0] / max(det_s[1], 0.001)
+                ref_aspect = ref_s[0] / max(ref_s[1], 0.001)
+                aspect_r = (min(det_aspect, ref_aspect)
+                            / max(det_aspect, ref_aspect, 0.001))
+                det_area = det_s[0] * det_s[1]
+                ref_area = ref_s[0] * ref_s[1]
+                area_r = min(det_area, ref_area) / max(det_area, ref_area, 1e-6)
+
+                gate_pass = (r0 >= 0.50 and r1 >= 0.50
+                             and aspect_r >= 0.50 and area_r >= 0.33)
+                self.get_logger().info(
+                    f'SIZE_CHECK: det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm] '
+                    f'asp={det_aspect:.1f} vs '
+                    f'{part_id}=[{ref_s[0]*100:.1f}x{ref_s[1]*100:.1f}cm] '
+                    f'asp={ref_aspect:.1f} '
+                    f'→ r0={r0:.2f} r1={r1:.2f} asp_r={aspect_r:.2f} '
+                    f'area_r={area_r:.2f} '
+                    f'{"PASS" if gate_pass else "REJECT"}',
+                    throttle_duration_sec=5.0)
+                if not gate_pass:
                     continue
-                size_score = sum(size_ratios) / len(size_ratios)
+                size_score = (r0 + r1 + aspect_r) / 3.0
 
                 # ── GATE 2: CONTOUR (Hu-moment distance, 4 rotations) ─
                 contour_score = 0.0
