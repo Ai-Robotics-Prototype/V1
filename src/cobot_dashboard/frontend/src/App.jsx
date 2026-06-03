@@ -4,7 +4,7 @@ import TopBar from './components/TopBar'
 import StatusBar from './components/StatusBar'
 import ToastContainer from './components/ToastContainer'
 import EStopOverlay from './components/EStopOverlay'
-import MonitorLayout from './layouts/MonitorLayout'
+import MonitorDashboard from './pages/MonitorDashboard'
 import ProgramLayout from './layouts/ProgramLayout'
 import View3DLayout from './layouts/View3DLayout'
 import SensorsLayout from './layouts/SensorsLayout'
@@ -78,7 +78,7 @@ export default function App() {
   }, [])
 
   const layoutMap = {
-    monitor:          <MonitorLayout />,
+    monitor:          <MonitorDashboard />,
     programs:         <ProgramLibrary />,
     program:          <ProgramLayout />,
     '3dview':         <View3DLayout />,
@@ -97,7 +97,7 @@ export default function App() {
         </div>
         <div style={{ gridArea: 'content', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
           <ErrorBoundary>
-            {layoutMap[activeTab] ?? <MonitorLayout />}
+            {layoutMap[activeTab] ?? <MonitorDashboard />}
           </ErrorBoundary>
         </div>
         <div style={{ gridArea: 'statusbar' }}>
