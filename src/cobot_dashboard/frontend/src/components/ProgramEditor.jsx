@@ -8,8 +8,8 @@ import ProgramWizard from './ProgramWizard'
 // typed parameter fields the editor knows how to render.
 const ACTION_TYPES = [
   { value: 'move_home',     label: 'Move to Home',     type: 'home',    tag: 'HOME',    fields: [] },
-  { value: 'open_gripper',  label: 'Open Gripper',     type: 'gripper', tag: 'GRIPPER', fields: ['width_mm', 'speed_pct'] },
-  { value: 'close_gripper', label: 'Close Gripper',    type: 'gripper', tag: 'GRIPPER', fields: ['force_pct'] },
+  { value: 'open_gripper',  label: 'Open Gripper',     type: 'gripper', tag: 'GRIPPER', fields: ['width_mm', 'speed_pct', 'io_open', 'io_open_confirm'] },
+  { value: 'close_gripper', label: 'Close Gripper',    type: 'gripper', tag: 'GRIPPER', fields: ['force_pct', 'io_close', 'io_close_confirm'] },
   { value: 'move_joint',    label: 'Move Joint',       type: 'move',    tag: 'MOVE',    fields: ['joints'] },
   { value: 'move_linear',   label: 'Move Linear',      type: 'move',    tag: 'MOVE',    fields: ['position', 'offset_z_mm', 'speed_pct'] },
   { value: 'approach',      label: 'Approach Object',  type: 'move',    tag: 'MOVE',    fields: ['target', 'offset_z_mm'] },
@@ -44,7 +44,46 @@ function detailLine(step) {
   if (step.offset_z_mm !== undefined) bits.push('z' + (step.offset_z_mm >= 0 ? '+' : '') + step.offset_z_mm + 'mm')
   if (step.speed_pct)   bits.push(step.speed_pct + '%')
   if (step.io_id)       bits.push(step.io_id + '=' + (step.value ? 'ON' : 'OFF'))
+  if (step.io_open)         bits.push('open→' + step.io_open)
+  if (step.io_open_confirm) bits.push('verify ' + step.io_open_confirm)
+  if (step.io_close)        bits.push('close→' + step.io_close)
+  if (step.io_close_confirm) bits.push('verify ' + step.io_close_confirm)
   return bits.join(' | ')
+}
+
+// Dropdown that lists DO* or DI* ports with their pin numbers and the
+// operator-renamed labels from /api/io/config. Renders an "unassigned"
+// option at the top so a step can opt out of I/O explicitly.
+function IOPortSelector({ label, value, onChange, direction }) {
+  const [labels, setLabels] = useState({})
+
+  useEffect(() => {
+    let alive = true
+    fetch('/api/io/config')
+      .then((r) => r.json())
+      .then((d) => { if (alive && d) setLabels(d.labels || {}) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [])
+
+  const ports = Array.from({ length: 16 }, (_, i) => {
+    const id  = (direction === 'output' ? 'DO' : 'DI') + i
+    const pin = (direction === 'output' ? 'Y' : 'X') + Math.floor(i / 8) + '.' + (i % 8)
+    return { id, pin, label: labels[id] || id }
+  })
+
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 3 }}>{label}</div>
+      <select value={value || ''} onChange={(e) => onChange(e.target.value || undefined)}
+        style={{ ...selectStyle }}>
+        <option value="">Not assigned</option>
+        {ports.map((p) => (
+          <option key={p.id} value={p.id}>{p.pin} — {p.label}</option>
+        ))}
+      </select>
+    </div>
+  )
 }
 
 function StepEditor({ step, onSave, onClose }) {
@@ -117,6 +156,51 @@ function StepEditor({ step, onSave, onClose }) {
             onChange={(e) => update('force_pct', parseInt(e.target.value, 10))} style={inputStyle} />
         </Field>
       )}
+      {(actionDef.fields.includes('io_open') || actionDef.fields.includes('io_close')) && (
+        <div style={{
+          padding: '8px 10px', marginTop: 4, marginBottom: 8,
+          background: '#f8fafc', borderRadius: 6, border: '1px solid #e5e7eb',
+        }}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: '#374151', marginBottom: 8 }}>
+            I/O Port Assignment
+          </div>
+          {actionDef.fields.includes('io_open') && (
+            <IOPortSelector
+              label="Open signal (output to activate)"
+              value={draft.io_open}
+              onChange={(v) => update('io_open', v)}
+              direction="output"
+            />
+          )}
+          {actionDef.fields.includes('io_open_confirm') && (
+            <IOPortSelector
+              label="Open confirm (input to verify)"
+              value={draft.io_open_confirm}
+              onChange={(v) => update('io_open_confirm', v)}
+              direction="input"
+            />
+          )}
+          {actionDef.fields.includes('io_close') && (
+            <IOPortSelector
+              label="Close signal (output to activate)"
+              value={draft.io_close}
+              onChange={(v) => update('io_close', v)}
+              direction="output"
+            />
+          )}
+          {actionDef.fields.includes('io_close_confirm') && (
+            <IOPortSelector
+              label="Close confirm (input to verify)"
+              value={draft.io_close_confirm}
+              onChange={(v) => update('io_close_confirm', v)}
+              direction="input"
+            />
+          )}
+          <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 4 }}>
+            Operator-renamed labels from the Sensors tab show here. The confirm input is optional — when set, the program waits for that signal before continuing.
+          </div>
+        </div>
+      )}
       {actionDef.fields.includes('target') && (
         <Field label="Target">
           <select value={draft.target || 'auto'} onChange={(e) => update('target', e.target.value)} style={selectStyle}>
@@ -186,10 +270,15 @@ function StepEditor({ step, onSave, onClose }) {
         </Field>
       )}
       {actionDef.fields.includes('io_id') && (
-        <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
-          <Field label="I/O ID" style={{ flex: 1 }}>
-            <input value={draft.io_id || 'DO0'} onChange={(e) => update('io_id', e.target.value)} style={inputStyle} />
-          </Field>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 8, alignItems: 'flex-end' }}>
+          <div style={{ flex: 1 }}>
+            <IOPortSelector
+              label="I/O Port"
+              value={draft.io_id}
+              onChange={(v) => update('io_id', v || 'DO0')}
+              direction="output"
+            />
+          </div>
           <Field label="Value" style={{ flex: 1 }}>
             <select value={draft.value ?? 1} onChange={(e) => update('value', parseInt(e.target.value, 10))} style={selectStyle}>
               <option value={1}>ON</option>

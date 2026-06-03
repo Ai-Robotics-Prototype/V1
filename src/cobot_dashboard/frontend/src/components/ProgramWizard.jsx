@@ -598,7 +598,21 @@ function buildProgramSteps(operation, config) {
     steps.push({ action: 'loop',          label: 'Repeat', goto: 2, count: 0 })
   }
 
-  return steps.map((s, i) => ({ ...s, step: i + 1 }))
+  // Inject default I/O port assignments for gripper steps. Matches the
+  // factory defaults baked into the IOPanel: DO0 / DI0 control + verify
+  // close, DO1 / DI1 control + verify open. Operator can rewire these
+  // in the step editor without touching the wizard.
+  return steps.map((s, i) => {
+    const out = { ...s, step: i + 1 }
+    if (s.action === 'open_gripper') {
+      if (out.io_open === undefined)         out.io_open         = 'DO1'
+      if (out.io_open_confirm === undefined) out.io_open_confirm = 'DI1'
+    } else if (s.action === 'close_gripper') {
+      if (out.io_close === undefined)         out.io_close         = 'DO0'
+      if (out.io_close_confirm === undefined) out.io_close_confirm = 'DI0'
+    }
+    return out
+  })
 }
 
 const labelStyle  = { fontSize: 12, fontWeight: 600, color: '#374151', marginBottom: 6 }
