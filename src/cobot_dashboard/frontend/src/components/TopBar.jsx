@@ -7,7 +7,7 @@ const TABS = [
   { id: 'program',          label: 'Program' },
   { id: '3dview',           label: '3D View' },
   { id: 'sensors',          label: 'Sensors' },
-  { id: 'adaptive_picking', label: 'Adaptive Picking' },
+  { id: 'adaptive_picking', label: 'Part Recognition' },
   { id: 'configure',        label: 'Configure' },
 ]
 

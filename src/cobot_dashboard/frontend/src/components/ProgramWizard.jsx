@@ -315,7 +315,7 @@ function SelectPartsStep({ config, setConfig, onNext }) {
           padding: 24, textAlign: 'center', color: '#6b7280', fontSize: 13,
           border: '2px dashed #d1d5db', borderRadius: 8,
         }}>
-          No parts in library. Upload STEP files in Adaptive Picking first.
+          No parts in library. Upload STEP files in Part Recognition first.
         </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>

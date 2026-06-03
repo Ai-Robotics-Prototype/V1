@@ -1329,7 +1329,7 @@ export default function AdaptivePicking() {
               color: 'var(--text-muted, #9ca3af)', fontSize: 12, lineHeight: 1.6,
             }}>
               No parts uploaded yet.<br />
-              Upload a STEP file to start adaptive picking.
+              Upload a STEP file to start part recognition.
             </div>
           ) : filteredParts.length === 0 ? (
             <div style={{
