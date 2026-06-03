@@ -1,6 +1,7 @@
 import { useStore } from '../store/useStore'
 import CameraPanel from '../components/CameraPanel'
 import LidarPanel from '../components/LidarPanel'
+import SplitView from '../components/SplitView'
 import ArmViewer3D from '../components/ArmViewer3D'
 import ProgramPanel from '../components/ProgramPanel'
 import ControlStrip from '../components/ControlStrip'
@@ -144,31 +145,17 @@ function ViewportArea() {
 
   const sharedStyle = { flex: 1, overflow: 'hidden', minHeight: 0, display: 'flex' }
 
-  if (activeView === 'split') {
-    return (
-      <div style={{ ...sharedStyle }}>
-        <div style={{ flex: 1 }}><CameraPanel cam={0} /></div>
-        <div style={{ width: 1, background: 'var(--border)', flexShrink: 0 }} />
-        <div style={{ flex: 1 }}><CameraPanel cam={1} /></div>
-      </div>
-    )
-  }
-  if (activeView === 'cam0') return <div style={sharedStyle}><CameraPanel cam={0} /></div>
-  if (activeView === 'cam1') return <div style={sharedStyle}><CameraPanel cam={1} /></div>
+  if (activeView === 'split') return <div style={sharedStyle}><SplitView /></div>
+  if (activeView === 'cam0')  return <div style={sharedStyle}><CameraPanel cam={0} /></div>
+  if (activeView === 'cam1')  return <div style={sharedStyle}><CameraPanel cam={1} /></div>
   if (activeView === 'lidar') return <div style={sharedStyle}><LidarPanel /></div>
   if (activeView === 'arm')   return <div style={sharedStyle}><ArmViewer3D /></div>
   if (activeView === 'scene') return <div style={sharedStyle}><SceneGraphPanel /></div>
   if (activeView === 'parts') return <div style={sharedStyle}><PartsLibrary /></div>
   if (activeView === 'safety') return <div style={sharedStyle}><SafetyView /></div>
 
-  // Default: split
-  return (
-    <div style={{ ...sharedStyle }}>
-      <div style={{ flex: 1 }}><CameraPanel cam={0} /></div>
-      <div style={{ width: 1, background: 'var(--border)', flexShrink: 0 }} />
-      <div style={{ flex: 1 }}><CameraPanel cam={1} /></div>
-    </div>
-  )
+  // Default: split view
+  return <div style={sharedStyle}><SplitView /></div>
 }
 
 export default function MonitorLayout() {
