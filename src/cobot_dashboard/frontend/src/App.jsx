@@ -12,6 +12,7 @@ import SensorsLayout from './layouts/SensorsLayout'
 import ConfigureLayout from './layouts/ConfigureLayout'
 import AdaptivePicking from './pages/AdaptivePicking'
 import ProgramLibrary from './pages/ProgramLibrary'
+import IOPage from './pages/IOPage'
 
 class ErrorBoundary extends Component {
   constructor(props) {
@@ -82,6 +83,7 @@ export default function App() {
     program:          <ProgramLayout />,
     '3dview':         <View3DLayout />,
     sensors:          <SensorsLayout />,
+    io:               <IOPage />,
     adaptive_picking: <AdaptivePicking />,
     configure:        <ConfigureLayout />,
   }
