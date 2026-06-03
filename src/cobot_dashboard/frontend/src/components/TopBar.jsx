@@ -10,6 +10,7 @@ const TABS = [
   { id: 'io',               label: 'I/O' },
   { id: 'adaptive_picking', label: 'Part Recognition' },
   { id: 'configure',        label: 'Configure' },
+  { id: 'safety',           label: 'Safety' },
 ]
 
 const WS_DOT = {

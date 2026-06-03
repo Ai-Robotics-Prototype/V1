@@ -9,10 +9,6 @@ const TOP_ITEMS = [
   { icon: '📦', label: 'Parts',  view: 'parts' },
 ]
 
-const MID_ITEMS = [
-  { icon: '🛡', label: 'Safety', view: 'safety' },
-]
-
 export default function SideNav() {
   const activeTab  = useStore((s) => s.activeTab)
   const activeView = useStore((s) => s.activeView)
@@ -78,20 +74,6 @@ export default function SideNav() {
     }}>
       {/* Top items */}
       {TOP_ITEMS.map((item) => (
-        <NavItem
-          key={item.label}
-          icon={item.icon}
-          label={item.label}
-          isActive={activeTab === 'monitor' && activeView === item.view}
-          onClick={() => selectView(item.view)}
-        />
-      ))}
-
-      {/* Separator */}
-      <div style={{ margin: '4px 10px', height: 1, background: 'var(--border)', flexShrink: 0 }} />
-
-      {/* Mid items */}
-      {MID_ITEMS.map((item) => (
         <NavItem
           key={item.label}
           icon={item.icon}
