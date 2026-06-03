@@ -3,7 +3,6 @@ import { useStore } from '../store/useStore'
 import ProgramEditor from '../components/ProgramEditor'
 import ArmViewer3D from '../components/ArmViewer3D'
 
-// Vertical resize divider on the right edge of a left-fixed panel.
 function VerticalDivider({ onMouseDown, dragging }) {
   return (
     <div
@@ -39,71 +38,55 @@ function HorizontalDivider({ onMouseDown, dragging }) {
   )
 }
 
-// Run / Pause / Stop / Home — bigger, touch-friendly buttons.
-function RunStrip() {
-  const task          = useStore((s) => s.task)
-  const safety        = useStore((s) => s.safety)
-  const runProgram    = useStore((s) => s.runProgram)
-  const pauseProgram  = useStore((s) => s.pauseProgram)
-  const resumeProgram = useStore((s) => s.resumeProgram)
-  const homeRobot     = useStore((s) => s.homeRobot)
-  const cancelProgram = useStore((s) => s.cancelProgram)
-  const { estop }     = safety
-  const { running, paused, state, program_step, program_total } = task
+// A button that fires its action on press and keeps re-firing every
+// 150 ms until the user releases (mouse-up, mouse-leave, touch-end).
+// Used for every directional arrow so the operator can hold to jog.
+function HoldButton({ onPress, color, width, height, children }) {
+  const timer = useRef(null)
+  const start = useCallback((e) => {
+    if (e && e.preventDefault) e.preventDefault()
+    onPress()
+    if (timer.current) clearInterval(timer.current)
+    timer.current = setInterval(onPress, 150)
+  }, [onPress])
+  const stop = useCallback(() => {
+    if (timer.current) {
+      clearInterval(timer.current)
+      timer.current = null
+    }
+  }, [])
+  useEffect(() => () => stop(), [stop])
 
-  const btn = (bg, color, disabled) => ({
-    flex: 1, padding: '14px 0', fontSize: 14, fontWeight: 700,
-    background: bg, color, border: 'none', borderRadius: 6,
-    cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.45 : 1,
-    minHeight: 48,
-  })
-
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-      <button onClick={paused ? resumeProgram : runProgram}
-        disabled={estop || (running && !paused)}
-        style={btn('#16A34A', '#fff', estop || (running && !paused))}>
-        {paused ? '▶ Resume' : '▶ Run'}
-      </button>
-      <button onClick={pauseProgram} disabled={!running || paused || estop}
-        style={btn('#fef3c7', '#92400e', !running || paused || estop)}>
-        ⏸ Pause
-      </button>
-      <button onClick={cancelProgram} disabled={!running && !paused}
-        style={btn('#fee2e2', '#b91c1c', !running && !paused)}>
-        ✕ Stop
-      </button>
-      <button onClick={homeRobot} disabled={estop}
-        style={btn('#f3f4f6', '#374151', estop)}>
-        ⌂ Home
-      </button>
-      <span style={{ fontSize: 12, color: '#6b7280', minWidth: 140, textAlign: 'right' }}>
-        {state} · {program_step + 1}/{program_total}
-      </span>
-    </div>
-  )
-}
-
-// One arrow button. Size, svg, label all parameterised so the same
-// component drives both normal-jog and maximised-jog layouts.
-function ArrowPadBtn({ onMouseDown, rotation, label, color, size = 80, svgSize = 36, labelSize = 12 }) {
   return (
     <button
-      onMouseDown={onMouseDown}
+      onMouseDown={start}
+      onMouseUp={stop}
+      onMouseLeave={(e) => { e.currentTarget.style.background = '#fff'; e.currentTarget.style.borderColor = '#d1d5db'; stop() }}
+      onMouseEnter={(e) => { e.currentTarget.style.background = color + '15'; e.currentTarget.style.borderColor = color }}
+      onTouchStart={start}
+      onTouchEnd={stop}
+      onTouchCancel={stop}
       style={{
-        width: size, height: size, padding: 0,
+        width, height, padding: 0,
         background: '#fff', border: '1px solid #d1d5db', borderRadius: 8,
         cursor: 'pointer', display: 'flex', flexDirection: 'column',
         alignItems: 'center', justifyContent: 'center', gap: 4,
         transition: 'background 100ms, border-color 100ms',
-      }}
-      onMouseEnter={(e) => { e.currentTarget.style.background = color + '15'; e.currentTarget.style.borderColor = color }}
-      onMouseLeave={(e) => { e.currentTarget.style.background = '#fff';        e.currentTarget.style.borderColor = '#d1d5db' }}>
+        userSelect: 'none', touchAction: 'none',
+      }}>
+      {children}
+    </button>
+  )
+}
+
+function ArrowPad({ onPress, rotation, label, color, size, svgSize, labelSize }) {
+  return (
+    <HoldButton onPress={onPress} color={color} width={size} height={size}>
       <svg width={svgSize} height={svgSize} viewBox="0 0 24 24" style={{ transform: `rotate(${rotation}deg)` }}>
         <path d="M12 4l-8 8h5v8h6v-8h5z" fill={color} />
       </svg>
       <span style={{ fontSize: labelSize, fontWeight: 700, color: '#374151' }}>{label}</span>
-    </button>
+    </HoldButton>
   )
 }
 
@@ -125,36 +108,64 @@ function JogPanel({ maximized, onToggleMaximize }) {
   const jogCartesian = useStore((s) => s.jogCartesian)
   const triggerEstop = useStore((s) => s.triggerEstop)
   const homeRobot    = useStore((s) => s.homeRobot)
+  const runProgram   = useStore((s) => s.runProgram)
+  const pauseProgram = useStore((s) => s.pauseProgram)
+  const resumeProgram= useStore((s) => s.resumeProgram)
+  const cancelProgram= useStore((s) => s.cancelProgram)
+  const task         = useStore((s) => s.task)
+  const safety       = useStore((s) => s.safety)
 
-  const [jogMode, setJogMode] = useState('cartesian') // 'cartesian' | 'joint'
+  const [jogMode, setJogMode] = useState('cartesian')
   const [step, setStep]       = useState(1.0)
   const [speed, setSpeed]     = useState(20)
 
-  // Joint mode: backend wants delta in radians on a joint index 0-5.
-  // Cartesian mode: publishes a ROS message via /cmd/jog_cartesian.
+  const stepRef  = useRef(step)
+  const speedRef = useRef(speed)
+  const modeRef  = useRef(jogMode)
+  useEffect(() => { stepRef.current = step },   [step])
+  useEffect(() => { speedRef.current = speed }, [speed])
+  useEffect(() => { modeRef.current = jogMode }, [jogMode])
+
+  // Stable callback for the HoldButton repeating interval — reads
+  // step/speed/mode from refs so a setInterval set up at press time
+  // doesn't capture stale values.
   const sendJog = useCallback((axis, direction) => {
-    if (jogMode === 'joint') {
-      const deltaRad = direction * step * Math.PI / 180
+    if (modeRef.current === 'joint') {
+      const deltaRad = direction * stepRef.current * Math.PI / 180
       jog(axis - 1, deltaRad)
     } else {
-      jogCartesian(axis, direction, step, speed)
+      jogCartesian(axis, direction, stepRef.current, speedRef.current)
     }
-  }, [jogMode, step, speed, jog, jogCartesian])
+  }, [jog, jogCartesian])
 
-  // Size knobs flip between normal and maximised modes.
-  const padBtn      = maximized ? 110 : 80
-  const zBtnWidth   = maximized ? 90  : 70
-  const zBtnHeight  = maximized ? 110 : 80
-  const jointBtn    = maximized ? 90  : 64
-  const svgPx       = maximized ? 48  : 36
-  const lblPx       = maximized ? 15  : 12
+  // Sizing knobs flip between normal and maximised modes.
+  const padBtn     = maximized ? 110 : 80
+  const zBtnWidth  = maximized ? 90  : 70
+  const zBtnHeight = maximized ? 110 : 80
+  const jointBtnW  = maximized ? 80  : 64
+  const jointBtnH  = maximized ? 80  : 56
+  const svgPx      = maximized ? 48  : 36
+  const lblPx      = maximized ? 15  : 12
 
-  const toggleStyle = (on) => ({
-    padding: '8px 18px', fontSize: 13, fontWeight: 600, borderRadius: 6, cursor: 'pointer',
-    minHeight: 40,
+  const { estop } = safety
+  const { running, paused, state, program_step, program_total } = task
+
+  // === Layout helpers ===
+  const modeBtnStyle = (on) => ({
+    padding: '14px 20px', fontSize: 15, fontWeight: 700,
     background: on ? '#2563EB' : '#f3f4f6',
     color:      on ? '#fff'    : '#374151',
-    border:     on ? 'none'    : '1px solid #d1d5db',
+    border:     on ? '2px solid #2563EB' : '2px solid #d1d5db',
+    borderRadius: 8, cursor: 'pointer', width: '100%',
+    transition: 'all 100ms',
+  })
+
+  const runBtnBase = (bg, color, disabled, weight = 700) => ({
+    width: '100%', padding: '14px', fontSize: 14, fontWeight: weight,
+    background: bg, color,
+    border: bg.startsWith('#f') ? '1px solid #d1d5db' : 'none',
+    borderRadius: 8, cursor: disabled ? 'not-allowed' : 'pointer',
+    opacity: disabled ? 0.45 : 1,
   })
 
   const padLabel = (text) => (
@@ -162,156 +173,189 @@ function JogPanel({ maximized, onToggleMaximize }) {
   )
 
   return (
-    <div style={{ padding: 14, background: '#fff', height: '100%', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 12 }}>
-      <RunStrip />
+    <div style={{
+      padding: 14, background: '#fff',
+      height: '100%', overflowY: 'auto',
+      display: 'flex', alignItems: 'stretch', gap: 16,
+    }}>
+      {/* LEFT — mode, step, speed, maximize */}
+      <div style={{
+        display: 'flex', flexDirection: 'column', gap: 10,
+        width: 160, flexShrink: 0,
+      }}>
+        <div style={{ fontSize: 14, fontWeight: 700, color: '#111' }}>Jog</div>
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ fontSize: 14, fontWeight: 700, color: '#111' }}>Jog</span>
+        <button onClick={() => setJogMode('cartesian')} style={modeBtnStyle(jogMode === 'cartesian')}>XYZ</button>
+        <button onClick={() => setJogMode('joint')}     style={modeBtnStyle(jogMode === 'joint')}>Joint</button>
+
+        <div style={{ marginTop: 4 }}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: '#6b7280', marginBottom: 4 }}>Step Size</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+            {[0.1, 0.5, 1, 5, 10].map((s) => (
+              <button key={s} onClick={() => setStep(s)} style={{
+                padding: '8px 12px', fontSize: 12, fontWeight: 600, borderRadius: 4, cursor: 'pointer',
+                minHeight: 36,
+                background: step === s ? '#2563EB' : '#f3f4f6',
+                color:      step === s ? '#fff'    : '#6b7280',
+                border:     step === s ? 'none'    : '1px solid #e5e7eb',
+              }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <div style={{ fontSize: 11, fontWeight: 600, color: '#6b7280', marginBottom: 4 }}>Speed: {speed}%</div>
+          <input type="range" min={1} max={100} value={speed}
+            onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
+            style={{ width: '100%', height: 6 }} />
+        </div>
+
         <div style={{ flex: 1 }} />
-        <button onClick={() => setJogMode('cartesian')} style={toggleStyle(jogMode === 'cartesian')}>XYZ</button>
-        <button onClick={() => setJogMode('joint')}     style={toggleStyle(jogMode === 'joint')}>Joint</button>
+
         <button onClick={onToggleMaximize}
           title={maximized ? 'Restore split layout' : 'Maximize jog panel'}
           style={{
-            padding: '8px 14px', fontSize: 12, fontWeight: 600,
+            padding: '10px', fontSize: 12, fontWeight: 600,
             background: '#f3f4f6', color: '#374151',
-            border: '1px solid #d1d5db', borderRadius: 6,
-            cursor: 'pointer', minHeight: 40,
+            border: '1px solid #d1d5db', borderRadius: 6, cursor: 'pointer',
           }}>
           {maximized ? 'Minimize' : 'Maximize'}
         </button>
       </div>
 
-      {jogMode === 'cartesian' ? (
-        <div style={{ display: 'flex', gap: 28, justifyContent: 'center', flexWrap: 'wrap' }}>
-          {/* XY pad — D-pad for the horizontal plane. */}
-          <div>
-            {padLabel('Position')}
-            <div style={{
-              display: 'grid',
-              gridTemplateColumns: `repeat(3, ${padBtn}px)`,
-              gridTemplateRows:    `repeat(3, ${padBtn}px)`,
-              gridTemplateAreas: '". up ." "left center right" ". down ."',
-              gap: 4,
-            }}>
-              <div style={{ gridArea: 'up' }}>
-                <ArrowPadBtn onMouseDown={() => sendJog('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
-              </div>
-              <div style={{ gridArea: 'left' }}>
-                <ArrowPadBtn onMouseDown={() => sendJog('x', -1)} rotation={-90} label="X−" color="#DC2626" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
-              </div>
-              <div style={{ gridArea: 'center' }}>
-                <PadCenter label="XY" width={padBtn} height={padBtn} labelSize={lblPx} />
-              </div>
-              <div style={{ gridArea: 'right' }}>
-                <ArrowPadBtn onMouseDown={() => sendJog('x',  1)} rotation={90}  label="X+" color="#DC2626" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
-              </div>
-              <div style={{ gridArea: 'down' }}>
-                <ArrowPadBtn onMouseDown={() => sendJog('y', -1)} rotation={180} label="Y−" color="#16A34A" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
+      {/* CENTER — jog arrow pads */}
+      <div style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', minWidth: 0 }}>
+        {jogMode === 'cartesian' ? (
+          <div style={{ display: 'flex', gap: 24, alignItems: 'flex-start', flexWrap: 'wrap', justifyContent: 'center' }}>
+            <div>
+              {padLabel('Position')}
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: `repeat(3, ${padBtn}px)`,
+                gridTemplateRows:    `repeat(3, ${padBtn}px)`,
+                gridTemplateAreas: '". up ." "left center right" ". down ."',
+                gap: 4,
+              }}>
+                <div style={{ gridArea: 'up' }}>
+                  <ArrowPad onPress={() => sendJog('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
+                </div>
+                <div style={{ gridArea: 'left' }}>
+                  <ArrowPad onPress={() => sendJog('x', -1)} rotation={-90} label="X−" color="#DC2626" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
+                </div>
+                <div style={{ gridArea: 'center' }}>
+                  <PadCenter label="XY" width={padBtn} height={padBtn} labelSize={lblPx} />
+                </div>
+                <div style={{ gridArea: 'right' }}>
+                  <ArrowPad onPress={() => sendJog('x',  1)} rotation={90}  label="X+" color="#DC2626" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
+                </div>
+                <div style={{ gridArea: 'down' }}>
+                  <ArrowPad onPress={() => sendJog('y', -1)} rotation={180} label="Y−" color="#16A34A" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
+                </div>
               </div>
             </div>
-          </div>
 
-          {/* Z column. */}
-          <div>
-            {padLabel('Height')}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: zBtnWidth }}>
-              <ArrowPadBtn onMouseDown={() => sendJog('z',  1)} rotation={0}   label="Z+" color="#3B82F6"
-                size={zBtnWidth} svgSize={svgPx} labelSize={lblPx} />
-              {/* PadCenter uses width override so its width matches the Z buttons. */}
-              <div style={{ width: zBtnWidth, height: Math.max(28, padBtn - 50) }}>
+            <div>
+              {padLabel('Height')}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: zBtnWidth }}>
+                <ArrowPad onPress={() => sendJog('z',  1)} rotation={0}   label="Z+" color="#3B82F6"
+                  size={zBtnWidth} svgSize={svgPx} labelSize={lblPx} />
                 <PadCenter label="Z" width={zBtnWidth} height={Math.max(28, padBtn - 50)} labelSize={lblPx} />
+                <ArrowPad onPress={() => sendJog('z', -1)} rotation={180} label="Z−" color="#3B82F6"
+                  size={zBtnWidth} svgSize={svgPx} labelSize={lblPx} />
               </div>
-              <ArrowPadBtn onMouseDown={() => sendJog('z', -1)} rotation={180} label="Z−" color="#3B82F6"
-                size={zBtnWidth} svgSize={svgPx} labelSize={lblPx} />
+            </div>
+
+            <div>
+              {padLabel('Rotation')}
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: `repeat(3, ${padBtn}px)`,
+                gridTemplateRows:    `repeat(3, ${padBtn}px)`,
+                gridTemplateAreas: '". rxp ." "rzn center rzp" ". rxn ."',
+                gap: 4,
+              }}>
+                <div style={{ gridArea: 'rxp' }}>
+                  <ArrowPad onPress={() => sendJog('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
+                </div>
+                <div style={{ gridArea: 'rzn' }}>
+                  <ArrowPad onPress={() => sendJog('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
+                </div>
+                <div style={{ gridArea: 'center' }}>
+                  <PadCenter label="Rot" width={padBtn} height={padBtn} labelSize={lblPx} />
+                </div>
+                <div style={{ gridArea: 'rzp' }}>
+                  <ArrowPad onPress={() => sendJog('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
+                </div>
+                <div style={{ gridArea: 'rxn' }}>
+                  <ArrowPad onPress={() => sendJog('rx', -1)} rotation={180} label="Rx−" color="#9333EA" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
+                </div>
+              </div>
             </div>
           </div>
-
-          {/* Rotation pad. */}
-          <div>
-            {padLabel('Rotation')}
-            <div style={{
-              display: 'grid',
-              gridTemplateColumns: `repeat(3, ${padBtn}px)`,
-              gridTemplateRows:    `repeat(3, ${padBtn}px)`,
-              gridTemplateAreas: '". rxp ." "rzn center rzp" ". rxn ."',
-              gap: 4,
-            }}>
-              <div style={{ gridArea: 'rxp' }}>
-                <ArrowPadBtn onMouseDown={() => sendJog('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
+        ) : (
+          <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
+            {[1, 2, 3, 4, 5, 6].map((j) => (
+              <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                <ArrowPad onPress={() => sendJog(j,  1)} rotation={0}   label="+" color="#16A34A"
+                  size={jointBtnW} svgSize={svgPx} labelSize={lblPx + 2} />
+                <PadCenter label={'J' + j} width={jointBtnW} height={28} labelSize={13} />
+                <ArrowPad onPress={() => sendJog(j, -1)} rotation={180} label="−" color="#DC2626"
+                  size={jointBtnW} svgSize={svgPx} labelSize={lblPx + 2} />
               </div>
-              <div style={{ gridArea: 'rzn' }}>
-                <ArrowPadBtn onMouseDown={() => sendJog('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
-              </div>
-              <div style={{ gridArea: 'center' }}>
-                <PadCenter label="Rot" width={padBtn} height={padBtn} labelSize={lblPx} />
-              </div>
-              <div style={{ gridArea: 'rzp' }}>
-                <ArrowPadBtn onMouseDown={() => sendJog('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
-              </div>
-              <div style={{ gridArea: 'rxn' }}>
-                <ArrowPadBtn onMouseDown={() => sendJog('rx', -1)} rotation={180} label="Rx−" color="#9333EA" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
-              </div>
-            </div>
+            ))}
           </div>
-        </div>
-      ) : (
-        // Joint mode — one column per joint with up (positive) / down (negative).
-        <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
-          {[1, 2, 3, 4, 5, 6].map((j) => (
-            <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, width: jointBtn }}>
-              <ArrowPadBtn onMouseDown={() => sendJog(j,  1)} rotation={0}   label="+" color="#16A34A"
-                size={jointBtn} svgSize={svgPx} labelSize={lblPx + 2} />
-              <PadCenter label={'J' + j} width={jointBtn} height={Math.max(32, jointBtn / 2)} labelSize={13} />
-              <ArrowPadBtn onMouseDown={() => sendJog(j, -1)} rotation={180} label="−" color="#DC2626"
-                size={jointBtn} svgSize={svgPx} labelSize={lblPx + 2} />
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Step size + speed */}
-      <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ fontSize: 12, fontWeight: 600, color: '#6b7280' }}>Step:</span>
-          {[0.1, 0.5, 1, 5, 10].map((s) => (
-            <button key={s} onClick={() => setStep(s)} style={{
-              padding: '8px 14px', fontSize: 12, fontWeight: 600, borderRadius: 4, cursor: 'pointer',
-              minHeight: 36,
-              background: step === s ? '#2563EB' : '#f3f4f6',
-              color:      step === s ? '#fff'    : '#6b7280',
-              border:     step === s ? 'none'    : '1px solid #e5e7eb',
-            }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
-          ))}
-        </div>
-        <div style={{ flex: 1, minWidth: 220, display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ fontSize: 12, fontWeight: 600, color: '#6b7280', whiteSpace: 'nowrap' }}>Speed: {speed}%</span>
-          <input type="range" min={1} max={100} value={speed}
-            onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
-            style={{ flex: 1, height: 6 }} />
-        </div>
+        )}
       </div>
 
-      {/* Action buttons */}
-      <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-        <button onClick={homeRobot} style={{
-          flex: 1, padding: '16px', fontSize: 15, fontWeight: 700,
-          background: '#f3f4f6', color: '#374151',
-          border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
-          minHeight: 52,
-        }}>Home</button>
-        <button onClick={triggerEstop} style={{
-          flex: 1, padding: '16px', fontSize: 15, fontWeight: 700,
-          background: '#DC2626', color: '#fff',
-          border: 'none', borderRadius: 8, cursor: 'pointer',
-          minHeight: 52,
-        }}>STOP</button>
-        <button title="Save current pose as a teach point (not yet wired)" style={{
-          flex: 1, padding: '16px', fontSize: 15, fontWeight: 700,
-          background: '#16A34A', color: '#fff',
-          border: 'none', borderRadius: 8, cursor: 'pointer',
-          minHeight: 52,
-        }}>Teach Position</button>
+      {/* RIGHT — Run/Pause/Stop/Home + Teach */}
+      <div style={{
+        display: 'flex', flexDirection: 'column', gap: 8,
+        width: 150, flexShrink: 0,
+      }}>
+        <button onClick={paused ? resumeProgram : runProgram}
+          disabled={estop || (running && !paused)}
+          style={runBtnBase('#16A34A', '#fff', estop || (running && !paused))}>
+          {paused ? '▶ Resume' : '▶ Run'}
+        </button>
+        <button onClick={pauseProgram}
+          disabled={!running || paused || estop}
+          style={runBtnBase('#fef3c7', '#92400e', !running || paused || estop, 600)}>
+          ⏸ Pause
+        </button>
+        <button onClick={cancelProgram}
+          disabled={!running && !paused}
+          style={{ ...runBtnBase('#DC2626', '#fff', !running && !paused), fontSize: 15 }}>
+          STOP
+        </button>
+        <button onClick={homeRobot} disabled={estop}
+          style={runBtnBase('#f3f4f6', '#374151', estop, 600)}>
+          ⌂ Home
+        </button>
+
+        <div style={{ fontSize: 11, color: '#6b7280', textAlign: 'center', padding: '4px 0', borderTop: '1px solid #e5e7eb', borderBottom: '1px solid #e5e7eb' }}>
+          {state} · {program_step + 1}/{program_total}
+        </div>
+
+        <div style={{ flex: 1 }} />
+
+        <button onClick={triggerEstop}
+          title="Emergency stop"
+          style={{
+            width: '100%', padding: '10px', fontSize: 11, fontWeight: 700,
+            background: '#fff', color: '#DC2626',
+            border: '2px solid #DC2626', borderRadius: 8, cursor: 'pointer',
+          }}>
+          E-STOP
+        </button>
+        <button
+          title="Save current pose as a teach point (not yet wired)"
+          style={{
+            width: '100%', padding: '14px', fontSize: 13, fontWeight: 700,
+            background: '#2563EB', color: '#fff',
+            border: 'none', borderRadius: 8, cursor: 'pointer',
+          }}>
+          Teach Position
+        </button>
       </div>
     </div>
   )
@@ -365,8 +409,6 @@ export default function ProgramLayout() {
     }
   }, [])
 
-  // Maximised mode: jog panel takes the whole Program tab. Editor + 3D
-  // viewer + horizontal divider all hidden.
   if (jogMaximized) {
     return (
       <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
