@@ -26,6 +26,19 @@ const TAG_COLORS = {
   PLACE: '#0891b2', WAIT: '#6b7280', DETECT: '#8b5cf6', LOOP: '#ec4899', IO: '#f97316',
 }
 
+// Actions that move the robot — these require a taught position
+// before the program can be safely run.
+const MOVE_ACTIONS = ['move_home', 'move_joint', 'move_linear', 'approach', 'pick', 'place']
+function isMoveStep(step) { return step && MOVE_ACTIONS.includes(step.action) }
+
+// /api/state returns joints.positions in radians; the step model
+// stores degrees so it round-trips through the editor / JSON files
+// in a human-friendly form.
+function radiansToJointDegrees(positions) {
+  if (!Array.isArray(positions)) return [0, 0, 0, 0, 0, 0]
+  return positions.slice(0, 6).map((rad) => Number((rad * 180 / Math.PI).toFixed(2)))
+}
+
 function actionFor(step) {
   return ACTION_TYPES.find((a) => a.value === step.action)
       ?? ACTION_TYPES.find((a) => a.type === step.type)
@@ -521,6 +534,13 @@ export default function ProgramEditor() {
   const programName = currentProgram.name
   const steps       = currentProgram.steps || []
   const unsaved     = currentProgram.unsaved
+  // Untaught move steps the operator still needs to teach before the
+  // path is ready to run. move_home is excluded — it has a fixed
+  // factory pose, no recording needed.
+  const untaughtCount = steps.filter((s) =>
+    isMoveStep(s) && s.action !== 'move_home' && !s.taught,
+  ).length
+  const allTaughtForRun = untaughtCount === 0
 
   // Setters that wrap the store action with the right patch shape.
   const setProgramName = (name) => setCurrentProgram({ name, unsaved: true })
@@ -529,14 +549,17 @@ export default function ProgramEditor() {
   // Transient UI state (selection / drag / wizard / load-menu / save
   // status) is fine to keep local — losing it on tab switch is the
   // expected behaviour, file-manager style.
-  const [showWizard, setShowWizard]       = useState(false)
-  const [editingId, setEditingId]         = useState(null)
-  const [selectedId, setSelectedId]       = useState(null)
-  const [dragId, setDragId]               = useState(null)
-  const [dragOverId, setDragOverId]       = useState(null)
-  const [dragOverPos, setDragOverPos]     = useState(null)
-  const [saveStatus, setSaveStatus]       = useState(null)
-  const [showLoadMenu, setShowLoadMenu]   = useState(false)
+  const [showWizard, setShowWizard]         = useState(false)
+  const [editingId, setEditingId]           = useState(null)
+  const [selectedId, setSelectedId]         = useState(null)
+  const [dragId, setDragId]                 = useState(null)
+  const [dragOverId, setDragOverId]         = useState(null)
+  const [dragOverPos, setDragOverPos]       = useState(null)
+  const [saveStatus, setSaveStatus]         = useState(null)
+  const [showLoadMenu, setShowLoadMenu]     = useState(false)
+  // Sequential "Teach All" walk-through. -1 = idle, otherwise the
+  // index into steps[] the operator is currently teaching.
+  const [teachingAllIdx, setTeachingAllIdx] = useState(-1)
   const [savedPrograms, setSavedPrograms] = useState([])
 
   // Diagnostic: log what the editor sees on every mount so a future
@@ -639,6 +662,68 @@ export default function ProgramEditor() {
 
   function handleEditSave(id, patch) {
     updateSteps(renumber(steps.map((s) => s.id === id ? { ...s, ...patch } : s)))
+  }
+
+  // Pull the live robot pose from /api/state and turn it into the
+  // taught-position patch the step model expects.
+  async function buildTaughtPatch() {
+    let joints = [0, 0, 0, 0, 0, 0]
+    let tcp    = null
+    try {
+      const res = await fetch('/api/state')
+      if (res.ok) {
+        const state = await res.json()
+        joints = radiansToJointDegrees(state?.joints?.positions)
+        if (Array.isArray(state?.tcp_pose)) tcp = state.tcp_pose
+      }
+    } catch { /* fall through to defaults */ }
+    const patch = {
+      taught:        true,
+      taught_joints: joints,
+      taught_tcp:    tcp,
+      taught_at:     new Date().toISOString(),
+      // Also overlay action-specific fields so an editor render shows
+      // the taught pose without a separate "use taught" toggle.
+      joints,
+    }
+    if (tcp) patch.position = tcp.slice(0, 3)
+    return patch
+  }
+
+  async function teachStep(id) {
+    const patch = await buildTaughtPatch()
+    updateSteps(renumber(steps.map((s) => s.id === id ? { ...s, ...patch } : s)))
+  }
+
+  // Teach the currently-targeted step in the Teach-All flow and then
+  // advance to the next untaught move step. Walking the array twice
+  // (once for the rewrite, once for the next pointer) avoids the
+  // closure-staleness bug if we relied on a re-rendered steps[].
+  async function teachAllRecord() {
+    if (teachingAllIdx < 0) return
+    const target = steps[teachingAllIdx]
+    if (!target) { setTeachingAllIdx(-1); return }
+    const patch = await buildTaughtPatch()
+    const newSteps = steps.map((s) => s.id === target.id ? { ...s, ...patch } : s)
+    updateSteps(renumber(newSteps))
+    let nextIdx = -1
+    for (let i = teachingAllIdx + 1; i < newSteps.length; i++) {
+      if (isMoveStep(newSteps[i]) && !newSteps[i].taught) { nextIdx = i; break }
+    }
+    setTeachingAllIdx(nextIdx)
+  }
+
+  function teachAllSkip() {
+    let nextIdx = -1
+    for (let i = teachingAllIdx + 1; i < steps.length; i++) {
+      if (isMoveStep(steps[i]) && !steps[i].taught) { nextIdx = i; break }
+    }
+    setTeachingAllIdx(nextIdx)
+  }
+
+  function startTeachAll() {
+    const firstIdx = steps.findIndex((s) => isMoveStep(s) && !s.taught)
+    setTeachingAllIdx(firstIdx)
   }
 
   async function handleSave() {
@@ -828,6 +913,66 @@ export default function ProgramEditor() {
         </span>
       </div>
 
+      {/* Untaught-positions banner — visible whenever any move step
+          still needs to be taught. Disappears once everything's set. */}
+      {untaughtCount > 0 && teachingAllIdx < 0 && (
+        <div style={{
+          margin: '8px 12px 0', padding: '8px 12px', fontSize: 12,
+          background: '#fef2f2', color: '#b91c1c',
+          border: '1px solid #fecaca', borderRadius: 6,
+          display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0,
+        }}>
+          <span style={{ fontWeight: 700 }}>
+            {untaughtCount} position{untaughtCount > 1 ? 's' : ''} not taught
+          </span>
+          <span style={{ color: '#9ca3af', fontSize: 11 }}>
+            — jog the robot, then click Teach on each step
+          </span>
+          <div style={{ flex: 1 }} />
+          <button onClick={startTeachAll}
+            style={{
+              padding: '6px 14px', fontSize: 11, fontWeight: 700,
+              background: '#2563EB', color: '#fff',
+              border: 'none', borderRadius: 5, cursor: 'pointer',
+            }}>
+            Teach All ({untaughtCount})
+          </button>
+        </div>
+      )}
+
+      {/* Active "Teach All" walk-through panel */}
+      {teachingAllIdx >= 0 && steps[teachingAllIdx] && (
+        <div style={{
+          margin: '8px 12px 0', padding: '10px 14px',
+          background: '#eff6ff', border: '2px solid #2563EB',
+          borderRadius: 8, fontSize: 13, flexShrink: 0,
+        }}>
+          <div style={{ fontWeight: 700, color: '#2563EB', marginBottom: 4 }}>
+            Teaching step {teachingAllIdx + 1}: {steps[teachingAllIdx].label || steps[teachingAllIdx].action}
+          </div>
+          <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 8 }}>
+            Jog the robot to the desired position, then click Record. Skip leaves this step untaught.
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={teachAllRecord} style={{
+              padding: '8px 20px', fontSize: 13, fontWeight: 700,
+              background: '#16A34A', color: '#fff',
+              border: 'none', borderRadius: 6, cursor: 'pointer',
+            }}>Record Position</button>
+            <button onClick={teachAllSkip} style={{
+              padding: '8px 16px', fontSize: 12, fontWeight: 600,
+              background: '#f3f4f6', color: '#374151',
+              border: '1px solid #d1d5db', borderRadius: 6, cursor: 'pointer',
+            }}>Skip</button>
+            <button onClick={() => setTeachingAllIdx(-1)} style={{
+              padding: '8px 16px', fontSize: 12,
+              background: '#f3f4f6', color: '#6b7280',
+              border: '1px solid #d1d5db', borderRadius: 6, cursor: 'pointer',
+            }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
       <div
         // Clicking blank space inside the scroll area (not on a row)
         // clears the selection — file-manager style.
@@ -899,6 +1044,20 @@ export default function ProgramEditor() {
                 {isDone ? '✓' : (idx + 1)}
               </div>
 
+              {isMoveStep(step) && step.action !== 'move_home' && (
+                <div title={step.taught ? `Taught at ${step.taught_at || 'unknown'}` : 'Position not taught — click Teach'}
+                  style={{
+                    width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    background: step.taught ? '#f0fdf4' : '#fef2f2',
+                    border:     step.taught ? '2px solid #16A34A' : '2px dashed #DC2626',
+                    color:      step.taught ? '#16A34A' : '#DC2626',
+                    fontSize: 10, fontWeight: 700,
+                  }}>
+                  {step.taught ? 'T' : '!'}
+                </div>
+              )}
+
               <span style={{
                 fontSize: 9, fontWeight: 700, padding: '2px 6px',
                 borderRadius: 3, flexShrink: 0, letterSpacing: '0.5px',
@@ -917,6 +1076,20 @@ export default function ProgramEditor() {
                               padding: '0 4px' }}>
                   {detailLine(step, ioLabels)}
                 </div>
+                {isMoveStep(step) && step.action !== 'move_home' && step.taught && step.taught_joints && (
+                  <div style={{
+                    fontSize: 10, color: '#16A34A', padding: '0 4px',
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  }}>
+                    J=[{step.taught_joints.map((j) => Number(j).toFixed(1)).join(', ')}]°
+                    {step.taught_tcp && ' · TCP=[' + step.taught_tcp.slice(0, 3).map((t) => Number(t).toFixed(3)).join(', ') + ']'}
+                  </div>
+                )}
+                {isMoveStep(step) && step.action !== 'move_home' && !step.taught && (
+                  <div style={{ fontSize: 10, color: '#DC2626', padding: '0 4px', fontWeight: 600 }}>
+                    Not taught
+                  </div>
+                )}
               </div>
 
               <button onClick={(e) => { e.stopPropagation(); setEditingId(step.id) }}
@@ -926,6 +1099,19 @@ export default function ProgramEditor() {
                          cursor: 'pointer', flexShrink: 0 }}>
                 Edit
               </button>
+              {isMoveStep(step) && step.action !== 'move_home' && (
+                <button onClick={(e) => { e.stopPropagation(); teachStep(step.id) }}
+                  title={step.taught ? 'Re-record this position from the current robot pose' : 'Record the current robot pose as this step\'s position'}
+                  style={{
+                    padding: '4px 10px', fontSize: 10, fontWeight: 600, flexShrink: 0,
+                    background: step.taught ? '#f0fdf4' : '#eff6ff',
+                    color:      step.taught ? '#16A34A' : '#2563EB',
+                    border:     step.taught ? '1px solid #bbf7d0' : '1px solid #bfdbfe',
+                    borderRadius: 4, cursor: 'pointer',
+                  }}>
+                  {step.taught ? 'Re-teach' : 'Teach'}
+                </button>
+              )}
               <button onClick={(e) => { e.stopPropagation(); if (!isActive) handleDelete(step.id) }}
                 disabled={isActive}
                 title={isActive ? 'Cannot delete the active step' : 'Delete step'}
