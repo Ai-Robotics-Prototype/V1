@@ -14,9 +14,18 @@ const MID_ITEMS = [
 ]
 
 export default function SideNav() {
+  const activeTab  = useStore((s) => s.activeTab)
   const activeView = useStore((s) => s.activeView)
   const setView    = useStore((s) => s.setView)
   const setTab     = useStore((s) => s.setTab)
+
+  // Every sidebar view lives inside MonitorLayout, so a sidebar click
+  // must also switch the top tab back to 'monitor' — otherwise nothing
+  // visible changes when the user is on e.g. Programs or Configure.
+  function selectView(view) {
+    setView(view)
+    setTab('monitor')
+  }
 
   function NavItem({ icon, label, onClick, isActive }) {
     return (
@@ -73,8 +82,8 @@ export default function SideNav() {
           key={item.label}
           icon={item.icon}
           label={item.label}
-          isActive={activeView === item.view}
-          onClick={() => setView(item.view)}
+          isActive={activeTab === 'monitor' && activeView === item.view}
+          onClick={() => selectView(item.view)}
         />
       ))}
 
@@ -87,8 +96,8 @@ export default function SideNav() {
           key={item.label}
           icon={item.icon}
           label={item.label}
-          isActive={activeView === item.view}
-          onClick={() => setView(item.view)}
+          isActive={activeTab === 'monitor' && activeView === item.view}
+          onClick={() => selectView(item.view)}
         />
       ))}
 
