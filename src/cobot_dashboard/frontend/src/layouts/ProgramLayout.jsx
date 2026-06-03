@@ -399,9 +399,17 @@ export default function ProgramLayout() {
     Math.min(Math.floor(availW * PROGRAM_MAX_FRAC), availW - VIEWER_MIN_WIDTH - 8))
   const jogMax  = Math.max(JOG_MIN_HEIGHT, Math.floor((winH - 96) * JOG_MAX_FRAC))
 
-  const [leftWidth, setLeftWidth]       = useState(() => Math.min(560, leftMax))
-  const [jogHeight, setJogHeight]       = useState(() => Math.min(500, jogMax))
-  const [jogMaximized, setJogMaximized] = useState(false)
+  // Layout state lives in the store (and is persisted) so tab swaps
+  // and page reloads keep the dividers where the operator put them.
+  const programLayout    = useStore((s) => s.programLayout)
+  const setProgramLayout = useStore((s) => s.setProgramLayout)
+  const leftWidth        = programLayout.leftWidth
+  const jogHeight        = programLayout.jogHeight
+  const jogMaximized     = programLayout.jogMaximized
+  const setLeftWidth    = useCallback((w) => setProgramLayout({ leftWidth: typeof w === 'function' ? w(programLayout.leftWidth) : w }), [setProgramLayout, programLayout.leftWidth])
+  const setJogHeight    = useCallback((h) => setProgramLayout({ jogHeight: typeof h === 'function' ? h(programLayout.jogHeight) : h }), [setProgramLayout, programLayout.jogHeight])
+  const setJogMaximized = useCallback((v) => setProgramLayout({ jogMaximized: Boolean(v) }), [setProgramLayout])
+
   const drag = useRef({ active: null, startPos: 0, startVal: 0 })
   const [activeDrag, setActiveDrag] = useState(null)
 
@@ -409,8 +417,12 @@ export default function ProgramLayout() {
   // doesn't end up over the new max (e.g. user shrinks the window
   // after dragging the editor to 800 px).
   useEffect(() => {
-    setLeftWidth((w) => Math.max(PROGRAM_MIN_WIDTH, Math.min(w, leftMax)))
-    setJogHeight((h) => Math.max(JOG_MIN_HEIGHT, Math.min(h, jogMax)))
+    const clampedW = Math.max(PROGRAM_MIN_WIDTH, Math.min(leftWidth, leftMax))
+    const clampedH = Math.max(JOG_MIN_HEIGHT,    Math.min(jogHeight, jogMax))
+    if (clampedW !== leftWidth || clampedH !== jogHeight) {
+      setProgramLayout({ leftWidth: clampedW, jogHeight: clampedH })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [leftMax, jogMax])
 
   const startVerticalDrag = useCallback((e) => {

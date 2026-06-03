@@ -321,6 +321,18 @@ const storeDefinition = (set, get) => ({
     set((s) => ({ currentProgram: { ...s.currentProgram, ...patch } }))
   },
 
+  // Program-tab layout dimensions — kept in the store (and persisted)
+  // so switching to another tab and back keeps the panels at the
+  // sizes the operator dragged them to.
+  programLayout: {
+    leftWidth:    560,
+    jogHeight:    500,
+    jogMaximized: false,
+  },
+  setProgramLayout(patch) {
+    set((s) => ({ programLayout: { ...s.programLayout, ...patch } }))
+  },
+
   // ---------------------------------------------------------------------------
   // Jog enable/disable
   // ---------------------------------------------------------------------------
@@ -395,6 +407,9 @@ export const useStore = create(
       // shouldn't lose their work — and switching tabs only un-mounts
       // the component, the store-backed slice survives either way.
       currentProgram: state.currentProgram,
+      // Same idea for the Program tab's resizable layout — dragging the
+      // dividers should outlive a tab switch and a page reload.
+      programLayout:  state.programLayout,
     }),
   })
 )
