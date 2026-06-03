@@ -1759,17 +1759,10 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/api/programs")
     async def api_programs_list():
-        """List robot programs available to link parts to. Includes a
-        small set of built-in defaults plus any JSON in /opt/cobot/programs/."""
-        defaults = [
-            {'id': 'pick_and_place',   'name': 'Pick and Place',   'steps': 5, 'builtin': True},
-            {'id': 'pick_and_sort',    'name': 'Pick and Sort',    'steps': 7, 'builtin': True},
-            {'id': 'pick_and_inspect', 'name': 'Pick and Inspect', 'steps': 6, 'builtin': True},
-            {'id': 'assembly_insert',  'name': 'Assembly Insert',  'steps': 8, 'builtin': True},
-            {'id': 'palletize',        'name': 'Palletize',        'steps': 4, 'builtin': True},
-            {'id': 'depalletize',      'name': 'Depalletize',      'steps': 4, 'builtin': True},
-        ]
-        programs = list(defaults)
+        """List user-created robot programs from /opt/cobot/programs/.
+        No built-in templates — every entry corresponds to a file on
+        disk and is fully editable / deletable."""
+        programs = []
         try:
             os.makedirs(_PROG_DIR, exist_ok=True)
             for fn in sorted(os.listdir(_PROG_DIR)):
@@ -1786,7 +1779,6 @@ if FASTAPI_AVAILABLE:
                         'tags':        prog.get('tags') or [],
                         'created':     prog.get('created') or '',
                         'updated':     prog.get('updated') or '',
-                        'builtin':     False,
                     })
                 except Exception:
                     continue

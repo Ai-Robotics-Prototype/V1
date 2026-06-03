@@ -674,7 +674,7 @@ export default function ProgramEditor() {
     try {
       const res = await fetch('/api/programs')
       const data = await res.json()
-      setSavedPrograms((data.programs || []).filter((p) => !p.builtin))
+      setSavedPrograms(data.programs || [])
     } catch {
       setSavedPrograms([])
     }

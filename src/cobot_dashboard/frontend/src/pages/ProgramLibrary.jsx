@@ -199,9 +199,9 @@ export default function ProgramLibrary() {
                   </button>
                   <button
                     onClick={() => handleEdit(p)}
-                    disabled={busyId === p.id || p.builtin}
-                    title={p.builtin ? 'Built-in templates are read-only — duplicate or use the wizard to make an editable copy' : 'Open in Program editor'}
-                    style={p.builtin ? { ...btnSecondary, opacity: 0.4, cursor: 'not-allowed' } : btnEdit}
+                    disabled={busyId === p.id}
+                    title="Open in Program editor"
+                    style={btnEdit}
                   >
                     Edit
                   </button>
@@ -214,9 +214,9 @@ export default function ProgramLibrary() {
                   </button>
                   <button
                     onClick={() => handleDelete(p)}
-                    disabled={busyId === p.id || p.builtin}
-                    title={p.builtin ? 'Built-in templates cannot be deleted' : 'Delete program'}
-                    style={p.builtin ? { ...btnDanger, opacity: 0.3, cursor: 'not-allowed' } : btnDanger}
+                    disabled={busyId === p.id}
+                    title="Delete program"
+                    style={btnDanger}
                   >
                     Delete
                   </button>
