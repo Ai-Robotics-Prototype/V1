@@ -657,8 +657,16 @@ export default function ProgramEditor() {
   // tab swap unmount-and-remount doesn't reset them.
   const programId   = currentProgram.id
   const programName = currentProgram.name
-  const steps       = currentProgram.steps || []
   const unsaved     = currentProgram.unsaved
+  // Persisted (or wizard-output) steps may arrive without numeric ids
+  // — for example, an older localStorage snapshot. If we passed those
+  // straight to the editor's id-keyed selectors, editingId === step.id
+  // would collapse to undefined === undefined → true for every row,
+  // i.e. clicking Edit would open every step at once. Renumber on
+  // ingest if any id is missing or non-numeric.
+  const rawSteps = currentProgram.steps || []
+  const stepsHaveIds = rawSteps.every((s) => typeof s.id === 'number')
+  const steps = stepsHaveIds ? rawSteps : renumber(rawSteps)
   // Untaught steps the operator still needs to teach before the path
   // is ready to run. Includes gripper open/close and the home pose —
   // they all happen at a specific robot location.
@@ -697,6 +705,17 @@ export default function ProgramEditor() {
       { id: currentProgram.id, name: currentProgram.name, steps: currentProgram.steps?.length, unsaved: currentProgram.unsaved })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // One-shot heal: if persisted steps lacked ids, write the
+  // renumbered list back so subsequent reads are stable and the next
+  // render doesn't redo the renumber.
+  useEffect(() => {
+    if (rawSteps.length > 0 && !stepsHaveIds) {
+      console.warn('[ProgramEditor] persisted steps missing ids — healing', rawSteps.length)
+      setCurrentProgram({ steps: renumber(rawSteps) })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stepsHaveIds, rawSteps.length])
 
   // ProgramLibrary writes a saved program into the store and switches
   // to this tab. Consume it once, populate currentProgram, mirror to
@@ -1197,7 +1216,11 @@ export default function ProgramEditor() {
           const def = actionFor(step)
           const tagColor = TAG_COLORS[def.tag] || '#6b7280'
 
-          if (editingId === step.id) {
+          // Belt-and-suspenders: never match a null/undefined editingId
+          // against a missing step.id — that's the exact failure mode
+          // that opened every editor at once when persisted steps had
+          // no ids.
+          if (typeof editingId === 'number' && typeof step.id === 'number' && editingId === step.id) {
             return (
               <StepEditor key={step.id} step={step}
                 onSave={(patch) => handleEditSave(step.id, patch)}
@@ -1322,6 +1345,10 @@ export default function ProgramEditor() {
               {!locked && (
                 <button onClick={(e) => {
                   e.stopPropagation()
+                  if (typeof step.id !== 'number') {
+                    console.error('[ProgramEditor] Step has no numeric id — refusing to open editor', step)
+                    return
+                  }
                   console.log('[ProgramEditor] Edit button clicked id=' + step.id + ' (was editingId=' + editingId + ')')
                   setEditingId(step.id)
                 }}
