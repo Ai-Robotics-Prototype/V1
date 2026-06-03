@@ -294,6 +294,62 @@ function VoiceBar() {
   )
 }
 
+function EditableStepLabel({ value, onSave }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft]     = useState(value)
+  const ref = useRef(null)
+
+  useEffect(() => { setDraft(value) }, [value])
+  useEffect(() => {
+    if (editing && ref.current) { ref.current.focus(); ref.current.select() }
+  }, [editing])
+
+  function commit() {
+    setEditing(false)
+    const trimmed = draft.trim()
+    if (trimmed && trimmed !== value) onSave(trimmed)
+    else setDraft(value)
+  }
+
+  if (editing) {
+    return (
+      <input ref={ref} value={draft}
+        onClick={(e) => e.stopPropagation()}
+        onMouseDown={(e) => e.stopPropagation()}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') commit()
+          else if (e.key === 'Escape') { setDraft(value); setEditing(false) }
+        }}
+        style={{
+          fontSize: 12, fontWeight: 600, padding: '2px 6px',
+          background: '#fff', color: '#111',
+          border: '1px solid #2563EB', borderRadius: 3,
+          outline: 'none', width: '100%',
+        }}
+      />
+    )
+  }
+
+  return (
+    <span
+      onClick={(e) => { e.stopPropagation(); setDraft(value); setEditing(true) }}
+      title="Click to rename"
+      style={{
+        fontSize: 12, fontWeight: 600, color: '#111',
+        cursor: 'text', padding: '2px 4px', borderRadius: 3,
+        display: 'block',
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      }}
+      onMouseEnter={(e) => { e.currentTarget.style.background = '#f0f0f0' }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}
+    >
+      {value}
+    </span>
+  )
+}
+
 export default function ProgramEditor() {
   const steps              = useStore((s) => s.program.steps ?? [])
   const addProgramStep     = useStore((s) => s.addProgramStep)
@@ -419,20 +475,23 @@ export default function ProgramEditor() {
                 {def.tag}
               </span>
 
-              <div style={{ flex: 1, minWidth: 0, cursor: 'pointer' }} onClick={() => setEditingId(step.id)}>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#111',
-                              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {step.label || def.label}
-                </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <EditableStepLabel
+                  value={step.label || def.label}
+                  onSave={(newLabel) => updateProgramStep(step.id, { label: newLabel })}
+                />
                 <div style={{ fontSize: 10, color: '#6b7280',
-                              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                              padding: '0 4px' }}>
                   {detailLine(step)}
                 </div>
               </div>
 
               <button onClick={(e) => { e.stopPropagation(); setEditingId(step.id) }}
-                style={{ padding: '3px 8px', fontSize: 10, background: '#f3f4f6', color: '#374151',
-                         border: '1px solid #d1d5db', borderRadius: 3, cursor: 'pointer', flexShrink: 0 }}>
+                style={{ padding: '4px 10px', fontSize: 10, fontWeight: 600,
+                         background: '#eff6ff', color: '#2563EB',
+                         border: '1px solid #bfdbfe', borderRadius: 4,
+                         cursor: 'pointer', flexShrink: 0 }}>
                 Edit
               </button>
               <button onClick={(e) => { e.stopPropagation(); if (!isActive) removeProgramStep(step.id) }}
