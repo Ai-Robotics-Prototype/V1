@@ -297,6 +297,23 @@ function VoiceBar() {
   )
 }
 
+// Fingerprint excludes runtime-owned fields (id, status, step) so the
+// editor doesn't go "unsaved" just because step 1 transitioned from
+// pending → active. Keys are sorted for stable comparison.
+function programSig(name, steps) {
+  return JSON.stringify({
+    name: String(name || '').trim(),
+    steps: (steps || []).map((s) => {
+      const out = {}
+      for (const k of Object.keys(s).sort()) {
+        if (k === 'id' || k === 'status' || k === 'step') continue
+        out[k] = s[k]
+      }
+      return out
+    }),
+  })
+}
+
 function InsertionBar() {
   return (
     <div
@@ -382,6 +399,20 @@ export default function ProgramEditor() {
   const [editingId, setEditingId]     = useState(null)
   const [dragId, setDragId]           = useState(null)
   const [dragOverId, setDragOverId]   = useState(null)
+
+  // Program identity + save state
+  const [programId, setProgramId]         = useState(null)
+  const [programName, setProgramName]     = useState('Untitled Program')
+  const [lastSavedSig, setLastSavedSig]   = useState('')
+  const [saveStatus, setSaveStatus]       = useState(null) // 'saving' | 'saved' | 'error' | null
+  const [showLoadMenu, setShowLoadMenu]   = useState(false)
+  const [savedPrograms, setSavedPrograms] = useState([])
+
+  const currentSig = programSig(programName, steps)
+  // Brand-new editor (no associated file) is always considered unsaved;
+  // an associated program is unsaved only when its current fingerprint
+  // differs from the last successful save.
+  const unsaved = programId == null || currentSig !== lastSavedSig
   // 'before' | 'after' — which side of the hovered row the cursor is on,
   // computed from the row's bounding rect so the blue insertion bar
   // tracks the actual landing spot, not just which row we're over.
@@ -441,18 +472,156 @@ export default function ProgramEditor() {
     addProgramStep({ type: 'wait', action: 'wait', label: 'Wait', duration_s: 1, detail: '' })
   }
 
+  async function handleSave() {
+    if (saveStatus === 'saving') return
+    const name = programName.trim() || 'Untitled Program'
+    setSaveStatus('saving')
+    try {
+      const body = JSON.stringify({ name, steps })
+      const res = await fetch(
+        programId ? `/api/programs/${encodeURIComponent(programId)}` : '/api/programs',
+        { method: programId ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' }, body },
+      )
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data && data.ok && data.program) {
+        if (!programId) setProgramId(data.program.id)
+        setLastSavedSig(programSig(data.program.name || name, data.program.steps || steps))
+        setSaveStatus('saved')
+        setTimeout(() => setSaveStatus(null), 2000)
+      } else {
+        setSaveStatus('error')
+        setTimeout(() => setSaveStatus(null), 3000)
+      }
+    } catch {
+      setSaveStatus('error')
+      setTimeout(() => setSaveStatus(null), 3000)
+    }
+  }
+
+  async function openLoadMenu() {
+    try {
+      const res = await fetch('/api/programs')
+      const data = await res.json()
+      setSavedPrograms((data.programs || []).filter((p) => !p.builtin))
+    } catch {
+      setSavedPrograms([])
+    }
+    setShowLoadMenu(true)
+  }
+
+  async function loadProgram(id) {
+    try {
+      const res = await fetch(`/api/programs/${encodeURIComponent(id)}`)
+      if (!res.ok) return
+      const prog = await res.json()
+      if (prog && Array.isArray(prog.steps)) {
+        setProgramSteps(prog.steps)
+        setProgramId(prog.id || id)
+        setProgramName(prog.name || 'Untitled Program')
+        setLastSavedSig(programSig(prog.name || 'Untitled Program', prog.steps))
+      }
+    } catch { /* swallow */ }
+    setShowLoadMenu(false)
+  }
+
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#fff' }}>
-      <div style={{ padding: '12px 16px', borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', gap: 12 }}>
-        <span style={{ fontSize: 14, fontWeight: 700, color: '#111', flex: 1 }}>Program</span>
-        <span style={{ fontSize: 11, color: '#6b7280' }}>{steps.length} step{steps.length === 1 ? '' : 's'}</span>
+      <div style={{ padding: '12px 16px', borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          value={programName}
+          onChange={(e) => setProgramName(e.target.value)}
+          placeholder="Untitled Program"
+          style={{
+            fontSize: 14, fontWeight: 700, flex: 1, padding: '4px 8px',
+            background: 'transparent', color: '#111',
+            border: '1px solid transparent', borderRadius: 4, outline: 'none',
+            minWidth: 0,
+          }}
+          onFocus={(e) => { e.currentTarget.style.borderColor = '#2563EB'; e.currentTarget.style.background = '#fff' }}
+          onBlur={(e)  => { e.currentTarget.style.borderColor = 'transparent'; e.currentTarget.style.background = 'transparent' }}
+        />
+        {unsaved && (
+          <div title="Unsaved changes"
+            style={{ width: 8, height: 8, borderRadius: '50%', background: '#f59e0b', flexShrink: 0 }} />
+        )}
+        <span style={{ fontSize: 11, color: '#6b7280', flexShrink: 0 }}>
+          {steps.length} step{steps.length === 1 ? '' : 's'}
+        </span>
+
+        <button onClick={handleSave} disabled={!unsaved || saveStatus === 'saving'}
+          style={{
+            padding: '6px 14px', fontSize: 12, fontWeight: 600,
+            background: saveStatus === 'saved' ? '#16A34A'
+                      : saveStatus === 'error' ? '#DC2626'
+                      : unsaved ? '#2563EB' : '#e5e7eb',
+            color:      (unsaved || saveStatus) ? '#fff' : '#9ca3af',
+            border: 'none', borderRadius: 6,
+            cursor: (unsaved && saveStatus !== 'saving') ? 'pointer' : 'default',
+            minWidth: 80, flexShrink: 0,
+          }}>
+          {saveStatus === 'saving' ? 'Saving…'
+            : saveStatus === 'saved' ? 'Saved'
+            : saveStatus === 'error' ? 'Error'
+            : unsaved ? 'Save' : 'Saved'}
+        </button>
+
+        <div style={{ position: 'relative', flexShrink: 0 }}>
+          <button onClick={openLoadMenu}
+            style={{
+              padding: '6px 12px', fontSize: 12, fontWeight: 600,
+              background: '#f3f4f6', color: '#374151',
+              border: '1px solid #d1d5db', borderRadius: 6, cursor: 'pointer',
+            }}>
+            Load
+          </button>
+          {showLoadMenu && (
+            <>
+              <div onClick={() => setShowLoadMenu(false)}
+                style={{ position: 'fixed', inset: 0, zIndex: 20, background: 'transparent' }} />
+              <div style={{
+                position: 'absolute', top: 'calc(100% + 4px)', right: 0, zIndex: 21,
+                background: '#fff', border: '1px solid #d1d5db', borderRadius: 8,
+                boxShadow: '0 8px 24px rgba(0,0,0,0.12)',
+                width: 280, maxHeight: 360, overflowY: 'auto',
+              }}>
+                <div style={{
+                  padding: '8px 12px', borderBottom: '1px solid #e5e7eb',
+                  fontSize: 11, color: '#6b7280', fontWeight: 600,
+                }}>
+                  Saved Programs
+                </div>
+                {savedPrograms.length === 0 ? (
+                  <div style={{ padding: 16, textAlign: 'center', color: '#9ca3af', fontSize: 12 }}>
+                    No saved programs yet
+                  </div>
+                ) : savedPrograms.map((p) => (
+                  <button key={p.id} onClick={() => loadProgram(p.id)}
+                    style={{
+                      width: '100%', padding: '10px 12px', textAlign: 'left', cursor: 'pointer',
+                      background: '#fff', border: 'none', borderBottom: '1px solid #f3f4f6',
+                      display: 'block',
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = '#f0f9ff' }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = '#fff' }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: '#111' }}>{p.name}</div>
+                    <div style={{ fontSize: 10, color: '#6b7280' }}>
+                      {p.steps} step{p.steps === 1 ? '' : 's'}{p.updated ? ' · ' + p.updated : ''}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+
         <button onClick={() => setShowWizard(true)}
           style={{
             padding: '6px 12px', fontSize: 12, fontWeight: 600,
             background: '#2563EB', color: '#fff', border: 'none',
-            borderRadius: 6, cursor: 'pointer',
+            borderRadius: 6, cursor: 'pointer', flexShrink: 0,
           }}>
-          + New Program Wizard
+          + Wizard
         </button>
       </div>
 
@@ -584,7 +753,12 @@ export default function ProgramEditor() {
         <ProgramWizard
           onClose={() => setShowWizard(false)}
           onSaved={(program) => {
-            if (program?.steps?.length) setProgramSteps(program.steps)
+            if (program) {
+              if (program.steps?.length) setProgramSteps(program.steps)
+              if (program.id)            setProgramId(program.id)
+              if (program.name)          setProgramName(program.name)
+              setLastSavedSig(programSig(program.name || 'Untitled Program', program.steps || []))
+            }
             setShowWizard(false)
           }}
         />

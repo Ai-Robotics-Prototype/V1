@@ -1739,32 +1739,50 @@ if FASTAPI_AVAILABLE:
 
         return {"ok": True, "part": part}
 
+    # Path-traversal guard for /api/programs/{prog_id} routes. Slugs are
+    # produced by the POST endpoint as [a-z0-9_]+ so we mirror that here.
+    import re as _prog_re
+    _PROG_DIR = '/opt/cobot/programs'
+    _PROG_ID_RE = _prog_re.compile(r'^[a-z0-9_]+$')
+
+    def _prog_path(prog_id: str):
+        if not _PROG_ID_RE.match(prog_id or ''):
+            return None
+        return os.path.join(_PROG_DIR, prog_id + '.json')
+
+    def _now_stamp():
+        return time.strftime('%Y-%m-%d %H:%M')
+
     @app.get("/api/programs")
     async def api_programs_list():
         """List robot programs available to link parts to. Includes a
         small set of built-in defaults plus any JSON in /opt/cobot/programs/."""
         defaults = [
-            {'id': 'pick_and_place',   'name': 'Pick and Place',   'steps': 5},
-            {'id': 'pick_and_sort',    'name': 'Pick and Sort',    'steps': 7},
-            {'id': 'pick_and_inspect', 'name': 'Pick and Inspect', 'steps': 6},
-            {'id': 'assembly_insert',  'name': 'Assembly Insert',  'steps': 8},
-            {'id': 'palletize',        'name': 'Palletize',        'steps': 4},
-            {'id': 'depalletize',      'name': 'Depalletize',      'steps': 4},
+            {'id': 'pick_and_place',   'name': 'Pick and Place',   'steps': 5, 'builtin': True},
+            {'id': 'pick_and_sort',    'name': 'Pick and Sort',    'steps': 7, 'builtin': True},
+            {'id': 'pick_and_inspect', 'name': 'Pick and Inspect', 'steps': 6, 'builtin': True},
+            {'id': 'assembly_insert',  'name': 'Assembly Insert',  'steps': 8, 'builtin': True},
+            {'id': 'palletize',        'name': 'Palletize',        'steps': 4, 'builtin': True},
+            {'id': 'depalletize',      'name': 'Depalletize',      'steps': 4, 'builtin': True},
         ]
         programs = list(defaults)
-        prog_dir = '/opt/cobot/programs'
         try:
-            os.makedirs(prog_dir, exist_ok=True)
-            for fn in sorted(os.listdir(prog_dir)):
+            os.makedirs(_PROG_DIR, exist_ok=True)
+            for fn in sorted(os.listdir(_PROG_DIR)):
                 if not fn.endswith('.json'):
                     continue
                 try:
-                    with open(os.path.join(prog_dir, fn)) as fp:
+                    with open(os.path.join(_PROG_DIR, fn)) as fp:
                         prog = json.load(fp)
                     programs.append({
-                        'id':    fn[:-5],
-                        'name':  prog.get('name') or fn[:-5],
-                        'steps': len(prog.get('steps') or []),
+                        'id':          fn[:-5],
+                        'name':        prog.get('name') or fn[:-5],
+                        'description': prog.get('description') or '',
+                        'steps':       len(prog.get('steps') or []),
+                        'tags':        prog.get('tags') or [],
+                        'created':     prog.get('created') or '',
+                        'updated':     prog.get('updated') or '',
+                        'builtin':     False,
                     })
                 except Exception:
                     continue
@@ -1775,9 +1793,8 @@ if FASTAPI_AVAILABLE:
     @app.post("/api/programs")
     async def api_programs_save(request: Request):
         """Persist a wizard-generated program to /opt/cobot/programs as a
-        JSON file. Slug is derived from the name; collisions get a -2,
-        -3, ... suffix so we never silently overwrite."""
-        import re as _re
+        JSON file. Slug is derived from the name; collisions get a _2,
+        _3, ... suffix so we never silently overwrite."""
         try:
             body = await request.json()
         except Exception:
@@ -1788,17 +1805,17 @@ if FASTAPI_AVAILABLE:
         steps = body.get("steps") or []
         if not isinstance(steps, list):
             return JSONResponse({"error": "steps must be a list"}, status_code=400)
-        base = _re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or 'program'
-        prog_dir = '/opt/cobot/programs'
+        base = _prog_re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or 'program'
         try:
-            os.makedirs(prog_dir, exist_ok=True)
+            os.makedirs(_PROG_DIR, exist_ok=True)
         except Exception as e:
-            return JSONResponse({"error": f"cannot create {prog_dir}: {e}"}, status_code=500)
+            return JSONResponse({"error": f"cannot create {_PROG_DIR}: {e}"}, status_code=500)
         slug = base
         n = 2
-        while os.path.exists(os.path.join(prog_dir, slug + '.json')):
+        while os.path.exists(os.path.join(_PROG_DIR, slug + '.json')):
             slug = f"{base}_{n}"
             n += 1
+        ts = _now_stamp()
         program = {
             "id":          slug,
             "name":        name,
@@ -1806,13 +1823,71 @@ if FASTAPI_AVAILABLE:
             "tags":        list(body.get("tags") or []),
             "config":      body.get("config") or {},
             "steps":       steps,
+            "created":     ts,
+            "updated":     ts,
         }
         try:
-            with open(os.path.join(prog_dir, slug + '.json'), 'w') as f:
+            with open(os.path.join(_PROG_DIR, slug + '.json'), 'w') as f:
                 json.dump(program, f, indent=2)
         except Exception as e:
             return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
         return {"ok": True, "program": program}
+
+    @app.get("/api/programs/{prog_id}")
+    async def api_programs_get(prog_id: str):
+        path = _prog_path(prog_id)
+        if not path or not os.path.isfile(path):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception as e:
+            return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
+
+    @app.put("/api/programs/{prog_id}")
+    async def api_programs_update(prog_id: str, request: Request):
+        """Merge an update into the existing program file. Preserves the
+        original id and created timestamp; bumps updated. Accepts the
+        same shape as POST minus the auto-slugging."""
+        path = _prog_path(prog_id)
+        if not path or not os.path.isfile(path):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        if "steps" in body and not isinstance(body["steps"], list):
+            return JSONResponse({"error": "steps must be a list"}, status_code=400)
+        try:
+            with open(path) as f:
+                prog = json.load(f)
+        except Exception as e:
+            return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
+        for k in ("name", "description", "tags", "config", "steps"):
+            if k in body:
+                prog[k] = body[k]
+        # id is owned by the filename — never let a client change it.
+        prog["id"] = prog_id
+        prog["updated"] = _now_stamp()
+        if "created" not in prog:
+            prog["created"] = prog["updated"]
+        try:
+            with open(path, 'w') as f:
+                json.dump(prog, f, indent=2)
+        except Exception as e:
+            return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
+        return {"ok": True, "program": prog}
+
+    @app.delete("/api/programs/{prog_id}")
+    async def api_programs_delete(prog_id: str):
+        path = _prog_path(prog_id)
+        if not path or not os.path.isfile(path):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        try:
+            os.remove(path)
+        except Exception as e:
+            return JSONResponse({"error": f"delete failed: {e}"}, status_code=500)
+        return {"ok": True}
 
     # ------------------------------------------------------------------
     # I/O state (Estun S10-140 digital/analog inputs and outputs).
