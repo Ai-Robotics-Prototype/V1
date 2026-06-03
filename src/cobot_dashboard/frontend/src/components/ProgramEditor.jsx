@@ -26,14 +26,12 @@ const TAG_COLORS = {
   PLACE: '#0891b2', WAIT: '#6b7280', DETECT: '#8b5cf6', LOOP: '#ec4899', IO: '#f97316',
 }
 
-// Actions that happen at a specific robot pose — every one of these
-// can have its position taught. Gripper open/close are included
-// because they always occur at a particular location (the pose at
-// which the gripper actuates is part of the program).
+// Actions that move the robot to a specific pose. Gripper open/close
+// are pure I/O signals — the pose at which they fire is owned by the
+// previous move step, so they don't get their own taught position.
 const TEACHABLE_ACTIONS = [
   'move_home', 'move_joint', 'move_linear',
   'approach',  'pick',       'place',
-  'open_gripper', 'close_gripper',
 ]
 function isTeachable(step) { return step && TEACHABLE_ACTIONS.includes(step.action) }
 
