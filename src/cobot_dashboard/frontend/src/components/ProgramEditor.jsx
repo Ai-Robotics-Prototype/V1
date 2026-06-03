@@ -331,6 +331,13 @@ function InsertionBar() {
   )
 }
 
+// Size the rename input to fit the current text, clamped between
+// 80px (so a one-character draft is still clickable) and 300px (so a
+// long paste doesn't push the row's buttons off the right edge).
+function labelInputWidth(text) {
+  return Math.max(80, Math.min(300, (text || '').length * 8 + 24))
+}
+
 function EditableStepLabel({ value, onSave }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft]     = useState(value)
@@ -363,7 +370,8 @@ function EditableStepLabel({ value, onSave }) {
           fontSize: 12, fontWeight: 600, padding: '2px 6px',
           background: '#fff', color: '#111',
           border: '1px solid #2563EB', borderRadius: 3,
-          outline: 'none', width: '100%',
+          outline: 'none',
+          width: labelInputWidth(draft),
         }}
       />
     )
@@ -376,8 +384,10 @@ function EditableStepLabel({ value, onSave }) {
       style={{
         fontSize: 12, fontWeight: 600, color: '#111',
         cursor: 'text', padding: '2px 4px', borderRadius: 3,
-        display: 'block',
-        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        display: 'inline-block',
+        whiteSpace: 'nowrap',
+        maxWidth: '100%',
+        overflow: 'hidden', textOverflow: 'ellipsis',
       }}
       onMouseEnter={(e) => { e.currentTarget.style.background = '#f0f0f0' }}
       onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}
@@ -397,6 +407,7 @@ export default function ProgramEditor() {
 
   const [showWizard, setShowWizard]   = useState(false)
   const [editingId, setEditingId]     = useState(null)
+  const [selectedId, setSelectedId]   = useState(null)
   const [dragId, setDragId]           = useState(null)
   const [dragOverId, setDragOverId]   = useState(null)
 
@@ -638,7 +649,11 @@ export default function ProgramEditor() {
         </span>
       </div>
 
-      <div style={{ flex: 1, overflowY: 'auto', padding: '8px 12px' }}>
+      <div
+        // Clicking blank space inside the scroll area (not on a row)
+        // clears the selection — file-manager style.
+        onClick={(e) => { if (e.target === e.currentTarget) setSelectedId(null) }}
+        style={{ flex: 1, overflowY: 'auto', padding: '8px 12px' }}>
         {steps.map((step, idx) => {
           const def = actionFor(step)
           const tagColor = TAG_COLORS[def.tag] || '#6b7280'
@@ -654,6 +669,7 @@ export default function ProgramEditor() {
 
           const isActive   = step.status === 'active'
           const isDone     = step.status === 'done'
+          const isSelected = selectedId === step.id
           const isDragging = dragId === step.id
           // Only show the insertion indicator if a drag is in progress
           // and we wouldn't be dropping onto ourselves.
@@ -667,6 +683,7 @@ export default function ProgramEditor() {
 
               <div
                 draggable={!isActive}
+                onClick={() => setSelectedId(step.id)}
                 onDragStart={(e) => handleDragStart(e, step.id)}
                 onDragOver={(e) => handleDragOver(e, step.id)}
                 onDrop={(e) => handleDrop(e, step.id)}
@@ -674,8 +691,16 @@ export default function ProgramEditor() {
                 style={{
                   display: 'flex', alignItems: 'center', gap: 10,
                   padding: '8px 12px', marginBottom: 4, borderRadius: 6,
-                  background: isDragging ? '#f1f5f9' : isActive ? '#f0f9ff' : '#fff',
-                  border: isActive ? '1px solid #93c5fd' : '1px solid #e5e7eb',
+                  // Selection wins over the live-task highlight so the
+                  // user can always tell what they just clicked.
+                  background: isDragging ? '#f1f5f9'
+                            : isSelected ? '#eff6ff'
+                            : isActive   ? '#f0fdf4'
+                            : '#fff',
+                  border: isDragging ? '1px solid #e5e7eb'
+                        : isSelected ? '2px solid #2563EB'
+                        : isActive   ? '1px solid #bbf7d0'
+                        : '1px solid #e5e7eb',
                   cursor: isActive ? 'default' : 'grab',
                   opacity: isDragging ? 0.3 : 1,
                   transform: isDragging ? 'scale(0.97)' : 'scale(1)',
