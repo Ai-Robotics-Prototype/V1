@@ -386,6 +386,11 @@ export const useStore = create(
       mode: state.mode,
       activeTab: state.activeTab,
       activeView: state.activeView,
+      // Persist the editor's current draft (id / name / steps / unsaved)
+      // across page reloads. A user mid-edit who accidentally hits F5
+      // shouldn't lose their work — and switching tabs only un-mounts
+      // the component, the store-backed slice survives either way.
+      currentProgram: state.currentProgram,
     }),
   })
 )

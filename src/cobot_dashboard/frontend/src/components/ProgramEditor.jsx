@@ -428,6 +428,15 @@ export default function ProgramEditor() {
   const [showLoadMenu, setShowLoadMenu]   = useState(false)
   const [savedPrograms, setSavedPrograms] = useState([])
 
+  // Diagnostic: log what the editor sees on every mount so a future
+  // "switching tabs lost my program" report can be verified — if
+  // currentProgram is intact here the bug is in render, not state.
+  useEffect(() => {
+    console.log('[ProgramEditor] mounted with currentProgram',
+      { id: currentProgram.id, name: currentProgram.name, steps: currentProgram.steps?.length, unsaved: currentProgram.unsaved })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // ProgramLibrary writes a saved program into the store and switches
   // to this tab. Consume it once, populate currentProgram, mirror to
   // STATE.program so Run sees it, then clear the slot.
