@@ -1316,6 +1316,34 @@ if FASTAPI_AVAILABLE:
             STATE["joints"]["positions"][joint] += delta
             return {"ok": True, "joints": copy.deepcopy(STATE["joints"])}
 
+    @app.post("/cmd/jog_cartesian")
+    async def cmd_jog_cartesian(request: Request):
+        """Cartesian-space jog. The sim has no IK so the arm doesn't
+        visibly move here — we just publish the command on a ROS topic
+        for a real driver to consume. Same safety gates as joint jog."""
+        body = await request.json()
+        with _state_lock:
+            if STATE["safety"]["estop"]:
+                return JSONResponse({"error": "Cannot jog: estop active"}, status_code=400)
+            if STATE["safety"]["zone"] != "GREEN":
+                return JSONResponse({"error": "Cannot jog: zone not GREEN"}, status_code=400)
+        if _ros_node is not None:
+            try:
+                if not hasattr(_ros_node, '_jog_cart_pub'):
+                    _ros_node._jog_cart_pub = _ros_node.create_publisher(
+                        String, "/robot/jog_cartesian", 10)
+                m = String()
+                m.data = json.dumps({
+                    "axis":      str(body.get("axis", "")),
+                    "direction": int(body.get("direction", 1)),
+                    "step":      float(body.get("step", 1.0)),
+                    "speed":     int(body.get("speed", 20)),
+                })
+                _ros_node._jog_cart_pub.publish(m)
+            except Exception:
+                pass
+        return {"ok": True}
+
     @app.post("/cmd/gripper")
     async def cmd_gripper(request: Request):
         body = await request.json()

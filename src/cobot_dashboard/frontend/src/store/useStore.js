@@ -295,6 +295,10 @@ const storeDefinition = (set, get) => ({
     return get().sendCommand('program/set', { steps })
   },
 
+  jogCartesian(axis, direction, step, speed) {
+    return get().sendCommand('jog_cartesian', { axis, direction, step, speed })
+  },
+
   // Hand-off slot used by the Programs library to load a saved program
   // into the Program tab's editor. ProgramEditor reads it once and
   // clears it; it doesn't survive page reloads.
