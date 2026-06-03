@@ -3,37 +3,41 @@ import { useStore } from '../store/useStore'
 import ProgramEditor from '../components/ProgramEditor'
 import ArmViewer3D from '../components/ArmViewer3D'
 
-function VerticalDivider({ onMouseDown, dragging }) {
+// Pinned: red tint when the panel is at its min/max limit so the
+// operator gets visual feedback instead of silent unresponsiveness.
+function VerticalDivider({ onMouseDown, dragging, atLimit }) {
+  const tint = dragging ? '#2563EB40' : atLimit ? '#DC262640' : 'transparent'
   return (
     <div
       onMouseDown={onMouseDown}
       style={{
         width: 5, cursor: 'col-resize', flexShrink: 0,
-        background: dragging ? '#2563EB40' : 'transparent',
-        position: 'relative', zIndex: 10,
+        background: tint, position: 'relative', zIndex: 10,
+        transition: 'background 150ms',
       }}
-      onMouseEnter={(e) => { e.currentTarget.style.background = '#2563EB40' }}
-      onMouseLeave={(e) => { if (!dragging) e.currentTarget.style.background = 'transparent' }}>
+      onMouseEnter={(e) => { e.currentTarget.style.background = atLimit ? '#DC262640' : '#2563EB40' }}
+      onMouseLeave={(e) => { if (!dragging) e.currentTarget.style.background = atLimit ? '#DC262640' : 'transparent' }}>
       <div style={{
         position: 'absolute', top: '50%', left: 1, transform: 'translateY(-50%)',
-        width: 3, height: 30, borderRadius: 2, background: '#d1d5db',
+        width: 3, height: 30, borderRadius: 2, background: atLimit ? '#DC2626' : '#d1d5db',
       }} />
     </div>
   )
 }
 
-function HorizontalDivider({ onMouseDown, dragging }) {
+function HorizontalDivider({ onMouseDown, dragging, atLimit }) {
+  const tint = dragging ? '#2563EB40' : atLimit ? '#DC262640' : 'transparent'
   return (
     <div
       onMouseDown={onMouseDown}
       style={{
         height: 5, cursor: 'row-resize', flexShrink: 0,
-        background: dragging ? '#2563EB40' : 'transparent',
+        background: tint, transition: 'background 150ms',
         display: 'flex', justifyContent: 'center', alignItems: 'center',
       }}
-      onMouseEnter={(e) => { e.currentTarget.style.background = '#2563EB40' }}
-      onMouseLeave={(e) => { if (!dragging) e.currentTarget.style.background = 'transparent' }}>
-      <div style={{ width: 30, height: 3, borderRadius: 2, background: '#d1d5db' }} />
+      onMouseEnter={(e) => { e.currentTarget.style.background = atLimit ? '#DC262640' : '#2563EB40' }}
+      onMouseLeave={(e) => { if (!dragging) e.currentTarget.style.background = atLimit ? '#DC262640' : 'transparent' }}>
+      <div style={{ width: 30, height: 3, borderRadius: 2, background: atLimit ? '#DC2626' : '#d1d5db' }} />
     </div>
   )
 }
@@ -361,12 +365,53 @@ function JogPanel({ maximized, onToggleMaximize }) {
   )
 }
 
+// Hard floors / fractional ceilings for the resizable panels. The
+// floors are derived from "what does each panel need to keep its
+// controls visible" — they keep buttons from being clipped no matter
+// how the operator drags the dividers.
+const PROGRAM_MIN_WIDTH = 380   // editor: step-row buttons (Edit / Teach / Del) fit
+const VIEWER_MIN_WIDTH  = 250   // 3D arm: enough to see the robot model
+const PROGRAM_MAX_FRAC  = 0.75  // editor can take up to 75% of the row
+const JOG_MIN_HEIGHT    = 320   // jog: arrow pads + step/speed + action col fit
+const JOG_MAX_FRAC      = 0.6   // jog can take up to 60% of available height
+
+function useWindowSize() {
+  const [size, setSize] = useState(() => ({
+    w: typeof window !== 'undefined' ? window.innerWidth  : 1280,
+    h: typeof window !== 'undefined' ? window.innerHeight : 800,
+  }))
+  useEffect(() => {
+    const onResize = () => setSize({ w: window.innerWidth, h: window.innerHeight })
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+  return size
+}
+
 export default function ProgramLayout() {
-  const [leftWidth, setLeftWidth]       = useState(560)
-  const [jogHeight, setJogHeight]       = useState(500)
+  const { w: winW, h: winH } = useWindowSize()
+  // Available width inside the Program tab: full viewport minus the
+  // left sidebar (64) and a tiny gutter for the divider. The 3D viewer
+  // always reserves VIEWER_MIN_WIDTH from the right edge, so the
+  // editor's hard max is whichever is tighter: 75 % or "leave room".
+  const availW = Math.max(640, winW - 64)
+  const leftMax = Math.max(PROGRAM_MIN_WIDTH,
+    Math.min(Math.floor(availW * PROGRAM_MAX_FRAC), availW - VIEWER_MIN_WIDTH - 8))
+  const jogMax  = Math.max(JOG_MIN_HEIGHT, Math.floor((winH - 96) * JOG_MAX_FRAC))
+
+  const [leftWidth, setLeftWidth]       = useState(() => Math.min(560, leftMax))
+  const [jogHeight, setJogHeight]       = useState(() => Math.min(500, jogMax))
   const [jogMaximized, setJogMaximized] = useState(false)
   const drag = useRef({ active: null, startPos: 0, startVal: 0 })
   const [activeDrag, setActiveDrag] = useState(null)
+
+  // Re-clamp when the viewport shrinks so a previously-valid width
+  // doesn't end up over the new max (e.g. user shrinks the window
+  // after dragging the editor to 800 px).
+  useEffect(() => {
+    setLeftWidth((w) => Math.max(PROGRAM_MIN_WIDTH, Math.min(w, leftMax)))
+    setJogHeight((h) => Math.max(JOG_MIN_HEIGHT, Math.min(h, jogMax)))
+  }, [leftMax, jogMax])
 
   const startVerticalDrag = useCallback((e) => {
     drag.current = { active: 'v', startPos: e.clientX, startVal: leftWidth }
@@ -387,10 +432,10 @@ export default function ProgramLayout() {
       const d = drag.current
       if (d.active === 'v') {
         const delta = e.clientX - d.startPos
-        setLeftWidth(Math.max(280, Math.min(1000, d.startVal + delta)))
+        setLeftWidth(Math.max(PROGRAM_MIN_WIDTH, Math.min(leftMax, d.startVal + delta)))
       } else if (d.active === 'h') {
         const delta = d.startPos - e.clientY
-        setJogHeight(Math.max(360, Math.min(800, d.startVal + delta)))
+        setJogHeight(Math.max(JOG_MIN_HEIGHT, Math.min(jogMax, d.startVal + delta)))
       }
     }
     const onUp = () => {
@@ -407,7 +452,10 @@ export default function ProgramLayout() {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup',   onUp)
     }
-  }, [])
+  }, [leftMax, jogMax])
+
+  const leftAtLimit = leftWidth <= PROGRAM_MIN_WIDTH + 0.5 || leftWidth >= leftMax - 0.5
+  const jogAtLimit  = jogHeight <= JOG_MIN_HEIGHT   + 0.5 || jogHeight >= jogMax  - 0.5
 
   if (jogMaximized) {
     return (
@@ -425,15 +473,17 @@ export default function ProgramLayout() {
             <ProgramEditor />
           </div>
         </div>
-        <VerticalDivider onMouseDown={startVerticalDrag} dragging={activeDrag === 'v'} />
-        <div style={{ flex: 1, overflow: 'hidden', background: '#FFFFFF' }}>
+        <VerticalDivider onMouseDown={startVerticalDrag} dragging={activeDrag === 'v'} atLimit={leftAtLimit} />
+        <div style={{ flex: 1, overflow: 'hidden', background: '#FFFFFF', minWidth: VIEWER_MIN_WIDTH }}>
           <ArmViewer3D />
         </div>
       </div>
 
-      <HorizontalDivider onMouseDown={startHorizontalDrag} dragging={activeDrag === 'h'} />
+      <HorizontalDivider onMouseDown={startHorizontalDrag} dragging={activeDrag === 'h'} atLimit={jogAtLimit} />
 
-      <div style={{ height: jogHeight, flexShrink: 0, overflow: 'hidden', borderTop: '1px solid #e5e7eb' }}>
+      {/* Jog panel: overflow auto so a too-small height shows a
+          scrollbar instead of clipping the action buttons. */}
+      <div style={{ height: jogHeight, flexShrink: 0, overflow: 'auto', borderTop: '1px solid #e5e7eb' }}>
         <JogPanel maximized={false} onToggleMaximize={() => setJogMaximized(true)} />
       </div>
     </div>
