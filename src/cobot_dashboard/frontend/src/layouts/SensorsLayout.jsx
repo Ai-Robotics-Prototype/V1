@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import CameraPanel from '../components/CameraPanel'
+import LidarPanel from '../components/LidarPanel'
 import IOPanel from '../components/IOPanel'
 
 function PanelChrome({ expanded, onToggle, children }) {
@@ -25,8 +26,8 @@ function PanelChrome({ expanded, onToggle, children }) {
 }
 
 export default function SensorsLayout() {
-  // null = default 2-row grid; 'cam0' | 'cam1' | 'io' = that panel
-  // fills the whole Sensors tab area.
+  // null = default 2×2 grid; 'cam0' | 'cam1' | 'lidar' | 'io' fills
+  // the whole Sensors tab area with that one panel.
   const [expanded, setExpanded] = useState(null)
   const collapse = () => setExpanded(null)
 
@@ -44,6 +45,13 @@ export default function SensorsLayout() {
       </PanelChrome>
     )
   }
+  if (expanded === 'lidar') {
+    return (
+      <PanelChrome expanded onToggle={collapse}>
+        <LidarPanel />
+      </PanelChrome>
+    )
+  }
   if (expanded === 'io') {
     return (
       <PanelChrome expanded onToggle={collapse}>
@@ -52,9 +60,7 @@ export default function SensorsLayout() {
     )
   }
 
-  // Default grid: two cameras on top, I/O panel full-width on the
-  // bottom (the I/O list is long and reads better with the wider
-  // aspect ratio).
+  // Default: 2×2 grid — two cameras on top, LiDAR + I/O on the bottom.
   return (
     <div style={{
       display: 'grid',
@@ -76,7 +82,13 @@ export default function SensorsLayout() {
         </PanelChrome>
       </div>
 
-      <div style={{ gridColumn: '1 / -1', overflow: 'hidden' }}>
+      <div style={{ borderRight: '1px solid var(--border)', overflow: 'hidden' }}>
+        <PanelChrome expanded={false} onToggle={() => setExpanded('lidar')}>
+          <LidarPanel />
+        </PanelChrome>
+      </div>
+
+      <div style={{ overflow: 'hidden' }}>
         <PanelChrome expanded={false} onToggle={() => setExpanded('io')}>
           <IOPanel />
         </PanelChrome>
