@@ -135,6 +135,11 @@ function IOPortSelector({ label, value, onChange, direction }) {
 }
 
 function StepEditor({ step, onSave, onClose }) {
+  // Sanity probe: if "Edit on one step opens all" ever happens again,
+  // the DevTools console will show one [StepEditor] line per render.
+  // More than one per Edit click means the parent is mounting the
+  // editor inside a non-conditional branch.
+  console.log('[StepEditor] render id=' + step?.id + ' action=' + step?.action)
   const [draft, setDraft] = useState({ ...step })
   const actionDef = actionFor(draft)
 
@@ -700,14 +705,16 @@ export default function ProgramEditor() {
     if (!loadedProgram || !loadedProgram.id) return
     console.log('[ProgramEditor] consuming loadedProgram',
       { id: loadedProgram.id, name: loadedProgram.name, steps: loadedProgram.steps?.length })
-    const steps = Array.isArray(loadedProgram.steps) ? loadedProgram.steps : []
+    // Renumber on ingest so an older saved program with duplicate or
+    // non-numeric ids can't break id-keyed selectors (edit, drag, etc).
+    const ingest = renumber(Array.isArray(loadedProgram.steps) ? loadedProgram.steps : [])
     setCurrentProgram({
       id:     loadedProgram.id,
       name:   loadedProgram.name || 'Untitled Program',
-      steps:  steps,
+      steps:  ingest,
       unsaved: false,
     })
-    setProgramSteps(steps)
+    setProgramSteps(ingest)
     setLoadedProgram(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadedProgram])
@@ -951,13 +958,14 @@ export default function ProgramEditor() {
       if (!res.ok) return
       const prog = await res.json()
       if (prog && Array.isArray(prog.steps)) {
+        const ingest = renumber(prog.steps)
         setCurrentProgram({
           id:      prog.id || id,
           name:    prog.name || 'Untitled Program',
-          steps:   prog.steps,
+          steps:   ingest,
           unsaved: false,
         })
-        setProgramSteps(prog.steps)
+        setProgramSteps(ingest)
       }
     } catch { /* swallow */ }
     setShowLoadMenu(false)
@@ -1435,13 +1443,14 @@ export default function ProgramEditor() {
           onClose={() => setShowWizard(false)}
           onSaved={(program) => {
             if (program) {
+              const ingest = renumber(program.steps || [])
               setCurrentProgram({
                 id:      program.id,
                 name:    program.name || 'Untitled Program',
-                steps:   program.steps || [],
+                steps:   ingest,
                 unsaved: false,
               })
-              setProgramSteps(program.steps || [])
+              setProgramSteps(ingest)
             }
             setShowWizard(false)
           }}
