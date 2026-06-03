@@ -4,6 +4,7 @@ import { useStore } from '../store/useStore'
 export default function ProgramLibrary() {
   const setTab             = useStore((s) => s.setTab)
   const setLoadedProgram   = useStore((s) => s.setLoadedProgram)
+  const addToast           = useStore((s) => s.addToast)
   const [programs, setPrograms] = useState([])
   const [loading, setLoading]   = useState(true)
   const [error, setError]       = useState(null)
@@ -58,10 +59,15 @@ export default function ProgramLibrary() {
         throw new Error(`HTTP ${res.status}${body ? ` — ${body.slice(0, 120)}` : ''}`)
       }
       const prog = await res.json()
+      if (!prog || !Array.isArray(prog.steps)) {
+        throw new Error('program payload missing steps')
+      }
       setLoadedProgram(prog)
       setTab('program')
+      addToast(`Loaded "${prog.name || p.name}" into editor`, 'success')
     } catch (e) {
       setError(e.message || String(e))
+      addToast(`Edit failed: ${e.message || e}`, 'error')
     } finally {
       setBusyId(null)
     }
