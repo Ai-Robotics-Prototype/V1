@@ -295,6 +295,12 @@ const storeDefinition = (set, get) => ({
     return get().sendCommand('program/set', { steps })
   },
 
+  // Hand-off slot used by the Programs library to load a saved program
+  // into the Program tab's editor. ProgramEditor reads it once and
+  // clears it; it doesn't survive page reloads.
+  loadedProgram: null,
+  setLoadedProgram(prog) { set({ loadedProgram: prog }) },
+
   // ---------------------------------------------------------------------------
   // Jog enable/disable
   // ---------------------------------------------------------------------------

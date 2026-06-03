@@ -2,7 +2,8 @@ import { useEffect, useState, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 
 export default function ProgramLibrary() {
-  const setTab = useStore((s) => s.setTab)
+  const setTab             = useStore((s) => s.setTab)
+  const setLoadedProgram   = useStore((s) => s.setLoadedProgram)
   const [programs, setPrograms] = useState([])
   const [loading, setLoading]   = useState(true)
   const [error, setError]       = useState(null)
@@ -45,6 +46,25 @@ export default function ProgramLibrary() {
   async function handleRun(p) {
     const ok = await callAction('POST', `/api/programs/${encodeURIComponent(p.id)}/run`, p.id)
     if (ok) setTab('program')
+  }
+
+  async function handleEdit(p) {
+    setBusyId(p.id)
+    setError(null)
+    try {
+      const res = await fetch(`/api/programs/${encodeURIComponent(p.id)}`)
+      if (!res.ok) {
+        const body = await res.text().catch(() => '')
+        throw new Error(`HTTP ${res.status}${body ? ` — ${body.slice(0, 120)}` : ''}`)
+      }
+      const prog = await res.json()
+      setLoadedProgram(prog)
+      setTab('program')
+    } catch (e) {
+      setError(e.message || String(e))
+    } finally {
+      setBusyId(null)
+    }
   }
 
   async function handleDuplicate(p) {
@@ -158,13 +178,21 @@ export default function ProgramLibrary() {
                   <span>id: {p.id}</span>
                   <span>steps: {p.steps ?? 0}</span>
                 </div>
-                <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+                <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
                   <button
                     onClick={() => handleRun(p)}
                     disabled={busyId === p.id}
                     style={btnPrimary}
                   >
                     Run
+                  </button>
+                  <button
+                    onClick={() => handleEdit(p)}
+                    disabled={busyId === p.id || p.builtin}
+                    title={p.builtin ? 'Built-in templates are read-only — duplicate or use the wizard to make an editable copy' : 'Open in Program editor'}
+                    style={p.builtin ? { ...btnSecondary, opacity: 0.4, cursor: 'not-allowed' } : btnEdit}
+                  >
+                    Edit
                   </button>
                   <button
                     onClick={() => handleDuplicate(p)}
@@ -175,8 +203,9 @@ export default function ProgramLibrary() {
                   </button>
                   <button
                     onClick={() => handleDelete(p)}
-                    disabled={busyId === p.id}
-                    style={btnDanger}
+                    disabled={busyId === p.id || p.builtin}
+                    title={p.builtin ? 'Built-in templates cannot be deleted' : 'Delete program'}
+                    style={p.builtin ? { ...btnDanger, opacity: 0.3, cursor: 'not-allowed' } : btnDanger}
                   >
                     Delete
                   </button>
@@ -217,4 +246,12 @@ const btnDanger = {
   background: 'transparent',
   borderColor: '#7f1d1d',
   color: '#fca5a5',
+}
+
+const btnEdit = {
+  ...btnBase,
+  background: '#eff6ff',
+  borderColor: '#bfdbfe',
+  color: '#2563EB',
+  fontWeight: 600,
 }

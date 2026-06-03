@@ -404,6 +404,8 @@ export default function ProgramEditor() {
   const reorderSteps       = useStore((s) => s.reorderSteps)
   const updateProgramStep  = useStore((s) => s.updateProgramStep)
   const setProgramSteps    = useStore((s) => s.setProgramSteps)
+  const loadedProgram      = useStore((s) => s.loadedProgram)
+  const setLoadedProgram   = useStore((s) => s.setLoadedProgram)
 
   const [showWizard, setShowWizard]   = useState(false)
   const [editingId, setEditingId]     = useState(null)
@@ -424,6 +426,20 @@ export default function ProgramEditor() {
   // an associated program is unsaved only when its current fingerprint
   // differs from the last successful save.
   const unsaved = programId == null || currentSig !== lastSavedSig
+
+  // ProgramLibrary writes a saved program into the store and the user
+  // is switched to this tab. Consume it once, populate identity + steps,
+  // then clear so a re-mount or future tab swap doesn't reload it.
+  useEffect(() => {
+    if (!loadedProgram) return
+    const prog = loadedProgram
+    if (Array.isArray(prog.steps)) setProgramSteps(prog.steps)
+    if (prog.id)   setProgramId(prog.id)
+    if (prog.name) setProgramName(prog.name)
+    setLastSavedSig(programSig(prog.name || 'Untitled Program', prog.steps || []))
+    setLoadedProgram(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadedProgram])
   // 'before' | 'after' — which side of the hovered row the cursor is on,
   // computed from the row's bounding rect so the blue insertion bar
   // tracks the actual landing spot, not just which row we're over.
