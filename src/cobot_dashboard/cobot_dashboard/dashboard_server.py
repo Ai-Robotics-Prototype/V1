@@ -77,9 +77,13 @@ STATE = {
     "reconstruction": {"active": False, "voxels_occupied": 0, "mesh_triangles": 0},
     "gripper": {"state": "open", "position_mm": 85.0},
     "program": {
+        # All steps start 'pending' — task.run resets them then marks
+        # step 0 'active'; task.cancel / completion resets back. No
+        # baked-in 'done'/'active' so the editor doesn't paint an
+        # execution highlight when nothing's running.
         "steps": [
-            {"id": 1, "type": "home",    "label": "Move to home",    "detail": "J: [0,−90,0,−90,0,0]°",     "status": "done"},
-            {"id": 2, "type": "gripper", "label": "Open gripper",    "detail": "Width: 85 mm · Speed: 80%", "status": "active"},
+            {"id": 1, "type": "home",    "label": "Move to home",    "detail": "J: [0,−90,0,−90,0,0]°",     "status": "pending"},
+            {"id": 2, "type": "gripper", "label": "Open gripper",    "detail": "Width: 85 mm · Speed: 80%", "status": "pending"},
             {"id": 3, "type": "move",    "label": "Approach object", "detail": "Target: auto · +150 mm Z",  "status": "pending"},
             {"id": 4, "type": "gripper", "label": "Pick & close",    "detail": "Descend 130 mm · close",    "status": "pending"},
             {"id": 5, "type": "move",    "label": "Place at target", "detail": "X: 0.30 Y: −0.20 Z: 0.40", "status": "pending"},

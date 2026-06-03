@@ -406,6 +406,11 @@ export default function ProgramEditor() {
   const setProgramSteps    = useStore((s) => s.setProgramSteps)
   const loadedProgram      = useStore((s) => s.loadedProgram)
   const setLoadedProgram   = useStore((s) => s.setLoadedProgram)
+  // Execution highlight is only valid while a task is actually running
+  // or paused. Outside of that the editor is an edit-mode view; no
+  // step should look "done" or "active" just because step.status from
+  // the backend hasn't been reset since the last run.
+  const taskRunning        = useStore((s) => Boolean(s.task?.running || s.task?.paused))
 
   const [showWizard, setShowWizard]   = useState(false)
   const [editingId, setEditingId]     = useState(null)
@@ -447,9 +452,11 @@ export default function ProgramEditor() {
   const [dragOverPos, setDragOverPos] = useState(null)
 
   // Resolve the "current step" pointer from real task state. The first
-  // active step is the playhead; everything before it is done.
-  const activeIdx = steps.findIndex((s) => s.status === 'active')
-  const doneCount = steps.filter((s) => s.status === 'done').length
+  // active step is the playhead; everything before it is done. When no
+  // task is running, suppress both so the editor doesn't show stale
+  // status from a previous run.
+  const activeIdx = taskRunning ? steps.findIndex((s) => s.status === 'active') : -1
+  const doneCount = taskRunning ? steps.filter((s) => s.status === 'done').length : 0
 
   function handleDragStart(e, id) {
     setDragId(id)
@@ -684,8 +691,8 @@ export default function ProgramEditor() {
             )
           }
 
-          const isActive   = step.status === 'active'
-          const isDone     = step.status === 'done'
+          const isActive   = taskRunning && step.status === 'active'
+          const isDone     = taskRunning && step.status === 'done'
           const isSelected = selectedId === step.id
           const isDragging = dragId === step.id
           // Only show the insertion indicator if a drag is in progress
