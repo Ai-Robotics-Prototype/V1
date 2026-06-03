@@ -134,16 +134,16 @@ function JointReadout() {
   return (
     <div style={{
       position: 'absolute', top: 10, left: 10,
-      background: 'rgba(10,10,14,0.85)',
-      border: '1px solid rgba(255,255,255,0.10)',
+      background: 'rgba(255,255,255,0.92)',
+      border: '1px solid #e5e7eb',
       borderRadius: 6, padding: '6px 10px',
       fontSize: 10, fontFamily: 'var(--font-mono)',
-      color: '#9AA0AC', width: 140,
+      color: '#374151', width: 140,
     }}>
       {list.map((name, i) => (
         <div key={name + i} style={{ display: 'flex', justifyContent: 'space-between' }}>
-          <span style={{ color: '#93C5FD' }}>{name}</span>
-          <span style={{ color: '#E6E8EE' }}>{DEG(positions?.[i] || 0)}°</span>
+          <span style={{ color: '#2563EB', fontWeight: 600 }}>{name}</span>
+          <span style={{ color: '#111' }}>{DEG(positions?.[i] || 0)}°</span>
         </div>
       ))}
     </div>
@@ -160,17 +160,18 @@ const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
   }))
 
   return (
-    <div style={{ position: 'relative', width: '100%', height: '100%', background: '#0A0A0B' }}>
+    <div style={{ position: 'relative', width: '100%', height: '100%', background: '#FFFFFF' }}>
       <Canvas
         camera={{ position: [1.2, 1.0, 1.4], fov: 45 }}
         shadows
         gl={{ antialias: true }}
       >
-        <ambientLight intensity={0.5} />
-        <directionalLight position={[3, 6, 3]} intensity={0.9} castShadow />
-        <directionalLight position={[-3, 4, -3]} intensity={0.3} />
+        <color attach="background" args={['#FFFFFF']} />
+        <ambientLight intensity={0.7} />
+        <directionalLight position={[3, 6, 3]} intensity={1.0} castShadow />
+        <directionalLight position={[-3, 4, -3]} intensity={0.4} />
 
-        <gridHelper args={[3, 30, '#1e2030', '#1e2030']} />
+        <gridHelper args={[3, 30, '#d1d5db', '#e5e7eb']} />
 
         {/* Shadow catcher */}
         <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.001, 0]} receiveShadow>
@@ -195,17 +196,17 @@ const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
 
       <div style={{
         position: 'absolute', top: 10, right: 10, display: 'flex', gap: 2,
-        background: 'rgba(10,10,14,0.85)', borderRadius: 6, padding: 3,
-        border: '1px solid var(--border)',
+        background: 'rgba(255,255,255,0.92)', borderRadius: 6, padding: 3,
+        border: '1px solid #e5e7eb',
       }}>
         {['Front', 'Side', 'Top', 'Iso'].map((p) => (
           <button
             key={p}
             onClick={() => setPreset(p.toLowerCase())}
             style={{
-              background: preset === p.toLowerCase() ? 'rgba(255,255,255,0.10)' : 'transparent',
-              color: preset === p.toLowerCase() ? '#E6E8EE' : '#9AA0AC',
-              border: 'none', padding: '3px 9px', borderRadius: 4, fontSize: 11,
+              background: preset === p.toLowerCase() ? '#eff6ff' : 'transparent',
+              color:      preset === p.toLowerCase() ? '#2563EB' : '#6b7280',
+              border: 'none', padding: '3px 9px', borderRadius: 4, fontSize: 11, fontWeight: 600,
             }}
           >
             {p}
@@ -216,8 +217,8 @@ const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
       {error && (
         <div style={{
           position: 'absolute', bottom: 10, left: 10,
-          background: 'rgba(220,38,38,0.20)', border: '1px solid #DC2626',
-          color: '#FECACA', padding: '4px 8px', borderRadius: 4, fontSize: 10,
+          background: '#fef2f2', border: '1px solid #DC2626',
+          color: '#b91c1c', padding: '4px 8px', borderRadius: 4, fontSize: 10,
         }}>
           {error}
         </div>
@@ -225,8 +226,8 @@ const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
       {!loaded && !error && (
         <div style={{
           position: 'absolute', bottom: 10, left: 10,
-          background: 'rgba(10,10,14,0.85)', border: '1px solid rgba(255,255,255,0.1)',
-          color: '#9AA0AC', padding: '4px 8px', borderRadius: 4, fontSize: 10,
+          background: 'rgba(255,255,255,0.92)', border: '1px solid #e5e7eb',
+          color: '#6b7280', padding: '4px 8px', borderRadius: 4, fontSize: 10,
         }}>
           Loading robot model…
         </div>

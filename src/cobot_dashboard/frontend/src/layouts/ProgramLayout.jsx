@@ -84,12 +84,50 @@ function RunStrip() {
   )
 }
 
+// One arrow button — SVG up-arrow rotated to taste, accent-tinted on
+// hover so the user can see which axis the button drives at a glance.
+function ArrowPadBtn({ onMouseDown, rotation, label, color, size = 44 }) {
+  return (
+    <button
+      onMouseDown={onMouseDown}
+      style={{
+        width: size, height: size, padding: 0,
+        background: '#fff', border: '1px solid #d1d5db', borderRadius: 6,
+        cursor: 'pointer', display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center', gap: 2,
+        transition: 'background 100ms, border-color 100ms',
+      }}
+      onMouseEnter={(e) => { e.currentTarget.style.background = color + '15'; e.currentTarget.style.borderColor = color }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = '#fff';        e.currentTarget.style.borderColor = '#d1d5db' }}>
+      <svg width="18" height="18" viewBox="0 0 24 24" style={{ transform: `rotate(${rotation}deg)` }}>
+        <path d="M12 4l-8 8h5v8h6v-8h5z" fill={color} />
+      </svg>
+      <span style={{ fontSize: 9, fontWeight: 600, color: '#374151' }}>{label}</span>
+    </button>
+  )
+}
+
+// Centred label tile that sits in the middle of a 3×3 arrow grid.
+function PadCenter({ label, height = 44, width = 44 }) {
+  return (
+    <div style={{
+      width, height,
+      background: '#f3f4f6', borderRadius: 6,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontSize: 9, fontWeight: 700, color: '#9ca3af',
+    }}>
+      {label}
+    </div>
+  )
+}
+
 function JogPanel() {
   const jog          = useStore((s) => s.jog)
   const jogCartesian = useStore((s) => s.jogCartesian)
   const triggerEstop = useStore((s) => s.triggerEstop)
+  const homeRobot    = useStore((s) => s.homeRobot)
 
-  const [jogMode, setJogMode] = useState('joint') // 'joint' | 'cartesian'
+  const [jogMode, setJogMode] = useState('cartesian') // 'cartesian' | 'joint'
   const [step, setStep]       = useState(1.0)
   const [speed, setSpeed]     = useState(20)
 
@@ -104,97 +142,148 @@ function JogPanel() {
     }
   }, [jogMode, step, speed, jog, jogCartesian])
 
-  const JogButton = ({ label, axis, dir, accent }) => (
-    <button
-      onMouseDown={() => sendJog(axis, dir)}
-      style={{
-        padding: '8px 0', fontSize: 11, fontWeight: 700,
-        background: '#fff', color: accent,
-        border: '1px solid #d1d5db', borderRadius: 4,
-        cursor: 'pointer', flex: 1, minWidth: 0,
-      }}
-      onMouseEnter={(e) => { e.currentTarget.style.background = '#f0f9ff'; e.currentTarget.style.borderColor = '#2563EB' }}
-      onMouseLeave={(e) => { e.currentTarget.style.background = '#fff';     e.currentTarget.style.borderColor = '#d1d5db' }}>
-      {label}
-    </button>
-  )
-
   const toggleStyle = (on) => ({
-    padding: '3px 10px', fontSize: 10, fontWeight: 600, borderRadius: 4, cursor: 'pointer',
+    padding: '4px 12px', fontSize: 10, fontWeight: 600, borderRadius: 4, cursor: 'pointer',
     background: on ? '#2563EB' : '#f3f4f6',
     color:      on ? '#fff'    : '#374151',
     border:     on ? 'none'    : '1px solid #d1d5db',
   })
 
+  const padLabel = (text) => (
+    <div style={{ fontSize: 10, fontWeight: 600, color: '#6b7280', textAlign: 'center', marginBottom: 4 }}>{text}</div>
+  )
+
   return (
-    <div style={{ padding: 10, background: '#fff', height: '100%', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
+    <div style={{ padding: 12, background: '#fff', height: '100%', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10 }}>
       <RunStrip />
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ fontSize: 12, fontWeight: 700, color: '#111' }}>Jog Control</span>
+        <span style={{ fontSize: 13, fontWeight: 700, color: '#111' }}>Jog</span>
         <div style={{ flex: 1 }} />
+        <button onClick={() => setJogMode('cartesian')} style={toggleStyle(jogMode === 'cartesian')}>XYZ</button>
         <button onClick={() => setJogMode('joint')}     style={toggleStyle(jogMode === 'joint')}>Joint</button>
-        <button onClick={() => setJogMode('cartesian')} style={toggleStyle(jogMode === 'cartesian')}>Cartesian</button>
       </div>
 
-      {jogMode === 'joint' ? (
-        <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr', gap: 4, alignItems: 'center' }}>
-          {[1, 2, 3, 4, 5, 6].map((j) => (
-            <div key={j} style={{ display: 'contents' }}>
-              <span style={{ fontSize: 11, fontWeight: 600, color: '#6b7280', textAlign: 'right', paddingRight: 6 }}>J{j}</span>
-              <JogButton label={'− J' + j} axis={j} dir={-1} accent="#DC2626" />
-              <JogButton label={'+ J' + j} axis={j} dir={1}  accent="#16A34A" />
+      {jogMode === 'cartesian' ? (
+        <div style={{ display: 'flex', gap: 16, justifyContent: 'center', flexWrap: 'wrap' }}>
+          {/* XY pad — D-pad for the horizontal plane. Y is "forward/back"
+              from the operator's perspective, X is "left/right". */}
+          <div>
+            {padLabel('Position')}
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(3, 44px)',
+              gridTemplateRows: 'repeat(3, 44px)',
+              gridTemplateAreas: '". up ." "left center right" ". down ."',
+              gap: 3,
+            }}>
+              <div style={{ gridArea: 'up' }}>
+                <ArrowPadBtn onMouseDown={() => sendJog('y',  1)} rotation={0}   label="Y+" color="#16A34A" />
+              </div>
+              <div style={{ gridArea: 'left' }}>
+                <ArrowPadBtn onMouseDown={() => sendJog('x', -1)} rotation={-90} label="X−" color="#DC2626" />
+              </div>
+              <div style={{ gridArea: 'center' }}>
+                <PadCenter label="XY" />
+              </div>
+              <div style={{ gridArea: 'right' }}>
+                <ArrowPadBtn onMouseDown={() => sendJog('x',  1)} rotation={90}  label="X+" color="#DC2626" />
+              </div>
+              <div style={{ gridArea: 'down' }}>
+                <ArrowPadBtn onMouseDown={() => sendJog('y', -1)} rotation={180} label="Y−" color="#16A34A" />
+              </div>
             </div>
-          ))}
+          </div>
+
+          {/* Z column — up / down for height. */}
+          <div>
+            {padLabel('Height')}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 3, width: 44 }}>
+              <ArrowPadBtn onMouseDown={() => sendJog('z',  1)} rotation={0}   label="Z+" color="#3B82F6" />
+              <PadCenter label="Z" height={22} />
+              <ArrowPadBtn onMouseDown={() => sendJog('z', -1)} rotation={180} label="Z−" color="#3B82F6" />
+            </div>
+          </div>
+
+          {/* Rotation pad — Rx tilts forward/back, Rz spins around Z. */}
+          <div>
+            {padLabel('Rotation')}
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(3, 44px)',
+              gridTemplateRows: 'repeat(3, 44px)',
+              gridTemplateAreas: '". rxp ." "rzn center rzp" ". rxn ."',
+              gap: 3,
+            }}>
+              <div style={{ gridArea: 'rxp' }}>
+                <ArrowPadBtn onMouseDown={() => sendJog('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" />
+              </div>
+              <div style={{ gridArea: 'rzn' }}>
+                <ArrowPadBtn onMouseDown={() => sendJog('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" />
+              </div>
+              <div style={{ gridArea: 'center' }}>
+                <PadCenter label="Rot" />
+              </div>
+              <div style={{ gridArea: 'rzp' }}>
+                <ArrowPadBtn onMouseDown={() => sendJog('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" />
+              </div>
+              <div style={{ gridArea: 'rxn' }}>
+                <ArrowPadBtn onMouseDown={() => sendJog('rx', -1)} rotation={180} label="Rx−" color="#9333EA" />
+              </div>
+            </div>
+          </div>
         </div>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr', gap: 4, alignItems: 'center' }}>
-          {['x', 'y', 'z', 'rx', 'ry', 'rz'].map((axis) => (
-            <div key={axis} style={{ display: 'contents' }}>
-              <span style={{ fontSize: 11, fontWeight: 600, color: '#6b7280', textAlign: 'right', paddingRight: 6 }}>{axis.toUpperCase()}</span>
-              <JogButton label={'− ' + axis.toUpperCase()} axis={axis} dir={-1} accent="#DC2626" />
-              <JogButton label={'+ ' + axis.toUpperCase()} axis={axis} dir={1}  accent="#16A34A" />
+        // Joint mode — one column per joint with up (positive) / down (negative).
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
+          {[1, 2, 3, 4, 5, 6].map((j) => (
+            <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, width: 44 }}>
+              <ArrowPadBtn onMouseDown={() => sendJog(j,  1)} rotation={0}   label="+" color="#16A34A" size={44} />
+              <PadCenter label={'J' + j} height={24} />
+              <ArrowPadBtn onMouseDown={() => sendJog(j, -1)} rotation={180} label="−" color="#DC2626" size={44} />
             </div>
           ))}
         </div>
       )}
 
-      <div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 6 }}>
-          <span style={{ fontSize: 10, color: '#6b7280', marginRight: 4 }}>Step:</span>
-          {[0.1, 0.5, 1.0, 5.0, 10.0].map((s) => (
-            <button key={s} onClick={() => setStep(s)}
-              style={{
-                padding: '2px 6px', fontSize: 9, borderRadius: 3, cursor: 'pointer',
-                background: step === s ? '#2563EB' : '#f3f4f6',
-                color:      step === s ? '#fff'    : '#6b7280',
-                border:     step === s ? 'none'    : '1px solid #d1d5db',
-              }}>
-              {s}{jogMode === 'joint' ? '°' : 'mm'}
-            </button>
+      {/* Step size + speed */}
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <span style={{ fontSize: 10, color: '#6b7280' }}>Step:</span>
+          {[0.1, 0.5, 1, 5, 10].map((s) => (
+            <button key={s} onClick={() => setStep(s)} style={{
+              padding: '3px 7px', fontSize: 9, fontWeight: 600, borderRadius: 3, cursor: 'pointer',
+              background: step === s ? '#2563EB' : '#f3f4f6',
+              color:      step === s ? '#fff'    : '#6b7280',
+              border:     step === s ? 'none'    : '1px solid #e5e7eb',
+            }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
           ))}
         </div>
-        <div style={{ fontSize: 10, color: '#6b7280' }}>
-          Speed: {speed}%
+        <div style={{ flex: 1, minWidth: 160, display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: 10, color: '#6b7280', whiteSpace: 'nowrap' }}>Speed: {speed}%</span>
           <input type="range" min={1} max={100} value={speed}
             onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
-            style={{ width: '100%', marginTop: 2 }} />
+            style={{ flex: 1, height: 4 }} />
         </div>
       </div>
 
+      {/* Action buttons */}
       <div style={{ display: 'flex', gap: 6 }}>
+        <button onClick={homeRobot} style={{
+          flex: 1, padding: '8px', fontSize: 11, fontWeight: 600,
+          background: '#f3f4f6', color: '#374151',
+          border: '1px solid #d1d5db', borderRadius: 5, cursor: 'pointer',
+        }}>Home</button>
         <button onClick={triggerEstop} style={{
           flex: 1, padding: '8px', fontSize: 11, fontWeight: 700,
           background: '#DC2626', color: '#fff',
-          border: 'none', borderRadius: 4, cursor: 'pointer',
+          border: 'none', borderRadius: 5, cursor: 'pointer',
         }}>STOP</button>
-        <button style={{
-          flex: 2, padding: '8px', fontSize: 10, fontWeight: 600,
+        <button title="Save current pose as a teach point (not yet wired)" style={{
+          flex: 1, padding: '8px', fontSize: 11, fontWeight: 600,
           background: '#16A34A', color: '#fff',
-          border: 'none', borderRadius: 4, cursor: 'pointer',
-        }} title="Save current pose as a teach point (not yet wired)">
-          Teach Current Position
-        </button>
+          border: 'none', borderRadius: 5, cursor: 'pointer',
+        }}>Teach Position</button>
       </div>
     </div>
   )
@@ -257,7 +346,7 @@ export default function ProgramLayout() {
           </div>
         </div>
         <VerticalDivider onMouseDown={startVerticalDrag} dragging={activeDrag === 'v'} />
-        <div style={{ flex: 1, overflow: 'hidden', background: '#0a0a12' }}>
+        <div style={{ flex: 1, overflow: 'hidden', background: '#FFFFFF' }}>
           <ArmViewer3D />
         </div>
       </div>
