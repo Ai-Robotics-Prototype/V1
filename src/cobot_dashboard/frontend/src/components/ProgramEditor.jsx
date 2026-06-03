@@ -434,6 +434,109 @@ function VoiceBar() {
   )
 }
 
+// Right-click context menu for a step row. Position is screen-fixed
+// at the cursor; closes on any outside mousedown or after an action.
+function StepContextMenu({ x, y, items, onAction, onClose }) {
+  const ref = useRef(null)
+  useEffect(() => {
+    function onDown(e) { if (ref.current && !ref.current.contains(e.target)) onClose() }
+    function onEsc(e)  { if (e.key === 'Escape') onClose() }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onEsc)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onEsc)
+    }
+  }, [onClose])
+
+  return (
+    <div ref={ref} style={{
+      position: 'fixed', left: x, top: y, zIndex: 1000,
+      background: '#fff', borderRadius: 8, padding: '4px 0',
+      boxShadow: '0 8px 30px rgba(0,0,0,0.18)',
+      border: '1px solid #e5e7eb', minWidth: 200,
+    }}>
+      {items.map((item, i) => {
+        if (item.divider) {
+          return <div key={'div'+i} style={{ height: 1, background: '#e5e7eb', margin: '4px 0' }} />
+        }
+        return (
+          <button key={item.action}
+            onClick={() => { onAction(item.action); onClose() }}
+            disabled={item.disabled}
+            style={{
+              width: '100%', padding: '9px 14px',
+              display: 'flex', alignItems: 'center', gap: 12,
+              background: 'transparent', border: 'none',
+              cursor: item.disabled ? 'not-allowed' : 'pointer',
+              fontSize: 13, color: item.danger ? '#DC2626' : '#374151',
+              textAlign: 'left', opacity: item.disabled ? 0.4 : 1,
+            }}
+            onMouseEnter={(e) => { if (!item.disabled) e.currentTarget.style.background = item.danger ? '#fef2f2' : '#f3f4f6' }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}>
+            <span style={{ flex: 1 }}>{item.label}</span>
+            <span style={{ fontSize: 10, color: '#9ca3af', fontFamily: 'monospace' }}>{item.hint || ''}</span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+// Action catalog used by the "+ Add Step" panel. Each entry's `action`
+// matches the value used by ACTION_TYPES so the inline editor and
+// detail line keep working on the new row.
+const STEP_CATEGORIES = [
+  {
+    name: 'Motion',
+    actions: [
+      { action: 'move_home',   label: 'Move Home',    desc: 'Move robot to home position' },
+      { action: 'move_joint',  label: 'Move Joint',   desc: 'Move to a joint position' },
+      { action: 'move_linear', label: 'Move Linear',  desc: 'Move in a straight line' },
+      { action: 'approach',    label: 'Approach',     desc: 'Move above a target position' },
+    ],
+  },
+  {
+    name: 'Pick and Place',
+    actions: [
+      { action: 'pick',          label: 'Pick',          desc: 'Descend and grasp an object' },
+      { action: 'place',         label: 'Place',         desc: 'Place object at target' },
+      { action: 'open_gripper',  label: 'Open Gripper',  desc: 'Open the gripper or release vacuum' },
+      { action: 'close_gripper', label: 'Close Gripper', desc: 'Close gripper on object' },
+    ],
+  },
+  {
+    name: 'Control',
+    actions: [
+      { action: 'loop',   label: 'Loop',   desc: 'Repeat steps a number of times' },
+      { action: 'wait',   label: 'Wait',   desc: 'Wait for time, I/O signal, or event' },
+      { action: 'detect', label: 'Detect', desc: 'Run camera detection' },
+      { action: 'set_io', label: 'Set I/O',desc: 'Set a digital or analog output' },
+    ],
+  },
+]
+
+// Default extras per action so a freshly-added step has sane defaults
+// the inline editor can show without "[object Object]" placeholders.
+function freshStepForAction(action) {
+  const def = ACTION_TYPES.find((a) => a.value === action) || ACTION_TYPES[0]
+  const base = { action: def.value, type: def.type, label: def.label, detail: '' }
+  switch (action) {
+    case 'open_gripper':  return { ...base, width_mm: 85, speed_pct: 80 }
+    case 'close_gripper': return { ...base, force_pct: 50 }
+    case 'move_joint':    return { ...base, joints: [0, -90, 0, -90, 0, 0] }
+    case 'move_linear':   return { ...base, position: [0.3, -0.2, 0.4], speed_pct: 50 }
+    case 'approach':      return { ...base, target: 'auto', offset_z_mm: 150 }
+    case 'pick':          return { ...base, descend_mm: 130 }
+    case 'place':         return { ...base, position: [0.3, -0.2, 0.4] }
+    case 'wait':          return { ...base, duration_s: 1 }
+    case 'detect':        return { ...base, mode: 'all' }
+    case 'loop':          return { ...base, goto: 1, count: 0 }
+    case 'set_io':        return { ...base, io_id: 'DO0', value: 1 }
+    default:              return base
+  }
+}
+
 function InsertionBar() {
   return (
     <div
@@ -574,7 +677,11 @@ export default function ProgramEditor() {
   const [showLoadMenu, setShowLoadMenu]     = useState(false)
   // Sequential "Teach All" walk-through. -1 = idle, otherwise the
   // index into steps[] the operator is currently teaching.
-  const [teachingAllIdx, setTeachingAllIdx] = useState(-1)
+  const [teachingAllIdx, setTeachingAllIdx]   = useState(-1)
+  const [contextMenu, setContextMenu]         = useState(null)
+  const [showAddPanel, setShowAddPanel]       = useState(false)
+  const [locked, setLocked]                   = useState(false)
+  const addToast                              = useStore((s) => s.addToast)
   const [savedPrograms, setSavedPrograms] = useState([])
 
   // Diagnostic: log what the editor sees on every mount so a future
@@ -663,8 +770,65 @@ export default function ProgramEditor() {
   function handleDragEnd() { clearDrag() }
 
   function handleAdd() {
-    const newStep = { type: 'wait', action: 'wait', label: 'Wait', duration_s: 1, detail: '' }
+    const newStep = freshStepForAction('wait')
     updateSteps(renumber([...steps, newStep]))
+  }
+
+  // Add a step of a specific action — used by the categorized
+  // "+ Add Step" panel. Appends to the end and opens the inline editor
+  // on the new row so the operator can immediately set parameters.
+  function handleAddAction(action) {
+    const newStep = freshStepForAction(action)
+    const next = renumber([...steps, newStep])
+    updateSteps(next)
+    setEditingId(next[next.length - 1].id)
+    setShowAddPanel(false)
+  }
+
+  // Context-menu actions are id-based so they're resilient to a
+  // concurrent reorder happening between right-click and selection.
+  function runContextAction(id, action) {
+    const idx = steps.findIndex((s) => s.id === id)
+    if (idx < 0) return
+    switch (action) {
+      case 'edit':       setEditingId(id); break
+      case 'rename':     setSelectedId(id); addToast('Click the step name to rename it', 'info'); break
+      case 'add_above': {
+        const newStep = freshStepForAction('move_joint')
+        const next = renumber([...steps.slice(0, idx), newStep, ...steps.slice(idx)])
+        updateSteps(next)
+        setEditingId(next[idx].id)
+        break
+      }
+      case 'add_below': {
+        const newStep = freshStepForAction('move_joint')
+        const next = renumber([...steps.slice(0, idx + 1), newStep, ...steps.slice(idx + 1)])
+        updateSteps(next)
+        setEditingId(next[idx + 1].id)
+        break
+      }
+      case 'copy': {
+        const src = steps[idx]
+        const copy = {
+          ...src,
+          label: (src.label || src.action) + ' (copy)',
+          taught: false,
+          taught_joints: undefined,
+          taught_tcp: undefined,
+          taught_at: undefined,
+        }
+        const next = renumber([...steps.slice(0, idx + 1), copy, ...steps.slice(idx + 1)])
+        updateSteps(next)
+        break
+      }
+      case 'resume':
+        addToast('Resume-from-step requires a backend handler — not yet wired', 'warning')
+        break
+      case 'delete':
+        handleDelete(id)
+        break
+      default: break
+    }
   }
 
   function handleDelete(id) {
@@ -913,7 +1077,35 @@ export default function ProgramEditor() {
           }}>
           + Wizard
         </button>
+
+        <button onClick={() => setLocked(!locked)}
+          title={locked ? 'Unlock to edit steps, drag-reorder, and add/delete' : 'Lock the program so it can only be read or run'}
+          style={{
+            padding: '6px 12px', fontSize: 12, fontWeight: 600,
+            background: locked ? '#DC2626' : '#f3f4f6',
+            color:      locked ? '#fff'    : '#374151',
+            border:     locked ? 'none'    : '1px solid #d1d5db',
+            borderRadius: 6, cursor: 'pointer', flexShrink: 0,
+          }}>
+          {locked ? '🔒 Locked' : 'Lock'}
+        </button>
       </div>
+
+      {locked && (
+        <div style={{
+          padding: '8px 16px', background: '#fef2f2', borderBottom: '1px solid #fecaca',
+          color: '#b91c1c', fontSize: 12, fontWeight: 600,
+          display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          <span>🔒</span>
+          <span style={{ flex: 1 }}>Editing locked — unlock to make changes</span>
+          <button onClick={() => setLocked(false)} style={{
+            padding: '4px 10px', fontSize: 11, fontWeight: 700,
+            background: '#fff', color: '#b91c1c',
+            border: '1px solid #fecaca', borderRadius: 4, cursor: 'pointer',
+          }}>Unlock</button>
+        </div>
+      )}
 
       <div style={{ padding: '8px 16px', borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', gap: 8 }}>
         <span style={{ fontSize: 10, color: '#6b7280' }}>PROGRESS</span>
@@ -1022,8 +1214,9 @@ export default function ProgramEditor() {
               {indicator === 'before' && <InsertionBar />}
 
               <div
-                draggable={!isActive}
+                draggable={!isActive && !locked}
                 onClick={() => setSelectedId(step.id)}
+                onContextMenu={(e) => { e.preventDefault(); setContextMenu({ x: e.clientX, y: e.clientY, id: step.id }) }}
                 onDragStart={(e) => handleDragStart(e, step.id)}
                 onDragOver={(e) => handleDragOver(e, step.id)}
                 onDrop={(e) => handleDrop(e, step.id)}
@@ -1082,10 +1275,21 @@ export default function ProgramEditor() {
               </span>
 
               <div style={{ flex: 1, minWidth: 0 }}>
-                <EditableStepLabel
-                  value={step.label || def.label}
-                  onSave={(newLabel) => handleRename(step.id, newLabel)}
-                />
+                {locked ? (
+                  <span style={{
+                    fontSize: 12, fontWeight: 600, color: '#111',
+                    padding: '2px 4px', display: 'inline-block',
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    maxWidth: '100%',
+                  }}>
+                    {step.label || def.label}
+                  </span>
+                ) : (
+                  <EditableStepLabel
+                    value={step.label || def.label}
+                    onSave={(newLabel) => handleRename(step.id, newLabel)}
+                  />
+                )}
                 <div style={{ fontSize: 10, color: '#6b7280',
                               overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                               padding: '0 4px' }}>
@@ -1107,14 +1311,16 @@ export default function ProgramEditor() {
                 )}
               </div>
 
-              <button onClick={(e) => { e.stopPropagation(); setEditingId(step.id) }}
-                style={{ padding: '4px 10px', fontSize: 10, fontWeight: 600,
-                         background: '#eff6ff', color: '#2563EB',
-                         border: '1px solid #bfdbfe', borderRadius: 4,
-                         cursor: 'pointer', flexShrink: 0 }}>
-                Edit
-              </button>
-              {isTeachable(step) &&(
+              {!locked && (
+                <button onClick={(e) => { e.stopPropagation(); setEditingId(step.id) }}
+                  style={{ padding: '4px 10px', fontSize: 10, fontWeight: 600,
+                           background: '#eff6ff', color: '#2563EB',
+                           border: '1px solid #bfdbfe', borderRadius: 4,
+                           cursor: 'pointer', flexShrink: 0 }}>
+                  Edit
+                </button>
+              )}
+              {!locked && isTeachable(step) &&(
                 <button onClick={(e) => { e.stopPropagation(); teachStep(step.id) }}
                   title={step.taught ? 'Re-record this position from the current robot pose' : 'Record the current robot pose as this step\'s position'}
                   style={{
@@ -1127,16 +1333,18 @@ export default function ProgramEditor() {
                   {step.taught ? 'Re-teach' : 'Teach'}
                 </button>
               )}
-              <button onClick={(e) => { e.stopPropagation(); if (!isActive) handleDelete(step.id) }}
-                disabled={isActive}
-                title={isActive ? 'Cannot delete the active step' : 'Delete step'}
-                style={{ padding: '3px 8px', fontSize: 10,
-                         background: '#fef2f2', color: '#DC2626',
-                         border: '1px solid #fecaca', borderRadius: 3,
-                         cursor: isActive ? 'not-allowed' : 'pointer', flexShrink: 0,
-                         opacity: isActive ? 0.4 : 1 }}>
-                Del
-              </button>
+              {!locked && (
+                <button onClick={(e) => { e.stopPropagation(); if (!isActive) handleDelete(step.id) }}
+                  disabled={isActive}
+                  title={isActive ? 'Cannot delete the active step' : 'Delete step'}
+                  style={{ padding: '3px 8px', fontSize: 10,
+                           background: '#fef2f2', color: '#DC2626',
+                           border: '1px solid #fecaca', borderRadius: 3,
+                           cursor: isActive ? 'not-allowed' : 'pointer', flexShrink: 0,
+                           opacity: isActive ? 0.4 : 1 }}>
+                  Del
+                </button>
+              )}
               </div>
 
               {indicator === 'after' && <InsertionBar />}
@@ -1144,16 +1352,83 @@ export default function ProgramEditor() {
           )
         })}
 
-        <button onClick={handleAdd} style={{
-          width: '100%', padding: 10, marginTop: 4,
-          background: '#fafafa', color: '#6b7280', fontSize: 12,
-          border: '2px dashed #d1d5db', borderRadius: 6, cursor: 'pointer',
-        }}>
-          + Add step
-        </button>
+        {!locked && (showAddPanel ? (
+          <div style={{
+            margin: '4px 0', padding: 12,
+            background: '#f8fafc', borderRadius: 8,
+            border: '2px solid #e5e7eb',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 10 }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: '#111', flex: 1 }}>Add Step</span>
+              <button onClick={() => setShowAddPanel(false)} title="Close"
+                style={{ background: 'none', border: 'none', cursor: 'pointer',
+                         fontSize: 16, color: '#9ca3af', padding: '2px 6px' }}>✕</button>
+            </div>
+            {STEP_CATEGORIES.map((cat) => (
+              <div key={cat.name} style={{ marginBottom: 12 }}>
+                <div style={{
+                  fontSize: 11, fontWeight: 600, color: '#6b7280',
+                  marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.5px',
+                }}>{cat.name}</div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                  {cat.actions.map((s) => (
+                    <button key={s.action} onClick={() => handleAddAction(s.action)}
+                      style={{
+                        padding: '10px 12px', textAlign: 'left', cursor: 'pointer',
+                        background: '#fff', border: '1px solid #e5e7eb', borderRadius: 6,
+                        transition: 'all 100ms',
+                      }}
+                      onMouseEnter={(e) => { e.currentTarget.style.borderColor = '#2563EB'; e.currentTarget.style.background = '#eff6ff' }}
+                      onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#e5e7eb'; e.currentTarget.style.background = '#fff' }}>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: '#111' }}>{s.label}</div>
+                      <div style={{ fontSize: 10, color: '#6b7280', marginTop: 2 }}>{s.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <button onClick={() => setShowAddPanel(true)} style={{
+            width: '100%', padding: 12, marginTop: 4,
+            background: '#fafafa', color: '#374151', fontSize: 13, fontWeight: 600,
+            border: '2px dashed #d1d5db', borderRadius: 6, cursor: 'pointer',
+          }}>
+            + Add Step
+          </button>
+        ))}
       </div>
 
       <VoiceBar />
+
+      {contextMenu && (
+        <StepContextMenu
+          x={contextMenu.x} y={contextMenu.y}
+          items={(() => {
+            const base = [
+              { action: 'edit',      label: 'Edit step',         hint: 'E' },
+              { divider: true },
+              { action: 'add_above', label: 'Add step above',    hint: '+' },
+              { action: 'add_below', label: 'Add step below',    hint: '+' },
+              { divider: true },
+              { action: 'copy',      label: 'Duplicate',         hint: '⌘D' },
+              { action: 'rename',    label: 'Rename',            hint: 'F2' },
+              { divider: true },
+              { action: 'resume',    label: 'Resume from step',  hint: '▶' },
+              { divider: true },
+              { action: 'delete',    label: 'Delete',            hint: 'Del', danger: true },
+            ]
+            // When locked, only "Resume from step" remains actionable.
+            return locked
+              ? base.map((it) => it.divider ? it
+                  : it.action === 'resume' ? it
+                  : { ...it, disabled: true })
+              : base
+          })()}
+          onAction={(action) => runContextAction(contextMenu.id, action)}
+          onClose={() => setContextMenu(null)}
+        />
+      )}
 
       {showWizard && (
         <ProgramWizard
