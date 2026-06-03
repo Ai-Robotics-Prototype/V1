@@ -1320,7 +1320,11 @@ export default function ProgramEditor() {
               </div>
 
               {!locked && (
-                <button onClick={(e) => { e.stopPropagation(); setEditingId(step.id) }}
+                <button onClick={(e) => {
+                  e.stopPropagation()
+                  console.log('[ProgramEditor] Edit button clicked id=' + step.id + ' (was editingId=' + editingId + ')')
+                  setEditingId(step.id)
+                }}
                   style={{ padding: '4px 10px', fontSize: 10, fontWeight: 600,
                            background: '#eff6ff', color: '#2563EB',
                            border: '1px solid #bfdbfe', borderRadius: 4,
