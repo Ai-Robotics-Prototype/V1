@@ -1787,6 +1787,41 @@ if FASTAPI_AVAILABLE:
     def _now_stamp():
         return time.strftime('%Y-%m-%d %H:%M')
 
+    # ------------------------------------------------------------------
+    # Production-stats endpoints used by MonitorDashboard. Backed by an
+    # in-memory dict for now; the real numbers will arrive once the
+    # robot driver publishes /robot/cycle_done + /robot/events. The
+    # endpoints exist so the dashboard panels render with empty state
+    # instead of network errors until then.
+    # ------------------------------------------------------------------
+    _stats: dict = {
+        'picks_today':  0,
+        'picks_shift':  0,
+        'picks_total':  0,
+        'per_hour':     [0] * 12,    # rolling 12-hour bucket
+        'recent_cycles': [],          # [{'result': 'pass'|'fail', 'message': str, 'ts': str}]
+        'events':        [],          # [{'severity': 'info'|'warning'|'error', 'message', 'timestamp'}]
+        'cycle_time':    0.0,
+        'repeat_count':  0,
+    }
+
+    @app.get("/api/stats/picks")
+    async def api_stats_picks():
+        return {
+            'today':    _stats['picks_today'],
+            'shift':    _stats['picks_shift'],
+            'total':    _stats['picks_total'],
+            'per_hour': list(_stats['per_hour']),
+        }
+
+    @app.get("/api/stats/cycles")
+    async def api_stats_cycles():
+        return {'recent': list(_stats['recent_cycles'][-20:])}
+
+    @app.get("/api/stats/events")
+    async def api_stats_events():
+        return {'events': list(_stats['events'][-10:])}
+
     @app.get("/api/programs")
     async def api_programs_list():
         """List user-created robot programs from /opt/cobot/programs/.

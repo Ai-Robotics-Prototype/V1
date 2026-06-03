@@ -28,6 +28,295 @@ function StatusBadge({ status }) {
   )
 }
 
+function PickCounter() {
+  const [counts, setCounts] = useState({ today: 0, shift: 0, total: 0, per_hour: [] })
+  useEffect(() => {
+    let alive = true
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/stats/picks')
+        if (!alive || !res.ok) return
+        const data = await res.json()
+        setCounts((prev) => ({ ...prev, ...data }))
+      } catch { /* keep prior counts on transient failure */ }
+    }
+    poll()
+    const iv = setInterval(poll, 5000)
+    return () => { alive = false; clearInterval(iv) }
+  }, [])
+
+  const trend  = (counts.per_hour || []).slice(-12)
+  const maxVal = Math.max(1, ...trend)
+
+  return (
+    <div style={{
+      background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
+      padding: 20, flex: 1,
+    }}>
+      <div style={cardLabel}>Parts Picked</div>
+      <div style={{ display: 'flex', gap: 24, alignItems: 'flex-end' }}>
+        <div>
+          <div style={{ fontSize: 42, fontWeight: 800, color: '#111', lineHeight: 1, fontVariantNumeric: 'tabular-nums' }}>
+            {counts.today}
+          </div>
+          <div style={{ fontSize: 12, color: '#6b7280', marginTop: 4 }}>today</div>
+        </div>
+        <div>
+          <div style={{ fontSize: 20, fontWeight: 700, color: '#6b7280', fontVariantNumeric: 'tabular-nums' }}>
+            {counts.shift}
+          </div>
+          <div style={{ fontSize: 11, color: '#9ca3af' }}>this shift</div>
+        </div>
+        <div>
+          <div style={{ fontSize: 20, fontWeight: 700, color: '#6b7280', fontVariantNumeric: 'tabular-nums' }}>
+            {counts.total}
+          </div>
+          <div style={{ fontSize: 11, color: '#9ca3af' }}>all time</div>
+        </div>
+        <div style={{ flex: 1, display: 'flex', alignItems: 'flex-end', gap: 2, height: 40, marginLeft: 16 }}>
+          {trend.map((v, i) => (
+            <div key={i} style={{
+              flex: 1, borderRadius: '2px 2px 0 0',
+              height: Math.max(4, (v / maxVal) * 40),
+              background: i === trend.length - 1 ? '#2563EB' : '#dbeafe',
+              transition: 'height 300ms',
+            }} />
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function CycleResults() {
+  const [results, setResults] = useState([])
+  useEffect(() => {
+    let alive = true
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/stats/cycles')
+        if (alive && res.ok) {
+          const data = await res.json()
+          setResults(data.recent || [])
+        }
+      } catch {}
+    }
+    poll()
+    const iv = setInterval(poll, 2000)
+    return () => { alive = false; clearInterval(iv) }
+  }, [])
+
+  const last = results[results.length - 1]
+  const passCount = results.filter((r) => r.result === 'pass').length
+  const failCount = results.filter((r) => r.result === 'fail').length
+
+  return (
+    <div style={{
+      background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
+      padding: 20, flex: 1,
+    }}>
+      <div style={cardLabel}>Cycle Results</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 12 }}>
+        <div style={{
+          width: 48, height: 48, borderRadius: '50%',
+          background: !last ? '#f3f4f6' : last.result === 'pass' ? '#f0fdf4' : '#fef2f2',
+          border:     !last ? '2px solid #d1d5db' : last.result === 'pass' ? '2px solid #16A34A' : '2px solid #DC2626',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 18, fontWeight: 700,
+          color: !last ? '#9ca3af' : last.result === 'pass' ? '#16A34A' : '#DC2626',
+        }}>
+          {!last ? '—' : last.result === 'pass' ? 'OK' : 'NG'}
+        </div>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: '#111' }}>
+            {!last ? 'No cycles yet' : last.result === 'pass' ? 'Last cycle passed' : 'Last cycle FAILED'}
+          </div>
+          {last && last.message && (
+            <div style={{ fontSize: 11, color: '#6b7280' }}>{last.message}</div>
+          )}
+        </div>
+        <div style={{ marginLeft: 'auto', textAlign: 'right' }}>
+          <span style={{ fontSize: 14, fontWeight: 700, color: '#16A34A' }}>{passCount}</span>
+          <span style={{ fontSize: 12, color: '#9ca3af' }}> pass </span>
+          <span style={{ fontSize: 14, fontWeight: 700, color: '#DC2626' }}>{failCount}</span>
+          <span style={{ fontSize: 12, color: '#9ca3af' }}> fail</span>
+        </div>
+      </div>
+      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+        {results.slice(-20).map((r, i) => (
+          <div key={i} style={{
+            width: 14, height: 14, borderRadius: '50%',
+            background: r.result === 'pass' ? '#16A34A' : '#DC2626',
+            opacity: i === Math.min(results.length, 20) - 1 ? 1 : 0.5,
+          }} title={r.message || r.result} />
+        ))}
+        {results.length === 0 && (
+          <div style={{ fontSize: 11, color: '#9ca3af' }}>No cycle data yet</div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function FaultLog() {
+  const [events, setEvents] = useState([])
+  useEffect(() => {
+    let alive = true
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/stats/events')
+        if (alive && res.ok) {
+          const data = await res.json()
+          setEvents(data.events || [])
+        }
+      } catch {}
+    }
+    poll()
+    const iv = setInterval(poll, 3000)
+    return () => { alive = false; clearInterval(iv) }
+  }, [])
+
+  const severity = { error: '#DC2626', warning: '#CA8A04', info: '#2563EB' }
+
+  return (
+    <div style={{
+      background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
+      padding: 20,
+    }}>
+      <div style={{ ...cardLabel, marginBottom: 10 }}>Recent Events</div>
+      {events.length === 0 ? (
+        <div style={{ fontSize: 12, color: '#9ca3af', padding: '8px 0' }}>No events</div>
+      ) : events.slice(-5).reverse().map((ev, i) => (
+        <div key={i} style={{
+          display: 'flex', alignItems: 'flex-start', gap: 10,
+          padding: '8px 0',
+          borderBottom: i < 4 ? '1px solid #f3f4f6' : 'none',
+        }}>
+          <div style={{
+            width: 8, height: 8, borderRadius: '50%', flexShrink: 0, marginTop: 5,
+            background: severity[ev.severity] || '#6b7280',
+          }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 12, fontWeight: 500, color: '#111' }}>{ev.message}</div>
+            <div style={{ fontSize: 10, color: '#9ca3af' }}>{ev.timestamp}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function TimeRemaining({ cycleTime, repeatCount, cyclesDone }) {
+  if (!repeatCount || repeatCount <= 0 || !cycleTime) return null
+  const remaining = Math.max(0, (repeatCount - cyclesDone) * cycleTime)
+  const mins = Math.floor(remaining / 60)
+  const secs = Math.floor(remaining % 60)
+  const eta = new Date(Date.now() + remaining * 1000)
+  const etaStr = eta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+
+  return (
+    <div style={{
+      background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
+      padding: 20, display: 'flex', alignItems: 'center', gap: 24, flexWrap: 'wrap',
+    }}>
+      <div>
+        <div style={cardLabel}>Time Remaining</div>
+        <div style={{ fontSize: 28, fontWeight: 800, color: '#111', fontVariantNumeric: 'tabular-nums', marginTop: 4 }}>
+          {mins}:{secs.toString().padStart(2, '0')}
+        </div>
+      </div>
+      <div>
+        <div style={cardLabel}>ETA</div>
+        <div style={{ fontSize: 20, fontWeight: 700, color: '#2563EB', marginTop: 4 }}>{etaStr}</div>
+      </div>
+      <div>
+        <div style={cardLabel}>Cycles</div>
+        <div style={{ fontSize: 20, fontWeight: 700, color: '#374151', marginTop: 4, fontVariantNumeric: 'tabular-nums' }}>
+          {cyclesDone} / {repeatCount}
+        </div>
+      </div>
+      <div style={{ flex: 1, minWidth: 200 }}>
+        <div style={{ height: 10, borderRadius: 5, background: '#e5e7eb', overflow: 'hidden' }}>
+          <div style={{
+            height: '100%', borderRadius: 5,
+            width: (cyclesDone / repeatCount * 100) + '%',
+            background: '#2563EB', transition: 'width 500ms',
+          }} />
+        </div>
+        <div style={{ fontSize: 10, color: '#9ca3af', textAlign: 'right', marginTop: 3 }}>
+          {Math.round(cyclesDone / repeatCount * 100)}% complete
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function IOSummary() {
+  const [ioState, setIoState] = useState({})
+  const [labels, setLabels]   = useState({})
+
+  useEffect(() => {
+    fetch('/api/io/config').then((r) => r.json()).then((d) => setLabels(d.labels || {})).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    let alive = true
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/io/state')
+        if (alive && res.ok) {
+          const data = await res.json()
+          setIoState(data.io || {})
+        }
+      } catch {}
+    }
+    poll()
+    const iv = setInterval(poll, 500)
+    return () => { alive = false; clearInterval(iv) }
+  }, [])
+
+  // Operator-relevant signals to surface as a strip. Same id space as
+  // the I/O page so labels stay in sync if the operator renames them.
+  const keySignals = ['DI0', 'DI1', 'DI4', 'DI8', 'DO0', 'DO1', 'DO2', 'DO4']
+
+  return (
+    <div style={{
+      background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
+      padding: '14px 20px',
+      display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap',
+    }}>
+      <span style={{ fontSize: 11, fontWeight: 600, color: '#6b7280', marginRight: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+        I/O
+      </span>
+      {keySignals.map((id) => {
+        const active = !!ioState[id]
+        const label  = labels[id] || id
+        return (
+          <div key={id} style={{
+            display: 'flex', alignItems: 'center', gap: 5,
+            padding: '4px 10px', borderRadius: 6,
+            background: active ? 'rgba(22,163,74,0.08)' : '#f3f4f6',
+            border:     active ? '1px solid rgba(22,163,74,0.3)' : '1px solid #e5e7eb',
+          }}>
+            <div style={{
+              width: 7, height: 7, borderRadius: '50%',
+              background: active ? '#16A34A' : '#9ca3af',
+            }} />
+            <span style={{ fontSize: 10, color: '#374151', fontWeight: 500 }}>
+              {label.length > 15 ? label.slice(0, 15) + '…' : label}
+            </span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+const cardLabel = {
+  fontSize: 11, fontWeight: 600, color: '#6b7280',
+  textTransform: 'uppercase', letterSpacing: '0.05em',
+}
+
 function StatCard({ label, value, unit, color }) {
   return (
     <div style={{
@@ -190,11 +479,32 @@ export default function MonitorDashboard() {
       </div>
 
       {/* Stats row */}
-      <div style={{ display: 'flex', gap: 12, marginBottom: 24, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
         <StatCard label="Speed" value={speedPct} unit="%" color="#2563EB" />
         <StatCard label="Cycle Count" value={cycleCount} color="#16A34A" />
         <StatCard label="Last Cycle Time" value={lastCycleTime ?? '—'} unit={lastCycleTime ? 's' : ''} color="#374151" />
         <StatCard label="Objects Detected" value={detectionCount} color="#9333EA" />
+      </div>
+
+      {/* Production stats: parts picked + cycle results */}
+      <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+        <PickCounter />
+        <CycleResults />
+      </div>
+
+      {/* Time remaining — only renders when a counted program is running */}
+      <div style={{ marginBottom: 16 }}>
+        <TimeRemaining
+          cycleTime={parseFloat(lastCycleTime) || 12}
+          repeatCount={currentProgram?.config?.repeat_count || 0}
+          cyclesDone={cycleCount}
+        />
+      </div>
+
+      {/* I/O strip on top, fault log below */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 24 }}>
+        <IOSummary />
+        <FaultLog />
       </div>
 
       {/* Program steps progress */}
