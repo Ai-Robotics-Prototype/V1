@@ -1,7 +1,6 @@
 import { useEffect, Component } from 'react'
 import { useStore } from './store/useStore'
 import TopBar from './components/TopBar'
-import SideNav from './components/SideNav'
 import StatusBar from './components/StatusBar'
 import ToastContainer from './components/ToastContainer'
 import EStopOverlay from './components/EStopOverlay'
@@ -61,8 +60,8 @@ class ErrorBoundary extends Component {
 
 const gridStyle = {
   display: 'grid',
-  gridTemplateAreas: '"topbar topbar" "sidenav content" "sidenav statusbar"',
-  gridTemplateColumns: '64px 1fr',
+  gridTemplateAreas: '"topbar" "content" "statusbar"',
+  gridTemplateColumns: '1fr',
   gridTemplateRows: '48px 1fr 36px',
   height: '100vh',
   overflow: 'hidden',
@@ -95,9 +94,6 @@ export default function App() {
       <div style={gridStyle}>
         <div style={{ gridArea: 'topbar' }}>
           <TopBar />
-        </div>
-        <div style={{ gridArea: 'sidenav', borderRight: '1px solid var(--border)', background: 'var(--bg-panel)' }}>
-          <SideNav />
         </div>
         <div style={{ gridArea: 'content', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
           <ErrorBoundary>
