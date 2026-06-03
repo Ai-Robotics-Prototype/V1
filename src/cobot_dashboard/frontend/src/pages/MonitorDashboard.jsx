@@ -1,5 +1,9 @@
 import { useState, useEffect } from 'react'
 import { useStore } from '../store/useStore'
+import { Canvas } from '@react-three/fiber'
+import { OrbitControls } from '@react-three/drei'
+import { STLLoader } from 'three/examples/jsm/loaders/STLLoader'
+import * as THREE from 'three'
 
 function StatusBadge({ status }) {
   const colors = {
@@ -312,6 +316,287 @@ function IOSummary() {
   )
 }
 
+function PartModel({ stlUrl }) {
+  const [mesh, setMesh] = useState(null)
+
+  useEffect(() => {
+    if (!stlUrl) { setMesh(null); return }
+    let cancelled = false
+    const loader = new STLLoader()
+    loader.load(
+      stlUrl,
+      (geometry) => {
+        if (cancelled) return
+        geometry.computeBoundingBox()
+        geometry.center()
+        // Scale to fit within a ~0.1 unit cube so the camera default
+        // works regardless of the part's real-world size.
+        const box = geometry.boundingBox
+        const size = Math.max(
+          (box.max.x - box.min.x),
+          (box.max.y - box.min.y),
+          (box.max.z - box.min.z),
+        ) || 1
+        const scale = 0.1 / size
+        geometry.scale(scale, scale, scale)
+        const m = new THREE.Mesh(
+          geometry,
+          new THREE.MeshStandardMaterial({ color: '#A8B0C0', metalness: 0.5, roughness: 0.35 }),
+        )
+        setMesh(m)
+      },
+      undefined,
+      () => { if (!cancelled) setMesh(null) },
+    )
+    return () => { cancelled = true }
+  }, [stlUrl])
+
+  if (!mesh) return null
+  return <primitive object={mesh} />
+}
+
+function PartViewer({ partId }) {
+  const [partMeta, setPartMeta] = useState(null)
+
+  useEffect(() => {
+    if (!partId) { setPartMeta(null); return }
+    let alive = true
+    fetch('/api/parts/' + encodeURIComponent(partId))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (alive) setPartMeta(d) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [partId])
+
+  const stlUrl = partMeta?.stl_file ? '/parts/' + partMeta.stl_file : null
+  const name   = partMeta?.name || partId
+
+  return (
+    <div style={{
+      background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
+      overflow: 'hidden',
+    }}>
+      <div style={{ padding: '12px 16px', borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', gap: 10 }}>
+        <div style={cardLabel}>Current Part</div>
+        <div style={{ flex: 1 }} />
+        {name && <span style={{ fontSize: 13, fontWeight: 700, color: '#111' }}>{name}</span>}
+      </div>
+
+      {partId ? (
+        <div style={{ height: 200, background: '#fafafa' }}>
+          <Canvas camera={{ position: [0.15, 0.12, 0.15], fov: 45 }} style={{ background: '#fafafa' }}>
+            <ambientLight intensity={0.7} />
+            <directionalLight position={[5, 5, 5]} intensity={0.8} />
+            <directionalLight position={[-5, 3, -5]} intensity={0.3} />
+            <gridHelper args={[0.2, 10, '#d1d5db', '#e5e7eb']} />
+            <PartModel stlUrl={stlUrl} />
+            <OrbitControls enablePan={false} target={[0, 0, 0]} />
+          </Canvas>
+        </div>
+      ) : (
+        <div style={{
+          height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center',
+          color: '#9ca3af', fontSize: 13, background: '#fafafa',
+        }}>
+          No part assigned to this program
+        </div>
+      )}
+
+      {partMeta && (
+        <div style={{ padding: '10px 16px', borderTop: '1px solid #e5e7eb', display: 'flex', gap: 16, fontSize: 11, color: '#6b7280', flexWrap: 'wrap' }}>
+          {Array.isArray(partMeta.extents_cm) && (
+            <span>
+              {partMeta.extents_cm.map((e) => Number(e).toFixed(1)).join(' × ')} cm
+            </span>
+          )}
+          {partMeta.teach_count !== undefined && (
+            <span>{partMeta.teach_count} teach refs</span>
+          )}
+          {partMeta.templates?.num_templates !== undefined && (
+            <span>{partMeta.templates.num_templates} templates</span>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ProgramPickStats({ programId }) {
+  const [stats, setStats] = useState({ total: 0, pass: 0, fail: 0, fail_reasons: [] })
+
+  useEffect(() => {
+    if (!programId) { setStats({ total: 0, pass: 0, fail: 0, fail_reasons: [] }); return }
+    let alive = true
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/stats/program/' + encodeURIComponent(programId))
+        if (!alive || !res.ok) return
+        const data = await res.json()
+        setStats((prev) => ({ ...prev, ...data }))
+      } catch {}
+    }
+    poll()
+    const iv = setInterval(poll, 3000)
+    return () => { alive = false; clearInterval(iv) }
+  }, [programId])
+
+  const passRate = stats.total > 0 ? Math.round(stats.pass / stats.total * 100) : 0
+  const ringColor = passRate >= 90 ? '#16A34A' : passRate >= 70 ? '#CA8A04' : '#DC2626'
+  const circumference = 2 * Math.PI * 34 // ≈ 213.6
+
+  return (
+    <div style={{
+      background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
+      padding: 20,
+    }}>
+      <div style={{ ...cardLabel, marginBottom: 12 }}>Program Pick Performance</div>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 24, marginBottom: 16 }}>
+        <div style={{ position: 'relative', width: 80, height: 80 }}>
+          <svg width="80" height="80" viewBox="0 0 80 80">
+            <circle cx="40" cy="40" r="34" fill="none" stroke="#e5e7eb" strokeWidth="8" />
+            <circle cx="40" cy="40" r="34" fill="none"
+              stroke={ringColor} strokeWidth="8"
+              strokeDasharray={`${(passRate / 100) * circumference} ${circumference}`}
+              strokeLinecap="round"
+              transform="rotate(-90 40 40)"
+            />
+          </svg>
+          <div style={{
+            position: 'absolute', inset: 0, display: 'flex',
+            alignItems: 'center', justifyContent: 'center',
+            fontSize: 18, fontWeight: 800, color: '#111',
+          }}>
+            {stats.total > 0 ? passRate + '%' : '—'}
+          </div>
+        </div>
+
+        <div style={{ flex: 1, display: 'flex', gap: 24, flexWrap: 'wrap' }}>
+          <div>
+            <div style={{ fontSize: 22, fontWeight: 800, color: '#16A34A', fontVariantNumeric: 'tabular-nums' }}>{stats.pass}</div>
+            <div style={{ fontSize: 10, color: '#6b7280' }}>successful picks</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 22, fontWeight: 800, color: '#DC2626', fontVariantNumeric: 'tabular-nums' }}>{stats.fail}</div>
+            <div style={{ fontSize: 10, color: '#6b7280' }}>failed picks</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 22, fontWeight: 800, color: '#374151', fontVariantNumeric: 'tabular-nums' }}>{stats.total}</div>
+            <div style={{ fontSize: 10, color: '#6b7280' }}>total attempts</div>
+          </div>
+        </div>
+      </div>
+
+      {Array.isArray(stats.fail_reasons) && stats.fail_reasons.length > 0 && (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: '#DC2626', marginBottom: 6 }}>Failure Reasons</div>
+          {stats.fail_reasons.map((r, i) => (
+            <div key={i} style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              padding: '4px 0', fontSize: 12, color: '#374151',
+            }}>
+              <div style={{ flex: 1 }}>{r.reason}</div>
+              <div style={{ fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{r.count}</div>
+              <div style={{ width: 60, height: 6, borderRadius: 3, background: '#e5e7eb', overflow: 'hidden' }}>
+                <div style={{
+                  height: '100%', borderRadius: 3, background: '#DC2626',
+                  width: stats.fail > 0 ? (r.count / stats.fail * 100) + '%' : '0%',
+                }} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {stats.total === 0 && (
+        <div style={{ fontSize: 11, color: '#9ca3af', marginTop: 4 }}>No pick attempts recorded for this program yet</div>
+      )}
+    </div>
+  )
+}
+
+function CycleTimeChart({ programId }) {
+  const [data, setData] = useState([])
+
+  useEffect(() => {
+    if (!programId) { setData([]); return }
+    let alive = true
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/stats/program/' + encodeURIComponent(programId) + '/cycle_times')
+        if (!alive || !res.ok) return
+        const d = await res.json()
+        setData(d.cycle_times || [])
+      } catch {}
+    }
+    poll()
+    const iv = setInterval(poll, 5000)
+    return () => { alive = false; clearInterval(iv) }
+  }, [programId])
+
+  if (data.length < 2) {
+    return (
+      <div style={{ background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb', padding: 20 }}>
+        <div style={{ ...cardLabel, marginBottom: 8 }}>Cycle Time History</div>
+        <div style={{ fontSize: 12, color: '#9ca3af', padding: '20px 0', textAlign: 'center' }}>
+          Need at least 2 cycles to show trend
+        </div>
+      </div>
+    )
+  }
+
+  const sample = data.slice(-50)
+  const times = sample.map((d) => Number(d.time) || 0)
+  const maxTime = Math.max(...times)
+  const minTime = Math.min(...times)
+  const avgTime = times.reduce((s, t) => s + t, 0) / times.length
+  const chartH  = 120
+
+  const yFor = (t) => maxTime > minTime
+    ? (1 - (t - minTime) / (maxTime - minTime)) * chartH
+    : chartH / 2
+
+  const points = sample.map((d, i) => {
+    const x = (i / Math.max(1, sample.length - 1)) * 100
+    return `${x},${yFor(Number(d.time) || 0)}`
+  })
+  const pathD = 'M ' + points.join(' L ')
+  const avgY  = yFor(avgTime)
+
+  return (
+    <div style={{ background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb', padding: 20 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12, flexWrap: 'wrap' }}>
+        <div style={cardLabel}>Cycle Time History</div>
+        <div style={{ flex: 1 }} />
+        <div style={{ display: 'flex', gap: 16, fontSize: 12 }}>
+          <span style={{ color: '#6b7280' }}>Avg: <strong style={{ color: '#2563EB' }}>{avgTime.toFixed(1)}s</strong></span>
+          <span style={{ color: '#6b7280' }}>Min: <strong style={{ color: '#16A34A' }}>{minTime.toFixed(1)}s</strong></span>
+          <span style={{ color: '#6b7280' }}>Max: <strong style={{ color: '#DC2626' }}>{maxTime.toFixed(1)}s</strong></span>
+        </div>
+      </div>
+
+      <div style={{ position: 'relative', height: chartH }}>
+        <svg width="100%" height={chartH} viewBox={'0 0 100 ' + chartH} preserveAspectRatio="none" style={{ overflow: 'visible' }}>
+          <line x1="0" y1={avgY} x2="100" y2={avgY}
+            stroke="#2563EB" strokeWidth="0.3" strokeDasharray="2,2" />
+          <path d={pathD + ' L 100,' + chartH + ' L 0,' + chartH + ' Z'} fill="#2563EB" fillOpacity="0.08" />
+          <path d={pathD} fill="none" stroke="#2563EB" strokeWidth="0.6" vectorEffect="non-scaling-stroke" />
+          {(() => {
+            const last = points[points.length - 1].split(',')
+            return <circle cx={last[0]} cy={last[1]} r="1.4" fill="#2563EB" vectorEffect="non-scaling-stroke" />
+          })()}
+        </svg>
+        <div style={{ position: 'absolute', top: 0, right: 0, fontSize: 9, color: '#9ca3af' }}>{maxTime.toFixed(1)}s</div>
+        <div style={{ position: 'absolute', bottom: 0, right: 0, fontSize: 9, color: '#9ca3af' }}>{minTime.toFixed(1)}s</div>
+      </div>
+
+      <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 6, textAlign: 'right' }}>
+        Last {sample.length} cycles
+      </div>
+    </div>
+  )
+}
+
 const cardLabel = {
   fontSize: 11, fontWeight: 600, color: '#6b7280',
   textTransform: 'uppercase', letterSpacing: '0.05em',
@@ -381,6 +666,11 @@ export default function MonitorDashboard() {
   const detections = Array.isArray(detectionsFromStore) ? detectionsFromStore : []
   const detectionCount = detections.length
   const speedPct = Math.round((safety?.speed_scale ?? 1) * 100)
+
+  // Wizard-saved programs carry the target part id in their config.
+  const programConfig  = currentProgram?.config || {}
+  const targetPartId   = programConfig.target_part || null
+  const programIdForStats = currentProgram?.id || null
 
   const runDisabled    = safety?.estop || (task?.running && !task?.paused)
   const pauseDisabled  = !task?.running || task?.paused || safety?.estop
@@ -490,6 +780,21 @@ export default function MonitorDashboard() {
       <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
         <PickCounter />
         <CycleResults />
+      </div>
+
+      {/* Per-program: part 3D viewer + pick performance */}
+      <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+        <div style={{ width: 320, flexShrink: 0 }}>
+          <PartViewer partId={targetPartId} />
+        </div>
+        <div style={{ flex: 1, minWidth: 320 }}>
+          <ProgramPickStats programId={programIdForStats} />
+        </div>
+      </div>
+
+      {/* Cycle time history for the loaded program */}
+      <div style={{ marginBottom: 16 }}>
+        <CycleTimeChart programId={programIdForStats} />
       </div>
 
       {/* Time remaining — only renders when a counted program is running */}

@@ -1822,6 +1822,26 @@ if FASTAPI_AVAILABLE:
     async def api_stats_events():
         return {'events': list(_stats['events'][-10:])}
 
+    # Per-program rolling stats — same in-memory shape as the global
+    # stats dict, but keyed by program id so the Monitor tab can show
+    # pass/fail + cycle-time history for the currently-loaded program.
+    _program_stats: dict = {}
+
+    @app.get("/api/stats/program/{prog_id}")
+    async def api_stats_program(prog_id: str):
+        s = _program_stats.get(prog_id, {})
+        return {
+            'total':        s.get('total', 0),
+            'pass':         s.get('pass', 0),
+            'fail':         s.get('fail', 0),
+            'fail_reasons': list(s.get('fail_reasons', [])),
+        }
+
+    @app.get("/api/stats/program/{prog_id}/cycle_times")
+    async def api_stats_program_cycle_times(prog_id: str):
+        s = _program_stats.get(prog_id, {})
+        return {'cycle_times': list(s.get('cycle_times', []))}
+
     @app.get("/api/programs")
     async def api_programs_list():
         """List user-created robot programs from /opt/cobot/programs/.
