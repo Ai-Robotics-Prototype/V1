@@ -1721,6 +1721,77 @@ if FASTAPI_AVAILABLE:
             pass
         return {"programs": programs}
 
+    # ------------------------------------------------------------------
+    # I/O state (Estun S10-140 digital/analog inputs and outputs).
+    # In-memory until the robot driver subscribes to /robot/io_command
+    # and reports back via /robot/io_state; labels are persisted to
+    # /opt/cobot/io_config.json so an installer can rename them.
+    # ------------------------------------------------------------------
+    _IO_STATE: dict = {}
+
+    @app.get("/api/io/state")
+    async def api_io_state():
+        return {"io": _IO_STATE}
+
+    @app.post("/api/io/set")
+    async def api_io_set(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        io_id = body.get('id')
+        if not io_id:
+            return JSONResponse({"error": "missing 'id'"}, status_code=400)
+        value = body.get('value', 0)
+        # Coerce: digitals are 0/1, analogs are floats. Trust the id prefix.
+        if isinstance(io_id, str) and io_id.startswith(('DO', 'DI')):
+            value = 1 if value else 0
+        else:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "invalid 'value'"}, status_code=400)
+        _IO_STATE[io_id] = value
+
+        # Forward to ROS so the robot driver can actuate the real signal.
+        if _ros_node is not None:
+            try:
+                if not hasattr(_ros_node, '_io_pub'):
+                    _ros_node._io_pub = _ros_node.create_publisher(
+                        String, "/robot/io_command", 10)
+                m = String()
+                m.data = json.dumps({"io_id": io_id, "value": value})
+                _ros_node._io_pub.publish(m)
+            except Exception:
+                pass
+        return {"ok": True, "id": io_id, "value": value}
+
+    @app.get("/api/io/config")
+    async def api_io_config_get():
+        path = '/opt/cobot/io_config.json'
+        if os.path.isfile(path):
+            try:
+                with open(path) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"config": "default"}
+
+    @app.put("/api/io/config")
+    async def api_io_config_put(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        path = '/opt/cobot/io_config.json'
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w') as f:
+                json.dump(body, f, indent=2)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return {"ok": True}
+
     @app.put("/api/parts/{part_id}/config")
     async def api_parts_config(part_id: str, request: Request):
         """Update part orientation, surface choice, and grasp settings."""
