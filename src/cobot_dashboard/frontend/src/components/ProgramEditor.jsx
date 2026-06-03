@@ -433,6 +433,7 @@ export default function ProgramEditor() {
   useEffect(() => {
     if (!loadedProgram) return
     const prog = loadedProgram
+    console.log('[ProgramEditor] consuming loadedProgram', { id: prog?.id, name: prog?.name, steps: prog?.steps?.length })
     if (Array.isArray(prog.steps)) setProgramSteps(prog.steps)
     if (prog.id)   setProgramId(prog.id)
     if (prog.name) setProgramName(prog.name)

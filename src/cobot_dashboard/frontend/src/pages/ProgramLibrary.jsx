@@ -50,22 +50,27 @@ export default function ProgramLibrary() {
   }
 
   async function handleEdit(p) {
+    console.log('[ProgramLibrary] Edit click', p.id, p.name)
     setBusyId(p.id)
     setError(null)
     try {
       const res = await fetch(`/api/programs/${encodeURIComponent(p.id)}`)
+      console.log('[ProgramLibrary] GET response', res.status, res.ok)
       if (!res.ok) {
         const body = await res.text().catch(() => '')
         throw new Error(`HTTP ${res.status}${body ? ` — ${body.slice(0, 120)}` : ''}`)
       }
       const prog = await res.json()
+      console.log('[ProgramLibrary] payload', { id: prog?.id, name: prog?.name, steps: prog?.steps?.length })
       if (!prog || !Array.isArray(prog.steps)) {
         throw new Error('program payload missing steps')
       }
       setLoadedProgram(prog)
       setTab('program')
+      console.log('[ProgramLibrary] stashed loadedProgram + switched to program tab')
       addToast(`Loaded "${prog.name || p.name}" into editor`, 'success')
     } catch (e) {
+      console.error('[ProgramLibrary] Edit failed', e)
       setError(e.message || String(e))
       addToast(`Edit failed: ${e.message || e}`, 'error')
     } finally {

@@ -344,6 +344,10 @@ const storeDefinition = (set, get) => ({
   setTab(tab) {
     set({ activeTab: tab })
   },
+  // Alias — matches the name external diagnostic scripts grep for.
+  setActiveTab(tab) {
+    set({ activeTab: tab })
+  },
 
   setView(view) {
     set({ activeView: view })
