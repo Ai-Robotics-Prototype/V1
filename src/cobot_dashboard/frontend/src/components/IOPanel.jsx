@@ -105,12 +105,16 @@ function EditableLabel({ value, onChange }) {
       onClick={() => { setDraft(value); setEditing(true) }}
       title="Click to rename"
       style={{
+        // Hard-coded color (matches --text-primary) so the label can
+        // never inherit a theme/contextual color that would hide it on
+        // a green-tinted active row.
+        color: '#F0F0F2',
         fontSize: 12,
-        color: 'var(--text-primary)',
+        display: 'block',
         flex: 1, minWidth: 0,
         cursor: 'text',
         padding: '2px 4px',
-        borderRadius: 'var(--radius-sm, 4px)',
+        borderRadius: 4,
         borderBottom: '1px dashed transparent',
         whiteSpace: 'nowrap',
         overflow: 'hidden',
@@ -130,10 +134,16 @@ function DigitalSignal({ signal, value, isOutput, onToggle, onRename }) {
     <div style={{
       display: 'flex', alignItems: 'center', gap: 10,
       padding: '6px 12px',
-      background: active ? 'rgba(22,163,74,0.08)' : 'var(--bg-surface)',
-      borderRadius: 'var(--radius-sm, 4px)',
-      border: `1px solid ${active ? 'rgba(22,163,74,0.3)' : 'var(--border)'}`,
+      // Row background stays dark (var(--bg-surface)) in both states so
+      // the label always sits on the same contrast surface. The active
+      // indication is carried by the LED, the left-edge stripe, and the
+      // toggle — no green wash behind the text.
+      background: 'var(--bg-surface)',
+      borderRadius: 4,
+      border: '1px solid var(--border)',
+      borderLeft: `3px solid ${active ? '#16A34A' : 'transparent'}`,
       marginBottom: 3,
+      transition: 'border-left-color 200ms',
     }}>
       <div style={{
         width: 10, height: 10, borderRadius: '50%', flexShrink: 0,
@@ -149,7 +159,7 @@ function DigitalSignal({ signal, value, isOutput, onToggle, onRename }) {
       </span>
       <EditableLabel value={signal.label} onChange={(v) => onRename(signal.id, v)} />
       <span style={{
-        fontSize: 11, fontWeight: 600, minWidth: 30, textAlign: 'right',
+        fontSize: 11, fontWeight: 600, minWidth: 28, textAlign: 'right',
         color: active ? '#16A34A' : 'var(--text-muted)', flexShrink: 0,
       }}>
         {active ? 'ON' : 'OFF'}
