@@ -11,7 +11,7 @@ const ACTION_TYPES = [
   { value: 'open_gripper',  label: 'Open Gripper',     type: 'gripper', tag: 'GRIPPER', fields: ['width_mm', 'speed_pct'] },
   { value: 'close_gripper', label: 'Close Gripper',    type: 'gripper', tag: 'GRIPPER', fields: ['force_pct'] },
   { value: 'move_joint',    label: 'Move Joint',       type: 'move',    tag: 'MOVE',    fields: ['joints'] },
-  { value: 'move_linear',   label: 'Move Linear',      type: 'move',    tag: 'MOVE',    fields: ['position', 'speed_pct'] },
+  { value: 'move_linear',   label: 'Move Linear',      type: 'move',    tag: 'MOVE',    fields: ['position', 'offset_z_mm', 'speed_pct'] },
   { value: 'approach',      label: 'Approach Object',  type: 'move',    tag: 'MOVE',    fields: ['target', 'offset_z_mm'] },
   { value: 'pick',          label: 'Pick and Close',   type: 'gripper', tag: 'PICK',    fields: ['descend_mm'] },
   { value: 'place',         label: 'Place at Target',  type: 'move',    tag: 'PLACE',   fields: ['position'] },
@@ -41,6 +41,8 @@ function detailLine(step) {
   if (step.duration_s)  bits.push(step.duration_s + 's')
   if (step.width_mm)    bits.push(step.width_mm + 'mm')
   if (step.descend_mm)  bits.push('descend ' + step.descend_mm + 'mm')
+  if (step.offset_z_mm !== undefined) bits.push('z' + (step.offset_z_mm >= 0 ? '+' : '') + step.offset_z_mm + 'mm')
+  if (step.speed_pct)   bits.push(step.speed_pct + '%')
   if (step.io_id)       bits.push(step.io_id + '=' + (step.value ? 'ON' : 'OFF'))
   return bits.join(' | ')
 }

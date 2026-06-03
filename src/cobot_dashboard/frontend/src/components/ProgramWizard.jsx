@@ -476,75 +476,126 @@ function ReviewStep({ operation, config, onSave, programName, setProgramName, sa
 }
 
 function buildProgramSteps(operation, config) {
-  const steps = []
-  const spd = config.speed_pct || 50
+  const steps     = []
+  const spd       = config.speed_pct || 50
+  const appHeight = config.approach_height || 150
+  const gripWidth = config.gripper_width   || 85
+  const gripForce = config.grip_force      || 50
+  // Speed caps for the safety moves — descents and the first lift are
+  // intentionally slower than the cruise speed so a misjudged pick
+  // doesn't crash the gripper or fling the part.
+  const slow   = Math.min(spd, 30)
+  const medium = Math.min(spd, 40)
+  // Placeholder TCP for explicit place moves. The operator edits the
+  // real coordinates in the editor after the wizard runs.
+  const tcpAbove = [0.3, -0.2, 0.4 + appHeight / 1000]
 
   if (operation.id === 'pick_and_place') {
-    steps.push({ action: 'move_home',     label: 'Move to home position' })
-    steps.push({ action: 'open_gripper',  label: 'Open gripper', width_mm: config.gripper_width || 85, speed_pct: spd })
-    if (config.pick_method === 'camera_auto')  steps.push({ action: 'detect', label: 'Detect objects',    mode: 'all' })
-    else if (config.pick_method === 'library_part') steps.push({ action: 'detect', label: 'Find library part', mode: 'library' })
-    steps.push({ action: 'approach', label: 'Approach pick position', target: config.pick_method === 'fixed_point' ? 'fixed' : 'auto', offset_z_mm: config.approach_height || 150 })
-    steps.push({ action: 'pick',     label: 'Pick part', descend_mm: config.approach_height || 150 })
-    if (config.place_point) {
-      steps.push({ action: 'move_joint', label: 'Move to place position', joints: config.place_point.joints })
-    } else {
-      steps.push({ action: 'place', label: 'Place at target', position: [0.3, -0.2, 0.4] })
+    steps.push({ action: 'move_home',    label: 'Move to home position' })
+    steps.push({ action: 'open_gripper', label: 'Open gripper', width_mm: gripWidth, speed_pct: spd })
+
+    if (config.pick_method === 'camera_auto') {
+      steps.push({ action: 'detect', label: 'Detect objects', mode: 'all' })
+    } else if (config.pick_method === 'library_part') {
+      steps.push({ action: 'detect', label: 'Find library part', mode: 'library' })
     }
-    steps.push({ action: 'open_gripper', label: 'Release part', width_mm: config.gripper_width || 85 })
-    steps.push({ action: 'move_home',    label: 'Return home' })
+
+    steps.push({ action: 'approach',      label: 'Move above pick position', target: config.pick_method === 'fixed_point' ? 'fixed' : 'auto', offset_z_mm: appHeight })
+    steps.push({ action: 'move_linear',   label: 'Descend to pick',    offset_z_mm: 0,         speed_pct: slow   })
+    steps.push({ action: 'close_gripper', label: 'Close gripper on part', force_pct: gripForce })
+    steps.push({ action: 'move_linear',   label: 'Lift from pick',     offset_z_mm: appHeight, speed_pct: medium })
+
+    if (config.place_point) {
+      steps.push({ action: 'move_joint',  label: 'Move above place position', joints: config.place_point.joints })
+    } else {
+      steps.push({ action: 'move_linear', label: 'Move above place position', position: tcpAbove, speed_pct: spd })
+    }
+    steps.push({ action: 'move_linear',   label: 'Descend to place',   offset_z_mm: 0,         speed_pct: slow   })
+    steps.push({ action: 'open_gripper',  label: 'Release part',       width_mm: gripWidth })
+    steps.push({ action: 'move_linear',   label: 'Lift from place',    offset_z_mm: appHeight, speed_pct: medium })
+    steps.push({ action: 'move_home',     label: 'Return home' })
   }
   else if (operation.id === 'sort') {
-    steps.push({ action: 'move_home',    label: 'Move to home position' })
-    steps.push({ action: 'detect',       label: 'Scan for parts', mode: 'library' })
-    steps.push({ action: 'open_gripper', label: 'Open gripper', width_mm: config.gripper_width || 85 })
-    steps.push({ action: 'approach',     label: 'Approach identified part', target: 'auto', offset_z_mm: config.approach_height || 150 })
-    steps.push({ action: 'pick',         label: 'Pick part', descend_mm: config.approach_height || 150 })
-    steps.push({ action: 'place',        label: 'Place in correct bin', position: [0.3, -0.2, 0.4] })
-    steps.push({ action: 'open_gripper', label: 'Release part', width_mm: config.gripper_width || 85 })
-    steps.push({ action: 'loop',         label: 'Repeat until no parts remain', goto: 2, count: 0 })
+    steps.push({ action: 'move_home',     label: 'Move to home position' })
+    steps.push({ action: 'detect',        label: 'Scan for library parts', mode: 'library' })
+    steps.push({ action: 'open_gripper',  label: 'Open gripper', width_mm: gripWidth })
+    steps.push({ action: 'approach',      label: 'Move above identified part', target: 'auto', offset_z_mm: appHeight })
+    steps.push({ action: 'move_linear',   label: 'Descend to pick',     offset_z_mm: 0,         speed_pct: slow   })
+    steps.push({ action: 'close_gripper', label: 'Grasp part',          force_pct: gripForce })
+    steps.push({ action: 'move_linear',   label: 'Lift from pick',      offset_z_mm: appHeight, speed_pct: medium })
+    steps.push({ action: 'move_linear',   label: 'Move above sort bin', position: tcpAbove,     speed_pct: spd    })
+    steps.push({ action: 'move_linear',   label: 'Descend into bin',    offset_z_mm: 0,         speed_pct: slow   })
+    steps.push({ action: 'open_gripper',  label: 'Release part',        width_mm: gripWidth })
+    steps.push({ action: 'move_linear',   label: 'Lift from bin',       offset_z_mm: appHeight, speed_pct: medium })
+    steps.push({ action: 'loop',          label: 'Repeat until no parts remain', goto: 2, count: 0 })
   }
   else if (operation.id === 'machine_tend') {
-    steps.push({ action: 'move_home',    label: 'Move to home position' })
-    steps.push({ action: 'open_gripper', label: 'Open gripper', width_mm: config.gripper_width || 85 })
-    steps.push({ action: 'approach',     label: 'Approach raw part', target: 'auto', offset_z_mm: config.approach_height || 150 })
-    steps.push({ action: 'pick',         label: 'Pick raw part', descend_mm: config.approach_height || 150 })
+    steps.push({ action: 'move_home',     label: 'Move to home position' })
+    steps.push({ action: 'open_gripper',  label: 'Open gripper', width_mm: gripWidth })
+    steps.push({ action: 'approach',      label: 'Move above raw part', target: 'auto', offset_z_mm: appHeight })
+    steps.push({ action: 'move_linear',   label: 'Descend to pick raw part', offset_z_mm: 0, speed_pct: slow })
+    steps.push({ action: 'close_gripper', label: 'Grasp raw part', force_pct: gripForce })
+    steps.push({ action: 'move_linear',   label: 'Lift raw part',  offset_z_mm: appHeight, speed_pct: medium })
     if (config.machine_load_point) {
-      steps.push({ action: 'move_joint', label: 'Move to machine load', joints: config.machine_load_point.joints })
+      steps.push({ action: 'move_joint',  label: 'Move to machine load position', joints: config.machine_load_point.joints })
     }
-    steps.push({ action: 'open_gripper', label: 'Place in machine', width_mm: config.gripper_width || 85 })
-    steps.push({ action: 'set_io',       label: 'Start machine cycle', io_id: config.io_cycle_start || 'DO4', value: 1 })
-    steps.push({ action: 'wait',         label: 'Wait for cycle complete', duration_s: config.cycle_timeout || 30 })
-    steps.push({ action: 'close_gripper',label: 'Grip finished part', force_pct: config.grip_force || 50 })
+    steps.push({ action: 'move_linear',   label: 'Descend to load position', offset_z_mm: 0,         speed_pct: 20 })
+    steps.push({ action: 'open_gripper',  label: 'Release into machine',     width_mm: gripWidth })
+    steps.push({ action: 'move_linear',   label: 'Retreat from machine',     offset_z_mm: appHeight, speed_pct: slow })
+    steps.push({ action: 'set_io',        label: 'Start machine cycle',      io_id: config.io_cycle_start || 'DO4', value: 1 })
+    steps.push({ action: 'wait',          label: 'Wait for cycle complete signal', duration_s: config.cycle_timeout || 30 })
+    steps.push({ action: 'set_io',        label: 'Clear cycle start',        io_id: config.io_cycle_start || 'DO4', value: 0 })
+    steps.push({ action: 'move_linear',   label: 'Approach finished part',   offset_z_mm: appHeight, speed_pct: slow })
+    steps.push({ action: 'move_linear',   label: 'Descend to finished part', offset_z_mm: 0,         speed_pct: 20 })
+    steps.push({ action: 'close_gripper', label: 'Grasp finished part',      force_pct: gripForce })
+    steps.push({ action: 'move_linear',   label: 'Lift finished part',       offset_z_mm: appHeight, speed_pct: slow })
     if (config.unload_point) {
-      steps.push({ action: 'move_joint', label: 'Move to unload', joints: config.unload_point.joints })
+      steps.push({ action: 'move_joint',  label: 'Move to unload position', joints: config.unload_point.joints })
     }
-    steps.push({ action: 'open_gripper', label: 'Release finished part', width_mm: config.gripper_width || 85 })
-    steps.push({ action: 'move_home',    label: 'Return home' })
-    steps.push({ action: 'loop',         label: 'Repeat cycle', goto: 1, count: 0 })
+    steps.push({ action: 'move_linear',   label: 'Descend to unload',       offset_z_mm: 0,         speed_pct: slow })
+    steps.push({ action: 'open_gripper',  label: 'Release finished part',   width_mm: gripWidth })
+    steps.push({ action: 'move_linear',   label: 'Lift from unload',        offset_z_mm: appHeight, speed_pct: slow })
+    steps.push({ action: 'move_home',     label: 'Return home' })
+    steps.push({ action: 'loop',          label: 'Repeat cycle', goto: 1, count: 0 })
   }
   else if (operation.id === 'palletize') {
-    steps.push({ action: 'move_home',    label: 'Move to home position' })
-    steps.push({ action: 'detect',       label: 'Find part to palletize', mode: 'all' })
-    steps.push({ action: 'open_gripper', label: 'Open gripper', width_mm: config.gripper_width || 85 })
-    steps.push({ action: 'approach',     label: 'Approach part', target: 'auto', offset_z_mm: config.approach_height || 150 })
-    steps.push({ action: 'pick',         label: 'Pick part', descend_mm: config.approach_height || 150 })
-    steps.push({ action: 'place',        label: 'Place on pallet (auto-increment)', position: [0.3, -0.2, 0.4] })
-    steps.push({ action: 'open_gripper', label: 'Release part', width_mm: config.gripper_width || 85 })
-    steps.push({ action: 'loop',         label: 'Repeat until pallet full', goto: 2, count: config.pallet_count || 12 })
-    steps.push({ action: 'move_home',    label: 'Return home — pallet complete' })
+    // Pallet origin: prefer the taught TCP, otherwise use the same
+    // placeholder as the editor — the operator can override later.
+    const palletTcp = config.pallet_origin?.tcp || [0.3, -0.2, 0.4]
+    const palletAbove = [palletTcp[0], palletTcp[1], palletTcp[2] + appHeight / 1000]
+
+    steps.push({ action: 'move_home',     label: 'Move to home position' })
+    steps.push({ action: 'detect',        label: 'Find part to palletize', mode: 'all' })
+    steps.push({ action: 'open_gripper',  label: 'Open gripper', width_mm: gripWidth })
+    steps.push({ action: 'approach',      label: 'Move above part', target: 'auto', offset_z_mm: appHeight })
+    steps.push({ action: 'move_linear',   label: 'Descend to pick', offset_z_mm: 0,         speed_pct: slow   })
+    steps.push({ action: 'close_gripper', label: 'Grasp part',      force_pct: gripForce })
+    steps.push({ action: 'move_linear',   label: 'Lift from pick',  offset_z_mm: appHeight, speed_pct: medium })
+    steps.push({ action: 'move_linear',   label: 'Move above pallet slot (auto-increment)', position: palletAbove, speed_pct: spd })
+    steps.push({ action: 'move_linear',   label: 'Descend onto pallet', offset_z_mm: 0,     speed_pct: slow   })
+    steps.push({ action: 'open_gripper',  label: 'Release part',    width_mm: gripWidth })
+    steps.push({ action: 'move_linear',   label: 'Lift from pallet', offset_z_mm: appHeight, speed_pct: medium })
+    steps.push({ action: 'loop',          label: 'Repeat until pallet full', goto: 2, count: config.pallet_count || 12 })
+    steps.push({ action: 'move_home',     label: 'Return home — pallet complete' })
   }
   else if (operation.id === 'inspect') {
-    steps.push({ action: 'move_home',    label: 'Move to home position' })
-    steps.push({ action: 'open_gripper', label: 'Open gripper', width_mm: config.gripper_width || 85 })
-    steps.push({ action: 'approach',     label: 'Approach part', target: 'auto', offset_z_mm: config.approach_height || 150 })
-    steps.push({ action: 'pick',         label: 'Pick part', descend_mm: config.approach_height || 150 })
-    steps.push({ action: 'move_joint',   label: 'Move to inspection pose', joints: config.inspect_point?.joints || [0, -45, 90, -45, -90, 0] })
-    steps.push({ action: 'detect',       label: 'Inspect part with camera', mode: 'library' })
-    steps.push({ action: 'place',        label: 'Place in pass bin', position: [0.3, -0.2, 0.4] })
-    steps.push({ action: 'open_gripper', label: 'Release part', width_mm: config.gripper_width || 85 })
-    steps.push({ action: 'move_home',    label: 'Return home' })
-    steps.push({ action: 'loop',         label: 'Repeat', goto: 2, count: 0 })
+    const passTcp = config.pass_point?.tcp || [0.3, -0.2, 0.4]
+    const passAbove = [passTcp[0], passTcp[1], passTcp[2] + appHeight / 1000]
+
+    steps.push({ action: 'move_home',     label: 'Move to home position' })
+    steps.push({ action: 'open_gripper',  label: 'Open gripper', width_mm: gripWidth })
+    steps.push({ action: 'approach',      label: 'Move above part', target: 'auto', offset_z_mm: appHeight })
+    steps.push({ action: 'move_linear',   label: 'Descend to pick',   offset_z_mm: 0,         speed_pct: slow   })
+    steps.push({ action: 'close_gripper', label: 'Grasp part',        force_pct: gripForce })
+    steps.push({ action: 'move_linear',   label: 'Lift from pick',    offset_z_mm: appHeight, speed_pct: medium })
+    steps.push({ action: 'move_joint',    label: 'Move to inspection pose', joints: config.inspect_point?.joints || [0, -45, 90, -45, -90, 0] })
+    steps.push({ action: 'detect',        label: 'Inspect part with camera', mode: 'library' })
+    steps.push({ action: 'move_linear',   label: 'Move above pass bin', position: passAbove, speed_pct: spd })
+    steps.push({ action: 'move_linear',   label: 'Descend to pass bin', offset_z_mm: 0,         speed_pct: slow   })
+    steps.push({ action: 'open_gripper',  label: 'Release part',        width_mm: gripWidth })
+    steps.push({ action: 'move_linear',   label: 'Lift from pass bin',  offset_z_mm: appHeight, speed_pct: medium })
+    steps.push({ action: 'move_home',     label: 'Return home' })
+    steps.push({ action: 'loop',          label: 'Repeat', goto: 2, count: 0 })
   }
 
   return steps.map((s, i) => ({ ...s, step: i + 1 }))
