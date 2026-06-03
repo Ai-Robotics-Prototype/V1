@@ -789,6 +789,22 @@ export default function ProgramEditor() {
           )}
         </div>
 
+        <button onClick={() => setCurrentProgram({
+          id: null,
+          name: 'New Program',
+          steps: [],
+          unsaved: true,
+        })}
+          title="Start a blank program — Save creates a new file"
+          style={{
+            padding: '6px 12px', fontSize: 12, fontWeight: 600,
+            background: '#fff', color: '#374151',
+            border: '1px solid #d1d5db', borderRadius: 6,
+            cursor: 'pointer', flexShrink: 0,
+          }}>
+          + Blank
+        </button>
+
         <button onClick={() => setShowWizard(true)}
           style={{
             padding: '6px 12px', fontSize: 12, fontWeight: 600,

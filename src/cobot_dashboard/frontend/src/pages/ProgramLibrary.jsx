@@ -89,13 +89,6 @@ export default function ProgramLibrary() {
     if (ok) load()
   }
 
-  async function handleNew() {
-    const name = prompt('New program name:')
-    if (!name) return
-    const ok = await callAction('POST', '/api/programs', null)
-    if (ok) load()
-  }
-
   return (
     <div style={{
       width: '100%',
@@ -126,12 +119,6 @@ export default function ProgramLibrary() {
           style={btnSecondary}
         >
           Refresh
-        </button>
-        <button
-          onClick={handleNew}
-          style={btnPrimary}
-        >
-          + New Program
         </button>
       </div>
 
