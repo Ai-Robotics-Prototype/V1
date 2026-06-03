@@ -1816,11 +1816,16 @@ if FASTAPI_AVAILABLE:
     if os.path.isdir(_assets):
         app.mount("/assets", StaticFiles(directory=_assets), name="assets")
 
+    # index.html must never be cached by the browser — its content-hashed
+    # asset URLs are how new bundles get picked up. A cached shell pins
+    # the old hash and the user never sees any rebuild.
+    _NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate"}
+
     @app.get("/")
     async def serve_index():
         idx = os.path.join(_static, "index.html")
         if os.path.isfile(idx):
-            return FileResponse(idx)
+            return FileResponse(idx, headers=_NO_CACHE)
         return JSONResponse({"detail": "Frontend not built — run: cd frontend && npm run build"}, status_code=404)
 
     @app.get("/parts/{filename:path}")
@@ -1849,7 +1854,7 @@ if FASTAPI_AVAILABLE:
             return FileResponse(candidate)
         idx = os.path.join(_static, "index.html")
         if os.path.isfile(idx):
-            return FileResponse(idx)
+            return FileResponse(idx, headers=_NO_CACHE)
         return JSONResponse({"detail": "Not found"}, status_code=404)
 
 
