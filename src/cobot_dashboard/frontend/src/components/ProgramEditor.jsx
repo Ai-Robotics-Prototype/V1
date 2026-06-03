@@ -294,6 +294,23 @@ function VoiceBar() {
   )
 }
 
+function InsertionBar() {
+  return (
+    <div
+      // Don't intercept drag events — the bar lives between rows but
+      // we want dragover to keep firing on the rows themselves.
+      style={{
+        height: 4,
+        background: '#2563EB',
+        borderRadius: 2,
+        margin: '2px 12px',
+        boxShadow: '0 0 8px rgba(37, 99, 235, 0.45)',
+        pointerEvents: 'none',
+      }}
+    />
+  )
+}
+
 function EditableStepLabel({ value, onSave }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft]     = useState(value)
@@ -357,9 +374,13 @@ export default function ProgramEditor() {
   const reorderSteps       = useStore((s) => s.reorderSteps)
   const updateProgramStep  = useStore((s) => s.updateProgramStep)
 
-  const [editingId, setEditingId]   = useState(null)
-  const [dragId, setDragId]         = useState(null)
-  const [dragOverId, setDragOverId] = useState(null)
+  const [editingId, setEditingId]     = useState(null)
+  const [dragId, setDragId]           = useState(null)
+  const [dragOverId, setDragOverId]   = useState(null)
+  // 'before' | 'after' — which side of the hovered row the cursor is on,
+  // computed from the row's bounding rect so the blue insertion bar
+  // tracks the actual landing spot, not just which row we're over.
+  const [dragOverPos, setDragOverPos] = useState(null)
 
   // Resolve the "current step" pointer from real task state. The first
   // active step is the playhead; everything before it is done.
@@ -375,25 +396,41 @@ export default function ProgramEditor() {
   function handleDragOver(e, id) {
     e.preventDefault()
     e.dataTransfer.dropEffect = 'move'
-    setDragOverId(id)
+    const rect = e.currentTarget.getBoundingClientRect()
+    const midY = rect.top + rect.height / 2
+    const pos  = e.clientY < midY ? 'before' : 'after'
+    if (dragOverId !== id) setDragOverId(id)
+    if (dragOverPos !== pos) setDragOverPos(pos)
+  }
+
+  function clearDrag() {
+    setDragId(null)
+    setDragOverId(null)
+    setDragOverPos(null)
   }
 
   function handleDrop(e, targetId) {
     e.preventDefault()
-    setDragOverId(null)
-    if (dragId === null || dragId === targetId) { setDragId(null); return }
+    if (dragId === null) { clearDrag(); return }
     const ids   = steps.map((s) => s.id)
     const fromI = ids.indexOf(dragId)
     const toI   = ids.indexOf(targetId)
-    if (fromI < 0 || toI < 0) { setDragId(null); return }
+    if (fromI < 0 || toI < 0) { clearDrag(); return }
+    // Compute the *post-removal* insertion index. The 'after' side of
+    // the target means we want to land after it (toI + 1); if we're
+    // removing from a position before that, the splice shifts indices
+    // down by one, so adjust.
+    let insertI = dragOverPos === 'after' ? toI + 1 : toI
+    if (fromI < insertI) insertI -= 1
+    if (fromI === insertI) { clearDrag(); return }
     const newIds = [...ids]
-    newIds.splice(fromI, 1)
-    newIds.splice(toI, 0, dragId)
+    const [moved] = newIds.splice(fromI, 1)
+    newIds.splice(insertI, 0, moved)
     reorderSteps(newIds)
-    setDragId(null)
+    clearDrag()
   }
 
-  function handleDragEnd() { setDragId(null); setDragOverId(null) }
+  function handleDragEnd() { clearDrag() }
 
   function handleAdd() {
     addProgramStep({ type: 'wait', action: 'wait', label: 'Wait', duration_s: 1, detail: '' })
@@ -433,28 +470,36 @@ export default function ProgramEditor() {
             )
           }
 
-          const isActive = step.status === 'active'
-          const isDone   = step.status === 'done'
-          const isDragOver = dragOverId === step.id
+          const isActive   = step.status === 'active'
+          const isDone     = step.status === 'done'
+          const isDragging = dragId === step.id
+          // Only show the insertion indicator if a drag is in progress
+          // and we wouldn't be dropping onto ourselves.
+          const indicator  = (dragId !== null && dragOverId === step.id && dragId !== step.id)
+                              ? dragOverPos
+                              : null
 
           return (
-            <div key={step.id}
-              draggable={!isActive}
-              onDragStart={(e) => handleDragStart(e, step.id)}
-              onDragOver={(e) => handleDragOver(e, step.id)}
-              onDrop={(e) => handleDrop(e, step.id)}
-              onDragEnd={handleDragEnd}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 10,
-                padding: '8px 12px', marginBottom: 4, borderRadius: 6,
-                background: isDragOver ? '#dbeafe' : isActive ? '#f0f9ff' : '#fff',
-                border: isDragOver ? '2px dashed #2563EB'
-                  : isActive ? '1px solid #93c5fd'
-                  : '1px solid #e5e7eb',
-                cursor: isActive ? 'default' : 'grab',
-                opacity: dragId === step.id ? 0.4 : 1,
-                transition: 'background 100ms, border 100ms',
-              }}>
+            <div key={step.id}>
+              {indicator === 'before' && <InsertionBar />}
+
+              <div
+                draggable={!isActive}
+                onDragStart={(e) => handleDragStart(e, step.id)}
+                onDragOver={(e) => handleDragOver(e, step.id)}
+                onDrop={(e) => handleDrop(e, step.id)}
+                onDragEnd={handleDragEnd}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '8px 12px', marginBottom: 4, borderRadius: 6,
+                  background: isDragging ? '#f1f5f9' : isActive ? '#f0f9ff' : '#fff',
+                  border: isActive ? '1px solid #93c5fd' : '1px solid #e5e7eb',
+                  cursor: isActive ? 'default' : 'grab',
+                  opacity: isDragging ? 0.3 : 1,
+                  transform: isDragging ? 'scale(0.97)' : 'scale(1)',
+                  transformOrigin: 'left center',
+                  transition: 'opacity 150ms, transform 150ms, background 100ms, border 100ms',
+                }}>
               <div style={{ color: '#9ca3af', fontSize: 14, flexShrink: 0, userSelect: 'none', lineHeight: 1 }}>:::</div>
 
               <div style={{
@@ -504,6 +549,9 @@ export default function ProgramEditor() {
                          opacity: isActive ? 0.4 : 1 }}>
                 Del
               </button>
+              </div>
+
+              {indicator === 'after' && <InsertionBar />}
             </div>
           )
         })}
