@@ -1768,14 +1768,19 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/api/io/config")
     async def api_io_config_get():
+        """Return saved I/O config (operator-renamed labels). Always has a
+        'labels' key so the frontend can rely on data.labels."""
         path = '/opt/cobot/io_config.json'
         if os.path.isfile(path):
             try:
                 with open(path) as f:
-                    return json.load(f)
+                    data = json.load(f)
+                if isinstance(data, dict) and 'labels' not in data:
+                    data['labels'] = {}
+                return data
             except Exception:
                 pass
-        return {"config": "default"}
+        return {"labels": {}}
 
     @app.put("/api/io/config")
     async def api_io_config_put(request: Request):

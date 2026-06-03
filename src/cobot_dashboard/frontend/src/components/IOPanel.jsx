@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 
 const IO_CONFIG = {
   digital_inputs: [
@@ -49,7 +49,82 @@ const IO_CONFIG = {
   ],
 }
 
-function DigitalSignal({ signal, value, isOutput, onToggle }) {
+const SECTIONS = ['digital_inputs', 'digital_outputs', 'analog_inputs', 'analog_outputs']
+
+function EditableLabel({ value, onChange }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft]     = useState(value)
+  const inputRef = useRef(null)
+
+  useEffect(() => {
+    if (editing && inputRef.current) {
+      inputRef.current.focus()
+      inputRef.current.select()
+    }
+  }, [editing])
+
+  function commit() {
+    setEditing(false)
+    const trimmed = draft.trim()
+    if (trimmed && trimmed !== value) onChange(trimmed)
+    else setDraft(value)
+  }
+
+  function cancel() {
+    setEditing(false)
+    setDraft(value)
+  }
+
+  if (editing) {
+    return (
+      <input
+        ref={inputRef}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') commit()
+          else if (e.key === 'Escape') cancel()
+        }}
+        style={{
+          flex: 1, minWidth: 0,
+          padding: '2px 6px',
+          fontSize: 12,
+          background: 'var(--bg-panel)',
+          color: 'var(--text-primary)',
+          border: '1px solid var(--accent)',
+          borderRadius: 'var(--radius-sm, 4px)',
+          outline: 'none',
+        }}
+      />
+    )
+  }
+
+  return (
+    <span
+      onClick={() => { setDraft(value); setEditing(true) }}
+      title="Click to rename"
+      style={{
+        fontSize: 12,
+        color: 'var(--text-primary)',
+        flex: 1, minWidth: 0,
+        cursor: 'text',
+        padding: '2px 4px',
+        borderRadius: 'var(--radius-sm, 4px)',
+        borderBottom: '1px dashed transparent',
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+      }}
+      onMouseEnter={(e) => { e.currentTarget.style.borderBottomColor = 'var(--border)' }}
+      onMouseLeave={(e) => { e.currentTarget.style.borderBottomColor = 'transparent' }}
+    >
+      {value}
+    </span>
+  )
+}
+
+function DigitalSignal({ signal, value, isOutput, onToggle, onRename }) {
   const active = Boolean(value)
   return (
     <div style={{
@@ -68,16 +143,14 @@ function DigitalSignal({ signal, value, isOutput, onToggle }) {
       }} />
       <span style={{
         fontSize: 10, fontFamily: 'var(--font-mono, monospace)',
-        color: 'var(--text-muted)', minWidth: 32,
+        color: 'var(--text-muted)', minWidth: 32, flexShrink: 0,
       }}>
         {signal.pin}
       </span>
-      <span style={{ fontSize: 12, color: 'var(--text-primary)', flex: 1 }}>
-        {signal.label}
-      </span>
+      <EditableLabel value={signal.label} onChange={(v) => onRename(signal.id, v)} />
       <span style={{
         fontSize: 11, fontWeight: 600, minWidth: 30, textAlign: 'right',
-        color: active ? '#16A34A' : 'var(--text-muted)',
+        color: active ? '#16A34A' : 'var(--text-muted)', flexShrink: 0,
       }}>
         {active ? 'ON' : 'OFF'}
       </span>
@@ -104,7 +177,7 @@ function DigitalSignal({ signal, value, isOutput, onToggle }) {
   )
 }
 
-function AnalogSignal({ signal, value, isOutput, onChange }) {
+function AnalogSignal({ signal, value, isOutput, onChange, onRename }) {
   const range = signal.max - signal.min || 1
   const pct   = ((value - signal.min) / range) * 100
   return (
@@ -118,14 +191,14 @@ function AnalogSignal({ signal, value, isOutput, onChange }) {
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
         <span style={{
           fontSize: 10, fontFamily: 'var(--font-mono, monospace)',
-          color: 'var(--text-muted)', minWidth: 32,
+          color: 'var(--text-muted)', minWidth: 32, flexShrink: 0,
         }}>
           {signal.pin}
         </span>
-        <span style={{ fontSize: 12, color: 'var(--text-primary)', flex: 1 }}>{signal.label}</span>
+        <EditableLabel value={signal.label} onChange={(v) => onRename(signal.id, v)} />
         <span style={{
           fontSize: 13, fontWeight: 700, fontVariantNumeric: 'tabular-nums',
-          color: 'var(--accent)', minWidth: 70, textAlign: 'right',
+          color: 'var(--accent)', minWidth: 70, textAlign: 'right', flexShrink: 0,
         }}>
           {Number(value).toFixed(1)} {signal.unit}
         </span>
@@ -168,9 +241,51 @@ function GroupHeader({ color, label, count }) {
   )
 }
 
+// Apply a saved {id -> label} map onto a fresh copy of IO_CONFIG.
+function applyLabelsToConfig(labels) {
+  const out = {}
+  for (const section of SECTIONS) {
+    out[section] = IO_CONFIG[section].map((sig) => ({
+      ...sig,
+      label: (labels && labels[sig.id]) ? labels[sig.id] : sig.label,
+    }))
+  }
+  return out
+}
+
+// Build a full {id -> label} map from the current config plus a single
+// in-flight override — used as the PUT payload so a save preserves
+// every previously-renamed label (and tolerates rapid renames).
+function buildLabelsPayload(config, overrideId, overrideLabel) {
+  const labels = {}
+  for (const section of SECTIONS) {
+    for (const sig of config[section]) {
+      labels[sig.id] = (sig.id === overrideId) ? overrideLabel : sig.label
+    }
+  }
+  return labels
+}
+
 export default function IOPanel() {
   const [ioState, setIoState] = useState({})
+  const [config, setConfig]   = useState(IO_CONFIG)
 
+  // Load saved labels on mount (defaults stay if none saved).
+  useEffect(() => {
+    let alive = true
+    fetch('/api/io/config')
+      .then((r) => r.json())
+      .then((data) => {
+        if (!alive) return
+        if (data && data.labels && Object.keys(data.labels).length > 0) {
+          setConfig(applyLabelsToConfig(data.labels))
+        }
+      })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [])
+
+  // Poll I/O values at 4 Hz.
   useEffect(() => {
     let alive = true
     const poll = async () => {
@@ -179,7 +294,7 @@ export default function IOPanel() {
         if (!res.ok) return
         const data = await res.json()
         if (alive && data && data.io) setIoState(data.io)
-      } catch { /* swallow — next tick will retry */ }
+      } catch { /* swallow — next tick retries */ }
     }
     poll()
     const interval = setInterval(poll, 250)
@@ -195,7 +310,7 @@ export default function IOPanel() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id, value }),
       })
-    } catch { /* poll will resync */ }
+    } catch {}
   }
 
   async function setAnalog(id, value) {
@@ -206,15 +321,54 @@ export default function IOPanel() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id, value }),
       })
-    } catch { /* poll will resync */ }
+    } catch {}
+  }
+
+  async function handleRename(signalId, newLabel) {
+    const labels = buildLabelsPayload(config, signalId, newLabel)
+    setConfig(applyLabelsToConfig(labels))
+    try {
+      await fetch('/api/io/config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ labels }),
+      })
+    } catch {}
+  }
+
+  async function handleResetLabels() {
+    if (!confirm('Reset all I/O labels to defaults?')) return
+    setConfig(IO_CONFIG)
+    try {
+      await fetch('/api/io/config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ labels: {} }),
+      })
+    } catch {}
   }
 
   return (
     <div style={{ height: '100%', overflowY: 'auto', padding: 16, background: '#08090c' }}>
-      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16, gap: 12 }}>
         <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-primary)', flex: 1 }}>
           I/O Configuration
         </div>
+        <button
+          onClick={handleResetLabels}
+          title="Reset all labels to factory defaults"
+          style={{
+            padding: '4px 12px',
+            fontSize: 11,
+            background: 'var(--bg-surface)',
+            color: 'var(--text-muted)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius-sm, 4px)',
+            cursor: 'pointer',
+          }}
+        >
+          Reset Labels
+        </button>
         <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
           Estun S10-140 Controller
         </div>
@@ -222,51 +376,55 @@ export default function IOPanel() {
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
         <div>
-          <GroupHeader color="#3B82F6" label="Digital Inputs" count={IO_CONFIG.digital_inputs.length} />
-          {IO_CONFIG.digital_inputs.map((sig) => (
+          <GroupHeader color="#3B82F6" label="Digital Inputs" count={config.digital_inputs.length} />
+          {config.digital_inputs.map((sig) => (
             <DigitalSignal
               key={sig.id}
               signal={sig}
               value={ioState[sig.id] || 0}
               isOutput={false}
+              onRename={handleRename}
             />
           ))}
         </div>
 
         <div>
-          <GroupHeader color="#16A34A" label="Digital Outputs" count={IO_CONFIG.digital_outputs.length} />
-          {IO_CONFIG.digital_outputs.map((sig) => (
+          <GroupHeader color="#16A34A" label="Digital Outputs" count={config.digital_outputs.length} />
+          {config.digital_outputs.map((sig) => (
             <DigitalSignal
               key={sig.id}
               signal={sig}
               value={ioState[sig.id] || 0}
               isOutput={true}
               onToggle={toggleDigital}
+              onRename={handleRename}
             />
           ))}
         </div>
 
         <div>
-          <GroupHeader color="#CA8A04" label="Analog Inputs" count={IO_CONFIG.analog_inputs.length} />
-          {IO_CONFIG.analog_inputs.map((sig) => (
+          <GroupHeader color="#CA8A04" label="Analog Inputs" count={config.analog_inputs.length} />
+          {config.analog_inputs.map((sig) => (
             <AnalogSignal
               key={sig.id}
               signal={sig}
               value={Number(ioState[sig.id]) || 0}
               isOutput={false}
+              onRename={handleRename}
             />
           ))}
         </div>
 
         <div>
-          <GroupHeader color="#9333EA" label="Analog Outputs" count={IO_CONFIG.analog_outputs.length} />
-          {IO_CONFIG.analog_outputs.map((sig) => (
+          <GroupHeader color="#9333EA" label="Analog Outputs" count={config.analog_outputs.length} />
+          {config.analog_outputs.map((sig) => (
             <AnalogSignal
               key={sig.id}
               signal={sig}
               value={Number(ioState[sig.id]) || 0}
               isOutput={true}
               onChange={setAnalog}
+              onRename={handleRename}
             />
           ))}
         </div>
