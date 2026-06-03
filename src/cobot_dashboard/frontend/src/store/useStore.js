@@ -301,6 +301,22 @@ const storeDefinition = (set, get) => ({
   loadedProgram: null,
   setLoadedProgram(prog) { set({ loadedProgram: prog }) },
 
+  // The editor's authoritative state — survives ProgramEditor unmount
+  // so switching tabs and coming back preserves the program identity,
+  // steps, and unsaved flag. Step mutations update this slice locally;
+  // Save and Load mirror it to STATE.program via setProgramSteps so the
+  // task runner (which reads STATE) stays in sync with the last saved
+  // version of the program.
+  currentProgram: {
+    id: null,
+    name: 'Untitled Program',
+    steps: [],
+    unsaved: false,
+  },
+  setCurrentProgram(patch) {
+    set((s) => ({ currentProgram: { ...s.currentProgram, ...patch } }))
+  },
+
   // ---------------------------------------------------------------------------
   // Jog enable/disable
   // ---------------------------------------------------------------------------

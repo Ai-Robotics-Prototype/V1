@@ -297,23 +297,6 @@ function VoiceBar() {
   )
 }
 
-// Fingerprint excludes runtime-owned fields (id, status, step) so the
-// editor doesn't go "unsaved" just because step 1 transitioned from
-// pending → active. Keys are sorted for stable comparison.
-function programSig(name, steps) {
-  return JSON.stringify({
-    name: String(name || '').trim(),
-    steps: (steps || []).map((s) => {
-      const out = {}
-      for (const k of Object.keys(s).sort()) {
-        if (k === 'id' || k === 'status' || k === 'step') continue
-        out[k] = s[k]
-      }
-      return out
-    }),
-  })
-}
-
 function InsertionBar() {
   return (
     <div
@@ -397,66 +380,85 @@ function EditableStepLabel({ value, onSave }) {
   )
 }
 
+// Renumber step ids 1..N. Called after every local mutation so the
+// drag/select handlers (which key off step.id) always have unique,
+// stable ids.
+function renumber(arr) {
+  return arr.map((s, i) => ({ ...s, id: i + 1 }))
+}
+
 export default function ProgramEditor() {
-  const steps              = useStore((s) => s.program.steps ?? [])
-  const addProgramStep     = useStore((s) => s.addProgramStep)
-  const removeProgramStep  = useStore((s) => s.removeProgramStep)
-  const reorderSteps       = useStore((s) => s.reorderSteps)
-  const updateProgramStep  = useStore((s) => s.updateProgramStep)
+  const currentProgram     = useStore((s) => s.currentProgram)
+  const setCurrentProgram  = useStore((s) => s.setCurrentProgram)
+  // setProgramSteps mirrors the editor's current steps to STATE.program
+  // on Save / Load so the task runner (Run button) sees the same
+  // program the editor displays. Edits between saves stay local.
   const setProgramSteps    = useStore((s) => s.setProgramSteps)
   const loadedProgram      = useStore((s) => s.loadedProgram)
   const setLoadedProgram   = useStore((s) => s.setLoadedProgram)
-  // Execution highlight is only valid while a task is actually running
-  // or paused. Outside of that the editor is an edit-mode view; no
-  // step should look "done" or "active" just because step.status from
-  // the backend hasn't been reset since the last run.
+  // For execution highlights we still need to know what the task
+  // runner thinks is the active step. status comes from STATE.program
+  // (the saved version that's actually running); we match by index so
+  // an unsaved edit doesn't desync the highlight when running matches
+  // the last save.
+  const runningSteps       = useStore((s) => s.program.steps ?? [])
   const taskRunning        = useStore((s) => Boolean(s.task?.running || s.task?.paused))
 
-  const [showWizard, setShowWizard]   = useState(false)
-  const [editingId, setEditingId]     = useState(null)
-  const [selectedId, setSelectedId]   = useState(null)
-  const [dragId, setDragId]           = useState(null)
-  const [dragOverId, setDragOverId]   = useState(null)
+  // Editor identity / steps / unsaved all live in the store now so a
+  // tab swap unmount-and-remount doesn't reset them.
+  const programId   = currentProgram.id
+  const programName = currentProgram.name
+  const steps       = currentProgram.steps || []
+  const unsaved     = currentProgram.unsaved
 
-  // Program identity + save state
-  const [programId, setProgramId]         = useState(null)
-  const [programName, setProgramName]     = useState('Untitled Program')
-  const [lastSavedSig, setLastSavedSig]   = useState('')
-  const [saveStatus, setSaveStatus]       = useState(null) // 'saving' | 'saved' | 'error' | null
+  // Setters that wrap the store action with the right patch shape.
+  const setProgramName = (name) => setCurrentProgram({ name, unsaved: true })
+  const updateSteps    = (next) => setCurrentProgram({ steps: next, unsaved: true })
+
+  // Transient UI state (selection / drag / wizard / load-menu / save
+  // status) is fine to keep local — losing it on tab switch is the
+  // expected behaviour, file-manager style.
+  const [showWizard, setShowWizard]       = useState(false)
+  const [editingId, setEditingId]         = useState(null)
+  const [selectedId, setSelectedId]       = useState(null)
+  const [dragId, setDragId]               = useState(null)
+  const [dragOverId, setDragOverId]       = useState(null)
+  const [dragOverPos, setDragOverPos]     = useState(null)
+  const [saveStatus, setSaveStatus]       = useState(null)
   const [showLoadMenu, setShowLoadMenu]   = useState(false)
   const [savedPrograms, setSavedPrograms] = useState([])
 
-  const currentSig = programSig(programName, steps)
-  // Brand-new editor (no associated file) is always considered unsaved;
-  // an associated program is unsaved only when its current fingerprint
-  // differs from the last successful save.
-  const unsaved = programId == null || currentSig !== lastSavedSig
-
-  // ProgramLibrary writes a saved program into the store and the user
-  // is switched to this tab. Consume it once, populate identity + steps,
-  // then clear so a re-mount or future tab swap doesn't reload it.
+  // ProgramLibrary writes a saved program into the store and switches
+  // to this tab. Consume it once, populate currentProgram, mirror to
+  // STATE.program so Run sees it, then clear the slot.
   useEffect(() => {
-    if (!loadedProgram) return
-    const prog = loadedProgram
-    console.log('[ProgramEditor] consuming loadedProgram', { id: prog?.id, name: prog?.name, steps: prog?.steps?.length })
-    if (Array.isArray(prog.steps)) setProgramSteps(prog.steps)
-    if (prog.id)   setProgramId(prog.id)
-    if (prog.name) setProgramName(prog.name)
-    setLastSavedSig(programSig(prog.name || 'Untitled Program', prog.steps || []))
+    if (!loadedProgram || !loadedProgram.id) return
+    console.log('[ProgramEditor] consuming loadedProgram',
+      { id: loadedProgram.id, name: loadedProgram.name, steps: loadedProgram.steps?.length })
+    const steps = Array.isArray(loadedProgram.steps) ? loadedProgram.steps : []
+    setCurrentProgram({
+      id:     loadedProgram.id,
+      name:   loadedProgram.name || 'Untitled Program',
+      steps:  steps,
+      unsaved: false,
+    })
+    setProgramSteps(steps)
     setLoadedProgram(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadedProgram])
-  // 'before' | 'after' — which side of the hovered row the cursor is on,
-  // computed from the row's bounding rect so the blue insertion bar
-  // tracks the actual landing spot, not just which row we're over.
-  const [dragOverPos, setDragOverPos] = useState(null)
 
-  // Resolve the "current step" pointer from real task state. The first
-  // active step is the playhead; everything before it is done. When no
-  // task is running, suppress both so the editor doesn't show stale
-  // status from a previous run.
-  const activeIdx = taskRunning ? steps.findIndex((s) => s.status === 'active') : -1
-  const doneCount = taskRunning ? steps.filter((s) => s.status === 'done').length : 0
+  // Execution highlight: when a task is running, map step ids to the
+  // backend's status by index (the saved program is what's running, so
+  // index alignment is correct as long as the editor matches the last
+  // save). If editor has unsaved edits, indices may diverge — the
+  // unsaved indicator already warns the operator.
+  function statusOf(idx) {
+    if (!taskRunning) return null
+    return runningSteps[idx]?.status ?? null
+  }
+  const doneCount = taskRunning
+    ? Math.min(steps.length, runningSteps.filter((s) => s.status === 'done').length)
+    : 0
 
   function handleDragStart(e, id) {
     setDragId(id)
@@ -487,24 +489,36 @@ export default function ProgramEditor() {
     const fromI = ids.indexOf(dragId)
     const toI   = ids.indexOf(targetId)
     if (fromI < 0 || toI < 0) { clearDrag(); return }
-    // Compute the *post-removal* insertion index. The 'after' side of
-    // the target means we want to land after it (toI + 1); if we're
-    // removing from a position before that, the splice shifts indices
-    // down by one, so adjust.
+    // Compute the *post-removal* insertion index. 'after' lands after
+    // the target (toI + 1); if we're removing from a position before
+    // that, the splice shifts indices down by one.
     let insertI = dragOverPos === 'after' ? toI + 1 : toI
     if (fromI < insertI) insertI -= 1
     if (fromI === insertI) { clearDrag(); return }
-    const newIds = [...ids]
-    const [moved] = newIds.splice(fromI, 1)
-    newIds.splice(insertI, 0, moved)
-    reorderSteps(newIds)
+    const next = [...steps]
+    const [moved] = next.splice(fromI, 1)
+    next.splice(insertI, 0, moved)
+    updateSteps(renumber(next))
     clearDrag()
   }
 
   function handleDragEnd() { clearDrag() }
 
   function handleAdd() {
-    addProgramStep({ type: 'wait', action: 'wait', label: 'Wait', duration_s: 1, detail: '' })
+    const newStep = { type: 'wait', action: 'wait', label: 'Wait', duration_s: 1, detail: '' }
+    updateSteps(renumber([...steps, newStep]))
+  }
+
+  function handleDelete(id) {
+    updateSteps(renumber(steps.filter((s) => s.id !== id)))
+  }
+
+  function handleRename(id, newLabel) {
+    updateSteps(renumber(steps.map((s) => s.id === id ? { ...s, label: newLabel } : s)))
+  }
+
+  function handleEditSave(id, patch) {
+    updateSteps(renumber(steps.map((s) => s.id === id ? { ...s, ...patch } : s)))
   }
 
   async function handleSave() {
@@ -520,8 +534,10 @@ export default function ProgramEditor() {
       )
       const data = await res.json().catch(() => ({}))
       if (res.ok && data && data.ok && data.program) {
-        if (!programId) setProgramId(data.program.id)
-        setLastSavedSig(programSig(data.program.name || name, data.program.steps || steps))
+        setCurrentProgram({ id: data.program.id, name: data.program.name || name, unsaved: false })
+        // Mirror to backend STATE so the task runner sees the just-
+        // saved program when the user clicks Run.
+        setProgramSteps(steps)
         setSaveStatus('saved')
         setTimeout(() => setSaveStatus(null), 2000)
       } else {
@@ -551,10 +567,13 @@ export default function ProgramEditor() {
       if (!res.ok) return
       const prog = await res.json()
       if (prog && Array.isArray(prog.steps)) {
+        setCurrentProgram({
+          id:      prog.id || id,
+          name:    prog.name || 'Untitled Program',
+          steps:   prog.steps,
+          unsaved: false,
+        })
         setProgramSteps(prog.steps)
-        setProgramId(prog.id || id)
-        setProgramName(prog.name || 'Untitled Program')
-        setLastSavedSig(programSig(prog.name || 'Untitled Program', prog.steps))
       }
     } catch { /* swallow */ }
     setShowLoadMenu(false)
@@ -685,14 +704,15 @@ export default function ProgramEditor() {
           if (editingId === step.id) {
             return (
               <StepEditor key={step.id} step={step}
-                onSave={(patch) => updateProgramStep(step.id, patch)}
+                onSave={(patch) => handleEditSave(step.id, patch)}
                 onClose={() => setEditingId(null)}
               />
             )
           }
 
-          const isActive   = taskRunning && step.status === 'active'
-          const isDone     = taskRunning && step.status === 'done'
+          const runStatus  = statusOf(idx)
+          const isActive   = runStatus === 'active'
+          const isDone     = runStatus === 'done'
           const isSelected = selectedId === step.id
           const isDragging = dragId === step.id
           // Only show the insertion indicator if a drag is in progress
@@ -754,7 +774,7 @@ export default function ProgramEditor() {
               <div style={{ flex: 1, minWidth: 0 }}>
                 <EditableStepLabel
                   value={step.label || def.label}
-                  onSave={(newLabel) => updateProgramStep(step.id, { label: newLabel })}
+                  onSave={(newLabel) => handleRename(step.id, newLabel)}
                 />
                 <div style={{ fontSize: 10, color: '#6b7280',
                               overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
@@ -770,7 +790,7 @@ export default function ProgramEditor() {
                          cursor: 'pointer', flexShrink: 0 }}>
                 Edit
               </button>
-              <button onClick={(e) => { e.stopPropagation(); if (!isActive) removeProgramStep(step.id) }}
+              <button onClick={(e) => { e.stopPropagation(); if (!isActive) handleDelete(step.id) }}
                 disabled={isActive}
                 title={isActive ? 'Cannot delete the active step' : 'Delete step'}
                 style={{ padding: '3px 8px', fontSize: 10,
@@ -803,10 +823,13 @@ export default function ProgramEditor() {
           onClose={() => setShowWizard(false)}
           onSaved={(program) => {
             if (program) {
-              if (program.steps?.length) setProgramSteps(program.steps)
-              if (program.id)            setProgramId(program.id)
-              if (program.name)          setProgramName(program.name)
-              setLastSavedSig(programSig(program.name || 'Untitled Program', program.steps || []))
+              setCurrentProgram({
+                id:      program.id,
+                name:    program.name || 'Untitled Program',
+                steps:   program.steps || [],
+                unsaved: false,
+              })
+              setProgramSteps(program.steps || [])
             }
             setShowWizard(false)
           }}
