@@ -85,8 +85,9 @@ export default function TopBar() {
       </nav>
 
       {/* Right: WS status + E-STOP */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-        {/* WS indicator */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
+        {/* WS indicator — fixed width so the centred tabs never shift
+            when the status text or latency digit-count changes. */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, color: 'var(--text-secondary)' }}>
           <span style={{
             width: 7,
@@ -95,21 +96,27 @@ export default function TopBar() {
             background: WS_DOT[wsStatus] ?? '#9A9A9E',
             display: 'inline-block',
             boxShadow: wsStatus === 'connected' ? `0 0 4px ${WS_DOT.connected}` : 'none',
+            flexShrink: 0,
           }} />
-          {wsStatus === 'connected' ? 'Connected' : wsStatus === 'connecting' ? 'Connecting…' : 'Offline'}
+          <span style={{ display: 'inline-block', minWidth: 72, textAlign: 'left' }}>
+            {wsStatus === 'connected' ? 'Connected' : wsStatus === 'connecting' ? 'Connecting…' : 'Offline'}
+          </span>
         </div>
 
-        {/* Latency */}
-        {wsStatus === 'connected' && (
-          <span style={{
-            fontSize: 11,
-            fontFamily: 'var(--font-mono)',
-            color: 'var(--text-muted)',
-            fontVariantNumeric: 'tabular-nums',
-          }}>
-            {wsLatency} ms
-          </span>
-        )}
+        {/* Latency — always rendered (visibility-hidden when disconnected)
+            so its width is reserved and the tabs don't reflow. */}
+        <span style={{
+          fontSize: 11,
+          fontFamily: 'var(--font-mono)',
+          color: 'var(--text-muted)',
+          fontVariantNumeric: 'tabular-nums',
+          display: 'inline-block',
+          minWidth: 52,
+          textAlign: 'right',
+          visibility: wsStatus === 'connected' ? 'visible' : 'hidden',
+        }}>
+          {wsLatency} ms
+        </span>
 
         {/* E-STOP button / inline confirm */}
         {confirming ? (
