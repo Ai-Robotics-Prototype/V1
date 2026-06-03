@@ -1403,6 +1403,28 @@ if FASTAPI_AVAILABLE:
             STATE["program"]["steps"] = reordered
             return {"ok": True, "program": copy.deepcopy(STATE["program"])}
 
+    @app.post("/cmd/program/update")
+    async def cmd_program_update(request: Request):
+        """Merge a patch into a single step. Body: {id, patch: {...}}.
+        Refuses to touch the 'id' or 'status' fields — those are owned by
+        the runtime, not the editor."""
+        body = await request.json()
+        try:
+            step_id = int(body.get("id", -1))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "invalid id"}, status_code=400)
+        patch = body.get("patch") or {}
+        if not isinstance(patch, dict):
+            return JSONResponse({"error": "patch must be an object"}, status_code=400)
+        patch.pop("id", None)
+        patch.pop("status", None)
+        with _state_lock:
+            target = next((s for s in STATE["program"]["steps"] if s["id"] == step_id), None)
+            if target is None:
+                return JSONResponse({"error": f"Step {step_id} not found"}, status_code=404)
+            target.update(patch)
+            return {"ok": True, "program": copy.deepcopy(STATE["program"])}
+
     # ------------------------------------------------------------------
     # Info endpoints
     # ------------------------------------------------------------------

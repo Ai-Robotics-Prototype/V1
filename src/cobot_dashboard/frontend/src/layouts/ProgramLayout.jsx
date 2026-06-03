@@ -1,6 +1,6 @@
 import { useRef } from 'react'
 import { useStore } from '../store/useStore'
-import ProgramPanel from '../components/ProgramPanel'
+import ProgramEditor from '../components/ProgramEditor'
 import ArmViewer3D from '../components/ArmViewer3D'
 
 function JointReadout() {
@@ -124,7 +124,7 @@ export default function ProgramLayout() {
     <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
       {/* Left: Program panel — larger */}
       <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-        <ProgramPanel />
+        <ProgramEditor />
       </div>
 
       {/* Right sidebar: 3D arm + readout + controls */}
