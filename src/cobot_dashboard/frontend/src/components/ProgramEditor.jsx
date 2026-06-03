@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { useStore } from '../store/useStore'
+import ProgramWizard from './ProgramWizard'
 
 // The richer action taxonomy lives in the editor. Each action carries
 // a coarse `type` (matching the existing backend schema: move/gripper/
@@ -373,7 +374,9 @@ export default function ProgramEditor() {
   const removeProgramStep  = useStore((s) => s.removeProgramStep)
   const reorderSteps       = useStore((s) => s.reorderSteps)
   const updateProgramStep  = useStore((s) => s.updateProgramStep)
+  const setProgramSteps    = useStore((s) => s.setProgramSteps)
 
+  const [showWizard, setShowWizard]   = useState(false)
   const [editingId, setEditingId]     = useState(null)
   const [dragId, setDragId]           = useState(null)
   const [dragOverId, setDragOverId]   = useState(null)
@@ -438,9 +441,17 @@ export default function ProgramEditor() {
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#fff' }}>
-      <div style={{ padding: '12px 16px', borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center' }}>
+      <div style={{ padding: '12px 16px', borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', gap: 12 }}>
         <span style={{ fontSize: 14, fontWeight: 700, color: '#111', flex: 1 }}>Program</span>
         <span style={{ fontSize: 11, color: '#6b7280' }}>{steps.length} step{steps.length === 1 ? '' : 's'}</span>
+        <button onClick={() => setShowWizard(true)}
+          style={{
+            padding: '6px 12px', fontSize: 12, fontWeight: 600,
+            background: '#2563EB', color: '#fff', border: 'none',
+            borderRadius: 6, cursor: 'pointer',
+          }}>
+          + New Program Wizard
+        </button>
       </div>
 
       <div style={{ padding: '8px 16px', borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -566,6 +577,16 @@ export default function ProgramEditor() {
       </div>
 
       <VoiceBar />
+
+      {showWizard && (
+        <ProgramWizard
+          onClose={() => setShowWizard(false)}
+          onSaved={(program) => {
+            if (program?.steps?.length) setProgramSteps(program.steps)
+            setShowWizard(false)
+          }}
+        />
+      )}
     </div>
   )
 }

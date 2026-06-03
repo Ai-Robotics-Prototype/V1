@@ -1403,6 +1403,35 @@ if FASTAPI_AVAILABLE:
             STATE["program"]["steps"] = reordered
             return {"ok": True, "program": copy.deepcopy(STATE["program"])}
 
+    @app.post("/cmd/program/set")
+    async def cmd_program_set(request: Request):
+        """Replace the entire active program. Used by the wizard's
+        "Save & Load" flow — the wizard generates a step list and we
+        swap it in wholesale, assigning fresh sequential ids."""
+        body = await request.json()
+        in_steps = body.get("steps") or []
+        if not isinstance(in_steps, list):
+            return JSONResponse({"error": "steps must be a list"}, status_code=400)
+        normalized = []
+        for i, s in enumerate(in_steps, start=1):
+            if not isinstance(s, dict):
+                continue
+            t = s.get("type") or "move"
+            normalized.append({
+                "id":     i,
+                "type":   t,
+                "label":  s.get("label") or s.get("action") or t,
+                "detail": s.get("detail", ""),
+                "status": "pending",
+                # Carry through any extra wizard-emitted fields so the
+                # editor can read them (action, position, joints, ...).
+                **{k: v for k, v in s.items()
+                   if k not in {"id", "type", "label", "detail", "status"}},
+            })
+        with _state_lock:
+            STATE["program"]["steps"] = normalized
+            return {"ok": True, "program": copy.deepcopy(STATE["program"])}
+
     @app.post("/cmd/program/update")
     async def cmd_program_update(request: Request):
         """Merge a patch into a single step. Body: {id, patch: {...}}.
@@ -1742,6 +1771,48 @@ if FASTAPI_AVAILABLE:
         except Exception:
             pass
         return {"programs": programs}
+
+    @app.post("/api/programs")
+    async def api_programs_save(request: Request):
+        """Persist a wizard-generated program to /opt/cobot/programs as a
+        JSON file. Slug is derived from the name; collisions get a -2,
+        -3, ... suffix so we never silently overwrite."""
+        import re as _re
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        name = str(body.get("name") or "").strip()
+        if not name:
+            return JSONResponse({"error": "name required"}, status_code=400)
+        steps = body.get("steps") or []
+        if not isinstance(steps, list):
+            return JSONResponse({"error": "steps must be a list"}, status_code=400)
+        base = _re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or 'program'
+        prog_dir = '/opt/cobot/programs'
+        try:
+            os.makedirs(prog_dir, exist_ok=True)
+        except Exception as e:
+            return JSONResponse({"error": f"cannot create {prog_dir}: {e}"}, status_code=500)
+        slug = base
+        n = 2
+        while os.path.exists(os.path.join(prog_dir, slug + '.json')):
+            slug = f"{base}_{n}"
+            n += 1
+        program = {
+            "id":          slug,
+            "name":        name,
+            "description": str(body.get("description") or ""),
+            "tags":        list(body.get("tags") or []),
+            "config":      body.get("config") or {},
+            "steps":       steps,
+        }
+        try:
+            with open(os.path.join(prog_dir, slug + '.json'), 'w') as f:
+                json.dump(program, f, indent=2)
+        except Exception as e:
+            return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
+        return {"ok": True, "program": program}
 
     # ------------------------------------------------------------------
     # I/O state (Estun S10-140 digital/analog inputs and outputs).

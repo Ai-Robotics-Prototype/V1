@@ -291,6 +291,10 @@ const storeDefinition = (set, get) => ({
     return get().sendCommand('program/update', { id, patch })
   },
 
+  setProgramSteps(steps) {
+    return get().sendCommand('program/set', { steps })
+  },
+
   // ---------------------------------------------------------------------------
   // Jog enable/disable
   // ---------------------------------------------------------------------------
