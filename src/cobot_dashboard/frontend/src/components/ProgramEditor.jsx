@@ -33,7 +33,20 @@ const TEACHABLE_ACTIONS = [
   'move_home', 'move_joint', 'move_linear',
   'approach',  'pick',       'place',
 ]
-function isTeachable(step) { return step && TEACHABLE_ACTIONS.includes(step.action) }
+function isTeachable(step) {
+  if (!step) return false
+  // Prefer the explicit action when set (wizard-emitted or PUT'd via
+  // /api/programs). Fall back to deriving an action from the legacy
+  // 'type' field (default STATE.program.steps used 'type' only) — but
+  // only if 'type' actually matches an ACTION_TYPES entry, so we
+  // don't trip a default fallback into "always teachable".
+  if (step.action) return TEACHABLE_ACTIONS.includes(step.action)
+  if (step.type) {
+    const match = ACTION_TYPES.find((a) => a.type === step.type)
+    if (match) return TEACHABLE_ACTIONS.includes(match.value)
+  }
+  return false
+}
 
 // /api/state returns joints.positions in radians; the step model
 // stores degrees so it round-trips through the editor / JSON files

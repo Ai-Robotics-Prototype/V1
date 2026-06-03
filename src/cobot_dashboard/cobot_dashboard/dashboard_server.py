@@ -80,13 +80,15 @@ STATE = {
         # All steps start 'pending' — task.run resets them then marks
         # step 0 'active'; task.cancel / completion resets back. No
         # baked-in 'done'/'active' so the editor doesn't paint an
-        # execution highlight when nothing's running.
+        # execution highlight when nothing's running. Each step carries
+        # both 'type' (legacy schema) and 'action' (richer wizard
+        # schema) so the editor's teach-gate works on the defaults.
         "steps": [
-            {"id": 1, "type": "home",    "label": "Move to home",    "detail": "J: [0,−90,0,−90,0,0]°",     "status": "pending"},
-            {"id": 2, "type": "gripper", "label": "Open gripper",    "detail": "Width: 85 mm · Speed: 80%", "status": "pending"},
-            {"id": 3, "type": "move",    "label": "Approach object", "detail": "Target: auto · +150 mm Z",  "status": "pending"},
-            {"id": 4, "type": "gripper", "label": "Pick & close",    "detail": "Descend 130 mm · close",    "status": "pending"},
-            {"id": 5, "type": "move",    "label": "Place at target", "detail": "X: 0.30 Y: −0.20 Z: 0.40", "status": "pending"},
+            {"id": 1, "type": "home",    "action": "move_home",    "label": "Move to home",    "detail": "J: [0,−90,0,−90,0,0]°",     "status": "pending"},
+            {"id": 2, "type": "gripper", "action": "open_gripper", "label": "Open gripper",    "detail": "Width: 85 mm · Speed: 80%", "status": "pending"},
+            {"id": 3, "type": "move",    "action": "approach",     "label": "Approach object", "detail": "Target: auto · +150 mm Z",  "status": "pending"},
+            {"id": 4, "type": "gripper", "action": "pick",         "label": "Pick & close",    "detail": "Descend 130 mm · close",    "status": "pending"},
+            {"id": 5, "type": "move",    "action": "place",        "label": "Place at target", "detail": "X: 0.30 Y: −0.20 Z: 0.40", "status": "pending"},
         ]
     },
     # LLM-generated pick/place program (populated by auto_program_node)
