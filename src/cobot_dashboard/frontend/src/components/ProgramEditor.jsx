@@ -26,10 +26,16 @@ const TAG_COLORS = {
   PLACE: '#0891b2', WAIT: '#6b7280', DETECT: '#8b5cf6', LOOP: '#ec4899', IO: '#f97316',
 }
 
-// Actions that move the robot — these require a taught position
-// before the program can be safely run.
-const MOVE_ACTIONS = ['move_home', 'move_joint', 'move_linear', 'approach', 'pick', 'place']
-function isMoveStep(step) { return step && MOVE_ACTIONS.includes(step.action) }
+// Actions that happen at a specific robot pose — every one of these
+// can have its position taught. Gripper open/close are included
+// because they always occur at a particular location (the pose at
+// which the gripper actuates is part of the program).
+const TEACHABLE_ACTIONS = [
+  'move_home', 'move_joint', 'move_linear',
+  'approach',  'pick',       'place',
+  'open_gripper', 'close_gripper',
+]
+function isTeachable(step) { return step && TEACHABLE_ACTIONS.includes(step.action) }
 
 // /api/state returns joints.positions in radians; the step model
 // stores degrees so it round-trips through the editor / JSON files
@@ -534,12 +540,10 @@ export default function ProgramEditor() {
   const programName = currentProgram.name
   const steps       = currentProgram.steps || []
   const unsaved     = currentProgram.unsaved
-  // Untaught move steps the operator still needs to teach before the
-  // path is ready to run. move_home is excluded — it has a fixed
-  // factory pose, no recording needed.
-  const untaughtCount = steps.filter((s) =>
-    isMoveStep(s) && s.action !== 'move_home' && !s.taught,
-  ).length
+  // Untaught steps the operator still needs to teach before the path
+  // is ready to run. Includes gripper open/close and the home pose —
+  // they all happen at a specific robot location.
+  const untaughtCount = steps.filter((s) => isTeachable(s) && !s.taught).length
   const allTaughtForRun = untaughtCount === 0
 
   // Setters that wrap the store action with the right patch shape.
@@ -708,7 +712,7 @@ export default function ProgramEditor() {
     updateSteps(renumber(newSteps))
     let nextIdx = -1
     for (let i = teachingAllIdx + 1; i < newSteps.length; i++) {
-      if (isMoveStep(newSteps[i]) && !newSteps[i].taught) { nextIdx = i; break }
+      if (isTeachable(newSteps[i]) && !newSteps[i].taught) { nextIdx = i; break }
     }
     setTeachingAllIdx(nextIdx)
   }
@@ -716,13 +720,13 @@ export default function ProgramEditor() {
   function teachAllSkip() {
     let nextIdx = -1
     for (let i = teachingAllIdx + 1; i < steps.length; i++) {
-      if (isMoveStep(steps[i]) && !steps[i].taught) { nextIdx = i; break }
+      if (isTeachable(steps[i]) && !steps[i].taught) { nextIdx = i; break }
     }
     setTeachingAllIdx(nextIdx)
   }
 
   function startTeachAll() {
-    const firstIdx = steps.findIndex((s) => isMoveStep(s) && !s.taught)
+    const firstIdx = steps.findIndex((s) => isTeachable(s) && !s.taught)
     setTeachingAllIdx(firstIdx)
   }
 
@@ -1044,7 +1048,7 @@ export default function ProgramEditor() {
                 {isDone ? '✓' : (idx + 1)}
               </div>
 
-              {isMoveStep(step) && step.action !== 'move_home' && (
+              {isTeachable(step) &&(
                 <div title={step.taught ? `Taught at ${step.taught_at || 'unknown'}` : 'Position not taught — click Teach'}
                   style={{
                     width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
@@ -1076,7 +1080,7 @@ export default function ProgramEditor() {
                               padding: '0 4px' }}>
                   {detailLine(step, ioLabels)}
                 </div>
-                {isMoveStep(step) && step.action !== 'move_home' && step.taught && step.taught_joints && (
+                {isTeachable(step) &&step.taught && step.taught_joints && (
                   <div style={{
                     fontSize: 10, color: '#16A34A', padding: '0 4px',
                     overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
@@ -1085,7 +1089,7 @@ export default function ProgramEditor() {
                     {step.taught_tcp && ' · TCP=[' + step.taught_tcp.slice(0, 3).map((t) => Number(t).toFixed(3)).join(', ') + ']'}
                   </div>
                 )}
-                {isMoveStep(step) && step.action !== 'move_home' && !step.taught && (
+                {isTeachable(step) &&!step.taught && (
                   <div style={{ fontSize: 10, color: '#DC2626', padding: '0 4px', fontWeight: 600 }}>
                     Not taught
                   </div>
@@ -1099,7 +1103,7 @@ export default function ProgramEditor() {
                          cursor: 'pointer', flexShrink: 0 }}>
                 Edit
               </button>
-              {isMoveStep(step) && step.action !== 'move_home' && (
+              {isTeachable(step) &&(
                 <button onClick={(e) => { e.stopPropagation(); teachStep(step.id) }}
                   title={step.taught ? 'Re-record this position from the current robot pose' : 'Record the current robot pose as this step\'s position'}
                   style={{
