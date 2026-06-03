@@ -11,6 +11,7 @@ import View3DLayout from './layouts/View3DLayout'
 import SensorsLayout from './layouts/SensorsLayout'
 import ConfigureLayout from './layouts/ConfigureLayout'
 import AdaptivePicking from './pages/AdaptivePicking'
+import ProgramLibrary from './pages/ProgramLibrary'
 
 class ErrorBoundary extends Component {
   constructor(props) {
@@ -77,6 +78,7 @@ export default function App() {
 
   const layoutMap = {
     monitor:          <MonitorLayout />,
+    programs:         <ProgramLibrary />,
     program:          <ProgramLayout />,
     '3dview':         <View3DLayout />,
     sensors:          <SensorsLayout />,

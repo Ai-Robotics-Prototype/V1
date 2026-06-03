@@ -3,6 +3,7 @@ import { useStore } from '../store/useStore'
 
 const TABS = [
   { id: 'monitor',          label: 'Monitor' },
+  { id: 'programs',         label: 'Programs' },
   { id: 'program',          label: 'Program' },
   { id: '3dview',           label: '3D View' },
   { id: 'sensors',          label: 'Sensors' },
