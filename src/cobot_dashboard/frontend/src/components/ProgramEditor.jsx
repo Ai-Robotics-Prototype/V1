@@ -33,7 +33,8 @@ function actionFor(step) {
 }
 
 // Format the secondary detail line under the label.
-function detailLine(step) {
+function detailLine(step, ioLabels) {
+  const ioName = (id) => (ioLabels && ioLabels[id]) || id
   const bits = [step.action || step.type]
   if (step.target)      bits.push('target: ' + step.target)
   if (step.position)    bits.push('pos: [' + step.position.map((p) => Number(p).toFixed(2)).join(', ') + ']')
@@ -43,12 +44,29 @@ function detailLine(step) {
   if (step.descend_mm)  bits.push('descend ' + step.descend_mm + 'mm')
   if (step.offset_z_mm !== undefined) bits.push('z' + (step.offset_z_mm >= 0 ? '+' : '') + step.offset_z_mm + 'mm')
   if (step.speed_pct)   bits.push(step.speed_pct + '%')
-  if (step.io_id)       bits.push(step.io_id + '=' + (step.value ? 'ON' : 'OFF'))
-  if (step.io_open)         bits.push('open→' + step.io_open)
-  if (step.io_open_confirm) bits.push('verify ' + step.io_open_confirm)
-  if (step.io_close)        bits.push('close→' + step.io_close)
-  if (step.io_close_confirm) bits.push('verify ' + step.io_close_confirm)
+  if (step.io_id)       bits.push(ioName(step.io_id) + '=' + (step.value ? 'ON' : 'OFF'))
+  if (step.io_open)         bits.push('open→' + ioName(step.io_open))
+  if (step.io_open_confirm) bits.push('verify ' + ioName(step.io_open_confirm))
+  if (step.io_close)        bits.push('close→' + ioName(step.io_close))
+  if (step.io_close_confirm) bits.push('verify ' + ioName(step.io_close_confirm))
   return bits.join(' | ')
+}
+
+// Shared label fetch — one round-trip per editor mount instead of one
+// per IOPortSelector instance. Backend now always returns factory
+// defaults merged with operator overrides so `labels[id]` is defined
+// for every port.
+function useIOLabels() {
+  const [labels, setLabels] = useState({})
+  useEffect(() => {
+    let alive = true
+    fetch('/api/io/config')
+      .then((r) => r.json())
+      .then((d) => { if (alive && d) setLabels(d.labels || {}) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [])
+  return labels
 }
 
 // Dropdown that lists DO* or DI* ports with their pin numbers and the
@@ -493,6 +511,10 @@ export default function ProgramEditor() {
   const runningSteps       = useStore((s) => s.program.steps ?? [])
   const taskRunning        = useStore((s) => Boolean(s.task?.running || s.task?.paused))
 
+  // Operator-renamed I/O labels for the detail line + IOPortSelector
+  // dropdowns. Fetched once per editor mount.
+  const ioLabels           = useIOLabels()
+
   // Editor identity / steps / unsaved all live in the store now so a
   // tab swap unmount-and-remount doesn't reset them.
   const programId   = currentProgram.id
@@ -877,7 +899,7 @@ export default function ProgramEditor() {
                 <div style={{ fontSize: 10, color: '#6b7280',
                               overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                               padding: '0 4px' }}>
-                  {detailLine(step)}
+                  {detailLine(step, ioLabels)}
                 </div>
               </div>
 

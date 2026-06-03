@@ -1938,21 +1938,49 @@ if FASTAPI_AVAILABLE:
                 pass
         return {"ok": True, "id": io_id, "value": value}
 
+    # Factory-default port labels — mirrors IOPanel's IO_CONFIG so any
+    # consumer (IOPortSelector dropdowns, program-step detail lines)
+    # gets a meaningful name even when the operator hasn't renamed
+    # anything. Operator overrides win.
+    _IO_FACTORY_LABELS = {
+        'DI0':  'Gripper Closed Sensor', 'DI1':  'Gripper Open Sensor',
+        'DI2':  'Part Present Sensor',   'DI3':  'Conveyor Running',
+        'DI4':  'Safety Gate Closed',    'DI5':  'Light Curtain Clear',
+        'DI6':  'Air Pressure OK',       'DI7':  'Cycle Start Button',
+        'DI8':  'Emergency Stop Chain',  'DI9':  'Fixture Clamped',
+        'DI10': 'Spare Input 10',        'DI11': 'Spare Input 11',
+        'DI12': 'Spare Input 12',        'DI13': 'Spare Input 13',
+        'DI14': 'Spare Input 14',        'DI15': 'Spare Input 15',
+        'DO0':  'Gripper Close',         'DO1':  'Gripper Open',
+        'DO2':  'Vacuum On',             'DO3':  'Vacuum Blow Off',
+        'DO4':  'Conveyor Forward',      'DO5':  'Conveyor Reverse',
+        'DO6':  'Signal Light Green',    'DO7':  'Signal Light Red',
+        'DO8':  'Fixture Clamp',         'DO9':  'Fixture Unclamp',
+        'DO10': 'Spare Output 10',       'DO11': 'Spare Output 11',
+        'DO12': 'Spare Output 12',       'DO13': 'Spare Output 13',
+        'DO14': 'Spare Output 14',       'DO15': 'Spare Output 15',
+        'AI0':  'Force Sensor',          'AI1':  'Pressure Sensor',
+        'AI2':  'Temperature',           'AI3':  'Spare Analog 3',
+        'AO0':  'Gripper Force',         'AO1':  'Conveyor Speed',
+    }
+
     @app.get("/api/io/config")
     async def api_io_config_get():
-        """Return saved I/O config (operator-renamed labels). Always has a
-        'labels' key so the frontend can rely on data.labels."""
+        """Return I/O port labels. Always merges factory defaults with
+        any operator overrides on disk so every port has a label."""
+        custom = {}
         path = '/opt/cobot/io_config.json'
         if os.path.isfile(path):
             try:
                 with open(path) as f:
                     data = json.load(f)
-                if isinstance(data, dict) and 'labels' not in data:
-                    data['labels'] = {}
-                return data
+                if isinstance(data, dict):
+                    saved = data.get('labels') or {}
+                    if isinstance(saved, dict):
+                        custom = {k: v for k, v in saved.items() if isinstance(v, str) and v.strip()}
             except Exception:
                 pass
-        return {"labels": {}}
+        return {"labels": {**_IO_FACTORY_LABELS, **custom}}
 
     @app.put("/api/io/config")
     async def api_io_config_put(request: Request):
