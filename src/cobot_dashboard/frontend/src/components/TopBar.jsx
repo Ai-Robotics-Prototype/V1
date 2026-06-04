@@ -55,12 +55,24 @@ export default function TopBar() {
       userSelect: 'none',
     }}>
       {/* Left: brand */}
-      <div style={{ width: 52, flexShrink: 0, fontSize: 13, fontWeight: 600, color: 'var(--accent)' }}>
+      <div style={{ width: 64, flexShrink: 0, fontSize: 14, fontWeight: 700, color: 'var(--accent)' }}>
         RoboAi
       </div>
 
-      {/* Centre: tab pills */}
-      <nav style={{ flex: 1, display: 'flex', justifyContent: 'center', gap: 2 }}>
+      {/* Centre: tab pills. The strip scrolls horizontally on narrow
+          viewports — no-scrollbar hides the visible bar so the pill
+          height isn't reduced. The brand on the left and the right
+          cluster are flexShrink: 0 so they can't be squeezed. */}
+      <nav className="no-scrollbar" style={{
+        flex: 1,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'flex-start',
+        gap: 6,
+        padding: '4px 8px',
+        overflowX: 'auto',
+        WebkitOverflowScrolling: 'touch',
+      }}>
         {TABS.map((tab) => {
           const active = activeTab === tab.id
           return (
@@ -68,17 +80,21 @@ export default function TopBar() {
               key={tab.id}
               onClick={() => setTab(tab.id)}
               style={{
-                background: 'none',
-                border: 'none',
-                borderBottom: active ? '2px solid #fff' : '2px solid transparent',
-                color: active ? 'var(--text-primary)' : 'var(--text-secondary)',
-                fontSize: 13,
-                fontWeight: active ? 500 : 400,
-                padding: '0 14px',
-                height: 48,
+                background: active ? 'rgba(47,127,255,0.14)' : 'transparent',
+                border:     active ? '1px solid rgba(47,127,255,0.45)' : '1px solid transparent',
+                color:      active ? 'var(--text-primary)' : 'var(--text-secondary)',
+                fontSize: 14,
+                fontWeight: active ? 700 : 500,
+                padding: '10px 18px',
+                minHeight: 44,
+                borderRadius: 10,
                 cursor: 'pointer',
-                transition: 'color 150ms',
+                whiteSpace: 'nowrap',
+                flexShrink: 0,
+                transition: 'background 120ms, border-color 120ms, color 120ms',
               }}
+              onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'rgba(255,255,255,0.06)' }}
+              onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent' }}
             >
               {tab.label}
             </button>
@@ -164,13 +180,14 @@ export default function TopBar() {
               background: '#DC2626',
               border: 'none',
               color: '#fff',
-              fontSize: 12,
-              fontWeight: 500,
-              padding: '5px 16px',
-              borderRadius: 'var(--radius-sm)',
+              fontSize: 14,
+              fontWeight: 700,
+              padding: '10px 22px',
+              minHeight: 44,
+              borderRadius: 8,
               cursor: 'pointer',
               animation: estop ? 'pulse-opacity 1s ease-in-out infinite' : 'none',
-              letterSpacing: '0.02em',
+              letterSpacing: '0.04em',
             }}
           >
             {estop ? 'ESTOP ACTIVE' : 'E-STOP'}

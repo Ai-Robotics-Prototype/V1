@@ -62,7 +62,7 @@ const gridStyle = {
   display: 'grid',
   gridTemplateAreas: '"topbar" "content" "statusbar"',
   gridTemplateColumns: '1fr',
-  gridTemplateRows: '48px 1fr 36px',
+  gridTemplateRows: '60px 1fr 36px',
   height: '100vh',
   overflow: 'hidden',
   background: 'var(--bg-app)',

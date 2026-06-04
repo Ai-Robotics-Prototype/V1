@@ -60,3 +60,9 @@ button:disabled {
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 2px; }
+
+/* Used by the TopBar tab strip so it can horizontally scroll on
+   narrow screens without exposing a scrollbar that competes with
+   the tab pills for vertical space. */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
