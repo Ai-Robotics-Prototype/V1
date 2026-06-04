@@ -64,6 +64,12 @@ class ProgramExecutor(Node):
         self._robot_connected = False
         self._robot_mode = 'unknown'
         self._wait_until = 0
+        # Scan & Identify state — populated by scan_workspace,
+        # consumed by scan_identify_each and the downstream sort /
+        # remove-defects actions.
+        self._scan_results      = []   # detections at the wide scan step
+        self._identified_parts  = []   # per-object results after close-up scan
+        self._scan_identify_idx = 0
         self._lock = threading.Lock()
 
         # Publishers
@@ -158,6 +164,9 @@ class ProgramExecutor(Node):
         self._current_step_idx = 0
         self._cycle_count = 0
         self._cycle_start_time = time.time()
+        self._scan_results      = []
+        self._identified_parts  = []
+        self._scan_identify_idx = 0
         self._state = self.RUNNING
         self.get_logger().info(f'Starting execution: "{self._program_name}"')
 
@@ -352,6 +361,101 @@ class ProgramExecutor(Node):
             self._wait_until = time.time() + 0.1
             self._state = self.WAITING_TIME
 
+        elif action == 'scan_workspace':
+            # Read current detections from the dashboard's /api/detections.
+            # The depth_segment_node publishes detections continuously;
+            # we just snapshot them at this instant. Note: positions are
+            # in CAMERA frame today — to move above each object the
+            # robot needs camera-to-robot extrinsics calibration, which
+            # is tracked separately. Until that lands, scan_identify_each
+            # only logs the intent.
+            try:
+                import urllib.request as _ur
+                with _ur.urlopen('http://localhost:8080/api/detections', timeout=2) as resp:
+                    data = json.loads(resp.read().decode())
+                self._scan_results = data.get('objects', []) or []
+                self.get_logger().info(
+                    f'Scan found {len(self._scan_results)} object'
+                    f'{"" if len(self._scan_results) == 1 else "s"}')
+            except Exception as e:
+                self.get_logger().warn(f'Failed to read detections: {e}')
+                self._scan_results = []
+            self._identified_parts  = []
+            self._scan_identify_idx = 0
+            self._advance_step()
+
+        elif action == 'scan_identify_each':
+            # Walks the snapshot from scan_workspace, intending to move
+            # the robot above each detected object for a close-up
+            # identification. Without camera->robot extrinsics we can't
+            # send a real motion command; we still record the per-object
+            # ID + confidence so the Monitor scan-results panel works.
+            scan_height_m  = float(step.get('scan_height_mm', 150)) / 1000.0
+            scan_speed_pct = int(step.get('scan_speed_pct', 20))
+            settle_s       = float(step.get('settle_time_ms', 500)) / 1000.0
+
+            if not self._scan_results:
+                self.get_logger().warn('No scan results from scan_workspace — skipping identify')
+                self._advance_step()
+                return
+
+            if self._scan_identify_idx >= len(self._scan_results):
+                self.get_logger().info(
+                    f'Identified {len(self._identified_parts)} part'
+                    f'{"" if len(self._identified_parts) == 1 else "s"}:')
+                for p in self._identified_parts:
+                    self.get_logger().info(
+                        f'  {p.get("part_id", "unknown")} '
+                        f'conf={p.get("confidence", 0):.0f}%')
+                self._scan_identify_idx = 0
+                self._advance_step()
+                return
+
+            obj = self._scan_results[self._scan_identify_idx]
+            obj_x = float(obj.get('x', 0))
+            obj_y = float(obj.get('y', 0))
+            obj_z = float(obj.get('z', 0))
+            self.get_logger().info(
+                f'Scanning object {self._scan_identify_idx + 1}/{len(self._scan_results)} '
+                f'at cam frame ({obj_x:.3f}, {obj_y:.3f}, {obj_z:.3f})')
+
+            # TODO: send movl above (obj_x, obj_y, obj_z + scan_height_m)
+            # once camera->robot calibration is wired. For now we just
+            # capture the existing detection metadata.
+            _ = scan_height_m, scan_speed_pct  # keep for the eventual move
+
+            self._identified_parts.append({
+                'scan_index':  self._scan_identify_idx,
+                'x': obj_x, 'y': obj_y, 'z': obj_z,
+                'part_id':     obj.get('part_id', 'unknown'),
+                'confidence':  float(obj.get('confidence', 0)),
+                'orientation': obj.get('orientation', 'unknown'),
+                'is_defect':   bool(obj.get('is_defect', False)),
+                'defect_name': obj.get('defect_name', ''),
+            })
+
+            self._scan_identify_idx += 1
+            self._wait_until = time.time() + settle_s
+            self._state = self.WAITING_TIME
+
+        elif action == 'sort_scanned':
+            # Placeholder — a real implementation needs:
+            #   * a per-part-id place position (or a bin per type)
+            #   * camera->robot calibration so we know where each
+            #     identified part actually is
+            # Until those are wired we log and advance.
+            self.get_logger().info(
+                f'sort_scanned: {len(self._identified_parts)} parts in queue '
+                '(placeholder — needs per-type bin positions + calibration)')
+            self._advance_step()
+
+        elif action == 'remove_defects':
+            defects = [p for p in self._identified_parts if p.get('is_defect')]
+            self.get_logger().info(
+                f'remove_defects: {len(defects)} defective parts found '
+                '(placeholder — needs reject-bin position + calibration)')
+            self._advance_step()
+
         elif action == 'loop':
             goto_step = step.get('goto', 1) - 1  # convert 1-indexed to 0-indexed
             count = step.get('count', 0)  # 0 = infinite
@@ -441,6 +545,13 @@ class ProgramExecutor(Node):
             'pick_fails': self._pick_fails,
             'robot_connected': self._robot_connected,
             'robot_mode': self._robot_mode,
+            # Scan & Identify snapshots — present even on non-scan
+            # programs (empty lists) so the Monitor can render
+            # consistently. scan_count is the wide-scan total;
+            # identified_count is how many have been close-up scanned.
+            'scan_results':     list(self._identified_parts),
+            'scan_count':       len(self._scan_results),
+            'identified_count': len(self._identified_parts),
         }
 
         msg = String()

@@ -439,10 +439,90 @@ const PAGES = [
           { value: 'machine_tend', label: 'Machine Tending', desc: 'Load parts into a machine, wait, then unload', icon: 'M' },
           { value: 'palletize', label: 'Palletize', desc: 'Arrange parts in a grid pattern on a pallet', icon: 'G' },
           { value: 'inspect', label: 'Pick and Inspect', desc: 'Pick a part, inspect it with the camera, then sort pass/fail', icon: 'I' },
+          { value: 'scan_identify', label: 'Scan & Identify', desc: 'Robot scans the workspace, moves above each detected object, identifies it from the parts library', icon: 'Q' },
         ].map(op => (
           <ChoiceButton key={op.value} label={op.label} description={op.desc} icon={op.icon}
             selected={answers.operation === op.value}
             onClick={() => { setAnswer('operation', op.value); goNext() }}
+          />
+        ))}
+      </QuestionCard>
+    ),
+  },
+
+  // 0a: Scan-only — scan height. Gated on operation === 'scan_identify'.
+  {
+    id: 'scan_height',
+    skip: (answers) => answers.operation !== 'scan_identify',
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="How close should the robot scan each part?"
+        description="The robot moves above each detected object at this height for a close-up identification. Lower = more detail but smaller field of view."
+      >
+        <SliderQuestion
+          label="Scan height"
+          value={answers.scan_height || 150}
+          onChange={(v) => setAnswer('scan_height', v)}
+          min={80} max={300} step={10} unit="mm"
+          description="Distance above the part surface during close-up scan"
+        />
+        <div style={{
+          padding: 12, background: '#f0f9ff', borderRadius: 8,
+          border: '1px solid #bfdbfe', fontSize: 12, color: '#2563EB', marginBottom: 16,
+        }}>
+          Recommended: 120–150 mm for small parts (under 10 cm). 200–250 mm for larger parts.
+        </div>
+        <NextButton onClick={goNext} label="Next" />
+      </QuestionCard>
+    ),
+  },
+
+  // 0b: Scan-only — what to do after scanning.
+  {
+    id: 'scan_after',
+    skip: (answers) => answers.operation !== 'scan_identify',
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="What should happen after scanning?"
+        description="After identifying all parts, what should the robot do?"
+      >
+        {[
+          { value: 'report_only',    label: 'Report Only',       desc: 'Just identify and report what was found. Robot returns home.' },
+          { value: 'pick_known',     label: 'Pick Known Parts',  desc: 'After scanning, pick identified parts and place them in their designated locations.' },
+          { value: 'sort_by_type',   label: 'Sort by Type',      desc: 'After scanning, sort parts into different bins based on their type.' },
+          { value: 'remove_defects', label: 'Remove Defects',    desc: 'After scanning, pick up defective parts and place them in a reject bin.' },
+        ].map((o) => (
+          <ChoiceButton
+            key={o.value}
+            label={o.label}
+            description={o.desc}
+            selected={answers.scan_after === o.value}
+            onClick={() => { setAnswer('scan_after', o.value); goNext() }}
+          />
+        ))}
+      </QuestionCard>
+    ),
+  },
+
+  // 0c: Scan-only — wide scan position source.
+  {
+    id: 'scan_wide_position',
+    skip: (answers) => answers.operation !== 'scan_identify',
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="Where should the robot look from to see the full workspace?"
+        description="The robot first moves to a high position to see all parts, then moves closer to each one."
+      >
+        {[
+          { value: 'home',  label: 'Use Home Position',      desc: 'The home position already has a good view of the workspace.' },
+          { value: 'teach', label: 'Teach a Scan Position',  desc: 'Jog the robot to a position where the camera can see the entire workspace.' },
+        ].map((o) => (
+          <ChoiceButton
+            key={o.value}
+            label={o.label}
+            description={o.desc}
+            selected={answers.scan_wide_source === o.value}
+            onClick={() => { setAnswer('scan_wide_source', o.value); goNext() }}
           />
         ))}
       </QuestionCard>
@@ -1001,6 +1081,61 @@ function buildSteps(answers) {
 
   steps.push({ action: 'move_home', label: 'Move to home position' })
 
+  // Scan & Identify takes a different path — the rest of the picking
+  // flow doesn't apply when the goal is to inventory the workspace.
+  // We still fall through to the post-processing block at the bottom
+  // so step numbering + taught-point application (home_point in
+  // particular) work the same way for scan programs.
+  const isScan = op === 'scan_identify'
+  if (isScan) {
+    if (answers.scan_wide_source === 'teach') {
+      steps.push({ action: 'move_joint', label: 'Move to wide scan position', speed_pct: spd })
+    }
+    steps.push({
+      action: 'scan_workspace',
+      label:  'Scan workspace — detect all objects',
+      scan_height_mm: answers.scan_height || 150,
+      scan_speed_pct: Math.min(spd, 30),
+      mode:   'wide',
+    })
+    steps.push({
+      action: 'scan_identify_each',
+      label:  'Move above each object and identify',
+      scan_height_mm: answers.scan_height || 150,
+      scan_speed_pct: Math.min(spd, 20),
+      settle_time_ms: 500,
+      capture_frames: 5,
+      match_threshold_pct: 70,
+    })
+    const after = answers.scan_after || 'report_only'
+    if (after === 'pick_known') {
+      steps.push({ action: 'move_joint',   label: 'Move above first identified part', speed_pct: spd })
+      steps.push({ action: 'move_linear',  label: 'Descend to pick',                  speed_pct: slow })
+      if (answers.gripper_type === 'finger') {
+        steps.push({ action: 'close_gripper', label: 'Grip part', force_pct: gripF, io_close: 'DO0', io_close_confirm: 'DI0' })
+      }
+      steps.push({ action: 'move_linear',  label: 'Lift part', offset_z_mm: appH, speed_pct: medium })
+      steps.push({ action: 'move_joint',   label: 'Move to place position', speed_pct: spd })
+      steps.push({ action: 'move_linear',  label: 'Descend to place', speed_pct: slow })
+      if (answers.gripper_type === 'finger') {
+        steps.push({ action: 'open_gripper', label: 'Release part', width_mm: gripW, io_open: 'DO1' })
+      }
+      steps.push({ action: 'move_linear',  label: 'Lift from place', offset_z_mm: appH, speed_pct: medium })
+    } else if (after === 'sort_by_type') {
+      steps.push({ action: 'sort_scanned',   label: 'Sort identified parts by type' })
+    } else if (after === 'remove_defects') {
+      steps.push({ action: 'remove_defects', label: 'Pick up defective parts and place in reject bin' })
+    }
+    steps.push({ action: 'move_home', label: 'Return to home' })
+    if (answers.repeat === 'continuous') {
+      steps.push({ action: 'loop', label: 'Repeat continuously', goto: 1, count: 0 })
+    } else if (answers.repeat === 'count') {
+      steps.push({ action: 'loop', label: 'Repeat ' + (answers.repeat_count || 10) + ' times', goto: 1, count: answers.repeat_count || 10 })
+    }
+  } else {
+  // ── Standard pick / sort / machine_tend / palletize / inspect flow.
+  //    Skipped for scan_identify, which built its own steps above.
+
   if (answers.gripper_type === 'finger') {
     steps.push({ action: 'open_gripper', label: 'Open gripper', width_mm: gripW, speed_pct: spd, io_open: 'DO1', io_open_confirm: 'DI1' })
   } else if (answers.gripper_type === 'vacuum') {
@@ -1078,6 +1213,7 @@ function buildSteps(answers) {
   } else if (answers.repeat === 'count') {
     steps.push({ action: 'loop', label: 'Repeat ' + (answers.repeat_count || 10) + ' times', goto: 1, count: answers.repeat_count || 10 })
   }
+  }  // end of !isScan picking flow
 
   // Inject taught data from the wizard's teach pages so the editor's
   // green T badges appear immediately for the positions the operator

@@ -792,6 +792,57 @@ export default function MonitorDashboard() {
         <FaultLog />
       </div>
 
+      {/* Scan & Identify results — only visible while a scan program
+          is running (or has just finished). The executor publishes
+          scan_results / scan_count / identified_count on /task/state. */}
+      {(task?.scan_results?.length > 0 || task?.scan_count > 0) && (
+        <div style={{
+          background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
+          padding: 20, marginBottom: 24,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 12 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: '#111' }}>
+              Scan Results
+            </div>
+            <div style={{ fontSize: 12, color: '#6b7280' }}>
+              {task?.identified_count || 0} of {task?.scan_count || 0} identified
+            </div>
+          </div>
+          {(task?.scan_results || []).length > 0 ? (
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
+              gap: 8,
+            }}>
+              {task.scan_results.map((p, i) => {
+                const known = p.part_id && p.part_id !== 'unknown'
+                const bg     = p.is_defect ? '#fef2f2' : known ? '#f0fdf4' : '#f3f4f6'
+                const border = p.is_defect ? '1px solid #fecaca'
+                              : known      ? '1px solid #bbf7d0'
+                                           : '1px solid #e5e7eb'
+                const color  = p.is_defect ? '#DC2626' : known ? '#16A34A' : '#6b7280'
+                return (
+                  <div key={i} style={{
+                    padding: '10px 12px', borderRadius: 8, background: bg, border,
+                  }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color }}>
+                      {p.is_defect ? `DEFECT: ${p.defect_name || ''}` : (p.part_id || 'Unknown')}
+                    </div>
+                    <div style={{ fontSize: 11, color: '#6b7280', marginTop: 2 }}>
+                      {Number(p.confidence || 0).toFixed(0)}% · {p.orientation || 'unknown'}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          ) : (
+            <div style={{ fontSize: 12, color: '#9ca3af' }}>
+              Wide scan captured {task?.scan_count || 0} objects — close-up identification in progress…
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Program steps progress */}
       {steps.length > 0 ? (
         <div style={{

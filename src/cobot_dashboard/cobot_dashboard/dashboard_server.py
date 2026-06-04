@@ -871,7 +871,8 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             # Richer passthrough fields the Monitor consumes directly.
             for k in ("program_id", "program_name", "step_label", "step_action",
                       "cycle_count", "last_cycle_time", "total_picks",
-                      "pick_passes", "pick_fails"):
+                      "pick_passes", "pick_fails",
+                      "scan_results", "scan_count", "identified_count"):
                 if k in d:
                     t[k] = d[k]
 
@@ -1867,6 +1868,14 @@ if FASTAPI_AVAILABLE:
             "captured":    captured,
             "is_defect":   is_defect,
         }
+
+    @app.get("/api/detections")
+    async def api_detections():
+        """Current detections snapshot — used by the executor's
+        scan_workspace step to enumerate objects on the table."""
+        with _state_lock:
+            dets = list(STATE.get('detections', []))
+        return {"count": len(dets), "objects": dets}
 
     @app.get("/api/parts/{part_id}/defects")
     async def api_parts_defects(part_id: str):

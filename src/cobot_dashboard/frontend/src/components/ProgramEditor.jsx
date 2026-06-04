@@ -7,23 +7,28 @@ import ProgramWizard from './ProgramWizard'
 // home/wait/etc.) so legacy consumers keep working, plus a list of
 // typed parameter fields the editor knows how to render.
 const ACTION_TYPES = [
-  { value: 'move_home',     label: 'Move to Home',     type: 'home',    tag: 'HOME',    fields: [] },
-  { value: 'open_gripper',  label: 'Open Gripper',     type: 'gripper', tag: 'GRIPPER', fields: ['width_mm', 'speed_pct', 'io_open', 'io_open_confirm'] },
-  { value: 'close_gripper', label: 'Close Gripper',    type: 'gripper', tag: 'GRIPPER', fields: ['force_pct', 'io_close', 'io_close_confirm'] },
-  { value: 'move_joint',    label: 'Move Joint',       type: 'move',    tag: 'MOVE',    fields: ['joints'] },
-  { value: 'move_linear',   label: 'Move Linear',      type: 'move',    tag: 'MOVE',    fields: ['position', 'offset_z_mm', 'speed_pct'] },
-  { value: 'approach',      label: 'Approach Object',  type: 'move',    tag: 'MOVE',    fields: ['target', 'offset_z_mm'] },
-  { value: 'pick',          label: 'Pick and Close',   type: 'gripper', tag: 'PICK',    fields: ['descend_mm'] },
-  { value: 'place',         label: 'Place at Target',  type: 'move',    tag: 'PLACE',   fields: ['position'] },
-  { value: 'wait',          label: 'Wait',             type: 'wait',    tag: 'WAIT',    fields: ['duration_s'] },
-  { value: 'detect',        label: 'Detect Objects',   type: 'move',    tag: 'DETECT',  fields: ['mode'] },
-  { value: 'loop',          label: 'Loop',             type: 'move',    tag: 'LOOP',    fields: ['goto', 'count'] },
-  { value: 'set_io',        label: 'Set I/O',          type: 'move',    tag: 'IO',      fields: ['io_id', 'value'] },
+  { value: 'move_home',          label: 'Move to Home',     type: 'home',    tag: 'HOME',    fields: [] },
+  { value: 'open_gripper',       label: 'Open Gripper',     type: 'gripper', tag: 'GRIPPER', fields: ['width_mm', 'speed_pct', 'io_open', 'io_open_confirm'] },
+  { value: 'close_gripper',      label: 'Close Gripper',    type: 'gripper', tag: 'GRIPPER', fields: ['force_pct', 'io_close', 'io_close_confirm'] },
+  { value: 'move_joint',         label: 'Move Joint',       type: 'move',    tag: 'MOVE',    fields: ['joints'] },
+  { value: 'move_linear',        label: 'Move Linear',      type: 'move',    tag: 'MOVE',    fields: ['position', 'offset_z_mm', 'speed_pct'] },
+  { value: 'approach',           label: 'Approach Object',  type: 'move',    tag: 'MOVE',    fields: ['target', 'offset_z_mm'] },
+  { value: 'pick',               label: 'Pick and Close',   type: 'gripper', tag: 'PICK',    fields: ['descend_mm'] },
+  { value: 'place',              label: 'Place at Target',  type: 'move',    tag: 'PLACE',   fields: ['position'] },
+  { value: 'wait',               label: 'Wait',             type: 'wait',    tag: 'WAIT',    fields: ['duration_s'] },
+  { value: 'detect',             label: 'Detect Objects',   type: 'move',    tag: 'DETECT',  fields: ['mode'] },
+  { value: 'loop',               label: 'Loop',             type: 'move',    tag: 'LOOP',    fields: ['goto', 'count'] },
+  { value: 'set_io',             label: 'Set I/O',          type: 'move',    tag: 'IO',      fields: ['io_id', 'value'] },
+  { value: 'scan_workspace',     label: 'Scan Workspace',   type: 'move',    tag: 'SCAN',    fields: ['scan_height_mm', 'scan_speed_pct'] },
+  { value: 'scan_identify_each', label: 'Identify Each',    type: 'move',    tag: 'SCAN',    fields: ['scan_height_mm', 'scan_speed_pct', 'settle_time_ms', 'capture_frames', 'match_threshold_pct'] },
+  { value: 'sort_scanned',       label: 'Sort Scanned',     type: 'move',    tag: 'SCAN',    fields: [] },
+  { value: 'remove_defects',     label: 'Remove Defects',   type: 'move',    tag: 'SCAN',    fields: [] },
 ]
 
 const TAG_COLORS = {
   HOME: '#6366f1', GRIPPER: '#f59e0b', MOVE: '#2563EB', PICK: '#16A34A',
-  PLACE: '#0891b2', WAIT: '#6b7280', DETECT: '#8b5cf6', LOOP: '#ec4899', IO: '#f97316',
+  PLACE: '#0891b2', WAIT: '#6b7280', DETECT: '#8b5cf6', LOOP: '#ec4899',
+  IO: '#f97316', SCAN: '#9333EA',
 }
 
 // Actions that move the robot to a specific pose. Gripper open/close
@@ -79,6 +84,11 @@ function detailLine(step, ioLabels) {
   if (step.io_open_confirm) bits.push('verify ' + ioName(step.io_open_confirm))
   if (step.io_close)        bits.push('close→' + ioName(step.io_close))
   if (step.io_close_confirm) bits.push('verify ' + ioName(step.io_close_confirm))
+  if (step.scan_height_mm)      bits.push('scan@' + step.scan_height_mm + 'mm')
+  if (step.scan_speed_pct)      bits.push('scan ' + step.scan_speed_pct + '%')
+  if (step.settle_time_ms)      bits.push('settle ' + step.settle_time_ms + 'ms')
+  if (step.capture_frames)      bits.push(step.capture_frames + ' frames')
+  if (step.match_threshold_pct) bits.push('match≥' + step.match_threshold_pct + '%')
   return bits.join(' | ')
 }
 
@@ -519,6 +529,15 @@ const STEP_CATEGORIES = [
       { action: 'set_io', label: 'Set I/O',desc: 'Set a digital or analog output' },
     ],
   },
+  {
+    name: 'Scan',
+    actions: [
+      { action: 'scan_workspace',     label: 'Scan Workspace', desc: 'Detect all objects on the table from current position' },
+      { action: 'scan_identify_each', label: 'Identify Each',  desc: 'Move above each detected object for close-up identification' },
+      { action: 'sort_scanned',       label: 'Sort Scanned',   desc: 'Pick and sort scanned parts by type (needs robot-frame calibration)' },
+      { action: 'remove_defects',     label: 'Remove Defects', desc: 'Pick up defective parts from scan results (needs robot-frame calibration)' },
+    ],
+  },
 ]
 
 // Default extras per action so a freshly-added step has sane defaults
@@ -538,6 +557,15 @@ function freshStepForAction(action) {
     case 'detect':        return { ...base, mode: 'all' }
     case 'loop':          return { ...base, goto: 1, count: 0 }
     case 'set_io':        return { ...base, io_id: 'DO0', value: 1 }
+    case 'scan_workspace': return {
+      ...base, scan_height_mm: 150, scan_speed_pct: 30, mode: 'wide',
+    }
+    case 'scan_identify_each': return {
+      ...base, scan_height_mm: 150, scan_speed_pct: 20,
+      settle_time_ms: 500, capture_frames: 5, match_threshold_pct: 70,
+    }
+    case 'sort_scanned':   return base
+    case 'remove_defects': return base
     default:              return base
   }
 }
