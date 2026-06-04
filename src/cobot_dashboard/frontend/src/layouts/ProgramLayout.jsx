@@ -1,29 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 import ProgramEditor from '../components/ProgramEditor'
-import ArmViewer3D from '../components/ArmViewer3D'
 
-// Pinned: red tint when the panel is at its min/max limit so the
-// operator gets visual feedback instead of silent unresponsiveness.
-function VerticalDivider({ onMouseDown, dragging, atLimit }) {
-  const tint = dragging ? '#2563EB40' : atLimit ? '#DC262640' : 'transparent'
-  return (
-    <div
-      onMouseDown={onMouseDown}
-      style={{
-        width: 5, cursor: 'col-resize', flexShrink: 0,
-        background: tint, position: 'relative', zIndex: 10,
-        transition: 'background 150ms',
-      }}
-      onMouseEnter={(e) => { e.currentTarget.style.background = atLimit ? '#DC262640' : '#2563EB40' }}
-      onMouseLeave={(e) => { if (!dragging) e.currentTarget.style.background = atLimit ? '#DC262640' : 'transparent' }}>
-      <div style={{
-        position: 'absolute', top: '50%', left: 1, transform: 'translateY(-50%)',
-        width: 3, height: 30, borderRadius: 2, background: atLimit ? '#DC2626' : '#d1d5db',
-      }} />
-    </div>
-  )
-}
+// ArmViewer3D import removed — the articulated 3D model has been
+// pulled from the Program tab pending the Estun-supplied URDF. The
+// component file is left in place so it can be reintroduced later.
 
 function HorizontalDivider({ onMouseDown, dragging, atLimit }) {
   const tint = dragging ? '#2563EB40' : atLimit ? '#DC262640' : 'transparent'
@@ -387,13 +368,9 @@ function JogPanel({ maximized, onToggleMaximize }) {
   )
 }
 
-// Hard floors / fractional ceilings for the resizable panels. The
-// floors are derived from "what does each panel need to keep its
-// controls visible" — they keep buttons from being clipped no matter
-// how the operator drags the dividers.
-const PROGRAM_MIN_WIDTH = 380   // editor: step-row buttons (Edit / Teach / Del) fit
-const VIEWER_MIN_WIDTH  = 250   // 3D arm: enough to see the robot model
-const PROGRAM_MAX_FRAC  = 0.75  // editor can take up to 75% of the row
+// Hard floor / fractional ceiling for the jog panel. Width-related
+// constants are gone with the 3D viewer removal — both surviving
+// panels are full width.
 const JOG_MIN_HEIGHT    = 320   // jog: arrow pads + step/speed + action col fit
 const JOG_MAX_FRAC      = 0.6   // jog can take up to 60% of available height
 
@@ -411,55 +388,35 @@ function useWindowSize() {
 }
 
 export default function ProgramLayout() {
-  const { w: winW, h: winH } = useWindowSize()
-  // Available width inside the Program tab: full viewport minus the
-  // left sidebar (64) and a tiny gutter for the divider. The 3D viewer
-  // always reserves VIEWER_MIN_WIDTH from the right edge, so the
-  // editor's hard max is whichever is tighter: 75 % or "leave room".
-  const availW = Math.max(640, winW - 64)
-  const leftMax = Math.max(PROGRAM_MIN_WIDTH,
-    Math.min(Math.floor(availW * PROGRAM_MAX_FRAC), availW - VIEWER_MIN_WIDTH - 8))
-  const jogMax  = Math.max(JOG_MIN_HEIGHT, Math.floor((winH - 96) * JOG_MAX_FRAC))
+  const { h: winH } = useWindowSize()
+  const jogMax = Math.max(JOG_MIN_HEIGHT, Math.floor((winH - 96) * JOG_MAX_FRAC))
 
   // Layout state lives in the store (and is persisted) so tab swaps
-  // and page reloads keep the dividers where the operator put them.
+  // and page reloads keep the divider where the operator put it.
   const programLayout    = useStore((s) => s.programLayout)
   const setProgramLayout = useStore((s) => s.setProgramLayout)
-  const leftWidth        = programLayout.leftWidth
   const jogHeight        = programLayout.jogHeight
-  // expandedPanel: 'steps' | '3d' | 'jog' | null. Old persisted state
-  // may still carry jogMaximized:true from before this slice existed —
+  // expandedPanel: 'steps' | 'jog' | null. Old persisted state may
+  // still carry jogMaximized:true from before this slice existed —
   // honour it as the migration path so a tab swap doesn't surprise.
   const expandedPanel    = programLayout.expandedPanel
     ?? (programLayout.jogMaximized ? 'jog' : null)
-  const setLeftWidth     = useCallback((w) => setProgramLayout({ leftWidth: typeof w === 'function' ? w(programLayout.leftWidth) : w }), [setProgramLayout, programLayout.leftWidth])
   const setJogHeight     = useCallback((h) => setProgramLayout({ jogHeight: typeof h === 'function' ? h(programLayout.jogHeight) : h }), [setProgramLayout, programLayout.jogHeight])
   const setExpandedPanel = useCallback((p) => setProgramLayout({
     expandedPanel: p,
-    jogMaximized: p === 'jog',  // mirror so legacy reads stay consistent
+    jogMaximized:  p === 'jog',  // mirror so legacy reads stay consistent
   }), [setProgramLayout])
 
   const drag = useRef({ active: null, startPos: 0, startVal: 0 })
   const [activeDrag, setActiveDrag] = useState(null)
 
-  // Re-clamp when the viewport shrinks so a previously-valid width
-  // doesn't end up over the new max (e.g. user shrinks the window
-  // after dragging the editor to 800 px).
+  // Re-clamp when the viewport shrinks so a previously-valid height
+  // doesn't end up over the new max.
   useEffect(() => {
-    const clampedW = Math.max(PROGRAM_MIN_WIDTH, Math.min(leftWidth, leftMax))
-    const clampedH = Math.max(JOG_MIN_HEIGHT,    Math.min(jogHeight, jogMax))
-    if (clampedW !== leftWidth || clampedH !== jogHeight) {
-      setProgramLayout({ leftWidth: clampedW, jogHeight: clampedH })
-    }
+    const clampedH = Math.max(JOG_MIN_HEIGHT, Math.min(jogHeight, jogMax))
+    if (clampedH !== jogHeight) setProgramLayout({ jogHeight: clampedH })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [leftMax, jogMax])
-
-  const startVerticalDrag = useCallback((e) => {
-    drag.current = { active: 'v', startPos: e.clientX, startVal: leftWidth }
-    setActiveDrag('v')
-    document.body.style.cursor = 'col-resize'
-    document.body.style.userSelect = 'none'
-  }, [leftWidth])
+  }, [jogMax])
 
   const startHorizontalDrag = useCallback((e) => {
     drag.current = { active: 'h', startPos: e.clientY, startVal: jogHeight }
@@ -471,10 +428,7 @@ export default function ProgramLayout() {
   useEffect(() => {
     const onMove = (e) => {
       const d = drag.current
-      if (d.active === 'v') {
-        const delta = e.clientX - d.startPos
-        setLeftWidth(Math.max(PROGRAM_MIN_WIDTH, Math.min(leftMax, d.startVal + delta)))
-      } else if (d.active === 'h') {
+      if (d.active === 'h') {
         const delta = d.startPos - e.clientY
         setJogHeight(Math.max(JOG_MIN_HEIGHT, Math.min(jogMax, d.startVal + delta)))
       }
@@ -493,28 +447,17 @@ export default function ProgramLayout() {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup',   onUp)
     }
-  }, [leftMax, jogMax])
+  }, [jogMax])
 
-  const leftAtLimit = leftWidth <= PROGRAM_MIN_WIDTH + 0.5 || leftWidth >= leftMax - 0.5
-  const jogAtLimit  = jogHeight <= JOG_MIN_HEIGHT   + 0.5 || jogHeight >= jogMax  - 0.5
+  const jogAtLimit = jogHeight <= JOG_MIN_HEIGHT + 0.5 || jogHeight >= jogMax - 0.5
 
-  // Single-panel maximised views. Each one is the full Program tab with
-  // a Minimize button in the corner that drops back to the three-region
-  // layout. The jog panel was the only one with this before — Steps
-  // and 3D viewer now get it too.
+  // Single-panel maximised views. The 3D viewer expand branch was
+  // removed alongside the viewer itself; steps + jog remain.
   if (expandedPanel === 'steps') {
     return (
       <div style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden' }}>
         <PanelExpandBtn expanded onClick={() => setExpandedPanel(null)} title="Restore split layout" />
         <ProgramEditor />
-      </div>
-    )
-  }
-  if (expandedPanel === '3d') {
-    return (
-      <div style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden', background: '#FFFFFF' }}>
-        <PanelExpandBtn expanded onClick={() => setExpandedPanel(null)} title="Restore split layout" />
-        <ArmViewer3D />
       </div>
     )
   }
@@ -528,26 +471,16 @@ export default function ProgramLayout() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
-        <div style={{ width: leftWidth, flexShrink: 0, display: 'flex', overflow: 'hidden', position: 'relative' }}>
-          <PanelExpandBtn onClick={() => setExpandedPanel('steps')} title="Expand the program steps panel" />
-          <div style={{ flex: 1, overflow: 'hidden' }}>
-            <ProgramEditor />
-          </div>
-        </div>
-        <VerticalDivider onMouseDown={startVerticalDrag} dragging={activeDrag === 'v'} atLimit={leftAtLimit} />
-        <div style={{ flex: 1, overflow: 'hidden', background: '#FFFFFF', minWidth: VIEWER_MIN_WIDTH, position: 'relative' }}>
-          <PanelExpandBtn onClick={() => setExpandedPanel('3d')} title="Expand the 3D viewer" />
-          <ArmViewer3D />
-        </div>
+      {/* Steps panel — full width, fills remaining space above the
+          jog panel. */}
+      <div style={{ flex: 1, position: 'relative', overflow: 'hidden', minHeight: 0 }}>
+        <PanelExpandBtn onClick={() => setExpandedPanel('steps')} title="Expand the program steps panel" />
+        <ProgramEditor />
       </div>
 
       <HorizontalDivider onMouseDown={startHorizontalDrag} dragging={activeDrag === 'h'} atLimit={jogAtLimit} />
 
-      {/* Jog panel: overflow auto so a too-small height shows a
-          scrollbar instead of clipping the action buttons. The
-          existing Maximize button inside JogPanel routes through the
-          same expandedPanel state. */}
+      {/* Jog panel — full width, resizable height. */}
       <div style={{ height: jogHeight, flexShrink: 0, overflow: 'auto', borderTop: '1px solid #e5e7eb' }}>
         <JogPanel maximized={false} onToggleMaximize={() => setExpandedPanel('jog')} />
       </div>

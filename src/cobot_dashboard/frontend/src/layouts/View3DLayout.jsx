@@ -1,6 +1,9 @@
 import { useRef } from 'react'
 import { useStore } from '../store/useStore'
-import ArmViewer3D from '../components/ArmViewer3D'
+
+// ArmViewer3D import removed — the 3D arm viewer has been pulled
+// pending the Estun-supplied URDF. The component file is left in
+// place so it can be reintroduced later.
 
 const PRESETS = ['Front', 'Side', 'Top', 'Iso']
 
@@ -161,13 +164,29 @@ function LeftPanel({ armRef }) {
 }
 
 export default function View3DLayout() {
+  // armRef kept so LeftPanel's preset buttons don't blow up — they
+  // no-op (armRef.current is always null) which is fine while the
+  // viewer is absent.
   const armRef = useRef(null)
 
   return (
     <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
       <LeftPanel armRef={armRef} />
-      <div style={{ flex: 1, overflow: 'hidden' }}>
-        <ArmViewer3D ref={armRef} />
+      <div style={{
+        flex: 1, overflow: 'hidden',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        background: '#fafafa', color: '#6b7280', fontSize: 14, padding: 24,
+        textAlign: 'center',
+      }}>
+        <div>
+          <div style={{ fontSize: 18, fontWeight: 600, color: '#374151', marginBottom: 8 }}>
+            3D viewer unavailable
+          </div>
+          <div>
+            The articulated arm viewer is paused until Estun provides
+            a URDF with verified joint axes.
+          </div>
+        </div>
       </div>
     </div>
   )
