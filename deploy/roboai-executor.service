@@ -1,0 +1,15 @@
+[Unit]
+Description=RoboAi Program Executor
+After=network.target roboai-estun.service
+Requires=roboai-estun.service
+
+[Service]
+Type=simple
+User=teddy
+Environment="ROS_DOMAIN_ID=0"
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 run estun_driver program_executor_node'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

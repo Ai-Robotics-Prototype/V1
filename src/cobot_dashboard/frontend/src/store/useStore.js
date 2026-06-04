@@ -219,25 +219,33 @@ const storeDefinition = (set, get) => ({
   // Task commands
   // ---------------------------------------------------------------------------
 
-  runProgram() {
-    return get().sendCommand('task', { command: 'run' })
+  // Dispatches to the program_executor_node via /api/program/run. We
+  // keep the legacy /cmd/task sendCommand as a fallback so older code
+  // paths (and the sim, when the executor isn't running) still update
+  // STATE.task locally. The executor — when alive — overrides STATE.task
+  // via its 5Hz /task/state publish, so its view wins.
+  async _dispatchProgram(action, opts = {}) {
+    const programId = opts.programId
+      || (action === 'run' ? get().currentProgram?.id : undefined)
+    try {
+      await fetch('/api/program/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(programId ? { action, program_id: programId } : { action }),
+      })
+    } catch (e) { /* swallow; the sim fallback below still runs */ }
+    // Keep the legacy task-command path so the sim still progresses
+    // when the executor isn't connected.
+    const legacy = { run: 'run', pause: 'pause', resume: 'resume',
+                     stop: 'cancel', home: 'home' }[action]
+    if (legacy) return get().sendCommand('task', { command: legacy })
   },
 
-  pauseProgram() {
-    return get().sendCommand('task', { command: 'pause' })
-  },
-
-  resumeProgram() {
-    return get().sendCommand('task', { command: 'resume' })
-  },
-
-  homeRobot() {
-    return get().sendCommand('task', { command: 'home' })
-  },
-
-  cancelProgram() {
-    return get().sendCommand('task', { command: 'cancel' })
-  },
+  runProgram(opts)     { return get()._dispatchProgram('run', opts) },
+  pauseProgram()        { return get()._dispatchProgram('pause') },
+  resumeProgram()       { return get()._dispatchProgram('resume') },
+  homeRobot()           { return get()._dispatchProgram('home') },
+  cancelProgram()       { return get()._dispatchProgram('stop') },
 
   // ---------------------------------------------------------------------------
   // Jog commands

@@ -19,6 +19,7 @@ setup(
     entry_points={
         'console_scripts': [
             'estun_driver_node = estun_driver.estun_driver_node:main',
+            'program_executor_node = estun_driver.program_executor_node:main',
         ],
     },
 )

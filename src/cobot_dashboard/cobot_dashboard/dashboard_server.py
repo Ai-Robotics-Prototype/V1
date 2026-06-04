@@ -479,6 +479,10 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         # When connected, this overwrites the sim joints — real wins.
         self.create_subscription(String, "/estun/status", self._on_estun_status, 10)
 
+        # Program executor state (richer than /task/status: step labels,
+        # cycle stats, executor-state strings like 'waiting_motion').
+        self.create_subscription(String, "/task/state", self._on_task_state, 10)
+
         # Grasp planner output (JSON String — full per-candidate metadata).
         self.create_subscription(String, "/grasp/candidates",
                                  self._on_grasp_candidates, 5)
@@ -838,6 +842,37 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             STATE["joints"]["names"]      = list(msg.name)
             STATE["joints"]["positions"]  = list(msg.position)
             STATE["joints"]["velocities"] = list(msg.velocity) if msg.velocity else [0.0] * len(msg.name)
+
+    def _on_task_state(self, msg):
+        """Merge the program executor's state into STATE.task. Maps the
+        executor's 'state' string onto the running/paused booleans the
+        existing UI reads, and adds the richer fields (step_label,
+        cycle_count, etc.) for the Monitor dashboard."""
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        exec_state = d.get("state", "idle")
+        running_states = {"running", "waiting_motion", "waiting_io",
+                          "waiting_detect", "waiting_time"}
+        paused = (exec_state == "paused")
+        running = paused or (exec_state in running_states)
+        with _state_lock:
+            t = STATE["task"]
+            t["running"] = running
+            t["paused"]  = paused
+            t["state"]   = exec_state
+            cur = d.get("current_step", -1)
+            tot = d.get("total_steps", 0)
+            if isinstance(cur, int) and cur >= 0:
+                t["program_step"] = cur
+            t["program_total"]   = int(tot) if isinstance(tot, int) else t.get("program_total", 0)
+            # Richer passthrough fields the Monitor consumes directly.
+            for k in ("program_id", "program_name", "step_label", "step_action",
+                      "cycle_count", "last_cycle_time", "total_picks",
+                      "pick_passes", "pick_fails"):
+                if k in d:
+                    t[k] = d[k]
 
     def _on_estun_status(self, msg):
         """Mirror the Estun driver's status blob into STATE."""
@@ -1906,20 +1941,67 @@ if FASTAPI_AVAILABLE:
     # pass/fail + cycle-time history for the currently-loaded program.
     _program_stats: dict = {}
 
+    _STATS_DIR = '/opt/cobot/stats'
+
+    def _load_disk_stats(prog_id: str) -> dict:
+        """Read program_executor_node's stats blob from disk. Returns {}
+        on any error so the in-memory fallback can take over."""
+        try:
+            path = os.path.join(_STATS_DIR, f'{prog_id}.json')
+            if os.path.isfile(path):
+                with open(path) as f:
+                    return json.load(f) or {}
+        except Exception:
+            pass
+        return {}
+
     @app.get("/api/stats/program/{prog_id}")
     async def api_stats_program(prog_id: str):
-        s = _program_stats.get(prog_id, {})
+        # Disk (executor-written) wins when present; otherwise fall back
+        # to the in-memory mock stats.
+        disk = _load_disk_stats(prog_id)
+        s = disk if disk else _program_stats.get(prog_id, {})
         return {
             'total':        s.get('total', 0),
             'pass':         s.get('pass', 0),
             'fail':         s.get('fail', 0),
             'fail_reasons': list(s.get('fail_reasons', [])),
+            'last_run':     s.get('last_run'),
         }
 
     @app.get("/api/stats/program/{prog_id}/cycle_times")
     async def api_stats_program_cycle_times(prog_id: str):
-        s = _program_stats.get(prog_id, {})
+        disk = _load_disk_stats(prog_id)
+        s = disk if disk else _program_stats.get(prog_id, {})
         return {'cycle_times': list(s.get('cycle_times', []))}
+
+    @app.post("/api/program/run")
+    async def api_program_run(request: Request):
+        """Dispatch run/pause/resume/stop/home to the program executor.
+        Body: {action, program_id?}. Without program_id, the executor
+        resumes / re-runs whatever it currently has loaded."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        action = str(body.get('action', 'run'))
+        prog_id = body.get('program_id')
+        if action not in ('run', 'pause', 'resume', 'stop', 'home'):
+            return JSONResponse({'error': f'unknown action {action!r}'}, status_code=400)
+        if _ros_node is not None:
+            try:
+                if not hasattr(_ros_node, '_run_program_pub'):
+                    _ros_node._run_program_pub = _ros_node.create_publisher(
+                        String, '/task/run_program', 10)
+                payload = {'action': action}
+                if prog_id:
+                    payload['program_id'] = str(prog_id)
+                m = String()
+                m.data = json.dumps(payload)
+                _ros_node._run_program_pub.publish(m)
+            except Exception as e:
+                return JSONResponse({'error': str(e)}, status_code=500)
+        return {'ok': True, 'action': action, 'program_id': prog_id}
 
     # Folder index — sibling JSON to the program files. Underscored so
     # it's ignored by the program-list scan and by the slug regex.
