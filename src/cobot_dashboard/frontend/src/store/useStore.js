@@ -333,11 +333,10 @@ const storeDefinition = (set, get) => ({
   // so switching to another tab and back keeps the panels at the
   // sizes the operator dragged them to.
   programLayout: {
-    // leftWidth removed with the 3D viewer pullout — no vertical
-    // split in the Program tab anymore, only jogHeight matters.
+    leftWidth:    560,
     jogHeight:    500,
     jogMaximized: false,        // legacy alias — kept for persisted state
-    expandedPanel: null,         // 'steps' | 'jog' | null
+    expandedPanel: null,         // 'steps' | '3d' | 'jog' | null
   },
   setProgramLayout(patch) {
     set((s) => ({ programLayout: { ...s.programLayout, ...patch } }))
