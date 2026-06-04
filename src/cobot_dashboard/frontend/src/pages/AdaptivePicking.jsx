@@ -555,6 +555,17 @@ function TeachWizard({ part, onClose, onComplete }) {
   // 'flipped'  = part upside-down (robot must flip before pick)
   // 'on_side'  = part on its side (robot must reorient before pick)
   const [orientation, setOrientation]         = useState('pickable')
+  // Defect-teaching state. defectTypes is the running list of defect
+  // names the operator has captured so far (one entry per unique
+  // name, with a capture count that increments when they re-capture
+  // the same defect from a different angle). The form fields below
+  // are bound to the current capture; on success they're folded
+  // into defectTypes and the form clears for the next one.
+  const [defectTypes,        setDefectTypes]        = useState([])
+  const [defectName,         setDefectName]         = useState('')
+  const [defectDescription,  setDefectDescription]  = useState('')
+  const [defectSeverity,     setDefectSeverity]     = useState('reject')
+  const [capturingDefect,    setCapturingDefect]    = useState(false)
   // Rendered image bounds inside the camera pane. The MJPEG stream is
   // 640×480 native; the <img> uses object-fit:contain so the actual
   // drawn area is letterboxed inside its container. Detection boxes
@@ -663,7 +674,67 @@ function TeachWizard({ part, onClose, onComplete }) {
     return ok
   }
 
-  const totalSteps = 6
+  async function captureDefect() {
+    const name = defectName.trim()
+    if (!name) return
+    setCapturingDefect(true)
+    setError(null)
+    try {
+      const idx = selectedDetection ?? 0
+      const res = await fetch(`/api/parts/${part.id}/teach`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          detection_index:     idx,
+          action:              'teach',
+          part_id:             part.id,
+          // Defect refs ride the same teach endpoint, with extra
+          // metadata that the backend folds into defects.json.
+          // depth_segment_node still writes the .npz so the visual
+          // ref is captured; the matcher will learn to filter on
+          // is_defect once that flow lands.
+          is_defect:           true,
+          defect_name:         name,
+          defect_description:  defectDescription.trim(),
+          defect_severity:     defectSeverity,
+          orientation:         'pickable',  // unused for defects but required by validator
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data.captured === false) {
+        setError('No object captured — make sure the defective part is in view and a green box is visible.')
+      } else if (res.ok) {
+        // Fold into the running list; same name increments captures,
+        // otherwise append a new entry.
+        setDefectTypes((prev) => {
+          const i = prev.findIndex((d) => d.name.toLowerCase() === name.toLowerCase())
+          if (i >= 0) {
+            const copy = prev.slice()
+            copy[i] = { ...copy[i], captures: copy[i].captures + 1,
+                        description: defectDescription.trim() || copy[i].description,
+                        severity:    defectSeverity }
+            return copy
+          }
+          return [...prev, {
+            name,
+            description: defectDescription.trim(),
+            severity:    defectSeverity,
+            captures:    1,
+          }]
+        })
+        setFlashGreen(true)
+        setTimeout(() => setFlashGreen(false), 600)
+      } else {
+        setError(data.error || `Capture failed (HTTP ${res.status})`)
+      }
+    } catch (e) {
+      setError(e.message || 'Network error')
+    }
+    setCapturingDefect(false)
+  }
+
+  // 0 intro, 1-4 angles, 5 defects-intro, 6 defect-capture, 7 review.
+  const totalSteps = 8
 
   const stepContent = {
     0: {
@@ -718,8 +789,37 @@ function TeachWizard({ part, onClose, onComplete }) {
       showCamera: true,
     },
     5: {
+      title:      'Teach Defective Parts?',
+      subtitle:   'Optional — improves quality inspection later',
+      instruction:
+        'You can optionally teach the robot what defective versions of this part ' +
+        'look like. The matcher will then flag matching defective parts so the ' +
+        'task planner can sort them into a reject bin. Skip this step if you ' +
+        'only want to teach good parts.',
+      showCamera: false,
+      // Two-button special case rendered in the non-camera branch.
+      defectsIntro: true,
+    },
+    6: {
+      title:      'Teach Defect',
+      subtitle:   defectTypes.length === 0
+        ? 'Place a defective part in front of Camera 0'
+        : `${defectTypes.length} defect type${defectTypes.length === 1 ? '' : 's'} captured so far`,
+      instruction:
+        '1. Place a defective example of the part in view of Camera 0\n' +
+        '2. Click the detection box that matches it\n' +
+        '3. Name the defect (e.g. "Cracked", "Bent", "Missing hole")\n' +
+        '4. Add a description and pick a severity\n' +
+        '5. Click "Capture Defect"\n' +
+        '6. Repeat for as many defect types as you have, or click Done',
+      showCamera: true,
+      defectCapture: true,
+    },
+    7: {
       title:    'Teaching Complete!',
-      subtitle: `${captures.length} angle${captures.length === 1 ? '' : 's'} captured for ${part.name}`,
+      subtitle: `${captures.length} good angle${captures.length === 1 ? '' : 's'}`
+        + (defectTypes.length > 0 ? ` · ${defectTypes.length} defect type${defectTypes.length === 1 ? '' : 's'}` : '')
+        + ` captured for ${part.name}`,
       instruction: captures.length >= 3
         ? 'Teaching was successful. The robot can now recognise this part from ' +
           'multiple angles. You can close this wizard and test recognition on the ' +
@@ -1107,7 +1207,7 @@ function TeachWizard({ part, onClose, onComplete }) {
                   </button>
                 )}
                 <button
-                  onClick={() => step < 5 ? setStep(step + 1) : (onComplete?.(), onClose?.())}
+                  onClick={() => step < 7 ? setStep(step + 1) : (onComplete?.(), onClose?.())}
                   style={{
                     padding: '8px 16px', fontSize: 12,
                     background: 'transparent', color: 'var(--text-muted)',
@@ -1116,27 +1216,278 @@ function TeachWizard({ part, onClose, onComplete }) {
                     marginLeft: 'auto',
                   }}
                 >
-                  {step < 4 ? 'Skip this angle →' : step === 4 ? 'Finish →' : 'Close'}
+                  {step < 4 ? 'Skip this angle →' : step === 4 ? 'Continue →' : 'Close'}
+                </button>
+              </div>
+            </div>
+          </>
+        ) : current.defectCapture ? (
+          /* Defect capture — same camera as steps 1-4, different right
+             panel. We re-use the camera + detection overlay above by
+             rendering them again here; React doesn't mind. */
+          <>
+            <div style={{
+              flex: 3, position: 'relative', background: '#111',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              border: flashGreen ? '4px solid var(--red)' : '4px solid transparent',
+              transition: 'border-color 200ms',
+            }}>
+              <img
+                ref={imgRef}
+                src="/stream/cam0"
+                alt="cam0"
+                style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+                onLoad={() => {
+                  const el = imgRef.current
+                  if (!el?.parentElement) return
+                  const c = el.parentElement.getBoundingClientRect()
+                  const scale = Math.min(c.width / 640, c.height / 480)
+                  setImgBounds({
+                    w: 640 * scale, h: 480 * scale,
+                    offX: (c.width - 640 * scale) / 2,
+                    offY: (c.height - 480 * scale) / 2,
+                  })
+                }}
+              />
+              {liveDetections.map((det, i) => {
+                const bp = det.bbox_px
+                if (!bp || bp.length < 4) return null
+                const [x1, y1, x2, y2] = bp
+                const left   = imgBounds.offX + (x1 / 640) * imgBounds.w
+                const top    = imgBounds.offY + (y1 / 480) * imgBounds.h
+                const width  = ((x2 - x1) / 640) * imgBounds.w
+                const height = ((y2 - y1) / 480) * imgBounds.h
+                const isSelected = selectedDetection === i
+                return (
+                  <div
+                    key={i}
+                    onClick={(e) => { e.stopPropagation(); setSelectedDet(isSelected ? null : i) }}
+                    style={{
+                      position: 'absolute',
+                      left: `${left}px`, top: `${top}px`,
+                      width: `${width}px`, height: `${height}px`,
+                      border:    isSelected ? '3px solid #3B82F6' : '2px solid #DC2626',
+                      background: isSelected ? 'rgba(59,130,246,0.20)' : 'rgba(220,38,38,0.08)',
+                      borderRadius: 4, cursor: 'pointer',
+                      zIndex: 10, pointerEvents: 'auto',
+                    }}
+                  />
+                )
+              })}
+              {liveDetections.length === 0 && (
+                <div style={{
+                  position: 'absolute', bottom: 20, left: '50%',
+                  transform: 'translateX(-50%)',
+                  background: 'rgba(0,0,0,0.7)', color: '#FCD34D',
+                  padding: '8px 16px', borderRadius: 8, fontSize: 13,
+                }}>
+                  No objects detected — place the defective part in view of Camera 0
+                </div>
+              )}
+            </div>
+
+            {/* Right panel — defect form */}
+            <div style={{
+              flex: 2, padding: 24, overflow: 'auto',
+              display: 'flex', flexDirection: 'column', gap: 12,
+              background: 'var(--bg-panel)', borderLeft: '1px solid var(--border)',
+            }}>
+              <div style={{ fontSize: 18, fontWeight: 700, color: '#DC2626' }}>
+                Teach Defect {defectTypes.length === 0 ? '' : `#${defectTypes.length + 1}`}
+              </div>
+
+              <div style={{
+                background: 'var(--bg-surface)',
+                borderRadius: 'var(--radius-md)', padding: 12,
+              }}>
+                {current.instruction.split('\n').map((line, i) => (
+                  <div key={i} style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 3 }}>
+                    {line}
+                  </div>
+                ))}
+              </div>
+
+              {error && (
+                <div style={{
+                  background: 'var(--red-dim)', border: '1px solid var(--red)',
+                  borderRadius: 'var(--radius-md)', padding: 10, fontSize: 12, color: 'var(--red)',
+                }}>
+                  {error}
+                </div>
+              )}
+
+              <div>
+                <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', display: 'block', marginBottom: 4 }}>
+                  Defect type name
+                </label>
+                <input
+                  value={defectName}
+                  onChange={(e) => setDefectName(e.target.value)}
+                  placeholder="Cracked / Bent / Missing hole / Scratched"
+                  style={{
+                    width: '100%', padding: '10px 12px', fontSize: 14,
+                    border: '2px solid #DC2626', borderRadius: 6, outline: 'none',
+                    background: '#fff', color: '#111', boxSizing: 'border-box',
+                  }}
+                />
+              </div>
+
+              <div>
+                <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', display: 'block', marginBottom: 4 }}>
+                  Description
+                </label>
+                <textarea
+                  value={defectDescription}
+                  onChange={(e) => setDefectDescription(e.target.value)}
+                  placeholder="What does this defect look like?"
+                  rows={3}
+                  style={{
+                    width: '100%', padding: '10px 12px', fontSize: 13,
+                    border: '1px solid var(--border)', borderRadius: 6, outline: 'none',
+                    background: '#fff', color: '#111', resize: 'vertical',
+                    boxSizing: 'border-box', fontFamily: 'inherit',
+                  }}
+                />
+              </div>
+
+              <div>
+                <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', display: 'block', marginBottom: 4 }}>
+                  Severity
+                </label>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  {[
+                    { id: 'reject',   label: 'Reject',   color: '#DC2626' },
+                    { id: 'warning',  label: 'Warning',  color: '#CA8A04' },
+                    { id: 'cosmetic', label: 'Cosmetic', color: '#6b7280' },
+                  ].map((opt) => {
+                    const active = defectSeverity === opt.id
+                    return (
+                      <button
+                        key={opt.id}
+                        onClick={() => setDefectSeverity(opt.id)}
+                        style={{
+                          flex: 1, padding: '10px 6px', fontSize: 12, fontWeight: active ? 700 : 500,
+                          background: active ? opt.color : 'var(--bg-surface)',
+                          color: active ? '#fff' : 'var(--text-secondary)',
+                          border: active ? `1px solid ${opt.color}` : '1px solid var(--border)',
+                          borderRadius: 'var(--radius-md)', cursor: 'pointer',
+                        }}
+                      >
+                        {opt.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+
+              <button
+                onClick={captureDefect}
+                disabled={!defectName.trim() || capturingDefect || liveDetections.length === 0}
+                style={{
+                  padding: '14px', fontSize: 15, fontWeight: 700,
+                  background: (defectName.trim() && liveDetections.length > 0 && !capturingDefect) ? '#DC2626' : 'var(--bg-surface)',
+                  color: (defectName.trim() && liveDetections.length > 0 && !capturingDefect) ? '#fff' : 'var(--text-muted)',
+                  border: 'none', borderRadius: 'var(--radius-lg)',
+                  cursor: (defectName.trim() && liveDetections.length > 0 && !capturingDefect) ? 'pointer' : 'not-allowed',
+                  marginTop: 4,
+                }}
+              >
+                {capturingDefect ? 'Capturing…'
+                  : !defectName.trim() ? 'Name the defect first'
+                  : liveDetections.length === 0 ? 'Waiting for object…'
+                  : 'Capture Defect'}
+              </button>
+
+              {/* Captured defects so far */}
+              {defectTypes.length > 0 && (
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 6 }}>
+                    Captured defects ({defectTypes.length})
+                  </div>
+                  {defectTypes.map((d, i) => (
+                    <div key={i} style={{
+                      display: 'flex', alignItems: 'center', gap: 8,
+                      padding: '8px 10px', marginBottom: 4,
+                      background: '#fef2f2', border: '1px solid #fecaca',
+                      borderRadius: 6,
+                    }}>
+                      <span style={{
+                        padding: '2px 6px', borderRadius: 3, fontSize: 9, fontWeight: 700, color: '#fff',
+                        background: d.severity === 'reject' ? '#DC2626' : d.severity === 'warning' ? '#CA8A04' : '#6b7280',
+                      }}>{d.severity.toUpperCase()}</span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: '#DC2626' }}>{d.name}</div>
+                        {d.description && (
+                          <div style={{ fontSize: 11, color: '#6b7280', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {d.description}
+                          </div>
+                        )}
+                      </div>
+                      <span style={{ fontSize: 11, color: '#9ca3af', flexShrink: 0 }}>
+                        {d.captures} ref{d.captures !== 1 ? 's' : ''}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Navigation */}
+              <div style={{ display: 'flex', gap: 8, marginTop: 'auto' }}>
+                <button
+                  onClick={() => setStep(5)}
+                  style={{
+                    padding: '8px 16px', fontSize: 12,
+                    background: 'var(--bg-surface)', color: 'var(--text-secondary)',
+                    border: '1px solid var(--border)',
+                    borderRadius: 'var(--radius-md)', cursor: 'pointer',
+                  }}
+                >
+                  ← Back
+                </button>
+                <button
+                  onClick={() => { setDefectName(''); setDefectDescription(''); setDefectSeverity('reject') }}
+                  style={{
+                    padding: '8px 16px', fontSize: 12,
+                    background: '#fef2f2', color: '#DC2626',
+                    border: '1px solid #fecaca',
+                    borderRadius: 'var(--radius-md)', cursor: 'pointer',
+                  }}
+                >
+                  Clear form
+                </button>
+                <button
+                  onClick={() => setStep(7)}
+                  style={{
+                    padding: '8px 16px', fontSize: 12, fontWeight: 600,
+                    background: 'var(--green)', color: '#fff',
+                    border: 'none',
+                    borderRadius: 'var(--radius-md)', cursor: 'pointer',
+                    marginLeft: 'auto',
+                  }}
+                >
+                  Done — Review →
                 </button>
               </div>
             </div>
           </>
         ) : (
-          /* Intro and review screens */
+          /* Intro / defects-intro / review screens */
           <div style={{
             flex: 1, display: 'flex', flexDirection: 'column',
             alignItems: 'center', justifyContent: 'center',
-            padding: 40, gap: 24, textAlign: 'center',
+            padding: 40, gap: 20, textAlign: 'center',
           }}>
             <div style={{ fontSize: 48 }}>
-              {step === 0 ? '🎯' : captures.length >= 3 ? '✅' : '⚠️'}
+              {step === 0 ? '🎯'
+                : step === 5 ? '🔍'
+                : captures.length >= 3 ? '✅' : '⚠️'}
             </div>
             <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--text-primary)' }}>
               {current.title}
             </div>
             <div style={{
               fontSize: 14, color: 'var(--text-secondary)',
-              maxWidth: 500, whiteSpace: 'pre-wrap',
+              maxWidth: 560, whiteSpace: 'pre-wrap',
             }}>
               {current.instruction}
             </div>
@@ -1149,22 +1500,89 @@ function TeachWizard({ part, onClose, onComplete }) {
                 {current.detail}
               </div>
             )}
-            {step === 5 && captures.length > 0 && (
-              <div style={{ display: 'flex', gap: 12 }}>
-                {captures.map((c, i) => (
-                  <div key={i} style={{
-                    width: 60, height: 60, borderRadius: '50%',
-                    background: 'var(--green-dim)',
-                    border: '2px solid var(--green)',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    fontSize: 12, fontWeight: 700, color: 'var(--green)',
-                  }}>
-                    {c.angle}°
+
+            {/* Review summary at step 7: good orientations + defect types */}
+            {step === 7 && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 16, alignItems: 'center', width: '100%', maxWidth: 600 }}>
+                {captures.length > 0 && (
+                  <div style={{ width: '100%' }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--green)', marginBottom: 8, textAlign: 'left' }}>
+                      Good Part References ({captures.length})
+                    </div>
+                    <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
+                      {captures.map((c, i) => (
+                        <div key={i} style={{
+                          width: 56, height: 56, borderRadius: '50%',
+                          background: 'var(--green-dim)',
+                          border: '2px solid var(--green)',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          fontSize: 12, fontWeight: 700, color: 'var(--green)',
+                        }}>
+                          {c.angle}°
+                        </div>
+                      ))}
+                    </div>
                   </div>
-                ))}
+                )}
+                {defectTypes.length > 0 && (
+                  <div style={{ width: '100%' }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: '#DC2626', marginBottom: 8, textAlign: 'left' }}>
+                      Defect References ({defectTypes.length} type{defectTypes.length === 1 ? '' : 's'})
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      {defectTypes.map((d, i) => (
+                        <div key={i} style={{
+                          display: 'flex', alignItems: 'center', gap: 8,
+                          padding: '8px 12px', textAlign: 'left',
+                          background: '#fef2f2', borderRadius: 6, border: '1px solid #fecaca',
+                        }}>
+                          <span style={{
+                            padding: '2px 8px', borderRadius: 4, fontSize: 10, fontWeight: 700, color: '#fff',
+                            background: d.severity === 'reject' ? '#DC2626' : d.severity === 'warning' ? '#CA8A04' : '#6b7280',
+                          }}>{d.severity.toUpperCase()}</span>
+                          <span style={{ fontSize: 13, fontWeight: 600, color: '#DC2626' }}>{d.name}</span>
+                          {d.description && (
+                            <span style={{ fontSize: 11, color: '#6b7280', flex: 1,
+                                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {d.description}
+                            </span>
+                          )}
+                          <span style={{ fontSize: 11, color: '#9ca3af', marginLeft: 'auto' }}>
+                            {d.captures} ref{d.captures !== 1 ? 's' : ''}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
-            {current.action && (
+
+            {/* Step 5 has two buttons (Yes / Skip) instead of one action */}
+            {current.defectsIntro ? (
+              <div style={{ display: 'flex', gap: 12 }}>
+                <button
+                  onClick={() => setStep(6)}
+                  style={{
+                    padding: '14px 28px', fontSize: 15, fontWeight: 700,
+                    background: '#DC2626', color: '#fff',
+                    border: 'none', borderRadius: 'var(--radius-lg)', cursor: 'pointer',
+                  }}
+                >
+                  Yes — Teach Defects
+                </button>
+                <button
+                  onClick={() => setStep(7)}
+                  style={{
+                    padding: '14px 28px', fontSize: 15, fontWeight: 600,
+                    background: 'var(--bg-surface)', color: 'var(--text-secondary)',
+                    border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', cursor: 'pointer',
+                  }}
+                >
+                  Skip — No Defects
+                </button>
+              </div>
+            ) : current.action && (
               <button
                 onClick={current.action.onClick}
                 style={{

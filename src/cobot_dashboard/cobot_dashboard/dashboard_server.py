@@ -11,6 +11,7 @@ import struct
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 try:
@@ -1738,6 +1739,15 @@ if FASTAPI_AVAILABLE:
         orientation = str(body.get('orientation') or 'pickable')
         if orientation not in ('pickable', 'flipped', 'on_side'):
             orientation = 'pickable'
+        is_defect          = bool(body.get('is_defect') or False)
+        defect_name        = str(body.get('defect_name') or '').strip()
+        defect_description = str(body.get('defect_description') or '').strip()
+        defect_severity    = str(body.get('defect_severity') or 'reject')
+        if defect_severity not in ('reject', 'warning', 'cosmetic'):
+            defect_severity = 'reject'
+        if is_defect and not defect_name:
+            return JSONResponse({"error": "defect_name required when is_defect=true"}, status_code=400)
+
         if _ros_node is None or _ros_node._teach_cmd_pub is None:
             return JSONResponse({"error": "ROS node not ready"}, status_code=503)
 
@@ -1751,28 +1761,97 @@ if FASTAPI_AVAILABLE:
 
         _ros_node.get_logger().info(
             f'TEACH: part_id={part_id} detection_index={det_idx} '
-            f'orientation={orientation} (before={before})'
+            f'orientation={orientation} is_defect={is_defect} '
+            f'defect_name={defect_name!r} (before={before})'
         )
         m = String()
-        m.data = json.dumps({
+        payload = {
             'action':           'teach',
             'part_id':          part_id,
             'detection_index':  det_idx,
             'orientation':      orientation,
-        })
+        }
+        if is_defect:
+            # Pass defect fields to depth_segment_node so it can route
+            # the capture if/when it learns to. Today the node ignores
+            # the extra keys; the metadata lives in defects.json below.
+            payload.update({
+                'is_defect':           True,
+                'defect_name':         defect_name,
+                'defect_description':  defect_description,
+                'defect_severity':     defect_severity,
+            })
+        m.data = json.dumps(payload)
         _ros_node._teach_cmd_pub.publish(m)
 
         # Give depth_segment_node a moment to write the .npz.
         import asyncio as _asyncio
         await _asyncio.sleep(0.6)
         after = _count()
+        captured = after > before
+
+        # On a successful defect capture, fold the defect metadata
+        # into a per-part defects.json. Same name → captures++; new
+        # name → append. The matcher will learn to consult this when
+        # the defect-aware path is wired.
+        if is_defect and captured:
+            try:
+                os.makedirs(teach_dir, exist_ok=True)
+                defects_path = os.path.join(teach_dir, 'defects.json')
+                data = {'defects': []}
+                if os.path.isfile(defects_path):
+                    with open(defects_path) as f:
+                        try: data = json.load(f) or {'defects': []}
+                        except Exception: data = {'defects': []}
+                defects = data.get('defects') or []
+                now = datetime.now().isoformat(timespec='seconds')
+                hit = None
+                for d in defects:
+                    if str(d.get('name', '')).lower() == defect_name.lower():
+                        hit = d; break
+                if hit is not None:
+                    hit['captures']      = int(hit.get('captures', 0)) + 1
+                    hit['last_captured'] = now
+                    if defect_description:
+                        hit['description'] = defect_description
+                    hit['severity'] = defect_severity
+                else:
+                    defects.append({
+                        'name':           defect_name,
+                        'description':    defect_description,
+                        'severity':       defect_severity,
+                        'captures':       1,
+                        'first_captured': now,
+                        'last_captured':  now,
+                    })
+                data['defects'] = defects
+                with open(defects_path, 'w') as f:
+                    json.dump(data, f, indent=2)
+            except Exception as e:
+                _ros_node.get_logger().warn(f'defects.json update failed: {e}')
+
         return {
             "ok":          True,
-            "status":      "captured" if after > before else "no_capture",
+            "status":      "captured" if captured else "no_capture",
             "part_id":     part_id,
             "teach_count": after,
-            "captured":    after > before,
+            "captured":    captured,
+            "is_defect":   is_defect,
         }
+
+    @app.get("/api/parts/{part_id}/defects")
+    async def api_parts_defects(part_id: str):
+        """Read the per-part defects.json so the teach wizard can show
+        previously-captured defects when the operator re-opens it."""
+        defects_path = f'/opt/cobot/parts/teach/{part_id}/defects.json'
+        if not os.path.isfile(defects_path):
+            return {"defects": []}
+        try:
+            with open(defects_path) as f:
+                data = json.load(f) or {}
+            return {"defects": data.get('defects') or []}
+        except Exception:
+            return {"defects": []}
 
     @app.post("/api/teach_mode/start")
     async def api_teach_mode_start():
