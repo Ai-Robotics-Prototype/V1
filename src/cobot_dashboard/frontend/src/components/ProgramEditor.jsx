@@ -563,7 +563,8 @@ function InsertionBar() {
 // 80px (so a one-character draft is still clickable) and 300px (so a
 // long paste doesn't push the row's buttons off the right edge).
 function labelInputWidth(text) {
-  return Math.max(80, Math.min(300, (text || '').length * 8 + 24))
+  // Sized for the bumped 16 px label font: ~10 px per char.
+  return Math.max(120, Math.min(420, (text || '').length * 10 + 28))
 }
 
 function EditableStepLabel({ value, onSave }) {
@@ -595,9 +596,9 @@ function EditableStepLabel({ value, onSave }) {
           else if (e.key === 'Escape') { setDraft(value); setEditing(false) }
         }}
         style={{
-          fontSize: 12, fontWeight: 600, padding: '2px 6px',
+          fontSize: 16, fontWeight: 700, padding: '3px 8px',
           background: '#fff', color: '#111',
-          border: '1px solid #2563EB', borderRadius: 3,
+          border: '1px solid #2563EB', borderRadius: 4,
           outline: 'none',
           width: labelInputWidth(draft),
         }}
@@ -610,8 +611,8 @@ function EditableStepLabel({ value, onSave }) {
       onClick={(e) => { e.stopPropagation(); setDraft(value); setEditing(true) }}
       title="Click to rename"
       style={{
-        fontSize: 12, fontWeight: 600, color: '#111',
-        cursor: 'text', padding: '2px 4px', borderRadius: 3,
+        fontSize: 16, fontWeight: 700, color: '#111',
+        cursor: 'text', padding: '2px 4px', borderRadius: 4,
         display: 'inline-block',
         whiteSpace: 'nowrap',
         maxWidth: '100%',
@@ -1253,8 +1254,8 @@ export default function ProgramEditor() {
                 onDrop={(e) => handleDrop(e, step.id)}
                 onDragEnd={handleDragEnd}
                 style={{
-                  display: 'flex', alignItems: 'center', gap: 10,
-                  padding: '8px 12px', marginBottom: 4, borderRadius: 6,
+                  display: 'flex', alignItems: 'center', gap: 12,
+                  padding: '10px 14px', marginBottom: 4, borderRadius: 8,
                   // Selection wins over the live-task highlight so the
                   // user can always tell what they just clicked.
                   background: isDragging ? '#f1f5f9'
@@ -1271,35 +1272,35 @@ export default function ProgramEditor() {
                   transformOrigin: 'left center',
                   transition: 'opacity 150ms, transform 150ms, background 100ms, border 100ms',
                 }}>
-              <div style={{ color: '#9ca3af', fontSize: 14, flexShrink: 0, userSelect: 'none', lineHeight: 1 }}>:::</div>
+              <div style={{ color: '#9ca3af', fontSize: 18, flexShrink: 0, userSelect: 'none', lineHeight: 1 }}>⋮⋮</div>
 
               <div style={{
-                width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
+                width: 32, height: 32, borderRadius: '50%', flexShrink: 0,
                 background: isDone ? '#16A34A' : isActive ? '#2563EB' : '#e5e7eb',
                 color: isDone || isActive ? '#fff' : '#6b7280',
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
-                fontSize: 11, fontWeight: 700,
+                fontSize: 13, fontWeight: 700,
               }}>
                 {isDone ? '✓' : (idx + 1)}
               </div>
 
-              {isTeachable(step) &&(
+              {isTeachable(step) && (
                 <div title={step.taught ? `Taught at ${step.taught_at || 'unknown'}` : 'Position not taught — click Teach'}
                   style={{
-                    width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
+                    width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
                     display: 'flex', alignItems: 'center', justifyContent: 'center',
                     background: step.taught ? '#f0fdf4' : '#fef2f2',
                     border:     step.taught ? '2px solid #16A34A' : '2px dashed #DC2626',
                     color:      step.taught ? '#16A34A' : '#DC2626',
-                    fontSize: 10, fontWeight: 700,
+                    fontSize: 11, fontWeight: 700,
                   }}>
                   {step.taught ? 'T' : '!'}
                 </div>
               )}
 
               <span style={{
-                fontSize: 9, fontWeight: 700, padding: '2px 6px',
-                borderRadius: 3, flexShrink: 0, letterSpacing: '0.5px',
+                fontSize: 11, fontWeight: 700, padding: '3px 8px',
+                borderRadius: 4, flexShrink: 0, letterSpacing: '0.5px',
                 background: tagColor + '18', color: tagColor,
               }}>
                 {def.tag}
@@ -1307,36 +1308,36 @@ export default function ProgramEditor() {
 
               <div style={{ flex: 1, minWidth: 0 }}>
                 {locked ? (
-                  <span style={{
-                    fontSize: 12, fontWeight: 600, color: '#111',
-                    padding: '2px 4px', display: 'inline-block',
+                  <div style={{
+                    fontSize: 16, fontWeight: 700, color: '#111',
+                    padding: '2px 4px',
                     overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                    maxWidth: '100%',
+                    marginBottom: 2,
                   }}>
                     {step.label || def.label}
-                  </span>
+                  </div>
                 ) : (
                   <EditableStepLabel
                     value={step.label || def.label}
                     onSave={(newLabel) => handleRename(step.id, newLabel)}
                   />
                 )}
-                <div style={{ fontSize: 10, color: '#6b7280',
+                <div style={{ fontSize: 13, color: '#6b7280',
                               overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                               padding: '0 4px' }}>
                   {detailLine(step, ioLabels)}
                 </div>
-                {isTeachable(step) &&step.taught && step.taught_joints && (
+                {isTeachable(step) && step.taught && step.taught_joints && (
                   <div style={{
-                    fontSize: 10, color: '#16A34A', padding: '0 4px',
+                    fontSize: 13, color: '#16A34A', padding: '0 4px',
                     overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                   }}>
                     J=[{step.taught_joints.map((j) => Number(j).toFixed(1)).join(', ')}]°
                     {step.taught_tcp && ' · TCP=[' + step.taught_tcp.slice(0, 3).map((t) => Number(t).toFixed(3)).join(', ') + ']'}
                   </div>
                 )}
-                {isTeachable(step) &&!step.taught && (
-                  <div style={{ fontSize: 10, color: '#DC2626', padding: '0 4px', fontWeight: 600 }}>
+                {isTeachable(step) && !step.taught && (
+                  <div style={{ fontSize: 13, color: '#DC2626', padding: '0 4px', fontWeight: 600, marginTop: 2 }}>
                     Not taught
                   </div>
                 )}
@@ -1352,22 +1353,22 @@ export default function ProgramEditor() {
                   console.log('[ProgramEditor] Edit button clicked id=' + step.id + ' (was editingId=' + editingId + ')')
                   setEditingId(step.id)
                 }}
-                  style={{ padding: '4px 10px', fontSize: 10, fontWeight: 600,
+                  style={{ padding: '6px 14px', fontSize: 12, fontWeight: 600,
                            background: '#eff6ff', color: '#2563EB',
-                           border: '1px solid #bfdbfe', borderRadius: 4,
+                           border: '1px solid #bfdbfe', borderRadius: 5,
                            cursor: 'pointer', flexShrink: 0 }}>
                   Edit
                 </button>
               )}
-              {!locked && isTeachable(step) &&(
+              {!locked && isTeachable(step) && (
                 <button onClick={(e) => { e.stopPropagation(); teachStep(step.id) }}
                   title={step.taught ? 'Re-record this position from the current robot pose' : 'Record the current robot pose as this step\'s position'}
                   style={{
-                    padding: '4px 10px', fontSize: 10, fontWeight: 600, flexShrink: 0,
+                    padding: '6px 14px', fontSize: 12, fontWeight: 600, flexShrink: 0,
                     background: step.taught ? '#f0fdf4' : '#eff6ff',
                     color:      step.taught ? '#16A34A' : '#2563EB',
                     border:     step.taught ? '1px solid #bbf7d0' : '1px solid #bfdbfe',
-                    borderRadius: 4, cursor: 'pointer',
+                    borderRadius: 5, cursor: 'pointer',
                   }}>
                   {step.taught ? 'Re-teach' : 'Teach'}
                 </button>
@@ -1376,9 +1377,9 @@ export default function ProgramEditor() {
                 <button onClick={(e) => { e.stopPropagation(); if (!isActive) handleDelete(step.id) }}
                   disabled={isActive}
                   title={isActive ? 'Cannot delete the active step' : 'Delete step'}
-                  style={{ padding: '3px 8px', fontSize: 10,
+                  style={{ padding: '6px 14px', fontSize: 12, fontWeight: 600,
                            background: '#fef2f2', color: '#DC2626',
-                           border: '1px solid #fecaca', borderRadius: 3,
+                           border: '1px solid #fecaca', borderRadius: 5,
                            cursor: isActive ? 'not-allowed' : 'pointer', flexShrink: 0,
                            opacity: isActive ? 0.4 : 1 }}>
                   Del
