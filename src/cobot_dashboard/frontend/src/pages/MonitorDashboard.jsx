@@ -744,27 +744,11 @@ export default function MonitorDashboard() {
           </div>
         </div>
 
-        <div style={{
-          width: 400, height: 280, borderRadius: 12, overflow: 'hidden',
-          background: '#111', border: '1px solid #e5e7eb', flexShrink: 0,
-          position: 'relative',
-        }}>
-          <img src="/stream/annotated" alt="Live camera"
-            style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-            onError={(e) => { e.target.src = '/stream/cam0' }}
-          />
-          <div style={{
-            position: 'absolute', top: 8, left: 8,
-            background: 'rgba(0,0,0,0.6)', color: '#fff',
-            padding: '3px 10px', borderRadius: 4, fontSize: 11, fontWeight: 600,
-          }}>LIVE</div>
-          {detectionCount > 0 && (
-            <div style={{
-              position: 'absolute', bottom: 8, left: 8,
-              background: 'rgba(37,99,235,0.8)', color: '#fff',
-              padding: '3px 10px', borderRadius: 4, fontSize: 11, fontWeight: 600,
-            }}>{detectionCount} object{detectionCount !== 1 ? 's' : ''} detected</div>
-          )}
+        {/* Top-right: 3D viewer of the current program's target part.
+            The live camera moved out — it has its own home in the
+            Cameras & LiDAR tab. */}
+        <div style={{ width: 400, flexShrink: 0 }}>
+          <PartViewer partId={targetPartId} />
         </div>
       </div>
 
@@ -782,14 +766,10 @@ export default function MonitorDashboard() {
         <CycleResults />
       </div>
 
-      {/* Per-program: part 3D viewer + pick performance */}
-      <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
-        <div style={{ width: 320, flexShrink: 0 }}>
-          <PartViewer partId={targetPartId} />
-        </div>
-        <div style={{ flex: 1, minWidth: 320 }}>
-          <ProgramPickStats programId={programIdForStats} />
-        </div>
+      {/* Per-program pick performance (PartViewer moved to the top-right
+          slot vacated by the camera feed). */}
+      <div style={{ marginBottom: 16 }}>
+        <ProgramPickStats programId={programIdForStats} />
       </div>
 
       {/* Cycle time history for the loaded program */}
