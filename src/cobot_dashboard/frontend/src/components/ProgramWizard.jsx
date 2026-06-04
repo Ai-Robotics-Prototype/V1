@@ -790,10 +790,18 @@ const PAGES = [
   },
 
   // 13: Teach home
+  //
+  // Every TeachWithJog below carries key={pointName}. Without it, React
+  // matches the component by position-in-tree and reuses the SAME
+  // instance across teach pages — meaning useState(initialTaught) reads
+  // answers[pointName] only on the first mount and the `taught` /
+  // `position` state from the previous teach page leaks into the next.
+  // The key forces a fresh mount per teach point.
   {
     id: 'teach_home',
     render: ({ answers, setAnswer, goNext }) => (
       <TeachWithJog
+        key="teach-home_point"
         title="Teach the HOME position"
         description="This is where the robot rests between cycles. Jog to adjust if needed, or just record the current pose."
         instructions={[
@@ -814,6 +822,7 @@ const PAGES = [
     id: 'teach_pick',
     render: ({ answers, setAnswer, goNext }) => (
       <TeachWithJog
+        key="teach-pick_point"
         title="Teach the PICK position"
         description="Move the robot to where it should pick up parts."
         instructions={[
@@ -839,6 +848,7 @@ const PAGES = [
     skip: (answers) => answers.operation === 'machine_tend',
     render: ({ answers, setAnswer, goNext }) => (
       <TeachWithJog
+        key="teach-place_point"
         title="Teach the PLACE position"
         description="Move the robot to where parts should be placed."
         instructions={[
@@ -860,6 +870,7 @@ const PAGES = [
     skip: (answers) => answers.operation !== 'machine_tend',
     render: ({ answers, setAnswer, goNext }) => (
       <TeachWithJog
+        key="teach-machine_load_point"
         title="Teach the MACHINE LOAD position"
         description="Move the robot to where it loads parts into the machine."
         instructions={[
@@ -882,6 +893,7 @@ const PAGES = [
     skip: (answers) => answers.operation !== 'machine_tend',
     render: ({ answers, setAnswer, goNext }) => (
       <TeachWithJog
+        key="teach-unload_point"
         title="Teach the UNLOAD position"
         description="Move the robot to where finished parts should be placed after the machine cycle."
         instructions={[
@@ -902,6 +914,7 @@ const PAGES = [
     skip: (answers) => answers.operation !== 'inspect',
     render: ({ answers, setAnswer, goNext }) => (
       <TeachWithJog
+        key="teach-inspect_point"
         title="Teach the INSPECTION pose"
         description="Move the robot to where it holds the part in front of the camera for inspection."
         instructions={[
