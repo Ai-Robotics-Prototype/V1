@@ -1,104 +1,130 @@
 import { useEffect, useRef, useState, forwardRef, useImperativeHandle } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
-import URDFLoader from 'urdf-loader'
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
 
-const URDF_URL = '/robot_model/ur5e.urdf'
-// Sentinel that means "we have S10-140 link STLs and a proper URDF
-// authored" — when this file exists, ArmViewer3D uses the articulated
-// path; when missing, it falls back to the static converted GLB so
-// the operator at least sees the correct-looking robot.
-// Lives under /robot/ (active-robot symlink) rather than the legacy
-// /robot_model/ static dir.
-const LINKS_JSON_URL = '/robot/links.json'
-// Order is intentional: lite GLB first (~3 MB, decimated to ~150k
-// faces — what the tablet can chew through), full GLB next (~114 MB,
-// for desktop / engineering), STL last (~243 MB, only if both GLBs
-// 404). The viewer tries each in turn.
+// ---------------------------------------------------------------------------
+// Asset URLs. The dashboard serves /robot/* from the active robot model
+// directory (/opt/cobot/models/robot -> models/robots/<robot_id>/).
+// ---------------------------------------------------------------------------
+
+const LINKS_JSON_URL  = '/robot/links.json'
+const LINK_FILE_BASE  = '/robot/links/'
+// Order matters: lite first, full second, STL last-ditch.
 const STATIC_GLB_URLS = ['/robot/model_lite.glb', '/robot/model.glb']
 const STATIC_STL_URL  = '/robot/model.stl'
-const JOINT_ORDER = [
-  'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
-  'wrist_1_joint',      'wrist_2_joint',       'wrist_3_joint',
-]
+
 const SMOOTH = 0.15
 const DEG = (r) => ((r * 180) / Math.PI).toFixed(1)
 
-// URDFRobot: loads the URDF once, then advances joint values toward the
-// store's `joints.positions` every frame with a simple low-pass filter.
-function URDFRobot({ onLoaded, onError }) {
-  const robotRef = useRef(null)
-  const { scene } = useThree()
-  const targetRef = useRef([0, -Math.PI / 2, 0, -Math.PI / 2, 0, 0])
+function applyMetallicMaterial(root) {
+  root.traverse((child) => {
+    if (child.isMesh) {
+      child.material = new THREE.MeshStandardMaterial({
+        color: '#B0B8C8', metalness: 0.6, roughness: 0.3,
+      })
+      child.castShadow = true
+      child.receiveShadow = true
+    }
+  })
+}
 
-  // Keep the latest desired joint angles in a ref so useFrame doesn't
-  // need to subscribe to every Zustand change.
+// ---------------------------------------------------------------------------
+// ArticulatedRobot — builds the kinematic chain from links.json.
+//
+// Each link's GLB has been pre-translated so its parent joint sits at
+// the mesh-local origin (see scripts/split_robot_links.py). That means
+// every link group rotates around (0,0,0), and the joint offset is
+// carried purely by the group's `position` in its parent's frame.
+//
+// On every frame we slew each joint group's rotation toward the
+// store's joints.positions[ji] value with a low-pass filter — the
+// same approach the old URDFRobot used.
+// ---------------------------------------------------------------------------
+
+function ArticulatedRobot({ links, onLoaded, onError }) {
+  const { scene } = useThree()
+  const rootRef     = useRef(null)
+  const groupsRef   = useRef({})
+  const targetsRef  = useRef([0, 0, 0, 0, 0, 0])
+
+  // Keep the latest desired angles in a ref so useFrame doesn't have
+  // to subscribe to every Zustand change.
   const positions = useStore((s) => s.joints?.positions)
   useEffect(() => {
     if (positions && positions.length >= 6) {
-      targetRef.current = positions.slice(0, 6).map((v) => v || 0)
+      targetsRef.current = positions.slice(0, 6).map((v) => v || 0)
     }
   }, [positions])
 
   useEffect(() => {
-    const loader = new URDFLoader()
-    // Force every mesh ref (.stl after our URDF rewrite) through the
-    // STLLoader — the urdf-loader default works but being explicit
-    // dodges the case where a future URDF accidentally references .dae
-    // again and silently fails.
-    loader.loadMeshCb = (path, manager, done) => {
-      const stl = new STLLoader(manager)
-      stl.load(
-        path,
-        (geom) => {
-          geom.computeVertexNormals()
-          const mat = new THREE.MeshStandardMaterial({
-            color: 0xbac3cf, metalness: 0.35, roughness: 0.55,
-          })
-          const mesh = new THREE.Mesh(geom, mat)
-          mesh.castShadow = true
-          mesh.receiveShadow = true
-          done(mesh)
-        },
-        undefined,
-        (err) => done(null, err),
-      )
-    }
-
     let disposed = false
-    let robot = null
-    loader.load(
-      URDF_URL,
-      (r) => {
-        if (disposed) return
-        robot = r
-        robotRef.current = r
-        // URDF Z-up -> three.js Y-up
-        r.rotation.x = -Math.PI / 2
-        // Apply initial joint values so the first frame isn't at zero
-        JOINT_ORDER.forEach((name, i) => {
-          const j = r.joints[name]
-          if (j) j.setJointValue(targetRef.current[i] || 0)
-        })
-        scene.add(r)
-        onLoaded && onLoaded()
-      },
-    )
-    // urdf-loader's .load doesn't take an error callback — surface
-    // a manual fetch check so we know if the URDF itself is missing.
-    fetch(URDF_URL, { method: 'HEAD' }).then((res) => {
-      if (!res.ok && onError) onError(`URDF HTTP ${res.status}`)
-    }).catch((e) => onError && onError(`URDF fetch failed: ${e.message}`))
+    const loader = new GLTFLoader()
+
+    const loadOne = (link) => new Promise((resolve) => {
+      const file = link.file_lite || link.file
+      if (!file) {
+        resolve({ link, mesh: null })
+        return
+      }
+      loader.load(
+        LINK_FILE_BASE + file,
+        (gltf) => resolve({ link, mesh: gltf.scene }),
+        undefined,
+        (err) => {
+          console.warn(`Link ${link.name} load failed`, err)
+          resolve({ link, mesh: null })
+        },
+      )
+    })
+
+    Promise.all(links.map(loadOne)).then((entries) => {
+      if (disposed) return
+      const groups = {}
+
+      // First pass: create groups, position them at their joint
+      // offset in the parent's frame.
+      entries.forEach(({ link }) => {
+        const g = new THREE.Group()
+        g.name = link.name
+        const o = link.joint_origin || [0, 0, 0]
+        g.position.set(o[0], o[1], o[2])
+        g.userData = {
+          axis:       link.joint_axis || [0, 0, 0],
+          jointIndex: link.joint_index,
+        }
+        groups[link.name] = g
+      })
+
+      // Second pass: attach meshes, wire parent/child.
+      entries.forEach(({ link, mesh }) => {
+        const g = groups[link.name]
+        if (mesh) {
+          applyMetallicMaterial(mesh)
+          g.add(mesh)
+        }
+        if (link.parent && groups[link.parent]) {
+          groups[link.parent].add(g)
+        } else {
+          rootRef.current = g
+          scene.add(g)
+        }
+      })
+
+      groupsRef.current = groups
+      onLoaded && onLoaded()
+    }).catch((e) => {
+      if (!disposed && onError) onError(`Articulated load failed: ${e?.message || e}`)
+    })
 
     return () => {
       disposed = true
-      if (robot) {
-        scene.remove(robot)
-        robot.traverse((o) => {
+      if (rootRef.current) {
+        scene.remove(rootRef.current)
+        rootRef.current.traverse((o) => {
           if (o.geometry) o.geometry.dispose()
           if (o.material) {
             const mats = Array.isArray(o.material) ? o.material : [o.material]
@@ -106,29 +132,40 @@ function URDFRobot({ onLoaded, onError }) {
           }
         })
       }
+      rootRef.current   = null
+      groupsRef.current = {}
     }
-  }, [scene])
+  }, [scene, links])
 
   useFrame(() => {
-    const r = robotRef.current
-    if (!r) return
-    for (let i = 0; i < JOINT_ORDER.length; i++) {
-      const j = r.joints[JOINT_ORDER[i]]
-      if (!j) continue
-      const cur = j.angle || 0
-      const tgt = targetRef.current[i] || 0
-      const next = cur + (tgt - cur) * SMOOTH
-      j.setJointValue(next)
-    }
+    const groups = groupsRef.current
+    if (!groups) return
+    Object.values(groups).forEach((g) => {
+      const ji   = g.userData?.jointIndex
+      const axis = g.userData?.axis
+      if (typeof ji !== 'number' || ji < 0 || ji > 5) return
+      if (!axis) return
+      // Dominant component picks the Euler axis. Axis sign carries
+      // direction (e.g. [0,-1,0] flips J1's rotation).
+      const ax = Math.abs(axis[0]), ay = Math.abs(axis[1]), az = Math.abs(axis[2])
+      let prop, dir
+      if (ax >= ay && ax >= az) { prop = 'x'; dir = axis[0] >= 0 ? 1 : -1 }
+      else if (ay >= az)        { prop = 'y'; dir = axis[1] >= 0 ? 1 : -1 }
+      else                      { prop = 'z'; dir = axis[2] >= 0 ? 1 : -1 }
+      const target = dir * (targetsRef.current[ji] || 0)
+      const cur    = g.rotation[prop]
+      g.rotation[prop] = cur + (target - cur) * SMOOTH
+    })
   })
 
   return null
 }
 
-// Static fallback when links.json doesn't exist. Loads the GLB
-// converted from the S10-140 STEP file as a single un-articulated
-// mesh — no joint motion, but the geometry is correct. Used as a
-// placeholder until somebody authors S10-140 link STLs + URDF.
+// ---------------------------------------------------------------------------
+// StaticRobotModel — fallback when links.json is missing. Loads the
+// monolithic GLB (lite first, full second, STL last). No articulation.
+// ---------------------------------------------------------------------------
+
 function StaticRobotModel({ onLoaded, onError }) {
   const { scene } = useThree()
   const rootRef = useRef(null)
@@ -136,19 +173,6 @@ function StaticRobotModel({ onLoaded, onError }) {
   useEffect(() => {
     let disposed = false
     let model = null
-
-    // Same per-mesh styling applied whether the source was GLB or STL.
-    const applyMaterial = (root) => {
-      root.traverse((child) => {
-        if (child.isMesh) {
-          child.material = new THREE.MeshStandardMaterial({
-            color: '#B0B8C8', metalness: 0.6, roughness: 0.3,
-          })
-          child.castShadow = true
-          child.receiveShadow = true
-        }
-      })
-    }
 
     const fit = (root) => {
       const box  = new THREE.Box3().setFromObject(root)
@@ -163,14 +187,12 @@ function StaticRobotModel({ onLoaded, onError }) {
       if (disposed) return
       model = root
       fit(model)
-      applyMaterial(model)
+      applyMetallicMaterial(model)
       rootRef.current = model
       scene.add(model)
       onLoaded && onLoaded()
     }
 
-    // Try each GLB in order, falling back to STL if all GLBs are
-    // missing. The first GLB that loads wins.
     const tryStl = () => {
       console.warn('All GLBs failed, trying STL (last resort, ~240 MB)')
       const stl = new STLLoader()
@@ -229,18 +251,22 @@ function StaticRobotModel({ onLoaded, onError }) {
   return null
 }
 
+// ---------------------------------------------------------------------------
+// Camera + readout widgets
+// ---------------------------------------------------------------------------
+
 function CameraPreset({ preset }) {
   const { camera } = useThree()
   useEffect(() => {
     const presets = {
-      front: [0, 0.6, 1.6],
-      side:  [1.6, 0.6, 0],
-      top:   [0, 2.0, 0.001],
-      iso:   [1.2, 1.0, 1.4],
+      front: [0,   0.9, 2.4],
+      side:  [2.4, 0.9, 0],
+      top:   [0,   3.0, 0.001],
+      iso:   [1.5, 1.2, 1.8],
     }
     const pos = presets[preset] ?? presets.iso
     camera.position.set(...pos)
-    camera.lookAt(0, 0.4, 0)
+    camera.lookAt(0, 0.8, 0)
   }, [preset, camera])
   return null
 }
@@ -268,21 +294,32 @@ function JointReadout() {
   )
 }
 
+// ---------------------------------------------------------------------------
+// ArmViewer3D — top-level. Probes /robot/links.json:
+//   - 200 with body → mount ArticulatedRobot (S10-140 kinematic chain)
+//   - 404 / network error → mount StaticRobotModel (monolithic GLB)
+// ---------------------------------------------------------------------------
+
 const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
   const [preset, setPreset] = useState('iso')
-  const [error, setError] = useState(null)
+  const [error,  setError]  = useState(null)
   const [loaded, setLoaded] = useState(false)
-  // mode: 'probing' until we know which path to take, then either
-  // 'articulated' (URDF + live joints) or 'static' (GLB fallback).
-  // The probe runs once on mount — switching paths later would
-  // require an unmount/remount of the inner Canvas children, so we
-  // hold off until the answer is known.
-  const [mode, setMode] = useState('probing')
+  const [mode,   setMode]   = useState('probing')
+  const [linksData, setLinksData] = useState(null)
 
   useEffect(() => {
     let alive = true
-    fetch(LINKS_JSON_URL, { method: 'HEAD' })
-      .then((res) => { if (alive) setMode(res.ok ? 'articulated' : 'static') })
+    fetch(LINKS_JSON_URL)
+      .then((r) => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
+      .then((data) => {
+        if (!alive) return
+        if (!data?.links || !Array.isArray(data.links) || data.links.length === 0) {
+          setMode('static')
+          return
+        }
+        setLinksData(data)
+        setMode('articulated')
+      })
       .catch(() => { if (alive) setMode('static') })
     return () => { alive = false }
   }, [])
@@ -294,7 +331,7 @@ const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
   return (
     <div style={{ position: 'relative', width: '100%', height: '100%', background: '#FFFFFF' }}>
       <Canvas
-        camera={{ position: [1.2, 1.0, 1.4], fov: 45 }}
+        camera={{ position: [1.5, 1.2, 1.8], fov: 45 }}
         shadows
         gl={{ antialias: true }}
       >
@@ -304,15 +341,14 @@ const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
         <directionalLight position={[-3, 4, -3]} intensity={0.4} />
 
         <gridHelper args={[3, 30, '#d1d5db', '#e5e7eb']} />
-
-        {/* Shadow catcher */}
         <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.001, 0]} receiveShadow>
           <planeGeometry args={[3, 3]} />
           <shadowMaterial opacity={0.3} />
         </mesh>
 
-        {mode === 'articulated' && (
-          <URDFRobot
+        {mode === 'articulated' && linksData && (
+          <ArticulatedRobot
+            links={linksData.links}
             onLoaded={() => setLoaded(true)}
             onError={(e) => setError(e)}
           />
@@ -326,9 +362,9 @@ const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
 
         <CameraPreset preset={preset} />
         <OrbitControls
-          target={[0, 0.4, 0]}
+          target={[0, 0.8, 0]}
           enableDamping dampingFactor={0.08}
-          minDistance={0.5} maxDistance={4}
+          minDistance={0.5} maxDistance={6}
         />
       </Canvas>
 
@@ -369,7 +405,9 @@ const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
           background: 'rgba(255,255,255,0.92)', border: '1px solid #e5e7eb',
           color: '#6b7280', padding: '4px 8px', borderRadius: 4, fontSize: 10,
         }}>
-          Loading robot model…
+          {mode === 'probing' ? 'Probing model…'
+           : mode === 'articulated' ? 'Loading articulated robot…'
+           : 'Loading static model…'}
         </div>
       )}
     </div>

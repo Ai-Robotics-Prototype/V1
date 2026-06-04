@@ -1,0 +1,133 @@
+{
+  "dominant_axis": "Y",
+  "joint_world_y": [
+    0.09,
+    0.11,
+    0.83,
+    1.38,
+    1.47,
+    1.58
+  ],
+  "note": "Joint axes are assumed Y-Z-Z-Y-Z-Y for a typical 6-axis cobot. Verify against the real Estun and adjust JOINT_AXES in scripts/split_robot_links.py if needed.",
+  "links": [
+    {
+      "name": "link0_base",
+      "file": "link0_base.glb",
+      "file_lite": "link0_base_lite.glb",
+      "joint_index": null,
+      "joint_origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "joint_axis": [
+        0,
+        0,
+        0
+      ],
+      "parent": null
+    },
+    {
+      "name": "link1_shoulder",
+      "file": "link1_shoulder.glb",
+      "file_lite": "link1_shoulder_lite.glb",
+      "joint_index": 0,
+      "joint_origin": [
+        0.0,
+        0.09,
+        0.0
+      ],
+      "joint_axis": [
+        0,
+        1,
+        0
+      ],
+      "parent": "link0_base"
+    },
+    {
+      "name": "link2_upper_arm",
+      "file": "link2_upper_arm.glb",
+      "file_lite": "link2_upper_arm_lite.glb",
+      "joint_index": 1,
+      "joint_origin": [
+        0.0,
+        0.020000000000000004,
+        0.0
+      ],
+      "joint_axis": [
+        0,
+        0,
+        1
+      ],
+      "parent": "link1_shoulder"
+    },
+    {
+      "name": "link3_forearm",
+      "file": "link3_forearm.glb",
+      "file_lite": "link3_forearm_lite.glb",
+      "joint_index": 2,
+      "joint_origin": [
+        0.0,
+        0.72,
+        0.0
+      ],
+      "joint_axis": [
+        0,
+        0,
+        1
+      ],
+      "parent": "link2_upper_arm"
+    },
+    {
+      "name": "link4_wrist1",
+      "file": "link4_wrist1.glb",
+      "file_lite": "link4_wrist1_lite.glb",
+      "joint_index": 3,
+      "joint_origin": [
+        0.0,
+        0.5499999999999999,
+        0.0
+      ],
+      "joint_axis": [
+        0,
+        1,
+        0
+      ],
+      "parent": "link3_forearm"
+    },
+    {
+      "name": "link5_wrist2",
+      "file": "link5_wrist2.glb",
+      "file_lite": "link5_wrist2_lite.glb",
+      "joint_index": 4,
+      "joint_origin": [
+        0.0,
+        0.09000000000000008,
+        0.0
+      ],
+      "joint_axis": [
+        0,
+        0,
+        1
+      ],
+      "parent": "link4_wrist1"
+    },
+    {
+      "name": "link6_flange",
+      "file": "link6_flange.glb",
+      "file_lite": "link6_flange_lite.glb",
+      "joint_index": 5,
+      "joint_origin": [
+        0.0,
+        0.1100000000000001,
+        0.0
+      ],
+      "joint_axis": [
+        0,
+        1,
+        0
+      ],
+      "parent": "link5_wrist2"
+    }
+  ]
+}
