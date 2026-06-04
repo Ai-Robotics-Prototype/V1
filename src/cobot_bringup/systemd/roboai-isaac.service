@@ -1,0 +1,14 @@
+[Unit]
+Description=RoboAi Isaac ROS Full Pipeline
+After=roboai-cameras.service
+Requires=roboai-cameras.service
+
+[Service]
+Type=simple
+User=teddy
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 launch cobot_bringup isaac_ros_full.launch.py launch_dashboard:=false'
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

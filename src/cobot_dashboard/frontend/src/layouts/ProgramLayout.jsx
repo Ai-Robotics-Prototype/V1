@@ -83,6 +83,28 @@ function HoldButton({ onPress, color, width, height, children }) {
   )
 }
 
+// Small overlay button on each of the three program-tab panels. Lets
+// the operator give one panel the entire workspace (and back again).
+function PanelExpandBtn({ expanded, onClick, title }) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      style={{
+        position: 'absolute', top: 8, right: 8, zIndex: 20,
+        padding: '6px 12px', fontSize: 11, fontWeight: 700,
+        background: expanded ? '#2563EB' : 'rgba(255,255,255,0.92)',
+        color:      expanded ? '#fff'    : '#374151',
+        border:     expanded ? 'none'    : '1px solid #d1d5db',
+        borderRadius: 6, cursor: 'pointer',
+        boxShadow: '0 1px 2px rgba(0,0,0,0.08)',
+      }}
+    >
+      {expanded ? 'Minimize' : 'Expand'}
+    </button>
+  )
+}
+
 function ArrowPad({ onPress, rotation, label, color, size, svgSize, labelSize }) {
   return (
     <HoldButton onPress={onPress} color={color} width={size} height={size}>
@@ -405,10 +427,17 @@ export default function ProgramLayout() {
   const setProgramLayout = useStore((s) => s.setProgramLayout)
   const leftWidth        = programLayout.leftWidth
   const jogHeight        = programLayout.jogHeight
-  const jogMaximized     = programLayout.jogMaximized
-  const setLeftWidth    = useCallback((w) => setProgramLayout({ leftWidth: typeof w === 'function' ? w(programLayout.leftWidth) : w }), [setProgramLayout, programLayout.leftWidth])
-  const setJogHeight    = useCallback((h) => setProgramLayout({ jogHeight: typeof h === 'function' ? h(programLayout.jogHeight) : h }), [setProgramLayout, programLayout.jogHeight])
-  const setJogMaximized = useCallback((v) => setProgramLayout({ jogMaximized: Boolean(v) }), [setProgramLayout])
+  // expandedPanel: 'steps' | '3d' | 'jog' | null. Old persisted state
+  // may still carry jogMaximized:true from before this slice existed —
+  // honour it as the migration path so a tab swap doesn't surprise.
+  const expandedPanel    = programLayout.expandedPanel
+    ?? (programLayout.jogMaximized ? 'jog' : null)
+  const setLeftWidth     = useCallback((w) => setProgramLayout({ leftWidth: typeof w === 'function' ? w(programLayout.leftWidth) : w }), [setProgramLayout, programLayout.leftWidth])
+  const setJogHeight     = useCallback((h) => setProgramLayout({ jogHeight: typeof h === 'function' ? h(programLayout.jogHeight) : h }), [setProgramLayout, programLayout.jogHeight])
+  const setExpandedPanel = useCallback((p) => setProgramLayout({
+    expandedPanel: p,
+    jogMaximized: p === 'jog',  // mirror so legacy reads stay consistent
+  }), [setProgramLayout])
 
   const drag = useRef({ active: null, startPos: 0, startVal: 0 })
   const [activeDrag, setActiveDrag] = useState(null)
@@ -469,10 +498,30 @@ export default function ProgramLayout() {
   const leftAtLimit = leftWidth <= PROGRAM_MIN_WIDTH + 0.5 || leftWidth >= leftMax - 0.5
   const jogAtLimit  = jogHeight <= JOG_MIN_HEIGHT   + 0.5 || jogHeight >= jogMax  - 0.5
 
-  if (jogMaximized) {
+  // Single-panel maximised views. Each one is the full Program tab with
+  // a Minimize button in the corner that drops back to the three-region
+  // layout. The jog panel was the only one with this before — Steps
+  // and 3D viewer now get it too.
+  if (expandedPanel === 'steps') {
+    return (
+      <div style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden' }}>
+        <PanelExpandBtn expanded onClick={() => setExpandedPanel(null)} title="Restore split layout" />
+        <ProgramEditor />
+      </div>
+    )
+  }
+  if (expandedPanel === '3d') {
+    return (
+      <div style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden', background: '#FFFFFF' }}>
+        <PanelExpandBtn expanded onClick={() => setExpandedPanel(null)} title="Restore split layout" />
+        <ArmViewer3D />
+      </div>
+    )
+  }
+  if (expandedPanel === 'jog') {
     return (
       <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        <JogPanel maximized onToggleMaximize={() => setJogMaximized(false)} />
+        <JogPanel maximized onToggleMaximize={() => setExpandedPanel(null)} />
       </div>
     )
   }
@@ -480,13 +529,15 @@ export default function ProgramLayout() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
-        <div style={{ width: leftWidth, flexShrink: 0, display: 'flex', overflow: 'hidden' }}>
+        <div style={{ width: leftWidth, flexShrink: 0, display: 'flex', overflow: 'hidden', position: 'relative' }}>
+          <PanelExpandBtn onClick={() => setExpandedPanel('steps')} title="Expand the program steps panel" />
           <div style={{ flex: 1, overflow: 'hidden' }}>
             <ProgramEditor />
           </div>
         </div>
         <VerticalDivider onMouseDown={startVerticalDrag} dragging={activeDrag === 'v'} atLimit={leftAtLimit} />
-        <div style={{ flex: 1, overflow: 'hidden', background: '#FFFFFF', minWidth: VIEWER_MIN_WIDTH }}>
+        <div style={{ flex: 1, overflow: 'hidden', background: '#FFFFFF', minWidth: VIEWER_MIN_WIDTH, position: 'relative' }}>
+          <PanelExpandBtn onClick={() => setExpandedPanel('3d')} title="Expand the 3D viewer" />
           <ArmViewer3D />
         </div>
       </div>
@@ -494,9 +545,11 @@ export default function ProgramLayout() {
       <HorizontalDivider onMouseDown={startHorizontalDrag} dragging={activeDrag === 'h'} atLimit={jogAtLimit} />
 
       {/* Jog panel: overflow auto so a too-small height shows a
-          scrollbar instead of clipping the action buttons. */}
+          scrollbar instead of clipping the action buttons. The
+          existing Maximize button inside JogPanel routes through the
+          same expandedPanel state. */}
       <div style={{ height: jogHeight, flexShrink: 0, overflow: 'auto', borderTop: '1px solid #e5e7eb' }}>
-        <JogPanel maximized={false} onToggleMaximize={() => setJogMaximized(true)} />
+        <JogPanel maximized={false} onToggleMaximize={() => setExpandedPanel('jog')} />
       </div>
     </div>
   )

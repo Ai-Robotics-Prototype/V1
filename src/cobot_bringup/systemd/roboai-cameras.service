@@ -1,0 +1,16 @@
+[Unit]
+Description=RoboAi RealSense Cameras
+After=network.target
+
+[Service]
+Type=simple
+User=teddy
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 launch cobot_bringup cameras.launch.py'
+Restart=always
+RestartSec=5
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

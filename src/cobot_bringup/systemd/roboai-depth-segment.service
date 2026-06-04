@@ -1,0 +1,15 @@
+[Unit]
+Description=RoboAi Depth-Segmentation Generic Object Detector
+After=roboai-cameras.service
+Requires=roboai-cameras.service
+
+[Service]
+Type=simple
+User=teddy
+WorkingDirectory=/home/teddy/cobot_ws
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 launch cobot_bringup depth_detection.launch.py'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

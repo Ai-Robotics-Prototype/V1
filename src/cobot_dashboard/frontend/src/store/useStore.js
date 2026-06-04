@@ -335,7 +335,8 @@ const storeDefinition = (set, get) => ({
   programLayout: {
     leftWidth:    560,
     jogHeight:    500,
-    jogMaximized: false,
+    jogMaximized: false,        // legacy alias — kept for persisted state
+    expandedPanel: null,         // 'steps' | '3d' | 'jog' | null
   },
   setProgramLayout(patch) {
     set((s) => ({ programLayout: { ...s.programLayout, ...patch } }))

@@ -1,0 +1,18 @@
+[Unit]
+Description=RoboAi Dashboard Server
+After=network.target
+
+[Service]
+Type=simple
+User=teddy
+WorkingDirectory=/home/teddy/cobot_ws
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && python3 /home/teddy/cobot_ws/src/cobot_dashboard/cobot_dashboard/dashboard_server.py'
+Restart=always
+TimeoutStopSec=10
+RestartSec=3
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
