@@ -7,10 +7,10 @@ const TABS = [
   { id: 'program',          label: 'Program' },
   { id: '3dview',           label: '3D View' },
   { id: 'sensors',          label: 'Cameras & LiDAR' },
-  { id: 'io',               label: 'I/O' },
   { id: 'adaptive_picking', label: 'Part Recognition' },
-  { id: 'configure',        label: 'Configure' },
+  { id: 'io',               label: 'I/O' },
   { id: 'safety',           label: 'Safety' },
+  { id: 'configure',        label: 'Configure' },
 ]
 
 const WS_DOT = {
