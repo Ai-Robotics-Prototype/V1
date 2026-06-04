@@ -1701,21 +1701,50 @@ if FASTAPI_AVAILABLE:
             "stl_url":      f"/parts/{part_data['stl_file']}",
         }
 
+    def _load_defect_types(part_id: str) -> list:
+        """Read defects.json for a part and return the list shaped for
+        the public API. Returns [] when the file is missing/unreadable.
+        Tolerates the legacy 'captures' field by mapping it to
+        'capture_count' on read."""
+        path = f'/opt/cobot/parts/teach/{part_id}/defects.json'
+        if not os.path.isfile(path):
+            return []
+        try:
+            with open(path) as f:
+                data = json.load(f) or {}
+        except Exception:
+            return []
+        out = []
+        for d in (data.get('defects') or []):
+            if not isinstance(d, dict):
+                continue
+            out.append({
+                'name':          str(d.get('name') or ''),
+                'description':   str(d.get('description') or ''),
+                'severity':      str(d.get('severity') or 'reject'),
+                'capture_count': int(d.get('capture_count', d.get('captures', 0))),
+            })
+        return out
+
     @app.get("/api/parts")
     async def api_parts_list():
         from object_detection.part_library import get_all_parts
         parts = get_all_parts()
-        # Annotate each entry with its current taught-sample count so
-        # the library UI can show "Not taught yet" / "N taught samples".
+        # Annotate each entry with its current taught-sample count and
+        # any defect types the operator taught via the wizard. The UI
+        # uses teach_count for the "Taught" pill and defect_types for
+        # a red defect-count badge.
         teach_base = '/opt/cobot/parts/teach'
         for p in parts:
-            d = os.path.join(teach_base, p.get('id') or '')
+            pid = p.get('id') or ''
+            d = os.path.join(teach_base, pid)
             try:
                 p['teach_count'] = sum(
                     1 for f in os.listdir(d) if f.endswith('.npz')
                 ) if os.path.isdir(d) else 0
             except OSError:
                 p['teach_count'] = 0
+            p['defect_types'] = _load_defect_types(pid)
         return {"parts": parts}
 
     @app.post("/api/parts/{part_id}/teach")
@@ -1810,7 +1839,7 @@ if FASTAPI_AVAILABLE:
                     if str(d.get('name', '')).lower() == defect_name.lower():
                         hit = d; break
                 if hit is not None:
-                    hit['captures']      = int(hit.get('captures', 0)) + 1
+                    hit['capture_count'] = int(hit.get('capture_count', hit.get('captures', 0))) + 1
                     hit['last_captured'] = now
                     if defect_description:
                         hit['description'] = defect_description
@@ -1820,7 +1849,7 @@ if FASTAPI_AVAILABLE:
                         'name':           defect_name,
                         'description':    defect_description,
                         'severity':       defect_severity,
-                        'captures':       1,
+                        'capture_count':  1,
                         'first_captured': now,
                         'last_captured':  now,
                     })
@@ -1843,15 +1872,7 @@ if FASTAPI_AVAILABLE:
     async def api_parts_defects(part_id: str):
         """Read the per-part defects.json so the teach wizard can show
         previously-captured defects when the operator re-opens it."""
-        defects_path = f'/opt/cobot/parts/teach/{part_id}/defects.json'
-        if not os.path.isfile(defects_path):
-            return {"defects": []}
-        try:
-            with open(defects_path) as f:
-                data = json.load(f) or {}
-            return {"defects": data.get('defects') or []}
-        except Exception:
-            return {"defects": []}
+        return {"defects": _load_defect_types(part_id)}
 
     @app.post("/api/teach_mode/start")
     async def api_teach_mode_start():
@@ -1893,6 +1914,7 @@ if FASTAPI_AVAILABLE:
         part = get_part(part_id)
         if not part:
             return JSONResponse({"error": "part not found"}, status_code=404)
+        part['defect_types'] = _load_defect_types(part_id)
         return part
 
     @app.delete("/api/parts/{part_id}")

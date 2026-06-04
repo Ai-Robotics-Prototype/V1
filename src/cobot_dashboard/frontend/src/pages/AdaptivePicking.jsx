@@ -585,6 +585,20 @@ function TeachWizard({ part, onClose, onComplete }) {
     }
   }, [])
 
+  // Pre-seed defectTypes from the backend so previously-taught defects
+  // show up when the operator re-opens the wizard. Runs once on mount.
+  useEffect(() => {
+    let cancelled = false
+    fetch(`/api/parts/${part.id}/defects`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => {
+        if (cancelled || !data || !Array.isArray(data.defects)) return
+        setDefectTypes(data.defects)
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [part.id])
+
   // Poll live detections from dashboard state at 2 Hz.
   useEffect(() => {
     let cancelled = false
@@ -710,16 +724,16 @@ function TeachWizard({ part, onClose, onComplete }) {
           const i = prev.findIndex((d) => d.name.toLowerCase() === name.toLowerCase())
           if (i >= 0) {
             const copy = prev.slice()
-            copy[i] = { ...copy[i], captures: copy[i].captures + 1,
+            copy[i] = { ...copy[i], capture_count: (copy[i].capture_count || 0) + 1,
                         description: defectDescription.trim() || copy[i].description,
                         severity:    defectSeverity }
             return copy
           }
           return [...prev, {
             name,
-            description: defectDescription.trim(),
-            severity:    defectSeverity,
-            captures:    1,
+            description:   defectDescription.trim(),
+            severity:      defectSeverity,
+            capture_count: 1,
           }]
         })
         setFlashGreen(true)
@@ -1424,7 +1438,7 @@ function TeachWizard({ part, onClose, onComplete }) {
                         )}
                       </div>
                       <span style={{ fontSize: 11, color: '#9ca3af', flexShrink: 0 }}>
-                        {d.captures} ref{d.captures !== 1 ? 's' : ''}
+                        {d.capture_count} ref{d.capture_count !== 1 ? 's' : ''}
                       </span>
                     </div>
                   ))}
@@ -1548,7 +1562,7 @@ function TeachWizard({ part, onClose, onComplete }) {
                             </span>
                           )}
                           <span style={{ fontSize: 11, color: '#9ca3af', marginLeft: 'auto' }}>
-                            {d.captures} ref{d.captures !== 1 ? 's' : ''}
+                            {d.capture_count} ref{d.capture_count !== 1 ? 's' : ''}
                           </span>
                         </div>
                       ))}
@@ -1837,6 +1851,13 @@ export default function AdaptivePicking() {
                       ? `${part.teach_count} taught sample${part.teach_count > 1 ? 's' : ''}`
                       : 'Not taught yet — click "Teach" to start the wizard'}
                   </div>
+                  {(part.defect_types?.length || 0) > 0 && (
+                    <div style={{
+                      fontSize: 10, marginTop: 2, color: '#DC2626', fontWeight: 600,
+                    }} title={part.defect_types.map(d => d.name).join(', ')}>
+                      {part.defect_types.length} defect type{part.defect_types.length > 1 ? 's' : ''}: {part.defect_types.map(d => d.name).join(', ')}
+                    </div>
+                  )}
                   {(ops.length > 0 || part.program_name) && (
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginTop: 4 }}>
                       {ops.map((op) => {
