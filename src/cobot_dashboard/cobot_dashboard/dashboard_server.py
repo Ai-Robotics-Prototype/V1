@@ -2499,6 +2499,34 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({"detail": "not found"}, status_code=404)
         return FileResponse(path)
 
+    # Robot model assets (converted from /opt/cobot/models/robot/
+    # S10-140_G2.STEP by scripts/convert_robot_step.py). The route
+    # exists whether or not the conversion has run — 404 is the
+    # signal the ArmViewer3D fallback uses to stick with the URDF.
+    _ROBOT_MODEL_DIR = '/opt/cobot/models/robot'
+
+    def _serve_robot_asset(filename: str, media_type: str):
+        path = os.path.join(_ROBOT_MODEL_DIR, filename)
+        if not os.path.isfile(path):
+            return JSONResponse({"detail": "robot model not converted yet"}, status_code=404)
+        return FileResponse(path, media_type=media_type)
+
+    @app.get("/robot/model.glb")
+    async def robot_model_glb():
+        return _serve_robot_asset('S10-140.glb', 'model/gltf-binary')
+
+    @app.get("/robot/model.stl")
+    async def robot_model_stl():
+        return _serve_robot_asset('S10-140.stl', 'application/sla')
+
+    @app.get("/robot/model.step")
+    async def robot_model_step():
+        return _serve_robot_asset('S10-140_G2.STEP', 'application/step')
+
+    @app.get("/robot/parts_inventory.json")
+    async def robot_parts_inventory():
+        return _serve_robot_asset('parts_inventory.json', 'application/json')
+
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         if full_path.startswith(("api/", "cmd/", "ws/", "stream/", "health", "assets/")):
@@ -2506,6 +2534,15 @@ if FASTAPI_AVAILABLE:
         candidate = os.path.join(_static, full_path)
         if os.path.isfile(candidate):
             return FileResponse(candidate)
+        # If the request looks like an asset (has a file extension on
+        # its last segment) AND the file doesn't exist, return 404
+        # instead of falling through to index.html. Otherwise the
+        # client can't distinguish "this file exists" from "the SPA
+        # absorbed my missing-asset probe" — which broke the
+        # ArmViewer3D links.json check.
+        last = full_path.rsplit('/', 1)[-1]
+        if '.' in last:
+            return JSONResponse({"detail": "Not found"}, status_code=404)
         idx = os.path.join(_static, "index.html")
         if os.path.isfile(idx):
             return FileResponse(idx, headers=_NO_CACHE)

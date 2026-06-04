@@ -3,10 +3,17 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import URDFLoader from 'urdf-loader'
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js'
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
 
 const URDF_URL = '/robot_model/ur5e.urdf'
+// Sentinel that means "we have S10-140 link STLs and a proper URDF
+// authored" — when this file exists, ArmViewer3D uses the articulated
+// path; when missing, it falls back to the static converted GLB so
+// the operator at least sees the correct-looking robot.
+const LINKS_JSON_URL = '/robot_model/links.json'
+const STATIC_GLB_URL = '/robot/model.glb'
 const JOINT_ORDER = [
   'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
   'wrist_1_joint',      'wrist_2_joint',       'wrist_3_joint',
@@ -111,6 +118,70 @@ function URDFRobot({ onLoaded, onError }) {
   return null
 }
 
+// Static fallback when links.json doesn't exist. Loads the GLB
+// converted from the S10-140 STEP file as a single un-articulated
+// mesh — no joint motion, but the geometry is correct. Used as a
+// placeholder until somebody authors S10-140 link STLs + URDF.
+function StaticRobotModel({ onLoaded, onError }) {
+  const { scene } = useThree()
+  const rootRef = useRef(null)
+
+  useEffect(() => {
+    const loader = new GLTFLoader()
+    let disposed = false
+    let model = null
+    loader.load(
+      STATIC_GLB_URL,
+      (gltf) => {
+        if (disposed) return
+        model = gltf.scene
+        // Center on origin, scale to ~1.5 units so it sits in the
+        // same volume the URDFRobot would have occupied.
+        const box  = new THREE.Box3().setFromObject(model)
+        const size = box.getSize(new THREE.Vector3())
+        const ctr  = box.getCenter(new THREE.Vector3())
+        model.position.sub(ctr)
+        const maxDim = Math.max(size.x, size.y, size.z)
+        if (maxDim > 0) model.scale.multiplyScalar(1.5 / maxDim)
+        // Apply a metallic-grey material to every mesh — the GLB
+        // didn't carry per-part materials from the STEP.
+        model.traverse((child) => {
+          if (child.isMesh) {
+            child.material = new THREE.MeshStandardMaterial({
+              color: '#B0B8C8', metalness: 0.55, roughness: 0.35,
+            })
+            child.castShadow = true
+            child.receiveShadow = true
+          }
+        })
+        rootRef.current = model
+        scene.add(model)
+        onLoaded && onLoaded()
+      },
+      undefined,
+      (err) => {
+        if (!disposed && onError) onError(`GLB fetch failed: ${err?.message || err}`)
+      },
+    )
+
+    return () => {
+      disposed = true
+      if (model) {
+        scene.remove(model)
+        model.traverse((o) => {
+          if (o.geometry) o.geometry.dispose()
+          if (o.material) {
+            const mats = Array.isArray(o.material) ? o.material : [o.material]
+            mats.forEach((m) => m.dispose && m.dispose())
+          }
+        })
+      }
+    }
+  }, [scene])
+
+  return null
+}
+
 function CameraPreset({ preset }) {
   const { camera } = useThree()
   useEffect(() => {
@@ -154,6 +225,20 @@ const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
   const [preset, setPreset] = useState('iso')
   const [error, setError] = useState(null)
   const [loaded, setLoaded] = useState(false)
+  // mode: 'probing' until we know which path to take, then either
+  // 'articulated' (URDF + live joints) or 'static' (GLB fallback).
+  // The probe runs once on mount — switching paths later would
+  // require an unmount/remount of the inner Canvas children, so we
+  // hold off until the answer is known.
+  const [mode, setMode] = useState('probing')
+
+  useEffect(() => {
+    let alive = true
+    fetch(LINKS_JSON_URL, { method: 'HEAD' })
+      .then((res) => { if (alive) setMode(res.ok ? 'articulated' : 'static') })
+      .catch(() => { if (alive) setMode('static') })
+    return () => { alive = false }
+  }, [])
 
   useImperativeHandle(ref, () => ({
     setCameraPreset(name) { setPreset(name) },
@@ -179,10 +264,18 @@ const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
           <shadowMaterial opacity={0.3} />
         </mesh>
 
-        <URDFRobot
-          onLoaded={() => setLoaded(true)}
-          onError={(e) => setError(e)}
-        />
+        {mode === 'articulated' && (
+          <URDFRobot
+            onLoaded={() => setLoaded(true)}
+            onError={(e) => setError(e)}
+          />
+        )}
+        {mode === 'static' && (
+          <StaticRobotModel
+            onLoaded={() => setLoaded(true)}
+            onError={(e) => setError(e)}
+          />
+        )}
 
         <CameraPreset preset={preset} />
         <OrbitControls
