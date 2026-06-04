@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { useStore } from '../store/useStore'
 
 /*
  * Conversational Program Wizard
@@ -86,6 +87,337 @@ function NextButton({ onClick, disabled, label }) {
 // ────────────────────────────────────────────────────────
 // Wizard pages
 // ────────────────────────────────────────────────────────
+
+// ────────────────────────────────────────────────────────
+// TeachWithJog — inline jog pendant for each wizard teach page.
+// Wires straight into the store's existing jog actions so the same
+// safety guards + radian conversion the Program tab uses apply here.
+// ────────────────────────────────────────────────────────
+
+function radiansToJointDegrees(positions) {
+  if (!Array.isArray(positions)) return [0, 0, 0, 0, 0, 0]
+  return positions.slice(0, 6).map((rad) => Number((rad * 180 / Math.PI).toFixed(2)))
+}
+
+function JogArrow({ onPress, color, label, rotation, size = 64 }) {
+  const timer = useRef(null)
+  const start = useCallback((e) => {
+    if (e && e.preventDefault) e.preventDefault()
+    onPress()
+    if (timer.current) clearInterval(timer.current)
+    timer.current = setInterval(onPress, 150)
+  }, [onPress])
+  const stop = useCallback(() => {
+    if (timer.current) { clearInterval(timer.current); timer.current = null }
+  }, [])
+  useEffect(() => () => stop(), [stop])
+
+  return (
+    <button
+      onMouseDown={start}
+      onMouseUp={stop}
+      onMouseLeave={(e) => { e.currentTarget.style.background = '#fff'; e.currentTarget.style.borderColor = '#d1d5db'; stop() }}
+      onMouseEnter={(e) => { e.currentTarget.style.background = color + '15'; e.currentTarget.style.borderColor = color }}
+      onTouchStart={start}
+      onTouchEnd={stop}
+      onTouchCancel={stop}
+      style={{
+        width: size, height: size, padding: 0,
+        background: '#fff', border: '1px solid #d1d5db', borderRadius: 8,
+        cursor: 'pointer', display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center', gap: 2,
+        userSelect: 'none', touchAction: 'none',
+      }}>
+      <svg width="24" height="24" viewBox="0 0 24 24" style={{ transform: `rotate(${rotation}deg)` }}>
+        <path d="M12 4l-8 8h5v8h6v-8h5z" fill={color} />
+      </svg>
+      <span style={{ fontSize: 10, fontWeight: 700, color: '#374151' }}>{label}</span>
+    </button>
+  )
+}
+
+function PadCenterTile({ label, width = 64, height = 64 }) {
+  return (
+    <div style={{
+      width, height,
+      background: '#f3f4f6', borderRadius: 8,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontSize: 11, fontWeight: 700, color: '#9ca3af',
+    }}>{label}</div>
+  )
+}
+
+function TeachWithJog({ title, description, instructions, pointName, config, setConfig, onNext, onSkip }) {
+  const jog          = useStore((s) => s.jog)
+  const jogCartesian = useStore((s) => s.jogCartesian)
+  const homeRobot    = useStore((s) => s.homeRobot)
+  const triggerEstop = useStore((s) => s.triggerEstop)
+
+  const initialTaught = !!config[pointName]
+  const [taught, setTaught]   = useState(initialTaught)
+  const [position, setPosition] = useState(config[pointName] || null)
+
+  const [jogMode, setJogMode] = useState('cartesian')
+  const [step, setStep]       = useState(1.0)
+  const [speed, setSpeed]     = useState(20)
+
+  const [liveJoints, setLiveJoints] = useState([0, -90, 0, -90, 0, 0])
+  const [liveTcp,    setLiveTcp]    = useState([0, 0, 0, 0, 0, 0])
+
+  // Keep refs current so the JogArrow's repeating interval reads
+  // the latest step/speed/mode instead of the values captured at
+  // press time.
+  const stepRef = useRef(step), speedRef = useRef(speed), modeRef = useRef(jogMode)
+  useEffect(() => { stepRef.current = step },   [step])
+  useEffect(() => { speedRef.current = speed }, [speed])
+  useEffect(() => { modeRef.current = jogMode }, [jogMode])
+
+  // Poll live robot state.
+  useEffect(() => {
+    let alive = true
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/state')
+        if (!alive || !res.ok) return
+        const d = await res.json()
+        setLiveJoints(radiansToJointDegrees(d?.joints?.positions))
+        if (Array.isArray(d?.tcp_pose)) setLiveTcp(d.tcp_pose)
+      } catch {}
+    }
+    poll()
+    const iv = setInterval(poll, 300)
+    return () => { alive = false; clearInterval(iv) }
+  }, [])
+
+  // Use the same store actions the Program-tab jog panel uses —
+  // joint mode posts /cmd/jog (rad delta), cartesian mode posts
+  // /cmd/jog_cartesian. Safety gates already live in the backend.
+  const sendJog = useCallback((axis, direction) => {
+    if (modeRef.current === 'joint') {
+      const deltaRad = direction * stepRef.current * Math.PI / 180
+      jog(axis - 1, deltaRad)
+    } else {
+      jogCartesian(axis, direction, stepRef.current, speedRef.current)
+    }
+  }, [jog, jogCartesian])
+
+  async function recordPosition() {
+    try {
+      const res = await fetch('/api/state')
+      if (!res.ok) return
+      const d = await res.json()
+      const joints = radiansToJointDegrees(d?.joints?.positions)
+      const tcp    = Array.isArray(d?.tcp_pose) ? d.tcp_pose : null
+      const pos = {
+        joints,
+        tcp,
+        name:      pointName,
+        taught_at: new Date().toISOString(),
+      }
+      setPosition(pos)
+      setConfig((prev) => ({ ...prev, [pointName]: pos }))
+      setTaught(true)
+    } catch {}
+  }
+
+  const padBtn = 64
+
+  return (
+    <div style={{ padding: 24, maxWidth: 760, margin: '0 auto' }}>
+      <div style={{ fontSize: 20, fontWeight: 700, color: '#111', marginBottom: 6 }}>{title}</div>
+      <div style={{ fontSize: 14, color: '#6b7280', marginBottom: 16 }}>{description}</div>
+
+      <div style={{
+        padding: 16, background: '#eff6ff', borderRadius: 10,
+        border: '1px solid #bfdbfe', marginBottom: 20,
+      }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: '#2563EB', marginBottom: 8 }}>
+          How to teach this position:
+        </div>
+        {instructions.map((inst, i) => (
+          <div key={i} style={{
+            display: 'flex', gap: 10, marginBottom: 6,
+            fontSize: 13, color: '#374151',
+          }}>
+            <div style={{
+              width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
+              background: '#2563EB', color: '#fff',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 11, fontWeight: 700,
+            }}>{i + 1}</div>
+            <div style={{ paddingTop: 2 }}>{inst}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{
+        padding: 12, background: '#f8fafc', borderRadius: 8,
+        border: '1px solid #e5e7eb', marginBottom: 16,
+        fontFamily: 'monospace', fontSize: 12,
+      }}>
+        <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
+          <div>
+            <span style={{ color: '#6b7280' }}>Joints: </span>
+            <span style={{ color: '#111', fontWeight: 700 }}>
+              [{liveJoints.map((j) => j.toFixed(1)).join(', ')}]°
+            </span>
+          </div>
+          <div>
+            <span style={{ color: '#6b7280' }}>TCP: </span>
+            <span style={{ color: '#111', fontWeight: 700 }}>
+              [{liveTcp.slice(0, 3).map((t) => Number(t).toFixed(3)).join(', ')}]
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div style={{
+        padding: 16, background: '#fff', borderRadius: 10,
+        border: '1px solid #e5e7eb', marginBottom: 16,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+          <button onClick={() => setJogMode('cartesian')} style={modeBtn(jogMode === 'cartesian')}>XYZ</button>
+          <button onClick={() => setJogMode('joint')}     style={modeBtn(jogMode === 'joint')}>Joint</button>
+          <div style={{ flex: 1 }} />
+          <span style={{ fontSize: 11, color: '#6b7280' }}>Step:</span>
+          {[0.1, 0.5, 1, 5, 10].map((s) => (
+            <button key={s} onClick={() => setStep(s)} style={{
+              padding: '4px 8px', fontSize: 10, fontWeight: 600, borderRadius: 4, cursor: 'pointer',
+              background: step === s ? '#2563EB' : '#f3f4f6',
+              color:      step === s ? '#fff'    : '#6b7280',
+              border:     step === s ? 'none'    : '1px solid #e5e7eb',
+            }}>{s}</button>
+          ))}
+        </div>
+
+        {jogMode === 'cartesian' ? (
+          <div style={{ display: 'flex', gap: 16, justifyContent: 'center', alignItems: 'flex-start', flexWrap: 'wrap' }}>
+            <div>
+              <div style={padLabelStyle}>Position</div>
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: `repeat(3, ${padBtn}px)`,
+                gridTemplateRows:    `repeat(3, ${padBtn}px)`,
+                gridTemplateAreas: '". up ." "left center right" ". down ."',
+                gap: 4,
+              }}>
+                <div style={{ gridArea: 'up' }}>    <JogArrow onPress={() => sendJog('y',  1)} rotation={0}   label="Y+" color="#16A34A" /></div>
+                <div style={{ gridArea: 'left' }}>  <JogArrow onPress={() => sendJog('x', -1)} rotation={-90} label="X−" color="#DC2626" /></div>
+                <div style={{ gridArea: 'center' }}><PadCenterTile label="XY" /></div>
+                <div style={{ gridArea: 'right' }}> <JogArrow onPress={() => sendJog('x',  1)} rotation={90}  label="X+" color="#DC2626" /></div>
+                <div style={{ gridArea: 'down' }}>  <JogArrow onPress={() => sendJog('y', -1)} rotation={180} label="Y−" color="#16A34A" /></div>
+              </div>
+            </div>
+
+            <div>
+              <div style={padLabelStyle}>Height</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: padBtn }}>
+                <JogArrow onPress={() => sendJog('z',  1)} rotation={0}   label="Z+" color="#3B82F6" />
+                <PadCenterTile label="Z" height={24} />
+                <JogArrow onPress={() => sendJog('z', -1)} rotation={180} label="Z−" color="#3B82F6" />
+              </div>
+            </div>
+
+            <div>
+              <div style={padLabelStyle}>Rotation</div>
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: `repeat(3, ${padBtn}px)`,
+                gridTemplateRows:    `repeat(3, ${padBtn}px)`,
+                gridTemplateAreas: '". rxp ." "rzn center rzp" ". rxn ."',
+                gap: 4,
+              }}>
+                <div style={{ gridArea: 'rxp' }}>   <JogArrow onPress={() => sendJog('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" /></div>
+                <div style={{ gridArea: 'rzn' }}>   <JogArrow onPress={() => sendJog('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" /></div>
+                <div style={{ gridArea: 'center' }}><PadCenterTile label="Rot" /></div>
+                <div style={{ gridArea: 'rzp' }}>   <JogArrow onPress={() => sendJog('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" /></div>
+                <div style={{ gridArea: 'rxn' }}>   <JogArrow onPress={() => sendJog('rx', -1)} rotation={180} label="Rx−" color="#9333EA" /></div>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
+            {[1, 2, 3, 4, 5, 6].map((j) => (
+              <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                <JogArrow onPress={() => sendJog(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={56} />
+                <PadCenterTile label={'J' + j} width={56} height={24} />
+                <JogArrow onPress={() => sendJog(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={56} />
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }}>
+          <span style={{ fontSize: 12, color: '#6b7280', minWidth: 90 }}>Speed: {speed}%</span>
+          <input type="range" min={1} max={100} value={speed}
+            onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
+            style={{ flex: 1 }} />
+          <button onClick={homeRobot} style={smallBtn('#f3f4f6', '#374151', '#d1d5db')}>Home</button>
+          <button onClick={triggerEstop} style={{ ...smallBtn('#DC2626', '#fff'), border: 'none', fontWeight: 700 }}>STOP</button>
+        </div>
+      </div>
+
+      {taught && position && (
+        <div style={{
+          padding: 14, background: '#f0fdf4', borderRadius: 10,
+          border: '1px solid #bbf7d0', marginBottom: 16,
+        }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: '#16A34A', marginBottom: 4 }}>
+            ✓ Position recorded
+          </div>
+          <div style={{ fontSize: 12, color: '#6b7280', fontFamily: 'monospace' }}>
+            Joints: [{position.joints.map((j) => j.toFixed(1)).join(', ')}]°
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 10 }}>
+        <button onClick={recordPosition} style={{
+          flex: 2, padding: '16px', fontSize: 16, fontWeight: 700,
+          background: taught ? '#16A34A' : '#2563EB', color: '#fff',
+          border: 'none', borderRadius: 10, cursor: 'pointer',
+        }}>
+          {taught ? 'Re-record Position' : 'Record This Position'}
+        </button>
+        {taught && (
+          <button onClick={onNext} style={{
+            flex: 1, padding: '16px', fontSize: 16, fontWeight: 700,
+            background: '#16A34A', color: '#fff',
+            border: 'none', borderRadius: 10, cursor: 'pointer',
+          }}>Next</button>
+        )}
+      </div>
+      {onSkip && !taught && (
+        <button onClick={onSkip} style={{
+          width: '100%', marginTop: 8, padding: '10px', fontSize: 13,
+          background: 'transparent', color: '#6b7280',
+          border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
+        }}>
+          Skip — use auto-detection instead
+        </button>
+      )}
+    </div>
+  )
+}
+
+const modeBtn = (on) => ({
+  padding: '8px 16px', fontSize: 13, fontWeight: 600, borderRadius: 6, cursor: 'pointer',
+  background: on ? '#2563EB' : '#f3f4f6',
+  color:      on ? '#fff'    : '#374151',
+  border:     on ? 'none'    : '1px solid #d1d5db',
+})
+
+const smallBtn = (bg, color, border) => ({
+  padding: '8px 16px', fontSize: 12, fontWeight: 600,
+  background: bg, color,
+  border: border ? `1px solid ${border}` : 'none',
+  borderRadius: 6, cursor: 'pointer',
+})
+
+const padLabelStyle = {
+  fontSize: 11, fontWeight: 600, color: '#6b7280',
+  textAlign: 'center', marginBottom: 4,
+}
 
 const PAGES = [
   // 0: What operation?
@@ -417,7 +749,170 @@ const PAGES = [
     ),
   },
 
-  // 12: Review and save
+  // 12: Teach intro — explains the upcoming teach walk-through.
+  {
+    id: 'teach_intro',
+    render: ({ answers, goNext }) => {
+      const points = [
+        '1. Home position — where the robot rests between cycles',
+        '2. Pick position — where the robot grabs parts',
+        '3. Place position — where the robot puts parts',
+      ]
+      if (answers.operation === 'machine_tend') {
+        points.push('4. Machine load position')
+        points.push('5. Unload position')
+      }
+      if (answers.operation === 'inspect') {
+        points.push('4. Inspection pose')
+      }
+      return (
+        <QuestionCard
+          question="Now let's teach the robot positions"
+          description="Use the jog controls to move the robot to each spot, then press Record."
+        >
+          <div style={{
+            padding: 16, background: '#eff6ff', borderRadius: 10,
+            border: '1px solid #bfdbfe', marginBottom: 20,
+            fontSize: 14, color: '#374151', lineHeight: 1.7,
+          }}>
+            <div style={{ fontWeight: 700, color: '#2563EB', marginBottom: 8 }}>You will teach:</div>
+            {points.map((p, i) => <div key={i}>{p}</div>)}
+          </div>
+          <NextButton onClick={goNext} label="Start Teaching" />
+        </QuestionCard>
+      )
+    },
+  },
+
+  // 13: Teach home
+  {
+    id: 'teach_home',
+    render: ({ config, setConfig, goNext }) => (
+      <TeachWithJog
+        title="Teach the HOME position"
+        description="This is where the robot rests between cycles. Jog to adjust if needed, or just record the current pose."
+        instructions={[
+          'The home position should be clear of all obstacles',
+          'The robot should have good visibility of the workspace',
+          'This position runs at the start and end of every cycle',
+          'Press "Record This Position" to confirm',
+        ]}
+        pointName="home_point"
+        config={config} setConfig={setConfig}
+        onNext={goNext}
+      />
+    ),
+  },
+
+  // 14: Teach pick
+  {
+    id: 'teach_pick',
+    render: ({ answers, config, setConfig, goNext }) => (
+      <TeachWithJog
+        title="Teach the PICK position"
+        description="Move the robot to where it should pick up parts."
+        instructions={[
+          'Use the XY arrows to move the robot over the part',
+          'Use Z− to lower the robot close to the part surface',
+          'Use Rotation to align the gripper with the part',
+          'Make sure the gripper can close around the part',
+          'Press "Record This Position" when ready',
+        ]}
+        pointName="pick_point"
+        config={config} setConfig={setConfig}
+        onNext={goNext}
+        // Camera-driven picks can skip a fixed teach point; runtime
+        // detection supplies the pose. Fixed-position picks must teach.
+        onSkip={answers.pick_method === 'fixed' ? null : goNext}
+      />
+    ),
+  },
+
+  // 15: Teach place
+  {
+    id: 'teach_place',
+    skip: (answers) => answers.operation === 'machine_tend',
+    render: ({ config, setConfig, goNext }) => (
+      <TeachWithJog
+        title="Teach the PLACE position"
+        description="Move the robot to where parts should be placed."
+        instructions={[
+          'Use the XY arrows to move to the place location',
+          'Use Z− to lower to the correct height',
+          'The robot will open the gripper here to release the part',
+          'Press "Record This Position" when ready',
+        ]}
+        pointName="place_point"
+        config={config} setConfig={setConfig}
+        onNext={goNext}
+      />
+    ),
+  },
+
+  // 16: Teach machine load
+  {
+    id: 'teach_machine_load',
+    skip: (answers) => answers.operation !== 'machine_tend',
+    render: ({ config, setConfig, goNext }) => (
+      <TeachWithJog
+        title="Teach the MACHINE LOAD position"
+        description="Move the robot to where it loads parts into the machine."
+        instructions={[
+          'Move the robot to the machine opening',
+          'Position the gripper so the part aligns with the fixture',
+          'Use small step sizes (0.1 mm) for precision near the machine',
+          'Make sure there is clearance — the robot must not collide with the machine',
+          'Press "Record This Position" when ready',
+        ]}
+        pointName="machine_load_point"
+        config={config} setConfig={setConfig}
+        onNext={goNext}
+      />
+    ),
+  },
+
+  // 17: Teach unload
+  {
+    id: 'teach_unload',
+    skip: (answers) => answers.operation !== 'machine_tend',
+    render: ({ config, setConfig, goNext }) => (
+      <TeachWithJog
+        title="Teach the UNLOAD position"
+        description="Move the robot to where finished parts should be placed after the machine cycle."
+        instructions={[
+          'Move the robot to the unload / output area',
+          'Lower to the correct drop-off height',
+          'Press "Record This Position" when ready',
+        ]}
+        pointName="unload_point"
+        config={config} setConfig={setConfig}
+        onNext={goNext}
+      />
+    ),
+  },
+
+  // 18: Teach inspection pose
+  {
+    id: 'teach_inspect',
+    skip: (answers) => answers.operation !== 'inspect',
+    render: ({ config, setConfig, goNext }) => (
+      <TeachWithJog
+        title="Teach the INSPECTION pose"
+        description="Move the robot to where it holds the part in front of the camera for inspection."
+        instructions={[
+          'Position the part in clear view of the camera',
+          'Make sure the camera can see all features of the part',
+          'The part should be well-lit and at the right distance',
+          'Press "Record This Position" when ready',
+        ]}
+        pointName="inspect_point"
+        config={config} setConfig={setConfig}
+        onNext={goNext}
+      />
+    ),
+  },
+
+  // 19: Review and save (final)
   {
     id: 'review',
     render: ({ answers, steps, saving, onSave }) => (
@@ -566,7 +1061,62 @@ function buildSteps(answers) {
     steps.push({ action: 'loop', label: 'Repeat ' + (answers.repeat_count || 10) + ' times', goto: 1, count: answers.repeat_count || 10 })
   }
 
-  return steps.map((s, i) => ({ ...s, step: i + 1 }))
+  // Inject taught data from the wizard's teach pages so the editor's
+  // green T badges appear immediately for the positions the operator
+  // recorded. Mapping rules:
+  //   home_point         → first + last move_home (start / return-home)
+  //   pick_point         → the 'approach' step (descend uses the same)
+  //   place_point        → first move_joint or move_linear labelled
+  //                        "Move above place position"
+  //   machine_load_point → "Move to machine load position"
+  //   unload_point       → "Move to unload position"
+  //   inspect_point      → "Move to inspection pose"
+  function applyTaught(s, point) {
+    if (!point) return s
+    return {
+      ...s,
+      taught: true,
+      taught_joints: point.joints,
+      taught_tcp:    point.tcp || null,
+      taught_at:     point.taught_at || new Date().toISOString(),
+      joints:        point.joints,
+      ...(point.tcp ? { position: point.tcp.slice(0, 3) } : {}),
+    }
+  }
+
+  const cfg = answers
+  const numbered = steps.map((s, i) => ({ ...s, step: i + 1 }))
+
+  // First and last move_home both share home_point.
+  if (cfg.home_point) {
+    const homeIdxs = numbered.map((s, i) => s.action === 'move_home' ? i : -1).filter((i) => i >= 0)
+    homeIdxs.forEach((i) => { numbered[i] = applyTaught(numbered[i], cfg.home_point) })
+  }
+  if (cfg.pick_point) {
+    const i = numbered.findIndex((s) => s.action === 'approach')
+    if (i >= 0) numbered[i] = applyTaught(numbered[i], cfg.pick_point)
+  }
+  if (cfg.place_point) {
+    const i = numbered.findIndex((s) =>
+      (s.action === 'move_joint' || s.action === 'move_linear') &&
+      typeof s.label === 'string' && s.label.toLowerCase().includes('place')
+    )
+    if (i >= 0) numbered[i] = applyTaught(numbered[i], cfg.place_point)
+  }
+  if (cfg.machine_load_point) {
+    const i = numbered.findIndex((s) => s.action === 'move_joint' && s.label === 'Move to machine load position')
+    if (i >= 0) numbered[i] = applyTaught(numbered[i], cfg.machine_load_point)
+  }
+  if (cfg.unload_point) {
+    const i = numbered.findIndex((s) => s.action === 'move_joint' && s.label === 'Move to unload position')
+    if (i >= 0) numbered[i] = applyTaught(numbered[i], cfg.unload_point)
+  }
+  if (cfg.inspect_point) {
+    const i = numbered.findIndex((s) => s.action === 'move_joint' && s.label === 'Move to inspection pose')
+    if (i >= 0) numbered[i] = applyTaught(numbered[i], cfg.inspect_point)
+  }
+
+  return numbered
 }
 
 // ────────────────────────────────────────────────────────
@@ -639,7 +1189,7 @@ export default function ProgramWizard({ onClose, onSaved }) {
       display: 'flex', alignItems: 'center', justifyContent: 'center',
     }}>
       <div style={{
-        width: '90%', maxWidth: 650, maxHeight: '90vh',
+        width: '95%', maxWidth: 800, maxHeight: '95vh',
         background: '#fff', borderRadius: 16, overflow: 'hidden',
         boxShadow: '0 25px 60px rgba(0,0,0,0.25)',
         display: 'flex', flexDirection: 'column',
