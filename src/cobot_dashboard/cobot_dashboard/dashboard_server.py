@@ -76,6 +76,18 @@ STATE = {
     "grasp_poses": [],
     "reconstruction": {"active": False, "voxels_occupied": 0, "mesh_triangles": 0},
     "gripper": {"state": "open", "position_mm": 85.0},
+    # Real-robot mirror — populated by /estun/status when the driver is
+    # connected. Kept distinct from "joints" so the sim path keeps working
+    # when the driver is offline; when present, robot.connected=true means
+    # joints/tcp_pose in STATE are real readings.
+    "robot": {
+        "connected": False,
+        "mode": "disconnected",
+        "safety_mode": "unknown",
+        "status_flag": 0,
+        "moving": False,
+    },
+    "tcp_pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     "program": {
         # All steps start 'pending' — task.run resets them then marks
         # step 0 'active'; task.cancel / completion resets back. No
@@ -463,6 +475,10 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             self.get_logger().warn("vision_msgs not available — detection3d subscription skipped")
         self.create_subscription(JointState, "/joint_states",            self._on_joint_states,   10)
 
+        # Estun driver status (publishes robot mode, joints, TCP pose as JSON).
+        # When connected, this overwrites the sim joints — real wins.
+        self.create_subscription(String, "/estun/status", self._on_estun_status, 10)
+
         # Grasp planner output (JSON String — full per-candidate metadata).
         self.create_subscription(String, "/grasp/candidates",
                                  self._on_grasp_candidates, 5)
@@ -822,6 +838,34 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             STATE["joints"]["names"]      = list(msg.name)
             STATE["joints"]["positions"]  = list(msg.position)
             STATE["joints"]["velocities"] = list(msg.velocity) if msg.velocity else [0.0] * len(msg.name)
+
+    def _on_estun_status(self, msg):
+        """Mirror the Estun driver's status blob into STATE."""
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        with _state_lock:
+            r = STATE.setdefault("robot", {})
+            r["connected"]   = bool(d.get("connected", False))
+            r["mode"]        = d.get("robot_mode", "unknown")
+            r["safety_mode"] = d.get("safety_mode", "unknown")
+            r["status_flag"] = int(d.get("status_flag", 0))
+            r["moving"]      = bool(d.get("moving", False))
+            # Joints (rad) — only overwrite if the driver gave us real data.
+            jr = d.get("joints_rad")
+            if isinstance(jr, list) and len(jr) == 6:
+                STATE["joints"]["positions"] = list(jr)
+            # TCP pose (m / rad)
+            tcp = d.get("tcp_m")
+            if isinstance(tcp, list) and len(tcp) == 6:
+                STATE["tcp_pose"] = list(tcp)
+            # Estop — real robot is authoritative when connected
+            if r["connected"] and "estop" in d:
+                STATE["safety"]["estop"] = bool(d["estop"])
+            # Task running mirror — only when not driven by the project runner
+            if r["connected"] and not STATE["task"].get("running", False):
+                STATE["task"]["running"] = bool(d.get("moving", False))
 
     # ---- Cameras ----
 
@@ -1266,6 +1310,20 @@ if FASTAPI_AVAILABLE:
             _going_home = False
         if _ros_node:
             _ros_node.publish_task_command(command)
+            # Mirror to Estun driver: project commands plus home/stop pass-through.
+            try:
+                if not hasattr(_ros_node, "_estun_cmd_pub"):
+                    _ros_node._estun_cmd_pub = _ros_node.create_publisher(
+                        String, "/estun/command", 10)
+                action_map = {"run": "run", "pause": "pause", "resume": "resume",
+                              "home": "home", "stop": "stop", "cancel": "stop"}
+                est_action = action_map.get(command)
+                if est_action:
+                    m = String()
+                    m.data = json.dumps({"action": est_action})
+                    _ros_node._estun_cmd_pub.publish(m)
+            except Exception:
+                pass
         with _state_lock:
             return {"ok": True, "task": copy.deepcopy(STATE["task"])}
 
@@ -1316,7 +1374,28 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({"error": "Invalid joint index"}, status_code=400)
         with _state_lock:
             STATE["joints"]["positions"][joint] += delta
-            return {"ok": True, "joints": copy.deepcopy(STATE["joints"])}
+            joints_snapshot = copy.deepcopy(STATE["joints"])
+        # Forward to Estun driver — the sim update above keeps the UI
+        # responsive when the driver isn't connected; when it is, the
+        # driver's /estun/status feedback will overwrite STATE.joints.
+        if _ros_node is not None:
+            try:
+                if not hasattr(_ros_node, "_estun_jog_pub"):
+                    _ros_node._estun_jog_pub = _ros_node.create_publisher(
+                        String, "/robot/jog_command", 10)
+                speed_pct = abs(delta) / 0.175 * 100.0  # delta -> 0..100
+                m = String()
+                m.data = json.dumps({
+                    "mode":      "joint",
+                    "axis":      joint + 1,         # Estun uses 1-indexed joints
+                    "direction": 1 if delta >= 0 else -1,
+                    "speed":     int(max(1, min(100, speed_pct))),
+                    "step":      float(abs(delta)),
+                })
+                _ros_node._estun_jog_pub.publish(m)
+            except Exception:
+                pass
+        return {"ok": True, "joints": joints_snapshot}
 
     @app.post("/cmd/jog_cartesian")
     async def cmd_jog_cartesian(request: Request):
