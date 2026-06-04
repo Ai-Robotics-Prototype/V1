@@ -1842,6 +1842,26 @@ if FASTAPI_AVAILABLE:
         s = _program_stats.get(prog_id, {})
         return {'cycle_times': list(s.get('cycle_times', []))}
 
+    # Folder index — sibling JSON to the program files. Underscored so
+    # it's ignored by the program-list scan and by the slug regex.
+    _FOLDERS_FILE = os.path.join(_PROG_DIR, '_folders.json')
+
+    def _load_folders():
+        if os.path.isfile(_FOLDERS_FILE):
+            try:
+                with open(_FOLDERS_FILE) as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and 'folders' in data:
+                    return data
+            except Exception:
+                pass
+        return {'folders': []}
+
+    def _save_folders(data):
+        os.makedirs(_PROG_DIR, exist_ok=True)
+        with open(_FOLDERS_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+
     @app.get("/api/programs")
     async def api_programs_list():
         """List user-created robot programs from /opt/cobot/programs/.
@@ -1851,7 +1871,7 @@ if FASTAPI_AVAILABLE:
         try:
             os.makedirs(_PROG_DIR, exist_ok=True)
             for fn in sorted(os.listdir(_PROG_DIR)):
-                if not fn.endswith('.json'):
+                if not fn.endswith('.json') or fn.startswith('_'):
                     continue
                 try:
                     with open(os.path.join(_PROG_DIR, fn)) as fp:
@@ -1863,13 +1883,133 @@ if FASTAPI_AVAILABLE:
                         'steps':       len(prog.get('steps') or []),
                         'tags':        prog.get('tags') or [],
                         'created':     prog.get('created') or '',
-                        'updated':     prog.get('updated') or '',
+                        'updated':     prog.get('updated') or prog.get('created') or '',
+                        'folder':      prog.get('folder'),
                     })
                 except Exception:
                     continue
         except Exception:
             pass
         return {"programs": programs}
+
+    @app.get("/api/folders")
+    async def api_folders_list():
+        return _load_folders()
+
+    @app.post("/api/folders")
+    async def api_folders_create(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        name = str(body.get('name') or 'New Folder').strip() or 'New Folder'
+        data = _load_folders()
+        import uuid as _uuid
+        folder = {
+            'id':      _uuid.uuid4().hex[:8],
+            'name':    name,
+            'created': _now_stamp(),
+        }
+        data['folders'].append(folder)
+        _save_folders(data)
+        return {'ok': True, 'folder': folder}
+
+    @app.put("/api/folders/{folder_id}")
+    async def api_folders_rename(folder_id: str, request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({'error': 'invalid JSON body'}, status_code=400)
+        name = str(body.get('name') or '').strip()
+        if not name:
+            return JSONResponse({'error': 'name required'}, status_code=400)
+        data = _load_folders()
+        for f in data['folders']:
+            if f['id'] == folder_id:
+                f['name'] = name
+                _save_folders(data)
+                return {'ok': True, 'folder': f}
+        return JSONResponse({'error': 'not found'}, status_code=404)
+
+    @app.delete("/api/folders/{folder_id}")
+    async def api_folders_delete(folder_id: str):
+        data = _load_folders()
+        before = len(data['folders'])
+        data['folders'] = [f for f in data['folders'] if f['id'] != folder_id]
+        if len(data['folders']) == before:
+            return JSONResponse({'error': 'not found'}, status_code=404)
+        _save_folders(data)
+        # Unassign every program that pointed at this folder so the
+        # deletion doesn't orphan them behind an invalid id.
+        try:
+            for fn in os.listdir(_PROG_DIR):
+                if not fn.endswith('.json') or fn.startswith('_'):
+                    continue
+                p = os.path.join(_PROG_DIR, fn)
+                try:
+                    with open(p) as fp:
+                        prog = json.load(fp)
+                    if prog.get('folder') == folder_id:
+                        prog['folder'] = None
+                        with open(p, 'w') as fp:
+                            json.dump(prog, fp, indent=2)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return {'ok': True}
+
+    @app.put("/api/programs/{prog_id}/folder")
+    async def api_programs_set_folder(prog_id: str, request: Request):
+        path = _prog_path(prog_id)
+        if not path or not os.path.isfile(path):
+            return JSONResponse({'error': 'not found'}, status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({'error': 'invalid JSON body'}, status_code=400)
+        folder_id = body.get('folder_id')  # null/None to unassign
+        try:
+            with open(path) as f:
+                prog = json.load(f)
+            prog['folder'] = folder_id
+            prog['updated'] = _now_stamp()
+            with open(path, 'w') as f:
+                json.dump(prog, f, indent=2)
+        except Exception as e:
+            return JSONResponse({'error': f'write failed: {e}'}, status_code=500)
+        return {'ok': True, 'folder': folder_id}
+
+    @app.post("/api/programs/{prog_id}/duplicate")
+    async def api_programs_duplicate(prog_id: str):
+        """Create a copy of an existing program with a new id (slug
+        with collision suffix) and " (copy)" appended to the name."""
+        src = _prog_path(prog_id)
+        if not src or not os.path.isfile(src):
+            return JSONResponse({'error': 'not found'}, status_code=404)
+        try:
+            with open(src) as f:
+                prog = json.load(f)
+        except Exception as e:
+            return JSONResponse({'error': f'read failed: {e}'}, status_code=500)
+        base_slug = prog_id
+        slug = base_slug + '_copy'
+        n = 2
+        while os.path.isfile(os.path.join(_PROG_DIR, slug + '.json')):
+            slug = base_slug + f'_copy_{n}'
+            n += 1
+        ts = _now_stamp()
+        new_prog = dict(prog)
+        new_prog['id']      = slug
+        new_prog['name']    = (prog.get('name') or prog_id) + ' (copy)'
+        new_prog['created'] = ts
+        new_prog['updated'] = ts
+        try:
+            with open(os.path.join(_PROG_DIR, slug + '.json'), 'w') as f:
+                json.dump(new_prog, f, indent=2)
+        except Exception as e:
+            return JSONResponse({'error': f'write failed: {e}'}, status_code=500)
+        return {'ok': True, 'program': new_prog}
 
     @app.post("/api/programs")
     async def api_programs_save(request: Request):
