@@ -12,8 +12,11 @@ const URDF_URL = '/robot_model/ur5e.urdf'
 // authored" — when this file exists, ArmViewer3D uses the articulated
 // path; when missing, it falls back to the static converted GLB so
 // the operator at least sees the correct-looking robot.
-const LINKS_JSON_URL = '/robot_model/links.json'
+// Lives under /robot/ (active-robot symlink) rather than the legacy
+// /robot_model/ static dir.
+const LINKS_JSON_URL = '/robot/links.json'
 const STATIC_GLB_URL = '/robot/model.glb'
+const STATIC_STL_URL = '/robot/model.stl'
 const JOINT_ORDER = [
   'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
   'wrist_1_joint',      'wrist_2_joint',       'wrist_3_joint',
@@ -127,40 +130,68 @@ function StaticRobotModel({ onLoaded, onError }) {
   const rootRef = useRef(null)
 
   useEffect(() => {
-    const loader = new GLTFLoader()
     let disposed = false
     let model = null
+
+    // Same per-mesh styling applied whether the source was GLB or STL.
+    const applyMaterial = (root) => {
+      root.traverse((child) => {
+        if (child.isMesh) {
+          child.material = new THREE.MeshStandardMaterial({
+            color: '#B0B8C8', metalness: 0.6, roughness: 0.3,
+          })
+          child.castShadow = true
+          child.receiveShadow = true
+        }
+      })
+    }
+
+    const fit = (root) => {
+      const box  = new THREE.Box3().setFromObject(root)
+      const size = box.getSize(new THREE.Vector3())
+      const ctr  = box.getCenter(new THREE.Vector3())
+      root.position.sub(ctr)
+      const maxDim = Math.max(size.x, size.y, size.z)
+      if (maxDim > 0) root.scale.multiplyScalar(2.0 / maxDim)
+    }
+
+    const onSuccess = (root) => {
+      if (disposed) return
+      model = root
+      fit(model)
+      applyMaterial(model)
+      rootRef.current = model
+      scene.add(model)
+      onLoaded && onLoaded()
+    }
+
+    const loader = new GLTFLoader()
     loader.load(
       STATIC_GLB_URL,
-      (gltf) => {
-        if (disposed) return
-        model = gltf.scene
-        // Center on origin, scale to ~1.5 units so it sits in the
-        // same volume the URDFRobot would have occupied.
-        const box  = new THREE.Box3().setFromObject(model)
-        const size = box.getSize(new THREE.Vector3())
-        const ctr  = box.getCenter(new THREE.Vector3())
-        model.position.sub(ctr)
-        const maxDim = Math.max(size.x, size.y, size.z)
-        if (maxDim > 0) model.scale.multiplyScalar(1.5 / maxDim)
-        // Apply a metallic-grey material to every mesh — the GLB
-        // didn't carry per-part materials from the STEP.
-        model.traverse((child) => {
-          if (child.isMesh) {
-            child.material = new THREE.MeshStandardMaterial({
-              color: '#B0B8C8', metalness: 0.55, roughness: 0.35,
-            })
-            child.castShadow = true
-            child.receiveShadow = true
-          }
-        })
-        rootRef.current = model
-        scene.add(model)
-        onLoaded && onLoaded()
-      },
+      (gltf) => onSuccess(gltf.scene),
       undefined,
       (err) => {
-        if (!disposed && onError) onError(`GLB fetch failed: ${err?.message || err}`)
+        // STL fallback path. The converted .stl is huge (~240 MB),
+        // so this only fires if the GLB is genuinely missing.
+        console.warn('GLB load failed, trying STL:', err)
+        const stl = new STLLoader()
+        stl.load(
+          STATIC_STL_URL,
+          (geom) => {
+            geom.computeVertexNormals()
+            const mesh = new THREE.Mesh(
+              geom,
+              new THREE.MeshStandardMaterial({
+                color: '#B0B8C8', metalness: 0.6, roughness: 0.3,
+              }),
+            )
+            const wrap = new THREE.Group()
+            wrap.add(mesh)
+            onSuccess(wrap)
+          },
+          undefined,
+          (e) => { if (!disposed && onError) onError(`GLB+STL load failed: ${e?.message || e}`) },
+        )
       },
     )
 

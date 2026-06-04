@@ -2499,16 +2499,26 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({"detail": "not found"}, status_code=404)
         return FileResponse(path)
 
-    # Robot model assets (converted from /opt/cobot/models/robot/
-    # S10-140_G2.STEP by scripts/convert_robot_step.py). The route
-    # exists whether or not the conversion has run — 404 is the
-    # signal the ArmViewer3D fallback uses to stick with the URDF.
+    # Robot model assets. /opt/cobot/models/robot is a symlink to the
+    # active per-robot dir under models/robots/<id>/ in the repo. The
+    # routes exist whether or not link STLs have been authored — a 404
+    # on /robot/links.json is the sentinel the ArmViewer3D uses to
+    # fall back to the static GLB.
     _ROBOT_MODEL_DIR = '/opt/cobot/models/robot'
 
+    def _resolve_robot_asset(filename: str) -> str:
+        path = os.path.realpath(os.path.join(_ROBOT_MODEL_DIR, filename))
+        # Guard against `..` escapes — resolved path must stay under
+        # the active robot dir (after dereferencing the symlink).
+        base = os.path.realpath(_ROBOT_MODEL_DIR)
+        if not path.startswith(base + os.sep) and path != base:
+            return ''
+        return path
+
     def _serve_robot_asset(filename: str, media_type: str):
-        path = os.path.join(_ROBOT_MODEL_DIR, filename)
-        if not os.path.isfile(path):
-            return JSONResponse({"detail": "robot model not converted yet"}, status_code=404)
+        path = _resolve_robot_asset(filename)
+        if not path or not os.path.isfile(path):
+            return JSONResponse({"detail": "robot asset not available"}, status_code=404)
         return FileResponse(path, media_type=media_type)
 
     @app.get("/robot/model.glb")
@@ -2526,6 +2536,27 @@ if FASTAPI_AVAILABLE:
     @app.get("/robot/parts_inventory.json")
     async def robot_parts_inventory():
         return _serve_robot_asset('parts_inventory.json', 'application/json')
+
+    @app.get("/robot/info")
+    async def robot_info():
+        return _serve_robot_asset('robot.json', 'application/json')
+
+    @app.get("/robot/links.json")
+    async def robot_links_json():
+        # Lives under links/ to keep the articulation files grouped.
+        return _serve_robot_asset('links/links.json', 'application/json')
+
+    @app.get("/robot/links/{filename}")
+    async def robot_link_file(filename: str):
+        if '..' in filename or '/' in filename:
+            return JSONResponse({"detail": "bad path"}, status_code=400)
+        ext = os.path.splitext(filename)[1].lower()
+        media = {
+            '.json': 'application/json',
+            '.stl':  'application/sla',
+            '.glb':  'model/gltf-binary',
+        }.get(ext, 'application/octet-stream')
+        return _serve_robot_asset(f'links/{filename}', media)
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):

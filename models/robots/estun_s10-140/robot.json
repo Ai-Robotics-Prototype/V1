@@ -1,0 +1,32 @@
+{
+  "id": "estun_s10-140",
+  "name": "Estun S10-140 Pro",
+  "manufacturer": "Estun Codroid",
+  "series": "S-Series",
+  "payload_kg": 10.0,
+  "reach_mm": 1400,
+  "dof": 6,
+  "repeatability_mm": 0.03,
+  "weight_kg": 33.5,
+  "api": {
+    "transport": "websocket",
+    "url_template": "ws://{ROBOT_IP}:9000",
+    "format": "json",
+    "spec": "Codroid Interface (2025-07-08)"
+  },
+  "joint_limits_deg": {
+    "j1": [-360, 360],
+    "j2": [-130, 130],
+    "j3": [-150, 150],
+    "j4": [-360, 360],
+    "j5": [-130, 130],
+    "j6": [-360, 360]
+  },
+  "assets": {
+    "step":      "S10-140_G2.STEP",
+    "glb":       "S10-140.glb",
+    "stl":       "S10-140.stl",
+    "inventory": "parts_inventory.json",
+    "links_dir": "links/"
+  }
+}

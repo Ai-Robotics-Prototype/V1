@@ -1,0 +1,13 @@
+# Source CAD — always LFS (big binary, low diff value).
+*.STEP filter=lfs diff=lfs merge=lfs -text
+*.step filter=lfs diff=lfs merge=lfs -text
+*.stp  filter=lfs diff=lfs merge=lfs -text
+
+# Compiled inference engines (TensorRT). Treated as opaque blobs.
+*.engine filter=lfs diff=lfs merge=lfs -text
+
+# Robot model assets — LFS only inside models/robots/. The small UR5e
+# mesh files under src/cobot_dashboard/frontend/public/robot_model/
+# are intentionally NOT LFS (~1 MB each, churn-free for years).
+models/robots/**/*.glb filter=lfs diff=lfs merge=lfs -text
+models/robots/**/*.stl filter=lfs diff=lfs merge=lfs -text
