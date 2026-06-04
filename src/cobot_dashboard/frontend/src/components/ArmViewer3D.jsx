@@ -1,254 +1,116 @@
-import { useEffect, useRef, useState, forwardRef, useImperativeHandle } from 'react'
-import { Canvas, useFrame, useThree } from '@react-three/fiber'
-import { OrbitControls, Environment } from '@react-three/drei'
-import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js'
+import { useEffect, useState, useRef, forwardRef, useImperativeHandle } from 'react'
+import { Canvas } from '@react-three/fiber'
+import { OrbitControls } from '@react-three/drei'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
 
 // ---------------------------------------------------------------------------
-// Asset URLs. The dashboard serves /robot/* from the active robot model
-// directory (/opt/cobot/models/robot -> models/robots/<robot_id>/).
+// ArmViewer3D — static (non-articulated) viewer of the converted Estun
+// S10-140 GLB. Loads /robot/model_lite.glb first (~3 MB, fast on the
+// tablet) and falls back to the full /robot/model.glb if the lite file
+// is missing.
+//
+// Articulation is deliberately not wired up here — the previous
+// link-splitting attempt produced a disjointed mesh because the
+// part-to-link assignment can't be done cleanly without measuring
+// against the real arm. The articulated viewer is a follow-up; this
+// gets us a clean visual that stands upright and reads correctly.
 // ---------------------------------------------------------------------------
 
-const LINKS_JSON_URL  = '/robot/links.json'
-const LINK_FILE_BASE  = '/robot/links/'
-// Order matters: lite first, full second, STL last-ditch.
-const STATIC_GLB_URLS = ['/robot/model_lite.glb', '/robot/model.glb']
-const STATIC_STL_URL  = '/robot/model.stl'
+const JOINT_COLORS = ['#3B82F6', '#16A34A', '#CA8A04', '#DC2626', '#9333EA', '#F97316']
 
-const SMOOTH = 0.15
-const DEG = (r) => ((r * 180) / Math.PI).toFixed(1)
-
-function applyMetallicMaterial(root) {
-  root.traverse((child) => {
-    if (child.isMesh) {
-      child.material = new THREE.MeshStandardMaterial({
-        color: '#B0B8C8', metalness: 0.6, roughness: 0.3,
-      })
-      child.castShadow = true
-      child.receiveShadow = true
-    }
-  })
+// Camera presets — chosen for an arm whose base sits on Y=0 and
+// extends up to roughly Y=2 after the in-loader normalisation.
+const PRESETS = {
+  front: [0, 1.2, 3],
+  side:  [3, 1.2, 0],
+  top:   [0, 4, 0.01],
+  iso:   [2, 1.5, 2],
 }
 
-// ---------------------------------------------------------------------------
-// ArticulatedRobot — builds the kinematic chain from links.json.
-//
-// Each link's GLB has been pre-translated so its parent joint sits at
-// the mesh-local origin (see scripts/split_robot_links.py). That means
-// every link group rotates around (0,0,0), and the joint offset is
-// carried purely by the group's `position` in its parent's frame.
-//
-// On every frame we slew each joint group's rotation toward the
-// store's joints.positions[ji] value with a low-pass filter — the
-// same approach the old URDFRobot used.
-// ---------------------------------------------------------------------------
+const LITE_URL = '/robot/model_lite.glb'
+const FULL_URL = '/robot/model.glb'
 
-function ArticulatedRobot({ links, onLoaded, onError }) {
-  const { scene } = useThree()
-  const rootRef     = useRef(null)
-  const groupsRef   = useRef({})
-  const targetsRef  = useRef([0, 0, 0, 0, 0, 0])
-
-  // Keep the latest desired angles in a ref so useFrame doesn't have
-  // to subscribe to every Zustand change.
-  const positions = useStore((s) => s.joints?.positions)
-  useEffect(() => {
-    if (positions && positions.length >= 6) {
-      targetsRef.current = positions.slice(0, 6).map((v) => v || 0)
-    }
-  }, [positions])
+function RobotModel({ onLoaded, onError }) {
+  const [model, setModel] = useState(null)
 
   useEffect(() => {
-    let disposed = false
     const loader = new GLTFLoader()
-
-    const loadOne = (link) => new Promise((resolve) => {
-      const file = link.file_lite || link.file
-      if (!file) {
-        resolve({ link, mesh: null })
-        return
-      }
-      loader.load(
-        LINK_FILE_BASE + file,
-        (gltf) => resolve({ link, mesh: gltf.scene }),
-        undefined,
-        (err) => {
-          console.warn(`Link ${link.name} load failed`, err)
-          resolve({ link, mesh: null })
-        },
-      )
-    })
-
-    Promise.all(links.map(loadOne)).then((entries) => {
-      if (disposed) return
-      const groups = {}
-
-      // First pass: create groups, position them at their joint
-      // offset in the parent's frame.
-      entries.forEach(({ link }) => {
-        const g = new THREE.Group()
-        g.name = link.name
-        const o = link.joint_origin || [0, 0, 0]
-        g.position.set(o[0], o[1], o[2])
-        g.userData = {
-          axis:       link.joint_axis || [0, 0, 0],
-          jointIndex: link.joint_index,
-        }
-        groups[link.name] = g
-      })
-
-      // Second pass: attach meshes, wire parent/child.
-      entries.forEach(({ link, mesh }) => {
-        const g = groups[link.name]
-        if (mesh) {
-          applyMetallicMaterial(mesh)
-          g.add(mesh)
-        }
-        if (link.parent && groups[link.parent]) {
-          groups[link.parent].add(g)
-        } else {
-          // The split GLBs came out of trimesh which preserves the
-          // STEP file's Z-up convention. three.js renders Y-up, so
-          // wrap the root in a parent group that applies the
-          // classic -90° X rotation — same correction the previous
-          // URDFRobot used on the UR5e model.
-          const worldWrap = new THREE.Group()
-          worldWrap.rotation.x = -Math.PI / 2
-          worldWrap.add(g)
-          rootRef.current = worldWrap
-          scene.add(worldWrap)
-        }
-      })
-
-      groupsRef.current = groups
-      onLoaded && onLoaded()
-    }).catch((e) => {
-      if (!disposed && onError) onError(`Articulated load failed: ${e?.message || e}`)
-    })
-
-    return () => {
-      disposed = true
-      if (rootRef.current) {
-        scene.remove(rootRef.current)
-        rootRef.current.traverse((o) => {
-          if (o.geometry) o.geometry.dispose()
-          if (o.material) {
-            const mats = Array.isArray(o.material) ? o.material : [o.material]
-            mats.forEach((m) => m.dispose && m.dispose())
-          }
-        })
-      }
-      rootRef.current   = null
-      groupsRef.current = {}
-    }
-  }, [scene, links])
-
-  useFrame(() => {
-    const groups = groupsRef.current
-    if (!groups) return
-    Object.values(groups).forEach((g) => {
-      const ji   = g.userData?.jointIndex
-      const axis = g.userData?.axis
-      if (typeof ji !== 'number' || ji < 0 || ji > 5) return
-      if (!axis) return
-      // Dominant component picks the Euler axis. Axis sign carries
-      // direction (e.g. [0,-1,0] flips J1's rotation).
-      const ax = Math.abs(axis[0]), ay = Math.abs(axis[1]), az = Math.abs(axis[2])
-      let prop, dir
-      if (ax >= ay && ax >= az) { prop = 'x'; dir = axis[0] >= 0 ? 1 : -1 }
-      else if (ay >= az)        { prop = 'y'; dir = axis[1] >= 0 ? 1 : -1 }
-      else                      { prop = 'z'; dir = axis[2] >= 0 ? 1 : -1 }
-      const target = dir * (targetsRef.current[ji] || 0)
-      const cur    = g.rotation[prop]
-      g.rotation[prop] = cur + (target - cur) * SMOOTH
-    })
-  })
-
-  return null
-}
-
-// ---------------------------------------------------------------------------
-// StaticRobotModel — fallback when links.json is missing. Loads the
-// monolithic GLB (lite first, full second, STL last). No articulation.
-// ---------------------------------------------------------------------------
-
-function StaticRobotModel({ onLoaded, onError }) {
-  const { scene } = useThree()
-  const rootRef = useRef(null)
-
-  useEffect(() => {
     let disposed = false
-    let model = null
 
-    const fit = (root) => {
-      const box  = new THREE.Box3().setFromObject(root)
-      const size = box.getSize(new THREE.Vector3())
-      const ctr  = box.getCenter(new THREE.Vector3())
-      root.position.sub(ctr)
-      const maxDim = Math.max(size.x, size.y, size.z)
-      if (maxDim > 0) root.scale.multiplyScalar(2.0 / maxDim)
-    }
+    const fit = (scene) => {
+      // Phong (not Standard) so we don't need an environment map —
+      // metallic Standard material reads as nearly black on a plain
+      // white background. Phong has a usable specular highlight
+      // without an env probe.
+      scene.traverse((child) => {
+        if (child.isMesh) {
+          child.material = new THREE.MeshPhongMaterial({
+            color:     0xC0C8D4,
+            specular:  0x666666,
+            shininess: 30,
+            side:      THREE.DoubleSide,
+          })
+        }
+      })
 
-    const onSuccess = (root) => {
-      if (disposed) return
-      applyMetallicMaterial(root)
-      // Same Z-up -> Y-up correction the ArticulatedRobot applies.
-      const wrap = new THREE.Group()
-      wrap.rotation.x = -Math.PI / 2
-      wrap.add(root)
-      fit(wrap)
-      model = wrap
-      rootRef.current = model
-      scene.add(model)
+      // 1) Center on the geometric centroid.
+      const box    = new THREE.Box3().setFromObject(scene)
+      const center = box.getCenter(new THREE.Vector3())
+      const size   = box.getSize(new THREE.Vector3())
+      scene.position.sub(center)
+
+      // 2) Auto-detect the tallest axis in the source file and
+      //    rotate so it becomes three.js +Y. STEP files often use
+      //    Z-up; the GLB exporter may or may not have converted.
+      //    Doing this from the actual bounds keeps us robust.
+      const dims = [size.x, size.y, size.z]
+      const tallest = dims.indexOf(Math.max(...dims))
+      if (tallest === 0)        scene.rotation.z =  Math.PI / 2  // X is up
+      else if (tallest === 2)   scene.rotation.x = -Math.PI / 2  // Z is up
+      // tallest === 1: Y is already up, no rotation needed.
+
+      // 3) Scale to a ~2-unit envelope so the OrbitControls preset
+      //    distances make sense regardless of the source units.
+      scene.updateMatrixWorld(true)
+      const box2  = new THREE.Box3().setFromObject(scene)
+      const size2 = box2.getSize(new THREE.Vector3())
+      const maxDim = Math.max(size2.x, size2.y, size2.z)
+      if (maxDim > 0) scene.scale.multiplyScalar(2.0 / maxDim)
+
+      // 4) Plant the base on the grid (so the floor isn't a foot
+      //    above or below the bottom of the model).
+      scene.updateMatrixWorld(true)
+      const box3 = new THREE.Box3().setFromObject(scene)
+      scene.position.y -= box3.min.y
+
+      setModel(scene)
       onLoaded && onLoaded()
     }
 
-    const tryStl = () => {
-      console.warn('All GLBs failed, trying STL (last resort, ~240 MB)')
-      const stl = new STLLoader()
-      stl.load(
-        STATIC_STL_URL,
-        (geom) => {
-          geom.computeVertexNormals()
-          const mesh = new THREE.Mesh(
-            geom,
-            new THREE.MeshStandardMaterial({
-              color: '#B0B8C8', metalness: 0.6, roughness: 0.3,
-            }),
-          )
-          const wrap = new THREE.Group()
-          wrap.add(mesh)
-          onSuccess(wrap)
-        },
-        undefined,
-        (e) => { if (!disposed && onError) onError(`GLB+STL load failed: ${e?.message || e}`) },
-      )
-    }
-
-    const tryGlbCascade = (idx) => {
-      if (idx >= STATIC_GLB_URLS.length) return tryStl()
-      const url = STATIC_GLB_URLS[idx]
-      const loader = new GLTFLoader()
-      loader.load(
-        url,
-        (gltf) => onSuccess(gltf.scene),
-        undefined,
-        (err) => {
-          if (disposed) return
-          console.warn(`GLB load failed (${url}):`, err)
-          tryGlbCascade(idx + 1)
-        },
-      )
-    }
-
-    tryGlbCascade(0)
+    loader.load(
+      LITE_URL,
+      (gltf) => { if (!disposed) fit(gltf.scene) },
+      undefined,
+      () => {
+        // Lite missing — try the full GLB. Slower (~114 MB) but
+        // ensures the operator sees *something* even on a fresh
+        // checkout where the decimator hasn't run yet.
+        if (disposed) return
+        console.warn('Lite GLB missing, falling back to full model')
+        loader.load(
+          FULL_URL,
+          (gltf) => { if (!disposed) fit(gltf.scene) },
+          undefined,
+          (err) => { if (!disposed && onError) onError(`GLB load failed: ${err?.message || err}`) },
+        )
+      },
+    )
 
     return () => {
       disposed = true
       if (model) {
-        scene.remove(model)
         model.traverse((o) => {
           if (o.geometry) o.geometry.dispose()
           if (o.material) {
@@ -258,156 +120,107 @@ function StaticRobotModel({ onLoaded, onError }) {
         })
       }
     }
-  }, [scene])
-
-  return null
-}
-
-// ---------------------------------------------------------------------------
-// Camera + readout widgets
-// ---------------------------------------------------------------------------
-
-function CameraPreset({ preset }) {
-  const { camera } = useThree()
-  useEffect(() => {
-    const presets = {
-      front: [0,   0.9, 2.4],
-      side:  [2.4, 0.9, 0],
-      top:   [0,   3.0, 0.001],
-      iso:   [1.5, 1.2, 1.8],
-    }
-    const pos = presets[preset] ?? presets.iso
-    camera.position.set(...pos)
-    camera.lookAt(0, 0.8, 0)
-  }, [preset, camera])
-  return null
-}
-
-function JointReadout() {
-  const positions = useStore((s) => s.joints?.positions)
-  const names = useStore((s) => s.joints?.names)
-  const list = names && names.length ? names : ['J1', 'J2', 'J3', 'J4', 'J5', 'J6']
-  return (
-    <div style={{
-      position: 'absolute', top: 10, left: 10,
-      background: 'rgba(255,255,255,0.92)',
-      border: '1px solid #e5e7eb',
-      borderRadius: 6, padding: '6px 10px',
-      fontSize: 10, fontFamily: 'var(--font-mono)',
-      color: '#374151', width: 140,
-    }}>
-      {list.map((name, i) => (
-        <div key={name + i} style={{ display: 'flex', justifyContent: 'space-between' }}>
-          <span style={{ color: '#2563EB', fontWeight: 600 }}>{name}</span>
-          <span style={{ color: '#111' }}>{DEG(positions?.[i] || 0)}°</span>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// ArmViewer3D — top-level. Probes /robot/links.json:
-//   - 200 with body → mount ArticulatedRobot (S10-140 kinematic chain)
-//   - 404 / network error → mount StaticRobotModel (monolithic GLB)
-// ---------------------------------------------------------------------------
-
-const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
-  const [preset, setPreset] = useState('iso')
-  const [error,  setError]  = useState(null)
-  const [loaded, setLoaded] = useState(false)
-  const [mode,   setMode]   = useState('probing')
-  const [linksData, setLinksData] = useState(null)
-
-  useEffect(() => {
-    let alive = true
-    fetch(LINKS_JSON_URL)
-      .then((r) => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
-      .then((data) => {
-        if (!alive) return
-        if (!data?.links || !Array.isArray(data.links) || data.links.length === 0) {
-          setMode('static')
-          return
-        }
-        setLinksData(data)
-        setMode('articulated')
-      })
-      .catch(() => { if (alive) setMode('static') })
-    return () => { alive = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  if (!model) return null
+  return <primitive object={model} />
+}
+
+const ArmViewer3D = forwardRef(function ArmViewer3D({ joints }, ref) {
+  const controlsRef = useRef(null)
+  const [loaded, setLoaded] = useState(false)
+  const [error,  setError]  = useState(null)
+
+  // Joint angles for the on-canvas readout. Caller-provided `joints`
+  // wins (degrees array); otherwise pull from the Zustand store
+  // (positions in radians) and convert. The store is updated by the
+  // WebSocket broadcast at 25 Hz, which is faster and cheaper than
+  // polling /api/state — and avoids the j1/.../j6 shape mismatch the
+  // /api/state response doesn't have.
+  const storePositions = useStore((s) => s.joints?.positions)
+  let liveJointsDeg
+  if (joints && joints.length >= 6) {
+    liveJointsDeg = joints
+  } else if (storePositions && storePositions.length >= 6) {
+    liveJointsDeg = storePositions.slice(0, 6).map((rad) => (rad || 0) * 180 / Math.PI)
+  } else {
+    liveJointsDeg = [0, 0, 0, 0, 0, 0]
+  }
+
+  const applyPreset = (name) => {
+    const pos = PRESETS[name] ?? PRESETS.iso
+    const c = controlsRef.current
+    if (!c) return
+    c.object.position.set(pos[0], pos[1], pos[2])
+    c.target.set(0, 1, 0)
+    c.update()
+  }
+
+  // Expose imperative camera-preset API so View3DLayout's external
+  // preset row can drive the viewer without prop-drilling.
   useImperativeHandle(ref, () => ({
-    setCameraPreset(name) { setPreset(name) },
+    setCameraPreset(name) { applyPreset(name) },
   }))
 
   return (
-    <div style={{ position: 'relative', width: '100%', height: '100%', background: '#FFFFFF' }}>
-      <Canvas
-        camera={{ position: [1.5, 1.2, 1.8], fov: 45 }}
-        shadows
-        gl={{ antialias: true }}
-      >
-        <color attach="background" args={['#FFFFFF']} />
-        {/* Environment map gives metallic surfaces something to
-            reflect. Without it, MeshStandardMaterial(metalness=0.6)
-            reads as nearly black because metals don't scatter
-            diffuse light. The 'warehouse' preset is neutral white-
-            grey and renders well on a light background. */}
-        <Environment preset="warehouse" background={false} />
-        <ambientLight intensity={0.45} />
-        <directionalLight position={[3, 6, 3]} intensity={0.8} castShadow />
-        <directionalLight position={[-3, 4, -3]} intensity={0.3} />
-
-        <gridHelper args={[3, 30, '#d1d5db', '#e5e7eb']} />
-        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.001, 0]} receiveShadow>
-          <planeGeometry args={[3, 3]} />
-          <shadowMaterial opacity={0.3} />
-        </mesh>
-
-        {mode === 'articulated' && linksData && (
-          <ArticulatedRobot
-            links={linksData.links}
-            onLoaded={() => setLoaded(true)}
-            onError={(e) => setError(e)}
-          />
-        )}
-        {mode === 'static' && (
-          <StaticRobotModel
-            onLoaded={() => setLoaded(true)}
-            onError={(e) => setError(e)}
-          />
-        )}
-
-        <CameraPreset preset={preset} />
+    <div style={{ width: '100%', height: '100%', position: 'relative', background: '#fafafa' }}>
+      <Canvas camera={{ position: PRESETS.iso, fov: 45 }} gl={{ antialias: true }}>
+        <ambientLight intensity={0.8} />
+        <directionalLight position={[5, 10, 5]}  intensity={0.9} />
+        <directionalLight position={[-5, 5, -5]} intensity={0.4} />
+        <pointLight       position={[0, 3, 0]}   intensity={0.3} />
+        <RobotModel onLoaded={() => setLoaded(true)} onError={setError} />
         <OrbitControls
-          target={[0, 0.8, 0]}
-          enableDamping dampingFactor={0.08}
-          minDistance={0.5} maxDistance={6}
+          ref={controlsRef}
+          enablePan enableZoom
+          target={[0, 1, 0]}
+          minDistance={0.5}
+          maxDistance={8}
         />
+        <gridHelper args={[4, 20, '#cccccc', '#e5e5e5']} />
       </Canvas>
 
-      <JointReadout />
-
+      {/* Joint readout, top-right */}
       <div style={{
-        position: 'absolute', top: 10, right: 10, display: 'flex', gap: 2,
-        background: 'rgba(255,255,255,0.92)', borderRadius: 6, padding: 3,
-        border: '1px solid #e5e7eb',
+        position: 'absolute', top: 8, right: 8, padding: '8px 12px',
+        background: 'rgba(255,255,255,0.95)', borderRadius: 8, fontSize: 12,
+        fontFamily: 'var(--font-mono, monospace)', color: '#374151', zIndex: 10,
+        boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
       }}>
-        {['Front', 'Side', 'Top', 'Iso'].map((p) => (
+        {['J1', 'J2', 'J3', 'J4', 'J5', 'J6'].map((name, i) => (
+          <div key={name} style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}>
+            <span style={{ fontWeight: 600, color: JOINT_COLORS[i] }}>{name}</span>
+            <span>{(liveJointsDeg[i] || 0).toFixed(1)}°</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Camera presets, top-left */}
+      <div style={{
+        position: 'absolute', top: 8, left: 8, display: 'flex', gap: 4, zIndex: 10,
+      }}>
+        {[
+          { label: 'Front', key: 'front' },
+          { label: 'Side',  key: 'side'  },
+          { label: 'Top',   key: 'top'   },
+          { label: 'Iso',   key: 'iso'   },
+        ].map((p) => (
           <button
-            key={p}
-            onClick={() => setPreset(p.toLowerCase())}
+            key={p.key}
+            onClick={() => applyPreset(p.key)}
             style={{
-              background: preset === p.toLowerCase() ? '#eff6ff' : 'transparent',
-              color:      preset === p.toLowerCase() ? '#2563EB' : '#6b7280',
-              border: 'none', padding: '3px 9px', borderRadius: 4, fontSize: 11, fontWeight: 600,
+              padding: '4px 10px', fontSize: 10, fontWeight: 600,
+              background: 'rgba(255,255,255,0.92)', color: '#374151',
+              border: '1px solid #d1d5db', borderRadius: 4, cursor: 'pointer',
             }}
           >
-            {p}
+            {p.label}
           </button>
         ))}
       </div>
 
+      {/* Status bottom-left — error or loading */}
       {error && (
         <div style={{
           position: 'absolute', bottom: 10, left: 10,
@@ -423,9 +236,7 @@ const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
           background: 'rgba(255,255,255,0.92)', border: '1px solid #e5e7eb',
           color: '#6b7280', padding: '4px 8px', borderRadius: 4, fontSize: 10,
         }}>
-          {mode === 'probing' ? 'Probing model…'
-           : mode === 'articulated' ? 'Loading articulated robot…'
-           : 'Loading static model…'}
+          Loading robot model…
         </div>
       )}
     </div>
