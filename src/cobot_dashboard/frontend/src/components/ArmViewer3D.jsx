@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, forwardRef, useImperativeHandle } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
-import { OrbitControls } from '@react-three/drei'
+import { OrbitControls, Environment } from '@react-three/drei'
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import * as THREE from 'three'
@@ -109,8 +109,16 @@ function ArticulatedRobot({ links, onLoaded, onError }) {
         if (link.parent && groups[link.parent]) {
           groups[link.parent].add(g)
         } else {
-          rootRef.current = g
-          scene.add(g)
+          // The split GLBs came out of trimesh which preserves the
+          // STEP file's Z-up convention. three.js renders Y-up, so
+          // wrap the root in a parent group that applies the
+          // classic -90° X rotation — same correction the previous
+          // URDFRobot used on the UR5e model.
+          const worldWrap = new THREE.Group()
+          worldWrap.rotation.x = -Math.PI / 2
+          worldWrap.add(g)
+          rootRef.current = worldWrap
+          scene.add(worldWrap)
         }
       })
 
@@ -185,9 +193,13 @@ function StaticRobotModel({ onLoaded, onError }) {
 
     const onSuccess = (root) => {
       if (disposed) return
-      model = root
-      fit(model)
-      applyMetallicMaterial(model)
+      applyMetallicMaterial(root)
+      // Same Z-up -> Y-up correction the ArticulatedRobot applies.
+      const wrap = new THREE.Group()
+      wrap.rotation.x = -Math.PI / 2
+      wrap.add(root)
+      fit(wrap)
+      model = wrap
       rootRef.current = model
       scene.add(model)
       onLoaded && onLoaded()
@@ -336,9 +348,15 @@ const ArmViewer3D = forwardRef(function ArmViewer3D(props, ref) {
         gl={{ antialias: true }}
       >
         <color attach="background" args={['#FFFFFF']} />
-        <ambientLight intensity={0.7} />
-        <directionalLight position={[3, 6, 3]} intensity={1.0} castShadow />
-        <directionalLight position={[-3, 4, -3]} intensity={0.4} />
+        {/* Environment map gives metallic surfaces something to
+            reflect. Without it, MeshStandardMaterial(metalness=0.6)
+            reads as nearly black because metals don't scatter
+            diffuse light. The 'warehouse' preset is neutral white-
+            grey and renders well on a light background. */}
+        <Environment preset="warehouse" background={false} />
+        <ambientLight intensity={0.45} />
+        <directionalLight position={[3, 6, 3]} intensity={0.8} castShadow />
+        <directionalLight position={[-3, 4, -3]} intensity={0.3} />
 
         <gridHelper args={[3, 30, '#d1d5db', '#e5e7eb']} />
         <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.001, 0]} receiveShadow>
