@@ -2525,6 +2525,12 @@ if FASTAPI_AVAILABLE:
     async def robot_model_glb():
         return _serve_robot_asset('S10-140.glb', 'model/gltf-binary')
 
+    @app.get("/robot/model_lite.glb")
+    async def robot_model_lite_glb():
+        # Decimated to ~150k faces by scripts/decimate_robot_glb.py.
+        # ArmViewer3D loads this first; the full GLB is the fallback.
+        return _serve_robot_asset('S10-140_lite.glb', 'model/gltf-binary')
+
     @app.get("/robot/model.stl")
     async def robot_model_stl():
         return _serve_robot_asset('S10-140.stl', 'application/sla')

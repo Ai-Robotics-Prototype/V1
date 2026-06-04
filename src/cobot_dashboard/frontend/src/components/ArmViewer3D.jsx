@@ -15,8 +15,12 @@ const URDF_URL = '/robot_model/ur5e.urdf'
 // Lives under /robot/ (active-robot symlink) rather than the legacy
 // /robot_model/ static dir.
 const LINKS_JSON_URL = '/robot/links.json'
-const STATIC_GLB_URL = '/robot/model.glb'
-const STATIC_STL_URL = '/robot/model.stl'
+// Order is intentional: lite GLB first (~3 MB, decimated to ~150k
+// faces — what the tablet can chew through), full GLB next (~114 MB,
+// for desktop / engineering), STL last (~243 MB, only if both GLBs
+// 404). The viewer tries each in turn.
+const STATIC_GLB_URLS = ['/robot/model_lite.glb', '/robot/model.glb']
+const STATIC_STL_URL  = '/robot/model.stl'
 const JOINT_ORDER = [
   'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
   'wrist_1_joint',      'wrist_2_joint',       'wrist_3_joint',
@@ -165,35 +169,47 @@ function StaticRobotModel({ onLoaded, onError }) {
       onLoaded && onLoaded()
     }
 
-    const loader = new GLTFLoader()
-    loader.load(
-      STATIC_GLB_URL,
-      (gltf) => onSuccess(gltf.scene),
-      undefined,
-      (err) => {
-        // STL fallback path. The converted .stl is huge (~240 MB),
-        // so this only fires if the GLB is genuinely missing.
-        console.warn('GLB load failed, trying STL:', err)
-        const stl = new STLLoader()
-        stl.load(
-          STATIC_STL_URL,
-          (geom) => {
-            geom.computeVertexNormals()
-            const mesh = new THREE.Mesh(
-              geom,
-              new THREE.MeshStandardMaterial({
-                color: '#B0B8C8', metalness: 0.6, roughness: 0.3,
-              }),
-            )
-            const wrap = new THREE.Group()
-            wrap.add(mesh)
-            onSuccess(wrap)
-          },
-          undefined,
-          (e) => { if (!disposed && onError) onError(`GLB+STL load failed: ${e?.message || e}`) },
-        )
-      },
-    )
+    // Try each GLB in order, falling back to STL if all GLBs are
+    // missing. The first GLB that loads wins.
+    const tryStl = () => {
+      console.warn('All GLBs failed, trying STL (last resort, ~240 MB)')
+      const stl = new STLLoader()
+      stl.load(
+        STATIC_STL_URL,
+        (geom) => {
+          geom.computeVertexNormals()
+          const mesh = new THREE.Mesh(
+            geom,
+            new THREE.MeshStandardMaterial({
+              color: '#B0B8C8', metalness: 0.6, roughness: 0.3,
+            }),
+          )
+          const wrap = new THREE.Group()
+          wrap.add(mesh)
+          onSuccess(wrap)
+        },
+        undefined,
+        (e) => { if (!disposed && onError) onError(`GLB+STL load failed: ${e?.message || e}`) },
+      )
+    }
+
+    const tryGlbCascade = (idx) => {
+      if (idx >= STATIC_GLB_URLS.length) return tryStl()
+      const url = STATIC_GLB_URLS[idx]
+      const loader = new GLTFLoader()
+      loader.load(
+        url,
+        (gltf) => onSuccess(gltf.scene),
+        undefined,
+        (err) => {
+          if (disposed) return
+          console.warn(`GLB load failed (${url}):`, err)
+          tryGlbCascade(idx + 1)
+        },
+      )
+    }
+
+    tryGlbCascade(0)
 
     return () => {
       disposed = true
