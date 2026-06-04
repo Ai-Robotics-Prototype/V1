@@ -147,15 +147,18 @@ function PadCenterTile({ label, width = 64, height = 64 }) {
   )
 }
 
-function TeachWithJog({ title, description, instructions, pointName, config, setConfig, onNext, onSkip }) {
+function TeachWithJog({ title, description, instructions, pointName, answers, setAnswer, onNext, onSkip }) {
   const jog          = useStore((s) => s.jog)
   const jogCartesian = useStore((s) => s.jogCartesian)
   const homeRobot    = useStore((s) => s.homeRobot)
   const triggerEstop = useStore((s) => s.triggerEstop)
 
-  const initialTaught = !!config[pointName]
-  const [taught, setTaught]   = useState(initialTaught)
-  const [position, setPosition] = useState(config[pointName] || null)
+  // answers may be undefined on the very first render if a stale
+  // teach page mounts before the parent wizard hydrates — guard both
+  // reads so initial useState never throws.
+  const initialTaught = !!(answers && answers[pointName])
+  const [taught, setTaught]     = useState(initialTaught)
+  const [position, setPosition] = useState((answers && answers[pointName]) || null)
 
   const [jogMode, setJogMode] = useState('cartesian')
   const [step, setStep]       = useState(1.0)
@@ -215,7 +218,9 @@ function TeachWithJog({ title, description, instructions, pointName, config, set
         taught_at: new Date().toISOString(),
       }
       setPosition(pos)
-      setConfig((prev) => ({ ...prev, [pointName]: pos }))
+      // Wizard's per-answer setter: (key, value). Not the (prev =>
+      // next) functional setter the previous draft assumed.
+      setAnswer(pointName, pos)
       setTaught(true)
     } catch {}
   }
@@ -787,7 +792,7 @@ const PAGES = [
   // 13: Teach home
   {
     id: 'teach_home',
-    render: ({ config, setConfig, goNext }) => (
+    render: ({ answers, setAnswer, goNext }) => (
       <TeachWithJog
         title="Teach the HOME position"
         description="This is where the robot rests between cycles. Jog to adjust if needed, or just record the current pose."
@@ -798,7 +803,7 @@ const PAGES = [
           'Press "Record This Position" to confirm',
         ]}
         pointName="home_point"
-        config={config} setConfig={setConfig}
+        answers={answers} setAnswer={setAnswer}
         onNext={goNext}
       />
     ),
@@ -807,7 +812,7 @@ const PAGES = [
   // 14: Teach pick
   {
     id: 'teach_pick',
-    render: ({ answers, config, setConfig, goNext }) => (
+    render: ({ answers, setAnswer, goNext }) => (
       <TeachWithJog
         title="Teach the PICK position"
         description="Move the robot to where it should pick up parts."
@@ -819,7 +824,7 @@ const PAGES = [
           'Press "Record This Position" when ready',
         ]}
         pointName="pick_point"
-        config={config} setConfig={setConfig}
+        answers={answers} setAnswer={setAnswer}
         onNext={goNext}
         // Camera-driven picks can skip a fixed teach point; runtime
         // detection supplies the pose. Fixed-position picks must teach.
@@ -832,7 +837,7 @@ const PAGES = [
   {
     id: 'teach_place',
     skip: (answers) => answers.operation === 'machine_tend',
-    render: ({ config, setConfig, goNext }) => (
+    render: ({ answers, setAnswer, goNext }) => (
       <TeachWithJog
         title="Teach the PLACE position"
         description="Move the robot to where parts should be placed."
@@ -843,7 +848,7 @@ const PAGES = [
           'Press "Record This Position" when ready',
         ]}
         pointName="place_point"
-        config={config} setConfig={setConfig}
+        answers={answers} setAnswer={setAnswer}
         onNext={goNext}
       />
     ),
@@ -853,7 +858,7 @@ const PAGES = [
   {
     id: 'teach_machine_load',
     skip: (answers) => answers.operation !== 'machine_tend',
-    render: ({ config, setConfig, goNext }) => (
+    render: ({ answers, setAnswer, goNext }) => (
       <TeachWithJog
         title="Teach the MACHINE LOAD position"
         description="Move the robot to where it loads parts into the machine."
@@ -865,7 +870,7 @@ const PAGES = [
           'Press "Record This Position" when ready',
         ]}
         pointName="machine_load_point"
-        config={config} setConfig={setConfig}
+        answers={answers} setAnswer={setAnswer}
         onNext={goNext}
       />
     ),
@@ -875,7 +880,7 @@ const PAGES = [
   {
     id: 'teach_unload',
     skip: (answers) => answers.operation !== 'machine_tend',
-    render: ({ config, setConfig, goNext }) => (
+    render: ({ answers, setAnswer, goNext }) => (
       <TeachWithJog
         title="Teach the UNLOAD position"
         description="Move the robot to where finished parts should be placed after the machine cycle."
@@ -885,7 +890,7 @@ const PAGES = [
           'Press "Record This Position" when ready',
         ]}
         pointName="unload_point"
-        config={config} setConfig={setConfig}
+        answers={answers} setAnswer={setAnswer}
         onNext={goNext}
       />
     ),
@@ -895,7 +900,7 @@ const PAGES = [
   {
     id: 'teach_inspect',
     skip: (answers) => answers.operation !== 'inspect',
-    render: ({ config, setConfig, goNext }) => (
+    render: ({ answers, setAnswer, goNext }) => (
       <TeachWithJog
         title="Teach the INSPECTION pose"
         description="Move the robot to where it holds the part in front of the camera for inspection."
@@ -906,7 +911,7 @@ const PAGES = [
           'Press "Record This Position" when ready',
         ]}
         pointName="inspect_point"
-        config={config} setConfig={setConfig}
+        answers={answers} setAnswer={setAnswer}
         onNext={goNext}
       />
     ),
