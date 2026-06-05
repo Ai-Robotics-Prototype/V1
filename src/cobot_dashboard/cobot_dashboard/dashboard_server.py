@@ -1765,8 +1765,13 @@ if FASTAPI_AVAILABLE:
             pid = p.get('id') or ''
             d = os.path.join(teach_base, pid)
             try:
+                # Exclude any defect sidecar files (defects.json today;
+                # the filter also guards against any future
+                # `defects*.npz` that would inflate the count beyond
+                # what the operator actually captured this session).
                 p['teach_count'] = sum(
-                    1 for f in os.listdir(d) if f.endswith('.npz')
+                    1 for f in os.listdir(d)
+                    if f.endswith('.npz') and not f.startswith('defects')
                 ) if os.path.isdir(d) else 0
             except OSError:
                 p['teach_count'] = 0
@@ -1814,8 +1819,14 @@ if FASTAPI_AVAILABLE:
 
         teach_dir = f'/opt/cobot/parts/teach/{part_id}'
         def _count():
+            # Same filter as api_parts_list — exclude defect sidecars
+            # so the wizard's per-capture count reflects what the
+            # operator just taught.
             try:
-                return sum(1 for f in os.listdir(teach_dir) if f.endswith('.npz'))
+                return sum(
+                    1 for f in os.listdir(teach_dir)
+                    if f.endswith('.npz') and not f.startswith('defects')
+                )
             except OSError:
                 return 0
         before = _count()
@@ -2012,6 +2023,161 @@ if FASTAPI_AVAILABLE:
             'png_files':   len([f for f in files if f.endswith('.png')]),
             'files':       files[:200],
         }
+
+    @app.get("/api/parts/{part_id}/orientation_debug")
+    async def api_parts_orientation_debug(part_id: str):
+        """Surface the live orientation-classifier state for a part.
+
+        Lists the part's teach refs grouped by orientation key
+        (is_pickable + orientation_label), with the .png preview
+        filenames the wizard can render side-by-side.
+
+        Also returns the latest match scores: NCC, hist, spatial,
+        gap, winner label. Those come from a sidecar
+        .last_match.json the depth_segment_node writes (throttled to
+        ~2 Hz per part). dashboard_server and depth_segment_node run
+        as separate processes — they can't share an in-process dict
+        — so the file is the cross-process surface."""
+        import numpy as _np
+        teach_dir = f'/opt/cobot/parts/teach/{part_id}'
+        if not os.path.isdir(teach_dir):
+            return {
+                'part_id':    part_id,
+                'groups':     [],
+                'last_match': None,
+            }
+
+        # Group refs by (is_pickable, orientation_label).
+        groups: dict = {}
+        try:
+            for fn in sorted(os.listdir(teach_dir)):
+                if not fn.endswith('.npz') or fn.startswith('defects'):
+                    continue
+                full = os.path.join(teach_dir, fn)
+                try:
+                    z = _np.load(full, allow_pickle=True)
+                    files = set(z.files)
+                    is_pick = (bool(z['is_pickable'])
+                               if 'is_pickable' in files
+                               else (str(z['orientation']) == 'pickable'
+                                     if 'orientation' in files else True))
+                    label = (str(z['orientation_label'])
+                             if 'orientation_label' in files else '')
+                except Exception:
+                    continue
+                key = (is_pick, label)
+                png_name = fn[:-4] + '.png'
+                if not os.path.isfile(os.path.join(teach_dir, png_name)):
+                    png_name = None
+                grp = groups.setdefault(key, {
+                    'is_pickable':       is_pick,
+                    'orientation_label': label,
+                    'ref_count':         0,
+                    'previews':          [],
+                })
+                grp['ref_count'] += 1
+                if png_name is not None:
+                    grp['previews'].append(png_name)
+        except OSError:
+            pass
+
+        last_match = None
+        last_match_path = os.path.join(teach_dir, '.last_match.json')
+        if os.path.isfile(last_match_path):
+            try:
+                with open(last_match_path) as f:
+                    last_match = json.load(f)
+            except Exception:
+                last_match = None
+
+        return {
+            'part_id':    part_id,
+            'groups':     list(groups.values()),
+            'last_match': last_match,
+        }
+
+    _ORIENT_WEIGHT_DEFAULTS = {
+        'ncc': 0.25, 'hist': 0.20, 'spatial': 0.20, 'depth': 0.35,
+    }
+
+    def _orient_weights_for(part_id: str) -> dict:
+        """Read + normalise weights from the part's metadata json.
+        Mirrors DepthSegmentNode._load_orient_weights so the
+        dashboard and the matcher report the same values."""
+        weights = dict(_ORIENT_WEIGHT_DEFAULTS)
+        meta_path = f'/opt/cobot/parts/metadata/{part_id}.json'
+        if not os.path.isfile(meta_path):
+            return weights
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f) or {}
+            w = meta.get('orient_weights') or {}
+            if isinstance(w, dict):
+                for k in list(weights.keys()):
+                    v = w.get(k)
+                    if isinstance(v, (int, float)) and float(v) >= 0:
+                        weights[k] = float(v)
+                total = sum(weights.values())
+                if total > 0:
+                    weights = {k: v / total for k, v in weights.items()}
+        except Exception:
+            pass
+        return weights
+
+    @app.get("/api/parts/{part_id}/orient_weights")
+    async def api_parts_orient_weights_get(part_id: str):
+        """Current orientation-classifier weights for a part,
+        normalised to sum=1.0. Returns the defaults when the part
+        has no orient_weights field saved."""
+        meta_path = f'/opt/cobot/parts/metadata/{part_id}.json'
+        if not os.path.isfile(meta_path):
+            return JSONResponse({"error": "part not found"}, status_code=404)
+        return {
+            'part_id':  part_id,
+            'weights':  _orient_weights_for(part_id),
+            'defaults': _ORIENT_WEIGHT_DEFAULTS,
+        }
+
+    @app.post("/api/parts/{part_id}/orient_weights")
+    async def api_parts_orient_weights_set(part_id: str, request: Request):
+        """Persist per-part orientation-classifier weights.
+        Body must carry every key (ncc / hist / spatial / depth) as a
+        non-negative number. Values are re-normalised to sum=1.0 then
+        written under orient_weights in the part's metadata json.
+        depth_segment_node picks the new weights up on its next
+        _match_part call (the metadata file is reread per-frame)."""
+        meta_path = f'/opt/cobot/parts/metadata/{part_id}.json'
+        if not os.path.isfile(meta_path):
+            return JSONResponse({"error": "part not found"}, status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        required = ('ncc', 'hist', 'spatial', 'depth')
+        raw = {}
+        for k in required:
+            v = body.get(k)
+            if not isinstance(v, (int, float)) or float(v) < 0:
+                return JSONResponse(
+                    {"error": f"weight '{k}' must be a non-negative number"},
+                    status_code=400)
+            raw[k] = float(v)
+        total = sum(raw.values())
+        if total <= 0:
+            return JSONResponse(
+                {"error": "at least one weight must be > 0"}, status_code=400)
+        normalised = {k: v / total for k, v in raw.items()}
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f) or {}
+            meta['orient_weights'] = normalised
+            tmp = meta_path + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(meta, f, indent=2)
+            os.replace(tmp, meta_path)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return {'ok': True, 'part_id': part_id, 'weights': normalised}
 
     @app.get("/api/parts/{part_id}")
     async def api_parts_get(part_id: str):

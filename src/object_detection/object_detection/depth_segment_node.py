@@ -47,6 +47,7 @@ except ImportError:
         return None, 0.0, ''
 from scipy import ndimage
 from scipy.spatial.transform import Rotation as _SR
+from scipy.stats import skew as _scipy_skew, kurtosis as _scipy_kurtosis
 from PIL import Image as PILImage, ImageDraw, ImageFont
 
 try:
@@ -101,6 +102,32 @@ def _load_cam_to_lidar(frame_id: str, logger):
         f'cam_to_lidar({key!r}) from {used or "fallback"}: '
         f't={t_vec.tolist()} q={quat}')
     return R_mat, t_vec, np.asarray(quat, dtype=np.float64)
+
+
+# Per-part orient-match cache. Updated by _match_part on each frame
+# the part is matched. In-process only — depth_segment_node and
+# dashboard_server run in SEPARATE processes, so the dashboard's
+# /api/parts/<id>/orientation_debug endpoint reads from the
+# .last_match.json sidecar this module writes (see _write_last_match).
+# Other in-process consumers (debug nodes, future GUI) can still
+# import this dict directly.
+_last_orient_match: dict = {}
+
+
+def _write_last_match(part_id: str, payload: dict) -> None:
+    """Atomically write the part's latest orient-match payload to a
+    sidecar JSON the dashboard process can read. Writes are throttled
+    inside _match_part so we hit the FS at most ~2x/sec per part."""
+    try:
+        teach_dir = os.path.join('/opt/cobot/parts/teach', str(part_id))
+        os.makedirs(teach_dir, exist_ok=True)
+        path = os.path.join(teach_dir, '.last_match.json')
+        tmp  = path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
 
 
 class DepthSegmentNode(Node):
@@ -1195,6 +1222,19 @@ class DepthSegmentNode(Node):
                     orientation_str = (str(z['orientation'])
                                        if 'orientation' in files
                                        else 'pickable')
+                    # Keypoint descriptors are stored as a 2-D N×D
+                    # array; the matcher expects a list of 1-D rows.
+                    # Missing → empty list (matcher returns 0 for kp
+                    # signal, LBP carries on if available).
+                    if 'kp_descs' in files:
+                        raw_kp = np.asarray(z['kp_descs'], dtype=np.float32)
+                        kp_list = ([raw_kp[i] for i in range(raw_kp.shape[0])]
+                                   if raw_kp.ndim == 2 else [])
+                    else:
+                        kp_list = []
+                    lbp_arr = (np.asarray(z['lbp_hist'], dtype=np.float32)
+                               if 'lbp_hist' in files
+                               else np.zeros(64, dtype=np.float32))
                     ref = {
                         'size_m':   np.asarray(z['size_m'], dtype=np.float32)
                                     if 'size_m' in files
@@ -1227,6 +1267,12 @@ class DepthSegmentNode(Node):
                                       if 'distance_m' in files else 0.5,
                         'px_per_cm':  float(z['px_per_cm'])
                                       if 'px_per_cm' in files else 10.0,
+                        # Keypoint+LBP features for the orientation
+                        # classifier. Old refs without these fall back
+                        # to empty list / zero vector, which the
+                        # matcher scores as a 0.5 (neutral) feat.
+                        'kp_descs':   kp_list,
+                        'lbp_hist':   lbp_arr,
                     }
                     refs.append(ref)
                 except Exception:
@@ -1423,6 +1469,23 @@ class DepthSegmentNode(Node):
                                 float(np.sqrt(area / np.pi)) / max(ref_w, ref_h),
                             ])
 
+            # ── Keypoint descriptors + LBP histogram ─────────────────
+            # Computed at teach time so runtime _match_part doesn't
+            # have to rebuild them per frame. lbp_hist is always
+            # saved (even zeros) so loaders don't need to special-
+            # case its absence; kp_descs is only saved when at least
+            # one corner survived the variance gate.
+            kp_descs_teach = []
+            lbp_hist_teach = np.zeros(64, dtype=np.float32)
+            if ref_color is not None and ref_mask.any():
+                gray_for_features = (
+                    np.mean(ref_color.astype(np.float32), axis=2)
+                    if ref_color.ndim == 3
+                    else ref_color.astype(np.float32)
+                )
+                kp_descs_teach, lbp_hist_teach = self._extract_features(
+                    gray_for_features, ref_mask)
+
             teach_dir = self._teach_dir(part_id)
             os.makedirs(teach_dir, exist_ok=True)
             existing = sum(1 for f in os.listdir(teach_dir) if f.endswith('.npz'))
@@ -1460,6 +1523,10 @@ class DepthSegmentNode(Node):
                 save_data['contour'] = contour_points
             if hole_positions:
                 save_data['hole_positions'] = np.array(hole_positions, dtype=np.float32)
+            # Feature descriptors for the matcher's keypoint+LBP signal.
+            save_data['lbp_hist'] = lbp_hist_teach.astype(np.float32)
+            if kp_descs_teach:
+                save_data['kp_descs'] = np.vstack(kp_descs_teach).astype(np.float32)
 
             out_path = os.path.join(teach_dir, f'ref_{ref_id:03d}.npz')
             np.savez_compressed(out_path, **save_data)
@@ -2202,17 +2269,45 @@ class DepthSegmentNode(Node):
         return out
 
     @staticmethod
-    def _color_hist_corr(rgb1, rgb2, bins=16):
-        """Pearson correlation between two RGB images' per-channel
-        histograms. numpy-only — depth_segment_node has a hard
-        no-cv2/no-skimage policy.
+    def _load_orient_weights(part_id, defaults):
+        """Read per-part orientation-classifier weights from the
+        part's metadata json (key: 'orient_weights'). Re-normalises
+        to sum=1.0 so the operator can supply unnormalised numbers
+        and the classifier still produces a probability-like score.
+        Falls back to `defaults` when the file is missing, the key
+        absent, or any value invalid."""
+        weights = dict(defaults)
+        path = f'/opt/cobot/parts/metadata/{part_id}.json'
+        if not os.path.isfile(path):
+            return weights
+        try:
+            with open(path) as fp:
+                meta = json.load(fp)
+            w = meta.get('orient_weights') or {}
+            if not isinstance(w, dict):
+                return weights
+            for k in list(weights.keys()):
+                v = w.get(k)
+                if isinstance(v, (int, float)) and float(v) >= 0:
+                    weights[k] = float(v)
+            total = sum(weights.values())
+            if total > 0:
+                weights = {k: v / total for k, v in weights.items()}
+        except Exception:
+            pass
+        return weights
 
-        Used as an orientation tie-breaker: two refs with identical
-        outline (a key-fob front vs back) often produce near-identical
-        NCC scores, but the surface texture / colour distribution
-        differs and shows up in the histogram. Returns 0..1; values
-        below 0 are clamped (negative correlation means "very different
-        distributions" — equivalent to 0 for our scoring purposes)."""
+    @staticmethod
+    def _color_hist_corr(rgb1, rgb2, bins=32, mask1=None, mask2=None):
+        """Pearson correlation between two RGB images' per-channel
+        histograms, optionally restricted to masked pixels. numpy-only
+        — depth_segment_node has a hard no-cv2/no-skimage policy.
+
+        One of three orientation tie-breakers. Returns 0..1; negative
+        correlations are clamped to 0 (in scoring context "very
+        different" and "uncorrelated" both mean "no signal"). bins=32
+        + per-image masks give the granularity needed to discriminate
+        a key fob's two faces."""
         try:
             if rgb1 is None or rgb2 is None:
                 return 0.0
@@ -2224,18 +2319,32 @@ class DepthSegmentNode(Node):
                 r1 = np.stack([r1, r1, r1], axis=-1)
             if r2.ndim == 2:
                 r2 = np.stack([r2, r2, r2], axis=-1)
+
+            # Restrict to masked pixels when masks are supplied — keeps
+            # background out so two crops of the same part on different
+            # tables still match.
+            def _flatten(img, mask):
+                if (mask is not None
+                        and np.asarray(mask).shape[:2] == img.shape[:2]
+                        and np.asarray(mask).any()):
+                    return img[np.asarray(mask).astype(bool)]
+                return img.reshape(-1, img.shape[-1])
+
+            r1_use = _flatten(r1, mask1)
+            r2_use = _flatten(r2, mask2)
+            if r1_use.size == 0 or r2_use.size == 0:
+                return 0.0
+
             parts = []
-            for c in range(min(3, r1.shape[-1], r2.shape[-1])):
-                h1, _ = np.histogram(r1[..., c], bins=bins, range=(0, 256))
-                h2, _ = np.histogram(r2[..., c], bins=bins, range=(0, 256))
+            for c in range(min(3, r1_use.shape[-1], r2_use.shape[-1])):
+                h1, _ = np.histogram(r1_use[..., c], bins=bins, range=(0, 256))
+                h2, _ = np.histogram(r2_use[..., c], bins=bins, range=(0, 256))
                 h1 = h1.astype(np.float32)
                 h2 = h2.astype(np.float32)
                 s1, s2 = h1.sum(), h2.sum()
                 if s1 > 0: h1 /= s1
                 if s2 > 0: h2 /= s2
                 parts.append((h1, h2))
-            # Concatenate per-channel histograms into one vector and
-            # Pearson-correlate.
             a = np.concatenate([p[0] for p in parts])
             b = np.concatenate([p[1] for p in parts])
             sa, sb = float(a.std()), float(b.std())
@@ -2245,6 +2354,406 @@ class DepthSegmentNode(Node):
             return max(0.0, min(1.0, corr))
         except Exception:
             return 0.0
+
+    @staticmethod
+    def _spatial_color_score(det_color, det_mask, ref_color, ref_mask):
+        """4x4 spatial colour-grid cosine similarity.
+
+        Two crops with identical outlines (key-fob front vs back)
+        often tie on overall colour histograms AND grayscale NCC.
+        This score breaks the tie by comparing colour PER SPATIAL
+        CELL: each crop becomes a 48-dim vector (4x4 grid x mean
+        R/G/B over the cell's masked pixels), then cosine similarity.
+        Empty cells fall back to the overall masked-region mean so a
+        tiny mask gap doesn't punish the score with a hard zero."""
+        def _grid_vec(rgb, mask):
+            if rgb is None:
+                return None
+            arr = np.asarray(rgb, dtype=np.float32)
+            if arr.ndim == 2:
+                arr = np.stack([arr, arr, arr], axis=-1)
+            H, W = arr.shape[:2]
+            if H < 4 or W < 4:
+                return None
+            if (mask is not None
+                    and np.asarray(mask).shape[:2] == (H, W)):
+                m = np.asarray(mask).astype(bool)
+            else:
+                m = np.ones((H, W), dtype=bool)
+            if m.any():
+                overall = arr[m].mean(axis=0)
+            else:
+                overall = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            vec = []
+            for gy in range(4):
+                y0 = int(round(gy * H / 4.0))
+                y1 = int(round((gy + 1) * H / 4.0)) if gy < 3 else H
+                for gx in range(4):
+                    x0 = int(round(gx * W / 4.0))
+                    x1 = int(round((gx + 1) * W / 4.0)) if gx < 3 else W
+                    cm = m[y0:y1, x0:x1]
+                    cc = arr[y0:y1, x0:x1]
+                    v = cc[cm].mean(axis=0) if cm.any() else overall
+                    vec.extend([float(v[0]), float(v[1]), float(v[2])])
+            v = np.asarray(vec, dtype=np.float32)
+            v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+            n = float(np.linalg.norm(v))
+            return (v / n) if n > 1e-9 else v
+
+        try:
+            v1 = _grid_vec(det_color, det_mask)
+            v2 = _grid_vec(ref_color, ref_mask)
+            if v1 is None or v2 is None or v1.size == 0 or v2.size == 0:
+                return 0.0
+            return float(max(0.0, min(1.0, float(np.dot(v1, v2)))))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _extract_features(gray, mask, max_corners=25, patch_size=16):
+        """Per-crop feature extraction for orientation matching.
+
+        Returns (keypoint_descs, lbp_hist):
+          keypoint_descs : list of 1-D float32 arrays, each
+                           patch_size**2 long (256 by default).
+                           Empty list when no corners survive the
+                           Harris response gate or variance gate.
+          lbp_hist       : float32 array length 64, L1-normalised.
+                           All zeros when the mask has <20 pixels.
+
+        Numpy + scipy.ndimage only (no cv2 / skimage). All work is
+        restricted to the masked region so background table pixels
+        don't generate spurious keypoints or texture energy."""
+        H, W = gray.shape[:2]
+        if H < patch_size or W < patch_size:
+            return [], np.zeros(64, dtype=np.float32)
+
+        gray_f = gray.astype(np.float32)
+        m_bool = np.asarray(mask).astype(bool)
+        if m_bool.shape[:2] != (H, W):
+            m_bool = np.ones((H, W), dtype=bool)
+
+        # ── Harris corner detection on masked grayscale ──────────
+        m_float = m_bool.astype(np.float32)
+        masked_gray = gray_f * m_float
+        try:
+            smoothed = ndimage.gaussian_filter(masked_gray, sigma=1.0)
+            dx = ndimage.sobel(smoothed, axis=1, mode='nearest')
+            dy = ndimage.sobel(smoothed, axis=0, mode='nearest')
+            Ixx = ndimage.gaussian_filter(dx * dx, 2.0)
+            Iyy = ndimage.gaussian_filter(dy * dy, 2.0)
+            Ixy = ndimage.gaussian_filter(dx * dy, 2.0)
+            R = Ixx * Iyy - Ixy * Ixy - 0.05 * (Ixx + Iyy) ** 2
+            # Only accept corners that lie ON the part (mask=True).
+            R = np.where(m_bool, R, 0.0)
+            R_max = float(R.max()) if R.size else 0.0
+            thresh = max(R_max * 0.01, 1e-6) if R_max > 0 else float('inf')
+            # Non-maximum suppression: a pixel must equal the max in
+            # a 9x9 window AND clear the response threshold.
+            R_nms = ndimage.maximum_filter(R, size=9)
+            peaks_y, peaks_x = np.where((R == R_nms) & (R > thresh))
+            # Sort by response strength so the strongest survive the
+            # max_corners cap.
+            if peaks_y.size:
+                resp = R[peaks_y, peaks_x]
+                order = np.argsort(-resp)
+                peaks_y = peaks_y[order]
+                peaks_x = peaks_x[order]
+        except Exception:
+            peaks_y = np.array([], dtype=int)
+            peaks_x = np.array([], dtype=int)
+
+        # ── Patch descriptors around each surviving corner ───────
+        descs = []
+        half = patch_size // 2
+        for idx in range(min(int(peaks_y.size), int(max_corners))):
+            y, x = int(peaks_y[idx]), int(peaks_x[idx])
+            # Pad-with-zeros patch so corners near the border still
+            # produce a valid descriptor.
+            y0 = y - half
+            x0 = x - half
+            y1 = y0 + patch_size
+            x1 = x0 + patch_size
+            patch = np.zeros((patch_size, patch_size), dtype=np.float32)
+            sy0, sx0 = max(0, -y0), max(0, -x0)
+            cy0, cx0 = max(0,  y0), max(0,  x0)
+            cy1, cx1 = min(H,  y1), min(W,  x1)
+            h_take = cy1 - cy0
+            w_take = cx1 - cx0
+            if h_take > 0 and w_take > 0:
+                patch[sy0:sy0 + h_take, sx0:sx0 + w_take] = (
+                    gray_f[cy0:cy1, cx0:cx1])
+            std = float(patch.std())
+            if std < 0.5:
+                # Featureless patch — skip rather than feed noise into
+                # the matcher.
+                continue
+            normed = (patch - float(patch.mean())) / std
+            descs.append(normed.astype(np.float32).ravel())
+
+        # ── 8-neighbour LBP histogram on masked pixels ────────────
+        if int(m_bool.sum()) < 20:
+            return descs, np.zeros(64, dtype=np.float32)
+        try:
+            # 8 unit-radius neighbours; sin/cos rounded to ±1/0 so
+            # we just index-roll the image rather than interpolating.
+            angles = [i * math.pi / 4.0 for i in range(8)]
+            lbp_code = np.zeros((H, W), dtype=np.int32)
+            for i, ang in enumerate(angles):
+                dy_off = int(round(math.sin(ang)))
+                dx_off = int(round(math.cos(ang)))
+                # np.roll wraps the array which is fine — edge pixels
+                # under the mask will rarely be near the seam.
+                neighbour = np.roll(
+                    np.roll(gray_f, -dy_off, axis=0),
+                    -dx_off, axis=1)
+                lbp_code |= ((neighbour >= gray_f).astype(np.int32)) << i
+            codes_in_mask = lbp_code[m_bool]
+            lbp_hist, _ = np.histogram(
+                codes_in_mask, bins=64, range=(0, 256))
+            lbp_hist = lbp_hist.astype(np.float32)
+            s = lbp_hist.sum()
+            if s > 0:
+                lbp_hist /= s
+        except Exception:
+            lbp_hist = np.zeros(64, dtype=np.float32)
+
+        return descs, lbp_hist
+
+    @staticmethod
+    def _match_features(det_descs, det_lbp, ref_descs, ref_lbp):
+        """Combined keypoint + LBP feature-match score in [0, 1].
+
+        Two signals:
+          0.60  Keypoint match ratio — for each det descriptor, the
+                Lowe ratio test passes when best L2 distance to any
+                ref descriptor is < 0.75 * second-best. The ratio of
+                passing det descriptors to total det descriptors is
+                the score. Returns 0 when either side has no
+                descriptors.
+
+          0.40  LBP histogram correlation — Pearson on the 64-vectors,
+                mapped from [-1, 1] to [0, 1]. Returns 0.5 (neutral)
+                when either histogram is all zeros (no signal)."""
+        try:
+            # Keypoint matching.
+            if (not det_descs or not ref_descs
+                    or len(det_descs) == 0 or len(ref_descs) == 0):
+                keypoint_score = 0.0
+            else:
+                A = np.asarray(det_descs, dtype=np.float32)
+                B = np.asarray(ref_descs, dtype=np.float32)
+                if A.ndim != 2 or B.ndim != 2 or A.shape[1] != B.shape[1]:
+                    keypoint_score = 0.0
+                else:
+                    # Pairwise L2 distance via squared-sum expansion —
+                    # avoids the (N, M, D) intermediate that would
+                    # blow up memory for big descriptor counts.
+                    aa = np.sum(A * A, axis=1, keepdims=True)        # (N, 1)
+                    bb = np.sum(B * B, axis=1, keepdims=True).T      # (1, M)
+                    D2 = aa + bb - 2.0 * (A @ B.T)
+                    D = np.sqrt(np.maximum(D2, 0.0))
+                    good = 0
+                    for i in range(D.shape[0]):
+                        row = D[i]
+                        if row.size < 2:
+                            # With only one ref descriptor the Lowe
+                            # ratio is undefined; treat as no-match
+                            # rather than guessing.
+                            continue
+                        idx2 = np.argpartition(row, 1)[:2]
+                        d1, d2 = float(row[idx2[0]]), float(row[idx2[1]])
+                        if d1 > d2:
+                            d1, d2 = d2, d1
+                        if d2 > 1e-6 and d1 < 0.75 * d2:
+                            good += 1
+                    keypoint_score = good / max(int(A.shape[0]), 1)
+                    keypoint_score = max(0.0, min(1.0, keypoint_score))
+
+            # LBP histogram correlation.
+            a = np.asarray(det_lbp, dtype=np.float32)
+            b = np.asarray(ref_lbp, dtype=np.float32)
+            if a.size == 0 or b.size == 0 or a.size != b.size:
+                lbp_score = 0.5
+            elif float(a.sum()) <= 0 or float(b.sum()) <= 0:
+                lbp_score = 0.5
+            else:
+                sa, sb = float(a.std()), float(b.std())
+                if sa < 1e-9 or sb < 1e-9:
+                    lbp_score = 0.5
+                else:
+                    corr = float(np.mean(
+                        (a - a.mean()) * (b - b.mean())) / (sa * sb))
+                    lbp_score = max(0.0, min(1.0, (corr + 1.0) / 2.0))
+
+            return float(keypoint_score * 0.60 + lbp_score * 0.40)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _depth_geometry_score(det_depth, det_mask, ref_depth, ref_mask):
+        """Surface-geometry similarity between detection and ref.
+
+        Returns 0..1. Returns 0.5 (neutral) when depth data is
+        missing or thinner than 20 valid masked pixels on either
+        side — that way a depth-less ref doesn't actively push the
+        scoring one way or the other.
+
+        Three numpy-only sub-signals (no cv2, no skimage):
+
+          0.40  DEPTH PROFILE HISTOGRAM
+                rel = depth[mask] - median(depth[mask]) for both
+                sides, binned into 16 bins over [-15mm, +15mm].
+                Pearson correlation between the two histograms.
+                Captures whether the surface is convex, concave,
+                flat, or carries raised features — depth-offset
+                invariant.
+
+          0.40  SPATIAL DEPTH GRID
+                3x3 grid over the masked region; each cell holds
+                the mean relative depth (cells with <3 masked
+                pixels collapse to 0). Pearson-correlate the two
+                9-vectors. Captures WHERE the height features sit
+                (raised boss top-left vs bottom-right, holes at
+                specific positions).
+
+          0.20  HOLE SIGNATURE
+                hole_fraction = (pixels deeper than median+8mm
+                inside the mask) / mask_pixels. Score =
+                1 - |fd - fr| / max(fd + fr, 1e-3). If both are
+                near-zero (no holes either side) the score lands
+                at 1.0 (they agree).
+
+        ref_depth is scaled to det_depth.shape with scipy zoom
+        (order=1, mask order=0) before any comparison, so the
+        physical alignment matches what the RGB scoring already
+        does.
+        """
+        try:
+            if det_depth is None or ref_depth is None:
+                return 0.5
+            det_d = np.asarray(det_depth, dtype=np.float32)
+            ref_d = np.asarray(ref_depth, dtype=np.float32)
+            if det_d.size == 0 or ref_d.size == 0:
+                return 0.5
+            det_m = (np.asarray(det_mask).astype(bool)
+                     if det_mask is not None
+                     else np.ones(det_d.shape, dtype=bool))
+            ref_m = (np.asarray(ref_mask).astype(bool)
+                     if ref_mask is not None
+                     else np.ones(ref_d.shape, dtype=bool))
+
+            # Mask shape sanity — fall back to all-true if mismatched.
+            if det_m.shape != det_d.shape:
+                det_m = np.ones(det_d.shape, dtype=bool)
+            if ref_m.shape != ref_d.shape:
+                ref_m = np.ones(ref_d.shape, dtype=bool)
+
+            # Scale ref to det dimensions so cell-by-cell comparisons
+            # are physically aligned.
+            if ref_d.shape != det_d.shape:
+                H, W = det_d.shape
+                rh, rw = max(ref_d.shape[0], 1), max(ref_d.shape[1], 1)
+                try:
+                    ref_d = ndimage.zoom(ref_d, (H / rh, W / rw), order=1)
+                    ref_m = (ndimage.zoom(ref_m.astype(np.float32),
+                                          (H / rh, W / rw), order=0)
+                             > 0.5)
+                except Exception:
+                    return 0.5
+                # zoom can land 1 px short — clip to det's shape
+                ref_d = ref_d[:H, :W]
+                ref_m = ref_m[:H, :W]
+                if ref_d.shape != det_d.shape:
+                    return 0.5
+
+            # Valid masked pixels — must have positive finite depth.
+            det_valid = det_m & (det_d > 0) & np.isfinite(det_d)
+            ref_valid = ref_m & (ref_d > 0) & np.isfinite(ref_d)
+            if det_valid.sum() < 20 or ref_valid.sum() < 20:
+                return 0.5
+
+            det_vals = det_d[det_valid]
+            ref_vals = ref_d[ref_valid]
+            det_med = float(np.median(det_vals))
+            ref_med = float(np.median(ref_vals))
+
+            # ── (1) Depth profile histogram (weight 0.40) ────────────
+            edges = np.linspace(-0.015, 0.015, 17)
+            h_det, _ = np.histogram(det_vals - det_med, bins=edges)
+            h_ref, _ = np.histogram(ref_vals - ref_med, bins=edges)
+            h_det = h_det.astype(np.float32)
+            h_ref = h_ref.astype(np.float32)
+            sd, sr = h_det.sum(), h_ref.sum()
+            if sd > 0: h_det /= sd
+            if sr > 0: h_ref /= sr
+            sa, sb = float(h_det.std()), float(h_ref.std())
+            if sa < 1e-9 or sb < 1e-9:
+                hist_score = 0.5
+            else:
+                corr = float(np.mean(
+                    (h_det - h_det.mean()) * (h_ref - h_ref.mean())
+                ) / (sa * sb))
+                hist_score = max(0.0, min(1.0, corr))
+
+            # ── (2) Spatial depth grid (weight 0.40) ─────────────────
+            H, W = det_d.shape
+            det_rel = np.zeros_like(det_d)
+            ref_rel = np.zeros_like(ref_d)
+            det_rel[det_valid] = det_d[det_valid] - det_med
+            ref_rel[ref_valid] = ref_d[ref_valid] - ref_med
+
+            def _grid_means(rel, valid):
+                out = []
+                for gy in range(3):
+                    y0 = int(round(gy * H / 3.0))
+                    y1 = int(round((gy + 1) * H / 3.0)) if gy < 2 else H
+                    for gx in range(3):
+                        x0 = int(round(gx * W / 3.0))
+                        x1 = int(round((gx + 1) * W / 3.0)) if gx < 2 else W
+                        cv = valid[y0:y1, x0:x1]
+                        cr = rel[y0:y1, x0:x1]
+                        if int(cv.sum()) >= 3:
+                            out.append(float(cr[cv].mean()))
+                        else:
+                            out.append(0.0)
+                return np.asarray(out, dtype=np.float32)
+
+            gv_det = _grid_means(det_rel, det_valid)
+            gv_ref = _grid_means(ref_rel, ref_valid)
+            sa, sb = float(gv_det.std()), float(gv_ref.std())
+            if sa < 1e-9 or sb < 1e-9:
+                spatial_score = 0.5
+            else:
+                corr = float(np.mean(
+                    (gv_det - gv_det.mean()) * (gv_ref - gv_ref.mean())
+                ) / (sa * sb))
+                spatial_score = max(0.0, min(1.0, corr))
+
+            # ── (3) Hole signature (weight 0.20) ─────────────────────
+            det_hole_count = float(
+                np.sum(det_valid & (det_d > (det_med + 0.008))))
+            ref_hole_count = float(
+                np.sum(ref_valid & (ref_d > (ref_med + 0.008))))
+            det_total = float(max(int(det_m.sum()), 1))
+            ref_total = float(max(int(ref_m.sum()), 1))
+            fd = det_hole_count / det_total
+            fr = ref_hole_count / ref_total
+            denom = max(fd + fr, 1e-3)
+            hole_score = 1.0 - abs(fd - fr) / denom
+            # Special case: both near-zero (no holes on either side) →
+            # full credit. The expression above already lands close to
+            # 1.0 there but the denom guard can drift slightly under
+            # noise.
+            if fd < 1e-4 and fr < 1e-4:
+                hole_score = 1.0
+            hole_score = max(0.0, min(1.0, hole_score))
+
+            return float(hist_score * 0.40
+                         + spatial_score * 0.40
+                         + hole_score * 0.20)
+        except Exception:
+            return 0.5
 
     def _match_part(self, mask_crop, obb_size, color_crop=None,
                     depth_crop=None):
@@ -2276,7 +2785,8 @@ class DepthSegmentNode(Node):
                 mask_crop, obb_size, color_crop)
             # Template matches use legacy orientation tags
             # (pickable / flipped / on_side); derive is_pickable.
-            info = {'is_pickable': (o == 'pickable')} if o else {}
+            info = ({'is_pickable': (o == 'pickable'), 'source': 'template'}
+                    if o else {})
             return (n or 'unknown'), pid, s, (o or ''), info
 
         if mask_crop is None or color_crop is None:
@@ -2320,6 +2830,33 @@ class DepthSegmentNode(Node):
 
         from scipy.ndimage import zoom as _zoom
 
+        # Default orientation weights. The operator can override these
+        # per-part via /api/parts/<id>/orient_weights — useful when a
+        # part is uniformly silver (lean on depth+features) vs visually
+        # rich (lean on colour). 'feat' = Harris keypoint patches +
+        # LBP histogram, the strongest discriminator for metal parts
+        # where colour signals collapse. See _load_orient_weights.
+        default_weights = {
+            'ncc':     0.20,
+            'hist':    0.10,
+            'spatial': 0.10,
+            'depth':   0.25,
+            'feat':    0.35,
+        }
+
+        # Extract features from the live detection ONCE up here so
+        # the per-ref loop only does the cheap match step.
+        det_kp_descs = []
+        det_lbp_hist = np.zeros(64, dtype=np.float32)
+        if color_crop is not None and mask_crop is not None and mask_crop.any():
+            det_gray_full = (
+                np.mean(color_crop.astype(np.float32), axis=2)
+                if color_crop.ndim == 3
+                else color_crop.astype(np.float32)
+            )
+            det_kp_descs, det_lbp_hist = self._extract_features(
+                det_gray_full, mask_crop)
+
         best_score = 0.0
         best_id    = None
         best_name  = 'unknown'
@@ -2362,14 +2899,22 @@ class DepthSegmentNode(Node):
                 )
                 groups.setdefault(gkey, []).append(ref)
 
+            # Per-part weight override. Falls back to defaults when the
+            # metadata json has no orient_weights field.
+            weights = self._load_orient_weights(part_id, default_weights)
+
             best_group_score = 0.0
             best_group_key   = None
-            best_group_meta  = None    # (avg_ncc, avg_hist, n_refs, best_ref)
+            # (avg_ncc, avg_hist, avg_spatial, avg_depth, avg_feat, n_refs, best_ref)
+            best_group_meta  = None
             group_dbg = []             # for the throttled log
 
             for gkey, grp_refs in groups.items():
-                nccs   = []
-                hists  = []
+                nccs     = []
+                hists    = []
+                spatials = []
+                depths   = []
+                features = []
                 best_in_group_ncc = 0.0
                 best_in_group_ref = None
 
@@ -2422,46 +2967,107 @@ class DepthSegmentNode(Node):
                             best_in_group_ncc = best_rot_ncc
                             best_in_group_ref = ref
 
-                    # Colour-histogram tie-breaker. Only counts when
-                    # both detection and ref carry colour pixels.
+                    # Colour-histogram tie-breaker (masked-pixel only).
                     ref_color = ref.get('color')
+                    ref_mask  = ref.get('mask')
                     if ref_color is not None and color_crop is not None:
-                        hists.append(self._color_hist_corr(color_crop, ref_color))
+                        hists.append(self._color_hist_corr(
+                            color_crop, ref_color,
+                            mask1=mask_crop, mask2=ref_mask))
+                        # 4x4 spatial colour grid — separates two faces
+                        # of a key fob that score identically on outline
+                        # + overall histogram.
+                        spatials.append(self._spatial_color_score(
+                            color_crop, mask_crop, ref_color, ref_mask))
+
+                    # ── Signal 4: depth geometry ─────────────────────
+                    # The discriminating signal for uniformly-coloured
+                    # metal parts. Pre-scale ref to the per-ref
+                    # physical resolution; _depth_geometry_score
+                    # re-scales to match det_depth.shape internally
+                    # if the shapes still differ.
+                    ref_depth_arr = ref.get('depth')
+                    if depth_crop is not None and ref_depth_arr is not None:
+                        try:
+                            zh = target_h / max(ref_depth_arr.shape[0], 1)
+                            zw = target_w / max(ref_depth_arr.shape[1], 1)
+                            ref_depth_sc = _zoom(
+                                ref_depth_arr.astype(np.float32),
+                                (zh, zw), order=1)
+                            ref_mask_sc = (_zoom(
+                                (ref_mask if ref_mask is not None
+                                 else np.zeros(ref_depth_arr.shape,
+                                               dtype=bool))
+                                .astype(np.float32),
+                                (zh, zw), order=0) > 0.5)
+                        except Exception:
+                            ref_depth_sc = None
+                            ref_mask_sc  = None
+                        if ref_depth_sc is not None:
+                            depths.append(self._depth_geometry_score(
+                                depth_crop, mask_crop,
+                                ref_depth_sc, ref_mask_sc))
+
+                    # ── Signal 5: Harris keypoints + LBP histogram ───
+                    # The strongest discriminator on metal parts whose
+                    # two faces share colour but differ in surface
+                    # micro-features (stamped text, holes, chamfers).
+                    ref_kp  = ref.get('kp_descs') or []
+                    ref_lbp = ref.get('lbp_hist')
+                    if ref_lbp is None:
+                        ref_lbp = np.zeros(64, dtype=np.float32)
+                    features.append(self._match_features(
+                        det_kp_descs, det_lbp_hist, ref_kp, ref_lbp))
 
                 if not nccs:
                     continue
-                avg_ncc  = float(np.mean(nccs))
-                avg_hist = float(np.mean(hists)) if hists else 0.5
-                # Weighted: NCC dominates (texture/shape correlation is
-                # the primary signal); histogram supplies the tie-break
-                # when two groups have similar NCC but different
-                # surface colours.
-                group_score = avg_ncc * 0.70 + avg_hist * 0.30
+                avg_ncc     = float(np.mean(nccs))
+                avg_hist    = float(np.mean(hists))    if hists    else 0.5
+                avg_spatial = float(np.mean(spatials)) if spatials else 0.5
+                avg_depth   = float(np.mean(depths))   if depths   else 0.5
+                avg_feat    = float(np.mean(features)) if features else 0.5
+                # Five-signal score. Weights per-part overridable.
+                # Defaults: features (0.35) lead, depth (0.25) second,
+                # NCC (0.20), hist (0.10), spatial colour (0.10).
+                group_score = (avg_ncc     * weights['ncc']
+                               + avg_hist    * weights['hist']
+                               + avg_spatial * weights['spatial']
+                               + avg_depth   * weights['depth']
+                               + avg_feat    * weights['feat'])
 
-                group_dbg.append((gkey, avg_ncc, avg_hist, group_score, len(nccs)))
+                group_dbg.append(
+                    (gkey, avg_ncc, avg_hist, avg_spatial, avg_depth,
+                     avg_feat, group_score, len(nccs)))
 
                 if group_score > best_group_score:
                     best_group_score = group_score
                     best_group_key   = gkey
-                    best_group_meta  = (avg_ncc, avg_hist, len(nccs), best_in_group_ref)
+                    best_group_meta  = (avg_ncc, avg_hist, avg_spatial,
+                                        avg_depth, avg_feat,
+                                        len(nccs), best_in_group_ref)
 
             if best_group_meta is None:
                 continue
 
-            best_ref_ncc, best_ref_hist, n_refs, best_ref_for_part = best_group_meta
-            combined = size_score * 0.50 + best_group_score * 0.50
+            (best_ref_ncc, best_ref_hist, best_ref_spatial,
+             best_ref_depth, best_ref_feat,
+             n_refs, best_ref_for_part) = best_group_meta
+            combined = size_score * 0.40 + best_group_score * 0.60
 
             # Per-group debug log so the operator can see WHY one
             # orientation won over another. Sorted by score desc.
+            # Tuple layout: (gkey, ncc, hist, spat, depth, feat,
+            #                score, n_refs).
             try:
-                group_dbg.sort(key=lambda x: -x[3])
-                gap = (group_dbg[0][3] - group_dbg[1][3]) if len(group_dbg) >= 2 else float('nan')
+                group_dbg.sort(key=lambda x: -x[6])
+                gap = ((group_dbg[0][6] - group_dbg[1][6])
+                       if len(group_dbg) >= 2 else float('nan'))
                 summary = ' | '.join(
-                    "{}'{}' ncc={:.2f} hist={:.2f} score={:.2f} ({}r)".format(
+                    "{}'{}' ncc={:.2f} hist={:.2f} sp={:.2f} dep={:.2f} feat={:.2f} score={:.2f} ({}r)".format(
                         'pick' if k[0] else 'NOpick', k[3] or '?',
-                        a, h, s, n
+                        a, h, sp, dp, ft, sc, n
                     )
-                    for (k, a, h, s, n) in group_dbg
+                    for (k, a, h, sp, dp, ft, sc, n) in group_dbg
                 )
                 self.get_logger().info(
                     f'ORIENT_MATCH {part_id[:8]} det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm] '
@@ -2470,6 +3076,44 @@ class DepthSegmentNode(Node):
                     f'"{best_group_key[3] or "?"}" '
                     f'gap={gap:.2f} | {summary}',
                     throttle_duration_sec=3.0)
+            except Exception:
+                pass
+
+            # Surface the winner's stats for /api/parts/<id>/orientation_debug.
+            # In-memory dict for same-process consumers; sidecar JSON
+            # (throttled to ~2 Hz per part to keep eMMC writes low) for
+            # the dashboard's separate process.
+            try:
+                import time as _time
+                payload = {
+                    'winner_label':        str(best_group_key[3] or ''),
+                    'winner_is_pickable':  bool(best_group_key[0]),
+                    'winner_is_defect':    bool(best_group_key[1]),
+                    'ncc':                 round(float(best_ref_ncc), 3),
+                    'hist':                round(float(best_ref_hist), 3),
+                    'spatial':             round(float(best_ref_spatial), 3),
+                    'depth':               round(float(best_ref_depth), 3),
+                    'feat':                round(float(best_ref_feat), 3),
+                    'weights':             {k: round(float(v), 3)
+                                            for k, v in weights.items()},
+                    'group_score':         round(float(best_group_score), 3),
+                    'size_score':          round(float(size_score), 3),
+                    'combined':            round(float(combined), 3),
+                    'gap':                 (None
+                                            if not (len(group_dbg) >= 2)
+                                            else round(float(group_dbg[0][6] - group_dbg[1][6]), 3)),
+                    'n_refs_in_group':     int(n_refs),
+                    'ts':                  _time.time(),
+                }
+                _last_orient_match[str(part_id)] = payload
+                # Throttle disk writes — fires at the segment node's
+                # ~15 Hz processing rate otherwise.
+                last_disk_ts = (_last_orient_match
+                                .get('__disk_ts__', {})
+                                .get(str(part_id), 0.0))
+                if (_time.time() - last_disk_ts) >= 0.5:
+                    _write_last_match(part_id, payload)
+                    _last_orient_match.setdefault('__disk_ts__', {})[str(part_id)] = _time.time()
             except Exception:
                 pass
 
@@ -2493,20 +3137,31 @@ class DepthSegmentNode(Node):
         # match (template path returns the legacy pickable/flipped/on_side
         # orientation string).
         if best_score >= 0.60 and best_id is not None:
-            info = {}
+            info = {'source': 'teach'}
             if best_ref_meta is not None:
-                info = {
+                info.update({
                     'is_pickable':       bool(best_ref_meta.get('is_pickable', True)),
                     'is_defect':         bool(best_ref_meta.get('is_defect', False)),
                     'orientation_label': str(best_ref_meta.get('orientation_label') or ''),
                     'defect_name':       str(best_ref_meta.get('defect_name') or ''),
-                }
-            return best_name, best_id, round(best_score, 3), '', info
+                })
+            # BUG 1 fix: previously this returned orient='' for every
+            # teach match, so _match_parts left position_correct /
+            # surface_ok / position_status unset and the executor +
+            # task planner couldn't tell pickable from non-pickable.
+            # Derive the legacy orient string from the winning ref's
+            # is_pickable so those downstream fields populate.
+            derived_orient = ('pickable'
+                              if info.get('is_pickable', True)
+                              else 'flipped')
+            return best_name, best_id, round(best_score, 3), derived_orient, info
 
         n, pid, s, _y, o = self._match_by_templates(
             mask_crop, obb_size, color_crop)
         if n and s >= 0.55:
-            return n, pid, s, (o or ''), {'is_pickable': (o == 'pickable')} if o else {}
+            info = ({'is_pickable': (o == 'pickable'), 'source': 'template'}
+                    if o else {'source': 'template'})
+            return n, pid, s, (o or ''), info
         return 'unknown', None, 0.0, '', empty_info
 
     def _match_parts(self, objects):
@@ -2549,8 +3204,12 @@ class DepthSegmentNode(Node):
 
             o['_holes']        = []
             o['_match_reason'] = ''
-            o['_match_source'] = ('teach' if matched and not orient
-                                  else ('template' if matched else ''))
+            # Source comes from match_info now; orient alone can no
+            # longer distinguish teach from template since BUG 1's fix
+            # makes teach matches return a derived 'pickable'/'flipped'
+            # string rather than ''.
+            o['_match_source'] = (str(match_info.get('source') or '')
+                                  if matched else '')
             o['orientation']   = orient or None
             # Rich orientation metadata from the matched teach ref so
             # _publish_annotated can colour boxes (green pickable / red
@@ -2740,6 +3399,52 @@ class DepthSegmentNode(Node):
                 ])
         return best_corners
 
+    @staticmethod
+    def _draw_dashed_rect(draw, box, color, width, dash=8):
+        """Draw a rectangle with a dashed border using PIL line calls.
+
+        `box` accepts either a 4-tuple (x0, y0, x1, y1) for an
+        axis-aligned box or a 4x2 array-like of corners for the
+        rotated-rectangle output of _min_area_rect_2d.
+
+        Dashes alternate `dash` px line / `dash` px gap along each
+        edge; the last segment may be truncated when the edge length
+        doesn't divide evenly. Used by _publish_annotated to make
+        non-pickable bounding boxes visually distinct from solid-
+        bordered pickable ones at a glance on a tablet."""
+        # Resolve to 4 corner points
+        try:
+            if (hasattr(box, 'shape') and len(box.shape) == 2
+                    and box.shape[0] == 4 and box.shape[1] == 2):
+                corners = [(float(box[i][0]), float(box[i][1]))
+                           for i in range(4)]
+            else:
+                x0, y0, x1, y1 = box
+                corners = [(float(x0), float(y0)), (float(x1), float(y0)),
+                           (float(x1), float(y1)), (float(x0), float(y1))]
+        except Exception:
+            return
+
+        for i in range(4):
+            p1 = corners[i]
+            p2 = corners[(i + 1) % 4]
+            dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+            length = (dx * dx + dy * dy) ** 0.5
+            if length < 1.0:
+                continue
+            ux, uy = dx / length, dy / length
+            pos = 0.0
+            on  = True
+            while pos < length:
+                end = min(pos + dash, length)
+                if on:
+                    draw.line(
+                        [(p1[0] + ux * pos, p1[1] + uy * pos),
+                         (p1[0] + ux * end, p1[1] + uy * end)],
+                        fill=color, width=width)
+                pos = end
+                on = not on
+
     def _publish_annotated(self, objects, h, w):
         rgb = self._color_rgb
         if rgb is None or rgb.shape[0] != h or rgb.shape[1] != w:
@@ -2792,16 +3497,23 @@ class DepthSegmentNode(Node):
                 rect_corners = self._min_area_rect_2d(
                     mask_2d, offset_x=x0, offset_y=y0)
 
-            # Thickness signals "is this object known?" at a glance —
-            # matched parts get a 3px border, unknowns get 1px.
-            box_thick = 3 if matched else 1
+            # Thickness signals matched/unknown at a glance:
+            #   pickable matched    → 4 px solid
+            #   non-pickable matched → 4 px dashed
+            #   other matched (amber, defect) → 4 px solid
+            #   unknown             → 1 px solid
+            box_thick = 4 if matched else 1
+            dashed = bool(matched and is_pickable is False and not is_defect)
             if rect_corners is not None:
-                for i in range(4):
-                    p1 = (int(round(rect_corners[i][0])),
-                          int(round(rect_corners[i][1])))
-                    p2 = (int(round(rect_corners[(i + 1) % 4][0])),
-                          int(round(rect_corners[(i + 1) % 4][1])))
-                    draw.line([p1, p2], fill=col, width=box_thick)
+                if dashed:
+                    self._draw_dashed_rect(draw, rect_corners, col, box_thick)
+                else:
+                    for i in range(4):
+                        p1 = (int(round(rect_corners[i][0])),
+                              int(round(rect_corners[i][1])))
+                        p2 = (int(round(rect_corners[(i + 1) % 4][0])),
+                              int(round(rect_corners[(i + 1) % 4][1])))
+                        draw.line([p1, p2], fill=col, width=box_thick)
                 top_y = int(np.min(rect_corners[:, 1]))
                 left_x = int(np.min(rect_corners[:, 0]))
                 cx_box = float(np.mean(rect_corners[:, 0]))
@@ -2811,28 +3523,67 @@ class DepthSegmentNode(Node):
                 bx1 = int(np.max(rect_corners[:, 0]))
                 by1 = int(np.max(rect_corners[:, 1]))
             else:
-                draw.rectangle(
-                    [x0 + 1, y0 + 1, x1 - 1, y1 - 1],
-                    outline=col, width=box_thick)
+                if dashed:
+                    self._draw_dashed_rect(
+                        draw,
+                        (x0 + 1, y0 + 1, x1 - 1, y1 - 1),
+                        col, box_thick)
+                else:
+                    draw.rectangle(
+                        [x0 + 1, y0 + 1, x1 - 1, y1 - 1],
+                        outline=col, width=box_thick)
                 top_y = y0
                 left_x = x0
                 cx_box = (x0 + x1) * 0.5
                 cy_box = (y0 + y1) * 0.5
                 bx0, by0, bx1, by1 = int(x0), int(y0), int(x1), int(y1)
 
-            # NON-PICKABLE / DEFECT: draw a red X across the box so the
-            # operator's eye catches "do not grasp" without reading text.
-            if matched and (is_defect or is_pickable is False):
-                draw.line([(bx0, by0), (bx1, by1)], fill=red, width=2)
-                draw.line([(bx1, by0), (bx0, by1)], fill=red, width=2)
+            # Status pill INSIDE the top-left of the bbox (so it
+            # doesn't get clipped at the image edge the way a badge
+            # above the box would). The pill is the primary "is this
+            # safe to grasp?" cue — colour + symbol + plain-English
+            # word so an operator glancing at a tablet doesn't have to
+            # rely on colour alone.
+            #
+            #   ✓ PICK OK      green    pickable, no defect
+            #   ✗ NO PICK      red      non-pickable orientation
+            #   ⚠ DEFECT       red      defect ref winner
+            #   (none)         —        unknown / amber
+            pill_text = None
+            pill_bg   = None
+            if matched and is_defect:
+                pill_text = '⚠ ' + (defect_lbl.upper() if defect_lbl else 'DEFECT')
+                pill_bg   = red
+            elif matched and is_pickable is True:
+                pill_text = '✓ ' + (orient_lbl.upper() if orient_lbl else 'PICK OK')
+                pill_bg   = green
+            elif matched and is_pickable is False:
+                pill_text = '✗ ' + (orient_lbl.upper() if orient_lbl else 'NO PICK')
+                pill_bg   = red
 
-            # PICKABLE: small green checkmark in the top-left corner.
-            if matched and is_pickable is True and not is_defect:
-                cx_check, cy_check = bx0 + 6, by0 + 14
-                draw.line([(cx_check, cy_check),
-                           (cx_check + 4, cy_check + 4)], fill=green, width=2)
-                draw.line([(cx_check + 4, cy_check + 4),
-                           (cx_check + 12, cy_check - 6)], fill=green, width=2)
+            if pill_text is not None:
+                pill_font = _ANNOT_FONT
+                ptxt_bbox = draw.textbbox((0, 0), pill_text, font=pill_font)
+                pad_x = 8
+                pw = (ptxt_bbox[2] - ptxt_bbox[0]) + pad_x * 2
+                ph = 20
+                px_pos = int(bx0) + 2
+                py_pos = int(by0) + 2
+                # Defensive: skip the pill if the box is too small for it
+                # to fit cleanly (no point drawing a label that covers
+                # the whole detection).
+                box_w = max(0, bx1 - bx0)
+                box_h = max(0, by1 - by0)
+                if pw < box_w - 4 and ph < box_h - 4:
+                    draw.rectangle(
+                        [px_pos, py_pos, px_pos + pw, py_pos + ph],
+                        fill=pill_bg)
+                    # Vertical-centre the text inside the 20px pill.
+                    txt_h = (ptxt_bbox[3] - ptxt_bbox[1])
+                    txt_y = py_pos + max(0, (ph - txt_h) // 2 - 1)
+                    draw.text(
+                        (px_pos + pad_x, txt_y),
+                        pill_text, fill=(255, 255, 255), font=pill_font)
 
             # Cyan orientation arrow at the rect centre, pointing along
             # the OBB yaw (rotation about cam-Z = optical axis).
@@ -2877,6 +3628,9 @@ class DepthSegmentNode(Node):
             tw = bbox_text[2] - bbox_text[0] + 8
             th = bbox_text[3] - bbox_text[1] + 6
             label_x = max(0, int(left_x))
+            # Pill now sits INSIDE the box top-left, so the detail
+            # label can drop back to its original position right above
+            # the bbox (no more badge_offset stacking).
             label_y = max(0, int(top_y) - th - 2)
             draw.rectangle([label_x, label_y, label_x + tw, label_y + th],
                            fill=col)
