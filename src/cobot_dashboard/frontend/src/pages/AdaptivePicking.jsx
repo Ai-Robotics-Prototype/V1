@@ -781,13 +781,13 @@ const PAGES = [
           label="Yes — upload STEP file"
           description="Best accuracy. Provides dimensions and a 3D preview."
           selected={answers.has_step === true}
-          onClick={() => { setAnswer('has_step', true); goNext() }}
+          onClick={() => { setAnswer('has_step', true); goNext({ has_step: true }) }}
         />
         <ChoiceButton
           label="No — teach from camera only"
           description="Skip the STEP upload and teach the robot purely from camera captures."
           selected={answers.has_step === false}
-          onClick={() => { setAnswer('has_step', false); goNext() }}
+          onClick={() => { setAnswer('has_step', false); goNext({ has_step: false }) }}
         />
       </QuestionCard>
     ),
@@ -886,6 +886,58 @@ const PAGES = [
     },
   },
 
+  // 3a. Start-fresh-vs-add-more — only when re-teaching a part that
+  //     already has refs from a prior session. Without this, the new
+  //     captures pile on top of the old ones and the library count
+  //     ends up higher than what the operator just taught (BUG 2).
+  {
+    id: 'confirm_overwrite',
+    skip: (a) => !a.part_id || (a.existing_teach_count || 0) === 0,
+    render: ({ answers, setAnswer, goNext }) => {
+      const [clearing, setClearing] = useState(false)
+      const [err, setErr]           = useState(null)
+      const startFresh = async () => {
+        setClearing(true); setErr(null)
+        try {
+          const r = await fetch(`/api/parts/${answers.part_id}/teach_clear`, { method: 'POST' })
+          if (!r.ok) throw new Error('clear failed (HTTP ' + r.status + ')')
+          setAnswer('existing_teach_count', 0)
+          setAnswer('cleared_at_start', true)
+          goNext({ existing_teach_count: 0, cleared_at_start: true })
+        } catch (e) {
+          setErr(String(e.message || e))
+        } finally {
+          setClearing(false)
+        }
+      }
+      return (
+        <QuestionCard
+          question="This part already has teach references"
+          description={`"${answers.part_name}" has ${answers.existing_teach_count} existing reference${answers.existing_teach_count === 1 ? '' : 's'}. Do you want to start fresh or add to them?`}
+        >
+          {err && (
+            <div style={{
+              padding: '8px 12px', marginBottom: 10,
+              background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6,
+              fontSize: 12, color: '#DC2626',
+            }}>{err}</div>
+          )}
+          <ChoiceButton
+            label={clearing ? 'Clearing...' : 'Start Fresh'}
+            description="Clear all existing references and teach from scratch. The library count will match exactly what you capture in this session."
+            onClick={clearing ? undefined : startFresh}
+            accent="#DC2626"
+          />
+          <ChoiceButton
+            label="Add More"
+            description="Keep existing references and add new captures on top of them."
+            onClick={() => goNext()}
+          />
+        </QuestionCard>
+      )
+    },
+  },
+
   // 4. Pickable count
   {
     id: 'pickable_count',
@@ -909,11 +961,13 @@ const PAGES = [
             return (
               <button key={n}
                 onClick={() => {
-                  setAnswer('pickable_count', n)
                   const labels = (answers.pickable_labels || []).slice(0, n)
                   while (labels.length < n) labels.push('')
+                  setAnswer('pickable_count', n)
                   setAnswer('pickable_labels', labels)
-                  goNext()
+                  // Pass overrides — goNext's skip predicates need to
+                  // see the new count NOW, not after the next render.
+                  goNext({ pickable_count: n, pickable_labels: labels })
                 }}
                 style={{
                   padding: '18px', fontSize: 22, fontWeight: 700,
@@ -1020,11 +1074,14 @@ const PAGES = [
             return (
               <button key={n}
                 onClick={() => {
-                  setAnswer('non_pickable_count', n)
                   const labels = (answers.non_pickable_labels || []).slice(0, n)
                   while (labels.length < n) labels.push('')
+                  setAnswer('non_pickable_count', n)
                   setAnswer('non_pickable_labels', labels)
-                  goNext()
+                  // Override: non_pickable_count defaults to 0, so without
+                  // this the skip predicates would still see 0 and skip
+                  // every non-pickable page (BUG 1).
+                  goNext({ non_pickable_count: n, non_pickable_labels: labels })
                 }}
                 style={{
                   padding: '18px', fontSize: 22, fontWeight: 700,
@@ -1122,14 +1179,14 @@ const PAGES = [
           label="Yes — teach defects"
           description="Walk through each defect type one at a time."
           selected={answers.teach_defects === true}
-          onClick={() => { setAnswer('teach_defects', true); goNext() }}
+          onClick={() => { setAnswer('teach_defects', true); goNext({ teach_defects: true }) }}
           accent="#DC2626"
         />
         <ChoiceButton
           label="No — skip"
           description="No defect references will be taught. You can come back later."
           selected={answers.teach_defects === false}
-          onClick={() => { setAnswer('teach_defects', false); goNext() }}
+          onClick={() => { setAnswer('teach_defects', false); goNext({ teach_defects: false }) }}
         />
       </QuestionCard>
     ),
@@ -1427,6 +1484,10 @@ function TeachWizard({ part, onClose, onComplete }) {
     has_step:                 part?.id ? !!part?.source_file : null,
     dimensions:               part?.extents_cm || null,
     stl_url:                  null,
+    // Prior teach_count on the part. The confirm_overwrite page only
+    // surfaces when this is > 0; Start-Fresh wipes it back to 0.
+    existing_teach_count:     part?.teach_count || 0,
+    cleared_at_start:         false,
     pickable_count:           1,
     pickable_labels:          [''],
     pickable_captures:        [],
@@ -1494,15 +1555,20 @@ function TeachWizard({ part, onClose, onComplete }) {
     }
   }, [answers.part_id, answers.part_name, answers.part_description, setAnswer])
 
-  const goNext = useCallback(async () => {
+  const goNext = useCallback(async (overrides) => {
+    // setAnswer is queued; click handlers that set the next-page
+    // determining value (e.g. non_pickable_count) AND advance in the
+    // same tick must pass that value through `overrides` so skip
+    // predicates see the new state, not the stale closure value.
+    const effective = overrides ? { ...answers, ...overrides } : answers
     let next = pageIdx + 1
-    while (next < PAGES.length && PAGES[next].skip?.(answers)) next++
+    while (next < PAGES.length && PAGES[next].skip?.(effective)) next++
     if (next >= PAGES.length) return
     // Capture pages need a real part_id. Create one if the STEP-upload
     // branch was skipped (camera-only flow).
     const target = PAGES[next]
     if (target.id?.endsWith('_capture_0') || target.id === 'defect_capture') {
-      if (!answers.part_id) {
+      if (!effective.part_id) {
         const id = await ensurePartExists()
         if (!id) return
       }
