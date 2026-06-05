@@ -595,10 +595,16 @@ function NextButton({ onClick, disabled, label, color = '#2563EB' }) {
 
 // Inline capture component used on every "Capture: X" page so the
 // accent colour (green / amber / red) tracks the orientation type.
+//
+// addingMore + existingCount drive the "X new (+ Y existing)" readout
+// that lets the operator see what the library count will read after
+// Save — the wizard's session counter alone is misleading when they
+// chose "Add More" on a part that already had refs.
 function CaptureView({
   partId, orientation, orientationNumber, orientationLabel,
   isPickable, isDefect, defectName, defectDescription, defectSeverity,
   onCapture, captureCount,
+  addingMore = false, existingCount = 0, minToAdvance = 2,
 }) {
   const [capturing, setCapturing] = useState(false)
   const [error,     setError]     = useState(null)
@@ -674,9 +680,14 @@ function CaptureView({
           fontVariantNumeric: 'tabular-nums',
         }}>{captureCount}</div>
         <div style={{ fontSize: 13, color: '#6b7280' }}>
-          capture{captureCount === 1 ? '' : 's'} taken
-          {captureCount < 2 && (
-            <span style={{ color: accent, fontWeight: 600 }}> — need at least 2</span>
+          {addingMore ? 'new capture' : 'capture'}{captureCount === 1 ? '' : 's'} taken
+          {addingMore && existingCount > 0 && (
+            <span style={{ color: '#9ca3af' }}> (+ {existingCount} existing)</span>
+          )}
+          {captureCount < minToAdvance && (
+            <span style={{ color: accent, fontWeight: 600 }}>
+              {' '}— need at least {minToAdvance}
+            </span>
           )}
         </div>
       </div>
@@ -913,7 +924,8 @@ const PAGES = [
           if (!r.ok) throw new Error('clear failed (HTTP ' + r.status + ')')
           setAnswer('existing_teach_count', 0)
           setAnswer('cleared_at_start', true)
-          goNext({ existing_teach_count: 0, cleared_at_start: true })
+          setAnswer('adding_more', false)
+          goNext({ existing_teach_count: 0, cleared_at_start: true, adding_more: false })
         } catch (e) {
           setErr(String(e.message || e))
         } finally {
@@ -959,7 +971,12 @@ const PAGES = [
               Wipe the prior references and teach this part from scratch. The library count will match exactly what you capture in this session.
             </div>
           </button>
-          <button onClick={() => goNext()} disabled={clearing}
+          <button
+            onClick={() => {
+              setAnswer('adding_more', true)
+              goNext({ adding_more: true })
+            }}
+            disabled={clearing}
             style={{
               width: '100%', padding: '14px 16px', textAlign: 'left',
               cursor: clearing ? 'wait' : 'pointer',
@@ -969,7 +986,7 @@ const PAGES = [
             }}>
             <div style={{ fontSize: 15, fontWeight: 600 }}>Add More</div>
             <div style={{ fontSize: 12, color: '#6b7280', marginTop: 3 }}>
-              Keep the existing references and add new captures on top.
+              Keep the existing {answers.existing_teach_count} reference{answers.existing_teach_count === 1 ? '' : 's'} and add new captures on top.
             </div>
           </button>
         </QuestionCard>
@@ -1060,15 +1077,14 @@ const PAGES = [
     {
       id: `pickable_capture_${i}`,
       skip: (a) => (a.pickable_count || 0) <= i,
-      render: ({ answers, setAnswer, goNext }) => {
+      render: ({ answers, bumpCounter, goNext }) => {
         const label  = answers.pickable_labels?.[i] || ''
-        const counts = answers.pickable_captures || []
-        const count  = counts[i] || 0
-        const bump = () => {
-          const next = counts.slice()
-          next[i] = (next[i] || 0) + 1
-          setAnswer('pickable_captures', next)
-        }
+        const count  = (answers.pickable_captures || [])[i] || 0
+        const addingMore = !!answers.adding_more
+        // In Add More mode the operator may legitimately want to add
+        // just one new reference for a new view of an already-taught
+        // part — drop the gate from 2 to 1.
+        const minN = addingMore ? 1 : 2
         return (
           <QuestionCard
             question={`Capture: ${label || 'Pickable orientation ' + (i + 1)}`}
@@ -1081,11 +1097,14 @@ const PAGES = [
               orientationLabel={label}
               isPickable={true}
               isDefect={false}
-              onCapture={bump}
+              onCapture={() => bumpCounter('pickable_captures', i)}
               captureCount={count}
+              addingMore={addingMore}
+              existingCount={answers.existing_teach_count || 0}
+              minToAdvance={minN}
             />
-            <NextButton onClick={goNext} disabled={count < 2} color="#16A34A"
-              label={count < 2 ? `Need ${2 - count} more capture${2 - count === 1 ? '' : 's'}` : 'Next'} />
+            <NextButton onClick={goNext} disabled={count < minN} color="#16A34A"
+              label={count < minN ? `Need ${minN - count} more capture${minN - count === 1 ? '' : 's'}` : 'Next'} />
           </QuestionCard>
         )
       },
@@ -1174,15 +1193,11 @@ const PAGES = [
     {
       id: `non_pickable_capture_${i}`,
       skip: (a) => (a.non_pickable_count || 0) <= i,
-      render: ({ answers, setAnswer, goNext }) => {
+      render: ({ answers, bumpCounter, goNext }) => {
         const label  = answers.non_pickable_labels?.[i] || ''
-        const counts = answers.non_pickable_captures || []
-        const count  = counts[i] || 0
-        const bump = () => {
-          const next = counts.slice()
-          next[i] = (next[i] || 0) + 1
-          setAnswer('non_pickable_captures', next)
-        }
+        const count  = (answers.non_pickable_captures || [])[i] || 0
+        const addingMore = !!answers.adding_more
+        const minN = addingMore ? 1 : 2
         return (
           <QuestionCard
             question={`Capture: ${label} (Non-pickable)`}
@@ -1195,11 +1210,14 @@ const PAGES = [
               orientationLabel={label}
               isPickable={false}
               isDefect={false}
-              onCapture={bump}
+              onCapture={() => bumpCounter('non_pickable_captures', i)}
               captureCount={count}
+              addingMore={addingMore}
+              existingCount={answers.existing_teach_count || 0}
+              minToAdvance={minN}
             />
-            <NextButton onClick={goNext} disabled={count < 2} color="#CA8A04"
-              label={count < 2 ? `Need ${2 - count} more capture${2 - count === 1 ? '' : 's'}` : 'Next'} />
+            <NextButton onClick={goNext} disabled={count < minN} color="#CA8A04"
+              label={count < minN ? `Need ${minN - count} more capture${minN - count === 1 ? '' : 's'}` : 'Next'} />
           </QuestionCard>
         )
       },
@@ -1323,7 +1341,10 @@ const PAGES = [
     render: ({ answers, setAnswer, goNext, goTo }) => {
       const name  = answers.cur_defect_name || ''
       const count = answers.cur_defect_capture_count || 0
-      const bump  = () => setAnswer('cur_defect_capture_count', count + 1)
+      const addingMore = !!answers.adding_more
+      const minN = addingMore ? 1 : 2
+      const bump  = () => setAnswer('cur_defect_capture_count',
+                                    (answers.cur_defect_capture_count || 0) + 1)
 
       const folder = () => {
         const defects = answers.defects || []
@@ -1360,24 +1381,27 @@ const PAGES = [
             defectSeverity={answers.cur_defect_severity || 'reject'}
             onCapture={bump}
             captureCount={count}
+            addingMore={addingMore}
+            existingCount={answers.existing_teach_count || 0}
+            minToAdvance={minN}
           />
 
           <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-            <button onClick={addAnother} disabled={count < 2}
+            <button onClick={addAnother} disabled={count < minN}
               style={{
                 flex: 1, padding: '14px', fontSize: 14, fontWeight: 700,
-                background: count < 2 ? '#f3f4f6' : '#fff',
-                color:      count < 2 ? '#9ca3af' : '#DC2626',
-                border:     count < 2 ? '2px solid #e5e7eb' : '2px solid #DC2626',
-                borderRadius: 10, cursor: count < 2 ? 'default' : 'pointer',
+                background: count < minN ? '#f3f4f6' : '#fff',
+                color:      count < minN ? '#9ca3af' : '#DC2626',
+                border:     count < minN ? '2px solid #e5e7eb' : '2px solid #DC2626',
+                borderRadius: 10, cursor: count < minN ? 'default' : 'pointer',
                 minHeight: 44,
               }}>+ Add another defect</button>
-            <button onClick={doneWithDefects} disabled={count < 2}
+            <button onClick={doneWithDefects} disabled={count < minN}
               style={{
                 flex: 1, padding: '14px', fontSize: 14, fontWeight: 700,
-                background: count < 2 ? '#d1d5db' : '#16A34A', color: '#fff',
+                background: count < minN ? '#d1d5db' : '#16A34A', color: '#fff',
                 border: 'none', borderRadius: 10,
-                cursor: count < 2 ? 'default' : 'pointer',
+                cursor: count < minN ? 'default' : 'pointer',
                 minHeight: 44,
               }}>Done — Review</button>
           </div>
@@ -1395,14 +1419,26 @@ const PAGES = [
       const nonPick  = (answers.non_pickable_labels || []).slice(0, answers.non_pickable_count || 0)
       const nonCaps  = answers.non_pickable_captures || []
       const defects  = answers.defects || []
-      const total = pickCaps.reduce((a, b) => a + (b || 0), 0)
+      const sessionTotal = pickCaps.reduce((a, b) => a + (b || 0), 0)
                   + nonCaps.reduce((a, b) => a + (b || 0), 0)
                   + defects.reduce((a, d) => a + (d.capture_count || 0), 0)
+      // When the operator picked "Add More", the library count after
+      // save is existing_teach_count + this session's captures. Show
+      // both so the displayed total matches what they'll see in the
+      // parts list pill.
+      const existingRefs = (answers.adding_more && !answers.cleared_at_start)
+        ? (answers.existing_teach_count || 0)
+        : 0
+      const libraryTotal = existingRefs + sessionTotal
 
       return (
         <QuestionCard
           question="Review your part teaching"
-          description={`${answers.part_name || 'Unnamed part'} — ${total} total capture${total === 1 ? '' : 's'}`}
+          description={
+            existingRefs > 0
+              ? `${answers.part_name || 'Unnamed part'} — ${sessionTotal} new + ${existingRefs} existing = ${libraryTotal} total`
+              : `${answers.part_name || 'Unnamed part'} — ${sessionTotal} total capture${sessionTotal === 1 ? '' : 's'}`
+          }
         >
           {answers.part_description && (
             <div style={{
@@ -1527,6 +1563,12 @@ function TeachWizard({ part, onClose, onComplete }) {
     // surfaces when this is > 0; Start-Fresh wipes it back to 0.
     existing_teach_count:     part?.teach_count || 0,
     cleared_at_start:         false,
+    // True when the operator picks "Add More" on confirm_overwrite.
+    // Capture pages relax min-2-captures to min-1 (operator may
+    // legitimately add just one more reference for a new view) and
+    // the counter shows "X new (+ Y existing)" so they can see what
+    // the library count will read after Save.
+    adding_more:              false,
     pickable_count:           1,
     pickable_labels:          [''],
     pickable_captures:        [],
@@ -1592,6 +1634,20 @@ function TeachWizard({ part, onClose, onComplete }) {
 
   const setAnswer = useCallback((key, value) => {
     setAnswers((prev) => ({ ...prev, [key]: value }))
+  }, [])
+
+  // Functional bumper for per-orientation capture counts. The
+  // page-level `bump()` helpers read `counts` from a closure; if the
+  // operator clicks Capture before React re-renders (or if the array
+  // was just initialised) sequential increments can clobber each
+  // other. Reading prev[key] inside the updater guarantees we always
+  // start from the latest state.
+  const bumpCounter = useCallback((key, index) => {
+    setAnswers((prev) => {
+      const cur = Array.isArray(prev[key]) ? prev[key].slice() : []
+      cur[index] = (cur[index] || 0) + 1
+      return { ...prev, [key]: cur }
+    })
   }, [])
 
   const ensurePartExists = useCallback(async () => {
@@ -1732,7 +1788,7 @@ function TeachWizard({ part, onClose, onComplete }) {
         )}
 
         <div style={{ flex: 1, overflowY: 'auto' }}>
-          {page.render({ answers, setAnswer, goNext, goBack, goTo, saving, onSave })}
+          {page.render({ answers, setAnswer, bumpCounter, goNext, goBack, goTo, saving, onSave })}
         </div>
       </div>
     </div>
