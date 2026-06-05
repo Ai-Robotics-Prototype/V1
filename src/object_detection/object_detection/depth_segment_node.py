@@ -1189,6 +1189,12 @@ class DepthSegmentNode(Node):
                                     else color_arr.astype(np.float32))
                     else:
                         gray_arr = None
+                    # Legacy refs (pre-conversational-wizard) only stored
+                    # the orientation string. Derive is_pickable from it
+                    # so the new colouring scheme still works on them.
+                    orientation_str = (str(z['orientation'])
+                                       if 'orientation' in files
+                                       else 'pickable')
                     ref = {
                         'size_m':   np.asarray(z['size_m'], dtype=np.float32)
                                     if 'size_m' in files
@@ -1205,8 +1211,18 @@ class DepthSegmentNode(Node):
                         'gray':     gray_arr,
                         'num_holes': int(z['num_holes'])
                                      if 'num_holes' in files else 0,
-                        'orientation': str(z['orientation'])
-                                       if 'orientation' in files else 'pickable',
+                        'orientation':        orientation_str,
+                        'orientation_number': int(z['orientation_number'])
+                                              if 'orientation_number' in files else 0,
+                        'orientation_label':  str(z['orientation_label'])
+                                              if 'orientation_label' in files else '',
+                        'is_pickable':        bool(z['is_pickable'])
+                                              if 'is_pickable' in files
+                                              else (orientation_str == 'pickable'),
+                        'is_defect':          bool(z['is_defect'])
+                                              if 'is_defect' in files else False,
+                        'defect_name':        str(z['defect_name'])
+                                              if 'defect_name' in files else '',
                         'distance_m': float(z['distance_m'])
                                       if 'distance_m' in files else 0.5,
                         'px_per_cm':  float(z['px_per_cm'])
@@ -1258,13 +1274,29 @@ class DepthSegmentNode(Node):
             if not part_id:
                 self.get_logger().warn('teach: missing part_id')
                 return
+            # The launch file starts one depth_segment_node per camera
+            # (cam0 = primary, cam1 = secondary). Both subscribe to
+            # /perception/teach_command — if both write a .npz, every
+            # operator capture lands as TWO refs on disk and the
+            # library's teach_count reads as 2× the wizard's session
+            # count. Gate writes to the primary instance only.
+            if self.get_name() != 'depth_segment_node':
+                return
             if not self._last_objects:
                 self.get_logger().warn('teach: no recent detections')
                 return
             det_idx = int(cmd.get('detection_index') or 0)
             if det_idx < 0 or det_idx >= len(self._last_objects):
                 det_idx = 0
-            orientation = str(cmd.get('orientation') or 'pickable')
+            orientation        = str(cmd.get('orientation') or 'pickable')
+            # Rich orientation metadata from the conversational wizard.
+            # Defaults preserve the legacy {pickable=True} semantics.
+            orientation_number = int(cmd.get('orientation_number') or 0)
+            orientation_label  = str(cmd.get('orientation_label') or '').strip()
+            is_pickable        = bool(cmd.get('is_pickable',
+                                              orientation == 'pickable'))
+            is_defect          = bool(cmd.get('is_defect', False))
+            defect_name        = str(cmd.get('defect_name') or '').strip()
 
             det = self._last_objects[det_idx]
             mask_crop  = det.get('mask_2d')
@@ -1397,14 +1429,19 @@ class DepthSegmentNode(Node):
             ref_id = existing
 
             save_data = {
-                'size_m':       size_m,
-                'yaw_deg':      np.float32(yaw_deg),
-                'orientation':  orientation,
-                'crop_shape':   np.array([ref_h, ref_w], dtype=np.int32),
-                'num_holes':    np.int32(num_holes),
-                'distance_m':   np.float32(depth_median),
-                'px_per_cm':    np.float32(px_per_cm),
-                'scale_factor': np.float32(scale_factor),
+                'size_m':             size_m,
+                'yaw_deg':            np.float32(yaw_deg),
+                'orientation':        orientation,
+                'orientation_number': np.int32(orientation_number),
+                'orientation_label':  orientation_label,
+                'is_pickable':        np.bool_(is_pickable),
+                'is_defect':          np.bool_(is_defect),
+                'defect_name':        defect_name,
+                'crop_shape':         np.array([ref_h, ref_w], dtype=np.int32),
+                'num_holes':          np.int32(num_holes),
+                'distance_m':         np.float32(depth_median),
+                'px_per_cm':          np.float32(px_per_cm),
+                'scale_factor':       np.float32(scale_factor),
             }
             if ref_color is not None:
                 save_data['color'] = ref_color.astype(np.uint8)
@@ -2172,27 +2209,37 @@ class DepthSegmentNode(Node):
         (or none for a given part_id) — that path also supplies the
         orientation tag (pickable / flipped / on_side).
 
-        Returns (name|'unknown', id|None, score, orientation|'').
+        Returns (name|'unknown', id|None, score, orientation|'', info_dict).
+        info_dict carries is_pickable / is_defect / orientation_label /
+        defect_name extracted from the matched ref so the renderer can
+        colour the bounding box appropriately.
         """
+        empty_info = {}
         # If absolutely no teach refs anywhere, lean entirely on templates.
         if not self._teach_refs:
             n, pid, s, _y, o = self._match_by_templates(
                 mask_crop, obb_size, color_crop)
-            return (n or 'unknown'), pid, s, (o or '')
+            # Template matches use legacy orientation tags
+            # (pickable / flipped / on_side); derive is_pickable.
+            info = {'is_pickable': (o == 'pickable')} if o else {}
+            return (n or 'unknown'), pid, s, (o or ''), info
 
         if mask_crop is None or color_crop is None:
-            return 'unknown', None, 0.0, ''
+            return 'unknown', None, 0.0, '', empty_info
         crop_h, crop_w = mask_crop.shape[:2]
         if crop_h < 25 or crop_w < 25:
-            return 'unknown', None, 0.0, ''
+            return 'unknown', None, 0.0, '', empty_info
 
         det_max_dim = (max(float(obb_size[0]), float(obb_size[1]))
                        if obb_size is not None and len(obb_size) >= 2 else 0.0)
         if det_max_dim < 0.015:
-            return 'unknown', None, 0.0, ''
+            return 'unknown', None, 0.0, '', empty_info
 
         det_s = sorted([float(obb_size[0]), float(obb_size[1])], reverse=True)
         det_asp = det_s[0] / max(det_s[1], 0.001)
+        # Track the ref that drove the best score so we can return its
+        # is_pickable / is_defect / orientation_label downstream.
+        best_ref_meta = None
 
         # Detection grayscale at native resolution.
         if color_crop.ndim == 3:
@@ -2239,6 +2286,7 @@ class DepthSegmentNode(Node):
 
             # ── Physical-scale NCC against each ref ────────────────────
             best_ref_ncc = 0.0
+            best_ref_for_part = None
             for ref in refs:
                 ref_gray = ref.get('gray')
                 ref_px_per_cm = float(ref.get('px_per_cm', 10.0) or 10.0)
@@ -2280,6 +2328,7 @@ class DepthSegmentNode(Node):
                     ) / (a_s * b_s))
                     if ncc > best_ref_ncc:
                         best_ref_ncc = max(0.0, ncc)
+                        best_ref_for_part = ref
 
             combined = size_score * 0.50 + best_ref_ncc * 0.50
             self.get_logger().info(
@@ -2293,6 +2342,7 @@ class DepthSegmentNode(Node):
             if combined > best_score:
                 best_score = combined
                 best_id    = part_id
+                best_ref_meta = best_ref_for_part
                 meta_path  = f'/opt/cobot/parts/metadata/{part_id}.json'
                 if os.path.isfile(meta_path):
                     try:
@@ -2303,17 +2353,27 @@ class DepthSegmentNode(Node):
                 else:
                     best_name = part_id
 
-        # If we found a teach match, use it (no orientation — operator
-        # captures don't carry orientation tags). If we didn't, try the
-        # template path so orientation/CAD-only parts still match.
+        # If we found a teach match, return it with the rich orientation
+        # metadata from the winning ref. Falls back to the template path
+        # if the teach score is below threshold so CAD-only parts still
+        # match (template path returns the legacy pickable/flipped/on_side
+        # orientation string).
         if best_score >= 0.60 and best_id is not None:
-            return best_name, best_id, round(best_score, 3), ''
+            info = {}
+            if best_ref_meta is not None:
+                info = {
+                    'is_pickable':       bool(best_ref_meta.get('is_pickable', True)),
+                    'is_defect':         bool(best_ref_meta.get('is_defect', False)),
+                    'orientation_label': str(best_ref_meta.get('orientation_label') or ''),
+                    'defect_name':       str(best_ref_meta.get('defect_name') or ''),
+                }
+            return best_name, best_id, round(best_score, 3), '', info
 
         n, pid, s, _y, o = self._match_by_templates(
             mask_crop, obb_size, color_crop)
         if n and s >= 0.55:
-            return n, pid, s, (o or '')
-        return 'unknown', None, 0.0, ''
+            return n, pid, s, (o or ''), {'is_pickable': (o == 'pickable')} if o else {}
+        return 'unknown', None, 0.0, '', empty_info
 
     def _match_parts(self, objects):
         """Two-stage recognition: STEP dimension gate + physical-scale
@@ -2334,6 +2394,10 @@ class DepthSegmentNode(Node):
                 o['surface_ok']       = None
                 o['position_status']  = ''
                 o['orientation']      = None
+                o['is_pickable']      = None
+                o['is_defect']        = False
+                o['orientation_label']= ''
+                o['defect_name']      = ''
                 o['_holes']           = []
                 o['_match_reason']    = ''
                 o['_match_source']    = ''
@@ -2345,7 +2409,7 @@ class DepthSegmentNode(Node):
             size_m = [float(sx), float(sy), float(sz)]
             color_crop = o.get('color_crop')
 
-            name, pid, score, orient = self._match_part(
+            name, pid, score, orient, match_info = self._match_part(
                 mask, size_m, color_crop=color_crop, depth_crop=depth)
             matched = (name and name != 'unknown')
 
@@ -2354,16 +2418,28 @@ class DepthSegmentNode(Node):
             o['_match_source'] = ('teach' if matched and not orient
                                   else ('template' if matched else ''))
             o['orientation']   = orient or None
+            # Rich orientation metadata from the matched teach ref so
+            # _publish_annotated can colour boxes (green pickable / red
+            # non-pickable / red defect) and the dashboard can surface
+            # the operator-supplied label.
+            o['is_pickable']       = bool(match_info.get('is_pickable', True)) if matched else None
+            o['is_defect']         = bool(match_info.get('is_defect', False)) if matched else False
+            o['orientation_label'] = str(match_info.get('orientation_label') or '')
+            o['defect_name']       = str(match_info.get('defect_name') or '')
 
             if not matched:
-                o['part_name']        = None
-                o['part_id']          = None
-                o['match_score']      = 0.0
-                o['match_yaw']        = 0.0
-                o['position_correct'] = None
-                o['yaw_error_deg']    = 0.0
-                o['surface_ok']       = None
-                o['position_status']  = ''
+                o['part_name']         = None
+                o['part_id']           = None
+                o['match_score']       = 0.0
+                o['match_yaw']         = 0.0
+                o['position_correct']  = None
+                o['yaw_error_deg']     = 0.0
+                o['surface_ok']        = None
+                o['position_status']   = ''
+                o['is_pickable']       = None
+                o['is_defect']         = False
+                o['orientation_label'] = ''
+                o['defect_name']       = ''
                 continue
 
             o['part_name']   = str(name)
@@ -2542,22 +2618,34 @@ class DepthSegmentNode(Node):
             sx, sy, sz = o['size_3d']
             roll, pitch, yaw = o['euler']
             matched     = bool(o.get('part_name'))
-            orientation = o.get('orientation')  # 'pickable' / 'flipped' / 'on_side' / None
-            # Four-state colour code from the orientation tag:
-            #   blue    — matched + pickable (right-side up)
-            #   red     — matched + flipped (upside down)
-            #   orange  — matched + on side (needs reorienting)
-            #   green   — no template match
-            if matched and orientation == 'pickable':
-                col = (59, 130, 246)    # blue
-            elif matched and orientation == 'flipped':
-                col = (220, 38, 38)     # red
-            elif matched and orientation == 'on_side':
-                col = (249, 115, 22)    # orange
+            is_pickable = o.get('is_pickable')      # True / False / None
+            is_defect   = bool(o.get('is_defect'))
+            orient_lbl  = str(o.get('orientation_label') or '')
+            defect_lbl  = str(o.get('defect_name') or '')
+            # Legacy template-matcher orientation (pickable/flipped/on_side)
+            # still informs is_pickable when the matcher didn't set it.
+            orientation = o.get('orientation')
+            if matched and is_pickable is None and orientation:
+                is_pickable = (orientation == 'pickable')
+            # Four-state colour code keyed on is_pickable + is_defect:
+            #   green  — matched + pickable (operator approved this view)
+            #   red    — matched + non-pickable OR defect (do NOT grasp)
+            #   amber  — matched but orientation unknown
+            #   grey   — no match (unknown object)
+            green = (22, 163, 74)
+            red   = (220, 38, 38)
+            amber = (202, 138, 4)
+            grey  = (156, 163, 175)
+            if matched and is_defect:
+                col = red
+            elif matched and is_pickable is True:
+                col = green
+            elif matched and is_pickable is False:
+                col = red
             elif matched:
-                col = (249, 115, 22)    # orange (matched, orientation unknown)
+                col = amber
             else:
-                col = self._dist_color(pz)
+                col = grey
 
             # Pixel-space minimum-area rotated rectangle around the
             # cleaned mask. Drawing from mask pixels (not from projected
@@ -2570,25 +2658,47 @@ class DepthSegmentNode(Node):
                 rect_corners = self._min_area_rect_2d(
                     mask_2d, offset_x=x0, offset_y=y0)
 
+            # Thickness signals "is this object known?" at a glance —
+            # matched parts get a 3px border, unknowns get 1px.
+            box_thick = 3 if matched else 1
             if rect_corners is not None:
                 for i in range(4):
                     p1 = (int(round(rect_corners[i][0])),
                           int(round(rect_corners[i][1])))
                     p2 = (int(round(rect_corners[(i + 1) % 4][0])),
                           int(round(rect_corners[(i + 1) % 4][1])))
-                    draw.line([p1, p2], fill=col, width=3)
+                    draw.line([p1, p2], fill=col, width=box_thick)
                 top_y = int(np.min(rect_corners[:, 1]))
                 left_x = int(np.min(rect_corners[:, 0]))
                 cx_box = float(np.mean(rect_corners[:, 0]))
                 cy_box = float(np.mean(rect_corners[:, 1]))
+                bx0 = int(np.min(rect_corners[:, 0]))
+                by0 = int(np.min(rect_corners[:, 1]))
+                bx1 = int(np.max(rect_corners[:, 0]))
+                by1 = int(np.max(rect_corners[:, 1]))
             else:
                 draw.rectangle(
                     [x0 + 1, y0 + 1, x1 - 1, y1 - 1],
-                    outline=col, width=2)
+                    outline=col, width=box_thick)
                 top_y = y0
                 left_x = x0
                 cx_box = (x0 + x1) * 0.5
                 cy_box = (y0 + y1) * 0.5
+                bx0, by0, bx1, by1 = int(x0), int(y0), int(x1), int(y1)
+
+            # NON-PICKABLE / DEFECT: draw a red X across the box so the
+            # operator's eye catches "do not grasp" without reading text.
+            if matched and (is_defect or is_pickable is False):
+                draw.line([(bx0, by0), (bx1, by1)], fill=red, width=2)
+                draw.line([(bx1, by0), (bx0, by1)], fill=red, width=2)
+
+            # PICKABLE: small green checkmark in the top-left corner.
+            if matched and is_pickable is True and not is_defect:
+                cx_check, cy_check = bx0 + 6, by0 + 14
+                draw.line([(cx_check, cy_check),
+                           (cx_check + 4, cy_check + 4)], fill=green, width=2)
+                draw.line([(cx_check + 4, cy_check + 4),
+                           (cx_check + 12, cy_check - 6)], fill=green, width=2)
 
             # Cyan orientation arrow at the rect centre, pointing along
             # the OBB yaw (rotation about cam-Z = optical axis).
@@ -2611,15 +2721,19 @@ class DepthSegmentNode(Node):
             if matched:
                 pct = int(round(float(o.get('match_score') or 0) * 100))
                 hole_tag = f' [{n_holes}h]' if n_holes else ''
-                if orientation == 'pickable':
-                    label = (f"{o['part_name']} ({pct}%){hole_tag} "
-                             f"✓ pickable")
+                if is_defect:
+                    tag = defect_lbl or 'defect'
+                    label = f"DEFECT: {tag} — {o['part_name']} ({pct}%){hole_tag}"
+                elif is_pickable is True:
+                    suffix = f' — {orient_lbl}' if orient_lbl else ''
+                    label = f"{o['part_name']}{suffix} — PICK OK ({pct}%){hole_tag}"
+                elif is_pickable is False:
+                    tag = orient_lbl or 'non-pickable'
+                    label = f"{o['part_name']} — NO PICK: {tag} ({pct}%){hole_tag}"
                 elif orientation == 'flipped':
-                    label = (f"{o['part_name']} ({pct}%){hole_tag} "
-                             f"⚠ FLIPPED")
+                    label = f"{o['part_name']} ({pct}%){hole_tag} ⚠ FLIPPED"
                 elif orientation == 'on_side':
-                    label = (f"{o['part_name']} ({pct}%){hole_tag} "
-                             f"⚠ ON SIDE")
+                    label = f"{o['part_name']} ({pct}%){hole_tag} ⚠ ON SIDE"
                 else:
                     label = f"{o['part_name']} ({pct}%){hole_tag} {pz:.2f}m"
             else:
