@@ -2191,6 +2191,51 @@ class DepthSegmentNode(Node):
             pass
         return out
 
+    @staticmethod
+    def _color_hist_corr(rgb1, rgb2, bins=16):
+        """Pearson correlation between two RGB images' per-channel
+        histograms. numpy-only — depth_segment_node has a hard
+        no-cv2/no-skimage policy.
+
+        Used as an orientation tie-breaker: two refs with identical
+        outline (a key-fob front vs back) often produce near-identical
+        NCC scores, but the surface texture / colour distribution
+        differs and shows up in the histogram. Returns 0..1; values
+        below 0 are clamped (negative correlation means "very different
+        distributions" — equivalent to 0 for our scoring purposes)."""
+        try:
+            if rgb1 is None or rgb2 is None:
+                return 0.0
+            r1 = np.asarray(rgb1)
+            r2 = np.asarray(rgb2)
+            if r1.size == 0 or r2.size == 0:
+                return 0.0
+            if r1.ndim == 2:
+                r1 = np.stack([r1, r1, r1], axis=-1)
+            if r2.ndim == 2:
+                r2 = np.stack([r2, r2, r2], axis=-1)
+            parts = []
+            for c in range(min(3, r1.shape[-1], r2.shape[-1])):
+                h1, _ = np.histogram(r1[..., c], bins=bins, range=(0, 256))
+                h2, _ = np.histogram(r2[..., c], bins=bins, range=(0, 256))
+                h1 = h1.astype(np.float32)
+                h2 = h2.astype(np.float32)
+                s1, s2 = h1.sum(), h2.sum()
+                if s1 > 0: h1 /= s1
+                if s2 > 0: h2 /= s2
+                parts.append((h1, h2))
+            # Concatenate per-channel histograms into one vector and
+            # Pearson-correlate.
+            a = np.concatenate([p[0] for p in parts])
+            b = np.concatenate([p[1] for p in parts])
+            sa, sb = float(a.std()), float(b.std())
+            if sa < 1e-9 or sb < 1e-9:
+                return 0.0
+            corr = float(np.mean((a - a.mean()) * (b - b.mean())) / (sa * sb))
+            return max(0.0, min(1.0, corr))
+        except Exception:
+            return 0.0
+
     def _match_part(self, mask_crop, obb_size, color_crop=None,
                     depth_crop=None):
         """Reliable per-detection matcher.
@@ -2284,60 +2329,139 @@ class DepthSegmentNode(Node):
             else:
                 size_score = 0.5  # no STEP record — neutral
 
-            # ── Physical-scale NCC against each ref ────────────────────
-            best_ref_ncc = 0.0
-            best_ref_for_part = None
+            # ── Orientation-aware ref matching ─────────────────────────
+            #
+            # Group refs by orientation key (is_pickable, is_defect,
+            # orientation_number, orientation_label). Compute the MEAN
+            # NCC and MEAN colour-histogram correlation per group, then
+            # pick the highest-scoring group. The "best ref" inside
+            # that group supplies the metadata.
+            #
+            # Why this matters: a key fob's front and back have nearly
+            # identical outlines, so any single ref's NCC can win at
+            # random under noise. Averaging per-group + adding colour
+            # histogram correlation breaks the tie based on actual
+            # surface differences (buttons vs flat back).
+            groups = {}
             for ref in refs:
-                ref_gray = ref.get('gray')
-                ref_px_per_cm = float(ref.get('px_per_cm', 10.0) or 10.0)
-                if ref_gray is None or ref_px_per_cm <= 0:
-                    continue
-                ref_h, ref_w = ref_gray.shape[:2]
+                gkey = (
+                    bool(ref.get('is_pickable', True)),
+                    bool(ref.get('is_defect', False)),
+                    int(ref.get('orientation_number', 0)),
+                    str(ref.get('orientation_label') or ''),
+                )
+                groups.setdefault(gkey, []).append(ref)
 
-                # Scale detection so 1 cm on the part takes the same
-                # pixel count as it does in the reference.
-                phys_scale = ref_px_per_cm / max(det_px_per_cm, 0.1)
-                target_h = int(round(crop_h * phys_scale))
-                target_w = int(round(crop_w * phys_scale))
-                if (target_h < 20 or target_w < 20
-                        or target_h > 300 or target_w > 300):
-                    continue
-                try:
-                    det_scaled = _zoom(
-                        det_gray,
-                        (target_h / crop_h, target_w / crop_w), order=1)
-                except Exception:
-                    continue
+            best_group_score = 0.0
+            best_group_key   = None
+            best_group_meta  = None    # (avg_ncc, avg_hist, n_refs, best_ref)
+            group_dbg = []             # for the throttled log
 
-                for rot in range(4):
-                    dr = np.rot90(det_scaled, rot) if rot else det_scaled
-                    mh = min(dr.shape[0], ref_h)
-                    mw = min(dr.shape[1], ref_w)
-                    if mh < 15 or mw < 15:
+            for gkey, grp_refs in groups.items():
+                nccs   = []
+                hists  = []
+                best_in_group_ncc = 0.0
+                best_in_group_ref = None
+
+                for ref in grp_refs:
+                    ref_gray = ref.get('gray')
+                    ref_px_per_cm = float(ref.get('px_per_cm', 10.0) or 10.0)
+                    if ref_gray is None or ref_px_per_cm <= 0:
                         continue
-                    a = ref_gray[:mh, :mw].flatten()
-                    b = dr[:mh, :mw].flatten()
-                    if a.size != b.size or a.size < 100:
-                        continue
-                    a_m, a_s = float(a.mean()), float(a.std())
-                    b_m, b_s = float(b.mean()), float(b.std())
-                    if a_s < 1.0 or b_s < 1.0:
-                        continue  # flat / featureless — can't trust
-                    ncc = float(np.mean(
-                        (a - a_m) * (b - b_m)
-                    ) / (a_s * b_s))
-                    if ncc > best_ref_ncc:
-                        best_ref_ncc = max(0.0, ncc)
-                        best_ref_for_part = ref
+                    ref_h, ref_w = ref_gray.shape[:2]
 
-            combined = size_score * 0.50 + best_ref_ncc * 0.50
-            self.get_logger().info(
-                f'PART_MATCH: {part_id[:8]} '
-                f'det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm] '
-                f'step={[round(sd[0]*100,1), round(sd[1]*100,1)] if sd else "N/A"} '
-                f'size={size_score:.2f} ncc={best_ref_ncc:.2f} '
-                f'total={combined:.2f}',
-                throttle_duration_sec=3.0)
+                    # Scale detection so 1 cm on the part takes the same
+                    # pixel count as it does in the reference.
+                    phys_scale = ref_px_per_cm / max(det_px_per_cm, 0.1)
+                    target_h = int(round(crop_h * phys_scale))
+                    target_w = int(round(crop_w * phys_scale))
+                    if (target_h < 20 or target_w < 20
+                            or target_h > 300 or target_w > 300):
+                        continue
+                    try:
+                        det_scaled = _zoom(
+                            det_gray,
+                            (target_h / crop_h, target_w / crop_w), order=1)
+                    except Exception:
+                        continue
+
+                    best_rot_ncc = 0.0
+                    for rot in range(4):
+                        dr = np.rot90(det_scaled, rot) if rot else det_scaled
+                        mh = min(dr.shape[0], ref_h)
+                        mw = min(dr.shape[1], ref_w)
+                        if mh < 15 or mw < 15:
+                            continue
+                        a = ref_gray[:mh, :mw].flatten()
+                        b = dr[:mh, :mw].flatten()
+                        if a.size != b.size or a.size < 100:
+                            continue
+                        a_m, a_s = float(a.mean()), float(a.std())
+                        b_m, b_s = float(b.mean()), float(b.std())
+                        if a_s < 1.0 or b_s < 1.0:
+                            continue  # flat / featureless — can't trust
+                        ncc = float(np.mean(
+                            (a - a_m) * (b - b_m)
+                        ) / (a_s * b_s))
+                        ncc = max(0.0, ncc)
+                        if ncc > best_rot_ncc:
+                            best_rot_ncc = ncc
+                    if best_rot_ncc > 0:
+                        nccs.append(best_rot_ncc)
+                        if best_rot_ncc > best_in_group_ncc:
+                            best_in_group_ncc = best_rot_ncc
+                            best_in_group_ref = ref
+
+                    # Colour-histogram tie-breaker. Only counts when
+                    # both detection and ref carry colour pixels.
+                    ref_color = ref.get('color')
+                    if ref_color is not None and color_crop is not None:
+                        hists.append(self._color_hist_corr(color_crop, ref_color))
+
+                if not nccs:
+                    continue
+                avg_ncc  = float(np.mean(nccs))
+                avg_hist = float(np.mean(hists)) if hists else 0.5
+                # Weighted: NCC dominates (texture/shape correlation is
+                # the primary signal); histogram supplies the tie-break
+                # when two groups have similar NCC but different
+                # surface colours.
+                group_score = avg_ncc * 0.70 + avg_hist * 0.30
+
+                group_dbg.append((gkey, avg_ncc, avg_hist, group_score, len(nccs)))
+
+                if group_score > best_group_score:
+                    best_group_score = group_score
+                    best_group_key   = gkey
+                    best_group_meta  = (avg_ncc, avg_hist, len(nccs), best_in_group_ref)
+
+            if best_group_meta is None:
+                continue
+
+            best_ref_ncc, best_ref_hist, n_refs, best_ref_for_part = best_group_meta
+            combined = size_score * 0.50 + best_group_score * 0.50
+
+            # Per-group debug log so the operator can see WHY one
+            # orientation won over another. Sorted by score desc.
+            try:
+                group_dbg.sort(key=lambda x: -x[3])
+                gap = (group_dbg[0][3] - group_dbg[1][3]) if len(group_dbg) >= 2 else float('nan')
+                summary = ' | '.join(
+                    "{}'{}' ncc={:.2f} hist={:.2f} score={:.2f} ({}r)".format(
+                        'pick' if k[0] else 'NOpick', k[3] or '?',
+                        a, h, s, n
+                    )
+                    for (k, a, h, s, n) in group_dbg
+                )
+                self.get_logger().info(
+                    f'ORIENT_MATCH {part_id[:8]} det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm] '
+                    f'size={size_score:.2f} → '
+                    f'winner={"PICK" if best_group_key[0] else "NOpick"}/'
+                    f'"{best_group_key[3] or "?"}" '
+                    f'gap={gap:.2f} | {summary}',
+                    throttle_duration_sec=3.0)
+            except Exception:
+                pass
 
             if combined > best_score:
                 best_score = combined
