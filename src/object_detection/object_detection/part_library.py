@@ -9,6 +9,7 @@ Layout under /opt/cobot/parts:
 import json
 import os
 import shutil
+import uuid
 from typing import Optional, Tuple
 
 LIBRARY_DIR   = '/opt/cobot/parts'
@@ -61,6 +62,36 @@ def add_part(step_path: str, part_data: dict) -> str:
     return part_id
 
 
+def create_part_no_step(name: str, description: str = '') -> dict:
+    """Register a part with no STEP file. The teach wizard's
+    'camera-only' branch needs a part-id to call /teach against
+    before any STEP file is available (or when there will never
+    be one)."""
+    init_library()
+    part_id = uuid.uuid4().hex[:12]
+    part_data = {
+        'id':          part_id,
+        'name':        name,
+        'description': description,
+        'extents_cm':  [0.0, 0.0, 0.0],
+        'grasp':       {'approach': 'top_down'},
+        'source_file': '',
+        'stl_file':    '',
+        'vertices':    [],
+        'faces':       [],
+        'no_step':     True,
+    }
+    meta_path = os.path.join(LIBRARY_DIR, 'metadata', f'{part_id}.json')
+    with open(meta_path, 'w') as f:
+        json.dump(part_data, f, indent=2)
+    with open(LIBRARY_INDEX) as f:
+        index = json.load(f) or {'parts': []}
+    index['parts'].append(_index_entry(part_data))
+    with open(LIBRARY_INDEX, 'w') as f:
+        json.dump(index, f, indent=2)
+    return part_data
+
+
 def get_all_parts() -> list:
     init_library()
     with open(LIBRARY_INDEX) as f:
@@ -81,8 +112,14 @@ def delete_part(part_id: str) -> bool:
     if meta is None:
         return False
     for subdir, key in [('step', 'source_file'), ('stl', 'stl_file')]:
-        path = os.path.join(LIBRARY_DIR, subdir, meta.get(key, ''))
-        if path and os.path.exists(path):
+        filename = meta.get(key, '')
+        # Camera-only parts have empty filenames — os.path.join with ''
+        # would resolve to the directory itself and os.remove on it
+        # would raise IsADirectoryError. Skip the entry instead.
+        if not filename:
+            continue
+        path = os.path.join(LIBRARY_DIR, subdir, filename)
+        if os.path.exists(path):
             os.remove(path)
     meta_path = os.path.join(LIBRARY_DIR, 'metadata', f'{part_id}.json')
     if os.path.exists(meta_path):

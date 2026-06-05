@@ -1727,6 +1727,31 @@ if FASTAPI_AVAILABLE:
             })
         return out
 
+    @app.post("/api/parts")
+    async def api_parts_create(request: Request):
+        """Create a part record from name + description, no STEP
+        file required. The conversational teach wizard uses this so
+        the operator can teach a brand-new part from the camera
+        alone, then call /api/parts/<id>/teach against the new id."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        name = str(body.get('name') or '').strip()
+        if not name:
+            return JSONResponse({"error": "name required"}, status_code=400)
+        description = str(body.get('description') or '').strip()
+        try:
+            from object_detection.part_library import create_part_no_step
+            part_data = create_part_no_step(name=name, description=description)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return {
+            "ok":      True,
+            "part_id": part_data['id'],
+            "name":    part_data['name'],
+        }
+
     @app.get("/api/parts")
     async def api_parts_list():
         from object_detection.part_library import get_all_parts
@@ -1767,8 +1792,14 @@ if FASTAPI_AVAILABLE:
             body = {}
         det_idx = int(body.get('detection_index') or 0)
         orientation = str(body.get('orientation') or 'pickable')
-        if orientation not in ('pickable', 'flipped', 'on_side'):
+        if orientation not in ('pickable', 'flipped', 'on_side', 'non_pickable'):
             orientation = 'pickable'
+        # New conversational wizard adds rich orientation metadata. Pass
+        # through unchanged — depth_segment_node ignores unknown keys
+        # today but the metadata is stored in the .npz sidecar.
+        orientation_number = int(body.get('orientation_number') or 0)
+        orientation_label  = str(body.get('orientation_label') or '').strip()
+        is_pickable        = bool(body.get('is_pickable', orientation == 'pickable'))
         is_defect          = bool(body.get('is_defect') or False)
         defect_name        = str(body.get('defect_name') or '').strip()
         defect_description = str(body.get('defect_description') or '').strip()
@@ -1796,10 +1827,13 @@ if FASTAPI_AVAILABLE:
         )
         m = String()
         payload = {
-            'action':           'teach',
-            'part_id':          part_id,
-            'detection_index':  det_idx,
-            'orientation':      orientation,
+            'action':              'teach',
+            'part_id':             part_id,
+            'detection_index':     det_idx,
+            'orientation':         orientation,
+            'orientation_number':  orientation_number,
+            'orientation_label':   orientation_label,
+            'is_pickable':         is_pickable,
         }
         if is_defect:
             # Pass defect fields to depth_segment_node so it can route

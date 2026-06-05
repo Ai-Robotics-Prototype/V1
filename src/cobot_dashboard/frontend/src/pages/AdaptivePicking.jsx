@@ -537,147 +537,105 @@ function PartConfigurator({ partId, onSave, onDelete }) {
 
 // ── Teaching wizard ──────────────────────────────────────────────────
 //
-// Operators were never finding the tiny "teach as <part>" button on the
-// detections panel. This wizard walks them through 4 angles of the same
-// part, posting to /api/parts/:id/teach for each one. depth_segment_node
-// stores the resulting .npz fingerprints under /opt/cobot/parts/teach/:id
-// and api_parts_list counts them back to render the green "Taught" pill.
+// Conversational, page-by-page flow modeled on ProgramWizard. Each
+// page asks ONE question; the answer determines the next page. The
+// same modal overlay + PAGES-array pattern gives operators one mental
+// model for every wizard in the app.
+//
+// Entry points:
+//   • Library "Teach New Part" button  → starts at part_name (page 0)
+//   • Per-row "Teach" button           → part exists; pages 0–3 skip,
+//                                        wizard begins at pickable_count
 
-function TeachWizard({ part, onClose, onComplete }) {
-  const [step, setStep]                       = useState(0)
-  const [captures, setCaptures]               = useState([])
-  const [capturing, setCapturing]             = useState(false)
-  const [error, setError]                     = useState(null)
-  const [liveDetections, setLiveDetections]   = useState([])
-  const [selectedDetection, setSelectedDet]   = useState(null)
-  const [flashGreen, setFlashGreen]           = useState(false)
-  // 'pickable' = part lying as it should be picked
-  // 'flipped'  = part upside-down (robot must flip before pick)
-  // 'on_side'  = part on its side (robot must reorient before pick)
-  const [orientation, setOrientation]         = useState('pickable')
-  // Defect-teaching state. defectTypes is the running list of defect
-  // names the operator has captured so far (one entry per unique
-  // name, with a capture count that increments when they re-capture
-  // the same defect from a different angle). The form fields below
-  // are bound to the current capture; on success they're folded
-  // into defectTypes and the form clears for the next one.
-  const [defectTypes,        setDefectTypes]        = useState([])
-  const [defectName,         setDefectName]         = useState('')
-  const [defectDescription,  setDefectDescription]  = useState('')
-  const [defectSeverity,     setDefectSeverity]     = useState('reject')
-  const [capturingDefect,    setCapturingDefect]    = useState(false)
-  // Rendered image bounds inside the camera pane. The MJPEG stream is
-  // 640×480 native; the <img> uses object-fit:contain so the actual
-  // drawn area is letterboxed inside its container. Detection boxes
-  // need to be positioned against the *drawn* area, not the container.
-  const imgRef                                = useRef(null)
-  const [imgBounds, setImgBounds]             = useState({
-    w: 640, h: 480, offX: 0, offY: 0,
-  })
+function QuestionCard({ question, description, children }) {
+  return (
+    <div style={{ padding: 28, maxWidth: 640, margin: '0 auto' }}>
+      <div style={{ fontSize: 20, fontWeight: 700, color: '#111', marginBottom: 8, lineHeight: 1.3 }}>
+        {question}
+      </div>
+      {description && (
+        <div style={{ fontSize: 14, color: '#6b7280', marginBottom: 22, lineHeight: 1.5 }}>
+          {description}
+        </div>
+      )}
+      {children}
+    </div>
+  )
+}
 
-  // Tell depth_segment_node to suppress part recognition while the
-  // wizard is open — otherwise the matcher would false-positive off the
-  // operator showing the part from random angles.
-  useEffect(() => {
-    fetch('/api/teach_mode/start', { method: 'POST' }).catch(() => {})
-    return () => {
-      fetch('/api/teach_mode/stop', { method: 'POST' }).catch(() => {})
+function ChoiceButton({ label, description, selected, onClick, accent = '#2563EB' }) {
+  return (
+    <button onClick={onClick} style={{
+      width: '100%', padding: '14px 16px', textAlign: 'left', cursor: 'pointer',
+      background: selected ? '#eff6ff' : '#fff',
+      border: selected ? `2px solid ${accent}` : '2px solid #e5e7eb',
+      borderRadius: 10, marginBottom: 8, minHeight: 44,
+      transition: 'all 100ms',
+    }}>
+      <div style={{ fontSize: 15, fontWeight: 600, color: selected ? accent : '#111' }}>{label}</div>
+      {description && (
+        <div style={{ fontSize: 12, color: '#6b7280', marginTop: 3 }}>{description}</div>
+      )}
+    </button>
+  )
+}
+
+function NextButton({ onClick, disabled, label, color = '#2563EB' }) {
+  return (
+    <button onClick={onClick} disabled={disabled} style={{
+      width: '100%', padding: '14px', fontSize: 16, fontWeight: 700, marginTop: 14,
+      background: disabled ? '#d1d5db' : color, color: '#fff',
+      border: 'none', borderRadius: 10, cursor: disabled ? 'default' : 'pointer',
+      minHeight: 44,
+    }}>
+      {label || 'Next'}
+    </button>
+  )
+}
+
+// Inline capture component used on every "Capture: X" page so the
+// accent colour (green / amber / red) tracks the orientation type.
+function CaptureView({
+  partId, orientation, orientationNumber, orientationLabel,
+  isPickable, isDefect, defectName, defectDescription, defectSeverity,
+  onCapture, captureCount,
+}) {
+  const [capturing, setCapturing] = useState(false)
+  const [error,     setError]     = useState(null)
+
+  const accent = isDefect    ? '#DC2626'
+              : isPickable   ? '#16A34A'
+              :                '#CA8A04'  // non-pickable → amber
+  const tint   = isDefect    ? '#fef2f2'
+              : isPickable   ? '#f0fdf4'
+              :                '#fffbeb'
+
+  const handleCapture = async () => {
+    if (!partId) {
+      setError('Part is not registered yet. Go back one step.')
+      return
     }
-  }, [])
-
-  // Pre-seed defectTypes from the backend so previously-taught defects
-  // show up when the operator re-opens the wizard. Runs once on mount.
-  useEffect(() => {
-    let cancelled = false
-    fetch(`/api/parts/${part.id}/defects`)
-      .then((r) => r.ok ? r.json() : null)
-      .then((data) => {
-        if (cancelled || !data || !Array.isArray(data.defects)) return
-        setDefectTypes(data.defects)
-      })
-      .catch(() => {})
-    return () => { cancelled = true }
-  }, [part.id])
-
-  // Poll live detections from dashboard state at 2 Hz.
-  useEffect(() => {
-    let cancelled = false
-    const tick = async () => {
-      try {
-        const res = await fetch('/api/state')
-        const data = await res.json()
-        if (!cancelled) setLiveDetections(data.detections || [])
-      } catch { /* network blip — keep last list */ }
-    }
-    tick()
-    const interval = setInterval(tick, 500)
-    return () => { cancelled = true; clearInterval(interval) }
-  }, [])
-
-  // Track the rendered image area so overlays line up with object-fit:contain.
-  useEffect(() => {
-    const updateBounds = () => {
-      const el = imgRef.current
-      if (!el || !el.parentElement) return
-      const c = el.parentElement.getBoundingClientRect()
-      const natW = 640, natH = 480
-      const scale = Math.min(c.width / natW, c.height / natH)
-      const renderedW = natW * scale
-      const renderedH = natH * scale
-      setImgBounds({
-        w: renderedW,
-        h: renderedH,
-        offX: (c.width - renderedW) / 2,
-        offY: (c.height - renderedH) / 2,
-      })
-    }
-    updateBounds()
-    let observer = null
-    if (imgRef.current?.parentElement && 'ResizeObserver' in window) {
-      observer = new ResizeObserver(updateBounds)
-      observer.observe(imgRef.current.parentElement)
-    }
-    window.addEventListener('resize', updateBounds)
-    return () => {
-      observer?.disconnect()
-      window.removeEventListener('resize', updateBounds)
-    }
-  }, [step])
-
-  async function captureTeach(detectionIndex) {
-    setCapturing(true)
-    setError(null)
-    let ok = false
+    setCapturing(true); setError(null)
     try {
-      // If nothing selected, idx=0 — depth_segment_node treats index 0
-      // as the first (typically nearest/largest) detection.
-      const idx = detectionIndex ?? 0
-      const res = await fetch(`/api/parts/${part.id}/teach`, {
-        method: 'POST',
+      const res = await fetch(`/api/parts/${partId}/teach`, {
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          detection_index: idx,
-          action: 'teach',
-          part_id: part.id,
+        body:    JSON.stringify({
           orientation,
+          orientation_number: orientationNumber,
+          orientation_label:  orientationLabel,
+          is_pickable:        !!isPickable,
+          is_defect:          !!isDefect,
+          defect_name:        defectName        || '',
+          defect_description: defectDescription || '',
+          defect_severity:    defectSeverity    || '',
         }),
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok && data.captured === false) {
-        // Endpoint succeeded but no file appeared — depth_segment_node
-        // didn't have a usable detection. Tell the user to wait.
-        setError('No object captured — make sure the part is in view '
-          + 'and a green box is visible, then try again.')
-      } else if (res.ok && (data.ok || data.status)) {
-        setCaptures(prev => [...prev, {
-          step,
-          angle: (step - 1) * 90,
-          timestamp: Date.now(),
-          teach_count: data.teach_count,
-        }])
-        setFlashGreen(true)
-        setTimeout(() => setFlashGreen(false), 600)
-        ok = true
+        setError('No object captured — make sure a green detection box is visible, then try again.')
+      } else if (res.ok) {
+        onCapture()
       } else {
         setError(data.error || `Capture failed (HTTP ${res.status})`)
       }
@@ -685,932 +643,965 @@ function TeachWizard({ part, onClose, onComplete }) {
       setError(e.message || 'Network error')
     }
     setCapturing(false)
-    return ok
   }
-
-  async function captureDefect() {
-    const name = defectName.trim()
-    if (!name) return
-    setCapturingDefect(true)
-    setError(null)
-    try {
-      const idx = selectedDetection ?? 0
-      const res = await fetch(`/api/parts/${part.id}/teach`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          detection_index:     idx,
-          action:              'teach',
-          part_id:             part.id,
-          // Defect refs ride the same teach endpoint, with extra
-          // metadata that the backend folds into defects.json.
-          // depth_segment_node still writes the .npz so the visual
-          // ref is captured; the matcher will learn to filter on
-          // is_defect once that flow lands.
-          is_defect:           true,
-          defect_name:         name,
-          defect_description:  defectDescription.trim(),
-          defect_severity:     defectSeverity,
-          orientation:         'pickable',  // unused for defects but required by validator
-        }),
-      })
-      const data = await res.json().catch(() => ({}))
-      if (res.ok && data.captured === false) {
-        setError('No object captured — make sure the defective part is in view and a green box is visible.')
-      } else if (res.ok) {
-        // Fold into the running list; same name increments captures,
-        // otherwise append a new entry.
-        setDefectTypes((prev) => {
-          const i = prev.findIndex((d) => d.name.toLowerCase() === name.toLowerCase())
-          if (i >= 0) {
-            const copy = prev.slice()
-            copy[i] = { ...copy[i], capture_count: (copy[i].capture_count || 0) + 1,
-                        description: defectDescription.trim() || copy[i].description,
-                        severity:    defectSeverity }
-            return copy
-          }
-          return [...prev, {
-            name,
-            description:   defectDescription.trim(),
-            severity:      defectSeverity,
-            capture_count: 1,
-          }]
-        })
-        setFlashGreen(true)
-        setTimeout(() => setFlashGreen(false), 600)
-      } else {
-        setError(data.error || `Capture failed (HTTP ${res.status})`)
-      }
-    } catch (e) {
-      setError(e.message || 'Network error')
-    }
-    setCapturingDefect(false)
-  }
-
-  // 0 intro, 1-4 angles, 5 defects-intro, 6 defect-capture, 7 review.
-  const totalSteps = 8
-
-  const stepContent = {
-    0: {
-      title:      'Teach Part Recognition',
-      subtitle:   `Teaching: ${part.name}`,
-      instruction:
-        'This wizard will guide you through teaching the robot to recognise this part. ' +
-        'You will show the part to the camera from 4 different angles so the robot ' +
-        'can identify it reliably.',
-      detail: part.extents_cm
-        ? `Part dimensions: ${part.extents_cm[0]}×${part.extents_cm[1]}×${part.extents_cm[2]} cm`
-        : null,
-      showCamera: false,
-      action: { label: 'Start Teaching →', onClick: () => setStep(1) },
-    },
-    1: {
-      title:       'Angle 1 of 4 — Front (0°)',
-      subtitle:    'Place the part in front of Camera 0',
-      instruction:
-        '1. Place the part on the table in its normal orientation\n' +
-        '2. Make sure the ENTIRE part is visible in the camera\n' +
-        '3. Click on the detection box that matches this part\n' +
-        '4. Then click "Capture" to teach this angle',
-      showCamera: true,
-    },
-    2: {
-      title:       'Angle 2 of 4 — Right (90°)',
-      subtitle:    'Rotate the part 90° clockwise',
-      instruction:
-        '1. Rotate the part approximately 90° clockwise on the table\n' +
-        '2. Wait for the detection box to appear\n' +
-        '3. Click the detection box for this part\n' +
-        '4. Click "Capture"',
-      showCamera: true,
-    },
-    3: {
-      title:       'Angle 3 of 4 — Back (180°)',
-      subtitle:    'Rotate another 90° (now 180° from start)',
-      instruction:
-        '1. Rotate the part another 90° clockwise\n' +
-        '2. The part should now be facing backwards from the starting position\n' +
-        '3. Click the detection box and capture',
-      showCamera: true,
-    },
-    4: {
-      title:       'Angle 4 of 4 — Left (270°)',
-      subtitle:    'Rotate another 90° (now 270° from start)',
-      instruction:
-        '1. Rotate the part one more 90° clockwise\n' +
-        '2. This is the last angle to teach\n' +
-        '3. Click the detection box and capture',
-      showCamera: true,
-    },
-    5: {
-      title:      'Teach Defective Parts?',
-      subtitle:   'Optional — improves quality inspection later',
-      instruction:
-        'You can optionally teach the robot what defective versions of this part ' +
-        'look like. The matcher will then flag matching defective parts so the ' +
-        'task planner can sort them into a reject bin. Skip this step if you ' +
-        'only want to teach good parts.',
-      showCamera: false,
-      // Two-button special case rendered in the non-camera branch.
-      defectsIntro: true,
-    },
-    6: {
-      title:      'Teach Defect',
-      subtitle:   defectTypes.length === 0
-        ? 'Place a defective part in front of Camera 0'
-        : `${defectTypes.length} defect type${defectTypes.length === 1 ? '' : 's'} captured so far`,
-      instruction:
-        '1. Place a defective example of the part in view of Camera 0\n' +
-        '2. Click the detection box that matches it\n' +
-        '3. Name the defect (e.g. "Cracked", "Bent", "Missing hole")\n' +
-        '4. Add a description and pick a severity\n' +
-        '5. Click "Capture Defect"\n' +
-        '6. Repeat for as many defect types as you have, or click Done',
-      showCamera: true,
-      defectCapture: true,
-    },
-    7: {
-      title:    'Teaching Complete!',
-      subtitle: `${captures.length} good angle${captures.length === 1 ? '' : 's'}`
-        + (defectTypes.length > 0 ? ` · ${defectTypes.length} defect type${defectTypes.length === 1 ? '' : 's'}` : '')
-        + ` captured for ${part.name}`,
-      instruction: captures.length >= 3
-        ? 'Teaching was successful. The robot can now recognise this part from ' +
-          'multiple angles. You can close this wizard and test recognition on the ' +
-          'Monitor tab.'
-        : `Only ${captures.length} angle(s) captured. For reliable recognition, ` +
-          'teach at least 3 angles. You can go back and capture more.',
-      showCamera: false,
-      action: {
-        label:   captures.length >= 3 ? 'Done ✓' : 'Close Anyway',
-        onClick: () => { onComplete?.(); onClose?.() },
-      },
-    },
-  }
-
-  const current = stepContent[step] || stepContent[0]
 
   return (
-    <div style={{
-      position: 'absolute', inset: 0,
-      background: 'var(--bg-app)', zIndex: 50,
-      display: 'flex', flexDirection: 'column', overflow: 'hidden',
-    }}>
-      {/* Header */}
+    <div>
       <div style={{
-        padding: '12px 20px', borderBottom: '1px solid var(--border)',
-        display: 'flex', alignItems: 'center', gap: 16,
-        background: 'var(--bg-panel)',
+        width: '100%', borderRadius: 10, overflow: 'hidden',
+        border: `2px solid ${accent}`, marginBottom: 10, background: '#111',
       }}>
-        <button onClick={onClose} style={{
-          background: 'none', border: 'none', cursor: 'pointer',
-          fontSize: 18, color: 'var(--text-muted)', padding: '4px 8px',
-        }}>✕</button>
+        <img src="/stream/annotated" alt="Camera"
+          style={{ width: '100%', display: 'block' }} />
+      </div>
 
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-primary)' }}>
-            {current.title}
-          </div>
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-            {current.subtitle}
-          </div>
-        </div>
-
-        {/* Progress dots */}
-        <div style={{ display: 'flex', gap: 6 }}>
-          {Array.from({ length: totalSteps }).map((_, i) => (
-            <div key={i} style={{
-              width: i === step ? 24 : 8, height: 8, borderRadius: 4,
-              background: i < step ? 'var(--green)'
-                : i === step ? 'var(--accent)'
-                : 'var(--bg-active)',
-              transition: 'all 200ms',
-            }} />
-          ))}
-        </div>
-
+      {(isDefect || !isPickable) && (
         <div style={{
-          fontSize: 12, color: 'var(--text-muted)',
-          minWidth: 80, textAlign: 'right',
-        }}>
-          {captures.length} captured
+          display: 'inline-block', padding: '4px 10px', borderRadius: 4,
+          background: accent, color: '#fff',
+          fontSize: 11, fontWeight: 800, letterSpacing: '0.08em',
+          marginBottom: 10,
+        }}>{isDefect ? 'NON-PICKABLE — DEFECT' : 'NON-PICKABLE'}</div>
+      )}
+
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12,
+        padding: '10px 14px', background: tint,
+        borderRadius: 8, border: `1px solid ${accent}40`,
+      }}>
+        <div style={{
+          fontSize: 28, fontWeight: 800, color: accent,
+          fontVariantNumeric: 'tabular-nums',
+        }}>{captureCount}</div>
+        <div style={{ fontSize: 13, color: '#6b7280' }}>
+          capture{captureCount === 1 ? '' : 's'} taken
+          {captureCount < 2 && (
+            <span style={{ color: accent, fontWeight: 600 }}> — need at least 2</span>
+          )}
         </div>
       </div>
 
-      {/* Body */}
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        {current.showCamera ? (
-          <>
-            {/* Camera + overlay (3/5) */}
+      <div style={{
+        fontSize: 12, color: '#6b7280', lineHeight: 1.7,
+        marginBottom: 12, padding: '10px 14px',
+        background: '#f8fafc', borderRadius: 8, border: '1px solid #e5e7eb',
+      }}>
+        1. Place the part in view of the camera<br/>
+        2. Wait for the green detection box<br/>
+        3. Click <b>Capture</b><br/>
+        4. Rotate slightly and capture again for better recognition
+      </div>
+
+      {error && (
+        <div style={{
+          padding: '8px 12px', marginBottom: 10,
+          background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6,
+          fontSize: 12, color: '#DC2626',
+        }}>{error}</div>
+      )}
+
+      <button onClick={handleCapture} disabled={capturing} style={{
+        width: '100%', padding: '16px', fontSize: 16, fontWeight: 700,
+        background: capturing ? '#9ca3af' : accent, color: '#fff',
+        border: 'none', borderRadius: 10, cursor: capturing ? 'wait' : 'pointer',
+        minHeight: 48,
+      }}>
+        {capturing ? 'Capturing...' : 'Capture'}
+      </button>
+    </div>
+  )
+}
+
+const MAX_PICKABLE     = 6
+const MAX_NON_PICKABLE = 5
+
+const PAGES = [
+  // 0. Part name (skip when teaching an existing part)
+  {
+    id: 'part_name',
+    skip: (a) => !!a.part_id,
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="What is this part called?"
+        description="Give it a name you'll recognize in the parts library."
+      >
+        <input
+          autoFocus
+          value={answers.part_name || ''}
+          onChange={(e) => setAnswer('part_name', e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && answers.part_name?.trim()) goNext() }}
+          placeholder="e.g. M6 hex bolt"
+          style={{
+            width: '100%', padding: '14px 16px', fontSize: 17, fontWeight: 600,
+            border: '2px solid #2563EB', borderRadius: 10, outline: 'none',
+            boxSizing: 'border-box',
+          }}
+        />
+        <NextButton onClick={goNext} disabled={!answers.part_name?.trim()} />
+      </QuestionCard>
+    ),
+  },
+
+  // 1. Part description
+  {
+    id: 'part_description',
+    skip: (a) => !!a.part_id,
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="Describe this part briefly"
+        description="This helps operators identify it. For example: small steel bracket with two mounting holes."
+      >
+        <textarea
+          autoFocus
+          value={answers.part_description || ''}
+          onChange={(e) => setAnswer('part_description', e.target.value)}
+          rows={2}
+          placeholder="e.g. Small steel bracket with two mounting holes"
+          style={{
+            width: '100%', padding: '12px 14px', fontSize: 14,
+            border: '2px solid #e5e7eb', borderRadius: 10, outline: 'none',
+            resize: 'vertical', fontFamily: 'inherit', boxSizing: 'border-box',
+          }}
+        />
+        <NextButton onClick={goNext} />
+      </QuestionCard>
+    ),
+  },
+
+  // 2. Has STEP?
+  {
+    id: 'has_step',
+    skip: (a) => !!a.part_id,
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="Do you have a 3D model (STEP file) for this part?"
+        description="A STEP file gives exact dimensions and enables automatic template generation. If you don't have one, the system will learn from camera captures only."
+      >
+        <ChoiceButton
+          label="Yes — upload STEP file"
+          description="Best accuracy. Provides dimensions and a 3D preview."
+          selected={answers.has_step === true}
+          onClick={() => { setAnswer('has_step', true); goNext() }}
+        />
+        <ChoiceButton
+          label="No — teach from camera only"
+          description="Skip the STEP upload and teach the robot purely from camera captures."
+          selected={answers.has_step === false}
+          onClick={() => { setAnswer('has_step', false); goNext() }}
+        />
+      </QuestionCard>
+    ),
+  },
+
+  // 3. STEP upload
+  {
+    id: 'step_upload',
+    skip: (a) => !!a.part_id || a.has_step !== true,
+    render: ({ answers, setAnswer, goNext }) => {
+      const [uploading, setUploading] = useState(false)
+      const [err, setErr]             = useState(null)
+      const inputRef                  = useRef(null)
+
+      const upload = async (file) => {
+        if (!file) return
+        if (!/\.(step|stp)$/i.test(file.name)) {
+          setErr('Only .STEP / .STP files are accepted')
+          return
+        }
+        setUploading(true); setErr(null)
+        try {
+          const fd = new FormData()
+          fd.append('file', file)
+          const r = await fetch('/api/parts/upload', { method: 'POST', body: fd })
+          const d = await r.json()
+          if (!r.ok || !d.ok) {
+            setErr(d.error || 'Upload failed')
+          } else {
+            setAnswer('part_id',     d.part_id)
+            setAnswer('part_name',   d.name || answers.part_name)
+            setAnswer('step_file_id', d.part_id)
+            setAnswer('dimensions',  d.extents_cm)
+            setAnswer('stl_url',     d.stl_url)
+          }
+        } catch (e) {
+          setErr(String(e.message || e))
+        } finally {
+          setUploading(false)
+        }
+      }
+
+      const dims = answers.dimensions
+      return (
+        <QuestionCard
+          question="Upload the STEP file"
+          description="Drag and drop or click to browse. The system will extract dimensions and generate recognition templates."
+        >
+          <div
+            onClick={() => !uploading && inputRef.current?.click()}
+            onDrop={(e) => { e.preventDefault(); upload(e.dataTransfer.files?.[0]) }}
+            onDragOver={(e) => e.preventDefault()}
+            style={{
+              padding: 32, textAlign: 'center', cursor: uploading ? 'wait' : 'pointer',
+              border: '2px dashed #93c5fd', borderRadius: 12,
+              background: '#f0f9ff', color: '#2563EB',
+              fontSize: 15, fontWeight: 600, marginBottom: 12, minHeight: 100,
+            }}
+          >
+            {uploading
+              ? 'Processing STEP file...'
+              : answers.part_id
+                ? '+ STEP uploaded — click to replace'
+                : 'Click to browse, or drop a .STEP file here'}
+          </div>
+          <input ref={inputRef} type="file" accept=".step,.stp,.STEP,.STP"
+            style={{ display: 'none' }}
+            onChange={(e) => upload(e.target.files?.[0])}
+          />
+
+          {err && (
             <div style={{
-              flex: 3, position: 'relative', background: '#111',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              border: flashGreen ? '4px solid var(--green)' : '4px solid transparent',
-              transition: 'border-color 200ms',
-            }}>
-              <img
-                ref={imgRef}
-                src="/stream/cam0"
-                alt="cam0"
-                style={{
-                  width: '100%', height: '100%', objectFit: 'contain',
-                }}
-                onLoad={() => {
-                  // Trigger a re-measure once the MJPEG kicks off.
-                  const el = imgRef.current
-                  if (!el?.parentElement) return
-                  const c = el.parentElement.getBoundingClientRect()
-                  const scale = Math.min(c.width / 640, c.height / 480)
-                  setImgBounds({
-                    w: 640 * scale, h: 480 * scale,
-                    offX: (c.width - 640 * scale) / 2,
-                    offY: (c.height - 480 * scale) / 2,
-                  })
-                }}
-              />
+              padding: '8px 12px', marginBottom: 10,
+              background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6,
+              fontSize: 12, color: '#DC2626',
+            }}>{err}</div>
+          )}
 
-              {/* Detection overlay — clickable boxes positioned against
-                  the actual drawn image area (object-fit:contain leaves
-                  letterbox margins on whichever axis isn't constrained). */}
-              {liveDetections.map((det, i) => {
-                const bp = det.bbox_px
-                if (!bp || bp.length < 4) return null
-                const [x1, y1, x2, y2] = bp
-                const left   = imgBounds.offX + (x1 / 640) * imgBounds.w
-                const top    = imgBounds.offY + (y1 / 480) * imgBounds.h
-                const width  = ((x2 - x1) / 640) * imgBounds.w
-                const height = ((y2 - y1) / 480) * imgBounds.h
-                const isSelected = selectedDetection === i
-                return (
-                  <div
-                    key={i}
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      setSelectedDet(isSelected ? null : i)
-                    }}
-                    style={{
-                      position: 'absolute',
-                      left:   `${left}px`,
-                      top:    `${top}px`,
-                      width:  `${width}px`,
-                      height: `${height}px`,
-                      border:    isSelected ? '3px solid #3B82F6' : '2px solid #22C55E',
-                      background: isSelected ? 'rgba(59,130,246,0.20)' : 'rgba(34,197,94,0.08)',
-                      borderRadius: 4, cursor: 'pointer',
-                      transition: 'border-color 150ms, background 150ms',
-                      zIndex: 10,
-                      pointerEvents: 'auto',
-                    }}
-                  >
-                    {isSelected && (
-                      <div style={{
-                        position: 'absolute', top: -22, left: 0,
-                        background: '#3B82F6', color: '#fff',
-                        fontSize: 10, fontWeight: 600,
-                        padding: '2px 8px', borderRadius: 4, whiteSpace: 'nowrap',
-                      }}>
-                        ✓ Selected
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
-
-              {liveDetections.length === 0 && (
-                <div style={{
-                  position: 'absolute', bottom: 20, left: '50%',
-                  transform: 'translateX(-50%)',
-                  background: 'rgba(0,0,0,0.7)', color: '#FCD34D',
-                  padding: '8px 16px', borderRadius: 8, fontSize: 13,
-                }}>
-                  No objects detected — place the part in view of Camera 0
-                </div>
-              )}
-
-              {flashGreen && (
-                <div style={{
-                  position: 'absolute',
-                  top: '50%', left: '50%',
-                  transform: 'translate(-50%, -50%)',
-                  background: 'rgba(22, 163, 74, 0.9)',
-                  color: '#fff',
-                  fontSize: 24, fontWeight: 700,
-                  padding: '16px 32px', borderRadius: 12, zIndex: 60,
-                }}>
-                  ✓ Captured!
-                </div>
-              )}
-            </div>
-
-            {/* Right panel — instructions + capture (2/5) */}
+          {dims && (
             <div style={{
-              flex: 2, padding: 24,
-              display: 'flex', flexDirection: 'column', gap: 16,
-              background: 'var(--bg-panel)', borderLeft: '1px solid var(--border)',
+              padding: 14, background: '#f0fdf4', border: '1px solid #bbf7d0',
+              borderRadius: 10, marginBottom: 12,
             }}>
-              {/* Angle indicator */}
-              <div style={{ display: 'flex', justifyContent: 'center', gap: 12 }}>
-                {[0, 90, 180, 270].map((angle, i) => {
-                  const stepNum  = i + 1
-                  const captured = captures.some(c => c.step === stepNum)
-                  const isCurrent = step === stepNum
-                  return (
-                    <div key={angle} style={{
-                      width: 56, height: 56, borderRadius: '50%',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      background: captured ? 'var(--green-dim)'
-                        : isCurrent ? 'var(--accent-dim)'
-                        : 'var(--bg-surface)',
-                      border: captured ? '2px solid var(--green)'
-                        : isCurrent ? '2px solid var(--accent)'
-                        : '2px solid var(--border)',
-                    }}>
-                      <div style={{
-                        fontSize: 14, fontWeight: 700,
-                        color: captured ? 'var(--green)'
-                          : isCurrent ? 'var(--accent)'
-                          : 'var(--text-muted)',
-                      }}>
-                        {captured ? '✓' : `${angle}°`}
-                      </div>
-                    </div>
-                  )
-                })}
+              <div style={{ fontSize: 13, fontWeight: 600, color: '#16A34A', marginBottom: 4 }}>
+                Dimensions extracted
               </div>
+              <div style={{ fontSize: 13, color: '#374151', fontFamily: 'monospace' }}>
+                {Number(dims[0]).toFixed(1)} × {Number(dims[1]).toFixed(1)} × {Number(dims[2]).toFixed(1)} cm
+              </div>
+            </div>
+          )}
 
-              {/* Instructions */}
-              <div style={{
-                background: 'var(--bg-surface)',
-                borderRadius: 'var(--radius-md)', padding: 16,
-              }}>
-                <div style={{
-                  fontSize: 13, fontWeight: 600,
-                  color: 'var(--text-primary)', marginBottom: 8,
+          <NextButton onClick={goNext} disabled={!answers.part_id} />
+        </QuestionCard>
+      )
+    },
+  },
+
+  // 4. Pickable count
+  {
+    id: 'pickable_count',
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="How many ways can the robot pick up this part?"
+        description="Think about all the positions where the gripper can safely grab the part. A simple cube has 3 pickable faces. A bracket might only have 1 or 2."
+      >
+        <div style={{
+          padding: 12, background: '#f8fafc', borderRadius: 8,
+          border: '1px solid #e5e7eb', marginBottom: 16,
+          fontSize: 13, color: '#374151', lineHeight: 1.6,
+        }}>
+          <div><b>1 orientation</b> — part can only be picked one way (e.g. always right-side up)</div>
+          <div><b>2 orientations</b> — part can be picked two ways (e.g. right-side up or on its side)</div>
+          <div><b>3+ orientations</b> — part has multiple stable pickable positions</div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+          {[1, 2, 3, 4, 5, 6].map((n) => {
+            const selected = answers.pickable_count === n
+            return (
+              <button key={n}
+                onClick={() => {
+                  setAnswer('pickable_count', n)
+                  const labels = (answers.pickable_labels || []).slice(0, n)
+                  while (labels.length < n) labels.push('')
+                  setAnswer('pickable_labels', labels)
+                  goNext()
+                }}
+                style={{
+                  padding: '18px', fontSize: 22, fontWeight: 700,
+                  background: selected ? '#16A34A' : '#fff',
+                  color:      selected ? '#fff'    : '#111',
+                  border:     selected ? '2px solid #16A34A' : '2px solid #e5e7eb',
+                  borderRadius: 10, cursor: 'pointer', minHeight: 56,
+                }}>{n}</button>
+            )
+          })}
+        </div>
+      </QuestionCard>
+    ),
+  },
+
+  // 5..16. Per-pickable-orientation NAME then CAPTURE pages
+  ...Array.from({ length: MAX_PICKABLE }, (_, i) => ([
+    {
+      id: `pickable_name_${i}`,
+      skip: (a) => (a.pickable_count || 0) <= i,
+      render: ({ answers, setAnswer, goNext }) => {
+        const labels = answers.pickable_labels || []
+        const value  = labels[i] || ''
+        const update = (v) => {
+          const next = labels.slice()
+          next[i] = v
+          setAnswer('pickable_labels', next)
+        }
+        return (
+          <QuestionCard
+            question={`Describe pickable orientation ${i + 1}`}
+            description="What does the part look like in this position? For example: 'Right side up — holes facing up' or 'Flat on table — logo visible'"
+          >
+            <input
+              autoFocus
+              value={value}
+              onChange={(e) => update(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && value.trim()) goNext() }}
+              placeholder="e.g. Right side up, holes facing up"
+              style={{
+                width: '100%', padding: '14px 16px', fontSize: 16, fontWeight: 600,
+                border: '2px solid #16A34A', borderRadius: 10, outline: 'none',
+                boxSizing: 'border-box',
+              }}
+            />
+            <NextButton onClick={goNext} disabled={!value.trim()} color="#16A34A" />
+          </QuestionCard>
+        )
+      },
+    },
+    {
+      id: `pickable_capture_${i}`,
+      skip: (a) => (a.pickable_count || 0) <= i,
+      render: ({ answers, setAnswer, goNext }) => {
+        const label  = answers.pickable_labels?.[i] || ''
+        const counts = answers.pickable_captures || []
+        const count  = counts[i] || 0
+        const bump = () => {
+          const next = counts.slice()
+          next[i] = (next[i] || 0) + 1
+          setAnswer('pickable_captures', next)
+        }
+        return (
+          <QuestionCard
+            question={`Capture: ${label || 'Pickable orientation ' + (i + 1)}`}
+            description="Place the part in this orientation in front of the camera. Rotate it to different angles and capture multiple views. More captures = better recognition."
+          >
+            <CaptureView
+              partId={answers.part_id}
+              orientation="pickable"
+              orientationNumber={i}
+              orientationLabel={label}
+              isPickable={true}
+              isDefect={false}
+              onCapture={bump}
+              captureCount={count}
+            />
+            <NextButton onClick={goNext} disabled={count < 2} color="#16A34A"
+              label={count < 2 ? `Need ${2 - count} more capture${2 - count === 1 ? '' : 's'}` : 'Next'} />
+          </QuestionCard>
+        )
+      },
+    },
+  ])).flat(),
+
+  // 17. Non-pickable count
+  {
+    id: 'non_pickable_count',
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="How many non-pickable orientations do you want to teach?"
+        description="Non-pickable means the robot should NOT try to grab it in this position. For example: upside down, balanced on an edge, or standing up. Teaching these helps the robot recognize them and either skip the part or flip it first."
+      >
+        <div style={{
+          padding: 12, background: '#fffbeb', borderRadius: 8,
+          border: '1px solid #fde68a', marginBottom: 16,
+          fontSize: 13, color: '#92400E',
+        }}>
+          You can also skip this — the robot will only pick parts matching the pickable orientations you just taught.
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+          {[0, 1, 2, 3, 4, 5].map((n) => {
+            const selected = answers.non_pickable_count === n
+            return (
+              <button key={n}
+                onClick={() => {
+                  setAnswer('non_pickable_count', n)
+                  const labels = (answers.non_pickable_labels || []).slice(0, n)
+                  while (labels.length < n) labels.push('')
+                  setAnswer('non_pickable_labels', labels)
+                  goNext()
+                }}
+                style={{
+                  padding: '18px', fontSize: 22, fontWeight: 700,
+                  background: selected ? '#CA8A04' : '#fff',
+                  color:      selected ? '#fff'    : '#111',
+                  border:     selected ? '2px solid #CA8A04' : '2px solid #e5e7eb',
+                  borderRadius: 10, cursor: 'pointer', minHeight: 56,
+                }}>{n === 0 ? 'Skip' : n}</button>
+            )
+          })}
+        </div>
+      </QuestionCard>
+    ),
+  },
+
+  // 18..27. Per-non-pickable NAME then CAPTURE
+  ...Array.from({ length: MAX_NON_PICKABLE }, (_, i) => ([
+    {
+      id: `non_pickable_name_${i}`,
+      skip: (a) => (a.non_pickable_count || 0) <= i,
+      render: ({ answers, setAnswer, goNext }) => {
+        const labels = answers.non_pickable_labels || []
+        const value  = labels[i] || ''
+        const update = (v) => {
+          const next = labels.slice()
+          next[i] = v
+          setAnswer('non_pickable_labels', next)
+        }
+        return (
+          <QuestionCard
+            question={`Describe non-pickable orientation ${i + 1}`}
+            description="What does the part look like in this position? The robot will learn NOT to pick it this way."
+          >
+            <input
+              autoFocus
+              value={value}
+              onChange={(e) => update(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && value.trim()) goNext() }}
+              placeholder="e.g. Upside down, Balanced on edge, Standing vertical"
+              style={{
+                width: '100%', padding: '14px 16px', fontSize: 16, fontWeight: 600,
+                border: '2px solid #CA8A04', borderRadius: 10, outline: 'none',
+                boxSizing: 'border-box',
+              }}
+            />
+            <NextButton onClick={goNext} disabled={!value.trim()} color="#CA8A04" />
+          </QuestionCard>
+        )
+      },
+    },
+    {
+      id: `non_pickable_capture_${i}`,
+      skip: (a) => (a.non_pickable_count || 0) <= i,
+      render: ({ answers, setAnswer, goNext }) => {
+        const label  = answers.non_pickable_labels?.[i] || ''
+        const counts = answers.non_pickable_captures || []
+        const count  = counts[i] || 0
+        const bump = () => {
+          const next = counts.slice()
+          next[i] = (next[i] || 0) + 1
+          setAnswer('non_pickable_captures', next)
+        }
+        return (
+          <QuestionCard
+            question={`Capture: ${label} (Non-pickable)`}
+            description="Place the part in this NON-PICKABLE orientation. The robot will learn to recognize this and avoid picking it."
+          >
+            <CaptureView
+              partId={answers.part_id}
+              orientation="non_pickable"
+              orientationNumber={i}
+              orientationLabel={label}
+              isPickable={false}
+              isDefect={false}
+              onCapture={bump}
+              captureCount={count}
+            />
+            <NextButton onClick={goNext} disabled={count < 2} color="#CA8A04"
+              label={count < 2 ? `Need ${2 - count} more capture${2 - count === 1 ? '' : 's'}` : 'Next'} />
+          </QuestionCard>
+        )
+      },
+    },
+  ])).flat(),
+
+  // 28. Teach defects?
+  {
+    id: 'teach_defects',
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="Do you want to teach defective versions of this part?"
+        description="If this part has known defects (cracks, bends, missing features), you can teach what they look like. The robot will flag defective parts during operation."
+      >
+        <ChoiceButton
+          label="Yes — teach defects"
+          description="Walk through each defect type one at a time."
+          selected={answers.teach_defects === true}
+          onClick={() => { setAnswer('teach_defects', true); goNext() }}
+          accent="#DC2626"
+        />
+        <ChoiceButton
+          label="No — skip"
+          description="No defect references will be taught. You can come back later."
+          selected={answers.teach_defects === false}
+          onClick={() => { setAnswer('teach_defects', false); goNext() }}
+        />
+      </QuestionCard>
+    ),
+  },
+
+  // 29. Defect name
+  {
+    id: 'defect_name',
+    skip: (a) => a.teach_defects !== true,
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="What is this defect called?"
+        description="Short, memorable name. You'll see this name in the operator's reject log."
+      >
+        <input
+          autoFocus
+          value={answers.cur_defect_name || ''}
+          onChange={(e) => setAnswer('cur_defect_name', e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && answers.cur_defect_name?.trim()) goNext() }}
+          placeholder="e.g. Cracked, Bent, Missing hole, Scratched"
+          style={{
+            width: '100%', padding: '14px 16px', fontSize: 16, fontWeight: 600,
+            border: '2px solid #DC2626', borderRadius: 10, outline: 'none',
+            boxSizing: 'border-box',
+          }}
+        />
+        <NextButton onClick={goNext} disabled={!answers.cur_defect_name?.trim()} color="#DC2626" />
+      </QuestionCard>
+    ),
+  },
+
+  // 30. Defect description
+  {
+    id: 'defect_description',
+    skip: (a) => a.teach_defects !== true,
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="Describe what this defect looks like"
+        description="Be specific — operators will read this when triaging the reject bin."
+      >
+        <textarea
+          autoFocus
+          value={answers.cur_defect_description || ''}
+          onChange={(e) => setAnswer('cur_defect_description', e.target.value)}
+          rows={3}
+          placeholder="e.g. Visible crack on the top surface near the left mounting hole"
+          style={{
+            width: '100%', padding: '12px 14px', fontSize: 14,
+            border: '2px solid #e5e7eb', borderRadius: 10, outline: 'none',
+            resize: 'vertical', fontFamily: 'inherit', boxSizing: 'border-box',
+          }}
+        />
+        <NextButton onClick={goNext} color="#DC2626" />
+      </QuestionCard>
+    ),
+  },
+
+  // 31. Defect severity
+  {
+    id: 'defect_severity',
+    skip: (a) => a.teach_defects !== true,
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="How serious is this defect?"
+        description="Determines how the robot handles it during operation."
+      >
+        <ChoiceButton
+          label="Reject"
+          description="Part must be removed, cannot be used."
+          selected={answers.cur_defect_severity === 'reject'}
+          onClick={() => { setAnswer('cur_defect_severity', 'reject'); goNext() }}
+          accent="#DC2626"
+        />
+        <ChoiceButton
+          label="Warning"
+          description="Part is borderline — operator should inspect."
+          selected={answers.cur_defect_severity === 'warning'}
+          onClick={() => { setAnswer('cur_defect_severity', 'warning'); goNext() }}
+          accent="#CA8A04"
+        />
+        <ChoiceButton
+          label="Cosmetic"
+          description="Minor visual issue, part still functional."
+          selected={answers.cur_defect_severity === 'cosmetic'}
+          onClick={() => { setAnswer('cur_defect_severity', 'cosmetic'); goNext() }}
+        />
+      </QuestionCard>
+    ),
+  },
+
+  // 32. Defect capture
+  {
+    id: 'defect_capture',
+    skip: (a) => a.teach_defects !== true,
+    render: ({ answers, setAnswer, goNext, goTo }) => {
+      const name  = answers.cur_defect_name || ''
+      const count = answers.cur_defect_capture_count || 0
+      const bump  = () => setAnswer('cur_defect_capture_count', count + 1)
+
+      const folder = () => {
+        const defects = answers.defects || []
+        const next = defects.concat([{
+          name,
+          description:   answers.cur_defect_description || '',
+          severity:      answers.cur_defect_severity || 'reject',
+          capture_count: count,
+        }])
+        setAnswer('defects', next)
+        setAnswer('cur_defect_name', '')
+        setAnswer('cur_defect_description', '')
+        setAnswer('cur_defect_severity', 'reject')
+        setAnswer('cur_defect_capture_count', 0)
+      }
+
+      const addAnother      = () => { folder(); goTo('defect_name') }
+      const doneWithDefects = () => { folder(); goNext() }
+
+      return (
+        <QuestionCard
+          question={`Capture: ${name}`}
+          description="Place a defective part showing this defect in front of the camera."
+        >
+          <CaptureView
+            partId={answers.part_id}
+            orientation="non_pickable"
+            orientationNumber={(answers.defects || []).length}
+            orientationLabel={name}
+            isPickable={false}
+            isDefect={true}
+            defectName={name}
+            defectDescription={answers.cur_defect_description || ''}
+            defectSeverity={answers.cur_defect_severity || 'reject'}
+            onCapture={bump}
+            captureCount={count}
+          />
+
+          <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+            <button onClick={addAnother} disabled={count < 2}
+              style={{
+                flex: 1, padding: '14px', fontSize: 14, fontWeight: 700,
+                background: count < 2 ? '#f3f4f6' : '#fff',
+                color:      count < 2 ? '#9ca3af' : '#DC2626',
+                border:     count < 2 ? '2px solid #e5e7eb' : '2px solid #DC2626',
+                borderRadius: 10, cursor: count < 2 ? 'default' : 'pointer',
+                minHeight: 44,
+              }}>+ Add another defect</button>
+            <button onClick={doneWithDefects} disabled={count < 2}
+              style={{
+                flex: 1, padding: '14px', fontSize: 14, fontWeight: 700,
+                background: count < 2 ? '#d1d5db' : '#16A34A', color: '#fff',
+                border: 'none', borderRadius: 10,
+                cursor: count < 2 ? 'default' : 'pointer',
+                minHeight: 44,
+              }}>Done — Review</button>
+          </div>
+        </QuestionCard>
+      )
+    },
+  },
+
+  // 33. Review + save
+  {
+    id: 'review',
+    render: ({ answers, saving, onSave, goTo }) => {
+      const pickable = (answers.pickable_labels || []).slice(0, answers.pickable_count || 0)
+      const pickCaps = answers.pickable_captures || []
+      const nonPick  = (answers.non_pickable_labels || []).slice(0, answers.non_pickable_count || 0)
+      const nonCaps  = answers.non_pickable_captures || []
+      const defects  = answers.defects || []
+      const total = pickCaps.reduce((a, b) => a + (b || 0), 0)
+                  + nonCaps.reduce((a, b) => a + (b || 0), 0)
+                  + defects.reduce((a, d) => a + (d.capture_count || 0), 0)
+
+      return (
+        <QuestionCard
+          question="Review your part teaching"
+          description={`${answers.part_name || 'Unnamed part'} — ${total} total capture${total === 1 ? '' : 's'}`}
+        >
+          {answers.part_description && (
+            <div style={{
+              fontSize: 13, color: '#374151', marginBottom: 12,
+              padding: '10px 14px', background: '#f8fafc',
+              borderRadius: 8, border: '1px solid #e5e7eb',
+            }}>{answers.part_description}</div>
+          )}
+
+          {answers.dimensions && answers.dimensions[0] > 0 && (
+            <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 12 }}>
+              STEP dimensions: {Number(answers.dimensions[0]).toFixed(1)} × {Number(answers.dimensions[1]).toFixed(1)} × {Number(answers.dimensions[2]).toFixed(1)} cm
+            </div>
+          )}
+
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: '#16A34A', marginBottom: 6 }}>
+              Pickable orientations
+            </div>
+            {pickable.length === 0 && (
+              <div style={{ fontSize: 12, color: '#9ca3af' }}>None taught</div>
+            )}
+            {pickable.map((label, i) => {
+              const c = pickCaps[i] || 0
+              const ok = c >= 2
+              return (
+                <div key={i} style={{
+                  display: 'flex', justifyContent: 'space-between',
+                  padding: '8px 12px', marginBottom: 4,
+                  background: '#f0fdf4', border: '1px solid #bbf7d0',
+                  borderRadius: 6, fontSize: 13,
                 }}>
-                  Instructions
+                  <span style={{ color: '#16A34A', fontWeight: 600 }}>
+                    {label || `(unnamed ${i + 1})`} {ok ? '✓' : ''}
+                  </span>
+                  <span style={{ color: '#6b7280' }}>{c} capture{c === 1 ? '' : 's'}</span>
                 </div>
-                {current.instruction.split('\n').map((line, i) => (
+              )
+            })}
+          </div>
+
+          {nonPick.length > 0 && (
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: '#CA8A04', marginBottom: 6 }}>
+                Non-pickable orientations
+              </div>
+              {nonPick.map((label, i) => {
+                const c = nonCaps[i] || 0
+                return (
                   <div key={i} style={{
-                    fontSize: 12, color: 'var(--text-secondary)',
-                    marginBottom: 4,
+                    display: 'flex', justifyContent: 'space-between',
+                    padding: '8px 12px', marginBottom: 4,
+                    background: '#fffbeb', border: '1px solid #fde68a',
+                    borderRadius: 6, fontSize: 13,
                   }}>
-                    {line}
+                    <span style={{ color: '#92400E', fontWeight: 600 }}>{label}</span>
+                    <span style={{ color: '#6b7280' }}>{c} capture{c === 1 ? '' : 's'}</span>
                   </div>
-                ))}
-              </div>
-
-              <div style={{
-                background: 'var(--accent-dim)',
-                border: '1px solid var(--accent-border)',
-                borderRadius: 'var(--radius-md)', padding: 12,
-                fontSize: 12, color: 'var(--accent)',
-              }}>
-                💡 Place the part 40–60 cm from the camera for best results.
-                The distance will be recorded as a reference.
-              </div>
-
-              {error && (
-                <div style={{
-                  background: 'var(--red-dim)', border: '1px solid var(--red)',
-                  borderRadius: 'var(--radius-md)', padding: 12,
-                  fontSize: 12, color: 'var(--red)',
-                }}>
-                  {error}
-                </div>
-              )}
-
-              {/* Orientation selector — operator picks how the part is
-                  currently presented so the robot knows whether it can
-                  be picked directly, must be flipped first, or has
-                  fallen on its side. The tag rides along on the teach
-                  POST and is stored in the .npz; the matcher returns it
-                  alongside the match so the task planner can branch. */}
-              <div style={{
-                display: 'flex', flexDirection: 'column', gap: 6,
-                background: 'var(--bg-surface)', borderRadius: 'var(--radius-md)',
-                padding: 12,
-              }}>
-                <div style={{
-                  fontSize: 12, fontWeight: 600,
-                  color: 'var(--text-primary)',
-                }}>
-                  Part orientation
-                </div>
-                <div style={{ display: 'flex', gap: 6 }}>
-                  {[
-                    { id: 'pickable', label: 'Pickable',  hint: 'Ready to grasp' },
-                    { id: 'flipped',  label: 'Flipped',   hint: 'Upside-down'    },
-                    { id: 'on_side',  label: 'On Side',   hint: 'Lying on side'  },
-                  ].map(opt => {
-                    const active = orientation === opt.id
-                    return (
-                      <button
-                        key={opt.id}
-                        onClick={() => setOrientation(opt.id)}
-                        title={opt.hint}
-                        style={{
-                          flex: 1,
-                          padding: '8px 6px',
-                          fontSize: 12,
-                          fontWeight: active ? 700 : 500,
-                          background: active ? 'var(--accent)' : 'var(--bg-panel)',
-                          color: active ? '#fff' : 'var(--text-secondary)',
-                          border: active
-                            ? '1px solid var(--accent)'
-                            : '1px solid var(--border)',
-                          borderRadius: 'var(--radius-md)',
-                          cursor: 'pointer',
-                        }}
-                      >
-                        {opt.label}
-                      </button>
-                    )
-                  })}
-                </div>
-              </div>
-
-              {/* BIG CAPTURE BUTTON — prominent, centred. Enabled as
-                  soon as we have any detections (no need to click a
-                  box first); selecting a box just overrides which
-                  detection index is captured. */}
-              <div style={{
-                padding: '16px 24px',
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'center',
-                gap: 12,
-              }}>
-                <div style={{
-                  fontSize: 14,
-                  fontWeight: 600,
-                  color: 'var(--text-primary)',
-                }}>
-                  Step {step} of 4 — {['', 'Front (0°)', 'Right (90°)', 'Back (180°)', 'Left (270°)'][step]}
-                </div>
-
-                {(() => {
-                  const hasDetections = liveDetections.length > 0
-                  const canCapture    = hasDetections && !capturing
-                  const doCapture = async () => {
-                    const idx = selectedDetection ?? 0
-                    const ok = await captureTeach(idx)
-                    if (ok) {
-                      setSelectedDet(null)
-                      if (step < 4) setTimeout(() => setStep(step + 1), 800)
-                      else setStep(5)
-                    }
-                  }
-                  return (
-                    <>
-                      <button
-                        onClick={() => { if (canCapture) doCapture() }}
-                        disabled={!canCapture}
-                        style={{
-                          padding: '16px 36px',
-                          fontSize: 15,
-                          fontWeight: 700,
-                          background: canCapture ? 'var(--accent)' : 'var(--bg-surface)',
-                          color: canCapture ? '#fff' : 'var(--text-muted)',
-                          border: 'none',
-                          borderRadius: 'var(--radius-lg)',
-                          cursor: canCapture ? 'pointer' : 'not-allowed',
-                          boxShadow: canCapture ? '0 4px 12px rgba(29,111,216,0.35)' : 'none',
-                          minWidth: 260,
-                          transition: 'all 150ms',
-                        }}
-                      >
-                        {capturing
-                          ? '⏳ Capturing…'
-                          : !hasDetections
-                            ? 'Waiting for object…'
-                            : selectedDetection !== null
-                              ? `📸 Capture Selected (Angle ${step}/4)`
-                              : `📸 Capture Nearest (Angle ${step}/4)`}
-                      </button>
-
-                      <div style={{
-                        fontSize: 12,
-                        color: 'var(--text-muted)',
-                        textAlign: 'center',
-                        maxWidth: 280,
-                      }}>
-                        {!hasDetections
-                          ? 'Place the part in front of Camera 0. Detection boxes appear here when one is seen.'
-                          : selectedDetection !== null
-                            ? 'Click the box again to deselect, or tap Capture.'
-                            : `${liveDetections.length} object${liveDetections.length === 1 ? '' : 's'} detected — tap a green box to choose, or just press Capture to teach the nearest.`}
-                      </div>
-                    </>
-                  )
-                })()}
-              </div>
-
-              {/* Navigation */}
-              <div style={{ display: 'flex', gap: 8, marginTop: 'auto' }}>
-                {step > 1 && (
-                  <button
-                    onClick={() => setStep(step - 1)}
-                    style={{
-                      padding: '8px 16px', fontSize: 12,
-                      background: 'var(--bg-surface)', color: 'var(--text-secondary)',
-                      border: '1px solid var(--border)',
-                      borderRadius: 'var(--radius-md)', cursor: 'pointer',
-                    }}
-                  >
-                    ← Back
-                  </button>
-                )}
-                <button
-                  onClick={() => step < 7 ? setStep(step + 1) : (onComplete?.(), onClose?.())}
-                  style={{
-                    padding: '8px 16px', fontSize: 12,
-                    background: 'transparent', color: 'var(--text-muted)',
-                    border: '1px solid var(--border)',
-                    borderRadius: 'var(--radius-md)', cursor: 'pointer',
-                    marginLeft: 'auto',
-                  }}
-                >
-                  {step < 4 ? 'Skip this angle →' : step === 4 ? 'Continue →' : 'Close'}
-                </button>
-              </div>
-            </div>
-          </>
-        ) : current.defectCapture ? (
-          /* Defect capture — same camera as steps 1-4, different right
-             panel. We re-use the camera + detection overlay above by
-             rendering them again here; React doesn't mind. */
-          <>
-            <div style={{
-              flex: 3, position: 'relative', background: '#111',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              border: flashGreen ? '4px solid var(--red)' : '4px solid transparent',
-              transition: 'border-color 200ms',
-            }}>
-              <img
-                ref={imgRef}
-                src="/stream/cam0"
-                alt="cam0"
-                style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-                onLoad={() => {
-                  const el = imgRef.current
-                  if (!el?.parentElement) return
-                  const c = el.parentElement.getBoundingClientRect()
-                  const scale = Math.min(c.width / 640, c.height / 480)
-                  setImgBounds({
-                    w: 640 * scale, h: 480 * scale,
-                    offX: (c.width - 640 * scale) / 2,
-                    offY: (c.height - 480 * scale) / 2,
-                  })
-                }}
-              />
-              {liveDetections.map((det, i) => {
-                const bp = det.bbox_px
-                if (!bp || bp.length < 4) return null
-                const [x1, y1, x2, y2] = bp
-                const left   = imgBounds.offX + (x1 / 640) * imgBounds.w
-                const top    = imgBounds.offY + (y1 / 480) * imgBounds.h
-                const width  = ((x2 - x1) / 640) * imgBounds.w
-                const height = ((y2 - y1) / 480) * imgBounds.h
-                const isSelected = selectedDetection === i
-                return (
-                  <div
-                    key={i}
-                    onClick={(e) => { e.stopPropagation(); setSelectedDet(isSelected ? null : i) }}
-                    style={{
-                      position: 'absolute',
-                      left: `${left}px`, top: `${top}px`,
-                      width: `${width}px`, height: `${height}px`,
-                      border:    isSelected ? '3px solid #3B82F6' : '2px solid #DC2626',
-                      background: isSelected ? 'rgba(59,130,246,0.20)' : 'rgba(220,38,38,0.08)',
-                      borderRadius: 4, cursor: 'pointer',
-                      zIndex: 10, pointerEvents: 'auto',
-                    }}
-                  />
                 )
               })}
-              {liveDetections.length === 0 && (
-                <div style={{
-                  position: 'absolute', bottom: 20, left: '50%',
-                  transform: 'translateX(-50%)',
-                  background: 'rgba(0,0,0,0.7)', color: '#FCD34D',
-                  padding: '8px 16px', borderRadius: 8, fontSize: 13,
-                }}>
-                  No objects detected — place the defective part in view of Camera 0
-                </div>
-              )}
             </div>
+          )}
 
-            {/* Right panel — defect form */}
-            <div style={{
-              flex: 2, padding: 24, overflow: 'auto',
-              display: 'flex', flexDirection: 'column', gap: 12,
-              background: 'var(--bg-panel)', borderLeft: '1px solid var(--border)',
-            }}>
-              <div style={{ fontSize: 18, fontWeight: 700, color: '#DC2626' }}>
-                Teach Defect {defectTypes.length === 0 ? '' : `#${defectTypes.length + 1}`}
+          {defects.length > 0 && (
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: '#DC2626', marginBottom: 6 }}>
+                Defects
               </div>
-
-              <div style={{
-                background: 'var(--bg-surface)',
-                borderRadius: 'var(--radius-md)', padding: 12,
-              }}>
-                {current.instruction.split('\n').map((line, i) => (
-                  <div key={i} style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 3 }}>
-                    {line}
-                  </div>
-                ))}
-              </div>
-
-              {error && (
-                <div style={{
-                  background: 'var(--red-dim)', border: '1px solid var(--red)',
-                  borderRadius: 'var(--radius-md)', padding: 10, fontSize: 12, color: 'var(--red)',
+              {defects.map((d, i) => (
+                <div key={i} style={{
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  padding: '8px 12px', marginBottom: 4,
+                  background: '#fef2f2', border: '1px solid #fecaca',
+                  borderRadius: 6, fontSize: 13,
                 }}>
-                  {error}
+                  <span style={{ color: '#DC2626', fontWeight: 600, flex: 1 }}>{d.name}</span>
+                  <span style={{
+                    padding: '2px 8px', borderRadius: 4, fontSize: 10, fontWeight: 700, color: '#fff',
+                    background: d.severity === 'reject'  ? '#DC2626'
+                             : d.severity === 'warning'  ? '#CA8A04' : '#6b7280',
+                  }}>{(d.severity || '').toUpperCase()}</span>
+                  <span style={{ color: '#6b7280' }}>{d.capture_count} ref{d.capture_count === 1 ? '' : 's'}</span>
                 </div>
-              )}
-
-              <div>
-                <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', display: 'block', marginBottom: 4 }}>
-                  Defect type name
-                </label>
-                <input
-                  value={defectName}
-                  onChange={(e) => setDefectName(e.target.value)}
-                  placeholder="Cracked / Bent / Missing hole / Scratched"
-                  style={{
-                    width: '100%', padding: '10px 12px', fontSize: 14,
-                    border: '2px solid #DC2626', borderRadius: 6, outline: 'none',
-                    background: '#fff', color: '#111', boxSizing: 'border-box',
-                  }}
-                />
-              </div>
-
-              <div>
-                <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', display: 'block', marginBottom: 4 }}>
-                  Description
-                </label>
-                <textarea
-                  value={defectDescription}
-                  onChange={(e) => setDefectDescription(e.target.value)}
-                  placeholder="What does this defect look like?"
-                  rows={3}
-                  style={{
-                    width: '100%', padding: '10px 12px', fontSize: 13,
-                    border: '1px solid var(--border)', borderRadius: 6, outline: 'none',
-                    background: '#fff', color: '#111', resize: 'vertical',
-                    boxSizing: 'border-box', fontFamily: 'inherit',
-                  }}
-                />
-              </div>
-
-              <div>
-                <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', display: 'block', marginBottom: 4 }}>
-                  Severity
-                </label>
-                <div style={{ display: 'flex', gap: 6 }}>
-                  {[
-                    { id: 'reject',   label: 'Reject',   color: '#DC2626' },
-                    { id: 'warning',  label: 'Warning',  color: '#CA8A04' },
-                    { id: 'cosmetic', label: 'Cosmetic', color: '#6b7280' },
-                  ].map((opt) => {
-                    const active = defectSeverity === opt.id
-                    return (
-                      <button
-                        key={opt.id}
-                        onClick={() => setDefectSeverity(opt.id)}
-                        style={{
-                          flex: 1, padding: '10px 6px', fontSize: 12, fontWeight: active ? 700 : 500,
-                          background: active ? opt.color : 'var(--bg-surface)',
-                          color: active ? '#fff' : 'var(--text-secondary)',
-                          border: active ? `1px solid ${opt.color}` : '1px solid var(--border)',
-                          borderRadius: 'var(--radius-md)', cursor: 'pointer',
-                        }}
-                      >
-                        {opt.label}
-                      </button>
-                    )
-                  })}
-                </div>
-              </div>
-
-              <button
-                onClick={captureDefect}
-                disabled={!defectName.trim() || capturingDefect || liveDetections.length === 0}
-                style={{
-                  padding: '14px', fontSize: 15, fontWeight: 700,
-                  background: (defectName.trim() && liveDetections.length > 0 && !capturingDefect) ? '#DC2626' : 'var(--bg-surface)',
-                  color: (defectName.trim() && liveDetections.length > 0 && !capturingDefect) ? '#fff' : 'var(--text-muted)',
-                  border: 'none', borderRadius: 'var(--radius-lg)',
-                  cursor: (defectName.trim() && liveDetections.length > 0 && !capturingDefect) ? 'pointer' : 'not-allowed',
-                  marginTop: 4,
-                }}
-              >
-                {capturingDefect ? 'Capturing…'
-                  : !defectName.trim() ? 'Name the defect first'
-                  : liveDetections.length === 0 ? 'Waiting for object…'
-                  : 'Capture Defect'}
-              </button>
-
-              {/* Captured defects so far */}
-              {defectTypes.length > 0 && (
-                <div>
-                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 6 }}>
-                    Captured defects ({defectTypes.length})
-                  </div>
-                  {defectTypes.map((d, i) => (
-                    <div key={i} style={{
-                      display: 'flex', alignItems: 'center', gap: 8,
-                      padding: '8px 10px', marginBottom: 4,
-                      background: '#fef2f2', border: '1px solid #fecaca',
-                      borderRadius: 6,
-                    }}>
-                      <span style={{
-                        padding: '2px 6px', borderRadius: 3, fontSize: 9, fontWeight: 700, color: '#fff',
-                        background: d.severity === 'reject' ? '#DC2626' : d.severity === 'warning' ? '#CA8A04' : '#6b7280',
-                      }}>{d.severity.toUpperCase()}</span>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 13, fontWeight: 600, color: '#DC2626' }}>{d.name}</div>
-                        {d.description && (
-                          <div style={{ fontSize: 11, color: '#6b7280', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {d.description}
-                          </div>
-                        )}
-                      </div>
-                      <span style={{ fontSize: 11, color: '#9ca3af', flexShrink: 0 }}>
-                        {d.capture_count} ref{d.capture_count !== 1 ? 's' : ''}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Navigation */}
-              <div style={{ display: 'flex', gap: 8, marginTop: 'auto' }}>
-                <button
-                  onClick={() => setStep(5)}
-                  style={{
-                    padding: '8px 16px', fontSize: 12,
-                    background: 'var(--bg-surface)', color: 'var(--text-secondary)',
-                    border: '1px solid var(--border)',
-                    borderRadius: 'var(--radius-md)', cursor: 'pointer',
-                  }}
-                >
-                  ← Back
-                </button>
-                <button
-                  onClick={() => { setDefectName(''); setDefectDescription(''); setDefectSeverity('reject') }}
-                  style={{
-                    padding: '8px 16px', fontSize: 12,
-                    background: '#fef2f2', color: '#DC2626',
-                    border: '1px solid #fecaca',
-                    borderRadius: 'var(--radius-md)', cursor: 'pointer',
-                  }}
-                >
-                  Clear form
-                </button>
-                <button
-                  onClick={() => setStep(7)}
-                  style={{
-                    padding: '8px 16px', fontSize: 12, fontWeight: 600,
-                    background: 'var(--green)', color: '#fff',
-                    border: 'none',
-                    borderRadius: 'var(--radius-md)', cursor: 'pointer',
-                    marginLeft: 'auto',
-                  }}
-                >
-                  Done — Review →
-                </button>
-              </div>
+              ))}
             </div>
-          </>
-        ) : (
-          /* Intro / defects-intro / review screens */
-          <div style={{
-            flex: 1, display: 'flex', flexDirection: 'column',
-            alignItems: 'center', justifyContent: 'center',
-            padding: 40, gap: 20, textAlign: 'center',
+          )}
+
+          <button onClick={onSave} disabled={saving} style={{
+            width: '100%', padding: 16, fontSize: 17, fontWeight: 700,
+            background: saving ? '#9ca3af' : '#16A34A', color: '#fff',
+            border: 'none', borderRadius: 10, cursor: saving ? 'wait' : 'pointer',
+            marginTop: 6, minHeight: 48,
           }}>
-            <div style={{ fontSize: 48 }}>
-              {step === 0 ? '🎯'
-                : step === 5 ? '🔍'
-                : captures.length >= 3 ? '✅' : '⚠️'}
-            </div>
-            <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--text-primary)' }}>
-              {current.title}
-            </div>
-            <div style={{
-              fontSize: 14, color: 'var(--text-secondary)',
-              maxWidth: 560, whiteSpace: 'pre-wrap',
-            }}>
-              {current.instruction}
-            </div>
-            {current.detail && (
-              <div style={{
-                fontSize: 13, color: 'var(--text-muted)',
-                background: 'var(--bg-surface)',
-                padding: '8px 16px', borderRadius: 'var(--radius-md)',
-              }}>
-                {current.detail}
-              </div>
-            )}
+            {saving ? 'Saving...' : 'Save Part'}
+          </button>
 
-            {/* Review summary at step 7: good orientations + defect types */}
-            {step === 7 && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 16, alignItems: 'center', width: '100%', maxWidth: 600 }}>
-                {captures.length > 0 && (
-                  <div style={{ width: '100%' }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--green)', marginBottom: 8, textAlign: 'left' }}>
-                      Good Part References ({captures.length})
-                    </div>
-                    <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
-                      {captures.map((c, i) => (
-                        <div key={i} style={{
-                          width: 56, height: 56, borderRadius: '50%',
-                          background: 'var(--green-dim)',
-                          border: '2px solid var(--green)',
-                          display: 'flex', alignItems: 'center', justifyContent: 'center',
-                          fontSize: 12, fontWeight: 700, color: 'var(--green)',
-                        }}>
-                          {c.angle}°
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-                {defectTypes.length > 0 && (
-                  <div style={{ width: '100%' }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: '#DC2626', marginBottom: 8, textAlign: 'left' }}>
-                      Defect References ({defectTypes.length} type{defectTypes.length === 1 ? '' : 's'})
-                    </div>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                      {defectTypes.map((d, i) => (
-                        <div key={i} style={{
-                          display: 'flex', alignItems: 'center', gap: 8,
-                          padding: '8px 12px', textAlign: 'left',
-                          background: '#fef2f2', borderRadius: 6, border: '1px solid #fecaca',
-                        }}>
-                          <span style={{
-                            padding: '2px 8px', borderRadius: 4, fontSize: 10, fontWeight: 700, color: '#fff',
-                            background: d.severity === 'reject' ? '#DC2626' : d.severity === 'warning' ? '#CA8A04' : '#6b7280',
-                          }}>{d.severity.toUpperCase()}</span>
-                          <span style={{ fontSize: 13, fontWeight: 600, color: '#DC2626' }}>{d.name}</span>
-                          {d.description && (
-                            <span style={{ fontSize: 11, color: '#6b7280', flex: 1,
-                                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {d.description}
-                            </span>
-                          )}
-                          <span style={{ fontSize: 11, color: '#9ca3af', marginLeft: 'auto' }}>
-                            {d.capture_count} ref{d.capture_count !== 1 ? 's' : ''}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
+          <button onClick={() => goTo('pickable_count')} style={{
+            width: '100%', padding: 12, fontSize: 14, marginTop: 8,
+            background: 'transparent', color: '#6b7280',
+            border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+            minHeight: 44,
+          }}>
+            Teach More
+          </button>
+        </QuestionCard>
+      )
+    },
+  },
+]
 
-            {/* Step 5 has two buttons (Yes / Skip) instead of one action */}
-            {current.defectsIntro ? (
-              <div style={{ display: 'flex', gap: 12 }}>
-                <button
-                  onClick={() => setStep(6)}
-                  style={{
-                    padding: '14px 28px', fontSize: 15, fontWeight: 700,
-                    background: '#DC2626', color: '#fff',
-                    border: 'none', borderRadius: 'var(--radius-lg)', cursor: 'pointer',
-                  }}
-                >
-                  Yes — Teach Defects
-                </button>
-                <button
-                  onClick={() => setStep(7)}
-                  style={{
-                    padding: '14px 28px', fontSize: 15, fontWeight: 600,
-                    background: 'var(--bg-surface)', color: 'var(--text-secondary)',
-                    border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', cursor: 'pointer',
-                  }}
-                >
-                  Skip — No Defects
-                </button>
+function TeachWizard({ part, onClose, onComplete }) {
+  // `part` from per-row "Teach" button pre-fills + skips pages 0–3.
+  // "Teach New Part" passes no part and the wizard starts at page 0.
+  const initialAnswers = useMemo(() => ({
+    part_id:                  part?.id || null,
+    part_name:                part?.name || '',
+    part_description:         part?.description || '',
+    has_step:                 part?.id ? !!part?.source_file : null,
+    dimensions:               part?.extents_cm || null,
+    stl_url:                  null,
+    pickable_count:           1,
+    pickable_labels:          [''],
+    pickable_captures:        [],
+    non_pickable_count:       0,
+    non_pickable_labels:      [],
+    non_pickable_captures:    [],
+    teach_defects:            null,
+    defects:                  [],
+    cur_defect_name:          '',
+    cur_defect_description:   '',
+    cur_defect_severity:      'reject',
+    cur_defect_capture_count: 0,
+  }), [part])
+
+  const firstUnskipped = (a) => {
+    let i = 0
+    while (i < PAGES.length && PAGES[i].skip?.(a)) i++
+    return Math.min(i, PAGES.length - 1)
+  }
+
+  const [answers,   setAnswers]   = useState(initialAnswers)
+  const [pageIdx,   setPageIdx]   = useState(() => firstUnskipped(initialAnswers))
+  const [history,   setHistory]   = useState(() => [firstUnskipped(initialAnswers)])
+  const [saving,    setSaving]    = useState(false)
+  const [creating,  setCreating]  = useState(false)
+  const [createErr, setCreateErr] = useState(null)
+
+  // Pause the matcher while the wizard is open so teach captures
+  // don't drive false positives in the main detector.
+  useEffect(() => {
+    fetch('/api/teach_mode/start', { method: 'POST' }).catch(() => {})
+    return () => {
+      fetch('/api/teach_mode/stop', { method: 'POST' }).catch(() => {})
+    }
+  }, [])
+
+  const setAnswer = useCallback((key, value) => {
+    setAnswers((prev) => ({ ...prev, [key]: value }))
+  }, [])
+
+  const ensurePartExists = useCallback(async () => {
+    if (answers.part_id) return answers.part_id
+    setCreating(true); setCreateErr(null)
+    try {
+      const r = await fetch('/api/parts', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          name:        (answers.part_name || '').trim() || 'Untitled part',
+          description: (answers.part_description || '').trim(),
+        }),
+      })
+      const d = await r.json()
+      if (!r.ok || !d.ok) {
+        setCreateErr(d.error || 'Failed to create part')
+        return null
+      }
+      setAnswer('part_id', d.part_id)
+      return d.part_id
+    } catch (e) {
+      setCreateErr(String(e.message || e))
+      return null
+    } finally {
+      setCreating(false)
+    }
+  }, [answers.part_id, answers.part_name, answers.part_description, setAnswer])
+
+  const goNext = useCallback(async () => {
+    let next = pageIdx + 1
+    while (next < PAGES.length && PAGES[next].skip?.(answers)) next++
+    if (next >= PAGES.length) return
+    // Capture pages need a real part_id. Create one if the STEP-upload
+    // branch was skipped (camera-only flow).
+    const target = PAGES[next]
+    if (target.id?.endsWith('_capture_0') || target.id === 'defect_capture') {
+      if (!answers.part_id) {
+        const id = await ensurePartExists()
+        if (!id) return
+      }
+    }
+    setPageIdx(next)
+    setHistory((prev) => [...prev, next])
+  }, [pageIdx, answers, ensurePartExists])
+
+  const goBack = useCallback(() => {
+    if (history.length > 1) {
+      const trimmed = history.slice(0, -1)
+      setHistory(trimmed)
+      setPageIdx(trimmed[trimmed.length - 1])
+    }
+  }, [history])
+
+  const goTo = useCallback((pageId) => {
+    const idx = PAGES.findIndex((p) => p.id === pageId)
+    if (idx < 0) return
+    setPageIdx(idx)
+    setHistory((prev) => [...prev, idx])
+  }, [])
+
+  const onSave = useCallback(async () => {
+    setSaving(true)
+    // Captures are persisted as they happen via /api/parts/<id>/teach.
+    // Save just closes the wizard and triggers the parent refresh.
+    onComplete?.()
+    onClose?.()
+    setSaving(false)
+  }, [onClose, onComplete])
+
+  const page = PAGES[pageIdx]
+  const progressPct = Math.min(100, ((history.length - 1) / Math.max(1, PAGES.length - 1)) * 100)
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 100,
+      background: 'rgba(0,0,0,0.4)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }}>
+      <div style={{
+        width: '95%', maxWidth: 700, maxHeight: '95vh',
+        background: '#fff', borderRadius: 16, overflow: 'hidden',
+        boxShadow: '0 25px 60px rgba(0,0,0,0.25)',
+        display: 'flex', flexDirection: 'column',
+      }}>
+        <div style={{
+          padding: '14px 20px', borderBottom: '1px solid #e5e7eb',
+          display: 'flex', alignItems: 'center', gap: 12,
+        }}>
+          {history.length > 1 && (
+            <button onClick={goBack} style={{
+              background: 'none', border: 'none', cursor: 'pointer',
+              fontSize: 18, color: '#6b7280', padding: '2px 6px',
+              minWidth: 28, minHeight: 28,
+            }}>{'<'}</button>
+          )}
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 12, color: '#6b7280' }}>
+              Teach Part Recognition
+            </div>
+            {answers.part_name && (
+              <div style={{ fontSize: 13, fontWeight: 600, color: '#111' }}>
+                {answers.part_name}
               </div>
-            ) : current.action && (
-              <button
-                onClick={current.action.onClick}
-                style={{
-                  padding: '14px 32px', fontSize: 15, fontWeight: 700,
-                  background: 'var(--accent)', color: '#fff',
-                  border: 'none', borderRadius: 'var(--radius-lg)',
-                  cursor: 'pointer',
-                }}
-              >
-                {current.action.label}
-              </button>
             )}
           </div>
+          <button onClick={onClose} style={{
+            background: 'none', border: 'none', cursor: 'pointer',
+            fontSize: 18, color: '#9ca3af', padding: '2px 8px',
+            minWidth: 28, minHeight: 28,
+          }}>X</button>
+        </div>
+
+        <div style={{ height: 3, background: '#e5e7eb' }}>
+          <div style={{
+            height: '100%', background: '#2563EB',
+            width: progressPct + '%',
+            transition: 'width 300ms',
+          }} />
+        </div>
+
+        {creating && (
+          <div style={{
+            padding: '8px 16px', background: '#eff6ff', borderTop: '1px solid #bfdbfe',
+            fontSize: 12, color: '#2563EB',
+          }}>Creating part record...</div>
         )}
+        {createErr && (
+          <div style={{
+            padding: '8px 16px', background: '#fef2f2', borderTop: '1px solid #fecaca',
+            fontSize: 12, color: '#DC2626',
+          }}>{createErr}</div>
+        )}
+
+        <div style={{ flex: 1, overflowY: 'auto' }}>
+          {page.render({ answers, setAnswer, goNext, goBack, goTo, saving, onSave })}
+        </div>
       </div>
     </div>
   )
@@ -1699,14 +1690,23 @@ export default function AdaptivePicking() {
             fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 12,
           }}>{parts.length} part{parts.length === 1 ? '' : 's'}</div>
 
+          <button onClick={() => setTeachingPart('NEW')}
+            style={{
+              width: '100%', padding: 12, fontSize: 13, fontWeight: 700,
+              cursor: 'pointer',
+              background: '#16A34A', color: '#fff', border: 'none',
+              borderRadius: 'var(--radius-md, 6px)', marginBottom: 8,
+            }}
+          >+ Teach New Part</button>
+
           <button onClick={() => fileInputRef.current?.click()} disabled={uploading}
             style={{
-              width: '100%', padding: 10, fontSize: 13, fontWeight: 600,
+              width: '100%', padding: 10, fontSize: 12, fontWeight: 600,
               cursor: uploading ? 'wait' : 'pointer',
               background: 'rgba(59,130,246,0.85)', color: '#fff', border: 'none',
               borderRadius: 'var(--radius-md, 6px)', marginBottom: 8,
             }}
-          >{uploading ? 'Processing STEP file…' : '+ Upload STEP File'}</button>
+          >{uploading ? 'Processing STEP file…' : 'Upload STEP File only'}</button>
           <input ref={fileInputRef} type="file" accept=".step,.stp,.STEP,.STP"
             style={{ display: 'none' }}
             onChange={(e) => handleUpload(e.target.files?.[0])}
@@ -1909,7 +1909,7 @@ export default function AdaptivePicking() {
           list so the new teach_count is picked up. */}
       {teachingPart && (
         <TeachWizard
-          part={teachingPart}
+          part={teachingPart === 'NEW' ? null : teachingPart}
           onClose={() => { setTeachingPart(null); refresh() }}
           onComplete={() => refresh()}
         />
