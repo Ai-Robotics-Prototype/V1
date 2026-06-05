@@ -822,6 +822,16 @@ const PAGES = [
             setAnswer('step_file_id', d.part_id)
             setAnswer('dimensions',  d.extents_cm)
             setAnswer('stl_url',     d.stl_url)
+            // STEP files hash to a deterministic part_id, so uploading
+            // the same STEP twice resolves to a part that may already
+            // have teach refs. Check the live count so confirm_overwrite
+            // can offer Start Fresh instead of silently piling on top.
+            try {
+              const dbg = await fetch('/api/parts/' + d.part_id + '/teach/debug')
+                .then((rr) => rr.ok ? rr.json() : null)
+              const live = Number(dbg?.npz_files || 0)
+              if (live > 0) setAnswer('existing_teach_count', live)
+            } catch {}
           }
         } catch (e) {
           setErr(String(e.message || e))
@@ -922,17 +932,46 @@ const PAGES = [
               fontSize: 12, color: '#DC2626',
             }}>{err}</div>
           )}
-          <ChoiceButton
-            label={clearing ? 'Clearing...' : 'Start Fresh'}
-            description="Clear all existing references and teach from scratch. The library count will match exactly what you capture in this session."
-            onClick={clearing ? undefined : startFresh}
-            accent="#DC2626"
-          />
-          <ChoiceButton
-            label="Add More"
-            description="Keep existing references and add new captures on top of them."
-            onClick={() => goNext()}
-          />
+          {answers.cleared_at_start && (
+            <div style={{
+              padding: '8px 12px', marginBottom: 10,
+              background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 6,
+              fontSize: 12, color: '#16A34A', fontWeight: 600,
+            }}>Refs cleared — library count will match this session.</div>
+          )}
+          {/* Bypass ChoiceButton: its accent colour only shows when
+              selected=true, so both options would look identical here.
+              The two outcomes are very different (destructive vs
+              additive) — render explicit colored buttons so the
+              operator can't pick the wrong one by accident. */}
+          <button onClick={clearing ? undefined : startFresh} disabled={clearing}
+            style={{
+              width: '100%', padding: '16px 18px', textAlign: 'left',
+              cursor: clearing ? 'wait' : 'pointer',
+              background: '#DC2626', color: '#fff',
+              border: '2px solid #DC2626', borderRadius: 10,
+              marginBottom: 10, minHeight: 56,
+            }}>
+            <div style={{ fontSize: 15, fontWeight: 700 }}>
+              {clearing ? 'Clearing references...' : `Start Fresh — delete all ${answers.existing_teach_count}`}
+            </div>
+            <div style={{ fontSize: 12, opacity: 0.9, marginTop: 3 }}>
+              Wipe the prior references and teach this part from scratch. The library count will match exactly what you capture in this session.
+            </div>
+          </button>
+          <button onClick={() => goNext()} disabled={clearing}
+            style={{
+              width: '100%', padding: '14px 16px', textAlign: 'left',
+              cursor: clearing ? 'wait' : 'pointer',
+              background: '#fff', color: '#111',
+              border: '2px solid #e5e7eb', borderRadius: 10,
+              minHeight: 44,
+            }}>
+            <div style={{ fontSize: 15, fontWeight: 600 }}>Add More</div>
+            <div style={{ fontSize: 12, color: '#6b7280', marginTop: 3 }}>
+              Keep the existing references and add new captures on top.
+            </div>
+          </button>
         </QuestionCard>
       )
     },
@@ -1523,6 +1562,33 @@ function TeachWizard({ part, onClose, onComplete }) {
       fetch('/api/teach_mode/stop', { method: 'POST' }).catch(() => {})
     }
   }, [])
+
+  // Live teach_count refresh. The parts-list prop is whatever was on
+  // disk when the operator last opened the parts page — by the time
+  // they click "Teach" it can be wildly out of date (esp. after the
+  // dual-camera dedupe fix changed the counting basis). Always
+  // re-fetch on mount so confirm_overwrite shows the real number.
+  useEffect(() => {
+    if (!part?.id) return
+    let cancelled = false
+    fetch('/api/parts/' + part.id + '/teach/debug')
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => {
+        if (cancelled || !d) return
+        const live = Number(d.npz_files || 0)
+        setAnswers((prev) => ({ ...prev, existing_teach_count: live }))
+        // If the live count differs from what we started with AND we
+        // were already past confirm_overwrite, jump back to it so the
+        // operator gets the choice.
+        const confirmIdx = PAGES.findIndex((p) => p.id === 'confirm_overwrite')
+        if (live > 0 && confirmIdx >= 0) {
+          setPageIdx((curIdx) => (curIdx > confirmIdx ? curIdx : confirmIdx))
+          setHistory((h) => h.length === 1 && h[0] !== confirmIdx ? [confirmIdx] : h)
+        }
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [part?.id])
 
   const setAnswer = useCallback((key, value) => {
     setAnswers((prev) => ({ ...prev, [key]: value }))

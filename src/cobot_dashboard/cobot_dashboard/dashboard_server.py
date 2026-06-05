@@ -1937,19 +1937,81 @@ if FASTAPI_AVAILABLE:
             _ros_node._teach_cmd_pub.publish(m)
         return {"ok": True, "teach_mode": False}
 
-    @app.post("/api/parts/{part_id}/teach_clear")
-    async def api_parts_teach_clear(part_id: str):
-        """Delete every taught reference for this part."""
+    def _do_teach_clear(part_id: str) -> dict:
+        """Rmtree the part's teach directory, blocking until the
+        filesystem actually reports it gone, and tell depth_segment_node
+        to drop its in-memory cache. Returns counts so the caller can
+        verify the operation worked end-to-end (the wizard surfaces
+        `remaining` to confirm 0 refs remain before the first capture)."""
         import shutil as _sh
         teach_dir = f'/opt/cobot/parts/teach/{part_id}'
+        before = 0
         if os.path.isdir(teach_dir):
+            try:
+                before = sum(1 for f in os.listdir(teach_dir)
+                             if f.endswith('.npz'))
+            except OSError:
+                before = 0
             _sh.rmtree(teach_dir, ignore_errors=True)
         # Notify depth_segment_node so it can reload its in-memory cache
         if _ros_node and _ros_node._teach_cmd_pub:
             m = String()
-            m.data = json.dumps({'action': 'reload'})
+            m.data = json.dumps({'action': 'reload', 'part_id': part_id})
             _ros_node._teach_cmd_pub.publish(m)
-        return {"ok": True}
+        remaining = 0
+        if os.path.isdir(teach_dir):
+            try:
+                remaining = sum(1 for f in os.listdir(teach_dir)
+                                if f.endswith('.npz'))
+            except OSError:
+                remaining = 0
+        return {
+            'ok':         True,
+            'cleared':    before,
+            'remaining':  remaining,
+            'part_id':    part_id,
+        }
+
+    @app.post("/api/parts/{part_id}/teach_clear")
+    async def api_parts_teach_clear(part_id: str):
+        """Delete every taught reference for this part."""
+        return _do_teach_clear(part_id)
+
+    @app.post("/api/parts/{part_id}/teach/clear")
+    async def api_parts_teach_clear_slash(part_id: str):
+        """Alias for /teach_clear with a slash separator. Matches the
+        REST shape the wizard's "Start Fresh" button expects on some
+        client builds; both routes resolve to the same code."""
+        return _do_teach_clear(part_id)
+
+    @app.get("/api/parts/{part_id}/teach/debug")
+    async def api_parts_teach_debug(part_id: str):
+        """List the actual files in the part's teach directory so
+        operators can verify the wizard's count matches reality."""
+        teach_dir = f'/opt/cobot/parts/teach/{part_id}'
+        if not os.path.isdir(teach_dir):
+            return {
+                'part_id':     part_id,
+                'path':        teach_dir,
+                'exists':      False,
+                'total_files': 0,
+                'npz_files':   0,
+                'png_files':   0,
+                'files':       [],
+            }
+        try:
+            files = sorted(os.listdir(teach_dir))
+        except OSError as e:
+            return JSONResponse({'error': str(e)}, status_code=500)
+        return {
+            'part_id':     part_id,
+            'path':        teach_dir,
+            'exists':      True,
+            'total_files': len(files),
+            'npz_files':   len([f for f in files if f.endswith('.npz')]),
+            'png_files':   len([f for f in files if f.endswith('.png')]),
+            'files':       files[:200],
+        }
 
     @app.get("/api/parts/{part_id}")
     async def api_parts_get(part_id: str):
