@@ -2170,7 +2170,14 @@ class DepthSegmentNode(Node):
     def _load_step_dims(self):
         """Return {part_id: sorted_top_2_extents_m} parsed from
         /opt/cobot/parts/index.json. The STEP-derived extents are the
-        EXACT ground-truth dimensions and feed the strict size gate."""
+        EXACT ground-truth dimensions and feed the strict size gate.
+
+        Camera-only parts (POST /api/parts, no STEP upload) carry
+        extents_cm=[0,0,0]; emitting sd=[0,0] for them would make the
+        size gate compute r0 = 0 / det_dim = 0.0 and `continue` past
+        the part — the matcher would never see the fob's teach refs.
+        Skip those so the matcher treats them as "no STEP record" and
+        falls through to the neutral size_score=0.5 branch."""
         out = {}
         path = '/opt/cobot/parts/index.json'
         if not os.path.isfile(path):
@@ -2186,6 +2193,9 @@ class DepthSegmentNode(Node):
                                float(ext[1]) / 100.0,
                                (float(ext[2]) / 100.0 if len(ext) >= 3 else 0.0)],
                               reverse=True)[:2]
+                if top2[0] <= 0.0:
+                    # Camera-only part — no usable STEP dimensions.
+                    continue
                 out[p['id']] = top2
         except Exception:
             pass
