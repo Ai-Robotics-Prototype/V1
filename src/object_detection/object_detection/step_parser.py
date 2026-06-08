@@ -282,6 +282,147 @@ _RECOG_ORIENTATIONS = (
 )
 
 
+def extract_face_features(mesh, img_size: int = 128,
+                          margin: int = 8) -> dict:
+    """Extract feature anchor positions for each of the 6 face
+    orientations of a CAD mesh.
+
+    For each orientation (top, bottom, right, left, front, back),
+    rotates the mesh so that face points +Z, projects vertices top-
+    down into an `img_size`×`img_size` height map, then locates:
+      - holes:  regions significantly BELOW median surface height
+                (recesses, counterbores, through-holes)
+      - bosses: regions significantly ABOVE median surface height
+                (raised pads, embossed features)
+
+    Coordinates are normalised to [0, 1] of the rendered face bbox
+    so the camera-side matcher can compare directly against live
+    detection blob centroids without worrying about CAD vs sensor
+    pixel scale.
+
+    Returns a dict keyed by orient_name (top/bottom/right/left/
+    front/back). Each value carries `holes`, `bosses`, and a
+    `has_features` flag the matcher uses to short-circuit out for
+    flat faces (no penalty in scoring when CAD has nothing to
+    verify against).
+    """
+    from scipy.ndimage import (
+        label as _label, binary_erosion)
+
+    result = {}
+
+    for orient in _RECOG_ORIENTATIONS:
+        orient_name = orient['name']
+        rot_mat = trimesh.transformations.euler_matrix(
+            float(orient['rotation'][0]),
+            float(orient['rotation'][1]),
+            float(orient['rotation'][2]))
+        oriented = mesh.copy()
+        oriented.apply_transform(rot_mat)
+
+        verts = oriented.vertices
+        if len(verts) == 0:
+            result[orient_name] = {
+                'holes': [], 'bosses': [],
+                'has_features': False}
+            continue
+
+        x = verts[:, 0]; y = verts[:, 1]; z = verts[:, 2]
+        x_range = float(x.max() - x.min()) or 1e-3
+        y_range = float(y.max() - y.min()) or 1e-3
+        scale = (img_size - 2 * margin) / max(x_range, y_range)
+
+        px = ((x - x.min()) * scale + margin
+              ).astype(int).clip(0, img_size - 1)
+        py = ((y - y.min()) * scale + margin
+              ).astype(int).clip(0, img_size - 1)
+
+        # Top-down height map: max z per pixel. Picks up only the
+        # surface visible from above (matches what a top-down camera
+        # would see).
+        height_map = np.full(
+            (img_size, img_size), -np.inf, dtype=np.float64)
+        np.maximum.at(height_map, (py, px), z)
+        valid = height_map > -np.inf
+        if not valid.any():
+            result[orient_name] = {
+                'holes': [], 'bosses': [],
+                'has_features': False}
+            continue
+
+        h_vals = height_map[valid]
+        h_min = float(h_vals.min())
+        h_max = float(h_vals.max())
+        norm_h = np.zeros((img_size, img_size), dtype=np.float64)
+        if h_max > h_min:
+            norm_h[valid] = (height_map[valid] - h_min) / (h_max - h_min)
+
+        # Erode 3 px so outline pixels (which sit at the part edge,
+        # often at a different height than the surface interior)
+        # don't masquerade as features.
+        interior = binary_erosion(valid, iterations=3)
+        if not interior.any():
+            interior = valid
+
+        int_vals = norm_h[interior]
+        med_h = float(np.median(int_vals))
+        std_h = float(int_vals.std())
+        if std_h < 0.01:
+            std_h = 0.01
+
+        # ── Holes: interior pixels well below the surface ─────────
+        hole_mask = interior & (norm_h < med_h - 0.5 * std_h)
+        labeled_h, n_h = _label(hole_mask)
+        holes = []
+        for i in range(1, n_h + 1):
+            ys, xs = np.where(labeled_h == i)
+            area = int(len(ys))
+            if area < 10:
+                continue
+            cx = float(np.clip(
+                (np.mean(xs) - margin) / max(img_size - 2 * margin, 1),
+                0.0, 1.0))
+            cy = float(np.clip(
+                (np.mean(ys) - margin) / max(img_size - 2 * margin, 1),
+                0.0, 1.0))
+            radius_norm = float(
+                np.sqrt(area / np.pi) / max(img_size - 2 * margin, 1))
+            holes.append({
+                'center':      [round(cx, 3), round(cy, 3)],
+                'radius_norm': round(radius_norm, 4),
+                'area_px':     area,
+            })
+
+        # ── Bosses: interior pixels well above the surface ────────
+        boss_mask = interior & (norm_h > med_h + 0.5 * std_h)
+        labeled_b, n_b = _label(boss_mask)
+        bosses = []
+        for i in range(1, n_b + 1):
+            ys, xs = np.where(labeled_b == i)
+            area = int(len(ys))
+            if area < 10:
+                continue
+            cx = float(np.clip(
+                (np.mean(xs) - margin) / max(img_size - 2 * margin, 1),
+                0.0, 1.0))
+            cy = float(np.clip(
+                (np.mean(ys) - margin) / max(img_size - 2 * margin, 1),
+                0.0, 1.0))
+            bosses.append({
+                'center':  [round(cx, 3), round(cy, 3)],
+                'area_px': area,
+            })
+
+        has_features = bool(holes or bosses)
+        result[orient_name] = {
+            'holes':        holes,
+            'bosses':       bosses,
+            'has_features': has_features,
+        }
+
+    return result
+
+
 def generate_recognition_templates(mesh, output_dir: str, part_id: str,
                                    yaw_steps: int = 12, img_size: int = 128,
                                    margin: int = 8):
@@ -485,6 +626,16 @@ def parse_step_file(step_path: str) -> dict:
     except Exception:
         geometric_features = {}
 
+    # Per-face feature anchors (hole / boss positions per orientation).
+    # The orientation classifier uses these to VERIFY at runtime that
+    # the live crop actually shows the features the CAD model says
+    # should be on that face — turns a soft texture-similarity score
+    # into a hard geometric check.
+    try:
+        face_features = extract_face_features(mesh)
+    except Exception:
+        face_features = {}
+
     return {
         'id':                file_hash,
         'name':              os.path.splitext(os.path.basename(step_path))[0],
@@ -514,4 +665,5 @@ def parse_step_file(step_path: str) -> dict:
         'silhouettes':    silhouettes,
         'templates':      templates_info,
         'geometric_features': geometric_features,
+        'face_features':      face_features,
     }
