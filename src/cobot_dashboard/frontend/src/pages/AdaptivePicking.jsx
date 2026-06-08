@@ -1561,7 +1561,18 @@ function TeachWizard({ part, onClose, onComplete }) {
     stl_url:                  null,
     // Prior teach_count on the part. The confirm_overwrite page only
     // surfaces when this is > 0; Start-Fresh wipes it back to 0.
-    existing_teach_count:     part?.teach_count || 0,
+    //
+    // When teach_count is undefined/null on the prop (e.g. the parts
+    // list was loaded before this part had refs, or the dashboard
+    // hasn't refreshed since the last capture), default to 1 so
+    // confirm_overwrite is SHOWN. The teach/debug useEffect below
+    // then patches in the real count within ~200 ms — before the
+    // operator can read the prompt and click. Falsy-default-0 used
+    // to skip the prompt silently, letting new captures append onto
+    // an unknown number of stale refs.
+    existing_teach_count:     part?.id
+      ? (part?.teach_count ?? 1)
+      : 0,
     cleared_at_start:         false,
     // True when the operator picks "Add More" on confirm_overwrite.
     // Capture pages relax min-2-captures to min-1 (operator may
@@ -1618,15 +1629,13 @@ function TeachWizard({ part, onClose, onComplete }) {
       .then((d) => {
         if (cancelled || !d) return
         const live = Number(d.npz_files || 0)
+        // Only update existing_teach_count — do NOT move the page.
+        // The confirm_overwrite page is shown based on initialAnswers
+        // (computed once on mount from part.teach_count / id; see
+        // BUG 3 bias below). Racing a page jump against operator
+        // navigation used to snap them back to confirm_overwrite
+        // mid-capture and lose their progress.
         setAnswers((prev) => ({ ...prev, existing_teach_count: live }))
-        // If the live count differs from what we started with AND we
-        // were already past confirm_overwrite, jump back to it so the
-        // operator gets the choice.
-        const confirmIdx = PAGES.findIndex((p) => p.id === 'confirm_overwrite')
-        if (live > 0 && confirmIdx >= 0) {
-          setPageIdx((curIdx) => (curIdx > confirmIdx ? curIdx : confirmIdx))
-          setHistory((h) => h.length === 1 && h[0] !== confirmIdx ? [confirmIdx] : h)
-        }
       })
       .catch(() => {})
     return () => { cancelled = true }
@@ -1724,6 +1733,17 @@ function TeachWizard({ part, onClose, onComplete }) {
   }, [onClose, onComplete])
 
   const page = PAGES[pageIdx]
+  // Guard: a stale pageIdx beyond PAGES.length (e.g. after a hot-
+  // reload or after the PAGES array shrinks across versions) made
+  // page undefined and `page.render(...)` crashed the wizard to a
+  // blank screen. Snap back to the last valid page and re-render
+  // on the next frame instead of throwing.
+  if (!page) {
+    const safeIdx = PAGES.length - 1
+    setPageIdx(safeIdx)
+    setHistory([safeIdx])
+    return null
+  }
   const progressPct = Math.min(100, ((history.length - 1) / Math.max(1, PAGES.length - 1)) * 100)
 
   return (

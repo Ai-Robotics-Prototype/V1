@@ -135,6 +135,12 @@ class DepthSegmentNode(Node):
         super().__init__('depth_segment_node')
 
         self.declare_parameter('max_depth_m',        3.0)
+        # RealSense D435i depth is unreliable below ~0.28 m — reflective
+        # surfaces can return 0 (mistaken for invalid) or sub-cm noise
+        # that snaps to the plane fit. Setting min_depth_m=0.10 keeps
+        # genuinely-close pixels (a hand at 12 cm) while explicitly
+        # treating the sensor's near-field garbage as "invalid".
+        self.declare_parameter('min_depth_m',        0.10)
         self.declare_parameter('min_object_area_px', 50)
         self.declare_parameter('floor_tolerance_m',  0.015)
         self.declare_parameter('erode_kernel',       2)
@@ -156,6 +162,7 @@ class DepthSegmentNode(Node):
         self.declare_parameter('frame_id',         'cam0_color_optical_frame')
 
         self.max_depth   = float(self.get_parameter('max_depth_m').value)
+        self.min_depth   = float(self.get_parameter('min_depth_m').value)
         self.min_area    = int(self.get_parameter('min_object_area_px').value)
         self.floor_tol   = float(self.get_parameter('floor_tolerance_m').value)
         self.erode_k     = int(self.get_parameter('erode_kernel').value)
@@ -943,7 +950,16 @@ class DepthSegmentNode(Node):
         h, w = depth.shape
         u, v = self._uv_grids(h, w)
 
-        valid = np.isfinite(depth) & (depth > 0.0) & (depth < self.max_depth)
+        # Tighter valid gate: depth > self.min_depth (default 0.10 m)
+        # rather than depth > 0. The RealSense D435i frequently emits
+        # near-zero garbage on reflective surfaces — that used to slip
+        # through `depth > 0`, count as valid pixels, then mess up the
+        # plane fit + foreground statistics. Pixels above min_depth
+        # are kept regardless of how close they are so a close-up
+        # part still produces a foreground.
+        valid = (np.isfinite(depth)
+                 & (depth > self.min_depth)
+                 & (depth < self.max_depth))
         if valid.sum() < self.min_area:
             self._history.append([])
             self._emit(h, w)
@@ -1004,6 +1020,37 @@ class DepthSegmentNode(Node):
             ndimage.sobel(depth_filled_h, axis=1, mode='nearest'))
         edge_fg_h = valid_half & (gmag_h > self.edge_thresh)
         foreground_h = plane_fg_h | edge_fg_h
+
+        # ── Plane-fit guard for close-up parts ──────────────────────
+        # When the part dominates the frame (camera ~30 cm from a 6 cm
+        # bracket, for example), RANSAC fits the plane to the PART
+        # surface rather than the table. plane_fg then collapses to
+        # near-empty — the part shows up only as a thin edge ring,
+        # which the morphology stage can't recover into a solid mask.
+        #
+        # If plane_fg covers <2 % of valid pixels, treat the plane fit
+        # as suspect. Fall back to the edge channels alone (depth edges
+        # plus the cached half-res RGB edge mask) and aggressively
+        # dilate to fill the outline into a solid blob. Detection on
+        # the resulting mask then works regardless of the bad plane.
+        _valid_count    = int(valid_half.sum())
+        _plane_fg_count = int(plane_fg_h.sum())
+        if (_valid_count > 0
+                and _plane_fg_count < _valid_count * 0.02):
+            foreground_h = edge_fg_h.copy()
+            # _rgb_edge_fg_h is initialised by the RGB Sobel block
+            # further down in _process, so on the very first frame
+            # it may not exist as an attribute yet. getattr keeps
+            # this guard safe before that block has run once.
+            _cached_rgb_h = getattr(self, '_rgb_edge_fg_h', None)
+            if _cached_rgb_h is not None:
+                try:
+                    foreground_h = foreground_h | _cached_rgb_h
+                except ValueError:
+                    pass
+            foreground_h = ndimage.binary_dilation(
+                foreground_h, iterations=6)
+            foreground_h = foreground_h & valid_half
 
         # (c) RGB edges: catches flat dark objects with minimal depth
         # difference from the surface but visible colour boundaries.
@@ -3495,18 +3542,14 @@ class DepthSegmentNode(Node):
             'feat':    0.35,
         }
 
-        # Extract features from the live detection ONCE up here so
-        # the per-ref loop only does the cheap match step.
-        det_kp_descs = []
-        det_lbp_hist = np.zeros(64, dtype=np.float32)
-        if color_crop is not None and mask_crop is not None and mask_crop.any():
-            det_gray_full = (
-                np.mean(color_crop.astype(np.float32), axis=2)
-                if color_crop.ndim == 3
-                else color_crop.astype(np.float32)
-            )
-            det_kp_descs, det_lbp_hist = self._extract_features(
-                det_gray_full, mask_crop)
+        # BUG 3 fix: detection features (Harris keypoints + LBP) must
+        # be extracted at the SAME physical scale as the ref they're
+        # being compared against, otherwise patch descriptors are
+        # geometrically incomparable and the Lowe ratio test returns
+        # zero matches → feat ~ 0.5 for every ref (35% of the score
+        # budget wasted on neutral noise). Extraction moved INSIDE
+        # the per-ref loop where det_scaled is already computed for
+        # NCC at the ref's resolution.
 
         best_score = 0.0
         best_id    = None
@@ -3694,12 +3737,33 @@ class DepthSegmentNode(Node):
                     # The strongest discriminator on metal parts whose
                     # two faces share colour but differ in surface
                     # micro-features (stamped text, holes, chamfers).
-                    ref_kp  = ref.get('kp_descs') or []
-                    ref_lbp = ref.get('lbp_hist')
-                    if ref_lbp is None:
-                        ref_lbp = np.zeros(64, dtype=np.float32)
+                    #
+                    # Extract detection features at THIS ref's physical
+                    # resolution (det_scaled was already produced for
+                    # the NCC step above). Native-scale extraction —
+                    # what the previous code did pre-loop — produced
+                    # patch descriptors that aren't comparable to the
+                    # ref's stored ones, so Lowe ratio always failed.
+                    _ref_lbp = ref.get('lbp_hist')
+                    if _ref_lbp is None:
+                        _ref_lbp = np.zeros(64, dtype=np.float32)
+                    _ref_kp = ref.get('kp_descs') or []
+                    if det_scaled is not None and mask_crop is not None:
+                        try:
+                            _det_mask_sc = (_zoom(
+                                mask_crop.astype(np.float32),
+                                (target_h / crop_h, target_w / crop_w),
+                                order=0) > 0.5)
+                            _det_kp_sc, _det_lbp_sc = self._extract_features(
+                                det_scaled, _det_mask_sc)
+                        except Exception:
+                            _det_kp_sc  = []
+                            _det_lbp_sc = np.zeros(64, dtype=np.float32)
+                    else:
+                        _det_kp_sc  = []
+                        _det_lbp_sc = np.zeros(64, dtype=np.float32)
                     features.append(self._match_features(
-                        det_kp_descs, det_lbp_hist, ref_kp, ref_lbp))
+                        _det_kp_sc, _det_lbp_sc, _ref_kp, _ref_lbp))
 
                 if not nccs:
                     continue
@@ -3768,16 +3832,31 @@ class DepthSegmentNode(Node):
                 # If CAD has no features for this face (flat surface),
                 # cad_score stays 0.5 — neutral, no penalty.
 
-            # Blend: size (30%) + group scoring (35%) + CAD features (35%).
-            # When the part has no STEP file (no face_features), fall
-            # back to the legacy 40/60 blend so camera-only parts
-            # aren't degraded. CAD-equipped flat-faced parts land at
-            # cad_score=0.5 which contributes 0.5·0.35 ≈ 0.18 — no
-            # regression vs the legacy blend's implicit "neutral".
-            if part_face_features:
+            # Four-branch blend so EVERY available signal — size,
+            # group scoring, CAD features, and classifier confidence —
+            # contributes to whether the match passes threshold. The
+            # classifier used to only override is_pickable AFTER the
+            # gate, meaning a 90%-confident clf couldn't help an
+            # otherwise borderline match clear 0.48. Branches:
+            #
+            #   CAD + clf  : size 0.25 + group 0.30 + cad 0.25 + clf 0.20
+            #   CAD only   : size 0.30 + group 0.40 + cad 0.30
+            #   clf only   : size 0.35 + group 0.40 + clf 0.25
+            #   legacy     : size 0.40 + group 0.60   (no CAD, no clf —
+            #                camera-only parts before this codepath)
+            if part_face_features and clf is not None:
+                combined = (size_score        * 0.25
+                            + best_group_score * 0.30
+                            + cad_score        * 0.25
+                            + clf_score        * 0.20)
+            elif part_face_features:
                 combined = (size_score        * 0.30
-                            + best_group_score * 0.35
-                            + cad_score        * 0.35)
+                            + best_group_score * 0.40
+                            + cad_score        * 0.30)
+            elif clf is not None:
+                combined = (size_score        * 0.35
+                            + best_group_score * 0.40
+                            + clf_score        * 0.25)
             else:
                 combined = size_score * 0.40 + best_group_score * 0.60
 
@@ -3874,7 +3953,15 @@ class DepthSegmentNode(Node):
         # if the teach score is below threshold so CAD-only parts still
         # match (template path returns the legacy pickable/flipped/on_side
         # orientation string).
-        if best_score >= 0.60 and best_id is not None:
+        # Threshold re-calibrated from 0.60 (set under the original
+        # size*0.50 + ncc*0.50 formula) to 0.48 — the current
+        # five-signal blend (size + group + cad + clf) typically
+        # peaks around 0.63 for a clean match, leaving only ~3 pts
+        # of head-room above the old gate. Any lighting/angle blip
+        # dropped well-matched parts under threshold and silently
+        # produced 'unknown'. 0.48 keeps the same false-positive
+        # rejection while passing realistic clean matches.
+        if best_score >= 0.48 and best_id is not None:
             info = {'source': 'teach'}
             if best_ref_meta is not None:
                 info.update({
@@ -4445,113 +4532,6 @@ class DepthSegmentNode(Node):
                     rr = max(3.0, r * max(bw_px, bh_px))
                     draw.ellipse([hx - rr, hy - rr, hx + rr, hy + rr],
                                  outline=(0, 220, 255), width=2)
-
-            # ── Feature detection overlay (teach mode only) ──────────
-            # Show the operator which structural features the
-            # classifier can actually see — holes, bosses, slots,
-            # step edges. Each gets a small coloured box drawn
-            # INSIDE the main green teach box plus a tiny
-            # confidence label.
-            if self._teach_mode:
-                _color_crop = o.get('color_crop')
-                _mask_2d    = o.get('mask_2d')
-                _feat_gray  = None
-                if _color_crop is not None:
-                    _feat_gray = (
-                        np.mean(_color_crop.astype(np.float32), axis=2)
-                        if _color_crop.ndim == 3
-                        else _color_crop.astype(np.float32))
-                if _feat_gray is not None and _mask_2d is not None:
-                    _feats = self._detect_part_features(
-                        _feat_gray, _mask_2d)
-                    # x0, y0 (unpacked from o['bbox_px'] at loop top)
-                    # are the crop origin in full-frame coordinates.
-                    # mask_2d + color_crop are sized to that bbox, so
-                    # feature crop-coords convert to full-frame by
-                    # adding (crop_x0, crop_y0).
-                    _crop_x0 = max(0, int(x0))
-                    _crop_y0 = max(0, int(y0))
-
-                    _abbrev = {
-                        'circular_hole':    'HOLE\u25cf',
-                        'slot_hole':        'SLOT',
-                        'rectangular_hole': 'RECESS',
-                        'circular_boss':    'BOSS\u25cf',
-                        'rectangular_boss': 'BOSS',
-                        'edge_step':        'STEP',
-                    }
-                    try:
-                        _ff = ImageFont.truetype(
-                            '/usr/share/fonts/truetype/dejavu/'
-                            'DejaVuSans-Bold.ttf', size=10)
-                    except Exception:
-                        _ff = ImageFont.load_default()
-
-                    for _f in _feats:
-                        _fx0, _fy0, _fx1, _fy1 = _f['bbox']
-                        _ffx0 = _crop_x0 + _fx0
-                        _ffy0 = _crop_y0 + _fy0
-                        _ffx1 = _crop_x0 + _fx1
-                        _ffy1 = _crop_y0 + _fy1
-                        _ft = _f['type']
-                        _fc = ((0, 190, 255)   if 'hole' in _ft
-                               else (255, 140, 0)  if 'boss' in _ft
-                               else (220, 220, 0)  if 'edge' in _ft
-                               else (180, 180, 180))
-                        draw.rectangle(
-                            [_ffx0, _ffy0, _ffx1, _ffy1],
-                            outline=_fc, width=1)
-                        _lbl = (_abbrev.get(_ft, _ft[:6].upper())
-                                + f' {int(_f["confidence"] * 100)}%')
-                        if hasattr(draw, 'textlength'):
-                            _tw = int(draw.textlength(_lbl, font=_ff))
-                        else:
-                            _tw = len(_lbl) * 6
-                        _tx = max(0, _ffx0)
-                        _ty = max(0, _ffy0 - 13)
-                        draw.rectangle(
-                            [_tx, _ty, _tx + _tw + 2, _ty + 11],
-                            fill=_fc)
-                        draw.text(
-                            (_tx + 1, _ty + 1), _lbl,
-                            fill=(0, 0, 0), font=_ff)
-
-                # ── CAD anchor overlay (teach mode) ──────────────────
-                # Show where the CAD model EXPECTS to find features on
-                # the part's top face. Cyan thin circle = expected hole,
-                # orange thin box = expected boss. Lets the operator
-                # verify camera-vs-CAD alignment before accepting a
-                # teach capture. Only fires when exactly one part has
-                # CAD face features loaded (teach mode suppresses
-                # recognition so we don't know which part_id is in
-                # frame; if only one CAD part exists it's unambiguous).
-                _part_ids_for_obj = list(self._cad_face_features.keys())
-                if len(_part_ids_for_obj) == 1:
-                    _show_part_id = _part_ids_for_obj[0]
-                    _pff = self._cad_face_features.get(_show_part_id, {})
-                    _top_face = _pff.get('top', {})
-                    _crop_x0c, _crop_y0c, _crop_x1c, _crop_y1c = o['bbox_px']
-                    _cw = max(1, int(_crop_x1c) - int(_crop_x0c))
-                    _ch = max(1, int(_crop_y1c) - int(_crop_y0c))
-
-                    for _hole in (_top_face.get('holes') or []):
-                        _hcx = int(_crop_x0c + float(_hole['center'][0]) * _cw)
-                        _hcy = int(_crop_y0c + float(_hole['center'][1]) * _ch)
-                        _hr  = max(4, int(float(_hole.get('radius_norm', 0.05))
-                                          * max(_cw, _ch)))
-                        draw.ellipse(
-                            [_hcx - _hr, _hcy - _hr,
-                             _hcx + _hr, _hcy + _hr],
-                            outline=(0, 255, 200), width=1)
-
-                    for _boss in (_top_face.get('bosses') or []):
-                        _bcx = int(_crop_x0c + float(_boss['center'][0]) * _cw)
-                        _bcy = int(_crop_y0c + float(_boss['center'][1]) * _ch)
-                        _br  = 8
-                        draw.rectangle(
-                            [_bcx - _br, _bcy - _br,
-                             _bcx + _br, _bcy + _br],
-                            outline=(255, 165, 0), width=1)
 
         msg = Image()
         msg.header.stamp = self._depth_hdr.stamp if self._depth_hdr else self.get_clock().now().to_msg()
