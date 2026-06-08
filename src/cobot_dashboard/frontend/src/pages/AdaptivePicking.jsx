@@ -726,6 +726,195 @@ function CaptureView({
 const MAX_PICKABLE     = 6
 const MAX_NON_PICKABLE = 5
 
+// Pages that own their own local state (useState / useRef) must be
+// extracted as real function components — calling hooks inside a
+// plain render-callback would be a rules-of-hooks violation, and on
+// every page transition React would throw and crash the wizard to a
+// blank screen.
+
+function StepUploadPage({ answers, setAnswer, goNext }) {
+  const [uploading, setUploading] = useState(false)
+  const [err, setErr]             = useState(null)
+  const inputRef                  = useRef(null)
+
+  const upload = async (file) => {
+    if (!file) return
+    if (!/\.(step|stp)$/i.test(file.name)) {
+      setErr('Only .STEP / .STP files are accepted')
+      return
+    }
+    setUploading(true); setErr(null)
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      const r = await fetch('/api/parts/upload', { method: 'POST', body: fd })
+      const d = await r.json()
+      if (!r.ok || !d.ok) {
+        setErr(d.error || 'Upload failed')
+      } else {
+        setAnswer('part_id',      d.part_id)
+        setAnswer('part_name',    d.name || answers.part_name)
+        setAnswer('step_file_id', d.part_id)
+        setAnswer('dimensions',   d.extents_cm)
+        setAnswer('stl_url',      d.stl_url)
+        // STEP files hash to a deterministic part_id, so uploading the
+        // same STEP twice resolves to a part that may already have
+        // teach refs. Check the live count so confirm_overwrite can
+        // offer Start Fresh instead of silently piling on top.
+        try {
+          const dbg = await fetch('/api/parts/' + d.part_id + '/teach/debug')
+            .then((rr) => rr.ok ? rr.json() : null)
+          const live = Number(dbg?.npz_files || 0)
+          if (live > 0) setAnswer('existing_teach_count', live)
+        } catch {}
+      }
+    } catch (e) {
+      setErr(String(e.message || e))
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  const dims = answers.dimensions
+  return (
+    <QuestionCard
+      question="Upload the STEP file"
+      description="Drag and drop or click to browse. The system will extract dimensions and generate recognition templates."
+    >
+      <div
+        onClick={() => !uploading && inputRef.current?.click()}
+        onDrop={(e) => { e.preventDefault(); upload(e.dataTransfer.files?.[0]) }}
+        onDragOver={(e) => e.preventDefault()}
+        style={{
+          padding: 32, textAlign: 'center', cursor: uploading ? 'wait' : 'pointer',
+          border: '2px dashed #93c5fd', borderRadius: 12,
+          background: '#f0f9ff', color: '#2563EB',
+          fontSize: 15, fontWeight: 600, marginBottom: 12, minHeight: 100,
+        }}
+      >
+        {uploading
+          ? 'Processing STEP file...'
+          : answers.part_id
+            ? '+ STEP uploaded — click to replace'
+            : 'Click to browse, or drop a .STEP file here'}
+      </div>
+      <input ref={inputRef} type="file" accept=".step,.stp,.STEP,.STP"
+        style={{ display: 'none' }}
+        onChange={(e) => upload(e.target.files?.[0])}
+      />
+      {err && (
+        <div style={{
+          padding: '8px 12px', marginBottom: 10,
+          background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6,
+          fontSize: 12, color: '#DC2626',
+        }}>{err}</div>
+      )}
+      {dims && (
+        <div style={{
+          padding: 14, background: '#f0fdf4', border: '1px solid #bbf7d0',
+          borderRadius: 10, marginBottom: 12,
+        }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: '#16A34A', marginBottom: 4 }}>
+            Dimensions extracted
+          </div>
+          <div style={{ fontSize: 13, color: '#374151', fontFamily: 'monospace' }}>
+            {Number(dims[0]).toFixed(1)} × {Number(dims[1]).toFixed(1)} × {Number(dims[2]).toFixed(1)} cm
+          </div>
+        </div>
+      )}
+      <NextButton onClick={goNext} disabled={!answers.part_id} />
+    </QuestionCard>
+  )
+}
+
+function ConfirmOverwritePage({ answers, setAnswer, goNext }) {
+  const [clearing, setClearing] = useState(false)
+  const [err, setErr]           = useState(null)
+
+  const startFresh = async () => {
+    setClearing(true); setErr(null)
+    try {
+      const r = await fetch(
+        `/api/parts/${answers.part_id}/teach_clear`,
+        { method: 'POST' })
+      if (!r.ok) throw new Error('clear failed (HTTP ' + r.status + ')')
+      setAnswer('existing_teach_count', 0)
+      setAnswer('cleared_at_start', true)
+      setAnswer('adding_more', false)
+      goNext({ existing_teach_count: 0, cleared_at_start: true,
+               adding_more: false })
+    } catch (e) {
+      setErr(String(e.message || e))
+    } finally {
+      setClearing(false)
+    }
+  }
+
+  return (
+    <QuestionCard
+      question="This part already has teach references"
+      description={`"${answers.part_name}" has ${answers.existing_teach_count} existing reference${answers.existing_teach_count === 1 ? '' : 's'}. Do you want to start fresh or add to them?`}
+    >
+      {err && (
+        <div style={{
+          padding: '8px 12px', marginBottom: 10,
+          background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6,
+          fontSize: 12, color: '#DC2626',
+        }}>{err}</div>
+      )}
+      {answers.cleared_at_start && (
+        <div style={{
+          padding: '8px 12px', marginBottom: 10,
+          background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 6,
+          fontSize: 12, color: '#16A34A', fontWeight: 600,
+        }}>Refs cleared — library count will match this session.</div>
+      )}
+      {/* Bypass ChoiceButton: its accent colour only shows when
+          selected=true, so both options would look identical here.
+          The two outcomes are very different (destructive vs
+          additive) — render explicit colored buttons so the
+          operator can't pick the wrong one by accident. */}
+      <button
+        onClick={clearing ? undefined : startFresh}
+        disabled={clearing}
+        style={{
+          width: '100%', padding: '16px 18px', textAlign: 'left',
+          cursor: clearing ? 'wait' : 'pointer',
+          background: '#DC2626', color: '#fff',
+          border: '2px solid #DC2626', borderRadius: 10,
+          marginBottom: 10, minHeight: 56,
+        }}>
+        <div style={{ fontSize: 15, fontWeight: 700 }}>
+          {clearing
+            ? 'Clearing references...'
+            : `Start Fresh — delete all ${answers.existing_teach_count}`}
+        </div>
+        <div style={{ fontSize: 12, opacity: 0.9, marginTop: 3 }}>
+          Wipe the prior references and teach this part from scratch. The library count will match exactly what you capture in this session.
+        </div>
+      </button>
+      <button
+        onClick={() => {
+          setAnswer('adding_more', true)
+          goNext({ adding_more: true })
+        }}
+        disabled={clearing}
+        style={{
+          width: '100%', padding: '14px 16px', textAlign: 'left',
+          cursor: clearing ? 'wait' : 'pointer',
+          background: '#fff', color: '#111',
+          border: '2px solid #e5e7eb', borderRadius: 10,
+          minHeight: 44,
+        }}>
+        <div style={{ fontSize: 15, fontWeight: 600 }}>Add More</div>
+        <div style={{ fontSize: 12, color: '#6b7280', marginTop: 3 }}>
+          Keep the existing {answers.existing_teach_count} reference{answers.existing_teach_count === 1 ? '' : 's'} and add new captures on top.
+        </div>
+      </button>
+    </QuestionCard>
+  )
+}
+
 const PAGES = [
   // 0. Part name (skip when teaching an existing part)
   {
@@ -808,103 +997,10 @@ const PAGES = [
   {
     id: 'step_upload',
     skip: (a) => !!a.part_id || a.has_step !== true,
-    render: ({ answers, setAnswer, goNext }) => {
-      const [uploading, setUploading] = useState(false)
-      const [err, setErr]             = useState(null)
-      const inputRef                  = useRef(null)
-
-      const upload = async (file) => {
-        if (!file) return
-        if (!/\.(step|stp)$/i.test(file.name)) {
-          setErr('Only .STEP / .STP files are accepted')
-          return
-        }
-        setUploading(true); setErr(null)
-        try {
-          const fd = new FormData()
-          fd.append('file', file)
-          const r = await fetch('/api/parts/upload', { method: 'POST', body: fd })
-          const d = await r.json()
-          if (!r.ok || !d.ok) {
-            setErr(d.error || 'Upload failed')
-          } else {
-            setAnswer('part_id',     d.part_id)
-            setAnswer('part_name',   d.name || answers.part_name)
-            setAnswer('step_file_id', d.part_id)
-            setAnswer('dimensions',  d.extents_cm)
-            setAnswer('stl_url',     d.stl_url)
-            // STEP files hash to a deterministic part_id, so uploading
-            // the same STEP twice resolves to a part that may already
-            // have teach refs. Check the live count so confirm_overwrite
-            // can offer Start Fresh instead of silently piling on top.
-            try {
-              const dbg = await fetch('/api/parts/' + d.part_id + '/teach/debug')
-                .then((rr) => rr.ok ? rr.json() : null)
-              const live = Number(dbg?.npz_files || 0)
-              if (live > 0) setAnswer('existing_teach_count', live)
-            } catch {}
-          }
-        } catch (e) {
-          setErr(String(e.message || e))
-        } finally {
-          setUploading(false)
-        }
-      }
-
-      const dims = answers.dimensions
-      return (
-        <QuestionCard
-          question="Upload the STEP file"
-          description="Drag and drop or click to browse. The system will extract dimensions and generate recognition templates."
-        >
-          <div
-            onClick={() => !uploading && inputRef.current?.click()}
-            onDrop={(e) => { e.preventDefault(); upload(e.dataTransfer.files?.[0]) }}
-            onDragOver={(e) => e.preventDefault()}
-            style={{
-              padding: 32, textAlign: 'center', cursor: uploading ? 'wait' : 'pointer',
-              border: '2px dashed #93c5fd', borderRadius: 12,
-              background: '#f0f9ff', color: '#2563EB',
-              fontSize: 15, fontWeight: 600, marginBottom: 12, minHeight: 100,
-            }}
-          >
-            {uploading
-              ? 'Processing STEP file...'
-              : answers.part_id
-                ? '+ STEP uploaded — click to replace'
-                : 'Click to browse, or drop a .STEP file here'}
-          </div>
-          <input ref={inputRef} type="file" accept=".step,.stp,.STEP,.STP"
-            style={{ display: 'none' }}
-            onChange={(e) => upload(e.target.files?.[0])}
-          />
-
-          {err && (
-            <div style={{
-              padding: '8px 12px', marginBottom: 10,
-              background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6,
-              fontSize: 12, color: '#DC2626',
-            }}>{err}</div>
-          )}
-
-          {dims && (
-            <div style={{
-              padding: 14, background: '#f0fdf4', border: '1px solid #bbf7d0',
-              borderRadius: 10, marginBottom: 12,
-            }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: '#16A34A', marginBottom: 4 }}>
-                Dimensions extracted
-              </div>
-              <div style={{ fontSize: 13, color: '#374151', fontFamily: 'monospace' }}>
-                {Number(dims[0]).toFixed(1)} × {Number(dims[1]).toFixed(1)} × {Number(dims[2]).toFixed(1)} cm
-              </div>
-            </div>
-          )}
-
-          <NextButton onClick={goNext} disabled={!answers.part_id} />
-        </QuestionCard>
-      )
-    },
+    // Rendered through the StepUploadPage component (defined above)
+    // because the body uses useState + useRef; calling those inline
+    // from a render callback violates rules-of-hooks.
+    render: (props) => <StepUploadPage {...props} />,
   },
 
   // 3a. Start-fresh-vs-add-more — only when re-teaching a part that
@@ -914,84 +1010,12 @@ const PAGES = [
   {
     id: 'confirm_overwrite',
     skip: (a) => !a.part_id || (a.existing_teach_count || 0) === 0,
-    render: ({ answers, setAnswer, goNext }) => {
-      const [clearing, setClearing] = useState(false)
-      const [err, setErr]           = useState(null)
-      const startFresh = async () => {
-        setClearing(true); setErr(null)
-        try {
-          const r = await fetch(`/api/parts/${answers.part_id}/teach_clear`, { method: 'POST' })
-          if (!r.ok) throw new Error('clear failed (HTTP ' + r.status + ')')
-          setAnswer('existing_teach_count', 0)
-          setAnswer('cleared_at_start', true)
-          setAnswer('adding_more', false)
-          goNext({ existing_teach_count: 0, cleared_at_start: true, adding_more: false })
-        } catch (e) {
-          setErr(String(e.message || e))
-        } finally {
-          setClearing(false)
-        }
-      }
-      return (
-        <QuestionCard
-          question="This part already has teach references"
-          description={`"${answers.part_name}" has ${answers.existing_teach_count} existing reference${answers.existing_teach_count === 1 ? '' : 's'}. Do you want to start fresh or add to them?`}
-        >
-          {err && (
-            <div style={{
-              padding: '8px 12px', marginBottom: 10,
-              background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6,
-              fontSize: 12, color: '#DC2626',
-            }}>{err}</div>
-          )}
-          {answers.cleared_at_start && (
-            <div style={{
-              padding: '8px 12px', marginBottom: 10,
-              background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 6,
-              fontSize: 12, color: '#16A34A', fontWeight: 600,
-            }}>Refs cleared — library count will match this session.</div>
-          )}
-          {/* Bypass ChoiceButton: its accent colour only shows when
-              selected=true, so both options would look identical here.
-              The two outcomes are very different (destructive vs
-              additive) — render explicit colored buttons so the
-              operator can't pick the wrong one by accident. */}
-          <button onClick={clearing ? undefined : startFresh} disabled={clearing}
-            style={{
-              width: '100%', padding: '16px 18px', textAlign: 'left',
-              cursor: clearing ? 'wait' : 'pointer',
-              background: '#DC2626', color: '#fff',
-              border: '2px solid #DC2626', borderRadius: 10,
-              marginBottom: 10, minHeight: 56,
-            }}>
-            <div style={{ fontSize: 15, fontWeight: 700 }}>
-              {clearing ? 'Clearing references...' : `Start Fresh — delete all ${answers.existing_teach_count}`}
-            </div>
-            <div style={{ fontSize: 12, opacity: 0.9, marginTop: 3 }}>
-              Wipe the prior references and teach this part from scratch. The library count will match exactly what you capture in this session.
-            </div>
-          </button>
-          <button
-            onClick={() => {
-              setAnswer('adding_more', true)
-              goNext({ adding_more: true })
-            }}
-            disabled={clearing}
-            style={{
-              width: '100%', padding: '14px 16px', textAlign: 'left',
-              cursor: clearing ? 'wait' : 'pointer',
-              background: '#fff', color: '#111',
-              border: '2px solid #e5e7eb', borderRadius: 10,
-              minHeight: 44,
-            }}>
-            <div style={{ fontSize: 15, fontWeight: 600 }}>Add More</div>
-            <div style={{ fontSize: 12, color: '#6b7280', marginTop: 3 }}>
-              Keep the existing {answers.existing_teach_count} reference{answers.existing_teach_count === 1 ? '' : 's'} and add new captures on top.
-            </div>
-          </button>
-        </QuestionCard>
-      )
-    },
+    // Rendered through the ConfirmOverwritePage component (defined
+    // above) because the body uses useState; calling that inline
+    // from a render callback violates rules-of-hooks and previously
+    // crashed the wizard to a blank fail-page whenever Add More
+    // moved the operator past this page.
+    render: (props) => <ConfirmOverwritePage {...props} />,
   },
 
   // 4. Pickable count
