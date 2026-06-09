@@ -29,6 +29,7 @@ import collections
 import json
 import math
 import os
+import time
 import numpy as np
 import rclpy
 import yaml
@@ -232,6 +233,27 @@ class DepthSegmentNode(Node):
         # off those frames, so we short-circuit recognition entirely until
         # the wizard tells us it's done.
         self._teach_mode   = False
+        # ── Teach lock state ─────────────────────────────────────────
+        # During teach the operator places exactly one part. Specular
+        # dropouts on shiny aluminum can fragment that part into 2-3
+        # detections per frame. The lock fuses fragments by re-segmenting
+        # a ROI around the first frame's centroid and returning exactly
+        # one detection per frame for the rest of the session. State
+        # below is inert until start_teach resets it (see
+        # _on_teach_command / _reset_teach_lock).
+        self._teach_lock_active             = False
+        self._teach_lock_centroid           = None   # (cx, cy) pixels
+        self._teach_lock_bbox               = None   # (w, h) pixels
+        self._teach_lock_area               = None   # pixels
+        self._teach_lock_last_seen          = None
+        self._teach_lock_search_radius_mult = 2.5
+        self._teach_lock_misses             = 0
+        self._teach_lock_last_log_t         = 0.0
+        # Per-frame caches set in _process right before _emit so the
+        # teach lock (which runs from _emit) can reach the latest depth
+        # + foreground without changing _emit's call signature.
+        self._last_depth_frame = None
+        self._last_foreground  = None
         self._load_teach_refs()
         self._backfill_classifiers()
         self._load_templates()
@@ -949,6 +971,12 @@ class DepthSegmentNode(Node):
         fx, fy, cx, cy = K
         h, w = depth.shape
         u, v = self._uv_grids(h, w)
+        # The teach lock (called from _emit) needs the current frame's
+        # depth + foreground mask. Default to None up front so the early
+        # returns below leave a safe "no observation" state; populate
+        # right before the _emit call on the success path.
+        self._last_depth_frame = None
+        self._last_foreground  = None
 
         # Tighter valid gate: depth > self.min_depth (default 0.10 m)
         # rather than depth > 0. The RealSense D435i frequently emits
@@ -969,164 +997,64 @@ class DepthSegmentNode(Node):
         X = (u - cx) * Z / fx
         Y = (v - cy) * Z / fy
 
-        # ── Foreground detection at half resolution ───────────────────
-        # All the expensive ops (plane fit, depth Sobel, morphology,
-        # boundary carving, fill_holes) run on a 240×320 downsample —
-        # ~4× fewer pixels for the same detection quality. A 2 cm
-        # part at 0.5 m still spans ~20 px at half-res so component
-        # extraction never loses anything we care about. The final
-        # foreground mask is upsampled back to full-res before bbox
-        # extraction; the per-bbox crops then use raw full-res depth
-        # so OBB / matching downstream is unaffected.
-        from scipy.ndimage import zoom as _zoom_hr
-        _half_h = h // 2
-        _half_w = w // 2
-        # order=1 for depth (smooth gradients matter for the Sobel),
-        # order=0 (nearest) for the valid mask (just a binary flag).
-        depth_half = _zoom_hr(depth, 0.5, order=1)
-        valid_half = _zoom_hr(valid.astype(np.float32), 0.5, order=0) > 0.5
-
-        # Plane fit on the half-res grid. Scale intrinsics to match —
-        # fx/fy are pixel-per-metre at the half-res sampling.
-        fx_h = fx * 0.5; fy_h = fy * 0.5
-        cx_h = cx * 0.5; cy_h = cy * 0.5
-        u_h, v_h = self._uv_grids(_half_h, _half_w)
-        Z_h = np.where(valid_half, depth_half, 0.0).astype(np.float32)
-        X_h = (u_h - cx_h) * Z_h / fx_h
-        Y_h = (v_h - cy_h) * Z_h / fy_h
-        vy_h, vx_h = np.nonzero(valid_half)
-        # Sample budget halved alongside the resolution — same
-        # statistical power on a 4× smaller pixel grid.
-        if vy_h.size > 2000:
-            sel = np.random.choice(vy_h.size, 2000, replace=False)
-            vy_h, vx_h = vy_h[sel], vx_h[sel]
-        plane = self._fit_plane(
-            X_h[vy_h, vx_h], Y_h[vy_h, vx_h], Z_h[vy_h, vx_h])
+        # Adaptive (planar) background fit on a random valid subsample
+        vy, vx = np.nonzero(valid)
+        if vy.size > 4000:
+            sel = np.random.choice(vy.size, 4000, replace=False)
+            vy, vx = vy[sel], vx[sel]
+        plane = self._fit_plane(X[vy, vx], Y[vy, vx], Z[vy, vx])
         if plane is None:
             self._history.append([])
             self._emit(h, w)
             return
         a, b, c = plane
-        plane_z_h = a * X_h + b * Y_h + c
-        # (a) planar background subtraction at half-res.
-        plane_fg_h = valid_half & (depth_half < (plane_z_h - self.floor_tol))
-        # (b) depth edges at half-res. depth_filled_h is reused
-        # later by the boundary carving block (CHANGE 4) so we
-        # compute it here once.
-        depth_filled_h = np.where(
-            valid_half, depth_half, plane_z_h).astype(np.float32)
-        gmag_h = np.hypot(
-            ndimage.sobel(depth_filled_h, axis=0, mode='nearest'),
-            ndimage.sobel(depth_filled_h, axis=1, mode='nearest'))
-        edge_fg_h = valid_half & (gmag_h > self.edge_thresh)
-        foreground_h = plane_fg_h | edge_fg_h
+        plane_z = a * X + b * Y + c
+        # (a) planar background subtraction: pixels nearer than the surface
+        plane_fg = valid & (depth < (plane_z - self.floor_tol))
+        # (b) depth edges: a sharp depth discontinuity marks an object boundary
+        # even when the height above the surface is tiny. Fill invalid pixels
+        # with the plane depth first, so data holes don't create spurious edges.
+        depth_filled = np.where(valid, depth, plane_z).astype(np.float32)
+        gmag = np.hypot(ndimage.sobel(depth_filled, axis=0, mode='nearest'),
+                        ndimage.sobel(depth_filled, axis=1, mode='nearest'))
+        edge_fg = valid & (gmag > self.edge_thresh)
+        foreground = plane_fg | edge_fg
 
-        # ── Plane-fit guard for close-up parts ──────────────────────
-        # When the part dominates the frame (camera ~30 cm from a 6 cm
-        # bracket, for example), RANSAC fits the plane to the PART
-        # surface rather than the table. plane_fg then collapses to
-        # near-empty — the part shows up only as a thin edge ring,
-        # which the morphology stage can't recover into a solid mask.
-        #
-        # If plane_fg covers <2 % of valid pixels, treat the plane fit
-        # as suspect. Fall back to the edge channels alone (depth edges
-        # plus the cached half-res RGB edge mask) and aggressively
-        # dilate to fill the outline into a solid blob. Detection on
-        # the resulting mask then works regardless of the bad plane.
-        _valid_count    = int(valid_half.sum())
-        _plane_fg_count = int(plane_fg_h.sum())
-        if (_valid_count > 0
-                and _plane_fg_count < _valid_count * 0.02):
-            foreground_h = edge_fg_h.copy()
-            # _rgb_edge_fg_h is initialised by the RGB Sobel block
-            # further down in _process, so on the very first frame
-            # it may not exist as an attribute yet. getattr keeps
-            # this guard safe before that block has run once.
-            _cached_rgb_h = getattr(self, '_rgb_edge_fg_h', None)
-            if _cached_rgb_h is not None:
-                try:
-                    foreground_h = foreground_h | _cached_rgb_h
-                except ValueError:
-                    pass
-            foreground_h = ndimage.binary_dilation(
-                foreground_h, iterations=6)
-            foreground_h = foreground_h & valid_half
-
-        # (c) RGB edges: catches flat dark objects with minimal depth
-        # difference from the surface but visible colour boundaries.
-        # Run at HALF resolution, every OTHER frame — the depth path
-        # already catches most objects every frame, so dropping the
-        # RGB pass to ~7.5 Hz has no visible effect on detection and
-        # saves ~9 ms/frame.
-        if not hasattr(self, '_rgb_frame_counter'):
-            self._rgb_frame_counter = 0
-            self._rgb_edge_fg_h = None
-        self._rgb_frame_counter += 1
+        # (c) RGB edges: catches flat dark objects that have minimal depth
+        # difference from the surface but visible colour/texture boundaries.
         rgb = self._color_rgb
-        if (rgb is not None
-                and rgb.shape[0] == h
-                and rgb.shape[1] == w
-                and self._rgb_frame_counter % 2 == 0):
-            gray_full = (0.299 * rgb[:, :, 0]
-                         + 0.587 * rgb[:, :, 1]
-                         + 0.114 * rgb[:, :, 2]).astype(np.float32)
-            gray_h = _zoom_hr(gray_full, 0.5, order=1)
-            rgb_gmag_h = np.hypot(
-                ndimage.sobel(gray_h, axis=0, mode='nearest'),
-                ndimage.sobel(gray_h, axis=1, mode='nearest'))
-            self._rgb_edge_fg_h = (
-                (_zoom_hr(valid.astype(np.float32), 0.5, order=0) > 0.5)
-                & (rgb_gmag_h > self.rgb_edge_thresh))
-        if self._rgb_edge_fg_h is not None:
-            try:
-                foreground_h = foreground_h | self._rgb_edge_fg_h
-            except ValueError:
-                # Resolution changed between frames — drop the stale
-                # cached mask and pick up the new shape next pass.
-                self._rgb_edge_fg_h = None
+        if rgb is not None and rgb.shape[0] == h and rgb.shape[1] == w:
+            gray = (0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1]
+                    + 0.114 * rgb[:, :, 2]).astype(np.float32)
+            rgb_gmag = np.hypot(ndimage.sobel(gray, axis=0, mode='nearest'),
+                                ndimage.sobel(gray, axis=1, mode='nearest'))
+            rgb_edge_fg = valid & (rgb_gmag > self.rgb_edge_thresh)
+            foreground = foreground | rgb_edge_fg
 
-        # Closing (dilate->erode) fills gaps in/between fragments; fill
-        # enclosed edge contours; THEN opening (erode->dilate) removes
-        # speckle. All at HALF res — 4× fewer pixels, ~4× faster. Kernel
-        # sizes halved to maintain the same physical coverage; the 5×5
-        # bbox-stabilising closing drops to 3×3 for the same reason.
-        _dk_h = max(1, self.dilate_k // 2)
-        _ek_h = max(1, self.erode_k  // 2)
-        foreground_h = self._erode(
-            self._dilate(foreground_h, _dk_h), _dk_h)
-        foreground_h = ndimage.binary_fill_holes(foreground_h)
-        foreground_h = self._dilate(
-            self._erode(foreground_h, _ek_h), _ek_h)
-        foreground_h = ndimage.binary_closing(
-            foreground_h,
-            structure=np.ones((3, 3), dtype=bool), iterations=1)
+        # Closing (dilate->erode) fills gaps in/between fragments; fill enclosed
+        # edge contours; THEN opening (erode->dilate) removes speckle noise.
+        foreground = self._erode(self._dilate(foreground, self.dilate_k), self.dilate_k)
+        foreground = ndimage.binary_fill_holes(foreground)
+        foreground = self._dilate(self._erode(foreground, self.erode_k), self.erode_k)
+        # Stabilise mask edges: a small 5x5 closing fills 1-2 px gaps that
+        # appear and disappear across frames and otherwise wobble the bbox.
+        foreground = ndimage.binary_closing(
+            foreground, structure=np.ones((5, 5), dtype=bool), iterations=1)
 
         # Carve depth-discontinuity boundaries OUT of the foreground so
-        # neighbouring objects whose 2D masks touch get split. Uses
-        # true per-pixel depth derivatives (np.gradient), not sobel-
-        # scaled values — threshold is "metres per pixel". All at
-        # half-res; valid_half + depth_filled_h were computed in
-        # CHANGE 1 above.
-        gy_h, gx_h = np.gradient(depth_filled_h)
-        boundary_h = (np.hypot(gx_h, gy_h) > self.split_thresh) & valid_half
-        boundary_h = ndimage.binary_dilation(boundary_h, iterations=1)
-        foreground_h = foreground_h & ~boundary_h
-        # Re-fill enclosed holes that the carving just opened. For a
-        # ring the inner depth edge gets carved, leaving the centre
-        # disconnected; fill_holes only fills regions FULLY surrounded
-        # by foreground, so two distinct objects with a carved gap
-        # that touches the image border stay split — only ring-style
-        # enclosed holes are restored.
-        foreground_h = ndimage.binary_fill_holes(foreground_h)
-
-        # Upsample the half-res foreground mask back to full resolution
-        # for bbox extraction and per-object cropping downstream.
-        # order=0 (nearest-neighbour) preserves sharp blob boundaries —
-        # any smoothing would round corners off the silhouette. Trim
-        # to (h, w) in case zoom over-shoots by 1 px on odd image dims.
-        foreground = _zoom_hr(
-            foreground_h.astype(np.float32), 2.0, order=0) > 0.5
-        foreground = foreground[:h, :w]
+        # neighbouring objects whose 2D masks touch get split. Uses true
+        # per-pixel depth derivatives (np.gradient), not sobel-scaled
+        # values — threshold is "metres per pixel".
+        gy, gx = np.gradient(depth_filled)
+        boundary = (np.hypot(gx, gy) > self.split_thresh) & valid
+        boundary = ndimage.binary_dilation(boundary, iterations=1)
+        foreground = foreground & ~boundary
+        # Re-fill enclosed holes that the carving just opened. For a ring
+        # the inner depth edge gets carved, leaving the centre disconnected;
+        # fill_holes only fills regions FULLY surrounded by foreground, so
+        # two distinct objects with a carved gap that touches the image
+        # border stay split — only ring-style enclosed holes are restored.
+        foreground = ndimage.binary_fill_holes(foreground)
 
         # Multi-scale connected components: full res + 2x block-OR downsample
         bboxes = self._components(foreground, scale=1)
@@ -1314,6 +1242,11 @@ class DepthSegmentNode(Node):
                 if bx1 > bx0 and by1 > by0:
                     o['color_crop'] = rgb_full[by0:by1, bx0:bx1].copy()
 
+        # Stash the current frame for the teach lock to consume from
+        # _emit. Plain references — both arrays are not mutated below
+        # this point.
+        self._last_depth_frame = depth
+        self._last_foreground  = foreground
         self._history.append(objects)
         self._emit(h, w)
 
@@ -1430,6 +1363,48 @@ class DepthSegmentNode(Node):
                     for k, v in self._teach_refs.items())
             )
 
+        # ── TEACH_READINESS: per-part rollup ──────────────────────────
+        # For every part in index.json, report how many refs are taught
+        # and how many of those refs carry full orientation metadata
+        # (is_pickable + orientation_label). Re-teach campaigns can use
+        # this to confirm Start Fresh actually emptied the cache and
+        # subsequent captures populated the metadata fields.
+        #
+        # Lighting conditions are NOT currently captured in the .npz
+        # format — explicitly logged so operators planning a re-teach
+        # under new lighting know there's no per-ref lighting record
+        # to consult. Could be added in a future schema bump.
+        all_parts = []
+        try:
+            with open('/opt/cobot/parts/index.json') as _f:
+                all_parts = (json.load(_f) or {}).get('parts') or []
+        except Exception:
+            pass
+        if all_parts:
+            self.get_logger().info('TEACH_READINESS:')
+            for _p in all_parts:
+                _pid = _p.get('id')
+                _name = _p.get('name') or self._id_to_name(_pid)
+                _refs = self._teach_refs.get(_pid, [])
+                _n_meta = sum(
+                    1 for _r in _refs
+                    if _r.get('orientation_label')
+                    and 'is_pickable' in _r
+                )
+                self.get_logger().info(
+                    f'  {_name:<14} id={(_pid or "—")[:8]:<8} '
+                    f'refs={len(_refs):>3}  with_orientation_meta={_n_meta:>3}  '
+                    f'lighting=NOT_CAPTURED'
+                )
+            # Orphans: teach dirs that don't have an index.json entry.
+            _indexed = {_p.get('id') for _p in all_parts}
+            for _pid in self._teach_refs:
+                if _pid not in _indexed:
+                    self.get_logger().warn(
+                        f'TEACH_READINESS: ORPHAN refs for id={_pid[:8]} '
+                        f'(not in index.json — operator should re-index '
+                        f'or wipe before re-teaching)')
+
         # Load pre-trained orientation classifiers for each part.
         # Rebuilt every time refs change (via _on_teach_command +
         # _backfill_classifiers); this just re-hydrates the runtime
@@ -1512,10 +1487,15 @@ class DepthSegmentNode(Node):
             return
         if action == 'start_teach':
             self._teach_mode = True
+            # Fresh session: discard any stale lock from a previous run.
+            self._reset_teach_lock()
             self.get_logger().info('TEACH MODE ON — recognition suppressed')
             return
         if action == 'stop_teach':
             self._teach_mode = False
+            # Clean up so the next non-teach frame returns to normal
+            # multi-object detection immediately.
+            self._reset_teach_lock()
             self.get_logger().info('TEACH MODE OFF — recognition resumed')
             return
         if action != 'teach':
@@ -2184,6 +2164,236 @@ class DepthSegmentNode(Node):
         except Exception:
             pass
 
+    # ── Teach lock ──────────────────────────────────────────────────────────
+    #
+    # During teach mode the operator places exactly one part in the scene.
+    # Specular dropouts on shiny aluminum can fragment that part into 2-3
+    # bounding boxes per frame (and a different 2-3 next frame). The lock:
+    #
+    #   1. First frame with a detection: stash centroid + bbox + area as
+    #      the "expected" position; return that single detection.
+    #   2. Subsequent frames: search a 2.5× bbox ROI around the locked
+    #      centroid, aggressively close gaps, take the largest connected
+    #      component, rebuild a single detection from it. Update centroid
+    #      with a gentle EMA so the lock follows slow operator movement.
+    #   3. If nothing in ROI for 30 frames, expand the radius once.
+    #      If still nothing after 60 misses total, release the lock.
+    #
+    # Runs ONLY when self._teach_mode is True (gated in _emit). Normal
+    # multi-object detection is unaffected.
+
+    def _reset_teach_lock(self):
+        """Full reset — called on start_teach / stop_teach transitions."""
+        self._teach_lock_active             = False
+        self._teach_lock_centroid           = None
+        self._teach_lock_bbox               = None
+        self._teach_lock_area               = None
+        self._teach_lock_last_seen          = None
+        self._teach_lock_search_radius_mult = 2.5
+        self._teach_lock_misses             = 0
+        self._teach_lock_last_log_t         = 0.0
+
+    def _teach_lock_release_runtime(self):
+        """Soft release after sustained misses; keeps tunables but clears
+        the measured state so the next valid detection can re-establish."""
+        self._teach_lock_active             = False
+        self._teach_lock_centroid           = None
+        self._teach_lock_bbox               = None
+        self._teach_lock_area               = None
+        self._teach_lock_search_radius_mult = 2.5
+        self._teach_lock_misses             = 0
+
+    def _maybe_log_teach_lock(self, established=False):
+        """Throttled 1 Hz log of lock state. `established=True` forces a
+        log line on the frame the lock is set up so the operator can see
+        it in journal output even if logs are quiet otherwise."""
+        now = time.monotonic()
+        if not established and (now - self._teach_lock_last_log_t) < 1.0:
+            return
+        if self._teach_lock_centroid is None:
+            return
+        cx, cy = self._teach_lock_centroid
+        bw, bh = self._teach_lock_bbox or (None, None)
+        self.get_logger().info(
+            f'TEACH_LOCK: centroid=({int(cx)},{int(cy)}) '
+            f'bbox=({int(bw) if bw else None},{int(bh) if bh else None}) '
+            f'area={self._teach_lock_area} '
+            f'misses={self._teach_lock_misses} '
+            f'radius_mult={self._teach_lock_search_radius_mult}')
+        self._teach_lock_last_log_t = now
+
+    def _teach_lock_handle_miss(self):
+        """Increment miss counter, expand radius at 30 misses, release at
+        60 misses. Returns [] so the caller emits no detection this frame."""
+        self._teach_lock_misses += 1
+        if self._teach_lock_misses == 30:
+            self._teach_lock_search_radius_mult = 4.0
+            self.get_logger().info(
+                f'TEACH_LOCK: 30 consecutive misses — expanding search '
+                f'radius mult to {self._teach_lock_search_radius_mult}')
+        elif self._teach_lock_misses >= 60:
+            self.get_logger().info(
+                f'TEACH_LOCK: {self._teach_lock_misses} consecutive '
+                f'misses — releasing lock')
+            self._teach_lock_release_runtime()
+            return []
+        self._maybe_log_teach_lock()
+        return []
+
+    @staticmethod
+    def _detection_area(d):
+        """Pixel area of a detection. Prefer mask_2d (cleaned silhouette);
+        fall back to bbox area if mask is missing."""
+        m = d.get('mask_2d')
+        if m is not None:
+            return int(m.sum())
+        x0, y0, x1, y1 = d.get('bbox_px', (0, 0, 0, 0))
+        return max(0, int(x1) - int(x0)) * max(0, int(y1) - int(y0))
+
+    def _apply_teach_lock(self, detections, depth_frame, foreground_mask):
+        """Fuse fragments of the single taught part into one detection.
+
+        Returns a list with exactly 0 or 1 elements.
+        """
+        # ── First frame: try to establish a lock ─────────────────────
+        if self._teach_lock_centroid is None:
+            if not detections:
+                return []
+            largest = max(detections, key=self._detection_area)
+            x0, y0, x1, y1 = largest['bbox_px']
+            bbw = max(1, int(x1) - int(x0))
+            bbh = max(1, int(y1) - int(y0))
+            self._teach_lock_centroid = (
+                (int(x0) + int(x1)) * 0.5,
+                (int(y0) + int(y1)) * 0.5,
+            )
+            self._teach_lock_bbox    = (bbw, bbh)
+            self._teach_lock_area    = self._detection_area(largest)
+            self._teach_lock_misses  = 0
+            self._teach_lock_active  = True
+            self._maybe_log_teach_lock(established=True)
+            return [largest]
+
+        # ── Subsequent frames: re-segment ROI around locked centroid ─
+        if foreground_mask is None or depth_frame is None:
+            return self._teach_lock_handle_miss()
+
+        h, w = foreground_mask.shape
+        bbw, bbh = self._teach_lock_bbox
+        rmult = self._teach_lock_search_radius_mult
+        half_w = max(8, int(bbw * rmult / 2.0))
+        half_h = max(8, int(bbh * rmult / 2.0))
+        cx_px, cy_px = self._teach_lock_centroid
+        x0 = max(0, int(cx_px - half_w))
+        x1 = min(w, int(cx_px + half_w))
+        y0 = max(0, int(cy_px - half_h))
+        y1 = min(h, int(cy_px + half_h))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return self._teach_lock_handle_miss()
+
+        roi = foreground_mask[y0:y1, x0:x1]
+        if not roi.any():
+            return self._teach_lock_handle_miss()
+
+        # Aggressive closing to bridge specular gaps. 8 iterations of a
+        # 3×3 structuring element ≈ 17 px closing — heavier than the
+        # default 15×15 morphology so shiny-part fragments fuse cleanly.
+        roi_closed = ndimage.binary_closing(
+            roi, structure=np.ones((3, 3), dtype=bool), iterations=8)
+        labels, n_lbl = ndimage.label(roi_closed)
+        if n_lbl == 0:
+            return self._teach_lock_handle_miss()
+        sizes = ndimage.sum(roi_closed, labels, range(1, n_lbl + 1))
+        largest_id   = int(np.argmax(sizes)) + 1
+        largest_area = int(sizes[largest_id - 1])
+        if largest_area < 100:
+            return self._teach_lock_handle_miss()
+
+        cc = labels == largest_id
+
+        # Tight bbox in ROI coords → full-frame coords
+        ys, xs = np.where(cc)
+        rx0, ry0 = int(xs.min()), int(ys.min())
+        rx1, ry1 = int(xs.max()) + 1, int(ys.max()) + 1
+        fx0 = x0 + rx0
+        fy0 = y0 + ry0
+        fx1 = x0 + rx1
+        fy1 = y0 + ry1
+
+        sub_fg    = cc[ry0:ry1, rx0:rx1]
+        sub_depth = depth_frame[fy0:fy1, fx0:fx1]
+
+        # Reuse the same point-refinement + OBB-fit helpers the normal
+        # pipeline uses so the produced detection has the exact same
+        # schema (and downstream publish / annotate code is unchanged).
+        fx, fy, cx, cy = self._K
+        pts3d = self._refine_object_points(
+            sub_depth, sub_fg.astype(bool),
+            fx, fy, cx - fx0, cy - fy0)
+
+        if pts3d.shape[0] >= 20:
+            centroid_3d, size_3d, R = self._fit_obb(pts3d)
+            quat, euler = self._rmat_to_quat_euler(R)
+            corners = self._obb_corners(centroid_3d, size_3d, R)
+            det = {
+                'bbox_px': (int(fx0), int(fy0), int(fx1), int(fy1)),
+                'pos':     (float(centroid_3d[0]),
+                            float(centroid_3d[1]),
+                            float(centroid_3d[2])),
+                'size_3d': (float(size_3d[0]),
+                            float(size_3d[1]),
+                            float(size_3d[2])),
+                'quat':    tuple(float(q) for q in quat),
+                'euler':   euler,
+                'corners': corners,
+                'obb':     True,
+                '_pts3d':  pts3d,
+                'mask_2d': np.ascontiguousarray(sub_fg, dtype=bool),
+                'depth_2d': np.ascontiguousarray(sub_depth, dtype=np.float32),
+            }
+        elif pts3d.shape[0] >= 5:
+            centroid_3d = pts3d.mean(axis=0)
+            extents = pts3d.max(axis=0) - pts3d.min(axis=0)
+            det = {
+                'bbox_px': (int(fx0), int(fy0), int(fx1), int(fy1)),
+                'pos':     tuple(float(v) for v in centroid_3d),
+                'size_3d': tuple(float(v) for v in extents.clip(0.01, None)),
+                'quat':    (0.0, 0.0, 0.0, 1.0),
+                'euler':   (0.0, 0.0, 0.0),
+                'corners': None,
+                'obb':     False,
+                '_pts3d':  pts3d,
+                'mask_2d': np.ascontiguousarray(sub_fg, dtype=bool),
+                'depth_2d': np.ascontiguousarray(sub_depth, dtype=np.float32),
+            }
+        else:
+            return self._teach_lock_handle_miss()
+
+        # Attach color crop for parity with the normal pipeline (teach
+        # capture relies on this).
+        rgb_full = self._color_rgb
+        if (rgb_full is not None
+                and rgb_full.shape[0] == h and rgb_full.shape[1] == w):
+            det['color_crop'] = rgb_full[fy0:fy1, fx0:fx1].copy()
+
+        # Update lock state with a gentle EMA so slow operator movement
+        # is tracked but per-frame noise doesn't drag the centroid.
+        measured_cx = (fx0 + fx1) * 0.5
+        measured_cy = (fy0 + fy1) * 0.5
+        self._teach_lock_centroid = (
+            0.7 * cx_px + 0.3 * measured_cx,
+            0.7 * cy_px + 0.3 * measured_cy,
+        )
+        self._teach_lock_bbox    = (fx1 - fx0, fy1 - fy0)
+        self._teach_lock_area    = largest_area
+        self._teach_lock_misses  = 0
+        # If the radius had been expanded, ease back toward default now
+        # that we have a confident reacquisition.
+        if self._teach_lock_search_radius_mult > 2.5:
+            self._teach_lock_search_radius_mult = 2.5
+        self._maybe_log_teach_lock()
+        return [det]
+
     def _emit(self, h, w):
         """Apply temporal smoothing, match against the parts library,
         then publish detections + annotated image."""
@@ -2198,6 +2408,13 @@ class DepthSegmentNode(Node):
         # mode would otherwise persist and render a stale pill on top
         # of the green teach box; clear the matching fields here.
         if self._teach_mode:
+            # Fuse fragments of the one taught part into a single
+            # detection before clearing match fields. The lock returns
+            # exactly 0 or 1 element. The matching pipeline is already
+            # short-circuited below, so this only affects what gets
+            # published / annotated.
+            stable = self._apply_teach_lock(
+                stable, self._last_depth_frame, self._last_foreground)
             for o in stable:
                 o['part_name']         = None
                 o['part_id']           = None
@@ -2650,6 +2867,55 @@ class DepthSegmentNode(Node):
         except Exception:
             pass
         return out
+
+    def _id_to_name(self, part_id):
+        """Resolve a part_id (hex) → human-readable name.
+
+        Looks up index.json, falls back to metadata/<id>.json, then to
+        'UNKNOWN PART (xxxxxxxx)' if both fail. Warns once per failing
+        id so the raw hex never leaks into any user-facing string
+        (labels, log lines, /perception/detections_3d class_id).
+        """
+        if not hasattr(self, '_id_name_cache'):
+            self._id_name_cache = {}
+            self._id_name_warned = set()
+        if part_id is None:
+            return 'UNKNOWN PART (none)'
+        if part_id in self._id_name_cache:
+            return self._id_name_cache[part_id]
+        name = None
+        try:
+            idx_path = '/opt/cobot/parts/index.json'
+            if os.path.isfile(idx_path):
+                with open(idx_path) as f:
+                    idx = json.load(f) or {}
+                for p in (idx.get('parts') or []):
+                    if p.get('id') == part_id:
+                        name = p.get('name')
+                        break
+        except Exception:
+            pass
+        if not name:
+            try:
+                meta_path = f'/opt/cobot/parts/metadata/{part_id}.json'
+                if os.path.isfile(meta_path):
+                    with open(meta_path) as f:
+                        name = (json.load(f) or {}).get('name')
+            except Exception:
+                pass
+        if not name:
+            name = f'UNKNOWN PART ({str(part_id)[:8]})'
+            if part_id not in self._id_name_warned:
+                self.get_logger().warn(
+                    f'name lookup failed for part_id={part_id!r}; '
+                    f'using "{name}". Add an entry to '
+                    f'/opt/cobot/parts/index.json to fix.')
+                self._id_name_warned.add(part_id)
+        # Don't cache the UNKNOWN string — a future index.json edit
+        # should be picked up without a restart.
+        if not name.startswith('UNKNOWN PART'):
+            self._id_name_cache[part_id] = name
+        return name
 
     @staticmethod
     def _load_orient_weights(part_id, defaults):
@@ -3459,9 +3725,12 @@ class DepthSegmentNode(Node):
 
         Two stages:
           1) STEP-file dimension gate — exact ground-truth extents from
-             /opt/cobot/parts/index.json. Each XY dim must be within 50%
-             of the part's two largest CAD extents and aspect within 50%.
-             Eliminates impossible candidates before any image work.
+             /opt/cobot/parts/index.json. Each XY dim and the aspect
+             ratio must be within 25% of the part's CAD values (i.e.
+             min/max ratio ≥ 0.75). Eliminates impossible candidates
+             before any image work. When multiple parts pass the gate,
+             the identity decision goes to the one with LOWEST total
+             dimension error — see SIZE_GATE_BEST_MATCH below.
           2) Grayscale NCC at the SAME physical resolution as each teach
              reference, best of 4 rotations.
 
@@ -3563,17 +3832,64 @@ class DepthSegmentNode(Node):
         clf_is_pick    = None
         clf_confidence = 0.0
 
+        # ── SIZE_GATE pre-pass ────────────────────────────────────────
+        # Tolerance: each dim and the aspect ratio must be within 25%
+        # of the part's CAD dimensions (i.e. min/max ratio ≥ 0.75).
+        # Tighter than the older 0.50 floor; still looser than D435i
+        # depth noise on a tabletop part at 0.35 m. We log a one-line
+        # summary of every candidate (pass/fail + dimension error) so
+        # the operator can see WHY a part was rejected without rerunning
+        # the matcher. Throttled to 2 s so the log stays readable when
+        # detections fire every frame.
+        SIZE_GATE_RATIO_FLOOR = 0.75
+        gate_summary  = []
+        gate_passers  = []     # [(part_id, avg_err)] for parts with STEP + taught
+        for _pid, _sd in step_dims.items():
+            if _pid not in self._teach_refs:
+                # Skip parts with a CAD entry but no taught refs — they
+                # can never produce a match, so listing them is just noise.
+                continue
+            _r0 = min(det_s[0], _sd[0]) / max(det_s[0], _sd[0], 0.001)
+            _r1 = min(det_s[1], _sd[1]) / max(det_s[1], _sd[1], 0.001)
+            _step_asp = _sd[0] / max(_sd[1], 0.001)
+            _asp_r = (min(det_asp, _step_asp)
+                      / max(det_asp, _step_asp, 0.001))
+            _passed = (_r0 >= SIZE_GATE_RATIO_FLOOR
+                       and _r1 >= SIZE_GATE_RATIO_FLOOR
+                       and _asp_r >= SIZE_GATE_RATIO_FLOOR)
+            _avg_err = ((1.0 - _r0) + (1.0 - _r1) + (1.0 - _asp_r)) / 3.0
+            _nm = self._id_to_name(_pid)
+            gate_summary.append(
+                f'{_nm}({"pass" if _passed else "fail"}, '
+                f'dim_err={_avg_err*100:.1f}%)')
+            if _passed:
+                gate_passers.append((_pid, _avg_err))
+        if gate_summary:
+            self.get_logger().info(
+                f'SIZE_GATE: det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm] '
+                f'candidates: ' + ', '.join(gate_summary),
+                throttle_duration_sec=2.0)
+        gate_passer_ids = {p[0] for p in gate_passers}
+
+        # Per-part match cache so the SIZE_GATE_BEST_MATCH override
+        # below can swap identity without re-running the matcher.
+        per_part_match = {}
+
         for part_id, refs in self._teach_refs.items():
             # ── Size gate from STEP dimensions ─────────────────────────
+            # Pre-pass above already classified each candidate. For
+            # parts with a CAD entry, skip those that didn't pass. For
+            # parts without CAD (camera-only legacy refs), treat
+            # size_score as neutral.
             sd = step_dims.get(part_id)
             if sd is not None:
+                if part_id not in gate_passer_ids:
+                    continue
                 r0 = min(det_s[0], sd[0]) / max(det_s[0], sd[0], 0.001)
                 r1 = min(det_s[1], sd[1]) / max(det_s[1], sd[1], 0.001)
                 step_asp = sd[0] / max(sd[1], 0.001)
                 asp_r = (min(det_asp, step_asp)
                          / max(det_asp, step_asp, 0.001))
-                if r0 < 0.50 or r1 < 0.50 or asp_r < 0.50:
-                    continue
                 size_score = (r0 + r1 + asp_r) / 3.0
             else:
                 size_score = 0.5  # no STEP record — neutral
@@ -3934,19 +4250,49 @@ class DepthSegmentNode(Node):
             except Exception:
                 pass
 
+            # Cache every part's match outcome so the post-loop
+            # SIZE_GATE_BEST_MATCH override can swap identity without
+            # re-running the matcher.
+            per_part_match[part_id] = {
+                'name':     self._id_to_name(part_id),
+                'combined': float(combined),
+                'best_ref_meta': best_ref_for_part,
+            }
+
             if combined > best_score:
                 best_score = combined
                 best_id    = part_id
                 best_ref_meta = best_ref_for_part
-                meta_path  = f'/opt/cobot/parts/metadata/{part_id}.json'
-                if os.path.isfile(meta_path):
-                    try:
-                        with open(meta_path) as fp:
-                            best_name = json.load(fp).get('name') or part_id
-                    except Exception:
-                        best_name = part_id
-                else:
-                    best_name = part_id
+                # Centralised name lookup with "UNKNOWN PART (xxx)"
+                # fallback — never leak the raw hex into the label.
+                best_name = self._id_to_name(part_id)
+
+        # ── SIZE_GATE_BEST_MATCH override ─────────────────────────────
+        # When multiple candidate parts cleared the 25% size gate, the
+        # identity decision is the one with LOWEST total dimension
+        # error — NOT the matcher's combined-score winner (which is
+        # noise-dominated for visually similar parts under variable
+        # lighting). The matcher's pose / orientation / score for THAT
+        # part are still used downstream; only the part_id is swapped.
+        if len(gate_passers) > 1 and best_id is not None:
+            sorted_passers = sorted(gate_passers, key=lambda x: x[1])
+            size_winner_id, size_winner_err = sorted_passers[0]
+            if (size_winner_id != best_id
+                    and size_winner_id in per_part_match):
+                runner_err = next((e for pid, e in sorted_passers
+                                   if pid == best_id), float('nan'))
+                winner_name = self._id_to_name(size_winner_id)
+                runner_name = self._id_to_name(best_id)
+                self.get_logger().info(
+                    f'SIZE_GATE_BEST_MATCH: {winner_name} '
+                    f'(total_err={size_winner_err*100:.1f}%) over '
+                    f'{runner_name} (total_err={runner_err*100:.1f}%)')
+                winner_match = per_part_match[size_winner_id]
+                best_id       = size_winner_id
+                best_name     = winner_name
+                best_ref_meta = winner_match.get('best_ref_meta')
+                best_score    = float(winner_match.get('combined',
+                                                        best_score))
 
         # If we found a teach match, return it with the rich orientation
         # metadata from the winning ref. Falls back to the template path
@@ -4032,19 +4378,6 @@ class DepthSegmentNode(Node):
                 o['_match_source']    = ''
             return
 
-        # Frame-skip the expensive NCC/feat/CAD scoring when there are
-        # many parts in the library. Detection still runs every frame;
-        # an already-matched object reuses its previous-frame verdict
-        # on the skipped frame (via the EMA tracker's dict-identity
-        # carry-forward — the temporal filter returns the same object
-        # instances from self._history). New objects (no part_name yet)
-        # always run matching regardless of the skip.
-        if not hasattr(self, '_match_frame_counter'):
-            self._match_frame_counter = 0
-        self._match_frame_counter += 1
-        _do_orient = (len(self._teach_refs) <= 2
-                      or self._match_frame_counter % 2 == 0)
-
         for o in objects:
             mask  = o.get('mask_2d')
             depth = o.get('depth_2d')
@@ -4052,26 +4385,8 @@ class DepthSegmentNode(Node):
             size_m = [float(sx), float(sy), float(sz)]
             color_crop = o.get('color_crop')
 
-            _is_new_object = not bool(o.get('part_name'))
-            if _do_orient or _is_new_object:
-                name, pid, score, orient, match_info = self._match_part(
-                    mask, size_m, color_crop=color_crop, depth_crop=depth)
-            else:
-                # Reuse the cached match from the previous frame —
-                # the object dict carries forward through the temporal
-                # filter / EMA tracker, so its part_* fields are
-                # already populated.
-                name        = o.get('part_name') or 'unknown'
-                pid         = o.get('part_id')
-                score       = float(o.get('match_score') or 0.0)
-                orient      = o.get('orientation') or ''
-                match_info  = {
-                    'is_pickable':       o.get('is_pickable'),
-                    'is_defect':         bool(o.get('is_defect')),
-                    'orientation_label': str(o.get('orientation_label') or ''),
-                    'defect_name':       str(o.get('defect_name') or ''),
-                    'source':            'cached',
-                }
+            name, pid, score, orient, match_info = self._match_part(
+                mask, size_m, color_crop=color_crop, depth_crop=depth)
             matched = (name and name != 'unknown')
 
             o['_holes']        = []

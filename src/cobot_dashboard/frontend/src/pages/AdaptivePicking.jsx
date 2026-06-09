@@ -827,7 +827,7 @@ function StepUploadPage({ answers, setAnswer, goNext }) {
   )
 }
 
-function ConfirmOverwritePage({ answers, setAnswer, goNext }) {
+function ConfirmOverwritePage({ answers, setAnswer, goNext, goTo }) {
   const [clearing, setClearing] = useState(false)
   const [err, setErr]           = useState(null)
 
@@ -895,8 +895,11 @@ function ConfirmOverwritePage({ answers, setAnswer, goNext }) {
       </button>
       <button
         onClick={() => {
+          // Set adding_more first so add_more_picker's skip
+          // predicate (!a.adding_more) returns false by the time
+          // goTo evaluates the target page.
           setAnswer('adding_more', true)
-          goNext({ adding_more: true })
+          goTo('add_more_picker')
         }}
         disabled={clearing}
         style={{
@@ -911,6 +914,158 @@ function ConfirmOverwritePage({ answers, setAnswer, goNext }) {
           Keep the existing {answers.existing_teach_count} reference{answers.existing_teach_count === 1 ? '' : 's'} and add new captures on top.
         </div>
       </button>
+    </QuestionCard>
+  )
+}
+
+function AddMorePage({ answers, setAnswer, goTo }) {
+  // null = still loading; [] = no orientations yet on this part.
+  const [groups, setGroups] = useState(null)
+  const [err,    setErr]    = useState(null)
+
+  useEffect(() => {
+    if (!answers.part_id) { setGroups([]); return }
+    fetch(`/api/parts/${answers.part_id}/orientation_debug`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => setGroups(d?.groups || []))
+      .catch(() => setGroups([]))
+  }, [answers.part_id])
+
+  if (groups === null) {
+    return (
+      <QuestionCard
+        question="Add more captures"
+        description="Loading existing orientations..."
+      >
+        <div style={{ color: '#6b7280', fontSize: 13 }}>Loading…</div>
+      </QuestionCard>
+    )
+  }
+
+  const pickable    = groups.filter(g => g.is_pickable)
+  const nonPickable = groups.filter(g => !g.is_pickable)
+
+  return (
+    <QuestionCard
+      question="What do you want to add?"
+      description="Select an existing orientation to add more captures to, or add a brand new orientation."
+    >
+      {err && (
+        <div style={{
+          padding: '8px 12px', marginBottom: 10,
+          background: '#fef2f2', border: '1px solid #fecaca',
+          borderRadius: 6, fontSize: 12, color: '#DC2626',
+        }}>{err}</div>
+      )}
+
+      {pickable.length > 0 && (
+        <div style={{ marginBottom: 16 }}>
+          <div style={{
+            fontSize: 11, fontWeight: 700, color: '#16A34A',
+            letterSpacing: '0.06em', marginBottom: 6,
+          }}>PICKABLE ORIENTATIONS</div>
+          {pickable.map((g, i) => (
+            <button key={i}
+              onClick={() => {
+                setAnswer('adding_more',         true)
+                setAnswer('add_more_mode',       'existing')
+                setAnswer('add_more_is_pick',    true)
+                setAnswer('add_more_label',      g.orientation_label)
+                setAnswer('add_more_orient_num', i)
+                setAnswer('add_more_capture_count', 0)
+                goTo('add_more_capture')
+              }}
+              style={{
+                width: '100%', padding: '12px 16px', textAlign: 'left',
+                marginBottom: 8, cursor: 'pointer',
+                background: '#f0fdf4', border: '2px solid #16A34A',
+                borderRadius: 10, display: 'flex',
+                justifyContent: 'space-between', alignItems: 'center',
+              }}>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 600,
+                              color: '#16A34A' }}>
+                  ✓ {g.orientation_label || '(unnamed pickable)'}
+                </div>
+                <div style={{ fontSize: 11, color: '#6b7280',
+                              marginTop: 2 }}>
+                  {g.ref_count} existing capture{g.ref_count === 1 ? '' : 's'}
+                </div>
+              </div>
+              <div style={{ fontSize: 12, color: '#16A34A',
+                            fontWeight: 600 }}>+ Add →</div>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {nonPickable.length > 0 && (
+        <div style={{ marginBottom: 16 }}>
+          <div style={{
+            fontSize: 11, fontWeight: 700, color: '#CA8A04',
+            letterSpacing: '0.06em', marginBottom: 6,
+          }}>NON-PICKABLE ORIENTATIONS</div>
+          {nonPickable.map((g, i) => (
+            <button key={i}
+              onClick={() => {
+                setAnswer('adding_more',         true)
+                setAnswer('add_more_mode',       'existing')
+                setAnswer('add_more_is_pick',    false)
+                setAnswer('add_more_label',      g.orientation_label)
+                setAnswer('add_more_orient_num', i)
+                setAnswer('add_more_capture_count', 0)
+                goTo('add_more_capture')
+              }}
+              style={{
+                width: '100%', padding: '12px 16px', textAlign: 'left',
+                marginBottom: 8, cursor: 'pointer',
+                background: '#fffbeb', border: '2px solid #CA8A04',
+                borderRadius: 10, display: 'flex',
+                justifyContent: 'space-between', alignItems: 'center',
+              }}>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 600,
+                              color: '#CA8A04' }}>
+                  ✗ {g.orientation_label || '(unnamed non-pickable)'}
+                </div>
+                <div style={{ fontSize: 11, color: '#6b7280',
+                              marginTop: 2 }}>
+                  {g.ref_count} existing capture{g.ref_count === 1 ? '' : 's'}
+                </div>
+              </div>
+              <div style={{ fontSize: 12, color: '#CA8A04',
+                            fontWeight: 600 }}>+ Add →</div>
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div style={{
+        borderTop: '1px solid #e5e7eb', paddingTop: 14, marginTop: 4,
+      }}>
+        <div style={{
+          fontSize: 11, fontWeight: 700, color: '#6b7280',
+          letterSpacing: '0.06em', marginBottom: 8,
+        }}>NEW ORIENTATION</div>
+        <button
+          onClick={() => {
+            setAnswer('adding_more',   true)
+            setAnswer('add_more_mode', 'new_pickable')
+            goTo('add_more_new_type')
+          }}
+          style={{
+            width: '100%', padding: '12px 16px', textAlign: 'left',
+            cursor: 'pointer',
+            background: '#fff', border: '2px dashed #d1d5db',
+            borderRadius: 10, display: 'flex',
+            justifyContent: 'space-between', alignItems: 'center',
+          }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>
+            + Teach a new orientation
+          </div>
+          <div style={{ fontSize: 12, color: '#6b7280' }}>→</div>
+        </button>
+      </div>
     </QuestionCard>
   )
 }
@@ -1018,9 +1173,200 @@ const PAGES = [
     render: (props) => <ConfirmOverwritePage {...props} />,
   },
 
+  // 4a. Add More — orientation picker. Only reachable when the
+  //     operator has clicked Add More on confirm_overwrite; the rest
+  //     of the wizard's pickable/non_pickable/defects pages are
+  //     skipped via `!!a.adding_more` so the operator only sees the
+  //     targeted picker + capture flow below.
+  {
+    id: 'add_more_picker',
+    skip: (a) => !a.adding_more,
+    render: (props) => <AddMorePage {...props} />,
+  },
+
+  // 4b. Add More — capture page for the selected orientation. Reused
+  //     for BOTH adding to an existing orientation (mode='existing')
+  //     and a freshly-named new one (mode='new_pickable' that
+  //     reached 4d's Next → Capture).
+  {
+    id: 'add_more_capture',
+    skip: (a) => !a.adding_more,
+    render: ({ answers, setAnswer, goTo }) => {
+      const isPick = !!answers.add_more_is_pick
+      const label  = answers.add_more_label || ''
+      const count  = answers.add_more_capture_count || 0
+      const accent = isPick ? '#16A34A' : '#CA8A04'
+      return (
+        <QuestionCard
+          question={`Add captures: ${label || (isPick ? 'Pickable' : 'Non-pickable')}`}
+          description="Place the part in this orientation. Capture as many angles as you like. Click Done when finished."
+        >
+          <CaptureView
+            partId={answers.part_id}
+            orientation={isPick ? 'pickable' : 'non_pickable'}
+            orientationNumber={answers.add_more_orient_num || 0}
+            orientationLabel={label}
+            isPickable={isPick}
+            isDefect={false}
+            onCapture={() => setAnswer(
+              'add_more_capture_count',
+              (answers.add_more_capture_count || 0) + 1)}
+            captureCount={count}
+            addingMore={true}
+            existingCount={answers.existing_teach_count || 0}
+            minToAdvance={1}
+          />
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <button
+              onClick={() => goTo('add_more_picker')}
+              style={{
+                flex: 1, padding: '12px', fontSize: 13, fontWeight: 600,
+                background: '#fff', color: '#374151',
+                border: '2px solid #e5e7eb', borderRadius: 10,
+                cursor: 'pointer', minHeight: 44,
+              }}>
+              ← Back to orientations
+            </button>
+            <button
+              onClick={() => goTo('review')}
+              disabled={count < 1}
+              style={{
+                flex: 2, padding: '12px', fontSize: 14, fontWeight: 700,
+                background: count < 1 ? '#d1d5db' : accent,
+                color: '#fff', border: 'none', borderRadius: 10,
+                cursor: count < 1 ? 'default' : 'pointer', minHeight: 44,
+              }}>
+              {count < 1 ? 'Capture at least 1' : 'Done — Review'}
+            </button>
+          </div>
+        </QuestionCard>
+      )
+    },
+  },
+
+  // 4c. Add More — new orientation type picker. Asks the operator
+  //     whether the brand-new orientation is pickable or not.
+  {
+    id: 'add_more_new_type',
+    skip: (a) => !a.adding_more || a.add_more_mode !== 'new_pickable',
+    render: ({ answers, setAnswer, goTo }) => (
+      <QuestionCard
+        question="New orientation — pickable or non-pickable?"
+        description="Is this a position where the robot CAN pick the part, or one it should avoid?"
+      >
+        <button
+          onClick={() => {
+            setAnswer('add_more_is_pick', true)
+            setAnswer('add_more_label', '')
+            setAnswer('add_more_orient_num',
+              (answers.existing_teach_count || 0) + 1)
+            setAnswer('add_more_capture_count', 0)
+            goTo('add_more_new_name')
+          }}
+          style={{
+            width: '100%', padding: '16px', textAlign: 'left',
+            marginBottom: 10, cursor: 'pointer',
+            background: '#f0fdf4', border: '2px solid #16A34A',
+            borderRadius: 10,
+          }}>
+          <div style={{ fontSize: 15, fontWeight: 700,
+                        color: '#16A34A' }}>✓ Pickable</div>
+          <div style={{ fontSize: 12, color: '#6b7280', marginTop: 3 }}>
+            Robot can grasp the part in this position
+          </div>
+        </button>
+        <button
+          onClick={() => {
+            setAnswer('add_more_is_pick', false)
+            setAnswer('add_more_label', '')
+            setAnswer('add_more_orient_num',
+              (answers.existing_teach_count || 0) + 1)
+            setAnswer('add_more_capture_count', 0)
+            goTo('add_more_new_name')
+          }}
+          style={{
+            width: '100%', padding: '16px', textAlign: 'left',
+            cursor: 'pointer',
+            background: '#fffbeb', border: '2px solid #CA8A04',
+            borderRadius: 10,
+          }}>
+          <div style={{ fontSize: 15, fontWeight: 700,
+                        color: '#CA8A04' }}>✗ Non-pickable</div>
+          <div style={{ fontSize: 12, color: '#6b7280', marginTop: 3 }}>
+            Robot should not pick in this position
+          </div>
+        </button>
+        <button onClick={() => goTo('add_more_picker')}
+          style={{
+            marginTop: 10, width: '100%', padding: '10px',
+            background: 'none', border: '1px solid #e5e7eb',
+            borderRadius: 8, cursor: 'pointer',
+            fontSize: 13, color: '#6b7280',
+          }}>
+          ← Back
+        </button>
+      </QuestionCard>
+    ),
+  },
+
+  // 4d. Add More — name the new orientation.
+  {
+    id: 'add_more_new_name',
+    skip: (a) => !a.adding_more || a.add_more_mode !== 'new_pickable',
+    render: ({ answers, setAnswer, goTo }) => {
+      const isPick = !!answers.add_more_is_pick
+      const accent = isPick ? '#16A34A' : '#CA8A04'
+      return (
+        <QuestionCard
+          question={`Name this ${isPick ? 'pickable' : 'non-pickable'} orientation`}
+          description="A short label so you can identify it later. For example: 'Logo facing up' or 'Upside down'."
+        >
+          <input
+            autoFocus
+            value={answers.add_more_label || ''}
+            onChange={(e) => setAnswer('add_more_label', e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && answers.add_more_label?.trim())
+                goTo('add_more_capture')
+            }}
+            placeholder="e.g. Logo facing up"
+            style={{
+              width: '100%', padding: '14px 16px', fontSize: 16,
+              fontWeight: 600, border: `2px solid ${accent}`,
+              borderRadius: 10, outline: 'none', boxSizing: 'border-box',
+            }}
+          />
+          <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
+            <button onClick={() => goTo('add_more_new_type')}
+              style={{
+                flex: 1, padding: '12px', fontSize: 13,
+                background: '#fff', color: '#374151',
+                border: '2px solid #e5e7eb', borderRadius: 10,
+                cursor: 'pointer',
+              }}>← Back</button>
+            <button
+              onClick={() => goTo('add_more_capture')}
+              disabled={!answers.add_more_label?.trim()}
+              style={{
+                flex: 2, padding: '12px', fontSize: 14, fontWeight: 700,
+                background: !answers.add_more_label?.trim()
+                  ? '#d1d5db' : accent,
+                color: '#fff', border: 'none', borderRadius: 10,
+                cursor: !answers.add_more_label?.trim()
+                  ? 'default' : 'pointer',
+              }}>Next → Capture</button>
+          </div>
+        </QuestionCard>
+      )
+    },
+  },
+
   // 4. Pickable count
   {
     id: 'pickable_count',
+    // Add-More mode uses its own dedicated picker/capture pages
+    // above — skip the full-wizard count/name/capture flow.
+    skip: (a) => !!a.adding_more,
     render: ({ answers, setAnswer, goNext }) => (
       <QuestionCard
         question="How many ways can the robot pick up this part?"
@@ -1067,7 +1413,7 @@ const PAGES = [
   ...Array.from({ length: MAX_PICKABLE }, (_, i) => ([
     {
       id: `pickable_name_${i}`,
-      skip: (a) => (a.pickable_count || 0) <= i,
+      skip: (a) => !!a.adding_more || (a.pickable_count || 0) <= i,
       render: ({ answers, setAnswer, goNext }) => {
         const labels = answers.pickable_labels || []
         const value  = labels[i] || ''
@@ -1100,7 +1446,7 @@ const PAGES = [
     },
     {
       id: `pickable_capture_${i}`,
-      skip: (a) => (a.pickable_count || 0) <= i,
+      skip: (a) => !!a.adding_more || (a.pickable_count || 0) <= i,
       render: ({ answers, bumpCounter, goNext }) => {
         const label  = answers.pickable_labels?.[i] || ''
         const count  = (answers.pickable_captures || [])[i] || 0
@@ -1138,6 +1484,8 @@ const PAGES = [
   // 17. Non-pickable count
   {
     id: 'non_pickable_count',
+    // Add-More mode uses its own dedicated flow above.
+    skip: (a) => !!a.adding_more,
     render: ({ answers, setAnswer, goNext }) => (
       <QuestionCard
         question="How many non-pickable orientations do you want to teach?"
@@ -1183,7 +1531,7 @@ const PAGES = [
   ...Array.from({ length: MAX_NON_PICKABLE }, (_, i) => ([
     {
       id: `non_pickable_name_${i}`,
-      skip: (a) => (a.non_pickable_count || 0) <= i,
+      skip: (a) => !!a.adding_more || (a.non_pickable_count || 0) <= i,
       render: ({ answers, setAnswer, goNext }) => {
         const labels = answers.non_pickable_labels || []
         const value  = labels[i] || ''
@@ -1216,7 +1564,7 @@ const PAGES = [
     },
     {
       id: `non_pickable_capture_${i}`,
-      skip: (a) => (a.non_pickable_count || 0) <= i,
+      skip: (a) => !!a.adding_more || (a.non_pickable_count || 0) <= i,
       render: ({ answers, bumpCounter, goNext }) => {
         const label  = answers.non_pickable_labels?.[i] || ''
         const count  = (answers.non_pickable_captures || [])[i] || 0
@@ -1251,6 +1599,9 @@ const PAGES = [
   // 28. Teach defects?
   {
     id: 'teach_defects',
+    // Add-More mode uses its own dedicated flow above; defect
+    // teaching is only part of the full wizard run.
+    skip: (a) => !!a.adding_more,
     render: ({ answers, setAnswer, goNext }) => (
       <QuestionCard
         question="Do you want to teach defective versions of this part?"
@@ -1604,6 +1955,17 @@ function TeachWizard({ part, onClose, onComplete }) {
     // the counter shows "X new (+ Y existing)" so they can see what
     // the library count will read after Save.
     adding_more:              false,
+    // Add-More dedicated flow state. mode:
+    //   'existing'      operator picked an existing orientation
+    //                   from add_more_picker
+    //   'new_pickable'  operator chose "+ Teach a new orientation"
+    //                   and is going through new_type → new_name
+    //                   → capture
+    add_more_mode:            null,
+    add_more_is_pick:         true,
+    add_more_label:           '',
+    add_more_orient_num:      0,
+    add_more_capture_count:   0,
     pickable_count:           1,
     pickable_labels:          [''],
     pickable_captures:        [],
@@ -1756,18 +2118,15 @@ function TeachWizard({ part, onClose, onComplete }) {
     setSaving(false)
   }, [onClose, onComplete])
 
-  const page = PAGES[pageIdx]
   // Guard: a stale pageIdx beyond PAGES.length (e.g. after a hot-
   // reload or after the PAGES array shrinks across versions) made
   // page undefined and `page.render(...)` crashed the wizard to a
-  // blank screen. Snap back to the last valid page and re-render
-  // on the next frame instead of throwing.
-  if (!page) {
-    const safeIdx = PAGES.length - 1
-    setPageIdx(safeIdx)
-    setHistory([safeIdx])
-    return null
-  }
+  // blank screen. Fall back to the last page (review) silently —
+  // it always exists and has no skip condition, so it always
+  // renders safely. Calling setPageIdx/setHistory here would be a
+  // setState-during-render, which React rejects with #300 and an
+  // infinite re-render loop.
+  const page = PAGES[pageIdx] ?? PAGES[PAGES.length - 1]
   const progressPct = Math.min(100, ((history.length - 1) / Math.max(1, PAGES.length - 1)) * 100)
 
   return (
