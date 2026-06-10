@@ -8,6 +8,7 @@ const TABS = [
   { id: '3dview',           label: '3D View' },
   { id: 'sensors',          label: 'Cameras & LiDAR' },
   { id: 'adaptive_picking', label: 'Part Recognition' },
+  { id: 'quality_inspection', label: 'Quality Inspection' },
   { id: 'io',               label: 'I/O' },
   { id: 'safety',           label: 'Safety' },
   { id: 'configure',        label: 'Configure' },

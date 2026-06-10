@@ -1,0 +1,35 @@
+# roboai-inspection — Quality Inspection pipeline node.
+#
+# DISABLED ON PURPOSE. The Mech-Eye depth camera is not yet wired to
+# the robot; enable this unit only after the camera is integrated and
+# /mech_eye/depth/points is publishing.
+#
+# Install:
+#   sudo cp install/inspection_pipeline/share/inspection_pipeline/systemd/roboai-inspection.service \
+#        /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   # Do NOT enable yet:
+#   #   sudo systemctl enable --now roboai-inspection
+#
+# Logs:
+#   journalctl -u roboai-inspection -f
+
+[Unit]
+Description=RoboAi Quality Inspection Pipeline
+After=network.target
+# Add Mech-Eye driver here once the camera package exists:
+# After=mech_eye_driver.service network.target
+# Requires=mech_eye_driver.service
+
+[Service]
+Type=simple
+User=cobot
+WorkingDirectory=/home/teddy/cobot_ws
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 launch inspection_pipeline inspection.launch.py'
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

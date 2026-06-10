@@ -1,0 +1,28 @@
+# Default tolerance template — copy and edit per-part.
+#
+# Each key is a measurement name from the inspection_pipeline measurement
+# vocabulary (see tier1_dimensional.py). Values:
+#   nominal:   expected value
+#   tol_warn:  +/- threshold that flags the measurement as 'warn'
+#   tol_fail:  +/- threshold that flags the measurement as 'fail'
+#
+# Missing entries become free measurements (recorded but never fail).
+# Runtime overrides live in /opt/cobot/inspections/config/tolerances.json
+# and take precedence over this file.
+
+length_mm:
+  nominal: 100.0
+  tol_warn: 0.20
+  tol_fail: 0.50
+width_mm:
+  nominal: 50.0
+  tol_warn: 0.20
+  tol_fail: 0.50
+height_mm:
+  nominal: 20.0
+  tol_warn: 0.10
+  tol_fail: 0.30
+yaw_deg:
+  nominal: 0.0
+  tol_warn: 1.0
+  tol_fail: 3.0

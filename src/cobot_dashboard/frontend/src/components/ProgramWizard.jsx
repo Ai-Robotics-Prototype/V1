@@ -439,6 +439,7 @@ const PAGES = [
           { value: 'machine_tend', label: 'Machine Tending', desc: 'Load parts into a machine, wait, then unload', icon: 'M' },
           { value: 'palletize', label: 'Palletize', desc: 'Arrange parts in a grid pattern on a pallet', icon: 'G' },
           { value: 'inspect', label: 'Pick and Inspect', desc: 'Pick a part, inspect it with the camera, then sort pass/fail', icon: 'I' },
+          { value: 'inspect_verify', label: 'Inspect & Verify', desc: 'Run a full Quality Inspection on each part with pass/warn/fail branching', icon: 'V' },
           { value: 'scan_identify', label: 'Scan & Identify', desc: 'Robot scans the workspace, moves above each detected object, identifies it from the parts library', icon: 'Q' },
         ].map(op => (
           <ChoiceButton key={op.value} label={op.label} description={op.desc} icon={op.icon}
@@ -446,6 +447,98 @@ const PAGES = [
             onClick={() => { setAnswer('operation', op.value); goNext() }}
           />
         ))}
+      </QuestionCard>
+    ),
+  },
+
+  // 0i: Inspect & Verify configuration — gated on operation === 'inspect_verify'.
+  // One page that captures every iv_* answer the buildSteps branch
+  // needs; the rest of the wizard (gripper / speed / teach / review)
+  // is shared with pick_and_place so we don't grow the wizard a lot.
+  {
+    id: 'inspect_verify_config',
+    skip: (answers) => answers.operation !== 'inspect_verify',
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="Configure the Quality Inspection"
+        description="Pick which part to inspect, which plan to run, and how to handle pass/warn/fail results. References and tolerances are managed in the Quality Inspection tab."
+      >
+        <div style={{ display: 'grid', gap: 12, marginBottom: 20 }}>
+          <label style={{ fontSize: 13, fontWeight: 600 }}>Part ID
+            <input value={answers.iv_part_id || ''}
+                   onChange={(e) => setAnswer('iv_part_id', e.target.value)}
+                   style={{ display: 'block', width: '100%', marginTop: 4,
+                            padding: '6px 8px', fontSize: 13,
+                            border: '1px solid #e5e7eb', borderRadius: 4 }}
+                   placeholder="e.g. bracket_a"/>
+          </label>
+          <label style={{ fontSize: 13, fontWeight: 600 }}>Inspection plan
+            <input value={answers.iv_plan_id || 'default'}
+                   onChange={(e) => setAnswer('iv_plan_id', e.target.value)}
+                   style={{ display: 'block', width: '100%', marginTop: 4,
+                            padding: '6px 8px', fontSize: 13,
+                            border: '1px solid #e5e7eb', borderRadius: 4 }}
+                   placeholder="default"/>
+          </label>
+          <label style={{ fontSize: 13, fontWeight: 600 }}>Tier
+            <select value={answers.iv_tier || '2'}
+                    onChange={(e) => setAnswer('iv_tier', e.target.value)}
+                    style={{ display: 'block', width: '100%', marginTop: 4,
+                             padding: '6px 8px', fontSize: 13,
+                             border: '1px solid #e5e7eb', borderRadius: 4 }}>
+              <option value="1">Tier 1 — dimensions only (fast)</option>
+              <option value="2">Tier 2 — surface deviation (recommended)</option>
+              <option value="3">Tier 3 — feature-specific</option>
+            </select>
+          </label>
+          <label style={{ fontSize: 13, fontWeight: 600 }}>Reference type
+            <select value={answers.iv_reference_type || 'step'}
+                    onChange={(e) => setAnswer('iv_reference_type', e.target.value)}
+                    style={{ display: 'block', width: '100%', marginTop: 4,
+                             padding: '6px 8px', fontSize: 13,
+                             border: '1px solid #e5e7eb', borderRadius: 4 }}>
+              <option value="step">STEP-derived (CAD)</option>
+              <option value="golden">Golden scan</option>
+              <option value="statistical">Statistical envelope</option>
+            </select>
+          </label>
+          <label style={{ fontSize: 13, fontWeight: 600 }}>Sampling rate
+            <select value={answers.iv_sampling || '1'}
+                    onChange={(e) => setAnswer('iv_sampling', e.target.value)}
+                    style={{ display: 'block', width: '100%', marginTop: 4,
+                             padding: '6px 8px', fontSize: 13,
+                             border: '1px solid #e5e7eb', borderRadius: 4 }}>
+              <option value="1">Every part</option>
+              <option value="2">Every 2nd part</option>
+              <option value="5">Every 5th part</option>
+              <option value="10">Every 10th part</option>
+            </select>
+          </label>
+          <label style={{ fontSize: 13, fontWeight: 600 }}>Action on fail
+            <select value={answers.iv_on_fail || 'jump_to_reject'}
+                    onChange={(e) => setAnswer('iv_on_fail', e.target.value)}
+                    style={{ display: 'block', width: '100%', marginTop: 4,
+                             padding: '6px 8px', fontSize: 13,
+                             border: '1px solid #e5e7eb', borderRadius: 4 }}>
+              <option value="jump_to_reject">Place in reject bin</option>
+              <option value="pause">Pause program + alert</option>
+              <option value="log_continue">Log only and continue</option>
+              <option value="alert">Alert operator and wait</option>
+            </select>
+          </label>
+          <label style={{ fontSize: 13, fontWeight: 600 }}>Action on warn
+            <select value={answers.iv_on_warn || 'log_continue'}
+                    onChange={(e) => setAnswer('iv_on_warn', e.target.value)}
+                    style={{ display: 'block', width: '100%', marginTop: 4,
+                             padding: '6px 8px', fontSize: 13,
+                             border: '1px solid #e5e7eb', borderRadius: 4 }}>
+              <option value="log_continue">Log and continue</option>
+              <option value="pause">Pause for operator review</option>
+              <option value="alert">Alert operator (continue on ack)</option>
+            </select>
+          </label>
+        </div>
+        <NextButton onClick={goNext} />
       </QuestionCard>
     ),
   },
@@ -850,6 +943,12 @@ const PAGES = [
       if (answers.operation === 'inspect') {
         points.push('4. Inspection pose')
       }
+      if (answers.operation === 'inspect_verify') {
+        points.push('4. Inspection pose (where the camera scans the part)')
+        if (answers.iv_on_fail === 'jump_to_reject') {
+          points.push('5. Reject position (where failed parts are placed)')
+        }
+      }
       return (
         <QuestionCard
           question="Now let's teach the robot positions"
@@ -1189,6 +1288,50 @@ function buildSteps(answers) {
     steps.push({ action: 'detect', label: 'Inspect part with camera', mode: 'library' })
     steps.push({ action: 'move_joint', label: 'Move above place position', speed_pct: spd })
     steps.push({ action: 'move_linear', label: 'Descend to place', offset_z_mm: 0, speed_pct: slow })
+  } else if (op === 'inspect_verify') {
+    // Full Quality Inspection flow: stage above part → run inspection
+    // (which gates the rest of the program on result) → either continue
+    // to place, or jump to reject. The executor handles the branch via
+    // step.on_fail = 'jump_to_reject'.
+    const sampling = parseInt(answers.iv_sampling || '1', 10)
+    const onFail   = answers.iv_on_fail || 'jump_to_reject'
+    const onWarn   = answers.iv_on_warn || 'log_continue'
+    const planId   = answers.iv_plan_id || 'default'
+    const partId   = answers.iv_part_id || 'unknown'
+    const tier     = parseInt(answers.iv_tier || '2', 10)
+
+    steps.push({ action: 'move_joint', label: 'Move to inspection pose', speed_pct: spd })
+    steps.push({
+      action: 'inspect_part',
+      label:  'Run Quality Inspection',
+      part_id: partId, plan_id: planId, tier,
+      reference_type: answers.iv_reference_type || 'step',
+      every_n_parts:  sampling,
+      on_pass: 'continue', on_warn: onWarn, on_fail: onFail,
+      inspection_timeout_s: 30,
+    })
+    steps.push({ action: 'move_joint', label: 'Move above place position', speed_pct: spd })
+    steps.push({ action: 'move_linear', label: 'Descend to place', offset_z_mm: 0, speed_pct: slow })
+    // Reject branch — `on_fail: jump_to_reject` targets the first
+    // place_at_reject step that follows the inspect_part. Appended at
+    // the tail so it's reachable but doesn't run unless jumped to.
+    if (onFail === 'jump_to_reject') {
+      steps.push({
+        action: 'place_at_reject',
+        label:  'Place in reject bin',
+        speed_pct: spd,
+      })
+      steps.push({ action: 'move_home', label: 'Return after reject' })
+    } else if (onFail === 'alert') {
+      steps.push({
+        action: 'alert_operator',
+        label:  'Alert operator — failed inspection',
+        severity: 'fail',
+        message: 'Part failed Quality Inspection — operator review required',
+        operator_timeout_s: 120,
+        on_timeout: 'abort',
+      })
+    }
   } else {
     steps.push({ action: 'move_joint', label: 'Move above place position', speed_pct: spd })
     steps.push({ action: 'move_linear', label: 'Descend to place', offset_z_mm: 0, speed_pct: slow })

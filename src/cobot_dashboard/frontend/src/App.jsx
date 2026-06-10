@@ -13,6 +13,7 @@ import AdaptivePicking from './pages/AdaptivePicking'
 import ProgramLibrary from './pages/ProgramLibrary'
 import IOPage from './pages/IOPage'
 import SafetyPage from './pages/SafetyPage'
+import QualityInspectionLayout from './layouts/QualityInspectionLayout'
 
 class ErrorBoundary extends Component {
   constructor(props) {
@@ -85,6 +86,7 @@ export default function App() {
     sensors:          <SensorsLayout />,
     io:               <IOPage />,
     adaptive_picking: <AdaptivePicking />,
+    quality_inspection: <QualityInspectionLayout />,
     configure:        <ConfigureLayout />,
     safety:           <SafetyPage />,
   }

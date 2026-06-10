@@ -135,6 +135,7 @@ _mesh_lock = threading.Lock()
 _state_clients: dict = {}
 _lidar_clients: dict = {}
 _mesh_clients:  dict = {}
+_insp_clients:  dict = {}   # /ws/inspection — live inspection status
 _ws_lock = threading.Lock()
 
 # Program simulation state
@@ -2935,6 +2936,245 @@ if FASTAPI_AVAILABLE:
             '.glb':  'model/gltf-binary',
         }.get(ext, 'application/octet-stream')
         return _serve_robot_asset(f'links/{filename}', media)
+
+    # ------------------------------------------------------------------
+    # Quality Inspection endpoints (PART H)
+    #
+    # The pipeline runs in a separate ROS2 node (inspection_pipeline).
+    # Until the Mech-Eye camera is integrated the node ships disabled,
+    # but every endpoint below is structurally complete so the UI can
+    # render properly and configuration can be edited in advance.
+    # File-backed storage at /opt/cobot/inspections (see PART F).
+    # ------------------------------------------------------------------
+
+    from .inspection_helpers import InspectionHelpers as _InspectionHelpers
+    _insp = _InspectionHelpers()  # bundles all the disk/SQLite helpers
+
+    @app.get("/api/inspections")
+    async def api_inspections_list(
+        start_date: float | None = None,
+        end_date:   float | None = None,
+        part_id:    str | None = None,
+        result:     str | None = None,
+        tier:       int | None = None,
+        page:       int = 1,
+        per_page:   int = 25,
+        sort:       str = '-timestamp',
+    ):
+        return _insp.list_records(
+            start_date=start_date, end_date=end_date, part_id=part_id,
+            result=result, tier=tier, page=page, per_page=per_page,
+            sort=sort)
+
+    @app.get("/api/inspections/stats")
+    async def api_inspections_stats(timeframe: str = '24h',
+                                    part_id: str | None = None):
+        return _insp.get_stats(timeframe=timeframe, part_id=part_id)
+
+    @app.get("/api/inspections/stats/timeseries")
+    async def api_inspections_timeseries(
+        metric:       str = 'max_deviation',
+        timeframe:    str = '7d',
+        part_id:      str | None = None,
+        granularity:  str = 'day',
+    ):
+        return _insp.timeseries(metric=metric, timeframe=timeframe,
+                                 part_id=part_id, granularity=granularity)
+
+    @app.get("/api/inspections/stats/distribution")
+    async def api_inspections_distribution(
+        metric:    str = 'max_deviation',
+        timeframe: str = '7d',
+        part_id:   str | None = None,
+        bins:      int = 30,
+    ):
+        return _insp.distribution(metric=metric, timeframe=timeframe,
+                                   part_id=part_id, bins=bins)
+
+    @app.get("/api/inspections/storage")
+    async def api_inspections_storage():
+        return _insp.storage_summary()
+
+    @app.post("/api/inspections/cleanup")
+    async def api_inspections_cleanup(request: Request):
+        body = await request.json()
+        return _insp.cleanup(dry_run=bool(body.get('dry_run', True)),
+                              before_date=body.get('before_date'))
+
+    @app.get("/api/inspections/tolerances")
+    async def api_inspections_tolerances_all():
+        return _insp.load_tolerances()
+
+    @app.get("/api/inspections/tolerances/{part_id}")
+    async def api_inspections_tolerances_one(part_id: str):
+        return _insp.load_tolerances().get(part_id, {})
+
+    @app.post("/api/inspections/tolerances")
+    async def api_inspections_tolerances_save(request: Request):
+        body = await request.json()
+        return _insp.save_tolerance_rule(body)
+
+    @app.delete("/api/inspections/tolerances/{rule_id}")
+    async def api_inspections_tolerances_delete(rule_id: str):
+        return _insp.delete_tolerance_rule(rule_id)
+
+    @app.get("/api/inspections/plans")
+    async def api_inspections_plans_all():
+        return _insp.load_plans()
+
+    @app.get("/api/inspections/plans/{plan_id}")
+    async def api_inspections_plans_one(plan_id: str):
+        p = _insp.load_plans().get(plan_id)
+        if p is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return p
+
+    @app.post("/api/inspections/plans")
+    async def api_inspections_plans_save(request: Request):
+        body = await request.json()
+        return _insp.save_plan(body)
+
+    @app.delete("/api/inspections/plans/{plan_id}")
+    async def api_inspections_plans_delete(plan_id: str):
+        return _insp.delete_plan(plan_id)
+
+    @app.post("/api/inspections/plans/{plan_id}/validate")
+    async def api_inspections_plan_validate(plan_id: str):
+        return _insp.validate_plan(plan_id)
+
+    @app.get("/api/inspections/references/{part_id}")
+    async def api_inspections_refs_list(part_id: str):
+        return _insp.list_references(part_id)
+
+    @app.post("/api/inspections/references/{part_id}/build_from_step")
+    async def api_inspections_refs_build_step(part_id: str, request: Request):
+        body = await request.json()
+        return _insp.build_reference_from_step(
+            part_id=part_id,
+            step_path=body.get('step_path'),
+            sample_points=int(body.get('sample_points', 1_000_000)))
+
+    @app.post("/api/inspections/references/{part_id}/capture_golden")
+    async def api_inspections_refs_capture_golden(part_id: str, request: Request):
+        body = await request.json() if request.headers.get('content-length') else {}
+        return _insp.capture_golden_reference(part_id=part_id,
+                                               metadata=body or {})
+
+    @app.post("/api/inspections/references/{part_id}/build_statistical")
+    async def api_inspections_refs_build_stat(part_id: str, request: Request):
+        body = await request.json()
+        return _insp.build_statistical_reference(
+            part_id=part_id,
+            min_samples=int(body.get('min_samples', 30)))
+
+    @app.post("/api/inspections/references/{part_id}/set_active")
+    async def api_inspections_refs_set_active(part_id: str, request: Request):
+        body = await request.json()
+        return _insp.set_active_reference(
+            part_id=part_id, ref_type=body.get('type', ''))
+
+    @app.get("/api/inspections/templates")
+    async def api_inspections_templates_all():
+        return _insp.load_templates()
+
+    @app.post("/api/inspections/templates")
+    async def api_inspections_templates_save(request: Request):
+        body = await request.json()
+        return _insp.save_template(body)
+
+    @app.post("/api/inspections/export")
+    async def api_inspections_export(request: Request):
+        body = await request.json()
+        return _insp.export(format=body.get('format', 'csv'),
+                             filters=body.get('filters', {}),
+                             date_range=body.get('date_range', {}))
+
+    @app.post("/api/inspections/start")
+    async def api_inspections_start(request: Request):
+        body = await request.json()
+        return _insp.start_inspection(_ros_node, body)
+
+    # ── per-id endpoints (registered after the static-prefixed ones so
+    # FastAPI's path resolver doesn't match e.g. /stats here) ────────
+    @app.get("/api/inspections/{inspection_id}")
+    async def api_inspections_one(inspection_id: str):
+        rec = _insp.load_record(inspection_id)
+        if rec is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return rec
+
+    @app.get("/api/inspections/{inspection_id}/cloud")
+    async def api_inspections_cloud(inspection_id: str):
+        path = _insp.record_file_path(inspection_id, 'cloud.ply')
+        if not path:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return FileResponse(path, media_type='application/octet-stream')
+
+    @app.get("/api/inspections/{inspection_id}/heatmap")
+    async def api_inspections_heatmap(inspection_id: str):
+        path = _insp.record_file_path(inspection_id, 'heatmap.ply')
+        if not path:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return FileResponse(path, media_type='application/octet-stream')
+
+    @app.get("/api/inspections/{inspection_id}/report")
+    async def api_inspections_report(inspection_id: str):
+        path = _insp.ensure_report(inspection_id)
+        if not path:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return FileResponse(path, media_type='application/pdf',
+                            filename=f'inspection_{inspection_id}.pdf')
+
+    @app.get("/api/inspections/{inspection_id}/screenshot/{view}")
+    async def api_inspections_screenshot(inspection_id: str, view: str):
+        path = _insp.record_file_path(
+            inspection_id, f'screenshot_{view}.png')
+        if not path:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return FileResponse(path, media_type='image/png')
+
+    @app.post("/api/inspections/{inspection_id}/cancel")
+    async def api_inspections_cancel(inspection_id: str):
+        return _insp.cancel_inspection(_ros_node, inspection_id)
+
+    @app.post("/api/inspections/{inspection_id}/mark_false_positive")
+    async def api_inspections_mark_fp(inspection_id: str, request: Request):
+        body = await request.json()
+        return _insp.mark_false_positive(
+            inspection_id=inspection_id,
+            reason=body.get('reason', ''),
+            defects_to_unflag=body.get('defects_to_unflag', []))
+
+    @app.post("/api/inspections/{inspection_id}/notes")
+    async def api_inspections_notes(inspection_id: str, request: Request):
+        body = await request.json()
+        return _insp.add_notes(inspection_id, body.get('notes', ''))
+
+    @app.post("/api/inspections/{inspection_id}/re_run")
+    async def api_inspections_re_run(inspection_id: str):
+        return _insp.re_run_inspection(_ros_node, inspection_id)
+
+    @app.websocket("/ws/inspection")
+    async def ws_inspection(websocket: WebSocket):
+        """Live inspection status. Pushes whatever the ROS node emits
+        on /inspection/status and /inspection/result so the dashboard
+        Active sub-tab can render a progress bar.
+        """
+        await websocket.accept()
+        q = asyncio.Queue(maxsize=4)
+        with _ws_lock:
+            _insp_clients[websocket] = q
+        try:
+            while True:
+                txt = await q.get()
+                await websocket.send_text(txt)
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            with _ws_lock:
+                _insp_clients.pop(websocket, None)
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):

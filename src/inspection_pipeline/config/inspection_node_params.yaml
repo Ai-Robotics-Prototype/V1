@@ -1,0 +1,17 @@
+inspection_node:
+  ros__parameters:
+    # Maximum wait for a fresh point cloud before failing the capture.
+    cloud_timeout_s: 5.0
+    # Voxel size used when downsampling for ICP. Tuned to Mech-Eye
+    # NANO ULTRA resolution; revisit if a different camera is used.
+    icp_voxel_size_m: 0.003
+    # ICP fine-stage correspondence distance — points further apart
+    # than this are ignored in the inlier set.
+    icp_fine_distance_m: 0.002
+    # Minimum number of inlier correspondences to call ICP successful.
+    icp_min_correspondences: 200
+    # DBSCAN parameters for defect clustering on the failing point set.
+    defect_cluster_eps_m: 0.003
+    defect_cluster_min_samples: 20
+    # How often the periodic statistics rebuild runs (seconds).
+    stats_rebuild_period_s: 300.0

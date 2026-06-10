@@ -40,6 +40,8 @@ class ProgramExecutor(Node):
     WAITING_IO = 'waiting_io'
     WAITING_DETECT = 'waiting_detect'
     WAITING_TIME = 'waiting_time'
+    WAITING_INSPECTION = 'waiting_inspection'
+    WAITING_OPERATOR = 'waiting_operator'
     ERROR = 'error'
     COMPLETE = 'complete'
 
@@ -70,6 +72,18 @@ class ProgramExecutor(Node):
         self._scan_results      = []   # detections at the wide scan step
         self._identified_parts  = []   # per-object results after close-up scan
         self._scan_identify_idx = 0
+        # Inspection state — populated by the inspect_part handler and
+        # consumed by the WAITING_INSPECTION transition. Kept on the
+        # executor (not the inspection node) because the *executor* is
+        # the thing that gates the rest of the program on the result.
+        self._current_inspection_id     = None
+        self._last_inspection_result    = None   # 'pass' / 'warn' / 'fail' / None
+        self._last_inspection_record    = None   # full JSON record
+        self._inspection_in_progress    = False
+        self._inspection_pass_count     = 0
+        self._inspection_fail_count     = 0
+        self._inspection_sample_counter = 0      # for sampling: every N parts
+        self._operator_ack              = False  # alert_operator waits on this
         self._lock = threading.Lock()
 
         # Publishers
@@ -83,6 +97,22 @@ class ProgramExecutor(Node):
         self.create_subscription(String, '/task/run_program', self._on_run_command, 10)
         self.create_subscription(String, '/estun/status', self._on_robot_status, 10)
         self.create_subscription(Bool, '/estun/is_moving', self._on_is_moving, 10)
+        # Inspection integration — published by inspection_pipeline.
+        # The /inspection/result message arrives once per inspection;
+        # the inspect_part step waits for it before deciding pass/warn/
+        # fail branching.
+        self.create_subscription(String, '/inspection/result',
+                                 self._on_inspection_result, 10)
+        self.create_subscription(String, '/inspection/status',
+                                 self._on_inspection_status, 10)
+        self.create_subscription(String, '/task/operator_ack',
+                                 self._on_operator_ack, 10)
+        # Used to tell the inspection node which part/plan to run
+        # before the next /inspection/start call.
+        self._pub_insp_params = self.create_publisher(
+            String, '/inspection/set_params', 10)
+        self._pub_alert = self.create_publisher(
+            String, '/task/operator_alert', 10)
 
         # Execution timer — checks state at 20Hz
         self._exec_timer = self.create_timer(0.05, self._execution_tick)
@@ -185,11 +215,67 @@ class ProgramExecutor(Node):
         """Track whether the robot is currently in motion."""
         self._is_robot_moving = msg.data
 
+    def _on_inspection_result(self, msg):
+        """Receive a finished inspection record from inspection_pipeline.
+
+        We only consume the result when there's a currently-pending
+        inspection on the executor side — stale or out-of-order results
+        (e.g. from a manual inspection started from the dashboard) get
+        logged and ignored.
+        """
+        try:
+            record = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        if not self._inspection_in_progress:
+            return
+        # Only accept results that match our pending inspection_id; if
+        # the inspection_node assigned us a different id, accept the
+        # next result anyway (manual starts produce mismatching ids).
+        expected = self._current_inspection_id
+        actual = record.get('inspection_id')
+        if expected and actual and expected != actual:
+            self.get_logger().info(
+                f'ignoring inspection result {actual} '
+                f'(waiting for {expected})')
+            return
+        self._last_inspection_record = record
+        self._last_inspection_result = record.get('overall_result', 'pass')
+        self._inspection_in_progress = False
+        if self._last_inspection_result == 'pass':
+            self._inspection_pass_count += 1
+        elif self._last_inspection_result == 'fail':
+            self._inspection_fail_count += 1
+
+    def _on_inspection_status(self, msg):
+        """Mirror inspection-node liveness into executor state.
+
+        We don't gate on the status topic — the result topic is the
+        authoritative completion signal. This just lets us notice if
+        the inspection node enters an error state and abort cleanly.
+        """
+        try:
+            status = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        if (self._inspection_in_progress and
+                status.get('status') == 'error'):
+            self._last_inspection_result = 'error'
+            self._inspection_in_progress = False
+
+    def _on_operator_ack(self, msg):
+        """Operator pressed Acknowledge on the dashboard alert."""
+        self._operator_ack = True
+
     # ── Execution Engine ──────────────────────────────────
 
     def _execution_tick(self):
         """Main execution loop — runs at 20Hz."""
-        if self._state not in (self.RUNNING, self.WAITING_MOTION, self.WAITING_TIME, self.WAITING_IO, self.WAITING_DETECT):
+        if self._state not in (self.RUNNING, self.WAITING_MOTION,
+                                self.WAITING_TIME, self.WAITING_IO,
+                                self.WAITING_DETECT,
+                                self.WAITING_INSPECTION,
+                                self.WAITING_OPERATOR):
             return
 
         if self._current_step_idx < 0 or self._current_step_idx >= len(self._steps):
@@ -221,6 +307,38 @@ class ProgramExecutor(Node):
         if self._state == self.WAITING_DETECT:
             # For now, advance immediately (real implementation would wait for detection result)
             self._advance_step()
+            return
+
+        if self._state == self.WAITING_INSPECTION:
+            # Block until /inspection/result arrives. Timeout after the
+            # configured limit (default 30s) so a stalled pipeline
+            # doesn't freeze the program forever.
+            timeout_s = float(step.get('inspection_timeout_s', 30.0))
+            if not self._inspection_in_progress:
+                self._handle_inspection_outcome(step)
+                return
+            if time.time() - self._wait_until > timeout_s:
+                self.get_logger().warn(
+                    f'inspection timed out after {timeout_s}s — '
+                    f'treating as fail')
+                self._inspection_in_progress = False
+                self._last_inspection_result = 'fail'
+                self._last_inspection_record = {'overall_result': 'fail',
+                                                'error': 'timeout'}
+                self._handle_inspection_outcome(step)
+            return
+
+        if self._state == self.WAITING_OPERATOR:
+            timeout_s = float(step.get('operator_timeout_s', 60.0))
+            if self._operator_ack:
+                self._operator_ack = False
+                self._advance_step()
+                return
+            if time.time() - self._wait_until > timeout_s:
+                if step.get('on_timeout', 'continue') == 'abort':
+                    self._state = self.ERROR
+                else:
+                    self._advance_step()
             return
 
         # ── Execute current step ──
@@ -473,9 +591,151 @@ class ProgramExecutor(Node):
                 self.get_logger().info(f'Loop iteration {self._cycle_count}{" / " + str(count) if count > 0 else ""} — jumping to step {goto_step + 1}')
                 self._current_step_idx = max(0, min(goto_step, len(self._steps) - 1))
 
+        elif action == 'inspect_part':
+            self._handle_inspect_part(step)
+
+        elif action == 'place_at_reject':
+            tcp = step.get('reject_tcp') or step.get('taught_tcp')
+            if tcp and len(tcp) >= 3:
+                tcp_mm = [
+                    tcp[0] * 1000 if abs(tcp[0]) < 10 else tcp[0],
+                    tcp[1] * 1000 if abs(tcp[1]) < 10 else tcp[1],
+                    tcp[2] * 1000 if abs(tcp[2]) < 10 else tcp[2],
+                    tcp[3] if len(tcp) > 3 else 0,
+                    tcp[4] if len(tcp) > 4 else 0,
+                    tcp[5] if len(tcp) > 5 else 0,
+                ]
+                self._send_move({
+                    'type': 'movl',
+                    'tcp': tcp_mm,
+                    'speed_pct': step.get('speed_pct', 30),
+                })
+                self._state = self.WAITING_MOTION
+            else:
+                self.get_logger().warn(
+                    f'place_at_reject: no reject position taught — skipping')
+                self._advance_step()
+
+        elif action == 'alert_operator':
+            # Publish the alert so the dashboard can render it; then
+            # park in WAITING_OPERATOR until an ack arrives (or the
+            # timeout fires per `on_timeout`).
+            alert = {
+                'type':      'inspection_alert',
+                'severity':  step.get('severity', 'warn'),
+                'message':   step.get('message',
+                                      'Inspection requires operator review'),
+                'inspection_id': self._current_inspection_id,
+                'timestamp':  time.time(),
+            }
+            self._pub_alert.publish(String(data=json.dumps(alert)))
+            self._operator_ack = False
+            self._wait_until = time.time()
+            self._state = self.WAITING_OPERATOR
+
+        elif action == 'log_inspection':
+            # Records the most-recent inspection result into stats
+            # without taking any action on it. Useful in sample-mode
+            # inspection programs where only every Nth part is
+            # actually inspected.
+            self.get_logger().info(
+                f'log_inspection: result={self._last_inspection_result}, '
+                f'pass_total={self._inspection_pass_count}, '
+                f'fail_total={self._inspection_fail_count}')
+            self._advance_step()
+
         else:
             self.get_logger().warn(f'Unknown action: {action} — skipping')
             self._advance_step()
+
+    # ── Inspection-step support ───────────────────────────
+
+    def _handle_inspect_part(self, step):
+        """Kick off an inspection and park in WAITING_INSPECTION.
+
+        Sampling: if `every_n_parts` > 1, only inspect every Nth part.
+        Manual triggers (every_n_parts=0) skip the inspection here —
+        the operator invokes it from the dashboard instead.
+        """
+        every_n = int(step.get('every_n_parts', 1))
+        self._inspection_sample_counter += 1
+        if every_n > 1 and (self._inspection_sample_counter % every_n) != 0:
+            self.get_logger().info(
+                f'inspect_part: skipping (sample {self._inspection_sample_counter} '
+                f'of every {every_n})')
+            self._last_inspection_result = 'pass'  # treat as pass for branching
+            self._advance_step()
+            return
+        if every_n == 0:
+            # Manual-trigger only — never starts an inspection from
+            # inside the program.
+            self._advance_step()
+            return
+
+        # Publish per-inspection params (part_id / plan_id) onto the
+        # /inspection/set_params topic so the inspection_node knows
+        # what to scan against. The actual /inspection/start ROS
+        # service call is fired by the dashboard or by a sibling node
+        # — here we just record what we're waiting for.
+        params = {
+            'part_id':       step.get('part_id', 'unknown'),
+            'plan_id':       step.get('plan_id', 'default'),
+            'tier':          step.get('tier', 1),
+            'reference_type': step.get('reference_type', 'step'),
+            'trigger_source': 'program',
+            'program':       self._program_name,
+        }
+        self._pub_insp_params.publish(String(data=json.dumps(params)))
+
+        self._current_inspection_id  = None
+        self._last_inspection_result = None
+        self._last_inspection_record = None
+        self._inspection_in_progress = True
+        self._wait_until = time.time()
+        self._state = self.WAITING_INSPECTION
+
+    def _handle_inspection_outcome(self, step):
+        """Branch the program based on the last inspection result."""
+        result = self._last_inspection_result or 'pass'
+        action_on_pass = step.get('on_pass',  'continue')
+        action_on_warn = step.get('on_warn',  'log_continue')
+        action_on_fail = step.get('on_fail',  'pause')
+
+        chosen = {
+            'pass': action_on_pass,
+            'warn': action_on_warn,
+            'fail': action_on_fail,
+            'error': action_on_fail,
+        }.get(result, 'continue')
+
+        self.get_logger().info(
+            f'inspection result: {result} → action={chosen}')
+
+        if chosen == 'continue' or chosen == 'log_continue':
+            self._advance_step()
+        elif chosen == 'pause':
+            self._state = self.PAUSED
+        elif chosen == 'abort':
+            self._state = self.ERROR
+        elif chosen == 'jump_to_reject':
+            # Jump to the next place_at_reject step if any.
+            reject_idx = self._find_step_by_action('place_at_reject')
+            if reject_idx is not None:
+                self._current_step_idx = reject_idx
+                self._state = self.RUNNING
+            else:
+                self.get_logger().warn(
+                    'inspection on_fail=jump_to_reject but no '
+                    'place_at_reject step found — pausing instead')
+                self._state = self.PAUSED
+        else:
+            self._advance_step()
+
+    def _find_step_by_action(self, action_name):
+        for i in range(self._current_step_idx + 1, len(self._steps)):
+            if self._steps[i].get('action') == action_name:
+                return i
+        return None
 
     def _advance_step(self):
         """Move to the next step."""
@@ -552,6 +812,13 @@ class ProgramExecutor(Node):
             'scan_results':     list(self._identified_parts),
             'scan_count':       len(self._scan_results),
             'identified_count': len(self._identified_parts),
+            # Inspection progress — null when no inspection program is
+            # loaded or when no inspection has run yet.
+            'current_inspection_id':   self._current_inspection_id,
+            'last_inspection_result':  self._last_inspection_result,
+            'inspection_in_progress':  self._inspection_in_progress,
+            'cumulative_pass_count':   self._inspection_pass_count,
+            'cumulative_fail_count':   self._inspection_fail_count,
         }
 
         msg = String()
