@@ -1282,8 +1282,10 @@ export default function ProgramEditor() {
                 onDrop={(e) => handleDrop(e, step.id)}
                 onDragEnd={handleDragEnd}
                 style={{
-                  display: 'flex', alignItems: 'center', gap: 12,
-                  padding: '10px 14px', marginBottom: 4, borderRadius: 8,
+                  display: 'flex', alignItems: 'center', gap: 16,
+                  padding: '12px 16px', width: '100%',
+                  marginBottom: 4, borderRadius: 8,
+                  boxSizing: 'border-box',
                   // Selection wins over the live-task highlight so the
                   // user can always tell what they just clicked.
                   background: isDragging ? '#f1f5f9'
@@ -1300,23 +1302,36 @@ export default function ProgramEditor() {
                   transformOrigin: 'left center',
                   transition: 'opacity 150ms, transform 150ms, background 100ms, border 100ms',
                 }}>
-              <div style={{ color: '#9ca3af', fontSize: 18, flexShrink: 0, userSelect: 'none', lineHeight: 1 }}>⋮⋮</div>
 
+              {/* LEFT — drag handle, step number, T/! indicator, action tag.
+                  Fixed width so the MIDDLE column always starts at the same
+                  X coordinate, keeping every title left-edge aligned
+                  regardless of which optional sub-elements are present. */}
               <div style={{
-                width: 32, height: 32, borderRadius: '50%', flexShrink: 0,
-                background: isDone ? '#16A34A' : isActive ? '#2563EB' : '#e5e7eb',
-                color: isDone || isActive ? '#fff' : '#6b7280',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                fontSize: 13, fontWeight: 700,
+                display: 'flex', alignItems: 'center', gap: 8,
+                flexShrink: 0, flexGrow: 0, width: 220,
               }}>
-                {isDone ? '✓' : (idx + 1)}
-              </div>
+                <div style={{ color: '#9ca3af', fontSize: 18, flexShrink: 0, userSelect: 'none', lineHeight: 1, width: 14, textAlign: 'center' }}>⋮⋮</div>
 
-              {isTeachable(step) && (
-                <div title={step.taught ? `Taught at ${step.taught_at || 'unknown'}` : 'Position not taught — click Teach'}
+                <div style={{
+                  width: 32, height: 32, borderRadius: '50%', flexShrink: 0,
+                  background: isDone ? '#16A34A' : isActive ? '#2563EB' : '#e5e7eb',
+                  color: isDone || isActive ? '#fff' : '#6b7280',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 13, fontWeight: 700,
+                }}>
+                  {isDone ? '✓' : (idx + 1)}
+                </div>
+
+                {/* Always reserve the T/! slot so the pill's X position is
+                    the same on teachable and non-teachable rows. */}
+                <div title={isTeachable(step)
+                              ? (step.taught ? `Taught at ${step.taught_at || 'unknown'}` : 'Position not taught — click Teach')
+                              : undefined}
                   style={{
                     width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
                     display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    visibility: isTeachable(step) ? 'visible' : 'hidden',
                     background: step.taught ? '#f0fdf4' : '#fef2f2',
                     border:     step.taught ? '2px solid #16A34A' : '2px dashed #DC2626',
                     color:      step.taught ? '#16A34A' : '#DC2626',
@@ -1324,17 +1339,22 @@ export default function ProgramEditor() {
                   }}>
                   {step.taught ? 'T' : '!'}
                 </div>
-              )}
 
-              <span style={{
-                fontSize: 11, fontWeight: 700, padding: '3px 8px',
-                borderRadius: 4, flexShrink: 0, letterSpacing: '0.5px',
-                background: tagColor + '18', color: tagColor,
-              }}>
-                {def.tag}
-              </span>
+                <span style={{
+                  display: 'inline-block', flexShrink: 0,
+                  minWidth: 70, textAlign: 'center', boxSizing: 'border-box',
+                  fontSize: 11, fontWeight: 700, padding: '3px 8px',
+                  borderRadius: 4, letterSpacing: '0.5px',
+                  background: tagColor + '18', color: tagColor,
+                }}>
+                  {def.tag}
+                </span>
+              </div>
 
-              <div style={{ flex: 1, minWidth: 0 }}>
+              {/* MIDDLE — title + detail row, fills remaining width.
+                  paddingLeft:16 sets the canonical title X coordinate;
+                  every title row aligns to this edge. */}
+              <div style={{ flex: '1 1 0', minWidth: 0, paddingLeft: 16 }}>
                 {locked ? (
                   <div style={{
                     fontSize: 16, fontWeight: 700, color: '#111',
@@ -1371,6 +1391,10 @@ export default function ProgramEditor() {
                 )}
               </div>
 
+              {/* RIGHT — Edit, Teach, Del. flex-shrink: 0 so the
+                  buttons keep their natural width and the MIDDLE
+                  column absorbs the row's flex space. */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
               {!locked && (
                 <button onClick={(e) => {
                   e.stopPropagation()
@@ -1413,6 +1437,7 @@ export default function ProgramEditor() {
                   Del
                 </button>
               )}
+              </div>
               </div>
 
               {indicator === 'after' && <InsertionBar />}
