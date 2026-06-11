@@ -1,0 +1,10 @@
+trajectory_msgs/JointTrajectory trajectory
+string profile_name
+---
+bool valid
+bool within_velocity_limits
+bool within_acceleration_limits
+bool within_jerk_limits
+bool collision_free
+string[] warnings
+string[] errors

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useStore } from '../store/useStore'
+import WorkspaceMaskSection from '../components/WorkspaceMaskSection'
 
 const LS_KEY = 'roboai-config'
 
@@ -318,6 +319,9 @@ export default function ConfigureLayout() {
           </button>
         </Field>
       </Section>
+
+      {/* LiDAR workspace polygon for the object identifier */}
+      <WorkspaceMaskSection />
 
       {/* Version info */}
       <div style={{

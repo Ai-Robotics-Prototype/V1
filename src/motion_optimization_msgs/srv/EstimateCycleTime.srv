@@ -1,0 +1,8 @@
+string program_id
+string profile_name
+---
+float32 estimated_duration_s
+float32 unoptimized_duration_s
+float32 estimated_savings_s
+string[] segment_breakdown
+bool success

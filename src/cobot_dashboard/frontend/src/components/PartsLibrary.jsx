@@ -230,6 +230,64 @@ function PartInfo({ part, name, onNameChange }) {
 
 // ── Library grid (cards) ─────────────────────────────────────────────
 
+function LidarStatsFooter({ partId }) {
+  const [stats, setStats] = useState(null)
+  useEffect(() => {
+    if (!partId) return
+    let alive = true
+    fetch(`/api/lidar_objects/by_part/${encodeURIComponent(partId)}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (!alive) return
+        const live = j.live || []
+        const hist = j.history || []
+        const all = [...live, ...hist]
+        if (!all.length) { setStats({ samples: 0 }); return }
+        const conf = all.map((o) => Number(o.confidence) || 0)
+        const dims = live.filter((o) => o.dimensions).map((o) => o.dimensions)
+        let mean_dims = null
+        if (dims.length) {
+          mean_dims = [0, 0, 0].map((_, i) =>
+            dims.reduce((s, d) => s + (Number(d[Object.keys(d)[i]]) || Number(d['xyz'.charAt(i)]) || 0), 0) / dims.length)
+        }
+        setStats({
+          samples: all.length,
+          live_samples: live.length,
+          mean: conf.reduce((a, b) => a + b, 0) / conf.length,
+          confident: conf.filter((c) => c >= 0.8).length,
+          mean_dims,
+        })
+      })
+      .catch(() => setStats({ samples: 0 }))
+    return () => { alive = false }
+  }, [partId])
+  if (!stats) return null
+  if (stats.samples === 0) {
+    return (
+      <div style={{
+        fontSize: 10, color: 'var(--text-muted, #6b7280)',
+        marginTop: 6, fontFamily: 'monospace',
+      }}>
+        LiDAR: not yet identified
+      </div>
+    )
+  }
+  return (
+    <div style={{
+      fontSize: 10, color: 'var(--text-secondary, #9ca3af)',
+      marginTop: 6, fontFamily: 'monospace', lineHeight: 1.4,
+    }}>
+      LiDAR · {stats.samples} sightings ·
+      {' '}{Math.round((stats.mean || 0) * 100)}% avg confidence
+      {stats.live_samples > 0 && (
+        <span style={{ color: '#22C55E', marginLeft: 6 }}>
+          ({stats.live_samples} live)
+        </span>
+      )}
+    </div>
+  )
+}
+
 function PartCard({ part, onConfigure, onDelete }) {
   const ex = part.extents_cm || [0, 0, 0]
   const stl = part.stl_file ? `/parts/${part.stl_file}` : null
@@ -246,8 +304,21 @@ function PartCard({ part, onConfigure, onDelete }) {
         {stl ? <PartCanvas url={stl} rotation={[0, 0, 0]} /> : <div style={{ background: '#0d0f14', width: '100%', height: '100%' }} />}
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
-          {part.name || part.id}
+        <div style={{
+          fontSize: 13, fontWeight: 600,
+          color: 'var(--text-primary)', marginBottom: 4,
+          display: 'flex', alignItems: 'center', gap: 6,
+        }}>
+          {part.identification_basis === 'step_only' && (
+            <span title="STEP file but no teach images — outline match only"
+              style={{
+                fontSize: 12, color: '#F59E0B',
+                lineHeight: 1, flexShrink: 0,
+              }}>⚠</span>
+          )}
+          <span style={{
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>{part.name || part.id}</span>
         </div>
         <div style={{ fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
           {ex.map(e => e.toFixed(1)).join(' × ')} cm
@@ -269,6 +340,7 @@ function PartCard({ part, onConfigure, onDelete }) {
               border: '1px solid #4b1d1d', borderRadius: 4,
             }}>Delete</button>
         </div>
+        <LidarStatsFooter partId={part.id} />
       </div>
     </div>
   )
@@ -316,6 +388,79 @@ function UploadZone({ onUpload, busy }) {
 }
 
 // ── Setup view ───────────────────────────────────────────────────────
+
+function StepFeaturesPanel({ partId }) {
+  const [doc, setDoc] = useState(null)
+  useEffect(() => {
+    if (!partId) return
+    let alive = true
+    fetch(`/api/parts/${encodeURIComponent(partId)}/features`)
+      .then((r) => r.json())
+      .then((j) => { if (alive) setDoc(j) })
+      .catch(() => { if (alive) setDoc({ features: [], faces: {}, orientation_signatures: {} }) })
+    return () => { alive = false }
+  }, [partId])
+  if (!doc) return null
+  const facesWithFeatures = Object.entries(doc.faces || {})
+    .filter(([_n, f]) => !f.is_flat)
+  if (facesWithFeatures.length === 0
+      && !(doc.features && doc.features.length)) {
+    return null
+  }
+  const sig = doc.orientation_signatures || {}
+  const pickable = sig.pickable
+  const nonPickable = sig.non_pickable || []
+  return (
+    <div style={{
+      marginBottom: 14, padding: '10px 12px',
+      background: 'rgba(59, 130, 246, 0.08)',
+      border: '1px solid rgba(59, 130, 246, 0.4)',
+      borderRadius: 6, fontSize: 11, color: '#cbd5e1',
+      lineHeight: 1.5,
+    }}>
+      <div style={{ fontWeight: 700, marginBottom: 6, color: '#60a5fa' }}>
+        Detected STEP features
+      </div>
+      <div style={{ marginBottom: 6 }}>
+        {facesWithFeatures.length
+          ? facesWithFeatures.map(([face, f]) => (
+              <div key={face} style={{ fontFamily: 'monospace' }}>
+                • {face}: {f.feature_summary}
+                {' '}<span style={{ color: 'var(--text-muted, #6b7280)' }}>
+                  (distinctiveness {Math.round(f.distinctiveness * 100)}%)
+                </span>
+              </div>
+            ))
+          : <div style={{ color: 'var(--text-muted, #6b7280)' }}>
+              No distinctive features detected on any face (flat shape).
+            </div>
+        }
+      </div>
+      {pickable && (
+        <div>
+          <div style={{ marginTop: 4 }}>
+            <span style={{ color: '#86EFAC' }}>✓ Pickable</span>{' '}
+            ({pickable.up_face} up): {pickable.feature_summary}
+          </div>
+          {nonPickable.slice(0, 2).map((np, i) => (
+            <div key={i}>
+              <span style={{ color: '#FCA5A5' }}>✗ {np.label}</span>{' '}
+              ({np.up_face} up): {np.feature_summary}
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{
+        fontSize: 10, color: 'var(--text-muted, #6b7280)',
+        marginTop: 6, fontStyle: 'italic',
+      }}>
+        Used to boost orientation confidence after the part is identified
+        from camera teach images. STEP features never identify a part on
+        their own.
+      </div>
+    </div>
+  )
+}
 
 function PartSetup({ part, onCancel, onSaved }) {
   const [surface, setSurface] = useState({
@@ -369,6 +514,34 @@ function PartSetup({ part, onCancel, onSaved }) {
         <PartCanvas url={stlUrl} rotation={surface.value} frontVec={front.value} />
       </div>
       <div style={{ flex: '1 1 40%', padding: 16, overflowY: 'auto' }}>
+        <StepFeaturesPanel partId={part.id} />
+        {part.identification_basis === 'step_only' && (
+          <div style={{
+            marginBottom: 14, padding: '10px 12px',
+            background: '#27201A', border: '1px solid #F59E0B',
+            borderRadius: 6, fontSize: 11, color: '#FCD34D',
+            lineHeight: 1.45,
+          }}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>
+              ⚠ STEP file present but no teach images
+            </div>
+            <div style={{ marginBottom: 8 }}>
+              This part cannot be identified by the cameras until you teach
+              it with images. STEP features (above) will then boost
+              orientation confidence — but identity always comes from
+              taught camera images plus the size gate. A STEP file alone
+              never identifies a part.
+            </div>
+            <button onClick={() => {
+              window.dispatchEvent(new CustomEvent('open-teach-wizard',
+                { detail: { partId: part.id } }))
+            }} style={{
+              padding: '6px 12px', fontSize: 11, fontWeight: 700,
+              background: '#F59E0B', color: '#0A0A0B',
+              border: 'none', borderRadius: 4, cursor: 'pointer',
+            }}>Teach This Part</button>
+          </div>
+        )}
         <SurfaceSelector
           selectedLabel={surface.label}
           onChange={(opt) => setSurface({ label: opt.label, value: opt.value })}

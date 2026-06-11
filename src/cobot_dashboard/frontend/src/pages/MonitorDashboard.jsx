@@ -4,6 +4,8 @@ import { Canvas } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader'
 import * as THREE from 'three'
+import ProgramLibrary from './ProgramLibrary'
+import IdentifiedObjectsCard from '../components/IdentifiedObjectsCard'
 
 function StatusBadge({ status }) {
   const colors = {
@@ -162,54 +164,6 @@ function CycleResults() {
   )
 }
 
-function FaultLog() {
-  const [events, setEvents] = useState([])
-  useEffect(() => {
-    let alive = true
-    const poll = async () => {
-      try {
-        const res = await fetch('/api/stats/events')
-        if (alive && res.ok) {
-          const data = await res.json()
-          setEvents(data.events || [])
-        }
-      } catch {}
-    }
-    poll()
-    const iv = setInterval(poll, 3000)
-    return () => { alive = false; clearInterval(iv) }
-  }, [])
-
-  const severity = { error: '#DC2626', warning: '#CA8A04', info: '#2563EB' }
-
-  return (
-    <div style={{
-      background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
-      padding: 20,
-    }}>
-      <div style={{ ...cardLabel, marginBottom: 10 }}>Recent Events</div>
-      {events.length === 0 ? (
-        <div style={{ fontSize: 12, color: '#9ca3af', padding: '8px 0' }}>No events</div>
-      ) : events.slice(-5).reverse().map((ev, i) => (
-        <div key={i} style={{
-          display: 'flex', alignItems: 'flex-start', gap: 10,
-          padding: '8px 0',
-          borderBottom: i < 4 ? '1px solid #f3f4f6' : 'none',
-        }}>
-          <div style={{
-            width: 8, height: 8, borderRadius: '50%', flexShrink: 0, marginTop: 5,
-            background: severity[ev.severity] || '#6b7280',
-          }} />
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 12, fontWeight: 500, color: '#111' }}>{ev.message}</div>
-            <div style={{ fontSize: 10, color: '#9ca3af' }}>{ev.timestamp}</div>
-          </div>
-        </div>
-      ))}
-    </div>
-  )
-}
-
 function TimeRemaining({ cycleTime, repeatCount, cyclesDone }) {
   if (!repeatCount || repeatCount <= 0 || !cycleTime) return null
   const remaining = Math.max(0, (repeatCount - cyclesDone) * cycleTime)
@@ -255,67 +209,6 @@ function TimeRemaining({ cycleTime, repeatCount, cyclesDone }) {
   )
 }
 
-function IOSummary() {
-  const [ioState, setIoState] = useState({})
-  const [labels, setLabels]   = useState({})
-
-  useEffect(() => {
-    fetch('/api/io/config').then((r) => r.json()).then((d) => setLabels(d.labels || {})).catch(() => {})
-  }, [])
-
-  useEffect(() => {
-    let alive = true
-    const poll = async () => {
-      try {
-        const res = await fetch('/api/io/state')
-        if (alive && res.ok) {
-          const data = await res.json()
-          setIoState(data.io || {})
-        }
-      } catch {}
-    }
-    poll()
-    const iv = setInterval(poll, 500)
-    return () => { alive = false; clearInterval(iv) }
-  }, [])
-
-  // Operator-relevant signals to surface as a strip. Same id space as
-  // the I/O page so labels stay in sync if the operator renames them.
-  const keySignals = ['DI0', 'DI1', 'DI4', 'DI8', 'DO0', 'DO1', 'DO2', 'DO4']
-
-  return (
-    <div style={{
-      background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
-      padding: '14px 20px',
-      display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap',
-    }}>
-      <span style={{ fontSize: 11, fontWeight: 600, color: '#6b7280', marginRight: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-        I/O
-      </span>
-      {keySignals.map((id) => {
-        const active = !!ioState[id]
-        const label  = labels[id] || id
-        return (
-          <div key={id} style={{
-            display: 'flex', alignItems: 'center', gap: 5,
-            padding: '4px 10px', borderRadius: 6,
-            background: active ? 'rgba(22,163,74,0.08)' : '#f3f4f6',
-            border:     active ? '1px solid rgba(22,163,74,0.3)' : '1px solid #e5e7eb',
-          }}>
-            <div style={{
-              width: 7, height: 7, borderRadius: '50%',
-              background: active ? '#16A34A' : '#9ca3af',
-            }} />
-            <span style={{ fontSize: 10, color: '#374151', fontWeight: 500 }}>
-              {label.length > 15 ? label.slice(0, 15) + '…' : label}
-            </span>
-          </div>
-        )
-      })}
-    </div>
-  )
-}
-
 function PartModel({ stlUrl }) {
   const [mesh, setMesh] = useState(null)
 
@@ -355,68 +248,72 @@ function PartModel({ stlUrl }) {
   return <primitive object={mesh} />
 }
 
-function PartViewer({ partId }) {
+// Compact target-part viewer for the Monitor top section. Renders
+// null whenever the loaded program either doesn't have a target_part
+// or that part has no STL/GLB on disk — the right block disappears
+// entirely so the left block can take the full width.
+function TopPartViewer({ partId }) {
   const [partMeta, setPartMeta] = useState(null)
+  const [loadErr,  setLoadErr]  = useState(false)
 
   useEffect(() => {
-    if (!partId) { setPartMeta(null); return }
+    if (!partId) { setPartMeta(null); setLoadErr(false); return }
     let alive = true
+    setLoadErr(false)
     fetch('/api/parts/' + encodeURIComponent(partId))
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => { if (alive) setPartMeta(d) })
-      .catch(() => {})
+      .then((d) => { if (alive) { if (d) setPartMeta(d); else { setPartMeta(null); setLoadErr(true) } } })
+      .catch(() => { if (alive) { setPartMeta(null); setLoadErr(true) } })
     return () => { alive = false }
   }, [partId])
 
-  const stlUrl = partMeta?.stl_file ? '/parts/' + partMeta.stl_file : null
-  const name   = partMeta?.name || partId
+  if (!partId || loadErr) return null
+  // Resolve the renderable URL. STL is what the parts pipeline
+  // currently writes; GLB is reserved for the future grippers-style
+  // upgrade — we try it first and fall through to STL.
+  const partKey = partMeta?.id || partMeta?.part_id || partId
+  const stlUrl  = partMeta?.stl_file ? '/parts/' + partMeta.stl_file : null
+  if (!stlUrl) return null
+
+  const name = partMeta?.name || partKey
+  const ext  = Array.isArray(partMeta?.extents_cm) ? partMeta.extents_cm : null
 
   return (
     <div style={{
       background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
-      overflow: 'hidden',
+      overflow: 'hidden', width: 220, flexShrink: 0,
     }}>
-      <div style={{ padding: '12px 16px', borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', gap: 10 }}>
-        <div style={cardLabel}>Current Part</div>
-        <div style={{ flex: 1 }} />
-        {name && <span style={{ fontSize: 13, fontWeight: 700, color: '#111' }}>{name}</span>}
+      <div style={{
+        padding: '8px 12px',
+        fontSize: 11, fontWeight: 700, color: '#6b7280',
+        textTransform: 'uppercase', letterSpacing: '0.06em',
+        borderBottom: '1px solid #e5e7eb', background: '#fff',
+      }}>
+        Target Part
       </div>
-
-      {partId ? (
-        <div style={{ height: 200, background: '#fafafa' }}>
-          <Canvas camera={{ position: [0.15, 0.12, 0.15], fov: 45 }} style={{ background: '#fafafa' }}>
-            <ambientLight intensity={0.7} />
-            <directionalLight position={[5, 5, 5]} intensity={0.8} />
-            <directionalLight position={[-5, 3, -5]} intensity={0.3} />
-            <gridHelper args={[0.2, 10, '#d1d5db', '#e5e7eb']} />
-            <PartModel stlUrl={stlUrl} />
-            <OrbitControls enablePan={false} target={[0, 0, 0]} />
-          </Canvas>
+      <div style={{ width: 200, height: 200, margin: '0 auto', background: '#fff' }}>
+        <Canvas
+          camera={{ position: [0.18, 0.14, 0.18], fov: 45 }}
+          style={{ background: '#fff' }}
+          gl={{ antialias: true }}>
+          <ambientLight intensity={0.75} />
+          <directionalLight position={[5, 5, 5]} intensity={0.85} />
+          <directionalLight position={[-5, 3, -5]} intensity={0.3} />
+          <PartModel stlUrl={stlUrl} />
+          <OrbitControls enablePan={false} target={[0, 0, 0]}
+            autoRotate autoRotateSpeed={1.5} />
+        </Canvas>
+      </div>
+      <div style={{ padding: '8px 12px 12px', borderTop: '1px solid #f3f4f6' }}>
+        <div style={{ fontSize: 14, fontWeight: 700, color: '#111', lineHeight: 1.3 }}>
+          {name}
         </div>
-      ) : (
-        <div style={{
-          height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center',
-          color: '#9ca3af', fontSize: 13, background: '#fafafa',
-        }}>
-          No part assigned to this program
-        </div>
-      )}
-
-      {partMeta && (
-        <div style={{ padding: '10px 16px', borderTop: '1px solid #e5e7eb', display: 'flex', gap: 16, fontSize: 11, color: '#6b7280', flexWrap: 'wrap' }}>
-          {Array.isArray(partMeta.extents_cm) && (
-            <span>
-              {partMeta.extents_cm.map((e) => Number(e).toFixed(1)).join(' × ')} cm
-            </span>
-          )}
-          {partMeta.teach_count !== undefined && (
-            <span>{partMeta.teach_count} teach refs</span>
-          )}
-          {partMeta.templates?.num_templates !== undefined && (
-            <span>{partMeta.templates.num_templates} templates</span>
-          )}
-        </div>
-      )}
+        {ext && (
+          <div style={{ fontSize: 12, color: '#6b7280', marginTop: 2 }}>
+            {ext.map((e) => Number(e).toFixed(1)).join(' × ')} cm
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -602,6 +499,193 @@ const cardLabel = {
   textTransform: 'uppercase', letterSpacing: '0.05em',
 }
 
+// Pallet progress widget — only renders while a pallet program is
+// running. Subscribes to /task/state via the global store; reads
+// pallet_mode / pallet_cycle / pallet_row / pallet_col / pallet_layer
+// / pallet_total. Shows layer tabs (one per pallet layer) with a
+// grid of rows × cols slot tiles for the active layer.
+function PalletProgressWidget({ task, programConfig, lastCycleTime }) {
+  const palletMode  = task?.pallet_mode || null
+  const cycle       = task?.pallet_cycle ?? null
+  const total       = task?.pallet_total ?? null
+  const activeRow   = task?.pallet_row   ?? 0
+  const activeCol   = task?.pallet_col   ?? 0
+  const activeLayer = task?.pallet_layer ?? 0
+  const isDepal     = palletMode === 'depalletize'
+
+  // Selected layer tab — defaults to the layer the executor is on,
+  // but the operator can click around to inspect others.
+  const [selectedLayer, setSelectedLayer] = useState(0)
+  useEffect(() => {
+    if (typeof activeLayer === 'number') setSelectedLayer(activeLayer)
+  }, [activeLayer])
+
+  if (!palletMode || cycle === null || total === null) return null
+
+  const pallet = programConfig?.pallet || {}
+  const rows    = pallet.rows   || 4
+  const cols    = pallet.cols   || 4
+  const layers  = pallet.layers || 1
+  const fillOrder = pallet.fill_order || 'row_lr'
+
+  // Recreate the same slot ordering the executor uses so the widget's
+  // grey/green/blue tiles match what the robot is doing. For
+  // depalletize the layer order reverses (top first).
+  const slotForCycle = (n) => {
+    const layerSize = Math.max(1, rows * cols)
+    const layerIdx  = Math.floor(n / layerSize)
+    const within    = n % layerSize
+    let r, c
+    if (fillOrder === 'row_lr') {
+      r = Math.floor(within / cols) % rows
+      c = within % cols
+    } else if (fillOrder === 'row_rl') {
+      r = Math.floor(within / cols) % rows
+      c = (cols - 1) - (within % cols)
+    } else if (fillOrder === 'col') {
+      r = within % rows
+      c = Math.floor(within / rows) % cols
+    } else {
+      r = Math.floor(within / cols) % rows
+      const wr = within % cols
+      c = (r % 2 === 0) ? wr : (cols - 1 - wr)
+    }
+    const layer = isDepal ? (layers - 1) - (layerIdx % layers) : (layerIdx % layers)
+    return { r, c, layer }
+  }
+
+  // Build a {layer -> {r,c -> status}} map. Anything with index < cycle
+  // is done; index === cycle is active; else not yet.
+  const slotState = {}
+  for (let i = 0; i < total; i++) {
+    const { r, c, layer } = slotForCycle(i)
+    if (!slotState[layer]) slotState[layer] = {}
+    const status = i < cycle ? 'done' : i === cycle ? 'active' : 'pending'
+    slotState[layer][r + ',' + c] = status
+  }
+
+  const remaining = Math.max(0, total - cycle)
+  const cycleSec  = parseFloat(lastCycleTime) || 12
+  const etaSec    = Math.max(0, Math.round(remaining * cycleSec))
+  const etaMin    = Math.floor(etaSec / 60)
+  const etaRem    = etaSec - etaMin * 60
+  const tileFor = (status) => ({
+    background: status === 'done'    ? '#16A34A'
+             : status === 'active'   ? '#2563EB'
+             : status === 'failed'   ? '#DC2626'
+             : '#e5e7eb',
+    boxShadow: status === 'active' ? '0 0 0 3px rgba(37,99,235,0.25)' : 'none',
+    animation: status === 'active' ? 'pulse-pallet 1.2s ease-in-out infinite' : 'none',
+    color: status === 'done' || status === 'active' || status === 'failed' ? '#fff' : '#9ca3af',
+  })
+
+  const badgeBg     = isDepal ? '#fffbeb' : '#eff6ff'
+  const badgeBorder = isDepal ? '#fde68a' : '#bfdbfe'
+  const badgeColor  = isDepal ? '#CA8A04' : '#2563EB'
+  const badgeLabel  = isDepal ? 'DEPALLETIZING' : 'PALLETIZING'
+
+  return (
+    <div style={{
+      background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
+      padding: 20, marginBottom: 16,
+    }}>
+      <style>{`
+        @keyframes pulse-pallet {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50%      { opacity: 0.55; transform: scale(0.92); }
+        }
+      `}</style>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14, flexWrap: 'wrap' }}>
+        <div style={{
+          display: 'inline-flex', alignItems: 'center', gap: 8,
+          padding: '6px 14px', borderRadius: 999,
+          background: badgeBg, border: '1px solid ' + badgeBorder,
+          color: badgeColor, fontSize: 12, fontWeight: 800, letterSpacing: '0.05em',
+        }}>
+          <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
+            <path d={isDepal
+              ? "M12 20V8m0 0l-5 5m5-5l5 5"
+              : "M12 4v12m0 0l-5-5m5 5l5-5"}
+              stroke={badgeColor} strokeWidth="2.5"
+              strokeLinecap="round" strokeLinejoin="round" fill="none" />
+          </svg>
+          {badgeLabel}
+        </div>
+        <div style={{ fontSize: 12, color: '#6b7280' }}>
+          {rows} × {cols} × {layers} = {total} slots
+        </div>
+        <div style={{ flex: 1 }} />
+        <div style={{ fontSize: 12, color: '#6b7280' }}>
+          Slot row {activeRow + 1}, col {activeCol + 1}, layer {activeLayer + 1}
+        </div>
+      </div>
+
+      {/* Layer tabs */}
+      {layers > 1 && (
+        <div style={{ display: 'flex', gap: 6, marginBottom: 12, flexWrap: 'wrap' }}>
+          {Array.from({ length: layers }).map((_, i) => (
+            <button key={i} onClick={() => setSelectedLayer(i)}
+              style={{
+                padding: '6px 12px', fontSize: 12, fontWeight: 700,
+                borderRadius: 6, cursor: 'pointer',
+                background: selectedLayer === i ? badgeColor : '#f3f4f6',
+                color:      selectedLayer === i ? '#fff'     : '#374151',
+                border:     selectedLayer === i ? 'none'     : '1px solid #e5e7eb',
+              }}>
+              Layer {i + 1}{activeLayer === i ? ' •' : ''}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Slot grid for the selected layer */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: `repeat(${cols}, minmax(28px, 44px))`,
+        gridAutoRows: 'minmax(28px, 44px)',
+        gap: 6, justifyContent: 'center',
+        padding: 14, background: '#f8fafc', borderRadius: 8,
+        border: '1px solid #e5e7eb', marginBottom: 12,
+      }}>
+        {Array.from({ length: rows }).map((_, r) =>
+          Array.from({ length: cols }).map((__, c) => {
+            const status = (slotState[selectedLayer] || {})[r + ',' + c] || 'pending'
+            return (
+              <div key={`${r}-${c}`} title={`Row ${r + 1}, Col ${c + 1} — ${status}`}
+                style={{
+                  borderRadius: 6,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 10, fontWeight: 700,
+                  transition: 'background 200ms, box-shadow 200ms',
+                  ...tileFor(status),
+                }}>
+                {status === 'done' ? '✓' : status === 'active' ? '●' : ''}
+              </div>
+            )
+          })
+        )}
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 18, fontSize: 13, color: '#374151', flexWrap: 'wrap' }}>
+        <div>
+          <strong style={{ color: '#111', fontVariantNumeric: 'tabular-nums' }}>{cycle}</strong> of{' '}
+          <strong style={{ color: '#111', fontVariantNumeric: 'tabular-nums' }}>{total}</strong> done
+        </div>
+        <div style={{ color: '#9ca3af' }}>•</div>
+        <div>
+          approx {etaMin > 0 ? `${etaMin} min ` : ''}{etaRem} sec remaining
+        </div>
+        <div style={{ flex: 1 }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#6b7280' }}>
+          <span style={{ width: 10, height: 10, borderRadius: 2, background: '#16A34A' }} />Done
+          <span style={{ width: 10, height: 10, borderRadius: 2, background: '#2563EB', marginLeft: 8 }} />Active
+          <span style={{ width: 10, height: 10, borderRadius: 2, background: '#e5e7eb', marginLeft: 8 }} />Pending
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function StatCard({ label, value, unit, color }) {
   return (
     <div style={{
@@ -620,16 +704,62 @@ function StatCard({ label, value, unit, color }) {
 }
 
 export default function MonitorDashboard() {
-  const currentProgram = useStore((s) => s.currentProgram)
-  const task           = useStore((s) => s.task)
-  const safety         = useStore((s) => s.safety)
+  const currentProgram     = useStore((s) => s.currentProgram)
+  const setCurrentProgram  = useStore((s) => s.setCurrentProgram)
+  const task               = useStore((s) => s.task)
+  const safety             = useStore((s) => s.safety)
   const detectionsFromStore = useStore((s) => s.detections)
-  const setTab         = useStore((s) => s.setTab)
+  const setTab             = useStore((s) => s.setTab)
+  const addToast           = useStore((s) => s.addToast)
 
   const runProgram     = useStore((s) => s.runProgram)
   const pauseProgram   = useStore((s) => s.pauseProgram)
   const resumeProgram  = useStore((s) => s.resumeProgram)
   const cancelProgram  = useStore((s) => s.cancelProgram)
+
+  // Change Program overlay state. The Program Library is rendered
+  // inside a full-viewport modal here; onSelectProgram closes it and
+  // makes the picked program the active one (without auto-starting).
+  const [showLibrary, setShowLibrary] = useState(false)
+
+  const onSelectProgram = async (prog) => {
+    setShowLibrary(false)
+    if (!prog || !prog.id) return
+    try {
+      const res = await fetch('/api/programs/' + encodeURIComponent(prog.id))
+      if (!res.ok) throw new Error('HTTP ' + res.status)
+      const full = await res.json()
+      if (full && Array.isArray(full.steps)) {
+        // Wholesale replace currentProgram so the Monitor (and the
+        // 3D viewer's gripper subscription) re-renders against the
+        // new program immediately.
+        setCurrentProgram({
+          id:          full.id,
+          name:        full.name,
+          description: full.description || '',
+          steps:       full.steps,
+          config:      full.config || {},
+        })
+        // Tell the executor about the new active program. action='load'
+        // is treated as a frontend-facing 'set active'; the next Run
+        // picks it up via the normal load+run flow.
+        try {
+          await fetch('/api/program/run', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ action: 'load', program_id: full.id }),
+          })
+        } catch {}
+        if (typeof addToast === 'function') {
+          addToast('Loaded "' + (full.name || full.id) + '"', 'success')
+        }
+      }
+    } catch (e) {
+      if (typeof addToast === 'function') {
+        addToast('Load failed: ' + (e?.message || e), 'error')
+      }
+    }
+  }
 
   // Cycle bookkeeping lives in local state — the backend doesn't track
   // cycle count in STATE yet, so we maintain a counter on the client
@@ -734,6 +864,13 @@ export default function MonitorDashboard() {
                 ▶ Run Program
               </button>
             )}
+            <button onClick={() => setShowLibrary(true)} style={{
+              padding: '14px 24px', fontSize: 14, fontWeight: 600,
+              background: '#fff', color: '#374151',
+              border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+            }}>
+              Change Program
+            </button>
             <button onClick={() => setTab('program')} style={{
               padding: '14px 24px', fontSize: 14, fontWeight: 600,
               background: '#fff', color: '#374151',
@@ -742,14 +879,20 @@ export default function MonitorDashboard() {
               Edit Program
             </button>
           </div>
+
+          {/* Optional program description, below the step indicator
+              so the button row stays visible above the fold. */}
+          {currentProgram?.description && (
+            <div style={{ fontSize: 13, color: '#6b7280', marginTop: 12, lineHeight: 1.4 }}>
+              {currentProgram.description}
+            </div>
+          )}
         </div>
 
-        {/* Top-right: 3D viewer of the current program's target part.
-            The live camera moved out — it has its own home in the
-            Cameras & LiDAR tab. */}
-        <div style={{ width: 400, flexShrink: 0 }}>
-          <PartViewer partId={targetPartId} />
-        </div>
+        {/* Top-right: compact 200×200 target part viewer.
+            TopPartViewer self-hides when no target_part / no STL is
+            available, so the left block reclaims the row width. */}
+        <TopPartViewer partId={targetPartId} />
       </div>
 
       {/* Stats row */}
@@ -760,10 +903,19 @@ export default function MonitorDashboard() {
         <StatCard label="Objects Detected" value={detectionCount} color="#9333EA" />
       </div>
 
-      {/* Production stats: parts picked + cycle results */}
+      {/* Pallet progress — hidden unless the executor is publishing
+          pallet_mode on /task/state for the active program. */}
+      <PalletProgressWidget
+        task={task}
+        programConfig={programConfig}
+        lastCycleTime={lastCycleTime}
+      />
+
+      {/* Production stats: parts picked + cycle results + LiDAR identifications */}
       <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
         <PickCounter />
         <CycleResults />
+        <IdentifiedObjectsCard />
       </div>
 
       {/* Per-program pick performance (PartViewer moved to the top-right
@@ -784,12 +936,6 @@ export default function MonitorDashboard() {
           repeatCount={currentProgram?.config?.repeat_count || 0}
           cyclesDone={cycleCount}
         />
-      </div>
-
-      {/* I/O strip on top, fault log below */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 24 }}>
-        <IOSummary />
-        <FaultLog />
       </div>
 
       {/* Scan & Identify results — only visible while a scan program
@@ -843,59 +989,11 @@ export default function MonitorDashboard() {
         </div>
       )}
 
-      {/* Program steps progress */}
-      {steps.length > 0 ? (
-        <div style={{
-          background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
-          padding: 20,
-        }}>
-          <div style={{ fontSize: 14, fontWeight: 700, color: '#111', marginBottom: 14 }}>
-            Program Steps
-          </div>
-          <div style={{ display: 'flex', gap: 4, marginBottom: 16 }}>
-            {steps.map((step, i) => (
-              <div key={step.id ?? i} style={{
-                flex: 1, height: 8, borderRadius: 4,
-                background: i < currentStepIdx ? '#16A34A'
-                  : i === currentStepIdx ? '#2563EB'
-                  : '#e5e7eb',
-                transition: 'background 300ms',
-              }} />
-            ))}
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 8 }}>
-            {steps.map((step, i) => (
-              <div key={step.id ?? i} style={{
-                display: 'flex', alignItems: 'center', gap: 8,
-                padding: '8px 12px', borderRadius: 6,
-                background: i === currentStepIdx ? '#eff6ff'
-                  : i < currentStepIdx ? '#f0fdf4'
-                  : '#fafafa',
-                border: i === currentStepIdx ? '1px solid #93c5fd'
-                  : i < currentStepIdx ? '1px solid #bbf7d0'
-                  : '1px solid #e5e7eb',
-              }}>
-                <div style={{
-                  width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: 10, fontWeight: 700,
-                  background: i < currentStepIdx ? '#16A34A' : i === currentStepIdx ? '#2563EB' : '#e5e7eb',
-                  color: i <= currentStepIdx ? '#fff' : '#6b7280',
-                }}>
-                  {i < currentStepIdx ? '✓' : i + 1}
-                </div>
-                <div style={{
-                  fontSize: 12, fontWeight: i === currentStepIdx ? 700 : 400,
-                  color: i === currentStepIdx ? '#2563EB' : '#374151',
-                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                }}>
-                  {step.label || step.action}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      ) : (
+      {/* No-program placeholder. The previous "Program Steps" panel
+          (progress bar + numbered step grid) was removed; only the
+          empty-state hint remains so a fresh operator knows where to
+          load a program from. */}
+      {steps.length === 0 && (
         <div style={{
           background: '#fff', borderRadius: 12, border: '2px dashed #d1d5db',
           padding: 40, textAlign: 'center',
@@ -921,6 +1019,45 @@ export default function MonitorDashboard() {
             }}>
               Create New Program
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Change Program overlay — full-viewport modal wrapping the
+          shared ProgramLibrary component. The onSelectProgram prop
+          routes program clicks back into our load-and-set handler
+          instead of the library's default Edit/Duplicate/Delete
+          details modal. */}
+      {showLibrary && (
+        <div
+          onClick={(e) => { if (e.target === e.currentTarget) setShowLibrary(false) }}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 200,
+            background: 'rgba(15,23,42,0.55)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+          <div style={{
+            width: '95%', maxWidth: 1100, height: '90vh',
+            background: '#f8fafc', borderRadius: 16, overflow: 'hidden',
+            boxShadow: '0 25px 60px rgba(0,0,0,0.25)',
+            display: 'flex', flexDirection: 'column',
+            position: 'relative',
+          }}>
+            <div style={{
+              padding: '14px 20px', borderBottom: '1px solid #e5e7eb',
+              display: 'flex', alignItems: 'center', background: '#fff',
+            }}>
+              <div style={{ fontSize: 13, color: '#6b7280', flex: 1 }}>
+                Pick a program to load as the active program
+              </div>
+              <button onClick={() => setShowLibrary(false)} style={{
+                background: 'none', border: 'none', cursor: 'pointer',
+                fontSize: 18, color: '#9ca3af', padding: '2px 8px',
+              }} title="Close">X</button>
+            </div>
+            <div style={{ flex: 1, overflow: 'hidden' }}>
+              <ProgramLibrary onSelectProgram={onSelectProgram} />
+            </div>
           </div>
         </div>
       )}

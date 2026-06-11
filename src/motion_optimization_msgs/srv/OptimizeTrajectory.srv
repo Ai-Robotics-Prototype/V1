@@ -1,0 +1,6 @@
+trajectory_msgs/JointTrajectory input_trajectory
+string profile_name
+bool check_collisions
+---
+motion_optimization_msgs/OptimizedTrajectory result
+bool success

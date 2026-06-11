@@ -1,4 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { Canvas } from '@react-three/fiber'
+import { OrbitControls } from '@react-three/drei'
+import { STLLoader } from 'three/examples/jsm/loaders/STLLoader'
+import * as THREE from 'three'
 import { useStore } from '../store/useStore'
 
 /*
@@ -424,6 +428,748 @@ const padLabelStyle = {
   textAlign: 'center', marginBottom: 4,
 }
 
+const inputBox = {
+  width: '100%', padding: '10px 12px', fontSize: 16, fontWeight: 600,
+  border: '2px solid #e5e7eb', borderRadius: 8, outline: 'none',
+  boxSizing: 'border-box',
+}
+
+// ────────────────────────────────────────────────────────
+// Custom-gripper page support
+// ────────────────────────────────────────────────────────
+
+// STL viewer reused for the Custom Gripper preview. Same lighting /
+// material / OrbitControls / grid setup as the parts library viewer
+// so the operator sees the gripper rendered identically to a part.
+function GripperStlModel({ stlUrl }) {
+  const [mesh, setMesh] = useState(null)
+  useEffect(() => {
+    if (!stlUrl) { setMesh(null); return }
+    let cancelled = false
+    const loader = new STLLoader()
+    loader.load(
+      stlUrl,
+      (geometry) => {
+        if (cancelled) return
+        geometry.computeBoundingBox()
+        geometry.center()
+        const box = geometry.boundingBox
+        const size = Math.max(
+          box.max.x - box.min.x,
+          box.max.y - box.min.y,
+          box.max.z - box.min.z,
+        ) || 1
+        const scale = 0.2 / size
+        geometry.scale(scale, scale, scale)
+        const m = new THREE.Mesh(
+          geometry,
+          new THREE.MeshStandardMaterial({ color: '#A8B0C0', metalness: 0.5, roughness: 0.35 }),
+        )
+        m.castShadow = true
+        setMesh(m)
+      },
+      undefined,
+      () => { if (!cancelled) setMesh(null) },
+    )
+    return () => { cancelled = true }
+  }, [stlUrl])
+  if (!mesh) return null
+  return <primitive object={mesh} />
+}
+
+function GripperPreviewCanvas({ stlUrl, name, dims, onRemove }) {
+  return (
+    <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 10, overflow: 'hidden' }}>
+      <div style={{ height: 300, background: '#fafafa', position: 'relative' }}>
+        <Canvas camera={{ position: [0.25, 0.18, 0.25], fov: 45 }} shadows>
+          <ambientLight intensity={0.6} />
+          <directionalLight position={[5, 5, 5]} intensity={0.9} castShadow />
+          <directionalLight position={[-5, 3, -5]} intensity={0.3} />
+          <gridHelper args={[0.4, 16, '#d1d5db', '#e5e7eb']} position={[0, -0.1, 0]} />
+          {/* Shadow catcher beneath the model. */}
+          <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.1, 0]} receiveShadow>
+            <planeGeometry args={[0.6, 0.6]} />
+            <shadowMaterial transparent opacity={0.18} />
+          </mesh>
+          <GripperStlModel stlUrl={stlUrl} />
+          <OrbitControls enablePan={false} target={[0, 0, 0]} />
+        </Canvas>
+        {onRemove && (
+          <button onClick={onRemove}
+            style={{
+              position: 'absolute', top: 8, right: 8,
+              padding: '4px 10px', fontSize: 11, fontWeight: 600,
+              background: 'rgba(255,255,255,0.92)', color: '#DC2626',
+              border: '1px solid #fecaca', borderRadius: 6, cursor: 'pointer',
+            }}>
+            Remove
+          </button>
+        )}
+      </div>
+      <div style={{ padding: '10px 14px', borderTop: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: '#111' }}>{name || 'Custom Gripper'}</div>
+        {dims && (
+          <div style={{ fontSize: 12, color: '#6b7280' }}>
+            {Number(dims.w_cm || 0).toFixed(1)} × {Number(dims.d_cm || 0).toFixed(1)} × {Number(dims.h_cm || 0).toFixed(1)} cm
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// Small DO / DI selector that mirrors the editor's IOPortSelector
+// look so the operator gets the same dropdown they see when wiring
+// gripper IO on a step. Pulls labels from /api/io/config.
+function IOPortDropdown({ label, direction, value, onChange, ioLabels }) {
+  const ports = Array.from({ length: 16 }, (_, i) => {
+    const id  = (direction === 'output' ? 'DO' : 'DI') + i
+    const pin = (direction === 'output' ? 'Y' : 'X') + Math.floor(i / 8) + '.' + (i % 8)
+    return { id, pin, label: (ioLabels && ioLabels[id]) || id }
+  })
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 4 }}>{label}</div>
+      <select value={value || ''} onChange={(e) => onChange(e.target.value || undefined)}
+        style={{
+          width: '100%', padding: '10px 12px', fontSize: 14,
+          border: '1px solid #d1d5db', borderRadius: 6, background: '#fff',
+        }}>
+        <option value="">Not assigned</option>
+        {ports.map((p) => (
+          <option key={p.id} value={p.id}>{p.pin} — {p.label}</option>
+        ))}
+      </select>
+    </div>
+  )
+}
+
+function CustomGripperPanel({ answers, setAnswer, goNext }) {
+  const [uploading, setUploading] = useState(false)
+  const [uploadErr, setUploadErr] = useState('')
+  const [dragOver,  setDragOver]  = useState(false)
+  const [ioLabels,  setIoLabels]  = useState({})
+  const fileInputRef = useRef(null)
+
+  useEffect(() => {
+    let alive = true
+    fetch('/api/io/config')
+      .then((r) => r.json())
+      .then((d) => { if (alive && d) setIoLabels(d.labels || {}) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [])
+
+  const uploadedModelId  = answers.gripper_model_id  || null
+  const uploadedStlUrl   = answers.gripper_stl_url   || null
+  const uploadedGlbUrl   = answers.gripper_glb_url   || null
+  const uploadedName     = answers.gripper_upload_name || ''
+  const uploadedDims     = answers.gripper_dimensions || null
+  const gripperName      = answers.gripper_name || uploadedName
+  const activateSignal   = answers.gripper_activate_signal || ''
+  const confirmSignal    = answers.gripper_confirm_signal  || ''
+
+  const uploadFile = async (file) => {
+    if (!file) return
+    const lower = file.name.toLowerCase()
+    if (!(lower.endsWith('.step') || lower.endsWith('.stp'))) {
+      setUploadErr('Only .step / .stp files accepted')
+      return
+    }
+    setUploadErr('')
+    setUploading(true)
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const res = await fetch('/api/gripper/upload', { method: 'POST', body: form })
+      const data = await res.json()
+      if (!res.ok || data.error) {
+        setUploadErr(data.error || 'Upload failed')
+      } else {
+        setAnswer('gripper_model_id',   data.id)
+        setAnswer('gripper_glb_url',    data.glb_url || null)
+        setAnswer('gripper_stl_url',    data.stl_url || null)
+        setAnswer('gripper_upload_name', data.name || '')
+        setAnswer('gripper_dimensions', data.dimensions || null)
+        if (!answers.gripper_name && data.name) {
+          setAnswer('gripper_name', data.name)
+        }
+      }
+    } catch (e) {
+      setUploadErr('Upload error: ' + (e?.message || 'unknown'))
+    }
+    setUploading(false)
+  }
+
+  const removeModel = () => {
+    const id = answers.gripper_model_id
+    if (id) {
+      fetch('/api/gripper/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {})
+    }
+    setAnswer('gripper_model_id',   null)
+    setAnswer('gripper_glb_url',    null)
+    setAnswer('gripper_stl_url',    null)
+    setAnswer('gripper_upload_name', '')
+    setAnswer('gripper_dimensions', null)
+  }
+
+  const onDrop = (e) => {
+    e.preventDefault()
+    setDragOver(false)
+    const f = e.dataTransfer?.files?.[0]
+    if (f) uploadFile(f)
+  }
+
+  return (
+    <div style={{ padding: 24, maxWidth: 720, margin: '0 auto' }}>
+      <div style={{ fontSize: 22, fontWeight: 700, color: '#111', marginBottom: 8, lineHeight: 1.3 }}>
+        Custom Gripper
+      </div>
+      <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 20, lineHeight: 1.5 }}>
+        Optional: upload a STEP file for a 3D preview. Name your gripper and assign any digital I/O it uses.
+      </div>
+
+      {/* Section 1 — STEP file */}
+      <div style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 8 }}>STEP File (optional)</div>
+      {uploading ? (
+        <div style={{
+          padding: 28, border: '2px dashed #bfdbfe', borderRadius: 10, background: '#eff6ff',
+          textAlign: 'center', marginBottom: 20,
+        }}>
+          <div style={{
+            width: 28, height: 28, margin: '0 auto 10px',
+            border: '3px solid #bfdbfe', borderTopColor: '#2563EB',
+            borderRadius: '50%', animation: 'spin 1s linear infinite',
+          }} />
+          <div style={{ fontSize: 13, color: '#2563EB', fontWeight: 600 }}>Processing STEP file…</div>
+          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+        </div>
+      ) : uploadedModelId && uploadedStlUrl ? (
+        <div style={{ marginBottom: 20 }}>
+          <GripperPreviewCanvas
+            stlUrl={uploadedStlUrl}
+            name={uploadedName || gripperName}
+            dims={uploadedDims}
+            onRemove={removeModel}
+          />
+        </div>
+      ) : (
+        <div
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={onDrop}
+          style={{
+            padding: 28, marginBottom: 20,
+            border: '2px dashed ' + (dragOver ? '#2563EB' : '#d1d5db'),
+            background: dragOver ? '#eff6ff' : '#f8fafc',
+            borderRadius: 10, textAlign: 'center',
+            transition: 'all 100ms',
+          }}>
+          <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 10 }}>
+            Upload a STEP file to preview your gripper in 3D (optional)
+          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".step,.stp"
+            style={{ display: 'none' }}
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadFile(f); e.target.value = '' }}
+          />
+          <button onClick={() => fileInputRef.current?.click()}
+            style={{
+              padding: '10px 18px', fontSize: 13, fontWeight: 700,
+              background: '#2563EB', color: '#fff', border: 'none',
+              borderRadius: 8, cursor: 'pointer',
+            }}>
+            Upload Gripper STEP File
+          </button>
+          <div style={{ fontSize: 11, color: '#9ca3af', marginTop: 8 }}>
+            Or drag and drop a .step / .stp file here.
+          </div>
+        </div>
+      )}
+      {uploadErr && (
+        <div style={{
+          padding: 10, marginBottom: 16, fontSize: 12,
+          background: '#fef2f2', border: '1px solid #fecaca',
+          borderRadius: 6, color: '#DC2626',
+        }}>{uploadErr}</div>
+      )}
+
+      {/* Section 2 — Name */}
+      <div style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 4 }}>Gripper name</div>
+      <input
+        value={gripperName}
+        onChange={(e) => setAnswer('gripper_name', e.target.value)}
+        placeholder="e.g. Custom Magnetic Gripper"
+        style={{ ...inputBox, fontSize: 15, marginBottom: 20 }}
+      />
+
+      {/* Section 3 — I/O */}
+      <div style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 4 }}>
+        I/O signals (optional — assign if your gripper uses digital I/O)
+      </div>
+      <IOPortDropdown
+        label="Activate signal"
+        direction="output"
+        value={activateSignal}
+        onChange={(v) => setAnswer('gripper_activate_signal', v)}
+        ioLabels={ioLabels}
+      />
+      <IOPortDropdown
+        label="Confirm signal"
+        direction="input"
+        value={confirmSignal}
+        onChange={(v) => setAnswer('gripper_confirm_signal', v)}
+        ioLabels={ioLabels}
+      />
+
+      <NextButton onClick={goNext} disabled={!gripperName.trim()} label="Next" />
+    </div>
+  )
+}
+
+// ────────────────────────────────────────────────────────
+// TeachSequence — the dedicated end-of-wizard teach flow
+//
+// One position at a time. Derives the list from `answers` (operation
+// + pallet_mode + scan_after, etc.), walks the operator through them
+// with a full-bleed jog pendant (140×140 buttons, same sizing as the
+// Program tab's maximised pendant), and writes the recorded
+// {tcp, joints, taught_at, skipped} payload into answers under
+// taught_home / taught_pick / taught_place / etc. so program
+// generation and the Review page can read them.
+// ────────────────────────────────────────────────────────
+
+// Derive the ordered list of positions for the current operation.
+function teachPositionsForAnswers(answers) {
+  const op   = answers.operation
+  const mode = answers.pallet_mode
+  const positions = [
+    { key: 'taught_home', label: 'HOME POSITION',
+      instr: 'Jog the robot to its safe home position — a neutral pose away from the work area that the robot returns to between cycles.' },
+  ]
+  if (op === 'palletize' && mode === 'palletize') {
+    positions.push({
+      key: 'taught_pick', label: 'PICK POSITION',
+      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
+    })
+    positions.push({
+      key: 'taught_pallet_corner', label: 'PALLET CORNER [row 1, col 1, layer 1]',
+      instr: 'Jog the robot to the centre of the FIRST pallet slot — bottom layer, nearest corner [row 1, col 1, layer 1]. All other grid positions will be calculated automatically.',
+    })
+  } else if (op === 'palletize' && mode === 'depalletize') {
+    positions.push({
+      key: 'taught_pallet_corner', label: 'PALLET CORNER [row 1, col 1, top layer]',
+      instr: 'Jog the robot to the centre of the FIRST part to pick — top layer, nearest corner [row 1, col 1]. All other grid positions will be calculated automatically.',
+    })
+    positions.push({
+      key: 'taught_place', label: 'PLACE POSITION',
+      instr: 'Jog the robot to where it should place parts, above the target location at the correct approach angle.',
+    })
+  } else if (op === 'machine_tend') {
+    positions.push({
+      key: 'taught_pick', label: 'PICK / LOAD POSITION',
+      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
+    })
+    positions.push({
+      key: 'taught_machine_load', label: 'MACHINE LOAD POSITION',
+      instr: 'Jog the robot to the machine load point — where it places a part into the machine fixture.',
+    })
+    positions.push({
+      key: 'taught_unload', label: 'UNLOAD POSITION',
+      instr: 'Jog the robot to where it picks the finished part out of the machine.',
+    })
+  } else if (op === 'sort') {
+    positions.push({
+      key: 'taught_pick', label: 'PICK POSITION',
+      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
+    })
+    positions.push({
+      key: 'taught_sort_1', label: 'SORT PLACE 1',
+      instr: 'Jog the robot to the first sort destination — where type 1 parts are placed.',
+    })
+    positions.push({
+      key: 'taught_sort_2', label: 'SORT PLACE 2',
+      instr: 'Jog the robot to the second sort destination — where type 2 parts are placed.',
+    })
+  } else if (op === 'inspect') {
+    positions.push({
+      key: 'taught_pick', label: 'PICK POSITION',
+      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
+    })
+    positions.push({
+      key: 'taught_inspect', label: 'INSPECT POSITION',
+      instr: 'Jog the robot to the inspection station — where it holds the part in front of the camera for inspection.',
+    })
+  } else {
+    // Default: pick_and_place and anything else with a pick + place flow.
+    positions.push({
+      key: 'taught_pick', label: 'PICK POSITION',
+      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
+    })
+    positions.push({
+      key: 'taught_place', label: 'PLACE POSITION',
+      instr: 'Jog the robot to where it should place parts, above the target location at the correct approach angle.',
+    })
+  }
+  return positions
+}
+
+function ProgressDots({ count, currentIdx, statuses }) {
+  return (
+    <div style={{ display: 'flex', gap: 10, justifyContent: 'center', margin: '12px 0' }}>
+      {Array.from({ length: count }).map((_, i) => {
+        const s = statuses[i] || 'pending'
+        const fill = s === 'recorded' ? '#2563EB'
+                   : s === 'skipped'  ? '#d1d5db'
+                   : i === currentIdx ? '#bfdbfe' : '#e5e7eb'
+        const ring = i === currentIdx ? '2px solid #2563EB' : 'none'
+        return (
+          <div key={i} title={`Step ${i + 1}: ${s}`}
+            style={{
+              width: 14, height: 14, borderRadius: '50%',
+              background: fill, outline: ring, outlineOffset: 2,
+            }} />
+        )
+      })}
+    </div>
+  )
+}
+
+function TeachSequence({ answers, setAnswer, onComplete, onBackToName }) {
+  const jog          = useStore((s) => s.jog)
+  const jogCartesian = useStore((s) => s.jogCartesian)
+  const homeRobot    = useStore((s) => s.homeRobot)
+  const triggerEstop = useStore((s) => s.triggerEstop)
+
+  const positions = teachPositionsForAnswers(answers)
+  const [posIdx, setPosIdx]   = useState(0)
+  const [flash, setFlash]     = useState(false)
+  const [jogMode, setJogMode] = useState('cartesian')
+  const [step, setStep]       = useState(1.0)
+  const [speed, setSpeed]     = useState(20)
+  const [liveJoints, setLiveJoints] = useState([0, -90, 0, -90, 0, 0])
+  const [liveTcp,    setLiveTcp]    = useState([0, 0, 0, 0, 0, 0])
+
+  const stepRef  = useRef(step)
+  const speedRef = useRef(speed)
+  const modeRef  = useRef(jogMode)
+  useEffect(() => { stepRef.current = step },     [step])
+  useEffect(() => { speedRef.current = speed },   [speed])
+  useEffect(() => { modeRef.current = jogMode },  [jogMode])
+
+  // Live state for the small joint / TCP readout in the panel header.
+  useEffect(() => {
+    let alive = true
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/state')
+        if (!alive || !res.ok) return
+        const d = await res.json()
+        setLiveJoints(radiansToJointDegrees(d?.joints?.positions))
+        if (Array.isArray(d?.tcp_pose)) setLiveTcp(d.tcp_pose)
+      } catch {}
+    }
+    poll()
+    const iv = setInterval(poll, 300)
+    return () => { alive = false; clearInterval(iv) }
+  }, [])
+
+  const sendJog = useCallback((axis, direction) => {
+    if (modeRef.current === 'joint') {
+      const deltaRad = direction * stepRef.current * Math.PI / 180
+      jog(axis - 1, deltaRad)
+    } else {
+      jogCartesian(axis, direction, stepRef.current, speedRef.current)
+    }
+  }, [jog, jogCartesian])
+
+  // Compute per-position status (recorded / skipped / pending) for the
+  // progress dots and Review page card.
+  const statusOf = (i) => {
+    const v = answers[positions[i].key]
+    if (!v) return 'pending'
+    if (v.skipped) return 'skipped'
+    if (v.tcp || v.joints) return 'recorded'
+    return 'pending'
+  }
+  const statuses = positions.map((_, i) => statusOf(i))
+
+  const current = positions[posIdx]
+
+  const advanceOrComplete = useCallback(() => {
+    if (posIdx >= positions.length - 1) {
+      onComplete()
+    } else {
+      setPosIdx(posIdx + 1)
+    }
+  }, [posIdx, positions.length, onComplete])
+
+  async function recordPosition() {
+    try {
+      const res = await fetch('/api/state')
+      if (!res.ok) return
+      const d = await res.json()
+      const joints = radiansToJointDegrees(d?.joints?.positions)
+      const tcp    = Array.isArray(d?.tcp_pose) ? d.tcp_pose : null
+      setAnswer(current.key, {
+        tcp, joints,
+        taught_at: new Date().toISOString(),
+        skipped: false,
+      })
+      setFlash(true)
+      setTimeout(() => { setFlash(false); advanceOrComplete() }, 1500)
+    } catch {}
+  }
+
+  function skipCurrent() {
+    setAnswer(current.key, {
+      tcp: null, joints: null,
+      taught_at: new Date().toISOString(),
+      skipped: true,
+    })
+    advanceOrComplete()
+  }
+
+  function skipAllRemaining() {
+    const stamp = new Date().toISOString()
+    positions.slice(posIdx).forEach((p) => {
+      const existing = answers[p.key]
+      // Don't clobber an already-recorded position.
+      if (existing && !existing.skipped && (existing.tcp || existing.joints)) return
+      setAnswer(p.key, { tcp: null, joints: null, taught_at: stamp, skipped: true })
+    })
+    onComplete()
+  }
+
+  function goBack() {
+    if (posIdx === 0) onBackToName()
+    else setPosIdx(posIdx - 1)
+  }
+
+  // Fullscreen-pendant button sizes. Matches the maximised JogPanel
+  // in ProgramLayout so the operator gets the same big buttons here.
+  const padBtn  = 140
+  const svgPx   = 60
+  const lblPx   = 16
+  const padGap  = 14
+
+  const modeBtn = (on) => ({
+    padding: '14px 22px', minHeight: 52, fontSize: 15, fontWeight: 700,
+    background: on ? '#2563EB' : '#f3f4f6',
+    color:      on ? '#fff'    : '#374151',
+    border:     on ? '2px solid #2563EB' : '2px solid #d1d5db',
+    borderRadius: 8, cursor: 'pointer',
+  })
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 1000,
+      background: 'rgba(15,23,42,0.55)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      padding: 20,
+    }}>
+      <div style={{
+        width: '90vw', maxWidth: 900, height: '90vh',
+        background: '#fff', borderRadius: 16,
+        boxShadow: '0 25px 60px rgba(0,0,0,0.28)',
+        display: 'flex', flexDirection: 'column', overflow: 'hidden',
+      }}>
+        {/* Header */}
+        <div style={{
+          padding: '14px 20px', borderBottom: '1px solid #e5e7eb',
+          display: 'flex', alignItems: 'center', gap: 12,
+        }}>
+          <div style={{
+            fontSize: 11, fontWeight: 700, color: '#6b7280',
+            textTransform: 'uppercase', letterSpacing: '0.08em',
+          }}>
+            Teaching Positions
+          </div>
+          <div style={{ flex: 1 }} />
+          <div style={{ fontSize: 12, color: '#374151', fontWeight: 600 }}>
+            Step {posIdx + 1} of {positions.length}
+          </div>
+          <button onClick={skipAllRemaining}
+            title="Skip all remaining positions and go to Review"
+            style={{
+              padding: '6px 12px', fontSize: 12, fontWeight: 600,
+              background: 'transparent', color: '#DC2626',
+              border: '1px solid #fecaca', borderRadius: 6, cursor: 'pointer',
+            }}>
+            × Skip All
+          </button>
+        </div>
+
+        {/* Body — scrollable so big buttons + readout fit at smaller heights. */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: '20px 28px' }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 8 }}>
+            <div style={{
+              width: 30, height: 30, borderRadius: '50%',
+              background: '#2563EB', color: '#fff',
+              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 13, fontWeight: 800,
+            }}>{posIdx + 1}</div>
+            <div style={{ fontSize: 24, fontWeight: 800, color: '#111', lineHeight: 1.2 }}>
+              {current.label}
+            </div>
+          </div>
+          <div style={{ fontSize: 16, color: '#6b7280', marginBottom: 18, lineHeight: 1.5 }}>
+            {current.instr}
+          </div>
+
+          {/* Live joint / TCP readout */}
+          <div style={{
+            padding: 12, marginBottom: 16, background: '#f8fafc', border: '1px solid #e5e7eb',
+            borderRadius: 8, fontFamily: 'monospace', fontSize: 12,
+            display: 'flex', gap: 24, flexWrap: 'wrap',
+          }}>
+            <div>
+              <span style={{ color: '#6b7280' }}>Joints: </span>
+              <span style={{ color: '#111', fontWeight: 700 }}>
+                [{liveJoints.map((j) => j.toFixed(1)).join(', ')}]°
+              </span>
+            </div>
+            <div>
+              <span style={{ color: '#6b7280' }}>TCP: </span>
+              <span style={{ color: '#111', fontWeight: 700 }}>
+                [{liveTcp.slice(0, 3).map((t) => Number(t).toFixed(3)).join(', ')}]
+              </span>
+            </div>
+          </div>
+
+          {/* Jog mode + step size + speed */}
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 16 }}>
+            <button onClick={() => setJogMode('cartesian')} style={modeBtn(jogMode === 'cartesian')}>XYZ</button>
+            <button onClick={() => setJogMode('joint')}     style={modeBtn(jogMode === 'joint')}>Joint</button>
+            <div style={{ display: 'flex', gap: 6, marginLeft: 12, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 12, color: '#6b7280', alignSelf: 'center' }}>Step:</span>
+              {[0.1, 0.5, 1, 5, 10].map((s) => (
+                <button key={s} onClick={() => setStep(s)} style={{
+                  padding: '8px 14px', fontSize: 13, fontWeight: 600, borderRadius: 6, cursor: 'pointer',
+                  minHeight: 40,
+                  background: step === s ? '#2563EB' : '#f3f4f6',
+                  color:      step === s ? '#fff'    : '#374151',
+                  border:     step === s ? 'none'    : '1px solid #e5e7eb',
+                }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
+              ))}
+            </div>
+            <div style={{ flex: 1, minWidth: 160 }}>
+              <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 2 }}>Speed: {speed}%</div>
+              <input type="range" min={1} max={100} value={speed}
+                onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
+                style={{ width: '100%', height: 8 }} />
+            </div>
+            <button onClick={homeRobot} style={{
+              padding: '10px 16px', fontSize: 13, fontWeight: 600,
+              background: '#f3f4f6', color: '#374151',
+              border: '1px solid #d1d5db', borderRadius: 6, cursor: 'pointer',
+            }}>Home</button>
+            <button onClick={triggerEstop} style={{
+              padding: '10px 16px', fontSize: 13, fontWeight: 700,
+              background: '#DC2626', color: '#fff',
+              border: 'none', borderRadius: 6, cursor: 'pointer',
+            }}>STOP</button>
+          </div>
+
+          {/* Big jog pendant */}
+          <div style={{
+            padding: 16, background: '#fafafa', border: '1px solid #e5e7eb',
+            borderRadius: 10, marginBottom: 16,
+            display: 'flex', justifyContent: 'center', alignItems: 'center',
+          }}>
+            {jogMode === 'cartesian' ? (
+              <div style={{ display: 'flex', gap: 40, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'center' }}>
+                <div>
+                  <div style={padLabelStyle}>Position</div>
+                  <div style={{
+                    display: 'grid',
+                    gridTemplateColumns: `repeat(3, ${padBtn}px)`,
+                    gridTemplateRows:    `repeat(3, ${padBtn}px)`,
+                    gridTemplateAreas: '". up ." "left center right" ". down ."',
+                    gap: padGap,
+                  }}>
+                    <div style={{ gridArea: 'up' }}>    <JogArrow onPress={() => sendJog('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} /></div>
+                    <div style={{ gridArea: 'left' }}>  <JogArrow onPress={() => sendJog('x', -1)} rotation={-90} label="X−" color="#DC2626" size={padBtn} /></div>
+                    <div style={{ gridArea: 'center' }}><PadCenterTile label="XY" width={padBtn} height={padBtn} /></div>
+                    <div style={{ gridArea: 'right' }}> <JogArrow onPress={() => sendJog('x',  1)} rotation={90}  label="X+" color="#DC2626" size={padBtn} /></div>
+                    <div style={{ gridArea: 'down' }}>  <JogArrow onPress={() => sendJog('y', -1)} rotation={180} label="Y−" color="#16A34A" size={padBtn} /></div>
+                  </div>
+                </div>
+                <div>
+                  <div style={padLabelStyle}>Height</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: padGap, width: padBtn }}>
+                    <JogArrow onPress={() => sendJog('z',  1)} rotation={0}   label="Z+" color="#3B82F6" size={padBtn} />
+                    <JogArrow onPress={() => sendJog('z', -1)} rotation={180} label="Z−" color="#3B82F6" size={padBtn} />
+                  </div>
+                </div>
+                <div>
+                  <div style={padLabelStyle}>Rotation</div>
+                  <div style={{
+                    display: 'grid',
+                    gridTemplateColumns: `repeat(3, ${padBtn}px)`,
+                    gridTemplateRows:    `repeat(3, ${padBtn}px)`,
+                    gridTemplateAreas: '". rxp ." "rzn center rzp" ". rxn ."',
+                    gap: padGap,
+                  }}>
+                    <div style={{ gridArea: 'rxp' }}>   <JogArrow onPress={() => sendJog('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} /></div>
+                    <div style={{ gridArea: 'rzn' }}>   <JogArrow onPress={() => sendJog('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" size={padBtn} /></div>
+                    <div style={{ gridArea: 'center' }}><PadCenterTile label="Rot" width={padBtn} height={padBtn} /></div>
+                    <div style={{ gridArea: 'rzp' }}>   <JogArrow onPress={() => sendJog('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" size={padBtn} /></div>
+                    <div style={{ gridArea: 'rxn' }}>   <JogArrow onPress={() => sendJog('rx', -1)} rotation={180} label="Rx−" color="#9333EA" size={padBtn} /></div>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', gap: 24, justifyContent: 'center', flexWrap: 'wrap' }}>
+                {[1, 2, 3, 4, 5, 6].map((j) => (
+                  <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: padGap }}>
+                    <div style={{ fontSize: lblPx, fontWeight: 700, color: '#374151' }}>{'J' + j}</div>
+                    <JogArrow onPress={() => sendJog(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={padBtn} />
+                    <JogArrow onPress={() => sendJog(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={padBtn} />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Progress dots */}
+          <ProgressDots count={positions.length} currentIdx={posIdx} statuses={statuses} />
+        </div>
+
+        {/* Footer — Back / Record / Skip */}
+        <div style={{
+          padding: '14px 20px', borderTop: '1px solid #e5e7eb',
+          display: 'flex', gap: 12, alignItems: 'center',
+        }}>
+          <button onClick={goBack} style={{
+            padding: '14px 22px', minHeight: 52, fontSize: 14, fontWeight: 700,
+            background: '#fff', color: '#374151',
+            border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+          }}>← Back</button>
+          <div style={{ flex: 1 }} />
+          <button onClick={recordPosition} style={{
+            padding: '14px 32px', minHeight: 56, fontSize: 16, fontWeight: 800,
+            background: flash ? '#16A34A' : '#2563EB', color: '#fff',
+            border: 'none', borderRadius: 10, cursor: 'pointer',
+            minWidth: 220,
+            transition: 'background 200ms',
+          }}>
+            {flash ? '✓ Recorded' : 'Record Position'}
+          </button>
+          <div style={{ flex: 1 }} />
+          <button onClick={skipCurrent} style={{
+            padding: '14px 22px', minHeight: 52, fontSize: 14, fontWeight: 700,
+            background: '#fff', color: '#374151',
+            border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+          }}>Skip →</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 const PAGES = [
   // 0: What operation?
   {
@@ -437,7 +1183,7 @@ const PAGES = [
           { value: 'pick_and_place', label: 'Pick and Place', desc: 'Pick an object and move it to another location', icon: 'P' },
           { value: 'sort', label: 'Sort Parts', desc: 'Identify parts and place them in different locations by type', icon: 'S' },
           { value: 'machine_tend', label: 'Machine Tending', desc: 'Load parts into a machine, wait, then unload', icon: 'M' },
-          { value: 'palletize', label: 'Palletize', desc: 'Arrange parts in a grid pattern on a pallet', icon: 'G' },
+          { value: 'palletize', label: 'Palletize', desc: 'Stack parts onto a pallet or pick them off a pallet', icon: 'G' },
           { value: 'inspect', label: 'Pick and Inspect', desc: 'Pick a part, inspect it with the camera, then sort pass/fail', icon: 'I' },
           { value: 'inspect_verify', label: 'Inspect & Verify', desc: 'Run a full Quality Inspection on each part with pass/warn/fail branching', icon: 'V' },
           { value: 'scan_identify', label: 'Scan & Identify', desc: 'Robot scans the workspace, moves above each detected object, identifies it from the parts library', icon: 'Q' },
@@ -449,6 +1195,65 @@ const PAGES = [
         ))}
       </QuestionCard>
     ),
+  },
+
+  // 0p: Palletize / Depalletize selector. Inserted immediately after the
+  // operation page so the wizard branches before sharing the rest of the
+  // setup. Also seeds answers.source so the gripper / detection path
+  // skips correctly later on.
+  {
+    id: 'pallet_mode',
+    skip: (answers) => answers.operation !== 'palletize',
+    render: ({ answers, setAnswer, goNext }) => {
+      const choose = (mode) => {
+        setAnswer('pallet_mode', mode)
+        setAnswer('source', mode === 'palletize' ? 'camera_library' : 'fixed_grid')
+        goNext()
+      }
+      const cardStyle = (selected) => ({
+        flex: 1, minHeight: 140, padding: '20px 22px', cursor: 'pointer',
+        background: selected ? '#eff6ff' : '#fff',
+        border: selected ? '2px solid #2563EB' : '2px solid #e5e7eb',
+        borderRadius: 12,
+        display: 'flex', flexDirection: 'column', gap: 10,
+        textAlign: 'left', transition: 'all 100ms',
+      })
+      return (
+        <QuestionCard
+          question="Palletize or Depalletize?"
+          description="Both modes share the same pallet layout setup. Pick which direction your robot is going."
+        >
+          <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap' }}>
+            <button onClick={() => choose('palletize')} style={cardStyle(answers.pallet_mode === 'palletize')}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <svg width="28" height="28" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 4v12m0 0l-5-5m5 5l5-5M5 20h14" stroke={answers.pallet_mode === 'palletize' ? '#2563EB' : '#374151'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+                </svg>
+                <div style={{ fontSize: 18, fontWeight: 700, color: answers.pallet_mode === 'palletize' ? '#2563EB' : '#111' }}>
+                  PALLETIZE
+                </div>
+              </div>
+              <div style={{ fontSize: 13, color: '#6b7280', lineHeight: 1.5 }}>
+                Pick parts and stack them onto a pallet
+              </div>
+            </button>
+            <button onClick={() => choose('depalletize')} style={cardStyle(answers.pallet_mode === 'depalletize')}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <svg width="28" height="28" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 20V8m0 0l-5 5m5-5l5 5M5 4h14" stroke={answers.pallet_mode === 'depalletize' ? '#CA8A04' : '#374151'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+                </svg>
+                <div style={{ fontSize: 18, fontWeight: 700, color: answers.pallet_mode === 'depalletize' ? '#CA8A04' : '#111' }}>
+                  DEPALLETIZE
+                </div>
+              </div>
+              <div style={{ fontSize: 13, color: '#6b7280', lineHeight: 1.5 }}>
+                Pick parts off a pallet and place them elsewhere
+              </div>
+            </button>
+          </div>
+        </QuestionCard>
+      )
+    },
   },
 
   // 0i: Inspect & Verify configuration — gated on operation === 'inspect_verify'.
@@ -623,31 +1428,39 @@ const PAGES = [
   },
 
   // 1: How does the robot find objects?
+  //    Skipped entirely for pallet modes — palletize forces camera_library,
+  //    depalletize forces fixed_grid (selection happens on the
+  //    pallet_mode page above).
+  //    Stores answers.source (the value downstream consumers read).
+  //    'camera_library' — vision detects the part using taught
+  //                       references from the Part Recognition library;
+  //                       requires the which_part page to pick which.
+  //    'fixed_position' — part is always in the same taught spot.
   {
     id: 'pick_method',
+    skip: (answers) => answers.operation === 'palletize',
     render: ({ answers, setAnswer, goNext }) => (
       <QuestionCard
         question="How should the robot find the parts?"
         description="Choose how the robot identifies what to pick up."
       >
         {[
-          { value: 'camera_auto', label: 'Use Camera', desc: 'The camera detects objects automatically. Best when parts move around.' },
-          { value: 'library_part', label: 'Look for Specific Part', desc: 'The camera looks for a specific part from the parts library. Only picks the right type.' },
-          { value: 'fixed', label: 'Always Same Position', desc: 'The part is always in the same spot (e.g. from a feeder or conveyor).' },
+          { value: 'camera_library', label: 'Camera Detection', desc: 'Camera detects parts using taught references from the Part Recognition library' },
+          { value: 'fixed_position', label: 'Fixed Position', desc: 'The part is always in the same spot (e.g. from a feeder or conveyor).' },
         ].map(m => (
           <ChoiceButton key={m.value} label={m.label} description={m.desc}
-            selected={answers.pick_method === m.value}
-            onClick={() => { setAnswer('pick_method', m.value); goNext() }}
+            selected={answers.source === m.value}
+            onClick={() => { setAnswer('source', m.value); goNext() }}
           />
         ))}
       </QuestionCard>
     ),
   },
 
-  // 2: Which part? (only if library_part selected)
+  // 2: Which part? (only if Camera Detection selected on page 1)
   {
     id: 'which_part',
-    skip: (answers) => answers.pick_method !== 'library_part',
+    skip: (answers) => answers.source !== 'camera_library',
     render: ({ answers, setAnswer, goNext }) => {
       const [parts, setParts] = useState([])
       useEffect(() => {
@@ -685,7 +1498,7 @@ const PAGES = [
         {[
           { value: 'finger', label: 'Finger Gripper', desc: 'Two parallel jaw fingers. Best for rigid parts with flat gripping surfaces.' },
           { value: 'vacuum', label: 'Vacuum Suction', desc: 'Vacuum cup picks from the top. Best for flat, smooth, sealed surfaces.' },
-          { value: 'magnetic', label: 'Magnetic', desc: 'Electromagnetic gripper. For ferrous metal parts only.' },
+          { value: 'custom', label: 'Custom Gripper', desc: 'Upload a STEP file, name the gripper, and assign optional I/O. For magnetic, electroadhesive, or any other end-effector.' },
         ].map(g => (
           <ChoiceButton key={g.value} label={g.label} description={g.desc}
             selected={answers.gripper_type === g.value}
@@ -697,64 +1510,286 @@ const PAGES = [
   },
 
   // 4: Gripper settings
+  //    Vacuum → threshold slider.
+  //    Custom → STEP upload + name + I/O assignment.
+  //    Finger → nothing operator-tunable, page is skipped entirely.
   {
     id: 'gripper_settings',
-    render: ({ answers, setAnswer, goNext }) => (
-      <QuestionCard
-        question={answers.gripper_type === 'finger' ? 'Set the gripper opening width' : answers.gripper_type === 'vacuum' ? 'Set the vacuum settings' : 'Configure the gripper'}
-        description="These settings control how the gripper picks up parts."
-      >
-        {answers.gripper_type === 'finger' && (
-          <>
-            <SliderQuestion label="Opening width" value={answers.gripper_width || 85}
-              onChange={v => setAnswer('gripper_width', v)} min={10} max={150} step={5} unit="mm"
-              description="How wide the gripper opens before picking" />
-            <SliderQuestion label="Grip force" value={answers.grip_force || 50}
-              onChange={v => setAnswer('grip_force', v)} min={10} max={100} step={5} unit="%"
-              description="How hard the gripper squeezes. Higher = more secure, but may damage soft parts" />
-          </>
-        )}
-        {answers.gripper_type === 'vacuum' && (
+    skip: (answers) => !(answers.gripper_type === 'vacuum' || answers.gripper_type === 'custom'),
+    render: ({ answers, setAnswer, goNext }) => {
+      if (answers.gripper_type === 'custom') {
+        return (
+          <CustomGripperPanel answers={answers} setAnswer={setAnswer} goNext={goNext} />
+        )
+      }
+      return (
+        <QuestionCard
+          question="Set the vacuum settings"
+          description="These settings control how the gripper picks up parts."
+        >
           <SliderQuestion label="Vacuum threshold" value={answers.vacuum_threshold || 70}
             onChange={v => setAnswer('vacuum_threshold', v)} min={30} max={95} step={5} unit="%"
             description="Minimum vacuum level needed to confirm a successful pick" />
-        )}
-        <NextButton onClick={goNext} label="Next" />
-      </QuestionCard>
-    ),
+          <NextButton onClick={goNext} label="Next" />
+        </QuestionCard>
+      )
+    },
   },
 
-  // 5: How fast?
+  // ──────────────────────────────────────────────────────────────────
+  // PALLET PAGES — shared layout + per-mode teach + approach pages.
+  // All gated on operation === 'palletize' plus the chosen pallet_mode.
+  // ──────────────────────────────────────────────────────────────────
+
+  // P1: Shared pallet layout (rows / cols / layers / spacing / order)
   {
-    id: 'speed',
+    id: 'pallet_layout',
+    skip: (answers) => answers.operation !== 'palletize',
+    render: ({ answers, setAnswer, goNext }) => {
+      const rows   = answers.pallet_rows   ?? 4
+      const cols   = answers.pallet_cols   ?? 4
+      const layers = answers.pallet_layers ?? 1
+      const sx     = answers.pallet_spacing_x_mm ?? 150
+      const sy     = answers.pallet_spacing_y_mm ?? 150
+      const lz     = answers.pallet_layer_height_mm ?? 100
+      const order  = answers.pallet_fill_order || 'row_lr'
+      const total  = rows * cols * layers
+      const isDepal = answers.pallet_mode === 'depalletize'
+
+      const setInt = (key, v, lo, hi) => {
+        const n = parseInt(v, 10)
+        if (Number.isNaN(n)) return
+        setAnswer(key, Math.max(lo, Math.min(hi, n)))
+      }
+
+      // Visualise the first-layer fill order so the operator can see
+      // exactly which slot the robot will hit first / next / last.
+      const sequence = []
+      for (let i = 0; i < rows * cols; i++) {
+        let r, c
+        if (order === 'row_lr') {
+          c = i % cols
+          r = Math.floor(i / cols)
+        } else if (order === 'row_rl') {
+          c = (cols - 1) - (i % cols)
+          r = Math.floor(i / cols)
+        } else if (order === 'col') {
+          r = i % rows
+          c = Math.floor(i / rows)
+        } else { // snake
+          r = Math.floor(i / cols)
+          const within = i % cols
+          c = (r % 2 === 0) ? within : (cols - 1 - within)
+        }
+        sequence.push({ r, c, idx: i })
+      }
+      const orderForCell = (r, c) => sequence.findIndex((s) => s.r === r && s.c === c)
+
+      const orderOptions = [
+        { value: 'row_lr', label: 'Row by row L→R', icon: '→' },
+        { value: 'row_rl', label: 'Row by row R→L', icon: '←' },
+        { value: 'col',    label: 'Column by column', icon: '↓' },
+        { value: 'snake',  label: 'Snake (alternating)', icon: '↔' },
+      ]
+
+      return (
+        <QuestionCard
+          question="How is your pallet arranged?"
+          description={isDepal
+            ? "Set the grid layout of the pallet the robot will pick FROM. Parts will be picked top layer first."
+            : "Set the grid layout of the pallet the robot will place parts ON."}
+        >
+          <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
+            <label style={{ flex: 1, minWidth: 90 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: '#374151', marginBottom: 4 }}>Rows</div>
+              <input type="number" min={1} max={20} value={rows}
+                onChange={(e) => setInt('pallet_rows', e.target.value, 1, 20)}
+                style={inputBox} />
+            </label>
+            <label style={{ flex: 1, minWidth: 90 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: '#374151', marginBottom: 4 }}>Columns</div>
+              <input type="number" min={1} max={20} value={cols}
+                onChange={(e) => setInt('pallet_cols', e.target.value, 1, 20)}
+                style={inputBox} />
+            </label>
+            <label style={{ flex: 1, minWidth: 90 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: '#374151', marginBottom: 4 }}>Layers</div>
+              <input type="number" min={1} max={10} value={layers}
+                onChange={(e) => setInt('pallet_layers', e.target.value, 1, 10)}
+                style={inputBox} />
+            </label>
+          </div>
+
+          <SliderQuestion label="Spacing X (centre-to-centre)" value={sx}
+            onChange={(v) => setAnswer('pallet_spacing_x_mm', v)}
+            min={10} max={500} step={5} unit="mm"
+            description="Distance between columns" />
+          <SliderQuestion label="Spacing Y (centre-to-centre)" value={sy}
+            onChange={(v) => setAnswer('pallet_spacing_y_mm', v)}
+            min={10} max={500} step={5} unit="mm"
+            description="Distance between rows" />
+          <SliderQuestion label="Layer height Z" value={lz}
+            onChange={(v) => setAnswer('pallet_layer_height_mm', v)}
+            min={10} max={300} step={5} unit="mm"
+            description="Vertical offset added per layer" />
+
+          <div style={{
+            padding: 14, background: '#eff6ff', border: '1px solid #bfdbfe',
+            borderRadius: 10, marginBottom: 16, textAlign: 'center',
+          }}>
+            <div style={{ fontSize: 13, color: '#374151' }}>Total capacity</div>
+            <div style={{ fontSize: 22, fontWeight: 800, color: '#2563EB', fontVariantNumeric: 'tabular-nums' }}>
+              {rows} × {cols} × {layers} = {total} parts
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 8 }}>
+              Layer preview (first layer)
+            </div>
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: `repeat(${cols}, minmax(20px, 32px))`,
+              gridAutoRows: 'minmax(20px, 32px)',
+              gap: 4,
+              justifyContent: 'center',
+              padding: 12,
+              background: '#f8fafc',
+              border: '1px solid #e5e7eb',
+              borderRadius: 8,
+            }}>
+              {Array.from({ length: rows }).map((_, r) =>
+                Array.from({ length: cols }).map((__, c) => {
+                  const ord = orderForCell(r, c)
+                  const isFirst = ord === 0
+                  return (
+                    <div key={`${r}-${c}`} title={`Slot ${ord + 1} — row ${r + 1}, col ${c + 1}`}
+                      style={{
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        background: isFirst ? '#2563EB' : '#dbeafe',
+                        color: isFirst ? '#fff' : '#1e3a8a',
+                        borderRadius: 4,
+                        fontSize: 10, fontWeight: 700,
+                      }}>
+                      {ord + 1}
+                    </div>
+                  )
+                })
+              )}
+            </div>
+            <div style={{ fontSize: 11, color: '#9ca3af', marginTop: 6, textAlign: 'center' }}>
+              Blue square is slot 1 — the first {isDepal ? 'pick' : 'place'} position.
+            </div>
+          </div>
+
+          <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
+            Fill order
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 8 }}>
+            {orderOptions.map((o) => (
+              <button key={o.value} onClick={() => setAnswer('pallet_fill_order', o.value)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '10px 12px', textAlign: 'left', cursor: 'pointer',
+                  background: order === o.value ? '#eff6ff' : '#fff',
+                  border: order === o.value ? '2px solid #2563EB' : '2px solid #e5e7eb',
+                  borderRadius: 8,
+                  fontSize: 13, fontWeight: 600,
+                  color: order === o.value ? '#2563EB' : '#111',
+                }}>
+                <span style={{
+                  width: 26, height: 26, borderRadius: 6, background: '#f3f4f6',
+                  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 14, color: '#374151',
+                }}>{o.icon}</span>
+                {o.label}
+              </button>
+            ))}
+          </div>
+
+          {isDepal && (
+            <div style={{
+              padding: 12, background: '#fffbeb', border: '1px solid #fde68a',
+              borderRadius: 8, fontSize: 12, color: '#92400e', marginBottom: 8,
+            }}>
+              Parts will be picked top layer first — layer {layers} down to layer 1.
+            </div>
+          )}
+
+          <NextButton onClick={goNext} label="Next" />
+        </QuestionCard>
+      )
+    },
+  },
+
+  // PA3: Palletize — place approach + retract heights.
+  {
+    id: 'palletize_approach',
+    skip: (answers) => !(answers.operation === 'palletize' && answers.pallet_mode === 'palletize'),
     render: ({ answers, setAnswer, goNext }) => (
       <QuestionCard
-        question="How fast should the robot move?"
-        description="Lower speed is safer, especially during initial testing. You can increase it later."
+        question="Place approach settings"
+        description="How the robot positions above each pallet slot before placing and how high it retracts between moves."
       >
-        {[
-          { value: 15, label: 'Slow', desc: 'Safe for first test runs. Good for heavy or fragile parts.' },
-          { value: 40, label: 'Medium', desc: 'Normal production speed. Good balance of speed and safety.' },
-          { value: 75, label: 'Fast', desc: 'Maximum production throughput. Use only after testing is complete.' },
-        ].map(s => (
-          <ChoiceButton key={s.value} label={s.label} description={s.desc}
-            selected={answers.speed === s.value}
-            onClick={() => { setAnswer('speed', s.value); goNext() }}
-          />
-        ))}
-        <div style={{ marginTop: 16 }}>
-          <SliderQuestion label="Custom speed" value={answers.speed || 40}
-            onChange={v => setAnswer('speed', v)} min={5} max={100} step={5} unit="%"
-            description="Or set an exact speed percentage" />
+        <SliderQuestion label="Approach height" value={answers.pallet_approach_height_mm || 100}
+          onChange={(v) => setAnswer('pallet_approach_height_mm', v)}
+          min={20} max={300} step={5} unit="mm"
+          description="Z offset above each slot before descent" />
+        <SliderQuestion label="Retract height" value={answers.pallet_retract_height_mm || 200}
+          onChange={(v) => setAnswer('pallet_retract_height_mm', v)}
+          min={50} max={500} step={10} unit="mm"
+          description="Z height the robot moves to between pick / place moves" />
+        <div style={{
+          padding: 12, background: '#f0f9ff', borderRadius: 8,
+          border: '1px solid #bfdbfe', fontSize: 12, color: '#2563EB', marginBottom: 16,
+        }}>
+          Higher retract = safer but slower.
         </div>
         <NextButton onClick={goNext} label="Next" />
       </QuestionCard>
     ),
   },
 
+  // DA3: Depalletize — pick approach + retract heights.
+  {
+    id: 'depalletize_approach',
+    skip: (answers) => !(answers.operation === 'palletize' && answers.pallet_mode === 'depalletize'),
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard
+        question="Pick approach settings"
+        description="How the robot positions above each pallet slot before picking and how high it retracts between moves."
+      >
+        <SliderQuestion label="Approach height" value={answers.pallet_approach_height_mm || 100}
+          onChange={(v) => setAnswer('pallet_approach_height_mm', v)}
+          min={20} max={300} step={5} unit="mm"
+          description="Z offset above each slot before descent" />
+        <SliderQuestion label="Retract height" value={answers.pallet_retract_height_mm || 200}
+          onChange={(v) => setAnswer('pallet_retract_height_mm', v)}
+          min={50} max={500} step={10} unit="mm"
+          description="Z height the robot moves to between pick / place moves" />
+        <div style={{
+          padding: 12, background: '#f0f9ff', borderRadius: 8,
+          border: '1px solid #bfdbfe', fontSize: 12, color: '#2563EB', marginBottom: 16,
+        }}>
+          Higher retract = safer but slower.
+        </div>
+        <NextButton onClick={goNext} label="Next" />
+      </QuestionCard>
+    ),
+  },
+
+  // Speed and Motion Profile pages were removed from the wizard. The
+  // program config still carries `speed_pct` and `motion_profile_name`
+  // (the executor still reads them), but they are defaulted silently at
+  // save time. Operators tune both from the Program tab's motion profile
+  // card after the program exists.
+
   // 6: Approach height
+  //    Skipped for pallet modes — they teach their own approach/retract
+  //    heights on the dedicated PA3 / DA3 pages.
   {
     id: 'approach',
+    skip: (answers) => answers.operation === 'palletize',
     render: ({ answers, setAnswer, goNext }) => (
       <QuestionCard
         question="How high above the part should the robot approach?"
@@ -775,9 +1810,11 @@ const PAGES = [
   },
 
   // 7: Where to place? (for pick_and_place)
+  //    Skipped for machine_tend (own load/unload teach) and palletize
+  //    (the pallet pages own the place flow).
   {
     id: 'place_method',
-    skip: (answers) => answers.operation === 'machine_tend',
+    skip: (answers) => answers.operation === 'machine_tend' || answers.operation === 'palletize',
     render: ({ answers, setAnswer, goNext }) => (
       <QuestionCard
         question="Where should the robot place the part?"
@@ -798,27 +1835,6 @@ const PAGES = [
             onClick={() => { setAnswer('place_method', p.value); goNext() }}
           />
         ))}
-      </QuestionCard>
-    ),
-  },
-
-  // 8: Pallet configuration (only for palletize)
-  {
-    id: 'pallet_config',
-    skip: (answers) => answers.place_method !== 'pallet',
-    render: ({ answers, setAnswer, goNext }) => (
-      <QuestionCard
-        question="Set up the pallet grid"
-        description="How many rows and columns of parts on the pallet?"
-      >
-        <SliderQuestion label="Rows" value={answers.pallet_rows || 3}
-          onChange={v => setAnswer('pallet_rows', v)} min={1} max={10} step={1} unit="" />
-        <SliderQuestion label="Columns" value={answers.pallet_cols || 4}
-          onChange={v => setAnswer('pallet_cols', v)} min={1} max={10} step={1} unit="" />
-        <div style={{ fontSize: 14, color: '#374151', padding: '8px 0', fontWeight: 600 }}>
-          Total positions: {(answers.pallet_rows || 3) * (answers.pallet_cols || 4)}
-        </div>
-        <NextButton onClick={goNext} label="Next" />
       </QuestionCard>
     ),
   },
@@ -875,32 +1891,71 @@ const PAGES = [
   },
 
   // 10: Should it repeat?
+  //     For pallet modes the count is locked to rows × cols × layers —
+  //     the program loops through the full pallet then stops.
   {
     id: 'repeat',
-    render: ({ answers, setAnswer, goNext }) => (
-      <QuestionCard
-        question="Should the program repeat?"
-        description="After completing all steps, should the robot start again?"
-      >
-        {[
-          { value: 'once', label: 'Run Once', desc: 'Complete the operation one time and stop.' },
-          { value: 'continuous', label: 'Run Continuously', desc: 'Repeat the cycle until stopped by the operator.' },
-          { value: 'count', label: 'Run a Set Number of Times', desc: 'Repeat a specific number of cycles.' },
-        ].map(r => (
-          <ChoiceButton key={r.value} label={r.label} description={r.desc}
-            selected={answers.repeat === r.value}
-            onClick={() => { setAnswer('repeat', r.value); if (r.value !== 'count') goNext() }}
-          />
-        ))}
-        {answers.repeat === 'count' && (
-          <div style={{ marginTop: 12 }}>
-            <SliderQuestion label="Number of cycles" value={answers.repeat_count || 10}
-              onChange={v => setAnswer('repeat_count', v)} min={2} max={500} step={1} unit="" />
+    render: ({ answers, setAnswer, goNext }) => {
+      const isPallet = answers.operation === 'palletize'
+      if (isPallet) {
+        const rows   = answers.pallet_rows   ?? 4
+        const cols   = answers.pallet_cols   ?? 4
+        const layers = answers.pallet_layers ?? 1
+        const total  = rows * cols * layers
+        // buildPalletizeSteps emits the loop with count = rows×cols×layers
+        // directly so answers.repeat is not consulted for pallet
+        // programs — no need to setAnswer here.
+        return (
+          <QuestionCard
+            question="Cycle count"
+            description="A pallet program runs once through every slot, then stops."
+          >
+            <div style={{
+              padding: 16, background: '#eff6ff', border: '1px solid #bfdbfe',
+              borderRadius: 10, marginBottom: 16,
+            }}>
+              <div style={{ fontSize: 13, color: '#374151', marginBottom: 6 }}>
+                This program will run
+              </div>
+              <div style={{ fontSize: 22, fontWeight: 800, color: '#2563EB', fontVariantNumeric: 'tabular-nums' }}>
+                {total} cycles
+              </div>
+              <div style={{ fontSize: 12, color: '#6b7280', marginTop: 6 }}>
+                {rows} rows × {cols} cols × {layers} layers
+              </div>
+            </div>
+            <div style={{ fontSize: 12, color: '#9ca3af', marginBottom: 12 }}>
+              Cycle count is fixed for pallet programs and cannot be changed here.
+            </div>
             <NextButton onClick={goNext} label="Next" />
-          </div>
-        )}
-      </QuestionCard>
-    ),
+          </QuestionCard>
+        )
+      }
+      return (
+        <QuestionCard
+          question="Should the program repeat?"
+          description="After completing all steps, should the robot start again?"
+        >
+          {[
+            { value: 'once', label: 'Run Once', desc: 'Complete the operation one time and stop.' },
+            { value: 'continuous', label: 'Run Continuously', desc: 'Repeat the cycle until stopped by the operator.' },
+            { value: 'count', label: 'Run a Set Number of Times', desc: 'Repeat a specific number of cycles.' },
+          ].map(r => (
+            <ChoiceButton key={r.value} label={r.label} description={r.desc}
+              selected={answers.repeat === r.value}
+              onClick={() => { setAnswer('repeat', r.value); if (r.value !== 'count') goNext() }}
+            />
+          ))}
+          {answers.repeat === 'count' && (
+            <div style={{ marginTop: 12 }}>
+              <SliderQuestion label="Number of cycles" value={answers.repeat_count || 10}
+                onChange={v => setAnswer('repeat_count', v)} min={2} max={500} step={1} unit="" />
+              <NextButton onClick={goNext} label="Next" />
+            </div>
+          )}
+        </QuestionCard>
+      )
+    },
   },
 
   // 11: Name the program
@@ -928,8 +1983,11 @@ const PAGES = [
   },
 
   // 12: Teach intro — explains the upcoming teach walk-through.
+  //     Pallet flows already taught their points (PA*/DA*) so skip the
+  //     generic intro.
   {
     id: 'teach_intro',
+    skip: (answers) => answers.operation === 'palletize',
     render: ({ answers, goNext }) => {
       const points = [
         '1. Home position — where the robot rests between cycles',
@@ -976,135 +2034,22 @@ const PAGES = [
   // answers[pointName] only on the first mount and the `taught` /
   // `position` state from the previous teach page leaks into the next.
   // The key forces a fresh mount per teach point.
+  //
+  // Pallet flows skip — the robot uses the driver's hard-coded home.
+  // 13: Teach sequence — the dedicated fullscreen flow that replaces
+  //     the old per-position teach pages (teach_home / teach_pick /
+  //     teach_place / teach_machine_load / teach_unload / teach_inspect
+  //     plus the PA1/PA2/DA1/DA2 pallet teach pages). One position at a
+  //     time, big jog pendant, progress dots; advances to Review when
+  //     finished or when Skip All is pressed.
   {
-    id: 'teach_home',
-    render: ({ answers, setAnswer, goNext }) => (
-      <TeachWithJog
-        key="home_point"
-        title="Teach the HOME position"
-        description="This is where the robot rests between cycles. Jog to adjust if needed, or just record the current pose."
-        instructions={[
-          'The home position should be clear of all obstacles',
-          'The robot should have good visibility of the workspace',
-          'This position runs at the start and end of every cycle',
-          'Press "Record This Position" to confirm',
-        ]}
-        pointName="home_point"
-        answers={answers} setAnswer={setAnswer}
-        onNext={goNext}
-      />
-    ),
-  },
-
-  // 14: Teach pick
-  {
-    id: 'teach_pick',
-    render: ({ answers, setAnswer, goNext }) => (
-      <TeachWithJog
-        key="pick_point"
-        title="Teach the PICK position"
-        description="Move the robot to where it should pick up parts."
-        instructions={[
-          'Use the XY arrows to move the robot over the part',
-          'Use Z− to lower the robot close to the part surface',
-          'Use Rotation to align the gripper with the part',
-          'Make sure the gripper can close around the part',
-          'Press "Record This Position" when ready',
-        ]}
-        pointName="pick_point"
-        answers={answers} setAnswer={setAnswer}
-        onNext={goNext}
-        // Camera-driven picks can skip a fixed teach point; runtime
-        // detection supplies the pose. Fixed-position picks must teach.
-        onSkip={answers.pick_method === 'fixed' ? null : goNext}
-      />
-    ),
-  },
-
-  // 15: Teach place
-  {
-    id: 'teach_place',
-    skip: (answers) => answers.operation === 'machine_tend',
-    render: ({ answers, setAnswer, goNext }) => (
-      <TeachWithJog
-        key="place_point"
-        title="Teach the PLACE position"
-        description="Move the robot to where parts should be placed."
-        instructions={[
-          'Use the XY arrows to move to the place location',
-          'Use Z− to lower to the correct height',
-          'The robot will open the gripper here to release the part',
-          'Press "Record This Position" when ready',
-        ]}
-        pointName="place_point"
-        answers={answers} setAnswer={setAnswer}
-        onNext={goNext}
-      />
-    ),
-  },
-
-  // 16: Teach machine load
-  {
-    id: 'teach_machine_load',
-    skip: (answers) => answers.operation !== 'machine_tend',
-    render: ({ answers, setAnswer, goNext }) => (
-      <TeachWithJog
-        key="machine_load_point"
-        title="Teach the MACHINE LOAD position"
-        description="Move the robot to where it loads parts into the machine."
-        instructions={[
-          'Move the robot to the machine opening',
-          'Position the gripper so the part aligns with the fixture',
-          'Use small step sizes (0.1 mm) for precision near the machine',
-          'Make sure there is clearance — the robot must not collide with the machine',
-          'Press "Record This Position" when ready',
-        ]}
-        pointName="machine_load_point"
-        answers={answers} setAnswer={setAnswer}
-        onNext={goNext}
-      />
-    ),
-  },
-
-  // 17: Teach unload
-  {
-    id: 'teach_unload',
-    skip: (answers) => answers.operation !== 'machine_tend',
-    render: ({ answers, setAnswer, goNext }) => (
-      <TeachWithJog
-        key="unload_point"
-        title="Teach the UNLOAD position"
-        description="Move the robot to where finished parts should be placed after the machine cycle."
-        instructions={[
-          'Move the robot to the unload / output area',
-          'Lower to the correct drop-off height',
-          'Press "Record This Position" when ready',
-        ]}
-        pointName="unload_point"
-        answers={answers} setAnswer={setAnswer}
-        onNext={goNext}
-      />
-    ),
-  },
-
-  // 18: Teach inspection pose
-  {
-    id: 'teach_inspect',
-    skip: (answers) => answers.operation !== 'inspect',
-    render: ({ answers, setAnswer, goNext }) => (
-      <TeachWithJog
-        key="inspect_point"
-        title="Teach the INSPECTION pose"
-        description="Move the robot to where it holds the part in front of the camera for inspection."
-        instructions={[
-          'Position the part in clear view of the camera',
-          'Make sure the camera can see all features of the part',
-          'The part should be well-lit and at the right distance',
-          'Press "Record This Position" when ready',
-        ]}
-        pointName="inspect_point"
-        answers={answers} setAnswer={setAnswer}
-        onNext={goNext}
+    id: 'teach_sequence',
+    render: ({ answers, setAnswer, goNext, goBack }) => (
+      <TeachSequence
+        answers={answers}
+        setAnswer={setAnswer}
+        onComplete={goNext}
+        onBackToName={goBack}
       />
     ),
   },
@@ -1112,7 +2057,20 @@ const PAGES = [
   // 19: Review and save (final)
   {
     id: 'review',
-    render: ({ answers, steps, saving, onSave }) => (
+    render: ({ answers, steps, saving, onSave }) => {
+      const isPallet  = answers.operation === 'palletize'
+      const isDepal   = isPallet && answers.pallet_mode === 'depalletize'
+      const rows      = answers.pallet_rows   ?? 4
+      const cols      = answers.pallet_cols   ?? 4
+      const layers    = answers.pallet_layers ?? 1
+      const total     = rows * cols * layers
+      const orderLabel = {
+        row_lr: 'Row by row L→R',
+        row_rl: 'Row by row R→L',
+        col:    'Column by column',
+        snake:  'Snake (alternating)',
+      }[answers.pallet_fill_order || 'row_lr']
+      return (
       <QuestionCard
         question="Review your program"
         description={`"${answers.program_name}" — ${steps.length} steps`}
@@ -1141,15 +2099,147 @@ const PAGES = [
           ))}
         </div>
 
+        {isPallet && (
+          <div style={{
+            padding: 14, background: isDepal ? '#fffbeb' : '#eff6ff',
+            border: isDepal ? '1px solid #fde68a' : '1px solid #bfdbfe',
+            borderRadius: 10, marginBottom: 16, fontSize: 13,
+          }}>
+            <div style={{
+              fontWeight: 800, color: isDepal ? '#92400e' : '#1e3a8a',
+              marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8,
+              letterSpacing: '0.05em',
+            }}>
+              <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+                <path d={isDepal
+                  ? "M12 20V8m0 0l-5 5m5-5l5 5"
+                  : "M12 4v12m0 0l-5-5m5 5l5-5"}
+                  stroke={isDepal ? '#CA8A04' : '#2563EB'} strokeWidth="2.5"
+                  strokeLinecap="round" strokeLinejoin="round" fill="none" />
+              </svg>
+              {isDepal ? 'DEPALLETIZE' : 'PALLETIZE'}
+            </div>
+            <div style={{ color: '#374151', fontWeight: 600, marginBottom: 4 }}>
+              {rows} rows × {cols} cols × {layers} layers = {total} parts
+            </div>
+            <div style={{ color: '#6b7280' }}>
+              Spacing: {answers.pallet_spacing_x_mm ?? 150}mm × {answers.pallet_spacing_y_mm ?? 150}mm
+            </div>
+            <div style={{ color: '#6b7280' }}>
+              Layer height: {answers.pallet_layer_height_mm ?? 100}mm
+            </div>
+            <div style={{ color: '#6b7280' }}>
+              {isDepal ? 'Pick' : 'Fill'} order: {isDepal ? `Top layer first, ${orderLabel}` : orderLabel}
+            </div>
+            <div style={{ color: '#6b7280', marginTop: 6 }}>
+              {isDepal ? (
+                <>
+                  Corner [1,1,top]: {readTaught(answers, 'taught_pallet_corner') ? '✓ Taught' : '— Not taught'}
+                  <br />
+                  Place position: {readTaught(answers, 'taught_place') ? '✓ Taught' : '— Not taught'}
+                </>
+              ) : (
+                <>
+                  Pick position: {readTaught(answers, 'taught_pick') ? '✓ Taught' : '— Not taught'}
+                  <br />
+                  Corner [1,1,1]: {readTaught(answers, 'taught_pallet_corner') ? '✓ Taught' : '— Not taught'}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
+        {(() => {
+          // POSITIONS TAUGHT card — driven by the same teachPositionsForAnswers
+          // helper the TeachSequence uses, so the list always matches what
+          // the operator just walked through.
+          const positions = teachPositionsForAnswers(answers)
+          const statuses  = positions.map((p) => {
+            const v = answers[p.key]
+            if (!v) return 'pending'
+            if (v.skipped) return 'skipped'
+            if ((Array.isArray(v.tcp) && v.tcp.length) || (Array.isArray(v.joints) && v.joints.length)) return 'recorded'
+            return 'pending'
+          })
+          const requiredKeys = new Set(['taught_home', 'taught_pick'])
+          const recordedCount = statuses.filter((s) => s === 'recorded').length
+          const anyTaught     = recordedCount > 0
+          return (
+            <div style={{
+              padding: 14, background: '#f8fafc', borderRadius: 10,
+              border: '1px solid #e5e7eb', marginBottom: 16, fontSize: 13,
+            }}>
+              <div style={{
+                fontWeight: 700, color: '#374151', marginBottom: 8,
+                textTransform: 'uppercase', letterSpacing: '0.05em', fontSize: 11,
+              }}>
+                Positions Taught
+              </div>
+              {positions.map((p, i) => {
+                const s = statuses[i]
+                const required = requiredKeys.has(p.key)
+                const isWarn = required && s !== 'recorded'
+                const color  = s === 'recorded' ? '#16A34A'
+                             : isWarn           ? '#CA8A04'
+                                                : '#9ca3af'
+                const symbol = s === 'recorded' ? '✓'
+                             : isWarn           ? '!'
+                                                : '—'
+                return (
+                  <div key={p.key} style={{
+                    display: 'flex', alignItems: 'center', gap: 10,
+                    padding: '4px 0', fontSize: 13,
+                  }}>
+                    <span style={{
+                      width: 20, height: 20, borderRadius: '50%',
+                      background: color + '22', color, fontWeight: 800,
+                      display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                      fontSize: 12, flexShrink: 0,
+                    }}>{symbol}</span>
+                    <span style={{ color: '#374151' }}>{p.label}</span>
+                    <span style={{ flex: 1 }} />
+                    <span style={{ fontSize: 12, color, fontWeight: 600, textTransform: 'lowercase' }}>
+                      {s === 'recorded' ? 'recorded'
+                       : isWarn         ? 'required — skipped'
+                       : s === 'skipped' ? 'skipped' : 'not taught'}
+                    </span>
+                  </div>
+                )
+              })}
+              {!anyTaught && (
+                <div style={{
+                  marginTop: 10, padding: 10, fontSize: 12,
+                  background: '#fffbeb', border: '1px solid #fde68a',
+                  borderRadius: 6, color: '#92400e',
+                }}>
+                  No positions were taught. You can teach them later from the
+                  Program tab using Teach All.
+                </div>
+              )}
+            </div>
+          )
+        })()}
+
         <div style={{
           padding: 14, background: '#f8fafc', borderRadius: 10,
           border: '1px solid #e5e7eb', marginBottom: 16, fontSize: 13,
         }}>
           <div style={{ fontWeight: 600, color: '#374151', marginBottom: 8 }}>Settings</div>
           <div style={{ color: '#6b7280' }}>Gripper: {answers.gripper_type}</div>
-          <div style={{ color: '#6b7280' }}>Speed: {answers.speed}%</div>
-          <div style={{ color: '#6b7280' }}>Approach height: {answers.approach_height}mm</div>
-          <div style={{ color: '#6b7280' }}>Repeat: {answers.repeat === 'continuous' ? 'Continuously' : answers.repeat === 'count' ? answers.repeat_count + ' times' : 'Once'}</div>
+          {/* Speed and motion profile are defaulted at save time (see save handler).
+              They are tuned from the Program tab's motion profile card after creation. */}
+          {isPallet ? (
+            <>
+              <div style={{ color: '#6b7280' }}>Approach height: {answers.pallet_approach_height_mm ?? 100}mm</div>
+              <div style={{ color: '#6b7280' }}>Retract height: {answers.pallet_retract_height_mm ?? 200}mm</div>
+              <div style={{ color: '#6b7280' }}>Cycles: {total} (locked — full pallet)</div>
+            </>
+          ) : (
+            <>
+              <div style={{ color: '#6b7280' }}>Approach height: {answers.approach_height}mm</div>
+              <div style={{ color: '#6b7280' }}>Repeat: {answers.repeat === 'continuous' ? 'Continuously' : answers.repeat === 'count' ? answers.repeat_count + ' times' : 'Once'}</div>
+            </>
+          )}
         </div>
 
         <button onClick={onSave} disabled={saving} style={{
@@ -1160,7 +2250,8 @@ const PAGES = [
           {saving ? 'Saving...' : 'Save Program'}
         </button>
       </QuestionCard>
-    ),
+      )
+    },
   },
 ]
 
@@ -1168,7 +2259,219 @@ const PAGES = [
 // Build steps from answers
 // ────────────────────────────────────────────────────────
 
+// Convert TCP recorded by /api/state (meters / radians) into the
+// {x,y,z,rx,ry,rz} object the saved program config uses.
+function tcpToObj(tcp) {
+  if (!Array.isArray(tcp) || tcp.length < 3) return { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0 }
+  return {
+    x:  Number(tcp[0]) || 0,
+    y:  Number(tcp[1]) || 0,
+    z:  Number(tcp[2]) || 0,
+    rx: Number(tcp[3]) || 0,
+    ry: Number(tcp[4]) || 0,
+    rz: Number(tcp[5]) || 0,
+  }
+}
+
+// Read a taught_* payload from answers, treating skipped / empty as
+// null so downstream applyTaught calls don't half-apply a position.
+function readTaught(answers, key) {
+  const v = answers && answers[key]
+  if (!v) return null
+  if (v.skipped) return null
+  if (!Array.isArray(v.tcp) && !Array.isArray(v.joints)) return null
+  return v
+}
+
+// Build the typed pallet config block saved into program.config.pallet.
+// The wizard never bakes per-slot coordinates into steps — the executor
+// computes them at runtime from this block. See the EXECUTOR CHANGES
+// section of the task spec.
+function buildPalletConfig(answers) {
+  const cornerPoint = readTaught(answers, 'taught_pallet_corner')
+  return {
+    rows:            answers.pallet_rows   ?? 4,
+    cols:            answers.pallet_cols   ?? 4,
+    layers:          answers.pallet_layers ?? 1,
+    spacing_x_mm:    answers.pallet_spacing_x_mm   ?? 150,
+    spacing_y_mm:    answers.pallet_spacing_y_mm   ?? 150,
+    layer_height_mm: answers.pallet_layer_height_mm ?? 100,
+    fill_order:      answers.pallet_fill_order || 'row_lr',
+    corner_tcp:      tcpToObj(cornerPoint?.tcp),
+    approach_height_mm: answers.pallet_approach_height_mm ?? 100,
+    retract_height_mm:  answers.pallet_retract_height_mm  ?? 200,
+  }
+}
+
+// Emit the wizard-side step list for a pallet program. Per-cycle motion
+// uses move_to_pallet which the executor expands into the actual slot
+// XYZ at runtime; pick / place taught TCPs (and their lift/approach
+// offsets) are baked into normal move_linear steps with absolute TCPs
+// since they're fixed once the operator records them.
+function buildPalletizeSteps(answers) {
+  const spd = answers.speed || 40
+  const slow = Math.min(spd, 30)
+  const medium = Math.min(spd, 40)
+  const gripW = answers.gripper_width || 85
+  const gripF = answers.grip_force || 50
+  const mode  = answers.pallet_mode === 'depalletize' ? 'depalletize' : 'palletize'
+  const rows   = answers.pallet_rows   ?? 4
+  const cols   = answers.pallet_cols   ?? 4
+  const layers = answers.pallet_layers ?? 1
+  const cycles = rows * cols * layers
+  const appH   = answers.pallet_approach_height_mm ?? 100
+  const retH   = answers.pallet_retract_height_mm  ?? 200
+
+  const gripType = answers.gripper_type || 'finger'
+  // Custom-gripper IO: the operator picks the activate signal on the
+  // Custom Gripper page. We emit it onto the generated steps so the
+  // existing executor 'magnetic' branch (single DO toggle) fires the
+  // correct port without any executor changes — the saved program
+  // config still carries gripper_type === 'custom' for display.
+  const customActivate = answers.gripper_activate_signal || 'DO3'
+  const customConfirm  = answers.gripper_confirm_signal  || ''
+  // gripper_type sent on per-step payloads. Executor only knows
+  // finger / vacuum / magnetic — 'custom' is mapped to 'magnetic'
+  // (single-signal IO) so its branch handles the gripper actuation.
+  const stepGripType = gripType === 'custom' ? 'magnetic' : gripType
+  const gripOpen  = (label = 'Open gripper') => gripType === 'finger'
+    ? { action: 'open_gripper', label, width_mm: gripW, speed_pct: spd, io_open: 'DO1', io_open_confirm: 'DI1' }
+    : gripType === 'vacuum'
+      ? { action: 'set_io', label, io_id: 'DO2', value: 0 }
+      : { action: 'set_io', label, io_id: customActivate, value: 0 }
+  const gripClose = (label = 'Close gripper') => gripType === 'finger'
+    ? { action: 'close_gripper', label, force_pct: gripF, io_close: 'DO0', io_close_confirm: 'DI0' }
+    : gripType === 'vacuum'
+      ? { action: 'set_io', label, io_id: 'DO2', value: 1 }
+      : { action: 'set_io', label, io_id: customActivate, value: 1, ...(customConfirm ? { io_close_confirm: customConfirm } : {}) }
+
+  const steps = []
+  steps.push({ action: 'move_home', label: 'Move to home position' })
+
+  // Loop start index — step number (1-indexed for the executor's
+  // goto-1 convention) of the first inside-loop step we're about to
+  // push. move_home is step 1, so loop body starts at step 2.
+  const loopStart = steps.length + 1
+
+  if (mode === 'palletize') {
+    // Camera-driven pick: detect first using the parts library.
+    if ((answers.source || 'camera_library') === 'camera_library') {
+      steps.push({ action: 'detect', label: 'Find ' + (answers.target_part_name || 'library part'), mode: 'library' })
+    }
+
+    const pickPoint = readTaught(answers, 'taught_pick') || {}
+    const pickTcp   = Array.isArray(pickPoint.tcp) ? pickPoint.tcp : null
+    const pickJoints = Array.isArray(pickPoint.joints) ? pickPoint.joints : null
+
+    // Approach above pick — emit as movj on taught joints (matches
+    // the wizard's existing 'approach' semantics in buildSteps). The
+    // executor goes to the taught pose; the operator already taught
+    // it at the pick. The compound descend / lift TCPs below carry
+    // the approach / retract offsets.
+    steps.push({
+      action: 'approach', label: 'Approach above pick',
+      taught: !!pickJoints, taught_joints: pickJoints, joints: pickJoints,
+      taught_tcp: pickTcp, position: pickTcp ? pickTcp.slice(0, 3) : null,
+      speed_pct: spd, offset_z_mm: appH,
+    })
+    // Descend to pick TCP.
+    if (pickTcp) {
+      steps.push({
+        action: 'move_linear', label: 'Descend to pick',
+        taught: true, taught_tcp: pickTcp, position: pickTcp.slice(0, 3),
+        taught_joints: pickJoints, joints: pickJoints,
+        speed_pct: slow, offset_z_mm: 0,
+      })
+    }
+    steps.push(gripClose('Grip part'))
+    if (gripType === 'vacuum') steps.push({ action: 'wait', label: 'Wait for vacuum seal', duration_s: 0.5 })
+    // Lift from pick — taught pose with retract offset for display.
+    steps.push({
+      action: 'move_linear', label: 'Lift from pick',
+      taught: !!pickTcp, taught_tcp: pickTcp, position: pickTcp ? pickTcp.slice(0, 3) : null,
+      taught_joints: pickJoints, joints: pickJoints,
+      speed_pct: medium, offset_z_mm: retH,
+    })
+    // Compound pallet motion — executor computes slot, traverses,
+    // descends to slot, opens gripper, lifts to retract, advances
+    // cycle. Carries the gripper IO so the executor knows what to
+    // fire mid-motion.
+    steps.push({
+      action: 'move_to_pallet', mode: 'palletize',
+      label: 'Place at pallet slot [computed at runtime]',
+      pallet_phase: 'place',
+      gripper_type: stepGripType,
+      io_open: 'DO1', io_close: 'DO0', io_vacuum: 'DO2',
+      io_magnet: gripType === 'custom' ? customActivate : 'DO3',
+      width_mm: gripW, force_pct: gripF,
+      speed_pct: slow,
+    })
+  } else {
+    // DEPALLETIZE — pick FROM the pallet.
+    steps.push({
+      action: 'move_to_pallet', mode: 'depalletize',
+      label: 'Pick from pallet slot [computed at runtime]',
+      pallet_phase: 'pick',
+      gripper_type: stepGripType,
+      io_open: 'DO1', io_close: 'DO0', io_vacuum: 'DO2',
+      io_magnet: gripType === 'custom' ? customActivate : 'DO3',
+      width_mm: gripW, force_pct: gripF,
+      speed_pct: slow,
+    })
+
+    const placePoint = readTaught(answers, 'taught_place') || {}
+    const placeTcp   = Array.isArray(placePoint.tcp) ? placePoint.tcp : null
+    const placeJoints = Array.isArray(placePoint.joints) ? placePoint.joints : null
+
+    // Above place at retract height.
+    steps.push({
+      action: 'move_linear', label: 'Move above place',
+      taught: !!placeTcp, taught_tcp: placeTcp, position: placeTcp ? placeTcp.slice(0, 3) : null,
+      taught_joints: placeJoints, joints: placeJoints,
+      speed_pct: spd, offset_z_mm: retH,
+    })
+    // Descend to place.
+    if (placeTcp) {
+      steps.push({
+        action: 'move_linear', label: 'Descend to place',
+        taught: true, taught_tcp: placeTcp, position: placeTcp.slice(0, 3),
+        taught_joints: placeJoints, joints: placeJoints,
+        speed_pct: slow, offset_z_mm: 0,
+      })
+    }
+    steps.push(gripOpen('Release part'))
+    if (gripType === 'vacuum') {
+      steps.push({ action: 'set_io', label: 'Blow off', io_id: 'DO3', value: 1 })
+      steps.push({ action: 'wait',   label: 'Wait for blow off', duration_s: 0.3 })
+      steps.push({ action: 'set_io', label: 'Blow off stop', io_id: 'DO3', value: 0 })
+    }
+    // Lift from place.
+    steps.push({
+      action: 'move_linear', label: 'Lift from place',
+      taught: !!placeTcp, taught_tcp: placeTcp, position: placeTcp ? placeTcp.slice(0, 3) : null,
+      taught_joints: placeJoints, joints: placeJoints,
+      speed_pct: medium, offset_z_mm: retH,
+    })
+  }
+
+  // Loop back to the first inside-loop step. count = total slots.
+  steps.push({
+    action: 'loop',
+    label: `Pallet loop — ${cycles} cycles (${rows} × ${cols} × ${layers})`,
+    goto: loopStart, count: cycles,
+    pallet_loop: true,
+  })
+
+  steps.push({ action: 'move_home', label: 'Return to home' })
+  return steps.map((s, i) => ({ ...s, step: i + 1 }))
+}
+
 function buildSteps(answers) {
+  // Pallet programs follow a totally different shape — their steps
+  // come from buildPalletizeSteps so the editor and executor see the
+  // move_to_pallet flow rather than the generic pick/place body.
+  if (answers.operation === 'palletize') return buildPalletizeSteps(answers)
+
   const steps = []
   const spd = answers.speed || 40
   const slow = Math.min(spd, 30)
@@ -1235,19 +2538,24 @@ function buildSteps(answers) {
   // ── Standard pick / sort / machine_tend / palletize / inspect flow.
   //    Skipped for scan_identify, which built its own steps above.
 
+  // Custom gripper IO: operator-selected activate / confirm signals
+  // from the Custom Gripper page. Default to DO3 / no-confirm to match
+  // the prior 'magnetic' behaviour for programs that didn't assign IO.
+  const customActivate = answers.gripper_activate_signal || 'DO3'
+
   if (answers.gripper_type === 'finger') {
     steps.push({ action: 'open_gripper', label: 'Open gripper', width_mm: gripW, speed_pct: spd, io_open: 'DO1', io_open_confirm: 'DI1' })
   } else if (answers.gripper_type === 'vacuum') {
     steps.push({ action: 'set_io', label: 'Vacuum off', io_id: 'DO2', value: 0 })
+  } else if (answers.gripper_type === 'custom') {
+    steps.push({ action: 'set_io', label: 'Gripper off', io_id: customActivate, value: 0 })
   }
 
-  if (answers.pick_method === 'camera_auto') {
-    steps.push({ action: 'detect', label: 'Detect objects with camera', mode: 'all' })
-  } else if (answers.pick_method === 'library_part') {
+  if (answers.source === 'camera_library') {
     steps.push({ action: 'detect', label: 'Find ' + (answers.target_part_name || 'library part'), mode: 'library' })
   }
 
-  steps.push({ action: 'approach', label: 'Move above pick position', target: answers.pick_method === 'fixed' ? 'fixed' : 'auto', offset_z_mm: appH, speed_pct: spd })
+  steps.push({ action: 'approach', label: 'Move above pick position', target: answers.source === 'fixed_position' ? 'fixed' : 'auto', offset_z_mm: appH, speed_pct: spd })
   steps.push({ action: 'move_linear', label: 'Descend to part', offset_z_mm: 0, speed_pct: slow })
 
   if (answers.gripper_type === 'finger') {
@@ -1256,7 +2564,8 @@ function buildSteps(answers) {
     steps.push({ action: 'set_io', label: 'Vacuum on', io_id: 'DO2', value: 1 })
     steps.push({ action: 'wait', label: 'Wait for vacuum seal', duration_s: 0.5 })
   } else {
-    steps.push({ action: 'set_io', label: 'Magnet on', io_id: 'DO3', value: 1 })
+    // Custom gripper — single-signal toggle on the operator's activate port.
+    steps.push({ action: 'set_io', label: 'Gripper on', io_id: customActivate, value: 1 })
   }
 
   steps.push({ action: 'move_linear', label: 'Lift part', offset_z_mm: appH, speed_pct: medium })
@@ -1293,12 +2602,12 @@ function buildSteps(answers) {
     // (which gates the rest of the program on result) → either continue
     // to place, or jump to reject. The executor handles the branch via
     // step.on_fail = 'jump_to_reject'.
-    const sampling = parseInt(answers.iv_sampling || '1', 10)
-    const onFail   = answers.iv_on_fail || 'jump_to_reject'
-    const onWarn   = answers.iv_on_warn || 'log_continue'
-    const planId   = answers.iv_plan_id || 'default'
-    const partId   = answers.iv_part_id || 'unknown'
-    const tier     = parseInt(answers.iv_tier || '2', 10)
+    const sampling   = parseInt(answers.iv_sampling || '1', 10)
+    const onFail     = answers.iv_on_fail || 'jump_to_reject'
+    const onWarn     = answers.iv_on_warn || 'log_continue'
+    const planId     = answers.iv_plan_id || 'default'
+    const partId     = answers.iv_part_id || 'unknown'
+    const tier       = parseInt(answers.iv_tier || '2', 10)
 
     steps.push({ action: 'move_joint', label: 'Move to inspection pose', speed_pct: spd })
     steps.push({
@@ -1345,7 +2654,8 @@ function buildSteps(answers) {
     steps.push({ action: 'wait', label: 'Wait for blow off', duration_s: 0.3 })
     steps.push({ action: 'set_io', label: 'Blow off stop', io_id: 'DO3', value: 0 })
   } else {
-    steps.push({ action: 'set_io', label: 'Magnet off — release part', io_id: 'DO3', value: 0 })
+    // Custom gripper — release on the operator's activate port.
+    steps.push({ action: 'set_io', label: 'Gripper off — release part', io_id: customActivate, value: 0 })
   }
 
   steps.push({ action: 'move_linear', label: 'Lift from place', offset_z_mm: appH, speed_pct: medium })
@@ -1384,33 +2694,44 @@ function buildSteps(answers) {
   const cfg = answers
   const numbered = steps.map((s, i) => ({ ...s, step: i + 1 }))
 
-  // First and last move_home both share home_point.
-  if (cfg.home_point) {
+  // Taught points come from the dedicated TeachSequence at the end of
+  // the wizard. readTaught() returns null for skipped / empty entries
+  // so the corresponding step keeps its untaught state (the editor
+  // shows the red "!" badge).
+  const homeP   = readTaught(cfg, 'taught_home')
+  const pickP   = readTaught(cfg, 'taught_pick')
+  const placeP  = readTaught(cfg, 'taught_place')
+  const loadP   = readTaught(cfg, 'taught_machine_load')
+  const unloadP = readTaught(cfg, 'taught_unload')
+  const inspP   = readTaught(cfg, 'taught_inspect')
+
+  // First and last move_home both share taught_home.
+  if (homeP) {
     const homeIdxs = numbered.map((s, i) => s.action === 'move_home' ? i : -1).filter((i) => i >= 0)
-    homeIdxs.forEach((i) => { numbered[i] = applyTaught(numbered[i], cfg.home_point) })
+    homeIdxs.forEach((i) => { numbered[i] = applyTaught(numbered[i], homeP) })
   }
-  if (cfg.pick_point) {
+  if (pickP) {
     const i = numbered.findIndex((s) => s.action === 'approach')
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], cfg.pick_point)
+    if (i >= 0) numbered[i] = applyTaught(numbered[i], pickP)
   }
-  if (cfg.place_point) {
+  if (placeP) {
     const i = numbered.findIndex((s) =>
       (s.action === 'move_joint' || s.action === 'move_linear') &&
       typeof s.label === 'string' && s.label.toLowerCase().includes('place')
     )
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], cfg.place_point)
+    if (i >= 0) numbered[i] = applyTaught(numbered[i], placeP)
   }
-  if (cfg.machine_load_point) {
+  if (loadP) {
     const i = numbered.findIndex((s) => s.action === 'move_joint' && s.label === 'Move to machine load position')
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], cfg.machine_load_point)
+    if (i >= 0) numbered[i] = applyTaught(numbered[i], loadP)
   }
-  if (cfg.unload_point) {
+  if (unloadP) {
     const i = numbered.findIndex((s) => s.action === 'move_joint' && s.label === 'Move to unload position')
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], cfg.unload_point)
+    if (i >= 0) numbered[i] = applyTaught(numbered[i], unloadP)
   }
-  if (cfg.inspect_point) {
+  if (inspP) {
     const i = numbered.findIndex((s) => s.action === 'move_joint' && s.label === 'Move to inspection pose')
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], cfg.inspect_point)
+    if (i >= 0) numbered[i] = applyTaught(numbered[i], inspP)
   }
 
   return numbered
@@ -1423,7 +2744,13 @@ function buildSteps(answers) {
 export default function ProgramWizard({ onClose, onSaved }) {
   const [pageIdx, setPageIdx] = useState(0)
   const [answers, setAnswers] = useState({
-    speed: 40,
+    // Silently-defaulted: the wizard no longer asks about speed or motion
+    // profile. The Program tab's motion profile card is where operators
+    // adjust both after creation. Keep these keys populated so any
+    // intermediate buildSteps helper that reads `answers.speed` keeps
+    // emitting Medium-speed moves.
+    speed: 60,
+    motion_profile_name: 'Balanced',
     approach_height: 100,
     gripper_width: 85,
     grip_force: 50,
@@ -1459,6 +2786,56 @@ export default function ProgramWizard({ onClose, onSaved }) {
   const handleSave = async () => {
     setSaving(true)
     try {
+      // Pallet programs need the typed pallet + pick/place TCP block at
+      // the top of program.config so the executor (and the Monitor
+      // widget) can find them without rummaging through wizard-internal
+      // answer keys. The full answers object is still kept for round-
+      // tripping into the wizard later.
+      let config = { ...answers }
+      // Speed and motion profile are no longer asked in the wizard. We
+      // force the silent Medium / Balanced defaults onto the saved
+      // program. The Program tab's motion profile card is where these
+      // get tuned after creation.
+      const SILENT_SPEED_PCT = 60
+      const SILENT_MOTION_PROFILE = 'Balanced'
+      config.speed = SILENT_SPEED_PCT
+      config.speed_pct = SILENT_SPEED_PCT
+      config.motion_profile_name = SILENT_MOTION_PROFILE
+      if (answers.operation === 'palletize') {
+        const pallet = buildPalletConfig(answers)
+        config.pallet      = pallet
+        config.pallet_mode = answers.pallet_mode === 'depalletize' ? 'depalletize' : 'palletize'
+        config.source      = config.pallet_mode === 'palletize' ? 'camera_library' : 'fixed_grid'
+        config.speed_pct   = SILENT_SPEED_PCT
+        if (answers.pallet_mode === 'depalletize') {
+          const placeP = readTaught(answers, 'taught_place')
+          config.place_tcp = tcpToObj(placeP?.tcp)
+        } else {
+          const pickP = readTaught(answers, 'taught_pick')
+          config.pick_tcp = tcpToObj(pickP?.tcp)
+        }
+      }
+      // Always emit a typed gripper block — the 3D viewer reads this
+      // to decide whether to load a custom gripper GLB.
+      const gripper = {
+        type:             answers.gripper_type || 'finger',
+        width_mm:         answers.gripper_width || 85,
+        force_pct:        answers.grip_force || 50,
+        vacuum_threshold: answers.vacuum_threshold || 70,
+      }
+      if ((answers.gripper_type || 'finger') === 'custom') {
+        gripper.gripper_type    = 'custom'
+        gripper.gripper_name    = (answers.gripper_name || answers.gripper_upload_name || '').trim()
+        gripper.gripper_model_id = answers.gripper_model_id || null
+        gripper.gripper_glb_url = answers.gripper_glb_url || null
+        gripper.gripper_stl_url = answers.gripper_stl_url || null
+        gripper.activate_signal = answers.gripper_activate_signal || null
+        gripper.confirm_signal  = answers.gripper_confirm_signal  || null
+        if (answers.gripper_dimensions) gripper.dimensions = answers.gripper_dimensions
+      } else {
+        gripper.gripper_type = gripper.type
+      }
+      config.gripper = gripper
       const res = await fetch('/api/programs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1467,7 +2844,10 @@ export default function ProgramWizard({ onClose, onSaved }) {
           description: PAGES[0] && answers.operation ? answers.operation.replace(/_/g, ' ') : '',
           steps: builtSteps,
           tags: [answers.operation],
-          config: answers,
+          config,
+          motion_profile_name: SILENT_MOTION_PROFILE,
+          motion_profile_override_enabled: false,
+          motion_optimization_enabled: true,
         }),
       })
       const data = await res.json()
@@ -1528,6 +2908,7 @@ export default function ProgramWizard({ onClose, onSaved }) {
             answers,
             setAnswer,
             goNext,
+            goBack,
             steps: builtSteps,
             saving,
             onSave: handleSave,

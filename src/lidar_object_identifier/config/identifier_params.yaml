@@ -1,0 +1,54 @@
+# Identifier pipeline tuning. Loaded at node start; hot-reloadable via the
+# /api/lidar_objects/* endpoints (the dashboard mirrors keys 1:1).
+
+/**:
+  ros__parameters:
+    input_topic: /lidar/points_filtered
+    output_topic: /lidar_objects/identified
+    visualization_topic: /lidar_objects/visualization
+    stats_topic: /lidar_objects/stats
+
+    base_frame: base_link
+    process_rate_hz: 5.0
+
+    # Workspace crop in base_link (metres).
+    workspace_xmin: -3.0
+    workspace_xmax:  3.0
+    workspace_ymin: -3.0
+    workspace_ymax:  3.0
+    workspace_zmin:  0.0
+    workspace_zmax:  2.0
+
+    # Ground extraction.
+    ground_ransac_distance_m: 0.015
+    ground_ransac_iterations: 1000
+    ground_normal_max_tilt_deg: 15.0
+
+    # Clustering.
+    cluster_tolerance_m: 0.02
+    cluster_min_points: 50
+    cluster_max_points: 50000
+    cluster_min_volume_m3: 1.0e-6
+    cluster_max_volume_m3: 2.0
+    cluster_max_aspect_ratio: 50.0
+    cluster_min_density_per_m3: 100.0
+
+    # Parts matching tolerances.
+    size_tolerance_pct: 25.0
+    volume_tolerance_pct: 30.0
+    score_weights_size: 0.35
+    score_weights_volume: 0.25
+    score_weights_shape: 0.30
+    score_weights_persistence: 0.10
+
+    # Confidence buckets.
+    confidence_confirmed: 0.8
+    confidence_tentative: 0.5
+    confidence_detected:  0.3
+
+    # Persistence.
+    persistence_buffer_len: 10
+    persistence_match_xy_m: 0.05
+    persistence_confirm_streak: 5
+    persistence_lost_after: 3
+    persistence_drop_after: 10

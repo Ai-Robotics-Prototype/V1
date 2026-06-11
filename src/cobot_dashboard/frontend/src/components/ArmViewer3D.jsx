@@ -1,7 +1,59 @@
-import { useRef, forwardRef, useImperativeHandle } from 'react'
+import { useEffect, useRef, useState, forwardRef, useImperativeHandle } from 'react'
 import { Canvas } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader'
+import * as THREE from 'three'
 import { useStore } from '../store/useStore'
+
+// Loads the custom gripper GLB attached to the currently-loaded
+// program and renders it parented to the (currently stationary)
+// flange origin. -0.05m on Z places it just below where tool0 sits
+// in the existing camera frame (origin at y=1 in this scene because
+// OrbitControls targets [0, 1, 0]). When the URDF returns we can
+// parent this group to the actual flange link.
+function CustomGripperModel({ url }) {
+  const [scene, setScene] = useState(null)
+  useEffect(() => {
+    if (!url) { setScene(null); return }
+    let cancelled = false
+    const loader = new GLTFLoader()
+    loader.load(
+      url,
+      (gltf) => {
+        if (cancelled) return
+        const root = gltf.scene
+        // Apply the parts-viewer style material to every mesh so the
+        // gripper renders with the metallic grey look the operator
+        // already associates with parts in the library.
+        const mat = new THREE.MeshStandardMaterial({
+          color: '#A8B0C0', metalness: 0.5, roughness: 0.35,
+        })
+        root.traverse((o) => { if (o.isMesh) { o.material = mat; o.castShadow = true } })
+        // Normalise size and centre the model on its own origin.
+        const box = new THREE.Box3().setFromObject(root)
+        const size = box.getSize(new THREE.Vector3())
+        const center = box.getCenter(new THREE.Vector3())
+        const maxDim = Math.max(size.x, size.y, size.z) || 1
+        const scale = 0.2 / maxDim
+        root.position.sub(center).multiplyScalar(scale)
+        root.scale.setScalar(scale)
+        setScene(root)
+      },
+      undefined,
+      () => { if (!cancelled) setScene(null) },
+    )
+    return () => { cancelled = true }
+  }, [url])
+  if (!scene) return null
+  return (
+    // Park at the flange origin. y=1 matches the OrbitControls target
+    // (the scene's notional flange height); z offset is the spec's
+    // -0.05 m below tool0 along the tool axis.
+    <group position={[0, 1, -0.05]}>
+      <primitive object={scene} />
+    </group>
+  )
+}
 
 // ---------------------------------------------------------------------------
 // ArmViewer3D — empty 3D workspace.
@@ -28,7 +80,7 @@ const PRESETS = {
   iso:   [2, 1.5, 2],
 }
 
-const ArmViewer3D = forwardRef(function ArmViewer3D({ joints }, ref) {
+const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay }, ref) {
   const controlsRef = useRef(null)
 
   // Joint readout. Caller-provided `joints` prop wins (degrees array);
@@ -59,6 +111,17 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints }, ref) {
     setCameraPreset(name) { applyPreset(name) },
   }))
 
+  // Custom gripper attached to the loaded program (if any). The
+  // viewer hides the GLB block entirely when the program either has
+  // no gripper config or uses a non-custom (finger / vacuum) gripper.
+  const currentProgram = useStore((s) => s.currentProgram)
+  const gripperCfg     = currentProgram?.config?.gripper || {}
+  const gripperType    = gripperCfg.gripper_type || gripperCfg.type || null
+  const gripperGlbUrl  = gripperType === 'custom' && gripperCfg.gripper_model_id
+    ? (gripperCfg.gripper_glb_url || `/grippers/glb/${gripperCfg.gripper_model_id}.glb`)
+    : null
+  const gripperName    = gripperCfg.gripper_name || gripperCfg.name || ''
+
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative', background: '#fafafa' }}>
       <Canvas camera={{ position: PRESETS.iso, fov: 45 }} gl={{ antialias: true }}>
@@ -74,7 +137,24 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints }, ref) {
           maxDistance={8}
         />
         <gridHelper args={[4, 20, '#cccccc', '#e5e5e5']} />
+        <CustomGripperModel url={gripperGlbUrl} />
+        {children}
       </Canvas>
+      {overlay}
+
+      {/* Label below the viewer when a custom gripper is loaded. */}
+      {gripperGlbUrl && (
+        <div style={{
+          position: 'absolute', bottom: 8, left: 8,
+          padding: '6px 12px', borderRadius: 8,
+          background: 'rgba(255,255,255,0.95)',
+          border: '1px solid #e5e7eb',
+          fontSize: 12, color: '#374151', fontWeight: 600,
+          boxShadow: '0 2px 8px rgba(0,0,0,0.08)', zIndex: 10,
+        }}>
+          Custom Gripper: {gripperName || '(unnamed)'}
+        </div>
+      )}
 
       {/* Joint readout, top-right */}
       <div style={{

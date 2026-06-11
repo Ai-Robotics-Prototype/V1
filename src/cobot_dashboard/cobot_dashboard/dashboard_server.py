@@ -873,7 +873,9 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             for k in ("program_id", "program_name", "step_label", "step_action",
                       "cycle_count", "last_cycle_time", "total_picks",
                       "pick_passes", "pick_fails",
-                      "scan_results", "scan_count", "identified_count"):
+                      "scan_results", "scan_count", "identified_count",
+                      "pallet_mode", "pallet_cycle", "pallet_total",
+                      "pallet_row", "pallet_col", "pallet_layer"):
                 if k in d:
                     t[k] = d[k]
 
@@ -1703,6 +1705,235 @@ if FASTAPI_AVAILABLE:
             "stl_url":      f"/parts/{part_data['stl_file']}",
         }
 
+    # ------------------------------------------------------------------
+    # Custom gripper upload / library
+    # ------------------------------------------------------------------
+    _GRIPPERS_DIR = '/opt/cobot/grippers'
+
+    def _gripper_root(gid: str) -> str:
+        """Return the per-gripper directory under /opt/cobot/grippers,
+        guarding against `..` traversal in the id."""
+        if not gid or '/' in gid or '..' in gid:
+            return ''
+        return os.path.join(_GRIPPERS_DIR, gid)
+
+    def _read_gripper_meta(gid: str) -> dict:
+        root = _gripper_root(gid)
+        if not root:
+            return {}
+        path = os.path.join(root, 'metadata.json')
+        if not os.path.isfile(path):
+            return {}
+        try:
+            with open(path) as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
+    @app.post("/api/gripper/upload")
+    async def api_gripper_upload(file: UploadFile = File(...)):
+        """Accept a .step/.stp gripper model. Reuses the parts step
+        parser to load + scale + extract bounds + export .stl; adds a
+        .glb export on top via trimesh so the dashboard's 3D viewer
+        can render it directly. Saves everything under
+        /opt/cobot/grippers/{id}/ keyed by the file's md5 hash so
+        re-uploading the same STEP is idempotent."""
+        import tempfile, shutil, hashlib
+        if not file.filename or not file.filename.lower().endswith(('.step', '.stp')):
+            return JSONResponse(
+                {"error": "Only .step / .stp files accepted"},
+                status_code=400)
+
+        suffix   = os.path.splitext(file.filename)[1] or '.step'
+        raw_name = os.path.basename(file.filename)
+        base_name = os.path.splitext(raw_name)[0]
+        try:
+            os.makedirs(_GRIPPERS_DIR, exist_ok=True)
+        except Exception as e:
+            return JSONResponse({"error": f"cannot create {_GRIPPERS_DIR}: {e}"}, status_code=500)
+
+        # Save the upload to a temp file. parse_step_file writes a
+        # sibling .stl which we'll move into the gripper dir alongside
+        # the source .step.
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+
+        try:
+            with open(tmp_path, 'rb') as f:
+                gid = hashlib.md5(f.read()).hexdigest()[:12]
+            target_dir = os.path.join(_GRIPPERS_DIR, gid)
+            os.makedirs(target_dir, exist_ok=True)
+            step_dest = os.path.join(target_dir, gid + '.step')
+            stl_dest  = os.path.join(target_dir, gid + '.stl')
+            glb_dest  = os.path.join(target_dir, gid + '.glb')
+
+            # Move uploaded step into target dir with the canonical name.
+            shutil.copy2(tmp_path, step_dest)
+
+            # Reuse the existing parts pipeline for load + scale +
+            # extents + STL export. parse_step_file also generates
+            # silhouettes/templates in /opt/cobot/parts — they're
+            # harmless orphans for a gripper file and dedupe on hash.
+            try:
+                from object_detection.step_parser import parse_step_file
+                import trimesh
+            except Exception as e:
+                return JSONResponse({"error": f"parser unavailable: {e}"}, status_code=500)
+            try:
+                meta = parse_step_file(step_dest)
+            except Exception as e:
+                return JSONResponse({"error": f"STEP parse failed: {e}"}, status_code=500)
+
+            # parse_step_file writes the .stl alongside the .step with
+            # the same basename — move it to its canonical id.stl path.
+            parsed_stl = os.path.splitext(step_dest)[0] + '.stl'
+            try:
+                if os.path.exists(parsed_stl) and parsed_stl != stl_dest:
+                    shutil.move(parsed_stl, stl_dest)
+            except Exception:
+                pass
+
+            # Re-load the STL to export as GLB. trimesh's GLB export
+            # bundles the mesh into a single-binary gltf the Three.js
+            # GLTFLoader reads directly. STL → GLB keeps the pipeline
+            # parser-agnostic (no second STEP parse).
+            try:
+                mesh = trimesh.load(stl_dest if os.path.exists(stl_dest) else step_dest, force='mesh')
+                if isinstance(mesh, trimesh.Scene):
+                    mesh = mesh.dump(concatenate=True)
+                mesh.export(glb_dest, file_type='glb')
+            except Exception as e:
+                return JSONResponse({"error": f"GLB export failed: {e}"}, status_code=500)
+
+            extents_cm = list(meta.get('extents_cm') or [0, 0, 0])
+            display_name = base_name or meta.get('name', gid)
+            metadata = {
+                'id':         gid,
+                'name':       display_name,
+                'source_file': raw_name,
+                'glb_url':    f'/grippers/glb/{gid}.glb',
+                'stl_url':    f'/grippers/stl/{gid}.stl',
+                'dimensions': {
+                    'w_cm': float(extents_cm[0]) if len(extents_cm) > 0 else 0.0,
+                    'd_cm': float(extents_cm[1]) if len(extents_cm) > 1 else 0.0,
+                    'h_cm': float(extents_cm[2]) if len(extents_cm) > 2 else 0.0,
+                },
+                'uploaded_at': _now_stamp(),
+            }
+            try:
+                with open(os.path.join(target_dir, 'metadata.json'), 'w') as f:
+                    json.dump(metadata, f, indent=2)
+            except Exception:
+                pass
+            return metadata
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
+    @app.get("/api/gripper/list")
+    async def api_gripper_list():
+        """List every uploaded gripper model."""
+        out = []
+        try:
+            if os.path.isdir(_GRIPPERS_DIR):
+                for gid in sorted(os.listdir(_GRIPPERS_DIR)):
+                    meta = _read_gripper_meta(gid)
+                    if meta and meta.get('id'):
+                        out.append(meta)
+        except Exception:
+            pass
+        return {"grippers": out}
+
+    @app.delete("/api/gripper/{gid}")
+    async def api_gripper_delete(gid: str):
+        import shutil
+        root = _gripper_root(gid)
+        if not root:
+            return JSONResponse({"error": "bad id"}, status_code=400)
+        if not os.path.isdir(root):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        try:
+            shutil.rmtree(root)
+        except Exception as e:
+            return JSONResponse({"error": f"delete failed: {e}"}, status_code=500)
+        return {"ok": True, "id": gid}
+
+    @app.get("/grippers/{kind}/{filename:path}")
+    async def serve_gripper_asset(kind: str, filename: str):
+        """Serve the GLB / STL / STEP assets for a stored gripper.
+        URL shape: /grippers/glb/{id}.glb (also /stl/, /step/)."""
+        if '..' in filename or filename.startswith('/'):
+            return JSONResponse({"detail": "bad path"}, status_code=400)
+        if kind not in ('glb', 'stl', 'step'):
+            return JSONResponse({"detail": "unsupported"}, status_code=415)
+        gid = os.path.splitext(filename)[0]
+        root = _gripper_root(gid)
+        if not root:
+            return JSONResponse({"detail": "bad id"}, status_code=400)
+        path = os.path.join(root, filename)
+        if not os.path.isfile(path):
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        media = {
+            'glb':  'model/gltf-binary',
+            'stl':  'application/sla',
+            'step': 'application/step',
+        }[kind]
+        return FileResponse(path, media_type=media)
+
+    # ── STEP features (new architecture) ─────────────────────────────
+    # The STEP feature dictionary + per-orientation signatures live at
+    # /opt/cobot/parts/features/{id}_{features,orientation_signatures}.json.
+    # They're written by step_parser at upload time and rewritten here
+    # when the operator picks a pick direction.
+    _FEATURES_DIR = '/opt/cobot/parts/features'
+
+    def _features_paths(part_id: str):
+        return (
+            os.path.join(_FEATURES_DIR, f'{part_id}_features.json'),
+            os.path.join(_FEATURES_DIR, f'{part_id}_orientation_signatures.json'),
+        )
+
+    def _load_features_doc(part_id: str) -> dict:
+        fp, _ = _features_paths(part_id)
+        if not os.path.isfile(fp):
+            return {}
+        try:
+            with open(fp) as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
+    def _load_orientation_signatures(part_id: str) -> dict:
+        _, sp = _features_paths(part_id)
+        if not os.path.isfile(sp):
+            return {}
+        try:
+            with open(sp) as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
+    def _recompute_orientation_signatures(part_id: str, pick_normal) -> dict:
+        """Rewrite the orientation signatures for `part_id` using the
+        operator's pick direction. Returns the new signatures doc; an
+        empty dict on failure.
+        """
+        from object_detection.step_parser import (
+            compute_orientation_signatures, write_features_artifacts,
+            _face_from_normal,
+        )
+        feats = _load_features_doc(part_id)
+        if not feats:
+            return {}
+        pick_face = _face_from_normal(pick_normal) if pick_normal else 'top'
+        sig = compute_orientation_signatures(feats, pick_face)
+        write_features_artifacts(part_id, feats, sig)
+        return sig
+
     def _load_defect_types(part_id: str) -> list:
         """Read defects.json for a part and return the list shaped for
         the public API. Returns [] when the file is missing/unreadable.
@@ -1755,7 +1986,10 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/api/parts")
     async def api_parts_list():
-        from object_detection.part_library import get_all_parts
+        from object_detection.part_library import (
+            get_all_parts, identification_basis, has_teach_images,
+            get_teach_image_count, has_step_file,
+        )
         parts = get_all_parts()
         # Annotate each entry with its current taught-sample count and
         # any defect types the operator taught via the wizard. The UI
@@ -1777,6 +2011,13 @@ if FASTAPI_AVAILABLE:
             except OSError:
                 p['teach_count'] = 0
             p['defect_types'] = _load_defect_types(pid)
+            # Identification-basis annotation: lets the dashboard warn
+            # operators about parts that can only be identified by STEP
+            # outline (high false-match rate on flat / rectangular parts).
+            p['identification_basis'] = identification_basis(pid)
+            p['has_teach_images'] = has_teach_images(pid)
+            p['teach_image_count'] = get_teach_image_count(pid)
+            p['has_step_file'] = has_step_file(pid)
         return {"parts": parts}
 
     @app.post("/api/parts/{part_id}/teach")
@@ -2182,12 +2423,47 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/api/parts/{part_id}")
     async def api_parts_get(part_id: str):
-        from object_detection.part_library import get_part
+        from object_detection.part_library import (
+            get_part, identification_basis, has_teach_images,
+            get_teach_image_count, has_step_file,
+        )
         part = get_part(part_id)
         if not part:
             return JSONResponse({"error": "part not found"}, status_code=404)
         part['defect_types'] = _load_defect_types(part_id)
+        part['identification_basis'] = identification_basis(part_id)
+        part['has_teach_images'] = has_teach_images(part_id)
+        part['teach_image_count'] = get_teach_image_count(part_id)
+        part['has_step_file'] = has_step_file(part_id)
         return part
+
+    @app.get("/api/parts/{part_id}/features")
+    async def api_parts_features(part_id: str):
+        """Return the STEP feature dictionary + per-orientation
+        signatures for a part. Empty doc when the part has no STEP
+        file."""
+        feats = _load_features_doc(part_id)
+        sig = _load_orientation_signatures(part_id)
+        return {
+            'part_id':                 part_id,
+            'features':                feats.get('features') or [],
+            'faces':                   feats.get('faces') or {},
+            'orientation_signatures':  sig or {},
+        }
+
+    @app.get("/api/parts/{part_id}/feature_correlation")
+    async def api_parts_feature_correlation(part_id: str):
+        """Placeholder until teach-time STEP↔image correlation is wired
+        up (Part C of the live-boost work). Returns an empty result
+        with status='not_computed' so the dashboard can show a stable
+        shape today and light up later when the correlator lands."""
+        return {
+            'part_id': part_id,
+            'status':  'not_computed',
+            'note':    'STEP/image correlation not yet implemented '
+                       '(see Part C of the new STEP architecture).',
+            'per_orientation': [],
+        }
 
     @app.delete("/api/parts/{part_id}")
     async def api_parts_delete(part_id: str):
@@ -2352,14 +2628,19 @@ if FASTAPI_AVAILABLE:
     async def api_program_run(request: Request):
         """Dispatch run/pause/resume/stop/home to the program executor.
         Body: {action, program_id?}. Without program_id, the executor
-        resumes / re-runs whatever it currently has loaded."""
+        resumes / re-runs whatever it currently has loaded.
+        action='load' is a frontend-facing 'set active program' verb —
+        the executor doesn't currently have a load-only path, so we
+        forward the message (executor ignores unknown actions) and let
+        the Monitor UI take care of displaying the program. The next
+        Run will pick it up via the normal load+run path."""
         try:
             body = await request.json()
         except Exception:
             body = {}
         action = str(body.get('action', 'run'))
         prog_id = body.get('program_id')
-        if action not in ('run', 'pause', 'resume', 'stop', 'home'):
+        if action not in ('run', 'pause', 'resume', 'stop', 'home', 'load'):
             return JSONResponse({'error': f'unknown action {action!r}'}, status_code=400)
         if _ros_node is not None:
             try:
@@ -2784,6 +3065,15 @@ if FASTAPI_AVAILABLE:
                 merged.pop(key, None)
         part['grasp'] = merged
 
+        # New architecture: when the pick direction is set, recompute
+        # per-orientation feature signatures from the cached STEP
+        # features doc. The signatures feed (future) orientation
+        # boost — identity still comes from taught images + size.
+        try:
+            _recompute_orientation_signatures(part_id, merged.get('pick_normal'))
+        except Exception as _exc:
+            pass
+
         # Derive footprint + standing height under the chosen rotation.
         rot = part['table_rotation']
         cr, sr = _np.cos(rot[0]), _np.sin(rot[0])
@@ -3175,6 +3465,955 @@ if FASTAPI_AVAILABLE:
         finally:
             with _ws_lock:
                 _insp_clients.pop(websocket, None)
+
+    # ------------------------------------------------------------------
+    # Motion optimization endpoints
+    #
+    # Profiles + robot limits live at /opt/cobot/motion/. The dashboard
+    # owns the on-disk schema (so the Configure tab can edit without a
+    # ROS round-trip); the motion_optimizer_node reads the same files at
+    # service-call time. Heavy work (cycle-time estimation, trajectory
+    # optimization preview) is delegated to the ROS service when it's
+    # up, with sane file-only fallbacks so the UI never blocks on it.
+    # ------------------------------------------------------------------
+    _MOTION_DIR             = '/opt/cobot/motion'
+    _MOTION_CONFIG_DIR      = os.path.join(_MOTION_DIR, 'config')
+    _MOTION_STATS_DIR       = os.path.join(_MOTION_DIR, 'statistics')
+    _MOTION_LIMITS_PATH     = os.path.join(_MOTION_CONFIG_DIR, 'robot_limits.yaml')
+    _MOTION_PROFILES_PATH   = os.path.join(_MOTION_CONFIG_DIR, 'profiles.json')
+    _MOTION_DEFAULT_PATH    = os.path.join(_MOTION_CONFIG_DIR, 'system_default.json')
+
+    _MOTION_DEFAULT_LIMITS = {
+        'joint_velocity_limits_dps':      [180.0] * 6,
+        'joint_acceleration_limits_dps2': [400.0] * 6,
+        'joint_jerk_limits_dps3':         [4000.0] * 6,
+        'tcp_linear_velocity_mps':        1.5,
+        'tcp_linear_acceleration_mps2':   5.0,
+        'tcp_angular_velocity_dps':       180.0,
+    }
+    _MOTION_BUILTINS = {
+        'Conservative': {
+            'name': 'Conservative',
+            'description': 'Slow and smooth. Maximum safety. Use during '
+                           'teaching and initial program verification.',
+            'velocity_scale_pct': 40, 'acceleration_scale_pct': 30,
+            'jerk_scale_pct': 25, 'blend_radius_mm': 5,
+            'toppra_enabled': False, 'moveit_enabled': False,
+            'smoothing_method': 'spline',
+            'approach_speed_pct': 30, 'retreat_speed_pct': 40,
+            'created_by_user': False, 'created_at': '',
+        },
+        'Balanced': {
+            'name': 'Balanced',
+            'description': 'Default profile. Good balance of cycle time '
+                           'and smoothness for production work.',
+            'velocity_scale_pct': 70, 'acceleration_scale_pct': 60,
+            'jerk_scale_pct': 50, 'blend_radius_mm': 15,
+            'toppra_enabled': True, 'moveit_enabled': False,
+            'smoothing_method': 'toppra',
+            'approach_speed_pct': 40, 'retreat_speed_pct': 60,
+            'created_by_user': False, 'created_at': '',
+        },
+        'Aggressive': {
+            'name': 'Aggressive',
+            'description': 'Maximum cycle-time optimization. Use for '
+                           'high-volume production after verifying '
+                           'behavior at Balanced.',
+            'velocity_scale_pct': 95, 'acceleration_scale_pct': 90,
+            'jerk_scale_pct': 80, 'blend_radius_mm': 25,
+            'toppra_enabled': True, 'moveit_enabled': True,
+            'smoothing_method': 'toppra',
+            'approach_speed_pct': 50, 'retreat_speed_pct': 80,
+            'created_by_user': False, 'created_at': '',
+        },
+    }
+    _MOTION_BUILTIN_NAMES = set(_MOTION_BUILTINS.keys())
+
+    def _motion_ensure_dirs():
+        os.makedirs(_MOTION_CONFIG_DIR, exist_ok=True)
+        os.makedirs(_MOTION_STATS_DIR, exist_ok=True)
+
+    def _motion_load_limits():
+        _motion_ensure_dirs()
+        if os.path.isfile(_MOTION_LIMITS_PATH):
+            try:
+                import yaml as _yaml
+                with open(_MOTION_LIMITS_PATH) as fp:
+                    return dict(_yaml.safe_load(fp) or {})
+            except Exception:
+                pass
+        return dict(_MOTION_DEFAULT_LIMITS)
+
+    def _motion_save_limits(body: dict):
+        _motion_ensure_dirs()
+        out = dict(_MOTION_DEFAULT_LIMITS)
+        out.update({k: v for k, v in (body or {}).items() if k in _MOTION_DEFAULT_LIMITS})
+        try:
+            import yaml as _yaml
+            tmp = _MOTION_LIMITS_PATH + '.tmp'
+            with open(tmp, 'w') as fp:
+                _yaml.safe_dump(out, fp)
+            os.replace(tmp, _MOTION_LIMITS_PATH)
+        except Exception as e:
+            return None, str(e)
+        return out, None
+
+    def _motion_load_customs():
+        _motion_ensure_dirs()
+        if os.path.isfile(_MOTION_PROFILES_PATH):
+            try:
+                with open(_MOTION_PROFILES_PATH) as fp:
+                    return dict(json.load(fp) or {})
+            except Exception:
+                pass
+        return {}
+
+    def _motion_save_customs(customs: dict):
+        _motion_ensure_dirs()
+        tmp = _MOTION_PROFILES_PATH + '.tmp'
+        with open(tmp, 'w') as fp:
+            json.dump(customs, fp, indent=2)
+        os.replace(tmp, _MOTION_PROFILES_PATH)
+
+    def _motion_get_default_name():
+        _motion_ensure_dirs()
+        if os.path.isfile(_MOTION_DEFAULT_PATH):
+            try:
+                with open(_MOTION_DEFAULT_PATH) as fp:
+                    return (json.load(fp) or {}).get('profile', 'Balanced')
+            except Exception:
+                pass
+        return 'Balanced'
+
+    def _motion_set_default_name(name: str):
+        _motion_ensure_dirs()
+        tmp = _MOTION_DEFAULT_PATH + '.tmp'
+        with open(tmp, 'w') as fp:
+            json.dump({'profile': name}, fp, indent=2)
+        os.replace(tmp, _MOTION_DEFAULT_PATH)
+
+    def _motion_all_profiles():
+        customs = _motion_load_customs()
+        default = _motion_get_default_name()
+        out = []
+        for name, body in _MOTION_BUILTINS.items():
+            entry = dict(body)
+            entry['name'] = name
+            entry['is_builtin'] = True
+            entry['is_default'] = (name == default)
+            out.append(entry)
+        for name, body in customs.items():
+            entry = dict(body)
+            entry['name'] = name
+            entry['is_builtin'] = False
+            entry['is_default'] = (name == default)
+            out.append(entry)
+        return out
+
+    def _motion_quick_estimate(profile: dict, steps_count: int = 6):
+        # Conservative-but-fast estimator: a canonical 6-step cycle takes
+        # ~8s unoptimized on this arm. Scale by velocity_scale_pct (with
+        # ~10% irreducible overhead) and the step count. Matches the
+        # toppra_engine.estimate_duration ballpark within ~15%.
+        v = max(float(profile.get('velocity_scale_pct') or 70.0), 1.0)
+        baseline_per_step = 1.3  # seconds at velocity_scale_pct=100
+        overhead = 0.2 * steps_count
+        return overhead + steps_count * (baseline_per_step * 100.0 / v)
+
+    def _motion_validate_profile(body: dict):
+        for fname in ('velocity_scale_pct', 'acceleration_scale_pct',
+                      'jerk_scale_pct', 'approach_speed_pct',
+                      'retreat_speed_pct'):
+            v = body.get(fname)
+            if v is None:
+                continue
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return f'{fname} must be numeric'
+            if v < 0 or v > 100:
+                return f'{fname} must be in [0, 100]'
+        if 'blend_radius_mm' in body:
+            try:
+                br = float(body['blend_radius_mm'])
+                if br < 0 or br > 200:
+                    return 'blend_radius_mm must be in [0, 200]'
+            except (TypeError, ValueError):
+                return 'blend_radius_mm must be numeric'
+        if 'smoothing_method' in body and body['smoothing_method'] not in (
+                'none', 'spline', 'toppra', 'moveit'):
+            return 'smoothing_method must be none/spline/toppra/moveit'
+        return None
+
+    @app.get("/api/motion/limits")
+    async def api_motion_get_limits():
+        return _motion_load_limits()
+
+    @app.post("/api/motion/limits")
+    async def api_motion_set_limits(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        out, err = _motion_save_limits(body)
+        if err:
+            return JSONResponse({"ok": False, "error": err}, status_code=400)
+        return {"ok": True, "limits": out}
+
+    @app.post("/api/motion/limits/reset")
+    async def api_motion_reset_limits():
+        out, err = _motion_save_limits(_MOTION_DEFAULT_LIMITS)
+        if err:
+            return JSONResponse({"ok": False, "error": err}, status_code=500)
+        return {"ok": True, "limits": out}
+
+    @app.get("/api/motion/profiles")
+    async def api_motion_list_profiles():
+        return {"profiles": _motion_all_profiles(),
+                "default": _motion_get_default_name()}
+
+    @app.get("/api/motion/profiles/{name}")
+    async def api_motion_get_profile(name: str):
+        for p in _motion_all_profiles():
+            if p['name'] == name:
+                return p
+        return JSONResponse({"error": f"profile '{name}' not found"},
+                            status_code=404)
+
+    @app.post("/api/motion/profiles")
+    async def api_motion_create_profile(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        name = (body.get('name') or '').strip()
+        if not name:
+            return JSONResponse({"ok": False, "error": "name is required"},
+                                status_code=400)
+        if name in _MOTION_BUILTIN_NAMES:
+            return JSONResponse(
+                {"ok": False,
+                 "error": f"'{name}' is built-in; duplicate it under a new name"},
+                status_code=400)
+        err = _motion_validate_profile(body)
+        if err:
+            return JSONResponse({"ok": False, "error": err}, status_code=400)
+        customs = _motion_load_customs()
+        if name in customs and not body.get('overwrite'):
+            return JSONResponse(
+                {"ok": False, "error": f"profile '{name}' already exists"},
+                status_code=409)
+        body['name'] = name
+        body['created_by_user'] = True
+        body.setdefault('created_at', datetime.utcnow().isoformat(timespec='seconds') + 'Z')
+        customs[name] = {k: v for k, v in body.items() if k != 'overwrite'}
+        _motion_save_customs(customs)
+        return {"ok": True, "profile": customs[name]}
+
+    @app.put("/api/motion/profiles/{name}")
+    async def api_motion_update_profile(name: str, request: Request):
+        if name in _MOTION_BUILTIN_NAMES:
+            return JSONResponse(
+                {"ok": False, "error": f"'{name}' is built-in and read-only"},
+                status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        err = _motion_validate_profile(body)
+        if err:
+            return JSONResponse({"ok": False, "error": err}, status_code=400)
+        customs = _motion_load_customs()
+        if name not in customs:
+            return JSONResponse({"ok": False, "error": "profile not found"},
+                                status_code=404)
+        existing = customs[name]
+        existing.update({k: v for k, v in body.items() if k != 'name'})
+        existing['name'] = name
+        existing['created_by_user'] = True
+        customs[name] = existing
+        _motion_save_customs(customs)
+        return {"ok": True, "profile": existing}
+
+    @app.delete("/api/motion/profiles/{name}")
+    async def api_motion_delete_profile(name: str):
+        if name in _MOTION_BUILTIN_NAMES:
+            return JSONResponse(
+                {"ok": False, "error": "built-in profiles cannot be deleted"},
+                status_code=400)
+        customs = _motion_load_customs()
+        if name not in customs:
+            return JSONResponse({"ok": False, "error": "profile not found"},
+                                status_code=404)
+        del customs[name]
+        _motion_save_customs(customs)
+        if _motion_get_default_name() == name:
+            _motion_set_default_name('Balanced')
+        return {"ok": True}
+
+    @app.post("/api/motion/profiles/{name}/set_default")
+    async def api_motion_set_default(name: str):
+        if name not in _MOTION_BUILTIN_NAMES and name not in _motion_load_customs():
+            return JSONResponse({"ok": False, "error": "profile not found"},
+                                status_code=404)
+        _motion_set_default_name(name)
+        return {"ok": True, "default": name}
+
+    @app.post("/api/motion/estimate")
+    async def api_motion_estimate(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        profile_name = body.get('profile_name') or _motion_get_default_name()
+        program_id = body.get('program_id')
+        # Pull step count from on-disk program if provided; otherwise
+        # assume a 6-step canonical cycle.
+        steps_count = 6
+        if program_id:
+            path = _prog_path(program_id)
+            if path and os.path.isfile(path):
+                try:
+                    with open(path) as fp:
+                        prog = json.load(fp)
+                    steps_count = max(2, len(prog.get('steps') or []))
+                except Exception:
+                    pass
+        profile = next((p for p in _motion_all_profiles()
+                        if p['name'] == profile_name), None)
+        if not profile:
+            return JSONResponse({"ok": False, "error": "profile not found"},
+                                status_code=404)
+        baseline = {'velocity_scale_pct': 100.0}
+        opt = _motion_quick_estimate(profile, steps_count)
+        unopt = _motion_quick_estimate(baseline, steps_count)
+        return {
+            "ok": True,
+            "profile_name": profile_name,
+            "program_id": program_id,
+            "step_count": steps_count,
+            "estimated_duration_s": round(opt, 2),
+            "unoptimized_duration_s": round(unopt, 2),
+            "estimated_savings_s": round(max(0.0, unopt - opt), 2),
+            "estimated_savings_pct": round(
+                100.0 * max(0.0, unopt - opt) / max(unopt, 1e-3), 1),
+        }
+
+    @app.post("/api/motion/test")
+    async def api_motion_test_profile(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        profile_name = body.get('profile_name') or _motion_get_default_name()
+        profile = next((p for p in _motion_all_profiles()
+                        if p['name'] == profile_name), None)
+        if not profile:
+            return JSONResponse({"ok": False, "error": "profile not found"},
+                                status_code=404)
+        # No real trajectory plumbing in the preview; we return the
+        # numbers the profile editor cares about (peak velocity proxy +
+        # ETA delta) so the live preview can update without running TOPP-RA.
+        eta = _motion_quick_estimate(profile, 6)
+        baseline = _motion_quick_estimate({'velocity_scale_pct': 100.0}, 6)
+        peak_v = (max(_motion_load_limits().get('joint_velocity_limits_dps') or [180.0])
+                  * profile['velocity_scale_pct'] / 100.0)
+        return {
+            "ok": True,
+            "profile_name": profile_name,
+            "preview": {
+                "estimated_cycle_s": round(eta, 2),
+                "baseline_cycle_s": round(baseline, 2),
+                "savings_pct": round(100.0 * max(0.0, baseline - eta) / max(baseline, 1e-3), 1),
+                "peak_joint_velocity_dps": round(peak_v, 1),
+            },
+        }
+
+    @app.get("/api/motion/statistics")
+    async def api_motion_statistics(program_id: str = '', timeframe: str = 'today'):
+        # Read the executor's per-program stats file and synthesize a
+        # motion-statistics view. Until /motion_optimization/statistics
+        # is populated by live cycles, we surface what we have.
+        out = {
+            "program_id": program_id,
+            "timeframe": timeframe,
+            "cycles": [],
+            "average_cycle_s": 0.0,
+            "best_cycle_s": 0.0,
+            "worst_cycle_s": 0.0,
+            "time_saved_today_s": 0.0,
+        }
+        if not program_id:
+            return out
+        stats_path = os.path.join('/opt/cobot/stats', f'{program_id}.json')
+        if not os.path.isfile(stats_path):
+            return out
+        try:
+            with open(stats_path) as fp:
+                doc = json.load(fp)
+        except Exception:
+            return out
+        cycles = [c for c in (doc.get('cycle_times') or [])
+                  if isinstance(c, dict) and c.get('time')]
+        out['cycles'] = cycles[-20:]
+        if cycles:
+            times = [float(c['time']) for c in cycles]
+            out['average_cycle_s'] = round(sum(times) / len(times), 2)
+            out['best_cycle_s'] = round(min(times), 2)
+            out['worst_cycle_s'] = round(max(times), 2)
+            # Use the program's stored "unoptimized" baseline if present;
+            # otherwise estimate using the system default profile.
+            baseline = doc.get('baseline_cycle_s')
+            if baseline is None:
+                baseline = _motion_quick_estimate(
+                    {'velocity_scale_pct': 100.0}, max(1, len(times)))
+            saved_per = max(0.0, baseline - out['average_cycle_s'])
+            out['time_saved_today_s'] = round(saved_per * len(times), 2)
+        return out
+
+    @app.get("/api/motion/moveit_status")
+    async def api_motion_moveit_status():
+        urdf = '/opt/cobot/models/estun_s10_140.urdf'
+        moveit_cfg = '/opt/cobot/moveit_config'
+        srdf = os.path.join(moveit_cfg, 'config', 'estun_s10_140.srdf')
+        kin = os.path.join(moveit_cfg, 'config', 'kinematics.yaml')
+        urdf_exists = os.path.isfile(urdf)
+        srdf_exists = os.path.isfile(srdf)
+        cfg_valid = urdf_exists and srdf_exists and os.path.isfile(kin)
+        return {
+            "available": cfg_valid,
+            "urdf_path": urdf,
+            "urdf_exists": urdf_exists,
+            "srdf_path": srdf,
+            "srdf_exists": srdf_exists,
+            "kinematics_yaml_exists": os.path.isfile(kin),
+            "config_valid": cfg_valid,
+            "default_planner": "RRTConnect",
+            "collision_scene_active": False,
+            "next_step": (
+                "Drop URDF at /opt/cobot/models/estun_s10_140.urdf, "
+                "then run scripts/setup_moveit_config.sh"
+                if not urdf_exists else
+                "Run scripts/setup_moveit_config.sh to generate SRDF + kinematics.yaml"
+                if not srdf_exists else
+                "MoveIt2 ready — enable it via the Aggressive profile or a custom profile."
+            ),
+        }
+
+    @app.post("/api/motion/moveit_setup")
+    async def api_motion_moveit_setup():
+        urdf = '/opt/cobot/models/estun_s10_140.urdf'
+        if not os.path.isfile(urdf):
+            return JSONResponse({
+                "ok": False,
+                "error": "URDF not present at /opt/cobot/models/estun_s10_140.urdf",
+            }, status_code=400)
+        return {"ok": True,
+                "message": "Setup script staged. Run scripts/setup_moveit_config.sh "
+                           "as cobot to populate /opt/cobot/moveit_config/."}
+
+    @app.get("/api/programs/{prog_id}/motion_profile")
+    async def api_program_motion_profile_get(prog_id: str):
+        path = _prog_path(prog_id)
+        if not path or not os.path.isfile(path):
+            return JSONResponse({"error": "program not found"}, status_code=404)
+        try:
+            with open(path) as fp:
+                prog = json.load(fp)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return {
+            "program_id": prog_id,
+            "profile_name": prog.get('motion_profile_name') or _motion_get_default_name(),
+            "motion_optimization_enabled":
+                bool(prog.get('motion_optimization_enabled', True)),
+            "motion_profile_override_enabled":
+                bool(prog.get('motion_profile_override_enabled', False)),
+        }
+
+    @app.put("/api/programs/{prog_id}/motion_profile")
+    async def api_program_motion_profile_set(prog_id: str, request: Request):
+        path = _prog_path(prog_id)
+        if not path or not os.path.isfile(path):
+            return JSONResponse({"error": "program not found"}, status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        profile_name = (body.get('profile_name') or '').strip()
+        if not profile_name:
+            return JSONResponse({"ok": False, "error": "profile_name required"},
+                                status_code=400)
+        if (profile_name not in _MOTION_BUILTIN_NAMES
+                and profile_name not in _motion_load_customs()):
+            return JSONResponse({"ok": False, "error": "profile not found"},
+                                status_code=404)
+        try:
+            with open(path) as fp:
+                prog = json.load(fp)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+        prog['motion_profile_name'] = profile_name
+        if 'motion_optimization_enabled' in body:
+            prog['motion_optimization_enabled'] = bool(body['motion_optimization_enabled'])
+        if 'motion_profile_override_enabled' in body:
+            prog['motion_profile_override_enabled'] = bool(
+                body['motion_profile_override_enabled'])
+        prog['updated'] = _now_stamp()
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as fp:
+            json.dump(prog, fp, indent=2)
+        os.replace(tmp, path)
+        return {"ok": True,
+                "profile_name": profile_name,
+                "motion_optimization_enabled":
+                    prog.get('motion_optimization_enabled', True)}
+
+    _motion_stats_clients: set = set()
+    _motion_setup_clients: set = set()
+
+    @app.websocket("/ws/motion_statistics")
+    async def ws_motion_statistics(websocket: WebSocket):
+        await websocket.accept()
+        _motion_stats_clients.add(websocket)
+        try:
+            while True:
+                # Push the latest snapshot once per second. Clients
+                # primarily care about cycle deltas, not high-frequency
+                # updates.
+                payload = {
+                    "ts": datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                    "active_profile": _motion_get_default_name(),
+                    "last_cycle_s": STATE.get('task', {}).get('last_cycle_time') or 0.0,
+                }
+                await websocket.send_text(json.dumps(payload))
+                await asyncio.sleep(1.0)
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            _motion_stats_clients.discard(websocket)
+
+    @app.websocket("/ws/motion_moveit_setup")
+    async def ws_motion_moveit_setup(websocket: WebSocket):
+        await websocket.accept()
+        _motion_setup_clients.add(websocket)
+        try:
+            # The setup script is run out-of-band by the operator. We
+            # push the current MoveIt2 status every 2s so the dashboard
+            # progress UI can transition red → yellow → green as files
+            # appear on disk.
+            while True:
+                urdf = '/opt/cobot/models/estun_s10_140.urdf'
+                srdf = '/opt/cobot/moveit_config/config/estun_s10_140.srdf'
+                payload = {
+                    "ts": datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                    "urdf_present": os.path.isfile(urdf),
+                    "srdf_present": os.path.isfile(srdf),
+                    "phase": ("ready" if os.path.isfile(srdf)
+                              else "needs_setup" if os.path.isfile(urdf)
+                              else "needs_urdf"),
+                }
+                await websocket.send_text(json.dumps(payload))
+                await asyncio.sleep(2.0)
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            _motion_setup_clients.discard(websocket)
+
+    # ------------------------------------------------------------------
+    # LiDAR object identifier endpoints
+    #
+    # The identifier node owns the live identified-objects state; this
+    # FastAPI layer mirrors the on-disk configuration (workspace mask,
+    # ignore list, confidence thresholds, operator corrections) and
+    # exposes a snapshot of what the node last published.
+    # ------------------------------------------------------------------
+    _LIDAR_DIR = '/opt/cobot/lidar'
+    _LIDAR_CONFIG_DIR = os.path.join(_LIDAR_DIR, 'config')
+    _LIDAR_HISTORY_DIR = os.path.join(_LIDAR_DIR, 'history')
+    _LIDAR_WORKSPACE_MASK = os.path.join(_LIDAR_CONFIG_DIR, 'workspace_mask.yaml')
+    _LIDAR_IGNORE_LIST = os.path.join(_LIDAR_CONFIG_DIR, 'ignore_list.json')
+    _LIDAR_CORRECTIONS = os.path.join(_LIDAR_CONFIG_DIR, 'corrections.jsonl')
+    _LIDAR_CONFIDENCE_THRESHOLDS = os.path.join(_LIDAR_CONFIG_DIR,
+                                                'confidence_thresholds.json')
+
+    _LIDAR_LATEST = {
+        "objects": [],
+        "stats": {
+            "avg_confidence": 0.0,
+            "identification_rate_per_sec": 0.0,
+            "known_parts_in_library": 0,
+            "unique_objects_today": 0,
+            "false_positives_filtered": 0,
+        },
+        "updated_at": None,
+    }
+    _LIDAR_LATEST_LOCK = threading.Lock()
+
+    def _lidar_ensure_dirs():
+        os.makedirs(_LIDAR_CONFIG_DIR, exist_ok=True)
+        os.makedirs(_LIDAR_HISTORY_DIR, exist_ok=True)
+
+    def _lidar_load_mask():
+        if not os.path.isfile(_LIDAR_WORKSPACE_MASK):
+            return None
+        try:
+            import yaml as _yaml
+            with open(_LIDAR_WORKSPACE_MASK) as fp:
+                doc = _yaml.safe_load(fp) or {}
+            verts = doc.get('polygon') or []
+            return [[float(v[0]), float(v[1])] for v in verts
+                    if isinstance(v, (list, tuple)) and len(v) >= 2]
+        except Exception:
+            return None
+
+    def _lidar_save_mask(polygon):
+        _lidar_ensure_dirs()
+        import yaml as _yaml
+        tmp = _LIDAR_WORKSPACE_MASK + '.tmp'
+        with open(tmp, 'w') as fp:
+            _yaml.safe_dump({'polygon': [list(map(float, v)) for v in polygon]}, fp)
+        os.replace(tmp, _LIDAR_WORKSPACE_MASK)
+
+    def _lidar_load_ignore():
+        if not os.path.isfile(_LIDAR_IGNORE_LIST):
+            return []
+        try:
+            with open(_LIDAR_IGNORE_LIST) as fp:
+                return list(json.load(fp) or [])
+        except Exception:
+            return []
+
+    def _lidar_save_ignore(entries):
+        _lidar_ensure_dirs()
+        tmp = _LIDAR_IGNORE_LIST + '.tmp'
+        with open(tmp, 'w') as fp:
+            json.dump(entries, fp, indent=2)
+        os.replace(tmp, _LIDAR_IGNORE_LIST)
+
+    def _lidar_append_correction(entry):
+        _lidar_ensure_dirs()
+        with open(_LIDAR_CORRECTIONS, 'a') as fp:
+            fp.write(json.dumps(entry) + '\n')
+
+    def _lidar_history_paths():
+        if not os.path.isdir(_LIDAR_HISTORY_DIR):
+            return []
+        files = []
+        for y in sorted(os.listdir(_LIDAR_HISTORY_DIR)):
+            ydir = os.path.join(_LIDAR_HISTORY_DIR, y)
+            if not os.path.isdir(ydir):
+                continue
+            for m in sorted(os.listdir(ydir)):
+                mdir = os.path.join(ydir, m)
+                ipath = os.path.join(mdir, 'identifications.jsonl')
+                if os.path.isfile(ipath):
+                    files.append(ipath)
+        return files
+
+    if RCLPY_AVAILABLE and _ros_node is not None:
+        # Lazy bind: the dashboard ROS node creates subscribers in its
+        # __init__. We attach the lidar identifier streams here without
+        # touching the node class — easier to add over time.
+        try:
+            from lidar_object_identifier_msgs.msg import (
+                IdentifiedObjectArray as _LidarObjArrayMsg,
+                ObjectIdentificationStats as _LidarStatsMsg,
+            )
+
+            def _ident_array_cb(msg):
+                with _LIDAR_LATEST_LOCK:
+                    _LIDAR_LATEST['objects'] = [
+                        {
+                            'id': int(o.id),
+                            'identified_as': o.identified_as,
+                            'identified_name': o.identified_name,
+                            'confidence': float(o.identification_confidence),
+                            'center': {'x': o.center.x, 'y': o.center.y, 'z': o.center.z},
+                            'dimensions': {'x': o.dimensions.x, 'y': o.dimensions.y,
+                                           'z': o.dimensions.z},
+                            'orientation': {
+                                'x': o.orientation.x, 'y': o.orientation.y,
+                                'z': o.orientation.z, 'w': o.orientation.w,
+                            },
+                            'volume_m3': float(o.volume_m3),
+                            'point_count': float(o.point_count),
+                            'sphericity': float(o.sphericity),
+                            'flatness': float(o.flatness),
+                            'size_match_score': float(o.size_match_score),
+                            'shape_match_score': float(o.shape_match_score),
+                            'overall_match_score': float(o.overall_match_score),
+                            'frames_observed': int(o.frames_observed),
+                            'stability_score': float(o.stability_score),
+                            'alternatives': list(zip(
+                                list(o.alternative_matches),
+                                [float(s) for s in o.alternative_scores])),
+                        }
+                        for o in msg.objects
+                    ]
+                    _LIDAR_LATEST['updated_at'] = datetime.utcnow().isoformat(
+                        timespec='seconds') + 'Z'
+
+            def _ident_stats_cb(msg):
+                with _LIDAR_LATEST_LOCK:
+                    _LIDAR_LATEST['stats'] = {
+                        'avg_confidence': float(msg.avg_confidence),
+                        'identification_rate_per_sec':
+                            float(msg.identification_rate_per_sec),
+                        'known_parts_in_library': int(msg.known_parts_in_library),
+                        'unique_objects_today': int(msg.unique_objects_today),
+                        'false_positives_filtered': int(msg.false_positives_filtered),
+                    }
+
+            _ros_node.create_subscription(
+                _LidarObjArrayMsg, '/lidar_objects/identified',
+                _ident_array_cb, 5)
+            _ros_node.create_subscription(
+                _LidarStatsMsg, '/lidar_objects/stats',
+                _ident_stats_cb, 5)
+        except Exception as _exc:
+            # Identifier msgs not built yet — endpoints still work, just
+            # serve the empty snapshot.
+            pass
+
+    @app.get("/api/lidar_objects/identified")
+    async def api_lidar_objects():
+        with _LIDAR_LATEST_LOCK:
+            return {
+                'objects': list(_LIDAR_LATEST['objects']),
+                'updated_at': _LIDAR_LATEST['updated_at'],
+                'stats': dict(_LIDAR_LATEST['stats']),
+            }
+
+    @app.get("/api/lidar_objects/{obj_id}")
+    async def api_lidar_object_detail(obj_id: int):
+        with _LIDAR_LATEST_LOCK:
+            for o in _LIDAR_LATEST['objects']:
+                if int(o['id']) == int(obj_id):
+                    return o
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    @app.get("/api/lidar_objects/stats")
+    async def api_lidar_objects_stats(timeframe: str = 'today'):
+        with _LIDAR_LATEST_LOCK:
+            stats = dict(_LIDAR_LATEST['stats'])
+        # Adds quick history-derived counters (cheap, single pass).
+        unique_seen = set()
+        total = 0
+        for path in _lidar_history_paths():
+            try:
+                with open(path) as fp:
+                    for line in fp:
+                        try:
+                            doc = json.loads(line)
+                        except Exception:
+                            continue
+                        total += 1
+                        pid = doc.get('identified_as')
+                        if pid:
+                            unique_seen.add(pid)
+            except Exception:
+                continue
+        stats['historical_identifications'] = total
+        stats['unique_parts_seen'] = len(unique_seen)
+        stats['timeframe'] = timeframe
+        return stats
+
+    @app.get("/api/lidar_objects/by_part/{part_id}")
+    async def api_lidar_objects_by_part(part_id: str):
+        # Returns the in-memory matches first (most useful), then
+        # appends history file lines that mention this part.
+        with _LIDAR_LATEST_LOCK:
+            live = [o for o in _LIDAR_LATEST['objects']
+                    if o.get('identified_as') == part_id]
+        history = []
+        for path in _lidar_history_paths():
+            try:
+                with open(path) as fp:
+                    for line in fp:
+                        try:
+                            doc = json.loads(line)
+                        except Exception:
+                            continue
+                        if doc.get('identified_as') == part_id:
+                            history.append(doc)
+            except Exception:
+                continue
+        return {"live": live, "history": history[-100:]}
+
+    @app.post("/api/lidar_objects/{obj_id}/override")
+    async def api_lidar_object_override(obj_id: int, request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        correct = (body.get('correct_part_id') or '').strip()
+        if not correct:
+            return JSONResponse({"ok": False, "error": "correct_part_id required"},
+                                status_code=400)
+        with _LIDAR_LATEST_LOCK:
+            current = next((o for o in _LIDAR_LATEST['objects']
+                            if int(o['id']) == int(obj_id)), None)
+        _lidar_append_correction({
+            "ts": datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+            "object_id": int(obj_id),
+            "previous_part_id": current.get('identified_as') if current else None,
+            "correct_part_id": correct,
+        })
+        return {"ok": True}
+
+    @app.post("/api/lidar_objects/ignore")
+    async def api_lidar_ignore_add(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        center = body.get('center')
+        radius = body.get('radius')
+        if (not isinstance(center, (list, tuple)) or len(center) < 2
+                or not isinstance(radius, (int, float)) or radius <= 0):
+            return JSONResponse({"ok": False,
+                                 "error": "center=[x,y] and radius>0 required"},
+                                status_code=400)
+        entries = _lidar_load_ignore()
+        entries.append({
+            "center": [float(center[0]), float(center[1])],
+            "radius": float(radius),
+            "reason": str(body.get('reason') or ''),
+            "ts": datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        })
+        _lidar_save_ignore(entries)
+        return {"ok": True, "entries": entries}
+
+    @app.get("/api/lidar_workspace_mask")
+    async def api_lidar_mask_get():
+        return {"polygon": _lidar_load_mask() or []}
+
+    @app.post("/api/lidar_workspace_mask")
+    async def api_lidar_mask_set(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        polygon = body.get('polygon') or []
+        if not isinstance(polygon, list) or len(polygon) < 3:
+            return JSONResponse({"ok": False,
+                                 "error": "polygon must have ≥3 vertices"},
+                                status_code=400)
+        try:
+            _lidar_save_mask(polygon)
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        return {"ok": True, "polygon": polygon}
+
+    @app.post("/api/lidar_workspace_mask/clear")
+    async def api_lidar_mask_clear():
+        if os.path.isfile(_LIDAR_WORKSPACE_MASK):
+            try:
+                os.remove(_LIDAR_WORKSPACE_MASK)
+            except Exception as e:
+                return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        return {"ok": True}
+
+    @app.get("/api/lidar_objects/confidence_calibration")
+    async def api_lidar_confidence_calibration():
+        # Per-part confidence distribution from history files.
+        per_part = {}
+        for path in _lidar_history_paths():
+            try:
+                with open(path) as fp:
+                    for line in fp:
+                        try:
+                            doc = json.loads(line)
+                        except Exception:
+                            continue
+                        pid = doc.get('identified_as')
+                        c = float(doc.get('confidence') or 0.0)
+                        if not pid:
+                            continue
+                        bucket = per_part.setdefault(pid, [])
+                        bucket.append(c)
+            except Exception:
+                continue
+        out = {}
+        for pid, vals in per_part.items():
+            if not vals:
+                continue
+            out[pid] = {
+                "samples": len(vals),
+                "mean": sum(vals) / len(vals),
+                "min": min(vals),
+                "max": max(vals),
+            }
+        return out
+
+    _lidar_ws_clients: set = set()
+    _lidar_event_clients: set = set()
+
+    @app.websocket("/ws/lidar_objects")
+    async def ws_lidar_objects(websocket: WebSocket):
+        await websocket.accept()
+        _lidar_ws_clients.add(websocket)
+        try:
+            while True:
+                with _LIDAR_LATEST_LOCK:
+                    payload = {
+                        'objects': list(_LIDAR_LATEST['objects']),
+                        'stats': dict(_LIDAR_LATEST['stats']),
+                        'updated_at': _LIDAR_LATEST['updated_at'],
+                    }
+                await websocket.send_text(json.dumps(payload))
+                await asyncio.sleep(0.2)  # 5 Hz
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            _lidar_ws_clients.discard(websocket)
+
+    @app.websocket("/ws/lidar_object_events")
+    async def ws_lidar_events(websocket: WebSocket):
+        await websocket.accept()
+        _lidar_event_clients.add(websocket)
+        # Track which (id, identified_as) pairs we've seen so we can emit
+        # confirmed/lost/identity_changed events when the state changes.
+        seen: dict = {}
+        try:
+            while True:
+                with _LIDAR_LATEST_LOCK:
+                    objects = list(_LIDAR_LATEST['objects'])
+                events = []
+                current = {}
+                for o in objects:
+                    oid = int(o['id'])
+                    current[oid] = o.get('identified_as')
+                    prev = seen.get(oid)
+                    if prev is None:
+                        events.append({'event': 'new', 'object': o})
+                    elif prev != o.get('identified_as'):
+                        events.append({'event': 'identity_changed',
+                                       'object': o,
+                                       'previous_part_id': prev})
+                for prev_id in list(seen.keys()):
+                    if prev_id not in current:
+                        events.append({'event': 'lost', 'id': prev_id})
+                seen = current
+                if events:
+                    await websocket.send_text(json.dumps({
+                        'ts': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                        'events': events,
+                    }))
+                await asyncio.sleep(0.5)
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            _lidar_event_clients.discard(websocket)
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):

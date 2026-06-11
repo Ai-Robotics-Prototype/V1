@@ -1,0 +1,5 @@
+motion_optimization_msgs/MotionProfile profile
+bool overwrite
+---
+bool success
+string error_message

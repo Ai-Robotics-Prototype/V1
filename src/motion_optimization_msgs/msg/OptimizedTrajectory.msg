@@ -1,0 +1,15 @@
+std_msgs/Header header
+trajectory_msgs/JointTrajectory original
+trajectory_msgs/JointTrajectory optimized
+float32 original_duration_s
+float32 optimized_duration_s
+float32 time_saved_s
+float32 time_saved_pct
+float32 peak_velocity_dps
+float32 peak_acceleration_dps2
+float32 peak_jerk_dps3
+bool collision_free
+bool within_limits
+string optimizer_used
+string status
+string error_message

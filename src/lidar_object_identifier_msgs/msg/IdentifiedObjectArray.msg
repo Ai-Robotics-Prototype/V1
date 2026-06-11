@@ -1,0 +1,8 @@
+std_msgs/Header header
+lidar_object_identifier_msgs/IdentifiedObject[] objects
+int32 total_identified
+int32 confident_identifications
+int32 tentative_identifications
+int32 unknown_objects
+int32 total_clusters_processed
+float32 processing_time_ms

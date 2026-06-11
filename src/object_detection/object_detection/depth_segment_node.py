@@ -257,6 +257,7 @@ class DepthSegmentNode(Node):
         self._load_teach_refs()
         self._backfill_classifiers()
         self._load_templates()
+        self._check_index_health()
         # Per-face CAD feature anchors (hole + boss centres for each
         # of top / bottom / right / left / front / back). Read once at
         # startup; the matcher uses these to verify the live crop
@@ -1802,20 +1803,64 @@ class DepthSegmentNode(Node):
         """Load /opt/cobot/parts/templates/<part_id>_templates.npz files.
 
         Each file holds N templates (default 72 = 6 orientations × 12
-        yaws). Mapping is keyed by part_id (hash) and includes the part
-        name resolved from the metadata json.
+        yaws). Templates are keyed by part_id; the human-readable name
+        is resolved by _id_to_name() so the dashboard label never sees
+        the raw hex.
+
+        ORPHAN policy: a templates file is rejected (NOT loaded) when
+        either of these is true:
+          * /opt/cobot/parts/metadata/<part_id>.json doesn't exist
+          * The metadata json has no 'name' field (or it's empty)
+
+        Orphans match nothing — the alternative (accepting them and
+        labelling with the raw hex) caused legitimate detections to be
+        misidentified, since the template matcher will happily pick
+        any orphan with score >= 0.55 in _match_by_templates.
+
+        Per-file status is logged at startup with the resolved name;
+        orphan rm commands are printed to stdout so the operator can
+        decide whether to remove them.
         """
         self._templates = {}
         tdir = '/opt/cobot/parts/templates'
         mdir = '/opt/cobot/parts/metadata'
         if not os.path.isdir(tdir):
             return
+        loaded_ok = 0
+        orphans = []      # list of (part_id, abs_path, reason)
         for fn in sorted(os.listdir(tdir)):
             if not fn.endswith('_templates.npz'):
                 continue
             part_id = fn[:-len('_templates.npz')]
+            abs_path = os.path.join(tdir, fn)
+
+            # ── Orphan check FIRST, before loading the .npz ──────────
+            meta_path = os.path.join(mdir, f'{part_id}.json')
+            reason = None
+            resolved_name = None
+            if not os.path.isfile(meta_path):
+                reason = 'no metadata json'
+            else:
+                try:
+                    with open(meta_path) as fp:
+                        md = json.load(fp) or {}
+                    resolved_name = (md.get('name') or '').strip() or None
+                    if not resolved_name:
+                        reason = 'metadata has no "name" field'
+                except Exception as e:
+                    reason = f'metadata unreadable: {e}'
+            if reason is not None:
+                self.get_logger().warn(
+                    f'Skipping orphan template {part_id} '
+                    f'(no metadata or no name field) — {reason}. '
+                    f'Add metadata/{part_id}.json with a "name" field or '
+                    f'remove the templates file.')
+                orphans.append((part_id, abs_path, reason))
+                continue
+
+            # ── Metadata OK — try to load templates ─────────────────
             try:
-                z = np.load(os.path.join(tdir, fn), allow_pickle=True)
+                z = np.load(abs_path, allow_pickle=True)
                 n = int(z['num_templates'])
                 tpls = []
                 for i in range(n):
@@ -1831,23 +1876,117 @@ class DepthSegmentNode(Node):
                     })
             except Exception as e:
                 self.get_logger().warn(
-                    f'template load failed for {part_id}: {e}', once=True)
+                    f'template load failed for {part_id[:8]}...: {e}',
+                    once=True)
                 continue
-            # Look up the part name from metadata json (falls back to id).
-            name = part_id
-            meta_path = os.path.join(mdir, f'{part_id}.json')
-            if os.path.isfile(meta_path):
-                try:
-                    with open(meta_path) as fp:
-                        name = json.load(fp).get('name') or part_id
-                except Exception:
-                    pass
-            self._templates[part_id] = {'name': name, 'templates': tpls}
+            # Use the centralised resolver so the same fallback rules
+            # apply everywhere (and the resolved string can't be the
+            # raw hex if metadata happens to be malformed later).
+            display_name = self._id_to_name(part_id)
+            self._templates[part_id] = {
+                'name': display_name,
+                'templates': tpls,
+            }
+            loaded_ok += 1
+            self.get_logger().info(
+                f'  OK:     {part_id[:8]}... → {display_name} '
+                f'({len(tpls)} templates)')
+
+        # TEACH_READINESS startup summary — symmetric to the rollup in
+        # _check_index_health (which logs from the index→metadata side).
+        # Together both lines give the operator a single line each for
+        # "templates with metadata" and "index entries with metadata".
+        self.get_logger().info(
+            f'TEACH_READINESS: {loaded_ok} templates loaded, '
+            f'{len(orphans)} orphans skipped')
         if self._templates:
             self.get_logger().info(
                 'templates: '
-                + ', '.join(f'{v["name"]}({len(v["templates"])})'
-                            for v in self._templates.values()))
+                + ', '.join(
+                    f'{self._id_to_name(pid)}({len(v["templates"])})'
+                    for pid, v in self._templates.items()))
+
+        # Operator cleanup helper: list each orphan template's path and
+        # the rm command. Goes to stdout (not the ROS logger) so it's
+        # easy to grep / copy-paste from `journalctl` output. We do not
+        # auto-delete — the operator decides.
+        if orphans:
+            print('', flush=True)
+            print('=' * 72, flush=True)
+            print('ORPHAN TEMPLATE FILES (no matching metadata):', flush=True)
+            print('=' * 72, flush=True)
+            for pid, path, reason in orphans:
+                print(f'  {path}', flush=True)
+                print(f'    reason: {reason}', flush=True)
+                print(f'    To remove: rm {path}', flush=True)
+            print('=' * 72, flush=True)
+            print('', flush=True)
+
+    def _check_index_health(self):
+        """Sanity-check /opt/cobot/parts/index.json against the
+        metadata directory. For each entry in index.json verify that
+        metadata/<id>.json exists AND carries a non-empty 'name'.
+        Logs INDEX_MISMATCH for every entry that fails.
+
+        Symmetric to _load_templates' orphan check — together they
+        cover both directions (templates → metadata and index →
+        metadata) so the operator sees every gap that could produce a
+        bad label or a phantom match.
+        """
+        idx_path = '/opt/cobot/parts/index.json'
+        mdir = '/opt/cobot/parts/metadata'
+        if not os.path.isfile(idx_path):
+            self.get_logger().warn(
+                f'INDEX_MISMATCH: {idx_path} does not exist')
+            return
+        try:
+            with open(idx_path) as f:
+                idx = json.load(f) or {}
+        except Exception as e:
+            self.get_logger().warn(
+                f'INDEX_MISMATCH: failed to read {idx_path}: {e}')
+            return
+        bad = 0
+        good = 0
+        for entry in (idx.get('parts') or []):
+            pid = entry.get('id')
+            ename = (entry.get('name') or '').strip()
+            if not pid:
+                self.get_logger().warn(
+                    'INDEX_MISMATCH: index.json entry has no id field')
+                bad += 1
+                continue
+            meta_path = os.path.join(mdir, f'{pid}.json')
+            if not os.path.isfile(meta_path):
+                self.get_logger().warn(
+                    f'INDEX_MISMATCH: {pid[:8]}... in index.json but '
+                    f'metadata/{pid}.json missing')
+                bad += 1
+                continue
+            try:
+                with open(meta_path) as f:
+                    md = json.load(f) or {}
+                mname = (md.get('name') or '').strip()
+            except Exception as e:
+                self.get_logger().warn(
+                    f'INDEX_MISMATCH: {pid[:8]}... metadata unreadable: {e}')
+                bad += 1
+                continue
+            if not mname:
+                self.get_logger().warn(
+                    f'INDEX_MISMATCH: {pid[:8]}... metadata has no '
+                    f'"name" field')
+                bad += 1
+                continue
+            if ename and mname != ename:
+                self.get_logger().warn(
+                    f'INDEX_MISMATCH: {pid[:8]}... index says '
+                    f'{ename!r} but metadata says {mname!r}')
+                bad += 1
+                continue
+            good += 1
+        self.get_logger().info(
+            f'index.json health: {good} OK, {bad} mismatches')
 
     def _match_by_templates(self, mask_crop, obb_size, color_crop=None):
         """Match a detection against all CAD-derived templates.
@@ -1891,6 +2030,11 @@ class DepthSegmentNode(Node):
         best_yaw    = 0.0
         best_orient = None
         best_bd     = (0.0, 0.0, 0.0)
+        # Per-part best score (RAW, pre-penalty). The step_only penalty
+        # applies after the loop so a part with images_only or
+        # step_and_images can take the win even when a step_only
+        # candidate has a higher raw outline score.
+        per_part_best = {}     # part_id -> (raw_score, name, yaw, orient, bd)
 
         for part_id, entry in self._templates.items():
             name = entry['name']
@@ -1965,25 +2109,114 @@ class DepthSegmentNode(Node):
                 score = (size_score * 0.40
                          + mask_iou  * 0.30
                          + edge_score * 0.30)
-                if score > best_score:
-                    best_score   = score
-                    best_part_id = part_id
-                    best_name    = name
-                    best_yaw     = t['yaw_deg']
-                    best_orient  = t['orient_label']
-                    best_bd      = (size_score, mask_iou, edge_score)
+                prev = per_part_best.get(part_id)
+                if prev is None or score > prev[0]:
+                    per_part_best[part_id] = (
+                        score, name, t['yaw_deg'], t['orient_label'],
+                        (size_score, mask_iou, edge_score))
+
+        if not per_part_best:
+            return None, None, 0.0, 0.0, None
+
+        # Apply the step_only penalty (Fix 3): outline geometry alone
+        # cannot reliably distinguish flat / rectangular parts. Parts
+        # that the operator has actually shown to the camera carry their
+        # own teach refs and win in `_match_by_teach`; parts known only
+        # by their STEP outline get knocked back so they're a last
+        # resort, not a default winner.
+        STEP_ONLY_PENALTY = 0.6
+        ranked = []  # (effective_score, raw_score, part_id, name, yaw, orient, bd, basis)
+        for pid, (raw_sc, nm, yw, orn, bd) in per_part_best.items():
+            basis = self._identification_basis_for(pid)
+            if basis == 'step_only':
+                eff = raw_sc * STEP_ONLY_PENALTY
+                self.get_logger().info(
+                    f'[STEP_ONLY] {nm} template match {raw_sc:.2f} '
+                    f'→ penalized to {eff:.2f} '
+                    f'(no teach images to confirm identity)',
+                    throttle_duration_sec=3.0)
+            else:
+                eff = raw_sc
+            ranked.append((eff, raw_sc, pid, nm, yw, orn, bd, basis))
+        ranked.sort(key=lambda r: -r[0])
+
+        best_eff, best_score, best_part_id, best_name, best_yaw, best_orient, best_bd, best_basis = ranked[0]
 
         if best_part_id is not None and best_score > 0.30:
             sz, iou, ed = best_bd
             self.get_logger().info(
                 f'TEMPLATE_MATCH: {best_name} score={best_score:.2f} '
+                f'(effective={best_eff:.2f}, basis={best_basis}) '
                 f'orient={best_orient} yaw={best_yaw:.0f}° '
                 f'size={sz:.2f} iou={iou:.2f} edges={ed:.2f}',
                 throttle_duration_sec=2.0)
-        if best_score < 0.55:
+        # Threshold compares against the EFFECTIVE (post-penalty) score
+        # so a step_only outline match has to be overwhelmingly strong
+        # (raw ≥ 0.55/0.6 ≈ 0.92) to win as a last resort.
+        if best_eff < 0.55:
             return None, None, 0.0, 0.0, None
-        return (best_name, best_part_id, round(best_score, 3),
+        # Live-library cross-check: even though _load_templates rejects
+        # orphans at startup, the parts library can shrink at runtime
+        # (operator deletes a part). Refuse to accept a template match
+        # against an id that's no longer in part_library.get_all_parts().
+        if not self._part_id_in_library(best_part_id):
+            self.get_logger().warn(
+                f'Skipping orphan template {best_part_id} '
+                f'(no metadata or no name field) — not in part library; '
+                f'rejecting match (score was {best_score:.2f}).',
+                throttle_duration_sec=10.0)
+            return None, None, 0.0, 0.0, None
+        return (best_name, best_part_id, round(best_eff, 3),
                 best_yaw, best_orient)
+
+    def _identification_basis_for(self, part_id):
+        """Resolve identification_basis with a short-lived cache so the
+        template matcher doesn't hit disk on every detection.
+        """
+        try:
+            now = time.monotonic()
+        except Exception:
+            now = 0.0
+        cache = getattr(self, '_ident_basis_cache', None)
+        if cache is None or (now - cache.get('ts', 0.0)) > 2.0:
+            try:
+                from object_detection.part_library import identification_basis
+                cache = {'ts': now, 'fn': identification_basis, 'memo': {}}
+            except Exception:
+                cache = {'ts': now, 'fn': None, 'memo': {}}
+            self._ident_basis_cache = cache
+        memo = cache.get('memo') or {}
+        if part_id in memo:
+            return memo[part_id]
+        fn = cache.get('fn')
+        try:
+            basis = fn(part_id) if fn else 'untrained'
+        except Exception:
+            basis = 'untrained'
+        memo[part_id] = basis
+        return basis
+
+    def _part_id_in_library(self, part_id):
+        """True iff `part_id` is currently in /opt/cobot/parts/index.json.
+
+        Cached for 2 s — get_all_parts() reads a small file, but the
+        template matcher gets called per detection per frame, so we
+        avoid the disk hit when it doesn't matter.
+        """
+        try:
+            now = time.monotonic()
+        except Exception:
+            now = 0.0
+        cache = getattr(self, '_part_id_cache', None)
+        if cache is None or (now - cache.get('ts', 0.0)) > 2.0:
+            try:
+                from object_detection.part_library import get_all_parts
+                ids = {p.get('id') for p in (get_all_parts() or []) if p.get('id')}
+            except Exception:
+                ids = set()
+            cache = {'ts': now, 'ids': ids}
+            self._part_id_cache = cache
+        return part_id in cache.get('ids', set())
 
     def _match_by_teach(self, depth_crop, mask_crop, obb_size, color_crop=None):
         """Scale-aware teach matching.
@@ -3797,51 +4030,39 @@ class DepthSegmentNode(Node):
 
         from scipy.ndimage import zoom as _zoom
 
-        # Default orientation weights. The operator can override these
-        # per-part via /api/parts/<id>/orient_weights — useful when a
-        # part is uniformly silver (lean on depth+features) vs visually
-        # rich (lean on colour). 'feat' = Harris keypoint patches +
-        # LBP histogram, the strongest discriminator for metal parts
-        # where colour signals collapse. See _load_orient_weights.
+        # June 5 simple two-signal blend: NCC carries the silhouette /
+        # texture match, hist carries the surface colour. Spatial /
+        # depth-geometry / Harris+LBP / CAD-face / nearest-centroid
+        # were added between Jun 5–9, regressed accuracy on flat and
+        # shiny parts (signal noise diluted the working signals), and
+        # have been removed from the matching path. The dead helpers
+        # remain in the file because the teach save flow still computes
+        # the per-ref Harris/LBP arrays during ref capture — removing
+        # them would touch the teach wizard storage format, which is
+        # out of scope here.
         default_weights = {
-            'ncc':     0.20,
-            'hist':    0.10,
-            'spatial': 0.10,
-            'depth':   0.25,
-            'feat':    0.35,
+            'ncc':  0.70,
+            'hist': 0.30,
         }
-
-        # BUG 3 fix: detection features (Harris keypoints + LBP) must
-        # be extracted at the SAME physical scale as the ref they're
-        # being compared against, otherwise patch descriptors are
-        # geometrically incomparable and the Lowe ratio test returns
-        # zero matches → feat ~ 0.5 for every ref (35% of the score
-        # budget wasted on neutral noise). Extraction moved INSIDE
-        # the per-ref loop where det_scaled is already computed for
-        # NCC at the ref's resolution.
 
         best_score = 0.0
         best_id    = None
         best_name  = 'unknown'
 
-        # Classifier state — initialised once so the post-loop return
-        # block can safely reference these even when the loop is empty
-        # or no part_id passed the size gate.
-        clf            = None
-        clf_score      = 0.5     # neutral fallback
-        clf_is_pick    = None
-        clf_confidence = 0.0
+        # Classifier state was removed in the June 5 revert. The
+        # _orient_classifiers dict still loads on startup (the helper
+        # stays in place so teach save doesn't break) but the matcher
+        # no longer consults it.
 
         # ── SIZE_GATE pre-pass ────────────────────────────────────────
-        # Tolerance: each dim and the aspect ratio must be within 25%
-        # of the part's CAD dimensions (i.e. min/max ratio ≥ 0.75).
-        # Tighter than the older 0.50 floor; still looser than D435i
-        # depth noise on a tabletop part at 0.35 m. We log a one-line
-        # summary of every candidate (pass/fail + dimension error) so
-        # the operator can see WHY a part was rejected without rerunning
-        # the matcher. Throttled to 2 s so the log stays readable when
-        # detections fire every frame.
-        SIZE_GATE_RATIO_FLOOR = 0.75
+        # Tolerance: each dim and the aspect ratio must be within 35%
+        # of the part's CAD dimensions (i.e. min/max ratio ≥ 0.65).
+        # The June 9 tightening to 0.75 (25% tol) combined with the
+        # D435i's ±30% OBB measurement noise rejected correct parts
+        # because the noise exceeded the gate width. 0.65 is the
+        # compromise: still tight enough to separate genuinely
+        # different sizes, loose enough to absorb sensor noise.
+        SIZE_GATE_RATIO_FLOOR = 0.65
         gate_summary  = []
         gate_passers  = []     # [(part_id, avg_err)] for parts with STEP + taught
         for _pid, _sd in step_dims.items():
@@ -3866,8 +4087,8 @@ class DepthSegmentNode(Node):
                 gate_passers.append((_pid, _avg_err))
         if gate_summary:
             self.get_logger().info(
-                f'SIZE_GATE: det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm] '
-                f'candidates: ' + ', '.join(gate_summary),
+                f'[SIZE_GATE] det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm] '
+                f'tol=35%: candidates ' + ', '.join(gate_summary),
                 throttle_duration_sec=2.0)
         gate_passer_ids = {p[0] for p in gate_passers}
 
@@ -3894,28 +4115,13 @@ class DepthSegmentNode(Node):
             else:
                 size_score = 0.5  # no STEP record — neutral
 
-            # ── Nearest-centroid orientation classifier ────────────────
-            # If a trained classifier exists for this part, classify
-            # the live detection against the two class centroids. This
-            # supplements per-ref group scoring with a single decision
-            # that's seen ALL training data at once and uses ALL signals
-            # (colour + interior edge layout + brightness layout).
-            clf = self._orient_classifiers.get(part_id)
-            clf_score = 0.5
-            clf_is_pick = None
-            clf_confidence = 0.0
-            if (clf is not None
-                    and color_crop is not None
-                    and mask_crop is not None
-                    and mask_crop.any()):
-                _fv = self._extract_orientation_fv(
-                    color_crop, mask_crop, depth_crop)
-                _d_pick   = float(np.linalg.norm(_fv - clf['pick_c']))
-                _d_nopick = float(np.linalg.norm(_fv - clf['nopick_c']))
-                _total_d  = _d_pick + _d_nopick + 1e-9
-                clf_is_pick    = (_d_pick < _d_nopick)
-                clf_confidence = float(abs(_d_nopick - _d_pick) / _total_d)
-                clf_score      = clf_confidence
+            # Nearest-centroid orientation classifier was removed in
+            # the June 5 revert — it overrode the group-scoring decision
+            # using noisy depth + colour-layout features that misfired
+            # on flat / shiny parts. Orientation is now decided purely
+            # by group scoring (NCC + hist mean across each orientation
+            # group), with the operator seeing the gap-confidence in
+            # the ORIENT log line below.
 
             # ── Orientation-aware ref matching ─────────────────────────
             #
@@ -3953,9 +4159,6 @@ class DepthSegmentNode(Node):
             for gkey, grp_refs in groups.items():
                 nccs     = []
                 hists    = []
-                spatials = []
-                depths   = []
-                features = []
                 best_in_group_ncc = 0.0
                 best_in_group_ref = None
 
@@ -4009,205 +4212,81 @@ class DepthSegmentNode(Node):
                             best_in_group_ref = ref
 
                     # Colour-histogram tie-breaker (masked-pixel only).
+                    # Spatial colour grid, depth geometry, and Harris+
+                    # LBP feature signals were removed in the June 5
+                    # revert — they were noisy on flat/shiny parts and
+                    # diluted the working NCC + hist signals.
                     ref_color = ref.get('color')
                     ref_mask  = ref.get('mask')
                     if ref_color is not None and color_crop is not None:
                         hists.append(self._color_hist_corr(
                             color_crop, ref_color,
                             mask1=mask_crop, mask2=ref_mask))
-                        # 4x4 spatial colour grid — separates two faces
-                        # of a key fob that score identically on outline
-                        # + overall histogram.
-                        spatials.append(self._spatial_color_score(
-                            color_crop, mask_crop, ref_color, ref_mask))
-
-                    # ── Signal 4: depth geometry ─────────────────────
-                    # The discriminating signal for uniformly-coloured
-                    # metal parts. Pre-scale ref to the per-ref
-                    # physical resolution; _depth_geometry_score
-                    # re-scales to match det_depth.shape internally
-                    # if the shapes still differ.
-                    ref_depth_arr = ref.get('depth')
-                    if depth_crop is not None and ref_depth_arr is not None:
-                        try:
-                            zh = target_h / max(ref_depth_arr.shape[0], 1)
-                            zw = target_w / max(ref_depth_arr.shape[1], 1)
-                            ref_depth_sc = _zoom(
-                                ref_depth_arr.astype(np.float32),
-                                (zh, zw), order=1)
-                            ref_mask_sc = (_zoom(
-                                (ref_mask if ref_mask is not None
-                                 else np.zeros(ref_depth_arr.shape,
-                                               dtype=bool))
-                                .astype(np.float32),
-                                (zh, zw), order=0) > 0.5)
-                        except Exception:
-                            ref_depth_sc = None
-                            ref_mask_sc  = None
-                        if ref_depth_sc is not None:
-                            depths.append(self._depth_geometry_score(
-                                depth_crop, mask_crop,
-                                ref_depth_sc, ref_mask_sc))
-
-                    # ── Signal 5: Harris keypoints + LBP histogram ───
-                    # The strongest discriminator on metal parts whose
-                    # two faces share colour but differ in surface
-                    # micro-features (stamped text, holes, chamfers).
-                    #
-                    # Extract detection features at THIS ref's physical
-                    # resolution (det_scaled was already produced for
-                    # the NCC step above). Native-scale extraction —
-                    # what the previous code did pre-loop — produced
-                    # patch descriptors that aren't comparable to the
-                    # ref's stored ones, so Lowe ratio always failed.
-                    _ref_lbp = ref.get('lbp_hist')
-                    if _ref_lbp is None:
-                        _ref_lbp = np.zeros(64, dtype=np.float32)
-                    _ref_kp = ref.get('kp_descs') or []
-                    if det_scaled is not None and mask_crop is not None:
-                        try:
-                            _det_mask_sc = (_zoom(
-                                mask_crop.astype(np.float32),
-                                (target_h / crop_h, target_w / crop_w),
-                                order=0) > 0.5)
-                            _det_kp_sc, _det_lbp_sc = self._extract_features(
-                                det_scaled, _det_mask_sc)
-                        except Exception:
-                            _det_kp_sc  = []
-                            _det_lbp_sc = np.zeros(64, dtype=np.float32)
-                    else:
-                        _det_kp_sc  = []
-                        _det_lbp_sc = np.zeros(64, dtype=np.float32)
-                    features.append(self._match_features(
-                        _det_kp_sc, _det_lbp_sc, _ref_kp, _ref_lbp))
 
                 if not nccs:
                     continue
-                avg_ncc     = float(np.mean(nccs))
-                avg_hist    = float(np.mean(hists))    if hists    else 0.5
-                avg_spatial = float(np.mean(spatials)) if spatials else 0.5
-                avg_depth   = float(np.mean(depths))   if depths   else 0.5
-                avg_feat    = float(np.mean(features)) if features else 0.5
-                # Five-signal score. Weights per-part overridable.
-                # Defaults: features (0.35) lead, depth (0.25) second,
-                # NCC (0.20), hist (0.10), spatial colour (0.10).
-                group_score = (avg_ncc     * weights['ncc']
-                               + avg_hist    * weights['hist']
-                               + avg_spatial * weights['spatial']
-                               + avg_depth   * weights['depth']
-                               + avg_feat    * weights['feat'])
+                avg_ncc  = float(np.mean(nccs))
+                avg_hist = float(np.mean(hists)) if hists else 0.5
+                # Two-signal score: NCC carries the silhouette / texture
+                # match, hist carries the surface colour. Weights are
+                # per-part overridable but default to 0.70 / 0.30.
+                group_score = (avg_ncc  * weights['ncc']
+                               + avg_hist * weights['hist'])
 
                 group_dbg.append(
-                    (gkey, avg_ncc, avg_hist, avg_spatial, avg_depth,
-                     avg_feat, group_score, len(nccs)))
+                    (gkey, avg_ncc, avg_hist, group_score, len(nccs)))
 
                 if group_score > best_group_score:
                     best_group_score = group_score
                     best_group_key   = gkey
-                    best_group_meta  = (avg_ncc, avg_hist, avg_spatial,
-                                        avg_depth, avg_feat,
+                    best_group_meta  = (avg_ncc, avg_hist,
                                         len(nccs), best_in_group_ref)
 
             if best_group_meta is None:
                 continue
 
-            (best_ref_ncc, best_ref_hist, best_ref_spatial,
-             best_ref_depth, best_ref_feat,
+            (best_ref_ncc, best_ref_hist,
              n_refs, best_ref_for_part) = best_group_meta
-            # ── CAD feature anchor verification ───────────────────────
-            # The winning group says is_pickable=True/False. Map that
-            # plus the operator's orientation_label to a CAD face name
-            # (top / bottom / left / right / front / back) and verify
-            # the live detection actually shows the holes + bosses the
-            # CAD model says belong on that face. This converts a soft
-            # texture similarity into a hard geometric check.
-            #
-            #   is_pickable=True  → 'top' (default)
-            #   is_pickable=False → 'bottom' (flipped)
-            #   on_side variants  → matched off the orientation_label
-            #                       when it contains 'right'/'left'/
-            #                       'front'/'back'
-            cad_score = 0.5   # neutral default — no penalty when CAD
-                              # has nothing to verify on this face
-            part_face_features = self._cad_face_features.get(part_id)
-            if part_face_features and best_group_key is not None:
-                is_pick_winner = bool(best_group_key[0])
-                orient_lbl_winner = str(best_group_key[3] or '').lower()
-                face_name = None
-                for candidate in ['top', 'bottom', 'right', 'left',
-                                  'front', 'back']:
-                    if candidate in orient_lbl_winner:
-                        face_name = candidate
-                        break
-                if face_name is None:
-                    face_name = 'top' if is_pick_winner else 'bottom'
-                cad_face = part_face_features.get(face_name, {})
-                if cad_face.get('has_features', False):
-                    cad_score = self._match_cad_features(
-                        cad_face, color_crop, mask_crop)
-                # If CAD has no features for this face (flat surface),
-                # cad_score stays 0.5 — neutral, no penalty.
+            # CAD face anchor verification was removed in the June 5
+            # revert — CAD renders didn't match real camera images, so
+            # the geometric check it claimed to add was unreliable and
+            # the cad_score collapsed to its neutral 0.5 most of the
+            # time anyway.
 
-            # Four-branch blend so EVERY available signal — size,
-            # group scoring, CAD features, and classifier confidence —
-            # contributes to whether the match passes threshold. The
-            # classifier used to only override is_pickable AFTER the
-            # gate, meaning a 90%-confident clf couldn't help an
-            # otherwise borderline match clear 0.48. Branches:
-            #
-            #   CAD + clf  : size 0.25 + group 0.30 + cad 0.25 + clf 0.20
-            #   CAD only   : size 0.30 + group 0.40 + cad 0.30
-            #   clf only   : size 0.35 + group 0.40 + clf 0.25
-            #   legacy     : size 0.40 + group 0.60   (no CAD, no clf —
-            #                camera-only parts before this codepath)
-            if part_face_features and clf is not None:
-                combined = (size_score        * 0.25
-                            + best_group_score * 0.30
-                            + cad_score        * 0.25
-                            + clf_score        * 0.20)
-            elif part_face_features:
-                combined = (size_score        * 0.30
-                            + best_group_score * 0.40
-                            + cad_score        * 0.30)
-            elif clf is not None:
-                combined = (size_score        * 0.35
-                            + best_group_score * 0.40
-                            + clf_score        * 0.25)
-            else:
-                combined = size_score * 0.40 + best_group_score * 0.60
+            # Simple two-branch combined score: size gate + group
+            # scoring, exactly the June 5 formulation.
+            #   size 0.40 + group 0.60
+            combined = size_score * 0.40 + best_group_score * 0.60
 
             # Per-group debug log so the operator can see WHY one
             # orientation won over another. Sorted by score desc.
-            # Tuple layout: (gkey, ncc, hist, spat, depth, feat,
-            #                score, n_refs).
+            # Tuple layout: (gkey, ncc, hist, score, n_refs).
             try:
-                group_dbg.sort(key=lambda x: -x[6])
-                gap = ((group_dbg[0][6] - group_dbg[1][6])
+                group_dbg.sort(key=lambda x: -x[3])
+                gap = ((group_dbg[0][3] - group_dbg[1][3])
                        if len(group_dbg) >= 2 else float('nan'))
-                summary = ' | '.join(
-                    "{}'{}' ncc={:.2f} hist={:.2f} sp={:.2f} dep={:.2f} feat={:.2f} score={:.2f} ({}r)".format(
-                        'pick' if k[0] else 'NOpick', k[3] or '?',
-                        a, h, sp, dp, ft, sc, n
-                    )
-                    for (k, a, h, sp, dp, ft, sc, n) in group_dbg
-                )
-                # Classifier verdict appended so the operator can see
-                # whether it agreed with the group-scoring winner.
-                # "NA" when there's no trained classifier for this part.
-                if clf_is_pick is None:
-                    _clf_str = 'NA'
-                elif clf_is_pick:
-                    _clf_str = 'PICK'
+                # ORIENT confidence buckets per spec Part E:
+                #   gap > 0.08 → HIGH, 0.04–0.08 → MEDIUM, < 0.04 → LOW.
+                if not (gap == gap):  # NaN
+                    _orient_conf = 'SINGLE'
+                elif gap > 0.08:
+                    _orient_conf = 'HIGH'
+                elif gap >= 0.04:
+                    _orient_conf = 'MEDIUM'
                 else:
-                    _clf_str = 'NOPICK'
+                    _orient_conf = 'LOW'
+                summary = ' | '.join(
+                    "{}'{}': ncc={:.2f} hist={:.2f} score={:.2f} ({}r)".format(
+                        'pickable' if k[0] else 'NOpick', k[3] or '?',
+                        a, h, sc, n
+                    )
+                    for (k, a, h, sc, n) in group_dbg
+                )
                 self.get_logger().info(
-                    f'ORIENT_MATCH {part_id[:8]} det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm] '
-                    f'size={size_score:.2f} → '
-                    f'winner={"PICK" if best_group_key[0] else "NOpick"}/'
-                    f'"{best_group_key[3] or "?"}" '
-                    f'gap={gap:.2f} | {summary} '
-                    f'clf_conf={clf_confidence:.2f} clf={_clf_str} '
-                    f'cad={cad_score:.2f}',
+                    f'[ORIENT] {self._id_to_name(part_id)}: '
+                    f'winner={"pickable" if best_group_key[0] else "NOpick"}/'
+                    f'"{best_group_key[3] or "?"}" gap={gap:.2f} '
+                    f'{_orient_conf} | {summary}',
                     throttle_duration_sec=3.0)
             except Exception:
                 pass
@@ -4224,9 +4303,6 @@ class DepthSegmentNode(Node):
                     'winner_is_defect':    bool(best_group_key[1]),
                     'ncc':                 round(float(best_ref_ncc), 3),
                     'hist':                round(float(best_ref_hist), 3),
-                    'spatial':             round(float(best_ref_spatial), 3),
-                    'depth':               round(float(best_ref_depth), 3),
-                    'feat':                round(float(best_ref_feat), 3),
                     'weights':             {k: round(float(v), 3)
                                             for k, v in weights.items()},
                     'group_score':         round(float(best_group_score), 3),
@@ -4234,7 +4310,7 @@ class DepthSegmentNode(Node):
                     'combined':            round(float(combined), 3),
                     'gap':                 (None
                                             if not (len(group_dbg) >= 2)
-                                            else round(float(group_dbg[0][6] - group_dbg[1][6]), 3)),
+                                            else round(float(group_dbg[0][3] - group_dbg[1][3]), 3)),
                     'n_refs_in_group':     int(n_refs),
                     'ts':                  _time.time(),
                 }
@@ -4268,7 +4344,7 @@ class DepthSegmentNode(Node):
                 best_name = self._id_to_name(part_id)
 
         # ── SIZE_GATE_BEST_MATCH override ─────────────────────────────
-        # When multiple candidate parts cleared the 25% size gate, the
+        # When multiple candidate parts cleared the 35% size gate, the
         # identity decision is the one with LOWEST total dimension
         # error — NOT the matcher's combined-score winner (which is
         # noise-dominated for visually similar parts under variable
@@ -4299,16 +4375,18 @@ class DepthSegmentNode(Node):
         # if the teach score is below threshold so CAD-only parts still
         # match (template path returns the legacy pickable/flipped/on_side
         # orientation string).
-        # Threshold re-calibrated from 0.60 (set under the original
-        # size*0.50 + ncc*0.50 formula) to 0.48 — the current
-        # five-signal blend (size + group + cad + clf) typically
-        # peaks around 0.63 for a clean match, leaving only ~3 pts
-        # of head-room above the old gate. Any lighting/angle blip
-        # dropped well-matched parts under threshold and silently
-        # produced 'unknown'. 0.48 keeps the same false-positive
-        # rejection while passing realistic clean matches.
+        # Threshold 0.48 — calibrated for the simple two-signal blend
+        # restored in the June 5 revert. Clean matches typically peak
+        # around 0.60-0.70 (NCC ≈ 0.7 on a well-lit part + hist ≈ 0.6
+        # → group_score ≈ 0.67; size_score on a clean STEP gate pass
+        # ≈ 0.85; combined ≈ 0.40·0.85 + 0.60·0.67 ≈ 0.74). Bad matches
+        # sit well below 0.48 because the size gate now rejects them
+        # before this combined number is computed.
+        FINAL = self.get_logger()
+        teach_basis = (self._identification_basis_for(best_id)
+                       if best_id is not None else 'untrained')
         if best_score >= 0.48 and best_id is not None:
-            info = {'source': 'teach'}
+            info = {'source': 'teach', 'identification_basis': teach_basis}
             if best_ref_meta is not None:
                 info.update({
                     'is_pickable':       bool(best_ref_meta.get('is_pickable', True)),
@@ -4316,36 +4394,56 @@ class DepthSegmentNode(Node):
                     'orientation_label': str(best_ref_meta.get('orientation_label') or ''),
                     'defect_name':       str(best_ref_meta.get('defect_name') or ''),
                 })
-            # If the classifier ran with high confidence on the
-            # winning iteration, trust it over the group-scoring
-            # ref's metadata — the classifier saw all training
-            # examples while the group winner is just one ref.
-            # Note: clf, clf_confidence, clf_is_pick, part_id all
-            # carry their LAST loop iteration values here, so the
-            # best_id == part_id guard only fires when the winner
-            # happened to be processed last in the loop.
-            if (clf is not None
-                    and clf_confidence >= 0.30
-                    and best_id == part_id):
-                info['is_pickable']    = bool(clf_is_pick)
-                info['clf_confidence'] = round(clf_confidence, 3)
-            # BUG 1 fix: previously this returned orient='' for every
-            # teach match, so _match_parts left position_correct /
-            # surface_ok / position_status unset and the executor +
-            # task planner couldn't tell pickable from non-pickable.
             # Derive the legacy orient string from the winning ref's
-            # is_pickable so those downstream fields populate.
+            # is_pickable so downstream code (executor, dashboard) sees
+            # a non-empty orientation.
             derived_orient = ('pickable'
                               if info.get('is_pickable', True)
                               else 'flipped')
+            FINAL.info(
+                f'[DECISION] det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm]: '
+                f'teach winner = {best_name} ({best_score:.2f}, '
+                f'basis={teach_basis}) — clears 0.48, template path skipped',
+                throttle_duration_sec=3.0)
+            FINAL.info(
+                f'[FINAL] det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm]: '
+                f'{best_name} via teach ({best_score:.2f}) '
+                f'orient={derived_orient}',
+                throttle_duration_sec=3.0)
             return best_name, best_id, round(best_score, 3), derived_orient, info
 
         n, pid, s, _y, o = self._match_by_templates(
             mask_crop, obb_size, color_crop)
+        template_basis = (self._identification_basis_for(pid)
+                          if pid is not None else None)
         if n and s >= 0.55:
-            info = ({'is_pickable': (o == 'pickable'), 'source': 'template'}
-                    if o else {'source': 'template'})
+            info = ({'is_pickable': (o == 'pickable'),
+                     'source': 'template',
+                     'identification_basis': template_basis}
+                    if o else {'source': 'template',
+                               'identification_basis': template_basis})
+            FINAL.info(
+                f'[DECISION] det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm]: '
+                f'Path1 (STEP) teach best {best_score:.2f} (basis='
+                f'{teach_basis or "n/a"}), Path2 (template) {n}={s:.2f} '
+                f'basis={template_basis} → template wins (no teach match '
+                f'cleared 0.48)',
+                throttle_duration_sec=3.0)
+            FINAL.info(
+                f'[FINAL] det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm]: '
+                f'{n} via template ({s:.2f}) teach best {best_score:.2f}',
+                throttle_duration_sec=3.0)
             return n, pid, s, (o or ''), info
+        # Honest UNKNOWN — better than a forced wrong match.
+        FINAL.info(
+            f'[DECISION] det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm]: '
+            f'no path cleared threshold (teach best {best_score:.2f}, '
+            f'template best {s if n else 0.0:.2f}) → UNKNOWN',
+            throttle_duration_sec=3.0)
+        FINAL.info(
+            f'[FINAL] det=[{det_s[0]*100:.1f}x{det_s[1]*100:.1f}cm]: '
+            f'UNKNOWN (teach best {best_score:.2f}, no template above 0.55)',
+            throttle_duration_sec=3.0)
         return 'unknown', None, 0.0, '', empty_info
 
     def _match_parts(self, objects):

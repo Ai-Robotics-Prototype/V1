@@ -168,3 +168,64 @@ def match_detection_to_part(
     if best_part is None:
         return None, None
     return best_part, round(best_score, 4)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Teach-image inventory
+#
+# Per-part teach refs live at /opt/cobot/parts/teach/<part_id>/ref_NNN.npz
+# (with matching ref_NNN.png screenshots). The "identification basis"
+# distinguishes parts the operator has actually shown to the camera from
+# parts that only have a STEP model — the latter can only match by
+# outline, which is documented to misfire on flat / rectangular parts.
+# ─────────────────────────────────────────────────────────────────────
+
+_TEACH_DIR = os.path.join(LIBRARY_DIR, 'teach')
+
+
+def get_teach_image_count(part_id: str) -> int:
+    """Number of teach reference .npz files for the given part."""
+    if not part_id:
+        return 0
+    d = os.path.join(_TEACH_DIR, str(part_id))
+    if not os.path.isdir(d):
+        return 0
+    try:
+        return sum(1 for f in os.listdir(d)
+                   if f.startswith('ref_') and f.endswith('.npz'))
+    except OSError:
+        return 0
+
+
+def has_teach_images(part_id: str) -> bool:
+    """True iff at least one teach ref exists on disk."""
+    return get_teach_image_count(part_id) >= 1
+
+
+def has_step_file(part_id: str) -> bool:
+    """True iff the part has a STEP source on disk (per its metadata)."""
+    meta = get_part(part_id)
+    if not meta:
+        return False
+    src = (meta.get('source_file') or '').strip()
+    if not src:
+        return False
+    return os.path.isfile(os.path.join(LIBRARY_DIR, 'step', src))
+
+
+def identification_basis(part_id: str) -> str:
+    """Returns one of:
+        step_and_images — STEP file present AND ≥1 teach ref (best)
+        images_only     — taught from camera, no STEP
+        step_only       — STEP file present, NO teach refs (outline only)
+        untrained       — neither
+    """
+    has_step = has_step_file(part_id)
+    has_imgs = has_teach_images(part_id)
+    if has_step and has_imgs:
+        return 'step_and_images'
+    if has_imgs:
+        return 'images_only'
+    if has_step:
+        return 'step_only'
+    return 'untrained'

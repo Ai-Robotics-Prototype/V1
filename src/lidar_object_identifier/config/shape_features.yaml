@@ -1,0 +1,19 @@
+# Which shape descriptors participate in matching, and their relative weights.
+# Keys must match attribute names on the cluster feature dict produced by
+# shape_analyzer.analyze().
+features:
+  sphericity:
+    weight: 1.0
+    tolerance: 0.25
+  flatness:
+    weight: 1.0
+    tolerance: 0.25
+  elongation:
+    weight: 1.2
+    tolerance: 0.25
+  compactness:
+    weight: 0.8
+    tolerance: 0.30
+  solidity:
+    weight: 0.6
+    tolerance: 0.20

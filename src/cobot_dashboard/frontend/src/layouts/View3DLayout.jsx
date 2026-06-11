@@ -1,10 +1,69 @@
-import { useRef } from 'react'
+import { useRef, useState } from 'react'
 import { useStore } from '../store/useStore'
 import ArmViewer3D from '../components/ArmViewer3D'
+import LidarObjectsOverlay from '../components/LidarObjectsOverlay'
 
 const PRESETS = ['Front', 'Side', 'Top', 'Iso']
 
-function LeftPanel({ armRef }) {
+function ToggleRow({ label, checked, onChange }) {
+  return (
+    <label style={{
+      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      fontSize: 11, color: 'var(--text-secondary)', cursor: 'pointer',
+    }}>
+      <span>{label}</span>
+      <input type="checkbox" checked={checked}
+             onChange={(e) => onChange(e.target.checked)} />
+    </label>
+  )
+}
+
+function LidarLayerSection({ controls, setControls, lastPick }) {
+  return (
+    <div>
+      <div style={{
+        fontSize: 9, textTransform: 'uppercase', color: 'var(--text-muted)',
+        letterSpacing: '0.06em', marginBottom: 6,
+      }}>
+        Identified Objects (LiDAR)
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <ToggleRow label="Show Identified Objects"
+                   checked={controls.show}
+                   onChange={(v) => setControls({ ...controls, show: v })} />
+        <ToggleRow label="Show Tentative"
+                   checked={controls.tentative}
+                   onChange={(v) => setControls({ ...controls, tentative: v })} />
+        <ToggleRow label="Show Unknown"
+                   checked={controls.unknown}
+                   onChange={(v) => setControls({ ...controls, unknown: v })} />
+        <ToggleRow label="Show Confidence Labels"
+                   checked={controls.labels}
+                   onChange={(v) => setControls({ ...controls, labels: v })} />
+        <ToggleRow label="Group by Part Type"
+                   checked={controls.groupByPart}
+                   onChange={(v) => setControls({ ...controls, groupByPart: v })} />
+      </div>
+      {lastPick && (
+        <div style={{
+          marginTop: 8, padding: '6px 8px', borderRadius: 4,
+          background: 'var(--bg-surface)', border: '1px solid var(--border)',
+          fontSize: 10, color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)',
+        }}>
+          <div style={{ color: 'var(--text-primary)', fontWeight: 600 }}>
+            {lastPick.identified_name || 'unknown'}
+          </div>
+          <div>Confidence: {Math.round(lastPick.confidence * 100)}%</div>
+          <div>Size {Math.round((lastPick.size_match_score || 0) * 100)}% ·
+            Shape {Math.round((lastPick.shape_match_score || 0) * 100)}%</div>
+          <div>Frames observed: {lastPick.frames_observed}</div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function LeftPanel({ armRef, lidarControls, setLidarControls, lastPick }) {
   const joints  = useStore((s) => s.joints)
   const gripper = useStore((s) => s.gripper)
   const task    = useStore((s) => s.task)
@@ -156,18 +215,42 @@ function LeftPanel({ armRef }) {
           </span>
         </div>
       </div>
+
+      <LidarLayerSection
+        controls={lidarControls}
+        setControls={setLidarControls}
+        lastPick={lastPick}
+      />
     </div>
   )
 }
 
 export default function View3DLayout() {
   const armRef = useRef(null)
+  const [lidarControls, setLidarControls] = useState({
+    show: true, tentative: true, unknown: false,
+    labels: true, groupByPart: false,
+  })
+  const [lastPick, setLastPick] = useState(null)
 
   return (
     <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
-      <LeftPanel armRef={armRef} />
+      <LeftPanel armRef={armRef}
+                 lidarControls={lidarControls}
+                 setLidarControls={setLidarControls}
+                 lastPick={lastPick} />
       <div style={{ flex: 1, overflow: 'hidden' }}>
-        <ArmViewer3D ref={armRef} />
+        <ArmViewer3D ref={armRef}>
+          {lidarControls.show && (
+            <LidarObjectsOverlay
+              showTentative={lidarControls.tentative}
+              showUnknown={lidarControls.unknown}
+              showLabels={lidarControls.labels}
+              groupByPartType={lidarControls.groupByPart}
+              onPick={setLastPick}
+            />
+          )}
+        </ArmViewer3D>
       </div>
     </div>
   )

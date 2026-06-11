@@ -1,0 +1,42 @@
+profiles:
+  Conservative:
+    description: |
+      Slow and smooth. Maximum safety. Use during teaching and initial
+      program verification.
+    velocity_scale_pct: 40
+    acceleration_scale_pct: 30
+    jerk_scale_pct: 25
+    blend_radius_mm: 5
+    toppra_enabled: false
+    moveit_enabled: false
+    smoothing_method: spline
+    approach_speed_pct: 30
+    retreat_speed_pct: 40
+
+  Balanced:
+    description: |
+      Default profile. Good balance of cycle time and smoothness for
+      production work.
+    velocity_scale_pct: 70
+    acceleration_scale_pct: 60
+    jerk_scale_pct: 50
+    blend_radius_mm: 15
+    toppra_enabled: true
+    moveit_enabled: false
+    smoothing_method: toppra
+    approach_speed_pct: 40
+    retreat_speed_pct: 60
+
+  Aggressive:
+    description: |
+      Maximum cycle-time optimization. Use for high-volume production
+      after verifying behavior at Balanced.
+    velocity_scale_pct: 95
+    acceleration_scale_pct: 90
+    jerk_scale_pct: 80
+    blend_radius_mm: 25
+    toppra_enabled: true
+    moveit_enabled: true
+    smoothing_method: toppra
+    approach_speed_pct: 50
+    retreat_speed_pct: 80

@@ -1,0 +1,21 @@
+[Unit]
+Description=RoboAi motion optimization (TOPP-RA + MoveIt2 bridge)
+After=network-online.target roboai-dashboard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cobot
+Group=cobot
+WorkingDirectory=/home/teddy/cobot_ws
+Environment=ROS_DOMAIN_ID=0
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && \
+    source /home/teddy/cobot_ws/install/setup.bash && \
+    ros2 launch motion_optimization motion_optimization.launch.py'
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+# Conservative defaults for Estun S10-140 ECO until manufacturer datasheet
+# values are confirmed. Operators may override via the Configure tab.
+joint_velocity_limits_dps:      [180, 180, 180, 180, 180, 180]
+joint_acceleration_limits_dps2: [400, 400, 400, 400, 400, 400]
+joint_jerk_limits_dps3:         [4000, 4000, 4000, 4000, 4000, 4000]
+tcp_linear_velocity_mps:        1.5
+tcp_linear_acceleration_mps2:   5.0
+tcp_angular_velocity_dps:       180.0

@@ -1,0 +1,6 @@
+std_msgs/Header header
+float32 avg_confidence
+float32 identification_rate_per_sec
+int32 known_parts_in_library
+int32 unique_objects_today
+int32 false_positives_filtered

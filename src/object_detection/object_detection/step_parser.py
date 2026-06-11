@@ -423,6 +423,298 @@ def extract_face_features(mesh, img_size: int = 128,
     return result
 
 
+# ── New architecture: STEP as a feature dictionary, not an identifier ──
+#
+# These helpers take the per-face hole/boss extraction from
+# `extract_face_features` above and convert it into:
+#   1. A flat list of geometric features with stable IDs and a
+#      distinctiveness score.
+#   2. Per-orientation feature signatures (which features are visible from
+#      each viewpoint) so the live matcher can BOOST orientation
+#      confidence — but NOT identity.
+#
+# The hard rule is documented in src/object_detection/CHANGES.md: STEP
+# files contribute only to orientation; identity must come from taught
+# camera images + size. These helpers exist so the dashboard and
+# orientation booster have a clean source of truth.
+
+FACE_NAMES = ('top', 'bottom', 'right', 'left', 'front', 'back')
+
+# Outward face normals for the canonical orientations. Mirrors the
+# rotations used in `extract_face_features` so a hole that appears on
+# the "+Z" face when the part is in its native pose maps to the 'top'
+# orientation here.
+FACE_NORMALS = {
+    'top':    (0.0,  0.0,  1.0),
+    'bottom': (0.0,  0.0, -1.0),
+    'right':  (1.0,  0.0,  0.0),
+    'left':  (-1.0,  0.0,  0.0),
+    'front':  (0.0,  1.0,  0.0),
+    'back':   (0.0, -1.0,  0.0),
+}
+
+OPPOSITE_FACE = {
+    'top': 'bottom', 'bottom': 'top',
+    'right': 'left', 'left': 'right',
+    'front': 'back', 'back': 'front',
+}
+
+
+def _detect_slots_on_face(face_dict: dict) -> list:
+    """Heuristic slot detection from the hole-cluster output of
+    extract_face_features.
+
+    A "slot" here is a cluster of two or more holes that are colinear
+    and similar in size — typical of CAD elongated voids that
+    `extract_face_features` sees as a string of connected hole pixels.
+    Rather than re-running the height-map extraction (which would need
+    the mesh), we approximate slots from the existing hole record.
+
+    Returns a list of slot dicts. May be empty.
+    """
+    holes = list(face_dict.get('holes') or [])
+    if len(holes) < 2:
+        return []
+    # Bucket holes by (rounded) y position, then look for runs along x
+    # (and the symmetric case). This catches the common "row of holes
+    # along the front edge" pattern that operators teach as one slot
+    # but extract_face_features splits into N holes.
+    slots = []
+    sorted_x = sorted(holes, key=lambda h: h['center'][0])
+    run = [sorted_x[0]]
+    for h in sorted_x[1:]:
+        prev = run[-1]
+        # Same row if y within 0.03 of normalized coord (≈3 mm on a
+        # 100 mm face) and the x gap is < 4× hole radius.
+        same_y = abs(h['center'][1] - prev['center'][1]) < 0.03
+        gap = h['center'][0] - prev['center'][0]
+        close = gap < max(0.06, 4.0 * float(prev.get('radius_norm', 0.01)))
+        if same_y and close:
+            run.append(h)
+        else:
+            if len(run) >= 3:
+                slots.append(_slot_from_run(run))
+            run = [h]
+    if len(run) >= 3:
+        slots.append(_slot_from_run(run))
+    return slots
+
+
+def _slot_from_run(run: list) -> dict:
+    xs = [h['center'][0] for h in run]
+    ys = [h['center'][1] for h in run]
+    cx = (min(xs) + max(xs)) / 2.0
+    cy = (min(ys) + max(ys)) / 2.0
+    length = max(xs) - min(xs) + 2 * float(run[0].get('radius_norm', 0.01))
+    width = 2 * float(run[0].get('radius_norm', 0.01))
+    return {
+        'center':      [round(cx, 3), round(cy, 3)],
+        'length_norm': round(float(length), 4),
+        'width_norm':  round(float(width), 4),
+        'orientation': 'horizontal',
+        'hole_count':  int(len(run)),
+    }
+
+
+def _distinctiveness(holes: list, bosses: list, slots: list) -> float:
+    """Crude per-face distinctiveness score in [0, 1].
+
+    A face with one or more well-defined features is more discriminating
+    than a flat face. The score rewards count + variety but caps at 1.0
+    so a face with 20 tiny holes doesn't dominate a face with 3 large
+    distinctive ones.
+    """
+    count = (len(holes) + len(bosses) + 2 * len(slots))
+    if count == 0:
+        return 0.0
+    variety = (1 if holes else 0) + (1 if bosses else 0) + (1 if slots else 0)
+    score = (count / 6.0) * 0.6 + (variety / 3.0) * 0.4
+    return float(max(0.0, min(1.0, score)))
+
+
+def extract_step_features(face_features: dict, part_id: str = '') -> dict:
+    """Compose the canonical STEP feature dictionary saved per part.
+
+    Input: the dict returned by `extract_face_features` (per-face holes
+    and bosses).
+
+    Output schema (also persisted as
+    /opt/cobot/parts/features/{part_id}_features.json):
+
+        {
+          "part_id": "...",
+          "features": [
+            {"id": "hole_top_1", "type": "hole", "on_face": "top",
+             "center": [x, y], "radius_norm": 0.06,
+             "distinctiveness": 0.9},
+            ...
+          ],
+          "faces": {
+            "top":    {"features": [...], "is_flat": false,
+                       "distinctiveness": 0.9,
+                       "feature_summary": "3 holes"},
+            ...
+          }
+        }
+    """
+    out = {'part_id': part_id, 'features': [], 'faces': {}}
+    if not face_features:
+        for face in FACE_NAMES:
+            out['faces'][face] = {
+                'features': [], 'is_flat': True,
+                'distinctiveness': 0.0,
+                'feature_summary': 'flat face, no features',
+            }
+        return out
+
+    counters = {}
+    for face_name in FACE_NAMES:
+        face = face_features.get(face_name) or {}
+        holes  = list(face.get('holes')  or [])
+        bosses = list(face.get('bosses') or [])
+        slots  = _detect_slots_on_face(face)
+        face_feature_ids = []
+
+        for kind, items in (('hole', holes), ('boss', bosses), ('slot', slots)):
+            for i, item in enumerate(items):
+                counters[face_name] = counters.get(face_name, 0) + 1
+                fid = f'{kind}_{face_name}_{counters[face_name]}'
+                rec = {
+                    'id':       fid,
+                    'type':     kind,
+                    'on_face':  face_name,
+                }
+                if kind == 'slot':
+                    rec.update({
+                        'center':      list(item.get('center', [0.0, 0.0])),
+                        'length_norm': float(item.get('length_norm', 0.0)),
+                        'width_norm':  float(item.get('width_norm', 0.0)),
+                        'orientation': item.get('orientation', 'horizontal'),
+                    })
+                else:
+                    rec.update({
+                        'center':      list(item.get('center', [0.0, 0.0])),
+                        'radius_norm': float(item.get('radius_norm', 0.0)),
+                        'area_px':     int(item.get('area_px', 0)),
+                    })
+                out['features'].append(rec)
+                face_feature_ids.append(fid)
+
+        dscore = _distinctiveness(holes, bosses, slots)
+        summary_bits = []
+        if holes:  summary_bits.append(f'{len(holes)} hole{"s" if len(holes) != 1 else ""}')
+        if bosses: summary_bits.append(f'{len(bosses)} boss{"es" if len(bosses) != 1 else ""}')
+        if slots:  summary_bits.append(f'{len(slots)} slot{"s" if len(slots) != 1 else ""}')
+        feature_summary = ', '.join(summary_bits) or 'flat face, no features'
+
+        out['faces'][face_name] = {
+            'features':         face_feature_ids,
+            'is_flat':          not bool(holes or bosses or slots),
+            'distinctiveness':  round(dscore, 3),
+            'feature_summary':  feature_summary,
+        }
+
+    return out
+
+
+def _face_from_normal(normal) -> str:
+    """Snap an arbitrary unit normal to the closest canonical face label.
+
+    The dashboard's face-click picker yields exact axis vectors most of
+    the time (the user picks a flat face), but operators sometimes click
+    a chamfer or rotate the part — we still want a canonical bucket.
+    """
+    if not normal or len(normal) < 3:
+        return 'top'
+    arr = np.asarray(normal, dtype=float)
+    n = float(np.linalg.norm(arr))
+    if n < 1e-6:
+        return 'top'
+    arr = arr / n
+    best_face = 'top'
+    best_dot = -2.0
+    for face, fn in FACE_NORMALS.items():
+        d = float(np.dot(arr, fn))
+        if d > best_dot:
+            best_dot = d
+            best_face = face
+    return best_face
+
+
+def compute_orientation_signatures(features_doc: dict, pick_face: str) -> dict:
+    """Given the features doc and the operator-chosen pickable face,
+    derive per-orientation feature signatures.
+
+    Pickable signature: features visible on `pick_face`.
+    Flipped signature: features visible on the opposite face.
+    On-side signatures: features on each of the four side faces.
+
+    Returns a dict suitable for serialisation; persists at
+    /opt/cobot/parts/features/{part_id}_orientation_signatures.json.
+    """
+    faces = (features_doc or {}).get('faces') or {}
+    if pick_face not in FACE_NAMES:
+        pick_face = 'top'
+    pick_entry = faces.get(pick_face, {})
+    flipped_face = OPPOSITE_FACE.get(pick_face, 'bottom')
+    flipped_entry = faces.get(flipped_face, {})
+
+    pickable_sig = {
+        'up_face':           pick_face,
+        'visible_features':  list(pick_entry.get('features') or []),
+        'feature_summary':   pick_entry.get('feature_summary') or 'flat face, no features',
+        'distinctiveness':   float(pick_entry.get('distinctiveness') or 0.0),
+    }
+    flipped_sig = {
+        'label':            'flipped',
+        'up_face':           flipped_face,
+        'visible_features':  list(flipped_entry.get('features') or []),
+        'feature_summary':   flipped_entry.get('feature_summary') or 'flat face, no features',
+        'distinctiveness':   float(flipped_entry.get('distinctiveness') or 0.0),
+    }
+    on_side_sigs = []
+    for face in FACE_NAMES:
+        if face in (pick_face, flipped_face):
+            continue
+        e = faces.get(face, {})
+        on_side_sigs.append({
+            'label':            f'on_side_{face}',
+            'up_face':           face,
+            'visible_features':  list(e.get('features') or []),
+            'feature_summary':   e.get('feature_summary') or 'flat face, no features',
+            'distinctiveness':   float(e.get('distinctiveness') or 0.0),
+        })
+
+    return {
+        'part_id':       features_doc.get('part_id', ''),
+        'pickable':      pickable_sig,
+        'non_pickable':  [flipped_sig] + on_side_sigs,
+    }
+
+
+def write_features_artifacts(part_id: str, features_doc: dict,
+                             orientation_signatures: dict,
+                             features_dir: str = '/opt/cobot/parts/features'
+                             ) -> tuple:
+    """Persist features.json and orientation_signatures.json. Returns
+    (features_path, signatures_path) or (None, None) on error.
+    """
+    os.makedirs(features_dir, exist_ok=True)
+    fp = os.path.join(features_dir, f'{part_id}_features.json')
+    sp = os.path.join(features_dir, f'{part_id}_orientation_signatures.json')
+    try:
+        import json
+        with open(fp + '.tmp', 'w') as f:
+            json.dump(features_doc, f, indent=2)
+        os.replace(fp + '.tmp', fp)
+        with open(sp + '.tmp', 'w') as f:
+            json.dump(orientation_signatures, f, indent=2)
+        os.replace(sp + '.tmp', sp)
+    except Exception:
+        return None, None
+    return fp, sp
+
+
 def generate_recognition_templates(mesh, output_dir: str, part_id: str,
                                    yaw_steps: int = 12, img_size: int = 128,
                                    margin: int = 8):
@@ -635,6 +927,18 @@ def parse_step_file(step_path: str) -> dict:
         face_features = extract_face_features(mesh)
     except Exception:
         face_features = {}
+
+    # New architecture (Foundation): write features.json +
+    # orientation_signatures.json so the dashboard and (future)
+    # orientation-boost code can find them. The pickable face defaults
+    # to 'top'; the dashboard pick-direction selector rewrites the
+    # signatures when the operator chooses a different face.
+    try:
+        features_doc = extract_step_features(face_features, file_hash)
+        sig_doc = compute_orientation_signatures(features_doc, 'top')
+        write_features_artifacts(file_hash, features_doc, sig_doc)
+    except Exception:
+        pass
 
     return {
         'id':                file_hash,

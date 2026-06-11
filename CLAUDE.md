@@ -1,5 +1,31 @@
 # Cobot Perception Stack — Architecture
 
+## LiDAR object identification
+
+The `lidar_object_identifier` package consumes `/lidar/points_filtered`
+and publishes static-object identifications on
+`/lidar_objects/identified` at 5 Hz. Pipeline: workspace crop → RANSAC
+ground → optional polygon mask → Euclidean clustering → shape
+descriptors → parts library match → N-frame persistence. The dashboard
+shows live boxes on the 3D View tab, a Monitor card, per-part stats on
+the Parts Library cards, and a workspace polygon editor in Configure.
+This is separate from any motion / safety LiDAR pipeline; the two coexist
+at the topic level. Note: nvblox remains in camera-depth mode by
+design — LiDAR mode is blocked by the Livox MID-360's non-repetitive
+scan pattern (see `cobot_bringup/config/nvblox.yaml` comment).
+
+## Motion optimization
+
+The `motion_optimization` package (TOPP-RA + smoother + MoveIt2 bridge)
+sits in front of the Estun driver. Programs carry a
+`motion_profile_name` (Conservative / Balanced / Aggressive / custom);
+the program executor scales `/estun/move` speeds against the active
+profile and publishes `MotionStatistics` after each cycle. Configure
+via the Configure → Motion section in the dashboard, or directly under
+`/opt/cobot/motion/`. The MoveIt2 bridge stays inactive until an Estun
+URDF lands at `/opt/cobot/models/estun_s10_140.urdf`.
+
+
 ## System Overview
 
 ROS2 Humble stack running on NVIDIA Jetson AGX Orin 64GB. The system performs
@@ -90,6 +116,8 @@ Latch reset: requires zone=GREEN + service call `/safety/reset_estop`.
 | filterpy | scene_graph | Kalman filtering |
 | fastapi + uvicorn | cobot_dashboard | Web dashboard |
 | Ollama (external) | language_interface | LLM inference (llama3.1:8b) |
+| toppra | motion_optimization | Time-optimal trajectory parameterization |
+| open3d | lidar_object_identifier | Convex hull + DBSCAN clustering |
 
 ## Development Branches
 

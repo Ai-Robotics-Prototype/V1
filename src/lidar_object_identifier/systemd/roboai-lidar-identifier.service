@@ -1,0 +1,21 @@
+[Unit]
+Description=RoboAi LiDAR object identifier (static parts library matching)
+After=network-online.target roboai-accumulator.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cobot
+Group=cobot
+WorkingDirectory=/home/teddy/cobot_ws
+Environment=ROS_DOMAIN_ID=0
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && \
+    source /home/teddy/cobot_ws/install/setup.bash && \
+    ros2 launch lidar_object_identifier lidar_object_identifier.launch.py'
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

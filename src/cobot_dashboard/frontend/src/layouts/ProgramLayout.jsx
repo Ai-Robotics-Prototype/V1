@@ -85,23 +85,54 @@ function HoldButton({ onPress, color, width, height, children }) {
 
 // Small overlay button on each of the three program-tab panels. Lets
 // the operator give one panel the entire workspace (and back again).
+//
+// Icon-only 32×32 chip at the top-right. The wrapping <PanelChrome>
+// gives it the position:relative + overflow:hidden + padding-top
+// clearance it needs so no other panel button can ever sit underneath
+// it (step Edit/Teach/Del buttons, jog arrow pads, viewer controls).
 function PanelExpandBtn({ expanded, onClick, title }) {
   return (
     <button
       onClick={onClick}
-      title={title}
+      title={title || (expanded ? 'Restore split layout' : 'Expand panel')}
+      aria-label={expanded ? 'Collapse panel' : 'Expand panel'}
       style={{
-        position: 'absolute', top: 8, right: 8, zIndex: 20,
-        padding: '6px 12px', fontSize: 11, fontWeight: 700,
+        position: 'absolute', top: 8, right: 8, zIndex: 10,
+        width: 32, height: 32, padding: 0,
         background: expanded ? '#2563EB' : 'rgba(255,255,255,0.92)',
         color:      expanded ? '#fff'    : '#374151',
         border:     expanded ? 'none'    : '1px solid #d1d5db',
         borderRadius: 6, cursor: 'pointer',
         boxShadow: '0 1px 2px rgba(0,0,0,0.08)',
+        fontSize: 16, lineHeight: 1,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        userSelect: 'none',
       }}
     >
-      {expanded ? 'Minimize' : 'Expand'}
+      {expanded ? '✕' : '⛶'}
     </button>
+  )
+}
+
+// Wraps a panel's contents so the expand button is clipped to that
+// panel only and the content sits below it (min 44px top inset).
+// All three program-tab panels share this chrome so the corner button
+// behaves identically across steps, 3D viewer, and jog.
+function PanelChrome({ expanded, onToggle, title, background, children }) {
+  return (
+    <div style={{
+      position: 'relative', overflow: 'hidden',
+      width: '100%', height: '100%',
+      background: background || 'transparent',
+    }}>
+      <PanelExpandBtn expanded={expanded} onClick={onToggle} title={title} />
+      <div style={{
+        width: '100%', height: '100%',
+        paddingTop: 44, boxSizing: 'border-box',
+      }}>
+        {children}
+      </div>
+    </div>
   )
 }
 
@@ -129,7 +160,10 @@ function PadCenter({ label, width = 80, height = 80, labelSize = 12 }) {
   )
 }
 
-function JogPanel({ maximized, onToggleMaximize }) {
+// The teach pendant. Maximize/restore is driven entirely by the
+// surrounding PanelChrome corner button — JogPanel no longer renders
+// its own toggle.
+function JogPanel({ maximized }) {
   const jog          = useStore((s) => s.jog)
   const jogCartesian = useStore((s) => s.jogCartesian)
   const triggerEstop = useStore((s) => s.triggerEstop)
@@ -164,21 +198,49 @@ function JogPanel({ maximized, onToggleMaximize }) {
     }
   }, [jog, jogCartesian])
 
-  // Sizing knobs flip between normal and maximised modes.
-  const padBtn     = maximized ? 110 : 80
-  const zBtnWidth  = maximized ? 90  : 70
-  const zBtnHeight = maximized ? 110 : 80
-  const jointBtnW  = maximized ? 80  : 64
-  const jointBtnH  = maximized ? 80  : 56
-  const svgPx      = maximized ? 48  : 36
-  const lblPx      = maximized ? 15  : 12
+  // Sizing knobs flip between normal and maximised modes. Every value
+  // below is sized to the spec'd jog button sheet — the panel fills
+  // the available area instead of clustering buttons in a corner.
+  //
+  // Arrow / d-pad buttons:
+  const padBtn     = maximized ? 140 : 96
+  const zBtnWidth  = maximized ? 140 : 96
+  const zBtnHeight = maximized ? 140 : 96
+  const jointBtnW  = maximized ? 140 : 96
+  const jointBtnH  = maximized ? 140 : 96
+  const svgPx      = maximized ? 60  : 42
+  const lblPx      = maximized ? 16  : 13
+  // Gaps inside each d-pad and between the three d-pad groups.
+  const padInner   = maximized ? 14  : 10
+  const padGroup   = maximized ? 40  : 28
+  const jointColGap = maximized ? 24 : 16
+  // Joint label that sits between +/- buttons of each joint column.
+  const jointLblFont = maximized ? 16 : 13
+  const jointLblMb   = maximized ? 10 : 6
+  // Action buttons on the right (Run / Pause / Stop / Home / Teach).
+  const actionMinH = maximized ? 68  : 52
+  const actionFont = maximized ? 17  : 14
+  const actionMinW = maximized ? 100 : 80
+  const actionGap  = maximized ? 14  : 10
+  // Mode toggle buttons (XYZ / Joint).
+  const modeMinH   = maximized ? 56  : 44
+  const modeFont   = maximized ? 16  : 13
+  const modePadX   = maximized ? 24  : 18
+  // Step-size chips (small selection grid).
+  const stepBtnH   = maximized ? 56  : 36
+  const stepBtnFont = maximized ? 15 : 12
+  const sectionLabelFont = maximized ? 13 : 11
+  const speedFont  = maximized ? 15 : 13
+  const containerPad = maximized ? 20 : 12
 
   const { estop } = safety
   const { running, paused, state, program_step, program_total } = task
 
   // === Layout helpers ===
   const modeBtnStyle = (on) => ({
-    padding: '14px 20px', fontSize: 15, fontWeight: 700,
+    padding: `0 ${modePadX}px`,
+    minHeight: modeMinH,
+    fontSize: modeFont, fontWeight: 700,
     background: on ? '#2563EB' : '#f3f4f6',
     color:      on ? '#fff'    : '#374151',
     border:     on ? '2px solid #2563EB' : '2px solid #d1d5db',
@@ -187,7 +249,11 @@ function JogPanel({ maximized, onToggleMaximize }) {
   })
 
   const runBtnBase = (bg, color, disabled, weight = 700) => ({
-    width: '100%', padding: '14px', fontSize: 14, fontWeight: weight,
+    width: '100%',
+    minWidth: actionMinW,
+    padding: maximized ? '16px' : '12px',
+    minHeight: actionMinH,
+    fontSize: actionFont, fontWeight: weight,
     background: bg, color,
     border: bg.startsWith('#f') ? '1px solid #d1d5db' : 'none',
     borderRadius: 8, cursor: disabled ? 'not-allowed' : 'pointer',
@@ -200,27 +266,32 @@ function JogPanel({ maximized, onToggleMaximize }) {
 
   return (
     <div style={{
-      padding: 14, background: '#fff',
-      height: '100%', overflowY: 'auto',
-      display: 'flex', alignItems: 'stretch', gap: 16,
+      padding: containerPad, background: '#fff',
+      width: '100%', height: '100%', overflowY: 'auto',
+      display: 'flex', flexDirection: 'row',
+      alignItems: 'center', justifyContent: 'space-evenly',
+      gap: maximized ? 28 : 16,
+      boxSizing: 'border-box',
     }}>
-      {/* LEFT — mode, step, speed, maximize */}
+      {/* LEFT — mode, step, speed */}
       <div style={{
         display: 'flex', flexDirection: 'column', gap: 10,
-        width: 160, flexShrink: 0,
+        width: maximized ? 220 : 180, flexShrink: 0,
+        alignSelf: 'stretch', justifyContent: 'center',
       }}>
-        <div style={{ fontSize: 14, fontWeight: 700, color: '#111' }}>Jog</div>
+        <div style={{ fontSize: maximized ? 16 : 14, fontWeight: 700, color: '#111' }}>Jog</div>
 
         <button onClick={() => setJogMode('cartesian')} style={modeBtnStyle(jogMode === 'cartesian')}>XYZ</button>
         <button onClick={() => setJogMode('joint')}     style={modeBtnStyle(jogMode === 'joint')}>Joint</button>
 
         <div style={{ marginTop: 4 }}>
-          <div style={{ fontSize: 11, fontWeight: 600, color: '#6b7280', marginBottom: 4 }}>Step Size</div>
+          <div style={{ fontSize: sectionLabelFont, fontWeight: 600, color: '#6b7280', marginBottom: 4 }}>Step Size</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
             {[0.1, 0.5, 1, 5, 10].map((s) => (
               <button key={s} onClick={() => setStep(s)} style={{
-                padding: '8px 12px', fontSize: 12, fontWeight: 600, borderRadius: 4, cursor: 'pointer',
-                minHeight: 36,
+                padding: maximized ? '12px 16px' : '8px 12px',
+                fontSize: stepBtnFont, fontWeight: 600, borderRadius: 4, cursor: 'pointer',
+                minHeight: stepBtnH,
                 background: step === s ? '#2563EB' : '#f3f4f6',
                 color:      step === s ? '#fff'    : '#6b7280',
                 border:     step === s ? 'none'    : '1px solid #e5e7eb',
@@ -230,29 +301,19 @@ function JogPanel({ maximized, onToggleMaximize }) {
         </div>
 
         <div>
-          <div style={{ fontSize: 11, fontWeight: 600, color: '#6b7280', marginBottom: 4 }}>Speed: {speed}%</div>
+          <div style={{ fontSize: speedFont, fontWeight: 600, color: '#6b7280', marginBottom: 4 }}>Speed: {speed}%</div>
           <input type="range" min={1} max={100} value={speed}
             onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
-            style={{ width: '100%', height: 6 }} />
+            style={{ width: '100%', height: maximized ? 10 : 6 }} />
         </div>
 
         <div style={{ flex: 1 }} />
-
-        <button onClick={onToggleMaximize}
-          title={maximized ? 'Restore split layout' : 'Maximize jog panel'}
-          style={{
-            padding: '10px', fontSize: 12, fontWeight: 600,
-            background: '#f3f4f6', color: '#374151',
-            border: '1px solid #d1d5db', borderRadius: 6, cursor: 'pointer',
-          }}>
-          {maximized ? 'Minimize' : 'Maximize'}
-        </button>
       </div>
 
       {/* CENTER — jog arrow pads */}
-      <div style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', minWidth: 0 }}>
+      <div style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', minWidth: 0, alignSelf: 'stretch' }}>
         {jogMode === 'cartesian' ? (
-          <div style={{ display: 'flex', gap: 24, alignItems: 'flex-start', flexWrap: 'wrap', justifyContent: 'center' }}>
+          <div style={{ display: 'flex', gap: padGroup, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'center' }}>
             <div>
               {padLabel('Position')}
               <div style={{
@@ -260,7 +321,7 @@ function JogPanel({ maximized, onToggleMaximize }) {
                 gridTemplateColumns: `repeat(3, ${padBtn}px)`,
                 gridTemplateRows:    `repeat(3, ${padBtn}px)`,
                 gridTemplateAreas: '". up ." "left center right" ". down ."',
-                gap: 4,
+                gap: padInner,
               }}>
                 <div style={{ gridArea: 'up' }}>
                   <ArrowPad onPress={() => sendJog('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
@@ -282,10 +343,9 @@ function JogPanel({ maximized, onToggleMaximize }) {
 
             <div>
               {padLabel('Height')}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: zBtnWidth }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: padInner, width: zBtnWidth }}>
                 <ArrowPad onPress={() => sendJog('z',  1)} rotation={0}   label="Z+" color="#3B82F6"
                   size={zBtnWidth} svgSize={svgPx} labelSize={lblPx} />
-                <PadCenter label="Z" width={zBtnWidth} height={Math.max(28, padBtn - 50)} labelSize={lblPx} />
                 <ArrowPad onPress={() => sendJog('z', -1)} rotation={180} label="Z−" color="#3B82F6"
                   size={zBtnWidth} svgSize={svgPx} labelSize={lblPx} />
               </div>
@@ -298,7 +358,7 @@ function JogPanel({ maximized, onToggleMaximize }) {
                 gridTemplateColumns: `repeat(3, ${padBtn}px)`,
                 gridTemplateRows:    `repeat(3, ${padBtn}px)`,
                 gridTemplateAreas: '". rxp ." "rzn center rzp" ". rxn ."',
-                gap: 4,
+                gap: padInner,
               }}>
                 <div style={{ gridArea: 'rxp' }}>
                   <ArrowPad onPress={() => sendJog('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} svgSize={svgPx} labelSize={lblPx} />
@@ -319,12 +379,14 @@ function JogPanel({ maximized, onToggleMaximize }) {
             </div>
           </div>
         ) : (
-          <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: jointColGap, justifyContent: 'center', flexWrap: 'wrap', alignItems: 'center' }}>
             {[1, 2, 3, 4, 5, 6].map((j) => (
-              <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+              <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: padInner }}>
+                <div style={{ fontSize: jointLblFont, fontWeight: 700, color: '#374151', marginBottom: jointLblMb }}>
+                  {'J' + j}
+                </div>
                 <ArrowPad onPress={() => sendJog(j,  1)} rotation={0}   label="+" color="#16A34A"
                   size={jointBtnW} svgSize={svgPx} labelSize={lblPx + 2} />
-                <PadCenter label={'J' + j} width={jointBtnW} height={28} labelSize={13} />
                 <ArrowPad onPress={() => sendJog(j, -1)} rotation={180} label="−" color="#DC2626"
                   size={jointBtnW} svgSize={svgPx} labelSize={lblPx + 2} />
               </div>
@@ -335,8 +397,9 @@ function JogPanel({ maximized, onToggleMaximize }) {
 
       {/* RIGHT — Run/Pause/Stop/Home + Teach */}
       <div style={{
-        display: 'flex', flexDirection: 'column', gap: 8,
-        width: 150, flexShrink: 0,
+        display: 'flex', flexDirection: 'column', gap: actionGap,
+        width: maximized ? 180 : 150, flexShrink: 0,
+        alignSelf: 'stretch', justifyContent: 'center',
       }}>
         <button onClick={paused ? resumeProgram : runProgram}
           disabled={estop || (running && !paused)}
@@ -350,7 +413,7 @@ function JogPanel({ maximized, onToggleMaximize }) {
         </button>
         <button onClick={cancelProgram}
           disabled={!running && !paused}
-          style={{ ...runBtnBase('#DC2626', '#fff', !running && !paused), fontSize: 15 }}>
+          style={runBtnBase('#DC2626', '#fff', !running && !paused)}>
           STOP
         </button>
         <button onClick={homeRobot} disabled={estop}
@@ -362,12 +425,14 @@ function JogPanel({ maximized, onToggleMaximize }) {
           {state} · {program_step + 1}/{program_total}
         </div>
 
-        <div style={{ flex: 1 }} />
-
         <button onClick={triggerEstop}
           title="Emergency stop"
           style={{
-            width: '100%', padding: '10px', fontSize: 11, fontWeight: 700,
+            width: '100%',
+            minWidth: actionMinW,
+            padding: maximized ? '14px' : '10px',
+            minHeight: actionMinH,
+            fontSize: actionFont, fontWeight: 700,
             background: '#fff', color: '#DC2626',
             border: '2px solid #DC2626', borderRadius: 8, cursor: 'pointer',
           }}>
@@ -376,7 +441,11 @@ function JogPanel({ maximized, onToggleMaximize }) {
         <button
           title="Save current pose as a teach point (not yet wired)"
           style={{
-            width: '100%', padding: '14px', fontSize: 13, fontWeight: 700,
+            width: '100%',
+            minWidth: actionMinW,
+            padding: maximized ? '16px' : '12px',
+            minHeight: actionMinH,
+            fontSize: actionFont, fontWeight: 700,
             background: '#2563EB', color: '#fff',
             border: 'none', borderRadius: 8, cursor: 'pointer',
           }}>
@@ -394,7 +463,7 @@ function JogPanel({ maximized, onToggleMaximize }) {
 const PROGRAM_MIN_WIDTH = 380   // editor: step-row buttons (Edit / Teach / Del) fit
 const VIEWER_MIN_WIDTH  = 250   // 3D arm: enough to see the robot model
 const PROGRAM_MAX_FRAC  = 0.75  // editor can take up to 75% of the row
-const JOG_MIN_HEIGHT    = 320   // jog: arrow pads + step/speed + action col fit
+const JOG_MIN_HEIGHT    = 420   // jog: 96×96 d-pad + label + chrome 44 + padding fit
 const JOG_MAX_FRAC      = 0.6   // jog can take up to 60% of available height
 
 function useWindowSize() {
@@ -499,57 +568,75 @@ export default function ProgramLayout() {
   const jogAtLimit  = jogHeight <= JOG_MIN_HEIGHT   + 0.5 || jogHeight >= jogMax  - 0.5
 
   // Single-panel maximised views. Each one is the full Program tab with
-  // a Minimize button in the corner that drops back to the three-region
-  // layout. The jog panel was the only one with this before — Steps
-  // and 3D viewer now get it too.
+  // a top-right Collapse button. PanelChrome supplies the 44px top
+  // inset so the corner button never overlays inner controls (step
+  // buttons, jog arrows, viewer overlays).
   if (expandedPanel === 'steps') {
     return (
-      <div style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden' }}>
-        <PanelExpandBtn expanded onClick={() => setExpandedPanel(null)} title="Restore split layout" />
-        <ProgramEditor />
-      </div>
+      <PanelChrome expanded onToggle={() => setExpandedPanel(null)} title="Restore split layout">
+        <div style={{ width: '100%', height: '100%', overflow: 'hidden' }}>
+          <ProgramEditor />
+        </div>
+      </PanelChrome>
     )
   }
   if (expandedPanel === '3d') {
     return (
-      <div style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden', background: '#FFFFFF' }}>
-        <PanelExpandBtn expanded onClick={() => setExpandedPanel(null)} title="Restore split layout" />
+      <PanelChrome expanded onToggle={() => setExpandedPanel(null)} title="Restore split layout" background="#FFFFFF">
         <ArmViewer3D />
-      </div>
+      </PanelChrome>
     )
   }
   if (expandedPanel === 'jog') {
     return (
-      <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        <JogPanel maximized onToggleMaximize={() => setExpandedPanel(null)} />
-      </div>
+      <PanelChrome expanded onToggle={() => setExpandedPanel(null)} title="Restore split layout">
+        <div style={{ width: '100%', height: '100%', overflow: 'auto' }}>
+          <JogPanel maximized />
+        </div>
+      </PanelChrome>
     )
   }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
-        <div style={{ width: leftWidth, flexShrink: 0, display: 'flex', overflow: 'hidden', position: 'relative' }}>
-          <PanelExpandBtn onClick={() => setExpandedPanel('steps')} title="Expand the program steps panel" />
-          <div style={{ flex: 1, overflow: 'hidden' }}>
-            <ProgramEditor />
-          </div>
+        <div style={{ width: leftWidth, flexShrink: 0, display: 'flex', overflow: 'hidden' }}>
+          <PanelChrome
+            onToggle={() => setExpandedPanel('steps')}
+            title="Expand the program steps panel"
+          >
+            <div style={{ width: '100%', height: '100%', overflow: 'hidden' }}>
+              <ProgramEditor />
+            </div>
+          </PanelChrome>
         </div>
         <VerticalDivider onMouseDown={startVerticalDrag} dragging={activeDrag === 'v'} atLimit={leftAtLimit} />
-        <div style={{ flex: 1, overflow: 'hidden', background: '#FFFFFF', minWidth: VIEWER_MIN_WIDTH, position: 'relative' }}>
-          <PanelExpandBtn onClick={() => setExpandedPanel('3d')} title="Expand the 3D viewer" />
-          <ArmViewer3D />
+        <div style={{ flex: 1, overflow: 'hidden', background: '#FFFFFF', minWidth: VIEWER_MIN_WIDTH }}>
+          <PanelChrome
+            onToggle={() => setExpandedPanel('3d')}
+            title="Expand the 3D viewer"
+            background="#FFFFFF"
+          >
+            <ArmViewer3D />
+          </PanelChrome>
         </div>
       </div>
 
       <HorizontalDivider onMouseDown={startHorizontalDrag} dragging={activeDrag === 'h'} atLimit={jogAtLimit} />
 
-      {/* Jog panel: overflow auto so a too-small height shows a
-          scrollbar instead of clipping the action buttons. The
-          existing Maximize button inside JogPanel routes through the
-          same expandedPanel state. */}
-      <div style={{ height: jogHeight, flexShrink: 0, overflow: 'auto', borderTop: '1px solid #e5e7eb' }}>
-        <JogPanel maximized={false} onToggleMaximize={() => setExpandedPanel('jog')} />
+      {/* Jog panel — wrapped in the same PanelChrome so the corner
+          button matches the other two panels. PanelChrome's inner
+          scroll keeps the action buttons accessible even at small
+          heights. */}
+      <div style={{ height: jogHeight, flexShrink: 0, borderTop: '1px solid #e5e7eb' }}>
+        <PanelChrome
+          onToggle={() => setExpandedPanel('jog')}
+          title="Expand the teach pendant"
+        >
+          <div style={{ width: '100%', height: '100%', overflow: 'auto' }}>
+            <JogPanel maximized={false} />
+          </div>
+        </PanelChrome>
       </div>
     </div>
   )

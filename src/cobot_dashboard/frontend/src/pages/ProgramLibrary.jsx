@@ -276,7 +276,12 @@ function ProgramDetailsModal({ prog, onClose, onEdit, onDuplicate, onDelete }) {
   )
 }
 
-export default function ProgramLibrary() {
+// onSelectProgram (optional): when provided, single-clicking a program
+// tile invokes the callback with the program record instead of opening
+// the details modal. Used by Monitor's "Change Program" overlay so the
+// operator can pick an active program without the Edit/Duplicate/Delete
+// affordances getting in the way.
+export default function ProgramLibrary({ onSelectProgram } = {}) {
   const [programs, setPrograms]             = useState([])
   const [folders, setFolders]               = useState([])
   const [search, setSearch]                 = useState('')
@@ -528,7 +533,13 @@ export default function ProgramLibrary() {
                 key={prog.id}
                 prog={prog}
                 folderName={isSearchMode && prog.folder ? folderById[prog.folder]?.name : null}
-                onClick={(p) => setSelectedProgram(p)}
+                onClick={(p) => {
+                  // Modal-mode pick → fire the callback and skip the
+                  // details modal. The Monitor's Change Program flow
+                  // owns the close + load-on-executor steps.
+                  if (onSelectProgram) onSelectProgram(p)
+                  else setSelectedProgram(p)
+                }}
               />
             ))}
           </div>

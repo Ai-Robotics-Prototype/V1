@@ -29,6 +29,19 @@ import threading
 PROGRAMS_DIR = '/opt/cobot/programs'
 STATS_DIR = '/opt/cobot/stats'
 
+# Motion optimization middleware — graceful fallback if msgs not yet built.
+try:
+    from motion_optimization_msgs.msg import MotionStatistics
+    MOTION_MSGS_AVAILABLE = True
+except Exception:
+    MotionStatistics = None
+    MOTION_MSGS_AVAILABLE = False
+
+DEFAULT_MOTION_PROFILE = 'Balanced'
+# Match the velocity_scale_pct of the default profile so unscaled programs
+# behave identically to the pre-motion-optimization executor.
+_PROFILE_BASELINE_VEL_PCT = 70.0
+
 
 class ProgramExecutor(Node):
 
@@ -72,6 +85,18 @@ class ProgramExecutor(Node):
         self._scan_results      = []   # detections at the wide scan step
         self._identified_parts  = []   # per-object results after close-up scan
         self._scan_identify_idx = 0
+        # Pallet runtime state. mode + config are populated when a
+        # pallet program is loaded (None otherwise so the dashboard
+        # knows no pallet program is active). cycle / row / col / layer
+        # track which slot the current move_to_pallet step targets.
+        # pallet_substep / pallet_io_fired manage the multi-phase motion
+        # inside a single move_to_pallet step.
+        self._pallet_state = {
+            'cycle': 0, 'row': 0, 'col': 0, 'layer': 0,
+            'mode': None, 'config': None,
+        }
+        self._pallet_substep   = 0      # 0=lift, 1=traverse retract, 2=descend approach, 3=descend slot, 4=io, 5=lift retract
+        self._pallet_io_fired  = False
         # Inspection state — populated by the inspect_part handler and
         # consumed by the WAITING_INSPECTION transition. Kept on the
         # executor (not the inspection node) because the *executor* is
@@ -86,12 +111,32 @@ class ProgramExecutor(Node):
         self._operator_ack              = False  # alert_operator waits on this
         self._lock = threading.Lock()
 
+        # Motion optimization state — populated when a program is loaded.
+        # _motion_profile mirrors the active profile body (cached so we
+        # don't query the optimizer service on every move). When motion
+        # optimization is disabled (per-program flag or service down),
+        # _send_move passes commands through unchanged.
+        self._motion_profile_name = DEFAULT_MOTION_PROFILE
+        self._motion_profile = None  # dict or None
+        self._motion_enabled = True
+        self._motion_optimize_estimate_s = 0.0
+        self._motion_unopt_estimate_s = 0.0
+        self._motion_segment_count = 0
+        self._motion_segments_optimized = 0
+        self._motion_cycles_completed = 0
+        self._motion_last_cycle_time = 0.0
+
         # Publishers
         self._pub_state = self.create_publisher(String, '/task/state', 10)
         self._pub_cmd = self.create_publisher(String, '/estun/command', 10)
         self._pub_move = self.create_publisher(String, '/estun/move', 10)
         self._pub_io = self.create_publisher(String, '/robot/io_command', 10)
         self._pub_jog = self.create_publisher(String, '/robot/jog_command', 10)
+        if MOTION_MSGS_AVAILABLE:
+            self._pub_motion_stats = self.create_publisher(
+                MotionStatistics, '/motion_optimization/statistics', 10)
+        else:
+            self._pub_motion_stats = None
 
         # Subscribers
         self.create_subscription(String, '/task/run_program', self._on_run_command, 10)
@@ -186,6 +231,37 @@ class ProgramExecutor(Node):
             self.get_logger().warn(f'Program "{self._program_name}" has no steps')
             return
 
+        # Motion profile lookup: program override → system default →
+        # built-in Balanced. The cached body is read off disk so the
+        # executor doesn't take a service-call hit on every step.
+        self._motion_profile_name = (
+            prog.get('motion_profile_name') or DEFAULT_MOTION_PROFILE)
+        self._motion_enabled = bool(prog.get('motion_optimization_enabled', True))
+        self._motion_profile = self._load_motion_profile(self._motion_profile_name)
+        self._motion_segment_count = sum(
+            1 for s in self._steps
+            if s.get('action') in ('move_to_position', 'move_to_pallet',
+                                   'home', 'tcp_move'))
+        self._motion_segments_optimized = 0
+        self._motion_cycles_completed = 0
+        self._motion_last_cycle_time = 0.0
+
+        # Latch pallet runtime state from program.config if this is a
+        # pallet program; otherwise null it out so the dashboard hides
+        # its widget.
+        cfg = prog.get('config') or {}
+        if cfg.get('operation') == 'palletize' and isinstance(cfg.get('pallet'), dict):
+            self._pallet_state = {
+                'cycle': 0, 'row': 0, 'col': 0, 'layer': 0,
+                'mode':   'depalletize' if cfg.get('pallet_mode') == 'depalletize' else 'palletize',
+                'config': cfg['pallet'],
+            }
+        else:
+            self._pallet_state = {
+                'cycle': 0, 'row': 0, 'col': 0, 'layer': 0,
+                'mode': None, 'config': None,
+            }
+
         self.get_logger().info(f'Loaded program "{self._program_name}" with {len(self._steps)} steps')
         self._start_execution()
 
@@ -197,6 +273,14 @@ class ProgramExecutor(Node):
         self._scan_results      = []
         self._identified_parts  = []
         self._scan_identify_idx = 0
+        # Reset pallet position trackers but keep the mode/config the
+        # program loader latched in.
+        self._pallet_state['cycle'] = 0
+        self._pallet_state['row']   = 0
+        self._pallet_state['col']   = 0
+        self._pallet_state['layer'] = 0
+        self._pallet_substep   = 0
+        self._pallet_io_fired  = False
         self._state = self.RUNNING
         self.get_logger().info(f'Starting execution: "{self._program_name}"')
 
@@ -288,13 +372,24 @@ class ProgramExecutor(Node):
         # ── Waiting states ──
         if self._state == self.WAITING_MOTION:
             if not self._is_robot_moving:
-                # Motion complete — advance to next step
+                # Motion complete. For multi-phase move_to_pallet steps,
+                # transition to the next substep rather than advancing
+                # the whole step.
+                if action == 'move_to_pallet':
+                    self._tick_move_to_pallet(step, motion_complete=True)
+                    return
                 self.get_logger().info(f'Step {self._current_step_idx + 1} motion complete: {step.get("label", action)}')
                 self._advance_step()
             return
 
         if self._state == self.WAITING_TIME:
             if time.time() >= self._wait_until:
+                # Same trick for move_to_pallet — the gripper-settle
+                # substep parks in WAITING_TIME for ~0.4s; on expiry we
+                # need to kick the next substep, not advance the step.
+                if action == 'move_to_pallet':
+                    self._tick_move_to_pallet(step, time_complete=True)
+                    return
                 self.get_logger().info(f'Step {self._current_step_idx + 1} wait complete')
                 self._advance_step()
             return
@@ -574,6 +669,10 @@ class ProgramExecutor(Node):
                 '(placeholder — needs reject-bin position + calibration)')
             self._advance_step()
 
+        elif action == 'move_to_pallet':
+            self._tick_move_to_pallet(step)
+            return
+
         elif action == 'loop':
             goto_step = step.get('goto', 1) - 1  # convert 1-indexed to 0-indexed
             count = step.get('count', 0)  # 0 = infinite
@@ -750,6 +849,8 @@ class ProgramExecutor(Node):
         now = time.time()
         if self._cycle_start_time > 0:
             self._last_cycle_time = round(now - self._cycle_start_time, 2)
+            self._motion_last_cycle_time = self._last_cycle_time
+            self._motion_cycles_completed += 1
 
         self._state = self.COMPLETE
         self._current_step_idx = -1
@@ -760,6 +861,215 @@ class ProgramExecutor(Node):
 
         # Save stats
         self._save_stats()
+        # Publish motion-optimization statistics so the Monitor badge and
+        # /opt/cobot/motion/statistics/ historical data can update.
+        try:
+            self._publish_motion_statistics()
+        except Exception as e:
+            self.get_logger().debug(f'motion statistics publish failed: {e}')
+
+    # ── move_to_pallet multi-phase compound motion ────────
+
+    def _tick_move_to_pallet(self, step, motion_complete=False, time_complete=False):
+        """Drive the compound motion for a single move_to_pallet step.
+
+        Substeps (palletize = place, depalletize = pick):
+          0: traverse XY to retract above slot       (medium speed)
+          1: descend to approach height above slot   (slow)
+          2: descend to slot                          (slow)
+          3: fire gripper (release for palletize,
+             close for depalletize) and brief settle
+          4: lift back to retract above slot          (medium)
+          done: advance pallet_state.cycle, advance step
+        """
+        pallet = self._pallet_state
+        config = pallet.get('config')
+        if not config:
+            self.get_logger().warn('move_to_pallet without pallet config — skipping')
+            self._advance_step()
+            return
+
+        cycle = pallet.get('cycle', 0)
+        rows   = int(config.get('rows',   1) or 1)
+        cols   = int(config.get('cols',   1) or 1)
+        layers = int(config.get('layers', 1) or 1)
+        total  = max(1, rows * cols * layers)
+        if cycle >= total:
+            self.get_logger().warn(
+                f'move_to_pallet cycle {cycle} beyond capacity {total} — skipping')
+            self._advance_step()
+            return
+
+        row, col, layer = self._get_next_slot(config, cycle)
+        pallet['row']   = row
+        pallet['col']   = col
+        pallet['layer'] = layer
+
+        slot           = self._compute_pallet_position(config, row, col, layer)
+        appH_m         = float(config.get('approach_height_mm', 100)) / 1000.0
+        retH_m         = float(config.get('retract_height_mm',  200)) / 1000.0
+        above_retract  = {**slot, 'z': slot['z'] + retH_m}
+        above_approach = {**slot, 'z': slot['z'] + appH_m}
+
+        spd    = int(step.get('speed_pct', 30))
+        slow   = max(5,  min(spd, 20))
+        medium = max(10, min(spd, 40))
+        is_place = (pallet.get('mode') == 'palletize')
+
+        # New step entering — reset substep tracking. The fresh enter is
+        # the only call with neither motion nor time completion flags
+        # set, and current substep hasn't been touched yet for this step.
+        if not motion_complete and not time_complete:
+            self._pallet_substep  = 0
+            self._pallet_io_fired = False
+        elif motion_complete or time_complete:
+            # Previous substep done — bump.
+            self._pallet_substep += 1
+
+        sub = self._pallet_substep
+
+        if sub == 0:
+            self.get_logger().info(
+                f'Pallet cycle {cycle + 1}/{total}: traverse to retract '
+                f'above slot row={row} col={col} layer={layer}')
+            self._send_pallet_move(above_retract, medium)
+            self._state = self.WAITING_MOTION
+            return
+
+        if sub == 1:
+            self._send_pallet_move(above_approach, slow)
+            self._state = self.WAITING_MOTION
+            return
+
+        if sub == 2:
+            self._send_pallet_move(slot, slow)
+            self._state = self.WAITING_MOTION
+            return
+
+        if sub == 3:
+            # Fire the gripper and park briefly while it actuates. The
+            # IO command itself is fast; the wait lets the gripper close
+            # / release before we lift.
+            if not self._pallet_io_fired:
+                self._fire_pallet_gripper(step, 'open' if is_place else 'close')
+                self._pallet_io_fired = True
+                if is_place:
+                    self._pick_passes += 1
+                else:
+                    self._total_picks += 1
+                    self._pick_passes += 1
+            self._wait_until = time.time() + 0.4
+            self._state = self.WAITING_TIME
+            return
+
+        if sub == 4:
+            self._send_pallet_move(above_retract, medium)
+            self._state = self.WAITING_MOTION
+            return
+
+        # Compound motion complete — advance the pallet cycle counter
+        # then step forward. The next iteration of the program's
+        # outer loop will re-enter move_to_pallet with cycle + 1.
+        pallet['cycle']        = cycle + 1
+        self._pallet_substep   = 0
+        self._pallet_io_fired  = False
+        self.get_logger().info(
+            f'Pallet cycle {cycle + 1}/{total} complete '
+            f'(row={row} col={col} layer={layer})')
+        self._advance_step()
+
+    # ── Pallet helpers ────────────────────────────────────
+
+    def _compute_pallet_position(self, config, row, col, layer):
+        """Translate a (row, col, layer) grid slot into an absolute
+        TCP using the corner_tcp + spacing fields the wizard saved.
+
+        corner_tcp is in metres / radians (matches Estun TCP convention);
+        spacing_*_mm and layer_height_mm are millimetres so we divide by
+        1000 before adding. rx/ry/rz are taken straight from the corner."""
+        corner = config.get('corner_tcp') or {}
+        cx = float(corner.get('x', 0.0))
+        cy = float(corner.get('y', 0.0))
+        cz = float(corner.get('z', 0.0))
+        rx = float(corner.get('rx', 0.0))
+        ry = float(corner.get('ry', 0.0))
+        rz = float(corner.get('rz', 0.0))
+        sx = float(config.get('spacing_x_mm', 150)) / 1000.0
+        sy = float(config.get('spacing_y_mm', 150)) / 1000.0
+        lz = float(config.get('layer_height_mm', 100)) / 1000.0
+        return {
+            'x':  cx + col * sx,
+            'y':  cy + row * sy,
+            'z':  cz + layer * lz,
+            'rx': rx, 'ry': ry, 'rz': rz,
+        }
+
+    def _get_next_slot(self, config, cycle):
+        """Return (row, col, layer) for the Nth pallet cycle (0-indexed)
+        under the configured fill order. For depalletize the layer is
+        reversed so the top layer is emptied first."""
+        rows   = int(config.get('rows',   1) or 1)
+        cols   = int(config.get('cols',   1) or 1)
+        layers = int(config.get('layers', 1) or 1)
+        layer_size = max(1, rows * cols)
+        order = config.get('fill_order') or 'row_lr'
+
+        layer_idx = cycle // layer_size
+        within    = cycle %  layer_size
+
+        if order == 'row_lr':
+            r = (within // cols) % rows
+            c = within % cols
+        elif order == 'row_rl':
+            r = (within // cols) % rows
+            c = (cols - 1) - (within % cols)
+        elif order == 'col':
+            r = within % rows
+            c = (within // rows) % cols
+        elif order == 'snake':
+            r = (within // cols) % rows
+            within_row = within % cols
+            c = within_row if (r % 2 == 0) else (cols - 1 - within_row)
+        else:
+            r = (within // cols) % rows
+            c = within % cols
+
+        if self._pallet_state.get('mode') == 'depalletize':
+            layer = (layers - 1) - (layer_idx % layers)
+        else:
+            layer = layer_idx % layers
+        return (r, c, layer)
+
+    def _send_pallet_move(self, tcp, speed_pct, motion='movl'):
+        """Helper — convert a pallet TCP dict (metres) into the mm-format
+        Estun /estun/move expects and publish it."""
+        tcp_mm = [
+            tcp['x'] * 1000.0,
+            tcp['y'] * 1000.0,
+            tcp['z'] * 1000.0,
+            tcp.get('rx', 0.0),
+            tcp.get('ry', 0.0),
+            tcp.get('rz', 0.0),
+        ]
+        self._send_move({'type': motion, 'tcp': tcp_mm, 'speed_pct': int(speed_pct)})
+
+    def _fire_pallet_gripper(self, step, phase):
+        """Fire the gripper IO for the current move_to_pallet phase.
+        phase='close' → grip; phase='open' → release.
+        Looks up the IO from the step's gripper_type so palletize
+        programs work for finger / vacuum / magnetic alike."""
+        gtype = step.get('gripper_type', 'finger')
+        if gtype == 'finger':
+            if phase == 'close':
+                self._send_io(step.get('io_close', 'DO0'), 1)
+                self._send_io(step.get('io_open',  'DO1'), 0)
+            else:
+                self._send_io(step.get('io_open',  'DO1'), 1)
+                self._send_io(step.get('io_close', 'DO0'), 0)
+        elif gtype == 'vacuum':
+            self._send_io(step.get('io_vacuum', 'DO2'), 1 if phase == 'close' else 0)
+        elif gtype == 'magnetic':
+            self._send_io(step.get('io_magnet', 'DO3'), 1 if phase == 'close' else 0)
 
     # ── Helpers ───────────────────────────────────────────
 
@@ -770,10 +1080,114 @@ class ProgramExecutor(Node):
         self._pub_cmd.publish(msg)
 
     def _send_move(self, move_data):
-        """Publish a motion command."""
+        """Publish a motion command, optionally scaled by the active motion profile.
+
+        The scaling layer is a stop-gap until /estun/move carries a full
+        joint trajectory we can hand to TOPP-RA. We multiply the
+        commanded speed_pct by the profile's velocity_scale_pct ratio
+        (against a 70%% baseline so the default Balanced profile is a
+        no-op against pre-motion-opt programs).
+        """
+        try:
+            move_data = self._apply_motion_profile(dict(move_data))
+        except Exception as e:
+            self.get_logger().debug(f'motion profile scaling skipped: {e}')
         msg = String()
         msg.data = json.dumps(move_data)
         self._pub_move.publish(msg)
+        self._motion_segments_optimized += 1
+
+    def _load_motion_profile(self, name):
+        """Read a motion profile body from /opt/cobot/motion/.
+
+        Built-ins are baked into the package's default_profiles.yaml; user
+        profiles live in /opt/cobot/motion/config/profiles.json. Returns a
+        plain dict (or None if the name can't be resolved).
+        """
+        # Custom profiles first
+        try:
+            custom_path = '/opt/cobot/motion/config/profiles.json'
+            if os.path.isfile(custom_path):
+                with open(custom_path) as f:
+                    customs = json.load(f) or {}
+                if name in customs:
+                    return customs[name]
+        except Exception:
+            pass
+        # Built-ins from install share
+        try:
+            import yaml
+            from ament_index_python.packages import get_package_share_directory
+            share = get_package_share_directory('motion_optimization')
+            with open(os.path.join(share, 'config', 'default_profiles.yaml')) as f:
+                doc = yaml.safe_load(f) or {}
+            builtins = (doc.get('profiles') or {})
+            if name in builtins:
+                body = dict(builtins[name])
+                body['name'] = name
+                return body
+        except Exception as e:
+            self.get_logger().debug(f'Could not load default_profiles.yaml: {e}')
+        return None
+
+    def _apply_motion_profile(self, move_data):
+        """Mutate move_data['speed_pct'] in place per the active profile.
+
+        Move types respected:
+          movj / movl / movc / move_to_position → velocity_scale_pct
+          approach moves (move_data.get('phase') == 'approach') →
+            approach_speed_pct
+          retreat moves (phase == 'retreat') → retreat_speed_pct
+        When _motion_enabled is False or no profile is cached, move_data
+        is returned unchanged.
+        """
+        if not self._motion_enabled or not self._motion_profile:
+            return move_data
+        prof = self._motion_profile
+        phase = move_data.get('phase')
+        if phase == 'approach':
+            factor_pct = prof.get('approach_speed_pct',
+                                  prof.get('velocity_scale_pct',
+                                           _PROFILE_BASELINE_VEL_PCT))
+        elif phase == 'retreat':
+            factor_pct = prof.get('retreat_speed_pct',
+                                  prof.get('velocity_scale_pct',
+                                           _PROFILE_BASELINE_VEL_PCT))
+        else:
+            factor_pct = prof.get('velocity_scale_pct',
+                                  _PROFILE_BASELINE_VEL_PCT)
+        # Express the profile factor relative to the 70% baseline so the
+        # default Balanced profile is the identity for legacy programs.
+        ratio = max(0.05, min(2.0, float(factor_pct) / _PROFILE_BASELINE_VEL_PCT))
+        base_speed = float(move_data.get('speed_pct', 50))
+        new_speed = max(1.0, min(100.0, base_speed * ratio))
+        move_data['speed_pct'] = round(new_speed, 1)
+        move_data['motion_profile'] = prof.get('name')
+        return move_data
+
+    def _publish_motion_statistics(self):
+        """Publish a MotionStatistics snapshot after a cycle finishes."""
+        if not self._pub_motion_stats or not MOTION_MSGS_AVAILABLE:
+            return
+        msg = MotionStatistics()
+        try:
+            msg.header.stamp = self.get_clock().now().to_msg()
+        except Exception:
+            pass
+        msg.program_id = self._program_id or ''
+        msg.program_name = self._program_name or ''
+        msg.estimated_cycle_time_s = float(self._motion_optimize_estimate_s)
+        msg.actual_cycle_time_s = float(self._motion_last_cycle_time)
+        diff = msg.actual_cycle_time_s - msg.estimated_cycle_time_s
+        msg.cycle_time_savings_s = float(self._motion_unopt_estimate_s -
+                                         msg.actual_cycle_time_s)
+        denom = max(self._motion_unopt_estimate_s, 1e-3)
+        msg.cycle_time_savings_pct = float(
+            100.0 * msg.cycle_time_savings_s / denom)
+        msg.total_segments = int(self._motion_segment_count)
+        msg.optimized_segments = int(self._motion_segments_optimized)
+        msg.cycles_completed = int(self._motion_cycles_completed)
+        self._pub_motion_stats.publish(msg)
 
     def _send_io(self, io_id, value):
         """Publish an I/O command."""
@@ -789,6 +1203,30 @@ class ProgramExecutor(Node):
             s = self._steps[self._current_step_idx]
             step_label = s.get('label', '')
             step_action = s.get('action', '')
+
+        # Pallet snapshot — null when no pallet program is loaded, so
+        # the dashboard widget knows to hide itself. The cycle / row /
+        # col / layer keep updating across the program's outer loop so
+        # the operator sees which slot is being placed / picked.
+        pallet      = self._pallet_state
+        pallet_mode = pallet.get('mode')
+        if pallet_mode and isinstance(pallet.get('config'), dict):
+            cfg = pallet['config']
+            rows   = int(cfg.get('rows',   1) or 1)
+            cols   = int(cfg.get('cols',   1) or 1)
+            layers = int(cfg.get('layers', 1) or 1)
+            pallet_total = max(1, rows * cols * layers)
+            pallet_cycle = int(pallet.get('cycle', 0))
+            pallet_row   = int(pallet.get('row',   0))
+            pallet_col   = int(pallet.get('col',   0))
+            pallet_layer = int(pallet.get('layer', 0))
+        else:
+            pallet_mode  = None
+            pallet_total = None
+            pallet_cycle = None
+            pallet_row   = None
+            pallet_col   = None
+            pallet_layer = None
 
         state = {
             'state': self._state,
@@ -812,6 +1250,14 @@ class ProgramExecutor(Node):
             'scan_results':     list(self._identified_parts),
             'scan_count':       len(self._scan_results),
             'identified_count': len(self._identified_parts),
+            # Pallet progress — all fields are null when no pallet
+            # program is loaded so the Monitor widget hides cleanly.
+            'pallet_mode':  pallet_mode,
+            'pallet_cycle': pallet_cycle,
+            'pallet_total': pallet_total,
+            'pallet_row':   pallet_row,
+            'pallet_col':   pallet_col,
+            'pallet_layer': pallet_layer,
             # Inspection progress — null when no inspection program is
             # loaded or when no inspection has run yet.
             'current_inspection_id':   self._current_inspection_id,

@@ -1,0 +1,10 @@
+std_msgs/Header header
+string program_id
+string program_name
+float32 estimated_cycle_time_s
+float32 actual_cycle_time_s
+float32 cycle_time_savings_s
+float32 cycle_time_savings_pct
+int32 total_segments
+int32 optimized_segments
+int32 cycles_completed
