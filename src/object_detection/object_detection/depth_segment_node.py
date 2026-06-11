@@ -1266,14 +1266,50 @@ class DepthSegmentNode(Node):
         The new teach format stores full-resolution color, depth, mask,
         a binary edge map, a 200-point contour, hole count + positions,
         the OBB size, and the operator-supplied orientation tag. The
-        matcher uses the edge + contour + size triple as hard gates."""
+        matcher uses the edge + contour + size triple as hard gates.
+
+        Orphan policy: a teach dir whose `part_id` doesn't appear in
+        `/opt/cobot/parts/index.json` is REFUSED at load time. Letting
+        orphans into `_teach_refs` produces false UNKNOWN PART matches
+        because the matcher scores them against live detections but the
+        name resolver can only return `UNKNOWN PART (xxxx)`. Operator
+        action: re-add the part to the index, restore its metadata
+        json, or move the orphan dir out from under /opt/cobot/parts/
+        teach/. Symmetric to the orphan-template skip in `_load_templates`.
+        """
+        # Snapshot the parts library once so we don't hit disk per dir.
+        try:
+            from object_detection.part_library import get_all_parts
+            known_pids = {p.get('id') for p in (get_all_parts() or [])
+                          if p.get('id')}
+            id_to_name = {p.get('id'): (p.get('name') or p.get('id'))
+                          for p in (get_all_parts() or []) if p.get('id')}
+        except Exception:
+            known_pids = None  # disable the check if the library is unreadable
+            id_to_name = {}
+
         self._teach_refs = {}
         base = '/opt/cobot/parts/teach'
         if not os.path.isdir(base):
             return
+        skipped_orphans = []   # list of (part_id, ref_count) for the log
         for pid in os.listdir(base):
             pdir = os.path.join(base, pid)
             if not os.path.isdir(pdir):
+                continue
+            if known_pids is not None and pid not in known_pids:
+                # Orphan teach dir — count refs for the log so the
+                # operator sees how much data was skipped, then move on.
+                # We never load orphans; they used to produce
+                # `UNKNOWN PART (xxxx)` false matches when their shape
+                # scored well against a live detection.
+                try:
+                    n_orphan_refs = sum(
+                        1 for f in os.listdir(pdir)
+                        if f.startswith('ref_') and f.endswith('.npz'))
+                except OSError:
+                    n_orphan_refs = 0
+                skipped_orphans.append((pid, n_orphan_refs))
                 continue
             refs = []
             for fn in sorted(os.listdir(pdir)):
@@ -1355,14 +1391,38 @@ class DepthSegmentNode(Node):
                     continue
             if refs:
                 self._teach_refs[pid] = refs
-        if self._teach_refs:
-            self.get_logger().info(
-                'teach refs: '
-                + ', '.join(
-                    f'{k}({len(v)} refs, edges='
-                    f'{"y" if any(r.get("edges") is not None for r in v) else "n"})'
-                    for k, v in self._teach_refs.items())
-            )
+        # Per-orphan warning lines first so they sit next to the loader
+        # context in the log, then a single TEACH_LOAD rollup that's
+        # easy to grep.
+        for opid, n_refs in skipped_orphans:
+            self.get_logger().warn(
+                f'SKIP_ORPHAN_TEACH: {opid} not in parts library '
+                f'— skipping {n_refs} ref{"s" if n_refs != 1 else ""}')
+
+        # TEACH_LOAD rollup — one line for grepping, then per-part
+        # detail showing how many refs each named part has. A named
+        # part with zero refs is a valid state (e.g., right after the
+        # operator runs Start Fresh) so we still list it; the matcher
+        # will return UNKNOWN for it which is the honest answer.
+        all_loaded_pids = set(self._teach_refs.keys()) | (
+            (known_pids or set()) - {p for p, _ in skipped_orphans})
+        # Count only library-known dirs as "loaded parts" in the
+        # summary so we don't double-count orphans (already excluded
+        # from _teach_refs above).
+        loaded_count = len([1 for p in all_loaded_pids
+                            if known_pids is None or p in known_pids])
+        self.get_logger().info(
+            f'TEACH_LOAD: {loaded_count} parts loaded, '
+            f'{len(skipped_orphans)} orphan dirs skipped')
+        if known_pids is not None:
+            for pid in sorted(known_pids):
+                name = id_to_name.get(pid) or pid
+                n = len(self._teach_refs.get(pid, []))
+                edges = ('y' if any(r.get('edges') is not None
+                                    for r in self._teach_refs.get(pid, []))
+                         else 'n')
+                self.get_logger().info(
+                    f'  {name}: {n} ref{"s" if n != 1 else ""} (edges={edges})')
 
         # ── TEACH_READINESS: per-part rollup ──────────────────────────
         # For every part in index.json, report how many refs are taught
@@ -3292,6 +3352,124 @@ class DepthSegmentNode(Node):
             return 0.0
 
     @staticmethod
+    def _spatial_pattern_score(det_color, det_mask, ref_color, ref_mask,
+                               det_depth=None, ref_depth=None, grid=6):
+        """Spatial pattern correlation — where are the dark / recessed
+        regions, not what colour they are.
+
+        The original `_spatial_color_score` above uses RGB-cosine, which
+        for a uniformly-white part (delrin) collapses to ~1.0 regardless
+        of where the holes are: every cell's RGB mean is dominated by
+        the white surface so the 48-dim vectors all look the same. This
+        score fixes that by:
+
+          1. Bucketing each crop into a grid×grid grid of masked-mean
+             intensities.
+          2. Z-standardising each grid (subtract mean, divide by std)
+             so we compare PATTERNS of variation, not absolute levels.
+             A grid that's flat at any brightness drops to zeros and
+             scores 0 — there's no pattern to compare.
+          3. Pearson-correlating the standardised vectors. The score is
+             clipped to [0, 1] (negative correlation also reads as a
+             mismatch).
+
+        When depth is available on both sides we run the same
+        standardised-grid trick on relative depth (depth − masked
+        median). Holes are recessed, so the depth grid carries the
+        same hole-position signal as the brightness grid even when
+        colour is too uniform to discriminate. The two scores are
+        averaged 50/50; colour alone is used when either depth crop
+        is missing.
+
+        Returns 0..1.
+        """
+        def _grid_vec(arr2d, mask, channel_dim=False):
+            """Z-standardised grid×grid vector from a masked 2-D
+            crop. Returns None when there's no usable mask or no
+            variation."""
+            if arr2d is None:
+                return None
+            arr = np.asarray(arr2d, dtype=np.float32)
+            if channel_dim and arr.ndim == 3:
+                # RGB → grayscale via average. Keeps the "dark cell
+                # versus light cell" signal that the existing
+                # `_spatial_color_score` flattens by treating RGB as
+                # 3 independent dims.
+                arr = arr.mean(axis=2)
+            elif arr.ndim != 2:
+                return None
+            H, W = arr.shape
+            if H < grid or W < grid:
+                return None
+            if mask is not None and np.asarray(mask).shape == (H, W):
+                m = np.asarray(mask).astype(bool)
+            else:
+                m = np.ones((H, W), dtype=bool)
+            if not m.any():
+                return None
+            arr = np.where(np.isfinite(arr), arr, 0.0)
+            vec = np.zeros(grid * grid, dtype=np.float32)
+            for gy in range(grid):
+                y0 = int(round(gy * H / grid))
+                y1 = int(round((gy + 1) * H / grid)) if gy < grid - 1 else H
+                for gx in range(grid):
+                    x0 = int(round(gx * W / grid))
+                    x1 = int(round((gx + 1) * W / grid)) if gx < grid - 1 else W
+                    cm = m[y0:y1, x0:x1]
+                    cc = arr[y0:y1, x0:x1]
+                    if cm.any():
+                        vec[gy * grid + gx] = float(cc[cm].mean())
+                    else:
+                        vec[gy * grid + gx] = 0.0
+            # Z-standardise: subtract mean, divide by std. A grid with
+            # zero variance (uniform brightness) returns zeros, so the
+            # downstream correlation reads "no pattern to compare" = 0.
+            mu = float(vec.mean())
+            sd = float(vec.std())
+            if sd < 1e-6:
+                return None
+            return (vec - mu) / sd
+
+        def _correlate(v1, v2):
+            if v1 is None or v2 is None:
+                return None
+            # Both already zero-mean unit-std → dot product / N is the
+            # Pearson correlation. Clip negatives to 0 since orientation
+            # mismatch and pattern inversion both read as "wrong".
+            n = float(v1.size)
+            r = float(np.dot(v1, v2) / n) if n > 0 else 0.0
+            return max(0.0, min(1.0, r))
+
+        try:
+            color_v1 = _grid_vec(det_color, det_mask, channel_dim=True)
+            color_v2 = _grid_vec(ref_color, ref_mask, channel_dim=True)
+            color_corr = _correlate(color_v1, color_v2)
+
+            depth_corr = None
+            if det_depth is not None and ref_depth is not None:
+                # Depth — recessed holes are LOCALLY deeper than the
+                # surface. We pass raw depth in; the standardisation
+                # step inside _grid_vec removes the absolute distance,
+                # so 30 cm and 40 cm working distances both produce the
+                # same pattern of "hole cells deeper than surface cells".
+                depth_v1 = _grid_vec(det_depth, det_mask, channel_dim=False)
+                depth_v2 = _grid_vec(ref_depth, ref_mask, channel_dim=False)
+                depth_corr = _correlate(depth_v1, depth_v2)
+
+            if color_corr is None and depth_corr is None:
+                return 0.0
+            if depth_corr is None:
+                return float(color_corr)
+            if color_corr is None:
+                return float(depth_corr)
+            # 50/50 blend when both available. Holes contribute to BOTH
+            # signals; uniform surfaces drop out via the standardisation
+            # so we don't dilute with neutral 0.5s.
+            return float(0.5 * color_corr + 0.5 * depth_corr)
+        except Exception:
+            return 0.0
+
+    @staticmethod
     def _extract_features(gray, mask, max_corners=25, patch_size=16):
         """Per-crop feature extraction for orientation matching.
 
@@ -4030,19 +4208,24 @@ class DepthSegmentNode(Node):
 
         from scipy.ndimage import zoom as _zoom
 
-        # June 5 simple two-signal blend: NCC carries the silhouette /
-        # texture match, hist carries the surface colour. Spatial /
-        # depth-geometry / Harris+LBP / CAD-face / nearest-centroid
-        # were added between Jun 5–9, regressed accuracy on flat and
-        # shiny parts (signal noise diluted the working signals), and
-        # have been removed from the matching path. The dead helpers
-        # remain in the file because the teach save flow still computes
-        # the per-ref Harris/LBP arrays during ref capture — removing
-        # them would touch the teach wizard storage format, which is
-        # out of scope here.
+        # Re-tuned for orientation discrimination on uniform-coloured
+        # parts (delrin). NCC + hist together identify the part shape
+        # but can't tell the pickable side (holes visible) from the
+        # flipped side (holes hidden) — both have nearly identical
+        # outlines and overall colour. The spatial-pattern signal —
+        # WHERE the dark / recessed regions sit — does the work.
+        #
+        #   ncc      0.40  silhouette match (identity / pose)
+        #   hist     0.15  overall colour (weak signal on white parts)
+        #   spatial  0.45  hole-position pattern (grayscale + depth grid)
+        #   depth    0.00  raw depth-geometry (kept for orient_weights override)
+        #   feat     0.00  Harris+LBP (kept for orient_weights override)
         default_weights = {
-            'ncc':  0.70,
-            'hist': 0.30,
+            'ncc':     0.40,
+            'hist':    0.15,
+            'spatial': 0.45,
+            'depth':   0.00,
+            'feat':    0.00,
         }
 
         best_score = 0.0
@@ -4159,6 +4342,7 @@ class DepthSegmentNode(Node):
             for gkey, grp_refs in groups.items():
                 nccs     = []
                 hists    = []
+                spatials = []
                 best_in_group_ncc = 0.0
                 best_in_group_ref = None
 
@@ -4212,40 +4396,59 @@ class DepthSegmentNode(Node):
                             best_in_group_ref = ref
 
                     # Colour-histogram tie-breaker (masked-pixel only).
-                    # Spatial colour grid, depth geometry, and Harris+
-                    # LBP feature signals were removed in the June 5
-                    # revert — they were noisy on flat/shiny parts and
-                    # diluted the working NCC + hist signals.
                     ref_color = ref.get('color')
                     ref_mask  = ref.get('mask')
                     if ref_color is not None and color_crop is not None:
                         hists.append(self._color_hist_corr(
                             color_crop, ref_color,
                             mask1=mask_crop, mask2=ref_mask))
+                    # Spatial-pattern signal — captures WHERE the dark
+                    # / recessed regions sit in the crop. This is what
+                    # separates pickable (holes visible) from flipped
+                    # (holes hidden) on uniform-coloured parts. Both
+                    # depth crops are needed for the depth half of the
+                    # signal; when either is missing the score uses
+                    # the grayscale grid alone.
+                    if ref_color is not None and color_crop is not None:
+                        ref_depth_for_pattern = ref.get('depth')
+                        spatials.append(self._spatial_pattern_score(
+                            color_crop, mask_crop,
+                            ref_color, ref_mask,
+                            det_depth=depth_crop,
+                            ref_depth=ref_depth_for_pattern))
 
                 if not nccs:
                     continue
                 avg_ncc  = float(np.mean(nccs))
                 avg_hist = float(np.mean(hists)) if hists else 0.5
-                # Two-signal score: NCC carries the silhouette / texture
-                # match, hist carries the surface colour. Weights are
-                # per-part overridable but default to 0.70 / 0.30.
-                group_score = (avg_ncc  * weights['ncc']
-                               + avg_hist * weights['hist'])
+                # Real spatial-pattern average now that the signal is
+                # wired in (line above). depth / feat remain inert at
+                # 0.5 because their compute paths were removed in the
+                # June 5 revert; they stay in the weights dict so
+                # per-part orient_weights overrides keep working.
+                avg_spatial = float(np.mean(spatials)) if spatials else 0.5
+                avg_depth   = 0.5
+                avg_feat    = 0.5
+                group_score = (avg_ncc     * weights['ncc']
+                               + avg_hist    * weights['hist']
+                               + avg_spatial * weights.get('spatial', 0.0)
+                               + avg_depth   * weights.get('depth',   0.0)
+                               + avg_feat    * weights.get('feat',    0.0))
 
                 group_dbg.append(
-                    (gkey, avg_ncc, avg_hist, group_score, len(nccs)))
+                    (gkey, avg_ncc, avg_hist, avg_spatial,
+                     group_score, len(nccs)))
 
                 if group_score > best_group_score:
                     best_group_score = group_score
                     best_group_key   = gkey
-                    best_group_meta  = (avg_ncc, avg_hist,
+                    best_group_meta  = (avg_ncc, avg_hist, avg_spatial,
                                         len(nccs), best_in_group_ref)
 
             if best_group_meta is None:
                 continue
 
-            (best_ref_ncc, best_ref_hist,
+            (best_ref_ncc, best_ref_hist, best_ref_spatial,
              n_refs, best_ref_for_part) = best_group_meta
             # CAD face anchor verification was removed in the June 5
             # revert — CAD renders didn't match real camera images, so
@@ -4254,16 +4457,18 @@ class DepthSegmentNode(Node):
             # time anyway.
 
             # Simple two-branch combined score: size gate + group
-            # scoring, exactly the June 5 formulation.
-            #   size 0.40 + group 0.60
-            combined = size_score * 0.40 + best_group_score * 0.60
+            # scoring. Tuned to size 0.35 + group 0.65 — group scoring
+            # (now NCC + hist dominant per default_weights) carries
+            # most of the decision, with size providing the candidate
+            # filter via the SIZE_GATE pre-pass above.
+            combined = size_score * 0.35 + best_group_score * 0.65
 
             # Per-group debug log so the operator can see WHY one
             # orientation won over another. Sorted by score desc.
-            # Tuple layout: (gkey, ncc, hist, score, n_refs).
+            # Tuple layout: (gkey, ncc, hist, spatial, score, n_refs).
             try:
-                group_dbg.sort(key=lambda x: -x[3])
-                gap = ((group_dbg[0][3] - group_dbg[1][3])
+                group_dbg.sort(key=lambda x: -x[4])
+                gap = ((group_dbg[0][4] - group_dbg[1][4])
                        if len(group_dbg) >= 2 else float('nan'))
                 # ORIENT confidence buckets per spec Part E:
                 #   gap > 0.08 → HIGH, 0.04–0.08 → MEDIUM, < 0.04 → LOW.
@@ -4276,11 +4481,11 @@ class DepthSegmentNode(Node):
                 else:
                     _orient_conf = 'LOW'
                 summary = ' | '.join(
-                    "{}'{}': ncc={:.2f} hist={:.2f} score={:.2f} ({}r)".format(
+                    "{}'{}': ncc={:.2f} hist={:.2f} spatial={:.2f} score={:.2f} ({}r)".format(
                         'pickable' if k[0] else 'NOpick', k[3] or '?',
-                        a, h, sc, n
+                        a, h, sp, sc, n
                     )
-                    for (k, a, h, sc, n) in group_dbg
+                    for (k, a, h, sp, sc, n) in group_dbg
                 )
                 self.get_logger().info(
                     f'[ORIENT] {self._id_to_name(part_id)}: '
@@ -4288,6 +4493,28 @@ class DepthSegmentNode(Node):
                     f'"{best_group_key[3] or "?"}" gap={gap:.2f} '
                     f'{_orient_conf} | {summary}',
                     throttle_duration_sec=3.0)
+                # Per-part match-result one-liner so future regressions
+                # show up immediately in journalctl. depth / feat are
+                # zero-weighted by default — included in the bracketed
+                # tail when a per-part orient_weights override turns
+                # them on. spatial is now the real grid-pattern score
+                # (no asterisk); ratios > 0.5 mean the live view's
+                # hole/recess pattern aligns with the winning group's
+                # refs, ≤ 0.3 means they diverge.
+                self.get_logger().info(
+                    f'MATCH_RESULT: {self._id_to_name(part_id)} '
+                    f'combined={combined:.3f} (size={size_score:.2f} '
+                    f'group={best_group_score:.2f}) '
+                    f'winner_group='
+                    f'{"pickable" if best_group_key[0] else "NOpick"} '
+                    f'gap={gap:.2f} '
+                    f'[ncc={best_ref_ncc:.2f} hist={best_ref_hist:.2f} '
+                    f'spatial={best_ref_spatial:.2f} '
+                    f'w_ncc={weights["ncc"]:.2f} w_hist={weights["hist"]:.2f} '
+                    f'w_spat={weights.get("spatial", 0.0):.2f} '
+                    f'w_dep={weights.get("depth", 0.0):.2f} '
+                    f'w_feat={weights.get("feat", 0.0):.2f}]',
+                    throttle_duration_sec=2.0)
             except Exception:
                 pass
 
@@ -4303,6 +4530,7 @@ class DepthSegmentNode(Node):
                     'winner_is_defect':    bool(best_group_key[1]),
                     'ncc':                 round(float(best_ref_ncc), 3),
                     'hist':                round(float(best_ref_hist), 3),
+                    'spatial':             round(float(best_ref_spatial), 3),
                     'weights':             {k: round(float(v), 3)
                                             for k, v in weights.items()},
                     'group_score':         round(float(best_group_score), 3),
@@ -4310,7 +4538,7 @@ class DepthSegmentNode(Node):
                     'combined':            round(float(combined), 3),
                     'gap':                 (None
                                             if not (len(group_dbg) >= 2)
-                                            else round(float(group_dbg[0][3] - group_dbg[1][3]), 3)),
+                                            else round(float(group_dbg[0][4] - group_dbg[1][4]), 3)),
                     'n_refs_in_group':     int(n_refs),
                     'ts':                  _time.time(),
                 }
@@ -4869,6 +5097,20 @@ class DepthSegmentNode(Node):
                 box_w = max(0, bx1 - bx0)
                 box_h = max(0, by1 - by0)
                 if pw < box_w - 4 and ph < box_h - 4:
+                    # Edge-aware horizontal clamp: even when the pill
+                    # fits inside the bbox, the bbox itself can sit
+                    # close to the right image edge, sliding the pill
+                    # off-screen (e.g. "✓ PICKABLE SID…" cut off).
+                    # Shrink the placement to fit inside the image
+                    # first, then re-anchor inside the bbox if there's
+                    # still room there. Same idea on the bottom edge
+                    # for tall bbox / short image cases.
+                    if px_pos + pw > w:
+                        px_pos = max(int(bx0) + 2, w - pw - 2)
+                    if py_pos + ph > h:
+                        py_pos = max(int(by0) + 2, h - ph - 2)
+                    px_pos = max(0, px_pos)
+                    py_pos = max(0, py_pos)
                     draw.rectangle(
                         [px_pos, py_pos, px_pos + pw, py_pos + ph],
                         fill=pill_bg)
@@ -4921,11 +5163,39 @@ class DepthSegmentNode(Node):
             bbox_text = draw.textbbox((0, 0), label, font=label_font)
             tw = bbox_text[2] - bbox_text[0] + 8
             th = bbox_text[3] - bbox_text[1] + 6
-            label_x = max(0, int(left_x))
-            # Pill now sits INSIDE the box top-left, so the detail
-            # label can drop back to its original position right above
-            # the bbox (no more badge_offset stacking).
-            label_y = max(0, int(top_y) - th - 2)
+
+            # Edge-aware label placement. The annotated image is
+            # published at native camera resolution — the black bars
+            # the operator sees on the tablet come from the browser
+            # letterboxing the stream, not from padding we add here.
+            # That means anything we draw past [0, w] × [0, h] gets
+            # clipped by PIL, so the only thing that helps is to
+            # KEEP the label inside the image:
+            #   * left clamp keeps label_x ≥ 0 (unchanged).
+            #   * right clamp keeps the full text width inside w.
+            #     If left_x sits near the right edge we slide left
+            #     until the label fits — the label still visually
+            #     points at the same bbox.
+            #   * above-the-box is preferred (label_y_above). When
+            #     that goes negative (detection touches the top edge)
+            #     fall through to below-the-box. Final clamp keeps
+            #     label_y in [0, h - th].
+            # If the label is somehow wider than the entire image
+            # (very long part name on a narrow stream) we shrink to
+            # the small font as a last-ditch fit.
+            if tw > w:
+                label_font = _ANNOT_FONT_SMALL
+                bbox_text = draw.textbbox((0, 0), label, font=label_font)
+                tw = bbox_text[2] - bbox_text[0] + 8
+                th = bbox_text[3] - bbox_text[1] + 6
+            label_x = max(0, min(int(left_x), w - tw))
+            label_y_above = int(top_y) - th - 2
+            if label_y_above >= 0:
+                label_y = label_y_above
+            else:
+                # Top edge — drop the label below the box instead.
+                label_y = min(int(by1) + 2, h - th)
+            label_y = max(0, min(label_y, h - th))
             draw.rectangle([label_x, label_y, label_x + tw, label_y + th],
                            fill=col)
             draw.text((label_x + 4, label_y + 2), label,
