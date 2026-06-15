@@ -14,6 +14,18 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
+# Dual-import shim — matches inspection_helpers below. The systemd unit
+# runs this file as a script (no parent package), so relative imports
+# fail; the ROS2 entry-point path has a parent package and prefers them.
+try:
+    from . import motioncam as _mc
+except ImportError:
+    import sys as _sys_for_mc
+    _this_dir = str(Path(__file__).resolve().parent)
+    if _this_dir not in _sys_for_mc.path:
+        _sys_for_mc.path.insert(0, _this_dir)
+    import motioncam as _mc
+
 try:
     import rclpy
     from rclpy.node import Node
@@ -136,7 +148,15 @@ _state_clients: dict = {}
 _lidar_clients: dict = {}
 _mesh_clients:  dict = {}
 _insp_clients:  dict = {}   # /ws/inspection — live inspection status
+_motioncam_cloud_clients: dict = {}
+_motioncam_reco_clients:  dict = {}
 _ws_lock = threading.Lock()
+
+# MotionCam state — single shared instance for the dashboard server.
+# The synthetic generator only ticks when STATE.motioncam_state.get_mock()
+# is True; otherwise we wait for real driver topics.
+_motioncam = _mc.MotionCamState()
+_motioncam_synth = _mc.SyntheticSource()
 
 # Program simulation state
 _step_start_time: float = 0.0
@@ -1056,12 +1076,18 @@ if FASTAPI_AVAILABLE:
         state_hz  = 25
         lidar_hz  = 10
         mesh_hz   = 2
+        motioncam_hz = 10
+        motioncam_reco_hz = 4
         state_dt  = 1.0 / state_hz
         lidar_dt  = 1.0 / lidar_hz
         mesh_dt   = 1.0 / mesh_hz
+        motioncam_dt = 1.0 / motioncam_hz
+        motioncam_reco_dt = 1.0 / motioncam_reco_hz
         next_state = time.time()
         next_lidar = time.time()
         next_mesh  = time.time()
+        next_motioncam = time.time()
+        next_motioncam_reco = time.time()
         _last_mesh_t = 0.0
 
         while True:
@@ -1134,6 +1160,44 @@ if FASTAPI_AVAILABLE:
                             pass
                 next_lidar = now + lidar_dt
 
+            if now >= next_motioncam:
+                # Tick the synthetic source when mock is on; the real path
+                # (DashboardServer node) writes frames directly into _motioncam
+                # via update_real_frame, so we only need to package the latest
+                # snapshot for clients here.
+                if _motioncam.get_mock():
+                    try:
+                        sframe = _motioncam_synth.step()
+                        _motioncam.update_mock_frame(sframe)
+                        _motioncam.update_recognitions(_motioncam_synth.recognitions())
+                    except Exception as e:
+                        print(f"[motioncam] synth error: {e}", flush=True)
+                frame = _motioncam.snapshot_frame()
+                payload = _mc.pack_mock_cloud(frame) if frame.n else None
+                if payload is not None:
+                    with _ws_lock:
+                        clients = list(_motioncam_cloud_clients.items())
+                    for ws, q in clients:
+                        if q.qsize() < 2:
+                            try:
+                                await q.put(('binary', payload))
+                            except Exception:
+                                pass
+                next_motioncam = now + motioncam_dt
+
+            if now >= next_motioncam_reco:
+                items = _motioncam.snapshot_recognitions()
+                txt = json.dumps(_mc.pack_recognition_payload(items))
+                with _ws_lock:
+                    clients = list(_motioncam_reco_clients.items())
+                for ws, q in clients:
+                    if q.qsize() < 2:
+                        try:
+                            await q.put(txt)
+                        except Exception:
+                            pass
+                next_motioncam_reco = now + motioncam_reco_dt
+
             await asyncio.sleep(0.005)
 
     # ------------------------------------------------------------------
@@ -1174,6 +1238,41 @@ if FASTAPI_AVAILABLE:
         finally:
             with _ws_lock:
                 _lidar_clients.pop(websocket, None)
+
+    @app.websocket("/ws/motioncam_cloud")
+    async def ws_motioncam_cloud(websocket: WebSocket):
+        await websocket.accept()
+        q: asyncio.Queue = asyncio.Queue(maxsize=2)
+        with _ws_lock:
+            _motioncam_cloud_clients[websocket] = q
+        try:
+            while True:
+                item = await q.get()
+                if isinstance(item, tuple) and item and item[0] == 'binary':
+                    await websocket.send_bytes(item[1])
+                else:
+                    await websocket.send_text(item)
+        except (WebSocketDisconnect, Exception):
+            pass
+        finally:
+            with _ws_lock:
+                _motioncam_cloud_clients.pop(websocket, None)
+
+    @app.websocket("/ws/motioncam_recognition")
+    async def ws_motioncam_recognition(websocket: WebSocket):
+        await websocket.accept()
+        q: asyncio.Queue = asyncio.Queue(maxsize=2)
+        with _ws_lock:
+            _motioncam_reco_clients[websocket] = q
+        try:
+            while True:
+                txt = await q.get()
+                await websocket.send_text(txt)
+        except (WebSocketDisconnect, Exception):
+            pass
+        finally:
+            with _ws_lock:
+                _motioncam_reco_clients.pop(websocket, None)
 
     @app.websocket("/ws/mesh")
     async def ws_mesh(websocket: WebSocket):
@@ -1631,6 +1730,7 @@ if FASTAPI_AVAILABLE:
             mesh_age = round(time.time() - _mesh_state["t"], 2) \
                 if _mesh_state["t"] > 0 else None
             mesh_tris = _mesh_state["n_tris"]
+        mc_status = _motioncam.snapshot_status()
         return {
             "status": "ok", "ros": RCLPY_AVAILABLE, "mock": False,
             "uptime_s": round(time.time() - _START_TIME, 1),
@@ -1638,12 +1738,104 @@ if FASTAPI_AVAILABLE:
             "cam0_live": have_cam0, "cam1_live": have_cam1,
             "lidar_live": lidar_live, "lidar_pts": lidar_pts,
             "mesh_age_s": mesh_age, "mesh_tris": mesh_tris,
+            "motioncam": {
+                "connected":    mc_status["connected"],
+                "mock_enabled": mc_status["mock_enabled"],
+                "point_count":  mc_status["point_count"],
+                "fps":          mc_status["fps"],
+            },
         }
 
     @app.get("/api/state")
     async def api_state():
         with _state_lock:
             return copy.deepcopy(STATE)
+
+    # ------------------------------------------------------------------
+    # MotionCam-3D Color S+ — status, mode, scene control
+    # ------------------------------------------------------------------
+
+    @app.get("/api/motioncam/status")
+    async def api_motioncam_status():
+        s = _motioncam.snapshot_status()
+        s["topics"] = _motioncam.get_topics()
+        return s
+
+    @app.post("/api/motioncam/mode")
+    async def api_motioncam_mode(request: Request):
+        body = await request.json()
+        mode = body.get("mode", "")
+        if mode not in ("scanner", "camera"):
+            return JSONResponse({"error": "mode must be 'scanner' or 'camera'"},
+                                status_code=400)
+        _motioncam.set_mode(mode)
+        # Real driver hook: if a driver client lives elsewhere, switch its
+        # capture mode here. The Photoneo driver service name isn't yet
+        # confirmed — leaving this as a stub so the UI is exercisable.
+        return {"ok": True, "mode": mode}
+
+    @app.post("/api/motioncam/mock")
+    async def api_motioncam_mock(request: Request):
+        body = await request.json()
+        enabled = bool(body.get("enabled", False))
+        _motioncam.set_mock(enabled)
+        return {"ok": True, "mock_enabled": enabled}
+
+    @app.post("/api/motioncam/topics")
+    async def api_motioncam_topics(request: Request):
+        body = await request.json()
+        topics = body.get("topics") if isinstance(body, dict) else None
+        if not isinstance(topics, dict):
+            return JSONResponse({"error": "expected {topics: {...}}"},
+                                status_code=400)
+        _motioncam.set_topics(topics)
+        return {"ok": True, "topics": _motioncam.get_topics()}
+
+    @app.post("/api/motioncam/scene/start")
+    async def api_motioncam_scene_start():
+        _motioncam.scene_start()
+        return {"ok": True, "status": _motioncam.snapshot_status()["scene"]}
+
+    @app.post("/api/motioncam/scene/stop")
+    async def api_motioncam_scene_stop():
+        _motioncam.scene_stop()
+        return {"ok": True, "status": _motioncam.snapshot_status()["scene"]}
+
+    @app.post("/api/motioncam/scene/clear")
+    async def api_motioncam_scene_clear():
+        _motioncam.scene_clear()
+        return {"ok": True, "status": _motioncam.snapshot_status()["scene"]}
+
+    @app.post("/api/motioncam/scene/save")
+    async def api_motioncam_scene_save():
+        try:
+            target = _motioncam.scene_save()
+            return {"ok": True, "path": str(target)}
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.get("/api/motioncam/scene")
+    async def api_motioncam_scene():
+        snap = _motioncam.scene_snapshot()
+        # Keep the JSON payload bounded — return a stride-decimated view of
+        # the scene cloud rather than the raw accumulator dump.
+        max_pts = 80000
+        n = snap["n"]
+        pts = snap["points"]
+        cols = snap["colors"]
+        if n > max_pts:
+            stride = max(1, n // max_pts)
+            stripped_pts = []
+            stripped_cols = []
+            for i in range(0, n, stride):
+                stripped_pts.extend(pts[i * 3:i * 3 + 3])
+                if len(cols) >= (i + 1) * 3:
+                    stripped_cols.extend(cols[i * 3:i * 3 + 3])
+            snap["points"] = stripped_pts
+            snap["colors"] = stripped_cols
+            snap["n"] = len(stripped_pts) // 3
+            snap["downsampled_from"] = n
+        return snap
 
     # ------------------------------------------------------------------
     # Parts library — STEP file upload + metadata
@@ -2926,6 +3118,275 @@ if FASTAPI_AVAILABLE:
         return {"ok": True}
 
     # ------------------------------------------------------------------
+    # Programming by Demonstration (/api/pbd/*).
+    #
+    # Wires the dashboard to programming_by_demonstration.pipeline which
+    # does the real work (transcribe + understand + compose + store).
+    # The pipeline is built lazily on first use so dashboard startup
+    # doesn't crash when faster-whisper / anthropic aren't installed.
+    # ------------------------------------------------------------------
+
+    _PBD_UPLOAD_DIR = '/opt/cobot/demonstrations/_uploads'
+    _PBD_DEMOS_DIR  = '/opt/cobot/demonstrations'
+
+    try:
+        os.makedirs(_PBD_UPLOAD_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+    _pbd_lock = threading.Lock()
+    _pbd_pipeline_holder: dict = {'pipeline': None, 'last_error': None}
+
+    def _pbd_parts_provider():
+        """Hand the pipeline the same parts list the wizard sees so it
+        grounds part_ids to the real library, not invented ones."""
+        try:
+            from object_detection.part_library import get_all_parts
+            return get_all_parts() or []
+        except Exception:
+            return []
+
+    def _pbd_pipeline():
+        """Build (or reuse) the pipeline. Failures are surfaced to the
+        caller with the actionable install hint rather than 500s."""
+        with _pbd_lock:
+            if _pbd_pipeline_holder['pipeline'] is not None:
+                return _pbd_pipeline_holder['pipeline'], None
+            try:
+                from programming_by_demonstration.pipeline import (
+                    Pipeline, PipelineConfig,
+                )
+            except Exception as e:
+                msg = (f'programming_by_demonstration import failed: {e}. '
+                       'Source install/setup.bash and rebuild the package.')
+                _pbd_pipeline_holder['last_error'] = msg
+                return None, msg
+            cfg = PipelineConfig(
+                demonstrations_dir=_PBD_DEMOS_DIR,
+                programs_dir=_PROG_DIR,
+                backend=os.environ.get('ROBOAI_PBD_BACKEND', 'api'),
+                backend_params={
+                    'model':               os.environ.get('ROBOAI_PBD_API_MODEL', 'claude-opus-4-7'),
+                    'max_tokens':          int(os.environ.get('ROBOAI_PBD_MAX_TOKENS', '4096')),
+                    'request_timeout_s':   float(os.environ.get('ROBOAI_PBD_TIMEOUT_S', '120')),
+                    'zero_data_retention': True,
+                },
+            )
+            pipeline = Pipeline(cfg, parts_provider=_pbd_parts_provider)
+            _pbd_pipeline_holder['pipeline'] = pipeline
+            return pipeline, None
+
+    def _pbd_store():
+        """A lightweight read-only handle on the store — used by stats
+        and the /api/pbd/{demo_id} fetch even if the full pipeline
+        can't initialise (e.g. SDKs not installed)."""
+        from programming_by_demonstration.learning_store import LearningStore
+        return LearningStore(_PBD_DEMOS_DIR)
+
+    @app.post("/api/pbd/upload")
+    async def api_pbd_upload(file: UploadFile = File(...)):
+        """Accept a video upload, return a demo_id ready for /generate.
+        Stored under _PBD_UPLOAD_DIR until the pipeline copies it into
+        the demonstration's permanent directory."""
+        try:
+            from programming_by_demonstration.utils import mint_demo_id
+        except Exception as e:
+            return JSONResponse(
+                {"ok": False, "error": f"PBD package not installed: {e}"},
+                status_code=500,
+            )
+        demo_id = mint_demo_id()
+        # Constrain to a small allowlist to avoid weird .exe uploads.
+        orig = (file.filename or 'upload.mp4')
+        ext  = os.path.splitext(orig)[1].lower()
+        if ext not in ('.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi'):
+            return JSONResponse(
+                {"ok": False, "error": f"unsupported video extension: {ext}"},
+                status_code=415,
+            )
+        target = os.path.join(_PBD_UPLOAD_DIR, demo_id + ext)
+        try:
+            with open(target, 'wb') as out:
+                while True:
+                    chunk = await file.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"upload write failed: {e}"},
+                                status_code=500)
+        return {"ok": True, "demo_id": demo_id,
+                "video_path": target,
+                "filename": orig}
+
+    def _pbd_run_sync(video_path: str, demo_id: str,
+                      backend_override: str | None) -> dict:
+        pipeline, err = _pbd_pipeline()
+        if pipeline is None:
+            return {"ok": False, "error": err, "demo_id": demo_id}
+        res = pipeline.run_from_upload(
+            video_path,
+            demo_id=demo_id,
+            backend_override=(backend_override or None),
+        )
+        return {
+            "ok":         res.ok,
+            "error":      res.error,
+            "demo_id":    res.demo_id,
+            "intent":     res.intent.to_dict() if res.intent else None,
+            "draft":      res.draft.to_program_payload() if res.draft else None,
+            "transcript": res.transcript_text,
+            "used_examples": res.used_examples,
+            "backend_id": res.backend_id,
+            "transited_externally": res.transited_externally,
+            "stages_done": res.stages_done,
+        }
+
+    @app.post("/api/pbd/generate")
+    async def api_pbd_generate(request: Request):
+        """Run the full pipeline for an already-uploaded demo. Body:
+            { demo_id: <returned by /upload>, video_path?: <override>,
+              backend?: 'api'|'local' }
+        Long-running — the dashboard shows a progress spinner."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "error": "invalid JSON body"}, status_code=400)
+        from programming_by_demonstration.utils import safe_demo_id
+        demo_id = safe_demo_id(str(body.get('demo_id') or '')) or ''
+        if not demo_id:
+            return JSONResponse({"ok": False, "error": "demo_id required"}, status_code=400)
+        video_path = str(body.get('video_path') or '').strip()
+        # If the client didn't echo the upload path back, fish it out of
+        # the upload dir by demo_id prefix.
+        if not video_path:
+            for fn in os.listdir(_PBD_UPLOAD_DIR):
+                if fn.startswith(demo_id + '.'):
+                    video_path = os.path.join(_PBD_UPLOAD_DIR, fn)
+                    break
+        if not os.path.isfile(video_path):
+            return JSONResponse(
+                {"ok": False, "error": f"video not found: {video_path}"},
+                status_code=404,
+            )
+        backend_override = str(body.get('backend') or '').strip() or None
+        # Heavy work — drop off the event loop.
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, _pbd_run_sync, video_path, demo_id, backend_override,
+        )
+
+    @app.get("/api/pbd/list")
+    async def api_pbd_list():
+        try:
+            store = _pbd_store()
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        return {"demos": store.list_demos(limit=200)}
+
+    @app.get("/api/pbd/{demo_id}")
+    async def api_pbd_get(demo_id: str):
+        from programming_by_demonstration.utils import safe_demo_id
+        did = safe_demo_id(demo_id)
+        if not did:
+            return JSONResponse({"ok": False, "error": "bad demo_id"}, status_code=400)
+        try:
+            store = _pbd_store()
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        return store.load_all_files(did)
+
+    @app.post("/api/pbd/{demo_id}/correct")
+    async def api_pbd_correct(demo_id: str, request: Request):
+        """Operator accepted the (possibly edited) draft. Body:
+            { program: <full program payload — same shape as POST /api/programs>,
+              save_to_library: true }
+        We save through the existing /api/programs path internally so
+        the saved file ends up identical to a wizard-saved program, then
+        write human_corrected.json (the gold training signal) into the
+        learning store."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "error": "invalid JSON body"}, status_code=400)
+        program = body.get('program') or {}
+        if not program.get('name'):
+            return JSONResponse({"ok": False, "error": "program.name required"}, status_code=400)
+        from programming_by_demonstration.utils import safe_demo_id
+        did = safe_demo_id(demo_id)
+        if not did:
+            return JSONResponse({"ok": False, "error": "bad demo_id"}, status_code=400)
+
+        program_id = None
+        if body.get('save_to_library', True):
+            # Mint a slug using the same convention as POST /api/programs.
+            name = str(program.get('name')).strip()
+            base = _prog_re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or 'program'
+            try:
+                os.makedirs(_PROG_DIR, exist_ok=True)
+            except Exception as e:
+                return JSONResponse({"ok": False,
+                                     "error": f"cannot create {_PROG_DIR}: {e}"},
+                                    status_code=500)
+            slug = base
+            n = 2
+            while os.path.exists(os.path.join(_PROG_DIR, slug + '.json')):
+                slug = f"{base}_{n}"
+                n += 1
+            ts = _now_stamp()
+            saved = {
+                "id":          slug,
+                "name":        name,
+                "description": str(program.get('description') or ''),
+                "tags":        list(program.get('tags') or []) + ['from_demonstration'],
+                "config":      program.get('config') or {},
+                "steps":       list(program.get('steps') or []),
+                "created":     ts,
+                "updated":     ts,
+            }
+            try:
+                with open(os.path.join(_PROG_DIR, slug + '.json'), 'w') as f:
+                    json.dump(saved, f, indent=2)
+            except Exception as e:
+                return JSONResponse({"ok": False, "error": f"write failed: {e}"},
+                                    status_code=500)
+            program_id = slug
+
+        # Write human_corrected.json — the highest-value signal for
+        # future training of the local model.
+        try:
+            store = _pbd_store()
+            store.save_correction(did, program, program_id=program_id)
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"save_correction failed: {e}"},
+                                status_code=500)
+        return {"ok": True, "demo_id": did, "program_id": program_id}
+
+    @app.get("/api/pbd/dataset/stats")
+    async def api_pbd_stats():
+        try:
+            store = _pbd_store()
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        return store.stats()
+
+    @app.get("/api/pbd/dataset/export")
+    async def api_pbd_export():
+        """Export the corrected corpus as JSONL — the training-ready
+        bundle for fine-tuning the future local model on a GPU
+        machine."""
+        try:
+            store = _pbd_store()
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        out_path = os.path.join(_PBD_DEMOS_DIR,
+                                f'training_export_{_now_stamp()}.jsonl')
+        info = store.export_training_bundle(out_path)
+        return FileResponse(out_path, media_type='application/jsonl',
+                            filename=os.path.basename(out_path),
+                            headers={'X-Examples': str(info['examples'])})
+
+    # ------------------------------------------------------------------
     # I/O state (Estun S10-140 digital/analog inputs and outputs).
     # In-memory until the robot driver subscribes to /robot/io_command
     # and reports back via /robot/io_state; labels are persisted to
@@ -3145,6 +3606,18 @@ if FASTAPI_AVAILABLE:
             return FileResponse(idx, headers=_NO_CACHE)
         return JSONResponse({"detail": "Frontend not built — run: cd frontend && npm run build"}, status_code=404)
 
+    # PWA manifest. The catch-all SPA handler would also serve this file,
+    # but FileResponse infers application/json from the .json extension.
+    # Chrome accepts that, but the spec-preferred type is
+    # application/manifest+json — declare it explicitly so any picky
+    # client (or future devtools lint) sees the right MIME.
+    @app.get("/manifest.json")
+    async def serve_manifest():
+        path = os.path.join(_static, "manifest.json")
+        if os.path.isfile(path):
+            return FileResponse(path, media_type="application/manifest+json")
+        return JSONResponse({"detail": "manifest missing"}, status_code=404)
+
     @app.get("/parts/{filename:path}")
     async def serve_part_asset(filename: str):
         """Serve uploaded part files (.stl, .step) from /opt/cobot/parts.
@@ -3237,7 +3710,17 @@ if FASTAPI_AVAILABLE:
     # File-backed storage at /opt/cobot/inspections (see PART F).
     # ------------------------------------------------------------------
 
-    from .inspection_helpers import InspectionHelpers as _InspectionHelpers
+    # Tolerate both module-run (`python -m cobot_dashboard.dashboard_server`)
+    # and direct-script-run (`python dashboard_server.py`, what the systemd
+    # unit does). The relative import only resolves when there's a parent
+    # package — fall back to a path-based absolute import otherwise.
+    try:
+        from .inspection_helpers import InspectionHelpers as _InspectionHelpers
+    except ImportError:
+        import sys as _sys
+        if str(_THIS_DIR) not in _sys.path:
+            _sys.path.insert(0, str(_THIS_DIR))
+        from inspection_helpers import InspectionHelpers as _InspectionHelpers
     _insp = _InspectionHelpers()  # bundles all the disk/SQLite helpers
 
     @app.get("/api/inspections")

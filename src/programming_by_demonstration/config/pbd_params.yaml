@@ -1,0 +1,36 @@
+pbd_node:
+  ros__parameters:
+    # ── Storage ────────────────────────────────────────────────────
+    demonstrations_dir: /opt/cobot/demonstrations
+    programs_dir:       /opt/cobot/programs
+
+    # ── Understanding backend selection ────────────────────────────
+    # "api"   -> backends.api_backend.AnthropicClaudeBackend (network)
+    # "local" -> backends.local_backend.LocalBackendStub      (stub today)
+    backend: api
+
+    # ── Anthropic API config (only used when backend = "api") ──────
+    # Read ANTHROPIC_API_KEY from environment; do NOT commit a key.
+    api_model:                claude-opus-4-7
+    api_max_tokens:           4096
+    api_request_timeout_s:    120.0
+    # Zero-data-retention beta header. Provider currently honours this
+    # for enrolled enterprise accounts; including it is additive — if
+    # the account isn't enrolled the request still completes.
+    api_zero_data_retention:  true
+
+    # ── Frame extraction ───────────────────────────────────────────
+    frame_sample_fps:    1.0      # one frame per second of video
+    frame_max_count:     20       # cap upload size; longer clips skip
+    frame_resize_long_edge_px: 768
+    frame_jpeg_quality:  82
+
+    # ── Whisper / transcription ────────────────────────────────────
+    whisper_model:       base.en  # tiny.en/base.en/small.en for Orin
+    whisper_compute:     int8     # int8 is the Orin-friendly default
+    whisper_device:      auto     # auto picks cuda when available
+
+    # ── Few-shot retrieval ─────────────────────────────────────────
+    retrieval_enabled:   true
+    retrieval_k:         3
+    retrieval_min_score: 0.10

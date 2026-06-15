@@ -163,7 +163,19 @@ function PadCenter({ label, width = 80, height = 80, labelSize = 12 }) {
 // The teach pendant. Maximize/restore is driven entirely by the
 // surrounding PanelChrome corner button — JogPanel no longer renders
 // its own toggle.
+//
+// Sizing notes for tablet (≈1200px CSS landscape):
+// at the previous fixed sizes (LEFT 180, RIGHT 150, padBtn 96) the
+// jog panel needed ~1154px which overflowed the 1136px usable width
+// inside the Program tab. The constants below scale down at narrow
+// viewports so the whole pad fits without horizontal scroll.
 function JogPanel({ maximized }) {
+  const winW = (typeof window !== 'undefined') ? window.innerWidth : 1280
+  // Three breakpoints — tablet (≤ 1280), laptop (≤ 1500), desktop.
+  // The thresholds are deliberately conservative so the panel stays
+  // touch-friendly on the tablet without shrinking on real desktops.
+  const isTabletW = winW <= 1280
+  const isNarrowW = winW <= 1500
   const jog          = useStore((s) => s.jog)
   const jogCartesian = useStore((s) => s.jogCartesian)
   const triggerEstop = useStore((s) => s.triggerEstop)
@@ -198,40 +210,92 @@ function JogPanel({ maximized }) {
     }
   }, [jog, jogCartesian])
 
-  // Sizing knobs flip between normal and maximised modes. Every value
-  // below is sized to the spec'd jog button sheet — the panel fills
-  // the available area instead of clustering buttons in a corner.
+  // Sizing knobs flip between normal and maximised modes AND drop a
+  // tier at narrow viewports (tablet/laptop) so the whole pad fits
+  // without horizontal scroll. The desktop sizes are unchanged.
   //
   // Arrow / d-pad buttons:
-  const padBtn     = maximized ? 140 : 96
-  const zBtnWidth  = maximized ? 140 : 96
-  const zBtnHeight = maximized ? 140 : 96
-  const jointBtnW  = maximized ? 140 : 96
-  const jointBtnH  = maximized ? 140 : 96
-  const svgPx      = maximized ? 60  : 42
-  const lblPx      = maximized ? 16  : 13
+  const padBtn     = maximized
+    ? (isTabletW ? 84 : isNarrowW ? 108 : 140)
+    : (isTabletW ? 72 : isNarrowW ? 84  : 96)
+  const zBtnWidth  = padBtn
+  const zBtnHeight = padBtn
+  const jointBtnW  = padBtn
+  const jointBtnH  = padBtn
+  const svgPx      = maximized
+    ? (isTabletW ? 38 : isNarrowW ? 48 : 60)
+    : (isTabletW ? 32 : isNarrowW ? 38 : 42)
+  const lblPx      = maximized
+    ? (isTabletW ? 12 : isNarrowW ? 14 : 16)
+    : (isTabletW ? 11 : isNarrowW ? 12 : 13)
   // Gaps inside each d-pad and between the three d-pad groups.
-  const padInner   = maximized ? 14  : 10
-  const padGroup   = maximized ? 40  : 28
-  const jointColGap = maximized ? 24 : 16
+  const padInner   = maximized
+    ? (isTabletW ? 8  : isNarrowW ? 10 : 14)
+    : (isTabletW ? 6  : isNarrowW ? 8  : 10)
+  const padGroup   = maximized
+    ? (isTabletW ? 16 : isNarrowW ? 24 : 40)
+    : (isTabletW ? 12 : isNarrowW ? 20 : 28)
+  const jointColGap = maximized
+    ? (isTabletW ? 12 : isNarrowW ? 18 : 24)
+    : (isTabletW ?  8 : isNarrowW ? 12 : 16)
   // Joint label that sits between +/- buttons of each joint column.
-  const jointLblFont = maximized ? 16 : 13
-  const jointLblMb   = maximized ? 10 : 6
+  const jointLblFont = maximized
+    ? (isTabletW ? 12 : isNarrowW ? 14 : 16)
+    : (isTabletW ? 11 : isNarrowW ? 12 : 13)
+  const jointLblMb   = maximized
+    ? (isTabletW ? 6 : isNarrowW ? 8 : 10)
+    : (isTabletW ? 4 : isNarrowW ? 5 : 6)
   // Action buttons on the right (Run / Pause / Stop / Home / Teach).
-  const actionMinH = maximized ? 68  : 52
-  const actionFont = maximized ? 17  : 14
-  const actionMinW = maximized ? 100 : 80
-  const actionGap  = maximized ? 14  : 10
+  const actionMinH = maximized
+    ? (isTabletW ? 56 : isNarrowW ? 60 : 68)
+    : (isTabletW ? 44 : isNarrowW ? 48 : 52)
+  const actionFont = maximized
+    ? (isTabletW ? 14 : isNarrowW ? 16 : 17)
+    : (isTabletW ? 12 : isNarrowW ? 13 : 14)
+  const actionMinW = maximized
+    ? (isTabletW ? 84  : isNarrowW ? 92  : 100)
+    : (isTabletW ? 64  : isNarrowW ? 72  : 80)
+  const actionGap  = maximized
+    ? (isTabletW ? 8  : isNarrowW ? 12 : 14)
+    : (isTabletW ? 6  : isNarrowW ?  8 : 10)
   // Mode toggle buttons (XYZ / Joint).
-  const modeMinH   = maximized ? 56  : 44
-  const modeFont   = maximized ? 16  : 13
-  const modePadX   = maximized ? 24  : 18
+  const modeMinH   = maximized
+    ? (isTabletW ? 46 : isNarrowW ? 50 : 56)
+    : (isTabletW ? 40 : isNarrowW ? 42 : 44)
+  const modeFont   = maximized
+    ? (isTabletW ? 13 : isNarrowW ? 14 : 16)
+    : (isTabletW ? 12 : isNarrowW ? 13 : 13)
+  const modePadX   = maximized
+    ? (isTabletW ? 14 : isNarrowW ? 18 : 24)
+    : (isTabletW ? 12 : isNarrowW ? 14 : 18)
   // Step-size chips (small selection grid).
-  const stepBtnH   = maximized ? 56  : 36
-  const stepBtnFont = maximized ? 15 : 12
-  const sectionLabelFont = maximized ? 13 : 11
-  const speedFont  = maximized ? 15 : 13
-  const containerPad = maximized ? 20 : 12
+  const stepBtnH   = maximized
+    ? (isTabletW ? 44 : isNarrowW ? 48 : 56)
+    : (isTabletW ? 32 : isNarrowW ? 34 : 36)
+  const stepBtnFont = maximized
+    ? (isTabletW ? 13 : isNarrowW ? 14 : 15)
+    : (isTabletW ? 11 : isNarrowW ? 12 : 12)
+  const sectionLabelFont = maximized
+    ? (isTabletW ? 12 : 13)
+    : (isTabletW ? 11 : 11)
+  const speedFont  = maximized
+    ? (isTabletW ? 13 : isNarrowW ? 14 : 15)
+    : (isTabletW ? 12 : 13)
+  const containerPad = maximized
+    ? (isTabletW ? 10 : isNarrowW ? 16 : 20)
+    : (isTabletW ?  8 : isNarrowW ? 10 : 12)
+  // Column widths — at narrow viewports the LEFT (jog mode/step/speed)
+  // and RIGHT (Run/Pause/Stop) panels shrink so the centre d-pad has
+  // room. They keep flexShrink: 0 in the JSX below to stay readable.
+  const leftColW  = maximized
+    ? (isTabletW ? 168 : isNarrowW ? 196 : 220)
+    : (isTabletW ? 132 : isNarrowW ? 156 : 180)
+  const rightColW = maximized
+    ? (isTabletW ? 132 : isNarrowW ? 156 : 180)
+    : (isTabletW ? 108 : isNarrowW ? 128 : 150)
+  const rowGap    = maximized
+    ? (isTabletW ? 14 : isNarrowW ? 20 : 28)
+    : (isTabletW ?  8 : isNarrowW ? 12 : 16)
 
   const { estop } = safety
   const { running, paused, state, program_step, program_total } = task
@@ -267,16 +331,17 @@ function JogPanel({ maximized }) {
   return (
     <div style={{
       padding: containerPad, background: '#fff',
-      width: '100%', height: '100%', overflowY: 'auto',
+      width: '100%', height: '100%',
+      overflowX: 'hidden', overflowY: 'auto',
       display: 'flex', flexDirection: 'row',
       alignItems: 'center', justifyContent: 'space-evenly',
-      gap: maximized ? 28 : 16,
+      gap: rowGap,
       boxSizing: 'border-box',
     }}>
       {/* LEFT — mode, step, speed */}
       <div style={{
         display: 'flex', flexDirection: 'column', gap: 10,
-        width: maximized ? 220 : 180, flexShrink: 0,
+        width: leftColW, flexShrink: 0,
         alignSelf: 'stretch', justifyContent: 'center',
       }}>
         <div style={{ fontSize: maximized ? 16 : 14, fontWeight: 700, color: '#111' }}>Jog</div>
@@ -398,7 +463,7 @@ function JogPanel({ maximized }) {
       {/* RIGHT — Run/Pause/Stop/Home + Teach */}
       <div style={{
         display: 'flex', flexDirection: 'column', gap: actionGap,
-        width: maximized ? 180 : 150, flexShrink: 0,
+        width: rightColW, flexShrink: 0,
         alignSelf: 'stretch', justifyContent: 'center',
       }}>
         <button onClick={paused ? resumeProgram : runProgram}
@@ -459,11 +524,14 @@ function JogPanel({ maximized }) {
 // Hard floors / fractional ceilings for the resizable panels. The
 // floors are derived from "what does each panel need to keep its
 // controls visible" — they keep buttons from being clipped no matter
-// how the operator drags the dividers.
-const PROGRAM_MIN_WIDTH = 380   // editor: step-row buttons (Edit / Teach / Del) fit
-const VIEWER_MIN_WIDTH  = 250   // 3D arm: enough to see the robot model
+// how the operator drags the dividers. Floors are intentionally low
+// enough that on a tablet (~1200 px CSS landscape) the editor +
+// divider + viewer always fit inside the Program tab without
+// overflowing horizontally.
+const PROGRAM_MIN_WIDTH = 320   // editor: step-row buttons stay readable
+const VIEWER_MIN_WIDTH  = 220   // 3D arm: enough to see the robot model
 const PROGRAM_MAX_FRAC  = 0.75  // editor can take up to 75% of the row
-const JOG_MIN_HEIGHT    = 420   // jog: 96×96 d-pad + label + chrome 44 + padding fit
+const JOG_MIN_HEIGHT    = 360   // jog: shrunk pad (72 px buttons on tablet) fits
 const JOG_MAX_FRAC      = 0.6   // jog can take up to 60% of available height
 
 function useWindowSize() {
@@ -598,7 +666,11 @@ export default function ProgramLayout() {
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+    <div style={{
+      display: 'flex', flexDirection: 'column', height: '100%',
+      width: '100%', maxWidth: '100%',
+      overflowX: 'hidden', overflowY: 'hidden',
+    }}>
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
         <div style={{ width: leftWidth, flexShrink: 0, display: 'flex', overflow: 'hidden' }}>
           <PanelChrome

@@ -1,0 +1,17 @@
+# GenerateFromDemonstration.srv
+# Declarative interface for the demo->program pipeline. The dashboard
+# currently calls the orchestration via HTTP (/api/pbd/*) into the
+# library directly; this .srv is kept as the canonical contract so a
+# future migration to a true rclpy service is one srv-build away.
+
+# Request
+string demo_id            # demonstration directory under /opt/cobot/demonstrations
+string video_path         # absolute path to uploaded video
+string backend_override   # optional: "api" | "local" | "" for config default
+---
+# Response
+bool   ok
+string error              # empty when ok=true
+string structured_intent  # JSON-encoded StructuredIntent
+string program_draft      # JSON-encoded ProgramDraft
+string transcript         # local Whisper transcript

@@ -4,6 +4,7 @@ import TopBar from './components/TopBar'
 import StatusBar from './components/StatusBar'
 import ToastContainer from './components/ToastContainer'
 import EStopOverlay from './components/EStopOverlay'
+import ViewportDebug from './components/ViewportDebug'
 import MonitorDashboard from './pages/MonitorDashboard'
 import ProgramLayout from './layouts/ProgramLayout'
 import View3DLayout from './layouts/View3DLayout'
@@ -59,11 +60,17 @@ class ErrorBoundary extends Component {
   }
 }
 
+// App shell. Width clamped to the device viewport so a stray
+// fixed-pixel sub-tree can't push the whole page wider than the
+// screen and get clipped by the body-level overflow:hidden — the
+// problem the tablet exhibited before this build.
 const gridStyle = {
   display: 'grid',
   gridTemplateAreas: '"topbar" "content" "statusbar"',
   gridTemplateColumns: '1fr',
   gridTemplateRows: '60px 1fr 36px',
+  width: '100%',
+  maxWidth: '100vw',
   height: '100vh',
   overflow: 'hidden',
   background: 'var(--bg-app)',
@@ -108,6 +115,7 @@ export default function App() {
 
         <ToastContainer />
         <EStopOverlay />
+        <ViewportDebug />
       </div>
     </ErrorBoundary>
   )

@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 import ProgramWizard from './ProgramWizard'
+import ProgramFromDemonstration from './ProgramFromDemonstration'
 
 // The richer action taxonomy lives in the editor. Each action carries
 // a coarse `type` (matching the existing backend schema: move/gripper/
@@ -49,8 +50,30 @@ const TEACHABLE_ACTIONS = [
   'move_home', 'move_joint', 'move_linear',
   'approach',  'pick',       'place',
 ]
+
+// A derived offset move (descend / lift / retreat / "approach finished
+// part") computes its target at runtime as <source taught_tcp> + Z
+// offset; the operator never teaches it directly. Explicit derived_from
+// tag is the new shape emitted by the wizard; the offset_z_mm heuristic
+// covers older saved programs that were generated before the tag
+// existed (their descend/lift had offset_z_mm set and no taught data of
+// their own, which uniquely identifies them as wizard-derived).
+function isDerivedOffsetMove(step) {
+  if (!step) return false
+  if (step.derived_from) return true
+  const isMoveLinear = step.action === 'move_linear' || step.type === 'move'
+  if (!isMoveLinear) return false
+  if (step.offset_z_mm === undefined || step.offset_z_mm === null) return false
+  const hasJoints = Array.isArray(step.taught_joints) && step.taught_joints.length >= 6
+  const hasTcp    = Array.isArray(step.taught_tcp)    && step.taught_tcp.length    >= 3
+  return !hasJoints && !hasTcp
+}
+
 function isTeachable(step) {
   if (!step) return false
+  // Derived offset moves resolve at runtime from their source step's
+  // taught pose, so the operator must NOT teach them independently.
+  if (isDerivedOffsetMove(step)) return false
   // Prefer the explicit action when set (wizard-emitted or PUT'd via
   // /api/programs). Fall back to deriving an action from the legacy
   // 'type' field (default STATE.program.steps used 'type' only) — but
@@ -89,7 +112,16 @@ function detailLine(step, ioLabels) {
   if (step.duration_s)  bits.push(step.duration_s + 's')
   if (step.width_mm)    bits.push(step.width_mm + 'mm')
   if (step.descend_mm)  bits.push('descend ' + step.descend_mm + 'mm')
-  if (step.offset_z_mm !== undefined) bits.push('z' + (step.offset_z_mm >= 0 ? '+' : '') + step.offset_z_mm + 'mm')
+  // Derived offset moves: show "from <role>, z+Nmm" so the operator can
+  // see at a glance that this step is computed at runtime from a taught
+  // source — no Teach button, no separate pose to record.
+  if (isDerivedOffsetMove(step)) {
+    const role = step.derived_from || 'prev'
+    const z = step.offset_z_mm ?? 0
+    bits.push('from ' + role + ', z' + (z >= 0 ? '+' : '') + z + 'mm')
+  } else if (step.offset_z_mm !== undefined) {
+    bits.push('z' + (step.offset_z_mm >= 0 ? '+' : '') + step.offset_z_mm + 'mm')
+  }
   if (step.speed_pct)   bits.push(step.speed_pct + '%')
   if (step.io_id)       bits.push(ioName(step.io_id) + '=' + (step.value ? 'ON' : 'OFF'))
   if (step.io_open)         bits.push('open→' + ioName(step.io_open))
@@ -828,15 +860,20 @@ function TeachOverlay({
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
   }, [])
-  const isWide = vw > 1400
-  const padBtn      = isWide ? 160 : 140
-  const svgPx       = isWide ? 72  : 60
-  const padGap      = 14
-  const groupGap    = 40
-  const actionH     = isWide ? 78  : 68
-  const actionFont  = isWide ? 18  : 16
-  const modeBtnH    = isWide ? 64  : 56
-  const modeBtnFont = isWide ? 17  : 16
+  // Three tiers — tablet (≤ 1280 CSS px landscape ONN 11"), narrow
+  // laptop, desktop. The previous two-tier scheme bottomed out at a
+  // 140 px d-pad which overflowed the tablet's 1200 px viewport
+  // (three 3×3 grids of 140 px + gaps + padding ≈ 1472 px).
+  const isWide   = vw > 1400
+  const isTabletW = vw <= 1280
+  const padBtn      = isTabletW ? 96  : isWide ? 160 : 140
+  const svgPx       = isTabletW ? 42  : isWide ?  72 :  60
+  const padGap      = isTabletW ? 10  : 14
+  const groupGap    = isTabletW ? 24  : 40
+  const actionH     = isTabletW ? 56  : isWide ?  78 :  68
+  const actionFont  = isTabletW ? 14  : isWide ?  18 :  16
+  const modeBtnH    = isTabletW ? 48  : isWide ?  64 :  56
+  const modeBtnFont = isTabletW ? 14  : isWide ?  17 :  16
 
   const modeBtn = (on) => ({
     padding: '0 26px', minHeight: modeBtnH, fontSize: modeBtnFont, fontWeight: 700,
@@ -876,12 +913,15 @@ function TeachOverlay({
       background: '#0A0A0B', color: '#e5e7eb',
       display: 'flex', flexDirection: 'column',
       userSelect: 'none',
+      overflowX: 'hidden',
     }}>
       {/* HEADER */}
       <div style={{
         height: 60, flexShrink: 0,
         background: '#141416', borderBottom: '1px solid #2a2a30',
-        display: 'flex', alignItems: 'center', padding: '0 22px', gap: 16,
+        display: 'flex', alignItems: 'center',
+        padding: isTabletW ? '0 14px' : '0 22px',
+        gap: 16,
       }}>
         <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
           <div style={{ fontSize: 14, fontWeight: 600, color: '#9ca3af', letterSpacing: '0.04em' }}>
@@ -923,8 +963,8 @@ function TeachOverlay({
         background: '#0A0A0B',
         display: 'flex', flexDirection: 'column',
         justifyContent: 'center', alignItems: 'center',
-        padding: 24, gap: 18,
-        overflow: 'auto',
+        padding: isTabletW ? 12 : 24, gap: isTabletW ? 12 : 18,
+        overflowX: 'hidden', overflowY: 'auto',
       }}>
         {/* Mode toggle row — flex 0 0 auto. */}
         <div style={{
@@ -1154,6 +1194,7 @@ export default function ProgramEditor() {
   // status) is fine to keep local — losing it on tab switch is the
   // expected behaviour, file-manager style.
   const [showWizard, setShowWizard]         = useState(false)
+  const [showPbd,    setShowPbd]            = useState(false)
   const [editingId, setEditingId]           = useState(null)
   const [selectedId, setSelectedId]         = useState(null)
   const [dragId, setDragId]                 = useState(null)
@@ -1640,6 +1681,16 @@ export default function ProgramEditor() {
           New Program Wizard
         </button>
 
+        <button onClick={() => setShowPbd(true)}
+          title="Generate a draft program from a demonstration video + voice narration"
+          style={{
+            padding: '6px 12px', fontSize: 12, fontWeight: 600,
+            background: '#7C3AED', color: '#fff', border: 'none',
+            borderRadius: 6, cursor: 'pointer', flexShrink: 0,
+          }}>
+          Program from Demonstration
+        </button>
+
         <button onClick={() => setLocked(!locked)}
           title={locked ? 'Unlock to edit steps, drag-reorder, and add/delete' : 'Lock the program so it can only be read or run'}
           style={{
@@ -2062,6 +2113,25 @@ export default function ProgramEditor() {
               setProgramSteps(ingest)
             }
             setShowWizard(false)
+          }}
+        />
+      )}
+
+      {showPbd && (
+        <ProgramFromDemonstration
+          onClose={() => setShowPbd(false)}
+          onSaved={(program) => {
+            if (program) {
+              const ingest = renumber(program.steps || [])
+              setCurrentProgram({
+                id:      program.id,
+                name:    program.name || 'Demonstration draft',
+                steps:   ingest,
+                unsaved: false,
+              })
+              setProgramSteps(ingest)
+            }
+            setShowPbd(false)
           }}
         />
       )}

@@ -116,6 +116,13 @@ function JogArrow({ onPress, color, label, rotation, size = 64 }) {
   }, [])
   useEffect(() => () => stop(), [stop])
 
+  // Inner content scales with the button size so big touch buttons in the
+  // fullscreen teach pendant don't render with a tiny arrow + label in the
+  // middle. Floors stay at the previous fixed values so the smaller jog
+  // panels (TeachWithJog at size 64) render identically to before.
+  const svgPx = Math.max(24, Math.floor(size * 0.28))
+  const lblPx = Math.max(10, Math.floor(size * 0.10))
+
   return (
     <button
       onMouseDown={start}
@@ -132,10 +139,10 @@ function JogArrow({ onPress, color, label, rotation, size = 64 }) {
         alignItems: 'center', justifyContent: 'center', gap: 2,
         userSelect: 'none', touchAction: 'none',
       }}>
-      <svg width="24" height="24" viewBox="0 0 24 24" style={{ transform: `rotate(${rotation}deg)` }}>
+      <svg width={svgPx} height={svgPx} viewBox="0 0 24 24" style={{ transform: `rotate(${rotation}deg)` }}>
         <path d="M12 4l-8 8h5v8h6v-8h5z" fill={color} />
       </svg>
-      <span style={{ fontSize: 10, fontWeight: 700, color: '#374151' }}>{label}</span>
+      <span style={{ fontSize: lblPx, fontWeight: 700, color: '#374151' }}>{label}</span>
     </button>
   )
 }
@@ -733,7 +740,7 @@ function CustomGripperPanel({ answers, setAnswer, goNext }) {
 // TeachSequence — the dedicated end-of-wizard teach flow
 //
 // One position at a time. Derives the list from `answers` (operation
-// + pallet_mode + scan_after, etc.), walks the operator through them
+// + pallet_mode, etc.), walks the operator through them
 // with a full-bleed jog pendant (140×140 buttons, same sizing as the
 // Program tab's maximised pendant), and writes the recorded
 // {tcp, joints, taught_at, skipped} payload into answers under
@@ -793,15 +800,6 @@ function teachPositionsForAnswers(answers) {
       key: 'taught_sort_2', label: 'SORT PLACE 2',
       instr: 'Jog the robot to the second sort destination — where type 2 parts are placed.',
     })
-  } else if (op === 'inspect') {
-    positions.push({
-      key: 'taught_pick', label: 'PICK POSITION',
-      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
-    })
-    positions.push({
-      key: 'taught_inspect', label: 'INSPECT POSITION',
-      instr: 'Jog the robot to the inspection station — where it holds the part in front of the camera for inspection.',
-    })
   } else {
     // Default: pick_and_place and anything else with a pick + place flow.
     positions.push({
@@ -813,6 +811,20 @@ function teachPositionsForAnswers(answers) {
       instr: 'Jog the robot to where it should place parts, above the target location at the correct approach angle.',
     })
   }
+  // Every operation's generated program ends with a move_home ("Return
+  // to home" — buildSteps / buildPalletizeSteps both emit it). Append a
+  // teach step keyed to the same 'taught_home' so the return appears in
+  // the sequence and the reuse mechanism fires in forward navigation:
+  // teaching Home at step 1 populates the key, and reaching the return
+  // step shows the Reuse/Re-teach choice screen with the recorded TCP.
+  // Same key = single shared value; Re-teach here overwrites both
+  // references, by design (Re-teach updates "any other step in this
+  // session that references the same key" — task spec).
+  positions.push({
+    key: 'taught_home',
+    label: 'HOME (return)',
+    instr: 'The robot returns to this position after completing each cycle. Reuse the home you taught earlier, or teach a different return position — re-teaching here updates the start-home as well, since both reference the same logical home.',
+  })
   return positions
 }
 
@@ -821,15 +833,22 @@ function ProgressDots({ count, currentIdx, statuses }) {
     <div style={{ display: 'flex', gap: 10, justifyContent: 'center', margin: '12px 0' }}>
       {Array.from({ length: count }).map((_, i) => {
         const s = statuses[i] || 'pending'
+        // 'reused' renders as a hollow blue dot to set it apart from
+        // 'recorded' (solid blue) — same logical value but a different
+        // user action got it there.
+        const isReused = s === 'reused'
         const fill = s === 'recorded' ? '#2563EB'
+                   : isReused         ? '#fff'
                    : s === 'skipped'  ? '#d1d5db'
                    : i === currentIdx ? '#bfdbfe' : '#e5e7eb'
+        const border = isReused ? '2px solid #2563EB' : 'none'
         const ring = i === currentIdx ? '2px solid #2563EB' : 'none'
         return (
           <div key={i} title={`Step ${i + 1}: ${s}`}
             style={{
               width: 14, height: 14, borderRadius: '50%',
-              background: fill, outline: ring, outlineOffset: 2,
+              background: fill, border, outline: ring, outlineOffset: 2,
+              boxSizing: 'border-box',
             }} />
         )
       })}
@@ -837,7 +856,7 @@ function ProgressDots({ count, currentIdx, statuses }) {
   )
 }
 
-function TeachSequence({ answers, setAnswer, onComplete, onBackToName }) {
+function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSteps, setReusedSteps }) {
   const jog          = useStore((s) => s.jog)
   const jogCartesian = useStore((s) => s.jogCartesian)
   const homeRobot    = useStore((s) => s.homeRobot)
@@ -851,6 +870,23 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName }) {
   const [speed, setSpeed]     = useState(20)
   const [liveJoints, setLiveJoints] = useState([0, -90, 0, -90, 0, 0])
   const [liveTcp,    setLiveTcp]    = useState([0, 0, 0, 0, 0, 0])
+
+  // forceTeach[posIdx] = true means the operator clicked "Re-teach" on the
+  // reuse-choice screen for this step, so we should render the jog
+  // pendant even though the underlying key is already recorded. Keyed by
+  // step index, not key, so two steps that share a key (back-nav, future
+  // duplicate entries) can have independent decisions.
+  const [forceTeach, setForceTeach] = useState({})
+
+  const clearReusedAt = (idx) => {
+    if (!setReusedSteps) return
+    setReusedSteps((prev) => {
+      if (!prev || !prev[idx]) return prev
+      const next = { ...prev }
+      delete next[idx]
+      return next
+    })
+  }
 
   const stepRef  = useRef(step)
   const speedRef = useRef(speed)
@@ -885,9 +921,12 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName }) {
     }
   }, [jog, jogCartesian])
 
-  // Compute per-position status (recorded / skipped / pending) for the
-  // progress dots and Review page card.
+  // Compute per-position status (recorded / reused / skipped / pending)
+  // for the progress dots and Review page card. A step marked 'reused'
+  // for this session beats the underlying answer's 'recorded' state so
+  // the operator can see at a glance which steps they revisited.
   const statusOf = (i) => {
+    if (reusedSteps?.[i]) return 'reused'
     const v = answers[positions[i].key]
     if (!v) return 'pending'
     if (v.skipped) return 'skipped'
@@ -897,6 +936,16 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName }) {
   const statuses = positions.map((_, i) => statusOf(i))
 
   const current = positions[posIdx]
+
+  // The reuse prompt fires when the current step's key already holds a
+  // recorded (non-skipped, has tcp/joints) value from earlier in this
+  // session — either a prior step that shares the key, a back-nav return,
+  // or a re-entry into the teach sequence.
+  const existingForCurrent = current ? answers[current.key] : null
+  const alreadyRecordedHere = !!(existingForCurrent &&
+    !existingForCurrent.skipped &&
+    (Array.isArray(existingForCurrent.tcp) || Array.isArray(existingForCurrent.joints)))
+  const showChoiceScreen = alreadyRecordedHere && !forceTeach[posIdx]
 
   const advanceOrComplete = useCallback(() => {
     if (posIdx >= positions.length - 1) {
@@ -918,6 +967,9 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName }) {
         taught_at: new Date().toISOString(),
         skipped: false,
       })
+      // This step is now freshly taught — drop any prior 'reused' flag
+      // so the progress dot / review shows the new fresh-record state.
+      clearReusedAt(posIdx)
       setFlash(true)
       setTimeout(() => { setFlash(false); advanceOrComplete() }, 1500)
     } catch {}
@@ -929,6 +981,7 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName }) {
       taught_at: new Date().toISOString(),
       skipped: true,
     })
+    clearReusedAt(posIdx)
     advanceOrComplete()
   }
 
@@ -943,20 +996,83 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName }) {
     onComplete()
   }
 
+  // Reuse the existing taught value as-is. Don't touch the answer; just
+  // mark this step as 'reused' for the progress dot + Review summary and
+  // advance. No jog/record needed.
+  function reuseCurrent() {
+    if (setReusedSteps) {
+      setReusedSteps((prev) => ({ ...(prev || {}), [posIdx]: true }))
+    }
+    advanceOrComplete()
+  }
+
+  // Operator wants to teach this position fresh. Pivot the body to the
+  // jog pendant by setting forceTeach for this step; clear any prior
+  // reused flag (it would be overwritten by recordPosition anyway, but
+  // also keeps the progress dot honest while they're jogging).
+  function reteachCurrent() {
+    setForceTeach((p) => ({ ...p, [posIdx]: true }))
+    clearReusedAt(posIdx)
+  }
+
   function goBack() {
     if (posIdx === 0) onBackToName()
     else setPosIdx(posIdx - 1)
   }
 
-  // Fullscreen-pendant button sizes. Matches the maximised JogPanel
-  // in ProgramLayout so the operator gets the same big buttons here.
-  const padBtn  = 140
-  const svgPx   = 60
-  const lblPx   = 16
-  const padGap  = 14
+  // Jog-pad button size is computed from the live size of the jog-pad
+  // container so the buttons fill the available area without overflowing.
+  // The fullscreen overlay flexes header / title / control / dots / footer
+  // as fixed bands and gives the jog-pad container `flex: 1` for the rest;
+  // ResizeObserver below measures that container and picks the largest
+  // square button size that lets the full layout fit at once. No scroll.
+  const jogPadRef = useRef(null)
+  const [padBtn, setPadBtn] = useState(120)
+  const padGap = 12
+
+  useEffect(() => {
+    if (showChoiceScreen) return  // pad not rendered in choice mode
+    const el = jogPadRef.current
+    if (!el) return
+    const recalc = () => {
+      const w = el.clientWidth
+      const h = el.clientHeight
+      if (w <= 0 || h <= 0) return
+      const containerPad = 32 // matches padding: 16 top + 16 bottom/sides
+      const blockGap = 28     // gap between position/height/rotation blocks
+      const availW = Math.max(0, w - containerPad)
+      const availH = Math.max(0, h - containerPad)
+      let size
+      if (jogMode === 'cartesian') {
+        // Cartesian: 7 button-widths across (position 3 + height 1 +
+        // rotation 3), with 4 intra-block gaps + 2 block gaps.
+        const byW = (availW - 4 * padGap - 2 * blockGap) / 7
+        // 3 button-heights tall (position / rotation blocks dominate),
+        // with 2 inter-row gaps.
+        const byH = (availH - 2 * padGap) / 3
+        size = Math.min(byW, byH)
+      } else {
+        // Joint: 6 column blocks; each column is 2 stacked buttons plus a
+        // small label above. 5 inter-column gaps.
+        const colGap = 20
+        const labelBand = 28
+        const byW = (availW - 5 * colGap) / 6
+        const byH = (availH - labelBand - padGap) / 2
+        size = Math.min(byW, byH)
+      }
+      // 60px floor keeps buttons tappable at small viewports; 220px cap
+      // keeps them from looking comically big on ultra-wide displays.
+      size = Math.max(60, Math.min(size, 220))
+      setPadBtn(Math.floor(size))
+    }
+    recalc()
+    const ro = new ResizeObserver(recalc)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [jogMode, showChoiceScreen])
 
   const modeBtn = (on) => ({
-    padding: '14px 22px', minHeight: 52, fontSize: 15, fontWeight: 700,
+    padding: '12px 20px', minHeight: 48, fontSize: 14, fontWeight: 700,
     background: on ? '#2563EB' : '#f3f4f6',
     color:      on ? '#fff'    : '#374151',
     border:     on ? '2px solid #2563EB' : '2px solid #d1d5db',
@@ -964,123 +1080,210 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName }) {
   })
 
   return (
+    // True fullscreen container — no centered modal, no backdrop margins,
+    // no rounded corners. The overlay IS the screen. Vertical flex column
+    // with overflow: hidden so the layout exactly fills 100vh and nothing
+    // scrolls. The jog pad area absorbs all remaining vertical space.
     <div style={{
-      position: 'fixed', inset: 0, zIndex: 1000,
-      background: 'rgba(15,23,42,0.55)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      padding: 20,
+      position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+      width: '100vw', height: '100vh',
+      margin: 0, padding: 0, borderRadius: 0,
+      zIndex: 2000,
+      background: '#fff',
+      display: 'flex', flexDirection: 'column',
+      overflow: 'hidden',
     }}>
+      {/* HEADER (~56px) */}
       <div style={{
-        width: '90vw', maxWidth: 900, height: '90vh',
-        background: '#fff', borderRadius: 16,
-        boxShadow: '0 25px 60px rgba(0,0,0,0.28)',
-        display: 'flex', flexDirection: 'column', overflow: 'hidden',
+        flex: '0 0 auto', height: 56, minHeight: 56,
+        padding: '0 24px',
+        borderBottom: '1px solid #e5e7eb',
+        display: 'flex', alignItems: 'center', gap: 12,
+        boxSizing: 'border-box',
       }}>
-        {/* Header */}
         <div style={{
-          padding: '14px 20px', borderBottom: '1px solid #e5e7eb',
-          display: 'flex', alignItems: 'center', gap: 12,
+          fontSize: 11, fontWeight: 700, color: '#6b7280',
+          textTransform: 'uppercase', letterSpacing: '0.08em',
         }}>
-          <div style={{
-            fontSize: 11, fontWeight: 700, color: '#6b7280',
-            textTransform: 'uppercase', letterSpacing: '0.08em',
+          Teaching Positions
+        </div>
+        <div style={{ flex: 1 }} />
+        <div style={{ fontSize: 12, color: '#374151', fontWeight: 600 }}>
+          Step {posIdx + 1} of {positions.length}
+        </div>
+        <button onClick={skipAllRemaining}
+          title="Skip all remaining positions and go to Review"
+          style={{
+            padding: '8px 14px', fontSize: 12, fontWeight: 600,
+            background: 'transparent', color: '#DC2626',
+            border: '1px solid #fecaca', borderRadius: 6, cursor: 'pointer',
           }}>
-            Teaching Positions
+          × Skip All
+        </button>
+      </div>
+
+      {/* TITLE + INSTRUCTION + READOUT (~80px) — flex:0 0 auto so it never
+          steals space from the jog pad. Instruction is clamped to 2 lines
+          via -webkit-line-clamp to keep the band height bounded. */}
+      <div style={{
+        flex: '0 0 auto',
+        padding: '10px 24px',
+        borderBottom: '1px solid #f3f4f6',
+        boxSizing: 'border-box',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 4, flexWrap: 'nowrap', minWidth: 0 }}>
+          <div style={{
+            width: 28, height: 28, borderRadius: '50%',
+            background: '#2563EB', color: '#fff',
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 13, fontWeight: 800, flexShrink: 0,
+          }}>{posIdx + 1}</div>
+          <div style={{
+            fontSize: 19, fontWeight: 800, color: '#111', lineHeight: 1.2,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0,
+          }}>
+            {current.label}
           </div>
           <div style={{ flex: 1 }} />
-          <div style={{ fontSize: 12, color: '#374151', fontWeight: 600 }}>
-            Step {posIdx + 1} of {positions.length}
+          <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#6b7280', whiteSpace: 'nowrap', flexShrink: 0 }}>
+            Joints [{liveJoints.map((j) => j.toFixed(1)).join(', ')}]°
           </div>
-          <button onClick={skipAllRemaining}
-            title="Skip all remaining positions and go to Review"
-            style={{
-              padding: '6px 12px', fontSize: 12, fontWeight: 600,
-              background: 'transparent', color: '#DC2626',
-              border: '1px solid #fecaca', borderRadius: 6, cursor: 'pointer',
-            }}>
-            × Skip All
-          </button>
+          <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#6b7280', whiteSpace: 'nowrap', flexShrink: 0 }}>
+            TCP [{liveTcp.slice(0, 3).map((t) => Number(t).toFixed(3)).join(', ')}]
+          </div>
         </div>
+        <div style={{
+          fontSize: 13, color: '#6b7280', lineHeight: 1.4,
+          display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+          overflow: 'hidden',
+        }}>
+          {current.instr}
+        </div>
+      </div>
 
-        {/* Body — scrollable so big buttons + readout fit at smaller heights. */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '20px 28px' }}>
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 8 }}>
+      {showChoiceScreen ? (
+        /* CHOICE SCREEN — fills the middle (flex:1), centered. Same shell
+           as the teach mode (header above, footer below) so the operator
+           gets consistent navigation. No scroll. */
+        <div style={{
+          flex: '1 1 auto', minHeight: 0,
+          display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'center',
+          padding: 32, overflow: 'hidden',
+          background: '#fafafa',
+        }}>
+          <div style={{ maxWidth: 720, width: '100%' }}>
             <div style={{
-              width: 30, height: 30, borderRadius: '50%',
-              background: '#2563EB', color: '#fff',
-              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 13, fontWeight: 800,
-            }}>{posIdx + 1}</div>
-            <div style={{ fontSize: 24, fontWeight: 800, color: '#111', lineHeight: 1.2 }}>
-              {current.label}
+              padding: 22, marginBottom: 22,
+              background: '#f0fdf4', border: '1px solid #bbf7d0',
+              borderRadius: 12,
+            }}>
+              <div style={{ fontSize: 16, fontWeight: 700, color: '#16A34A', marginBottom: 10 }}>
+                ✓ This position is already taught
+              </div>
+              <div style={{ fontFamily: 'monospace', fontSize: 14, color: '#111', marginBottom: 6 }}>
+                {Array.isArray(existingForCurrent.tcp) && existingForCurrent.tcp.length >= 3 ? (
+                  <>
+                    <div>
+                      TCP: x:{Number(existingForCurrent.tcp[0]).toFixed(3)}
+                      {'  '}y:{Number(existingForCurrent.tcp[1]).toFixed(3)}
+                      {'  '}z:{Number(existingForCurrent.tcp[2]).toFixed(3)}
+                    </div>
+                    {existingForCurrent.tcp.length >= 6 && (
+                      <div>
+                        {'     '}rx:{Number(existingForCurrent.tcp[3]).toFixed(3)}
+                        {'  '}ry:{Number(existingForCurrent.tcp[4]).toFixed(3)}
+                        {'  '}rz:{Number(existingForCurrent.tcp[5]).toFixed(3)}
+                      </div>
+                    )}
+                  </>
+                ) : Array.isArray(existingForCurrent.joints) && existingForCurrent.joints.length ? (
+                  <div>
+                    Joints: [{existingForCurrent.joints.map((j) => Number(j).toFixed(1)).join(', ')}]°
+                  </div>
+                ) : null}
+              </div>
+              <div style={{ fontSize: 13, color: '#6b7280' }}>
+                Taught earlier in this setup.
+              </div>
+            </div>
+            <div style={{ fontSize: 16, color: '#374151', marginBottom: 18, textAlign: 'center' }}>
+              Do you want to reuse it or teach it again?
+            </div>
+            <div style={{ display: 'flex', gap: 14 }}>
+              <button onClick={reuseCurrent} style={{
+                flex: 1, minHeight: 64,
+                padding: '16px 22px', fontSize: 17, fontWeight: 800,
+                background: '#2563EB', color: '#fff',
+                border: 'none', borderRadius: 12, cursor: 'pointer',
+              }}>
+                ✓ Reuse This Position
+              </button>
+              <button onClick={reteachCurrent} style={{
+                flex: 1, minHeight: 64,
+                padding: '16px 22px', fontSize: 17, fontWeight: 700,
+                background: '#fff', color: '#374151',
+                border: '1px solid #d1d5db', borderRadius: 12, cursor: 'pointer',
+              }}>
+                ↻ Re-teach
+              </button>
             </div>
           </div>
-          <div style={{ fontSize: 16, color: '#6b7280', marginBottom: 18, lineHeight: 1.5 }}>
-            {current.instr}
-          </div>
-
-          {/* Live joint / TCP readout */}
+        </div>
+      ) : (
+        <>
+          {/* CONTROL BAR (~56px) — single row, no wrap. The speed slider
+              flexes to absorb leftover width. All touch targets ≥ 44px. */}
           <div style={{
-            padding: 12, marginBottom: 16, background: '#f8fafc', border: '1px solid #e5e7eb',
-            borderRadius: 8, fontFamily: 'monospace', fontSize: 12,
-            display: 'flex', gap: 24, flexWrap: 'wrap',
+            flex: '0 0 auto', minHeight: 56,
+            padding: '8px 16px',
+            borderBottom: '1px solid #f3f4f6',
+            display: 'flex', alignItems: 'center', gap: 8,
+            boxSizing: 'border-box',
           }}>
-            <div>
-              <span style={{ color: '#6b7280' }}>Joints: </span>
-              <span style={{ color: '#111', fontWeight: 700 }}>
-                [{liveJoints.map((j) => j.toFixed(1)).join(', ')}]°
-              </span>
-            </div>
-            <div>
-              <span style={{ color: '#6b7280' }}>TCP: </span>
-              <span style={{ color: '#111', fontWeight: 700 }}>
-                [{liveTcp.slice(0, 3).map((t) => Number(t).toFixed(3)).join(', ')}]
-              </span>
-            </div>
-          </div>
-
-          {/* Jog mode + step size + speed */}
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 16 }}>
             <button onClick={() => setJogMode('cartesian')} style={modeBtn(jogMode === 'cartesian')}>XYZ</button>
             <button onClick={() => setJogMode('joint')}     style={modeBtn(jogMode === 'joint')}>Joint</button>
-            <div style={{ display: 'flex', gap: 6, marginLeft: 12, flexWrap: 'wrap' }}>
-              <span style={{ fontSize: 12, color: '#6b7280', alignSelf: 'center' }}>Step:</span>
-              {[0.1, 0.5, 1, 5, 10].map((s) => (
-                <button key={s} onClick={() => setStep(s)} style={{
-                  padding: '8px 14px', fontSize: 13, fontWeight: 600, borderRadius: 6, cursor: 'pointer',
-                  minHeight: 40,
-                  background: step === s ? '#2563EB' : '#f3f4f6',
-                  color:      step === s ? '#fff'    : '#374151',
-                  border:     step === s ? 'none'    : '1px solid #e5e7eb',
-                }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
-              ))}
-            </div>
-            <div style={{ flex: 1, minWidth: 160 }}>
-              <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 2 }}>Speed: {speed}%</div>
+            <span style={{ fontSize: 12, color: '#6b7280', marginLeft: 8 }}>Step:</span>
+            {[0.1, 0.5, 1, 5, 10].map((s) => (
+              <button key={s} onClick={() => setStep(s)} style={{
+                padding: '10px 12px', fontSize: 13, fontWeight: 600, borderRadius: 6, cursor: 'pointer',
+                minHeight: 44, minWidth: 48,
+                background: step === s ? '#2563EB' : '#f3f4f6',
+                color:      step === s ? '#fff'    : '#374151',
+                border:     step === s ? 'none'    : '1px solid #e5e7eb',
+              }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
+            ))}
+            <div style={{ flex: 1, minWidth: 120, display: 'flex', alignItems: 'center', gap: 8, marginLeft: 8 }}>
+              <span style={{ fontSize: 12, color: '#6b7280', whiteSpace: 'nowrap' }}>Speed {speed}%</span>
               <input type="range" min={1} max={100} value={speed}
                 onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
-                style={{ width: '100%', height: 8 }} />
+                style={{ flex: 1, minWidth: 0 }} />
             </div>
             <button onClick={homeRobot} style={{
               padding: '10px 16px', fontSize: 13, fontWeight: 600,
               background: '#f3f4f6', color: '#374151',
               border: '1px solid #d1d5db', borderRadius: 6, cursor: 'pointer',
+              minHeight: 44,
             }}>Home</button>
             <button onClick={triggerEstop} style={{
               padding: '10px 16px', fontSize: 13, fontWeight: 700,
               background: '#DC2626', color: '#fff',
               border: 'none', borderRadius: 6, cursor: 'pointer',
+              minHeight: 44,
             }}>STOP</button>
           </div>
 
-          {/* Big jog pendant */}
-          <div style={{
-            padding: 16, background: '#fafafa', border: '1px solid #e5e7eb',
-            borderRadius: 10, marginBottom: 16,
-            display: 'flex', justifyContent: 'center', alignItems: 'center',
+          {/* JOG PAD — flex:1, scales to fit. Buttons sized via the
+              ResizeObserver effect above so the full layout always fits
+              the viewport without scrolling. */}
+          <div ref={jogPadRef} style={{
+            flex: '1 1 auto', minHeight: 0,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            padding: 16, overflow: 'hidden',
+            background: '#fafafa',
           }}>
             {jogMode === 'cartesian' ? (
-              <div style={{ display: 'flex', gap: 40, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'center' }}>
+              <div style={{ display: 'flex', gap: 28, alignItems: 'center', justifyContent: 'center' }}>
                 <div>
                   <div style={padLabelStyle}>Position</div>
                   <div style={{
@@ -1122,10 +1325,10 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName }) {
                 </div>
               </div>
             ) : (
-              <div style={{ display: 'flex', gap: 24, justifyContent: 'center', flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', gap: 20, justifyContent: 'center' }}>
                 {[1, 2, 3, 4, 5, 6].map((j) => (
                   <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: padGap }}>
-                    <div style={{ fontSize: lblPx, fontWeight: 700, color: '#374151' }}>{'J' + j}</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: '#374151' }}>{'J' + j}</div>
                     <JogArrow onPress={() => sendJog(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={padBtn} />
                     <JogArrow onPress={() => sendJog(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={padBtn} />
                   </div>
@@ -1133,38 +1336,52 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName }) {
               </div>
             )}
           </div>
+        </>
+      )}
 
-          {/* Progress dots */}
-          <ProgressDots count={positions.length} currentIdx={posIdx} statuses={statuses} />
-        </div>
+      {/* PROGRESS DOTS (~28px) — slim band above the footer so the operator
+          sees where they are without stealing space from the jog pad. */}
+      <div style={{
+        flex: '0 0 auto', padding: '4px 0',
+        borderTop: '1px solid #f3f4f6', background: '#fff',
+      }}>
+        <ProgressDots count={positions.length} currentIdx={posIdx} statuses={statuses} />
+      </div>
 
-        {/* Footer — Back / Record / Skip */}
-        <div style={{
-          padding: '14px 20px', borderTop: '1px solid #e5e7eb',
-          display: 'flex', gap: 12, alignItems: 'center',
-        }}>
-          <button onClick={goBack} style={{
-            padding: '14px 22px', minHeight: 52, fontSize: 14, fontWeight: 700,
-            background: '#fff', color: '#374151',
-            border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
-          }}>← Back</button>
-          <div style={{ flex: 1 }} />
-          <button onClick={recordPosition} style={{
-            padding: '14px 32px', minHeight: 56, fontSize: 16, fontWeight: 800,
-            background: flash ? '#16A34A' : '#2563EB', color: '#fff',
-            border: 'none', borderRadius: 10, cursor: 'pointer',
-            minWidth: 220,
-            transition: 'background 200ms',
-          }}>
-            {flash ? '✓ Recorded' : 'Record Position'}
-          </button>
-          <div style={{ flex: 1 }} />
-          <button onClick={skipCurrent} style={{
-            padding: '14px 22px', minHeight: 52, fontSize: 14, fontWeight: 700,
-            background: '#fff', color: '#374151',
-            border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
-          }}>Skip →</button>
-        </div>
+      {/* FOOTER (~88px) — Back / Record / Skip in teach mode; only Back in
+          choice mode (the Reuse/Re-teach buttons live in the body). */}
+      <div style={{
+        flex: '0 0 auto', minHeight: 88,
+        padding: '14px 24px',
+        borderTop: '1px solid #e5e7eb',
+        display: 'flex', gap: 12, alignItems: 'center',
+        boxSizing: 'border-box',
+      }}>
+        <button onClick={goBack} style={{
+          padding: '14px 22px', minHeight: 56, fontSize: 14, fontWeight: 700,
+          background: '#fff', color: '#374151',
+          border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+        }}>← Back</button>
+        {!showChoiceScreen && (
+          <>
+            <div style={{ flex: 1 }} />
+            <button onClick={recordPosition} style={{
+              padding: '14px 32px', minHeight: 60, fontSize: 16, fontWeight: 800,
+              background: flash ? '#16A34A' : '#2563EB', color: '#fff',
+              border: 'none', borderRadius: 10, cursor: 'pointer',
+              minWidth: 220,
+              transition: 'background 200ms',
+            }}>
+              {flash ? '✓ Recorded' : 'Record Position'}
+            </button>
+            <div style={{ flex: 1 }} />
+            <button onClick={skipCurrent} style={{
+              padding: '14px 22px', minHeight: 56, fontSize: 14, fontWeight: 700,
+              background: '#fff', color: '#374151',
+              border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+            }}>Skip →</button>
+          </>
+        )}
       </div>
     </div>
   )
@@ -1184,9 +1401,6 @@ const PAGES = [
           { value: 'sort', label: 'Sort Parts', desc: 'Identify parts and place them in different locations by type', icon: 'S' },
           { value: 'machine_tend', label: 'Machine Tending', desc: 'Load parts into a machine, wait, then unload', icon: 'M' },
           { value: 'palletize', label: 'Palletize', desc: 'Stack parts onto a pallet or pick them off a pallet', icon: 'G' },
-          { value: 'inspect', label: 'Pick and Inspect', desc: 'Pick a part, inspect it with the camera, then sort pass/fail', icon: 'I' },
-          { value: 'inspect_verify', label: 'Inspect & Verify', desc: 'Run a full Quality Inspection on each part with pass/warn/fail branching', icon: 'V' },
-          { value: 'scan_identify', label: 'Scan & Identify', desc: 'Robot scans the workspace, moves above each detected object, identifies it from the parts library', icon: 'Q' },
         ].map(op => (
           <ChoiceButton key={op.value} label={op.label} description={op.desc} icon={op.icon}
             selected={answers.operation === op.value}
@@ -1254,177 +1468,6 @@ const PAGES = [
         </QuestionCard>
       )
     },
-  },
-
-  // 0i: Inspect & Verify configuration — gated on operation === 'inspect_verify'.
-  // One page that captures every iv_* answer the buildSteps branch
-  // needs; the rest of the wizard (gripper / speed / teach / review)
-  // is shared with pick_and_place so we don't grow the wizard a lot.
-  {
-    id: 'inspect_verify_config',
-    skip: (answers) => answers.operation !== 'inspect_verify',
-    render: ({ answers, setAnswer, goNext }) => (
-      <QuestionCard
-        question="Configure the Quality Inspection"
-        description="Pick which part to inspect, which plan to run, and how to handle pass/warn/fail results. References and tolerances are managed in the Quality Inspection tab."
-      >
-        <div style={{ display: 'grid', gap: 12, marginBottom: 20 }}>
-          <label style={{ fontSize: 13, fontWeight: 600 }}>Part ID
-            <input value={answers.iv_part_id || ''}
-                   onChange={(e) => setAnswer('iv_part_id', e.target.value)}
-                   style={{ display: 'block', width: '100%', marginTop: 4,
-                            padding: '6px 8px', fontSize: 13,
-                            border: '1px solid #e5e7eb', borderRadius: 4 }}
-                   placeholder="e.g. bracket_a"/>
-          </label>
-          <label style={{ fontSize: 13, fontWeight: 600 }}>Inspection plan
-            <input value={answers.iv_plan_id || 'default'}
-                   onChange={(e) => setAnswer('iv_plan_id', e.target.value)}
-                   style={{ display: 'block', width: '100%', marginTop: 4,
-                            padding: '6px 8px', fontSize: 13,
-                            border: '1px solid #e5e7eb', borderRadius: 4 }}
-                   placeholder="default"/>
-          </label>
-          <label style={{ fontSize: 13, fontWeight: 600 }}>Tier
-            <select value={answers.iv_tier || '2'}
-                    onChange={(e) => setAnswer('iv_tier', e.target.value)}
-                    style={{ display: 'block', width: '100%', marginTop: 4,
-                             padding: '6px 8px', fontSize: 13,
-                             border: '1px solid #e5e7eb', borderRadius: 4 }}>
-              <option value="1">Tier 1 — dimensions only (fast)</option>
-              <option value="2">Tier 2 — surface deviation (recommended)</option>
-              <option value="3">Tier 3 — feature-specific</option>
-            </select>
-          </label>
-          <label style={{ fontSize: 13, fontWeight: 600 }}>Reference type
-            <select value={answers.iv_reference_type || 'step'}
-                    onChange={(e) => setAnswer('iv_reference_type', e.target.value)}
-                    style={{ display: 'block', width: '100%', marginTop: 4,
-                             padding: '6px 8px', fontSize: 13,
-                             border: '1px solid #e5e7eb', borderRadius: 4 }}>
-              <option value="step">STEP-derived (CAD)</option>
-              <option value="golden">Golden scan</option>
-              <option value="statistical">Statistical envelope</option>
-            </select>
-          </label>
-          <label style={{ fontSize: 13, fontWeight: 600 }}>Sampling rate
-            <select value={answers.iv_sampling || '1'}
-                    onChange={(e) => setAnswer('iv_sampling', e.target.value)}
-                    style={{ display: 'block', width: '100%', marginTop: 4,
-                             padding: '6px 8px', fontSize: 13,
-                             border: '1px solid #e5e7eb', borderRadius: 4 }}>
-              <option value="1">Every part</option>
-              <option value="2">Every 2nd part</option>
-              <option value="5">Every 5th part</option>
-              <option value="10">Every 10th part</option>
-            </select>
-          </label>
-          <label style={{ fontSize: 13, fontWeight: 600 }}>Action on fail
-            <select value={answers.iv_on_fail || 'jump_to_reject'}
-                    onChange={(e) => setAnswer('iv_on_fail', e.target.value)}
-                    style={{ display: 'block', width: '100%', marginTop: 4,
-                             padding: '6px 8px', fontSize: 13,
-                             border: '1px solid #e5e7eb', borderRadius: 4 }}>
-              <option value="jump_to_reject">Place in reject bin</option>
-              <option value="pause">Pause program + alert</option>
-              <option value="log_continue">Log only and continue</option>
-              <option value="alert">Alert operator and wait</option>
-            </select>
-          </label>
-          <label style={{ fontSize: 13, fontWeight: 600 }}>Action on warn
-            <select value={answers.iv_on_warn || 'log_continue'}
-                    onChange={(e) => setAnswer('iv_on_warn', e.target.value)}
-                    style={{ display: 'block', width: '100%', marginTop: 4,
-                             padding: '6px 8px', fontSize: 13,
-                             border: '1px solid #e5e7eb', borderRadius: 4 }}>
-              <option value="log_continue">Log and continue</option>
-              <option value="pause">Pause for operator review</option>
-              <option value="alert">Alert operator (continue on ack)</option>
-            </select>
-          </label>
-        </div>
-        <NextButton onClick={goNext} />
-      </QuestionCard>
-    ),
-  },
-
-  // 0a: Scan-only — scan height. Gated on operation === 'scan_identify'.
-  {
-    id: 'scan_height',
-    skip: (answers) => answers.operation !== 'scan_identify',
-    render: ({ answers, setAnswer, goNext }) => (
-      <QuestionCard
-        question="How close should the robot scan each part?"
-        description="The robot moves above each detected object at this height for a close-up identification. Lower = more detail but smaller field of view."
-      >
-        <SliderQuestion
-          label="Scan height"
-          value={answers.scan_height || 150}
-          onChange={(v) => setAnswer('scan_height', v)}
-          min={80} max={300} step={10} unit="mm"
-          description="Distance above the part surface during close-up scan"
-        />
-        <div style={{
-          padding: 12, background: '#f0f9ff', borderRadius: 8,
-          border: '1px solid #bfdbfe', fontSize: 12, color: '#2563EB', marginBottom: 16,
-        }}>
-          Recommended: 120–150 mm for small parts (under 10 cm). 200–250 mm for larger parts.
-        </div>
-        <NextButton onClick={goNext} label="Next" />
-      </QuestionCard>
-    ),
-  },
-
-  // 0b: Scan-only — what to do after scanning.
-  {
-    id: 'scan_after',
-    skip: (answers) => answers.operation !== 'scan_identify',
-    render: ({ answers, setAnswer, goNext }) => (
-      <QuestionCard
-        question="What should happen after scanning?"
-        description="After identifying all parts, what should the robot do?"
-      >
-        {[
-          { value: 'report_only',    label: 'Report Only',       desc: 'Just identify and report what was found. Robot returns home.' },
-          { value: 'pick_known',     label: 'Pick Known Parts',  desc: 'After scanning, pick identified parts and place them in their designated locations.' },
-          { value: 'sort_by_type',   label: 'Sort by Type',      desc: 'After scanning, sort parts into different bins based on their type.' },
-          { value: 'remove_defects', label: 'Remove Defects',    desc: 'After scanning, pick up defective parts and place them in a reject bin.' },
-        ].map((o) => (
-          <ChoiceButton
-            key={o.value}
-            label={o.label}
-            description={o.desc}
-            selected={answers.scan_after === o.value}
-            onClick={() => { setAnswer('scan_after', o.value); goNext() }}
-          />
-        ))}
-      </QuestionCard>
-    ),
-  },
-
-  // 0c: Scan-only — wide scan position source.
-  {
-    id: 'scan_wide_position',
-    skip: (answers) => answers.operation !== 'scan_identify',
-    render: ({ answers, setAnswer, goNext }) => (
-      <QuestionCard
-        question="Where should the robot look from to see the full workspace?"
-        description="The robot first moves to a high position to see all parts, then moves closer to each one."
-      >
-        {[
-          { value: 'home',  label: 'Use Home Position',      desc: 'The home position already has a good view of the workspace.' },
-          { value: 'teach', label: 'Teach a Scan Position',  desc: 'Jog the robot to a position where the camera can see the entire workspace.' },
-        ].map((o) => (
-          <ChoiceButton
-            key={o.value}
-            label={o.label}
-            description={o.desc}
-            selected={answers.scan_wide_source === o.value}
-            onClick={() => { setAnswer('scan_wide_source', o.value); goNext() }}
-          />
-        ))}
-      </QuestionCard>
-    ),
   },
 
   // 1: How does the robot find objects?
@@ -1998,15 +2041,6 @@ const PAGES = [
         points.push('4. Machine load position')
         points.push('5. Unload position')
       }
-      if (answers.operation === 'inspect') {
-        points.push('4. Inspection pose')
-      }
-      if (answers.operation === 'inspect_verify') {
-        points.push('4. Inspection pose (where the camera scans the part)')
-        if (answers.iv_on_fail === 'jump_to_reject') {
-          points.push('5. Reject position (where failed parts are placed)')
-        }
-      }
       return (
         <QuestionCard
           question="Now let's teach the robot positions"
@@ -2044,12 +2078,14 @@ const PAGES = [
   //     finished or when Skip All is pressed.
   {
     id: 'teach_sequence',
-    render: ({ answers, setAnswer, goNext, goBack }) => (
+    render: ({ answers, setAnswer, goNext, goBack, reusedSteps, setReusedSteps }) => (
       <TeachSequence
         answers={answers}
         setAnswer={setAnswer}
         onComplete={goNext}
         onBackToName={goBack}
+        reusedSteps={reusedSteps}
+        setReusedSteps={setReusedSteps}
       />
     ),
   },
@@ -2057,7 +2093,7 @@ const PAGES = [
   // 19: Review and save (final)
   {
     id: 'review',
-    render: ({ answers, steps, saving, onSave }) => {
+    render: ({ answers, steps, saving, onSave, reusedSteps }) => {
       const isPallet  = answers.operation === 'palletize'
       const isDepal   = isPallet && answers.pallet_mode === 'depalletize'
       const rows      = answers.pallet_rows   ?? 4
@@ -2154,15 +2190,30 @@ const PAGES = [
           // helper the TeachSequence uses, so the list always matches what
           // the operator just walked through.
           const positions = teachPositionsForAnswers(answers)
-          const statuses  = positions.map((p) => {
+          // Track which key carries the "primary" (first-taught) value so
+          // a duplicate later occurrence of the same key labels as
+          // 'reused (same as ...)'. With the current position list none
+          // of the operations have duplicate keys, but the wiring is
+          // ready for it.
+          const seenKeyAt = {}
+          const statuses  = positions.map((p, i) => {
+            const reusedHere = reusedSteps && reusedSteps[i]
             const v = answers[p.key]
+            const recorded = !!v && !v.skipped && (
+              (Array.isArray(v.tcp) && v.tcp.length) ||
+              (Array.isArray(v.joints) && v.joints.length)
+            )
+            // Record the first index that taught this key so duplicates
+            // can label themselves "same as <label>".
+            if (recorded && seenKeyAt[p.key] === undefined) seenKeyAt[p.key] = i
+            if (reusedHere && recorded) return 'reused'
             if (!v) return 'pending'
             if (v.skipped) return 'skipped'
-            if ((Array.isArray(v.tcp) && v.tcp.length) || (Array.isArray(v.joints) && v.joints.length)) return 'recorded'
+            if (recorded) return 'recorded'
             return 'pending'
           })
-          const requiredKeys = new Set(['taught_home', 'taught_pick'])
-          const recordedCount = statuses.filter((s) => s === 'recorded').length
+          const requiredKeys  = new Set(['taught_home', 'taught_pick'])
+          const recordedCount = statuses.filter((s) => s === 'recorded' || s === 'reused').length
           const anyTaught     = recordedCount > 0
           return (
             <div style={{
@@ -2178,15 +2229,36 @@ const PAGES = [
               {positions.map((p, i) => {
                 const s = statuses[i]
                 const required = requiredKeys.has(p.key)
-                const isWarn = required && s !== 'recorded'
+                const isReused = s === 'reused'
+                const isWarn   = required && s !== 'recorded' && s !== 'reused'
                 const color  = s === 'recorded' ? '#16A34A'
+                             : isReused         ? '#2563EB'
                              : isWarn           ? '#CA8A04'
                                                 : '#9ca3af'
                 const symbol = s === 'recorded' ? '✓'
+                             : isReused         ? '↻'
                              : isWarn           ? '!'
                                                 : '—'
+                // Build the trailing label. For reused entries point at
+                // the earlier step that taught this key (when one exists)
+                // so the operator knows where the value came from.
+                let trailing
+                if (isReused) {
+                  const firstIdx = seenKeyAt[p.key]
+                  const primary  = (firstIdx !== undefined && firstIdx !== i)
+                    ? positions[firstIdx]?.label
+                    : null
+                  trailing = primary
+                    ? `reused (same as ${primary.toLowerCase()})`
+                    : 'reused'
+                } else {
+                  trailing = s === 'recorded' ? 'recorded'
+                           : isWarn         ? 'required — skipped'
+                           : s === 'skipped' ? 'skipped'
+                                              : 'not taught'
+                }
                 return (
-                  <div key={p.key} style={{
+                  <div key={i + ':' + p.key} style={{
                     display: 'flex', alignItems: 'center', gap: 10,
                     padding: '4px 0', fontSize: 13,
                   }}>
@@ -2199,9 +2271,7 @@ const PAGES = [
                     <span style={{ color: '#374151' }}>{p.label}</span>
                     <span style={{ flex: 1 }} />
                     <span style={{ fontSize: 12, color, fontWeight: 600, textTransform: 'lowercase' }}>
-                      {s === 'recorded' ? 'recorded'
-                       : isWarn         ? 'required — skipped'
-                       : s === 'skipped' ? 'skipped' : 'not taught'}
+                      {trailing}
                     </span>
                   </div>
                 )
@@ -2368,29 +2438,37 @@ function buildPalletizeSteps(answers) {
     // executor goes to the taught pose; the operator already taught
     // it at the pick. The compound descend / lift TCPs below carry
     // the approach / retract offsets.
+    // Source step for taught_pick; descend / lift derive from it via
+    // derived_from + offset so re-teaching the pick in the editor
+    // propagates to both children automatically.
     steps.push({
       action: 'approach', label: 'Approach above pick',
       taught: !!pickJoints, taught_joints: pickJoints, joints: pickJoints,
       taught_tcp: pickTcp, position: pickTcp ? pickTcp.slice(0, 3) : null,
       speed_pct: spd, offset_z_mm: appH,
+      position_role: 'pick',
     })
-    // Descend to pick TCP.
+    // Descend to pick TCP. Keep the literal taught data as a fallback
+    // for the legacy executor path but tag derived_from so the new
+    // resolver uses the source step's current pose (handles re-teach).
     if (pickTcp) {
       steps.push({
         action: 'move_linear', label: 'Descend to pick',
-        taught: true, taught_tcp: pickTcp, position: pickTcp.slice(0, 3),
+        taught_tcp: pickTcp, position: pickTcp.slice(0, 3),
         taught_joints: pickJoints, joints: pickJoints,
         speed_pct: slow, offset_z_mm: 0,
+        derived_from: 'pick',
       })
     }
     steps.push(gripClose('Grip part'))
     if (gripType === 'vacuum') steps.push({ action: 'wait', label: 'Wait for vacuum seal', duration_s: 0.5 })
-    // Lift from pick — taught pose with retract offset for display.
+    // Lift from pick — derived from taught_pick + retract offset.
     steps.push({
       action: 'move_linear', label: 'Lift from pick',
-      taught: !!pickTcp, taught_tcp: pickTcp, position: pickTcp ? pickTcp.slice(0, 3) : null,
+      taught_tcp: pickTcp, position: pickTcp ? pickTcp.slice(0, 3) : null,
       taught_joints: pickJoints, joints: pickJoints,
       speed_pct: medium, offset_z_mm: retH,
+      derived_from: 'pick',
     })
     // Compound pallet motion — executor computes slot, traverses,
     // descends to slot, opens gripper, lifts to retract, advances
@@ -2423,20 +2501,24 @@ function buildPalletizeSteps(answers) {
     const placeTcp   = Array.isArray(placePoint.tcp) ? placePoint.tcp : null
     const placeJoints = Array.isArray(placePoint.joints) ? placePoint.joints : null
 
-    // Above place at retract height.
+    // Source step for taught_place; the first "Move above place" carries
+    // the taught data and tags itself as the 'place' role so the descend
+    // and lift below can derive from it via derived_from + offset.
     steps.push({
       action: 'move_linear', label: 'Move above place',
       taught: !!placeTcp, taught_tcp: placeTcp, position: placeTcp ? placeTcp.slice(0, 3) : null,
       taught_joints: placeJoints, joints: placeJoints,
       speed_pct: spd, offset_z_mm: retH,
+      position_role: 'place',
     })
-    // Descend to place.
+    // Derived: descend to place at z+0 from taught_place.
     if (placeTcp) {
       steps.push({
         action: 'move_linear', label: 'Descend to place',
-        taught: true, taught_tcp: placeTcp, position: placeTcp.slice(0, 3),
+        taught_tcp: placeTcp, position: placeTcp.slice(0, 3),
         taught_joints: placeJoints, joints: placeJoints,
         speed_pct: slow, offset_z_mm: 0,
+        derived_from: 'place',
       })
     }
     steps.push(gripOpen('Release part'))
@@ -2445,12 +2527,13 @@ function buildPalletizeSteps(answers) {
       steps.push({ action: 'wait',   label: 'Wait for blow off', duration_s: 0.3 })
       steps.push({ action: 'set_io', label: 'Blow off stop', io_id: 'DO3', value: 0 })
     }
-    // Lift from place.
+    // Derived: lift from place at z+retract offset.
     steps.push({
       action: 'move_linear', label: 'Lift from place',
-      taught: !!placeTcp, taught_tcp: placeTcp, position: placeTcp ? placeTcp.slice(0, 3) : null,
+      taught_tcp: placeTcp, position: placeTcp ? placeTcp.slice(0, 3) : null,
       taught_joints: placeJoints, joints: placeJoints,
       speed_pct: medium, offset_z_mm: retH,
+      derived_from: 'place',
     })
   }
 
@@ -2483,60 +2566,8 @@ function buildSteps(answers) {
 
   steps.push({ action: 'move_home', label: 'Move to home position' })
 
-  // Scan & Identify takes a different path — the rest of the picking
-  // flow doesn't apply when the goal is to inventory the workspace.
-  // We still fall through to the post-processing block at the bottom
-  // so step numbering + taught-point application (home_point in
-  // particular) work the same way for scan programs.
-  const isScan = op === 'scan_identify'
-  if (isScan) {
-    if (answers.scan_wide_source === 'teach') {
-      steps.push({ action: 'move_joint', label: 'Move to wide scan position', speed_pct: spd })
-    }
-    steps.push({
-      action: 'scan_workspace',
-      label:  'Scan workspace — detect all objects',
-      scan_height_mm: answers.scan_height || 150,
-      scan_speed_pct: Math.min(spd, 30),
-      mode:   'wide',
-    })
-    steps.push({
-      action: 'scan_identify_each',
-      label:  'Move above each object and identify',
-      scan_height_mm: answers.scan_height || 150,
-      scan_speed_pct: Math.min(spd, 20),
-      settle_time_ms: 500,
-      capture_frames: 5,
-      match_threshold_pct: 70,
-    })
-    const after = answers.scan_after || 'report_only'
-    if (after === 'pick_known') {
-      steps.push({ action: 'move_joint',   label: 'Move above first identified part', speed_pct: spd })
-      steps.push({ action: 'move_linear',  label: 'Descend to pick',                  speed_pct: slow })
-      if (answers.gripper_type === 'finger') {
-        steps.push({ action: 'close_gripper', label: 'Grip part', force_pct: gripF, io_close: 'DO0', io_close_confirm: 'DI0' })
-      }
-      steps.push({ action: 'move_linear',  label: 'Lift part', offset_z_mm: appH, speed_pct: medium })
-      steps.push({ action: 'move_joint',   label: 'Move to place position', speed_pct: spd })
-      steps.push({ action: 'move_linear',  label: 'Descend to place', speed_pct: slow })
-      if (answers.gripper_type === 'finger') {
-        steps.push({ action: 'open_gripper', label: 'Release part', width_mm: gripW, io_open: 'DO1' })
-      }
-      steps.push({ action: 'move_linear',  label: 'Lift from place', offset_z_mm: appH, speed_pct: medium })
-    } else if (after === 'sort_by_type') {
-      steps.push({ action: 'sort_scanned',   label: 'Sort identified parts by type' })
-    } else if (after === 'remove_defects') {
-      steps.push({ action: 'remove_defects', label: 'Pick up defective parts and place in reject bin' })
-    }
-    steps.push({ action: 'move_home', label: 'Return to home' })
-    if (answers.repeat === 'continuous') {
-      steps.push({ action: 'loop', label: 'Repeat continuously', goto: 1, count: 0 })
-    } else if (answers.repeat === 'count') {
-      steps.push({ action: 'loop', label: 'Repeat ' + (answers.repeat_count || 10) + ' times', goto: 1, count: answers.repeat_count || 10 })
-    }
-  } else {
-  // ── Standard pick / sort / machine_tend / palletize / inspect flow.
-  //    Skipped for scan_identify, which built its own steps above.
+  // ── Standard pick / sort / machine_tend flow. Palletize takes the
+  //    buildPalletizeSteps path above.
 
   // Custom gripper IO: operator-selected activate / confirm signals
   // from the Custom Gripper page. Default to DO3 / no-confirm to match
@@ -2555,8 +2586,14 @@ function buildSteps(answers) {
     steps.push({ action: 'detect', label: 'Find ' + (answers.target_part_name || 'library part'), mode: 'library' })
   }
 
-  steps.push({ action: 'approach', label: 'Move above pick position', target: answers.source === 'fixed_position' ? 'fixed' : 'auto', offset_z_mm: appH, speed_pct: spd })
-  steps.push({ action: 'move_linear', label: 'Descend to part', offset_z_mm: 0, speed_pct: slow })
+  // Source step for the pick — carries taught_pick (applied by applyTaught
+  // below) so the descend/lift derived moves can resolve to its taught_tcp
+  // plus their offsets at runtime.
+  steps.push({ action: 'approach', label: 'Move above pick position', target: answers.source === 'fixed_position' ? 'fixed' : 'auto', offset_z_mm: appH, speed_pct: spd, position_role: 'pick' })
+  // Derived from the taught pick — z+0 (descend onto the part). The
+  // editor treats `derived_from` steps as non-teachable; the executor
+  // resolves the actual TCP at runtime from the source step + offset.
+  steps.push({ action: 'move_linear', label: 'Descend to part', offset_z_mm: 0, speed_pct: slow, derived_from: 'pick' })
 
   if (answers.gripper_type === 'finger') {
     steps.push({ action: 'close_gripper', label: 'Grip part', force_pct: gripF, io_close: 'DO0', io_close_confirm: 'DI0' })
@@ -2568,82 +2605,43 @@ function buildSteps(answers) {
     steps.push({ action: 'set_io', label: 'Gripper on', io_id: customActivate, value: 1 })
   }
 
-  steps.push({ action: 'move_linear', label: 'Lift part', offset_z_mm: appH, speed_pct: medium })
+  // Lift = pick + appH (return above the part after gripping).
+  steps.push({ action: 'move_linear', label: 'Lift part', offset_z_mm: appH, speed_pct: medium, derived_from: 'pick' })
 
   if (op === 'machine_tend') {
-    steps.push({ action: 'move_joint', label: 'Move to machine load position', speed_pct: spd })
-    steps.push({ action: 'move_linear', label: 'Descend to load position', offset_z_mm: 0, speed_pct: Math.min(spd, 20) })
+    // Source step for the machine_load taught point; descend / retreat /
+    // approach-finished-part / descend-to-finished-part / lift-finished
+    // all derive from this single taught position with z-offsets.
+    steps.push({ action: 'move_joint', label: 'Move to machine load position', speed_pct: spd, position_role: 'machine_load' })
+    steps.push({ action: 'move_linear', label: 'Descend to load position', offset_z_mm: 0, speed_pct: Math.min(spd, 20), derived_from: 'machine_load' })
     if (answers.gripper_type === 'finger') {
       steps.push({ action: 'open_gripper', label: 'Release part into machine', width_mm: gripW, io_open: 'DO1' })
     } else {
       steps.push({ action: 'set_io', label: 'Release part into machine', io_id: 'DO2', value: 0 })
     }
-    steps.push({ action: 'move_linear', label: 'Retreat from machine', offset_z_mm: appH, speed_pct: slow })
+    steps.push({ action: 'move_linear', label: 'Retreat from machine', offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
     steps.push({ action: 'set_io', label: 'Start machine cycle', io_id: answers.io_cycle_start || 'DO4', value: 1 })
     steps.push({ action: 'wait', label: 'Wait for machine to finish', duration_s: answers.cycle_timeout || 30 })
     steps.push({ action: 'set_io', label: 'Clear cycle start', io_id: answers.io_cycle_start || 'DO4', value: 0 })
-    steps.push({ action: 'move_linear', label: 'Approach finished part', offset_z_mm: appH, speed_pct: slow })
-    steps.push({ action: 'move_linear', label: 'Descend to finished part', offset_z_mm: 0, speed_pct: Math.min(spd, 20) })
+    // The robot picks the finished part out of the same fixture it loaded
+    // into, so these all derive from machine_load too.
+    steps.push({ action: 'move_linear', label: 'Approach finished part', offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
+    steps.push({ action: 'move_linear', label: 'Descend to finished part', offset_z_mm: 0, speed_pct: Math.min(spd, 20), derived_from: 'machine_load' })
     if (answers.gripper_type === 'finger') {
       steps.push({ action: 'close_gripper', label: 'Grip finished part', force_pct: gripF, io_close: 'DO0' })
     } else {
       steps.push({ action: 'set_io', label: 'Pick finished part', io_id: 'DO2', value: 1 })
     }
-    steps.push({ action: 'move_linear', label: 'Lift finished part', offset_z_mm: appH, speed_pct: medium })
-    steps.push({ action: 'move_joint', label: 'Move to unload position', speed_pct: spd })
-    steps.push({ action: 'move_linear', label: 'Descend to unload', offset_z_mm: 0, speed_pct: slow })
-  } else if (op === 'inspect') {
-    steps.push({ action: 'move_joint', label: 'Move to inspection pose', speed_pct: spd })
-    steps.push({ action: 'detect', label: 'Inspect part with camera', mode: 'library' })
-    steps.push({ action: 'move_joint', label: 'Move above place position', speed_pct: spd })
-    steps.push({ action: 'move_linear', label: 'Descend to place', offset_z_mm: 0, speed_pct: slow })
-  } else if (op === 'inspect_verify') {
-    // Full Quality Inspection flow: stage above part → run inspection
-    // (which gates the rest of the program on result) → either continue
-    // to place, or jump to reject. The executor handles the branch via
-    // step.on_fail = 'jump_to_reject'.
-    const sampling   = parseInt(answers.iv_sampling || '1', 10)
-    const onFail     = answers.iv_on_fail || 'jump_to_reject'
-    const onWarn     = answers.iv_on_warn || 'log_continue'
-    const planId     = answers.iv_plan_id || 'default'
-    const partId     = answers.iv_part_id || 'unknown'
-    const tier       = parseInt(answers.iv_tier || '2', 10)
-
-    steps.push({ action: 'move_joint', label: 'Move to inspection pose', speed_pct: spd })
-    steps.push({
-      action: 'inspect_part',
-      label:  'Run Quality Inspection',
-      part_id: partId, plan_id: planId, tier,
-      reference_type: answers.iv_reference_type || 'step',
-      every_n_parts:  sampling,
-      on_pass: 'continue', on_warn: onWarn, on_fail: onFail,
-      inspection_timeout_s: 30,
-    })
-    steps.push({ action: 'move_joint', label: 'Move above place position', speed_pct: spd })
-    steps.push({ action: 'move_linear', label: 'Descend to place', offset_z_mm: 0, speed_pct: slow })
-    // Reject branch — `on_fail: jump_to_reject` targets the first
-    // place_at_reject step that follows the inspect_part. Appended at
-    // the tail so it's reachable but doesn't run unless jumped to.
-    if (onFail === 'jump_to_reject') {
-      steps.push({
-        action: 'place_at_reject',
-        label:  'Place in reject bin',
-        speed_pct: spd,
-      })
-      steps.push({ action: 'move_home', label: 'Return after reject' })
-    } else if (onFail === 'alert') {
-      steps.push({
-        action: 'alert_operator',
-        label:  'Alert operator — failed inspection',
-        severity: 'fail',
-        message: 'Part failed Quality Inspection — operator review required',
-        operator_timeout_s: 120,
-        on_timeout: 'abort',
-      })
-    }
+    steps.push({ action: 'move_linear', label: 'Lift finished part', offset_z_mm: appH, speed_pct: medium, derived_from: 'machine_load' })
+    // Source step for the unload taught point; the descend-to-unload
+    // derives from it.
+    steps.push({ action: 'move_joint', label: 'Move to unload position', speed_pct: spd, position_role: 'unload' })
+    steps.push({ action: 'move_linear', label: 'Descend to unload', offset_z_mm: 0, speed_pct: slow, derived_from: 'unload' })
   } else {
-    steps.push({ action: 'move_joint', label: 'Move above place position', speed_pct: spd })
-    steps.push({ action: 'move_linear', label: 'Descend to place', offset_z_mm: 0, speed_pct: slow })
+    // Default place flow (pick_and_place / sort). The move_joint is the
+    // taught place position; the descend derives from it.
+    steps.push({ action: 'move_joint', label: 'Move above place position', speed_pct: spd, position_role: 'place' })
+    steps.push({ action: 'move_linear', label: 'Descend to place', offset_z_mm: 0, speed_pct: slow, derived_from: 'place' })
   }
 
   if (answers.gripper_type === 'finger') {
@@ -2658,7 +2656,7 @@ function buildSteps(answers) {
     steps.push({ action: 'set_io', label: 'Gripper off — release part', io_id: customActivate, value: 0 })
   }
 
-  steps.push({ action: 'move_linear', label: 'Lift from place', offset_z_mm: appH, speed_pct: medium })
+  steps.push({ action: 'move_linear', label: 'Lift from place', offset_z_mm: appH, speed_pct: medium, derived_from: 'place' })
   steps.push({ action: 'move_home', label: 'Return to home' })
 
   if (answers.repeat === 'continuous') {
@@ -2666,7 +2664,6 @@ function buildSteps(answers) {
   } else if (answers.repeat === 'count') {
     steps.push({ action: 'loop', label: 'Repeat ' + (answers.repeat_count || 10) + ' times', goto: 1, count: answers.repeat_count || 10 })
   }
-  }  // end of !isScan picking flow
 
   // Inject taught data from the wizard's teach pages so the editor's
   // green T badges appear immediately for the positions the operator
@@ -2677,7 +2674,6 @@ function buildSteps(answers) {
   //                        "Move above place position"
   //   machine_load_point → "Move to machine load position"
   //   unload_point       → "Move to unload position"
-  //   inspect_point      → "Move to inspection pose"
   function applyTaught(s, point) {
     if (!point) return s
     return {
@@ -2703,7 +2699,6 @@ function buildSteps(answers) {
   const placeP  = readTaught(cfg, 'taught_place')
   const loadP   = readTaught(cfg, 'taught_machine_load')
   const unloadP = readTaught(cfg, 'taught_unload')
-  const inspP   = readTaught(cfg, 'taught_inspect')
 
   // First and last move_home both share taught_home.
   if (homeP) {
@@ -2728,10 +2723,6 @@ function buildSteps(answers) {
   if (unloadP) {
     const i = numbered.findIndex((s) => s.action === 'move_joint' && s.label === 'Move to unload position')
     if (i >= 0) numbered[i] = applyTaught(numbered[i], unloadP)
-  }
-  if (inspP) {
-    const i = numbered.findIndex((s) => s.action === 'move_joint' && s.label === 'Move to inspection pose')
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], inspP)
   }
 
   return numbered
@@ -2761,6 +2752,11 @@ export default function ProgramWizard({ onClose, onSaved }) {
   })
   const [saving, setSaving] = useState(false)
   const [history, setHistory] = useState([0])
+  // reusedSteps tracks which TeachSequence step indices the operator
+  // confirmed via the Reuse button (vs. teaching fresh). Lifted here so
+  // the Review page can show the distinction after the teach sequence
+  // completes — TeachSequence's internal state would be lost on unmount.
+  const [reusedSteps, setReusedSteps] = useState({})
 
   const setAnswer = (key, value) => setAnswers(prev => ({ ...prev, [key]: value }))
 
@@ -2856,8 +2852,35 @@ export default function ProgramWizard({ onClose, onSaved }) {
     setSaving(false)
   }
 
-  const page = PAGES[pageIdx]
+  // Safety guard: clamp pageIdx to a valid index. If goNext / history ever
+  // resolves to an out-of-range or skipped page, fall through to the next
+  // renderable page instead of letting `PAGES[pageIdx]` be undefined and
+  // crashing React. Belt-and-braces: goNext already bounds-checks, but a
+  // future regression in skip-rule chaining shouldn't be able to crash the
+  // wizard.
+  let safeIdx = pageIdx
+  if (safeIdx < 0 || safeIdx >= PAGES.length || !PAGES[safeIdx]) {
+    safeIdx = 0
+  } else if (PAGES[safeIdx].skip?.(answers)) {
+    let probe = safeIdx + 1
+    while (probe < PAGES.length && PAGES[probe].skip?.(answers)) probe++
+    safeIdx = probe < PAGES.length ? probe : PAGES.length - 1
+  }
+  const page = PAGES[safeIdx]
   const progressPct = ((history.length - 1) / (PAGES.length - 1)) * 100
+
+  // Each page render uses hooks (useState / useEffect / etc.) inside its
+  // inline `render` function. If we invoke it as a plain function call
+  // (`{page.render(props)}`) the hooks land on the parent ProgramWizard
+  // fiber — meaning the parent's hook count changes whenever pageIdx
+  // points to a page whose render uses different hooks, and React throws
+  // "Rendered more hooks than during the previous render" at that
+  // transition.
+  //
+  // Treating page.render as a component type (JSX element) gives each
+  // page its own fiber and hook stack. key={safeIdx} forces a fresh
+  // mount per page so even repeat visits start with a clean stack.
+  const PageBody = page && typeof page.render === 'function' ? page.render : null
 
   return (
     <div style={{
@@ -2904,15 +2927,31 @@ export default function ProgramWizard({ onClose, onSaved }) {
 
         {/* Content */}
         <div style={{ flex: 1, overflowY: 'auto' }}>
-          {page.render({
-            answers,
-            setAnswer,
-            goNext,
-            goBack,
-            steps: builtSteps,
-            saving,
-            onSave: handleSave,
-          })}
+          {PageBody ? (
+            <PageBody
+              key={safeIdx}
+              answers={answers}
+              setAnswer={setAnswer}
+              goNext={goNext}
+              goBack={goBack}
+              steps={builtSteps}
+              saving={saving}
+              onSave={handleSave}
+              reusedSteps={reusedSteps}
+              setReusedSteps={setReusedSteps}
+            />
+          ) : (
+            <div style={{ padding: 32, textAlign: 'center', color: '#6b7280' }}>
+              <div style={{ fontSize: 14, marginBottom: 12 }}>
+                This step could not be loaded.
+              </div>
+              <button onClick={goBack} style={{
+                padding: '10px 18px', fontSize: 13, fontWeight: 600,
+                background: '#2563EB', color: '#fff',
+                border: 'none', borderRadius: 8, cursor: 'pointer',
+              }}>Back</button>
+            </div>
+          )}
         </div>
       </div>
     </div>

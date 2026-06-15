@@ -1,0 +1,29 @@
+[Unit]
+# RoboAi Programming-by-Demonstration node.
+#
+# Long-running ROS2 node that publishes /pbd/status and exposes the
+# orchestration library in-process so the dashboard's /api/pbd/*
+# endpoints can drive it without crossing a service boundary.
+#
+# The Anthropic API key (used only when backend=api) is read from
+# ANTHROPIC_API_KEY in the EnvironmentFile below. Keep the key out
+# of the unit file proper.
+Description=RoboAi Programming by Demonstration node
+After=network.target
+
+[Service]
+Type=simple
+User=teddy
+WorkingDirectory=/home/teddy/cobot_ws
+# Operator-owned credentials. Create the file 0600 root:teddy:
+#   /etc/roboai/pbd.env
+# with at minimum:
+#   ANTHROPIC_API_KEY=sk-ant-...
+#   ROBOAI_PBD_BACKEND=api
+EnvironmentFile=-/etc/roboai/pbd.env
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 launch programming_by_demonstration pbd.launch.py'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
