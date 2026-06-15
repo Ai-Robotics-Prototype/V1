@@ -439,6 +439,14 @@ class ProgramExecutor(Node):
         # ── Execute current step ──
         self.get_logger().info(f'Executing step {self._current_step_idx + 1}/{len(self._steps)}: [{action}] {step.get("label", "")}')
 
+        # Derived-move resolver: descend / lift / retreat / "approach
+        # finished part" carry `derived_from: '<role>'` + offset_z_mm and
+        # compute their target at runtime from a prior step's taught_tcp.
+        # _resolve_base_tcp walks backward from the current step looking
+        # for the matching source by `position_role` (explicit) or, for
+        # legacy programs without the tag, the most recent step that
+        # carries any taught_tcp/position. Returns (tcp_list, label).
+
         if action == 'move_home':
             self._send_cmd({'action': 'home'})
             self._state = self.WAITING_MOTION
@@ -457,6 +465,53 @@ class ProgramExecutor(Node):
                 self._advance_step()
 
         elif action == 'move_linear':
+            # Derived offset moves (descend / lift / retreat / "approach
+            # finished part") carry derived_from + offset_z_mm and resolve
+            # at runtime by reading the source step's taught_tcp and
+            # adding the z offset. The operator teaches the source ONCE;
+            # all derived children pick up the new pose automatically.
+            base_tcp, source_label = self._resolve_base_tcp(step)
+            offset_z_mm = float(step.get('offset_z_mm') or 0)
+            is_derived = (step.get('derived_from') is not None) or (
+                # Heuristic for older saves: a move_linear with offset and
+                # no own taught data is a wizard-derived step.
+                step.get('offset_z_mm') is not None
+                and not (step.get('taught_tcp') or step.get('position'))
+                and not (step.get('taught_joints') or step.get('joints'))
+            )
+            if is_derived:
+                if base_tcp is None:
+                    role = step.get('derived_from') or 'previous taught position'
+                    self.get_logger().warn(
+                        f'Step {self._current_step_idx + 1}: derived from "{role}" '
+                        f'but {source_label or "source"} is not taught — skipping'
+                    )
+                    self._advance_step()
+                    return
+                # base_tcp is in meters from /api/state-style payloads.
+                # Apply z offset in meters (mm → m).
+                target = [
+                    base_tcp[0],
+                    base_tcp[1],
+                    base_tcp[2] + offset_z_mm / 1000.0,
+                    base_tcp[3] if len(base_tcp) > 3 else 0,
+                    base_tcp[4] if len(base_tcp) > 4 else 0,
+                    base_tcp[5] if len(base_tcp) > 5 else 0,
+                ]
+                tcp_mm = [
+                    target[0] * 1000 if abs(target[0]) < 10 else target[0],
+                    target[1] * 1000 if abs(target[1]) < 10 else target[1],
+                    target[2] * 1000 if abs(target[2]) < 10 else target[2],
+                    target[3], target[4], target[5],
+                ]
+                self._send_move({
+                    'type': 'movl',
+                    'tcp': tcp_mm,
+                    'speed_pct': step.get('speed_pct', 30),
+                })
+                self._state = self.WAITING_MOTION
+                return
+            # Non-derived: existing behavior — read taught pose directly.
             tcp = step.get('taught_tcp') or step.get('position')
             joints = step.get('taught_joints') or step.get('joints')
             if tcp and len(tcp) >= 3:
@@ -835,6 +890,34 @@ class ProgramExecutor(Node):
             if self._steps[i].get('action') == action_name:
                 return i
         return None
+
+    def _resolve_base_tcp(self, step):
+        """Find the base TCP for a derived offset move.
+
+        Walks backward through self._steps from the current step looking
+        for the source pose:
+          - If `step.derived_from` is set (e.g. 'pick'), find the most
+            recent prior step with `position_role` matching that role
+            and read its taught_tcp.
+          - Otherwise (legacy programs without the tag) take the most
+            recent prior step that carries any taught_tcp / position.
+
+        Returns (tcp_list_in_meters, source_label) — tcp_list is a list
+        of length 3 or 6 (meters / radians), or (None, label) if no
+        suitable source is found. `source_label` is the human-readable
+        role for warning messages.
+        """
+        derived_from = step.get('derived_from')
+        # Walk backward from immediately before the current step.
+        for i in range(self._current_step_idx - 1, -1, -1):
+            src = self._steps[i]
+            if derived_from is not None:
+                if src.get('position_role') != derived_from:
+                    continue
+            tcp = src.get('taught_tcp') or src.get('position')
+            if tcp and len(tcp) >= 3:
+                return list(tcp), (derived_from or src.get('position_role') or src.get('label') or 'previous taught position')
+        return None, (derived_from or 'previous taught position')
 
     def _advance_step(self):
         """Move to the next step."""

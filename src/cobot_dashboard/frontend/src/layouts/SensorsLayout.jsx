@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import CameraPanel from '../components/CameraPanel'
 import LidarPanel from '../components/LidarPanel'
+import MotionCamPanel from '../components/MotionCamPanel'
 
 function PanelChrome({ expanded, onToggle, children }) {
   return (
@@ -25,7 +26,7 @@ function PanelChrome({ expanded, onToggle, children }) {
 }
 
 export default function SensorsLayout() {
-  // null = default 2-row grid; 'cam0' | 'cam1' | 'lidar' fills the
+  // null = default grid; 'cam0' | 'cam1' | 'lidar' | 'motioncam' fills the
   // whole Cameras & LiDAR area with that one panel.
   const [expanded, setExpanded] = useState(null)
   const collapse = () => setExpanded(null)
@@ -51,16 +52,24 @@ export default function SensorsLayout() {
       </PanelChrome>
     )
   }
+  if (expanded === 'motioncam') {
+    return (
+      <PanelChrome expanded onToggle={collapse}>
+        <MotionCamPanel />
+      </PanelChrome>
+    )
+  }
 
-  // Default grid: two cameras on top, LiDAR full-width on the bottom
-  // — point clouds benefit from the wider aspect ratio.
+  // Default grid: two cameras on top, LiDAR in the middle, MotionCam on the
+  // bottom — the MotionCam panel needs the wider width to host its split
+  // live-feed view + point cloud + recognition overlay.
   return (
     <div style={{
       display: 'grid',
       gridTemplateColumns: '1fr 1fr',
-      gridTemplateRows: '1fr 1fr',
+      gridTemplateRows: 'minmax(220px, 1fr) minmax(260px, 1fr) minmax(380px, 1.4fr)',
       height: '100%',
-      overflow: 'hidden',
+      overflow: 'auto',
       gap: 0,
     }}>
       <div style={{ borderRight: '1px solid var(--border)', borderBottom: '1px solid var(--border)', overflow: 'hidden' }}>
@@ -75,9 +84,15 @@ export default function SensorsLayout() {
         </PanelChrome>
       </div>
 
-      <div style={{ gridColumn: '1 / -1', overflow: 'hidden' }}>
+      <div style={{ gridColumn: '1 / -1', borderBottom: '1px solid var(--border)', overflow: 'hidden' }}>
         <PanelChrome expanded={false} onToggle={() => setExpanded('lidar')}>
           <LidarPanel />
+        </PanelChrome>
+      </div>
+
+      <div style={{ gridColumn: '1 / -1', overflow: 'hidden' }}>
+        <PanelChrome expanded={false} onToggle={() => setExpanded('motioncam')}>
+          <MotionCamPanel />
         </PanelChrome>
       </div>
     </div>
