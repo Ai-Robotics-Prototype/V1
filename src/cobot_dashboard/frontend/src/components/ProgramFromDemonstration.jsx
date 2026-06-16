@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import LiveRecorder from './LiveRecorder'
 
 /*
  * Program from Demonstration — three-step modal mirroring the wizard's
@@ -40,6 +41,24 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
   // Editable mirrors of the draft fields — operator corrections.
   const [editName, setEditName]       = useState('')
   const [editDesc, setEditDesc]       = useState('')
+  // Which capture mode is shown in the upload phase: in-browser
+  // recorder vs file upload. Both feed pickFile() so the rest of the
+  // wizard is mode-agnostic.
+  const [captureMode, setCaptureMode] = useState('record')
+  // Editable mirror of the AI's scene understanding. We deep-clone
+  // the AI's scene into local state on REVIEW entry so edits don't
+  // mutate the intent object we display elsewhere.
+  const [editScene, setEditScene]     = useState(null)
+  // The parts library — used to populate the matched-part dropdown
+  // when the operator corrects an unmatched/mismatched object.
+  const [partsLibrary, setPartsLibrary] = useState([])
+  useEffect(() => {
+    let alive = true
+    fetch('/api/parts').then((r) => r.json()).then((d) => {
+      if (alive) setPartsLibrary(d?.parts || [])
+    }).catch(() => {})
+    return () => { alive = false }
+  }, [])
 
   const fileInputRef = useRef(null)
   const videoRef     = useRef(null)
@@ -61,6 +80,21 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
     setDemoId(null)
     setVideoPath(null)
     setGenError('')
+  }
+
+  // LiveRecorder hands us a raw Blob (its lifetime is owned here once
+  // we wrap it in a File). Wrap with a meaningful filename so the
+  // backend's extension allowlist accepts it and the upload directory
+  // shows a sensible name. Type-fall-back to webm — that's what
+  // MediaRecorder produces on every Android Chrome we've shipped to.
+  function handleRecordedClip(blob, filename, mimeType) {
+    if (!blob) return
+    const f = new File(
+      [blob],
+      filename || `pbd_recording_${Date.now()}.webm`,
+      { type: mimeType || blob.type || 'video/webm' },
+    )
+    pickFile(f)
   }
 
   async function upload() {
@@ -111,6 +145,12 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
       setUsedExamples(data.used_examples || [])
       setBackendId(data.backend_id || '')
       setTransited(!!data.transited_externally)
+      // Editable mirror of the AI's scene — deep-cloned so edits don't
+      // mutate the intent we display in the AI-output sections.
+      const aiScene = data.intent?.scene || {
+        objects: [], locations: [], spatial_summary: '',
+      }
+      setEditScene(JSON.parse(JSON.stringify(aiScene)))
       const draftName = data.draft?.name || (data.intent?.task_summary?.slice(0, 60))
                         || `Demo ${up.demo_id}`
       setEditName(draftName)
@@ -133,10 +173,25 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
         name:        editName.trim() || draft.name,
         description: editDesc,
       }
+      // The operator may have corrected the scene (renamed an object,
+      // fixed an unmatched part, changed a location's role, edited the
+      // spatial summary). Send the corrected scene + a corrected
+      // intent (intent with the scene swapped in) so the learning
+      // store captures both as supervised training targets for the
+      // future on-Jetson model.
+      const correctedScene = editScene || (intent && intent.scene) || null
+      const correctedIntent = intent && correctedScene
+        ? { ...intent, scene: correctedScene }
+        : intent
       const res = await fetch(`/api/pbd/${demoId}/correct`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ program, save_to_library: true }),
+        body:    JSON.stringify({
+          program,
+          scene:   correctedScene,
+          intent:  correctedIntent,
+          save_to_library: true,
+        }),
       })
       const data = await res.json()
       if (!data.ok) {
@@ -154,20 +209,40 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
 
   // ── Renderers ───────────────────────────────────────────────────
 
+  // Stretchable card that fills the actual visible viewport (100dvh on
+  // tablets so the address bar doesn't clip us) with a fixed header
+  // and footer flanking a scrollable body. min-height:0 on the body is
+  // mandatory inside a flex column or the body won't actually scroll —
+  // it would just grow to fit its content and push past the card edge,
+  // which is exactly the bug we hit before this refactor.
   return (
     <div style={{
       position: 'fixed', inset: 0, zIndex: 100,
       background: 'rgba(0,0,0,0.4)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      display: 'flex', alignItems: 'stretch', justifyContent: 'center',
+      paddingTop:    'env(safe-area-inset-top, 0px)',
+      paddingBottom: 'env(safe-area-inset-bottom, 0px)',
+      paddingLeft:   'env(safe-area-inset-left, 0px)',
+      paddingRight:  'env(safe-area-inset-right, 0px)',
+      boxSizing: 'border-box',
     }}>
       <div style={{
-        width: '95%', maxWidth: 900, maxHeight: '95vh',
-        background: '#fff', borderRadius: 16, overflow: 'hidden',
+        width: '100%', maxWidth: 980,
+        // `height: 100dvh` is the modern fix for tablet/phone where the
+        // URL bar makes `vh` lie. The earlier overlay padding already
+        // respects safe areas, so the card itself just needs to fill
+        // what's available.
+        height: '100dvh',
+        maxHeight: '100dvh',
+        background: '#fff', borderRadius: 12,
         boxShadow: '0 25px 60px rgba(0,0,0,0.25)',
         display: 'flex', flexDirection: 'column',
+        overflow: 'hidden',
+        boxSizing: 'border-box',
       }}>
-        {/* Header */}
+        {/* Header — never compresses under content pressure. */}
         <div style={{
+          flexShrink: 0,
           padding: '14px 20px', borderBottom: '1px solid #e5e7eb',
           display: 'flex', alignItems: 'center', gap: 12,
         }}>
@@ -182,61 +257,111 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
           <button onClick={onClose} style={iconBtn}>X</button>
         </div>
 
-        {/* Body */}
-        <div style={{ flex: 1, overflowY: 'auto' }}>
+        {/* Body — scrolls when content exceeds available height. The
+            min-height:0 here is what actually unlocks the scroll inside
+            this flex column. */}
+        <div style={{
+          flex: '1 1 auto',
+          minHeight: 0,
+          overflowY: 'auto',
+          WebkitOverflowScrolling: 'touch',
+        }}>
           {phase === PHASE_UPLOAD && (
             <div style={{ padding: 24, maxWidth: 720, margin: '0 auto' }}>
               <div style={{ fontSize: 14, color: '#374151', marginBottom: 16, lineHeight: 1.6 }}>
-                Upload a short clip showing &mdash; and narrating &mdash; the
-                task you want the robot to perform (e.g.&nbsp;&ldquo;pick the
-                BT225L24 brackets from the bin and place them in the
-                left tray&rdquo;). RoboAi will transcribe the voice locally,
-                interpret the demonstration, and produce a draft program
-                you can review before saving.
+                Film the workspace while narrating &mdash; or upload a clip
+                you already recorded on your phone. RoboAi will transcribe
+                the voice locally, fuse video and narration into one
+                understanding, and produce a draft program you can review.
               </div>
 
-              <div
-                onDragOver={(e) => { e.preventDefault() }}
-                onDrop={(e) => {
-                  e.preventDefault()
-                  const f = e.dataTransfer?.files?.[0]
-                  if (f) pickFile(f)
-                }}
-                onClick={() => fileInputRef.current?.click()}
-                style={{
-                  border: '2px dashed #d1d5db', borderRadius: 10,
-                  padding: 30, textAlign: 'center', cursor: 'pointer',
-                  background: file ? '#f8fafc' : '#fafafa', marginBottom: 16,
-                }}>
-                <input ref={fileInputRef} type="file" accept="video/*"
-                  style={{ display: 'none' }}
-                  onChange={(e) => pickFile(e.target.files?.[0])} />
-                {file ? (
-                  <div>
-                    <div style={{ fontSize: 14, fontWeight: 600, color: '#111' }}>
-                      {file.name}
-                    </div>
-                    <div style={{ fontSize: 12, color: '#6b7280', marginTop: 4 }}>
-                      {(file.size / 1024 / 1024).toFixed(2)} MB
-                    </div>
-                  </div>
-                ) : (
-                  <>
-                    <div style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>
-                      Click or drop a video file here
-                    </div>
-                    <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 6 }}>
-                      MP4 / MOV / WebM &mdash; voice narration in any clip language
-                    </div>
-                  </>
-                )}
+              {/* Capture-mode tabs. Both paths produce a File handed to
+                  pickFile() — the rest of the wizard (preview, generate)
+                  is mode-agnostic. */}
+              <div style={{
+                display: 'flex', gap: 4, marginBottom: 14,
+                background: '#f3f4f6', padding: 4, borderRadius: 8,
+              }}>
+                <CaptureTab
+                  label="● Record live"
+                  active={captureMode === 'record'}
+                  onClick={() => setCaptureMode('record')}
+                />
+                <CaptureTab
+                  label="↥ Upload clip"
+                  active={captureMode === 'upload'}
+                  onClick={() => setCaptureMode('upload')}
+                />
               </div>
 
+              {captureMode === 'record' && (
+                <LiveRecorder
+                  onClipReady={handleRecordedClip}
+                  disabled={generating}
+                  autoStart
+                />
+              )}
+
+              {captureMode === 'upload' && (
+                <div
+                  onDragOver={(e) => { e.preventDefault() }}
+                  onDrop={(e) => {
+                    e.preventDefault()
+                    const f = e.dataTransfer?.files?.[0]
+                    if (f) pickFile(f)
+                  }}
+                  onClick={() => fileInputRef.current?.click()}
+                  style={{
+                    border: '2px dashed #d1d5db', borderRadius: 10,
+                    padding: 30, textAlign: 'center', cursor: 'pointer',
+                    background: file ? '#f8fafc' : '#fafafa', marginBottom: 16,
+                  }}>
+                  <input ref={fileInputRef} type="file" accept="video/*"
+                    style={{ display: 'none' }}
+                    onChange={(e) => pickFile(e.target.files?.[0])} />
+                  {file ? (
+                    <div>
+                      <div style={{ fontSize: 14, fontWeight: 600, color: '#111' }}>
+                        {file.name}
+                      </div>
+                      <div style={{ fontSize: 12, color: '#6b7280', marginTop: 4 }}>
+                        {(file.size / 1024 / 1024).toFixed(2)} MB
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>
+                        Click or drop a video file here
+                      </div>
+                      <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 6 }}>
+                        MP4 / MOV / WebM &mdash; voice narration in any clip language
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* Always show a tiny "selected clip" summary + preview
+                  when a file is queued — works for both record and
+                  upload modes so the user can verify before generating. */}
               {file && (
-                <video ref={videoRef} controls
-                  src={objectUrlRef.current}
-                  style={{ width: '100%', maxHeight: 280, background: '#000',
-                    borderRadius: 8, marginBottom: 16 }} />
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{
+                    padding: '8px 10px', marginBottom: 8,
+                    background: '#f0fdf4', border: '1px solid #bbf7d0',
+                    borderRadius: 6, fontSize: 12, color: '#166534',
+                    display: 'flex', alignItems: 'center', gap: 8,
+                  }}>
+                    <span style={{ fontWeight: 700 }}>✓ Ready</span>
+                    <span style={{ flex: 1 }}>
+                      {file.name} · {(file.size / 1024 / 1024).toFixed(2)} MB
+                    </span>
+                  </div>
+                  <video ref={videoRef} controls
+                    src={objectUrlRef.current}
+                    style={{ width: '100%', maxHeight: 280, background: '#000',
+                      borderRadius: 8 }} />
+                </div>
               )}
 
               {generateError && <ErrorBanner msg={generateError} />}
@@ -252,17 +377,8 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
                 recognition stack resolves the pick/place poses on the real
                 robot.
               </div>
-
-              <button onClick={generate}
-                disabled={!file || generating}
-                style={{
-                  width: '100%', padding: 14, fontSize: 16, fontWeight: 700,
-                  background: !file ? '#d1d5db' : '#2563EB',
-                  color: '#fff', border: 'none', borderRadius: 10,
-                  cursor: !file ? 'default' : 'pointer',
-                }}>
-                {generating ? 'Uploading…' : 'Generate Draft Program'}
-              </button>
+              {/* Generate button now lives in the sticky footer below
+                  so it stays tappable even when the body scrolls. */}
             </div>
           )}
 
@@ -291,21 +407,69 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
               usedExamples={usedExamples}
               editName={editName} setEditName={setEditName}
               editDesc={editDesc} setEditDesc={setEditDesc}
+              editScene={editScene} setEditScene={setEditScene}
+              partsLibrary={partsLibrary}
               accepting={accepting} acceptError={acceptError}
-              onAccept={accept} onCancel={onClose}
             />
           )}
         </div>
+
+        {/* Sticky footer — never scrolls, always tappable. Per-phase
+            actions live here. PHASE_PROCESSING has no footer because
+            it's a spinner-only state. */}
+        {phase === PHASE_UPLOAD && (
+          <div style={footerRow}>
+            <button onClick={generate}
+              disabled={!file || generating}
+              style={{
+                flex: 1, padding: 14, fontSize: 16, fontWeight: 700,
+                background: (!file || generating) ? '#d1d5db' : '#2563EB',
+                color: '#fff', border: 'none', borderRadius: 10,
+                cursor: (!file || generating) ? 'default' : 'pointer',
+              }}>
+              {generating ? 'Uploading…' : 'Generate Draft Program'}
+            </button>
+          </div>
+        )}
+        {phase === PHASE_REVIEW && draft && intent && (
+          <div style={footerRow}>
+            <button onClick={onClose} disabled={accepting}
+              style={{
+                flex: 1, padding: 14, fontSize: 14, fontWeight: 700,
+                background: '#fff', color: '#374151',
+                border: '1px solid #d1d5db', borderRadius: 10,
+                cursor: accepting ? 'wait' : 'pointer',
+              }}>Cancel</button>
+            <button onClick={accept} disabled={accepting || !editName.trim()}
+              style={{
+                flex: 2, padding: 14, fontSize: 15, fontWeight: 700,
+                background: accepting ? '#9ca3af' : '#16A34A',
+                color: '#fff', border: 'none', borderRadius: 10,
+                cursor: accepting ? 'wait' : 'pointer',
+              }}>
+              {accepting ? 'Saving…' : 'Accept → Save to Program Library'}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   )
+}
+
+const footerRow = {
+  flexShrink: 0,
+  padding: '12px 20px',
+  borderTop: '1px solid #e5e7eb',
+  background: '#fff',
+  display: 'flex', alignItems: 'center', gap: 10,
 }
 
 
 function ReviewPanel({
   intent, draft, transcript, backendId, transitedExternally, usedExamples,
   editName, setEditName, editDesc, setEditDesc,
-  accepting, acceptError, onAccept, onCancel,
+  editScene, setEditScene, partsLibrary,
+  accepting, acceptError,
 }) {
   return (
     <div style={{ padding: 22 }}>
@@ -327,6 +491,12 @@ function ReviewPanel({
           Confidence: {(intent.confidence_overall * 100).toFixed(0)}%
         </div>
       </Section>
+
+      <SceneSection
+        scene={editScene}
+        onChange={setEditScene}
+        partsLibrary={partsLibrary}
+      />
 
       <Section title={`Operations (${intent.operations?.length || 0})`}>
         {(intent.operations || []).length === 0 ? (
@@ -444,25 +614,9 @@ function ReviewPanel({
       )}
 
       {acceptError && <ErrorBanner msg={acceptError} />}
-
-      <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
-        <button onClick={onCancel} disabled={accepting}
-          style={{
-            flex: 1, padding: 14, fontSize: 14, fontWeight: 700,
-            background: '#fff', color: '#374151',
-            border: '1px solid #d1d5db', borderRadius: 10,
-            cursor: accepting ? 'wait' : 'pointer',
-          }}>Cancel</button>
-        <button onClick={onAccept} disabled={accepting || !editName.trim()}
-          style={{
-            flex: 2, padding: 14, fontSize: 15, fontWeight: 700,
-            background: accepting ? '#9ca3af' : '#16A34A',
-            color: '#fff', border: 'none', borderRadius: 10,
-            cursor: accepting ? 'wait' : 'pointer',
-          }}>
-          {accepting ? 'Saving…' : 'Accept → Save to Program Library'}
-        </button>
-      </div>
+      {/* Cancel + Accept buttons live in the wizard's sticky footer
+          now so they remain tappable even when this review content is
+          taller than the viewport. */}
     </div>
   )
 }
@@ -568,5 +722,297 @@ function ErrorBanner({ msg }) {
       background: '#fef2f2', border: '1px solid #fecaca',
       borderRadius: 6, color: '#DC2626',
     }}>{msg}</div>
+  )
+}
+
+function CaptureTab({ label, active, onClick }) {
+  return (
+    <button onClick={onClick}
+      style={{
+        flex: 1, padding: '10px 14px', fontSize: 13, fontWeight: 700,
+        background: active ? '#fff' : 'transparent',
+        color:      active ? '#111' : '#6b7280',
+        border:     active ? '1px solid #e5e7eb' : '1px solid transparent',
+        borderRadius: 6, cursor: 'pointer',
+        boxShadow: active ? '0 1px 2px rgba(0,0,0,0.06)' : 'none',
+        transition: 'all 100ms',
+      }}>{label}</button>
+  )
+}
+
+
+// ── Scene Understanding section ────────────────────────────────────
+// What the AI extracted by FUSING the video and the narration: the
+// objects on the table, the named places, and a free-text spatial
+// summary. Every field is editable — the operator's corrections feed
+// the learning store as a separate supervised training target for the
+// future on-Jetson model. v1 captures CORE scene only: objects,
+// locations, summary. Metric poses stay null/awaiting_perception in
+// the operations below and will be resolved by perception later.
+
+const SOURCE_OPTIONS = [
+  { value: 'both',      label: 'Video + Voice' },
+  { value: 'video',     label: 'Video only' },
+  { value: 'narration', label: 'Voice only' },
+]
+
+const LOCATION_ROLES = [
+  { value: 'pick_source',  label: 'Pick source' },
+  { value: 'place_target', label: 'Place target' },
+  { value: 'fixture',      label: 'Fixture' },
+  { value: 'other',        label: 'Other' },
+]
+
+function SceneSection({ scene, onChange, partsLibrary }) {
+  if (!scene) return null
+  const objects   = scene.objects   || []
+  const locations = scene.locations || []
+
+  const update = (next) => onChange?.(next)
+  const updateObject = (idx, patch) => {
+    const objs = objects.map((o, i) => (i === idx ? { ...o, ...patch } : o))
+    update({ ...scene, objects: objs })
+  }
+  const updateLocation = (idx, patch) => {
+    const locs = locations.map((l, i) => (i === idx ? { ...l, ...patch } : l))
+    update({ ...scene, locations: locs })
+  }
+  const removeObject = (idx) => update({
+    ...scene, objects: objects.filter((_, i) => i !== idx),
+  })
+  const removeLocation = (idx) => update({
+    ...scene, locations: locations.filter((_, i) => i !== idx),
+  })
+  const addObject = () => update({
+    ...scene,
+    objects: [...objects, {
+      label: '', matched_part_id: null, matched_part_name: null,
+      match_confidence: 0.0, source: 'video',
+      approx_location: '', count_seen: 1,
+    }],
+  })
+  const addLocation = () => update({
+    ...scene,
+    locations: [...locations, {
+      label: '', role: 'other', approx_position: '', source: 'video',
+    }],
+  })
+  const updateSummary = (text) => update({ ...scene, spatial_summary: text })
+
+  // Build the part-id options once per render.
+  const partOptions = (partsLibrary || []).map((p) => ({
+    value: p.id || p.part_id || '', label: p.name || p.id,
+  })).filter((p) => p.value)
+
+  return (
+    <Section title="Scene Understanding (video + voice fused)">
+      <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 10, lineHeight: 1.5 }}>
+        Here&rsquo;s what RoboAi understood from the demonstration by
+        combining the video and your narration. Correct anything that&rsquo;s
+        wrong — your corrections train the model.
+      </div>
+
+      <SubTitle text="Spatial summary" />
+      <textarea value={scene.spatial_summary || ''}
+        onChange={(e) => updateSummary(e.target.value)}
+        placeholder="e.g. A bin of brackets on the right; an empty tray on the left."
+        rows={2}
+        style={{ ...inputBox, marginBottom: 14, resize: 'vertical', fontSize: 13 }} />
+
+      {/* Objects */}
+      <SubTitle text={`Objects detected (${objects.length})`} />
+      {objects.length === 0 ? (
+        <Empty>No objects extracted.</Empty>
+      ) : objects.map((o, i) => (
+        <SceneCard key={i}>
+          <Row>
+            <Label>Label</Label>
+            <input value={o.label || ''}
+              onChange={(e) => updateObject(i, { label: e.target.value })}
+              placeholder="e.g. white bracket"
+              style={miniInput} />
+            <SourceBadge value={o.source}
+              onChange={(v) => updateObject(i, { source: v })} />
+            <RemoveBtn onClick={() => removeObject(i)} />
+          </Row>
+          <Row>
+            <Label>Matched part</Label>
+            <select value={o.matched_part_id || ''}
+              onChange={(e) => {
+                const v = e.target.value || null
+                const found = partOptions.find((p) => p.value === v)
+                updateObject(i, {
+                  matched_part_id:   v,
+                  matched_part_name: found?.label || null,
+                })
+              }}
+              style={miniInput}>
+              <option value="">— not matched —</option>
+              {partOptions.map((p) => (
+                <option key={p.value} value={p.value}>{p.label} ({p.value})</option>
+              ))}
+            </select>
+            <span style={{
+              fontSize: 11, color: '#6b7280', minWidth: 80,
+              textAlign: 'right',
+            }}>
+              conf {(o.match_confidence * 100).toFixed(0)}%
+            </span>
+          </Row>
+          <Row>
+            <Label>Approx location</Label>
+            <input value={o.approx_location || ''}
+              onChange={(e) => updateObject(i, { approx_location: e.target.value })}
+              placeholder="e.g. in the right bin"
+              style={miniInput} />
+            <Label>Count</Label>
+            <input value={String(o.count_seen ?? '')}
+              onChange={(e) => updateObject(i, { count_seen: e.target.value })}
+              placeholder="1 or 'multiple'"
+              style={{ ...miniInput, maxWidth: 110 }} />
+          </Row>
+        </SceneCard>
+      ))}
+      <AddBtn onClick={addObject} label="+ Add object" />
+
+      {/* Locations */}
+      <SubTitle text={`Locations (${locations.length})`} style={{ marginTop: 14 }} />
+      {locations.length === 0 ? (
+        <Empty>No named locations extracted.</Empty>
+      ) : locations.map((l, i) => (
+        <SceneCard key={i}>
+          <Row>
+            <Label>Label</Label>
+            <input value={l.label || ''}
+              onChange={(e) => updateLocation(i, { label: e.target.value })}
+              placeholder="e.g. left tray"
+              style={miniInput} />
+            <SourceBadge value={l.source}
+              onChange={(v) => updateLocation(i, { source: v })} />
+            <RemoveBtn onClick={() => removeLocation(i)} />
+          </Row>
+          <Row>
+            <Label>Role</Label>
+            <select value={l.role || 'other'}
+              onChange={(e) => updateLocation(i, { role: e.target.value })}
+              style={miniInput}>
+              {LOCATION_ROLES.map((r) => (
+                <option key={r.value} value={r.value}>{r.label}</option>
+              ))}
+            </select>
+            <Label>Approx position</Label>
+            <input value={l.approx_position || ''}
+              onChange={(e) => updateLocation(i, { approx_position: e.target.value })}
+              placeholder="e.g. left side, front edge"
+              style={miniInput} />
+          </Row>
+        </SceneCard>
+      ))}
+      <AddBtn onClick={addLocation} label="+ Add location" />
+    </Section>
+  )
+}
+
+// Small primitives kept local to the scene section. They mirror the
+// existing Section/Field/PartChip styling so the panel feels native.
+
+function SubTitle({ text, style }) {
+  return (
+    <div style={{
+      fontSize: 12, fontWeight: 700, color: '#374151',
+      marginBottom: 6, ...(style || {}),
+    }}>{text}</div>
+  )
+}
+
+function SceneCard({ children }) {
+  return (
+    <div style={{
+      padding: 10, marginBottom: 6, borderRadius: 6,
+      background: '#f8fafc', border: '1px solid #e5e7eb',
+      display: 'flex', flexDirection: 'column', gap: 6,
+    }}>{children}</div>
+  )
+}
+
+function Row({ children }) {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 8,
+      flexWrap: 'wrap',
+    }}>{children}</div>
+  )
+}
+
+function Label({ children }) {
+  return (
+    <span style={{
+      fontSize: 11, color: '#6b7280', minWidth: 70,
+    }}>{children}</span>
+  )
+}
+
+const miniInput = {
+  flex: 1, minWidth: 0,
+  padding: '6px 8px', fontSize: 12,
+  border: '1px solid #d1d5db', borderRadius: 4,
+  outline: 'none', boxSizing: 'border-box',
+  background: '#fff',
+}
+
+function SourceBadge({ value, onChange }) {
+  return (
+    <select value={value || 'both'}
+      onChange={(e) => onChange?.(e.target.value)}
+      style={{
+        ...miniInput, flex: '0 0 auto', maxWidth: 130,
+        fontSize: 11, fontWeight: 600,
+        background: value === 'both' ? '#eff6ff'
+                  : value === 'video' ? '#f5f3ff'
+                  : '#fffbeb',
+        color:      value === 'both' ? '#1e3a8a'
+                  : value === 'video' ? '#5b21b6'
+                  : '#92400e',
+        border:     value === 'both' ? '1px solid #bfdbfe'
+                  : value === 'video' ? '1px solid #ddd6fe'
+                  : '1px solid #fde68a',
+      }}>
+      {SOURCE_OPTIONS.map((s) => (
+        <option key={s.value} value={s.value}>{s.label}</option>
+      ))}
+    </select>
+  )
+}
+
+function RemoveBtn({ onClick }) {
+  return (
+    <button onClick={onClick} title="Remove"
+      style={{
+        flex: '0 0 auto', padding: '4px 8px', fontSize: 11,
+        background: 'transparent', color: '#DC2626',
+        border: '1px solid #fecaca', borderRadius: 4, cursor: 'pointer',
+      }}>×</button>
+  )
+}
+
+function AddBtn({ onClick, label }) {
+  return (
+    <button onClick={onClick}
+      style={{
+        padding: '6px 12px', fontSize: 12, fontWeight: 600,
+        background: '#fff', color: '#1d4ed8',
+        border: '1px dashed #93c5fd', borderRadius: 6, cursor: 'pointer',
+        marginTop: 2,
+      }}>{label}</button>
+  )
+}
+
+function Empty({ children }) {
+  return (
+    <div style={{
+      padding: '8px 10px', marginBottom: 6, borderRadius: 4,
+      background: '#fafafa', border: '1px dashed #e5e7eb',
+      fontSize: 12, color: '#9ca3af', fontStyle: 'italic',
+    }}>{children}</div>
   )
 }
