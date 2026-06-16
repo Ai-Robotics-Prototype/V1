@@ -157,7 +157,7 @@ function FolderTile({ folder, programCount, onOpen, onRename, onDelete, onDrop }
   )
 }
 
-function ProgramTile({ prog, onClick, folderName }) {
+function ProgramTile({ prog, onClick, folderName, cellName }) {
   const initial = ((prog.name || '?').trim()[0] || '?').toUpperCase()
   const color   = programColor(prog.id)
 
@@ -183,6 +183,18 @@ function ProgramTile({ prog, onClick, folderName }) {
       onMouseEnter={(e) => { e.currentTarget.style.boxShadow = '0 4px 12px rgba(0,0,0,0.08)' }}
       onMouseLeave={(e) => { e.currentTarget.style.boxShadow = 'none' }}
     >
+      {cellName && (
+        <div title={`Cell: ${cellName}`} style={{
+          position: 'absolute', top: 8, left: 8,
+          fontSize: 10, fontWeight: 700, padding: '2px 8px',
+          background: '#eff6ff', color: '#1d4ed8',
+          border: '1px solid #bfdbfe', borderRadius: 999,
+          maxWidth: 'calc(100% - 16px)',
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }}>
+          ▣ {cellName}
+        </div>
+      )}
       <div style={{
         width: 56, height: 56, borderRadius: '50%',
         background: color, color: '#fff',
@@ -284,6 +296,8 @@ function ProgramDetailsModal({ prog, onClose, onEdit, onDuplicate, onDelete }) {
 export default function ProgramLibrary({ onSelectProgram } = {}) {
   const [programs, setPrograms]             = useState([])
   const [folders, setFolders]               = useState([])
+  const [cells, setCells]                   = useState([])
+  const [cellFilter, setCellFilter]         = useState('all')   // 'all' | 'none' | cell_id
   const [search, setSearch]                 = useState('')
   const [currentFolder, setCurrentFolder]   = useState(null)   // null = root
   const [selectedProgram, setSelectedProgram] = useState(null)
@@ -297,19 +311,25 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
   const load = useCallback(async () => {
     setError(null)
     try {
-      const [pRes, fRes] = await Promise.all([
+      const [pRes, fRes, cRes] = await Promise.all([
         fetch('/api/programs'),
         fetch('/api/folders'),
+        fetch('/api/cells'),
       ])
       const pData = await pRes.json()
       const fData = await fRes.json()
+      const cData = await cRes.json().catch(() => ({ cells: [] }))
       setPrograms(pData.programs || [])
       setFolders(fData.folders || [])
+      setCells(cData.cells || [])
     } catch (e) {
       setError(e.message || String(e))
     }
   }, [])
   useEffect(() => { load() }, [load])
+
+  const cellNameById = {}
+  cells.forEach((c) => { cellNameById[c.cell_id] = c.name })
 
   // Drop the selected-program if it was deleted out from under us by
   // another tab or a refresh.
@@ -403,11 +423,18 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
 
   // ── View selection ────────────────────────────────────────────────
   const q = search.trim().toLowerCase()
-  const filtered = !q ? programs : programs.filter((p) =>
-    p.name.toLowerCase().includes(q) ||
-    (p.description || '').toLowerCase().includes(q) ||
-    (p.tags || []).some((t) => t.toLowerCase().includes(q))
-  )
+  const cellMatched = (p) => {
+    if (cellFilter === 'all')  return true
+    if (cellFilter === 'none') return !p.cell_id
+    return p.cell_id === cellFilter
+  }
+  const filtered = programs.filter((p) => {
+    if (!cellMatched(p)) return false
+    if (!q) return true
+    return p.name.toLowerCase().includes(q) ||
+           (p.description || '').toLowerCase().includes(q) ||
+           (p.tags || []).some((t) => t.toLowerCase().includes(q))
+  })
 
   const folderById = {}
   folders.forEach((f) => { folderById[f.id] = f })
@@ -488,19 +515,40 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
           </div>
         )}
 
-        {/* Search */}
-        <input
-          type="text" placeholder="Search programs..."
-          value={search} onChange={(e) => setSearch(e.target.value)}
-          style={{
-            width: '100%', padding: '14px 18px', fontSize: 16,
-            background: '#fff', color: '#111',
-            border: '1px solid #d1d5db', borderRadius: 10,
-            marginBottom: 20, outline: 'none', minHeight: 50,
-          }}
-          onFocus={(e) => { e.target.style.borderColor = '#2563EB' }}
-          onBlur={(e)  => { e.target.style.borderColor = '#d1d5db' }}
-        />
+        {/* Search + cell filter */}
+        <div style={{ display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap' }}>
+          <input
+            type="text" placeholder="Search programs..."
+            value={search} onChange={(e) => setSearch(e.target.value)}
+            style={{
+              flex: 1, minWidth: 240, padding: '14px 18px', fontSize: 16,
+              background: '#fff', color: '#111',
+              border: '1px solid #d1d5db', borderRadius: 10,
+              outline: 'none', minHeight: 50,
+            }}
+            onFocus={(e) => { e.target.style.borderColor = '#2563EB' }}
+            onBlur={(e)  => { e.target.style.borderColor = '#d1d5db' }}
+          />
+          <select
+            value={cellFilter}
+            onChange={(e) => setCellFilter(e.target.value)}
+            title="Filter programs by cell"
+            style={{
+              padding: '12px 14px', fontSize: 14, fontWeight: 600,
+              background: '#fff', color: '#111',
+              border: '1px solid #d1d5db', borderRadius: 10,
+              minWidth: 220, minHeight: 50, cursor: 'pointer',
+            }}
+          >
+            <option value="all">Show programs for: All cells</option>
+            <option value="none">Show programs for: (no cell assigned)</option>
+            {cells.map((c) => (
+              <option key={c.cell_id} value={c.cell_id}>
+                Show programs for: {c.name}{c.is_active ? ' (active)' : ''}
+              </option>
+            ))}
+          </select>
+        </div>
 
         {error && (
           <div style={{
@@ -533,6 +581,7 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
                 key={prog.id}
                 prog={prog}
                 folderName={isSearchMode && prog.folder ? folderById[prog.folder]?.name : null}
+                cellName={prog.cell_id ? cellNameById[prog.cell_id] : null}
                 onClick={(p) => {
                   // Modal-mode pick → fire the callback and skip the
                   // details modal. The Monitor's Change Program flow

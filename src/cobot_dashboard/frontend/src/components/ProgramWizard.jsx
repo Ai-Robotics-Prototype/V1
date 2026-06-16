@@ -1387,8 +1387,77 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   )
 }
 
+function CellPickerPage({ answers, setAnswer, goNext }) {
+  const [cells, setCells]   = useState([])
+  const [active, setActive] = useState(null)
+  const [loaded, setLoaded] = useState(false)
+  useEffect(() => {
+    let alive = true
+    fetch('/api/cells').then(r => r.json()).then((j) => {
+      if (!alive) return
+      setCells((j.cells || []).filter(c => c.commissioning_complete))
+      setActive(j.active_cell_id || null)
+      setLoaded(true)
+      // Pre-select the active cell on first mount if the user hasn't
+      // already chosen one in this session.
+      if (j.active_cell_id && !answers.cell_id) {
+        setAnswer('cell_id', j.active_cell_id)
+      }
+    }).catch(() => { setLoaded(true) })
+    return () => { alive = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const haveCells = cells.length > 0
+  return (
+    <QuestionCard
+      question="Which workspace is this program for?"
+      description="Programs are scoped to a commissioned cell. The active cell is pre-selected."
+    >
+      {!loaded && <div style={{ color: '#6b7280', fontSize: 13 }}>Loading cells…</div>}
+      {loaded && !haveCells && (
+        <div style={{
+          padding: 14, background: '#fffbeb', border: '1px solid #fde68a',
+          borderRadius: 10, color: '#92400e', fontSize: 13, lineHeight: 1.5,
+          marginBottom: 12,
+        }}>
+          No cells commissioned yet. You can still continue without one, but linking the program to a cell unlocks per-cell baselines and bounds later.
+          {' '}Go to <strong>Configure → Setup Wizard</strong> to commission one.
+        </div>
+      )}
+      {loaded && haveCells && (
+        <div style={{ marginBottom: 12 }}>
+          {cells.map(c => (
+            <ChoiceButton key={c.cell_id}
+              label={c.name + (c.cell_id === active ? '   (Active)' : '')}
+              description={
+                (c.baseline_captured ? `Baseline ${(c.baseline_point_count || 0).toLocaleString()} pts · ` : 'No baseline · ')
+                + (c.commissioning_complete ? 'Commissioned' : 'Incomplete')
+              }
+              selected={answers.cell_id === c.cell_id}
+              onClick={() => { setAnswer('cell_id', c.cell_id); goNext() }}
+            />
+          ))}
+        </div>
+      )}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+        <NextButton
+          onClick={goNext}
+          label={haveCells ? 'Use selected' : 'Continue without a cell'}
+        />
+      </div>
+    </QuestionCard>
+  )
+}
+
 const PAGES = [
-  // 0: What operation?
+  // 0: Which workspace is this program for?
+  {
+    id: 'cell',
+    render: CellPickerPage,
+  },
+
+  // 1: What operation?
   {
     id: 'operation',
     render: ({ answers, setAnswer, goNext }) => (
@@ -2837,10 +2906,11 @@ export default function ProgramWizard({ onClose, onSaved }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: answers.program_name,
-          description: PAGES[0] && answers.operation ? answers.operation.replace(/_/g, ' ') : '',
+          description: answers.operation ? answers.operation.replace(/_/g, ' ') : '',
           steps: builtSteps,
           tags: [answers.operation],
           config,
+          cell_id: answers.cell_id || null,
           motion_profile_name: SILENT_MOTION_PROFILE,
           motion_profile_override_enabled: false,
           motion_optimization_enabled: true,

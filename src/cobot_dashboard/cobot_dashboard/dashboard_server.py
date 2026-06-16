@@ -2892,6 +2892,7 @@ if FASTAPI_AVAILABLE:
                         'created':     prog.get('created') or '',
                         'updated':     prog.get('updated') or prog.get('created') or '',
                         'folder':      prog.get('folder'),
+                        'cell_id':     prog.get('cell_id'),
                     })
                 except Exception:
                     continue
@@ -3051,6 +3052,7 @@ if FASTAPI_AVAILABLE:
             "tags":        list(body.get("tags") or []),
             "config":      body.get("config") or {},
             "steps":       steps,
+            "cell_id":     body.get("cell_id") or None,
             "created":     ts,
             "updated":     ts,
         }
@@ -3091,7 +3093,7 @@ if FASTAPI_AVAILABLE:
                 prog = json.load(f)
         except Exception as e:
             return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
-        for k in ("name", "description", "tags", "config", "steps"):
+        for k in ("name", "description", "tags", "config", "steps", "cell_id"):
             if k in body:
                 prog[k] = body[k]
         # id is owned by the filename — never let a client change it.
@@ -4948,8 +4950,48 @@ def main(args=None):
     else:
         print("WARNING: rclpy not available — running without ROS2 (simulation mode)")
 
+    # ── TLS configuration ─────────────────────────────────────────
+    # The dashboard SHOULD serve HTTPS so browsers grant the
+    # getUserMedia / MediaRecorder permissions the Program-from-
+    # Demonstration recorder relies on (Chrome and Firefox refuse
+    # those APIs on plain HTTP for LAN IPs).
+    #
+    # Behaviour:
+    #   - If both cert + key files exist at the configured paths,
+    #     uvicorn binds with TLS — serves https://… on the same
+    #     port (default 8080). Mixed-content: any WebSocket the
+    #     frontend opens auto-upgrades to wss:// because the page
+    #     origin is https.
+    #   - If either file is missing, we DON'T hard-fail. The dashboard
+    #     comes up on plain HTTP with a loud warning so the operator
+    #     still has the UI; live recording in the wizard simply won't
+    #     work until the cert is generated (scripts/generate_dashboard_cert.sh).
+    #
+    # Override locations with env vars for non-Jetson dev machines.
+    ssl_certfile = os.environ.get(
+        'ROBOAI_DASHBOARD_CERT', '/opt/cobot/certs/dashboard_cert.pem')
+    ssl_keyfile  = os.environ.get(
+        'ROBOAI_DASHBOARD_KEY',  '/opt/cobot/certs/dashboard_key.pem')
+    port         = int(os.environ.get('ROBOAI_DASHBOARD_PORT', '8080'))
+    uvicorn_kwargs = {
+        'host':      '0.0.0.0',
+        'port':      port,
+        'log_level': 'warning',
+    }
+    if os.path.isfile(ssl_certfile) and os.path.isfile(ssl_keyfile):
+        uvicorn_kwargs['ssl_certfile'] = ssl_certfile
+        uvicorn_kwargs['ssl_keyfile']  = ssl_keyfile
+        print(f'[dashboard] HTTPS enabled on :{port} '
+              f'(cert={ssl_certfile})')
+    else:
+        print(f'[dashboard] WARNING: TLS cert not found at {ssl_certfile}; '
+              f'serving plain HTTP on :{port}. '
+              f'Live recording (getUserMedia) will be blocked by the browser '
+              f'over the LAN. Generate the cert with: '
+              f'sudo scripts/generate_dashboard_cert.sh')
+
     try:
-        uvicorn.run(app, host="0.0.0.0", port=8080, log_level="warning")
+        uvicorn.run(app, **uvicorn_kwargs)
     except KeyboardInterrupt:
         pass
     finally:

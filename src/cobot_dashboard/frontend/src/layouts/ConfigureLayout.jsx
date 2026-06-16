@@ -1,6 +1,9 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 import WorkspaceMaskSection from '../components/WorkspaceMaskSection'
+import SetupWizard from '../components/SetupWizard'
+import CellDetailPanel from '../components/CellDetailPanel'
+import { useCellWizardStore } from '../store/cellWizardStore'
 
 const LS_KEY = 'roboai-config'
 
@@ -99,6 +102,198 @@ function ZoneRingSVG({ green, yellow, red }) {
   )
 }
 
+function CellRow({ c, allCells, busy, onActivate, onDelete, expanded, onToggleExpand, onRefresh }) {
+  return (
+    <div style={{
+      background: 'var(--bg-panel)',
+      border: '1px solid var(--border)',
+      borderRadius: 'var(--radius-sm)',
+      display: 'flex', flexDirection: 'column',
+      overflow: 'hidden',
+    }}>
+      <div
+        onClick={onToggleExpand}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 10,
+          padding: '8px 12px',
+          cursor: 'pointer',
+          background: expanded ? 'rgba(37,99,235,0.06)' : 'transparent',
+          transition: 'background 120ms',
+        }}>
+        <span
+          aria-label={expanded ? 'Collapse' : 'Expand'}
+          style={{
+            color: 'var(--text-muted)', fontSize: 13,
+            transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
+            transition: 'transform 180ms',
+            width: 12, display: 'inline-block',
+          }}>▶</span>
+        <span style={{
+          width: 10, height: 10, borderRadius: '50%',
+          background: c.is_active ? '#22c55e' : '#475569',
+          flexShrink: 0,
+        }} title={c.is_active ? 'Active cell' : 'Inactive'} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{
+            fontSize: 13, fontWeight: 600, color: 'var(--text-primary)',
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>
+            {c.name}
+          </div>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+            {c.baseline_captured
+              ? `Baseline ${(c.baseline_point_count || 0).toLocaleString()} pts`
+              : 'No baseline'}
+            {' · '}
+            {(c.program_count ?? 0)} {(c.program_count === 1) ? 'program' : 'programs'}
+          </div>
+        </div>
+        <span style={{
+          fontSize: 10, fontWeight: 700,
+          padding: '2px 8px', borderRadius: 999,
+          background: c.commissioning_complete ? '#dcfce7' : '#fef3c7',
+          color:      c.commissioning_complete ? '#166534' : '#92400e',
+        }}>
+          {c.commissioning_complete ? 'Complete' : 'Incomplete'}
+        </span>
+        {!c.is_active && (
+          <button onClick={(e) => { e.stopPropagation(); onActivate(c.cell_id) }}
+            disabled={busy} style={cellBtn('#2563EB')}>
+            Activate
+          </button>
+        )}
+        <button onClick={(e) => { e.stopPropagation(); onDelete(c.cell_id) }}
+          disabled={busy} style={cellBtn('#DC2626')}>
+          Delete
+        </button>
+      </div>
+      <div style={{
+        maxHeight: expanded ? 9999 : 0,
+        opacity: expanded ? 1 : 0,
+        overflow: expanded ? 'visible' : 'hidden',
+        transition: 'opacity 180ms',
+      }}>
+        {expanded && (
+          <CellDetailPanel
+            cellId={c.cell_id}
+            allCells={allCells}
+            onRefresh={onRefresh}
+            onDeleted={() => onRefresh()}
+          />
+        )}
+      </div>
+    </div>
+  )
+}
+
+function CellSetupSection() {
+  const openWizard       = useCellWizardStore((s) => s.openWizard)
+  const wizardOpen       = useCellWizardStore((s) => s.open)
+  const closeWizard      = useCellWizardStore((s) => s.closeWizard)
+  const expandedId       = useCellWizardStore((s) => s.expandedCellId)
+  const setExpandedCell  = useCellWizardStore((s) => s.setExpandedCell)
+  const clearCellPanel   = useCellWizardStore((s) => s.clearCellPanelState)
+
+  const [data, setData] = useState({ active_cell_id: null, cells: [] })
+  const [busy, setBusy] = useState(false)
+
+  const refresh = useCallback(async () => {
+    try {
+      const r = await fetch('/api/cells')
+      const j = await r.json()
+      setData(j)
+    } catch {}
+  }, [])
+
+  useEffect(() => { refresh() }, [refresh])
+
+  const onToggleExpand = (cellId) => {
+    setExpandedCell(cellId)
+  }
+
+  const onActivate = async (cellId) => {
+    setBusy(true)
+    try {
+      await fetch(`/api/cells/${cellId}/activate`, { method: 'POST' })
+      await refresh()
+    } finally { setBusy(false) }
+  }
+
+  const onDelete = async (cellId) => {
+    if (!confirm('Delete this cell? This removes the profile and baseline cloud.')) return
+    setBusy(true)
+    try {
+      await fetch(`/api/cells/${cellId}`, { method: 'DELETE' })
+      clearCellPanel(cellId)
+      await refresh()
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <>
+      <div style={{
+        background: 'var(--bg-surface)',
+        border: '1px solid var(--border)',
+        borderRadius: 'var(--radius-lg)',
+        padding: '16px 20px',
+        display: 'flex', flexDirection: 'column', gap: 12,
+      }}>
+        <div style={{
+          fontSize: 11, fontWeight: 600, color: 'var(--text-primary)',
+          textTransform: 'uppercase', letterSpacing: '0.08em',
+          paddingBottom: 8, borderBottom: '1px solid var(--border)',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          <span>Setup Wizard — Cells</span>
+          <button
+            onClick={() => openWizard(null)}
+            style={{
+              background: '#16A34A', color: '#fff', border: 'none',
+              padding: '6px 14px', borderRadius: 'var(--radius-sm)',
+              fontSize: 12, fontWeight: 600, cursor: 'pointer',
+              textTransform: 'none', letterSpacing: 'normal',
+            }}>
+            + Commission a New Cell
+          </button>
+        </div>
+        {data.cells.length === 0 ? (
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 0' }}>
+            No cells commissioned yet. Click <strong>Commission a New Cell</strong> to set up your first workspace.
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {data.cells.map((c) => (
+              <CellRow key={c.cell_id} c={c}
+                allCells={data.cells}
+                busy={busy}
+                onActivate={onActivate}
+                onDelete={onDelete}
+                expanded={expandedId === c.cell_id}
+                onToggleExpand={() => onToggleExpand(c.cell_id)}
+                onRefresh={refresh}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+      {wizardOpen && (
+        <SetupWizard
+          onClose={() => { closeWizard(); refresh() }}
+          onSaved={() => { refresh() }}
+        />
+      )}
+    </>
+  )
+}
+
+function cellBtn(color) {
+  return {
+    background: color, color: '#fff', border: 'none',
+    padding: '4px 10px', borderRadius: 4,
+    fontSize: 11, fontWeight: 600, cursor: 'pointer',
+  }
+}
+
 export default function ConfigureLayout() {
   const setMode = useStore((s) => s.setMode)
   const mode    = useStore((s) => s.mode)
@@ -158,6 +353,8 @@ export default function ConfigureLayout() {
       <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
         Configure
       </div>
+
+      <CellSetupSection />
 
       {/* Robot Connection */}
       <Section title="Robot Connection">
