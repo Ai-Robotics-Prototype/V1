@@ -84,6 +84,31 @@ STATE = {
     },
     "detections": [],
     "lidar_objects": [],
+    "openvocab": {
+        "enabled":      False,            # toggled by frontend; gates ROS publishing of prompts
+        "prompts":      [],               # text prompts the operator wants detected
+        "detections":   [],               # last detection set from the node (status & objects)
+        "stalled":      False,
+        "frame_age_s":  None,
+        "inference_ms": 0.0,
+        "fps":          0.0,
+        "device":       "",
+        "image_w":      0,
+        "image_h":      0,
+        "image_topic":  "",
+        "model":        "",
+        "error":        None,
+    },
+    "collision": {
+        "status": "clear",         # clear | warning | collision
+        "min_distance_m": None,
+        "objects": [],             # ordered nearest-first
+        "have_joints": False,
+        "reach_radius_m": 1.4,
+        "warn_distance_m": 0.150,
+        "critical_distance_m": 0.050,
+        "mock_objects": [],        # synthetic AABBs from /api/collision/mock
+    },
     "placed_objects": [],
     "scene_graph": {"objects": []},
     "grasp_poses": [],
@@ -496,6 +521,17 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         except ImportError:
             self.get_logger().warn("vision_msgs not available — detection3d subscription skipped")
         self.create_subscription(JointState, "/joint_states",            self._on_joint_states,   10)
+        # Collision monitor (capsule-vs-bbox proximity from the LiDAR identifier).
+        # Both topics are JSON over std_msgs/String so we can stay schema-free
+        # while iterating; can be upgraded to typed msgs later.
+        self.create_subscription(String, "/collision/objects", self._on_collision_objects, 5)
+        self.create_subscription(String, "/collision/status",  self._on_collision_status,  5)
+        # NanoOWL open-vocabulary detector — JSON status over /perception/openvocab_detections
+        self.create_subscription(String, "/perception/openvocab_detections",
+                                 self._on_openvocab, 5)
+        # Outbound prompts channel for the NanoOWL node (frontend updates → node)
+        self._openvocab_prompts_pub = self.create_publisher(
+            String, "/perception/openvocab/prompts", 5)
 
         # Estun driver status (publishes robot mode, joints, TCP pose as JSON).
         # When connected, this overwrites the sim joints — real wins.
@@ -652,6 +688,92 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             })
         with _state_lock:
             STATE["lidar_objects"] = out
+
+    def _on_openvocab(self, msg):
+        """Mirror /perception/openvocab_detections (JSON over String) into
+        STATE['openvocab']. Frontend reads this via /ws/state to render the
+        overlay + side panel + stalled banner."""
+        try:
+            payload = json.loads(msg.data) if msg.data else {}
+        except Exception:
+            return
+        with _state_lock:
+            ov = STATE["openvocab"]
+            ov["detections"]   = list(payload.get("detections") or [])
+            ov["stalled"]      = bool(payload.get("stalled"))
+            ov["frame_age_s"]  = payload.get("frame_age_s")
+            ov["inference_ms"] = float(payload.get("inference_ms") or 0.0)
+            ov["fps"]          = float(payload.get("fps") or 0.0)
+            ov["device"]       = str(payload.get("device") or "")
+            ov["image_w"]      = int(payload.get("image_w") or 0)
+            ov["image_h"]      = int(payload.get("image_h") or 0)
+            ov["image_topic"]  = str(payload.get("image_topic") or "")
+            ov["model"]        = str(payload.get("model") or "")
+            ov["error"]        = payload.get("error")
+            # NanoOWL echoes back the prompts it's currently running with —
+            # we don't trust this as authoritative (frontend owns the list)
+            # but it's useful for diagnosing.
+            ov["prompts_echo"] = list(payload.get("prompts") or [])
+
+    def publish_openvocab_prompts(self, prompts):
+        """Send a fresh prompt list to the NanoOWL node over the ROS topic
+        the node subscribes to. Called by the /api/openvocab/prompts POST
+        handler whenever the operator edits the prompt list. When the panel
+        is disabled (or the prompt list is empty), the node receives [] and
+        publishes empty detections."""
+        if self._openvocab_prompts_pub is None:
+            return
+        try:
+            msg = String()
+            msg.data = json.dumps({'prompts': list(prompts or [])})
+            self._openvocab_prompts_pub.publish(msg)
+        except Exception as e:
+            self.get_logger().warn(f'openvocab prompt publish failed: {e}')
+
+    def _on_collision_objects(self, msg):
+        """Mirror /collision/objects (JSON over String) into STATE['collision'].
+        Mock objects (from /api/collision/mock) are re-classified using the
+        current thresholds and merged with the real list, then sorted
+        nearest-first so the frontend can render both interchangeably."""
+        try:
+            payload = json.loads(msg.data) if msg.data else {}
+        except Exception:
+            return
+        real_objects = list(payload.get("objects") or [])
+        with _state_lock:
+            c = STATE["collision"]
+            c["reach_radius_m"]     = float(payload.get("reach_radius_m", c.get("reach_radius_m", 1.4)))
+            c["warn_distance_m"]    = float(payload.get("warn_distance_m", c.get("warn_distance_m", 0.150)))
+            c["critical_distance_m"] = float(payload.get("critical_distance_m", c.get("critical_distance_m", 0.050)))
+            c["have_joints"]        = bool(payload.get("have_joints", c.get("have_joints", False)))
+            mocks = c.get("mock_objects") or []
+            for m in mocks:
+                _classify_mock_entry(m, c)
+            merged = real_objects + list(mocks)
+            merged.sort(key=lambda r: r.get("min_distance_m") or 1e9)
+            c["objects"] = merged
+
+    def _on_collision_status(self, msg):
+        try:
+            payload = json.loads(msg.data) if msg.data else {}
+        except Exception:
+            return
+        with _state_lock:
+            c = STATE["collision"]
+            real_status = str(payload.get("status") or "clear")
+            real_min    = payload.get("min_distance_m")
+            worst = real_status
+            min_d = real_min if real_min is not None else float('inf')
+            for m in (c.get("mock_objects") or []):
+                _classify_mock_entry(m, c)
+                if m["status"] == "collision":
+                    worst = "collision"
+                elif m["status"] == "warning" and worst != "collision":
+                    worst = "warning"
+                if m["min_distance_m"] < min_d:
+                    min_d = m["min_distance_m"]
+            c["status"]         = worst
+            c["min_distance_m"] = (min_d if min_d != float('inf') else None)
 
     def _on_detections_3d(self, msg):
         """Camera-based detector — stays in STATE['detections'] for the
@@ -1750,6 +1872,146 @@ if FASTAPI_AVAILABLE:
     async def api_state():
         with _state_lock:
             return copy.deepcopy(STATE)
+
+    # ------------------------------------------------------------------
+    # Collision monitor — mock-injection endpoints
+    # ------------------------------------------------------------------
+    # The collision pipeline runs in roboai-collision-monitor against the
+    # LiDAR identifier's real detections. These endpoints let the operator
+    # inject a synthetic AABB at a chosen position to verify the
+    # green→yellow→red threshold transitions without staging a real
+    # object on the bench. The dashboard treats mock entries identically
+    # to real ones when rendering the 3D scene + side panel.
+
+    def _classify_mock_entry(entry, thresholds):
+        """Recompute distance + status for one mock object using a
+        simplified "vertical base capsule at origin, radius 0.15 m"
+        kinematic — good enough for testing thresholds with no robot
+        present. Mutates the entry in place."""
+        cx = float(entry.get('center', {}).get('x') or 0.0)
+        cy = float(entry.get('center', {}).get('y') or 0.0)
+        dx = float(entry.get('dimensions', {}).get('x') or 0.0)
+        dy = float(entry.get('dimensions', {}).get('y') or 0.0)
+        # Closest point on AABB to (0,0) in the XY plane, minus base radius.
+        clx = max(-dx / 2.0, min(0 - cx, dx / 2.0)) + cx
+        cly = max(-dy / 2.0, min(0 - cy, dy / 2.0)) + cy
+        d = math.hypot(clx, cly) - 0.15
+        d = max(0.0, d)
+        warn = float(thresholds.get('warn_distance_m', 0.15))
+        crit = float(thresholds.get('critical_distance_m', 0.05))
+        if d < crit:    status = 'collision'
+        elif d < warn:  status = 'warning'
+        else:           status = 'clear'
+        entry['min_distance_m'] = d
+        entry['status']         = status
+        entry['nearest_link']   = 'base (mock)'
+        entry['mock']           = True
+        return entry
+
+    def _rebuild_collision_state():
+        """Recompute mock statuses and re-derive overall status. Called
+        whenever mocks change so the operator sees instant feedback even
+        before the next /collision/objects tick arrives."""
+        with _state_lock:
+            c = STATE["collision"]
+            mocks = c.get("mock_objects") or []
+            for m in mocks:
+                _classify_mock_entry(m, c)
+            # Worst-of-all overall status
+            worst = c.get("status") or "clear"
+            for m in mocks:
+                if m["status"] == "collision":
+                    worst = "collision"; break
+                if m["status"] == "warning" and worst != "collision":
+                    worst = "warning"
+            c["status"] = worst
+
+    @app.post("/api/collision/mock")
+    async def api_collision_mock_post(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        cx = float((body.get("center") or {}).get("x") or 0.0)
+        cy = float((body.get("center") or {}).get("y") or 0.0)
+        cz = float((body.get("center") or {}).get("z") or 0.3)
+        dx = float((body.get("dimensions") or {}).get("x") or 0.12)
+        dy = float((body.get("dimensions") or {}).get("y") or 0.12)
+        dz = float((body.get("dimensions") or {}).get("z") or 0.20)
+        import uuid as _uuid
+        entry = {
+            "id":         -abs(hash(_uuid.uuid4().hex)) % 99999 - 1,  # negative id flags it as mock
+            "name":       str(body.get("name") or "mock"),
+            "identified_as": "mock",
+            "confidence": 0.0,
+            "static":     False,
+            "frames_observed": 0,
+            "center":     {"x": cx, "y": cy, "z": cz},
+            "dimensions": {"x": dx, "y": dy, "z": dz},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        }
+        replace = bool(body.get("replace", True))
+        with _state_lock:
+            c = STATE["collision"]
+            if replace:
+                c["mock_objects"] = [entry]
+            else:
+                c["mock_objects"].append(entry)
+        _rebuild_collision_state()
+        with _state_lock:
+            return {"ok": True, "mock_objects": list(STATE["collision"]["mock_objects"])}
+
+    @app.delete("/api/collision/mock")
+    async def api_collision_mock_clear():
+        with _state_lock:
+            STATE["collision"]["mock_objects"] = []
+        _rebuild_collision_state()
+        return {"ok": True}
+
+    @app.get("/api/collision")
+    async def api_collision_get():
+        with _state_lock:
+            return copy.deepcopy(STATE["collision"])
+
+    # ------------------------------------------------------------------
+    # NanoOWL open-vocabulary detection — prompt management
+    # ------------------------------------------------------------------
+    # The dashboard does NOT run OWL-ViT itself — that lives in
+    # roboai-nanoowl. We just store the operator's intent (prompts +
+    # enabled flag) in STATE["openvocab"] and push the prompts to the
+    # node over the ROS topic the node subscribes to. The frontend
+    # reads STATE["openvocab"] via /ws/state for detection results.
+
+    @app.get("/api/openvocab")
+    async def api_openvocab_get():
+        with _state_lock:
+            return copy.deepcopy(STATE["openvocab"])
+
+    @app.post("/api/openvocab/prompts")
+    async def api_openvocab_prompts(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        prompts_in = body.get("prompts") or []
+        if not isinstance(prompts_in, list):
+            return JSONResponse({"error": "'prompts' must be a list"}, status_code=400)
+        prompts = [str(p).strip() for p in prompts_in if str(p).strip()]
+        enabled = bool(body.get("enabled", True))
+        with _state_lock:
+            STATE["openvocab"]["prompts"] = prompts
+            STATE["openvocab"]["enabled"] = enabled
+        # Push to the node. If the panel is disabled OR the list is empty,
+        # we explicitly publish [] so the node clears its detections instead
+        # of carrying on with the last-known prompts.
+        outgoing = prompts if enabled else []
+        try:
+            if _ros_node is not None:
+                _ros_node.publish_openvocab_prompts(outgoing)
+        except Exception as e:
+            return JSONResponse({"error": f"prompt publish failed: {e}"},
+                                status_code=500)
+        return {"ok": True, "prompts": prompts, "enabled": enabled}
 
     # ------------------------------------------------------------------
     # MotionCam-3D Color S+ — status, mode, scene control
