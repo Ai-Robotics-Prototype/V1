@@ -3169,7 +3169,12 @@ if FASTAPI_AVAILABLE:
                     'model':               os.environ.get('ROBOAI_PBD_API_MODEL', 'claude-opus-4-7'),
                     'max_tokens':          int(os.environ.get('ROBOAI_PBD_MAX_TOKENS', '4096')),
                     'request_timeout_s':   float(os.environ.get('ROBOAI_PBD_TIMEOUT_S', '120')),
-                    'zero_data_retention': True,
+                    # ZDR is opt-in per workspace and Anthropic now strict-
+                    # validates the anthropic-beta header — leaving it True
+                    # on a non-enrolled workspace triggers HTTP 400. Default
+                    # OFF; set ROBOAI_PBD_ZERO_DATA_RETENTION=1 (read inside
+                    # AnthropicClaudeBackend) once ZDR is enrolled.
+                    'zero_data_retention': False,
                 },
             )
             pipeline = Pipeline(cfg, parts_provider=_pbd_parts_provider)

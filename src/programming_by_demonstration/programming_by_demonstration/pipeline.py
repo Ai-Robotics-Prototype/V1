@@ -324,7 +324,9 @@ def pipeline_config_from_params(get: Callable[[str], Any]) -> PipelineConfig:
             'model':               str(get('api_model') or 'claude-opus-4-7'),
             'max_tokens':          int(get('api_max_tokens') or 4096),
             'request_timeout_s':   float(get('api_request_timeout_s') or 120.0),
-            'zero_data_retention': bool(get('api_zero_data_retention') if get('api_zero_data_retention') is not None else True),
+            # Defaults to False — see api_backend.AnthropicClaudeBackend.__init__
+            # for why (Anthropic rejects the ZDR beta unless enrolled).
+            'zero_data_retention': bool(get('api_zero_data_retention') if get('api_zero_data_retention') is not None else False),
         },
         whisper_model=str(get('whisper_model') or 'base.en'),
         whisper_device=str(get('whisper_device') or 'auto'),

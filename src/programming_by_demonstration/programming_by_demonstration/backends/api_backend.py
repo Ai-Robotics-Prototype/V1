@@ -197,12 +197,21 @@ class AnthropicClaudeBackend(UnderstandingBackend):
                  base_url: Optional[str] = None,
                  max_tokens: int = 4096,
                  request_timeout_s: float = 120.0,
-                 zero_data_retention: bool = True):
+                 zero_data_retention: Optional[bool] = None):
         self.model = model
         self.api_key  = api_key or os.environ.get('ANTHROPIC_API_KEY') or ''
         self.base_url = base_url or os.environ.get('ANTHROPIC_BASE_URL') or None
         self.max_tokens = int(max_tokens)
         self.timeout_s = float(request_timeout_s)
+        # ZDR is an opt-in Anthropic feature that requires per-account
+        # enrollment. Sending the `anthropic-beta: zero-data-retention`
+        # header on accounts that aren't enrolled used to be a no-op but
+        # the API now strict-validates beta values and rejects with HTTP
+        # 400 if you ask for one you don't have. Default is therefore
+        # OFF; the dashboard can flip it on via ROBOAI_PBD_ZERO_DATA_RETENTION=1
+        # for accounts that actually have ZDR turned on with Anthropic.
+        if zero_data_retention is None:
+            zero_data_retention = (os.environ.get('ROBOAI_PBD_ZERO_DATA_RETENTION', '') == '1')
         self.zero_data_retention = bool(zero_data_retention)
         self.backend_id = f'api:{model}'
 
@@ -232,8 +241,13 @@ class AnthropicClaudeBackend(UnderstandingBackend):
         except BackendApiUnavailable as e:
             return self._error_result(str(e))
 
-        # Zero-data-retention is opt-in per provider account; sending the
-        # header on accounts that don't have it enrolled is harmless.
+        # Anthropic's API strict-validates `anthropic-beta` header values
+        # and rejects requests asking for ZDR unless the account is
+        # actually enrolled for it (HTTP 400 "Unexpected value(s) for the
+        # anthropic-beta header"). Default is OFF; flip ON only after
+        # verifying ZDR enrollment on the workspace this key belongs to
+        # via the Anthropic Console — then either pass zero_data_retention=True
+        # to the constructor, or set env ROBOAI_PBD_ZERO_DATA_RETENTION=1.
         extra_headers: Dict[str, str] = {}
         if self.zero_data_retention:
             extra_headers['anthropic-beta'] = 'zero-data-retention'
