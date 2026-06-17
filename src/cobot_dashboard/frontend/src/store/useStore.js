@@ -340,6 +340,56 @@ const storeDefinition = (set, get) => ({
   loadedProgram: null,
   setLoadedProgram(prog) { set({ loadedProgram: prog }) },
 
+  // ── Active cell — the single source of truth that Configure writes
+  // to on Activate and that the 3D View, ProgramWizard, and any other
+  // cell-scoped feature read from. Backend authority is
+  // /api/cells/active; we hydrate once at app boot and on tab refocus
+  // so the store stays in sync even if a cell was activated from
+  // another browser session.
+  //
+  // `activeCellHydrated` tells consumers whether we've heard from the
+  // backend yet — this distinguishes the initial-load "we don't know
+  // yet" state from a confirmed "there is no active cell" state.
+  // Without this, the 3D View briefly flashes "No active cell" before
+  // the first /api/cells/active response lands (the original bug).
+  activeCellId:       null,
+  activeCell:         null,   // last full payload from /api/cells/active
+  activeCellHydrated: false,
+  setActiveCellId(id, cell) {
+    set((s) => {
+      const next = {
+        activeCellId:       id || null,
+        activeCellHydrated: true,
+      }
+      // Merge a fresh `cell` payload if the caller provided one; keep
+      // the previous one otherwise (Configure's local refresh and the
+      // hydrate fetch can disagree on which fields they include).
+      if (cell !== undefined) next.activeCell = cell || null
+      else if ((id || null) !== s.activeCellId) next.activeCell = null
+      return next
+    })
+  },
+  async hydrateActiveCell() {
+    try {
+      const r = await fetch('/api/cells/active')
+      if (!r.ok) {
+        // Backend reachable but the cell endpoint failed — still mark
+        // hydrated so consumers can stop showing the "loading…" state
+        // and surface a proper error instead.
+        set({ activeCellHydrated: true })
+        return
+      }
+      const j = await r.json()
+      set({
+        activeCellId:       j.active_cell_id || null,
+        activeCell:         j.cell || null,
+        activeCellHydrated: true,
+      })
+    } catch {
+      set({ activeCellHydrated: true })
+    }
+  },
+
   // The editor's authoritative state — survives ProgramEditor unmount
   // so switching tabs and coming back preserves the program identity,
   // steps, and unsaved flag. Step mutations update this slice locally;
@@ -351,6 +401,14 @@ const storeDefinition = (set, get) => ({
     name: 'Untitled Program',
     steps: [],
     unsaved: false,
+    // Full program.config payload (gripper, pallet, motion_profile_name,
+    // pallet_mode, pick_tcp, place_tcp, etc.). Loaded on Library → Edit
+    // so the editor can mutate pallet configuration and send it back
+    // through PUT /api/programs/{id}.
+    config: {},
+    description: '',
+    tags: [],
+    cell_id: null,
   },
   setCurrentProgram(patch) {
     set((s) => ({ currentProgram: { ...s.currentProgram, ...patch } }))

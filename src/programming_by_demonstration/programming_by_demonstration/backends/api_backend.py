@@ -22,13 +22,19 @@ import base64
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..schema import (
     AVAILABLE_OPERATIONS,
     IntentOperation,
     PartReference,
     PoseSlot,
+    Scene,
+    SceneLocation,
+    SceneObject,
+    SOURCE_BOTH,
+    SOURCE_NARRATION,
+    SOURCE_VIDEO,
     StructuredIntent,
     POSE_AWAITING_PERCEPTION,
 )
@@ -63,36 +69,61 @@ class BackendApiUnavailable(RuntimeError):
 
 SYSTEM_PROMPT = """\
 You are RoboAi's understanding model. The user uploaded a short video
-with voice narration showing/describing a robot task they want
-programmed. Your job is to produce a STRICT JSON StructuredIntent that
-RoboAi will use as input to a deterministic program composer.
+WITH voice narration showing AND describing a robot task they want
+programmed. Your job is to FUSE the two channels into ONE coherent
+StructuredIntent JSON that RoboAi's deterministic composer consumes.
+
+HOW TO FUSE VIDEO + NARRATION:
+
+  • Video SHOWS what physically happens — which objects are present,
+    where they sit on the workspace, how the action unfolds in time
+    (first frame = initial state, last frame = final state, interior
+    frames = the action).
+  • Narration EXPLAINS intent and naming — what to call things, which
+    object is "the bracket", what should be picked vs placed.
+  • Combine them: if video shows three white parts in a bin and the
+    narration says "pick the brackets", bind the visible objects to
+    the named one. If narration mentions an object the video doesn't
+    clearly show, note it. If video shows an object the narration
+    ignores, still record it.
+  • On every scene element set `source` to "video" | "narration" |
+    "both". "both" means the two channels agreed (highest signal).
+  • When channels CONFLICT, prefer what the video shows and flag the
+    conflict in `ambiguities`.
 
 CRITICAL RULES — violating any of these makes the output unusable:
 
   1) operation_type MUST be one of EXACTLY this set (no other value):
 {ops_list}
 
-  2) target_part MUST be grounded to a real part from the provided
-     parts library by part_id. If you cannot match it confidently,
-     emit:
-        "part_id": "unknown",
-        "source":  "unknown_part_not_in_library",
-        "confidence": 0.0,
-     and add an entry to ambiguities explaining what part appeared.
-     NEVER invent part_ids.
+  2) target_part AND scene.objects[].matched_part_id MUST be grounded
+     to a real part from the provided parts library by part_id. If you
+     cannot match it confidently, emit part_id "unknown" / matched_part_id
+     null and add to ambiguities. NEVER invent part_ids.
 
   3) DO NOT produce numeric poses. Every pose value MUST be:
-        "pose": null,
-        "pose_status": "awaiting_perception",
+        "pose": null, "pose_status": "awaiting_perception",
         "location_hint": "<short human-readable spatial cue>"
-     RoboAi's perception stack resolves the metric pose later. Your
-     job is to capture the human INTENT, not coordinates.
+     RoboAi's perception stack resolves metric poses later. Capture
+     intent + verbal layout, not coordinates.
 
-  4) Surface things you are unsure about in `ambiguities` — these are
-     the questions a human reviewer will resolve next.
+  4) The `scene` block summarises WHAT IS IN THE WORKSPACE.
+     `scene.objects[]` = each physical object you identified, with
+     `approx_location` as a verbal cue ("right side of the table",
+     "in the bin", "on the left tray"). `scene.locations[]` = named
+     places referenced (pick zone, place zone, fixture). Neither
+     contains numeric coordinates.
 
-  5) Output ONLY a JSON object matching the schema below. No prose,
-     no markdown fences, no commentary.
+  5) `operations[]` references scene objects/locations by their LABELS
+     so the reviewer can see "Operation 1 picks the white bracket
+     from 'right bin', places at 'left tray'". Sequence is captured by
+     `sequence_index` (1, 2, …) and the frame timestamps you're given.
+
+  6) Surface uncertainty in `ambiguities`. Conflicts between video and
+     narration go here.
+
+  7) Output ONLY a JSON object matching the schema below. No prose, no
+     markdown fences, no commentary.
 
 Schema:
 {schema_example}
@@ -102,6 +133,24 @@ Schema:
 SCHEMA_EXAMPLE = """\
 {
   "task_summary": "Pick BT225L24 brackets from the bin and place them on the left tray",
+  "scene": {
+    "objects": [
+      {
+        "label": "white bracket",
+        "matched_part_id": "bt225l24",
+        "matched_part_name": "BT225L24 bracket",
+        "match_confidence": 0.86,
+        "source": "both",
+        "approx_location": "in the bin on the right side of the table",
+        "count_seen": "multiple"
+      }
+    ],
+    "locations": [
+      { "label": "right bin",  "role": "pick_source",   "approx_position": "right side of the table",            "source": "video" },
+      { "label": "left tray",  "role": "place_target",  "approx_position": "left side of the table, front edge", "source": "both"  }
+    ],
+    "spatial_summary": "A bin of small white brackets sits on the right of the work surface; an empty tray sits on the left. The robot path goes from the right bin to the left tray."
+  },
   "operations": [
     {
       "operation_type": "pick_and_place",
@@ -113,16 +162,16 @@ SCHEMA_EXAMPLE = """\
       },
       "sequence_index": 1,
       "count_hint": "all",
-      "pick":  { "location_hint": "from the bin on the right",  "pose": null, "pose_status": "awaiting_perception" },
-      "place": { "location_hint": "onto the left tray",          "pose": null, "pose_status": "awaiting_perception" },
-      "notes": ""
+      "pick":  { "location_hint": "from the right bin",  "pose": null, "pose_status": "awaiting_perception" },
+      "place": { "location_hint": "onto the left tray",  "pose": null, "pose_status": "awaiting_perception" },
+      "notes": "Video shows three brackets at t=0s, tray empty at t=0s, brackets in tray at t=8s."
     }
   ],
   "ambiguities": [
     "Operator mentioned 'the other tray' but only one tray was clearly visible"
   ],
-  "confidence_overall": 0.74,
-  "raw_understanding_notes": "Brief one-liner about what was visually anchored"
+  "confidence_overall": 0.78,
+  "raw_understanding_notes": "Initial state and final state agree across video frames and narration."
 }
 """
 
@@ -138,16 +187,24 @@ def _user_content(transcript: str,
                   parts_library: List[Dict[str, Any]],
                   context: Dict[str, Any],
                   retrieved_examples: List[Dict[str, Any]],
-                  frame_paths: List[str]) -> List[Dict[str, Any]]:
-    """Build the message content list. Anthropic wants {type: image} and
-    {type: text} blocks; order matters — keep the grounding text
-    before the frames so the model reads constraints first."""
+                  frames: List[Any]) -> List[Dict[str, Any]]:
+    """Build the message content list.
+
+    `frames` is the ordered list returned by utils.extract_frames —
+    `(path, timestamp_s)` tuples. A bare list of paths is still
+    accepted for back-compat (no timestamps surfaced in that case).
+
+    Order matters: grounding + retrieval text FIRST so the model reads
+    the constraints, then frames in chronological order each preceded
+    by a tiny `frame @ t=Ns` label so the model can refer to specific
+    moments in the action.
+    """
     blocks: List[Dict[str, Any]] = []
 
     grounding = {
-        'transcript':          transcript,
-        'context':             context or {},
-        'parts_library':       parts_library or [],
+        'transcript':           transcript,
+        'context':              context or {},
+        'parts_library':        parts_library or [],
         'available_operations': list(AVAILABLE_OPERATIONS),
     }
     blocks.append({'type': 'text',
@@ -161,24 +218,47 @@ def _user_content(transcript: str,
                                'patterns when similar):\n' +
                                json.dumps(retrieved_examples, indent=2)})
 
-    if frame_paths:
-        blocks.append({'type': 'text', 'text': f'Video frames ({len(frame_paths)} sampled):'})
-        for p in frame_paths:
+    # Normalise: accept either [(path, ts), ...] or [path, ...].
+    norm_frames: List[Tuple[str, Optional[float]]] = []
+    for item in (frames or []):
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            norm_frames.append((str(item[0]), float(item[1])))
+        else:
+            norm_frames.append((str(item), None))
+
+    if norm_frames:
+        blocks.append({
+            'type': 'text',
+            'text': (
+                f'VIDEO FRAMES ({len(norm_frames)} sampled, ordered '
+                'chronologically). The first frame is the initial scene '
+                'state, the last frame is the final state after the '
+                'demonstrated action. Use the timestamps to reason about '
+                'sequence.'
+            ),
+        })
+        for path, ts in norm_frames:
             try:
-                media_type, b64 = read_b64_jpeg(p)
+                media_type, b64 = read_b64_jpeg(path)
             except Exception:
                 continue
+            label = (f'frame @ t={ts:.2f}s' if ts is not None
+                     else f'frame {os.path.basename(path)}')
+            blocks.append({'type': 'text', 'text': label})
             blocks.append({
                 'type': 'image',
                 'source': {
-                    'type': 'base64',
+                    'type':       'base64',
                     'media_type': media_type,
-                    'data': b64,
+                    'data':       b64,
                 },
             })
 
-    blocks.append({'type': 'text',
-                   'text': 'Produce the StructuredIntent JSON now.'})
+    blocks.append({
+        'type': 'text',
+        'text': ('FUSE the video and narration into ONE StructuredIntent. '
+                 'Output the JSON now.'),
+    })
     return blocks
 
 
@@ -334,9 +414,63 @@ def _parse_intent_json(text: str,
 
     valid_ops = set(available_operations)
     parts_index = {(p.get('part_id') or '').lower(): p for p in parts_library or []}
+    valid_sources = {SOURCE_VIDEO, SOURCE_NARRATION, SOURCE_BOTH}
 
+    ambiguities: List[str] = list(data.get('ambiguities') or [])
+
+    # ── scene ───────────────────────────────────────────────────────
+    scene_raw = data.get('scene') or {}
+    scene_objects: List[SceneObject] = []
+    for obj in (scene_raw.get('objects') or []):
+        mp = obj.get('matched_part_id')
+        mp_id: Optional[str] = None
+        mp_name: Optional[str] = None
+        if mp:
+            mp_str = str(mp).lower()
+            if mp_str in parts_index:
+                mp_id   = parts_index[mp_str].get('part_id') or mp_str
+                mp_name = (str(obj.get('matched_part_name'))
+                           if obj.get('matched_part_name')
+                           else parts_index[mp_str].get('name') or '')
+            else:
+                ambiguities.append(
+                    f'Scene object {str(obj.get("label") or "?")!r} '
+                    f'referenced matched_part_id {mp_str!r} which is not '
+                    f'in the parts library — left unmatched.'
+                )
+        src = str(obj.get('source') or SOURCE_BOTH).lower()
+        if src not in valid_sources:
+            src = SOURCE_BOTH
+        scene_objects.append(SceneObject(
+            label=str(obj.get('label') or ''),
+            matched_part_id=mp_id,
+            matched_part_name=mp_name,
+            match_confidence=float(obj.get('match_confidence') or 0.0),
+            source=src,
+            approx_location=str(obj.get('approx_location') or ''),
+            count_seen=obj.get('count_seen', 1),
+        ))
+
+    scene_locations: List[SceneLocation] = []
+    for loc in (scene_raw.get('locations') or []):
+        src = str(loc.get('source') or SOURCE_BOTH).lower()
+        if src not in valid_sources:
+            src = SOURCE_BOTH
+        scene_locations.append(SceneLocation(
+            label=str(loc.get('label') or ''),
+            role=str(loc.get('role') or 'other'),
+            approx_position=str(loc.get('approx_position') or ''),
+            source=src,
+        ))
+
+    scene = Scene(
+        objects=scene_objects,
+        locations=scene_locations,
+        spatial_summary=str(scene_raw.get('spatial_summary') or ''),
+    )
+
+    # ── operations ──────────────────────────────────────────────────
     ops_out: List[IntentOperation] = []
-    ambiguities = list(data.get('ambiguities') or [])
     for idx, op in enumerate(data.get('operations') or []):
         op_type = str((op or {}).get('operation_type') or '').lower()
         if op_type not in valid_ops:
@@ -381,6 +515,7 @@ def _parse_intent_json(text: str,
 
     return StructuredIntent(
         task_summary=str(data.get('task_summary') or ''),
+        scene=scene,
         operations=ops_out,
         ambiguities=ambiguities,
         confidence_overall=float(data.get('confidence_overall') or 0.0),

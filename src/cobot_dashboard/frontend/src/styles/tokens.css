@@ -33,19 +33,23 @@
   --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
 }
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-/* Foundation width clamp.
-   The Android tablet (ONN 11", landscape ≈1200 CSS px) was rendering
-   the app wider than the viewport and clipping at the right edge.
-   Cause: html/body/#root had no width clamp, so any inner element
-   that computed slightly wider than the viewport extended the body
-   while `overflow: hidden` silently clipped the right side.
-   `width: 100%` + `max-width: 100vw` pin every level to the device
-   viewport; `overflow-x: hidden` keeps the original "no horizontal
-   scrollbar" behaviour for tablet kiosk use. */
+/* Foundation viewport + safe-area handling.
+   - width: 100% + max-width: 100vw → app shell can't grow past the
+     device viewport (prior fix; sw measurements confirm sw === iw on
+     the tablet, so we are not chasing overflow anymore).
+   - height: 100vh fallback, then 100dvh: in Chrome on Android the
+     address bar is dynamic — 100vh refers to the LARGEST possible
+     viewport (no chrome) so the bottom row clipped under the bar
+     when it appeared. 100dvh tracks the actual visible height. Older
+     browsers ignore the second declaration and keep 100vh.
+   - overflow-x: hidden keeps the kiosk "no horizontal scroll" feel.
+     Vertical is also hidden because the app provides its own internal
+     scroll regions. */
 html, body, #root {
-  height: 100%;
   width: 100%;
   max-width: 100vw;
+  height: 100vh;
+  height: 100dvh;
   overflow-x: hidden;
   overflow-y: hidden;
 }

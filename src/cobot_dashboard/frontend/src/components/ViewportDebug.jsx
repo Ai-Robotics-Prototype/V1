@@ -52,34 +52,54 @@ export default function ViewportDebug() {
   if (!enabled) return null
 
   const overflows = m.scrollW > m.innerW
+  const screenGap = m.screenW - m.innerW
+  const offscreen = m.topbarRight != null && m.topbarRight > m.innerW
+  const flagged = overflows || screenGap > 0 || offscreen
   return (
     <div style={{
       position: 'fixed', top: 4, left: 4, zIndex: 9999,
       padding: '4px 8px',
-      background: overflows ? 'rgba(220,38,38,0.92)' : 'rgba(15,23,42,0.85)',
+      background: flagged ? 'rgba(220,38,38,0.92)' : 'rgba(15,23,42,0.85)',
       color: '#fff',
       fontFamily: 'ui-monospace, monospace',
       fontSize: 11,
       lineHeight: 1.35,
       borderRadius: 4,
       pointerEvents: 'none',
-      maxWidth: 260,
+      maxWidth: 320,
     }}>
       <div>iw {m.innerW} · sw {m.scrollW}{overflows ? ' ⚠' : ' ✓'}</div>
       <div>dpr {m.dpr} · ih {m.innerH} · sh {m.scrollH}</div>
+      <div>screenW {m.screenW} · gap {screenGap}{screenGap > 0 ? ' ⚠' : ''}</div>
+      <div>vvW {m.vvW} · scale {m.vvScale}</div>
+      <div>topbarRight {m.topbarRight ?? '—'}{offscreen ? ' ⚠' : ''}</div>
     </div>
   )
 }
 
 function measure() {
   if (typeof window === 'undefined') {
-    return { innerW: 0, innerH: 0, scrollW: 0, scrollH: 0, dpr: 1 }
+    return {
+      innerW: 0, innerH: 0, scrollW: 0, scrollH: 0, dpr: 1,
+      screenW: 0, vvW: 0, vvScale: 1, topbarRight: null,
+    }
   }
+  const vv = window.visualViewport
+  let topbarRight = null
+  try {
+    const nav = document.querySelector('nav')
+    const topbar = nav?.parentElement
+    if (topbar) topbarRight = Math.round(topbar.getBoundingClientRect().right)
+  } catch { /* swallow */ }
   return {
     innerW:  window.innerWidth,
     innerH:  window.innerHeight,
     scrollW: document.documentElement.scrollWidth,
     scrollH: document.documentElement.scrollHeight,
     dpr:     Math.round((window.devicePixelRatio || 1) * 100) / 100,
+    screenW: (window.screen && window.screen.width) || 0,
+    vvW:     vv ? Math.round(vv.width) : 0,
+    vvScale: vv ? Math.round(vv.scale * 100) / 100 : 1,
+    topbarRight,
   }
 }

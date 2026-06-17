@@ -470,14 +470,25 @@ class ProgramExecutor(Node):
             # at runtime by reading the source step's taught_tcp and
             # adding the z offset. The operator teaches the source ONCE;
             # all derived children pick up the new pose automatically.
+            #
+            # Override: if the operator manually overrode the derived
+            # step in the editor (overridden:true + a real taught_tcp),
+            # we use that pose verbatim and skip the base+offset path.
+            # Reset-to-auto in the editor clears both fields and we
+            # fall back to the link.
+            overridden = bool(step.get('overridden')) and (
+                isinstance(step.get('taught_tcp'), list) and len(step['taught_tcp']) >= 3
+            )
             base_tcp, source_label = self._resolve_base_tcp(step)
             offset_z_mm = float(step.get('offset_z_mm') or 0)
-            is_derived = (step.get('derived_from') is not None) or (
-                # Heuristic for older saves: a move_linear with offset and
-                # no own taught data is a wizard-derived step.
-                step.get('offset_z_mm') is not None
-                and not (step.get('taught_tcp') or step.get('position'))
-                and not (step.get('taught_joints') or step.get('joints'))
+            is_derived = (not overridden) and (
+                (step.get('derived_from') is not None) or (
+                    # Heuristic for older saves: a move_linear with offset and
+                    # no own taught data is a wizard-derived step.
+                    step.get('offset_z_mm') is not None
+                    and not (step.get('taught_tcp') or step.get('position'))
+                    and not (step.get('taught_joints') or step.get('joints'))
+                )
             )
             if is_derived:
                 if base_tcp is None:

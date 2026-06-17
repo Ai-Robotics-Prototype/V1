@@ -1,0 +1,195 @@
+<?xml version="1.0"?>
+<!--
+  Estun S10-140 Gen 2 — 6-DOF cobot.
+  ===================================================================
+  Reach 1400 mm. Two 700 mm arm segments. Base ⌀ 198.5 mm.
+
+  Coordinates: metres, radians, ROS convention (X forward, Y left, Z up).
+
+  Joint origins below were transcribed VERBATIM from the spec the user
+  supplied for the build:
+
+      J1: base center,  Z = 0
+      J2: X = 0,        Z = 0.186   (base height, Fig 4-9)
+      J3: X = 0.175,    Z = 0.700   (upper arm length)
+      J4: X = 0.221,    Z = 0.700
+      J5: X = 0,        Z = 0.700   (forearm length, per spec)
+      J6: X = 0,        Z = 0.1615  (wrist→flange)
+
+  The spec acknowledges these are approximate from the manual.
+  When the chain is summed up, J5 sitting at +0.700 m in link4 frame
+  pushes the wrist well past the documented 1400 mm reach — that one
+  is almost certainly a transcription artefact and should be tuned
+  against measurements off the actual robot once available. For now
+  we honour the spec verbatim so the file matches the build request;
+  edit the J5 origin if/when corrected wrist offsets are measured.
+
+  Joint axes follow the standard 6-DOF cobot convention:
+      J1 = base yaw            (Z)
+      J2 = shoulder pitch      (Y)
+      J3 = elbow pitch         (Y)
+      J4 = wrist roll          (Z)
+      J5 = wrist pitch         (Y)
+      J6 = flange / tool yaw   (Z)
+
+  Mesh URIs use package://robot_description so the urdf-loader in
+  ArmViewer3D resolves them via the loader's `packages` map, which
+  the dashboard wires to /robot/. So
+      package://robot_description/links/link0_base.glb
+  is fetched as /robot/links/link0_base.glb at runtime.
+-->
+<robot name="estun_s10_140">
+
+  <!-- ─── Materials ─────────────────────────────────────────────── -->
+  <material name="estun_grey">
+    <color rgba="0.66 0.69 0.75 1.0"/>
+  </material>
+
+  <!-- ─── Links ─────────────────────────────────────────────────── -->
+
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link0_base.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <link name="link1_shoulder">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link1_shoulder.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <link name="link2_upper_arm">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link2_upper_arm.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <link name="link3_forearm">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link3_forearm.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <link name="link4_wrist1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link4_wrist1.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <link name="link5_wrist2">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link5_wrist2.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <link name="link6_flange">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link6_flange.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <!-- Tool-tip convenience frame so downstream code can use `tool0`. -->
+  <link name="tool0"/>
+
+  <!-- ─── Joints ────────────────────────────────────────────────── -->
+
+  <!--
+    Joint limits below are the per-joint travel from the spec:
+        J1 ±360°, J2 ±360°, J3 ±160°, J4 ±360°, J5 ±360°, J6 ±360°
+    All revolute. Effort/velocity placeholders are conservative — the
+    viewer doesn't enforce them, planners that consume this URDF later
+    should override.
+  -->
+
+  <joint name="J1" type="revolute">
+    <parent link="base_link"/>
+    <child  link="link1_shoulder"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="150" velocity="3.14"/>
+  </joint>
+
+  <joint name="J2" type="revolute">
+    <parent link="link1_shoulder"/>
+    <child  link="link2_upper_arm"/>
+    <origin xyz="0 0 0.186" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.2832" upper="6.2832" effort="150" velocity="3.14"/>
+  </joint>
+
+  <joint name="J3" type="revolute">
+    <parent link="link2_upper_arm"/>
+    <child  link="link3_forearm"/>
+    <origin xyz="0.175 0 0.700" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <!-- J3 has a tighter range than the others per the spec (±160°). -->
+    <limit lower="-2.7925" upper="2.7925" effort="150" velocity="3.14"/>
+  </joint>
+
+  <joint name="J4" type="revolute">
+    <parent link="link3_forearm"/>
+    <child  link="link4_wrist1"/>
+    <origin xyz="0.221 0 0.700" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="50" velocity="6.28"/>
+  </joint>
+
+  <joint name="J5" type="revolute">
+    <parent link="link4_wrist1"/>
+    <child  link="link5_wrist2"/>
+    <!--
+      Spec value verbatim. See top-of-file note — this offset summed
+      against the rest of the chain exceeds the documented reach and
+      is likely a transcription artefact in the spec. Tune once
+      measured against the real robot.
+    -->
+    <origin xyz="0 0 0.700" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.2832" upper="6.2832" effort="50" velocity="6.28"/>
+  </joint>
+
+  <joint name="J6" type="revolute">
+    <parent link="link5_wrist2"/>
+    <child  link="link6_flange"/>
+    <origin xyz="0 0 0.1615" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="50" velocity="6.28"/>
+  </joint>
+
+  <!-- Static frame at the tool plate for downstream code. -->
+  <joint name="flange_to_tool0" type="fixed">
+    <parent link="link6_flange"/>
+    <child  link="tool0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+</robot>

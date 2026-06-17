@@ -5,9 +5,14 @@ from programming_by_demonstration.schema import (
     IntentOperation,
     PartReference,
     PoseSlot,
+    Scene,
+    SceneLocation,
+    SceneObject,
     StructuredIntent,
     AVAILABLE_OPERATIONS,
     POSE_AWAITING_PERCEPTION,
+    SOURCE_BOTH,
+    SOURCE_VIDEO,
 )
 from programming_by_demonstration.program_composer import compose_program_draft
 
@@ -87,3 +92,62 @@ def test_empty_intent_produces_loadable_draft():
     payload = draft.to_program_payload()
     assert payload['steps'], 'empty intent must still produce a loadable artifact'
     assert payload['tags'] == ['pick_and_place', 'draft', 'pbd']
+
+
+def test_scene_round_trip_through_intent():
+    """Scene survives to_dict/from_dict and keeps grounded matched_part_id
+    plus the fused-source marker on both objects and locations."""
+    scene = Scene(
+        objects=[
+            SceneObject(
+                label='white bracket',
+                matched_part_id='bt225l24',
+                matched_part_name='BT225L24 bracket',
+                match_confidence=0.86,
+                source=SOURCE_BOTH,
+                approx_location='in the right bin',
+                count_seen='multiple',
+            ),
+            SceneObject(
+                label='unfamiliar widget',
+                matched_part_id=None,
+                source=SOURCE_VIDEO,
+                approx_location='back of the table',
+            ),
+        ],
+        locations=[
+            SceneLocation(label='right bin', role='pick_source',
+                          approx_position='right side', source=SOURCE_VIDEO),
+            SceneLocation(label='left tray', role='place_target',
+                          approx_position='left side, front', source=SOURCE_BOTH),
+        ],
+        spatial_summary='A bin on the right and an empty tray on the left.',
+    )
+    intent = StructuredIntent(
+        task_summary='Pick brackets from the right bin, place on the left tray',
+        scene=scene,
+        operations=[],
+        ambiguities=[],
+        confidence_overall=0.81,
+        backend_id='api:claude-opus-4-7',
+        transited_externally=True,
+    )
+    again = StructuredIntent.from_dict(intent.to_dict())
+    assert again.scene.spatial_summary == scene.spatial_summary
+    assert len(again.scene.objects) == 2
+    assert again.scene.objects[0].matched_part_id == 'bt225l24'
+    assert again.scene.objects[0].source == 'both'
+    assert again.scene.objects[1].matched_part_id is None
+    assert again.scene.objects[1].source == 'video'
+    assert again.scene.locations[0].role == 'pick_source'
+    assert again.scene.locations[1].source == 'both'
+
+
+def test_default_intent_has_empty_scene_not_none():
+    """from_dict({}) must produce a usable empty Scene — UI mounts before
+    the AI replies and would crash on intent.scene.objects otherwise."""
+    intent = StructuredIntent.from_dict({})
+    assert intent.scene is not None
+    assert intent.scene.objects == []
+    assert intent.scene.locations == []
+    assert intent.scene.spatial_summary == ''

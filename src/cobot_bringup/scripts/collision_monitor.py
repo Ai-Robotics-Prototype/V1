@@ -144,6 +144,38 @@ def capsule_to_aabb_distance(seg_a, seg_b, radius, center, dims):
 # ───────────────────────────────────────────────────────────────────────
 
 
+CELLS_DIR  = '/opt/cobot/cells'
+CELLS_IDX  = os.path.join(CELLS_DIR, 'index.json')
+
+
+def _read_active_cell_id() -> Optional[str]:
+    try:
+        with open(CELLS_IDX) as f:
+            data = json.load(f)
+        cid = data.get('active_cell_id')
+        return str(cid) if cid else None
+    except Exception:
+        return None
+
+
+def _read_static_zones_for_cell(cell_id: Optional[str]) -> list:
+    """Load the persisted static keep-out zones for the active cell.
+    Returns [] when there's no active cell or no saved file — that's
+    the no-op path; the monitor still publishes live objects."""
+    if not cell_id:
+        return []
+    path = os.path.join(CELLS_DIR, cell_id, 'collision_zones.json')
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        zones = data.get('zones') or []
+        return zones if isinstance(zones, list) else []
+    except Exception:
+        return []
+
+
 class CollisionMonitor(Node):
     def __init__(self):
         super().__init__('collision_monitor')
@@ -165,11 +197,21 @@ class CollisionMonitor(Node):
         self.have_joints = False
         self.last_obj_stamp: Optional[float] = None
 
+        # Static keep-out zones loaded from the active cell's persisted
+        # collision_zones.json (built from the baseline cloud).
+        # _reload_static_zones() refreshes these from disk; the dashboard
+        # publishes on /collision/reload after rebuild/clear.
+        self.static_cell_id: Optional[str] = None
+        self.static_zones: list = []
+        self._reload_static_zones()
+
         self.create_subscription(
             IdentifiedObjectArray, '/lidar_objects/identified',
             self._on_objects, 5)
         self.create_subscription(
             JointState, '/joint_states', self._on_joints, 5)
+        self.create_subscription(
+            String, '/collision/reload', self._on_reload, 5)
 
         self.objects_pub = self.create_publisher(String, '/collision/objects', 5)
         self.status_pub  = self.create_publisher(String, '/collision/status', 5)
@@ -179,7 +221,23 @@ class CollisionMonitor(Node):
         self.get_logger().info(
             f'collision_monitor ready. reach={self.reach_r:.2f} m, '
             f'warn={self.warn_d*1000:.0f} mm, crit={self.crit_d*1000:.0f} mm, '
-            f'process_rate={rate} Hz')
+            f'process_rate={rate} Hz, '
+            f'static_zones={len(self.static_zones)} (cell={self.static_cell_id})')
+
+    def _reload_static_zones(self) -> None:
+        cid = _read_active_cell_id()
+        self.static_cell_id = cid
+        self.static_zones = _read_static_zones_for_cell(cid)
+
+    def _on_reload(self, _msg: String) -> None:
+        """Dashboard publishes on /collision/reload after rebuild/clear.
+        We don't read the payload — just refresh from disk so the
+        currently-active cell's zones are always what's flowing."""
+        before = len(self.static_zones)
+        self._reload_static_zones()
+        self.get_logger().info(
+            f'static zones reloaded: {before} → {len(self.static_zones)} '
+            f'(cell={self.static_cell_id})')
 
     def _on_joints(self, msg: JointState):
         # Honor URDF joint ordering; fall back to positional if the names
@@ -202,31 +260,33 @@ class CollisionMonitor(Node):
         capsules = [(points[i], points[i + 1], JOINT_CHAIN[i][3]) for i in range(6)]
         capsule_labels = [c[2] for c in JOINT_CHAIN]
 
+        def _check_object(cx, cy, cz, dx, dy, dz):
+            """Run the reach filter + capsule-to-AABB check. Returns
+            (kept, best_d, best_link, status) where kept=False means
+            outside reach (caller should skip)."""
+            footprint_r = math.hypot(cx, cy)
+            if footprint_r - max(dx, dy) * 0.5 > self.reach_r:
+                return False, None, None, None
+            if cz - dz * 0.5 > self.reach_z:
+                return False, None, None, None
+            best_d = float('inf'); best_link = ''
+            for (a, b, r), label in zip(capsules, capsule_labels):
+                d = capsule_to_aabb_distance(a, b, r, (cx, cy, cz), (dx, dy, dz))
+                if d < best_d:
+                    best_d = d; best_link = label
+            if best_d < self.crit_d:   status = 'collision'
+            elif best_d < self.warn_d: status = 'warning'
+            else:                      status = 'clear'
+            return True, best_d, best_link, status
+
         out = []
         overall_min = float('inf')
         for o in self.latest_objs:
             cx, cy, cz = o.center.x, o.center.y, o.center.z
             dx, dy, dz = o.dimensions.x, o.dimensions.y, o.dimensions.z
-            # Reach filter — quick reject in the XY plane + Z cap.
-            footprint_r = math.hypot(cx, cy)
-            if footprint_r - max(dx, dy) * 0.5 > self.reach_r:
+            kept, best_d, best_link, status = _check_object(cx, cy, cz, dx, dy, dz)
+            if not kept:
                 continue
-            if cz - dz * 0.5 > self.reach_z:
-                continue
-            # Capsule-to-AABB distances (orientation approximation: AABB)
-            best_d = float('inf')
-            best_link = ''
-            for (a, b, r), label in zip(capsules, capsule_labels):
-                d = capsule_to_aabb_distance(a, b, r, (cx, cy, cz), (dx, dy, dz))
-                if d < best_d:
-                    best_d = d
-                    best_link = label
-            if best_d < self.crit_d:
-                status = 'collision'
-            elif best_d < self.warn_d:
-                status = 'warning'
-            else:
-                status = 'clear'
             overall_min = min(overall_min, best_d)
             out.append({
                 'id':              int(o.id),
@@ -235,6 +295,7 @@ class CollisionMonitor(Node):
                 'confidence':      float(o.identification_confidence),
                 'frames_observed': int(o.frames_observed),
                 'static':          bool(o.frames_observed > 30),
+                'source':          'lidar_live',
                 'center':          {'x': float(cx), 'y': float(cy), 'z': float(cz)},
                 'dimensions':      {'x': float(dx), 'y': float(dy), 'z': float(dz)},
                 'orientation':     {
@@ -244,6 +305,38 @@ class CollisionMonitor(Node):
                 'min_distance_m':  float(best_d),
                 'nearest_link':    best_link,
                 'status':          status,
+            })
+
+        # Persistent static keep-out zones from the active cell's
+        # baseline build. Identical capsule check; same status banding
+        # so the dashboard banner respects them too.
+        for z in self.static_zones:
+            try:
+                cx = float(z['center']['x']); cy = float(z['center']['y']); cz = float(z['center']['z'])
+                dx = float(z['dimensions']['x']); dy = float(z['dimensions']['y']); dz = float(z['dimensions']['z'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            kept, best_d, best_link, status = _check_object(cx, cy, cz, dx, dy, dz)
+            if not kept:
+                continue
+            overall_min = min(overall_min, best_d)
+            ori = z.get('orientation') or {'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0}
+            out.append({
+                'id':             str(z.get('id') or 'static_unknown'),
+                'name':           str(z.get('name') or 'static_obstacle'),
+                'identified_as':  'static_obstacle',
+                'confidence':     1.0,
+                'frames_observed': int(z.get('point_count', 0)),
+                'static':         True,
+                'source':         str(z.get('source', 'baseline_static')),
+                'center':         {'x': cx, 'y': cy, 'z': cz},
+                'dimensions':     {'x': dx, 'y': dy, 'z': dz},
+                'orientation':    ori,
+                'min_distance_m': float(best_d),
+                'nearest_link':   best_link,
+                'status':         status,
+                'margin_m':       float(z.get('margin_m', 0.0)),
+                'point_count':    int(z.get('point_count', 0)),
             })
 
         out.sort(key=lambda r: r['min_distance_m'])

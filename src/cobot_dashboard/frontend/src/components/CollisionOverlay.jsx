@@ -61,9 +61,19 @@ function ReachCylinder({ radius }) {
 }
 
 function ObjectBox({ obj, showLabel }) {
-  const { center, dimensions, orientation = {}, status, static: isStatic } = obj
+  const { center, dimensions, orientation = {}, status, static: isStatic, source } = obj
   if (!center || !dimensions) return null
-  const { stroke } = statusColors(status)
+  // Baseline-built static zones (source=='baseline_static') render as
+  // red/orange "permanent obstacle" volumes — distinct from the live
+  // dynamic boxes which are green/yellow/red by proximity. We still
+  // overlay the proximity color when the capsule check elevates them
+  // to warning/collision, since those edges are what the operator
+  // needs to react to.
+  const isBaselineStatic = source === 'baseline_static'
+  const fillColor   = isBaselineStatic ? '#ea580c' : statusColors(status).stroke
+  const strokeColor = (isBaselineStatic && status === 'clear')
+    ? '#ea580c'
+    : statusColors(status).stroke
   const [px, py, pz] = lidarToThree(center.x || 0, center.y || 0, center.z || 0)
   // Map URDF/LiDAR quaternion (rotation about Z is "yaw" in LiDAR frame)
   // into Three's frame. We approximate by keeping yaw about world up (Y in
@@ -79,24 +89,24 @@ function ObjectBox({ obj, showLabel }) {
 
   return (
     <group position={[px, py, pz]} rotation={[0, -yaw, 0]}>
-      {/* Wireframe outline. Static objects are rendered with a thinner edge
-          + lower opacity to distinguish from dynamic ones, but still
-          status-colored so the operator sees risk regardless. */}
       <mesh>
         <boxGeometry args={[dx, dz, dy]} />
         <meshBasicMaterial
-          color={stroke}
+          color={fillColor}
           transparent
-          opacity={isStatic ? 0.05 : 0.10}
+          opacity={isBaselineStatic ? 0.18 : isStatic ? 0.05 : 0.10}
         />
       </mesh>
       <lineSegments>
         <edgesGeometry args={[new THREE.BoxGeometry(dx, dz, dy)]} />
-        {isStatic ? (
-          <lineDashedMaterial color={stroke} dashSize={0.04} gapSize={0.025}
+        {isBaselineStatic ? (
+          <lineDashedMaterial color={strokeColor} dashSize={0.05} gapSize={0.025}
+            transparent opacity={0.95} />
+        ) : isStatic ? (
+          <lineDashedMaterial color={strokeColor} dashSize={0.04} gapSize={0.025}
             transparent opacity={0.95} />
         ) : (
-          <lineBasicMaterial color={stroke} linewidth={2} />
+          <lineBasicMaterial color={strokeColor} linewidth={2} />
         )}
       </lineSegments>
       {showLabel && (
@@ -107,9 +117,11 @@ function ObjectBox({ obj, showLabel }) {
             padding: '2px 6px', borderRadius: 4,
             fontSize: 10, fontFamily: 'ui-monospace, monospace',
             whiteSpace: 'nowrap',
-            border: `1px solid ${stroke}`,
+            border: `1px solid ${strokeColor}`,
           }}>
-            #{obj.id} · {(obj.min_distance_m * 1000).toFixed(0)} mm · {isStatic ? 'static' : 'dynamic'}
+            {isBaselineStatic ? 'static obstacle' : `#${obj.id}`} ·
+            {' '}{(obj.min_distance_m * 1000).toFixed(0)} mm
+            {isBaselineStatic ? '' : (isStatic ? ' · static' : ' · dynamic')}
           </div>
         </Html>
       )}
@@ -117,15 +129,20 @@ function ObjectBox({ obj, showLabel }) {
   )
 }
 
-export function CollisionScene3D({ showLabels = true }) {
+export function CollisionScene3D({ showLabels = true, showStatic = true, showDynamic = true }) {
   const collision = useStore((s) => s.collision)
   if (!collision) return null
   const objects = collision.objects || []
   const reach   = collision.reach_radius_m || 1.4
+  const filtered = objects.filter((o) => {
+    const isBaselineStatic = o.source === 'baseline_static'
+    if (isBaselineStatic) return showStatic
+    return showDynamic
+  })
   return (
     <group>
       <ReachCylinder radius={reach} />
-      {objects.map((o, i) => (
+      {filtered.map((o, i) => (
         <ObjectBox key={`${o.id ?? 'obj'}-${i}`} obj={o} showLabel={showLabels} />
       ))}
     </group>

@@ -60,28 +60,49 @@ class ErrorBoundary extends Component {
   }
 }
 
-// App shell. Width clamped to the device viewport so a stray
-// fixed-pixel sub-tree can't push the whole page wider than the
-// screen and get clipped by the body-level overflow:hidden — the
-// problem the tablet exhibited before this build.
+// App shell.
+// - width/maxWidth: pin to viewport (sw=iw measurements confirm no overflow).
+// - height inherits 100dvh from #root via tokens.css, so the bottom row
+//   isn't clipped under Chrome's dynamic address bar.
+// - Safe-area paddings keep edge elements (E-STOP top-right, Connected
+//   status, StatusBar row at the bottom) off the physical screen edge
+//   on the ONN 11" tablet. The +12px on the right is explicit
+//   breathing room beyond the safe-area inset since the device reports
+//   zero inset in landscape but the rightmost cluster still felt flush.
 const gridStyle = {
   display: 'grid',
   gridTemplateAreas: '"topbar" "content" "statusbar"',
-  gridTemplateColumns: '1fr',
-  gridTemplateRows: '60px 1fr 36px',
+  gridTemplateColumns: 'minmax(0, 1fr)',
+  gridTemplateRows: '60px minmax(0, 1fr) 36px',
   width: '100%',
   maxWidth: '100vw',
-  height: '100vh',
+  height: '100%',
+  paddingLeft:   'env(safe-area-inset-left, 0px)',
+  paddingRight:  'calc(env(safe-area-inset-right, 0px) + 12px)',
+  paddingBottom: 'env(safe-area-inset-bottom, 0px)',
   overflow: 'hidden',
   background: 'var(--bg-app)',
+  boxSizing: 'border-box',
 }
 
 export default function App() {
-  const connectWS = useStore((s) => s.connectWS)
-  const activeTab = useStore((s) => s.activeTab)
+  const connectWS         = useStore((s) => s.connectWS)
+  const activeTab         = useStore((s) => s.activeTab)
+  const hydrateActiveCell = useStore((s) => s.hydrateActiveCell)
 
   useEffect(() => {
     connectWS()
+    // Hydrate the active cell from /api/cells/active once at app
+    // boot so the 3D View (and other cell-scoped features) never
+    // render against a null state on first mount. Re-hydrate when
+    // the tab regains focus so out-of-band activations (another
+    // session, a fresh deploy) propagate without a manual refresh.
+    hydrateActiveCell()
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') hydrateActiveCell()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -101,15 +122,15 @@ export default function App() {
   return (
     <ErrorBoundary>
       <div style={gridStyle}>
-        <div style={{ gridArea: 'topbar' }}>
+        <div style={{ gridArea: 'topbar', minWidth: 0, overflow: 'hidden' }}>
           <TopBar />
         </div>
-        <div style={{ gridArea: 'content', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+        <div style={{ gridArea: 'content', minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
           <ErrorBoundary>
             {layoutMap[activeTab] ?? <MonitorDashboard />}
           </ErrorBoundary>
         </div>
-        <div style={{ gridArea: 'statusbar' }}>
+        <div style={{ gridArea: 'statusbar', minWidth: 0, overflow: 'hidden' }}>
           <StatusBar />
         </div>
 

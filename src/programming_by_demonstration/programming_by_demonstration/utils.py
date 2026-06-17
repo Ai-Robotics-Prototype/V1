@@ -70,19 +70,47 @@ def extract_audio_wav(video_path: str, out_path: str) -> str:
     return out_path
 
 
+def probe_duration_s(video_path: str) -> float:
+    """Return the clip duration in seconds, or 0.0 if ffprobe fails."""
+    ffprobe = shutil.which('ffprobe')
+    if not ffprobe:
+        return 0.0
+    try:
+        out = subprocess.check_output(
+            [ffprobe, '-v', 'error',
+             '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1',
+             video_path],
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        ).decode('ascii', errors='ignore').strip()
+        return float(out or 0.0)
+    except Exception:
+        return 0.0
+
+
 def extract_frames(video_path: str, out_dir: str,
                    fps: float = 1.0,
                    max_count: int = 20,
                    long_edge_px: int = 768,
-                   jpeg_quality: int = 82) -> List[str]:
-    """Sample frames at `fps` fps, resize longest edge to `long_edge_px`,
-    write JPEGs into out_dir. Returns sorted file paths.
+                   jpeg_quality: int = 82) -> List[Tuple[str, float]]:
+    """Sample the clip at `fps` fps and return an ORDERED list of
+    `(jpeg_path, timestamp_seconds)` pairs.
 
-    `max_count` caps how many frames we keep so a 10-minute clip doesn't
-    blow up the API request — we keep the first `max_count` after
-    sampling. The first frame and a frame from the end of the clip are
-    almost always the most informative, but for v1 a simple cap is
-    plenty."""
+    Key-moment guarantees so the backend sees the full arc:
+      • The first sampled frame (≈ t=0) — initial scene state.
+      • The last sampled frame (≈ t=duration) — final state after the
+        demonstrated action.
+      • Interior frames spread uniformly between them.
+
+    The backend uses timestamps to reason about sequence; passing them
+    through the prompt lets the model say "frame at 4.0s shows..."
+    instead of guessing order from raw image order.
+
+    `max_count` caps payload size for long clips. We sample at `fps`
+    first (ffmpeg-cheap), then thin uniformly to `max_count` while
+    pinning the first and last frames.
+    """
     ffmpeg = require_ffmpeg()
     ensure_dir(out_dir)
     # Wipe any previous extraction so re-runs don't mix old frames.
@@ -108,24 +136,45 @@ def extract_frames(video_path: str, out_dir: str,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
-    frames = sorted(
+    frame_files = sorted(
         os.path.join(out_dir, fn)
         for fn in os.listdir(out_dir)
         if fn.startswith('frame_') and fn.endswith('.jpg')
     )
-    if max_count > 0 and len(frames) > max_count:
-        # Even sampling so a long clip's late context isn't lost.
-        step = len(frames) / float(max_count)
-        kept_idx = {int(i * step) for i in range(max_count)}
-        keep = [p for i, p in enumerate(frames) if i in kept_idx]
-        for p in frames:
-            if p not in keep:
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-        frames = keep
-    return frames
+    if not frame_files:
+        return []
+
+    # Reconstruct each kept frame's timestamp from its sampling index
+    # (ffmpeg's `fps=` filter is deterministic — frame 1 = 0s,
+    # frame 2 = 1/fps, …).
+    period_s = 1.0 / float(fps) if fps > 0 else 1.0
+    timed = [(p, i * period_s) for i, p in enumerate(frame_files)]
+
+    # If we already fit, keep all. Otherwise thin uniformly, pinning
+    # both endpoints so the first/last frames always survive.
+    if max_count <= 0 or len(timed) <= max_count:
+        return timed
+
+    n = len(timed)
+    if max_count == 1:
+        idxs = [0]
+    elif max_count == 2:
+        idxs = [0, n - 1]
+    else:
+        # max_count points evenly across [0, n-1] inclusive — guarantees
+        # 0 and n-1 are in the set.
+        step = (n - 1) / float(max_count - 1)
+        idxs = sorted({int(round(i * step)) for i in range(max_count)})
+
+    keep = [timed[i] for i in idxs]
+    keep_paths = {p for p, _ in keep}
+    for p, _ in timed:
+        if p not in keep_paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    return keep
 
 
 def read_b64_jpeg(path: str) -> Tuple[str, str]:

@@ -1,0 +1,217 @@
+<?xml version="1.0"?>
+<!--
+  PROVISIONAL — derived from the S10-140 technical/installation drawing
+  (outline dimensions) + spec tables. Joint limits/speeds EXACT; segment
+  lengths from the dimension drawing (accurate proportions, ~1400mm
+  reach); precise joint-axis offsets APPROXIMATED (no DH table in the
+  manual). For visualization, workspace approximation, and motion-
+  planning prep — NOT for sub-mm collision-accurate planning. Replace
+  with Estun's official URDF when available.
+
+  Coordinates: ROS REP-103 (X forward, Y left, Z up). Metres + radians.
+  At zero pose the arm extends straight up along +Z; the cable bay
+  faces −Y. Joint axes at zero pose:
+      J1  base yaw            axis Z
+      J2  shoulder pitch      axis Y
+      J3  elbow pitch         axis Y
+      J4  forearm roll        axis Z   (along the forearm at zero pose)
+      J5  wrist pitch         axis Y
+      J6  tool roll           axis Z
+
+  DIMENSIONS (from S10-140 dimension drawing, mm → m)
+    Base height (floor → J1 axis):                0.186
+    Shoulder horizontal offset (J1 → J2):         0.221  · APPROXIMATED dir (Y)
+    Lower major arm (J2 → J3, "upper arm"):       0.700
+    Elbow horizontal offset (J3 → J4):            0.175  · APPROXIMATED dir (Y)
+    Upper major arm (J3 → J4, "forearm"):         0.700
+    Wrist J4 → J5 axial offset:                   0.1615 · from drawing 161.5
+    Wrist J5 → J6 axial offset:                   0.1505 · from drawing 150.5
+    Total reach (J1 axis → tool0):                ≈ 1.4    matches SR 1400
+
+  LIMITS (exact, per manual)
+    Position: J1/J2/J4/J5/J6 = ±360°  =  ±6.2832 rad
+              J3            = ±160°  =  ±2.7925 rad
+    Velocity: J1/J2/J3      = 150 °/s = 2.6180 rad/s
+              J4/J5/J6      = 180 °/s = 3.1416 rad/s
+    Payload  10 kg · self-weight 39 kg · flange ISO 9409-1-50-4-M6.
+
+  MESH FILES
+  Per-link decimated GLBs (no Draco, total ≈ 29 k triangles for tablet
+  safety) live at /robot/links/{name}_light.glb. The dashboard's
+  urdf-loader resolves them through the `packages` map
+  { robot_description → /robot } from the URI prefix
+  `package://robot_description/links/...`.
+
+  APPROXIMATED items flagged inline by " · APPROXIMATED" comments
+  above. Visual <origin> blocks are zero — the mesh GLBs were
+  exported with link-local origins by the SolidWorks split, so the
+  joint-origin chain alone positions the links correctly.
+-->
+<robot name="estun_s10_140_provisional">
+
+  <material name="estun_grey">
+    <color rgba="0.66 0.69 0.75 1.0"/>
+  </material>
+
+  <!-- Root frame so this URDF composes cleanly with a tabletop /
+       cell-mount transform downstream. -->
+  <link name="world"/>
+
+  <!-- ─── base_link (link0) ─────────────────────────────────── -->
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link0_base_light.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <joint name="world_to_base" type="fixed">
+    <parent link="world"/>
+    <child  link="base_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ─── link1_shoulder (J1 = base yaw) ────────────────────── -->
+  <link name="link1_shoulder">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link1_shoulder_light.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <joint name="J1" type="revolute">
+    <parent link="base_link"/>
+    <child  link="link1_shoulder"/>
+    <!-- Base height 186 mm, drawing dimension. -->
+    <origin xyz="0 0 0.186" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="150" velocity="2.6180"/>
+  </joint>
+
+  <!-- ─── link2_upper_arm (J2 = shoulder pitch) ─────────────── -->
+  <link name="link2_upper_arm">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link2_upper_arm_light.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <joint name="J2" type="revolute">
+    <parent link="link1_shoulder"/>
+    <child  link="link2_upper_arm"/>
+    <!-- Shoulder horizontal offset 221 mm.
+         APPROXIMATED: drawing gives magnitude only — direction set
+         along +Y (perpendicular to the J1 axis, in the J2-pitch
+         plane). Flip sign / axis if mesh visibly mounts the wrong
+         side once rendered. -->
+    <origin xyz="0 0.221 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.2832" upper="6.2832" effort="150" velocity="2.6180"/>
+  </joint>
+
+  <!-- ─── link3_forearm (J3 = elbow pitch) ──────────────────── -->
+  <link name="link3_forearm">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link3_forearm_light.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <joint name="J3" type="revolute">
+    <parent link="link2_upper_arm"/>
+    <child  link="link3_forearm"/>
+    <!-- Lower major arm 700 mm. Drawing dimension. -->
+    <origin xyz="0 0 0.700" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <!-- J3 alone has the ±160° travel limit per the manual. -->
+    <limit lower="-2.7925" upper="2.7925" effort="150" velocity="2.6180"/>
+  </joint>
+
+  <!-- ─── link4_wrist1 (J4 = forearm roll) ──────────────────── -->
+  <link name="link4_wrist1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link4_wrist1_light.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <joint name="J4" type="revolute">
+    <parent link="link3_forearm"/>
+    <child  link="link4_wrist1"/>
+    <!-- Upper major arm (forearm) 700 mm + elbow horizontal offset
+         175 mm. The 175 mm goes along +Y (same direction as the
+         shoulder offset by convention).
+         APPROXIMATED direction. -->
+    <origin xyz="0 0.175 0.700" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="50" velocity="3.1416"/>
+  </joint>
+
+  <!-- ─── link5_wrist2 (J5 = wrist pitch) ───────────────────── -->
+  <link name="link5_wrist2">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link5_wrist2_light.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <joint name="J5" type="revolute">
+    <parent link="link4_wrist1"/>
+    <child  link="link5_wrist2"/>
+    <!-- Wrist J4 → J5 axial offset 161.5 mm (drawing). -->
+    <origin xyz="0 0 0.1615" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.2832" upper="6.2832" effort="50" velocity="3.1416"/>
+  </joint>
+
+  <!-- ─── link6_flange (J6 = tool roll) ─────────────────────── -->
+  <link name="link6_flange">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://robot_description/links/link6_flange_light.glb"/>
+      </geometry>
+      <material name="estun_grey"/>
+    </visual>
+  </link>
+
+  <joint name="J6" type="revolute">
+    <parent link="link5_wrist2"/>
+    <child  link="link6_flange"/>
+    <!-- Wrist J5 → J6 axial offset 150.5 mm (drawing). -->
+    <origin xyz="0 0 0.1505" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="50" velocity="3.1416"/>
+  </joint>
+
+  <!-- ─── tool0 (static flange-face reference) ──────────────── -->
+  <link name="tool0"/>
+
+  <joint name="flange_to_tool0" type="fixed">
+    <parent link="link6_flange"/>
+    <child  link="tool0"/>
+    <!-- Flange face is approximately co-located with J6's frame
+         after the 150.5 mm offset above; no additional translation.
+         ISO 9409-1-50-4-M6 bolt pattern lives on this face. -->
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+</robot>

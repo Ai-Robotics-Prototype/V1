@@ -250,6 +250,381 @@ function PartCanvas({ url, rotation, frontAngle, approach, partExtents, selected
   )
 }
 
+// Compact SVG overlay rendering the open-vocab bboxes on top of the
+// cam0 thumbnail in the Part Recognition test preview. Mirrors
+// NanoOWLOverlay (Cameras & LiDAR) but is self-contained so the
+// section doesn't depend on that component being mounted elsewhere.
+function OpenVocabBoxes({ detections, imageW, imageH }) {
+  const w = imageW || 640
+  const h = imageH || 480
+  const dets = Array.isArray(detections) ? detections : []
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="xMidYMid meet"
+      style={{ position: 'absolute', inset: 0, width: '100%', height: '100%',
+               pointerEvents: 'none' }}>
+      {dets.map((d, i) => {
+        const b = d.bbox_px || {}
+        const x1 = b.x1, y1 = b.y1, x2 = b.x2, y2 = b.y2
+        if (![x1, y1, x2, y2].every((v) => Number.isFinite(v))) return null
+        const bw = Math.max(1, x2 - x1)
+        const bh = Math.max(1, y2 - y1)
+        const conf = Math.round(((d.confidence ?? d.conf) || 0) * 100)
+        const z = d.approx_xyz_cam?.z
+        const label = `${d.prompt || d.label || ''}  ${conf}%`
+          + (Number.isFinite(z) ? `  · ${(z * 1000).toFixed(0)}mm` : '')
+        return (
+          <g key={i}>
+            <rect x={x1} y={y1} width={bw} height={bh}
+              fill="rgba(225,29,72,0.10)" stroke="#e11d48"
+              strokeWidth={Math.max(1.5, w / 320)} />
+            <rect x={x1} y={Math.max(0, y1 - 18)}
+              width={Math.min(w - x1, 260)} height={18}
+              fill="rgba(0,0,0,0.78)" />
+            <text x={x1 + 6} y={Math.max(0, y1 - 5)}
+              fontSize={13} fill="#e11d48"
+              fontFamily="ui-monospace, monospace" fontWeight={700}>{label}</text>
+          </g>
+        )
+      })}
+    </svg>
+  )
+}
+
+// ── Open-Vocabulary Detection section ───────────────────────────────
+//
+// Compact per-part panel that lives in PartConfigurator's right
+// column alongside the pick-direction config. Authors text prompts
+// the open-vocab detector uses to find THIS component on cam0. The
+// prompts persist on the part's metadata (openvocab_prompts) via
+// PUT /api/parts/{id}/config — so each part remembers its own.
+//
+// Test Detection POSTs the current prompts to /api/openvocab/prompts
+// with enabled=true; the NanoOWL node picks them up via its
+// /perception/openvocab/prompts subscription. We read back live
+// detections + status from STATE.openvocab (echoed over /ws/state).
+//
+// Service state we honor:
+//   - openvocab.enabled  false → engine is off (informational chip)
+//   - openvocab.error    set   → engine returned a hard error
+//   - openvocab.stalled  true  → no fresh cam0 frames; banner
+//   - openvocab.model    ''    → node not connected; treat as
+//                                "not installed" (operator can still
+//                                edit + save prompts for later)
+function OpenVocabSection({ partId, partName, prompts, onChange }) {
+  const openvocab = useStore((s) => s.openvocab) || {}
+  const [draft, setDraft]       = useState('')
+  const [testing, setTesting]   = useState(false)
+  const [enabled, setEnabled]   = useState(false)
+  const [postErr, setPostErr]   = useState(null)
+  // Stale chip: track the last time we saw a fresh detection or a
+  // service heartbeat (model name + any frame_age data). When more
+  // than 2 s without an update, surface a "camera stalled" indicator.
+  // The backend already reports openvocab.stalled — we just consume
+  // it, but track a UI-side timer too so the chip clears smoothly.
+  const isStalled    = !!openvocab.stalled
+  const noService    = !openvocab.model || openvocab.model === ''
+  const liveError    = openvocab.error || null
+  const liveDets     = Array.isArray(openvocab.detections) ? openvocab.detections : []
+  // Live-detect chips show only when the prompts the operator is
+  // editing locally match what the server is currently running. If
+  // the operator typed something new, we wait for them to hit Update.
+  const livePrompts  = (openvocab.prompts || []).map((p) => String(p).toLowerCase())
+  const localPrompts = (prompts || []).map((p) => String(p).toLowerCase())
+  const promptsInSync = livePrompts.length === localPrompts.length
+    && livePrompts.every((p, i) => p === localPrompts[i])
+
+  function addChip(text) {
+    const s = String(text || '').trim()
+    if (!s) return
+    if ((prompts || []).some((p) => p.toLowerCase() === s.toLowerCase())) return
+    onChange([...(prompts || []), s].slice(0, 16))
+  }
+  function removeChip(i) {
+    const next = (prompts || []).slice()
+    next.splice(i, 1)
+    onChange(next)
+  }
+  function fillDefault() {
+    if (!partName) return
+    onChange([String(partName).trim()])
+  }
+
+  async function pushPromptsToEngine(enabledFlag) {
+    setPostErr(null)
+    try {
+      const r = await fetch('/api/openvocab/prompts', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompts: prompts || [], enabled: enabledFlag }),
+      })
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}))
+        setPostErr(j.error || `HTTP ${r.status}`)
+        return false
+      }
+      return true
+    } catch (e) {
+      setPostErr(String(e?.message || e))
+      return false
+    }
+  }
+
+  async function startTest() {
+    if (!(prompts || []).length) { setPostErr('Add at least one prompt.'); return }
+    setTesting(true)
+    const ok = await pushPromptsToEngine(true)
+    if (!ok) setTesting(false)
+  }
+  async function stopTest() {
+    await pushPromptsToEngine(false)
+    setTesting(false)
+  }
+  async function toggleEnabled(next) {
+    setEnabled(next)
+    if (next) {
+      await pushPromptsToEngine(true)
+    } else {
+      await pushPromptsToEngine(false)
+      setTesting(false)
+    }
+  }
+
+  return (
+    <div>
+      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
+        Open-Vocabulary Detection
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--text-muted, #9ca3af)', marginBottom: 8 }}>
+        Find this component on the camera by description (e.g. <i>"metal bracket"</i>).
+      </div>
+
+      {/* Service status strip */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap',
+        marginBottom: 8, fontSize: 10, color: 'var(--text-muted)',
+      }}>
+        {noService ? (
+          <span style={{
+            padding: '2px 8px', borderRadius: 4,
+            background: 'rgba(148,163,184,0.18)', color: '#94a3b8',
+            border: '1px solid rgba(148,163,184,0.4)', fontWeight: 600,
+          }}>NOT INSTALLED</span>
+        ) : (
+          <span style={{
+            padding: '2px 8px', borderRadius: 4,
+            background: openvocab.enabled ? 'rgba(34,197,94,0.18)' : 'rgba(148,163,184,0.18)',
+            color: openvocab.enabled ? '#22c55e' : '#94a3b8',
+            border: openvocab.enabled
+              ? '1px solid rgba(34,197,94,0.4)'
+              : '1px solid rgba(148,163,184,0.4)',
+            fontWeight: 600,
+          }}>{openvocab.enabled ? 'ENGINE LIVE' : 'IDLE'}</span>
+        )}
+        {!noService && openvocab.model && (
+          <span style={{ opacity: 0.8 }}>{openvocab.model}</span>
+        )}
+        {!noService && openvocab.fps > 0 && (
+          <span>{openvocab.fps.toFixed(1)} FPS · {(openvocab.inference_ms || 0).toFixed(0)} ms</span>
+        )}
+        {!noService && isStalled && (
+          <span style={{
+            padding: '2px 8px', borderRadius: 4,
+            background: 'rgba(234,179,8,0.18)', color: '#eab308',
+            border: '1px solid rgba(234,179,8,0.5)', fontWeight: 700,
+          }}>CAM0 STALLED</span>
+        )}
+      </div>
+
+      {/* Prompt chips */}
+      <div style={{
+        display: 'flex', flexWrap: 'wrap', gap: 6,
+        padding: '6px 8px', marginBottom: 6,
+        background: 'var(--bg-surface)', borderRadius: 'var(--radius-sm, 4px)',
+        border: '1px solid var(--border)', minHeight: 36,
+      }}>
+        {(prompts || []).map((p, i) => (
+          <span key={i} style={{
+            display: 'inline-flex', alignItems: 'center', gap: 6,
+            padding: '3px 6px 3px 8px', borderRadius: 4,
+            background: 'rgba(99,102,241,0.18)', color: '#a5b4fc',
+            border: '1px solid rgba(99,102,241,0.45)',
+            fontSize: 11, fontWeight: 500,
+          }}>
+            {p}
+            <button onClick={() => removeChip(i)}
+              title="Remove prompt"
+              style={{
+                padding: 0, lineHeight: 1, width: 14, height: 14,
+                background: 'transparent', color: '#a5b4fc',
+                border: 'none', cursor: 'pointer', fontSize: 12,
+              }}>×</button>
+          </span>
+        ))}
+        {!(prompts || []).length && (
+          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            No prompts yet. Type below or{' '}
+            <button onClick={fillDefault}
+              style={{ background: 'transparent', color: '#60a5fa',
+                       border: 'none', padding: 0, cursor: 'pointer',
+                       fontSize: 11, textDecoration: 'underline' }}>
+              use part name
+            </button>.
+          </span>
+        )}
+      </div>
+      <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && draft.trim()) {
+              e.preventDefault(); addChip(draft); setDraft('')
+            }
+            if (e.key === ',' && draft.trim()) {
+              e.preventDefault(); addChip(draft.replace(',', '')); setDraft('')
+            }
+          }}
+          placeholder='Add a prompt (Enter to save)…'
+          style={{
+            flex: 1, padding: '6px 8px', fontSize: 12,
+            background: 'var(--bg-input, var(--bg-surface))',
+            color: 'var(--text-primary)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius-sm, 4px)', outline: 'none',
+          }}
+        />
+        <button onClick={() => { if (draft.trim()) { addChip(draft); setDraft('') } }}
+          style={{
+            padding: '6px 10px', fontSize: 11, fontWeight: 600,
+            background: 'rgba(59,130,246,0.18)', color: '#60a5fa',
+            border: '1px solid rgba(59,130,246,0.5)',
+            borderRadius: 'var(--radius-sm, 4px)', cursor: 'pointer',
+          }}>Add</button>
+      </div>
+
+      {/* Live detections preview — only when this part's prompts are
+          what the engine is currently running. Compact cam0 thumbnail
+          + SVG box overlay, then a text breakdown below it. */}
+      {testing && !noService && (
+        <div style={{
+          padding: '6px 8px', marginBottom: 8,
+          background: 'var(--bg-surface)',
+          border: '1px solid var(--border)',
+          borderRadius: 'var(--radius-sm, 4px)',
+          fontSize: 11, color: 'var(--text-secondary)',
+        }}>
+          <div style={{ fontWeight: 600, color: 'var(--text-primary)', marginBottom: 6 }}>
+            Live detections {promptsInSync ? '' : '(awaiting engine update…)'}
+          </div>
+          <div style={{
+            position: 'relative', width: '100%', maxWidth: 320,
+            margin: '0 auto 6px', borderRadius: 4, overflow: 'hidden',
+            background: '#000', aspectRatio: '4 / 3',
+          }}>
+            <img src="/stream/cam0" alt="cam0"
+              style={{ width: '100%', height: '100%', display: 'block',
+                       objectFit: 'contain' }} />
+            <OpenVocabBoxes detections={liveDets}
+              imageW={openvocab.image_w} imageH={openvocab.image_h} />
+            {isStalled && (
+              <div style={{
+                position: 'absolute', top: 4, left: 4,
+                padding: '2px 6px', borderRadius: 3,
+                background: 'rgba(220,38,38,0.85)', color: '#fff',
+                fontSize: 10, fontWeight: 700,
+              }}>CAM0 STALLED</div>
+            )}
+          </div>
+          {(!liveDets.length) && (
+            <div style={{ color: 'var(--text-muted)' }}>No detections yet.</div>
+          )}
+          {liveDets.slice(0, 6).map((d, i) => {
+            const conf = Math.round(((d.confidence ?? d.conf) || 0) * 100)
+            const zM = d.approx_xyz_cam?.z ?? d.z_m
+            const zMm = zM != null ? Math.round(zM * 1000) : (d.z_mm ?? null)
+            return (
+              <div key={i} style={{
+                display: 'flex', justifyContent: 'space-between',
+                fontFamily: 'var(--font-mono, monospace)',
+              }}>
+                <span>{conf}% · {d.prompt || d.label}</span>
+                <span style={{ color: 'var(--text-muted)' }}>
+                  {zMm != null ? `~${zMm} mm approx (D435i)` : ''}
+                </span>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* Buttons */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+        {!testing ? (
+          <button onClick={startTest} disabled={noService}
+            title={noService ? 'Open-vocab service not installed' : 'Run this prompt on cam0'}
+            style={{
+              flex: 1, padding: 8, fontSize: 12, fontWeight: 600,
+              cursor: noService ? 'not-allowed' : 'pointer',
+              background: noService ? 'rgba(148,163,184,0.18)' : 'rgba(99,102,241,0.18)',
+              color: noService ? '#94a3b8' : '#a5b4fc',
+              border: noService ? '1px solid rgba(148,163,184,0.4)' : '1px solid rgba(99,102,241,0.5)',
+              borderRadius: 'var(--radius-sm, 4px)',
+            }}>
+            Test Detection
+          </button>
+        ) : (
+          <button onClick={stopTest}
+            style={{
+              flex: 1, padding: 8, fontSize: 12, fontWeight: 600,
+              cursor: 'pointer',
+              background: 'rgba(234,179,8,0.18)', color: '#eab308',
+              border: '1px solid rgba(234,179,8,0.5)',
+              borderRadius: 'var(--radius-sm, 4px)',
+            }}>
+            Stop Test
+          </button>
+        )}
+        <label style={{
+          display: 'inline-flex', alignItems: 'center', gap: 6,
+          padding: '4px 10px',
+          background: 'var(--bg-surface)',
+          border: '1px solid var(--border)',
+          borderRadius: 'var(--radius-sm, 4px)',
+          cursor: noService ? 'not-allowed' : 'pointer',
+          opacity: noService ? 0.5 : 1,
+          fontSize: 11, color: 'var(--text-secondary)',
+        }} title={noService ? 'Open-vocab service not installed' : 'Keep this part\'s prompts active in the engine'}>
+          <input type="checkbox" disabled={noService}
+            checked={enabled}
+            onChange={(e) => toggleEnabled(e.target.checked)} />
+          Always-on
+        </label>
+      </div>
+
+      {(postErr || liveError) && (
+        <div style={{
+          padding: '6px 8px', marginBottom: 8, fontSize: 11,
+          background: 'rgba(239,68,68,0.12)', color: '#ef4444',
+          border: '1px solid rgba(239,68,68,0.4)',
+          borderRadius: 'var(--radius-sm, 4px)',
+        }}>
+          {postErr || liveError}
+        </div>
+      )}
+
+      <div style={{
+        padding: '6px 8px', fontSize: 10, lineHeight: 1.5,
+        color: 'var(--text-muted)', fontStyle: 'italic',
+        background: 'var(--bg-surface)', borderRadius: 'var(--radius-sm, 4px)',
+        border: '1px dashed var(--border)',
+      }}>
+        Open-vocabulary detection finds this component by description
+        (awareness/approx location). It is not pick-grade 6 DOF pose —
+        final picking uses the part's taught/STEP recognition + pose stack.
+      </div>
+    </div>
+  )
+}
+
 // ── Configurator ─────────────────────────────────────────────────────
 
 function PartConfigurator({ partId, onSave, onDelete }) {
@@ -266,6 +641,10 @@ function PartConfigurator({ partId, onSave, onDelete }) {
   const [selectedFace, setSelectedFace] = useState(null)
   const [saving, setSaving]       = useState(false)
   const [saveStatus, setSaveStatus] = useState(null)  // null | 'saved' | error string
+  // Open-vocabulary detection prompts for THIS part. Persisted as
+  // openvocab_prompts on the part's metadata. Defaults to the part
+  // name (single chip) until the operator edits.
+  const [ovPrompts, setOvPrompts] = useState([])
 
   const handleFaceClick = (faceData) => {
     setSelectedFace(faceData)
@@ -311,6 +690,12 @@ function PartConfigurator({ partId, onSave, onDelete }) {
           }
           setGrasp(g)
         }
+        // Open-vocab prompts: load from part metadata or default to
+        // the part name as one chip. Operator can edit/add chips.
+        const stored = Array.isArray(d.openvocab_prompts) ? d.openvocab_prompts : null
+        if (stored && stored.length > 0) setOvPrompts(stored.slice(0, 16))
+        else if (d.name) setOvPrompts([String(d.name).trim()])
+        else setOvPrompts([])
       })
   }, [partId])
 
@@ -328,6 +713,7 @@ function PartConfigurator({ partId, onSave, onDelete }) {
           front_direction: frontDir,
           front_angle_deg: frontAngle,
           grasp: { ...grasp },
+          openvocab_prompts: ovPrompts,
         }),
       })
       const data = await res.json().catch(() => ({}))
@@ -501,6 +887,15 @@ function PartConfigurator({ partId, onSave, onDelete }) {
           </div>
         </div>
 
+        {/* Open-vocabulary detection — per-part text prompts that drive
+            the open-vocab detector (formerly the cam0-page panel). */}
+        <OpenVocabSection
+          partId={partId}
+          partName={part?.name || ''}
+          prompts={ovPrompts}
+          onChange={setOvPrompts}
+        />
+
         {/* Actions */}
         <div style={{
           display: 'flex', gap: 8,
@@ -600,14 +995,386 @@ function NextButton({ onClick, disabled, label, color = '#2563EB' }) {
 // that lets the operator see what the library count will read after
 // Save — the wizard's session counter alone is misleading when they
 // chose "Add More" on a part that already had refs.
+// Tablet-camera "STEP + Video Teach" scan view. Used when the part
+// has a STEP (extents_cm) — the wizard offers it as an alternative to
+// the cam0 single-tap capture for operators holding the tablet next
+// to the part. Scale is anchored to the STEP file, not to depth.
+//
+// Flow:
+//   1. Operator points the tablet at the empty surface and clicks
+//      "Capture background".
+//   2. Operator places the part and rotates it slowly; this view
+//      snapshots a JPEG every ~250 ms and posts it to
+//      /api/parts/{id}/scan/frame. Backend runs blur/seg/STEP-aspect
+//      cross-check/yaw dedup; on a kept frame writes a standard
+//      ref_NNN.npz the matcher's loader picks up.
+//   3. Auto-stops at TARGET_VIEWS (18 distinct yaws) per orientation.
+//
+// Each backend-confirmed kept frame calls onCapture() so the wizard's
+// counter behaves identically to cam0-driven captures.
+function TabletScanView({
+  partId, orientation, orientationNumber, orientationLabel,
+  isPickable, onCapture, captureCount, onExit,
+}) {
+  const TARGET_VIEWS  = 18
+  const TICK_MS       = 250
+  const STALL_MS      = 2500
+
+  const videoRef    = useRef(null)
+  const canvasRef   = useRef(null)
+  const streamRef   = useRef(null)
+  const lastReplyAt = useRef(0)
+  const tickRef     = useRef(null)
+
+  const [permError,   setPermError]   = useState(null)
+  const [bgCaptured,  setBgCaptured]  = useState(false)
+  const [scanning,    setScanning]    = useState(false)
+  const [paused,      setPaused]      = useState(false)
+  const [lastDecision, setLastDecision] = useState(null)
+  const [keptTotal,   setKeptTotal]   = useState(0)
+  const [keptYaws,    setKeptYaws]    = useState([])
+  const [rejected,    setRejected]    = useState({})
+  const [stalled,     setStalled]     = useState(false)
+  const [posting,     setPosting]     = useState(false)
+  const [statusMsg,   setStatusMsg]   = useState('')
+
+  // ── Open the tablet's back camera on mount ──────────────────────
+  useEffect(() => {
+    let cancelled = false
+    async function open() {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setPermError('Tablet camera not available in this browser.')
+        return
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } },
+          audio: false,
+        })
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return }
+        streamRef.current = stream
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream
+          await videoRef.current.play().catch(() => {})
+        }
+      } catch (e) {
+        setPermError('Camera permission denied or no rear camera. ' + (e?.message || ''))
+      }
+    }
+    open()
+    return () => {
+      cancelled = true
+      streamRef.current?.getTracks().forEach((t) => t.stop())
+      if (tickRef.current) { clearInterval(tickRef.current); tickRef.current = null }
+    }
+  }, [])
+
+  // ── JPEG snapshot helper ────────────────────────────────────────
+  async function snapshotJpeg(quality = 0.7) {
+    const video  = videoRef.current
+    const canvas = canvasRef.current
+    if (!video || !canvas || !video.videoWidth) return null
+    canvas.width  = video.videoWidth
+    canvas.height = video.videoHeight
+    const ctx = canvas.getContext('2d')
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+    return await new Promise((resolve) => canvas.toBlob(
+      (b) => resolve(b), 'image/jpeg', quality))
+  }
+
+  async function captureBackground() {
+    setStatusMsg('Capturing background...')
+    const blob = await snapshotJpeg(0.85)
+    if (!blob) { setStatusMsg('Camera not ready yet.'); return }
+    try {
+      const r = await fetch(`/api/parts/${partId}/scan/bg`, {
+        method: 'POST', body: blob,
+        headers: { 'Content-Type': 'image/jpeg' },
+      })
+      const d = await r.json().catch(() => ({}))
+      if (r.ok && d.ok) {
+        setBgCaptured(true)
+        setStatusMsg(`Background set (${d.width}×${d.height}). Place the part in view and Start.`)
+      } else {
+        setStatusMsg(d.error || 'Background capture failed.')
+      }
+    } catch (e) {
+      setStatusMsg('Network error setting background: ' + (e?.message || e))
+    }
+  }
+
+  async function resetSession() {
+    try {
+      await fetch(`/api/parts/${partId}/scan/reset`, { method: 'POST' })
+    } catch {}
+    setBgCaptured(false); setScanning(false); setPaused(false)
+    setKeptTotal(0); setKeptYaws([]); setRejected({}); setLastDecision(null)
+    setStatusMsg('Session reset. Capture a fresh background to start.')
+  }
+
+  // ── Periodic snapshot loop ──────────────────────────────────────
+  useEffect(() => {
+    if (!scanning || paused) {
+      if (tickRef.current) { clearInterval(tickRef.current); tickRef.current = null }
+      return
+    }
+    lastReplyAt.current = Date.now()
+    setStalled(false)
+    tickRef.current = setInterval(async () => {
+      if (Date.now() - lastReplyAt.current > STALL_MS) setStalled(true)
+      if (posting) return
+      setPosting(true)
+      try {
+        const blob = await snapshotJpeg(0.7)
+        if (!blob) { setPosting(false); return }
+        const url = `/api/parts/${partId}/scan/frame?` + new URLSearchParams({
+          orientation,
+          orientation_number: String(orientationNumber || 0),
+          orientation_label:  orientationLabel || '',
+          is_pickable:        String(!!isPickable),
+        }).toString()
+        const r = await fetch(url, {
+          method: 'POST', body: blob,
+          headers: { 'Content-Type': 'image/jpeg' },
+        })
+        const d = await r.json().catch(() => ({}))
+        lastReplyAt.current = Date.now()
+        setStalled(false)
+        if (!r.ok) {
+          setLastDecision({ kept: false, reason: 'http_' + r.status,
+                            message: d.error || ('HTTP ' + r.status) })
+          return
+        }
+        setLastDecision(d)
+        setKeptTotal(d.kept_total || 0)
+        const yaws = (d.kept_yaws && d.kept_yaws[orientation]) || []
+        setKeptYaws(yaws)
+        setRejected(d.rejected_counts || {})
+        if (d.kept) {
+          onCapture?.()
+          if ((yaws.length || 0) >= TARGET_VIEWS) {
+            setScanning(false)
+            setStatusMsg('Target reached — ' + yaws.length + ' distinct views captured.')
+          }
+        }
+      } catch (e) {
+        setLastDecision({ kept: false, reason: 'network',
+                          message: String(e?.message || e) })
+      } finally {
+        setPosting(false)
+      }
+    }, TICK_MS)
+    return () => { if (tickRef.current) clearInterval(tickRef.current) }
+  }, [scanning, paused, partId, orientation, orientationNumber,
+      orientationLabel, isPickable, posting, onCapture])
+
+  const accent = isPickable ? '#16A34A' : '#CA8A04'
+  const reachedTarget = keptYaws.length >= TARGET_VIEWS
+
+  return (
+    <div>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8,
+        padding: '8px 10px', background: '#eff6ff',
+        border: '1px solid #bfdbfe', borderRadius: 6,
+      }}>
+        <span style={{
+          fontSize: 10, fontWeight: 700, color: '#1d4ed8',
+          background: '#dbeafe', padding: '2px 6px', borderRadius: 4,
+        }}>TABLET SCAN</span>
+        <div style={{ fontSize: 11, color: '#1d4ed8', flex: 1 }}>
+          STEP gives exact size/shape; the video supplies real appearance.
+          Improves identification + orientation, not 6-DOF grasp pose.
+        </div>
+        <button onClick={onExit}
+          style={{ padding: '4px 10px', fontSize: 11, fontWeight: 600,
+                   background: '#fff', color: '#1d4ed8',
+                   border: '1px solid #bfdbfe', borderRadius: 4, cursor: 'pointer' }}>
+          ← Back to cam0
+        </button>
+      </div>
+
+      <div style={{
+        width: '100%', borderRadius: 10, overflow: 'hidden',
+        border: `2px solid ${accent}`, marginBottom: 10, background: '#111',
+        position: 'relative',
+      }}>
+        <video ref={videoRef} playsInline muted
+          style={{ width: '100%', display: 'block' }} />
+        {permError && (
+          <div style={{
+            position: 'absolute', inset: 0, display: 'flex',
+            alignItems: 'center', justifyContent: 'center',
+            background: 'rgba(220,38,38,0.85)', color: '#fff',
+            padding: 16, fontSize: 12, textAlign: 'center',
+          }}>{permError}</div>
+        )}
+        {stalled && !permError && (
+          <div style={{
+            position: 'absolute', top: 8, left: 8, padding: '4px 10px',
+            background: 'rgba(220,38,38,0.9)', color: '#fff',
+            fontSize: 11, fontWeight: 700, borderRadius: 4,
+          }}>CAMERA STALLED — check the tablet</div>
+        )}
+        <canvas ref={canvasRef} style={{ display: 'none' }} />
+      </div>
+
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12,
+        padding: '10px 14px',
+        background: isPickable ? '#f0fdf4' : '#fffbeb',
+        borderRadius: 8, border: `1px solid ${accent}40`,
+      }}>
+        <div style={{
+          fontSize: 28, fontWeight: 800, color: accent,
+          fontVariantNumeric: 'tabular-nums',
+        }}>{keptYaws.length}</div>
+        <div style={{ fontSize: 13, color: '#6b7280' }}>
+          / {TARGET_VIEWS} distinct yaws
+          {captureCount > 0 && (
+            <span style={{ color: '#9ca3af' }}> · {captureCount} this session</span>
+          )}
+        </div>
+        <div style={{ flex: 1 }} />
+        {Object.keys(rejected).length > 0 && (
+          <div style={{ fontSize: 10, color: '#6b7280', textAlign: 'right' }}>
+            rejected: {Object.entries(rejected).map(
+              ([k, v]) => `${k}=${v}`).join(' · ')}
+          </div>
+        )}
+      </div>
+
+      {!bgCaptured ? (
+        <div style={{
+          padding: '12px 14px', marginBottom: 12,
+          background: '#fef3c7', border: '1px solid #fcd34d', borderRadius: 8,
+          fontSize: 12, color: '#92400E',
+        }}>
+          <b>Step 1.</b> Point the tablet at the empty surface (no part).
+          Click <b>Capture background</b>.
+        </div>
+      ) : (
+        <div style={{
+          padding: '10px 14px', marginBottom: 12,
+          background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8,
+          fontSize: 12, color: '#1d4ed8',
+        }}>
+          <b>Step 2.</b> Place the part on the surface and rotate it slowly.
+          Frames auto-capture every {TICK_MS / 1000}s.
+        </div>
+      )}
+
+      {lastDecision && (
+        <div style={{
+          padding: '6px 10px', marginBottom: 10, borderRadius: 6,
+          background: lastDecision.kept ? '#f0fdf4' : '#fef2f2',
+          border: lastDecision.kept ? '1px solid #bbf7d0' : '1px solid #fecaca',
+          fontSize: 11, color: lastDecision.kept ? '#166534' : '#b91c1c',
+        }}>
+          {lastDecision.kept ? '✓ ' : '✕ '}
+          {lastDecision.message || lastDecision.reason}
+        </div>
+      )}
+      {statusMsg && (
+        <div style={{ marginBottom: 10, fontSize: 11, color: '#6b7280' }}>
+          {statusMsg}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+        {!bgCaptured && (
+          <button onClick={captureBackground} disabled={!!permError}
+            style={{
+              flex: 1, padding: '14px', fontSize: 14, fontWeight: 700,
+              background: permError ? '#9ca3af' : '#2563EB', color: '#fff',
+              border: 'none', borderRadius: 10,
+              cursor: permError ? 'not-allowed' : 'pointer', minHeight: 48,
+            }}>
+            Capture background
+          </button>
+        )}
+        {bgCaptured && !scanning && !reachedTarget && (
+          <button onClick={() => { setScanning(true); setPaused(false) }}
+            style={{
+              flex: 1, padding: '14px', fontSize: 14, fontWeight: 700,
+              background: accent, color: '#fff',
+              border: 'none', borderRadius: 10, cursor: 'pointer', minHeight: 48,
+            }}>
+            Start scan
+          </button>
+        )}
+        {scanning && !paused && (
+          <button onClick={() => setPaused(true)}
+            style={{
+              flex: 1, padding: '14px', fontSize: 14, fontWeight: 700,
+              background: '#f59e0b', color: '#fff',
+              border: 'none', borderRadius: 10, cursor: 'pointer', minHeight: 48,
+            }}>
+            Pause
+          </button>
+        )}
+        {scanning && paused && (
+          <button onClick={() => setPaused(false)}
+            style={{
+              flex: 1, padding: '14px', fontSize: 14, fontWeight: 700,
+              background: accent, color: '#fff',
+              border: 'none', borderRadius: 10, cursor: 'pointer', minHeight: 48,
+            }}>
+            Resume
+          </button>
+        )}
+        {scanning && (
+          <button onClick={() => { setScanning(false); setPaused(false) }}
+            style={{
+              padding: '14px 16px', fontSize: 13, fontWeight: 600,
+              background: '#fff', color: '#374151',
+              border: '2px solid #e5e7eb', borderRadius: 10, cursor: 'pointer',
+            }}>
+            Stop
+          </button>
+        )}
+        <button onClick={resetSession}
+          title="Discard the background and per-orientation yaw history"
+          style={{
+            padding: '14px 12px', fontSize: 12, fontWeight: 600,
+            background: '#fff', color: '#b91c1c',
+            border: '2px solid #fecaca', borderRadius: 10, cursor: 'pointer',
+          }}>
+          Reset
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function CaptureView({
   partId, orientation, orientationNumber, orientationLabel,
   isPickable, isDefect, defectName, defectDescription, defectSeverity,
   onCapture, captureCount,
   addingMore = false, existingCount = 0, minToAdvance = 2,
+  hasStep = false,
 }) {
   const [capturing, setCapturing] = useState(false)
   const [error,     setError]     = useState(null)
+  // Whether the operator switched this capture page into tablet-scan
+  // mode. Only available when the part has STEP geometry (size-gate
+  // requires it).
+  const [useTablet, setUseTablet] = useState(false)
+
+  if (useTablet && hasStep && !isDefect) {
+    return (
+      <TabletScanView
+        partId={partId}
+        orientation={orientation}
+        orientationNumber={orientationNumber}
+        orientationLabel={orientationLabel}
+        isPickable={isPickable}
+        onCapture={onCapture}
+        captureCount={captureCount}
+        onExit={() => setUseTablet(false)}
+      />
+    )
+  }
 
   const accent = isDefect    ? '#DC2626'
               : isPickable   ? '#16A34A'
@@ -653,6 +1420,19 @@ function CaptureView({
 
   return (
     <div>
+      {hasStep && !isDefect && (
+        <button onClick={() => setUseTablet(true)}
+          title="Use the tablet's back camera instead of cam0. Available because this part has STEP geometry to anchor scale."
+          style={{
+            width: '100%', padding: '10px 12px', marginBottom: 8,
+            fontSize: 12, fontWeight: 600,
+            background: '#eff6ff', color: '#1d4ed8',
+            border: '1px solid #bfdbfe', borderRadius: 6, cursor: 'pointer',
+          }}>
+          📷 Use tablet camera scan instead (STEP-anchored)
+        </button>
+      )}
+
       <div style={{
         width: '100%', borderRadius: 10, overflow: 'hidden',
         border: `2px solid ${accent}`, marginBottom: 10, background: '#111',
@@ -1215,6 +1995,7 @@ const PAGES = [
             addingMore={true}
             existingCount={answers.existing_teach_count || 0}
             minToAdvance={1}
+            hasStep={!!answers.dimensions}
           />
           <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
             <button
@@ -1472,6 +2253,7 @@ const PAGES = [
               addingMore={addingMore}
               existingCount={answers.existing_teach_count || 0}
               minToAdvance={minN}
+              hasStep={!!answers.dimensions}
             />
             <NextButton onClick={goNext} disabled={count < minN} color="#16A34A"
               label={count < minN ? `Need ${minN - count} more capture${minN - count === 1 ? '' : 's'}` : 'Next'} />
@@ -1587,6 +2369,7 @@ const PAGES = [
               addingMore={addingMore}
               existingCount={answers.existing_teach_count || 0}
               minToAdvance={minN}
+              hasStep={!!answers.dimensions}
             />
             <NextButton onClick={goNext} disabled={count < minN} color="#CA8A04"
               label={count < minN ? `Need ${minN - count} more capture${minN - count === 1 ? '' : 's'}` : 'Next'} />

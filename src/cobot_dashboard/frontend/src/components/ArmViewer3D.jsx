@@ -5,7 +5,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader'
 import URDFLoader from 'urdf-loader'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
-import { CollisionScene3D, CollisionBanner, CollisionSidePanel } from './CollisionOverlay'
+import { CollisionScene3D, CollisionBanner } from './CollisionOverlay'
 
 // ──────────────────────────────────────────────────────────────────
 // ArmViewer3D — Estun S10-140 ARTICULATED view.
@@ -80,6 +80,153 @@ function lidarHeightColor(z) {
   return         new THREE.Color(0.85, 0.25, 0.15)
 }
 
+// BaselineCloudInScene — render the ACTIVE cell's SAVED baseline cloud
+// (the wizard-captured PCD), NOT the live LiDAR feed. The robot view
+// is intended to show the world the robot was commissioned in; live
+// LiDAR overlays belong on the Cameras & LiDAR tab where LidarPanel
+// already runs that path. Falls back to a no-baseline inline notice
+// rendered via the parent's HTML overlay slot.
+//
+// Source of truth for the active cell: useStore.activeCellId, written
+// by Configure on Activate and hydrated once at app boot from
+// /api/cells/active. We then GET /api/cells/{id}/baseline/cloud — same
+// JSON shape the WS broadcast speaks ({n, p:[x,y,z,...]}). We
+// voxel-downsample server-side so the SPA stays smooth.
+//
+// Replaces the previous local 4 s poll, which caused two failure
+// modes: (a) an initial-mount flash of "No active cell" before the
+// first fetch landed, and (b) up to a 4 s lag after Configure
+// activated a different cell.
+function BaselineCloudInScene({ onStatusChange }) {
+  const geoRef    = useRef(new THREE.BufferGeometry())
+  const posBufRef = useRef(new Float32Array(LIDAR_MAX_PTS * 3))
+  const colBufRef = useRef(new Float32Array(LIDAR_MAX_PTS * 3))
+  const [cloud,  setCloud]  = useState(null)  // {n, p:[...]} or null
+
+  // Subscribe to the shared store. Render reactively when Configure
+  // activates a different cell. `activeCellHydrated` distinguishes
+  // "haven't asked the backend yet" (don't show "No active cell")
+  // from "backend confirmed there is no active cell" (do show it).
+  const activeCellId       = useStore((s) => s.activeCellId)
+  const activeCell         = useStore((s) => s.activeCell)
+  const activeCellHydrated = useStore((s) => s.activeCellHydrated)
+  const hydrateActiveCell  = useStore((s) => s.hydrateActiveCell)
+
+  // Belt-and-suspenders: App.jsx hydrates at boot, but if this
+  // component mounts before that finished (or the boot fetch failed),
+  // re-trigger so we don't render stale.
+  useEffect(() => {
+    if (!activeCellHydrated) hydrateActiveCell()
+  }, [activeCellHydrated, hydrateActiveCell])
+
+  // Re-fetch the cell's profile + baseline whenever the active id
+  // changes. We don't trust the cached `activeCell.baseline_captured`
+  // alone because Configure's local refresh may lag behind a fresh
+  // capture; ask the baseline endpoint directly — its 404 vs 200
+  // tells us authoritatively.
+  useEffect(() => {
+    if (!activeCellHydrated) {
+      onStatusChange?.({ cell_id: null, n: 0,
+                         hydrated: false, message: 'loading' })
+      return
+    }
+    if (!activeCellId) {
+      setCloud(null)
+      onStatusChange?.({ cell_id: null, n: 0,
+                         hydrated: true, has_baseline: false,
+                         message: 'no_active_cell' })
+      return
+    }
+    const cellName = activeCell?.name || ''
+    let cancelled = false
+    onStatusChange?.({ cell_id: activeCellId, name: cellName,
+                       hydrated: true, n: 0, message: 'loading_baseline' })
+    fetch(`/api/cells/${encodeURIComponent(activeCellId)}/baseline/cloud?max_points=80000`)
+      .then(async (r) => {
+        if (cancelled) return
+        if (r.status === 404) {
+          // Authoritative: active cell has no baseline file yet.
+          setCloud(null)
+          onStatusChange?.({ cell_id: activeCellId, name: cellName,
+                             hydrated: true, has_baseline: false,
+                             n: 0, message: 'no_baseline' })
+          return
+        }
+        if (!r.ok) {
+          setCloud(null)
+          onStatusChange?.({ cell_id: activeCellId, name: cellName,
+                             hydrated: true, has_baseline: true,
+                             n: 0, message: 'load_failed' })
+          return
+        }
+        const j = await r.json()
+        if (cancelled) return
+        if (typeof j?.n === 'number' && Array.isArray(j?.p)) {
+          setCloud(j)
+          onStatusChange?.({
+            cell_id: activeCellId, name: cellName,
+            hydrated: true, has_baseline: true, n: j.n,
+            captured_at: j.captured_at,
+            total_in_file: j.total_in_file,
+          })
+        }
+      })
+      .catch(() => {
+        if (cancelled) return
+        setCloud(null)
+        onStatusChange?.({ cell_id: activeCellId, name: cellName,
+                           hydrated: true, has_baseline: true,
+                           n: 0, message: 'load_failed' })
+      })
+    return () => { cancelled = true }
+  }, [activeCellId, activeCell?.name, activeCellHydrated, onStatusChange])
+
+  // Build the buffer once when the cloud lands. The baseline is
+  // static — no useFrame loop needed.
+  useEffect(() => {
+    const g = geoRef.current
+    g.setAttribute('position', new THREE.BufferAttribute(posBufRef.current, 3))
+    g.setAttribute('color',    new THREE.BufferAttribute(colBufRef.current, 3))
+    if (!cloud || !Array.isArray(cloud.p) || !cloud.n) {
+      g.setDrawRange(0, 0)
+      return
+    }
+    const positions = posBufRef.current
+    const colors    = colBufRef.current
+    const p = cloud.p
+    const n = Math.min(cloud.n, LIDAR_MAX_PTS)
+    for (let i = 0; i < n; i++) {
+      const px = p[i * 3], py = p[i * 3 + 1], pz = p[i * 3 + 2]
+      // LiDAR (ROS Z-up) → Three (Y-up): (x, y, z) → (x, z, y)
+      positions[i * 3]     = px
+      positions[i * 3 + 1] = pz
+      positions[i * 3 + 2] = py
+      const c = lidarHeightColor(pz)
+      colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b
+    }
+    g.setDrawRange(0, n)
+    g.attributes.position.needsUpdate = true
+    g.attributes.color.needsUpdate    = true
+  }, [cloud])
+
+  if (!cloud || !cloud.n) return null
+  return (
+    <points>
+      <primitive object={geoRef.current} attach="geometry" />
+      <pointsMaterial
+        size={0.006}
+        vertexColors
+        sizeAttenuation={true}
+        transparent
+        opacity={0.95}
+        depthWrite={false}
+      />
+    </points>
+  )
+}
+
+// Legacy live-LiDAR cloud — kept as exported diagnostics for the
+// Cameras & LiDAR tab; not mounted in the robot view.
 function LidarCloudInScene() {
   const geoRef    = useRef(new THREE.BufferGeometry())
   const posBufRef = useRef(new Float32Array(LIDAR_MAX_PTS * 3))
@@ -484,10 +631,113 @@ function CustomGripperModel({ url, flange }) {
 // ──────────────────────────────────────────────────────────────────
 // ArmViewer3D — the public component.
 // ──────────────────────────────────────────────────────────────────
+function BaselineStatusNotice({ status }) {
+  if (!status) return null
+  const { cell_id, name, has_baseline, n, message, captured_at, hydrated } = status
+  // Quiet success state: a tiny readout sitting in the top-center
+  // beneath the collision banner. Loud only when there's something
+  // for the operator to act on.
+  if (cell_id && has_baseline && n > 0) {
+    return (
+      <div style={{
+        position: 'absolute', top: 56, left: '50%',
+        transform: 'translateX(-50%)',
+        padding: '3px 8px', borderRadius: 4, zIndex: 9,
+        fontSize: 10, fontFamily: 'var(--font-mono, monospace)',
+        background: 'rgba(15,23,42,0.6)', color: '#e2e8f0',
+        pointerEvents: 'none', letterSpacing: 0.2,
+      }}>
+        Baseline · {name || cell_id} · {n.toLocaleString()} pts
+        {captured_at ? ' · ' + captured_at : ''}
+      </div>
+    )
+  }
+  // Pre-hydration: don't claim "no active cell" — we don't know yet.
+  // The store hasn't heard from the backend at all, so this is
+  // genuinely "loading", not an empty state. This was the original
+  // bug: the previous code defaulted to "No active cell" when
+  // cell_id was null, even on the very first render before any
+  // network round-trip.
+  if (hydrated === false) {
+    return (
+      <div style={{
+        position: 'absolute', top: 56, left: '50%',
+        transform: 'translateX(-50%)',
+        padding: '6px 12px', borderRadius: 6, zIndex: 9,
+        fontSize: 11, color: '#94a3b8',
+        background: 'rgba(15,23,42,0.7)',
+        border: '1px solid rgba(148,163,184,0.3)',
+        pointerEvents: 'none',
+      }}>Loading active cell…</div>
+    )
+  }
+  const msg = !cell_id
+    ? 'No active cell — pick one in Configure → Cells.'
+    : !has_baseline
+      ? `Active cell "${name || cell_id}" has no baseline — capture one in the Setup Wizard.`
+      : message === 'load_failed'
+        ? 'Baseline cloud failed to load — check the Setup Wizard.'
+        : message === 'loading_baseline'
+          ? `Loading baseline for "${name || cell_id}"…`
+          : 'Loading baseline…'
+  // Loading-baseline state is informational, not a problem; the others
+  // are amber so the operator notices.
+  const looksLikeLoading = message === 'loading_baseline'
+  return (
+    <div style={{
+      position: 'absolute', top: 56, left: '50%',
+      transform: 'translateX(-50%)',
+      padding: '8px 14px', borderRadius: 6, zIndex: 11,
+      fontSize: 12, fontWeight: 600,
+      background: looksLikeLoading
+        ? 'rgba(15,23,42,0.75)'
+        : 'rgba(254,243,199,0.96)',
+      color: looksLikeLoading ? '#cbd5e1' : '#92400e',
+      border: looksLikeLoading
+        ? '1px solid rgba(148,163,184,0.35)'
+        : '1px solid #fcd34d',
+      boxShadow: '0 2px 8px rgba(0,0,0,0.12)',
+      maxWidth: '70%', textAlign: 'center',
+    }}>{msg}</div>
+  )
+}
+
+function StaticZonesToggle({ value, onChange }) {
+  // Probe the live collision payload for any baseline-built obstacles
+  // so we don't dangle an inert toggle when no cell has zones yet.
+  const hasStatic = useStore((s) => (s.collision?.objects || []).some(
+    (o) => o.source === 'baseline_static'))
+  if (!hasStatic) return null
+  return (
+    <div style={{
+      position: 'absolute', top: 8, left: 8, padding: '6px 10px',
+      background: 'rgba(255,255,255,0.95)', borderRadius: 8,
+      border: '1px solid #fed7aa',
+      boxShadow: '0 2px 8px rgba(0,0,0,0.08)', zIndex: 11,
+      display: 'flex', alignItems: 'center', gap: 8,
+      fontSize: 11, color: '#9a3412',
+    }}>
+      <span style={{ width: 10, height: 10, borderRadius: 2,
+                     background: '#ea580c', border: '1px solid #c2410c' }} />
+      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+        <input type="checkbox" checked={!!value}
+          onChange={(e) => onChange(e.target.checked)} />
+        <span style={{ fontWeight: 600 }}>Static keep-out zones</span>
+      </label>
+    </div>
+  )
+}
+
 const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay }, ref) {
   const controlsRef = useRef(null)
   const [flange, setFlange] = useState(null)
   const [urdfStatus, setUrdfStatus] = useState({ state: 'idle', detail: '' })
+  // Show baseline-built static keep-out zones by default; the
+  // operator can hide them via the StaticZonesToggle.
+  const [showStaticZones, setShowStaticZones] = useState(true)
+  // What BaselineCloudInScene last reported — drives the inline
+  // "no commissioned baseline" notice for the empty case.
+  const [baselineStatus, setBaselineStatus] = useState(null)
   const autoFittedRef = useRef(false)
 
   // === DIAGNOSTIC — independent fetch of one per-link GLB so a
@@ -591,11 +841,22 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay 
           onLoaded={handleUrdfLoaded}
         />
         <CustomGripperModel url={gripperGlbUrl} flange={flange} />
-        <LidarCloudInScene />
-        <CollisionScene3D />
+        <BaselineCloudInScene onStatusChange={setBaselineStatus} />
+        <CollisionScene3D showStatic={showStaticZones} />
         {children}
       </Canvas>
       {overlay}
+
+      {/* Static keep-out zones toggle — top-left. Hidden when the
+          collision payload has no baseline-static obstacles so the
+          UI doesn't dangle a useless toggle. */}
+      <StaticZonesToggle value={showStaticZones} onChange={setShowStaticZones} />
+
+      {/* Baseline cloud status — inline notice for the empty / not-
+          captured cases so the operator isn't staring at an empty
+          scene wondering whether the system is broken. The success
+          case (cloud rendered) only surfaces a tiny pt-count chip. */}
+      <BaselineStatusNotice status={baselineStatus} />
 
       {/* Collision banner — centered at top */}
       <div style={{
@@ -605,14 +866,10 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay 
         <CollisionBanner />
       </div>
 
-      {/* Collision side panel — bottom-left, above the gripper hint */}
-      <div style={{
-        position: 'absolute', bottom: 8, left: 8,
-        zIndex: 11, pointerEvents: 'none',
-        maxWidth: '40%',
-      }}>
-        <CollisionSidePanel />
-      </div>
+      {/* (Removed) Collision side panel — was dev scaffolding showing
+          per-object distances + Mock injection + home-pose state in the
+          bottom-left. CollisionSidePanel is still exported from
+          CollisionOverlay for diagnostic pages. */}
 
       {gripperGlbUrl && (
         <div style={{
@@ -642,27 +899,32 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay 
         ))}
       </div>
 
-      {/* Status pill, bottom-right */}
-      <div style={{
-        position: 'absolute', bottom: 8, right: 8, padding: '6px 10px',
-        borderRadius: 6, fontSize: 11, lineHeight: 1.35,
-        fontFamily: 'var(--font-mono, monospace)', zIndex: 10,
-        maxWidth: 360,
-        boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-        background: urdfStatus.state === 'error'
-          ? 'rgba(220,38,38,0.95)'
-          : urdfStatus.state === 'loaded'
-            ? 'rgba(22,163,74,0.92)'
-            : 'rgba(15,23,42,0.85)',
-        color: '#fff',
-      }}>
-        <div style={{ fontWeight: 700, marginBottom: 2 }}>URDF: {urdfStatus.state}</div>
-        <div style={{ opacity: 0.92, wordBreak: 'break-all' }}>{urdfStatus.detail || '—'}</div>
-        {/* DIAGNOSTIC — remove after model confirmed live */}
+      {/* Status pill, bottom-right — DEV scaffolding. Hidden by default;
+          reveal with ?debug=1 in the URL when diagnosing URDF or
+          GLB-fetch issues. The pill used to display "URDF: loading /
+          fetching URDF / GLB fetch 200 OK" in the normal view, which
+          was distracting once the model loaded reliably. */}
+      {(typeof window !== 'undefined' && /[?&]debug=1\b/.test(window.location.search)) && (
         <div style={{
-          fontSize: 11, color: '#ff9900', marginTop: 4, wordBreak: 'break-all',
-        }}>{diagMsg}</div>
-      </div>
+          position: 'absolute', bottom: 8, right: 8, padding: '6px 10px',
+          borderRadius: 6, fontSize: 11, lineHeight: 1.35,
+          fontFamily: 'var(--font-mono, monospace)', zIndex: 10,
+          maxWidth: 360,
+          boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+          background: urdfStatus.state === 'error'
+            ? 'rgba(220,38,38,0.95)'
+            : urdfStatus.state === 'loaded'
+              ? 'rgba(22,163,74,0.92)'
+              : 'rgba(15,23,42,0.85)',
+          color: '#fff',
+        }}>
+          <div style={{ fontWeight: 700, marginBottom: 2 }}>URDF: {urdfStatus.state}</div>
+          <div style={{ opacity: 0.92, wordBreak: 'break-all' }}>{urdfStatus.detail || '—'}</div>
+          <div style={{
+            fontSize: 11, color: '#ff9900', marginTop: 4, wordBreak: 'break-all',
+          }}>{diagMsg}</div>
+        </div>
+      )}
 
       {/* Camera presets, top-left */}
       <div style={{

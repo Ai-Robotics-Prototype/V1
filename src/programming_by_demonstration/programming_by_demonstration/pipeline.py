@@ -154,9 +154,13 @@ class Pipeline:
         self._log(f'[{demo_id}] transcript ({len(result.transcript_text)} chars)')
 
         # 3. Extract frames at low fps + JPEG-encode for the backend.
+        #    The function returns (path, timestamp_s) tuples so the
+        #    backend can reason about sequence. First + last frames are
+        #    guaranteed to survive any downsampling so the initial and
+        #    final scene state are always visible to the model.
         frames_dir = os.path.join(self.store.dir_for(demo_id), 'frames')
         try:
-            frame_paths = extract_frames(
+            frames = extract_frames(
                 saved, frames_dir,
                 fps=self.cfg.frame_sample_fps,
                 max_count=self.cfg.frame_max_count,
@@ -168,7 +172,7 @@ class Pipeline:
         except Exception as e:
             return self._fail(demo_id, f'frame extraction failed: {e}', stage='frames')
         result.stages_done.append('frames')
-        self._log(f'[{demo_id}] extracted {len(frame_paths)} frames')
+        self._log(f'[{demo_id}] extracted {len(frames)} frames')
 
         # 4. Few-shot retrieval (only from human-corrected past demos).
         parts_library = self._parts_provider() or []
@@ -199,7 +203,7 @@ class Pipeline:
         )
         try:
             br: BackendResult = backend.understand(
-                frames=frame_paths,
+                frames=frames,
                 transcript=result.transcript_text,
                 context={'units': 'mm/deg', 'workspace': 'tabletop'},
                 parts_library=parts_library_summary(parts_library),
@@ -236,6 +240,17 @@ class Pipeline:
         result.stages_done.append('compose')
 
         # 7. Index metadata (drives /api/pbd/dataset/stats + retrieval).
+        # Part-id union: operations + scene-objects. Retrieval ranks past
+        # demos by overlapping parts/ops; pulling scene-grounded parts
+        # into the index means a demo mentioning a part only in scene
+        # context (not as a pick target) still surfaces for similar
+        # future runs.
+        op_part_ids = [op.target_part.part_id for op in intent.operations
+                       if op.target_part and op.target_part.part_id
+                       and op.target_part.part_id != 'unknown']
+        scene_part_ids = [o.matched_part_id for o in (intent.scene.objects or [])
+                          if o.matched_part_id]
+        all_part_ids = sorted(set(op_part_ids + scene_part_ids))
         meta = {
             'demo_id':       demo_id,
             'created_at':    now_iso(),
@@ -245,13 +260,21 @@ class Pipeline:
                 'backend_id':            br.backend_id,
                 'transited_externally':  br.transited_externally,
             },
-            'part_ids':      [op.target_part.part_id for op in intent.operations
-                              if op.target_part and op.target_part.part_id
-                              and op.target_part.part_id != 'unknown'],
+            'part_ids':      all_part_ids,
             'operations':    [op.operation_type for op in intent.operations],
             'ambiguities':   list(intent.ambiguities),
             'confidence':    float(intent.confidence_overall or 0.0),
             'correction_made': False,
+            'scene': {
+                'object_count':    len(intent.scene.objects),
+                'location_count':  len(intent.scene.locations),
+                'spatial_summary': intent.scene.spatial_summary,
+                'object_labels':   [o.label for o in intent.scene.objects],
+                'location_labels': [l.label for l in intent.scene.locations],
+                'matched_part_ids': scene_part_ids,
+            },
+            'frame_count':   len(frames),
+            'frame_timestamps': [round(ts, 3) for _, ts in frames],
             'retrieval': {
                 'used_examples': [
                     {'demo_id': e.get('demo_id'), 'score': e.get('_score')}
@@ -270,12 +293,22 @@ class Pipeline:
 
     def accept_correction(self, demo_id: str,
                           corrected_program: Dict[str, Any],
-                          program_id: Optional[str] = None) -> Dict[str, Any]:
+                          program_id: Optional[str] = None,
+                          corrected_scene: Optional[Dict[str, Any]] = None,
+                          corrected_intent: Optional[Dict[str, Any]] = None,
+                          ) -> Dict[str, Any]:
         """Called when the operator clicks Accept. The dashboard saves
         the program through the existing /api/programs endpoint and
         hands us the slug; we record it as the highest-value training
-        signal."""
-        self.store.save_correction(demo_id, corrected_program, program_id=program_id)
+        signal — including any corrections the operator made to the
+        scene-extraction (objects/locations/spatial summary) which is
+        a separate supervised target for the future on-Jetson model."""
+        self.store.save_correction(
+            demo_id, corrected_program,
+            program_id=program_id,
+            corrected_scene=corrected_scene,
+            corrected_intent=corrected_intent,
+        )
         return {'ok': True, 'demo_id': demo_id, 'program_id': program_id}
 
     # ── Internals ──────────────────────────────────────────────────

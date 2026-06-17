@@ -136,16 +136,28 @@ class LearningStore:
         self._upsert_index_from_meta(demo_id, meta)
 
     def save_correction(self, demo_id: str, corrected_program: Dict[str, Any],
-                        program_id: Optional[str] = None) -> None:
+                        program_id: Optional[str] = None,
+                        corrected_scene: Optional[Dict[str, Any]] = None,
+                        corrected_intent: Optional[Dict[str, Any]] = None) -> None:
         """Write the human-corrected program — the highest-value signal
         for training the future local model. ALWAYS write the file even
-        if it matches the draft exactly (confirms the AI was right)."""
+        if it matches the draft exactly (confirms the AI was right).
+
+        `corrected_scene` (optional) is the operator-corrected Scene
+        block — captured separately so the future local model can train
+        on scene-extraction targets, not just the final program.
+        `corrected_intent` (optional) is the full intent object the
+        operator confirmed; we persist it under the same demo dir."""
         d = self.ensure_demo_dir(demo_id)
         payload = {
             'corrected_at':      now_iso(),
             'program':           corrected_program,
             'program_id':        program_id,
         }
+        if corrected_scene is not None:
+            payload['scene'] = corrected_scene
+        if corrected_intent is not None:
+            payload['intent'] = corrected_intent
         with open(os.path.join(d, 'human_corrected.json'), 'w') as f:
             json.dump(payload, f, indent=2)
         # Mark the index correction-made + record the saved program id.

@@ -2610,6 +2610,96 @@ if FASTAPI_AVAILABLE:
             "is_defect":   is_defect,
         }
 
+    # ── Tablet-camera "STEP + Video Teach" scan endpoints ─────────────
+    # The tablet has no depth, so scale is anchored to the part's STEP
+    # geometry (extents_cm in metadata). The full pipeline lives in
+    # scan_capture.py — endpoints are thin JSON wrappers.
+
+    async def _read_jpeg_body(request: Request) -> bytes | None:
+        """Accept either a raw JPEG (application/octet-stream / image/jpeg)
+        or a multipart form with a `frame` file field. Returns the JPEG
+        bytes or None when nothing usable came through."""
+        ct = (request.headers.get('content-type') or '').lower()
+        if ct.startswith('multipart/'):
+            try:
+                form = await request.form()
+                f = form.get('frame') or form.get('file')
+                if hasattr(f, 'read'):
+                    return await f.read()
+            except Exception:
+                return None
+            return None
+        # Raw body — image/jpeg, application/octet-stream, or unspecified.
+        try:
+            body = await request.body()
+        except Exception:
+            return None
+        return body if body else None
+
+    @app.post("/api/parts/{part_id}/scan/bg")
+    async def api_parts_scan_bg(part_id: str, request: Request):
+        """Capture the empty-surface background frame the scan loop
+        will diff against. Body is multipart/form-data with field
+        `frame` carrying a JPEG, OR raw application/octet-stream
+        JPEG bytes. Returns frame dimensions on success."""
+        if not os.path.isfile(f'/opt/cobot/parts/metadata/{part_id}.json'):
+            return JSONResponse({"error": "part not found"}, status_code=404)
+        try:
+            from . import scan_capture
+        except ImportError:
+            import scan_capture  # type: ignore
+        jpeg = await _read_jpeg_body(request)
+        if jpeg is None:
+            return JSONResponse({"error": "no JPEG body"}, status_code=400)
+        return scan_capture.set_background(part_id, jpeg)
+
+    @app.post("/api/parts/{part_id}/scan/frame")
+    async def api_parts_scan_frame(part_id: str, request: Request,
+                                   orientation: str = 'pickable',
+                                   orientation_number: int = 0,
+                                   orientation_label: str = '',
+                                   is_pickable: bool = True):
+        """Ingest one tablet-camera frame. Backend runs the full scan
+        pipeline (blur reject, bg subtract, STEP-aspect cross-check,
+        yaw dedup) and on a kept frame writes a standard ref_NNN.npz
+        the existing matcher loader picks up. Returns the verdict +
+        running counters for the wizard's live UI."""
+        if not os.path.isfile(f'/opt/cobot/parts/metadata/{part_id}.json'):
+            return JSONResponse({"error": "part not found"}, status_code=404)
+        try:
+            from . import scan_capture
+        except ImportError:
+            import scan_capture  # type: ignore
+        jpeg = await _read_jpeg_body(request)
+        if jpeg is None:
+            return JSONResponse({"error": "no JPEG body"}, status_code=400)
+        if orientation not in ('pickable', 'flipped', 'on_side', 'non_pickable'):
+            orientation = 'pickable'
+        try:
+            return scan_capture.ingest_frame(
+                part_id, jpeg, orientation,
+                int(orientation_number), str(orientation_label or ''),
+                bool(is_pickable))
+        except Exception as e:
+            return JSONResponse({"error": f"scan failed: {e}"}, status_code=500)
+
+    @app.get("/api/parts/{part_id}/scan/status")
+    async def api_parts_scan_status(part_id: str):
+        try:
+            from . import scan_capture
+        except ImportError:
+            import scan_capture  # type: ignore
+        return scan_capture.session_status(part_id)
+
+    @app.post("/api/parts/{part_id}/scan/reset")
+    async def api_parts_scan_reset(part_id: str):
+        try:
+            from . import scan_capture
+        except ImportError:
+            import scan_capture  # type: ignore
+        scan_capture.reset_session(part_id)
+        return {"ok": True, "part_id": part_id}
+
     @app.get("/api/detections")
     async def api_detections():
         """Current detections snapshot — used by the executor's
@@ -3622,10 +3712,21 @@ if FASTAPI_AVAILABLE:
             program_id = slug
 
         # Write human_corrected.json — the highest-value signal for
-        # future training of the local model.
+        # future training of the local model. The body MAY include
+        # `scene` (the operator-corrected scene block) and `intent`
+        # (the full intent the operator confirmed) — both are
+        # persisted alongside the program as separate training
+        # targets.
+        corrected_scene  = body.get('scene')  if isinstance(body.get('scene'),  dict) else None
+        corrected_intent = body.get('intent') if isinstance(body.get('intent'), dict) else None
         try:
             store = _pbd_store()
-            store.save_correction(did, program, program_id=program_id)
+            store.save_correction(
+                did, program,
+                program_id=program_id,
+                corrected_scene=corrected_scene,
+                corrected_intent=corrected_intent,
+            )
         except Exception as e:
             return JSONResponse({"ok": False, "error": f"save_correction failed: {e}"},
                                 status_code=500)
@@ -3795,6 +3896,32 @@ if FASTAPI_AVAILABLE:
                 merged.pop(key, None)
         part['grasp'] = merged
 
+        # Open-vocabulary detection prompts (the panel that used to
+        # live in Cameras & LiDAR now lives in Part Recognition and
+        # is scoped to THIS part). Stored as a list of strings; the
+        # Test Detection control in the frontend posts the live
+        # subset to /api/openvocab/prompts so the NanoOWL node can
+        # pick it up immediately.
+        if 'openvocab_prompts' in body:
+            raw = body.get('openvocab_prompts') or []
+            if isinstance(raw, list):
+                cleaned = []
+                for p in raw:
+                    s = str(p).strip()
+                    if s and len(s) < 200:
+                        cleaned.append(s)
+                # De-dup while preserving order so the operator sees
+                # their chip order on the next load.
+                seen = set()
+                deduped = []
+                for s in cleaned:
+                    k = s.lower()
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    deduped.append(s)
+                part['openvocab_prompts'] = deduped[:16]
+
         # New architecture: when the pick direction is set, recompute
         # per-orientation feature signatures from the cached STEP
         # features doc. The signatures feed (future) orientation
@@ -3936,6 +4063,37 @@ if FASTAPI_AVAILABLE:
         # ArmViewer3D loads this first; the full GLB is the fallback.
         return _serve_robot_asset('S10-140_lite.glb', 'model/gltf-binary')
 
+    @app.get("/robot/assembly.glb")
+    async def robot_assembly_glb():
+        # Single-file assembled model — every link already in its
+        # correct world-space position from the SolidWorks export.
+        # ArmViewer3D loads THIS instead of the URDF + per-link GLBs
+        # because the per-link split scattered on the dashboard
+        # (origins baked into world space, not per-link). Once the
+        # official Estun URDF + per-link meshes arrive we'll move
+        # back to the articulated path.
+        #
+        # Preferred file: s10-140_tablet.glb — produced by
+        # `gltf-transform weld → simplify --ratio 0.08 --error 0.01
+        #  → draco` from the 294 k-triangle ECO source. The result
+        # is 26.7 k triangles (~9 % of the ECO), 192 KB on the wire,
+        # which the ONN 11" tablet GPU can hold without OOM. Falls
+        # back to S10-140_lite.glb then the ECO source if the tablet
+        # build is missing. `Content-Encoding: identity` blocks any
+        # future gzip middleware from corrupting the Draco payload.
+        for name in ('s10-140_tablet.glb',
+                     'S10-140_lite.glb',
+                     's10-140_-eco_.glb'):
+            path = _resolve_robot_asset(name)
+            if path and os.path.isfile(path):
+                return FileResponse(
+                    path,
+                    media_type='model/gltf-binary',
+                    headers={'Content-Encoding': 'identity'},
+                )
+        return JSONResponse({"detail": "assembly not available"},
+                            status_code=404)
+
     @app.get("/robot/model.stl")
     async def robot_model_stl():
         return _serve_robot_asset('S10-140.stl', 'application/sla')
@@ -3956,6 +4114,18 @@ if FASTAPI_AVAILABLE:
     async def robot_links_json():
         # Lives under links/ to keep the articulation files grouped.
         return _serve_robot_asset('links/links.json', 'application/json')
+
+    @app.get("/robot/urdf")
+    async def robot_urdf():
+        # The URDF references its meshes with package:// URIs that the
+        # frontend's urdf-loader resolves via a packages map pointing
+        # at /robot/, so this single route is enough — meshes ride on
+        # the existing /robot/links/{filename} endpoint below.
+        # The "provisional" file is the manual-derived URDF with the
+        # corrected §9.1 zero-pose offsets (J3/J5 rpy −π/2) and the
+        # 231 mm elbow lateral. Swap back to s10-140.urdf if the older
+        # geometry needs to be reproduced for comparison.
+        return _serve_robot_asset('s10-140-provisional.urdf', 'application/xml')
 
     @app.get("/robot/links/{filename}")
     async def robot_link_file(filename: str):
@@ -5166,6 +5336,526 @@ if FASTAPI_AVAILABLE:
             pass
         finally:
             _lidar_event_clients.discard(websocket)
+
+    # ------------------------------------------------------------------
+    # Cell profiles (Setup / Commissioning Wizard)
+    # ------------------------------------------------------------------
+    # A "cell" is a commissioned robot workspace. Stored on disk under
+    # /opt/cobot/cells/{cell_id}/. The index file tracks ordering and
+    # which cell is currently active.
+    _CELLS_DIR  = '/opt/cobot/cells'
+    _CELLS_INDEX = os.path.join(_CELLS_DIR, 'index.json')
+    _cell_lock = threading.Lock()
+    _baseline_sessions: dict = {}
+    _baseline_lock = threading.Lock()
+
+    def _cells_load_index():
+        try:
+            os.makedirs(_CELLS_DIR, exist_ok=True)
+        except Exception:
+            pass
+        if not os.path.isfile(_CELLS_INDEX):
+            return {'active_cell_id': None, 'cells': []}
+        try:
+            with open(_CELLS_INDEX) as f:
+                data = json.load(f)
+            if not isinstance(data, dict): return {'active_cell_id': None, 'cells': []}
+            data.setdefault('active_cell_id', None)
+            data.setdefault('cells', [])
+            return data
+        except Exception:
+            return {'active_cell_id': None, 'cells': []}
+
+    def _cells_save_index(data):
+        os.makedirs(_CELLS_DIR, exist_ok=True)
+        tmp = _CELLS_INDEX + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, _CELLS_INDEX)
+
+    def _cell_dir(cell_id: str) -> str:
+        return os.path.join(_CELLS_DIR, cell_id)
+
+    def _cell_profile_path(cell_id: str) -> str:
+        return os.path.join(_cell_dir(cell_id), 'profile.json')
+
+    def _cell_load_profile(cell_id: str):
+        path = _cell_profile_path(cell_id)
+        if not os.path.isfile(path): return None
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _cell_save_profile(profile: dict):
+        cid = profile['cell_id']
+        os.makedirs(_cell_dir(cid), exist_ok=True)
+        tmp = _cell_profile_path(cid) + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(profile, f, indent=2)
+        os.replace(tmp, _cell_profile_path(cid))
+
+    def _cell_default_profile(name: str) -> dict:
+        # LiDAR is rigidly mounted on the robot base — the LiDAR↔base
+        # transform is a code constant, not a per-cell value, so the
+        # profile no longer carries robot_base_position. The robot
+        # base IS the world origin.
+        import uuid as _uuid
+        ts = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+        return {
+            'cell_id':      _uuid.uuid4().hex[:12],
+            'name':         name,
+            'created_at':   ts,
+            'updated_at':   ts,
+            'workspace_bounds':    {'x_min': -0.6, 'x_max': 0.6,
+                                    'y_min': -0.6, 'y_max': 0.6,
+                                    'z_min': 0.0,  'z_max': 0.8},
+            'baseline_captured':   False,
+            'baseline_point_count': 0,
+            'baseline_path':       'baseline_cloud.pcd',
+            'calibration':         {'hand_eye_done': False},
+            'commissioning_complete': False,
+            'steps_completed':     [],
+        }
+
+    def _cell_program_count(cell_id: str) -> int:
+        try:
+            n = 0
+            if not os.path.isdir(_PROG_DIR): return 0
+            for fn in os.listdir(_PROG_DIR):
+                if not fn.endswith('.json') or fn.startswith('_'):
+                    continue
+                try:
+                    with open(os.path.join(_PROG_DIR, fn)) as fp:
+                        prog = json.load(fp)
+                    if prog.get('cell_id') == cell_id:
+                        n += 1
+                except Exception:
+                    continue
+            return n
+        except Exception:
+            return 0
+
+    @app.get("/api/cells")
+    async def api_cells_list():
+        idx = _cells_load_index()
+        out = []
+        for cell_id in idx.get('cells', []):
+            prof = _cell_load_profile(cell_id)
+            if prof:
+                out.append({
+                    'cell_id':                prof.get('cell_id'),
+                    'name':                   prof.get('name'),
+                    'created_at':             prof.get('created_at'),
+                    'updated_at':             prof.get('updated_at'),
+                    'baseline_captured':      bool(prof.get('baseline_captured')),
+                    'baseline_point_count':   int(prof.get('baseline_point_count') or 0),
+                    'commissioning_complete': bool(prof.get('commissioning_complete')),
+                    'is_active':              prof.get('cell_id') == idx.get('active_cell_id'),
+                    'program_count':          _cell_program_count(prof.get('cell_id')),
+                })
+        return {'active_cell_id': idx.get('active_cell_id'), 'cells': out}
+
+    @app.get("/api/cells/{cell_id}/programs")
+    async def api_cells_programs(cell_id: str):
+        """List every program tagged with this cell_id. Lightweight
+        projection of the existing /api/programs listing — cell membership
+        is just the cell_id field on the program JSON."""
+        if not _cell_load_profile(cell_id):
+            return JSONResponse({'error': 'cell not found'}, status_code=404)
+        out = []
+        try:
+            if os.path.isdir(_PROG_DIR):
+                for fn in sorted(os.listdir(_PROG_DIR)):
+                    if not fn.endswith('.json') or fn.startswith('_'):
+                        continue
+                    try:
+                        with open(os.path.join(_PROG_DIR, fn)) as fp:
+                            prog = json.load(fp)
+                    except Exception:
+                        continue
+                    if prog.get('cell_id') != cell_id:
+                        continue
+                    out.append({
+                        'id':          fn[:-5],
+                        'name':        prog.get('name') or fn[:-5],
+                        'description': prog.get('description') or '',
+                        'steps':       len(prog.get('steps') or []),
+                        'tags':        prog.get('tags') or [],
+                        'updated':     prog.get('updated') or prog.get('created') or '',
+                        'folder':      prog.get('folder'),
+                    })
+        except Exception:
+            pass
+        return {'cell_id': cell_id, 'programs': out}
+
+    @app.get("/api/cells/active")
+    async def api_cells_active():
+        idx = _cells_load_index()
+        cid = idx.get('active_cell_id')
+        if not cid:
+            return {'active_cell_id': None, 'cell': None}
+        prof = _cell_load_profile(cid)
+        return {'active_cell_id': cid, 'cell': prof}
+
+    @app.post("/api/cells")
+    async def api_cells_create(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        name = str(body.get('name') or '').strip() or 'Untitled Cell'
+        prof = _cell_default_profile(name)
+        with _cell_lock:
+            _cell_save_profile(prof)
+            idx = _cells_load_index()
+            if prof['cell_id'] not in idx['cells']:
+                idx['cells'].append(prof['cell_id'])
+            if idx.get('active_cell_id') is None:
+                idx['active_cell_id'] = prof['cell_id']
+            _cells_save_index(idx)
+        return {'ok': True, 'cell': prof}
+
+    @app.get("/api/cells/{cell_id}")
+    async def api_cells_get(cell_id: str):
+        prof = _cell_load_profile(cell_id)
+        if not prof:
+            return JSONResponse({'error': 'not found'}, status_code=404)
+        idx = _cells_load_index()
+        prof = dict(prof)
+        prof['is_active'] = prof.get('cell_id') == idx.get('active_cell_id')
+        return prof
+
+    @app.put("/api/cells/{cell_id}")
+    async def api_cells_update(cell_id: str, request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({'error': 'invalid JSON body'}, status_code=400)
+        with _cell_lock:
+            prof = _cell_load_profile(cell_id)
+            if not prof:
+                return JSONResponse({'error': 'not found'}, status_code=404)
+            for k in ('name', 'workspace_bounds',
+                      'calibration', 'steps_completed',
+                      'commissioning_complete'):
+                if k in body:
+                    prof[k] = body[k]
+            prof['cell_id']    = cell_id
+            prof['updated_at'] = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+            _cell_save_profile(prof)
+        return {'ok': True, 'cell': prof}
+
+    @app.delete("/api/cells/{cell_id}")
+    async def api_cells_delete(cell_id: str):
+        with _cell_lock:
+            idx = _cells_load_index()
+            if cell_id not in idx.get('cells', []):
+                return JSONResponse({'error': 'not found'}, status_code=404)
+            idx['cells'] = [c for c in idx['cells'] if c != cell_id]
+            if idx.get('active_cell_id') == cell_id:
+                idx['active_cell_id'] = idx['cells'][0] if idx['cells'] else None
+            _cells_save_index(idx)
+            try:
+                import shutil
+                shutil.rmtree(_cell_dir(cell_id), ignore_errors=True)
+            except Exception:
+                pass
+        with _baseline_lock:
+            _baseline_sessions.pop(cell_id, None)
+        return {'ok': True, 'active_cell_id': idx.get('active_cell_id')}
+
+    @app.post("/api/cells/{cell_id}/activate")
+    async def api_cells_activate(cell_id: str):
+        with _cell_lock:
+            prof = _cell_load_profile(cell_id)
+            if not prof:
+                return JSONResponse({'error': 'not found'}, status_code=404)
+            idx = _cells_load_index()
+            idx['active_cell_id'] = cell_id
+            _cells_save_index(idx)
+        return {'ok': True, 'active_cell_id': cell_id}
+
+    # Baseline capture — subscribes (read-only) to the latest /lidar/points_dense
+    # snapshot accumulated by the dashboard's own LidarNode, accumulates across
+    # the requested duration, voxel-downsamples with open3d if available, and
+    # writes baseline_cloud.pcd into the cell directory.
+    def _baseline_capture_worker(cell_id: str, duration_s: float, voxel_m: float):
+        sess = _baseline_sessions.get(cell_id)
+        if sess is None: return
+        sess['status']   = 'capturing'
+        sess['started']  = time.time()
+        sess['duration'] = duration_s
+        sess['frames']   = 0
+        sess['pts_collected'] = 0
+        accumulated: list = []
+        last_seen_id = None
+        deadline = sess['started'] + duration_s
+        try:
+            while time.time() < deadline:
+                with _lidar_lock:
+                    pts = _lidar_state.get('pts')
+                if pts is not None:
+                    seen_id = id(pts)
+                    if seen_id != last_seen_id:
+                        if _np is not None and isinstance(pts, _np.ndarray):
+                            arr = pts.reshape(-1, 3) if pts.ndim == 1 else pts
+                            accumulated.append(arr.astype('float32', copy=False))
+                            sess['frames'] += 1
+                            sess['pts_collected'] += int(arr.shape[0])
+                        last_seen_id = seen_id
+                sess['progress'] = min(1.0, (time.time() - sess['started']) / max(0.001, duration_s))
+                time.sleep(0.1)
+            if not accumulated:
+                sess['status'] = 'error'
+                sess['error']  = 'no LiDAR frames received (is /lidar/points_dense publishing?)'
+                return
+            sess['status'] = 'saving'
+            combined = _np.concatenate(accumulated, axis=0) if _np is not None else None
+            final_path = os.path.join(_cell_dir(cell_id), 'baseline_cloud.pcd')
+            final_pts  = int(combined.shape[0]) if combined is not None else 0
+            voxeled_count = final_pts
+            try:
+                import open3d as _o3d
+                pcd = _o3d.geometry.PointCloud()
+                pcd.points = _o3d.utility.Vector3dVector(combined.astype('float64'))
+                voxeled = pcd.voxel_down_sample(voxel_m) if voxel_m > 0 else pcd
+                voxeled_count = len(voxeled.points)
+                os.makedirs(_cell_dir(cell_id), exist_ok=True)
+                _o3d.io.write_point_cloud(final_path, voxeled, write_ascii=False)
+            except Exception as e:
+                # fallback: write ASCII PCD by hand if open3d failed
+                try:
+                    os.makedirs(_cell_dir(cell_id), exist_ok=True)
+                    n = int(combined.shape[0])
+                    with open(final_path, 'w') as f:
+                        f.write('# .PCD v0.7 - Point Cloud Data file format\n')
+                        f.write('VERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\n')
+                        f.write('TYPE F F F\nCOUNT 1 1 1\n')
+                        f.write(f'WIDTH {n}\nHEIGHT 1\n')
+                        f.write('VIEWPOINT 0 0 0 1 0 0 0\n')
+                        f.write(f'POINTS {n}\nDATA ascii\n')
+                        for r in combined:
+                            f.write(f'{r[0]} {r[1]} {r[2]}\n')
+                except Exception as e2:
+                    sess['status'] = 'error'
+                    sess['error']  = f'PCD write failed: {e}; fallback failed: {e2}'
+                    return
+            # Update the cell profile with baseline metadata
+            with _cell_lock:
+                prof = _cell_load_profile(cell_id)
+                if prof:
+                    prof['baseline_captured']    = True
+                    prof['baseline_point_count'] = int(voxeled_count)
+                    prof['baseline_path']        = 'baseline_cloud.pcd'
+                    prof['updated_at']           = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+                    if 'baseline' not in prof.get('steps_completed', []):
+                        prof.setdefault('steps_completed', []).append('baseline')
+                    _cell_save_profile(prof)
+            sess['status']    = 'done'
+            sess['final_count'] = int(voxeled_count)
+        except Exception as e:
+            sess['status'] = 'error'
+            sess['error']  = f'baseline capture crashed: {e}'
+
+    @app.post("/api/cells/{cell_id}/baseline")
+    async def api_cells_baseline_start(cell_id: str, request: Request):
+        prof = _cell_load_profile(cell_id)
+        if not prof:
+            return JSONResponse({'error': 'cell not found'}, status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        duration_s = float(body.get('duration_s') or 10.0)
+        duration_s = max(2.0, min(60.0, duration_s))
+        voxel_m    = float(body.get('voxel_m') or 0.01)
+        with _baseline_lock:
+            existing = _baseline_sessions.get(cell_id)
+            if existing and existing.get('status') in ('capturing', 'saving'):
+                return JSONResponse({'error': 'capture already in progress',
+                                     'session': existing}, status_code=409)
+            sess = {'status': 'starting', 'cell_id': cell_id,
+                    'duration': duration_s, 'voxel_m': voxel_m,
+                    'frames': 0, 'pts_collected': 0, 'progress': 0.0,
+                    'final_count': 0, 'started': time.time(), 'error': None}
+            _baseline_sessions[cell_id] = sess
+        t = threading.Thread(target=_baseline_capture_worker,
+                             args=(cell_id, duration_s, voxel_m), daemon=True)
+        t.start()
+        return {'ok': True, 'session': sess}
+
+    @app.get("/api/cells/{cell_id}/baseline/cloud")
+    async def api_cells_baseline_cloud(cell_id: str, max_points: int = 50000):
+        """Return the saved baseline point cloud for in-browser rendering.
+        Loaded from baseline_cloud.pcd, voxel-downsampled to keep the
+        response small enough for the SPA's PointCloud component. The
+        payload uses the same {n, p:[x0,y0,z0,...]} shape that the
+        live /ws/lidar broadcast already speaks."""
+        prof = _cell_load_profile(cell_id)
+        if not prof:
+            return JSONResponse({'error': 'cell not found'}, status_code=404)
+        pcd_name = prof.get('baseline_path') or 'baseline_cloud.pcd'
+        path = os.path.join(_cell_dir(cell_id), pcd_name)
+        if not os.path.isfile(path):
+            return JSONResponse({'error': 'baseline not captured',
+                                 'baseline_captured': False}, status_code=404)
+        max_points = max(1000, min(int(max_points), 200000))
+        try:
+            import open3d as _o3d
+            pcd = _o3d.io.read_point_cloud(path)
+            pts = _np.asarray(pcd.points, dtype='float32') if _np is not None else None
+            if pts is None or pts.size == 0:
+                return {'cell_id': cell_id, 'n': 0, 'p': [], 'source': 'baseline_cloud.pcd'}
+            if pts.shape[0] > max_points:
+                voxel = float(prof.get('baseline_voxel_m') or 0.01)
+                tries = 0
+                while pts.shape[0] > max_points and tries < 6:
+                    voxel *= 1.6
+                    pcd2 = _o3d.geometry.PointCloud()
+                    pcd2.points = _o3d.utility.Vector3dVector(pts.astype('float64'))
+                    pcd2 = pcd2.voxel_down_sample(voxel)
+                    pts = _np.asarray(pcd2.points, dtype='float32')
+                    tries += 1
+            return {
+                'cell_id':           cell_id,
+                'n':                 int(pts.shape[0]),
+                'p':                 pts.flatten().tolist(),
+                'total_in_file':     int(prof.get('baseline_point_count') or 0),
+                'captured_at':       prof.get('updated_at'),
+                'source':            'baseline_cloud.pcd',
+            }
+        except Exception as e:
+            return JSONResponse({'error': f'pcd read failed: {e}'}, status_code=500)
+
+    @app.get("/api/cells/{cell_id}/baseline/status")
+    async def api_cells_baseline_status(cell_id: str):
+        sess = _baseline_sessions.get(cell_id)
+        if sess is None:
+            return {'status': 'idle', 'cell_id': cell_id}
+        out = dict(sess)
+        if sess.get('started'):
+            out['elapsed_s'] = round(time.time() - sess['started'], 2)
+        return out
+
+    # ── Static keep-out zones (built from the cell's saved baseline) ──
+    # Reuses the live LiDAR clustering / OBB code; see static_zones.py.
+
+    def _import_static_zones():
+        try:
+            from . import static_zones as _sz  # type: ignore
+        except ImportError:
+            import static_zones as _sz  # type: ignore
+        return _sz
+
+    @app.post("/api/cells/{cell_id}/collision_zones/build")
+    async def api_cells_zones_build(cell_id: str, request: Request):
+        """Cluster the cell's baseline cloud into static keep-out
+        boxes and persist them. Body (optional JSON) lets the
+        operator override the default cluster tolerance / margin /
+        thresholds; omitted fields fall back to DEFAULTS."""
+        _sz = _import_static_zones()
+        pcd_path = _sz.baseline_pcd_path(cell_id)
+        if not os.path.isfile(pcd_path):
+            return JSONResponse({
+                'ok': False,
+                'reason': 'no_baseline',
+                'message': 'This cell has no saved baseline. Capture one in the wizard first.',
+            }, status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        params = body if isinstance(body, dict) else {}
+        try:
+            result = _sz.build_zones_from_pcd(pcd_path, params=params)
+        except Exception as e:
+            return JSONResponse({
+                'ok': False, 'reason': 'build_failed', 'message': str(e),
+            }, status_code=500)
+        try:
+            _sz.save_zones(cell_id, result)
+        except Exception as e:
+            return JSONResponse({
+                'ok': False, 'reason': 'save_failed', 'message': str(e),
+            }, status_code=500)
+        # Notify the collision_monitor so the new boxes start flowing
+        # through /collision/objects on the next tick. Best-effort —
+        # if the publisher isn't wired we still saved the file.
+        try:
+            if _ros_node is not None:
+                m = String()
+                m.data = json.dumps({'action': 'reload', 'cell_id': cell_id})
+                # Lazily create the publisher on first use; cached on
+                # the node so subsequent reloads reuse it.
+                pub = getattr(_ros_node, '_collision_reload_pub', None)
+                if pub is None:
+                    pub = _ros_node.create_publisher(String, '/collision/reload', 5)
+                    _ros_node._collision_reload_pub = pub
+                pub.publish(m)
+        except Exception:
+            pass
+        return {
+            'ok':         True,
+            'cell_id':    cell_id,
+            'n_zones':    result.get('n_zones', 0),
+            'built_at':   result.get('built_at'),
+            'elapsed_s':  result.get('elapsed_s'),
+            'diag':       {k: v for k, v in result.items()
+                           if k not in ('zones', 'params')},
+        }
+
+    @app.get("/api/cells/{cell_id}/collision_zones")
+    async def api_cells_zones_get(cell_id: str):
+        _sz = _import_static_zones()
+        data = _sz.load_zones(cell_id)
+        if data is None:
+            return {'ok': True, 'cell_id': cell_id, 'has_zones': False,
+                    'zones': []}
+        data.setdefault('ok', True)
+        data['has_zones'] = True
+        return data
+
+    @app.delete("/api/cells/{cell_id}/collision_zones")
+    async def api_cells_zones_clear(cell_id: str):
+        _sz = _import_static_zones()
+        removed = _sz.clear_zones(cell_id)
+        try:
+            if _ros_node is not None:
+                m = String()
+                m.data = json.dumps({'action': 'reload', 'cell_id': cell_id})
+                pub = getattr(_ros_node, '_collision_reload_pub', None)
+                if pub is None:
+                    pub = _ros_node.create_publisher(String, '/collision/reload', 5)
+                    _ros_node._collision_reload_pub = pub
+                pub.publish(m)
+        except Exception:
+            pass
+        return {'ok': True, 'cell_id': cell_id, 'removed': removed}
+
+    @app.get("/api/collision/static_zones")
+    async def api_collision_static_zones():
+        """Return the active cell's persisted static zones. Used by
+        the 3D viewer + diagnostics so they can fall back to the
+        on-disk source when collision_monitor's /collision/objects
+        feed isn't yet streaming static boxes (e.g. headless dev)."""
+        _sz = _import_static_zones()
+        idx = _cells_load_index()
+        cid = idx.get('active_cell_id')
+        if not cid:
+            return {'ok': True, 'cell_id': None, 'has_zones': False, 'zones': []}
+        data = _sz.load_zones(cid)
+        if data is None:
+            return {'ok': True, 'cell_id': cid, 'has_zones': False, 'zones': []}
+        return {
+            'ok':       True,
+            'cell_id':  cid,
+            'has_zones': True,
+            'built_at': data.get('built_at'),
+            'n_zones':  data.get('n_zones', len(data.get('zones', []))),
+            'zones':    data.get('zones', []),
+        }
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):

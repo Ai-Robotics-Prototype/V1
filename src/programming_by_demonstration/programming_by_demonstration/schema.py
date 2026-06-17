@@ -91,10 +91,100 @@ class IntentOperation:
         return d
 
 
+# ── Scene extraction ────────────────────────────────────────────────
+# v1 captures only the CORE scene: what objects are present, what named
+# locations are referenced, and a free-text spatial summary. Metric
+# poses stay out by design — those land later when the MotionCam
+# recognition stack resolves them on the real workspace.
+#
+# Every field carries a `source` tag — "video" | "narration" | "both"
+# — so the human reviewer (and the future local model) can see where
+# each piece of understanding came from. "both" means video + voice
+# agreed, which is the highest-confidence signal.
+
+SOURCE_VIDEO     = 'video'
+SOURCE_NARRATION = 'narration'
+SOURCE_BOTH      = 'both'
+
+
+@dataclass
+class SceneObject:
+    """One object recognised in the demonstration."""
+    label: str = ''
+    matched_part_id: Optional[str] = None       # real library id or None
+    matched_part_name: Optional[str] = None
+    match_confidence: float = 0.0
+    source: str = SOURCE_BOTH                   # video|narration|both
+    approx_location: str = ''                   # verbal, NOT metric
+    count_seen: Any = 1                         # int OR "multiple"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class SceneLocation:
+    """A named place referenced in the demonstration (pick/place/fixture)."""
+    label: str = ''
+    role: str = 'other'                         # place_target|pick_source|fixture|other
+    approx_position: str = ''                   # verbal
+    source: str = SOURCE_BOTH
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class Scene:
+    """Combined video+narration scene understanding."""
+    objects: List[SceneObject] = field(default_factory=list)
+    locations: List[SceneLocation] = field(default_factory=list)
+    spatial_summary: str = ''
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'objects':         [o.to_dict() for o in self.objects],
+            'locations':       [l.to_dict() for l in self.locations],
+            'spatial_summary': self.spatial_summary,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> 'Scene':
+        if not d:
+            return cls()
+        objs: List[SceneObject] = []
+        for raw in (d.get('objects') or []):
+            objs.append(SceneObject(
+                label=str(raw.get('label') or ''),
+                matched_part_id=(str(raw['matched_part_id'])
+                                 if raw.get('matched_part_id') else None),
+                matched_part_name=(str(raw['matched_part_name'])
+                                   if raw.get('matched_part_name') else None),
+                match_confidence=float(raw.get('match_confidence') or 0.0),
+                source=str(raw.get('source') or SOURCE_BOTH),
+                approx_location=str(raw.get('approx_location') or ''),
+                count_seen=raw.get('count_seen', 1),
+            ))
+        locs: List[SceneLocation] = []
+        for raw in (d.get('locations') or []):
+            locs.append(SceneLocation(
+                label=str(raw.get('label') or ''),
+                role=str(raw.get('role') or 'other'),
+                approx_position=str(raw.get('approx_position') or ''),
+                source=str(raw.get('source') or SOURCE_BOTH),
+            ))
+        return cls(
+            objects=objs,
+            locations=locs,
+            spatial_summary=str(d.get('spatial_summary') or ''),
+        )
+
+
 @dataclass
 class StructuredIntent:
     """Grounded interpretation of one demonstration."""
     task_summary: str = ''
+    scene: Scene = field(default_factory=Scene)
     operations: List[IntentOperation] = field(default_factory=list)
     ambiguities: List[str] = field(default_factory=list)
     confidence_overall: float = 0.0
@@ -106,6 +196,7 @@ class StructuredIntent:
     def to_dict(self) -> Dict[str, Any]:
         return {
             'task_summary':            self.task_summary,
+            'scene':                   self.scene.to_dict(),
             'operations':              [op.to_dict() for op in self.operations],
             'ambiguities':             list(self.ambiguities),
             'confidence_overall':      float(self.confidence_overall),
@@ -148,6 +239,7 @@ class StructuredIntent:
             ))
         return cls(
             task_summary=str(d.get('task_summary') or ''),
+            scene=Scene.from_dict(d.get('scene') or {}),
             operations=ops,
             ambiguities=list(d.get('ambiguities') or []),
             confidence_overall=float(d.get('confidence_overall') or 0.0),

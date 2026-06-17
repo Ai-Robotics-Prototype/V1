@@ -196,14 +196,26 @@ function CellSetupSection() {
 
   const [data, setData] = useState({ active_cell_id: null, cells: [] })
   const [busy, setBusy] = useState(false)
+  // Shared active-cell store — Configure is the writer; the 3D View
+  // and other cell-scoped consumers subscribe so they reflect the
+  // change instantly without polling.
+  const setActiveCellId = useStore((s) => s.setActiveCellId)
+  const storeActiveId   = useStore((s) => s.activeCellId)
 
   const refresh = useCallback(async () => {
     try {
       const r = await fetch('/api/cells')
       const j = await r.json()
       setData(j)
+      // Reconcile the shared store with the freshly-listed cells so
+      // a delete / activate that changed state on the backend doesn't
+      // leave the store pointing at a ghost id.
+      if ((j?.active_cell_id || null) !== storeActiveId) {
+        const cell = (j?.cells || []).find((c) => c.cell_id === j?.active_cell_id) || null
+        setActiveCellId(j?.active_cell_id || null, cell)
+      }
     } catch {}
-  }, [])
+  }, [storeActiveId, setActiveCellId])
 
   useEffect(() => { refresh() }, [refresh])
 
@@ -215,6 +227,13 @@ function CellSetupSection() {
     setBusy(true)
     try {
       await fetch(`/api/cells/${cellId}/activate`, { method: 'POST' })
+      // Write the new active id into the shared store immediately so
+      // the 3D View (and ProgramWizard etc.) flip without waiting for
+      // the next refresh / poll. Pull the corresponding cell payload
+      // from the cached `data.cells` list when we have it so the
+      // baseline_captured flag is up to date.
+      const cellPayload = (data?.cells || []).find((c) => c.cell_id === cellId) || null
+      setActiveCellId(cellId, cellPayload)
       await refresh()
     } finally { setBusy(false) }
   }

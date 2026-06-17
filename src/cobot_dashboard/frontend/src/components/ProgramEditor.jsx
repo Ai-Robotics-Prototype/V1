@@ -58,8 +58,16 @@ const TEACHABLE_ACTIONS = [
 // covers older saved programs that were generated before the tag
 // existed (their descend/lift had offset_z_mm set and no taught data of
 // their own, which uniquely identifies them as wizard-derived).
+//
+// Override semantics: a derived step can be manually overridden by the
+// operator (overridden:true + its own taught_tcp). When overridden, we
+// stop treating it as auto-derived so the editor exposes pose inputs
+// and the Teach button works on it directly. The executor also reads
+// the overridden taught_tcp instead of base+offset (see
+// program_executor_node.py _resolve_base_tcp call site).
 function isDerivedOffsetMove(step) {
   if (!step) return false
+  if (step.overridden) return false
   if (step.derived_from) return true
   const isMoveLinear = step.action === 'move_linear' || step.type === 'move'
   if (!isMoveLinear) return false
@@ -67,6 +75,57 @@ function isDerivedOffsetMove(step) {
   const hasJoints = Array.isArray(step.taught_joints) && step.taught_joints.length >= 6
   const hasTcp    = Array.isArray(step.taught_tcp)    && step.taught_tcp.length    >= 3
   return !hasJoints && !hasTcp
+}
+
+// True when this step has been derived but the operator manually
+// overrode the pose. Used by the editor to badge the row and surface
+// the Reset-to-auto control.
+function isDerivedOverridden(step) {
+  if (!step) return false
+  if (!step.overridden) return false
+  return step.derived_from != null
+}
+
+// True when this step is a source-of-link for derived steps (the
+// operator's teach point that descend/lift/retract use as the base).
+function isPoseSource(step) {
+  if (!step) return false
+  if (!step.position_role) return false
+  return ['pick', 'place', 'home'].includes(step.position_role)
+}
+
+// Resolve the auto-derived pose for a derived step from the surrounding
+// step list. Mirrors program_executor_node._resolve_base_tcp on the JS
+// side so the editor can show the operator what the runtime will land
+// at. Returns a 6-array [x,y,z,rx,ry,rz] in meters/radians, or null if
+// the link source isn't taught yet.
+function resolveDerivedPose(step, allSteps) {
+  if (!step || !Array.isArray(allSteps)) return null
+  const derivedFrom = step.derived_from
+  const idx = allSteps.findIndex((s) => s === step || s.id === step.id)
+  if (idx < 0) return null
+  // Walk backward looking for the source.
+  for (let i = idx - 1; i >= 0; i--) {
+    const src = allSteps[i]
+    if (derivedFrom != null) {
+      if (src.position_role !== derivedFrom) continue
+    }
+    const tcp = (Array.isArray(src.taught_tcp) ? src.taught_tcp
+                : Array.isArray(src.position)   ? src.position : null)
+    if (!tcp || tcp.length < 3) continue
+    const offsetMm = Number(step.offset_z_mm) || 0
+    // tcp from /api/state is in meters; convert offset mm → m.
+    const out = [
+      Number(tcp[0]) || 0,
+      Number(tcp[1]) || 0,
+      (Number(tcp[2]) || 0) + offsetMm / 1000,
+      Number(tcp[3]) || 0,
+      Number(tcp[4]) || 0,
+      Number(tcp[5]) || 0,
+    ]
+    return out
+  }
+  return null
 }
 
 function isTeachable(step) {
@@ -219,7 +278,292 @@ function IOPortSelector({ label, value, onChange, direction }) {
   )
 }
 
-function StepEditor({ step, onSave, onClose }) {
+// Pull the live robot pose from /api/state and shape it into the
+// {x,y,z,rx,ry,rz} TCP object the saved program stores.
+async function fetchTcpFromState() {
+  try {
+    const res = await fetch('/api/state')
+    if (!res.ok) return null
+    const state = await res.json()
+    const tcp = Array.isArray(state?.tcp_pose) ? state.tcp_pose : null
+    if (!tcp || tcp.length < 6) return null
+    return { x: tcp[0], y: tcp[1], z: tcp[2], rx: tcp[3], ry: tcp[4], rz: tcp[5] }
+  } catch {
+    return null
+  }
+}
+
+// Rebuild the move_to_pallet step list when pallet config changes. This
+// is a focused port of buildPalletizeSteps from ProgramWizard.jsx — we
+// only regenerate the inside-loop move_to_pallet step + the loop count;
+// the surrounding home / approach / pick / place skeleton is preserved
+// from the existing program so taught poses don't get clobbered.
+//
+// Returns the new steps array (renumbered downstream by the caller).
+function regenerateMoveToPalletSteps(steps, palletCfg, palletMode) {
+  if (!Array.isArray(steps)) return steps
+  const rows   = Number(palletCfg?.rows   ?? 4)
+  const cols   = Number(palletCfg?.cols   ?? 4)
+  const layers = Number(palletCfg?.layers ?? 1)
+  const cycles = Math.max(1, rows * cols * layers)
+  const mode   = palletMode === 'depalletize' ? 'depalletize' : 'palletize'
+  return steps.map((s) => {
+    if (s?.action === 'move_to_pallet') {
+      return { ...s, mode, pallet_phase: mode === 'palletize' ? 'place' : 'pick' }
+    }
+    if (s?.action === 'loop' && s.pallet_loop) {
+      return {
+        ...s,
+        goto: s.goto || 2,
+        count: cycles,
+        label: `Pallet loop — ${cycles} cycles (${rows} × ${cols} × ${layers})`,
+      }
+    }
+    return s
+  })
+}
+
+// PalletConfigEditor — modal for editing the program-level pallet
+// block (rows/cols/layers/spacing/fill order/heights + taught
+// corner TCP + taught pick/place TCP). Pre-fills from the program's
+// existing config; "Use current pose" buttons re-record TCPs from the
+// live robot. Save writes back through onSave; the parent regenerates
+// the steps + PUT's the program.
+function PalletConfigEditor({ config, onSave, onClose }) {
+  const initialMode = config?.pallet_mode === 'depalletize' ? 'depalletize' : 'palletize'
+  const initialPallet = (config?.pallet && typeof config.pallet === 'object') ? config.pallet : {}
+  const [mode,       setMode]       = useState(initialMode)
+  const [rows,       setRows]       = useState(Number(initialPallet.rows   ?? 4))
+  const [cols,       setCols]       = useState(Number(initialPallet.cols   ?? 4))
+  const [layers,     setLayers]     = useState(Number(initialPallet.layers ?? 1))
+  const [spacingX,   setSpacingX]   = useState(Number(initialPallet.spacing_x_mm   ?? 150))
+  const [spacingY,   setSpacingY]   = useState(Number(initialPallet.spacing_y_mm   ?? 150))
+  const [layerH,     setLayerH]     = useState(Number(initialPallet.layer_height_mm ?? 100))
+  const [fillOrder,  setFillOrder]  = useState(initialPallet.fill_order || 'row_lr')
+  const [approachH,  setApproachH]  = useState(Number(initialPallet.approach_height_mm ?? config?.pallet_approach_height_mm ?? 100))
+  const [retractH,   setRetractH]   = useState(Number(initialPallet.retract_height_mm  ?? config?.pallet_retract_height_mm  ?? 200))
+  const [speed,      setSpeed]      = useState(Number(config?.speed_pct ?? config?.speed ?? 60))
+  const [cornerTcp,  setCornerTcp]  = useState(initialPallet.corner_tcp || null)
+  const [pickTcp,    setPickTcp]    = useState(config?.pick_tcp || null)
+  const [placeTcp,   setPlaceTcp]   = useState(config?.place_tcp || null)
+  const [busy,       setBusy]       = useState(null)
+  const [error,      setError]      = useState(null)
+
+  const cycles = Math.max(1, rows * cols * layers)
+  const isDepal = mode === 'depalletize'
+
+  async function captureTcp(role) {
+    setBusy(role)
+    setError(null)
+    try {
+      const tcp = await fetchTcpFromState()
+      if (!tcp) {
+        setError('Could not read TCP from robot. Is the driver connected?')
+        return
+      }
+      if (role === 'corner') setCornerTcp(tcp)
+      else if (role === 'pick') setPickTcp(tcp)
+      else if (role === 'place') setPlaceTcp(tcp)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  function commit() {
+    const pallet = {
+      rows: Number(rows) || 1,
+      cols: Number(cols) || 1,
+      layers: Number(layers) || 1,
+      spacing_x_mm: Number(spacingX) || 0,
+      spacing_y_mm: Number(spacingY) || 0,
+      layer_height_mm: Number(layerH) || 0,
+      fill_order: fillOrder || 'row_lr',
+      corner_tcp: cornerTcp || { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0 },
+      approach_height_mm: Number(approachH) || 0,
+      retract_height_mm:  Number(retractH)  || 0,
+    }
+    onSave({
+      pallet,
+      pallet_mode: mode,
+      source: mode === 'palletize' ? 'camera_library' : 'fixed_grid',
+      speed_pct: Number(speed) || 60,
+      pick_tcp:  pickTcp  || undefined,
+      place_tcp: placeTcp || undefined,
+    })
+    onClose()
+  }
+
+  const fillOptions = [
+    { value: 'row_lr', label: 'Rows (left → right)' },
+    { value: 'row_rl', label: 'Rows (right → left)' },
+    { value: 'col',    label: 'Columns (front → back)' },
+    { value: 'snake',  label: 'Snake (alternate)' },
+  ]
+
+  const tcpRow = (label, tcp, role) => (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 8,
+      padding: '8px 10px', marginBottom: 6,
+      background: '#f8fafc', border: '1px solid #e5e7eb', borderRadius: 6,
+    }}>
+      <div style={{ minWidth: 110, fontSize: 11, fontWeight: 600, color: '#374151' }}>{label}</div>
+      <div style={{ flex: 1, fontSize: 11, color: tcp ? '#111' : '#9ca3af', fontFamily: 'var(--font-mono, monospace)' }}>
+        {tcp
+          ? `x=${(+tcp.x).toFixed(1)} y=${(+tcp.y).toFixed(1)} z=${(+tcp.z).toFixed(1)}  rx=${(+tcp.rx).toFixed(2)} ry=${(+tcp.ry).toFixed(2)} rz=${(+tcp.rz).toFixed(2)}`
+          : '— not taught'}
+      </div>
+      <button onClick={() => captureTcp(role)} disabled={busy === role}
+        style={{ padding: '5px 10px', fontSize: 11, fontWeight: 600,
+                 background: '#eff6ff', color: '#2563EB',
+                 border: '1px solid #bfdbfe', borderRadius: 4,
+                 cursor: busy === role ? 'wait' : 'pointer' }}>
+        {busy === role ? '...' : 'Use current pose'}
+      </button>
+    </div>
+  )
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.4)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      zIndex: 1200,
+    }}
+      onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#fff', borderRadius: 10, width: 'min(560px, 92vw)',
+          maxHeight: '90vh', display: 'flex', flexDirection: 'column',
+          boxShadow: '0 12px 48px rgba(0,0,0,0.18)',
+        }}>
+        <div style={{ padding: '14px 18px', borderBottom: '1px solid #e5e7eb',
+          display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{
+            fontSize: 10, fontWeight: 700, color: '#0f766e',
+            background: '#ccfbf1', padding: '2px 8px', borderRadius: 4,
+            letterSpacing: 0.5,
+          }}>PALLET</span>
+          <div style={{ fontSize: 14, fontWeight: 700, color: '#111' }}>
+            Edit pallet configuration
+          </div>
+          <div style={{ flex: 1 }} />
+          <button onClick={onClose}
+            style={{ padding: '4px 10px', fontSize: 11, background: '#f3f4f6',
+                     color: '#6b7280', border: '1px solid #d1d5db',
+                     borderRadius: 4, cursor: 'pointer' }}>Cancel</button>
+          <button onClick={commit}
+            style={{ padding: '4px 14px', fontSize: 11, fontWeight: 600,
+                     background: '#2563EB', color: '#fff', border: 'none',
+                     borderRadius: 4, cursor: 'pointer' }}>Save</button>
+        </div>
+
+        <div style={{ padding: 18, overflowY: 'auto' }}>
+          <Field label="Mode">
+            <div style={{ display: 'flex', gap: 6 }}>
+              {['palletize', 'depalletize'].map((m) => (
+                <button key={m} onClick={() => setMode(m)}
+                  style={{
+                    flex: 1, padding: '8px 12px', fontSize: 12, fontWeight: 600,
+                    background: mode === m ? '#eff6ff' : '#fff',
+                    color: mode === m ? '#2563EB' : '#374151',
+                    border: mode === m ? '2px solid #2563EB' : '1px solid #d1d5db',
+                    borderRadius: 5, cursor: 'pointer',
+                  }}>
+                  {m === 'palletize' ? 'PALLETIZE' : 'DEPALLETIZE'}
+                </button>
+              ))}
+            </div>
+          </Field>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+            <Field label="Rows">
+              <input type="number" min={1} max={20} value={rows}
+                onChange={(e) => setRows(parseInt(e.target.value, 10) || 1)} style={inputStyle} />
+            </Field>
+            <Field label="Cols">
+              <input type="number" min={1} max={20} value={cols}
+                onChange={(e) => setCols(parseInt(e.target.value, 10) || 1)} style={inputStyle} />
+            </Field>
+            <Field label="Layers">
+              <input type="number" min={1} max={10} value={layers}
+                onChange={(e) => setLayers(parseInt(e.target.value, 10) || 1)} style={inputStyle} />
+            </Field>
+          </div>
+          <div style={{ marginBottom: 6, fontSize: 11, color: '#0f766e', fontWeight: 600 }}>
+            Total slots: {cycles}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+            <Field label="Spacing X (mm)">
+              <input type="number" min={0} value={spacingX}
+                onChange={(e) => setSpacingX(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+            </Field>
+            <Field label="Spacing Y (mm)">
+              <input type="number" min={0} value={spacingY}
+                onChange={(e) => setSpacingY(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+            </Field>
+            <Field label="Layer height (mm)">
+              <input type="number" min={0} value={layerH}
+                onChange={(e) => setLayerH(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+            </Field>
+          </div>
+
+          <Field label="Fill order">
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {fillOptions.map((o) => (
+                <button key={o.value} onClick={() => setFillOrder(o.value)}
+                  style={{
+                    padding: '6px 10px', fontSize: 11, fontWeight: 600,
+                    background: fillOrder === o.value ? '#eff6ff' : '#fff',
+                    color:      fillOrder === o.value ? '#2563EB' : '#374151',
+                    border:     fillOrder === o.value ? '2px solid #2563EB' : '1px solid #d1d5db',
+                    borderRadius: 4, cursor: 'pointer',
+                  }}>
+                  {o.label}
+                </button>
+              ))}
+            </div>
+          </Field>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+            <Field label="Approach height (mm)">
+              <input type="number" min={0} value={approachH}
+                onChange={(e) => setApproachH(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+            </Field>
+            <Field label="Retract height (mm)">
+              <input type="number" min={0} value={retractH}
+                onChange={(e) => setRetractH(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+            </Field>
+            <Field label="Speed (%)">
+              <input type="number" min={1} max={100} value={speed}
+                onChange={(e) => setSpeed(parseInt(e.target.value, 10) || 60)} style={inputStyle} />
+            </Field>
+          </div>
+
+          <div style={{ marginTop: 8, marginBottom: 8, fontSize: 11, fontWeight: 700, color: '#374151' }}>
+            Taught positions
+          </div>
+          {tcpRow(
+            isDepal ? 'Corner [1,1,top]' : 'Corner [1,1,1]',
+            cornerTcp, 'corner',
+          )}
+          {isDepal
+            ? tcpRow('Place TCP', placeTcp, 'place')
+            : tcpRow('Pick TCP',  pickTcp,  'pick')}
+
+          {error && (
+            <div style={{ marginTop: 8, padding: '6px 10px', fontSize: 11,
+              background: '#fef2f2', color: '#DC2626',
+              border: '1px solid #fecaca', borderRadius: 4 }}>
+              {error}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function StepEditor({ step, allSteps, onSave, onClose }) {
   // Sanity probe: if "Edit on one step opens all" ever happens again,
   // the DevTools console will show one [StepEditor] line per render.
   // More than one per Edit click means the parent is mounting the
@@ -241,8 +585,91 @@ function StepEditor({ step, onSave, onClose }) {
     for (const f of def.fields) {
       if (draft[f] !== undefined) patch[f] = draft[f]
     }
+    // Pose fields live outside the per-action `fields` list — they're
+    // shown for every step that carries a position_role / derived_from
+    // / taught_tcp. Pass them through commit explicitly so a numeric
+    // nudge to xyz/rpy or an override toggle survives Save.
+    const POSE_KEYS = [
+      'taught_tcp', 'taught_joints', 'taught',
+      'position', 'position_role', 'derived_from',
+      'overridden', 'offset_z_mm',
+    ]
+    for (const k of POSE_KEYS) {
+      if (draft[k] !== undefined) patch[k] = draft[k]
+    }
     onSave(patch)
     onClose()
+  }
+
+  // Pose section visibility: shown for any step that's part of the
+  // pick/place/approach link graph — either a base pose source, a
+  // derived offset move, or a step that already carries a taught_tcp.
+  const isDerived         = !!draft.derived_from
+  const isOverridden      = !!draft.overridden && isDerived
+  const showPosePanel     =
+    isPoseSource(draft) || isDerived ||
+    (Array.isArray(draft.taught_tcp) && draft.taught_tcp.length >= 3)
+  const derivedAuto       = isDerived ? resolveDerivedPose(draft, allSteps) : null
+
+  // Active pose displayed/edited in the panel. For base steps and
+  // overridden derived steps this is taught_tcp; for auto-derived
+  // steps it's the computed pose (read-only).
+  const liveTcp = (Array.isArray(draft.taught_tcp) && draft.taught_tcp.length >= 6)
+    ? draft.taught_tcp
+    : (isDerived && !isOverridden && derivedAuto) ? derivedAuto
+    : null
+
+  async function capturePoseFromRobot() {
+    try {
+      const res = await fetch('/api/state')
+      if (!res.ok) return
+      const state = await res.json()
+      const tcp = Array.isArray(state?.tcp_pose) ? state.tcp_pose : null
+      const joints = Array.isArray(state?.joints?.positions) ? state.joints.positions : null
+      if (!tcp || tcp.length < 6) return
+      setDraft((prev) => ({
+        ...prev,
+        taught: true,
+        taught_tcp: tcp,
+        taught_joints: joints ? radiansToJointDegrees(joints) : prev.taught_joints,
+        taught_at: new Date().toISOString(),
+        position: tcp.slice(0, 3),
+        // If this is a derived step, capturing a pose implicitly
+        // overrides the auto-link.
+        ...(prev.derived_from ? { overridden: true } : {}),
+      }))
+    } catch { /* ignore */ }
+  }
+
+  function updatePoseAxis(i, val) {
+    const v = parseFloat(val)
+    const start = Array.isArray(liveTcp) && liveTcp.length >= 6
+      ? liveTcp.map(Number)
+      : [0, 0, 0, 0, 0, 0]
+    start[i] = isNaN(v) ? 0 : v
+    setDraft((prev) => ({
+      ...prev,
+      taught: true,
+      taught_tcp: start,
+      position: start.slice(0, 3),
+      // Manual numeric edit on a derived step → override the link.
+      ...(prev.derived_from ? { overridden: true } : {}),
+    }))
+  }
+
+  function resetToAuto() {
+    // Clear the manual override on a derived step so the executor
+    // (and editor preview) falls back to base + offset_z_mm.
+    setDraft((prev) => {
+      const next = { ...prev }
+      delete next.taught_tcp
+      delete next.taught_joints
+      delete next.taught_at
+      delete next.position
+      next.taught = false
+      next.overridden = false
+      return next
+    })
   }
 
   return (
@@ -275,6 +702,96 @@ function StepEditor({ step, onSave, onClose }) {
         <input value={draft.label || ''} onChange={(e) => update('label', e.target.value)}
           placeholder={actionDef.label} style={inputStyle} />
       </div>
+
+      {showPosePanel && (
+        <div style={{
+          padding: '10px 12px', marginBottom: 10,
+          background: isOverridden ? '#fffbeb' : '#f8fafc',
+          border: isOverridden ? '1px solid #fcd34d' : '1px solid #e5e7eb',
+          borderRadius: 6,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <span style={{
+              fontSize: 10, fontWeight: 700, letterSpacing: 0.5,
+              padding: '2px 6px', borderRadius: 4,
+              background: isDerived ? (isOverridden ? '#fde68a' : '#dbeafe') : '#dcfce7',
+              color:      isDerived ? (isOverridden ? '#92400e' : '#1d4ed8') : '#166534',
+            }}>
+              {isDerived
+                ? (isOverridden ? 'OVERRIDDEN' : 'AUTO (derived)')
+                : (draft.position_role ? draft.position_role.toUpperCase() : 'POSE')}
+            </span>
+            {isDerived && (
+              <span style={{ fontSize: 10, color: '#6b7280' }}>
+                from <b>{String(draft.derived_from)}</b>
+                {(draft.offset_z_mm !== undefined && draft.offset_z_mm !== null)
+                  ? ` + Z ${draft.offset_z_mm}mm` : ''}
+              </span>
+            )}
+            <div style={{ flex: 1 }} />
+            <button onClick={capturePoseFromRobot}
+              title="Capture the current robot TCP and apply it to this step (overrides auto-link for derived steps)."
+              style={{
+                padding: '4px 10px', fontSize: 10, fontWeight: 600,
+                background: '#eff6ff', color: '#2563EB',
+                border: '1px solid #bfdbfe', borderRadius: 4, cursor: 'pointer',
+              }}>
+              Use current pose
+            </button>
+            {isOverridden && (
+              <button onClick={resetToAuto}
+                title="Drop the manual pose; revert to base + offset link."
+                style={{
+                  padding: '4px 10px', fontSize: 10, fontWeight: 600,
+                  background: '#fef2f2', color: '#b91c1c',
+                  border: '1px solid #fecaca', borderRadius: 4, cursor: 'pointer',
+                }}>
+                Reset to auto
+              </button>
+            )}
+          </div>
+
+          {isDerived && !isOverridden && (
+            <div style={{ fontSize: 10, color: '#0369a1', marginBottom: 6 }}>
+              Computed at runtime from <b>{String(draft.derived_from)}</b> + Z {draft.offset_z_mm ?? 0}mm.
+              Edit any axis below or click "Use current pose" to override the link.
+            </div>
+          )}
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 6 }}>
+            {['X (m)', 'Y (m)', 'Z (m)'].map((lbl, i) => (
+              <div key={lbl}>
+                <div style={{ fontSize: 10, color: '#6b7280', marginBottom: 2 }}>{lbl}</div>
+                <input type="number" step="0.001"
+                  value={liveTcp ? Number(liveTcp[i] ?? 0).toFixed(4) : ''}
+                  placeholder={liveTcp ? '' : '—'}
+                  onChange={(e) => updatePoseAxis(i, e.target.value)}
+                  style={inputStyle} />
+              </div>
+            ))}
+            {['Rx (rad)', 'Ry (rad)', 'Rz (rad)'].map((lbl, i) => (
+              <div key={lbl}>
+                <div style={{ fontSize: 10, color: '#6b7280', marginBottom: 2 }}>{lbl}</div>
+                <input type="number" step="0.01"
+                  value={liveTcp ? Number(liveTcp[i + 3] ?? 0).toFixed(4) : ''}
+                  placeholder={liveTcp ? '' : '—'}
+                  onChange={(e) => updatePoseAxis(i + 3, e.target.value)}
+                  style={inputStyle} />
+              </div>
+            ))}
+          </div>
+          {isDerived && !liveTcp && (
+            <div style={{ marginTop: 6, fontSize: 10, color: '#b45309' }}>
+              Source pose isn't taught yet — teach the base step (e.g. pick/place) first to see this resolve.
+            </div>
+          )}
+          {!isDerived && !liveTcp && (
+            <div style={{ marginTop: 6, fontSize: 10, color: '#b45309' }}>
+              Not taught yet. Use the Teach button on the row, or "Use current pose" above.
+            </div>
+          )}
+        </div>
+      )}
 
       {actionDef.fields.includes('width_mm') && (
         <Field label="Gripper Width (mm)">
@@ -1196,6 +1713,10 @@ export default function ProgramEditor() {
   const [showWizard, setShowWizard]         = useState(false)
   const [showPbd,    setShowPbd]            = useState(false)
   const [editingId, setEditingId]           = useState(null)
+  // True when the operator has opened the dedicated pallet config
+  // editor for this program (entry point: Edit button on any
+  // move_to_pallet step). Single-instance modal — not per-step.
+  const [editingPallet, setEditingPallet]   = useState(false)
   const [selectedId, setSelectedId]         = useState(null)
   const [dragId, setDragId]                 = useState(null)
   const [dragOverId, setDragOverId]         = useState(null)
@@ -1265,6 +1786,10 @@ export default function ProgramEditor() {
       name:   loadedProgram.name || 'Untitled Program',
       steps:  ingest,
       unsaved: false,
+      config: (loadedProgram.config && typeof loadedProgram.config === 'object') ? loadedProgram.config : {},
+      description: loadedProgram.description || '',
+      tags:        Array.isArray(loadedProgram.tags) ? loadedProgram.tags : [],
+      cell_id:     loadedProgram.cell_id || null,
     })
     setProgramSteps(ingest)
     setLoadedProgram(null)
@@ -1467,6 +1992,10 @@ export default function ProgramEditor() {
     const target = teachOverlayStep()
     if (!target) return
     const patch = await buildTaughtPatch()
+    // Teaching a derived step (descend / lift / "above") promotes it
+    // to an override — the executor will then prefer this taught_tcp
+    // over base+offset. Reset-to-auto clears it.
+    if (target.derived_from) patch.overridden = true
     updateSteps(renumber(steps.map((s) => s.id === target.id ? { ...s, ...patch } : s)))
     // Single-step flow: just close.
     if (teachSingleId != null) {
@@ -1512,7 +2041,17 @@ export default function ProgramEditor() {
     const name = programName.trim() || 'Untitled Program'
     setSaveStatus('saving')
     try {
-      const body = JSON.stringify({ name, steps })
+      // Preserve the full config block (gripper, pallet, motion profile,
+      // etc.) — earlier versions of this save sent only name+steps,
+      // which silently wiped pallet config on every edit-save cycle for
+      // palletize programs.
+      const payload = { name, steps }
+      const cfg = currentProgram.config
+      if (cfg && typeof cfg === 'object') payload.config = cfg
+      if (currentProgram.description) payload.description = currentProgram.description
+      if (Array.isArray(currentProgram.tags) && currentProgram.tags.length) payload.tags = currentProgram.tags
+      if (currentProgram.cell_id) payload.cell_id = currentProgram.cell_id
+      const body = JSON.stringify(payload)
       const res = await fetch(
         programId ? `/api/programs/${encodeURIComponent(programId)}` : '/api/programs',
         { method: programId ? 'PUT' : 'POST',
@@ -1559,6 +2098,10 @@ export default function ProgramEditor() {
           name:    prog.name || 'Untitled Program',
           steps:   ingest,
           unsaved: false,
+          config:      (prog.config && typeof prog.config === 'object') ? prog.config : {},
+          description: prog.description || '',
+          tags:        Array.isArray(prog.tags) ? prog.tags : [],
+          cell_id:     prog.cell_id || null,
         })
         setProgramSteps(ingest)
       }
@@ -1568,7 +2111,16 @@ export default function ProgramEditor() {
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#fff' }}>
-      <div style={{ padding: '12px 16px', borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', gap: 8 }}>
+      <div className="no-scrollbar" style={{
+        padding: '12px 16px',
+        paddingRight: 'calc(16px + env(safe-area-inset-right, 0px))',
+        borderBottom: '1px solid #e5e7eb',
+        display: 'flex', alignItems: 'center', gap: 8,
+        width: '100%', maxWidth: '100%', minWidth: 0,
+        overflowX: 'auto', overflowY: 'hidden',
+        WebkitOverflowScrolling: 'touch',
+        boxSizing: 'border-box',
+      }}>
         <input
           value={programName}
           onChange={(e) => setProgramName(e.target.value)}
@@ -1775,7 +2327,7 @@ export default function ProgramEditor() {
           // no ids.
           if (typeof editingId === 'number' && typeof step.id === 'number' && editingId === step.id) {
             return (
-              <StepEditor key={step.id} step={step}
+              <StepEditor key={step.id} step={step} allSteps={steps}
                 onSave={(patch) => handleEditSave(step.id, patch)}
                 onClose={() => setEditingId(null)}
               />
@@ -1959,12 +2511,16 @@ export default function ProgramEditor() {
               }}>
                 {!locked && (
                   isPalletDriven(step) ? (
-                    <button disabled
-                      title="Position is computed at runtime from the program's pallet config — not manually editable."
+                    <button onClick={(e) => {
+                      e.stopPropagation()
+                      console.log('[ProgramEditor] Pallet Edit button clicked')
+                      setEditingPallet(true)
+                    }}
+                      title="Edit the program's pallet configuration (grid, spacing, fill order, taught corner/pick)."
                       style={{ padding: '6px 14px', fontSize: 12, fontWeight: 600,
-                               background: '#f3f4f6', color: '#9ca3af',
-                               border: '1px solid #e5e7eb', borderRadius: 5,
-                               cursor: 'not-allowed', flexShrink: 0 }}>
+                               background: '#eff6ff', color: '#2563EB',
+                               border: '1px solid #bfdbfe', borderRadius: 5,
+                               cursor: 'pointer', flexShrink: 0 }}>
                       Edit
                     </button>
                   ) : (
@@ -2133,6 +2689,46 @@ export default function ProgramEditor() {
             }
             setShowPbd(false)
           }}
+        />
+      )}
+
+      {editingPallet && (
+        <PalletConfigEditor
+          config={currentProgram.config || {}}
+          onSave={(patch) => {
+            // patch carries pallet / pallet_mode / source / speed_pct +
+            // optional pick_tcp / place_tcp. Merge into program.config,
+            // then regenerate the move_to_pallet + pallet loop steps
+            // so the runtime motion reflects edited grid / spacing /
+            // fill order. Taught poses on other steps stay intact.
+            const nextConfig = {
+              ...(currentProgram.config || {}),
+              ...patch,
+              operation: 'palletize',
+            }
+            // Mirror the typed pallet config back to the legacy
+            // pallet_* answer keys so the wizard's Review path stays
+            // consistent if the operator ever round-trips through it.
+            if (patch.pallet) {
+              nextConfig.pallet_rows           = patch.pallet.rows
+              nextConfig.pallet_cols           = patch.pallet.cols
+              nextConfig.pallet_layers         = patch.pallet.layers
+              nextConfig.pallet_spacing_x_mm   = patch.pallet.spacing_x_mm
+              nextConfig.pallet_spacing_y_mm   = patch.pallet.spacing_y_mm
+              nextConfig.pallet_layer_height_mm = patch.pallet.layer_height_mm
+              nextConfig.pallet_fill_order     = patch.pallet.fill_order
+              nextConfig.pallet_approach_height_mm = patch.pallet.approach_height_mm
+              nextConfig.pallet_retract_height_mm  = patch.pallet.retract_height_mm
+            }
+            const regen = regenerateMoveToPalletSteps(steps, patch.pallet, patch.pallet_mode)
+            setCurrentProgram({
+              config:  nextConfig,
+              steps:   renumber(regen),
+              unsaved: true,
+            })
+            addToast?.('Pallet config updated — Save to persist', 'success')
+          }}
+          onClose={() => setEditingPallet(false)}
         />
       )}
 

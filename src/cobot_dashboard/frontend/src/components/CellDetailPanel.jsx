@@ -572,6 +572,136 @@ function SectionBaseline({ cell, onChanged }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// SECTION 3a — Static keep-out zones built from the baseline cloud.
+// Reuses the live LiDAR clustering / OBB pipeline (server-side
+// static_zones.py); the result is a list of merged AABBs the
+// collision_monitor injects into /collision/objects with static:true
+// for the existing capsule-vs-box proximity check, AND that the 3D
+// viewer renders as red/orange permanent obstacles.
+// ─────────────────────────────────────────────────────────────────────────
+
+function SectionCollisionZones({ cell, onChanged }) {
+  const [zones,    setZones]    = useState(null)
+  const [building, setBuilding] = useState(false)
+  const [error,    setError]    = useState(null)
+  const [lastDiag, setLastDiag] = useState(null)
+
+  const refresh = useCallback(async () => {
+    try {
+      const r = await fetch(`/api/cells/${cell.cell_id}/collision_zones`)
+      if (!r.ok) { setZones(null); return }
+      const j = await r.json()
+      if (j.has_zones) setZones(j); else setZones({ zones: [], n_zones: 0 })
+    } catch { setZones(null) }
+  }, [cell.cell_id])
+  useEffect(() => { refresh() }, [refresh])
+
+  const canBuild = !!cell.baseline_captured
+  const build = async () => {
+    if (!canBuild || building) return
+    setBuilding(true); setError(null)
+    try {
+      const r = await fetch(`/api/cells/${cell.cell_id}/collision_zones/build`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const j = await r.json().catch(() => ({}))
+      if (!r.ok || !j.ok) {
+        setError(j.message || j.error || `Build failed (HTTP ${r.status})`)
+      } else {
+        setLastDiag(j)
+      }
+    } catch (e) {
+      setError(String(e?.message || e))
+    } finally {
+      setBuilding(false)
+      refresh()
+      onChanged?.()
+    }
+  }
+
+  const clear = async () => {
+    if (!zones || (zones.n_zones ?? 0) === 0) return
+    if (!confirm('Clear the static collision zones for this cell?')) return
+    try {
+      await fetch(`/api/cells/${cell.cell_id}/collision_zones`, { method: 'DELETE' })
+    } catch {}
+    refresh()
+  }
+
+  const count = zones?.n_zones ?? 0
+  const builtAt = zones?.built_at || lastDiag?.built_at
+  const diag = zones?.diag || lastDiag?.diag
+
+  return (
+    <Section title="Static collision zones (from baseline)"
+             dirtySlot={<SavedDot cellId={cell.cell_id} section="collision_zones" />}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+                    marginBottom: 8 }}>
+        <button onClick={build}
+          disabled={!canBuild || building}
+          style={smallBtn(!canBuild ? '#94a3b8' : (building ? '#475569' : '#ea580c'))}>
+          {building ? 'Building…'
+            : (count > 0 ? 'Rebuild zones' : 'Build zones')}
+        </button>
+        {count > 0 && (
+          <button onClick={clear} style={smallBtn('#475569')}>
+            Clear zones
+          </button>
+        )}
+        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+          {!canBuild && 'Needs a baseline first — capture one above.'}
+          {canBuild && count === 0 && 'No zones built yet.'}
+          {canBuild && count > 0 && (
+            <>
+              <b style={{ color: '#ea580c' }}>{count}</b> static obstacle{count === 1 ? '' : 's'}
+              {builtAt && <> · built {builtAt}</>}
+            </>
+          )}
+        </span>
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+        Clusters dense regions of the saved baseline (within the 1.4 m reach),
+        merges adjacent boxes (one bench = one box), inflates 5 cm for
+        clearance. The robot's capsule proximity check uses these for
+        warning / slow / stop in real time.{' '}
+        <b style={{ color: '#92400e' }}>Note:</b> trajectory planning <i>around</i>
+        these obstacles requires MoveIt2 + the official Estun URDF
+        (pending). The build also writes a MoveIt2-compatible
+        planning_scene file so a future planner can ingest the obstacle
+        set without re-running this build.
+      </div>
+      {diag && (
+        <div style={{
+          marginTop: 8, padding: '8px 10px',
+          background: 'var(--surface, #f8fafc)', borderRadius: 6,
+          border: '1px solid var(--border)',
+          fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono, monospace)',
+        }}>
+          {[
+            ['voxel', diag.n_after_voxel],
+            ['reach', diag.n_after_reach],
+            ['self-filter', diag.n_after_self_filter],
+            ['above-ground', diag.n_above_ground],
+            ['raw clusters', diag.n_clusters_raw],
+            ['kept (density)', diag.n_clusters_kept],
+            ['merged groups', diag.n_merged_groups],
+          ].filter(([, v]) => v !== undefined).map(([k, v]) => (
+            <span key={k} style={{ marginRight: 12 }}>{k}: <b>{v}</b></span>
+          ))}
+          {diag.elapsed_s !== undefined && (
+            <span>elapsed: <b>{(diag.elapsed_s).toFixed(2)} s</b></span>
+          )}
+        </div>
+      )}
+      {error && (
+        <div style={{ marginTop: 8, fontSize: 12, color: '#dc2626' }}>{error}</div>
+      )}
+    </Section>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // SECTION 4 — Workspace bounds (editable, save via PUT)
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -698,6 +828,7 @@ export default function CellDetailPanel({ cellId, allCells, onRefresh, onDeleted
                        onDeleted={() => { onDeleted?.(cellId); onRefresh?.() }} />
       <SectionPrograms cell={cell} allCells={allCells || []} onChanged={localOnChanged} />
       <SectionBaseline cell={cell} onChanged={localOnChanged} />
+      <SectionCollisionZones cell={cell} onChanged={localOnChanged} />
       <SectionBounds   cell={cell} onChanged={localOnChanged} />
       <SectionHandEye  cell={cell} />
       <ReRunWizardRow  cell={cell} />

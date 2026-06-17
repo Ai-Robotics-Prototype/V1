@@ -2,30 +2,17 @@ import { useState } from 'react'
 import CameraPanel from '../components/CameraPanel'
 import LidarPanel from '../components/LidarPanel'
 import MotionCamPanel from '../components/MotionCamPanel'
-import NanoOWLOverlay from '../components/NanoOWLOverlay'
-import NanoOWLPanel from '../components/NanoOWLPanel'
 
-// Wrap the cam0 area so the NanoOWL overlay (boxes burned over the MJPEG
-// stream) and the controls panel (docked bottom-right) come along
-// everywhere CameraPanel cam=0 is rendered. The overlay is pointer-events
-// disabled so clicking the cell still triggers expand/collapse.
-function Cam0WithNanoOWL({ controlsDocked = true }) {
+// Cameras & LiDAR shows cam0 with its server-burned Isaac/COCO
+// detection boxes. The open-vocabulary detection panel (formerly
+// "NanoOWL") moved to Part Recognition → per-part config so each
+// part owns its own prompt — `NanoOWLOverlay` / `NanoOWLPanel`
+// are no longer mounted here. The components still exist for
+// diagnostics; just nothing imports them on this screen.
+function Cam0(_props) {
   return (
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
       <CameraPanel cam={0} />
-      <NanoOWLOverlay />
-      {controlsDocked && (
-        <div style={{
-          position: 'absolute',
-          right: 8, bottom: 8,
-          width: 'min(380px, 70%)',
-          maxHeight: '70%',
-          overflow: 'auto',
-          zIndex: 6,
-        }}>
-          <NanoOWLPanel />
-        </div>
-      )}
     </div>
   )
 }
@@ -101,7 +88,7 @@ export default function SensorsLayout() {
     }}>
       <div style={{ borderRight: '1px solid var(--border)', borderBottom: '1px solid var(--border)', overflow: 'hidden' }}>
         <PanelChrome expanded={false} onToggle={() => setExpanded('cam0')}>
-          <Cam0WithNanoOWL />
+          <Cam0 />
         </PanelChrome>
       </div>
 

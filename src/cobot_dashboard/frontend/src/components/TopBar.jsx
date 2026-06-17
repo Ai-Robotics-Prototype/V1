@@ -1,4 +1,3 @@
-import { useState } from 'react'
 import { useStore } from '../store/useStore'
 
 const TABS = [
@@ -29,24 +28,24 @@ export default function TopBar() {
   const triggerEstop = useStore((s) => s.triggerEstop)
   const releaseEstop = useStore((s) => s.releaseEstop)
 
-  const [confirming, setConfirming] = useState(false)
-
+  // Safety: trigger fires on the first tap with no confirmation — an
+  // emergency stop must act with zero delay. Release stays guarded by
+  // the store's releaseEstop() (requires zone=GREEN), so an active
+  // E-STOP can't be un-stopped by an accidental tap.
   function handleEstopClick() {
     if (estop) {
       releaseEstop()
     } else {
-      setConfirming(true)
+      triggerEstop()
     }
-  }
-
-  function confirmEstop() {
-    setConfirming(false)
-    triggerEstop()
   }
 
   return (
     <div style={{
+      width: '100%',
+      maxWidth: '100%',
       height: '100%',
+      boxSizing: 'border-box',
       background: 'var(--bg-panel)',
       borderBottom: '1px solid var(--border)',
       display: 'flex',
@@ -54,6 +53,8 @@ export default function TopBar() {
       padding: '0 12px',
       gap: 8,
       userSelect: 'none',
+      overflow: 'hidden',
+      minWidth: 0,
     }}>
       {/* Left: brand */}
       <div style={{ width: 64, flexShrink: 0, fontSize: 14, fontWeight: 700, color: 'var(--accent)' }}>
@@ -65,13 +66,16 @@ export default function TopBar() {
           height isn't reduced. The brand on the left and the right
           cluster are flexShrink: 0 so they can't be squeezed. */}
       <nav className="no-scrollbar" style={{
-        flex: 1,
+        flex: '1 1 0',
+        width: 0,
+        minWidth: 0,
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'flex-start',
         gap: 6,
         padding: '4px 8px',
         overflowX: 'auto',
+        overflowY: 'hidden',
         WebkitOverflowScrolling: 'touch',
       }}>
         {TABS.map((tab) => {
@@ -84,10 +88,10 @@ export default function TopBar() {
                 background: active ? 'rgba(47,127,255,0.14)' : 'transparent',
                 border:     active ? '1px solid rgba(47,127,255,0.45)' : '1px solid transparent',
                 color:      active ? 'var(--text-primary)' : 'var(--text-secondary)',
-                fontSize: 14,
+                fontSize: 16,
                 fontWeight: active ? 700 : 500,
-                padding: '10px 18px',
-                minHeight: 44,
+                padding: '12px 22px',
+                minHeight: 50,
                 borderRadius: 10,
                 cursor: 'pointer',
                 whiteSpace: 'nowrap',
@@ -137,63 +141,32 @@ export default function TopBar() {
           {wsLatency} ms
         </span>
 
-        {/* E-STOP button / inline confirm */}
-        {confirming ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Trigger E-Stop?</span>
-            <button
-              onClick={() => setConfirming(false)}
-              style={{
-                background: 'var(--bg-surface)',
-                border: '1px solid var(--border)',
-                color: 'var(--text-secondary)',
-                fontSize: 12,
-                padding: '3px 10px',
-                borderRadius: 'var(--radius-sm)',
-              }}
-            >
-              Cancel
-            </button>
-            <button
-              onClick={confirmEstop}
-              style={{
-                background: '#DC2626',
-                border: 'none',
-                color: '#fff',
-                fontSize: 12,
-                fontWeight: 600,
-                padding: '3px 10px',
-                borderRadius: 'var(--radius-sm)',
-              }}
-            >
-              Confirm
-            </button>
-          </div>
-        ) : (
-          <button
-            onClick={handleEstopClick}
-            title={
-              estop
-                ? 'E-Stop active — click to release (requires green zone)'
-                : 'Click to trigger emergency stop'
-            }
-            style={{
-              background: '#DC2626',
-              border: 'none',
-              color: '#fff',
-              fontSize: 14,
-              fontWeight: 700,
-              padding: '10px 22px',
-              minHeight: 44,
-              borderRadius: 8,
-              cursor: 'pointer',
-              animation: estop ? 'pulse-opacity 1s ease-in-out infinite' : 'none',
-              letterSpacing: '0.04em',
-            }}
-          >
-            {estop ? 'ESTOP ACTIVE' : 'E-STOP'}
-          </button>
-        )}
+        {/* E-STOP — fires on first tap (no confirm). Sized large for
+            safety: it must be the most prominent control in the row. */}
+        <button
+          onClick={handleEstopClick}
+          title={
+            estop
+              ? 'E-Stop active — click to release (requires green zone)'
+              : 'Click to trigger emergency stop'
+          }
+          style={{
+            background: '#DC2626',
+            border: 'none',
+            color: '#fff',
+            fontSize: 18,
+            fontWeight: 700,
+            padding: '14px 32px',
+            minHeight: 56,
+            borderRadius: 10,
+            cursor: 'pointer',
+            animation: estop ? 'pulse-opacity 1s ease-in-out infinite' : 'none',
+            letterSpacing: '0.06em',
+            boxShadow: '0 2px 6px rgba(220,38,38,0.35)',
+          }}
+        >
+          {estop ? 'ESTOP ACTIVE' : 'E-STOP'}
+        </button>
       </div>
     </div>
   )
