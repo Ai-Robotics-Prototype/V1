@@ -90,7 +90,10 @@ DEFAULTS = {
     # merging only exists to glue fragments that DBSCAN already
     # handles. Set merge_gap_m > 0 to re-enable for special cases.
     'merge_gap_m':         -1.0,
-    'inflate_margin_m':     0.05,
+    # Was 0.05; with OBB-rotated boxes (which hug the cluster instead
+    # of the inflated AABB) a smaller clearance suffices and the
+    # boxes look visually tight in the 3D View.
+    'inflate_margin_m':     0.02,
     # Ground filter (passed to GroundExtractor)
     'ground_dist_thresh_m': 0.015,
     'ground_max_tilt_deg':  15.0,
@@ -101,17 +104,16 @@ DEFAULTS = {
     # becoming an "obstacle".
     'ground_clearance_m':   0.03,
     # ── Max-size sanity rejection (per cluster + per merged group) ──
-    # The floor / DBSCAN-chained-noise box that originally appeared
-    # was ~3 m on a side — well above any real workshop fixture
-    # inside a 1.4 m reach. Cap a single obstacle at 1.8 m on BOTH
-    # horizontal axes: that still rejects the 2.6-3 m floor chain
-    # but allows realistic benches and machine housings.
-    'max_obstacle_xy_m':    1.8,
+    # Cap a single obstacle at 1.2 m on BOTH horizontal axes. Was
+    # 1.8 m to absorb the rotation-induced AABB inflation; now we
+    # emit the OBB directly so the dims are TIGHT (the box hugs the
+    # cluster), and a real workshop fixture rarely exceeds 1.2 m
+    # along both axes. The floor's OBB is still 2 m+ on its long
+    # axis so it's caught by this gate.
+    'max_obstacle_xy_m':    1.2,
     # Reject clusters whose XY footprint covers more than this
-    # fraction of the reach disc area (π·r²). 55 % of 6.16 m² ≈ 3.4 m².
-    # The floor's footprint (~8 m²) is comfortably above; a real
-    # 1.5 m bench (~2.25 m²) is below.
-    'max_footprint_frac':   0.55,
+    # fraction of the reach disc area (π·r²). 35 % of 6.16 m² ≈ 2.2 m².
+    'max_footprint_frac':   0.35,
     # Reject clusters that are very flat AND large: a wide sheet
     # under 4 cm tall is the floor / a tabletop residue, not an
     # obstacle to plan around.
@@ -157,6 +159,32 @@ def drop_robot_self(points: np.ndarray, self_r: float, self_z: float,
 
 
 # ── OBB → AABB helpers + merge ───────────────────────────────────────
+def obb_yaw_quat(rotation: np.ndarray, dims: np.ndarray) -> tuple[float, float, float, float]:
+    """Convert an OBB rotation matrix into a yaw-only quaternion
+    (rotation about world Z). The 3D viewer's ObjectBox component
+    reads `yaw = 2*atan2(q.z, q.w)` so we encode the cluster's
+    horizontal orientation in just the z/w components.
+
+    Strategy: pick the rotation column whose XY-plane projection is
+    longest (i.e. the most-horizontal body axis); its atan2 gives
+    the yaw. Falls back to 0 when the longest body axis is vertical
+    (tall thin objects — yaw is then degenerate anyway).
+    """
+    if rotation is None or rotation.shape != (3, 3):
+        return (0.0, 0.0, 0.0, 1.0)
+    # Per-column horizontal length, weighted by the column's extent so
+    # ties prefer the longer side of the OBB.
+    cols = rotation
+    horiz = np.sqrt(cols[0, :] ** 2 + cols[1, :] ** 2)
+    weighted = horiz * np.asarray(dims, dtype=np.float64)
+    j = int(np.argmax(weighted))
+    if horiz[j] < 1e-3:
+        return (0.0, 0.0, 0.0, 1.0)
+    yaw = float(np.arctan2(cols[1, j], cols[0, j]))
+    # Yaw quaternion (axis = world Z): (0, 0, sin(y/2), cos(y/2)).
+    return (0.0, 0.0, float(np.sin(yaw * 0.5)), float(np.cos(yaw * 0.5)))
+
+
 def obb_to_aabb(center: np.ndarray, dims: np.ndarray, rotation: np.ndarray,
                 ) -> tuple[np.ndarray, np.ndarray]:
     """Worst-case AABB enclosing an OBB. Returns (min, max) each (3,).
@@ -402,30 +430,74 @@ def build_zones_from_pcd(pcd_path: str,
     groups = merge_aabbs([r['aabb'] for r in raw], gap_threshold_m=float(p['merge_gap_m']))
     diag['n_merged_groups'] = len(groups)
 
-    # For each merged group emit a single AXIS-ALIGNED keep-out box.
-    # We deliberately drop the OBB rotation in the persistent output
-    # because (a) the existing collision_monitor capsule-vs-AABB check
-    # operates on axis-aligned boxes, and (b) merging arbitrary
-    # rotations would otherwise need a Minkowski hull. The 3D viewer
-    # supports rotation in the per-object payload, so single-cluster
-    # groups still get their OBB yaw if you want it — for now we keep
-    # everything AABB for consistency with the live collision pipeline.
+    # Emit one keep-out box per group. When a group has a SINGLE
+    # cluster (the default — merging is disabled), we emit the
+    # ORIENTED bounding box directly: center + OBB extents + a
+    # yaw-only quaternion derived from the OBB rotation. This makes
+    # the persisted box hug the cluster tightly instead of the
+    # rotation-inflated AABB. When a group has multiple clusters
+    # (i.e. merging was explicitly enabled), we fall back to the
+    # AABB envelope since merging arbitrary rotations is undefined.
     margin = float(p['inflate_margin_m'])
     zones: list[dict[str, Any]] = []
     merged_rejected: list[dict[str, Any]] = []
     for gi, idxs in enumerate(groups):
+        if len(idxs) == 1:
+            # ── Single-cluster group: emit the OBB directly ──
+            r = raw[idxs[0]]
+            dims_arr = np.asarray(r['dims'], dtype=np.float64) + (2.0 * margin)
+            center = r['center'].tolist()
+            qx, qy, qz, qw = obb_yaw_quat(r['rotation'], r['dims'])
+            ds_sorted = sorted(dims_arr.tolist(), reverse=True)
+            rej_reason = None
+            # Post-emit guard on the TIGHT OBB dims — much stricter
+            # than the AABB-era guards because OBB dims hug the
+            # cluster, so a real fixture rarely exceeds max_xy here.
+            if max_xy > 0 and ds_sorted[0] > max_xy and ds_sorted[1] > max_xy:
+                rej_reason = (f'obb_oversize_xy '
+                              f'(long={ds_sorted[0]:.2f},short={ds_sorted[1]:.2f} > {max_xy})')
+            elif max_footprint > 0 and (ds_sorted[0] * ds_sorted[1]) > max_footprint:
+                rej_reason = (f'obb_footprint {ds_sorted[0]*ds_sorted[1]:.2f}m² > '
+                              f'{max_footprint:.2f}m²')
+            elif flat_z > 0 and ds_sorted[2] < flat_z and ds_sorted[0] > flat_xy_min:
+                rej_reason = (f'obb_flat_sheet (z={ds_sorted[2]:.3f},'
+                              f' long={ds_sorted[0]:.2f})')
+            if rej_reason is not None:
+                merged_rejected.append({
+                    'group_index': gi,
+                    'cluster_count': 1,
+                    'dims': [round(float(dims_arr[0]), 3),
+                             round(float(dims_arr[1]), 3),
+                             round(float(dims_arr[2]), 3)],
+                    'reason': rej_reason,
+                })
+                continue
+            total_points = int(r['point_count'])
+            total_vol = float(np.prod(dims_arr))
+            zones.append({
+                'id':           f'static_{gi:03d}',
+                'name':         f'static_obstacle_{gi + 1}',
+                'source':       'baseline_static',
+                'center':       {'x': float(center[0]), 'y': float(center[1]), 'z': float(center[2])},
+                'dimensions':   {'x': float(dims_arr[0]), 'y': float(dims_arr[1]), 'z': float(dims_arr[2])},
+                # OBB yaw-only quaternion → the 3D viewer's ObjectBox
+                # rotates the box around world-up by this yaw.
+                'orientation':  {'x': qx, 'y': qy, 'z': qz, 'w': qw},
+                'point_count':  total_points,
+                'density':      float(total_points / max(total_vol, 1e-9)),
+                'cluster_count': 1,
+                'margin_m':     margin,
+                'shape':        'obb',
+            })
+            continue
+        # ── Multi-cluster merged group: fall back to AABB envelope ──
+        # Only reachable when merge_gap_m was explicitly set ≥ 0.
         a_min = np.minimum.reduce([raw[i]['aabb'][0] for i in idxs])
         a_max = np.maximum.reduce([raw[i]['aabb'][1] for i in idxs])
         a_min = a_min - margin
         a_max = a_max + margin
         center = ((a_min + a_max) * 0.5).tolist()
         dims = (a_max - a_min).tolist()
-        # Post-merge guard: an individual cluster passed the per-
-        # cluster sanity checks, but the merge step can still
-        # balloon a group across the workspace if neighboring
-        # clusters happen to sit within `merge_gap_m`. Re-apply the
-        # same XY / footprint limits so a ballooned merge gets
-        # dropped instead of dominating the scene.
         ds_sorted = sorted([float(dims[0]), float(dims[1]), float(dims[2])], reverse=True)
         rej_reason = None
         if max_xy > 0 and ds_sorted[0] > max_xy and ds_sorted[1] > max_xy:
@@ -455,14 +527,12 @@ def build_zones_from_pcd(pcd_path: str,
             'source':       'baseline_static',
             'center':       {'x': float(center[0]), 'y': float(center[1]), 'z': float(center[2])},
             'dimensions':   {'x': float(dims[0]),   'y': float(dims[1]),   'z': float(dims[2])},
-            # AABB → identity quaternion. Kept on the payload so the
-            # frontend's existing ObjectBox component renders it without
-            # branching on whether 'orientation' is present.
             'orientation':  {'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0},
             'point_count':  int(total_points),
             'density':      float(total_points / max(total_vol, 1e-9)),
             'cluster_count': len(idxs),
             'margin_m':     margin,
+            'shape':        'aabb',
         })
     diag['n_merged_rejected'] = len(merged_rejected)
     diag['merged_rejected'] = merged_rejected[:16]
