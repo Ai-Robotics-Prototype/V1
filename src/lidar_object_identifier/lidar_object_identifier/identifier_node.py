@@ -20,7 +20,8 @@ import json
 import logging
 import os
 import time
-from typing import List
+import math
+from typing import List, Optional
 
 import numpy as np
 import rclpy
@@ -86,6 +87,18 @@ class IdentifierNode(Node):
         p('cluster_max_aspect_ratio', 50.0)
         p('cluster_min_density_per_m3', 100.0)
 
+        # Post-cluster sanity guards — match static_zones.py thresholds
+        # so the live LiDAR boxes don't include the workspace-sized
+        # "0 mm" floor box or sparse scatter blobs.
+        p('ground_clearance_m', 0.03)       # extra cull above RANSAC plane
+        p('obstacle_reach_radius_m', 1.4)    # used for footprint frac
+        p('obstacle_max_xy_m', 1.8)          # both horizontal extents below this
+        p('obstacle_max_footprint_frac', 0.55)
+        p('obstacle_flat_z_max_m', 0.04)
+        p('obstacle_flat_xy_min_m', 0.5)
+        p('obstacle_min_density_per_m3', 200.0)  # post-OBB density floor
+        p('obstacle_min_point_count', 25)        # post-cluster point floor
+
         p('size_tolerance_pct', 25.0)
         p('volume_tolerance_pct', 30.0)
         p('score_weights_size', 0.35)
@@ -149,6 +162,21 @@ class IdentifierNode(Node):
             float(gp('confidence_detected')),
         )
         self._persistence_weight = float(gp('score_weights_persistence'))
+
+        # Post-cluster sanity-filter thresholds (mirror static_zones.py)
+        self._ground_clearance_m       = float(gp('ground_clearance_m'))
+        self._obs_reach_r              = float(gp('obstacle_reach_radius_m'))
+        self._obs_max_xy               = float(gp('obstacle_max_xy_m'))
+        self._obs_max_footprint_frac   = float(gp('obstacle_max_footprint_frac'))
+        self._obs_flat_z_max           = float(gp('obstacle_flat_z_max_m'))
+        self._obs_flat_xy_min          = float(gp('obstacle_flat_xy_min_m'))
+        self._obs_min_density          = float(gp('obstacle_min_density_per_m3'))
+        self._obs_min_pts              = int(gp('obstacle_min_point_count'))
+        # Counters so journalctl can show what got filtered between ticks.
+        self._sanity_rejects = {
+            'flat_sheet': 0, 'oversize_xy': 0, 'oversize_footprint': 0,
+            'low_density': 0, 'low_points': 0,
+        }
 
         # ---- ROS plumbing ----
         latched = QoSProfile(depth=1)
@@ -254,7 +282,32 @@ class IdentifierNode(Node):
         t0 = time.monotonic()
 
         cropped = utils.crop_to_box(cloud, *self._workspace)
-        ground_pts, above_pts, _coeffs = self._ground.extract(cropped)
+        ground_pts, above_pts, coeffs = self._ground.extract(cropped)
+
+        # Extra cull above the RANSAC plane. The extractor keeps a
+        # thin band (~1.5 cm) as ground; without this, residual floor
+        # returns just above it survive into DBSCAN and chain into a
+        # workspace-sized "0 mm" box. Mirror static_zones.py's
+        # ground_clearance pass exactly so the live + saved paths
+        # behave identically.
+        if self._ground_clearance_m > 0.0 and above_pts.shape[0] > 0:
+            try:
+                if coeffs is not None and len(coeffs) == 4:
+                    a, b, c, d = (float(coeffs[0]), float(coeffs[1]),
+                                  float(coeffs[2]), float(coeffs[3]))
+                    nrm = float(np.sqrt(a*a + b*b + c*c)) or 1.0
+                    signed = (above_pts[:, 0]*a + above_pts[:, 1]*b
+                              + above_pts[:, 2]*c + d) / nrm
+                    side = 1.0 if float(np.median(signed)) >= 0 else -1.0
+                    above_pts = above_pts[(signed * side) > self._ground_clearance_m]
+                elif ground_pts is not None and ground_pts.shape[0] > 0:
+                    g_top = float(np.percentile(ground_pts[:, 2], 95))
+                    above_pts = above_pts[above_pts[:, 2] > (g_top + self._ground_clearance_m)]
+            except Exception:
+                # Defensive: never let a numeric hiccup kill the tick.
+                if ground_pts is not None and ground_pts.shape[0] > 0:
+                    g_top = float(np.percentile(ground_pts[:, 2], 95))
+                    above_pts = above_pts[above_pts[:, 2] > (g_top + self._ground_clearance_m)]
 
         polygon = self._load_workspace_mask()
         if polygon is not None and above_pts.shape[0]:
@@ -273,6 +326,14 @@ class IdentifierNode(Node):
                 self._false_positives += 1
                 continue
             feats = analyze(cl.points)
+            # Post-cluster sanity guard: reject the floor-sheet / chained-
+            # noise / sparse-scatter / oversize phantoms BEFORE they get
+            # tracked + published. Same thresholds as static_zones.py.
+            sanity_reason = self._sanity_reject(cl, feats)
+            if sanity_reason is not None:
+                self._sanity_rejects[sanity_reason] = \
+                    self._sanity_rejects.get(sanity_reason, 0) + 1
+                continue
             match = self._matcher.match(feats, persistence_score=0.0)
             scored_observations.append({
                 'cluster': cl,
@@ -337,6 +398,15 @@ class IdentifierNode(Node):
         self.pub_objects.publish(out_array)
         if markers.markers:
             self.pub_markers.publish(markers)
+
+        # Periodic rejection-counter log so journalctl shows what the
+        # new sanity guards are filtering. Only emits when something
+        # was rejected; rolls over after logging so each line is the
+        # delta for that tick.
+        if any(self._sanity_rejects.values()):
+            parts = ', '.join(f'{k}={v}' for k, v in self._sanity_rejects.items() if v > 0)
+            self.get_logger().debug(f'sanity rejects this tick: {parts}')
+            self._sanity_rejects = {k: 0 for k in self._sanity_rejects}
 
         stats = ObjectIdentificationStatsMsg()
         stats.header = out_array.header
@@ -459,6 +529,50 @@ class IdentifierNode(Node):
                       f'({score.confidence:.0%})')
         markers.append(label)
         return markers
+
+    def _sanity_reject(self, cl: Cluster, feats) -> Optional[str]:
+        """Return a reason string if this cluster shouldn't become a
+        published detection. None means accept.
+
+        These guards mirror static_zones.py so the live LiDAR boxes
+        and the persisted baseline zones use the same definition of
+        "this is a real obstacle, not the floor / sparse scatter /
+        a workspace-sized phantom." Order matters: cheapest checks
+        first so the common case (real object) returns None fast.
+        """
+        # Minimum point count — sparse blobs aren't solid objects.
+        pc = int(cl.point_count)
+        if pc < self._obs_min_pts:
+            return 'low_points'
+        dims = np.asarray(feats.dimensions_m, dtype=float)
+        if dims.size != 3:
+            return 'low_points'
+        # Sort descending so ds[0]=long, ds[1]=short horizontal, ds[2]=height.
+        ds = sorted([float(dims[0]), float(dims[1]), float(dims[2])], reverse=True)
+        # Flat-sheet guard: a thin sheet that's wide on the long axis
+        # is the floor / a tabletop residue, not an obstacle.
+        if self._obs_flat_z_max > 0 \
+                and ds[2] < self._obs_flat_z_max \
+                and ds[0] > self._obs_flat_xy_min:
+            return 'flat_sheet'
+        # Oversize XY: a real fixture inside a 1.4 m reach has at
+        # least one horizontal extent under max_xy.
+        if self._obs_max_xy > 0 \
+                and ds[0] > self._obs_max_xy and ds[1] > self._obs_max_xy:
+            return 'oversize_xy'
+        # Footprint fraction of the reach disc: anything bigger than
+        # a sizeable chunk of the reach is the floor or chained noise.
+        if self._obs_max_footprint_frac > 0 and self._obs_reach_r > 0:
+            reach_area = math.pi * (self._obs_reach_r ** 2)
+            if (ds[0] * ds[1]) > self._obs_max_footprint_frac * reach_area:
+                return 'oversize_footprint'
+        # Density floor — points per OBB volume. Catches sparse
+        # scatter blobs that DBSCAN linked but aren't solid.
+        obb_vol = max(float(dims[0]) * float(dims[1]) * float(dims[2]), 1e-9)
+        density = pc / obb_vol
+        if self._obs_min_density > 0 and density < self._obs_min_density:
+            return 'low_density'
+        return None
 
     @staticmethod
     def _cluster_inside_ignore(cl: Cluster, ignore_regions) -> bool:

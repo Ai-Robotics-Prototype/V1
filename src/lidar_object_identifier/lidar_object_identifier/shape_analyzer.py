@@ -34,8 +34,23 @@ class ShapeFeatures:
     density_per_m3: float
 
 
-def _principal_axes(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (center, rotation_3x3, extents_along_axes)."""
+def _principal_axes(points: np.ndarray,
+                    extent_pct_low: float = 2.0,
+                    extent_pct_high: float = 98.0,
+                    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (center, rotation_3x3, extents_along_axes).
+
+    Extents are computed from PERCENTILES of the per-axis projections,
+    not the raw min/max — a single outlier point (a stray ray return,
+    a sensor flash, a partially-segmented neighbouring object)
+    otherwise stretches the OBB across empty space. The defaults
+    (2nd / 98th percentile) reject the top + bottom 2 % of points per
+    axis, so the box hugs the dense bulk of the cluster instead of
+    its outliers.
+
+    Pass extent_pct_low=0, extent_pct_high=100 to recover the legacy
+    raw-min/max behaviour.
+    """
     center = points.mean(axis=0)
     centred = points - center
     cov = np.cov(centred.T)
@@ -47,10 +62,17 @@ def _principal_axes(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndar
     if np.linalg.det(eigvecs) < 0:
         eigvecs[:, 2] = -eigvecs[:, 2]
     projected = centred @ eigvecs
-    mins = projected.min(axis=0)
-    maxs = projected.max(axis=0)
+    if extent_pct_low <= 0.0 and extent_pct_high >= 100.0:
+        mins = projected.min(axis=0)
+        maxs = projected.max(axis=0)
+    else:
+        # np.percentile is per-column when axis=0.
+        mins = np.percentile(projected, extent_pct_low,  axis=0)
+        maxs = np.percentile(projected, extent_pct_high, axis=0)
     extents = maxs - mins
-    # Shift center to box center along the principal axes
+    # Shift center to box center along the (trimmed) principal axes
+    # so the OBB sits on the dense mass, not on the outlier-skewed
+    # arithmetic mean of all points.
     center = center + eigvecs @ ((mins + maxs) * 0.5)
     return center, eigvecs, extents
 
