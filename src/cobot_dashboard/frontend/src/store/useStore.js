@@ -429,6 +429,41 @@ const storeDefinition = (set, get) => ({
     return get().hydrateCells({ force: true })
   },
 
+  // ── Programs list — same pattern as cellsList. Populated by
+  // hydratePrograms() from /api/programs; consumed by
+  // ProgramLibrary so a tab-switch doesn't flash an empty list and
+  // a just-saved program is visible immediately. After ProgramEditor.
+  // handleSave we call refreshPrograms() so the cache is current
+  // before the operator navigates to Library.
+  programsList:         [],
+  programsHydrated:     false,
+  _programsLastHydrate: 0,
+  async hydratePrograms({ force = false } = {}) {
+    const now = (typeof performance !== 'undefined' && performance.now)
+      ? performance.now()
+      : Date.now()
+    if (!force && (now - (get()._programsLastHydrate || 0)) < 500) return
+    set({ _programsLastHydrate: now })
+    try {
+      const r = await fetch('/api/programs')
+      if (!r.ok) {
+        set({ programsHydrated: true })
+        return
+      }
+      const j = await r.json()
+      const programs = Array.isArray(j?.programs) ? j.programs : []
+      set({
+        programsList:     programs,
+        programsHydrated: true,
+      })
+    } catch {
+      set({ programsHydrated: true })
+    }
+  },
+  async refreshPrograms() {
+    return get().hydratePrograms({ force: true })
+  },
+
   // The editor's authoritative state — survives ProgramEditor unmount
   // so switching tabs and coming back preserves the program identity,
   // steps, and unsaved flag. Step mutations update this slice locally;

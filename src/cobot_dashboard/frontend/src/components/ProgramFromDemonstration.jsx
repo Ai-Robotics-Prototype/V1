@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import LiveRecorder from './LiveRecorder'
+import { useStore } from '../store/useStore'
 
 /*
  * Program from Demonstration — three-step modal mirroring the wizard's
@@ -199,6 +200,9 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
         setAccepting(false)
         return
       }
+      // Refresh the shared programs list so ProgramLibrary reflects
+      // the new draft program immediately (no mount-fetch lag).
+      try { useStore.getState().refreshPrograms?.() } catch {}
       onSaved?.({ id: data.program_id, name: program.name, ...program })
       onClose?.()
     } catch (e) {

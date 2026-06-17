@@ -86,21 +86,27 @@ const gridStyle = {
 }
 
 export default function App() {
-  const connectWS    = useStore((s) => s.connectWS)
-  const activeTab    = useStore((s) => s.activeTab)
-  const hydrateCells = useStore((s) => s.hydrateCells)
+  const connectWS       = useStore((s) => s.connectWS)
+  const activeTab       = useStore((s) => s.activeTab)
+  const hydrateCells    = useStore((s) => s.hydrateCells)
+  const hydratePrograms = useStore((s) => s.hydratePrograms)
 
   useEffect(() => {
     connectWS()
-    // Hydrate cells (list + active) from /api/cells at app boot so
-    // any tab the operator lands on first — Configure, 3D View,
-    // Program — sees a populated state on its first render. Also
-    // re-hydrate when the tab regains focus so out-of-band changes
-    // (another session, a fresh deploy) propagate without a page
-    // refresh. The store throttles redundant calls.
+    // Hydrate cells + programs from their respective endpoints at
+    // app boot so any tab the operator lands on first — Configure,
+    // 3D View, Program, Program Library — sees a populated state on
+    // its first render. Also re-hydrate when the tab regains focus
+    // so out-of-band changes (another session, a fresh deploy)
+    // propagate without a page refresh. The store throttles
+    // redundant calls.
     hydrateCells()
+    hydratePrograms()
     const onVisible = () => {
-      if (document.visibilityState === 'visible') hydrateCells()
+      if (document.visibilityState === 'visible') {
+        hydrateCells()
+        hydratePrograms()
+      }
     }
     document.addEventListener('visibilitychange', onVisible)
     return () => document.removeEventListener('visibilitychange', onVisible)
@@ -111,12 +117,16 @@ export default function App() {
   // Configure tab the cells section needs fresh data — without this,
   // Configure relied on its own mount-effect fetch which silently
   // swallowed any transient failure and left the list at "No cells
-  // commissioned yet" until manual page refresh. Hydrate on every
-  // tab change for the cell-aware tabs; the store throttles within
-  // a 500 ms window so this is cheap.
+  // commissioned yet" until manual page refresh. Same idea for the
+  // Programs library: a tab switch should never flash an empty list
+  // before the data arrives.
+  // The store throttles within a 500 ms window so this is cheap.
   useEffect(() => {
     if (['configure', '3dview', 'program', 'adaptive_picking'].includes(activeTab)) {
       hydrateCells()
+    }
+    if (['programs', 'program'].includes(activeTab)) {
+      hydratePrograms()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab])

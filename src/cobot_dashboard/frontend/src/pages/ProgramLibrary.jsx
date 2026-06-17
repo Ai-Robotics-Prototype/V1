@@ -294,39 +294,59 @@ function ProgramDetailsModal({ prog, onClose, onEdit, onDuplicate, onDelete }) {
 // operator can pick an active program without the Edit/Duplicate/Delete
 // affordances getting in the way.
 export default function ProgramLibrary({ onSelectProgram } = {}) {
-  const [programs, setPrograms]             = useState([])
+  // Programs are mirrored into the Zustand store (`programsList` +
+  // `programsHydrated`) so a tab-switch never flashes an empty
+  // initial state and saves elsewhere in the app are visible
+  // instantly. Folders are tab-local; cells already live in the
+  // shared store via cellsList.
+  const programs        = useStore((s) => s.programsList)
+  const programsHydrated = useStore((s) => s.programsHydrated)
+  const refreshPrograms = useStore((s) => s.refreshPrograms)
+  const hydratePrograms = useStore((s) => s.hydratePrograms)
+  const cells           = useStore((s) => s.cellsList)
+  const refreshCells    = useStore((s) => s.refreshCells)
+
   const [folders, setFolders]               = useState([])
-  const [cells, setCells]                   = useState([])
   const [cellFilter, setCellFilter]         = useState('all')   // 'all' | 'none' | cell_id
   const [search, setSearch]                 = useState('')
   const [currentFolder, setCurrentFolder]   = useState(null)   // null = root
   const [selectedProgram, setSelectedProgram] = useState(null)
   const [rootDragOver, setRootDragOver]     = useState(false)
   const [error, setError]                   = useState(null)
+  const [foldersHydrated, setFoldersHydrated] = useState(false)
 
   const setLoadedProgram = useStore((s) => s.setLoadedProgram)
   const setTab           = useStore((s) => s.setTab)
   const addToast         = useStore((s) => s.addToast)
 
+  // Fetch folders (and refresh programs / cells via the store) on
+  // mount. App-level hydration already kicked off programs + cells
+  // when the operator switched to this tab, so this call is usually
+  // a no-op thanks to the 500 ms throttle — we keep it as a
+  // belt-and-suspenders so the page always renders against a fresh
+  // snapshot.
   const load = useCallback(async () => {
     setError(null)
+    refreshPrograms()
+    refreshCells()
     try {
-      const [pRes, fRes, cRes] = await Promise.all([
-        fetch('/api/programs'),
-        fetch('/api/folders'),
-        fetch('/api/cells'),
-      ])
-      const pData = await pRes.json()
+      const fRes = await fetch('/api/folders')
       const fData = await fRes.json()
-      const cData = await cRes.json().catch(() => ({ cells: [] }))
-      setPrograms(pData.programs || [])
       setFolders(fData.folders || [])
-      setCells(cData.cells || [])
+      setFoldersHydrated(true)
     } catch (e) {
       setError(e.message || String(e))
+      setFoldersHydrated(true)
     }
-  }, [])
+  }, [refreshPrograms, refreshCells])
   useEffect(() => { load() }, [load])
+
+  // If the operator lands here before App's tab-change hydrate ran
+  // for any reason, kick the programs hydrate ourselves so we never
+  // get stuck on the loading state.
+  useEffect(() => {
+    if (!programsHydrated) hydratePrograms()
+  }, [programsHydrated, hydratePrograms])
 
   const cellNameById = {}
   cells.forEach((c) => { cellNameById[c.cell_id] = c.name })
@@ -555,11 +575,43 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
             padding: '10px 14px', marginBottom: 14, fontSize: 13,
             background: '#fef2f2', color: '#b91c1c',
             border: '1px solid #fecaca', borderRadius: 8,
-          }}>{error}</div>
+            display: 'flex', alignItems: 'center', gap: 12,
+          }}>
+            <span style={{ flex: 1 }}>{error}</span>
+            <button onClick={() => load()}
+              style={{
+                padding: '4px 10px', fontSize: 12, fontWeight: 600,
+                background: '#fff', color: '#b91c1c',
+                border: '1px solid #fecaca', borderRadius: 4, cursor: 'pointer',
+              }}>Retry</button>
+          </div>
         )}
 
-        {/* The grid — folders first, then programs */}
-        {(viewFolders.length > 0 || viewPrograms.length > 0) ? (
+        {/* Loading skeleton — shown only when we've never heard
+            back from /api/programs OR /api/folders. Distinguishes
+            "fetch in flight, please wait" from "no programs exist".
+            Once either fetch resolves we render the grid (which can
+            still be empty); on subsequent tab-switches the cached
+            programsList shows instantly with no flash. */}
+        {(!programsHydrated || !foldersHydrated) ? (
+          <div style={{
+            padding: 60, textAlign: 'center', color: 'var(--text-muted)',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12,
+          }}>
+            <div style={{
+              width: 36, height: 36, borderRadius: '50%',
+              border: '3px solid var(--border)',
+              borderTopColor: '#2563EB',
+              animation: 'programLibSpin 0.9s linear infinite',
+            }} />
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>
+              Loading programs…
+            </div>
+            <style>{`@keyframes programLibSpin {
+              to { transform: rotate(360deg) }
+            }`}</style>
+          </div>
+        ) : (viewFolders.length > 0 || viewPrograms.length > 0) ? (
           <div style={{
             display: 'grid',
             gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',

@@ -1742,6 +1742,9 @@ export default function ProgramEditor() {
   const setProgramSteps    = useStore((s) => s.setProgramSteps)
   const loadedProgram      = useStore((s) => s.loadedProgram)
   const setLoadedProgram   = useStore((s) => s.setLoadedProgram)
+  // Refresh the shared programs list immediately on save/delete so
+  // ProgramLibrary never lags behind the editor.
+  const refreshPrograms    = useStore((s) => s.refreshPrograms)
   // For execution highlights we still need to know what the task
   // runner thinks is the active step. status comes from STATE.program
   // (the saved version that's actually running); we match by index so
@@ -2134,6 +2137,12 @@ export default function ProgramEditor() {
         // Mirror to backend STATE so the task runner sees the just-
         // saved program when the user clicks Run.
         setProgramSteps(steps)
+        // Refresh the shared programs list so ProgramLibrary sees
+        // the just-saved program WITHOUT waiting for its next
+        // mount-fetch. The store throttles within 500 ms but
+        // this is a force-refresh — the operator just changed
+        // the backend, we want the cache current immediately.
+        refreshPrograms?.()
         setSaveStatus('saved')
         setTimeout(() => setSaveStatus(null), 2000)
       } else {

@@ -2917,7 +2917,14 @@ export default function ProgramWizard({ onClose, onSaved }) {
         }),
       })
       const data = await res.json()
-      if (data.ok) { onSaved?.(data.program); onClose() }
+      if (data.ok) {
+        // Refresh the shared programs list so ProgramLibrary +
+        // anywhere else reading programsList sees the new program
+        // without waiting for its next mount-fetch.
+        try { useStore.getState().refreshPrograms?.() } catch {}
+        onSaved?.(data.program)
+        onClose()
+      }
     } catch {}
     setSaving(false)
   }
