@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
+import { createPortal } from 'react-dom'
 import { useStore } from '../store/useStore'
 import ProgramWizard from './ProgramWizard'
 import ProgramFromDemonstration from './ProgramFromDemonstration'
@@ -34,6 +35,76 @@ const TAG_COLORS = {
   HOME: '#6366f1', GRIPPER: '#f59e0b', MOVE: '#2563EB', PICK: '#16A34A',
   PLACE: '#0891b2', WAIT: '#6b7280', DETECT: '#8b5cf6', LOOP: '#ec4899',
   IO: '#f97316', SCAN: '#9333EA', PALLET: '#0f766e',
+}
+
+// LoadProgramsPanel — the "Load" dropdown for the Program editor.
+// Rendered through a portal to document.body and positioned with
+// position:fixed at the button's screen coordinates so the
+// toolbar's `overflowY:hidden` doesn't clip it. The previous
+// position:absolute + zIndex:21 implementation was both clipped by
+// the toolbar AND sat below most other page chrome (modals use
+// zIndex ~2000, the teach overlay 1000, etc.) — fixed here with
+// zIndex 4000+ which is well above any in-editor surface.
+function LoadProgramsPanel({ anchorRect, programs, onSelect, onDismiss }) {
+  // Position the dropdown's right edge under the button's right
+  // edge (matching the visual it had when it worked). Fall back to
+  // a safe top-right corner if the rect was lost between clicks.
+  const r = anchorRect
+  const PANEL_W = 280
+  const top = r ? Math.round(r.bottom + 4)
+                : 56
+  const left = r ? Math.max(8, Math.round(r.right - PANEL_W))
+                 : Math.max(8, (typeof window !== 'undefined' ? window.innerWidth : 1024) - PANEL_W - 16)
+  // Cap height to viewport so the dropdown never runs off the
+  // bottom on small displays / tablets.
+  const maxH = (typeof window !== 'undefined' ? window.innerHeight : 800) - top - 16
+  return (
+    <>
+      {/* Click-outside backdrop. zIndex sits just below the panel and
+          above all editor chrome. pointerEvents must NOT be 'none'
+          here — we need the backdrop to actually catch outside
+          clicks. */}
+      <div onClick={onDismiss}
+        style={{
+          position: 'fixed', inset: 0, zIndex: 4000,
+          background: 'transparent',
+        }} />
+      <div style={{
+        position: 'fixed', top, left,
+        zIndex: 4001,
+        width: PANEL_W, maxHeight: Math.max(120, maxH), overflowY: 'auto',
+        background: '#fff', color: '#111',
+        border: '1px solid #d1d5db', borderRadius: 8,
+        boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
+      }}>
+        <div style={{
+          padding: '8px 12px', borderBottom: '1px solid #e5e7eb',
+          fontSize: 11, color: '#6b7280', fontWeight: 600,
+        }}>
+          Saved Programs
+        </div>
+        {(!programs || programs.length === 0) ? (
+          <div style={{ padding: 16, textAlign: 'center', color: '#9ca3af', fontSize: 12 }}>
+            No saved programs yet
+          </div>
+        ) : programs.map((p) => (
+          <button key={p.id} onClick={() => onSelect(p.id)}
+            style={{
+              width: '100%', padding: '10px 12px', textAlign: 'left', cursor: 'pointer',
+              background: '#fff', border: 'none', borderBottom: '1px solid #f3f4f6',
+              display: 'block',
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = '#f0f9ff' }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = '#fff' }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: '#111' }}>{p.name}</div>
+            <div style={{ fontSize: 10, color: '#6b7280' }}>
+              {p.steps} step{p.steps === 1 ? '' : 's'}{p.updated ? ' · ' + p.updated : ''}
+            </div>
+          </button>
+        ))}
+      </div>
+    </>
+  )
 }
 
 // move_to_pallet steps are config-driven — the executor computes the
@@ -2075,16 +2146,52 @@ export default function ProgramEditor() {
     }
   }
 
+  // Anchor rect for the portal'd Load dropdown. The button lives
+  // inside a flex toolbar with `overflowY: hidden`, which would clip
+  // any absolutely-positioned popover. We render the panel through a
+  // portal to document.body with position:fixed at the button's
+  // screen coordinates so no ancestor overflow can cut it off, and
+  // raise the z-index above other page chrome.
+  const loadBtnRef = useRef(null)
+  const [loadBtnRect, setLoadBtnRect] = useState(null)
+
   async function openLoadMenu() {
+    // Diagnostic — if the dropdown ever fails to appear we want to
+    // know whether the click reached this handler at all (the state
+    // flip happens; the menu's clipping/z-index is the problem) vs.
+    // some invisible overlay swallowing the click.
+    console.log('[ProgramEditor] Load clicked — fetching /api/programs')
+    if (loadBtnRef.current) {
+      setLoadBtnRect(loadBtnRef.current.getBoundingClientRect())
+    }
     try {
       const res = await fetch('/api/programs')
       const data = await res.json()
       setSavedPrograms(data.programs || [])
-    } catch {
+      console.log('[ProgramEditor] Loaded', (data.programs || []).length, 'saved programs')
+    } catch (e) {
+      console.warn('[ProgramEditor] /api/programs failed', e)
       setSavedPrograms([])
     }
     setShowLoadMenu(true)
   }
+
+  // Keep the dropdown anchored if the layout shifts while it's open
+  // (resize, scroll inside the toolbar).
+  useEffect(() => {
+    if (!showLoadMenu) return
+    const update = () => {
+      if (loadBtnRef.current) {
+        setLoadBtnRect(loadBtnRef.current.getBoundingClientRect())
+      }
+    }
+    window.addEventListener('resize', update)
+    window.addEventListener('scroll', update, true)
+    return () => {
+      window.removeEventListener('resize', update)
+      window.removeEventListener('scroll', update, true)
+    }
+  }, [showLoadMenu])
 
   async function loadProgram(id) {
     try {
@@ -2159,8 +2266,8 @@ export default function ProgramEditor() {
             : unsaved ? 'Save' : 'Saved'}
         </button>
 
-        <div style={{ position: 'relative', flexShrink: 0 }}>
-          <button onClick={openLoadMenu}
+        <div style={{ flexShrink: 0 }}>
+          <button ref={loadBtnRef} onClick={openLoadMenu}
             style={{
               padding: '6px 12px', fontSize: 12, fontWeight: 600,
               background: '#f3f4f6', color: '#374151',
@@ -2168,43 +2275,18 @@ export default function ProgramEditor() {
             }}>
             Load
           </button>
-          {showLoadMenu && (
-            <>
-              <div onClick={() => setShowLoadMenu(false)}
-                style={{ position: 'fixed', inset: 0, zIndex: 20, background: 'transparent' }} />
-              <div style={{
-                position: 'absolute', top: 'calc(100% + 4px)', right: 0, zIndex: 21,
-                background: '#fff', border: '1px solid #d1d5db', borderRadius: 8,
-                boxShadow: '0 8px 24px rgba(0,0,0,0.12)',
-                width: 280, maxHeight: 360, overflowY: 'auto',
-              }}>
-                <div style={{
-                  padding: '8px 12px', borderBottom: '1px solid #e5e7eb',
-                  fontSize: 11, color: '#6b7280', fontWeight: 600,
-                }}>
-                  Saved Programs
-                </div>
-                {savedPrograms.length === 0 ? (
-                  <div style={{ padding: 16, textAlign: 'center', color: '#9ca3af', fontSize: 12 }}>
-                    No saved programs yet
-                  </div>
-                ) : savedPrograms.map((p) => (
-                  <button key={p.id} onClick={() => loadProgram(p.id)}
-                    style={{
-                      width: '100%', padding: '10px 12px', textAlign: 'left', cursor: 'pointer',
-                      background: '#fff', border: 'none', borderBottom: '1px solid #f3f4f6',
-                      display: 'block',
-                    }}
-                    onMouseEnter={(e) => { e.currentTarget.style.background = '#f0f9ff' }}
-                    onMouseLeave={(e) => { e.currentTarget.style.background = '#fff' }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, color: '#111' }}>{p.name}</div>
-                    <div style={{ fontSize: 10, color: '#6b7280' }}>
-                      {p.steps} step{p.steps === 1 ? '' : 's'}{p.updated ? ' · ' + p.updated : ''}
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </>
+          {/* Portal'd dropdown — see LoadProgramsPanel below. The
+              portal escapes the toolbar's overflow:hidden so the
+              menu can render at full size, and we anchor with
+              position:fixed at the button's screen coordinates. */}
+          {showLoadMenu && createPortal(
+            <LoadProgramsPanel
+              anchorRect={loadBtnRect}
+              programs={savedPrograms}
+              onSelect={loadProgram}
+              onDismiss={() => setShowLoadMenu(false)}
+            />,
+            document.body,
           )}
         </div>
 
