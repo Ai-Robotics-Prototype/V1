@@ -3,11 +3,18 @@ import { Html } from '@react-three/drei'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
 
-// LiDAR (ROS) frame:  +X forward, +Y left, +Z up.
-// Three.js scene used by ArmViewer3D: lidarToThree maps (x,y,z) → (x, z, y)
-// so world up is screen up. All collision geometry uses the SAME mapping
-// — DO NOT change without updating ArmViewer3D / LidarPanel together.
-function lidarToThree(x, y, z) { return [x, z, y] }
+// LiDAR (ROS) frame:  +X forward, +Y left, +Z up  (right-handed).
+// Three.js scene used by ArmViewer3D: lidarToThree maps
+//   (x, y, z) → (x, z, -y)
+// — handedness-preserving (det = +1, NOT a reflection). The previous
+// bare (x, z, y) swap was a reflection and produced a mirrored scene
+// where a known left-side object appeared on the right. Every cloud
+// loop + helper in LidarPanel / ArmViewer3D / CellDetailPanel uses
+// this exact mapping; collision-box positions must match.
+//
+// Under this mapping a positive ROS yaw (rotation about ROS Z) maps
+// to a positive Three.js Y rotation by the same angle — same sign.
+function lidarToThree(x, y, z) { return [x, z, -y] }
 
 function statusColors(status) {
   switch (status) {
@@ -75,10 +82,12 @@ function ObjectBox({ obj, showLabel }) {
     ? '#ea580c'
     : statusColors(status).stroke
   const [px, py, pz] = lidarToThree(center.x || 0, center.y || 0, center.z || 0)
-  // Map URDF/LiDAR quaternion (rotation about Z is "yaw" in LiDAR frame)
-  // into Three's frame. We approximate by keeping yaw about world up (Y in
-  // Three) — close enough for visualization since the object boxes are
-  // boxes, not robot models.
+  // Map LiDAR/ROS quaternion (rotation about Z is "yaw" in LiDAR frame)
+  // into Three's frame. Under the handedness-preserving lidarToThree
+  // mapping (x, z, -y), ROS yaw about +Z is the same sign as Three Y
+  // rotation about +Y — so we use +yaw directly. (The old scene used
+  // `-yaw` to compensate for the previous mirrored mapping; that
+  // negation is no longer needed.)
   const q = orientation
   const yaw = 2 * Math.atan2(q.z || 0, q.w || 1)
   // Three's box geometry argument order is X, Y, Z which after our axis
@@ -88,7 +97,7 @@ function ObjectBox({ obj, showLabel }) {
   const dz = Math.max(0.005, dimensions.z || 0)
 
   return (
-    <group position={[px, py, pz]} rotation={[0, -yaw, 0]}>
+    <group position={[px, py, pz]} rotation={[0, yaw, 0]}>
       <mesh>
         <boxGeometry args={[dx, dz, dy]} />
         <meshBasicMaterial

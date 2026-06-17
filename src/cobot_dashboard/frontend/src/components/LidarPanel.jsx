@@ -7,12 +7,19 @@ import { useStore } from '../store/useStore'
 const HOST     = typeof window !== 'undefined' ? window.location.host : 'localhost:8080'
 const WS_PROTO = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws'
 
-// Single source of truth for livox_frame (ROS: X=forward, Y=left, Z=up)
-// to three.js (X=right, Y=up, Z=toward camera). The PointCloud, mesh,
-// detections, and grasps all use this — they must, or 3D objects from
-// different streams end up rendered at inconsistent positions.
+// Single source of truth for livox_frame (ROS: X=forward, Y=left, Z=up,
+// right-handed) → three.js (X=right, Y=up, Z=toward camera, also
+// right-handed). The mapping (x, y, z) → (x, z, -y) negates Y to
+// PRESERVE handedness — the previous (x, z, y) was a reflection and
+// produced a mirrored scene (left/right swapped). The URDF gets the
+// equivalent rotation via `urdf.rotation.x = -π/2` in ArmViewer3D; the
+// two paths agree on the corrected (non-mirrored) mapping.
+//
+// PointCloud, mesh, detections, grasps — every consumer in this file
+// uses this exact mapping (function or inlined copy), so 3D objects
+// from different streams stay co-located.
 function lidarToThree(x, y, z) {
-  return [x, z, y]
+  return [x, z, -y]
 }
 
 // Height-based ramp tuned for legibility on the dark panel background.
@@ -52,7 +59,8 @@ function PointCloud({ pointsRef }) {
     let n = 0
 
     // Binary wire format: { binary: true, floats: Float32Array, n }
-    // floats are interleaved XYZ in LiDAR frame; map (x, y, z) -> (x, z, y).
+    // floats are interleaved XYZ in LiDAR frame; map (x, y, z) -> (x, z, -y).
+    // The -y negation preserves handedness — see lidarToThree comment.
     if (data.binary && data.floats) {
       const f = data.floats
       n = Math.min(data.n, MAX_PTS)
@@ -62,7 +70,7 @@ function PointCloud({ pointsRef }) {
         const pz = f[i * 3 + 2]
         positions[i * 3]     = px
         positions[i * 3 + 1] = pz
-        positions[i * 3 + 2] = py
+        positions[i * 3 + 2] = -py
         const c = heightColor(pz)
         colors[i * 3]     = c.r
         colors[i * 3 + 1] = c.g
@@ -77,10 +85,10 @@ function PointCloud({ pointsRef }) {
         const px = p[i * 3]
         const py = p[i * 3 + 1]
         const pz = p[i * 3 + 2]
-        // lidarToThree mapping inlined: (x, y, z) -> (x, z, y)
+        // lidarToThree mapping inlined: (x, y, z) -> (x, z, -y)
         positions[i * 3]     = px
         positions[i * 3 + 1] = pz
-        positions[i * 3 + 2] = py
+        positions[i * 3 + 2] = -py
         const c = heightColor(pz)
         colors[i * 3]     = c.r
         colors[i * 3 + 1] = c.g
@@ -94,7 +102,7 @@ function PointCloud({ pointsRef }) {
         const q = pts[i]
         positions[i * 3]     = q.x
         positions[i * 3 + 1] = q.z
-        positions[i * 3 + 2] = q.y
+        positions[i * 3 + 2] = -q.y
         const c = heightColor(q.z)
         colors[i * 3]     = c.r
         colors[i * 3 + 1] = c.g
@@ -348,13 +356,14 @@ function PlacedObjects({ objects }) {
 // Real-time 3D detections from /perception/detections_3d (depth_segment_node).
 //
 // Detections are published in livox_frame (ROS: X=forward, Y=left, Z=up).
-// PointCloud uses the mapping  three.x = lidar.x, three.y = lidar.z,
-// three.z = lidar.y  — we match it here so markers and points share a
-// world. OBB orientations are also in livox_frame; we extract the yaw
-// component (rotation about lidar Z, which is three.js Y) and re-build a
-// three.js-Y rotation — the y/z swap from lidar to three.js is a
-// reflection, not a pure rotation, so the lidar quaternion can't be
-// reused verbatim.
+// PointCloud uses the handedness-preserving mapping
+//   three.x = lidar.x, three.y = lidar.z, three.z = -lidar.y
+// — we match it here so markers and points share a world.
+// OBB orientations are also in livox_frame; we extract the yaw
+// component (rotation about lidar Z, which is three.js Y) and re-build
+// a three.js-Y rotation directly. The new mapping is a proper rotation
+// (det = +1), so a positive ROS yaw maps to a positive three.js Y
+// rotation by the same angle — no sign flip needed.
 //
 // Detections are positioned at the published centroid using the shared
 // lidarToThree mapping — identical to PointCloud, mesh, and grasps. The

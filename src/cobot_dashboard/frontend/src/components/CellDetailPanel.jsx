@@ -34,10 +34,11 @@ function StaticPoints({ data, color }) {
     const p = data.p
     for (let i = 0; i < n; i++) {
       const px = p[i * 3], py = p[i * 3 + 1], pz = p[i * 3 + 2]
-      // LiDAR (x,y,z) -> Three (x, z, y) — same mapping the live panel uses.
+      // LiDAR (x,y,z) -> Three (x, z, -y) — handedness-preserving, matches
+      // LidarPanel/ArmViewer3D. The -y prevents the left/right mirror.
       positions[i * 3] = px
       positions[i * 3 + 1] = pz
-      positions[i * 3 + 2] = py
+      positions[i * 3 + 2] = -py
       const c = color || heightColor(pz)
       colors[i * 3] = c[0]; colors[i * 3 + 1] = c[1]; colors[i * 3 + 2] = c[2]
     }
@@ -77,9 +78,10 @@ function LivePoints({ pointsRef, color }) {
       n = Math.min(d.n, MAX_PTS)
       for (let i = 0; i < n; i++) {
         const px = f[i * 3], py = f[i * 3 + 1], pz = f[i * 3 + 2]
+        // LiDAR -> Three (x, z, -y) — handedness-preserving.
         positions[i * 3] = px
         positions[i * 3 + 1] = pz
-        positions[i * 3 + 2] = py
+        positions[i * 3 + 2] = -py
         const c = color || heightColor(pz)
         colors[i * 3] = c[0]; colors[i * 3 + 1] = c[1]; colors[i * 3 + 2] = c[2]
       }
@@ -90,7 +92,7 @@ function LivePoints({ pointsRef, color }) {
         const px = p[i * 3], py = p[i * 3 + 1], pz = p[i * 3 + 2]
         positions[i * 3] = px
         positions[i * 3 + 1] = pz
-        positions[i * 3 + 2] = py
+        positions[i * 3 + 2] = -py
         const c = color || heightColor(pz)
         colors[i * 3] = c[0]; colors[i * 3 + 1] = c[1]; colors[i * 3 + 2] = c[2]
       }

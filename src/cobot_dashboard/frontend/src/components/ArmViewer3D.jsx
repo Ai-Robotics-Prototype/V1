@@ -62,7 +62,10 @@ const ROBOT_MATERIAL = new THREE.MeshPhongMaterial({
 // LidarPanel exactly so the two views read identically:
 //
 //   - subscribes to /ws/lidar (same wire format)
-//   - LiDAR (x,y,z) → Three (x, z, y), matching LidarPanel.lidarToThree
+//   - LiDAR (x,y,z) → Three (x, z, -y), handedness-preserving,
+//     matching LidarPanel.lidarToThree exactly. The -y negation
+//     prevents the left/right mirror that a bare (x, z, y) swap
+//     produced (right-handed ROS → left-handed Three = reflection).
 //   - same height ramp, same `size: 0.005`, same sizeAttenuation
 //
 // URDF gets its own Z-up→Y-up via `urdf.rotation.x = -π/2` (see
@@ -202,10 +205,12 @@ function BaselineCloudInScene({ onStatusChange }) {
     const n = Math.min(cloud.n, LIDAR_MAX_PTS)
     for (let i = 0; i < n; i++) {
       const px = p[i * 3], py = p[i * 3 + 1], pz = p[i * 3 + 2]
-      // LiDAR (ROS Z-up) → Three (Y-up): (x, y, z) → (x, z, y)
+      // LiDAR (ROS Z-up) → Three (Y-up): (x, y, z) → (x, z, -y)
+      // The -y is essential: a bare (x, z, y) swap is a REFLECTION,
+      // not a rotation, and produces a mirrored scene.
       positions[i * 3]     = px
       positions[i * 3 + 1] = pz
-      positions[i * 3 + 2] = py
+      positions[i * 3 + 2] = -py
       const c = lidarHeightColor(pz)
       colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b
     }
@@ -290,10 +295,10 @@ function LidarCloudInScene() {
       n = Math.min(d.n, LIDAR_MAX_PTS)
       for (let i = 0; i < n; i++) {
         const px = f[i * 3], py = f[i * 3 + 1], pz = f[i * 3 + 2]
-        // LiDAR (ROS Z-up) → Three (Y-up): (x, y, z) → (x, z, y)
+        // LiDAR (ROS Z-up) → Three (Y-up): (x, y, z) → (x, z, -y)
         positions[i * 3]     = px
         positions[i * 3 + 1] = pz
-        positions[i * 3 + 2] = py
+        positions[i * 3 + 2] = -py
         const c = lidarHeightColor(pz)
         colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b
       }
@@ -304,7 +309,7 @@ function LidarCloudInScene() {
         const px = p[i * 3], py = p[i * 3 + 1], pz = p[i * 3 + 2]
         positions[i * 3]     = px
         positions[i * 3 + 1] = pz
-        positions[i * 3 + 2] = py
+        positions[i * 3 + 2] = -py
         const c = lidarHeightColor(pz)
         colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b
       }
