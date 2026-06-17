@@ -60,16 +60,36 @@ from lidar_object_identifier.shape_analyzer import analyze
 
 # ── Tuning defaults ──────────────────────────────────────────────────
 DEFAULTS = {
-    'voxel_m':              0.03,
+    # Smaller voxel keeps more points per cluster — important because
+    # the saved baseline is already voxel-downsampled (~1 cm) and the
+    # cluster body counts are correspondingly lower than on raw LiDAR.
+    'voxel_m':              0.02,
     'cluster_tolerance_m':  0.08,
-    'cluster_min_points':   30,
+    # Loosened for voxel-downsampled baselines: a typical bench-top
+    # fixture only contributes a few dozen voxel-sampled points, so
+    # demanding 30 to start a DBSCAN cluster discards real objects.
+    'cluster_min_points':   15,
     'reach_radius_m':       1.4,
     'reach_z_max_m':        2.5,
     'base_self_radius_m':   0.20,
     'base_self_z_max_m':    0.30,
-    'min_volume_m3':        0.001,
-    'min_point_count':      60,
-    'merge_gap_m':          0.05,
+    # Was 0.001 (1 L); small real fixtures (e.g. an 11×7×4 cm bracket
+    # → ~0.3 L) were being rejected. 0.0001 (0.1 L) still rules out
+    # 3-cm-cube noise blobs but keeps useful small obstacles.
+    'min_volume_m3':        0.0001,
+    # Same reason as cluster_min_points — voxel-down clouds yield fewer
+    # points per object. Was 60; 25 still rejects sparse noise but
+    # keeps the smaller real fixtures.
+    'min_point_count':      25,
+    # Merge step DISABLED by default. The previous 5 cm gap chained
+    # objects across the workspace; lowering to 0 didn't help because
+    # OBB→AABB inflation makes rotated OBBs' axis-aligned bboxes
+    # overlap even when the OBBs themselves don't. DBSCAN at
+    # cluster_tolerance_m=0.08 already keeps a single physical object
+    # as one cluster, so per-cluster boxes are the natural unit —
+    # merging only exists to glue fragments that DBSCAN already
+    # handles. Set merge_gap_m > 0 to re-enable for special cases.
+    'merge_gap_m':         -1.0,
     'inflate_margin_m':     0.05,
     # Ground filter (passed to GroundExtractor)
     'ground_dist_thresh_m': 0.015,
@@ -81,14 +101,17 @@ DEFAULTS = {
     # becoming an "obstacle".
     'ground_clearance_m':   0.03,
     # ── Max-size sanity rejection (per cluster + per merged group) ──
-    # A real bench/fixture inside the 1.4 m reach is much smaller than
-    # the reach disc. Anything wider than ~0.9 m on a horizontal axis
-    # is almost certainly the floor or a DBSCAN chain across noise.
-    'max_obstacle_xy_m':    0.9,
+    # The floor / DBSCAN-chained-noise box that originally appeared
+    # was ~3 m on a side — well above any real workshop fixture
+    # inside a 1.4 m reach. Cap a single obstacle at 1.8 m on BOTH
+    # horizontal axes: that still rejects the 2.6-3 m floor chain
+    # but allows realistic benches and machine housings.
+    'max_obstacle_xy_m':    1.8,
     # Reject clusters whose XY footprint covers more than this
-    # fraction of the reach disc area (π·r²). 40 % of the 6.16 m²
-    # reach disc is ~2.5 m² — way bigger than any real fixture.
-    'max_footprint_frac':   0.40,
+    # fraction of the reach disc area (π·r²). 55 % of 6.16 m² ≈ 3.4 m².
+    # The floor's footprint (~8 m²) is comfortably above; a real
+    # 1.5 m bench (~2.25 m²) is below.
+    'max_footprint_frac':   0.55,
     # Reject clusters that are very flat AND large: a wide sheet
     # under 4 cm tall is the floor / a tabletop residue, not an
     # obstacle to plan around.
@@ -172,8 +195,15 @@ def merge_aabbs(aabbs: list[tuple[np.ndarray, np.ndarray]],
                 gap_threshold_m: float,
                 ) -> list[list[int]]:
     """Union-find merge of AABBs that overlap or are within
-    `gap_threshold_m` of each other. Returns groups of source indices."""
+    `gap_threshold_m` of each other. Returns groups of source indices.
+
+    A negative `gap_threshold_m` disables merging entirely (one group
+    per input) — this is the default for static-baseline zones because
+    OBB→AABB inflation chains separate real objects together.
+    """
     n = len(aabbs)
+    if gap_threshold_m < 0:
+        return [[i] for i in range(n)]
     parent = list(range(n))
 
     def find(i):

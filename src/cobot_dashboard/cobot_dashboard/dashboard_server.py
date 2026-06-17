@@ -5745,11 +5745,18 @@ if FASTAPI_AVAILABLE:
             pts = _np.asarray(pcd.points, dtype='float32') if _np is not None else None
             if pts is None or pts.size == 0:
                 return {'cell_id': cell_id, 'n': 0, 'p': [], 'source': 'baseline_cloud.pcd'}
+            # Bring the cloud under max_points with as LITTLE
+            # downsampling as possible — the 3D View wants the
+            # densest cloud the SPA buffer can hold. The old loop
+            # used a 1.6× voxel step which overshoots aggressively
+            # (e.g. requesting 80 k from a 529 k-point PCD landed at
+            # 37 k, then capping at 131 k landed at 86 k). A 1.15×
+            # step converges to within a few percent of the target.
             if pts.shape[0] > max_points:
                 voxel = float(prof.get('baseline_voxel_m') or 0.01)
                 tries = 0
-                while pts.shape[0] > max_points and tries < 6:
-                    voxel *= 1.6
+                while pts.shape[0] > max_points and tries < 20:
+                    voxel *= 1.15
                     pcd2 = _o3d.geometry.PointCloud()
                     pcd2.points = _o3d.utility.Vector3dVector(pts.astype('float64'))
                     pcd2 = pcd2.voxel_down_sample(voxel)

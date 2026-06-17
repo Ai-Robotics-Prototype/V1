@@ -141,7 +141,12 @@ function BaselineCloudInScene({ onStatusChange }) {
     let cancelled = false
     onStatusChange?.({ cell_id: activeCellId, name: cellName,
                        hydrated: true, n: 0, message: 'loading_baseline' })
-    fetch(`/api/cells/${encodeURIComponent(activeCellId)}/baseline/cloud?max_points=80000`)
+    // Fetch as many points as the SPA buffer can hold so the saved
+    // baseline reads as DENSE as the live LidarPanel cloud. The
+    // server returns the cloud voxel-downsampled to fit under this
+    // cap; 131 072 is LIDAR_MAX_PTS, the size of the GPU buffer we
+    // populate below — no point requesting more.
+    fetch(`/api/cells/${encodeURIComponent(activeCellId)}/baseline/cloud?max_points=${LIDAR_MAX_PTS}`)
       .then(async (r) => {
         if (cancelled) return
         if (r.status === 404) {
@@ -214,7 +219,13 @@ function BaselineCloudInScene({ onStatusChange }) {
     <points>
       <primitive object={geoRef.current} attach="geometry" />
       <pointsMaterial
-        size={0.006}
+        // 0.012 m world-size dots — matches the dense look of
+        // LidarPanel on the Cameras & LiDAR tab. The previous
+        // 0.006 was visually correct for raw live LiDAR at 30 Hz
+        // (each frame adds points, the eye integrates), but for a
+        // static, downsampled baseline the cloud needs bigger
+        // dots to read as solid.
+        size={0.012}
         vertexColors
         sizeAttenuation={true}
         transparent
