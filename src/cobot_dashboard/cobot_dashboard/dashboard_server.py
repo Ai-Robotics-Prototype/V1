@@ -5653,6 +5653,43 @@ if FASTAPI_AVAILABLE:
                     if 'baseline' not in prof.get('steps_completed', []):
                         prof.setdefault('steps_completed', []).append('baseline')
                     _cell_save_profile(prof)
+
+            # Auto-build static keep-out zones from the freshly-saved
+            # baseline so a commissioned (or recaptured) cell already
+            # has obstacles in the 3D view + capsule check without the
+            # operator having to click "Build zones". Best-effort: any
+            # failure (no scipy at runtime, empty cluster set, etc.)
+            # gets logged on sess so the wizard can surface it but
+            # does NOT block the baseline 'done' status.
+            try:
+                try:
+                    from . import static_zones as _sz
+                except ImportError:
+                    import static_zones as _sz  # type: ignore
+                zr = _sz.build_zones_from_pcd(final_path)
+                _sz.save_zones(cell_id, zr)
+                sess['zones_built'] = int(zr.get('n_zones', 0))
+                sess['zones_built_at'] = zr.get('built_at')
+                # Tell collision_monitor to reload — it only re-reads
+                # zones for the ACTIVE cell, so this is a no-op for an
+                # inactive recapture but cheap either way.
+                try:
+                    if _ros_node is not None:
+                        m = String()
+                        m.data = json.dumps({'action': 'reload', 'cell_id': cell_id,
+                                             'reason': 'auto_build_after_baseline'})
+                        pub = getattr(_ros_node, '_collision_reload_pub', None)
+                        if pub is None:
+                            pub = _ros_node.create_publisher(String, '/collision/reload', 5)
+                            _ros_node._collision_reload_pub = pub
+                        pub.publish(m)
+                except Exception:
+                    pass
+            except Exception as ze:
+                # Don't block the baseline result — the operator can
+                # still hit "Rebuild zones" manually from Configure.
+                sess['zones_error'] = str(ze)
+
             sess['status']    = 'done'
             sess['final_count'] = int(voxeled_count)
         except Exception as e:
