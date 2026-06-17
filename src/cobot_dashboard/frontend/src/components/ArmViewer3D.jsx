@@ -724,22 +724,60 @@ function StaticZonesToggle({ value, onChange }) {
   const hasStatic = useStore((s) => (s.collision?.objects || []).some(
     (o) => o.source === 'baseline_static'))
   if (!hasStatic) return null
+  // Larger control sized for tablet thumbs — pill-shaped sliding
+  // switch instead of a native checkbox. On = orange (#ea580c)
+  // matching the baseline-static box color; off = neutral gray.
+  const on = !!value
   return (
     <div style={{
-      position: 'absolute', top: 8, left: 8, padding: '6px 10px',
-      background: 'rgba(255,255,255,0.95)', borderRadius: 8,
+      position: 'absolute', top: 8, left: 8,
+      padding: '10px 14px',
+      background: 'rgba(255,255,255,0.96)', borderRadius: 10,
       border: '1px solid #fed7aa',
-      boxShadow: '0 2px 8px rgba(0,0,0,0.08)', zIndex: 11,
-      display: 'flex', alignItems: 'center', gap: 8,
-      fontSize: 11, color: '#9a3412',
-    }}>
-      <span style={{ width: 10, height: 10, borderRadius: 2,
-                     background: '#ea580c', border: '1px solid #c2410c' }} />
-      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
-        <input type="checkbox" checked={!!value}
-          onChange={(e) => onChange(e.target.checked)} />
-        <span style={{ fontWeight: 600 }}>Static keep-out zones</span>
-      </label>
+      boxShadow: '0 2px 10px rgba(0,0,0,0.10)', zIndex: 11,
+      display: 'flex', alignItems: 'center', gap: 12,
+      fontSize: 13, color: '#9a3412',
+      cursor: 'pointer',
+      userSelect: 'none',
+    }}
+      role="switch"
+      tabIndex={0}
+      aria-checked={on}
+      aria-label="Static keep-out zones"
+      onClick={() => onChange(!on)}
+      onKeyDown={(e) => {
+        if (e.key === ' ' || e.key === 'Enter') {
+          e.preventDefault()
+          onChange(!on)
+        }
+      }}>
+      <span style={{
+        width: 14, height: 14, borderRadius: 3,
+        background: '#ea580c', border: '1px solid #c2410c', flexShrink: 0,
+      }} />
+      <span style={{ fontWeight: 600, fontSize: 14 }}>Static keep-out zones</span>
+      {/* Sliding switch — track + knob. 44px wide × 24px tall track
+          with a 20px knob meets the typical tablet touch target. */}
+      <span style={{
+        position: 'relative',
+        width: 44, height: 24, flexShrink: 0,
+        borderRadius: 999,
+        background: on ? '#ea580c' : '#cbd5e1',
+        transition: 'background 160ms ease',
+        boxShadow: on
+          ? 'inset 0 1px 2px rgba(0,0,0,0.18)'
+          : 'inset 0 1px 2px rgba(0,0,0,0.10)',
+      }}>
+        <span style={{
+          position: 'absolute',
+          top: 2, left: on ? 22 : 2,
+          width: 20, height: 20,
+          borderRadius: '50%',
+          background: '#fff',
+          boxShadow: '0 1px 3px rgba(0,0,0,0.25)',
+          transition: 'left 160ms ease',
+        }} />
+      </span>
     </div>
   )
 }
@@ -900,20 +938,11 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay 
         </div>
       )}
 
-      {/* Joint readout, top-right */}
-      <div style={{
-        position: 'absolute', top: 8, right: 8, padding: '8px 12px',
-        background: 'rgba(255,255,255,0.95)', borderRadius: 8, fontSize: 12,
-        fontFamily: 'var(--font-mono, monospace)', color: '#374151', zIndex: 10,
-        boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-      }}>
-        {JOINT_NAMES.map((name, i) => (
-          <div key={name} style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}>
-            <span style={{ fontWeight: 600, color: JOINT_COLORS[i] }}>{name}</span>
-            <span>{(liveJointsDeg[i] || 0).toFixed(1)}°</span>
-          </div>
-        ))}
-      </div>
+      {/* Joint readout overlay removed — the J1..J6 angles were
+          duplicate scaffolding once the URDF and live pose were
+          rendering correctly. Keep JOINT_NAMES / JOINT_COLORS in
+          this file (the FK loop uses them); just don't render
+          the floating readout chip in the top-right anymore. */}
 
       {/* Status pill, bottom-right — DEV scaffolding. Hidden by default;
           reveal with ?debug=1 in the URL when diagnosing URDF or

@@ -2988,13 +2988,16 @@ export default function AdaptivePicking() {
   const [selectedPart, setSelected]     = useState(null)
   const [uploading, setUploading]       = useState(false)
   const [uploadError, setUploadError]   = useState(null)
-  const [filterOp, setFilterOp]         = useState(null)
   const [teachingPart, setTeachingPart] = useState(null)
   const fileInputRef = useRef(null)
 
-  const filteredParts = filterOp
-    ? parts.filter(p => (p.operations || []).includes(filterOp))
-    : parts
+  // Previously this view had an operation filter row (All / Pick /
+  // Insert / Inspect / Sort / Assemble) that hid parts not tagged
+  // with the active op. The filter created confusion when freshly-
+  // uploaded parts (no operations yet) seemed to "vanish" under
+  // anything other than All. Removed; the list now always shows
+  // every saved part.
+  const filteredParts = parts
 
   async function refresh() {
     try {
@@ -3080,21 +3083,14 @@ export default function AdaptivePicking() {
               background: 'rgba(59,130,246,0.85)', color: '#fff', border: 'none',
               borderRadius: 'var(--radius-md, 6px)', marginBottom: 8,
             }}
-          >{uploading ? 'Processing STEP file…' : 'Upload STEP File only'}</button>
+          >{uploading ? 'Parsing…' : 'Upload STEP file'}</button>
           <input ref={fileInputRef} type="file" accept=".step,.stp,.STEP,.STP"
             style={{ display: 'none' }}
             onChange={(e) => handleUpload(e.target.files?.[0])}
           />
-
-          <div
-            onDrop={(e) => { e.preventDefault(); handleUpload(e.dataTransfer.files?.[0]) }}
-            onDragOver={(e) => e.preventDefault()}
-            style={{
-              padding: 12, fontSize: 11, textAlign: 'center',
-              border: '2px dashed var(--border)', borderRadius: 'var(--radius-md, 6px)',
-              color: 'var(--text-muted, #9ca3af)', background: 'rgba(255,255,255,0.02)',
-            }}
-          >or drop a .STEP file here</div>
+          {/* The big dashed drop-target was visual noise — the
+              "Upload STEP file" button above is the only upload
+              path and drag-drop wasn't broadly used. */}
 
           {uploadError && (
             <div style={{
@@ -3105,44 +3101,13 @@ export default function AdaptivePicking() {
           )}
         </div>
 
-        {/* Operation filter bar */}
-        {parts.length > 0 && (
-          <div style={{
-            display: 'flex', flexWrap: 'wrap', gap: 4,
-            padding: '8px 16px 4px',
-          }}>
-            {[null, 'pick', 'insert', 'inspect', 'sort', 'assemble'].map((op) => {
-              const active = filterOp === op
-              return (
-                <button key={op ?? 'all'} onClick={() => setFilterOp(op)}
-                  style={{
-                    fontSize: 10, padding: '3px 8px', borderRadius: 12, cursor: 'pointer',
-                    background: active ? 'rgba(59,130,246,0.15)' : 'transparent',
-                    color:      active ? '#60a5fa'              : 'var(--text-muted, #9ca3af)',
-                    border:     active ? '1px solid rgba(59,130,246,0.5)' : '1px solid var(--border)',
-                    textTransform: 'capitalize',
-                  }}
-                >{op ?? 'All'}</button>
-              )
-            })}
-          </div>
-        )}
-
         <div style={{ flex: 1, overflowY: 'auto', padding: 8 }}>
           {parts.length === 0 ? (
             <div style={{
               textAlign: 'center', padding: '40px 16px',
               color: 'var(--text-muted, #9ca3af)', fontSize: 12, lineHeight: 1.6,
             }}>
-              No parts uploaded yet.<br />
-              Upload a STEP file to start part recognition.
-            </div>
-          ) : filteredParts.length === 0 ? (
-            <div style={{
-              textAlign: 'center', padding: '24px 16px',
-              color: 'var(--text-muted, #9ca3af)', fontSize: 11,
-            }}>
-              No parts tagged "{filterOp}".
+              {'No parts uploaded yet. Click "Upload STEP file" to get started.'}
             </div>
           ) : (
             filteredParts.map(part => {

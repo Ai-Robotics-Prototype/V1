@@ -349,39 +349,32 @@ function PartCard({ part, onConfigure, onDelete }) {
 // ── Drop zone ────────────────────────────────────────────────────────
 
 function UploadZone({ onUpload, busy }) {
+  // Compact button — the previous large dashed drop-target was
+  // visually heavy and rarely the upload path operators actually
+  // used (the click-to-browse case dominated). Same hidden file
+  // input + onUpload callback, just a small button now.
   const inputRef = useRef()
-  const [drag, setDrag] = useState(false)
   function pick(f) { if (f) onUpload(f) }
   return (
-    <div
-      onDragOver={(e) => { e.preventDefault(); setDrag(true) }}
-      onDragLeave={() => setDrag(false)}
-      onDrop={(e) => {
-        e.preventDefault(); setDrag(false)
-        const f = e.dataTransfer.files?.[0]
-        pick(f)
-      }}
-      onClick={() => inputRef.current?.click()}
-      style={{
-        border: `2px dashed ${drag ? '#3b82f6' : 'var(--border)'}`,
-        borderRadius: 'var(--radius-md, 8px)',
-        padding: 24,
-        background: drag ? 'rgba(59, 130, 246, 0.08)' : 'rgba(255,255,255,0.02)',
-        textAlign: 'center',
-        cursor: 'pointer',
-        transition: 'background 120ms, border-color 120ms',
-      }}
-    >
-      <div style={{ fontSize: 24, marginBottom: 6 }}>{busy ? '⏳' : '📦'}</div>
-      <div style={{ fontSize: 13, color: 'var(--text-primary)' }}>
-        {busy ? 'Parsing…' : 'Drop a .STEP / .STP file here'}
-      </div>
-      <div style={{ fontSize: 11, color: 'var(--text-muted, #6b7280)', marginTop: 4 }}>
-        or click to choose
-      </div>
+    <div style={{ display: 'inline-flex' }}>
+      <button
+        onClick={() => inputRef.current?.click()}
+        disabled={!!busy}
+        title={busy ? 'Parsing the STEP file…' : 'Upload a .STEP / .STP file'}
+        style={{
+          padding: '8px 14px', fontSize: 12, fontWeight: 600,
+          background: busy ? 'rgba(148,163,184,0.18)' : 'rgba(59,130,246,0.18)',
+          color:      busy ? '#94a3b8' : '#60a5fa',
+          border:     busy ? '1px solid rgba(148,163,184,0.4)'
+                           : '1px solid rgba(59,130,246,0.5)',
+          borderRadius: 'var(--radius-sm, 4px)',
+          cursor: busy ? 'not-allowed' : 'pointer',
+        }}>
+        {busy ? 'Parsing…' : 'Upload STEP file'}
+      </button>
       <input ref={inputRef} type="file" accept=".step,.stp"
         style={{ display: 'none' }}
-        onChange={(e) => pick(e.target.files?.[0])}
+        onChange={(e) => { pick(e.target.files?.[0]); e.target.value = '' }}
       />
     </div>
   )
@@ -680,7 +673,7 @@ export default function PartsLibrary() {
       {parts.length === 0 && !uploading && (
         <div style={{ marginTop: 24, padding: 24, textAlign: 'center',
                       color: 'var(--text-muted, #6b7280)', fontSize: 12 }}>
-          No parts uploaded yet. Drop a STEP file above to get started.
+          {'No parts uploaded yet. Click "Upload STEP file" to get started.'}
         </div>
       )}
 

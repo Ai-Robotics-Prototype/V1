@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useStore } from '../store/useStore'
-import WorkspaceMaskSection from '../components/WorkspaceMaskSection'
+// WorkspaceMaskSection removed from the Configure UI — the component
+// file + backend endpoints are intentionally kept in the repo so
+// the feature can be re-surfaced without re-implementation.
 import SetupWizard from '../components/SetupWizard'
 import CellDetailPanel from '../components/CellDetailPanel'
 import { useCellWizardStore } from '../store/cellWizardStore'
@@ -549,9 +551,6 @@ export default function ConfigureLayout() {
           </button>
         </Field>
       </Section>
-
-      {/* LiDAR workspace polygon for the object identifier */}
-      <WorkspaceMaskSection />
 
       {/* Version info */}
       <div style={{

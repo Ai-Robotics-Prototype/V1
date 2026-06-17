@@ -118,7 +118,13 @@ function ObjectBox({ obj, showLabel }) {
           <lineBasicMaterial color={strokeColor} linewidth={2} />
         )}
       </lineSegments>
-      {showLabel && (
+      {/* Baseline-static keep-out boxes render WITHOUT a floating
+          label — the orange box itself is enough signal and the
+          "static obstacle · 47 mm" text clutter wasn't useful.
+          Live dynamic detections keep their ID + min-distance label
+          since those change as the scene changes and the number is
+          actually informative. */}
+      {showLabel && !isBaselineStatic && (
         <Html position={[0, dz / 2 + 0.05, 0]} center distanceFactor={2.5}
               style={{ pointerEvents: 'none' }}>
           <div style={{
@@ -128,9 +134,8 @@ function ObjectBox({ obj, showLabel }) {
             whiteSpace: 'nowrap',
             border: `1px solid ${strokeColor}`,
           }}>
-            {isBaselineStatic ? 'static obstacle' : `#${obj.id}`} ·
-            {' '}{(obj.min_distance_m * 1000).toFixed(0)} mm
-            {isBaselineStatic ? '' : (isStatic ? ' · static' : ' · dynamic')}
+            #{obj.id} · {(obj.min_distance_m * 1000).toFixed(0)} mm
+            {isStatic ? ' · static' : ' · dynamic'}
           </div>
         </Html>
       )}
