@@ -355,6 +355,17 @@ const storeDefinition = (set, get) => ({
   activeCellId:       null,
   activeCell:         null,   // last full payload from /api/cells/active
   activeCellHydrated: false,
+  // Full cell list — populated by `hydrateCells()` from /api/cells.
+  // Configure subscribes to this so its list auto-loads on tab
+  // navigation without a manual page refresh. Items follow the
+  // /api/cells listing schema: { cell_id, name, baseline_captured,
+  // is_active, ... }.
+  cellsList:          [],
+  cellsHydrated:      false,
+  // When the last hydrate started — used to throttle: we'll happily
+  // re-hydrate when /configure is focused but won't thrash the
+  // backend if two effects fire within ~500 ms of each other.
+  _cellsLastHydrate:  0,
   setActiveCellId(id, cell) {
     set((s) => {
       const next = {
@@ -369,25 +380,53 @@ const storeDefinition = (set, get) => ({
       return next
     })
   },
-  async hydrateActiveCell() {
+  async hydrateCells({ force = false } = {}) {
+    // Throttle redundant calls — Configure re-mount, App tab change,
+    // and visibilitychange can all fire within the same animation
+    // frame on a fresh tab navigation. The first call populates
+    // the store; the rest within 500 ms become no-ops.
+    const now = (typeof performance !== 'undefined' && performance.now)
+      ? performance.now()
+      : Date.now()
+    if (!force && (now - (get()._cellsLastHydrate || 0)) < 500) return
+    set({ _cellsLastHydrate: now })
     try {
-      const r = await fetch('/api/cells/active')
+      const r = await fetch('/api/cells')
       if (!r.ok) {
-        // Backend reachable but the cell endpoint failed — still mark
-        // hydrated so consumers can stop showing the "loading…" state
-        // and surface a proper error instead.
-        set({ activeCellHydrated: true })
+        // Backend reachable but the list endpoint failed — still mark
+        // hydrated so consumers can stop showing "loading…" and the
+        // operator sees the genuine empty state with an error chip
+        // instead of an indefinite spinner.
+        set({ cellsHydrated: true, activeCellHydrated: true })
         return
       }
       const j = await r.json()
+      const cells = Array.isArray(j?.cells) ? j.cells : []
+      const aid   = j?.active_cell_id || null
+      const activeCell = aid ? (cells.find((c) => c.cell_id === aid) || null) : null
       set({
-        activeCellId:       j.active_cell_id || null,
-        activeCell:         j.cell || null,
+        cellsList:          cells,
+        cellsHydrated:      true,
+        activeCellId:       aid,
+        activeCell:         activeCell,
         activeCellHydrated: true,
       })
     } catch {
-      set({ activeCellHydrated: true })
+      set({ cellsHydrated: true, activeCellHydrated: true })
     }
+  },
+  // Backward-compat shim. Some consumers (boot, the 3D View) only
+  // care about the active cell — they don't need the full list — but
+  // we still fold them into the same fetch so a single network
+  // round-trip serves everyone.
+  async hydrateActiveCell() {
+    return get().hydrateCells()
+  },
+  // Imperative refresh — invoked by Configure on wizard close, on
+  // delete, etc. Skips the throttle since the caller knows the
+  // backend just changed.
+  async refreshCells() {
+    return get().hydrateCells({ force: true })
   },
 
   // The editor's authoritative state — survives ProgramEditor unmount

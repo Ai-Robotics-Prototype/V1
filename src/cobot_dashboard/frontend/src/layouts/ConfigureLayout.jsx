@@ -194,30 +194,30 @@ function CellSetupSection() {
   const setExpandedCell  = useCellWizardStore((s) => s.setExpandedCell)
   const clearCellPanel   = useCellWizardStore((s) => s.clearCellPanelState)
 
-  const [data, setData] = useState({ active_cell_id: null, cells: [] })
   const [busy, setBusy] = useState(false)
-  // Shared active-cell store — Configure is the writer; the 3D View
-  // and other cell-scoped consumers subscribe so they reflect the
-  // change instantly without polling.
+  // Shared cells store — Configure is both a reader and a writer.
+  // App.jsx kicks off `hydrateCells()` at boot, on tab focus, and on
+  // navigation INTO this tab, so by the time we render here the
+  // store usually already has the list. We never keep our own copy
+  // in local state anymore — that was the source of the "no cells
+  // until I refresh" bug (a silent fetch failure stranded local
+  // state at the empty default).
+  const cells           = useStore((s) => s.cellsList)
+  const cellsHydrated   = useStore((s) => s.cellsHydrated)
   const setActiveCellId = useStore((s) => s.setActiveCellId)
-  const storeActiveId   = useStore((s) => s.activeCellId)
+  const refreshCells    = useStore((s) => s.refreshCells)
+  const hydrateCells    = useStore((s) => s.hydrateCells)
 
-  const refresh = useCallback(async () => {
-    try {
-      const r = await fetch('/api/cells')
-      const j = await r.json()
-      setData(j)
-      // Reconcile the shared store with the freshly-listed cells so
-      // a delete / activate that changed state on the backend doesn't
-      // leave the store pointing at a ghost id.
-      if ((j?.active_cell_id || null) !== storeActiveId) {
-        const cell = (j?.cells || []).find((c) => c.cell_id === j?.active_cell_id) || null
-        setActiveCellId(j?.active_cell_id || null, cell)
-      }
-    } catch {}
-  }, [storeActiveId, setActiveCellId])
+  // Belt-and-suspenders: if this component mounts before App's
+  // tab-change effect fires (or that effect was somehow skipped),
+  // kick a hydrate. The store throttles redundant calls so this is
+  // free when the data is already fresh.
+  useEffect(() => { hydrateCells() }, [hydrateCells])
 
-  useEffect(() => { refresh() }, [refresh])
+  // Local convenience: refresh the global store + return when done
+  // so the existing callers (Activate, Delete, SetupWizard onSaved,
+  // CellRow onRefresh) keep their await contract.
+  const refresh = useCallback(() => refreshCells(), [refreshCells])
 
   const onToggleExpand = (cellId) => {
     setExpandedCell(cellId)
@@ -229,10 +229,9 @@ function CellSetupSection() {
       await fetch(`/api/cells/${cellId}/activate`, { method: 'POST' })
       // Write the new active id into the shared store immediately so
       // the 3D View (and ProgramWizard etc.) flip without waiting for
-      // the next refresh / poll. Pull the corresponding cell payload
-      // from the cached `data.cells` list when we have it so the
-      // baseline_captured flag is up to date.
-      const cellPayload = (data?.cells || []).find((c) => c.cell_id === cellId) || null
+      // the refresh round-trip. Pull the cell payload from the
+      // currently-loaded list so the baseline_captured flag is correct.
+      const cellPayload = (cells || []).find((c) => c.cell_id === cellId) || null
       setActiveCellId(cellId, cellPayload)
       await refresh()
     } finally { setBusy(false) }
@@ -275,15 +274,27 @@ function CellSetupSection() {
             + Commission a New Cell
           </button>
         </div>
-        {data.cells.length === 0 ? (
+        {!cellsHydrated ? (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            fontSize: 12, color: 'var(--text-muted)', padding: '8px 0',
+          }}>
+            <span style={{
+              width: 10, height: 10, borderRadius: '50%',
+              background: '#94a3b8',
+              animation: 'cellsLoadingPulse 1.2s ease-in-out infinite',
+            }} />
+            Loading cells…
+          </div>
+        ) : cells.length === 0 ? (
           <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 0' }}>
             No cells commissioned yet. Click <strong>Commission a New Cell</strong> to set up your first workspace.
           </div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {data.cells.map((c) => (
+            {cells.map((c) => (
               <CellRow key={c.cell_id} c={c}
-                allCells={data.cells}
+                allCells={cells}
                 busy={busy}
                 onActivate={onActivate}
                 onDelete={onDelete}
@@ -294,6 +305,9 @@ function CellSetupSection() {
             ))}
           </div>
         )}
+        <style>{`@keyframes cellsLoadingPulse {
+          0%, 100% { opacity: 0.3 } 50% { opacity: 1 }
+        }`}</style>
       </div>
       {wizardOpen && (
         <SetupWizard
