@@ -74,6 +74,26 @@ DEFAULTS = {
     # Ground filter (passed to GroundExtractor)
     'ground_dist_thresh_m': 0.015,
     'ground_max_tilt_deg':  15.0,
+    # Extra cull above the fitted ground plane: RANSAC keeps a thin
+    # 1.5 cm band as ground, but residual floor points sit just above
+    # it and DBSCAN happily chains them into a workspace-sized sheet.
+    # Drop everything within this extra band so the floor stops
+    # becoming an "obstacle".
+    'ground_clearance_m':   0.03,
+    # ── Max-size sanity rejection (per cluster + per merged group) ──
+    # A real bench/fixture inside the 1.4 m reach is much smaller than
+    # the reach disc. Anything wider than ~0.9 m on a horizontal axis
+    # is almost certainly the floor or a DBSCAN chain across noise.
+    'max_obstacle_xy_m':    0.9,
+    # Reject clusters whose XY footprint covers more than this
+    # fraction of the reach disc area (π·r²). 40 % of the 6.16 m²
+    # reach disc is ~2.5 m² — way bigger than any real fixture.
+    'max_footprint_frac':   0.40,
+    # Reject clusters that are very flat AND large: a wide sheet
+    # under 4 cm tall is the floor / a tabletop residue, not an
+    # obstacle to plan around.
+    'flat_z_max_m':         0.04,
+    'flat_xy_min_m':        0.5,
 }
 
 
@@ -215,13 +235,63 @@ def build_zones_from_pcd(pcd_path: str,
         distance_threshold_m=p['ground_dist_thresh_m'],
         max_tilt_deg=p['ground_max_tilt_deg'],
     )
-    _ground, above, _coeffs = ge.extract(points)
+    ground, above, coeffs = ge.extract(points)
     diag['n_above_ground'] = int(above.shape[0] if above is not None else 0)
     if above is None or above.shape[0] < 50:
         diag['note'] = 'no above-ground points'
         diag['zones'] = []
         diag['elapsed_s'] = time.time() - t0
         return diag
+
+    # Extra cull above the RANSAC band. The extractor only treats
+    # points within `ground_dist_thresh_m` (1.5 cm) of the fitted
+    # plane as ground; the band immediately above that often holds
+    # the few centimetres of residual floor returns that DBSCAN then
+    # chains into a workspace-sized sheet. Drop everything within
+    # `ground_clearance_m` of the fitted plane height so the floor
+    # genuinely stops contributing to clusters.
+    clearance = float(p.get('ground_clearance_m', 0.0))
+    if clearance > 0.0:
+        # Prefer the fitted plane normal+offset (handles tilted
+        # mounts); fall back to ground point z statistics if the
+        # extractor didn't return coefficients.
+        n_before = int(above.shape[0])
+        try:
+            if coeffs is not None and len(coeffs) == 4:
+                a, b, c, d = (float(coeffs[0]), float(coeffs[1]),
+                              float(coeffs[2]), float(coeffs[3]))
+                # Plane equation a*x + b*y + c*z + d = 0; signed
+                # distance is (a*x+b*y+c*z+d)/||n||. Cull points whose
+                # distance above the plane is below the clearance band.
+                nrm = float(np.sqrt(a * a + b * b + c * c)) or 1.0
+                signed = (above[:, 0] * a + above[:, 1] * b
+                          + above[:, 2] * c + d) / nrm
+                # Ensure "above" means the same side as the points we
+                # already kept (extractor returns above-plane points,
+                # so their majority signed-distance sign tells us
+                # which side is "up"); cull anything within clearance
+                # of the plane on that side.
+                side = 1.0 if float(np.median(signed)) >= 0 else -1.0
+                keep = (signed * side) > clearance
+                above = above[keep]
+            elif ground is not None and ground.shape[0] > 0:
+                g_top = float(np.percentile(ground[:, 2], 95))
+                above = above[above[:, 2] > (g_top + clearance)]
+            else:
+                above = above[above[:, 2] > clearance]
+        except Exception:
+            # Defensive: a numeric hiccup mustn't kill the build. Fall
+            # back to a simple Z cull from the ground point top.
+            if ground is not None and ground.shape[0] > 0:
+                g_top = float(np.percentile(ground[:, 2], 95))
+                above = above[above[:, 2] > (g_top + clearance)]
+        diag['n_after_ground_clearance'] = int(above.shape[0])
+        diag['ground_clearance_dropped'] = n_before - int(above.shape[0])
+        if above.shape[0] < 50:
+            diag['note'] = 'no points left after ground clearance cull'
+            diag['zones'] = []
+            diag['elapsed_s'] = time.time() - t0
+            return diag
 
     cl = ObjectClusterer(
         tolerance_m=p['cluster_tolerance_m'],
@@ -230,21 +300,58 @@ def build_zones_from_pcd(pcd_path: str,
     clusters = cl.cluster(above)
     diag['n_clusters_raw'] = len(clusters)
 
-    # Per-cluster OBB + density filter. Drop fragments below volume /
-    # point thresholds before merging so we don't pull stray noise
-    # into a real obstacle's box.
+    # Per-cluster OBB + density + sanity-size filter. Drop fragments
+    # below volume / point thresholds before merging so we don't pull
+    # stray noise into a real obstacle's box. Additionally reject
+    # clusters whose OBB is implausibly large for an actual fixture:
+    # a 2.8 m-wide "box" inside a 1.4 m reach is the floor or a
+    # DBSCAN chain across noise, not an obstacle to plan around.
+    max_xy = float(p.get('max_obstacle_xy_m', 0.0))
+    reach_area = math.pi * float(p.get('reach_radius_m', 1.4)) ** 2
+    max_footprint = float(p.get('max_footprint_frac', 0.0)) * reach_area
+    flat_z = float(p.get('flat_z_max_m', 0.0))
+    flat_xy_min = float(p.get('flat_xy_min_m', 0.0))
     raw: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
     for c in clusters:
+        ci = {
+            'point_count': int(c.point_count),
+            'dims': None, 'reason': None,
+        }
         if c.point_count < int(p['min_point_count']):
-            continue
+            ci['reason'] = 'min_point_count'
+            rejected.append(ci); continue
         try:
             features = analyze(c.points)
-        except Exception:
-            continue
+        except Exception as fx:
+            ci['reason'] = f'analyze_failed:{fx.__class__.__name__}'
+            rejected.append(ci); continue
         dims = np.asarray(features.dimensions_m, dtype=np.float32)
+        ci['dims'] = [round(float(dims[0]), 3),
+                      round(float(dims[1]), 3),
+                      round(float(dims[2]), 3)]
         vol = float(np.prod(dims))
         if vol < float(p['min_volume_m3']):
-            continue
+            ci['reason'] = 'min_volume'
+            rejected.append(ci); continue
+        # Sort dims so [0]=long, [1]=short, [2]=height. Cluster OBB
+        # already returns dims sorted descending (shape_analyzer
+        # convention), but be defensive.
+        ds = sorted([float(dims[0]), float(dims[1]), float(dims[2])], reverse=True)
+        # Long horizontal axis too big → almost certainly the floor.
+        if max_xy > 0 and ds[0] > max_xy and ds[1] > max_xy:
+            ci['reason'] = f'oversize_xy (long={ds[0]:.2f},short={ds[1]:.2f} > {max_xy})'
+            rejected.append(ci); continue
+        # Footprint area dominates the reach disc → not an obstacle.
+        if max_footprint > 0 and (ds[0] * ds[1]) > max_footprint:
+            ci['reason'] = (f'footprint {ds[0]*ds[1]:.2f}m² > '
+                            f'{max_footprint:.2f}m² ({p["max_footprint_frac"]*100:.0f}% of reach disc)')
+            rejected.append(ci); continue
+        # Flat + huge → residual floor / tabletop sheet.
+        if flat_z > 0 and ds[2] < flat_z and ds[0] > flat_xy_min:
+            ci['reason'] = (f'flat_sheet (z={ds[2]:.3f} < {flat_z}, '
+                            f'long={ds[0]:.2f} > {flat_xy_min})')
+            rejected.append(ci); continue
         center = np.asarray(features.center, dtype=np.float32)
         rotation = np.asarray(features.rotation, dtype=np.float32)
         aabb = obb_to_aabb(center, dims, rotation)
@@ -258,6 +365,8 @@ def build_zones_from_pcd(pcd_path: str,
             'aabb':         aabb,
         })
     diag['n_clusters_kept'] = len(raw)
+    diag['n_clusters_rejected'] = len(rejected)
+    diag['rejected'] = rejected[:32]  # cap to keep diag readable
 
     # Merge overlapping / near-touching boxes into one obstacle.
     groups = merge_aabbs([r['aabb'] for r in raw], gap_threshold_m=float(p['merge_gap_m']))
@@ -273,6 +382,7 @@ def build_zones_from_pcd(pcd_path: str,
     # everything AABB for consistency with the live collision pipeline.
     margin = float(p['inflate_margin_m'])
     zones: list[dict[str, Any]] = []
+    merged_rejected: list[dict[str, Any]] = []
     for gi, idxs in enumerate(groups):
         a_min = np.minimum.reduce([raw[i]['aabb'][0] for i in idxs])
         a_max = np.maximum.reduce([raw[i]['aabb'][1] for i in idxs])
@@ -280,6 +390,33 @@ def build_zones_from_pcd(pcd_path: str,
         a_max = a_max + margin
         center = ((a_min + a_max) * 0.5).tolist()
         dims = (a_max - a_min).tolist()
+        # Post-merge guard: an individual cluster passed the per-
+        # cluster sanity checks, but the merge step can still
+        # balloon a group across the workspace if neighboring
+        # clusters happen to sit within `merge_gap_m`. Re-apply the
+        # same XY / footprint limits so a ballooned merge gets
+        # dropped instead of dominating the scene.
+        ds_sorted = sorted([float(dims[0]), float(dims[1]), float(dims[2])], reverse=True)
+        rej_reason = None
+        if max_xy > 0 and ds_sorted[0] > max_xy and ds_sorted[1] > max_xy:
+            rej_reason = (f'merged_oversize_xy '
+                          f'(long={ds_sorted[0]:.2f},short={ds_sorted[1]:.2f} > {max_xy})')
+        elif max_footprint > 0 and (ds_sorted[0] * ds_sorted[1]) > max_footprint:
+            rej_reason = (f'merged_footprint {ds_sorted[0]*ds_sorted[1]:.2f}m² > '
+                          f'{max_footprint:.2f}m²')
+        elif flat_z > 0 and ds_sorted[2] < flat_z and ds_sorted[0] > flat_xy_min:
+            rej_reason = (f'merged_flat_sheet (z={ds_sorted[2]:.3f},'
+                          f' long={ds_sorted[0]:.2f})')
+        if rej_reason is not None:
+            merged_rejected.append({
+                'group_index': gi,
+                'cluster_count': len(idxs),
+                'dims': [round(float(dims[0]), 3),
+                         round(float(dims[1]), 3),
+                         round(float(dims[2]), 3)],
+                'reason': rej_reason,
+            })
+            continue
         total_points = sum(raw[i]['point_count'] for i in idxs)
         total_vol = float(dims[0] * dims[1] * dims[2])
         zones.append({
@@ -297,6 +434,8 @@ def build_zones_from_pcd(pcd_path: str,
             'cluster_count': len(idxs),
             'margin_m':     margin,
         })
+    diag['n_merged_rejected'] = len(merged_rejected)
+    diag['merged_rejected'] = merged_rejected[:16]
 
     # Sort largest first — UX nicety so the biggest obstacles show up
     # first in lists / debugging output.
