@@ -119,6 +119,33 @@ DEFAULTS = {
     # obstacle to plan around.
     'flat_z_max_m':         0.04,
     'flat_xy_min_m':        0.5,
+    # ── Contoured-shape extraction (alpha-shape visual + convex hull) ──
+    # Per-cluster outlier rejection before contour fitting so a single
+    # stray return doesn't blow the alpha-shape open. Statistical
+    # outlier removal compares each point's mean neighbour distance to
+    # the cluster's distribution.
+    'outlier_nb_neighbors': 20,
+    'outlier_std_ratio':    2.0,
+    # Belt-and-braces percentile clip: drop the extreme ends per axis
+    # before hull/alpha so a 1-in-a-thousand return still can't drag
+    # the shape out. 2..98 keeps the dense body intact.
+    'percentile_clip_low':  2.0,
+    'percentile_clip_high': 98.0,
+    # Alpha-shape candidate radii (m). We try smallest-first and pick
+    # the first that yields a non-empty mesh — small alphas hug tightly
+    # but fail on sparse clusters; the cascade keeps the visual tight
+    # where the points support it and degrades gracefully otherwise.
+    'alpha_candidates_m':   (0.04, 0.06, 0.08, 0.12, 0.18),
+    # Cap visual mesh complexity so the tablet's WebGL stays smooth
+    # even with a dozen zones. Quadric-decimated after alpha-shape;
+    # 250 triangles per zone × 10 zones is ~2.5k tris, trivial for the
+    # viewer.
+    'visual_max_triangles': 250,
+    # Inflate the COLLISION hull by this margin (shift each hull vertex
+    # outward along the centroid→vertex ray). Replaces the old box
+    # margin; smaller because the hull already hugs tighter than the
+    # OBB did.
+    'hull_inflate_m':       0.02,
 }
 
 
@@ -254,6 +281,203 @@ def merge_aabbs(aabbs: list[tuple[np.ndarray, np.ndarray]],
     for i in range(n):
         groups.setdefault(find(i), []).append(i)
     return list(groups.values())
+
+
+# ── Contoured-shape extraction (alpha-shape + convex hull) ─────────
+# Two representations per cluster:
+#   • visual_mesh   — concave alpha-shape, tight to the surface, for
+#                     the 3D viewer only. Decimated to a poly cap.
+#   • collision_hull — convex hull, the primitive MoveIt2/FCL handle
+#                     natively and the collision monitor uses for
+#                     point-to-mesh distance. Always exists for any
+#                     kept cluster (open3d compute_convex_hull is
+#                     robust to small/sparse inputs).
+
+def _clean_cluster_points(points: np.ndarray,
+                          nb_neighbors: int,
+                          std_ratio: float,
+                          pct_low: float,
+                          pct_high: float) -> np.ndarray:
+    """Strip outliers before contour fitting. Without this a stray
+    return blows the alpha-shape outward and the contour stops hugging
+    the dense mass — the very pathology the user called out."""
+    if points.shape[0] < max(8, nb_neighbors):
+        return points
+    try:
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+        pcd_clean, _ = pcd.remove_statistical_outlier(
+            nb_neighbors=int(nb_neighbors),
+            std_ratio=float(std_ratio))
+        cleaned = np.asarray(pcd_clean.points, dtype=np.float32)
+    except Exception:
+        cleaned = points
+
+    if cleaned.shape[0] < 8:
+        cleaned = points  # degenerate — fall back to raw
+
+    # Percentile clip per axis as a belt-and-braces second pass; the
+    # statistical filter is dense-cluster-tuned, the percentile clip
+    # catches anything it lets through.
+    if 0.0 < pct_low < pct_high < 100.0 and cleaned.shape[0] >= 32:
+        lo = np.percentile(cleaned, pct_low,  axis=0)
+        hi = np.percentile(cleaned, pct_high, axis=0)
+        mask = np.all((cleaned >= lo) & (cleaned <= hi), axis=1)
+        if int(mask.sum()) >= 8:
+            cleaned = cleaned[mask]
+    return cleaned
+
+
+def _convex_hull_mesh(points: np.ndarray):
+    """Return (vertices Nx3, triangles Mx3) of the convex hull, or
+    (None, None) if open3d can't form a hull (e.g. <4 non-coplanar
+    points). open3d's hull is robust enough for noisy real clusters."""
+    try:
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+        hull, _ = pcd.compute_convex_hull()
+        v = np.asarray(hull.vertices, dtype=np.float32)
+        f = np.asarray(hull.triangles, dtype=np.int32)
+        if v.shape[0] < 4 or f.shape[0] < 1:
+            return None, None
+        return v, f
+    except Exception:
+        return None, None
+
+
+def _alpha_shape_mesh(points: np.ndarray,
+                      alpha_candidates: tuple,
+                      target_triangles: int):
+    """Build a tight concave mesh via alpha-shape. Tries each alpha
+    smallest-first, decimates to the poly cap, returns
+    (vertices, triangles, alpha_used) or (None, None, None) when every
+    alpha yielded an empty mesh — the caller then falls back to the
+    convex hull as the visual form."""
+    if points.shape[0] < 8:
+        return None, None, None
+    try:
+        import open3d as o3d
+    except Exception:
+        return None, None, None
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    best = None  # (n_tri, alpha, mesh)
+    for alpha in alpha_candidates:
+        try:
+            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(
+                pcd, float(alpha))
+        except Exception:
+            continue
+        # Cheap clean-up before evaluating size.
+        try:
+            mesh.remove_degenerate_triangles()
+            mesh.remove_duplicated_triangles()
+            mesh.remove_duplicated_vertices()
+            mesh.remove_non_manifold_edges()
+        except Exception:
+            pass
+        n_tri = int(np.asarray(mesh.triangles).shape[0])
+        if n_tri <= 0:
+            continue
+        # First non-empty alpha wins — smallest alpha = tightest contour.
+        best = (n_tri, float(alpha), mesh)
+        break
+
+    if best is None:
+        return None, None, None
+
+    n_tri, alpha_used, mesh = best
+    if n_tri > target_triangles:
+        try:
+            mesh = mesh.simplify_quadric_decimation(
+                target_number_of_triangles=int(target_triangles))
+        except Exception:
+            pass
+    v = np.asarray(mesh.vertices, dtype=np.float32)
+    f = np.asarray(mesh.triangles, dtype=np.int32)
+    if v.shape[0] < 3 or f.shape[0] < 1:
+        return None, None, None
+    return v, f, alpha_used
+
+
+def _inflate_hull(vertices: np.ndarray, center: np.ndarray,
+                  margin_m: float) -> np.ndarray:
+    """Push each hull vertex outward along the centroid→vertex ray by
+    `margin_m`. Preserves convexity for convex hulls and is a clean
+    stand-in for a true Minkowski sum with a ball at the safety level
+    we need here."""
+    if margin_m <= 0.0 or vertices.shape[0] == 0:
+        return vertices
+    d = vertices - center
+    n = np.linalg.norm(d, axis=1, keepdims=True)
+    n[n < 1e-9] = 1.0
+    return (vertices + (d / n) * float(margin_m)).astype(np.float32)
+
+
+def _bbox_extents(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Center, dimensions, halfdims of the cleaned point cloud's AABB
+    (in the world/LiDAR frame). Used for the lightweight cull / label
+    primitives even when the persisted shape is a mesh."""
+    mn = points.min(axis=0)
+    mx = points.max(axis=0)
+    return ((mn + mx) * 0.5).astype(np.float32), \
+           (mx - mn).astype(np.float32), \
+           ((mx - mn) * 0.5).astype(np.float32)
+
+
+def _mesh_to_payload(vertices: np.ndarray, triangles: np.ndarray
+                     ) -> dict[str, list]:
+    """Serialize a TriangleMesh-shaped pair for collision_zones.json."""
+    return {
+        'vertices':  [[float(p[0]), float(p[1]), float(p[2])]
+                      for p in vertices],
+        'triangles': [[int(t[0]),   int(t[1]),   int(t[2])]
+                      for t in triangles],
+        'n_vertices':  int(vertices.shape[0]),
+        'n_triangles': int(triangles.shape[0]),
+    }
+
+
+def _build_zone_shapes(cluster_points: np.ndarray, p: dict) -> dict:
+    """Build the visual concave mesh + the convex collision hull for a
+    cleaned point set. Returns a dict with both meshes (any of which
+    may be None if construction failed) plus the AABB extents the rest
+    of the pipeline still relies on."""
+    cleaned = _clean_cluster_points(
+        cluster_points,
+        nb_neighbors=int(p['outlier_nb_neighbors']),
+        std_ratio=float(p['outlier_std_ratio']),
+        pct_low=float(p['percentile_clip_low']),
+        pct_high=float(p['percentile_clip_high']),
+    )
+
+    hull_v, hull_f = _convex_hull_mesh(cleaned)
+    center, dims, _ = _bbox_extents(cleaned)
+    if hull_v is not None and float(p.get('hull_inflate_m', 0.0)) > 0:
+        hull_v = _inflate_hull(hull_v, center, float(p['hull_inflate_m']))
+
+    vis_v, vis_f, alpha_used = _alpha_shape_mesh(
+        cleaned,
+        alpha_candidates=tuple(p['alpha_candidates_m']),
+        target_triangles=int(p['visual_max_triangles']),
+    )
+    if vis_v is None and hull_v is not None:
+        # Alpha failed (sparse cluster) — convex hull doubles as visual.
+        vis_v, vis_f, alpha_used = hull_v, hull_f, None
+
+    return {
+        'cleaned_points':  cleaned,
+        'center':          center,
+        'dims':            dims,
+        'hull_v':          hull_v,
+        'hull_f':          hull_f,
+        'visual_v':        vis_v,
+        'visual_f':        vis_f,
+        'alpha_used':      alpha_used,
+    }
 
 
 # ── Main build ───────────────────────────────────────────────────────
@@ -421,6 +645,12 @@ def build_zones_from_pcd(pcd_path: str,
             'volume_m3':    vol,
             'density':      float(c.point_count / max(vol, 1e-9)),
             'aabb':         aabb,
+            # Keep the raw cluster points — we re-fit the contour/hull
+            # on these (possibly combined with siblings if a merge
+            # group spans multiple clusters), which is the right way
+            # to get a clean single mesh instead of gluing per-cluster
+            # meshes geometrically.
+            'points':       np.asarray(c.points, dtype=np.float32),
         })
     diag['n_clusters_kept'] = len(raw)
     diag['n_clusters_rejected'] = len(rejected)
@@ -430,110 +660,110 @@ def build_zones_from_pcd(pcd_path: str,
     groups = merge_aabbs([r['aabb'] for r in raw], gap_threshold_m=float(p['merge_gap_m']))
     diag['n_merged_groups'] = len(groups)
 
-    # Emit one keep-out box per group. When a group has a SINGLE
-    # cluster (the default — merging is disabled), we emit the
-    # ORIENTED bounding box directly: center + OBB extents + a
-    # yaw-only quaternion derived from the OBB rotation. This makes
-    # the persisted box hug the cluster tightly instead of the
-    # rotation-inflated AABB. When a group has multiple clusters
-    # (i.e. merging was explicitly enabled), we fall back to the
-    # AABB envelope since merging arbitrary rotations is undefined.
+    # Emit one keep-out zone per group. Each zone now carries:
+    #   • collision_hull — convex hull of the (merged) cleaned points,
+    #     inflated by hull_inflate_m. Tighter than the OBB box ever
+    #     was and the form MoveIt2/FCL handle natively.
+    #   • visual_mesh    — concave alpha-shape that hugs the surface,
+    #     decimated to the poly cap for the 3D viewer.
+    # The legacy center/dimensions/orientation are kept too so older
+    # consumers (and the AABB pre-filter in collision_monitor) still
+    # work without a schema migration; new consumers prefer the hull.
     margin = float(p['inflate_margin_m'])
     zones: list[dict[str, Any]] = []
     merged_rejected: list[dict[str, Any]] = []
     for gi, idxs in enumerate(groups):
+        # Combine source points across all clusters in the group, then
+        # re-fit hull + alpha-shape on the COMBINED cloud. This is the
+        # right way to merge — don't union per-cluster meshes
+        # geometrically (which leaves visible seams and breaks
+        # convexity); always re-fit.
+        combined = np.concatenate([raw[i]['points'] for i in idxs], axis=0)
+        shapes = _build_zone_shapes(combined, p)
+        center_arr   = shapes['center']
+        bbox_dims    = shapes['dims']
+        hull_v       = shapes['hull_v']
+        hull_f       = shapes['hull_f']
+        visual_v     = shapes['visual_v']
+        visual_f     = shapes['visual_f']
+        alpha_used   = shapes['alpha_used']
+
+        # OBB orientation is meaningful for a single-cluster group;
+        # for merged groups we drop to identity (the hull captures
+        # the real shape — the AABB is just a label primitive now).
         if len(idxs) == 1:
-            # ── Single-cluster group: emit the OBB directly ──
             r = raw[idxs[0]]
-            dims_arr = np.asarray(r['dims'], dtype=np.float64) + (2.0 * margin)
-            center = r['center'].tolist()
             qx, qy, qz, qw = obb_yaw_quat(r['rotation'], r['dims'])
-            ds_sorted = sorted(dims_arr.tolist(), reverse=True)
-            rej_reason = None
-            # Post-emit guard on the TIGHT OBB dims — much stricter
-            # than the AABB-era guards because OBB dims hug the
-            # cluster, so a real fixture rarely exceeds max_xy here.
-            if max_xy > 0 and ds_sorted[0] > max_xy and ds_sorted[1] > max_xy:
-                rej_reason = (f'obb_oversize_xy '
-                              f'(long={ds_sorted[0]:.2f},short={ds_sorted[1]:.2f} > {max_xy})')
-            elif max_footprint > 0 and (ds_sorted[0] * ds_sorted[1]) > max_footprint:
-                rej_reason = (f'obb_footprint {ds_sorted[0]*ds_sorted[1]:.2f}m² > '
-                              f'{max_footprint:.2f}m²')
-            elif flat_z > 0 and ds_sorted[2] < flat_z and ds_sorted[0] > flat_xy_min:
-                rej_reason = (f'obb_flat_sheet (z={ds_sorted[2]:.3f},'
-                              f' long={ds_sorted[0]:.2f})')
-            if rej_reason is not None:
-                merged_rejected.append({
-                    'group_index': gi,
-                    'cluster_count': 1,
-                    'dims': [round(float(dims_arr[0]), 3),
-                             round(float(dims_arr[1]), 3),
-                             round(float(dims_arr[2]), 3)],
-                    'reason': rej_reason,
-                })
-                continue
-            total_points = int(r['point_count'])
-            total_vol = float(np.prod(dims_arr))
-            zones.append({
-                'id':           f'static_{gi:03d}',
-                'name':         f'static_obstacle_{gi + 1}',
-                'source':       'baseline_static',
-                'center':       {'x': float(center[0]), 'y': float(center[1]), 'z': float(center[2])},
-                'dimensions':   {'x': float(dims_arr[0]), 'y': float(dims_arr[1]), 'z': float(dims_arr[2])},
-                # OBB yaw-only quaternion → the 3D viewer's ObjectBox
-                # rotates the box around world-up by this yaw.
-                'orientation':  {'x': qx, 'y': qy, 'z': qz, 'w': qw},
-                'point_count':  total_points,
-                'density':      float(total_points / max(total_vol, 1e-9)),
-                'cluster_count': 1,
-                'margin_m':     margin,
-                'shape':        'obb',
-            })
-            continue
-        # ── Multi-cluster merged group: fall back to AABB envelope ──
-        # Only reachable when merge_gap_m was explicitly set ≥ 0.
-        a_min = np.minimum.reduce([raw[i]['aabb'][0] for i in idxs])
-        a_max = np.maximum.reduce([raw[i]['aabb'][1] for i in idxs])
-        a_min = a_min - margin
-        a_max = a_max + margin
-        center = ((a_min + a_max) * 0.5).tolist()
-        dims = (a_max - a_min).tolist()
-        ds_sorted = sorted([float(dims[0]), float(dims[1]), float(dims[2])], reverse=True)
+        else:
+            qx, qy, qz, qw = (0.0, 0.0, 0.0, 1.0)
+
+        # Sanity guard on the hull/AABB dims (same intent as before:
+        # never re-introduce the floor box). The contour shouldn't
+        # make those guards looser — apply them to the AABB of the
+        # cleaned-+-inflated hull, which is the tightest world-frame
+        # envelope of what we're about to emit.
+        if hull_v is not None and hull_v.shape[0] >= 4:
+            envelope_min = hull_v.min(axis=0)
+            envelope_max = hull_v.max(axis=0)
+            env_dims = (envelope_max - envelope_min).astype(np.float64)
+        else:
+            env_dims = np.asarray(bbox_dims, dtype=np.float64) + (2.0 * margin)
+        ds_sorted = sorted(env_dims.tolist(), reverse=True)
         rej_reason = None
         if max_xy > 0 and ds_sorted[0] > max_xy and ds_sorted[1] > max_xy:
-            rej_reason = (f'merged_oversize_xy '
+            rej_reason = (f'hull_oversize_xy '
                           f'(long={ds_sorted[0]:.2f},short={ds_sorted[1]:.2f} > {max_xy})')
         elif max_footprint > 0 and (ds_sorted[0] * ds_sorted[1]) > max_footprint:
-            rej_reason = (f'merged_footprint {ds_sorted[0]*ds_sorted[1]:.2f}m² > '
+            rej_reason = (f'hull_footprint {ds_sorted[0]*ds_sorted[1]:.2f}m² > '
                           f'{max_footprint:.2f}m²')
         elif flat_z > 0 and ds_sorted[2] < flat_z and ds_sorted[0] > flat_xy_min:
-            rej_reason = (f'merged_flat_sheet (z={ds_sorted[2]:.3f},'
+            rej_reason = (f'hull_flat_sheet (z={ds_sorted[2]:.3f},'
                           f' long={ds_sorted[0]:.2f})')
         if rej_reason is not None:
             merged_rejected.append({
                 'group_index': gi,
                 'cluster_count': len(idxs),
-                'dims': [round(float(dims[0]), 3),
-                         round(float(dims[1]), 3),
-                         round(float(dims[2]), 3)],
+                'dims': [round(float(env_dims[0]), 3),
+                         round(float(env_dims[1]), 3),
+                         round(float(env_dims[2]), 3)],
                 'reason': rej_reason,
             })
             continue
-        total_points = sum(raw[i]['point_count'] for i in idxs)
-        total_vol = float(dims[0] * dims[1] * dims[2])
-        zones.append({
+
+        total_points = int(combined.shape[0])
+        # The legacy dims field reports the (inflated) hull's AABB
+        # envelope so older consumers see a tight box; if no hull was
+        # produced fall back to the bbox of the cleaned cluster.
+        leg_dims = env_dims
+        total_vol = float(np.prod(np.maximum(leg_dims, 1e-6)))
+
+        zone: dict[str, Any] = {
             'id':           f'static_{gi:03d}',
             'name':         f'static_obstacle_{gi + 1}',
             'source':       'baseline_static',
-            'center':       {'x': float(center[0]), 'y': float(center[1]), 'z': float(center[2])},
-            'dimensions':   {'x': float(dims[0]),   'y': float(dims[1]),   'z': float(dims[2])},
-            'orientation':  {'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0},
-            'point_count':  int(total_points),
+            'center':       {'x': float(center_arr[0]),
+                             'y': float(center_arr[1]),
+                             'z': float(center_arr[2])},
+            'dimensions':   {'x': float(leg_dims[0]),
+                             'y': float(leg_dims[1]),
+                             'z': float(leg_dims[2])},
+            'orientation':  {'x': qx, 'y': qy, 'z': qz, 'w': qw},
+            'point_count':  total_points,
             'density':      float(total_points / max(total_vol, 1e-9)),
             'cluster_count': len(idxs),
             'margin_m':     margin,
-            'shape':        'aabb',
-        })
+            # Tag the *primary* shape so older / new viewers can branch.
+            'shape':        ('mesh' if visual_v is not None else
+                             ('obb' if len(idxs) == 1 else 'aabb')),
+        }
+        if hull_v is not None and hull_f is not None:
+            zone['collision_hull'] = _mesh_to_payload(hull_v, hull_f)
+            zone['collision_hull']['margin_m'] = float(p.get('hull_inflate_m', 0.0))
+        if visual_v is not None and visual_f is not None:
+            zone['visual_mesh'] = _mesh_to_payload(visual_v, visual_f)
+            zone['visual_mesh']['alpha_m'] = alpha_used
+            zone['visual_mesh']['decimated_to'] = int(p['visual_max_triangles'])
+        zones.append(zone)
     diag['n_merged_rejected'] = len(merged_rejected)
     diag['merged_rejected'] = merged_rejected[:16]
 
@@ -588,32 +818,53 @@ def save_zones(cell_id: str, build_result: dict[str, Any]) -> None:
     with open(zones_json_path(cell_id), 'w') as f:
         json.dump(out, f, indent=2)
 
-    # MoveIt2 PlanningScene-compatible export. Each obstacle is a
-    # single primitive BOX with an identity quaternion (AABB),
-    # encoded close to a moveit_msgs/CollisionObject shape so the
-    # future planning_scene loader doesn't need this dashboard's
-    # internal schema.
-    scene = {
-        'frame_id':         'base_link',
-        'cell_id':          cell_id,
-        'collision_objects': [
-            {
+    # MoveIt2 PlanningScene-compatible export. We now emit each zone's
+    # CONVEX HULL as a moveit_msgs/CollisionObject mesh (vertices +
+    # triangles) — much tighter than the old BOX primitive and a form
+    # MoveIt2/FCL handle natively. When no hull was produced (degenerate
+    # cluster), fall back to a BOX primitive on the legacy dims so the
+    # zone still ends up in the planning scene rather than vanishing.
+    def _co_for(z: dict[str, Any]) -> dict[str, Any]:
+        hull = z.get('collision_hull') or {}
+        verts = hull.get('vertices') or []
+        tris  = hull.get('triangles') or []
+        if verts and tris:
+            return {
                 'id':         z['id'],
                 'header':     {'frame_id': 'base_link'},
-                'primitives': [{
-                    'type':       'BOX',
-                    'dimensions': [z['dimensions']['x'],
-                                   z['dimensions']['y'],
-                                   z['dimensions']['z']],
+                'meshes': [{
+                    'vertices':  verts,
+                    'triangles': tris,
                 }],
-                'primitive_poses': [{
-                    'position':    z['center'],
-                    'orientation': z['orientation'],
+                # Mesh vertices are already in the world (base_link)
+                # frame; pose = identity so MoveIt2 doesn't transform
+                # them a second time.
+                'mesh_poses': [{
+                    'position':    {'x': 0.0, 'y': 0.0, 'z': 0.0},
+                    'orientation': {'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0},
                 }],
                 'operation':  'ADD',
             }
-            for z in build_result.get('zones', [])
-        ],
+        # Legacy box fallback for zones with no hull.
+        return {
+            'id':         z['id'],
+            'header':     {'frame_id': 'base_link'},
+            'primitives': [{
+                'type':       'BOX',
+                'dimensions': [z['dimensions']['x'],
+                               z['dimensions']['y'],
+                               z['dimensions']['z']],
+            }],
+            'primitive_poses': [{
+                'position':    z['center'],
+                'orientation': z['orientation'],
+            }],
+            'operation':  'ADD',
+        }
+    scene = {
+        'frame_id':         'base_link',
+        'cell_id':          cell_id,
+        'collision_objects': [_co_for(z) for z in build_result.get('zones', [])],
     }
     with open(moveit_scene_path(cell_id), 'w') as f:
         json.dump(scene, f, indent=2)

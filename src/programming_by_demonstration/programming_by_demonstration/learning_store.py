@@ -32,6 +32,7 @@ import sqlite3
 from typing import Any, Dict, Iterable, List, Optional
 
 from .utils import ensure_dir, now_iso, demo_dir
+from .correction_diff import compute_correction_diff
 
 
 # ── Schema for the index ───────────────────────────────────────────
@@ -50,11 +51,23 @@ CREATE TABLE IF NOT EXISTS demonstrations (
     confidence        REAL,
     ambiguities       TEXT,     -- JSON list
     correction_made   INTEGER NOT NULL DEFAULT 0,
-    program_id        TEXT      -- slug under /opt/cobot/programs if saved
+    program_id        TEXT,     -- slug under /opt/cobot/programs if saved
+    poses_adjusted    INTEGER NOT NULL DEFAULT 0,
+    steps_changed     INTEGER NOT NULL DEFAULT 0,
+    verbatim_accept   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS demos_created_idx ON demonstrations (created_iso);
 CREATE INDEX IF NOT EXISTS demos_correction_idx ON demonstrations (correction_made);
 """
+
+# Columns introduced after the original schema — applied at startup
+# with ALTER TABLE so an existing index.db picks them up without losing
+# data. Each entry is (column_name, full DDL fragment).
+_LATE_COLUMNS = [
+    ('poses_adjusted',  'INTEGER NOT NULL DEFAULT 0'),
+    ('steps_changed',   'INTEGER NOT NULL DEFAULT 0'),
+    ('verbatim_accept', 'INTEGER NOT NULL DEFAULT 0'),
+]
 
 
 class LearningStore:
@@ -74,6 +87,15 @@ class LearningStore:
     def _init_index(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA_SQL)
+            # Backfill columns added after the original schema (no-op
+            # on fresh DBs, additive on existing ones).
+            existing = {row['name'] for row in conn.execute(
+                "PRAGMA table_info(demonstrations)").fetchall()}
+            for col, ddl in _LATE_COLUMNS:
+                if col not in existing:
+                    conn.execute(
+                        f'ALTER TABLE demonstrations ADD COLUMN {col} {ddl}'
+                    )
 
     # ── Layout helpers ─────────────────────────────────────────────
 
@@ -169,6 +191,68 @@ class LearningStore:
                 (now_iso(), program_id, demo_id),
             )
 
+    def save_correction_diff(self, demo_id: str,
+                             ai_draft: Optional[Dict[str, Any]],
+                             corrected: Dict[str, Any]) -> Dict[str, Any]:
+        """Compute and persist the structured DIFF between the AI's
+        draft and the operator-corrected program. Best-effort: if diff
+        computation fails, write a stub with degraded=True rather than
+        raising — the operator's Accept must not be blocked. Returns
+        the diff dict so the caller can log it."""
+        diff: Dict[str, Any]
+        try:
+            diff = compute_correction_diff(ai_draft, corrected)
+        except Exception as e:
+            diff = {
+                'top_level': {},
+                'steps':     {'added': [], 'removed': [], 'reordered': [], 'matched': []},
+                'summary':   {
+                    'no_change': False, 'verbatim_accept': False,
+                    'fields_changed': 0, 'steps_added': 0, 'steps_removed': 0,
+                    'steps_reordered': 0, 'poses_adjusted': 0,
+                    'fields_by_category': {},
+                    'degraded': True,
+                    'notes': [f'compute_correction_diff raised: {type(e).__name__}: {e}'],
+                },
+            }
+        diff['computed_at'] = now_iso()
+        d = self.ensure_demo_dir(demo_id)
+        with open(os.path.join(d, 'correction_diff.json'), 'w') as f:
+            json.dump(diff, f, indent=2)
+
+        s = diff.get('summary') or {}
+        with self._connect() as conn:
+            conn.execute(
+                'UPDATE demonstrations '
+                'SET poses_adjusted=?, steps_changed=?, verbatim_accept=?, '
+                '    updated_iso=? '
+                'WHERE demo_id=?',
+                (
+                    int(s.get('poses_adjusted') or 0),
+                    int((s.get('fields_changed') or 0)
+                        + (s.get('steps_added') or 0)
+                        + (s.get('steps_removed') or 0)
+                        + (s.get('steps_reordered') or 0)),
+                    1 if s.get('verbatim_accept') else 0,
+                    now_iso(),
+                    demo_id,
+                ),
+            )
+        return diff
+
+    def load_draft(self, demo_id: str) -> Optional[Dict[str, Any]]:
+        """Return the stored AI draft for this demo, or None if absent
+        / unreadable. Used by save_correction_diff's caller to feed the
+        diff."""
+        path = os.path.join(self.dir_for(demo_id), 'program_draft.json')
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return None
+
     # ── Read hooks ─────────────────────────────────────────────────
 
     def load_all_files(self, demo_id: str) -> Dict[str, Any]:
@@ -181,6 +265,7 @@ class LearningStore:
             ('structured_intent.json', 'structured_intent'),
             ('program_draft.json',     'program_draft'),
             ('human_corrected.json',   'human_corrected'),
+            ('correction_diff.json',   'correction_diff'),
             ('backend_used.json',      'backend_used'),
             ('metadata.json',          'metadata'),
         ]:
@@ -251,6 +336,10 @@ class LearningStore:
                 'SELECT operations FROM demonstrations').fetchall()
             parts_rows = conn.execute(
                 'SELECT part_ids FROM demonstrations').fetchall()
+            diff_rows = conn.execute(
+                'SELECT demo_id, poses_adjusted, steps_changed, verbatim_accept '
+                'FROM demonstrations WHERE correction_made=1'
+            ).fetchall()
         op_counts: Dict[str, int] = {}
         for r in ops_rows:
             for o in json.loads(r['operations'] or '[]'):
@@ -259,6 +348,41 @@ class LearningStore:
         for r in parts_rows:
             for p in json.loads(r['part_ids'] or '[]'):
                 part_counts[p] = part_counts.get(p, 0) + 1
+
+        # Diff aggregates — the "where is the AI weakest?" signal. These
+        # cover demos with a stored diff (older demos pre-diff just
+        # contribute zeros to denominators they're counted against).
+        diffs_present       = 0
+        verbatim_count      = 0
+        total_poses         = 0
+        total_steps_changed = 0
+        category_totals: Dict[str, int] = {}
+        for r in diff_rows:
+            did = r['demo_id']
+            dpath = os.path.join(self.dir_for(did), 'correction_diff.json')
+            if not os.path.isfile(dpath):
+                continue
+            try:
+                with open(dpath) as f:
+                    diff = json.load(f) or {}
+            except Exception:
+                continue
+            diffs_present += 1
+            s = diff.get('summary') or {}
+            if s.get('verbatim_accept'):
+                verbatim_count += 1
+            total_poses         += int(s.get('poses_adjusted') or 0)
+            total_steps_changed += int(s.get('fields_changed') or 0)
+            for cat, n in (s.get('fields_by_category') or {}).items():
+                category_totals[cat] = category_totals.get(cat, 0) + int(n or 0)
+
+        avg_poses = (total_poses / diffs_present) if diffs_present else 0.0
+        verbatim_rate = (verbatim_count / diffs_present) if diffs_present else 0.0
+        # Sorted list so the most-corrected category is first — the
+        # direct answer to "where is the AI weakest?".
+        most_corrected_field_types = sorted(
+            category_totals.items(), key=lambda kv: kv[1], reverse=True)
+
         return {
             'total_demonstrations': int(total),
             'corrected':            int(corrected),
@@ -266,6 +390,16 @@ class LearningStore:
             'externally_processed': int(external),
             'operations_seen':      op_counts,
             'parts_seen':           part_counts,
+            'diffs_present':            diffs_present,
+            'verbatim_accept_count':    verbatim_count,
+            'verbatim_accept_rate':     verbatim_rate,
+            'avg_poses_adjusted_per_demo': avg_poses,
+            'total_fields_changed':     total_steps_changed,
+            'fields_changed_by_category': category_totals,
+            'most_corrected_field_types': [
+                {'category': c, 'count': n}
+                for c, n in most_corrected_field_types
+            ],
             'root':                 self.root,
         }
 

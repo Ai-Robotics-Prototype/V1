@@ -1,7 +1,51 @@
-import { useState } from 'react'
+import { Component, useState } from 'react'
 import CameraPanel from '../components/CameraPanel'
 import LidarPanel from '../components/LidarPanel'
 import MotionCamPanel from '../components/MotionCamPanel'
+
+// Local error boundary so a render error inside any sensor panel
+// (camera / lidar / motioncam) shows an inline "retry" fallback
+// instead of crashing the whole Cameras & LiDAR screen to the
+// global React error page. Added after a dangling component
+// reference in the cam0 expand path crashed the view; the underlying
+// bug is fixed below, but this catches future regressions.
+class SensorErrorBoundary extends Component {
+  constructor(props) {
+    super(props)
+    this.state = { err: null }
+  }
+  static getDerivedStateFromError(err) {
+    return { err }
+  }
+  componentDidCatch(err, info) {
+    // eslint-disable-next-line no-console
+    console.error('[SensorErrorBoundary]', err, info?.componentStack)
+  }
+  retry = () => this.setState({ err: null })
+  render() {
+    if (!this.state.err) return this.props.children
+    return (
+      <div style={{
+        width: '100%', height: '100%',
+        display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center', gap: 10,
+        background: '#0b1018', color: '#e2e8f0',
+        padding: 16, textAlign: 'center',
+      }}>
+        <span style={{ fontSize: 32 }}>⚠️</span>
+        <div style={{ fontSize: 13, fontWeight: 600 }}>Camera view error</div>
+        <div style={{ fontSize: 11, color: '#94a3b8', maxWidth: 360 }}>
+          {String(this.state.err?.message || this.state.err || 'render failed')}
+        </div>
+        <button onClick={this.retry} style={{
+          marginTop: 6, padding: '6px 14px', fontSize: 12, fontWeight: 600,
+          background: '#1f2937', color: '#e5e7eb',
+          border: '1px solid #334155', borderRadius: 6, cursor: 'pointer',
+        }}>Retry</button>
+      </div>
+    )
+  }
+}
 
 // Cameras & LiDAR shows cam0 with its server-burned Isaac/COCO
 // detection boxes. The open-vocabulary detection panel (formerly
@@ -46,31 +90,44 @@ export default function SensorsLayout() {
   const collapse = () => setExpanded(null)
 
   if (expanded === 'cam0') {
+    // Was `<Cam0WithNanoOWL />` — a component that doesn't exist
+    // (the NanoOWL wrapper moved to Part Recognition long ago and the
+    // expand path never got updated). React mounted an `undefined`
+    // element and threw "Element type is invalid". cam1 was fine
+    // because its expand path pointed at the real CameraPanel.
     return (
-      <PanelChrome expanded onToggle={collapse}>
-        <Cam0WithNanoOWL />
-      </PanelChrome>
+      <SensorErrorBoundary>
+        <PanelChrome expanded onToggle={collapse}>
+          <Cam0 />
+        </PanelChrome>
+      </SensorErrorBoundary>
     )
   }
   if (expanded === 'cam1') {
     return (
-      <PanelChrome expanded onToggle={collapse}>
-        <CameraPanel cam={1} />
-      </PanelChrome>
+      <SensorErrorBoundary>
+        <PanelChrome expanded onToggle={collapse}>
+          <CameraPanel cam={1} />
+        </PanelChrome>
+      </SensorErrorBoundary>
     )
   }
   if (expanded === 'lidar') {
     return (
-      <PanelChrome expanded onToggle={collapse}>
-        <LidarPanel />
-      </PanelChrome>
+      <SensorErrorBoundary>
+        <PanelChrome expanded onToggle={collapse}>
+          <LidarPanel />
+        </PanelChrome>
+      </SensorErrorBoundary>
     )
   }
   if (expanded === 'motioncam') {
     return (
-      <PanelChrome expanded onToggle={collapse}>
-        <MotionCamPanel />
-      </PanelChrome>
+      <SensorErrorBoundary>
+        <PanelChrome expanded onToggle={collapse}>
+          <MotionCamPanel />
+        </PanelChrome>
+      </SensorErrorBoundary>
     )
   }
 
@@ -87,27 +144,35 @@ export default function SensorsLayout() {
       gap: 0,
     }}>
       <div style={{ borderRight: '1px solid var(--border)', borderBottom: '1px solid var(--border)', overflow: 'hidden' }}>
-        <PanelChrome expanded={false} onToggle={() => setExpanded('cam0')}>
-          <Cam0 />
-        </PanelChrome>
+        <SensorErrorBoundary>
+          <PanelChrome expanded={false} onToggle={() => setExpanded('cam0')}>
+            <Cam0 />
+          </PanelChrome>
+        </SensorErrorBoundary>
       </div>
 
       <div style={{ borderBottom: '1px solid var(--border)', overflow: 'hidden' }}>
-        <PanelChrome expanded={false} onToggle={() => setExpanded('cam1')}>
-          <CameraPanel cam={1} />
-        </PanelChrome>
+        <SensorErrorBoundary>
+          <PanelChrome expanded={false} onToggle={() => setExpanded('cam1')}>
+            <CameraPanel cam={1} />
+          </PanelChrome>
+        </SensorErrorBoundary>
       </div>
 
       <div style={{ gridColumn: '1 / -1', borderBottom: '1px solid var(--border)', overflow: 'hidden' }}>
-        <PanelChrome expanded={false} onToggle={() => setExpanded('lidar')}>
-          <LidarPanel />
-        </PanelChrome>
+        <SensorErrorBoundary>
+          <PanelChrome expanded={false} onToggle={() => setExpanded('lidar')}>
+            <LidarPanel />
+          </PanelChrome>
+        </SensorErrorBoundary>
       </div>
 
       <div style={{ gridColumn: '1 / -1', overflow: 'hidden' }}>
-        <PanelChrome expanded={false} onToggle={() => setExpanded('motioncam')}>
-          <MotionCamPanel />
-        </PanelChrome>
+        <SensorErrorBoundary>
+          <PanelChrome expanded={false} onToggle={() => setExpanded('motioncam')}>
+            <MotionCamPanel />
+          </PanelChrome>
+        </SensorErrorBoundary>
       </div>
     </div>
   )

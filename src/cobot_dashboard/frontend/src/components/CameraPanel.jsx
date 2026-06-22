@@ -150,12 +150,17 @@ function DetectionModeToggle() {
 }
 
 export default function CameraPanel({ cam = 0 }) {
-  const detections    = useStore((s) => s.detections)
+  // Defensive defaults: the expanded single-camera mount can race the
+  // websocket hydration, and selectors that returned undefined have
+  // crashed the panel before. Both fields have store defaults already
+  // (detections=[], detectionMode='all') but reading through `||` here
+  // is cheap insurance against a stale/cleared slice.
+  const detections    = useStore((s) => s.detections) || []
   const setView       = useStore((s) => s.setView)
-  const detectionMode = useStore((s) => s.detectionMode || 'all')
+  const detectionMode = useStore((s) => s.detectionMode) || 'all'
 
   const visibleDetections = detectionMode === 'library'
-    ? detections.filter(d => d.part_name && Number(d.match_score) >= 0.48)
+    ? detections.filter(d => d?.part_name && Number(d?.match_score) >= 0.48)
     : detections
 
   const [online, setOnline]     = useState(true)

@@ -3730,7 +3730,22 @@ if FASTAPI_AVAILABLE:
         except Exception as e:
             return JSONResponse({"ok": False, "error": f"save_correction failed: {e}"},
                                 status_code=500)
-        return {"ok": True, "demo_id": did, "program_id": program_id}
+        # Compute the CORRECTED-vs-DRAFT diff — the most valuable
+        # training signal (what the AI got wrong, by how much). Strictly
+        # best-effort: a diff failure must NEVER block the operator's
+        # Accept, so we swallow exceptions and just log them.
+        diff_summary = None
+        try:
+            ai_draft = store.load_draft(did)
+            diff = store.save_correction_diff(did, ai_draft, program)
+            diff_summary = (diff or {}).get('summary')
+        except Exception as e:
+            print(f'[pbd] correction_diff capture failed for {did}: '
+                  f'{type(e).__name__}: {e}', flush=True)
+        out = {"ok": True, "demo_id": did, "program_id": program_id}
+        if diff_summary is not None:
+            out["diff_summary"] = diff_summary
+        return out
 
     @app.get("/api/pbd/dataset/stats")
     async def api_pbd_stats():

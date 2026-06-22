@@ -18,3 +18,14 @@ src/cobot_dashboard/mock_server/static/
 # scripts/install_livox.sh, not vendored in this repo.
 src/Livox-SDK2/
 src/livox_ros_driver2/
+
+# Ad-hoc backups of robot 3D assets (~90 MB of .glb) — restore from
+# models/robots/estun_s10-140/links/ instead, the live set is the source.
+models/robots/estun_s10-140/links.bak/
+
+# Secrets / env files — never commit. Belt-and-braces; nothing matches today.
+.env
+.env.*
+*.pem
+*.key
+**/credentials.json

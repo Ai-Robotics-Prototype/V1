@@ -67,9 +67,75 @@ function ReachCylinder({ radius }) {
   )
 }
 
+// Build a THREE.BufferGeometry from a {vertices, triangles} payload
+// in the LiDAR/ROS frame, applying the same handedness-preserving
+// lidarToThree mapping element-wise so the mesh sits exactly where
+// the box would have. Memoise on the object identity so repeated
+// store updates don't rebuild the geometry on every render.
+function useMeshGeometry(payload) {
+  return useMemo(() => {
+    if (!payload?.vertices?.length || !payload?.triangles?.length) return null
+    const v = payload.vertices
+    const t = payload.triangles
+    const positions = new Float32Array(v.length * 3)
+    for (let i = 0; i < v.length; i++) {
+      const [x, y, z] = v[i]
+      const [tx, ty, tz] = lidarToThree(x || 0, y || 0, z || 0)
+      positions[i * 3 + 0] = tx
+      positions[i * 3 + 1] = ty
+      positions[i * 3 + 2] = tz
+    }
+    const indices = new Uint32Array(t.length * 3)
+    for (let i = 0; i < t.length; i++) {
+      indices[i * 3 + 0] = t[i][0]
+      indices[i * 3 + 1] = t[i][1]
+      indices[i * 3 + 2] = t[i][2]
+    }
+    const geo = new THREE.BufferGeometry()
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    geo.setIndex(new THREE.BufferAttribute(indices, 1))
+    geo.computeVertexNormals()
+    geo.computeBoundingSphere()
+    return geo
+  }, [payload])
+}
+
+// Render a baseline-static keep-out zone as its CONCAVE alpha-shape
+// (when present) with an edge wireframe overlay — tightly contoured
+// to the cluster surface, not a box. Falls back to the convex
+// collision hull when the alpha mesh is missing, so the operator
+// never sees nothing where a zone should be.
+function ContouredZone({ obj, fillColor, strokeColor, fillOpacity }) {
+  // Try the visual mesh first, then the collision hull. We do this
+  // unconditionally — the hooks run on every render regardless of
+  // which mesh we end up drawing.
+  const visualGeo = useMeshGeometry(obj.visual_mesh)
+  const hullGeo   = useMeshGeometry(obj.collision_hull)
+  const geo = visualGeo || hullGeo
+  if (!geo) return null
+  return (
+    <group>
+      <mesh geometry={geo}>
+        <meshStandardMaterial
+          color={fillColor}
+          transparent
+          opacity={fillOpacity}
+          roughness={0.85}
+          metalness={0.0}
+          side={THREE.DoubleSide}
+          depthWrite={false}
+        />
+      </mesh>
+      <lineSegments>
+        <wireframeGeometry attach="geometry" args={[geo]} />
+        <lineBasicMaterial color={strokeColor} transparent opacity={0.55} />
+      </lineSegments>
+    </group>
+  )
+}
+
 function ObjectBox({ obj, showLabel }) {
   const { center, dimensions, orientation = {}, status, static: isStatic, source } = obj
-  if (!center || !dimensions) return null
   // Baseline-built static zones (source=='baseline_static') render as
   // red/orange "permanent obstacle" volumes — distinct from the live
   // dynamic boxes which are green/yellow/red by proximity. We still
@@ -81,6 +147,25 @@ function ObjectBox({ obj, showLabel }) {
   const strokeColor = (isBaselineStatic && status === 'clear')
     ? '#ea580c'
     : statusColors(status).stroke
+
+  // Tight contoured rendering for baseline-static zones that ship a
+  // visual mesh (alpha-shape) or convex collision hull. The mesh
+  // vertices are already in the LiDAR/ROS frame; ContouredZone applies
+  // lidarToThree per vertex, so we render the mesh in scene space
+  // without an enclosing group transform — keeps the cluster pinned
+  // to its real points regardless of orientation.
+  if (isBaselineStatic && (obj.visual_mesh || obj.collision_hull)) {
+    return (
+      <ContouredZone
+        obj={obj}
+        fillColor={fillColor}
+        strokeColor={strokeColor}
+        fillOpacity={0.22}
+      />
+    )
+  }
+
+  if (!center || !dimensions) return null
   const [px, py, pz] = lidarToThree(center.x || 0, center.y || 0, center.z || 0)
   // Map LiDAR/ROS quaternion (rotation about Z is "yaw" in LiDAR frame)
   // into Three's frame. Under the handedness-preserving lidarToThree
@@ -145,9 +230,37 @@ function ObjectBox({ obj, showLabel }) {
 
 export function CollisionScene3D({ showLabels = true, showStatic = true, showDynamic = true }) {
   const collision = useStore((s) => s.collision)
+  // Mesh data is persisted in collision_zones.json on the dashboard
+  // side — too heavy for the 10 Hz /collision/objects feed but stable
+  // across rebuilds. We fetch it once on mount and re-fetch when the
+  // set of static-zone ids changes (i.e. operator rebuilt zones).
+  const [zoneMeshes, setZoneMeshes] = useState({})
+  const objects = collision?.objects || []
+  const staticIds = useMemo(() => objects
+    .filter((o) => o.source === 'baseline_static')
+    .map((o) => o.id).sort().join(','), [objects])
+  useEffect(() => {
+    let aborted = false
+    fetch('/api/collision/static_zones')
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => {
+        if (aborted || !data) return
+        const map = {}
+        for (const z of (data.zones || [])) {
+          if (!z?.id) continue
+          map[z.id] = {
+            visual_mesh:    z.visual_mesh    || null,
+            collision_hull: z.collision_hull || null,
+          }
+        }
+        setZoneMeshes(map)
+      })
+      .catch(() => {})
+    return () => { aborted = true }
+  }, [staticIds])
+
   if (!collision) return null
-  const objects = collision.objects || []
-  const reach   = collision.reach_radius_m || 1.4
+  const reach = collision.reach_radius_m || 1.4
   const filtered = objects.filter((o) => {
     const isBaselineStatic = o.source === 'baseline_static'
     if (isBaselineStatic) return showStatic
@@ -156,9 +269,16 @@ export function CollisionScene3D({ showLabels = true, showStatic = true, showDyn
   return (
     <group>
       <ReachCylinder radius={reach} />
-      {filtered.map((o, i) => (
-        <ObjectBox key={`${o.id ?? 'obj'}-${i}`} obj={o} showLabel={showLabels} />
-      ))}
+      {filtered.map((o, i) => {
+        // Join: per-tick payload is small, mesh data comes from the
+        // persisted-zones fetch above. Both must be present for the
+        // contoured render to take over.
+        const meshes = zoneMeshes[o.id]
+        const merged = meshes ? { ...o, ...meshes } : o
+        return (
+          <ObjectBox key={`${o.id ?? 'obj'}-${i}`} obj={merged} showLabel={showLabels} />
+        )
+      })}
     </group>
   )
 }
