@@ -262,7 +262,10 @@ class Pipeline:
             },
             'part_ids':      all_part_ids,
             'operations':    [op.operation_type for op in intent.operations],
-            'ambiguities':   list(intent.ambiguities),
+            # Convert Clarification dataclasses to plain dicts —
+            # save_metadata json.dumps this directly.
+            'ambiguities':   [c.to_dict() if hasattr(c, 'to_dict') else c
+                              for c in (intent.ambiguities or [])],
             'confidence':    float(intent.confidence_overall or 0.0),
             'correction_made': False,
             'scene': {

@@ -3633,11 +3633,33 @@ if FASTAPI_AVAILABLE:
                 status_code=404,
             )
         backend_override = str(body.get('backend') or '').strip() or None
-        # Heavy work — drop off the event loop.
+        # Heavy work — drop off the event loop. Wrap in try/except so
+        # a pipeline crash (ffmpeg failure, schema bug, network) always
+        # returns JSON instead of FastAPI's default text 500. The FE
+        # parses res.json() and the bare "Internal Server Error" body
+        # used to surface as the misleading "Unexpected token 'I'"
+        # JSON parse error instead of the real reason.
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, _pbd_run_sync, video_path, demo_id, backend_override,
-        )
+        try:
+            return await loop.run_in_executor(
+                None, _pbd_run_sync, video_path, demo_id, backend_override,
+            )
+        except Exception as e:
+            import traceback as _tb
+            tb_text = _tb.format_exc()
+            print(f'[pbd] api_pbd_generate failed for demo {demo_id}: '
+                  f'{type(e).__name__}: {e}\n{tb_text}', flush=True)
+            return JSONResponse(
+                {
+                    'ok':       False,
+                    'demo_id':  demo_id,
+                    'error':    f'{type(e).__name__}: {e}',
+                    # Truncated traceback for the operator's bug
+                    # report; the full one stays in the journal.
+                    'traceback_excerpt': tb_text[-1500:],
+                },
+                status_code=500,
+            )
 
     @app.get("/api/pbd/list")
     async def api_pbd_list():
@@ -3731,6 +3753,16 @@ if FASTAPI_AVAILABLE:
                 corrected_scene=corrected_scene,
                 corrected_intent=corrected_intent,
             )
+            # Persist the operator's clarification answers as a
+            # separate training signal — what the AI ASKED + what the
+            # human ANSWERED. The intent's ambiguities list carries
+            # the structured questions; answers is a {id: value} map.
+            cl_list = []
+            if isinstance(corrected_intent, dict):
+                cl_list = corrected_intent.get('ambiguities') or []
+            cl_answers = body.get('clarifications_answered')
+            if isinstance(cl_answers, dict) and (cl_answers or cl_list):
+                store.save_clarifications(did, cl_list, cl_answers)
         except Exception as e:
             return JSONResponse({"ok": False, "error": f"save_correction failed: {e}"},
                                 status_code=500)

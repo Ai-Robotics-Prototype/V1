@@ -798,9 +798,6 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
   // Show baseline-built static keep-out zones by default; the
   // operator can hide them via the StaticZonesToggle.
   const [showStaticZones, setShowStaticZones] = useState(true)
-  // What BaselineCloudInScene last reported — drives the inline
-  // "no commissioned baseline" notice for the empty case.
-  const [baselineStatus, setBaselineStatus] = useState(null)
   const autoFittedRef = useRef(false)
 
   // === DIAGNOSTIC — independent fetch of one per-link GLB so a
@@ -906,7 +903,6 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
           />
         )}
         <CustomGripperModel url={gripperGlbUrl} flange={flange} />
-        <BaselineCloudInScene onStatusChange={setBaselineStatus} />
         <CollisionScene3D showStatic={showStaticZones} />
         {children}
       </Canvas>
@@ -916,12 +912,6 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
           collision payload has no baseline-static obstacles so the
           UI doesn't dangle a useless toggle. */}
       <StaticZonesToggle value={showStaticZones} onChange={setShowStaticZones} />
-
-      {/* Baseline cloud status — inline notice for the empty / not-
-          captured cases so the operator isn't staring at an empty
-          scene wondering whether the system is broken. The success
-          case (cloud rendered) only surfaces a tiny pt-count chip. */}
-      <BaselineStatusNotice status={baselineStatus} />
 
       {/* Collision banner — centered at top */}
       <div style={{

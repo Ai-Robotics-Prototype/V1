@@ -39,6 +39,11 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
   const [transitedExternally, setTransited] = useState(false)
   const [accepting, setAccepting]     = useState(false)
   const [acceptError, setAcceptError] = useState('')
+  // Map of clarification.id → operator answer (or suggested default
+  // until they change it). Reset every time a new draft loads. Empty
+  // string means "explicitly pending" (used for text/number inputs
+  // the operator hasn't touched yet when no suggested existed).
+  const [clarAnswers, setClarAnswers] = useState({})
   // Editable mirrors of the draft fields — operator corrections.
   const [editName, setEditName]       = useState('')
   const [editDesc, setEditDesc]       = useState('')
@@ -106,7 +111,12 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
       const fd = new FormData()
       fd.append('file', file)
       const res = await fetch('/api/pbd/upload', { method: 'POST', body: fd })
-      const data = await res.json()
+      const data = await safeParseJsonResponse(res, 'upload')
+      if (data._parseError) {
+        setGenError(data._parseError)
+        setGenerating(false)
+        return null
+      }
       if (!data.ok) {
         setGenError(data.error || 'upload failed')
         setGenerating(false)
@@ -133,9 +143,20 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ demo_id: up.demo_id, video_path: up.video_path }),
       })
-      const data = await res.json()
+      const data = await safeParseJsonResponse(res, 'generate')
+      if (data._parseError) {
+        setGenError(data._parseError)
+        setPhase(PHASE_UPLOAD)
+        setGenerating(false)
+        return
+      }
       if (!data.ok) {
-        setGenError(data.error || 'generate failed')
+        // Backend now always returns JSON on error (even on 500), so
+        // surface its real message + optional traceback excerpt.
+        const detail = data.traceback_excerpt
+          ? ` — ${data.traceback_excerpt.split('\n').slice(-3).join(' ').slice(0, 280)}`
+          : ''
+        setGenError(`${data.error || 'generate failed'}${detail}`)
         setPhase(PHASE_UPLOAD)
         setGenerating(false)
         return
@@ -156,6 +177,18 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
                         || `Demo ${up.demo_id}`
       setEditName(draftName)
       setEditDesc(data.draft?.description || '')
+      // Seed each clarification's answer with its `suggested` default
+      // so "Accept all suggested defaults" is just an Accept with no
+      // edits — the operator only needs to TOUCH the ones they want
+      // to override. Plain-string legacy ambiguities (answerable=false)
+      // are skipped here so they never poison the diff/learning store.
+      const seed = {}
+      for (const c of (data.intent?.ambiguities || [])) {
+        if (c && c.answerable !== false && c.id) {
+          seed[c.id] = c.suggested !== undefined ? c.suggested : ''
+        }
+      }
+      setClarAnswers(seed)
       setPhase(PHASE_REVIEW)
     } catch (e) {
       setGenError(`generate error: ${e?.message || e}`)
@@ -169,9 +202,14 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
     setAccepting(true)
     setAcceptError('')
     try {
+      // Fold clarification answers into the draft + intent BEFORE the
+      // POST so the saved program already reflects every answered
+      // question (no second round-trip). The applied intent is what
+      // gets persisted as the training target.
+      const applied = applyClarifications(draft, intent, clarAnswers)
       const program = {
-        ...draft,
-        name:        editName.trim() || draft.name,
+        ...applied.draft,
+        name:        editName.trim() || applied.draft.name,
         description: editDesc,
       }
       // The operator may have corrected the scene (renamed an object,
@@ -180,10 +218,10 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
       // intent (intent with the scene swapped in) so the learning
       // store captures both as supervised training targets for the
       // future on-Jetson model.
-      const correctedScene = editScene || (intent && intent.scene) || null
-      const correctedIntent = intent && correctedScene
-        ? { ...intent, scene: correctedScene }
-        : intent
+      const correctedScene = editScene || (applied.intent && applied.intent.scene) || null
+      const correctedIntent = applied.intent && correctedScene
+        ? { ...applied.intent, scene: correctedScene }
+        : applied.intent
       const res = await fetch(`/api/pbd/${demoId}/correct`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -191,6 +229,11 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
           program,
           scene:   correctedScene,
           intent:  correctedIntent,
+          // Operator's answers, keyed by clarification.id. Persisted
+          // as a separate file (clarifications_answered.json) so the
+          // learning loop can see which questions the AI needed to
+          // ask and how the human answered them.
+          clarifications_answered: clarAnswers,
           save_to_library: true,
         }),
       })
@@ -413,6 +456,7 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
               editDesc={editDesc} setEditDesc={setEditDesc}
               editScene={editScene} setEditScene={setEditScene}
               partsLibrary={partsLibrary}
+              clarAnswers={clarAnswers} setClarAnswers={setClarAnswers}
               accepting={accepting} acceptError={acceptError}
             />
           )}
@@ -473,6 +517,7 @@ function ReviewPanel({
   intent, draft, transcript, backendId, transitedExternally, usedExamples,
   editName, setEditName, editDesc, setEditDesc,
   editScene, setEditScene, partsLibrary,
+  clarAnswers, setClarAnswers,
   accepting, acceptError,
 }) {
   return (
@@ -541,15 +586,12 @@ function ReviewPanel({
       </Section>
 
       {(intent.ambiguities || []).length > 0 && (
-        <Section title={`Ambiguities (${intent.ambiguities.length})`}>
-          {intent.ambiguities.map((a, i) => (
-            <div key={i} style={{
-              padding: '8px 10px', marginBottom: 4, borderRadius: 6,
-              background: '#fffbeb', border: '1px solid #fde68a',
-              fontSize: 12, color: '#92400e',
-            }}>{a}</div>
-          ))}
-        </Section>
+        <ClarificationsPanel
+          clarifications={intent.ambiguities}
+          answers={clarAnswers}
+          setAnswers={setClarAnswers}
+          partsLibrary={partsLibrary}
+        />
       )}
 
       {(usedExamples || []).length > 0 && (
@@ -623,6 +665,363 @@ function ReviewPanel({
           taller than the viewport. */}
     </div>
   )
+}
+
+
+// ── ClarificationsPanel — interactive question/answer block ──────
+//
+// Renders each structured clarification with the right input for its
+// `type`, pre-filled from `suggested`. Legacy plain-string ambiguities
+// (answerable=false after schema wrapping) render as read-only chips
+// so old demos still display. The panel reports unanswered vs
+// answered + lets the operator "Accept all suggested defaults" in one
+// click; that's just a no-op since the seed already populated
+// suggested values into answers, but the button makes the implicit
+// behaviour explicit.
+function ClarificationsPanel({ clarifications, answers, setAnswers, partsLibrary }) {
+  const list = Array.isArray(clarifications) ? clarifications : []
+  const interactive = list.filter((c) => c && c.answerable !== false && c.id)
+  const passive     = list.filter((c) => c && (c.answerable === false || !c.id))
+
+  // "Pending" = answer is empty string AND no suggested default lined
+  // up to back-fill it (so it would actually go in as empty). An
+  // answer that still equals the suggested default is considered
+  // "answered" — accepting the suggestion is a real choice.
+  const pendingCount = interactive.reduce((n, c) => {
+    const v = answers ? answers[c.id] : undefined
+    const empty = (v === undefined || v === null || v === '')
+    return n + (empty ? 1 : 0)
+  }, 0)
+  const answeredCount = interactive.length - pendingCount
+
+  function setOne(id, v) { setAnswers((prev) => ({ ...(prev || {}), [id]: v })) }
+  function acceptAllSuggested() {
+    const next = { ...(answers || {}) }
+    for (const c of interactive) {
+      if (next[c.id] === undefined || next[c.id] === '') {
+        if (c.suggested !== undefined && c.suggested !== null) {
+          next[c.id] = c.suggested
+        }
+      }
+    }
+    setAnswers(next)
+  }
+
+  return (
+    <Section title={`Clarifications (${interactive.length})`}>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8,
+        fontSize: 12, color: '#374151',
+      }}>
+        <span><b>{answeredCount}</b> answered · <b>{pendingCount}</b> pending</span>
+        <div style={{ flex: 1 }} />
+        {pendingCount > 0 && (
+          <button onClick={acceptAllSuggested}
+            style={{
+              padding: '4px 10px', fontSize: 11, fontWeight: 600,
+              background: '#eff6ff', color: '#1d4ed8',
+              border: '1px solid #bfdbfe', borderRadius: 4, cursor: 'pointer',
+            }}>
+            Accept all suggested defaults
+          </button>
+        )}
+      </div>
+
+      {interactive.map((c) => {
+        const v = answers ? answers[c.id] : undefined
+        const isEmpty = (v === undefined || v === null || v === '')
+        const isPending = isEmpty
+        const isSuggested = !isEmpty && JSON.stringify(v) === JSON.stringify(c.suggested)
+        return (
+          <ClarificationRow
+            key={c.id}
+            c={c}
+            value={v}
+            isPending={isPending}
+            isSuggested={isSuggested}
+            onChange={(next) => setOne(c.id, next)}
+            partsLibrary={partsLibrary}
+          />
+        )
+      })}
+
+      {passive.length > 0 && (
+        <div style={{ marginTop: interactive.length ? 10 : 0 }}>
+          <div style={{ fontSize: 10, color: '#6b7280', marginBottom: 4 }}>
+            Notes (read-only — legacy format):
+          </div>
+          {passive.map((c, i) => (
+            <div key={`p${i}`} style={{
+              padding: '6px 10px', marginBottom: 4, borderRadius: 6,
+              background: '#fffbeb', border: '1px solid #fde68a',
+              fontSize: 12, color: '#92400e',
+            }}>{c.question || c}</div>
+          ))}
+        </div>
+      )}
+    </Section>
+  )
+}
+
+function ClarificationRow({ c, value, isPending, isSuggested, onChange, partsLibrary }) {
+  const borderColor = isPending ? '#fde68a' : (isSuggested ? '#bfdbfe' : '#86efac')
+  const tintColor   = isPending ? '#fffbeb' : (isSuggested ? '#eff6ff' : '#f0fdf4')
+  const statusText  = isPending
+    ? 'PENDING'
+    : (isSuggested ? 'SUGGESTED' : 'ANSWERED')
+  const statusColor = isPending ? '#92400e' : (isSuggested ? '#1d4ed8' : '#166534')
+
+  return (
+    <div style={{
+      padding: 10, marginBottom: 6, borderRadius: 6,
+      background: tintColor, border: '1px solid ' + borderColor,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+        <span style={{
+          fontSize: 10, fontWeight: 700, letterSpacing: 0.5,
+          padding: '1px 6px', borderRadius: 4,
+          color: '#fff', background: '#6b7280',
+          textTransform: 'uppercase',
+        }}>{c.field}</span>
+        <span style={{
+          fontSize: 10, fontWeight: 700, letterSpacing: 0.5,
+          padding: '1px 6px', borderRadius: 4,
+          color: statusColor, background: '#fff',
+          border: '1px solid ' + borderColor,
+        }}>{statusText}</span>
+      </div>
+      <div style={{ fontSize: 13, color: '#111', marginBottom: 8 }}>
+        {c.question || <em>(no question text)</em>}
+      </div>
+      <ClarificationInput
+        c={c} value={value} onChange={onChange}
+        partsLibrary={partsLibrary}
+      />
+    </div>
+  )
+}
+
+function ClarificationInput({ c, value, onChange, partsLibrary }) {
+  const type = c?.type || 'text'
+
+  if (type === 'choice') {
+    const opts = Array.isArray(c.options) ? c.options : []
+    return (
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        {opts.map((opt, i) => {
+          const label = typeof opt === 'string' ? opt : (opt?.label || JSON.stringify(opt))
+          const val   = typeof opt === 'string' ? opt : (opt?.value !== undefined ? opt.value : opt)
+          const active = JSON.stringify(val) === JSON.stringify(value)
+          return (
+            <button key={i} onClick={() => onChange(val)}
+              style={{
+                padding: '6px 10px', fontSize: 12,
+                fontWeight: active ? 700 : 500,
+                background: active ? '#2563EB' : '#fff',
+                color: active ? '#fff' : '#374151',
+                border: '1px solid ' + (active ? '#2563EB' : '#d1d5db'),
+                borderRadius: 6, cursor: 'pointer',
+              }}>{label}</button>
+          )
+        })}
+      </div>
+    )
+  }
+
+  if (type === 'number') {
+    return (
+      <input type="number"
+        value={value ?? ''}
+        onChange={(e) => {
+          const n = e.target.value
+          onChange(n === '' ? '' : Number(n))
+        }}
+        placeholder={c.suggested !== undefined ? String(c.suggested) : ''}
+        style={{ ...inputBox, maxWidth: 160 }} />
+    )
+  }
+
+  if (type === 'part_select') {
+    // Build the dropdown from `c.options` (the AI's top matches) plus
+    // every taught library part — the operator may know it's actually
+    // a different taught part the AI ignored. Untaught parts stay
+    // hidden, mirroring the program editor's Detect Part dropdown.
+    const seen = new Set()
+    const merged = []
+    for (const opt of (Array.isArray(c.options) ? c.options : [])) {
+      const pid = typeof opt === 'string' ? opt : opt?.part_id
+      const name = typeof opt === 'string'
+        ? opt
+        : (opt?.name || opt?.part_id || '')
+      if (!pid || seen.has(pid)) continue
+      seen.add(pid)
+      merged.push({ part_id: pid, name })
+    }
+    for (const p of (partsLibrary || [])) {
+      if (!p?.id || seen.has(p.id)) continue
+      if (Number(p.teach_count || 0) <= 0) continue
+      seen.add(p.id)
+      merged.push({ part_id: p.id, name: p.name || p.id })
+    }
+    const current = typeof value === 'string' ? value : (value?.part_id || '')
+    return (
+      <select value={current}
+        onChange={(e) => {
+          const pid = e.target.value
+          const hit = merged.find((p) => p.part_id === pid)
+          onChange(hit ? { part_id: pid, name: hit.name } : pid)
+        }}
+        style={{ ...inputBox, maxWidth: 320 }}>
+        <option value="">— pick a part —</option>
+        {merged.map((p) => (
+          <option key={p.part_id} value={p.part_id}>{p.name} ({p.part_id})</option>
+        ))}
+      </select>
+    )
+  }
+
+  // Default: text.
+  return (
+    <input type="text"
+      value={value ?? ''}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder={c.suggested ? String(c.suggested) : ''}
+      style={inputBox} />
+  )
+}
+
+
+// Tolerant parser for /api/pbd/* responses.
+// - If the body is valid JSON → return it as-is.
+// - If the body isn't JSON (e.g. FastAPI's bare-text 500 page, an
+//   nginx HTML page, a truncated stream), return {_parseError: "<label>
+//   failed (HTTP <status>): <first 200 chars of body>"} so the UI can
+//   show a real message instead of "Unexpected token 'I' is not valid
+//   JSON".
+// - On res.ok=false WITH valid JSON, the caller still sees data.ok=false
+//   and renders data.error.
+async function safeParseJsonResponse(res, label) {
+  let raw = ''
+  try { raw = await res.text() } catch { /* network died mid-body */ }
+  const ctype = (res.headers.get('content-type') || '').toLowerCase()
+  if (ctype.includes('application/json') || (raw.startsWith('{') || raw.startsWith('['))) {
+    try {
+      return JSON.parse(raw)
+    } catch (e) {
+      return {
+        _parseError: `${label} response was not valid JSON (HTTP ${res.status}): ${raw.slice(0, 200)}`,
+      }
+    }
+  }
+  // Plain-text / HTML body — the symptom the original bug created.
+  // Show the first 200 chars verbatim so the operator can read the
+  // actual server message.
+  return {
+    _parseError: `${label} failed (HTTP ${res.status} ${res.statusText || ''}): ${raw.slice(0, 200).trim() || '<empty body>'}`,
+  }
+}
+
+
+// ── Clarifications: apply operator answers to draft + intent ─────
+//
+// Reads each clarification's `affects` metadata (scope + path) and
+// writes the answer to the right field on a DEEP COPY of the draft
+// + intent. The frontend never mutates the props it received — the
+// returned objects are what gets POSTed to /correct, so the saved
+// program is the post-answers version. Unknown affects/paths are
+// ignored silently (better than throwing and blocking Accept on a
+// malformed AI response).
+function applyClarifications(draft, intent, answers) {
+  const d = draft ? JSON.parse(JSON.stringify(draft)) : null
+  const i = intent ? JSON.parse(JSON.stringify(intent)) : null
+  if (!d || !i) return { draft: d, intent: i }
+
+  const ambs = Array.isArray(i.ambiguities) ? i.ambiguities : []
+  for (const c of ambs) {
+    if (!c || c.answerable === false || !c.id) continue
+    if (!(c.id in (answers || {}))) continue
+    const ans = answers[c.id]
+    // Empty-string answers from a text/number input that the operator
+    // cleared aren't applied — the AI's existing draft value stays.
+    if (ans === '' || ans === null || ans === undefined) continue
+    const aff = c.affects || {}
+    const scope = aff.scope || 'other'
+    const path  = String(aff.path || '')
+    try {
+      if (scope === 'config' && path === 'config.pallet') {
+        // Expected shape: { rows, cols, layers, fill_order? }. Falls
+        // back to the AI's existing config.pallet for missing keys so
+        // partial answers keep spacing/corner_tcp intact.
+        const existing = (d.config && d.config.pallet) || {}
+        const r = Number(ans.rows ?? existing.rows ?? 1)
+        const cN = Number(ans.cols ?? existing.cols ?? 1)
+        const l = Number(ans.layers ?? existing.layers ?? 1)
+        d.config = { ...(d.config || {}) }
+        d.config.pallet = {
+          ...existing,
+          rows:   Math.max(1, r),
+          cols:   Math.max(1, cN),
+          layers: Math.max(1, l),
+          fill_order: ans.fill_order || existing.fill_order || 'row_lr',
+        }
+        // Mirror the same shape onto the intent op so the saved
+        // intent (training target) tells the same story.
+        const opIdx = Number(aff.operation_index ?? 0)
+        if (Array.isArray(i.operations) && i.operations[opIdx]) {
+          i.operations[opIdx].pallet = {
+            ...(i.operations[opIdx].pallet || {}),
+            rows: d.config.pallet.rows,
+            cols: d.config.pallet.cols,
+            layers: d.config.pallet.layers,
+            fill_order: d.config.pallet.fill_order,
+            assumed: false,
+          }
+        }
+      } else if (scope === 'operation' && Array.isArray(i.operations)) {
+        const opIdx = Number(aff.operation_index ?? 0)
+        const op = i.operations[opIdx]
+        if (!op) continue
+        if (path === 'target_part') {
+          // ans can be a part_id string or {part_id, name}.
+          const pid  = typeof ans === 'string' ? ans : ans?.part_id
+          const name = typeof ans === 'string' ? '' : (ans?.name || '')
+          if (pid) {
+            op.target_part = {
+              ...(op.target_part || {}),
+              part_id: pid,
+              name: name || op.target_part?.name || pid,
+              source: 'matched_to_library',
+            }
+          }
+        } else if (path === 'count_hint') {
+          const n = Number(ans)
+          op.count_hint = Number.isFinite(n) && n > 0 ? n : ans
+        } else if (path === 'pick.location_hint') {
+          op.pick = { ...(op.pick || {}), location_hint: String(ans) }
+        } else if (path === 'place.location_hint') {
+          op.place = { ...(op.place || {}), location_hint: String(ans) }
+        }
+      } else if (scope === 'step' && Array.isArray(d.steps)) {
+        // Generic step.<field> path — best-effort. Used for one-off
+        // step tweaks the model might emit.
+        const stepIdx = Number(aff.step_index ?? -1)
+        if (stepIdx >= 0 && d.steps[stepIdx] && path) {
+          // path is dot-delimited from the step root.
+          const keys = path.split('.')
+          let cur = d.steps[stepIdx]
+          for (let k = 0; k < keys.length - 1; k++) {
+            const key = keys[k]
+            cur[key] = cur[key] || {}
+            cur = cur[key]
+          }
+          cur[keys[keys.length - 1]] = ans
+        }
+      }
+    } catch {
+      // Don't let a malformed `affects` block break Accept.
+    }
+  }
+  return { draft: d, intent: i }
 }
 
 

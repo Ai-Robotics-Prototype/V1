@@ -3,6 +3,8 @@ import { Canvas, useThree } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader'
+import { useStore } from '../store/useStore'
+import PanelErrorBoundary from '../components/PanelErrorBoundary'
 
 // step_parser.py writes a .stl alongside each uploaded .step. The
 // dashboard's upload endpoint copies that .stl into the dashboard's
@@ -744,7 +746,18 @@ function PartConfigurator({ partId, onSave, onDelete }) {
   }
 
   const stlUrl = part.stl_file ? `/parts/${part.stl_file}` : null
-  const ex = part.extents_cm || [0, 0, 0]
+  // Same normalizer as the parts-list ex — guarantees three finite
+  // numbers so the dimension chip can never crash on a legacy/malformed
+  // extents_cm entry (e.g. the Delrin piece's [0,0,0] placeholder).
+  const ex = (() => {
+    const raw = Array.isArray(part.extents_cm) ? part.extents_cm : []
+    return [0, 1, 2].map(i => {
+      const n = Number(raw[i])
+      return Number.isFinite(n) ? n : 0
+    })
+  })()
+  const verts = Number.isFinite(Number(part.vertices)) ? Number(part.vertices) : '—'
+  const vol   = Number.isFinite(Number(part.volume_cm3)) ? Number(part.volume_cm3) : null
 
   return (
     <div style={{ display: 'flex', height: '100%', minHeight: 0 }}>
@@ -767,8 +780,8 @@ function PartConfigurator({ partId, onSave, onDelete }) {
           padding: '4px 10px', borderRadius: 4, fontSize: 11,
           border: '1px solid rgba(0,0,0,0.06)',
         }}>
-          {ex[0]}×{ex[1]}×{ex[2]} cm · {part.vertices} verts
-          {part.volume_cm3 ? ` · ${part.volume_cm3} cm³` : ''}
+          {ex[0].toFixed(1)}×{ex[1].toFixed(1)}×{ex[2].toFixed(1)} cm · {verts} verts
+          {vol !== null ? ` · ${vol.toFixed(1)} cm³` : ''}
         </div>
       </div>
 
@@ -1361,6 +1374,43 @@ function CaptureView({
   // requires it).
   const [useTablet, setUseTablet] = useState(false)
 
+  // Capture-readiness, polled from the SAME detector the teach
+  // endpoint reads on the backend (depth_segment_node._last_objects,
+  // exposed via /api/detections). The annotated MJPEG already paints
+  // the depth-seg boxes, but operators repeatedly reported "the box
+  // is green, why does capture fail?" — they were either looking at
+  // a stale frame, or at the open-vocab box in another panel. An
+  // explicit "Ready: N object(s) detected" pill driven by the same
+  // source the capture handler uses removes that ambiguity.
+  const [readyCount, setReadyCount] = useState(null)
+  const [framesStale, setFramesStale] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    let lastChangeT = Date.now()
+    let lastSig = ''
+    async function tick() {
+      try {
+        const r = await fetch('/api/detections')
+        if (!r.ok) throw new Error('http ' + r.status)
+        const d = await r.json()
+        if (cancelled) return
+        const objs = Array.isArray(d?.objects) ? d.objects : []
+        const sig = JSON.stringify(objs.map((o) => o?.bbox_px || o?.pos))
+        if (sig !== lastSig) { lastSig = sig; lastChangeT = Date.now() }
+        setReadyCount(objs.length)
+        // If the detections payload hasn't changed for 3 s the cam
+        // feed has likely stalled — flag it so the operator doesn't
+        // try to capture from a frozen image.
+        setFramesStale(Date.now() - lastChangeT > 3000)
+      } catch {
+        if (!cancelled) { setReadyCount(null); setFramesStale(false) }
+      }
+    }
+    tick()
+    const id = setInterval(tick, 350)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [])
+
   if (useTablet && hasStep && !isDefect) {
     return (
       <TabletScanView
@@ -1406,7 +1456,24 @@ function CaptureView({
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok && data.captured === false) {
-        setError('No object captured — make sure a green detection box is visible, then try again.')
+        // The teach handler reads depth_segment_node._last_objects — a
+        // temporally-filtered list (object must appear in ≥2 of last
+        // 3 frames). It will return captured:false when (a) the list
+        // is empty, or (b) the chosen detection's mask is < 30×30 px.
+        // Both modes mean "the depth segmentation isn't seeing the
+        // part" — the open-vocab/NanoOWL box (if any) is unrelated.
+        setError(
+          'Capture failed — the depth segmentation didn\'t find an object. '
+          + 'Likely causes: '
+          + '(1) part is too close — keep it 0.30–0.40 m from the camera '
+          + '(D435i depth is unreliable below ~0.28 m); '
+          + '(2) part is too flat/short to clear the table-plane (15 mm) '
+          + 'or too low-contrast against the surface — try a darker mat '
+          + 'or a contrasting backdrop; '
+          + '(3) part is outside the camera frame or behind the gripper. '
+          + 'The live "Ready" chip above turns green only when the '
+          + 'capture pipeline would actually succeed.'
+        )
       } else if (res.ok) {
         onCapture()
       } else {
@@ -1439,6 +1506,44 @@ function CaptureView({
       }}>
         <img src="/stream/annotated" alt="Camera"
           style={{ width: '100%', display: 'block' }} />
+      </div>
+
+      {/* Capture-readiness pill — turns green only when the depth
+          segmentation that the teach endpoint actually reads is
+          seeing ≥1 object on the current frame. */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10,
+        padding: '6px 10px', borderRadius: 6,
+        background: framesStale
+          ? '#fef3c7'
+          : (readyCount && readyCount > 0) ? '#dcfce7' : '#fef2f2',
+        border: '1px solid ' + (framesStale
+          ? '#fde68a'
+          : (readyCount && readyCount > 0) ? '#86efac' : '#fecaca'),
+        fontSize: 12, color: '#111',
+      }}>
+        <span style={{
+          width: 10, height: 10, borderRadius: '50%',
+          background: framesStale
+            ? '#d97706'
+            : (readyCount && readyCount > 0) ? '#16A34A' : '#DC2626',
+        }} />
+        <span style={{ fontWeight: 700 }}>
+          {framesStale
+            ? 'Camera feed stalled'
+            : readyCount === null
+              ? 'Checking…'
+              : readyCount > 0
+                ? `Ready: ${readyCount} object${readyCount === 1 ? '' : 's'} detected`
+                : 'No object detected by capture pipeline'}
+        </span>
+        <span style={{ color: '#6b7280' }}>
+          {framesStale
+            ? '— wait for fresh frames'
+            : readyCount === 0
+              ? '— check distance (0.30–0.40 m) and contrast'
+              : ''}
+        </span>
       </div>
 
       {(isDefect || !isPickable) && (
@@ -1477,10 +1582,13 @@ function CaptureView({
         marginBottom: 12, padding: '10px 14px',
         background: '#f8fafc', borderRadius: 8, border: '1px solid #e5e7eb',
       }}>
-        1. Place the part in view of the camera<br/>
-        2. Wait for the green detection box<br/>
+        1. Place the part 0.30–0.40 m from the camera (D435i depth is
+           unreliable below ~0.28 m).<br/>
+        2. Wait for the <b>Ready</b> pill above to turn green
+           (that's the actual capture detector — the live image's
+           boxes can lag a frame or two).<br/>
         3. Click <b>Capture</b><br/>
-        4. Rotate slightly and capture again for better recognition
+        4. Rotate the part slightly and capture again for better recognition.
       </div>
 
       {error && (
@@ -1491,14 +1599,27 @@ function CaptureView({
         }}>{error}</div>
       )}
 
-      <button onClick={handleCapture} disabled={capturing} style={{
-        width: '100%', padding: '16px', fontSize: 16, fontWeight: 700,
-        background: capturing ? '#9ca3af' : accent, color: '#fff',
-        border: 'none', borderRadius: 10, cursor: capturing ? 'wait' : 'pointer',
-        minHeight: 48,
-      }}>
-        {capturing ? 'Capturing...' : 'Capture'}
-      </button>
+      {(() => {
+        const notReady = readyCount === 0 || framesStale
+        const disabled = capturing || notReady
+        return (
+          <button onClick={handleCapture} disabled={disabled}
+            title={notReady
+              ? (framesStale
+                  ? 'Camera feed is stalled — wait for fresh frames before capturing.'
+                  : 'Depth segmentation isn\'t seeing the part. Adjust distance/contrast until the Ready pill is green.')
+              : undefined}
+            style={{
+              width: '100%', padding: '16px', fontSize: 16, fontWeight: 700,
+              background: disabled ? '#9ca3af' : accent, color: '#fff',
+              border: 'none', borderRadius: 10,
+              cursor: capturing ? 'wait' : (notReady ? 'not-allowed' : 'pointer'),
+              minHeight: 48, opacity: notReady && !capturing ? 0.85 : 1,
+            }}>
+            {capturing ? 'Capturing...' : (notReady ? 'Waiting for detection…' : 'Capture')}
+          </button>
+        )
+      })()}
     </div>
   )
 }
@@ -2991,6 +3112,20 @@ export default function AdaptivePicking() {
   const [teachingPart, setTeachingPart] = useState(null)
   const fileInputRef = useRef(null)
 
+  // The Program editor's detect step sets pendingTeachNew before
+  // switching tabs to here. Consume it once on mount so the wizard
+  // pops straight up — and clear the flag so a later tab switch
+  // doesn't re-open it.
+  const pendingTeachNew    = useStore((s) => s.pendingTeachNew)
+  const setPendingTeachNew = useStore((s) => s.setPendingTeachNew)
+  useEffect(() => {
+    if (pendingTeachNew) {
+      setTeachingPart('NEW')
+      setPendingTeachNew(false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // Previously this view had an operation filter row (All / Pick /
   // Insert / Inspect / Sort / Assemble) that hid parts not tagged
   // with the active op. The filter created confusion when freshly-
@@ -3110,9 +3245,26 @@ export default function AdaptivePicking() {
               {'No parts uploaded yet. Click "Upload STEP file" to get started.'}
             </div>
           ) : (
+            // Boundary around the whole list so a single bad part record
+            // can't take down the entire library/sidebar — the
+            // normalizers below should prevent any throws, but this is
+            // the safety net the user explicitly asked for.
+            <PanelErrorBoundary label="Parts library">{
             filteredParts.map(part => {
               const active = selectedPart === part.id
-              const ex = part.extents_cm || [0, 0, 0]
+              // Normalize extents_cm to ALWAYS be three finite numbers.
+              // Legacy parts (e.g. records that were saved before a STEP
+              // re-parse populated dimensions) can have extents_cm
+              // missing / shorter than 3 / containing nulls — the old
+              // `|| [0,0,0]` only handled missing, so a malformed array
+              // crashed downstream `.toFixed`.
+              const ex = (() => {
+                const raw = Array.isArray(part.extents_cm) ? part.extents_cm : []
+                return [0, 1, 2].map(i => {
+                  const n = Number(raw[i])
+                  return Number.isFinite(n) ? n : 0
+                })
+              })()
               const ops = part.operations || []
               const taught = (part.teach_count || 0) > 0
               return (
@@ -3178,7 +3330,7 @@ export default function AdaptivePicking() {
                     fontSize: 11, marginTop: 2,
                     color: 'var(--text-muted, #9ca3af)',
                   }}>
-                    {ex.map(e => Number(e).toFixed(1)).join(' × ')} cm · {
+                    {ex.map(e => e.toFixed(1)).join(' × ')} cm · {
                       part.grasp?.approach === 'top_down' ? '↓ top' : '→ side'
                     } grasp
                   </div>
@@ -3219,6 +3371,7 @@ export default function AdaptivePicking() {
                 </div>
               )
             })
+          }</PanelErrorBoundary>
           )}
         </div>
       </div>
@@ -3226,12 +3379,16 @@ export default function AdaptivePicking() {
       {/* CENTER — Configurator (or empty hint) */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         {selectedPart ? (
-          <PartConfigurator
-            key={selectedPart}
-            partId={selectedPart}
-            onSave={refresh}
-            onDelete={handleDelete}
-          />
+          // Separate boundary around the configurator so a bad part's
+          // detail view doesn't take the list down with it.
+          <PanelErrorBoundary label="Part configurator">
+            <PartConfigurator
+              key={selectedPart}
+              partId={selectedPart}
+              onSave={refresh}
+              onDelete={handleDelete}
+            />
+          </PanelErrorBoundary>
         ) : (
           <div style={{
             flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',

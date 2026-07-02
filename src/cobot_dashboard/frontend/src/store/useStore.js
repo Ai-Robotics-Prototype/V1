@@ -81,6 +81,10 @@ const storeDefinition = (set, get) => ({
   // ---- UI state ----
   activeTab: 'monitor',
   activeView: 'split',
+  // Cross-tab signal: the Program editor's detect step sets this to
+  // true before switching to the Part Recognition tab; AdaptivePicking
+  // reads + clears it on mount and opens the Teach New Part wizard.
+  pendingTeachNew: false,
   mode: 'operator',
   jogEnabled: false,
   jogJoint: 0,
@@ -559,6 +563,10 @@ const storeDefinition = (set, get) => ({
 
   setJogJoint(j) {
     set({ jogJoint: j })
+  },
+
+  setPendingTeachNew(v) {
+    set({ pendingTeachNew: !!v })
   },
 })
 

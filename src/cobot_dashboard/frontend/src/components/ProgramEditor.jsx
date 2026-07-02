@@ -18,7 +18,7 @@ const ACTION_TYPES = [
   { value: 'pick',               label: 'Pick and Close',   type: 'gripper', tag: 'PICK',    fields: ['descend_mm'] },
   { value: 'place',              label: 'Place at Target',  type: 'move',    tag: 'PLACE',   fields: ['position'] },
   { value: 'wait',               label: 'Wait',             type: 'wait',    tag: 'WAIT',    fields: ['duration_s'] },
-  { value: 'detect',             label: 'Detect Objects',   type: 'move',    tag: 'DETECT',  fields: ['mode'] },
+  { value: 'detect',             label: 'Detect Objects',   type: 'move',    tag: 'DETECT',  fields: ['target_part'] },
   { value: 'loop',               label: 'Loop',             type: 'move',    tag: 'LOOP',    fields: ['goto', 'count'] },
   { value: 'set_io',             label: 'Set I/O',          type: 'move',    tag: 'IO',      fields: ['io_id', 'value'] },
   { value: 'scan_workspace',     label: 'Scan Workspace',   type: 'move',    tag: 'SCAN',    fields: ['scan_height_mm', 'scan_speed_pct'] },
@@ -394,6 +394,177 @@ function regenerateMoveToPalletSteps(steps, palletCfg, palletMode) {
   })
 }
 
+// PalletCornerIcon — compact top-down preview of the pallet grid for
+// each taught-position row. Renders rows × cols as cells, highlights
+// the cell the taught pose corresponds to (origin corner / pick corner
+// / place start), shows a robot marker on the operator-facing side,
+// and a small arrow conveying fill_order direction from the reference
+// corner. Renders SVG so it stays crisp at the 36 px size used in the
+// rows. Honest about precision: the robot-vs-pallet geometry isn't a
+// measured transform — we use the convention "robot sits in front of
+// the pallet" and label the row as such, so the icon is an orientation
+// aid, not a transformed render.
+function PalletCornerIcon({ rows = 4, cols = 4, role = 'corner',
+                             mode = 'palletize', fillOrder = 'row_lr',
+                             size = 36 }) {
+  const R = Math.max(1, Math.min(20, Number(rows) || 1))
+  const C = Math.max(1, Math.min(20, Number(cols) || 1))
+  // External glyph for the role that doesn't map to a pallet corner
+  // (pick in palletize mode → camera/source; place in depalletize
+  // mode → external destination). Keeps the row meaningful instead of
+  // forcing a grid where there isn't one.
+  const externalRole =
+    (mode === 'palletize'   && role === 'pick')  ? 'source' :
+    (mode === 'depalletize' && role === 'place') ? 'sink'   : null
+  // Pallet-corner roles all reference the [1,1] corner — corner_tcp
+  // IS that corner; pick in depalletize starts at [1,1,top]; place
+  // in palletize starts at [1,1,1]. So one consistent highlight cell.
+  const origin = { row: 0, col: 0 }
+  // SVG layout: leave a strip at the bottom for the robot marker so
+  // it's clearly OUTSIDE the grid (robot-side convention).
+  const pad = 3
+  const robotStripH = 8
+  const gridW = size - pad * 2
+  const gridH = size - pad * 2 - robotStripH
+  const cellW = gridW / C
+  const cellH = gridH / R
+  const x0 = pad
+  const y0 = pad
+  const stroke = '#475569'
+
+  if (externalRole) {
+    // Camera-feed glyph for "source" (palletize pick) and a target
+    // glyph for "sink" (depalletize place). Both share the same robot
+    // marker so the rows stay visually consistent.
+    return (
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}
+           style={{ flexShrink: 0 }}>
+        <rect x={pad} y={pad} width={size - pad * 2}
+              height={gridH} rx={3} ry={3}
+              fill="#f1f5f9" stroke={stroke} strokeWidth={1} />
+        {externalRole === 'source' ? (
+          <>
+            <rect x={pad + 5} y={pad + 6}
+                  width={size - pad * 2 - 10} height={gridH - 12}
+                  rx={1.5} ry={1.5}
+                  fill="#fff" stroke="#0f766e" strokeWidth={1.2} />
+            <circle cx={size / 2} cy={pad + gridH / 2 - 1} r={2.6}
+                    fill="#0f766e" />
+            <text x={size / 2} y={pad + gridH - 2}
+                  textAnchor="middle" fontSize={6}
+                  fill="#0f766e" fontWeight={700}
+                  fontFamily="ui-monospace, monospace">FEED</text>
+          </>
+        ) : (
+          <>
+            <circle cx={size / 2} cy={pad + gridH / 2} r={gridH / 2 - 4}
+                    fill="none" stroke="#0f766e" strokeWidth={1.2} />
+            <circle cx={size / 2} cy={pad + gridH / 2} r={2.6}
+                    fill="#0f766e" />
+            <text x={size / 2} y={pad + gridH - 2}
+                  textAnchor="middle" fontSize={6}
+                  fill="#0f766e" fontWeight={700}
+                  fontFamily="ui-monospace, monospace">OUT</text>
+          </>
+        )}
+        {/* Robot marker — same convention as the grid icon. */}
+        <rect x={size / 2 - 5} y={size - pad - robotStripH + 1}
+              width={10} height={robotStripH - 2} rx={2}
+              fill="#1e293b" />
+        <text x={size / 2} y={size - pad - 1.5}
+              textAnchor="middle" fontSize={5.5}
+              fill="#fff" fontWeight={700}
+              fontFamily="ui-monospace, monospace">R</text>
+      </svg>
+    )
+  }
+
+  // Build the cell grid with the origin corner highlighted.
+  const cells = []
+  for (let r = 0; r < R; r++) {
+    for (let c = 0; c < C; c++) {
+      const isOrigin = (r === origin.row && c === origin.col)
+      cells.push(
+        <rect key={`${r}-${c}`}
+              x={x0 + c * cellW + 0.5}
+              y={y0 + r * cellH + 0.5}
+              width={cellW - 1}
+              height={cellH - 1}
+              fill={isOrigin ? '#2563EB' : '#fff'}
+              stroke={stroke} strokeWidth={0.75} rx={0.6} />
+      )
+    }
+  }
+
+  // Fill-direction arrow from the [1,1] cell. Per the executor's
+  // semantics: row_lr → → ; row_rl → ← (still starts at [1,1] but
+  // walks right-to-left along the row, which we depict as an arrow
+  // *into* [1,1] from the right); col → ↓ ; snake → ⤵ (right then
+  // down).
+  const cx = x0 + cellW / 2
+  const cy = y0 + cellH / 2
+  let arrow = null
+  const arrColor = '#dc2626'
+  const sw = 1.4
+  if (fillOrder === 'row_lr') {
+    const x2 = x0 + Math.min(C, 2) * cellW - cellW / 3
+    arrow = (
+      <g stroke={arrColor} strokeWidth={sw} fill="none" strokeLinecap="round">
+        <line x1={cx} y1={cy} x2={x2} y2={cy} />
+        <polyline points={`${x2 - 2},${cy - 2} ${x2},${cy} ${x2 - 2},${cy + 2}`} />
+      </g>
+    )
+  } else if (fillOrder === 'row_rl') {
+    // arrow walks from the inside *toward* the highlighted [1,1] cell
+    // to indicate "this corner is the start, fill direction is RTL".
+    const xs = x0 + Math.min(C, 2) * cellW - cellW / 3
+    arrow = (
+      <g stroke={arrColor} strokeWidth={sw} fill="none" strokeLinecap="round">
+        <line x1={xs} y1={cy} x2={cx} y2={cy} />
+        <polyline points={`${cx + 2},${cy - 2} ${cx},${cy} ${cx + 2},${cy + 2}`} />
+      </g>
+    )
+  } else if (fillOrder === 'col') {
+    const y2 = y0 + Math.min(R, 2) * cellH - cellH / 3
+    arrow = (
+      <g stroke={arrColor} strokeWidth={sw} fill="none" strokeLinecap="round">
+        <line x1={cx} y1={cy} x2={cx} y2={y2} />
+        <polyline points={`${cx - 2},${y2 - 2} ${cx},${y2} ${cx + 2},${y2 - 2}`} />
+      </g>
+    )
+  } else if (fillOrder === 'snake') {
+    // Row right + down + row left — fits in the first two rows.
+    const xMid = x0 + Math.min(C, 2) * cellW - cellW / 3
+    const yMid = y0 + Math.min(R, 2) * cellH - cellH / 2
+    const xEnd = x0 + cellW / 2
+    arrow = (
+      <g stroke={arrColor} strokeWidth={sw} fill="none" strokeLinecap="round">
+        <polyline points={`${cx},${cy} ${xMid},${cy} ${xMid},${yMid} ${xEnd},${yMid}`} />
+        <polyline points={`${xEnd + 2},${yMid - 2} ${xEnd},${yMid} ${xEnd + 2},${yMid + 2}`} />
+      </g>
+    )
+  }
+
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}
+         style={{ flexShrink: 0 }}>
+      {cells}
+      {arrow}
+      {/* Robot marker — placed below the grid, by convention, since
+          we don't have a measured pallet-vs-base transform. The
+          row's title text ("relative to robot · front") names the
+          convention so the icon isn't ambiguous. */}
+      <rect x={size / 2 - 5} y={size - pad - robotStripH + 1}
+            width={10} height={robotStripH - 2} rx={2}
+            fill="#1e293b" />
+      <text x={size / 2} y={size - pad - 1.5}
+            textAnchor="middle" fontSize={5.5}
+            fill="#fff" fontWeight={700}
+            fontFamily="ui-monospace, monospace">R</text>
+    </svg>
+  )
+}
+
 // PalletConfigEditor — modal for editing the program-level pallet
 // block (rows/cols/layers/spacing/fill order/heights + taught
 // corner TCP + taught pick/place TCP). Pre-fills from the program's
@@ -471,12 +642,28 @@ function PalletConfigEditor({ config, onSave, onClose }) {
     { value: 'snake',  label: 'Snake (alternate)' },
   ]
 
+  // Hover-title that describes what the icon is showing — useful when
+  // the convention ("robot at front") isn't obvious from the row label.
+  const iconTitle = (role) => {
+    if (mode === 'palletize' && role === 'pick')
+      return 'Pick source (camera feed) · robot R at front'
+    if (mode === 'depalletize' && role === 'place')
+      return 'Place destination (external) · robot R at front'
+    const cell = (mode === 'depalletize' && role === 'pick')
+      ? '[1,1, top layer]' : '[1,1]'
+    return `Reference corner ${cell} · fill order ${fillOrder} · robot R at front (convention)`
+  }
+
   const tcpRow = (label, tcp, role) => (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 8,
       padding: '8px 10px', marginBottom: 6,
       background: '#f8fafc', border: '1px solid #e5e7eb', borderRadius: 6,
     }}>
+      <div title={iconTitle(role)} style={{ flexShrink: 0, lineHeight: 0 }}>
+        <PalletCornerIcon rows={rows} cols={cols}
+          role={role} mode={mode} fillOrder={fillOrder} size={36} />
+      </div>
       <div style={{ minWidth: 110, fontSize: 11, fontWeight: 600, color: '#374151' }}>{label}</div>
       <div style={{ flex: 1, fontSize: 11, color: tcp ? '#111' : '#9ca3af', fontFamily: 'var(--font-mono, monospace)' }}>
         {tcp
@@ -643,6 +830,43 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
   const [draft, setDraft] = useState({ ...step })
   const actionDef = actionFor(draft)
 
+  // Taught library parts for the detect step's "Detect Part" dropdown.
+  // Fetched lazily — only when the editor renders a detect step — and
+  // re-fetched whenever the operator returns from teaching a new part
+  // (setActiveTab back to 'program' bumps partsReloadKey).
+  const setActiveTab = useStore((s) => s.setActiveTab)
+  const setPendingTeachNew = useStore((s) => s.setPendingTeachNew)
+  const [taughtParts, setTaughtParts] = useState(null)
+  const [partsLoading, setPartsLoading] = useState(false)
+  const [partsReloadKey, setPartsReloadKey] = useState(0)
+
+  useEffect(() => {
+    if (draft.action !== 'detect') return
+    let cancelled = false
+    setPartsLoading(true)
+    fetch('/api/parts')
+      .then((r) => r.ok ? r.json() : { parts: [] })
+      .then((d) => {
+        if (cancelled) return
+        const all = Array.isArray(d?.parts) ? d.parts : []
+        setTaughtParts(all.filter((p) => Number(p?.teach_count || 0) > 0))
+      })
+      .catch(() => { if (!cancelled) setTaughtParts([]) })
+      .finally(() => { if (!cancelled) setPartsLoading(false) })
+    return () => { cancelled = true }
+  }, [draft.action, partsReloadKey])
+
+  // Refresh the dropdown when the window regains focus — the operator
+  // may have just finished teaching on the Part Recognition tab and
+  // come back; without this they'd have to close+reopen the editor to
+  // see the newly-taught part.
+  useEffect(() => {
+    if (draft.action !== 'detect') return
+    const onFocus = () => setPartsReloadKey((k) => k + 1)
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [draft.action])
+
   const update = (key, val) => setDraft((prev) => ({ ...prev, [key]: val }))
 
   function changeAction(actionValue) {
@@ -654,6 +878,11 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
     const def = actionFor(draft)
     const patch = { action: draft.action || def.value, type: def.type, label: draft.label }
     for (const f of def.fields) {
+      if (f === 'target_part') {
+        if (draft.target_part_id !== undefined)   patch.target_part_id   = draft.target_part_id
+        if (draft.target_part_name !== undefined) patch.target_part_name = draft.target_part_name
+        continue
+      }
       if (draft[f] !== undefined) patch[f] = draft[f]
     }
     // Pose fields live outside the per-action `fields` list — they're
@@ -987,12 +1216,48 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
             onChange={(e) => update('duration_s', parseFloat(e.target.value))} style={inputStyle} />
         </Field>
       )}
-      {actionDef.fields.includes('mode') && (
-        <Field label="Detection Mode">
-          <select value={draft.mode || 'all'} onChange={(e) => update('mode', e.target.value)} style={selectStyle}>
-            <option value="all">All Objects</option>
-            <option value="library">Library Parts Only</option>
-          </select>
+      {actionDef.fields.includes('target_part') && (
+        <Field label="Detect Part">
+          <div style={{ display: 'flex', gap: 6, alignItems: 'stretch' }}>
+            <select
+              value={draft.target_part_id || ''}
+              disabled={partsLoading || !taughtParts || taughtParts.length === 0}
+              onChange={(e) => {
+                const id = e.target.value || null
+                const match = (taughtParts || []).find((p) => String(p.id) === String(id))
+                setDraft((prev) => ({
+                  ...prev,
+                  target_part_id: id,
+                  target_part_name: match?.name || null,
+                }))
+              }}
+              style={{ ...selectStyle, flex: 1 }}
+            >
+              <option value="">
+                {partsLoading
+                  ? 'Loading…'
+                  : (taughtParts && taughtParts.length === 0)
+                    ? 'No taught parts yet — teach one first'
+                    : 'Select a taught part…'}
+              </option>
+              {(taughtParts || []).map((p) => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => {
+                setPendingTeachNew(true)
+                setActiveTab('adaptive_picking')
+              }}
+              title="Open the Part Recognition tab and start the Teach New Part wizard. The dropdown refreshes when you return."
+              style={{
+                padding: '6px 10px', fontSize: 11, fontWeight: 600,
+                background: '#16A34A', color: '#fff', border: 'none',
+                borderRadius: 4, cursor: 'pointer', whiteSpace: 'nowrap',
+              }}
+            >+ Teach New Part</button>
+          </div>
         </Field>
       )}
       {actionDef.fields.includes('io_id') && (
@@ -1217,7 +1482,7 @@ function freshStepForAction(action) {
     case 'pick':          return { ...base, descend_mm: 130 }
     case 'place':         return { ...base, position: [0.3, -0.2, 0.4] }
     case 'wait':          return { ...base, duration_s: 1 }
-    case 'detect':        return { ...base, mode: 'all' }
+    case 'detect':        return { ...base, target_part_id: null, target_part_name: null }
     case 'loop':          return { ...base, goto: 1, count: 0 }
     case 'set_io':        return { ...base, io_id: 'DO0', value: 1 }
     case 'scan_workspace': return {

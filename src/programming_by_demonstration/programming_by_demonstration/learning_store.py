@@ -157,6 +157,45 @@ class LearningStore:
             json.dump(meta, f, indent=2)
         self._upsert_index_from_meta(demo_id, meta)
 
+    def save_clarifications(self, demo_id: str,
+                            clarifications: List[Dict[str, Any]],
+                            answers: Dict[str, Any]) -> None:
+        """Persist the operator's clarification answers as a separate
+        training signal. Each entry pairs the question the AI asked
+        (clarification dict) with the operator's answer + whether the
+        operator accepted the suggested default verbatim or overrode
+        it. Used by the retrieval-augment pass to teach future runs
+        which phrasings were ambiguous and what the human chose."""
+        d = self.ensure_demo_dir(demo_id)
+        by_id = {str(c.get('id') or ''): c for c in (clarifications or [])
+                 if isinstance(c, dict)}
+        rows = []
+        for cid, ans in (answers or {}).items():
+            c = by_id.get(str(cid)) or {}
+            suggested = c.get('suggested')
+            try:
+                used_default = (ans == suggested) and (ans is not None)
+            except Exception:
+                used_default = False
+            rows.append({
+                'id':           cid,
+                'field':        c.get('field'),
+                'question':     c.get('question'),
+                'type':         c.get('type'),
+                'options':      c.get('options') or [],
+                'suggested':    suggested,
+                'affects':      c.get('affects') or {},
+                'answer':       ans,
+                'used_default': used_default,
+            })
+        payload = {
+            'saved_at':       now_iso(),
+            'clarifications': list(clarifications or []),
+            'answers':        rows,
+        }
+        with open(os.path.join(d, 'clarifications_answered.json'), 'w') as f:
+            json.dump(payload, f, indent=2)
+
     def save_correction(self, demo_id: str, corrected_program: Dict[str, Any],
                         program_id: Optional[str] = None,
                         corrected_scene: Optional[Dict[str, Any]] = None,

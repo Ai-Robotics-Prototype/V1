@@ -3,6 +3,28 @@ import { Canvas } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader'
+import PanelErrorBoundary from './PanelErrorBoundary'
+
+// Guarantee three finite numbers for extents_cm reads. The old
+// `part.extents_cm || [0,0,0]` guarded a MISSING array but a SHORT
+// or non-numeric one (e.g. legacy STEP-only records like the
+// "Delrin piece" with [0,0,0] placeholders or missing trailing
+// entries) still crashed `.toFixed()` downstream.
+function normalizeExtents(raw) {
+  const arr = Array.isArray(raw) ? raw : []
+  return [0, 1, 2].map(i => {
+    const n = Number(arr[i])
+    return Number.isFinite(n) ? n : 0
+  })
+}
+
+// `value` is assumed numeric but the caller doesn't always know;
+// wrap once, then format. Returns the formatted string OR 'fallback'
+// when the value cannot be coerced to a finite number.
+function fixedOr(value, digits, fallback = '—') {
+  const n = Number(value)
+  return Number.isFinite(n) ? n.toFixed(digits) : fallback
+}
 
 // step_parser writes a .stl alongside each .step, copied into the
 // dashboard static dir under /parts/. Loading STL keeps things simple —
@@ -205,7 +227,11 @@ function GraspSettings({ settings, onChange }) {
 
 function PartInfo({ part, name, onNameChange }) {
   if (!part) return null
-  const ex = part.extents_cm || [0, 0, 0]
+  const ex = normalizeExtents(part.extents_cm)
+  // verts / faces are integers in the well-formed case; Number(undefined)
+  // is NaN which the template would render literally, so coerce + fall back.
+  const verts = Number.isFinite(Number(part.vertices)) ? Number(part.vertices) : '—'
+  const faces = Number.isFinite(Number(part.faces))    ? Number(part.faces)    : '—'
   return (
     <div style={{ marginTop: 14 }}>
       <div style={sectionTitle}>Part Info</div>
@@ -220,9 +246,9 @@ function PartInfo({ part, name, onNameChange }) {
       />
       <div style={{ fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
         <div>Dimensions: {ex[0].toFixed(1)} × {ex[1].toFixed(1)} × {ex[2].toFixed(1)} cm</div>
-        <div>Volume: {(part.volume_cm3 ?? 0).toFixed(1)} cm³</div>
-        <div>Surface: {(part.surface_area_cm2 ?? 0).toFixed(1)} cm²</div>
-        <div>Mesh: {part.vertices ?? 0} verts / {part.faces ?? 0} faces</div>
+        <div>Volume: {fixedOr(part.volume_cm3, 1, '0.0')} cm³</div>
+        <div>Surface: {fixedOr(part.surface_area_cm2, 1, '0.0')} cm²</div>
+        <div>Mesh: {verts} verts / {faces} faces</div>
       </div>
     </div>
   )
@@ -244,16 +270,26 @@ function LidarStatsFooter({ partId }) {
         const all = [...live, ...hist]
         if (!all.length) { setStats({ samples: 0 }); return }
         const conf = all.map((o) => Number(o.confidence) || 0)
-        const dims = live.filter((o) => o.dimensions).map((o) => o.dimensions)
+        // Only keep dimensions that are plain objects with at least
+        // one key; the reduce below indexes by Object.keys(d)[i], so
+        // anything null/array/empty would throw inside the reduce.
+        const dims = live
+          .map((o) => o.dimensions)
+          .filter((d) => d && typeof d === 'object' && !Array.isArray(d) && Object.keys(d).length)
         let mean_dims = null
         if (dims.length) {
           mean_dims = [0, 0, 0].map((_, i) =>
             dims.reduce((s, d) => s + (Number(d[Object.keys(d)[i]]) || Number(d['xyz'.charAt(i)]) || 0), 0) / dims.length)
         }
+        // conf.length could be 0 if all .filter survivors had zero
+        // confidence numbers — divide-by-zero yields NaN which would
+        // render fine but it's clearer to expose null and gate the
+        // display below.
+        const meanConf = conf.length ? (conf.reduce((a, b) => a + b, 0) / conf.length) : null
         setStats({
           samples: all.length,
           live_samples: live.length,
-          mean: conf.reduce((a, b) => a + b, 0) / conf.length,
+          mean: meanConf,
           confident: conf.filter((c) => c >= 0.8).length,
           mean_dims,
         })
@@ -278,7 +314,7 @@ function LidarStatsFooter({ partId }) {
       marginTop: 6, fontFamily: 'monospace', lineHeight: 1.4,
     }}>
       LiDAR · {stats.samples} sightings ·
-      {' '}{Math.round((stats.mean || 0) * 100)}% avg confidence
+      {' '}{stats.mean == null ? '—' : `${Math.round(stats.mean * 100)}%`} avg confidence
       {stats.live_samples > 0 && (
         <span style={{ color: '#22C55E', marginLeft: 6 }}>
           ({stats.live_samples} live)
@@ -289,7 +325,7 @@ function LidarStatsFooter({ partId }) {
 }
 
 function PartCard({ part, onConfigure, onDelete }) {
-  const ex = part.extents_cm || [0, 0, 0]
+  const ex = normalizeExtents(part.extents_cm)
   const stl = part.stl_file ? `/parts/${part.stl_file}` : null
   return (
     <div style={{
@@ -324,7 +360,7 @@ function PartCard({ part, onConfigure, onDelete }) {
           {ex.map(e => e.toFixed(1)).join(' × ')} cm
         </div>
         <div style={{ fontSize: 10, color: 'var(--text-muted, #6b7280)', marginTop: 4 }}>
-          grasp: {part.grasp?.approach || '—'} · {((part.grasp?.gripper_width_cm) || 5).toFixed(1)} cm
+          grasp: {part.grasp?.approach || '—'} · {fixedOr(part.grasp?.gripper_width_cm, 1, '5.0')} cm
         </div>
         <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
           <button onClick={() => onConfigure(part.id)}
@@ -639,10 +675,12 @@ export default function PartsLibrary() {
           </div>
         </div>
         <div style={{ flex: 1, minHeight: 0 }}>
-          <PartSetup part={setupPart}
-            onCancel={() => setSetupPart(null)}
-            onSaved={() => { setSetupPart(null); refresh() }}
-          />
+          <PanelErrorBoundary label="Part configurator">
+            <PartSetup part={setupPart}
+              onCancel={() => setSetupPart(null)}
+              onSaved={() => { setSetupPart(null); refresh() }}
+            />
+          </PanelErrorBoundary>
         </div>
       </div>
     )
@@ -678,10 +716,14 @@ export default function PartsLibrary() {
       )}
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 16 }}>
+        {/* Per-card boundary so one malformed part record can't blank
+            the entire library grid. Same pattern as the camera panels. */}
         {parts.map(p => (
-          <PartCard key={p.id} part={p}
-            onConfigure={handleConfigure} onDelete={handleDelete}
-          />
+          <PanelErrorBoundary key={p.id} label={`Part ${p.id || p.name || ''}`}>
+            <PartCard part={p}
+              onConfigure={handleConfigure} onDelete={handleDelete}
+            />
+          </PanelErrorBoundary>
         ))}
       </div>
     </div>

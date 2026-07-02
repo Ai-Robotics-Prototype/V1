@@ -26,10 +26,22 @@ from typing import Any, Dict, List, Optional
 from .schema import (
     AVAILABLE_OPERATIONS,
     IntentOperation,
+    PalletSpec,
     POSE_AWAITING_PERCEPTION,
     ProgramDraft,
     StructuredIntent,
 )
+
+
+# Composer-side defaults — applied only when the spoken intent didn't
+# specify spacing / layer height. Match the wizard's defaults
+# (buildPalletConfig in ProgramWizard.jsx) so a PBD-generated program
+# and a wizard-built program with the same grid look identical to the
+# executor and the PalletConfigEditor.
+_DEFAULT_SPACING_MM = 150.0
+_DEFAULT_LAYER_H_MM = 100.0
+_DEFAULT_PALLET_APPROACH_MM = 100
+_DEFAULT_PALLET_RETRACT_MM  = 200
 
 
 # Silent defaults matching ProgramWizard.jsx — Balanced motion, 60% speed.
@@ -262,6 +274,40 @@ def _build_palletize(op: IntentOperation, mode: str,
     return s
 
 
+# ── Pallet config builder ──────────────────────────────────────────
+
+def _build_pallet_config(spec: Optional[PalletSpec], mode: str) -> Dict[str, Any]:
+    """Materialise the program.config.pallet block from the (possibly
+    None) intent PalletSpec. Mirrors the shape produced by the wizard's
+    buildPalletConfig so the same PalletConfigEditor renders both.
+
+    None spec → (1,1,1) single slot. This is the load-bearing default:
+    the executor uses rows*cols*layers as its cycle budget, so dropping
+    the spec must never silently inflate to a multi-cell grid.
+    """
+    s = spec or PalletSpec()
+    return {
+        'rows':                int(s.rows or 1),
+        'cols':                int(s.cols or 1),
+        'layers':              int(s.layers or 1),
+        'spacing_x_mm':        float(s.spacing_x_mm if s.spacing_x_mm is not None
+                                     else _DEFAULT_SPACING_MM),
+        'spacing_y_mm':        float(s.spacing_y_mm if s.spacing_y_mm is not None
+                                     else _DEFAULT_SPACING_MM),
+        'layer_height_mm':     float(s.layer_height_mm if s.layer_height_mm is not None
+                                     else _DEFAULT_LAYER_H_MM),
+        'fill_order':          s.fill_order or 'row_lr',
+        # corner_tcp is taught by the operator after the draft loads.
+        # Stub a zero corner so the executor's _compute_pallet_position
+        # can index without KeyError when the program is dry-run pre-
+        # teach (slot positions will read as the corner origin until
+        # the operator records the corner).
+        'corner_tcp':          {'x': 0, 'y': 0, 'z': 0, 'rx': 0, 'ry': 0, 'rz': 0},
+        'approach_height_mm':  _DEFAULT_PALLET_APPROACH_MM,
+        'retract_height_mm':   _DEFAULT_PALLET_RETRACT_MM,
+    }
+
+
 # ── Composer ────────────────────────────────────────────────────────
 
 def compose_program_draft(intent: StructuredIntent,
@@ -295,6 +341,12 @@ def compose_program_draft(intent: StructuredIntent,
     steps: List[Dict[str, Any]] = []
     steps.append(_move_home())
 
+    # Captured during the loop below so it can be written into
+    # config.pallet after step composition. None for non-pallet
+    # programs.
+    pallet_op_mode: Optional[str] = None
+    pallet_spec: Optional[PalletSpec] = None
+
     for op in sorted_ops:
         if op.operation_type == 'pick_and_place':
             steps.extend(_build_pick_and_place(op, appH, spd, slow, medium))
@@ -305,10 +357,14 @@ def compose_program_draft(intent: StructuredIntent,
         elif op.operation_type == 'palletize':
             steps = _build_palletize(op, 'palletize', appH, spd, slow, medium)
             primary_op_type = 'palletize'
+            pallet_op_mode = 'palletize'
+            pallet_spec = op.pallet
             break        # pallet programs are single-op by design
         elif op.operation_type == 'depalletize':
             steps = _build_palletize(op, 'depalletize', appH, spd, slow, medium)
             primary_op_type = 'palletize'
+            pallet_op_mode = 'depalletize'
+            pallet_spec = op.pallet
             break
 
     if not sorted_ops:
@@ -343,7 +399,11 @@ def compose_program_draft(intent: StructuredIntent,
         'part_ids':       parts_seen,
         'operations':     ops_seen,
         'task_summary':   intent.task_summary,
-        'ambiguities':    list(intent.ambiguities),
+        # Serialise each Clarification to a plain dict — pbd_metadata
+        # is JSON-dumped by learning_store.save_draft, which can't
+        # handle dataclass instances directly.
+        'ambiguities':    [c.to_dict() if hasattr(c, 'to_dict') else c
+                           for c in (intent.ambiguities or [])],
         'confidence':     float(intent.confidence_overall or 0.0),
         'backend_id':     intent.backend_id,
         'transited_externally': bool(intent.transited_externally),
@@ -364,6 +424,15 @@ def compose_program_draft(intent: StructuredIntent,
         },
         'pbd_metadata': pbd_metadata,
     }
+
+    # Pallet programs: bake the spoken grid into config.pallet so the
+    # executor's move_to_pallet expansion (which reads
+    # config.pallet.{rows,cols,layers,...}) uses the operator's pattern
+    # — not a hard-coded default. Also surfaces in the
+    # PalletConfigEditor (which pre-fills from config.pallet).
+    if pallet_op_mode is not None:
+        config['pallet']      = _build_pallet_config(pallet_spec, pallet_op_mode)
+        config['pallet_mode'] = pallet_op_mode
 
     return ProgramDraft(
         name=name,

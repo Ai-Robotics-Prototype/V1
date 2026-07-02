@@ -867,6 +867,16 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   const [flash, setFlash]     = useState(false)
   const [jogMode, setJogMode] = useState('cartesian')
   const [step, setStep]       = useState(1.0)
+  // Error banner shown when a Record Position attempt can't get a usable
+  // pose from the robot (fetch throws, endpoint returns non-2xx, or the
+  // response has no live TCP because no arm is connected). Presence of
+  // this string also triggers the inline manual-entry form so the wizard
+  // is never dead-ended.
+  const [recordErr, setRecordErr] = useState(null)
+  const [manualOpen, setManualOpen] = useState(false)
+  // TCP entry is in mm / degrees to match how operators think about
+  // positions on the shop floor; convert to m / radians on save.
+  const [manualTcp, setManualTcp] = useState({ x: '', y: '', z: '', rx: '', ry: '', rz: '' })
   const [speed, setSpeed]     = useState(20)
   const [liveJoints, setLiveJoints] = useState([0, -90, 0, -90, 0, 0])
   const [liveTcp,    setLiveTcp]    = useState([0, 0, 0, 0, 0, 0])
@@ -955,25 +965,117 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
     }
   }, [posIdx, positions.length, onComplete])
 
+  // Record Position never dead-ends. Fallback chain:
+  //   1. /api/state has a real TCP (live arm) → record live tcp+joints.
+  //   2. /api/state responds but tcp is missing/zeros (no arm) → record
+  //      joints from the payload and mark source='simulated'; tcp stays
+  //      null so downstream code can tell it's joint-only.
+  //   3. Fetch throws or returns non-2xx → use the last-polled liveJoints
+  //      from the header readout (already populated by the poll loop).
+  // Any of these paths writes into wizard state and advances. A "source"
+  // note surfaces briefly so the operator knows a fallback was used.
+  const [lastSource, setLastSource] = useState(null)
   async function recordPosition() {
+    setRecordErr(null)
+    let joints = null
+    let tcp = null
+    let source = 'live'
     try {
       const res = await fetch('/api/state')
-      if (!res.ok) return
-      const d = await res.json()
-      const joints = radiansToJointDegrees(d?.joints?.positions)
-      const tcp    = Array.isArray(d?.tcp_pose) ? d.tcp_pose : null
-      setAnswer(current.key, {
-        tcp, joints,
-        taught_at: new Date().toISOString(),
-        skipped: false,
-      })
-      // This step is now freshly taught — drop any prior 'reused' flag
-      // so the progress dot / review shows the new fresh-record state.
-      clearReusedAt(posIdx)
-      setFlash(true)
-      setTimeout(() => { setFlash(false); advanceOrComplete() }, 1500)
-    } catch {}
+      if (res.ok) {
+        const d = await res.json()
+        joints = radiansToJointDegrees(d?.joints?.positions)
+        const tcpArr = Array.isArray(d?.tcp_pose) ? d.tcp_pose : null
+        const tcpAllZeros = tcpArr && tcpArr.length >= 3 &&
+          tcpArr.slice(0, 3).every((v) => Math.abs(Number(v) || 0) < 1e-6)
+        const armConnected = !!(d?.robot?.connected)
+        if (tcpArr && !tcpAllZeros && armConnected) {
+          tcp = tcpArr
+          source = 'live'
+        } else {
+          // Endpoint responded but there's no live TCP — use the joint
+          // pose we did get (realistic sim defaults or last-known), tcp
+          // stays null.
+          tcp = null
+          source = 'simulated'
+        }
+      } else {
+        joints = liveJoints
+        tcp = null
+        source = 'simulated'
+      }
+    } catch {
+      joints = liveJoints
+      tcp = null
+      source = 'simulated'
+    }
+    setAnswer(current.key, {
+      tcp, joints,
+      taught_at: new Date().toISOString(),
+      skipped: false,
+      source,
+    })
+    setLastSource(source)
+    clearReusedAt(posIdx)
+    setFlash(true)
+    setTimeout(() => { setFlash(false); advanceOrComplete() }, 900)
   }
+
+  // Pre-fill the manual-entry form with the current live TCP so the
+  // operator can tweak instead of typing 6 fields from scratch. TCP is
+  // stored in meters / radians on the state; the form is mm / degrees.
+  function openManualEntry() {
+    const R2D = 180 / Math.PI
+    const t = Array.isArray(liveTcp) ? liveTcp : [0, 0, 0, 0, 0, 0]
+    setManualTcp({
+      x:  ((Number(t[0]) || 0) * 1000).toFixed(1),
+      y:  ((Number(t[1]) || 0) * 1000).toFixed(1),
+      z:  ((Number(t[2]) || 0) * 1000).toFixed(1),
+      rx: ((Number(t[3]) || 0) * R2D).toFixed(1),
+      ry: ((Number(t[4]) || 0) * R2D).toFixed(1),
+      rz: ((Number(t[5]) || 0) * R2D).toFixed(1),
+    })
+    setRecordErr(null)
+    setManualOpen(true)
+  }
+
+  function saveManualPose() {
+    const parse = (s) => {
+      const n = Number(s)
+      return Number.isFinite(n) ? n : null
+    }
+    const x = parse(manualTcp.x), y = parse(manualTcp.y), z = parse(manualTcp.z)
+    const rx = parse(manualTcp.rx), ry = parse(manualTcp.ry), rz = parse(manualTcp.rz)
+    if ([x, y, z, rx, ry, rz].some((v) => v === null)) {
+      setRecordErr('All six fields are required. Use numeric values (mm for x/y/z, degrees for rx/ry/rz).')
+      return
+    }
+    const D2R = Math.PI / 180
+    // Store TCP in the same units /api/state uses: meters + radians.
+    const tcp = [x / 1000, y / 1000, z / 1000, rx * D2R, ry * D2R, rz * D2R]
+    setAnswer(current.key, {
+      tcp,
+      joints: (Array.isArray(liveJoints) ? liveJoints.slice(0, 6) : [0, 0, 0, 0, 0, 0]),
+      taught_at: new Date().toISOString(),
+      skipped: false,
+      source: 'manual',
+    })
+    setLastSource('manual')
+    clearReusedAt(posIdx)
+    setManualOpen(false)
+    setRecordErr(null)
+    setFlash(true)
+    setTimeout(() => { setFlash(false); advanceOrComplete() }, 900)
+  }
+
+  // When the operator moves to a new step, drop any stale error banner or
+  // half-filled manual-entry form from the previous step.
+  useEffect(() => {
+    setRecordErr(null)
+    setManualOpen(false)
+    setLastSource(null)
+    setManualTcp({ x: '', y: '', z: '', rx: '', ry: '', rz: '' })
+  }, [posIdx])
 
   function skipCurrent() {
     setAnswer(current.key, {
@@ -1160,6 +1262,97 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
           {current.instr}
         </div>
       </div>
+
+      {recordErr && (
+        <div style={{
+          flex: '0 0 auto',
+          margin: '10px 24px 0',
+          padding: '10px 14px',
+          background: '#fef2f2', border: '1px solid #fecaca',
+          borderRadius: 8, color: '#991b1b',
+          fontSize: 13, lineHeight: 1.4,
+          display: 'flex', alignItems: 'center', gap: 12,
+        }}>
+          <div style={{ flex: 1 }}>{recordErr}</div>
+          <button onClick={openManualEntry} style={{
+            padding: '6px 12px', fontSize: 12, fontWeight: 700,
+            background: '#fff', color: '#991b1b',
+            border: '1px solid #fecaca', borderRadius: 6, cursor: 'pointer',
+          }}>Enter manually</button>
+          <button onClick={() => setRecordErr(null)} title="Dismiss" style={{
+            padding: '6px 10px', fontSize: 12, fontWeight: 700,
+            background: 'transparent', color: '#991b1b',
+            border: 'none', cursor: 'pointer',
+          }}>×</button>
+        </div>
+      )}
+
+      {lastSource && lastSource !== 'live' && !recordErr && (
+        <div style={{
+          flex: '0 0 auto',
+          margin: '10px 24px 0',
+          padding: '8px 12px',
+          background: '#fffbeb', border: '1px solid #fde68a',
+          borderRadius: 8, color: '#92400e',
+          fontSize: 12, lineHeight: 1.4,
+        }}>
+          {lastSource === 'simulated'
+            ? 'Recorded from simulated pose — no arm is connected. Use "Enter manually" to override.'
+            : 'Recorded from manually-entered pose.'}
+        </div>
+      )}
+
+      {manualOpen && (
+        <div style={{
+          position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+          background: 'rgba(0,0,0,0.4)', zIndex: 2100,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          padding: 24,
+        }}>
+          <div style={{
+            background: '#fff', borderRadius: 12,
+            padding: 24, maxWidth: 520, width: '100%',
+            boxShadow: '0 20px 60px rgba(0,0,0,0.35)',
+          }}>
+            <div style={{ fontSize: 18, fontWeight: 800, color: '#111', marginBottom: 6 }}>
+              Enter TCP pose manually
+            </div>
+            <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 16 }}>
+              Position in mm, rotation in degrees. Saved as the taught pose for {current.label}.
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 14 }}>
+              {['x', 'y', 'z'].map((k) => (
+                <label key={k} style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: '#374151', fontWeight: 600 }}>
+                  {k.toUpperCase()} (mm)
+                  <input type="number" value={manualTcp[k]}
+                    onChange={(e) => setManualTcp({ ...manualTcp, [k]: e.target.value })}
+                    style={{ padding: '10px 12px', fontSize: 14, border: '1px solid #d1d5db', borderRadius: 6, fontFamily: 'monospace' }} />
+                </label>
+              ))}
+              {['rx', 'ry', 'rz'].map((k) => (
+                <label key={k} style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: '#374151', fontWeight: 600 }}>
+                  {k.toUpperCase()} (°)
+                  <input type="number" value={manualTcp[k]}
+                    onChange={(e) => setManualTcp({ ...manualTcp, [k]: e.target.value })}
+                    style={{ padding: '10px 12px', fontSize: 14, border: '1px solid #d1d5db', borderRadius: 6, fontFamily: 'monospace' }} />
+                </label>
+              ))}
+            </div>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button onClick={() => { setManualOpen(false); setRecordErr(null) }} style={{
+                padding: '10px 18px', fontSize: 14, fontWeight: 700,
+                background: '#fff', color: '#374151',
+                border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
+              }}>Cancel</button>
+              <button onClick={saveManualPose} style={{
+                padding: '10px 22px', fontSize: 14, fontWeight: 800,
+                background: '#2563EB', color: '#fff',
+                border: 'none', borderRadius: 8, cursor: 'pointer',
+              }}>Save Position</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showChoiceScreen ? (
         /* CHOICE SCREEN — fills the middle (flex:1), centered. Same shell
@@ -1365,6 +1558,11 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
         {!showChoiceScreen && (
           <>
             <div style={{ flex: 1 }} />
+            <button onClick={openManualEntry} title="Type in x/y/z + orientation instead of capturing live" style={{
+              padding: '14px 20px', minHeight: 56, fontSize: 13, fontWeight: 700,
+              background: '#fff', color: '#2563EB',
+              border: '1px solid #93c5fd', borderRadius: 10, cursor: 'pointer',
+            }}>Enter manually</button>
             <button onClick={recordPosition} style={{
               padding: '14px 32px', minHeight: 60, fontSize: 16, fontWeight: 800,
               background: flash ? '#16A34A' : '#2563EB', color: '#fff',

@@ -347,6 +347,47 @@ def _convex_hull_mesh(points: np.ndarray):
         return None, None
 
 
+def _aabb_corner_mesh(points: np.ndarray):
+    """Last-ditch hull built from the cluster's AABB corners. Used when
+    alpha-shape AND convex hull both fail (e.g. a near-coplanar cluster
+    where compute_convex_hull aborts). 8 vertices, 12 triangles — same
+    {vertices, triangles} payload shape the viewer expects, so the zone
+    renders through ContouredZone with proper wireframe edges instead
+    of falling through to the legacy AABB box renderer.
+
+    This is a *guaranteed* mesh: as long as the cluster has at least
+    one point, we return a valid box-mesh. A minimum thickness keeps
+    a fully-degenerate (single-point or coplanar) cluster from
+    collapsing into invisible geometry."""
+    if points.shape[0] < 1:
+        return None, None
+    mn = points.min(axis=0).astype(np.float64)
+    mx = points.max(axis=0).astype(np.float64)
+    # 1 cm minimum extent per axis so the mesh is always visible even
+    # for degenerate (coplanar / collinear / single-point) clusters.
+    eps = 0.005
+    for i in range(3):
+        if mx[i] - mn[i] < 2 * eps:
+            mid = 0.5 * (mn[i] + mx[i])
+            mn[i] = mid - eps
+            mx[i] = mid + eps
+    x0, y0, z0 = mn; x1, y1, z1 = mx
+    v = np.array([
+        [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+        [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+    ], dtype=np.float32)
+    # 12 triangles, outward-facing — matches Three.js BoxGeometry winding.
+    f = np.array([
+        [0, 3, 2], [0, 2, 1],          # -z (bottom)
+        [4, 5, 6], [4, 6, 7],          # +z (top)
+        [0, 1, 5], [0, 5, 4],          # -y
+        [2, 3, 7], [2, 7, 6],          # +y
+        [1, 2, 6], [1, 6, 5],          # +x
+        [0, 4, 7], [0, 7, 3],          # -x
+    ], dtype=np.int32)
+    return v, f
+
+
 def _alpha_shape_mesh(points: np.ndarray,
                       alpha_candidates: tuple,
                       target_triangles: int):
@@ -456,6 +497,16 @@ def _build_zone_shapes(cluster_points: np.ndarray, p: dict) -> dict:
 
     hull_v, hull_f = _convex_hull_mesh(cleaned)
     center, dims, _ = _bbox_extents(cleaned)
+    # Last-ditch hull from AABB corners. A near-coplanar cluster (a
+    # thin sheet, a sparse 3-point bundle) makes open3d's convex hull
+    # return empty — without this fallback the zone gets persisted
+    # with no mesh and the viewer falls through to a plain box. We
+    # build the corner-mesh BEFORE inflation so the inflate step
+    # operates on the same primitive regardless of which path won.
+    hull_used = 'convex_hull'
+    if hull_v is None:
+        hull_v, hull_f = _aabb_corner_mesh(cleaned)
+        hull_used = 'aabb_corners'
     if hull_v is not None and float(p.get('hull_inflate_m', 0.0)) > 0:
         hull_v = _inflate_hull(hull_v, center, float(p['hull_inflate_m']))
 
@@ -465,7 +516,9 @@ def _build_zone_shapes(cluster_points: np.ndarray, p: dict) -> dict:
         target_triangles=int(p['visual_max_triangles']),
     )
     if vis_v is None and hull_v is not None:
-        # Alpha failed (sparse cluster) — convex hull doubles as visual.
+        # Alpha failed (sparse cluster) — hull (real OR AABB-corners
+        # fallback) doubles as the visual mesh so the viewer always
+        # gets a contoured ContouredZone, never an unmeshed box.
         vis_v, vis_f, alpha_used = hull_v, hull_f, None
 
     return {
@@ -474,6 +527,7 @@ def _build_zone_shapes(cluster_points: np.ndarray, p: dict) -> dict:
         'dims':            dims,
         'hull_v':          hull_v,
         'hull_f':          hull_f,
+        'hull_source':     hull_used,
         'visual_v':        vis_v,
         'visual_f':        vis_f,
         'alpha_used':      alpha_used,
@@ -684,6 +738,7 @@ def build_zones_from_pcd(pcd_path: str,
         bbox_dims    = shapes['dims']
         hull_v       = shapes['hull_v']
         hull_f       = shapes['hull_f']
+        hull_source  = shapes.get('hull_source', 'convex_hull')
         visual_v     = shapes['visual_v']
         visual_f     = shapes['visual_f']
         alpha_used   = shapes['alpha_used']
@@ -756,13 +811,31 @@ def build_zones_from_pcd(pcd_path: str,
             'shape':        ('mesh' if visual_v is not None else
                              ('obb' if len(idxs) == 1 else 'aabb')),
         }
+        # Invariant: EVERY emitted zone ships at least a collision_hull
+        # AND a visual_mesh. _build_zone_shapes guarantees this via the
+        # AABB-corners fallback when both alpha-shape AND open3d's
+        # convex hull fail. The branch below stays guarded so a future
+        # refactor that returns None on a degenerate cluster still
+        # produces a renderable mesh instead of silently dropping back
+        # to the FE's box renderer.
+        if hull_v is None or hull_f is None:
+            hull_v, hull_f = _aabb_corner_mesh(combined)
+            hull_source = 'aabb_corners'
         if hull_v is not None and hull_f is not None:
             zone['collision_hull'] = _mesh_to_payload(hull_v, hull_f)
             zone['collision_hull']['margin_m'] = float(p.get('hull_inflate_m', 0.0))
+            zone['collision_hull']['source']   = hull_source
+        if visual_v is None or visual_f is None:
+            visual_v, visual_f = hull_v, hull_f
+            alpha_used = None
         if visual_v is not None and visual_f is not None:
             zone['visual_mesh'] = _mesh_to_payload(visual_v, visual_f)
             zone['visual_mesh']['alpha_m'] = alpha_used
             zone['visual_mesh']['decimated_to'] = int(p['visual_max_triangles'])
+            zone['visual_mesh']['source'] = (
+                'alpha_shape' if alpha_used is not None else hull_source)
+        # Reflect what's actually shipped on the zone-level shape tag.
+        zone['shape'] = 'mesh' if zone.get('visual_mesh') else zone['shape']
         zones.append(zone)
     diag['n_merged_rejected'] = len(merged_rejected)
     diag['merged_rejected'] = merged_rejected[:16]

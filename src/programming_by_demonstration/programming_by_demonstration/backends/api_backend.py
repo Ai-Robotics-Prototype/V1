@@ -119,10 +119,94 @@ CRITICAL RULES — violating any of these makes the output unusable:
      from 'right bin', places at 'left tray'". Sequence is captured by
      `sequence_index` (1, 2, …) and the frame timestamps you're given.
 
-  6) Surface uncertainty in `ambiguities`. Conflicts between video and
-     narration go here.
+  6) Surface uncertainty in `ambiguities` as STRUCTURED CLARIFICATIONS,
+     not free-form prose. Each item is an OBJECT the dashboard renders
+     as an interactive question the operator answers inline. Schema:
+        {{
+          "id":         "<short kebab id, unique per intent>",
+          "field":      "part" | "count" | "pallet_grid" | "location"
+                       | "speed" | "gripper" | "order" | "other",
+          "question":   "<short, single-sentence question>",
+          "type":       "choice" | "number" | "text" | "part_select",
+          "options":    [...]      // required for type=choice; for
+                                   // part_select put the top
+                                   // matching parts library entries
+          "suggested":  <your best-guess default the operator can
+                        accept verbatim — same shape as the answer
+                        you'd want stored>,
+          "affects":    {{ "scope": "config" | "operation" | "step",
+                          "operation_index": <int, when scope!="config">,
+                          "path": "config.pallet" | "target_part"
+                                  | "count_hint" | "place.location_hint"
+                                  | ... }}
+        }}
+     RULES:
+       a) Do NOT silently guess on MATERIAL ambiguities (which part,
+          how many, what grid). Emit a clarification with a sensible
+          `suggested` default so the operator can accept-as-is or
+          override. Low-stakes assumptions (e.g. you defaulted speed
+          to 60) can still be one-line `type:"text"`, `answerable:false`
+          notes — but always with a clear `question` so the reviewer
+          knows what you assumed.
+       b) For pallet_grid, `suggested` should be the same shape the
+          composer reads (e.g. {{"rows":1,"cols":1,"layers":1}}). For
+          part_select, `suggested` is a part_id; `options` is a list
+          of {{"part_id":"...","name":"..."}}. For count, `suggested`
+          is an int. For choice, `suggested` is one of `options`.
+     Conflicts between video and narration go in this same list with
+     `field:"other"` and a question asking the operator which to
+     trust.
 
-  7) Output ONLY a JSON object matching the schema below. No prose, no
+     Examples:
+       Vague pallet phrasing:
+         {{"id":"q-pallet", "field":"pallet_grid",
+           "question":"How should the parts be arranged on the pallet?",
+           "type":"choice",
+           "options":["1 by 1 (single slot)", "a row of 4", "2 by 3 grid"],
+           "suggested":{{"rows":1,"cols":1,"layers":1}},
+           "affects":{{"scope":"config","path":"config.pallet"}}}}
+       Part not confidently matched:
+         {{"id":"q-part-1", "field":"part",
+           "question":"Which library part did you mean?",
+           "type":"part_select",
+           "options":[{{"part_id":"bt225l24","name":"BT225L24 bracket"}},
+                      {{"part_id":"bt225l13","name":"BT225L13 bracket"}}],
+           "suggested":"bt225l24",
+           "affects":{{"scope":"operation","operation_index":0,"path":"target_part"}}}}
+       Count unclear:
+         {{"id":"q-count", "field":"count",
+           "question":"How many pieces should the robot place?",
+           "type":"number", "suggested":1,
+           "affects":{{"scope":"operation","operation_index":0,"path":"count_hint"}}}}
+       Place location vague:
+         {{"id":"q-place", "field":"location",
+           "question":"Describe the place target in a few words.",
+           "type":"text", "suggested":"left tray",
+           "affects":{{"scope":"operation","operation_index":0,"path":"place.location_hint"}}}}
+
+  7) For palletize / depalletize operations, EXTRACT the pallet grid
+     from the narration and emit it as `operations[i].pallet`:
+        {{"rows": int, "cols": int, "layers": int,
+         "fill_order": "row_lr"|"row_rl"|"col"|"snake",
+         "spacing_x_mm": <optional>, "spacing_y_mm": <optional>,
+         "assumed": false}}
+     Mappings (apply LITERALLY — do not "round up" a stated grid):
+       • "1 by 1" / "one by one" / "single slot"     → rows=1, cols=1
+       • "3 by 4" / "three by four"                  → rows=3, cols=4
+       • "2 rows of 5" / "two rows of five"          → rows=2, cols=5
+       • "a row of 6" / "single row of six"          → rows=1, cols=6
+       • "a column of 4" / "stack of 4 in a column"  → rows=4, cols=1
+       • "2 layers" / "stack 3 high"                 → layers=2 / layers=3
+       • "snake" / "back and forth"                  → fill_order="snake"
+     If the operator gives a TOTAL count but no grid ("place 6 of
+     them"), set rows=1 cols=<count> layers=1 and assumed=true, and
+     add a line to `ambiguities` ("Assumed a single row of N — no grid
+     was stated").
+     If NO pattern is stated AT ALL, emit rows=1 cols=1 layers=1
+     (a single placement). NEVER guess a multi-cell grid.
+     Leave `pallet` null on non-pallet operations.
+
+  8) Output ONLY a JSON object matching the schema below. No prose, no
      markdown fences, no commentary.
 
 Schema:
@@ -168,10 +252,54 @@ SCHEMA_EXAMPLE = """\
     }
   ],
   "ambiguities": [
-    "Operator mentioned 'the other tray' but only one tray was clearly visible"
+    {
+      "id": "q-place-tray",
+      "field": "location",
+      "question": "Which tray is the place target? Only one tray was clearly visible in the video.",
+      "type": "choice",
+      "options": ["left tray (the one visible)", "right tray (mentioned but not visible)"],
+      "suggested": "left tray (the one visible)",
+      "affects": { "scope": "operation", "operation_index": 0, "path": "place.location_hint" }
+    }
   ],
   "confidence_overall": 0.78,
   "raw_understanding_notes": "Initial state and final state agree across video frames and narration."
+}
+
+Palletize example — operator says "place these in a 3 by 4 pallet
+pattern on the right side of the table, snake order":
+{
+  "operations": [
+    {
+      "operation_type": "palletize",
+      "target_part": { "part_id": "bt225l24", "name": "BT225L24 bracket",
+                       "confidence": 0.9, "source": "matched_to_library" },
+      "sequence_index": 1,
+      "count_hint": "all",
+      "pick":  { "location_hint": "from the left bin",         "pose": null, "pose_status": "awaiting_perception" },
+      "place": { "location_hint": "into the pallet on the right", "pose": null, "pose_status": "awaiting_perception" },
+      "pallet": { "rows": 3, "cols": 4, "layers": 1, "fill_order": "snake", "assumed": false },
+      "notes": "Spoken grid: 3 by 4."
+    }
+  ]
+}
+
+Palletize example — operator says "place it in a 1 by 1 pattern" (one
+slot only — emit rows=1 cols=1, NOT a default 4x4):
+{
+  "operations": [
+    {
+      "operation_type": "palletize",
+      "target_part": { "part_id": "bt225l24", "name": "BT225L24 bracket",
+                       "confidence": 0.9, "source": "matched_to_library" },
+      "sequence_index": 1,
+      "count_hint": 1,
+      "pick":  { "location_hint": "from the bin",      "pose": null, "pose_status": "awaiting_perception" },
+      "place": { "location_hint": "single pallet slot", "pose": null, "pose_status": "awaiting_perception" },
+      "pallet": { "rows": 1, "cols": 1, "layers": 1, "fill_order": "row_lr", "assumed": false },
+      "notes": "Operator stated 1 by 1 — single placement."
+    }
+  ]
 }
 """
 

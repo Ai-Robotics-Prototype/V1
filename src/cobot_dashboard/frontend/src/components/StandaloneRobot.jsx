@@ -1,9 +1,18 @@
 import { useEffect, useRef } from 'react'
 import { useThree } from '@react-three/fiber'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader'
+import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader'
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment'
 import URDFLoader from 'urdf-loader'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
+
+// Shared DRACOLoader — registered once for the app lifetime. The
+// per-link GLBs shipped today are not Draco-compressed but future
+// exports may be, and registering unconditionally is cheap; the
+// wasm/js pair lives at /draco/ on the served static dir.
+const DRACO = new DRACOLoader()
+DRACO.setDecoderPath('/draco/')
 
 const JOINT_NAMES = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
 
@@ -22,10 +31,27 @@ const JOINT_NAMES = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joi
 // /joint_states from the driver replace these). A 25 Hz lerp keeps the
 // arm visually responsive to /ws/state without triggering React renders.
 export default function StandaloneRobot() {
-  const { scene } = useThree()
+  const { scene, gl } = useThree()
   const robotRef   = useRef(null)
   const targetsRef = useRef([0, 0, 0, 0, 0, 0])
   const currentRef = useRef([0, 0, 0, 0, 0, 0])
+
+  // Environment map — PMREM of RoomEnvironment. Even though the current
+  // baked GLB material is metalness=0, the reflection contribution kills
+  // the "flat gray" look on curved surfaces (§71 Issue 2). Sets scene.environment
+  // so any surviving MeshStandardMaterial (baked or otherwise) shades correctly.
+  useEffect(() => {
+    if (!gl || !scene) return undefined
+    const pmrem = new THREE.PMREMGenerator(gl)
+    const envRT = pmrem.fromScene(new RoomEnvironment(), 0.04)
+    const prev  = scene.environment
+    scene.environment = envRT.texture
+    return () => {
+      scene.environment = prev
+      envRT.dispose()
+      pmrem.dispose()
+    }
+  }, [gl, scene])
 
   const storePositions = useStore((s) => s.joints?.positions)
 
@@ -45,30 +71,36 @@ export default function StandaloneRobot() {
     loader.parseVisual    = true
     loader.parseCollision = false
 
-    // Material swap MUST happen inside loadMeshCb (per-mesh, before
-    // done()) — the meshes are only guaranteed to exist here. Any later
-    // traverse over the URDF root fires before per-link GLB fetches
-    // resolve, so it silently no-ops.
+    // Do NOT override the GLB's baked material — the exported PBR
+    // (metallicFactor 0, roughnessFactor 0.18, white) is what the model
+    // was designed to look like; the scene.environment (PMREM of
+    // RoomEnvironment, set above) + HemisphereLight (in the JSX) give
+    // it correct shading. Only backstop meshes that were exported
+    // without any material.
     //
-    // The GLB meshes ship with MeshStandardMaterial metalness≈1, which
-    // without an environment map renders as flat dark grey — same bug as
-    // the earlier static-model saga. Replacing with Phong bypasses that.
+    // Also register the shared Draco decoder — no-op for the current
+    // (non-Draco) GLBs, harmless for future compressed exports.
     loader.loadMeshCb = (path, manager, done) => {
-      new GLTFLoader(manager).load(
+      const gltf = new GLTFLoader(manager)
+      gltf.setDRACOLoader(DRACO)
+      gltf.load(
         path,
-        (gltf) => {
-          gltf.scene.traverse((c) => {
+        (g) => {
+          g.scene.traverse((c) => {
             if (c.isMesh) {
-              c.material = new THREE.MeshPhongMaterial({
-                color: 0xd8dce2, specular: 0x444444, shininess: 30,
-                side: THREE.DoubleSide,
-              })
-              // Decimation to 18.3k tris can leave stale / faceted
-              // normals — recompute so Phong shading reads smooth.
-              c.geometry.computeVertexNormals()
+              if (!c.material) {
+                c.material = new THREE.MeshStandardMaterial({
+                  color: 0xd8dce2, roughness: 0.5, metalness: 0.0,
+                })
+              }
+              // Decimated meshes sometimes ship faceted normals;
+              // recompute so PBR shading reads smooth.
+              if (c.geometry && !c.geometry.attributes.normal) {
+                c.geometry.computeVertexNormals()
+              }
             }
           })
-          done(gltf.scene)
+          done(g.scene)
         },
         undefined,
         (e) => {
@@ -130,14 +162,15 @@ export default function StandaloneRobot() {
   }, [])
 
   // Lights ride with the robot so this component is self-contained on
-  // any Canvas that mounts it (the 3D View / LiDAR scene has no lights
-  // of its own — the LiDAR points and zone wireframes are unlit
-  // materials so these lights are invisible to them).
+  // any Canvas that mounts it. Hemisphere (sky/ground bounce) is what
+  // separates a PBR robot from "flat gray" — the two prior directionals
+  // alone left the underside black. Ambient stays low to keep contrast.
+  // LiDAR points and zone wireframes use unlit materials → unaffected.
   return (
     <>
-      <ambientLight intensity={0.65} />
-      <directionalLight position={[3, 5, 4]}  intensity={1.1} />
-      <directionalLight position={[-3, 2, -2]} intensity={0.4} />
+      <hemisphereLight args={['#e6ecf5', '#1f2937', 0.55]} />
+      <directionalLight position={[3, 5, 4]} intensity={0.9} />
+      <ambientLight intensity={0.15} />
     </>
   )
 }
