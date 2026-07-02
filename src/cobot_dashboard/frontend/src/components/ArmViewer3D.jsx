@@ -32,7 +32,7 @@ import { CollisionScene3D, CollisionBanner } from './CollisionOverlay'
 //   - Custom-gripper GLB overlay parented to the URDF flange
 // ──────────────────────────────────────────────────────────────────
 
-const JOINT_NAMES  = ['J1', 'J2', 'J3', 'J4', 'J5', 'J6']
+const JOINT_NAMES  = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
 const JOINT_COLORS = ['#3B82F6', '#16A34A', '#CA8A04', '#DC2626', '#9333EA', '#F97316']
 
 // Defaults used before the URDF reports its bbox; auto-fit overrides
@@ -405,6 +405,11 @@ function URDFArm({ urdfUrl, onFlangeReady, onStatus, onLoaded }) {
       const box = new THREE.Box3().setFromObject(urdfRoot)
       const sz  = box.getSize(new THREE.Vector3())
       const bboxStr = `${sz.x.toFixed(2)}×${sz.y.toFixed(2)}×${sz.z.toFixed(2)} m`
+      let meshTotal = 0
+      urdfRoot.traverse((c) => { if (c.isMesh) meshTotal += 1 })
+      // eslint-disable-next-line no-console
+      console.log(`loaded ${meshTotal} meshes, bbox `
+        + `${sz.x.toFixed(2)}x${sz.y.toFixed(2)}x${sz.z.toFixed(2)}`)
       const state = (loadedN > 0 && failed === 0)
         ? 'loaded'
         : (loadedN === 0 ? 'error' : 'loaded')
@@ -519,8 +524,8 @@ function URDFArm({ urdfUrl, onFlangeReady, onStatus, onLoaded }) {
       urdfUrl,
       (urdf) => {
         if (cancelled) return
-        // URDF is Z-up; tilt onto scene Y-up so the arm stands.
-        urdf.rotation.x = -Math.PI / 2
+        // s10-140-real.urdf is already Y-up (native three.js frame);
+        // no axis tilt applied.
         const g = groupRef.current
         if (!g) return
         g.add(urdf)
@@ -528,7 +533,7 @@ function URDFArm({ urdfUrl, onFlangeReady, onStatus, onLoaded }) {
         robotRef.current = urdf
         urdfRoot = urdf
 
-        const flange = (urdf.links && (urdf.links.tool0 || urdf.links.link6_flange))
+        const flange = (urdf.links && (urdf.links.tool0 || urdf.links.link_6))
                        || null
         onFlangeReady?.(flange)
 
@@ -564,7 +569,11 @@ function URDFArm({ urdfUrl, onFlangeReady, onStatus, onLoaded }) {
       robotRef.current = null
       onFlangeReady?.(null)
     }
-  }, [urdfUrl, scene, onFlangeReady, onStatus, onLoaded])
+    // Load once for the lifetime of this component. Re-running this
+    // effect on parent-callback identity changes caused the URDF to
+    // be re-fetched every render, producing a flicker loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // 25 Hz joint lerp toward target at factor 0.3. Reads from refs so
   // the interval doesn't trigger React renders.
@@ -782,7 +791,7 @@ function StaticZonesToggle({ value, onChange }) {
   )
 }
 
-const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay }, ref) {
+const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay, noRobot = false }, ref) {
   const controlsRef = useRef(null)
   const [flange, setFlange] = useState(null)
   const [urdfStatus, setUrdfStatus] = useState({ state: 'idle', detail: '' })
@@ -888,12 +897,14 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay 
           maxDistance={20}
         />
         <gridHelper args={[4, 20, '#cccccc', '#e5e5e5']} />
-        <URDFArm
-          urdfUrl="/robot/urdf"
-          onFlangeReady={setFlange}
-          onStatus={setUrdfStatus}
-          onLoaded={handleUrdfLoaded}
-        />
+        {!noRobot && (
+          <URDFArm
+            urdfUrl="/robot/urdf"
+            onFlangeReady={setFlange}
+            onStatus={setUrdfStatus}
+            onLoaded={handleUrdfLoaded}
+          />
+        )}
         <CustomGripperModel url={gripperGlbUrl} flange={flange} />
         <BaselineCloudInScene onStatusChange={setBaselineStatus} />
         <CollisionScene3D showStatic={showStaticZones} />
@@ -944,32 +955,29 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay 
           this file (the FK loop uses them); just don't render
           the floating readout chip in the top-right anymore. */}
 
-      {/* Status pill, bottom-right — DEV scaffolding. Hidden by default;
-          reveal with ?debug=1 in the URL when diagnosing URDF or
-          GLB-fetch issues. The pill used to display "URDF: loading /
-          fetching URDF / GLB fetch 200 OK" in the normal view, which
-          was distracting once the model loaded reliably. */}
-      {(typeof window !== 'undefined' && /[?&]debug=1\b/.test(window.location.search)) && (
+      {/* Status pill, bottom-right — currently shown ALWAYS so the two
+          tabs (Program vs 3D View) can be compared side-by-side while
+          we chase the "no robot on 3D View" report. Re-gate on
+          ?debug=1 after the tabs are confirmed matching. */}
+      <div style={{
+        position: 'absolute', bottom: 8, right: 8, padding: '6px 10px',
+        borderRadius: 6, fontSize: 11, lineHeight: 1.35,
+        fontFamily: 'var(--font-mono, monospace)', zIndex: 10,
+        maxWidth: 360,
+        boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+        background: urdfStatus.state === 'error'
+          ? 'rgba(220,38,38,0.95)'
+          : urdfStatus.state === 'loaded'
+            ? 'rgba(22,163,74,0.92)'
+            : 'rgba(15,23,42,0.85)',
+        color: '#fff',
+      }}>
+        <div style={{ fontWeight: 700, marginBottom: 2 }}>URDF: {urdfStatus.state}</div>
+        <div style={{ opacity: 0.92, wordBreak: 'break-all' }}>{urdfStatus.detail || '—'}</div>
         <div style={{
-          position: 'absolute', bottom: 8, right: 8, padding: '6px 10px',
-          borderRadius: 6, fontSize: 11, lineHeight: 1.35,
-          fontFamily: 'var(--font-mono, monospace)', zIndex: 10,
-          maxWidth: 360,
-          boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-          background: urdfStatus.state === 'error'
-            ? 'rgba(220,38,38,0.95)'
-            : urdfStatus.state === 'loaded'
-              ? 'rgba(22,163,74,0.92)'
-              : 'rgba(15,23,42,0.85)',
-          color: '#fff',
-        }}>
-          <div style={{ fontWeight: 700, marginBottom: 2 }}>URDF: {urdfStatus.state}</div>
-          <div style={{ opacity: 0.92, wordBreak: 'break-all' }}>{urdfStatus.detail || '—'}</div>
-          <div style={{
-            fontSize: 11, color: '#ff9900', marginTop: 4, wordBreak: 'break-all',
-          }}>{diagMsg}</div>
-        </div>
-      )}
+          fontSize: 11, color: '#ff9900', marginTop: 4, wordBreak: 'break-all',
+        }}>{diagMsg}</div>
+      </div>
 
       {/* Camera presets, top-left */}
       <div style={{

@@ -71,7 +71,11 @@ STATE = {
     "safety": {"zone": "GREEN", "speed_scale": 1.0, "estop": False, "human_proximity": 2.4},
     "joints": {
         "names": ["J1", "J2", "J3", "J4", "J5", "J6"],
-        "positions": [0.0, -1.571, 0.785, -0.785, 0.0, 0.209],
+        # Zeros = URDF export pose (L-shape) for the Estun S10-140. The
+        # prior [0, -1.571, 0.785, -0.785, 0, 0.209] were UR5e leftovers
+        # from the mock server; they contorted this URDF. Real
+        # /joint_states replace these once the robot is connected.
+        "positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         "velocities": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     },
     "task": {
@@ -4132,15 +4136,12 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/robot/urdf")
     async def robot_urdf():
-        # The URDF references its meshes with package:// URIs that the
-        # frontend's urdf-loader resolves via a packages map pointing
-        # at /robot/, so this single route is enough — meshes ride on
-        # the existing /robot/links/{filename} endpoint below.
-        # The "provisional" file is the manual-derived URDF with the
-        # corrected §9.1 zero-pose offsets (J3/J5 rpy −π/2) and the
-        # 231 mm elbow lateral. Swap back to s10-140.urdf if the older
-        # geometry needs to be reproduced for comparison.
-        return _serve_robot_asset('s10-140-provisional.urdf', 'application/xml')
+        # The URDF references its meshes via /robot/links/*.glb, which
+        # the existing /robot/links/{filename} endpoint below serves.
+        # s10-140-real.urdf uses the SolidWorks-export pose meshes
+        # (Y-up, 18.3k tris, verified real-mesh set). The prior
+        # provisional file is kept on disk for reference.
+        return _serve_robot_asset('s10-140-real.urdf', 'application/xml')
 
     @app.get("/robot/links/{filename}")
     async def robot_link_file(filename: str):

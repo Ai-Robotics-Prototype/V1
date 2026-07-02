@@ -2,6 +2,7 @@ import { useRef, useState } from 'react'
 import { useStore } from '../store/useStore'
 import ArmViewer3D from '../components/ArmViewer3D'
 import LidarObjectsOverlay from '../components/LidarObjectsOverlay'
+import StandaloneRobot from '../components/StandaloneRobot'
 
 const PRESETS = ['Front', 'Side', 'Top', 'Iso']
 
@@ -159,7 +160,8 @@ export default function View3DLayout() {
                  setLidarControls={setLidarControls}
                  lastPick={lastPick} />
       <div style={{ flex: 1, overflow: 'hidden' }}>
-        <ArmViewer3D ref={armRef}>
+        <ArmViewer3D ref={armRef} noRobot>
+          <StandaloneRobot />
           {lidarControls.show && (
             <LidarObjectsOverlay
               showTentative={lidarControls.tentative}

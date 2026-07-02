@@ -25,7 +25,10 @@ STATE = {
     "safety": {"zone": "GREEN", "speed_scale": 1.0, "estop": False, "human_proximity": 2.4},
     "joints": {
         "names": ["J1", "J2", "J3", "J4", "J5", "J6"],
-        "positions": [0.0, -1.571, 0.785, -0.785, 0.0, 0.209],
+        # Zeros = URDF export pose for the Estun S10-140 (L-shape). The
+        # previous [0, -1.571, 0.785, -0.785, 0, 0.209] were UR5e-shaped
+        # defaults that mis-posed this URDF.
+        "positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         "velocities": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     },
     "task": {
@@ -215,8 +218,9 @@ async def simulation_loop():
                             steps[1]["status"] = "active"
 
         else:
-            # Idle oscillation
-            offsets = [0.0, -1.571, 0.785, -0.785, 0.0, 0.209]
+            # Idle oscillation — oscillate around zero (Estun S10-140
+            # export pose), not the UR5e-shaped offsets.
+            offsets = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
             new_pos = [offsets[i] + 0.4 * math.sin(t * 0.3 + i * 0.9) for i in range(6)]
             new_pos = _clamp_joints(new_pos)
             STATE["joints"]["velocities"] = [(new_pos[i] - joints[i]) * 25 for i in range(6)]
