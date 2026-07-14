@@ -23,6 +23,26 @@ src/livox_ros_driver2/
 # models/robots/estun_s10-140/links/ instead, the live set is the source.
 models/robots/estun_s10-140/links.bak/
 
+# Raw robot telemetry captures + DH-fit derived scratch. Calibration
+# checkpoints worth keeping live under config/ (e.g. dh_fit_report.txt);
+# everything else in data/ is regenerable capture.
+data/
+
+# Timestamped URDF backups from scripts/fit_dh.py — regeneratable.
+*.urdf.bak-*
+
+# Ad-hoc WS frame captures at the repo root (posture.py fallback path
+# when /opt/cobot/logs isn't writable). Only match at the top level so
+# real data JSONL under packages is unaffected.
+/*.jsonl
+
+# Uncompressed source meshes — the compressed set in
+# models/robots/estun_s10-140/links/ is the versioned copy.
+models/robots/estun_s10-140/links.uncompressed/
+
+# DH-fit tool output URDF — derived from config/dh_fit_report.txt.
+config/estun_s10_140_fitted.urdf
+
 # Secrets / env files — never commit. Belt-and-braces; nothing matches today.
 .env
 .env.*

@@ -6,15 +6,27 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import URDFLoader from 'urdf-loader'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
+import { startHomeMove } from '../lib/homeAnim'
+import { startJointAnimation } from '../lib/jointAnim'
 
-// Shared DRACOLoader — registered once for the app lifetime. The
-// per-link GLBs shipped today are not Draco-compressed but future
-// exports may be, and registering unconditionally is cheap; the
-// wasm/js pair lives at /draco/ on the served static dir.
+// Shared DRACOLoader — registered once for the app lifetime. Twin GLBs
+// are Draco-compressed now (see models/robots/estun_s10-140/links/),
+// so the decoder actually runs on each mesh.
 const DRACO = new DRACOLoader()
 DRACO.setDecoderPath('/draco/')
 
+// GLB byte cache across mounts. Same rationale as ArmViewer3D: keeps
+// the second-tab load from re-fetching what the first tab already
+// pulled. Setting it here is idempotent — ArmViewer3D sets it too.
+THREE.Cache.enabled = true
+
 const JOINT_NAMES = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
+
+// URDF axis-convention gate — mirrors ArmViewer3D. Current served URDF
+// (s10-140-full) is Y-up native. Flip to 'Z' if the /robot/urdf route
+// swings back to a REP-103 URDF variant.
+const URDF_UP_AXIS = 'Y'  // 'Y' → no tilt · 'Z' → rotation.x = -π/2
+const URDF_ROT_X   = URDF_UP_AXIS === 'Y' ? 0 : -Math.PI / 2
 
 // StandaloneRobot — self-contained URDF loader intended for the 3D View
 // tab's LiDAR scene. Mount as a child of a react-three-fiber <Canvas>.
@@ -30,11 +42,18 @@ const JOINT_NAMES = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joi
 // radians (server default is now all zeros = URDF export pose; real
 // /joint_states from the driver replace these). A 25 Hz lerp keeps the
 // arm visually responsive to /ws/state without triggering React renders.
-export default function StandaloneRobot() {
+export default function StandaloneRobot({ onRobotReady } = {}) {
   const { scene, gl } = useThree()
   const robotRef   = useRef(null)
   const targetsRef = useRef([0, 0, 0, 0, 0, 0])
   const currentRef = useRef([0, 0, 0, 0, 0, 0])
+  // Per-joint manual-jog override. When mask[i] is true the store→
+  // targets mirror skips joint i, so the slider write is the single
+  // source of truth for that joint until Reset. Other joints keep
+  // tracking the store (per instruction 6 of the fix).
+  const manualMaskRef = useRef([false, false, false, false, false, false])
+  // Active Home animation handle (see lib/homeAnim.js).
+  const homeAnimRef   = useRef(null)
 
   // Environment map — PMREM of RoomEnvironment. Even though the current
   // baked GLB material is metalness=0, the reflection contribution kills
@@ -56,10 +75,17 @@ export default function StandaloneRobot() {
   const storePositions = useStore((s) => s.joints?.positions)
 
   useEffect(() => {
-    if (Array.isArray(storePositions) && storePositions.length >= 6) {
-      targetsRef.current = storePositions
-        .slice(0, 6)
-        .map((v) => (Number.isFinite(v) ? Number(v) : 0))
+    if (!Array.isArray(storePositions) || storePositions.length < 6) return
+    const mask = manualMaskRef.current
+    const t    = targetsRef.current
+    // In-place mutation (not array replacement) so that
+    // JointJogPanel writes to targetsRef.current[i] between mirror
+    // ticks survive when mask[i] is false — and are protected
+    // outright when mask[i] is true.
+    for (let i = 0; i < 6; i++) {
+      if (mask[i]) continue
+      const v = Number(storePositions[i])
+      t[i] = Number.isFinite(v) ? v : 0
     }
   }, [storePositions])
 
@@ -67,7 +93,15 @@ export default function StandaloneRobot() {
     let cancelled = false
     let attached  = null
 
+    const timeLabel = '[urdf-load] StandaloneRobot /robot/urdf'
+    // eslint-disable-next-line no-console
+    console.time(timeLabel)
+
     const loader = new URDFLoader()
+    // package://robot_description/links/foo.glb -> /robot/links/foo.glb
+    // Required now that /robot/urdf serves the provisional URDF, which
+    // references its meshes via package:// URIs.
+    loader.packages       = { robot_description: '/robot' }
     loader.parseVisual    = true
     loader.parseCollision = false
 
@@ -115,16 +149,106 @@ export default function StandaloneRobot() {
       '/robot/urdf',
       (robot) => {
         if (cancelled) return
-        // Y-up URDF (see file header) — no rotation applied. If the
-        // arm ever renders on its side, try `robot.rotation.x = -Math.PI/2`
-        // (Z-up input) or `+Math.PI/2` (opposite handedness).
+        // Axis convention gate (URDF_UP_AXIS at top). Current URDF
+        // (s10-140-full) is Y-up → rotation stays 0.
+        robot.rotation.x = URDF_ROT_X
         scene.add(robot)
         attached = robot
         robotRef.current = robot
+
+        // Inject tool0 at link6 so IK / TCP readout have a stable name.
+        // See ArmViewer3D URDFArm for the matching insertion.
+        if (robot.links && robot.links.link6 && !robot.links.tool0) {
+          const tool0 = new THREE.Object3D()
+          tool0.name = 'tool0'
+          robot.links.link6.add(tool0)
+          robot.links.tool0 = tool0
+        }
+
+        // Same jog handle shape as URDFArm's — see ArmViewer3D.jsx.
+        // Writes both targetsRef and currentRef so the 25 Hz lerp
+        // below holds the slider pose instead of yanking back to the
+        // store target.
+        const cancelHome = () => {
+          if (homeAnimRef.current) {
+            homeAnimRef.current.cancel()
+            homeAnimRef.current = null
+          }
+        }
+        const jogApi = {
+          robot,
+          setJointRad: (idx, rad) => {
+            if (idx < 0 || idx >= 6) return
+            const j = robot.joints?.[JOINT_NAMES[idx]]
+            if (!j || typeof j.setJointValue !== 'function') return
+            cancelHome()
+            manualMaskRef.current[idx] = true
+            j.setJointValue(rad)
+            currentRef.current[idx] = rad
+            targetsRef.current[idx] = rad
+          },
+          resetAll: () => {
+            cancelHome()
+            for (let i = 0; i < 6; i++) {
+              manualMaskRef.current[i] = false
+              robot.joints?.[JOINT_NAMES[i]]?.setJointValue?.(0)
+              currentRef.current[i] = 0
+              targetsRef.current[i] = 0
+            }
+          },
+          setJointsRad: (rads) => {
+            if (!Array.isArray(rads) || rads.length < 6) return
+            cancelHome()
+            for (let i = 0; i < 6; i++) {
+              const rad = Number(rads[i])
+              if (!Number.isFinite(rad)) continue
+              const j = robot.joints?.[JOINT_NAMES[i]]
+              if (!j || typeof j.setJointValue !== 'function') continue
+              manualMaskRef.current[i] = true
+              j.setJointValue(rad)
+              currentRef.current[i] = rad
+              targetsRef.current[i] = rad
+            }
+          },
+          // Smooth coordinated return to all-zeros. Same behavior as
+          // URDFArm's home(); see lib/homeAnim.js for the animation.
+          home: () => {
+            cancelHome()
+            homeAnimRef.current = startHomeMove({
+              robot,
+              currentRef, targetsRef, manualMaskRef,
+              onComplete: () => { homeAnimRef.current = null },
+            })
+          },
+          // Twin-only interpolated move to an arbitrary target joint
+          // vector. Used by QuickOrientButtons. Masks stay latched at
+          // completion so the twin holds at the target pose. Shares
+          // the homeAnimRef slot with home() so cancels are unified.
+          runJointAnimation: (q_target, durationMs) => {
+            cancelHome()
+            homeAnimRef.current = startJointAnimation({
+              robot,
+              q_target,
+              duration: Number(durationMs) || 1500,
+              currentRef, targetsRef, manualMaskRef,
+              onComplete: () => { homeAnimRef.current = null },
+            })
+          },
+        }
+        onRobotReady?.(jogApi)
+
         let n = 0
-        robot.traverse((c) => { if (c.isMesh) n += 1 })
+        let m = 0
+        robot.traverse((c) => {
+          if (c.isMesh) {
+            n += 1
+            if (c.material) m += 1
+          }
+        })
         // eslint-disable-next-line no-console
-        console.log(`[3dview] loaded ${n} meshes`)
+        console.log(`[3dview] loaded ${n} meshes, withMaterial ${m}`)
+        // eslint-disable-next-line no-console
+        try { console.timeEnd(timeLabel) } catch {}
       },
       undefined,
       (err) => {
@@ -135,8 +259,13 @@ export default function StandaloneRobot() {
 
     return () => {
       cancelled = true
+      if (homeAnimRef.current) {
+        homeAnimRef.current.cancel()
+        homeAnimRef.current = null
+      }
       if (attached && attached.parent) attached.parent.remove(attached)
       robotRef.current = null
+      onRobotReady?.(null)
     }
     // Load once for the lifetime of this component; parent re-renders
     // must not re-trigger the URDF fetch (matches URDFArm's contract).

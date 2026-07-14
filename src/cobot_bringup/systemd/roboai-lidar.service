@@ -7,13 +7,13 @@ Wants=network-online.target
 Type=simple
 User=teddy
 WorkingDirectory=/home/teddy/cobot_ws
-# Network setup runs as root via the '+' prefix so no sudoers entry is needed.
-# We use 192.168.1.200/32 + a host route — the Jetson WiFi (wlP1p1s0) is
-# also on 192.168.1.0/24; installing /24 on eno1 would hijack SSH return
-# traffic. The Livox MID-360 is at 192.168.1.150 (verified by arp-scan).
+# LiDAR now lives on the isolated cell subnet (192.168.2.0/24) at
+# 192.168.2.150, reached via eno1 (192.168.2.246). No /32 workaround
+# needed — kernel routes 192.168.2.0/24 through eno1 natively. Do NOT
+# reintroduce any 192.168.1.x address or route on eno1 here: the
+# Jetson's WiFi (wlP1p1s0) owns 192.168.1.0/24 and any overlap on eno1
+# hijacks the SSH return path.
 ExecStartPre=+/sbin/ip link set eno1 up
-ExecStartPre=+/bin/sh -c '/sbin/ip addr replace 192.168.1.200/32 dev eno1'
-ExecStartPre=+/bin/sh -c '/sbin/ip route replace 192.168.1.150/32 dev eno1'
 ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 launch cobot_bringup lidar.launch.py'
 Restart=always
 RestartSec=5

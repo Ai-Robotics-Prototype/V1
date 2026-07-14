@@ -5,8 +5,8 @@
 # Sensor IP and host IP are baked in — change here if your unit differs.
 set -euo pipefail
 
-SENSOR_IP="${SENSOR_IP:-192.168.1.150}"
-HOST_IP="${HOST_IP:-192.168.1.200}"
+SENSOR_IP="${SENSOR_IP:-192.168.2.150}"
+HOST_IP="${HOST_IP:-192.168.2.246}"
 
 WS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$WS_ROOT/src"

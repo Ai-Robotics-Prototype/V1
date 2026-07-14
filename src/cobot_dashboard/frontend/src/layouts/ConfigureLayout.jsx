@@ -559,7 +559,7 @@ export default function ConfigureLayout() {
         textAlign: 'center',
         padding: '8px 0 16px',
       }}>
-        RoboAi Controller v1.0.0-mock — Settings saved to localStorage
+        NeuRobots Control v1.0.0-mock — Settings saved to localStorage
       </div>
     </div>
   )

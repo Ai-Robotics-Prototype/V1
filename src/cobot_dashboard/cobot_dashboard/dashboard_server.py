@@ -1182,6 +1182,15 @@ _ros_node: DashboardServer = None
 if FASTAPI_AVAILABLE:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # main() has run by this point, so _ros_node is populated.
+        # Register any subscriptions that were declared at module scope
+        # but needed to wait for _ros_node to exist.
+        try:
+            _register_lidar_identifier_subs()
+        except NameError:
+            # Registration function not defined yet (rare — early
+            # import failure). Endpoints will just serve empty data.
+            pass
         task = asyncio.create_task(_broadcast_loop())
         yield
         task.cancel()
@@ -1243,11 +1252,21 @@ if FASTAPI_AVAILABLE:
                 with _ws_lock:
                     clients = list(_state_clients.items())
                 for ws, q in clients:
-                    if q.qsize() < 2:
-                        try:
-                            await q.put(txt)
-                        except Exception:
-                            pass
+                    # Drop-to-latest: drain any stale queued frame before
+                    # inserting the fresh one so slow WS consumers always
+                    # see the newest STATE, never a chain of stale frames.
+                    # Prior "if qsize<2: put" logic held old frames when
+                    # the consumer stalled — that surfaced as twin
+                    # surge-and-lag on wireless clients.
+                    try:
+                        while True:
+                            q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                    try:
+                        q.put_nowait(txt)
+                    except asyncio.QueueFull:
+                        pass
                 next_state = now + state_dt
 
             if now >= next_lidar:
@@ -4168,12 +4187,15 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/robot/urdf")
     async def robot_urdf():
-        # The URDF references its meshes via /robot/links/*.glb, which
-        # the existing /robot/links/{filename} endpoint below serves.
-        # s10-140-real.urdf uses the SolidWorks-export pose meshes
-        # (Y-up, 18.3k tris, verified real-mesh set). The prior
-        # provisional file is kept on disk for reference.
-        return _serve_robot_asset('s10-140-real.urdf', 'application/xml')
+        # s10-140-full.urdf: full articulating twin built from the
+        # calibrated CS-frame dump. Six revolute joints, per-link
+        # meshes baked to link-local frames (identity visual origins),
+        # Y-up native (three.js frame — viewer applies NO tilt).
+        # link_5 has no mesh yet (wrist2 re-export pending); joint_5
+        # still articulates the downstream flange. s10-140-partial,
+        # s10-140-hybrid, s10-140-real, and the canonical provisional
+        # URDF stay on disk as fallbacks.
+        return _serve_robot_asset('s10-140-full.urdf', 'application/xml')
 
     @app.get("/robot/links/{filename}")
     async def robot_link_file(filename: str):
@@ -5085,10 +5107,14 @@ if FASTAPI_AVAILABLE:
                     files.append(ipath)
         return files
 
-    if RCLPY_AVAILABLE and _ros_node is not None:
-        # Lazy bind: the dashboard ROS node creates subscribers in its
-        # __init__. We attach the lidar identifier streams here without
-        # touching the node class — easier to add over time.
+    # Lazy bind: the dashboard ROS node creates subscribers in its
+    # __init__ inside main(); this module-level block runs at import
+    # BEFORE main(), so `_ros_node` is still None here. Wrap the
+    # registration in a callable and invoke it from `lifespan`'s
+    # startup — by then main() has assigned `_ros_node`. Prior code
+    # gated on `if _ros_node is not None:` at import time and silently
+    # skipped, which is why the identifier subs never attached.
+    if RCLPY_AVAILABLE:
         try:
             from lidar_object_identifier_msgs.msg import (
                 IdentifiedObjectArray as _LidarObjArrayMsg,
@@ -5139,15 +5165,24 @@ if FASTAPI_AVAILABLE:
                         'false_positives_filtered': int(msg.false_positives_filtered),
                     }
 
-            _ros_node.create_subscription(
-                _LidarObjArrayMsg, '/lidar_objects/identified',
-                _ident_array_cb, 5)
-            _ros_node.create_subscription(
-                _LidarStatsMsg, '/lidar_objects/stats',
-                _ident_stats_cb, 5)
-        except Exception as _exc:
+            def _register_lidar_identifier_subs():
+                # Called from lifespan startup, after main() has set
+                # _ros_node. Silent no-op if the node isn't up.
+                if _ros_node is None:
+                    return
+                _ros_node.create_subscription(
+                    _LidarObjArrayMsg, '/lidar_objects/identified',
+                    _ident_array_cb, 5)
+                _ros_node.create_subscription(
+                    _LidarStatsMsg, '/lidar_objects/stats',
+                    _ident_stats_cb, 5)
+        except Exception:
             # Identifier msgs not built yet — endpoints still work, just
             # serve the empty snapshot.
+            def _register_lidar_identifier_subs():
+                pass
+    else:
+        def _register_lidar_identifier_subs():
             pass
 
     @app.get("/api/lidar_objects/identified")

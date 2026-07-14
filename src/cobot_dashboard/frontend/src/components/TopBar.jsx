@@ -1,4 +1,5 @@
 import { useStore } from '../store/useStore'
+import Brand from './Brand'
 
 const TABS = [
   { id: 'monitor',          label: 'Monitor' },
@@ -57,8 +58,8 @@ export default function TopBar() {
       minWidth: 0,
     }}>
       {/* Left: brand */}
-      <div style={{ width: 64, flexShrink: 0, fontSize: 14, fontWeight: 700, color: 'var(--accent)' }}>
-        RoboAi
+      <div style={{ flexShrink: 0, fontSize: 14, color: 'var(--accent)', paddingRight: 8 }}>
+        <Brand />
       </div>
 
       {/* Centre: tab pills. The strip scrolls horizontally on narrow

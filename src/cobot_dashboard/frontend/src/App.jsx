@@ -134,8 +134,6 @@ export default function App() {
   const layoutMap = {
     monitor:          <MonitorDashboard />,
     programs:         <ProgramLibrary />,
-    program:          <ProgramLayout />,
-    '3dview':         <View3DLayout />,
     sensors:          <SensorsLayout />,
     io:               <IOPage />,
     adaptive_picking: <AdaptivePicking />,
@@ -143,6 +141,17 @@ export default function App() {
     configure:        <ConfigureLayout />,
     safety:           <SafetyPage />,
   }
+
+  // Keep the two 3D-heavy tabs persistently mounted, toggled by CSS
+  // display, so switching between them doesn't tear down the Canvas +
+  // URDFLoader and re-parse all 7 GLBs. Other tabs unmount as before.
+  const kept3D  = ['program', '3dview']
+  const isKept  = kept3D.includes(activeTab)
+  const other   = !isKept ? (layoutMap[activeTab] ?? <MonitorDashboard />) : null
+  const keptStyle = (tab) => ({
+    display: activeTab === tab ? 'flex' : 'none',
+    flex: 1, minHeight: 0, flexDirection: 'column',
+  })
 
   return (
     <ErrorBoundary>
@@ -152,7 +161,9 @@ export default function App() {
         </div>
         <div style={{ gridArea: 'content', minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
           <ErrorBoundary>
-            {layoutMap[activeTab] ?? <MonitorDashboard />}
+            <div style={keptStyle('program')}><ProgramLayout /></div>
+            <div style={keptStyle('3dview')}><View3DLayout /></div>
+            {other}
           </ErrorBoundary>
         </div>
         <div style={{ gridArea: 'statusbar', minWidth: 0, overflow: 'hidden' }}>

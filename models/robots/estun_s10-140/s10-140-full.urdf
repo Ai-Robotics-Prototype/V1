@@ -1,0 +1,75 @@
+<?xml version="1.0"?>
+<!-- Estun S10-140 verified twin (geom frame, Y-up). Generated from chain_final.json (Addendum 10). -->
+<!-- Meshes baked relative to each joint origin; all link visual origins are identity. -->
+<!--
+  Controller-vs-CAD axis convention (verified 2026-07-09 against live arm):
+    joint_3 (elbow pitch) and joint_5 (wrist pitch) have <axis> SIGNS
+    negated relative to the CAD geometric axes on record. This is by
+    design — the controller-positive rotation on these two joints is
+    opposite the CAD geometric axis (consistent with the ~90° zero-
+    theta offsets seen on J3/J5 in the DH fit). Do NOT "correct" these
+    back to (1,0,0) / (0,1,0): the twin will then move inverted vs the
+    physical arm during J3/J5 jogs.
+  Sign-flip owner: J3 = -1 0 0, J5 = 0 -1 0. All other joints track
+  the CAD-of-record axis unchanged (J1: 0 1 0, J2: -1 0 0, J4: 1 0 0,
+  J6: -1 0 0).
+-->
+<robot name="s10_140_twin">
+  <link name="base_link">
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="links/link0_base.glb"/></geometry></visual>
+  </link>
+  <link name="link1">
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="links/link1_shoulder.glb"/></geometry></visual>
+  </link>
+  <joint name="joint_1" type="revolute">  <!-- base yaw; limits: ±200°, 150°/s -->
+    <parent link="base_link"/><child link="link1"/>
+    <origin xyz="-0.000341 0.000000 -0.000038" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-3.490659" upper="3.490659" effort="200" velocity="2.617994"/>
+  </joint>
+  <link name="link2">
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="links/link2_upper_arm.glb"/></geometry></visual>
+  </link>
+  <joint name="joint_2" type="revolute">  <!-- shoulder pitch; limits: ±200°, 150°/s -->
+    <parent link="link1"/><child link="link2"/>
+    <origin xyz="-0.201859 0.183312 0.000221" rpy="0 0 0"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="-3.490659" upper="3.490659" effort="200" velocity="2.617994"/>
+  </joint>
+  <link name="link3">
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="links/link3_forearm.glb"/></geometry></visual>
+  </link>
+  <joint name="joint_3" type="revolute">  <!-- elbow pitch; limits: ±166°, 150°/s; axis: controller-positive is -X (CAD +X, sign inverted — see header) -->
+    <parent link="link2"/><child link="link3"/>
+    <origin xyz="0.144000 0.700198 -0.000187" rpy="0 0 0"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="-2.897247" upper="2.897247" effort="200" velocity="2.617994"/>
+  </joint>
+  <link name="link4">
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="links/link4_wrist1.glb"/></geometry></visual>
+  </link>
+  <joint name="joint_4" type="revolute">  <!-- wrist tilt (was mislabeled forearm roll); limits: ±200°, 180°/s -->
+    <parent link="link3"/><child link="link4"/>
+    <origin xyz="-0.001437 0.538990 0.000005" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-3.490659" upper="3.490659" effort="200" velocity="3.141593"/>
+  </joint>
+  <link name="link5">
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="links/link5_wrist2.glb"/></geometry></visual>
+  </link>
+  <joint name="joint_5" type="revolute">  <!-- wrist pitch; limits: ±200°, 180°/s; axis: controller-positive is -Y (CAD +Y, sign inverted — see header) -->
+    <parent link="link4"/><child link="link5"/>
+    <origin xyz="-0.147868 0.083500 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-3.490659" upper="3.490659" effort="200" velocity="3.141593"/>
+  </joint>
+  <link name="link6">
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="links/link6_flange.glb"/></geometry></visual>
+  </link>
+  <joint name="joint_6" type="revolute">  <!-- flange roll; limits: ±200°, 180°/s -->
+    <parent link="link5"/><child link="link6"/>
+    <origin xyz="-0.131895 0.078106 0.002073" rpy="0 0 0"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="-3.490659" upper="3.490659" effort="200" velocity="3.141593"/>
+  </joint>
+</robot>

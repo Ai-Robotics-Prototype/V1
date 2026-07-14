@@ -1,0 +1,47 @@
+# Estun Codroid driver — declared parameters + safety gates.
+#
+# Load with:
+#   ros2 run estun_driver estun_driver_node --ros-args --params-file <this>
+# or via the launch file:
+#   ros2 launch estun_driver estun_driver.launch.py
+#
+# Priority (highest wins):
+#   1. `-p key:=value` on the CLI
+#   2. --params-file loading this YAML
+#   3. ESTUN_ROBOT_IP / ESTUN_ROBOT_PORT env vars (only for IP + port)
+#   4. declare_parameter() default baked into the node
+
+estun_driver:
+  ros__parameters:
+    # ── Connection ───────────────────────────────────────────────
+    # Current cell target (isolated robot subnet):
+    #   192.168.2.136   (Estun S10-140-ECO-V2 @ Norse, confirmed working
+    #                    via scripts/posture.py on 2026-07-09)
+    # Historic firmware default candidates:
+    #   192.168.101.100 (Codroid S-series factory default)
+    #   192.168.1.136   (some Gen2 CC10-A units on DHCP shipping profile)
+    # Set via ESTUN_ROBOT_IP env for a per-cell override (see systemd
+    # drop-in at /etc/default/roboai-estun).
+    robot_ip:     "192.168.2.136"
+    robot_port:   9000
+    ui_origin_port: 9198     # Codroid UI HTTP port used for the WS Origin header
+    auto_connect: true
+
+    # ── Safety gates ─────────────────────────────────────────────
+    # Read-only telemetry mirror. TRUE means every inbound write
+    # path (jog / move / IO / command / project run) is REJECTED at
+    # the subscription. This driver build has NO motion-write code
+    # path implemented — flipping monitor_only to false does NOT
+    # enable motion; a separate branch that re-adds the v2.3 write
+    # paths is required first, gated on:
+    #   1. WS raw log confirms shipped firmware's write-message shapes
+    #   2. operator has cleared the cell
+    #   3. deadman + limit clamps exercised on a bench
+    monitor_only: true
+
+    # ── First-connect logging ────────────────────────────────────
+    # Dumps every TX/RX WS frame to
+    #   /opt/cobot/logs/estun_ws_YYYYMMDD_HHMMSS.jsonl
+    # One rotated file per driver start. Ground truth for the v2.3
+    # protocol shapes — leave on during bring-up.
+    ws_log_raw: true

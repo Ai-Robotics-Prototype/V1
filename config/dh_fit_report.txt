@@ -1,0 +1,61 @@
+=== fit_dh.py — Estun S10-140-ECO-V2 DH identification ===
+input: /home/teddy/cobot_ws/data/estun_posture_20260708_161306.jsonl
+parsed 4653 RobotPosture frames from estun_posture_20260708_161306.jsonl
+after dedupe (0.05deg threshold): 2458 unique poses
+
+joint coverage (deg):
+  J1:  -232.78 ..  +201.56  (span 434.35)
+  J2:   -93.66 ..   +41.94  (span 135.60)
+  J3:  -167.01 ..  +159.02  (span 326.03)
+  J4:   -89.76 ..   +30.29  (span 120.06)
+  J5:   +90.98 ..  +269.56  (span 178.58)
+  J6:  +176.53 ..  +235.79  (span  59.26)
+
+split: 1966 train / 492 test  (seed 20260708)
+
+[STAGE A] position-only fit  (seed reach ~1.4m, J2/J3/J5 pi/2 theta offsets)
+  seed residual (train):   RMS=   941.69mm   MAX=  1534.39mm
+  fitted residual:
+    train:  RMS= 23.71251mm   MAX=140.61888mm
+    test:   RMS= 22.21548mm   MAX=135.95495mm
+  status=2  nfev=371  cost=5.527e+05  time=278.5s
+
+[CONVENTION] full stage-B fit under BOTH conventions
+           fixed-xyz (extrinsic): pos RMS=   0.025mm  MAX=   0.186mm  |  ori RMS=  0.0035deg  MAX=  0.0226deg   nfev=580  t=6.3s
+                   intrinsic XYZ: pos RMS= 581.628mm  MAX=1206.546mm  |  ori RMS= 80.3302deg  MAX=179.9055deg   nfev=20010  t=199.2s
+  => fixed-xyz WINS (pos RMS 0.025mm vs 581.63mm intrinsic). Using fixed-xyz for stage B.
+
+[STAGE B] full pose fit (fixed-xyz), bounded to keep DH physical
+  train  pos: RMS=  0.02507mm   MAX=  0.18554mm
+  train  ori: RMS=  0.00350deg  MAX=  0.02263deg
+  test   pos: RMS=  0.02447mm   MAX=  0.18241mm
+  test   ori: RMS=  0.00349deg  MAX=  0.02215deg
+  status=2  nfev=58  cost=4.296e+00  time=43.0s
+   least-constrained params (5 smallest Jacobian column norms):
+     a_1             col_norm=4.434e+01
+     a_4             col_norm=4.434e+01
+     d_2             col_norm=4.434e+01
+     d_6             col_norm=4.434e+01
+     d_5             col_norm=4.434e+01
+
+[urdf-encoding sanity] max |FK - URDF-chain| on test set: 6.821e-13  (should be < 1e-6)
+
+===== FITTED DH TABLE (standard DH) =====
+joint         a (mm)    alpha (deg)        d (mm)     theta_off (deg)   note
+joint_1      -0.00002       90.00058     325.89611          -179.99989   
+joint_2    -701.00394        0.00028    -579.68908           -90.00022   controller-zero theta offset (~90deg)
+joint_3    -538.58526      180.00313    -214.01833            -0.00615   no theta offset
+joint_4      -0.00374      -89.99857   -1000.00000           -90.00736   controller-zero theta offset (~90deg)
+joint_5       0.00533       89.99433    -161.46726           179.99693   
+joint_6      -0.00155       -0.00674     150.49959             0.00152   no theta offset
+base_z = -139.89595 mm
+backed up provisional URDF -> /home/teddy/cobot_ws/models/robots/estun_s10-140/s10-140-full.urdf.bak-fit-20260709_090633
+joint-limit discrepancies vs provisional URDF:
+   joint_1: provisional [-360.00, +360.00] deg  -> fitted [-200, +200] deg
+   joint_2: provisional [-360.00, +360.00] deg  -> fitted [-200, +200] deg
+   joint_3: provisional [-160.00, +160.00] deg  -> fitted [-166, +166] deg
+   joint_4: provisional [-360.00, +360.00] deg  -> fitted [-200, +200] deg
+   joint_5: provisional [-360.00, +360.00] deg  -> fitted [-200, +200] deg
+   joint_6: provisional [-360.00, +360.00] deg  -> fitted [-200, +200] deg
+
+wrote fitted URDF: /home/teddy/cobot_ws/config/estun_s10_140_fitted.urdf
