@@ -318,7 +318,7 @@ export default function LiveRecorder({ onClipReady, disabled, autoStart = false 
           <div style={{ textAlign: 'center', padding: '24px 16px' }}>
             <div style={{ fontSize: 14, color: '#374151', marginBottom: 12 }}>
               Film the workspace while narrating what should happen.
-              RoboAi will fuse the video and your voice into a draft
+              NeuRobots will fuse the video and your voice into a draft
               program.
             </div>
             <button onClick={() => startStream(facing)}

@@ -5,8 +5,20 @@ After=network.target
 [Service]
 Type=simple
 User=teddy
+# ROS_DOMAIN_ID stays inline (unlikely to change per site).
 Environment="ROS_DOMAIN_ID=0"
-ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 run estun_driver estun_driver_node --ros-args -p robot_ip:=192.168.101.100 -p robot_port:=9000 -p poll_rate_hz:=50.0'
+
+# Optional per-cell overrides for the robot's network location. The
+# leading `-` makes the file optional so the service still starts if
+# the operator hasn't dropped one in yet — the YAML default in
+# estun_driver/config/estun.yaml takes over. See
+# /etc/default/roboai-estun.example for the format.
+EnvironmentFile=-/etc/default/roboai-estun
+
+# Launch instead of `ros2 run` so the packaged config/estun.yaml is
+# loaded as --params-file. The driver still honors ESTUN_ROBOT_IP /
+# ESTUN_ROBOT_PORT (from the EnvironmentFile) with priority over YAML.
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 launch estun_driver estun_driver.launch.py'
 Restart=always
 RestartSec=3
 

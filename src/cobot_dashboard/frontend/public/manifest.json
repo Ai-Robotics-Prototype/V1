@@ -1,7 +1,7 @@
 {
-  "name": "RoboAi Controller",
-  "short_name": "RoboAi",
-  "description": "RoboAi cobot controller dashboard",
+  "name": "NeuRobots Control",
+  "short_name": "NeuRobots",
+  "description": "NeuRobots cobot controller dashboard",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

@@ -21,6 +21,20 @@ const storeDefinition = (set, get) => ({
   wsLatency: 0,
   lastMessageTime: 0,
 
+  // ---- Jog speed (0-100 %) ----
+  // Reusable knob. Currently drives ONLY the twin animation speed for
+  // quick-orient / home / any future twin-side interpolated moves.
+  // TODO(motion): when commanded motion is enabled (write-command
+  // format captured, signs verified, Remote mode on the pendant),
+  // this becomes speed_pct on /estun/move — safety-capped by
+  // global_speed_cap_pct in estun_driver. Do NOT wire that path
+  // without an explicit safety review; monitor_only stays true.
+  jogSpeedPct: 50,
+  setJogSpeedPct(pct) {
+    const n = Math.max(0, Math.min(100, Number(pct)))
+    if (Number.isFinite(n)) set({ jogSpeedPct: n })
+  },
+
   // ---- Robot state ----
   safety: { zone: 'GREEN', speed_scale: 1.0, estop: false, human_proximity: 2.4 },
   joints: {
@@ -586,6 +600,9 @@ export const useStore = create(
       // Same idea for the Program tab's resizable layout — dragging the
       // dividers should outlive a tab switch and a page reload.
       programLayout:  state.programLayout,
+      // Persist the jog speed % so the operator's chosen speed survives
+      // page reloads.
+      jogSpeedPct:    state.jogSpeedPct,
     }),
   })
 )

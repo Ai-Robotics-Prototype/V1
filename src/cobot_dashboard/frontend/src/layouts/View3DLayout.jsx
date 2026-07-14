@@ -1,77 +1,29 @@
 import { useRef, useState } from 'react'
 import { useStore } from '../store/useStore'
 import ArmViewer3D from '../components/ArmViewer3D'
-import LidarObjectsOverlay from '../components/LidarObjectsOverlay'
 import StandaloneRobot from '../components/StandaloneRobot'
+import JointJogPanel from '../components/JointJogPanel'
+import IKGizmo from '../components/IKGizmo'
+
+// The LiDAR identified-objects overlay previously mounted here has
+// been removed from the 3D twin scene — the floating labels + boxes
+// cluttered the twin view. The identification pipeline still runs
+// (roboai-lidar-identifier publishes /lidar_objects/identified) and
+// the data is consumed by the Monitor tab's IdentifiedObjectsCard,
+// PartsLibrary, WorkspaceMaskSection, and /api/lidar_objects/*. This
+// twin viewer is now robot + collision + IK gizmo only.
 
 const PRESETS = ['Front', 'Side', 'Top', 'Iso']
 
-function ToggleRow({ label, checked, onChange }) {
-  return (
-    <label style={{
-      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-      fontSize: 11, color: 'var(--text-secondary)', cursor: 'pointer',
-    }}>
-      <span>{label}</span>
-      <input type="checkbox" checked={checked}
-             onChange={(e) => onChange(e.target.checked)} />
-    </label>
-  )
-}
-
-function LidarLayerSection({ controls, setControls, lastPick }) {
-  return (
-    <div>
-      <div style={{
-        fontSize: 9, textTransform: 'uppercase', color: 'var(--text-muted)',
-        letterSpacing: '0.06em', marginBottom: 6,
-      }}>
-        Identified Objects (LiDAR)
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        <ToggleRow label="Show Identified Objects"
-                   checked={controls.show}
-                   onChange={(v) => setControls({ ...controls, show: v })} />
-        <ToggleRow label="Show Tentative"
-                   checked={controls.tentative}
-                   onChange={(v) => setControls({ ...controls, tentative: v })} />
-        <ToggleRow label="Show Unknown"
-                   checked={controls.unknown}
-                   onChange={(v) => setControls({ ...controls, unknown: v })} />
-        <ToggleRow label="Show Confidence Labels"
-                   checked={controls.labels}
-                   onChange={(v) => setControls({ ...controls, labels: v })} />
-        <ToggleRow label="Group by Part Type"
-                   checked={controls.groupByPart}
-                   onChange={(v) => setControls({ ...controls, groupByPart: v })} />
-      </div>
-      {lastPick && (
-        <div style={{
-          marginTop: 8, padding: '6px 8px', borderRadius: 4,
-          background: 'var(--bg-surface)', border: '1px solid var(--border)',
-          fontSize: 10, color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)',
-        }}>
-          <div style={{ color: 'var(--text-primary)', fontWeight: 600 }}>
-            {lastPick.identified_name || 'unknown'}
-          </div>
-          <div>Confidence: {Math.round(lastPick.confidence * 100)}%</div>
-          <div>Size {Math.round((lastPick.size_match_score || 0) * 100)}% ·
-            Shape {Math.round((lastPick.shape_match_score || 0) * 100)}%</div>
-          <div>Frames observed: {lastPick.frames_observed}</div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-function LeftPanel({ armRef, lidarControls, setLidarControls, lastPick }) {
+function LeftPanel({ armRef }) {
   // Joint angles + Gripper + TCP-pose readouts were intentionally
   // removed: the joint table duplicated the (since-removed) top-right
   // chip in the canvas, the TCP "pose" was a rough analytic-FK
   // approximation that didn't match the URDF, and the gripper state
-  // is already surfaced on the Monitor + Program tabs. The panel now
-  // hosts only what's unique to this view: camera presets + the
-  // current task state + the LiDAR layer controls.
+  // is already surfaced on the Monitor + Program tabs. The LiDAR
+  // identified-objects section was removed with the overlay itself —
+  // see the top-of-file note. The panel now hosts only camera presets
+  // and the current task state.
   const task = useStore((s) => s.task)
 
   return (
@@ -136,42 +88,68 @@ function LeftPanel({ armRef, lidarControls, setLidarControls, lastPick }) {
         </div>
       </div>
 
-      <LidarLayerSection
-        controls={lidarControls}
-        setControls={setLidarControls}
-        lastPick={lastPick}
-      />
     </div>
   )
 }
 
 export default function View3DLayout() {
   const armRef = useRef(null)
-  const [lidarControls, setLidarControls] = useState({
-    show: true, tentative: true, unknown: false,
-    labels: true, groupByPart: false,
-  })
-  const [lastPick, setLastPick] = useState(null)
+  // FK jog handle exposed by StandaloneRobot once its URDF resolves.
+  // Drives JointJogPanel below without re-parsing anything.
+  const [jogApi, setJogApi] = useState(null)
+  // Cartesian-drag state for the 3D View tab's gizmo. Program tab has
+  // its own copy inside ArmViewer3D; the two viewers don't share.
+  const [cartMode, setCartMode]     = useState(false)
+  const [gizmoMode, setGizmoMode]   = useState('translate')
+  // AT LIMIT indicator — IKGizmo emits atLimit each frame the drag
+  // advances, cleared on drag-release. Ref-not-state to avoid a re-
+  // render every RAF; a small ticker below flips the visible state
+  // only when the flag changes.
+  const [ikAtLimit, setIkAtLimit] = useState(false)
 
   return (
     <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
-      <LeftPanel armRef={armRef}
-                 lidarControls={lidarControls}
-                 setLidarControls={setLidarControls}
-                 lastPick={lastPick} />
-      <div style={{ flex: 1, overflow: 'hidden' }}>
+      <LeftPanel armRef={armRef} />
+      <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
         <ArmViewer3D ref={armRef} noRobot>
-          <StandaloneRobot />
-          {lidarControls.show && (
-            <LidarObjectsOverlay
-              showTentative={lidarControls.tentative}
-              showUnknown={lidarControls.unknown}
-              showLabels={lidarControls.labels}
-              groupByPartType={lidarControls.groupByPart}
-              onPick={setLastPick}
+          <StandaloneRobot onRobotReady={setJogApi} />
+          {cartMode && (
+            <IKGizmo
+              jogApi={jogApi}
+              enabled
+              mode={gizmoMode}
+              onDragChange={(d) => {
+                armRef.current?.setOrbitEnabled?.(!d)
+                if (!d) setIkAtLimit(false)   // clear on release
+              }}
+              onTargetPose={(p) => {
+                if (!!p.atLimit !== ikAtLimit) setIkAtLimit(!!p.atLimit)
+              }}
             />
           )}
         </ArmViewer3D>
+        {cartMode && ikAtLimit && (
+          <div style={{
+            position: 'absolute', top: 8, right: 8, zIndex: 20,
+            padding: '4px 10px', borderRadius: 4,
+            background: '#DC2626', color: '#fff',
+            fontSize: 12, fontFamily: 'var(--font-mono, monospace)',
+            fontWeight: 700, letterSpacing: 0.6,
+            boxShadow: '0 1px 4px rgba(0,0,0,0.35)',
+            pointerEvents: 'none',
+          }}>
+            AT LIMIT
+          </div>
+        )}
+        <JointJogPanel
+          jogApi={jogApi}
+          cartesianMode={cartMode}
+          onCartesianModeChange={setCartMode}
+          gizmoMode={gizmoMode}
+          onGizmoModeChange={setGizmoMode}
+          onHome={() => jogApi?.home?.()}
+          onAtLimit={(atLimit) => setIkAtLimit(!!atLimit)}
+        />
       </div>
     </div>
   )

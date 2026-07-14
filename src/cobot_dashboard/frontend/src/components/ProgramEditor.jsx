@@ -1353,7 +1353,7 @@ function VoiceBar() {
       <div style={{ display: 'flex', gap: 4 }}>
         <input value={text} onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && submit()}
-          placeholder="Ask RoboAi…"
+          placeholder="Ask NeuRobots…"
           style={{ flex: 1, padding: '5px 8px', fontSize: 12, borderRadius: 4,
                    border: '1px solid #d1d5db', background: '#fff', outline: 'none' }} />
         <button onClick={listening ? stopListening : startListening}

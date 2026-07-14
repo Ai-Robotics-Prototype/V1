@@ -317,7 +317,7 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
             <div style={{ padding: 24, maxWidth: 720, margin: '0 auto' }}>
               <div style={{ fontSize: 14, color: '#374151', marginBottom: 16, lineHeight: 1.6 }}>
                 Film the workspace while narrating &mdash; or upload a clip
-                you already recorded on your phone. RoboAi will transcribe
+                you already recorded on your phone. NeuRobots will transcribe
                 the voice locally, fuse video and narration into one
                 understanding, and produce a draft program you can review.
               </div>
@@ -1210,7 +1210,7 @@ function SceneSection({ scene, onChange, partsLibrary }) {
   return (
     <Section title="Scene Understanding (video + voice fused)">
       <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 10, lineHeight: 1.5 }}>
-        Here&rsquo;s what RoboAi understood from the demonstration by
+        Here&rsquo;s what NeuRobots understood from the demonstration by
         combining the video and your narration. Correct anything that&rsquo;s
         wrong — your corrections train the model.
       </div>

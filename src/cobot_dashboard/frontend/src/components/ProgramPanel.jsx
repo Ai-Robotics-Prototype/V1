@@ -264,7 +264,7 @@ function VoiceBar() {
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && submit()}
-          placeholder="Ask RoboAi…"
+          placeholder="Ask NeuRobots…"
           style={{
             flex: 1,
             background: 'var(--bg-surface)',

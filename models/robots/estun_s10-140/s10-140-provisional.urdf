@@ -85,7 +85,7 @@
     </visual>
   </link>
 
-  <joint name="J1" type="revolute">
+  <joint name="joint_1" type="revolute">
     <parent link="base_link"/>
     <child  link="link1_shoulder"/>
     <!-- Base height 186 mm, drawing dimension. -->
@@ -105,7 +105,7 @@
     </visual>
   </link>
 
-  <joint name="J2" type="revolute">
+  <joint name="joint_2" type="revolute">
     <parent link="link1_shoulder"/>
     <child  link="link2_upper_arm"/>
     <!-- Shoulder horizontal offset 221 mm.
@@ -129,7 +129,7 @@
     </visual>
   </link>
 
-  <joint name="J3" type="revolute">
+  <joint name="joint_3" type="revolute">
     <parent link="link2_upper_arm"/>
     <child  link="link3_forearm"/>
     <!-- Lower major arm 700 mm. Drawing dimension. -->
@@ -150,7 +150,7 @@
     </visual>
   </link>
 
-  <joint name="J4" type="revolute">
+  <joint name="joint_4" type="revolute">
     <parent link="link3_forearm"/>
     <child  link="link4_wrist1"/>
     <!-- Upper major arm (forearm) 700 mm + elbow horizontal offset
@@ -173,7 +173,7 @@
     </visual>
   </link>
 
-  <joint name="J5" type="revolute">
+  <joint name="joint_5" type="revolute">
     <parent link="link4_wrist1"/>
     <child  link="link5_wrist2"/>
     <!-- Wrist J4 → J5 axial offset 161.5 mm (drawing). -->
@@ -193,7 +193,7 @@
     </visual>
   </link>
 
-  <joint name="J6" type="revolute">
+  <joint name="joint_6" type="revolute">
     <parent link="link5_wrist2"/>
     <child  link="link6_flange"/>
     <!-- Wrist J5 → J6 axial offset 150.5 mm (drawing). -->
