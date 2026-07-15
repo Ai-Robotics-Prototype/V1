@@ -24,6 +24,15 @@ capsules:
     p1: [-7.76, 587.55, 0.19]
     radius: 81.34
     # raw_max_radius=69.34 axis_length=648.0
+    # NOTE: this single-cap fit is used ONLY for other-link pairs
+    # (base↔l3, l1↔l3, l3↔l6, l3↔ground, l3↔env). The l3↔l5 pair
+    # uses mesh-mesh distance instead (see `mesh_pairs:` below).
+    # A cylindrical capsule over-approximates the link's flat
+    # rectangular ends by 40–50 mm at every bent pose — including
+    # HOME — where real l3/l5 clearance stays a designed 46.8 mm.
+    # Sub-slab, side-split, and dual-side-split fits all reproduced
+    # this floor. Only true geometry via mesh sampling recovers the
+    # real gap.
   link4_wrist1:
     p0: [-136.4, -49.55, -0.0]
     p1: [-136.4, 88.8, -0.0]
@@ -34,6 +43,8 @@ capsules:
     p1: [49.05, 66.03, 0.0]
     radius: 72.53
     # raw_max_radius=60.53 axis_length=138.35
+    # Same treatment as link3 — single cap for other pairs, mesh-mesh
+    # distance for the l3↔l5 pair only.
   link6_flange:
     p0: [2.4, -49.61, -2.07]
     p1: [2.4, 48.39, -2.07]
@@ -79,17 +90,30 @@ pairs:
   - [link2_upper_arm, link4_wrist1]
   - [link2_upper_arm, link5_wrist2]
   - [link2_upper_arm, link6_flange]
-  # link3_forearm ↔ link5_wrist2 removed 2026-07-15: capsule
-  # over-approximation fires false-positive at ~14 mm in bent poses
-  # where the real slim geometry stays >150 mm apart. Re-enable
-  # after we swap the PCA-cylinder capsules for tighter convex
-  # hulls / composite primitives.
-  # - [link3_forearm, link5_wrist2]
+  # link3_forearm ↔ link5_wrist2 is handled via mesh-mesh distance
+  # instead (see mesh_pairs below). It is NOT listed here because
+  # any cylinder-cylinder capsule fit inherently over-approximates by
+  # 40–50 mm at every arm pose, producing constant phantoms.
   - [link3_forearm, link6_flange]
   - [__ground__, link3_forearm]
   - [__ground__, link4_wrist1]
   - [__ground__, link5_wrist2]
   - [__ground__, link6_flange]
+
+# Pairs that use MESH-MESH ground-truth distance instead of capsule-
+# capsule. Each named link must have a matching .npy vertex cloud at
+# estun_driver/mesh_verts/<link>.npy (stride-4 subsample of the URDF
+# GLB, ~15 kB each). Runtime cost: ~5 ms per pair per tick, well
+# inside the 50 Hz budget.
+#
+# Currently only link3↔link5 warrants this: the mesh clearance stays
+# at a designed 46.8 mm across a wide range of poses (the wrist stub
+# link4 mechanically enforces the gap), and cylindrical capsules
+# fitted to link3's rectangular distal flange and link5's chunky
+# block always report -5 to -50 mm at that separation, regardless of
+# radius. Mesh sampling recovers the true value within 0.3 mm.
+mesh_pairs:
+  - [link3_forearm, link5_wrist2]
 
 # Ground plane pseudo-body — flat at z=0 in base frame, treated as
 # an infinite half-space for distance queries. The base column itself

@@ -143,37 +143,99 @@ class Capsule:
 
 
 def load_capsules_yaml(path):
-    """Minimal YAML parser tuned to fit_capsules.py's output — no
-    PyYAML dep. Returns (dict[link → Capsule], list[(a,b)] pair list)."""
+    """Minimal YAML parser tuned to fit_capsules.py's output plus the
+    multi-capsule block from fit_multi_capsules.py.  Two supported
+    per-link shapes:
+
+      # single capsule (legacy)
+      link_name:
+        p0: [...]
+        p1: [...]
+        radius: ...
+
+      # multi-capsule (2-3 per link)
+      link_name:
+        capsules:
+          - p0: [...]
+            p1: [...]
+            radius: ...
+          - p0: [...]
+            p1: [...]
+            radius: ...
+
+    Additional top-level section (optional):
+      mesh_pairs:
+        - [link_a, link_b]      # use mesh-mesh distance instead of capsule
+
+    Returns (capsules, pairs, mesh_pairs). Every link in `capsules`
+    maps to a LIST of Capsule so downstream code iterates uniformly."""
     capsules = {}
     pairs = []
+    mesh_pairs = []
     section = None
     cur_link = None
-    cur = {}
+    cur = {}           # scratch for a single-capsule link
+    cur_multi = None   # list of dicts when parsing a link's `capsules:` block
     def flush():
-        nonlocal cur_link, cur
-        if cur_link and 'p0' in cur and 'p1' in cur and 'radius' in cur:
-            capsules[cur_link] = Capsule(cur_link, cur['p0'], cur['p1'], cur['radius'])
-        cur_link, cur = None, {}
+        nonlocal cur_link, cur, cur_multi
+        if cur_link is None:
+            cur, cur_multi = {}, None; return
+        if cur_multi is not None:
+            capsules[cur_link] = [
+                Capsule(cur_link, c['p0'], c['p1'], c['radius'])
+                for c in cur_multi
+                if 'p0' in c and 'p1' in c and 'radius' in c]
+        elif 'p0' in cur and 'p1' in cur and 'radius' in cur:
+            capsules[cur_link] = [Capsule(cur_link,
+                cur['p0'], cur['p1'], cur['radius'])]
+        cur_link, cur, cur_multi = None, {}, None
     with open(path) as fh:
         for raw in fh:
             line = raw.split('#', 1)[0].rstrip()
             if not line.strip():
                 continue
             stripped = line.strip()
-            if line.startswith('capsules:'):
+            if line.startswith('capsules:') and (
+                    len(line) - len(line.lstrip(' '))) == 0:
                 section = 'capsules'; continue
             if line.startswith('pairs:'):
                 flush(); section = 'pairs'; continue
+            if line.startswith('mesh_pairs:'):
+                flush(); section = 'mesh_pairs'; continue
             if line.startswith('ground_plane:'):
                 flush(); section = 'ground'; continue
             if section == 'capsules':
-                # `  link_name:`  → new capsule; `    key: value` → field
                 indent = len(line) - len(line.lstrip(' '))
+                # `  link_name:`  (2-space indent, trailing colon) → new link
                 if indent == 2 and stripped.endswith(':'):
                     flush()
                     cur_link = stripped[:-1]
-                elif indent == 4:
+                # `    capsules:`  (4-space indent) → this link is multi-cap
+                elif indent == 4 and stripped == 'capsules:':
+                    cur_multi = []
+                # `      - p0: [...]` (6-space, list item start) → new capsule entry
+                elif indent == 6 and stripped.startswith('- '):
+                    if cur_multi is None:
+                        cur_multi = []
+                    cur_multi.append({})
+                    body = stripped[2:]
+                    if body:
+                        k, _, v = body.partition(':')
+                        v = v.strip()
+                        if k in ('p0', 'p1'):
+                            cur_multi[-1][k] = [float(x) for x in v.strip('[]').split(',')]
+                        elif k == 'radius':
+                            cur_multi[-1][k] = float(v)
+                # `        key: value` (8-space) → next field of current entry
+                elif indent == 8 and cur_multi is not None and cur_multi:
+                    k, _, v = stripped.partition(':')
+                    v = v.strip()
+                    if k in ('p0', 'p1'):
+                        cur_multi[-1][k] = [float(x) for x in v.strip('[]').split(',')]
+                    elif k == 'radius':
+                        cur_multi[-1][k] = float(v)
+                # single-capsule legacy: `    key: value` (4-space)
+                elif indent == 4 and cur_multi is None:
                     k, _, v = stripped.partition(':')
                     v = v.strip()
                     if k in ('p0', 'p1'):
@@ -185,8 +247,13 @@ def load_capsules_yaml(path):
                     inner = stripped[1:].strip().strip('[]')
                     a, b = [s.strip() for s in inner.split(',')]
                     pairs.append((a, b))
+            elif section == 'mesh_pairs':
+                if stripped.startswith('-'):
+                    inner = stripped[1:].strip().strip('[]')
+                    a, b = [s.strip() for s in inner.split(',')]
+                    mesh_pairs.append((a, b))
     flush()
-    return capsules, pairs
+    return capsules, pairs, mesh_pairs
 
 
 # ── Geometry: capsule-capsule distance ────────────────────────────────
@@ -338,7 +405,8 @@ class CollisionModel:
     entries. Computes FK once per call."""
 
     def __init__(self, capsules_yaml_path):
-        self.capsules, self.pairs = load_capsules_yaml(capsules_yaml_path)
+        self.capsules, self.pairs, self.mesh_pairs = load_capsules_yaml(
+            capsules_yaml_path)
         # Ground plane z (mm). Set `ground_z_mm = None` to disable
         # ground checks entirely (needed until URDF Y-up vs ground
         # Z-up convention is unified). Env-obstacle pairs continue to
@@ -348,6 +416,23 @@ class CollisionModel:
         # so the driver can refresh them at the low static-zone
         # update rate (they don't move at run-time by definition).
         self._env_zones = []
+        # Mesh vertex clouds for the link3↔link5 pair. Cylindrical
+        # capsules over-approximate the arm's rectangular link ends by
+        # 40–50 mm at any bent pose, which forces the pair to be
+        # DISABLED and leaves the arm's most-plausible self-collision
+        # unguarded. Sampling the actual mesh gives ground-truth
+        # distances at ~5 ms/tick and requires ~15 kB of pre-decoded
+        # vertex data per link (stride=4 subsample; 0.3 mm sampling
+        # error, well under the 30 mm stop threshold).
+        self._mesh_verts = {}
+        if self.mesh_pairs:
+            here = os.path.dirname(os.path.abspath(__file__))
+            for a, b in self.mesh_pairs:
+                for link in (a, b):
+                    if link in self._mesh_verts: continue
+                    npy = os.path.join(here, 'mesh_verts', f'{link}.npy')
+                    if os.path.exists(npy):
+                        self._mesh_verts[link] = np.load(npy).astype(np.float64)
 
     def set_env_zones(self, zones):
         """Replace the environment obstacle set. `zones` is a list of
@@ -367,49 +452,75 @@ class CollisionModel:
         return len(self._env_zones)
 
     def evaluate(self, q_deg):
-        """Returns a list of (a, b, dist_mm) sorted ascending, mixing:
-          - self-pair capsule-capsule distances (a, b are link names)
-          - self-pair capsule-ground distances (a='__ground__', b=link or vice-versa)
-          - env-obstacle capsule-OBB distances (a=link name,
-            b='zone#<id>' string)
-        Computes FK once, converts each capsule's endpoints to world
-        frame once, then dispatches each pair to its geometry."""
+        """Returns a list of (a, b, dist_mm) sorted ascending. Each
+        link can have multiple capsules (self.capsules[link] is a
+        list); for pair (A, B) we take the MIN across all cap-A ×
+        cap-B combinations. Env pairs likewise iterate every arm
+        capsule against every zone."""
         frames = fk_frames(q_deg)
-        # Precompute each real capsule's endpoints in the base frame.
+        # For each link, list of (p0_world, p1_world, radius).
         world = {}
-        for link, cap in self.capsules.items():
+        for link, caps in self.capsules.items():
             idx = LINK_NAMES.index(link)
             T = frames[idx]
-            world[link] = (
-                _transform_point(T, cap.p0_local),
-                _transform_point(T, cap.p1_local),
-                cap.radius,
-            )
+            world[link] = [
+                (_transform_point(T, c.p0_local),
+                 _transform_point(T, c.p1_local),
+                 c.radius)
+                for c in caps
+            ]
         results = []
+        # Mesh-mesh pairs (currently just link3↔link5). Compute FIRST
+        # so we can skip the capsule fallback for the same pair below.
+        mesh_pair_set = {frozenset(p) for p in self.mesh_pairs}
+        for a, b in self.mesh_pairs:
+            if a not in self._mesh_verts or b not in self._mesh_verts:
+                continue
+            Va = self._mesh_verts[a]; Vb = self._mesh_verts[b]
+            Ta = frames[LINK_NAMES.index(a)]; Tb = frames[LINK_NAMES.index(b)]
+            Wa = (Ta[:3, :3] @ Va.T).T + Ta[:3, 3]
+            Wb = (Tb[:3, :3] @ Vb.T).T + Tb[:3, 3]
+            # cKDTree query is O(N log M). Use scipy only if available;
+            # fall back to numpy broadcasting (slower but works headless).
+            try:
+                from scipy.spatial import cKDTree
+                d = float(cKDTree(Wb).query(Wa, k=1)[0].min())
+            except ImportError:
+                d2 = ((Wa[:, None, :] - Wb[None, :, :]) ** 2).sum(-1)
+                d = float(np.sqrt(d2.min()))
+            results.append((a, b, d))
         for a, b in self.pairs:
+            if frozenset({a, b}) in mesh_pair_set:
+                continue  # already handled via mesh-mesh above
             if a == '__ground__' or b == '__ground__':
                 if self.ground_z_mm is None:
-                    continue      # ground checks disabled
+                    continue
                 real = b if a == '__ground__' else a
                 if real not in world:
                     continue
-                p0, p1, r = world[real]
-                d = _capsule_ground_dist(p0, p1, r, self.ground_z_mm)
-                results.append((a, b, float(d)))
+                best = float('inf')
+                for p0, p1, r in world[real]:
+                    d = _capsule_ground_dist(p0, p1, r, self.ground_z_mm)
+                    if d < best: best = d
+                results.append((a, b, float(best)))
                 continue
             if a not in world or b not in world:
                 continue
-            a_p0, a_p1, r_a = world[a]
-            b_p0, b_p1, r_b = world[b]
-            d, _ = _capsule_capsule_dist(a_p0, a_p1, r_a, b_p0, b_p1, r_b)
-            results.append((a, b, float(d)))
-        # Env obstacles — every arm capsule vs every zone. On this arm
-        # (7 capsules) × typical 3-8 zones the cost is O(30) point-samples
-        # per OBB per capsule; measured ~1.5 ms/tick for 8 zones.
-        for link, (p0, p1, r) in world.items():
+            best = float('inf')
+            for a_p0, a_p1, r_a in world[a]:
+                for b_p0, b_p1, r_b in world[b]:
+                    d, _ = _capsule_capsule_dist(a_p0, a_p1, r_a,
+                                                 b_p0, b_p1, r_b)
+                    if d < best: best = d
+            results.append((a, b, float(best)))
+        # Env obstacles — each arm capsule vs each zone; per-link min.
+        for link, cap_list in world.items():
             for z in self._env_zones:
-                d = _capsule_obb_dist(p0, p1, r, z)
-                results.append((link, f'zone#{z.zone_id}', float(d)))
+                best = float('inf')
+                for p0, p1, r in cap_list:
+                    d = _capsule_obb_dist(p0, p1, r, z)
+                    if d < best: best = d
+                results.append((link, f'zone#{z.zone_id}', float(best)))
         results.sort(key=lambda t: t[2])
         return results
 
