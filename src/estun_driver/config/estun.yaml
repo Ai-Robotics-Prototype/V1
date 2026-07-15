@@ -52,6 +52,23 @@ estun_driver:
     # this without the joint-mode validation pass first is unsafe.
     allow_cartesian_jog: false
 
+    # ── Power write path (third gate — SEPARATE from allow_jog) ──────────
+    # /robot/power_command → enable / disable / clear_alarm. Wire verbs
+    # captured from the factory UI at :9198 (single-arm branch of
+    # useMultiarmWs): Robot/switchOn, Robot/switchOff, System/ClearError.
+    # Env override ESTUN_ALLOW_POWER=1 wins over this YAML (same precedence
+    # as ESTUN_ALLOW_JOG). Default false so a stray YAML flip alone cannot
+    # enable a live command surface.
+    #
+    # Safety invariant: nothing in this driver auto-enables. Every
+    # Robot/switchOn on the wire comes from an explicit operator gesture
+    # on /robot/power_command. There is no enable-on-startup, no
+    # enable-on-reconnect, no retry-on-failure. Disable and clear_alarm
+    # are the "safing" path — they run under the same gate but are
+    # *not* additionally gated by allow_jog: safing an arm must never
+    # be gated harder than moving it.
+    allow_power: false
+
     # Hard cap on |speed| in Robot/jog frames. Bench observations at 51%
     # produced a comfortable slow jog; 0.15 keeps a wide margin below that
     # for first-motion trials. Raise deliberately after bench validation.

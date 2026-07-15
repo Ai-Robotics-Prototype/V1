@@ -57,6 +57,16 @@ const storeDefinition = (set, get) => ({
     jog_direction: 0,
     allow_jog: false,
     allow_cartesian_jog: false,
+    // Power transition surface — read-only mirror of the driver's
+    // /estun/status. `allow_power` gates the /cmd/power endpoint; the
+    // banner uses `enabled`, `enabling`, and `alarm` to pick the label.
+    allow_power: false,
+    enabled: false,
+    enabling: false,
+    alarm: false,
+    alarm_count: 0,
+    state_code: 0,
+    state_name: '',
   },
 
   // 3D View tab's REAL-ARM jog panel visibility. Three states —
@@ -298,6 +308,22 @@ const storeDefinition = (set, get) => ({
     // Bypass zone check — operator has manually verified area is clear.
     // Speed stays at 0 until zone naturally returns to GREEN.
     get().sendCommand('estop', { active: false, override: true })
+  },
+
+  // ── Robot power (enable / disable / clear_alarm) ────────────────────
+  // Distinct from motion: transitions the servo state, not motion state.
+  // The banner's Enable / Disable / Clear-Alarm buttons all funnel here
+  // AFTER an operator confirmation dialog — no auto-callers. Every call
+  // routes through the backend's /cmd/power, which validates the action
+  // string and publishes onto /robot/power_command. The driver's
+  // allow_power gate is the real safety layer; this helper is just the
+  // transport. Returns the parsed response body (or null on error).
+  sendPowerCommand(action) {
+    if (action !== 'enable' && action !== 'disable' && action !== 'clear_alarm') {
+      get().addToast(`Unknown power action: ${action}`, 'error')
+      return Promise.resolve(null)
+    }
+    return get().sendCommand('power', { action })
   },
 
   // ---------------------------------------------------------------------------

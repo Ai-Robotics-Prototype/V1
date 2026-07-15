@@ -129,6 +129,13 @@ STATE = {
         "safety_mode": "unknown",
         "status_flag": 0,
         "moving": False,
+        "allow_power": False,
+        "enabled": False,
+        "enabling": False,
+        "alarm": False,
+        "alarm_count": 0,
+        "state_code": 0,
+        "state_name": "",
     },
     "tcp_pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     "program": {
@@ -1047,6 +1054,15 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             r["jog_direction"] = int(d.get("jog_direction", 0))
             r["allow_jog"]   = bool(d.get("allow_jog", False))
             r["allow_cartesian_jog"] = bool(d.get("allow_cartesian_jog", False))
+            # Power gate + telemetry — dashboard banner shows Enable/
+            # Disable/Clear-Alarm affordances driven by these fields.
+            r["allow_power"] = bool(d.get("allow_power", False))
+            r["enabled"]     = bool(d.get("enabled", False))
+            r["enabling"]    = bool(d.get("enabling", False))
+            r["alarm"]       = bool(d.get("alarm", False))
+            r["alarm_count"] = int(d.get("alarm_count", 0))
+            r["state_code"]  = int(d.get("state_code", 0))
+            r["state_name"]  = d.get("state_name", "")
             # Joints (rad) — only overwrite if the driver gave us real data.
             jr = d.get("joints_rad")
             if isinstance(jr, list) and len(jr) == 6:
@@ -1853,6 +1869,49 @@ if FASTAPI_AVAILABLE:
             if body.get(k) is not None: payload[k] = body[k]
         _publish_estun_jog(payload)
         return {"ok": True, "action": "hold"}
+
+    def _publish_estun_power(payload):
+        """Publish a single frame on /robot/power_command. Reliable QoS,
+        depth 5 — these are single infrequent commands, unlike jog which
+        needs best-effort/volatile. Best-effort try/except keeps the HTTP
+        call from 500-ing on a transient publisher hiccup; the driver's
+        allow_power gate is the real safety layer."""
+        if _ros_node is None:
+            return
+        try:
+            if not hasattr(_ros_node, "_estun_power_pub"):
+                _ros_node._estun_power_pub = _ros_node.create_publisher(
+                    String, "/robot/power_command", 5)
+            m = String(); m.data = json.dumps(payload)
+            _ros_node._estun_power_pub.publish(m)
+        except Exception:
+            pass
+
+    _POWER_ACTIONS = {"enable", "disable", "clear_alarm"}
+
+    @app.post("/cmd/power")
+    async def cmd_power(request: Request):
+        """Robot power transition dispatcher. Body: {"action": "enable" |
+        "disable" | "clear_alarm"}. This endpoint is a thin publisher onto
+        /robot/power_command — every safety decision (monitor_only,
+        allow_power, connection, jog-preempt on disable) is enforced in
+        the driver. Deliberately does NOT check estop or safety zone:
+        (a) disable must always be reachable to safe the arm, and
+        (b) enable is guarded by the driver's allow_power gate + the
+        operator's explicit confirmation in the UI."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        action = str(body.get("action", "")).lower()
+        if action not in _POWER_ACTIONS:
+            return JSONResponse(
+                {"error": f"unknown action {action!r}; expected one of "
+                          f"{sorted(_POWER_ACTIONS)}"},
+                status_code=400,
+            )
+        _publish_estun_power({"action": action})
+        return {"ok": True, "action": action}
 
     @app.post("/cmd/gripper")
     async def cmd_gripper(request: Request):

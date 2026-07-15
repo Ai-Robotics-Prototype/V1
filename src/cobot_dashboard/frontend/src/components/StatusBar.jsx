@@ -86,12 +86,14 @@ export default function StatusBar() {
 
       <div style={{ flex: 1 }} />
 
-      {/* Right side: version */}
+      {/* Right side: version.
+          __BUILD_ID__ is now `git describe --always --dirty` (deterministic
+          per tree state); __COMMIT__ carries the same string for backwards-
+          compat. The visible label is BUILD_ID + BUILD_TIME so a rebuild
+          on unchanged tree still emits a new footer via BUILD_TIME
+          (second precision).*/}
       <Block style={{ borderRight: 'none', borderLeft: '1px solid var(--border)', color: 'var(--text-muted)' }}>
-        {typeof __COMMIT__ !== 'undefined' ? `build ${__COMMIT__}` : 'dev'}
-        {typeof __BUILD_ID__ !== 'undefined' && (
-          <span style={{ marginLeft: 4, opacity: 0.85 }}>· {__BUILD_ID__}</span>
-        )}
+        {typeof __BUILD_ID__ !== 'undefined' ? `build ${__BUILD_ID__}` : 'dev'}
         {typeof __BUILD_TIME__ !== 'undefined' && (
           <span style={{ marginLeft: 6, opacity: 0.55 }}>{__BUILD_TIME__}</span>
         )}

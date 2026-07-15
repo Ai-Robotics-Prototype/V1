@@ -106,6 +106,11 @@ function HoldButton({
     }
   }, [onPressTick])
 
+  // Route the "release" fallback (mouse-up while pointer is OFF the button)
+  // through a window-level pointerup/mouseup listener, wired at press and
+  // torn down at stop. Reading the LATEST stop via stopRef keeps this
+  // decoupled from stop's identity churn.
+  const globalUpHandlerRef = useRef(null)
   const start = useCallback((e) => {
     if (disabled) return
     if (e && e.preventDefault) e.preventDefault()
@@ -123,6 +128,14 @@ function HoldButton({
       onPressStart?.(meta)
       if (tickTimer.current) clearInterval(tickTimer.current)
       tickTimer.current = setInterval(() => { doRefresh() }, 150)
+      // Fallback release for mouse: if the operator drags off the button
+      // and releases in dead space, neither onMouseUp nor onMouseLeave
+      // (in buttons==0 mode) fires on the button element. This global
+      // listener catches that case. Removed in stop().
+      const handler = () => stopRef.current?.()
+      globalUpHandlerRef.current = handler
+      window.addEventListener('mouseup', handler)
+      window.addEventListener('pointerup', handler)
     } else {
       // STEP: one increment per press, no interval, no hold repeat.
       onTap?.()
@@ -135,6 +148,12 @@ function HoldButton({
     if (tickTimer.current) {
       clearInterval(tickTimer.current)
       tickTimer.current = null
+    }
+    // Detach the global mouse/pointer-up fallback if we set one up.
+    if (globalUpHandlerRef.current) {
+      window.removeEventListener('mouseup', globalUpHandlerRef.current)
+      window.removeEventListener('pointerup', globalUpHandlerRef.current)
+      globalUpHandlerRef.current = null
     }
     // Abort any in-flight refresh so it releases its connection slot;
     // then send the release. Release travels on its own fresh request.
@@ -156,7 +175,22 @@ function HoldButton({
     }
   }, [jogStyle, onPressEnd])
 
-  useEffect(() => () => stop(), [stop])
+  // Fire release ONLY on real unmount, not on every stop-identity change.
+  // Why this mattered: `stop`'s useCallback deps include `onPressEnd`, and
+  // JogControls creates a fresh `(meta) => holdEnd(meta)` closure in wire()
+  // on every render. The store's /ws state stream updates `robot`/`safety`/
+  // `task` slices ~25 Hz, so JogControls re-renders ~25 Hz, so onPressEnd
+  // gets a new identity ~25 Hz, so stop got a new identity ~25 Hz, so this
+  // effect's cleanup fired ~25 Hz — sending release POSTs mid-hold.
+  // Symptom in the driver log: every "continuous hold: …" was followed
+  // ~100–200 ms later by "Robot/stopJog sent (release cmd)" (client
+  // release), NOT "hold staleness" (deadman). Look like step mode.
+  // Fix: route unmount through a ref so cleanup identity is decoupled
+  // from the per-render closure churn — the ref holds the latest stop,
+  // but the effect deps are empty so cleanup only runs on real unmount.
+  const stopRef = useRef(stop)
+  useEffect(() => { stopRef.current = stop })
+  useEffect(() => () => stopRef.current?.(), [])
 
   return (
     <button
@@ -167,7 +201,13 @@ function HoldButton({
       onMouseLeave={(e) => {
         e.currentTarget.style.background = '#fff'
         e.currentTarget.style.borderColor = '#d1d5db'
-        stop()
+        // Only end the hold if the mouse button is genuinely up. During a
+        // mouse-drag off the button the browser fires mouseleave but the
+        // press is still active — old behavior treated that as a release,
+        // cutting motion short on any twitch. Global mouseup handles the
+        // "released while off the button" case (attached below in start).
+        if (!pressed.current) return
+        if (e.buttons === 0) stop()
       }}
       onMouseEnter={(e) => {
         if (disabled) return
@@ -245,6 +285,7 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   const jogRelease     = useStore((s) => s.jogRelease)
   const jogIncrement       = useStore((s) => s.jogIncrement)
   const jogPulseCartesian  = useStore((s) => s.jogPulseCartesian)
+  const sendPowerCommand   = useStore((s) => s.sendPowerCommand)
   const jogStyle          = useStore((s) => s.jogStyle) || 'STEP'
   const setJogStyle       = useStore((s) => s.setJogStyle)
   const program           = useStore((s) => s.program) || { steps: [] }
@@ -311,18 +352,46 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
 
   // ── State banner ─────────────────────────────────────────────
   // Explicit reason surface — buttons only grey when banner is not
-  // READY. No silent disables.
+  // READY. No silent disables. `bannerAction` is a small affordance
+  // rendered inline (Enable / Disable / Clear-Alarm) so the banner
+  // itself is the control point for power transitions. Nothing here
+  // auto-fires — every action goes through a confirm dialog below.
   let bannerLevel = 'ready'
   let bannerText  = 'READY'
+  let bannerAction = null   // { kind, label, appearance }
   if (estop) {
     bannerLevel = 'error'
     bannerText  = 'E-STOP — release to jog'
   } else if (!robot.connected) {
     bannerLevel = 'error'
     bannerText  = 'DRIVER DISCONNECTED'
-  } else if (robot.mode !== 'enabled') {
+  } else if (robot.alarm) {
+    // Alarm gates enable — the controller refuses switchOn while
+    // errors are latched. Match the pendant's recovery order: Clear
+    // Alarm first, then Enable becomes offered.
+    bannerLevel = 'error'
+    bannerText  = robot.alarm_count > 1
+      ? `ALARM (${robot.alarm_count} active)`
+      : 'ALARM'
+    if (robot.allow_power) {
+      bannerAction = { kind: 'clear_alarm', label: 'Clear Alarm', appearance: 'danger' }
+    }
+  } else if (robot.enabling) {
+    // Transient state observed on the wire (state=1 "Enabling"). The
+    // banner shows this until state transitions to 2/3 (enabled) or
+    // back to 0 (failure to enable, which drops us to the disabled case).
     bannerLevel = 'warn'
-    bannerText  = 'ROBOT DISABLED — enable on pendant'
+    bannerText  = 'ENABLING…'
+  } else if (!robot.enabled) {
+    bannerLevel = 'warn'
+    bannerText  = 'ROBOT DISABLED'
+    if (robot.allow_power) {
+      bannerAction = { kind: 'enable', label: 'Enable', appearance: 'primary' }
+    } else {
+      // Match the previous message for the closed-gate case so the
+      // operator still knows the pendant fallback path.
+      bannerText = 'ROBOT DISABLED — enable on pendant'
+    }
   } else if (running) {
     const stateLabel = paused ? 'paused' : (state || 'running')
     bannerLevel = 'warn'
@@ -330,6 +399,17 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   } else if (!robot.allow_jog) {
     bannerLevel = 'warn'
     bannerText  = 'JOG GATE CLOSED — set ESTUN_ALLOW_JOG=1 on the driver'
+    // Enabled but jog closed — still offer Disable to safe the arm.
+    if (robot.allow_power) {
+      bannerAction = { kind: 'disable', label: 'Disable', appearance: 'subtle' }
+    }
+  } else {
+    // READY. Subtle Disable button on the right so the operator can
+    // safe the arm without hunting through menus. Present but not
+    // inviting: neutral colour, small target.
+    if (robot.allow_power) {
+      bannerAction = { kind: 'disable', label: 'Disable', appearance: 'subtle' }
+    }
   }
   const jogGateOk = bannerLevel === 'ready'
 
@@ -430,6 +510,34 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   })
 
   const [confirmingRun, setConfirmingRun] = useState(false)
+  // Power-transition confirmation. `kind` is 'enable' | 'disable' |
+  // 'clear_alarm'; null = no dialog open. Nothing on this component
+  // ever calls sendPowerCommand without going through this state.
+  const [pendingPower, setPendingPower] = useState(null)
+  const openPowerConfirm = useCallback((kind) => {
+    setPendingPower(kind)
+  }, [])
+  const cancelPowerConfirm = useCallback(() => {
+    setPendingPower(null)
+  }, [])
+  const confirmPowerAction = useCallback(() => {
+    const kind = pendingPower
+    setPendingPower(null)
+    if (kind) sendPowerCommand(kind)
+  }, [pendingPower, sendPowerCommand])
+  const powerCopy = pendingPower === 'enable'
+    ? { title: 'Enable robot power?',
+        body: 'Ensure the cell is clear before applying servo power.',
+        cta: 'Enable', cta_bg: '#059669', cta_color: '#fff' }
+    : pendingPower === 'disable'
+    ? { title: 'Disable robot power?',
+        body: 'Servo power will drop. Any active motion is stopped first.',
+        cta: 'Disable', cta_bg: '#B45309', cta_color: '#fff' }
+    : pendingPower === 'clear_alarm'
+    ? { title: 'Clear active alarms?',
+        body: 'Alarms will be dismissed on the controller. Enable is offered next if the alarm state clears.',
+        cta: 'Clear', cta_bg: '#B91C1C', cta_color: '#fff' }
+    : null
   const stepCount = Array.isArray(program?.steps) ? program.steps.length : 0
   const programLabel = program_name || 'program'
 
@@ -465,8 +573,80 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
                     : bannerLevel === 'warn'  ? '#FDE68A'
                     : '#FCA5A5',
         }} />
-        <span>{bannerText}</span>
+        <span style={{ flex: 1 }}>{bannerText}</span>
+        {bannerAction && (
+          <button
+            onClick={() => openPowerConfirm(bannerAction.kind)}
+            style={{
+              // Three appearances so DISABLE looks unlike ENABLE.
+              // primary — filled green (invites the transition)
+              // danger  — filled red   (only used for Clear-Alarm)
+              // subtle  — outline over the READY banner (present, not inviting)
+              background:
+                bannerAction.appearance === 'primary' ? '#059669'
+                : bannerAction.appearance === 'danger'  ? '#B91C1C'
+                :                                        'transparent',
+              color:  bannerAction.appearance === 'subtle' ? '#fff' : '#fff',
+              border: bannerAction.appearance === 'subtle'
+                ? '1px solid rgba(255,255,255,0.55)'
+                : '1px solid transparent',
+              padding: bannerAction.appearance === 'subtle' ? '2px 8px' : '3px 10px',
+              borderRadius: 6,
+              fontSize: 10, fontWeight: 700,
+              letterSpacing: '0.04em',
+              cursor: 'pointer',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {bannerAction.label}
+          </button>
+        )}
       </div>
+
+      {pendingPower && powerCopy && (
+        <div
+          onClick={cancelPowerConfirm}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 3000,
+            background: 'rgba(15,23,42,0.55)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: '#fff', borderRadius: 10, padding: 20, minWidth: 320,
+              maxWidth: 440, boxShadow: '0 20px 60px rgba(0,0,0,0.35)',
+              display: 'flex', flexDirection: 'column', gap: 14,
+            }}
+          >
+            <div style={{ fontSize: 16, fontWeight: 700, color: '#111' }}>{powerCopy.title}</div>
+            <div style={{ fontSize: 13, color: '#374151', lineHeight: 1.4 }}>{powerCopy.body}</div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button
+                onClick={cancelPowerConfirm}
+                style={{
+                  padding: '8px 14px', borderRadius: 6,
+                  background: '#F3F4F6', color: '#111827',
+                  border: '1px solid #D1D5DB', fontWeight: 600, cursor: 'pointer',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmPowerAction}
+                style={{
+                  padding: '8px 14px', borderRadius: 6,
+                  background: powerCopy.cta_bg, color: powerCopy.cta_color,
+                  border: 'none', fontWeight: 700, cursor: 'pointer',
+                }}
+              >
+                {powerCopy.cta}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
     <div style={{
       padding: containerPad, background: '#fff',

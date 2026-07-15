@@ -2,28 +2,27 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { execSync } from 'child_process'
 
-const commitHash = (() => {
-  try { return execSync('git rev-parse --short HEAD').toString().trim() }
+// Footer identity — `git describe --always --dirty` at build time. Always
+// emits SOMETHING (falls back to the short hash when no tags exist) and
+// suffixes -dirty when the working tree has uncommitted changes. This
+// replaces a random per-build nonce that had burned us as a verification
+// tell: two independent random values had shown up looking similar
+// enough to be misread as "same build". `git describe` is deterministic
+// per tree state, and __BUILD_TIME__ below (now second-precision) is the
+// per-build freshness signal — two rebuilds on the same tree share the
+// __BUILD_ID__ string but always differ on __BUILD_TIME__.
+const buildId = (() => {
+  try { return execSync('git describe --always --dirty').toString().trim() }
   catch { return 'dev' }
 })()
 
-const dirtyFlag = (() => {
-  try {
-    const s = execSync('git status --porcelain').toString().trim()
-    return s ? '-dirty' : ''
-  } catch { return '' }
-})()
+// Kept for backwards-compat with existing footer code that reads both;
+// same content as buildId now.
+const commitHash = buildId
+const dirtyFlag = ''   // buildId already carries the -dirty suffix
 
-const buildTime = new Date().toISOString().slice(0, 16).replace('T', ' ')
-
-// Build-nonce — random 7-char id, changes every `npm run build`. The
-// vite output filename already includes a content hash
-// (assets/index-<hash>.js) but that hash isn't visible from inside the
-// bundle at build time. The nonce gives the operator a per-build
-// tag visible in the footer so a rebuild is obvious even without a
-// new commit — solves the "blind footer" problem when working on
-// uncommitted code.
-const buildId = Math.random().toString(36).slice(2, 9)
+// Second-precision build time — the per-build freshness signal.
+const buildTime = new Date().toISOString().slice(0, 19).replace('T', ' ')
 
 export default defineConfig({
   plugins: [react()],

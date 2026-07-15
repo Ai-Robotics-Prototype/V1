@@ -19,9 +19,14 @@ Publishes:
   /safety/estop           std_msgs/Bool
 
 Subscribes: /estun/command, /estun/move, /estun/jog, /estun/io,
-            /robot/jog_command, /robot/io_command — ALL rejected in
-            monitor_only mode (the driver's only mode until motion is
-            explicitly gated back on).
+            /robot/jog_command, /robot/io_command, /robot/power_command —
+            ALL rejected in monitor_only mode (the driver's only mode
+            until motion is explicitly gated back on). /robot/power_command
+            has its own second gate (allow_power) independent of allow_jog:
+            power transitions are a distinct privilege from motion, and
+            *safing* the arm (disable / clear_alarm) must never be gated
+            harder than moving it — so those two work whenever allow_power
+            is open, regardless of allow_jog.
 
 Parameter sources — priority high → low:
   1. `-p key:=value` on the CLI
@@ -122,6 +127,20 @@ class EstunCodroidDriver(Node):
         # Server should already validate |delta_deg| ≤ 5°; this is belt+braces.
         self.declare_parameter('jog_increment_max_delta_deg', 5.0)
 
+        # Power write path — third gate, SEPARATE from allow_jog. Power
+        # transitions are a distinct privilege: an operator may be
+        # authorised to command motion under an already-enabled arm
+        # without also holding the key to bring the arm up in the first
+        # place, and vice-versa (safing an arm we shouldn't have brought
+        # up is always allowed to whoever has this key). monitor_only
+        # still master-gates all three commands. Env override
+        # ESTUN_ALLOW_POWER=1 wins over YAML, same precedence as
+        # allow_jog. NO code path anywhere calls enable except the
+        # explicit operator command arriving on /robot/power_command:
+        # no auto-enable-on-startup, no auto-enable-on-reconnect, no
+        # retry-on-failure.
+        self.declare_parameter('allow_power', False)
+
         # Cadence knobs.
         self.declare_parameter('recv_timeout_s', 5.0)   # matches posture.py
         self.declare_parameter('ping_on_timeout', True)
@@ -163,6 +182,13 @@ class EstunCodroidDriver(Node):
         self._joint_limit_margin_deg = float(self.get_parameter('joint_limit_margin_deg').value)
         self._jog_inc_max_delta_deg = float(self.get_parameter('jog_increment_max_delta_deg').value)
 
+        self._allow_power = bool(self.get_parameter('allow_power').value)
+        self._allow_power_source = 'param'
+        env_power = os.environ.get('ESTUN_ALLOW_POWER')
+        if env_power is not None:
+            self._allow_power = env_power.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._allow_power_source = 'ESTUN_ALLOW_POWER'
+
         # Env override — ALWAYS wins so systemd can retarget without rebuild.
         env_ip = os.environ.get('ESTUN_ROBOT_IP')
         env_port = os.environ.get('ESTUN_ROBOT_PORT')
@@ -189,10 +215,22 @@ class EstunCodroidDriver(Node):
         self._joint_rad = [0.0] * 6
         self._tcp_mm    = [0.0] * 6   # x,y,z (mm), a,b,c (deg, fixed-XYZ)
         self._tcp_m     = [0.0] * 6   # x,y,z (m),  a,b,c (rad)
-        self._state_code = -1         # RobotStatus.state; 2 == enabled
+        # RobotStatus.state observed values (2026-07-14 logs):
+        #   0 = Disabled    1 = Enabling (transient)
+        #   2 = Enabled     3 = Enabled (sub-state, still enabled)
+        # 'enabled' is state ∈ {2, 3}; 'enabling' is state == 1 (used by
+        # the dashboard banner for the "ENABLING…" transition state).
+        self._state_code = -1
+        self._state_name = ''
         self._enabled    = False
+        self._enabling   = False
         self._is_estop   = False
         self._is_moving  = False
+        # Alarm mirror. publish/Error carries db as a list of active
+        # alarms — empty list = no alarms, non-empty = at least one
+        # active. Populated by _on_error; consumed by the mode/status
+        # blob so the dashboard banner can show ALARM before Enable.
+        self._alarms     = []
         self._last_posture_ts = 0.0
         self._last_status_ts  = 0.0
         self._last_disabled_log = 0.0
@@ -290,6 +328,10 @@ class EstunCodroidDriver(Node):
         )
         self.create_subscription(String, '/robot/jog_command',  self._on_jog_command,  _jog_qos)
         self.create_subscription(String, '/robot/io_command',   self._on_write_reject, 10)
+        # Power transitions — one-shot commands (enable/disable/clear_alarm).
+        # Reliable QoS, small depth: these are single infrequent user gestures,
+        # not the ephemeral refresh stream that jog is.
+        self.create_subscription(String, '/robot/power_command', self._on_power_command, 5)
 
         # ── Timers ─────────────────────────────────────────────
         self._mode_timer    = self.create_timer(1.0, self._publish_mode)
@@ -320,6 +362,19 @@ class EstunCodroidDriver(Node):
             self.get_logger().warn(
                 'monitor_only=false but allow_jog=false — jog path still '
                 'gated; set ESTUN_ALLOW_JOG=1 or allow_jog:true in YAML to open it.')
+        if self._monitor_only:
+            pass  # already covered by the monitor_only warn above
+        elif self._allow_power:
+            self.get_logger().warn(
+                f'POWER WRITE PATH ENABLED — enable/disable/clear_alarm on '
+                f'/robot/power_command will emit Robot/switchOn, Robot/switchOff, '
+                f'and System/ClearError (source: {self._allow_power_source}). '
+                f'No code path auto-enables — every enable requires an explicit '
+                f'operator command.')
+        else:
+            self.get_logger().warn(
+                'monitor_only=false but allow_power=false — power write path '
+                'still gated; set ESTUN_ALLOW_POWER=1 or allow_power:true in YAML.')
         self._publish_mode()
 
     # ── WS raw log ────────────────────────────────────────
@@ -379,14 +434,97 @@ class EstunCodroidDriver(Node):
 
     def _on_write_reject(self, msg):
         # Catch-all reject for every write topic OTHER than /robot/jog_command
-        # (which has _on_jog_command). monitor_only closes the outer gate;
-        # no non-jog write paths are implemented on this branch regardless.
+        # and /robot/power_command (each has its own handler). monitor_only
+        # closes the outer gate; no other write paths are implemented on
+        # this branch regardless.
         family = 'write'
         if self._monitor_only:
             self._reject(family, 'monitor_only active',
                          extra={'payload': msg.data[:200]})
             return
-        self._reject(family, 'non-jog write paths not implemented on this branch')
+        self._reject(family, 'non-jog/power write paths not implemented on this branch')
+
+    # ── Power write path (enable / disable / clear_alarm) ──────────────
+
+    # Captured verbs (single-arm S10-140; see PHASE 0 report):
+    #   enable       →  {"ty": "Robot/switchOn"}
+    #   disable      →  {"ty": "Robot/switchOff"}
+    #   clear_alarm  →  {"ty": "System/ClearError"}
+    # These are the "isarm==false" branches from useMultiarmWs — the
+    # multi-arm shapes ({ty:"RobotCommand/..."} with a db array) do not
+    # apply to this controller.
+    _POWER_FRAMES = {
+        'enable':      {'ty': 'Robot/switchOn'},
+        'disable':     {'ty': 'Robot/switchOff'},
+        'clear_alarm': {'ty': 'System/ClearError'},
+    }
+
+    def _on_power_command(self, msg):
+        """Incoming /robot/power_command JSON: {"action": "enable" | "disable" |
+        "clear_alarm"}.  Each is a one-shot with a fresh nonce.
+
+        Gate matrix (monitor_only is the outer master gate on everything):
+          - enable       : monitor_only=false AND allow_power=true
+          - disable      : monitor_only=false AND allow_power=true
+          - clear_alarm  : monitor_only=false AND allow_power=true
+        Safing (disable, clear_alarm) is intentionally NOT additionally
+        gated by allow_jog — an operator with jog closed but power open
+        must still be able to bring an unexpectedly-enabled arm down and
+        clear an alarm. Enable is the one command with no fallback path.
+
+        Safety invariants (see module docstring):
+          1. This function is the ONLY place that sends Robot/switchOn.
+             No retry, no auto-enable-on-startup, no auto-enable-on-reconnect.
+          2. Disable/clear_alarm reach the wire under the same gate;
+             they are never rejected on jog-gate state.
+          3. If a jog is active when disable arrives, stopJog first,
+             then Robot/switchOff.
+        """
+        family = 'power'
+        if self._monitor_only:
+            self._reject(family, 'monitor_only active',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._allow_power:
+            self._reject(family, 'allow_power gate closed',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._connected:
+            self._reject(family, 'ws not connected')
+            return
+
+        try:
+            d = json.loads(msg.data)
+        except Exception as e:
+            self._reject(family, f'invalid JSON: {e}')
+            return
+
+        action = str(d.get('action', '')).lower()
+        frame_tmpl = self._POWER_FRAMES.get(action)
+        if frame_tmpl is None:
+            self._reject(family, f'unknown action {action!r} '
+                                 f'(expected enable/disable/clear_alarm)')
+            return
+
+        # Invariant #3: safe motion before the disable frame reaches
+        # the wire. stopJog is idempotent (no-op if no jog active).
+        if action == 'disable':
+            self._stop_jog(reason='disable command')
+
+        frame = dict(frame_tmpl)
+        frame['id'] = self._new_nonce()
+        try:
+            if not self._send(frame):
+                self._reject(family, 'send returned False',
+                             extra={'action': action})
+                return
+        except Exception as e:
+            self.get_logger().warn(f'Robot/{action} send failed: {e}')
+            self._reject(family, f'send raised: {e}', extra={'action': action})
+            return
+        self.get_logger().info(
+            f'power {action}: {frame["ty"]} sent (id={frame["id"]}) — '
+            f'state before={self._state_code}({self._state_name!r})')
 
     # ── Jog write path ─────────────────────────────────────────
 
@@ -1020,6 +1158,8 @@ class EstunCodroidDriver(Node):
             'allow_jog_source': self._allow_jog_source,
             'allow_cartesian_jog': self._allow_cartesian_jog,
             'allow_cart_source': self._allow_cart_source,
+            'allow_power':    self._allow_power,
+            'allow_power_source': self._allow_power_source,
             'jog_speed_cap':  self._jog_speed_cap,
             'jog_heartbeat_s': self._jog_hb_s,
             'jog_freshness_s': self._jog_freshness_s,
@@ -1037,7 +1177,11 @@ class EstunCodroidDriver(Node):
             'ip_source':      self._ip_source,
             'connected':      self._connected,
             'enabled':        self._enabled,
+            'enabling':       self._enabling,
             'state_code':     self._state_code,
+            'state_name':     self._state_name,
+            'alarm':          len(self._alarms) > 0,
+            'alarm_count':    len(self._alarms),
             'last_posture_age_s': (time.time() - self._last_posture_ts) if self._last_posture_ts else None,
             'last_status_age_s':  (time.time() - self._last_status_ts)  if self._last_status_ts  else None,
         }
@@ -1168,9 +1312,19 @@ class EstunCodroidDriver(Node):
             self._on_posture(db)
         elif topic == 'RobotStatus':
             self._on_status(db)
-        # Other topics (WebCommand, ProjectState, Error, RobotCoordinate,
+        elif topic == 'Error':
+            self._on_error(db)
+        # Other topics (WebCommand, ProjectState, RobotCoordinate,
         # ProjectStatus, web) are captured in the raw log but not
         # otherwise processed in this telemetry mirror.
+
+    def _on_error(self, db):
+        """publish/Error — db is a list of active alarms (empty when none).
+        Mirror the count and the raw list into telemetry so the dashboard
+        banner can show 'ALARM — [Clear Alarm]' before offering Enable."""
+        if isinstance(db, list):
+            self._alarms = db
+            self._publish_status_blob()
 
     def _on_posture(self, db):
         """publish/RobotPosture — db.joint[6] (deg), db.end {x,y,z mm, a,b,c deg}."""
@@ -1228,8 +1382,13 @@ class EstunCodroidDriver(Node):
         except Exception:
             state_int = -1
         self._state_code = state_int
+        self._state_name = str(db.get('stateName', ''))
         was_enabled = self._enabled
-        self._enabled = (state_int == 2)
+        # Both state 2 ("Enabled") and state 3 (sub-state, still enabled)
+        # are treated as enabled. state 1 is "Enabling" — the transient
+        # that the dashboard banner uses to show ENABLING…
+        self._enabled  = (state_int in (2, 3))
+        self._enabling = (state_int == 1)
         self._last_status_ts = time.time()
 
         # Best-effort status field parsing — unknown fields go through
@@ -1246,9 +1405,13 @@ class EstunCodroidDriver(Node):
         m = Bool(); m.data = self._enabled
         self._pub_enabled.publish(m)
         mode_s = String()
-        # Map the state code to something human — 2==enabled, others
-        # collectively 'disabled' until we've documented the full set.
-        mode_s.data = 'enabled' if self._enabled else f'disabled(state={state_int})'
+        # State-code map (observed): 0=Disabled 1=Enabling 2/3=Enabled.
+        if self._enabled:
+            mode_s.data = 'enabled'
+        elif self._enabling:
+            mode_s.data = 'enabling'
+        else:
+            mode_s.data = f'disabled(state={state_int})'
         self._pub_robot_mode.publish(mode_s)
 
         est = Bool(); est.data = self._is_estop
@@ -1269,14 +1432,26 @@ class EstunCodroidDriver(Node):
         self._publish_status_blob()
 
     def _publish_status_blob(self):
+        if self._enabled:
+            robot_mode = 'enabled'
+        elif self._enabling:
+            robot_mode = 'enabling'
+        else:
+            robot_mode = f'disabled(state={self._state_code})'
         blob = {
             'connected':     self._connected,
-            'robot_mode':    'enabled' if self._enabled else f'disabled(state={self._state_code})',
+            'robot_mode':    robot_mode,
             'safety_mode':   'estop' if self._is_estop else 'normal',
             'status_flag':   self._state_code,
+            'state_code':    self._state_code,
+            'state_name':    self._state_name,
             'estop':         self._is_estop,
             'moving':        self._is_moving,
             'enabled':       self._enabled,
+            'enabling':      self._enabling,
+            'alarm':         len(self._alarms) > 0,
+            'alarm_count':   len(self._alarms),
+            'allow_power':   self._allow_power,
             'joints_deg':    list(self._joint_deg),
             'joints_rad':    list(self._joint_rad),
             'tcp_mm':        list(self._tcp_mm),
