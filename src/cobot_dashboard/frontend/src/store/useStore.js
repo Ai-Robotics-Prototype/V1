@@ -67,7 +67,65 @@ const storeDefinition = (set, get) => ({
     alarm_count: 0,
     state_code: 0,
     state_name: '',
+    // Structured active alarm from the controller. Shape (or null):
+    //   {severity: int, code: int, ts: float, text: string}
+    // Banner interprets `code` to pick recovery copy — 2002 joint-limit
+    // is the operator's most common lockout.
+    active_alarm: null,
+    // Most recent driver-side stop reason string (from _stop_jog_locked).
+    // Rendered as a transient toast/banner line while last_stop_ts is
+    // recent (see JogControls). Empty until the first stop.
+    last_stop_reason: '',
+    last_stop_ts: 0,
+    // Per-joint limit evaluation — one entry per joint, driver-side.
+    // Each: {joint, current_deg, limit_deg, margin_deg, out_of_range,
+    //        near_limit, headroom_deg}. Populated by /estun/status.
+    joint_limits: [],
+    // Self-collision guard mirror. `collision_pair` is [linkA, linkB]
+    // when any capsule pair is under `collision_warn_mm`; the twin uses
+    // it to tint those two links (amber ≤ warn, red ≤ stop). Values
+    // update live at the same cadence as the state broadcast.
+    collision_enabled: false,
+    collision_pair: null,
+    collision_min_mm: null,
+    collision_warn_mm: 80.0,
+    collision_stop_mm: 30.0,
+    collision_warning: false,
+    // Environment (static-obstacle) telemetry — separate from
+    // self-collision because the escape popup is env-specific
+    // (self-collision hands off to Joint mode / open-the-pose copy).
+    env_zone_count: 0,
+    env_pair: null,          // [link, "zone#<id>"] or null
+    env_min_mm: null,
+    env_warn_mm: 80.0,
+    env_stop_mm: 30.0,
+    // Driver-computed escape directions when in the warn zone.
+    // Each: {joint, direction, projected_mm, current_mm}.
+    env_escape_dirs: [],
+    // Unified guard state — used by the guard popup for ANY collision
+    // kind (self / ground / env). Driver publishes whichever pair is
+    // closest into these keys with a `guard_kind` discriminator.
+    guard_active: false,
+    guard_kind: null,          // 'self' | 'ground' | 'env' | null
+    guard_pair: null,
+    guard_min_mm: null,
+    guard_warn_mm: 80.0,
+    guard_stop_mm: 30.0,
+    guard_escapes: [],
+    ground_z_mm: -300.0,
   },
+
+  // Alarm recovery modal UI state — the modal auto-opens whenever an
+  // alarm or out-of-range condition arises (see AlarmRecoveryModal).
+  // The operator can minimize it to see the 3D twin behind; minimize
+  // sets `alarmModalMinimized: true` and the banner grows a "Recovery
+  // guide" button to re-open. Minimize is the ONLY way to close while
+  // the condition persists — full-close only happens automatically
+  // after a successful enable (2 s READY confirmation).
+  // Reset to false on every fresh alarm transition so the modal
+  // always demands attention when something new arrives.
+  alarmModalMinimized: false,
+  setAlarmModalMinimized(v) { set({ alarmModalMinimized: !!v }) },
 
   // 3D View tab's REAL-ARM jog panel visibility. Three states —
   // 'MINIMIZED' shows a dockable pill, 'NORMAL' shows the panel
@@ -323,6 +381,13 @@ const storeDefinition = (set, get) => ({
       get().addToast(`Unknown power action: ${action}`, 'error')
       return Promise.resolve(null)
     }
+    // WS-first, HTTP fallback — mirror the jog transport. Power gestures
+    // are already gated by a confirmation dialog and are infrequent, so
+    // either path is fine; WS eliminates handshake cost during degraded
+    // dashboards.
+    if (get()._sendJogWS('power', { action })) {
+      return Promise.resolve({ ok: true, action, transport: 'ws' })
+    }
     return get().sendCommand('power', { action })
   },
 
@@ -380,12 +445,49 @@ const storeDefinition = (set, get) => ({
   // (monitor_only, allow_jog); a spurious hold under a closed gate
   // becomes a rejection log line rather than a UI-side warning.
 
-  // Low-level jog POST — abort-friendly, no UI toast on abort.
-  // sendCommand is the wrong tool for hold-jog: it sets
-  // pendingCommand + toasts on error, both of which fire at 10 Hz and
-  // would spam the UI. This helper is used only by hold/release/pulse/
-  // increment paths.
+  // Send a jog frame — WS-first, HTTP fallback. When the state WebSocket
+  // is OPEN, jog holds/refreshes/releases ride the persistent channel:
+  //   - no per-request TLS handshake / TCP connection cost (dashboard
+  //     server's degraded event loop was pushing HTTP POST latency past
+  //     the 300 ms driver freshness deadman — this cuts that path out),
+  //   - ordered delivery (HTTP/1.1 parallel connections can reorder;
+  //     seq=2-before-seq=1 was showing up in the driver log),
+  //   - no in-flight promise to hang, so the doRefresh coalesce guard
+  //     never trips on the WS path.
+  // When the WS is not connected (initial page load / reconnect / server
+  // restart), we fall back to fetch — the driver-side deadman is the
+  // ultimate stop if the fallback stalls.
+  // endpoint ∈ {'jog', 'jog_cartesian', 'power'}. Returns true if a send
+  // was dispatched (WS or HTTP), false only when the WS is closed and
+  // the HTTP fetch also throws — best-effort, no toasts, no retries.
+  _sendJogWS(endpoint, body, meta = {}) {
+    const ws = get()._stateWs
+    if (!ws || ws.readyState !== 1 /* OPEN */) return false
+    const { hold_id, seq, client_ts_ms } = meta
+    const payload = { ...body }
+    if (hold_id != null)      payload.hold_id = hold_id
+    if (seq != null)          payload.seq = seq
+    if (client_ts_ms != null) payload.client_ts_ms = client_ts_ms
+    const type = endpoint === 'jog_cartesian' ? 'jog_cartesian'
+               : endpoint === 'power'         ? 'power'
+               :                                'jog'
+    try {
+      ws.send(JSON.stringify({ type, payload }))
+      return true
+    } catch {
+      return false
+    }
+  },
+
+  // Low-level jog transport — WS first, HTTP fallback. No UI toast on
+  // failure: refresh cadence is 10 Hz and would spam.
   async _postJog(endpoint, body, meta = {}) {
+    // WS fast path.
+    if (get()._sendJogWS(endpoint, body, meta)) return true
+    // HTTP fallback. Coalescing (skip-if-in-flight) lives one layer up
+    // in HoldButton.doRefresh; the previous 400 ms abort-and-refire
+    // self-heal was killing slow-but-viable requests and has been
+    // removed there — a slow fallback fetch is now allowed to complete.
     const { signal, hold_id, seq, client_ts_ms } = meta
     const fullBody = { ...body }
     if (hold_id != null)      fullBody.hold_id = hold_id
@@ -398,12 +500,9 @@ const storeDefinition = (set, get) => ({
         body: JSON.stringify(fullBody),
         signal,
       })
-      // We don't need the JSON body for jog messages, but consume it
-      // so the connection can be reused.
       try { await res.text() } catch { /* nop */ }
       return res.ok
     } catch (err) {
-      // AbortError on release-abort is expected and NOT an error.
       if (err && (err.name === 'AbortError' || err.code === 20)) return false
       return false
     }

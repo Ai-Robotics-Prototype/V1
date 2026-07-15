@@ -90,3 +90,25 @@ estun_driver:
     # One rotated file per driver start. Ground truth for the v2.3
     # protocol shapes — leave on during bring-up.
     ws_log_raw: true
+
+    # ── Collision guard: ground plane ─────────────────────────────
+    # z of the PHYSICAL floor in the driver's base_link frame (mm).
+    # base_link IS the base flange in the URDF — z=0 there is the
+    # flange plane, NOT the floor. A mounted arm sits on some stand;
+    # measure the stand height and set this to  -stand_height_mm.
+    # Default -300 assumes a common 300 mm cell stand. Fit an exact
+    # value with scripts/fit_ground_plane.py against the live LiDAR
+    # cloud when the cell is finalised.
+    # 2026-07-15 wedge: the old default (0) had the model reporting
+    # normal poses as 87 mm from the "ground" and tripping the guard.
+    ground_z_mm: -300.0
+
+    # Collision guard escape / fallback speed caps. When the guard is
+    # in the warn zone and the operator jogs in an OPENING direction,
+    # commanded speed is clamped to escape_speed_frac. When the model
+    # can find NO single-axis escape (deep pocket or bad model), the
+    # driver still permits joint-mode jog at fallback_speed_frac with
+    # a loud log line — the operator has an e-stop and outranks a
+    # geometry model that might be wrong.
+    collision_escape_speed_frac:   0.06
+    collision_fallback_speed_frac: 0.03

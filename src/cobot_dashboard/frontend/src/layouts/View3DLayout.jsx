@@ -237,6 +237,7 @@ export default function View3DLayout() {
                 AT LIMIT
               </div>
             )}
+            <MinClearanceReadout />
             <JointJogPanel
               jogApi={jogApi}
               cartesianMode={cartMode}
@@ -260,6 +261,45 @@ export default function View3DLayout() {
           </RealArmChrome>
         )}
       </div>
+    </div>
+  )
+}
+
+// Live min-clearance chip — appears in the 3D View top-left whenever
+// the driver reports any capsule pair closer than 2× warn distance.
+// Amber ≤ warn, red ≤ stop. Renders under the AT-LIMIT chip so both
+// stay visible when they co-occur.
+function MinClearanceReadout() {
+  const pair    = useStore((s) => s.robot?.collision_pair)
+  const dist    = useStore((s) => s.robot?.collision_min_mm)
+  const warn    = useStore((s) => s.robot?.collision_warn_mm) || 80
+  const stop    = useStore((s) => s.robot?.collision_stop_mm) || 30
+  const enabled = useStore((s) => s.robot?.collision_enabled)
+  if (!enabled || dist == null || !pair) return null
+  if (dist > 2 * warn) return null   // only show when actually close
+  const level = dist <= stop ? 'stop' : (dist <= warn ? 'warn' : 'near')
+  const bg = level === 'stop' ? '#B91C1C'
+           : level === 'warn' ? '#D97706'
+           :                    '#0f172a'
+  const label = level === 'stop' ? 'CONTACT'
+              : level === 'warn' ? 'CLEARANCE'
+              :                    'clearance'
+  const shorten = (n) => n
+    .replace('_shoulder', '').replace('_upper_arm', '')
+    .replace('_forearm',  '').replace('_wrist1',    '')
+    .replace('_wrist2',   '').replace('_flange',    '')
+    .replace('__ground__', 'ground')
+  return (
+    <div style={{
+      position: 'absolute', top: 8, left: 8, zIndex: 20,
+      padding: '4px 10px', borderRadius: 4,
+      background: bg, color: '#fff',
+      fontSize: 12, fontFamily: 'var(--font-mono, monospace)',
+      fontWeight: 700, letterSpacing: 0.5,
+      boxShadow: '0 1px 4px rgba(0,0,0,0.35)',
+      pointerEvents: 'none',
+    }}>
+      {label}: {dist.toFixed(0)} mm  {shorten(pair[0])}↔{shorten(pair[1])}
     </div>
   )
 }

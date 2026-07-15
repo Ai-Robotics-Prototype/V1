@@ -62,32 +62,28 @@ function HoldButton({
   // we abort it before firing release — the release never queues
   // behind refreshes.
   const inFlightAbort  = useRef(null)
-  // Coalesce guard: if the previous refresh POST is still in flight,
-  // skip this tick. Caps the pending queue at 1 regardless of network
-  // conditions, so a slow HTTPS pool can't build a backlog.
-  // A stuck fetch could otherwise starve the refresh stream forever
-  // (driver's 300 ms deadman would fire mid-hold). Self-heal: if the
-  // in-flight fetch is older than 400 ms, abort it and issue a fresh
-  // request on the same tick.
+  // Coalesce guard: skip this tick if a previous refresh is still in
+  // flight. WS transport (the fast path) sends synchronously and never
+  // leaves this true; the guard only ever fires on HTTP fallback where
+  // it keeps the pending queue capped at 1 so a slow HTTPS pool can't
+  // stack a backlog. The old 400 ms abort-and-refire self-heal has been
+  // removed — a slow-but-viable HTTP fetch is now allowed to complete,
+  // and the driver's 300 ms freshness deadman is the safety backstop.
   const refreshInFlight = useRef(false)
   const refreshStartMs  = useRef(0)
-  const HUNG_FETCH_ABORT_MS = 400
 
   const nextSeq = () => { seqRef.current += 1; return seqRef.current }
   const newHoldId = () => Math.random().toString(36).slice(2, 12)
 
   const doRefresh = useCallback(async () => {
     if (!pressed.current || !holdIdRef.current) return
-    if (refreshInFlight.current) {
-      // Coalesce (do not stack) — unless the current fetch is hung.
-      const age = Date.now() - refreshStartMs.current
-      if (age < HUNG_FETCH_ABORT_MS) return
-      // Self-heal: abort the stuck one and fall through to fire fresh.
-      if (inFlightAbort.current) {
-        try { inFlightAbort.current.abort() } catch { /* nop */ }
-      }
-      refreshInFlight.current = false
-    }
+    // Coalesce: skip this tick if a previous refresh is still in flight.
+    // Only ever true on the HTTP fallback path — the WS path returns
+    // synchronously and never leaves refreshInFlight true. The previous
+    // 400 ms abort-and-refire self-heal was removed: it was killing
+    // slow-but-viable HTTP requests on a degraded dashboard, and the
+    // driver's 300 ms freshness deadman is the correct final backstop.
+    if (refreshInFlight.current) return
     refreshInFlight.current = true
     refreshStartMs.current = Date.now()
     const ctrl = new AbortController()
@@ -99,7 +95,7 @@ function HoldButton({
     }
     try {
       await onPressTick?.(meta)
-    } catch { /* aborted or network failure — driver's deadman handles it */ }
+    } catch { /* network failure — driver's deadman handles it */ }
     finally {
       refreshInFlight.current = false
       if (inFlightAbort.current === ctrl) inFlightAbort.current = null
@@ -127,7 +123,12 @@ function HoldButton({
       // there's nothing to coalesce against.
       onPressStart?.(meta)
       if (tickTimer.current) clearInterval(tickTimer.current)
-      tickTimer.current = setInterval(() => { doRefresh() }, 150)
+      // 100 ms cadence: driver's 300 ms deadman gets 3× headroom, so a
+      // single dropped/late frame no longer trips staleness. WS transport
+      // makes this cheap — each refresh is one send() on an already-open
+      // socket. HTTP fallback uses the same cadence; the coalesce guard
+      // one layer above skips ticks while a previous fetch is in flight.
+      tickTimer.current = setInterval(() => { doRefresh() }, 100)
       // Fallback release for mouse: if the operator drags off the button
       // and releases in dead space, neither onMouseUp nor onMouseLeave
       // (in buttons==0 mode) fires on the button element. This global
@@ -286,6 +287,13 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   const jogIncrement       = useStore((s) => s.jogIncrement)
   const jogPulseCartesian  = useStore((s) => s.jogPulseCartesian)
   const sendPowerCommand   = useStore((s) => s.sendPowerCommand)
+  // Banner is the MINIMIZED form of AlarmRecoveryModal. When the modal
+  // is minimized AND a condition still exists, the banner grows a
+  // "Recovery guide" chip that flips minimized back to false to
+  // reopen the modal. Single source of truth: same store slice as the
+  // modal reads.
+  const alarmModalMinimized = useStore((s) => s.alarmModalMinimized)
+  const setAlarmModalMinimized = useStore((s) => s.setAlarmModalMinimized)
   const jogStyle          = useStore((s) => s.jogStyle) || 'STEP'
   const setJogStyle       = useStore((s) => s.setJogStyle)
   const program           = useStore((s) => s.program) || { steps: [] }
@@ -298,6 +306,8 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   const task           = useStore((s) => s.task)
   const safety         = useStore((s) => s.safety)
   const robot          = useStore((s) => s.robot) || {}
+  // Joint angles for the alarm banner's "J<n> is at <deg>°" recovery line.
+  const joints         = useStore((s) => s.joints) || { positions: [] }
 
   // Default 'cartesian' matches the Program tab so operators see the
   // same layout (XYZ + Height + Rotation d-pads) on both tabs. If the
@@ -350,6 +360,138 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   const { estop } = safety
   const { running, paused, state, program_step, program_total, program_name } = task
 
+  // ── Alarm + stop-reason interpreters ──────────────────────────────
+  // Map raw driver telemetry to actionable operator text. Codes are
+  // from wire-captured publish/Error entries (see driver's _on_error
+  // docstring for the full observed list).
+  //
+  // Joint-limit lockout: text pattern "Joint<n> exceeded limit."
+  //   Recovery is not "clear the alarm"; the controller refuses to clear
+  //   while the joint is still past limits. Operator must physically
+  //   jog it back toward center on the factory UI first.
+  // Emergency stop: recovery is the physical E-stop button reset,
+  //   then Clear Alarm becomes effective.
+  // Singular position: controller stalled at a kinematic singularity;
+  //   operator has to jog away from the pose. Clear Alarm won't help
+  //   until pose changes.
+  // Servo error / power loss: generic reset via Clear Alarm; the
+  //   operator likely needs to power-cycle if the cause is persistent.
+  const alarm = robot.active_alarm || null
+  const jointNumFromText = (txt) => {
+    const m = /Joint\s*(\d)/i.exec(txt || '')
+    return m ? parseInt(m[1], 10) : null
+  }
+  const jointLiveDeg = (jointNum) => {
+    // /joint_states is 6-long, radians. Match by 1-based joint number.
+    const positions = joints?.positions || []
+    if (!jointNum || jointNum < 1 || jointNum > positions.length) return null
+    return (positions[jointNum - 1] * 180 / Math.PI)
+  }
+  // Live joint-limit recovery data. If ANY joint reports out_of_range
+  // in the driver's per-joint evaluation, we take over the banner with
+  // a live recovery guide — direction, target, progress. This lets the
+  // operator watch the arm come back into range in real time (posture
+  // still streams during alarm state) instead of guessing.
+  const outOfRangeJoints = (robot.joint_limits || []).filter((j) => j?.out_of_range)
+  const anyOutOfRange = outOfRangeJoints.length > 0
+  const recoveryGuideText = (() => {
+    if (!anyOutOfRange) return null
+    const lines = outOfRangeJoints.map((j) => {
+      const dir = j.current_deg > 0 ? 'NEGATIVE' : 'POSITIVE'
+      const targetInside = (j.limit_deg - 10).toFixed(0)
+      return (
+        `J${j.joint} PAST LIMIT: ${j.current_deg.toFixed(1)}° `
+        + `(limit ±${j.limit_deg.toFixed(0)}°)\n`
+        + `→ On the factory UI (Manual → Move → Joint), jog J${j.joint} `
+        + `${dir} until below ${targetInside}°. `
+        + `Live: ${j.current_deg.toFixed(1)}°`
+      )
+    })
+    return lines.join('\n\n')
+      + '\n\nOur jog is unavailable until the alarm clears — this step uses the pendant/factory UI by controller design.'
+  })()
+  const alarmCopy = (() => {
+    if (!alarm) return null
+    const { code, text } = alarm
+    const jn = jointNumFromText(text)
+    // 2002 joint-limit alarms hand off to the live recovery guide when
+    // we can see the offending joint is still out_of_range — otherwise
+    // fall back to the static copy.
+    if (code === 2002 && jn != null) {
+      const deg = jointLiveDeg(jn)
+      const degStr = deg != null ? `${deg.toFixed(1)}°` : 'past its limit'
+      return {
+        headline: `ALARM: J${jn} exceeded limit`,
+        recovery: `J${jn} is at ${degStr}. Clear is blocked while the joint is past its limit — use the factory UI (Manual → Jog) to move J${jn} toward center, then Clear Alarm → Enable.`,
+      }
+    }
+    if (code === 2006 || code === 13046) {
+      return {
+        headline: `ALARM: Emergency stop`,
+        recovery: `Reset the physical E-stop button on the pendant, then Clear Alarm → Enable.`,
+      }
+    }
+    if (code === 2023) {
+      return {
+        headline: `ALARM: Singular position`,
+        recovery: `The arm is at a kinematic singularity. Jog away from this pose on the factory UI first — Clear Alarm won't help until the pose changes.`,
+      }
+    }
+    if (code === 9012) {
+      return {
+        headline: `ALARM: Power disconnection`,
+        recovery: `Servo power was lost. Check the E-stop chain and pendant power, then Clear Alarm → Enable.`,
+      }
+    }
+    // Fallback for any code we haven't specifically mapped — surface
+    // the controller's own text verbatim and let the operator interpret.
+    return {
+      headline: `ALARM ${code ?? ''}: ${text || 'unknown'}`.trim(),
+      recovery: 'Try Clear Alarm; if it re-appears immediately, the underlying condition is still active — check the pendant.',
+    }
+  })()
+
+  // Recent driver-side jog stop reason. Rendered as a sub-line under
+  // the banner for a few seconds after last_stop_ts so the operator
+  // can see WHY motion stopped, not just that it did. Silent for
+  // routine "release cmd" and "increment complete" — those are the
+  // operator's own gestures ending normally.
+  const nowSec = Date.now() / 1000
+  const stopAgeS = robot.last_stop_ts ? (nowSec - robot.last_stop_ts) : Infinity
+  const stopReasonRaw = robot.last_stop_reason || ''
+  const routineStop = /^release cmd|^increment complete|^increment expiry|^node shutdown|^ws disconnect/i.test(stopReasonRaw)
+  const showStopReason = stopReasonRaw && stopAgeS < 6 && !routineStop
+  const stopReasonHuman = (() => {
+    if (!showStopReason) return null
+    // "hold staleness 0.31s"  → connection jitter
+    if (/^hold staleness/i.test(stopReasonRaw)) {
+      return 'Connection jitter — release and re-press to continue.'
+    }
+    // "limit approach J3 at +198.20° (+198.00°)" → limit approach
+    let m = /limit approach J(\d) at ([+-]?[\d.]+)°/i.exec(stopReasonRaw)
+    if (m) {
+      return `J${m[1]} near ${m[2]}° limit — jog the other direction.`
+    }
+    // "cart limit approach J2 at +198.20° (|>198.00°|)" (cartesian)
+    m = /cart limit approach J(\d) at ([+-]?[\d.]+)°/i.exec(stopReasonRaw)
+    if (m) {
+      return `J${m[1]} near limit — cartesian jog blocked; jog joints back first.`
+    }
+    // "clamp: J3 target +170.50° exceeds ±164.00° ..."
+    m = /clamp: J(\d) target/i.exec(stopReasonRaw)
+    if (m) {
+      return `J${m[1]} would exceed its safety limit — pick a smaller step or the other direction.`
+    }
+    // "increment freshness fallback 0.35s" — backup stop, still connection-ish
+    if (/freshness fallback/i.test(stopReasonRaw)) {
+      return 'Connection jitter (backup stop) — release and re-press.'
+    }
+    if (/send failed|hb send failed|send returned False/i.test(stopReasonRaw)) {
+      return 'Controller send failed — connection dropped or busy; retry the jog.'
+    }
+    return `Jog stopped: ${stopReasonRaw}`
+  })()
+
   // ── State banner ─────────────────────────────────────────────
   // Explicit reason surface — buttons only grey when banner is not
   // READY. No silent disables. `bannerAction` is a small affordance
@@ -358,23 +500,59 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   // auto-fires — every action goes through a confirm dialog below.
   let bannerLevel = 'ready'
   let bannerText  = 'READY'
-  let bannerAction = null   // { kind, label, appearance }
+  // Array of {kind, label, appearance, disabled?, tooltip?}. Rendered
+  // inline right-aligned in the banner in array order. Alarm state
+  // gets two entries so the operator sees the intended sequence
+  // (Clear Alarm → then Enable) — the second is disabled while the
+  // alarm is active, so it can't be clicked out of order.
+  let bannerActions = []
   if (estop) {
     bannerLevel = 'error'
     bannerText  = 'E-STOP — release to jog'
   } else if (!robot.connected) {
     bannerLevel = 'error'
     bannerText  = 'DRIVER DISCONNECTED'
-  } else if (robot.alarm) {
-    // Alarm gates enable — the controller refuses switchOn while
-    // errors are latched. Match the pendant's recovery order: Clear
-    // Alarm first, then Enable becomes offered.
+  } else if (anyOutOfRange) {
+    // Joint(s) past controller limit. The AlarmRecoveryModal is the
+    // PRIMARY surface; this banner is the minimized form. When the
+    // operator has minimized the modal, we grow a "Recovery guide"
+    // chip so they can reopen it. Direction/progress live inside the
+    // modal now — not duplicated here.
     bannerLevel = 'error'
-    bannerText  = robot.alarm_count > 1
-      ? `ALARM (${robot.alarm_count} active)`
-      : 'ALARM'
+    bannerText  = outOfRangeJoints.length > 1
+      ? `JOINTS PAST LIMIT: ${outOfRangeJoints.map((j) => 'J' + j.joint).join(', ')}`
+      : `J${outOfRangeJoints[0].joint} PAST LIMIT`
+    bannerActions = alarmModalMinimized
+      ? [{ kind: 'reopen_alarm_modal', label: '↗ Recovery guide', appearance: 'danger' }]
+      : []
+  } else if (robot.alarm) {
+    // Alarm without out-of-range — same story: modal is primary,
+    // banner is the minimized form. When minimized, offer the reopen
+    // affordance. The Clear Alarm / Enable buttons live in the modal
+    // now; keeping them in the banner would duplicate state and split
+    // the operator's attention.
+    bannerLevel = 'error'
+    bannerText  = alarmCopy?.headline
+      || (robot.alarm_count > 1 ? `ALARM (${robot.alarm_count} active)` : 'ALARM')
+    bannerActions = alarmModalMinimized
+      ? [{ kind: 'reopen_alarm_modal', label: '↗ Recovery guide', appearance: 'danger' }]
+      : []
+  } else if (robot.alarm_count === 0 && robot.joint_limits?.some &&
+             robot.joint_limits.some((j) => j?.near_limit) && !robot.enabled) {
+    // Transitional "back in range" state: the operator has jogged the
+    // joint(s) back below limit but hasn't cleared the alarm yet, OR
+    // the alarm has just cleared and we're still disabled. This is the
+    // amber sweet spot that tells the operator "you're clear, now
+    // Clear Alarm → Enable". Only fires when no joint is out_of_range
+    // AND no active_alarm — safe to click both actions in sequence.
+    // (We check near_limit as a soft indicator; not a gate.)
+    bannerLevel = 'warn'
+    bannerText  = 'BACK IN RANGE — CLEAR ALARM, THEN ENABLE'
     if (robot.allow_power) {
-      bannerAction = { kind: 'clear_alarm', label: 'Clear Alarm', appearance: 'danger' }
+      bannerActions = [
+        { kind: 'clear_alarm', label: 'Clear Alarm', appearance: 'danger' },
+        { kind: 'enable', label: 'Enable', appearance: 'primary' },
+      ]
     }
   } else if (robot.enabling) {
     // Transient state observed on the wire (state=1 "Enabling"). The
@@ -386,7 +564,7 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
     bannerLevel = 'warn'
     bannerText  = 'ROBOT DISABLED'
     if (robot.allow_power) {
-      bannerAction = { kind: 'enable', label: 'Enable', appearance: 'primary' }
+      bannerActions = [{ kind: 'enable', label: 'Enable', appearance: 'primary' }]
     } else {
       // Match the previous message for the closed-gate case so the
       // operator still knows the pendant fallback path.
@@ -401,14 +579,14 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
     bannerText  = 'JOG GATE CLOSED — set ESTUN_ALLOW_JOG=1 on the driver'
     // Enabled but jog closed — still offer Disable to safe the arm.
     if (robot.allow_power) {
-      bannerAction = { kind: 'disable', label: 'Disable', appearance: 'subtle' }
+      bannerActions = [{ kind: 'disable', label: 'Disable', appearance: 'subtle' }]
     }
   } else {
     // READY. Subtle Disable button on the right so the operator can
     // safe the arm without hunting through menus. Present but not
     // inviting: neutral colour, small target.
     if (robot.allow_power) {
-      bannerAction = { kind: 'disable', label: 'Disable', appearance: 'subtle' }
+      bannerActions = [{ kind: 'disable', label: 'Disable', appearance: 'subtle' }]
     }
   }
   const jogGateOk = bannerLevel === 'ready'
@@ -574,34 +752,72 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
                     : '#FCA5A5',
         }} />
         <span style={{ flex: 1 }}>{bannerText}</span>
-        {bannerAction && (
+        {bannerActions.map((a) => (
           <button
-            onClick={() => openPowerConfirm(bannerAction.kind)}
+            key={a.kind}
+            onClick={() => {
+              if (a.disabled) return
+              // `reopen_alarm_modal` is the banner's escape hatch back
+              // into the modal — different action from the power verbs.
+              if (a.kind === 'reopen_alarm_modal') {
+                setAlarmModalMinimized(false)
+                return
+              }
+              openPowerConfirm(a.kind)
+            }}
+            disabled={!!a.disabled}
+            title={a.tooltip || undefined}
             style={{
               // Three appearances so DISABLE looks unlike ENABLE.
               // primary — filled green (invites the transition)
               // danger  — filled red   (only used for Clear-Alarm)
               // subtle  — outline over the READY banner (present, not inviting)
               background:
-                bannerAction.appearance === 'primary' ? '#059669'
-                : bannerAction.appearance === 'danger'  ? '#B91C1C'
-                :                                        'transparent',
-              color:  bannerAction.appearance === 'subtle' ? '#fff' : '#fff',
-              border: bannerAction.appearance === 'subtle'
+                a.appearance === 'primary' ? '#059669'
+                : a.appearance === 'danger'  ? '#B91C1C'
+                :                              'transparent',
+              color:  '#fff',
+              border: a.appearance === 'subtle'
                 ? '1px solid rgba(255,255,255,0.55)'
                 : '1px solid transparent',
-              padding: bannerAction.appearance === 'subtle' ? '2px 8px' : '3px 10px',
+              padding: a.appearance === 'subtle' ? '2px 8px' : '3px 10px',
               borderRadius: 6,
               fontSize: 10, fontWeight: 700,
               letterSpacing: '0.04em',
-              cursor: 'pointer',
+              cursor: a.disabled ? 'not-allowed' : 'pointer',
+              opacity: a.disabled ? 0.45 : 1,
               whiteSpace: 'nowrap',
             }}
           >
-            {bannerAction.label}
+            {a.label}
           </button>
-        )}
+        ))}
       </div>
+
+      {/* Recovery sub-line — shown UNDER the banner. Three sources, in
+          priority order:
+            1. Live joint-limit recovery guide (any joint out_of_range) —
+               multi-line with direction + live-degrees readout,
+               overrides any static alarm copy.
+            2. Static alarm recovery copy (2002/2006/2023/9012/etc.).
+            3. Transient mid-session jog-stop reason.
+          Kept mixed-case (banner is uppercase) so this reads as prose. */}
+      {(recoveryGuideText || alarmCopy?.recovery || stopReasonHuman) && (
+        <div style={{
+          background: recoveryGuideText ? '#7F1D1D'
+                    : alarmCopy         ? '#7F1D1D'
+                    :                     '#78350F',
+          color: '#FFF7ED',
+          padding: '6px 12px',
+          fontSize: 12,
+          lineHeight: 1.4,
+          flexShrink: 0,
+          whiteSpace: 'pre-wrap',   // preserve the line breaks in the guide
+          fontVariantNumeric: 'tabular-nums',   // keep live degrees readable
+        }}>
+          {recoveryGuideText || alarmCopy?.recovery || stopReasonHuman}
+        </div>
+      )}
 
       {pendingPower && powerCopy && (
         <div

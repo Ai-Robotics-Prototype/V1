@@ -136,6 +136,30 @@ STATE = {
         "alarm_count": 0,
         "state_code": 0,
         "state_name": "",
+        "active_alarm": None,
+        "last_stop_reason": "",
+        "last_stop_ts": 0.0,
+        "joint_limits": [],
+        "collision_enabled": False,
+        "collision_pair": None,
+        "collision_min_mm": None,
+        "collision_warn_mm": 80.0,
+        "collision_stop_mm": 30.0,
+        "collision_warning": False,
+        "env_zone_count": 0,
+        "env_pair": None,
+        "env_min_mm": None,
+        "env_warn_mm": 80.0,
+        "env_stop_mm": 30.0,
+        "env_escape_dirs": [],
+        "guard_active": False,
+        "guard_kind": None,
+        "guard_pair": None,
+        "guard_min_mm": None,
+        "guard_warn_mm": 80.0,
+        "guard_stop_mm": 30.0,
+        "guard_escapes": [],
+        "ground_z_mm": -300.0,
     },
     "tcp_pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     "program": {
@@ -188,6 +212,47 @@ _insp_clients:  dict = {}   # /ws/inspection — live inspection status
 _motioncam_cloud_clients: dict = {}
 _motioncam_reco_clients:  dict = {}
 _ws_lock = threading.Lock()
+
+# WS backpressure protection. Prior defect: a slow tablet's TCP send
+# buffer accumulated multi-MB backlogs and the consumer coroutine spent
+# most of its time blocked in `await send_text`, dragging /cmd/jog POST
+# latency past the driver's 300 ms freshness deadman and turning
+# continuous jog into step mode. Fix: every per-client send is wrapped
+# in `asyncio.wait_for(..., timeout=WS_SEND_TIMEOUT_S)`. A client whose
+# send hasn't drained in that window gets its socket closed — the
+# broadcaster stops fanning frames to it and the fast path stays fast.
+# 0.5 s is generous for a state-broadcast frame (~9 KB): loopback sends
+# complete sub-ms, LAN wifi tablets round-trip in <100 ms. Anything past
+# 500 ms means the client's TCP receive window is stuck (tab throttled,
+# laptop closed, wifi dead) — kicking it protects the fast path. The
+# reconnect loop already backs off exponentially, so a truly healthy
+# client that hits a brief blip gets a graceful reconnect.
+WS_SEND_TIMEOUT_S = 0.5
+# Cumulative kicks per stream, exposed on /health for observability.
+_ws_kicked = {"state": 0, "lidar": 0, "mesh": 0,
+              "motioncam_cloud": 0, "motioncam_reco": 0}
+
+# Camera-encode worker pool. Wire evidence (2026-07-15 continuous jog
+# session): the ROS executor thread's synchronous PIL JPEG encode was
+# holding the GIL long enough in bursts that the asyncio loop's WS
+# receive latency crossed the driver's 300 ms freshness deadman about
+# 5 % of intervals, firing "hold staleness" mid-hold. Moving the
+# encode off the ROS callback (encode runs in this pool; the callback
+# returns after the submit) both frees the ROS executor for
+# subsequent frames and reduces GIL contention with the asyncio loop.
+# Small pool (2 workers = one per camera): the encode itself releases
+# GIL inside PIL's native code, so more threads wouldn't help and
+# would only add scheduler churn.
+import concurrent.futures as _futures
+_cam_encode_pool = _futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix='cam-encode')
+# Drop-latest: if a previous encode is still in flight for a camera,
+# skip this frame rather than queue. Freshness > completeness for
+# telemetry cameras; the operator sees the newest frame within one
+# encode wall time. _cam_encode_busy[cam_id] is a bool the ROS thread
+# consults before submitting.
+_cam_encode_busy = {0: False, 1: False}
+_cam_encode_busy_lock = threading.Lock()
 
 # MotionCam state — single shared instance for the dashboard server.
 # The synthetic generator only ticks when STATE.motioncam_state.get_mock()
@@ -1063,6 +1128,47 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             r["alarm_count"] = int(d.get("alarm_count", 0))
             r["state_code"]  = int(d.get("state_code", 0))
             r["state_name"]  = d.get("state_name", "")
+            # Structured active alarm (or None) + latest stop reason.
+            # Passed through untouched — the dashboard banner formats
+            # cause + recovery text from these fields.
+            r["active_alarm"]      = d.get("active_alarm")
+            r["last_stop_reason"]  = d.get("last_stop_reason", "")
+            r["last_stop_ts"]      = float(d.get("last_stop_ts") or 0.0)
+            # Per-joint limit evaluation — a list of six dicts (one per
+            # joint) each with current_deg/limit_deg/out_of_range/etc.
+            # Passed through untouched; dashboard interprets to render
+            # the live joint-limit recovery guide.
+            jl = d.get("joint_limits")
+            if isinstance(jl, list):
+                r["joint_limits"] = jl
+            # Self-collision guard telemetry (pair + distance + thresholds).
+            # Dashboard uses these to tint the offending link pair
+            # amber/red in the twin and render a live clearance readout.
+            r["collision_enabled"] = bool(d.get("collision_enabled", False))
+            r["collision_pair"]    = d.get("collision_pair")
+            r["collision_min_mm"]  = d.get("collision_min_mm")
+            r["collision_warn_mm"] = float(d.get("collision_warn_mm") or 0.0)
+            r["collision_stop_mm"] = float(d.get("collision_stop_mm") or 0.0)
+            r["collision_warning"] = bool(d.get("collision_warning", False))
+            # Environment obstacle guard — separate keys from self-collision.
+            # env_pair is [link, "zone#<id>"]; env_escape_dirs is a list of
+            # {joint, direction, projected_mm, current_mm} sorted best-first.
+            r["env_zone_count"]  = int(d.get("env_zone_count") or 0)
+            r["env_pair"]        = d.get("env_pair")
+            r["env_min_mm"]      = d.get("env_min_mm")
+            r["env_warn_mm"]     = float(d.get("env_warn_mm") or 0.0)
+            r["env_stop_mm"]     = float(d.get("env_stop_mm") or 0.0)
+            r["env_escape_dirs"] = d.get("env_escape_dirs") or []
+            # Unified guard state — used by the guard popup for any
+            # collision kind (self / ground / env).
+            r["guard_active"]  = bool(d.get("guard_active", False))
+            r["guard_kind"]    = d.get("guard_kind")
+            r["guard_pair"]    = d.get("guard_pair")
+            r["guard_min_mm"]  = d.get("guard_min_mm")
+            r["guard_warn_mm"] = float(d.get("guard_warn_mm") or 0.0)
+            r["guard_stop_mm"] = float(d.get("guard_stop_mm") or 0.0)
+            r["guard_escapes"] = d.get("guard_escapes") or []
+            r["ground_z_mm"]   = d.get("ground_z_mm")
             # Joints (rad) — only overwrite if the driver gave us real data.
             jr = d.get("joints_rad")
             if isinstance(jr, list) and len(jr) == 6:
@@ -1081,27 +1187,52 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
     # ---- Cameras ----
 
     def _on_camera(self, cam_id: int, msg):
-        jpeg = _ros_image_to_jpeg(msg)
-        if jpeg:
-            with _cam_lock:
-                _cam_frames[cam_id] = jpeg
-            attr = f"_cam{cam_id}_logged"
-            if not getattr(self, attr, False):
-                setattr(self, attr, True)
-                self.get_logger().info(
-                    f"Camera {cam_id} first frame: "
-                    f"{msg.width}x{msg.height} enc={msg.encoding} "
-                    f"jpeg={len(jpeg)}B"
-                )
-        else:
-            attr = f"_cam{cam_id}_fail_logged"
-            if not getattr(self, attr, False):
-                setattr(self, attr, True)
-                self.get_logger().warn(
-                    f"Camera {cam_id} encode failed: "
-                    f"{msg.width}x{msg.height} enc={msg.encoding} "
-                    f"data_len={len(msg.data)}"
-                )
+        # Off-load JPEG encode to the dedicated worker pool so the ROS
+        # executor thread (which holds the GIL through PIL's Python-side
+        # bytecode) returns fast and stops competing with the asyncio
+        # loop for GIL windows. Drop-latest: if the previous frame for
+        # this camera is still encoding, skip this one — freshness
+        # beats completeness for the telemetry viewer, and queuing
+        # would only re-introduce the backlog we're trying to eliminate.
+        with _cam_encode_busy_lock:
+            if _cam_encode_busy.get(cam_id):
+                # Prior encode still in flight; drop this frame.
+                return
+            _cam_encode_busy[cam_id] = True
+        # Freeze the fields the encoder needs — the ROS msg is
+        # thread-safe to read here, but capture them explicitly so the
+        # worker doesn't hold a reference longer than needed.
+        w, h, enc = msg.width, msg.height, msg.encoding
+        raw = bytes(bytearray(msg.data))
+        first = not getattr(self, f"_cam{cam_id}_logged", False)
+
+        class _Msg:
+            width = w; height = h; encoding = enc; data = raw
+        stub = _Msg()
+
+        def _encode_task():
+            try:
+                jpeg = _ros_image_to_jpeg(stub)
+            finally:
+                with _cam_encode_busy_lock:
+                    _cam_encode_busy[cam_id] = False
+            if jpeg:
+                with _cam_lock:
+                    _cam_frames[cam_id] = jpeg
+                if first:
+                    setattr(self, f"_cam{cam_id}_logged", True)
+                    self.get_logger().info(
+                        f"Camera {cam_id} first frame: {w}x{h} enc={enc} "
+                        f"jpeg={len(jpeg)}B (encoded off-loop)")
+            else:
+                attr = f"_cam{cam_id}_fail_logged"
+                if not getattr(self, attr, False):
+                    setattr(self, attr, True)
+                    self.get_logger().warn(
+                        f"Camera {cam_id} encode failed: {w}x{h} enc={enc} "
+                        f"data_len={len(raw)}")
+
+        _cam_encode_pool.submit(_encode_task)
 
     # ---- LiDAR ----
 
@@ -1217,8 +1348,25 @@ if FASTAPI_AVAILABLE:
             # import failure). Endpoints will just serve empty data.
             pass
         task = asyncio.create_task(_broadcast_loop())
+        # Server-side hold keepalive — drives /robot/jog_command at a
+        # steady 100 ms cadence. Runs on a dedicated NATIVE thread, not
+        # the asyncio loop — the loop's callback-dispatch drift measured
+        # 50–300 ms under normal load (camera streams + state broadcast
+        # + WS traffic), and even ONE stack-up of that drift crosses
+        # the driver's freshness deadman. A native thread with
+        # time.sleep-based scheduling is unaffected by loop load;
+        # rclpy publishers are thread-safe so calling _publish_estun_jog
+        # from here is fine.
+        _keepalive_stop.clear()
+        keepalive_thread = threading.Thread(
+            target=_keepalive_thread_loop,
+            name='hold-keepalive',
+            daemon=True)
+        keepalive_thread.start()
         yield
         task.cancel()
+        _keepalive_stop.set()
+        keepalive_thread.join(timeout=1.0)
         try:
             await task
         except asyncio.CancelledError:
@@ -1270,6 +1418,15 @@ if FASTAPI_AVAILABLE:
                 next_mesh = now + mesh_dt
 
             if now >= next_state:
+                # Skip the deep-copy + json.dumps (both non-trivial on
+                # a state blob this size) when no one is listening.
+                # The next_state cursor still advances so we don't spin.
+                with _ws_lock:
+                    n_clients = len(_state_clients)
+                if n_clients == 0:
+                    next_state = now + state_dt
+                    await asyncio.sleep(state_dt)
+                    continue
                 with _state_lock:
                     payload = copy.deepcopy(STATE)
                 payload["t"] = now * 1000
@@ -1371,6 +1528,295 @@ if FASTAPI_AVAILABLE:
             await asyncio.sleep(0.005)
 
     # ------------------------------------------------------------------
+    # WS client→server message router
+    # ------------------------------------------------------------------
+    #
+    # /ws/state is now bidirectional. Server → client is the periodic
+    # state broadcast; client → server carries jog + power commands over
+    # the same persistent channel so a single hold session doesn't pay
+    # per-message TLS handshake / TCP connection cost, and messages
+    # arrive in order (which HTTP/1.1 does not guarantee across parallel
+    # connections). The HTTP endpoints (/cmd/jog, /cmd/jog_cartesian,
+    # /cmd/power) remain as-is; the frontend falls back to them if the
+    # WS is down. Every message just funnels back into the same
+    # _publish_estun_jog / _publish_estun_power helpers — the driver
+    # sees identical /robot/jog_command traffic either way, and the
+    # hold_id/seq semantics are unchanged.
+    #
+    # Wire format (JSON, one message per frame):
+    #   {"type": "jog",           "payload": {...jog body as /cmd/jog...}}
+    #   {"type": "jog_cartesian", "payload": {...as /cmd/jog_cartesian...}}
+    #   {"type": "power",         "payload": {"action": "enable"|"disable"|"clear_alarm"}}
+    #
+    # Server does NOT reply — this is fire-and-forget, matching the
+    # HTTP endpoints. Errors are swallowed so a bad message from one
+    # client cannot tear down the connection.
+
+    _WS_JOG_ACTIONS = {"jog", "jog_cartesian", "power"}
+
+    # ── Server-side hold keepalive ────────────────────────────────────
+    #
+    # The dashboard now maintains the freshness heartbeat to the driver
+    # on the server's own event loop. Wire evidence (2026-07-15 cont-jog
+    # session): under normal camera + WS load, browser→server refresh
+    # inter-arrival at the driver hit ~5 % > 300 ms — enough to trip
+    # the driver's freshness deadman mid-hold and turn Cartesian jog
+    # into step. Root cause was GIL-holding JPEG encode; that's fixed
+    # above by moving encode to a worker pool. This keepalive is the
+    # structural fix — the dashboard has all the state (open WS,
+    # hold_id, last browser refresh time), so it can maintain a
+    # rock-steady 100 ms cadence to the driver regardless of browser
+    # jitter, while preserving every safety property:
+    #
+    #   • WS disconnects (browser closed / laptop lid / network lost)
+    #     → keepalive drops the session → driver's 300 ms deadman fires
+    #     → Robot/stopJog on the wire.
+    #   • Explicit release from browser → we send hold:false immediately
+    #     and drop the session.
+    #   • Browser silent > 400 ms (finger genuinely lifted, or all WS
+    #     messages lost) → keepalive drops the session → driver deadman
+    #     ~300 ms later.
+    #
+    # The operator's finger remains the deadman; we just stop network
+    # jitter from impersonating a release. The driver's own 300 ms
+    # deadman remains the ultimate safety backstop.
+    # 60 ms interval (not 100) — the keepalive runs on a native thread
+    # but still shares the GIL with the asyncio loop; measured on-Jetson
+    # under normal load, GIL bursts occasionally hold 200–250 ms, so a
+    # 100 ms interval + one drifted tick can just cross the driver's
+    # 300 ms deadman. At 60 ms we get five ticks per deadman window —
+    # even TWO consecutive drifted ticks stay under 300 ms driver-side.
+    HOLD_KEEPALIVE_INTERVAL_S = 0.06
+    HOLD_BROWSER_TIMEOUT_S    = 0.4
+
+    class _HoldSession:
+        """Bookkeeping for a single active jog hold. Owned by the
+        server keepalive loop; refreshed by inbound browser messages."""
+        __slots__ = ('hold_id', 'ws', 'driver_payload_template',
+                     'last_browser_ts', 'server_seq', 'mode')
+        def __init__(self, hold_id, ws, tpl, mode):
+            self.hold_id = hold_id
+            self.ws = ws
+            self.driver_payload_template = tpl  # dict WITHOUT seq/hold
+            self.last_browser_ts = time.monotonic()
+            # Start server_seq high (ms since epoch) so it dominates any
+            # browser seq the driver might have latched from an earlier
+            # session — monotonic across the whole day.
+            self.server_seq = int(time.time() * 1000)
+            self.mode = mode
+
+    _active_holds = {}          # hold_id -> _HoldSession
+    _active_holds_lock = threading.Lock()
+
+    def _build_driver_payload(t, payload):
+        """Shared payload shaping — mirrors the HTTP endpoints' translations
+        (joint → axis, letter-axis → 1..6). Used by both the initial-hold
+        publish path and the keepalive loop. Returns the dict WITHOUT
+        seq/hold_id/hold — the caller adds those as appropriate."""
+        mode = "cartesian" if t == "jog_cartesian" else "joint"
+        out = dict(payload)
+        out.setdefault("mode", mode)
+        if "axis" not in out and "joint" in out:
+            try:
+                out["axis"] = int(out.pop("joint"))
+            except (TypeError, ValueError):
+                return None
+        if mode == "cartesian" and isinstance(out.get("axis"), str):
+            axis_map = {"x": 1, "y": 2, "z": 3, "rx": 4, "ry": 5, "rz": 6}
+            n = axis_map.get(out["axis"].lower())
+            if n is not None:
+                out["axis"] = n
+        # Strip fields the keepalive will manage on its own.
+        for k in ("seq", "hold", "client_ts_ms"):
+            out.pop(k, None)
+        return out
+
+    def _handle_ws_client_msg(raw: str, ws=None):
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return
+        # Diagnostic: count every inbound message that hits this router.
+        # Bumps a global so /health can show whether the silence-test
+        # sim is truly silent (bumps stop) or something is coming in.
+        _keepalive_stats.setdefault('ws_msgs_in', 0)
+        _keepalive_stats['ws_msgs_in'] += 1
+        t = msg.get("type")
+        if t not in _WS_JOG_ACTIONS:
+            return
+        payload = msg.get("payload") or {}
+        if not isinstance(payload, dict):
+            return
+        if t == "power":
+            action = str(payload.get("action", "")).lower()
+            if action not in _POWER_ACTIONS:
+                return
+            _publish_estun_power({"action": action})
+            return
+
+        hold_id = payload.get("hold_id")
+        # Release path takes absolute priority. Publish release
+        # immediately and drop any tracked session for this hold_id.
+        if payload.get("hold") is False or payload.get("stop") is True:
+            mode = "cartesian" if t == "jog_cartesian" else "joint"
+            out = {"mode": mode, "hold": False}
+            for k in ("hold_id", "seq", "client_ts_ms"):
+                if payload.get(k) is not None:
+                    out[k] = payload[k]
+            _publish_estun_jog(out)
+            if hold_id is not None:
+                with _active_holds_lock:
+                    _active_holds.pop(hold_id, None)
+            return
+
+        # Non-hold jog shapes (delta_deg increments, cart pulse) — pass
+        # through, no keepalive tracking needed. The driver runs its own
+        # time-boxed stop for those.
+        if payload.get("hold") is not True:
+            tpl = _build_driver_payload(t, payload)
+            if tpl is None: return
+            # For increments: re-attach delta_deg / pulse fields that
+            # _build_driver_payload didn't strip (only seq/hold/client_ts).
+            _publish_estun_jog(tpl)
+            return
+
+        # hold:true — register / refresh the session. The keepalive loop
+        # will drive the actual /robot/jog_command traffic from here on.
+        tpl = _build_driver_payload(t, payload)
+        if tpl is None: return
+        mode = tpl.get("mode", "joint")
+        now = time.monotonic()
+        with _active_holds_lock:
+            hs = _active_holds.get(hold_id) if hold_id is not None else None
+            if hs is None:
+                # New session — publish the first frame IMMEDIATELY so
+                # the driver's session-tracking state gets set up before
+                # our first keepalive tick. Subsequent keepalive ticks
+                # will refresh at 100 ms cadence.
+                hs = _HoldSession(hold_id, ws, tpl, mode)
+                _active_holds[hold_id] = hs
+                initial = True
+            else:
+                # Refresh — just update the freshness timestamp; the
+                # keepalive loop is already publishing.
+                hs.last_browser_ts = now
+                # Guard: if the caller mutated the payload (e.g. cart
+                # direction change on the same hold_id — shouldn't happen
+                # from HoldButton but browsers can surprise us), refresh
+                # the template so the keepalive uses the latest.
+                hs.driver_payload_template = tpl
+                initial = False
+        if initial:
+            frame = dict(tpl); frame['hold'] = True
+            frame['hold_id'] = hold_id
+            frame['seq'] = hs.server_seq
+            _publish_estun_jog(frame)
+
+    # Keepalive runs on a DEDICATED THREAD, not the asyncio loop.
+    # Rationale: measured on-Jetson, `await asyncio.sleep(0.1)` drifts
+    # 50–300 ms under normal load (camera streams, ROS callbacks, state
+    # broadcast, arbitrary WS traffic) — even with drift-corrected
+    # scheduling — because the loop's next-callback dispatch has to
+    # wait for the currently-executing coroutine to `await` again. A
+    # single 300+ ms drift crosses the driver's freshness deadman.
+    # rclpy publishers are thread-safe; `time.sleep()` in a native
+    # thread is scheduled by the kernel and unaffected by asyncio load.
+    # The dashboard's ROS publisher (`_publish_estun_jog`) is invoked
+    # from this thread directly. The only asyncio-touching field is
+    # `ws.client_state`, a simple int enum read that's safe cross-thread.
+    _keepalive_thread = None
+    _keepalive_stop = threading.Event()
+    _keepalive_stats = {"ticks": 0, "publishes": 0, "expired": 0,
+                        "last_tick_gap_ms": 0.0, "max_tick_gap_ms": 0.0}
+    _keepalive_last_tick_mono = 0.0
+
+    def _keepalive_thread_loop():
+        interval = HOLD_KEEPALIVE_INTERVAL_S
+        next_fire = time.monotonic() + interval
+        while not _keepalive_stop.is_set():
+            delay = next_fire - time.monotonic()
+            if delay > 0:
+                # threading.Event.wait is interruptible by set() — clean shutdown.
+                _keepalive_stop.wait(timeout=delay)
+                if _keepalive_stop.is_set():
+                    return
+            now = time.monotonic()
+            next_fire += interval
+            if next_fire < now:
+                next_fire = now + interval
+            try:
+                _keepalive_tick(now)
+            except Exception as e:
+                # Never let a tick exception kill the keepalive thread —
+                # log once and continue.
+                print(f'[keepalive] tick error: {e}', flush=True)
+
+    def _keepalive_tick(now):
+        nonlocal_stats = _keepalive_stats
+        # Track scheduling jitter: gap between successive tick entries.
+        # Useful for confirming the native thread ISN'T being throttled
+        # by GIL (visible on /health under ws_kicked → keepalive_max_ms).
+        global _keepalive_last_tick_mono
+        prev = _keepalive_last_tick_mono
+        _keepalive_last_tick_mono = now
+        if prev > 0:
+            gap_ms = (now - prev) * 1000
+            nonlocal_stats["last_tick_gap_ms"] = gap_ms
+            if gap_ms > nonlocal_stats["max_tick_gap_ms"]:
+                nonlocal_stats["max_tick_gap_ms"] = gap_ms
+        nonlocal_stats["ticks"] += 1
+        expired = []
+        with _active_holds_lock:
+            items = list(_active_holds.items())
+        for hold_id, hs in items:
+            # WS connection health — if the WS is closed / gone,
+            # drop the session. Starlette WebSocket exposes
+            # client_state and application_state; both must be
+            # CONNECTED for the ws to be usable.
+            ws_ok = True
+            if hs.ws is not None:
+                # Compare via `.value` — WebSocketState is a plain Enum,
+                # not IntEnum, so `int(state)` raises TypeError. The
+                # earlier "int(cs) != 1" version was silently expiring
+                # every session (TypeError → except → ws_ok=False) so
+                # keepalive never actually republished — /health showed
+                # publishes=0 while expired grew unbounded.
+                try:
+                    cs = getattr(hs.ws, 'client_state', None)
+                    if cs is not None:
+                        # Treat DISCONNECTED (2) as dead. CONNECTING (0)
+                        # or CONNECTED (1) or RESPONSE (3) → alive.
+                        val = getattr(cs, 'value', None)
+                        if val is not None and val >= 2:
+                            ws_ok = False
+                except Exception:
+                    ws_ok = False
+            if not ws_ok:
+                expired.append((hold_id, 'ws disconnected'))
+                continue
+            # Browser silence — if no refresh in HOLD_BROWSER_TIMEOUT_S,
+            # the finger is genuinely gone (or the last N messages
+            # were lost). Drop; driver deadman is next.
+            if now - hs.last_browser_ts > HOLD_BROWSER_TIMEOUT_S:
+                expired.append((hold_id, 'browser silent >{:.0f}ms'.format(
+                    HOLD_BROWSER_TIMEOUT_S * 1000)))
+                continue
+            # Republish. Advance the server-side seq so the driver's
+            # monotonic check accepts.
+            hs.server_seq += 1
+            frame = dict(hs.driver_payload_template)
+            frame['hold'] = True
+            frame['hold_id'] = hold_id
+            frame['seq'] = hs.server_seq
+            _publish_estun_jog(frame)
+            nonlocal_stats["publishes"] += 1
+        if expired:
+            with _active_holds_lock:
+                for hid, reason in expired:
+                    _active_holds.pop(hid, None)
+            nonlocal_stats["expired"] += len(expired)
+
+    # ------------------------------------------------------------------
     # WebSocket endpoints
     # ------------------------------------------------------------------
 
@@ -1381,14 +1827,49 @@ if FASTAPI_AVAILABLE:
         with _ws_lock:
             _state_clients[websocket] = q
         try:
-            while True:
-                txt = await q.get()
-                await websocket.send_text(txt)
+            # Bidirectional: sender pulls broadcast payloads from the app
+            # queue and sends them (wrapped in wait_for so a slow client
+            # can't back up the event loop); receiver awaits inbound
+            # messages from the client (used for the WS jog transport
+            # implemented alongside /cmd/jog — see _handle_ws_client_msg).
+            # Both coroutines share the same WebSocket; either failing or
+            # timing out cancels the other via asyncio.wait FIRST_COMPLETED.
+            async def _sender():
+                while True:
+                    txt = await q.get()
+                    try:
+                        await asyncio.wait_for(
+                            websocket.send_text(txt),
+                            timeout=WS_SEND_TIMEOUT_S)
+                    except asyncio.TimeoutError:
+                        _ws_kicked["state"] += 1
+                        return
+            async def _receiver():
+                while True:
+                    msg = await websocket.receive_text()
+                    try:
+                        # ws passed through so _handle_ws_client_msg can
+                        # register/refresh the server-side hold session,
+                        # which key-alives on this ws.client_state.
+                        _handle_ws_client_msg(msg, ws=websocket)
+                    except Exception:
+                        pass
+            done, pending = await asyncio.wait(
+                [asyncio.create_task(_sender()),
+                 asyncio.create_task(_receiver())],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
         except (WebSocketDisconnect, Exception):
             pass
         finally:
             with _ws_lock:
                 _state_clients.pop(websocket, None)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     @app.websocket("/ws/lidar")
     async def ws_lidar(websocket: WebSocket):
@@ -1399,15 +1880,27 @@ if FASTAPI_AVAILABLE:
         try:
             while True:
                 item = await q.get()
-                if isinstance(item, tuple) and item and item[0] == 'binary':
-                    await websocket.send_bytes(item[1])
-                else:
-                    await websocket.send_text(item)
+                try:
+                    if isinstance(item, tuple) and item and item[0] == 'binary':
+                        await asyncio.wait_for(
+                            websocket.send_bytes(item[1]),
+                            timeout=WS_SEND_TIMEOUT_S)
+                    else:
+                        await asyncio.wait_for(
+                            websocket.send_text(item),
+                            timeout=WS_SEND_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    _ws_kicked["lidar"] += 1
+                    break
         except (WebSocketDisconnect, Exception):
             pass
         finally:
             with _ws_lock:
                 _lidar_clients.pop(websocket, None)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     @app.websocket("/ws/motioncam_cloud")
     async def ws_motioncam_cloud(websocket: WebSocket):
@@ -1418,15 +1911,27 @@ if FASTAPI_AVAILABLE:
         try:
             while True:
                 item = await q.get()
-                if isinstance(item, tuple) and item and item[0] == 'binary':
-                    await websocket.send_bytes(item[1])
-                else:
-                    await websocket.send_text(item)
+                try:
+                    if isinstance(item, tuple) and item and item[0] == 'binary':
+                        await asyncio.wait_for(
+                            websocket.send_bytes(item[1]),
+                            timeout=WS_SEND_TIMEOUT_S)
+                    else:
+                        await asyncio.wait_for(
+                            websocket.send_text(item),
+                            timeout=WS_SEND_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    _ws_kicked["motioncam_cloud"] += 1
+                    break
         except (WebSocketDisconnect, Exception):
             pass
         finally:
             with _ws_lock:
                 _motioncam_cloud_clients.pop(websocket, None)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     @app.websocket("/ws/motioncam_recognition")
     async def ws_motioncam_recognition(websocket: WebSocket):
@@ -1437,12 +1942,21 @@ if FASTAPI_AVAILABLE:
         try:
             while True:
                 txt = await q.get()
-                await websocket.send_text(txt)
+                try:
+                    await asyncio.wait_for(websocket.send_text(txt),
+                                           timeout=WS_SEND_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    _ws_kicked["motioncam_reco"] += 1
+                    break
         except (WebSocketDisconnect, Exception):
             pass
         finally:
             with _ws_lock:
                 _motioncam_reco_clients.pop(websocket, None)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     @app.websocket("/ws/mesh")
     async def ws_mesh(websocket: WebSocket):
@@ -1456,18 +1970,28 @@ if FASTAPI_AVAILABLE:
             cached = _mesh_state["payload"]
         if cached:
             try:
-                await websocket.send_text(cached)
+                await asyncio.wait_for(websocket.send_text(cached),
+                                       timeout=WS_SEND_TIMEOUT_S)
             except Exception:
                 pass
         try:
             while True:
                 txt = await q.get()
-                await websocket.send_text(txt)
+                try:
+                    await asyncio.wait_for(websocket.send_text(txt),
+                                           timeout=WS_SEND_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    _ws_kicked["mesh"] += 1
+                    break
         except (WebSocketDisconnect, Exception):
             pass
         finally:
             with _ws_lock:
                 _mesh_clients.pop(websocket, None)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # MJPEG camera streams
@@ -2087,6 +2611,13 @@ if FASTAPI_AVAILABLE:
             "cam0_live": have_cam0, "cam1_live": have_cam1,
             "lidar_live": lidar_live, "lidar_pts": lidar_pts,
             "mesh_age_s": mesh_age, "mesh_tris": mesh_tris,
+            # Cumulative WS backpressure kicks per stream. Nonzero means at
+            # least one client's send stalled past WS_SEND_TIMEOUT_S — the
+            # broadcaster force-closed the socket to protect the event loop.
+            "ws_kicked": dict(_ws_kicked),
+            "ws_send_timeout_s": WS_SEND_TIMEOUT_S,
+            "hold_keepalive": dict(_keepalive_stats),
+            "active_holds": len(_active_holds),
             "motioncam": {
                 "connected":    mc_status["connected"],
                 "mock_enabled": mc_status["mock_enabled"],

@@ -51,6 +51,11 @@ import os
 import threading
 import time
 
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
@@ -73,6 +78,113 @@ SUBSCRIBE_TOPICS = [
     'web', 'WebCommand', 'Error', 'ProjectState',
     'RobotStatus', 'RobotPosture', 'RobotCoordinate', 'ProjectStatus',
 ]
+
+# ── Fitted DH table (standard convention) — Estun S10-140-ECO-V2 ──────
+# Source: config/dh_fit_report.txt (stage-B fixed-xyz fit, pos RMS 0.025 mm
+# on the held-out test set). Used only by SingularityGuard below to
+# compute σ_min at live joint angles for the Cartesian-jog governor.
+#
+# Row per joint: (a_mm, alpha_deg, d_mm, theta_off_deg).
+_FITTED_DH_STD = [
+    (-0.00002,     90.00058,   325.89611, -179.99989),  # J1
+    (-701.00394,    0.00028,  -579.68908,  -90.00022),  # J2
+    (-538.58526,  180.00313,  -214.01833,   -0.00615),  # J3
+    (-0.00374,    -89.99857, -1000.00000,  -90.00736),  # J4
+    ( 0.00533,     89.99433,  -161.46726,  179.99693),  # J5
+    (-0.00155,     -0.00674,   150.49959,    0.00152),  # J6
+]
+_FITTED_BASE_Z_MM = -139.89595
+
+
+class SingularityGuard:
+    """Computes σ_min of the 6×6 geometric Jacobian from live joint angles,
+    and derives a speed scale for the Cartesian-jog governor.
+
+    σ_min tracks how far the arm is from a singular configuration —
+    smaller = closer to singularity, where a bounded TCP command demands
+    unbounded joint velocity. Concretely, in the current wire capture of
+    alarm 2015 the arm ran σ_min = 0.180 five seconds before the alarm,
+    0.021 at 100 ms before, and 0.003 at the alarm itself — a ~60×
+    degradation. Joint 1 was commanded at 1.57 rad/s (10× our
+    speed_frac=0.15 cap) at that pose. The governor uses σ_min so we can
+    stop the Cartesian jog BEFORE the controller's IK explodes joint
+    velocity past its own acceleration limit and latches the 2015 alarm.
+
+    Thresholds (soft / hard) come from the driver config; scale() returns
+    1.0 when σ_min ≥ soft, 0.0 when σ_min ≤ hard, and a linear
+    interpolation in between."""
+
+    def __init__(self, dh_std=_FITTED_DH_STD, base_z_mm=_FITTED_BASE_Z_MM):
+        self._dh = dh_std
+        self._base_z_mm = base_z_mm
+
+    def _dh_T(self, theta, d_mm, a_mm, alpha):
+        # Standard DH: T = Rz(θ) · Tz(d) · Tx(a) · Rx(α).
+        ct = math.cos(theta); st = math.sin(theta)
+        ca = math.cos(alpha); sa = math.sin(alpha)
+        return [
+            [ct, -st*ca,  st*sa, a_mm*ct],
+            [st,  ct*ca, -ct*sa, a_mm*st],
+            [0.0,    sa,     ca, d_mm  ],
+            [0.0,   0.0,    0.0, 1.0   ],
+        ]
+
+    def _matmul(self, A, B):
+        return [[sum(A[i][k]*B[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+    def _identity_with_base(self):
+        T = [[1.0,0,0,0],[0,1.0,0,0],[0,0,1.0,self._base_z_mm],[0,0,0,1.0]]
+        return T
+
+    def sigma_min(self, q_deg):
+        """Returns σ_min of the 6×6 geometric Jacobian at q_deg. Returns
+        None if numpy isn't available (guard is then disabled — the
+        driver falls back to the reactive joint-velocity backstop)."""
+        if _np is None:
+            return None
+        # Forward-kinematics chain; store intermediate frames T_0..T_6
+        # so we can extract each joint's z axis and origin for the
+        # geometric Jacobian.
+        T = self._identity_with_base()
+        Ts = [T]
+        for i in range(6):
+            a_mm, alpha_deg, d_mm, theta_off_deg = self._dh[i]
+            theta = math.radians(q_deg[i] + theta_off_deg)
+            Ti = self._dh_T(theta, d_mm, a_mm, math.radians(alpha_deg))
+            T = self._matmul(T, Ti)
+            Ts.append(T)
+        # End-effector position (mm)
+        p_ee = [Ts[6][k][3] for k in range(3)]
+        # Build Jacobian in meters (for linear part) and rad (for angular)
+        J = [[0.0]*6 for _ in range(6)]
+        for i in range(6):
+            z  = [Ts[i][k][2] for k in range(3)]
+            p  = [Ts[i][k][3] for k in range(3)]
+            dp = [(p_ee[k] - p[k]) / 1000.0 for k in range(3)]   # to meters
+            # cross(z, dp)
+            J[0][i] = z[1]*dp[2] - z[2]*dp[1]
+            J[1][i] = z[2]*dp[0] - z[0]*dp[2]
+            J[2][i] = z[0]*dp[1] - z[1]*dp[0]
+            J[3][i] = z[0]
+            J[4][i] = z[1]
+            J[5][i] = z[2]
+        try:
+            return float(_np.linalg.svd(_np.asarray(J), compute_uv=False).min())
+        except Exception:
+            return None
+
+    @staticmethod
+    def scale(sigma, soft, hard):
+        """Linear ramp: 1.0 at ≥soft, 0.0 at ≤hard, linear between.
+        Returns 1.0 when sigma is None (guard disabled) so we never
+        accidentally freeze motion because the model can't compute."""
+        if sigma is None:
+            return 1.0
+        if sigma >= soft:
+            return 1.0
+        if sigma <= hard:
+            return 0.0
+        return max(0.0, min(1.0, (sigma - hard) / (soft - hard)))
 
 
 class EstunCodroidDriver(Node):
@@ -126,6 +238,96 @@ class EstunCodroidDriver(Node):
         self.declare_parameter('joint_limit_margin_deg', 2.0)
         # Server should already validate |delta_deg| ≤ 5°; this is belt+braces.
         self.declare_parameter('jog_increment_max_delta_deg', 5.0)
+
+        # ── Cartesian-jog singularity + overspeed governor ──────────────
+        # Wire evidence (alarm 2015 on 2026-07-15): a Cartesian X hold at
+        # our speed_frac=0.15 drove the controller's IK to command Joint1
+        # at 1.57 rad/s (≈10× our cap) as the arm approached a wrist
+        # singularity — σ_min collapsed from 0.180 (5 s pre-alarm) → 0.021
+        # (100 ms pre-alarm) → 0.003 (alarm). The governor stops or
+        # scales the Cartesian jog before that final collapse. Applies
+        # to continuous_cart and cart_pulse; joint-mode holds are
+        # untouched (their per-joint cap already governs velocity).
+        # Thresholds are logarithmic-ish (soft ≈ 3× hard); tuned so the
+        # -100 ms danger point lands just above sigma_hard.
+        self.declare_parameter('cart_sigma_soft', 0.060)  # begin scaling
+        self.declare_parameter('cart_sigma_hard', 0.020)  # hard stop
+        # Reactive backstop — if the controller's live joint velocity
+        # spikes past this during OUR Cartesian hold, stop with reason
+        # 'joint overspeed guard J<n>'. 1.5 rad/s is a compromise: below
+        # the 2 rad/s that produced alarm 2015, and above what a bench
+        # Cartesian jog at speed_frac=0.15 in a healthy region produces
+        # (measured 0.3–0.5 rad/s peak-per-joint in the same session).
+        self.declare_parameter('cart_joint_velocity_cap_radps', 1.5)
+        # Mid-hold speed changes ramp, not step. Delta hysteresis avoids
+        # spamming stop+restart cycles; up-ramp is capped per tick so a
+        # pose that briefly re-opens (σ_min bounces back) can't
+        # instantly slam speed to 100%.
+        self.declare_parameter('cart_speed_change_min_delta', 0.10)   # 10%
+        self.declare_parameter('cart_speed_up_ramp_per_tick', 0.25)   # 25%
+
+        # ── Self-collision guard ────────────────────────────────────────
+        # Capsule model of the arm + ground plane, distances checked per
+        # supervise tick during ANY active jog (joint or cartesian).
+        # Applied AFTER the per-joint limit clamp and the cartesian
+        # singularity governor — this is the closest-approach guard.
+        # Wire evidence (2026-07-14): the operator-side lockouts we've
+        # seen have all been controller-side alarms; this guard is
+        # preventive so we never even ask the controller to command a
+        # motion that puts two links in contact. Direction-aware: a
+        # jog moving AWAY from the closest pair is NOT stopped —
+        # otherwise the operator gets wedged with every direction
+        # refused when clearance is already thin.
+        # Thresholds calibrated from the random-pose validation:
+        #   warn=80 mm  — surfaces "SELF-COLLISION WARNING" toast;
+        #                 amber tint on the offending pair in the twin;
+        #                 jog continues.
+        #   stop=30 mm  — stopJog with reason
+        #                 'self-collision guard <a>-<b> at <d>mm';
+        #                 red tint; recovery copy in the modal.
+        self.declare_parameter('collision_warn_distance_mm', 80.0)
+        self.declare_parameter('collision_stop_distance_mm', 30.0)
+        # Env thresholds — separate from self/ground so the two can
+        # diverge. Wire evidence 2026-07-15: env-guard was firing on
+        # phantom geometry because the DH-FK misplaced intermediate
+        # link frames; after the URDF-FK fix, env distances agree with
+        # collision_monitor (raw-LiDAR arithmetic) within a few mm.
+        # Tighter thresholds (env warn=50, stop=25) because the arm
+        # moves through the workspace and 80mm was overzealous.
+        self.declare_parameter('env_warn_distance_mm', 50.0)
+        self.declare_parameter('env_stop_distance_mm', 25.0)
+        # Config file lives beside the YAML params — resolved at init.
+        self.declare_parameter('collision_capsules_yaml',
+            '/home/teddy/cobot_ws/config/self_collision_capsules.yaml')
+        self.declare_parameter('collision_enabled', True)
+        # Ground plane z (mm) in the driver's base_link frame. The URDF
+        # base_link is the base flange; a mounted arm sits some
+        # distance above the physical floor. z=0 in base frame is the
+        # flange, NOT the floor — that was today's wedge (the guard
+        # thought every normal pose was at 87 mm from the "ground").
+        # Default -300 mm assumes a 300 mm stand; fit an exact number
+        # for your cell with scripts/fit_ground_plane.py and override
+        # via the YAML params file.
+        self.declare_parameter('ground_z_mm', -300.0)
+        # DISABLE ground plane check by default until the Y-up / Z-up
+        # frame convention mismatch between the URDF (Y-up) and the
+        # ground half-space model (Z-up) is properly resolved. Wire
+        # evidence 2026-07-15: after switching to URDF-native FK, the
+        # startup sanity line reported -80mm ground clearance because
+        # URDF-frame link Z values do not represent "height above the
+        # floor" as the ground model assumed. Env-obstacle checks are
+        # not affected — they compare capsule world coords directly
+        # against zone OBB world coords in the same URDF frame.
+        self.declare_parameter('ground_check_enabled', False)
+        # Fallback override: when the escape-direction model finds NO
+        # single-axis escape (deep pocket, or the model itself is
+        # wrong), allow any joint-mode jog at this reduced speed. The
+        # operator has an e-stop in hand and outranks a geometry model.
+        # Logs LOUDLY on every override so we can review after the fact.
+        self.declare_parameter('collision_fallback_speed_frac', 0.03)
+        # Speed cap while in the warn / stop zone. Escape jogs go
+        # through this cap so a slip never becomes a slam.
+        self.declare_parameter('collision_escape_speed_frac', 0.06)
 
         # Power write path — third gate, SEPARATE from allow_jog. Power
         # transitions are a distinct privilege: an operator may be
@@ -182,6 +384,23 @@ class EstunCodroidDriver(Node):
         self._joint_limit_margin_deg = float(self.get_parameter('joint_limit_margin_deg').value)
         self._jog_inc_max_delta_deg = float(self.get_parameter('jog_increment_max_delta_deg').value)
 
+        self._cart_sigma_soft   = float(self.get_parameter('cart_sigma_soft').value)
+        self._cart_sigma_hard   = float(self.get_parameter('cart_sigma_hard').value)
+        self._cart_joint_v_cap  = float(self.get_parameter('cart_joint_velocity_cap_radps').value)
+        self._cart_speed_min_delta   = float(self.get_parameter('cart_speed_change_min_delta').value)
+        self._cart_speed_up_per_tick = float(self.get_parameter('cart_speed_up_ramp_per_tick').value)
+
+        self._coll_warn_mm   = float(self.get_parameter('collision_warn_distance_mm').value)
+        self._coll_stop_mm   = float(self.get_parameter('collision_stop_distance_mm').value)
+        self._env_warn_mm    = float(self.get_parameter('env_warn_distance_mm').value)
+        self._env_stop_mm    = float(self.get_parameter('env_stop_distance_mm').value)
+        self._coll_yaml_path = str(self.get_parameter('collision_capsules_yaml').value)
+        self._coll_enabled   = bool(self.get_parameter('collision_enabled').value)
+        self._ground_z_mm    = float(self.get_parameter('ground_z_mm').value)
+        self._ground_check_enabled = bool(self.get_parameter('ground_check_enabled').value)
+        self._coll_fallback_frac = float(self.get_parameter('collision_fallback_speed_frac').value)
+        self._coll_escape_frac   = float(self.get_parameter('collision_escape_speed_frac').value)
+
         self._allow_power = bool(self.get_parameter('allow_power').value)
         self._allow_power_source = 'param'
         env_power = os.environ.get('ESTUN_ALLOW_POWER')
@@ -227,10 +446,30 @@ class EstunCodroidDriver(Node):
         self._is_estop   = False
         self._is_moving  = False
         # Alarm mirror. publish/Error carries db as a list of active
-        # alarms — empty list = no alarms, non-empty = at least one
-        # active. Populated by _on_error; consumed by the mode/status
-        # blob so the dashboard banner can show ALARM before Enable.
+        # alarms. Each entry (from wire captures) is
+        #   [severity:int, code:int, ts:float, text:str]
+        # Observed codes (2026-07 logs):
+        #   2000  "Joint<n> servo status error, error code: 0x<hex>."
+        #   2002  "Joint<n> exceeded limit."               ← the operator's case
+        #   2006  "Emergency stop button pressed."
+        #   2023  "Singular position."
+        #   9012  "Power disconnection detected."
+        #   13046 "Emergency stop pressed."
+        # _alarms holds the raw list from the last non-empty frame; empty
+        # frames arrive continuously as heartbeats between real alarms
+        # and MUST NOT clear the mirror (the controller re-emits only on
+        # state change, and an empty followed by a non-empty is normal).
+        # _alarm_active is set to the newest non-empty entry so the
+        # status blob can surface a single most-relevant alarm to the
+        # dashboard banner.
         self._alarms     = []
+        self._alarm_active = None    # dict {severity, code, ts, text} or None
+        # Latest stop reason for the dashboard's "why did jog stop?" line.
+        # Populated by every _stop_jog_locked path (staleness / limit /
+        # release / expiry / send-fail / disconnect / shutdown). The
+        # dashboard shows this transiently when last_stop_ts is recent.
+        self._last_stop_reason = ''
+        self._last_stop_ts     = 0.0
         self._last_posture_ts = 0.0
         self._last_status_ts  = 0.0
         self._last_disabled_log = 0.0
@@ -238,6 +477,77 @@ class EstunCodroidDriver(Node):
         # Rejection accounting.
         self._rej_counts = {}
         self._rej_warned = set()
+
+        # Cartesian-jog governor state.
+        self._sing_guard = SingularityGuard()
+        # Self-collision guard — loads capsule YAML at init. If the
+        # YAML is missing or malformed, we WARN and disable the guard
+        # rather than refuse to start the driver.
+        self._coll_model = None
+        if self._coll_enabled:
+            try:
+                from .collision import CollisionModel
+                self._coll_model = CollisionModel(self._coll_yaml_path)
+                self._coll_model.ground_z_mm = (
+                    self._ground_z_mm if self._ground_check_enabled else None)
+                self.get_logger().info(
+                    f'Self-collision guard loaded: {len(self._coll_model.capsules)} '
+                    f'capsules, {len(self._coll_model.pairs)} pairs from '
+                    f'{self._coll_yaml_path}  warn={self._coll_warn_mm:.0f}mm '
+                    f'stop={self._coll_stop_mm:.0f}mm  '
+                    f'ground_z={self._ground_z_mm:.0f}mm')
+            except Exception as e:
+                self.get_logger().warn(
+                    f'Self-collision guard DISABLED — could not load '
+                    f'{self._coll_yaml_path}: {e}')
+                self._coll_model = None
+        # Latest guard telemetry — dashboard mirror reads these.
+        self._coll_min_pair = None      # tuple (link_a, link_b) or None
+        self._coll_min_dist_mm = None   # float or None
+        self._coll_warning_active = False
+        # Environment (static-zone) subscription. We poll the dashboard's
+        # /api/collision/static_zones endpoint at low rate (they're
+        # static — no need for real-time updates). Zone fetch runs on
+        # its own thread to avoid blocking the ROS executor.
+        self._env_zones_url = 'https://127.0.0.1:8080/api/collision/static_zones'
+        self._env_zone_refresh_s = 30.0
+        self._env_last_refresh_ts = 0.0
+        # Escape-direction cache — published only when an env pair is
+        # within warn distance. list of dicts {joint, direction,
+        # projected_mm, current_mm}, sorted best-first.
+        self._env_escape_dirs = []
+        # Latest env pair specifically (self-collision pair can also
+        # be the overall winner; keep them separate so the popup only
+        # fires on environment collision, not self).
+        self._env_min_pair = None
+        self._env_min_dist_mm = None
+        # Unified guard state (drives the guard popup — covers self,
+        # ground, and env in one blob).
+        self._guard_active = False
+        self._guard_kind   = None       # 'self' | 'ground' | 'env' | None
+        self._guard_pair   = None
+        self._guard_min_dist_mm = None
+        self._guard_escapes = []
+        self._guard_warn_effective_mm = self._coll_warn_mm
+        self._guard_stop_effective_mm = self._coll_stop_mm
+        # Environment-zone refresher thread.
+        self._env_stop = threading.Event()
+        if self._coll_model is not None:
+            self._env_refresh_thread = threading.Thread(
+                target=self._env_refresh_thread_loop,
+                name='env-zone-refresh', daemon=True)
+            self._env_refresh_thread.start()
+        self._prev_joint_deg = None      # for reactive velocity backstop
+        self._prev_joint_ts  = 0.0
+        # Latest σ_min sample and effective scale — surfaced in status.
+        self._last_sigma_min = None
+        self._last_sing_scale = 1.0
+        # For mid-hold ramp: what did we last actually send on the wire?
+        # (Signed fraction, matching Robot/jog's `speed` field.)
+        self._cart_last_sent_speed = 0.0
+        # Commanded (unscaled) magnitude of the current hold, used as
+        # the ceiling the governor scales down from.
+        self._cart_commanded_frac = 0.0
 
         # Jog write-path state (only used when both monitor_only=false and
         # allow_jog=true — otherwise every jog message hits _on_write_reject).
@@ -745,6 +1055,106 @@ class EstunCodroidDriver(Node):
         target_mode = 'continuous' if mode_s == 'joint' else 'continuous_cart'
         robot_jog_mode = 1 if mode_s == 'joint' else 2  # captured protocol values
 
+        # ── Collision guard command-time gate (joint mode) ────────────
+        # THE WEDGE FIX. Evaluate the COMMANDED direction with an FK
+        # projection now (before we send anything), so a fresh command
+        # in the opposite direction from the last one gets a clean
+        # answer. Three cases:
+        #   1. current clearance > warn:            allow full-speed
+        #   2. current ≤ warn, projection OPENS:    escape → cap at 6%
+        #   3. current ≤ stop, projection CLOSES:   REFUSE (with reason)
+        #   4. current ≤ warn (not stop), CLOSES:   allow, log warning
+        #   5. no escape direction found at all AND current ≤ stop:
+        #      fallback → allow at 3% with LOUD log (operator has e-stop)
+        # Cartesian is left permissive here — the σ_min governor + the
+        # per-tick check handle it after motion begins.
+        override_used = False
+        if (self._coll_model is not None and mode_s == 'joint'
+                and self._last_posture_ts > 0.0):
+            try:
+                (pair, cur_min) = self._coll_model.min_distance_at(self._joint_deg)
+                if cur_min <= self._coll_warn_mm:
+                    # Project the commanded direction 5° ahead.
+                    proj = list(self._joint_deg)
+                    proj[axis-1] += 5.0 * (1.0 if direction > 0 else -1.0)
+                    _, proj_min = self._coll_model.min_distance_at(proj)
+                    opening = proj_min > cur_min + 0.5
+                    if opening:
+                        # Escape motion. Cap speed at 6% and let it go.
+                        cap = self._coll_escape_frac
+                        if effective_frac > cap:
+                            self.get_logger().info(
+                                f'guard: escape cap {effective_frac:.2f} → {cap:.2f} '
+                                f'(J{axis}{"+" if direction>0 else "-"}, '
+                                f'{cur_min:.0f}mm → {proj_min:.0f}mm, pair={pair})')
+                            effective_frac = cap
+                            signed_speed = direction * effective_frac
+                    else:
+                        # Closing motion.
+                        if cur_min <= self._coll_stop_mm:
+                            # Check if ANY direction opens. If none, we
+                            # honor the fallback override — operator
+                            # outranks a possibly-wrong geometry model.
+                            # If some other direction WOULD open, this
+                            # specific closing command is refused.
+                            offender_pair = pair
+                            has_escape = False
+                            if offender_pair and isinstance(offender_pair, tuple):
+                                a, b = offender_pair
+                                is_env  = isinstance(a, str) and a.startswith('zone#') \
+                                        or isinstance(b, str) and b.startswith('zone#')
+                                if is_env:
+                                    link = a if not a.startswith('zone#') else b
+                                    z_id = (a if a.startswith('zone#') else b).replace('zone#','')
+                                    has_escape = bool(self._coll_model.escape_directions(
+                                        self._joint_deg, link, z_id))
+                                else:
+                                    # For self/ground pairs we don't have a
+                                    # bulk escape helper — probe the 12
+                                    # single-axis directions inline.
+                                    for j in range(6):
+                                        for s in (+1, -1):
+                                            q_try = list(self._joint_deg)
+                                            q_try[j] += 5.0 * s
+                                            _, dt = self._coll_model.min_distance_at(q_try)
+                                            if dt > cur_min + 2.0:
+                                                has_escape = True; break
+                                        if has_escape: break
+                            if has_escape:
+                                self._reject(family,
+                                    f'collision guard: J{axis}{"+" if direction>0 else "-"} '
+                                    f'closes {pair} from {cur_min:.0f}mm '
+                                    f'(current ≤ stop {self._coll_stop_mm:.0f}mm). '
+                                    f'Use an escape direction from the popup.')
+                                return
+                            # FALLBACK — no direction opens per model; let the
+                            # operator override at 3% cap. This is the "model
+                            # wrong / geometry approximate" safety valve.
+                            cap = self._coll_fallback_frac
+                            if effective_frac > cap:
+                                self.get_logger().warn(
+                                    f'guard FALLBACK OVERRIDE: no escape direction '
+                                    f'per model at {pair} dist={cur_min:.0f}mm — '
+                                    f'allowing J{axis}{"+" if direction>0 else "-"} '
+                                    f'at {cap:.2f} cap (operator has e-stop)')
+                                effective_frac = cap
+                                signed_speed = direction * effective_frac
+                                override_used = True
+                        else:
+                            # In warn zone but not stop. Closing is allowed
+                            # but throttled to fallback speed for caution.
+                            cap = self._coll_fallback_frac
+                            if effective_frac > cap:
+                                self.get_logger().info(
+                                    f'guard: warn-zone closing throttle {effective_frac:.2f} → {cap:.2f} '
+                                    f'({pair} at {cur_min:.0f}mm, warn≤{self._coll_warn_mm:.0f}mm)')
+                                effective_frac = cap
+                                signed_speed = direction * effective_frac
+            except Exception as e:
+                if not getattr(self, '_coll_warned_bad', False):
+                    self._coll_warned_bad = True
+                    self.get_logger().warn(f'guard gate error (suppressed): {e}')
+
         with self._jog_lock:
             now = time.time()
 
@@ -798,6 +1208,11 @@ class EstunCodroidDriver(Node):
             self._jog_index = axis
             self._jog_direction = direction
             self._jog_signed_speed = signed_speed
+            # Governor bookkeeping — commanded magnitude (unscaled) and
+            # the actual speed we last put on the wire. Only meaningful
+            # for continuous_cart, but harmless to set for joint holds.
+            self._cart_commanded_frac  = abs(signed_speed)
+            self._cart_last_sent_speed = signed_speed
             self._jog_last_cmd_ts = now
             self._jog_last_hb_ts = now
             # Latch this session's identity so future refreshes with
@@ -910,6 +1325,8 @@ class EstunCodroidDriver(Node):
             self._jog_index = axis
             self._jog_direction = direction
             self._jog_signed_speed = signed_speed
+            self._cart_commanded_frac  = abs(signed_speed)
+            self._cart_last_sent_speed = signed_speed
             self._jog_last_cmd_ts = now
             self._jog_last_hb_ts = now
             self._jog_increment_end_ts = now + duration_s
@@ -962,6 +1379,30 @@ class EstunCodroidDriver(Node):
                          f'(limit ±{limit}, margin {margin})',
                          extra={'current_deg': current_deg, 'delta_deg': delta_deg})
             return
+
+        # Self-collision pre-check for increments — project the FINAL
+        # pose that the step will land at, reject if it crosses the
+        # stop threshold. Mirrors the joint-limit clamp above, using
+        # the same reason string convention. Continuous jogs run the
+        # per-tick guard in supervise; this pre-check is the discrete
+        # counterpart so a "tap" can't jump us into contact.
+        if self._coll_model is not None:
+            projected = list(self._joint_deg)
+            projected[axis-1] = target_deg
+            try:
+                pres = self._coll_model.evaluate(projected)
+                if pres:
+                    pa, pb, pd = pres[0]
+                    if pd <= self._coll_stop_mm:
+                        self._reject(family,
+                            f'self-collision guard {pa}-{pb} at {pd:.0f}mm '
+                            f'(projected after J{axis} {delta_deg:+.2f}° step)')
+                        return
+            except Exception as e:
+                if not getattr(self, '_coll_warned_bad', False):
+                    self._coll_warned_bad = True
+                    self.get_logger().warn(
+                        f'collision pre-check error (suppressed): {e}')
 
         # Busy check — only one jog at a time. Simpler than queueing.
         with self._jog_lock:
@@ -1023,6 +1464,208 @@ class EstunCodroidDriver(Node):
                 f'increment jog: J{axis} {delta_deg:+.2f}° @ speed_frac={speed_frac:.2f} '
                 f'(max {max_speed}°/s) → duration={duration_s*1000:.0f}ms, '
                 f'current={current_deg:+.2f}° → target={target_deg:+.2f}°')
+
+    def _refresh_env_zones(self):
+        """Fetch static-zone OBBs from the dashboard's collision API.
+        Runs on a dedicated thread — never blocks the ROS executor.
+        Static zones don't change at run-time (cell setup only), so
+        we poll infrequently (30 s). Silently no-op on any fetch error;
+        the guard just runs with the previously-known zones. If the
+        model isn't loaded (yaml missing), do nothing."""
+        if self._coll_model is None:
+            return
+        try:
+            import urllib.request, ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(
+                    self._env_zones_url, context=ctx, timeout=3) as r:
+                payload = json.loads(r.read())
+            from .collision import parse_static_zones
+            zones = parse_static_zones(payload)
+            prev_n = self._coll_model.env_zone_count
+            self._coll_model.set_env_zones(zones)
+            self._env_last_refresh_ts = time.time()
+            if len(zones) != prev_n:
+                self.get_logger().info(
+                    f'env zones refreshed: {prev_n} → {len(zones)} '
+                    f'from {self._env_zones_url}')
+        except Exception as e:
+            if not getattr(self, '_env_zone_fetch_warned', False):
+                self._env_zone_fetch_warned = True
+                self.get_logger().warn(
+                    f'env-zone fetch failed (retrying every '
+                    f'{self._env_zone_refresh_s:.0f}s): {e}')
+
+    def _env_refresh_thread_loop(self):
+        """Runs in a daemon thread — polls _refresh_env_zones at the
+        configured interval. Started from __init__ if collision is
+        enabled. Immediate first call so the guard has zones as soon
+        as possible after startup; subsequent calls at the interval."""
+        while not getattr(self, '_env_stop', threading.Event()).is_set():
+            self._refresh_env_zones()
+            # threading.Event.wait is interruptible for clean shutdown.
+            self._env_stop.wait(timeout=self._env_zone_refresh_s)
+
+    def _check_collision_locked(self):
+        """Evaluate self-collision at live joint angles. Returns True
+        iff we stopped the jog. Also updates self._coll_min_pair /
+        self._coll_min_dist_mm / self._coll_warning_active for the
+        status blob so the dashboard can render live clearance.
+
+        Direction-aware: if the current joint-velocity projection
+        shows the closest-pair distance INCREASING (opening up),
+        we suppress the stop even when distance is below the stop
+        threshold — otherwise the operator gets wedged with every
+        direction refused. Warning is issued regardless of direction.
+        Caller must hold self._jog_lock."""
+        try:
+            res = self._coll_model.evaluate(self._joint_deg)
+        except Exception as e:
+            # Model bug → fall silent, keep motion. Log first hit.
+            if not getattr(self, '_coll_warned_bad', False):
+                self._coll_warned_bad = True
+                self.get_logger().warn(f'collision guard error (suppressed): {e}')
+            return False
+        if not res:
+            return False
+        a, b, d = res[0]
+        self._coll_min_pair = (a, b)
+        self._coll_min_dist_mm = d
+
+        # Warning zone: log once when it becomes active, once when clears.
+        in_warn = d <= self._coll_warn_mm
+        if in_warn and not self._coll_warning_active:
+            self.get_logger().warn(
+                f'SELF-COLLISION WARNING: {a}-{b} at {d:.0f}mm '
+                f'(warn threshold {self._coll_warn_mm:.0f}mm)')
+            self._coll_warning_active = True
+        elif not in_warn and self._coll_warning_active:
+            self.get_logger().info(
+                f'self-collision warning cleared: {a}-{b} now at {d:.0f}mm')
+            self._coll_warning_active = False
+
+        if d > self._coll_stop_mm:
+            return False
+
+        # Below stop threshold — check direction using the COMMANDED
+        # jog direction (not observed velocity from posture-diff).
+        # THIS IS THE WEDGE FIX: the old code took (joint_deg -
+        # prev_joint_deg)/dt as the velocity vector, but when the arm
+        # is stopped (right after a guard stop, or on the first tick
+        # of a fresh command that hasn't moved anything yet), that
+        # velocity is ≈ 0. `projected == joint_deg` ⇒ same clearance
+        # ⇒ opening=False ⇒ STOP loops forever. The commanded
+        # direction is what we ACTUALLY intend, so use that.
+        opening = False
+        if self._jog_mode == 'continuous' and 1 <= self._jog_index <= 6:
+            projected = list(self._joint_deg)
+            step = 5.0 * (1.0 if self._jog_direction > 0 else -1.0)
+            projected[self._jog_index - 1] += step
+            try:
+                res2 = self._coll_model.evaluate(projected)
+                for a2, b2, d2 in res2:
+                    if (a2, b2) == (a, b):
+                        opening = d2 > d + 0.5
+                        break
+            except Exception:
+                opening = False
+        # Cartesian mode: we don't have an FK-forward projection for
+        # cartesian direction (that requires IK). Fall back to the
+        # older posture-diff heuristic — but only when we HAVE fresh
+        # posture-derived motion. If posture hasn't moved (freshly
+        # started), assume opening (trust the operator's fresh
+        # command in cartesian mode). The command-time gate in
+        # _start_or_refresh_continuous does the real work for cart.
+        elif self._jog_mode == 'continuous_cart':
+            pj = self._prev_joint_deg
+            pt = self._prev_joint_ts
+            if pj is not None and pt > 0.0 and self._last_posture_ts > pt:
+                dt = self._last_posture_ts - pt
+                if dt > 1e-4:
+                    projected = [self._joint_deg[i]
+                                 + (self._joint_deg[i] - pj[i]) / dt * 0.04
+                                 for i in range(6)]
+                    try:
+                        res2 = self._coll_model.evaluate(projected)
+                        for a2, b2, d2 in res2:
+                            if (a2, b2) == (a, b):
+                                opening = d2 > d + 0.5
+                                break
+                    except Exception:
+                        opening = False
+            else:
+                opening = True   # first-tick trust in commanded cart dir
+
+        if opening:
+            # Motion is moving away — don't stop, but keep the warning.
+            return False
+
+        # STOP. Reason string distinguishes env obstacle from self-
+        # collision so the dashboard can pick the right modal copy.
+        is_env = (isinstance(a, str) and a.startswith('zone#')) or \
+                 (isinstance(b, str) and b.startswith('zone#'))
+        kind = 'obstacle' if is_env else 'self-collision'
+        # Normalize order — put the link name first for readability.
+        if isinstance(a, str) and a.startswith('zone#'):
+            a, b = b, a
+        self._stop_jog_locked(
+            reason=f'{kind} guard {a} vs {b} at {d:.0f}mm')
+        return True
+
+    def _apply_governor_scale_locked(self, sigma, scale):
+        """Emit a fresh Robot/jog at the governor-scaled speed when the
+        change from the last-sent speed exceeds the hysteresis. Upward
+        ramp is capped per tick so a σ_min that briefly re-opens can't
+        instantly slam us back to full speed. Caller must hold
+        self._jog_lock."""
+        cmd  = self._cart_commanded_frac         # unscaled magnitude
+        sign = 1.0 if self._jog_direction >= 0 else -1.0
+        target_signed = sign * cmd * scale
+        last = self._cart_last_sent_speed
+        # Rate-limit upward changes. Downward changes propagate immediately.
+        if abs(target_signed) > abs(last):
+            cap_up = abs(last) + cmd * self._cart_speed_up_per_tick
+            if abs(target_signed) > cap_up:
+                target_signed = sign * min(abs(target_signed), cap_up)
+        # Hysteresis — only push a fresh frame when the change is
+        # material relative to the commanded magnitude. Avoids spam.
+        if abs(target_signed - last) < cmd * self._cart_speed_min_delta:
+            return
+        # Issue: stopJog + fresh Robot/jog. Preserve session identity —
+        # this is a speed change within the SAME hold, not a new one, so
+        # hold_id / seq bookkeeping stays put.
+        try:
+            self._send({'ty': 'Robot/stopJog', 'id': self._new_nonce()})
+        except Exception as e:
+            self.get_logger().warn(f'governor: stopJog send failed: {e}')
+            return
+        # Robot/jog with the new signed speed. index / coorType / coorId
+        # unchanged — we're only ramping magnitude.
+        frame = {
+            'ty': 'Robot/jog',
+            'db': {
+                'mode':     2,
+                'speed':    target_signed,
+                'index':    self._jog_index,
+                'coorType': 0,
+                'coorId':   0,
+            },
+            'id': self._new_nonce(),
+        }
+        try:
+            if not self._send(frame):
+                self.get_logger().warn('governor: Robot/jog send returned False')
+                return
+        except Exception as e:
+            self.get_logger().warn(f'governor: Robot/jog send failed: {e}')
+            return
+        self._cart_last_sent_speed = target_signed
+        self._jog_signed_speed = target_signed
+        self.get_logger().info(
+            f'governor scale {scale:.2f}: σ_min={sigma:.4f}  '
+            f'speed {last:+.3f} → {target_signed:+.3f}')
 
     def _stop_jog_from_expiry(self):
         """Fires from the threading.Timer scheduled by _start_increment_jog.
@@ -1096,6 +1739,64 @@ class EstunCodroidDriver(Node):
                                 reason=f'cart limit approach J{i+1} at {current:+.2f}° '
                                        f'(|>{safe_edge:.2f}°|)')
                             return
+                    # ── Singularity + overspeed governor (cart only) ──
+                    # Compute σ_min at live joint angles; scale/stop the
+                    # cartesian jog before the controller's IK explodes.
+                    if self._last_posture_ts > 0.0:
+                        sigma = self._sing_guard.sigma_min(self._joint_deg)
+                        self._last_sigma_min = sigma
+                        scale = SingularityGuard.scale(
+                            sigma, self._cart_sigma_soft, self._cart_sigma_hard)
+                        self._last_sing_scale = scale
+                        if sigma is not None and sigma <= self._cart_sigma_hard:
+                            self._stop_jog_locked(
+                                reason=f'singularity guard (σ_min={sigma:.4f} '
+                                       f'≤ hard={self._cart_sigma_hard:.3f})')
+                            return
+                        # Reactive backstop — the sole line of defense
+                        # when the DH model is off, or when the incident
+                        # is IK-controller-side rather than kinematics-
+                        # side. Finite-difference velocity from the last
+                        # two posture samples.
+                        pj = self._prev_joint_deg
+                        pt = self._prev_joint_ts
+                        if (pj is not None and pt > 0.0
+                                and self._last_posture_ts > pt):
+                            dt = self._last_posture_ts - pt
+                            if dt > 1e-4:
+                                for i in range(6):
+                                    dq_dps = (self._joint_deg[i] - pj[i]) / dt
+                                    dq_rps = math.radians(dq_dps)
+                                    if abs(dq_rps) > self._cart_joint_v_cap:
+                                        self._stop_jog_locked(
+                                            reason=f'joint overspeed guard J{i+1} '
+                                                   f'{dq_rps:+.2f} rad/s '
+                                                   f'(cap {self._cart_joint_v_cap:.2f})')
+                                        return
+                        # If σ is in the scaling zone, ramp the commanded
+                        # speed. The captured protocol rejects a fresh
+                        # Robot/jog while active only sometimes (the
+                        # "100/robot state is not ready" case was seen at
+                        # state=0, not during a good hold), so we go via
+                        # stopJog + fresh Robot/jog when the change is
+                        # meaningful — hysteresis at 10 %, up-ramp capped
+                        # per tick. If a downward change wanted, apply
+                        # immediately; upward changes rate-limit.
+                        if scale < 1.0 and sigma is not None:
+                            self._apply_governor_scale_locked(sigma, scale)
+
+                # ── Self-collision guard (both joint and cartesian) ──
+                # Applied AFTER the limit clamp + singularity governor
+                # so those stops keep their existing reason strings.
+                # Direction-aware: only stop if the commanded motion is
+                # REDUCING the min-pair distance. Uses a 40 ms look-ahead
+                # from the current joint velocity to project the next
+                # pose and re-evaluate.
+                if (self._coll_model is not None
+                        and self._last_posture_ts > 0.0
+                        and self._jog_mode in ('continuous', 'continuous_cart')):
+                    if self._check_collision_locked():
+                        return   # stopped
             if (now - self._jog_last_hb_ts) >= self._jog_hb_s:
                 try:
                     self._send({'ty': 'Robot/jogHeartbeat', 'id': self._new_nonce()})
@@ -1108,6 +1809,12 @@ class EstunCodroidDriver(Node):
         """Send Robot/stopJog and tear down the supervise timer. Caller
         must hold self._jog_lock. Safe to call when no jog is active."""
         was_active = self._jog_active
+        # Latch the reason regardless of active/inactive — the operator
+        # still wants to know when a rejected start or a redundant stop
+        # happened. Downstream dashboards decide staleness themselves
+        # via _last_stop_ts.
+        self._last_stop_reason = reason
+        self._last_stop_ts     = time.time()
         self._jog_active = False
         self._jog_mode = None
         self._jog_index = 0
@@ -1180,8 +1887,11 @@ class EstunCodroidDriver(Node):
             'enabling':       self._enabling,
             'state_code':     self._state_code,
             'state_name':     self._state_name,
-            'alarm':          len(self._alarms) > 0,
+            'alarm':          self._alarm_active is not None,
             'alarm_count':    len(self._alarms),
+            'active_alarm':   self._alarm_active,
+            'last_stop_reason': self._last_stop_reason,
+            'last_stop_ts':     self._last_stop_ts,
             'last_posture_age_s': (time.time() - self._last_posture_ts) if self._last_posture_ts else None,
             'last_status_age_s':  (time.time() - self._last_status_ts)  if self._last_status_ts  else None,
         }
@@ -1320,11 +2030,46 @@ class EstunCodroidDriver(Node):
 
     def _on_error(self, db):
         """publish/Error — db is a list of active alarms (empty when none).
-        Mirror the count and the raw list into telemetry so the dashboard
-        banner can show 'ALARM — [Clear Alarm]' before offering Enable."""
-        if isinstance(db, list):
-            self._alarms = db
-            self._publish_status_blob()
+        Each entry: [severity, code, ts, text] (wire-captured shape).
+        We mirror the raw list AND parse the newest entry into a structured
+        active_alarm blob so the dashboard can render cause + recovery text.
+
+        Note on empty frames: the controller re-emits Error on state
+        change but also keeps publishing at ~3 Hz; empty payloads DO
+        actively mean "no active alarms" once the alarm has cleared.
+        The dashboard's own "recent stop reason" surface is what
+        preserves cause after the alarm goes away."""
+        if not isinstance(db, list):
+            return
+        self._alarms = db
+        newest = None
+        for entry in db:
+            if not isinstance(entry, list) or len(entry) < 4:
+                continue
+            try:
+                sev  = int(entry[0])
+                code = int(entry[1])
+                ts   = float(entry[2])
+                text = str(entry[3])
+            except (TypeError, ValueError):
+                continue
+            if newest is None or ts > newest['ts']:
+                newest = {'severity': sev, 'code': code, 'ts': ts, 'text': text}
+        # Set/clear active alarm. Empty db → active clears immediately;
+        # non-empty → newest entry wins.
+        prev = self._alarm_active
+        self._alarm_active = newest
+        # Log alarm transitions (append + clear) once, don't spam per frame.
+        if newest is not None and (prev is None or prev.get('code') != newest['code']
+                                                 or prev.get('text') != newest['text']):
+            self.get_logger().warn(
+                f'ALARM active: code={newest["code"]} '
+                f'text={newest["text"]!r}')
+        elif newest is None and prev is not None:
+            self.get_logger().info(
+                f'ALARM cleared (was code={prev.get("code")} '
+                f'text={prev.get("text")!r})')
+        self._publish_status_blob()
 
     def _on_posture(self, db):
         """publish/RobotPosture — db.joint[6] (deg), db.end {x,y,z mm, a,b,c deg}."""
@@ -1333,7 +2078,13 @@ class EstunCodroidDriver(Node):
         joints = db.get('joint')
         if isinstance(joints, list) and len(joints) >= 6:
             # Vectorized-ish parse: single pass, deg → rad in place.
-            self._joint_deg = [float(joints[i]) for i in range(6)]
+            new_deg = [float(joints[i]) for i in range(6)]
+            # Snapshot the previous sample BEFORE overwriting — the
+            # supervise-tick reactive backstop reads this pair as its
+            # finite-difference joint velocity estimate.
+            self._prev_joint_deg = list(self._joint_deg)
+            self._prev_joint_ts  = self._last_posture_ts
+            self._joint_deg = new_deg
             self._joint_rad = [math.radians(v) for v in self._joint_deg]
 
             js = JointState()
@@ -1370,6 +2121,79 @@ class EstunCodroidDriver(Node):
             self._pub_tcp_pose.publish(ps)
 
         self._last_posture_ts = time.time()
+        # Passive collision evaluation — refresh min-pair distance on
+        # EVERY posture update, not just during active jogs. The 3D
+        # view's "min clearance" chip depends on this staying live at
+        # idle so the operator can see impending contact BEFORE they
+        # press a jog key. No stop action here; stops only fire in
+        # _check_collision_locked (jog-active path).
+        if self._coll_model is not None:
+            try:
+                res = self._coll_model.evaluate(self._joint_deg)
+                if res:
+                    a, b, d = res[0]
+                    self._coll_min_pair = (a, b)
+                    self._coll_min_dist_mm = d
+                # Separate the closest ENV pair — the escape popup
+                # fires only on environment contact, not self.
+                env = [(a, b, d) for a, b, d in res
+                       if isinstance(a, str) and isinstance(b, str)
+                       and (a.startswith('zone#') or b.startswith('zone#'))]
+                if env:
+                    a, b, d = env[0]
+                    self._env_min_pair = (a, b)
+                    self._env_min_dist_mm = d
+                    # Only spend the escape-search cost when we're in
+                    # or near the warn zone (< 2×warn). Otherwise the
+                    # popup wouldn't be firing anyway.
+                    if d < 2.0 * self._coll_warn_mm:
+                        link  = a if b.startswith('zone#') else b
+                        z_str = b if b.startswith('zone#') else a
+                        z_id  = z_str.split('#', 1)[1]
+                        self._env_escape_dirs = \
+                            self._coll_model.escape_directions(
+                                self._joint_deg, link, z_id)
+                    else:
+                        self._env_escape_dirs = []
+                else:
+                    self._env_min_pair = None
+                    self._env_min_dist_mm = None
+                    self._env_escape_dirs = []
+
+                # ── UNIFIED GUARD STATE ────────────────────────────────
+                # Whichever pair (self / ground / env) is closest wins
+                # and drives the guard popup. `guard_kind` picks the
+                # right modal copy; `guard_escapes` is the operator's
+                # live escape menu regardless of collision type.
+                a, b, d = res[0]
+                is_ground = (a == '__ground__' or b == '__ground__')
+                is_env    = (isinstance(a, str) and a.startswith('zone#')) \
+                          or (isinstance(b, str) and b.startswith('zone#'))
+                if is_ground:
+                    kind = 'ground'
+                elif is_env:
+                    kind = 'env'
+                else:
+                    kind = 'self'
+                self._guard_kind = kind
+                self._guard_pair = (a, b)
+                self._guard_min_dist_mm = d
+                # Threshold selection: env uses env_warn/stop; self+ground
+                # use collision_warn/stop.
+                warn_mm = self._env_warn_mm if kind == 'env' else self._coll_warn_mm
+                stop_mm = self._env_stop_mm if kind == 'env' else self._coll_stop_mm
+                self._guard_warn_effective_mm = warn_mm
+                self._guard_stop_effective_mm = stop_mm
+                # Compute escapes only when in/near the warn zone.
+                if d < 2.0 * warn_mm:
+                    self._guard_escapes = \
+                        self._coll_model.escape_directions_any(
+                            self._joint_deg, (a, b))
+                else:
+                    self._guard_escapes = []
+                self._guard_active = d <= warn_mm
+            except Exception:
+                pass
         self._publish_status_blob()
 
     def _on_status(self, db):
@@ -1428,6 +2252,37 @@ class EstunCodroidDriver(Node):
                     'RobotPosture will resume when the operator enables the arm.')
         elif not was_enabled:
             self.get_logger().info('RobotStatus.state=2 — controller ENABLED; posture stream should start.')
+            # Ground-plane sanity check — the first time posture goes
+            # live after enable, compute the minimum ground clearance
+            # implied by the current pose and the configured
+            # ground_z_mm. If ANY ground pair reports a NEGATIVE
+            # distance (i.e. the model thinks a link is below the
+            # physical floor), the configured value is wrong — WARN
+            # loudly. This is the 2026-07-15 wedge signature: with
+            # ground_z=0 default and normal pose, elbow was 87 mm
+            # "above" but really 400+ mm above the actual floor.
+            if (self._coll_model is not None
+                    and self._last_posture_ts > 0.0):
+                try:
+                    res = self._coll_model.evaluate(self._joint_deg)
+                    ground_res = [(a, b, d) for a, b, d in res
+                                  if a == '__ground__' or b == '__ground__']
+                    if ground_res:
+                        _, _, min_d = ground_res[0]
+                        if min_d < -50.0:   # 50 mm below "floor" is impossible
+                            self.get_logger().warn(
+                                f'GROUND SANITY FAIL: min ground clearance '
+                                f'{min_d:.0f} mm at current pose with '
+                                f'ground_z_mm={self._ground_z_mm:.0f}. The '
+                                f'physical floor cannot be above the arm — '
+                                f'check ground_z_mm in estun.yaml (should be '
+                                f'-stand_height_mm).')
+                        else:
+                            self.get_logger().info(
+                                f'ground clearance at enable pose: {min_d:.0f} mm '
+                                f'(configured ground_z_mm={self._ground_z_mm:.0f})')
+                except Exception:
+                    pass
 
         self._publish_status_blob()
 
@@ -1449,11 +2304,93 @@ class EstunCodroidDriver(Node):
             'moving':        self._is_moving,
             'enabled':       self._enabled,
             'enabling':      self._enabling,
-            'alarm':         len(self._alarms) > 0,
+            'alarm':         self._alarm_active is not None,
             'alarm_count':   len(self._alarms),
+            # Structured active alarm — {severity, code, ts, text} or None.
+            # Dashboard banner uses text + code to render cause + recovery
+            # guidance; specific codes (2002 joint-limit, 2006/13046 e-stop,
+            # 2023 singular, 9012 power) get bespoke copy.
+            'active_alarm':  self._alarm_active,
+            # Latest stop reason surface — dashboard shows this as a
+            # transient toast/banner line when last_stop_ts is recent.
+            'last_stop_reason': self._last_stop_reason,
+            'last_stop_ts':     self._last_stop_ts,
             'allow_power':   self._allow_power,
             'joints_deg':    list(self._joint_deg),
             'joints_rad':    list(self._joint_rad),
+            # Cartesian-jog governor telemetry. sigma_min is None when
+            # numpy isn't available (guard disabled — only the reactive
+            # backstop remains). cart_scale is what the last supervise
+            # tick applied to the commanded speed (1.0 = unchanged).
+            'sigma_min':       self._last_sigma_min,
+            'cart_scale':      self._last_sing_scale,
+            'cart_sigma_soft': self._cart_sigma_soft,
+            'cart_sigma_hard': self._cart_sigma_hard,
+            # Self-collision guard telemetry. Dashboard uses `collision_pair`
+            # + `collision_min_mm` to render an amber/red tint on the two
+            # offending links plus a live "min clearance" readout when
+            # any pair is under 2× warn.
+            'collision_enabled':   self._coll_model is not None,
+            'collision_pair':      (list(self._coll_min_pair)
+                                    if self._coll_min_pair else None),
+            'collision_min_mm':    self._coll_min_dist_mm,
+            'collision_warn_mm':   self._coll_warn_mm,
+            'collision_stop_mm':   self._coll_stop_mm,
+            'collision_warning':   self._coll_warning_active,
+            # Environment (static-obstacle) telemetry — separate from
+            # self-collision so the dashboard can trigger the escape
+            # popup only on env contact. Same warn/stop thresholds as
+            # self today; keys are separate so they can diverge.
+            'env_zone_count':      (self._coll_model.env_zone_count
+                                    if self._coll_model else 0),
+            'env_pair':            (list(self._env_min_pair)
+                                    if self._env_min_pair else None),
+            'env_min_mm':          self._env_min_dist_mm,
+            'env_escape_dirs':     list(self._env_escape_dirs),
+            # env_warn_mm/env_stop_mm are set in the guard block below;
+            # do not add them here.
+            # Unified guard state — one blob whatever the collision
+            # kind. The frontend popup keys off `guard_active`;
+            # `guard_kind` picks the headline copy.
+            'guard_active':        self._guard_active,
+            'guard_kind':          self._guard_kind,
+            'guard_pair':          (list(self._guard_pair)
+                                    if self._guard_pair else None),
+            'guard_min_mm':        self._guard_min_dist_mm,
+            'guard_warn_mm':       self._guard_warn_effective_mm,
+            'guard_stop_mm':       self._guard_stop_effective_mm,
+            'guard_escapes':       list(self._guard_escapes),
+            # Env-specific thresholds (dashboard reads separately from
+            # self/ground so it can label them).
+            'env_warn_mm':         self._env_warn_mm,
+            'env_stop_mm':         self._env_stop_mm,
+            'ground_z_mm':         self._ground_z_mm,
+            # Per-joint limit evaluation — one dict per joint so the
+            # dashboard can render a live joint-limit recovery guide.
+            # `out_of_range` means the joint is PAST its controller
+            # limit — the state that latches the 2002 alarm. Since our
+            # driver never emits Robot/jog while alarmed / disabled,
+            # the operator must jog the joint back on the factory UI;
+            # this field lets the dashboard render live guidance and
+            # a progress readout as they do so. `near_limit` is the
+            # softer "within margin" warning used pre-emptively by
+            # the jog clamp.
+            'joint_limits':  [
+                {
+                    'joint':         i + 1,
+                    'current_deg':   self._joint_deg[i],
+                    'limit_deg':     self._joint_limit_deg[i],
+                    'margin_deg':    self._joint_limit_margin_deg,
+                    'out_of_range':  abs(self._joint_deg[i]) > self._joint_limit_deg[i],
+                    'near_limit':    abs(self._joint_deg[i]) > (self._joint_limit_deg[i] - self._joint_limit_margin_deg),
+                    # Signed distance from the edge, for the recovery
+                    # progress bar — negative = past limit (magnitude
+                    # = degrees to bring the joint back INSIDE), positive
+                    # = margin remaining.
+                    'headroom_deg':  self._joint_limit_deg[i] - abs(self._joint_deg[i]),
+                }
+                for i in range(6)
+            ],
             'tcp_mm':        list(self._tcp_mm),
             'tcp_m':         list(self._tcp_m),
             'monitor_only':  self._monitor_only,

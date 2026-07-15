@@ -1,0 +1,532 @@
+"""Self-collision core — capsule model + pair distance evaluator.
+
+Used by the driver's supervise tick to decide warn / stop, and by the
+dashboard mirror to display live clearance. Kept as a standalone module
+(no rclpy dependency) so the offline validator can import it directly.
+
+Everything is in mm / degrees on the input side. FK uses the SAME fitted
+DH parameters as SingularityGuard in estun_driver_node — one source of
+truth, so a change in kinematics propagates to both σ_min and collision.
+"""
+
+from __future__ import annotations
+import math
+import os
+from typing import Iterable, Optional
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+# ── Fitted DH (identical to _FITTED_DH_STD in estun_driver_node) ──────
+_FITTED_DH_STD = [
+    (-0.00002,     90.00058,   325.89611, -179.99989),
+    (-701.00394,    0.00028,  -579.68908,  -90.00022),
+    (-538.58526,  180.00313,  -214.01833,   -0.00615),
+    (-0.00374,    -89.99857, -1000.00000,  -90.00736),
+    ( 0.00533,     89.99433,  -161.46726,  179.99693),
+    (-0.00155,     -0.00674,   150.49959,    0.00152),
+]
+_FITTED_BASE_Z_MM = -139.89595
+
+# URDF link name for each frame after the corresponding joint transform.
+# Frame index 0 = base_link (pre-joint1). After joint i's DH transform,
+# we are at the link that JOINT i drives — i.e. frame 1 = link1_shoulder.
+LINK_NAMES = [
+    'base_link',       # frame 0
+    'link1_shoulder',  # frame 1 (after joint_1)
+    'link2_upper_arm', # frame 2
+    'link3_forearm',   # frame 3
+    'link4_wrist1',    # frame 4
+    'link5_wrist2',    # frame 5
+    'link6_flange',    # frame 6
+]
+
+
+def _dh_T(theta, d_mm, a_mm, alpha):
+    """Standard DH: T = Rz(θ) · Tz(d) · Tx(a) · Rx(α). Returns 4×4 list."""
+    ct, st = math.cos(theta), math.sin(theta)
+    ca, sa = math.cos(alpha), math.sin(alpha)
+    return [
+        [ct, -st*ca,  st*sa, a_mm*ct],
+        [st,  ct*ca, -ct*sa, a_mm*st],
+        [0.0,    sa,     ca, d_mm],
+        [0.0,   0.0,    0.0, 1.0],
+    ]
+
+
+def _matmul4(A, B):
+    return [[sum(A[i][k]*B[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+
+def fk_frames(q_deg):
+    """Return the 7 link-frame transforms in the base frame (numpy 4×4)
+    for q_deg[0..5], in URDF visual-frame convention. Frame 0 is
+    base_link; frame k for k≥1 is `link<k>_*` at its URDF-child joint.
+
+    WHY NOT DH: the standard DH chain (fit in dh_fit_report.txt) is
+    TCP-accurate but places INTERMEDIATE link frames at DH's own
+    convention — NOT at the URDF link-visual origins. That silently
+    broke env-collision detection: capsules (defined in URDF link
+    frames when we fit them from meshes) got placed in DH frames,
+    misaligning link2's world position by hundreds of mm. Wire
+    evidence 2026-07-15: env guard reported 68 mm to zone#static_003
+    while collision_monitor (URDF FK) correctly reported 1017 mm.
+    We use URDF-native chain from the same source as
+    src/cobot_bringup/scripts/collision_monitor.py.
+
+    DH is still the right model for TCP (σ_min governor); keep it
+    exported as `SingularityGuard`. This FK is for collision only."""
+    if np is None:
+        raise RuntimeError('numpy required for FK')
+    # URDF chain — matches /robot/urdf (s10-140-full.urdf) EXACTLY.
+    # These are the joint origins + axes read directly from the URDF
+    # (grep '<joint' in the file). collision_monitor.py has its own
+    # simplified chain that predates the fit-derived URDF and is
+    # numerically different — do NOT copy from there. Row per joint:
+    # (parent→child translation in mm, joint axis in that parent
+    # frame). Angles arrive in DEGREES.
+    URDF_CHAIN = [
+        # joint  origin (mm)                    axis
+        # J1:    (-0.341, 0.000, -0.038)         (0, 1, 0)
+        (( -0.341,   0.000,   -0.038),  (0.0,  1.0, 0.0)),
+        # J2:    (-201.859, 183.312, 0.221)      (-1, 0, 0)
+        ((-201.859, 183.312,   0.221),  (-1.0, 0.0, 0.0)),
+        # J3:    (144.000, 700.198, -0.187)      (-1, 0, 0)
+        (( 144.000, 700.198,  -0.187),  (-1.0, 0.0, 0.0)),
+        # J4:    (-1.437, 538.990, 0.005)        (1, 0, 0)
+        ((  -1.437, 538.990,   0.005),  ( 1.0, 0.0, 0.0)),
+        # J5:    (-147.868, 83.500, 0.000)       (0, -1, 0)
+        ((-147.868,  83.500,   0.000),  (0.0, -1.0, 0.0)),
+        # J6:    (-131.895, 78.106, 2.073)       (-1, 0, 0)
+        ((-131.895,  78.106,   2.073),  (-1.0, 0.0, 0.0)),
+    ]
+    R = np.eye(3)
+    p = np.zeros(3)
+    frames = []
+    # Frame 0 is base_link at world origin.
+    T0 = np.eye(4)
+    frames.append(T0)
+    for i, (xyz, axis) in enumerate(URDF_CHAIN):
+        # Translate in current frame.
+        p = p + R @ np.asarray(xyz, dtype=np.float64)
+        # Rotate about the local axis by joint angle.
+        theta = math.radians(q_deg[i])
+        c = math.cos(theta); s = math.sin(theta)
+        ax = np.asarray(axis, dtype=np.float64)
+        # Rodrigues rotation matrix.
+        ux, uy, uz = ax
+        C = 1 - c
+        Rj = np.array([
+            [c + ux*ux*C,    ux*uy*C - uz*s, ux*uz*C + uy*s],
+            [uy*ux*C + uz*s, c + uy*uy*C,    uy*uz*C - ux*s],
+            [uz*ux*C - uy*s, uz*uy*C + ux*s, c + uz*uz*C   ],
+        ])
+        R = R @ Rj
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3,  3] = p
+        frames.append(T)
+    return frames
+
+
+# ── Capsule model ─────────────────────────────────────────────────────
+
+class Capsule:
+    __slots__ = ('link', 'p0_local', 'p1_local', 'radius')
+    def __init__(self, link: str, p0_local, p1_local, radius: float):
+        self.link = link
+        self.p0_local = np.asarray(p0_local, dtype=np.float64)  # in link frame, mm
+        self.p1_local = np.asarray(p1_local, dtype=np.float64)
+        self.radius = float(radius)
+
+
+def load_capsules_yaml(path):
+    """Minimal YAML parser tuned to fit_capsules.py's output — no
+    PyYAML dep. Returns (dict[link → Capsule], list[(a,b)] pair list)."""
+    capsules = {}
+    pairs = []
+    section = None
+    cur_link = None
+    cur = {}
+    def flush():
+        nonlocal cur_link, cur
+        if cur_link and 'p0' in cur and 'p1' in cur and 'radius' in cur:
+            capsules[cur_link] = Capsule(cur_link, cur['p0'], cur['p1'], cur['radius'])
+        cur_link, cur = None, {}
+    with open(path) as fh:
+        for raw in fh:
+            line = raw.split('#', 1)[0].rstrip()
+            if not line.strip():
+                continue
+            stripped = line.strip()
+            if line.startswith('capsules:'):
+                section = 'capsules'; continue
+            if line.startswith('pairs:'):
+                flush(); section = 'pairs'; continue
+            if line.startswith('ground_plane:'):
+                flush(); section = 'ground'; continue
+            if section == 'capsules':
+                # `  link_name:`  → new capsule; `    key: value` → field
+                indent = len(line) - len(line.lstrip(' '))
+                if indent == 2 and stripped.endswith(':'):
+                    flush()
+                    cur_link = stripped[:-1]
+                elif indent == 4:
+                    k, _, v = stripped.partition(':')
+                    v = v.strip()
+                    if k in ('p0', 'p1'):
+                        cur[k] = [float(x) for x in v.strip('[]').split(',')]
+                    elif k == 'radius':
+                        cur[k] = float(v)
+            elif section == 'pairs':
+                if stripped.startswith('-'):
+                    inner = stripped[1:].strip().strip('[]')
+                    a, b = [s.strip() for s in inner.split(',')]
+                    pairs.append((a, b))
+    flush()
+    return capsules, pairs
+
+
+# ── Geometry: capsule-capsule distance ────────────────────────────────
+
+def _clamp01(x):
+    return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+
+
+def _segment_segment_dist(p1, q1, p2, q2):
+    """Shortest distance between two line SEGMENTS (Ericson, Real-Time
+    Collision Detection §5.1.9). Returns (dist, closestA, closestB)."""
+    d1 = q1 - p1
+    d2 = q2 - p2
+    r  = p1 - p2
+    a  = float(d1 @ d1)
+    e  = float(d2 @ d2)
+    f  = float(d2 @ r)
+    EPS = 1e-8
+    if a <= EPS and e <= EPS:
+        return float(np.linalg.norm(p1 - p2)), p1, p2
+    if a <= EPS:
+        s = 0.0
+        t = _clamp01(f / e)
+    else:
+        c = float(d1 @ r)
+        if e <= EPS:
+            t = 0.0
+            s = _clamp01(-c / a)
+        else:
+            b = float(d1 @ d2)
+            denom = a * e - b * b
+            s = _clamp01((b * f - c * e) / denom) if denom > EPS else 0.0
+            t = (b * s + f) / e
+            if t < 0.0:
+                t = 0.0
+                s = _clamp01(-c / a)
+            elif t > 1.0:
+                t = 1.0
+                s = _clamp01((b - c) / a)
+    ca = p1 + d1 * s
+    cb = p2 + d2 * t
+    return float(np.linalg.norm(ca - cb)), ca, cb
+
+
+def _capsule_capsule_dist(cap_a_p0, cap_a_p1, r_a, cap_b_p0, cap_b_p1, r_b):
+    """Closest-surface distance between two capsules. Negative when
+    the capsules interpenetrate. Returns (surface_dist_mm, axis_dist_mm)."""
+    d, _, _ = _segment_segment_dist(cap_a_p0, cap_a_p1, cap_b_p0, cap_b_p1)
+    return d - (r_a + r_b), d
+
+
+def _capsule_ground_dist(cap_p0, cap_p1, r, z_ground):
+    """Signed distance from a capsule's lowest surface point to the
+    ground plane z = z_ground. Positive = above; negative = below."""
+    z_min_surface = min(cap_p0[2], cap_p1[2]) - r
+    return z_min_surface - z_ground
+
+
+# ── Transformer: capsule endpoints from link frame → base frame ───────
+
+def _transform_point(T, p_local):
+    """T is 4×4 numpy; p_local is (3,) mm. Returns (3,) mm."""
+    return T[:3, :3] @ p_local + T[:3, 3]
+
+
+# ── Environment obstacles (from static-zone pipeline) ────────────────
+
+class ObbZone:
+    """Oriented bounding box in world frame. `center` is mm, `R` is a
+    3×3 world→local rotation (i.e. R @ (p - center) gives the point in
+    the OBB's local axes), `half` is mm half-extents in the OBB's own
+    axes. `zone_id` is the identifier from the /api/collision/static_zones
+    payload so we can name the offending zone in stop reasons."""
+    __slots__ = ('zone_id', 'center', 'R', 'half')
+    def __init__(self, zone_id, center_mm, R, half_mm):
+        self.zone_id = zone_id
+        self.center = np.asarray(center_mm, dtype=np.float64)
+        self.R      = np.asarray(R,          dtype=np.float64)
+        self.half   = np.asarray(half_mm,    dtype=np.float64)
+
+
+def _quat_to_rotmat(x, y, z, w):
+    """Right-handed unit quaternion → 3×3 rotation matrix."""
+    xx, yy, zz = x*x, y*y, z*z
+    xy, xz, yz = x*y, x*z, y*z
+    wx, wy, wz = w*x, w*y, w*z
+    return np.array([
+        [1-2*(yy+zz),   2*(xy-wz),     2*(xz+wy)],
+        [2*(xy+wz),     1-2*(xx+zz),   2*(yz-wx)],
+        [2*(xz-wy),     2*(yz+wx),     1-2*(xx+yy)],
+    ], dtype=np.float64)
+
+
+def parse_static_zones(payload):
+    """Convert the /api/collision/static_zones payload (a list of
+    zone dicts with center/dimensions/orientation in METERS) into a
+    list of ObbZone in MILLIMETERS. Robust to missing fields — any
+    zone we can't parse is skipped with a printed warning."""
+    zones = []
+    for z in (payload or {}).get('zones', []):
+        try:
+            c = z['center']; d = z['dimensions']; q = z['orientation']
+            center_mm = np.array([c['x'], c['y'], c['z']]) * 1000.0
+            half_mm   = np.array([d['x'], d['y'], d['z']]) * 500.0   # /2 * 1000
+            R_world_from_local = _quat_to_rotmat(q['x'], q['y'], q['z'], q['w'])
+            # We store R as WORLD→LOCAL so distance queries can rotate
+            # a world-frame point into the OBB's local axes.
+            R_world_to_local = R_world_from_local.T
+            zones.append(ObbZone(z.get('id') or z.get('name') or '?',
+                                 center_mm, R_world_to_local, half_mm))
+        except (KeyError, TypeError) as e:
+            # Skip malformed zones — one bad entry shouldn't kill the guard.
+            continue
+    return zones
+
+
+# Sample density along each capsule for capsule-vs-OBB distance. Twenty
+# samples gives ≤ ~50 mm spacing on the longest arm capsule (link2 at
+# 840 mm), well below the 30 mm stop threshold. Trades a small amount
+# of accuracy for a fully-vectorized per-capsule query.
+CAPSULE_OBB_SAMPLES = 20
+
+
+def _capsule_obb_dist(cap_p0_world, cap_p1_world, radius, obb):
+    """Distance from a capsule (world-frame endpoints + radius) to an
+    OBB. Returns surface-to-surface mm (negative on interpenetration).
+
+    Method: sample points along the capsule axis, transform to OBB
+    local frame, clamp each to the OBB half-extents, take the min
+    distance across samples, subtract capsule radius."""
+    ts = np.linspace(0.0, 1.0, CAPSULE_OBB_SAMPLES)
+    pts = cap_p0_world[None, :] + ts[:, None] * (cap_p1_world - cap_p0_world)[None, :]
+    local = (pts - obb.center) @ obb.R.T   # since R is world→local, R.T is local→world;
+                                            # for a point p_world we compute R @ (p - c) → local
+    # Actually: R stored is world→local, so p_local = R @ (p_world - center).
+    # Above line applied R.T on the right, which is equivalent to (R @ (p-c).T).T only when R is orthogonal.
+    # Use explicit matmul to keep it obvious:
+    local = (obb.R @ (pts - obb.center).T).T
+    clipped = np.clip(local, -obb.half, obb.half)
+    dists = np.linalg.norm(local - clipped, axis=1)
+    return float(dists.min() - radius)
+
+
+class CollisionModel:
+    """Holds the capsule dict + pair list + ground plane + env OBBs.
+    Evaluates all pairs given a joint-angle vector; returns a list of
+    (link_a, link_b, surface_dist_mm) tuples sorted by ascending
+    distance. Env obstacles produce (link, 'zone#<id>', dist)
+    entries. Computes FK once per call."""
+
+    def __init__(self, capsules_yaml_path):
+        self.capsules, self.pairs = load_capsules_yaml(capsules_yaml_path)
+        # Ground plane z (mm). Set `ground_z_mm = None` to disable
+        # ground checks entirely (needed until URDF Y-up vs ground
+        # Z-up convention is unified). Env-obstacle pairs continue to
+        # run regardless.
+        self.ground_z_mm = 0.0
+        # Environment OBBs — populated externally via set_env_zones()
+        # so the driver can refresh them at the low static-zone
+        # update rate (they don't move at run-time by definition).
+        self._env_zones = []
+
+    def set_env_zones(self, zones):
+        """Replace the environment obstacle set. `zones` is a list of
+        ObbZone or the raw payload from /api/collision/static_zones
+        (dicts). Called by the driver whenever the static-zone
+        subscription publishes a fresh snapshot."""
+        if not zones:
+            self._env_zones = []
+            return
+        if isinstance(zones[0], ObbZone):
+            self._env_zones = list(zones)
+        else:
+            self._env_zones = parse_static_zones({'zones': zones})
+
+    @property
+    def env_zone_count(self):
+        return len(self._env_zones)
+
+    def evaluate(self, q_deg):
+        """Returns a list of (a, b, dist_mm) sorted ascending, mixing:
+          - self-pair capsule-capsule distances (a, b are link names)
+          - self-pair capsule-ground distances (a='__ground__', b=link or vice-versa)
+          - env-obstacle capsule-OBB distances (a=link name,
+            b='zone#<id>' string)
+        Computes FK once, converts each capsule's endpoints to world
+        frame once, then dispatches each pair to its geometry."""
+        frames = fk_frames(q_deg)
+        # Precompute each real capsule's endpoints in the base frame.
+        world = {}
+        for link, cap in self.capsules.items():
+            idx = LINK_NAMES.index(link)
+            T = frames[idx]
+            world[link] = (
+                _transform_point(T, cap.p0_local),
+                _transform_point(T, cap.p1_local),
+                cap.radius,
+            )
+        results = []
+        for a, b in self.pairs:
+            if a == '__ground__' or b == '__ground__':
+                if self.ground_z_mm is None:
+                    continue      # ground checks disabled
+                real = b if a == '__ground__' else a
+                if real not in world:
+                    continue
+                p0, p1, r = world[real]
+                d = _capsule_ground_dist(p0, p1, r, self.ground_z_mm)
+                results.append((a, b, float(d)))
+                continue
+            if a not in world or b not in world:
+                continue
+            a_p0, a_p1, r_a = world[a]
+            b_p0, b_p1, r_b = world[b]
+            d, _ = _capsule_capsule_dist(a_p0, a_p1, r_a, b_p0, b_p1, r_b)
+            results.append((a, b, float(d)))
+        # Env obstacles — every arm capsule vs every zone. On this arm
+        # (7 capsules) × typical 3-8 zones the cost is O(30) point-samples
+        # per OBB per capsule; measured ~1.5 ms/tick for 8 zones.
+        for link, (p0, p1, r) in world.items():
+            for z in self._env_zones:
+                d = _capsule_obb_dist(p0, p1, r, z)
+                results.append((link, f'zone#{z.zone_id}', float(d)))
+        results.sort(key=lambda t: t[2])
+        return results
+
+    def env_dist_for_pair(self, q_deg, link_name, zone_id):
+        """Fast path: compute the distance between one specific arm
+        capsule and one specific env zone. Used by the escape-direction
+        search — projects a candidate pose one step ahead and only
+        needs to know how ONE distance changes, not the full sweep.
+        Returns +inf if zone or link not found."""
+        cap = self.capsules.get(link_name)
+        if cap is None:
+            return float('inf')
+        zone = next((z for z in self._env_zones if z.zone_id == zone_id), None)
+        if zone is None:
+            return float('inf')
+        frames = fk_frames(q_deg)
+        idx = LINK_NAMES.index(link_name)
+        T = frames[idx]
+        p0 = _transform_point(T, cap.p0_local)
+        p1 = _transform_point(T, cap.p1_local)
+        return _capsule_obb_dist(p0, p1, cap.radius, zone)
+
+    # Joint step size for the escape-direction search (degrees). One
+    # tick of motion at 6% speed_frac × max_joint_speed 180°/s over
+    # 50 ms ≈ 0.54° — the 5° step used here is deliberately larger so
+    # the direction of clearance change is unambiguous under sensor
+    # noise. Direction is what matters; the actual escape jog is
+    # separately capped at 6% via the frontend.
+    ESCAPE_JOINT_STEP_DEG = 5.0
+    # Hysteresis for "opens": require the projected distance to be
+    # bigger than current by this much to count as an escape direction.
+    # Prevents jitter from producing meaningless candidates.
+    ESCAPE_OPEN_MARGIN_MM = 2.0
+
+    def escape_directions(self, q_deg, offending_link, offending_zone_id):
+        """For the given (link, zone) offender, return a list of
+        joint directions whose one-step-ahead projection INCREASES
+        clearance. Each entry: {'joint': 1..6, 'direction': ±1,
+        'projected_mm': float}.
+
+        Uses the fast env_dist_for_pair for the projected evaluation
+        so 12 candidate probes fit inside ~2 ms — dominated by FK.
+        Ordered by projected distance descending (best escape first)."""
+        cur = self.env_dist_for_pair(q_deg, offending_link, offending_zone_id)
+        if not math.isfinite(cur):
+            return []
+        cands = []
+        for j in range(6):
+            for sign in (+1, -1):
+                q_try = list(q_deg)
+                q_try[j] = q_deg[j] + sign * self.ESCAPE_JOINT_STEP_DEG
+                proj = self.env_dist_for_pair(q_try, offending_link, offending_zone_id)
+                if proj > cur + self.ESCAPE_OPEN_MARGIN_MM:
+                    cands.append({
+                        'joint':     j + 1,
+                        'direction': sign,
+                        'projected_mm': proj,
+                        'current_mm':   cur,
+                    })
+        cands.sort(key=lambda c: -c['projected_mm'])
+        return cands
+
+    def min_distance_at(self, q_deg):
+        """Return the closest pair (any kind) + its distance for the
+        given joint angles. Used by the command-time direction check
+        to decide whether a jog opens or closes clearance — doesn't
+        care about pair identity, only min. Fast: computes FK once
+        + all pair distances but returns first-result only."""
+        res = self.evaluate(q_deg)
+        if not res:
+            return None, float('inf')
+        a, b, d = res[0]
+        return (a, b), d
+
+    def escape_directions_any(self, q_deg, pair):
+        """Escape-direction search for ANY pair (self / ground / env).
+        Probes the 12 single-axis joint directions with a 5° step;
+        keeps those that increase this specific pair's distance by at
+        least ESCAPE_OPEN_MARGIN_MM. Used when the offender is self-
+        collision or ground, where the env-specific fast path doesn't
+        apply. Returns same shape as escape_directions()."""
+        if not pair:
+            return []
+        a, b = pair
+        # Baseline: find this pair's current distance.
+        cur = None
+        for x, y, d in self.evaluate(q_deg):
+            if (x, y) == (a, b):
+                cur = d; break
+        if cur is None or not math.isfinite(cur):
+            return []
+        cands = []
+        for j in range(6):
+            for sign in (+1, -1):
+                q_try = list(q_deg)
+                q_try[j] = q_deg[j] + sign * self.ESCAPE_JOINT_STEP_DEG
+                proj = None
+                for x, y, d in self.evaluate(q_try):
+                    if (x, y) == (a, b):
+                        proj = d; break
+                if proj is None:
+                    continue
+                if proj > cur + self.ESCAPE_OPEN_MARGIN_MM:
+                    cands.append({
+                        'joint':     j + 1,
+                        'direction': sign,
+                        'projected_mm': proj,
+                        'current_mm':   cur,
+                    })
+        cands.sort(key=lambda c: -c['projected_mm'])
+        return cands
+
+    def evaluate_min(self, q_deg):
+        """Fast path — returns (min_pair, min_dist_mm, all_results). If
+        the caller only needs the closest pair, this saves nothing over
+        evaluate() but reads cleaner."""
+        res = self.evaluate(q_deg)
+        return (res[0][:2] if res else None,
+                res[0][2]   if res else float('inf'),
+                res)

@@ -4,6 +4,8 @@ import TopBar from './components/TopBar'
 import StatusBar from './components/StatusBar'
 import ToastContainer from './components/ToastContainer'
 import EStopOverlay from './components/EStopOverlay'
+import AlarmRecoveryModal from './components/AlarmRecoveryModal'
+import ObstacleEscapeModal from './components/ObstacleEscapeModal'
 import ViewportDebug from './components/ViewportDebug'
 import MonitorDashboard from './pages/MonitorDashboard'
 import ProgramLayout from './layouts/ProgramLayout'
@@ -172,6 +174,8 @@ export default function App() {
 
         <ToastContainer />
         <EStopOverlay />
+        <AlarmRecoveryModal />
+        <ObstacleEscapeModal />
         <ViewportDebug />
       </div>
     </ErrorBoundary>
