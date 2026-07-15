@@ -89,8 +89,11 @@ export default function StatusBar() {
       {/* Right side: version */}
       <Block style={{ borderRight: 'none', borderLeft: '1px solid var(--border)', color: 'var(--text-muted)' }}>
         {typeof __COMMIT__ !== 'undefined' ? `build ${__COMMIT__}` : 'dev'}
+        {typeof __BUILD_ID__ !== 'undefined' && (
+          <span style={{ marginLeft: 4, opacity: 0.85 }}>· {__BUILD_ID__}</span>
+        )}
         {typeof __BUILD_TIME__ !== 'undefined' && (
-          <span style={{ marginLeft: 6, opacity: 0.6 }}>{__BUILD_TIME__}</span>
+          <span style={{ marginLeft: 6, opacity: 0.55 }}>{__BUILD_TIME__}</span>
         )}
       </Block>
     </div>

@@ -42,6 +42,45 @@ const storeDefinition = (set, get) => ({
     positions: [0, 0, 0, 0, 0, 0],
     velocities: [0, 0, 0, 0, 0, 0],
   },
+  // Real-arm state — mirrored from dashboard_server, which listens to
+  // /estun/status. IncrementalJogPanel disables its buttons while
+  // jog_active is true or connected is false.
+  robot: {
+    connected: false,
+    mode: 'unknown',
+    safety_mode: 'unknown',
+    status_flag: 0,
+    moving: false,
+    jog_active: false,
+    jog_mode: null,
+    jog_index: 0,
+    jog_direction: 0,
+    allow_jog: false,
+    allow_cartesian_jog: false,
+  },
+
+  // 3D View tab's REAL-ARM jog panel visibility. Three states —
+  // 'MINIMIZED' shows a dockable pill, 'NORMAL' shows the panel
+  // beside the viewer, 'EXPANDED' fills the tab area (only one
+  // panel can be expanded at a time; if a future viewer panel adopts
+  // the same pattern it toggles this off when it expands).
+  view3dJogPanel: 'NORMAL',
+  setView3dJogPanel(mode) {
+    if (mode === 'MINIMIZED' || mode === 'NORMAL' || mode === 'EXPANDED') {
+      set({ view3dJogPanel: mode })
+    }
+  },
+
+  // JogControls press style — mirrors the factory pendant's Jogging/
+  // Inching split. STEP = one increment per press (no hold-repeat);
+  // CONTINUOUS = motion while held. Applies to both Joint and Cartesian.
+  // Default STEP: the conservative one. Persisted in Zustand (memory
+  // only — no localStorage; a fresh page load resets to STEP).
+  jogStyle: 'STEP',
+  setJogStyle(style) {
+    if (style === 'STEP' || style === 'CONTINUOUS') set({ jogStyle: style })
+  },
+
   task: {
     state: 'IDLE',
     target: null,
@@ -143,6 +182,7 @@ const storeDefinition = (set, get) => ({
         set({
           safety: msg.safety ?? get().safety,
           joints: msg.joints ?? get().joints,
+          robot: msg.robot ?? get().robot,
           task: msg.task ?? get().task,
           detections: msg.detections ?? get().detections,
           // Server publishes detection_mode in STATE; keep the store
@@ -302,6 +342,90 @@ const storeDefinition = (set, get) => ({
       return
     }
     return get().sendCommand('jog', { joint, delta })
+  },
+
+  // ── Continuous hold-to-jog ────────────────────────────────
+  // JogControls calls jogHold on press + every ~150 ms while held,
+  // and jogRelease on release / touchcancel / unmount. The backend
+  // translates hold:true / hold:false into /robot/jog_command frames
+  // consumed by the driver's continuous-jog state machine.
+  //
+  // No jogEnabled toast gate here — the driver enforces gates
+  // (monitor_only, allow_jog); a spurious hold under a closed gate
+  // becomes a rejection log line rather than a UI-side warning.
+
+  // Low-level jog POST — abort-friendly, no UI toast on abort.
+  // sendCommand is the wrong tool for hold-jog: it sets
+  // pendingCommand + toasts on error, both of which fire at 10 Hz and
+  // would spam the UI. This helper is used only by hold/release/pulse/
+  // increment paths.
+  async _postJog(endpoint, body, meta = {}) {
+    const { signal, hold_id, seq, client_ts_ms } = meta
+    const fullBody = { ...body }
+    if (hold_id != null)      fullBody.hold_id = hold_id
+    if (seq != null)          fullBody.seq = seq
+    if (client_ts_ms != null) fullBody.client_ts_ms = client_ts_ms
+    try {
+      const res = await fetch(`/cmd/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(fullBody),
+        signal,
+      })
+      // We don't need the JSON body for jog messages, but consume it
+      // so the connection can be reused.
+      try { await res.text() } catch { /* nop */ }
+      return res.ok
+    } catch (err) {
+      // AbortError on release-abort is expected and NOT an error.
+      if (err && (err.name === 'AbortError' || err.code === 20)) return false
+      return false
+    }
+  },
+
+  jogHold(joint1based, direction, speedPct, meta = {}) {
+    return get()._postJog('jog', {
+      joint: joint1based,
+      direction,
+      speed_pct: speedPct,
+      hold: true,
+    }, meta)
+  },
+
+  jogHoldCartesian(axisLetter, direction, speedPct, meta = {}) {
+    return get()._postJog('jog_cartesian', {
+      axis: axisLetter,
+      direction,
+      speed_pct: speedPct,
+      hold: true,
+    }, meta)
+  },
+
+  jogRelease(mode = 'joint', meta = {}) {
+    // Idempotent — safe to call more than once (touchcancel + touchend
+    // etc.). Backend maps to /robot/jog_command with hold:false, which
+    // the driver treats as an explicit stop.
+    const endpoint = mode === 'cartesian' ? 'jog_cartesian' : 'jog'
+    return get()._postJog(endpoint, { hold: false }, meta)
+  },
+
+  // Tap → single-step increment. Joint uses the driver's time-boxed
+  // delta_deg path (angle-bounded, driver owns stop timing). Cartesian
+  // uses the new fixed-duration mode:2 pulse (see driver docstring).
+  jogIncrement(joint1based, deltaDeg) {
+    return get()._postJog('jog', {
+      joint: joint1based,
+      delta_deg: deltaDeg,
+    })
+  },
+
+  jogPulseCartesian(axisLetter, direction, speedPct) {
+    return get()._postJog('jog_cartesian', {
+      axis: axisLetter,
+      direction,
+      speed_pct: speedPct,
+      pulse: true,
+    })
   },
 
   // ---------------------------------------------------------------------------

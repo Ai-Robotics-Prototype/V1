@@ -29,6 +29,7 @@ except ImportError:
 try:
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
     from sensor_msgs.msg import Image, JointState, PointCloud2
     from std_msgs.msg import Bool, Float32, String
     from std_srvs.srv import Trigger
@@ -1038,6 +1039,14 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             r["safety_mode"] = d.get("safety_mode", "unknown")
             r["status_flag"] = int(d.get("status_flag", 0))
             r["moving"]      = bool(d.get("moving", False))
+            # Jog state — IncrementalJogPanel disables its buttons while
+            # any driver-side jog is in flight.
+            r["jog_active"]  = bool(d.get("jog_active", False))
+            r["jog_mode"]    = d.get("jog_mode")   # None | 'velocity' | 'increment' | 'continuous' | 'continuous_cart'
+            r["jog_index"]   = int(d.get("jog_index", 0))
+            r["jog_direction"] = int(d.get("jog_direction", 0))
+            r["allow_jog"]   = bool(d.get("allow_jog", False))
+            r["allow_cartesian_jog"] = bool(d.get("allow_cartesian_jog", False))
             # Joints (rad) — only overwrite if the driver gave us real data.
             jr = d.get("joints_rad")
             if isinstance(jr, list) and len(jr) == 6:
@@ -1642,72 +1651,208 @@ if FASTAPI_AVAILABLE:
             return {"ok": True, "status": "generating",
                     "auto_status": copy.deepcopy(STATE.get("auto_status", {}))}
 
+    def _publish_estun_jog(payload):
+        """Publish a single frame on /robot/jog_command. Best-effort;
+        swallows exceptions so a transient publisher issue doesn't 500
+        the HTTP call — the driver's own gates + safety layers are what
+        actually decides whether motion happens."""
+        if _ros_node is None:
+            return
+        try:
+            if not hasattr(_ros_node, "_estun_jog_pub"):
+                # Depth 5 best-effort — jog refreshes are ephemeral so
+                # KEEP_LAST + best-effort drops old ones rather than
+                # blocking the publisher (which is what the old
+                # depth-10 reliable default did, building the backlog
+                # that caused release lag). Depth 5 gives ~500 ms of
+                # tolerance to subscriber-side jitter so the 300 ms
+                # freshness deadman doesn't fire mid-hold when the
+                # single-threaded driver executor stalls briefly on
+                # a WS heartbeat send. The driver's hold_id + seq
+                # guards handle any straggler that survives the drop.
+                qos = QoSProfile(
+                    depth=5,
+                    reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                    history=QoSHistoryPolicy.KEEP_LAST,
+                    durability=QoSDurabilityPolicy.VOLATILE,
+                )
+                _ros_node._estun_jog_pub = _ros_node.create_publisher(
+                    String, "/robot/jog_command", qos)
+            m = String(); m.data = json.dumps(payload)
+            _ros_node._estun_jog_pub.publish(m)
+        except Exception:
+            pass
+
     @app.post("/cmd/jog")
     async def cmd_jog(request: Request):
+        """Joint jog dispatcher. Three shapes accepted:
+        - Incremental (angle-bounded, driver time-boxes the move):
+            {"joint": 1..6, "delta_deg": ±1..±5}
+        - Continuous hold (start or refresh at ~7 Hz from HoldButton):
+            {"joint": 1..6, "direction": ±1, "speed_pct": 1..100, "hold": true}
+        - Release (also emitted on touch-cancel / mouse-leave / unmount):
+            {"hold": false}
+        Legacy `{joint: 0..5, delta: <rad>}` from now-dead ControlStrip
+        callers is still accepted and mapped to an increment."""
         body = await request.json()
         with _state_lock:
             if STATE["safety"]["estop"]:
                 return JSONResponse({"error": "Cannot jog: estop active"}, status_code=400)
             if STATE["safety"]["zone"] != "GREEN":
                 return JSONResponse({"error": "Cannot jog: zone not GREEN"}, status_code=400)
-        joint = int(body.get("joint", 0))
-        delta = float(body.get("delta", 0.0))
-        if abs(delta) > 0.175:
-            return JSONResponse({"error": "Delta too large (max 10°)"}, status_code=400)
-        if not (0 <= joint <= 5):
-            return JSONResponse({"error": "Invalid joint index"}, status_code=400)
-        with _state_lock:
-            STATE["joints"]["positions"][joint] += delta
-            joints_snapshot = copy.deepcopy(STATE["joints"])
-        # Forward to Estun driver — the sim update above keeps the UI
-        # responsive when the driver isn't connected; when it is, the
-        # driver's /estun/status feedback will overwrite STATE.joints.
-        if _ros_node is not None:
+
+        # Release — no joint/direction required. Forward session
+        # metadata (hold_id/seq/client_ts_ms) so the driver can enforce
+        # session tracking and drop stale queued refreshes.
+        if body.get("hold") is False or body.get("stop") is True:
+            payload = {"mode": "joint", "hold": False}
+            for k in ("hold_id", "seq", "client_ts_ms"):
+                if body.get(k) is not None: payload[k] = body[k]
+            _publish_estun_jog(payload)
+            return {"ok": True, "action": "release"}
+
+        raw_joint = body.get("joint")
+        try:
+            joint_int = int(raw_joint)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": f"Invalid joint: {raw_joint!r}"}, status_code=400)
+
+        # Continuous hold path — start or refresh.
+        if body.get("hold") is True:
+            if not (1 <= joint_int <= 6):
+                return JSONResponse({"error": "joint must be 1..6"}, status_code=400)
             try:
-                if not hasattr(_ros_node, "_estun_jog_pub"):
-                    _ros_node._estun_jog_pub = _ros_node.create_publisher(
-                        String, "/robot/jog_command", 10)
-                speed_pct = abs(delta) / 0.175 * 100.0  # delta -> 0..100
-                m = String()
-                m.data = json.dumps({
-                    "mode":      "joint",
-                    "axis":      joint + 1,         # Estun uses 1-indexed joints
-                    "direction": 1 if delta >= 0 else -1,
-                    "speed":     int(max(1, min(100, speed_pct))),
-                    "step":      float(abs(delta)),
-                })
-                _ros_node._estun_jog_pub.publish(m)
-            except Exception:
-                pass
-        return {"ok": True, "joints": joints_snapshot}
+                direction = int(body.get("direction", 0))
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "direction not an int"}, status_code=400)
+            if direction not in (-1, 1):
+                return JSONResponse({"error": "direction must be ±1"}, status_code=400)
+            try:
+                speed_pct = float(body.get("speed_pct", body.get("speed", 0)))
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "speed_pct not a number"}, status_code=400)
+            if not (0 < speed_pct <= 100):
+                return JSONResponse({"error": "speed_pct must be in (0, 100]"}, status_code=400)
+            payload = {
+                "mode":      "joint",
+                "axis":      joint_int,
+                "direction": direction,
+                "speed_pct": speed_pct,
+                "hold":      True,
+            }
+            for k in ("hold_id", "seq", "client_ts_ms"):
+                if body.get(k) is not None: payload[k] = body[k]
+            _publish_estun_jog(payload)
+            return {"ok": True, "action": "hold"}
+
+        if "delta_deg" in body:
+            # Incremental path — 1-based joint, degrees.
+            try:
+                delta_deg = float(body.get("delta_deg", 0.0))
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "delta_deg not a number"}, status_code=400)
+            if not (1 <= joint_int <= 6):
+                return JSONResponse({"error": "joint must be 1..6"}, status_code=400)
+            if abs(delta_deg) > 5.0 + 1e-9:
+                return JSONResponse({"error": "|delta_deg| exceeds 5°"}, status_code=400)
+            if abs(delta_deg) < 0.01:
+                return JSONResponse({"error": "delta_deg ~ 0"}, status_code=400)
+            axis_1based = joint_int
+            joint_0based = joint_int - 1
+            step_rad = delta_deg * math.pi / 180.0
+        else:
+            # Legacy shape: joint 0-5, delta in radians.
+            try:
+                delta = float(body.get("delta", 0.0))
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "delta not a number"}, status_code=400)
+            if not (0 <= joint_int <= 5):
+                return JSONResponse({"error": "joint must be 0..5 (legacy)"}, status_code=400)
+            if abs(delta) > 0.175:
+                return JSONResponse({"error": "Delta too large (max 10°)"}, status_code=400)
+            delta_deg = delta * 180.0 / math.pi
+            if abs(delta_deg) > 5.0:
+                return JSONResponse({"error": "|delta| exceeds 5° after conversion"}, status_code=400)
+            axis_1based = joint_int + 1
+            joint_0based = joint_int
+            step_rad = delta
+
+        with _state_lock:
+            # Optimistic sim update so the UI reflects the intended target
+            # even if the driver isn't connected. Real driver feedback via
+            # /estun/status overwrites this once telemetry catches up.
+            STATE["joints"]["positions"][joint_0based] += step_rad
+            joints_snapshot = copy.deepcopy(STATE["joints"])
+
+        _publish_estun_jog({
+            "mode":      "joint",
+            "axis":      axis_1based,
+            "delta_deg": delta_deg,
+        })
+        return {"ok": True, "joints": joints_snapshot, "delta_deg": delta_deg,
+                "action": "increment"}
 
     @app.post("/cmd/jog_cartesian")
     async def cmd_jog_cartesian(request: Request):
-        """Cartesian-space jog. The sim has no IK so the arm doesn't
-        visibly move here — we just publish the command on a ROS topic
-        for a real driver to consume. Same safety gates as joint jog."""
+        """Cartesian-space hold-to-jog. Same shape as /cmd/jog but with a
+        letter axis ('x','y','z','rx','ry','rz'). Publishes to the SAME
+        /robot/jog_command topic with mode:cartesian so the driver's
+        continuous-jog state machine handles it (gated by
+        allow_cartesian_jog on the driver — refused today by default)."""
         body = await request.json()
         with _state_lock:
             if STATE["safety"]["estop"]:
                 return JSONResponse({"error": "Cannot jog: estop active"}, status_code=400)
             if STATE["safety"]["zone"] != "GREEN":
                 return JSONResponse({"error": "Cannot jog: zone not GREEN"}, status_code=400)
-        if _ros_node is not None:
-            try:
-                if not hasattr(_ros_node, '_jog_cart_pub'):
-                    _ros_node._jog_cart_pub = _ros_node.create_publisher(
-                        String, "/robot/jog_cartesian", 10)
-                m = String()
-                m.data = json.dumps({
-                    "axis":      str(body.get("axis", "")),
-                    "direction": int(body.get("direction", 1)),
-                    "step":      float(body.get("step", 1.0)),
-                    "speed":     int(body.get("speed", 20)),
-                })
-                _ros_node._jog_cart_pub.publish(m)
-            except Exception:
-                pass
-        return {"ok": True}
+
+        if body.get("hold") is False or body.get("stop") is True:
+            payload = {"mode": "cartesian", "hold": False}
+            for k in ("hold_id", "seq", "client_ts_ms"):
+                if body.get(k) is not None: payload[k] = body[k]
+            _publish_estun_jog(payload)
+            return {"ok": True, "action": "release"}
+
+        axis_letter = str(body.get("axis", "")).lower()
+        axis_map = {"x": 1, "y": 2, "z": 3, "rx": 4, "ry": 5, "rz": 6}
+        axis_1based = axis_map.get(axis_letter)
+        if axis_1based is None:
+            return JSONResponse({"error": f"cartesian axis must be one of {list(axis_map)}"},
+                                status_code=400)
+        try:
+            direction = int(body.get("direction", 0))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "direction not an int"}, status_code=400)
+        if direction not in (-1, 1):
+            return JSONResponse({"error": "direction must be ±1"}, status_code=400)
+        try:
+            speed_pct = float(body.get("speed_pct", body.get("speed", 20)))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "speed_pct not a number"}, status_code=400)
+        if not (0 < speed_pct <= 100):
+            return JSONResponse({"error": "speed_pct must be in (0, 100]"}, status_code=400)
+
+        if body.get("pulse") is True:
+            _publish_estun_jog({
+                "mode":      "cartesian",
+                "axis":      axis_1based,
+                "direction": direction,
+                "speed_pct": speed_pct,
+                "pulse":     True,
+            })
+            return {"ok": True, "action": "pulse"}
+
+        payload = {
+            "mode":      "cartesian",
+            "axis":      axis_1based,
+            "direction": direction,
+            "speed_pct": speed_pct,
+            "hold":      True,
+        }
+        for k in ("hold_id", "seq", "client_ts_ms"):
+            if body.get(k) is not None: payload[k] = body[k]
+        _publish_estun_jog(payload)
+        return {"ok": True, "action": "hold"}
 
     @app.post("/cmd/gripper")
     async def cmd_gripper(request: Request):

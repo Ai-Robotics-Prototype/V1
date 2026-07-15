@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 import ProgramEditor from '../components/ProgramEditor'
 import ArmViewer3D from '../components/ArmViewer3D'
+import JogControls from '../components/JogControls'
 
 // Pinned: red tint when the panel is at its min/max limit so the
 // operator gets visual feedback instead of silent unresponsiveness.
@@ -659,7 +660,7 @@ export default function ProgramLayout() {
     return (
       <PanelChrome expanded onToggle={() => setExpandedPanel(null)} title="Restore split layout">
         <div style={{ width: '100%', height: '100%', overflow: 'auto' }}>
-          <JogPanel maximized />
+          <JogControls maximized />
         </div>
       </PanelChrome>
     )
@@ -706,7 +707,7 @@ export default function ProgramLayout() {
           title="Expand the teach pendant"
         >
           <div style={{ width: '100%', height: '100%', overflow: 'auto' }}>
-            <JogPanel maximized={false} />
+            <JogControls maximized={false} />
           </div>
         </PanelChrome>
       </div>

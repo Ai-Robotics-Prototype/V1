@@ -136,7 +136,7 @@ export default function JointJogPanel({
     <div style={styles.panel}>
       <div style={styles.header}>
         <div style={styles.title}>Joint Jog</div>
-        <div style={styles.twinTag}>TWIN</div>
+        <div style={styles.twinTag}>TWIN ONLY</div>
       </div>
 
       {!ready && (

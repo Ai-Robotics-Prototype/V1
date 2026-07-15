@@ -39,6 +39,34 @@ estun_driver:
     #   3. deadman + limit clamps exercised on a bench
     monitor_only: true
 
+    # ── Jog write path (second gate) ─────────────────────────────
+    # Both gates must be open for /robot/jog_command to emit Robot/jog
+    # frames: monitor_only:false AND allow_jog:true. Env override
+    # ESTUN_ALLOW_JOG=1 wins over this YAML (same precedence as
+    # ESTUN_ROBOT_IP). Default here is false so a stray YAML flip alone
+    # cannot enable motion; the live test uses the env var only.
+    allow_jog: false
+
+    # Cartesian (mode:2) jog stays hard-gated on this build. The captured
+    # protocol shape is implemented but not exercised on hardware; enabling
+    # this without the joint-mode validation pass first is unsafe.
+    allow_cartesian_jog: false
+
+    # Hard cap on |speed| in Robot/jog frames. Bench observations at 51%
+    # produced a comfortable slow jog; 0.15 keeps a wide margin below that
+    # for first-motion trials. Raise deliberately after bench validation.
+    jog_speed_cap: 0.15
+
+    # Robot/jogHeartbeat cadence. Captured protocol requires ~400 ms; the
+    # controller stops motion when heartbeats stop.
+    jog_heartbeat_s: 0.4
+
+    # Freshness deadman: if /robot/jog_command doesn't refresh within
+    # this window, the driver emits Robot/stopJog and tears down the
+    # supervise timer. Set below jog_heartbeat_s so a single missed
+    # command message halts motion before the next heartbeat fires.
+    jog_freshness_timeout_s: 0.3
+
     # ── First-connect logging ────────────────────────────────────
     # Dumps every TX/RX WS frame to
     #   /opt/cobot/logs/estun_ws_YYYYMMDD_HHMMSS.jsonl
