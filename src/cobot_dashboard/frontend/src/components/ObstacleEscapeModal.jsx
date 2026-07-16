@@ -1,26 +1,27 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 
-// Escape-guidance popup for arm-vs-environment proximity.
+// Escape-guidance popup for arm-vs-environment (and self / ground) proximity.
 //
-// Trigger: robot.env_min_mm ≤ env_warn_mm AND the arm is jog-capable
-// (enabled, no alarm). Renders a centered amber modal with:
-//   1. LIVE distance + offending zone id (tabular numerals, updates
-//      every state broadcast so the operator watches it change).
-//   2. Escape-direction hold-to-jog buttons — ONLY the joint
-//      directions the driver computed as opening clearance
-//      (robot.env_escape_dirs). Never renders a closing direction.
-//   3. Minimize control (banner takes over), matching AlarmRecoveryModal.
-//   4. Auto-dismisses with a green "Clear" flash once the pair
-//      exceeds env_warn_mm + HYSTERESIS_MM.
+// TIERED PRESENTATION (2026-07-16):
+//   warn band (stop < d ≤ warn)  — a NON-BLOCKING chip lives in the 3D
+//     view chrome (see MinClearanceChip in View3DLayout). This popup
+//     STAYS SILENT there; jog is fully unrestricted at warn level.
+//   stop band (d ≤ stop)         — this popup opens with hold-to-jog
+//     escape controls. Speed is capped, direction is filtered by the
+//     driver's supervise tick, and the fallback override appears only
+//     when NO direction opens.
+//   hysteresis                   — once the popup opens, it stays until
+//     d > stop + HYSTERESIS_MM. Chip in the chrome tracks live warn/stop
+//     bands independently (no hysteresis there — the chip is cheap).
 //
 // Escape jogs use the standard jog transport (WS-first, HTTP fallback,
-// server-side keepalive) BUT the speed is hard-capped at
-// ESCAPE_SPEED_PCT so a slip never becomes a slam. The driver's own
-// direction-aware refinement is the second line of defense — even if
-// this UI hands the operator the wrong button, the driver's supervise
-// tick still blocks any motion that closes clearance further.
-const HYSTERESIS_MM   = 20    // clearance must exceed warn + this to dismiss
+// server-side keepalive) with the speed hard-capped at ESCAPE_SPEED_PCT
+// so a slip never becomes a slam. The driver's own direction-aware
+// refinement is the second line of defense — even if this UI hands
+// the operator the wrong button, the driver's supervise tick still
+// blocks any motion that closes clearance further.
+const HYSTERESIS_MM   = 20    // clearance must exceed stop + this to dismiss
 const ESCAPE_SPEED_PCT = 6    // capped speed while modal is up (percent)
 const AUTO_CLOSE_FLASH_MS = 1400
 
@@ -98,33 +99,35 @@ export default function ObstacleEscapeModal() {
   const env_stop_mm = guard_stop_mm
   const env_escape_dirs = guard_escapes
 
-  // Trigger + phase logic — single source of truth, mirrors the
-  // AlarmRecoveryModal pattern. Session latches when we first enter
-  // the warn zone; releases when clearance rises past warn + hysteresis
-  // (through a brief green "Clear" flash for operator feedback).
+  // Trigger + phase logic — single source of truth. Session latches
+  // when d ≤ stop; releases when d > stop + HYSTERESIS_MM (with a brief
+  // "Clear" flash for operator feedback). Warn-band proximity does NOT
+  // open this popup — the MinClearanceChip in the 3D view chrome owns
+  // that presentation.
   const [minimized, setMinimized] = useState(false)
   const [sessionActive, setSessionActive] = useState(false)
   const [flashClearUntil, setFlashClearUntil] = useState(0)
-  const prevInWarn = useRef(false)
+  const prevInStop = useRef(false)
 
-  const inWarn = env_min_mm != null && env_warn_mm != null
-                 && env_min_mm <= env_warn_mm
+  const inStop = env_min_mm != null && env_stop_mm != null
+                 && env_min_mm <= env_stop_mm
   const isJogCapable = !!enabled && !alarm && !safety?.estop
 
   useEffect(() => {
-    if (inWarn && !prevInWarn.current) {
-      // Freshly entered warn — pop the modal, reset minimize.
+    if (inStop && !prevInStop.current) {
+      // Freshly entered stop band — pop the modal, reset minimize.
       setSessionActive(true)
       setMinimized(false)
     }
-    if (!inWarn && prevInWarn.current && sessionActive) {
-      // Just exited warn — check hysteresis, kick off flash + close.
-      if (env_min_mm != null && env_min_mm > env_warn_mm + HYSTERESIS_MM) {
+    if (!inStop && prevInStop.current && sessionActive) {
+      // Just exited stop — check hysteresis, kick off flash + close.
+      if (env_min_mm != null && env_stop_mm != null
+          && env_min_mm > env_stop_mm + HYSTERESIS_MM) {
         setFlashClearUntil(Date.now() + AUTO_CLOSE_FLASH_MS)
       }
     }
-    prevInWarn.current = inWarn
-  }, [inWarn, sessionActive, env_min_mm, env_warn_mm])
+    prevInStop.current = inStop
+  }, [inStop, sessionActive, env_min_mm, env_stop_mm])
 
   useEffect(() => {
     if (flashClearUntil === 0) return

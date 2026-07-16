@@ -163,19 +163,29 @@ def load_capsules_yaml(path):
             p1: [...]
             radius: ...
 
-    Additional top-level section (optional):
+    Additional top-level sections (optional):
       mesh_pairs:
         - [link_a, link_b]      # use mesh-mesh distance instead of capsule
+      pair_thresholds:
+        - pair: [link_a, link_b]
+          warn: 60.0
+          stop: 30.0
 
-    Returns (capsules, pairs, mesh_pairs). Every link in `capsules`
-    maps to a LIST of Capsule so downstream code iterates uniformly."""
+    Returns (capsules, pairs, mesh_pairs, pair_thresholds). Every link
+    in `capsules` maps to a LIST of Capsule so downstream code iterates
+    uniformly. `pair_thresholds` is a list of dicts with keys
+    'pair' (frozenset), 'warn', 'stop' — consumed by the driver to
+    override the global warn/stop for a specific pair (e.g. link3↔link5
+    which has a design floor of ~46 mm from link4's mechanical mass)."""
     capsules = {}
     pairs = []
     mesh_pairs = []
+    pair_thresholds = []
     section = None
     cur_link = None
     cur = {}           # scratch for a single-capsule link
     cur_multi = None   # list of dicts when parsing a link's `capsules:` block
+    cur_thr = None     # scratch dict when parsing a pair_thresholds entry
     def flush():
         nonlocal cur_link, cur, cur_multi
         if cur_link is None:
@@ -189,6 +199,15 @@ def load_capsules_yaml(path):
             capsules[cur_link] = [Capsule(cur_link,
                 cur['p0'], cur['p1'], cur['radius'])]
         cur_link, cur, cur_multi = None, {}, None
+    def flush_thr():
+        nonlocal cur_thr
+        if cur_thr and 'pair' in cur_thr and 'warn' in cur_thr and 'stop' in cur_thr:
+            pair_thresholds.append({
+                'pair': frozenset(cur_thr['pair']),
+                'warn': float(cur_thr['warn']),
+                'stop': float(cur_thr['stop']),
+            })
+        cur_thr = None
     with open(path) as fh:
         for raw in fh:
             line = raw.split('#', 1)[0].rstrip()
@@ -202,8 +221,10 @@ def load_capsules_yaml(path):
                 flush(); section = 'pairs'; continue
             if line.startswith('mesh_pairs:'):
                 flush(); section = 'mesh_pairs'; continue
+            if line.startswith('pair_thresholds:'):
+                flush(); flush_thr(); section = 'pair_thresholds'; continue
             if line.startswith('ground_plane:'):
-                flush(); section = 'ground'; continue
+                flush(); flush_thr(); section = 'ground'; continue
             if section == 'capsules':
                 indent = len(line) - len(line.lstrip(' '))
                 # `  link_name:`  (2-space indent, trailing colon) → new link
@@ -252,8 +273,29 @@ def load_capsules_yaml(path):
                     inner = stripped[1:].strip().strip('[]')
                     a, b = [s.strip() for s in inner.split(',')]
                     mesh_pairs.append((a, b))
+            elif section == 'pair_thresholds':
+                indent = len(line) - len(line.lstrip(' '))
+                if stripped.startswith('- '):
+                    flush_thr()
+                    cur_thr = {}
+                    body = stripped[2:].strip()
+                    if body:
+                        k, _, v = body.partition(':')
+                        v = v.strip()
+                        if k == 'pair':
+                            cur_thr[k] = [s.strip() for s in v.strip('[]').split(',')]
+                        elif k in ('warn', 'stop'):
+                            cur_thr[k] = float(v)
+                elif cur_thr is not None:
+                    k, _, v = stripped.partition(':')
+                    v = v.strip()
+                    if k == 'pair':
+                        cur_thr[k] = [s.strip() for s in v.strip('[]').split(',')]
+                    elif k in ('warn', 'stop'):
+                        cur_thr[k] = float(v)
     flush()
-    return capsules, pairs, mesh_pairs
+    flush_thr()
+    return capsules, pairs, mesh_pairs, pair_thresholds
 
 
 # ── Geometry: capsule-capsule distance ────────────────────────────────
@@ -405,8 +447,8 @@ class CollisionModel:
     entries. Computes FK once per call."""
 
     def __init__(self, capsules_yaml_path):
-        self.capsules, self.pairs, self.mesh_pairs = load_capsules_yaml(
-            capsules_yaml_path)
+        (self.capsules, self.pairs, self.mesh_pairs,
+         self.pair_thresholds) = load_capsules_yaml(capsules_yaml_path)
         # Ground plane z (mm). Set `ground_z_mm = None` to disable
         # ground checks entirely (needed until URDF Y-up vs ground
         # Z-up convention is unified). Env-obstacle pairs continue to
@@ -450,6 +492,22 @@ class CollisionModel:
     @property
     def env_zone_count(self):
         return len(self._env_zones)
+
+    def thresholds_for(self, pair, default_warn_mm, default_stop_mm):
+        """Return (warn_mm, stop_mm) for a specific (a, b) pair, honoring
+        any pair_thresholds override. Order-insensitive. `pair` may be
+        a tuple/list; env pairs (link, 'zone#N') never match — env has
+        its own warn/stop path in the driver."""
+        if not pair:
+            return default_warn_mm, default_stop_mm
+        try:
+            key = frozenset(pair)
+        except TypeError:
+            return default_warn_mm, default_stop_mm
+        for entry in self.pair_thresholds:
+            if entry['pair'] == key:
+                return entry['warn'], entry['stop']
+        return default_warn_mm, default_stop_mm
 
     def evaluate(self, q_deg):
         """Returns a list of (a, b, dist_mm) sorted ascending. Each
@@ -543,17 +601,33 @@ class CollisionModel:
         p1 = _transform_point(T, cap.p1_local)
         return _capsule_obb_dist(p0, p1, cap.radius, zone)
 
-    # Joint step size for the escape-direction search (degrees). One
-    # tick of motion at 6% speed_frac × max_joint_speed 180°/s over
-    # 50 ms ≈ 0.54° — the 5° step used here is deliberately larger so
-    # the direction of clearance change is unambiguous under sensor
-    # noise. Direction is what matters; the actual escape jog is
-    # separately capped at 6% via the frontend.
-    ESCAPE_JOINT_STEP_DEG = 5.0
-    # Hysteresis for "opens": require the projected distance to be
-    # bigger than current by this much to count as an escape direction.
-    # Prevents jitter from producing meaningless candidates.
-    ESCAPE_OPEN_MARGIN_MM = 2.0
+    # Joint step size for the escape-direction search (degrees). The
+    # actual escape jog is separately capped at 6% via the frontend; the
+    # only role of this step is to size the finite-difference probe so
+    # the direction of clearance change is unambiguous. 5° is the default
+    # for env / capsule-pair queries where the min-distance function is
+    # smooth. Mesh-mesh pairs (currently just link3↔link5) probe at
+    # ESCAPE_JOINT_STEP_MESH_DEG since the mesh-vertex-sampled distance
+    # is piecewise linear and needs a wider probe to clear the ~0.3 mm
+    # sampling noise floor when the pair's total range of motion is
+    # only a few mm.
+    ESCAPE_JOINT_STEP_DEG      = 5.0
+    ESCAPE_JOINT_STEP_MESH_DEG = 15.0
+    # A candidate direction is reported when the projected distance
+    # exceeds the current distance by at least ESCAPE_OPEN_MARGIN_MM
+    # (per-probe). Lower than the previous 2 mm so shallow-response
+    # pairs (mesh_pairs with mechanical floor) still surface real
+    # openings. The fallback trigger uses a separate, larger threshold —
+    # see ESCAPE_FALLBACK_FLOOR_MM below.
+    ESCAPE_OPEN_MARGIN_MM      = 1.0
+    # Fallback ("no single-axis escape") fires only when the best
+    # projected opening across all 12 candidate directions is BELOW
+    # this floor. Set to 0.5 mm so that any measurable improvement
+    # keeps the operator on the numbered-jog UI. Task 2026-07-16 —
+    # previously the fallback fired at every stop-band entry because
+    # a 2 mm strict margin plus 0.3 mm mesh noise combined to hide
+    # real J4/J5 openings on link3↔link5.
+    ESCAPE_FALLBACK_FLOOR_MM   = 0.5
 
     def escape_directions(self, q_deg, offending_link, offending_zone_id):
         """For the given (link, zone) offender, return a list of
@@ -583,6 +657,57 @@ class CollisionModel:
         cands.sort(key=lambda c: -c['projected_mm'])
         return cands
 
+    def escape_probe_table(self, q_deg, pair):
+        """Diagnostic helper — return the full 12-row finite-difference
+        table for a given pair, at whatever step size the pair type
+        implies (mesh pair → mesh step; else standard). No filtering.
+        Rows: {'joint': 1..6, 'direction': ±1, 'projected_mm', 'delta_mm',
+        'step_deg'}. Ordered by joint, then sign. Used by the offline
+        diagnostic and by driver logs to explain a fallback event."""
+        if not pair:
+            return []
+        step = (self.ESCAPE_JOINT_STEP_MESH_DEG
+                if frozenset(pair) in {frozenset(p) for p in self.mesh_pairs}
+                else self.ESCAPE_JOINT_STEP_DEG)
+        # Baseline for this specific pair — pick the matching row out of
+        # evaluate() so mesh pairs pull their true mesh-mesh distance.
+        cur = None
+        for x, y, d in self.evaluate(q_deg):
+            if (x, y) == pair or (y, x) == pair:
+                cur = d; break
+        if cur is None or not math.isfinite(cur):
+            return []
+        rows = []
+        for j in range(6):
+            for sign in (+1, -1):
+                q_try = list(q_deg)
+                q_try[j] = q_deg[j] + sign * step
+                proj = None
+                for x, y, d in self.evaluate(q_try):
+                    if (x, y) == pair or (y, x) == pair:
+                        proj = d; break
+                if proj is None:
+                    continue
+                rows.append({
+                    'joint': j + 1,
+                    'direction': sign,
+                    'projected_mm': proj,
+                    'current_mm': cur,
+                    'delta_mm': proj - cur,
+                    'step_deg': step,
+                })
+        return rows
+
+    def has_any_escape(self, q_deg, pair):
+        """Boolean: does ANY of the 12 single-axis probes clear the
+        fallback floor? Used by the driver's stop-band gate to decide
+        whether to show numbered escapes (True) or the all-axes override
+        fallback (False)."""
+        rows = self.escape_probe_table(q_deg, pair)
+        if not rows:
+            return False
+        return max(r['delta_mm'] for r in rows) >= self.ESCAPE_FALLBACK_FLOOR_MM
+
     def min_distance_at(self, q_deg):
         """Return the closest pair (any kind) + its distance for the
         given joint angles. Used by the command-time direction check
@@ -597,39 +722,20 @@ class CollisionModel:
 
     def escape_directions_any(self, q_deg, pair):
         """Escape-direction search for ANY pair (self / ground / env).
-        Probes the 12 single-axis joint directions with a 5° step;
-        keeps those that increase this specific pair's distance by at
-        least ESCAPE_OPEN_MARGIN_MM. Used when the offender is self-
-        collision or ground, where the env-specific fast path doesn't
-        apply. Returns same shape as escape_directions()."""
-        if not pair:
-            return []
-        a, b = pair
-        # Baseline: find this pair's current distance.
-        cur = None
-        for x, y, d in self.evaluate(q_deg):
-            if (x, y) == (a, b):
-                cur = d; break
-        if cur is None or not math.isfinite(cur):
-            return []
+        Reuses escape_probe_table so mesh pairs get a wider step, then
+        filters to rows whose Δ ≥ ESCAPE_OPEN_MARGIN_MM. Returns same
+        shape as escape_directions(). Order-insensitive on the pair
+        tuple."""
+        rows = self.escape_probe_table(q_deg, pair)
         cands = []
-        for j in range(6):
-            for sign in (+1, -1):
-                q_try = list(q_deg)
-                q_try[j] = q_deg[j] + sign * self.ESCAPE_JOINT_STEP_DEG
-                proj = None
-                for x, y, d in self.evaluate(q_try):
-                    if (x, y) == (a, b):
-                        proj = d; break
-                if proj is None:
-                    continue
-                if proj > cur + self.ESCAPE_OPEN_MARGIN_MM:
-                    cands.append({
-                        'joint':     j + 1,
-                        'direction': sign,
-                        'projected_mm': proj,
-                        'current_mm':   cur,
-                    })
+        for r in rows:
+            if r['delta_mm'] >= self.ESCAPE_OPEN_MARGIN_MM:
+                cands.append({
+                    'joint':        r['joint'],
+                    'direction':    r['direction'],
+                    'projected_mm': r['projected_mm'],
+                    'current_mm':   r['current_mm'],
+                })
         cands.sort(key=lambda c: -c['projected_mm'])
         return cands
 

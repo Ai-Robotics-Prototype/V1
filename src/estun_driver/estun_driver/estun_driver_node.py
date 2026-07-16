@@ -1073,7 +1073,22 @@ class EstunCodroidDriver(Node):
                 and self._last_posture_ts > 0.0):
             try:
                 (pair, cur_min) = self._coll_model.min_distance_at(self._joint_deg)
-                if cur_min <= self._coll_warn_mm:
+                # Honor per-pair YAML overrides so pairs with a design
+                # floor (link3↔link5, ~46 mm mechanical minimum) don't
+                # trip the closing-throttle every jog. Env pairs stay on
+                # the global env warn/stop.
+                is_env_pair = False
+                if pair and isinstance(pair, tuple):
+                    a, b = pair
+                    is_env_pair = ((isinstance(a, str) and a.startswith('zone#'))
+                                or (isinstance(b, str) and b.startswith('zone#')))
+                if is_env_pair:
+                    warn_thr = self._env_warn_mm
+                    stop_thr = self._env_stop_mm
+                else:
+                    warn_thr, stop_thr = self._coll_model.thresholds_for(
+                        pair, self._coll_warn_mm, self._coll_stop_mm)
+                if cur_min <= warn_thr:
                     # Project the commanded direction 5° ahead.
                     proj = list(self._joint_deg)
                     proj[axis-1] += 5.0 * (1.0 if direction > 0 else -1.0)
@@ -1091,40 +1106,18 @@ class EstunCodroidDriver(Node):
                             signed_speed = direction * effective_frac
                     else:
                         # Closing motion.
-                        if cur_min <= self._coll_stop_mm:
-                            # Check if ANY direction opens. If none, we
-                            # honor the fallback override — operator
-                            # outranks a possibly-wrong geometry model.
-                            # If some other direction WOULD open, this
-                            # specific closing command is refused.
-                            offender_pair = pair
-                            has_escape = False
-                            if offender_pair and isinstance(offender_pair, tuple):
-                                a, b = offender_pair
-                                is_env  = isinstance(a, str) and a.startswith('zone#') \
-                                        or isinstance(b, str) and b.startswith('zone#')
-                                if is_env:
-                                    link = a if not a.startswith('zone#') else b
-                                    z_id = (a if a.startswith('zone#') else b).replace('zone#','')
-                                    has_escape = bool(self._coll_model.escape_directions(
-                                        self._joint_deg, link, z_id))
-                                else:
-                                    # For self/ground pairs we don't have a
-                                    # bulk escape helper — probe the 12
-                                    # single-axis directions inline.
-                                    for j in range(6):
-                                        for s in (+1, -1):
-                                            q_try = list(self._joint_deg)
-                                            q_try[j] += 5.0 * s
-                                            _, dt = self._coll_model.min_distance_at(q_try)
-                                            if dt > cur_min + 2.0:
-                                                has_escape = True; break
-                                        if has_escape: break
+                        if cur_min <= stop_thr:
+                            # Delegate the "does any direction open?"
+                            # question to the collision model — it knows
+                            # whether the pair is mesh-mesh (needs a
+                            # wider probe step) or capsule.
+                            has_escape = self._coll_model.has_any_escape(
+                                self._joint_deg, pair)
                             if has_escape:
                                 self._reject(family,
                                     f'collision guard: J{axis}{"+" if direction>0 else "-"} '
                                     f'closes {pair} from {cur_min:.0f}mm '
-                                    f'(current ≤ stop {self._coll_stop_mm:.0f}mm). '
+                                    f'(current ≤ stop {stop_thr:.0f}mm). '
                                     f'Use an escape direction from the popup.')
                                 return
                             # FALLBACK — no direction opens per model; let the
@@ -1141,15 +1134,15 @@ class EstunCodroidDriver(Node):
                                 signed_speed = direction * effective_frac
                                 override_used = True
                         else:
-                            # In warn zone but not stop. Closing is allowed
-                            # but throttled to fallback speed for caution.
-                            cap = self._coll_fallback_frac
-                            if effective_frac > cap:
-                                self.get_logger().info(
-                                    f'guard: warn-zone closing throttle {effective_frac:.2f} → {cap:.2f} '
-                                    f'({pair} at {cur_min:.0f}mm, warn≤{self._coll_warn_mm:.0f}mm)')
-                                effective_frac = cap
-                                signed_speed = direction * effective_frac
+                            # In warn zone but not stop. Under the new
+                            # tiered policy (2026-07-16) the warn band
+                            # is presentational only — no speed throttle,
+                            # no direction block. The 3D view chip
+                            # surfaces the proximity; the operator
+                            # decides. Leaving this branch as a no-op
+                            # keeps the gate readable if we ever want
+                            # to reinstate a per-pair throttle.
+                            pass
             except Exception as e:
                 if not getattr(self, '_coll_warned_bad', False):
                     self._coll_warned_bad = True
@@ -2179,9 +2172,17 @@ class EstunCodroidDriver(Node):
                 self._guard_pair = (a, b)
                 self._guard_min_dist_mm = d
                 # Threshold selection: env uses env_warn/stop; self+ground
-                # use collision_warn/stop.
-                warn_mm = self._env_warn_mm if kind == 'env' else self._coll_warn_mm
-                stop_mm = self._env_stop_mm if kind == 'env' else self._coll_stop_mm
+                # use collision_warn/stop. Per-pair YAML overrides win
+                # over the global defaults so pairs with a design floor
+                # (link3↔link5) can carry a tighter warn without shaking
+                # everything else.
+                default_warn = self._env_warn_mm if kind == 'env' else self._coll_warn_mm
+                default_stop = self._env_stop_mm if kind == 'env' else self._coll_stop_mm
+                if kind == 'env':
+                    warn_mm, stop_mm = default_warn, default_stop
+                else:
+                    warn_mm, stop_mm = self._coll_model.thresholds_for(
+                        (a, b), default_warn, default_stop)
                 self._guard_warn_effective_mm = warn_mm
                 self._guard_stop_effective_mm = stop_mm
                 # Compute escapes only when in/near the warn zone.

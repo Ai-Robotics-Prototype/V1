@@ -266,14 +266,19 @@ export default function View3DLayout() {
 }
 
 // Live min-clearance chip — appears in the 3D View top-left whenever
-// the driver reports any capsule pair closer than 2× warn distance.
-// Amber ≤ warn, red ≤ stop. Renders under the AT-LIMIT chip so both
-// stay visible when they co-occur.
+// the unified guard reports any pair closer than 2× warn distance. This
+// is the NON-BLOCKING presentation for the warn band; the popup only
+// takes over at stop. Amber in warn, red in stop. Renders under the
+// AT-LIMIT chip so both stay visible when they co-occur.
 function MinClearanceReadout() {
-  const pair    = useStore((s) => s.robot?.collision_pair)
-  const dist    = useStore((s) => s.robot?.collision_min_mm)
-  const warn    = useStore((s) => s.robot?.collision_warn_mm) || 80
-  const stop    = useStore((s) => s.robot?.collision_stop_mm) || 30
+  // Prefer the unified guard state (self / ground / env aggregated by
+  // the driver) so a self-collision fold surfaces the same way as an
+  // env obstacle. Fall back to the legacy self-collision keys for
+  // driver builds pre-guard-unification.
+  const pair    = useStore((s) => s.robot?.guard_pair) || useStore((s) => s.robot?.collision_pair)
+  const dist    = useStore((s) => s.robot?.guard_min_mm) ?? useStore((s) => s.robot?.collision_min_mm)
+  const warn    = useStore((s) => s.robot?.guard_warn_mm) || useStore((s) => s.robot?.collision_warn_mm) || 80
+  const stop    = useStore((s) => s.robot?.guard_stop_mm) || useStore((s) => s.robot?.collision_stop_mm) || 30
   const enabled = useStore((s) => s.robot?.collision_enabled)
   if (!enabled || dist == null || !pair) return null
   if (dist > 2 * warn) return null   // only show when actually close
@@ -289,6 +294,7 @@ function MinClearanceReadout() {
     .replace('_forearm',  '').replace('_wrist1',    '')
     .replace('_wrist2',   '').replace('_flange',    '')
     .replace('__ground__', 'ground')
+    .replace(/^zone#/, 'zone:')
   return (
     <div style={{
       position: 'absolute', top: 8, left: 8, zIndex: 20,

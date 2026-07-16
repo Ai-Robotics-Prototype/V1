@@ -115,6 +115,25 @@ pairs:
 mesh_pairs:
   - [link3_forearm, link5_wrist2]
 
+# Per-pair threshold overrides. Global defaults come from the driver
+# (collision_warn_distance_mm / collision_stop_distance_mm). Overrides
+# below win when a specific pair is closer than any other and would
+# otherwise trip warn spuriously.
+#
+# link3_forearm ↔ link5_wrist2 — the mesh clearance stays a designed
+# 46.8–51 mm across any J4/J5 combo because link4's mechanical body
+# physically enforces the gap; J1/J2/J3/J6 are kinematically invariant
+# to the pair (both links are children of J4). Global 80 mm warn is
+# ALWAYS lit for this pair during any normal fold; 60 mm mostly is too.
+# The chip in the 3D view chrome takes over for warn-band presentation
+# (non-blocking); the stop-band popup only fires below stop. Keep stop
+# at 30 mm as a real "something is wrong with the mesh model or geometry"
+# tripwire.
+pair_thresholds:
+  - pair: [link3_forearm, link5_wrist2]
+    warn: 60.0
+    stop: 30.0
+
 # Ground plane pseudo-body — flat at z=0 in base frame, treated as
 # an infinite half-space for distance queries. The base column itself
 # is already covered by the base_link capsule.
