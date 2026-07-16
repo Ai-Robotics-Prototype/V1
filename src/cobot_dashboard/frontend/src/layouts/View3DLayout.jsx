@@ -274,12 +274,25 @@ function MinClearanceReadout() {
   // Prefer the unified guard state (self / ground / env aggregated by
   // the driver) so a self-collision fold surfaces the same way as an
   // env obstacle. Fall back to the legacy self-collision keys for
-  // driver builds pre-guard-unification.
-  const pair    = useStore((s) => s.robot?.guard_pair) || useStore((s) => s.robot?.collision_pair)
-  const dist    = useStore((s) => s.robot?.guard_min_mm) ?? useStore((s) => s.robot?.collision_min_mm)
-  const warn    = useStore((s) => s.robot?.guard_warn_mm) || useStore((s) => s.robot?.collision_warn_mm) || 80
-  const stop    = useStore((s) => s.robot?.guard_stop_mm) || useStore((s) => s.robot?.collision_stop_mm) || 30
-  const enabled = useStore((s) => s.robot?.collision_enabled)
+  // driver builds pre-guard-unification. ALL useStore hooks are called
+  // unconditionally at the top of the component — the fallback merge
+  // happens in plain JS below (previously used `||`/`??` between hook
+  // calls, which broke hook-order on any state transition where the
+  // primary key flipped truthiness → React #300).
+  const guardPair    = useStore((s) => s.robot?.guard_pair)
+  const collisionPair = useStore((s) => s.robot?.collision_pair)
+  const guardMin     = useStore((s) => s.robot?.guard_min_mm)
+  const collisionMin = useStore((s) => s.robot?.collision_min_mm)
+  const guardWarn    = useStore((s) => s.robot?.guard_warn_mm)
+  const collisionWarn = useStore((s) => s.robot?.collision_warn_mm)
+  const guardStop    = useStore((s) => s.robot?.guard_stop_mm)
+  const collisionStop = useStore((s) => s.robot?.collision_stop_mm)
+  const enabled      = useStore((s) => s.robot?.collision_enabled)
+
+  const pair = guardPair || collisionPair
+  const dist = guardMin != null ? guardMin : collisionMin
+  const warn = (guardWarn || collisionWarn || 80)
+  const stop = (guardStop || collisionStop || 30)
   if (!enabled || dist == null || !pair) return null
   if (dist > 2 * warn) return null   // only show when actually close
   const level = dist <= stop ? 'stop' : (dist <= warn ? 'warn' : 'near')
