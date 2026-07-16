@@ -528,8 +528,23 @@ class EstunCodroidDriver(Node):
         self._guard_pair   = None
         self._guard_min_dist_mm = None
         self._guard_escapes = []
+        # Rate-limit for the 13× evaluate() escape probe. 0 == never
+        # computed yet; refresh at ≤2 Hz on the posture callback.
+        self._guard_escapes_ts = 0.0
         self._guard_warn_effective_mm = self._coll_warn_mm
         self._guard_stop_effective_mm = self._coll_stop_mm
+        # Mesh-refresh worker (~5 Hz on its own thread). Populates
+        # CollisionModel._mesh_cache so posture / supervise ticks read
+        # mesh-mesh distances from cache instead of paying the 6 ms/
+        # query cost inline. The worker is what keeps the 50 ms
+        # supervise budget under 5 ms even at the J3=122° fold.
+        self._mesh_worker_stop = threading.Event()
+        self._mesh_worker = None
+        if self._coll_model is not None and self._coll_model.mesh_pairs:
+            self._mesh_worker = threading.Thread(
+                target=self._mesh_refresh_loop,
+                name='mesh-refresh', daemon=True)
+            self._mesh_worker.start()
         # Environment-zone refresher thread.
         self._env_stop = threading.Event()
         if self._coll_model is not None:
@@ -1501,6 +1516,25 @@ class EstunCodroidDriver(Node):
             # threading.Event.wait is interruptible for clean shutdown.
             self._env_stop.wait(timeout=self._env_zone_refresh_s)
 
+    def _mesh_refresh_loop(self):
+        """Off-loop mesh-mesh distance refresher. Runs at ~5 Hz
+        (200 ms cadence) so the supervise/posture hot paths can read
+        link3↔link5 mesh-mesh distance from cache instead of paying the
+        3-6 ms/query cost on the single-threaded ROS executor. Skips
+        computation until we have at least one posture sample (nothing
+        to compute against). Terminates cleanly on `_mesh_worker_stop`."""
+        MESH_REFRESH_PERIOD_S = 0.2
+        while not self._mesh_worker_stop.is_set():
+            if self._coll_model is not None and self._last_posture_ts > 0.0:
+                try:
+                    self._coll_model.refresh_mesh_cache(list(self._joint_deg))
+                except Exception as e:
+                    if not getattr(self, '_mesh_worker_warned', False):
+                        self._mesh_worker_warned = True
+                        self.get_logger().warn(
+                            f'mesh-refresh worker error (suppressed after 1st): {e}')
+            self._mesh_worker_stop.wait(timeout=MESH_REFRESH_PERIOD_S)
+
     def _check_collision_locked(self):
         """Evaluate self-collision at live joint angles. Returns True
         iff we stopped the jog. Also updates self._coll_min_pair /
@@ -2115,10 +2149,11 @@ class EstunCodroidDriver(Node):
 
         self._last_posture_ts = time.time()
         # Passive collision evaluation — refresh min-pair distance on
-        # EVERY posture update, not just during active jogs. The 3D
-        # view's "min clearance" chip depends on this staying live at
-        # idle so the operator can see impending contact BEFORE they
-        # press a jog key. No stop action here; stops only fire in
+        # EVERY posture update so the 3D view's "min clearance" chip
+        # stays live. mesh-mesh pairs are served from `_mesh_cache`,
+        # populated by the mesh-refresh worker below (5 Hz off-loop) —
+        # keeps the posture callback under ~6 ms even at the J3=122°
+        # fold. No stop action here; stops only fire in
         # _check_collision_locked (jog-active path).
         if self._coll_model is not None:
             try:
@@ -2136,63 +2171,62 @@ class EstunCodroidDriver(Node):
                     a, b, d = env[0]
                     self._env_min_pair = (a, b)
                     self._env_min_dist_mm = d
-                    # Only spend the escape-search cost when we're in
-                    # or near the warn zone (< 2×warn). Otherwise the
-                    # popup wouldn't be firing anyway.
-                    if d < 2.0 * self._coll_warn_mm:
-                        link  = a if b.startswith('zone#') else b
-                        z_str = b if b.startswith('zone#') else a
-                        z_id  = z_str.split('#', 1)[1]
-                        self._env_escape_dirs = \
-                            self._coll_model.escape_directions(
-                                self._joint_deg, link, z_id)
-                    else:
-                        self._env_escape_dirs = []
                 else:
                     self._env_min_pair = None
                     self._env_min_dist_mm = None
-                    self._env_escape_dirs = []
-
                 # ── UNIFIED GUARD STATE ────────────────────────────────
                 # Whichever pair (self / ground / env) is closest wins
                 # and drives the guard popup. `guard_kind` picks the
                 # right modal copy; `guard_escapes` is the operator's
                 # live escape menu regardless of collision type.
-                a, b, d = res[0]
-                is_ground = (a == '__ground__' or b == '__ground__')
-                is_env    = (isinstance(a, str) and a.startswith('zone#')) \
-                          or (isinstance(b, str) and b.startswith('zone#'))
-                if is_ground:
-                    kind = 'ground'
-                elif is_env:
-                    kind = 'env'
-                else:
-                    kind = 'self'
-                self._guard_kind = kind
-                self._guard_pair = (a, b)
-                self._guard_min_dist_mm = d
-                # Threshold selection: env uses env_warn/stop; self+ground
-                # use collision_warn/stop. Per-pair YAML overrides win
-                # over the global defaults so pairs with a design floor
-                # (link3↔link5) can carry a tighter warn without shaking
-                # everything else.
-                default_warn = self._env_warn_mm if kind == 'env' else self._coll_warn_mm
-                default_stop = self._env_stop_mm if kind == 'env' else self._coll_stop_mm
-                if kind == 'env':
-                    warn_mm, stop_mm = default_warn, default_stop
-                else:
-                    warn_mm, stop_mm = self._coll_model.thresholds_for(
-                        (a, b), default_warn, default_stop)
-                self._guard_warn_effective_mm = warn_mm
-                self._guard_stop_effective_mm = stop_mm
-                # Compute escapes only when in/near the warn zone.
-                if d < 2.0 * warn_mm:
-                    self._guard_escapes = \
-                        self._coll_model.escape_directions_any(
-                            self._joint_deg, (a, b))
-                else:
-                    self._guard_escapes = []
-                self._guard_active = d <= warn_mm
+                if res:
+                    a, b, d = res[0]
+                    is_ground = (a == '__ground__' or b == '__ground__')
+                    is_env    = (isinstance(a, str) and a.startswith('zone#')) \
+                              or (isinstance(b, str) and b.startswith('zone#'))
+                    if is_ground: kind = 'ground'
+                    elif is_env:  kind = 'env'
+                    else:         kind = 'self'
+                    self._guard_kind = kind
+                    self._guard_pair = (a, b)
+                    self._guard_min_dist_mm = d
+                    # Threshold selection: env uses env_warn/stop; self+ground
+                    # use collision_warn/stop. Per-pair YAML overrides win
+                    # for pairs with a design floor (link3↔link5).
+                    default_warn = self._env_warn_mm if kind == 'env' else self._coll_warn_mm
+                    default_stop = self._env_stop_mm if kind == 'env' else self._coll_stop_mm
+                    if kind == 'env':
+                        warn_mm, stop_mm = default_warn, default_stop
+                    else:
+                        warn_mm, stop_mm = self._coll_model.thresholds_for(
+                            (a, b), default_warn, default_stop)
+                    self._guard_warn_effective_mm = warn_mm
+                    self._guard_stop_effective_mm = stop_mm
+                    self._guard_active = d <= warn_mm
+                    # Escape probe table is 13× evaluate() (~78 ms). We
+                    # can't afford it in the posture callback (25 Hz).
+                    # Recompute only when d ≤ stop AND at most 2 Hz;
+                    # otherwise reuse the last computed set. Popup UI
+                    # only shows in stop band anyway (tiered policy),
+                    # so this matches when the escapes are needed.
+                    now_t = time.time()
+                    if d <= stop_mm:
+                        if now_t - self._guard_escapes_ts >= 0.5:
+                            self._guard_escapes = \
+                                self._coll_model.escape_directions_any(
+                                    self._joint_deg, (a, b))
+                            self._guard_escapes_ts = now_t
+                    else:
+                        # Cheap path: clear escapes when out of stop band.
+                        if self._guard_escapes:
+                            self._guard_escapes = []
+                        self._guard_escapes_ts = 0.0
+                # Env-specific escape publish (legacy consumers).
+                self._env_escape_dirs = list(self._guard_escapes) if (
+                    self._env_min_dist_mm is not None
+                    and self._env_stop_mm is not None
+                    and self._env_min_dist_mm <= self._env_stop_mm
+                ) else []
             except Exception:
                 pass
         self._publish_status_blob()
@@ -2419,6 +2453,10 @@ class EstunCodroidDriver(Node):
         # via rclpy's KeyboardInterrupt path in main().
         try:
             self._stop_jog(reason='node shutdown')
+        except Exception:
+            pass
+        try:
+            self._mesh_worker_stop.set()
         except Exception:
             pass
         self._disconnect()

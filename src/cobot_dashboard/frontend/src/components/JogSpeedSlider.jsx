@@ -13,14 +13,29 @@ import { useStore } from '../store/useStore'
 // estun_driver.yaml. Do NOT flip that on without an explicit safety
 // review; monitor_only stays true.
 
+// Driver-side hard cap on commanded jog speed_frac. Mirrors
+// estun_driver_node.declare_parameter('jog_speed_cap', 0.15) — anything
+// above 15% on the slider is clamped there. Surfaced in the UI so the
+// operator isn't surprised that pushing the slider past 15% looks the
+// same on the wire (it hits the same 15% cap the driver enforces).
+const JOG_SPEED_CAP_PCT = 15
+
 export default function JogSpeedSlider() {
   const jogSpeedPct    = useStore((s) => s.jogSpeedPct)
   const setJogSpeedPct = useStore((s) => s.setJogSpeedPct)
+  const capped = jogSpeedPct > JOG_SPEED_CAP_PCT
   return (
     <div style={styles.wrap}>
       <div style={styles.head}>
         <span style={styles.label}>Jog speed</span>
-        <span style={styles.val}>{Math.round(jogSpeedPct)}%</span>
+        <span style={styles.val}>
+          {Math.round(jogSpeedPct)}%
+          {capped && (
+            <span style={styles.capped}>
+              &nbsp;→ {JOG_SPEED_CAP_PCT}% (capped)
+            </span>
+          )}
+        </span>
       </div>
       <input
         type="range"
@@ -29,11 +44,13 @@ export default function JogSpeedSlider() {
         step={1}
         value={jogSpeedPct}
         onChange={(e) => setJogSpeedPct(Number(e.target.value))}
-        aria-label="Jog speed (twin animation speed; also future commanded-motion speed)"
+        aria-label="Jog speed. Driver caps commanded speed at 15%."
         style={styles.range}
       />
       <div style={styles.hint}>
-        Twin animation only — motion command wiring is TODO.
+        {capped
+          ? `Driver caps commanded speed at ${JOG_SPEED_CAP_PCT}%. Speed changes apply at the next hold — mid-hold jogs keep the starting speed.`
+          : `Applies at hold-start; mid-hold slider changes take effect on the next press.`}
       </div>
     </div>
   )
@@ -56,6 +73,11 @@ const styles = {
   val: {
     fontSize: 11, fontFamily: 'var(--font-mono, monospace)',
     color: 'var(--text-primary)', fontWeight: 600,
+  },
+  capped: {
+    color: 'var(--text-warn, #f59e0b)',
+    fontFamily: 'var(--font-mono, monospace)',
+    fontSize: 10, fontWeight: 700, letterSpacing: '0.03em',
   },
   range: { width: '100%' },
   hint: {
