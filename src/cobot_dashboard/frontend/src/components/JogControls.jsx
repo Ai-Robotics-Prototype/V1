@@ -315,7 +315,17 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   // disabled and the operator can tap the Joint mode button to switch.
   const [jogMode, setJogMode] = useState('cartesian')
   const [step, setStep]       = useState(1.0)      // vestigial in continuous mode (kept for future inching / IncrementalJogPanel path)
-  const [speed, setSpeed]     = useState(20)
+  // Speed is a SHARED store field (jogSpeedPct) so this pad's slider
+  // AND the standalone JogSpeedSlider write to the same source of
+  // truth. Prior local `useState(20)` state was invisible to the
+  // JogSpeedSlider — moving that widget changed the store but the
+  // pad's hold handler kept reading its own state, so the wire showed
+  // whatever value the pad's inline slider was last set to
+  // (defaulting to 20% at page load). Symptom: slider "did nothing"
+  // when the operator moved the pretty slider (jogSpeedPct changed;
+  // wire stayed at 20% → driver capped at 15% → identical motion).
+  const speed    = useStore((s) => s.jogSpeedPct)
+  const setSpeed = useStore((s) => s.setJogSpeedPct)
 
   const speedRef = useRef(speed)
   const modeRef  = useRef(jogMode)
@@ -941,12 +951,21 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
         </div>
 
         <div>
-          <div style={{ fontSize: speedFont, fontWeight: 600, color: '#6b7280', marginBottom: 4 }}>Speed: {speed}%</div>
+          <div style={{ fontSize: speedFont, fontWeight: 600, color: '#6b7280', marginBottom: 4 }}>
+            Speed: {speed}%
+            {speed > 15 && (
+              <span style={{ color: '#d97706', fontWeight: 700, marginLeft: 6 }}>
+                → 15% (capped)
+              </span>
+            )}
+          </div>
           <input type="range" min={1} max={100} value={speed}
             onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
             style={{ width: '100%', height: maximized ? 10 : 6 }} />
           <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 2 }}>
-            effective ≤ 15% (cap)
+            {speed <= 15
+              ? `wire ${(speed / 100).toFixed(2)} — mid-hold changes take effect on next press`
+              : `wire 0.15 cap — driver clamps ≥15%`}
           </div>
         </div>
 
