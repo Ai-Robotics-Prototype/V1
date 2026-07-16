@@ -468,15 +468,28 @@ class CollisionModel:
         # distances at ~5 ms/tick and requires ~15 kB of pre-decoded
         # vertex data per link (stride=4 subsample; 0.3 mm sampling
         # error, well under the 30 mm stop threshold).
+        # Load EVERY .npy in mesh_verts/, not just the two the
+        # mesh_pairs list mentions. bd8d3e6 shipped mesh-vs-capsule
+        # ground-truth for link3↔link5 only, but the same fat-cylinder
+        # mismatch drives phantom stops on the ENTIRE capsule set
+        # (link2↔link4: cap 301 mm vs mesh 421 mm; link3↔link6:
+        # cap 48 mm vs mesh 112 mm — phantom firing today). Loading
+        # every link's verts lets the worker generalize: any pair
+        # whose capsule pre-screen goes close AND has verts for both
+        # sides gets mesh-confirmed.
         self._mesh_verts = {}
-        if self.mesh_pairs:
-            here = os.path.dirname(os.path.abspath(__file__))
-            for a, b in self.mesh_pairs:
-                for link in (a, b):
-                    if link in self._mesh_verts: continue
-                    npy = os.path.join(here, 'mesh_verts', f'{link}.npy')
-                    if os.path.exists(npy):
-                        self._mesh_verts[link] = np.load(npy).astype(np.float64)
+        here = os.path.dirname(os.path.abspath(__file__))
+        mesh_dir = os.path.join(here, 'mesh_verts')
+        if os.path.isdir(mesh_dir):
+            for fname in os.listdir(mesh_dir):
+                if not fname.endswith('.npy'):
+                    continue
+                link = fname[:-4]
+                npy = os.path.join(mesh_dir, fname)
+                try:
+                    self._mesh_verts[link] = np.load(npy).astype(np.float64)
+                except Exception:
+                    pass
         # Mesh-mesh pair distances are 3-6 ms per query on the Jetson —
         # too expensive for the 50 ms supervise tick which also has to
         # service /robot/jog_command callbacks on the same single-thread
@@ -538,20 +551,84 @@ class CollisionModel:
             d2 = ((Wa[:, None, :] - Wb[None, :, :]) ** 2).sum(-1)
             return float(np.sqrt(d2.min()))
 
+    # Every self-pair (including anything in mesh_pairs) is eligible
+    # for mesh confirmation whenever the capsule pre-screen says close.
+    # Threshold below controls how far the capsule can be before the
+    # worker bothers with a mesh query — 200 mm keeps the worker
+    # cost bounded (only 1-3 pairs "close" at any typical pose) while
+    # still catching every phantom candidate (all seen so far under 100
+    # mm capsule distance when they fire).
+    MESH_CONFIRM_PROXIMITY_MM = 200.0
+
     def refresh_mesh_cache(self, q_deg):
-        """Recompute every mesh_pair at the given pose and update cache.
-        Intended to be called from a worker thread, NOT the supervise
-        tick. Cheap enough to run at 5-10 Hz per pair on the Jetson."""
+        """Recompute mesh-mesh distances at the given pose and update
+        cache. Runs on a worker thread, NOT on the supervise tick.
+
+        Every pair with mesh_verts for BOTH links is eligible: forced-
+        mesh pairs (self.mesh_pairs) are always refreshed; every other
+        (self-collision) pair is refreshed only when its capsule pre-
+        screen is inside MESH_CONFIRM_PROXIMITY_MM. This preserves the
+        <5 ms hot-tick budget on the executor while eliminating the
+        fat-cylinder phantom class across all pairs — the phantom
+        signature (capsule ≤ warn but mesh ≫ warn) is always caught."""
         now = time.time()
-        for pair_tuple in self.mesh_pairs:
-            d = self._mesh_pair_dist(q_deg, pair_tuple)
+        # 1) Unconditional mesh pairs (design-floor pairs like l3↔l5).
+        forced = {frozenset(p): p for p in self.mesh_pairs}
+        for key, pair in forced.items():
+            d = self._mesh_pair_dist(q_deg, pair)
             if d is None:
                 continue
-            key = frozenset(pair_tuple)
             with self._mesh_cache_lock:
                 self._mesh_cache[key] = {
                     'dist_mm': d, 'ts': now,
-                    'a': pair_tuple[0], 'b': pair_tuple[1],
+                    'a': pair[0], 'b': pair[1],
+                }
+        # 2) Every OTHER pair: mesh-confirm only when the capsule pre-
+        #    screen says close. FK is already inside _mesh_pair_dist,
+        #    so we do one lightweight capsule call here first.
+        frames = fk_frames(q_deg)
+        world = {}
+        for link, caps in self.capsules.items():
+            idx = LINK_NAMES.index(link)
+            T = frames[idx]
+            world[link] = [
+                (_transform_point(T, c.p0_local),
+                 _transform_point(T, c.p1_local),
+                 c.radius)
+                for c in caps
+            ]
+        for a, b in self.pairs:
+            if a == '__ground__' or b == '__ground__':
+                continue  # ground has no mesh
+            key = frozenset({a, b})
+            if key in forced:
+                continue
+            if a not in self._mesh_verts or b not in self._mesh_verts:
+                continue
+            if a not in world or b not in world:
+                continue
+            # Cheap capsule pre-screen.
+            best = float('inf')
+            for a_p0, a_p1, r_a in world[a]:
+                for b_p0, b_p1, r_b in world[b]:
+                    d, _ = _capsule_capsule_dist(a_p0, a_p1, r_a,
+                                                 b_p0, b_p1, r_b)
+                    if d < best: best = d
+            if best > self.MESH_CONFIRM_PROXIMITY_MM:
+                # Too far to matter; drop any stale cache entry so
+                # evaluate() falls back to the capsule reading (which
+                # is safely conservative at large distances).
+                with self._mesh_cache_lock:
+                    self._mesh_cache.pop(key, None)
+                continue
+            # Close enough to be worth confirming.
+            d = self._mesh_pair_dist(q_deg, (a, b))
+            if d is None:
+                continue
+            with self._mesh_cache_lock:
+                self._mesh_cache[key] = {
+                    'dist_mm': d, 'ts': now,
+                    'a': a, 'b': b,
                 }
 
     def mesh_cached_dist(self, pair, max_age_s=0.5):
@@ -624,26 +701,34 @@ class CollisionModel:
                 for c in caps
             ]
         results = []
-        # Mesh-mesh pairs (currently just link3↔link5). Formerly ran
-        # in-line here at 3-6 ms/query — too expensive for the 50 ms
-        # supervise tick + 25 Hz posture callback path. Now served from
-        # `_mesh_cache`, populated by a worker thread that calls
-        # `refresh_mesh_cache(q_deg)` on its own schedule (≤5 Hz). If
-        # the cache is missing/stale, we OMIT the pair from results
-        # rather than block — callers already tolerate missing entries
-        # (e.g., env / ground / self pairs continue), and the pair-
-        # threshold guard treats absence as "no known threat" while
-        # the worker catches up. Fresh entries (via mesh_cached_dist)
-        # are appended below.
+        # Mesh-preferred pair distance:
+        #   - Every self-collision pair (including the "always mesh"
+        #     pairs listed in self.mesh_pairs) may have a fresh mesh
+        #     cache entry produced by the worker thread. If it does, we
+        #     use the mesh distance — that's the truth.
+        #   - Otherwise we fall back to the capsule reading. Capsules
+        #     UNDER-report on this arm (fat cylinders vs the mesh's
+        #     flat rectangular ends), so falling back to capsule is
+        #     safely conservative — the worst case is a phantom
+        #     warn/stop that the operator clears manually, never a
+        #     missed real collision.
+        #   - The worker refreshes mesh cache for any pair whose
+        #     capsule pre-screen is within MESH_CONFIRM_PROXIMITY_MM
+        #     (200 mm) so far-away pairs never pay the mesh cost.
+        #
+        # Cache read here is under the tick budget — a single dict
+        # lookup + freshness check per pair (~µs). No mesh math on
+        # the hot path.
         mesh_pair_set = {frozenset(p) for p in self.mesh_pairs}
+        MAX_AGE_S = 0.5
+        now = time.time()
         with self._mesh_cache_lock:
-            for a, b in self.mesh_pairs:
-                entry = self._mesh_cache.get(frozenset({a, b}))
-                if entry is not None:
-                    results.append((a, b, float(entry['dist_mm'])))
+            fresh_mesh = {
+                k: v['dist_mm'] for k, v in self._mesh_cache.items()
+                if now - v['ts'] <= MAX_AGE_S
+            }
         for a, b in self.pairs:
-            if frozenset({a, b}) in mesh_pair_set:
-                continue  # already handled via mesh-mesh above
+            key = frozenset({a, b})
             if a == '__ground__' or b == '__ground__':
                 if self.ground_z_mm is None:
                     continue
@@ -658,6 +743,10 @@ class CollisionModel:
                 continue
             if a not in world or b not in world:
                 continue
+            # Prefer mesh cache; fall back to capsule.
+            if key in fresh_mesh:
+                results.append((a, b, float(fresh_mesh[key])))
+                continue
             best = float('inf')
             for a_p0, a_p1, r_a in world[a]:
                 for b_p0, b_p1, r_b in world[b]:
@@ -665,6 +754,14 @@ class CollisionModel:
                                                  b_p0, b_p1, r_b)
                     if d < best: best = d
             results.append((a, b, float(best)))
+        # Mesh-only pairs (e.g. link3↔link5) that aren't in the capsule
+        # `pairs` list — surface them if the cache has an entry.
+        for a, b in self.mesh_pairs:
+            key = frozenset({a, b})
+            if any(frozenset({x, y}) == key for x, y, _ in results):
+                continue  # already surfaced via the pairs loop
+            if key in fresh_mesh:
+                results.append((a, b, float(fresh_mesh[key])))
         # Env obstacles — each arm capsule vs each zone; per-link min.
         for link, cap_list in world.items():
             for z in self._env_zones:
