@@ -582,16 +582,28 @@ class CollisionModel:
         any pair_thresholds override. Order-insensitive. `pair` may be
         a tuple/list; env pairs (link, 'zone#N') never match — env has
         its own warn/stop path in the driver."""
+        w, s, _ = self.thresholds_for_ex(pair, default_warn_mm, default_stop_mm)
+        return w, s
+
+    def thresholds_for_ex(self, pair, default_warn_mm, default_stop_mm):
+        """Same as `thresholds_for` but also returns `overridden`: True
+        iff the (warn, stop) come from a pair_thresholds YAML entry
+        rather than the global defaults. Callers use this to decide
+        whether to speed-scale the stop distance — an EXPLICIT per-pair
+        override is authoritative and represents a design-floor number
+        (e.g. link3↔link5's mesh-bounded 46 mm floor) that must NOT be
+        raised by the dynamic-margin formula; scaling would push the
+        stop threshold above the mechanical floor and lock jog forever."""
         if not pair:
-            return default_warn_mm, default_stop_mm
+            return default_warn_mm, default_stop_mm, False
         try:
             key = frozenset(pair)
         except TypeError:
-            return default_warn_mm, default_stop_mm
+            return default_warn_mm, default_stop_mm, False
         for entry in self.pair_thresholds:
             if entry['pair'] == key:
-                return entry['warn'], entry['stop']
-        return default_warn_mm, default_stop_mm
+                return entry['warn'], entry['stop'], True
+        return default_warn_mm, default_stop_mm, False
 
     def evaluate(self, q_deg):
         """Returns a list of (a, b, dist_mm) sorted ascending. Each

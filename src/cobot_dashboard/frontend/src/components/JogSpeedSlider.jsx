@@ -1,5 +1,11 @@
 import { useStore } from '../store/useStore'
 
+// Fallback if the driver hasn't published effective_speed_cap yet
+// (pre-safety-pass driver builds, cold-boot before first status blob).
+// Matches the pre-pass 0.15 baseline so the UI is conservative when
+// the number is unknown.
+const FALLBACK_EFFECTIVE_CAP = 0.15
+
 // Jog speed slider — 0-100 %. Currently drives ONLY the twin animation
 // speed (quick-orient buttons via durationForJogSpeed()). Named, reused
 // across the Program window and the 3D View so a single operator gesture
@@ -13,17 +19,20 @@ import { useStore } from '../store/useStore'
 // estun_driver.yaml. Do NOT flip that on without an explicit safety
 // review; monitor_only stays true.
 
-// Driver-side hard cap on commanded jog speed_frac. Mirrors
-// estun_driver_node.declare_parameter('jog_speed_cap', 0.15) — anything
-// above 15% on the slider is clamped there. Surfaced in the UI so the
-// operator isn't surprised that pushing the slider past 15% looks the
-// same on the wire (it hits the same 15% cap the driver enforces).
-const JOG_SPEED_CAP_PCT = 15
-
 export default function JogSpeedSlider() {
   const jogSpeedPct    = useStore((s) => s.jogSpeedPct)
   const setJogSpeedPct = useStore((s) => s.setJogSpeedPct)
-  const capped = jogSpeedPct > JOG_SPEED_CAP_PCT
+  // Effective ceiling from the driver's status blob. Two-tier cap:
+  //   effective = min(jog_speed_cap, operator_speed_limit)
+  // Fallback when the driver isn't yet reporting (cold boot,
+  // pre-safety-pass build): the conservative 0.15 pre-pass baseline.
+  const effCap = useStore((s) => s.robot?.effective_speed_cap)
+  const opLim  = useStore((s) => s.robot?.operator_speed_limit)
+  const hwCap  = useStore((s) => s.robot?.jog_speed_cap)
+  const effectivePct = Math.round(
+    (Number.isFinite(effCap) ? effCap : FALLBACK_EFFECTIVE_CAP) * 100
+  )
+  const capped = jogSpeedPct > effectivePct
   return (
     <div style={styles.wrap}>
       <div style={styles.head}>
@@ -32,25 +41,39 @@ export default function JogSpeedSlider() {
           {Math.round(jogSpeedPct)}%
           {capped && (
             <span style={styles.capped}>
-              &nbsp;→ {JOG_SPEED_CAP_PCT}% (capped)
+              &nbsp;→ {effectivePct}% (capped)
             </span>
           )}
         </span>
       </div>
-      <input
-        type="range"
-        min={0}
-        max={100}
-        step={1}
-        value={jogSpeedPct}
-        onChange={(e) => setJogSpeedPct(Number(e.target.value))}
-        aria-label="Jog speed. Driver caps commanded speed at 15%."
-        style={styles.range}
-      />
+      <div style={styles.rangeWrap}>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={1}
+          value={jogSpeedPct}
+          onChange={(e) => setJogSpeedPct(Number(e.target.value))}
+          aria-label={`Jog speed. Driver ceiling ${effectivePct}%.`}
+          style={styles.range}
+        />
+        {/* Effective-ceiling tick mark below the slider — a small
+            colored bar the operator can see the ceiling at a glance. */}
+        <div style={{
+          position: 'relative', width: '100%', height: 6, marginTop: 2,
+        }}>
+          <div style={{
+            position: 'absolute',
+            left: `calc(${effectivePct}% - 1px)`,
+            top: 0, width: 2, height: 6,
+            background: 'var(--text-warn, #f59e0b)',
+          }} />
+        </div>
+      </div>
       <div style={styles.hint}>
         {capped
-          ? `Driver caps commanded speed at ${JOG_SPEED_CAP_PCT}%. Speed changes apply at the next hold — mid-hold jogs keep the starting speed.`
-          : `Applies at hold-start; mid-hold slider changes take effect on the next press.`}
+          ? `Driver clamps to ${effectivePct}% (min(hw ${Math.round((hwCap || 0.15) * 100)}%, op-limit ${Math.round((opLim || 0.15) * 100)}%)). Speed changes apply at next hold — mid-hold jogs keep the starting speed.`
+          : `Ceiling ${effectivePct}% (hw ${Math.round((hwCap || 0.15) * 100)}% / op-limit ${Math.round((opLim || 0.15) * 100)}%). Mid-hold changes take effect on next press.`}
       </div>
     </div>
   )
@@ -80,6 +103,7 @@ const styles = {
     fontSize: 10, fontWeight: 700, letterSpacing: '0.03em',
   },
   range: { width: '100%' },
+  rangeWrap: { display: 'flex', flexDirection: 'column' },
   hint: {
     fontSize: 9, color: 'var(--text-muted)', fontStyle: 'italic',
   },

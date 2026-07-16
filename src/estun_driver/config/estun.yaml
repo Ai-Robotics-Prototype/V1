@@ -69,10 +69,46 @@ estun_driver:
     # be gated harder than moving it.
     allow_power: false
 
-    # Hard cap on |speed| in Robot/jog frames. Bench observations at 51%
-    # produced a comfortable slow jog; 0.15 keeps a wide margin below that
-    # for first-motion trials. Raise deliberately after bench validation.
-    jog_speed_cap: 0.15
+    # ── Two-tier speed cap (staged raise 2026-07-16 safety pass) ──────
+    #
+    # jog_speed_cap is the HARDWARE-DERIVED ceiling — the point past
+    # which the derived safety margins (limit clamp, collision stop_mm,
+    # sigma governor) can no longer keep worst-case overrun distance
+    # under a supervise-tick budget.
+    #
+    # operator_speed_limit is the OPERATIONALLY-ALLOWED ceiling the
+    # operator is permitted to reach today. Effective_cap =
+    #   min(jog_speed_cap, operator_speed_limit).
+    #
+    # Raise operator_speed_limit → 0.50 ONLY after ALL of:
+    #   * Test B (limit-approach + collision-approach at 0.25) complete
+    #     and captured in the test log at /opt/cobot/logs/testB-*.jsonl
+    #   * One week of continuous cell operation at operator_speed_limit
+    #     = 0.25 with zero unresolved 2xxx alarms
+    #   * Independent review of the wire-log at
+    #     /opt/cobot/logs/estun_ws_*.jsonl for that week showing no
+    #     speed-cap-driven stops (deadman, singularity, limit clamp)
+    # Raising this is a one-line YAML change and a systemd restart.
+    # Do NOT raise the HARDWARE ceiling (jog_speed_cap) without a
+    # separate safety-pass margin re-derivation.
+    #
+    # Margin math backing 0.50 (see estun_driver_node.py comment block
+    # above _on_jog_command):
+    #   - Limit clamp:   dyn margin = v_max × f × latency × 1.5
+    #                    J1 @ f=0.50: 150 × 0.50 × 0.150 × 1.5 = 16.9° (was 2°)
+    #                    J4 @ f=0.50: 180 × 0.50 × 0.150 × 1.5 = 20.3° (was 2°)
+    #   - Collision stop_mm: base + (f - 0.15) × 1500 mm/s × 0.15s × 1.5
+    #                    f=0.15 → 30 mm (unchanged baseline)
+    #                    f=0.25 →  64 mm
+    #                    f=0.50 → 148 mm
+    #   - σ_soft scales × f / 0.15  (governor engages earlier at speed).
+    #   - Deadman is time-based (0.300 s) — overrun distance at f=0.50:
+    #                    J1 (150°/s × 0.50) × 0.300 s = 22.5° angular
+    #                    ≈ 500 mm at flange with 1 m radius
+    #     Note this in the log; do not silently rely on time-based deadman
+    #     as the sole guard.
+    jog_speed_cap:        0.50
+    operator_speed_limit: 0.25
 
     # Robot/jogHeartbeat cadence. Captured protocol requires ~400 ms; the
     # controller stops motion when heartbeats stop.

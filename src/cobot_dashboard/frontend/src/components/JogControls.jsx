@@ -340,6 +340,19 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   // /estun/status mirror. Default false until validated on hardware.
   const cartesianEnabled = !!robot.allow_cartesian_jog
 
+  // Two-tier speed cap surfaced by the driver in the status blob
+  // (2026-07-16 safety pass):
+  //   effective_speed_cap = min(jog_speed_cap, operator_speed_limit)
+  // Fallback 0.15 for pre-pass builds / cold boot so the UI is
+  // conservative when the driver hasn't reported yet. Slider visual +
+  // "capped" marker + `wire N` hint all read this.
+  const _effCap = Number.isFinite(robot.effective_speed_cap) ? robot.effective_speed_cap : 0.15
+  const _hwCap  = Number.isFinite(robot.jog_speed_cap)        ? robot.jog_speed_cap        : 0.15
+  const _opLim  = Number.isFinite(robot.operator_speed_limit) ? robot.operator_speed_limit : 0.15
+  const effectivePct = Math.round(_effCap * 100)
+  const hwPct        = Math.round(_hwCap  * 100)
+  const opPct        = Math.round(_opLim  * 100)
+
   const holdStart = useCallback((axis, direction, meta) => {
     if (modeRef.current === 'joint') {
       // axis is 1..6 already for joint pads.
@@ -953,19 +966,26 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
         <div>
           <div style={{ fontSize: speedFont, fontWeight: 600, color: '#6b7280', marginBottom: 4 }}>
             Speed: {speed}%
-            {speed > 15 && (
+            {speed > effectivePct && (
               <span style={{ color: '#d97706', fontWeight: 700, marginLeft: 6 }}>
-                → 15% (capped)
+                → {effectivePct}% (capped)
               </span>
             )}
           </div>
           <input type="range" min={1} max={100} value={speed}
             onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
             style={{ width: '100%', height: maximized ? 10 : 6 }} />
+          <div style={{ position: 'relative', width: '100%', height: 6, marginTop: 2 }}>
+            <div style={{
+              position: 'absolute',
+              left: `calc(${effectivePct}% - 1px)`,
+              top: 0, width: 2, height: 6, background: '#d97706',
+            }} />
+          </div>
           <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 2 }}>
-            {speed <= 15
-              ? `wire ${(speed / 100).toFixed(2)} — mid-hold changes take effect on next press`
-              : `wire 0.15 cap — driver clamps ≥15%`}
+            {speed <= effectivePct
+              ? `wire ${(Math.min(speed, effectivePct) / 100).toFixed(2)} — driver ceiling ${effectivePct}%`
+              : `wire ${(effectivePct / 100).toFixed(2)} — driver ceiling ${effectivePct}% (hw ${hwPct}% / op-limit ${opPct}%)`}
           </div>
         </div>
 

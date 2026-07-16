@@ -1159,6 +1159,13 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             r["jog_direction"] = int(d.get("jog_direction", 0))
             r["allow_jog"]   = bool(d.get("allow_jog", False))
             r["allow_cartesian_jog"] = bool(d.get("allow_cartesian_jog", False))
+            # Two-tier speed cap. UI slider ceiling + "capped" marker
+            # both derive from these; passed through untouched so the
+            # driver stays the single source of truth for the limits.
+            for k in ("jog_speed_cap", "operator_speed_limit",
+                      "effective_speed_cap"):
+                if k in d:
+                    r[k] = float(d[k])
             # Power gate + telemetry — dashboard banner shows Enable/
             # Disable/Clear-Alarm affordances driven by these fields.
             r["allow_power"] = bool(d.get("allow_power", False))

@@ -216,9 +216,32 @@ class EstunCodroidDriver(Node):
         # is captured but not yet validated. Independent flag so the joint
         # path can go live without exposing untested Cartesian motion.
         self.declare_parameter('allow_cartesian_jog', False)
-        self.declare_parameter('jog_speed_cap', 0.15)          # |speed| ≤ 0.15 fraction-of-max
+        # Two-tier speed cap. `jog_speed_cap` is the hardware-derived
+        # upper bound: the point past which the DERIVED safety margins
+        # (limit clamp, collision stop_mm, sigma governor) would no
+        # longer keep worst-case stop-distance under a supervise-tick
+        # budget. `operator_speed_limit` is the operationally-allowed
+        # ceiling that the OPERATOR is permitted to reach today —
+        # normally lower than the hardware cap so we roll speed up in
+        # controlled steps. Effective_cap = min(jog_speed_cap,
+        # operator_speed_limit). See YAML for the raise-condition
+        # (Test B complete + one week clean at 0.25).
+        self.declare_parameter('jog_speed_cap',        0.50)   # hardware-safe upper bound
+        self.declare_parameter('operator_speed_limit', 0.25)   # operationally-allowed ceiling
         self.declare_parameter('jog_heartbeat_s', 0.4)         # Robot/jogHeartbeat cadence
         self.declare_parameter('jog_freshness_timeout_s', 0.3) # deadman: no refresh → stopJog
+        # Latency and safety-factor inputs to the SPEED-SCALED margin
+        # formulas below. Values chosen from wire measurements:
+        #   - posture RX → guard reaction takes ~150 ms (three 50 ms
+        #     supervise ticks worst case)
+        #   - safety factor 1.5 as an engineering headroom
+        self.declare_parameter('safety_latency_s', 0.150)
+        self.declare_parameter('safety_factor', 1.5)
+        # Anchor speed_frac at which the STATIC baseline margins (the
+        # legacy 2 mm limit margin, 30 mm collision stop, 60 mm sigma
+        # soft) were originally tuned. Dynamic margins scale linearly
+        # in (speed_frac - baseline_speed_frac).
+        self.declare_parameter('baseline_speed_frac', 0.15)
 
         # Incremental (angle-bounded) jog — the driver owns the stop timer
         # so the browser never controls stop timing. Duration formula:
@@ -375,7 +398,12 @@ class EstunCodroidDriver(Node):
         if env_cart is not None:
             self._allow_cartesian_jog = env_cart.strip().lower() in ('1', 'true', 'yes', 'on')
             self._allow_cart_source = 'ESTUN_ALLOW_CARTESIAN'
-        self._jog_speed_cap   = float(self.get_parameter('jog_speed_cap').value)
+        self._jog_speed_cap        = float(self.get_parameter('jog_speed_cap').value)
+        self._operator_speed_limit = float(self.get_parameter('operator_speed_limit').value)
+        # Effective ceiling — the operator can never command past this.
+        # Displayed as "capped at X%" in the UI slider.
+        self._effective_speed_cap  = min(self._jog_speed_cap,
+                                         self._operator_speed_limit)
         self._jog_hb_s        = float(self.get_parameter('jog_heartbeat_s').value)
         self._jog_freshness_s = float(self.get_parameter('jog_freshness_timeout_s').value)
         self._jog_inc_speed_frac = float(self.get_parameter('jog_increment_speed_frac').value)
@@ -383,6 +411,10 @@ class EstunCodroidDriver(Node):
         self._joint_limit_deg = list(self.get_parameter('joint_limit_deg').value)
         self._joint_limit_margin_deg = float(self.get_parameter('joint_limit_margin_deg').value)
         self._jog_inc_max_delta_deg = float(self.get_parameter('jog_increment_max_delta_deg').value)
+        # Inputs to the SPEED-SCALED margin formulas.
+        self._safety_latency_s     = float(self.get_parameter('safety_latency_s').value)
+        self._safety_factor        = float(self.get_parameter('safety_factor').value)
+        self._baseline_speed_frac  = float(self.get_parameter('baseline_speed_frac').value)
 
         self._cart_sigma_soft   = float(self.get_parameter('cart_sigma_soft').value)
         self._cart_sigma_hard   = float(self.get_parameter('cart_sigma_hard').value)
@@ -867,6 +899,77 @@ class EstunCodroidDriver(Node):
             buf = digits[r] + buf
         return f'mrkno{buf or "0"}{os.urandom(3).hex()}'
 
+    # ── SPEED-SCALED SAFETY MARGINS ─────────────────────────────────
+    #
+    # The static baseline margins (2° limit, 30 mm collision stop,
+    # σ_soft=0.060) were tuned at jog_speed_cap=0.15. Raising the
+    # cap invalidates those numbers: worst-case overrun distance
+    # scales linearly with commanded speed_frac. Below we express
+    # each margin as `base + extra × (speed_frac - baseline)`
+    # (clamped to `base` at low speeds) so the geometry that made
+    # 0.15 safe stays safe at 0.50.
+    #
+    # Values on file (safety_latency_s, safety_factor,
+    # baseline_speed_frac) are declared ROS parameters so a specific
+    # cell can retune from YAML without a code change.
+    #
+    #                       WORKED MATH
+    # ──────────────────────────────────────────────────────────────
+    # Limit clamp margin, per joint j:
+    #   margin_j(f) = max(base,
+    #                     max_joint_speed_degps[j] × f × latency × K)
+    # where K = safety_factor. Example at f=0.15 (J1, 150°/s):
+    #   150 × 0.15 × 0.150 × 1.5 = 5.06° → matches the ~5° we've
+    #   been running as an implicit assumption. At f=0.50:
+    #   150 × 0.50 × 0.150 × 1.5 = 16.9° → the "17°" the safety
+    #   pass calls for.
+    #
+    # Collision guard stop distance:
+    #   stop_mm(f) = base_stop_mm + max(0, f - baseline_speed_frac)
+    #                             × TIP_SPEED_MMPS × latency × K
+    # TIP_SPEED_MMPS is the worst-case link-tip speed at f=1.0.
+    # ~1500 mm/s bounds the flange-tip speed at max joint speed and
+    # a typical 1 m radius from the driving joint on this S10-140.
+    # Result at f=0.15: 30 mm (unchanged). At f=0.50: 30 + 118 = 148 mm.
+    #
+    # Singularity governor:
+    #   sigma_soft(f) = base_soft × max(1.0, f / baseline_speed_frac)
+    # Wire evidence (alarm 2015 on 2026-07-15): IK amplification
+    # collapsed σ from 0.180 → 0.021 over ~5 s at f=0.15. That rate
+    # is proportional to commanded TCP speed; at f=0.50 the same
+    # collapse fits inside ~1.5 s. Scaling σ_soft up (more
+    # conservative) preserves the 5 s reaction window. σ_hard
+    # stays at the physical stop threshold.
+    _TIP_SPEED_MMPS = 1500.0    # worst-case flange-tip speed at f=1.0
+
+    def _dyn_limit_margin_deg(self, joint_idx0, speed_frac):
+        """Dynamic joint-limit margin (deg) at commanded speed_frac.
+        joint_idx0 is 0..5. Returns MAX(static base, dynamic)."""
+        base = self._joint_limit_margin_deg
+        vmax = self._max_joint_speed_degps[joint_idx0]
+        dyn = vmax * speed_frac * self._safety_latency_s * self._safety_factor
+        return max(base, dyn)
+
+    def _dyn_collision_stop_mm(self, speed_frac):
+        """Dynamic collision stop distance (mm). At f≤baseline the
+        returned value equals the static base; above baseline it grows
+        linearly in (f - baseline) × TIP_SPEED_MMPS × latency × K."""
+        base = self._coll_stop_mm
+        extra_f = max(0.0, speed_frac - self._baseline_speed_frac)
+        return base + extra_f * self._TIP_SPEED_MMPS * self._safety_latency_s * self._safety_factor
+
+    def _dyn_env_stop_mm(self, speed_frac):
+        base = self._env_stop_mm
+        extra_f = max(0.0, speed_frac - self._baseline_speed_frac)
+        return base + extra_f * self._TIP_SPEED_MMPS * self._safety_latency_s * self._safety_factor
+
+    def _dyn_sigma_soft(self, speed_frac):
+        """Speed-scaled σ_soft — never drops below the static base."""
+        if self._baseline_speed_frac <= 0:
+            return self._cart_sigma_soft
+        scale = max(1.0, speed_frac / self._baseline_speed_frac)
+        return self._cart_sigma_soft * scale
+
     def _on_jog_command(self, msg):
         """Incoming /robot/jog_command JSON. Four shapes accepted:
         - Incremental (angle-bounded, driver owns stop timing):
@@ -1042,29 +1145,40 @@ class EstunCodroidDriver(Node):
                 self._stop_jog_locked(reason='zero-speed hold cmd')
             return
 
-        # Cap: effective speed frac = min(ui_pct/100, jog_speed_cap).
-        effective_frac = min(speed_pct / 100.0, self._jog_speed_cap)
+        # Cap: effective speed frac = min(ui_pct/100, effective_cap)
+        # where effective_cap = min(jog_speed_cap, operator_speed_limit).
+        # Two-tier staged cap: jog_speed_cap is the hardware-derived
+        # ceiling (0.50); operator_speed_limit is the operationally
+        # allowed ceiling (0.25 today). See safety pass 2026-07-16 for
+        # margin math backing the raise from 0.15 → 0.50 hardware cap.
+        effective_frac = min(speed_pct / 100.0, self._effective_speed_cap)
         signed_speed = direction * effective_frac
 
         # For joint mode: pre-emptive limit clamp using LIVE angle. Stop
         # commanding motion if this jog would carry us past limit − margin.
+        # Margin is SPEED-SCALED — see _dyn_limit_margin_deg. Formula
+        # derivation lives in the comment block above _on_jog_command.
         if mode_s == 'joint':
             if self._last_posture_ts <= 0.0:
                 self._reject(family, 'no posture reading yet — refusing to hold-jog blind')
                 return
             current_deg = self._joint_deg[axis-1]
             limit = self._joint_limit_deg[axis-1]
-            margin = self._joint_limit_margin_deg
+            margin = self._dyn_limit_margin_deg(axis-1, effective_frac)
             safe_edge = limit - margin
             # Direction-aware check: only reject when we'd be pushing PAST
             # the far edge in the commanded direction.
             if direction > 0 and current_deg >= safe_edge:
                 self._reject(family,
-                             f'clamp: J{axis} at {current_deg:+.2f}° already past +{safe_edge:.2f}° — hold rejected')
+                             f'clamp: J{axis} at {current_deg:+.2f}° already past '
+                             f'+{safe_edge:.2f}° (dyn margin {margin:.2f}° @ f={effective_frac:.2f}) '
+                             f'— hold rejected')
                 return
             if direction < 0 and current_deg <= -safe_edge:
                 self._reject(family,
-                             f'clamp: J{axis} at {current_deg:+.2f}° already past -{safe_edge:.2f}° — hold rejected')
+                             f'clamp: J{axis} at {current_deg:+.2f}° already past '
+                             f'-{safe_edge:.2f}° (dyn margin {margin:.2f}° @ f={effective_frac:.2f}) '
+                             f'— hold rejected')
                 return
 
         target_mode = 'continuous' if mode_s == 'joint' else 'continuous_cart'
@@ -1099,10 +1213,24 @@ class EstunCodroidDriver(Node):
                                 or (isinstance(b, str) and b.startswith('zone#')))
                 if is_env_pair:
                     warn_thr = self._env_warn_mm
-                    stop_thr = self._env_stop_mm
+                    stop_thr = self._dyn_env_stop_mm(effective_frac)
                 else:
-                    warn_thr, stop_thr = self._coll_model.thresholds_for(
-                        pair, self._coll_warn_mm, self._coll_stop_mm)
+                    warn_thr, base_stop, overridden = \
+                        self._coll_model.thresholds_for_ex(
+                            pair, self._coll_warn_mm, self._coll_stop_mm)
+                    if overridden:
+                        # Per-pair YAML entry is authoritative — represents
+                        # a design-floor number (e.g. link3↔link5's mesh-
+                        # bounded ~46 mm floor) that must NOT be scaled by
+                        # the speed formula. Scaling would push stop_thr
+                        # above the mechanical floor and permanently deny
+                        # jog in a legitimate pose.
+                        stop_thr = base_stop
+                    else:
+                        # Global default — speed-scale as usual.
+                        stop_thr = base_stop + max(0.0, effective_frac - self._baseline_speed_frac) \
+                                              * self._TIP_SPEED_MMPS * self._safety_latency_s \
+                                              * self._safety_factor
                 if cur_min <= warn_thr:
                     # Project the commanded direction 5° ahead.
                     proj = list(self._joint_deg)
@@ -1236,7 +1364,10 @@ class EstunCodroidDriver(Node):
                 self._jog_supervise_timer = self.create_timer(0.05, self._on_jog_supervise)
             self.get_logger().info(
                 f'continuous hold: {mode_s} axis={axis} dir={direction:+d} '
-                f'speed_frac={effective_frac:.3f} (ui {speed_pct:.0f}% capped at {self._jog_speed_cap:.2f}) '
+                f'speed_frac={effective_frac:.3f} '
+                f'(ui {speed_pct:.0f}% capped at {self._effective_speed_cap:.2f} '
+                f'= min(jog_speed_cap={self._jog_speed_cap:.2f}, '
+                f'operator_speed_limit={self._operator_speed_limit:.2f})) '
                 f'hold_id={hold_id} seq={seq_in}')
 
     def _start_cart_pulse(self, d):
@@ -1281,23 +1412,26 @@ class EstunCodroidDriver(Node):
         if speed_pct <= 0.0:
             self._reject(family, 'cart pulse: speed_pct ≤ 0')
             return
-        effective_frac = min(speed_pct / 100.0, self._jog_speed_cap)
+        effective_frac = min(speed_pct / 100.0, self._effective_speed_cap)
         signed_speed = direction * effective_frac
         duration_s = 0.150  # fixed pulse; see method docstring.
 
         # Pre-emptive limit check across all joints — we can't project
         # cartesian motion into joint space cheaply, so refuse when any
-        # joint is already at its safe edge.
+        # joint is already at its speed-scaled safe edge. Per-joint
+        # margin because J1-3 (150°/s) and J4-6 (180°/s) differ.
         if self._last_posture_ts <= 0.0:
             self._reject(family, 'cart pulse: no posture reading yet')
             return
-        margin = self._joint_limit_margin_deg
         for i in range(6):
+            margin = self._dyn_limit_margin_deg(i, effective_frac)
             safe_edge = self._joint_limit_deg[i] - margin
             if abs(self._joint_deg[i]) >= safe_edge:
                 self._reject(family,
                              f'cart pulse clamp: J{i+1} at {self._joint_deg[i]:+.2f}° '
-                             f'exceeds ±{safe_edge:.2f}° — refuse to pulse')
+                             f'exceeds ±{safe_edge:.2f}° '
+                             f'(dyn margin {margin:.2f}° @ f={effective_frac:.2f}) '
+                             f'— refuse to pulse')
                 return
 
         with self._jog_lock:
@@ -1419,7 +1553,7 @@ class EstunCodroidDriver(Node):
                              f'busy — {self._jog_mode} jog on J{self._jog_index} still in flight')
                 return
 
-            speed_frac = min(self._jog_inc_speed_frac, self._jog_speed_cap)
+            speed_frac = min(self._jog_inc_speed_frac, self._effective_speed_cap)
             max_speed = self._max_joint_speed_degps[axis-1]
             duration_s = abs(delta_deg) / max(1e-3, speed_frac * max_speed)
             signed_speed = (1.0 if delta_deg > 0.0 else -1.0) * speed_frac
@@ -1562,18 +1696,32 @@ class EstunCodroidDriver(Node):
         self._coll_min_dist_mm = d
 
         # Warning zone: log once when it becomes active, once when clears.
+        # Dynamic stop-distance for the CURRENT hold's speed_frac.
+        # Higher speed → longer stop distance (see _dyn_collision_stop_mm
+        # math block). Per-pair YAML overrides are authoritative — they
+        # represent design-floor numbers (link3↔link5 mesh floor at
+        # ~46 mm) that must NOT be raised by the speed formula.
+        cur_frac = abs(self._jog_signed_speed) if self._jog_signed_speed else self._effective_speed_cap
+        _, base_stop_for_pair, overridden = self._coll_model.thresholds_for_ex(
+            (a, b), self._coll_warn_mm, self._coll_stop_mm)
+        if overridden:
+            dyn_stop_mm = base_stop_for_pair
+        else:
+            dyn_stop_mm = self._dyn_collision_stop_mm(cur_frac)
+
         in_warn = d <= self._coll_warn_mm
         if in_warn and not self._coll_warning_active:
             self.get_logger().warn(
                 f'SELF-COLLISION WARNING: {a}-{b} at {d:.0f}mm '
-                f'(warn threshold {self._coll_warn_mm:.0f}mm)')
+                f'(warn threshold {self._coll_warn_mm:.0f}mm, '
+                f'stop {dyn_stop_mm:.0f}mm dyn @ f={cur_frac:.2f})')
             self._coll_warning_active = True
         elif not in_warn and self._coll_warning_active:
             self.get_logger().info(
                 f'self-collision warning cleared: {a}-{b} now at {d:.0f}mm')
             self._coll_warning_active = False
 
-        if d > self._coll_stop_mm:
+        if d > dyn_stop_mm:
             return False
 
         # Below stop threshold — check direction using the COMMANDED
@@ -1740,40 +1888,51 @@ class EstunCodroidDriver(Node):
                 # its ±limit — conservative but safe. /joint_states
                 # streams throughout the motion so this check has fresh
                 # data on every 50 ms tick.
+                # Effective speed_frac for the CURRENT hold — used for
+                # dynamic-margin sizing. Falls back to effective cap
+                # when signed_speed hasn't been set yet.
+                cur_frac = abs(self._jog_signed_speed) if self._jog_signed_speed else self._effective_speed_cap
                 if self._jog_mode == 'continuous':
                     ax = self._jog_index
                     if 1 <= ax <= 6:
                         current = self._joint_deg[ax - 1]
                         limit = self._joint_limit_deg[ax - 1]
-                        margin = self._joint_limit_margin_deg
+                        margin = self._dyn_limit_margin_deg(ax - 1, cur_frac)
                         safe_edge = limit - margin
                         if self._jog_direction > 0 and current >= safe_edge:
                             self._stop_jog_locked(
-                                reason=f'limit approach J{ax} at {current:+.2f}° (+{safe_edge:.2f}°)')
+                                reason=f'limit approach J{ax} at {current:+.2f}° '
+                                       f'(+{safe_edge:.2f}°, dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
                             return
                         if self._jog_direction < 0 and current <= -safe_edge:
                             self._stop_jog_locked(
-                                reason=f'limit approach J{ax} at {current:+.2f}° (-{safe_edge:.2f}°)')
+                                reason=f'limit approach J{ax} at {current:+.2f}° '
+                                       f'(-{safe_edge:.2f}°, dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
                             return
                 elif self._jog_mode == 'continuous_cart':
                     for i in range(6):
                         current = self._joint_deg[i]
                         limit = self._joint_limit_deg[i]
-                        margin = self._joint_limit_margin_deg
+                        margin = self._dyn_limit_margin_deg(i, cur_frac)
                         safe_edge = limit - margin
                         if abs(current) >= safe_edge:
                             self._stop_jog_locked(
                                 reason=f'cart limit approach J{i+1} at {current:+.2f}° '
-                                       f'(|>{safe_edge:.2f}°|)')
+                                       f'(|>{safe_edge:.2f}°|, dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
                             return
                     # ── Singularity + overspeed governor (cart only) ──
                     # Compute σ_min at live joint angles; scale/stop the
                     # cartesian jog before the controller's IK explodes.
+                    # σ_soft is speed-scaled — at higher speed_frac the
+                    # IK amplification arrives sooner in wall time, so
+                    # engage the governor earlier. σ_hard stays at the
+                    # physical stop threshold.
                     if self._last_posture_ts > 0.0:
                         sigma = self._sing_guard.sigma_min(self._joint_deg)
                         self._last_sigma_min = sigma
+                        dyn_soft = self._dyn_sigma_soft(cur_frac)
                         scale = SingularityGuard.scale(
-                            sigma, self._cart_sigma_soft, self._cart_sigma_hard)
+                            sigma, dyn_soft, self._cart_sigma_hard)
                         self._last_sing_scale = scale
                         if sigma is not None and sigma <= self._cart_sigma_hard:
                             self._stop_jog_locked(
@@ -1894,7 +2053,9 @@ class EstunCodroidDriver(Node):
             'allow_cart_source': self._allow_cart_source,
             'allow_power':    self._allow_power,
             'allow_power_source': self._allow_power_source,
-            'jog_speed_cap':  self._jog_speed_cap,
+            'jog_speed_cap':         self._jog_speed_cap,
+            'operator_speed_limit':  self._operator_speed_limit,
+            'effective_speed_cap':   self._effective_speed_cap,
             'jog_heartbeat_s': self._jog_hb_s,
             'jog_freshness_s': self._jog_freshness_s,
             'jog_active':     self._jog_active,
@@ -2435,6 +2596,11 @@ class EstunCodroidDriver(Node):
             'jog_mode':      self._jog_mode,
             'jog_index':     self._jog_index,
             'jog_direction': self._jog_direction,
+            # Two-tier speed cap so the UI can render slider ceiling +
+            # "capped" marker without a separate /estun/mode fetch.
+            'jog_speed_cap':        self._jog_speed_cap,
+            'operator_speed_limit': self._operator_speed_limit,
+            'effective_speed_cap':  self._effective_speed_cap,
             'rejections':    dict(self._rej_counts),
             'ip':            self._robot_ip,
             'ip_source':     self._ip_source,
