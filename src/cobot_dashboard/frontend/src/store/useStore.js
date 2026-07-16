@@ -247,6 +247,19 @@ const storeDefinition = (set, get) => ({
         const msg = JSON.parse(ev.data)
         const now = Date.now()
         const latency = msg.t ? Math.round(now - msg.t) : 0
+        // ACK-gated state protocol (2026-07-16). Server sends the next
+        // frame only after we ack this one, which bounds in-flight to
+        // one frame and prevents the OS TCP send buffer from
+        // accumulating multi-second backlogs on slow clients. We ack
+        // BEFORE the set() so the ack is on the wire while React does
+        // the re-render work — that way the server's next frame is
+        // already being prepped and the pipeline is filled cleanly.
+        // Pre-ACK server versions still work: they ignore the ack
+        // (WS receiver treats unknown messages as no-op).
+        if (msg.seq && ws.readyState === WebSocket.OPEN) {
+          try { ws.send(JSON.stringify({ type: 'state_ack', seq: msg.seq })) }
+          catch (_) { /* socket closing — sender falls back to timeout gate */ }
+        }
         set({
           safety: msg.safety ?? get().safety,
           joints: msg.joints ?? get().joints,

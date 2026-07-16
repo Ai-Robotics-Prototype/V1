@@ -204,14 +204,54 @@ _mesh_state: dict = {"payload": None, "n_tris": 0, "n_vertices": 0,
                      "n_occupied": 0, "t": 0.0}
 _mesh_lock = threading.Lock()
 
-# WebSocket client queues
+# WebSocket client queues. `_state_clients` is now a dict of ws → per-
+# client dict {latest_txt, latest_seq, new_event, ack_event,
+# last_acked_seq, ...}. See the /ws/state sender + broadcast loop for
+# the ACK-gated protocol that bounds in-flight to one frame and
+# prevents OS TCP-buffer backlog on slow tabs. Prior version held an
+# asyncio.Queue per client and did drain-to-latest at put time; that
+# did NOT bound in-flight because send_text returns after starlette
+# accepts the bytes, not after they've been drained by the client.
 _state_clients: dict = {}
+_state_seq_counter = [0]   # single-elem list so nested funcs can bump
 _lidar_clients: dict = {}
 _mesh_clients:  dict = {}
 _insp_clients:  dict = {}   # /ws/inspection — live inspection status
 _motioncam_cloud_clients: dict = {}
 _motioncam_reco_clients:  dict = {}
 _ws_lock = threading.Lock()
+# Rolling latency + inflight histogram for /health. Ring of the last
+# 200 (server_broadcast_ts, client_ack_ts) pairs so ops can spot the
+# growing-queue pattern quickly. Populated by _sender when an ack
+# arrives.
+_state_perf = {"acks": [], "inflight_ms_max": 0.0, "sends": 0, "ack_timeouts": 0}
+_state_perf_lock = threading.Lock()
+
+def _state_perf_snapshot():
+    """Read-only snapshot for /health. p50/p95 over the last ~200 acks;
+    inflight_ms_max is the peak broadcast→send-complete gap observed
+    since server start. High p95 with rising inflight_ms_max is the
+    signature the sender's ack gate is falling behind — i.e., the
+    twin will feel laggy on the offending tab."""
+    with _state_perf_lock:
+        acks = list(_state_perf['acks'])
+        sends = _state_perf['sends']
+        ack_timeouts = _state_perf['ack_timeouts']
+        inflight_max = _state_perf['inflight_ms_max']
+    if acks:
+        s = sorted(acks)
+        p50 = s[len(s)//2]
+        p95 = s[min(len(s)-1, int(len(s)*0.95))]
+    else:
+        p50 = p95 = None
+    return {
+        "sends": sends,
+        "ack_timeouts": ack_timeouts,
+        "acks_seen": len(acks),
+        "ack_lat_ms_p50": (round(p50, 1) if p50 is not None else None),
+        "ack_lat_ms_p95": (round(p95, 1) if p95 is not None else None),
+        "inflight_ms_max": round(inflight_max, 1),
+    }
 
 # WS backpressure protection. Prior defect: a slow tablet's TCP send
 # buffer accumulated multi-MB backlogs and the consumer coroutine spent
@@ -1429,26 +1469,29 @@ if FASTAPI_AVAILABLE:
                     continue
                 with _state_lock:
                     payload = copy.deepcopy(STATE)
-                payload["t"] = now * 1000
+                # Sequence + broadcast time. The seq lets the ACK-gated
+                # sender (below) coalesce: if the client hasn't yet acked
+                # frame N, we overwrite `latest_payload` in place and
+                # only send AFTER the ack arrives. This bounds in-flight
+                # to one frame regardless of how deep the OS TCP send
+                # buffer is — the previous fire-and-forget `send_text`
+                # let starlette/kernel accept frames unbounded, which
+                # turned into 600–5000 ms of accumulated latency during
+                # jog. See _sender in the ws_state handler.
+                _state_seq_counter[0] += 1
+                payload["t"]   = now * 1000
+                payload["seq"] = _state_seq_counter[0]
                 txt = json.dumps(payload)
                 with _ws_lock:
                     clients = list(_state_clients.items())
-                for ws, q in clients:
-                    # Drop-to-latest: drain any stale queued frame before
-                    # inserting the fresh one so slow WS consumers always
-                    # see the newest STATE, never a chain of stale frames.
-                    # Prior "if qsize<2: put" logic held old frames when
-                    # the consumer stalled — that surfaced as twin
-                    # surge-and-lag on wireless clients.
-                    try:
-                        while True:
-                            q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                    try:
-                        q.put_nowait(txt)
-                    except asyncio.QueueFull:
-                        pass
+                for ws, client in clients:
+                    # Latest-wins: overwrite in place. The sender only
+                    # pulls at ack time, so the newest txt at ack time
+                    # is what ships next — never a chain of stale frames.
+                    client['latest_txt'] = txt
+                    client['latest_seq'] = _state_seq_counter[0]
+                    client['latest_broadcast_ts'] = now * 1000
+                    client['new_event'].set()
                 next_state = now + state_dt
 
             if now >= next_lidar:
@@ -1823,34 +1866,98 @@ if FASTAPI_AVAILABLE:
     @app.websocket("/ws/state")
     async def ws_state(websocket: WebSocket):
         await websocket.accept()
-        q: asyncio.Queue = asyncio.Queue(maxsize=2)
+        # ACK-gated per-client sender state — see comment at
+        # _state_clients declaration. `new_event` fires when the
+        # broadcaster overwrites `latest_txt`; `ack_event` fires when
+        # the client sends `{type:"state_ack",seq:N}` with N ≥ our
+        # latest_seq. `ACK_TIMEOUT_S` is the fallback so a client that
+        # never acks (older frontend, JS deadlock) still receives
+        # frames — just at a slower rate.
+        ACK_TIMEOUT_S = 0.3
+        client = {
+            'latest_txt':          None,
+            'latest_seq':          0,
+            'latest_broadcast_ts': 0.0,
+            'last_acked_seq':      0,
+            'new_event':           asyncio.Event(),
+            'ack_event':           asyncio.Event(),
+        }
         with _ws_lock:
-            _state_clients[websocket] = q
+            _state_clients[websocket] = client
         try:
-            # Bidirectional: sender pulls broadcast payloads from the app
-            # queue and sends them (wrapped in wait_for so a slow client
-            # can't back up the event loop); receiver awaits inbound
-            # messages from the client (used for the WS jog transport
-            # implemented alongside /cmd/jog — see _handle_ws_client_msg).
-            # Both coroutines share the same WebSocket; either failing or
-            # timing out cancels the other via asyncio.wait FIRST_COMPLETED.
             async def _sender():
+                # Send the very first payload immediately when it
+                # arrives — no ack gate on the initial send.
                 while True:
-                    txt = await q.get()
+                    if client['latest_txt'] is None:
+                        await client['new_event'].wait()
+                        client['new_event'].clear()
+                    txt_to_send = client['latest_txt']
+                    seq_to_send = client['latest_seq']
+                    broadcast_ts = client['latest_broadcast_ts']
+                    # Consume the "new" signal (broadcaster may have
+                    # set it repeatedly while we were awaiting ack;
+                    # only the current latest matters).
+                    client['new_event'].clear()
+                    send_start = time.time() * 1000.0
                     try:
                         await asyncio.wait_for(
-                            websocket.send_text(txt),
+                            websocket.send_text(txt_to_send),
                             timeout=WS_SEND_TIMEOUT_S)
                     except asyncio.TimeoutError:
                         _ws_kicked["state"] += 1
                         return
+                    send_done = time.time() * 1000.0
+                    with _state_perf_lock:
+                        _state_perf['sends'] += 1
+                        if send_done - broadcast_ts > _state_perf['inflight_ms_max']:
+                            _state_perf['inflight_ms_max'] = send_done - broadcast_ts
+                    # Wait for the client to ack this seq (bounded).
+                    # After ack, loop; if broadcaster has posted a
+                    # newer payload we send it next iteration.
+                    # Timeout guarantees liveness for pre-ACK frontends.
+                    try:
+                        while client['last_acked_seq'] < seq_to_send:
+                            await asyncio.wait_for(
+                                client['ack_event'].wait(),
+                                timeout=ACK_TIMEOUT_S)
+                            client['ack_event'].clear()
+                    except asyncio.TimeoutError:
+                        with _state_perf_lock:
+                            _state_perf['ack_timeouts'] += 1
+                        # Fall through — send next frame anyway.
+                    # If nothing newer is queued, block until broadcaster
+                    # sets new_event.
+                    if client['latest_seq'] <= seq_to_send:
+                        await client['new_event'].wait()
+                        client['new_event'].clear()
+
             async def _receiver():
                 while True:
                     msg = await websocket.receive_text()
+                    # ACK path — never dispatch these to
+                    # _handle_ws_client_msg (they're not commands).
                     try:
-                        # ws passed through so _handle_ws_client_msg can
-                        # register/refresh the server-side hold session,
-                        # which key-alives on this ws.client_state.
+                        if msg and msg[0] == '{' and 'state_ack' in msg[:40]:
+                            try:
+                                d = json.loads(msg)
+                            except Exception:
+                                d = None
+                            if isinstance(d, dict) and d.get('type') == 'state_ack':
+                                seq = int(d.get('seq') or 0)
+                                if seq > client['last_acked_seq']:
+                                    client['last_acked_seq'] = seq
+                                    # Record ack latency for /health.
+                                    with _state_perf_lock:
+                                        acks = _state_perf['acks']
+                                        acks.append(time.time() * 1000.0 - client['latest_broadcast_ts'])
+                                        if len(acks) > 200:
+                                            del acks[:len(acks) - 200]
+                                client['ack_event'].set()
+                                continue
+                    except Exception:
+                        pass
+                    try:
                         _handle_ws_client_msg(msg, ws=websocket)
                     except Exception:
                         pass
@@ -2616,6 +2723,7 @@ if FASTAPI_AVAILABLE:
             # broadcaster force-closed the socket to protect the event loop.
             "ws_kicked": dict(_ws_kicked),
             "ws_send_timeout_s": WS_SEND_TIMEOUT_S,
+            "state_perf": _state_perf_snapshot(),
             "hold_keepalive": dict(_keepalive_stats),
             "active_holds": len(_active_holds),
             "motioncam": {
