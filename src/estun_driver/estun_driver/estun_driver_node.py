@@ -380,6 +380,17 @@ class EstunCodroidDriver(Node):
         self._ui_origin_port = int(self.get_parameter('ui_origin_port').value)
         self._auto_connect = bool(self.get_parameter('auto_connect').value)
         self._monitor_only = bool(self.get_parameter('monitor_only').value)
+        # Env override — mirrors ESTUN_ALLOW_JOG so the drop-in file at
+        # /etc/default/roboai-estun can drive both gates from one place.
+        # The systemd unit stays DISABLED at boot; when the operator
+        # brings the driver up for a session, the env file supplies
+        # both ESTUN_MONITOR_ONLY=false and ESTUN_ALLOW_JOG=1 and
+        # motion is permitted for that session only.
+        self._monitor_source = 'param'
+        env_monitor = os.environ.get('ESTUN_MONITOR_ONLY')
+        if env_monitor is not None:
+            self._monitor_only = env_monitor.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._monitor_source = 'ESTUN_MONITOR_ONLY'
         self._ws_log_raw   = bool(self.get_parameter('ws_log_raw').value)
         self._recv_timeout = float(self.get_parameter('recv_timeout_s').value)
         self._ping_on_to   = bool(self.get_parameter('ping_on_timeout').value)
