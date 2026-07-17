@@ -1648,6 +1648,86 @@ function CellPickerPage({ answers, setAnswer, goNext }) {
   )
 }
 
+// ── Page bodies that use hooks — extracted as proper Components so
+// ── React tracks their hook stacks separately from the parent
+// ── ProgramWizard fiber. Prior inline lambda form
+//    render: ({...}) => { const [x] = useState(...); ... }
+// tripped react-hooks/rules-of-hooks because the render-prop function
+// has a lowercase name from ESLint's perspective; capitalising the
+// component name is what tells the linter this IS a component and
+// makes the hooks legal. The PAGES entries below simply spread these
+// component references into the `render` field.
+function WhichPartBody({ answers, setAnswer, goNext }) {
+  const [parts, setParts] = useState([])
+  useEffect(() => {
+    fetch('/api/parts').then(r => r.json()).then(d => setParts(d.parts || [])).catch(() => {})
+  }, [])
+  return (
+    <QuestionCard
+      question="Which part should the robot look for?"
+      description="Select a part from the library. The robot will only pick this type."
+    >
+      {parts.length === 0 ? (
+        <div style={{ padding: 24, textAlign: 'center', color: '#6b7280', border: '2px dashed #d1d5db', borderRadius: 8 }}>
+          No parts in the library. Upload STEP files in Part Recognition first.
+        </div>
+      ) : parts.map(p => (
+        <ChoiceButton key={p.id} label={p.name}
+          description={`${p.extents_cm?.[0]} x ${p.extents_cm?.[1]} x ${p.extents_cm?.[2]} cm`}
+          selected={answers.target_part === p.id}
+          onClick={() => { setAnswer('target_part', p.id); setAnswer('target_part_name', p.name); goNext() }}
+        />
+      ))}
+    </QuestionCard>
+  )
+}
+
+function MachineIOBody({ answers, setAnswer, goNext }) {
+  const [ioLabels, setIoLabels] = useState({})
+  useEffect(() => {
+    fetch('/api/io/config').then(r => r.json()).then(d => setIoLabels(d.labels || {})).catch(() => {})
+  }, [])
+  const doOptions = Array.from({ length: 16 }, (_, i) => ({
+    id: 'DO' + i, label: ioLabels['DO' + i] || 'DO' + i,
+    pin: 'Y' + Math.floor(i/8) + '.' + (i%8),
+  }))
+  const diOptions = Array.from({ length: 16 }, (_, i) => ({
+    id: 'DI' + i, label: ioLabels['DI' + i] || 'DI' + i,
+    pin: 'X' + Math.floor(i/8) + '.' + (i%8),
+  }))
+  return (
+    <QuestionCard
+      question="Which I/O signals control the machine?"
+      description="Select the digital outputs and inputs that communicate with the machine."
+    >
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
+          Cycle Start Signal (output to machine)
+        </div>
+        <select value={answers.io_cycle_start || 'DO4'}
+          onChange={e => setAnswer('io_cycle_start', e.target.value)}
+          style={{ width: '100%', padding: 10, fontSize: 14, borderRadius: 6, border: '1px solid #d1d5db' }}>
+          {doOptions.map(o => <option key={o.id} value={o.id}>{o.pin} - {o.label}</option>)}
+        </select>
+      </div>
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
+          Cycle Complete Signal (input from machine)
+        </div>
+        <select value={answers.io_cycle_done || 'DI3'}
+          onChange={e => setAnswer('io_cycle_done', e.target.value)}
+          style={{ width: '100%', padding: 10, fontSize: 14, borderRadius: 6, border: '1px solid #d1d5db' }}>
+          {diOptions.map(o => <option key={o.id} value={o.id}>{o.pin} - {o.label}</option>)}
+        </select>
+      </div>
+      <SliderQuestion label="Cycle timeout" value={answers.cycle_timeout || 30}
+        onChange={v => setAnswer('cycle_timeout', v)} min={5} max={300} step={5} unit="s"
+        description="Maximum time to wait for the machine to finish before flagging an error" />
+      <NextButton onClick={goNext} label="Next" />
+    </QuestionCard>
+  )
+}
+
 const PAGES = [
   // 0: Which workspace is this program for?
   {
@@ -1771,30 +1851,7 @@ const PAGES = [
   {
     id: 'which_part',
     skip: (answers) => answers.source !== 'camera_library',
-    render: ({ answers, setAnswer, goNext }) => {
-      const [parts, setParts] = useState([])
-      useEffect(() => {
-        fetch('/api/parts').then(r => r.json()).then(d => setParts(d.parts || [])).catch(() => {})
-      }, [])
-      return (
-        <QuestionCard
-          question="Which part should the robot look for?"
-          description="Select a part from the library. The robot will only pick this type."
-        >
-          {parts.length === 0 ? (
-            <div style={{ padding: 24, textAlign: 'center', color: '#6b7280', border: '2px dashed #d1d5db', borderRadius: 8 }}>
-              No parts in the library. Upload STEP files in Part Recognition first.
-            </div>
-          ) : parts.map(p => (
-            <ChoiceButton key={p.id} label={p.name}
-              description={`${p.extents_cm?.[0]} x ${p.extents_cm?.[1]} x ${p.extents_cm?.[2]} cm`}
-              selected={answers.target_part === p.id}
-              onClick={() => { setAnswer('target_part', p.id); setAnswer('target_part_name', p.name); goNext() }}
-            />
-          ))}
-        </QuestionCard>
-      )
-    },
+    render: WhichPartBody,
   },
 
   // 3: What gripper type?
@@ -2153,51 +2210,7 @@ const PAGES = [
   {
     id: 'machine_io',
     skip: (answers) => answers.operation !== 'machine_tend',
-    render: ({ answers, setAnswer, goNext }) => {
-      const [ioLabels, setIoLabels] = useState({})
-      useEffect(() => {
-        fetch('/api/io/config').then(r => r.json()).then(d => setIoLabels(d.labels || {})).catch(() => {})
-      }, [])
-      const doOptions = Array.from({ length: 16 }, (_, i) => ({
-        id: 'DO' + i, label: ioLabels['DO' + i] || 'DO' + i,
-        pin: 'Y' + Math.floor(i/8) + '.' + (i%8),
-      }))
-      const diOptions = Array.from({ length: 16 }, (_, i) => ({
-        id: 'DI' + i, label: ioLabels['DI' + i] || 'DI' + i,
-        pin: 'X' + Math.floor(i/8) + '.' + (i%8),
-      }))
-      return (
-        <QuestionCard
-          question="Which I/O signals control the machine?"
-          description="Select the digital outputs and inputs that communicate with the machine."
-        >
-          <div style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
-              Cycle Start Signal (output to machine)
-            </div>
-            <select value={answers.io_cycle_start || 'DO4'}
-              onChange={e => setAnswer('io_cycle_start', e.target.value)}
-              style={{ width: '100%', padding: 10, fontSize: 14, borderRadius: 6, border: '1px solid #d1d5db' }}>
-              {doOptions.map(o => <option key={o.id} value={o.id}>{o.pin} - {o.label}</option>)}
-            </select>
-          </div>
-          <div style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
-              Cycle Complete Signal (input from machine)
-            </div>
-            <select value={answers.io_cycle_done || 'DI3'}
-              onChange={e => setAnswer('io_cycle_done', e.target.value)}
-              style={{ width: '100%', padding: 10, fontSize: 14, borderRadius: 6, border: '1px solid #d1d5db' }}>
-              {diOptions.map(o => <option key={o.id} value={o.id}>{o.pin} - {o.label}</option>)}
-            </select>
-          </div>
-          <SliderQuestion label="Cycle timeout" value={answers.cycle_timeout || 30}
-            onChange={v => setAnswer('cycle_timeout', v)} min={5} max={300} step={5} unit="s"
-            description="Maximum time to wait for the machine to finish before flagging an error" />
-          <NextButton onClick={goNext} label="Next" />
-        </QuestionCard>
-      )
-    },
+    render: MachineIOBody,
   },
 
   // 10: Should it repeat?
