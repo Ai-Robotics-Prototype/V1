@@ -165,6 +165,51 @@ function isPoseSource(step) {
   return ['pick', 'place', 'home'].includes(step.position_role)
 }
 
+// Actions that carry a taught position AND are eligible for the
+// "reuse an earlier taught position" prompt. Non-motion steps
+// (open_gripper, wait, set_io, detect, etc.) skip the prompt.
+const REUSABLE_POSITION_ACTIONS = new Set([
+  'move_home', 'move_joint', 'move_linear', 'approach', 'pick', 'place',
+])
+
+// Given the current step list and a candidate action, return the
+// FIRST earlier step that (a) has the same `action` or (b) shares a
+// `position_role` derived from the same intent (home ↔ move_home,
+// pick ↔ pick, place ↔ place). The returned step is a valid source
+// for `position_ref` — the reused step live-links to it rather than
+// copying joints. Used by the add-step handler to offer the reuse
+// prompt. Returns null when there is no earlier taught source.
+function findPositionReuseSource(steps, action) {
+  if (!REUSABLE_POSITION_ACTIONS.has(action)) return null
+  // Role inferred from the candidate action.
+  const roleFor = (a) => {
+    if (a === 'move_home')  return 'home'
+    if (a === 'pick')       return 'pick'
+    if (a === 'place')      return 'place'
+    return null
+  }
+  const wantAction = action
+  const wantRole   = roleFor(action)
+  for (const s of steps) {
+    // Skip steps that themselves reuse someone else — chase to the
+    // ORIGINAL taught source so the operator sees "same as step 2"
+    // even when they add a fourth step and the third is a link.
+    if (s.position_ref) continue
+    const sameAction = s.action === wantAction
+    const sameRole   = wantRole && s.position_role === wantRole
+    if (!sameAction && !sameRole) continue
+    // Only offer as source if the step actually carries pose data
+    // OR is a home (home's pose is the fixed all-zeros default —
+    // reuse is meaningful even before "teach").
+    const isHome = wantRole === 'home' || sameRole === 'home' || sameAction && wantAction === 'move_home'
+    const taughtJoints = Array.isArray(s.taught_joints) && s.taught_joints.length >= 6
+    const taughtTcp    = Array.isArray(s.taught_tcp)    && s.taught_tcp.length >= 3
+    if (!isHome && !taughtJoints && !taughtTcp) continue
+    return s
+  }
+  return null
+}
+
 // Resolve the auto-derived pose for a derived step from the surrounding
 // step list. Mirrors program_executor_node._resolve_base_tcp on the JS
 // side so the editor can show the operator what the runtime will land
@@ -204,6 +249,10 @@ function isTeachable(step) {
   // Derived offset moves resolve at runtime from their source step's
   // taught pose, so the operator must NOT teach them independently.
   if (isDerivedOffsetMove(step)) return false
+  // Position-reuse steps also resolve at runtime — the source's
+  // taught_joints/tcp is what actually gets used. Referencing steps
+  // must NOT be teachable; the operator re-teaches the source instead.
+  if (step.position_ref != null) return false
   // Prefer the explicit action when set (wizard-emitted or PUT'd via
   // /api/programs). Fall back to deriving an action from the legacy
   // 'type' field (default STATE.program.steps used 'type' only) — but
@@ -1498,6 +1547,104 @@ function freshStepForAction(action) {
   }
 }
 
+// Modal shown when the operator adds a step whose position could
+// reuse an earlier taught pose. Two-button choice — Use same (creates
+// a linked reference via `position_ref`) or Teach new (independent
+// pose that the operator will teach separately). Both close the modal;
+// Cancel dismisses without adding a step.
+function PositionReuseModal({ action, source, onUseSame, onTeachNew, onCancel }) {
+  const kindLabel = action === 'move_home' ? 'Home'
+                  : action === 'pick'      ? 'Pick'
+                  : action === 'place'     ? 'Place'
+                  : action === 'approach'  ? 'Approach'
+                  : action === 'move_linear' ? 'Move Linear'
+                  :                            'Move'
+  const srcLabel = source?.label
+                   || (source?.action === 'move_home' ? 'Home'
+                       : source?.action || 'position')
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      style={{
+        position: 'fixed', inset: 0, zIndex: 4000,
+        background: 'rgba(15, 23, 42, 0.55)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 24,
+      }}
+      onClick={onCancel}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#fff', color: '#111827',
+          borderRadius: 12, width: '100%', maxWidth: 520,
+          boxShadow: '0 30px 80px rgba(0,0,0,0.45)',
+          overflow: 'hidden',
+        }}
+      >
+        <div style={{
+          padding: '16px 20px 8px 20px',
+          borderBottom: '1px solid #E5E7EB',
+        }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#6B7280',
+                        textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+            Add {kindLabel} step
+          </div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#111827',
+                        marginTop: 4 }}>
+            Use the same {kindLabel} position as Step {source?.id}?
+          </div>
+          <div style={{ fontSize: 13, color: '#6B7280', marginTop: 6, lineHeight: 1.4 }}>
+            &ldquo;{srcLabel}&rdquo; is already taught earlier in this program.
+            Linking the new step shares the taught pose — re-teaching Step {source?.id}
+            updates every linked step at once. Teach new gives you an
+            independent position that you&rsquo;ll teach separately.
+          </div>
+        </div>
+        <div style={{
+          padding: '14px 20px 16px 20px',
+          display: 'flex', gap: 10, justifyContent: 'flex-end',
+        }}>
+          <button
+            onClick={onCancel}
+            style={{
+              minHeight: 44, padding: '0 14px',
+              background: 'transparent', color: '#6B7280',
+              border: '1px solid #E5E7EB', borderRadius: 8,
+              fontSize: 14, fontWeight: 600, cursor: 'pointer',
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onTeachNew}
+            style={{
+              minHeight: 44, padding: '0 14px',
+              background: '#f3f4f6', color: '#111827',
+              border: '1px solid #d1d5db', borderRadius: 8,
+              fontSize: 14, fontWeight: 700, cursor: 'pointer',
+            }}
+          >
+            Teach new
+          </button>
+          <button
+            onClick={onUseSame}
+            style={{
+              minHeight: 44, padding: '0 18px',
+              background: '#2563EB', color: '#fff',
+              border: 'none', borderRadius: 8,
+              fontSize: 14, fontWeight: 700, cursor: 'pointer',
+            }}
+          >
+            Use same as Step {source?.id}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function InsertionBar() {
   return (
     <div
@@ -2087,6 +2234,10 @@ export default function ProgramEditor() {
   const [contextMenu, setContextMenu]         = useState(null)
   const [showAddPanel, setShowAddPanel]       = useState(false)
   const [locked, setLocked]                   = useState(false)
+  // Position-reuse prompt state. `pendingReuse` is set when the user
+  // adds a step whose position could reuse an already-taught source.
+  // Shape: {action, sourceStep, insertIdx} — insertIdx null = append.
+  const [pendingReuse, setPendingReuse]       = useState(null)
   const addToast                              = useStore((s) => s.addToast)
   const [savedPrograms, setSavedPrograms] = useState([])
 
@@ -2200,12 +2351,59 @@ export default function ProgramEditor() {
   // Add a step of a specific action — used by the categorized
   // "+ Add Step" panel. Appends to the end and opens the inline editor
   // on the new row so the operator can immediately set parameters.
+  //
+  // Reuse prompt (2026-07-17): when the operator adds a step whose
+  // action could reuse an earlier taught position (move_home,
+  // move_joint, approach, pick, place, move_linear), we check the
+  // existing steps for a matching source. If one is found, defer the
+  // insertion behind a modal offering [Use same] / [Teach new]. Use
+  // same → new step gets `position_ref: <sourceId>` (shared, not
+  // copied — re-teaching the source updates every referencing step
+  // at execution time). Teach new → current behavior.
   function handleAddAction(action) {
+    const source = findPositionReuseSource(steps, action)
+    if (source) {
+      setPendingReuse({ action, sourceStep: source, insertIdx: null })
+      setShowAddPanel(false)
+      return
+    }
     const newStep = freshStepForAction(action)
     const next = renumber([...steps, newStep])
     updateSteps(next)
     setEditingId(next[next.length - 1].id)
     setShowAddPanel(false)
+  }
+
+  function completeReuse({ useSame }) {
+    if (!pendingReuse) return
+    const { action, sourceStep, insertIdx } = pendingReuse
+    let newStep = freshStepForAction(action)
+    if (useSame) {
+      // Link to the source. Do NOT copy taught_joints / taught_tcp —
+      // the executor resolves at runtime via position_ref so the
+      // operator can re-teach the source and every reference updates.
+      newStep = {
+        ...newStep,
+        position_ref: sourceStep.id,
+        // Nicer default label so the operator sees the link intent.
+        label: `${newStep.label} (from Step ${sourceStep.id})`,
+        // Referencing steps are NOT independently teachable — the
+        // teach panel skips them (see isTeachable).
+        taught: undefined,
+        taught_joints: undefined,
+        taught_tcp: undefined,
+      }
+    }
+    const next = insertIdx == null
+      ? renumber([...steps, newStep])
+      : renumber([...steps.slice(0, insertIdx), newStep, ...steps.slice(insertIdx)])
+    updateSteps(next)
+    // Focus the newly-inserted row.
+    const inserted = insertIdx == null
+      ? next[next.length - 1]
+      : next[insertIdx]
+    setEditingId(inserted.id)
+    setPendingReuse(null)
   }
 
   // Context-menu actions are id-based so they're resilient to a
@@ -2217,6 +2415,8 @@ export default function ProgramEditor() {
       case 'edit':       setEditingId(id); break
       case 'rename':     setSelectedId(id); addToast('Click the step name to rename it', 'info'); break
       case 'add_above': {
+        const src = findPositionReuseSource(steps, 'move_joint')
+        if (src) { setPendingReuse({ action: 'move_joint', sourceStep: src, insertIdx: idx }); break }
         const newStep = freshStepForAction('move_joint')
         const next = renumber([...steps.slice(0, idx), newStep, ...steps.slice(idx)])
         updateSteps(next)
@@ -2224,6 +2424,8 @@ export default function ProgramEditor() {
         break
       }
       case 'add_below': {
+        const src = findPositionReuseSource(steps, 'move_joint')
+        if (src) { setPendingReuse({ action: 'move_joint', sourceStep: src, insertIdx: idx + 1 }); break }
         const newStep = freshStepForAction('move_joint')
         const next = renumber([...steps.slice(0, idx + 1), newStep, ...steps.slice(idx + 1)])
         updateSteps(next)
@@ -2753,23 +2955,43 @@ export default function ProgramEditor() {
                 }}>
                   {isDone ? '✓' : (idx + 1)}
                 </div>
-                {/* Always reserve the T/! slot so the pill's X position is
-                    the same on teachable and non-teachable rows. */}
-                <div title={isTeachable(step)
-                              ? (step.taught ? `Taught at ${step.taught_at || 'unknown'}` : 'Position not taught — click Teach')
-                              : undefined}
-                  style={{
-                    width: 26, height: 26, borderRadius: '50%',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    flexShrink: 0,
-                    visibility: isTeachable(step) ? 'visible' : 'hidden',
-                    background: step.taught ? '#f0fdf4' : '#fef2f2',
-                    border:     step.taught ? '2px solid #16A34A' : '2px dashed #DC2626',
-                    color:      step.taught ? '#16A34A' : '#DC2626',
-                    fontSize: 11, fontWeight: 700,
-                  }}>
-                  {step.taught ? 'T' : '!'}
-                </div>
+                {/* Always reserve the T/!/🔗 slot so the pill's X position
+                    is the same on teachable and non-teachable rows.
+                    position_ref rows render a link chip pointing at the
+                    source step so the operator can see the shared pose
+                    at a glance. */}
+                {step.position_ref != null ? (
+                  <div
+                    title={`Uses the same position as Step ${step.position_ref}`}
+                    style={{
+                      minWidth: 26, height: 26, borderRadius: 13,
+                      padding: '0 8px',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      gap: 3, flexShrink: 0,
+                      background: '#eff6ff', border: '1px solid #93c5fd',
+                      color: '#1D4ED8', fontSize: 11, fontWeight: 700,
+                    }}
+                  >
+                    <span style={{ fontSize: 13, lineHeight: 1 }}>🔗</span>
+                    <span>{step.position_ref}</span>
+                  </div>
+                ) : (
+                  <div title={isTeachable(step)
+                                ? (step.taught ? `Taught at ${step.taught_at || 'unknown'}` : 'Position not taught — click Teach')
+                                : undefined}
+                    style={{
+                      width: 26, height: 26, borderRadius: '50%',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      flexShrink: 0,
+                      visibility: isTeachable(step) ? 'visible' : 'hidden',
+                      background: step.taught ? '#f0fdf4' : '#fef2f2',
+                      border:     step.taught ? '2px solid #16A34A' : '2px dashed #DC2626',
+                      color:      step.taught ? '#16A34A' : '#DC2626',
+                      fontSize: 11, fontWeight: 700,
+                    }}>
+                    {step.taught ? 'T' : '!'}
+                  </div>
+                )}
                 <span style={{
                   display: 'inline-block', flexShrink: 0,
                   minWidth: 70, textAlign: 'center', boxSizing: 'border-box',
@@ -2980,6 +3202,16 @@ export default function ProgramEditor() {
       </div>
 
       <VoiceBar />
+
+      {pendingReuse && (
+        <PositionReuseModal
+          action={pendingReuse.action}
+          source={pendingReuse.sourceStep}
+          onUseSame={() => completeReuse({ useSame: true })}
+          onTeachNew={() => completeReuse({ useSame: false })}
+          onCancel={() => setPendingReuse(null)}
+        />
+      )}
 
       {contextMenu && (
         <StepContextMenu

@@ -448,11 +448,24 @@ class ProgramExecutor(Node):
         # carries any taught_tcp/position. Returns (tcp_list, label).
 
         if action == 'move_home':
-            self._send_cmd({'action': 'home'})
+            # If the step (or its referenced source via position_ref)
+            # carries a custom taught pose, prefer that so the operator's
+            # "Home" is whatever they taught — not the driver's fixed
+            # all-zeros. Fall back to the driver's built-in home for
+            # untaught first-run steps.
+            joints = self._step_taught_joints(step)
+            if joints and len(joints) >= 6:
+                self._send_move({
+                    'type': 'movj',
+                    'joints': joints,
+                    'speed_pct': step.get('speed_pct', 50),
+                })
+            else:
+                self._send_cmd({'action': 'home'})
             self._state = self.WAITING_MOTION
 
         elif action == 'move_joint':
-            joints = step.get('taught_joints') or step.get('joints')
+            joints = self._step_taught_joints(step)
             if joints and len(joints) >= 6:
                 self._send_move({
                     'type': 'movj',
@@ -523,8 +536,8 @@ class ProgramExecutor(Node):
                 self._state = self.WAITING_MOTION
                 return
             # Non-derived: existing behavior — read taught pose directly.
-            tcp = step.get('taught_tcp') or step.get('position')
-            joints = step.get('taught_joints') or step.get('joints')
+            tcp = self._step_taught_tcp(step)
+            joints = self._step_taught_joints(step)
             if tcp and len(tcp) >= 3:
                 # Convert meters to mm for Estun API
                 tcp_mm = [
@@ -554,7 +567,7 @@ class ProgramExecutor(Node):
                 self._advance_step()
 
         elif action == 'approach':
-            joints = step.get('taught_joints') or step.get('joints')
+            joints = self._step_taught_joints(step)
             if joints and len(joints) >= 6:
                 self._send_move({
                     'type': 'movj',
@@ -566,7 +579,7 @@ class ProgramExecutor(Node):
                 self._advance_step()
 
         elif action == 'pick':
-            joints = step.get('taught_joints') or step.get('joints')
+            joints = self._step_taught_joints(step)
             if joints and len(joints) >= 6:
                 self._send_move({
                     'type': 'movj',
@@ -579,8 +592,8 @@ class ProgramExecutor(Node):
                 self._advance_step()
 
         elif action == 'place':
-            joints = step.get('taught_joints') or step.get('joints')
-            tcp = step.get('taught_tcp') or step.get('position')
+            joints = self._step_taught_joints(step)
+            tcp = self._step_taught_tcp(step)
             if joints and len(joints) >= 6:
                 self._send_move({
                     'type': 'movj',
@@ -901,6 +914,47 @@ class ProgramExecutor(Node):
             if self._steps[i].get('action') == action_name:
                 return i
         return None
+
+    def _resolve_position_ref(self, step):
+        """Follow `position_ref` to the referenced step's taught pose.
+        Returns the source step (dict) or None. Chases through chains
+        of references (source→source→…) up to a depth of 8 so a
+        pathological cycle can't loop. The editor's add-step flow
+        walks past reference-only steps to the ORIGINAL source, so a
+        chain deeper than 2 shouldn't occur in practice."""
+        ref = step.get('position_ref')
+        seen = set()
+        depth = 0
+        while ref is not None and depth < 8:
+            if ref in seen:
+                return None
+            seen.add(ref)
+            src = next((s for s in self._steps if s.get('id') == ref), None)
+            if src is None:
+                return None
+            if src.get('position_ref') is None:
+                return src
+            ref = src.get('position_ref')
+            depth += 1
+        return None
+
+    def _step_taught_joints(self, step):
+        """Return taught_joints for a step, following position_ref if
+        present. Returns None if no source has taught joints yet."""
+        if step.get('position_ref') is not None:
+            src = self._resolve_position_ref(step)
+            if src is None:
+                return None
+            return src.get('taught_joints') or src.get('joints')
+        return step.get('taught_joints') or step.get('joints')
+
+    def _step_taught_tcp(self, step):
+        if step.get('position_ref') is not None:
+            src = self._resolve_position_ref(step)
+            if src is None:
+                return None
+            return src.get('taught_tcp') or src.get('position')
+        return step.get('taught_tcp') or step.get('position')
 
     def _resolve_base_tcp(self, step):
         """Find the base TCP for a derived offset move.
