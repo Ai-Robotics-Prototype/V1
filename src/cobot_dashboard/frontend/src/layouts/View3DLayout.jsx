@@ -26,67 +26,77 @@ const PRESETS = ['Front', 'Side', 'Top', 'Iso']
 const REAL_ARM_RED = '#7F1D1D'
 const REAL_ARM_HINT = '#FCA5A5'
 
+// Slim left rail (Part 3b, 2026-07-17). Previous 240 px width was
+// wide enough for a full label column but wasted canvas real estate at
+// 1155-1280 px tablet widths where the 3D twin needs every pixel. New:
+// camera presets as a compact segmented row, TASK as a single-line
+// chip. Touch targets stay ≥ 44 px so tablet ops still hit the presets
+// cleanly. Total rail width now ~130 px (borders + padding included).
+const RAIL_W = 130
 function LeftPanel({ armRef }) {
-  const task = useStore((s) => s.task)
-
+  const task = useStore((s) => s.task) || {}
+  const taskState = task.state || 'IDLE'
+  const taskColor = taskState === 'IDLE' ? 'var(--text-muted)'
+                  : taskState === 'PAUSED' ? 'var(--yellow)'
+                  : 'var(--accent)'
   return (
     <div style={{
-      width: 240,
+      width: RAIL_W,
       flexShrink: 0,
       borderRight: '1px solid var(--border)',
       background: 'var(--bg-panel)',
       display: 'flex',
       flexDirection: 'column',
       overflow: 'hidden',
-      padding: '12px 14px',
-      gap: 14,
+      padding: '10px 8px',
+      gap: 12,
     }}>
       <div>
-        <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 8 }}>
-          3D Robot View
+        <div style={{
+          fontSize: 9, textTransform: 'uppercase',
+          color: 'var(--text-muted)', letterSpacing: '0.06em',
+          marginBottom: 4,
+        }}>
+          Camera
         </div>
-
-        <div>
-          <div style={{ fontSize: 9, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.06em', marginBottom: 4 }}>
-            Camera
-          </div>
-          <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
-            {PRESETS.map((p) => (
-              <button
-                key={p}
-                onClick={() => armRef.current?.setCameraPreset(p.toLowerCase())}
-                style={{
-                  background: 'var(--bg-surface)',
-                  border: '1px solid var(--border)',
-                  color: 'var(--text-secondary)',
-                  padding: '3px 10px',
-                  borderRadius: 'var(--radius-sm)',
-                  fontSize: 11,
-                  cursor: 'pointer',
-                }}
-              >
-                {p}
-              </button>
-            ))}
-          </div>
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(2, 1fr)',
+          gap: 3,
+        }}>
+          {PRESETS.map((p) => (
+            <button
+              key={p}
+              onClick={() => armRef.current?.setCameraPreset(p.toLowerCase())}
+              style={{
+                background: 'var(--bg-surface)',
+                border: '1px solid var(--border)',
+                color: 'var(--text-secondary)',
+                padding: 0,
+                minHeight: 44,   // tablet touch target
+                borderRadius: 'var(--radius-sm)',
+                fontSize: 11,
+                fontWeight: 600,
+                cursor: 'pointer',
+                letterSpacing: '0.02em',
+              }}
+            >
+              {p}
+            </button>
+          ))}
         </div>
       </div>
 
-      <div>
-        <div style={{ fontSize: 9, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.06em', marginBottom: 4 }}>
-          Task
-        </div>
-        <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
-          State:&nbsp;
-          <span style={{
-            fontWeight: 600,
-            color: task.state === 'IDLE' ? 'var(--text-muted)'
-                : task.state === 'PAUSED' ? 'var(--yellow)'
-                : 'var(--accent)',
-          }}>
-            {task.state}
-          </span>
-        </div>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 6,
+        fontSize: 10, color: 'var(--text-muted)',
+        letterSpacing: '0.06em', textTransform: 'uppercase',
+      }}>
+        <span>Task</span>
+        <span style={{ fontWeight: 700, color: taskColor,
+                       letterSpacing: 0, textTransform: 'none' }}>
+          {taskState}
+        </span>
       </div>
     </div>
   )
@@ -198,7 +208,14 @@ export default function View3DLayout() {
 
   return (
     <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
-      <LeftPanel armRef={armRef} />
+      {/* Part 3a parity fix (2026-07-17): hide the left rail while the
+          REAL ARM panel is EXPANDED so the shared JogControls receives
+          the SAME width as it does on the Program tab's expanded view.
+          Without this, LeftPanel eats ~130 px and the pad's tablet-
+          breakpoint sizing kicked in one step earlier than on the
+          Program tab, producing a visibly smaller layout for the same
+          `maximized=true` flag. */}
+      {!isExpanded && <LeftPanel armRef={armRef} />}
 
       <div style={{
         flex: 1, overflow: 'hidden', position: 'relative',
