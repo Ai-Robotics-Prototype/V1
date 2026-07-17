@@ -116,9 +116,15 @@ estun_driver:
 
     # Freshness deadman: if /robot/jog_command doesn't refresh within
     # this window, the driver emits Robot/stopJog and tears down the
-    # supervise timer. Set below jog_heartbeat_s so a single missed
-    # command message halts motion before the next heartbeat fires.
-    jog_freshness_timeout_s: 0.3
+    # supervise timer. Set below jog_heartbeat_s (0.4 s) so a single
+    # missed heartbeat halts motion before the controller notices.
+    #
+    # 2026-07-17: bumped 0.3 → 0.5 to tolerate observed 622 ms
+    # dashboard-side GIL stalls (json.dumps of the 10 KB state blob
+    # under 25 Hz starved the keepalive native thread mid-hold →
+    # phantom staleness stops). Full rationale in the driver's
+    # declare_parameter comment.
+    jog_freshness_timeout_s: 0.5
 
     # ── First-connect logging ────────────────────────────────────
     # Dumps every TX/RX WS frame to

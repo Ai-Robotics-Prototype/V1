@@ -1428,12 +1428,23 @@ if FASTAPI_AVAILABLE:
     # ------------------------------------------------------------------
 
     async def _broadcast_loop():
-        state_hz  = 25
+        # 2026-07-17: state rate is 25 Hz at idle but DROPS to 8 Hz
+        # while any jog hold is active. Rationale: at 25 Hz the loop
+        # spent ~15% of the GIL on deepcopy + json.dumps of the 10 KB
+        # state blob, occasionally starving the native keepalive thread
+        # for up to 672 ms (past the driver's freshness deadman → phantom
+        # staleness stops mid-hold on both the Program tab and 3D View
+        # jog screens). 8 Hz keeps the twin visually responsive (Twin
+        # follower uses exponential smoothing so update rate isn't
+        # visually critical) while freeing GIL for the keepalive.
+        state_hz_idle = 25
+        state_hz_hold = 8
         lidar_hz  = 10
         mesh_hz   = 2
         motioncam_hz = 10
         motioncam_reco_hz = 4
-        state_dt  = 1.0 / state_hz
+        state_dt_idle  = 1.0 / state_hz_idle
+        state_dt_hold  = 1.0 / state_hz_hold
         lidar_dt  = 1.0 / lidar_hz
         mesh_dt   = 1.0 / mesh_hz
         motioncam_dt = 1.0 / motioncam_hz
@@ -1470,25 +1481,42 @@ if FASTAPI_AVAILABLE:
                 # The next_state cursor still advances so we don't spin.
                 with _ws_lock:
                     n_clients = len(_state_clients)
+                # Adaptive rate — 8 Hz while a jog hold is active, 25 Hz otherwise.
+                with _active_holds_lock:
+                    hold_active = len(_active_holds) > 0
+                state_dt = state_dt_hold if hold_active else state_dt_idle
                 if n_clients == 0:
                     next_state = now + state_dt
                     await asyncio.sleep(state_dt)
                     continue
-                with _state_lock:
-                    payload = copy.deepcopy(STATE)
+                # Root-caused 2026-07-17: deepcopy + json.dumps of the
+                # ~10 KB STATE blob was executing inside the asyncio
+                # loop's task and holding the GIL for 5-10 ms per
+                # broadcast. Under 25 Hz that's ~15% GIL occupancy on
+                # THIS thread — enough to starve the native keepalive
+                # thread (max_tick_gap_ms measured at 622 ms in a
+                # single stall, twice the driver's 300 ms freshness
+                # deadman → driver fires stopJog mid-hold → chattery
+                # jog on BOTH the Program and 3D View screens because
+                # they share the same transport). Fix: run the
+                # deepcopy+json.dumps in the default thread executor
+                # (concurrent futures pool) so the asyncio loop
+                # RELEASES the GIL while json runs its C-side work,
+                # and the keepalive native thread gets scheduled.
+                loop = asyncio.get_running_loop()
+                def _snapshot_and_serialize():
+                    with _state_lock:
+                        payload = copy.deepcopy(STATE)
+                    _state_seq_counter[0] += 1
+                    payload["t"]   = now * 1000
+                    payload["seq"] = _state_seq_counter[0]
+                    return json.dumps(payload), _state_seq_counter[0]
+                txt, seq = await loop.run_in_executor(None, _snapshot_and_serialize)
                 # Sequence + broadcast time. The seq lets the ACK-gated
-                # sender (below) coalesce: if the client hasn't yet acked
-                # frame N, we overwrite `latest_payload` in place and
-                # only send AFTER the ack arrives. This bounds in-flight
-                # to one frame regardless of how deep the OS TCP send
-                # buffer is — the previous fire-and-forget `send_text`
-                # let starlette/kernel accept frames unbounded, which
-                # turned into 600–5000 ms of accumulated latency during
-                # jog. See _sender in the ws_state handler.
-                _state_seq_counter[0] += 1
-                payload["t"]   = now * 1000
-                payload["seq"] = _state_seq_counter[0]
-                txt = json.dumps(payload)
+                # sender coalesce: if the client hasn't yet acked frame
+                # N, we overwrite `latest_payload` in place and only
+                # send AFTER the ack arrives. This bounds in-flight to
+                # one frame regardless of OS TCP send buffer depth.
                 with _ws_lock:
                     clients = list(_state_clients.items())
                 for ws, client in clients:
@@ -1496,7 +1524,7 @@ if FASTAPI_AVAILABLE:
                     # pulls at ack time, so the newest txt at ack time
                     # is what ships next — never a chain of stale frames.
                     client['latest_txt'] = txt
-                    client['latest_seq'] = _state_seq_counter[0]
+                    client['latest_seq'] = seq
                     client['latest_broadcast_ts'] = now * 1000
                     client['new_event'].set()
                 next_state = now + state_dt
