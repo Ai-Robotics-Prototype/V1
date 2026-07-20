@@ -4116,11 +4116,21 @@ if FASTAPI_AVAILABLE:
 
         return {"ok": True, "part": part}
 
-    # Path-traversal guard for /api/programs/{prog_id} routes. Slugs are
-    # produced by the POST endpoint as [a-z0-9_]+ so we mirror that here.
+    # Path-traversal guard for /api/programs/{prog_id} routes. Slugs
+    # produced by POST are LOWERCASE ALPHANUMERIC ONLY — no underscore
+    # or dash — because the Estun controller's URL parser (:9198)
+    # splits `projectlua_<id>` on '_' into nested path segments.
+    # A program id `new_program_2` gets stored at
+    # `projectlua/new/program/2/…` on the controller but projectlist
+    # still keys it as `new_program_2`, so save reports 4×200-OK yet
+    # project/run resolves the id to a non-existent path and emits
+    # controller alarm 10001 "Project <…> does not exist." Wire-proof:
+    # 2026-07-20 13:02:10 log. Fixed by keeping our ids single-segment
+    # so no URL-parser split can turn a valid save into an unrunnable
+    # project.
     import re as _prog_re
     _PROG_DIR = '/opt/cobot/programs'
-    _PROG_ID_RE = _prog_re.compile(r'^[a-z0-9_]+$')
+    _PROG_ID_RE = _prog_re.compile(r'^[a-z0-9]+$')
 
     def _prog_path(prog_id: str):
         if not _PROG_ID_RE.match(prog_id or ''):
@@ -4311,6 +4321,46 @@ if FASTAPI_AVAILABLE:
                 program, operator_speed_limit_pct=operator_cap_pct)
         except Exception as e:
             return JSONResponse({"error": f"codegen: {e}"}, status_code=500)
+
+        # Empty-program guard. If codegen produced zero varspoint
+        # entries, project/run would either (a) reach a Lua source
+        # with only skip-comments and complete instantly, or (b) on
+        # some controller firmwares reject with a run-time alarm.
+        # Either way we don't want to publish a run that can't
+        # possibly move the arm — refuse HERE with a clear reason
+        # instead of round-tripping a confusing controller error.
+        if not points:
+            return JSONResponse({
+                "error": "program has no taught poses — teach at least "
+                         "one point before running",
+                "ok": False,
+                "outcome": {"kind": "empty_program",
+                            "reason": "codegen produced zero valid movJ steps"},
+                "program_id": prog_id,
+                "requested_pct":  int(program.get("config", {}).get(
+                    "speed_pct") or program.get("speed_pct") or 10),
+                "effective_pct":  int(eff_pct),
+            }, status_code=400)
+
+        # Controller-id underscore-split guard. If our program id
+        # contains anything other than [a-z0-9], the controller's
+        # `projectlua_<id>` URL parser will split on the separator
+        # and store the project at a path that doesn't round-trip
+        # (2026-07-20 wire-proof: `new_program_2` → files land at
+        # `projectlua/new/program/2/…`, project/run then can't
+        # resolve back to the id → alarm 10001). Refuse the run
+        # rather than emit a save that runs OK on paper but fails
+        # at start.
+        if not _PROG_ID_RE.match(prog_id):
+            return JSONResponse({
+                "error": f"program id {prog_id!r} contains characters the "
+                         "controller can't round-trip (only [a-z0-9] "
+                         "allowed). Rename the program and try again.",
+                "ok": False,
+                "outcome": {"kind": "id_not_controller_safe",
+                            "reason": f"id {prog_id!r} would collide with "
+                                      "controller URL-parser separator"},
+            }, status_code=400)
 
         # Hash the source so the UI can display an upload-fingerprint —
         # helps the operator visually confirm two presses in a row shipped
@@ -4674,8 +4724,9 @@ if FASTAPI_AVAILABLE:
     @app.post("/api/programs")
     async def api_programs_save(request: Request):
         """Persist a wizard-generated program to /opt/cobot/programs as a
-        JSON file. Slug is derived from the name; collisions get a _2,
-        _3, ... suffix so we never silently overwrite."""
+        JSON file. Slug is derived from the name; collisions get a 2/3/…
+        digit suffix (NO underscore separator — see _PROG_ID_RE for the
+        controller-underscore-split rationale)."""
         try:
             body = await request.json()
         except Exception:
@@ -4686,7 +4737,12 @@ if FASTAPI_AVAILABLE:
         steps = body.get("steps") or []
         if not isinstance(steps, list):
             return JSONResponse({"error": "steps must be a list"}, status_code=400)
-        base = _prog_re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or 'program'
+        # Slug: lowercase alnum only. "New Program" → "newprogram";
+        # "My Palletize Task 3" → "mypalletizetask3". Collisions get
+        # a numeric suffix ("newprogram2") without an underscore
+        # separator — the controller would otherwise treat that
+        # underscore as a path segment boundary and lose the id.
+        base = _prog_re.sub(r'[^a-z0-9]+', '', name.lower()) or 'program'
         try:
             os.makedirs(_PROG_DIR, exist_ok=True)
         except Exception as e:
@@ -4694,7 +4750,7 @@ if FASTAPI_AVAILABLE:
         slug = base
         n = 2
         while os.path.exists(os.path.join(_PROG_DIR, slug + '.json')):
-            slug = f"{base}_{n}"
+            slug = f"{base}{n}"
             n += 1
         ts = _now_stamp()
         # Provenance: POST /api/programs is the MANUAL builder's write
@@ -5291,8 +5347,10 @@ if FASTAPI_AVAILABLE:
         program_id = None
         if body.get('save_to_library', True):
             # Mint a slug using the same convention as POST /api/programs.
+            # NO underscore — see _PROG_ID_RE comment for the controller-
+            # side URL-parser split rationale.
             name = str(program.get('name')).strip()
-            base = _prog_re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or 'program'
+            base = _prog_re.sub(r'[^a-z0-9]+', '', name.lower()) or 'program'
             try:
                 os.makedirs(_PROG_DIR, exist_ok=True)
             except Exception as e:
@@ -5302,7 +5360,7 @@ if FASTAPI_AVAILABLE:
             slug = base
             n = 2
             while os.path.exists(os.path.join(_PROG_DIR, slug + '.json')):
-                slug = f"{base}_{n}"
+                slug = f"{base}{n}"
                 n += 1
             ts = _now_stamp()
             saved = {

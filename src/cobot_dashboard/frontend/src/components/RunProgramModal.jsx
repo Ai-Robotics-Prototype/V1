@@ -49,10 +49,26 @@ export default function RunProgramModal() {
   if (!open) return null
 
   const stepCount = Array.isArray(currentProgram?.steps) ? currentProgram.steps.length : 0
+  // Count "runnable" steps: either (a) a step referencing a real
+  // taught point OR (b) legacy taught_joints on the step itself.
+  // Codegen skips anything else with a `-- skipped` comment; if
+  // this count is zero the codegen produces a Lua file with only
+  // skip-comments — no movJ, no varspoint, project/run can't
+  // resolve. Same guard on the backend, mirrored here so Confirm
+  // is disabled instead of the operator waiting for a round-trip
+  // failure.
+  const pointsDict = currentProgram?.points || {}
   const taughtCount = Array.isArray(currentProgram?.steps)
-    ? currentProgram.steps.filter((s) => Array.isArray(s?.taught_joints)
-                                          && s.taught_joints.length === 6).length
+    ? currentProgram.steps.filter((s) => {
+        if (!s) return false
+        if (s.point_name && pointsDict[s.point_name]?.joints?.length === 6) return true
+        return Array.isArray(s?.taught_joints) && s.taught_joints.length === 6
+      }).length
     : 0
+  // Controller-id round-trip safety: only [a-z0-9] ids can be
+  // resolved by the controller's URL parser (underscore/dash get
+  // treated as path separators and break project/run lookup).
+  const idSafe = /^[a-z0-9]+$/.test(currentProgram?.id || '')
   // The Monitor speed input feeds runSpeedPct in the store; this
   // modal reads from THAT (not program.config.speed_pct) so what
   // the operator saw next to Run is exactly what confirm ships.
@@ -196,12 +212,34 @@ export default function RunProgramModal() {
                 driver will refuse it, and the refusal reason appears here.
               </div>
             )}
+            {taughtCount === 0 && (
+              <div style={{
+                marginTop: 12, padding: 10, background: '#FEE2E2',
+                border: '1px solid #DC2626', borderRadius: 6,
+                color: '#7F1D1D', fontSize: 13,
+              }}>
+                <b>Program has no taught poses.</b> Teach at least one
+                point (Program tab → Teach current pose) or add
+                taught steps before running.
+              </div>
+            )}
+            {!idSafe && (
+              <div style={{
+                marginTop: 12, padding: 10, background: '#FEE2E2',
+                border: '1px solid #DC2626', borderRadius: 6,
+                color: '#7F1D1D', fontSize: 13,
+              }}>
+                <b>Program id <code>{currentProgram?.id}</code> can't round-trip on the controller.</b>{' '}
+                Underscores and dashes are treated as path separators.
+                Save this program under a new name (letters + digits only).
+              </div>
+            )}
             <div style={btnRow}>
               <button style={btnGhost} onClick={close}>Cancel</button>
               <button
-                style={btnPrimary('#16A34A', taughtCount === 0)}
+                style={btnPrimary('#16A34A', taughtCount === 0 || !idSafe)}
                 onClick={confirmRun}
-                disabled={taughtCount === 0}>
+                disabled={taughtCount === 0 || !idSafe}>
                 Confirm — Run at {effectivePct}%
               </button>
             </div>
