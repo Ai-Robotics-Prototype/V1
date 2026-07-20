@@ -1024,6 +1024,14 @@ const storeDefinition = (set, get) => ({
   openRunModal()  { set({ runModalOpen: true })  },
   closeRunModal() { set({ runModalOpen: false }) },
 
+  // Live step-preview panel expand/collapse. Session-scoped only —
+  // NOT persisted (see partialize below). Defaults to expanded so a
+  // fresh page load shows the operator step-by-step progress; the
+  // operator can collapse it manually and their choice sticks until
+  // the tab closes.
+  stepPanelOpen: true,
+  setStepPanelOpen(v) { set({ stepPanelOpen: !!v }) },
+
   // Monitor speed entry (integer % 1..100). Truth-in-UI display: the
   // driver's operator_speed_limit is the HARD cap; whatever the
   // operator enters here is clamped to [1, 100] first (invalid values

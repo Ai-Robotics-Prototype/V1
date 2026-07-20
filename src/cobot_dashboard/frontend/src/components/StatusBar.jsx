@@ -1,4 +1,5 @@
 import { useStore } from '../store/useStore'
+import { deriveRunState } from '../lib/runState'
 
 function Block({ children, style }) {
   return (
@@ -31,6 +32,10 @@ export default function StatusBar() {
   const wsLatency = useStore((s) => s.wsLatency)
   const task      = useStore((s) => s.task)
   const safety    = useStore((s) => s.safety)
+  const robot     = useStore((s) => s.robot) || {}
+  // Same unified derivation the Monitor pill uses so the footer
+  // "State" chip can't disagree with what the operator sees above.
+  const runState  = deriveRunState({ robot, task, safety })
 
   const zoneColor = ZONE_COLORS[safety.zone] ?? '#9A9A9E'
   const dotColor  = wsStatus === 'connected' ? '#22C55E'
@@ -56,18 +61,21 @@ export default function StatusBar() {
       <Block>Robot Generic TCP</Block>
       <Block>IP&nbsp;192.168.1.246</Block>
 
-      {/* Task state */}
+      {/* Unified run-state (same source as the Monitor pill). Was
+          previously reading task.state directly — that only reflected
+          the executor's own machine, so an Estun-pipeline run stayed
+          IDLE here even though the arm was moving. */}
       <Block>
         State&nbsp;
-        <span style={{
-          color: task.state === 'IDLE'   ? 'var(--text-secondary)'
-               : task.state === 'PAUSED' ? 'var(--yellow)'
-               : task.state === 'HOME'   ? 'var(--green)'
-               : 'var(--accent)',
-          fontWeight: 500,
-        }}>
-          {task.state}
+        <span style={{ color: runState.color, fontWeight: 600 }}>
+          {runState.label}
         </span>
+        {runState.detail && (
+          <span style={{ marginLeft: 6, color: 'var(--text-secondary)',
+                         fontSize: 10 }}>
+            {runState.detail}
+          </span>
+        )}
       </Block>
 
       {/* Zone + proximity */}

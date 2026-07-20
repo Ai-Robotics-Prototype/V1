@@ -8,30 +8,36 @@ import ProgramLibrary from './ProgramLibrary'
 import IdentifiedObjectsCard from '../components/IdentifiedObjectsCard'
 import RunProgramModal from '../components/RunProgramModal'
 import ProgramErrorModal from '../components/ProgramErrorModal'
+import StepPreviewPanel from '../components/StepPreviewPanel'
+import { deriveRunState } from '../lib/runState'
 
-function StatusBadge({ status }) {
-  const colors = {
-    idle:    { bg: '#f3f4f6', border: '#d1d5db', text: '#6b7280', label: 'IDLE' },
-    running: { bg: '#f0fdf4', border: '#16A34A', text: '#16A34A', label: 'RUNNING' },
-    paused:  { bg: '#fffbeb', border: '#CA8A04', text: '#CA8A04', label: 'PAUSED' },
-    estop:   { bg: '#fef2f2', border: '#DC2626', text: '#DC2626', label: 'E-STOP' },
-    homing:  { bg: '#eff6ff', border: '#2563EB', text: '#2563EB', label: 'HOMING' },
-  }
-  const c = colors[status] || colors.idle
+// Status badge — reads the unified deriveRunState() so pill matches
+// footer matches banner. Rendered from a runState object (color, label,
+// detail, pulse) so any future new state variant just needs an entry
+// in runState.js.
+function StatusBadge({ runState }) {
+  const rs = runState || { kind: 'idle', label: 'IDLE', color: '#6b7280',
+                           bg: '#f3f4f6', border: '#d1d5db', pulse: false }
   return (
     <div style={{
       display: 'inline-flex', alignItems: 'center', gap: 10,
       padding: '12px 24px', borderRadius: 12,
-      background: c.bg, border: '2px solid ' + c.border,
+      background: rs.bg, border: '2px solid ' + rs.border,
     }}>
       <div style={{
         width: 14, height: 14, borderRadius: '50%',
-        background: c.text,
-        animation: status === 'running' ? 'pulse-dot 1.5s ease-in-out infinite' : 'none',
+        background: rs.color,
+        animation: rs.pulse ? 'pulse-dot 1.5s ease-in-out infinite' : 'none',
       }} />
-      <span style={{ fontSize: 20, fontWeight: 800, color: c.text, letterSpacing: '0.05em' }}>
-        {c.label}
+      <span style={{ fontSize: 20, fontWeight: 800, color: rs.color, letterSpacing: '0.05em' }}>
+        {rs.label}
       </span>
+      {rs.detail && (
+        <span style={{ fontSize: 12, color: rs.color, opacity: 0.75,
+                       marginLeft: 4, fontVariantNumeric: 'tabular-nums' }}>
+          {rs.detail}
+        </span>
+      )}
     </div>
   )
 }
@@ -785,11 +791,12 @@ export default function MonitorDashboard() {
     }
   }, [task?.running, task?.paused, cycleStart])
 
-  // Derive the badge from real task + safety state.
-  const status = safety?.estop ? 'estop'
-               : task?.paused  ? 'paused'
-               : task?.running ? 'running'
-               :                  'idle'
+  // Unified run-state — same helper the StatusBar footer and the
+  // StepPreviewPanel consume, so pill / footer / banner never disagree.
+  // See lib/runState.js for the precedence rules.
+  const runState = deriveRunState({ robot, task, safety })
+  const status = runState.kind   // kept for old code that keyed off the string
+  const isRunning = runState.kind === 'running' || runState.kind === 'stopping'
 
   const programName    = currentProgram?.name || 'No program loaded'
   const steps          = currentProgram?.steps || []
@@ -807,9 +814,14 @@ export default function MonitorDashboard() {
   const targetPartId   = programConfig.target_part || null
   const programIdForStats = currentProgram?.id || null
 
-  const runDisabled    = safety?.estop || (task?.running && !task?.paused)
-  const pauseDisabled  = !task?.running || task?.paused || safety?.estop
-  const stopDisabled   = !task?.running && !task?.paused
+  // Disable-conditions use the unified runState so the Run button
+  // greys out when the Estun pipeline is running (not just when the
+  // sim executor is running). Same for Stop/Pause.
+  const runDisabled    = safety?.estop || runState.kind === 'running'
+                                        || runState.kind === 'stopping'
+  const pauseDisabled  = runState.kind !== 'running' || safety?.estop
+  const stopDisabled   = runState.kind !== 'running' && runState.kind !== 'paused'
+                                                     && runState.kind !== 'stopping'
 
   return (
     <div style={{
@@ -826,7 +838,7 @@ export default function MonitorDashboard() {
       {/* Top row: Status + Program info | Live camera */}
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 24, marginBottom: 24, flexWrap: 'wrap' }}>
         <div style={{ flex: 1, minWidth: 360 }}>
-          <StatusBadge status={status} />
+          <StatusBadge runState={runState} />
           <div style={{ marginTop: 16 }}>
             <div style={{ fontSize: 11, color: '#6b7280', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
               Current Program
@@ -861,6 +873,11 @@ export default function MonitorDashboard() {
                 )}
               </div>
             )}
+            {/* Live step-preview panel — highlights the currently-executing
+                step from publish/ProjectState.line. Only appears when
+                the current program has steps. Collapsible; header shows
+                "Step N / M" summary when collapsed. */}
+            <StepPreviewPanel />
           </div>
 
           {/* Speed entry — editable integer % (1-100). Truth-in-UI:
