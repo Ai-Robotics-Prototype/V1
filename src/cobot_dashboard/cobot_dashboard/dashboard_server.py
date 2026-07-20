@@ -654,6 +654,23 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         # When connected, this overwrites the sim joints — real wins.
         self.create_subscription(String, "/estun/status", self._on_estun_status, 10)
 
+        # Driver mode heartbeat — carries the allow_move/allow_jog/allow_power
+        # gates + program-execution live fields (program_state, program_line,
+        # is_step, active project_id). Monitor "Run" needs these to render
+        # the confirm modal's gate warning and the live line indicator.
+        self.create_subscription(String, "/estun/mode", self._on_estun_mode, 5)
+        # Program lifecycle events from the driver — save (HTTP result set),
+        # status (ProjectState snapshots), error (deduped publish/Error).
+        self.create_subscription(String, "/estun/program_status",
+                                 self._on_estun_program_status, 10)
+        # Driver rejections — surface gate-closed and other refusals to the UI
+        # so the Run modal shows exactly WHY nothing happened when it didn't.
+        self.create_subscription(String, "/estun/rejected",
+                                 self._on_estun_rejected, 10)
+        # Publisher for the /estun/program op-envelope. Created lazily on
+        # first use so the constructor stays cheap.
+        self._estun_program_pub = None
+
         # Program executor state (richer than /task/status: step labels,
         # cycle stats, executor-state strings like 'waiting_motion').
         self.create_subscription(String, "/task/state", self._on_task_state, 10)
@@ -1230,6 +1247,113 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             # Task running mirror — only when not driven by the project runner
             if r["connected"] and not STATE["task"].get("running", False):
                 STATE["task"]["running"] = bool(d.get("moving", False))
+
+    # ---- Estun /estun/mode: gates + program live state ----
+
+    def _on_estun_mode(self, msg):
+        """Mirror /estun/mode into STATE.robot. Adds the fields /estun/status
+        doesn't carry: the four gates (with sources), the effective jog
+        heartbeat + freshness deadman, and the live program-execution
+        state (from publish/ProjectState) — project_state, task, line,
+        is_step, active project_id."""
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        with _state_lock:
+            r = STATE.setdefault("robot", {})
+            for k in (
+                "monitor_only", "allow_jog", "allow_jog_source",
+                "allow_cartesian_jog", "allow_cart_source",
+                "allow_power", "allow_power_source",
+                "allow_move", "allow_move_source",
+                "jog_heartbeat_s", "jog_freshness_s",
+            ):
+                if k in d:
+                    r[k] = d[k]
+            # Program-execution fields — driven by the driver's
+            # publish/ProjectState mirror.
+            prog = r.setdefault("program", {})
+            prog["state"]      = int(d.get("program_state", 0))
+            prog["project_id"] = d.get("program_project_id")
+            prog["task"]       = d.get("program_task")
+            prog["line"]       = d.get("program_line")
+            prog["is_step"]    = bool(d.get("program_is_step", False))
+
+    # ---- Estun /estun/program_status: save/status/error events ----
+
+    def _on_estun_program_status(self, msg):
+        """Bridge the driver's program-status events to STATE.robot.program.
+        Events are one of:
+          event=save   — payload includes steps[] (per-HTTP-call outcomes)
+          event=status — a ProjectState snapshot (state/line/is_step/error)
+          (source prefix "error_" indicates an ErrorDedup transition)
+        We keep the LAST save event under program.last_save, and a small
+        rolling window of status events under program.recent so the UI
+        can render both the confirm modal (post-save) and the live
+        line indicator (post-run) from one place."""
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        with _state_lock:
+            r = STATE.setdefault("robot", {})
+            prog = r.setdefault("program", {})
+            ev = d.get("event")
+            if ev == "save":
+                prog["last_save"] = d
+            elif ev == "status":
+                # Track the latest error tuple (first-appearance, deduped
+                # by the driver's ErrorDedup). Cleared when driver reports
+                # None.
+                err = d.get("error")
+                prog["error"] = err
+                prog["source"] = d.get("source", "")
+                # Keep the last N status frames for a mini-timeline in the
+                # UI. Cap at 32 — enough to show a run's state trajectory,
+                # small enough to send inline in the /ws/state broadcast.
+                recent = prog.setdefault("recent", [])
+                recent.append({
+                    "ts":       d.get("ts"),
+                    "state":    d.get("state"),
+                    "is_step":  d.get("is_step"),
+                    "task":     d.get("task"),
+                    "line":     d.get("line"),
+                    "source":   d.get("source"),
+                })
+                if len(recent) > 32:
+                    del recent[:-32]
+
+    def _on_estun_rejected(self, msg):
+        """Mirror driver rejections into STATE.robot.rejected (ring buffer).
+        The Monitor Run modal reads the newest entry with family='program'
+        to render the exact reason — 'allow_move gate closed', 'ws not
+        connected', etc. — instead of just a generic failure."""
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        with _state_lock:
+            r = STATE.setdefault("robot", {})
+            rej = r.setdefault("rejected", [])
+            rej.append(d)
+            if len(rej) > 32:
+                del rej[:-32]
+
+    # ---- Estun /estun/program publisher + op helper ----
+
+    def _estun_publish_op(self, op: str, **payload):
+        """Publish a single /estun/program op envelope. Returns True if
+        the frame reached the topic (does NOT mean the driver accepted
+        or ran it — the driver's gate + rejection stream is the source
+        of truth for that)."""
+        if self._estun_program_pub is None:
+            self._estun_program_pub = self.create_publisher(
+                String, "/estun/program", 5)
+        body = dict(payload); body["op"] = op
+        m = String(); m.data = json.dumps(body)
+        self._estun_program_pub.publish(m)
+        return True
 
     # ---- Cameras ----
 
@@ -4068,6 +4192,183 @@ if FASTAPI_AVAILABLE:
         disk = _load_disk_stats(prog_id)
         s = disk if disk else _program_stats.get(prog_id, {})
         return {'cycle_times': list(s.get('cycle_times', []))}
+
+    # ─── Estun-arm program pipeline (ladder-proven, commit d059207) ─────
+    #
+    # This is the REAL-ARM run path — distinct from /api/program/run
+    # (which dispatches to the sim/executor). Sequence per press:
+    #
+    #   1. Read /opt/cobot/programs/{id}.json   (fresh every press — no
+    #      stale controller-stored copy is trusted; see §Staleness below)
+    #   2. Codegen Lua + varspoint via program_ops.codegen_lua_from_program
+    #      — hard-caps speed_pct at the driver's operator_speed_limit
+    #   3. Publish {op:save, …}                 → driver POSTs 4 HTTP
+    #      calls (source + varspoint + project.json + projectlist)
+    #   4. Publish {op:to_auto}
+    #   5. Publish {op:set_auto_rate, pct:<eff>}
+    #   6. Publish {op:set_breakpoint, task_id:'main', lines:[]}
+    #   7. Publish {op:clear_start_line}
+    #   8. Publish {op:run, program_id, task_id:'main'}
+    #
+    # Each op passes through the driver's monitor_only + allow_move gate.
+    # A closed gate → rejection on /estun/rejected → surfaced to the UI
+    # via STATE.robot.rejected. We DELIBERATELY do NOT pre-check the
+    # gate here: the operator's requirement is that pressing Run with
+    # the gate closed still surfaces the driver's own refusal, proving
+    # the whole pipeline is wired end-to-end.
+    #
+    # Staleness: the frontend re-fetches the program from /api/programs
+    # before opening the confirm modal, and this endpoint re-reads the
+    # disk copy on every call — so a taught-poses edit made in the same
+    # session ships to the controller before run. The controller's
+    # varspoint / robotcode / projectlist are unconditionally OVER-
+    # WRITTEN on every press (see program_ops.save_project — its
+    # projectlist MERGE preserves other projects but always rewrites
+    # our entry with the fresh codegen output).
+
+    @app.post("/api/estun/program/run")
+    async def api_estun_program_run(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        prog_id = str(body.get("program_id") or "").strip()
+        if not prog_id:
+            return JSONResponse({"error": "program_id required"}, status_code=400)
+        # Task id is fixed to "main" for the B1 shape. Multi-task programs
+        # come with the multi-task saveAll flow (deferred, tracked in the
+        # architecture doc).
+        task_id = "main"
+
+        path = _prog_path(prog_id)
+        if not os.path.isfile(path):
+            return JSONResponse({"error": f"program {prog_id!r} not on disk"},
+                                status_code=404)
+        try:
+            with open(path) as f:
+                program = json.load(f)
+        except Exception as e:
+            return JSONResponse({"error": f"program read: {e}"}, status_code=500)
+
+        # Codegen. operator_speed_limit is a driver-side parameter — mirrored
+        # into STATE.robot from /estun/mode. It's a FRACTION (0..1) there;
+        # program_ops takes an integer percent. If we don't have a live
+        # /estun/mode snapshot yet (driver not up), fall back to a very
+        # conservative 25% cap.
+        with _state_lock:
+            r = STATE.get("robot", {})
+            op_frac = float(r.get("operator_speed_limit", 0.25))
+            allow_move = bool(r.get("allow_move", False))
+            monitor_only = bool(r.get("monitor_only", True))
+        operator_cap_pct = max(1, min(100, int(round(op_frac * 100))))
+
+        try:
+            from estun_driver import program_ops  # ladder-proven module
+        except Exception as e:
+            return JSONResponse({"error": f"program_ops import: {e}"},
+                                status_code=500)
+        try:
+            lua, points, eff_pct = program_ops.codegen_lua_from_program(
+                program, operator_speed_limit_pct=operator_cap_pct)
+        except Exception as e:
+            return JSONResponse({"error": f"codegen: {e}"}, status_code=500)
+
+        # Hash the source so the UI can display an upload-fingerprint —
+        # helps the operator visually confirm two presses in a row shipped
+        # DIFFERENT programs (or the same one) when they edit between runs.
+        import hashlib
+        src_hash = hashlib.sha256(lua.encode("utf-8")).hexdigest()[:12]
+
+        # Snapshot the rejection ring so we can attribute any refusals
+        # that arrive DURING this endpoint's op sequence back to this
+        # specific press.
+        with _state_lock:
+            r = STATE.get("robot", {})
+            rej_before = len(r.get("rejected", []))
+
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        try:
+            _ros_node._estun_publish_op(
+                "save",
+                program_id=prog_id, task_id=task_id,
+                name=str(program.get("name") or prog_id),
+                task_name="main",
+                points=points, lua_source=lua)
+            _ros_node._estun_publish_op("to_auto")
+            _ros_node._estun_publish_op("set_auto_rate", pct=int(eff_pct))
+            _ros_node._estun_publish_op(
+                "set_breakpoint", task_id=task_id, lines=[])
+            _ros_node._estun_publish_op("clear_start_line")
+            _ros_node._estun_publish_op(
+                "run", program_id=prog_id, task_id=task_id)
+        except Exception as e:
+            return JSONResponse({"error": f"publish: {e}"}, status_code=500)
+
+        # Give the driver a short window to publish either a save event
+        # OR a rejection so the response reflects the real outcome, not
+        # just "we published, don't know what happened."
+        deadline = time.time() + 1.5
+        outcome = None
+        while time.time() < deadline:
+            await asyncio.sleep(0.05)
+            with _state_lock:
+                r = STATE.get("robot", {})
+                new_rej = r.get("rejected", [])[rej_before:]
+                prog_state = r.get("program", {})
+            program_rejects = [x for x in new_rej if x.get("family") == "program"]
+            if program_rejects:
+                outcome = {"kind": "rejected",
+                           "reason": program_rejects[0].get("reason"),
+                           "payload_head": program_rejects[0].get("payload", "")[:120]}
+                break
+            # Any save event with a per-step failure counts as save-failed;
+            # otherwise we consider run-published a success once we see
+            # program_state != 0 (2 or 3) or when we've exhausted the
+            # window and see no rejection.
+            save = prog_state.get("last_save")
+            if save and any(s.get("http_status") != 200 for s in save.get("steps", [])):
+                outcome = {"kind": "save_failed", "save": save}
+                break
+        if outcome is None:
+            outcome = {"kind": "published"}
+
+        return {
+            "ok": outcome["kind"] in ("published",),
+            "program_id": prog_id,
+            "task_id":    task_id,
+            "requested_pct":  int(program.get("config", {}).get(
+                "speed_pct") or program.get("speed_pct") or 10),
+            "operator_cap_pct": operator_cap_pct,
+            "effective_pct":  int(eff_pct),
+            "points":     list(points.keys()),
+            "source_hash": src_hash,
+            "gate": {"allow_move": allow_move, "monitor_only": monitor_only},
+            "outcome": outcome,
+        }
+
+    @app.post("/api/estun/program/stop")
+    async def api_estun_program_stop():
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        _ros_node._estun_publish_op("stop")
+        return {"ok": True}
+
+    @app.post("/api/estun/program/pause")
+    async def api_estun_program_pause():
+        # SOURCE-ONLY behavior — the UI keeps the pause button labelled
+        # as such until pause/resume are wire-proven in a future ladder.
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        _ros_node._estun_publish_op("pause")
+        return {"ok": True, "source_only": True}
+
+    @app.post("/api/estun/program/clear_error")
+    async def api_estun_program_clear_error():
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        _ros_node._estun_publish_op("clear_error")
+        return {"ok": True}
 
     @app.post("/api/program/run")
     async def api_program_run(request: Request):

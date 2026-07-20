@@ -6,6 +6,8 @@ import { STLLoader } from 'three/examples/jsm/loaders/STLLoader'
 import * as THREE from 'three'
 import ProgramLibrary from './ProgramLibrary'
 import IdentifiedObjectsCard from '../components/IdentifiedObjectsCard'
+import RunProgramModal from '../components/RunProgramModal'
+import ProgramErrorModal from '../components/ProgramErrorModal'
 
 function StatusBadge({ status }) {
   const colors = {
@@ -716,6 +718,7 @@ export default function MonitorDashboard() {
   const pauseProgram   = useStore((s) => s.pauseProgram)
   const resumeProgram  = useStore((s) => s.resumeProgram)
   const cancelProgram  = useStore((s) => s.cancelProgram)
+  const robot          = useStore((s) => s.robot) || {}
 
   // Change Program overlay state. The Program Library is rendered
   // inside a full-viewport modal here; onSelectProgram closes it and
@@ -834,6 +837,28 @@ export default function MonitorDashboard() {
                 Step {currentStepIdx + 1} of {steps.length}: {currentStepLabel}
               </div>
             )}
+            {/* Live indicator from the Estun driver's publish/ProjectState
+                mirror (STATE.robot.program). Renders whenever the driver
+                reports state=2 (running) OR the operator is single-stepping.
+                This is the ground truth from the controller, distinct from
+                the sim executor's task.program_step. */}
+            {(robot?.program?.state === 2 || robot?.program?.is_step) && (
+              <div style={{
+                marginTop: 8, padding: '8px 12px',
+                background: '#F0FDF4', border: '1px solid #16A34A',
+                borderRadius: 6, fontSize: 13, color: '#065F46',
+                fontFamily: 'monospace',
+              }}>
+                <b>Estun:</b>{' '}
+                state={robot.program.state}{' '}
+                {robot.program.is_step ? '(single-step)' : '(auto)'}{' '}
+                &middot; task={robot.program.task ?? '—'}{' '}
+                &middot; line={robot.program.line ?? '—'}{' '}
+                {robot.program.project_id && (
+                  <> &middot; project={robot.program.project_id}</>
+                )}
+              </div>
+            )}
           </div>
 
           <div style={{ display: 'flex', gap: 10, marginTop: 20, flexWrap: 'wrap' }}>
@@ -850,10 +875,12 @@ export default function MonitorDashboard() {
             ) : status === 'running' ? (
               <>
                 <button onClick={pauseProgram} disabled={pauseDisabled}
+                  title="project/pause — SOURCE-ONLY (behavior not yet wire-proven)"
                   style={primaryBtn('#CA8A04', pauseDisabled)}>
-                  ⏸ Pause
+                  ⏸ Pause*
                 </button>
                 <button onClick={cancelProgram} disabled={stopDisabled}
+                  title="project/stop — wire-proven rung 1"
                   style={primaryBtn('#DC2626', stopDisabled)}>
                   ✕ Stop
                 </button>
@@ -1061,6 +1088,12 @@ export default function MonitorDashboard() {
           </div>
         </div>
       )}
+
+      {/* Run-confirm modal (opens when the operator presses Run) and
+          program error modal (opens on driver-side publish/Error
+          transitions, deduped by the driver's ErrorDedup at ~3 Hz). */}
+      <RunProgramModal />
+      <ProgramErrorModal />
     </div>
   )
 }

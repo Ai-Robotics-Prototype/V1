@@ -430,11 +430,48 @@ const storeDefinition = (set, get) => ({
     if (legacy) return get().sendCommand('task', { command: legacy })
   },
 
-  runProgram(opts)     { return get()._dispatchProgram('run', opts) },
-  pauseProgram()        { return get()._dispatchProgram('pause') },
-  resumeProgram()       { return get()._dispatchProgram('resume') },
+  // Monitor Run button. Opens the confirm modal instead of firing the
+  // run directly — the ladder-proven pipeline is destructive (overwrites
+  // the controller's stored program on every press) and moves the real
+  // arm, so the operator needs to see program name + step count +
+  // effective speed + move-gate status before proceeding. The actual
+  // POST /api/estun/program/run happens inside RunProgramModal on
+  // Confirm. Passing {sim:true} bypasses the modal for the legacy sim
+  // flow (executor + /task/run_program).
+  runProgram(opts = {}) {
+    if (opts.sim) return get()._dispatchProgram('run', opts)
+    return get().openRunModal()
+  },
+  // Pause / Resume go through the ladder verbs (project/pause,
+  // project/resume). Pause is still SOURCE-ONLY behavior-wise; a future
+  // ladder rung will lift the flag. If the driver refuses (gate closed,
+  // etc.), the rejection surfaces on STATE.robot.rejected.
+  async pauseProgram() {
+    try { await fetch('/api/estun/program/pause', { method: 'POST' }) }
+    catch (_) { /* fall through to sim */ }
+    return get()._dispatchProgram('pause')
+  },
+  async resumeProgram() {
+    try { await fetch('/api/estun/program/run', { method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ program_id: get().currentProgram?.id }) }) }
+    catch (_) { /* fall through to sim */ }
+    return get()._dispatchProgram('resume')
+  },
   homeRobot()           { return get()._dispatchProgram('home') },
-  cancelProgram()       { return get()._dispatchProgram('stop') },
+  // Stop → project/stop, the wire-proven ladder-rung-1 verb. Falls
+  // through to the sim's cancel so both paths land at rest.
+  async cancelProgram() {
+    try { await fetch('/api/estun/program/stop', { method: 'POST' }) }
+    catch (_) { /* fall through to sim */ }
+    return get()._dispatchProgram('stop')
+  },
+  // Clear the driver's latched error (also stops the 3 Hz publish/Error
+  // reflood on the controller). Wired to the error modal below.
+  async clearProgramError() {
+    try { await fetch('/api/estun/program/clear_error', { method: 'POST' }) }
+    catch (_) { /* no-op */ }
+  },
 
   // ---------------------------------------------------------------------------
   // Jog commands
@@ -767,6 +804,14 @@ const storeDefinition = (set, get) => ({
   setCurrentProgram(patch) {
     set((s) => ({ currentProgram: { ...s.currentProgram, ...patch } }))
   },
+
+  // Monitor "Run Program" confirm modal. The button opens this;
+  // RunProgramModal renders the confirm/error/ok sequence and POSTs
+  // /api/estun/program/run when the operator confirms. See the
+  // RunProgramModal comment header for the full ladder-pipeline flow.
+  runModalOpen: false,
+  openRunModal()  { set({ runModalOpen: true })  },
+  closeRunModal() { set({ runModalOpen: false }) },
 
   // Program-tab layout dimensions — kept in the store (and persisted)
   // so switching to another tab and back keeps the panels at the
