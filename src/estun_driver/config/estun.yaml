@@ -69,6 +69,19 @@ estun_driver:
     # be gated harder than moving it.
     allow_power: false
 
+    # ── Program-execution write path (fourth gate — Part 2c, B1) ─────
+    # /estun/program → save (HTTP) + project/run|stop|pause|resume|
+    # runStep|setStartLine|clearStartLine|setBreakpoint|clearBreakpoint,
+    # Robot/toAuto|toManual|setManualMoveRate|setAutoMoveRate,
+    # System/ClearError. Env override ESTUN_ALLOW_MOVE=1 wins over YAML.
+    # monitor_only stays the master gate (closed → all above rejected).
+    # SOURCE-ONLY verbs (stop / pause / resume / runStep / clearBreakpoint /
+    # setAutoMoveRate) have their SHAPE proven by cross-validation
+    # against the captured no-db family but their BEHAVIOR needs a
+    # live wire test — see PART_2C_ARCHITECTURE.md §5 for the ladder
+    # (stop-verb validation FIRST, before any multi-step run).
+    allow_move: false
+
     # ── Two-tier speed cap (staged raise 2026-07-16 safety pass) ──────
     #
     # jog_speed_cap is the HARDWARE-DERIVED ceiling — the point past

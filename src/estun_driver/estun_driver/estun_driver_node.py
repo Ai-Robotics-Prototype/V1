@@ -379,6 +379,21 @@ class EstunCodroidDriver(Node):
         # retry-on-failure.
         self.declare_parameter('allow_power', False)
 
+        # Program-execution write path (Part 2c, B1). Fourth gate,
+        # SEPARATE from allow_jog and allow_power. Opens the family:
+        #   - HTTP save (POST /api/robotcode + /api/robotjson/...)
+        #   - project/run, /stop, /pause, /resume, /runStep,
+        #     /setStartLine, /clearStartLine, /setBreakpoint,
+        #     /clearBreakpoint
+        #   - Robot/toAuto, Robot/toManual, Robot/setManualMoveRate,
+        #     Robot/setAutoMoveRate  (mode switches + program speed cap)
+        #   - System/ClearError  (also allowed under allow_power for the
+        #     jog-side clear_alarm command — clearing an error is a
+        #     safing action, not a moving one, but on the program path
+        #     it appears here because the sequence is start-run-clear-run)
+        # monitor_only stays the master gate. See PART_2C_ARCHITECTURE.md.
+        self.declare_parameter('allow_move', False)
+
         # Cadence knobs.
         self.declare_parameter('recv_timeout_s', 5.0)   # matches posture.py
         self.declare_parameter('ping_on_timeout', True)
@@ -464,6 +479,13 @@ class EstunCodroidDriver(Node):
             self._allow_power = env_power.strip().lower() in ('1', 'true', 'yes', 'on')
             self._allow_power_source = 'ESTUN_ALLOW_POWER'
 
+        self._allow_move = bool(self.get_parameter('allow_move').value)
+        self._allow_move_source = 'param'
+        env_move = os.environ.get('ESTUN_ALLOW_MOVE')
+        if env_move is not None:
+            self._allow_move = env_move.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._allow_move_source = 'ESTUN_ALLOW_MOVE'
+
         # Env override — ALWAYS wins so systemd can retarget without rebuild.
         env_ip = os.environ.get('ESTUN_ROBOT_IP')
         env_port = os.environ.get('ESTUN_ROBOT_PORT')
@@ -529,6 +551,22 @@ class EstunCodroidDriver(Node):
         self._last_posture_ts = 0.0
         self._last_status_ts  = 0.0
         self._last_disabled_log = 0.0
+
+        # Part 2c program-execution state, updated from publish/ProjectState.
+        # None values mean "no info yet"; a state==0 ProjectState frame
+        # after a run clears line/task/is_step but preserves last_project_id
+        # so the dashboard can still show "just ran <that project>".
+        self._prog_state       = 0        # 0=idle, 2=running (wire values)
+        self._prog_project_id  = None
+        self._prog_task        = None
+        self._prog_line        = None
+        self._prog_is_step     = False
+        self._prog_last_update_ts = 0.0
+        # publish/Error dedup — the ~3 Hz reflood collapses to one
+        # event per unique (code, unix_ts) key. See program_ops.ErrorDedup.
+        from estun_driver.program_ops import ErrorDedup
+        self._prog_err_dedup = ErrorDedup()
+        self._prog_last_error = None      # last observed entry or None
 
         # Rejection accounting.
         self._rej_counts = {}
@@ -682,6 +720,11 @@ class EstunCodroidDriver(Node):
         self._pub_status      = self.create_publisher(String, '/estun/status', 10)
         self._pub_mode        = self.create_publisher(String, '/estun/mode', 10)
         self._pub_rejected    = self.create_publisher(String, '/estun/rejected', 10)
+        # Part 2c program-execution status. Updated from publish/ProjectState
+        # frames (state, project id, current task, current line, isStep)
+        # and from publish/Error transitions (new fault, cleared) after
+        # dedup by (code, unix_ts) — see program_ops.ErrorDedup.
+        self._pub_program     = self.create_publisher(String, '/estun/program_status', 10)
 
         # ── Subscribers ────────────────────────────────────────
         # /robot/jog_command has a real handler that emits Robot/jog when
@@ -713,6 +756,11 @@ class EstunCodroidDriver(Node):
         # Reliable QoS, small depth: these are single infrequent user gestures,
         # not the ephemeral refresh stream that jog is.
         self.create_subscription(String, '/robot/power_command', self._on_power_command, 5)
+
+        # Program execution — save (HTTP) + run/stop/pause/... (WS).
+        # Same infrequent-user-gesture profile as power; small reliable
+        # queue. Gate = monitor_only=false AND allow_move=true.
+        self.create_subscription(String, '/estun/program', self._on_program_command, 5)
 
         # ── Timers ─────────────────────────────────────────────
         self._mode_timer    = self.create_timer(1.0, self._publish_mode)
@@ -756,6 +804,22 @@ class EstunCodroidDriver(Node):
             self.get_logger().warn(
                 'monitor_only=false but allow_power=false — power write path '
                 'still gated; set ESTUN_ALLOW_POWER=1 or allow_power:true in YAML.')
+        if self._monitor_only:
+            pass
+        elif self._allow_move:
+            self.get_logger().warn(
+                f'MOVE WRITE PATH ENABLED — monitor_only=false, '
+                f'allow_move=true (source: {self._allow_move_source}). '
+                f'/estun/program will emit project/* + Robot/toAuto|toManual '
+                f'+ Robot/setManualMoveRate + System/ClearError and HTTP-save '
+                f'to :{self._ui_origin_port}. SOURCE-ONLY verbs (stop/pause/'
+                f'resume/runStep/clearBreakpoint/setAutoMoveRate) are '
+                f'behind-shape-not-behavior — see PART_2C_ARCHITECTURE.md §5.')
+        else:
+            self.get_logger().warn(
+                'monitor_only=false but allow_move=false — program write '
+                'path still gated; set ESTUN_ALLOW_MOVE=1 or allow_move:true '
+                'in YAML.')
         self._publish_mode()
 
     # ── WS raw log ────────────────────────────────────────
@@ -906,6 +970,263 @@ class EstunCodroidDriver(Node):
         self.get_logger().info(
             f'power {action}: {frame["ty"]} sent (id={frame["id"]}) — '
             f'state before={self._state_code}({self._state_name!r})')
+
+    # ── Program write path (Part 2c, B1) ───────────────────────
+    #
+    # /estun/program accepts a JSON envelope { "op": "<verb>", ... }.
+    # The gate is monitor_only=false AND allow_move=true (checked FIRST,
+    # before any argument parsing, so a gate-closed run publishes
+    # rejections without touching the wire). See PART_2C_ARCHITECTURE.md
+    # for the full verb catalog and the SOURCE-ONLY status of the
+    # stop/pause/resume/runStep/clearBreakpoint family.
+    #
+    # Verbs whose shape / behavior is confirmed from the HAR are marked
+    # CAPTURED. Verbs mined from assets_entry_as-D2dla8D6.js only are
+    # marked SOURCE-ONLY — their shape matches the confirmed no-db
+    # family but behavior needs live wire proof (see the validation
+    # ladder in PART_2C_ARCHITECTURE.md §5).
+    #
+    # HTTP save (op="save") uses program_ops.save_project — POST to
+    # /api/robotcode/ (Lua source) + /api/robotjson/... (varspoint,
+    # project.json, projectlist). Response codes surface via the
+    # rejection channel on failure.
+
+    def _writes_allowed_for_move(self):
+        return (not self._monitor_only) and self._allow_move
+
+    def _ws_verb(self, ty, db=None):
+        """Send a single ty[/db] envelope, id-tagged. Returns True on
+        wire success (which does NOT mean the controller accepted —
+        only that the frame reached the socket). Rejection surfaces
+        through the family-typed logger + /estun/rejected on the
+        CALLER'S side."""
+        frame = {'ty': ty}
+        if db is not None:
+            frame['db'] = db
+        frame['id'] = self._new_nonce()
+        return self._send(frame)
+
+    def _on_program_command(self, msg):
+        """Program-family command dispatcher. One family per op so
+        rejections stay attributable in /estun/rejected.
+
+        Op catalog (see PART_2C_ARCHITECTURE.md for shape references):
+          save          — HTTP: Lua source + varspoint + project.json + projectlist
+          run           — WS   {ty:"project/run",         db:{id,task}}    (CAPTURED)
+          runStep       — WS   {ty:"project/runStep",     db:{id,task}}    (SOURCE-ONLY)
+          stop          — WS   {ty:"project/stop"}                          (SOURCE-ONLY)
+          pause         — WS   {ty:"project/pause"}                         (SOURCE-ONLY)
+          resume        — WS   {ty:"project/resume"}                        (SOURCE-ONLY)
+          set_start_line   — WS {ty:"project/setStartLine",  db:<int line>} (CAPTURED)
+          clear_start_line — WS {ty:"project/clearStartLine"}               (CAPTURED)
+          set_breakpoint   — WS {ty:"project/setBreakpoint", db:{task:[…]}} (CAPTURED)
+          clear_breakpoint — WS {ty:"project/clearBreakpoint"}              (SOURCE-ONLY)
+          to_auto       — WS   {ty:"Robot/toAuto"}                          (CAPTURED)
+          to_manual     — WS   {ty:"Robot/toManual"}                        (CAPTURED)
+          set_move_rate — WS   {ty:"Robot/setManualMoveRate", db:<int %>}   (CAPTURED)
+          set_auto_rate — WS   {ty:"Robot/setAutoMoveRate",   db:<int %>}   (SOURCE-ONLY)
+          clear_error   — WS   {ty:"System/ClearError"}                     (CAPTURED)
+
+        Every op above requires monitor_only=false AND allow_move=true.
+        (clear_error is available separately on /robot/power_command as
+        'clear_alarm', which is gated on allow_power — that path stays
+        for the jog/power UI and is unchanged.)
+        """
+        family = 'program'
+        # ─ Gate: the FIRST check, before we touch the payload. This
+        #   is what makes the gate-closed proof airtight — a rejected
+        #   op never emits a wire frame.
+        if self._monitor_only:
+            self._reject(family, 'monitor_only active',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._allow_move:
+            self._reject(family, 'allow_move gate closed',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._connected:
+            self._reject(family, 'ws not connected',
+                         extra={'payload': msg.data[:200]})
+            return
+
+        try:
+            d = json.loads(msg.data)
+        except Exception as e:
+            self._reject(family, f'invalid JSON: {e}')
+            return
+
+        op = str(d.get('op', '')).lower()
+        try:
+            handler = _PROGRAM_OP_HANDLERS.get(op)
+            if handler is None:
+                self._reject(family, f'unknown op {op!r}')
+                return
+            handler(self, d)
+        except Exception as e:
+            self.get_logger().warn(f'program op {op!r} failed: {e}')
+            self._reject(family, f'op {op!r} raised: {e}')
+
+    # ── /estun/program op handlers ─────────────────────────────
+    #
+    # Each handler enforces its own argument shape but assumes the
+    # gate check in _on_program_command has already succeeded — do
+    # NOT call these directly from any other path.
+
+    def _op_save(self, d):
+        """HTTP save. Required fields:
+          program_id, task_id, name, task_name,
+          points: {name: {joint:[6 floats]}}  (POSTed as varspoint)
+          lua_source: <str>
+
+        The caller (usually a codegen script or the dashboard) supplies
+        the FINAL Lua text and points dict; this handler just POSTs
+        them. Codegen lives in program_ops.codegen_lua_from_program
+        so a caller can produce these fields from a taught-program IR
+        without duplicating logic here.
+        """
+        from estun_driver import program_ops
+        required = ('program_id', 'task_id', 'lua_source', 'points')
+        for k in required:
+            if d.get(k) is None:
+                self._reject('program', f'save: missing {k!r}')
+                return
+        try:
+            steps = program_ops.save_project(
+                self._robot_ip, self._ui_origin_port,
+                project_id=str(d['program_id']),
+                task_id=str(d['task_id']),
+                project_display=str(d.get('name', d['program_id'])),
+                task_display=str(d.get('task_name', d['task_id'])),
+                lua_source=str(d['lua_source']),
+                varspoint=dict(d['points']),
+            )
+        except Exception as e:
+            self._reject('program', f'save: HTTP failed: {e}')
+            return
+        # Emit a status frame so the dashboard/test scripts see the
+        # exact per-step response chain. Uses a compact schema.
+        m = String()
+        m.data = json.dumps({
+            'event': 'save',
+            'project_id': d['program_id'],
+            'task_id': d['task_id'],
+            'steps': steps,
+            'ts': time.time(),
+        }, separators=(',', ':'))
+        self._pub_program.publish(m)
+        self.get_logger().info(
+            f'program save: {d["program_id"]}/{d["task_id"]} — '
+            f'{len(steps)} HTTP calls, '
+            f'{sum(1 for s in steps if s.get("http_status")==200)} 200-OK')
+
+    def _op_run(self, d):
+        pid = str(d.get('program_id', ''))
+        tid = str(d.get('task_id', ''))
+        if not pid or not tid:
+            self._reject('program', 'run: missing program_id/task_id')
+            return
+        ok = self._ws_verb('project/run', {'id': pid, 'task': tid})
+        self.get_logger().info(f'project/run sent pid={pid!r} tid={tid!r} ok={ok}')
+
+    def _op_runstep(self, d):
+        # SOURCE-ONLY (verb + shape mined from JS bundle; behavior
+        # awaits live wire proof — see PART_2C_ARCHITECTURE.md §2.2).
+        pid = str(d.get('program_id', ''))
+        tid = str(d.get('task_id', ''))
+        if not pid or not tid:
+            self._reject('program', 'runStep: missing program_id/task_id')
+            return
+        ok = self._ws_verb('project/runStep', {'id': pid, 'task': tid})
+        self.get_logger().info(f'project/runStep sent (SOURCE-ONLY) ok={ok}')
+
+    def _op_stop(self, _d):
+        # SOURCE-ONLY. This is the verb that stops an autonomously-
+        # running program without touching motor power. Behavior
+        # validation is the FIRST live test in the Part 2c ladder
+        # (PART_2C_ARCHITECTURE.md §5).
+        ok = self._ws_verb('project/stop')
+        self.get_logger().info(f'project/stop sent (SOURCE-ONLY) ok={ok}')
+
+    def _op_pause(self, _d):
+        # SOURCE-ONLY.
+        ok = self._ws_verb('project/pause')
+        self.get_logger().info(f'project/pause sent (SOURCE-ONLY) ok={ok}')
+
+    def _op_resume(self, _d):
+        # SOURCE-ONLY.
+        ok = self._ws_verb('project/resume')
+        self.get_logger().info(f'project/resume sent (SOURCE-ONLY) ok={ok}')
+
+    def _op_set_start_line(self, d):
+        try:
+            line = int(d.get('line', 1))
+        except (TypeError, ValueError):
+            self._reject('program', 'set_start_line: invalid line')
+            return
+        ok = self._ws_verb('project/setStartLine', line)
+        self.get_logger().info(f'project/setStartLine db={line} ok={ok}')
+
+    def _op_clear_start_line(self, _d):
+        ok = self._ws_verb('project/clearStartLine')
+        self.get_logger().info(f'project/clearStartLine ok={ok}')
+
+    def _op_set_breakpoint(self, d):
+        task = d.get('task_id') or d.get('task')
+        lines = d.get('lines') or []
+        if not task:
+            self._reject('program', 'set_breakpoint: missing task_id')
+            return
+        db = {str(task): list(lines)}
+        ok = self._ws_verb('project/setBreakpoint', db)
+        self.get_logger().info(f'project/setBreakpoint db={db} ok={ok}')
+
+    def _op_clear_breakpoint(self, _d):
+        # SOURCE-ONLY. (An alternative would be to send
+        # project/setBreakpoint with db={task:[]} — captured behavior
+        # — but this dedicated verb from the JS bundle is a cleaner
+        # global clear.)
+        ok = self._ws_verb('project/clearBreakpoint')
+        self.get_logger().info(f'project/clearBreakpoint sent (SOURCE-ONLY) ok={ok}')
+
+    def _op_to_auto(self, _d):
+        ok = self._ws_verb('Robot/toAuto')
+        self.get_logger().info(f'Robot/toAuto ok={ok}')
+
+    def _op_to_manual(self, _d):
+        ok = self._ws_verb('Robot/toManual')
+        self.get_logger().info(f'Robot/toManual ok={ok}')
+
+    def _op_set_move_rate(self, d):
+        # setManualMoveRate is the MANUAL-mode override (jogs); the
+        # AUTO-mode program-speed knob is setAutoMoveRate below.
+        try:
+            pct = int(d.get('pct', d.get('rate', 0)))
+        except (TypeError, ValueError):
+            self._reject('program', 'set_move_rate: invalid pct')
+            return
+        pct = max(1, min(100, pct))
+        ok = self._ws_verb('Robot/setManualMoveRate', pct)
+        self.get_logger().info(f'Robot/setManualMoveRate db={pct}%% ok={ok}')
+
+    def _op_set_auto_rate(self, d):
+        # SOURCE-ONLY.
+        try:
+            pct = int(d.get('pct', d.get('rate', 0)))
+        except (TypeError, ValueError):
+            self._reject('program', 'set_auto_rate: invalid pct')
+            return
+        pct = max(1, min(100, pct))
+        ok = self._ws_verb('Robot/setAutoMoveRate', pct)
+        self.get_logger().info(f'Robot/setAutoMoveRate db={pct}%% (SOURCE-ONLY) ok={ok}')
+
+    def _op_clear_error(self, _d):
+        # CAPTURED via HAR (used to stop the ~3 Hz publish/Error
+        # reflood mid-capture). Symmetric to /robot/power_command
+        # action=clear_alarm, but stays on this move-gate path so
+        # program flows can clear + retry without also being
+        # allowed to switchOn.
+        ok = self._ws_verb('System/ClearError')
+        self.get_logger().info(f'System/ClearError sent (program-path) ok={ok}')
 
     # ── Jog write path ─────────────────────────────────────────
 
@@ -2077,6 +2398,13 @@ class EstunCodroidDriver(Node):
             'allow_cart_source': self._allow_cart_source,
             'allow_power':    self._allow_power,
             'allow_power_source': self._allow_power_source,
+            'allow_move':     self._allow_move,
+            'allow_move_source': self._allow_move_source,
+            'program_state':  self._prog_state,
+            'program_project_id': self._prog_project_id,
+            'program_task':   self._prog_task,
+            'program_line':   self._prog_line,
+            'program_is_step': self._prog_is_step,
             'jog_speed_cap':         self._jog_speed_cap,
             'operator_speed_limit':  self._operator_speed_limit,
             'effective_speed_cap':   self._effective_speed_cap,
@@ -2236,9 +2564,64 @@ class EstunCodroidDriver(Node):
             self._on_status(db)
         elif topic == 'Error':
             self._on_error(db)
-        # Other topics (WebCommand, ProjectState, RobotCoordinate,
-        # ProjectStatus, web) are captured in the raw log but not
-        # otherwise processed in this telemetry mirror.
+            # Dedup + publish on transitions. See program_ops.ErrorDedup
+            # docstring — the ~3 Hz reflood collapses to one event per
+            # unique (code, unix_ts) key.
+            evt = self._prog_err_dedup.observe(db)
+            if evt.get('changed'):
+                self._prog_last_error = evt.get('entry')
+                self._publish_program_status(source='error_' + evt['kind'])
+        elif topic == 'ProjectState':
+            self._on_project_state(db)
+        # Other topics (WebCommand, RobotCoordinate, ProjectStatus, web)
+        # are captured in the raw log but not otherwise processed in
+        # this telemetry mirror.
+
+    def _on_project_state(self, db):
+        """publish/ProjectState — see program_ops.parse_project_state
+        for the shape parser. Two frame variants inside state==2:
+        the first carries the project id, subsequent frames blank it
+        and carry scripts.{task}.line instead. We persist the id
+        across the transition so the dashboard sees a stable
+        program_id for the whole run."""
+        from estun_driver.program_ops import parse_project_state
+        parsed, new_prev = parse_project_state(db, self._prog_project_id)
+        if not parsed:
+            return
+        self._prog_project_id = new_prev
+        prev_state = self._prog_state
+        self._prog_state = parsed['state']
+        self._prog_task = parsed['task'] or self._prog_task
+        self._prog_line = parsed['line'] if parsed['line'] is not None else self._prog_line
+        self._prog_is_step = parsed['is_step']
+        self._prog_last_update_ts = time.time()
+        if prev_state != self._prog_state:
+            self.get_logger().info(
+                f'ProjectState: state {prev_state} → {self._prog_state} '
+                f'(project={self._prog_project_id!r} task={self._prog_task!r} '
+                f'line={self._prog_line} isStep={self._prog_is_step})')
+            # State-transition frames are the interesting ones — line-tick
+            # frames within a running program get published too but as
+            # incremental updates that the dashboard can dedup by line.
+        self._publish_program_status(source='projectstate')
+
+    def _publish_program_status(self, source: str = ''):
+        """Emit a snapshot of the program-execution state to
+        /estun/program_status. Called on ProjectState transitions and
+        Error dedup events."""
+        m = String()
+        m.data = json.dumps({
+            'event': 'status',
+            'source': source,
+            'state': self._prog_state,
+            'project_id': self._prog_project_id,
+            'task': self._prog_task,
+            'line': self._prog_line,
+            'is_step': self._prog_is_step,
+            'error': self._prog_last_error,
+            'ts': time.time(),
+        }, separators=(',', ':'))
+        self._pub_program.publish(m)
 
     def _on_error(self, db):
         """publish/Error — db is a list of active alarms (empty when none).
@@ -2652,6 +3035,32 @@ class EstunCodroidDriver(Node):
         self._disconnect()
         self._close_ws_log()
         super().destroy_node()
+
+
+# Dispatch table for /estun/program ops. Populated after the class is
+# defined so each entry references a bound method on the instance
+# (called as handler(self, d) — see _on_program_command).
+_PROGRAM_OP_HANDLERS = {
+    'save':              EstunCodroidDriver._op_save,
+    'run':               EstunCodroidDriver._op_run,
+    'step':              EstunCodroidDriver._op_runstep,
+    'runstep':           EstunCodroidDriver._op_runstep,
+    'stop':              EstunCodroidDriver._op_stop,
+    'pause':             EstunCodroidDriver._op_pause,
+    'resume':            EstunCodroidDriver._op_resume,
+    'set_start_line':    EstunCodroidDriver._op_set_start_line,
+    'clear_start_line':  EstunCodroidDriver._op_clear_start_line,
+    'set_breakpoint':    EstunCodroidDriver._op_set_breakpoint,
+    'set_breakpoints':   EstunCodroidDriver._op_set_breakpoint,
+    'clear_breakpoint':  EstunCodroidDriver._op_clear_breakpoint,
+    'clear_breakpoints': EstunCodroidDriver._op_clear_breakpoint,
+    'to_auto':           EstunCodroidDriver._op_to_auto,
+    'to_manual':         EstunCodroidDriver._op_to_manual,
+    'set_move_rate':     EstunCodroidDriver._op_set_move_rate,
+    'set_manual_rate':   EstunCodroidDriver._op_set_move_rate,
+    'set_auto_rate':     EstunCodroidDriver._op_set_auto_rate,
+    'clear_error':       EstunCodroidDriver._op_clear_error,
+}
 
 
 def main(args=None):
