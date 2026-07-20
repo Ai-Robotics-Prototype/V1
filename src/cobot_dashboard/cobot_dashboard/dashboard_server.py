@@ -4721,6 +4721,40 @@ if FASTAPI_AVAILABLE:
             return False
         return True
 
+    def _validate_step_point_refs(steps, points):
+        """Return a per-step message list for any step whose point_name
+        doesn't resolve in the program's points table. Empty list on
+        success. Used by BOTH POST and PUT so a save that would produce
+        a program that can't run also can't slip past the write.
+
+        Rule: a step CAN carry a point_name; if it does, that name MUST
+        appear in points with a 6-element joints array. A step with no
+        point_name AND no taught_joints is a legitimate placeholder
+        (operator hasn't taught it yet — that's captured by
+        has_taught_poses:false on read, not blocked here)."""
+        issues = []
+        pts = points or {}
+        for i, s in enumerate(steps):
+            if not isinstance(s, dict):
+                continue
+            pn = s.get("point_name")
+            if not pn:
+                continue
+            p = pts.get(pn)
+            joints = (p or {}).get("joints")
+            if not (isinstance(joints, list) and len(joints) == 6):
+                issues.append({
+                    "step_index": i,
+                    "step_label": s.get("label") or s.get("action") or f"step {i+1}",
+                    "point_name": pn,
+                    "reason": f"references point {pn!r} which is not taught "
+                              f"in this program's points table",
+                    "hint": "Either teach it (Points panel → 📌 Teach current pose "
+                            f"then rename to {pn!r}) OR repoint this step to a "
+                            "taught point.",
+                })
+        return issues
+
     @app.post("/api/programs")
     async def api_programs_save(request: Request):
         """Persist a wizard-generated program to /opt/cobot/programs as a
@@ -4737,6 +4771,27 @@ if FASTAPI_AVAILABLE:
         steps = body.get("steps") or []
         if not isinstance(steps, list):
             return JSONResponse({"error": "steps must be a list"}, status_code=400)
+        # Step→point reference validation. A step that names a point but
+        # the point isn't in the program's points{} table blocks the save
+        # with a specific, actionable error listing which step + which
+        # missing point + how to fix. The blocked message replaces the
+        # generic frontend "Error" badge with human-readable text.
+        points_in = body.get("points") or {}
+        step_issues = _validate_step_point_refs(steps, points_in)
+        if step_issues:
+            return JSONResponse({
+                "error": (
+                    "This program has steps that reference untaught points. "
+                    + "; ".join(
+                        f"Step {it['step_index']+1} ({it['step_label']}) "
+                        f"references point {it['point_name']!r} which has "
+                        "not been taught"
+                        for it in step_issues)
+                    + ". Teach those points (Points panel → 📌 Teach current "
+                      "pose then rename) or repoint the steps."
+                ),
+                "step_issues": step_issues,
+            }, status_code=422)
         # Slug: lowercase alnum only. "New Program" → "newprogram";
         # "My Palletize Task 3" → "mypalletizetask3". Collisions get
         # a numeric suffix ("newprogram2") without an underscore
@@ -4840,6 +4895,25 @@ if FASTAPI_AVAILABLE:
                 prog = json.load(f)
         except Exception as e:
             return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
+        # Same step→point validation as POST. Uses the merged view of
+        # steps + points (incoming overrides existing) so a PUT that
+        # ADDS a bad point_name reference is blocked with the specific
+        # message.
+        merged_steps  = body.get("steps",  prog.get("steps")  or [])
+        merged_points = body.get("points", prog.get("points") or {})
+        step_issues = _validate_step_point_refs(merged_steps, merged_points)
+        if step_issues:
+            return JSONResponse({
+                "error": (
+                    "This update would leave steps referencing untaught points. "
+                    + "; ".join(
+                        f"Step {it['step_index']+1} ({it['step_label']}) → "
+                        f"point {it['point_name']!r} not taught"
+                        for it in step_issues)
+                    + ". Teach those points or repoint the steps."
+                ),
+                "step_issues": step_issues,
+            }, status_code=422)
         for k in ("name", "description", "tags", "config", "steps", "cell_id"):
             if k in body:
                 prog[k] = body[k]
@@ -4889,6 +4963,80 @@ if FASTAPI_AVAILABLE:
         except Exception as e:
             return JSONResponse({"error": f"delete failed: {e}"}, status_code=500)
         return {"ok": True}
+
+    @app.post("/api/programs/{prog_id}/rename")
+    async def api_programs_rename(prog_id: str, request: Request):
+        """Migrate a program to a controller-safe slug. Body: {new_name}.
+        The new slug is derived from new_name via the same regex the
+        POST endpoint uses (lowercase-alnum only, no underscore); the
+        endpoint refuses if the target already exists.
+
+        Preserves steps + points + config + source + tags + created
+        timestamp. Bumps updated. Rewrites the id field. Deletes the
+        old file only on successful new-file write (atomic-ish; a
+        crash between the two calls leaves BOTH files present but
+        with the same content, which is safe to clean up manually).
+
+        Also supports reaching an underscored old file that
+        /api/programs/{id} routes normally can't reach — we bypass
+        _prog_path here and open the raw candidate path so the
+        operator can migrate programs stuck under the old naming
+        scheme (rare cleanup path).
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        new_name = str(body.get("new_name") or "").strip()
+        if not new_name:
+            return JSONResponse({"error": "new_name required"}, status_code=400)
+
+        # Path resolution bypass — allow underscored ids for the
+        # source (we're migrating AWAY from them). Still strict about
+        # traversal: the id must contain only [a-z0-9_] and produce a
+        # path inside _PROG_DIR.
+        _migrate_re = _prog_re.compile(r'^[a-z0-9_]+$')
+        if not _migrate_re.match(prog_id or ''):
+            return JSONResponse({"error": "invalid source id"}, status_code=400)
+        src = os.path.join(_PROG_DIR, prog_id + '.json')
+        if not os.path.isfile(src):
+            return JSONResponse({"error": "not found"}, status_code=404)
+
+        new_slug = _prog_re.sub(r'[^a-z0-9]+', '', new_name.lower()) or 'program'
+        n = 2
+        candidate = new_slug
+        while os.path.exists(os.path.join(_PROG_DIR, candidate + '.json')):
+            if candidate == prog_id:
+                # Target IS the source (name didn't actually change).
+                return JSONResponse({"error": "new_name resolves to the same slug"},
+                                    status_code=409)
+            candidate = f"{new_slug}{n}"
+            n += 1
+        dst = os.path.join(_PROG_DIR, candidate + '.json')
+
+        try:
+            with open(src) as f:
+                prog = json.load(f)
+        except Exception as e:
+            return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
+        prog["id"] = candidate
+        prog["name"] = new_name
+        prog["updated"] = _now_stamp()
+
+        try:
+            with open(dst, 'w') as f:
+                json.dump(prog, f, indent=2)
+        except Exception as e:
+            return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
+        try:
+            os.remove(src)
+        except Exception:
+            # Non-fatal: the new file exists, the operator can clean up
+            # the old one manually. Preferable to a rollback that
+            # deletes the new file after a successful write.
+            pass
+        return {"ok": True, "old_id": prog_id, "new_id": candidate,
+                "program": prog}
 
     # ------------------------------------------------------------------
     # Point table — teach + manage taught poses per program.

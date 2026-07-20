@@ -2208,6 +2208,14 @@ export default function ProgramEditor() {
   const [dragOverId, setDragOverId]         = useState(null)
   const [dragOverPos, setDragOverPos]       = useState(null)
   const [saveStatus, setSaveStatus]         = useState(null)
+  // Save-error text. Populated from the backend response body's
+  // `error` field on any non-ok response (was previously discarded —
+  // a 404 or 422 would flash a generic red "Error" badge with no
+  // reason. Now the operator sees the specific message: "Step 2
+  // (Move Linear) references point 'p1' which has not been taught",
+  // "program id 'test_program' can't round-trip on the controller",
+  // etc.).
+  const [saveError, setSaveError] = useState(null)
   const [showLoadMenu, setShowLoadMenu]     = useState(false)
   // Sequential "Teach All" walk-through. -1 = idle, otherwise the
   // index into steps[] the operator is currently teaching.
@@ -2601,24 +2609,48 @@ export default function ProgramEditor() {
       const data = await res.json().catch(() => ({}))
       if (res.ok && data && data.ok && data.program) {
         setCurrentProgram({ id: data.program.id, name: data.program.name || name, unsaved: false })
-        // Mirror to backend STATE so the task runner sees the just-
-        // saved program when the user clicks Run.
         setProgramSteps(steps)
-        // Refresh the shared programs list so ProgramLibrary sees
-        // the just-saved program WITHOUT waiting for its next
-        // mount-fetch. The store throttles within 500 ms but
-        // this is a force-refresh — the operator just changed
-        // the backend, we want the cache current immediately.
         refreshPrograms?.()
         setSaveStatus('saved')
+        setSaveError(null)
         setTimeout(() => setSaveStatus(null), 2000)
+      } else if (res.status === 404 && programId) {
+        // Stale-id case: currentProgram carries an id whose file
+        // isn't on disk (deleted OR the id was authored under the
+        // old underscored-slug regime and now fails _PROG_ID_RE).
+        // Auto-fallback: retry as POST so the operator's edits
+        // don't get lost. A fresh slug will be minted from the
+        // current name.
+        const retry = await fetch('/api/programs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }, body,
+        })
+        const rdata = await retry.json().catch(() => ({}))
+        if (retry.ok && rdata.ok && rdata.program) {
+          setCurrentProgram({
+            id: rdata.program.id, name: rdata.program.name || name,
+            unsaved: false,
+          })
+          setProgramSteps(steps)
+          refreshPrograms?.()
+          setSaveStatus('saved')
+          setSaveError(`Saved as ${rdata.program.id} (previous id ${programId} no longer exists — the file was recreated with a fresh slug).`)
+          setTimeout(() => setSaveStatus(null), 4000)
+        } else {
+          setSaveStatus('error')
+          setSaveError(rdata?.error
+            || `Save-as-new fallback also failed (HTTP ${retry.status})`)
+        }
       } else {
         setSaveStatus('error')
-        setTimeout(() => setSaveStatus(null), 3000)
+        setSaveError(
+          data?.error
+          || `Save failed (HTTP ${res.status}${data?.step_issues ? '; see step details' : ''})`
+        )
       }
-    } catch {
+    } catch (e) {
       setSaveStatus('error')
-      setTimeout(() => setSaveStatus(null), 3000)
+      setSaveError(`Network error: ${e?.message || e}`)
     }
   }
 
@@ -2726,6 +2758,7 @@ export default function ProgramEditor() {
         </span>
 
         <button onClick={handleSave} disabled={!unsaved || saveStatus === 'saving'}
+          title={saveError || (unsaved ? 'Save the current program' : 'No unsaved changes')}
           style={{
             padding: '6px 14px', fontSize: 12, fontWeight: 600,
             background: saveStatus === 'saved' ? '#16A34A'
@@ -2741,6 +2774,57 @@ export default function ProgramEditor() {
             : saveStatus === 'error' ? 'Error'
             : unsaved ? 'Save' : 'Saved'}
         </button>
+
+        {/* Rename affordance for programs whose id can't round-trip
+            through the controller (any id containing anything but
+            [a-z0-9] — the controller splits underscores as path
+            separators; see 2026-07-20 alarm 10001 bug). Only shown
+            when the program has actually been saved (has an id) AND
+            the id fails the round-trip test. */}
+        {currentProgram?.id && !/^[a-z0-9]+$/.test(currentProgram.id) && (
+          <button
+            onClick={async () => {
+              const suggested = (currentProgram.name || currentProgram.id)
+                .toLowerCase().replace(/[^a-z0-9]+/g, '')
+              const newName = window.prompt(
+                `Program id "${currentProgram.id}" contains characters the controller ` +
+                `can't round-trip (only [a-z0-9] work). Enter a new name — it will ` +
+                `be re-slugged to a safe id.`,
+                suggested || currentProgram.name || 'newprogram')
+              if (newName) {
+                const result = await useStore.getState().renameProgram(currentProgram.id, newName)
+                if (result) {
+                  setSaveError(null)
+                  setSaveStatus('saved')
+                  setTimeout(() => setSaveStatus(null), 3000)
+                }
+              }
+            }}
+            title="Migrate this program to a controller-safe id (letters + digits only)"
+            style={{
+              padding: '6px 12px', fontSize: 12, fontWeight: 600,
+              background: '#B45309', color: '#fff',
+              border: 'none', borderRadius: 6, cursor: 'pointer', flexShrink: 0,
+            }}>
+            Rename to controller-safe id
+          </button>
+        )}
+
+        {/* Inline save-error text. Replaces the previously-silent
+            "Error" badge with the specific server response (e.g.
+            "Step 2 (Move Linear) references point 'p1' which has
+            not been taught"). Auto-clears when the operator clicks
+            Save successfully. */}
+        {saveError && saveStatus === 'error' && (
+          <div style={{
+            padding: '4px 10px', fontSize: 11, color: '#7F1D1D',
+            background: '#FEE2E2', border: '1px solid #DC2626',
+            borderRadius: 6, maxWidth: 480, lineHeight: 1.4,
+            flexShrink: 1, minWidth: 0,
+          }}>
+            {saveError}
+          </div>
+        )}
 
         <div style={{ flexShrink: 0 }}>
           <button ref={loadBtnRef} onClick={openLoadMenu}

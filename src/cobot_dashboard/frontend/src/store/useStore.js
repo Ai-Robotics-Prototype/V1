@@ -496,6 +496,46 @@ const storeDefinition = (set, get) => ({
   // Fetches the current version of the currently-loaded program from
   // the server and merges into currentProgram (so points + steps +
   // has_taught_poses stay in sync after any teach/rename/delete).
+  // Rename a program to a controller-safe slug. Server derives the
+  // new id from newName (lowercase-alnum-only). On success, updates
+  // currentProgram so the editor picks up the new id + name without
+  // needing a reload. Used by the "Rename to controller-safe id"
+  // affordance next to Save when currentProgram.id contains an
+  // underscore or otherwise fails the ^[a-z0-9]+$ round-trip test.
+  async renameProgram(oldId, newName) {
+    if (!oldId || !newName) return null
+    try {
+      const res = await fetch(`/api/programs/${encodeURIComponent(oldId)}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ new_name: newName }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || !data.ok) {
+        get().addToast(data?.error || `rename failed (HTTP ${res.status})`, 'warning')
+        return null
+      }
+      // Load the renamed file (which may have gained a numeric suffix
+      // if the target slug already existed) into currentProgram.
+      get().setCurrentProgram({
+        id: data.program.id, name: data.program.name,
+        description: data.program.description || '',
+        steps: data.program.steps || [],
+        config: data.program.config || {}, tags: data.program.tags || [],
+        cell_id: data.program.cell_id || null,
+        points: data.program.points || {},
+        source: data.program.source,
+        unsaved: false,
+      })
+      get().refreshPrograms?.()
+      get().addToast(`Renamed ${oldId} → ${data.program.id}`, 'success')
+      return data.program
+    } catch (e) {
+      get().addToast(`Network error during rename: ${e?.message || e}`, 'warning')
+      return null
+    }
+  },
+
   async _refreshCurrentProgram() {
     const id = get().currentProgram?.id
     if (!id) return
