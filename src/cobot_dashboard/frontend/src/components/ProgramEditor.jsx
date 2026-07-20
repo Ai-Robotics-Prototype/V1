@@ -2767,9 +2767,21 @@ export default function ProgramEditor() {
         </div>
 
         <button onClick={() => setCurrentProgram({
+          // Full blank template — every field explicitly reset so a
+          // previously-loaded PBD program's config.pbd_metadata / tags
+          // / description can't leak into what looks like a fresh
+          // hand-authored program. setCurrentProgram MERGES; passing
+          // the full shape here is what forces a clean slate.
           id: null,
           name: 'New Program',
+          description: '',
           steps: [],
+          config: {},
+          tags: [],
+          cell_id: null,
+          points: {},
+          source: 'manual',
+          has_taught_poses: false,
           unsaved: true,
         })}
           title="Start a blank program — Save creates a new file"

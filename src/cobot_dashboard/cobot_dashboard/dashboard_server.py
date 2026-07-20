@@ -4705,12 +4705,32 @@ if FASTAPI_AVAILABLE:
         source = str(body.get("source") or "manual")
         if source not in _PROG_SOURCES:
             source = "manual"
+
+        # Defense-in-depth against the ProgramEditor "New Program" merge
+        # leak (see 2026-07-20 bug: hand-created programs inherited the
+        # previously-loaded PBD draft's config.pbd_metadata + tags +
+        # description because the frontend's setCurrentProgram is a
+        # partial merge). Any program whose source is NOT "demonstration"
+        # gets its PBD-provenance markers scrubbed at ingress:
+        #   - config.pbd_metadata dropped
+        #   - tags 'pbd' / 'from_demonstration' / 'draft' removed
+        # A frontend already-fixed to send blank tags is unaffected;
+        # an older frontend or an out-of-band POST still can't smuggle
+        # PBD provenance into a manual save.
+        _PBD_TAG_MARKERS = {'pbd', 'from_demonstration', 'draft'}
+        cfg_in = body.get("config") or {}
+        tags_in = list(body.get("tags") or [])
+        if source != "demonstration":
+            if isinstance(cfg_in, dict) and 'pbd_metadata' in cfg_in:
+                cfg_in = {k: v for k, v in cfg_in.items() if k != 'pbd_metadata'}
+            tags_in = [t for t in tags_in if t not in _PBD_TAG_MARKERS]
+
         program = {
             "id":          slug,
             "name":        name,
             "description": str(body.get("description") or ""),
-            "tags":        list(body.get("tags") or []),
-            "config":      body.get("config") or {},
+            "tags":        tags_in,
+            "config":      cfg_in,
             "steps":       steps,
             "cell_id":     body.get("cell_id") or None,
             "source":      source,
@@ -4783,6 +4803,19 @@ if FASTAPI_AVAILABLE:
             prog["source"] = str(incoming_source)
         elif not prog.get("source"):
             prog["source"] = _infer_source(prog)
+
+        # Same PBD-marker scrub as POST (see comment there). Fires
+        # when the EFFECTIVE source is not demonstration — preserves
+        # config.pbd_metadata + PBD tags on genuine demo programs
+        # across edits (steps/name/description can still be edited
+        # on a PBD program without losing its provenance).
+        _PBD_TAG_MARKERS = {'pbd', 'from_demonstration', 'draft'}
+        if prog.get("source") != "demonstration":
+            cfg = prog.get("config") or {}
+            if isinstance(cfg, dict) and 'pbd_metadata' in cfg:
+                prog["config"] = {k: v for k, v in cfg.items() if k != 'pbd_metadata'}
+            tags = prog.get("tags") or []
+            prog["tags"] = [t for t in tags if t not in _PBD_TAG_MARKERS]
         try:
             with open(path, 'w') as f:
                 json.dump(prog, f, indent=2)
