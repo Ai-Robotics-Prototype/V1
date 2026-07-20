@@ -4262,6 +4262,34 @@ if FASTAPI_AVAILABLE:
             monitor_only = bool(r.get("monitor_only", True))
         operator_cap_pct = max(1, min(100, int(round(op_frac * 100))))
 
+        # Speed selection. The Monitor Run box overrides
+        # program.config.speed_pct — we clone the program in-memory and
+        # patch speed_pct so program_ops.codegen_lua_from_program's
+        # capping math (min(requested, operator_cap)) does the rest.
+        # Invalid values clamp to [1..100] with a note; the driver's
+        # operator_speed_limit still enforces the hard cap after that.
+        override_pct = None
+        raw_speed = body.get("run_speed_pct")
+        speed_note = None
+        if raw_speed is not None:
+            try:
+                override_pct = int(raw_speed)
+            except Exception:
+                speed_note = f"run_speed_pct not an integer ({raw_speed!r}); using program default"
+                override_pct = None
+            if override_pct is not None:
+                if override_pct < 1:
+                    speed_note = f"run_speed_pct {override_pct} < 1; clamped to 1"
+                    override_pct = 1
+                elif override_pct > 100:
+                    speed_note = f"run_speed_pct {override_pct} > 100; clamped to 100"
+                    override_pct = 100
+        if override_pct is not None:
+            program = dict(program)  # shallow copy
+            cfg = dict(program.get("config") or {})
+            cfg["speed_pct"] = override_pct
+            program["config"] = cfg
+
         try:
             from estun_driver import program_ops  # ladder-proven module
         except Exception as e:
@@ -4339,6 +4367,8 @@ if FASTAPI_AVAILABLE:
             "task_id":    task_id,
             "requested_pct":  int(program.get("config", {}).get(
                 "speed_pct") or program.get("speed_pct") or 10),
+            "override_pct":   override_pct,
+            "speed_note":     speed_note,
             "operator_cap_pct": operator_cap_pct,
             "effective_pct":  int(eff_pct),
             "points":     list(points.keys()),
@@ -4573,6 +4603,48 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({'error': f'write failed: {e}'}, status_code=500)
         return {'ok': True, 'program': new_prog}
 
+    # Program-provenance canonical values. The `source` field on
+    # /opt/cobot/programs/{id}.json records WHICH write path created
+    # the file — the Monitor screen renders a provenance badge from
+    # this so an operator can tell at a glance whether a program
+    # started life as a PBD demo, a hand-built manual build, or an
+    # imported file. Set at creation and preserved on update. If a
+    # program predates the field, _infer_source() below classifies
+    # it from surviving evidence (config.pbd_metadata, tags).
+    _PROG_SOURCES = ('demonstration', 'manual', 'imported')
+
+    def _infer_source(prog: dict) -> str:
+        """Read-time backfill for programs saved before the `source`
+        field existed. Classification order matters — a program with
+        pbd_metadata was authored by the PBD composer even if it
+        later got hand-edited, so demonstration wins over manual.
+        """
+        cfg = prog.get('config') or {}
+        tags = prog.get('tags') or []
+        if isinstance(cfg.get('pbd_metadata'), dict):
+            return 'demonstration'
+        if any(t in tags for t in ('pbd', 'from_demonstration')):
+            return 'demonstration'
+        return 'manual'
+
+    def _has_taught_poses(prog: dict) -> bool:
+        """A program has REAL taught poses if every motion step carries
+        a 6-element taught_joints AND taught=True. Used to strip the
+        stale "poses pending perception" caveat from a description when
+        the operator has finished teaching the poses that the PBD
+        draft flagged as placeholder."""
+        steps = prog.get('steps') or []
+        if not steps:
+            return False
+        for s in steps:
+            if s.get('type') in ('gripper',):
+                continue
+            j = s.get('taught_joints')
+            if not (isinstance(j, list) and len(j) == 6
+                    and s.get('taught') is True):
+                return False
+        return True
+
     @app.post("/api/programs")
     async def api_programs_save(request: Request):
         """Persist a wizard-generated program to /opt/cobot/programs as a
@@ -4599,6 +4671,14 @@ if FASTAPI_AVAILABLE:
             slug = f"{base}_{n}"
             n += 1
         ts = _now_stamp()
+        # Provenance: POST /api/programs is the MANUAL builder's write
+        # path (ProgramEditor.jsx handleSave). Stamp source="manual"
+        # unless the caller explicitly supplied one (imports may set
+        # "imported"; the /api/pbd/{demo_id}/correct path stamps
+        # "demonstration" through the branch below).
+        source = str(body.get("source") or "manual")
+        if source not in _PROG_SOURCES:
+            source = "manual"
         program = {
             "id":          slug,
             "name":        name,
@@ -4607,6 +4687,7 @@ if FASTAPI_AVAILABLE:
             "config":      body.get("config") or {},
             "steps":       steps,
             "cell_id":     body.get("cell_id") or None,
+            "source":      source,
             "created":     ts,
             "updated":     ts,
         }
@@ -4624,9 +4705,19 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({"error": "not found"}, status_code=404)
         try:
             with open(path) as f:
-                return json.load(f)
+                prog = json.load(f)
         except Exception as e:
             return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
+        # Provenance backfill for programs saved before the field
+        # existed. Non-persistent — a subsequent PUT with the correct
+        # source will overwrite it. `has_taught_poses` is a derived
+        # readonly hint the Monitor uses to suppress the stale
+        # "poses pending perception" caveat when the operator has
+        # finished teaching PBD-drafted placeholders.
+        if not prog.get("source"):
+            prog["source"] = _infer_source(prog)
+        prog["has_taught_poses"] = _has_taught_poses(prog)
+        return prog
 
     @app.put("/api/programs/{prog_id}")
     async def api_programs_update(prog_id: str, request: Request):
@@ -4655,6 +4746,17 @@ if FASTAPI_AVAILABLE:
         prog["updated"] = _now_stamp()
         if "created" not in prog:
             prog["created"] = prog["updated"]
+        # Provenance is preserved across updates. If missing (older
+        # file), backfill from the inference rules. The `source` field
+        # is only WRITABLE via update if the client explicitly sends
+        # one AND it's a canonical value — imports may need to override
+        # from "manual" to "imported", but a stray body field never
+        # relabels a demonstration as manual.
+        incoming_source = body.get("source")
+        if incoming_source and str(incoming_source) in _PROG_SOURCES:
+            prog["source"] = str(incoming_source)
+        elif not prog.get("source"):
+            prog["source"] = _infer_source(prog)
         try:
             with open(path, 'w') as f:
                 json.dump(prog, f, indent=2)
@@ -4924,6 +5026,14 @@ if FASTAPI_AVAILABLE:
                 "tags":        list(program.get('tags') or []) + ['from_demonstration'],
                 "config":      program.get('config') or {},
                 "steps":       list(program.get('steps') or []),
+                # PBD-corrected save path — source is authoritative
+                # here (the program originated from a recorded demo,
+                # even if the operator hand-corrected the intent and
+                # taught real poses afterward). Downstream backfill
+                # rules concur via config.pbd_metadata inference, but
+                # having the field explicit avoids the inference on
+                # every read.
+                "source":      "demonstration",
                 "created":     ts,
                 "updated":     ts,
             }

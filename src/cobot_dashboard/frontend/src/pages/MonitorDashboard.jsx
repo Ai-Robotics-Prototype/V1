@@ -719,6 +719,8 @@ export default function MonitorDashboard() {
   const resumeProgram  = useStore((s) => s.resumeProgram)
   const cancelProgram  = useStore((s) => s.cancelProgram)
   const robot          = useStore((s) => s.robot) || {}
+  const runSpeedPct    = useStore((s) => s.runSpeedPct)
+  const setRunSpeedPct = useStore((s) => s.setRunSpeedPct)
 
   // Change Program overlay state. The Program Library is rendered
   // inside a full-viewport modal here; onSelectProgram closes it and
@@ -861,6 +863,18 @@ export default function MonitorDashboard() {
             )}
           </div>
 
+          {/* Speed entry — editable integer % (1-100). Truth-in-UI:
+              driver caps at operator_speed_limit (typically 25%).
+              We show the effective % right next to the box so
+              entering above the cap doesn't silently accept an
+              unhonored value. The box selects WITHIN the cap and
+              follows automatically if operator_speed_limit rises. */}
+          <ProgramSpeedEntry
+            value={runSpeedPct}
+            setValue={setRunSpeedPct}
+            operatorCapFrac={robot?.operator_speed_limit}
+          />
+
           <div style={{ display: 'flex', gap: 10, marginTop: 20, flexWrap: 'wrap' }}>
             {status === 'paused' ? (
               <>
@@ -907,13 +921,31 @@ export default function MonitorDashboard() {
             </button>
           </div>
 
-          {/* Optional program description, below the step indicator
-              so the button row stays visible above the fold. */}
-          {currentProgram?.description && (
-            <div style={{ fontSize: 13, color: '#6b7280', marginTop: 12, lineHeight: 1.4 }}>
-              {currentProgram.description}
-            </div>
-          )}
+          {/* Provenance badge + description below the step indicator.
+              Badge reads from the authoritative `source` field on the
+              stored /opt/cobot/programs/{id}.json (also computed by
+              backend inference for pre-provenance-field files, so
+              older programs still get labeled correctly). Description
+              gets the stale "poses pending perception" caveat filtered
+              OUT when the backend flag has_taught_poses is true. */}
+          <ProgramProvenance program={currentProgram} />
+          {(() => {
+            const desc = currentProgram?.description
+            if (!desc) return null
+            // Strip the stale caveat when poses are actually taught.
+            // The backend sends has_taught_poses on the GET response;
+            // it's a snapshot boolean, not stored persistently.
+            const stripCaveat = currentProgram?.has_taught_poses === true
+            const filtered = stripCaveat
+              ? desc.replace(/^(?:PBD draft — |Generated from demonstration — )?poses pending perception\.\s*/i, '')
+              : desc
+            if (!filtered.trim()) return null
+            return (
+              <div style={{ fontSize: 13, color: '#6b7280', marginTop: 12, lineHeight: 1.4 }}>
+                {filtered.trim()}
+              </div>
+            )
+          })()}
         </div>
 
         {/* Top-right: compact 200×200 target part viewer.
@@ -1105,4 +1137,123 @@ function primaryBtn(bg, disabled) {
     borderRadius: 10, cursor: disabled ? 'not-allowed' : 'pointer',
     opacity: disabled ? 0.45 : 1,
   }
+}
+
+// Editable "Program speed" input + inline truth-in-UI effective %.
+// - Enter/blur commits (uses store.setRunSpeedPct which does the
+//   clamp + toast on invalid).
+// - Displays "X%" plain, OR "X% → effective Y%" if the driver's
+//   operator_speed_limit would cap it. The box's ceiling is 100 but
+//   the operator sees exactly what the driver will honor.
+// - When the driver isn't reporting (fresh page-load / disconnect),
+//   we conservatively assume a 25% cap so the display doesn't lie in
+//   the other direction.
+function ProgramSpeedEntry({ value, setValue, operatorCapFrac }) {
+  const [local, setLocal] = useState(String(value))
+
+  // Keep the input reflecting store changes (program load, toast-
+  // clamp). Only overwrite the visible text when it doesn't match
+  // the store — otherwise the user's mid-typing would flicker.
+  useEffect(() => {
+    if (String(value) !== local) setLocal(String(value))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value])
+
+  const capFrac = Number.isFinite(operatorCapFrac) ? operatorCapFrac : 0.25
+  const capPct  = Math.max(1, Math.min(100, Math.round(capFrac * 100)))
+  const eff     = Math.max(1, Math.min(capPct, value))
+  const capped  = value > capPct
+
+  const commit = () => {
+    const applied = setValue(local)
+    setLocal(String(applied))
+  }
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 10,
+      marginTop: 12,
+    }}>
+      <label style={{
+        fontSize: 12, color: '#6b7280',
+        fontWeight: 600, textTransform: 'uppercase',
+        letterSpacing: '0.05em',
+      }}>
+        Speed
+      </label>
+      <input
+        type="number"
+        min={1}
+        max={100}
+        step={1}
+        value={local}
+        onChange={(e) => setLocal(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commit() } }}
+        style={{
+          width: 72, padding: '6px 10px',
+          fontSize: 15, fontWeight: 600,
+          border: '1px solid #d1d5db', borderRadius: 8,
+          textAlign: 'right',
+        }}
+      />
+      <span style={{ fontSize: 13, color: '#6b7280' }}>%</span>
+      <span style={{
+        fontSize: 13, marginLeft: 6,
+        color: capped ? '#B45309' : '#059669',
+        fontWeight: 600,
+      }}>
+        {capped
+          ? `effective ${eff}% (driver cap ${capPct}%)`
+          : `effective ${eff}%`}
+      </span>
+    </div>
+  )
+}
+
+// Provenance badge + PBD-metadata detail row. Reads the `source`
+// field on the loaded program (backend backfills it via
+// _infer_source() for older files that predate the field). Color-
+// coded so a demonstration-derived program is visually distinct
+// from a hand-built one — matters most during authoring where an
+// operator might have loaded the wrong program.
+function ProgramProvenance({ program }) {
+  if (!program?.id) return null
+  const source = program.source || 'unknown'
+  const badgeStyle = {
+    demonstration: { bg: '#EDE9FE', border: '#7C3AED', text: '#5B21B6', label: 'Demonstration' },
+    manual:        { bg: '#ECFDF5', border: '#059669', text: '#065F46', label: 'Manual build' },
+    imported:      { bg: '#EFF6FF', border: '#2563EB', text: '#1E40AF', label: 'Imported' },
+    unknown:       { bg: '#F3F4F6', border: '#9CA3AF', text: '#4B5563', label: 'Unknown source' },
+  }[source] || { bg: '#F3F4F6', border: '#9CA3AF', text: '#4B5563', label: source }
+
+  const cfg = program.config || {}
+  const pbd = cfg.pbd_metadata || null
+  const detail = pbd?.demo_id ? `demo ${pbd.demo_id}` : null
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }}>
+      <span style={{
+        display: 'inline-block', padding: '3px 10px',
+        background: badgeStyle.bg,
+        border: `1px solid ${badgeStyle.border}`,
+        color: badgeStyle.text, borderRadius: 999,
+        fontSize: 12, fontWeight: 600,
+      }}>
+        {badgeStyle.label}
+      </span>
+      {detail && (
+        <span style={{ fontSize: 12, color: '#6b7280', fontFamily: 'monospace' }}>
+          {detail}
+        </span>
+      )}
+      {program.has_taught_poses === false && (
+        <span style={{
+          fontSize: 12, color: '#B45309', fontWeight: 600,
+          marginLeft: 6,
+        }}>
+          — poses pending
+        </span>
+      )}
+    </div>
+  )
 }

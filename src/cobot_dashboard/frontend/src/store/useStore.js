@@ -803,6 +803,20 @@ const storeDefinition = (set, get) => ({
   },
   setCurrentProgram(patch) {
     set((s) => ({ currentProgram: { ...s.currentProgram, ...patch } }))
+    // Reset runSpeedPct to whatever the newly-loaded program's config
+    // says, clamped 1..100. Only fires when the program's identity
+    // OR its config.speed_pct actually changed — editing a step
+    // without touching speed shouldn't reset the operator's manual
+    // speed selection. `patch.id` is the reliable identity marker
+    // (setCurrentProgram is used both for whole-program loads AND
+    // for {unsaved:true} field-level updates).
+    const cfg = patch?.config
+    if (patch?.id !== undefined || (cfg && 'speed_pct' in cfg)) {
+      const raw = Number(cfg?.speed_pct ?? patch?.speed_pct)
+      if (Number.isFinite(raw) && raw > 0) {
+        set({ runSpeedPct: Math.max(1, Math.min(100, Math.round(raw))) })
+      }
+    }
   },
 
   // Monitor "Run Program" confirm modal. The button opens this;
@@ -812,6 +826,44 @@ const storeDefinition = (set, get) => ({
   runModalOpen: false,
   openRunModal()  { set({ runModalOpen: true })  },
   closeRunModal() { set({ runModalOpen: false }) },
+
+  // Monitor speed entry (integer % 1..100). Truth-in-UI display: the
+  // driver's operator_speed_limit is the HARD cap; whatever the
+  // operator enters here is clamped to [1, 100] first (invalid values
+  // toast a clamp reason), then compared to the cap for display. The
+  // effective % is min(entered, operator_cap_pct). See
+  // RunProgramModal for the render + POST body wiring.
+  //
+  // Default 10 (safe conservative). Reset to program.config.speed_pct
+  // whenever a program is loaded via setCurrentProgram({config:…}).
+  // NOT persisted to localStorage — the operator's per-session choice
+  // shouldn't leak into a fresh page-load, and program-editor changes
+  // to speed_pct win.
+  runSpeedPct: 10,
+  setRunSpeedPct(rawInput) {
+    // Accepts numbers or strings. Non-numeric / empty → falls back to
+    // current value with an addToast('warning', …) so the operator
+    // sees WHY their entry didn't stick.
+    const cur = get().runSpeedPct
+    if (rawInput === '' || rawInput === null || rawInput === undefined) {
+      get().addToast('Speed must be an integer 1–100', 'warning')
+      set({ runSpeedPct: cur }); return cur
+    }
+    let n = Number(rawInput)
+    if (!Number.isFinite(n)) {
+      get().addToast(`Speed ${JSON.stringify(rawInput)} isn't a number (kept ${cur}%)`, 'warning')
+      set({ runSpeedPct: cur }); return cur
+    }
+    n = Math.round(n)
+    if (n < 1) {
+      get().addToast(`Speed ${n} clamped to 1%`, 'warning')
+      n = 1
+    } else if (n > 100) {
+      get().addToast(`Speed ${n} clamped to 100%`, 'warning')
+      n = 100
+    }
+    set({ runSpeedPct: n }); return n
+  },
 
   // Program-tab layout dimensions — kept in the store (and persisted)
   // so switching to another tab and back keeps the panels at the

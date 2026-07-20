@@ -377,11 +377,16 @@ def compose_program_draft(intent: StructuredIntent,
 
     numbered = [{**s, 'step': i + 1} for i, s in enumerate(steps)]
 
-    # Description summarises the source + caveat in one line so the
-    # Program Library row makes the draft-ness obvious without the
-    # operator opening the program.
+    # Description reflects the ACTUAL state of the draft. The
+    # "poses pending perception" caveat is included only while the
+    # poses truly are placeholders (which is always true at compose
+    # time — real joint values arrive when the operator teaches them
+    # in the wizard's review step, and dashboard_server strips this
+    # sentence on read once _has_taught_poses returns True). Provenance
+    # itself lives in the top-level `source` field on the saved
+    # program (see /api/pbd/{demo_id}/correct), not in the description.
     desc_lines = [
-        'Generated from demonstration — poses pending perception.',
+        'PBD draft — poses pending perception.',
     ]
     if intent.task_summary:
         desc_lines.append(intent.task_summary)

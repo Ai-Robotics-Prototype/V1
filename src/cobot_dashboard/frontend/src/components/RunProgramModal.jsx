@@ -31,6 +31,7 @@ export default function RunProgramModal() {
   const close          = useStore((s) => s.closeRunModal)
   const currentProgram = useStore((s) => s.currentProgram)
   const robot          = useStore((s) => s.robot) || {}
+  const runSpeedPct    = useStore((s) => s.runSpeedPct)
 
   const [phase, setPhase]   = useState('confirm')  // 'confirm' | 'running' | 'error' | 'ok'
   const [result, setResult] = useState(null)
@@ -52,12 +53,16 @@ export default function RunProgramModal() {
     ? currentProgram.steps.filter((s) => Array.isArray(s?.taught_joints)
                                           && s.taught_joints.length === 6).length
     : 0
+  // The Monitor speed input feeds runSpeedPct in the store; this
+  // modal reads from THAT (not program.config.speed_pct) so what
+  // the operator saw next to Run is exactly what confirm ships.
   const requestedPct = Number(
-    currentProgram?.config?.speed_pct ?? currentProgram?.speed_pct ?? 10
+    runSpeedPct ?? currentProgram?.config?.speed_pct ?? currentProgram?.speed_pct ?? 10
   )
   const operatorCapFrac = Number(robot?.operator_speed_limit ?? 0.25)
   const operatorCapPct  = Math.max(1, Math.min(100, Math.round(operatorCapFrac * 100)))
   const effectivePct    = Math.max(1, Math.min(operatorCapPct, requestedPct))
+  const isCapped        = requestedPct > operatorCapPct
 
   const allowMove   = !!robot.allow_move
   const monitorOnly = !!robot.monitor_only
@@ -98,7 +103,14 @@ export default function RunProgramModal() {
       const res = await fetch('/api/estun/program/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ program_id: currentProgram.id }),
+        body: JSON.stringify({
+          program_id: currentProgram.id,
+          // Send the operator's Monitor-entered speed. Backend clamps
+          // 1..100 then compares to operator_speed_limit for the hard
+          // cap. We already display the cap outcome in the modal so
+          // Confirm is a no-surprise action.
+          run_speed_pct: requestedPct,
+        }),
       })
       const body = await res.json()
       setResult(body)
@@ -153,7 +165,7 @@ export default function RunProgramModal() {
             </div>
             <div style={rowStyle}>
               <span style={{ color: '#6b7280' }}>Requested speed</span>
-              <span>{requestedPct}%</span>
+              <span>{requestedPct}%{isCapped ? ' (from Monitor input)' : ''}</span>
             </div>
             <div style={rowStyle}>
               <span style={{ color: '#6b7280' }}>Operator cap</span>
@@ -163,8 +175,11 @@ export default function RunProgramModal() {
               <span style={{ color: '#6b7280', fontWeight: 600 }}>
                 Effective speed
               </span>
-              <span style={{ fontWeight: 700, color: '#059669' }}>
-                {effectivePct}% (runs on REAL ARM)
+              <span style={{ fontWeight: 700, color: isCapped ? '#B45309' : '#059669' }}>
+                {isCapped
+                  ? `${effectivePct}% (capped from ${requestedPct}%)`
+                  : `${effectivePct}%`}
+                {' — runs on REAL ARM'}
               </span>
             </div>
             {!gateOK && (
@@ -215,7 +230,13 @@ export default function RunProgramModal() {
             </div>
             <div style={rowStyle}>
               <span style={{ color: '#6b7280' }}>effective_pct</span>
-              <span>{result.effective_pct}%</span>
+              <span>{result.effective_pct}%
+                {result?.speed_note && (
+                  <span style={{ color: '#B45309', marginLeft: 6 }}>
+                    ({result.speed_note})
+                  </span>
+                )}
+              </span>
             </div>
             <div style={rowStyle}>
               <span style={{ color: '#6b7280' }}>points</span>
