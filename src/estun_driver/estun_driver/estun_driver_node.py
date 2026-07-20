@@ -230,21 +230,19 @@ class EstunCodroidDriver(Node):
         self.declare_parameter('operator_speed_limit', 0.25)   # operationally-allowed ceiling
         self.declare_parameter('jog_heartbeat_s', 0.4)         # Robot/jogHeartbeat cadence
         # Freshness deadman: no refresh within this window → Robot/stopJog.
-        # 2026-07-17 measurement: under GIL contention on the dashboard
-        # process, the server-side keepalive native thread has been
-        # observed stalling up to 672 ms in a single burst (json.dumps
-        # of the 10 KB state blob competing for the GIL) — 2x the
-        # previous 300 ms deadman → phantom staleness stops
-        # mid-hold. 500 ms covers the observed p99 stall while still
-        # firing well before the controller's own heartbeat deadman
-        # (~1000 ms). The layered safety chain is UNCHANGED: browser
+        # 2026-07-17: bumped 0.3 → 0.5 to tolerate observed 672 ms
+        # dashboard-side GIL stalls (json.dumps of the 10 KB state blob
+        # starved the keepalive native thread mid-hold).
+        # 2026-07-20: reverted 0.5 → 0.3 after the source-side fixes
+        # landed (deepcopy+json.dumps offloaded onto a thread executor,
+        # state broadcast dropped to 8 Hz while a jog hold is active).
+        # With the stall source removed the tighter deadman is what we
+        # want; the 0.5 loosening was a workaround, not a design
+        # choice. The layered safety chain is UNCHANGED: browser
         # release → server publishes explicit stopJog (immediate);
-        # server crash → this 500 ms deadman fires; network stall →
-        # this deadman fires. The dashboard was also patched to
-        # offload deepcopy+json.dumps onto a thread executor + drop
-        # state broadcast to 8 Hz while a jog hold is active, which
-        # should keep the gap well under this threshold in normal ops.
-        self.declare_parameter('jog_freshness_timeout_s', 0.5)
+        # server crash → this deadman fires; network stall → this
+        # deadman fires.
+        self.declare_parameter('jog_freshness_timeout_s', 0.3)
         # Latency and safety-factor inputs to the SPEED-SCALED margin
         # formulas below. Values chosen from wire measurements:
         #   - posture RX → guard reaction takes ~150 ms (three 50 ms

@@ -124,7 +124,12 @@ estun_driver:
     # under 25 Hz starved the keepalive native thread mid-hold →
     # phantom staleness stops). Full rationale in the driver's
     # declare_parameter comment.
-    jog_freshness_timeout_s: 0.5
+    # 2026-07-20: reverted 0.5 → 0.3 now that the dashboard-side GIL
+    # source is fixed (serialization off-loop + 8 Hz broadcast during
+    # holds). The 0.5 loosening was a workaround for the stall, not
+    # a design choice — with the underlying stall gone the tighter
+    # deadman is what we want.
+    jog_freshness_timeout_s: 0.3
 
     # ── First-connect logging ────────────────────────────────────
     # Dumps every TX/RX WS frame to
