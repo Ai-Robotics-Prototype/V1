@@ -92,13 +92,14 @@ the captured no-db shape family (Robot/toAuto, project/clearStartLine,
 System/ClearError), so shape confidence is high; the outstanding
 question is behavior:
 
-| Verb | SOURCE shape | Confidence | First-live-test to run |
+| Verb | SOURCE shape | Confidence | Notes |
 |---|---|---|---|
-| `project/stop` | `{ty:"project/stop"}` | shape ✓ / behavior ✗ | See §5 |
-| `project/pause` | `{ty:"project/pause"}` | shape ✓ / behavior ✗ | Send during state=2, expect state stays 2 with isMoving falling to 0 |
-| `project/resume` | `{ty:"project/resume"}` | shape ✓ / behavior ✗ | Send after pause, expect motion to continue |
-| `project/runStep` | `{ty:"project/runStep", db:{id,task}}` | shape ✓ / behavior ✗ | Expect state=2 with `isStep:true` in ProjectState |
-| `project/clearBreakpoint` | `{ty:"project/clearBreakpoint"}` | shape ✓ / behavior ✗ | Send after setBreakpoint, expect the map to empty |
+| `project/stop` | `{ty:"project/stop"}` | **shape ✓ / behavior ✓** | Wire-proven rung 1 (2026-07-20): state 2 → 3 → 0, stop-ACK at ~214 ms, arm safe. |
+| `project/runStep` | see below | **shape ✓ / behavior ✓** | Wire-proven rung 2 (2026-07-20): TWO wire forms — initial `{ty,db:{id,task}}` enters step mode; advance `{ty,id:"1"}` (no db) executes one line. N+1 presses to walk N lines. |
+| `Robot/setAutoMoveRate` | `{ty:"Robot/setAutoMoveRate", db:<int %>}` | **shape ✓ / behavior ✓** | Wire-proven rung 2 (2026-07-20): ACK `db:null` RTT ~19 ms; program executed at requested rate. |
+| `project/pause` | `{ty:"project/pause"}` | shape ✓ / behavior ✗ | Send during state=2, expect state stays 2 with isMoving falling to 0. Not exercised this ladder. |
+| `project/resume` | `{ty:"project/resume"}` | shape ✓ / behavior ✗ | Observed on wire but conflated with "resume-of-step-mode = run-through" — clean pause/resume proof still pending. |
+| `project/clearBreakpoint` | `{ty:"project/clearBreakpoint"}` | shape ✓ / behavior ✗ | Send after setBreakpoint, expect the map to empty. Not exercised this ladder. |
 
 ### 2.3 Not a WS verb: `project/save`
 

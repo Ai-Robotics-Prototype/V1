@@ -134,41 +134,75 @@ is wire-proven.
 
 ## Rung 2 — Single-step through the 2-point program
 
-**Purpose:** exercise `setStartLine` + `project/runStep` semantics
-(SOURCE-ONLY) with real motion, one line at a time, so the operator
-retains stop control after every step.
+**Purpose:** exercise `setStartLine` + `project/runStep` semantics with
+real motion, one line at a time, so the operator retains stop control
+after every step.
 
 Uses the `roboaitest` program that's already saved on the controller
-(see §B). p1 is the current pose from the save test; p2 is p1 with
-+1° on J1. If the arm has moved since that save, re-teach and re-save
-before this rung (or accept that step 1's motion may be large).
+(see §B). p1 is the current pose at save time; p2 is p1 with +1° on J1.
+If the arm has moved since that save, re-teach and re-save before this
+rung (or accept that step 1's motion may be large).
+
+### Step semantics — N+1 presses to walk N lines
+
+`project/runStep` has TWO wire shapes with distinct semantics
+(mined + wire-proven this session; see PART_2C_ARCHITECTURE.md §2.2):
+
+1. **Initial** — `{ty:"project/runStep", db:{id,task}}` — ENTERS step
+   mode, positions the interpreter cursor at the start line, does NOT
+   execute anything yet.
+2. **Advance** — `{ty:"project/runStep", id:"1"}` (no db) — executes
+   the current line and moves the cursor forward one step. Fires the
+   `line` field on `publish/ProjectState` for the *new* cursor position.
+
+That means an N-line program takes **N+1 step presses** to walk end-to-
+end: one to enter step mode, then N to execute each line. This is the
+raw controller semantic. We deliberately DO NOT auto-batch the initial
++first-advance in the driver; that 1-press-per-line UX belongs in the
+dashboard layer later. The driver differentiates the two forms by
+whether `program_id` is present in the `/estun/program` payload:
+
+- `{op:"step", program_id:"…", task_id:"…"}` → **initial** (with-db)
+- `{op:"step"}` (no program_id) → **advance** (no-db)
+
+### Ladder
 
 ```bash
-# Set breakpoints empty, start at line 1, use setAutoMoveRate at 10%.
+# Common setup — auto mode, speed cap, empty breakpoints, cursor at line 1.
 ros2 topic pub -1 /estun/program std_msgs/String '{data: "{\"op\":\"to_auto\"}"}'
 ros2 topic pub -1 /estun/program std_msgs/String '{data: "{\"op\":\"set_auto_rate\",\"pct\":10}"}'
 ros2 topic pub -1 /estun/program std_msgs/String '{data: "{\"op\":\"set_breakpoint\",\"task_id\":\"main\",\"lines\":[]}"}'
 ros2 topic pub -1 /estun/program std_msgs/String '{data: "{\"op\":\"set_start_line\",\"line\":1}"}'
 
-# STEP 1: expected to be a near-no-op (p1 = current pose).
+# STEP 1 (initial, with-db) — enters step mode. NO motion. Cursor lands at line=1.
 ros2 topic pub -1 /estun/program std_msgs/String \
   '{data: "{\"op\":\"step\",\"program_id\":\"roboaitest\",\"task_id\":\"main\"}"}'
-# Watch program_status — expect state 2 → line advances → state 0 in <2 s.
 
-# STEP 2: J1 rotates +1° at 10% speed.
-# Physical J1 axis, current − 34.9° → −33.9°.
-ros2 topic pub -1 /estun/program std_msgs/String \
-  '{data: "{\"op\":\"step\",\"program_id\":\"roboaitest\",\"task_id\":\"main\"}"}'
-# Watch. If it does not stop cleanly at the end, STOP.
+# STEP 2 (advance, no-db) — executes line 1 = movJ(p1). No motion if p1=current.
+ros2 topic pub -1 /estun/program std_msgs/String '{data: "{\"op\":\"step\"}"}'
+
+# STEP 3 (advance, no-db) — executes line 2 = movJ(p2). J1 rotates +1° at 10%.
+ros2 topic pub -1 /estun/program std_msgs/String '{data: "{\"op\":\"step\"}"}'
 ```
 
-**Between steps, verify:**
+**Between presses, verify:**
 
-- `/estun/program_status` shows `state: 2` briefly during motion, then
-  `state: 0` — a clean idle transition means the controller's
-  interpreter honored the step boundary.
-- `is_step: true` on ProjectState frames during step motion.
-- `line` advances monotonically.
+- STEP 1: `/estun/program_status` shows `state=2, is_step=true, line=1`.
+  No motion. Cursor is parked *before* line 1.
+- STEP 2: `state=2, is_step=true, line=2`. Line 1 (`movJ(p1)`) executed;
+  motion visible only if p1 differs from the arm's actual pose.
+- STEP 3: line-tick briefly, then `state=0, is_step=false`. Line 2
+  (`movJ(p2)`) executed; **motion of +1° on J1** observed. Program end.
+
+**Failing behavior — any of:**
+
+- Wrong `line` advance (skip / stall / regress)
+- Motion doesn't match the executed movJ target
+- The controller faults mid-step (publish/Error non-empty, deduped
+  as `error_new` on `/estun/program_status`)
+
+If any: `{"op":"stop"}`, then `{"op":"clear_error"}`, and don't proceed
+to rung 3 until the failure mode is understood.
 
 ---
 

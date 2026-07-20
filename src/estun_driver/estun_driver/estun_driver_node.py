@@ -1129,15 +1129,37 @@ class EstunCodroidDriver(Node):
         self.get_logger().info(f'project/run sent pid={pid!r} tid={tid!r} ok={ok}')
 
     def _op_runstep(self, d):
-        # SOURCE-ONLY (verb + shape mined from JS bundle; behavior
-        # awaits live wire proof — see PART_2C_ARCHITECTURE.md §2.2).
-        pid = str(d.get('program_id', ''))
-        tid = str(d.get('task_id', ''))
-        if not pid or not tid:
-            self._reject('program', 'runStep: missing program_id/task_id')
-            return
-        ok = self._ws_verb('project/runStep', {'id': pid, 'task': tid})
-        self.get_logger().info(f'project/runStep sent (SOURCE-ONLY) ok={ok}')
+        # runStep has TWO wire shapes with distinct semantics, mined
+        # from the factory UI bundle:
+        #
+        #   1. Initial step (from idle, with program_id + task_id supplied):
+        #        {ty:"project/runStep", db:{id:<prid>, task:<tkid>}}
+        #      Called from the run popup "Step" button (JS: runSubmit(2)
+        #      → runStep(1)). Enters step mode.
+        #
+        #   2. Advance step (from paused-in-step, no program_id supplied):
+        #        {ty:"project/runStep", id:"1"}   (no db)
+        #      Called from the RunBar "Step" button while isStep=true
+        #      (JS: runStep(0)). Advances one step through the paused
+        #      program.
+        #
+        # We differentiate by presence of program_id in the /estun/program
+        # payload so callers can express both without a new op name.
+        pid = str(d.get('program_id', '')) if d.get('program_id') else ''
+        tid = str(d.get('task_id', '')) if d.get('task_id') else ''
+        if pid and tid:
+            # Initial: full envelope.
+            ok = self._ws_verb('project/runStep', {'id': pid, 'task': tid})
+            self.get_logger().info(
+                f'project/runStep(initial) db={{id:{pid!r},task:{tid!r}}} ok={ok}')
+        else:
+            # Advance: no db, id="1" (matches the wsSend variant used by
+            # the RunBar step button — the id="1" is a literal from the
+            # JS bundle, not our nonce).
+            frame = {'ty': 'project/runStep', 'id': '1'}
+            ok = self._send(frame)
+            self.get_logger().info(
+                f'project/runStep(advance) no-db ok={ok}')
 
     def _op_stop(self, _d):
         # SOURCE-ONLY. This is the verb that stops an autonomously-
