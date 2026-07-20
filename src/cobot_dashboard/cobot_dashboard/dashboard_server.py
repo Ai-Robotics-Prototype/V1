@@ -11,7 +11,7 @@ import struct
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Dual-import shim — matches inspection_helpers below. The systemd unit
@@ -1241,6 +1241,17 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             tcp = d.get("tcp_m")
             if isinstance(tcp, list) and len(tcp) == 6:
                 STATE["tcp_pose"] = list(tcp)
+            # Mirror the display-friendly units (deg / mm) into STATE.robot
+            # so the frontend Points panel and the Teach-current-pose flow
+            # can read them straight without a rad→deg conversion. Both
+            # are computed driver-side from the same source (fitted DH →
+            # tcp_mm, controller-published joints → joints_deg).
+            jd = d.get("joints_deg")
+            if isinstance(jd, list) and len(jd) == 6:
+                r["joints_deg"] = list(jd)
+            tm = d.get("tcp_mm")
+            if isinstance(tm, list) and len(tm) == 6:
+                r["tcp_mm"] = list(tm)
             # Estop — real robot is authoritative when connected
             if r["connected"] and "estop" in d:
                 STATE["safety"]["estop"] = bool(d["estop"])
@@ -4628,21 +4639,36 @@ if FASTAPI_AVAILABLE:
         return 'manual'
 
     def _has_taught_poses(prog: dict) -> bool:
-        """A program has REAL taught poses if every motion step carries
-        a 6-element taught_joints AND taught=True. Used to strip the
-        stale "poses pending perception" caveat from a description when
-        the operator has finished teaching the poses that the PBD
-        draft flagged as placeholder."""
+        """A program has REAL taught poses if every motion step either
+        (a) references a point by `point_name` that resolves in the
+        program.points dict, or (b) carries a 6-element taught_joints
+        with taught=True (backward-compat path used by PBD drafts
+        that predate the point-table schema).
+
+        Used to strip the stale "poses pending perception" caveat from
+        a description when the operator has finished teaching."""
         steps = prog.get('steps') or []
         if not steps:
+            # An empty program with an empty point table isn't
+            # "taught"; a program with at least one point defined
+            # counts as partial teaching so the Points panel shows
+            # them (the surrounding UI still gates run behind having
+            # steps).
             return False
+        points = prog.get('points') or {}
         for s in steps:
             if s.get('type') in ('gripper',):
                 continue
+            pn = s.get('point_name')
+            if pn and pn in points:
+                p = points[pn]
+                if isinstance(p.get('joints'), list) and len(p['joints']) == 6:
+                    continue
             j = s.get('taught_joints')
-            if not (isinstance(j, list) and len(j) == 6
+            if (isinstance(j, list) and len(j) == 6
                     and s.get('taught') is True):
-                return False
+                continue
+            return False
         return True
 
     @app.post("/api/programs")
@@ -4774,6 +4800,233 @@ if FASTAPI_AVAILABLE:
         except Exception as e:
             return JSONResponse({"error": f"delete failed: {e}"}, status_code=500)
         return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # Point table — teach + manage taught poses per program.
+    #
+    # Points live under a new top-level `points` dict on the program
+    # JSON:
+    #   points: {
+    #     "p1": {joints:[6 deg], tcp:[x,y,z,a,b,c mm/deg],
+    #            label:"Home", taught_at:"…Z"},
+    #     ...
+    #   }
+    # Steps can reference points by `point_name`; the ladder-proven
+    # program_ops.codegen_lua_from_program prefers this dict when
+    # present, falling back to steps[].taught_joints for backward
+    # compatibility with programs authored before this schema.
+    #
+    # SAFETY: teaching only RECORDS a pose. It never publishes to
+    # /estun/program, never opens a WS write, never touches the arm.
+    # No allow_move gate is required. The move-gate still governs Run
+    # exclusively — teach and run are separate authorities on purpose,
+    # so an integrator can shape a program with the gate closed and
+    # only open it when the operator is at the cell.
+    _POINT_NAME_RE = _prog_re.compile(r'^[A-Za-z][A-Za-z0-9_]{0,30}$')
+
+    def _snapshot_current_pose():
+        """Atomic pose snapshot from the driver's /estun/status mirror.
+        Returns (joints_deg, tcp_mm) or (None, None) if the driver has
+        never published — the endpoint refuses to teach in that case
+        rather than record zeros as a pose."""
+        with _state_lock:
+            r = STATE.get("robot") or {}
+            jd = r.get("joints_deg")
+            tm = r.get("tcp_mm")
+        if not (isinstance(jd, list) and len(jd) == 6
+                and all(isinstance(v, (int, float)) for v in jd)):
+            return None, None
+        # tcp is optional — the point table stores it for display
+        # only. movJ codegen uses joints only.
+        if not (isinstance(tm, list) and len(tm) == 6):
+            tm = None
+        else:
+            tm = [float(v) for v in tm]
+        return [float(v) for v in jd], tm
+
+    def _load_prog(prog_id):
+        path = _prog_path(prog_id)
+        if not path or not os.path.isfile(path):
+            return None, None
+        try:
+            with open(path) as f:
+                return json.load(f), path
+        except Exception:
+            return None, None
+
+    def _save_prog(prog, path):
+        prog["updated"] = _now_stamp()
+        with open(path, 'w') as f:
+            json.dump(prog, f, indent=2)
+
+    def _next_point_name(points):
+        """p1, p2, ... — skip any already taken so a renamed point
+        doesn't reappear as the next auto-name."""
+        n = 1
+        while f'p{n}' in points:
+            n += 1
+        return f'p{n}'
+
+    def _points_in_use(prog, name):
+        """Return the list of step indices that reference this point by
+        `point_name` (new schema). Used by DELETE to refuse removals
+        that would leave dangling references."""
+        used = []
+        for i, s in enumerate(prog.get("steps") or []):
+            if isinstance(s, dict) and s.get("point_name") == name:
+                used.append(i)
+        return used
+
+    def _bump_has_taught_poses(prog):
+        """No-op — has_taught_poses is a derived read-time flag on GET.
+        Kept as a named function so future authors don't inline
+        recompute-and-store logic here (which would silently drift)."""
+        return
+
+    @app.post("/api/programs/{prog_id}/points")
+    async def api_program_teach_point(prog_id: str, request: Request):
+        """Snapshot the arm's live pose and record it as a taught
+        point on the program. Body:
+            { label?: str, name?: str }
+        `name` auto-mints p1/p2/... if absent. `label` is a human
+        display string (rendered in the Points panel next to the
+        auto-name). If a name collides with an existing point, the
+        response is 409 — retach uses PUT."""
+        prog, path = _load_prog(prog_id)
+        if prog is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        joints, tcp = _snapshot_current_pose()
+        if joints is None:
+            return JSONResponse(
+                {"error": "no live pose — driver hasn't published joints_deg yet"},
+                status_code=503)
+
+        points = dict(prog.get("points") or {})
+        name = str(body.get("name") or "").strip() or _next_point_name(points)
+        if not _POINT_NAME_RE.match(name):
+            return JSONResponse(
+                {"error": f"invalid point name {name!r} — expected letters/digits/_ starting with a letter"},
+                status_code=400)
+        if name in points:
+            return JSONResponse(
+                {"error": f"point {name!r} already exists — use PUT to re-teach"},
+                status_code=409)
+
+        label = body.get("label")
+        if label is not None:
+            label = str(label)[:80]
+
+        points[name] = {
+            "joints":   joints,
+            "tcp":      tcp,           # may be None
+            "label":    label,
+            "taught_at": datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+        }
+        prog["points"] = points
+        _save_prog(prog, path)
+
+        return {"ok": True, "point": points[name] | {"name": name},
+                "program": prog}
+
+    @app.put("/api/programs/{prog_id}/points/{name}")
+    async def api_program_update_point(prog_id: str, name: str, request: Request):
+        """Re-teach (snapshot current pose into an existing point) OR
+        rename OR relabel. Body fields (all optional):
+            retach:   true → overwrite joints/tcp with current pose
+            label:    new label
+            new_name: rename (validated + collision-checked; updates
+                      step.point_name references atomically)
+        Sending an empty body is a no-op that just returns the current
+        program.
+        """
+        prog, path = _load_prog(prog_id)
+        if prog is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        points = dict(prog.get("points") or {})
+        if name not in points:
+            return JSONResponse({"error": f"point {name!r} not found"},
+                                status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        pt = dict(points[name])
+
+        if body.get("retach"):
+            j, t = _snapshot_current_pose()
+            if j is None:
+                return JSONResponse(
+                    {"error": "no live pose to retach with"},
+                    status_code=503)
+            pt["joints"] = j
+            pt["tcp"] = t
+            pt["taught_at"] = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
+        if "label" in body:
+            lab = body["label"]
+            pt["label"] = str(lab)[:80] if lab is not None else None
+
+        new_name = body.get("new_name")
+        if new_name is not None:
+            nn = str(new_name).strip()
+            if nn != name:
+                if not _POINT_NAME_RE.match(nn):
+                    return JSONResponse(
+                        {"error": f"invalid new_name {nn!r}"},
+                        status_code=400)
+                if nn in points:
+                    return JSONResponse(
+                        {"error": f"point {nn!r} already exists"},
+                        status_code=409)
+                # Move the entry AND update step references so no step
+                # is left pointing at a dead name. Atomic with the file
+                # write below.
+                del points[name]
+                points[nn] = pt
+                for s in prog.get("steps") or []:
+                    if isinstance(s, dict) and s.get("point_name") == name:
+                        s["point_name"] = nn
+                name = nn
+            else:
+                points[name] = pt
+        else:
+            points[name] = pt
+
+        prog["points"] = points
+        _save_prog(prog, path)
+        return {"ok": True, "point": points[name] | {"name": name},
+                "program": prog}
+
+    @app.delete("/api/programs/{prog_id}/points/{name}")
+    async def api_program_delete_point(prog_id: str, name: str):
+        """Delete a taught point. Refuses (409) if any step references
+        the point by `point_name` — the operator has to either
+        re-target the step first or delete the step. This is the
+        block-or-reassign rule the operator asked for; auto-reassign
+        would be lossy (which point do we pick?) and silent point
+        drop would leave the program broken."""
+        prog, path = _load_prog(prog_id)
+        if prog is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        points = dict(prog.get("points") or {})
+        if name not in points:
+            return JSONResponse({"error": f"point {name!r} not found"},
+                                status_code=404)
+        in_use = _points_in_use(prog, name)
+        if in_use:
+            return JSONResponse(
+                {"error": f"point {name!r} in use by step(s) {in_use}",
+                 "in_use_by": in_use},
+                status_code=409)
+        del points[name]
+        prog["points"] = points
+        _save_prog(prog, path)
+        return {"ok": True, "program": prog}
 
     # ------------------------------------------------------------------
     # Programming by Demonstration (/api/pbd/*).

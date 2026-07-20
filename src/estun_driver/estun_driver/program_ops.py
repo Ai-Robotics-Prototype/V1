@@ -111,26 +111,57 @@ def codegen_lua_from_program(
     # line 1 (with inline trailing `--` comments for review context)
     # and put the header/trailer AFTER, not before. That way rung 2's
     # `setStartLine 1` puts the interpreter exactly on `movJ(p1)`.
+    #
+    # Two step-source paths land at the same movJ output:
+    #   1. program.points table + step.point_name  — the schema authored
+    #      via /api/programs/{id}/points. Preferred; the point is a
+    #      first-class reusable entity across steps.
+    #   2. step.taught_joints (legacy PBD-draft path). Kept for backward
+    #      compat; each such step gets its own auto-named point (p1,
+    #      p2, ...) unique to that step.
+    #
+    # Points from path (1) are emitted into varspoint under their
+    # AUTHORED names; path (2) uses point_prefix + index. If both a
+    # point_name and taught_joints are present on the same step, the
+    # named point wins (authored schema is authoritative).
+    program_points = program.get('points') or {}
     exec_lines: list[str] = []
-    idx = 0
+    fallback_idx = 0
+    used_named: set[str] = set()   # named points that got REFERENCED
     for step in steps:
-        taught = step.get('taught_joints')
         action = step.get('action', '?')
+        pn = step.get('point_name')
+        if pn and pn in program_points:
+            p = program_points[pn]
+            j = p.get('joints') or p.get('jp')
+            if not (isinstance(j, list) and len(j) == 6
+                    and all(isinstance(v, (int, float)) for v in j)):
+                exec_lines.append(f'-- skipped {action!r}: '
+                                  f'point {pn!r} has no valid joints')
+                continue
+            if pn not in used_named:
+                varspoint[pn] = _make_jp_point(j, pn)
+                used_named.add(pn)
+            joints_s = ', '.join(f'{float(v):+.3f}' for v in j)
+            exec_lines.append(f'movJ({pn})  -- step {action}  point={pn}  '
+                              f'joints=[{joints_s}]')
+            continue
+        taught = step.get('taught_joints')
         if not (isinstance(taught, list) and len(taught) == 6
                 and all(isinstance(v, (int, float)) for v in taught)):
-            # A skipped step keeps the line count aligned by emitting
-            # a `-- skipped` comment as its OWN line — the operator can
-            # still count lines in the file and correlate against the
-            # source program.
             exec_lines.append(f'-- skipped {action!r}: '
-                              f'no 6-element taught_joints (got {type(taught).__name__})')
+                              f'no point_name/points ref, no 6-el taught_joints '
+                              f'(got {type(taught).__name__})')
             continue
-        idx += 1
-        name = f'{point_prefix}{idx}'
+        fallback_idx += 1
+        name = f'{point_prefix}{fallback_idx}'
+        while name in program_points or name in used_named:
+            fallback_idx += 1
+            name = f'{point_prefix}{fallback_idx}'
         varspoint[name] = _make_jp_point(taught, name)
+        used_named.add(name)
         joints_s = ', '.join(f'{float(v):+.3f}' for v in taught)
-        # Trailing inline comment on the same line as the executable.
-        exec_lines.append(f'movJ({name})  -- step[{idx}] {action}  '
+        exec_lines.append(f'movJ({name})  -- step {action}  '
                           f'joints=[{joints_s}]')
 
     trailer = time.strftime(_LUA_TRAILER_FMT, time.localtime(time.time()))

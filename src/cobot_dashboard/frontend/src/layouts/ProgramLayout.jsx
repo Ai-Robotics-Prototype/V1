@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 import ProgramEditor from '../components/ProgramEditor'
+import PointsPanel from '../components/PointsPanel'
 import ArmViewer3D from '../components/ArmViewer3D'
 import JogControls from '../components/JogControls'
 
@@ -187,6 +188,8 @@ function JogPanel({ maximized }) {
   const cancelProgram= useStore((s) => s.cancelProgram)
   const task         = useStore((s) => s.task)
   const safety       = useStore((s) => s.safety)
+  const teachCurrentPose = useStore((s) => s.teachCurrentPose)
+  const hasProgram   = useStore((s) => !!s.currentProgram?.id)
 
   const [jogMode, setJogMode] = useState('cartesian')
   const [step, setStep]       = useState(1.0)
@@ -505,17 +508,23 @@ function JogPanel({ maximized }) {
           E-STOP
         </button>
         <button
-          title="Save current pose as a teach point (not yet wired)"
+          onClick={() => teachCurrentPose({})}
+          disabled={!hasProgram}
+          title={hasProgram
+            ? "Snapshot the arm's live pose as a new point (p1, p2, …) in this program's point table. Teach never moves the arm — the move gate governs Run only."
+            : 'Load or save a program first — teach writes into the current program'}
           style={{
             width: '100%',
             minWidth: actionMinW,
             padding: maximized ? '16px' : '12px',
             minHeight: actionMinH,
             fontSize: actionFont, fontWeight: 700,
-            background: '#2563EB', color: '#fff',
-            border: 'none', borderRadius: 8, cursor: 'pointer',
+            background: hasProgram ? '#2563EB' : '#9CA3AF',
+            color: '#fff',
+            border: 'none', borderRadius: 8,
+            cursor: hasProgram ? 'pointer' : 'not-allowed',
           }}>
-          Teach Position
+          📌 Teach Position
         </button>
       </div>
     </div>
@@ -643,8 +652,13 @@ export default function ProgramLayout() {
   if (expandedPanel === 'steps') {
     return (
       <PanelChrome expanded onToggle={() => setExpandedPanel(null)} title="Restore split layout">
-        <div style={{ width: '100%', height: '100%', overflow: 'hidden' }}>
-          <ProgramEditor />
+        <div style={{ width: '100%', height: '100%',
+                      display: 'flex', flexDirection: 'column',
+                      overflow: 'hidden', gap: 8, padding: 8 }}>
+          <PointsPanel />
+          <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
+            <ProgramEditor />
+          </div>
         </div>
       </PanelChrome>
     )
@@ -678,8 +692,13 @@ export default function ProgramLayout() {
             onToggle={() => setExpandedPanel('steps')}
             title="Expand the program steps panel"
           >
-            <div style={{ width: '100%', height: '100%', overflow: 'hidden' }}>
-              <ProgramEditor />
+            <div style={{ width: '100%', height: '100%',
+                          display: 'flex', flexDirection: 'column',
+                          overflow: 'hidden', gap: 8, padding: 8 }}>
+              <PointsPanel compact />
+              <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
+                <ProgramEditor />
+              </div>
             </div>
           </PanelChrome>
         </div>

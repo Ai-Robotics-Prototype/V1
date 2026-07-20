@@ -473,6 +473,157 @@ const storeDefinition = (set, get) => ({
     catch (_) { /* no-op */ }
   },
 
+  // Point-table teach flow. All calls are same-origin fetches to the
+  // dashboard's /api/programs/{id}/points endpoints; the backend
+  // snapshots the LIVE pose from the driver's /estun/status mirror
+  // atomically at teach time, so we don't have to pass joints from
+  // the client (avoids a client-server race on a fast operator).
+  //
+  // SAFETY: teach never publishes to /estun/program and never touches
+  // allow_move. The gate governs Run only. That separation is
+  // enforced backend-side by the endpoints living outside the
+  // gate check block.
+  async _pointsFetch(method, path, body = null) {
+    const opts = { method }
+    if (body !== null) {
+      opts.headers = { 'Content-Type': 'application/json' }
+      opts.body = JSON.stringify(body)
+    }
+    const res = await fetch(path, opts)
+    const data = await res.json().catch(() => ({}))
+    return { ok: res.ok, status: res.status, data }
+  },
+  // Fetches the current version of the currently-loaded program from
+  // the server and merges into currentProgram (so points + steps +
+  // has_taught_poses stay in sync after any teach/rename/delete).
+  async _refreshCurrentProgram() {
+    const id = get().currentProgram?.id
+    if (!id) return
+    try {
+      const res = await fetch('/api/programs/' + encodeURIComponent(id))
+      if (!res.ok) return
+      const full = await res.json()
+      if (full && full.id) {
+        get().setCurrentProgram({
+          id:         full.id,
+          name:       full.name,
+          description: full.description || '',
+          steps:      Array.isArray(full.steps) ? full.steps : get().currentProgram.steps,
+          config:     full.config || {},
+          tags:       Array.isArray(full.tags) ? full.tags : [],
+          points:     full.points || {},
+          source:     full.source,
+          has_taught_poses: full.has_taught_poses,
+        })
+      }
+    } catch (_) { /* silent — next tick refresh, if any, will retry */ }
+  },
+  async teachCurrentPose({ label } = {}) {
+    const id = get().currentProgram?.id
+    if (!id) {
+      get().addToast('Load or save a program first, then teach', 'warning')
+      return null
+    }
+    const { ok, status, data } = await get()._pointsFetch(
+      'POST', `/api/programs/${encodeURIComponent(id)}/points`,
+      label ? { label } : {})
+    if (!ok) {
+      const msg = data?.error || `teach failed (HTTP ${status})`
+      get().addToast(msg, 'warning')
+      return null
+    }
+    await get()._refreshCurrentProgram()
+    get().addToast(`Taught ${data.point.name}${label ? ' — ' + label : ''}`, 'success')
+    return data.point
+  },
+  async retachPoint(name) {
+    const id = get().currentProgram?.id
+    if (!id) return null
+    const { ok, status, data } = await get()._pointsFetch(
+      'PUT', `/api/programs/${encodeURIComponent(id)}/points/${encodeURIComponent(name)}`,
+      { retach: true })
+    if (!ok) {
+      get().addToast(data?.error || `re-teach failed (HTTP ${status})`, 'warning')
+      return null
+    }
+    await get()._refreshCurrentProgram()
+    get().addToast(`Re-taught ${name}`, 'success')
+    return data.point
+  },
+  async renamePoint(name, newName) {
+    const id = get().currentProgram?.id
+    if (!id) return null
+    if (!newName || newName === name) return null
+    const { ok, status, data } = await get()._pointsFetch(
+      'PUT', `/api/programs/${encodeURIComponent(id)}/points/${encodeURIComponent(name)}`,
+      { new_name: newName })
+    if (!ok) {
+      get().addToast(data?.error || `rename failed (HTTP ${status})`, 'warning')
+      return null
+    }
+    await get()._refreshCurrentProgram()
+    return data.point
+  },
+  async relabelPoint(name, label) {
+    const id = get().currentProgram?.id
+    if (!id) return null
+    const { ok, status, data } = await get()._pointsFetch(
+      'PUT', `/api/programs/${encodeURIComponent(id)}/points/${encodeURIComponent(name)}`,
+      { label: label || null })
+    if (!ok) {
+      get().addToast(data?.error || `relabel failed (HTTP ${status})`, 'warning')
+      return null
+    }
+    await get()._refreshCurrentProgram()
+    return data.point
+  },
+  async deletePoint(name) {
+    const id = get().currentProgram?.id
+    if (!id) return false
+    const { ok, status, data } = await get()._pointsFetch(
+      'DELETE', `/api/programs/${encodeURIComponent(id)}/points/${encodeURIComponent(name)}`)
+    if (!ok) {
+      if (status === 409 && Array.isArray(data?.in_use_by)) {
+        get().addToast(
+          `Can't delete ${name}: step(s) ${data.in_use_by.map(i => '#' + (i + 1)).join(', ')} still use it. Re-target or delete those steps first.`,
+          'warning')
+      } else {
+        get().addToast(data?.error || `delete failed (HTTP ${status})`, 'warning')
+      }
+      return false
+    }
+    await get()._refreshCurrentProgram()
+    return true
+  },
+  // Append a movJ step that references a taught point by name. The
+  // caller usually clicks a "+ Insert step" button next to a point
+  // in the Points panel — the fastest way to author "movJ p1; movJ p2".
+  async addMoveStepForPoint(name) {
+    const cp = get().currentProgram
+    if (!cp?.id) return false
+    const steps = Array.isArray(cp.steps) ? [...cp.steps] : []
+    steps.push({
+      action: 'move',
+      type:   'move',
+      label:  `Move to ${name}`,
+      point_name: name,
+      taught: true,
+      id:     Date.now(),
+    })
+    // Save via PUT so the change is durable AND the backend's
+    // has_taught_poses recomputes for us on the next refresh.
+    const { ok, status, data } = await get()._pointsFetch(
+      'PUT', `/api/programs/${encodeURIComponent(cp.id)}`,
+      { steps, name: cp.name, description: cp.description || '' })
+    if (!ok) {
+      get().addToast(data?.error || `add-step failed (HTTP ${status})`, 'warning')
+      return false
+    }
+    await get()._refreshCurrentProgram()
+    get().addToast(`Added step: movJ(${name})`, 'success')
+    return true
+  },
+
   // ---------------------------------------------------------------------------
   // Jog commands
   // ---------------------------------------------------------------------------
@@ -800,6 +951,12 @@ const storeDefinition = (set, get) => ({
     description: '',
     tags: [],
     cell_id: null,
+    // Taught-point table — {name: {joints[6 deg], tcp[6], label, taught_at}}.
+    // Populated by /api/programs/{id}/points endpoints; drives varspoint
+    // codegen when steps reference points by name.
+    points: {},
+    source: null,
+    has_taught_poses: false,
   },
   setCurrentProgram(patch) {
     set((s) => ({ currentProgram: { ...s.currentProgram, ...patch } }))
