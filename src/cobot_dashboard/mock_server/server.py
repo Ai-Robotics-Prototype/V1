@@ -821,23 +821,70 @@ async def mock_systemcheck_restart(request: Request):
 # machines that lack the directory.
 # ---------------------------------------------------------------------------
 
-_MOCK_IO_MAP_PATH = os.environ.get('ROBOAI_MOCK_IO_MAP', '/tmp/roboai_io_map.json')
-_MOCK_IO_MAP_VERSION = 1
+_MOCK_IO_MAP_PATH    = os.environ.get('ROBOAI_MOCK_IO_MAP', '/tmp/roboai_io_map.json')
+_MOCK_IO_MAP_VERSION = 2
+
+_MOCK_IO_SPECS = {
+    'DI': {'voltage_typ_v': 24, 'voltage_max_v': 30, 'impedance_kohm': 10,
+           'polarity': 'PNP or NPN', 'terminals': ['24V', 'COM', 'DI'],
+           'notes': 'External supply 24 V, 1 A per group.'},
+    'DO': {'voltage_typ_v': 24, 'voltage_max_v': 30, 'current_max_ma': 125,
+           'polarity': 'PNP', 'terminals': ['24V', 'COM', 'DO'],
+           'notes': 'Max 125 mA per DO group. External supply 24 V, 1 A per group.'},
+    'AIO': {'terminals': ['AI+', 'AI-', 'AGND', 'AO+', 'AO-'],
+            'notes': 'Analog inputs + outputs share the AI/O block.'},
+    'M-FUNC': {'notes': 'Multi-function block — assignment depends on cell wiring.'},
+    'PWR-CFG': {'terminals': ['24V', 'COM'],
+                'notes': 'Power configuration terminals feeding DI/DO groups. External supply 24 V, 1 A per group.'},
+    'SAFETY': {'notes': '4 dual-channel safety inputs + 1 safety output group. Category-rated per manual.'},
+    'FLANGE': {'notes': 'Tool-flange I/O on the end-effector connector. Flange DI is PNP. Flange DO can be PNP signal-only (≤5 mA) or NPN drive.',
+                'flange_di_polarity': 'PNP',
+                'flange_do_modes': ['PNP signal-only (≤5 mA)', 'NPN drive']},
+}
 
 
-def _mock_io_map_defaults(ai_n: int, ao_n: int) -> dict:
+def _mock_io_map_default_blocks():
+    return [
+        {'id': 'MFUNC',  'kind': 'M-FUNC',  'label': 'M-Func',
+         'channels': ['MF0', 'MF1', 'MF2', 'MF3']},
+        {'id': 'DI-A',   'kind': 'DI',      'label': 'DI Block A',
+         'channels': [f'DI{i}' for i in range(0, 8)]},
+        {'id': 'DI-B',   'kind': 'DI',      'label': 'DI Block B',
+         'channels': [f'DI{i}' for i in range(8, 16)]},
+        {'id': 'DI-C',   'kind': 'DI',      'label': 'DI Block C',
+         'channels': [f'DI{i}' for i in range(16, 24)]},
+        {'id': 'PWRCFG', 'kind': 'PWR-CFG', 'label': 'Power Config',
+         'channels': ['24V-A', 'COM-A', '24V-B', 'COM-B']},
+        {'id': 'DO-A',   'kind': 'DO',      'label': 'DO Block A',
+         'channels': [f'DO{i}' for i in range(0, 8)]},
+        {'id': 'DO-B',   'kind': 'DO',      'label': 'DO Block B',
+         'channels': [f'DO{i}' for i in range(8, 16)]},
+        {'id': 'DO-C',   'kind': 'DO',      'label': 'DO Block C',
+         'channels': [f'DO{i}' for i in range(16, 24)]},
+        {'id': 'AIO',    'kind': 'AIO',     'label': 'Analog I/O',
+         'channels': ['AI0', 'AI1', 'AI2', 'AI3', 'AO0', 'AO1']},
+        {'id': 'SAFETY', 'kind': 'SAFETY',  'label': 'Safety I/O',
+         'channels': ['ES-A1', 'ES-A2', 'ES-B1', 'ES-B2',
+                       'GATE-A1', 'GATE-A2', 'GATE-B1', 'GATE-B2',
+                       'SAF-OUT-A', 'SAF-OUT-B']},
+        {'id': 'FLANGE', 'kind': 'FLANGE',  'label': 'Tool Flange I/O',
+         'channels': ['FDI0', 'FDI1', 'FDO0', 'FDO1']},
+    ]
+
+
+def _mock_io_map_default() -> dict:
+    blocks = _mock_io_map_default_blocks()
     ports = {}
-    for i in range(8):
-        ports[f'DI{i}'] = {'assignment': 'Unassigned', 'in_use': False, 'notes': ''}
-    for i in range(8):
-        ports[f'DO{i}'] = {'assignment': 'Unassigned', 'in_use': False, 'notes': ''}
-    for i in range(ai_n):
-        ports[f'AI{i}'] = {'assignment': 'Unassigned', 'in_use': False, 'notes': ''}
-    for i in range(ao_n):
-        ports[f'AO{i}'] = {'assignment': 'Unassigned', 'in_use': False, 'notes': ''}
-    ports['24V'] = {'assignment': '+24 V DC', 'in_use': True, 'notes': 'Field power rail'}
-    ports['GND'] = {'assignment': '0 V / GND', 'in_use': True, 'notes': 'Common return'}
-    return ports
+    for blk in blocks:
+        for ch in blk['channels']:
+            ports[ch] = {'assignment': 'Unassigned', 'in_use': False, 'notes': ''}
+    return {
+        'version':     _MOCK_IO_MAP_VERSION,
+        'provisional': True,
+        'blocks':      blocks,
+        'specs':       copy.deepcopy(_MOCK_IO_SPECS),
+        'ports':       ports,
+    }
 
 
 def _mock_io_map_load() -> dict:
@@ -845,16 +892,13 @@ def _mock_io_map_load() -> dict:
         try:
             with open(_MOCK_IO_MAP_PATH) as f:
                 d = json.load(f)
-            if isinstance(d, dict) and isinstance(d.get('ports'), dict):
+            if isinstance(d, dict) and int(d.get('version') or 1) >= 2 \
+                    and isinstance(d.get('blocks'), list):
+                d['specs'] = copy.deepcopy(_MOCK_IO_SPECS)
                 return d
         except Exception:
             pass
-    return {
-        'version': _MOCK_IO_MAP_VERSION,
-        'analog_input_count':  4,
-        'analog_output_count': 2,
-        'ports': _mock_io_map_defaults(4, 2),
-    }
+    return _mock_io_map_default()
 
 
 @app.get("/api/io/portmap")
@@ -866,20 +910,36 @@ async def mock_io_portmap_get():
 async def mock_io_portmap_put(request: Request):
     body = await request.json()
     cur = _mock_io_map_load()
-    if 'analog_input_count' in body:
-        cur['analog_input_count'] = max(0, min(16, int(body['analog_input_count'])))
-    if 'analog_output_count' in body:
-        cur['analog_output_count'] = max(0, min(16, int(body['analog_output_count'])))
-    incoming = body.get('ports') or {}
-    for pid, meta in incoming.items():
-        if not isinstance(meta, dict):
-            continue
-        row = dict(cur['ports'].get(pid) or
-                   {'assignment': 'Unassigned', 'in_use': False, 'notes': ''})
-        if 'assignment' in meta: row['assignment'] = str(meta['assignment'])[:80]
-        if 'in_use'     in meta: row['in_use']     = bool(meta['in_use'])
-        if 'notes'      in meta: row['notes']      = str(meta['notes'])[:400]
-        cur['ports'][pid] = row
+    incoming_blocks = body.get('blocks')
+    if isinstance(incoming_blocks, list):
+        by_id = {b['id']: b for b in cur.get('blocks', [])
+                 if isinstance(b, dict) and 'id' in b}
+        for patch in incoming_blocks:
+            if not isinstance(patch, dict) or 'id' not in patch:
+                continue
+            blk = by_id.get(patch['id'])
+            if blk is None:
+                continue
+            if isinstance(patch.get('channels'), list):
+                blk['channels'] = [str(c)[:24] for c in patch['channels']
+                                    if isinstance(c, (str, int))]
+            if 'label' in patch:
+                blk['label'] = str(patch['label'])[:60]
+    incoming_ports = body.get('ports')
+    if isinstance(incoming_ports, dict):
+        cur_ports = dict(cur.get('ports') or {})
+        for pid, meta in incoming_ports.items():
+            if not isinstance(meta, dict):
+                continue
+            row = dict(cur_ports.get(pid) or
+                       {'assignment': 'Unassigned', 'in_use': False, 'notes': ''})
+            if 'assignment' in meta: row['assignment'] = str(meta['assignment'])[:80]
+            if 'in_use'     in meta: row['in_use']     = bool(meta['in_use'])
+            if 'notes'      in meta: row['notes']      = str(meta['notes'])[:400]
+            cur_ports[pid] = row
+        cur['ports'] = cur_ports
+    if 'provisional' in body:
+        cur['provisional'] = bool(body['provisional'])
     cur['version'] = _MOCK_IO_MAP_VERSION
     try:
         with open(_MOCK_IO_MAP_PATH, 'w') as f:

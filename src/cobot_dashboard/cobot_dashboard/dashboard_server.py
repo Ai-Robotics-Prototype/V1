@@ -5917,96 +5917,221 @@ if FASTAPI_AVAILABLE:
     # ------------------------------------------------------------------
     # I/O Port Map — connector-graphic assignments.
     #
-    # Persists per-port metadata (assignment label, in-use flag, notes)
-    # to /opt/cobot/io_map.json. This is intentionally separate from
-    # io_config.json (which only stores string labels for the older list
-    # view); the port map carries richer metadata and an assignment
-    # workflow. No live-state read verbs are implemented here — the
-    # dashboard treats live state as "pending I/O capture" until the
-    # /estun/io read path is wired up.
+    # Schema v2 models the CC10-A back panel as an ordered list of
+    # "blocks" (M-FUNC · DI×3 · PWR-CFG · DO×3 · AI/O · SAFETY · FLANGE),
+    # each block carrying its own channel list + electrical spec.
+    # Per-channel operator metadata (assignment / in_use / notes) lives
+    # in the flat `ports` dict — the same shape as v1 so per-port PUTs
+    # are byte-compatible with the earlier client.
+    #
+    # Channel counts are PROVISIONAL — the layout matches the panel
+    # photo, but until the terminal labels are read off the connector
+    # (or a live I/O capture verifies them), the numbers are marked
+    # `provisional: true` and the frontend badges them accordingly.
+    # No live-state read verbs are implemented here.
     # ------------------------------------------------------------------
-    _IO_MAP_PATH = '/opt/cobot/io_map.json'
-    _IO_MAP_VERSION = 1
-    _IO_MAP_DEFAULT_AI = 4   # Estun S10-140 / CC10-A manual default
-    _IO_MAP_DEFAULT_AO = 2   # Estun S10-140 / CC10-A manual default
-    # Fixed digital port counts — 8 DI + 8 DO — per the manual wiring
-    # diagram. Analog counts stay editable via the portmap PUT.
-    _IO_MAP_DI_COUNT = 8
-    _IO_MAP_DO_COUNT = 8
+    _IO_MAP_PATH    = '/opt/cobot/io_map.json'
+    _IO_MAP_VERSION = 2
 
-    def _io_map_default_ports(ai_n: int, ao_n: int) -> dict:
-        ports = {}
-        for i in range(_IO_MAP_DI_COUNT):
-            ports[f'DI{i}'] = {'assignment': 'Unassigned',
-                                'in_use': False, 'notes': ''}
-        for i in range(_IO_MAP_DO_COUNT):
-            ports[f'DO{i}'] = {'assignment': 'Unassigned',
-                                'in_use': False, 'notes': ''}
-        for i in range(int(ai_n)):
-            ports[f'AI{i}'] = {'assignment': 'Unassigned',
-                                'in_use': False, 'notes': ''}
-        for i in range(int(ao_n)):
-            ports[f'AO{i}'] = {'assignment': 'Unassigned',
-                                'in_use': False, 'notes': ''}
-        # Power rails are display-only but modeled here so the UI has a
-        # single source of truth for their labels/notes.
-        ports['24V'] = {'assignment': '+24 V DC',
-                         'in_use': True, 'notes': 'Field power rail'}
-        ports['GND'] = {'assignment': '0 V / GND',
-                         'in_use': True, 'notes': 'Common return'}
-        return ports
+    # Kind-level specs — reference tooltips only. Numbers come from the
+    # manual OCR the operator confirmed:
+    #   DI: 24 V typ / 30 V max, ~10 kΩ, PNP or NPN
+    #   DO: 24 V typ / 30 V max, max 125 mA per group, PNP
+    #   External supply: 24 V, 1 A per group
+    _IO_SPECS = {
+        'DI': {
+            'voltage_typ_v': 24, 'voltage_max_v': 30,
+            'impedance_kohm': 10, 'polarity': 'PNP or NPN',
+            'terminals': ['24V', 'COM', 'DI'],
+            'notes': 'External supply 24 V, 1 A per group.',
+        },
+        'DO': {
+            'voltage_typ_v': 24, 'voltage_max_v': 30,
+            'current_max_ma': 125, 'polarity': 'PNP',
+            'terminals': ['24V', 'COM', 'DO'],
+            'notes': 'Max 125 mA per DO group. External supply 24 V, 1 A per group.',
+        },
+        'AIO': {
+            'terminals': ['AI+', 'AI-', 'AGND', 'AO+', 'AO-'],
+            'notes': 'Analog inputs + outputs share the AI/O block.',
+        },
+        'M-FUNC': {
+            'notes': 'Multi-function block — assignment depends on cell wiring.',
+        },
+        'PWR-CFG': {
+            'terminals': ['24V', 'COM'],
+            'notes': 'Power configuration terminals feeding DI/DO groups. External supply 24 V, 1 A per group.',
+        },
+        'SAFETY': {
+            'notes': ('4 dual-channel safety inputs (E-Stop A/B, Guard A/B) '
+                       '+ 1 safety output group. Category-rated per manual.'),
+        },
+        'FLANGE': {
+            'notes': ('Tool-flange I/O on the end-effector connector. '
+                       'Flange DI is PNP. Flange DO can be PNP signal-only '
+                       '(≤5 mA) or NPN drive.'),
+            'flange_di_polarity': 'PNP',
+            'flange_do_modes': ['PNP signal-only (≤5 mA)', 'NPN drive'],
+        },
+    }
+
+    def _range_channels(prefix: str, start: int, count: int):
+        return [f'{prefix}{i}' for i in range(start, start + count)]
+
+    def _io_map_default_blocks():
+        """Left-to-right block order matches the CC10-A back panel:
+        M-FUNC · DI×3 · PWR-CFG · DO×3 · AI/O · SAFETY · FLANGE."""
+        return [
+            {
+                'id':       'MFUNC',
+                'kind':     'M-FUNC',
+                'label':    'M-Func',
+                'channels': ['MF0', 'MF1', 'MF2', 'MF3'],
+            },
+            {
+                'id':       'DI-A',
+                'kind':     'DI',
+                'label':    'DI Block A',
+                'channels': _range_channels('DI', 0, 8),
+            },
+            {
+                'id':       'DI-B',
+                'kind':     'DI',
+                'label':    'DI Block B',
+                'channels': _range_channels('DI', 8, 8),
+            },
+            {
+                'id':       'DI-C',
+                'kind':     'DI',
+                'label':    'DI Block C',
+                'channels': _range_channels('DI', 16, 8),
+            },
+            {
+                'id':       'PWRCFG',
+                'kind':     'PWR-CFG',
+                'label':    'Power Config',
+                'channels': ['24V-A', 'COM-A', '24V-B', 'COM-B'],
+            },
+            {
+                'id':       'DO-A',
+                'kind':     'DO',
+                'label':    'DO Block A',
+                'channels': _range_channels('DO', 0, 8),
+            },
+            {
+                'id':       'DO-B',
+                'kind':     'DO',
+                'label':    'DO Block B',
+                'channels': _range_channels('DO', 8, 8),
+            },
+            {
+                'id':       'DO-C',
+                'kind':     'DO',
+                'label':    'DO Block C',
+                'channels': _range_channels('DO', 16, 8),
+            },
+            {
+                'id':       'AIO',
+                'kind':     'AIO',
+                'label':    'Analog I/O',
+                'channels': ['AI0', 'AI1', 'AI2', 'AI3', 'AO0', 'AO1'],
+            },
+            {
+                'id':       'SAFETY',
+                'kind':     'SAFETY',
+                'label':    'Safety I/O',
+                'channels': ['ES-A1', 'ES-A2', 'ES-B1', 'ES-B2',
+                             'GATE-A1', 'GATE-A2', 'GATE-B1', 'GATE-B2',
+                             'SAF-OUT-A', 'SAF-OUT-B'],
+            },
+            {
+                'id':       'FLANGE',
+                'kind':     'FLANGE',
+                'label':    'Tool Flange I/O',
+                'channels': ['FDI0', 'FDI1', 'FDO0', 'FDO1'],
+            },
+        ]
+
+    def _io_map_default() -> dict:
+        blocks = _io_map_default_blocks()
+        ports: dict = {}
+        for blk in blocks:
+            for ch in blk['channels']:
+                ports[ch] = {'assignment': 'Unassigned',
+                             'in_use': False, 'notes': ''}
+        return {
+            'version':     _IO_MAP_VERSION,
+            'provisional': True,
+            'blocks':      blocks,
+            'specs':       copy.deepcopy(_IO_SPECS),
+            'ports':       ports,
+        }
+
+    def _io_map_reconcile(state: dict) -> dict:
+        """Ensure every declared channel has a metadata row. Missing
+        rows get the default 'Unassigned' shape; extra rows are
+        preserved on disk (so an operator's hand-edited channel list
+        can be restored)."""
+        blocks = state.get('blocks') or _io_map_default_blocks()
+        state['blocks'] = blocks
+        ports = dict(state.get('ports') or {})
+        for blk in blocks:
+            for ch in blk.get('channels') or []:
+                if not isinstance(ports.get(ch), dict):
+                    ports[ch] = {'assignment': 'Unassigned',
+                                 'in_use': False, 'notes': ''}
+                else:
+                    for k, dflt in (('assignment', 'Unassigned'),
+                                     ('in_use', False),
+                                     ('notes', '')):
+                        ports[ch].setdefault(k, dflt)
+        state['ports'] = ports
+        state['specs'] = copy.deepcopy(_IO_SPECS)
+        state['provisional'] = bool(state.get('provisional', True))
+        return state
+
+    def _io_map_migrate_v1(v1: dict) -> dict:
+        """Convert a v1 flat portmap into a v2 block layout. Carries
+        over any operator-authored labels / notes for channels that
+        still exist in the v2 default layout."""
+        new = _io_map_default()
+        old_ports = v1.get('ports') or {}
+        for ch, row in old_ports.items():
+            if ch in new['ports'] and isinstance(row, dict):
+                for k in ('assignment', 'in_use', 'notes'):
+                    if k in row:
+                        new['ports'][ch][k] = row[k]
+        return new
 
     def _io_map_load() -> dict:
         if os.path.isfile(_IO_MAP_PATH):
             try:
                 with open(_IO_MAP_PATH) as f:
                     d = json.load(f)
-                if isinstance(d, dict) and isinstance(d.get('ports'), dict):
-                    ai_n = int(d.get('analog_input_count',
-                                     _IO_MAP_DEFAULT_AI))
-                    ao_n = int(d.get('analog_output_count',
-                                     _IO_MAP_DEFAULT_AO))
-                    return {
-                        'version': _IO_MAP_VERSION,
-                        'analog_input_count':  max(0, min(16, ai_n)),
-                        'analog_output_count': max(0, min(16, ao_n)),
-                        'ports': d['ports'],
-                    }
+                if isinstance(d, dict):
+                    ver = int(d.get('version') or 1)
+                    if ver >= 2 and isinstance(d.get('blocks'), list):
+                        return _io_map_reconcile(d)
+                    # v1 or unversioned — migrate forward.
+                    return _io_map_migrate_v1(d)
             except Exception:
                 pass
-        return {
-            'version': _IO_MAP_VERSION,
-            'analog_input_count':  _IO_MAP_DEFAULT_AI,
-            'analog_output_count': _IO_MAP_DEFAULT_AO,
-            'ports': _io_map_default_ports(_IO_MAP_DEFAULT_AI,
-                                            _IO_MAP_DEFAULT_AO),
-        }
+        return _io_map_default()
 
-    def _io_map_reconcile(state: dict) -> dict:
-        """Ensure the ports dict has an entry for every currently-configured
-        pin. Missing rows get the default 'Unassigned' shape so the UI
-        never renders a hole; extra rows (from a prior config with more
-        AI/AO) are preserved on disk but not re-emitted."""
-        ai_n = int(state.get('analog_input_count', _IO_MAP_DEFAULT_AI))
-        ao_n = int(state.get('analog_output_count', _IO_MAP_DEFAULT_AO))
-        defaults = _io_map_default_ports(ai_n, ao_n)
-        ports = dict(state.get('ports') or {})
-        for pid, dflt in defaults.items():
-            existing = ports.get(pid)
-            if not isinstance(existing, dict):
-                ports[pid] = dict(dflt)
-                continue
-            merged = dict(dflt)
-            for k in ('assignment', 'in_use', 'notes'):
-                if k in existing:
-                    merged[k] = existing[k]
-            ports[pid] = merged
-        state['ports'] = ports
-        return state
+    def _io_map_save(state: dict) -> tuple:
+        try:
+            os.makedirs(os.path.dirname(_IO_MAP_PATH), exist_ok=True)
+            tmp = _IO_MAP_PATH + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp, _IO_MAP_PATH)
+            return True, None
+        except Exception as e:
+            return False, str(e)
 
     @app.get("/api/io/portmap")
     async def api_io_portmap_get():
-        return _io_map_reconcile(_io_map_load())
+        return _io_map_load()
 
     @app.put("/api/io/portmap")
     async def api_io_portmap_put(request: Request):
@@ -6014,52 +6139,54 @@ if FASTAPI_AVAILABLE:
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-        # Merge with existing on-disk state so partial PUTs are safe.
         cur = _io_map_load()
-        if 'analog_input_count' in body:
-            try:
-                cur['analog_input_count'] = max(0, min(16,
-                    int(body['analog_input_count'])))
-            except (TypeError, ValueError):
-                return JSONResponse(
-                    {"error": "analog_input_count must be an integer"},
-                    status_code=400)
-        if 'analog_output_count' in body:
-            try:
-                cur['analog_output_count'] = max(0, min(16,
-                    int(body['analog_output_count'])))
-            except (TypeError, ValueError):
-                return JSONResponse(
-                    {"error": "analog_output_count must be an integer"},
-                    status_code=400)
-        incoming = body.get('ports') or {}
-        if not isinstance(incoming, dict):
-            return JSONResponse({"error": "'ports' must be an object"},
-                                status_code=400)
-        cur_ports = dict(cur.get('ports') or {})
-        for pid, meta in incoming.items():
-            if not isinstance(meta, dict):
-                continue
-            row = dict(cur_ports.get(pid) or
-                       {'assignment': 'Unassigned', 'in_use': False, 'notes': ''})
-            if 'assignment' in meta:
-                row['assignment'] = str(meta['assignment'])[:80]
-            if 'in_use' in meta:
-                row['in_use'] = bool(meta['in_use'])
-            if 'notes' in meta:
-                row['notes'] = str(meta['notes'])[:400]
-            cur_ports[pid] = row
-        cur['ports']   = cur_ports
+        # Block-level channel edits — operator adjusts the count / names
+        # per block. Passed as {"blocks": [{"id":"DI-A","channels":[...]}]}
+        # (partial — only the changed blocks are listed).
+        incoming_blocks = body.get('blocks')
+        if isinstance(incoming_blocks, list):
+            by_id = {b['id']: b for b in cur.get('blocks', [])
+                     if isinstance(b, dict) and 'id' in b}
+            for patch in incoming_blocks:
+                if not isinstance(patch, dict) or 'id' not in patch:
+                    continue
+                bid = patch['id']
+                blk = by_id.get(bid)
+                if blk is None:
+                    continue
+                if isinstance(patch.get('channels'), list):
+                    clean = [str(c)[:24] for c in patch['channels']
+                             if isinstance(c, (str, int))]
+                    blk['channels'] = clean
+                if 'label' in patch:
+                    blk['label'] = str(patch['label'])[:60]
+            cur['blocks'] = list(by_id.values()) if by_id else cur.get('blocks', [])
+            # Preserve original ordering.
+            cur['blocks'] = [b for b in cur.get('blocks', [])]
+        # Per-channel operator metadata.
+        incoming_ports = body.get('ports')
+        if isinstance(incoming_ports, dict):
+            cur_ports = dict(cur.get('ports') or {})
+            for pid, meta in incoming_ports.items():
+                if not isinstance(meta, dict):
+                    continue
+                row = dict(cur_ports.get(pid) or
+                           {'assignment': 'Unassigned', 'in_use': False, 'notes': ''})
+                if 'assignment' in meta:
+                    row['assignment'] = str(meta['assignment'])[:80]
+                if 'in_use' in meta:
+                    row['in_use'] = bool(meta['in_use'])
+                if 'notes' in meta:
+                    row['notes'] = str(meta['notes'])[:400]
+                cur_ports[pid] = row
+            cur['ports'] = cur_ports
+        if 'provisional' in body:
+            cur['provisional'] = bool(body['provisional'])
         cur['version'] = _IO_MAP_VERSION
         cur = _io_map_reconcile(cur)
-        try:
-            os.makedirs(os.path.dirname(_IO_MAP_PATH), exist_ok=True)
-            tmp = _IO_MAP_PATH + '.tmp'
-            with open(tmp, 'w') as f:
-                json.dump(cur, f, indent=2)
-            os.replace(tmp, _IO_MAP_PATH)
-        except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=500)
+        ok, err = _io_map_save(cur)
+        if not ok:
+            return JSONResponse({"error": err}, status_code=500)
         return {"ok": True, "portmap": cur}
 
     @app.put("/api/parts/{part_id}/config")
