@@ -17,21 +17,40 @@ const C = {
   rowBgDim:   '#f9fafb',
 }
 
-// Per-kind colour + rendering hint. The frontend never assumes anything
-// about channel counts — those come from the server's blocks[].channels.
+// Per-kind colour + rendering hint. Kinds mirror the controller's own
+// IOManager types plus HDI (M-FUNC high-speed inputs) and derived
+// group kinds (M-FUNC, PWR-CFG, SAFETY, FLANGE).
 const KIND_META = {
-  'DI': { color: '#3B82F6', short: 'DI', kindLabel: 'Digital Input' },
-  'DO': { color: '#16A34A', short: 'DO', kindLabel: 'Digital Output' },
-  'AI': { color: '#CA8A04', short: 'AI', kindLabel: 'Analog Input' },
-  'AO': { color: '#9333EA', short: 'AO', kindLabel: 'Analog Output' },
+  'DI':      { color: '#3B82F6', short: 'DI',     kindLabel: 'Digital Input' },
+  'DO':      { color: '#16A34A', short: 'DO',     kindLabel: 'Digital Output' },
+  'AI':      { color: '#CA8A04', short: 'AI',     kindLabel: 'Analog Input' },
+  'AO':      { color: '#9333EA', short: 'AO',     kindLabel: 'Analog Output' },
+  'HDI':     { color: '#0EA5E9', short: 'HDI',    kindLabel: 'High-speed DI' },
+  'M-FUNC':  { color: '#0EA5E9', short: 'M-FUNC', kindLabel: 'Multi-function' },
+  'PWR-CFG': { color: '#DC2626', short: 'PWR',    kindLabel: 'Power / Fuse' },
+  'SAFETY':  { color: '#B45309', short: 'SAFETY', kindLabel: 'Safety I/O' },
+  'FLANGE':  { color: '#7C3AED', short: 'FLANGE', kindLabel: 'Tool Flange' },
 }
 
-// Group meta — controls layout row + a subtle tint on the block header.
+// Non-signal terminal roles get a compact chip. Signal terminals are
+// rendered through the ChannelRow path.
+const ROLE_META = {
+  power:   { label: '24V',  bg: '#FEE2E2', color: '#991B1B' },
+  return:  { label: '0V',   bg: '#E0F2FE', color: '#075985' },
+  bus:     { label: 'BUS',  bg: '#F3E8FF', color: '#6B21A8' },
+  control: { label: 'CTL',  bg: '#FEF3C7', color: '#92400E' },
+  safety:  { label: 'SAF',  bg: '#FFE4E6', color: '#9F1239' },
+  aux:     { label: 'AUX',  bg: '#F3F4F6', color: '#374151' },
+  shield:  { label: 'SHD',  bg: '#F3F4F6', color: '#374151' },
+}
+
+// Group meta — subtle tint on the block header.
 const GROUP_META = {
-  general: { label: 'General',          tint: 'transparent' },
-  system:  { label: 'System-reserved',  tint: '#FEF3C7' },
-  flange:  { label: 'Flange (tool)',    tint: '#F3E8FF' },
-  analog:  { label: 'Analog',           tint: '#FEF9C3' },
+  general: { label: 'General',         tint: 'transparent' },
+  system:  { label: 'System-reserved', tint: '#FEF3C7' },
+  flange:  { label: 'Flange (tool)',   tint: '#F3E8FF' },
+  analog:  { label: 'Analog',          tint: '#FEF9C3' },
+  safety:  { label: 'Safety',          tint: '#FFE4E6' },
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +150,163 @@ function LiveStatePill({ kind }) {
 // ---------------------------------------------------------------------------
 // Single channel row inside a block.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Non-signal terminal row — power / return / bus / control / safety.
+// Compact, non-editable, shows the exact silkscreen name + a role chip.
+// ---------------------------------------------------------------------------
+function TerminalRow({ name, role }) {
+  const meta = ROLE_META[role] || ROLE_META.aux
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 6,
+      padding: '3px 8px', borderRadius: 4,
+      background: C.rowBgDim,
+      border: `1px dashed ${C.border}`,
+      minWidth: 0,
+    }}>
+      <span style={{
+        fontSize: 10, fontFamily: 'monospace',
+        color: C.textMuted, fontWeight: 600,
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        flex: 1,
+      }}>{name}</span>
+      <span style={{
+        fontSize: 8, fontWeight: 700,
+        color: meta.color, background: meta.bg,
+        padding: '1px 5px', borderRadius: 3,
+        letterSpacing: '0.05em', flexShrink: 0,
+      }}>{meta.label}</span>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Plate block (physical view). Renders every terminal in silkscreen
+// order — signals through ChannelRow, non-signals through TerminalRow.
+// ---------------------------------------------------------------------------
+function PlateBlock({ block, ports, specs, onEdit }) {
+  const kind    = block.kind
+  const group   = block.group || 'general'
+  const meta    = KIND_META[kind] || { color: C.textMuted, short: kind, kindLabel: kind }
+  const grpMeta = GROUP_META[group] || GROUP_META.general
+  const spec    = specs?.[kind] || {}
+  const wiring  = block.wiring   // {mode: 'sink'|'source', return_rail: '0V'|'24V'} for DI/DO
+  const terminals = Array.isArray(block.terminals) ? block.terminals : []
+  const nSig    = terminals.filter((t) => t.role === 'signal').length
+  const editable = group !== 'system' && group !== 'safety'
+  const tip      = specTooltip(kind, specs)
+
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column',
+      background: C.rowBg,
+      border: `1px solid ${C.border}`,
+      borderRadius: 6,
+      overflow: 'hidden',
+      minWidth: 0,
+    }}>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 6,
+        padding: '6px 8px',
+        background: grpMeta.tint !== 'transparent' ? grpMeta.tint : C.headerBg,
+        borderBottom: `1px solid ${C.border}`,
+        borderTop: `3px solid ${meta.color}`,
+      }}>
+        <span style={{
+          fontSize: 9, fontWeight: 700,
+          color: '#fff', background: meta.color,
+          padding: '1px 5px', borderRadius: 3,
+          letterSpacing: '0.05em', flexShrink: 0,
+          textTransform: 'uppercase',
+        }}>
+          {meta.short}
+        </span>
+        <span style={{
+          flex: 1,
+          fontSize: 11, fontWeight: 600, color: '#374151',
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }}>
+          {block.label}
+        </span>
+        {wiring && (
+          <span
+            title={`${wiring.mode} wiring — return rail ${wiring.return_rail}`}
+            style={{
+              fontSize: 8, fontWeight: 700,
+              padding: '1px 5px', borderRadius: 3,
+              background: wiring.mode === 'sink' ? '#DBEAFE' : '#DCFCE7',
+              color:      wiring.mode === 'sink' ? '#1E40AF' : '#166534',
+              letterSpacing: '0.05em', flexShrink: 0,
+              textTransform: 'uppercase',
+            }}>
+            {wiring.mode} · {wiring.return_rail}
+          </span>
+        )}
+        <span style={{
+          fontSize: 10, color: C.textMuted, fontFamily: 'monospace',
+          flexShrink: 0,
+        }} title={`${terminals.length} terminals · ${nSig} signals`}>
+          {terminals.length}t
+        </span>
+        {tip && (
+          <span
+            title={tip}
+            style={{
+              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+              width: 14, height: 14, borderRadius: '50%',
+              background: '#fff', color: C.textMuted,
+              border: `1px solid ${C.border}`,
+              fontSize: 9, fontWeight: 700, cursor: 'help',
+              flexShrink: 0,
+            }}>i</span>
+        )}
+      </div>
+
+      {block.notes && (
+        <div style={{
+          padding: '3px 8px',
+          fontSize: 9, color: C.textMuted,
+          background: C.rowBgDim,
+          borderBottom: `1px solid ${C.border}`,
+          lineHeight: 1.3,
+        }}>
+          {block.notes}
+        </div>
+      )}
+
+      <div style={{
+        display: 'flex', flexDirection: 'column', gap: 2,
+        padding: 5,
+      }}>
+        {terminals.length === 0 ? (
+          <div style={{ fontSize: 11, color: C.textDim, padding: '6px 4px' }}>
+            No terminals configured.
+          </div>
+        ) : terminals.map((t, i) => {
+          if (t.role === 'signal') {
+            return (
+              <ChannelRow
+                key={t.name || i}
+                id={t.name}
+                kind={t.kind || kind}
+                meta={ports?.[t.name]}
+                row={{
+                  port: t.port,
+                  default_name: t.default_name || t.name,
+                  function: t.function,
+                }}
+                editable={editable}
+                onEdit={onEdit}
+              />
+            )
+          }
+          return <TerminalRow key={t.name || i} name={t.name} role={t.role} />
+        })}
+      </div>
+    </div>
+  )
+}
+
 function ChannelRow({ id, kind, meta, row, onEdit, editable }) {
   const inUse = !!meta?.in_use
   const label = meta?.assignment || 'Unassigned'
@@ -158,13 +334,14 @@ function ChannelRow({ id, kind, meta, row, onEdit, editable }) {
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
         <span
-          title={defaultName && defaultName !== id ? `factory: ${defaultName}` : id}
+          title={port != null ? `port ${port} (${kind})` :
+                 defaultName && defaultName !== id ? `factory: ${defaultName}` : id}
           style={{
             fontSize: 10, fontWeight: 700, fontFamily: 'monospace',
             color: bankColor,
-            minWidth: 52, textAlign: 'left',
+            minWidth: 64, textAlign: 'left',
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-          }}>{kind}{port ?? ''}</span>
+          }}>{id}</span>
         {editable && (
           <input
             type="checkbox"
@@ -589,30 +766,28 @@ export default function IOPortMap() {
     )
   }
 
-  const blocks = Array.isArray(data.blocks) ? data.blocks : []
-  const specs  = data.specs || {}
-  const verbs  = data.verbs || {}
-  const ports  = data.ports || {}
+  const plate     = Array.isArray(data.plate) ? data.plate : []
+  const flange    = data.flange || null
+  const nameplate = data.nameplate || {}
+  const sources   = data.sources || {}
+  const specs     = data.specs || {}
+  const verbs     = data.verbs || {}
+  const ports     = data.ports || {}
 
-  // Count over channels present in the layout so a trimmed layout
-  // doesn't inflate totals. Skip system-reserved (operator can't
-  // assign those anyway).
+  // Assignment tally — walk the plate + flange, count only signal
+  // terminals in operator-assignable groups.
   let totalCount = 0
   let assignedCount = 0
-  for (const blk of blocks) {
-    if (blk.group === 'system') continue
-    for (const row of blk.rows || []) {
+  const walk = [...plate]
+  if (flange) walk.push(flange)
+  for (const blk of walk) {
+    const g = blk.group
+    if (g === 'system' || g === 'safety') continue
+    for (const t of blk.terminals || []) {
+      if (t.role !== 'signal') continue
       totalCount += 1
-      if (ports[row.ch]?.in_use) assignedCount += 1
+      if (ports[t.name]?.in_use) assignedCount += 1
     }
-  }
-
-  // Group blocks by functional group. Order: general → system → flange → analog.
-  const GROUP_ORDER = ['general', 'system', 'flange', 'analog']
-  const byGroup = {}
-  for (const blk of blocks) {
-    const g = blk.group || 'general'
-    ;(byGroup[g] = byGroup[g] || []).push(blk)
   }
 
   return (
@@ -623,51 +798,91 @@ export default function IOPortMap() {
       border: `1px solid ${C.border}`,
       borderRadius: 6,
     }}>
+      {/* Header + nameplate strip */}
       <div style={{ display: 'flex', alignItems: 'center' }}>
         <span style={{ fontSize: 15, fontWeight: 700, color: C.text, flex: 1 }}>
           I/O Port Map
         </span>
         <span style={{ fontSize: 11, color: C.textMuted }}>
-          Estun S10-140 · IOManager
+          Estun S10-140 · silkscreen-verified
         </span>
       </div>
+
+      {(nameplate.model || nameplate.serial) && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 12,
+          padding: '6px 10px',
+          background: '#0F172A',
+          color: '#E2E8F0',
+          border: `1px solid #1E293B`,
+          borderRadius: 6,
+          fontSize: 11, fontFamily: 'monospace',
+          letterSpacing: '0.02em',
+        }}>
+          <span style={{ color: '#94A3B8', fontSize: 9, textTransform: 'uppercase' }}>
+            Nameplate
+          </span>
+          <span style={{ fontWeight: 700 }}>{nameplate.model}</span>
+          {nameplate.power_w && <span>{nameplate.power_w} W</span>}
+          {nameplate.voltage && <span>{nameplate.voltage}</span>}
+          {nameplate.current_a && <span>{nameplate.current_a} A</span>}
+          {nameplate.serial && (
+            <span style={{ marginLeft: 'auto', color: '#94A3B8' }}>
+              SN {nameplate.serial}
+            </span>
+          )}
+        </div>
+      )}
 
       <Legend
         assignedCount={assignedCount}
         totalCount={totalCount}
         saving={saving}
         onReset={onReset}
-        source={data.source}
+        source={sources.physical || sources.software}
       />
 
-      {/* Functional-group layout — order: general → system → flange → analog */}
-      {GROUP_ORDER.filter((g) => byGroup[g]?.length).map((g) => (
-        <div key={g} style={{
-          display: 'flex', flexDirection: 'column', gap: 6,
-        }}>
+      {/* Physical plate — connectors in silkscreen order, left→right */}
+      <div style={{
+        fontSize: 10, fontWeight: 700, color: C.textMuted,
+        textTransform: 'uppercase', letterSpacing: '0.08em',
+        paddingLeft: 2, marginTop: 4,
+      }}>
+        CC10-A back panel
+      </div>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+        gap: 6, alignItems: 'start',
+      }}>
+        {plate.map((blk) => (
+          <PlateBlock key={blk.id} block={blk} ports={ports} specs={specs}
+                      onEdit={onEdit} />
+        ))}
+      </div>
+
+      {/* Tool-flange connector — separate row */}
+      {flange && (
+        <>
           <div style={{
             fontSize: 10, fontWeight: 700, color: C.textMuted,
             textTransform: 'uppercase', letterSpacing: '0.08em',
-            paddingLeft: 2,
+            paddingLeft: 2, marginTop: 4,
           }}>
-            {GROUP_META[g]?.label || g}
+            Tool flange (arm-end connector)
           </div>
           <div style={{
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
-            gap: 8,
+            gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+            gap: 6,
           }}>
-            {byGroup[g].map((blk) => (
-              <Block key={blk.id} block={blk} ports={ports} specs={specs}
-                     onEdit={onEdit} />
-            ))}
+            <PlateBlock block={flange} ports={ports} specs={specs}
+                        onEdit={onEdit} />
           </div>
-        </div>
-      ))}
+        </>
+      )}
 
-      {/* IOManager verb reference — collapsed by default so it doesn't
-          crowd the port grid, but discoverable so operators can see
-          the wire contract the layout is derived from. */}
+      {/* IOManager + Lua verb reference — collapsed by default */}
       <details style={{
         border: `1px solid ${C.border}`, borderRadius: 6,
         background: C.rowBgDim, padding: '6px 10px', fontSize: 11,
@@ -676,22 +891,28 @@ export default function IOPortMap() {
           cursor: 'pointer', color: C.textMuted, fontWeight: 600,
           userSelect: 'none',
         }}>
-          IOManager wire verbs · {Object.keys(verbs).length} documented
+          Verb reference · {Object.keys(verbs).length} documented (ws + lua)
         </summary>
         <div style={{
-          marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6,
+          marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4,
         }}>
           {Object.entries(verbs).map(([slot, v]) => (
             <div key={slot} style={{
               display: 'grid',
-              gridTemplateColumns: '80px 220px 1fr',
+              gridTemplateColumns: '80px 40px 220px 1fr',
               gap: 8, fontSize: 10, alignItems: 'baseline',
             }}>
               <span style={{ color: C.textMuted, fontFamily: 'monospace' }}>
                 {slot}
               </span>
+              <span style={{
+                color: v.layer === 'lua' ? '#6B21A8' : '#075985',
+                fontFamily: 'monospace', fontSize: 9, fontWeight: 700,
+              }}>
+                {(v.layer || '?').toUpperCase()}
+              </span>
               <span style={{ color: C.text, fontFamily: 'monospace' }}>
-                {v.ty}
+                {v.signature || v.ty}
               </span>
               <span style={{ color: C.textMuted }}>
                 {v.notes}
@@ -701,14 +922,14 @@ export default function IOPortMap() {
         </div>
       </details>
 
+      {/* Sources footer */}
       <div style={{
         fontSize: 10, color: C.textMuted, lineHeight: 1.5,
       }}>
-        Inventory (18 DO / 24 DI / 4 AI / 4 AO) is verified from{' '}
-        <code>{data.source || 'the factory-controller capture'}</code>.
-        The <code>allow_io</code> gate + driver bridge that turn the
-        live-state pills real land in a follow-up pass, gated by a
-        live-first force→read validation on a single DO.
+        <b>Sources:</b>{' '}
+        {sources.physical && <>physical · <code>{sources.physical}</code>; </>}
+        {sources.software && <>software · <code>{sources.software}</code>; </>}
+        {sources.lua && <>lua · <code>{sources.lua}</code>.</>}
       </div>
     </div>
   )

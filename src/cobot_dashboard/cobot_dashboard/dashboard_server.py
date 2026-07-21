@@ -5977,7 +5977,26 @@ if FASTAPI_AVAILABLE:
     # a live-first force → GetIOValue round-trip is verified.
     # ------------------------------------------------------------------
     _IO_MAP_PATH    = '/opt/cobot/io_map.json'
-    _IO_MAP_VERSION = 3
+    _IO_MAP_VERSION = 4
+
+    # Controller nameplate — captured from the silkscreen label plate on
+    # the back of the CC10-A controller on 2026-07-21.
+    _IO_NAMEPLATE = {
+        'model':     'CC10-A',
+        'power_w':   1500,
+        'voltage':   '1PH AC 100-240V',
+        'current_a': 8,
+        'serial':    '12605280821',
+    }
+
+    # Provenance for every data source that shapes this map. Keeping
+    # these strings on the payload lets the frontend show operators
+    # exactly which capture verified each part of the layout.
+    _IO_SOURCES = {
+        'physical': 'controller back-panel silkscreen label plate (2026-07-21)',
+        'software': 'data/estun_captures/estun_io_20260721.har (IOManager/GetIOInfo)',
+        'lua':      'data/estun_captures/estun_lua_io_v2_20260721.har (luaenginelib.json)',
+    }
 
     # Kind-level electrical specs — reference tooltips only. Numbers
     # come from the manual OCR the operator confirmed:
@@ -6144,190 +6163,291 @@ if FASTAPI_AVAILABLE:
         },
     }
 
-    # Verified inventory from the capture's IOManager/GetIOInfo response.
-    # Each row: (port, kind, default_name, function_tag, group)
-    # Groups: "general" | "system" | "flange" | "analog"
-    _IO_INVENTORY_DI = [
-        (0,  'DI0',           None, 'general'),
-        (1,  'DI1',           None, 'general'),
-        (2,  'DI2',           None, 'general'),
-        (3,  'DI3',           None, 'general'),
-        (4,  'DI4',           None, 'general'),
-        (5,  'DI5',           None, 'general'),
-        (6,  'DI6',           None, 'general'),
-        (7,  'DI7',           None, 'general'),
-        (8,  'DI8',           None, 'general'),
-        (9,  'DI9',           None, 'general'),
-        (10, 'DI10',          None, 'general'),
-        (11, 'DI11',          None, 'general'),
-        (12, 'DI12',          None, 'general'),
-        (13, 'DI13',          None, 'general'),
-        (14, 'DI14',          None, 'general'),
-        (15, 'DI15',          None, 'general'),
-        (16, 'modeSwitch',    'modeSwitch',           'system'),
-        (17, 'enableButton',  'enableButton',         'system'),
-        (18, 'flangeButton0', ['robotDrag', 0, None], 'flange'),
-        (19, 'flangeButton1', None, 'flange'),
-        (20, 'flangeButton2', None, 'flange'),
-        (21, 'flangeButton3', None, 'flange'),
-        (22, 'flangeDI0',     None, 'flange'),
-        (23, 'flangeDI1',     None, 'flange'),
-    ]
-    _IO_INVENTORY_DO = [
-        (0,  'DO0',       None, 'general'),
-        (1,  'DO1',       None, 'general'),
-        (2,  'DO2',       None, 'general'),
-        (3,  'DO3',       None, 'general'),
-        (4,  'DO4',       None, 'general'),
-        (5,  'DO5',       None, 'general'),
-        (6,  'DO6',       None, 'general'),
-        (7,  'DO7',       None, 'general'),
-        (8,  'DO8',       None, 'general'),
-        (9,  'DO9',       None, 'general'),
-        (10, 'DO10',      None, 'general'),
-        (11, 'DO11',      None, 'general'),
-        (12, 'DO12',      None, 'general'),
-        (13, 'DO13',      None, 'general'),
-        (14, 'DO14',      None, 'general'),
-        (15, 'DO15',      None, 'general'),
-        (16, 'flangeDO0', None, 'flange'),
-        (17, 'flangeDO1', None, 'flange'),
-    ]
+    # ------------------------------------------------------------------
+    # CC10-A physical plate — silkscreen-accurate terminal layout.
+    #
+    # Each `plate` block is one physical connector on the controller
+    # back panel. Terminals are listed in silkscreen order so the UI
+    # can render them as a real wiring diagram. Terminal `role` field:
+    #   signal   — a channel operators can assign (DI/DO/AI/AO/HDI)
+    #   power    — 24V / 12V rails
+    #   return   — 0V / GND / COM / AGND
+    #   bus      — CAN / RS-485
+    #   control  — ON / OFF / EN
+    #   safety   — VO / ES / CH terminals
+    #   aux      — FUSE, misc
+    # Signal terminals additionally carry `kind` + `port`.
+    # ------------------------------------------------------------------
+    def _plate_mfunc_terminals():
+        return [
+            {'name': 'CAN+',  'role': 'bus'},
+            {'name': 'CAN-',  'role': 'bus'},
+            {'name': '485A1', 'role': 'bus'},
+            {'name': '485B1', 'role': 'bus'},
+            {'name': '485A2', 'role': 'bus'},
+            {'name': '485B2', 'role': 'bus'},
+            {'name': 'ON',    'role': 'control'},
+            {'name': 'OFF',   'role': 'control'},
+            {'name': '12V',   'role': 'power'},
+            {'name': 'COM',   'role': 'return'},
+            {'name': 'EN',    'role': 'control'},
+            {'name': 'HDI1',  'role': 'signal', 'kind': 'HDI', 'port': 1},
+            {'name': 'HDI2',  'role': 'signal', 'kind': 'HDI', 'port': 2},
+            {'name': 'HDI3',  'role': 'signal', 'kind': 'HDI', 'port': 3},
+            {'name': 'HDI4',  'role': 'signal', 'kind': 'HDI', 'port': 4},
+            {'name': 'COM2',  'role': 'return'},
+        ]
 
-    def _io_map_default_blocks():
-        """Functional-group layout aligned with the controller's own
-        IOManager/GetIOInfo enumeration. Four groups × four kinds =
-        the block set the UI renders. Any kind that's empty in a
-        given group is simply omitted from the block list."""
+    def _plate_di_a_terminals():
+        ts = [{'name': '24V', 'role': 'power'}]
+        for i in range(8):
+            ts.append({'name': f'DI{i}', 'role': 'signal', 'kind': 'DI', 'port': i})
+        ts.append({'name': '0V', 'role': 'return'})
+        return ts
 
-        def _rows(kind, inv, group_name):
-            return [{
-                'port':          p,
-                'ch':            f'{kind}{p}',
-                'default_name':  dn,
-                'function':      fn,
-            } for (p, dn, fn, g) in inv if g == group_name]
+    def _plate_di_b_terminals():
+        ts = [{'name': '0V', 'role': 'return'}]
+        for i in range(8, 16):
+            ts.append({'name': f'DI{i}', 'role': 'signal', 'kind': 'DI', 'port': i})
+        ts.append({'name': '24V', 'role': 'power'})
+        return ts
 
-        blocks = []
-        # General digital I/O — DI0-15 + DO0-15
-        blocks.append({
-            'id': 'DI-GEN', 'kind': 'DI', 'group': 'general',
-            'label': 'Digital Inputs — general',
-            'channels': [r['ch'] for r in _rows('DI', _IO_INVENTORY_DI, 'general')],
-            'rows':     _rows('DI', _IO_INVENTORY_DI, 'general'),
-        })
-        blocks.append({
-            'id': 'DO-GEN', 'kind': 'DO', 'group': 'general',
-            'label': 'Digital Outputs — general',
-            'channels': [r['ch'] for r in _rows('DO', _IO_INVENTORY_DO, 'general')],
-            'rows':     _rows('DO', _IO_INVENTORY_DO, 'general'),
-        })
-        # System-reserved DIs — the controller owns these, they must be
-        # rendered read-only and never appear in force targets.
-        blocks.append({
-            'id': 'DI-SYS', 'kind': 'DI', 'group': 'system',
-            'label': 'System-reserved',
-            'channels': [r['ch'] for r in _rows('DI', _IO_INVENTORY_DI, 'system')],
-            'rows':     _rows('DI', _IO_INVENTORY_DI, 'system'),
-            'readonly': True,
-        })
-        # Flange I/O — DI18-23 + DO16-17
-        blocks.append({
-            'id': 'DI-FLG', 'kind': 'DI', 'group': 'flange',
-            'label': 'Flange Inputs',
-            'channels': [r['ch'] for r in _rows('DI', _IO_INVENTORY_DI, 'flange')],
-            'rows':     _rows('DI', _IO_INVENTORY_DI, 'flange'),
-        })
-        blocks.append({
-            'id': 'DO-FLG', 'kind': 'DO', 'group': 'flange',
-            'label': 'Flange Outputs',
-            'channels': [r['ch'] for r in _rows('DO', _IO_INVENTORY_DO, 'flange')],
-            'rows':     _rows('DO', _IO_INVENTORY_DO, 'flange'),
-        })
-        # Analog — 4 in, 4 out.
-        blocks.append({
-            'id': 'AI',  'kind': 'AI',  'group': 'analog',
-            'label': 'Analog Inputs',
-            'channels': [f'AI{i}' for i in range(4)],
-            'rows':     [{'port': i, 'ch': f'AI{i}',
-                           'default_name': f'AI{i}', 'function': None}
-                          for i in range(4)],
-        })
-        blocks.append({
-            'id': 'AO',  'kind': 'AO',  'group': 'analog',
-            'label': 'Analog Outputs',
-            'channels': [f'AO{i}' for i in range(4)],
-            'rows':     [{'port': i, 'ch': f'AO{i}',
-                           'default_name': f'AO{i}', 'function': None}
-                          for i in range(4)],
-        })
-        return blocks
+    def _plate_pwrcfg_terminals():
+        return [
+            {'name': 'COM1', 'role': 'return'},
+            {'name': '24V',  'role': 'power'},
+            {'name': 'GND',  'role': 'return'},
+            {'name': 'FUSE', 'role': 'aux'},
+        ]
 
-    def _io_map_default() -> dict:
-        blocks = _io_map_default_blocks()
-        ports: dict = {}
-        for blk in blocks:
-            for row in blk.get('rows') or []:
-                ch = row['ch']
-                # Seed the port-level operator metadata with the factory
-                # default name so a fresh install shows meaningful
-                # labels (modeSwitch, flangeDO0, etc.) rather than
-                # "Unassigned" for the system + flange channels.
-                dn = row.get('default_name') or ch
-                system_or_flange = blk.get('group') in ('system', 'flange')
-                ports[ch] = {
-                    'assignment': dn if system_or_flange else 'Unassigned',
-                    'in_use':     system_or_flange,
-                    'notes':      '',
-                }
+    def _plate_do_a_terminals():
+        ts = [{'name': '24V', 'role': 'power'}]
+        for i in range(8):
+            ts.append({'name': f'DO{i}', 'role': 'signal', 'kind': 'DO', 'port': i})
+        ts.append({'name': '0V', 'role': 'return'})
+        return ts
+
+    def _plate_do_b_terminals():
+        ts = [{'name': '0V', 'role': 'return'}]
+        for i in range(8, 16):
+            ts.append({'name': f'DO{i}', 'role': 'signal', 'kind': 'DO', 'port': i})
+        ts.append({'name': '24V', 'role': 'power'})
+        return ts
+
+    def _plate_ao_terminals():
+        ts = []
+        for i in range(4):
+            ts.append({'name': f'AO{i}',    'role': 'signal', 'kind': 'AO', 'port': i})
+            ts.append({'name': f'AGND{i}',  'role': 'return'})
+        return ts
+
+    def _plate_ai_terminals():
+        ts = []
+        for i in range(4):
+            ts.append({'name': f'AI{i}',        'role': 'signal', 'kind': 'AI', 'port': i})
+            ts.append({'name': f'AGND{i + 4}',  'role': 'return'})
+        return ts
+
+    def _plate_safety_terminals():
+        ts = [
+            {'name': 'VO1+', 'role': 'safety'},
+            {'name': 'VO1-', 'role': 'safety'},
+            {'name': 'VO2+', 'role': 'safety'},
+            {'name': 'VO2-', 'role': 'safety'},
+        ]
+        for i in range(1, 5):        # ES1..ES4
+            for ch in ('A', 'B'):    # dual-channel per E-stop
+                ts.append({'name': f'ES{i}{ch}+', 'role': 'safety'})
+                ts.append({'name': f'ES{i}{ch}-', 'role': 'safety'})
+        ts.append({'name': 'CHA', 'role': 'safety'})
+        ts.append({'name': 'CHB', 'role': 'safety'})
+        return ts
+
+    def _plate_flange_terminals():
+        # Software-enumerated (from IOManager/GetIOInfo) but NOT on the
+        # CC10-A back panel — these ride the tool-flange connector on
+        # the arm end. Kept separate so the plate view stays accurate.
+        return [
+            {'name': 'modeSwitch',    'role': 'signal', 'kind': 'DI', 'port': 16,
+             'default_name': 'modeSwitch',   'sw_group': 'system'},
+            {'name': 'enableButton',  'role': 'signal', 'kind': 'DI', 'port': 17,
+             'default_name': 'enableButton', 'sw_group': 'system'},
+            {'name': 'flangeButton0', 'role': 'signal', 'kind': 'DI', 'port': 18,
+             'default_name': 'Drag', 'function': ['robotDrag', 0, None]},
+            {'name': 'flangeButton1', 'role': 'signal', 'kind': 'DI', 'port': 19,
+             'default_name': 'flangeButton1'},
+            {'name': 'flangeButton2', 'role': 'signal', 'kind': 'DI', 'port': 20,
+             'default_name': 'flangeButton2'},
+            {'name': 'flangeButton3', 'role': 'signal', 'kind': 'DI', 'port': 21,
+             'default_name': 'flangeButton3'},
+            {'name': 'flangeDI0',     'role': 'signal', 'kind': 'DI', 'port': 22,
+             'default_name': 'flangeDI0'},
+            {'name': 'flangeDI1',     'role': 'signal', 'kind': 'DI', 'port': 23,
+             'default_name': 'flangeDI1'},
+            {'name': 'flangeDO0',     'role': 'signal', 'kind': 'DO', 'port': 16,
+             'default_name': 'flangeDO0'},
+            {'name': 'flangeDO1',     'role': 'signal', 'kind': 'DO', 'port': 17,
+             'default_name': 'flangeDO1'},
+        ]
+
+    def _io_map_default_plate():
+        """Physical CC10-A back panel — silkscreen order, left→right."""
+        return [
+            {'id': 'MFUNC',  'kind': 'M-FUNC',  'group': 'system',
+             'label': 'M-Func',
+             'terminals': _plate_mfunc_terminals(),
+             'notes': ('High-speed inputs HDI1-4, CAN bus, dual RS-485, '
+                        'ON/OFF, 12V/COM, EN, COM2.')},
+            {'id': 'DI-A',   'kind': 'DI', 'group': 'general',
+             'label': 'DI 0-7',
+             'wiring': {'mode': 'sink', 'return_rail': '0V'},
+             'terminals': _plate_di_a_terminals(),
+             'notes': 'Sink wiring — sensor pulls DIn LOW through 0V to signal ON.'},
+            {'id': 'DI-B',   'kind': 'DI', 'group': 'general',
+             'label': 'DI 8-15',
+             'wiring': {'mode': 'source', 'return_rail': '24V'},
+             'terminals': _plate_di_b_terminals(),
+             'notes': 'Source wiring — sensor pulls DIn HIGH from 24V to signal ON.'},
+            {'id': 'PWRCFG', 'kind': 'PWR-CFG', 'group': 'system',
+             'label': 'Power / Fuse',
+             'terminals': _plate_pwrcfg_terminals(),
+             'notes': 'External 24V field supply + system 0V/GND + FUSE.'},
+            {'id': 'DO-A',   'kind': 'DO', 'group': 'general',
+             'label': 'DO 0-7',
+             'wiring': {'mode': 'sink', 'return_rail': '0V'},
+             'terminals': _plate_do_a_terminals(),
+             'notes': 'PNP outputs — load between DOn and 0V rail.'},
+            {'id': 'DO-B',   'kind': 'DO', 'group': 'general',
+             'label': 'DO 8-15',
+             'wiring': {'mode': 'source', 'return_rail': '24V'},
+             'terminals': _plate_do_b_terminals(),
+             'notes': 'PNP outputs — load between DOn and 24V rail.'},
+            {'id': 'AO',     'kind': 'AO', 'group': 'analog',
+             'label': 'Analog Outputs',
+             'terminals': _plate_ao_terminals(),
+             'notes': 'Each AOn paired with its own AGND (0-3).'},
+            {'id': 'AI',     'kind': 'AI', 'group': 'analog',
+             'label': 'Analog Inputs',
+             'terminals': _plate_ai_terminals(),
+             'notes': 'Each AIn paired with its own AGND (4-7).'},
+            {'id': 'SAFETY', 'kind': 'SAFETY', 'group': 'safety',
+             'label': 'Safety I/O',
+             'terminals': _plate_safety_terminals(),
+             'notes': ('VO1± / VO2± voltage-monitored outputs, ES1-ES4 '
+                        'dual-channel A/B E-stop inputs, CHA/CHB charge test.')},
+        ]
+
+    def _io_map_default_flange():
         return {
-            'version':     _IO_MAP_VERSION,
-            'provisional': False,   # inventory is now wire-verified
-            'source':      'data/estun_captures/estun_io_20260721.har',
-            'blocks':      blocks,
-            'specs':       copy.deepcopy(_IO_SPECS),
-            'verbs':       copy.deepcopy(_IO_VERBS),
-            'ports':       ports,
+            'id':    'FLANGE',
+            'kind':  'FLANGE',
+            'group': 'flange',
+            'label': 'Tool Flange Connector (arm-end)',
+            'terminals': _plate_flange_terminals(),
+            'notes': ('Software-enumerated via IOManager/GetIOInfo but '
+                       'NOT on the CC10-A back-panel plate — these ride '
+                       'the tool-flange connector on the arm.'),
         }
 
-    def _io_map_reconcile(state: dict) -> dict:
-        """Merge the on-disk state with the current default layout.
-        Blocks always come from _io_map_default_blocks() so the
-        verified inventory + functional-group structure is enforced;
-        per-channel operator metadata (assignment / in_use / notes) is
-        carried forward from the incoming state where available."""
-        default_blocks = _io_map_default_blocks()
-        state['blocks'] = default_blocks
-        state['specs']  = copy.deepcopy(_IO_SPECS)
-        state['verbs']  = copy.deepcopy(_IO_VERBS)
-        state['provisional'] = False
-        state['source'] = 'data/estun_captures/estun_io_20260721.har'
-        prior = dict(state.get('ports') or {})
-        merged = {}
-        for blk in default_blocks:
-            for row in blk.get('rows') or []:
-                ch = row['ch']
-                dn = row.get('default_name') or ch
-                sysflg = blk.get('group') in ('system', 'flange')
-                base = {
+    # ------------------------------------------------------------------
+    # Blocks view (derived) — the compact functional-group summary that
+    # the older v3 renderer consumed. Kept alongside the plate so
+    # consumers who only need per-channel data (like computeLineMap in
+    # the frontend) don't need to walk terminals.
+    # ------------------------------------------------------------------
+    def _io_map_derive_blocks(plate: list, flange: dict) -> list:
+        blocks = []
+        for src in list(plate) + [flange]:
+            signals = [t for t in src['terminals'] if t.get('role') == 'signal']
+            if not signals:
+                continue
+            rows = [{
+                'port':         t.get('port'),
+                'ch':           t['name'],
+                'default_name': t.get('default_name', t['name']),
+                'function':     t.get('function'),
+                'kind':         t.get('kind', src['kind']),
+            } for t in signals]
+            blocks.append({
+                'id':       src['id'],
+                'kind':     src['kind'],
+                'group':    src.get('group'),
+                'label':    src['label'],
+                'channels': [r['ch'] for r in rows],
+                'rows':     rows,
+                'readonly': src.get('group') == 'system',
+            })
+        return blocks
+
+    def _io_map_default_ports(plate: list, flange: dict) -> dict:
+        ports: dict = {}
+        for src in list(plate) + [flange]:
+            for t in src['terminals']:
+                if t.get('role') != 'signal':
+                    continue
+                name = t['name']
+                dn = t.get('default_name', name)
+                sysflg = src.get('group') in ('system', 'flange', 'safety')
+                ports[name] = {
                     'assignment': dn if sysflg else 'Unassigned',
                     'in_use':     sysflg,
                     'notes':      '',
                 }
-                existing = prior.get(ch)
-                if isinstance(existing, dict):
-                    for k in ('assignment', 'in_use', 'notes'):
-                        if k in existing:
-                            base[k] = existing[k]
-                merged[ch] = base
+        return ports
+
+    def _io_map_default() -> dict:
+        plate  = _io_map_default_plate()
+        flange = _io_map_default_flange()
+        return {
+            'version':     _IO_MAP_VERSION,
+            'provisional': False,
+            'nameplate':   dict(_IO_NAMEPLATE),
+            'sources':     dict(_IO_SOURCES),
+            # `plate` is the primary rendering source (physical view).
+            'plate':       plate,
+            'flange':      flange,
+            # `blocks` is the derived functional-group view (kept for
+            # backward compat with the older frontend renderer).
+            'blocks':      _io_map_derive_blocks(plate, flange),
+            'specs':       copy.deepcopy(_IO_SPECS),
+            'verbs':       copy.deepcopy(_IO_VERBS),
+            'ports':       _io_map_default_ports(plate, flange),
+        }
+
+    def _io_map_reconcile(state: dict) -> dict:
+        """Enforce the current v4 plate/flange/nameplate/specs/verbs on
+        any incoming state. Only per-channel operator metadata
+        (assignment / in_use / notes) is carried forward — everything
+        else is authoritative from the physical plate silkscreen +
+        controller captures."""
+        default = _io_map_default()
+        prior_ports = dict(state.get('ports') or {})
+        state['version']     = _IO_MAP_VERSION
+        state['provisional'] = False
+        state['nameplate']   = default['nameplate']
+        state['sources']     = default['sources']
+        state['plate']       = default['plate']
+        state['flange']      = default['flange']
+        state['blocks']      = default['blocks']
+        state['specs']       = default['specs']
+        state['verbs']       = default['verbs']
+        merged = dict(default['ports'])
+        for ch, row in prior_ports.items():
+            if ch not in merged or not isinstance(row, dict):
+                continue
+            for k in ('assignment', 'in_use', 'notes'):
+                if k in row:
+                    merged[ch][k] = row[k]
         state['ports'] = merged
+        # Drop legacy fields the older schema emitted.
+        for k in ('analog_input_count', 'analog_output_count', 'source'):
+            state.pop(k, None)
         return state
 
     def _io_map_migrate_from_older(old: dict) -> dict:
-        """v1 flat portmap / v2 block layout → v3. Any operator
-        assignment/notes that still target a channel present in the
-        verified layout is carried over. Anything else is dropped
-        (with the on-disk file being rewritten in v3 form)."""
+        """v1 flat / v2 blocks / v3 functional-group → v4 plate.
+        Preserves operator assignments/notes for any channel whose
+        name still exists in the current plate + flange."""
         new = _io_map_default()
         old_ports = old.get('ports') or {}
         for ch, row in old_ports.items():
@@ -6345,7 +6465,8 @@ if FASTAPI_AVAILABLE:
                 if isinstance(d, dict):
                     ver = int(d.get('version') or 1)
                     if ver >= _IO_MAP_VERSION \
-                            and isinstance(d.get('blocks'), list):
+                            and isinstance(d.get('plate'), list) \
+                            and isinstance(d.get('flange'), dict):
                         return _io_map_reconcile(d)
                     return _io_map_migrate_from_older(d)
             except Exception:

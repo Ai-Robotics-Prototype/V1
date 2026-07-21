@@ -822,7 +822,17 @@ async def mock_systemcheck_restart(request: Request):
 # ---------------------------------------------------------------------------
 
 _MOCK_IO_MAP_PATH    = os.environ.get('ROBOAI_MOCK_IO_MAP', '/tmp/roboai_io_map.json')
-_MOCK_IO_MAP_VERSION = 3
+_MOCK_IO_MAP_VERSION = 4
+
+_MOCK_NAMEPLATE = {
+    'model': 'CC10-A', 'power_w': 1500, 'voltage': '1PH AC 100-240V',
+    'current_a': 8, 'serial': '12605280821',
+}
+_MOCK_SOURCES = {
+    'physical': 'controller back-panel silkscreen label plate (2026-07-21)',
+    'software': 'data/estun_captures/estun_io_20260721.har (IOManager/GetIOInfo)',
+    'lua':      'data/estun_captures/estun_lua_io_v2_20260721.har (luaenginelib.json)',
+}
 
 _MOCK_IO_SPECS = {
     'DI': {'voltage_typ_v': 24, 'voltage_max_v': 30, 'impedance_kohm': 10,
@@ -880,80 +890,151 @@ _MOCK_IO_VERBS = {
                               'unit unconfirmed.')},
 }
 
-_MOCK_IO_INV_DI = [
-    *[(i, f'DI{i}', None, 'general') for i in range(16)],
-    (16, 'modeSwitch',    'modeSwitch',           'system'),
-    (17, 'enableButton',  'enableButton',         'system'),
-    (18, 'flangeButton0', ['robotDrag', 0, None], 'flange'),
-    (19, 'flangeButton1', None, 'flange'),
-    (20, 'flangeButton2', None, 'flange'),
-    (21, 'flangeButton3', None, 'flange'),
-    (22, 'flangeDI0',     None, 'flange'),
-    (23, 'flangeDI1',     None, 'flange'),
-]
-_MOCK_IO_INV_DO = [
-    *[(i, f'DO{i}', None, 'general') for i in range(16)],
-    (16, 'flangeDO0', None, 'flange'),
-    (17, 'flangeDO1', None, 'flange'),
-]
+def _mock_di_range(start, count, wiring):
+    ts = ([{'name': '24V', 'role': 'power'}] if wiring == 'sink'
+          else [{'name': '0V', 'role': 'return'}])
+    for i in range(start, start + count):
+        ts.append({'name': f'DI{i}', 'role': 'signal', 'kind': 'DI', 'port': i})
+    ts.append({'name': '0V',  'role': 'return'} if wiring == 'sink'
+              else {'name': '24V', 'role': 'power'})
+    return ts
 
+def _mock_do_range(start, count, wiring):
+    ts = ([{'name': '24V', 'role': 'power'}] if wiring == 'sink'
+          else [{'name': '0V', 'role': 'return'}])
+    for i in range(start, start + count):
+        ts.append({'name': f'DO{i}', 'role': 'signal', 'kind': 'DO', 'port': i})
+    ts.append({'name': '0V',  'role': 'return'} if wiring == 'sink'
+              else {'name': '24V', 'role': 'power'})
+    return ts
 
-def _mock_io_map_default_blocks():
-    def _rows(kind, inv, group):
-        return [{'port': p, 'ch': f'{kind}{p}', 'default_name': dn, 'function': fn}
-                for (p, dn, fn, g) in inv if g == group]
-    blocks = [
-        {'id': 'DI-GEN', 'kind': 'DI', 'group': 'general',
-         'label': 'Digital Inputs — general',
-         'channels': [r['ch'] for r in _rows('DI', _MOCK_IO_INV_DI, 'general')],
-         'rows':     _rows('DI', _MOCK_IO_INV_DI, 'general')},
-        {'id': 'DO-GEN', 'kind': 'DO', 'group': 'general',
-         'label': 'Digital Outputs — general',
-         'channels': [r['ch'] for r in _rows('DO', _MOCK_IO_INV_DO, 'general')],
-         'rows':     _rows('DO', _MOCK_IO_INV_DO, 'general')},
-        {'id': 'DI-SYS', 'kind': 'DI', 'group': 'system',
-         'label': 'System-reserved', 'readonly': True,
-         'channels': [r['ch'] for r in _rows('DI', _MOCK_IO_INV_DI, 'system')],
-         'rows':     _rows('DI', _MOCK_IO_INV_DI, 'system')},
-        {'id': 'DI-FLG', 'kind': 'DI', 'group': 'flange',
-         'label': 'Flange Inputs',
-         'channels': [r['ch'] for r in _rows('DI', _MOCK_IO_INV_DI, 'flange')],
-         'rows':     _rows('DI', _MOCK_IO_INV_DI, 'flange')},
-        {'id': 'DO-FLG', 'kind': 'DO', 'group': 'flange',
-         'label': 'Flange Outputs',
-         'channels': [r['ch'] for r in _rows('DO', _MOCK_IO_INV_DO, 'flange')],
-         'rows':     _rows('DO', _MOCK_IO_INV_DO, 'flange')},
-        {'id': 'AI', 'kind': 'AI', 'group': 'analog', 'label': 'Analog Inputs',
-         'channels': [f'AI{i}' for i in range(4)],
-         'rows': [{'port': i, 'ch': f'AI{i}', 'default_name': f'AI{i}', 'function': None} for i in range(4)]},
+def _mock_safety_terminals():
+    ts = [{'name': 'VO1+', 'role': 'safety'}, {'name': 'VO1-', 'role': 'safety'},
+          {'name': 'VO2+', 'role': 'safety'}, {'name': 'VO2-', 'role': 'safety'}]
+    for i in range(1, 5):
+        for ch in ('A', 'B'):
+            ts.append({'name': f'ES{i}{ch}+', 'role': 'safety'})
+            ts.append({'name': f'ES{i}{ch}-', 'role': 'safety'})
+    ts += [{'name': 'CHA', 'role': 'safety'}, {'name': 'CHB', 'role': 'safety'}]
+    return ts
+
+def _mock_io_map_default_plate():
+    return [
+        {'id': 'MFUNC', 'kind': 'M-FUNC', 'group': 'system', 'label': 'M-Func',
+         'terminals': [
+            {'name': 'CAN+', 'role': 'bus'}, {'name': 'CAN-', 'role': 'bus'},
+            {'name': '485A1', 'role': 'bus'}, {'name': '485B1', 'role': 'bus'},
+            {'name': '485A2', 'role': 'bus'}, {'name': '485B2', 'role': 'bus'},
+            {'name': 'ON', 'role': 'control'}, {'name': 'OFF', 'role': 'control'},
+            {'name': '12V', 'role': 'power'}, {'name': 'COM', 'role': 'return'},
+            {'name': 'EN', 'role': 'control'},
+            {'name': 'HDI1', 'role': 'signal', 'kind': 'HDI', 'port': 1},
+            {'name': 'HDI2', 'role': 'signal', 'kind': 'HDI', 'port': 2},
+            {'name': 'HDI3', 'role': 'signal', 'kind': 'HDI', 'port': 3},
+            {'name': 'HDI4', 'role': 'signal', 'kind': 'HDI', 'port': 4},
+            {'name': 'COM2', 'role': 'return'}]},
+        {'id': 'DI-A', 'kind': 'DI', 'group': 'general', 'label': 'DI 0-7',
+         'wiring': {'mode': 'sink', 'return_rail': '0V'},
+         'terminals': _mock_di_range(0, 8, 'sink')},
+        {'id': 'DI-B', 'kind': 'DI', 'group': 'general', 'label': 'DI 8-15',
+         'wiring': {'mode': 'source', 'return_rail': '24V'},
+         'terminals': _mock_di_range(8, 8, 'source')},
+        {'id': 'PWRCFG', 'kind': 'PWR-CFG', 'group': 'system', 'label': 'Power / Fuse',
+         'terminals': [
+            {'name': 'COM1', 'role': 'return'},
+            {'name': '24V',  'role': 'power'},
+            {'name': 'GND',  'role': 'return'},
+            {'name': 'FUSE', 'role': 'aux'}]},
+        {'id': 'DO-A', 'kind': 'DO', 'group': 'general', 'label': 'DO 0-7',
+         'wiring': {'mode': 'sink', 'return_rail': '0V'},
+         'terminals': _mock_do_range(0, 8, 'sink')},
+        {'id': 'DO-B', 'kind': 'DO', 'group': 'general', 'label': 'DO 8-15',
+         'wiring': {'mode': 'source', 'return_rail': '24V'},
+         'terminals': _mock_do_range(8, 8, 'source')},
         {'id': 'AO', 'kind': 'AO', 'group': 'analog', 'label': 'Analog Outputs',
-         'channels': [f'AO{i}' for i in range(4)],
-         'rows': [{'port': i, 'ch': f'AO{i}', 'default_name': f'AO{i}', 'function': None} for i in range(4)]},
+         'terminals': [x for i in range(4)
+                       for x in ({'name': f'AO{i}', 'role': 'signal', 'kind': 'AO', 'port': i},
+                                  {'name': f'AGND{i}', 'role': 'return'})]},
+        {'id': 'AI', 'kind': 'AI', 'group': 'analog', 'label': 'Analog Inputs',
+         'terminals': [x for i in range(4)
+                       for x in ({'name': f'AI{i}', 'role': 'signal', 'kind': 'AI', 'port': i},
+                                  {'name': f'AGND{i+4}', 'role': 'return'})]},
+        {'id': 'SAFETY', 'kind': 'SAFETY', 'group': 'safety', 'label': 'Safety I/O',
+         'terminals': _mock_safety_terminals()},
     ]
+
+def _mock_io_map_default_flange():
+    return {
+        'id': 'FLANGE', 'kind': 'FLANGE', 'group': 'flange',
+        'label': 'Tool Flange Connector (arm-end)',
+        'terminals': [
+            {'name': 'modeSwitch', 'role': 'signal', 'kind': 'DI', 'port': 16,
+             'default_name': 'modeSwitch', 'sw_group': 'system'},
+            {'name': 'enableButton', 'role': 'signal', 'kind': 'DI', 'port': 17,
+             'default_name': 'enableButton', 'sw_group': 'system'},
+            {'name': 'flangeButton0', 'role': 'signal', 'kind': 'DI', 'port': 18,
+             'default_name': 'Drag', 'function': ['robotDrag', 0, None]},
+            {'name': 'flangeButton1', 'role': 'signal', 'kind': 'DI', 'port': 19,
+             'default_name': 'flangeButton1'},
+            {'name': 'flangeButton2', 'role': 'signal', 'kind': 'DI', 'port': 20,
+             'default_name': 'flangeButton2'},
+            {'name': 'flangeButton3', 'role': 'signal', 'kind': 'DI', 'port': 21,
+             'default_name': 'flangeButton3'},
+            {'name': 'flangeDI0', 'role': 'signal', 'kind': 'DI', 'port': 22,
+             'default_name': 'flangeDI0'},
+            {'name': 'flangeDI1', 'role': 'signal', 'kind': 'DI', 'port': 23,
+             'default_name': 'flangeDI1'},
+            {'name': 'flangeDO0', 'role': 'signal', 'kind': 'DO', 'port': 16,
+             'default_name': 'flangeDO0'},
+            {'name': 'flangeDO1', 'role': 'signal', 'kind': 'DO', 'port': 17,
+             'default_name': 'flangeDO1'},
+        ],
+    }
+
+def _mock_io_map_derive_blocks(plate, flange):
+    blocks = []
+    for src in list(plate) + [flange]:
+        signals = [t for t in src['terminals'] if t.get('role') == 'signal']
+        if not signals:
+            continue
+        rows = [{'port': t.get('port'), 'ch': t['name'],
+                 'default_name': t.get('default_name', t['name']),
+                 'function': t.get('function'),
+                 'kind': t.get('kind', src['kind'])} for t in signals]
+        blocks.append({'id': src['id'], 'kind': src['kind'],
+                       'group': src.get('group'), 'label': src['label'],
+                       'channels': [r['ch'] for r in rows], 'rows': rows,
+                       'readonly': src.get('group') == 'system'})
     return blocks
+
+def _mock_io_map_default_ports(plate, flange):
+    ports = {}
+    for src in list(plate) + [flange]:
+        for t in src['terminals']:
+            if t.get('role') != 'signal':
+                continue
+            name = t['name']
+            dn = t.get('default_name', name)
+            sysflg = src.get('group') in ('system', 'flange', 'safety')
+            ports[name] = {'assignment': dn if sysflg else 'Unassigned',
+                           'in_use': sysflg, 'notes': ''}
+    return ports
 
 
 def _mock_io_map_default() -> dict:
-    blocks = _mock_io_map_default_blocks()
-    ports = {}
-    for blk in blocks:
-        for row in blk.get('rows') or []:
-            ch = row['ch']
-            dn = row.get('default_name') or ch
-            sysflg = blk.get('group') in ('system', 'flange')
-            ports[ch] = {
-                'assignment': dn if sysflg else 'Unassigned',
-                'in_use':     sysflg,
-                'notes':      '',
-            }
+    plate  = _mock_io_map_default_plate()
+    flange = _mock_io_map_default_flange()
     return {
         'version':     _MOCK_IO_MAP_VERSION,
         'provisional': False,
-        'source':      'data/estun_captures/estun_io_20260721.har',
-        'blocks':      blocks,
+        'nameplate':   dict(_MOCK_NAMEPLATE),
+        'sources':     dict(_MOCK_SOURCES),
+        'plate':       plate,
+        'flange':      flange,
+        'blocks':      _mock_io_map_derive_blocks(plate, flange),
         'specs':       copy.deepcopy(_MOCK_IO_SPECS),
         'verbs':       copy.deepcopy(_MOCK_IO_VERBS),
-        'ports':       ports,
+        'ports':       _mock_io_map_default_ports(plate, flange),
     }
 
 
@@ -963,12 +1044,21 @@ def _mock_io_map_load() -> dict:
             with open(_MOCK_IO_MAP_PATH) as f:
                 d = json.load(f)
             if isinstance(d, dict) and int(d.get('version') or 1) >= _MOCK_IO_MAP_VERSION \
-                    and isinstance(d.get('blocks'), list):
-                # Fresh spec/verbs on every load — never trust stale
-                # copies on disk.
-                d['blocks'] = _mock_io_map_default_blocks()
-                d['specs']  = copy.deepcopy(_MOCK_IO_SPECS)
-                d['verbs']  = copy.deepcopy(_MOCK_IO_VERBS)
+                    and isinstance(d.get('plate'), list):
+                # Always refresh plate + spec + verbs from the current
+                # defaults — only ports metadata survives the disk trip.
+                fresh = _mock_io_map_default()
+                for k in ('plate', 'flange', 'blocks',
+                          'specs', 'verbs', 'nameplate', 'sources'):
+                    d[k] = fresh[k]
+                # Merge ports so an older on-disk file loses nothing.
+                merged = dict(fresh['ports'])
+                for ch, row in (d.get('ports') or {}).items():
+                    if ch in merged and isinstance(row, dict):
+                        for kk in ('assignment', 'in_use', 'notes'):
+                            if kk in row:
+                                merged[ch][kk] = row[kk]
+                d['ports'] = merged
                 return d
         except Exception:
             pass
