@@ -6020,14 +6020,27 @@ if FASTAPI_AVAILABLE:
         },
     }
 
-    # IOManager wire verbs — populated in the emitted payload so
-    # operators, docs, and future code all see the same spec. Every
-    # shape here was observed on the wire in
-    # data/estun_captures/estun_io_20260721.har unless marked
-    # SOURCE-ONLY (uncaptured, spec-only until validated live).
+    # Wire verbs — the operator-visible spec for how I/O is read, forced,
+    # and written. Two layers:
+    #
+    #   1. `ws` verbs: application-facing WebSocket messages the factory
+    #      UI sends to the controller for testing (force override) and
+    #      polling (batch read). Documented from the capture at
+    #      data/estun_captures/estun_io_20260721.har.
+    #
+    #   2. `lua` verbs: names emitted INSIDE a saved Lua project so a
+    #      running program can flip DO / read DI / (etc.). Documented
+    #      verbatim from the controller's own
+    #      /webmodel/cocontrol/luaeditor/luaenginelib.json (168-entry
+    #      Lua template library), captured in
+    #      data/estun_captures/estun_lua_io_v2_20260721.har.
+    #
+    # Every string here is the exact spelling the controller uses.
     _IO_VERBS = {
+        # -------------------- WebSocket / testing side --------------------
         'enumerate': {
             'ty': 'IOManager/GetIOInfo',
+            'layer': 'ws',
             'request':  {'ty': 'IOManager/GetIOInfo', 'db': '', 'id': '<client_id>'},
             'response': {'ty': 'IOManager/GetIOInfo', 'db':
                 {'DI': [{'port': 0, 'defaultName': 'DI0', 'name': 'DI0',
@@ -6038,57 +6051,96 @@ if FASTAPI_AVAILABLE:
                          'forced': 0, 'function': None}],
                  'AO': [{'port': 0, 'defaultName': 'AO0', 'name': 'AO0',
                          'forced': 0, 'function': None}]}},
-            'notes': ('Wire-verified. Full enumeration of all 4 kinds. '
-                       'name is operator-editable; defaultName is factory. '
-                       'forced ∈ {0,1}. function may be a role tag such '
-                       "as ['robotDrag', 0, null] for flangeButton0."),
+            'notes': 'Wire-verified. Full enumeration of all 4 kinds.',
         },
         'read': {
             'ty': 'IOManager/GetIOValue',
+            'layer': 'ws',
             'request':  {'ty': 'IOManager/GetIOValue',
                          'db': [{'type': 'DI', 'port': 0}],
                          'id': '<client_id>'},
             'response': {'ty': 'IOManager/GetIOValue',
                          'db': [{'type': 'DI', 'port': 0, 'value': 0}]},
             'cadence_ms_median': 500,
-            'notes': ('Wire-verified. Batch read; request db is a list '
-                       'of {type,port}; response db is a parallel list '
-                       'with a value per row. Mixed-type batches are '
-                       'legal by shape but not exercised in this capture '
-                       '(observed: 24-DI batches only).'),
+            'notes': 'Wire-verified. Batch read; mixed-kind batches legal by shape.',
         },
         'force': {
             'ty': 'IOManager/SetIOForcedFlag',
+            'layer': 'ws',
             'request':  {'ty': 'IOManager/SetIOForcedFlag',
                          'db': {'port': 2, 'value': 1, 'type': 'DI'},
                          'id': '<client_id>'},
             'response': {'ty': 'IOManager/SetIOForcedFlag', 'db': None},
             'wire_types_seen': ['DI'],
-            'notes': ('Wire-verified for type:"DI" only (17 calls, all '
-                       'DI). type:"DO" is SPEC-CONSISTENT but unverified '
-                       'on the wire — must be exercised live before the '
-                       'gate is opened for DO writes.'),
+            'notes': ('Wire-verified for type:"DI" only. type:"DO" '
+                       'is SPEC-CONSISTENT but unverified; must be '
+                       'exercised live before opening the gate for DO force.'),
         },
         'unforce': {
             'ty': 'IOManager/SetIOForcedFlag?  (unverified)',
-            'notes': ('SOURCE-ONLY. No unforce/release call observed in '
-                       'this capture; the trace ends with DI3 still '
-                       'forced. Whether the controller exposes '
-                       'IOManager/SetIOForcedFlag with a distinct flag, '
-                       'a separate ClearIOForced verb, or a name we '
-                       'have not seen is unknown. Must be captured '
-                       'before any UI toggles a force off.'),
+            'layer': 'ws',
+            'notes': 'SOURCE-ONLY — no unforce/release call ever observed.',
         },
-        'set': {
-            'ty': '<uncaptured>',
-            'notes': ('SOURCE-ONLY. No application-level DO SET verb '
-                       'appeared in this capture — the factory UI only '
-                       'exercised force/read. Application-level DO SET '
-                       'inside a running program is expected to be '
-                       'the Lua verb SetOut(port,value) emitted by the '
-                       'codegen, not a WS verb — that path is '
-                       'unimplemented in program_ops.codegen_lua_from_program '
-                       'today.'),
+        # -------------------- Lua / program-execution side ----------------
+        # All entries below are keys in luaenginelib.json — the
+        # controller's Lua template library. Exact spellings.
+        'lua_movJ': {
+            'ty': 'movJ',
+            'layer': 'lua',
+            'signature': 'movJ(p1, {v=..., a=..., b=..., rb=..., coor=..., tool=..., search=..., onpercent=...})',
+            'notes': 'Wire-verified. Emitted by program_ops.codegen_lua_from_program.',
+        },
+        'lua_movL': {
+            'ty': 'movL',
+            'layer': 'lua',
+            'signature': 'movL(p1, {v=..., a=..., b=..., rb=..., coor=..., tool=..., search=..., onpercent=...})',
+            'notes': 'Wire-verified. Not yet emitted (motion codegen only emits movJ).',
+        },
+        'lua_setDO': {
+            'ty': 'setDO',
+            'layer': 'lua',
+            'signature': 'setDO(port, value)',
+            'notes': ('Wire-verified. Emitted for set_io steps whose '
+                       'io_id starts with "DO". value coerced to 0/1.'),
+        },
+        'lua_setAO': {
+            'ty': 'setAO',
+            'layer': 'lua',
+            'signature': 'setAO(port, value)',
+            'notes': ('Wire-verified. Emitted for set_io steps whose '
+                       'io_id starts with "AO".'),
+        },
+        'lua_getDI': {
+            'ty': 'getDI',
+            'layer': 'lua',
+            'signature': 'val = getDI(port)',
+            'notes': ('Wire-verified. Not yet emitted — needed once we '
+                       'add a DI-wait / DI-read program step.'),
+        },
+        'lua_getDO': {
+            'ty': 'getDO',
+            'layer': 'lua',
+            'signature': 'val = getDO(port)',
+            'notes': 'Wire-verified. Not yet emitted.',
+        },
+        'lua_getAI': {
+            'ty': 'getAI',
+            'layer': 'lua',
+            'signature': 'val = getAI(port)',
+            'notes': 'Wire-verified. Not yet emitted.',
+        },
+        'lua_delay': {
+            'ty': 'waitCondition?  (unit unverified)',
+            'layer': 'lua',
+            'signature': 'res = waitCondition(condition, timeout)',
+            'notes': ('BLOCKED. The controller\'s luaenginelib.json '
+                       'has no plain sleep / wait / delay verb. The '
+                       'only wait-shaped primitive is waitCondition, '
+                       'and its timeout unit (ms vs s) is not '
+                       'declared. codegen currently emits a "-- skipped" '
+                       'comment for `action == "wait"`. Needs a save-'
+                       'shape capture of the factory UI Wait node '
+                       'to confirm the emit shape + timeout unit.'),
         },
     }
 

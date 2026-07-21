@@ -23,6 +23,7 @@ lives in one place.
 from __future__ import annotations
 
 import json
+import re as _re
 import time
 import urllib.error
 import urllib.request
@@ -124,12 +125,86 @@ def codegen_lua_from_program(
     # AUTHORED names; path (2) uses point_prefix + index. If both a
     # point_name and taught_joints are present on the same step, the
     # named point wins (authored schema is authoritative).
+    # Verb table verified against the controller's own
+    # /webmodel/cocontrol/luaeditor/luaenginelib.json (captured in
+    # data/estun_captures/estun_lua_io_v2_20260721.har). Every verb
+    # emitted below is a key in that library with the exact spelling
+    # shown here. Do NOT re-invent spellings — the interpreter rejects
+    # unknown names with 10012-class errors before any move runs.
+    #
+    # Wire-verified verbs currently used:
+    #   movJ(p, opts)            movJ($1,{v=..., a=..., b=..., ...})
+    #   setDO(port, value)       setDO($1,$2)      port in [0, 17]
+    #   setAO(port, value)       setAO($1,$2)      port in [0, 3]
+    #
+    # Wire-verified but not yet emitted (available for a future
+    # DI-wait / DO-read step):
+    #   val = getDI(port)        val = getDI($1)
+    #   val = getDO(port)        val = getDO($1)
+    #   val = getAI(port)        val = getAI($1)
+    #   val = getAO(port)        val = getAO($1)
+    #
+    # Delay: the 168-entry library has NO plain sleep/wait/delay verb.
+    # The only wait-shaped primitive is waitCondition(cond, timeout) —
+    # timeout unit unverified. A `wait` step therefore stays SKIPPED in
+    # the emitted Lua with an explanatory comment; the operator-side UI
+    # continues to flag it as "pending capture" in StepPreviewPanel.
     program_points = program.get('points') or {}
     exec_lines: list[str] = []
     fallback_idx = 0
     used_named: set[str] = set()   # named points that got REFERENCED
     for step in steps:
         action = step.get('action', '?')
+
+        # ---- DO / AO set — verified verbs setDO / setAO --------------
+        if action == 'set_io':
+            io_id = str(step.get('io_id') or '').strip()
+            m = _re.match(r'^(DO|AO)(\d+)$', io_id, _re.IGNORECASE)
+            if not m:
+                # DI writes aren't supported by the library (getDI is a
+                # reader; no setDI verb exists). System-reserved names
+                # (modeSwitch etc.) also fall through here.
+                exec_lines.append(f'-- skipped {action!r}: '
+                                  f'io_id {io_id!r} is not a writable DO/AO '
+                                  f'(DI is read-only per luaenginelib; '
+                                  f'system-reserved ports rejected)')
+                continue
+            kind = m.group(1).upper()
+            port = int(m.group(2))
+            raw_v = step.get('value')
+            if kind == 'DO':
+                if raw_v is None:
+                    exec_lines.append(f'-- skipped {action!r} {io_id!r}: '
+                                      f'value missing')
+                    continue
+                # DO takes 0/1 — coerce truthy → 1, everything else → 0.
+                v = 1 if int(bool(raw_v)) == 1 and raw_v not in (0, '0', False) else 0
+                exec_lines.append(f'setDO({port},{v})  -- step {action} {io_id}={v}')
+            else:  # AO
+                try:
+                    v_f = float(raw_v)
+                except (TypeError, ValueError):
+                    exec_lines.append(f'-- skipped {action!r} {io_id!r}: '
+                                      f'AO value {raw_v!r} not numeric')
+                    continue
+                exec_lines.append(f'setAO({port},{v_f:g})  -- step {action} {io_id}={v_f:g}')
+            continue
+
+        # ---- Wait / delay — verb NOT confirmed -----------------------
+        # See header comment: no plain sleep/wait/delay verb exists in
+        # luaenginelib.json. Emit a comment so line accounting still
+        # matches computeLineMap in the frontend (one line per step).
+        if action == 'wait':
+            dur = step.get('duration_s')
+            exec_lines.append(f'-- skipped {action!r}: no delay verb '
+                              f'confirmed in luaenginelib.json '
+                              f'(duration_s={dur!r}); needs a save-shape '
+                              f'capture of the factory UI Wait node to '
+                              f'confirm waitCondition(false, N) semantics + '
+                              f'timeout unit')
+            continue
+
+        # ---- Motion — movJ via point ref or inline taught_joints ----
         pn = step.get('point_name')
         if pn and pn in program_points:
             p = program_points[pn]
