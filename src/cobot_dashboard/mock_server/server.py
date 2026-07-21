@@ -816,6 +816,80 @@ async def mock_systemcheck_restart(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# I/O port map — mirrors the production endpoint. Stored under
+# /tmp/io_map.json so the mock never writes into /opt/cobot on dev
+# machines that lack the directory.
+# ---------------------------------------------------------------------------
+
+_MOCK_IO_MAP_PATH = os.environ.get('ROBOAI_MOCK_IO_MAP', '/tmp/roboai_io_map.json')
+_MOCK_IO_MAP_VERSION = 1
+
+
+def _mock_io_map_defaults(ai_n: int, ao_n: int) -> dict:
+    ports = {}
+    for i in range(8):
+        ports[f'DI{i}'] = {'assignment': 'Unassigned', 'in_use': False, 'notes': ''}
+    for i in range(8):
+        ports[f'DO{i}'] = {'assignment': 'Unassigned', 'in_use': False, 'notes': ''}
+    for i in range(ai_n):
+        ports[f'AI{i}'] = {'assignment': 'Unassigned', 'in_use': False, 'notes': ''}
+    for i in range(ao_n):
+        ports[f'AO{i}'] = {'assignment': 'Unassigned', 'in_use': False, 'notes': ''}
+    ports['24V'] = {'assignment': '+24 V DC', 'in_use': True, 'notes': 'Field power rail'}
+    ports['GND'] = {'assignment': '0 V / GND', 'in_use': True, 'notes': 'Common return'}
+    return ports
+
+
+def _mock_io_map_load() -> dict:
+    if os.path.isfile(_MOCK_IO_MAP_PATH):
+        try:
+            with open(_MOCK_IO_MAP_PATH) as f:
+                d = json.load(f)
+            if isinstance(d, dict) and isinstance(d.get('ports'), dict):
+                return d
+        except Exception:
+            pass
+    return {
+        'version': _MOCK_IO_MAP_VERSION,
+        'analog_input_count':  4,
+        'analog_output_count': 2,
+        'ports': _mock_io_map_defaults(4, 2),
+    }
+
+
+@app.get("/api/io/portmap")
+async def mock_io_portmap_get():
+    return _mock_io_map_load()
+
+
+@app.put("/api/io/portmap")
+async def mock_io_portmap_put(request: Request):
+    body = await request.json()
+    cur = _mock_io_map_load()
+    if 'analog_input_count' in body:
+        cur['analog_input_count'] = max(0, min(16, int(body['analog_input_count'])))
+    if 'analog_output_count' in body:
+        cur['analog_output_count'] = max(0, min(16, int(body['analog_output_count'])))
+    incoming = body.get('ports') or {}
+    for pid, meta in incoming.items():
+        if not isinstance(meta, dict):
+            continue
+        row = dict(cur['ports'].get(pid) or
+                   {'assignment': 'Unassigned', 'in_use': False, 'notes': ''})
+        if 'assignment' in meta: row['assignment'] = str(meta['assignment'])[:80]
+        if 'in_use'     in meta: row['in_use']     = bool(meta['in_use'])
+        if 'notes'      in meta: row['notes']      = str(meta['notes'])[:400]
+        cur['ports'][pid] = row
+    cur['version'] = _MOCK_IO_MAP_VERSION
+    try:
+        with open(_MOCK_IO_MAP_PATH, 'w') as f:
+            json.dump(cur, f, indent=2)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    return {'ok': True, 'portmap': cur}
+
+
+# ---------------------------------------------------------------------------
 # Static file serving (SPA fallback)
 # ---------------------------------------------------------------------------
 

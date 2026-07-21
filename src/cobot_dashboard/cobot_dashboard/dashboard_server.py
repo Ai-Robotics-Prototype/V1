@@ -5914,6 +5914,154 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({"error": str(e)}, status_code=500)
         return {"ok": True}
 
+    # ------------------------------------------------------------------
+    # I/O Port Map — connector-graphic assignments.
+    #
+    # Persists per-port metadata (assignment label, in-use flag, notes)
+    # to /opt/cobot/io_map.json. This is intentionally separate from
+    # io_config.json (which only stores string labels for the older list
+    # view); the port map carries richer metadata and an assignment
+    # workflow. No live-state read verbs are implemented here — the
+    # dashboard treats live state as "pending I/O capture" until the
+    # /estun/io read path is wired up.
+    # ------------------------------------------------------------------
+    _IO_MAP_PATH = '/opt/cobot/io_map.json'
+    _IO_MAP_VERSION = 1
+    _IO_MAP_DEFAULT_AI = 4   # Estun S10-140 / CC10-A manual default
+    _IO_MAP_DEFAULT_AO = 2   # Estun S10-140 / CC10-A manual default
+    # Fixed digital port counts — 8 DI + 8 DO — per the manual wiring
+    # diagram. Analog counts stay editable via the portmap PUT.
+    _IO_MAP_DI_COUNT = 8
+    _IO_MAP_DO_COUNT = 8
+
+    def _io_map_default_ports(ai_n: int, ao_n: int) -> dict:
+        ports = {}
+        for i in range(_IO_MAP_DI_COUNT):
+            ports[f'DI{i}'] = {'assignment': 'Unassigned',
+                                'in_use': False, 'notes': ''}
+        for i in range(_IO_MAP_DO_COUNT):
+            ports[f'DO{i}'] = {'assignment': 'Unassigned',
+                                'in_use': False, 'notes': ''}
+        for i in range(int(ai_n)):
+            ports[f'AI{i}'] = {'assignment': 'Unassigned',
+                                'in_use': False, 'notes': ''}
+        for i in range(int(ao_n)):
+            ports[f'AO{i}'] = {'assignment': 'Unassigned',
+                                'in_use': False, 'notes': ''}
+        # Power rails are display-only but modeled here so the UI has a
+        # single source of truth for their labels/notes.
+        ports['24V'] = {'assignment': '+24 V DC',
+                         'in_use': True, 'notes': 'Field power rail'}
+        ports['GND'] = {'assignment': '0 V / GND',
+                         'in_use': True, 'notes': 'Common return'}
+        return ports
+
+    def _io_map_load() -> dict:
+        if os.path.isfile(_IO_MAP_PATH):
+            try:
+                with open(_IO_MAP_PATH) as f:
+                    d = json.load(f)
+                if isinstance(d, dict) and isinstance(d.get('ports'), dict):
+                    ai_n = int(d.get('analog_input_count',
+                                     _IO_MAP_DEFAULT_AI))
+                    ao_n = int(d.get('analog_output_count',
+                                     _IO_MAP_DEFAULT_AO))
+                    return {
+                        'version': _IO_MAP_VERSION,
+                        'analog_input_count':  max(0, min(16, ai_n)),
+                        'analog_output_count': max(0, min(16, ao_n)),
+                        'ports': d['ports'],
+                    }
+            except Exception:
+                pass
+        return {
+            'version': _IO_MAP_VERSION,
+            'analog_input_count':  _IO_MAP_DEFAULT_AI,
+            'analog_output_count': _IO_MAP_DEFAULT_AO,
+            'ports': _io_map_default_ports(_IO_MAP_DEFAULT_AI,
+                                            _IO_MAP_DEFAULT_AO),
+        }
+
+    def _io_map_reconcile(state: dict) -> dict:
+        """Ensure the ports dict has an entry for every currently-configured
+        pin. Missing rows get the default 'Unassigned' shape so the UI
+        never renders a hole; extra rows (from a prior config with more
+        AI/AO) are preserved on disk but not re-emitted."""
+        ai_n = int(state.get('analog_input_count', _IO_MAP_DEFAULT_AI))
+        ao_n = int(state.get('analog_output_count', _IO_MAP_DEFAULT_AO))
+        defaults = _io_map_default_ports(ai_n, ao_n)
+        ports = dict(state.get('ports') or {})
+        for pid, dflt in defaults.items():
+            existing = ports.get(pid)
+            if not isinstance(existing, dict):
+                ports[pid] = dict(dflt)
+                continue
+            merged = dict(dflt)
+            for k in ('assignment', 'in_use', 'notes'):
+                if k in existing:
+                    merged[k] = existing[k]
+            ports[pid] = merged
+        state['ports'] = ports
+        return state
+
+    @app.get("/api/io/portmap")
+    async def api_io_portmap_get():
+        return _io_map_reconcile(_io_map_load())
+
+    @app.put("/api/io/portmap")
+    async def api_io_portmap_put(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        # Merge with existing on-disk state so partial PUTs are safe.
+        cur = _io_map_load()
+        if 'analog_input_count' in body:
+            try:
+                cur['analog_input_count'] = max(0, min(16,
+                    int(body['analog_input_count'])))
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "analog_input_count must be an integer"},
+                    status_code=400)
+        if 'analog_output_count' in body:
+            try:
+                cur['analog_output_count'] = max(0, min(16,
+                    int(body['analog_output_count'])))
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "analog_output_count must be an integer"},
+                    status_code=400)
+        incoming = body.get('ports') or {}
+        if not isinstance(incoming, dict):
+            return JSONResponse({"error": "'ports' must be an object"},
+                                status_code=400)
+        cur_ports = dict(cur.get('ports') or {})
+        for pid, meta in incoming.items():
+            if not isinstance(meta, dict):
+                continue
+            row = dict(cur_ports.get(pid) or
+                       {'assignment': 'Unassigned', 'in_use': False, 'notes': ''})
+            if 'assignment' in meta:
+                row['assignment'] = str(meta['assignment'])[:80]
+            if 'in_use' in meta:
+                row['in_use'] = bool(meta['in_use'])
+            if 'notes' in meta:
+                row['notes'] = str(meta['notes'])[:400]
+            cur_ports[pid] = row
+        cur['ports']   = cur_ports
+        cur['version'] = _IO_MAP_VERSION
+        cur = _io_map_reconcile(cur)
+        try:
+            os.makedirs(os.path.dirname(_IO_MAP_PATH), exist_ok=True)
+            tmp = _IO_MAP_PATH + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(cur, f, indent=2)
+            os.replace(tmp, _IO_MAP_PATH)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return {"ok": True, "portmap": cur}
+
     @app.put("/api/parts/{part_id}/config")
     async def api_parts_config(part_id: str, request: Request):
         """Update part orientation, surface choice, and grasp settings."""
