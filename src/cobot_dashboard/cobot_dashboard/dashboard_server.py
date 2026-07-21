@@ -4896,8 +4896,8 @@ if FASTAPI_AVAILABLE:
     # as "untaught" was the root cause of testwizard.json falsely
     # reporting has_taught_poses=false.
     _NON_MOTION_ACTIONS = frozenset({
-        'set_io', 'wait', 'loop', 'gripper', 'gripper_close',
-        'gripper_open', 'pause', 'comment', 'end',
+        'set_io', 'wait', 'wait_input', 'loop', 'gripper',
+        'gripper_close', 'gripper_open', 'pause', 'comment', 'end',
         'vacuum_on', 'vacuum_off',
     })
 
@@ -6133,8 +6133,11 @@ if FASTAPI_AVAILABLE:
             'ty': 'getDI',
             'layer': 'lua',
             'signature': 'val = getDI(port)',
-            'notes': ('Wire-verified. Not yet emitted — needed once we '
-                       'add a DI-wait / DI-read program step.'),
+            'notes': ('Wire-verified. Emitted for wait_input steps as '
+                       'a bare read: `_diN = getDI(port)`. A blocking '
+                       'wait-until-value pattern would compose with '
+                       'waitCondition, which has an undocumented timeout '
+                       'unit — not emitted.'),
         },
         'lua_getDO': {
             'ty': 'getDO',
@@ -6149,17 +6152,21 @@ if FASTAPI_AVAILABLE:
             'notes': 'Wire-verified. Not yet emitted.',
         },
         'lua_delay': {
-            'ty': 'waitCondition?  (unit unverified)',
+            'ty': '<absent>',
             'layer': 'lua',
-            'signature': 'res = waitCondition(condition, timeout)',
-            'notes': ('BLOCKED. The controller\'s luaenginelib.json '
-                       'has no plain sleep / wait / delay verb. The '
-                       'only wait-shaped primitive is waitCondition, '
-                       'and its timeout unit (ms vs s) is not '
-                       'declared. codegen currently emits a "-- skipped" '
-                       'comment for `action == "wait"`. Needs a save-'
-                       'shape capture of the factory UI Wait node '
-                       'to confirm the emit shape + timeout unit.'),
+            'signature': 'res = waitCondition(condition, timeout)  (only wait-shaped verb)',
+            'notes': ('DEFINITIVELY ABSENT. Full audit of luadoc.json '
+                       '(11 placeholder keys) and luaenginelib.json '
+                       '(168 verbs) turned up NO plain sleep/wait/'
+                       'delay/pause/tick/timer verb. Zero uses of '
+                       '"ms", "sec", "second", or "millisec" anywhere '
+                       'in any template or example. The only wait-'
+                       'shaped primitives are waitCondition, '
+                       'waitConnectSocketServer, waitConveyorObj — '
+                       'all take a `timeout` whose unit is not '
+                       'documented. codegen emits `-- skipped` for '
+                       '`action == "wait"` until a save-shape capture '
+                       'of the factory UI Wait node lands.'),
         },
     }
 

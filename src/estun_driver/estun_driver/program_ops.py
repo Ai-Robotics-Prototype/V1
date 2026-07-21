@@ -152,6 +152,7 @@ def codegen_lua_from_program(
     program_points = program.get('points') or {}
     exec_lines: list[str] = []
     fallback_idx = 0
+    di_read_idx  = 0   # counts wait_input steps → _di1, _di2, ... locals
     used_named: set[str] = set()   # named points that got REFERENCED
     for step in steps:
         action = step.get('action', '?')
@@ -190,18 +191,56 @@ def codegen_lua_from_program(
                 exec_lines.append(f'setAO({port},{v_f:g})  -- step {action} {io_id}={v_f:g}')
             continue
 
-        # ---- Wait / delay — verb NOT confirmed -----------------------
-        # See header comment: no plain sleep/wait/delay verb exists in
-        # luaenginelib.json. Emit a comment so line accounting still
-        # matches computeLineMap in the frontend (one line per step).
+        # ---- Wait / delay — verb DEFINITIVELY ABSENT -----------------
+        # Full audit of luadoc.json (11 keys, all placeholder strings)
+        # and luaenginelib.json (168 keys) turned up NO plain sleep /
+        # wait / delay / pause / tick / timer / clock verb. The only
+        # wait-shaped primitives are waitCondition(cond, timeout),
+        # waitConnectSocketServer(name, timeout), and waitConveyorObj(
+        # id, timeoutd) — and no `ms`, `sec`, `second`, or `millisec`
+        # string appears in any template or example, so the timeout
+        # unit for waitCondition is not documented either.
+        #
+        # Emit a comment so per-step line accounting stays 1:1 with
+        # computeLineMap on the frontend.
         if action == 'wait':
             dur = step.get('duration_s')
-            exec_lines.append(f'-- skipped {action!r}: no delay verb '
-                              f'confirmed in luaenginelib.json '
-                              f'(duration_s={dur!r}); needs a save-shape '
-                              f'capture of the factory UI Wait node to '
-                              f'confirm waitCondition(false, N) semantics + '
-                              f'timeout unit')
+            exec_lines.append(f'-- skipped {action!r}: no plain '
+                              f'sleep/wait/delay verb in luaenginelib.json '
+                              f'(168 verbs enumerated); duration_s={dur!r}. '
+                              f'waitCondition(false, N) is the closest '
+                              f'primitive but its timeout unit is '
+                              f'undocumented — unsafe to emit without a '
+                              f'wire-verified example.')
+            continue
+
+        # ---- Wait input — emit a getDI read -------------------------
+        # `getDI(port)` is wire-verified from luaenginelib.json:
+        #   {"lua": "$2 = getDI($1)", "vars": ["port", "var"]}
+        # Semantics of the emitted step: sample the DI channel and
+        # bind the value into a local. This is the read the user's
+        # brief mapped `wait_input` to. A blocking-wait pattern
+        # (waitCondition(getDI(port)==value, timeout)) would also
+        # need a wire-verified timeout unit, which is not documented
+        # — so it stays out of scope until captured.
+        if action == 'wait_input':
+            io_id = str(step.get('io_id') or '').strip()
+            m = _re.match(r'^DI(\d+)$', io_id, _re.IGNORECASE)
+            if not m:
+                exec_lines.append(f'-- skipped {action!r}: '
+                                  f'io_id {io_id!r} is not a DI port '
+                                  f'(getDI reads DI channels only)')
+                continue
+            port = int(m.group(1))
+            # Local variable name — one per wait_input step. `_diN`
+            # collides with no Lua keyword; downstream logic can wire
+            # it into a subsequent condition step.
+            di_read_idx += 1
+            local_name = f'_di{di_read_idx}'
+            exec_lines.append(f'{local_name} = getDI({port})  '
+                              f'-- step wait_input {io_id} '
+                              f'(read; blocking-wait pattern needs '
+                              f'waitCondition + unverified timeout unit)')
             continue
 
         # ---- Motion — movJ via point ref or inline taught_joints ----

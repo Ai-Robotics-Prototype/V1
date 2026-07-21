@@ -876,18 +876,19 @@ _MOCK_IO_VERBS = {
                    'notes': 'Wire-verified.'},
     'lua_getDI': {'ty': 'getDI',  'layer': 'lua',
                    'signature': 'val = getDI(port)',
-                   'notes': 'Wire-verified. Not yet emitted.'},
+                   'notes': 'Wire-verified. Emitted for wait_input steps as `_diN = getDI(port)`.'},
     'lua_getDO': {'ty': 'getDO',  'layer': 'lua',
                    'signature': 'val = getDO(port)',
                    'notes': 'Wire-verified.'},
     'lua_getAI': {'ty': 'getAI',  'layer': 'lua',
                    'signature': 'val = getAI(port)',
                    'notes': 'Wire-verified.'},
-    'lua_delay': {'ty': 'waitCondition?  (unit unverified)', 'layer': 'lua',
+    'lua_delay': {'ty': '<absent>', 'layer': 'lua',
                    'signature': 'res = waitCondition(condition, timeout)',
-                   'notes': ('BLOCKED. No plain sleep/wait/delay verb in '
-                              'luaenginelib.json. waitCondition timeout '
-                              'unit unconfirmed.')},
+                   'notes': ('DEFINITIVELY ABSENT. No plain sleep/wait/'
+                              'delay verb in luaenginelib.json (168 keys) '
+                              'or luadoc.json (11 placeholder keys). '
+                              'waitCondition timeout unit is undocumented.')},
 }
 
 def _mock_di_range(start, count, wiring):

@@ -4,8 +4,8 @@ import { deriveRunState, stepIndexForLine } from '../lib/runState'
 // Non-motion step actions — these don't take a pose. Keep in sync with
 // the backend's _NON_MOTION_ACTIONS in dashboard_server.py.
 const NON_MOTION_ACTIONS = new Set([
-  'set_io', 'wait', 'loop', 'gripper', 'gripper_close', 'gripper_open',
-  'pause', 'comment', 'end', 'vacuum_on', 'vacuum_off',
+  'set_io', 'wait', 'wait_input', 'loop', 'gripper', 'gripper_close',
+  'gripper_open', 'pause', 'comment', 'end', 'vacuum_on', 'vacuum_off',
 ])
 
 // Compact per-step target/status classifier for the step-preview panel.
@@ -47,7 +47,14 @@ function classifyStep(step, program) {
       return { kind: 'blocked', text: `I/O${port} · pending capture` }
     }
     if (action === 'wait') {
-      return { kind: 'blocked', text: `wait ${step?.duration_s ?? '?'}s · pending capture` }
+      return { kind: 'blocked', text: `wait ${step?.duration_s ?? '?'}s · no delay verb` }
+    }
+    if (action === 'wait_input') {
+      const port = step?.io_id ? ` ${step.io_id}` : ''
+      // wait_input emits a getDI(port) read via program_ops codegen —
+      // wire-verified verb, so this step is no longer blocked. Show
+      // as neutral non-motion.
+      return { kind: 'nonmotion', text: `read${port} (getDI)` }
     }
     if (action === 'loop') {
       const g = step?.goto != null ? ` → step ${step.goto}` : ''
