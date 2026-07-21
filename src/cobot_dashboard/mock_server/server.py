@@ -822,7 +822,7 @@ async def mock_systemcheck_restart(request: Request):
 # ---------------------------------------------------------------------------
 
 _MOCK_IO_MAP_PATH    = os.environ.get('ROBOAI_MOCK_IO_MAP', '/tmp/roboai_io_map.json')
-_MOCK_IO_MAP_VERSION = 2
+_MOCK_IO_MAP_VERSION = 3
 
 _MOCK_IO_SPECS = {
     'DI': {'voltage_typ_v': 24, 'voltage_max_v': 30, 'impedance_kohm': 10,
@@ -831,58 +831,102 @@ _MOCK_IO_SPECS = {
     'DO': {'voltage_typ_v': 24, 'voltage_max_v': 30, 'current_max_ma': 125,
            'polarity': 'PNP', 'terminals': ['24V', 'COM', 'DO'],
            'notes': 'Max 125 mA per DO group. External supply 24 V, 1 A per group.'},
-    'AIO': {'terminals': ['AI+', 'AI-', 'AGND', 'AO+', 'AO-'],
-            'notes': 'Analog inputs + outputs share the AI/O block.'},
-    'M-FUNC': {'notes': 'Multi-function block — assignment depends on cell wiring.'},
-    'PWR-CFG': {'terminals': ['24V', 'COM'],
-                'notes': 'Power configuration terminals feeding DI/DO groups. External supply 24 V, 1 A per group.'},
-    'SAFETY': {'notes': '4 dual-channel safety inputs + 1 safety output group. Category-rated per manual.'},
-    'FLANGE': {'notes': 'Tool-flange I/O on the end-effector connector. Flange DI is PNP. Flange DO can be PNP signal-only (≤5 mA) or NPN drive.',
+    'AI': {'terminals': ['AI+', 'AI-', 'AGND'],
+           'notes': 'Analog inputs.'},
+    'AO': {'terminals': ['AO+', 'AO-'],
+           'notes': 'Analog outputs.'},
+    'SYSTEM': {'notes': 'System-reserved DIs owned by the controller. Read-only.'},
+    'FLANGE': {'notes': 'Tool-flange I/O. Flange DI PNP. Flange DO PNP signal-only (≤5 mA) or NPN drive.',
                 'flange_di_polarity': 'PNP',
                 'flange_do_modes': ['PNP signal-only (≤5 mA)', 'NPN drive']},
 }
 
+_MOCK_IO_VERBS = {
+    'enumerate': {'ty': 'IOManager/GetIOInfo',
+                   'notes': 'Wire-verified in estun_io_20260721.har.'},
+    'read':      {'ty': 'IOManager/GetIOValue',
+                   'cadence_ms_median': 500,
+                   'notes': 'Wire-verified. Batch [{type,port}] request.'},
+    'force':     {'ty': 'IOManager/SetIOForcedFlag',
+                   'wire_types_seen': ['DI'],
+                   'notes': 'Wire-verified for type:"DI" only; type:"DO" SPEC-CONSISTENT unverified.'},
+    'unforce':   {'ty': '<uncaptured>', 'notes': 'SOURCE-ONLY.'},
+    'set':       {'ty': '<uncaptured>', 'notes': 'SOURCE-ONLY — expected as Lua SetOut.'},
+}
+
+_MOCK_IO_INV_DI = [
+    *[(i, f'DI{i}', None, 'general') for i in range(16)],
+    (16, 'modeSwitch',    'modeSwitch',           'system'),
+    (17, 'enableButton',  'enableButton',         'system'),
+    (18, 'flangeButton0', ['robotDrag', 0, None], 'flange'),
+    (19, 'flangeButton1', None, 'flange'),
+    (20, 'flangeButton2', None, 'flange'),
+    (21, 'flangeButton3', None, 'flange'),
+    (22, 'flangeDI0',     None, 'flange'),
+    (23, 'flangeDI1',     None, 'flange'),
+]
+_MOCK_IO_INV_DO = [
+    *[(i, f'DO{i}', None, 'general') for i in range(16)],
+    (16, 'flangeDO0', None, 'flange'),
+    (17, 'flangeDO1', None, 'flange'),
+]
+
 
 def _mock_io_map_default_blocks():
-    return [
-        {'id': 'MFUNC',  'kind': 'M-FUNC',  'label': 'M-Func',
-         'channels': ['MF0', 'MF1', 'MF2', 'MF3']},
-        {'id': 'DI-A',   'kind': 'DI',      'label': 'DI Block A',
-         'channels': [f'DI{i}' for i in range(0, 8)]},
-        {'id': 'DI-B',   'kind': 'DI',      'label': 'DI Block B',
-         'channels': [f'DI{i}' for i in range(8, 16)]},
-        {'id': 'DI-C',   'kind': 'DI',      'label': 'DI Block C',
-         'channels': [f'DI{i}' for i in range(16, 24)]},
-        {'id': 'PWRCFG', 'kind': 'PWR-CFG', 'label': 'Power Config',
-         'channels': ['24V-A', 'COM-A', '24V-B', 'COM-B']},
-        {'id': 'DO-A',   'kind': 'DO',      'label': 'DO Block A',
-         'channels': [f'DO{i}' for i in range(0, 8)]},
-        {'id': 'DO-B',   'kind': 'DO',      'label': 'DO Block B',
-         'channels': [f'DO{i}' for i in range(8, 16)]},
-        {'id': 'DO-C',   'kind': 'DO',      'label': 'DO Block C',
-         'channels': [f'DO{i}' for i in range(16, 24)]},
-        {'id': 'AIO',    'kind': 'AIO',     'label': 'Analog I/O',
-         'channels': ['AI0', 'AI1', 'AI2', 'AI3', 'AO0', 'AO1']},
-        {'id': 'SAFETY', 'kind': 'SAFETY',  'label': 'Safety I/O',
-         'channels': ['ES-A1', 'ES-A2', 'ES-B1', 'ES-B2',
-                       'GATE-A1', 'GATE-A2', 'GATE-B1', 'GATE-B2',
-                       'SAF-OUT-A', 'SAF-OUT-B']},
-        {'id': 'FLANGE', 'kind': 'FLANGE',  'label': 'Tool Flange I/O',
-         'channels': ['FDI0', 'FDI1', 'FDO0', 'FDO1']},
+    def _rows(kind, inv, group):
+        return [{'port': p, 'ch': f'{kind}{p}', 'default_name': dn, 'function': fn}
+                for (p, dn, fn, g) in inv if g == group]
+    blocks = [
+        {'id': 'DI-GEN', 'kind': 'DI', 'group': 'general',
+         'label': 'Digital Inputs — general',
+         'channels': [r['ch'] for r in _rows('DI', _MOCK_IO_INV_DI, 'general')],
+         'rows':     _rows('DI', _MOCK_IO_INV_DI, 'general')},
+        {'id': 'DO-GEN', 'kind': 'DO', 'group': 'general',
+         'label': 'Digital Outputs — general',
+         'channels': [r['ch'] for r in _rows('DO', _MOCK_IO_INV_DO, 'general')],
+         'rows':     _rows('DO', _MOCK_IO_INV_DO, 'general')},
+        {'id': 'DI-SYS', 'kind': 'DI', 'group': 'system',
+         'label': 'System-reserved', 'readonly': True,
+         'channels': [r['ch'] for r in _rows('DI', _MOCK_IO_INV_DI, 'system')],
+         'rows':     _rows('DI', _MOCK_IO_INV_DI, 'system')},
+        {'id': 'DI-FLG', 'kind': 'DI', 'group': 'flange',
+         'label': 'Flange Inputs',
+         'channels': [r['ch'] for r in _rows('DI', _MOCK_IO_INV_DI, 'flange')],
+         'rows':     _rows('DI', _MOCK_IO_INV_DI, 'flange')},
+        {'id': 'DO-FLG', 'kind': 'DO', 'group': 'flange',
+         'label': 'Flange Outputs',
+         'channels': [r['ch'] for r in _rows('DO', _MOCK_IO_INV_DO, 'flange')],
+         'rows':     _rows('DO', _MOCK_IO_INV_DO, 'flange')},
+        {'id': 'AI', 'kind': 'AI', 'group': 'analog', 'label': 'Analog Inputs',
+         'channels': [f'AI{i}' for i in range(4)],
+         'rows': [{'port': i, 'ch': f'AI{i}', 'default_name': f'AI{i}', 'function': None} for i in range(4)]},
+        {'id': 'AO', 'kind': 'AO', 'group': 'analog', 'label': 'Analog Outputs',
+         'channels': [f'AO{i}' for i in range(4)],
+         'rows': [{'port': i, 'ch': f'AO{i}', 'default_name': f'AO{i}', 'function': None} for i in range(4)]},
     ]
+    return blocks
 
 
 def _mock_io_map_default() -> dict:
     blocks = _mock_io_map_default_blocks()
     ports = {}
     for blk in blocks:
-        for ch in blk['channels']:
-            ports[ch] = {'assignment': 'Unassigned', 'in_use': False, 'notes': ''}
+        for row in blk.get('rows') or []:
+            ch = row['ch']
+            dn = row.get('default_name') or ch
+            sysflg = blk.get('group') in ('system', 'flange')
+            ports[ch] = {
+                'assignment': dn if sysflg else 'Unassigned',
+                'in_use':     sysflg,
+                'notes':      '',
+            }
     return {
         'version':     _MOCK_IO_MAP_VERSION,
-        'provisional': True,
+        'provisional': False,
+        'source':      'data/estun_captures/estun_io_20260721.har',
         'blocks':      blocks,
         'specs':       copy.deepcopy(_MOCK_IO_SPECS),
+        'verbs':       copy.deepcopy(_MOCK_IO_VERBS),
         'ports':       ports,
     }
 
@@ -892,9 +936,13 @@ def _mock_io_map_load() -> dict:
         try:
             with open(_MOCK_IO_MAP_PATH) as f:
                 d = json.load(f)
-            if isinstance(d, dict) and int(d.get('version') or 1) >= 2 \
+            if isinstance(d, dict) and int(d.get('version') or 1) >= _MOCK_IO_MAP_VERSION \
                     and isinstance(d.get('blocks'), list):
-                d['specs'] = copy.deepcopy(_MOCK_IO_SPECS)
+                # Fresh spec/verbs on every load — never trust stale
+                # copies on disk.
+                d['blocks'] = _mock_io_map_default_blocks()
+                d['specs']  = copy.deepcopy(_MOCK_IO_SPECS)
+                d['verbs']  = copy.deepcopy(_MOCK_IO_VERBS)
                 return d
         except Exception:
             pass

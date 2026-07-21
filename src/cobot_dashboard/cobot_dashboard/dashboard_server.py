@@ -5943,26 +5943,44 @@ if FASTAPI_AVAILABLE:
         return {"ok": True}
 
     # ------------------------------------------------------------------
-    # I/O Port Map — connector-graphic assignments.
+    # I/O Port Map — verified against the factory-controller WS capture
+    # at data/estun_captures/estun_io_20260721.har.
     #
-    # Schema v2 models the CC10-A back panel as an ordered list of
-    # "blocks" (M-FUNC · DI×3 · PWR-CFG · DO×3 · AI/O · SAFETY · FLANGE),
-    # each block carrying its own channel list + electrical spec.
-    # Per-channel operator metadata (assignment / in_use / notes) lives
-    # in the flat `ports` dict — the same shape as v1 so per-port PUTs
-    # are byte-compatible with the earlier client.
+    # Schema v3 replaces the earlier provisional block layout with the
+    # authoritative channel inventory reported by IOManager/GetIOInfo:
+    #   DI: 24 channels — general DI0-15 + modeSwitch@16 + enableButton@17
+    #                     + flangeButton0-3@18-21 (flangeButton0 name
+    #                     defaults to "Drag", function ['robotDrag',0,null])
+    #                     + flangeDI0/1@22-23
+    #   DO: 18 channels — general DO0-15 + flangeDO0/1@16-17
+    #   AI: 4 channels  — AI0-3
+    #   AO: 4 channels  — AO0-3
     #
-    # Channel counts are PROVISIONAL — the layout matches the panel
-    # photo, but until the terminal labels are read off the connector
-    # (or a live I/O capture verifies them), the numbers are marked
-    # `provisional: true` and the frontend badges them accordingly.
-    # No live-state read verbs are implemented here.
+    # Layout is organised by functional group (general / system-reserved /
+    # flange / analog) rather than the earlier CC10-A back-panel plug
+    # order — the panel-plug view was provisional and superseded by the
+    # controller's own enumeration.
+    #
+    # Wire verbs (documented in the emitted payload as `verbs`) come
+    # from the same capture:
+    #   IOManager/GetIOInfo      — enumerate, returns names + forced flags
+    #                              + function bindings
+    #   IOManager/GetIOValue     — batch read, request/response
+    #                              [{type,port,value}, ...]
+    #   IOManager/SetIOForcedFlag — force override (test-inject); ONLY
+    #                              type:"DI" seen in this capture; DO
+    #                              force + unforce/release verb are
+    #                              SOURCE-ONLY (unverified on the wire).
+    #
+    # Nothing in this module invokes those verbs. Driver-side bridge +
+    # allow_io gate + codegen extensions land in a follow-up pass, after
+    # a live-first force → GetIOValue round-trip is verified.
     # ------------------------------------------------------------------
     _IO_MAP_PATH    = '/opt/cobot/io_map.json'
-    _IO_MAP_VERSION = 2
+    _IO_MAP_VERSION = 3
 
-    # Kind-level specs — reference tooltips only. Numbers come from the
-    # manual OCR the operator confirmed:
+    # Kind-level electrical specs — reference tooltips only. Numbers
+    # come from the manual OCR the operator confirmed:
     #   DI: 24 V typ / 30 V max, ~10 kΩ, PNP or NPN
     #   DO: 24 V typ / 30 V max, max 125 mA per group, PNP
     #   External supply: 24 V, 1 A per group
@@ -5979,151 +5997,287 @@ if FASTAPI_AVAILABLE:
             'terminals': ['24V', 'COM', 'DO'],
             'notes': 'Max 125 mA per DO group. External supply 24 V, 1 A per group.',
         },
-        'AIO': {
-            'terminals': ['AI+', 'AI-', 'AGND', 'AO+', 'AO-'],
-            'notes': 'Analog inputs + outputs share the AI/O block.',
+        'AI': {
+            'terminals': ['AI+', 'AI-', 'AGND'],
+            'notes': 'Analog inputs, controller-mapped port 0-3.',
         },
-        'M-FUNC': {
-            'notes': 'Multi-function block — assignment depends on cell wiring.',
+        'AO': {
+            'terminals': ['AO+', 'AO-'],
+            'notes': 'Analog outputs, controller-mapped port 0-3.',
         },
-        'PWR-CFG': {
-            'terminals': ['24V', 'COM'],
-            'notes': 'Power configuration terminals feeding DI/DO groups. External supply 24 V, 1 A per group.',
-        },
-        'SAFETY': {
-            'notes': ('4 dual-channel safety inputs (E-Stop A/B, Guard A/B) '
-                       '+ 1 safety output group. Category-rated per manual.'),
+        'SYSTEM': {
+            'notes': ('System-reserved DIs owned by the controller '
+                       '(modeSwitch, enableButton). Read-only from the '
+                       'operator UI — do not force.'),
         },
         'FLANGE': {
             'notes': ('Tool-flange I/O on the end-effector connector. '
                        'Flange DI is PNP. Flange DO can be PNP signal-only '
-                       '(≤5 mA) or NPN drive.'),
+                       '(≤5 mA) or NPN drive. flangeButton0 defaults to '
+                       'the "Drag" function (robotDrag).'),
             'flange_di_polarity': 'PNP',
             'flange_do_modes': ['PNP signal-only (≤5 mA)', 'NPN drive'],
         },
     }
 
-    def _range_channels(prefix: str, start: int, count: int):
-        return [f'{prefix}{i}' for i in range(start, start + count)]
+    # IOManager wire verbs — populated in the emitted payload so
+    # operators, docs, and future code all see the same spec. Every
+    # shape here was observed on the wire in
+    # data/estun_captures/estun_io_20260721.har unless marked
+    # SOURCE-ONLY (uncaptured, spec-only until validated live).
+    _IO_VERBS = {
+        'enumerate': {
+            'ty': 'IOManager/GetIOInfo',
+            'request':  {'ty': 'IOManager/GetIOInfo', 'db': '', 'id': '<client_id>'},
+            'response': {'ty': 'IOManager/GetIOInfo', 'db':
+                {'DI': [{'port': 0, 'defaultName': 'DI0', 'name': 'DI0',
+                         'forced': 0, 'function': None}],
+                 'DO': [{'port': 0, 'defaultName': 'DO0', 'name': 'DO0',
+                         'forced': 0, 'function': None}],
+                 'AI': [{'port': 0, 'defaultName': 'AI0', 'name': 'AI0',
+                         'forced': 0, 'function': None}],
+                 'AO': [{'port': 0, 'defaultName': 'AO0', 'name': 'AO0',
+                         'forced': 0, 'function': None}]}},
+            'notes': ('Wire-verified. Full enumeration of all 4 kinds. '
+                       'name is operator-editable; defaultName is factory. '
+                       'forced ∈ {0,1}. function may be a role tag such '
+                       "as ['robotDrag', 0, null] for flangeButton0."),
+        },
+        'read': {
+            'ty': 'IOManager/GetIOValue',
+            'request':  {'ty': 'IOManager/GetIOValue',
+                         'db': [{'type': 'DI', 'port': 0}],
+                         'id': '<client_id>'},
+            'response': {'ty': 'IOManager/GetIOValue',
+                         'db': [{'type': 'DI', 'port': 0, 'value': 0}]},
+            'cadence_ms_median': 500,
+            'notes': ('Wire-verified. Batch read; request db is a list '
+                       'of {type,port}; response db is a parallel list '
+                       'with a value per row. Mixed-type batches are '
+                       'legal by shape but not exercised in this capture '
+                       '(observed: 24-DI batches only).'),
+        },
+        'force': {
+            'ty': 'IOManager/SetIOForcedFlag',
+            'request':  {'ty': 'IOManager/SetIOForcedFlag',
+                         'db': {'port': 2, 'value': 1, 'type': 'DI'},
+                         'id': '<client_id>'},
+            'response': {'ty': 'IOManager/SetIOForcedFlag', 'db': None},
+            'wire_types_seen': ['DI'],
+            'notes': ('Wire-verified for type:"DI" only (17 calls, all '
+                       'DI). type:"DO" is SPEC-CONSISTENT but unverified '
+                       'on the wire — must be exercised live before the '
+                       'gate is opened for DO writes.'),
+        },
+        'unforce': {
+            'ty': 'IOManager/SetIOForcedFlag?  (unverified)',
+            'notes': ('SOURCE-ONLY. No unforce/release call observed in '
+                       'this capture; the trace ends with DI3 still '
+                       'forced. Whether the controller exposes '
+                       'IOManager/SetIOForcedFlag with a distinct flag, '
+                       'a separate ClearIOForced verb, or a name we '
+                       'have not seen is unknown. Must be captured '
+                       'before any UI toggles a force off.'),
+        },
+        'set': {
+            'ty': '<uncaptured>',
+            'notes': ('SOURCE-ONLY. No application-level DO SET verb '
+                       'appeared in this capture — the factory UI only '
+                       'exercised force/read. Application-level DO SET '
+                       'inside a running program is expected to be '
+                       'the Lua verb SetOut(port,value) emitted by the '
+                       'codegen, not a WS verb — that path is '
+                       'unimplemented in program_ops.codegen_lua_from_program '
+                       'today.'),
+        },
+    }
+
+    # Verified inventory from the capture's IOManager/GetIOInfo response.
+    # Each row: (port, kind, default_name, function_tag, group)
+    # Groups: "general" | "system" | "flange" | "analog"
+    _IO_INVENTORY_DI = [
+        (0,  'DI0',           None, 'general'),
+        (1,  'DI1',           None, 'general'),
+        (2,  'DI2',           None, 'general'),
+        (3,  'DI3',           None, 'general'),
+        (4,  'DI4',           None, 'general'),
+        (5,  'DI5',           None, 'general'),
+        (6,  'DI6',           None, 'general'),
+        (7,  'DI7',           None, 'general'),
+        (8,  'DI8',           None, 'general'),
+        (9,  'DI9',           None, 'general'),
+        (10, 'DI10',          None, 'general'),
+        (11, 'DI11',          None, 'general'),
+        (12, 'DI12',          None, 'general'),
+        (13, 'DI13',          None, 'general'),
+        (14, 'DI14',          None, 'general'),
+        (15, 'DI15',          None, 'general'),
+        (16, 'modeSwitch',    'modeSwitch',           'system'),
+        (17, 'enableButton',  'enableButton',         'system'),
+        (18, 'flangeButton0', ['robotDrag', 0, None], 'flange'),
+        (19, 'flangeButton1', None, 'flange'),
+        (20, 'flangeButton2', None, 'flange'),
+        (21, 'flangeButton3', None, 'flange'),
+        (22, 'flangeDI0',     None, 'flange'),
+        (23, 'flangeDI1',     None, 'flange'),
+    ]
+    _IO_INVENTORY_DO = [
+        (0,  'DO0',       None, 'general'),
+        (1,  'DO1',       None, 'general'),
+        (2,  'DO2',       None, 'general'),
+        (3,  'DO3',       None, 'general'),
+        (4,  'DO4',       None, 'general'),
+        (5,  'DO5',       None, 'general'),
+        (6,  'DO6',       None, 'general'),
+        (7,  'DO7',       None, 'general'),
+        (8,  'DO8',       None, 'general'),
+        (9,  'DO9',       None, 'general'),
+        (10, 'DO10',      None, 'general'),
+        (11, 'DO11',      None, 'general'),
+        (12, 'DO12',      None, 'general'),
+        (13, 'DO13',      None, 'general'),
+        (14, 'DO14',      None, 'general'),
+        (15, 'DO15',      None, 'general'),
+        (16, 'flangeDO0', None, 'flange'),
+        (17, 'flangeDO1', None, 'flange'),
+    ]
 
     def _io_map_default_blocks():
-        """Left-to-right block order matches the CC10-A back panel:
-        M-FUNC · DI×3 · PWR-CFG · DO×3 · AI/O · SAFETY · FLANGE."""
-        return [
-            {
-                'id':       'MFUNC',
-                'kind':     'M-FUNC',
-                'label':    'M-Func',
-                'channels': ['MF0', 'MF1', 'MF2', 'MF3'],
-            },
-            {
-                'id':       'DI-A',
-                'kind':     'DI',
-                'label':    'DI Block A',
-                'channels': _range_channels('DI', 0, 8),
-            },
-            {
-                'id':       'DI-B',
-                'kind':     'DI',
-                'label':    'DI Block B',
-                'channels': _range_channels('DI', 8, 8),
-            },
-            {
-                'id':       'DI-C',
-                'kind':     'DI',
-                'label':    'DI Block C',
-                'channels': _range_channels('DI', 16, 8),
-            },
-            {
-                'id':       'PWRCFG',
-                'kind':     'PWR-CFG',
-                'label':    'Power Config',
-                'channels': ['24V-A', 'COM-A', '24V-B', 'COM-B'],
-            },
-            {
-                'id':       'DO-A',
-                'kind':     'DO',
-                'label':    'DO Block A',
-                'channels': _range_channels('DO', 0, 8),
-            },
-            {
-                'id':       'DO-B',
-                'kind':     'DO',
-                'label':    'DO Block B',
-                'channels': _range_channels('DO', 8, 8),
-            },
-            {
-                'id':       'DO-C',
-                'kind':     'DO',
-                'label':    'DO Block C',
-                'channels': _range_channels('DO', 16, 8),
-            },
-            {
-                'id':       'AIO',
-                'kind':     'AIO',
-                'label':    'Analog I/O',
-                'channels': ['AI0', 'AI1', 'AI2', 'AI3', 'AO0', 'AO1'],
-            },
-            {
-                'id':       'SAFETY',
-                'kind':     'SAFETY',
-                'label':    'Safety I/O',
-                'channels': ['ES-A1', 'ES-A2', 'ES-B1', 'ES-B2',
-                             'GATE-A1', 'GATE-A2', 'GATE-B1', 'GATE-B2',
-                             'SAF-OUT-A', 'SAF-OUT-B'],
-            },
-            {
-                'id':       'FLANGE',
-                'kind':     'FLANGE',
-                'label':    'Tool Flange I/O',
-                'channels': ['FDI0', 'FDI1', 'FDO0', 'FDO1'],
-            },
-        ]
+        """Functional-group layout aligned with the controller's own
+        IOManager/GetIOInfo enumeration. Four groups × four kinds =
+        the block set the UI renders. Any kind that's empty in a
+        given group is simply omitted from the block list."""
+
+        def _rows(kind, inv, group_name):
+            return [{
+                'port':          p,
+                'ch':            f'{kind}{p}',
+                'default_name':  dn,
+                'function':      fn,
+            } for (p, dn, fn, g) in inv if g == group_name]
+
+        blocks = []
+        # General digital I/O — DI0-15 + DO0-15
+        blocks.append({
+            'id': 'DI-GEN', 'kind': 'DI', 'group': 'general',
+            'label': 'Digital Inputs — general',
+            'channels': [r['ch'] for r in _rows('DI', _IO_INVENTORY_DI, 'general')],
+            'rows':     _rows('DI', _IO_INVENTORY_DI, 'general'),
+        })
+        blocks.append({
+            'id': 'DO-GEN', 'kind': 'DO', 'group': 'general',
+            'label': 'Digital Outputs — general',
+            'channels': [r['ch'] for r in _rows('DO', _IO_INVENTORY_DO, 'general')],
+            'rows':     _rows('DO', _IO_INVENTORY_DO, 'general'),
+        })
+        # System-reserved DIs — the controller owns these, they must be
+        # rendered read-only and never appear in force targets.
+        blocks.append({
+            'id': 'DI-SYS', 'kind': 'DI', 'group': 'system',
+            'label': 'System-reserved',
+            'channels': [r['ch'] for r in _rows('DI', _IO_INVENTORY_DI, 'system')],
+            'rows':     _rows('DI', _IO_INVENTORY_DI, 'system'),
+            'readonly': True,
+        })
+        # Flange I/O — DI18-23 + DO16-17
+        blocks.append({
+            'id': 'DI-FLG', 'kind': 'DI', 'group': 'flange',
+            'label': 'Flange Inputs',
+            'channels': [r['ch'] for r in _rows('DI', _IO_INVENTORY_DI, 'flange')],
+            'rows':     _rows('DI', _IO_INVENTORY_DI, 'flange'),
+        })
+        blocks.append({
+            'id': 'DO-FLG', 'kind': 'DO', 'group': 'flange',
+            'label': 'Flange Outputs',
+            'channels': [r['ch'] for r in _rows('DO', _IO_INVENTORY_DO, 'flange')],
+            'rows':     _rows('DO', _IO_INVENTORY_DO, 'flange'),
+        })
+        # Analog — 4 in, 4 out.
+        blocks.append({
+            'id': 'AI',  'kind': 'AI',  'group': 'analog',
+            'label': 'Analog Inputs',
+            'channels': [f'AI{i}' for i in range(4)],
+            'rows':     [{'port': i, 'ch': f'AI{i}',
+                           'default_name': f'AI{i}', 'function': None}
+                          for i in range(4)],
+        })
+        blocks.append({
+            'id': 'AO',  'kind': 'AO',  'group': 'analog',
+            'label': 'Analog Outputs',
+            'channels': [f'AO{i}' for i in range(4)],
+            'rows':     [{'port': i, 'ch': f'AO{i}',
+                           'default_name': f'AO{i}', 'function': None}
+                          for i in range(4)],
+        })
+        return blocks
 
     def _io_map_default() -> dict:
         blocks = _io_map_default_blocks()
         ports: dict = {}
         for blk in blocks:
-            for ch in blk['channels']:
-                ports[ch] = {'assignment': 'Unassigned',
-                             'in_use': False, 'notes': ''}
+            for row in blk.get('rows') or []:
+                ch = row['ch']
+                # Seed the port-level operator metadata with the factory
+                # default name so a fresh install shows meaningful
+                # labels (modeSwitch, flangeDO0, etc.) rather than
+                # "Unassigned" for the system + flange channels.
+                dn = row.get('default_name') or ch
+                system_or_flange = blk.get('group') in ('system', 'flange')
+                ports[ch] = {
+                    'assignment': dn if system_or_flange else 'Unassigned',
+                    'in_use':     system_or_flange,
+                    'notes':      '',
+                }
         return {
             'version':     _IO_MAP_VERSION,
-            'provisional': True,
+            'provisional': False,   # inventory is now wire-verified
+            'source':      'data/estun_captures/estun_io_20260721.har',
             'blocks':      blocks,
             'specs':       copy.deepcopy(_IO_SPECS),
+            'verbs':       copy.deepcopy(_IO_VERBS),
             'ports':       ports,
         }
 
     def _io_map_reconcile(state: dict) -> dict:
-        """Ensure every declared channel has a metadata row. Missing
-        rows get the default 'Unassigned' shape; extra rows are
-        preserved on disk (so an operator's hand-edited channel list
-        can be restored)."""
-        blocks = state.get('blocks') or _io_map_default_blocks()
-        state['blocks'] = blocks
-        ports = dict(state.get('ports') or {})
-        for blk in blocks:
-            for ch in blk.get('channels') or []:
-                if not isinstance(ports.get(ch), dict):
-                    ports[ch] = {'assignment': 'Unassigned',
-                                 'in_use': False, 'notes': ''}
-                else:
-                    for k, dflt in (('assignment', 'Unassigned'),
-                                     ('in_use', False),
-                                     ('notes', '')):
-                        ports[ch].setdefault(k, dflt)
-        state['ports'] = ports
-        state['specs'] = copy.deepcopy(_IO_SPECS)
-        state['provisional'] = bool(state.get('provisional', True))
+        """Merge the on-disk state with the current default layout.
+        Blocks always come from _io_map_default_blocks() so the
+        verified inventory + functional-group structure is enforced;
+        per-channel operator metadata (assignment / in_use / notes) is
+        carried forward from the incoming state where available."""
+        default_blocks = _io_map_default_blocks()
+        state['blocks'] = default_blocks
+        state['specs']  = copy.deepcopy(_IO_SPECS)
+        state['verbs']  = copy.deepcopy(_IO_VERBS)
+        state['provisional'] = False
+        state['source'] = 'data/estun_captures/estun_io_20260721.har'
+        prior = dict(state.get('ports') or {})
+        merged = {}
+        for blk in default_blocks:
+            for row in blk.get('rows') or []:
+                ch = row['ch']
+                dn = row.get('default_name') or ch
+                sysflg = blk.get('group') in ('system', 'flange')
+                base = {
+                    'assignment': dn if sysflg else 'Unassigned',
+                    'in_use':     sysflg,
+                    'notes':      '',
+                }
+                existing = prior.get(ch)
+                if isinstance(existing, dict):
+                    for k in ('assignment', 'in_use', 'notes'):
+                        if k in existing:
+                            base[k] = existing[k]
+                merged[ch] = base
+        state['ports'] = merged
         return state
 
-    def _io_map_migrate_v1(v1: dict) -> dict:
-        """Convert a v1 flat portmap into a v2 block layout. Carries
-        over any operator-authored labels / notes for channels that
-        still exist in the v2 default layout."""
+    def _io_map_migrate_from_older(old: dict) -> dict:
+        """v1 flat portmap / v2 block layout → v3. Any operator
+        assignment/notes that still target a channel present in the
+        verified layout is carried over. Anything else is dropped
+        (with the on-disk file being rewritten in v3 form)."""
         new = _io_map_default()
-        old_ports = v1.get('ports') or {}
+        old_ports = old.get('ports') or {}
         for ch, row in old_ports.items():
             if ch in new['ports'] and isinstance(row, dict):
                 for k in ('assignment', 'in_use', 'notes'):
@@ -6138,10 +6292,10 @@ if FASTAPI_AVAILABLE:
                     d = json.load(f)
                 if isinstance(d, dict):
                     ver = int(d.get('version') or 1)
-                    if ver >= 2 and isinstance(d.get('blocks'), list):
+                    if ver >= _IO_MAP_VERSION \
+                            and isinstance(d.get('blocks'), list):
                         return _io_map_reconcile(d)
-                    # v1 or unversioned — migrate forward.
-                    return _io_map_migrate_v1(d)
+                    return _io_map_migrate_from_older(d)
             except Exception:
                 pass
         return _io_map_default()
@@ -6163,43 +6317,28 @@ if FASTAPI_AVAILABLE:
 
     @app.put("/api/io/portmap")
     async def api_io_portmap_put(request: Request):
+        """Accepts per-channel operator metadata patches only.
+        Block structure + channel membership are authoritative from
+        the controller's IOManager/GetIOInfo enumeration and are not
+        editable via this endpoint. Any `blocks` field in the incoming
+        body is silently ignored (older frontend compat)."""
         try:
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
         cur = _io_map_load()
-        # Block-level channel edits — operator adjusts the count / names
-        # per block. Passed as {"blocks": [{"id":"DI-A","channels":[...]}]}
-        # (partial — only the changed blocks are listed).
-        incoming_blocks = body.get('blocks')
-        if isinstance(incoming_blocks, list):
-            by_id = {b['id']: b for b in cur.get('blocks', [])
-                     if isinstance(b, dict) and 'id' in b}
-            for patch in incoming_blocks:
-                if not isinstance(patch, dict) or 'id' not in patch:
-                    continue
-                bid = patch['id']
-                blk = by_id.get(bid)
-                if blk is None:
-                    continue
-                if isinstance(patch.get('channels'), list):
-                    clean = [str(c)[:24] for c in patch['channels']
-                             if isinstance(c, (str, int))]
-                    blk['channels'] = clean
-                if 'label' in patch:
-                    blk['label'] = str(patch['label'])[:60]
-            cur['blocks'] = list(by_id.values()) if by_id else cur.get('blocks', [])
-            # Preserve original ordering.
-            cur['blocks'] = [b for b in cur.get('blocks', [])]
-        # Per-channel operator metadata.
         incoming_ports = body.get('ports')
         if isinstance(incoming_ports, dict):
             cur_ports = dict(cur.get('ports') or {})
             for pid, meta in incoming_ports.items():
                 if not isinstance(meta, dict):
                     continue
-                row = dict(cur_ports.get(pid) or
-                           {'assignment': 'Unassigned', 'in_use': False, 'notes': ''})
+                # Never let a PUT create a channel that isn't in the
+                # verified inventory — it would be invisible in the UI
+                # and would drift out of sync on the next reconcile.
+                if pid not in cur_ports:
+                    continue
+                row = dict(cur_ports[pid])
                 if 'assignment' in meta:
                     row['assignment'] = str(meta['assignment'])[:80]
                 if 'in_use' in meta:
@@ -6208,8 +6347,6 @@ if FASTAPI_AVAILABLE:
                     row['notes'] = str(meta['notes'])[:400]
                 cur_ports[pid] = row
             cur['ports'] = cur_ports
-        if 'provisional' in body:
-            cur['provisional'] = bool(body['provisional'])
         cur['version'] = _IO_MAP_VERSION
         cur = _io_map_reconcile(cur)
         ok, err = _io_map_save(cur)

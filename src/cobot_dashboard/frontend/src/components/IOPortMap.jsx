@@ -20,19 +20,19 @@ const C = {
 // Per-kind colour + rendering hint. The frontend never assumes anything
 // about channel counts — those come from the server's blocks[].channels.
 const KIND_META = {
-  'DI':      { color: '#3B82F6', short: 'DI',     kindLabel: 'Digital Input' },
-  'DO':      { color: '#16A34A', short: 'DO',     kindLabel: 'Digital Output' },
-  'AIO':     { color: '#9333EA', short: 'AI/O',   kindLabel: 'Analog I/O' },
-  'M-FUNC':  { color: '#0EA5E9', short: 'M-FUNC', kindLabel: 'Multi-function' },
-  'PWR-CFG': { color: '#DC2626', short: 'PWR',    kindLabel: 'Power Config' },
-  'SAFETY':  { color: '#B45309', short: 'SAFETY', kindLabel: 'Safety I/O' },
-  'FLANGE':  { color: '#7C3AED', short: 'FLANGE', kindLabel: 'Tool Flange' },
+  'DI': { color: '#3B82F6', short: 'DI', kindLabel: 'Digital Input' },
+  'DO': { color: '#16A34A', short: 'DO', kindLabel: 'Digital Output' },
+  'AI': { color: '#CA8A04', short: 'AI', kindLabel: 'Analog Input' },
+  'AO': { color: '#9333EA', short: 'AO', kindLabel: 'Analog Output' },
 }
 
-// Groups render across the panel strip (M-Func / DI / PWR / DO / AI/O)
-// or as separate rows below (SAFETY, FLANGE) — the panel photo shows
-// those on their own connectors.
-const STRIP_KINDS = new Set(['M-FUNC', 'DI', 'PWR-CFG', 'DO', 'AIO'])
+// Group meta — controls layout row + a subtle tint on the block header.
+const GROUP_META = {
+  general: { label: 'General',          tint: 'transparent' },
+  system:  { label: 'System-reserved',  tint: '#FEF3C7' },
+  flange:  { label: 'Flange (tool)',    tint: '#F3E8FF' },
+  analog:  { label: 'Analog',           tint: '#FEF9C3' },
+}
 
 // ---------------------------------------------------------------------------
 // Inline editable string. Click → input; Enter/blur commits; Esc cancels.
@@ -106,10 +106,12 @@ function InlineEditable({ value, onSave, placeholder = 'Unassigned' }) {
 // ---------------------------------------------------------------------------
 function LiveStatePill({ kind }) {
   const dot = C.textDim
-  const isAnalog = kind === 'AIO'
+  const isAnalog = kind === 'AI' || kind === 'AO'
   return (
     <span
-      title="Live state — pending I/O capture"
+      title={'Live state pending driver bridge — verbs captured '
+              + '(IOManager/GetIOValue etc.) but not yet wired to the '
+              + 'dashboard; awaits live-first force→read validation.'}
       style={{
         display: 'inline-flex', alignItems: 'center', gap: 4,
         fontSize: 9, fontFamily: 'monospace',
@@ -129,12 +131,15 @@ function LiveStatePill({ kind }) {
 // ---------------------------------------------------------------------------
 // Single channel row inside a block.
 // ---------------------------------------------------------------------------
-function ChannelRow({ id, kind, meta, onEdit, editable }) {
+function ChannelRow({ id, kind, meta, row, onEdit, editable }) {
   const inUse = !!meta?.in_use
   const label = meta?.assignment || 'Unassigned'
   const notes = meta?.notes || ''
   const [showNotes, setShowNotes] = useState(false)
   const bankColor = KIND_META[kind]?.color || C.textMuted
+  const fnTag = row?.function
+  const port  = row?.port
+  const defaultName = row?.default_name
 
   return (
     <div
@@ -152,12 +157,14 @@ function ChannelRow({ id, kind, meta, onEdit, editable }) {
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
-        <span style={{
-          fontSize: 10, fontWeight: 700, fontFamily: 'monospace',
-          color: bankColor,
-          minWidth: 44, textAlign: 'left',
-          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-        }}>{id}</span>
+        <span
+          title={defaultName && defaultName !== id ? `factory: ${defaultName}` : id}
+          style={{
+            fontSize: 10, fontWeight: 700, fontFamily: 'monospace',
+            color: bankColor,
+            minWidth: 52, textAlign: 'left',
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>{kind}{port ?? ''}</span>
         {editable && (
           <input
             type="checkbox"
@@ -177,11 +184,22 @@ function ChannelRow({ id, kind, meta, onEdit, editable }) {
               })}
             />
           ) : (
-            <span style={{
-              fontSize: 11, color: C.text,
-              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-              display: 'block',
-            }}>{label}</span>
+            <span
+              title={fnTag ? `controller function: ${JSON.stringify(fnTag)}` : undefined}
+              style={{
+                fontSize: 11, color: C.text,
+                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                display: 'block',
+              }}>
+              {label}
+              {fnTag && (
+                <span style={{
+                  marginLeft: 6, fontSize: 9, fontFamily: 'monospace',
+                  color: C.amber, background: '#FEF3C7',
+                  padding: '0 4px', borderRadius: 2,
+                }}>fn</span>
+              )}
+            </span>
           )}
         </div>
         <LiveStatePill kind={kind} />
@@ -262,12 +280,16 @@ function specTooltip(kind, specs) {
 // ---------------------------------------------------------------------------
 function Block({ block, ports, specs, onEdit }) {
   const kind    = block.kind
+  const group   = block.group || 'general'
   const meta    = KIND_META[kind] || { color: C.textMuted, short: kind, kindLabel: kind }
+  const grpMeta = GROUP_META[group] || GROUP_META.general
   const spec    = specs?.[kind] || {}
-  // Editability rules:
-  //   - PWR-CFG channels aren't operator-assignable (they're power terminals).
-  //   - Everything else is editable, including SAFETY + FLANGE names.
-  const editable = kind !== 'PWR-CFG'
+  const rows    = Array.isArray(block.rows) ? block.rows :
+                  (Array.isArray(block.channels)
+                    ? block.channels.map((ch) => ({ ch, port: null,
+                                                     default_name: ch, function: null }))
+                    : [])
+  const editable = !block.readonly
   const tip      = specTooltip(kind, specs)
 
   return (
@@ -283,7 +305,7 @@ function Block({ block, ports, specs, onEdit }) {
       <div style={{
         display: 'flex', alignItems: 'center', gap: 8,
         padding: '6px 10px',
-        background: C.headerBg,
+        background: grpMeta.tint !== 'transparent' ? grpMeta.tint : C.headerBg,
         borderBottom: `1px solid ${C.border}`,
         borderTop: `3px solid ${meta.color}`,
       }}>
@@ -303,11 +325,20 @@ function Block({ block, ports, specs, onEdit }) {
         }}>
           {block.label}
         </span>
+        {block.readonly && (
+          <span
+            title="Read-only — controller owns this signal."
+            style={{
+              fontSize: 9, fontWeight: 700, color: '#92400E',
+              background: '#FEF3C7', padding: '1px 6px', borderRadius: 3,
+              flexShrink: 0,
+            }}>read-only</span>
+        )}
         <span style={{
           fontSize: 10, color: C.textMuted, fontFamily: 'monospace',
           flexShrink: 0,
         }}>
-          {(block.channels || []).length} ch
+          {rows.length} ch
         </span>
         {tip && (
           <span
@@ -342,15 +373,16 @@ function Block({ block, ports, specs, onEdit }) {
         display: 'flex', flexDirection: 'column', gap: 3,
         padding: 6,
       }}>
-        {(block.channels || []).length === 0 ? (
+        {rows.length === 0 ? (
           <div style={{ fontSize: 11, color: C.textDim, padding: '6px 4px' }}>
             No channels configured.
           </div>
-        ) : (block.channels || []).map((ch) => (
+        ) : rows.map((row) => (
           <ChannelRow
-            key={ch}
-            id={ch} kind={kind}
-            meta={ports?.[ch]}
+            key={row.ch}
+            id={row.ch} kind={kind}
+            meta={ports?.[row.ch]}
+            row={row}
             editable={editable}
             onEdit={onEdit}
           />
@@ -363,7 +395,7 @@ function Block({ block, ports, specs, onEdit }) {
 // ---------------------------------------------------------------------------
 // Legend / status bar.
 // ---------------------------------------------------------------------------
-function Legend({ assignedCount, totalCount, saving, onReset, provisional }) {
+function Legend({ assignedCount, totalCount, saving, onReset, source }) {
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 14,
@@ -374,19 +406,31 @@ function Legend({ assignedCount, totalCount, saving, onReset, provisional }) {
       borderRadius: 6,
       fontSize: 11, color: C.textMuted,
     }}>
-      {provisional && (
-        <span style={{
+      <span
+        title={`Inventory verified from ${source || 'the factory-controller capture'}.`}
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: 6,
+          padding: '2px 8px', borderRadius: 4,
+          background: '#DCFCE7', color: '#166534',
+          fontWeight: 600, fontSize: 10,
+          border: '1px solid #BBF7D0',
+        }}>
+        VERIFIED
+      </span>
+      <span
+        title={'IOManager/GetIOValue captured, IOManager/SetIOForcedFlag '
+                + 'captured for type:"DI" only. Driver bridge + allow_io '
+                + 'gate not yet wired — live values, force, and '
+                + 'program-side SET_IO remain pending a live-first check.'}
+        style={{
           display: 'inline-flex', alignItems: 'center', gap: 6,
           padding: '2px 8px', borderRadius: 4,
           background: '#FEF3C7', color: '#92400E',
           fontWeight: 600, fontSize: 10,
           border: '1px solid #FDE68A',
-        }}
-          title="Layout and channel counts are provisional — unverified,
-pending I/O capture or terminal-label confirmation.">
-          PROVISIONAL
-        </span>
-      )}
+        }}>
+        allow_io: PENDING
+      </span>
       <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
         <span style={{
           width: 8, height: 8, borderRadius: '50%',
@@ -411,7 +455,7 @@ pending I/O capture or terminal-label confirmation.">
           background: C.textDim, opacity: 0.5,
           border: `1px dashed ${C.textDim}`,
         }} />
-        Live state — pending I/O capture
+        Live state — driver bridge pending
       </span>
       <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10 }}>
         <span style={{ fontFamily: 'monospace' }}>
@@ -547,22 +591,29 @@ export default function IOPortMap() {
 
   const blocks = Array.isArray(data.blocks) ? data.blocks : []
   const specs  = data.specs || {}
+  const verbs  = data.verbs || {}
   const ports  = data.ports || {}
 
-  // Assignment count — only over channels present in the layout, so a
-  // trimmed layout doesn't inflate the totals.
+  // Count over channels present in the layout so a trimmed layout
+  // doesn't inflate totals. Skip system-reserved (operator can't
+  // assign those anyway).
   let totalCount = 0
   let assignedCount = 0
   for (const blk of blocks) {
-    if (blk.kind === 'PWR-CFG') continue
-    for (const ch of blk.channels || []) {
+    if (blk.group === 'system') continue
+    for (const row of blk.rows || []) {
       totalCount += 1
-      if (ports[ch]?.in_use) assignedCount += 1
+      if (ports[row.ch]?.in_use) assignedCount += 1
     }
   }
 
-  const stripBlocks = blocks.filter((b) => STRIP_KINDS.has(b.kind))
-  const extraBlocks = blocks.filter((b) => !STRIP_KINDS.has(b.kind))
+  // Group blocks by functional group. Order: general → system → flange → analog.
+  const GROUP_ORDER = ['general', 'system', 'flange', 'analog']
+  const byGroup = {}
+  for (const blk of blocks) {
+    const g = blk.group || 'general'
+    ;(byGroup[g] = byGroup[g] || []).push(blk)
+  }
 
   return (
     <div style={{
@@ -577,7 +628,7 @@ export default function IOPortMap() {
           I/O Port Map
         </span>
         <span style={{ fontSize: 11, color: C.textMuted }}>
-          Estun S10-140 · CC10-A
+          Estun S10-140 · IOManager
         </span>
       </div>
 
@@ -586,45 +637,78 @@ export default function IOPortMap() {
         totalCount={totalCount}
         saving={saving}
         onReset={onReset}
-        provisional={!!data.provisional}
+        source={data.source}
       />
 
-      {/* Panel-strip layout: mirrors the CC10-A back panel left→right.
-          Blocks share a row and flex-wrap on narrow screens; the
-          gridTemplateColumns keeps each block a legible min-width. */}
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-        gap: 8,
-      }}>
-        {stripBlocks.map((blk) => (
-          <Block key={blk.id} block={blk} ports={ports} specs={specs}
-                 onEdit={onEdit} />
-        ))}
-      </div>
-
-      {/* Off-strip groups: safety I/O + tool-flange connector. */}
-      {extraBlocks.length > 0 && (
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
-          gap: 8,
+      {/* Functional-group layout — order: general → system → flange → analog */}
+      {GROUP_ORDER.filter((g) => byGroup[g]?.length).map((g) => (
+        <div key={g} style={{
+          display: 'flex', flexDirection: 'column', gap: 6,
         }}>
-          {extraBlocks.map((blk) => (
-            <Block key={blk.id} block={blk} ports={ports} specs={specs}
-                   onEdit={onEdit} />
+          <div style={{
+            fontSize: 10, fontWeight: 700, color: C.textMuted,
+            textTransform: 'uppercase', letterSpacing: '0.08em',
+            paddingLeft: 2,
+          }}>
+            {GROUP_META[g]?.label || g}
+          </div>
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+            gap: 8,
+          }}>
+            {byGroup[g].map((blk) => (
+              <Block key={blk.id} block={blk} ports={ports} specs={specs}
+                     onEdit={onEdit} />
+            ))}
+          </div>
+        </div>
+      ))}
+
+      {/* IOManager verb reference — collapsed by default so it doesn't
+          crowd the port grid, but discoverable so operators can see
+          the wire contract the layout is derived from. */}
+      <details style={{
+        border: `1px solid ${C.border}`, borderRadius: 6,
+        background: C.rowBgDim, padding: '6px 10px', fontSize: 11,
+      }}>
+        <summary style={{
+          cursor: 'pointer', color: C.textMuted, fontWeight: 600,
+          userSelect: 'none',
+        }}>
+          IOManager wire verbs · {Object.keys(verbs).length} documented
+        </summary>
+        <div style={{
+          marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6,
+        }}>
+          {Object.entries(verbs).map(([slot, v]) => (
+            <div key={slot} style={{
+              display: 'grid',
+              gridTemplateColumns: '80px 220px 1fr',
+              gap: 8, fontSize: 10, alignItems: 'baseline',
+            }}>
+              <span style={{ color: C.textMuted, fontFamily: 'monospace' }}>
+                {slot}
+              </span>
+              <span style={{ color: C.text, fontFamily: 'monospace' }}>
+                {v.ty}
+              </span>
+              <span style={{ color: C.textMuted }}>
+                {v.notes}
+              </span>
+            </div>
           ))}
         </div>
-      )}
+      </details>
 
       <div style={{
         fontSize: 10, color: C.textMuted, lineHeight: 1.5,
       }}>
-        <b>Provisional:</b> block structure follows the CC10-A panel
-        photo. Channel counts per block are the manual's typical values —
-        unverified, pending I/O capture or terminal-label confirmation.
-        The live-state layer is inert; every port shows a placeholder
-        until the driver's /estun/io read path is captured.
+        Inventory (18 DO / 24 DI / 4 AI / 4 AO) is verified from{' '}
+        <code>{data.source || 'the factory-controller capture'}</code>.
+        The <code>allow_io</code> gate + driver bridge that turn the
+        live-state pills real land in a follow-up pass, gated by a
+        live-first force→read validation on a single DO.
       </div>
     </div>
   )
