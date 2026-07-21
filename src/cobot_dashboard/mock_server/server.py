@@ -733,6 +733,89 @@ async def api_state():
 
 
 # ---------------------------------------------------------------------------
+# System Check — matches the production endpoint's shape so the same
+# frontend renders against the mock without conditional logic. All five
+# rows report healthy by default; toggle STATE fields to simulate red
+# states while developing the UI.
+# ---------------------------------------------------------------------------
+
+_MOCK_STATIC_DIR = os.path.join(_THIS_DIR, "static")
+_MOCK_BUILT_DIR  = os.path.join(_THIS_DIR, "..", "frontend", "dist")
+
+
+def _mock_sha_file(path: str) -> str:
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, 'rb') as fp:
+            for chunk in iter(lambda: fp.read(65536), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ''
+
+
+def _mock_bundle_hash(dir_path: str) -> str:
+    idx = os.path.join(dir_path, "index.html")
+    return _mock_sha_file(idx) if os.path.isfile(idx) else ''
+
+
+@app.get("/api/systemcheck")
+async def mock_systemcheck():
+    # Robot — driven by the mock estop latch.
+    if STATE["safety"]["estop"]:
+        robot = {'level': 'red', 'state': 'Alarm',
+                 'detail': 'Mock: estop latched — release it in the toolbar.'}
+    else:
+        robot = {'level': 'green', 'state': 'Ready', 'detail': None}
+    # Controller — always fresh in mock; the simulation loop ticks 25 Hz.
+    controller = {'level': 'green', 'state': 'Connected', 'detail': None}
+    # Software — real bundle-hash compare.
+    served = _mock_bundle_hash(_MOCK_STATIC_DIR)
+    built  = _mock_bundle_hash(_MOCK_BUILT_DIR)
+    if not served:
+        software = {'level': 'red', 'state': 'Missing',
+                    'detail': 'Served bundle not found.',
+                    'served_hash': '', 'built_hash': built[:12]}
+    elif built and served != built:
+        software = {'level': 'amber', 'state': 'Refresh needed',
+                    'detail': ('Served bundle differs from the latest '
+                               'build on disk.'),
+                    'served_hash': served[:12], 'built_hash': built[:12]}
+    else:
+        software = {'level': 'green', 'state': 'Up to date', 'detail': None,
+                    'served_hash': served[:12],
+                    'built_hash':  built[:12] if built else ''}
+    # Services — mock has no systemd; report as healthy.
+    services = {'level': 'green', 'state': 'All running', 'detail': None,
+                'services': {'roboai-estun': True, 'roboai-dashboard': True}}
+    # Safety — mock has no on-disk config; treat as loaded.
+    safety = {'level': 'green', 'state': 'Loaded', 'detail': None}
+    checks = [
+        {'key': 'robot',      'label': 'Robot',      **robot},
+        {'key': 'controller', 'label': 'Controller', **controller},
+        {'key': 'software',   'label': 'Software',   **software},
+        {'key': 'services',   'label': 'Services',   **services},
+        {'key': 'safety',     'label': 'Safety',     **safety},
+    ]
+    levels = {c['level'] for c in checks}
+    ready = 'red' not in levels and 'amber' not in levels
+    return {
+        'ready':   ready,
+        'summary': 'READY' if ready else 'NOT READY',
+        'checks':  checks,
+        't':       round(time.time(), 3),
+    }
+
+
+@app.post("/api/systemcheck/service/restart")
+async def mock_systemcheck_restart(request: Request):
+    body = await request.json()
+    return {'ok': True, 'service': body.get('service', ''),
+            'rc': 0, 'stderr': ''}
+
+
+# ---------------------------------------------------------------------------
 # Static file serving (SPA fallback)
 # ---------------------------------------------------------------------------
 

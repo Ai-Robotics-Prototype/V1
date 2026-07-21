@@ -61,6 +61,16 @@ except ImportError:
 _START_TIME = time.time()
 _THIS_DIR = Path(__file__).resolve().parent
 _STATIC_DIR = _THIS_DIR.parent / "mock_server" / "static"
+# Location of the last-built frontend on disk. The System Check panel
+# compares the served bundle hash (under _STATIC_DIR) against the built
+# bundle hash here to surface stale-bundle drift — the classic
+# "operator sees old UI after a redeploy" trap.
+_BUILT_FRONTEND_DIR = _THIS_DIR.parent / "frontend" / "dist"
+
+# Timestamp of the last /estun/status frame received (monotonic seconds
+# via time.time()). Read by /api/systemcheck to compute controller
+# freshness — a stale value means the driver went silent.
+_last_estun_status_ts = [0.0]
 
 # ---------------------------------------------------------------------------
 # Shared state — updated by ROS2 callbacks, read by FastAPI
@@ -1161,6 +1171,7 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             d = json.loads(msg.data)
         except Exception:
             return
+        _last_estun_status_ts[0] = time.time()
         with _state_lock:
             r = STATE.setdefault("robot", {})
             r["connected"]   = bool(d.get("connected", False))
@@ -2908,6 +2919,198 @@ if FASTAPI_AVAILABLE:
     async def api_state():
         with _state_lock:
             return copy.deepcopy(STATE)
+
+    # ------------------------------------------------------------------
+    # System Check — read-only readiness aggregator
+    #
+    # Five checks, reported flat: robot / controller / software /
+    # services / safety. Purely observational — never enables the arm,
+    # opens a gate, or restarts anything on its own. The optional
+    # /api/systemcheck/service/restart endpoint is operator-triggered
+    # and restricted to a small allowlist that excludes any
+    # arm-touching service.
+    # ------------------------------------------------------------------
+    _SYSTEMCHECK_SERVICES = ("roboai-estun", "roboai-dashboard")
+    _SYSTEMCHECK_RESTART_ALLOWLIST = {"roboai-dashboard"}
+    _CONTROLLER_STALE_S = 3.0
+
+    def _sha256_file(path: str) -> str:
+        import hashlib
+        try:
+            h = hashlib.sha256()
+            with open(path, 'rb') as fp:
+                for chunk in iter(lambda: fp.read(65536), b''):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return ''
+
+    def _bundle_hash_for(dir_path: Path) -> str:
+        """Hash of the served/built bundle. We hash index.html because
+        every content-hashed asset URL is embedded there — any change
+        to the app forces a new index.html digest even if the assets
+        keep the same names in-flight."""
+        idx = dir_path / "index.html"
+        return _sha256_file(str(idx)) if idx.is_file() else ''
+
+    def _service_active(name: str) -> bool:
+        import subprocess
+        try:
+            r = subprocess.run(
+                ['systemctl', 'is-active', name],
+                capture_output=True, text=True, timeout=1.5)
+            return r.stdout.strip() == 'active'
+        except Exception:
+            return False
+
+    def _check_robot(robot: dict) -> dict:
+        if not robot.get('connected'):
+            return {'level': 'red',   'state': 'Offline',
+                    'detail': 'Driver is not publishing /estun/status. '
+                              'Check the roboai-estun service and the '
+                              'controller network link.'}
+        if robot.get('alarm'):
+            aa = robot.get('active_alarm') or {}
+            code = aa.get('code') if isinstance(aa, dict) else None
+            msg = aa.get('message') if isinstance(aa, dict) else None
+            detail = f"Controller alarm {code}: {msg}" if code else \
+                     "Controller reports an active alarm."
+            return {'level': 'red', 'state': 'Alarm', 'detail': detail}
+        if not robot.get('enabled'):
+            return {'level': 'amber', 'state': 'Disabled',
+                    'detail': 'Arm is connected but disabled. Enable '
+                              'from the toolbar when ready.'}
+        return {'level': 'green', 'state': 'Ready', 'detail': None}
+
+    def _check_controller() -> dict:
+        with _ws_lock:
+            n_state = len(_state_clients)
+        last_ts = _last_estun_status_ts[0]
+        if last_ts <= 0.0:
+            return {'level': 'red', 'state': 'Disconnected',
+                    'detail': 'No /estun/status frame has been received '
+                              'since the dashboard started.'}
+        age = time.time() - last_ts
+        if age > _CONTROLLER_STALE_S:
+            return {'level': 'red', 'state': 'Disconnected',
+                    'detail': f'Last /estun/status was {age:.1f}s ago '
+                              f'(threshold {_CONTROLLER_STALE_S:.0f}s). '
+                              f'Driver has gone silent.'}
+        return {'level': 'green', 'state': 'Connected',
+                'detail': (f'Last frame {age:.1f}s ago · '
+                           f'{n_state} client(s)') if n_state == 0 else None}
+
+    def _check_software() -> dict:
+        served = _bundle_hash_for(_STATIC_DIR)
+        built  = _bundle_hash_for(_BUILT_FRONTEND_DIR)
+        if not served:
+            return {'level': 'red', 'state': 'Missing',
+                    'detail': f'Served bundle not found under {_STATIC_DIR}.',
+                    'served_hash': '', 'built_hash': built[:12]}
+        if not built:
+            return {'level': 'green', 'state': 'Up to date',
+                    'detail': None,
+                    'served_hash': served[:12], 'built_hash': ''}
+        if served != built:
+            return {'level': 'amber', 'state': 'Refresh needed',
+                    'detail': (f'Served bundle differs from the latest '
+                               f'build on disk. Copy frontend/dist over '
+                               f'mock_server/static and reload the tab.'),
+                    'served_hash': served[:12], 'built_hash': built[:12]}
+        return {'level': 'green', 'state': 'Up to date',
+                'detail': None,
+                'served_hash': served[:12], 'built_hash': built[:12]}
+
+    def _check_services() -> dict:
+        results = {name: _service_active(name)
+                   for name in _SYSTEMCHECK_SERVICES}
+        down = [n for n, ok in results.items() if not ok]
+        if not down:
+            return {'level': 'green', 'state': 'All running',
+                    'detail': None, 'services': results}
+        return {'level': 'red',
+                'state': f'{len(down)} down',
+                'detail': 'Down: ' + ', '.join(down),
+                'services': results}
+
+    def _check_safety(robot: dict) -> dict:
+        missing = []
+        limits_path = os.path.join('/opt/cobot/motion/config',
+                                    'robot_limits.yaml')
+        limits_present = os.path.isfile(limits_path)
+        if not limits_present:
+            missing.append('joint limits')
+        # Guards are considered "loaded" when the driver has any
+        # non-zero collision/env stop threshold. Zero on both is the
+        # signature of a driver that never received guard config.
+        guard_stop = float(robot.get('guard_stop_mm') or 0.0)
+        coll_stop  = float(robot.get('collision_stop_mm') or 0.0)
+        env_stop   = float(robot.get('env_stop_mm') or 0.0)
+        if guard_stop <= 0 and coll_stop <= 0 and env_stop <= 0:
+            missing.append('collision guards')
+        if robot.get('ground_z_mm') is None:
+            missing.append('ground_z')
+        # LiDAR zones — the collision monitor loads zone configuration
+        # at boot. If it's not active there's no zone monitoring; if it
+        # IS active, we trust the loaded config.
+        if not _service_active('roboai-collision-monitor'):
+            missing.append('lidar zones')
+        if missing:
+            return {'level': 'amber', 'state': 'Check config',
+                    'detail': 'Missing: ' + ', '.join(missing)}
+        return {'level': 'green', 'state': 'Loaded', 'detail': None}
+
+    @app.get("/api/systemcheck")
+    async def api_systemcheck():
+        with _state_lock:
+            robot = copy.deepcopy(STATE.get('robot') or {})
+        checks = [
+            {'key': 'robot',      'label': 'Robot',      **_check_robot(robot)},
+            {'key': 'controller', 'label': 'Controller', **_check_controller()},
+            {'key': 'software',   'label': 'Software',   **_check_software()},
+            {'key': 'services',   'label': 'Services',   **_check_services()},
+            {'key': 'safety',     'label': 'Safety',     **_check_safety(robot)},
+        ]
+        levels = {c['level'] for c in checks}
+        ready = 'red' not in levels and 'amber' not in levels
+        return {
+            'ready':   ready,
+            'summary': 'READY' if ready else 'NOT READY',
+            'checks':  checks,
+            't':       round(time.time(), 3),
+        }
+
+    @app.post("/api/systemcheck/service/restart")
+    async def api_systemcheck_service_restart(request: Request):
+        """Operator-initiated systemctl restart for a small allowlist of
+        non-arm services. NEVER touches roboai-estun (motion) — the
+        operator restarts the driver from a different, more deliberate
+        surface. Returns the systemctl exit code + stderr so the UI
+        can surface a permission failure clearly."""
+        import subprocess
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        service = str(body.get('service') or '')
+        if service not in _SYSTEMCHECK_RESTART_ALLOWLIST:
+            return JSONResponse(
+                {'error': f'service {service!r} not in allowlist',
+                 'allowed': sorted(_SYSTEMCHECK_RESTART_ALLOWLIST)},
+                status_code=400,
+            )
+        try:
+            r = subprocess.run(
+                ['systemctl', 'restart', service],
+                capture_output=True, text=True, timeout=8.0)
+        except Exception as e:
+            return JSONResponse({'error': str(e)}, status_code=500)
+        return {
+            'ok':      r.returncode == 0,
+            'service': service,
+            'rc':      r.returncode,
+            'stderr':  (r.stderr or '').strip()[:400],
+        }
 
     # ------------------------------------------------------------------
     # Collision monitor — mock-injection endpoints
