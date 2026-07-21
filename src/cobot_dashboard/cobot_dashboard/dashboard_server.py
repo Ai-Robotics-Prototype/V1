@@ -4891,26 +4891,51 @@ if FASTAPI_AVAILABLE:
             return 'demonstration'
         return 'manual'
 
+    # Steps whose `action` doesn't require a pose. The wizard authors
+    # programs with these actions alongside motion steps; treating them
+    # as "untaught" was the root cause of testwizard.json falsely
+    # reporting has_taught_poses=false.
+    _NON_MOTION_ACTIONS = frozenset({
+        'set_io', 'wait', 'loop', 'gripper', 'gripper_close',
+        'gripper_open', 'pause', 'comment', 'end',
+        'vacuum_on', 'vacuum_off',
+    })
+
     def _has_taught_poses(prog: dict) -> bool:
-        """A program has REAL taught poses if every motion step either
-        (a) references a point by `point_name` that resolves in the
-        program.points dict, or (b) carries a 6-element taught_joints
-        with taught=True (backward-compat path used by PBD drafts
-        that predate the point-table schema).
+        """A program has REAL taught poses when every step's pose
+        requirement is satisfied. Sources counted as taught:
+          (a) `point_name` resolves in program.points with 6-el joints,
+          (b) a 6-element `taught_joints` with `taught=True` (legacy),
+          (c) `derived_from` role referring to another step that IS
+              taught inline (the executor resolves anchor + offset at
+              runtime — the derived step is authored, not a gap),
+          (d) non-motion actions (set_io/wait/loop/gripper/…) which
+              don't take a pose at all,
+          (e) the legacy `type == 'gripper'` marker.
 
         Used to strip the stale "poses pending perception" caveat from
         a description when the operator has finished teaching."""
         steps = prog.get('steps') or []
         if not steps:
-            # An empty program with an empty point table isn't
-            # "taught"; a program with at least one point defined
-            # counts as partial teaching so the Points panel shows
-            # them (the surrounding UI still gates run behind having
-            # steps).
+            # Empty programs with an empty point table aren't
+            # considered "taught" — matches the previous behaviour.
             return False
         points = prog.get('points') or {}
+        # Pre-pass: which position roles are taught inline in this
+        # program? A derived step is only counted (c) if its anchor
+        # role is actually present.
+        taught_roles = set()
+        for s in steps:
+            role = s.get('position_role')
+            j = s.get('taught_joints')
+            if role and isinstance(j, list) and len(j) == 6 \
+                    and s.get('taught') is True:
+                taught_roles.add(role)
         for s in steps:
             if s.get('type') in ('gripper',):
+                continue
+            action = str(s.get('action') or '').lower()
+            if action in _NON_MOTION_ACTIONS:
                 continue
             pn = s.get('point_name')
             if pn and pn in points:
@@ -4920,6 +4945,9 @@ if FASTAPI_AVAILABLE:
             j = s.get('taught_joints')
             if (isinstance(j, list) and len(j) == 6
                     and s.get('taught') is True):
+                continue
+            df = s.get('derived_from')
+            if df and df in taught_roles:
                 continue
             return False
         return True

@@ -1,5 +1,73 @@
 import { useStore } from '../store/useStore'
-import { deriveRunState, computeLineMap, stepIndexForLine } from '../lib/runState'
+import { deriveRunState, stepIndexForLine } from '../lib/runState'
+
+// Non-motion step actions — these don't take a pose. Keep in sync with
+// the backend's _NON_MOTION_ACTIONS in dashboard_server.py.
+const NON_MOTION_ACTIONS = new Set([
+  'set_io', 'wait', 'loop', 'gripper', 'gripper_close', 'gripper_open',
+  'pause', 'comment', 'end', 'vacuum_on', 'vacuum_off',
+])
+
+// Compact per-step target/status classifier for the step-preview panel.
+// Reads the truth on disk — never re-derives it — so the panel matches
+// what the executor + codegen see. Order of precedence matches the
+// backend's _has_taught_poses so display and gate agree.
+//
+// Returns { text, kind } where kind is one of:
+//   'taught'    — bright: step has an authored pose
+//   'derived'   — bright-muted: pose resolves at runtime from an anchor
+//   'nonmotion' — subtle: action doesn't need a pose (SET_IO / WAIT / LOOP …)
+//   'blocked'   — amber: SET_IO / WAIT whose I/O verb isn't captured yet
+//   'untaught'  — amber: motion step missing a pose source
+function classifyStep(step, program) {
+  const points = (program && program.points) || {}
+  const action = String(step?.action || '').toLowerCase()
+
+  // Taught inline / via point ref (has authored pose).
+  const pn = step?.point_name
+  if (pn && points[pn]
+      && Array.isArray(points[pn].joints) && points[pn].joints.length === 6) {
+    return { kind: 'taught', text: `→ ${pn}` }
+  }
+  const hasTj = Array.isArray(step?.taught_joints) && step.taught_joints.length === 6
+  if (hasTj) {
+    const role = step?.position_role
+    return { kind: 'taught', text: role ? `→ ${role} (taught)` : '→ (taught)' }
+  }
+  // Derived-from-anchor motion — resolves at runtime.
+  if (step?.derived_from) {
+    return { kind: 'derived', text: `↳ from ${step.derived_from}` }
+  }
+  // Non-motion actions: no pose required. Flag SET_IO / WAIT as
+  // blocked on I/O verbs so the operator sees them distinctly from
+  // taught / untaught motion.
+  if (NON_MOTION_ACTIONS.has(action)) {
+    if (action === 'set_io' || action === 'vacuum_on' || action === 'vacuum_off') {
+      const port = step?.io_id ? ` ${step.io_id}` : ''
+      return { kind: 'blocked', text: `I/O${port} · pending capture` }
+    }
+    if (action === 'wait') {
+      return { kind: 'blocked', text: `wait ${step?.duration_s ?? '?'}s · pending capture` }
+    }
+    if (action === 'loop') {
+      const g = step?.goto != null ? ` → step ${step.goto}` : ''
+      return { kind: 'nonmotion', text: `loop${g}` }
+    }
+    if (action.startsWith('gripper')) {
+      return { kind: 'blocked', text: 'gripper · pending capture' }
+    }
+    return { kind: 'nonmotion', text: action }
+  }
+  return { kind: 'untaught', text: 'not taught' }
+}
+
+const KIND_STYLE = {
+  taught:    { color: '#6b7280', weight: 500 },
+  derived:   { color: '#0369A1', weight: 500 },   // sky-blue: authored but deferred
+  nonmotion: { color: '#9CA3AF', weight: 400 },
+  blocked:   { color: '#B45309', weight: 500 },   // amber: needs a captured verb
+  untaught:  { color: '#B45309', weight: 600 },
+}
 
 // Live step-preview panel — shows the currently-loaded program's steps
 // with the executing step highlighted from publish/ProjectState
@@ -72,8 +140,6 @@ export default function StepPreviewPanel() {
   }
   const list = { maxHeight: 260, overflow: 'auto' }
 
-  const lineMap = computeLineMap(cp || {})
-
   return (
     <div style={wrap}>
       <div style={header} onClick={() => setOpen(!open)}>
@@ -94,15 +160,14 @@ export default function StepPreviewPanel() {
             const isDone = isActive && currentIdx >= 0 && i < currentIdx
             const isCurrent = isActive && i === currentIdx
             const isUpcoming = !isActive || (currentIdx < 0) || i > currentIdx
-            const wouldSkip = (lineMap[i] || {}).kind === 'skipped'
             const bg = isCurrent ? '#EFF6FF'
                      : isDone    ? '#F0FDF4'
                      : '#fff'
             const border = isCurrent ? '2px solid #2563EB' : '1px solid #f3f4f6'
             const label = s.label || s.action || `Step ${i + 1}`
             const type = (s.type || s.action || '').toString().toUpperCase().slice(0, 12)
-            const target = s.point_name
-              || (Array.isArray(s.taught_joints) && s.taught_joints.length === 6 ? '(taught inline)' : null)
+            const status = classifyStep(s, cp)
+            const statusStyle = KIND_STYLE[status.kind] || KIND_STYLE.untaught
             return (
               <div key={s.id ?? i}
                    style={{
@@ -144,11 +209,10 @@ export default function StepPreviewPanel() {
                   )}
                 </span>
                 <span style={{
-                  fontSize: 11, color: '#6b7280', fontFamily: 'monospace',
+                  fontSize: 11, fontFamily: 'monospace',
+                  color: statusStyle.color, fontWeight: statusStyle.weight,
                 }}>
-                  {target
-                    ? `→ ${target}`
-                    : wouldSkip ? <span style={{ color: '#B45309' }}>not taught</span> : ''}
+                  {status.text}
                 </span>
               </div>
             )
