@@ -681,6 +681,29 @@ def http_get_projectlist(robot_ip: str, port: int, lang: str = 'lua',
     return content or {}
 
 
+def http_get_lua(robot_ip: str, port: int, *, project_id: str, task_id: str,
+                 lang: str = 'lua', timeout_s: float = 3.0) -> str:
+    """Fetch the currently-stored Lua source for a project/task back
+    from the controller. Used by the run path's post-save byte-verify
+    (Part G) and by anyone wanting to prove what the controller
+    ACTUALLY holds vs. what codegen produced.
+
+    Returns the Lua text (never the JSON envelope). Raises RuntimeError
+    on any non-909 response — the caller decides whether that's fatal.
+    """
+    url = (f'{_origin(robot_ip, port)}/api/robotcode/'
+           f'project{lang}_{project_id}_{lang}/select/{task_id}/')
+    status, parsed, _ = _http_request('GET', url, None, '', timeout_s)
+    if status != 200 or (isinstance(parsed, dict) and parsed.get('code') != 909):
+        raise RuntimeError(f'lua GET status={status} '
+                           f'code={parsed.get("code") if isinstance(parsed, dict) else "?"}')
+    data = parsed.get('data') or []
+    if not data:
+        return ''
+    content = data[0].get('content')
+    return content if isinstance(content, str) else ''
+
+
 def http_post_json(robot_ip: str, port: int, path: str, obj: Any,
                    timeout_s: float = 3.0) -> tuple[int, dict, bytes]:
     """POST a JSON body to /api/robotjson/... — used for varspoint,
