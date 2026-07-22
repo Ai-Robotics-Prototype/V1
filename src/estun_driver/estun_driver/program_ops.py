@@ -348,25 +348,37 @@ def codegen_lua_from_program(
                 exec_lines.append(f'setAO({port},{v_f:g})  -- step {action} {io_id}={v_f:g}')
             continue
 
-        # ---- Wait / delay — wire-verified `wait(<seconds>)` -----------
-        # The Control category in the editor generates a bare
-        # `wait(<duration>)` node (verified live: a Control→wait step
-        # in the "roboaitest" editor project produced `wait(0)` in the
-        # exported Lua). Argument is seconds — matches the wizard's
-        # `duration_s` field on the step. `wait` is not enumerated in
-        # luaenginelib.json (which only covers the Motion / IO / Logic
-        # categories) but is a valid Control primitive on the
-        # controller. `waitCondition` stays reserved for future
-        # sensor-conditioned dwell steps.
+        # ---- Wait / delay — `wait(<milliseconds INTEGER>)` -----------
+        # Unit + type CONFIRMED from the controller's own editor i18n
+        # bundle (estun_lua_io_v2_20260721.har):
+        #     "wait": [
+        #         "wait",
+        #         "The program will continue to execute after waiting
+        #          for [x] milliseconds"
+        #     ]
+        # And from the runtime error we hit shipping wait(0.5): alarm
+        # 10006 "bad argument #-2 to 'wait' (number has no integer
+        # representation)" — the Lua 5.3 message thrown when a
+        # float-only value is passed to a function expecting an
+        # integer. So: argument is MILLISECONDS as an INTEGER.
+        # wait(0) means "no wait" (proved: the editor emitted wait(0)
+        # for an untimed Control→wait node without any pause visible).
+        # `waitCondition` stays reserved for future sensor-conditioned
+        # dwell steps.
         if action == 'wait':
             try:
                 dur = float(step.get('duration_s') or 0)
             except (TypeError, ValueError):
                 dur = 0.0
-            # Format short so 0.5 → "0.5" not "0.500000".
-            dur_s = f'{dur:g}'
-            exec_lines.append(f'wait({dur_s})  -- step {action}  '
-                              f'duration_s={dur_s}')
+            dur_ms = int(round(dur * 1000.0))
+            # Preserve any positive dwell: if the operator authored a
+            # non-zero duration but rounding zeroed it, floor to 1 ms
+            # so the wait isn't silently deleted.
+            if dur > 0 and dur_ms == 0:
+                dur_ms = 1
+            exec_lines.append(
+                f'wait({dur_ms})  -- step {action}  '
+                f'duration_s={dur:g} → {dur_ms} ms')
             continue
 
         # ---- Loop — goto label at file line 1 -------------------------
