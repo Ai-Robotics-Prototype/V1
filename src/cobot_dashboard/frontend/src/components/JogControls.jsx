@@ -44,10 +44,11 @@ import { useStore } from '../store/useStore'
 //                              and fires onPressEnd exactly once.
 // -----------------------------------------------------------------------------
 
-function HoldButton({
+export function HoldButton({
   jogStyle,
   onTap, onPressStart, onPressTick, onPressEnd,
   color, width, height, disabled, tooltip, children,
+  bg = '#fff', bgHover, borderColor = '#d1d5db',
 }) {
   const tickTimer      = useRef(null)
   const pressed        = useRef(false)
@@ -200,8 +201,8 @@ function HoldButton({
       onMouseDown={start}
       onMouseUp={stop}
       onMouseLeave={(e) => {
-        e.currentTarget.style.background = '#fff'
-        e.currentTarget.style.borderColor = '#d1d5db'
+        e.currentTarget.style.background = bg
+        e.currentTarget.style.borderColor = borderColor
         // Only end the hold if the mouse button is genuinely up. During a
         // mouse-drag off the button the browser fires mouseleave but the
         // press is still active — old behavior treated that as a release,
@@ -212,7 +213,7 @@ function HoldButton({
       }}
       onMouseEnter={(e) => {
         if (disabled) return
-        e.currentTarget.style.background = color + '15'
+        e.currentTarget.style.background = bgHover || (color + '15')
         e.currentTarget.style.borderColor = color
       }}
       onTouchStart={start}
@@ -220,8 +221,8 @@ function HoldButton({
       onTouchCancel={stop}
       style={{
         width, height, padding: 0,
-        background: '#fff',
-        border: '1px solid #d1d5db', borderRadius: 8,
+        background: bg,
+        border: `1px solid ${borderColor}`, borderRadius: 8,
         cursor: disabled ? 'not-allowed' : 'pointer',
         display: 'flex', flexDirection: 'column',
         alignItems: 'center', justifyContent: 'center', gap: 4,

@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { useStore } from '../store/useStore'
 import ProgramWizard from './ProgramWizard'
 import ProgramFromDemonstration from './ProgramFromDemonstration'
+import { HoldButton } from './JogControls'
 
 // The richer action taxonomy lives in the editor. Each action carries
 // a coarse `type` (matching the existing backend schema: move/gripper/
@@ -1739,12 +1740,18 @@ function renumber(arr) {
 }
 
 // ────────────────────────────────────────────────────────
-// TeachOverlay — dark fullscreen overlay that replaces the prior
-// inline blue "Teaching step N" banner. Opened both by Teach All
-// and by an individual step's Teach button. Reuses the live jog
-// store actions (jog / jogCartesian / homeRobot / triggerEstop)
-// but inlines the pendant markup at the large 140×140 sizing so
-// nothing else has to be exported from ProgramLayout.
+// TeachOverlay — fullscreen overlay for the "Teach All" and per-step
+// Teach flows. Uses the SHARED HoldButton primitive from JogControls
+// (WS transport, hold_id / seq refresh, 100 ms cadence, server-side
+// keepalive with 300 ms deadman). The previous inline pendant fired
+// setInterval(sendJog, 150) → discrete HTTP POSTs to /cmd/jog_cartesian
+// with no hold_id → the driver treated each pulse as a fresh session
+// and the freshness deadman stopped motion between them (the classic
+// chatter symptom). Now routed through the same jogHold / jogRelease
+// path the main Program-tab pendant uses.
+//
+// Styling matches the rest of the app: light theme, same button/panel
+// tokens JogControls uses (white pads, #d1d5db borders, #374151 text).
 // ────────────────────────────────────────────────────────
 
 function radiansToDeg(positions) {
@@ -1752,39 +1759,28 @@ function radiansToDeg(positions) {
   return positions.slice(0, 6).map((rad) => Number(((rad || 0) * 180 / Math.PI).toFixed(2)))
 }
 
-function OverlayJogArrow({ onPress, color, label, rotation, size = 140, svgSize = 60 }) {
-  const timer = useRef(null)
-  const start = useCallback((e) => {
-    if (e && e.preventDefault) e.preventDefault()
-    onPress()
-    if (timer.current) clearInterval(timer.current)
-    timer.current = setInterval(onPress, 150)
-  }, [onPress])
-  const stop = useCallback(() => {
-    if (timer.current) { clearInterval(timer.current); timer.current = null }
-  }, [])
-  useEffect(() => () => stop(), [stop])
+// Wraps HoldButton with the overlay pendant's larger sizing and the
+// arrow SVG. Same identity-stable callback pattern the main
+// JogControls's ArrowPad uses.
+function OverlayJogArrow({
+  onPressStart, onPressTick, onPressEnd,
+  color, label, rotation, size = 140, svgSize = 60, disabled,
+}) {
   return (
-    <button
-      onMouseDown={start}
-      onMouseUp={stop}
-      onMouseLeave={(e) => { e.currentTarget.style.background = '#1C1C1F'; e.currentTarget.style.borderColor = '#2a2a30'; stop() }}
-      onMouseEnter={(e) => { e.currentTarget.style.background = color + '22'; e.currentTarget.style.borderColor = color }}
-      onTouchStart={start}
-      onTouchEnd={stop}
-      onTouchCancel={stop}
-      style={{
-        width: size, height: size, padding: 0,
-        background: '#1C1C1F', border: '1px solid #2a2a30', borderRadius: 10,
-        cursor: 'pointer', display: 'flex', flexDirection: 'column',
-        alignItems: 'center', justifyContent: 'center', gap: 4,
-        userSelect: 'none', touchAction: 'none',
-      }}>
-      <svg width={svgSize} height={svgSize} viewBox="0 0 24 24" style={{ transform: `rotate(${rotation}deg)` }}>
+    <HoldButton
+      jogStyle="CONTINUOUS"
+      onPressStart={onPressStart}
+      onPressTick={onPressTick}
+      onPressEnd={onPressEnd}
+      color={color}
+      width={size} height={size}
+      disabled={disabled}>
+      <svg width={svgSize} height={svgSize} viewBox="0 0 24 24"
+           style={{ transform: `rotate(${rotation}deg)` }}>
         <path d="M12 4l-8 8h5v8h6v-8h5z" fill={color} />
       </svg>
-      <span style={{ fontSize: 14, fontWeight: 700, color: '#cbd5e1' }}>{label}</span>
-    </button>
+      <span style={{ fontSize: 14, fontWeight: 700, color: '#374151' }}>{label}</span>
+    </HoldButton>
   )
 }
 
@@ -1792,9 +1788,9 @@ function OverlayPadCenter({ label, width = 140, height = 140 }) {
   return (
     <div style={{
       width, height,
-      background: '#0F0F12', borderRadius: 10,
+      background: '#f3f4f6', borderRadius: 8,
       display: 'flex', alignItems: 'center', justifyContent: 'center',
-      fontSize: 14, fontWeight: 700, color: '#525866',
+      fontSize: 14, fontWeight: 700, color: '#9ca3af',
     }}>{label}</div>
   )
 }
@@ -1803,8 +1799,15 @@ function TeachOverlay({
   step, currentN, totalM, canBack,
   onRecord, onSkip, onBack, onCancel,
 }) {
-  const jog          = useStore((s) => s.jog)
-  const jogCartesian = useStore((s) => s.jogCartesian)
+  // Shared jog transport — WS-first with server-side hold keepalive.
+  // Same store actions the main Program-tab JogControls uses; the old
+  // (`s.jog` / `s.jogCartesian`) HTTP-pulse path was broken (s.jog is
+  // undefined, jogCartesian sent discrete pulses that the driver's
+  // 300 ms freshness deadman treated as start-stop chatter). See the
+  // JogControls docstring for the full rationale.
+  const jogHold          = useStore((s) => s.jogHold)
+  const jogHoldCartesian = useStore((s) => s.jogHoldCartesian)
+  const jogRelease       = useStore((s) => s.jogRelease)
   const homeRobot    = useStore((s) => s.homeRobot)
   const triggerEstop = useStore((s) => s.triggerEstop)
 
@@ -1826,14 +1829,27 @@ function TeachOverlay({
     return () => { document.body.style.overflow = prev }
   }, [])
 
-  const sendJog = useCallback((axis, direction) => {
+  // Hold callbacks that HoldButton feeds meta {hold_id, seq} into.
+  // press-start AND every 100 ms tick send the same hold:true frame —
+  // the driver interprets a hold with a matching hold_id as a refresh
+  // (no restart); a hold_id change would be a new session.
+  const holdStart = useCallback((axis, direction, meta) => {
     if (modeRef.current === 'joint') {
-      const deltaRad = direction * stepRef.current * Math.PI / 180
-      jog(axis - 1, deltaRad)
-    } else {
-      jogCartesian(axis, direction, stepRef.current, speedRef.current)
+      return jogHold(axis, direction, speedRef.current, meta)
     }
-  }, [jog, jogCartesian])
+    return jogHoldCartesian(axis, direction, speedRef.current, meta)
+  }, [jogHold, jogHoldCartesian])
+  const holdEnd = useCallback((meta) => {
+    return jogRelease(modeRef.current, meta)
+  }, [jogRelease])
+  // Wire helper: returns { onPressStart, onPressTick, onPressEnd } for
+  // a given (axis, direction). identity stability comes from the
+  // callbacks above.
+  const wire = useCallback((axis, direction) => ({
+    onPressStart: (meta) => holdStart(axis, direction, meta),
+    onPressTick:  (meta) => holdStart(axis, direction, meta),
+    onPressEnd:   (meta) => holdEnd(meta),
+  }), [holdStart, holdEnd])
 
   const recording = useRef(false)
   async function doRecord() {
@@ -1877,9 +1893,9 @@ function TeachOverlay({
 
   const modeBtn = (on) => ({
     padding: '0 26px', minHeight: modeBtnH, fontSize: modeBtnFont, fontWeight: 700,
-    background: on ? '#2F7FFF' : '#1C1C1F',
-    color:      on ? '#fff'    : '#cbd5e1',
-    border:     on ? 'none'    : '1px solid #2a2a30',
+    background: on ? '#2563EB' : '#fff',
+    color:      on ? '#fff'    : '#374151',
+    border:     on ? 'none'    : '1px solid #d1d5db',
     borderRadius: 8, cursor: 'pointer', flex: '0 0 auto',
   })
 
@@ -1899,8 +1915,8 @@ function TeachOverlay({
     }
     return {
       ...base,
-      background: '#1C1C1F', color: '#cbd5e1',
-      border: '1px solid #2a2a30',
+      background: '#fff', color: '#374151',
+      border: '1px solid #d1d5db',
     }
   }
 
@@ -1910,7 +1926,7 @@ function TeachOverlay({
   return (
     <div style={{
       position: 'fixed', inset: 0, zIndex: 1000,
-      background: '#0A0A0B', color: '#e5e7eb',
+      background: '#f8fafc', color: '#111827',
       display: 'flex', flexDirection: 'column',
       userSelect: 'none',
       overflowX: 'hidden',
@@ -1918,16 +1934,16 @@ function TeachOverlay({
       {/* HEADER */}
       <div style={{
         height: 60, flexShrink: 0,
-        background: '#141416', borderBottom: '1px solid #2a2a30',
+        background: '#fff', borderBottom: '1px solid #e5e7eb',
         display: 'flex', alignItems: 'center',
         padding: isTabletW ? '0 14px' : '0 22px',
         gap: 16,
       }}>
         <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-          <div style={{ fontSize: 14, fontWeight: 600, color: '#9ca3af', letterSpacing: '0.04em' }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: '#6b7280', letterSpacing: '0.04em' }}>
             TEACHING  •  Step {currentN} of {totalM}
           </div>
-          <div style={{ fontSize: 18, fontWeight: 700, color: '#fff', marginTop: 2 }}>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginTop: 2 }}>
             {stepLabel}
           </div>
         </div>
@@ -1936,7 +1952,7 @@ function TeachOverlay({
           style={{
             minHeight: 44, minWidth: 64, padding: '0 16px',
             fontSize: 14, fontWeight: 600,
-            background: 'transparent', color: '#9ca3af',
+            background: 'transparent', color: '#6b7280',
             border: 'none', cursor: 'pointer',
           }}>
           Cancel
@@ -1946,27 +1962,25 @@ function TeachOverlay({
       {/* INSTRUCTION BAND */}
       <div style={{
         height: 48, flexShrink: 0,
-        background: '#1C1C1F', borderBottom: '1px solid #0A0A0B',
+        background: '#eff6ff', borderBottom: '1px solid #bfdbfe',
         display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 22px',
       }}>
-        <div style={{ fontSize: 15, color: '#9ca3af', textAlign: 'center' }}>
+        <div style={{ fontSize: 15, color: '#1e40af', textAlign: 'center' }}>
           {stepInstruction}
         </div>
       </div>
 
-      {/* JOG CONTROLS — fills the full area between instruction band and
-          footer. Vertical layout: mode toggle row → speed/step row →
-          main control area (D-pads, takes the rest) → action buttons. */}
+      {/* JOG CONTROLS */}
       <div style={{
         width: '100%', height: '100%',
         flex: 1, minHeight: 0,
-        background: '#0A0A0B',
+        background: '#f8fafc',
         display: 'flex', flexDirection: 'column',
         justifyContent: 'center', alignItems: 'center',
         padding: isTabletW ? 12 : 24, gap: isTabletW ? 12 : 18,
         overflowX: 'hidden', overflowY: 'auto',
       }}>
-        {/* Mode toggle row — flex 0 0 auto. */}
+        {/* Mode toggle row */}
         <div style={{
           flex: '0 0 auto',
           display: 'flex', gap: 12, alignItems: 'center',
@@ -1978,7 +1992,7 @@ function TeachOverlay({
             style={{ ...modeBtn(false), opacity: 0.45, cursor: 'not-allowed' }}>Tool</button>
         </div>
 
-        {/* Speed + step row — flex 0 0 auto. */}
+        {/* Speed + step row */}
         <div style={{
           flex: '0 0 auto',
           width: '100%',
@@ -1986,19 +2000,19 @@ function TeachOverlay({
           justifyContent: 'space-evenly', flexWrap: 'wrap',
         }}>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-            <span style={{ fontSize: 13, color: '#9ca3af' }}>Step:</span>
+            <span style={{ fontSize: 13, color: '#6b7280' }}>Step:</span>
             {[0.1, 0.5, 1, 5, 10].map((s) => (
               <button key={s} onClick={() => setStepSize(s)} style={{
                 padding: '10px 14px', minHeight: 44,
                 fontSize: 13, fontWeight: 600, borderRadius: 6, cursor: 'pointer',
-                background: stepSize === s ? '#2F7FFF' : '#1C1C1F',
-                color:      stepSize === s ? '#fff'    : '#cbd5e1',
-                border:     stepSize === s ? 'none'    : '1px solid #2a2a30',
+                background: stepSize === s ? '#2563EB' : '#fff',
+                color:      stepSize === s ? '#fff'    : '#374151',
+                border:     stepSize === s ? 'none'    : '1px solid #d1d5db',
               }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
             ))}
           </div>
           <div style={{ flex: 1, minWidth: 240, maxWidth: 520 }}>
-            <div style={{ fontSize: 12, color: '#9ca3af', marginBottom: 2 }}>Speed: {speed}%</div>
+            <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 2 }}>Speed: {speed}%</div>
             <input type="range" min={1} max={100} value={speed}
               onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
               style={{ width: '100%', height: 8 }} />
@@ -2018,7 +2032,7 @@ function TeachOverlay({
           {jogMode === 'cartesian' ? (
             <>
               <div style={{ flex: '0 1 auto' }}>
-                <div style={{ fontSize: 12, color: '#9ca3af', textAlign: 'center', marginBottom: 6 }}>Position</div>
+                <div style={{ fontSize: 12, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>Position</div>
                 <div style={{
                   display: 'grid',
                   gridTemplateColumns: `repeat(3, ${padBtn}px)`,
@@ -2026,22 +2040,22 @@ function TeachOverlay({
                   gridTemplateAreas: '". up ." "left center right" ". down ."',
                   gap: padGap,
                 }}>
-                  <div style={{ gridArea: 'up' }}>    <OverlayJogArrow onPress={() => sendJog('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} svgSize={svgPx} /></div>
-                  <div style={{ gridArea: 'left' }}>  <OverlayJogArrow onPress={() => sendJog('x', -1)} rotation={-90} label="X−" color="#DC2626" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'up' }}>    <OverlayJogArrow {...wire('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'left' }}>  <OverlayJogArrow {...wire('x', -1)} rotation={-90} label="X−" color="#DC2626" size={padBtn} svgSize={svgPx} /></div>
                   <div style={{ gridArea: 'center' }}><OverlayPadCenter label="XY" width={padBtn} height={padBtn} /></div>
-                  <div style={{ gridArea: 'right' }}> <OverlayJogArrow onPress={() => sendJog('x',  1)} rotation={90}  label="X+" color="#DC2626" size={padBtn} svgSize={svgPx} /></div>
-                  <div style={{ gridArea: 'down' }}>  <OverlayJogArrow onPress={() => sendJog('y', -1)} rotation={180} label="Y−" color="#16A34A" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'right' }}> <OverlayJogArrow {...wire('x',  1)} rotation={90}  label="X+" color="#DC2626" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'down' }}>  <OverlayJogArrow {...wire('y', -1)} rotation={180} label="Y−" color="#16A34A" size={padBtn} svgSize={svgPx} /></div>
                 </div>
               </div>
               <div style={{ flex: '0 1 auto' }}>
-                <div style={{ fontSize: 12, color: '#9ca3af', textAlign: 'center', marginBottom: 6 }}>Height</div>
+                <div style={{ fontSize: 12, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>Height</div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: padGap, width: padBtn }}>
-                  <OverlayJogArrow onPress={() => sendJog('z',  1)} rotation={0}   label="Z+" color="#3B82F6" size={padBtn} svgSize={svgPx} />
-                  <OverlayJogArrow onPress={() => sendJog('z', -1)} rotation={180} label="Z−" color="#3B82F6" size={padBtn} svgSize={svgPx} />
+                  <OverlayJogArrow {...wire('z',  1)} rotation={0}   label="Z+" color="#3B82F6" size={padBtn} svgSize={svgPx} />
+                  <OverlayJogArrow {...wire('z', -1)} rotation={180} label="Z−" color="#3B82F6" size={padBtn} svgSize={svgPx} />
                 </div>
               </div>
               <div style={{ flex: '0 1 auto' }}>
-                <div style={{ fontSize: 12, color: '#9ca3af', textAlign: 'center', marginBottom: 6 }}>Rotation</div>
+                <div style={{ fontSize: 12, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>Rotation</div>
                 <div style={{
                   display: 'grid',
                   gridTemplateColumns: `repeat(3, ${padBtn}px)`,
@@ -2049,11 +2063,11 @@ function TeachOverlay({
                   gridTemplateAreas: '". rxp ." "rzn center rzp" ". rxn ."',
                   gap: padGap,
                 }}>
-                  <div style={{ gridArea: 'rxp' }}>   <OverlayJogArrow onPress={() => sendJog('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} svgSize={svgPx} /></div>
-                  <div style={{ gridArea: 'rzn' }}>   <OverlayJogArrow onPress={() => sendJog('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'rxp' }}>   <OverlayJogArrow {...wire('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'rzn' }}>   <OverlayJogArrow {...wire('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" size={padBtn} svgSize={svgPx} /></div>
                   <div style={{ gridArea: 'center' }}><OverlayPadCenter label="Rot" width={padBtn} height={padBtn} /></div>
-                  <div style={{ gridArea: 'rzp' }}>   <OverlayJogArrow onPress={() => sendJog('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" size={padBtn} svgSize={svgPx} /></div>
-                  <div style={{ gridArea: 'rxn' }}>   <OverlayJogArrow onPress={() => sendJog('rx', -1)} rotation={180} label="Rx−" color="#9333EA" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'rzp' }}>   <OverlayJogArrow {...wire('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'rxn' }}>   <OverlayJogArrow {...wire('rx', -1)} rotation={180} label="Rx−" color="#9333EA" size={padBtn} svgSize={svgPx} /></div>
                 </div>
               </div>
             </>
@@ -2064,9 +2078,9 @@ function TeachOverlay({
                 display: 'flex', flexDirection: 'column',
                 alignItems: 'center', gap: padGap,
               }}>
-                <div style={{ fontSize: 16, fontWeight: 700, color: '#cbd5e1' }}>{'J' + j}</div>
-                <OverlayJogArrow onPress={() => sendJog(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={padBtn} svgSize={svgPx} />
-                <OverlayJogArrow onPress={() => sendJog(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={padBtn} svgSize={svgPx} />
+                <div style={{ fontSize: 16, fontWeight: 700, color: '#374151' }}>{'J' + j}</div>
+                <OverlayJogArrow {...wire(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={padBtn} svgSize={svgPx} />
+                <OverlayJogArrow {...wire(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={padBtn} svgSize={svgPx} />
               </div>
             ))
           )}
@@ -2089,7 +2103,7 @@ function TeachOverlay({
       {/* FOOTER */}
       <div style={{
         height: 100, flexShrink: 0,
-        background: '#141416', borderTop: '1px solid #2a2a30',
+        background: '#fff', borderTop: '1px solid #e5e7eb',
         display: 'flex', alignItems: 'center', padding: '0 22px', gap: 16,
         position: 'relative',
       }}>
@@ -2098,8 +2112,8 @@ function TeachOverlay({
             <button onClick={onBack} style={{
               minHeight: 56, padding: '0 22px',
               fontSize: 15, fontWeight: 700,
-              background: 'transparent', color: '#cbd5e1',
-              border: '1px solid #2a2a30', borderRadius: 10, cursor: 'pointer',
+              background: '#fff', color: '#374151',
+              border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
             }}>← Back</button>
           ) : null}
         </div>
@@ -2112,9 +2126,10 @@ function TeachOverlay({
             style={{
               height: 72, minWidth: 280, padding: '0 36px',
               fontSize: 20, fontWeight: 800, letterSpacing: '0.5px',
-              background: flash ? '#fff' : '#00C47A',
-              color:      flash ? '#00C47A' : '#fff',
-              border: 'none', borderRadius: 12, cursor: 'pointer',
+              background: flash ? '#fff' : '#16A34A',
+              color:      flash ? '#16A34A' : '#fff',
+              border: flash ? '2px solid #16A34A' : 'none',
+              borderRadius: 12, cursor: 'pointer',
               transition: 'background 100ms, color 100ms',
             }}>
             {flash ? '✓ RECORDED' : 'RECORD POSITION'}
@@ -2125,19 +2140,19 @@ function TeachOverlay({
           <button onClick={onSkip} style={{
             minHeight: 56, padding: '0 22px',
             fontSize: 15, fontWeight: 700,
-            background: 'transparent', color: '#cbd5e1',
-            border: '1px solid #2a2a30', borderRadius: 10, cursor: 'pointer',
+            background: '#fff', color: '#374151',
+            border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
           }}>Skip →</button>
         </div>
 
         {/* Progress bar pinned to the very bottom */}
         <div style={{
           position: 'absolute', left: 0, right: 0, bottom: 0,
-          height: 4, background: '#1C1C1F',
+          height: 4, background: '#e5e7eb',
         }}>
           <div style={{
             height: '100%', width: progressPct + '%',
-            background: '#2F7FFF', transition: 'width 200ms',
+            background: '#2563EB', transition: 'width 200ms',
           }} />
         </div>
       </div>
