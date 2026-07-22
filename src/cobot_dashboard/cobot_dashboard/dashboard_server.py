@@ -6426,7 +6426,7 @@ if FASTAPI_AVAILABLE:
     # a live-first force → GetIOValue round-trip is verified.
     # ------------------------------------------------------------------
     _IO_MAP_PATH    = '/opt/cobot/io_map.json'
-    _IO_MAP_VERSION = 4
+    _IO_MAP_VERSION = 5
 
     # Controller nameplate — captured from the silkscreen label plate on
     # the back of the CC10-A controller on 2026-07-21.
@@ -6634,85 +6634,119 @@ if FASTAPI_AVAILABLE:
     #   aux      — FUSE, misc
     # Signal terminals additionally carry `kind` + `port`.
     # ------------------------------------------------------------------
-    def _plate_mfunc_terminals():
+    # ────────────────────────────────────────────────────────────
+    # Physical-plate terminal builders — v3 layout (2026-07-22)
+    #
+    # Every card mirrors the CC10-A back panel silkscreen 1:1 so an
+    # operator at the cabinet can count connectors left→right and
+    # match the screen. Two ordering rules matter:
+    #
+    #   1. DI / DO signal rows carry `pair_tag` = the return terminal
+    #      the operator physically lands the return wire on (0V for
+    #      DI-A / DO-A, 24V for DI-B / DO-B). The frontend renders
+    #      pair_tag as a small right-side chip on each row.
+    #
+    #   2. M-FUNC and PWR banks use `layout: 'pair-rows'` blocks where
+    #      each row is a [left, right] terminal pair — verbatim from
+    #      the silkscreen (not the logical order the earlier v1/v2
+    #      renderer used).
+    # ────────────────────────────────────────────────────────────
+
+    def _mfunc_cell(name, role, **extra):
+        return {'name': name, 'role': role, **extra}
+
+    def _plate_mfunc_pair_rows():
+        """8 rows, 2 columns — silkscreen order left→right, top→bottom.
+        HDI1-4 stay as signal terminals so the toggle + live pill still
+        light up on those cells."""
         return [
-            {'name': 'CAN+',  'role': 'bus'},
-            {'name': 'CAN-',  'role': 'bus'},
-            {'name': '485A1', 'role': 'bus'},
-            {'name': '485B1', 'role': 'bus'},
-            {'name': '485A2', 'role': 'bus'},
-            {'name': '485B2', 'role': 'bus'},
-            {'name': 'ON',    'role': 'control'},
-            {'name': 'OFF',   'role': 'control'},
-            {'name': '12V',   'role': 'power'},
-            {'name': 'COM',   'role': 'return'},
-            {'name': 'EN',    'role': 'control'},
-            {'name': 'HDI1',  'role': 'signal', 'kind': 'HDI', 'port': 1},
-            {'name': 'HDI2',  'role': 'signal', 'kind': 'HDI', 'port': 2},
-            {'name': 'HDI3',  'role': 'signal', 'kind': 'HDI', 'port': 3},
-            {'name': 'HDI4',  'role': 'signal', 'kind': 'HDI', 'port': 4},
-            {'name': 'COM2',  'role': 'return'},
+            [_mfunc_cell('CAN+',   'bus'),     _mfunc_cell('485A1',  'bus')],
+            [_mfunc_cell('CAN-',   'bus'),     _mfunc_cell('485B1',  'bus')],
+            [_mfunc_cell('ON/OFF', 'control'), _mfunc_cell('485A2',  'bus')],
+            [_mfunc_cell('12V',    'power'),   _mfunc_cell('485B2',  'bus')],
+            [_mfunc_cell('COM',    'return'),  _mfunc_cell('EN',     'control')],
+            [_mfunc_cell('HDI1',   'signal', kind='HDI', port=1),
+             _mfunc_cell('HDI2',   'signal', kind='HDI', port=2)],
+            [_mfunc_cell('COM2',   'return'),  _mfunc_cell('COM2',   'return')],
+            [_mfunc_cell('HDI3',   'signal', kind='HDI', port=3),
+             _mfunc_cell('HDI4',   'signal', kind='HDI', port=4)],
         ]
 
     def _plate_di_a_terminals():
-        ts = [{'name': '24V', 'role': 'power'}]
-        for i in range(8):
-            ts.append({'name': f'DI{i}', 'role': 'signal', 'kind': 'DI', 'port': i})
-        ts.append({'name': '0V', 'role': 'return'})
-        return ts
+        """DI0..DI7 — SINK wiring, each row paired with 0V (rendered as
+        a small right-side tag on each row)."""
+        return [{'name': f'DI{i}', 'role': 'signal', 'kind': 'DI',
+                 'port': i, 'pair_tag': '0V'}
+                for i in range(8)]
 
     def _plate_di_b_terminals():
-        ts = [{'name': '0V', 'role': 'return'}]
-        for i in range(8, 16):
-            ts.append({'name': f'DI{i}', 'role': 'signal', 'kind': 'DI', 'port': i})
-        ts.append({'name': '24V', 'role': 'power'})
-        return ts
-
-    def _plate_pwrcfg_terminals():
-        return [
-            {'name': 'COM1', 'role': 'return'},
-            {'name': '24V',  'role': 'power'},
-            {'name': 'GND',  'role': 'return'},
-            {'name': 'FUSE', 'role': 'aux'},
-        ]
+        """DI8..DI15 — SOURCE wiring, each row paired with 24V."""
+        return [{'name': f'DI{i}', 'role': 'signal', 'kind': 'DI',
+                 'port': i, 'pair_tag': '24V'}
+                for i in range(8, 16)]
 
     def _plate_do_a_terminals():
-        ts = [{'name': '24V', 'role': 'power'}]
-        for i in range(8):
-            ts.append({'name': f'DO{i}', 'role': 'signal', 'kind': 'DO', 'port': i})
-        ts.append({'name': '0V', 'role': 'return'})
-        return ts
+        """DO0..DO7 — PNP output, each row's load returns to 0V."""
+        return [{'name': f'DO{i}', 'role': 'signal', 'kind': 'DO',
+                 'port': i, 'pair_tag': '0V'}
+                for i in range(8)]
 
     def _plate_do_b_terminals():
-        ts = [{'name': '0V', 'role': 'return'}]
-        for i in range(8, 16):
-            ts.append({'name': f'DO{i}', 'role': 'signal', 'kind': 'DO', 'port': i})
-        ts.append({'name': '24V', 'role': 'power'})
-        return ts
+        """DO8..DO15 — PNP output, each row's load returns to 24V."""
+        return [{'name': f'DO{i}', 'role': 'signal', 'kind': 'DO',
+                 'port': i, 'pair_tag': '24V'}
+                for i in range(8, 16)]
 
-    def _plate_ao_terminals():
-        ts = []
-        for i in range(4):
-            ts.append({'name': f'AO{i}',    'role': 'signal', 'kind': 'AO', 'port': i})
-            ts.append({'name': f'AGND{i}',  'role': 'return'})
-        return ts
+    def _plate_pwr_rail_pair_rows():
+        """Standalone 24V|0V power connector — 8 rows, 2 columns.
+        Rendered between DI-A / DI-B (slot 3) and between DO-A / DO-B
+        (slot 7) on the physical panel."""
+        return [[
+            _mfunc_cell('24V', 'power'),
+            _mfunc_cell('0V',  'return'),
+        ] for _ in range(8)]
 
-    def _plate_ai_terminals():
-        ts = []
-        for i in range(4):
-            ts.append({'name': f'AI{i}',        'role': 'signal', 'kind': 'AI', 'port': i})
-            ts.append({'name': f'AGND{i + 4}',  'role': 'return'})
-        return ts
+    def _plate_pwrcfg_pair_rows():
+        """PWR CFG connector — 4 rows + FUSE aux."""
+        return [
+            [_mfunc_cell('COM1', 'return'),  _mfunc_cell('0V',  'return')],
+            [_mfunc_cell('24V',  'power'),   _mfunc_cell('0V',  'return')],
+            [_mfunc_cell('24V',  'power'),   _mfunc_cell('0V',  'return')],
+            [_mfunc_cell('GND',  'return'),  _mfunc_cell('0V',  'return')],
+        ]
+
+    def _plate_aio_sections():
+        """One AI/O connector, silkscreened top→bottom: AO 0-3 then AI 0-3.
+        Each row is AOn|AGNDn (or AIn|AGND{n+4}) — a signal terminal
+        paired with its dedicated analog-ground return on the same row."""
+        ao_rows = [[
+            _mfunc_cell(f'AO{i}',    'signal', kind='AO', port=i,
+                        pair_tag=f'AGND{i}'),
+            _mfunc_cell(f'AGND{i}',  'return'),
+        ] for i in range(4)]
+        ai_rows = [[
+            _mfunc_cell(f'AI{i}',        'signal', kind='AI', port=i,
+                        pair_tag=f'AGND{i + 4}'),
+            _mfunc_cell(f'AGND{i + 4}',  'return'),
+        ] for i in range(4)]
+        return [
+            {'label': 'AO 0-3', 'rows': ao_rows},
+            {'label': 'AI 0-3', 'rows': ai_rows},
+        ]
 
     def _plate_safety_terminals():
+        """Safety I/O terminals — order matches the CC10-A silkscreen
+        top→bottom (v3, 2026-07-22): VO2± / VO1± / ES4B± down to
+        ES1A± / CHA / CHB."""
         ts = [
-            {'name': 'VO1+', 'role': 'safety'},
-            {'name': 'VO1-', 'role': 'safety'},
             {'name': 'VO2+', 'role': 'safety'},
             {'name': 'VO2-', 'role': 'safety'},
+            {'name': 'VO1+', 'role': 'safety'},
+            {'name': 'VO1-', 'role': 'safety'},
         ]
-        for i in range(1, 5):        # ES1..ES4
-            for ch in ('A', 'B'):    # dual-channel per E-stop
+        # ES4B, ES4A, ES3B, ES3A, ES2B, ES2A, ES1B, ES1A — descending.
+        for i in (4, 3, 2, 1):
+            for ch in ('B', 'A'):
                 ts.append({'name': f'ES{i}{ch}+', 'role': 'safety'})
                 ts.append({'name': f'ES{i}{ch}-', 'role': 'safety'})
         ts.append({'name': 'CHA', 'role': 'safety'})
@@ -6747,46 +6781,78 @@ if FASTAPI_AVAILABLE:
         ]
 
     def _io_map_default_plate():
-        """Physical CC10-A back panel — silkscreen order, left→right."""
+        """Physical CC10-A back panel — v3 layout (2026-07-22).
+
+        Nine cards in exact left→right silkscreen order. Each carries
+        a `slot` (1-9) so the frontend can render a position badge —
+        the operator counts connectors at the cabinet and matches to
+        the screen 1:1.
+
+        Layout hints:
+          layout='pair-rows'   → block carries `pair_rows` (list of
+                                  [left_terminal, right_terminal])
+                                  and NO flat `terminals`.
+          layout='sections'    → block carries `sections`
+                                  ([{label, rows}, ...]).
+          default (signals)    → block carries flat `terminals`.
+
+        The SAFETY card is the 10th block (kept below the row per the
+        v2 declutter — safety-PLC domain, not operator-actuated)."""
         return [
-            {'id': 'MFUNC',  'kind': 'M-FUNC',  'group': 'system',
+            {'id': 'MFUNC',  'slot': 1, 'kind': 'M-FUNC', 'group': 'system',
              'label': 'M-Func',
-             'terminals': _plate_mfunc_terminals(),
+             'layout': 'pair-rows',
+             'pair_rows': _plate_mfunc_pair_rows(),
              'notes': ('High-speed inputs HDI1-4, CAN bus, dual RS-485, '
                         'ON/OFF, 12V/COM, EN, COM2.')},
-            {'id': 'DI-A',   'kind': 'DI', 'group': 'general',
+            {'id': 'DI-A',   'slot': 2, 'kind': 'DI', 'group': 'general',
              'label': 'DI 0-7',
              'wiring': {'mode': 'sink', 'return_rail': '0V'},
              'terminals': _plate_di_a_terminals(),
-             'notes': 'Sink wiring — sensor pulls DIn LOW through 0V to signal ON.'},
-            {'id': 'DI-B',   'kind': 'DI', 'group': 'general',
+             'notes': ('Sink wiring — sensor pulls DIn LOW through 0V to signal ON. '
+                       'Manual is PNP/NPN capable; each row lands its return on 0V.')},
+            {'id': 'PWR-A',  'slot': 3, 'kind': 'PWR-CFG', 'group': 'system',
+             'label': 'Power (DI rail)',
+             'layout': 'pair-rows',
+             'pair_rows': _plate_pwr_rail_pair_rows(),
+             'notes': ('Dedicated 24V|0V connector between the two DI banks — '
+                       'silkscreen shows 8 rows of 24V|0V terminals.')},
+            {'id': 'DI-B',   'slot': 4, 'kind': 'DI', 'group': 'general',
              'label': 'DI 8-15',
              'wiring': {'mode': 'source', 'return_rail': '24V'},
              'terminals': _plate_di_b_terminals(),
-             'notes': 'Source wiring — sensor pulls DIn HIGH from 24V to signal ON.'},
-            {'id': 'PWRCFG', 'kind': 'PWR-CFG', 'group': 'system',
+             'notes': ('Source wiring — sensor pulls DIn HIGH from 24V to signal ON. '
+                       'Manual is PNP/NPN capable; each row lands its return on 24V.')},
+            {'id': 'PWRCFG', 'slot': 5, 'kind': 'PWR-CFG', 'group': 'system',
              'label': 'Power / Fuse',
-             'terminals': _plate_pwrcfg_terminals(),
-             'notes': 'External 24V field supply + system 0V/GND + FUSE.'},
-            {'id': 'DO-A',   'kind': 'DO', 'group': 'general',
+             'layout': 'pair-rows',
+             'pair_rows': _plate_pwrcfg_pair_rows(),
+             'aux': [{'name': 'FUSE', 'role': 'aux'}],
+             'notes': 'External 24V field supply + system 0V/GND + FUSE lug.'},
+            {'id': 'DO-A',   'slot': 6, 'kind': 'DO', 'group': 'general',
              'label': 'DO 0-7',
              'wiring': {'mode': 'sink', 'return_rail': '0V'},
              'terminals': _plate_do_a_terminals(),
-             'notes': 'PNP outputs — load between DOn and 0V rail.'},
-            {'id': 'DO-B',   'kind': 'DO', 'group': 'general',
+             'notes': ('PNP outputs, 125 mA per group — load between DOn and 0V rail.')},
+            {'id': 'PWR-B',  'slot': 7, 'kind': 'PWR-CFG', 'group': 'system',
+             'label': 'Power (DO rail)',
+             'layout': 'pair-rows',
+             'pair_rows': _plate_pwr_rail_pair_rows(),
+             'notes': ('Dedicated 24V|0V connector between the two DO banks — '
+                       'silkscreen shows 8 rows of 24V|0V terminals.')},
+            {'id': 'DO-B',   'slot': 8, 'kind': 'DO', 'group': 'general',
              'label': 'DO 8-15',
              'wiring': {'mode': 'source', 'return_rail': '24V'},
              'terminals': _plate_do_b_terminals(),
-             'notes': 'PNP outputs — load between DOn and 24V rail.'},
-            {'id': 'AO',     'kind': 'AO', 'group': 'analog',
-             'label': 'Analog Outputs',
-             'terminals': _plate_ao_terminals(),
-             'notes': 'Each AOn paired with its own AGND (0-3).'},
-            {'id': 'AI',     'kind': 'AI', 'group': 'analog',
-             'label': 'Analog Inputs',
-             'terminals': _plate_ai_terminals(),
-             'notes': 'Each AIn paired with its own AGND (4-7).'},
-            {'id': 'SAFETY', 'kind': 'SAFETY', 'group': 'safety',
+             'notes': ('PNP outputs, 125 mA per group — load between DOn and 24V rail.')},
+            {'id': 'AIO',    'slot': 9, 'kind': 'A-IO', 'group': 'analog',
+             'label': 'Analog I/O',
+             'layout': 'sections',
+             'sections': _plate_aio_sections(),
+             'notes': ('One connector, silkscreened AO 0-3 on top, AI 0-3 below. '
+                       'Each row is AOn|AGNDn (or AIn|AGND{n+4}) — signal paired '
+                       'with its own analog ground.')},
+            {'id': 'SAFETY', 'slot': None, 'kind': 'SAFETY', 'group': 'safety',
              'label': 'Safety I/O',
              'terminals': _plate_safety_terminals(),
              'notes': ('VO1± / VO2± voltage-monitored outputs, ES1-ES4 '
@@ -6811,10 +6877,30 @@ if FASTAPI_AVAILABLE:
     # consumers who only need per-channel data (like computeLineMap in
     # the frontend) don't need to walk terminals.
     # ------------------------------------------------------------------
+    def _iter_block_terminals(src: dict):
+        """Yield every terminal in any layout — flat `terminals`,
+        `pair_rows` (M-FUNC + PWR banks), or `sections` (AI/O).
+        Callers that only care about signal ports don't need to
+        branch on block.layout — this hides the shape difference."""
+        if isinstance(src.get('terminals'), list):
+            yield from src['terminals']
+        for row in src.get('pair_rows') or []:
+            for cell in row:
+                if isinstance(cell, dict):
+                    yield cell
+        for section in src.get('sections') or []:
+            for row in section.get('rows') or []:
+                for cell in row:
+                    if isinstance(cell, dict):
+                        yield cell
+                for cell in section.get('terminals') or []:
+                    if isinstance(cell, dict):
+                        yield cell
+
     def _io_map_derive_blocks(plate: list, flange: dict) -> list:
         blocks = []
         for src in list(plate) + [flange]:
-            signals = [t for t in src['terminals'] if t.get('role') == 'signal']
+            signals = [t for t in _iter_block_terminals(src) if t.get('role') == 'signal']
             if not signals:
                 continue
             rows = [{
@@ -6838,7 +6924,7 @@ if FASTAPI_AVAILABLE:
     def _io_map_default_ports(plate: list, flange: dict) -> dict:
         ports: dict = {}
         for src in list(plate) + [flange]:
-            for t in src['terminals']:
+            for t in _iter_block_terminals(src):
                 if t.get('role') != 'signal':
                     continue
                 name = t['name']

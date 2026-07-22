@@ -538,6 +538,280 @@ function TerminalRow({ name, role }) {
 }
 
 // ---------------------------------------------------------------------------
+// SlotBadge — small position index (1-9) on each card header so the
+// operator can count connectors left→right at the cabinet and match
+// the screen 1:1. Blocks without a slot (SAFETY) render nothing.
+// ---------------------------------------------------------------------------
+function SlotBadge({ slot }) {
+  if (slot == null) return null
+  return (
+    <span
+      title={`Slot ${slot} — physical connector position, left→right on the CC10-A back panel.`}
+      style={{
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        width: 18, height: 18, borderRadius: '50%',
+        background: '#111827', color: '#fff',
+        fontSize: 10, fontWeight: 700, fontFamily: 'monospace',
+        flexShrink: 0,
+      }}>{slot}</span>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// PairRowsBlock — two-column terminal grid used by M-FUNC and the
+// PWR banks (v3 layout). Rows are `[left, right]` cells straight
+// from the silkscreen; either cell can be a signal terminal (HDI1-4
+// on M-FUNC) so we route through ChannelRow OR TerminalRow per cell.
+// ---------------------------------------------------------------------------
+function PairRowsBlock({ block, ports, specs, onEdit }) {
+  const kind    = block.kind
+  const group   = block.group || 'general'
+  const meta    = KIND_META[kind] || { color: C.textMuted, short: kind, kindLabel: kind }
+  const grpMeta = GROUP_META[group] || GROUP_META.general
+  const tip     = specTooltip(kind, specs)
+  const pairRows = Array.isArray(block.pair_rows) ? block.pair_rows : []
+  const auxRows  = Array.isArray(block.aux) ? block.aux : []
+  const editable = group !== 'system' && group !== 'safety'
+
+  const renderCell = (cell, cellKey) => {
+    if (!cell || typeof cell !== 'object') {
+      return <div key={cellKey} style={{ minWidth: 0 }} />
+    }
+    if (cell.role === 'signal') {
+      return (
+        <ChannelRow
+          key={cellKey}
+          id={cell.name}
+          kind={cell.kind || kind}
+          meta={ports?.[cell.name]}
+          row={{
+            port: cell.port,
+            default_name: cell.default_name || cell.name,
+            function: cell.function,
+            pair_tag: cell.pair_tag,
+          }}
+          editable={editable}
+          onEdit={onEdit}
+        />
+      )
+    }
+    // Non-signal cells render as a compact single-terminal chip
+    // (silkscreen-accurate: shows the literal terminal name + role).
+    const roleMeta = ROLE_META[cell.role] || ROLE_META.aux
+    return (
+      <div key={cellKey} style={{
+        display: 'flex', alignItems: 'center', gap: 6,
+        padding: '3px 8px', borderRadius: 4,
+        background: C.rowBgDim,
+        border: `1px dashed ${C.border}`,
+        minWidth: 0,
+      }}>
+        <span style={{
+          fontSize: 10, fontFamily: 'monospace',
+          color: C.textMuted, fontWeight: 600,
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          flex: 1,
+        }}>{cell.name}</span>
+        <span style={{
+          fontSize: 8, fontWeight: 700,
+          color: roleMeta.color, background: roleMeta.bg,
+          padding: '1px 5px', borderRadius: 3,
+          letterSpacing: '0.05em', flexShrink: 0,
+        }}>{roleMeta.label}</span>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column',
+      background: C.rowBg,
+      border: `1px solid ${C.border}`,
+      borderRadius: 6, overflow: 'hidden', minWidth: 0,
+    }}>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 6,
+        padding: '6px 8px',
+        background: grpMeta.tint !== 'transparent' ? grpMeta.tint : C.headerBg,
+        borderBottom: `1px solid ${C.border}`,
+        borderTop: `3px solid ${meta.color}`,
+      }}>
+        <SlotBadge slot={block.slot} />
+        <span style={{
+          fontSize: 9, fontWeight: 700,
+          color: '#fff', background: meta.color,
+          padding: '1px 5px', borderRadius: 3,
+          letterSpacing: '0.05em', flexShrink: 0,
+          textTransform: 'uppercase',
+        }}>{meta.short}</span>
+        <span style={{
+          flex: 1, fontSize: 11, fontWeight: 600, color: '#374151',
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }}>{block.label}</span>
+        <span
+          title={block.notes || `${pairRows.length} paired rows — silkscreen exact.`}
+          style={{
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            width: 14, height: 14, borderRadius: '50%',
+            background: '#fff', color: C.textMuted,
+            border: `1px solid ${C.border}`,
+            fontSize: 9, fontWeight: 700, cursor: 'help',
+            flexShrink: 0,
+          }}>i</span>
+      </div>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: 3, padding: 5,
+      }}>
+        {pairRows.flatMap((row, ri) => [
+          renderCell(row[0], `${ri}-L`),
+          renderCell(row[1], `${ri}-R`),
+        ])}
+        {auxRows.length > 0 && (
+          <div style={{
+            gridColumn: '1 / -1',
+            marginTop: 2, padding: '3px 8px',
+            fontSize: 10, color: C.textMuted, fontFamily: 'monospace',
+            background: '#FEF3C7', border: '1px solid #FBBF24',
+            borderRadius: 4,
+            display: 'flex', alignItems: 'center', gap: 6,
+          }}>
+            {auxRows.map((a) => (
+              <span key={a.name}>{a.name}</span>
+            ))}
+            <span style={{ marginLeft: 'auto', fontSize: 8, fontWeight: 700,
+                            color: '#92400E' }}>AUX</span>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// SectionsBlock — one card, multiple labeled sub-sections, each with
+// its own pair-row grid. Used by the AI/O connector (AO 0-3 on top,
+// AI 0-3 below — one connector, two silkscreen sections).
+// ---------------------------------------------------------------------------
+function SectionsBlock({ block, ports, specs, onEdit }) {
+  const kind    = block.kind
+  const group   = block.group || 'general'
+  const meta    = KIND_META[kind] || { color: C.textMuted, short: kind, kindLabel: kind }
+  const grpMeta = GROUP_META[group] || GROUP_META.general
+  const sections = Array.isArray(block.sections) ? block.sections : []
+  const editable = group !== 'system' && group !== 'safety'
+
+  const renderCell = (cell, key) => {
+    if (!cell || typeof cell !== 'object') return null
+    if (cell.role === 'signal') {
+      return (
+        <ChannelRow
+          key={key}
+          id={cell.name}
+          kind={cell.kind || kind}
+          meta={ports?.[cell.name]}
+          row={{
+            port: cell.port,
+            default_name: cell.default_name || cell.name,
+            function: cell.function,
+            pair_tag: cell.pair_tag,
+          }}
+          editable={editable}
+          onEdit={onEdit}
+        />
+      )
+    }
+    const roleMeta = ROLE_META[cell.role] || ROLE_META.aux
+    return (
+      <div key={key} style={{
+        display: 'flex', alignItems: 'center', gap: 6,
+        padding: '3px 8px', borderRadius: 4,
+        background: C.rowBgDim,
+        border: `1px dashed ${C.border}`,
+        minWidth: 0,
+      }}>
+        <span style={{
+          fontSize: 10, fontFamily: 'monospace',
+          color: C.textMuted, fontWeight: 600,
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          flex: 1,
+        }}>{cell.name}</span>
+        <span style={{
+          fontSize: 8, fontWeight: 700,
+          color: roleMeta.color, background: roleMeta.bg,
+          padding: '1px 5px', borderRadius: 3,
+          letterSpacing: '0.05em', flexShrink: 0,
+        }}>{roleMeta.label}</span>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column',
+      background: C.rowBg,
+      border: `1px solid ${C.border}`,
+      borderRadius: 6, overflow: 'hidden', minWidth: 0,
+    }}>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 6,
+        padding: '6px 8px',
+        background: grpMeta.tint !== 'transparent' ? grpMeta.tint : C.headerBg,
+        borderBottom: `1px solid ${C.border}`,
+        borderTop: `3px solid ${meta.color}`,
+      }}>
+        <SlotBadge slot={block.slot} />
+        <span style={{
+          fontSize: 9, fontWeight: 700,
+          color: '#fff', background: meta.color,
+          padding: '1px 5px', borderRadius: 3,
+          letterSpacing: '0.05em', flexShrink: 0,
+          textTransform: 'uppercase',
+        }}>{meta.short}</span>
+        <span style={{
+          flex: 1, fontSize: 11, fontWeight: 600, color: '#374151',
+        }}>{block.label}</span>
+        <span
+          title={block.notes || ''}
+          style={{
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            width: 14, height: 14, borderRadius: '50%',
+            background: '#fff', color: C.textMuted,
+            border: `1px solid ${C.border}`,
+            fontSize: 9, fontWeight: 700, cursor: 'help', flexShrink: 0,
+          }}>i</span>
+      </div>
+      <div style={{ padding: 5, display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {sections.map((sec, si) => (
+          <div key={si} style={{
+            border: `1px dashed ${C.border}`, borderRadius: 4,
+          }}>
+            <div style={{
+              padding: '3px 8px', fontSize: 9, fontWeight: 700,
+              color: C.textMuted, letterSpacing: '0.05em',
+              textTransform: 'uppercase',
+              borderBottom: `1px dashed ${C.border}`,
+              background: C.rowBgDim,
+            }}>{sec.label}</div>
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr',
+              gap: 3, padding: 4,
+            }}>
+              {(sec.rows || []).flatMap((row, ri) => [
+                renderCell(row[0], `${si}-${ri}-L`),
+                renderCell(row[1], `${si}-${ri}-R`),
+              ])}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Plate block (physical view). Renders every terminal in silkscreen
 // order — signals through ChannelRow, non-signals through TerminalRow.
 // ---------------------------------------------------------------------------
@@ -569,6 +843,7 @@ function PlateBlock({ block, ports, specs, onEdit }) {
         borderBottom: `1px solid ${C.border}`,
         borderTop: `3px solid ${meta.color}`,
       }}>
+        <SlotBadge slot={block.slot} />
         <span style={{
           fontSize: 9, fontWeight: 700,
           color: '#fff', background: meta.color,
@@ -712,6 +987,11 @@ function ChannelRow({ id, kind, meta, row, onEdit, editable }) {
   const fnTag = row?.function
   const port  = row?.port
   const defaultName = row?.default_name
+  // pair_tag = the terminal the operator physically lands the return
+  // wire on for this row (0V for DI-A / DO-A, 24V for DI-B / DO-B,
+  // AGNDn for analog rows). Rendered as a small right-side chip so
+  // the on-screen row matches the silkscreen pairing 1:1.
+  const pairTag = row?.pair_tag
 
   const { allowIo, bridgeUp, expertMode } = useIOLive()
   const showToggle =
@@ -789,6 +1069,22 @@ function ChannelRow({ id, kind, meta, row, onEdit, editable }) {
           )}
         </div>
         <LiveStatePill kind={kind} port={port} />
+        {pairTag && (
+          <span
+            title={`Physical return terminal for this row (silkscreen pairing): ${pairTag}. Land the return wire here.`}
+            style={{
+              fontSize: 8, fontWeight: 700,
+              padding: '1px 5px', borderRadius: 3,
+              background: pairTag === '24V' ? '#FEE2E2'
+                        : pairTag === '0V'  ? '#E0F2FE'
+                        : '#F3F4F6',
+              color:      pairTag === '24V' ? '#991B1B'
+                        : pairTag === '0V'  ? '#075985'
+                        : '#374151',
+              letterSpacing: '0.03em', flexShrink: 0,
+              fontFamily: 'monospace',
+            }}>{pairTag}</span>
+        )}
         {showToggle && (
           <IOToggle kind={kind} port={port}
                     disabled={toggleDisabled}
@@ -1412,10 +1708,25 @@ export default function IOPortMap() {
         gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
         gap: 6, alignItems: 'start',
       }}>
-        {plate.filter((b) => b.group !== 'safety').map((blk) => (
-          <PlateBlock key={blk.id} block={blk} ports={ports} specs={specs}
-                      onEdit={onEdit} />
-        ))}
+        {plate
+          .filter((b) => b.group !== 'safety')
+          .sort((a, b) => (a.slot ?? 99) - (b.slot ?? 99))
+          .map((blk) => {
+            // v3 dispatch — new layouts route to purpose-built cards.
+            if (blk.layout === 'pair-rows') {
+              return <PairRowsBlock key={blk.id} block={blk}
+                                    ports={ports} specs={specs}
+                                    onEdit={onEdit} />
+            }
+            if (blk.layout === 'sections') {
+              return <SectionsBlock key={blk.id} block={blk}
+                                    ports={ports} specs={specs}
+                                    onEdit={onEdit} />
+            }
+            return <PlateBlock key={blk.id} block={blk}
+                               ports={ports} specs={specs}
+                               onEdit={onEdit} />
+          })}
         {plate.filter((b) => b.group === 'safety').map((blk) => (
           <SafetyRail key={blk.id} block={blk} />
         ))}
