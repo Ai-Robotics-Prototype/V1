@@ -4727,6 +4727,14 @@ if FASTAPI_AVAILABLE:
 
         if _ros_node is None:
             return JSONResponse({"error": "ros not available"}, status_code=503)
+        # Part G byte-verify (2026-07-22): publish `save` FIRST alone,
+        # wait for the driver's save event, GET the stored Lua from the
+        # controller, and compare its sha256 to what codegen emitted.
+        # Only if the two agree do we publish the rest of the run
+        # sequence — otherwise we refuse the run with a readable error.
+        # Prevents the class of failure where a network stall dropped
+        # one of the 4 save POSTs; without this check we'd blindly run
+        # a partially-updated program.
         try:
             _ros_node._estun_publish_op(
                 "save",
@@ -4734,6 +4742,73 @@ if FASTAPI_AVAILABLE:
                 name=str(program.get("name") or prog_id),
                 task_name="main",
                 points=points, lua_source=lua)
+        except Exception as e:
+            return JSONResponse({"error": f"publish save: {e}"}, status_code=500)
+
+        # Wait up to 4s for the driver to publish a save event with all
+        # 4 HTTP-POST steps green.
+        save_event = None
+        save_deadline = time.time() + 4.0
+        while time.time() < save_deadline:
+            await asyncio.sleep(0.05)
+            with _state_lock:
+                r = STATE.get("robot", {})
+                new_rej = r.get("rejected", [])[rej_before:]
+                prog_state = r.get("program", {})
+                save_event = prog_state.get("last_save")
+            program_rejects = [x for x in new_rej if x.get("family") == "program"]
+            if program_rejects:
+                return JSONResponse({
+                    "ok": False,
+                    "error": program_rejects[0].get("reason"),
+                    "outcome": {"kind": "save_rejected",
+                                "reason": program_rejects[0].get("reason")},
+                }, status_code=400)
+            if save_event and all(s.get("http_status") == 200
+                                  for s in save_event.get("steps", [])):
+                break
+        if not (save_event and all(s.get("http_status") == 200
+                                   for s in save_event.get("steps", []))):
+            return JSONResponse({
+                "ok": False,
+                "error": ("save did not complete cleanly (some POSTs "
+                          "did not return 200) — refusing to run"),
+                "outcome": {"kind": "save_failed", "save": save_event},
+            }, status_code=502)
+
+        # GET stored Lua + byte-verify. Uses http_get_lua added in
+        # Part B; runs off-loop in a thread so we don't block asyncio.
+        import hashlib
+        sent_sha = hashlib.sha256(lua.encode('utf-8')).hexdigest()
+        try:
+            stored = await asyncio.wait_for(
+                asyncio.to_thread(
+                    program_ops.http_get_lua,
+                    "192.168.2.136", 9198,
+                    project_id=prog_id, task_id=task_id),
+                timeout=4.0)
+            stored_sha = hashlib.sha256(stored.encode('utf-8')).hexdigest()
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"post-save byte-verify GET failed: {e}",
+                "outcome": {"kind": "byte_verify_get_failed",
+                            "reason": str(e)},
+            }, status_code=502)
+        if stored_sha != sent_sha:
+            return JSONResponse({
+                "ok": False,
+                "error": (f"post-save byte-verify MISMATCH: sent "
+                          f"sha256={sent_sha[:12]} but controller "
+                          f"has {stored_sha[:12]}. Refusing to run — "
+                          f"the stored Lua is not what codegen produced."),
+                "outcome": {"kind": "byte_verify_mismatch",
+                            "sent_sha":   sent_sha[:12],
+                            "stored_sha": stored_sha[:12]},
+            }, status_code=502)
+
+        # Byte-verify passed — publish the rest of the run sequence.
+        try:
             _ros_node._estun_publish_op("to_auto")
             # at_run_start bypasses the driver's mid-run high-speed
             # confirm requirement — the Run modal already ran the
@@ -4746,7 +4821,7 @@ if FASTAPI_AVAILABLE:
             _ros_node._estun_publish_op(
                 "run", program_id=prog_id, task_id=task_id)
         except Exception as e:
-            return JSONResponse({"error": f"publish: {e}"}, status_code=500)
+            return JSONResponse({"error": f"publish run: {e}"}, status_code=500)
 
         # Give the driver a short window to publish either a save event
         # OR a rejection so the response reflects the real outcome, not

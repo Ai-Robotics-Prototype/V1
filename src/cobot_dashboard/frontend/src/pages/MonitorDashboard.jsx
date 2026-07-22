@@ -867,6 +867,22 @@ export default function MonitorDashboard() {
   // reason about). Explicitly enabled during 'stopping' so the arm can
   // be returned home when a run wedges in state=3.
   const homeDisabled   = !!safety?.estop
+  // Empty-program guard (Part G, 2026-07-22): count RUNNABLE steps
+  // — those that will produce a movJ/movL on the wire. Non-motion
+  // steps (wait, set_io, wait_input, loop) don't count. A program
+  // with only non-motion steps saves fine but the controller has
+  // nothing to run; disable the outer Run button so the operator
+  // doesn't open the confirm modal only to see it refuse. Mirrors
+  // the same rule RunProgramModal + /api/estun/program/run enforce.
+  const runnableStepCount = Array.isArray(currentProgram?.steps)
+    ? currentProgram.steps.filter((s) => {
+        if (!s) return false
+        if (s.point_name
+            && (currentProgram?.points || {})[s.point_name]?.joints?.length === 6) return true
+        return Array.isArray(s?.taught_joints) && s.taught_joints.length === 6
+      }).length
+    : 0
+  const emptyProgram = runnableStepCount === 0
   // Restart: enabled from any active state (running/stopping/paused)
   // AND from idle. The `restartProgram` helper below handles the
   // stop-then-run sequence when needed, so this button doubles as a
@@ -874,7 +890,7 @@ export default function MonitorDashboard() {
   // STOPPING. Only estop or no-program disables it.
   const restartDisabled = !!safety?.estop
                           || !(currentProgram?.id)
-                          || (steps.length === 0)
+                          || emptyProgram
   const pauseDisabled  = runState.kind !== 'running' || safety?.estop
   // STOP: NEVER disabled by gate/estop — only by "there's nothing to
   // stop" (idle without a program-execution state). Estop path is
@@ -1040,9 +1056,14 @@ export default function MonitorDashboard() {
               </button>
             )}
             {!(status === 'running' || status === 'paused' || status === 'stopping') && (
-              <button onClick={runProgram} disabled={runDisabled || steps.length === 0}
-                style={primaryBtn('#16A34A', runDisabled || steps.length === 0)}>
-                ▶ Run Program
+              <button
+                onClick={runProgram}
+                disabled={runDisabled || emptyProgram}
+                title={emptyProgram
+                  ? 'Program has no taught poses — nothing to run. Teach at least one point first.'
+                  : undefined}
+                style={primaryBtn('#16A34A', runDisabled || emptyProgram)}>
+                ▶ Run Program{emptyProgram ? ' (no taught poses)' : ''}
               </button>
             )}
             {/* RESTART PROGRAM — stops the running program (project/stop,
