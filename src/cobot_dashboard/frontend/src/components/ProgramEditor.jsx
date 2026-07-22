@@ -2526,6 +2526,43 @@ export default function ProgramEditor() {
     setTeachSingleId(id)
   }
 
+  // "Use Step 1 home position" — for any move_home step past the
+  // first, copy the first move_home step's taught pose into this
+  // step AND record the link so future edits to the first step
+  // propagate here automatically (see teachOverlayRecord). This is
+  // the operator-facing form of the wizard's built-in "share home
+  // pose across cycle start + end" intent — brought into the editor
+  // so drift introduced by a later individual re-teach can be
+  // healed with one click.
+  function linkHomeToFirst(id) {
+    const source = steps.find((s) => s.action === 'move_home')
+    if (!source || source.id === id) return
+    updateSteps(renumber(steps.map((s) => {
+      if (s.id !== id) return s
+      const mirrored = {
+        ...s,
+        linked_to_step_id: source.id,
+        taught: !!source.taught,
+        taught_joints: source.taught_joints ? [...source.taught_joints] : s.taught_joints,
+        taught_tcp:    source.taught_tcp    ? [...source.taught_tcp]    : s.taught_tcp,
+        taught_at:     source.taught_at || s.taught_at,
+        joints:        source.joints || source.taught_joints || s.joints,
+      }
+      if (source.taught_tcp) mirrored.position = source.taught_tcp.slice(0, 3)
+      return mirrored
+    })))
+  }
+  // Break the link — the step keeps its currently-mirrored pose but
+  // stops receiving updates from the source. Re-teach afterwards will
+  // give this step its own independent pose.
+  function unlinkHome(id) {
+    updateSteps(renumber(steps.map((s) => {
+      if (s.id !== id) return s
+      const { linked_to_step_id, ...rest } = s
+      return rest
+    })))
+  }
+
   // Teach All — snapshot the ordered list of step IDs that need
   // teaching and walk through them. The path stays fixed even if a
   // mid-walk record mutates `steps` (the rewrite happens via id, not
@@ -2560,7 +2597,26 @@ export default function ProgramEditor() {
     // to an override — the executor will then prefer this taught_tcp
     // over base+offset. Reset-to-auto clears it.
     if (target.derived_from) patch.overridden = true
-    updateSteps(renumber(steps.map((s) => s.id === target.id ? { ...s, ...patch } : s)))
+    // Propagate to any step linked to this one (currently: a later
+    // move_home linked via "Use Step 1 home position"). Mirrors the
+    // taught fields so the persisted JSON always has both source and
+    // linked-child at identical joints — no drift, no codegen FIX C
+    // normalization ever needs to fire.
+    updateSteps(renumber(steps.map((s) => {
+      if (s.id === target.id) return { ...s, ...patch }
+      if (s.linked_to_step_id === target.id) {
+        const linkedPatch = {
+          taught:        !!patch.taught,
+          taught_joints: patch.taught_joints ? [...patch.taught_joints] : s.taught_joints,
+          taught_tcp:    patch.taught_tcp    ? [...patch.taught_tcp]    : s.taught_tcp,
+          taught_at:     patch.taught_at,
+          joints:        patch.joints || patch.taught_joints || s.joints,
+        }
+        if (patch.taught_tcp) linkedPatch.position = patch.taught_tcp.slice(0, 3)
+        return { ...s, ...linkedPatch }
+      }
+      return s
+    })))
     // Single-step flow: just close.
     if (teachSingleId != null) {
       setTeachSingleId(null)
@@ -2987,6 +3043,18 @@ export default function ProgramEditor() {
         onClick={(e) => { if (e.target === e.currentTarget) setSelectedId(null) }}
         style={{ flex: 1, overflowY: 'auto', padding: '8px 12px' }}>
         {steps.map((step, idx) => {
+          // First move_home in the program is the shared "home"
+          // fixture. Any later move_home can link to it via the
+          // "Use Step 1 home position" control — updates to the first
+          // step then propagate through teachOverlayRecord.
+          const firstHomeStep    = steps.find((s) => s.action === 'move_home')
+          const firstHomeStepId  = firstHomeStep ? firstHomeStep.id : null
+          const firstHomeStepNum = firstHomeStep
+            ? (steps.findIndex((s) => s.id === firstHomeStep.id) + 1)
+            : null
+          const isMoveHome     = step.action === 'move_home'
+          const isLaterHome    = isMoveHome && firstHomeStepId != null && step.id !== firstHomeStepId
+          const isLinkedToHome = step.linked_to_step_id === firstHomeStepId && firstHomeStepId != null
           const def = actionFor(step)
           const tagColor = TAG_COLORS[def.tag] || '#6b7280'
 
@@ -3130,12 +3198,30 @@ export default function ProgramEditor() {
                     wordBreak: 'break-word', whiteSpace: 'normal',
                   }}>
                     {step.label || def.label}
+                    {isLinkedToHome && (
+                      <span style={{
+                        marginLeft: 10, fontSize: 11, fontWeight: 700,
+                        padding: '2px 8px', borderRadius: 10,
+                        background: '#eef2ff', color: '#4338ca',
+                        border: '1px solid #c7d2fe',
+                      }}>🔗 Linked to Step {firstHomeStepNum}</span>
+                    )}
                   </div>
                 ) : (
-                  <EditableStepLabel
-                    value={step.label || def.label}
-                    onSave={(newLabel) => handleRename(step.id, newLabel)}
-                  />
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <EditableStepLabel
+                      value={step.label || def.label}
+                      onSave={(newLabel) => handleRename(step.id, newLabel)}
+                    />
+                    {isLinkedToHome && (
+                      <span style={{
+                        fontSize: 11, fontWeight: 700,
+                        padding: '2px 8px', borderRadius: 10,
+                        background: '#eef2ff', color: '#4338ca',
+                        border: '1px solid #c7d2fe', whiteSpace: 'nowrap',
+                      }}>🔗 Linked to Step {firstHomeStepNum}</span>
+                    )}
+                  </div>
                 )}
                 <div style={{
                   display: 'flex', width: '100%',
@@ -3241,6 +3327,35 @@ export default function ProgramEditor() {
                       borderRadius: 5, cursor: 'pointer',
                     }}>
                     {step.taught ? 'Re-teach' : 'Teach'}
+                  </button>
+                )}
+                {/* "Use Step N home position" — appears on any move_home
+                    step past the first. Clicking it mirrors the first
+                    move_home's taught pose and records a live link so
+                    future re-teach of the first propagates here. If
+                    already linked, the button flips to "Unlink" so the
+                    operator can break the mirror and give this step
+                    its own pose again. */}
+                {!locked && isLaterHome && !isLinkedToHome && (
+                  <button onClick={(e) => { e.stopPropagation(); linkHomeToFirst(step.id) }}
+                    title={`Mirror the pose taught in Step ${firstHomeStepNum} — future re-teach of Step ${firstHomeStepNum} will update this step too.`}
+                    style={{
+                      padding: '6px 14px', fontSize: 12, fontWeight: 600, flexShrink: 0,
+                      background: '#eef2ff', color: '#4338ca',
+                      border: '1px solid #c7d2fe', borderRadius: 5, cursor: 'pointer',
+                    }}>
+                    🔗 Use Step {firstHomeStepNum} home position
+                  </button>
+                )}
+                {!locked && isLaterHome && isLinkedToHome && (
+                  <button onClick={(e) => { e.stopPropagation(); unlinkHome(step.id) }}
+                    title={`Currently mirroring Step ${firstHomeStepNum}. Click to break the link and let this step hold its own independent pose.`}
+                    style={{
+                      padding: '6px 14px', fontSize: 12, fontWeight: 600, flexShrink: 0,
+                      background: '#f5f3ff', color: '#6d28d9',
+                      border: '1px solid #ddd6fe', borderRadius: 5, cursor: 'pointer',
+                    }}>
+                    ⛓ Unlink from Step {firstHomeStepNum}
                   </button>
                 )}
                 {!locked && (
