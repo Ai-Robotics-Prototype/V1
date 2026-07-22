@@ -17,9 +17,10 @@ const IOLiveContext = createContext({
 function useIOLive() { return useContext(IOLiveContext) }
 
 
-// Colour palette pinned to IOPanel.jsx so the two sections read as one
-// page. Do not diverge — the port map lives beside the older list on
-// the same tab.
+// Colour palette. Kept co-located with the component so the port map
+// is self-contained; the legacy IOPanel that once shared this palette
+// was retired on 2026-07-22 when the v2 map absorbed live values +
+// manual actuation.
 const C = {
   border:     '#e5e7eb',
   cardBg:     '#fafafa',

@@ -1,8 +1,12 @@
-import IOPanel   from '../components/IOPanel'
 import IOPortMap from '../components/IOPortMap'
 
-// IOPortMap and IOPanel each manage their own inner padding; the page
-// just gives them a shared scrolling white surface.
+// I/O tab — routes to the v2 Port Map ONLY. The legacy IOPanel
+// (a flat list mirror of digital / analog port states) used to
+// mount inline below the map on the same page; both surfaces were
+// showing at once, and depending on scroll position the OLD panel
+// was what the operator saw first on tab activation. Removed
+// 2026-07-22 after IOPortMap v2 landed with live values + manual
+// actuation. IOPanel.jsx is now dead code and has been deleted.
 export default function IOPage() {
   return (
     <div style={{
@@ -13,7 +17,6 @@ export default function IOPage() {
       boxSizing: 'border-box',
     }}>
       <IOPortMap />
-      <IOPanel />
     </div>
   )
 }
