@@ -726,6 +726,14 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         # so the Run modal shows exactly WHY nothing happened when it didn't.
         self.create_subscription(String, "/estun/rejected",
                                  self._on_estun_rejected, 10)
+        # I/O bridge — driver polls IOManager/GetIOValue + GetIOInfo and
+        # publishes the merged snapshot here. /api/io/live re-exposes it.
+        self.create_subscription(String, "/estun/io",
+                                 self._on_estun_io, 10)
+        # Write path for manual DO / DI-force actions — dashboard's
+        # /api/io/force publishes here and the driver gates on allow_io.
+        self._estun_io_set_pub = self.create_publisher(
+            String, "/robot/io_set", 5)
         # Publisher for the /estun/program op-envelope. Created EAGERLY at
         # node construction so DDS discovery completes long before the
         # operator hits Run. The old lazy-init raced with discovery:
@@ -1258,6 +1266,9 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             # Power gate + telemetry — dashboard banner shows Enable/
             # Disable/Clear-Alarm affordances driven by these fields.
             r["allow_power"] = bool(d.get("allow_power", False))
+            # I/O bridge gate — /api/io/live and the frontend toggle
+            # switches read this. Driver is authoritative.
+            r["allow_io"]    = bool(d.get("allow_io", False))
             r["enabled"]     = bool(d.get("enabled", False))
             r["enabling"]    = bool(d.get("enabling", False))
             r["alarm"]       = bool(d.get("alarm", False))
@@ -1422,6 +1433,18 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             rej.append(d)
             if len(rej) > 32:
                 del rej[:-32]
+
+    def _on_estun_io(self, msg):
+        """Mirror the merged /estun/io snapshot into STATE.io_live so
+        the /api/io/live GET returns it without another ROS hop. Shape
+        matches what the driver publishes — see
+        estun_driver_node._publish_io_snapshot."""
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        with _state_lock:
+            STATE['io_live'] = d
 
     # ---- Estun /estun/program publisher + op helper ----
 
@@ -6209,6 +6232,72 @@ if FASTAPI_AVAILABLE:
     @app.get("/api/io/state")
     async def api_io_state():
         return {"io": _IO_STATE}
+
+    # Live merged snapshot from the driver's IOManager/GetIOValue +
+    # GetIOInfo poll. Returned verbatim; the frontend renders the
+    # `value` and `forced` fields on each row. `allow_io` mirrors the
+    # driver's gate — the frontend uses it to disable the toggles
+    # when writes would be refused.
+    @app.get("/api/io/live")
+    async def api_io_live():
+        with _state_lock:
+            live = STATE.get('io_live')
+        if not live:
+            return {"ok": False,
+                    "reason": "driver has not published /estun/io yet",
+                    "allow_io": False}
+        return {"ok": True, **live}
+
+    # Manual DO / DI-force write. Body: {port: int, value: 0|1, type: "DO"|"DI"}.
+    # This publishes onto /robot/io_set; the driver enforces the
+    # monitor_only + allow_io + SM==READY gate and emits
+    # IOManager/SetIOForcedFlag. Refusals surface on /estun/rejected
+    # (family='io').
+    @app.post("/api/io/force")
+    async def api_io_force(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            port = int(body.get('port'))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "port required (integer)"}, status_code=400)
+        typ = str(body.get('type') or '').upper()
+        if typ not in ('DI', 'DO'):
+            return JSONResponse({"error": "type must be 'DI' or 'DO'"}, status_code=400)
+        val = 1 if body.get('value') else 0
+        with _state_lock:
+            r = STATE.get("robot", {})
+            allow_io = bool(r.get('allow_io', False))
+            monitor_only = bool(r.get('monitor_only', True))
+            rej_before = len(r.get('rejected', []))
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        payload = {"port": port, "value": val, "type": typ}
+        m = String(); m.data = json.dumps(payload)
+        _ros_node._estun_io_set_pub.publish(m)
+        # Give the driver a short window to reject/ack. If the gate is
+        # closed the driver publishes on /estun/rejected; if not, the
+        # next /estun/io snapshot will carry the new forced/value.
+        deadline = time.time() + 0.6
+        outcome = {"kind": "published"}
+        while time.time() < deadline:
+            await asyncio.sleep(0.05)
+            with _state_lock:
+                r = STATE.get('robot', {})
+                new_rej = r.get('rejected', [])[rej_before:]
+                io_rejects = [x for x in new_rej if x.get('family') == 'io']
+                if io_rejects:
+                    outcome = {"kind": "rejected",
+                               "reason": io_rejects[0].get('reason')}
+                    break
+        return {
+            "ok": outcome["kind"] == "published",
+            "outcome": outcome,
+            "request": payload,
+            "gate": {"allow_io": allow_io, "monitor_only": monitor_only},
+        }
 
     @app.post("/api/io/set")
     async def api_io_set(request: Request):

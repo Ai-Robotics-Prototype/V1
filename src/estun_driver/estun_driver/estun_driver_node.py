@@ -255,6 +255,28 @@ class EstunCodroidDriver(Node):
         # above this without an explicit high-speed confirm flag is
         # rejected. Defaults to 40 (see YAML).
         self.declare_parameter('high_speed_confirm_threshold_pct', 40)
+
+        # ── I/O bridge (Task 30, 2026-07-22) ─────────────────────────
+        # Wire-proven verbs from data/estun_captures/estun_io_20260721.har
+        # + estun_lua_io_v2_20260721.har:
+        #   IOManager/GetIOInfo     — {} → {DI:[...], DO:[...], AI:[...], AO:[...]}
+        #                             each entry {port, defaultName, name, forced,
+        #                             function}
+        #   IOManager/GetIOValue    — [{type,port}, ...] → same shape + `value`
+        #   IOManager/SetIOForcedFlag — {port, value, type} → null; value=1 asserts
+        #                             the force (DO drives HIGH, DI reads HIGH),
+        #                             value=0 releases (unforced) — proven by the
+        #                             GetIOInfo.forced round-trip on the DI2
+        #                             capture (see PORT-MAP v2 commit body).
+        # Fifth write gate — SEPARATE from allow_jog / allow_power / allow_move.
+        # Env override ESTUN_ALLOW_IO=1 wins over YAML.
+        self.declare_parameter('allow_io', False)
+        # I/O poll cadence — batched GetIOValue every _io_poll_s, GetIOInfo
+        # every _io_info_poll_s (metadata + forced flags change rarely,
+        # values change on every input pulse). Keep both light — the
+        # captured factory UI polls at ~1 Hz.
+        self.declare_parameter('io_poll_s', 0.5)
+        self.declare_parameter('io_info_poll_s', 2.0)
         self.declare_parameter('jog_heartbeat_s', 0.4)         # Robot/jogHeartbeat cadence
         # Freshness deadman: no refresh within this window → Robot/stopJog.
         # 2026-07-17: bumped 0.3 → 0.5 to tolerate observed 672 ms
@@ -550,6 +572,15 @@ class EstunCodroidDriver(Node):
             self._allow_move = env_move.strip().lower() in ('1', 'true', 'yes', 'on')
             self._allow_move_source = 'ESTUN_ALLOW_MOVE'
 
+        self._allow_io = bool(self.get_parameter('allow_io').value)
+        self._allow_io_source = 'param'
+        env_io = os.environ.get('ESTUN_ALLOW_IO')
+        if env_io is not None:
+            self._allow_io = env_io.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._allow_io_source = 'ESTUN_ALLOW_IO'
+        self._io_poll_s      = float(self.get_parameter('io_poll_s').value)
+        self._io_info_poll_s = float(self.get_parameter('io_info_poll_s').value)
+
         # Env override — ALWAYS wins so systemd can retarget without rebuild.
         env_ip = os.environ.get('ESTUN_ROBOT_IP')
         env_port = os.environ.get('ESTUN_ROBOT_PORT')
@@ -807,6 +838,9 @@ class EstunCodroidDriver(Node):
         # and from publish/Error transitions (new fault, cleared) after
         # dedup by (code, unix_ts) — see program_ops.ErrorDedup.
         self._pub_program     = self.create_publisher(String, '/estun/program_status', 10)
+        # I/O bridge — live merged (info + values) snapshot. Dashboard
+        # subscribes here and re-exposes over /api/io/live.
+        self._pub_io          = self.create_publisher(String, '/estun/io', 10)
 
         # ── Subscribers ────────────────────────────────────────
         # /robot/jog_command has a real handler that emits Robot/jog when
@@ -816,6 +850,12 @@ class EstunCodroidDriver(Node):
         self.create_subscription(String, '/estun/command',      self._on_write_reject, 10)
         self.create_subscription(String, '/estun/move',         self._on_write_reject, 10)
         self.create_subscription(String, '/estun/jog',          self._on_write_reject, 10)
+        # I/O bridge — writes go through /robot/io_set (below); the old
+        # /estun/io broadcast slot has been repurposed as an OUTPUT
+        # publisher, so incoming subscriber duty here belongs to
+        # /robot/io_set (SetIOForcedFlag). Nothing legit should still
+        # publish TO /estun/io — leave a reject listener so a stray
+        # writer surfaces on /estun/rejected.
         self.create_subscription(String, '/estun/io',           self._on_write_reject, 10)
         # QoS: best-effort KEEP_LAST with a small buffer. Depth 5 is
         # enough to ride out ~500 ms of executor jitter (5× 100 ms
@@ -833,7 +873,12 @@ class EstunCodroidDriver(Node):
             durability=QoSDurabilityPolicy.VOLATILE,
         )
         self.create_subscription(String, '/robot/jog_command',  self._on_jog_command,  _jog_qos)
+        # Legacy /robot/io_command — the pre-bridge write topic; still
+        # rejected because it never carried the right shape. New writes
+        # go through /robot/io_set (allow_io-gated), which sends
+        # IOManager/SetIOForcedFlag.
         self.create_subscription(String, '/robot/io_command',   self._on_write_reject, 10)
+        self.create_subscription(String, '/robot/io_set',       self._on_io_set,       5)
         # Power transitions — one-shot commands (enable/disable/clear_alarm).
         # Reliable QoS, small depth: these are single infrequent user gestures,
         # not the ephemeral refresh stream that jog is.
@@ -858,6 +903,17 @@ class EstunCodroidDriver(Node):
         # constantly; the SM does the actual gating (backoff / grace /
         # cooldown).
         self._connect_timer = self.create_timer(0.5, self._conn_tick)
+        # I/O bridge poll — fires GetIOValue every _io_poll_s and
+        # GetIOInfo every _io_info_poll_s. Both are cheap on the
+        # controller (matches factory-UI cadence). Skipped when the
+        # SM isn't READY. See _io_poll.
+        self._io_last_info_ts = 0.0
+        # merged snapshot: {DI:{port -> {name, defaultName, forced, function, value}},
+        #                   DO:..., AI:..., AO:...}
+        self._io_snapshot = {'DI': {}, 'DO': {}, 'AI': {}, 'AO': {}}
+        self._io_last_publish_ts = 0.0
+        self._io_pending_writes = {}  # nonce -> {port, value, type} (for ack log)
+        self._io_timer = self.create_timer(self._io_poll_s, self._io_poll)
 
         self.get_logger().info(
             f'Estun v2.3 driver initialized — '
@@ -927,6 +983,22 @@ class EstunCodroidDriver(Node):
                 'monitor_only=false but allow_move=false — program write '
                 'path still gated; set ESTUN_ALLOW_MOVE=1 or allow_move:true '
                 'in YAML.')
+        if self._monitor_only:
+            pass
+        elif self._allow_io:
+            self.get_logger().warn(
+                f'I/O WRITE PATH ENABLED — /robot/io_set will emit '
+                f'IOManager/SetIOForcedFlag frames (source: '
+                f'{self._allow_io_source}). DO toggles drive outputs '
+                f'directly; DI forces are the expert path.')
+        else:
+            self.get_logger().warn(
+                'monitor_only=false but allow_io=false — I/O write path '
+                'still gated; set ESTUN_ALLOW_IO=1 or allow_io:true in YAML.')
+        self.get_logger().info(
+            f'I/O bridge: polling GetIOValue every {self._io_poll_s:.1f}s, '
+            f'GetIOInfo every {self._io_info_poll_s:.1f}s; publishing merged '
+            f'snapshot on /estun/io (allow_io={self._allow_io}).')
         self._publish_mode()
 
     # ── WS raw log ────────────────────────────────────────
@@ -2592,6 +2664,9 @@ class EstunCodroidDriver(Node):
             'jog_speed_cap_pct':        int(round(self._jog_speed_cap * 100)),
             'effective_speed_cap_pct':  int(round(self._effective_speed_cap * 100)),
             'high_speed_confirm_threshold_pct': int(self._high_speed_confirm_threshold_pct),
+            'allow_io':                          self._allow_io,
+            'allow_io_source':                   self._allow_io_source,
+            'io_poll_s':                         self._io_poll_s,
             'jog_heartbeat_s': self._jog_hb_s,
             'jog_freshness_s': self._jog_freshness_s,
             'jog_active':     self._jog_active,
@@ -2734,6 +2809,192 @@ class EstunCodroidDriver(Node):
             f'Controller READY — full subscribe burst sent '
             f'({len(FULL_TOPICS)} topics). Telemetry mirror active.')
 
+    # ── I/O bridge ──────────────────────────────────────────────
+    #
+    # Wire-proven verbs (see estun_captures/):
+    #   IOManager/GetIOInfo   — {} → {DI:[...], DO:[...], AI:[...], AO:[...]}
+    #                           each entry {port, defaultName, name, forced,
+    #                           function}. Cheap, run at low rate.
+    #   IOManager/GetIOValue  — batched read: db is an array of
+    #                           {type,port} — response same shape with
+    #                           `value` filled in.
+    #   IOManager/SetIOForcedFlag — {port, value, type:"DI"|"DO"};
+    #                           value=1 asserts a force (DO drives HIGH /
+    #                           DI reads HIGH regardless of pin), value=0
+    #                           RELEASES the force. Proven via the
+    #                           GetIOInfo.forced round-trip on the DI2
+    #                           capture (see PORT-MAP v2 commit).
+    _IO_TYPES = ('DI', 'DO', 'AI', 'AO')
+
+    def _io_poll(self):
+        """Periodic I/O poll. Runs at ~2 Hz (configurable). No wire
+        traffic until the SM is READY — the connect-race fix (Part
+        2788ec3) is the whole reason we're careful about this."""
+        if not self._connected:
+            return
+        if self._conn_sm.state != self._conn_sm.READY:
+            return
+        now = time.time()
+        # GetIOInfo — cheap, but low rate is enough (names/forced flags
+        # only change when the operator edits them).
+        if now - self._io_last_info_ts >= self._io_info_poll_s:
+            self._io_last_info_ts = now
+            try:
+                self._send({'ty': 'IOManager/GetIOInfo', 'db': '',
+                            'id': self._new_nonce()})
+            except Exception:
+                pass
+        # GetIOValue — batched request across every known port. We
+        # ask for a stable 32-DI / 32-DO / 8-AI / 8-AO fanout even
+        # before the first Info response so the ChannelRow live pill
+        # can render immediately. GetIOInfo response later trims the
+        # snapshot to real ports.
+        try:
+            batch = []
+            for typ, count in (('DI', 32), ('DO', 32), ('AI', 8), ('AO', 8)):
+                for p in range(count):
+                    batch.append({'type': typ, 'port': p})
+            self._send({'ty': 'IOManager/GetIOValue', 'db': batch,
+                        'id': self._new_nonce()})
+        except Exception:
+            pass
+
+    def _on_io_info(self, db):
+        """publish/IOManager/GetIOInfo response — merge names + forced
+        flags into the snapshot and publish."""
+        if not isinstance(db, dict):
+            return
+        for typ in self._IO_TYPES:
+            entries = db.get(typ) or []
+            if not isinstance(entries, list):
+                continue
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                port = e.get('port')
+                if port is None:
+                    continue
+                slot = self._io_snapshot[typ].setdefault(int(port), {})
+                slot['defaultName'] = e.get('defaultName')
+                slot['name']        = e.get('name')
+                slot['forced']      = int(e.get('forced') or 0)
+                slot['function']    = e.get('function')
+        self._publish_io_snapshot()
+
+    def _on_io_value(self, db):
+        """IOManager/GetIOValue response — merge port values into
+        the snapshot. Skips ports the controller returns errors for
+        (rare, e.g. port index beyond the physical fanout)."""
+        if not isinstance(db, list):
+            return
+        for e in db:
+            if not isinstance(e, dict):
+                continue
+            typ  = e.get('type')
+            port = e.get('port')
+            if typ not in self._IO_TYPES or port is None:
+                continue
+            val = e.get('value')
+            slot = self._io_snapshot[typ].setdefault(int(port), {})
+            slot['value'] = val
+        self._publish_io_snapshot()
+
+    def _publish_io_snapshot(self):
+        """Publish the merged snapshot on /estun/io. Rate-limited to
+        one publish per (io_poll_s / 2) so a burst of frame
+        responses doesn't spam the dashboard. Shape:
+            {"DI":[{port,name,defaultName,value,forced,function}, ...],
+             "DO":[...], "AI":[...], "AO":[...],
+             "ts": <unix>, "allow_io": bool}
+        """
+        now = time.time()
+        if (now - self._io_last_publish_ts) < (self._io_poll_s * 0.5):
+            return
+        self._io_last_publish_ts = now
+        out = {'ts': now, 'allow_io': self._allow_io}
+        for typ in self._IO_TYPES:
+            ports = self._io_snapshot.get(typ) or {}
+            rows = []
+            for port in sorted(ports.keys()):
+                s = ports[port]
+                rows.append({
+                    'port':        port,
+                    'name':        s.get('name'),
+                    'defaultName': s.get('defaultName'),
+                    'value':       s.get('value'),
+                    'forced':      s.get('forced', 0),
+                    'function':    s.get('function'),
+                })
+            out[typ] = rows
+        m = String(); m.data = json.dumps(out, separators=(',', ':'))
+        self._pub_io.publish(m)
+
+    def _on_io_set(self, msg):
+        """Handle a /robot/io_set write. Body:
+            {"port": <int>, "value": 0|1, "type": "DO"|"DI"}
+        Emits IOManager/SetIOForcedFlag on the wire. Gate:
+          monitor_only=false AND allow_io=true AND SM state == READY.
+        Value=1 asserts the force; value=0 releases. Only DO and DI
+        are exposed — AI/AO force is not a captured use case."""
+        family = 'io'
+        if self._monitor_only:
+            self._reject(family, 'monitor_only active',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._allow_io:
+            self._reject(family, 'allow_io gate closed',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._connected:
+            self._reject(family, 'ws not connected')
+            return
+        if self._conn_sm.state != self._conn_sm.READY:
+            self._reject(family,
+                f'controller {self._conn_sm.state} — writes gated until READY')
+            return
+        try:
+            d = json.loads(msg.data)
+        except Exception as e:
+            self._reject(family, f'invalid JSON: {e}')
+            return
+        typ  = str(d.get('type') or '').upper()
+        port = d.get('port')
+        val  = d.get('value')
+        if typ not in ('DI', 'DO'):
+            self._reject(family, f'unsupported type {typ!r} (want DI or DO)')
+            return
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            self._reject(family, f'invalid port {port!r}')
+            return
+        val_int = 1 if val else 0
+        frame = {
+            'ty': 'IOManager/SetIOForcedFlag',
+            'db': {'port': port, 'value': val_int, 'type': typ},
+            'id': self._new_nonce(),
+        }
+        try:
+            ok = self._send(frame)
+        except Exception as e:
+            self._reject(family, f'send raised: {e}')
+            return
+        if not ok:
+            self._reject(family, 'send returned False')
+            return
+        # Optimistically stash so the outgoing snapshot updates fast;
+        # GetIOValue response is the authoritative ACK a beat later.
+        slot = self._io_snapshot[typ].setdefault(port, {})
+        slot['forced'] = val_int
+        if typ == 'DO' and val_int == 1:
+            slot['value'] = 1
+        elif typ == 'DO' and val_int == 0:
+            # Release — real value will come from GetIOValue.
+            pass
+        self.get_logger().info(
+            f'IOManager/SetIOForcedFlag sent: type={typ} port={port} value={val_int}')
+        self._publish_io_snapshot()
+
     def _disconnect(self):
         # Best-effort stopJog on the still-open socket before we drop it —
         # if we're mid-motion and the WS dies, the controller's own
@@ -2835,6 +3096,19 @@ class EstunCodroidDriver(Node):
         if (obj.get('id') is not None
                 and self._conn_sm.state == self._conn_sm.INITIALIZING):
             self._conn_sm.note_probe_response()
+        # IOManager responses land here as {"ty": "IOManager/GetIOInfo",
+        # "db": {...}, "id": <echo>}. They're id-tagged replies, NOT
+        # publish/ frames, so dispatch before the publish-prefix gate.
+        if ty == 'IOManager/GetIOInfo':
+            self._on_io_info(db)
+            return
+        if ty == 'IOManager/GetIOValue':
+            self._on_io_value(db)
+            return
+        if ty == 'IOManager/SetIOForcedFlag':
+            # Ack of our write; next GetIOValue tick delivers the
+            # authoritative post-force value.
+            return
         if not ty.startswith('publish/'):
             return
         topic = ty[len('publish/'):]
@@ -3301,6 +3575,9 @@ class EstunCodroidDriver(Node):
             'jog_speed_cap_pct':         int(round(self._jog_speed_cap * 100)),
             'effective_speed_cap_pct':   int(round(self._effective_speed_cap * 100)),
             'high_speed_confirm_threshold_pct': int(self._high_speed_confirm_threshold_pct),
+            'allow_io':                          self._allow_io,
+            'allow_io_source':                   self._allow_io_source,
+            'io_poll_s':                         self._io_poll_s,
             'rejections':    dict(self._rej_counts),
             'ip':            self._robot_ip,
             'ip_source':     self._ip_source,

@@ -1,4 +1,21 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, createContext, useContext } from 'react'
+
+// Live-state + write context — 2026-07-22 I/O bridge (Task 30/31).
+// The dashboard polls /api/io/live at 1 Hz and threads the merged
+// snapshot + write callback through this context so every ChannelRow
+// (not just the top-level component) can render authentic HIGH/LOW
+// values and toggle DO/DI-force through the same shared plumbing.
+const IOLiveContext = createContext({
+  live:        null,       // last /api/io/live payload or null
+  allowIo:     false,      // driver gate — false → toggles disabled
+  bridgeUp:    false,      // /api/io/live returned ok:true recently
+  expertMode:  false,      // Expert: force inputs toggle
+  writePort:   () => Promise.resolve({ ok: false }),
+  bumpConfirm: () => false, // returns true if first-toggle confirm still needed
+})
+
+function useIOLive() { return useContext(IOLiveContext) }
+
 
 // Colour palette pinned to IOPanel.jsx so the two sections read as one
 // page. Do not diverge — the port map lives beside the older list on
@@ -117,42 +134,381 @@ function InlineEditable({ value, onSave, placeholder = 'Unassigned' }) {
 }
 
 // ---------------------------------------------------------------------------
-// Live-state pill.
-//
-// INERT until /estun/io read verbs land. Dashed muted dot + "—" so the
-// layout is stable — the pill becomes a real HIGH/LOW / ON/OFF / value
-// indicator once the live binding arrives, without any layout shift.
+// Live-state pill. Reads from IOLiveContext — the dashboard polls
+// /api/io/live at 1 Hz and threads the merged {DI,DO,AI,AO} snapshot
+// through this context. Rows render HIGH/LOW (digital) or the raw
+// float value (analog); if the bridge isn't up yet, falls back to a
+// dashed placeholder so the layout is stable.
 // ---------------------------------------------------------------------------
-function LiveStatePill({ kind }) {
-  const dot = C.textDim
+function LiveStatePill({ kind, port }) {
+  const { live, bridgeUp } = useIOLive()
   const isAnalog = kind === 'AI' || kind === 'AO'
+  const lookupKind = kind === 'HDI' ? 'DI' : kind  // HDI reads as DI
+  const rows = live && live[lookupKind]
+  const row  = rows ? rows.find((r) => r.port === port) : null
+  if (!bridgeUp || !row || row.value == null) {
+    // Bridge not up or port not in the driver's snapshot yet.
+    return (
+      <span
+        title="Live state not available — driver I/O bridge polling has not seen this port yet."
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: 4,
+          fontSize: 9, fontFamily: 'monospace',
+          color: C.textDim, letterSpacing: '0.03em',
+          flexShrink: 0,
+        }}>
+        <span style={{
+          width: 7, height: 7, borderRadius: '50%',
+          background: C.textDim, opacity: 0.5,
+          border: `1px dashed ${C.textDim}`,
+        }} />
+        {isAnalog ? '—.-' : '—'}
+      </span>
+    )
+  }
+  if (isAnalog) {
+    const num = Number(row.value)
+    const text = Number.isFinite(num) ? num.toFixed(3) : '—'
+    return (
+      <span
+        title={`Live value ${text} from IOManager/GetIOValue`}
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: 4,
+          fontSize: 9, fontFamily: 'monospace',
+          color: KIND_META[kind]?.color || C.textMuted,
+          letterSpacing: '0.03em', flexShrink: 0,
+        }}>
+        <span style={{
+          width: 7, height: 7, borderRadius: '50%',
+          background: KIND_META[kind]?.color || C.textMuted,
+        }} />
+        {text}
+      </span>
+    )
+  }
+  const isHigh = !!Number(row.value)
+  const isForced = !!Number(row.forced)
+  const dot = isHigh ? '#16A34A' : C.textDim
   return (
     <span
-      title={'Live state pending driver bridge — verbs captured '
-              + '(IOManager/GetIOValue etc.) but not yet wired to the '
-              + 'dashboard; awaits live-first force→read validation.'}
+      title={isForced
+        ? `FORCED ${isHigh ? 'HIGH' : 'LOW'} — the controller reports this port is under a force override`
+        : `Live: ${isHigh ? 'HIGH' : 'LOW'}`}
       style={{
         display: 'inline-flex', alignItems: 'center', gap: 4,
         fontSize: 9, fontFamily: 'monospace',
-        color: C.textDim, letterSpacing: '0.03em',
-        flexShrink: 0,
+        color: isForced ? '#B45309' : (isHigh ? '#166534' : C.textDim),
+        letterSpacing: '0.03em', flexShrink: 0, fontWeight: 700,
       }}>
       <span style={{
         width: 7, height: 7, borderRadius: '50%',
-        background: dot, opacity: 0.5,
-        border: `1px dashed ${dot}`,
+        background: dot,
+        outline: isForced ? '2px solid #F59E0B' : 'none',
+        outlineOffset: 1,
       }} />
-      {isAnalog ? '— .-' : '—'}
+      {isForced ? (isHigh ? 'HI◊' : 'LO◊') : (isHigh ? 'HI' : 'LO')}
     </span>
   )
 }
 
 // ---------------------------------------------------------------------------
-// Single channel row inside a block.
+// Toggle switch. Reads live value + forced flag from context; writes
+// via context.writePort(). Shows spinner while a write is pending
+// (ack = the next /api/io/live snapshot that matches the requested
+// value/forced). Optimistic UI is DELIBERATELY avoided — the toggle
+// position reflects the driver's ACK, not the operator's intent.
 // ---------------------------------------------------------------------------
+function IOToggle({ kind, port, disabled, disabledReason }) {
+  const { live, writePort, bumpConfirm } = useIOLive()
+  const rows = live && live[kind]
+  const row  = rows ? rows.find((r) => r.port === port) : null
+  const [pending, setPending] = useState(null)   // { targetValue, sentTs }
+  // Actual position: for DO we show HIGH iff (value=1 OR forced=1);
+  // for DI-force we show HIGH iff forced=1 (that's what the toggle
+  // controls). Both fall back to LOW when the row hasn't arrived.
+  const isHighNow =
+    kind === 'DO' ? (!!Number(row?.value) || !!Number(row?.forced))
+                  : !!Number(row?.forced)
+  const shownPosition = pending ? !!pending.targetValue : isHighNow
+
+  // Clear pending once the snapshot matches (or after 3s regardless).
+  useEffect(() => {
+    if (!pending) return undefined
+    if (isHighNow === !!pending.targetValue) {
+      setPending(null); return undefined
+    }
+    const id = setTimeout(() => setPending(null), 3000)
+    return () => clearTimeout(id)
+  }, [pending, isHighNow])
+
+  const onFlip = async (e) => {
+    e.stopPropagation()
+    if (disabled || pending) return
+    if (kind === 'DO' && bumpConfirm()) {
+      const ok = window.confirm(
+        'Manual I/O control energizes connected hardware. Continue?')
+      if (!ok) return
+    }
+    const target = shownPosition ? 0 : 1
+    setPending({ targetValue: target, sentTs: Date.now() })
+    try {
+      await writePort({ port, value: target, type: kind })
+    } catch { /* /api/io/force always returns JSON — swallow */ }
+  }
+
+  const isForced = !!Number(row?.forced)
+  const trackBg = shownPosition
+    ? (kind === 'DI' ? '#F59E0B' : '#16A34A')
+    : C.textDim
+  const opacity = disabled ? 0.4 : 1
+  return (
+    <button
+      onClick={onFlip}
+      disabled={disabled || pending != null}
+      title={disabled
+        ? (disabledReason || 'Toggle disabled — see gate status above')
+        : `Click to ${shownPosition ? 'release' : 'assert'} ${kind}${port}. `
+          + (kind === 'DI'
+             ? 'DI force LIES to running programs — leave off unless testing.'
+             : 'Manual DO drives the physical output.')}
+      style={{
+        position: 'relative',
+        width: 40, height: 22, padding: 0, opacity,
+        background: trackBg,
+        border: 'none', borderRadius: 999,
+        cursor: (disabled || pending) ? 'not-allowed' : 'pointer',
+        transition: 'background 150ms',
+        flexShrink: 0,
+        outline: isForced ? '2px solid #F59E0B' : 'none',
+        outlineOffset: 1,
+      }}>
+      <span style={{
+        position: 'absolute',
+        top: 2, left: shownPosition ? 20 : 2,
+        width: 18, height: 18, borderRadius: '50%',
+        background: '#fff',
+        boxShadow: '0 1px 2px rgba(0,0,0,0.2)',
+        transition: 'left 150ms',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}>
+        {pending && (
+          <span style={{
+            width: 8, height: 8, borderRadius: '50%',
+            border: '2px solid #6b7280', borderTopColor: 'transparent',
+            animation: 'io-spin 800ms linear infinite',
+            display: 'block',
+          }} />
+        )}
+      </span>
+    </button>
+  )
+}
+
 // ---------------------------------------------------------------------------
-// Non-signal terminal row — power / return / bus / control / safety.
-// Compact, non-editable, shows the exact silkscreen name + a role chip.
+// PowerStripRow — collapses consecutive non-signal terminals of the
+// SAME role (24V rail, 0V rail, FUSE, SHD, AUX) into a single thin
+// row with an expandable list. Cuts 4+ repeated 24V/0V chips down to
+// one strip per bank. Detail rows appear inline when expanded.
+// ---------------------------------------------------------------------------
+function PowerStripRow({ role, terminals }) {
+  const [open, setOpen] = useState(false)
+  const meta = ROLE_META[role] || ROLE_META.aux
+  const label = role === 'power'   ? 'Power rail (24V)'
+              : role === 'return'  ? 'Return rail (0V/COM)'
+              : role === 'shield'  ? 'Shield'
+              : role === 'aux'     ? 'Aux / FUSE'
+              : ROLE_META[role]?.label || role
+  return (
+    <div style={{
+      background: C.rowBgDim,
+      border: `1px dashed ${C.border}`,
+      borderRadius: 4, overflow: 'hidden',
+    }}>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        title={`${terminals.length} pins — ${terminals.map((t) => t.name).join(', ')}`}
+        style={{
+          width: '100%', background: 'transparent', border: 'none',
+          padding: '3px 8px', cursor: 'pointer',
+          display: 'flex', alignItems: 'center', gap: 6,
+          textAlign: 'left',
+        }}>
+        <span style={{
+          transform: open ? 'rotate(90deg)' : 'rotate(0deg)',
+          transition: 'transform 150ms',
+          fontSize: 8, color: C.textDim,
+        }}>▶</span>
+        <span style={{
+          fontSize: 10, color: C.textMuted, fontWeight: 600,
+          flex: 1, overflow: 'hidden', textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}>{label}</span>
+        <span style={{
+          fontSize: 9, color: C.textMuted, fontFamily: 'monospace',
+        }}>×{terminals.length}</span>
+        <span style={{
+          fontSize: 8, fontWeight: 700,
+          color: meta.color, background: meta.bg,
+          padding: '1px 5px', borderRadius: 3,
+          letterSpacing: '0.05em',
+        }}>{meta.label}</span>
+      </button>
+      {open && (
+        <div style={{
+          padding: '4px 8px 6px 22px',
+          display: 'flex', flexWrap: 'wrap', gap: 4,
+          borderTop: `1px dashed ${C.border}`,
+        }}>
+          {terminals.map((t) => (
+            <span key={t.name} style={{
+              fontSize: 10, fontFamily: 'monospace',
+              color: C.textMuted, padding: '0 4px',
+              background: '#fff', borderRadius: 3,
+              border: `1px solid ${C.border}`,
+            }}>{t.name}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// BusPinsRow — collapses M-FUNC bus + control pins behind a single
+// expandable summary. HDI pins stay visible as ChannelRows because
+// they're operator-assignable I/O.
+// ---------------------------------------------------------------------------
+function BusPinsRow({ terminals }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div style={{
+      background: C.rowBgDim,
+      border: `1px dashed ${C.border}`,
+      borderRadius: 4, overflow: 'hidden',
+    }}>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        title={terminals.map((t) => `${t.name} (${t.role})`).join(', ')}
+        style={{
+          width: '100%', background: 'transparent', border: 'none',
+          padding: '3px 8px', cursor: 'pointer',
+          display: 'flex', alignItems: 'center', gap: 6,
+          textAlign: 'left',
+        }}>
+        <span style={{
+          transform: open ? 'rotate(90deg)' : 'rotate(0deg)',
+          transition: 'transform 150ms',
+          fontSize: 8, color: C.textDim,
+        }}>▶</span>
+        <span style={{
+          fontSize: 10, color: C.textMuted, fontWeight: 600, flex: 1,
+        }}>bus &amp; control pins</span>
+        <span style={{
+          fontSize: 9, color: C.textMuted, fontFamily: 'monospace',
+        }}>×{terminals.length}</span>
+      </button>
+      {open && (
+        <div style={{
+          padding: '4px 8px 6px 22px',
+          display: 'flex', flexWrap: 'wrap', gap: 4,
+          borderTop: `1px dashed ${C.border}`,
+        }}>
+          {terminals.map((t) => {
+            const meta = ROLE_META[t.role] || ROLE_META.aux
+            return (
+              <span key={t.name} title={t.role} style={{
+                fontSize: 10, fontFamily: 'monospace',
+                color: C.textMuted, padding: '1px 4px',
+                background: '#fff', borderRadius: 3,
+                border: `1px solid ${C.border}`,
+                display: 'inline-flex', alignItems: 'center', gap: 3,
+              }}>
+                {t.name}
+                <span style={{
+                  fontSize: 8, fontWeight: 700, color: meta.color,
+                }}>{meta.label}</span>
+              </span>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// SafetyRail — the entire safety block collapses into one card by
+// default. Operators never actuate these terminals from here (they
+// live in the safety-PLC domain); the previous layout gave them 22
+// rows of prime plate real estate for no operator benefit. Expand
+// on demand for the full list.
+// ---------------------------------------------------------------------------
+function SafetyRail({ block }) {
+  const [open, setOpen] = useState(false)
+  const terminals = Array.isArray(block?.terminals) ? block.terminals : []
+  if (terminals.length === 0) return null
+  return (
+    <div style={{
+      background: '#FFE4E6',
+      border: '1px solid #FBBF24',
+      borderRadius: 6, overflow: 'hidden',
+      gridColumn: '1 / -1',   // full-width row in the plate grid
+    }}>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          width: '100%', background: 'transparent', border: 'none',
+          padding: '8px 12px', cursor: 'pointer',
+          display: 'flex', alignItems: 'center', gap: 10,
+          textAlign: 'left',
+        }}>
+        <span style={{
+          transform: open ? 'rotate(90deg)' : 'rotate(0deg)',
+          transition: 'transform 150ms',
+          fontSize: 10, color: '#9F1239',
+        }}>▶</span>
+        <span style={{
+          fontSize: 9, fontWeight: 700,
+          color: '#fff', background: '#B45309',
+          padding: '1px 6px', borderRadius: 3,
+          letterSpacing: '0.05em',
+          textTransform: 'uppercase',
+        }}>SAFETY</span>
+        <span style={{
+          flex: 1, fontSize: 12, fontWeight: 600, color: '#9F1239',
+        }}>
+          Safety I/O — {terminals.length} terminals
+        </span>
+        <span style={{ fontSize: 10, color: '#9F1239', fontStyle: 'italic' }}>
+          safety-PLC domain · not actuated from this UI
+        </span>
+      </button>
+      {open && (
+        <div style={{
+          padding: '4px 12px 10px 32px',
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fill, minmax(90px, 1fr))',
+          gap: 4,
+          borderTop: '1px solid #FBBF24',
+        }}>
+          {terminals.map((t) => (
+            <span key={t.name} style={{
+              fontSize: 10, fontFamily: 'monospace',
+              color: '#9F1239', padding: '1px 6px',
+              background: '#fff', borderRadius: 3,
+              border: '1px solid #FBBF24',
+            }}>{t.name}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Non-signal terminal row (fallback for stray roles not otherwise
+// bucketed into PowerStripRow / BusPinsRow — e.g. one-off safety
+// pins on a non-safety block).
 // ---------------------------------------------------------------------------
 function TerminalRow({ name, role }) {
   const meta = ROLE_META[role] || ROLE_META.aux
@@ -230,7 +586,13 @@ function PlateBlock({ block, ports, specs, onEdit }) {
         </span>
         {wiring && (
           <span
-            title={`${wiring.mode} wiring — return rail ${wiring.return_rail}`}
+            title={(block.notes
+                    ? `${block.notes}\n\n`
+                    : '')
+                   + `${wiring.mode.toUpperCase()} wiring — sensor return rail ${wiring.return_rail}.\n\n`
+                   + (wiring.mode === 'sink'
+                      ? 'Sink: sensor pulls the input LOW to the return rail. Wire signal → input, common → 0V.'
+                      : 'Source: sensor drives the input HIGH from 24V. Wire signal → input, common → 24V.')}
             style={{
               fontSize: 8, fontWeight: 700,
               padding: '1px 5px', borderRadius: 3,
@@ -238,8 +600,9 @@ function PlateBlock({ block, ports, specs, onEdit }) {
               color:      wiring.mode === 'sink' ? '#1E40AF' : '#166534',
               letterSpacing: '0.05em', flexShrink: 0,
               textTransform: 'uppercase',
+              cursor: 'help',
             }}>
-            {wiring.mode} · {wiring.return_rail}
+            {wiring.mode} · {wiring.return_rail} <span style={{ opacity: 0.6, marginLeft: 2 }}>i</span>
           </span>
         )}
         <span style={{
@@ -262,31 +625,51 @@ function PlateBlock({ block, ports, specs, onEdit }) {
         )}
       </div>
 
-      {block.notes && (
-        <div style={{
-          padding: '3px 8px',
-          fontSize: 9, color: C.textMuted,
-          background: C.rowBgDim,
-          borderBottom: `1px solid ${C.border}`,
-          lineHeight: 1.3,
-        }}>
-          {block.notes}
-        </div>
-      )}
+      {/* block.notes was previously rendered here as a subhead
+          paragraph — decluttered into the wiring badge's tooltip
+          above so operators aren't paying attention to it every
+          time they scan the port map. */}
 
       <div style={{
         display: 'flex', flexDirection: 'column', gap: 2,
         padding: 5,
       }}>
-        {terminals.length === 0 ? (
-          <div style={{ fontSize: 11, color: C.textDim, padding: '6px 4px' }}>
-            No terminals configured.
-          </div>
-        ) : terminals.map((t, i) => {
-          if (t.role === 'signal') {
+        {(() => {
+          if (terminals.length === 0) {
             return (
+              <div style={{ fontSize: 11, color: C.textDim, padding: '6px 4px' }}>
+                No terminals configured.
+              </div>
+            )
+          }
+          // Bucket consecutive non-signal terminals into strips:
+          // power/return each collapse to their own strip; bus/control
+          // pins collapse together into one "bus & control" strip.
+          // signal terminals render as usual. shield/aux/safety fall
+          // into their nearest strip.
+          const rendered = []
+          const powerBuckets = { power: [], return: [], shield: [], aux: [] }
+          const busPins = []
+          for (const t of terminals) {
+            if (t.role === 'signal') continue
+            if (t.role === 'bus' || t.role === 'control') { busPins.push(t); continue }
+            if (t.role in powerBuckets) { powerBuckets[t.role].push(t); continue }
+          }
+          for (const role of ['power', 'return', 'shield', 'aux']) {
+            if (powerBuckets[role].length > 0) {
+              rendered.push(
+                <PowerStripRow key={`ps-${role}`} role={role}
+                               terminals={powerBuckets[role]} />)
+            }
+          }
+          if (busPins.length > 0) {
+            rendered.push(<BusPinsRow key="bp" terminals={busPins} />)
+          }
+          for (const t of terminals) {
+            if (t.role !== 'signal') continue
+            rendered.push(
               <ChannelRow
-                key={t.name || i}
+                key={t.name}
                 id={t.name}
                 kind={t.kind || kind}
                 meta={ports?.[t.name]}
@@ -297,11 +680,17 @@ function PlateBlock({ block, ports, specs, onEdit }) {
                 }}
                 editable={editable}
                 onEdit={onEdit}
-              />
-            )
+              />)
           }
-          return <TerminalRow key={t.name || i} name={t.name} role={t.role} />
-        })}
+          // Fallback: any oddball role we didn't bucket falls through as
+          // a plain TerminalRow so nothing disappears silently.
+          for (const t of terminals) {
+            if (t.role === 'signal' || t.role in powerBuckets
+                || t.role === 'bus' || t.role === 'control') continue
+            rendered.push(<TerminalRow key={t.name} name={t.name} role={t.role} />)
+          }
+          return rendered
+        })()}
       </div>
     </div>
   )
@@ -309,16 +698,35 @@ function PlateBlock({ block, ports, specs, onEdit }) {
 
 function ChannelRow({ id, kind, meta, row, onEdit, editable }) {
   const inUse = !!meta?.in_use
-  const label = meta?.assignment || 'Unassigned'
+  const rawLabel = meta?.assignment || ''
+  // Empty / placeholder assignments render as a subtle em-dash — the
+  // old fallback was the italic word "Unassigned", which truncated
+  // to "Unassi…" on narrow lanes and read as active clutter. The
+  // "—" reads as "nothing here" without adding text noise.
+  const label = (rawLabel && rawLabel !== 'Unassigned') ? rawLabel : '—'
   const notes = meta?.notes || ''
   const [showNotes, setShowNotes] = useState(false)
+  const [hover, setHover]         = useState(false)
   const bankColor = KIND_META[kind]?.color || C.textMuted
   const fnTag = row?.function
   const port  = row?.port
   const defaultName = row?.default_name
 
+  const { allowIo, bridgeUp, expertMode } = useIOLive()
+  const showToggle =
+       kind === 'DO'
+    || (kind === 'DI' && expertMode)
+  const toggleDisabled = !allowIo || !bridgeUp
+  const toggleDisabledReason = !bridgeUp
+    ? 'Driver I/O bridge has not reported /estun/io yet — reconnect the driver.'
+    : !allowIo
+    ? 'allow_io gate closed on the driver — set ESTUN_ALLOW_IO=1 or allow_io:true in estun.yaml to enable manual I/O.'
+    : ''
+
   return (
     <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
       style={{
         display: 'flex', flexDirection: 'column',
         gap: 2,
@@ -328,7 +736,7 @@ function ChannelRow({ id, kind, meta, row, onEdit, editable }) {
         border: inUse
           ? `1px solid ${bankColor}55`
           : `1px solid ${C.border}`,
-        opacity: inUse ? 1 : 0.78,
+        opacity: inUse ? 1 : 0.85,
         minWidth: 0,
       }}
     >
@@ -379,13 +787,24 @@ function ChannelRow({ id, kind, meta, row, onEdit, editable }) {
             </span>
           )}
         </div>
-        <LiveStatePill kind={kind} />
+        <LiveStatePill kind={kind} port={port} />
+        {showToggle && (
+          <IOToggle kind={kind} port={port}
+                    disabled={toggleDisabled}
+                    disabledReason={toggleDisabledReason} />
+        )}
       </div>
 
       {editable && (
         <div style={{
           display: 'flex', alignItems: 'center', gap: 6,
           fontSize: 10, color: C.textMuted, minWidth: 0,
+          // "+ notes" affordance is visible only on hover OR when the
+          // row already carries notes / the notes input is open —
+          // decluttered per Port Map v2.
+          opacity: (hover || notes || showNotes) ? 1 : 0,
+          transition: 'opacity 100ms',
+          pointerEvents: (hover || notes || showNotes) ? 'auto' : 'none',
         }}>
           <button
             onClick={(e) => { e.stopPropagation(); setShowNotes((v) => !v) }}
@@ -572,7 +991,9 @@ function Block({ block, ports, specs, onEdit }) {
 // ---------------------------------------------------------------------------
 // Legend / status bar.
 // ---------------------------------------------------------------------------
-function Legend({ assignedCount, totalCount, saving, onReset, source }) {
+function Legend({ assignedCount, totalCount, saving, onReset, source,
+                  allowIo, bridgeUp, expertMode, setExpertMode,
+                  onClearForces, forcedCount }) {
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 14,
@@ -595,19 +1016,68 @@ function Legend({ assignedCount, totalCount, saving, onReset, source }) {
         VERIFIED
       </span>
       <span
-        title={'IOManager/GetIOValue captured, IOManager/SetIOForcedFlag '
-                + 'captured for type:"DI" only. Driver bridge + allow_io '
-                + 'gate not yet wired — live values, force, and '
-                + 'program-side SET_IO remain pending a live-first check.'}
+        title={allowIo
+          ? 'allow_io gate OPEN — DO toggles + DI force writes reach the '
+            + 'controller via IOManager/SetIOForcedFlag.'
+          : 'allow_io gate CLOSED on the driver. Set ESTUN_ALLOW_IO=1 '
+            + 'in /etc/default/roboai-estun (or allow_io:true in '
+            + 'estun.yaml) to enable manual I/O.'}
         style={{
           display: 'inline-flex', alignItems: 'center', gap: 6,
           padding: '2px 8px', borderRadius: 4,
-          background: '#FEF3C7', color: '#92400E',
+          background: allowIo ? '#DCFCE7' : '#FEF3C7',
+          color:      allowIo ? '#166534' : '#92400E',
           fontWeight: 600, fontSize: 10,
-          border: '1px solid #FDE68A',
+          border: `1px solid ${allowIo ? '#BBF7D0' : '#FDE68A'}`,
         }}>
-        allow_io: PENDING
+        allow_io: {allowIo ? 'OPEN' : 'CLOSED'}
       </span>
+      <span
+        title={bridgeUp
+          ? 'Driver I/O bridge is publishing /estun/io — GetIOValue / '
+            + 'GetIOInfo polling live.'
+          : 'Driver has not published /estun/io yet. Live-state pills + '
+            + 'toggles are inert until the bridge is up.'}
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: 6,
+          padding: '2px 8px', borderRadius: 4,
+          background: bridgeUp ? '#DBEAFE' : '#F3F4F6',
+          color:      bridgeUp ? '#1E40AF' : '#374151',
+          fontWeight: 600, fontSize: 10,
+          border: `1px solid ${bridgeUp ? '#93C5FD' : C.border}`,
+        }}>
+        bridge: {bridgeUp ? 'LIVE' : '—'}
+      </span>
+      <label
+        title="Reveals DI force toggles. Forced inputs LIE to running programs — leave off unless bench-testing."
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: 6,
+          padding: '2px 8px', borderRadius: 4,
+          background: expertMode ? '#FEF3C7' : '#fff',
+          color:      expertMode ? '#92400E' : C.textMuted,
+          fontWeight: 600, fontSize: 10,
+          border: `1px solid ${expertMode ? '#F59E0B' : C.border}`,
+          cursor: 'pointer',
+        }}>
+        <input
+          type="checkbox"
+          checked={expertMode}
+          onChange={(e) => setExpertMode(e.target.checked)}
+          style={{ margin: 0 }} />
+        Expert: force inputs
+      </label>
+      {expertMode && forcedCount > 0 && (
+        <button
+          onClick={onClearForces}
+          title={`Release ${forcedCount} currently-forced port(s).`}
+          style={{
+            padding: '3px 10px', fontSize: 10, fontWeight: 700,
+            background: '#B45309', color: '#fff',
+            border: 'none', borderRadius: 4, cursor: 'pointer',
+          }}>
+          Clear all {forcedCount} force{forcedCount === 1 ? '' : 's'}
+        </button>
+      )}
       <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
         <span style={{
           width: 8, height: 8, borderRadius: '50%',
@@ -625,14 +1095,15 @@ function Legend({ assignedCount, totalCount, saving, onReset, source }) {
       </span>
       <span style={{
         display: 'inline-flex', alignItems: 'center', gap: 4,
-        color: C.textDim,
+        color: bridgeUp ? '#166534' : C.textDim,
       }}>
         <span style={{
           width: 7, height: 7, borderRadius: '50%',
-          background: C.textDim, opacity: 0.5,
-          border: `1px dashed ${C.textDim}`,
+          background: bridgeUp ? '#16A34A' : C.textDim,
+          opacity: bridgeUp ? 1 : 0.5,
+          border: bridgeUp ? 'none' : `1px dashed ${C.textDim}`,
         }} />
-        Live state — driver bridge pending
+        {bridgeUp ? 'live · IOManager poll active' : 'live state pending'}
       </span>
       <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10 }}>
         <span style={{ fontFamily: 'monospace' }}>
@@ -664,6 +1135,78 @@ export default function IOPortMap() {
   const [saving, setSaving] = useState(false)
   const saveTimer  = useRef(null)
   const pendingRef = useRef({})   // accumulate per-port patches between debounces
+
+  // Live I/O bridge state. Polled at 1 Hz from /api/io/live. bridgeUp
+  // becomes true after the first ok:true response and stays true unless
+  // the endpoint drops back to ok:false (driver disconnected).
+  const [live, setLive]         = useState(null)
+  const [allowIo, setAllowIo]   = useState(false)
+  const [bridgeUp, setBridgeUp] = useState(false)
+  const [expertMode, setExpertMode] = useState(false)
+  // One-time confirm latch — first DO toggle after page load prompts;
+  // subsequent toggles are direct. bumpConfirm() returns true IF the
+  // confirm still needs to run, then flips the latch.
+  const [doConfirmed, setDoConfirmed] = useState(false)
+  const bumpConfirm = useCallback(() => {
+    if (doConfirmed) return false
+    setDoConfirmed(true)
+    return true
+  }, [doConfirmed])
+
+  const writePort = useCallback(async ({ port, value, type }) => {
+    try {
+      const res = await fetch('/api/io/force', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ port, value, type }),
+      })
+      return await res.json()
+    } catch (e) {
+      return { ok: false, error: String(e) }
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    const pull = async () => {
+      try {
+        const r = await fetch('/api/io/live')
+        const d = await r.json()
+        if (cancelled) return
+        if (d && d.ok) {
+          setLive(d)
+          setAllowIo(!!d.allow_io)
+          setBridgeUp(true)
+        } else {
+          setBridgeUp(false)
+        }
+      } catch {
+        if (!cancelled) setBridgeUp(false)
+      }
+    }
+    pull()
+    const id = setInterval(pull, 1000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [])
+
+  // Force-count for the Clear-All action.
+  const forcedPorts = []
+  if (live) {
+    for (const kind of ['DI', 'DO']) {
+      for (const r of live[kind] || []) {
+        if (Number(r.forced) === 1) forcedPorts.push({ kind, port: r.port })
+      }
+    }
+  }
+  const onClearForces = useCallback(async () => {
+    if (forcedPorts.length === 0) return
+    if (!window.confirm(
+      `Release ${forcedPorts.length} forced port(s)? This unforces every DI + DO currently in a force state.`)) return
+    for (const p of forcedPorts) {
+      // eslint-disable-next-line no-await-in-loop
+      await writePort({ port: p.port, value: 0, type: p.kind })
+    }
+  }, [forcedPorts, writePort])
 
   const load = useCallback(async () => {
     try {
@@ -791,6 +1334,10 @@ export default function IOPortMap() {
   }
 
   return (
+    <IOLiveContext.Provider value={{
+      live, allowIo, bridgeUp, expertMode, writePort, bumpConfirm,
+    }}>
+    <style>{`@keyframes io-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
     <div style={{
       display: 'flex', flexDirection: 'column', gap: 10,
       padding: 14,
@@ -840,9 +1387,18 @@ export default function IOPortMap() {
         saving={saving}
         onReset={onReset}
         source={sources.physical || sources.software}
+        allowIo={allowIo}
+        bridgeUp={bridgeUp}
+        expertMode={expertMode}
+        setExpertMode={setExpertMode}
+        onClearForces={onClearForces}
+        forcedCount={forcedPorts.length}
       />
 
-      {/* Physical plate — connectors in silkscreen order, left→right */}
+      {/* Physical plate — connectors in silkscreen order, left→right.
+          Safety block is intercepted and rendered as a single collapsed
+          SafetyRail card at the bottom (nobody actuates safety-PLC
+          terminals from this UI — see PORT-MAP v2 declutter). */}
       <div style={{
         fontSize: 10, fontWeight: 700, color: C.textMuted,
         textTransform: 'uppercase', letterSpacing: '0.08em',
@@ -855,9 +1411,12 @@ export default function IOPortMap() {
         gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
         gap: 6, alignItems: 'start',
       }}>
-        {plate.map((blk) => (
+        {plate.filter((b) => b.group !== 'safety').map((blk) => (
           <PlateBlock key={blk.id} block={blk} ports={ports} specs={specs}
                       onEdit={onEdit} />
+        ))}
+        {plate.filter((b) => b.group === 'safety').map((blk) => (
+          <SafetyRail key={blk.id} block={blk} />
         ))}
       </div>
 
@@ -932,5 +1491,6 @@ export default function IOPortMap() {
         {sources.lua && <>lua · <code>{sources.lua}</code>.</>}
       </div>
     </div>
+    </IOLiveContext.Provider>
   )
 }
