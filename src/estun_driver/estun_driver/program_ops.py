@@ -23,11 +23,177 @@ lives in one place.
 from __future__ import annotations
 
 import json
+import math
 import re as _re
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Iterable
+
+try:
+    import numpy as _np
+except ImportError:  # numpy not installed → SeededIK.available() == False
+    _np = None
+
+
+# ────────────────────────────────────────────────────────────────
+# Seeded IK for wrist re-solve avoidance (Part C)
+# ────────────────────────────────────────────────────────────────
+#
+# The wizard-derived "lift" steps (place_lift, retreat, etc. with
+# `derived_from` + non-trivial `offset_z_mm`) previously round-tripped
+# through movL / movJCoorRel with a base-frame Z offset — both allowed
+# the controller's IK to pick a DIFFERENT J4/J5/J6 branch than the
+# taught anchor. On real hardware this shows up as the wrist spinning
+# ~50° between anchor and the "lift" step (operator observed
+# taught J5≈89° vs runtime J5≈138° on testwizard step 7 / step 14).
+#
+# The fix implemented here computes the lifted joint solution AT
+# CODEGEN TIME, seeded from the anchor's taught_joints, using the
+# same fitted DH the driver's SingularityGuard uses (pos RMS 0.025 mm
+# on the held-out test set). Wrist joints (J4, J5, J6) are held at
+# their taught values — only J1/J2/J3 solve for the vertical lift.
+# The emitted step is a plain `movJ(<name>)` referencing a fresh jp
+# varspoint entry with the computed joints, so:
+#   * no controller-side IK runs → no branch choice → no wrist flip;
+#   * J5 is EXACTLY the taught value (delta 0 by construction);
+#   * the emitted move can never be a zero-length movL (it's a movJ,
+#     and zero-Δq is a no-op the controller tolerates).
+#
+# When the geometric shift can't be achieved by J1/J2/J3 alone
+# (tool orientation far from vertical, or Δz outside the reachable
+# manifold at this anchor pose), the seeded IK returns None and the
+# caller falls back to movJCoorRel — with a loud comment.
+
+# Fitted DH copied verbatim from estun_driver_node.py's SingularityGuard.
+# Source: config/dh_fit_report.txt (stage-B fixed-xyz fit).
+# Row per joint: (a_mm, alpha_deg, d_mm, theta_off_deg).
+_FITTED_DH_STD = [
+    (-0.00002,     90.00058,   325.89611, -179.99989),  # J1
+    (-701.00394,    0.00028,  -579.68908,  -90.00022),  # J2
+    (-538.58526,  180.00313,  -214.01833,   -0.00615),  # J3
+    (-0.00374,    -89.99857, -1000.00000,  -90.00736),  # J4
+    ( 0.00533,     89.99433,  -161.46726,  179.99693),  # J5
+    (-0.00155,     -0.00674,   150.49959,    0.00152),  # J6
+]
+_FITTED_BASE_Z_MM = -139.89595
+
+
+def _dh_transform(theta, d_mm, a_mm, alpha):
+    """Standard DH: T = Rz(θ) · Tz(d) · Tx(a) · Rx(α). Returns 4×4."""
+    ct = math.cos(theta); st = math.sin(theta)
+    ca = math.cos(alpha); sa = math.sin(alpha)
+    return _np.array([
+        [ct, -st*ca,  st*sa, a_mm*ct],
+        [st,  ct*ca, -ct*sa, a_mm*st],
+        [0.0,    sa,     ca, d_mm  ],
+        [0.0,   0.0,    0.0, 1.0   ],
+    ])
+
+
+def _fk_chain(q_deg):
+    """Forward kinematics for the fitted DH. Returns a list T_0..T_6
+    (each a 4x4 numpy array). T_6[:3, 3] is the flange (mm) in the
+    driver's base_link frame (with the _FITTED_BASE_Z_MM shift)."""
+    T = _np.eye(4)
+    T[2, 3] = _FITTED_BASE_Z_MM
+    Ts = [T]
+    for i in range(6):
+        a_mm, alpha_deg, d_mm, theta_off_deg = _FITTED_DH_STD[i]
+        theta = math.radians(q_deg[i] + theta_off_deg)
+        Ti = _dh_transform(theta, d_mm, a_mm, math.radians(alpha_deg))
+        T = T @ Ti
+        Ts.append(T)
+    return Ts
+
+
+def _jacobian_z_arm_only(q_deg):
+    """Return the 1×3 gradient of end-effector Z (mm) w.r.t. joints
+    [q1, q2, q3] (deg → the same units the caller passes in). We only
+    need the vertical row of the linear Jacobian since our lift Δ is
+    pure base-frame Z. Held wrist joints don't contribute to Δee_z at
+    codegen time — we CONSTRAIN them to zero delta so J5 is exactly
+    the taught value."""
+    Ts = _fk_chain(q_deg)
+    p_ee = Ts[6][:3, 3]
+    # z-axis of joint i frame (world frame), origin of that frame
+    row = [0.0, 0.0, 0.0]
+    for i in range(3):
+        z = Ts[i][:3, 2]      # unit vector, no units
+        p = Ts[i][:3, 3]      # mm
+        dp = p_ee - p         # mm
+        # (z × dp)_z = z_x*dp_y - z_y*dp_x
+        row[i] = z[0] * dp[1] - z[1] * dp[0]
+    # Convert d_pos_mm / d_theta_rad → d_pos_mm / d_theta_deg
+    return _np.array(row) * (math.pi / 180.0)
+
+
+def _joints_equal(a, b, tol_deg: float = 0.01) -> bool:
+    """Two 6-element joint vectors are 'equal' if every joint agrees
+    within `tol_deg` — 0.01° covers both float noise and the
+    controller's smallest advertised joint resolution."""
+    if len(a) != 6 or len(b) != 6:
+        return False
+    for x, y in zip(a, b):
+        if abs(float(x) - float(y)) > tol_deg:
+            return False
+    return True
+
+
+def seeded_ik_z_lift(anchor_deg, delta_z_mm, *,
+                     max_iter: int = 12,
+                     tol_mm: float = 0.05,
+                     max_dq_deg_norm: float = 15.0):
+    """Compute lifted joints given an anchor pose and a base-frame Z
+    lift, using Newton-Raphson on q1/q2/q3 with q4/q5/q6 held EXACTLY
+    at the anchor values.
+
+    Returns (lifted_deg, achieved_dz_mm) on success, or None if:
+      * numpy is unavailable;
+      * the Jacobian's ee_z column is nearly zero (singular for pure
+        vertical lift at this pose — J4/J5/J6 would be needed);
+      * the iteration doesn't converge below tol_mm inside max_iter;
+      * the shoulder-arm joint delta ‖Δq‖ blows up beyond
+        max_dq_deg_norm (this catches lifts that would require unsafe
+        arm reconfiguration — the caller falls back to movJCoorRel).
+
+    Never returns joints outside ±360° (the controller rejects those).
+    """
+    if _np is None:
+        return None
+    q = _np.array([float(v) for v in anchor_deg], dtype=float)
+    if q.shape != (6,):
+        return None
+    Ts0 = _fk_chain(q)
+    z0 = float(Ts0[6][2, 3])
+    z_target = z0 + float(delta_z_mm)
+    for _ in range(max_iter):
+        Ts = _fk_chain(q)
+        z = float(Ts[6][2, 3])
+        err = z_target - z
+        if abs(err) < tol_mm:
+            achieved = z - z0
+            # Sanity: J4/J5/J6 must be EXACTLY the anchor values
+            if not (q[3] == anchor_deg[3] and q[4] == anchor_deg[4]
+                    and q[5] == anchor_deg[5]):
+                return None
+            return q.tolist(), achieved
+        J = _jacobian_z_arm_only(q.tolist())   # shape (3,), row of dz/dq
+        # Minimum-norm dq_arm solve for a scalar error: dq = J^T (J J^T)^{-1} err.
+        # With J of shape (3,) and viewed as a 1×3 row:
+        #   J J^T = ||J||^2  (scalar)
+        #   dq   = err × J / ||J||^2
+        denom = float(J @ J)
+        if denom < 1e-9:
+            return None
+        step = (err / denom) * J
+        # Damp large steps
+        step_norm = float(_np.linalg.norm(step))
+        if step_norm > max_dq_deg_norm:
+            step = step * (max_dq_deg_norm / step_norm)
+        q[0] += step[0]; q[1] += step[1]; q[2] += step[2]
+        # q4/q5/q6 stay at anchor (never touched)
+    return None
 
 
 # ────────────────────────────────────────────────────────────────
@@ -305,6 +471,15 @@ def codegen_lua_from_program(
     # points at the anchor's already-registered varspoint entry rather
     # than duplicating the joints under a fresh name.
     role_point_name: dict[str, str] = {}
+    # Zero-length-movL guard (Part C, 2026-07-22). The controller's
+    # blend planner crashed on real hardware when asked to execute a
+    # movL whose target equals the CURRENT pose (0 mm Cartesian
+    # motion) — log-proven firmware bug. We track the joints of the
+    # previously-emitted move; if a new movL would target the same
+    # 6-vector, we skip it with a loud comment. Applies only to
+    # movL (movJ back-to-back at the same joints is a controller-
+    # tolerated no-op).
+    last_move_joints: list[float] | None = None
     # Loop step (goto=<line>, count=<n>) → emit `goto ::_prog_start::`.
     # Prepend the label at file line 1 so `setStartLine 1` still lands
     # on real executable code. Track whether the label is needed so
@@ -502,23 +677,59 @@ def codegen_lua_from_program(
                     f'(FIX A: identity offset → reuse anchor jp; no IK)  '
                     f'{j5_note}'
                     + (f'  joints=[{joints_s}]' if joints_s else ''))
+                if len(tj) == 6:
+                    last_move_joints = [float(v) for v in tj]
                 continue
-            # FIX B v2: non-trivial offset. Emit movJCoorRel with a
-            # relative cp offset. Base-frame Z (+/-) preserves the
-            # wizard's semantics for offset_z_mm. anchor J5 recorded in
-            # the comment so operator can compare vs live post-run.
+            # FIX C (Part C, 2026-07-22): SEEDED IK at codegen time.
+            # Compute the lifted joints from the anchor's taught_joints
+            # holding J4/J5/J6 EXACTLY, solving q1/q2/q3 for the base-
+            # frame Z lift. Emit `movJ(<lifted_point>)` referencing a
+            # fresh jp varspoint entry so the controller runs OUR
+            # joints — no IK, no branch choice, no wrist flip. Verify
+            # J5 delta == 0 (holds by construction) and record the
+            # taught-vs-emitted J5 for the operator table. Fall back to
+            # movJCoorRel only when the IK can't converge (rare —
+            # non-vertical tool at the anchor, or Δz outside J1/J2/J3
+            # manifold).
             anchor = role_map.get(role, {})
             tj = anchor.get('taught_joints') or []
+            if len(tj) == 6 and all(isinstance(v, (int, float)) for v in tj):
+                anchor_deg = [float(v) for v in tj]
+                anchor_j5 = anchor_deg[4]
+                ik = seeded_ik_z_lift(anchor_deg, ofs_mm)
+                if ik is not None:
+                    lifted_deg, achieved = ik
+                    j5_delta = abs(lifted_deg[4] - anchor_j5)
+                    if j5_delta <= 5.0:
+                        fallback_idx += 1
+                        name = f'{point_prefix}{fallback_idx}'
+                        while name in program_points or name in used_named:
+                            fallback_idx += 1
+                            name = f'{point_prefix}{fallback_idx}'
+                        varspoint[name] = _make_jp_point(lifted_deg, name)
+                        used_named.add(name)
+                        joints_s = ', '.join(f'{v:+.3f}' for v in lifted_deg)
+                        exec_lines.append(
+                            f'movJ({name})  -- step {action}  '
+                            f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
+                            f'(FIX C: SEEDED IK Δz={achieved:+.2f} mm; '
+                            f'taught J5={anchor_j5:+.2f}° → emitted J5={lifted_deg[4]:+.2f}° '
+                            f'Δ{j5_delta:.3f}°)  joints=[{joints_s}]')
+                        last_move_joints = list(lifted_deg)
+                        continue
+                    # J5 sanity trip — should NEVER happen (we hold J5)
+                    # but the fallback path is safer than emitting a
+                    # bad move.
+                # else: IK didn't converge; fall through to movJCoorRel
             j5_note = (f'anchor J5={float(tj[4]):+.2f}°' if len(tj) >= 5 else 'anchor J5=?')
-            # Relative cp: only translate Z. No orientation delta so
-            # the controller's IK has no reason to re-solve wrist.
+            exec_lines.append(
+                f'-- SEEDED IK unavailable → falling back to movJCoorRel  '
+                f'{j5_note}')
             exec_lines.append(
                 f'movJCoorRel({{cp={{0,0,{ofs_mm:g},0,0,0}}}},{{coor=0,tool=0}})  '
                 f'-- step {action}  derived_from={role!r} '
                 f'offset_z_mm={ofs_mm:g}  '
-                f'(FIX B v2: base-frame Z-offset from CURRENT joints — '
-                f'controller IK seeded from anchor pose, wrist held.  '
-                f'{j5_note})')
+                f'(FIX B v2 fallback)')
             continue
 
         # ---- Motion — movJ/movL via point ref or inline taught_joints
@@ -531,6 +742,15 @@ def codegen_lua_from_program(
                 exec_lines.append(f'-- skipped {action!r}: '
                                   f'point {pn!r} has no valid joints')
                 continue
+            j_list = [float(v) for v in j]
+            # Zero-length-movL guard — see comment on last_move_joints.
+            if verb == 'movL' and last_move_joints is not None \
+                    and _joints_equal(j_list, last_move_joints):
+                exec_lines.append(
+                    f'-- SKIPPED zero-length movL: point={pn!r} equals '
+                    f'previous move target (would crash controller '
+                    f'blend planner — firmware bug guard)')
+                continue
             if pn not in used_named:
                 varspoint[pn] = _make_jp_point(j, pn)
                 used_named.add(pn)
@@ -541,6 +761,7 @@ def codegen_lua_from_program(
             j5_note = f'J5={float(j[4]):+.2f}°'
             exec_lines.append(f'{verb}({pn})  -- step {action}  point={pn}  '
                               f'{j5_note}  joints=[{joints_s}]')
+            last_move_joints = j_list
             continue
         taught = step.get('taught_joints')
         if not (isinstance(taught, list) and len(taught) == 6
@@ -548,6 +769,14 @@ def codegen_lua_from_program(
             exec_lines.append(f'-- skipped {action!r}: '
                               f'no point_name/points ref, no 6-el taught_joints '
                               f'(got {type(taught).__name__})')
+            continue
+        taught_list = [float(v) for v in taught]
+        # Zero-length-movL guard.
+        if verb == 'movL' and last_move_joints is not None \
+                and _joints_equal(taught_list, last_move_joints):
+            exec_lines.append(
+                f'-- SKIPPED zero-length movL: inline taught_joints equal '
+                f'previous move target (firmware blend-planner bug guard)')
             continue
         fallback_idx += 1
         name = f'{point_prefix}{fallback_idx}'
@@ -563,6 +792,7 @@ def codegen_lua_from_program(
         j5_note = f'J5={float(taught[4]):+.2f}°'
         exec_lines.append(f'{verb}({name})  -- step {action}  '
                           f'{j5_note}  joints=[{joints_s}]')
+        last_move_joints = taught_list
 
     # If the program has any `loop` step, prepend a `::_prog_start::`
     # label so the emitted `goto _prog_start` has a target. Label goes
