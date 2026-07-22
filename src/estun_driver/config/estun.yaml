@@ -172,3 +172,51 @@ estun_driver:
     # geometry model that might be wrong.
     collision_escape_speed_frac:   0.06
     collision_fallback_speed_frac: 0.03
+
+    # ── Controller-boot race guards (added 2026-07-22) ──────────────
+    # The problem we're avoiding: C2Control starts its WebSocket
+    # server ~9s into controller boot, BEFORE the Robot plugin's RT
+    # loop has populated its joint vectors (EtherCAT slaves still
+    # reaching OP). Our old driver retried every 2 s and subscribed
+    # to publish/RobotPosture + publish/RobotCoordinate ~16 ms after
+    # the port opened; the publish path indexed an empty
+    # Vector<double> in Robot::step() → firmware exitProcess → the
+    # service died. Because our retry loop reconnected instantly on
+    # every restart, WE re-crashed the controller on EVERY boot.
+    #
+    # These four knobs fix that:
+    #   1. grace_period_s       — floor between WS-open and full
+    #                             subscribe. Only RobotStatus is on
+    #                             during this window (safe: emitted
+    #                             by C2Control directly, not from
+    #                             the RT loop).
+    #   2. probe_interval_s     — cadence of the lightweight
+    #                             IOManager/GetIOInfo readiness probe
+    #                             DURING the grace window.
+    #   3. reconnect_backoff_max_s / reconnect_healthy_reset_s —
+    #                             replace the fixed 2 s retry with
+    #                             exponential backoff (2→4→8→…→cap)
+    #                             that ONLY resets after a session
+    #                             has stayed READY for the reset
+    #                             window. Brief-lived healthy
+    #                             sessions don't reset the backoff.
+    #   4. crashloop_threshold / _window_s / _cooldown_s — if we
+    #                             see N connect→disconnect cycles in
+    #                             the window, enter a longer cool-
+    #                             down and surface it on /estun/status
+    #                             (controller_init:"cooldown"). The
+    #                             dashboard's System Check renders
+    #                             this as Controller: "initializing
+    #                             — waiting".
+    #
+    # NEVER lower grace_period_s below the controller's own EtherCAT-
+    # OP settling time (~2–3 s on this hardware) without live-log
+    # evidence — the 5 s default is what makes it safe for us to
+    # connect at boot without triggering exitProcess again.
+    grace_period_s:              5.0
+    probe_interval_s:            1.0
+    reconnect_backoff_max_s:     30.0
+    reconnect_healthy_reset_s:   60.0
+    crashloop_threshold:         3
+    crashloop_window_s:          120.0
+    crashloop_cooldown_s:        120.0

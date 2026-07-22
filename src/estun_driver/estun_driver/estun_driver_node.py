@@ -73,11 +73,28 @@ except ImportError:
 
 WS_LOG_DIR = '/opt/cobot/logs'
 
-# v2.3 subscribe burst — matches posture.py exactly.
-SUBSCRIBE_TOPICS = [
+# v2.3 subscribe burst — split into two phases to survive the
+# controller-boot race. See connect_state.ConnectStateMachine.
+#
+# PROBE_TOPICS are safe to subscribe to WHILE the controller is still
+# initializing: they don't touch the Robot plugin's joint-vector state,
+# which is empty until EtherCAT slaves reach OP. Wire evidence (2026-07-
+# controller-boot logs): subscribing to RobotPosture / RobotCoordinate
+# ~16 ms after C2Control opens :9000 crashes firmware in Robot::step()
+# via an empty Vector<double> index. RobotStatus is emitted directly by
+# C2Control from the state machine, not from the RT loop, and is
+# available immediately.
+#
+# FULL_TOPICS are added ONCE the readiness probe answers AND the grace
+# period has elapsed. This is the topic set that used to be blasted
+# unconditionally on connect.
+PROBE_TOPICS = ['RobotStatus']
+FULL_TOPICS = [
     'web', 'WebCommand', 'Error', 'ProjectState',
-    'RobotStatus', 'RobotPosture', 'RobotCoordinate', 'ProjectStatus',
+    'RobotPosture', 'RobotCoordinate', 'ProjectStatus',
 ]
+# Kept for backward-compat with any importer.
+SUBSCRIBE_TOPICS = PROBE_TOPICS + FULL_TOPICS
 
 # ── Fitted DH table (standard convention) — Estun S10-140-ECO-V2 ──────
 # Source: config/dh_fit_report.txt (stage-B fixed-xyz fit, pos RMS 0.025 mm
@@ -399,6 +416,30 @@ class EstunCodroidDriver(Node):
         self.declare_parameter('ping_on_timeout', True)
         self.declare_parameter('reconnect_backoff_s', 2.0)
 
+        # ── Controller-boot race guards ────────────────────────────
+        # We used to hammer the controller with the full subscribe
+        # burst 16 ms after :9000 opened, which crashed firmware
+        # during its own EtherCAT init — see connect_state.py header
+        # for the full story. These knobs govern the fix:
+        #   * grace_period_s: floor between WS-open and full subscribe
+        #   * probe_interval_s: cadence of the lightweight readiness
+        #     probe DURING the grace window
+        #   * reconnect_backoff_max_s: cap on the exponential retry
+        #     backoff (initial = reconnect_backoff_s above)
+        #   * reconnect_healthy_reset_s: seconds a session must stay
+        #     READY before we reset backoff to initial (short healthy
+        #     sessions don't reset — the whole hazard was that we
+        #     reconnected instantly on every restart)
+        #   * crashloop_threshold / _window_s / _cooldown_s: N cycles
+        #     inside window trigger a longer cool-down and a loud log
+        self.declare_parameter('grace_period_s', 5.0)
+        self.declare_parameter('probe_interval_s', 1.0)
+        self.declare_parameter('reconnect_backoff_max_s', 30.0)
+        self.declare_parameter('reconnect_healthy_reset_s', 60.0)
+        self.declare_parameter('crashloop_threshold', 3)
+        self.declare_parameter('crashloop_window_s', 120.0)
+        self.declare_parameter('crashloop_cooldown_s', 120.0)
+
         # Rate-limit the "waiting for stream" log so a disabled robot
         # doesn't spam. In seconds.
         self.declare_parameter('disabled_log_period_s', 15.0)
@@ -424,6 +465,14 @@ class EstunCodroidDriver(Node):
         self._ping_on_to   = bool(self.get_parameter('ping_on_timeout').value)
         self._reconn_backoff = float(self.get_parameter('reconnect_backoff_s').value)
         self._disabled_log_period = float(self.get_parameter('disabled_log_period_s').value)
+
+        self._grace_period_s        = float(self.get_parameter('grace_period_s').value)
+        self._probe_interval_s      = float(self.get_parameter('probe_interval_s').value)
+        self._reconnect_backoff_max_s = float(self.get_parameter('reconnect_backoff_max_s').value)
+        self._reconnect_healthy_reset_s = float(self.get_parameter('reconnect_healthy_reset_s').value)
+        self._crashloop_threshold   = int(self.get_parameter('crashloop_threshold').value)
+        self._crashloop_window_s    = float(self.get_parameter('crashloop_window_s').value)
+        self._crashloop_cooldown_s  = float(self.get_parameter('crashloop_cooldown_s').value)
 
         self._allow_jog             = bool(self.get_parameter('allow_jog').value)
         self._allow_cartesian_jog   = bool(self.get_parameter('allow_cartesian_jog').value)
@@ -506,6 +555,24 @@ class EstunCodroidDriver(Node):
         self._connected = False
         self._recv_thread = None
         self._send_lock = threading.Lock()
+        # Connection-lifecycle state machine. Owns the grace-period /
+        # readiness-probe / exponential-backoff / crash-loop rules
+        # that keep us from re-crashing a controller that's still
+        # coming up. Fully unit-tested in test/test_connect_state.py.
+        from estun_driver.connect_state import ConnectStateMachine
+        self._conn_sm = ConnectStateMachine(
+            grace_period_s=self._grace_period_s,
+            probe_interval_s=self._probe_interval_s,
+            backoff_initial_s=self._reconn_backoff,
+            backoff_max_s=self._reconnect_backoff_max_s,
+            backoff_reset_healthy_s=self._reconnect_healthy_reset_s,
+            crashloop_threshold=self._crashloop_threshold,
+            crashloop_window_s=self._crashloop_window_s,
+            crashloop_cooldown_s=self._crashloop_cooldown_s,
+        )
+        # Rate-limit the "controller appears to be restarting" log so
+        # it fires once per crash-loop entry, not every tick.
+        self._crashloop_logged = False
 
         # ── Robot state ────────────────────────────────────────
         self._joint_deg = [0.0] * 6
@@ -770,7 +837,12 @@ class EstunCodroidDriver(Node):
 
         # ── Timers ─────────────────────────────────────────────
         self._mode_timer    = self.create_timer(1.0, self._publish_mode)
-        self._connect_timer = self.create_timer(self._reconn_backoff, self._try_connect)
+        # Connection lifecycle tick — polls the state machine at 2 Hz
+        # to decide whether to attempt a connect, send a probe, or
+        # promote to the full subscribe burst. Cheap enough to run
+        # constantly; the SM does the actual gating (backoff / grace /
+        # cooldown).
+        self._connect_timer = self.create_timer(0.5, self._conn_tick)
 
         self.get_logger().info(
             f'Estun v2.3 driver initialized — '
@@ -943,6 +1015,11 @@ class EstunCodroidDriver(Node):
         if not self._connected:
             self._reject(family, 'ws not connected')
             return
+        if self._conn_sm.state != self._conn_sm.READY:
+            # Writes during INITIALIZING can hit the same joint-vector
+            # crash path we're avoiding with the deferred subscribe.
+            self._reject(family, f'controller {self._conn_sm.state} — writes gated until READY')
+            return
 
         try:
             d = json.loads(msg.data)
@@ -1052,6 +1129,10 @@ class EstunCodroidDriver(Node):
             return
         if not self._connected:
             self._reject(family, 'ws not connected',
+                         extra={'payload': msg.data[:200]})
+            return
+        if self._conn_sm.state != self._conn_sm.READY:
+            self._reject(family, f'controller {self._conn_sm.state} — writes gated until READY',
                          extra={'payload': msg.data[:200]})
             return
 
@@ -1366,6 +1447,11 @@ class EstunCodroidDriver(Node):
             return
         if not self._connected:
             self._reject(family, 'ws not connected')
+            return
+        if self._conn_sm.state != self._conn_sm.READY:
+            # Writes during INITIALIZING can hit the same joint-vector
+            # crash path we're avoiding with the deferred subscribe.
+            self._reject(family, f'controller {self._conn_sm.state} — writes gated until READY')
             return
 
         try:
@@ -2451,6 +2537,7 @@ class EstunCodroidDriver(Node):
             'origin':         f'http://{self._robot_ip}:{self._ui_origin_port}',
             'ip_source':      self._ip_source,
             'connected':      self._connected,
+            'conn':           self._conn_sm.status_snapshot(),
             'enabled':        self._enabled,
             'enabling':       self._enabling,
             'state_code':     self._state_code,
@@ -2468,7 +2555,39 @@ class EstunCodroidDriver(Node):
 
     # ── WebSocket lifecycle ───────────────────────────────
 
+    def _conn_tick(self):
+        """Periodic tick that drives the ConnectStateMachine forward.
+
+        Runs at 2 Hz. Handles three orthogonal responsibilities:
+          1. If DISCONNECTED and backoff/cooldown elapsed → attempt
+             a new WS connection.
+          2. If INITIALIZING and a probe is due → emit one.
+          3. If INITIALIZING and both probe answered + grace elapsed
+             → send the FULL subscribe burst and transition to READY.
+        """
+        sm = self._conn_sm
+
+        # 1) Attempt-connect gate.
+        if sm.state in (sm.DISCONNECTED, sm.COOLDOWN):
+            ok, _reason = sm.can_attempt_connect()
+            if ok:
+                self._try_connect()
+                return  # a successful connect already sent the probe
+
+        # 2) Probe tick during grace.
+        if sm.state == sm.INITIALIZING and self._connected:
+            if sm.should_send_probe():
+                self._send_probe()
+                sm.note_probe_sent()
+            # 3) Promotion to READY.
+            if sm.should_subscribe_full():
+                self._finalize_full_subscribe()
+
     def _try_connect(self):
+        """Open the WS and send the PROBE-ONLY subscribe. This does
+        NOT send the full topic set — that waits on the readiness
+        probe answering. The state-machine handles all timing;
+        callers just invoke this when the SM says an attempt is due."""
         if self._connected:
             return
         if ws_sync is None:
@@ -2483,23 +2602,67 @@ class EstunCodroidDriver(Node):
             self.get_logger().warn(f'Cannot connect {url} (origin={origin}): {e}')
             self._ws = None
             self._connected = False
+            self._conn_sm.on_connect_failure()
             return
 
         self._connected = True
+        self._conn_sm.on_connect_success()
+        self._crashloop_logged = False
         self.get_logger().info(
-            f'Connected {url} (origin={origin}) — sending v2.3 subscribe burst')
+            f'Connected {url} (origin={origin}) — INITIALIZING '
+            f'(grace={self._grace_period_s:.1f}s, probe only until '
+            f'controller responds)')
 
-        # Subscribe burst — mirrors posture.py exactly.
+        # PROBE-ONLY subscribe. RobotStatus is safe: emitted by
+        # C2Control directly, not from the crash-prone RT loop.
         try:
-            for t in SUBSCRIBE_TOPICS:
+            for t in PROBE_TOPICS:
                 self._send({'ty': f'publish/{t}'})
         except Exception as e:
-            self.get_logger().warn(f'Subscribe burst failed: {e}')
+            self.get_logger().warn(f'Probe subscribe failed: {e}')
             self._disconnect()
             return
 
+        # First probe fires immediately.
+        try:
+            self._send_probe()
+            self._conn_sm.note_probe_sent()
+        except Exception as e:
+            self.get_logger().warn(f'Readiness probe send failed: {e}')
+
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._recv_thread.start()
+
+    def _send_probe(self):
+        """Send the readiness probe. IOManager/GetIOInfo is the
+        lightweight system query mined from the Codroid UI bundle —
+        we don't have wire-log confirmation it exists on this
+        firmware, so the driver ALSO accepts any well-formed
+        publish/RobotStatus frame as evidence the controller is
+        responsive (see _handle_frame). Either signal graduates us
+        out of the grace state."""
+        try:
+            self._send({'ty': 'IOManager/GetIOInfo',
+                        'id': self._new_nonce()})
+        except Exception as e:
+            self.get_logger().warn(f'probe send failed: {e}')
+
+    def _finalize_full_subscribe(self):
+        """Grace passed + probe answered → send the full topic burst
+        and promote to READY. This is the ONLY path that subscribes
+        to RobotPosture / RobotCoordinate (the topics that crashed
+        the controller when subscribed too early)."""
+        try:
+            for t in FULL_TOPICS:
+                self._send({'ty': f'publish/{t}'})
+        except Exception as e:
+            self.get_logger().warn(f'Full subscribe burst failed: {e}')
+            self._disconnect()
+            return
+        self._conn_sm.on_subscribed_full()
+        self.get_logger().info(
+            f'Controller READY — full subscribe burst sent '
+            f'({len(FULL_TOPICS)} topics). Telemetry mirror active.')
 
     def _disconnect(self):
         # Best-effort stopJog on the still-open socket before we drop it —
@@ -2510,6 +2673,7 @@ class EstunCodroidDriver(Node):
             self._stop_jog(reason='ws disconnect')
         except Exception:
             pass
+        was_connected = self._connected
         self._connected = False
         self._enabled = False
         if self._ws:
@@ -2518,6 +2682,17 @@ class EstunCodroidDriver(Node):
             except Exception:
                 pass
             self._ws = None
+        if was_connected:
+            result = self._conn_sm.on_disconnect()
+            if result == 'crashloop' and not self._crashloop_logged:
+                self._crashloop_logged = True
+                self.get_logger().warn(
+                    f'controller appears to be restarting — backing off '
+                    f'{self._crashloop_cooldown_s:.0f}s '
+                    f'(≥{self._crashloop_threshold} disconnects inside '
+                    f'{self._crashloop_window_s:.0f}s window). Dashboard '
+                    f'System Check will show Controller: '
+                    f'"initializing — waiting".')
 
     def _send(self, obj):
         """Send a compact JSON frame — matches posture.py serialization."""
@@ -2583,6 +2758,13 @@ class EstunCodroidDriver(Node):
     def _handle_frame(self, obj):
         ty = obj.get('ty', '')
         db = obj.get('db')
+        # ANY id-tagged reply during INITIALIZING counts as a valid
+        # readiness answer — this covers the IOManager/GetIOInfo probe
+        # regardless of whether the firmware ships that verb (unknown
+        # verbs still round-trip an id echo on some Codroid builds).
+        if (obj.get('id') is not None
+                and self._conn_sm.state == self._conn_sm.INITIALIZING):
+            self._conn_sm.note_probe_response()
         if not ty.startswith('publish/'):
             return
         topic = ty[len('publish/'):]
@@ -2836,6 +3018,13 @@ class EstunCodroidDriver(Node):
             state_int = int(state)
         except Exception:
             state_int = -1
+        # RobotStatus with a parseable state field is our fallback
+        # readiness signal — proves the controller is publishing
+        # state and the WS message pump is alive. The primary probe
+        # (IOManager/GetIOInfo) may or may not be answered by this
+        # firmware; either signal graduates us out of INITIALIZING.
+        if state_int >= 0 and self._conn_sm.state == self._conn_sm.INITIALIZING:
+            self._conn_sm.note_probe_response()
         self._state_code = state_int
         self._state_name = str(db.get('stateName', ''))
         was_enabled = self._enabled
@@ -3040,6 +3229,18 @@ class EstunCodroidDriver(Node):
             'ip':            self._robot_ip,
             'ip_source':     self._ip_source,
         }
+        # Controller-boot-race state — dashboard System Check reads
+        # `controller_init` for the "initializing — waiting" copy.
+        # See connect_state.ConnectStateMachine + the driver's boot-race
+        # comment block for the reasons this exists.
+        sm_snap = self._conn_sm.status_snapshot()
+        blob['controller_init'] = (
+            'initializing' if sm_snap['conn_state'] == 'initializing'
+            else 'cooldown'   if sm_snap['conn_state'] == 'cooldown'
+            else 'ready'      if sm_snap['conn_state'] == 'ready'
+            else 'disconnected'
+        )
+        blob['conn'] = sm_snap
         # Also publish a plain safety mode string for legacy consumers.
         sm = String(); sm.data = 'estop' if self._is_estop else 'normal'
         self._pub_safety_mode.publish(sm)
