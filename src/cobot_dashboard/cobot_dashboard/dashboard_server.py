@@ -237,6 +237,55 @@ _ws_lock = threading.Lock()
 _state_perf = {"acks": [], "inflight_ms_max": 0.0, "sends": 0, "ack_timeouts": 0}
 _state_perf_lock = threading.Lock()
 
+
+# ── Bounded per-client queue with drop-oldest backpressure ────────────
+# Part E fix (2026-07-22). Previous pattern was `if q.qsize() < 2:
+# await q.put(...)` — drop-NEWEST when full, so a slow client saw
+# STALE data while the newest telemetry was silently discarded.
+# Drop-oldest is the correct choice for live streams: whenever the
+# queue is full, evict the oldest queued item to make room for the
+# new one. Freshness beats completeness for telemetry.
+#
+# Records the number of drops per broadcast channel so /health can
+# surface a backpressure trend without needing SIGUSR1 dumps.
+_ws_drops = {"state": 0, "lidar": 0, "mesh": 0,
+             "motioncam_cloud": 0, "motioncam_reco": 0}
+_ws_drops_lock = threading.Lock()
+
+
+def _put_drop_oldest(q, payload, channel: str) -> None:
+    """Enqueue `payload` on `q`, dropping the oldest queued item first
+    if the queue is at its maxsize. Increments `_ws_drops[channel]`
+    when an eviction happens. Never blocks; returns synchronously.
+
+    Called from the async broadcaster where the queue is already an
+    asyncio.Queue on the same event loop, so put_nowait / get_nowait
+    are the right calls (they don't context-switch)."""
+    try:
+        q.put_nowait(payload)
+        return
+    except asyncio.QueueFull:
+        pass
+    # Full — evict oldest, then put. If a concurrent consumer beat us
+    # to it, put_nowait may succeed on the second try; otherwise we
+    # retry the evict+put once more before giving up (avoids an
+    # infinite loop under pathological contention).
+    for _ in range(2):
+        try:
+            q.get_nowait()
+            with _ws_drops_lock:
+                _ws_drops[channel] = _ws_drops.get(channel, 0) + 1
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            q.put_nowait(payload)
+            return
+        except asyncio.QueueFull:
+            continue
+    # Give up rather than block.
+    with _ws_drops_lock:
+        _ws_drops[channel] = _ws_drops.get(channel, 0) + 1
+
 def _state_perf_snapshot():
     """Read-only snapshot for /health. p50/p95 over the last ~200 acks;
     inflight_ms_max is the peak broadcast→send-complete gap observed
@@ -1631,11 +1680,7 @@ if FASTAPI_AVAILABLE:
                     with _ws_lock:
                         clients = list(_mesh_clients.items())
                     for ws, q in clients:
-                        if q.qsize() < 2:
-                            try:
-                                await q.put(payload)
-                            except Exception:
-                                pass
+                        _put_drop_oldest(q, payload, 'mesh')
                 next_mesh = now + mesh_dt
 
             if now >= next_state:
@@ -1721,11 +1766,7 @@ if FASTAPI_AVAILABLE:
                 with _ws_lock:
                     clients = list(_lidar_clients.items())
                 for ws, q in clients:
-                    if q.qsize() < 2:
-                        try:
-                            await q.put(('binary', lidar_payload))
-                        except Exception:
-                            pass
+                    _put_drop_oldest(q, ('binary', lidar_payload), 'lidar')
                 next_lidar = now + lidar_dt
 
             if now >= next_motioncam:
@@ -1746,11 +1787,7 @@ if FASTAPI_AVAILABLE:
                     with _ws_lock:
                         clients = list(_motioncam_cloud_clients.items())
                     for ws, q in clients:
-                        if q.qsize() < 2:
-                            try:
-                                await q.put(('binary', payload))
-                            except Exception:
-                                pass
+                        _put_drop_oldest(q, ('binary', payload), 'motioncam_cloud')
                 next_motioncam = now + motioncam_dt
 
             if now >= next_motioncam_reco:
@@ -1759,11 +1796,7 @@ if FASTAPI_AVAILABLE:
                 with _ws_lock:
                     clients = list(_motioncam_reco_clients.items())
                 for ws, q in clients:
-                    if q.qsize() < 2:
-                        try:
-                            await q.put(txt)
-                        except Exception:
-                            pass
+                    _put_drop_oldest(q, txt, 'motioncam_reco')
                 next_motioncam_reco = now + motioncam_reco_dt
 
             await asyncio.sleep(0.005)
@@ -2894,6 +2927,28 @@ if FASTAPI_AVAILABLE:
             ns  = len(_state_clients)
             nl  = len(_lidar_clients)
             nm  = len(_mesh_clients)
+            # Snapshot per-channel queue depths — sum + max across all
+            # clients on each channel. Used by System Check to spot the
+            # zombie-WS pattern (queues holding steady > 0 while
+            # ws_drops climbs → clients are alive but not draining fast
+            # enough → backpressure is doing its job).
+            def _depth(clients):
+                depths = [c.qsize() for c in clients.values()
+                          if hasattr(c, 'qsize')]
+                return {
+                    'n':    len(depths),
+                    'sum':  sum(depths),
+                    'max':  max(depths) if depths else 0,
+                }
+            ws_depth = {
+                'state':           {'n': ns, 'sum': 0, 'max': 0},  # ACK-gated slot, no queue
+                'lidar':           _depth(_lidar_clients),
+                'mesh':            _depth(_mesh_clients),
+                'motioncam_cloud': _depth(_motioncam_cloud_clients),
+                'motioncam_reco':  _depth(_motioncam_reco_clients),
+            }
+        with _ws_drops_lock:
+            ws_drops_snap = dict(_ws_drops)
         with _cam_lock:
             have_cam0 = _cam_frames[0] is not None
             have_cam1 = _cam_frames[1] is not None
@@ -2920,6 +2975,16 @@ if FASTAPI_AVAILABLE:
             # least one client's send stalled past WS_SEND_TIMEOUT_S — the
             # broadcaster force-closed the socket to protect the event loop.
             "ws_kicked": dict(_ws_kicked),
+            # Cumulative drop-oldest counter per channel — nonzero means a
+            # bounded queue was full and the oldest payload got evicted to
+            # make room for the fresh one (Part E fix). Steady growth =
+            # a client is alive but not draining fast enough → the
+            # backpressure is working; a client-side lag investigation
+            # is warranted, not an outage.
+            "ws_drops": ws_drops_snap,
+            # Live queue depths per channel — {n=clients, sum, max}. Steady
+            # sum > 0 with rising ws_drops is the zombie-WS signature.
+            "ws_depth": ws_depth,
             "ws_send_timeout_s": WS_SEND_TIMEOUT_S,
             "state_perf": _state_perf_snapshot(),
             "hold_keepalive": dict(_keepalive_stats),
