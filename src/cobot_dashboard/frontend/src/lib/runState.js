@@ -81,6 +81,77 @@ export function deriveRunState({ robot, task, safety } = {}) {
            border: '#D1D5DB', pulse: false }
 }
 
+// ── Stuck-STOPPING recovery (Part D, 2026-07-22) ─────────────────
+//
+// A project/stop should transition the Estun controller through
+// state 2 → 3 → 0 in well under a second. If it sits at 3 for
+// STUCK_STOPPING_MS or longer, either the driver's stop ack was
+// dropped or the interpreter stalled mid-motion. These pure
+// helpers let the Monitor UI decide when to surface the recovery
+// banner and which buttons stay enabled — no React, easily unit-
+// tested in isolation.
+
+export const STUCK_STOPPING_MS = 3000
+
+// The STOP button MUST stay enabled in every active state so a
+// wedged program can always be interrupted. Deliberately exempt
+// from the gate-open / estop-clear checks that grey out the OTHER
+// motion verbs — STOP works precisely when things are running or
+// wedged, so its enable-state cannot depend on the same conditions
+// that got the arm into trouble.
+export function isStopButtonEnabled(runStateKind) {
+  return runStateKind === 'running'
+      || runStateKind === 'paused'
+      || runStateKind === 'stopping'
+      || runStateKind === 'alarm'
+}
+
+// Returns true if the run state is 'stopping' AND the operator has
+// been waiting at least STUCK_STOPPING_MS since the transition.
+// `stoppingSinceTs` is a wall-clock ms epoch OR null. `nowTs` is
+// injectable so tests can advance a fake clock; falls back to
+// Date.now().
+export function isStuckStopping(runStateKind, stoppingSinceTs,
+                                nowTs = Date.now()) {
+  if (runStateKind !== 'stopping') return false
+  if (stoppingSinceTs == null) return false
+  return (nowTs - stoppingSinceTs) >= STUCK_STOPPING_MS
+}
+
+// A "run-family" verb (Home, Restart) is normally disabled while
+// active — but when isStuckStopping is true, it re-enables (with a
+// confirm prompt supplied by the caller) so the operator has a
+// path out of the wedge.
+export function homeButtonEnabled({ runStateKind, stoppingSinceTs, safety, robot,
+                                    nowTs = Date.now() }) {
+  const stuck = isStuckStopping(runStateKind, stoppingSinceTs, nowTs)
+  // Never allowed under an estop — pressing home while estopped
+  // would waste the operator's confirm click on a guaranteed refusal.
+  if (safety && safety.estop) return false
+  // Normal path: enabled in idle/disabled; disabled while active.
+  if (runStateKind === 'running' || runStateKind === 'paused'
+      || runStateKind === 'alarm') {
+    return false
+  }
+  if (runStateKind === 'stopping') return stuck
+  return !!(robot && robot.connected)
+}
+
+export function restartButtonEnabled({ runStateKind, stoppingSinceTs, safety,
+                                       nowTs = Date.now() }) {
+  const stuck = isStuckStopping(runStateKind, stoppingSinceTs, nowTs)
+  if (safety && safety.estop) return false
+  // Restart is meaningful in idle (re-run) and in stuck-STOPPING
+  // (recovery). Not offered mid-run (use Stop first) or mid-alarm
+  // (fix the alarm first).
+  if (runStateKind === 'running' || runStateKind === 'paused'
+      || runStateKind === 'alarm') {
+    return false
+  }
+  if (runStateKind === 'stopping') return stuck
+  return true
+}
+
 // Reproduce the codegen's line-emission decision for each step so the
 // step-preview panel can find WHICH step corresponds to a given
 // ProjectState.line value. Matches program_ops.codegen_lua_from_program

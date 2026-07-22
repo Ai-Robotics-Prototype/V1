@@ -9,7 +9,9 @@ import IdentifiedObjectsCard from '../components/IdentifiedObjectsCard'
 import RunProgramModal from '../components/RunProgramModal'
 import ProgramErrorModal from '../components/ProgramErrorModal'
 import StepPreviewPanel from '../components/StepPreviewPanel'
-import { deriveRunState } from '../lib/runState'
+import { deriveRunState, isStopButtonEnabled,
+         isStuckStopping as _computeStuckStopping,
+         STUCK_STOPPING_MS } from '../lib/runState'
 
 // Status badge — reads the unified deriveRunState() so pill matches
 // footer matches banner. Rendered from a runState object (color, label,
@@ -819,7 +821,8 @@ export default function MonitorDashboard() {
     return () => clearInterval(id)
   }, [stoppingSince])
   const stuckStoppingMs = stoppingSince ? (nowTs - stoppingSince) : 0
-  const isStuckStopping = runState.kind === 'stopping' && stuckStoppingMs > 3000
+  // Pure helper — unit-tested in src/lib/runState.test.js
+  const isStuckStopping = _computeStuckStopping(runState.kind, stoppingSince, nowTs)
 
   const programName    = currentProgram?.name || 'No program loaded'
   const steps          = currentProgram?.steps || []
@@ -878,10 +881,9 @@ export default function MonitorDashboard() {
   // still permitted because the driver's stop verb is safe to send
   // repeatedly and won't itself move the arm — sending it when the
   // controller is already halted is a no-op that clears bookkeeping.
-  const stopDisabled   = runState.kind !== 'running'
-                          && runState.kind !== 'paused'
-                          && runState.kind !== 'stopping'
-                          && runState.kind !== 'alarm'
+  // Uses the unit-tested isStopButtonEnabled helper so JSX and tests
+  // agree on the rule.
+  const stopDisabled   = !isStopButtonEnabled(runState.kind)
 
   return (
     <div style={{
