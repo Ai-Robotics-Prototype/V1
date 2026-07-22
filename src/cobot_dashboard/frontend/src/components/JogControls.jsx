@@ -1,5 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useStore } from '../store/useStore'
+import { createHoldTicker } from '../lib/holdTicker'
+import { pushJogEvent, pushJogInterval,
+         startJogSession, endJogSession } from '../lib/jogTelemetry'
 
 // JogControls — the shared REAL-ARM hold-to-jog panel.
 //
@@ -50,8 +53,18 @@ export function HoldButton({
   color, width, height, disabled, tooltip, children,
   bg = '#fff', bgHover, borderColor = '#d1d5db',
 }) {
-  const tickTimer      = useRef(null)
+  // 2026-07-22 tablet-jitter fix — swap setInterval for a
+  // dual-source ticker (Web Worker + rAF with time accounting) so
+  // mobile timer throttling can't stretch keepalives past the
+  // driver's 300 ms deadman. Deadman UNCHANGED — this is a
+  // client-side reliability fix (Lesson 102 stands).
+  const tickerRef      = useRef(null)
   const pressed        = useRef(false)
+  // pointerId currently captured on this button — set on pointerdown,
+  // cleared on pointerup/cancel. setPointerCapture routes ALL
+  // subsequent move / up / cancel to the button element even if the
+  // finger drifts off, so slight movement never cancels the hold.
+  const capturedPointerId = useRef(null)
   // Per-session hold_id — regenerated on every fresh press so the
   // driver can distinguish "old cancelled session" refreshes from
   // "new session" holds. Any refresh whose hold_id doesn't match the
@@ -84,7 +97,10 @@ export function HoldButton({
     // 400 ms abort-and-refire self-heal was removed: it was killing
     // slow-but-viable HTTP requests on a degraded dashboard, and the
     // driver's 300 ms freshness deadman is the correct final backstop.
-    if (refreshInFlight.current) return
+    if (refreshInFlight.current) {
+      pushJogEvent('tick_skip_inflight', { hold_id: holdIdRef.current })
+      return
+    }
     refreshInFlight.current = true
     refreshStartMs.current = Date.now()
     const ctrl = new AbortController()
@@ -96,12 +112,29 @@ export function HoldButton({
     }
     try {
       await onPressTick?.(meta)
-    } catch { /* network failure — driver's deadman handles it */ }
+      pushJogEvent('tick_sent', { hold_id: holdIdRef.current, seq: meta.seq })
+    } catch {
+      pushJogEvent('tick_send_error', { hold_id: holdIdRef.current, seq: meta.seq })
+      /* network failure — driver's deadman handles it */
+    }
     finally {
       refreshInFlight.current = false
       if (inFlightAbort.current === ctrl) inFlightAbort.current = null
     }
   }, [onPressTick])
+
+  // Track the wall-clock delta between successive tick_sent events so
+  // the telemetry panel can show what the operator's actual keepalive
+  // cadence looked like (not just the ticker's target).
+  const lastSentTs = useRef(0)
+  const doRefreshWithSampling = useCallback(() => {
+    const now = performance.now()
+    if (lastSentTs.current) {
+      pushJogInterval('sent', 100, now - lastSentTs.current)
+    }
+    lastSentTs.current = now
+    doRefresh()
+  }, [doRefresh])
 
   // Route the "release" fallback (mouse-up while pointer is OFF the button)
   // through a window-level pointerup/mouseup listener, wired at press and
@@ -123,39 +156,39 @@ export function HoldButton({
       // First frame — no abort signal; we want it to complete, and
       // there's nothing to coalesce against.
       onPressStart?.(meta)
-      if (tickTimer.current) clearInterval(tickTimer.current)
-      // 100 ms cadence: driver's 300 ms deadman gets 3× headroom, so a
-      // single dropped/late frame no longer trips staleness. WS transport
-      // makes this cheap — each refresh is one send() on an already-open
-      // socket. HTTP fallback uses the same cadence; the coalesce guard
-      // one layer above skips ticks while a previous fetch is in flight.
-      tickTimer.current = setInterval(() => { doRefresh() }, 100)
-      // Fallback release for mouse: if the operator drags off the button
-      // and releases in dead space, neither onMouseUp nor onMouseLeave
-      // (in buttons==0 mode) fires on the button element. This global
-      // listener catches that case. Removed in stop().
-      const handler = () => stopRef.current?.()
-      globalUpHandlerRef.current = handler
-      window.addEventListener('mouseup', handler)
-      window.addEventListener('pointerup', handler)
+      startJogSession(holdIdRef.current)
+      pushJogEvent('press_start', { hold_id: holdIdRef.current })
+      lastSentTs.current = performance.now()
+      pushJogInterval('sent', 100, 0)
+      // 100 ms cadence via createHoldTicker — Worker + rAF hybrid.
+      // Both sources fire; the ticker coalesces so a single 100 ms
+      // effective cadence hits the send path. Mobile timer throttling
+      // (Lesson-102-adjacent: tablet browsers can stretch setInterval
+      // past the 300 ms deadman when the main thread is jank-y) can't
+      // stretch this because the Worker runs off-thread. rAF is the
+      // belt-and-braces path and stays foreground-only.
+      if (tickerRef.current) tickerRef.current.destroy()
+      tickerRef.current = createHoldTicker({
+        interval_ms: 100,
+        coalesce_ms: 40,
+        onFire: () => { doRefreshWithSampling() },
+      })
+      tickerRef.current.start()
     } else {
       // STEP: one increment per press, no interval, no hold repeat.
       onTap?.()
     }
-  }, [disabled, jogStyle, onTap, onPressStart, doRefresh])
+  }, [disabled, jogStyle, onTap, onPressStart, doRefreshWithSampling])
 
   const stop = useCallback(() => {
     if (!pressed.current) return
     pressed.current = false
-    if (tickTimer.current) {
-      clearInterval(tickTimer.current)
-      tickTimer.current = null
-    }
-    // Detach the global mouse/pointer-up fallback if we set one up.
-    if (globalUpHandlerRef.current) {
-      window.removeEventListener('mouseup', globalUpHandlerRef.current)
-      window.removeEventListener('pointerup', globalUpHandlerRef.current)
-      globalUpHandlerRef.current = null
+    // Kill the ticker BEFORE sending the release so no straggler
+    // tick can queue behind it. destroy() also terminates the
+    // Worker so the Blob URL / off-thread timer are cleaned up.
+    if (tickerRef.current) {
+      try { tickerRef.current.destroy() } catch { /* nop */ }
+      tickerRef.current = null
     }
     // Abort any in-flight refresh so it releases its connection slot;
     // then send the release. Release travels on its own fresh request.
@@ -169,11 +202,13 @@ export function HoldButton({
         hold_id: holdIdRef.current,
         seq:     nextSeq(),
       }
+      pushJogEvent('release_sent', { hold_id: holdIdRef.current, seq: meta.seq })
       // Fire-and-forget — we don't await so a slow release POST doesn't
       // block subsequent UI actions. The driver still processes the
       // hold:false frame immediately on receipt.
       onPressEnd?.(meta)
       holdIdRef.current = null
+      endJogSession()
     }
   }, [jogStyle, onPressEnd])
 
@@ -194,31 +229,62 @@ export function HoldButton({
   useEffect(() => { stopRef.current = stop })
   useEffect(() => () => stopRef.current?.(), [])
 
+  // Pointer events replace the earlier mouse + touch pair. Advantages:
+  //   * setPointerCapture routes all subsequent move/up/cancel events
+  //     to THIS button even if the finger drifts off — no movement
+  //     tolerance heuristic needed.
+  //   * pointercancel (OS/browser interrupt — scroll gesture, phone
+  //     call notification, long-press context menu) is a safe release.
+  //   * touch-action:none blocks the browser from claiming the touch
+  //     for a scroll/pinch gesture (also mirrored in the button style).
+  //   * preventDefault on pointerdown suppresses the long-press context
+  //     menu and other synthesized events (mousedown, click, etc.)
+  //     that would otherwise fire alongside on touch devices.
+  const onPointerDown = useCallback((e) => {
+    pushJogEvent('pointerdown', { pointerType: e.pointerType, id: e.pointerId })
+    if (disabled) return
+    if (e.preventDefault) e.preventDefault()
+    try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* nop */ }
+    capturedPointerId.current = e.pointerId
+    start(e)
+  }, [disabled, start])
+  const onPointerUp = useCallback((e) => {
+    pushJogEvent('pointerup', { pointerType: e.pointerType, id: e.pointerId })
+    if (capturedPointerId.current != null) {
+      try { e.currentTarget.releasePointerCapture(capturedPointerId.current) } catch { /* nop */ }
+      capturedPointerId.current = null
+    }
+    stop()
+  }, [stop])
+  const onPointerCancel = useCallback((e) => {
+    pushJogEvent('pointercancel', { pointerType: e.pointerType, id: e.pointerId })
+    if (capturedPointerId.current != null) {
+      try { e.currentTarget.releasePointerCapture(capturedPointerId.current) } catch { /* nop */ }
+      capturedPointerId.current = null
+    }
+    stop()
+  }, [stop])
+
   return (
     <button
       disabled={disabled}
       title={disabled ? (tooltip || 'disabled') : undefined}
-      onMouseDown={start}
-      onMouseUp={stop}
-      onMouseLeave={(e) => {
-        e.currentTarget.style.background = bg
-        e.currentTarget.style.borderColor = borderColor
-        // Only end the hold if the mouse button is genuinely up. During a
-        // mouse-drag off the button the browser fires mouseleave but the
-        // press is still active — old behavior treated that as a release,
-        // cutting motion short on any twitch. Global mouseup handles the
-        // "released while off the button" case (attached below in start).
-        if (!pressed.current) return
-        if (e.buttons === 0) stop()
-      }}
-      onMouseEnter={(e) => {
+      onPointerDown={onPointerDown}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerCancel}
+      onContextMenu={(e) => e.preventDefault()}
+      onPointerEnter={(e) => {
         if (disabled) return
         e.currentTarget.style.background = bgHover || (color + '15')
         e.currentTarget.style.borderColor = color
       }}
-      onTouchStart={start}
-      onTouchEnd={stop}
-      onTouchCancel={stop}
+      onPointerLeave={(e) => {
+        e.currentTarget.style.background = bg
+        e.currentTarget.style.borderColor = borderColor
+        // With setPointerCapture in place, pointerleave does NOT end
+        // the hold — the pointer still targets this button. Only real
+        // pointerup / pointercancel can end it.
+      }}
       style={{
         width, height, padding: 0,
         background: bg,
@@ -228,6 +294,7 @@ export function HoldButton({
         alignItems: 'center', justifyContent: 'center', gap: 4,
         transition: 'background 100ms, border-color 100ms',
         userSelect: 'none', touchAction: 'none',
+        WebkitTapHighlightColor: 'transparent',
         opacity: disabled ? 0.4 : 1,
       }}
     >

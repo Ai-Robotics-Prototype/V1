@@ -7,6 +7,7 @@ import EStopOverlay from './components/EStopOverlay'
 import AlarmRecoveryModal from './components/AlarmRecoveryModal'
 import ObstacleEscapeModal from './components/ObstacleEscapeModal'
 import ViewportDebug from './components/ViewportDebug'
+import JogDebugPanel from './components/JogDebugPanel'
 import MonitorDashboard from './pages/MonitorDashboard'
 import ProgramLayout from './layouts/ProgramLayout'
 import View3DLayout from './layouts/View3DLayout'
@@ -175,6 +176,7 @@ export default function App() {
         <AlarmRecoveryModal />
         <ObstacleEscapeModal />
         <ViewportDebug />
+        <JogDebugPanel />
       </div>
     </ErrorBoundary>
   )

@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
+import { pushWsGap as _pushWsGap } from '../lib/jogTelemetry'
 
 const HOST = typeof window !== 'undefined' ? window.location.host : 'localhost:8080'
 const WS_PROTO =
@@ -247,6 +248,18 @@ const storeDefinition = (set, get) => ({
         const msg = JSON.parse(ev.data)
         const now = Date.now()
         const latency = msg.t ? Math.round(now - msg.t) : 0
+        // Jog telemetry — record inter-message gap on the state
+        // channel so the tablet-vs-laptop RTT breakdown has real
+        // numbers to look at. pushWsGap is a no-op when telemetry
+        // is off, so this stays free of cost in prod.
+        if (typeof performance !== 'undefined') {
+          const nowP = performance.now()
+          const prev = get()._lastWsMsgTs
+          if (prev) {
+            try { _pushWsGap(nowP - prev) } catch { /* nop */ }
+          }
+          get()._lastWsMsgTs = nowP
+        }
         // ACK-gated state protocol (2026-07-16). Server sends the next
         // frame only after we ack this one, which bounds in-flight to
         // one frame and prevents the OS TCP send buffer from
