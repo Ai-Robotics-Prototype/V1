@@ -632,6 +632,7 @@ class EstunCodroidDriver(Node):
         # the dashboard banner for the "ENABLING…" transition state).
         self._state_code = -1
         self._state_name = ''
+        self._robot_mode_code = -1   # 0 AUTO, 1 MANUAL, -1 unknown (yet)
         self._enabled    = False
         self._enabling   = False
         self._is_estop   = False
@@ -2687,6 +2688,7 @@ class EstunCodroidDriver(Node):
             'enabling':       self._enabling,
             'state_code':     self._state_code,
             'state_name':     self._state_name,
+            'robot_mode_code': self._robot_mode_code,  # 0 AUTO / 1 MANUAL / -1 unknown
             'alarm':          self._alarm_active is not None,
             'alarm_count':    len(self._alarms),
             'active_alarm':   self._alarm_active,
@@ -2929,13 +2931,39 @@ class EstunCodroidDriver(Node):
         m = String(); m.data = json.dumps(out, separators=(',', ':'))
         self._pub_io.publish(m)
 
+    # Two-path DO/DI write dispatcher.
+    #
+    #   DI  → IOManager/SetIOForcedFlag {port, value, type:"DI"}
+    #         WIRE-PROVEN — the factory UI's DI-force capture (2026-07-21
+    #         estun_lua_io_v2_20260721.har). value:1 forces HIGH,
+    #         value:0 releases. GetIOInfo.forced round-trip confirmed.
+    #
+    #   DO  → NOT force-flag. Live capture 2026-07-22:
+    #             TX: {"ty":"IOManager/SetIOForcedFlag","db":{"port":1,"value":1,"type":"DO"}, ...}
+    #             RX: {"id":"...","ty":"IOManager/SetIOForcedFlag","db":null}
+    #         Silent success-shape ACK with NO physical effect —
+    #         subsequent GetIOValue / GetIOInfo report value=0 forced=0.
+    #         Matches the operator's observation that the factory UI
+    #         itself has NO DO force toggle (DI only): this firmware
+    #         doesn't force outputs via SetIOForcedFlag.
+    #         Path we take instead: build a one-line Lua source
+    #             setDO(<port>, <val>)
+    #         upload it as a dedicated `ioconsole` project (idempotent
+    #         reuse of the same project id), switch to AUTO if we
+    #         aren't already, project/run it. setDO is the wire-proven
+    #         Lua verb from luaenginelib.json — the Estun-supported way
+    #         to change a DO. ~200-400 ms latency per toggle, dominated
+    #         by 4 HTTP save posts + toAuto + project/run round-trips.
+
+    _IOCONSOLE_ID   = 'ioconsole'
+    _IOCONSOLE_TASK = 'main'
+
     def _on_io_set(self, msg):
         """Handle a /robot/io_set write. Body:
             {"port": <int>, "value": 0|1, "type": "DO"|"DI"}
-        Emits IOManager/SetIOForcedFlag on the wire. Gate:
-          monitor_only=false AND allow_io=true AND SM state == READY.
-        Value=1 asserts the force; value=0 releases. Only DO and DI
-        are exposed — AI/AO force is not a captured use case."""
+        Gate: monitor_only=false AND allow_io=true AND SM==READY.
+        DI writes go to SetIOForcedFlag; DO writes go through the
+        Lua-runtime `setDO(port, val)` path (see class docstring)."""
         family = 'io'
         if self._monitor_only:
             self._reject(family, 'monitor_only active',
@@ -2969,9 +2997,16 @@ class EstunCodroidDriver(Node):
             self._reject(family, f'invalid port {port!r}')
             return
         val_int = 1 if val else 0
+        if typ == 'DI':
+            self._do_di_force(port, val_int, family)
+        else:
+            self._do_do_write_lua(port, val_int, family)
+
+    def _do_di_force(self, port, val_int, family):
+        """DI force via wire-proven IOManager/SetIOForcedFlag."""
         frame = {
             'ty': 'IOManager/SetIOForcedFlag',
-            'db': {'port': port, 'value': val_int, 'type': typ},
+            'db': {'port': port, 'value': val_int, 'type': 'DI'},
             'id': self._new_nonce(),
         }
         try:
@@ -2982,18 +3017,146 @@ class EstunCodroidDriver(Node):
         if not ok:
             self._reject(family, 'send returned False')
             return
-        # Optimistically stash so the outgoing snapshot updates fast;
-        # GetIOValue response is the authoritative ACK a beat later.
-        slot = self._io_snapshot[typ].setdefault(port, {})
+        slot = self._io_snapshot['DI'].setdefault(port, {})
         slot['forced'] = val_int
-        if typ == 'DO' and val_int == 1:
-            slot['value'] = 1
-        elif typ == 'DO' and val_int == 0:
-            # Release — real value will come from GetIOValue.
-            pass
         self.get_logger().info(
-            f'IOManager/SetIOForcedFlag sent: type={typ} port={port} value={val_int}')
+            f'IOManager/SetIOForcedFlag sent: type=DI port={port} value={val_int}')
         self._publish_io_snapshot()
+
+    def _do_do_write_lua(self, port, val_int, family):
+        """DO write via the wire-proven Lua path.
+        Uploads a dedicated `ioconsole` project containing exactly
+        `setDO(<port>, <val>)`, then Robot/toAuto + project/run.
+        Runs on a background thread — the ROS executor callback
+        returns fast so no jog / status frames pile up behind it.
+        The next GetIOValue tick is the authoritative ACK."""
+        # Refuse if there's a REAL project currently running — we'd
+        # hijack its execution otherwise.
+        if self._prog_state == 2:
+            proj = self._prog_project_id or 'unknown'
+            if proj and proj != self._IOCONSOLE_ID:
+                self._reject(family,
+                    f'controller is running project {proj!r} — '
+                    f'refuse to hijack for DO write')
+                return
+        # Serialize DO writes so two rapid toggles don't race the
+        # save + toAuto + run sequence on the wire.
+        if getattr(self, '_io_do_write_lock', None) is None:
+            self._io_do_write_lock = threading.Lock()
+        t = threading.Thread(
+            target=self._do_do_write_lua_worker,
+            args=(port, val_int, family),
+            name=f'io-do-{port}-{val_int}',
+            daemon=True,
+        )
+        t.start()
+
+    def _do_do_write_lua_worker(self, port, val_int, family):
+        from estun_driver import program_ops
+        with self._io_do_write_lock:
+            lua = (
+                f'-- roboai I/O console — driver-owned single-op DO write\n'
+                f'setDO({port}, {val_int})\n'
+                f'-- Lua version 5.3\n'
+            )
+            try:
+                steps = program_ops.save_project(
+                    self._robot_ip, self._ui_origin_port,
+                    project_id=self._IOCONSOLE_ID,
+                    task_id=self._IOCONSOLE_TASK,
+                    project_display='I/O Console',
+                    task_display='main',
+                    lua_source=lua,
+                    varspoint={},
+                    timeout_s=3.0,
+                )
+            except Exception as e:
+                self._reject(family, f'ioconsole save raised: {e}')
+                return
+            bad = [s for s in steps if s.get('http_status') != 200]
+            if bad:
+                self._reject(family,
+                    f'ioconsole save failed: {bad[0].get("step")} '
+                    f'HTTP {bad[0].get("http_status")}')
+                return
+            # Snapshot the alarm state so we can detect a NEW alarm
+            # raised by the run below (10014 is the common one — see
+            # the hardware-mode-key constraint documented in the
+            # class docstring).
+            pre_alarm = self._alarm_active
+            # Best-effort project/stop — clears any prior ioconsole
+            # run that got wedged (alarm 10000 "A project is already
+            # running." on the next attempt). Safe to send when no
+            # project is active — the controller ACKs and no-ops.
+            self._ws_verb('project/stop')
+            # Best-effort mode switch. Robot/toAuto returns success
+            # even when the physical mode key is in MANUAL — the
+            # actual transition needs the operator's cabinet key at
+            # AUTO. If it stays in MANUAL, project/run below will
+            # raise alarm 10014 "Robot not in automatic mode." which
+            # we catch and surface as a clean rejection.
+            self._ws_verb('Robot/toAuto')
+            time.sleep(0.05)   # give the stop + toAuto acks a beat
+            ok = self._ws_verb('project/run', {
+                'id':   self._IOCONSOLE_ID,
+                'task': self._IOCONSOLE_TASK,
+            })
+            self.get_logger().info(
+                f'ioconsole setDO({port}, {val_int}) run ok={ok}')
+            # Wait briefly for the run to complete OR an alarm to fire.
+            # setDO is essentially instantaneous, but the round-trip
+            # through the interpreter adds ~200-400 ms. Alarm 10014
+            # arrives with the same latency when the mode-key blocks
+            # the run.
+            deadline = time.time() + 1.5
+            hit_alarm = None
+            while time.time() < deadline:
+                time.sleep(0.05)
+                aa = self._alarm_active
+                if aa and aa is not pre_alarm:
+                    hit_alarm = aa
+                    break
+            if hit_alarm:
+                code = hit_alarm.get('code')
+                text = hit_alarm.get('text') or ''
+                # Auto-clear the alarm so the next attempt (with the
+                # mode key flipped) starts clean; otherwise the
+                # controller re-floods this alarm at ~3 Hz.
+                try:
+                    self._send({'ty': 'System/ClearError',
+                                'id': self._new_nonce()})
+                except Exception:
+                    pass
+                if int(code) == 10014:
+                    self._reject(family,
+                        'DO write blocked: controller reports "Robot not '
+                        'in automatic mode." The cabinet mode-selector '
+                        'key must be at AUTO for the Lua-runtime setDO() '
+                        'path to run. Flip the key to AUTO and retry — '
+                        'no software override exists on this firmware.')
+                elif int(code) == 10000:
+                    # Prior run wedged — the pre-run project/stop we
+                    # already send should prevent this, but leave a
+                    # readable rejection in case the operator sees it.
+                    self._reject(family,
+                        f'DO write blocked: alarm 10000 "A project is '
+                        f'already running." Retry — the driver clears '
+                        f'this before the next attempt.')
+                else:
+                    self._reject(family,
+                        f'DO write raised alarm {code}: {text}')
+                return
+            # Force a GetIOValue tick soon so the ack lands quickly in
+            # the merged snapshot (default poll is 0.5s; this narrows
+            # the toggle-pending window).
+            self._io_last_info_ts = 0.0
+            try:
+                self._send({'ty': 'IOManager/GetIOValue',
+                            'db': [{'type': 'DO', 'port': port}],
+                            'id': self._new_nonce()})
+            except Exception:
+                pass
+            self._publish_io_snapshot()
 
     def _disconnect(self):
         # Best-effort stopJog on the still-open socket before we drop it —
@@ -3371,6 +3534,16 @@ class EstunCodroidDriver(Node):
             self._conn_sm.note_probe_response()
         self._state_code = state_int
         self._state_name = str(db.get('stateName', ''))
+        # RobotStatus.mode: 0 = AUTO, 1 = MANUAL/TEACH. Governed by the
+        # cabinet's physical mode-selector key — no software override.
+        # DO writes via the Lua-runtime setDO() path require mode == 0;
+        # the UI reads this to grey out DO toggles when the key is in
+        # MANUAL rather than letting the operator toggle into a
+        # guaranteed-refusal round-trip.
+        try:
+            self._robot_mode_code = int(db.get('mode')) if db.get('mode') is not None else -1
+        except Exception:
+            self._robot_mode_code = -1
         was_enabled = self._enabled
         # Both state 2 ("Enabled") and state 3 (sub-state, still enabled)
         # are treated as enabled. state 1 is "Enabling" — the transient
@@ -3464,6 +3637,7 @@ class EstunCodroidDriver(Node):
             'status_flag':   self._state_code,
             'state_code':    self._state_code,
             'state_name':    self._state_name,
+            'robot_mode_code': self._robot_mode_code,  # 0 AUTO / 1 MANUAL / -1 unknown
             'estop':         self._is_estop,
             'moving':        self._is_moving,
             'enabled':       self._enabled,

@@ -1274,6 +1274,14 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             r["alarm"]       = bool(d.get("alarm", False))
             r["alarm_count"] = int(d.get("alarm_count", 0))
             r["state_code"]  = int(d.get("state_code", 0))
+            # Cabinet mode-selector key state (0=AUTO, 1=MANUAL, -1=unknown).
+            # DO writes go through project/run → require AUTO. UI reads
+            # this to grey out DO toggles when the key blocks the write
+            # instead of round-tripping through a guaranteed alarm.
+            try:
+                r["robot_mode_code"] = int(d.get("robot_mode_code", -1))
+            except (TypeError, ValueError):
+                r["robot_mode_code"] = -1
             r["state_name"]  = d.get("state_name", "")
             # Structured active alarm (or None) + latest stop reason.
             # Passed through untouched — the dashboard banner formats
@@ -6242,11 +6250,15 @@ if FASTAPI_AVAILABLE:
     async def api_io_live():
         with _state_lock:
             live = STATE.get('io_live')
+            robot = STATE.get('robot') or {}
         if not live:
             return {"ok": False,
                     "reason": "driver has not published /estun/io yet",
-                    "allow_io": False}
-        return {"ok": True, **live}
+                    "allow_io": False,
+                    "robot_mode_code": robot.get('robot_mode_code', -1)}
+        return {"ok": True,
+                "robot_mode_code": robot.get('robot_mode_code', -1),
+                **live}
 
     # Manual DO / DI-force write. Body: {port: int, value: 0|1, type: "DO"|"DI"}.
     # This publishes onto /robot/io_set; the driver enforces the

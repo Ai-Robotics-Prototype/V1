@@ -6,12 +6,21 @@ import { useState, useEffect, useRef, useCallback, createContext, useContext } f
 // (not just the top-level component) can render authentic HIGH/LOW
 // values and toggle DO/DI-force through the same shared plumbing.
 const IOLiveContext = createContext({
-  live:        null,       // last /api/io/live payload or null
-  allowIo:     false,      // driver gate — false → toggles disabled
-  bridgeUp:    false,      // /api/io/live returned ok:true recently
-  expertMode:  false,      // Expert: force inputs toggle
-  writePort:   () => Promise.resolve({ ok: false }),
-  bumpConfirm: () => false, // returns true if first-toggle confirm still needed
+  live:           null,    // last /api/io/live payload or null
+  allowIo:        false,   // driver gate — false → toggles disabled
+  bridgeUp:       false,   // /api/io/live returned ok:true recently
+  expertMode:     false,   // Expert: force inputs toggle
+  // Cabinet mode-selector key state, from RobotStatus.mode:
+  //   0 = AUTO, 1 = MANUAL/TEACH, -1 = unknown
+  // DO writes go through the Lua-runtime path (setDO() inside a
+  // project/run) so they REQUIRE the physical key at AUTO. When the
+  // key is at MANUAL, the controller raises alarm 10014 ("Robot not
+  // in automatic mode.") and the write drops on the floor. Reading
+  // this value here lets the UI grey out DO toggles before the
+  // guaranteed-refusal round-trip.
+  robotModeCode:  -1,
+  writePort:      () => Promise.resolve({ ok: false }),
+  bumpConfirm:    () => false,
 })
 
 function useIOLive() { return useContext(IOLiveContext) }
@@ -997,6 +1006,15 @@ function ChannelRow({ id, kind, meta, row, onEdit, editable }) {
   const showToggle =
        kind === 'DO'
     || (kind === 'DI' && expertMode)
+  // DO writes flow through the Lua-runtime path (setDO() inside a
+  // project/run — see driver's _do_do_write_lua). If the controller's
+  // physical mode-selector key blocks the run, alarm 10014 fires and
+  // the driver publishes a clean rejection on /estun/rejected with
+  // the operator instruction. The earlier heuristic that gated on
+  // RobotStatus.mode == 0 (AUTO) was a FALSE POSITIVE — live captures
+  // show setDO() running successfully even when RobotStatus.mode == 1,
+  // so we let the write proceed and rely on the alarm-catch fallback.
+  // DI-force always works regardless of mode.
   const toggleDisabled = !allowIo || !bridgeUp
   const toggleDisabledReason = !bridgeUp
     ? 'Driver I/O bridge has not reported /estun/io yet — reconnect the driver.'
@@ -1439,6 +1457,7 @@ export default function IOPortMap() {
   const [live, setLive]         = useState(null)
   const [allowIo, setAllowIo]   = useState(false)
   const [bridgeUp, setBridgeUp] = useState(false)
+  const [robotModeCode, setRobotModeCode] = useState(-1)
   const [expertMode, setExpertMode] = useState(false)
   // One-time confirm latch — first DO toggle after page load prompts;
   // subsequent toggles are direct. bumpConfirm() returns true IF the
@@ -1474,8 +1493,13 @@ export default function IOPortMap() {
           setLive(d)
           setAllowIo(!!d.allow_io)
           setBridgeUp(true)
+          setRobotModeCode(
+            Number.isFinite(d.robot_mode_code) ? d.robot_mode_code : -1)
         } else {
           setBridgeUp(false)
+          if (d && Number.isFinite(d.robot_mode_code)) {
+            setRobotModeCode(d.robot_mode_code)
+          }
         }
       } catch {
         if (!cancelled) setBridgeUp(false)
@@ -1633,6 +1657,7 @@ export default function IOPortMap() {
   return (
     <IOLiveContext.Provider value={{
       live, allowIo, bridgeUp, expertMode, writePort, bumpConfirm,
+      robotModeCode,
     }}>
     <style>{`@keyframes io-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
     <div style={{
