@@ -3072,10 +3072,46 @@ if FASTAPI_AVAILABLE:
         # IS active, we trust the loaded config.
         if not _service_active('roboai-collision-monitor'):
             missing.append('lidar zones')
+        # Safety-row detail always includes the operator speed cap so
+        # the operator has one place to see the ceiling that governs
+        # every AUTO/program write. Doesn't gate the level — the cap
+        # being high isn't itself a safety fault; the row goes amber
+        # only for missing config.
+        op_cap_pct = robot.get('operator_speed_limit_pct')
+        if op_cap_pct is None:
+            op_frac = robot.get('operator_speed_limit')
+            if op_frac is not None:
+                try:
+                    op_cap_pct = int(round(float(op_frac) * 100))
+                except (TypeError, ValueError):
+                    op_cap_pct = None
+        jog_eff_pct = robot.get('effective_speed_cap_pct')
+        if jog_eff_pct is None:
+            eff = robot.get('effective_speed_cap')
+            if eff is not None:
+                try:
+                    jog_eff_pct = int(round(float(eff) * 100))
+                except (TypeError, ValueError):
+                    jog_eff_pct = None
+        hs_thresh = robot.get('high_speed_confirm_threshold_pct')
+        cap_detail_bits = []
+        if op_cap_pct is not None:
+            cap_detail_bits.append(f'operator cap {op_cap_pct}% (AUTO/program ceiling)')
+        if jog_eff_pct is not None:
+            cap_detail_bits.append(f'jog effective {jog_eff_pct}%')
+        if hs_thresh is not None:
+            cap_detail_bits.append(f'mid-run high-speed confirm above {hs_thresh}%')
+        cap_detail = ' · '.join(cap_detail_bits) if cap_detail_bits else None
+
         if missing:
-            return {'level': 'amber', 'state': 'Check config',
-                    'detail': 'Missing: ' + ', '.join(missing)}
-        return {'level': 'green', 'state': 'Loaded', 'detail': None}
+            detail = 'Missing: ' + ', '.join(missing)
+            if cap_detail:
+                detail += '. ' + cap_detail
+            return {'level': 'amber', 'state': 'Check config', 'detail': detail}
+        return {'level': 'green',
+                'state': (f'Loaded · cap {op_cap_pct}%'
+                          if op_cap_pct is not None else 'Loaded'),
+                'detail': cap_detail}
 
     @app.get("/api/systemcheck")
     async def api_systemcheck():
@@ -4605,7 +4641,11 @@ if FASTAPI_AVAILABLE:
                 task_name="main",
                 points=points, lua_source=lua)
             _ros_node._estun_publish_op("to_auto")
-            _ros_node._estun_publish_op("set_auto_rate", pct=int(eff_pct))
+            # at_run_start bypasses the driver's mid-run high-speed
+            # confirm requirement — the Run modal already ran the
+            # operator through its own confirm before this op fired.
+            _ros_node._estun_publish_op(
+                "set_auto_rate", pct=int(eff_pct), at_run_start=True)
             _ros_node._estun_publish_op(
                 "set_breakpoint", task_id=task_id, lines=[])
             _ros_node._estun_publish_op("clear_start_line")
@@ -4680,6 +4720,59 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({"error": "ros not available"}, status_code=503)
         _ros_node._estun_publish_op("clear_error")
         return {"ok": True}
+
+    # Mid-run auto-mode speed change. The driver clamps against
+    # operator_speed_limit (single-source policy cap in
+    # config/estun.yaml) and rejects an INCREASE above
+    # high_speed_confirm_threshold_pct without confirmed_high_speed=true.
+    # This endpoint mirrors the driver's own contract so the UI can
+    # decide up-front whether it needs to show the strong confirm.
+    # Body: {pct:int 1..100, confirmed_high_speed?:bool}
+    @app.post("/api/estun/program/speed")
+    async def api_estun_program_speed(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            pct = int(body.get("pct"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "pct required (integer 1..100)"},
+                                status_code=400)
+        pct = max(1, min(100, pct))
+        confirmed = bool(body.get("confirmed_high_speed", False))
+        with _state_lock:
+            r = STATE.get("robot", {})
+            op_frac = float(r.get("operator_speed_limit", 0.25))
+            threshold_pct = int(r.get("high_speed_confirm_threshold_pct", 40))
+        operator_cap_pct = max(1, min(100, int(round(op_frac * 100))))
+        eff_pct = max(1, min(operator_cap_pct, pct))
+        capped = pct > operator_cap_pct
+        needs_confirm = (eff_pct > threshold_pct) and not confirmed
+        if needs_confirm:
+            return JSONResponse({
+                "ok": False,
+                "needs_confirm": True,
+                "reason": (f"Mid-run speed {eff_pct}% exceeds high-speed "
+                           f"threshold {threshold_pct}%. Re-submit with "
+                           f"confirmed_high_speed:true."),
+                "effective_pct":     eff_pct,
+                "operator_cap_pct":  operator_cap_pct,
+                "threshold_pct":     threshold_pct,
+                "capped":            capped,
+            }, status_code=409)
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        _ros_node._estun_publish_op(
+            "set_auto_rate", pct=int(eff_pct),
+            confirmed_high_speed=bool(confirmed))
+        return {
+            "ok": True,
+            "effective_pct":     eff_pct,
+            "operator_cap_pct":  operator_cap_pct,
+            "threshold_pct":     threshold_pct,
+            "capped":            capped,
+        }
 
     @app.post("/api/program/run")
     async def api_program_run(request: Request):

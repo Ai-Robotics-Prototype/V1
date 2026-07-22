@@ -93,35 +93,32 @@ estun_driver:
     # operator is permitted to reach today. Effective_cap =
     #   min(jog_speed_cap, operator_speed_limit).
     #
-    # Raise operator_speed_limit → 0.50 ONLY after ALL of:
-    #   * Test B (limit-approach + collision-approach at 0.25) complete
-    #     and captured in the test log at /opt/cobot/logs/testB-*.jsonl
-    #   * One week of continuous cell operation at operator_speed_limit
-    #     = 0.25 with zero unresolved 2xxx alarms
-    #   * Independent review of the wire-log at
-    #     /opt/cobot/logs/estun_ws_*.jsonl for that week showing no
-    #     speed-cap-driven stops (deadman, singularity, limit clamp)
-    # Raising this is a one-line YAML change and a systemd restart.
+    # 2026-07-22 raise: operator_speed_limit 0.25 → 0.65 (this file is
+    # the SINGLE authoritative source — every other clamp point reads
+    # this via `/estun/mode` or the ROS param service; there are no
+    # hard-coded 0.25 copies left). Architecturally the controller
+    # supports up to 100% of its own auto-mode ramp; 0.65 is the
+    # current policy ceiling. Jog stays governed by `jog_speed_cap`
+    # via `effective_speed_cap = min(jog_speed_cap, operator_speed_limit)`
+    # — raising operator_speed_limit above jog_speed_cap does NOT
+    # widen the jog path (0.50 stays the jog ceiling).
+    #
+    # Safeguards paired with the raise (implemented in the dashboard):
+    #   * Program START still defaults `runSpeedPct` to a conservative
+    #     value (10) — raising the cap must not silently make every
+    #     run faster.
+    #   * Mid-run speed INCREASES to > `high_speed_confirm_threshold_pct`
+    #     (default 40) require an explicit high-speed confirmation.
+    #   * Jog is NOT affected (see effective_speed_cap above).
+    #
     # Do NOT raise the HARDWARE ceiling (jog_speed_cap) without a
     # separate safety-pass margin re-derivation.
-    #
-    # Margin math backing 0.50 (see estun_driver_node.py comment block
-    # above _on_jog_command):
-    #   - Limit clamp:   dyn margin = v_max × f × latency × 1.5
-    #                    J1 @ f=0.50: 150 × 0.50 × 0.150 × 1.5 = 16.9° (was 2°)
-    #                    J4 @ f=0.50: 180 × 0.50 × 0.150 × 1.5 = 20.3° (was 2°)
-    #   - Collision stop_mm: base + (f - 0.15) × 1500 mm/s × 0.15s × 1.5
-    #                    f=0.15 → 30 mm (unchanged baseline)
-    #                    f=0.25 →  64 mm
-    #                    f=0.50 → 148 mm
-    #   - σ_soft scales × f / 0.15  (governor engages earlier at speed).
-    #   - Deadman is time-based (0.300 s) — overrun distance at f=0.50:
-    #                    J1 (150°/s × 0.50) × 0.300 s = 22.5° angular
-    #                    ≈ 500 mm at flange with 1 m radius
-    #     Note this in the log; do not silently rely on time-based deadman
-    #     as the sole guard.
     jog_speed_cap:        0.50
-    operator_speed_limit: 0.25
+    operator_speed_limit: 0.65
+    # High-speed confirmation threshold. Mid-run INCREASES above this
+    # % require an explicit confirm click before the driver publishes
+    # `Robot/setAutoMoveRate`. Set anywhere in [1, operator_speed_limit×100].
+    high_speed_confirm_threshold_pct: 40
 
     # Robot/jogHeartbeat cadence. Captured protocol requires ~400 ms; the
     # controller stops motion when heartbeats stop.

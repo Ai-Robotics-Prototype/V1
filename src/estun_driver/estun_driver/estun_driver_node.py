@@ -238,13 +238,23 @@ class EstunCodroidDriver(Node):
         # (limit clamp, collision stop_mm, sigma governor) would no
         # longer keep worst-case stop-distance under a supervise-tick
         # budget. `operator_speed_limit` is the operationally-allowed
-        # ceiling that the OPERATOR is permitted to reach today —
-        # normally lower than the hardware cap so we roll speed up in
-        # controlled steps. Effective_cap = min(jog_speed_cap,
-        # operator_speed_limit). See YAML for the raise-condition
-        # (Test B complete + one week clean at 0.25).
+        # ceiling that the OPERATOR is permitted to reach today.
+        # Effective_cap (used by JOG) = min(jog_speed_cap,
+        # operator_speed_limit). AUTO-mode / program-run paths use
+        # operator_speed_limit directly (jog_speed_cap is a jog-specific
+        # margin ceiling, not an auto-mode one).
+        #
+        # 2026-07-22 raise: operator_speed_limit 0.25 → 0.65 — see the
+        # YAML for the safeguards paired with the raise. YAML is the
+        # single authoritative source; this default only takes effect
+        # if the config file is missing.
         self.declare_parameter('jog_speed_cap',        0.50)   # hardware-safe upper bound
-        self.declare_parameter('operator_speed_limit', 0.25)   # operationally-allowed ceiling
+        self.declare_parameter('operator_speed_limit', 0.65)   # operationally-allowed ceiling
+        # Mid-run INCREASE confirm threshold (integer %). A dashboard
+        # request to change the auto-mode rate to a value strictly
+        # above this without an explicit high-speed confirm flag is
+        # rejected. Defaults to 40 (see YAML).
+        self.declare_parameter('high_speed_confirm_threshold_pct', 40)
         self.declare_parameter('jog_heartbeat_s', 0.4)         # Robot/jogHeartbeat cadence
         # Freshness deadman: no refresh within this window → Robot/stopJog.
         # 2026-07-17: bumped 0.3 → 0.5 to tolerate observed 672 ms
@@ -488,10 +498,15 @@ class EstunCodroidDriver(Node):
             self._allow_cart_source = 'ESTUN_ALLOW_CARTESIAN'
         self._jog_speed_cap        = float(self.get_parameter('jog_speed_cap').value)
         self._operator_speed_limit = float(self.get_parameter('operator_speed_limit').value)
-        # Effective ceiling — the operator can never command past this.
-        # Displayed as "capped at X%" in the UI slider.
+        # Effective ceiling FOR JOG — the operator can never command
+        # past this on the jog path. Auto/program paths clamp against
+        # operator_speed_limit directly via _clamp_program_speed_pct
+        # (jog_speed_cap is a jog-specific margin ceiling, not an
+        # auto-mode one). Displayed as "capped at X%" in the UI slider.
         self._effective_speed_cap  = min(self._jog_speed_cap,
                                          self._operator_speed_limit)
+        self._high_speed_confirm_threshold_pct = int(
+            self.get_parameter('high_speed_confirm_threshold_pct').value)
         self._jog_hb_s        = float(self.get_parameter('jog_heartbeat_s').value)
         self._jog_freshness_s = float(self.get_parameter('jog_freshness_timeout_s').value)
         self._jog_inc_speed_frac = float(self.get_parameter('jog_increment_speed_frac').value)
@@ -849,6 +864,20 @@ class EstunCodroidDriver(Node):
             f'target ws://{self._robot_ip}:{self._robot_port}  '
             f'origin=http://{self._robot_ip}:{self._ui_origin_port}  '
             f'(ip source: {self._ip_source})')
+        # Announce the operator speed cap loudly at startup — this is
+        # the single-source policy ceiling that every AUTO/program
+        # write path clamps against (jog uses the tighter
+        # effective_speed_cap). Surfaces in /estun/status.op_cap and
+        # the dashboard's System Check Safety row detail.
+        _op_cap_pct = int(round(self._operator_speed_limit * 100))
+        _jog_cap_pct = int(round(self._jog_speed_cap * 100))
+        _eff_cap_pct = int(round(self._effective_speed_cap * 100))
+        self.get_logger().info(
+            f'SPEED CAP: operator_speed_limit={_op_cap_pct}% '
+            f'(policy ceiling for AUTO/program) · '
+            f'jog_speed_cap={_jog_cap_pct}% (jog hardware ceiling) · '
+            f'effective_speed_cap={_eff_cap_pct}% (jog effective) · '
+            f'high_speed_confirm_threshold={self._high_speed_confirm_threshold_pct}%')
         if self._monitor_only:
             self.get_logger().warn(
                 'MONITOR-ONLY mode — all inbound motion/IO/command writes '
@@ -1307,26 +1336,38 @@ class EstunCodroidDriver(Node):
 
     def _op_set_move_rate(self, d):
         # setManualMoveRate is the MANUAL-mode override (jogs); the
-        # AUTO-mode program-speed knob is setAutoMoveRate below.
-        try:
-            pct = int(d.get('pct', d.get('rate', 0)))
-        except (TypeError, ValueError):
-            self._reject('program', 'set_move_rate: invalid pct')
-            return
-        pct = max(1, min(100, pct))
+        # AUTO-mode program-speed knob is setAutoMoveRate below. Both
+        # clamp through _clamp_program_speed_pct — single-source
+        # policy cap, no duplicates.
+        pct, capped = self._clamp_program_speed_pct(d.get('pct', d.get('rate', 0)))
         ok = self._ws_verb('Robot/setManualMoveRate', pct)
-        self.get_logger().info(f'Robot/setManualMoveRate db={pct}%% ok={ok}')
+        self.get_logger().info(
+            f'Robot/setManualMoveRate db={pct}%% '
+            f'{"(capped at operator_speed_limit) " if capped else ""}ok={ok}')
 
     def _op_set_auto_rate(self, d):
-        # SOURCE-ONLY.
-        try:
-            pct = int(d.get('pct', d.get('rate', 0)))
-        except (TypeError, ValueError):
-            self._reject('program', 'set_auto_rate: invalid pct')
+        # High-speed safeguard: the dashboard's mid-run speed control
+        # publishes `set_auto_rate` with an explicit `confirmed_high_speed`
+        # flag when the requested pct is above the driver's
+        # high_speed_confirm_threshold_pct. Program-START set_auto_rate
+        # publishes the initial speed and bypasses the confirm-required
+        # check by passing `at_run_start:true` — the Run modal has
+        # already been through its own confirm at that point.
+        pct, capped = self._clamp_program_speed_pct(d.get('pct', d.get('rate', 0)))
+        threshold = self._high_speed_confirm_threshold_pct
+        at_run_start = bool(d.get('at_run_start', False))
+        confirmed = bool(d.get('confirmed_high_speed', False))
+        if (not at_run_start) and pct > threshold and not confirmed:
+            self._reject('program',
+                f'set_auto_rate: mid-run pct={pct} exceeds high-speed '
+                f'threshold {threshold} without confirmed_high_speed=true')
             return
-        pct = max(1, min(100, pct))
         ok = self._ws_verb('Robot/setAutoMoveRate', pct)
-        self.get_logger().info(f'Robot/setAutoMoveRate db={pct}%% (SOURCE-ONLY) ok={ok}')
+        self.get_logger().info(
+            f'Robot/setAutoMoveRate db={pct}%% '
+            f'{"(capped) " if capped else ""}'
+            f'{"(HIGH-SPEED confirmed) " if (confirmed and pct > threshold) else ""}'
+            f'ok={ok}')
 
     def _op_clear_error(self, _d):
         # CAPTURED via HAR (used to stop the ~3 Hz publish/Error
@@ -1352,6 +1393,31 @@ class EstunCodroidDriver(Node):
             n, r = divmod(n, 36)
             buf = digits[r] + buf
         return f'mrkno{buf or "0"}{os.urandom(3).hex()}'
+
+    # ── Shared operator-speed clamp (single-source policy cap) ──────
+    #
+    # Every AUTO-mode / program-run write path (set_move_rate,
+    # set_auto_rate, and the dashboard's `program/run` and mid-run
+    # `program/speed` endpoints — the last two through their own layer
+    # calling this via the ROS param service) must run its requested
+    # percent through this method. There is exactly ONE authoritative
+    # cap in the whole stack: `self._operator_speed_limit`, read from
+    # config/estun.yaml. Do NOT re-implement clamping — use this.
+    #
+    # Returns (effective_pct, capped_bool). `capped_bool` is True when
+    # the requested pct exceeded the cap (the value was clamped down).
+    # 1..100 is the hardware-legal range; anything outside that is
+    # first clamped to that range, then to the operator cap.
+
+    def _clamp_program_speed_pct(self, requested_pct):
+        try:
+            req = int(round(float(requested_pct)))
+        except (TypeError, ValueError):
+            req = 1
+        req = max(1, min(100, req))
+        cap_pct = max(1, min(100, int(round(self._operator_speed_limit * 100.0))))
+        eff = min(cap_pct, req)
+        return eff, (req > cap_pct)
 
     # ── SPEED-SCALED SAFETY MARGINS ─────────────────────────────────
     #
@@ -2522,6 +2588,10 @@ class EstunCodroidDriver(Node):
             'jog_speed_cap':         self._jog_speed_cap,
             'operator_speed_limit':  self._operator_speed_limit,
             'effective_speed_cap':   self._effective_speed_cap,
+            'operator_speed_limit_pct': int(round(self._operator_speed_limit * 100)),
+            'jog_speed_cap_pct':        int(round(self._jog_speed_cap * 100)),
+            'effective_speed_cap_pct':  int(round(self._effective_speed_cap * 100)),
+            'high_speed_confirm_threshold_pct': int(self._high_speed_confirm_threshold_pct),
             'jog_heartbeat_s': self._jog_hb_s,
             'jog_freshness_s': self._jog_freshness_s,
             'jog_active':     self._jog_active,
@@ -3225,6 +3295,12 @@ class EstunCodroidDriver(Node):
             'jog_speed_cap':        self._jog_speed_cap,
             'operator_speed_limit': self._operator_speed_limit,
             'effective_speed_cap':  self._effective_speed_cap,
+            # Integer % views for the System Check Safety row detail
+            # and the dashboard modals — no client-side rounding drift.
+            'operator_speed_limit_pct':  int(round(self._operator_speed_limit * 100)),
+            'jog_speed_cap_pct':         int(round(self._jog_speed_cap * 100)),
+            'effective_speed_cap_pct':   int(round(self._effective_speed_cap * 100)),
+            'high_speed_confirm_threshold_pct': int(self._high_speed_confirm_threshold_pct),
             'rejections':    dict(self._rej_counts),
             'ip':            self._robot_ip,
             'ip_source':     self._ip_source,

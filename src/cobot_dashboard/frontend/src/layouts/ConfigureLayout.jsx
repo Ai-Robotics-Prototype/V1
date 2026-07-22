@@ -256,7 +256,11 @@ function StatusDot({ level }) {
 }
 
 function SystemCheckRow({ row, expanded, onToggle, onRestart }) {
-  const canExpand = row.level !== 'green' && (row.detail || row.services)
+  // Green rows normally hide their detail, but Safety carries the
+  // operator speed cap in `detail` even when green — always let the
+  // row expand so the cap is discoverable.
+  const canExpand = (row.detail || row.services) &&
+    (row.level !== 'green' || row.key === 'safety')
   return (
     <div style={{
       background: 'var(--bg-panel)',

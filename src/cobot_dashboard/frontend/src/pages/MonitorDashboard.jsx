@@ -941,16 +941,27 @@ export default function MonitorDashboard() {
           </div>
 
           {/* Speed entry — editable integer % (1-100). Truth-in-UI:
-              driver caps at operator_speed_limit (typically 25%).
-              We show the effective % right next to the box so
-              entering above the cap doesn't silently accept an
-              unhonored value. The box selects WITHIN the cap and
-              follows automatically if operator_speed_limit rises. */}
+              driver caps at operator_speed_limit (policy ceiling
+              raised to 65% on 2026-07-22). We show the effective %
+              right next to the box so entering above the cap doesn't
+              silently accept an unhonored value. */}
           <ProgramSpeedEntry
             value={runSpeedPct}
             setValue={setRunSpeedPct}
             operatorCapFrac={robot?.operator_speed_limit}
           />
+
+          {/* Mid-run speed control — only appears while a program is
+              actively running. Publishes /api/estun/program/speed
+              which clamps via operator_speed_limit and requires an
+              explicit confirm for INCREASES above
+              high_speed_confirm_threshold_pct (default 40). */}
+          {isRunning && (
+            <MidRunSpeedControl
+              robot={robot}
+              addToast={addToast}
+            />
+          )}
 
           {/* Recovery banner — appears when the controller has been
               STOPPING (state=3) for more than 3s. Offers Force stop
@@ -1506,9 +1517,167 @@ function ProgramSpeedEntry({ value, setValue, operatorCapFrac }) {
         fontWeight: 600,
       }}>
         {capped
-          ? `effective ${eff}% (driver cap ${capPct}%)`
-          : `effective ${eff}%`}
+          ? `effective ${eff}% (cap ${capPct}%)`
+          : `effective ${eff}% (cap ${capPct}%)`}
       </span>
+    </div>
+  )
+}
+
+// Mid-run auto-mode speed adjustment. Only rendered while
+// deriveRunState says the program is running; posts to
+// /api/estun/program/speed which returns 409 with
+// {needs_confirm:true} when the requested increase exceeds the
+// driver's high_speed_confirm_threshold_pct. On 409 we show the
+// strong "High speed" confirm modal; on OK the local input updates
+// to the effective (possibly-capped) value.
+function MidRunSpeedControl({ robot, addToast }) {
+  const capFrac = Number.isFinite(robot?.operator_speed_limit) ? robot.operator_speed_limit : 0.25
+  const capPct  = Math.max(1, Math.min(100, Math.round(capFrac * 100)))
+  const threshold = Number.isFinite(robot?.high_speed_confirm_threshold_pct)
+    ? robot.high_speed_confirm_threshold_pct
+    : 40
+  const [input, setInput] = useState(String(Math.min(capPct, 10)))
+  const [busy, setBusy]   = useState(false)
+  const [pending, setPending] = useState(null)   // {pct, threshold} on 409
+
+  async function submit(pct, confirmed) {
+    setBusy(true)
+    try {
+      const res = await fetch('/api/estun/program/speed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pct, confirmed_high_speed: !!confirmed }),
+      })
+      const body = await res.json()
+      if (res.status === 409 && body?.needs_confirm) {
+        setPending({ pct: body.effective_pct, threshold: body.threshold_pct })
+        return
+      }
+      if (!res.ok || !body?.ok) {
+        addToast(`Speed change refused: ${body?.reason || body?.error || res.status}`, 'error')
+        return
+      }
+      const applied = body.effective_pct
+      setInput(String(applied))
+      addToast(
+        body.capped
+          ? `Program speed set to ${applied}% (capped from ${pct}%)`
+          : `Program speed set to ${applied}%`,
+        'info',
+      )
+      setPending(null)
+    } catch (e) {
+      addToast(`Speed change failed: ${e}`, 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function onApply() {
+    const n = Number(input)
+    if (!Number.isFinite(n) || n < 1) {
+      addToast('Speed must be an integer 1..100', 'warning'); return
+    }
+    submit(Math.round(n), false)
+  }
+
+  return (
+    <>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 10,
+        marginTop: 8, padding: '8px 12px',
+        background: '#FFFBEB', border: '1px solid #F59E0B',
+        borderRadius: 8,
+      }}>
+        <span style={{
+          fontSize: 12, color: '#92400E', fontWeight: 700,
+          textTransform: 'uppercase', letterSpacing: '0.05em',
+        }}>
+          Mid-run speed
+        </span>
+        <input
+          type="number" min={1} max={100} step={1}
+          value={input}
+          disabled={busy}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); onApply() } }}
+          style={{
+            width: 72, padding: '6px 10px', fontSize: 15, fontWeight: 600,
+            border: '1px solid #d1d5db', borderRadius: 8, textAlign: 'right',
+          }}
+        />
+        <span style={{ fontSize: 13, color: '#92400E' }}>%</span>
+        <button
+          onClick={onApply}
+          disabled={busy}
+          style={{
+            padding: '6px 14px', fontSize: 14, fontWeight: 600,
+            background: busy ? '#9CA3AF' : '#B45309', color: '#fff',
+            border: 'none', borderRadius: 6, cursor: busy ? 'wait' : 'pointer',
+          }}>
+          Apply
+        </button>
+        <span style={{ marginLeft: 'auto', fontSize: 13, color: '#92400E' }}>
+          cap {capPct}% · high-speed confirm above {threshold}%
+        </span>
+      </div>
+
+      {pending && (
+        <HighSpeedConfirmModal
+          pct={pending.pct}
+          threshold={pending.threshold}
+          cap={capPct}
+          onCancel={() => setPending(null)}
+          onConfirm={() => submit(pending.pct, true)}
+        />
+      )}
+    </>
+  )
+}
+
+function HighSpeedConfirmModal({ pct, threshold, cap, onCancel, onConfirm }) {
+  const backdrop = {
+    position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)',
+    zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center',
+  }
+  const panel = {
+    background: '#fff', borderRadius: 12, padding: 24,
+    minWidth: 440, maxWidth: 520,
+    boxShadow: '0 20px 40px rgba(0,0,0,0.3)',
+    borderTop: '4px solid #DC2626',
+  }
+  return (
+    <div style={backdrop} onClick={onCancel}>
+      <div style={panel} onClick={(e) => e.stopPropagation()}>
+        <div style={{ fontSize: 20, fontWeight: 800, color: '#7F1D1D', marginBottom: 10 }}>
+          High speed: increase to {pct}%?
+        </div>
+        <div style={{ fontSize: 14, color: '#374151', marginBottom: 12 }}>
+          You are increasing the program's auto-mode speed above the
+          high-speed threshold ({threshold}%). Ensure the cell is
+          clear before confirming.
+        </div>
+        <div style={{
+          padding: 10, background: '#FEE2E2',
+          border: '1px solid #DC2626', borderRadius: 6,
+          fontSize: 13, color: '#7F1D1D', marginBottom: 16,
+        }}>
+          New effective speed: <b>{pct}%</b> &nbsp;·&nbsp; policy cap: {cap}%
+        </div>
+        <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
+          <button onClick={onCancel} style={{
+            padding: '10px 18px', fontSize: 15, fontWeight: 600,
+            background: '#fff', color: '#374151',
+            border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
+          }}>Cancel</button>
+          <button onClick={onConfirm} style={{
+            padding: '10px 18px', fontSize: 15, fontWeight: 700,
+            background: '#DC2626', color: '#fff',
+            border: 'none', borderRadius: 8, cursor: 'pointer',
+          }}>Confirm — Run at {pct}%</button>
+        </div>
+      </div>
     </div>
   )
 }
