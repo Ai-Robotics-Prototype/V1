@@ -4,6 +4,7 @@ import { OrbitControls } from '@react-three/drei'
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
+import { HoldButton } from './JogControls'
 
 /*
  * Conversational Program Wizard
@@ -158,9 +159,41 @@ function PadCenterTile({ label, width = 64, height = 64 }) {
   )
 }
 
+// Wizard-sized wrapper for the shared HoldButton — same pattern as
+// ProgramEditor.OverlayJogArrow. Migrated from the old onPress
+// setInterval(150ms) pulsing that fired discrete /cmd/jog HTTP POSTs
+// (never `s.jog` — that store action doesn't exist, so joint-mode
+// jog was a silent TypeError). Now uses the same WS transport +
+// hold_id/seq/keepalive the main pendant does.
+function WizardJogArrow({
+  onPressStart, onPressTick, onPressEnd,
+  color, label, rotation, size = 64, svgSize,
+  disabled,
+}) {
+  const sp = svgSize || Math.max(24, Math.floor(size * 0.28))
+  const lp = Math.max(10, Math.floor(size * 0.10))
+  return (
+    <HoldButton
+      jogStyle="CONTINUOUS"
+      onPressStart={onPressStart}
+      onPressTick={onPressTick}
+      onPressEnd={onPressEnd}
+      color={color}
+      width={size} height={size}
+      disabled={disabled}>
+      <svg width={sp} height={sp} viewBox="0 0 24 24"
+           style={{ transform: `rotate(${rotation}deg)` }}>
+        <path d="M12 4l-8 8h5v8h6v-8h5z" fill={color} />
+      </svg>
+      <span style={{ fontSize: lp, fontWeight: 700, color: '#374151' }}>{label}</span>
+    </HoldButton>
+  )
+}
+
 function TeachWithJog({ title, description, instructions, pointName, answers, setAnswer, onNext, onSkip }) {
-  const jog          = useStore((s) => s.jog)
-  const jogCartesian = useStore((s) => s.jogCartesian)
+  const jogHold          = useStore((s) => s.jogHold)
+  const jogHoldCartesian = useStore((s) => s.jogHoldCartesian)
+  const jogRelease       = useStore((s) => s.jogRelease)
   const homeRobot    = useStore((s) => s.homeRobot)
   const triggerEstop = useStore((s) => s.triggerEstop)
 
@@ -203,17 +236,28 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
     return () => { alive = false; clearInterval(iv) }
   }, [])
 
-  // Use the same store actions the Program-tab jog panel uses —
-  // joint mode posts /cmd/jog (rad delta), cartesian mode posts
-  // /cmd/jog_cartesian. Safety gates already live in the backend.
-  const sendJog = useCallback((axis, direction) => {
+  // Shared WS jog transport — same store actions the main
+  // JogControls pendant and the fullscreen TeachOverlay use. The
+  // old broken pattern posted discrete HTTP /cmd/jog pulses through
+  // `s.jog` (undefined — silent TypeError on joint jog) or
+  // `s.jogCartesian` (worked but every 150 ms pulse looked like a
+  // fresh session to the driver → 300 ms freshness deadman fired
+  // between pulses → jog chatter). jogHold + jogRelease carry
+  // hold_id/seq/abort meta from HoldButton so the driver sees ONE
+  // continuous session and the server-side keepalive covers stalls.
+  const holdStart = useCallback((axis, direction, meta) => {
     if (modeRef.current === 'joint') {
-      const deltaRad = direction * stepRef.current * Math.PI / 180
-      jog(axis - 1, deltaRad)
-    } else {
-      jogCartesian(axis, direction, stepRef.current, speedRef.current)
+      return jogHold(axis, direction, speedRef.current, meta)
     }
-  }, [jog, jogCartesian])
+    return jogHoldCartesian(axis, direction, speedRef.current, meta)
+  }, [jogHold, jogHoldCartesian])
+  const holdEnd = useCallback((meta) => jogRelease(modeRef.current, meta),
+    [jogRelease])
+  const wire = useCallback((axis, direction) => ({
+    onPressStart: (meta) => holdStart(axis, direction, meta),
+    onPressTick:  (meta) => holdStart(axis, direction, meta),
+    onPressEnd:   (meta) => holdEnd(meta),
+  }), [holdStart, holdEnd])
 
   async function recordPosition() {
     try {
@@ -317,20 +361,20 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
                 gridTemplateAreas: '". up ." "left center right" ". down ."',
                 gap: 4,
               }}>
-                <div style={{ gridArea: 'up' }}>    <JogArrow onPress={() => sendJog('y',  1)} rotation={0}   label="Y+" color="#16A34A" /></div>
-                <div style={{ gridArea: 'left' }}>  <JogArrow onPress={() => sendJog('x', -1)} rotation={-90} label="X−" color="#DC2626" /></div>
+                <div style={{ gridArea: 'up' }}>    <WizardJogArrow {...wire('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} /></div>
+                <div style={{ gridArea: 'left' }}>  <WizardJogArrow {...wire('x', -1)} rotation={-90} label="X−" color="#DC2626" size={padBtn} /></div>
                 <div style={{ gridArea: 'center' }}><PadCenterTile label="XY" /></div>
-                <div style={{ gridArea: 'right' }}> <JogArrow onPress={() => sendJog('x',  1)} rotation={90}  label="X+" color="#DC2626" /></div>
-                <div style={{ gridArea: 'down' }}>  <JogArrow onPress={() => sendJog('y', -1)} rotation={180} label="Y−" color="#16A34A" /></div>
+                <div style={{ gridArea: 'right' }}> <WizardJogArrow {...wire('x',  1)} rotation={90}  label="X+" color="#DC2626" size={padBtn} /></div>
+                <div style={{ gridArea: 'down' }}>  <WizardJogArrow {...wire('y', -1)} rotation={180} label="Y−" color="#16A34A" size={padBtn} /></div>
               </div>
             </div>
 
             <div>
               <div style={padLabelStyle}>Height</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: padBtn }}>
-                <JogArrow onPress={() => sendJog('z',  1)} rotation={0}   label="Z+" color="#3B82F6" />
+                <WizardJogArrow {...wire('z',  1)} rotation={0}   label="Z+" color="#3B82F6" size={padBtn} />
                 <PadCenterTile label="Z" height={24} />
-                <JogArrow onPress={() => sendJog('z', -1)} rotation={180} label="Z−" color="#3B82F6" />
+                <WizardJogArrow {...wire('z', -1)} rotation={180} label="Z−" color="#3B82F6" size={padBtn} />
               </div>
             </div>
 
@@ -343,11 +387,11 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
                 gridTemplateAreas: '". rxp ." "rzn center rzp" ". rxn ."',
                 gap: 4,
               }}>
-                <div style={{ gridArea: 'rxp' }}>   <JogArrow onPress={() => sendJog('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" /></div>
-                <div style={{ gridArea: 'rzn' }}>   <JogArrow onPress={() => sendJog('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" /></div>
+                <div style={{ gridArea: 'rxp' }}>   <WizardJogArrow {...wire('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} /></div>
+                <div style={{ gridArea: 'rzn' }}>   <WizardJogArrow {...wire('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" size={padBtn} /></div>
                 <div style={{ gridArea: 'center' }}><PadCenterTile label="Rot" /></div>
-                <div style={{ gridArea: 'rzp' }}>   <JogArrow onPress={() => sendJog('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" /></div>
-                <div style={{ gridArea: 'rxn' }}>   <JogArrow onPress={() => sendJog('rx', -1)} rotation={180} label="Rx−" color="#9333EA" /></div>
+                <div style={{ gridArea: 'rzp' }}>   <WizardJogArrow {...wire('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" size={padBtn} /></div>
+                <div style={{ gridArea: 'rxn' }}>   <WizardJogArrow {...wire('rx', -1)} rotation={180} label="Rx−" color="#9333EA" size={padBtn} /></div>
               </div>
             </div>
           </div>
@@ -355,9 +399,9 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
           <div style={{ display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
             {[1, 2, 3, 4, 5, 6].map((j) => (
               <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
-                <JogArrow onPress={() => sendJog(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={56} />
+                <WizardJogArrow {...wire(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={56} />
                 <PadCenterTile label={'J' + j} width={56} height={24} />
-                <JogArrow onPress={() => sendJog(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={56} />
+                <WizardJogArrow {...wire(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={56} />
               </div>
             ))}
           </div>
@@ -857,8 +901,9 @@ function ProgressDots({ count, currentIdx, statuses }) {
 }
 
 function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSteps, setReusedSteps }) {
-  const jog          = useStore((s) => s.jog)
-  const jogCartesian = useStore((s) => s.jogCartesian)
+  const jogHold          = useStore((s) => s.jogHold)
+  const jogHoldCartesian = useStore((s) => s.jogHoldCartesian)
+  const jogRelease       = useStore((s) => s.jogRelease)
   const homeRobot    = useStore((s) => s.homeRobot)
   const triggerEstop = useStore((s) => s.triggerEstop)
 
@@ -922,14 +967,22 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
     return () => { alive = false; clearInterval(iv) }
   }, [])
 
-  const sendJog = useCallback((axis, direction) => {
+  // Migrated 2026-07-22 from the discrete HTTP-pulse `s.jog` /
+  // `s.jogCartesian` pattern (see TeachWithJog above for the full
+  // rationale). Same HoldButton-driven WS transport TeachOverlay uses.
+  const holdStart = useCallback((axis, direction, meta) => {
     if (modeRef.current === 'joint') {
-      const deltaRad = direction * stepRef.current * Math.PI / 180
-      jog(axis - 1, deltaRad)
-    } else {
-      jogCartesian(axis, direction, stepRef.current, speedRef.current)
+      return jogHold(axis, direction, speedRef.current, meta)
     }
-  }, [jog, jogCartesian])
+    return jogHoldCartesian(axis, direction, speedRef.current, meta)
+  }, [jogHold, jogHoldCartesian])
+  const holdEnd = useCallback((meta) => jogRelease(modeRef.current, meta),
+    [jogRelease])
+  const wire = useCallback((axis, direction) => ({
+    onPressStart: (meta) => holdStart(axis, direction, meta),
+    onPressTick:  (meta) => holdStart(axis, direction, meta),
+    onPressEnd:   (meta) => holdEnd(meta),
+  }), [holdStart, holdEnd])
 
   // Compute per-position status (recorded / reused / skipped / pending)
   // for the progress dots and Review page card. A step marked 'reused'
@@ -1486,18 +1539,18 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
                     gridTemplateAreas: '". up ." "left center right" ". down ."',
                     gap: padGap,
                   }}>
-                    <div style={{ gridArea: 'up' }}>    <JogArrow onPress={() => sendJog('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} /></div>
-                    <div style={{ gridArea: 'left' }}>  <JogArrow onPress={() => sendJog('x', -1)} rotation={-90} label="X−" color="#DC2626" size={padBtn} /></div>
+                    <div style={{ gridArea: 'up' }}>    <WizardJogArrow {...wire('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} /></div>
+                    <div style={{ gridArea: 'left' }}>  <WizardJogArrow {...wire('x', -1)} rotation={-90} label="X−" color="#DC2626" size={padBtn} /></div>
                     <div style={{ gridArea: 'center' }}><PadCenterTile label="XY" width={padBtn} height={padBtn} /></div>
-                    <div style={{ gridArea: 'right' }}> <JogArrow onPress={() => sendJog('x',  1)} rotation={90}  label="X+" color="#DC2626" size={padBtn} /></div>
-                    <div style={{ gridArea: 'down' }}>  <JogArrow onPress={() => sendJog('y', -1)} rotation={180} label="Y−" color="#16A34A" size={padBtn} /></div>
+                    <div style={{ gridArea: 'right' }}> <WizardJogArrow {...wire('x',  1)} rotation={90}  label="X+" color="#DC2626" size={padBtn} /></div>
+                    <div style={{ gridArea: 'down' }}>  <WizardJogArrow {...wire('y', -1)} rotation={180} label="Y−" color="#16A34A" size={padBtn} /></div>
                   </div>
                 </div>
                 <div>
                   <div style={padLabelStyle}>Height</div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: padGap, width: padBtn }}>
-                    <JogArrow onPress={() => sendJog('z',  1)} rotation={0}   label="Z+" color="#3B82F6" size={padBtn} />
-                    <JogArrow onPress={() => sendJog('z', -1)} rotation={180} label="Z−" color="#3B82F6" size={padBtn} />
+                    <WizardJogArrow {...wire('z',  1)} rotation={0}   label="Z+" color="#3B82F6" size={padBtn} />
+                    <WizardJogArrow {...wire('z', -1)} rotation={180} label="Z−" color="#3B82F6" size={padBtn} />
                   </div>
                 </div>
                 <div>
@@ -1509,11 +1562,11 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
                     gridTemplateAreas: '". rxp ." "rzn center rzp" ". rxn ."',
                     gap: padGap,
                   }}>
-                    <div style={{ gridArea: 'rxp' }}>   <JogArrow onPress={() => sendJog('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} /></div>
-                    <div style={{ gridArea: 'rzn' }}>   <JogArrow onPress={() => sendJog('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" size={padBtn} /></div>
+                    <div style={{ gridArea: 'rxp' }}>   <WizardJogArrow {...wire('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} /></div>
+                    <div style={{ gridArea: 'rzn' }}>   <WizardJogArrow {...wire('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" size={padBtn} /></div>
                     <div style={{ gridArea: 'center' }}><PadCenterTile label="Rot" width={padBtn} height={padBtn} /></div>
-                    <div style={{ gridArea: 'rzp' }}>   <JogArrow onPress={() => sendJog('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" size={padBtn} /></div>
-                    <div style={{ gridArea: 'rxn' }}>   <JogArrow onPress={() => sendJog('rx', -1)} rotation={180} label="Rx−" color="#9333EA" size={padBtn} /></div>
+                    <div style={{ gridArea: 'rzp' }}>   <WizardJogArrow {...wire('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" size={padBtn} /></div>
+                    <div style={{ gridArea: 'rxn' }}>   <WizardJogArrow {...wire('rx', -1)} rotation={180} label="Rx−" color="#9333EA" size={padBtn} /></div>
                   </div>
                 </div>
               </div>
@@ -1522,8 +1575,8 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
                 {[1, 2, 3, 4, 5, 6].map((j) => (
                   <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: padGap }}>
                     <div style={{ fontSize: 14, fontWeight: 700, color: '#374151' }}>{'J' + j}</div>
-                    <JogArrow onPress={() => sendJog(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={padBtn} />
-                    <JogArrow onPress={() => sendJog(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={padBtn} />
+                    <WizardJogArrow {...wire(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={padBtn} />
+                    <WizardJogArrow {...wire(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={padBtn} />
                   </div>
                 ))}
               </div>
