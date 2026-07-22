@@ -66,6 +66,96 @@ def _make_jp_point(joints: list[float], nm: str,
     }
 
 
+# Anchor pose resolution for `derived_from` steps. The wizard authors
+# offset moves (descend / lift / retreat) as {derived_from: "<role>",
+# offset_z_mm: N} with NO taught_joints/tcp of their own — the anchor
+# pose is a sibling step that carries position_role == <role> plus real
+# taught data. The runtime executor already resolves this at tick time
+# (program_executor_node._resolve_base_tcp). Codegen needs the same
+# resolution so we can emit a real movL instead of a `-- skipped` line.
+#
+# _build_role_map does the one-time scan; _resolve_derived returns a
+# ('cp'|'jp', [6 vals]) tuple for a derived step, applying the z offset
+# in the base frame (base_tcp is meters → convert to mm for Estun cp).
+def _build_role_map(steps: list[dict]) -> dict[str, dict]:
+    """{role → {taught_joints, taught_tcp}} for steps that both carry a
+    position_role AND real taught data. Later derived children look
+    themselves up here by their `derived_from` string."""
+    out: dict[str, dict] = {}
+    for s in steps:
+        role = s.get('position_role')
+        if not role:
+            continue
+        tj = s.get('taught_joints')
+        tc = s.get('taught_tcp') or s.get('position')
+        entry: dict = {}
+        if isinstance(tj, list) and len(tj) == 6 \
+                and all(isinstance(v, (int, float)) for v in tj):
+            entry['taught_joints'] = [float(v) for v in tj]
+        if isinstance(tc, list) and len(tc) >= 3 \
+                and all(isinstance(v, (int, float)) for v in tc):
+            entry['taught_tcp'] = [float(v) for v in tc]
+        if entry:
+            # Last writer wins if the same role is taught twice —
+            # matches the executor's "walk backward, take first
+            # match" semantics for the LATEST step at codegen time
+            # (there's no runtime step-index here to bound the walk).
+            out[role] = entry
+    return out
+
+
+def _resolve_derived(step: dict, role_map: dict[str, dict]
+                     ) -> tuple[str, list[float]] | None:
+    """Turn a `derived_from` + `offset_z_mm` step into a concrete pose.
+
+    Returns:
+        ('cp', [x_mm, y_mm, z_mm, rx, ry, rz])   preferred — TCP with
+                                                  z offset applied in
+                                                  the base frame
+        ('jp', [j1..j6])                          fallback when the
+                                                  anchor only has
+                                                  taught_joints and
+                                                  the offset is 0
+        None                                       anchor missing OR
+                                                  offset non-zero and
+                                                  no anchor TCP (can't
+                                                  apply cartesian z
+                                                  offset in joint
+                                                  space without IK)
+
+    Anchor lookup is by role string — matches
+    program_executor_node._resolve_base_tcp semantics.
+    """
+    role = step.get('derived_from')
+    if not role:
+        return None
+    anchor = role_map.get(role)
+    if not anchor:
+        return None
+    ofs_mm = float(step.get('offset_z_mm') or 0)
+    tcp = anchor.get('taught_tcp')
+    if tcp is not None:
+        # taught_tcp convention: meters for x/y/z (values < 10),
+        # radians for rx/ry/rz. Estun cp expects mm for translation,
+        # radians for rotation — mirror what program_executor_node
+        # does before send_move('movl').
+        x_m = tcp[0]; y_m = tcp[1]; z_m = tcp[2]
+        rx = tcp[3] if len(tcp) > 3 else 0.0
+        ry = tcp[4] if len(tcp) > 4 else 0.0
+        rz = tcp[5] if len(tcp) > 5 else 0.0
+        x_mm = x_m * 1000.0 if abs(x_m) < 10 else x_m
+        y_mm = y_m * 1000.0 if abs(y_m) < 10 else y_m
+        z_mm = z_m * 1000.0 if abs(z_m) < 10 else z_m
+        z_mm += ofs_mm
+        return 'cp', [x_mm, y_mm, z_mm, rx, ry, rz]
+    tj = anchor.get('taught_joints')
+    if tj is not None and abs(ofs_mm) < 1e-6:
+        # Anchor has only joints and offset is zero — the derived
+        # pose IS the anchor pose, so emit as jp.
+        return 'jp', list(tj)
+    return None
+
+
 def codegen_lua_from_program(
     program: dict,
     *,
@@ -150,10 +240,24 @@ def codegen_lua_from_program(
     # the emitted Lua with an explanatory comment; the operator-side UI
     # continues to flag it as "pending capture" in StepPreviewPanel.
     program_points = program.get('points') or {}
+    # Pre-pass: resolve position_role → taught data so `derived_from`
+    # children (descend / lift / retreat) can compute concrete poses
+    # at codegen time rather than being emitted as `-- skipped`.
+    role_map = _build_role_map(steps)
     exec_lines: list[str] = []
     fallback_idx = 0
     di_read_idx  = 0   # counts wait_input steps → _di1, _di2, ... locals
     used_named: set[str] = set()   # named points that got REFERENCED
+    # Points saved by role for reuse — a derived step with offset_z_mm=0
+    # points at the anchor's already-registered varspoint entry rather
+    # than duplicating the joints under a fresh name.
+    role_point_name: dict[str, str] = {}
+    # Loop step (goto=<line>, count=<n>) → emit `goto ::_prog_start::`.
+    # Prepend the label at file line 1 so `setStartLine 1` still lands
+    # on real executable code. Track whether the label is needed so
+    # non-looping programs stay label-free.
+    needs_start_label = any(str(s.get('action') or '').lower() == 'loop'
+                            for s in steps)
     for step in steps:
         action = step.get('action', '?')
 
@@ -191,27 +295,48 @@ def codegen_lua_from_program(
                 exec_lines.append(f'setAO({port},{v_f:g})  -- step {action} {io_id}={v_f:g}')
             continue
 
-        # ---- Wait / delay — verb DEFINITIVELY ABSENT -----------------
-        # Full audit of luadoc.json (11 keys, all placeholder strings)
-        # and luaenginelib.json (168 keys) turned up NO plain sleep /
-        # wait / delay / pause / tick / timer / clock verb. The only
-        # wait-shaped primitives are waitCondition(cond, timeout),
-        # waitConnectSocketServer(name, timeout), and waitConveyorObj(
-        # id, timeoutd) — and no `ms`, `sec`, `second`, or `millisec`
-        # string appears in any template or example, so the timeout
-        # unit for waitCondition is not documented either.
-        #
-        # Emit a comment so per-step line accounting stays 1:1 with
-        # computeLineMap on the frontend.
+        # ---- Wait / delay — wire-verified `wait(<seconds>)` -----------
+        # The Control category in the editor generates a bare
+        # `wait(<duration>)` node (verified live: a Control→wait step
+        # in the "roboaitest" editor project produced `wait(0)` in the
+        # exported Lua). Argument is seconds — matches the wizard's
+        # `duration_s` field on the step. `wait` is not enumerated in
+        # luaenginelib.json (which only covers the Motion / IO / Logic
+        # categories) but is a valid Control primitive on the
+        # controller. `waitCondition` stays reserved for future
+        # sensor-conditioned dwell steps.
         if action == 'wait':
-            dur = step.get('duration_s')
-            exec_lines.append(f'-- skipped {action!r}: no plain '
-                              f'sleep/wait/delay verb in luaenginelib.json '
-                              f'(168 verbs enumerated); duration_s={dur!r}. '
-                              f'waitCondition(false, N) is the closest '
-                              f'primitive but its timeout unit is '
-                              f'undocumented — unsafe to emit without a '
-                              f'wire-verified example.')
+            try:
+                dur = float(step.get('duration_s') or 0)
+            except (TypeError, ValueError):
+                dur = 0.0
+            # Format short so 0.5 → "0.5" not "0.500000".
+            dur_s = f'{dur:g}'
+            exec_lines.append(f'wait({dur_s})  -- step {action}  '
+                              f'duration_s={dur_s}')
+            continue
+
+        # ---- Loop — goto label at file line 1 -------------------------
+        # `goto` and `::label::` are wire-verified verbs in
+        # luaenginelib.json. `count == 0` (== continuous) emits a bare
+        # `goto ::_prog_start::`. A finite count would need a counter
+        # var + `if _iter < N then goto ... end`; not exercised by the
+        # test wizard so kept minimal here — extend when a program with
+        # count>0 lands.
+        if action == 'loop':
+            count = int(step.get('count') or 0)
+            if count == 0:
+                exec_lines.append(f'goto _prog_start  -- step {action}  '
+                                  f'continuous (count=0)')
+            else:
+                # Finite loops need a counter; not covered by current
+                # wire captures. Emit a bare goto with a marker so it
+                # still runs (turns into an infinite loop, but never
+                # stops the operator from spotting the TODO).
+                exec_lines.append(f'goto _prog_start  -- step {action}  '
+                                  f'count={count} (finite counter not '
+                                  f'yet implemented; running as '
+                                  f'continuous)')
             continue
 
         # ---- Wait input — emit a getDI read -------------------------
@@ -243,7 +368,53 @@ def codegen_lua_from_program(
                               f'waitCondition + unverified timeout unit)')
             continue
 
-        # ---- Motion — movJ via point ref or inline taught_joints ----
+        # Verb selection: move_linear → movL, everything else that
+        # reaches here (move_home / move_joint / approach / etc.) →
+        # movJ. Matches program_executor_node.tick semantics.
+        verb = 'movL' if str(action).lower() == 'move_linear' else 'movJ'
+
+        # ---- Derived offset resolver → inline movL({cp={...}}) --------
+        # A move_linear step with `derived_from` + `offset_z_mm` and no
+        # taught_joints of its own is a wizard-derived child: resolve
+        # against role_map, apply the z offset in the base frame, and
+        # emit a real movL to the concrete cp — no `-- skipped` line.
+        # offset_z_mm==0 collapses to movL(<anchor_point_name>).
+        if step.get('derived_from') and not (
+                isinstance(step.get('taught_joints'), list)
+                and len(step.get('taught_joints')) == 6):
+            role = step.get('derived_from')
+            resolved = _resolve_derived(step, role_map)
+            if resolved is not None:
+                kind, vals = resolved
+                ofs_mm = float(step.get('offset_z_mm') or 0)
+                # If offset is zero and the anchor was already saved
+                # as a jp point, reuse that name for a tighter movL.
+                if kind == 'jp' and abs(ofs_mm) < 1e-6 \
+                        and role in role_point_name:
+                    ref = role_point_name[role]
+                    joints_s = ', '.join(f'{float(v):+.3f}' for v in vals)
+                    exec_lines.append(
+                        f'{verb}({ref})  -- step {action}  '
+                        f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
+                        f'joints=[{joints_s}]')
+                    continue
+                if kind == 'cp':
+                    cp_s = ', '.join(f'{v:g}' for v in vals)
+                    exec_lines.append(
+                        f'{verb}({{cp={{{cp_s}}}}})  -- step {action}  '
+                        f'derived_from={role!r} '
+                        f'offset_z_mm={ofs_mm:g}')
+                else:  # jp fallback
+                    jp_s = ', '.join(f'{v:g}' for v in vals)
+                    exec_lines.append(
+                        f'{verb}({{jp={{{jp_s}}}}})  -- step {action}  '
+                        f'derived_from={role!r} '
+                        f'offset_z_mm={ofs_mm:g}')
+                continue
+            # Anchor unresolved — fall through so the point_name /
+            # taught_joints paths still get a chance.
+
+        # ---- Motion — movJ/movL via point ref or inline taught_joints
         pn = step.get('point_name')
         if pn and pn in program_points:
             p = program_points[pn]
@@ -256,8 +427,11 @@ def codegen_lua_from_program(
             if pn not in used_named:
                 varspoint[pn] = _make_jp_point(j, pn)
                 used_named.add(pn)
+            role = step.get('position_role')
+            if role and role not in role_point_name:
+                role_point_name[role] = pn
             joints_s = ', '.join(f'{float(v):+.3f}' for v in j)
-            exec_lines.append(f'movJ({pn})  -- step {action}  point={pn}  '
+            exec_lines.append(f'{verb}({pn})  -- step {action}  point={pn}  '
                               f'joints=[{joints_s}]')
             continue
         taught = step.get('taught_joints')
@@ -274,9 +448,20 @@ def codegen_lua_from_program(
             name = f'{point_prefix}{fallback_idx}'
         varspoint[name] = _make_jp_point(taught, name)
         used_named.add(name)
+        role = step.get('position_role')
+        if role and role not in role_point_name:
+            role_point_name[role] = name
         joints_s = ', '.join(f'{float(v):+.3f}' for v in taught)
-        exec_lines.append(f'movJ({name})  -- step {action}  '
+        exec_lines.append(f'{verb}({name})  -- step {action}  '
                           f'joints=[{joints_s}]')
+
+    # If the program has any `loop` step, prepend a `::_prog_start::`
+    # label so the emitted `goto _prog_start` has a target. Label goes
+    # BEFORE exec line 1 — the Estun interpreter treats `::label::` as
+    # a no-op statement, so `setStartLine 1` still lands on it and
+    # falls through to the first movJ without observable delay.
+    if needs_start_label:
+        exec_lines = ['::_prog_start::  -- loop target'] + exec_lines
 
     trailer = time.strftime(_LUA_TRAILER_FMT, time.localtime(time.time()))
     # Header AFTER the executable region so `setStartLine 1` lands on

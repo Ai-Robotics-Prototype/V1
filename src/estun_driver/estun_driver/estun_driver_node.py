@@ -758,9 +758,15 @@ class EstunCodroidDriver(Node):
         self.create_subscription(String, '/robot/power_command', self._on_power_command, 5)
 
         # Program execution — save (HTTP) + run/stop/pause/... (WS).
-        # Same infrequent-user-gesture profile as power; small reliable
-        # queue. Gate = monitor_only=false AND allow_move=true.
-        self.create_subscription(String, '/estun/program', self._on_program_command, 5)
+        # Gate = monitor_only=false AND allow_move=true.
+        # Queue depth 16: /api/estun/program/run publishes a 6-op burst
+        # (save → to_auto → set_auto_rate → set_breakpoint →
+        # clear_start_line → project/run) and `save` itself blocks the
+        # executor thread for up to ~12s (four HTTP POSTs at 3s each),
+        # so the queue must hold the whole tail without any risk of
+        # KEEP_LAST dropping the head. Depth 5 was too tight — grew to
+        # 16 to match the dashboard publisher.
+        self.create_subscription(String, '/estun/program', self._on_program_command, 16)
 
         # ── Timers ─────────────────────────────────────────────
         self._mode_timer    = self.create_timer(1.0, self._publish_mode)

@@ -724,6 +724,7 @@ export default function MonitorDashboard() {
   const pauseProgram   = useStore((s) => s.pauseProgram)
   const resumeProgram  = useStore((s) => s.resumeProgram)
   const cancelProgram  = useStore((s) => s.cancelProgram)
+  const homeRobot      = useStore((s) => s.homeRobot)
   const robot          = useStore((s) => s.robot) || {}
   const runSpeedPct    = useStore((s) => s.runSpeedPct)
   const setRunSpeedPct = useStore((s) => s.setRunSpeedPct)
@@ -818,6 +819,15 @@ export default function MonitorDashboard() {
   // greys out when the Estun pipeline is running (not just when the
   // sim executor is running). Same for Stop/Pause.
   const runDisabled    = safety?.estop || runState.kind === 'running'
+  // Return Home: allowed whenever the operator could jog (estop clear,
+  // driver connected, allow_move open). Same gate the Jog panel uses.
+  const homeDisabled   = !!safety?.estop || !robot?.connected || !robot?.allow_move
+  // Restart: requires a loaded program and no e-stop. Runs even if the
+  // executor thinks it's paused / stopping — the stop-then-run sequence
+  // handles those transitions.
+  const restartDisabled = !!safety?.estop
+                          || !(currentProgram?.id)
+                          || (steps.length === 0)
                                         || runState.kind === 'stopping'
   const pauseDisabled  = runState.kind !== 'running' || safety?.estop
   const stopDisabled   = runState.kind !== 'running' && runState.kind !== 'paused'
@@ -922,6 +932,35 @@ export default function MonitorDashboard() {
                 ▶ Run Program
               </button>
             )}
+            {/* RESTART PROGRAM — stops the running program (project/stop,
+                wire-proven) then re-invokes the same run path the Run
+                button uses (POST /api/estun/program/run — codegen →
+                save → project/run, with clearStartLine already inside
+                that endpoint so it starts at step 1). Confirms when a
+                program is currently running; goes straight through when
+                idle. Disabled when there's nothing to restart. */}
+            <button onClick={() => restartProgram({
+                              cancelProgram, currentProgram, runSpeedPct,
+                              robot, isRunning, addToast,
+                            })}
+                    disabled={restartDisabled}
+                    title="project/stop (if running) → /api/estun/program/run — restart from step 1"
+                    style={primaryBtn('#0369A1', restartDisabled)}>
+              ↻ Restart Program
+            </button>
+            {/* RETURN HOME — same store action the Jog panel's Home
+                button uses (homeRobot → /api/program/run action='home'
+                → executor → /cmd/task home). Always confirms because
+                it commands motion; the confirm text shows the
+                effective speed and gate status so the operator sees
+                exactly what will happen. E-stop / gate-closed / no-
+                connection cases surface the reason instead of moving. */}
+            <button onClick={() => returnHome({ homeRobot, robot, runSpeedPct, safety, addToast })}
+                    disabled={homeDisabled}
+                    title="/api/program/run action='home' — dispatches to the executor"
+                    style={primaryBtn('#0891B2', homeDisabled)}>
+              ⌂ Return Home
+            </button>
             <button onClick={() => setShowLibrary(true)} style={{
               padding: '14px 24px', fontSize: 14, fontWeight: 600,
               background: '#fff', color: '#374151',
@@ -1153,6 +1192,85 @@ function primaryBtn(bg, disabled) {
     background: bg, color: '#fff', border: 'none',
     borderRadius: 10, cursor: disabled ? 'not-allowed' : 'pointer',
     opacity: disabled ? 0.45 : 1,
+  }
+}
+
+// Return-Home confirm. Reads the driver's advertised operator cap so
+// the operator sees the actual effective speed before pressing OK.
+// Uses window.confirm so it works without adding a modal component —
+// same pattern as other destructive-motion prompts on this dashboard.
+function returnHome({ homeRobot, robot, runSpeedPct, safety, addToast }) {
+  const capFrac = Number(robot?.operator_speed_limit ?? 0.25)
+  const capPct  = Math.max(1, Math.min(100, Math.round(capFrac * 100)))
+  const reqPct  = Math.max(1, Math.min(100, Number(runSpeedPct || capPct)))
+  const effPct  = Math.min(capPct, reqPct)
+  const gateOK  = !safety?.estop && !!robot?.connected && !!robot?.allow_move
+  const lines = [
+    'Move to home?',
+    '',
+    `Effective speed: ${effPct}%${effPct < reqPct ? ` (capped from ${reqPct}%)` : ''}`,
+    `Gate: allow_move=${robot?.allow_move ? 'true' : 'false'}, ` +
+      `monitor_only=${robot?.monitor_only ? 'true' : 'false'}, ` +
+      `connected=${robot?.connected ? 'true' : 'false'}` +
+      (safety?.estop ? ', ESTOP ACTIVE' : ''),
+    '',
+    gateOK
+      ? 'OK to send home command.'
+      : 'Gate is closed — the driver will refuse this. Press OK to try anyway.',
+  ]
+  if (!window.confirm(lines.join('\n'))) return
+  try { homeRobot() }
+  catch (e) { if (addToast) addToast('Home dispatch failed: ' + e, 'error') }
+}
+
+// Restart-Program: stop-if-running then re-invoke the same run pipeline
+// the Run button uses. The /api/estun/program/run endpoint already
+// contains clearStartLine, so this restarts from step 1 by default.
+// Confirms when a program is currently active — a mid-run restart is
+// destructive (the current cycle's remaining steps are abandoned).
+async function restartProgram({ cancelProgram, currentProgram, runSpeedPct, robot, isRunning, addToast }) {
+  const name = currentProgram?.name || currentProgram?.id || '(current)'
+  const reqPct = Math.max(1, Math.min(100, Number(runSpeedPct || 10)))
+  const capFrac = Number(robot?.operator_speed_limit ?? 0.25)
+  const capPct  = Math.max(1, Math.min(100, Math.round(capFrac * 100)))
+  const effPct  = Math.min(capPct, reqPct)
+  if (isRunning) {
+    const prompt = [
+      `Restart "${name}" from step 1?`,
+      '',
+      'The program is currently RUNNING. This will:',
+      '  1. Send project/stop to halt the current cycle',
+      '  2. Re-save + re-run the program from the top',
+      '',
+      `Effective speed: ${effPct}%${effPct < reqPct ? ` (capped from ${reqPct}%)` : ''}`,
+    ]
+    if (!window.confirm(prompt.join('\n'))) return
+  }
+  try {
+    if (isRunning) {
+      // project/stop first — wire-proven rung 1. Give the driver a
+      // beat to publish the state=0 transition before re-invoking
+      // run, otherwise the two ops race on the controller.
+      try { await cancelProgram() } catch (_) { /* fall through */ }
+      await new Promise((r) => setTimeout(r, 350))
+    }
+    const res = await fetch('/api/estun/program/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        program_id: currentProgram?.id,
+        run_speed_pct: reqPct,
+      }),
+    })
+    const body = await res.json().catch(() => ({}))
+    if (body?.ok) {
+      if (addToast) addToast(`Restarted "${name}" from step 1`, 'success')
+    } else {
+      const reason = body?.outcome?.reason || body?.error || `HTTP ${res.status}`
+      if (addToast) addToast(`Restart refused: ${reason}`, 'error')
+    }
+  } catch (e) {
+    if (addToast) addToast(`Restart failed: ${e}`, 'error')
   }
 }
 

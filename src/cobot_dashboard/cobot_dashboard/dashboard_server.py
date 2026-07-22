@@ -677,9 +677,21 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         # so the Run modal shows exactly WHY nothing happened when it didn't.
         self.create_subscription(String, "/estun/rejected",
                                  self._on_estun_rejected, 10)
-        # Publisher for the /estun/program op-envelope. Created lazily on
-        # first use so the constructor stays cheap.
-        self._estun_program_pub = None
+        # Publisher for the /estun/program op-envelope. Created EAGERLY at
+        # node construction so DDS discovery completes long before the
+        # operator hits Run. The old lazy-init raced with discovery:
+        # /api/estun/program/run publishes save→to_auto→…→run in a tight
+        # burst, and the FIRST call was the one that created the
+        # publisher — so the driver's subscriber was still being
+        # discovered when the `save` op fired and RELIABLE+VOLATILE
+        # dropped it, while the later ops (to_auto through project/run)
+        # made it. Result: controller received `project/run testwizard`
+        # against a projectlist that had never been updated → alarm
+        # 10001 "Project <testwizard> does not exist." Depth grows from
+        # 5 → 16 so the 6-op burst can never pressure the subscriber's
+        # queue either.
+        self._estun_program_pub = self.create_publisher(
+            String, "/estun/program", 16)
 
         # Program executor state (richer than /task/status: step labels,
         # cycle stats, executor-state strings like 'waiting_motion').
@@ -1368,10 +1380,15 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         """Publish a single /estun/program op envelope. Returns True if
         the frame reached the topic (does NOT mean the driver accepted
         or ran it — the driver's gate + rejection stream is the source
-        of truth for that)."""
-        if self._estun_program_pub is None:
-            self._estun_program_pub = self.create_publisher(
-                String, "/estun/program", 5)
+        of truth for that). Publisher is created eagerly in __init__.
+        A count_subscribers()==0 check logs a warning so we notice if
+        the driver isn't up — but does NOT block the publish (there's
+        no producer we can hand the message off to)."""
+        if self._estun_program_pub.get_subscription_count() == 0:
+            self.get_logger().warn(
+                f'/estun/program op={op!r} publishing with 0 discovered '
+                f'subscribers — driver may be down; op will be dropped '
+                f'by RELIABLE+VOLATILE QoS')
         body = dict(payload); body["op"] = op
         m = String(); m.data = json.dumps(body)
         self._estun_program_pub.publish(m)
