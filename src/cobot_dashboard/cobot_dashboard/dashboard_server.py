@@ -4969,6 +4969,63 @@ if FASTAPI_AVAILABLE:
             return False
         return True
 
+    def _validate_move_home_consistency(steps):
+        """Return a list of warnings — one per move_home step whose
+        taught_joints differ from the FIRST move_home step's joints by
+        more than 5° in any axis. Returns an empty list when everything
+        is aligned OR when there's only one move_home step.
+
+        Matches the FIX C threshold in
+        program_ops.codegen_lua_from_program — codegen normalizes
+        silently at Lua-emit time, but we warn the operator here so
+        drift shows up at save time rather than being noticed only in
+        the emitted Lua footer.
+
+        Reason to keep as a WARNING (not a save-blocker): the codegen
+        normalization means the arm won't actually visit the drifted
+        pose. The warning is informational + a nudge to re-teach so the
+        on-disk record matches the emitted program.
+        """
+        THRESHOLD_DEG = 5.0
+        warnings = []
+        anchor_idx = None
+        anchor_joints = None
+        for i, s in enumerate(steps):
+            if not isinstance(s, dict):
+                continue
+            if str(s.get('action') or '').lower() != 'move_home':
+                continue
+            tj = s.get('taught_joints')
+            if not (isinstance(tj, list) and len(tj) == 6
+                    and all(isinstance(v, (int, float)) for v in tj)):
+                continue
+            if anchor_joints is None:
+                anchor_idx = i
+                anchor_joints = [float(v) for v in tj]
+                continue
+            deltas = [abs(float(a) - float(b))
+                      for a, b in zip(tj, anchor_joints)]
+            max_d = max(deltas)
+            if max_d > THRESHOLD_DEG:
+                warnings.append({
+                    "step_index": i,
+                    "step_label": s.get("label") or "move_home",
+                    "anchor_step_index": anchor_idx,
+                    "anchor_step_label":
+                        steps[anchor_idx].get("label") or "move_home",
+                    "max_joint_delta_deg": round(max_d, 2),
+                    "per_axis_delta_deg": [round(d, 2) for d in deltas],
+                    "reason": (
+                        f"move_home step {i+1} joints differ from "
+                        f"step {anchor_idx+1} by up to "
+                        f"{max_d:.2f}° (threshold {THRESHOLD_DEG:.1f}°). "
+                        "Codegen normalizes silently to the first "
+                        "move_home, but re-teach one of them so the "
+                        "on-disk record matches."
+                    ),
+                })
+        return warnings
+
     def _validate_step_point_refs(steps, points):
         """Return a per-step message list for any step whose point_name
         doesn't resolve in the program's points table. Empty list on
@@ -5040,6 +5097,10 @@ if FASTAPI_AVAILABLE:
                 ),
                 "step_issues": step_issues,
             }, status_code=422)
+        # move_home drift: warn (don't block) — codegen silently
+        # normalizes to the first move_home, but the operator should
+        # know so they can re-teach the on-disk pose to match.
+        home_warnings = _validate_move_home_consistency(steps)
         # Slug: lowercase alnum only. "New Program" → "newprogram";
         # "My Palletize Task 3" → "mypalletizetask3". Collisions get
         # a numeric suffix ("newprogram2") without an underscore
@@ -5101,7 +5162,9 @@ if FASTAPI_AVAILABLE:
                 json.dump(program, f, indent=2)
         except Exception as e:
             return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
-        return {"ok": True, "program": program}
+        return {"ok": True, "program": program,
+                "warnings": {"move_home_drift": home_warnings}
+                            if home_warnings else {}}
 
     @app.get("/api/programs/{prog_id}")
     async def api_programs_get(prog_id: str):
@@ -5162,6 +5225,9 @@ if FASTAPI_AVAILABLE:
                 ),
                 "step_issues": step_issues,
             }, status_code=422)
+        # move_home drift check on the merged view (same threshold as
+        # POST and program_ops FIX C).
+        home_warnings_put = _validate_move_home_consistency(merged_steps)
         for k in ("name", "description", "tags", "config", "steps", "cell_id"):
             if k in body:
                 prog[k] = body[k]
@@ -5199,7 +5265,9 @@ if FASTAPI_AVAILABLE:
                 json.dump(prog, f, indent=2)
         except Exception as e:
             return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
-        return {"ok": True, "program": prog}
+        return {"ok": True, "program": prog,
+                "warnings": {"move_home_drift": home_warnings_put}
+                            if home_warnings_put else {}}
 
     @app.delete("/api/programs/{prog_id}")
     async def api_programs_delete(prog_id: str):

@@ -240,7 +240,60 @@ def codegen_lua_from_program(
     # the emitted Lua with an explanatory comment; the operator-side UI
     # continues to flag it as "pending capture" in StepPreviewPanel.
     program_points = program.get('points') or {}
-    # Pre-pass: resolve position_role → taught data so `derived_from`
+    # Pre-pass 1 (FIX C, home-drift normalization): the wizard authors
+    # both the start-of-cycle and end-of-cycle move_home steps against
+    # the same `taught_home` fixture, but a later editor re-teach on
+    # one of them (without the other) can leave the program with two
+    # move_home steps that disagree on joints. That drift causes the
+    # arm to sweep to a different pose on each cycle boundary — the
+    # J1/J6 wrist rotation reported by the operator. Normalize here:
+    # take the FIRST move_home step's taught_joints as authoritative
+    # and rewrite any subsequent move_home step whose joints differ by
+    # >5° in any axis. Non-destructive to the on-disk JSON — we work on
+    # a local list. Emit a warning comment into the Lua header so the
+    # operator can see the alignment happened.
+    #
+    # 5° threshold: matches the validation the dashboard save endpoint
+    # applies (any single-axis drift above that flags the program for
+    # the operator).
+    steps = list(steps)  # local shallow copy — never mutate the caller's
+    home_drift_notes: list[str] = []
+    first_home_joints = None
+    first_home_tcp = None
+    first_home_idx = None
+    HOME_DRIFT_DEG = 5.0
+    for i, s in enumerate(steps):
+        if str(s.get('action') or '').lower() != 'move_home':
+            continue
+        tj = s.get('taught_joints')
+        if not (isinstance(tj, list) and len(tj) == 6
+                and all(isinstance(v, (int, float)) for v in tj)):
+            continue
+        if first_home_joints is None:
+            first_home_joints = [float(v) for v in tj]
+            first_home_tcp = s.get('taught_tcp')
+            first_home_idx = i
+            continue
+        deltas = [abs(float(a) - float(b))
+                  for a, b in zip(tj, first_home_joints)]
+        max_delta = max(deltas)
+        if max_delta > HOME_DRIFT_DEG:
+            # Rewrite this step's taught data to match the first home.
+            # Keep the step's own metadata (label, step-index, id)
+            # so the executor's per-step logging still reports "step 15
+            # Return to home", just with the aligned joints.
+            aligned = dict(s)
+            aligned['taught_joints'] = list(first_home_joints)
+            if first_home_tcp is not None:
+                aligned['taught_tcp'] = list(first_home_tcp)
+            aligned['joints'] = list(first_home_joints)
+            steps[i] = aligned
+            home_drift_notes.append(
+                f'step {s.get("step", i+1)} '
+                f'({s.get("label") or "move_home"}): '
+                f'aligned to step {steps[first_home_idx].get("step", first_home_idx+1)} '
+                f'(max joint delta was {max_delta:.2f}° > {HOME_DRIFT_DEG}°)')
+    # Pre-pass 2: resolve position_role → taught data so `derived_from`
     # children (descend / lift / retreat) can compute concrete poses
     # at codegen time rather than being emitted as `-- skipped`.
     role_map = _build_role_map(steps)
@@ -373,43 +426,75 @@ def codegen_lua_from_program(
         # movJ. Matches program_executor_node.tick semantics.
         verb = 'movL' if str(action).lower() == 'move_linear' else 'movJ'
 
-        # ---- Derived offset resolver → inline movL({cp={...}}) --------
+        # ---- Derived offset resolver → movJ(anchor) OR movL cp --------
         # A move_linear step with `derived_from` + `offset_z_mm` and no
-        # taught_joints of its own is a wizard-derived child: resolve
-        # against role_map, apply the z offset in the base frame, and
-        # emit a real movL to the concrete cp — no `-- skipped` line.
-        # offset_z_mm==0 collapses to movL(<anchor_point_name>).
+        # taught_joints of its own is a wizard-derived child. Two
+        # branches with distinct safety properties:
+        #
+        # FIX A — |offset_z_mm| < 1 mm: emit `movJ(<anchor_point>)`.
+        #   The derived pose IS the anchor pose. Reusing the anchor's
+        #   already-registered jp varspoint entry guarantees the arm
+        #   re-executes the EXACT taught joint solution — no IK, no
+        #   wrist ambiguity. This is critical because Estun's movL
+        #   solves inverse-kinematics fresh against the target TCP; if
+        #   the TCP is identical to the current pose (which it is after
+        #   the just-fired movJ to the anchor), IK can pick a DIFFERENT
+        #   J4/J5/J6 branch that still satisfies the TCP — the wrist
+        #   rotates without any Cartesian motion. movJ to the anchor
+        #   name is exact.
+        #
+        # FIX B — |offset_z_mm| ≥ 1 mm: no in-process IK library is
+        #   available at codegen time (no ikpy / no MoveIt bridge from
+        #   this module), so we fall back to `movL({cp={...}}, {coor=0,
+        #   tool=0})` with the anchor's rx/ry/rz preserved and the
+        #   frame/tool pinned. Pinning coor and tool reduces the IK's
+        #   solution-branch ambiguity (unpinned, Estun searches across
+        #   frames), which curbs — but does not eliminate — the wrist-
+        #   flip hazard. The step is flagged in the emitted comment so
+        #   the operator watches these steps live. Preferred long-term
+        #   fix: ship a seeded-IK helper (URDF at /opt/cobot/models/
+        #   estun_s10-140.urdf + ikpy) and swap this branch for a
+        #   movJ with the seeded-IK joints.
         if step.get('derived_from') and not (
                 isinstance(step.get('taught_joints'), list)
                 and len(step.get('taught_joints')) == 6):
             role = step.get('derived_from')
+            ofs_mm = float(step.get('offset_z_mm') or 0)
+            # FIX A: offset ≈ 0 collapses to a movJ back to the anchor.
+            # Prefer this branch whenever the anchor was already saved
+            # as a jp point AND the offset is under 1 mm — the anchor's
+            # taught_joints are authoritative, no IK involved.
+            if abs(ofs_mm) < 1.0 and role in role_point_name:
+                ref = role_point_name[role]
+                anchor = role_map.get(role, {})
+                tj = anchor.get('taught_joints') or []
+                joints_s = ', '.join(f'{float(v):+.3f}' for v in tj) if tj else ''
+                exec_lines.append(
+                    f'movJ({ref})  -- step {action}  '
+                    f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
+                    f'(FIX A: identity offset → reuse anchor jp; no IK)'
+                    + (f'  joints=[{joints_s}]' if joints_s else ''))
+                continue
+            # FIX B: non-trivial offset. Resolve to cp, emit movL with
+            # coor=0, tool=0 pinned, and flag the step.
             resolved = _resolve_derived(step, role_map)
             if resolved is not None:
                 kind, vals = resolved
-                ofs_mm = float(step.get('offset_z_mm') or 0)
-                # If offset is zero and the anchor was already saved
-                # as a jp point, reuse that name for a tighter movL.
-                if kind == 'jp' and abs(ofs_mm) < 1e-6 \
-                        and role in role_point_name:
-                    ref = role_point_name[role]
-                    joints_s = ', '.join(f'{float(v):+.3f}' for v in vals)
-                    exec_lines.append(
-                        f'{verb}({ref})  -- step {action}  '
-                        f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
-                        f'joints=[{joints_s}]')
-                    continue
                 if kind == 'cp':
                     cp_s = ', '.join(f'{v:g}' for v in vals)
                     exec_lines.append(
-                        f'{verb}({{cp={{{cp_s}}}}})  -- step {action}  '
-                        f'derived_from={role!r} '
-                        f'offset_z_mm={ofs_mm:g}')
-                else:  # jp fallback
+                        f'movL({{cp={{{cp_s}}}}},{{coor=0,tool=0}})  '
+                        f'-- step {action}  derived_from={role!r} '
+                        f'offset_z_mm={ofs_mm:g}  '
+                        f'(FIX B: offset>1mm; no seeded IK available — '
+                        f'movL with anchor rx/ry/rz + pinned coor/tool. '
+                        f'WATCH LIVE: wrist could still re-solve.)')
+                else:  # jp fallback (anchor had no tcp AND offset≈0)
                     jp_s = ', '.join(f'{v:g}' for v in vals)
                     exec_lines.append(
-                        f'{verb}({{jp={{{jp_s}}}}})  -- step {action}  '
-                        f'derived_from={role!r} '
-                        f'offset_z_mm={ofs_mm:g}')
+                        f'movJ({{jp={{{jp_s}}}}})  -- step {action}  '
+                        f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
+                        f'(anchor jp fallback)')
                 continue
             # Anchor unresolved — fall through so the point_name /
             # taught_joints paths still get a chance.
@@ -472,7 +557,12 @@ def codegen_lua_from_program(
         f'-- generated by estun_driver.program_ops from program '
         f'{program.get("id","<unknown>")!r}',
         f'-- taught steps: {len(steps)}, requested speed_pct={requested_pct}, '
-        f'operator_cap_pct={operator_speed_limit_pct}, effective_pct={eff_pct}',
+        f'operator_cap_pct={operator_speed_limit_pct}, effective_pct={eff_pct}',]
+    if home_drift_notes:
+        footer_lines.append('-- FIX C: move_home drift normalized —')
+        for note in home_drift_notes:
+            footer_lines.append(f'--   {note}')
+    footer_lines += [
         trailer,
     ]
     # CRLF line endings match the controller's own-emitted files (see
