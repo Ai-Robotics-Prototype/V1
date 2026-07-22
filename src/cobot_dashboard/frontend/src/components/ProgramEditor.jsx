@@ -2088,64 +2088,83 @@ function TeachOverlay({
           )}
         </div>
 
-        {/* Action buttons row — flex 0 0 auto. Run/Pause/Teach belong on
-            the program tab, not while teaching; here we surface Home and
-            STOP at the larger fullscreen sizing. */}
+        {/* Home button — helper action for jogging. STOP moved to
+            the sticky footer bar so it's ALWAYS visible without
+            scrolling on tablet-portrait; Home stays here since it's
+            not a safety-critical control. */}
         <div style={{
           flex: '0 0 auto',
           width: '100%',
           display: 'flex', gap: 16,
-          justifyContent: 'space-evenly',
+          justifyContent: 'center',
         }}>
           <button onClick={homeRobot} style={actionBtn('default')}>Home</button>
-          <button onClick={triggerEstop} style={actionBtn('estop')}>STOP</button>
         </div>
       </div>
 
-      {/* FOOTER */}
+      {/* STICKY FOOTER — tablet-first: Record + STOP + Back + Skip
+          share ONE row that never scrolls off. flex-shrink:0 keeps it
+          reserved regardless of jog-area content height, and the
+          padding-bottom includes the safe-area inset so the row
+          stays clear of iOS home indicator / Android nav bar.
+          Progress bar is pinned to the very bottom of this row. */}
       <div style={{
-        height: 100, flexShrink: 0,
+        flexShrink: 0,
         background: '#fff', borderTop: '1px solid #e5e7eb',
-        display: 'flex', alignItems: 'center', padding: '0 22px', gap: 16,
+        display: 'flex', alignItems: 'center',
+        padding: isTabletW ? '10px 14px' : '14px 22px',
+        paddingBottom: `calc(env(safe-area-inset-bottom, 0px) + ${isTabletW ? 10 : 14}px)`,
+        gap: isTabletW ? 10 : 16,
         position: 'relative',
       }}>
-        <div style={{ flex: 1, display: 'flex', justifyContent: 'flex-start' }}>
-          {canBack ? (
-            <button onClick={onBack} style={{
-              minHeight: 56, padding: '0 22px',
-              fontSize: 15, fontWeight: 700,
-              background: '#fff', color: '#374151',
-              border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
-            }}>← Back</button>
-          ) : null}
-        </div>
+        {canBack && (
+          <button onClick={onBack} style={{
+            minHeight: 56, padding: '0 18px',
+            fontSize: 15, fontWeight: 700,
+            background: '#fff', color: '#374151',
+            border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+            flexShrink: 0,
+          }}>← Back</button>
+        )}
 
-        <div style={{ flex: 2, display: 'flex', justifyContent: 'center' }}>
+        <button onClick={triggerEstop} style={{
+          minHeight: 56, minWidth: isTabletW ? 96 : 120,
+          padding: '0 18px',
+          fontSize: isTabletW ? 15 : 16, fontWeight: 800,
+          background: '#DC2626', color: '#fff',
+          border: 'none', borderRadius: 10, cursor: 'pointer',
+          flexShrink: 0,
+          boxShadow: '0 0 0 2px rgba(220,38,38,0.15)',
+        }}>⏹ STOP</button>
+
+        <div style={{ flex: 1, display: 'flex', justifyContent: 'center', minWidth: 0 }}>
           <button
             onClick={doRecord}
             onTouchStart={(e) => { e.preventDefault() }}
             onTouchEnd={(e) => { e.preventDefault(); doRecord() }}
             style={{
-              height: 72, minWidth: 280, padding: '0 36px',
-              fontSize: 20, fontWeight: 800, letterSpacing: '0.5px',
+              height: 72,
+              minWidth: isTabletW ? 200 : 280,
+              padding: isTabletW ? '0 20px' : '0 36px',
+              fontSize: isTabletW ? 17 : 20, fontWeight: 800, letterSpacing: '0.5px',
               background: flash ? '#fff' : '#16A34A',
               color:      flash ? '#16A34A' : '#fff',
               border: flash ? '2px solid #16A34A' : 'none',
               borderRadius: 12, cursor: 'pointer',
               transition: 'background 100ms, color 100ms',
+              flexShrink: 0,
             }}>
             {flash ? '✓ RECORDED' : 'RECORD POSITION'}
           </button>
         </div>
 
-        <div style={{ flex: 1, display: 'flex', justifyContent: 'flex-end' }}>
-          <button onClick={onSkip} style={{
-            minHeight: 56, padding: '0 22px',
-            fontSize: 15, fontWeight: 700,
-            background: '#fff', color: '#374151',
-            border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
-          }}>Skip →</button>
-        </div>
+        <button onClick={onSkip} style={{
+          minHeight: 56, padding: '0 18px',
+          fontSize: 15, fontWeight: 700,
+          background: '#fff', color: '#374151',
+          border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+          flexShrink: 0,
+        }}>Skip →</button>
 
         {/* Progress bar pinned to the very bottom */}
         <div style={{

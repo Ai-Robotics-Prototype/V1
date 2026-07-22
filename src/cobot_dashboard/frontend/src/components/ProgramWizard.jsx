@@ -282,8 +282,28 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
 
   const padBtn = 64
 
+  // Tablet-first layout (2026-07-22 fix). The old layout was a flat
+  // document-flow div — the Record button sat at the BOTTOM of a
+  // ~1200 px stack of instructions + live readout + three jog grids +
+  // speed slider, which on any tablet viewport put Record below the
+  // fold. The operator would have had to scroll while hold-jogging,
+  // impossible on touch. Now the component fills its parent (the
+  // wizard modal's flex-1 content area) as a flex column:
+  //   * scrollable middle (instructions, live readout, jog pads)
+  //   * flex-shrink:0 STICKY FOOTER — Record + STOP + Cancel/Next
+  //     stay reserved, safe-area padded, ≥44px touch targets.
   return (
-    <div style={{ padding: 24, maxWidth: 760, margin: '0 auto' }}>
+    <div style={{
+      display: 'flex', flexDirection: 'column',
+      height: '100%', minHeight: 0,
+      background: '#fff',
+    }}>
+      <div style={{
+        flex: 1, minHeight: 0, overflowY: 'auto',
+        padding: 24,
+        maxWidth: 760, width: '100%', margin: '0 auto',
+        boxSizing: 'border-box',
+      }}>
       <div style={{ fontSize: 20, fontWeight: 700, color: '#111', marginBottom: 6 }}>{title}</div>
       <div style={{ fontSize: 14, color: '#6b7280', marginBottom: 16 }}>{description}</div>
 
@@ -430,10 +450,32 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
           </div>
         </div>
       )}
+      </div>
 
-      <div style={{ display: 'flex', gap: 10 }}>
+      {/* STICKY FOOTER — tablet-first: Record + STOP + Skip/Next share
+          one row that stays reserved outside the scrollable content.
+          padding-bottom includes env(safe-area-inset-bottom) so the
+          row clears the iOS home indicator / Android nav bar. Every
+          button ≥56px tall (well over 44px minimum). */}
+      <div style={{
+        flexShrink: 0,
+        borderTop: '1px solid #e5e7eb', background: '#fff',
+        padding: '10px 16px',
+        paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 10px)',
+        display: 'flex', alignItems: 'center', gap: 10,
+      }}>
+        <button onClick={triggerEstop} style={{
+          minHeight: 56, minWidth: 96,
+          padding: '0 16px',
+          fontSize: 15, fontWeight: 800,
+          background: '#DC2626', color: '#fff',
+          border: 'none', borderRadius: 10, cursor: 'pointer',
+          flexShrink: 0,
+          boxShadow: '0 0 0 2px rgba(220,38,38,0.15)',
+        }}>⏹ STOP</button>
         <button onClick={recordPosition} style={{
-          flex: 2, padding: '16px', fontSize: 16, fontWeight: 700,
+          flex: 1, minHeight: 56, padding: '0 16px',
+          fontSize: 16, fontWeight: 800,
           background: taught ? '#16A34A' : '#2563EB', color: '#fff',
           border: 'none', borderRadius: 10, cursor: 'pointer',
         }}>
@@ -441,21 +483,23 @@ function TeachWithJog({ title, description, instructions, pointName, answers, se
         </button>
         {taught && (
           <button onClick={onNext} style={{
-            flex: 1, padding: '16px', fontSize: 16, fontWeight: 700,
+            minHeight: 56, padding: '0 22px',
+            fontSize: 15, fontWeight: 700,
             background: '#16A34A', color: '#fff',
             border: 'none', borderRadius: 10, cursor: 'pointer',
-          }}>Next</button>
+            flexShrink: 0,
+          }}>Next →</button>
+        )}
+        {onSkip && !taught && (
+          <button onClick={onSkip} style={{
+            minHeight: 56, padding: '0 16px',
+            fontSize: 14, fontWeight: 600,
+            background: '#fff', color: '#6b7280',
+            border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+            flexShrink: 0,
+          }}>Skip →</button>
         )}
       </div>
-      {onSkip && !taught && (
-        <button onClick={onSkip} style={{
-          width: '100%', marginTop: 8, padding: '10px', fontSize: 13,
-          background: 'transparent', color: '#6b7280',
-          border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
-        }}>
-          Skip — use auto-detection instead
-        </button>
-      )}
     </div>
   )
 }
@@ -1237,11 +1281,14 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   return (
     // True fullscreen container — no centered modal, no backdrop margins,
     // no rounded corners. The overlay IS the screen. Vertical flex column
-    // with overflow: hidden so the layout exactly fills 100vh and nothing
-    // scrolls. The jog pad area absorbs all remaining vertical space.
+    // with overflow: hidden so the layout exactly fills the viewport and
+    // nothing scrolls. The jog pad area absorbs all remaining vertical
+    // space. `inset: 0` sizes to the ACTUAL visible viewport (not the
+    // large-viewport 100vh, which on mobile Safari includes the address
+    // bar and pushes the footer bottom off-screen). Removed the redundant
+    // `width: 100vw, height: 100vh` for that reason.
     <div style={{
-      position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-      width: '100vw', height: '100vh',
+      position: 'fixed', inset: 0,
       margin: 0, padding: 0, borderRadius: 0,
       zIndex: 2000,
       background: '#fff',
@@ -1511,12 +1558,10 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
               border: '1px solid #d1d5db', borderRadius: 6, cursor: 'pointer',
               minHeight: 44,
             }}>Home</button>
-            <button onClick={triggerEstop} style={{
-              padding: '10px 16px', fontSize: 13, fontWeight: 700,
-              background: '#DC2626', color: '#fff',
-              border: 'none', borderRadius: 6, cursor: 'pointer',
-              minHeight: 44,
-            }}>STOP</button>
+            {/* STOP moved into the sticky footer bar so it stays visible
+                on tablet-portrait even when this toolbar wraps or the
+                jog area consumes all vertical space. See the FOOTER
+                block below. */}
           </div>
 
           {/* JOG PAD — flex:1, scales to fit. Buttons sized via the
@@ -1594,42 +1639,58 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
         <ProgressDots count={positions.length} currentIdx={posIdx} statuses={statuses} />
       </div>
 
-      {/* FOOTER (~88px) — Back / Record / Skip in teach mode; only Back in
-          choice mode (the Reuse/Re-teach buttons live in the body). */}
+      {/* STICKY FOOTER — tablet-first: STOP + Back + Record + Skip share
+          one row that stays reserved outside the scrollable content.
+          padding-bottom includes env(safe-area-inset-bottom) so the row
+          clears the iOS home indicator / Android nav bar. `Enter
+          manually` moved down a tier — it's less critical than STOP and
+          the sticky row on 800 px portrait doesn't have space for a
+          fifth button. */}
       <div style={{
         flex: '0 0 auto', minHeight: 88,
-        padding: '14px 24px',
+        padding: '14px 16px',
+        paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 14px)',
         borderTop: '1px solid #e5e7eb',
-        display: 'flex', gap: 12, alignItems: 'center',
+        display: 'flex', gap: 10, alignItems: 'center',
         boxSizing: 'border-box',
+        flexWrap: 'wrap',
       }}>
+        <button onClick={triggerEstop} style={{
+          padding: '0 18px', minHeight: 56, minWidth: 96,
+          fontSize: 15, fontWeight: 800,
+          background: '#DC2626', color: '#fff',
+          border: 'none', borderRadius: 10, cursor: 'pointer',
+          flexShrink: 0,
+          boxShadow: '0 0 0 2px rgba(220,38,38,0.15)',
+        }}>⏹ STOP</button>
         <button onClick={goBack} style={{
-          padding: '14px 22px', minHeight: 56, fontSize: 14, fontWeight: 700,
+          padding: '0 18px', minHeight: 56, fontSize: 14, fontWeight: 700,
           background: '#fff', color: '#374151',
           border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+          flexShrink: 0,
         }}>← Back</button>
         {!showChoiceScreen && (
           <>
-            <div style={{ flex: 1 }} />
-            <button onClick={openManualEntry} title="Type in x/y/z + orientation instead of capturing live" style={{
-              padding: '14px 20px', minHeight: 56, fontSize: 13, fontWeight: 700,
-              background: '#fff', color: '#2563EB',
-              border: '1px solid #93c5fd', borderRadius: 10, cursor: 'pointer',
-            }}>Enter manually</button>
             <button onClick={recordPosition} style={{
-              padding: '14px 32px', minHeight: 60, fontSize: 16, fontWeight: 800,
+              flex: 1, padding: '0 20px', minHeight: 60, fontSize: 16, fontWeight: 800,
               background: flash ? '#16A34A' : '#2563EB', color: '#fff',
               border: 'none', borderRadius: 10, cursor: 'pointer',
-              minWidth: 220,
+              minWidth: 200,
               transition: 'background 200ms',
             }}>
               {flash ? '✓ Recorded' : 'Record Position'}
             </button>
-            <div style={{ flex: 1 }} />
+            <button onClick={openManualEntry} title="Type in x/y/z + orientation instead of capturing live" style={{
+              padding: '0 14px', minHeight: 56, fontSize: 13, fontWeight: 700,
+              background: '#fff', color: '#2563EB',
+              border: '1px solid #93c5fd', borderRadius: 10, cursor: 'pointer',
+              flexShrink: 0,
+            }}>Enter…</button>
             <button onClick={skipCurrent} style={{
-              padding: '14px 22px', minHeight: 56, fontSize: 14, fontWeight: 700,
+              padding: '0 18px', minHeight: 56, fontSize: 14, fontWeight: 700,
               background: '#fff', color: '#374151',
               border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+              flexShrink: 0,
             }}>Skip →</button>
           </>
         )}
