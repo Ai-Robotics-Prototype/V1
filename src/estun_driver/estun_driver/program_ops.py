@@ -455,18 +455,32 @@ def codegen_lua_from_program(
         #   rotates without any Cartesian motion. movJ to the anchor
         #   name is exact.
         #
-        # FIX B — |offset_z_mm| ≥ 1 mm: no in-process IK library is
-        #   available at codegen time (no ikpy / no MoveIt bridge from
-        #   this module), so we fall back to `movL({cp={...}}, {coor=0,
-        #   tool=0})` with the anchor's rx/ry/rz preserved and the
-        #   frame/tool pinned. Pinning coor and tool reduces the IK's
-        #   solution-branch ambiguity (unpinned, Estun searches across
-        #   frames), which curbs — but does not eliminate — the wrist-
-        #   flip hazard. The step is flagged in the emitted comment so
-        #   the operator watches these steps live. Preferred long-term
-        #   fix: ship a seeded-IK helper (URDF at /opt/cobot/models/
-        #   estun_s10-140.urdf + ikpy) and swap this branch for a
-        #   movJ with the seeded-IK joints.
+        # FIX B (v2) — |offset_z_mm| ≥ 1 mm: emit movJCoorRel with a
+        #   relative-cp offset in base frame (coor=0). movJCoorRel is a
+        #   wire-verified verb in luaenginelib.json whose semantics are
+        #   documented as "Move from the current position, based on the
+        #   user's coordinate system, [the] joint moves to the target
+        #   point." Two properties that matter for our wrist problem:
+        #     • the START pose is CURRENT joints — the arm is at the
+        #       anchor after the just-fired movJ, so IK is seeded from
+        #       the anchor's exact taught joint solution (including J5)
+        #       and can't jump to a distant IK branch;
+        #     • the TARGET is expressed as a RELATIVE cp offset
+        #       ({cp={0,0,Δz,0,0,0}}) — no absolute orientation is
+        #       resolved, so there's no rx/ry/rz for the IK to satisfy
+        #       via a wrist flip.
+        #   The previous mitigation — absolute-cp movL with coor=0 /
+        #   tool=0 pinned — did NOT prevent J5 re-solve at runtime
+        #   (operator observed ~138° J5 rotation on step 7). Delegating
+        #   the IK to the controller with a relative offset and
+        #   current-pose seed is the proper fix.
+        #
+        # Note on true codegen-time seeded IK: the URDF at
+        # models/robots/estun_s10-140/ is untracked and unverified, and
+        # a Python-side IK (ikpy / PyKDL) would need the exact DH/URDF
+        # to match the controller's kinematics. Delegating to the
+        # controller via movJCoorRel avoids that risk entirely — it
+        # uses the arm's own kinematics.
         if step.get('derived_from') and not (
                 isinstance(step.get('taught_joints'), list)
                 and len(step.get('taught_joints')) == 6):
@@ -481,35 +495,31 @@ def codegen_lua_from_program(
                 anchor = role_map.get(role, {})
                 tj = anchor.get('taught_joints') or []
                 joints_s = ', '.join(f'{float(v):+.3f}' for v in tj) if tj else ''
+                j5_note = (f'J5={float(tj[4]):+.2f}°' if len(tj) >= 5 else 'J5=?')
                 exec_lines.append(
                     f'movJ({ref})  -- step {action}  '
                     f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
-                    f'(FIX A: identity offset → reuse anchor jp; no IK)'
+                    f'(FIX A: identity offset → reuse anchor jp; no IK)  '
+                    f'{j5_note}'
                     + (f'  joints=[{joints_s}]' if joints_s else ''))
                 continue
-            # FIX B: non-trivial offset. Resolve to cp, emit movL with
-            # coor=0, tool=0 pinned, and flag the step.
-            resolved = _resolve_derived(step, role_map)
-            if resolved is not None:
-                kind, vals = resolved
-                if kind == 'cp':
-                    cp_s = ', '.join(f'{v:g}' for v in vals)
-                    exec_lines.append(
-                        f'movL({{cp={{{cp_s}}}}},{{coor=0,tool=0}})  '
-                        f'-- step {action}  derived_from={role!r} '
-                        f'offset_z_mm={ofs_mm:g}  '
-                        f'(FIX B: offset>1mm; no seeded IK available — '
-                        f'movL with anchor rx/ry/rz + pinned coor/tool. '
-                        f'WATCH LIVE: wrist could still re-solve.)')
-                else:  # jp fallback (anchor had no tcp AND offset≈0)
-                    jp_s = ', '.join(f'{v:g}' for v in vals)
-                    exec_lines.append(
-                        f'movJ({{jp={{{jp_s}}}}})  -- step {action}  '
-                        f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
-                        f'(anchor jp fallback)')
-                continue
-            # Anchor unresolved — fall through so the point_name /
-            # taught_joints paths still get a chance.
+            # FIX B v2: non-trivial offset. Emit movJCoorRel with a
+            # relative cp offset. Base-frame Z (+/-) preserves the
+            # wizard's semantics for offset_z_mm. anchor J5 recorded in
+            # the comment so operator can compare vs live post-run.
+            anchor = role_map.get(role, {})
+            tj = anchor.get('taught_joints') or []
+            j5_note = (f'anchor J5={float(tj[4]):+.2f}°' if len(tj) >= 5 else 'anchor J5=?')
+            # Relative cp: only translate Z. No orientation delta so
+            # the controller's IK has no reason to re-solve wrist.
+            exec_lines.append(
+                f'movJCoorRel({{cp={{0,0,{ofs_mm:g},0,0,0}}}},{{coor=0,tool=0}})  '
+                f'-- step {action}  derived_from={role!r} '
+                f'offset_z_mm={ofs_mm:g}  '
+                f'(FIX B v2: base-frame Z-offset from CURRENT joints — '
+                f'controller IK seeded from anchor pose, wrist held.  '
+                f'{j5_note})')
+            continue
 
         # ---- Motion — movJ/movL via point ref or inline taught_joints
         pn = step.get('point_name')
@@ -528,8 +538,9 @@ def codegen_lua_from_program(
             if role and role not in role_point_name:
                 role_point_name[role] = pn
             joints_s = ', '.join(f'{float(v):+.3f}' for v in j)
+            j5_note = f'J5={float(j[4]):+.2f}°'
             exec_lines.append(f'{verb}({pn})  -- step {action}  point={pn}  '
-                              f'joints=[{joints_s}]')
+                              f'{j5_note}  joints=[{joints_s}]')
             continue
         taught = step.get('taught_joints')
         if not (isinstance(taught, list) and len(taught) == 6
@@ -549,8 +560,9 @@ def codegen_lua_from_program(
         if role and role not in role_point_name:
             role_point_name[role] = name
         joints_s = ', '.join(f'{float(v):+.3f}' for v in taught)
+        j5_note = f'J5={float(taught[4]):+.2f}°'
         exec_lines.append(f'{verb}({name})  -- step {action}  '
-                          f'joints=[{joints_s}]')
+                          f'{j5_note}  joints=[{joints_s}]')
 
     # If the program has any `loop` step, prepend a `::_prog_start::`
     # label so the emitted `goto _prog_start` has a target. Label goes

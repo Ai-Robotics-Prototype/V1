@@ -1,7 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 import ProgramEditor from '../components/ProgramEditor'
-import PointsPanel from '../components/PointsPanel'
 import ArmViewer3D from '../components/ArmViewer3D'
 import JogControls from '../components/JogControls'
 
@@ -655,7 +654,10 @@ export default function ProgramLayout() {
         <div style={{ width: '100%', height: '100%',
                       display: 'flex', flexDirection: 'column',
                       overflow: 'hidden', gap: 8, padding: 8 }}>
-          <PointsPanel />
+          {/* Removed the top PointsPanel — wizard-authored programs store
+              their poses inline on each step (taught_joints), not in a
+              separate points{} table, so this panel always showed
+              "POINTS (0)" and was pure visual noise. */}
           <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
             <ProgramEditor />
           </div>
@@ -695,7 +697,11 @@ export default function ProgramLayout() {
             <div style={{ width: '100%', height: '100%',
                           display: 'flex', flexDirection: 'column',
                           overflow: 'hidden', gap: 8, padding: 8 }}>
-              <PointsPanel compact />
+              {/* PointsPanel removed — see note in the expanded branch
+                  above. Wizard programs carry poses inline on each
+                  step; the separate points{} table was rarely used
+                  and made this compact view always render an empty
+                  "POINTS (0)" card. */}
               <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
                 <ProgramEditor />
               </div>
