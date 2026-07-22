@@ -2229,6 +2229,126 @@ const PAGES = [
     ),
   },
 
+  // 6b: Tool payload — mass + optional CoG. Stored under
+  // config.payload_kg / config.payload_cog_mm / config.tool_name.
+  // Non-blocking (operators can skip with "Not sure yet"), but every
+  // downstream surface (editor / run modal / monitor chip) will show
+  // an amber warning until it's filled in. See the codegen header
+  // and lib/payload.js for the full policy.
+  {
+    id: 'payload',
+    render: ({ answers, setAnswer, goNext }) => {
+      const kg = answers.payload_kg
+      const kgNum = Number(kg)
+      const canProceed = kg === 'skip' || (Number.isFinite(kgNum) && kgNum > 0)
+      const [showCog, setShowCog] = useState(false)
+      const cog = answers.payload_cog_mm || {}
+      return (
+        <QuestionCard
+          question="What tool or payload does this program use?"
+          description="Enter the tool's mass so the controller can size collision-detection thresholds correctly. If you don't know yet you can skip this and set it later in the program editor."
+        >
+          <div style={{
+            display: 'flex', flexDirection: 'column', gap: 12,
+            padding: '4px 2px',
+          }}>
+            <label style={{ fontSize: 13, color: '#374151', fontWeight: 600 }}>
+              Tool mass (kg)
+              <input
+                type="number" step="0.1" min="0" max="30"
+                placeholder="e.g. 1.2"
+                value={kg && kg !== 'skip' ? kg : ''}
+                onChange={(e) => setAnswer('payload_kg',
+                  e.target.value === '' ? null : Number(e.target.value))}
+                autoFocus
+                style={{
+                  display: 'block', marginTop: 6,
+                  padding: '8px 12px', fontSize: 16, fontWeight: 500,
+                  border: '1px solid #d1d5db', borderRadius: 8,
+                  background: '#fff', color: '#111827', width: 140,
+                }} />
+            </label>
+            <label style={{ fontSize: 13, color: '#374151', fontWeight: 600 }}>
+              Tool name (optional)
+              <input
+                type="text" maxLength={40}
+                placeholder="e.g. vacuum tool, welding gun, adaptive gripper"
+                value={answers.tool_name || ''}
+                onChange={(e) => setAnswer('tool_name', e.target.value)}
+                style={{
+                  display: 'block', marginTop: 6,
+                  padding: '8px 12px', fontSize: 14,
+                  border: '1px solid #d1d5db', borderRadius: 8,
+                  background: '#fff', color: '#111827', width: 340,
+                }} />
+            </label>
+            <button
+              onClick={() => setShowCog((v) => !v)}
+              style={{
+                background: 'none', border: 'none', padding: 0,
+                fontSize: 13, color: '#2563EB', cursor: 'pointer',
+                fontWeight: 500, textAlign: 'left', maxWidth: 300,
+              }}>
+              {showCog ? '▾ Hide CoG offset' : '▸ Add CoG offset (advanced)'}
+            </button>
+            {showCog && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+                fontSize: 13, color: '#374151',
+              }}>
+                <span>CoG (mm from flange)</span>
+                {['x', 'y', 'z'].map((k) => (
+                  <span key={k} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <span style={{ color: '#6b7280', fontWeight: 700, textTransform: 'uppercase' }}>{k}</span>
+                    <input
+                      type="number" step="1"
+                      placeholder="0"
+                      value={cog[k] ?? ''}
+                      onChange={(e) => {
+                        const v = e.target.value
+                        const next = { ...cog }
+                        if (v === '') delete next[k]
+                        else if (Number.isFinite(Number(v))) next[k] = Number(v)
+                        setAnswer('payload_cog_mm', Object.keys(next).length ? next : null)
+                      }}
+                      style={{
+                        padding: '4px 8px', fontSize: 13,
+                        border: '1px solid #d1d5db', borderRadius: 5,
+                        width: 72, textAlign: 'right',
+                      }} />
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+          <div style={{
+            padding: 12, background: '#EFF6FF', borderRadius: 8,
+            border: '1px solid #bfdbfe', fontSize: 12, color: '#1E3A8A',
+            marginTop: 14, lineHeight: 1.55,
+          }}>
+            <b>Why we ask.</b> Without a payload value the collision
+            monitor uses default (heavier) thresholds — false positives
+            go up and true collisions register later. Programs without
+            a set payload will show a warning until it's filled in.
+          </div>
+          <div style={{ marginTop: 16, display: 'flex', gap: 10, alignItems: 'center' }}>
+            <button
+              onClick={() => { setAnswer('payload_kg', 'skip'); goNext() }}
+              style={{
+                padding: '10px 18px', fontSize: 14, fontWeight: 500,
+                background: 'transparent', color: '#6b7280',
+                border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
+              }}>
+              Not sure yet — skip
+            </button>
+            <div style={{ flex: 1 }} />
+            <NextButton onClick={goNext} label="Next" disabled={!canProceed} />
+          </div>
+        </QuestionCard>
+      )
+    },
+  },
+
   // 7: Where to place? (for pick_and_place)
   //    Skipped for machine_tend (own load/unload teach) and palletize
   //    (the pallet pages own the place flow).
@@ -3130,6 +3250,21 @@ export default function ProgramWizard({ onClose, onSaved }) {
       config.speed = SILENT_SPEED_PCT
       config.speed_pct = SILENT_SPEED_PCT
       config.motion_profile_name = SILENT_MOTION_PROFILE
+      // Payload normalization: the wizard stores `payload_kg='skip'`
+      // when the operator chose "Not sure yet". Persist that as an
+      // explicit null so codegen + editor + run modal all agree the
+      // program has no payload set. Empty tool_name / no-CoG entries
+      // stay out of config so we don't ship junk keys.
+      if (config.payload_kg === 'skip' || config.payload_kg === undefined) {
+        config.payload_kg = null
+      }
+      if (!config.tool_name || String(config.tool_name).trim() === '') {
+        delete config.tool_name
+      }
+      if (config.payload_cog_mm && typeof config.payload_cog_mm === 'object'
+          && Object.keys(config.payload_cog_mm).length === 0) {
+        delete config.payload_cog_mm
+      }
       if (answers.operation === 'palletize') {
         const pallet = buildPalletConfig(answers)
         config.pallet      = pallet

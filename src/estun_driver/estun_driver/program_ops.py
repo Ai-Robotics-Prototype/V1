@@ -812,6 +812,42 @@ def codegen_lua_from_program(
         f'{program.get("id","<unknown>")!r}',
         f'-- taught steps: {len(steps)}, requested speed_pct={requested_pct}, '
         f'operator_cap_pct={operator_speed_limit_pct}, effective_pct={eff_pct}',]
+    # Payload annotation (INFO ONLY). The captured luaenginelib.json has
+    # NO callable setPayload signature — `setPayload` appears only as a
+    # reserved word in the Estun-Lua dialect's syntax-highlighter
+    # keyword list, and the i18n bundle labels it "Set the default
+    # load" (a factory-UI menu string, not a callable). The controller
+    # itself selects payload by PayloadId preset (visible in
+    # publish/RobotStatus). We therefore write the operator-authored
+    # payload_kg into the header as informational metadata but do NOT
+    # emit any wire-invented verb — see the run-confirm modal's
+    # PAYLOAD_INFO_ONLY line for where the operator sets the matching
+    # preset on the controller.
+    payload_kg = cfg.get('payload_kg')
+    try:
+        pkg = float(payload_kg) if payload_kg not in (None, '') else None
+    except (TypeError, ValueError):
+        pkg = None
+    if pkg is not None and pkg > 0:
+        tool_name = str(cfg.get('tool_name') or '').strip()
+        note = f'-- payload: {pkg:g} kg'
+        if tool_name:
+            note += f' ({tool_name})'
+        note += ' — info only; select the matching PayloadId preset on the controller'
+        footer_lines.append(note)
+        cog = cfg.get('payload_cog_mm') or {}
+        if isinstance(cog, dict) and any(k in cog for k in ('x','y','z')):
+            x = cog.get('x'); y = cog.get('y'); z = cog.get('z')
+            footer_lines.append(
+                f'-- payload CoG (mm from flange): '
+                f'x={x if x is not None else "?"} '
+                f'y={y if y is not None else "?"} '
+                f'z={z if z is not None else "?"}')
+    else:
+        footer_lines.append(
+            '-- payload: UNSET — collision-detection accuracy on this '
+            'program is reduced until an operator sets the tool mass '
+            'in the program editor')
     if home_drift_notes:
         footer_lines.append('-- FIX C: move_home drift normalized —')
         for note in home_drift_notes:

@@ -12,6 +12,7 @@ import StepPreviewPanel from '../components/StepPreviewPanel'
 import { deriveRunState, isStopButtonEnabled,
          isStuckStopping as _computeStuckStopping,
          STUCK_STOPPING_MS } from '../lib/runState'
+import { readPayload, payloadChipLabel } from '../lib/payload'
 
 // Status badge — reads the unified deriveRunState() so pill matches
 // footer matches banner. Rendered from a runState object (color, label,
@@ -1725,8 +1726,19 @@ function ProgramProvenance({ program }) {
   const pbd = cfg.pbd_metadata || null
   const detail = pbd?.demo_id ? `demo ${pbd.demo_id}` : null
 
+  const payload = readPayload(program)
+  const payloadChip = payload.isSet
+    ? { bg: '#ECFDF5', border: '#059669', text: '#065F46',
+        label: payloadChipLabel(payload),
+        title: `Payload ${payload.kg} kg — informational only. Set the ` +
+               `matching PayloadId preset on the controller.` }
+    : { bg: '#FFFBEB', border: '#F59E0B', text: '#92400E',
+        label: 'Payload not set',
+        title: 'No payload set — collision detection accuracy on this ' +
+               'program is reduced. Open the program in the editor to set it.' }
+
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
       <span style={{
         display: 'inline-block', padding: '3px 10px',
         background: badgeStyle.bg,
@@ -1735,6 +1747,16 @@ function ProgramProvenance({ program }) {
         fontSize: 12, fontWeight: 600,
       }}>
         {badgeStyle.label}
+      </span>
+      <span title={payloadChip.title} style={{
+        display: 'inline-block', padding: '3px 10px',
+        background: payloadChip.bg,
+        border: `1px solid ${payloadChip.border}`,
+        color: payloadChip.text, borderRadius: 999,
+        fontSize: 12, fontWeight: 600,
+        cursor: 'help',
+      }}>
+        {payloadChip.label}
       </span>
       {detail && (
         <span style={{ fontSize: 12, color: '#6b7280', fontFamily: 'monospace' }}>

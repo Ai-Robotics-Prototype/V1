@@ -4,6 +4,8 @@ import { useStore } from '../store/useStore'
 import ProgramWizard from './ProgramWizard'
 import ProgramFromDemonstration from './ProgramFromDemonstration'
 import { HoldButton } from './JogControls'
+import { readPayload, PAYLOAD_UNSET_WARNING, PAYLOAD_INFO_ONLY }
+  from '../lib/payload'
 
 // The richer action taxonomy lives in the editor. Each action carries
 // a coarse `type` (matching the existing backend schema: move/gripper/
@@ -2160,6 +2162,159 @@ function TeachOverlay({
   )
 }
 
+// Editable "Tool & Payload" section. Sits between the untaught-
+// positions banner and the step list. Collapsed by default when the
+// value is set (out of the way); AUTO-EXPANDED with an amber banner
+// when unset so the operator sees they need to fill it in. Values
+// live under program.config.{payload_kg, tool_name, payload_cog_mm}.
+function ToolAndPayloadSection({ program, onPatch }) {
+  const payload = readPayload(program)
+  const [expanded, setExpanded] = useState(!payload.isSet)
+  const [showCog,  setShowCog]  = useState(
+    !!(payload.cog_mm && (payload.cog_mm.x || payload.cog_mm.y || payload.cog_mm.z)))
+  // Keep expansion in sync when the operator jumps between programs.
+  useEffect(() => {
+    if (!payload.isSet) setExpanded(true)
+  }, [payload.isSet, program?.id])
+
+  const containerStyle = {
+    margin: '10px 12px 0', padding: 0,
+    border: `1px solid ${payload.isSet ? '#e5e7eb' : '#F59E0B'}`,
+    background: payload.isSet ? '#fff' : '#FFFBEB',
+    borderRadius: 8,
+  }
+  const headerStyle = {
+    padding: '8px 12px',
+    display: 'flex', alignItems: 'center', gap: 10,
+    cursor: 'pointer', userSelect: 'none',
+    borderBottom: expanded ? `1px solid ${payload.isSet ? '#e5e7eb' : '#F59E0B'}` : 'none',
+  }
+  const labelStyle = {
+    fontSize: 12, fontWeight: 700, color: payload.isSet ? '#111827' : '#92400E',
+    textTransform: 'uppercase', letterSpacing: '0.06em',
+  }
+  const inputStyle = {
+    padding: '4px 8px', fontSize: 13, fontWeight: 500,
+    border: '1px solid #d1d5db', borderRadius: 5,
+    background: '#fff', color: '#111827', width: 90, textAlign: 'right',
+  }
+  const smallInput = { ...inputStyle, width: 64 }
+  const bodyStyle = { padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 10 }
+
+  return (
+    <div style={containerStyle}>
+      <div style={headerStyle} onClick={() => setExpanded((v) => !v)}>
+        <span style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
+                        transition: 'transform 150ms', color: '#6b7280', fontSize: 11 }}>▶</span>
+        <span style={labelStyle}>Tool &amp; Payload</span>
+        <div style={{ flex: 1 }} />
+        {payload.isSet
+          ? (
+            <span style={{
+              fontSize: 12, fontWeight: 600, color: '#065F46',
+              background: '#ECFDF5', border: '1px solid #059669',
+              padding: '2px 10px', borderRadius: 999,
+            }}>
+              {payload.kg} kg{payload.tool_name ? ` · ${payload.tool_name}` : ''}
+            </span>
+          )
+          : (
+            <span style={{
+              fontSize: 12, fontWeight: 700, color: '#92400E',
+              background: '#FEF3C7', border: '1px solid #F59E0B',
+              padding: '2px 10px', borderRadius: 999,
+            }}>
+              ⚠ Payload not set
+            </span>
+          )}
+      </div>
+      {expanded && (
+        <div style={bodyStyle}>
+          {!payload.isSet && (
+            <div style={{ fontSize: 12, color: '#92400E', lineHeight: 1.5 }}>
+              {PAYLOAD_UNSET_WARNING}
+            </div>
+          )}
+          {/* Tool mass */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <label style={{ fontSize: 12, color: '#374151', fontWeight: 600, minWidth: 120 }}>
+              Tool mass (kg)
+            </label>
+            <input
+              type="number" step="0.1" min="0" max="30"
+              value={payload.kg ?? ''}
+              placeholder="e.g. 1.2"
+              onChange={(e) => {
+                const v = e.target.value
+                if (v === '') { onPatch({ payload_kg: null }); return }
+                const n = Number(v)
+                if (Number.isFinite(n)) onPatch({ payload_kg: n })
+              }}
+              style={inputStyle} />
+            <label style={{ fontSize: 12, color: '#374151', fontWeight: 600, marginLeft: 12 }}>
+              Tool name (optional)
+            </label>
+            <input
+              type="text" maxLength={40}
+              placeholder="e.g. vacuum tool"
+              value={payload.tool_name || ''}
+              onChange={(e) => onPatch({ tool_name: e.target.value })}
+              style={{ ...inputStyle, width: 180, textAlign: 'left' }} />
+          </div>
+          {/* CoG toggle + fields */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <button
+              onClick={() => setShowCog((v) => !v)}
+              style={{
+                background: 'none', border: 'none', padding: 0,
+                fontSize: 12, color: '#2563EB', cursor: 'pointer',
+                fontWeight: 500, textAlign: 'left', maxWidth: 220,
+              }}>
+              {showCog ? '▾ Hide CoG offset' : '▸ Add CoG offset (advanced)'}
+            </button>
+            {showCog && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                fontSize: 12, color: '#374151',
+              }}>
+                <span style={{ minWidth: 120 }}>CoG (mm from flange)</span>
+                {['x', 'y', 'z'].map((k) => (
+                  <span key={k} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <span style={{ color: '#6b7280', fontWeight: 600, textTransform: 'uppercase' }}>{k}</span>
+                    <input
+                      type="number" step="1"
+                      placeholder="0"
+                      value={payload.cog_mm?.[k] ?? ''}
+                      onChange={(e) => {
+                        const v = e.target.value
+                        const prev = payload.cog_mm || {}
+                        const next = { ...prev }
+                        if (v === '') { delete next[k] }
+                        else {
+                          const n = Number(v)
+                          if (Number.isFinite(n)) next[k] = n
+                        }
+                        onPatch({ payload_cog_mm: Object.keys(next).length ? next : null })
+                      }}
+                      style={smallInput} />
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+          <div style={{
+            padding: '8px 10px', background: '#EFF6FF',
+            border: '1px solid #93C5FD', borderRadius: 6,
+            fontSize: 11, color: '#1E3A8A', lineHeight: 1.5,
+          }}>
+            <b>Info only.</b>{' '}{PAYLOAD_INFO_ONLY}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function ProgramEditor() {
   const currentProgram     = useStore((s) => s.currentProgram)
   const setCurrentProgram  = useStore((s) => s.setCurrentProgram)
@@ -3036,6 +3191,19 @@ export default function ProgramEditor() {
           </button>
         </div>
       )}
+
+      {/* Tool & Payload — per-program metadata. Not on the wire (see
+          codegen; setPayload isn't wire-proven), but the collision
+          monitor and the run confirm modal both surface the value.
+          Amber banner when unset to nudge the operator; the fields
+          themselves live inside the collapsible section below. */}
+      <ToolAndPayloadSection
+        program={currentProgram}
+        onPatch={(patch) => setCurrentProgram({
+          config: { ...(currentProgram?.config || {}), ...patch },
+          unsaved: true,
+        })}
+      />
 
       <div
         // Clicking blank space inside the scroll area (not on a row)

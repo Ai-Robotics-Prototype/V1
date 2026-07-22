@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store/useStore'
+import { readPayload, PAYLOAD_UNSET_WARNING, PAYLOAD_INFO_ONLY }
+  from '../lib/payload'
 
 // Confirm modal for the Monitor "Run Program" button. Reads the same
 // currentProgram + robot.allow_move + robot.operator_speed_limit that
@@ -198,6 +200,54 @@ export default function RunProgramModal() {
                 {' — runs on REAL ARM'}
               </span>
             </div>
+            {/* Payload row — always shown so the operator sees whether
+                a program was authored with a payload value. When unset
+                a prominent warning appears below; when set an info
+                line clarifies that this is metadata only (we do NOT
+                emit setPayload — the verb isn't wire-proven; the
+                controller selects payload via PayloadId preset). */}
+            {(() => {
+              const p = readPayload(currentProgram)
+              return (
+                <div style={rowStyle}>
+                  <span style={{ color: '#6b7280' }}>Payload</span>
+                  <span style={{
+                    fontWeight: 700,
+                    color: p.isSet ? '#065F46' : '#B45309',
+                  }}>
+                    {p.isSet
+                      ? `${p.kg} kg${p.tool_name ? ` · ${p.tool_name}` : ''} (info only)`
+                      : 'not set — see warning below'}
+                  </span>
+                </div>
+              )
+            })()}
+            {(() => {
+              const p = readPayload(currentProgram)
+              if (p.isSet) {
+                return (
+                  <div style={{
+                    marginTop: 12, padding: 10, background: '#EFF6FF',
+                    border: '1px solid #93C5FD', borderRadius: 6,
+                    color: '#1E3A8A', fontSize: 12, lineHeight: 1.5,
+                  }}>
+                    <b>Payload {p.kg} kg</b>{p.tool_name ? ` · ${p.tool_name}` : ''}.
+                    {' '}{PAYLOAD_INFO_ONLY}
+                  </div>
+                )
+              }
+              return (
+                <div style={{
+                  marginTop: 12, padding: 10, background: '#FEF3C7',
+                  border: '1px solid #F59E0B', borderRadius: 6,
+                  color: '#92400E', fontSize: 13,
+                }}>
+                  <b>⚠ {PAYLOAD_UNSET_WARNING}</b>
+                  {' '}Run is allowed — but every run without a payload
+                  will keep showing this warning.
+                </div>
+              )
+            })()}
             {!gateOK && (
               <div style={{
                 marginTop: 12, padding: 10, background: '#FEF3C7',
