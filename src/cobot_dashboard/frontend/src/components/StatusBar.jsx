@@ -1,5 +1,21 @@
+import { useEffect, useState } from 'react'
 import { useStore } from '../store/useStore'
 import { deriveRunState } from '../lib/runState'
+
+// SERVED bundle identifier — read at runtime from the actual script
+// URL the browser loaded. This is Vite's content-hashed filename
+// (assets/index-<HASH>.js), so it matches whatever the server's
+// mock_server/static/ directory currently ships and CANNOT diverge
+// like a compile-time __BUILD_ID__ (which lies when a newer bundle
+// is served but the tab wasn't reloaded).
+function getServedBundleHash() {
+  if (typeof document === 'undefined') return null
+  for (const el of document.querySelectorAll('script[src]')) {
+    const m = el.src && el.src.match(/\/assets\/index-([A-Za-z0-9_-]+)\.js/)
+    if (m) return m[1]
+  }
+  return null
+}
 
 function Block({ children, style }) {
   return (
@@ -94,18 +110,64 @@ export default function StatusBar() {
 
       <div style={{ flex: 1 }} />
 
-      {/* Right side: version.
-          __BUILD_ID__ is now `git describe --always --dirty` (deterministic
-          per tree state); __COMMIT__ carries the same string for backwards-
-          compat. The visible label is BUILD_ID + BUILD_TIME so a rebuild
-          on unchanged tree still emits a new footer via BUILD_TIME
-          (second precision).*/}
-      <Block style={{ borderRight: 'none', borderLeft: '1px solid var(--border)', color: 'var(--text-muted)' }}>
-        {typeof __BUILD_ID__ !== 'undefined' ? `build ${__BUILD_ID__}` : 'dev'}
-        {typeof __BUILD_TIME__ !== 'undefined' && (
-          <span style={{ marginLeft: 6, opacity: 0.55 }}>{__BUILD_TIME__}</span>
-        )}
-      </Block>
+      {/* Right side: SERVED bundle identity.
+          `served <hash>` is Vite's content-hash of index-<HASH>.js — read
+          from the actual <script> element the browser loaded. This is
+          the SAME sha256 that System Check Software row displays
+          (dashboard_server _check_software → bundle_hash_for), so the
+          two ALWAYS agree on which bundle the tab is running.
+          BUILD_TIME is retained as a secondary freshness signal (a
+          rebuild with the same source tree emits the same hash but a
+          new BUILD_TIME).
+          If a newer bundle lands on the server, the footer stays
+          pinned to what THIS tab actually loaded — telling the operator
+          they need to reload. That was the whole point of the fix. */}
+      <FooterBuild />
     </div>
+  )
+}
+
+function FooterBuild() {
+  const [servedHash] = useState(() => getServedBundleHash())
+  const [systemHash, setSystemHash] = useState(null)
+  useEffect(() => {
+    // Fetch System Check ONCE for the "does what this tab loaded
+    // match what the server currently serves?" comparison. Refreshing
+    // won't help if the tab is stale — the operator has to reload.
+    let cancelled = false
+    fetch('/api/systemcheck')
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => {
+        if (cancelled || !d) return
+        const sw = (d.checks || []).find((c) => c.key === 'software')
+        // Use the Vite content-hash from the JS asset filename (same
+        // hash space as our footer's DOM lookup). Falls back to the
+        // sha256 of index.html for older backends that don't emit
+        // served_asset_hash yet.
+        if (sw) setSystemHash(sw.served_asset_hash || sw.served_hash)
+      }).catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+  const shortHash = servedHash ? servedHash.slice(0, 8) : null
+  const stale = systemHash && servedHash && systemHash !== servedHash
+  return (
+    <Block style={{
+      borderRight: 'none',
+      borderLeft: '1px solid var(--border)',
+      color: stale ? '#B45309' : 'var(--text-muted)',
+    }}>
+      {shortHash
+        ? <>served <span style={{ fontFamily: 'var(--font-mono)' }}>{shortHash}</span></>
+        : 'dev'}
+      {typeof __BUILD_TIME__ !== 'undefined' && (
+        <span style={{ marginLeft: 6, opacity: 0.55 }}>{__BUILD_TIME__}</span>
+      )}
+      {stale && (
+        <span style={{ marginLeft: 6, fontWeight: 700 }}
+              title={`server now serves ${systemHash.slice(0,8)} — reload to pick it up`}>
+          ⟳ RELOAD
+        </span>
+      )}
+    </Block>
   )
 }

@@ -3035,6 +3035,25 @@ if FASTAPI_AVAILABLE:
         idx = dir_path / "index.html"
         return _sha256_file(str(idx)) if idx.is_file() else ''
 
+    def _bundle_asset_hash_for(dir_path: Path) -> str:
+        """Extract Vite's content-hash from the served JS asset filename
+        (e.g. `assets/index-CpW0QB4a.js` → `CpW0QB4a`). This is the
+        SAME string the frontend footer reads from
+        document.querySelector('script[src*=\"/assets/index-\"]'), so
+        the two views are directly comparable. Returns '' if the
+        pattern doesn't match."""
+        idx = dir_path / "index.html"
+        if not idx.is_file():
+            return ''
+        try:
+            with open(idx, 'r') as f:
+                html = f.read()
+            import re as _re2
+            m = _re2.search(r'/assets/index-([A-Za-z0-9_-]+)\.js', html)
+            return m.group(1) if m else ''
+        except Exception:
+            return ''
+
     def _service_active(name: str) -> bool:
         import subprocess
         try:
@@ -3085,23 +3104,33 @@ if FASTAPI_AVAILABLE:
     def _check_software() -> dict:
         served = _bundle_hash_for(_STATIC_DIR)
         built  = _bundle_hash_for(_BUILT_FRONTEND_DIR)
+        # asset_hash is the Vite content-hash from the JS filename —
+        # this is the SAME string the frontend footer reads at runtime
+        # from document.querySelector('script[src*="/assets/index-"]').
+        # System Check and the footer therefore always agree on which
+        # bundle the tab is running.
+        asset_hash = _bundle_asset_hash_for(_STATIC_DIR)
         if not served:
             return {'level': 'red', 'state': 'Missing',
                     'detail': f'Served bundle not found under {_STATIC_DIR}.',
-                    'served_hash': '', 'built_hash': built[:12]}
+                    'served_hash': '', 'built_hash': built[:12],
+                    'served_asset_hash': asset_hash}
         if not built:
             return {'level': 'green', 'state': 'Up to date',
-                    'detail': None,
-                    'served_hash': served[:12], 'built_hash': ''}
+                    'detail': f'served asset {asset_hash}' if asset_hash else None,
+                    'served_hash': served[:12], 'built_hash': '',
+                    'served_asset_hash': asset_hash}
         if served != built:
             return {'level': 'amber', 'state': 'Refresh needed',
                     'detail': (f'Served bundle differs from the latest '
                                f'build on disk. Copy frontend/dist over '
                                f'mock_server/static and reload the tab.'),
-                    'served_hash': served[:12], 'built_hash': built[:12]}
+                    'served_hash': served[:12], 'built_hash': built[:12],
+                    'served_asset_hash': asset_hash}
         return {'level': 'green', 'state': 'Up to date',
-                'detail': None,
-                'served_hash': served[:12], 'built_hash': built[:12]}
+                'detail': f'served asset {asset_hash}' if asset_hash else None,
+                'served_hash': served[:12], 'built_hash': built[:12],
+                'served_asset_hash': asset_hash}
 
     def _check_services() -> dict:
         results = {name: _service_active(name)
