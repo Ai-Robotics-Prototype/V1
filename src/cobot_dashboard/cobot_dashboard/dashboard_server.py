@@ -3146,9 +3146,22 @@ if FASTAPI_AVAILABLE:
 
     def _check_safety(robot: dict) -> dict:
         missing = []
-        limits_path = os.path.join('/opt/cobot/motion/config',
-                                    'robot_limits.yaml')
-        limits_present = os.path.isfile(limits_path)
+        # Joint limits are considered present if EITHER the operator's
+        # per-cell override (/opt/cobot/motion/config/robot_limits.yaml)
+        # OR the shipped package default (default_robot_limits.yaml
+        # under motion_optimization's share dir) exists — ProfileManager
+        # falls back to the default if the override is missing, so the
+        # cell IS running with valid limits either way.
+        limits_paths = [
+            os.path.join('/opt/cobot/motion/config', 'robot_limits.yaml'),
+            os.path.join(
+                '/home/teddy/cobot_ws/install/motion_optimization/share/'
+                'motion_optimization/config', 'default_robot_limits.yaml'),
+            os.path.join(
+                '/home/teddy/cobot_ws/src/motion_optimization/'
+                'config', 'default_robot_limits.yaml'),
+        ]
+        limits_present = any(os.path.isfile(p) for p in limits_paths)
         if not limits_present:
             missing.append('joint limits')
         # Guards are considered "loaded" when the driver has any

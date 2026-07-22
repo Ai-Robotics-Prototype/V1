@@ -1081,16 +1081,45 @@ class ErrorDedup:
     from the wire (element [2] of the entry), NOT the frame time — it
     stays constant across the reflood so identical faults collapse to
     one event. An empty db list is treated as a clear.
+
+    Part I stale-error fix (2026-07-22): a bare `_active_key = None`
+    on clear meant a straggler reflood of the SAME (code, unix_ts)
+    after the clear would re-fire as `new` — the dashboard would
+    then re-show an alarm the operator had just acknowledged. Now
+    the class remembers the last N cleared keys in an LRU-ish set
+    (`_cleared_keys`) and treats a reflood of any cleared key as
+    `stale` (same handling as `same`: changed=False, no re-fire).
     """
+
+    # How many cleared keys to remember. In practice a run has < ~20
+    # distinct alarms in its lifetime; 64 gives comfortable headroom
+    # without unbounded growth on a very long-running session.
+    _CLEARED_HISTORY = 64
+
     def __init__(self):
         self._active_key: tuple[int, float] | None = None
         self._active_entry: list | None = None
+        # Insertion-ordered (Py 3.7+) — trimmed from the front when
+        # length exceeds _CLEARED_HISTORY. dict-as-ordered-set.
+        self._cleared_keys: dict[tuple[int, float], None] = {}
+
+    def _remember_cleared(self, key):
+        # Drop-oldest if we exceed cap; dict maintains insertion order.
+        self._cleared_keys.pop(key, None)   # move to end if already present
+        self._cleared_keys[key] = None
+        if len(self._cleared_keys) > self._CLEARED_HISTORY:
+            # Evict oldest — first inserted.
+            oldest = next(iter(self._cleared_keys))
+            del self._cleared_keys[oldest]
 
     def observe(self, db: Any) -> dict:
         """Return {kind, entry, key, changed}. kind ∈ {"clear", "new",
-        "same"}."""
+        "same", "stale", "noise"}. `stale` is a reflood of a cleared
+        error — treated like `same` (never re-fires an event)."""
         if not isinstance(db, list) or len(db) == 0:
             changed = self._active_key is not None
+            if self._active_key is not None:
+                self._remember_cleared(self._active_key)
             self._active_key = None
             self._active_entry = None
             return {'kind': 'clear', 'entry': None,
@@ -1104,6 +1133,10 @@ class ErrorDedup:
         key = (code, ts)
         if self._active_key == key:
             return {'kind': 'same', 'entry': entry, 'key': key,
+                    'changed': False}
+        # Reflood of a cleared error — do NOT re-surface it.
+        if key in self._cleared_keys:
+            return {'kind': 'stale', 'entry': entry, 'key': key,
                     'changed': False}
         self._active_key = key
         self._active_entry = entry
