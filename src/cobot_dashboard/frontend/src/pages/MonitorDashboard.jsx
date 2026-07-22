@@ -799,6 +799,28 @@ export default function MonitorDashboard() {
   const status = runState.kind   // kept for old code that keyed off the string
   const isRunning = runState.kind === 'running' || runState.kind === 'stopping'
 
+  // Stuck-STOPPING detector. project/stop normally transitions the
+  // controller state 2→3→0 in well under a second; if it sits at 3 for
+  // >3s, either the driver's stop ack got dropped or the interpreter
+  // stalled mid-motion. Surface a "Force stop / reset" affordance so
+  // the operator isn't trapped without a way to unwedge.
+  const [stoppingSince, setStoppingSince] = useState(null)
+  const [nowTs, setNowTs] = useState(Date.now())
+  useEffect(() => {
+    if (runState.kind === 'stopping') {
+      if (stoppingSince === null) setStoppingSince(Date.now())
+    } else if (stoppingSince !== null) {
+      setStoppingSince(null)
+    }
+  }, [runState.kind, stoppingSince])
+  useEffect(() => {
+    if (stoppingSince === null) return undefined
+    const id = setInterval(() => setNowTs(Date.now()), 500)
+    return () => clearInterval(id)
+  }, [stoppingSince])
+  const stuckStoppingMs = stoppingSince ? (nowTs - stoppingSince) : 0
+  const isStuckStopping = runState.kind === 'stopping' && stuckStoppingMs > 3000
+
   const programName    = currentProgram?.name || 'No program loaded'
   const steps          = currentProgram?.steps || []
   const currentStepIdx = task?.running || task?.paused ? (task?.program_step ?? 0) : -1
@@ -815,23 +837,51 @@ export default function MonitorDashboard() {
   const targetPartId   = programConfig.target_part || null
   const programIdForStats = currentProgram?.id || null
 
-  // Disable-conditions use the unified runState so the Run button
-  // greys out when the Estun pipeline is running (not just when the
-  // sim executor is running). Same for Stop/Pause.
+  // Enable/disable state machine — see README block above the button
+  // row for the operator-facing summary.
+  //
+  //  Button      | idle | running | stopping | paused | estop | alarm
+  //  ------------|------|---------|----------|--------|-------|------
+  //  RUN         |  ✓   |    ·    |    ·     |   ·    |   ·   |   ·
+  //  STOP        |  ·   |    ✓    |  ✓ (*)   |   ✓    |   ✓   |   ✓
+  //  PAUSE       |  ·   |    ✓    |    ·     |   ·    |   ·   |   ·
+  //  RESUME      |  ·   |    ·    |    ·     |   ✓    |   ·   |   ·
+  //  RESTART     |  ✓   |    ✓    |    ✓     |   ✓    |   ·   |   ·
+  //  HOME        |  ✓   |    ✓    |    ✓     |   ✓    |   ·   |   ·
+  //  FORCE-STOP  |  ·   |    ·    | ✓ >3s    |   ·    |   ·   |   ·
+  //
+  // (*) STOP is intentionally exempt from the gate/estop/alarm greying
+  //     that governs the other motion verbs — STOP works precisely when
+  //     things are running or wedged. It is the only recovery affordance
+  //     that must NEVER be unavailable while the arm is in motion.
   const runDisabled    = safety?.estop || runState.kind === 'running'
-  // Return Home: allowed whenever the operator could jog (estop clear,
-  // driver connected, allow_move open). Same gate the Jog panel uses.
-  const homeDisabled   = !!safety?.estop || !robot?.connected || !robot?.allow_move
-  // Restart: requires a loaded program and no e-stop. Runs even if the
-  // executor thinks it's paused / stopping — the stop-then-run sequence
-  // handles those transitions.
+                          || runState.kind === 'stopping'
+                          || runState.kind === 'paused'
+  // Return Home: only disabled by estop. Gate/connection state is
+  // surfaced by the confirm dialog so the operator can still ATTEMPT
+  // (the driver will refuse with a specific reason if the gate is
+  // closed — that's preferable to a greyed button the operator can't
+  // reason about). Explicitly enabled during 'stopping' so the arm can
+  // be returned home when a run wedges in state=3.
+  const homeDisabled   = !!safety?.estop
+  // Restart: enabled from any active state (running/stopping/paused)
+  // AND from idle. The `restartProgram` helper below handles the
+  // stop-then-run sequence when needed, so this button doubles as a
+  // "get me unstuck by starting over" affordance during a wedged
+  // STOPPING. Only estop or no-program disables it.
   const restartDisabled = !!safety?.estop
                           || !(currentProgram?.id)
                           || (steps.length === 0)
-                                        || runState.kind === 'stopping'
   const pauseDisabled  = runState.kind !== 'running' || safety?.estop
-  const stopDisabled   = runState.kind !== 'running' && runState.kind !== 'paused'
-                                                     && runState.kind !== 'stopping'
+  // STOP: NEVER disabled by gate/estop — only by "there's nothing to
+  // stop" (idle without a program-execution state). Estop path is
+  // still permitted because the driver's stop verb is safe to send
+  // repeatedly and won't itself move the arm — sending it when the
+  // controller is already halted is a no-op that clears bookkeeping.
+  const stopDisabled   = runState.kind !== 'running'
+                          && runState.kind !== 'paused'
+                          && runState.kind !== 'stopping'
+                          && runState.kind !== 'alarm'
 
   return (
     <div style={{
@@ -902,31 +952,81 @@ export default function MonitorDashboard() {
             operatorCapFrac={robot?.operator_speed_limit}
           />
 
+          {/* Recovery banner — appears when the controller has been
+              STOPPING (state=3) for more than 3s. Offers Force stop
+              (re-issues project/stop) + Clear alarms (System/ClearError)
+              so the operator can escape a wedged stop without hunting
+              for the button on another screen. */}
+          {isStuckStopping && (
+            <div style={{
+              marginTop: 16, padding: 12,
+              background: '#FEF3C7', border: '1px solid #F59E0B',
+              borderRadius: 8, color: '#92400E', fontSize: 14,
+              display: 'flex', alignItems: 'center', gap: 12,
+              flexWrap: 'wrap',
+            }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 700, marginBottom: 2 }}>
+                  Controller wedged in STOPPING for {Math.floor(stuckStoppingMs / 1000)}s
+                </div>
+                <div style={{ fontSize: 12 }}>
+                  project/stop should transition 2→3→0 in under a second.
+                  Force-stop re-issues the verb; Reset also clears any
+                  latched controller error so Home / Restart can proceed.
+                </div>
+              </div>
+              <button onClick={() => forceStop({ addToast })}
+                      style={{
+                        padding: '10px 18px', fontSize: 14, fontWeight: 700,
+                        background: '#DC2626', color: '#fff', border: 'none',
+                        borderRadius: 8, cursor: 'pointer',
+                      }}>
+                ✕ Force stop
+              </button>
+              <button onClick={() => forceReset({ addToast })}
+                      style={{
+                        padding: '10px 18px', fontSize: 14, fontWeight: 700,
+                        background: '#B45309', color: '#fff', border: 'none',
+                        borderRadius: 8, cursor: 'pointer',
+                      }}>
+                ⟲ Reset (stop + clear alarms)
+              </button>
+            </div>
+          )}
+
           <div style={{ display: 'flex', gap: 10, marginTop: 20, flexWrap: 'wrap' }}>
-            {status === 'paused' ? (
-              <>
-                <button onClick={resumeProgram} disabled={safety?.estop}
-                  style={primaryBtn('#16A34A', safety?.estop)}>
-                  ▶ Resume
-                </button>
-                <button onClick={cancelProgram} style={primaryBtn('#DC2626')}>
-                  ✕ Stop
-                </button>
-              </>
-            ) : status === 'running' ? (
-              <>
-                <button onClick={pauseProgram} disabled={pauseDisabled}
-                  title="project/pause — SOURCE-ONLY (behavior not yet wire-proven)"
-                  style={primaryBtn('#CA8A04', pauseDisabled)}>
-                  ⏸ Pause*
-                </button>
-                <button onClick={cancelProgram} disabled={stopDisabled}
-                  title="project/stop — wire-proven rung 1"
-                  style={primaryBtn('#DC2626', stopDisabled)}>
-                  ✕ Stop
-                </button>
-              </>
-            ) : (
+            {/* STOP — prominent, always visible when the program is in
+                ANY active state (running / stopping / paused / alarm).
+                Deliberately exempt from the gate-open/estop-clear checks
+                that grey out the other motion verbs; STOP works precisely
+                when things are running or wedged, so its enable-state
+                must never depend on the same conditions that got the
+                arm into trouble. */}
+            {!stopDisabled && (
+              <button onClick={cancelProgram}
+                      title="project/stop — wire-proven rung 1 (always enabled while active)"
+                      style={{
+                        ...primaryBtn('#DC2626', false),
+                        boxShadow: '0 0 0 3px rgba(220,38,38,0.15)',
+                        fontSize: 17, minWidth: 140,
+                      }}>
+                ✕ STOP
+              </button>
+            )}
+            {status === 'paused' && (
+              <button onClick={resumeProgram} disabled={safety?.estop}
+                style={primaryBtn('#16A34A', safety?.estop)}>
+                ▶ Resume
+              </button>
+            )}
+            {status === 'running' && (
+              <button onClick={pauseProgram} disabled={pauseDisabled}
+                title="project/pause — SOURCE-ONLY (behavior not yet wire-proven)"
+                style={primaryBtn('#CA8A04', pauseDisabled)}>
+                ⏸ Pause*
+              </button>
+            )}
+            {!(status === 'running' || status === 'paused' || status === 'stopping') && (
               <button onClick={runProgram} disabled={runDisabled || steps.length === 0}
                 style={primaryBtn('#16A34A', runDisabled || steps.length === 0)}>
                 ▶ Run Program
@@ -936,12 +1036,13 @@ export default function MonitorDashboard() {
                 wire-proven) then re-invokes the same run path the Run
                 button uses (POST /api/estun/program/run — codegen →
                 save → project/run, with clearStartLine already inside
-                that endpoint so it starts at step 1). Confirms when a
-                program is currently running; goes straight through when
-                idle. Disabled when there's nothing to restart. */}
+                that endpoint so it starts at step 1). Also works from
+                stuck-STOPPING: the stop-then-run sequence handles the
+                wedge (and forceReset() from the recovery banner can
+                clear a latched alarm first if needed). */}
             <button onClick={() => restartProgram({
                               cancelProgram, currentProgram, runSpeedPct,
-                              robot, isRunning, addToast,
+                              robot, isRunning, isStuckStopping, addToast,
                             })}
                     disabled={restartDisabled}
                     title="project/stop (if running) → /api/estun/program/run — restart from step 1"
@@ -950,12 +1051,16 @@ export default function MonitorDashboard() {
             </button>
             {/* RETURN HOME — same store action the Jog panel's Home
                 button uses (homeRobot → /api/program/run action='home'
-                → executor → /cmd/task home). Always confirms because
-                it commands motion; the confirm text shows the
-                effective speed and gate status so the operator sees
-                exactly what will happen. E-stop / gate-closed / no-
-                connection cases surface the reason instead of moving. */}
-            <button onClick={() => returnHome({ homeRobot, robot, runSpeedPct, safety, addToast })}
+                → executor → /cmd/task home). Confirms every press
+                because it commands motion; the confirm surfaces gate/
+                connection state so the operator knows whether the
+                driver will honor it. Enabled during stuck-STOPPING too
+                so the arm can be recovered from a wedged run. */}
+            <button onClick={() => returnHome({
+                              homeRobot, robot, runSpeedPct, safety,
+                              runStateKind: runState.kind,
+                              isStuckStopping, addToast,
+                            })}
                     disabled={homeDisabled}
                     title="/api/program/run action='home' — dispatches to the executor"
                     style={primaryBtn('#0891B2', homeDisabled)}>
@@ -1199,14 +1304,18 @@ function primaryBtn(bg, disabled) {
 // the operator sees the actual effective speed before pressing OK.
 // Uses window.confirm so it works without adding a modal component —
 // same pattern as other destructive-motion prompts on this dashboard.
-function returnHome({ homeRobot, robot, runSpeedPct, safety, addToast }) {
+// Extra prompt copy when firing from stuck-STOPPING so the operator
+// knows the wedge-recovery flow.
+function returnHome({ homeRobot, robot, runSpeedPct, safety, runStateKind, isStuckStopping, addToast }) {
   const capFrac = Number(robot?.operator_speed_limit ?? 0.25)
   const capPct  = Math.max(1, Math.min(100, Math.round(capFrac * 100)))
   const reqPct  = Math.max(1, Math.min(100, Number(runSpeedPct || capPct)))
   const effPct  = Math.min(capPct, reqPct)
   const gateOK  = !safety?.estop && !!robot?.connected && !!robot?.allow_move
   const lines = [
-    'Move to home?',
+    isStuckStopping
+      ? 'Move to home from STUCK-STOPPING state?'
+      : (runStateKind === 'stopping' ? 'Move to home from STOPPING state?' : 'Move to home?'),
     '',
     `Effective speed: ${effPct}%${effPct < reqPct ? ` (capped from ${reqPct}%)` : ''}`,
     `Gate: allow_move=${robot?.allow_move ? 'true' : 'false'}, ` +
@@ -1214,10 +1323,20 @@ function returnHome({ homeRobot, robot, runSpeedPct, safety, addToast }) {
       `connected=${robot?.connected ? 'true' : 'false'}` +
       (safety?.estop ? ', ESTOP ACTIVE' : ''),
     '',
+  ]
+  if (isStuckStopping) {
+    lines.push(
+      'Controller has been in STOPPING >3s — the previous run may not',
+      'have cleared. If Home is refused with a "state busy" reason, use',
+      'the yellow "Reset" button first to clear alarms, then retry.',
+      ''
+    )
+  }
+  lines.push(
     gateOK
       ? 'OK to send home command.'
-      : 'Gate is closed — the driver will refuse this. Press OK to try anyway.',
-  ]
+      : 'Gate is closed — the driver will refuse this. Press OK to try anyway.'
+  )
   if (!window.confirm(lines.join('\n'))) return
   try { homeRobot() }
   catch (e) { if (addToast) addToast('Home dispatch failed: ' + e, 'error') }
@@ -1226,28 +1345,41 @@ function returnHome({ homeRobot, robot, runSpeedPct, safety, addToast }) {
 // Restart-Program: stop-if-running then re-invoke the same run pipeline
 // the Run button uses. The /api/estun/program/run endpoint already
 // contains clearStartLine, so this restarts from step 1 by default.
-// Confirms when a program is currently active — a mid-run restart is
-// destructive (the current cycle's remaining steps are abandoned).
-async function restartProgram({ cancelProgram, currentProgram, runSpeedPct, robot, isRunning, addToast }) {
+// Confirms in any active state (running / stopping / paused) — a
+// mid-run restart is destructive. Wedge-recovery: when the controller
+// is stuck in STOPPING, the confirm surfaces that explicitly and the
+// stop-then-run sequence still fires (the second stop is cheap; the
+// run request re-establishes the pipeline from a known state).
+async function restartProgram({ cancelProgram, currentProgram, runSpeedPct, robot, isRunning, isStuckStopping, addToast }) {
   const name = currentProgram?.name || currentProgram?.id || '(current)'
   const reqPct = Math.max(1, Math.min(100, Number(runSpeedPct || 10)))
   const capFrac = Number(robot?.operator_speed_limit ?? 0.25)
   const capPct  = Math.max(1, Math.min(100, Math.round(capFrac * 100)))
   const effPct  = Math.min(capPct, reqPct)
-  if (isRunning) {
+  if (isRunning || isStuckStopping) {
     const prompt = [
-      `Restart "${name}" from step 1?`,
+      isStuckStopping
+        ? `Restart "${name}" from step 1? (recovering STUCK-STOPPING)`
+        : `Restart "${name}" from step 1?`,
       '',
-      'The program is currently RUNNING. This will:',
-      '  1. Send project/stop to halt the current cycle',
+      isStuckStopping
+        ? 'The controller has been in STOPPING >3s. Restart will:'
+        : 'The program is currently RUNNING. This will:',
+      '  1. Send project/stop (safe to re-issue if already stopping)',
       '  2. Re-save + re-run the program from the top',
       '',
       `Effective speed: ${effPct}%${effPct < reqPct ? ` (capped from ${reqPct}%)` : ''}`,
     ]
+    if (isStuckStopping) {
+      prompt.push('',
+        'If restart is refused with a "state busy" reason, use the',
+        'yellow "Reset" button in the recovery banner to clear alarms first.'
+      )
+    }
     if (!window.confirm(prompt.join('\n'))) return
   }
   try {
-    if (isRunning) {
+    if (isRunning || isStuckStopping) {
       // project/stop first — wire-proven rung 1. Give the driver a
       // beat to publish the state=0 transition before re-invoking
       // run, otherwise the two ops race on the controller.
@@ -1271,6 +1403,42 @@ async function restartProgram({ cancelProgram, currentProgram, runSpeedPct, robo
     }
   } catch (e) {
     if (addToast) addToast(`Restart failed: ${e}`, 'error')
+  }
+}
+
+// Recovery from a stuck STOPPING (state=3 > 3s). Force-stop just
+// re-issues project/stop — the driver treats a repeat stop as an ack
+// re-request, which resolves a "the driver's stop ack got dropped by
+// the ROS transport" wedge without any operator side effect.
+async function forceStop({ addToast }) {
+  try {
+    const res = await fetch('/api/estun/program/stop', { method: 'POST' })
+    if (res.ok) {
+      if (addToast) addToast('Force-stop sent (project/stop re-issued)', 'info')
+    } else {
+      if (addToast) addToast(`Force-stop refused: HTTP ${res.status}`, 'error')
+    }
+  } catch (e) {
+    if (addToast) addToast(`Force-stop failed: ${e}`, 'error')
+  }
+}
+
+// Reset = force-stop + clear latched controller alarms. Used when the
+// wedge is caused by a latched error (alarm 10001, ESTOP release, etc.)
+// blocking the 3→0 transition. clear_error is wire-proven; safe to
+// send when there's no active error.
+async function forceReset({ addToast }) {
+  try {
+    await fetch('/api/estun/program/stop', { method: 'POST' })
+    await new Promise((r) => setTimeout(r, 150))
+    const res = await fetch('/api/estun/program/clear_error', { method: 'POST' })
+    if (res.ok) {
+      if (addToast) addToast('Reset: stop re-issued + alarms cleared', 'success')
+    } else {
+      if (addToast) addToast(`Reset partial: clear_error HTTP ${res.status}`, 'error')
+    }
+  } catch (e) {
+    if (addToast) addToast(`Reset failed: ${e}`, 'error')
   }
 }
 
