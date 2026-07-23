@@ -1859,31 +1859,46 @@ function TeachOverlay({
   }
 
   const stepLabel = step?.label || step?.action || 'Position'
-  const stepInstruction = 'Jog the robot to the desired position, then press Record.'
+  const stepInstruction = 'Jog the robot to the desired position, then press Record Position.'
 
-  // Viewport-driven sizing — the spec asks for larger D-pads on wide
-  // screens (>1400 px) and the existing fullscreen size as the floor on
-  // smaller tablets (<1100 px). Tracking on a single state var means a
-  // window resize re-renders with the right metrics.
+  // Viewport-driven sizing. Width AND height both matter: a landscape
+  // 1840×1080 tablet is not "tablet width" (fits desktop layout) yet
+  // the vertical envelope after header+banner+Home bar+footer leaves
+  // only ~640 px for the jog grid — desktop-size 140 px buttons
+  // stacked 3-high plus gaps blows past that. Sizing therefore falls
+  // back on whichever dimension is tighter. Tracking on state so
+  // resize re-renders with the right metrics.
   const [vw, setVw] = useState(() => (
-    typeof window !== 'undefined' ? window.innerWidth : 1280))
+    typeof window !== 'undefined' ? window.innerWidth  : 1280))
+  const [vh, setVh] = useState(() => (
+    typeof window !== 'undefined' ? window.innerHeight : 800))
   useEffect(() => {
-    const onResize = () => setVw(window.innerWidth)
+    const onResize = () => { setVw(window.innerWidth); setVh(window.innerHeight) }
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
   }, [])
-  // Three tiers — tablet (≤ 1280 CSS px landscape ONN 11"), narrow
-  // laptop, desktop. The previous two-tier scheme bottomed out at a
-  // 140 px d-pad which overflowed the tablet's 1200 px viewport
-  // (three 3×3 grids of 140 px + gaps + padding ≈ 1472 px).
-  const isWide   = vw > 1400
+  const isWide    = vw > 1400
   const isTabletW = vw <= 1280
-  const padBtn      = isTabletW ? 96  : isWide ? 160 : 140
-  const svgPx       = isTabletW ? 42  : isWide ?  72 :  60
-  const padGap      = isTabletW ? 10  : 14
-  const groupGap    = isTabletW ? 24  : 40
-  const actionH     = isTabletW ? 56  : isWide ?  78 :  68
-  const actionFont  = isTabletW ? 14  : isWide ?  18 :  16
+  // Height envelope for the jog grid: viewport minus header (60) +
+  // instruction band (48) + mode row (~56) + step/speed row (~60) +
+  // Home bar (~64) + footer (~130 incl. safe-area padding floor).
+  // Whatever remains is the vertical budget for 3 rows of buttons
+  // and 2 inter-row gaps.
+  const gridHeightBudget = Math.max(240, vh - (60 + 48 + 56 + 60 + 64 + 130))
+  // Solve for the largest square button that fits three rows plus
+  // two gaps (gap ≈ 12 % of button). Cap at the width-tier ceiling.
+  const gridPadBtnCeil = isTabletW ? 96  : isWide ? 160 : 140
+  const gridPadBtnFit  = Math.floor((gridHeightBudget - 24) / 3)
+  // Touch-target floor per the task: 48 px minimum. Below that,
+  // section labels are hidden (via `hideSectionLabels`) before
+  // buttons are shrunk further.
+  const padBtn = Math.max(56, Math.min(gridPadBtnCeil, gridPadBtnFit))
+  const hideSectionLabels = padBtn < 96
+  // Scale the arrow icon with the button so a 56 px button doesn't
+  // render an oversized SVG. Round to whole pixels.
+  const svgPx    = Math.round(padBtn * 0.44)
+  const padGap   = isTabletW ? 10  : padBtn < 120 ? 12 : 14
+  const groupGap = isTabletW ? 24  : padBtn < 120 ? 24 : 40
   const modeBtnH    = isTabletW ? 48  : isWide ?  64 :  56
   const modeBtnFont = isTabletW ? 14  : isWide ?  17 :  16
 
@@ -1895,41 +1910,26 @@ function TeachOverlay({
     borderRadius: 8, cursor: 'pointer', flex: '0 0 auto',
   })
 
-  const actionBtn = (variant) => {
-    const base = {
-      minHeight: actionH, padding: '0 22px',
-      fontSize: actionFont, fontWeight: 700,
-      borderRadius: 10, cursor: 'pointer',
-      flex: '1 1 0', minWidth: 120,
-    }
-    if (variant === 'estop') {
-      return {
-        ...base,
-        background: '#DC2626', color: '#fff',
-        border: 'none', fontWeight: 800, letterSpacing: '0.5px',
-      }
-    }
-    return {
-      ...base,
-      background: '#fff', color: '#374151',
-      border: '1px solid #d1d5db',
-    }
-  }
+  // actionBtn() lived here for the (removed) STOP + Home row inside
+  // the controls area. Home is now its own in-flow bar and STOP is
+  // gone entirely — no callers left. Deleted.
 
   // M and N are 1-based per the spec.
   const progressPct = totalM > 0 ? ((currentN - 1) / totalM) * 100 : 0
 
   return (
     <div style={{
-      // Anchor the drawer to the visible viewport, not the layout
-      // viewport. `100dvh` shrinks when the URL bar collapses so the
-      // footer can't scroll off-screen on Android Chrome; `100vh`
-      // stays as a fallback for engines that don't recognise dvh
-      // yet. `inset: 0` positions it edge-to-edge (viewport-fit=cover
-      // is set in index.html) and the footer's own padding handles
-      // safe-area avoidance below.
+      // Anchor the drawer to the visible viewport with a plain
+      // `100dvh`. Chromium 108+ (the tablet's Android Chrome) resolves
+      // dvh against the CURRENT visible viewport — URL bar showing OR
+      // collapsed — so the footer stays reachable in either state.
+      // The earlier "vh with dvh maxHeight" pair drifted whenever the
+      // two disagreed; a single dvh anchor is simpler and matches
+      // what the operator sees. viewport-fit=cover in index.html
+      // means bottom:0 is at the physical device edge; the footer's
+      // own padding handles safe-area avoidance below.
       position: 'fixed', top: 0, left: 0, right: 0,
-      height: '100vh', maxHeight: '100dvh',
+      height: '100dvh',
       zIndex: 1000,
       background: '#f8fafc', color: '#111827',
       display: 'flex', flexDirection: 'column',
@@ -1975,15 +1975,19 @@ function TeachOverlay({
         </div>
       </div>
 
-      {/* JOG CONTROLS */}
+      {/* JOG CONTROLS — no internal scroll (mid-hold scrolling on a
+          touch device is how accidental jogs happen), no vertical
+          centering (justify-center + tall content clips off the TOP
+          of the container in some engines). Content sits top-aligned
+          and the height-responsive padBtn above guarantees fit. */}
       <div style={{
-        width: '100%', height: '100%',
+        width: '100%',
         flex: 1, minHeight: 0,
         background: '#f8fafc',
         display: 'flex', flexDirection: 'column',
-        justifyContent: 'center', alignItems: 'center',
-        padding: isTabletW ? 12 : 24, gap: isTabletW ? 12 : 18,
-        overflowX: 'hidden', overflowY: 'auto',
+        justifyContent: 'flex-start', alignItems: 'center',
+        padding: isTabletW ? 12 : 20, gap: isTabletW ? 12 : 16,
+        overflow: 'hidden',
       }}>
         {/* Mode toggle row */}
         <div style={{
@@ -2037,7 +2041,9 @@ function TeachOverlay({
           {jogMode === 'cartesian' ? (
             <>
               <div style={{ flex: '0 1 auto' }}>
-                <div style={{ fontSize: 12, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>Position</div>
+                {!hideSectionLabels && (
+                  <div style={{ fontSize: 12, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>Position</div>
+                )}
                 <div style={{
                   display: 'grid',
                   gridTemplateColumns: `repeat(3, ${padBtn}px)`,
@@ -2053,14 +2059,18 @@ function TeachOverlay({
                 </div>
               </div>
               <div style={{ flex: '0 1 auto' }}>
-                <div style={{ fontSize: 12, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>Height</div>
+                {!hideSectionLabels && (
+                  <div style={{ fontSize: 12, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>Height</div>
+                )}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: padGap, width: padBtn }}>
                   <OverlayJogArrow {...wire('z',  1)} rotation={0}   label="Z+" color="#3B82F6" size={padBtn} svgSize={svgPx} />
                   <OverlayJogArrow {...wire('z', -1)} rotation={180} label="Z−" color="#3B82F6" size={padBtn} svgSize={svgPx} />
                 </div>
               </div>
               <div style={{ flex: '0 1 auto' }}>
-                <div style={{ fontSize: 12, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>Rotation</div>
+                {!hideSectionLabels && (
+                  <div style={{ fontSize: 12, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>Rotation</div>
+                )}
                 <div style={{
                   display: 'grid',
                   gridTemplateColumns: `repeat(3, ${padBtn}px)`,
@@ -2091,21 +2101,29 @@ function TeachOverlay({
           )}
         </div>
 
-        {/* Home button — helper action for jogging. STOP moved to
-            the sticky footer bar so it's ALWAYS visible without
-            scrolling on tablet-portrait; Home stays here since it's
-            not a safety-critical control. */}
-        <div style={{
-          flex: '0 0 auto',
-          width: '100%',
-          display: 'flex', gap: 16,
-          justifyContent: 'center',
-        }}>
-          <button onClick={homeRobot} style={actionBtn('default')}>Home</button>
-        </div>
       </div>
 
-      {/* STICKY FOOTER — Back (multi-pose only) + Capture position
+      {/* HOME BAR — jog-to-home helper. Own in-flow row between the
+          jog grid and the footer so it can never overlap the grid or
+          get clipped when the URL bar collapses. `homeRobot` fires
+          the same store action the pendant page uses (same confirm/
+          hold semantics, same safety gates); no confirm modal here
+          either — pendant doesn't have one and we keep parity. */}
+      <div style={{
+        flexShrink: 0,
+        background: '#fff', borderTop: '1px solid #e5e7eb',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: '8px 22px',
+      }}>
+        <button onClick={homeRobot} style={{
+          minHeight: 48, padding: '0 32px',
+          fontSize: 15, fontWeight: 700,
+          background: '#fff', color: '#374151',
+          border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+        }}>⌂ Move to home</button>
+      </div>
+
+      {/* STICKY FOOTER — Back (multi-pose only) + Record Position
           + Skip (multi-pose only). No motion-stop button here:
           motion stopping is release-to-stop plus the driver's 300 ms
           heartbeat deadman, and the app's TopBar already exposes a
@@ -2154,7 +2172,7 @@ function TeachOverlay({
               transition: 'background 100ms, color 100ms',
               flexShrink: 0,
             }}>
-            {flash ? '✓ CAPTURED' : 'Capture position'}
+            {flash ? '✓ Recorded' : 'Record Position'}
           </button>
         </div>
 
