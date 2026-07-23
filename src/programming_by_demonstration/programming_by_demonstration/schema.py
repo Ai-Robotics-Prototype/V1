@@ -165,6 +165,23 @@ class IntentOperation:
     # vision via the location clarification. The applyClarifications
     # step-restructuring on the frontend keeps flipping bidirectional.
     source: str = 'fixed_position'
+    # End-effector type. Drives which gripper-actuation steps the
+    # composer emits per pick/place pair:
+    #   'finger'   — parallel-jaw gripper. `open_gripper` / `close_gripper`
+    #                / `open_gripper` actions with the app's existing
+    #                Open/Grip/Release labels. Default.
+    #   'vacuum'   — suction cup. `set_io Engage vacuum` /
+    #                `set_io Disengage vacuum` (both bound to the same
+    #                io_map "Vacuum" port), plus the blow-off pulse
+    #                (set_io Blow off → wait → set_io Blow off stop)
+    #                after Disengage when a blow-off port is
+    #                configured.
+    #   'magnetic' — single-signal magnet on a custom DO. Same
+    #                two-step shape as vacuum but no blow-off pulse.
+    # Legacy intents parse back with 'finger' — that's what the
+    # composer emitted before the effector split, so drafts stored
+    # under the old shape stay bit-for-bit identical.
+    effector: str = 'finger'
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -434,6 +451,9 @@ class StructuredIntent:
                 source=(str(raw.get('source') or 'fixed_position').lower()
                         if str(raw.get('source') or '').lower() in
                            ('camera_library', 'fixed_position') else 'fixed_position'),
+                effector=(str(raw.get('effector') or 'finger').lower()
+                          if str(raw.get('effector') or '').lower() in
+                             ('finger', 'vacuum', 'magnetic') else 'finger'),
             ))
         clarifications: List[Clarification] = []
         for idx, raw in enumerate(d.get('ambiguities') or []):

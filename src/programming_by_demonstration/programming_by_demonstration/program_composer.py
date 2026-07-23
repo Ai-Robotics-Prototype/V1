@@ -21,6 +21,7 @@ later when the robot is present.
 
 from __future__ import annotations
 
+import json as _json
 from typing import Any, Dict, List, Optional
 
 from .schema import (
@@ -255,6 +256,183 @@ def _grip_release() -> Dict[str, Any]:
     }
 
 
+# ── IO-map lookup for effector ports ──────────────────────────────
+#
+# The operator-editable io_map (dashboard I/O page → /opt/cobot/io_map
+# .json) is the single source of truth for "which physical DO does
+# 'Vacuum' refer to?". The composer reads it once per compose call so
+# BOTH the Engage and Disengage vacuum steps land on the SAME port —
+# re-mapping the port in the I/O page and recomposing updates both
+# steps together. No two independent hardcoded references.
+
+_IO_MAP_PATH = '/opt/cobot/io_map.json'
+_VACUUM_DEFAULT_PORT   = 2   # DO2, matches the pre-effector wizard hardcode
+_BLOWOFF_DEFAULT_PORT  = 3   # DO3, matches the pre-effector wizard hardcode
+_MAGNET_DEFAULT_PORT   = 3
+
+
+def _io_map_port_for(*keywords: str, kind: str = 'DO',
+                     default_port: Optional[int] = None) -> Optional[int]:
+    """Read /opt/cobot/io_map.json and return the port number whose
+    assignment (case-insensitive) contains any of the given keywords.
+    `kind` restricts the search to DO/DI/AI/AO channels. Falls back to
+    `default_port` when the file is missing, malformed, or has no
+    matching assignment.
+
+    Reading at compose time (not at module import) lets an operator
+    re-label the port on the I/O page and see the change reflected on
+    the next Regenerate draft, no service restart required."""
+    try:
+        with open(_IO_MAP_PATH) as f:
+            m = _json.load(f)
+    except Exception:
+        return default_port
+    ports = (m.get('ports') or {}) if isinstance(m, dict) else {}
+    kw = tuple(k.lower() for k in keywords)
+    # Iterate the flattened terminal list to keep the "which port"
+    # semantics stable regardless of block ordering.
+    def _iter_signals():
+        for block in (m.get('plate') or []):
+            for t in (block.get('terminals') or []):
+                if t and t.get('role') == 'signal': yield t
+            for row in (block.get('pair_rows') or []):
+                for c in row:
+                    if isinstance(c, dict) and c.get('role') == 'signal': yield c
+            for sec in (block.get('sections') or []):
+                for row in (sec.get('rows') or []):
+                    for c in row:
+                        if isinstance(c, dict) and c.get('role') == 'signal': yield c
+        flg = m.get('flange') or {}
+        for t in (flg.get('terminals') or []):
+            if t and t.get('role') == 'signal': yield t
+    for t in _iter_signals():
+        if (t.get('kind') or '').upper() != kind: continue
+        name = t.get('name') or ''
+        assign = ((ports.get(name) or {}).get('assignment') or '').lower().strip()
+        # Skip the sentinel "Unassigned" so we don't match "vacuum"
+        # against the placeholder label the io_map emits on unassigned
+        # ports.
+        if not assign or assign == 'unassigned': continue
+        if any(k in assign for k in kw):
+            p = t.get('port')
+            if isinstance(p, int): return p
+    return default_port
+
+
+# ── Effector-aware step emitters ──────────────────────────────────
+#
+# Each per-pair pick/place body needs three moments where the
+# effector actually acts:
+#   * READY at the start of the program (make sure it's OFF / open)
+#   * ENGAGE after arriving at the pick contact (grab the part)
+#   * DISENGAGE after arriving at the place contact (release), with
+#     the blow-off pulse for vacuum
+# Every emitter below returns a LIST of steps so vacuum's multi-step
+# pattern (set_io + wait + set_io) fits naturally alongside the
+# finger single-step pattern. `_effector_of(op)` normalises legacy
+# intents (missing field) back to 'finger'.
+
+def _effector_of(op: IntentOperation) -> str:
+    e = str(getattr(op, 'effector', '') or 'finger').lower()
+    if e not in ('finger', 'vacuum', 'magnetic'):
+        return 'finger'
+    return e
+
+
+def _effector_ready(op: IntentOperation, spd: int) -> List[Dict[str, Any]]:
+    e = _effector_of(op)
+    if e == 'vacuum':
+        port = _io_map_port_for('vacuum', kind='DO',
+                                default_port=_VACUUM_DEFAULT_PORT)
+        return [{
+            'action': 'set_io',
+            'label':  'Vacuum off (ready)',
+            'io_id':  f'DO{port}', 'value': 0,
+            'io_role': 'vacuum',
+        }]
+    if e == 'magnetic':
+        port = _io_map_port_for('magnet', 'gripper', kind='DO',
+                                default_port=_MAGNET_DEFAULT_PORT)
+        return [{
+            'action': 'set_io',
+            'label':  'Magnet off (ready)',
+            'io_id':  f'DO{port}', 'value': 0,
+            'io_role': 'magnet',
+        }]
+    return [_grip_open(spd)]
+
+
+def _effector_engage(op: IntentOperation) -> List[Dict[str, Any]]:
+    """Grip the part after the arm has reached the pick contact."""
+    e = _effector_of(op)
+    if e == 'vacuum':
+        port = _io_map_port_for('vacuum', kind='DO',
+                                default_port=_VACUUM_DEFAULT_PORT)
+        return [
+            {'action': 'set_io',
+             'label':  'Engage vacuum',
+             'io_id':  f'DO{port}', 'value': 1,
+             'io_role': 'vacuum'},
+            {'action': 'wait',
+             'label':  'Wait for vacuum seal',
+             'duration_s': 0.5},
+        ]
+    if e == 'magnetic':
+        port = _io_map_port_for('magnet', 'gripper', kind='DO',
+                                default_port=_MAGNET_DEFAULT_PORT)
+        return [
+            {'action': 'set_io',
+             'label':  'Engage magnet',
+             'io_id':  f'DO{port}', 'value': 1,
+             'io_role': 'magnet'},
+        ]
+    return [_grip_close()]
+
+
+def _effector_disengage(op: IntentOperation) -> List[Dict[str, Any]]:
+    """Release the part after arriving at the place contact. Vacuum
+    additionally fires the blow-off pulse (DO on → dwell → off) when
+    a "Blow off" port is configured in the io_map (falls back to DO3
+    for legacy wizard compatibility)."""
+    e = _effector_of(op)
+    if e == 'vacuum':
+        vac_port = _io_map_port_for('vacuum', kind='DO',
+                                    default_port=_VACUUM_DEFAULT_PORT)
+        blow_port = _io_map_port_for('blow', kind='DO',
+                                     default_port=_BLOWOFF_DEFAULT_PORT)
+        out: List[Dict[str, Any]] = [
+            {'action': 'set_io',
+             'label':  'Disengage vacuum',
+             'io_id':  f'DO{vac_port}', 'value': 0,
+             'io_role': 'vacuum'},
+        ]
+        if blow_port is not None and blow_port != vac_port:
+            out += [
+                {'action': 'set_io',
+                 'label':  'Blow off',
+                 'io_id':  f'DO{blow_port}', 'value': 1,
+                 'io_role': 'blow_off'},
+                {'action': 'wait',
+                 'label':  'Wait for blow off',
+                 'duration_s': 0.3},
+                {'action': 'set_io',
+                 'label':  'Blow off stop',
+                 'io_id':  f'DO{blow_port}', 'value': 0,
+                 'io_role': 'blow_off'},
+            ]
+        return out
+    if e == 'magnetic':
+        port = _io_map_port_for('magnet', 'gripper', kind='DO',
+                                default_port=_MAGNET_DEFAULT_PORT)
+        return [
+            {'action': 'set_io',
+             'label':  'Disengage magnet',
+             'io_id':  f'DO{port}', 'value': 0,
+             'io_role': 'magnet'},
+        ]
+    return [_grip_release()]
+
+
 # ── Per-operation builders ─────────────────────────────────────────
 #
 # Sequence per pick/place pair (approved 2026-07-23):
@@ -266,7 +444,7 @@ def _grip_release() -> Dict[str, Any]:
 def _build_pick_and_place(op: IntentOperation, appH: int,
                           spd: int, slow: int, medium: int) -> List[Dict[str, Any]]:
     s: List[Dict[str, Any]] = []
-    s.append(_grip_open(spd))
+    s.extend(_effector_ready(op, spd))
     # Detect step is gated on how the part is located each cycle. When
     # the operator confirms a fixed taught position (op.source ==
     # 'fixed_position'), the pick pose comes straight from the taught
@@ -279,11 +457,11 @@ def _build_pick_and_place(op: IntentOperation, appH: int,
         s.append(_detect(op.target_part.name))
     s.append(_above('pick',  'Approach above pick',  appH, spd))
     s.append(_pick_contact(op.pick.location_hint, slow))
-    s.append(_grip_close())
+    s.extend(_effector_engage(op))
     s.append(_above('pick',  'Retreat above pick',   appH, medium))
     s.append(_above('place', 'Approach above place', appH, spd))
     s.append(_place_contact(op.place.location_hint, slow))
-    s.append(_grip_release())
+    s.extend(_effector_disengage(op))
     s.append(_above('place', 'Retreat above place',  appH, medium))
     return s
 
@@ -303,13 +481,13 @@ def _build_sort(op: IntentOperation, appH: int,
 def _build_machine_tend(op: IntentOperation, appH: int,
                         spd: int, slow: int, medium: int) -> List[Dict[str, Any]]:
     s: List[Dict[str, Any]] = []
-    s.append(_grip_open(spd))
+    s.extend(_effector_ready(op, spd))
     # See _build_pick_and_place — detect gated on op.source.
     if op.source == 'camera_library':
         s.append(_detect(op.target_part.name))
     s.append(_above('pick', 'Approach above pick', appH, spd))
     s.append(_pick_contact(op.pick.location_hint, slow))
-    s.append(_grip_close())
+    s.extend(_effector_engage(op))
     s.append(_above('pick', 'Retreat above pick',  appH, medium))
     # Machine-load contact — the taught anchor for the machine-load
     # role. Approach/retreat steps around it derive from this pose
@@ -318,7 +496,7 @@ def _build_machine_tend(op: IntentOperation, appH: int,
     s.append(_contact('machine_load', 'Machine load — contact',
                       op.place.location_hint or 'machine load fixture',
                       min(spd, 20)))
-    s.append(_grip_release())
+    s.extend(_effector_disengage(op))
     s.append(_above('machine_load', 'Retreat from machine load', appH, slow))
     s.append({'action': 'set_io', 'label': 'Start machine cycle',
               'io_id': 'DO4', 'value': 1})
@@ -329,14 +507,13 @@ def _build_machine_tend(op: IntentOperation, appH: int,
     # Re-approach the same machine_load anchor to pick up the
     # finished part — reuses the SAME taught contact pose.
     s.append(_above('machine_load', 'Approach finished part', appH, slow))
-    s.append({'action': 'close_gripper', 'label': 'Grip finished part',
-              'force_pct': DEFAULT_GRIP_FORCE, 'io_close': 'DO0'})
+    s.extend(_effector_engage(op))
     s.append(_above('machine_load', 'Retreat with finished part', appH, medium))
     # Unload contact — separate taught role.
     s.append(_above('unload', 'Approach unload', appH, spd))
     s.append(_contact('unload', 'Unload position — contact',
                       'unload location', slow))
-    s.append(_grip_release())
+    s.extend(_effector_disengage(op))
     s.append(_above('unload', 'Retreat from unload', appH, medium))
     return s
 
@@ -361,7 +538,7 @@ def _build_palletize(op: IntentOperation, mode: str,
             s.append(_detect(op.target_part.name))
         s.append(_above('pick', 'Approach above pick', appH, spd))
         s.append(_pick_contact(op.pick.location_hint, slow))
-        s.append(_grip_close())
+        s.extend(_effector_engage(op))
         s.append(_above('pick', 'Retreat above pick', palletH, medium))
         s.append({
             'action': 'move_to_pallet',
@@ -386,7 +563,7 @@ def _build_palletize(op: IntentOperation, mode: str,
         })
         s.append(_above('place', 'Approach above place', palletH, spd))
         s.append(_place_contact(op.place.location_hint, slow))
-        s.append(_grip_release())
+        s.extend(_effector_disengage(op))
         s.append(_above('place', 'Retreat above place', palletH, medium))
     s.append(_move_home(label='Return to home'))
     return s

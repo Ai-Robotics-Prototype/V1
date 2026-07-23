@@ -347,6 +347,56 @@ def test_intent_source_round_trip_defaults_fixed_position():
     assert parsed2.operations[0].source == 'camera_library'
 
 
+def test_vacuum_effector_emits_engage_disengage_and_blow_off():
+    """Vacuum operation → the pick body swaps grip_close for
+    `set_io Engage vacuum` + a seal-wait, and the place body swaps
+    grip_release for `set_io Disengage vacuum` followed by the
+    blow-off pulse (DO on → wait → off). Both Engage and Disengage
+    must bind to the SAME `io_id` so re-mapping the port in the I/O
+    page updates the pair together (symmetry invariant)."""
+    intent = StructuredIntent(operations=[IntentOperation(
+        operation_type='pick_and_place', sequence_index=1,
+        target_part=PartReference(part_id='delrin', name='Delrin piece',
+                                  confidence=0.9, source='matched_to_library'),
+        pick=PoseSlot(location_hint='right bin'),
+        place=PoseSlot(location_hint='left tray'),
+        effector='vacuum',
+    )])
+    steps = compose_program_draft(intent, demo_id='demo_vac').to_program_payload()['steps']
+    labels = [s.get('label') for s in steps]
+    assert 'Engage vacuum'    in labels, labels
+    assert 'Disengage vacuum' in labels, labels
+    # No parallel-gripper verbs.
+    assert 'Grip part'    not in labels
+    assert 'Release part' not in labels
+    # Blow-off triplet present (set_io on → wait → set_io off).
+    blow_idxs = [i for i, s in enumerate(steps) if 'Blow off' in (s.get('label') or '')]
+    assert blow_idxs, f'blow-off sequence missing: {labels}'
+    # Symmetric port binding: Engage and Disengage vacuum share io_id.
+    engage_io = next(s['io_id'] for s in steps if s.get('label') == 'Engage vacuum')
+    disen_io  = next(s['io_id'] for s in steps if s.get('label') == 'Disengage vacuum')
+    assert engage_io == disen_io, (engage_io, disen_io)
+    # Both carry the io_role tag so downstream tools can regroup them
+    # symbolically without parsing labels.
+    for lbl in ('Engage vacuum', 'Disengage vacuum'):
+        s = next(x for x in steps if x.get('label') == lbl)
+        assert s.get('io_role') == 'vacuum', (lbl, s)
+
+
+def test_finger_effector_is_the_default():
+    """Legacy intents without an `effector` field parse back as
+    'finger' → composer keeps emitting open_gripper/close_gripper
+    with the classic Open/Grip/Release labels. Preserves the
+    pre-effector shape byte-for-byte."""
+    intent = _intent_pick_and_place()   # no effector set
+    steps = compose_program_draft(intent, demo_id='demo_fingerdef').to_program_payload()['steps']
+    actions = [s.get('action') for s in steps]
+    assert 'close_gripper' in actions
+    assert 'open_gripper'  in actions
+    # No vacuum I/O leaks in.
+    assert not any('vacuum' in (s.get('label') or '').lower() for s in steps)
+
+
 def test_derived_steps_never_carry_taught_data():
     """New shape invariant: any step with derived_from is pose-free
     (no taught_joints/tcp, no position_role). The old "carry taught data

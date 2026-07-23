@@ -6268,6 +6268,83 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
         return store.load_all_files(did)
 
+    @app.post("/api/pbd/{demo_id}/recompose")
+    async def api_pbd_recompose(demo_id: str, request: Request):
+        """Re-run the composer on a stored demo's intent — the fix
+        path for a draft that was generated before an effector /
+        source / other composer-shape flip. Reads structured_intent.
+        json from the demo's directory, applies optional overrides
+        from the request body (currently: effector), calls
+        compose_program_draft, and returns the fresh draft dict. Does
+        NOT overwrite program_draft.json on disk (the operator can
+        still Accept via /correct to persist).
+
+        Body: {effector?: 'vacuum'|'finger'|'magnetic', intent?: <full
+        intent override — the frontend can pass an intent that has
+        already had clarifications applied>}
+
+        This exists because a review screen with the wrong effector-
+        emitted steps can't be repaired by simple relabelling — the
+        step LIST needs to change (vacuum's engage/disengage steps
+        replace grip_close/grip_release entirely, with the blow-off
+        triplet inserted after disengage). Re-invoking the composer
+        deterministic-ally regenerates the whole thing."""
+        did = demo_id.strip()
+        try:
+            store = _pbd_store()
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        demo_dir = store.dir_for(did)
+        intent_path = os.path.join(demo_dir, 'structured_intent.json')
+        if not os.path.isfile(intent_path):
+            return JSONResponse({
+                "ok": False,
+                "error": f"no structured_intent.json for demo {did!r}",
+            }, status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            with open(intent_path) as f:
+                intent_raw = json.load(f)
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"intent read failed: {e}",
+            }, status_code=500)
+        # Full-intent override wins; otherwise apply named overrides.
+        if isinstance(body.get('intent'), dict):
+            intent_raw = body['intent']
+        eff = body.get('effector')
+        if isinstance(eff, str) and eff.lower() in ('finger', 'vacuum', 'magnetic'):
+            for op in (intent_raw.get('operations') or []):
+                if isinstance(op, dict): op['effector'] = eff.lower()
+        # Parse + compose using the same PBD pipeline the initial
+        # generate flow uses.
+        try:
+            from programming_by_demonstration.schema import StructuredIntent
+            from programming_by_demonstration.program_composer import compose_program_draft
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"pbd import failed: {e}",
+            }, status_code=500)
+        try:
+            intent = StructuredIntent.from_dict(intent_raw)
+            draft = compose_program_draft(intent, demo_id=did)
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"compose failed: {e}",
+            }, status_code=500)
+        return {
+            "ok":     True,
+            "demo_id": did,
+            "draft":  draft.to_program_payload(),
+            "intent": intent.to_dict(),
+        }
+
     @app.post("/api/pbd/{demo_id}/correct")
     async def api_pbd_correct(demo_id: str, request: Request):
         """Operator accepted the (possibly edited) draft. Body:

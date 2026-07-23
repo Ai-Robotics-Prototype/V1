@@ -216,6 +216,46 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
     setGenerating(false)
   }
 
+  // Re-invoke the server-side composer on the CURRENT (in-memory,
+  // possibly clarification-modified) intent. Used when an operator's
+  // answer to an effector clarification would change the draft's
+  // step list — a simple text relabelling wouldn't cover it because
+  // the vacuum effector inserts a blow-off triplet and swaps two
+  // step actions. Returns the fresh draft + intent from the server;
+  // both replace the local state so the review re-renders with the
+  // regenerated program.
+  const [regenerating, setRegenerating] = useState(false)
+  const [regenError,   setRegenError]   = useState('')
+  async function regenerateDraft() {
+    if (!demoId || !intent) return
+    setRegenerating(true)
+    setRegenError('')
+    try {
+      const applied = applyClarifications(draft, intent, clarAnswers)
+      const res = await fetch(`/api/pbd/${demoId}/recompose`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ intent: applied.intent }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!data.ok) {
+        setRegenError(data.error || `regenerate failed (HTTP ${res.status})`)
+        return
+      }
+      // Server returns { draft, intent }. Replace local state; keep
+      // clarification answers as-is (they still align with the same
+      // clarification set).
+      if (data.draft)  setDraft(data.draft)
+      if (data.intent) setIntent(data.intent)
+      // Editable name mirrors the fresh draft.
+      if (data.draft?.name) setEditName(data.draft.name)
+    } catch (e) {
+      setRegenError(`regenerate error: ${e?.message || e}`)
+    } finally {
+      setRegenerating(false)
+    }
+  }
+
   async function accept() {
     if (!draft || !demoId) return
     setAccepting(true)
@@ -533,6 +573,9 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
               clarInteracted={clarInteracted}
               setClarInteracted={setClarInteracted}
               cycles={cycles} setCycles={setCycles}
+              regenerateDraft={regenerateDraft}
+              regenerating={regenerating}
+              regenError={regenError}
               accepting={accepting} acceptError={acceptError}
             />
           )}
@@ -596,6 +639,7 @@ function ReviewPanel({
   clarAnswers, setClarAnswers,
   clarInteracted, setClarInteracted,
   cycles, setCycles,
+  regenerateDraft, regenerating, regenError,
   accepting, acceptError,
 }) {
   return (
@@ -669,6 +713,38 @@ function ReviewPanel({
           setInteracted={setClarInteracted}
           partsLibrary={partsLibrary}
         />
+      )}
+
+      {/* Regenerate draft — re-invokes the server-side composer on the
+          current (in-memory) intent so answers that change step
+          SHAPE (effector, source, etc.) can restructure the draft
+          without re-recording the demo. applyClarifications already
+          updates the in-memory intent; this button pushes that
+          through the composer to get the fresh step list. */}
+      {typeof regenerateDraft === 'function' && (
+        <div style={{
+          margin: '4px 0 14px', display: 'flex', alignItems: 'center',
+          gap: 10,
+        }}>
+          <button onClick={regenerateDraft} disabled={!!regenerating}
+            style={{
+              padding: '8px 14px', fontSize: 13, fontWeight: 600,
+              background: regenerating ? '#f3f4f6' : '#eff6ff',
+              color:      regenerating ? '#9ca3af' : '#1d4ed8',
+              border:     '1px solid ' + (regenerating ? '#e5e7eb' : '#bfdbfe'),
+              borderRadius: 6,
+              cursor: regenerating ? 'default' : 'pointer',
+            }}>
+            {regenerating ? 'Regenerating…' : '↻ Regenerate draft'}
+          </button>
+          <span style={{ fontSize: 12, color: '#6b7280' }}>
+            Rebuild the step list from the current answers (effector,
+            fixed vs vision, part choice) without re-recording.
+          </span>
+          {regenError && (
+            <span style={{ fontSize: 12, color: '#DC2626' }}>{regenError}</span>
+          )}
+        </div>
       )}
 
       {/* Retrieval-augment few-shot examples are still fetched, logged
@@ -1119,6 +1195,22 @@ function applyClarifications(draft, intent, answers) {
     const scope = aff.scope || 'other'
     const path  = String(aff.path || '')
     try {
+      // Legacy config.gripper clarification (older AI outputs) routes
+      // to op.effector — the composer's new discriminator that drives
+      // Engage/Disengage vacuum vs Open/Grip/Release step naming.
+      // Options "Suction cup" / "Vacuum" → 'vacuum'; anything with
+      // "finger", "parallel", "jaw", or "gripper" → 'finger'; magnet
+      // variants → 'magnetic'. Route AND recompose (the operator sees
+      // a "Regenerate draft" prompt after answering — see the footer).
+      if (scope === 'config' && path === 'config.gripper'
+          && Array.isArray(i.operations)) {
+        const s = String(ans || '').toLowerCase()
+        const chosen = /vacuum|suction/.test(s) ? 'vacuum'
+                     : /magnet/.test(s) ? 'magnetic'
+                     : 'finger'
+        for (const op of i.operations) op.effector = chosen
+        continue   // draft-step restructuring happens via recompose
+      }
       if (scope === 'config' && path === 'config.pallet') {
         // Expected shape: { rows, cols, layers, fill_order? }. Falls
         // back to the AI's existing config.pallet for missing keys so
@@ -1221,6 +1313,17 @@ function applyClarifications(draft, intent, answers) {
           }
           // Fall through — don't run any of the other operation-scope
           // handlers on this answer.
+          continue
+        }
+        if (path === 'effector') {
+          // New AI-emitted shape. Value is one of 'vacuum' | 'finger'
+          // | 'magnetic' (canonical). Route to op.effector; the draft
+          // steps get restructured when the operator hits Regenerate
+          // draft (calls /api/pbd/{demo_id}/recompose on the server).
+          const s = String(ans || '').toLowerCase()
+          op.effector = /vacuum|suction/.test(s) ? 'vacuum'
+                      : /magnet/.test(s) ? 'magnetic'
+                      : 'finger'
           continue
         }
         if (path === 'target_part') {

@@ -152,6 +152,21 @@ CRITICAL RULES — violating any of these makes the output unusable:
      with `affects.path = "source"` so the operator can flip it — see
      the fixed-vs-vision clarification example below.
 
+     Every operation ALSO carries `effector` — the end-effector type
+     that drives which gripper-actuation steps the composer emits:
+       "finger"   — parallel-jaw gripper (open/grip/release actions).
+                    Default.
+       "vacuum"   — suction cup. Composer emits
+                    `set_io Engage vacuum` / `set_io Disengage vacuum`
+                    with the blow-off pulse after Disengage.
+       "magnetic" — electromagnet on a single DO.
+     Read the demo. Suction cup / vacuum cup / vacuum gripper in
+     narration or visible in video → `effector: "vacuum"`. Parallel
+     jaw / two-finger / claw → `effector: "finger"`. When the demo is
+     ambiguous, emit a `field:"gripper"` clarification with
+     `affects.path = "effector"` and options ["vacuum", "finger"] so
+     the operator can confirm — see the effector example below.
+
   6) Surface uncertainty in `ambiguities` as STRUCTURED CLARIFICATIONS,
      not free-form prose. Each item is an OBJECT the dashboard renders
      as an interactive question the operator answers inline. Schema:
@@ -223,6 +238,18 @@ CRITICAL RULES — violating any of these makes the output unusable:
            "options":["fixed_position","camera_library"],
            "suggested":"fixed_position",
            "affects":{{"scope":"operation","operation_index":0,"path":"source"}}}}
+       End-effector type (drives Engage/Disengage vacuum vs
+       Open/Grip/Release step naming):
+         {{"id":"q-effector", "field":"gripper",
+           "question":"Confirm end effector is a suction cup.",
+           "type":"choice",
+           "options":["vacuum","finger"],
+           "suggested":"vacuum",
+           "affects":{{"scope":"operation","operation_index":0,"path":"effector"}}}}
+       Options MUST be the canonical values `vacuum` / `finger` /
+       `magnetic` so applyClarifications can restructure the draft
+       steps deterministically; any other option strings stay as
+       free-text and the composer keeps its default effector.
        Note: fixed_position is the default suggestion because a taught
        contact pose is deterministic and needs no runtime perception —
        operators pick vision only when the part actually moves between
@@ -307,7 +334,8 @@ SCHEMA_EXAMPLE = """\
       },
       "sequence_index": 1,
       "count_hint": "all",
-      "source": "fixed_position",
+      "source":   "fixed_position",
+      "effector": "finger",
       "pick":  { "location_hint": "from the right bin",  "pose": null, "pose_status": "awaiting_perception" },
       "place": { "location_hint": "onto the left tray",  "pose": null, "pose_status": "awaiting_perception" },
       "notes": "Video shows three brackets at t=0s, tray empty at t=0s, brackets in tray at t=8s."
