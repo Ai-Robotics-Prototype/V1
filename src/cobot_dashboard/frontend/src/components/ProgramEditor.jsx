@@ -6,6 +6,8 @@ import ProgramFromDemonstration from './ProgramFromDemonstration'
 import { HoldButton } from './JogControls'
 import { readPayload, PAYLOAD_UNSET_WARNING, PAYLOAD_INFO_ONLY }
   from '../lib/payload'
+import { useIOPortmap, portmapLabels, portmapToOptions }
+  from '../lib/ioPortmap'
 
 // The richer action taxonomy lives in the editor. Each action carries
 // a coarse `type` (matching the existing backend schema: move/gripper/
@@ -288,7 +290,13 @@ function actionFor(step) {
 // intentionally NOT included here — that lives in the collapsible
 // "position data" block triggered by the "View position data" link.
 function detailLine(step, ioLabels) {
-  const ioName = (id) => (ioLabels && ioLabels[id]) || id
+  // Match the main I/O page + dropdown format: "DO2 — Vacuum On" when
+  // the operator has renamed the port, plain "DO2" otherwise.
+  const ioName = (id) => {
+    if (!id) return id
+    const lab = ioLabels && ioLabels[id]
+    return lab ? `${id} — ${lab}` : id
+  }
   const bits = [step.action || step.type]
   if (step.target)      bits.push('target: ' + step.target)
   if (step.duration_s)  bits.push(step.duration_s + 's')
@@ -349,52 +357,35 @@ function positionDataLines(step) {
   return out
 }
 
-// Shared label fetch — one round-trip per editor mount instead of one
-// per IOPortSelector instance. Backend now always returns factory
-// defaults merged with operator overrides so `labels[id]` is defined
-// for every port.
+// Editor-wide label map for the detail line (fed into detailLine's
+// ioName helper). One fetch per editor mount via useIOPortmap; the
+// helper walks plate + flange terminals and returns the operator
+// assignments as { "DO2": "Vacuum On", ... }. Channels without a
+// user label are omitted so ioName falls back to the raw id.
 function useIOLabels() {
-  const [labels, setLabels] = useState({})
-  useEffect(() => {
-    let alive = true
-    fetch('/api/io/config')
-      .then((r) => r.json())
-      .then((d) => { if (alive && d) setLabels(d.labels || {}) })
-      .catch(() => {})
-    return () => { alive = false }
-  }, [])
-  return labels
+  const pm = useIOPortmap()
+  return portmapLabels(pm)
 }
 
-// Dropdown that lists DO* or DI* ports with their pin numbers and the
-// operator-renamed labels from /api/io/config. Renders an "unassigned"
-// option at the top so a step can opt out of I/O explicitly.
-function IOPortSelector({ label, value, onChange, direction }) {
-  const [labels, setLabels] = useState({})
-
-  useEffect(() => {
-    let alive = true
-    fetch('/api/io/config')
-      .then((r) => r.json())
-      .then((d) => { if (alive && d) setLabels(d.labels || {}) })
-      .catch(() => {})
-    return () => { alive = false }
-  }, [])
-
-  const ports = Array.from({ length: 16 }, (_, i) => {
-    const id  = (direction === 'output' ? 'DO' : 'DI') + i
-    const pin = (direction === 'output' ? 'Y' : 'X') + Math.floor(i / 8) + '.' + (i % 8)
-    return { id, pin, label: labels[id] || id }
-  })
-
+// Dropdown for a step-editor I/O field. Uses the same /api/io/portmap
+// source as the main I/O page so display, port set, and system-reserved
+// exclusions all stay in lockstep with the hardware plate.
+//   direction='output' → writable DOs (+ AOs when analog=true)
+//   direction='input'  → readable DIs (+ AIs when analog=true)
+// System-reserved DIs (modeSwitch, enableButton, flangeButton*) and
+// SAFETY terminals are excluded. Flange DOs/DIs sort to the bottom
+// with a "(flange)" suffix.
+function IOPortSelector({ label, value, onChange, direction, analog }) {
+  const portmap = useIOPortmap()
+  const options = portmapToOptions(portmap, direction, { analog: Boolean(analog) })
   return (
     <div style={{ marginBottom: 8 }}>
       <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 3 }}>{label}</div>
       <select value={value || ''} onChange={(e) => onChange(e.target.value || undefined)}
         style={{ ...selectStyle }}>
         <option value="">Not assigned</option>
-        {ports.map((p) => (
-          <option key={p.id} value={p.id}>{p.pin} — {p.label}</option>
+        {options.map((p) => (
+          <option key={p.id} value={p.id}>{p.display}</option>
         ))}
       </select>
     </div>
@@ -1811,7 +1802,10 @@ function TeachOverlay({
   const jogHoldCartesian = useStore((s) => s.jogHoldCartesian)
   const jogRelease       = useStore((s) => s.jogRelease)
   const homeRobot    = useStore((s) => s.homeRobot)
-  const triggerEstop = useStore((s) => s.triggerEstop)
+  // triggerEstop used to be pulled here for a red STOP button in the
+  // drawer footer. The button was removed (redundant with TopBar's
+  // global E-STOP, and inviting panic-taps mid-hold-to-jog). Motion
+  // stopping remains release-to-stop + heartbeat deadman.
 
   const [jogMode, setJogMode] = useState('cartesian')
   const [stepSize, setStepSize] = useState(1.0)
@@ -1927,7 +1921,16 @@ function TeachOverlay({
 
   return (
     <div style={{
-      position: 'fixed', inset: 0, zIndex: 1000,
+      // Anchor the drawer to the visible viewport, not the layout
+      // viewport. `100dvh` shrinks when the URL bar collapses so the
+      // footer can't scroll off-screen on Android Chrome; `100vh`
+      // stays as a fallback for engines that don't recognise dvh
+      // yet. `inset: 0` positions it edge-to-edge (viewport-fit=cover
+      // is set in index.html) and the footer's own padding handles
+      // safe-area avoidance below.
+      position: 'fixed', top: 0, left: 0, right: 0,
+      height: '100vh', maxHeight: '100dvh',
+      zIndex: 1000,
       background: '#f8fafc', color: '#111827',
       display: 'flex', flexDirection: 'column',
       userSelect: 'none',
@@ -2102,18 +2105,25 @@ function TeachOverlay({
         </div>
       </div>
 
-      {/* STICKY FOOTER — tablet-first: Record + STOP + Back + Skip
-          share ONE row that never scrolls off. flex-shrink:0 keeps it
-          reserved regardless of jog-area content height, and the
-          padding-bottom includes the safe-area inset so the row
-          stays clear of iOS home indicator / Android nav bar.
+      {/* STICKY FOOTER — Back (multi-pose only) + Capture position
+          + Skip (multi-pose only). No motion-stop button here:
+          motion stopping is release-to-stop plus the driver's 300 ms
+          heartbeat deadman, and the app's TopBar already exposes a
+          global E-STOP that stays visible above every screen. The
+          teach header retains a plain Cancel that aborts the teach
+          sequence without capturing.
+          The bottom padding uses max(safe-area-inset-bottom, 48px)
+          so the row clears the Android gesture home bar even when
+          the safe-area inset is reported as 0 (Android Chrome only
+          exposes non-zero safe-area for physical cutouts like foldable
+          camera notches — not for the software home indicator).
           Progress bar is pinned to the very bottom of this row. */}
       <div style={{
         flexShrink: 0,
         background: '#fff', borderTop: '1px solid #e5e7eb',
         display: 'flex', alignItems: 'center',
         padding: isTabletW ? '10px 14px' : '14px 22px',
-        paddingBottom: `calc(env(safe-area-inset-bottom, 0px) + ${isTabletW ? 10 : 14}px)`,
+        paddingBottom: `calc(max(env(safe-area-inset-bottom, 0px), 48px) + ${isTabletW ? 10 : 14}px)`,
         gap: isTabletW ? 10 : 16,
         position: 'relative',
       }}>
@@ -2126,16 +2136,6 @@ function TeachOverlay({
             flexShrink: 0,
           }}>← Back</button>
         )}
-
-        <button onClick={triggerEstop} style={{
-          minHeight: 56, minWidth: isTabletW ? 96 : 120,
-          padding: '0 18px',
-          fontSize: isTabletW ? 15 : 16, fontWeight: 800,
-          background: '#DC2626', color: '#fff',
-          border: 'none', borderRadius: 10, cursor: 'pointer',
-          flexShrink: 0,
-          boxShadow: '0 0 0 2px rgba(220,38,38,0.15)',
-        }}>⏹ STOP</button>
 
         <div style={{ flex: 1, display: 'flex', justifyContent: 'center', minWidth: 0 }}>
           <button
@@ -2154,17 +2154,19 @@ function TeachOverlay({
               transition: 'background 100ms, color 100ms',
               flexShrink: 0,
             }}>
-            {flash ? '✓ RECORDED' : 'RECORD POSITION'}
+            {flash ? '✓ CAPTURED' : 'Capture position'}
           </button>
         </div>
 
-        <button onClick={onSkip} style={{
-          minHeight: 56, padding: '0 18px',
-          fontSize: 15, fontWeight: 700,
-          background: '#fff', color: '#374151',
-          border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
-          flexShrink: 0,
-        }}>Skip →</button>
+        {totalM > 1 && (
+          <button onClick={onSkip} style={{
+            minHeight: 56, padding: '0 18px',
+            fontSize: 15, fontWeight: 700,
+            background: '#fff', color: '#374151',
+            border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+            flexShrink: 0,
+          }}>Skip this pose →</button>
+        )}
 
         {/* Progress bar pinned to the very bottom */}
         <div style={{
