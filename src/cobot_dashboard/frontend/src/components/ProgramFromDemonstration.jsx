@@ -1066,6 +1066,77 @@ function applyClarifications(draft, intent, answers) {
         const opIdx = Number(aff.operation_index ?? 0)
         const op = i.operations[opIdx]
         if (!op) continue
+        // Legacy-compat routing: older AI outputs put the fixed-vs-
+        // vision clarification on `place.location_hint` (or occasionally
+        // `pick.location_hint`) with the option strings themselves
+        // describing the choice. Detect that specific pattern — options
+        // containing "fixed" AND ("vision" OR "detect") — and route the
+        // answer to `op.source` PLUS restructure the draft's steps.
+        // Anything that doesn't match this narrow pattern keeps the
+        // pre-existing text-field behaviour so unrelated multi-choice
+        // location clarifications aren't hijacked.
+        const optStrs = Array.isArray(c.options)
+          ? c.options.map((o) => typeof o === 'string' ? o : (o?.label || ''))
+          : []
+        const looksLikeFixedVsVision =
+             optStrs.length === 2
+          && optStrs.some((s) => /fixed/i.test(s))
+          && optStrs.some((s) => /vision|detect|camera/i.test(s))
+        const isSourcePath = path === 'source'
+          || ((path === 'place.location_hint' || path === 'pick.location_hint')
+              && looksLikeFixedVsVision)
+
+        if (isSourcePath) {
+          // Normalise the answer to one of the two canonical values.
+          const s = String(ans || '').toLowerCase()
+          const chosen = (s === 'fixed_position' || /fixed/i.test(s))
+            ? 'fixed_position'
+            : 'camera_library'
+          op.source = chosen
+          // Restructure the DRAFT's steps to match — the composer
+          // already gates its detect emission on op.source, but this
+          // draft was built once and won't be re-composed unless we
+          // splice the step list. Bidirectional so flipping the
+          // answer restores the previous shape cleanly.
+          if (Array.isArray(d.steps)) {
+            if (chosen === 'fixed_position') {
+              d.steps = d.steps.filter((st) => st?.action !== 'detect')
+            } else {
+              // Add a detect step back if none exists. Canonical
+              // position is right after the opening grip-open step
+              // (or at the top if there isn't one) and before the
+              // first derived-from='pick' approach. Uses the current
+              // target_part.name for the label so the operator sees
+              // the same wording the composer would emit.
+              const hasDetect = d.steps.some((st) => st?.action === 'detect')
+              if (!hasDetect) {
+                const partName = op.target_part?.name || 'library part'
+                const detectStep = {
+                  action: 'detect',
+                  label:  'Find ' + partName,
+                  mode:   'library',
+                }
+                // Insert just before the first pick-approach step; if
+                // that can't be found, drop the detect right after the
+                // first gripper-open (or at index 0).
+                let insertAt = d.steps.findIndex(
+                  (st) => st?.action === 'move_linear' && st?.derived_from === 'pick')
+                if (insertAt < 0) {
+                  const gripIdx = d.steps.findIndex((st) => st?.action === 'open_gripper')
+                  insertAt = gripIdx >= 0 ? gripIdx + 1 : 0
+                }
+                d.steps = [
+                  ...d.steps.slice(0, insertAt),
+                  detectStep,
+                  ...d.steps.slice(insertAt),
+                ]
+              }
+            }
+          }
+          // Fall through — don't run any of the other operation-scope
+          // handlers on this answer.
+          continue
+        }
         if (path === 'target_part') {
           // ans can be a part_id string or {part_id, name}.
           const pid  = typeof ans === 'string' ? ans : ans?.part_id

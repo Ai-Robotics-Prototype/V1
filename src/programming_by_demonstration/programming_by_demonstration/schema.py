@@ -147,6 +147,18 @@ class IntentOperation:
     # ops so backward-compat consumers can keep ignoring it.
     pallet: Optional[PalletSpec] = None
     notes: str = ''
+    # How the robot LOCATES the part each cycle. Mirrors the wizard's
+    # `answers.source` discriminator so the composer can gate the
+    # `detect` step without inventing a new taxonomy:
+    #   'camera_library'  — vision recognises the part every cycle
+    #                       (composer emits a `detect` step).
+    #   'fixed_position'  — part is always in the same taught spot
+    #                       (composer emits NO detect; the pick pose
+    #                       is bound directly to the taught contact).
+    # Default 'camera_library' matches the composer's pre-change
+    # behaviour so intents that don't set this field keep producing
+    # vision-driven drafts.
+    source: str = 'camera_library'
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -413,6 +425,9 @@ class StructuredIntent:
                 ),
                 pallet=pallet_spec,
                 notes=str(raw.get('notes') or ''),
+                source=(str(raw.get('source') or 'camera_library').lower()
+                        if str(raw.get('source') or '').lower() in
+                           ('camera_library', 'fixed_position') else 'camera_library'),
             ))
         clarifications: List[Clarification] = []
         for idx, raw in enumerate(d.get('ambiguities') or []):

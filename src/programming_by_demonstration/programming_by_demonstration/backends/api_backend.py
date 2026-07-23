@@ -137,6 +137,21 @@ CRITICAL RULES — violating any of these makes the output unusable:
      from 'right bin', places at 'left tray'". Sequence is captured by
      `sequence_index` (1, 2, …) and the frame timestamps you're given.
 
+     Every operation carries `source` — how the robot LOCATES the part
+     each cycle:
+       "camera_library"  — vision recognises the part every cycle
+                           (composer emits a `detect` step tied to
+                           target_part.part_id). Default.
+       "fixed_position"  — part is always in the same taught spot
+                           (composer emits NO detect; the pick pose
+                           is bound to a fixed taught contact).
+     Choose `fixed_position` ONLY when the demo unambiguously shows a
+     dedicated fixture / feeder / conveyor stop that puts the part at
+     the same spot every cycle. When you're unsure, keep the default
+     `camera_library` and emit a `field:"location"` clarification
+     with `affects.path = "source"` so the operator can flip it — see
+     the fixed-vs-vision clarification example below.
+
   6) Surface uncertainty in `ambiguities` as STRUCTURED CLARIFICATIONS,
      not free-form prose. Each item is an OBJECT the dashboard renders
      as an interactive question the operator answers inline. Schema:
@@ -201,6 +216,18 @@ CRITICAL RULES — violating any of these makes the output unusable:
            "question":"Describe the place target in a few words.",
            "type":"text", "suggested":"left tray",
            "affects":{{"scope":"operation","operation_index":0,"path":"place.location_hint"}}}}
+       Fixed spot vs vision each cycle (drives the `detect` step):
+         {{"id":"q-part-source", "field":"location",
+           "question":"How should the robot locate the part each cycle?",
+           "type":"choice",
+           "options":["fixed_position","camera_library"],
+           "suggested":"camera_library",
+           "affects":{{"scope":"operation","operation_index":0,"path":"source"}}}}
+       Free-text variant of the same clarification (whichever phrasing
+       reads best to the operator) — `options` MUST still be the two
+       canonical values "fixed_position" and "camera_library" so the
+       dashboard can restructure the draft's steps; anything else and
+       the answer stays as a plain text field.
 
   7) For palletize / depalletize operations, EXTRACT the pallet grid
      from the narration and emit it as `operations[i].pallet`:
@@ -274,6 +301,7 @@ SCHEMA_EXAMPLE = """\
       },
       "sequence_index": 1,
       "count_hint": "all",
+      "source": "camera_library",
       "pick":  { "location_hint": "from the right bin",  "pose": null, "pose_status": "awaiting_perception" },
       "place": { "location_hint": "onto the left tray",  "pose": null, "pose_status": "awaiting_perception" },
       "notes": "Video shows three brackets at t=0s, tray empty at t=0s, brackets in tray at t=8s."

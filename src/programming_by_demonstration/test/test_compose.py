@@ -294,6 +294,50 @@ def test_machine_tend_taught_contacts_per_role():
         assert len(dsteps) >= 2, (role, dsteps)
 
 
+def test_detect_step_gated_on_operation_source():
+    """`op.source` is the part-locating discriminator that mirrors the
+    wizard's answers.source. Composer emits `detect` only when the
+    operator wants vision each cycle; 'fixed_position' means the pick
+    pose is bound to the taught contact and the detect step must be
+    absent from the draft."""
+    def _intent(src):
+        return StructuredIntent(operations=[IntentOperation(
+            operation_type='pick_and_place', sequence_index=1,
+            target_part=PartReference(part_id='bt225l24', name='BT225L24 bracket',
+                                      confidence=0.85, source='matched_to_library'),
+            source=src,
+        )])
+    # Default → detect present (backward-compatible with intents that
+    # don't set the field).
+    d_default = compose_program_draft(_intent('camera_library'), demo_id='dsrc1')
+    assert any(s['action'] == 'detect' for s in d_default.to_program_payload()['steps'])
+    # Vision each cycle → detect present.
+    d_vision = compose_program_draft(_intent('camera_library'), demo_id='dsrc2')
+    assert any(s['action'] == 'detect' for s in d_vision.to_program_payload()['steps'])
+    # Fixed position → NO detect step.
+    d_fixed = compose_program_draft(_intent('fixed_position'), demo_id='dsrc3')
+    assert not any(s['action'] == 'detect' for s in d_fixed.to_program_payload()['steps'])
+
+
+def test_intent_source_round_trip_defaults_camera_library():
+    """Legacy intents (no 'source' field in the JSON) parse back with
+    source='camera_library' — preserves pre-change behaviour."""
+    raw = {
+        'operations': [{
+            'operation_type': 'pick_and_place',
+            'target_part': {'part_id': 'p1', 'name': 'P1'},
+            'sequence_index': 1,
+        }],
+    }
+    parsed = StructuredIntent.from_dict(raw)
+    assert parsed.operations[0].source == 'camera_library'
+    # Explicit fixed_position round-trips.
+    raw2 = dict(raw)
+    raw2['operations'] = [{**raw['operations'][0], 'source': 'fixed_position'}]
+    parsed2 = StructuredIntent.from_dict(raw2)
+    assert parsed2.operations[0].source == 'fixed_position'
+
+
 def test_derived_steps_never_carry_taught_data():
     """New shape invariant: any step with derived_from is pose-free
     (no taught_joints/tcp, no position_role). The old "carry taught data

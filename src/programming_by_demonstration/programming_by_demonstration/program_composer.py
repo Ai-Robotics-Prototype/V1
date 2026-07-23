@@ -267,7 +267,16 @@ def _build_pick_and_place(op: IntentOperation, appH: int,
                           spd: int, slow: int, medium: int) -> List[Dict[str, Any]]:
     s: List[Dict[str, Any]] = []
     s.append(_grip_open(spd))
-    s.append(_detect(op.target_part.name))
+    # Detect step is gated on how the part is located each cycle. When
+    # the operator confirms a fixed taught position (op.source ==
+    # 'fixed_position'), the pick pose comes straight from the taught
+    # contact step below — vision-driven `detect` would be busy work
+    # that just adds latency and a false failure mode when the part
+    # isn't at exactly the recognised orientation. Default source is
+    # 'camera_library' so intents that don't set this field keep the
+    # detect step (matches the composer's pre-change behaviour).
+    if op.source == 'camera_library':
+        s.append(_detect(op.target_part.name))
     s.append(_above('pick',  'Approach above pick',  appH, spd))
     s.append(_pick_contact(op.pick.location_hint, slow))
     s.append(_grip_close())
@@ -295,7 +304,9 @@ def _build_machine_tend(op: IntentOperation, appH: int,
                         spd: int, slow: int, medium: int) -> List[Dict[str, Any]]:
     s: List[Dict[str, Any]] = []
     s.append(_grip_open(spd))
-    s.append(_detect(op.target_part.name))
+    # See _build_pick_and_place — detect gated on op.source.
+    if op.source == 'camera_library':
+        s.append(_detect(op.target_part.name))
     s.append(_above('pick', 'Approach above pick', appH, spd))
     s.append(_pick_contact(op.pick.location_hint, slow))
     s.append(_grip_close())
@@ -345,7 +356,9 @@ def _build_palletize(op: IntentOperation, mode: str,
     # composer so pallet programs keep the same clearance envelope.
     palletH = 200
     if mode == 'palletize':
-        s.append(_detect(op.target_part.name))
+        # See _build_pick_and_place — detect gated on op.source.
+        if op.source == 'camera_library':
+            s.append(_detect(op.target_part.name))
         s.append(_above('pick', 'Approach above pick', appH, spd))
         s.append(_pick_contact(op.pick.location_hint, slow))
         s.append(_grip_close())
