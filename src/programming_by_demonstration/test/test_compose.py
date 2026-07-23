@@ -42,22 +42,66 @@ def test_compose_pick_and_place_loads_like_wizard():
     intent = _intent_pick_and_place()
     draft = compose_program_draft(intent, demo_id='demo_test_001')
     payload = draft.to_program_payload()
-    # Steps numbered 1..N, contain the expected action labels.
-    actions = [s['action'] for s in payload['steps']]
-    assert actions[0] == 'move_home'
-    assert 'approach' in actions
-    assert 'close_gripper' in actions
-    assert 'open_gripper' in actions
+    steps = payload['steps']
+    actions = [s['action'] for s in steps]
+    # Structural expectations under the two-taught-poses-per-pair model:
+    #   move_home (framing), grip open, detect, approach (derived) →
+    #   pick contact (taught) → grip close → retreat (derived) →
+    #   approach place (derived) → place contact (taught) →
+    #   grip release → retreat (derived), move_home.
+    assert actions[0]  == 'move_home'
     assert actions[-1] == 'move_home'
-    # All move-style steps carry placeholder pose markers.
-    for s in payload['steps']:
-        if s['action'] in ('move_home', 'move_joint', 'approach'):
-            assert s.get('pose') is None
-            assert s.get('pose_status') == POSE_AWAITING_PERCEPTION
-    # Draft is tagged so the library can filter.
+    assert 'close_gripper' in actions
+    assert 'open_gripper'  in actions
+    # No standalone 'approach' action any more — all approach/retreat
+    # moves are move_linear steps carrying derived_from + offset_z_mm.
+    assert 'approach' not in actions
+    # Placeholder poses on taught + derived move steps alike; derived
+    # steps additionally carry derived_from and no position_role.
+    for s in steps:
+        if s['action'] in ('move_home', 'move_joint', 'move_linear'):
+            assert s.get('pose') is None or s.get('derived_from')
     assert 'draft' in payload['tags']
     assert 'pbd' in payload['tags']
     assert payload['config']['pbd_metadata']['demo_id'] == 'demo_test_001'
+
+
+def test_compose_pick_place_emits_two_taught_contacts_per_pair():
+    """Exactly one taught 'pick' anchor and one taught 'place' anchor.
+    Every approach/retreat step is derived_from one of those roles
+    with offset_z_mm > 0. No taught data on derived steps."""
+    intent = _intent_pick_and_place()
+    steps = compose_program_draft(intent, demo_id='demo_p001').to_program_payload()['steps']
+    taught_pick  = [s for s in steps if s.get('position_role') == 'pick']
+    taught_place = [s for s in steps if s.get('position_role') == 'place']
+    assert len(taught_pick)  == 1, taught_pick
+    assert len(taught_place) == 1, taught_place
+    # Derived pick/place steps: derived_from ∈ {pick, place}, positive Z
+    # offset (approach/retreat height). No taught data.
+    derived = [s for s in steps
+               if s.get('derived_from') in ('pick', 'place')]
+    for d in derived:
+        assert d.get('offset_z_mm', 0) > 0, d
+        assert not d.get('taught_joints')
+        assert not d.get('taught_tcp')
+        assert not d.get('position_role')
+    # And: at least one approach + one retreat on each side.
+    dpick  = [d for d in derived if d.get('derived_from') == 'pick']
+    dplace = [d for d in derived if d.get('derived_from') == 'place']
+    assert len(dpick)  >= 2, dpick
+    assert len(dplace) >= 2, dplace
+
+
+def test_compose_pick_place_taught_step_is_move_linear_move_linear():
+    """The taught pick/place steps use action='move_linear' + the
+    position_role tag — matches the executor's motion taxonomy without
+    introducing a new pick_position / place_position action."""
+    intent = _intent_pick_and_place()
+    steps = compose_program_draft(intent, demo_id='demo_p002').to_program_payload()['steps']
+    for s in steps:
+        if s.get('position_role') in ('pick', 'place'):
+            assert s['action'] == 'move_linear', s
+            assert 'contact' in (s.get('label') or '').lower()
 
 
 def test_available_operations_match_wizard_set():
@@ -218,3 +262,49 @@ def test_program_name_empty_intent_falls_back_to_demo_id():
     intent = StructuredIntent()
     draft = compose_program_draft(intent, demo_id='demo_name_005')
     assert draft.name.startswith('demo ')
+
+
+def test_machine_tend_taught_contacts_per_role():
+    """Machine-tend has three taught roles (pick, machine_load, unload).
+    Each must appear exactly once as position_role and have at least one
+    derived approach + retreat step attached."""
+    intent = StructuredIntent(
+        operations=[IntentOperation(
+            operation_type='machine_tend', sequence_index=1,
+            target_part=PartReference(part_id='bt225l24', name='BT225L24 bracket',
+                                      confidence=0.85, source='matched_to_library'),
+            pick=PoseSlot(location_hint='from bin'),
+            place=PoseSlot(location_hint='into vice'),
+        )],
+    )
+    steps = compose_program_draft(intent, demo_id='demo_mt').to_program_payload()['steps']
+    role_counts = {}
+    for s in steps:
+        r = s.get('position_role')
+        if r and not s.get('derived_from'):
+            role_counts[r] = role_counts.get(r, 0) + 1
+    # 'home' role appears twice (start + return); pick/machine_load/unload once each.
+    assert role_counts.get('pick') == 1
+    assert role_counts.get('machine_load') == 1
+    assert role_counts.get('unload') == 1
+    # Each role has at least one derived approach and retreat.
+    for role in ('pick', 'machine_load', 'unload'):
+        dsteps = [s for s in steps
+                  if s.get('derived_from') == role and s.get('offset_z_mm', 0) > 0]
+        assert len(dsteps) >= 2, (role, dsteps)
+
+
+def test_derived_steps_never_carry_taught_data():
+    """New shape invariant: any step with derived_from is pose-free
+    (no taught_joints/tcp, no position_role). The old "carry taught data
+    on derived steps as legacy fallback" pattern is gone from the
+    composer — the resolver + role_map covers all cases."""
+    intent = _intent_pick_and_place()
+    steps = compose_program_draft(intent, demo_id='demo_deriv').to_program_payload()['steps']
+    for s in steps:
+        if not s.get('derived_from'):
+            continue
+        assert not s.get('taught'), s
+        assert not s.get('taught_joints'), s
+        assert not s.get('taught_tcp'), s
+        assert not s.get('position_role'), s

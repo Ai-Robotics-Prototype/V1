@@ -165,39 +165,56 @@ def _move_home(label: str = 'Move to home position') -> Dict[str, Any]:
     }
 
 
-def _approach(hint: str, appH: int, spd: int) -> Dict[str, Any]:
+# ── Pick/place: two-taught-poses-per-pair model ─────────────────────
+#
+# Only the CONTACT poses (pick + place) are taught. Everything else —
+# approach, retreat, descend, lift — is DERIVED from those contact
+# poses via {derived_from: <role>, offset_z_mm: <height>}, with the
+# codegen resolver in estun_driver.program_ops applying the Z offset in
+# the base frame. Derived steps carry no taught data of their own.
+#
+# The old model had a single taught step (labeled "Move above pick
+# position") that combined "approach location" and "contact anchor"
+# into one, with the descend step at offset_z_mm=0 producing a movJ
+# back to the same taught pose. That model works but the taught-step
+# label misleads operators and the descend-at-offset-0 is a no-op.
+
+def _above(role: str, label: str, appH: int, spd: int) -> Dict[str, Any]:
+    """Derived approach/retreat: base_z(taught) + appH, no taught data.
+    Rendered read-only in the editor as `derived: above <role> (+Nmm Z)`
+    and resolved by program_ops.codegen_lua_from_program at build time
+    (movJCoorRel Δz relative in base frame). Same shape used for
+    approach-before-pick, retreat-after-pick, approach-before-place,
+    and retreat-after-place — the sequence-level meaning comes from
+    the surrounding steps, not the shape."""
     return {
-        'action': 'approach',
-        'label':  'Move above pick position',
-        'target':       'auto',
+        'action':       'move_linear',
+        'label':        label,
         'offset_z_mm':  int(appH),
         'speed_pct':    int(spd),
-        **_placeholder('pick', hint),
+        'derived_from': role,
     }
 
 
-def _descend(role: str, label: str, spd: int,
-             derived_from: str) -> Dict[str, Any]:
+def _contact(role: str, label: str, hint: str, spd: int) -> Dict[str, Any]:
+    """Taught contact step — position_role marks it as the anchor for
+    derived approach/retreat steps that share the same role. Applies
+    to pick/place, but also to secondary roles like machine_load and
+    unload for the machine-tending template."""
     return {
-        'action': 'move_linear',
-        'label':  label,
-        'offset_z_mm':  0,
-        'speed_pct':    int(spd),
-        'derived_from': derived_from,
-        **_placeholder(role, ''),
+        'action':    'move_linear',
+        'label':     label,
+        'speed_pct': int(spd),
+        **_placeholder(role, hint),
     }
 
 
-def _lift(role: str, label: str, offset_mm: int, spd: int,
-          derived_from: str) -> Dict[str, Any]:
-    return {
-        'action': 'move_linear',
-        'label':  label,
-        'offset_z_mm':  int(offset_mm),
-        'speed_pct':    int(spd),
-        'derived_from': derived_from,
-        **_placeholder(role, ''),
-    }
+def _pick_contact(hint: str, spd: int) -> Dict[str, Any]:
+    return _contact('pick', 'Pick position — contact', hint, spd)
+
+
+def _place_contact(hint: str, spd: int) -> Dict[str, Any]:
+    return _contact('place', 'Place position — contact', hint, spd)
 
 
 def _detect(part_name: str) -> Dict[str, Any]:
@@ -238,38 +255,35 @@ def _grip_release() -> Dict[str, Any]:
     }
 
 
-def _place_above(hint: str, spd: int) -> Dict[str, Any]:
-    return {
-        'action': 'move_joint',
-        'label':  'Move above place position',
-        'speed_pct': int(spd),
-        **_placeholder('place', hint),
-    }
-
-
 # ── Per-operation builders ─────────────────────────────────────────
+#
+# Sequence per pick/place pair (approved 2026-07-23):
+#   approach (derived, +appH)  → pick (taught, contact)
+#     → grip_close → retreat (derived, +appH)
+#     → approach-place (derived, +appH) → place (taught, contact)
+#     → grip_release → retreat-place (derived, +appH)
 
 def _build_pick_and_place(op: IntentOperation, appH: int,
                           spd: int, slow: int, medium: int) -> List[Dict[str, Any]]:
     s: List[Dict[str, Any]] = []
     s.append(_grip_open(spd))
     s.append(_detect(op.target_part.name))
-    s.append(_approach(op.pick.location_hint, appH, spd))
-    s.append(_descend('pick', 'Descend to part', slow, 'pick'))
+    s.append(_above('pick',  'Approach above pick',  appH, spd))
+    s.append(_pick_contact(op.pick.location_hint, slow))
     s.append(_grip_close())
-    s.append(_lift('pick', 'Lift part', appH, medium, 'pick'))
-    s.append(_place_above(op.place.location_hint, spd))
-    s.append(_descend('place', 'Descend to place', slow, 'place'))
+    s.append(_above('pick',  'Retreat above pick',   appH, medium))
+    s.append(_above('place', 'Approach above place', appH, spd))
+    s.append(_place_contact(op.place.location_hint, slow))
     s.append(_grip_release())
-    s.append(_lift('place', 'Lift from place', appH, medium, 'place'))
+    s.append(_above('place', 'Retreat above place',  appH, medium))
     return s
 
 
 def _build_sort(op: IntentOperation, appH: int,
                 spd: int, slow: int, medium: int) -> List[Dict[str, Any]]:
-    """Sort = pick + place-by-type. We emit the same pick body as
-    pick_and_place; the place leg gets a `sort_bin_hint` from the
-    intent's place location for the operator to verify later."""
+    """Sort = pick + place-by-type. Same body as pick_and_place; the
+    place-contact step gets a `sort_bin_hint` from the intent's place
+    location for the operator to verify later."""
     s = _build_pick_and_place(op, appH, spd, slow, medium)
     for step in s:
         if step.get('position_role') == 'place':
@@ -282,38 +296,37 @@ def _build_machine_tend(op: IntentOperation, appH: int,
     s: List[Dict[str, Any]] = []
     s.append(_grip_open(spd))
     s.append(_detect(op.target_part.name))
-    s.append(_approach(op.pick.location_hint, appH, spd))
-    s.append(_descend('pick', 'Descend to part', slow, 'pick'))
+    s.append(_above('pick', 'Approach above pick', appH, spd))
+    s.append(_pick_contact(op.pick.location_hint, slow))
     s.append(_grip_close())
-    s.append(_lift('pick', 'Lift part', appH, medium, 'pick'))
-    s.append({
-        'action': 'move_joint',
-        'label':  'Move to machine load position',
-        'speed_pct': int(spd),
-        **_placeholder('machine_load', op.place.location_hint or 'machine load fixture'),
-    })
-    s.append(_descend('machine_load', 'Descend to load position', min(spd, 20), 'machine_load'))
+    s.append(_above('pick', 'Retreat above pick',  appH, medium))
+    # Machine-load contact — the taught anchor for the machine-load
+    # role. Approach/retreat steps around it derive from this pose
+    # + appH, matching the pick/place two-taught-poses model.
+    s.append(_above('machine_load', 'Approach machine load', appH, spd))
+    s.append(_contact('machine_load', 'Machine load — contact',
+                      op.place.location_hint or 'machine load fixture',
+                      min(spd, 20)))
     s.append(_grip_release())
-    s.append(_lift('machine_load', 'Retreat from machine', appH, slow, 'machine_load'))
+    s.append(_above('machine_load', 'Retreat from machine load', appH, slow))
     s.append({'action': 'set_io', 'label': 'Start machine cycle',
               'io_id': 'DO4', 'value': 1})
     s.append({'action': 'wait', 'label': 'Wait for machine to finish',
               'duration_s': 30})
     s.append({'action': 'set_io', 'label': 'Clear cycle start',
               'io_id': 'DO4', 'value': 0})
-    s.append(_lift('machine_load', 'Approach finished part', appH, slow, 'machine_load'))
-    s.append(_descend('machine_load', 'Descend to finished part', min(spd, 20), 'machine_load'))
+    # Re-approach the same machine_load anchor to pick up the
+    # finished part — reuses the SAME taught contact pose.
+    s.append(_above('machine_load', 'Approach finished part', appH, slow))
     s.append({'action': 'close_gripper', 'label': 'Grip finished part',
               'force_pct': DEFAULT_GRIP_FORCE, 'io_close': 'DO0'})
-    s.append(_lift('machine_load', 'Lift finished part', appH, medium, 'machine_load'))
-    s.append({
-        'action': 'move_joint',
-        'label':  'Move to unload position',
-        'speed_pct': int(spd),
-        **_placeholder('unload', 'unload location'),
-    })
-    s.append(_descend('unload', 'Descend to unload', slow, 'unload'))
+    s.append(_above('machine_load', 'Retreat with finished part', appH, medium))
+    # Unload contact — separate taught role.
+    s.append(_above('unload', 'Approach unload', appH, spd))
+    s.append(_contact('unload', 'Unload position — contact',
+                      'unload location', slow))
     s.append(_grip_release())
+    s.append(_above('unload', 'Retreat from unload', appH, medium))
     return s
 
 
@@ -321,15 +334,22 @@ def _build_palletize(op: IntentOperation, mode: str,
                      appH: int, spd: int, slow: int, medium: int) -> List[Dict[str, Any]]:
     """Palletize / depalletize use move_to_pallet which the executor
     expands at runtime — pallet geometry is in config.pallet, not in
-    individual steps. The wizard does the same."""
+    individual steps. The taught end of the pair (pick for palletize,
+    place for depalletize) still follows the two-taught-poses model:
+    approach (derived) → contact (taught) → retreat (derived). The
+    pallet end is executor-computed and untouched here."""
     s: List[Dict[str, Any]] = []
     s.append(_move_home())
+    # Retract clearance for pallet moves is larger than the standard
+    # appH — reuses the existing 200 mm literal from the pre-change
+    # composer so pallet programs keep the same clearance envelope.
+    palletH = 200
     if mode == 'palletize':
         s.append(_detect(op.target_part.name))
-        s.append(_approach(op.pick.location_hint, appH, spd))
-        s.append(_descend('pick', 'Descend to pick', slow, 'pick'))
+        s.append(_above('pick', 'Approach above pick', appH, spd))
+        s.append(_pick_contact(op.pick.location_hint, slow))
         s.append(_grip_close())
-        s.append(_lift('pick', 'Lift from pick', 200, medium, 'pick'))
+        s.append(_above('pick', 'Retreat above pick', palletH, medium))
         s.append({
             'action': 'move_to_pallet',
             'mode':   'palletize',
@@ -351,15 +371,10 @@ def _build_palletize(op: IntentOperation, mode: str,
             'speed_pct': slow,
             **_placeholder('pick', op.pick.location_hint),
         })
-        s.append({
-            'action': 'move_linear',
-            'label':  'Move above place',
-            'speed_pct': spd, 'offset_z_mm': 200,
-            **_placeholder('place', op.place.location_hint),
-        })
-        s.append(_descend('place', 'Descend to place', slow, 'place'))
+        s.append(_above('place', 'Approach above place', palletH, spd))
+        s.append(_place_contact(op.place.location_hint, slow))
         s.append(_grip_release())
-        s.append(_lift('place', 'Lift from place', 200, medium, 'place'))
+        s.append(_above('place', 'Retreat above place', palletH, medium))
     s.append(_move_home(label='Return to home'))
     return s
 

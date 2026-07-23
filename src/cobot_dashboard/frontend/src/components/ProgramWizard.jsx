@@ -5,6 +5,7 @@ import { STLLoader } from 'three/examples/jsm/loaders/STLLoader'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
 import { HoldButton } from './JogControls'
+import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
 
 /*
  * Conversational Program Wizard
@@ -615,13 +616,11 @@ function GripperPreviewCanvas({ stlUrl, name, dims, onRemove }) {
 
 // Small DO / DI selector that mirrors the editor's IOPortSelector
 // look so the operator gets the same dropdown they see when wiring
-// gripper IO on a step. Pulls labels from /api/io/config.
-function IOPortDropdown({ label, direction, value, onChange, ioLabels }) {
-  const ports = Array.from({ length: 16 }, (_, i) => {
-    const id  = (direction === 'output' ? 'DO' : 'DI') + i
-    const pin = (direction === 'output' ? 'Y' : 'X') + Math.floor(i / 8) + '.' + (i % 8)
-    return { id, pin, label: (ioLabels && ioLabels[id]) || id }
-  })
+// gripper IO on a step. Same /api/io/portmap source as the main I/O
+// page — see frontend/src/lib/ioPortmap.js.
+function IOPortDropdown({ label, direction, value, onChange }) {
+  const portmap = useIOPortmap()
+  const options = portmapToOptions(portmap, direction)
   return (
     <div style={{ marginBottom: 10 }}>
       <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 4 }}>{label}</div>
@@ -631,8 +630,8 @@ function IOPortDropdown({ label, direction, value, onChange, ioLabels }) {
           border: '1px solid #d1d5db', borderRadius: 6, background: '#fff',
         }}>
         <option value="">Not assigned</option>
-        {ports.map((p) => (
-          <option key={p.id} value={p.id}>{p.pin} — {p.label}</option>
+        {options.map((p) => (
+          <option key={p.id} value={p.id}>{p.display}</option>
         ))}
       </select>
     </div>
@@ -643,17 +642,7 @@ function CustomGripperPanel({ answers, setAnswer, goNext }) {
   const [uploading, setUploading] = useState(false)
   const [uploadErr, setUploadErr] = useState('')
   const [dragOver,  setDragOver]  = useState(false)
-  const [ioLabels,  setIoLabels]  = useState({})
   const fileInputRef = useRef(null)
-
-  useEffect(() => {
-    let alive = true
-    fetch('/api/io/config')
-      .then((r) => r.json())
-      .then((d) => { if (alive && d) setIoLabels(d.labels || {}) })
-      .catch(() => {})
-    return () => { alive = false }
-  }, [])
 
   const uploadedModelId  = answers.gripper_model_id  || null
   const uploadedStlUrl   = answers.gripper_stl_url   || null
@@ -809,14 +798,12 @@ function CustomGripperPanel({ answers, setAnswer, goNext }) {
         direction="output"
         value={activateSignal}
         onChange={(v) => setAnswer('gripper_activate_signal', v)}
-        ioLabels={ioLabels}
       />
       <IOPortDropdown
         label="Confirm signal"
         direction="input"
         value={confirmSignal}
         onChange={(v) => setAnswer('gripper_confirm_signal', v)}
-        ioLabels={ioLabels}
       />
 
       <NextButton onClick={goNext} disabled={!gripperName.trim()} label="Next" />
@@ -844,10 +831,14 @@ function teachPositionsForAnswers(answers) {
     { key: 'taught_home', label: 'HOME POSITION',
       instr: 'Jog the robot to its safe home position — a neutral pose away from the work area that the robot returns to between cycles.' },
   ]
+  // Teach flow speaks the contact-pose model — the operator teaches
+  // where the gripper physically TOUCHES the part / target, not an
+  // approach hover. Approach and retreat poses are derived at build
+  // time from the taught contact + program-config approach_height.
   if (op === 'palletize' && mode === 'palletize') {
     positions.push({
       key: 'taught_pick', label: 'PICK POSITION',
-      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
+      instr: 'Jog the robot to the pick CONTACT — the pose where the gripper/vacuum touches the part. The approach hover above is computed automatically from your approach-height setting.',
     })
     positions.push({
       key: 'taught_pallet_corner', label: 'PALLET CORNER [row 1, col 1, layer 1]',
@@ -860,43 +851,43 @@ function teachPositionsForAnswers(answers) {
     })
     positions.push({
       key: 'taught_place', label: 'PLACE POSITION',
-      instr: 'Jog the robot to where it should place parts, above the target location at the correct approach angle.',
+      instr: 'Jog the robot to the place CONTACT — the pose where the part is released against the target surface. The retreat above is computed automatically.',
     })
   } else if (op === 'machine_tend') {
     positions.push({
       key: 'taught_pick', label: 'PICK / LOAD POSITION',
-      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
+      instr: 'Jog the robot to the pick CONTACT — where the gripper/vacuum touches the part. Approach and retreat are computed from your approach-height setting.',
     })
     positions.push({
       key: 'taught_machine_load', label: 'MACHINE LOAD POSITION',
-      instr: 'Jog the robot to the machine load point — where it places a part into the machine fixture.',
+      instr: 'Jog the robot to the machine-load CONTACT — where the part is seated in the fixture. Approach and retreat are computed automatically.',
     })
     positions.push({
       key: 'taught_unload', label: 'UNLOAD POSITION',
-      instr: 'Jog the robot to where it picks the finished part out of the machine.',
+      instr: 'Jog the robot to the unload CONTACT — where the finished part is released. Approach and retreat are computed automatically.',
     })
   } else if (op === 'sort') {
     positions.push({
       key: 'taught_pick', label: 'PICK POSITION',
-      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
+      instr: 'Jog the robot to the pick CONTACT — where the gripper/vacuum touches the part. Approach and retreat are computed automatically.',
     })
     positions.push({
       key: 'taught_sort_1', label: 'SORT PLACE 1',
-      instr: 'Jog the robot to the first sort destination — where type 1 parts are placed.',
+      instr: 'Jog the robot to the CONTACT for the first sort destination — where type 1 parts are released.',
     })
     positions.push({
       key: 'taught_sort_2', label: 'SORT PLACE 2',
-      instr: 'Jog the robot to the second sort destination — where type 2 parts are placed.',
+      instr: 'Jog the robot to the CONTACT for the second sort destination — where type 2 parts are released.',
     })
   } else {
     // Default: pick_and_place and anything else with a pick + place flow.
     positions.push({
       key: 'taught_pick', label: 'PICK POSITION',
-      instr: 'Jog the robot to where it should pick parts from, positioned directly above the pick point at the correct approach angle.',
+      instr: 'Jog the robot to the pick CONTACT — the pose where the gripper/vacuum touches the part. The approach hover above is computed automatically from your approach-height setting.',
     })
     positions.push({
       key: 'taught_place', label: 'PLACE POSITION',
-      instr: 'Jog the robot to where it should place parts, above the target location at the correct approach angle.',
+      instr: 'Jog the robot to the place CONTACT — the pose where the part is released against the target surface. The retreat above is computed automatically.',
     })
   }
   // Every operation's generated program ends with a move_home ("Return
@@ -1797,18 +1788,9 @@ function WhichPartBody({ answers, setAnswer, goNext }) {
 }
 
 function MachineIOBody({ answers, setAnswer, goNext }) {
-  const [ioLabels, setIoLabels] = useState({})
-  useEffect(() => {
-    fetch('/api/io/config').then(r => r.json()).then(d => setIoLabels(d.labels || {})).catch(() => {})
-  }, [])
-  const doOptions = Array.from({ length: 16 }, (_, i) => ({
-    id: 'DO' + i, label: ioLabels['DO' + i] || 'DO' + i,
-    pin: 'Y' + Math.floor(i/8) + '.' + (i%8),
-  }))
-  const diOptions = Array.from({ length: 16 }, (_, i) => ({
-    id: 'DI' + i, label: ioLabels['DI' + i] || 'DI' + i,
-    pin: 'X' + Math.floor(i/8) + '.' + (i%8),
-  }))
+  const portmap = useIOPortmap()
+  const doOptions = portmapToOptions(portmap, 'output')
+  const diOptions = portmapToOptions(portmap, 'input')
   return (
     <QuestionCard
       question="Which I/O signals control the machine?"
@@ -1821,7 +1803,7 @@ function MachineIOBody({ answers, setAnswer, goNext }) {
         <select value={answers.io_cycle_start || 'DO4'}
           onChange={e => setAnswer('io_cycle_start', e.target.value)}
           style={{ width: '100%', padding: 10, fontSize: 14, borderRadius: 6, border: '1px solid #d1d5db' }}>
-          {doOptions.map(o => <option key={o.id} value={o.id}>{o.pin} - {o.label}</option>)}
+          {doOptions.map(o => <option key={o.id} value={o.id}>{o.display}</option>)}
         </select>
       </div>
       <div style={{ marginBottom: 16 }}>
@@ -1831,7 +1813,7 @@ function MachineIOBody({ answers, setAnswer, goNext }) {
         <select value={answers.io_cycle_done || 'DI3'}
           onChange={e => setAnswer('io_cycle_done', e.target.value)}
           style={{ width: '100%', padding: 10, fontSize: 14, borderRadius: 6, border: '1px solid #d1d5db' }}>
-          {diOptions.map(o => <option key={o.id} value={o.id}>{o.pin} - {o.label}</option>)}
+          {diOptions.map(o => <option key={o.id} value={o.id}>{o.display}</option>)}
         </select>
       </div>
       <SliderQuestion label="Cycle timeout" value={answers.cycle_timeout || 30}
@@ -2947,40 +2929,26 @@ function buildPalletizeSteps(answers) {
     const pickTcp   = Array.isArray(pickPoint.tcp) ? pickPoint.tcp : null
     const pickJoints = Array.isArray(pickPoint.joints) ? pickPoint.joints : null
 
-    // Approach above pick — emit as movj on taught joints (matches
-    // the wizard's existing 'approach' semantics in buildSteps). The
-    // executor goes to the taught pose; the operator already taught
-    // it at the pick. The compound descend / lift TCPs below carry
-    // the approach / retract offsets.
-    // Source step for taught_pick; descend / lift derive from it via
-    // derived_from + offset so re-teaching the pick in the editor
-    // propagates to both children automatically.
+    // Two-taught-poses model on the pick side: approach and lift
+    // derive from a single taught 'pick' CONTACT step; the operator's
+    // taught_pick landed at that contact, not above it. Derived
+    // approach/retreat steps carry no taught data — the codegen
+    // resolver applies the base-frame Z offset at build time.
     steps.push({
-      action: 'approach', label: 'Approach above pick',
+      action: 'move_linear', label: 'Approach above pick',
+      speed_pct: spd, offset_z_mm: appH,
+      derived_from: 'pick',
+    })
+    steps.push({
+      action: 'move_linear', label: 'Pick position — contact',
       taught: !!pickJoints, taught_joints: pickJoints, joints: pickJoints,
       taught_tcp: pickTcp, position: pickTcp ? pickTcp.slice(0, 3) : null,
-      speed_pct: spd, offset_z_mm: appH,
-      position_role: 'pick',
+      speed_pct: slow, position_role: 'pick',
     })
-    // Descend to pick TCP. Keep the literal taught data as a fallback
-    // for the legacy executor path but tag derived_from so the new
-    // resolver uses the source step's current pose (handles re-teach).
-    if (pickTcp) {
-      steps.push({
-        action: 'move_linear', label: 'Descend to pick',
-        taught_tcp: pickTcp, position: pickTcp.slice(0, 3),
-        taught_joints: pickJoints, joints: pickJoints,
-        speed_pct: slow, offset_z_mm: 0,
-        derived_from: 'pick',
-      })
-    }
     steps.push(gripClose('Grip part'))
     if (gripType === 'vacuum') steps.push({ action: 'wait', label: 'Wait for vacuum seal', duration_s: 0.5 })
-    // Lift from pick — derived from taught_pick + retract offset.
     steps.push({
-      action: 'move_linear', label: 'Lift from pick',
-      taught_tcp: pickTcp, position: pickTcp ? pickTcp.slice(0, 3) : null,
-      taught_joints: pickJoints, joints: pickJoints,
+      action: 'move_linear', label: 'Retreat above pick',
       speed_pct: medium, offset_z_mm: retH,
       derived_from: 'pick',
     })
@@ -3015,37 +2983,27 @@ function buildPalletizeSteps(answers) {
     const placeTcp   = Array.isArray(placePoint.tcp) ? placePoint.tcp : null
     const placeJoints = Array.isArray(placePoint.joints) ? placePoint.joints : null
 
-    // Source step for taught_place; the first "Move above place" carries
-    // the taught data and tags itself as the 'place' role so the descend
-    // and lift below can derive from it via derived_from + offset.
+    // Two-taught-poses model on the place side: approach and lift
+    // derive from a single taught 'place' CONTACT step.
     steps.push({
-      action: 'move_linear', label: 'Move above place',
+      action: 'move_linear', label: 'Approach above place',
+      speed_pct: spd, offset_z_mm: retH,
+      derived_from: 'place',
+    })
+    steps.push({
+      action: 'move_linear', label: 'Place position — contact',
       taught: !!placeTcp, taught_tcp: placeTcp, position: placeTcp ? placeTcp.slice(0, 3) : null,
       taught_joints: placeJoints, joints: placeJoints,
-      speed_pct: spd, offset_z_mm: retH,
-      position_role: 'place',
+      speed_pct: slow, position_role: 'place',
     })
-    // Derived: descend to place at z+0 from taught_place.
-    if (placeTcp) {
-      steps.push({
-        action: 'move_linear', label: 'Descend to place',
-        taught_tcp: placeTcp, position: placeTcp.slice(0, 3),
-        taught_joints: placeJoints, joints: placeJoints,
-        speed_pct: slow, offset_z_mm: 0,
-        derived_from: 'place',
-      })
-    }
     steps.push(gripOpen('Release part'))
     if (gripType === 'vacuum') {
       steps.push({ action: 'set_io', label: 'Blow off', io_id: 'DO3', value: 1 })
       steps.push({ action: 'wait',   label: 'Wait for blow off', duration_s: 0.3 })
       steps.push({ action: 'set_io', label: 'Blow off stop', io_id: 'DO3', value: 0 })
     }
-    // Derived: lift from place at z+retract offset.
     steps.push({
-      action: 'move_linear', label: 'Lift from place',
-      taught_tcp: placeTcp, position: placeTcp ? placeTcp.slice(0, 3) : null,
-      taught_joints: placeJoints, joints: placeJoints,
+      action: 'move_linear', label: 'Retreat above place',
       speed_pct: medium, offset_z_mm: retH,
       derived_from: 'place',
     })
@@ -3100,14 +3058,14 @@ function buildSteps(answers) {
     steps.push({ action: 'detect', label: 'Find ' + (answers.target_part_name || 'library part'), mode: 'library' })
   }
 
-  // Source step for the pick — carries taught_pick (applied by applyTaught
-  // below) so the descend/lift derived moves can resolve to its taught_tcp
-  // plus their offsets at runtime.
-  steps.push({ action: 'approach', label: 'Move above pick position', target: answers.source === 'fixed_position' ? 'fixed' : 'auto', offset_z_mm: appH, speed_pct: spd, position_role: 'pick' })
-  // Derived from the taught pick — z+0 (descend onto the part). The
-  // editor treats `derived_from` steps as non-teachable; the executor
-  // resolves the actual TCP at runtime from the source step + offset.
-  steps.push({ action: 'move_linear', label: 'Descend to part', offset_z_mm: 0, speed_pct: slow, derived_from: 'pick' })
+  // Two-taught-poses-per-pair model (matches program_composer.py):
+  //   approach (derived, +appH) → pick contact (TAUGHT) → grip close →
+  //   retreat (derived, +appH) → approach-place (derived, +appH) →
+  //   place contact (TAUGHT) → grip release → retreat (derived, +appH).
+  // Only the contact steps carry position_role + taught data; every
+  // approach/retreat step is derived_from that role.
+  steps.push({ action: 'move_linear', label: 'Approach above pick', offset_z_mm: appH, speed_pct: spd, derived_from: 'pick' })
+  steps.push({ action: 'move_linear', label: 'Pick position — contact', speed_pct: slow, position_role: 'pick' })
 
   if (answers.gripper_type === 'finger') {
     steps.push({ action: 'close_gripper', label: 'Grip part', force_pct: gripF, io_close: 'DO0', io_close_confirm: 'DI0' })
@@ -3119,15 +3077,15 @@ function buildSteps(answers) {
     steps.push({ action: 'set_io', label: 'Gripper on', io_id: customActivate, value: 1 })
   }
 
-  // Lift = pick + appH (return above the part after gripping).
-  steps.push({ action: 'move_linear', label: 'Lift part', offset_z_mm: appH, speed_pct: medium, derived_from: 'pick' })
+  // Retreat back above the pick contact.
+  steps.push({ action: 'move_linear', label: 'Retreat above pick', offset_z_mm: appH, speed_pct: medium, derived_from: 'pick' })
 
   if (op === 'machine_tend') {
-    // Source step for the machine_load taught point; descend / retreat /
-    // approach-finished-part / descend-to-finished-part / lift-finished
-    // all derive from this single taught position with z-offsets.
-    steps.push({ action: 'move_joint', label: 'Move to machine load position', speed_pct: spd, position_role: 'machine_load' })
-    steps.push({ action: 'move_linear', label: 'Descend to load position', offset_z_mm: 0, speed_pct: Math.min(spd, 20), derived_from: 'machine_load' })
+    // Machine-load contact — same two-taught-poses model applied to the
+    // machine-load role. Load, cycle, and unload reuse the machine_load
+    // anchor with approach/retreat derived.
+    steps.push({ action: 'move_linear', label: 'Approach machine load', offset_z_mm: appH, speed_pct: spd, derived_from: 'machine_load' })
+    steps.push({ action: 'move_linear', label: 'Machine load — contact', speed_pct: Math.min(spd, 20), position_role: 'machine_load' })
     if (answers.gripper_type === 'finger') {
       steps.push({ action: 'open_gripper', label: 'Release part into machine', width_mm: gripW, io_open: 'DO1' })
     } else {
@@ -3137,25 +3095,21 @@ function buildSteps(answers) {
     steps.push({ action: 'set_io', label: 'Start machine cycle', io_id: answers.io_cycle_start || 'DO4', value: 1 })
     steps.push({ action: 'wait', label: 'Wait for machine to finish', duration_s: answers.cycle_timeout || 30 })
     steps.push({ action: 'set_io', label: 'Clear cycle start', io_id: answers.io_cycle_start || 'DO4', value: 0 })
-    // The robot picks the finished part out of the same fixture it loaded
-    // into, so these all derive from machine_load too.
+    // Re-approach the same fixture to pick up the finished part.
     steps.push({ action: 'move_linear', label: 'Approach finished part', offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
-    steps.push({ action: 'move_linear', label: 'Descend to finished part', offset_z_mm: 0, speed_pct: Math.min(spd, 20), derived_from: 'machine_load' })
     if (answers.gripper_type === 'finger') {
       steps.push({ action: 'close_gripper', label: 'Grip finished part', force_pct: gripF, io_close: 'DO0' })
     } else {
       steps.push({ action: 'set_io', label: 'Pick finished part', io_id: 'DO2', value: 1 })
     }
-    steps.push({ action: 'move_linear', label: 'Lift finished part', offset_z_mm: appH, speed_pct: medium, derived_from: 'machine_load' })
-    // Source step for the unload taught point; the descend-to-unload
-    // derives from it.
-    steps.push({ action: 'move_joint', label: 'Move to unload position', speed_pct: spd, position_role: 'unload' })
-    steps.push({ action: 'move_linear', label: 'Descend to unload', offset_z_mm: 0, speed_pct: slow, derived_from: 'unload' })
+    steps.push({ action: 'move_linear', label: 'Retreat with finished part', offset_z_mm: appH, speed_pct: medium, derived_from: 'machine_load' })
+    // Unload contact — separate taught role.
+    steps.push({ action: 'move_linear', label: 'Approach unload', offset_z_mm: appH, speed_pct: spd, derived_from: 'unload' })
+    steps.push({ action: 'move_linear', label: 'Unload position — contact', speed_pct: slow, position_role: 'unload' })
   } else {
-    // Default place flow (pick_and_place / sort). The move_joint is the
-    // taught place position; the descend derives from it.
-    steps.push({ action: 'move_joint', label: 'Move above place position', speed_pct: spd, position_role: 'place' })
-    steps.push({ action: 'move_linear', label: 'Descend to place', offset_z_mm: 0, speed_pct: slow, derived_from: 'place' })
+    // Default place flow (pick_and_place / sort).
+    steps.push({ action: 'move_linear', label: 'Approach above place', offset_z_mm: appH, speed_pct: spd, derived_from: 'place' })
+    steps.push({ action: 'move_linear', label: 'Place position — contact', speed_pct: slow, position_role: 'place' })
   }
 
   if (answers.gripper_type === 'finger') {
@@ -3170,7 +3124,10 @@ function buildSteps(answers) {
     steps.push({ action: 'set_io', label: 'Gripper off — release part', io_id: customActivate, value: 0 })
   }
 
-  steps.push({ action: 'move_linear', label: 'Lift from place', offset_z_mm: appH, speed_pct: medium, derived_from: 'place' })
+  // Retreat back above the final release contact (place or unload).
+  const retreatRole = (op === 'machine_tend') ? 'unload' : 'place'
+  const retreatLabel = (op === 'machine_tend') ? 'Retreat from unload' : 'Retreat above place'
+  steps.push({ action: 'move_linear', label: retreatLabel, offset_z_mm: appH, speed_pct: medium, derived_from: retreatRole })
   steps.push({ action: 'move_home', label: 'Return to home' })
 
   if (answers.repeat === 'continuous') {
@@ -3181,13 +3138,11 @@ function buildSteps(answers) {
 
   // Inject taught data from the wizard's teach pages so the editor's
   // green T badges appear immediately for the positions the operator
-  // recorded. Mapping rules:
-  //   home_point         → first + last move_home (start / return-home)
-  //   pick_point         → the 'approach' step (descend uses the same)
-  //   place_point        → first move_joint or move_linear labelled
-  //                        "Move above place position"
-  //   machine_load_point → "Move to machine load position"
-  //   unload_point       → "Move to unload position"
+  // recorded. Under the two-taught-poses-per-pair model, the taught
+  // step is the CONTACT step marked with position_role — approach and
+  // retreat are derived and never carry taught data. Matching by
+  // position_role rather than action label keeps this stable across
+  // label rewording.
   function applyTaught(s, point) {
     if (!point) return s
     return {
@@ -3214,30 +3169,22 @@ function buildSteps(answers) {
   const loadP   = readTaught(cfg, 'taught_machine_load')
   const unloadP = readTaught(cfg, 'taught_unload')
 
-  // First and last move_home both share taught_home.
+  const applyToRole = (role, point) => {
+    if (!point) return
+    const i = numbered.findIndex((s) => s.position_role === role
+                                     && !s.derived_from)
+    if (i >= 0) numbered[i] = applyTaught(numbered[i], point)
+  }
+
+  // Home has two occurrences (start + return); apply to both.
   if (homeP) {
     const homeIdxs = numbered.map((s, i) => s.action === 'move_home' ? i : -1).filter((i) => i >= 0)
     homeIdxs.forEach((i) => { numbered[i] = applyTaught(numbered[i], homeP) })
   }
-  if (pickP) {
-    const i = numbered.findIndex((s) => s.action === 'approach')
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], pickP)
-  }
-  if (placeP) {
-    const i = numbered.findIndex((s) =>
-      (s.action === 'move_joint' || s.action === 'move_linear') &&
-      typeof s.label === 'string' && s.label.toLowerCase().includes('place')
-    )
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], placeP)
-  }
-  if (loadP) {
-    const i = numbered.findIndex((s) => s.action === 'move_joint' && s.label === 'Move to machine load position')
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], loadP)
-  }
-  if (unloadP) {
-    const i = numbered.findIndex((s) => s.action === 'move_joint' && s.label === 'Move to unload position')
-    if (i >= 0) numbered[i] = applyTaught(numbered[i], unloadP)
-  }
+  applyToRole('pick',         pickP)
+  applyToRole('place',        placeP)
+  applyToRole('machine_load', loadP)
+  applyToRole('unload',       unloadP)
 
   return numbered
 }
