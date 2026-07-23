@@ -502,6 +502,8 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
               editScene={editScene} setEditScene={setEditScene}
               partsLibrary={partsLibrary}
               clarAnswers={clarAnswers} setClarAnswers={setClarAnswers}
+              clarInteracted={clarInteracted}
+              setClarInteracted={setClarInteracted}
               accepting={accepting} acceptError={acceptError}
             />
           )}
@@ -563,6 +565,7 @@ function ReviewPanel({
   editName, setEditName, editDesc, setEditDesc,
   editScene, setEditScene, partsLibrary,
   clarAnswers, setClarAnswers,
+  clarInteracted, setClarInteracted,
   accepting, acceptError,
 }) {
   return (
@@ -739,15 +742,36 @@ function ClarificationsPanel({
   const interactive = list.filter((c) => c && c.answerable !== false && c.id)
   const passive     = list.filter((c) => c && (c.answerable === false || !c.id))
 
+  // Defensive default: if the parent didn't thread the interaction set
+  // through (a prop-drilling regression like the one this file already
+  // crashed on before this guard landed), fall back to an empty Set so
+  // the review screen still renders with every chip PENDING/SUGGESTED —
+  // it will never white-screen over chip state. Warn once per mount so
+  // the drop stays visible without spamming the console. A no-op setter
+  // keeps the choice buttons clickable even when interaction tracking
+  // is disconnected — the answer still writes through to `answers`,
+  // just without a learning-store answered flag.
+  const noopSet = (fn) => { if (typeof fn === 'function') fn(new Set()) }
+  const interactedSet = interacted instanceof Set ? interacted : null
+  const _setInteracted = typeof setInteracted === 'function' ? setInteracted : noopSet
+  if (!interactedSet) {
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    // (Intentionally not a hook — a one-shot render-time warn is enough
+    // for the operator/dev-console breadcrumb.)
+    if (typeof console !== 'undefined' && console.warn) {
+      console.warn('[PBD] ClarificationsPanel: `interacted` prop missing or not a Set — falling back to empty; chips will read as SUGGESTED/PENDING only.')
+    }
+  }
+
   // Answered = explicitly interacted. Pending = not interacted (whether
   // or not a suggested default is pre-loaded — the operator hasn't
   // confirmed anything yet).
   const answeredCount = interactive.reduce(
-    (n, c) => n + (interacted && interacted.has(c.id) ? 1 : 0), 0)
+    (n, c) => n + (interactedSet && interactedSet.has(c.id) ? 1 : 0), 0)
   const pendingCount = interactive.length - answeredCount
 
   function markInteracted(id) {
-    setInteracted((prev) => {
+    _setInteracted((prev) => {
       if (prev && prev.has(id)) return prev
       const next = new Set(prev || [])
       next.add(id)
@@ -796,7 +820,7 @@ function ClarificationsPanel({
       {interactive.map((c) => {
         const v = answers ? answers[c.id] : undefined
         const isEmpty = (v === undefined || v === null || v === '')
-        const isInteracted = !!(interacted && interacted.has(c.id))
+        const isInteracted = !!(interactedSet && interactedSet.has(c.id))
         const isPending = !isInteracted && isEmpty
         // Not interacted but a seeded suggestion is pre-loaded — the
         // AI proposed something and the operator hasn't confirmed it
