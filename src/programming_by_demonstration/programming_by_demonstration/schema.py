@@ -150,15 +150,21 @@ class IntentOperation:
     # How the robot LOCATES the part each cycle. Mirrors the wizard's
     # `answers.source` discriminator so the composer can gate the
     # `detect` step without inventing a new taxonomy:
-    #   'camera_library'  — vision recognises the part every cycle
-    #                       (composer emits a `detect` step).
     #   'fixed_position'  — part is always in the same taught spot
     #                       (composer emits NO detect; the pick pose
     #                       is bound directly to the taught contact).
-    # Default 'camera_library' matches the composer's pre-change
-    # behaviour so intents that don't set this field keep producing
-    # vision-driven drafts.
-    source: str = 'camera_library'
+    #                       DEFAULT — a taught contact is
+    #                       deterministic and operators only add
+    #                       vision when the part actually moves.
+    #   'camera_library'  — vision recognises the part every cycle
+    #                       (composer emits a `detect` step tied to
+    #                       target_part.part_id).
+    # A schema round-trip on an older intent with no `source` field
+    # will now default to 'fixed_position' — fresh review of a legacy
+    # demo therefore shows no detect step until the operator picks
+    # vision via the location clarification. The applyClarifications
+    # step-restructuring on the frontend keeps flipping bidirectional.
+    source: str = 'fixed_position'
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -425,9 +431,9 @@ class StructuredIntent:
                 ),
                 pallet=pallet_spec,
                 notes=str(raw.get('notes') or ''),
-                source=(str(raw.get('source') or 'camera_library').lower()
+                source=(str(raw.get('source') or 'fixed_position').lower()
                         if str(raw.get('source') or '').lower() in
-                           ('camera_library', 'fixed_position') else 'camera_library'),
+                           ('camera_library', 'fixed_position') else 'fixed_position'),
             ))
         clarifications: List[Clarification] = []
         for idx, raw in enumerate(d.get('ambiguities') or []):

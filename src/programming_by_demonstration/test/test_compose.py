@@ -307,10 +307,16 @@ def test_detect_step_gated_on_operation_source():
                                       confidence=0.85, source='matched_to_library'),
             source=src,
         )])
-    # Default → detect present (backward-compatible with intents that
-    # don't set the field).
-    d_default = compose_program_draft(_intent('camera_library'), demo_id='dsrc1')
-    assert any(s['action'] == 'detect' for s in d_default.to_program_payload()['steps'])
+    # Default (unset source) → NO detect step — the safer default now
+    # that a taught contact pose is treated as authoritative.
+    from programming_by_demonstration.schema import StructuredIntent as SI
+    intent_default = SI(operations=[IntentOperation(
+        operation_type='pick_and_place', sequence_index=1,
+        target_part=PartReference(part_id='bt225l24', name='BT225L24 bracket',
+                                  confidence=0.85, source='matched_to_library'),
+    )])   # source unset → dataclass default kicks in
+    d_default = compose_program_draft(intent_default, demo_id='dsrc1')
+    assert not any(s['action'] == 'detect' for s in d_default.to_program_payload()['steps'])
     # Vision each cycle → detect present.
     d_vision = compose_program_draft(_intent('camera_library'), demo_id='dsrc2')
     assert any(s['action'] == 'detect' for s in d_vision.to_program_payload()['steps'])
@@ -319,9 +325,12 @@ def test_detect_step_gated_on_operation_source():
     assert not any(s['action'] == 'detect' for s in d_fixed.to_program_payload()['steps'])
 
 
-def test_intent_source_round_trip_defaults_camera_library():
-    """Legacy intents (no 'source' field in the JSON) parse back with
-    source='camera_library' — preserves pre-change behaviour."""
+def test_intent_source_round_trip_defaults_fixed_position():
+    """Intents without a `source` field parse back as fixed_position —
+    the safer default: a taught contact pose is deterministic and
+    operators only add vision when the part actually moves. Fresh
+    drafts therefore emit no detect step until the operator picks
+    vision via the location clarification."""
     raw = {
         'operations': [{
             'operation_type': 'pick_and_place',
@@ -330,12 +339,12 @@ def test_intent_source_round_trip_defaults_camera_library():
         }],
     }
     parsed = StructuredIntent.from_dict(raw)
-    assert parsed.operations[0].source == 'camera_library'
-    # Explicit fixed_position round-trips.
+    assert parsed.operations[0].source == 'fixed_position'
+    # Explicit camera_library round-trips (the vision-each-cycle path).
     raw2 = dict(raw)
-    raw2['operations'] = [{**raw['operations'][0], 'source': 'fixed_position'}]
+    raw2['operations'] = [{**raw['operations'][0], 'source': 'camera_library'}]
     parsed2 = StructuredIntent.from_dict(raw2)
-    assert parsed2.operations[0].source == 'fixed_position'
+    assert parsed2.operations[0].source == 'camera_library'
 
 
 def test_derived_steps_never_carry_taught_data():

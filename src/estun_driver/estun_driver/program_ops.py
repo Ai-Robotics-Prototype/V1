@@ -480,14 +480,63 @@ def codegen_lua_from_program(
     # movL (movJ back-to-back at the same joints is a controller-
     # tolerated no-op).
     last_move_joints: list[float] | None = None
-    # Loop step (goto=<line>, count=<n>) → emit `goto ::_prog_start::`.
-    # Prepend the label at file line 1 so `setStartLine 1` still lands
-    # on real executable code. Track whether the label is needed so
-    # non-looping programs stay label-free.
-    needs_start_label = any(str(s.get('action') or '').lower() == 'loop'
-                            for s in steps)
-    for step in steps:
+    # Loop step handling. There are three cases:
+    #   count == 0  (continuous)  — emit `goto ::_prog_start::` at the
+    #                               loop step and prepend the label at
+    #                               file line 1. Wire-verified.
+    #   count == 1                 — no loop wrapping at all; the step
+    #                               is a no-op (matches today's
+    #                               "run once" byte output).
+    #   count >= 2  (finite)       — wrap the body in a Lua counted
+    #                               `for i=1,N do ... end`. The
+    #                               initial move_home stays OUTSIDE
+    #                               the loop (home once, then cycle
+    #                               pick/place); the trailing
+    #                               return-to-home stays inside so
+    #                               each cycle ends at a safe pose.
+    # A finite-count wrapping suppresses the `::_prog_start::` label
+    # (for-loop doesn't need a goto target). Track which mode this
+    # program uses so the walker below emits the right skeleton.
+    _loop_step   = next((s for s in steps
+                          if str(s.get('action') or '').lower() == 'loop'),
+                        None)
+    _loop_count  = int((_loop_step.get('count') if _loop_step else 0) or 0)
+    _use_forloop = _loop_step is not None and _loop_count >= 2
+    _use_goto    = _loop_step is not None and _loop_count == 0
+    needs_start_label = _use_goto
+    # Index (in `steps`) of the first move_home — the anchor around
+    # which the for-loop wraps. `None` when no move_home exists (the
+    # for-loop then wraps everything after the first step).
+    _forloop_open_after_idx = None
+    if _use_forloop:
+        for _i, _s in enumerate(steps):
+            if str(_s.get('action') or '').lower() == 'move_home':
+                _forloop_open_after_idx = _i
+                break
+    # Records the exec_lines position at which the for-loop opener
+    # was injected, purely for post-walk sanity. If for some reason
+    # the initial move_home never emits (skipped, malformed pose,
+    # etc.) we still open the for-loop right before the first
+    # non-loop step so the counted body isn't lost.
+    _forloop_opened = False
+    for _step_idx, step in enumerate(steps):
         action = step.get('action', '?')
+
+        # Inject the `for i=1,N do` opener right before the first step
+        # AFTER the initial move_home (or before the first step
+        # outright when no move_home exists). The trailing `end` is
+        # emitted by the loop-step handler above.
+        if _use_forloop and not _forloop_opened:
+            _should_open = (
+                (_forloop_open_after_idx is None and _step_idx == 0)
+                or (_forloop_open_after_idx is not None
+                    and _step_idx == _forloop_open_after_idx + 1)
+            )
+            if _should_open:
+                exec_lines.append(
+                    f'for i=1,{_loop_count} do  '
+                    f'-- counted cycles (home outside; body inside)')
+                _forloop_opened = True
 
         # ---- DO / AO set — verified verbs setDO / setAO --------------
         if action == 'set_io':
@@ -556,27 +605,38 @@ def codegen_lua_from_program(
                 f'duration_s={dur:g} → {dur_ms} ms')
             continue
 
-        # ---- Loop — goto label at file line 1 -------------------------
-        # `goto` and `::label::` are wire-verified verbs in
-        # luaenginelib.json. `count == 0` (== continuous) emits a bare
-        # `goto ::_prog_start::`. A finite count would need a counter
-        # var + `if _iter < N then goto ... end`; not exercised by the
-        # test wizard so kept minimal here — extend when a program with
-        # count>0 lands.
+        # ---- Loop — for-loop wrap OR continuous goto ----------------
+        # Wire-verified verbs: `goto`, `::label::`, plus plain Lua 5.3
+        # counted `for` — none of these require a new controller verb.
+        #   count == 0  (continuous) → `goto ::_prog_start::` (label
+        #                             prepended before the first step
+        #                             so the jump has a target).
+        #   count == 1              → no output; the step is a no-op.
+        #                             Preserves byte-identical Lua vs
+        #                             the pre-cycles-input "run once"
+        #                             mode (diff-verifiable).
+        #   count >= 2  (finite)    → the loop body was opened with
+        #                             `for i=1,N do` right after the
+        #                             initial move_home; here we close
+        #                             it with `end`.
+        # For finite loops the initial move_home stays OUTSIDE (home
+        # once at start of program); the trailing return-to-home
+        # inside the loop keeps each cycle ending at a safe pose.
         if action == 'loop':
             count = int(step.get('count') or 0)
             if count == 0:
                 exec_lines.append(f'goto _prog_start  -- step {action}  '
                                   f'continuous (count=0)')
+            elif count == 1:
+                # Explicit no-op — the composer/wizard could just as
+                # well omit the loop step at count=1, but tolerating
+                # it here keeps hand-authored programs runnable.
+                exec_lines.append(f'-- step {action}  count=1 (no-op; '
+                                  f'body runs once as authored)')
             else:
-                # Finite loops need a counter; not covered by current
-                # wire captures. Emit a bare goto with a marker so it
-                # still runs (turns into an infinite loop, but never
-                # stops the operator from spotting the TODO).
-                exec_lines.append(f'goto _prog_start  -- step {action}  '
-                                  f'count={count} (finite counter not '
-                                  f'yet implemented; running as '
-                                  f'continuous)')
+                exec_lines.append(
+                    f'end  -- step {action}  '
+                    f'for i=1,{count} counted loop end')
             continue
 
         # ---- Wait input — emit a getDI read -------------------------

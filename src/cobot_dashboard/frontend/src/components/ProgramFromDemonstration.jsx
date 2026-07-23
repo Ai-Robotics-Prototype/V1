@@ -54,6 +54,13 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
   // interacted — that's an implicit-accept path, treated in the
   // learning store as answered=false / chose_suggested=true.
   const [clarInteracted, setClarInteracted] = useState(() => new Set())
+  // How many times the composed program should cycle (default 1 —
+  // matches the pre-cycles behaviour, byte-identical Lua). Set > 1 to
+  // wrap the composed body in a Lua for-loop at codegen time
+  // (initial move_home outside, body + return-to-home inside).
+  // Continuous (count=0) is not offered here — the operator can flip
+  // that in the ProgramEditor after Accept if they want it.
+  const [cycles, setCycles] = useState(1)
   // Editable mirrors of the draft fields — operator corrections.
   const [editName, setEditName]       = useState('')
   const [editDesc, setEditDesc]       = useState('')
@@ -200,6 +207,7 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
       }
       setClarAnswers(seed)
       setClarInteracted(new Set())
+      setCycles(1)
       setPhase(PHASE_REVIEW)
     } catch (e) {
       setGenError(`generate error: ${e?.message || e}`)
@@ -218,8 +226,28 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
       // question (no second round-trip). The applied intent is what
       // gets persisted as the training target.
       const applied = applyClarifications(draft, intent, clarAnswers)
+      // Cycles: 1 = no loop step (byte-identical to today). N ≥ 2
+      // appends a loop step at the tail; codegen wraps the body in
+      // `for i=1,N do ... end` with the initial move_home outside.
+      // Strip any pre-existing loop step first so a re-accept doesn't
+      // double up (shouldn't happen — the composer never emits one —
+      // but defensive against a legacy PBD draft that already has
+      // one on disk).
+      const cyclesN = Math.max(1, Math.min(9999, Number.isFinite(cycles) ? cycles : 1))
+      let outSteps = Array.isArray(applied.draft.steps)
+        ? applied.draft.steps.filter((s) => s?.action !== 'loop')
+        : []
+      if (cyclesN > 1) {
+        outSteps = outSteps.concat([{
+          action: 'loop',
+          label: 'Repeat ' + cyclesN + ' times',
+          goto: 1,
+          count: cyclesN,
+        }])
+      }
       const program = {
         ...applied.draft,
+        steps:       outSteps,
         name:        editName.trim() || applied.draft.name,
         description: editDesc,
       }
@@ -504,6 +532,7 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
               clarAnswers={clarAnswers} setClarAnswers={setClarAnswers}
               clarInteracted={clarInteracted}
               setClarInteracted={setClarInteracted}
+              cycles={cycles} setCycles={setCycles}
               accepting={accepting} acceptError={acceptError}
             />
           )}
@@ -566,19 +595,17 @@ function ReviewPanel({
   editScene, setEditScene, partsLibrary,
   clarAnswers, setClarAnswers,
   clarInteracted, setClarInteracted,
+  cycles, setCycles,
   accepting, acceptError,
 }) {
   return (
     <div style={{ padding: 22 }}>
-      <Banner
-        kind={transitedExternally ? 'warn' : 'info'}
-        title="Generated from demonstration — poses pending perception"
-        body={
-          `${transitedExternally
-            ? 'Interpreted by external API (' + backendId + '); your demonstration data and the human-corrected program are stored locally only.'
-            : 'Interpreted by the on-device backend (' + backendId + ').'}`
-        }
-      />
+      {/* Provenance banner removed 2026-07-23 — the "generated from
+          demonstration — poses pending perception" block was
+          review-screen clutter (backendId still logged in
+          metadata.json / backend_used.json for provenance). The
+          transitedExternally flag remains available on props for any
+          future warning; it just no longer renders here. */}
 
       <Section title="Task summary">
         <div style={{ fontSize: 14, color: '#111', marginBottom: 8 }}>
@@ -657,6 +684,28 @@ function ReviewPanel({
           rows={2} style={{ ...inputBox, marginTop: 6, resize: 'vertical' }} />
       </Section>
 
+      <Section title="Run mode">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 14, color: '#111' }}>Run for</span>
+          <input type="number" min={1} step={1}
+            value={Number.isFinite(cycles) ? cycles : 1}
+            onChange={(e) => {
+              const raw = parseInt(e.target.value, 10)
+              setCycles(Number.isFinite(raw) && raw >= 1 ? raw : 1)
+            }}
+            style={{ ...inputBox, width: 84, textAlign: 'right' }} />
+          <span style={{ fontSize: 14, color: '#111' }}>
+            cycle{cycles === 1 ? '' : 's'}
+          </span>
+        </div>
+        <div style={{ fontSize: 12, color: '#6b7280', marginTop: 6 }}>
+          The initial move-to-home runs once at program start; the
+          pick/place body then cycles the number of times you set here.
+          Continuous (run-forever) programs can be enabled in the
+          Program editor after saving.
+        </div>
+      </Section>
+
       <Section title={`Draft steps (${draft.steps?.length || 0})`}>
         <div style={{
           maxHeight: 220, overflowY: 'auto', borderRadius: 8,
@@ -689,15 +738,11 @@ function ReviewPanel({
         </div>
       </Section>
 
-      {transcript && (
-        <Section title="Voice transcript">
-          <div style={{
-            padding: 10, fontSize: 12, color: '#374151',
-            background: '#f8fafc', border: '1px solid #e5e7eb',
-            borderRadius: 6, lineHeight: 1.5, whiteSpace: 'pre-wrap',
-          }}>{transcript}</div>
-        </Section>
-      )}
+      {/* Voice transcript display removed 2026-07-23. The transcript
+          is still parsed, persisted (audio_transcript.json), and fed
+          to the understanding backend — the read-only review-screen
+          echo was clutter. The `transcript` prop is still received in
+          case a future placement wants it. */}
 
       {acceptError && <ErrorBanner msg={acceptError} />}
       {/* Cancel + Accept buttons live in the wizard's sticky footer
@@ -955,6 +1000,13 @@ function ClarificationInput({ c, value, onChange, partsLibrary }) {
     // every taught library part — the operator may know it's actually
     // a different taught part the AI ignored. Untaught parts stay
     // hidden, mirroring the program editor's Detect Part dropdown.
+    // A trailing "New part — not in library" option lets the operator
+    // record a match against a part that has not been taught yet;
+    // applyClarifications stores part_id=null with part_source='new'
+    // so downstream consumers can render the demo-derived descriptor
+    // instead of dereferencing a library entry that isn't there.
+    // TODO: hook this into an add-to-library flow when one exists —
+    // right now it just leaves the descriptor as the display name.
     const seen = new Set()
     const merged = []
     for (const opt of (Array.isArray(c.options) ? c.options : [])) {
@@ -972,11 +1024,20 @@ function ClarificationInput({ c, value, onChange, partsLibrary }) {
       seen.add(p.id)
       merged.push({ part_id: p.id, name: p.name || p.id })
     }
-    const current = typeof value === 'string' ? value : (value?.part_id || '')
+    const NEW_PART = '__new_part__'
+    const current = typeof value === 'string'
+      ? value
+      : (value?.part_id === null ? NEW_PART : (value?.part_id || ''))
     return (
       <select value={current}
         onChange={(e) => {
           const pid = e.target.value
+          if (pid === NEW_PART) {
+            // Sentinel — applyClarifications interprets this as
+            // "part_id: null, part_source: 'new'".
+            onChange(NEW_PART)
+            return
+          }
           const hit = merged.find((p) => p.part_id === pid)
           onChange(hit ? { part_id: pid, name: hit.name } : pid)
         }}
@@ -985,6 +1046,7 @@ function ClarificationInput({ c, value, onChange, partsLibrary }) {
         {merged.map((p) => (
           <option key={p.part_id} value={p.part_id}>{p.name} ({p.part_id})</option>
         ))}
+        <option value={NEW_PART}>New part — not in library</option>
       </select>
     )
   }
@@ -1162,15 +1224,34 @@ function applyClarifications(draft, intent, answers) {
           continue
         }
         if (path === 'target_part') {
-          // ans can be a part_id string or {part_id, name}.
-          const pid  = typeof ans === 'string' ? ans : ans?.part_id
-          const name = typeof ans === 'string' ? '' : (ans?.name || '')
-          if (pid) {
+          // ans is one of:
+          //   • '__new_part__' sentinel  → part_id:null, part_source:'new'
+          //   • a part_id string
+          //   • { part_id, name } object
+          if (ans === '__new_part__') {
+            // Descriptor stays whatever the AI/operator already put
+            // in target_part.name — the scene section is the single
+            // source of truth for the descriptor.
             op.target_part = {
               ...(op.target_part || {}),
-              part_id: pid,
-              name: name || op.target_part?.name || pid,
-              source: 'matched_to_library',
+              part_id: null,
+              part_source: 'new',
+              // Preserve the current name; if unset, drop back to a
+              // generic placeholder so downstream renderers never see
+              // an empty label.
+              name: op.target_part?.name || 'new part',
+            }
+          } else {
+            const pid  = typeof ans === 'string' ? ans : ans?.part_id
+            const name = typeof ans === 'string' ? '' : (ans?.name || '')
+            if (pid) {
+              op.target_part = {
+                ...(op.target_part || {}),
+                part_id: pid,
+                name: name || op.target_part?.name || pid,
+                source: 'matched_to_library',
+                part_source: 'library',
+              }
             }
           }
         } else if (path === 'count_hint') {
@@ -1400,7 +1481,7 @@ function SceneSection({ scene, onChange, partsLibrary }) {
         onChange={(e) => updateSummary(e.target.value)}
         placeholder="e.g. A bin of brackets on the right; an empty tray on the left."
         rows={2}
-        style={{ ...inputBox, marginBottom: 14, resize: 'vertical', fontSize: 13 }} />
+        style={{ ...inputBox, marginBottom: 14, resize: 'vertical' }} />
 
       {/* Objects */}
       <SubTitle text={`Objects detected (${objects.length})`} />

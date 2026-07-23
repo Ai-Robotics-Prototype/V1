@@ -221,8 +221,14 @@ CRITICAL RULES — violating any of these makes the output unusable:
            "question":"How should the robot locate the part each cycle?",
            "type":"choice",
            "options":["fixed_position","camera_library"],
-           "suggested":"camera_library",
+           "suggested":"fixed_position",
            "affects":{{"scope":"operation","operation_index":0,"path":"source"}}}}
+       Note: fixed_position is the default suggestion because a taught
+       contact pose is deterministic and needs no runtime perception —
+       operators pick vision only when the part actually moves between
+       cycles (feeder shuffle, camera-driven bin picking, etc.). Fresh
+       drafts without an answered clarification carry source
+       "fixed_position" and therefore emit NO detect step.
        Free-text variant of the same clarification (whichever phrasing
        reads best to the operator) — `options` MUST still be the two
        canonical values "fixed_position" and "camera_library" so the
@@ -301,7 +307,7 @@ SCHEMA_EXAMPLE = """\
       },
       "sequence_index": 1,
       "count_hint": "all",
-      "source": "camera_library",
+      "source": "fixed_position",
       "pick":  { "location_hint": "from the right bin",  "pose": null, "pose_status": "awaiting_perception" },
       "place": { "location_hint": "onto the left tray",  "pose": null, "pose_status": "awaiting_perception" },
       "notes": "Video shows three brackets at t=0s, tray empty at t=0s, brackets in tray at t=8s."
