@@ -114,6 +114,24 @@ CRITICAL RULES — violating any of these makes the output unusable:
      places referenced (pick zone, place zone, fixture). Neither
      contains numeric coordinates.
 
+     `scene.spatial_summary` VOCABULARY — must match the rest of the
+     RoboAi UI so operators reading the review screen see the same
+     terminology as in the program editor and the parts library:
+       • Refer to parts by their `matched_part_name` VERBATIM (the
+         library name — e.g. "BT225L24 bracket"), not by generic
+         descriptors like "the small white part". If a part is
+         unmatched, use its `label` verbatim.
+       • Location vocabulary is fixed: "pick location", "place
+         location", "approach", "retreat", "home". Do NOT invent
+         synonyms like "drop-off zone", "target area", "staging
+         spot" — those don't appear anywhere else in the app.
+       • Distances / heights are millimetres ("mm"), matching the
+         program editor's Z-offset and descend fields. Do NOT use
+         inches, cm, "a bit", "high", "low".
+       • Keep it to 1-2 short sentences. State where the part is at
+         the start, where it ends up, and any obvious in-between
+         location — nothing more.
+
   5) `operations[]` references scene objects/locations by their LABELS
      so the reviewer can see "Operation 1 picks the white bracket
      from 'right bin', places at 'left tray'". Sequence is captured by
@@ -206,7 +224,17 @@ CRITICAL RULES — violating any of these makes the output unusable:
      (a single placement). NEVER guess a multi-cell grid.
      Leave `pallet` null on non-pallet operations.
 
-  8) Output ONLY a JSON object matching the schema below. No prose, no
+  8) `task_summary` — one short sentence describing what the robot
+     does end to end, using the same VOCABULARY as rule 4's
+     spatial_summary (library part names verbatim, "pick location" /
+     "place location", millimetres, no synonyms). This value is used
+     as the LIBRARY-LIST NAME after truncation, so lead with the part
+     and operation (e.g. "BT225L24 bracket pick and place from the
+     right bin to the left tray"). Long free-form detail belongs in
+     `raw_understanding_notes` or the operator-editable description,
+     not here.
+
+  9) Output ONLY a JSON object matching the schema below. No prose, no
      markdown fences, no commentary.
 
 Schema:
@@ -233,7 +261,7 @@ SCHEMA_EXAMPLE = """\
       { "label": "right bin",  "role": "pick_source",   "approx_position": "right side of the table",            "source": "video" },
       { "label": "left tray",  "role": "place_target",  "approx_position": "left side of the table, front edge", "source": "both"  }
     ],
-    "spatial_summary": "A bin of small white brackets sits on the right of the work surface; an empty tray sits on the left. The robot path goes from the right bin to the left tray."
+    "spatial_summary": "BT225L24 brackets sit at the pick location on the right side of the work surface; the place location is an empty tray on the left. The robot approaches from home, picks each BT225L24 bracket, and places it at the left tray."
   },
   "operations": [
     {

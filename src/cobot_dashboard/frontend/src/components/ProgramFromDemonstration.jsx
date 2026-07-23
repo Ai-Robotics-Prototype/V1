@@ -44,6 +44,16 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
   // string means "explicitly pending" (used for text/number inputs
   // the operator hasn't touched yet when no suggested existed).
   const [clarAnswers, setClarAnswers] = useState({})
+  // Set of clarification ids the operator has EXPLICITLY interacted
+  // with — clicked a choice, edited a text/number, picked a part.
+  // Deliberately independent from clarAnswers: seeding the answer to
+  // `c.suggested` on draft-load pre-fills the value but does NOT count
+  // as an operator interaction, so the chip stays PENDING (or SUGGESTED
+  // if we want to display that) until the operator does something.
+  // "Accept all suggested defaults" ALSO does not mark anything as
+  // interacted — that's an implicit-accept path, treated in the
+  // learning store as answered=false / chose_suggested=true.
+  const [clarInteracted, setClarInteracted] = useState(() => new Set())
   // Editable mirrors of the draft fields — operator corrections.
   const [editName, setEditName]       = useState('')
   const [editDesc, setEditDesc]       = useState('')
@@ -189,6 +199,7 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
         }
       }
       setClarAnswers(seed)
+      setClarInteracted(new Set())
       setPhase(PHASE_REVIEW)
     } catch (e) {
       setGenError(`generate error: ${e?.message || e}`)
@@ -233,7 +244,41 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
           // as a separate file (clarifications_answered.json) so the
           // learning loop can see which questions the AI needed to
           // ask and how the human answered them.
-          clarifications_answered: clarAnswers,
+          //
+          // Richer per-id shape: {answered, chose_suggested, value}.
+          //   answered         = operator explicitly interacted with
+          //                      this clarification (clicked / edited).
+          //   chose_suggested  = the final value equals the AI's
+          //                      suggested default (regardless of
+          //                      whether the operator interacted).
+          //   value            = the final answer stored on the draft.
+          // Both signals matter for training: explicit-accept and
+          // implicit-accept-of-default are DIFFERENT signals — one
+          // means "the operator agreed", the other means "the operator
+          // never looked". The backend also accepts the older flat
+          // {id: value} shape for back-compat.
+          clarifications_answered: (() => {
+            const out = {}
+            const byId = {}
+            for (const c of (intent?.ambiguities || [])) {
+              if (c && c.id) byId[c.id] = c
+            }
+            for (const [cid, v] of Object.entries(clarAnswers || {})) {
+              const c = byId[cid]
+              const suggested = c ? c.suggested : undefined
+              let choseSuggested = false
+              try {
+                choseSuggested = (suggested !== undefined && suggested !== null)
+                                 && JSON.stringify(v) === JSON.stringify(suggested)
+              } catch { choseSuggested = false }
+              out[cid] = {
+                answered: clarInteracted.has(cid),
+                chose_suggested: choseSuggested,
+                value: v,
+              }
+            }
+            return out
+          })(),
           save_to_library: true,
         }),
       })
@@ -590,25 +635,17 @@ function ReviewPanel({
           clarifications={intent.ambiguities}
           answers={clarAnswers}
           setAnswers={setClarAnswers}
+          interacted={clarInteracted}
+          setInteracted={setClarInteracted}
           partsLibrary={partsLibrary}
         />
       )}
 
-      {(usedExamples || []).length > 0 && (
-        <Section title={`Informed by ${usedExamples.length} similar past demo${usedExamples.length === 1 ? '' : 's'}`}>
-          {usedExamples.map((ex, i) => (
-            <div key={i} style={{
-              padding: 8, marginBottom: 4, borderRadius: 6,
-              background: '#eff6ff', border: '1px solid #bfdbfe',
-              fontSize: 12, color: '#1e3a8a', display: 'flex', gap: 8,
-            }}>
-              <span style={{ fontFamily: 'monospace' }}>{ex.demo_id}</span>
-              <span style={{ flex: 1 }}>{ex.task_summary || ''}</span>
-              <span>score {ex._score}</span>
-            </div>
-          ))}
-        </Section>
-      )}
+      {/* Retrieval-augment few-shot examples are still fetched, logged
+          to metadata.retrieval.used_examples, and shape the AI's draft
+          — the operator-facing "Informed by N past demos" indicator
+          was removed as review-screen clutter. The retrieval mechanism
+          itself and its provenance record are unchanged. */}
 
       <Section title="Program name (editable)">
         <input value={editName} onChange={(e) => setEditName(e.target.value)}
@@ -673,29 +710,58 @@ function ReviewPanel({
 // Renders each structured clarification with the right input for its
 // `type`, pre-filled from `suggested`. Legacy plain-string ambiguities
 // (answerable=false after schema wrapping) render as read-only chips
-// so old demos still display. The panel reports unanswered vs
-// answered + lets the operator "Accept all suggested defaults" in one
-// click; that's just a no-op since the seed already populated
-// suggested values into answers, but the button makes the implicit
-// behaviour explicit.
-function ClarificationsPanel({ clarifications, answers, setAnswers, partsLibrary }) {
+// so old demos still display.
+//
+// STATUS MODEL — three visible states:
+//   PENDING   — operator has not interacted AND no seeded value.
+//   SUGGESTED — operator has not interacted BUT a suggested default
+//               is pre-loaded (accept-as-is is one click of the button
+//               below or an explicit click on the highlighted option).
+//   ANSWERED  — operator explicitly interacted with the input, regardless
+//               of whether the chosen value equals the suggested default.
+//
+// This distinguishes "the AI proposed X and the operator agreed" from
+// "the AI proposed X and the operator never looked" — both are useful
+// training signals, but they're not the same signal. The prior
+// implementation derived status from (value === suggested), so
+// explicitly clicking the option that matched the default kept the
+// chip stuck on SUGGESTED — the bug this panel now fixes.
+//
+// The "Accept all suggested defaults" button ONLY populates values;
+// it does NOT mark the entry as interacted. That preserves the
+// implicit-accept-of-default signal in the learning store.
+function ClarificationsPanel({
+  clarifications, answers, setAnswers,
+  interacted, setInteracted,
+  partsLibrary,
+}) {
   const list = Array.isArray(clarifications) ? clarifications : []
   const interactive = list.filter((c) => c && c.answerable !== false && c.id)
   const passive     = list.filter((c) => c && (c.answerable === false || !c.id))
 
-  // "Pending" = answer is empty string AND no suggested default lined
-  // up to back-fill it (so it would actually go in as empty). An
-  // answer that still equals the suggested default is considered
-  // "answered" — accepting the suggestion is a real choice.
-  const pendingCount = interactive.reduce((n, c) => {
-    const v = answers ? answers[c.id] : undefined
-    const empty = (v === undefined || v === null || v === '')
-    return n + (empty ? 1 : 0)
-  }, 0)
-  const answeredCount = interactive.length - pendingCount
+  // Answered = explicitly interacted. Pending = not interacted (whether
+  // or not a suggested default is pre-loaded — the operator hasn't
+  // confirmed anything yet).
+  const answeredCount = interactive.reduce(
+    (n, c) => n + (interacted && interacted.has(c.id) ? 1 : 0), 0)
+  const pendingCount = interactive.length - answeredCount
 
-  function setOne(id, v) { setAnswers((prev) => ({ ...(prev || {}), [id]: v })) }
+  function markInteracted(id) {
+    setInteracted((prev) => {
+      if (prev && prev.has(id)) return prev
+      const next = new Set(prev || [])
+      next.add(id)
+      return next
+    })
+  }
+  function setOne(id, v) {
+    setAnswers((prev) => ({ ...(prev || {}), [id]: v }))
+    markInteracted(id)
+  }
   function acceptAllSuggested() {
+    // Populate values only — deliberately does NOT touch the interacted
+    // set, so the learning store still records these as implicit
+    // accepts (answered:false, chose_suggested:true).
     const next = { ...(answers || {}) }
     for (const c of interactive) {
       if (next[c.id] === undefined || next[c.id] === '') {
@@ -730,15 +796,22 @@ function ClarificationsPanel({ clarifications, answers, setAnswers, partsLibrary
       {interactive.map((c) => {
         const v = answers ? answers[c.id] : undefined
         const isEmpty = (v === undefined || v === null || v === '')
-        const isPending = isEmpty
-        const isSuggested = !isEmpty && JSON.stringify(v) === JSON.stringify(c.suggested)
+        const isInteracted = !!(interacted && interacted.has(c.id))
+        const isPending = !isInteracted && isEmpty
+        // Not interacted but a seeded suggestion is pre-loaded — the
+        // AI proposed something and the operator hasn't confirmed it
+        // yet. Rendered distinctly from PENDING (empty) so the review
+        // screen makes the "seeded default is here for you to confirm"
+        // read at a glance.
+        const isSuggestedOnly = !isInteracted && !isEmpty
         return (
           <ClarificationRow
             key={c.id}
             c={c}
             value={v}
             isPending={isPending}
-            isSuggested={isSuggested}
+            isSuggestedOnly={isSuggestedOnly}
+            isAnswered={isInteracted}
             onChange={(next) => setOne(c.id, next)}
             partsLibrary={partsLibrary}
           />
@@ -763,13 +836,25 @@ function ClarificationsPanel({ clarifications, answers, setAnswers, partsLibrary
   )
 }
 
-function ClarificationRow({ c, value, isPending, isSuggested, onChange, partsLibrary }) {
-  const borderColor = isPending ? '#fde68a' : (isSuggested ? '#bfdbfe' : '#86efac')
-  const tintColor   = isPending ? '#fffbeb' : (isSuggested ? '#eff6ff' : '#f0fdf4')
-  const statusText  = isPending
-    ? 'PENDING'
-    : (isSuggested ? 'SUGGESTED' : 'ANSWERED')
-  const statusColor = isPending ? '#92400e' : (isSuggested ? '#1d4ed8' : '#166534')
+function ClarificationRow({
+  c, value,
+  isPending, isSuggestedOnly, isAnswered,
+  onChange, partsLibrary,
+}) {
+  // Colour by state, not by value: an interacted answer that happens
+  // to equal the suggested default still reads as ANSWERED.
+  const borderColor = isAnswered
+    ? '#86efac'
+    : (isSuggestedOnly ? '#bfdbfe' : '#fde68a')
+  const tintColor = isAnswered
+    ? '#f0fdf4'
+    : (isSuggestedOnly ? '#eff6ff' : '#fffbeb')
+  const statusText = isAnswered
+    ? 'ANSWERED'
+    : (isSuggestedOnly ? 'SUGGESTED' : 'PENDING')
+  const statusColor = isAnswered
+    ? '#166534'
+    : (isSuggestedOnly ? '#1d4ed8' : '#92400e')
 
   return (
     <div style={{

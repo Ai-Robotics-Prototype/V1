@@ -151,3 +151,70 @@ def test_default_intent_has_empty_scene_not_none():
     assert intent.scene.objects == []
     assert intent.scene.locations == []
     assert intent.scene.spatial_summary == ''
+
+
+# ── Program-name shape constraints ─────────────────────────────────
+#
+# The library-list name is the "<Part> <Operation>" short form (max
+# ~30 chars). Full descriptive detail lives in the description field,
+# not the name. These tests pin that behaviour so a future prompt or
+# composer change can't silently regress it.
+
+def test_program_name_uses_short_part_op_pattern():
+    """Library-matched part + pick_and_place → '<Part> Pick & Place'."""
+    intent = _intent_pick_and_place()
+    draft = compose_program_draft(intent, demo_id='demo_name_001')
+    assert draft.name == 'BT225L24 bracket Pick & Place'
+    assert len(draft.name) <= 30
+
+
+def test_program_name_trims_overlong_part_to_fit_char_budget():
+    """A long library part name is trimmed on word boundaries so the
+    operation half survives whole. Char budget is the hard rule."""
+    intent = StructuredIntent(
+        operations=[IntentOperation(
+            operation_type='palletize', sequence_index=1,
+            target_part=PartReference(
+                part_id='extra', name='Extra Long Multipart Assembly Name',
+                confidence=1.0, source='matched_to_library'),
+        )],
+    )
+    draft = compose_program_draft(intent, demo_id='demo_name_002')
+    assert draft.name.endswith('Palletize'), draft.name
+    assert len(draft.name) <= 30
+
+
+def test_program_name_falls_back_to_scene_when_op_target_unknown():
+    """Unknown target_part → fall back to a scene object's label."""
+    intent = StructuredIntent(
+        operations=[IntentOperation(
+            operation_type='pick_and_place', sequence_index=1,
+            target_part=PartReference(part_id='unknown', name='',
+                                      confidence=0.0, source=''),
+        )],
+        scene=Scene(objects=[
+            SceneObject(label='black bracket', matched_part_id='xyz'),
+        ]),
+    )
+    draft = compose_program_draft(intent, demo_id='demo_name_003')
+    assert draft.name == 'black bracket Pick & Place'
+
+
+def test_program_name_caller_override_is_capped():
+    """Caller-supplied program_name wins but still gets word-capped +
+    char-capped so an over-long upstream string can't leak through."""
+    intent = _intent_pick_and_place()
+    draft = compose_program_draft(
+        intent, demo_id='demo_name_004',
+        program_name='This is a very verbose upstream name for a demo',
+    )
+    # Word cap = 4.
+    assert len(draft.name.split()) <= 4
+    assert len(draft.name) <= 30
+
+
+def test_program_name_empty_intent_falls_back_to_demo_id():
+    """Nothing to work with → 'demo <id>', not empty or None."""
+    intent = StructuredIntent()
+    draft = compose_program_draft(intent, demo_id='demo_name_005')
+    assert draft.name.startswith('demo ')

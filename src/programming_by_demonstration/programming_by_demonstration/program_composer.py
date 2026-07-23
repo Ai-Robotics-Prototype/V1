@@ -52,6 +52,96 @@ DEFAULT_GRIPPER_WIDTH   = 85
 DEFAULT_GRIP_FORCE      = 50
 
 
+# Program-name shape: keep it short and identifiable so the library
+# view + program tabs stay scannable. Details belong in the description
+# field, not the name.
+_PROGRAM_NAME_MAX_WORDS = 4
+_PROGRAM_NAME_MAX_CHARS = 30
+
+# Human-readable operation tags for the "<Part> <Operation>" name
+# format. Anything not in this map falls back to the raw op string
+# with underscores replaced.
+_OP_DISPLAY = {
+    'pick_and_place': 'Pick & Place',
+    'sort':           'Sort',
+    'machine_tend':   'Machine Tend',
+    'palletize':      'Palletize',
+    'depalletize':    'Depalletize',
+}
+
+
+def _op_display_name(op_type: str) -> str:
+    if op_type in _OP_DISPLAY:
+        return _OP_DISPLAY[op_type]
+    # Fallback: "some_new_op" → "Some New Op".
+    return ' '.join(w.capitalize() for w in str(op_type or '').split('_') if w) or 'Task'
+
+
+def _trim_to_budget(text: str, budget: int) -> str:
+    """Trim `text` to at most `budget` chars, preferring a word
+    boundary. Falls back to a hard slice if the first word alone
+    exceeds the budget."""
+    text = (text or '').strip()
+    if len(text) <= budget:
+        return text
+    cut = text[:max(1, budget)].rstrip()
+    # If the raw slice landed mid-word AND there's a prior space, drop
+    # back to the last complete word.
+    if ' ' in cut and not text[budget:budget + 1].isspace():
+        cut = cut.rsplit(' ', 1)[0].rstrip()
+    return cut
+
+
+def _short_program_name(intent: StructuredIntent,
+                        primary_op_type: str) -> Optional[str]:
+    """Build a compact "<Part> <Operation>" program name from the
+    intent — the library-list-friendly short form. Returns None when
+    the intent doesn't carry enough signal (caller falls back to a
+    demo-id name).
+
+    Part chosen in priority order:
+      1. First operation's target_part.name (library-matched name).
+      2. First scene object's matched-library name.
+      3. First scene object's raw label.
+    Then paired with the operation's display name (e.g. "Pick & Place").
+
+    The OPERATION half is kept intact — it carries the "what does this
+    program do" signal. The PART half is trimmed to whatever fits the
+    remaining char budget, respecting word boundaries where possible.
+    That way "Extra Long Assembly" + "Palletize" becomes
+    "Extra Long Palletize" rather than "Extra Long Assembly" (part
+    without op) — the op tag is more useful than an extra part word."""
+    part = ''
+    ops = list(intent.operations or [])
+    if ops:
+        tp = ops[0].target_part
+        if tp and tp.name and tp.name.strip() and tp.part_id != 'unknown':
+            part = tp.name.strip()
+    if not part:
+        # Prefer scene objects with a library match; fall back to any
+        # labeled scene object.
+        matched = None
+        raw = None
+        for obj in (intent.scene.objects or []):
+            if obj.matched_part_id and obj.label and not matched:
+                matched = obj.label.strip()
+            if obj.label and not raw:
+                raw = obj.label.strip()
+        part = matched or raw or ''
+    if not part:
+        return None
+    op = _op_display_name(primary_op_type)
+    # Reserve `len(op) + 1` chars for the op segment (plus the space).
+    # If that leaves no room for even one char of part text (very long
+    # op display), fall back to op-only.
+    part_budget = _PROGRAM_NAME_MAX_CHARS - len(op) - 1
+    if part_budget < 1:
+        return _trim_to_budget(op, _PROGRAM_NAME_MAX_CHARS) or None
+    part = _trim_to_budget(part, part_budget)
+    name = f'{part} {op}'.strip() if part else op.strip()
+    return name or None
+
+
 # ── Step factories ─────────────────────────────────────────────────
 
 def _placeholder(role: str, hint: str) -> Dict[str, Any]:
@@ -325,10 +415,6 @@ def compose_program_draft(intent: StructuredIntent,
     slow   = min(spd, 30)
     medium = min(spd, 40)
 
-    name = (program_name
-            or (intent.task_summary[:60] if intent.task_summary else f'demo {demo_id}')
-            ).strip() or f'demo {demo_id}'
-
     sorted_ops = sorted(
         list(intent.operations or []),
         key=lambda o: o.sequence_index if o.sequence_index else 0,
@@ -337,6 +423,38 @@ def compose_program_draft(intent: StructuredIntent,
     primary_op_type = (sorted_ops[0].operation_type if sorted_ops else 'pick_and_place')
     if primary_op_type not in AVAILABLE_OPERATIONS:
         primary_op_type = 'pick_and_place'
+
+    # Name resolution order:
+    #   1. Caller-supplied `program_name` (external override — respected
+    #      verbatim but capped by the free-form guard below).
+    #   2. `_short_program_name(intent, primary_op_type)` — deterministic
+    #      "<Part> <Operation>" from the library-matched part + op type.
+    #      Already char-trimmed to _PROGRAM_NAME_MAX_CHARS internally so
+    #      the "<Part> <Op>" pattern survives whole (the free-form
+    #      word-cap does NOT apply on this path).
+    #   3. task_summary (legacy fallback) — trimmed by the guard.
+    #   4. `demo <id>` when the intent carries no signal at all.
+    # The full descriptive task_summary is still preserved elsewhere
+    # (metadata index, description field) — this constraint is about
+    # the LIBRARY-LIST NAME being scannable, not throwing away detail.
+    if program_name and str(program_name).strip():
+        # Free-form guard on external input — cap words + chars.
+        candidate = str(program_name).strip()
+        words = candidate.split()
+        if len(words) > _PROGRAM_NAME_MAX_WORDS:
+            candidate = ' '.join(words[:_PROGRAM_NAME_MAX_WORDS])
+        name = _trim_to_budget(candidate, _PROGRAM_NAME_MAX_CHARS) or candidate
+    else:
+        short = _short_program_name(intent, primary_op_type)
+        if short:
+            name = short
+        else:
+            candidate = (intent.task_summary if intent.task_summary
+                         else f'demo {demo_id}').strip() or f'demo {demo_id}'
+            words = candidate.split()
+            if len(words) > _PROGRAM_NAME_MAX_WORDS:
+                candidate = ' '.join(words[:_PROGRAM_NAME_MAX_WORDS])
+            name = _trim_to_budget(candidate, _PROGRAM_NAME_MAX_CHARS) or f'demo {demo_id}'
 
     steps: List[Dict[str, Any]] = []
     steps.append(_move_home())

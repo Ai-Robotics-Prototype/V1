@@ -162,31 +162,79 @@ class LearningStore:
                             answers: Dict[str, Any]) -> None:
         """Persist the operator's clarification answers as a separate
         training signal. Each entry pairs the question the AI asked
-        (clarification dict) with the operator's answer + whether the
-        operator accepted the suggested default verbatim or overrode
-        it. Used by the retrieval-augment pass to teach future runs
-        which phrasings were ambiguous and what the human chose."""
+        (clarification dict) with the operator's answer plus two
+        independent boolean signals:
+
+          answered         — the operator EXPLICITLY interacted with
+                             this clarification (clicked / edited).
+                             False when the operator accepted the
+                             seeded default implicitly (never touched
+                             the row).
+          chose_suggested  — the final value equals the AI's suggested
+                             default, regardless of interaction. Both
+                             an explicit-click-on-suggestion and an
+                             implicit-accept-of-default set this.
+
+        These two signals were conflated by the older `used_default`
+        field, which was really "value == suggested" — leaving the
+        review UI unable to distinguish "operator agreed with AI" from
+        "operator never looked". `used_default` is kept as an alias
+        for chose_suggested so older readers keep working.
+
+        The `answers` payload accepts either shape:
+          {id: value}                          — legacy flat map. In
+                                                 that case answered is
+                                                 unknown; we conservatively
+                                                 record answered=null so
+                                                 the field can be filtered
+                                                 out of training.
+          {id: {value, answered, chose_suggested}}
+                                               — new richer shape emitted
+                                                 by the review UI."""
         d = self.ensure_demo_dir(demo_id)
         by_id = {str(c.get('id') or ''): c for c in (clarifications or [])
                  if isinstance(c, dict)}
         rows = []
-        for cid, ans in (answers or {}).items():
+        for cid, raw in (answers or {}).items():
             c = by_id.get(str(cid)) or {}
             suggested = c.get('suggested')
-            try:
-                used_default = (ans == suggested) and (ans is not None)
-            except Exception:
-                used_default = False
+            if isinstance(raw, dict) and ('value' in raw or 'answered' in raw
+                                          or 'chose_suggested' in raw):
+                ans             = raw.get('value')
+                answered        = bool(raw.get('answered')) \
+                                    if raw.get('answered') is not None else None
+                chose_suggested = bool(raw.get('chose_suggested')) \
+                                    if raw.get('chose_suggested') is not None else None
+                if chose_suggested is None:
+                    try:
+                        chose_suggested = (ans == suggested) and (ans is not None)
+                    except Exception:
+                        chose_suggested = False
+            else:
+                ans = raw
+                # Legacy flat map — no interaction signal. Fall back to
+                # value comparison for chose_suggested (matches the old
+                # used_default behaviour so older callers see the same
+                # numbers).
+                answered = None
+                try:
+                    chose_suggested = (ans == suggested) and (ans is not None)
+                except Exception:
+                    chose_suggested = False
             rows.append({
-                'id':           cid,
-                'field':        c.get('field'),
-                'question':     c.get('question'),
-                'type':         c.get('type'),
-                'options':      c.get('options') or [],
-                'suggested':    suggested,
-                'affects':      c.get('affects') or {},
-                'answer':       ans,
-                'used_default': used_default,
+                'id':              cid,
+                'field':           c.get('field'),
+                'question':        c.get('question'),
+                'type':            c.get('type'),
+                'options':         c.get('options') or [],
+                'suggested':       suggested,
+                'affects':         c.get('affects') or {},
+                'answer':          ans,
+                'answered':        answered,
+                'chose_suggested': bool(chose_suggested),
+                # Retained as an alias so any consumer still reading
+                # the old field name keeps working.
+                'used_default':    bool(chose_suggested),
             })
         payload = {
             'saved_at':       now_iso(),
