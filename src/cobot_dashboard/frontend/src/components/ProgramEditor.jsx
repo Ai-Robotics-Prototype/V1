@@ -1879,12 +1879,15 @@ function TeachOverlay({
   }, [])
   const isWide    = vw > 1400
   const isTabletW = vw <= 1280
-  // Height envelope for the jog grid: viewport minus header (60) +
-  // instruction band (48) + mode row (~56) + step/speed row (~60) +
-  // Home bar (~64) + footer (~130 incl. safe-area padding floor).
-  // Whatever remains is the vertical budget for 3 rows of buttons
-  // and 2 inter-row gaps.
-  const gridHeightBudget = Math.max(240, vh - (60 + 48 + 56 + 60 + 64 + 130))
+  // Height envelope for the jog grid. Home is now a header chip and
+  // the footer is a slim 48 px-button bar, so the fixed regions add
+  // up to:
+  //   header (60) + instruction (48) + mode row (~56) +
+  //   step/speed row (~60) + slim footer (~76 incl. safe-area pad).
+  // Whatever remains is the vertical budget for 3 button rows and
+  // 2 inter-row gaps. This reclaims ~124 px vs the previous layout,
+  // which is exactly the room the clipped Y-/Rx- rows needed.
+  const gridHeightBudget = Math.max(240, vh - (60 + 48 + 56 + 60 + 76))
   // Solve for the largest square button that fits three rows plus
   // two gaps (gap ≈ 12 % of button). Cap at the width-tier ceiling.
   const gridPadBtnCeil = isTabletW ? 96  : isWide ? 160 : 140
@@ -1953,6 +1956,20 @@ function TeachOverlay({
           </div>
         </div>
         <div style={{ flex: 1 }} />
+        {/* Move to home — top-right beside Cancel. Same store action
+            + safety gates as the pendant's Home; the previous
+            full-width bar between the grid and the footer was
+            reclaiming a whole row of tablet vertical space for a
+            secondary action. Compact chip is enough. */}
+        <button onClick={homeRobot}
+          style={{
+            minHeight: 44, padding: '0 14px',
+            fontSize: 14, fontWeight: 600,
+            background: '#fff', color: '#374151',
+            border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
+          }}>
+          ⌂ Move to home
+        </button>
         <button onClick={onCancel}
           style={{
             minHeight: 44, minWidth: 64, padding: '0 16px',
@@ -2103,85 +2120,63 @@ function TeachOverlay({
 
       </div>
 
-      {/* HOME BAR — jog-to-home helper. Own in-flow row between the
-          jog grid and the footer so it can never overlap the grid or
-          get clipped when the URL bar collapses. `homeRobot` fires
-          the same store action the pendant page uses (same confirm/
-          hold semantics, same safety gates); no confirm modal here
-          either — pendant doesn't have one and we keep parity. */}
-      <div style={{
-        flexShrink: 0,
-        background: '#fff', borderTop: '1px solid #e5e7eb',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        padding: '8px 22px',
-      }}>
-        <button onClick={homeRobot} style={{
-          minHeight: 48, padding: '0 32px',
-          fontSize: 15, fontWeight: 700,
-          background: '#fff', color: '#374151',
-          border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
-        }}>⌂ Move to home</button>
-      </div>
-
       {/* STICKY FOOTER — Back (multi-pose only) + Record Position
-          + Skip (multi-pose only). No motion-stop button here:
-          motion stopping is release-to-stop plus the driver's 300 ms
-          heartbeat deadman, and the app's TopBar already exposes a
-          global E-STOP that stays visible above every screen. The
-          teach header retains a plain Cancel that aborts the teach
-          sequence without capturing.
-          The bottom padding uses max(safe-area-inset-bottom, 48px)
-          so the row clears the Android gesture home bar even when
-          the safe-area inset is reported as 0 (Android Chrome only
-          exposes non-zero safe-area for physical cutouts like foldable
-          camera notches — not for the software home indicator).
+          + Skip (multi-pose only). Standard slim bar: 48 px button
+          height, 8 px vertical padding, safe-area padding sized to
+          just clear the Android gesture home indicator (~20 px on
+          the ONN tablet) instead of the earlier 48-px-floor hero
+          band that was consuming close to a quarter of the viewport.
+          No motion-stop button here — motion stopping is release-to-
+          stop + the driver's 300 ms deadman + TopBar's global E-STOP.
           Progress bar is pinned to the very bottom of this row. */}
       <div style={{
         flexShrink: 0,
         background: '#fff', borderTop: '1px solid #e5e7eb',
         display: 'flex', alignItems: 'center',
-        padding: isTabletW ? '10px 14px' : '14px 22px',
-        paddingBottom: `calc(max(env(safe-area-inset-bottom, 0px), 48px) + ${isTabletW ? 10 : 14}px)`,
-        gap: isTabletW ? 10 : 16,
+        padding: '8px 16px',
+        // Safe-area floor of 12 px is enough for the Android gesture
+        // indicator on the target tablet; iOS notched devices' larger
+        // env value takes over via the max().
+        paddingBottom: 'calc(max(env(safe-area-inset-bottom, 0px), 12px) + 8px)',
+        gap: 10,
         position: 'relative',
       }}>
         {canBack && (
           <button onClick={onBack} style={{
-            minHeight: 56, padding: '0 18px',
-            fontSize: 15, fontWeight: 700,
+            height: 48, padding: '0 16px',
+            fontSize: 14, fontWeight: 600,
             background: '#fff', color: '#374151',
-            border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+            border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
             flexShrink: 0,
           }}>← Back</button>
         )}
 
-        <div style={{ flex: 1, display: 'flex', justifyContent: 'center', minWidth: 0 }}>
-          <button
-            onClick={doRecord}
-            onTouchStart={(e) => { e.preventDefault() }}
-            onTouchEnd={(e) => { e.preventDefault(); doRecord() }}
-            style={{
-              height: 72,
-              minWidth: isTabletW ? 200 : 280,
-              padding: isTabletW ? '0 20px' : '0 36px',
-              fontSize: isTabletW ? 17 : 20, fontWeight: 800, letterSpacing: '0.5px',
-              background: flash ? '#fff' : '#16A34A',
-              color:      flash ? '#16A34A' : '#fff',
-              border: flash ? '2px solid #16A34A' : 'none',
-              borderRadius: 12, cursor: 'pointer',
-              transition: 'background 100ms, color 100ms',
-              flexShrink: 0,
-            }}>
-            {flash ? '✓ Recorded' : 'Record Position'}
-          </button>
-        </div>
+        <div style={{ flex: 1 }} />
+
+        <button
+          onClick={doRecord}
+          onTouchStart={(e) => { e.preventDefault() }}
+          onTouchEnd={(e) => { e.preventDefault(); doRecord() }}
+          style={{
+            height: 48,
+            padding: '0 24px',
+            fontSize: 15, fontWeight: 700, letterSpacing: '0.3px',
+            background: flash ? '#fff' : '#16A34A',
+            color:      flash ? '#16A34A' : '#fff',
+            border: flash ? '2px solid #16A34A' : 'none',
+            borderRadius: 8, cursor: 'pointer',
+            transition: 'background 100ms, color 100ms',
+            flexShrink: 0,
+          }}>
+          {flash ? '✓ Recorded' : 'Record Position'}
+        </button>
 
         {totalM > 1 && (
           <button onClick={onSkip} style={{
-            minHeight: 56, padding: '0 18px',
-            fontSize: 15, fontWeight: 700,
+            height: 48, padding: '0 16px',
+            fontSize: 14, fontWeight: 600,
             background: '#fff', color: '#374151',
-            border: '1px solid #d1d5db', borderRadius: 10, cursor: 'pointer',
+            border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
             flexShrink: 0,
           }}>Skip this pose →</button>
         )}
