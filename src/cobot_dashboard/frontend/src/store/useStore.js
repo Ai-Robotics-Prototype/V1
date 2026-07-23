@@ -1083,18 +1083,11 @@ const storeDefinition = (set, get) => ({
     set({ runSpeedPct: n }); return n
   },
 
-  // Program-tab layout dimensions — kept in the store (and persisted)
-  // so switching to another tab and back keeps the panels at the
-  // sizes the operator dragged them to.
-  programLayout: {
-    leftWidth:    560,
-    jogHeight:    500,
-    jogMaximized: false,        // legacy alias — kept for persisted state
-    expandedPanel: null,         // 'steps' | '3d' | 'jog' | null
-  },
-  setProgramLayout(patch) {
-    set((s) => ({ programLayout: { ...s.programLayout, ...patch } }))
-  },
+  // Program-tab layout dimensions used to live here (leftWidth /
+  // jogHeight / expandedPanel) — removed 2026-07-23 when the Program
+  // tab collapsed to a single full-width editor. Any old value in
+  // localStorage is ignored on rehydrate; no migration needed since
+  // the field is unread after this change.
 
   // ---------------------------------------------------------------------------
   // Jog enable/disable
@@ -1174,9 +1167,6 @@ export const useStore = create(
       // shouldn't lose their work — and switching tabs only un-mounts
       // the component, the store-backed slice survives either way.
       currentProgram: state.currentProgram,
-      // Same idea for the Program tab's resizable layout — dragging the
-      // dividers should outlive a tab switch and a page reload.
-      programLayout:  state.programLayout,
       // Persist the jog speed % so the operator's chosen speed survives
       // page reloads.
       jogSpeedPct:    state.jogSpeedPct,
