@@ -471,7 +471,33 @@ const storeDefinition = (set, get) => ({
     catch (_) { /* fall through to sim */ }
     return get()._dispatchProgram('resume')
   },
-  homeRobot()           { return get()._dispatchProgram('home') },
+  // Return Home — dispatches through /api/robot/home, the wire-
+  // verified path that synthesises a one-step move_home program in
+  // memory and drives it through the estun /estun/program save→run
+  // pipeline. The old {action:'home'} path was orphaned: it went via
+  // /task/run_program → program_executor_node → /estun/command, and
+  // /estun/command is bound to the driver's catch-all reject handler
+  // (silent). Every failure mode of the new endpoint surfaces a JSON
+  // body with a specific `outcome.kind` — this handler turns each
+  // into a toast so the operator never sees a silent no-op.
+  async homeRobot() {
+    try {
+      const res  = await fetch('/api/robot/home', { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (data.ok) {
+        get().addToast?.(
+          `Homing at ${data.effective_pct || '?'}%`, 'info')
+        return { ok: true }
+      }
+      const msg = data.error || `home failed (HTTP ${res.status})`
+      get().addToast?.(msg, 'warning')
+      return { ok: false, error: msg, outcome: data.outcome }
+    } catch (e) {
+      const msg = `home dispatch failed: ${e?.message || e}`
+      get().addToast?.(msg, 'error')
+      return { ok: false, error: msg }
+    }
+  },
   // Stop → project/stop, the wire-proven ladder-rung-1 verb. Falls
   // through to the sim's cancel so both paths land at rest.
   async cancelProgram() {

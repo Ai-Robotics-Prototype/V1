@@ -4911,6 +4911,181 @@ if FASTAPI_AVAILABLE:
             "outcome": outcome,
         }
 
+    # ── Return Home — wire-verified path via /estun/program ────────
+    #
+    # The frontend's homeRobot() used to publish {action:'home'} to
+    # /task/run_program, which the executor forwarded to /estun/command;
+    # /estun/command is bound to _on_write_reject on the driver (see
+    # estun_driver_node.py:851 — "non-jog/power write paths not
+    # implemented on this branch"), so every press was silently
+    # rejected and never reached the arm. On top of that,
+    # roboai-executor.service is inactive on this deployment, so
+    # /task/run_program had no subscriber at all — double break.
+    #
+    # This endpoint bypasses both problems by synthesising a one-step
+    # `move_home` program in memory from /opt/cobot/home.json (the
+    # single-source-of-truth home pose) and dispatching it through
+    # the wire-verified /estun/program save→run pipeline the Run
+    # button already uses. No new controller verbs, no new codegen
+    # syntax; every op emitted here is one the ladder already proves.
+    # Silent failure is impossible — every early exit returns a JSON
+    # body with `ok:false` + a specific `outcome.kind` the UI surfaces
+    # as a toast.
+    _HOME_FILE = '/opt/cobot/home.json'
+    _HOME_PROG_ID = 'roboaihome'
+    _HOME_TASK_ID = 'main'
+
+    @app.post("/api/robot/home")
+    async def api_robot_home():
+        if not os.path.isfile(_HOME_FILE):
+            return JSONResponse({
+                "ok": False,
+                "error": "No home pose configured. Store one at "
+                         + _HOME_FILE + " ({\"taught_joints\": [...] in "
+                         "degrees}).",
+                "outcome": {"kind": "not_configured"},
+            }, status_code=404)
+        try:
+            with open(_HOME_FILE) as f:
+                home = json.load(f)
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"{_HOME_FILE} read failed: {e}",
+                "outcome": {"kind": "home_read_failed"},
+            }, status_code=500)
+        tj = home.get("taught_joints") or []
+        if not (isinstance(tj, list) and len(tj) == 6
+                and all(isinstance(v, (int, float)) for v in tj)):
+            return JSONResponse({
+                "ok": False,
+                "error": f"{_HOME_FILE} taught_joints missing or invalid "
+                         "(need 6 numeric degrees).",
+                "outcome": {"kind": "home_invalid"},
+            }, status_code=400)
+
+        with _state_lock:
+            r = STATE.get("robot", {})
+            op_frac      = float(r.get("operator_speed_limit", 0.25))
+            allow_move   = bool(r.get("allow_move", False))
+            monitor_only = bool(r.get("monitor_only", True))
+            connected    = bool(r.get("connected", False))
+        # Surface every gate on the response so the UI's toast tells
+        # the operator what to fix, instead of a generic "no motion".
+        if not connected:
+            return JSONResponse({
+                "ok": False,
+                "error": "Driver not connected — home refused.",
+                "outcome": {"kind": "gate_closed", "reason": "not_connected"},
+                "gate": {"connected": False, "allow_move": allow_move,
+                         "monitor_only": monitor_only},
+            }, status_code=503)
+        if monitor_only:
+            return JSONResponse({
+                "ok": False,
+                "error": "monitor_only is active — driver refuses moves.",
+                "outcome": {"kind": "gate_closed", "reason": "monitor_only"},
+                "gate": {"connected": True, "allow_move": allow_move,
+                         "monitor_only": True},
+            }, status_code=403)
+        if not allow_move:
+            return JSONResponse({
+                "ok": False,
+                "error": "allow_move is false — driver refuses moves.",
+                "outcome": {"kind": "gate_closed", "reason": "allow_move_off"},
+                "gate": {"connected": True, "allow_move": False,
+                         "monitor_only": False},
+            }, status_code=403)
+
+        operator_cap_pct = max(1, min(100, int(round(op_frac * 100))))
+        # Home is intentionally slow — cap at 25% (or operator's cap,
+        # whichever is lower). Not user-tunable from this endpoint;
+        # rushing home is a known collision mode.
+        home_speed_pct = min(operator_cap_pct, 25)
+
+        program = {
+            "id":     _HOME_PROG_ID,
+            "name":   "Return Home",
+            "config": {"speed_pct": home_speed_pct},
+            "steps": [{
+                "action":        "move_home",
+                "label":         "Move to unified home",
+                "taught":        True,
+                "taught_joints": [float(v) for v in tj],
+                "taught_tcp":    home.get("taught_tcp") or None,
+                "position_role": "home",
+                "step":          1,
+            }],
+        }
+        try:
+            from estun_driver import program_ops
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"program_ops import: {e}",
+                "outcome": {"kind": "codegen_import_failed"},
+            }, status_code=500)
+        try:
+            lua, points, eff_pct = program_ops.codegen_lua_from_program(
+                program, operator_speed_limit_pct=operator_cap_pct)
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"codegen failed: {e}",
+                "outcome": {"kind": "codegen_failed"},
+            }, status_code=500)
+        if not points:
+            return JSONResponse({
+                "ok": False,
+                "error": ("codegen produced no runnable points — "
+                          f"{_HOME_FILE} taught_joints may be malformed."),
+                "outcome": {"kind": "codegen_empty"},
+            }, status_code=500)
+
+        if _ros_node is None:
+            return JSONResponse({
+                "ok": False,
+                "error": "ros not available",
+                "outcome": {"kind": "ros_down"},
+            }, status_code=503)
+
+        # save → to_auto → set_auto_rate → set_breakpoint →
+        # clear_start_line → run — the same sequence /api/estun/program/
+        # run uses. Byte-verify is skipped (~4s of latency vs a one-
+        # step program that codegen produces deterministically); the
+        # driver's own save-event stream still surfaces failures via
+        # STATE.robot.rejected.
+        try:
+            _ros_node._estun_publish_op(
+                "save",
+                program_id=_HOME_PROG_ID, task_id=_HOME_TASK_ID,
+                name="Return Home", task_name="main",
+                points=points, lua_source=lua)
+            await asyncio.sleep(0.4)   # let the save complete
+            _ros_node._estun_publish_op("to_auto")
+            _ros_node._estun_publish_op(
+                "set_auto_rate", pct=int(eff_pct), at_run_start=True)
+            _ros_node._estun_publish_op(
+                "set_breakpoint", task_id=_HOME_TASK_ID, lines=[])
+            _ros_node._estun_publish_op("clear_start_line")
+            _ros_node._estun_publish_op(
+                "run", program_id=_HOME_PROG_ID, task_id=_HOME_TASK_ID)
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"publish sequence failed: {e}",
+                "outcome": {"kind": "publish_failed"},
+            }, status_code=500)
+
+        return {
+            "ok":            True,
+            "outcome":       {"kind": "published"},
+            "gate":          {"connected": True, "allow_move": True,
+                              "monitor_only": False},
+            "effective_pct": int(eff_pct),
+            "home_source":   home.get("source"),
+        }
+
     @app.post("/api/estun/program/stop")
     async def api_estun_program_stop():
         if _ros_node is None:
