@@ -1788,6 +1788,173 @@ function OverlayPadCenter({ label, width = 140, height = 140 }) {
   )
 }
 
+// ────────────────────────────────────────────────────────
+// RecordConfirmModal — confirms the current live pose before it's
+// written into the step. The modal displays a live preview of the
+// robot's pose (joints degrees + tcp) — the store's `joints` slice
+// streams from /ws so the display refreshes as the arm moves; tcp
+// polls /api/state at 500 ms cadence.
+//
+// The actual capture happens in teachOverlayRecord which re-reads
+// /api/state at click time — so the pose the modal shows and the
+// pose that lands in the step are the same value ± sub-second
+// WS/HTTP lag. If the operator jogs while the dialog is open the
+// preview updates; when they hit Record the CURRENT live pose is
+// captured (not whatever was live at the moment the dialog opened).
+//
+// Overlay + card styling mirrors PositionReuseModal so the drawer
+// stays visually consistent with the rest of the app's confirms.
+// ────────────────────────────────────────────────────────
+function RecordConfirmModal({ stepLabel, onConfirm, onCancel }) {
+  const jointsRad = useStore((s) => s.joints?.positions) || [0, 0, 0, 0, 0, 0]
+  const jointsDeg = radiansToJointDegrees(jointsRad)
+  const [tcp, setTcp] = useState(null)
+  useEffect(() => {
+    let alive = true
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/state')
+        if (!res.ok) return
+        const d = await res.json()
+        if (alive && Array.isArray(d?.tcp_pose)) setTcp(d.tcp_pose)
+      } catch { /* nop */ }
+    }
+    poll()
+    const id = setInterval(poll, 500)
+    return () => { alive = false; clearInterval(id) }
+  }, [])
+  const jointsLine = jointsDeg.slice(0, 6)
+    .map((v, i) => `J${i + 1}:${Number(v).toFixed(2)}`).join('  ')
+  const tcpKeys = ['x', 'y', 'z', 'rx', 'ry', 'rz']
+  const tcpLine = Array.isArray(tcp)
+    ? tcp.slice(0, 6).map((v, i) => `${tcpKeys[i]}:${Number(v).toFixed(3)}`).join('  ')
+    : null
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      style={{
+        position: 'fixed', inset: 0, zIndex: 4000,
+        background: 'rgba(15, 23, 42, 0.55)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 24,
+      }}
+      onClick={onCancel}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#fff', color: '#111827',
+          borderRadius: 12, width: '100%', maxWidth: 560,
+          boxShadow: '0 30px 80px rgba(0,0,0,0.45)',
+          overflow: 'hidden',
+        }}
+      >
+        <div style={{
+          padding: '16px 20px 8px 20px',
+          borderBottom: '1px solid #E5E7EB',
+        }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#6B7280',
+                        textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+            Confirm capture
+          </div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#111827',
+                        marginTop: 4 }}>
+            Record this position?
+          </div>
+          <div style={{ fontSize: 13, color: '#6B7280', marginTop: 6, lineHeight: 1.4 }}>
+            Step: <span style={{ color: '#111827', fontWeight: 600 }}>{stepLabel}</span>.
+            The pose shown below is the arm's live position — it updates as the
+            arm moves. Pressing Record captures the CURRENT live pose.
+          </div>
+        </div>
+        <div style={{ padding: '14px 20px' }}>
+          <div style={{
+            fontFamily: 'monospace', fontSize: 12, color: '#374151',
+            background: '#f8fafc', border: '1px solid #e5e7eb', borderRadius: 6,
+            padding: '10px 12px', lineHeight: 1.6, whiteSpace: 'pre-wrap',
+          }}>
+            joints: {jointsLine}
+            {'\n'}
+            tcp:    {tcpLine || '(awaiting live tcp…)'}
+          </div>
+        </div>
+        <div style={{
+          padding: '10px 20px 16px 20px',
+          display: 'flex', gap: 10, justifyContent: 'flex-end',
+        }}>
+          <button
+            onClick={onCancel}
+            style={{
+              minHeight: 44, padding: '0 16px',
+              background: 'transparent', color: '#6B7280',
+              border: '1px solid #E5E7EB', borderRadius: 8,
+              fontSize: 14, fontWeight: 600, cursor: 'pointer',
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            style={{
+              minHeight: 44, padding: '0 22px',
+              background: '#16A34A', color: '#fff',
+              border: 'none', borderRadius: 8,
+              fontSize: 14, fontWeight: 700, cursor: 'pointer',
+            }}
+          >
+            Record
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Debug HUD for the teach-drawer layout diagnosis (2026-07-23). The
+// operator opens the drawer on tablet + reports the numbers so the
+// layout fix can be justified by real viewport metrics rather than
+// devtools emulation. Once the layout question is settled this can
+// be gated behind a `?debug=1` URL flag — for now it renders on
+// every drawer mount so a passing operator can read it without
+// changing browser state.
+function TeachOverlayDebugHUD({ containerRef }) {
+  const [m, setM] = useState({ innerH: 0, clientH: 0, vvH: 0, sH: 0, cH: 0 })
+  useEffect(() => {
+    const measure = () => setM({
+      innerH:  window.innerHeight,
+      clientH: document.documentElement.clientHeight,
+      vvH:     window.visualViewport ? Math.round(window.visualViewport.height) : 0,
+      sH:      containerRef.current?.scrollHeight || 0,
+      cH:      containerRef.current?.clientHeight || 0,
+    })
+    measure()
+    const onResize = () => measure()
+    window.addEventListener('resize', onResize)
+    window.visualViewport?.addEventListener('resize', onResize)
+    // Poll once more after first paint — scrollHeight/clientHeight
+    // land after layout, not on the same tick as the initial mount.
+    const rafId = requestAnimationFrame(measure)
+    return () => {
+      window.removeEventListener('resize', onResize)
+      window.visualViewport?.removeEventListener('resize', onResize)
+      cancelAnimationFrame(rafId)
+    }
+  }, [containerRef])
+  const overflow = m.sH > m.cH ? ` OVF+${m.sH - m.cH}` : ''
+  return (
+    <div style={{
+      position: 'absolute', top: 4, right: 4, zIndex: 1001,
+      padding: '3px 6px', borderRadius: 4,
+      background: 'rgba(15,23,42,0.72)', color: '#fff',
+      fontFamily: 'monospace', fontSize: 10, lineHeight: 1.3,
+      pointerEvents: 'none',
+    }}>
+      innerH:{m.innerH} clientH:{m.clientH} vv:{m.vvH} drawer:{m.sH}/{m.cH}{overflow}
+    </div>
+  )
+}
+
 function TeachOverlay({
   step, currentN, totalM, canBack,
   onRecord, onSkip, onBack, onCancel,
@@ -1811,6 +1978,14 @@ function TeachOverlay({
   const [stepSize, setStepSize] = useState(1.0)
   const [speed, setSpeed]       = useState(20)
   const [flash, setFlash]       = useState(false)
+  // Confirm-before-record: opened by the footer Record Position
+  // button; RecordConfirmModal fires doRecord() on confirm. Closed on
+  // outside-click or Cancel; no capture happens on dismissal.
+  const [confirming, setConfirming] = useState(false)
+  // Drawer container ref for the debug HUD's scrollHeight/clientHeight
+  // read-out — a temporary tablet-layout diagnostic (see the
+  // TeachOverlayDebugHUD block).
+  const drawerRef = useRef(null)
   const stepRef  = useRef(stepSize)
   const speedRef = useRef(speed)
   const modeRef  = useRef(jogMode)
@@ -1921,7 +2096,7 @@ function TeachOverlay({
   const progressPct = totalM > 0 ? ((currentN - 1) / totalM) * 100 : 0
 
   return (
-    <div style={{
+    <div ref={drawerRef} style={{
       // Anchor the drawer to the visible viewport with a plain
       // `100dvh`. Chromium 108+ (the tablet's Android Chrome) resolves
       // dvh against the CURRENT visible viewport — URL bar showing OR
@@ -1939,6 +2114,7 @@ function TeachOverlay({
       userSelect: 'none',
       overflowX: 'hidden',
     }}>
+      <TeachOverlayDebugHUD containerRef={drawerRef} />
       {/* HEADER */}
       <div style={{
         height: 60, flexShrink: 0,
@@ -2129,34 +2305,41 @@ function TeachOverlay({
           No motion-stop button here — motion stopping is release-to-
           stop + the driver's 300 ms deadman + TopBar's global E-STOP.
           Progress bar is pinned to the very bottom of this row. */}
+      {/* 3-column grid keeps Record Position horizontally centered
+          regardless of whether Back / Skip are present. Left cell:
+          Back or empty. Center: Record Position (self-justified to
+          center). Right: Skip or empty. Column widths are fluid but
+          the outer two are min-content — the center gets the natural
+          center of the whole row. */}
       <div style={{
         flexShrink: 0,
         background: '#fff', borderTop: '1px solid #e5e7eb',
-        display: 'flex', alignItems: 'center',
+        display: 'grid',
+        gridTemplateColumns: '1fr auto 1fr',
+        alignItems: 'center',
         padding: '8px 16px',
         // Safe-area floor of 12 px is enough for the Android gesture
         // indicator on the target tablet; iOS notched devices' larger
         // env value takes over via the max().
         paddingBottom: 'calc(max(env(safe-area-inset-bottom, 0px), 12px) + 8px)',
-        gap: 10,
+        columnGap: 10,
         position: 'relative',
       }}>
-        {canBack && (
-          <button onClick={onBack} style={{
-            height: 48, padding: '0 16px',
-            fontSize: 14, fontWeight: 600,
-            background: '#fff', color: '#374151',
-            border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
-            flexShrink: 0,
-          }}>← Back</button>
-        )}
-
-        <div style={{ flex: 1 }} />
+        <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
+          {canBack && (
+            <button onClick={onBack} style={{
+              height: 48, padding: '0 16px',
+              fontSize: 14, fontWeight: 600,
+              background: '#fff', color: '#374151',
+              border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
+            }}>← Back</button>
+          )}
+        </div>
 
         <button
-          onClick={doRecord}
+          onClick={() => setConfirming(true)}
           onTouchStart={(e) => { e.preventDefault() }}
-          onTouchEnd={(e) => { e.preventDefault(); doRecord() }}
+          onTouchEnd={(e) => { e.preventDefault(); setConfirming(true) }}
           style={{
             height: 48,
             padding: '0 24px',
@@ -2166,20 +2349,21 @@ function TeachOverlay({
             border: flash ? '2px solid #16A34A' : 'none',
             borderRadius: 8, cursor: 'pointer',
             transition: 'background 100ms, color 100ms',
-            flexShrink: 0,
+            justifySelf: 'center',
           }}>
           {flash ? '✓ Recorded' : 'Record Position'}
         </button>
 
-        {totalM > 1 && (
-          <button onClick={onSkip} style={{
-            height: 48, padding: '0 16px',
-            fontSize: 14, fontWeight: 600,
-            background: '#fff', color: '#374151',
-            border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
-            flexShrink: 0,
-          }}>Skip this pose →</button>
-        )}
+        <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+          {totalM > 1 && (
+            <button onClick={onSkip} style={{
+              height: 48, padding: '0 16px',
+              fontSize: 14, fontWeight: 600,
+              background: '#fff', color: '#374151',
+              border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
+            }}>Skip this pose →</button>
+          )}
+        </div>
 
         {/* Progress bar pinned to the very bottom */}
         <div style={{
@@ -2192,6 +2376,14 @@ function TeachOverlay({
           }} />
         </div>
       </div>
+
+      {confirming && (
+        <RecordConfirmModal
+          stepLabel={stepLabel}
+          onConfirm={() => { setConfirming(false); doRecord() }}
+          onCancel={()  => { setConfirming(false) }}
+        />
+      )}
     </div>
   )
 }
