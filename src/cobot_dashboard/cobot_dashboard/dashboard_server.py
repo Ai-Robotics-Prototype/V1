@@ -14,6 +14,15 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from . import breadcrumbs as _breadcrumbs
+except ImportError:
+    import breadcrumbs as _breadcrumbs  # type: ignore
+BreadcrumbCollector     = _breadcrumbs.BreadcrumbCollector
+thin_waypoints          = _breadcrumbs.thin_waypoints
+is_stale                = _breadcrumbs.is_stale
+effector_state_at_end   = _breadcrumbs.effector_state_at_end
+
 # Dual-import shim — matches inspection_helpers below. The systemd unit
 # runs this file as a script (no parent package), so relative imports
 # fail; the ROS2 entry-point path has a parent package and prefers them.
@@ -643,6 +652,10 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self._task_pub = None
         self._voice_pub = None
         self._estop_client = None
+        # Records program-execution joint waypoints so Return Home
+        # can retrace the proven path rather than improvise a direct
+        # move through unproven space. See breadcrumbs.py.
+        self._breadcrumbs = BreadcrumbCollector()
 
         if not RCLPY_AVAILABLE:
             return
@@ -1199,6 +1212,14 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             STATE["joints"]["names"]      = list(msg.name)
             STATE["joints"]["positions"]  = list(msg.position)
             STATE["joints"]["velocities"] = list(msg.velocity) if msg.velocity else [0.0] * len(msg.name)
+        # Feed the breadcrumb collector so it can tag each ProjectState
+        # transition with the joints the arm was at right then. Fires
+        # ~25 Hz; the collector only holds the latest sample so this
+        # is O(1) and cheap.
+        try:
+            self._breadcrumbs.on_joint_states(msg.position)
+        except Exception:
+            pass
 
     def _on_task_state(self, msg):
         """Merge the program executor's state into STATE.task. Maps the
@@ -1209,6 +1230,12 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             d = json.loads(msg.data)
         except Exception:
             return
+        # Tell the breadcrumb collector about pause transitions so it
+        # can tag mid-step pauses on the trail's last waypoint.
+        try:
+            self._breadcrumbs.on_task_state(d)
+        except Exception:
+            pass
         exec_state = d.get("state", "idle")
         running_states = {"running", "waiting_motion", "waiting_io",
                           "waiting_detect", "waiting_time"}
@@ -1405,6 +1432,15 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             if ev == "save":
                 prog["last_save"] = d
             elif ev == "status":
+                # Feed the breadcrumb collector so it can snapshot the
+                # arm's joints at each step transition and finalise
+                # the trail on stop/complete. Called under _state_lock
+                # but the collector uses its own lock and doesn't
+                # touch STATE — nesting is safe.
+                try:
+                    self._breadcrumbs.on_program_status(d)
+                except Exception:
+                    pass
                 # Track the latest error tuple (first-appearance, deduped
                 # by the driver's ErrorDedup). Cleared when driver reports
                 # None.
@@ -4934,6 +4970,84 @@ if FASTAPI_AVAILABLE:
     _HOME_FILE = '/opt/cobot/home.json'
     _HOME_PROG_ID = 'roboaihome'
     _HOME_TASK_ID = 'main'
+
+    @app.get("/api/robot/home/preview")
+    async def api_robot_home_preview():
+        """Return everything the Return Home confirm dialog needs to
+        pick between a proven-path retrace and a direct move: whether
+        a home pose is configured, whether there's a fresh breadcrumb
+        trail from the current or most-recent program run, its
+        thinned length, the effector state at the interruption point,
+        and the current gate. NO side effects — pure read. The
+        frontend fetches this on the confirm dialog's mount."""
+        # Home configured?
+        home_present = os.path.isfile(_HOME_FILE)
+        home_source  = None
+        if home_present:
+            try:
+                with open(_HOME_FILE) as f:
+                    home = json.load(f)
+                home_source = home.get('source')
+            except Exception:
+                home_present = False
+
+        # Trail lookup. Prefer the active trail (in-flight or paused
+        # run); otherwise the last finalised trail (a program that
+        # completed a moment ago is still meaningful).
+        collector = _ros_node._breadcrumbs if _ros_node is not None else None
+        raw_trail = collector.latest_trail() if collector else None
+        current_joints_deg = collector.latest_joints_deg() if collector else None
+        prog_steps = collector.active_program_steps() if collector else None
+
+        trail_payload = {"available": False}
+        if raw_trail and raw_trail.get('waypoints'):
+            wps = raw_trail['waypoints']
+            thinned = thin_waypoints(wps)
+            stale = is_stale(raw_trail, current_joints_deg)
+            # Effector state — walk the program's steps up to the last
+            # completed step. If the collector's cached step list is
+            # gone (finalised trail; steps not reloaded), fall back to
+            # re-reading from disk here.
+            if not prog_steps:
+                pid = raw_trail.get('program_id') or ''
+                try:
+                    with open(os.path.join(_PROG_DIR, f'{pid}.json')) as f:
+                        prog_steps = (json.load(f) or {}).get('steps') or []
+                except Exception:
+                    prog_steps = []
+            eff = effector_state_at_end(raw_trail, prog_steps)
+            trail_payload = {
+                "available":              True,
+                "program_id":             raw_trail.get('program_id'),
+                "program_name":           raw_trail.get('program_name'),
+                "achieved_at":            raw_trail.get('run_finished_at')
+                                          or (wps[-1].get('ts') if wps else None),
+                "waypoint_count":         len(wps),
+                "waypoint_count_thinned": len(thinned),
+                "last_step_index":        wps[-1].get('step_index'),
+                "paused_mid_step":        bool(wps[-1].get('paused_mid_step')),
+                "finalized":              bool(raw_trail.get('finalized')),
+                "finish_reason":          raw_trail.get('finish_reason'),
+                "is_stale":               stale,
+                "effector_state":         eff,
+            }
+
+        with _state_lock:
+            r = STATE.get("robot", {})
+            s = STATE.get("safety", {})
+            gate = {
+                "connected":    bool(r.get("connected", False)),
+                "allow_move":   bool(r.get("allow_move", False)),
+                "monitor_only": bool(r.get("monitor_only", True)),
+                "estop":        bool(s.get("estop", False)),
+            }
+        return {
+            "ok":              True,
+            "home_configured": bool(home_present),
+            "home_source":     home_source,
+            "trail":           trail_payload,
+            "gate":            gate,
+        }
 
     @app.post("/api/robot/home")
     async def api_robot_home():
