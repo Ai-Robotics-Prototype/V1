@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<robot name="estun_s10_140_partial">
+  <!-- Interim assembly: full colored robot, base_yaw (joint_1) articulates. links 2-6 rigid until CS transforms available. Flange & wrist2 omitted (need transforms). Meshes in common frame, Z-up baked, identity visual origins. -->
+  <link name="base_link">
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="links/link0_base.glb"/></geometry></visual>
+  </link>
+  <link name="link_upper">
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="links/link1_shoulder.glb"/></geometry></visual>
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="links/link2_upper_arm.glb"/></geometry></visual>
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="links/link3_forearm.glb"/></geometry></visual>
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="links/link4_wrist1.glb"/></geometry></visual>
+  </link>
+  <joint name="joint_1" type="revolute">
+    <parent link="base_link"/><child link="link_upper"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="200" velocity="3.14"/>
+  </joint>
+</robot>
