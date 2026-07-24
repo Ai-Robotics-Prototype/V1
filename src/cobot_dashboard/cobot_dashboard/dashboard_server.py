@@ -1447,6 +1447,12 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 err = d.get("error")
                 prog["error"] = err
                 prog["source"] = d.get("source", "")
+                # Amendment 2 — auto-retry counter for project/stop.
+                # Client's wedge banner reads these to switch to
+                # evidence-based copy ("stop sent twice, controller
+                # not confirming") after the retry also fails.
+                prog["stop_retry_count"] = int(d.get("stop_retry_count") or 0)
+                prog["stop_retry_ts"]    = float(d.get("stop_retry_ts") or 0)
                 # Keep the last N status frames for a mini-timeline in the
                 # UI. Cap at 32 — enough to show a run's state trajectory,
                 # small enough to send inline in the /ws/state broadcast.

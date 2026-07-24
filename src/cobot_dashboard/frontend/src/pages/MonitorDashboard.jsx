@@ -1047,12 +1047,15 @@ export default function MonitorDashboard() {
             }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontWeight: 700, marginBottom: 2 }}>
-                  Controller wedged in STOPPING for {Math.floor(stuckStoppingMs / 1000)}s
+                  {(robot?.program?.stop_retry_count || 0) > 0
+                    ? `Stop sent twice, controller not confirming — STOPPING for ${Math.floor(stuckStoppingMs / 1000)}s`
+                    : `Controller wedged in STOPPING for ${Math.floor(stuckStoppingMs / 1000)}s`}
                 </div>
                 <div style={{ fontSize: 12 }}>
                   project/stop should transition 2→3→0 in under a second.
-                  Force-stop re-issues the verb; Reset also clears any
-                  latched controller error so Home / Restart can proceed.
+                  {(robot?.program?.stop_retry_count || 0) > 0
+                    ? ' The driver auto-re-issued project/stop once at the 3-second threshold and the controller still has not confirmed. Force-stop tries again manually; Reset also clears any latched controller error so Home / Restart can proceed.'
+                    : ' Force-stop re-issues the verb; Reset also clears any latched controller error so Home / Restart can proceed.'}
                 </div>
               </div>
               <button onClick={() => forceStop({ addToast })}

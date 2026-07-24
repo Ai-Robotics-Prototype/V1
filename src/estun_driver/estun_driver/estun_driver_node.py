@@ -676,6 +676,25 @@ class EstunCodroidDriver(Node):
         self._prog_line        = None
         self._prog_is_step     = False
         self._prog_last_update_ts = 0.0
+        # Stop-watchdog state — Amendment 2 (2026-07-24). Tracks
+        # when we sent the most-recent project/stop AND whether we've
+        # already fired the ONE permitted automatic retry. If the
+        # controller doesn't exit state 2/3 within STOP_RETRY_AFTER_S
+        # of the initial send, the watchdog re-issues project/stop
+        # exactly once and increments retry_count. Cleared as soon as
+        # a state==0 ProjectState frame arrives, or another op resets
+        # the sequence. This is exactly what Force-stop does manually
+        # — automating the first retry is safe because stop is a
+        # decrease-risk verb and idempotent by observation.
+        self._prog_stop_sent_ts    = 0.0
+        self._prog_stop_retry_count = 0
+        # Item 3: raw ProjectState frame dump, gated on the env var
+        # ESTUN_DEBUG_STATE_DUMP. Produces a JSONL artifact usable
+        # for the operator's side-by-side dual-observation session
+        # against the factory UI DevTools capture.
+        self._state_dump_enabled = bool(os.environ.get('ESTUN_DEBUG_STATE_DUMP'))
+        self._state_dump_fh      = None
+        self._state_dump_path    = None
         # publish/Error dedup — the ~3 Hz reflood collapses to one
         # event per unique (code, unix_ts) key. See program_ops.ErrorDedup.
         from estun_driver.program_ops import ErrorDedup
@@ -898,6 +917,10 @@ class EstunCodroidDriver(Node):
 
         # ── Timers ─────────────────────────────────────────────
         self._mode_timer    = self.create_timer(1.0, self._publish_mode)
+        # Stop-watchdog — polls the auto-retry state machine at 2 Hz.
+        # See _on_stop_watchdog. Runs unconditionally; the tick is a
+        # cheap early-out when no stop is pending.
+        self._stop_watchdog_timer = self.create_timer(0.5, self._on_stop_watchdog)
         # Connection lifecycle tick — polls the state machine at 2 Hz
         # to decide whether to attempt a connect, send a probe, or
         # promote to the full subscribe burst. Cheap enough to run
@@ -1356,7 +1379,72 @@ class EstunCodroidDriver(Node):
         # validation is the FIRST live test in the Part 2c ladder
         # (PART_2C_ARCHITECTURE.md §5).
         ok = self._ws_verb('project/stop')
+        # Prime the stop watchdog: mark when we sent this stop, and
+        # reset the retry counter to 0 (a fresh manual stop resets
+        # any prior auto-retry sequence). The 0.5-Hz watchdog polls
+        # _on_stop_watchdog and re-issues the verb exactly once if
+        # the controller doesn't exit state 2/3 within
+        # STOP_RETRY_AFTER_S.
+        self._prog_stop_sent_ts     = time.time()
+        self._prog_stop_retry_count = 0
         self.get_logger().info(f'project/stop sent (SOURCE-ONLY) ok={ok}')
+
+    # Grace period after the ORIGINAL stop send before the watchdog
+    # auto-retries. Chosen to match the client-side wedge banner's
+    # 3 s threshold: if the operator's screen would say "wedged", the
+    # driver's already firing the retry that might resolve it.
+    STOP_RETRY_AFTER_S = 3.0
+
+    def _on_stop_watchdog(self):
+        """0.5-Hz tick. Owns the state machine for the automatic
+        project/stop retry:
+            state==0                → clear (stop landed)
+            elapsed<threshold OR
+              retry_count>=1        → no-op
+            elapsed>=threshold AND
+              retry_count==0        → re-issue project/stop ONCE,
+                                      log with full context, publish
+                                      an event so the client can
+                                      update banner copy
+        Only fires when a stop is actually pending (_prog_stop_sent_ts
+        != 0.0). Safe to call unconditionally."""
+        if self._prog_stop_sent_ts == 0.0:
+            return
+        # Stop confirmed by a state==0 push: clear the pending sequence.
+        if self._prog_state == 0:
+            if self._prog_stop_retry_count > 0:
+                self.get_logger().info(
+                    f'project/stop completed after '
+                    f'{self._prog_stop_retry_count} auto-retry(ies) '
+                    f'— push frame(s) may have been late/lost')
+            self._prog_stop_sent_ts = 0.0
+            self._prog_stop_retry_count = 0
+            return
+        elapsed = time.time() - self._prog_stop_sent_ts
+        if elapsed < self.STOP_RETRY_AFTER_S:
+            return
+        if self._prog_stop_retry_count >= 1:
+            # Already fired the one permitted retry. Do NOT loop —
+            # escalation is now the operator's Force-stop UI, which
+            # the client's wedge banner already surfaces. Nothing to
+            # do here except stay quiet and keep evidence.
+            return
+        # Fire the one permitted auto-retry. Update the send timestamp
+        # so a NEW threshold applies for the eventual banner
+        # transition ("stop sent twice, controller not confirming").
+        ok = self._ws_verb('project/stop')
+        self._prog_stop_retry_count += 1
+        self._prog_stop_sent_ts = time.time()
+        self.get_logger().warn(
+            f'project/stop RE-ISSUED (auto-retry '
+            f'{self._prog_stop_retry_count}/1) — controller has not '
+            f'exited state {self._prog_state} in {elapsed:.1f}s. '
+            f'ok={ok} project={self._prog_project_id!r} '
+            f'task={self._prog_task!r} line={self._prog_line}')
+        # Publish so the dashboard's wedge banner can honestly say
+        # "stop sent twice, controller not confirming" after this
+        # retry also fails to elicit a state==0 within the threshold.
+        self._publish_program_status(source='auto_retry_stop')
 
     def _op_pause(self, _d):
         # SOURCE-ONLY.
@@ -3303,6 +3391,10 @@ class EstunCodroidDriver(Node):
         program_id for the whole run."""
         from estun_driver.program_ops import parse_project_state
         parsed, new_prev = parse_project_state(db, self._prog_project_id)
+        # Item 3 — raw dump for the dual-observation session. Runs
+        # BEFORE any parser reject so unparseable frames still land
+        # in the artifact for post-mortem inspection.
+        self._maybe_dump_state_frame(db, parsed)
         if not parsed:
             return
         self._prog_project_id = new_prev
@@ -3322,10 +3414,51 @@ class EstunCodroidDriver(Node):
             # incremental updates that the dashboard can dedup by line.
         self._publish_program_status(source='projectstate')
 
+    def _maybe_dump_state_frame(self, db, parsed):
+        """Item 3 — Optional JSONL dump of every incoming ProjectState
+        frame, gated on the env var ESTUN_DEBUG_STATE_DUMP. Produces
+        a Jetson-local artifact the operator can cross-reference
+        against a factory-UI DevTools WS capture in the same wall-
+        clock window. File is opened lazily on the first frame and
+        stays open for the driver's lifetime — one file per driver
+        session, timestamped in the filename."""
+        if not self._state_dump_enabled:
+            return
+        if self._state_dump_fh is None:
+            try:
+                os.makedirs('/opt/cobot/logs', exist_ok=True)
+                ts = time.strftime('%Y%m%dT%H%M%S', time.gmtime())
+                path = f'/opt/cobot/logs/projectstate_dump_{ts}.jsonl'
+                self._state_dump_fh   = open(path, 'a')
+                self._state_dump_path = path
+                self.get_logger().info(
+                    f'ESTUN_DEBUG_STATE_DUMP=1 → dumping ProjectState '
+                    f'frames to {path}')
+            except Exception as e:
+                self.get_logger().warn(f'state dump open failed: {e}')
+                self._state_dump_enabled = False
+                return
+        try:
+            rec = {
+                'recv_ts':     time.time(),
+                'parsed':      parsed,
+                'raw_db':      db if isinstance(db, (dict, list)) else str(db),
+                'prev_state':  self._prog_state,
+            }
+            self._state_dump_fh.write(json.dumps(rec, separators=(',', ':')) + '\n')
+            self._state_dump_fh.flush()
+        except Exception:
+            # Never let dump failure break the state pipeline.
+            pass
+
     def _publish_program_status(self, source: str = ''):
         """Emit a snapshot of the program-execution state to
         /estun/program_status. Called on ProjectState transitions and
-        Error dedup events."""
+        Error dedup events. `stop_retry_count` and `stop_retry_ts`
+        surface the auto-retry state (Amendment 2) so the client's
+        wedge banner can print evidence-based copy — "stop sent
+        twice, controller not confirming" — once the automated
+        retry has also elapsed its window."""
         m = String()
         m.data = json.dumps({
             'event': 'status',
@@ -3337,6 +3470,9 @@ class EstunCodroidDriver(Node):
             'is_step': self._prog_is_step,
             'error': self._prog_last_error,
             'ts': time.time(),
+            'stop_retry_count': self._prog_stop_retry_count,
+            'stop_retry_ts':    (self._prog_stop_sent_ts
+                                 if self._prog_stop_retry_count > 0 else 0),
         }, separators=(',', ':'))
         self._pub_program.publish(m)
 
