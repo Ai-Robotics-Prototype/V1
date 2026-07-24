@@ -11,6 +11,7 @@ import ProgramErrorModal from '../components/ProgramErrorModal'
 import StepPreviewPanel from '../components/StepPreviewPanel'
 import { deriveRunState, isStopButtonEnabled,
          isStuckStopping as _computeStuckStopping,
+         isStateStreamStale as _computeStreamStale,
          STUCK_STOPPING_MS } from '../lib/runState'
 import { readPayload, payloadChipLabel } from '../lib/payload'
 
@@ -823,7 +824,25 @@ export default function MonitorDashboard() {
   }, [stoppingSince])
   const stuckStoppingMs = stoppingSince ? (nowTs - stoppingSince) : 0
   // Pure helper — unit-tested in src/lib/runState.test.js
-  const isStuckStopping = _computeStuckStopping(runState.kind, stoppingSince, nowTs)
+  const rawStuckStopping = _computeStuckStopping(runState.kind, stoppingSince, nowTs)
+
+  // State-stream freshness gate. A wedge claim requires FRESH
+  // contradicting frames from the controller — a state=3 arriving
+  // within the last ~2.5s. If the WS stream has fallen quiet, we
+  // don't have live evidence to blame the controller; show a
+  // stream-stale banner instead. `lastProgramStateTs` is set on the
+  // client whenever a WS msg carries robot.program.state (see
+  // useStore.js). Both timestamps are same-machine Date.now(), so
+  // this comparison is safe under any clock skew against the server.
+  const lastProgramStateTs = useStore((s) => s.lastProgramStateTs)
+  const streamStale = _computeStreamStale(lastProgramStateTs, nowTs)
+  // Wedge banner fires only when the stream is fresh AND stuck.
+  // Stream-stale banner fires when the stream is quiet during any
+  // active-ish run state — running/stopping/paused (an idle stale
+  // stream is uninteresting).
+  const isStuckStopping = rawStuckStopping && !streamStale
+  const showStreamStale = streamStale
+    && ['running', 'stopping', 'paused'].includes(runState.kind)
 
   const programName    = currentProgram?.name || 'No program loaded'
   const steps          = currentProgram?.steps || []
@@ -987,6 +1006,37 @@ export default function MonitorDashboard() {
               (re-issues project/stop) + Clear alarms (System/ClearError)
               so the operator can escape a wedged stop without hunting
               for the button on another screen. */}
+          {/* State-stream stale — the WS is quiet during an active
+              run. Different diagnosis from a wedged controller: we
+              haven't RECEIVED a state=3 recently, we're just missing
+              updates. Neutral slate palette (no amber controller-
+              blame), no Force stop/Reset buttons (no fresh evidence
+              justifies those verbs). Falls back to wedge / normal
+              rendering as soon as fresh frames resume. */}
+          {showStreamStale && !isStuckStopping && (
+            <div style={{
+              marginTop: 16, padding: 12,
+              background: '#F1F5F9', border: '1px solid #94A3B8',
+              borderRadius: 8, color: '#334155', fontSize: 14,
+              display: 'flex', alignItems: 'center', gap: 12,
+              flexWrap: 'wrap',
+            }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 700, marginBottom: 2 }}>
+                  State stream stale — reconnecting
+                </div>
+                <div style={{ fontSize: 12 }}>
+                  No fresh ProjectState frames from the driver in the last
+                  {' '}{Math.floor((nowTs - (lastProgramStateTs || nowTs)) / 1000)}s.
+                  Reconnecting; the controller's actual state is unknown
+                  until frames resume. Not blaming the controller — could
+                  be a driver restart, WS backpressure, or a subscription
+                  stall. Wedge and recovery affordances will re-appear if
+                  a real wedge is confirmed.
+                </div>
+              </div>
+            </div>
+          )}
           {isStuckStopping && (
             <div style={{
               marginTop: 16, padding: 12,

@@ -7,8 +7,10 @@ import assert from 'node:assert/strict'
 import {
   deriveRunState,
   STUCK_STOPPING_MS,
+  STATE_STREAM_STALE_MS,
   isStopButtonEnabled,
   isStuckStopping,
+  isStateStreamStale,
   homeButtonEnabled,
   restartButtonEnabled,
 } from './runState.js'
@@ -197,4 +199,31 @@ test('restartButtonEnabled: idle → enabled', () => {
     safety: {}, nowTs: 10_000,
   })
   assert.equal(r, true)
+})
+
+
+// ── isStateStreamStale ─────────────────────────────────────────
+
+test('isStateStreamStale: zero timestamp counts as stale (never received)', () => {
+  assert.equal(isStateStreamStale(0, 100_000), true)
+  assert.equal(isStateStreamStale(null, 100_000), true)
+  assert.equal(isStateStreamStale(undefined, 100_000), true)
+})
+
+test('isStateStreamStale: recent frame within window → NOT stale', () => {
+  const now = 100_000
+  const recent = now - (STATE_STREAM_STALE_MS - 500)
+  assert.equal(isStateStreamStale(recent, now), false)
+})
+
+test('isStateStreamStale: old frame past window → stale', () => {
+  const now = 100_000
+  const old = now - (STATE_STREAM_STALE_MS + 100)
+  assert.equal(isStateStreamStale(old, now), true)
+})
+
+test('isStateStreamStale: exactly at threshold counts as stale', () => {
+  const now = 100_000
+  const boundary = now - STATE_STREAM_STALE_MS
+  assert.equal(isStateStreamStale(boundary, now), true)
 })

@@ -21,6 +21,12 @@ const storeDefinition = (set, get) => ({
   lidarWsStatus: 'disconnected',
   wsLatency: 0,
   lastMessageTime: 0,
+  // Same-machine Date.now() of the most recent WS frame carrying a
+  // robot.program.state value. Used ONLY by isStateStreamStale so
+  // the wedge banner can distinguish a real controller wedge from
+  // a stale stream. 0 means "never received a program.state frame
+  // this session" (freshly-loaded page).
+  lastProgramStateTs: 0,
 
   // ---- Jog speed (0-100 %) ----
   // Reusable knob. Currently drives ONLY the twin animation speed for
@@ -247,7 +253,20 @@ const storeDefinition = (set, get) => ({
       try {
         const msg = JSON.parse(ev.data)
         const now = Date.now()
-        const latency = msg.t ? Math.round(now - msg.t) : 0
+        // wsLatency estimates one-way (server-emit → client-receive)
+        // delay, but msg.t is the server's Date.now() (Jetson clock)
+        // and `now` is the tablet's Date.now() — cross-machine
+        // wall-clock subtraction. Any NTP drift between the two
+        // machines shows up here; on a fresh ONN tablet the browser
+        // clock can drift a few hundred ms behind the Jetson, which
+        // used to print as e.g. "-318 ms" in TopBar. Clamp to 0 so
+        // the display never lies about direction. This value is a
+        // ROUGH estimate under clock skew and MUST NOT be used in
+        // any control-flow decision — wedge staleness, deadman
+        // timers, etc. all use same-clock deltas instead (see
+        // lastProgramStateTs below, `stuckStoppingMs` in
+        // MonitorDashboard, HoldButton's Worker+rAF ticker).
+        const latency = msg.t ? Math.max(0, Math.round(now - msg.t)) : 0
         // Jog telemetry — record inter-message gap on the state
         // channel so the tablet-vs-laptop RTT breakdown has real
         // numbers to look at. pushWsGap is a no-op when telemetry
@@ -273,11 +292,26 @@ const storeDefinition = (set, get) => ({
           try { ws.send(JSON.stringify({ type: 'state_ack', seq: msg.seq })) }
           catch (_) { /* socket closing — sender falls back to timeout gate */ }
         }
+        // Track same-machine arrival time of ProjectState frames so
+        // the wedge banner can distinguish a real controller wedge
+        // (fresh state=3 arriving for >3s) from a stale stream
+        // (nothing arriving at all). Client-side Date.now() only —
+        // same clock as `stoppingSince`/`nowTs` in MonitorDashboard.
+        // A `program.state` value of 0/2/3 counts as a live frame;
+        // absence of `program.state` in the message doesn't refresh
+        // the timestamp so a burst of non-program updates can't hide
+        // a wedged stream.
+        const progStateNow =
+          msg.robot && msg.robot.program
+            && msg.robot.program.state !== undefined
+            && msg.robot.program.state !== null
+            ? now : get().lastProgramStateTs
         set({
           safety: msg.safety ?? get().safety,
           joints: msg.joints ?? get().joints,
           robot: msg.robot ?? get().robot,
           task: msg.task ?? get().task,
+          lastProgramStateTs: progStateNow,
           detections: msg.detections ?? get().detections,
           // Server publishes detection_mode in STATE; keep the store
           // in sync so a fresh page-load picks up whatever mode was

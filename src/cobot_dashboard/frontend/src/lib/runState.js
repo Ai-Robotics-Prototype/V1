@@ -93,6 +93,30 @@ export function deriveRunState({ robot, task, safety } = {}) {
 
 export const STUCK_STOPPING_MS = 3000
 
+// State-stream freshness threshold. When the client hasn't received
+// a WS frame carrying robot.program.state in this long, treat the
+// stream as stale and DO NOT blame the controller for a wedge —
+// there's no live evidence the controller is still in state 3;
+// what we're actually seeing is a subscription stall (driver
+// reconnected, WS backpressure, controller offline, etc.). Value is
+// deliberately shorter than the wedge threshold so a stale stream
+// hides the wedge banner instead of racing it.
+export const STATE_STREAM_STALE_MS = 2500
+
+// Returns true when we haven't seen a program.state frame in at
+// least STATE_STREAM_STALE_MS. `lastProgramStateTs` is a Date.now()
+// captured client-side when a WS frame with msg.robot.program.state
+// arrives; `nowTs` is Date.now(). Both are on the SAME machine, so
+// this is safe under any clock skew against the server. A 0
+// timestamp means we've never received a state frame this session
+// — treated as stale so a freshly-loaded page with no data yet
+// doesn't immediately assert a controller wedge.
+export function isStateStreamStale(lastProgramStateTs, nowTs = Date.now(),
+                                   staleMs = STATE_STREAM_STALE_MS) {
+  if (!lastProgramStateTs) return true
+  return (nowTs - lastProgramStateTs) >= staleMs
+}
+
 // The STOP button MUST stay enabled in every active state so a
 // wedged program can always be interrupted. Deliberately exempt
 // from the gate-open / estop-clear checks that grey out the OTHER
