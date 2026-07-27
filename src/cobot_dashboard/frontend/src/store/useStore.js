@@ -6,6 +6,18 @@ const HOST = typeof window !== 'undefined' ? window.location.host : 'localhost:8
 const WS_PROTO =
   typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws'
 
+// Per-page-load client id, sent as `X-Client-Id` on every program
+// mutation so the server can tag `program_changed` events with the
+// originator and every OTHER client refetches while THIS client
+// ignores its own echo. Regenerated per tab so two tabs on the same
+// device still see each other's edits.
+export const CLIENT_ID = (() => {
+  try {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID()
+  } catch { /* fall through */ }
+  return 'c-' + Math.random().toString(36).slice(2) + Date.now().toString(36)
+})()
+
 // Exponential backoff helper
 function backoffDelay(attempt) {
   return Math.min(1000 * Math.pow(2, attempt), 10000)
@@ -328,6 +340,18 @@ const storeDefinition = (set, get) => ({
           wsLatency: latency,
           lastMessageTime: now,
         })
+        // Bug 1 fix (2026-07-27): program_changed events piggyback
+        // on /ws/state as msg.program_events. Each event: {
+        //   type, program_id, rev, source_client, kind, ts_ms }.
+        // We ignore our own echoes (source_client === CLIENT_ID),
+        // ignore events for programs we don't have open, and
+        // dedupe on ts_ms so a single event fanning across
+        // multiple frames only fires once. Cross-client refetch
+        // lives at the bottom of the handler so all state is
+        // already committed by the time we ask for a re-read.
+        if (Array.isArray(msg.program_events) && msg.program_events.length) {
+          get()._handleProgramEvents(msg.program_events)
+        }
       } catch (e) {
         // ignore parse errors
       }
@@ -556,10 +580,66 @@ const storeDefinition = (set, get) => ({
   // allow_move. The gate governs Run only. That separation is
   // enforced backend-side by the endpoints living outside the
   // gate check block.
+  // Highest program_event ts_ms this client has already applied. Guards
+  // against the same event firing multiple times as it rides successive
+  // /ws/state frames within its 15 s TTL window on the server.
+  _lastProgramEventTs: 0,
+
+  // Set to {rev, source_client, kind, ts_ms} when the server tells us
+  // OUR currently-open program was mutated on ANOTHER device while we
+  // have local unsaved edits. ProgramEditor renders a banner reading
+  // "Program updated on another device — [Reload] [Keep my edits]".
+  // Cleared by explicit user action (Reload → auto-refetch clears it;
+  // Keep my edits → clears without refetch, next Save will win). null
+  // when there's nothing outstanding.
+  programChangedByOther: null,
+  clearProgramChangedByOther() { set({ programChangedByOther: null }) },
+
+  _handleProgramEvents(events) {
+    const cp = get().currentProgram
+    if (!cp || !cp.id) return
+    let latestSeen = get()._lastProgramEventTs
+    let mustRefetch = null      // last event we WILL apply
+    let mustBanner  = null      // last unsaved-edits-conflict event
+    for (const ev of events) {
+      if (!ev || ev.type !== 'program_changed') continue
+      if (ev.program_id !== cp.id) continue
+      if (ev.source_client && ev.source_client === CLIENT_ID) continue
+      if (!ev.ts_ms || ev.ts_ms <= latestSeen) continue
+      // Compare rev when we have one locally. rev==undefined on
+      // fresh loads means "assume stale" and refetch on any event.
+      if (cp.rev != null && ev.rev != null && ev.rev <= cp.rev) continue
+      latestSeen = ev.ts_ms
+      if (cp.unsaved) mustBanner  = ev
+      else            mustRefetch = ev
+    }
+    if (latestSeen > get()._lastProgramEventTs) {
+      set({ _lastProgramEventTs: latestSeen })
+    }
+    if (mustBanner) {
+      set({ programChangedByOther: {
+        rev:           mustBanner.rev,
+        source_client: mustBanner.source_client,
+        kind:          mustBanner.kind || 'mutation',
+        ts_ms:         mustBanner.ts_ms,
+      } })
+    } else if (mustRefetch) {
+      // No local unsaved edits → refetch quietly. The next state
+      // frame that arrives after refetch clears cp.rev == null so
+      // subsequent events fire the normal >-rev compare.
+      get()._refreshCurrentProgram()
+    }
+  },
+
   async _pointsFetch(method, path, body = null) {
-    const opts = { method }
+    // Every mutation stamps X-Client-Id so the server can tag the
+    // resulting program_changed event with this client's UUID and
+    // OTHER clients see the change while this one skips its echo
+    // (see Bug 1 fix in dashboard_server._emit_program_changed).
+    const headers = { 'X-Client-Id': CLIENT_ID }
+    const opts = { method, headers }
     if (body !== null) {
-      opts.headers = { 'Content-Type': 'application/json' }
+      headers['Content-Type'] = 'application/json'
       opts.body = JSON.stringify(body)
     }
     const res = await fetch(path, opts)
@@ -626,8 +706,13 @@ const storeDefinition = (set, get) => ({
           tags:       Array.isArray(full.tags) ? full.tags : [],
           points:     full.points || {},
           source:     full.source,
+          rev:        full.rev,      // Bug 1 fix: pick up rev so future
+                                     // program_events compare correctly.
+          unsaved:    false,         // Refetch clears the dirty flag —
+                                     // we just re-read canonical state.
           has_taught_poses: full.has_taught_poses,
         })
+        get().clearProgramChangedByOther()
       }
     } catch (_) { /* silent — next tick refresh, if any, will retry */ }
   },

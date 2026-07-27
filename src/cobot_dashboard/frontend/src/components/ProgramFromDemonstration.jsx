@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import LiveRecorder from './LiveRecorder'
 import { useStore } from '../store/useStore'
 
@@ -217,44 +217,117 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
   }
 
   // Re-invoke the server-side composer on the CURRENT (in-memory,
-  // possibly clarification-modified) intent. Used when an operator's
-  // answer to an effector clarification would change the draft's
-  // step list — a simple text relabelling wouldn't cover it because
-  // the vacuum effector inserts a blow-off triplet and swaps two
-  // step actions. Returns the fresh draft + intent from the server;
-  // both replace the local state so the review re-renders with the
-  // regenerated program.
+  // Auto-recompose (2026-07-27). Every clarification answer flows
+  // into the intent client-side via applyClarifications, then a POST
+  // to /recompose swaps in the fresh draft. Same server path Accept
+  // uses, so screen and eventually-persisted artifact stay one and
+  // the same. Debounced 400 ms so rapid-toggling coalesces; each
+  // dispatch bumps recomposeSeqRef and only the latest response
+  // applies its state — an older reply's setDraft would be a stale
+  // clobber that the seq check discards.
+  //
+  // Manual "Regenerate draft" button removed — the review is
+  // read-only (no step-level edits available today, see line ~810),
+  // so there is no operator-authored draft state to preserve across
+  // a rebuild, hence no manual-edit guard needed. If step editing
+  // ever ships in the review, gate the auto-fire on a "dirty" flag.
   const [regenerating, setRegenerating] = useState(false)
   const [regenError,   setRegenError]   = useState('')
-  async function regenerateDraft() {
-    if (!demoId || !intent) return
+  const [changedStepIdx, setChangedStepIdx] = useState(new Set())
+  const recomposeSeqRef      = useRef(0)
+  const recomposeInitialRef  = useRef(true)   // skip the initial seed
+  const recomposeAbortRef    = useRef(null)   // supersede in-flight
+
+  const runRecompose = useCallback(async () => {
+    if (!demoId || !intent || !draft) return
+    // Bump the seq FIRST so any older in-flight response fails the
+    // staleness check when it lands. Abort the previous fetch too —
+    // no point letting a superseded request tie up the network.
+    const mySeq = ++recomposeSeqRef.current
+    if (recomposeAbortRef.current) {
+      try { recomposeAbortRef.current.abort() } catch { /* nop */ }
+    }
+    const ac = new AbortController()
+    recomposeAbortRef.current = ac
     setRegenerating(true)
     setRegenError('')
+    // Snapshot the pre-recompose step signatures for the changed-
+    // row highlight when the new draft lands.
+    const prevSteps = Array.isArray(draft.steps) ? draft.steps : []
+    const prevSig = prevSteps.map((s) => `${s?.action || ''}|${s?.label || ''}`)
     try {
       const applied = applyClarifications(draft, intent, clarAnswers)
       const res = await fetch(`/api/pbd/${demoId}/recompose`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ intent: applied.intent }),
+        signal:  ac.signal,
       })
       const data = await res.json().catch(() => ({}))
+      // Staleness guard — a newer request superseded us while we
+      // were on the wire. Silent drop; the newer response will
+      // handle UI state.
+      if (mySeq !== recomposeSeqRef.current) return
       if (!data.ok) {
-        setRegenError(data.error || `regenerate failed (HTTP ${res.status})`)
+        // Keep the previous draft on the screen — never blank the
+        // list. The inline error is visible in the header.
+        setRegenError(data.error || `recompose failed (HTTP ${res.status})`)
         return
       }
-      // Server returns { draft, intent }. Replace local state; keep
-      // clarification answers as-is (they still align with the same
-      // clarification set).
+      // Server returns { draft, intent }. Compute the changed-row
+      // set (by index against prevSig) so the UI can flash amber
+      // on rows whose action/label just changed — the moment the
+      // product teaches the operator it listened.
+      const newSteps = Array.isArray(data.draft?.steps) ? data.draft.steps : []
+      const newSig   = newSteps.map((s) => `${s?.action || ''}|${s?.label || ''}`)
+      const changed  = new Set()
+      const maxN = Math.max(prevSig.length, newSig.length)
+      for (let i = 0; i < maxN; i++) {
+        if (prevSig[i] !== newSig[i]) changed.add(i)
+      }
       if (data.draft)  setDraft(data.draft)
       if (data.intent) setIntent(data.intent)
-      // Editable name mirrors the fresh draft.
       if (data.draft?.name) setEditName(data.draft.name)
+      if (changed.size > 0) {
+        setChangedStepIdx(changed)
+        // Fade the highlight after ~700 ms so a subsequent recompose
+        // starts from a clean slate.
+        setTimeout(() => {
+          // Only clear if we're still the latest — a NEW recompose
+          // will set its own changed set and we don't want to stomp.
+          if (recomposeSeqRef.current === mySeq) setChangedStepIdx(new Set())
+        }, 700)
+      }
     } catch (e) {
-      setRegenError(`regenerate error: ${e?.message || e}`)
+      if (e?.name === 'AbortError') return   // superseded — ignore
+      if (mySeq !== recomposeSeqRef.current) return
+      setRegenError(`recompose error: ${e?.message || e}`)
     } finally {
-      setRegenerating(false)
+      if (mySeq === recomposeSeqRef.current) setRegenerating(false)
     }
-  }
+  }, [demoId, intent, draft, clarAnswers])
+
+  // Fire recompose whenever the answer set changes. Skip the first
+  // run — that's the seed applied by the initial fetch (setClarAnswers
+  // called immediately after setDraft/setIntent). Recomposing on the
+  // seed would round-trip the same intent that just produced this
+  // draft — wasted request + a spurious "changed" flash on every
+  // rebuild-triggered answer echo. Resetting the initial-ref when
+  // demoId changes covers the "operator loads a different demo
+  // without unmounting the review" path.
+  useEffect(() => {
+    recomposeInitialRef.current = true
+  }, [demoId])
+  useEffect(() => {
+    if (recomposeInitialRef.current) {
+      recomposeInitialRef.current = false
+      return
+    }
+    if (!intent || !draft) return
+    const t = setTimeout(() => { runRecompose() }, 400)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clarAnswers])
 
   async function accept() {
     if (!draft || !demoId) return
@@ -356,10 +429,30 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
         setAccepting(false)
         return
       }
+      // Bug fix (2026-07-27): server now recomposes the program from
+      // the answered intent BEFORE persisting (see
+      // dashboard_server.api_pbd_correct's recompose block). The
+      // response echoes back the final saved program — adopt it into
+      // local state so the review re-renders whatever actually got
+      // saved. This closes the "answers recorded but not applied"
+      // hole where an effector-clarification answer stayed on the
+      // intent but the draft's step list was frozen from before the
+      // answer (whitebowl symptom: 'vacuum' answered, 'Grip part'
+      // saved because the client-side folder never restructures the
+      // step list on effector changes — only the ↻ Regenerate button
+      // did before this fix).
+      if (data.program) {
+        setDraft(data.program)
+        if (data.program.name) setEditName(data.program.name)
+      }
+      if (data.recompose_warning) {
+        console.warn('[PBD] server recompose failed:', data.recompose_warning)
+      }
       // Refresh the shared programs list so ProgramLibrary reflects
       // the new draft program immediately (no mount-fetch lag).
       try { useStore.getState().refreshPrograms?.() } catch {}
-      onSaved?.({ id: data.program_id, name: program.name, ...program })
+      onSaved?.({ id: data.program_id, name: program.name,
+                  ...(data.program || program) })
       onClose?.()
     } catch (e) {
       setAcceptError(`save error: ${e?.message || e}`)
@@ -573,9 +666,9 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
               clarInteracted={clarInteracted}
               setClarInteracted={setClarInteracted}
               cycles={cycles} setCycles={setCycles}
-              regenerateDraft={regenerateDraft}
               regenerating={regenerating}
               regenError={regenError}
+              changedStepIdx={changedStepIdx}
               accepting={accepting} acceptError={acceptError}
             />
           )}
@@ -639,7 +732,8 @@ function ReviewPanel({
   clarAnswers, setClarAnswers,
   clarInteracted, setClarInteracted,
   cycles, setCycles,
-  regenerateDraft, regenerating, regenError,
+  regenerating, regenError,
+  changedStepIdx,
   accepting, acceptError,
 }) {
   return (
@@ -715,37 +809,12 @@ function ReviewPanel({
         />
       )}
 
-      {/* Regenerate draft — re-invokes the server-side composer on the
-          current (in-memory) intent so answers that change step
-          SHAPE (effector, source, etc.) can restructure the draft
-          without re-recording the demo. applyClarifications already
-          updates the in-memory intent; this button pushes that
-          through the composer to get the fresh step list. */}
-      {typeof regenerateDraft === 'function' && (
-        <div style={{
-          margin: '4px 0 14px', display: 'flex', alignItems: 'center',
-          gap: 10,
-        }}>
-          <button onClick={regenerateDraft} disabled={!!regenerating}
-            style={{
-              padding: '8px 14px', fontSize: 13, fontWeight: 600,
-              background: regenerating ? '#f3f4f6' : '#eff6ff',
-              color:      regenerating ? '#9ca3af' : '#1d4ed8',
-              border:     '1px solid ' + (regenerating ? '#e5e7eb' : '#bfdbfe'),
-              borderRadius: 6,
-              cursor: regenerating ? 'default' : 'pointer',
-            }}>
-            {regenerating ? 'Regenerating…' : '↻ Regenerate draft'}
-          </button>
-          <span style={{ fontSize: 12, color: '#6b7280' }}>
-            Rebuild the step list from the current answers (effector,
-            fixed vs vision, part choice) without re-recording.
-          </span>
-          {regenError && (
-            <span style={{ fontSize: 12, color: '#DC2626' }}>{regenError}</span>
-          )}
-        </div>
-      )}
+      {/* Regenerate button removed 2026-07-27 — draft steps now
+          auto-recompose on every answer change (see the useEffect
+          on clarAnswers above). The spinner + inline error live in
+          the Draft steps header. Accept still runs its own server-
+          side recompose as the belt-AND-suspenders final authority
+          for the persisted artifact. */}
 
       {/* Retrieval-augment few-shot examples are still fetched, logged
           to metadata.retrieval.used_examples, and shape the AI's draft
@@ -782,37 +851,86 @@ function ReviewPanel({
         </div>
       </Section>
 
-      <Section title={`Draft steps (${draft.steps?.length || 0})`}>
+      {/* Draft steps — auto-recomposes as answers change. Header
+          shows a small spinner during rebuild; rows that changed
+          from the previous draft flash amber for ~700 ms so the
+          operator can see WHICH steps their answer moved. The
+          previous ↻ Regenerate button is gone — Accept keeps its
+          server-side recompose as the belt-AND-suspenders final
+          authority. */}
+      <div style={{ marginBottom: 14 }}>
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6,
+        }}>
+          <div style={{
+            fontSize: 11, fontWeight: 700, color: '#6b7280',
+            textTransform: 'uppercase', letterSpacing: '0.06em',
+          }}>{`Draft steps (${draft.steps?.length || 0})`}</div>
+          {regenerating && (
+            <>
+              <span
+                aria-label="Rebuilding steps"
+                style={{
+                  display: 'inline-block', width: 12, height: 12,
+                  border: '2px solid #bfdbfe', borderTopColor: '#2563EB',
+                  borderRadius: '50%',
+                  animation: 'pbdRecomposeSpin 0.7s linear infinite',
+                }}
+              />
+              <span style={{ fontSize: 11, color: '#6b7280' }}>rebuilding…</span>
+            </>
+          )}
+          {regenError && !regenerating && (
+            <span style={{ fontSize: 11, color: '#DC2626',
+                           marginLeft: 6, fontWeight: 600 }}>
+              recompose failed — showing previous draft; {regenError}
+            </span>
+          )}
+        </div>
+        <style>{`
+          @keyframes pbdRecomposeSpin { to { transform: rotate(360deg); } }
+          @keyframes pbdStepFlash {
+            0%   { background: #fde68a; }
+            60%  { background: #fef3c7; }
+            100% { background: transparent; }
+          }
+        `}</style>
         <div style={{
           maxHeight: 220, overflowY: 'auto', borderRadius: 8,
           border: '1px solid #e5e7eb',
+          opacity: regenerating ? 0.75 : 1,
+          transition: 'opacity 150ms ease-out',
         }}>
-          {(draft.steps || []).map((s, i) => (
-            <div key={i} style={{
-              display: 'flex', alignItems: 'center', gap: 8,
-              padding: '6px 10px',
-              borderBottom: i < draft.steps.length - 1 ? '1px solid #f3f4f6' : 'none',
-              background: i % 2 ? '#fafafa' : '#fff',
-            }}>
-              <span style={{
-                fontFamily: 'monospace', fontSize: 11, color: '#6b7280',
-                minWidth: 26, textAlign: 'right',
-              }}>{i + 1}</span>
-              <span style={{ fontSize: 12, fontWeight: 600, color: '#374151', minWidth: 110 }}>
-                {s.action}
-              </span>
-              <span style={{ fontSize: 12, color: '#111', flex: 1 }}>{s.label}</span>
-              {s.pose_status === POSE_AWAITING && (
+          {(draft.steps || []).map((s, i) => {
+            const flashed = changedStepIdx && changedStepIdx.has(i)
+            return (
+              <div key={i} style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                padding: '6px 10px',
+                borderBottom: i < draft.steps.length - 1 ? '1px solid #f3f4f6' : 'none',
+                background: i % 2 ? '#fafafa' : '#fff',
+                animation: flashed ? 'pbdStepFlash 700ms ease-out' : undefined,
+              }}>
                 <span style={{
-                  fontSize: 10, fontWeight: 700, padding: '2px 6px',
-                  borderRadius: 4, color: '#92400e', background: '#fef3c7',
-                  border: '1px solid #fde68a',
-                }}>awaiting perception</span>
-              )}
-            </div>
-          ))}
+                  fontFamily: 'monospace', fontSize: 11, color: '#6b7280',
+                  minWidth: 26, textAlign: 'right',
+                }}>{i + 1}</span>
+                <span style={{ fontSize: 12, fontWeight: 600, color: '#374151', minWidth: 110 }}>
+                  {s.action}
+                </span>
+                <span style={{ fontSize: 12, color: '#111', flex: 1 }}>{s.label}</span>
+                {s.pose_status === POSE_AWAITING && (
+                  <span style={{
+                    fontSize: 10, fontWeight: 700, padding: '2px 6px',
+                    borderRadius: 4, color: '#92400e', background: '#fef3c7',
+                    border: '1px solid #fde68a',
+                  }}>awaiting perception</span>
+                )}
+              </div>
+            )
+          })}
         </div>
-      </Section>
+      </div>
 
       {/* Voice transcript display removed 2026-07-23. The transcript
           is still parsed, persisted (audio_transcript.json), and fed
@@ -1316,10 +1434,14 @@ function applyClarifications(draft, intent, answers) {
           continue
         }
         if (path === 'effector') {
-          // New AI-emitted shape. Value is one of 'vacuum' | 'finger'
-          // | 'magnetic' (canonical). Route to op.effector; the draft
-          // steps get restructured when the operator hits Regenerate
-          // draft (calls /api/pbd/{demo_id}/recompose on the server).
+          // Value is one of 'vacuum' | 'finger' | 'magnetic'
+          // (canonical). Route to op.effector; the server recomposes
+          // the step list from the intent when the operator hits
+          // Accept (see dashboard_server.api_pbd_correct), so we no
+          // longer need to make Regenerate the mandatory intermediate
+          // step for this answer to actually take effect. The old
+          // client-only path used to require ↻ Regenerate before
+          // Accept, which was the whitebowl bug.
           const s = String(ans || '').toLowerCase()
           op.effector = /vacuum|suction/.test(s) ? 'vacuum'
                       : /magnet/.test(s) ? 'magnetic'

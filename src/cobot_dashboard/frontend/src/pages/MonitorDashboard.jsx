@@ -9,6 +9,7 @@ import IdentifiedObjectsCard from '../components/IdentifiedObjectsCard'
 import RunProgramModal from '../components/RunProgramModal'
 import ProgramErrorModal from '../components/ProgramErrorModal'
 import StepPreviewPanel from '../components/StepPreviewPanel'
+import RecentRunsCard from '../components/RecentRunsCard'
 import { deriveRunState, isStopButtonEnabled,
          isStuckStopping as _computeStuckStopping,
          isStateStreamStale as _computeStreamStale,
@@ -1369,6 +1370,16 @@ export default function MonitorDashboard() {
           </div>
         </div>
       )}
+
+      {/* Recent runs — always-on joint recorder browser. Sits at the
+          bottom of the Monitor scroll area so it never fights with
+          the run-in-progress UI at the top. Cheap to render (only
+          fetches /api/runs on a 4 s poll). */}
+      <div style={{
+        maxWidth: 1200, margin: '0 auto', padding: '0 20px 24px',
+      }}>
+        <RecentRunsCard />
+      </div>
 
       {/* Run-confirm modal (opens when the operator presses Run) and
           program error modal (opens on driver-side publish/Error

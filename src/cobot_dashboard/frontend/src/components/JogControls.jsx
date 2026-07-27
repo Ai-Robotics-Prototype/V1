@@ -1128,15 +1128,55 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
           </div>
         ) : (
           <div style={{ display: 'flex', gap: jointColGap, justifyContent: 'center', flexWrap: 'wrap', alignItems: 'center' }}>
-            {[1, 2, 3, 4, 5, 6].map((j) => (
-              <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: padInner }}>
-                <div style={{ fontSize: jointLblFont, fontWeight: 700, color: '#374151', marginBottom: jointLblMb }}>
-                  {'J' + j}
+            {[1, 2, 3, 4, 5, 6].map((j) => {
+              // Live angle: reuse the same /joint_states-derived slice
+              // JogControls already reads for the alarm banner (line 378);
+              // no new subscription. Radians → degrees, one decimal.
+              const posRad = joints?.positions?.[j - 1]
+              const angleDeg = Number.isFinite(posRad) ? (posRad * 180 / Math.PI) : null
+              // Limits: the driver publishes per-joint {limit_deg, headroom_deg}
+              // via /estun/status → robot.joint_limits. Single source of
+              // truth (URDF/config-loaded, ±200 / ±166 family). If the
+              // driver hasn't broadcast yet (cold boot), hide the line
+              // rather than hardcode — hardcoding is a bug per §134.
+              const jl = (robot.joint_limits || []).find((x) => x?.joint === j)
+              const limitDeg  = Number.isFinite(jl?.limit_deg)     ? jl.limit_deg     : null
+              const headroom  = Number.isFinite(jl?.headroom_deg)  ? jl.headroom_deg  : null
+              // Proximity tint from headroom (driver-computed as
+              // limit_deg − |current_deg|). Palette matches existing
+              // caution/alarm tokens used elsewhere in this file.
+              let angleColor = '#111827'
+              if (headroom != null) {
+                if (headroom <= 3)       angleColor = '#DC2626'   // alarm / near-limit red
+                else if (headroom <= 10) angleColor = '#d97706'   // caution amber
+              }
+              return (
+                <div key={j} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: padInner }}>
+                  <div style={{ fontSize: jointLblFont, fontWeight: 700, color: '#374151', marginBottom: 2 }}>
+                    {'J' + j}
+                  </div>
+                  <div style={{
+                    fontSize: jointLblFont + 2, fontWeight: 700, color: angleColor,
+                    fontVariantNumeric: 'tabular-nums',
+                    minHeight: jointLblFont + 4,
+                    marginBottom: jointLblMb,
+                  }}>
+                    {angleDeg != null ? `${angleDeg.toFixed(1)}°` : '—'}
+                  </div>
+                  <ArrowPad {...wire(j,  1)} rotation={0}   label="+" color="#16A34A" size={jointBtnW} svgSize={svgPx} labelSize={lblPx + 2} />
+                  <ArrowPad {...wire(j, -1)} rotation={180} label="−" color="#DC2626" size={jointBtnW} svgSize={svgPx} labelSize={lblPx + 2} />
+                  {limitDeg != null && (
+                    <div style={{
+                      fontSize: Math.max(10, jointLblFont - 2),
+                      color: '#9ca3af', fontVariantNumeric: 'tabular-nums',
+                      marginTop: 2, whiteSpace: 'nowrap',
+                    }}>
+                      {`−${limitDeg.toFixed(0)}° … +${limitDeg.toFixed(0)}°`}
+                    </div>
+                  )}
                 </div>
-                <ArrowPad {...wire(j,  1)} rotation={0}   label="+" color="#16A34A" size={jointBtnW} svgSize={svgPx} labelSize={lblPx + 2} />
-                <ArrowPad {...wire(j, -1)} rotation={180} label="−" color="#DC2626" size={jointBtnW} svgSize={svgPx} labelSize={lblPx + 2} />
-              </div>
-            ))}
+              )
+            })}
           </div>
         )}
       </div>

@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 import SetupWizard from '../components/SetupWizard'
 import CellDetailPanel from '../components/CellDetailPanel'
+import Cam0CalibrationCard from '../components/Cam0CalibrationCard'
 import { useCellWizardStore } from '../store/cellWizardStore'
 
 function CellRow({ c, allCells, busy, onActivate, onDelete, expanded, onToggleExpand, onRefresh }) {
@@ -551,6 +552,8 @@ export default function ConfigureLayout() {
       <SystemCheckSection />
 
       <CellSetupSection />
+
+      <Cam0CalibrationCard />
 
       <div style={{
         fontSize: 10,

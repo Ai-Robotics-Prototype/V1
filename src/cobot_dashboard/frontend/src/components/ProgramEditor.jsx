@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
-import { useStore } from '../store/useStore'
+import { useStore, CLIENT_ID } from '../store/useStore'
 import ProgramWizard from './ProgramWizard'
 import ProgramFromDemonstration from './ProgramFromDemonstration'
 import { HoldButton } from './JogControls'
@@ -269,6 +269,114 @@ function isTeachable(step) {
     if (match) return TEACHABLE_ACTIONS.includes(match.value)
   }
   return false
+}
+
+// Count steps that reference a named point via `point_name`. Powers
+// the picker's per-point badge and the row's link chip suffix.
+function countStepsUsingPoint(steps, pointName) {
+  if (!pointName || !Array.isArray(steps)) return 0
+  let n = 0
+  for (const s of steps) if (s && s.point_name === pointName) n += 1
+  return n
+}
+
+// Count steps that link to another step via ea64950 step-id refs
+// (position_ref) or the older linked_to_step_id field. Includes the
+// source step itself in the total so the badge reads intuitively as
+// "3 steps share this pose" (source + 2 refs = 3).
+function countStepsSharingStep(steps, srcStepId) {
+  if (srcStepId == null || !Array.isArray(steps)) return 0
+  let n = 0
+  for (const s of steps) {
+    if (!s) continue
+    if (s.id === srcStepId) { n += 1; continue }
+    if (s.position_ref === srcStepId) n += 1
+    else if (s.linked_to_step_id === srcStepId) n += 1
+  }
+  return n
+}
+
+// Aggregate every taught position the operator can link to. Two
+// source families sit alongside each other:
+//   • kind:'step'  — a position-type step in this program with taught
+//                    joints. Linking sets step.position_ref (matching
+//                    the ea64950 home-reuse pattern, which was the
+//                    only place this ever worked pre-fix).
+//   • kind:'point' — an entry in program.points, populated by
+//                    /api/programs/{id}/points (Points panel, voice,
+//                    wizard). Linking sets step.point_name.
+// Sorted by taught_at desc — most-recently-touched first. Steps that
+// themselves reference another step are excluded to keep the source
+// list pointing at ORIGINALS (chase-through is what the finder was
+// already doing at line ~200 before this refactor).
+function collectPositionSources(steps, points) {
+  const out = []
+  if (Array.isArray(steps)) {
+    for (const s of steps) {
+      if (!s) continue
+      if (s.position_ref != null || s.linked_to_step_id != null) continue
+      if (!isTeachable(s)) continue
+      if (!s.taught) continue
+      const j = Array.isArray(s.taught_joints) ? s.taught_joints
+              : Array.isArray(s.joints)        ? s.joints : null
+      const t = Array.isArray(s.taught_tcp)    ? s.taught_tcp
+              : Array.isArray(s.position)      ? s.position : null
+      if (!Array.isArray(j) || j.length < 6) continue
+      out.push({
+        kind:      'step',
+        id:        s.id,
+        label:     s.label || null,
+        action:    s.action || null,
+        role:      s.position_role || null,
+        joints:    j,
+        tcp:       t,
+        taught_at: s.taught_at || '',
+        refs:      countStepsSharingStep(steps, s.id),
+      })
+    }
+  }
+  if (points && typeof points === 'object') {
+    for (const [name, p] of Object.entries(points)) {
+      if (!p || !Array.isArray(p.joints) || p.joints.length < 6) continue
+      out.push({
+        kind:      'point',
+        name,
+        label:     p.label || null,
+        joints:    p.joints,
+        tcp:       Array.isArray(p.tcp) ? p.tcp : null,
+        taught_at: p.taught_at || '',
+        refs:      countStepsUsingPoint(steps, name),
+      })
+    }
+  }
+  out.sort((a, b) => (b.taught_at || '').localeCompare(a.taught_at || ''))
+  return out
+}
+
+// Compact joint summary for the picker rows — J1..J6 degrees, single
+// line, monospace-friendly.
+function pointJointsLine(joints) {
+  if (!Array.isArray(joints) || joints.length < 6) return ''
+  return joints.slice(0, 6)
+    .map((v, i) => `J${i + 1}:${Number(v).toFixed(1)}°`).join('  ')
+}
+
+// Format a taught_at ISO timestamp as "just now / 3m / 2h / 4d" for
+// the picker's most-recent-first list. Falls back to the raw string
+// on parse failure so a hand-authored program's non-standard stamp
+// still renders something meaningful.
+function formatTaughtAgo(iso) {
+  if (!iso) return ''
+  const t = Date.parse(iso)
+  if (!Number.isFinite(t)) return String(iso).slice(0, 19)
+  const secs = Math.max(0, Math.round((Date.now() - t) / 1000))
+  if (secs < 45)     return 'just now'
+  if (secs < 90)     return '1 min ago'
+  const mins = Math.round(secs / 60)
+  if (mins < 60)     return `${mins} min ago`
+  const hours = Math.round(mins / 60)
+  if (hours < 48)    return `${hours} h ago`
+  return `${Math.round(hours / 24)} d ago`
 }
 
 // /api/state returns joints.positions in radians; the step model
@@ -1639,6 +1747,267 @@ function PositionReuseModal({ action, source, onUseSame, onTeachNew, onCancel })
   )
 }
 
+// Position picker — generalizes the ea64950 "same as Step N" prompt
+// to every taught pose in the program. Two source families feed the
+// list (see collectPositionSources): taught position-type steps and
+// named entries in program.points. Linking is a SINGLE action;
+// linkStepToSource decides which ref field to set based on the
+// picked source's kind. Home's legacy "Use Step N home position"
+// button on the row still works — it routes through this same
+// linkStepToSource path.
+function PositionPickerModal({
+  step, steps, points,
+  onLink, onDeletePoint, onRenamePoint, onClose,
+}) {
+  const [renamingName, setRenamingName] = useState(null)
+  const [renameDraft, setRenameDraft]   = useState('')
+  const [query, setQuery]               = useState('')
+
+  const all = collectPositionSources(steps, points)
+  const entries = all.filter((e) => {
+    // Never offer THIS step's own position as a source — that would
+    // create a self-reference. Applies only when the picker is
+    // opened on a step-kind source.
+    if (e.kind === 'step' && step?.id != null && e.id === step.id) return false
+    if (!query) return true
+    const q = query.toLowerCase()
+    const hay = e.kind === 'step'
+      ? `${e.label || ''} ${e.action || ''} ${e.role || ''}`.toLowerCase()
+      : `${e.name} ${e.label || ''}`.toLowerCase()
+    return hay.includes(q)
+  })
+
+  // The step's CURRENT link, in whatever family it lives.
+  const currentRefId   = step?.position_ref ?? step?.linked_to_step_id ?? null
+  const currentPointNm = step?.point_name || null
+
+  function isCurrent(e) {
+    if (e.kind === 'step')  return currentRefId   === e.id
+    if (e.kind === 'point') return currentPointNm === e.name
+    return false
+  }
+  function idFor(e) { return e.kind === 'step' ? `s${e.id}` : `p${e.name}` }
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      style={{
+        position: 'fixed', inset: 0, zIndex: 4000,
+        background: 'rgba(15, 23, 42, 0.55)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 24,
+      }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#fff', color: '#111827',
+          borderRadius: 12, width: '100%', maxWidth: 620,
+          maxHeight: 'min(80vh, 720px)',
+          display: 'flex', flexDirection: 'column',
+          boxShadow: '0 30px 80px rgba(0,0,0,0.45)',
+          overflow: 'hidden',
+        }}
+      >
+        <div style={{
+          padding: '16px 20px 12px 20px',
+          borderBottom: '1px solid #E5E7EB',
+        }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#6B7280',
+                        textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+            Link to taught position
+          </div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#111827',
+                        marginTop: 4 }}>
+            Step {step?.id != null ? step.id : ''}
+            {step?.label ? <span style={{ color: '#6b7280', fontWeight: 500 }}>{' — '}{step.label}</span> : null}
+          </div>
+          <div style={{ fontSize: 13, color: '#6B7280', marginTop: 6, lineHeight: 1.4 }}>
+            Pick an existing taught position for this step. Re-teaching that
+            position later updates every step that links to it.
+          </div>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Filter by name or label…"
+            style={{
+              marginTop: 10, width: '100%', boxSizing: 'border-box',
+              padding: '8px 10px', fontSize: 13,
+              border: '1px solid #d1d5db', borderRadius: 6, outline: 'none',
+            }}
+          />
+        </div>
+
+        <div style={{
+          flex: 1, minHeight: 0, overflowY: 'auto',
+          padding: '4px 6px',
+        }}>
+          {entries.length === 0 ? (
+            <div style={{
+              padding: '28px 20px', textAlign: 'center',
+              color: '#6b7280', fontSize: 13, lineHeight: 1.5,
+            }}>
+              {all.length === 0
+                ? 'No taught positions in this program yet. Teach any step first — then every later step can link to it here.'
+                : 'No positions match this filter.'}
+            </div>
+          ) : entries.map((e) => {
+            const cur       = isCurrent(e)
+            const canDelete = e.kind === 'point' && e.refs === 0
+            const canRename = e.kind === 'point'
+            const headline  = e.kind === 'step'
+              ? (e.label || e.action || `Step ${e.id}`)
+              : e.name
+            const tagColor  = e.kind === 'step' ? '#0284c7' : '#4338ca'
+            const tagBg     = e.kind === 'step' ? '#e0f2fe' : '#eef2ff'
+            const tagBorder = e.kind === 'step' ? '#bae6fd' : '#c7d2fe'
+            return (
+              <div key={idFor(e)} style={{
+                margin: '6px 8px', padding: 12,
+                background: cur ? '#eff6ff' : '#fafafa',
+                border:     cur ? '1px solid #93c5fd' : '1px solid #e5e7eb',
+                borderRadius: 8,
+                display: 'flex', flexDirection: 'column', gap: 6,
+              }}>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+                  <span style={{
+                    fontSize: 10, fontWeight: 800,
+                    background: tagBg, color: tagColor,
+                    border: `1px solid ${tagBorder}`,
+                    borderRadius: 4, padding: '2px 6px',
+                    textTransform: 'uppercase', letterSpacing: '0.06em',
+                    flexShrink: 0,
+                  }}>{e.kind === 'step' ? `Step ${e.id}` : 'Point'}</span>
+                  {renamingName === idFor(e) ? (
+                    <input
+                      autoFocus
+                      value={renameDraft}
+                      onChange={(evt) => setRenameDraft(evt.target.value)}
+                      onKeyDown={(evt) => {
+                        if (evt.key === 'Enter') {
+                          const nn = renameDraft.trim()
+                          if (nn && nn !== e.name) onRenamePoint(e.name, nn)
+                          setRenamingName(null)
+                        } else if (evt.key === 'Escape') {
+                          setRenamingName(null)
+                        }
+                      }}
+                      onBlur={() => setRenamingName(null)}
+                      style={{
+                        fontSize: 15, fontWeight: 700,
+                        padding: '2px 8px', minWidth: 140,
+                        border: '1px solid #2563EB', borderRadius: 4,
+                        outline: 'none',
+                      }}
+                    />
+                  ) : (
+                    <span style={{
+                      fontSize: 15, fontWeight: 700, color: '#111827',
+                      fontFamily: e.kind === 'point' ? 'var(--font-mono, monospace)' : undefined,
+                    }}>{headline}</span>
+                  )}
+                  {e.kind === 'point' && e.label && renamingName !== idFor(e) && (
+                    <span style={{ fontSize: 12, color: '#6b7280' }}>
+                      &ldquo;{e.label}&rdquo;
+                    </span>
+                  )}
+                  {e.kind === 'step' && e.role && (
+                    <span style={{ fontSize: 11, color: '#6b7280',
+                                   textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                      {e.role}
+                    </span>
+                  )}
+                  <span style={{
+                    marginLeft: 'auto',
+                    fontSize: 11, fontWeight: 600, color: '#4338ca',
+                    background: '#eef2ff', border: '1px solid #c7d2fe',
+                    borderRadius: 10, padding: '2px 8px',
+                  }}>
+                    {e.refs === 0 ? (e.kind === 'point' ? 'unused' : 'only this one')
+                     : e.refs === 1 ? '1 step'
+                     :                `${e.refs} steps`}
+                  </span>
+                  {e.taught_at && (
+                    <span style={{ fontSize: 11, color: '#9ca3af' }}>
+                      taught {formatTaughtAgo(e.taught_at)}
+                    </span>
+                  )}
+                </div>
+                <div style={{
+                  fontSize: 11, color: '#374151',
+                  fontFamily: 'var(--font-mono, monospace)',
+                  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                }}>
+                  {pointJointsLine(e.joints) || <span style={{ color: '#9ca3af' }}>no joint data</span>}
+                </div>
+                <div style={{ display: 'flex', gap: 8, marginTop: 2 }}>
+                  <button
+                    onClick={() => { if (!cur) onLink(e) }}
+                    disabled={cur}
+                    style={{
+                      padding: '6px 12px', fontSize: 12, fontWeight: 700,
+                      background: cur ? '#dbeafe' : '#2563EB',
+                      color:      cur ? '#1e3a8a' : '#fff',
+                      border: 'none', borderRadius: 5,
+                      cursor: cur ? 'default' : 'pointer',
+                    }}
+                  >
+                    {cur ? '✓ Currently linked' : 'Link this step'}
+                  </button>
+                  {canRename && (
+                    <button
+                      onClick={() => { setRenamingName(idFor(e)); setRenameDraft(e.name) }}
+                      style={{
+                        padding: '6px 12px', fontSize: 12, fontWeight: 600,
+                        background: '#f3f4f6', color: '#374151',
+                        border: '1px solid #e5e7eb', borderRadius: 5, cursor: 'pointer',
+                      }}
+                    >Rename</button>
+                  )}
+                  {e.kind === 'point' && (
+                    <button
+                      onClick={() => { if (canDelete) onDeletePoint(e.name) }}
+                      disabled={!canDelete}
+                      title={canDelete ? 'Remove this taught position' : `${e.refs} step(s) still link to this position — unlink them first`}
+                      style={{
+                        padding: '6px 12px', fontSize: 12, fontWeight: 600,
+                        background: canDelete ? '#fef2f2' : '#f9fafb',
+                        color:      canDelete ? '#DC2626' : '#9ca3af',
+                        border:     canDelete ? '1px solid #fecaca' : '1px solid #e5e7eb',
+                        borderRadius: 5, cursor: canDelete ? 'pointer' : 'not-allowed',
+                      }}
+                    >Delete</button>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+
+        <div style={{
+          padding: '10px 20px 14px 20px',
+          borderTop: '1px solid #E5E7EB',
+          display: 'flex', justifyContent: 'flex-end', gap: 10,
+        }}>
+          <button
+            onClick={onClose}
+            style={{
+              minHeight: 40, padding: '0 16px',
+              background: 'transparent', color: '#6B7280',
+              border: '1px solid #E5E7EB', borderRadius: 8,
+              fontSize: 14, fontWeight: 600, cursor: 'pointer',
+            }}
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function InsertionBar() {
   return (
     <div
@@ -2642,6 +3011,16 @@ export default function ProgramEditor() {
   // adds a step whose position could reuse an already-taught source.
   // Shape: {action, sourceStep, insertIdx} — insertIdx null = append.
   const [pendingReuse, setPendingReuse]       = useState(null)
+  // Position picker state — set to a step id when the operator clicks
+  // the chain icon on a row. The picker reads `currentProgram.points`
+  // and mutates the step's `point_name` on selection.
+  const [pickerStepId, setPickerStepId]       = useState(null)
+  const deletePoint                           = useStore((s) => s.deletePoint)
+  const renamePoint                           = useStore((s) => s.renamePoint)
+  // Bug 1 fix wiring — banner state + refresh-on-command.
+  const programChangedByOther                 = useStore((s) => s.programChangedByOther)
+  const clearProgramChangedByOther            = useStore((s) => s.clearProgramChangedByOther)
+  const refreshCurrentProgram                 = useStore((s) => s._refreshCurrentProgram)
   const addToast                              = useStore((s) => s.addToast)
   const [savedPrograms, setSavedPrograms] = useState([])
 
@@ -2872,6 +3251,86 @@ export default function ProgramEditor() {
     updateSteps(renumber(steps.map((s) => s.id === id ? { ...s, ...patch } : s)))
   }
 
+  // Unified link handler — accepts a source descriptor from the
+  // position picker (kind: 'step' | 'point'). One code path for both
+  // families: step sources write `position_ref` (matching ea64950 and
+  // the row's home-mirror behavior), point sources write `point_name`.
+  // The OTHER ref field is always cleared so the two resolvers can't
+  // collide. When we're linking to a step, we mirror its pose fields
+  // onto the linking step too — some downstream consumers (older
+  // codegen paths, monitor cards) inspect step-local taught_joints
+  // directly and would otherwise show the row as stale. Mirrors what
+  // linkHomeToFirst already does for the home flow.
+  function linkStepToSource(stepId, src) {
+    if (!src) return
+    const srcStep = src.kind === 'step'
+      ? (steps.find((s) => s.id === src.id) || null)
+      : null
+    updateSteps(renumber(steps.map((s) => {
+      if (s.id !== stepId) return s
+      const next = { ...s, taught: true }
+      if (src.kind === 'step') {
+        next.position_ref     = src.id
+        next.linked_to_step_id = src.id
+        if ('point_name' in next) delete next.point_name
+        if (srcStep) {
+          if (srcStep.taught_joints) next.taught_joints = [...srcStep.taught_joints]
+          if (srcStep.taught_tcp)    next.taught_tcp    = [...srcStep.taught_tcp]
+          if (srcStep.taught_at)     next.taught_at     = srcStep.taught_at
+          if (srcStep.joints)        next.joints        = [...srcStep.joints]
+          if (srcStep.taught_tcp)    next.position      = srcStep.taught_tcp.slice(0, 3)
+        }
+      } else {
+        next.point_name = src.name
+        if ('position_ref'     in next) delete next.position_ref
+        if ('linked_to_step_id' in next) delete next.linked_to_step_id
+      }
+      return next
+    })))
+    setPickerStepId(null)
+    const target = src.kind === 'step' ? `Step ${src.id}` : `point ${src.name}`
+    addToast(`Step ${stepId} → ${target}`, 'success')
+  }
+
+  // Detach a step from whichever kind of link it currently holds. If
+  // it carries local taught_joints (mirrored from a step source, or
+  // set inline by Teach), `taught` stays true; otherwise it becomes
+  // untaught and the Teach button lights up.
+  function unlinkStepFromSource(stepId) {
+    updateSteps(renumber(steps.map((s) => {
+      if (s.id !== stepId) return s
+      const next = { ...s }
+      let hadLink = false
+      if ('point_name'        in next) { delete next.point_name;        hadLink = true }
+      if ('position_ref'      in next) { delete next.position_ref;      hadLink = true }
+      if ('linked_to_step_id' in next) { delete next.linked_to_step_id; hadLink = true }
+      if (!hadLink) return s
+      const has6 = Array.isArray(next.taught_joints) && next.taught_joints.length >= 6
+      next.taught = !!has6
+      return next
+    })))
+    addToast(
+      'Position link removed. This step now uses its own pose — re-teach if needed.',
+      'info')
+  }
+
+  async function handleDeletePointFromPicker(name) {
+    const ok = await deletePoint(name)
+    if (ok) addToast(`Deleted position ${name}`, 'success')
+  }
+
+  async function handleRenamePointFromPicker(oldName, newName) {
+    const p = await renamePoint(oldName, newName)
+    if (!p) return
+    // Server updates step.point_name references atomically (see
+    // dashboard_server PUT /points/{name}), but the editor's in-memory
+    // steps still carry the old name until refresh — mirror the rename
+    // locally so the row's chip flips without waiting for a round-trip.
+    updateSteps(renumber(steps.map((s) =>
+      s.point_name === oldName ? { ...s, point_name: newName } : s)))
+    addToast(`Renamed ${oldName} → ${newName}`, 'success')
+  }
+
   // Pull the live robot pose from /api/state and turn it into the
   // taught-position patch the step model expects.
   async function buildTaughtPatch() {
@@ -3056,7 +3515,8 @@ export default function ProgramEditor() {
       const res = await fetch(
         programId ? `/api/programs/${encodeURIComponent(programId)}` : '/api/programs',
         { method: programId ? 'PUT' : 'POST',
-          headers: { 'Content-Type': 'application/json' }, body },
+          headers: { 'Content-Type': 'application/json', 'X-Client-Id': CLIENT_ID },
+          body },
       )
       const data = await res.json().catch(() => ({}))
       if (res.ok && data && data.ok && data.program) {
@@ -3075,7 +3535,8 @@ export default function ProgramEditor() {
         // current name.
         const retry = await fetch('/api/programs', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' }, body,
+          headers: { 'Content-Type': 'application/json', 'X-Client-Id': CLIENT_ID },
+          body,
         })
         const rdata = await retry.json().catch(() => ({}))
         if (retry.ok && rdata.ok && rdata.program) {
@@ -3391,6 +3852,40 @@ export default function ProgramEditor() {
         </span>
       </div>
 
+      {/* Bug 1 banner — the currently-open program was mutated on
+          another device while THIS client has unsaved local edits.
+          The store's _handleProgramEvents sets programChangedByOther
+          only in the conflict case; in the no-unsaved-edits case the
+          store refetches quietly and this banner never appears. */}
+      {programChangedByOther && (
+        <div style={{
+          margin: '8px 12px 0', padding: '10px 14px', fontSize: 13,
+          background: '#fffbeb', color: '#92400e',
+          border: '1px solid #fde68a', borderRadius: 6,
+          display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0,
+        }}>
+          <span style={{ fontWeight: 700 }}>⚠ Program updated on another device</span>
+          <span style={{ color: '#78716c', fontSize: 12 }}>
+            You have unsaved edits. Reload will lose them; Keep my edits
+            leaves your work in place — the next Save will overwrite the
+            other change.
+          </span>
+          <div style={{ flex: 1 }} />
+          <button onClick={() => { refreshCurrentProgram(); }}
+            style={{
+              padding: '6px 14px', fontSize: 12, fontWeight: 700,
+              background: '#f59e0b', color: '#fff',
+              border: 'none', borderRadius: 5, cursor: 'pointer',
+            }}>Reload</button>
+          <button onClick={() => clearProgramChangedByOther()}
+            style={{
+              padding: '6px 14px', fontSize: 12, fontWeight: 600,
+              background: '#fff', color: '#92400e',
+              border: '1px solid #fde68a', borderRadius: 5, cursor: 'pointer',
+            }}>Keep my edits</button>
+        </div>
+      )}
+
       {/* Untaught-positions banner — visible whenever any move step
           still needs to be taught. Disappears once everything's set. */}
       {untaughtCount > 0 && teachAllPos < 0 && teachSingleId == null && (
@@ -3532,8 +4027,38 @@ export default function ProgramEditor() {
                     is the same on teachable and non-teachable rows.
                     position_ref rows render a link chip pointing at the
                     source step so the operator can see the shared pose
-                    at a glance. */}
-                {step.position_ref != null ? (
+                    at a glance. `point_name` linkage (the named-points
+                    path — the direction we're generalizing toward) gets
+                    its own chip variant with the point name and the
+                    total number of steps sharing it. */}
+                {step.point_name ? (() => {
+                  const refCount = countStepsUsingPoint(steps, step.point_name)
+                  return (
+                    <div
+                      title={`Uses taught position ${step.point_name}${refCount > 1 ? ` — ${refCount} steps share it` : ''}. Re-teaching the point updates every linked step.`}
+                      onClick={(e) => { e.stopPropagation(); if (!locked) setPickerStepId(step.id) }}
+                      style={{
+                        minWidth: 26, height: 26, borderRadius: 13,
+                        padding: '0 10px',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        gap: 4, flexShrink: 0,
+                        background: '#eef2ff', border: '1px solid #c7d2fe',
+                        color: '#4338ca', fontSize: 11, fontWeight: 700,
+                        cursor: locked ? 'default' : 'pointer',
+                      }}
+                    >
+                      <span style={{ fontSize: 13, lineHeight: 1 }}>🔗</span>
+                      <span style={{ fontFamily: 'var(--font-mono, monospace)' }}>{step.point_name}</span>
+                      {refCount > 1 && (
+                        <span style={{
+                          fontSize: 10, fontWeight: 800,
+                          background: '#4338ca', color: '#fff',
+                          borderRadius: 8, padding: '1px 6px',
+                        }}>×{refCount}</span>
+                      )}
+                    </div>
+                  )
+                })() : step.position_ref != null ? (
                   <div
                     title={`Uses the same position as Step ${step.position_ref}`}
                     style={{
@@ -3723,6 +4248,63 @@ export default function ProgramEditor() {
                     {step.taught ? 'Re-teach' : 'Teach'}
                   </button>
                 )}
+                {/* Position-picker gate. Every teachable step that
+                    isn't already linked can open the picker. Enabled
+                    condition: at least ONE taught position source
+                    exists in the program (either another teachable
+                    step with taught_joints, OR a named point in
+                    program.points). This is the Bug 2 fix — the
+                    previous version gated only on program.points,
+                    which stays empty in the normal editor-teach flow,
+                    so the button was dead on every non-home row. */}
+                {/* The home-specific buttons below still cover later
+                    move_home rows exactly as they did pre-Bug-2 — the
+                    unified Link/Unlink here hides on those rows so an
+                    operator with muscle memory sees the same UI.
+                    Gate on TEACHABLE_ACTIONS membership rather than
+                    isTeachable(step) — the latter returns false when
+                    position_ref is set, which would hide our own
+                    Unlink button on ea64950-linked rows. */}
+                {(() => {
+                  if (locked || isLaterHome) return null
+                  const isPosStep = TEACHABLE_ACTIONS.includes(step.action)
+                                 || (step.type && ACTION_TYPES.find((a) => a.type === step.type
+                                                                    && TEACHABLE_ACTIONS.includes(a.value)))
+                  if (!isPosStep) return null
+                  if (isDerivedOffsetMove(step)) return null
+                  const linked = step.point_name || step.position_ref != null
+                  if (linked) {
+                    return (
+                      <button onClick={(e) => { e.stopPropagation(); unlinkStepFromSource(step.id) }}
+                        title="Detach this step from its linked position. Keeps any mirrored pose data locally."
+                        style={{
+                          padding: '6px 14px', fontSize: 12, fontWeight: 600, flexShrink: 0,
+                          background: '#f5f3ff', color: '#6d28d9',
+                          border: '1px solid #ddd6fe', borderRadius: 5, cursor: 'pointer',
+                        }}>
+                        ⛓ Unlink
+                      </button>
+                    )
+                  }
+                  const hasAnySource = collectPositionSources(steps, currentProgram?.points)
+                    .some((e) => e.kind !== 'step' || e.id !== step.id)
+                  return (
+                    <button onClick={(e) => { e.stopPropagation(); setPickerStepId(step.id) }}
+                      title={hasAnySource
+                        ? 'Link this step to a previously taught position. Re-teaching the source updates every linked step.'
+                        : 'No other taught positions in this program yet — teach one first.'}
+                      disabled={!hasAnySource}
+                      style={{
+                        padding: '6px 14px', fontSize: 12, fontWeight: 600, flexShrink: 0,
+                        background: '#eef2ff', color: '#4338ca',
+                        border: '1px solid #c7d2fe', borderRadius: 5,
+                        cursor: hasAnySource ? 'pointer' : 'not-allowed',
+                        opacity: hasAnySource ? 1 : 0.5,
+                      }}>
+                      🔗 Link
+                    </button>
+                  )
+                })()}
                 {/* "Use Step N home position" — appears on any move_home
                     step past the first. Clicking it mirrors the first
                     move_home's taught pose and records a live link so
@@ -3832,6 +4414,22 @@ export default function ProgramEditor() {
           onCancel={() => setPendingReuse(null)}
         />
       )}
+
+      {pickerStepId != null && (() => {
+        const pickerStep = steps.find((s) => s.id === pickerStepId) || null
+        if (!pickerStep) return null
+        return (
+          <PositionPickerModal
+            step={pickerStep}
+            steps={steps}
+            points={currentProgram?.points || {}}
+            onLink={(src) => linkStepToSource(pickerStep.id, src)}
+            onDeletePoint={handleDeletePointFromPicker}
+            onRenamePoint={handleRenamePointFromPicker}
+            onClose={() => setPickerStepId(null)}
+          />
+        )
+      })()}
 
       {contextMenu && (
         <StepContextMenu
