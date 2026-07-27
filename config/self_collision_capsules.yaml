@@ -3,6 +3,17 @@
 # capsule = segment from p0 to p1 + radius; distances measured
 # in the base frame after per-tick FK.  Padding: 12.0 mm above raw fit.
 
+# Runtime evaluator selection.
+#   'mesh'    — every self-pair gets true point-sampled mesh-vs-mesh
+#               distance every worker sweep (~60 ms / sweep at 5 Hz,
+#               well inside the 200 ms cadence). Capsules below stay
+#               loaded as the cold-boot fallback (populated as the
+#               worker's first sweep completes) and the ground-plane
+#               query is still capsule-based (ground has no mesh).
+#   'capsule' — legacy fat-cylinder path; retained for one release as
+#               a switchable fallback per §5 of the mesh-guard task.
+geometry_source: mesh
+
 capsules:
   base_link:
     p0: [-99.24, 35.5, 0.0]

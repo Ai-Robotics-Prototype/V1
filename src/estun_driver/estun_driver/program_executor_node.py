@@ -959,30 +959,88 @@ class ProgramExecutor(Node):
     def _resolve_base_tcp(self, step):
         """Find the base TCP for a derived offset move.
 
-        Walks backward through self._steps from the current step looking
-        for the source pose:
-          - If `step.derived_from` is set (e.g. 'pick'), find the most
-            recent prior step with `position_role` matching that role
-            and read its taught_tcp.
-          - Otherwise (legacy programs without the tag) take the most
-            recent prior step that carries any taught_tcp / position.
+        Multi-pair bug fix (2026-07-27). The pre-fix version walked
+        backward only, which misgrouped derived steps: pair-1 approach-
+        above-place (which is BEFORE its own place) never found any
+        preceding place and skipped; pair-2 approach-above-place found
+        pair-1's place (the last preceding one) and targeted the wrong
+        pose. Both symptoms matched the CODEGEN last-writer-wins bug
+        that made this multi-pair issue observable.
 
-        Returns (tcp_list_in_meters, source_label) — tcp_list is a list
-        of length 3 or 6 (meters / radians), or (None, label) if no
-        suitable source is found. `source_label` is the human-readable
-        role for warning messages.
+        Resolution order — mirrors program_ops._resolve_anchor_step so
+        codegen and runtime executor never disagree:
+          1. Explicit `derived_from_step_id` on the derived step —
+             unambiguous. Forward-compat with a later composer/wizard
+             fix that stamps step ids at emit time.
+          2. Nearest step (by absolute index distance) whose
+             `position_role` matches `derived_from` AND that carries
+             taught_tcp / position. Ties on either side go to the
+             preceding step (already taught by then).
+          3. Legacy (no derived_from) → nearest preceding taught step
+             (pre-fix behavior, retained).
+
+        Returns (tcp_list_in_meters, source_label) — tcp_list is a
+        list of length 3 or 6 (meters / radians), or (None, label) if
+        no suitable source is found.
         """
         derived_from = step.get('derived_from')
-        # Walk backward from immediately before the current step.
-        for i in range(self._current_step_idx - 1, -1, -1):
-            src = self._steps[i]
-            if derived_from is not None:
+        idx          = self._current_step_idx
+        # 1) Explicit unique-id link.
+        explicit_id = step.get('derived_from_step_id')
+        if explicit_id is not None:
+            for src in self._steps:
+                if isinstance(src, dict) and src.get('id') == explicit_id:
+                    tcp = src.get('taught_tcp') or src.get('position')
+                    if tcp and len(tcp) >= 3:
+                        return list(tcp), (derived_from
+                                           or src.get('position_role')
+                                           or src.get('label')
+                                           or 'linked step')
+            return None, (derived_from or 'linked step')
+        # 2) Role-string with nearest-by-distance scoping.
+        if derived_from is not None:
+            best = None
+            best_dist = None
+            best_precedes = False
+            for j, src in enumerate(self._steps):
+                if j == idx:
+                    continue
+                if not isinstance(src, dict):
+                    continue
                 if src.get('position_role') != derived_from:
                     continue
+                tcp = src.get('taught_tcp') or src.get('position')
+                if not tcp or len(tcp) < 3:
+                    continue
+                dist = abs(j - idx)
+                precedes = j < idx
+                take = False
+                if best is None:
+                    take = True
+                elif dist < best_dist:
+                    take = True
+                elif dist == best_dist and precedes and not best_precedes:
+                    take = True
+                if take:
+                    best = (tcp, src)
+                    best_dist = dist
+                    best_precedes = precedes
+            if best is not None:
+                tcp, src = best
+                return list(tcp), (derived_from
+                                   or src.get('position_role')
+                                   or src.get('label')
+                                   or 'previous taught position')
+            return None, derived_from
+        # 3) Legacy: no derived_from → nearest preceding taught.
+        for i in range(idx - 1, -1, -1):
+            src = self._steps[i]
             tcp = src.get('taught_tcp') or src.get('position')
             if tcp and len(tcp) >= 3:
-                return list(tcp), (derived_from or src.get('position_role') or src.get('label') or 'previous taught position')
-        return None, (derived_from or 'previous taught position')
+                return list(tcp), (src.get('position_role')
+                                   or src.get('label')
+                                   or 'previous taught position')
+        return None, 'previous taught position'
 
     def _advance_step(self):
         """Move to the next step."""

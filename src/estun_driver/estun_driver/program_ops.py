@@ -245,8 +245,12 @@ def _make_jp_point(joints: list[float], nm: str,
 # in the base frame (base_tcp is meters → convert to mm for Estun cp).
 def _build_role_map(steps: list[dict]) -> dict[str, dict]:
     """{role → {taught_joints, taught_tcp}} for steps that both carry a
-    position_role AND real taught data. Later derived children look
-    themselves up here by their `derived_from` string."""
+    position_role AND real taught data. Historically the derived-step
+    resolver keyed off this map directly (last-writer-wins) — that's
+    the multi-pair bug fixed 2026-07-27 where pair-1's approach/retreat
+    steps resolved to pair-2's contact. Kept for backward compat with
+    any external caller; the codegen path now uses
+    `_resolve_anchor_step` instead, which is index-aware."""
     out: dict[str, dict] = {}
     for s in steps:
         role = s.get('position_role')
@@ -262,12 +266,86 @@ def _build_role_map(steps: list[dict]) -> dict[str, dict]:
                 and all(isinstance(v, (int, float)) for v in tc):
             entry['taught_tcp'] = [float(v) for v in tc]
         if entry:
-            # Last writer wins if the same role is taught twice —
-            # matches the executor's "walk backward, take first
-            # match" semantics for the LATEST step at codegen time
-            # (there's no runtime step-index here to bound the walk).
             out[role] = entry
     return out
+
+
+def _resolve_anchor_step(steps: list[dict], derived_step_idx: int
+                         ) -> dict | None:
+    """Return the taught anchor step for `steps[derived_step_idx]`.
+
+    Resolution order:
+      1. Explicit `derived_from_step_id` on the derived step — an
+         unambiguous unique-id reference (composer + wizard start
+         emitting this in the follow-up; already honored today for
+         forward compat).
+      2. Nearest step (by absolute index distance) whose
+         `position_role` matches `derived_from` AND that carries
+         real taught data. Ties (equidistant anchors on either side)
+         resolve toward the PRECEDING step — it's already been taught
+         and executed at the point the derived step runs, so seeded
+         IK / movJ-reuse has real joints in hand.
+      3. None if nothing plausible exists — the caller emits a
+         validation error, never a silent fallback (silent fallback
+         is exactly how multi-pair programs kept the pre-fix bug
+         invisible in single-pair programs).
+
+    The distance heuristic reliably groups derived steps with their
+    OWN pair in a flat multi-pair sequence: approach-before-anchor
+    finds the anchor that follows (distance 1); retreat-after-anchor
+    finds the anchor that preceded (distance 1); the OTHER pair's
+    same-role anchor sits further away and loses.
+    """
+    if derived_step_idx < 0 or derived_step_idx >= len(steps):
+        return None
+    dstep = steps[derived_step_idx]
+    if not isinstance(dstep, dict):
+        return None
+    # 1) Explicit unique-id link.
+    explicit_id = dstep.get('derived_from_step_id')
+    if explicit_id is not None:
+        for s in steps:
+            if isinstance(s, dict) and s.get('id') == explicit_id:
+                return s
+        return None
+    role = dstep.get('derived_from')
+    if not role:
+        return None
+    best = None
+    best_dist = None
+    best_precedes = False   # True when the current best has j < derived
+    for j, s in enumerate(steps):
+        if j == derived_step_idx:
+            continue
+        if not isinstance(s, dict):
+            continue
+        if s.get('position_role') != role:
+            continue
+        tj = s.get('taught_joints')
+        tc = s.get('taught_tcp') or s.get('position')
+        has_data = ((isinstance(tj, list) and len(tj) == 6
+                     and all(isinstance(v, (int, float)) for v in tj))
+                    or (isinstance(tc, list) and len(tc) >= 3
+                        and all(isinstance(v, (int, float)) for v in tc)))
+        if not has_data:
+            continue
+        dist = abs(j - derived_step_idx)
+        precedes = j < derived_step_idx
+        # Replacement rules: strictly closer wins; equal-distance
+        # tie goes to the preceding step (it's already been taught by
+        # then and can serve seeded-IK without waiting).
+        take = False
+        if best is None:
+            take = True
+        elif dist < best_dist:
+            take = True
+        elif dist == best_dist and precedes and not best_precedes:
+            take = True
+        if take:
+            best = s
+            best_dist = dist
+            best_precedes = precedes
+    return best
 
 
 def _resolve_derived(step: dict, role_map: dict[str, dict]
@@ -467,10 +545,16 @@ def codegen_lua_from_program(
     fallback_idx = 0
     di_read_idx  = 0   # counts wait_input steps → _di1, _di2, ... locals
     used_named: set[str] = set()   # named points that got REFERENCED
-    # Points saved by role for reuse — a derived step with offset_z_mm=0
-    # points at the anchor's already-registered varspoint entry rather
-    # than duplicating the joints under a fresh name.
-    role_point_name: dict[str, str] = {}
+    # Points saved BY STEP ID for reuse — a derived step with
+    # offset_z_mm≈0 emits movJ pointing at its anchor's already-
+    # registered varspoint. Keyed on the ANCHOR STEP'S UNIQUE id (not
+    # role) so multi-pair programs pick the right pair's varspoint;
+    # the pre-fix version used {role → point_name} which collapsed
+    # both pick-place pairs onto whichever landed first. Fallback
+    # role→name kept as a legacy key for programs whose taught steps
+    # have no id at all.
+    step_point_name: dict[int, str] = {}
+    role_point_name: dict[str, str] = {}   # legacy fallback
     # Zero-length-movL guard (Part C, 2026-07-22). The controller's
     # blend planner crashed on real hardware when asked to execute a
     # movL whose target equals the CURRENT pose (0 mm Cartesian
@@ -721,13 +805,35 @@ def codegen_lua_from_program(
                 and len(step.get('taught_joints')) == 6):
             role = step.get('derived_from')
             ofs_mm = float(step.get('offset_z_mm') or 0)
+            # Multi-pair bug fix (2026-07-27). Resolve to the NEAREST
+            # matching-role taught step by index distance — pair-local
+            # scoping — instead of the previous last-writer-wins
+            # role_map lookup that made pair-1 derived steps target
+            # pair-2 anchors. `anchor` is the resolved step dict here
+            # (or {} if nothing plausible); `anchor_id` keys the
+            # per-step varspoint reuse map, so FIX A picks the RIGHT
+            # pair's anchor point in multi-pair programs.
+            anchor = _resolve_anchor_step(steps, _step_idx) or {}
+            anchor_id = anchor.get('id') if isinstance(anchor, dict) else None
             # FIX A: offset ≈ 0 collapses to a movJ back to the anchor.
             # Prefer this branch whenever the anchor was already saved
             # as a jp point AND the offset is under 1 mm — the anchor's
             # taught_joints are authoritative, no IK involved.
-            if abs(ofs_mm) < 1.0 and role in role_point_name:
-                ref = role_point_name[role]
-                anchor = role_map.get(role, {})
+            reuse_ref = None
+            if anchor_id is not None and anchor_id in step_point_name:
+                reuse_ref = step_point_name[anchor_id]
+            elif role in role_point_name:
+                # Legacy fallback for programs whose taught steps
+                # never got id fields (older PBD outputs). Only
+                # trusted when there's a SINGLE matching-role anchor
+                # in the whole program — otherwise we'd re-introduce
+                # the multi-pair collapse.
+                matches = [s for s in steps
+                           if isinstance(s, dict) and s.get('position_role') == role]
+                if len(matches) == 1:
+                    reuse_ref = role_point_name[role]
+            if abs(ofs_mm) < 1.0 and reuse_ref is not None:
+                ref = reuse_ref
                 tj = anchor.get('taught_joints') or []
                 joints_s = ', '.join(f'{float(v):+.3f}' for v in tj) if tj else ''
                 j5_note = (f'J5={float(tj[4]):+.2f}°' if len(tj) >= 5 else 'J5=?')
@@ -751,7 +857,8 @@ def codegen_lua_from_program(
             # movJCoorRel only when the IK can't converge (rare —
             # non-vertical tool at the anchor, or Δz outside J1/J2/J3
             # manifold).
-            anchor = role_map.get(role, {})
+            # `anchor` is already the nearest-by-distance anchor for
+            # this derived step (resolved above in the FIX A branch).
             tj = anchor.get('taught_joints') or []
             if len(tj) == 6 and all(isinstance(v, (int, float)) for v in tj):
                 anchor_deg = [float(v) for v in tj]
@@ -817,6 +924,11 @@ def codegen_lua_from_program(
             role = step.get('position_role')
             if role and role not in role_point_name:
                 role_point_name[role] = pn
+            # Per-step id → varspoint name (bug fix 2026-07-27; picks
+            # the right pair in multi-pair programs).
+            sid = step.get('id')
+            if sid is not None:
+                step_point_name.setdefault(sid, pn)
             joints_s = ', '.join(f'{float(v):+.3f}' for v in j)
             j5_note = f'J5={float(j[4]):+.2f}°'
             exec_lines.append(f'{verb}({pn})  -- step {action}  point={pn}  '
@@ -848,6 +960,10 @@ def codegen_lua_from_program(
         role = step.get('position_role')
         if role and role not in role_point_name:
             role_point_name[role] = name
+        # Per-step id → varspoint name (multi-pair fix).
+        sid = step.get('id')
+        if sid is not None:
+            step_point_name.setdefault(sid, name)
         joints_s = ', '.join(f'{float(v):+.3f}' for v in taught)
         j5_note = f'J5={float(taught[4]):+.2f}°'
         exec_lines.append(f'{verb}({name})  -- step {action}  '

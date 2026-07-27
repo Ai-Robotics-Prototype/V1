@@ -166,6 +166,7 @@ def load_capsules_yaml(path):
             radius: ...
 
     Additional top-level sections (optional):
+      geometry_source: mesh          # 'mesh' (default) | 'capsule'
       mesh_pairs:
         - [link_a, link_b]      # use mesh-mesh distance instead of capsule
       pair_thresholds:
@@ -173,16 +174,22 @@ def load_capsules_yaml(path):
           warn: 60.0
           stop: 30.0
 
-    Returns (capsules, pairs, mesh_pairs, pair_thresholds). Every link
-    in `capsules` maps to a LIST of Capsule so downstream code iterates
-    uniformly. `pair_thresholds` is a list of dicts with keys
+    Returns (capsules, pairs, mesh_pairs, pair_thresholds, geometry_source).
+    Every link in `capsules` maps to a LIST of Capsule so downstream code
+    iterates uniformly. `pair_thresholds` is a list of dicts with keys
     'pair' (frozenset), 'warn', 'stop' — consumed by the driver to
     override the global warn/stop for a specific pair (e.g. link3↔link5
-    which has a design floor of ~46 mm from link4's mechanical mass)."""
+    which has a design floor of ~46 mm from link4's mechanical mass).
+    `geometry_source` selects the runtime evaluator: 'mesh' (default)
+    refreshes every self-pair's mesh-vertex distance every worker tick
+    and evaluate() prefers it over the capsule pre-screen; 'capsule'
+    forces the legacy fat-cylinder path and is retained as the one-
+    release fallback."""
     capsules = {}
     pairs = []
     mesh_pairs = []
     pair_thresholds = []
+    geometry_source = 'mesh'
     section = None
     cur_link = None
     cur = {}           # scratch for a single-capsule link
@@ -227,6 +234,12 @@ def load_capsules_yaml(path):
                 flush(); flush_thr(); section = 'pair_thresholds'; continue
             if line.startswith('ground_plane:'):
                 flush(); flush_thr(); section = 'ground'; continue
+            if line.startswith('geometry_source:'):
+                flush(); flush_thr(); section = None
+                v = line.split(':', 1)[1].strip().strip("'\"")
+                if v in ('mesh', 'capsule'):
+                    geometry_source = v
+                continue
             if section == 'capsules':
                 indent = len(line) - len(line.lstrip(' '))
                 # `  link_name:`  (2-space indent, trailing colon) → new link
@@ -297,7 +310,7 @@ def load_capsules_yaml(path):
                         cur_thr[k] = float(v)
     flush()
     flush_thr()
-    return capsules, pairs, mesh_pairs, pair_thresholds
+    return capsules, pairs, mesh_pairs, pair_thresholds, geometry_source
 
 
 # ── Geometry: capsule-capsule distance ────────────────────────────────
@@ -450,7 +463,7 @@ class CollisionModel:
 
     def __init__(self, capsules_yaml_path):
         (self.capsules, self.pairs, self.mesh_pairs,
-         self.pair_thresholds) = load_capsules_yaml(capsules_yaml_path)
+         self.pair_thresholds, self.geometry_source) = load_capsules_yaml(capsules_yaml_path)
         # Ground plane z (mm). Set `ground_z_mm = None` to disable
         # ground checks entirely (needed until URDF Y-up vs ground
         # Z-up convention is unified). Env-obstacle pairs continue to
@@ -551,85 +564,93 @@ class CollisionModel:
             d2 = ((Wa[:, None, :] - Wb[None, :, :]) ** 2).sum(-1)
             return float(np.sqrt(d2.min()))
 
-    # Every self-pair (including anything in mesh_pairs) is eligible
-    # for mesh confirmation whenever the capsule pre-screen says close.
-    # Threshold below controls how far the capsule can be before the
-    # worker bothers with a mesh query — 200 mm keeps the worker
-    # cost bounded (only 1-3 pairs "close" at any typical pose) while
-    # still catching every phantom candidate (all seen so far under 100
-    # mm capsule distance when they fire).
-    MESH_CONFIRM_PROXIMITY_MM = 200.0
+    # Rolling p95 tracker for the mesh-refresh cycle (last N sweeps).
+    # Populated by refresh_mesh_cache; readable via mesh_refresh_stats().
+    # Kept small — enough for a 60 s window at 5 Hz worker cadence with
+    # room for the one-off "startup" outlier to age out.
+    _MESH_REFRESH_WINDOW = 400
 
     def refresh_mesh_cache(self, q_deg):
         """Recompute mesh-mesh distances at the given pose and update
         cache. Runs on a worker thread, NOT on the supervise tick.
 
-        Every pair with mesh_verts for BOTH links is eligible: forced-
-        mesh pairs (self.mesh_pairs) are always refreshed; every other
-        (self-collision) pair is refreshed only when its capsule pre-
-        screen is inside MESH_CONFIRM_PROXIMITY_MM. This preserves the
-        <5 ms hot-tick budget on the executor while eliminating the
-        fat-cylinder phantom class across all pairs — the phantom
-        signature (capsule ≤ warn but mesh ≫ warn) is always caught."""
+        geometry_source='mesh' (default): every pair with mesh_verts
+        for BOTH links is refreshed unconditionally — the capsule pre-
+        screen gate has been removed so every self-collision pair
+        returns true mesh-derived distance every worker tick (~5 ms per
+        pair × 12 self-pairs = ~60 ms per sweep, worker cadence 200 ms).
+        This replaces the "capsule pre-screen inside 200 mm then mesh-
+        confirm" hybrid; the runtime cost trade-off is that far-apart
+        pairs pay the mesh query cost every sweep, which the 30% duty
+        cycle absorbs on the Jetson.
+
+        geometry_source='capsule': early-return; evaluate() then falls
+        through to the legacy capsule reading. Retained one release as
+        a fallback."""
+        if self.geometry_source == 'capsule':
+            return
         now = time.time()
-        # 1) Unconditional mesh pairs (design-floor pairs like l3↔l5).
+        t0 = time.perf_counter()
+        # Unconditional mesh refresh: forced (mesh-only, e.g. link3↔l5)
+        # plus every self-pair whose links both have mesh vertex clouds.
         forced = {frozenset(p): p for p in self.mesh_pairs}
-        for key, pair in forced.items():
-            d = self._mesh_pair_dist(q_deg, pair)
-            if d is None:
-                continue
-            with self._mesh_cache_lock:
-                self._mesh_cache[key] = {
-                    'dist_mm': d, 'ts': now,
-                    'a': pair[0], 'b': pair[1],
-                }
-        # 2) Every OTHER pair: mesh-confirm only when the capsule pre-
-        #    screen says close. FK is already inside _mesh_pair_dist,
-        #    so we do one lightweight capsule call here first.
-        frames = fk_frames(q_deg)
-        world = {}
-        for link, caps in self.capsules.items():
-            idx = LINK_NAMES.index(link)
-            T = frames[idx]
-            world[link] = [
-                (_transform_point(T, c.p0_local),
-                 _transform_point(T, c.p1_local),
-                 c.radius)
-                for c in caps
-            ]
+        # Aggregate every candidate pair, de-duplicated. Ground pairs
+        # skipped — ground has no mesh.
+        candidates = dict(forced)  # frozenset → (a, b)
         for a, b in self.pairs:
             if a == '__ground__' or b == '__ground__':
-                continue  # ground has no mesh
-            key = frozenset({a, b})
-            if key in forced:
                 continue
             if a not in self._mesh_verts or b not in self._mesh_verts:
                 continue
-            if a not in world or b not in world:
+            key = frozenset({a, b})
+            candidates.setdefault(key, (a, b))
+        # Hoist FK + world-frame vert transforms out of the per-pair loop.
+        # In the pre-batch version _mesh_pair_dist did the FK + rotate +
+        # translate for BOTH links on every call, so a 13-pair sweep did
+        # 26 world-vert transforms and 13 FKs. Batching drops that to 1
+        # FK + N transforms + a per-link KDTree that's built once and
+        # reused across every pair that link participates in.
+        frames = fk_frames(q_deg)
+        used_links = {L for pair in candidates.values() for L in pair}
+        world_verts = {}
+        for L in used_links:
+            V = self._mesh_verts.get(L)
+            if V is None:
                 continue
-            # Cheap capsule pre-screen.
-            best = float('inf')
-            for a_p0, a_p1, r_a in world[a]:
-                for b_p0, b_p1, r_b in world[b]:
-                    d, _ = _capsule_capsule_dist(a_p0, a_p1, r_a,
-                                                 b_p0, b_p1, r_b)
-                    if d < best: best = d
-            if best > self.MESH_CONFIRM_PROXIMITY_MM:
-                # Too far to matter; drop any stale cache entry so
-                # evaluate() falls back to the capsule reading (which
-                # is safely conservative at large distances).
-                with self._mesh_cache_lock:
-                    self._mesh_cache.pop(key, None)
+            T = frames[LINK_NAMES.index(L)]
+            world_verts[L] = (T[:3, :3] @ V.T).T + T[:3, 3]
+        try:
+            from scipy.spatial import cKDTree
+            kdt = {L: cKDTree(W) for L, W in world_verts.items()}
+        except ImportError:
+            kdt = None
+        for key, (a, b) in candidates.items():
+            Wa = world_verts.get(a); Wb = world_verts.get(b)
+            if Wa is None or Wb is None:
                 continue
-            # Close enough to be worth confirming.
-            d = self._mesh_pair_dist(q_deg, (a, b))
-            if d is None:
-                continue
+            if kdt is not None:
+                # KDTree query is asymmetric in cost — small vs. large;
+                # query the smaller set against the larger tree.
+                if len(Wa) <= len(Wb):
+                    d = float(kdt[b].query(Wa, k=1)[0].min())
+                else:
+                    d = float(kdt[a].query(Wb, k=1)[0].min())
+            else:
+                d2 = ((Wa[:, None, :] - Wb[None, :, :]) ** 2).sum(-1)
+                d = float(np.sqrt(d2.min()))
             with self._mesh_cache_lock:
                 self._mesh_cache[key] = {
                     'dist_mm': d, 'ts': now,
                     'a': a, 'b': b,
                 }
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        # Rolling window append (bounded).
+        hist = getattr(self, '_mesh_refresh_hist', None)
+        if hist is None:
+            self._mesh_refresh_hist = hist = []
+        hist.append(dt_ms)
+        if len(hist) > self._MESH_REFRESH_WINDOW:
+            del hist[:len(hist) - self._MESH_REFRESH_WINDOW]
 
     def mesh_cached_dist(self, pair, max_age_s=0.5):
         """Read helper. Returns dist_mm if the pair has a fresh entry,
@@ -653,6 +674,26 @@ class CollisionModel:
                     {'dist_mm': round(v['dist_mm'], 2),
                      'age_s':   round(now - v['ts'], 3)}
                     for v in self._mesh_cache.values()}
+
+    def mesh_refresh_stats(self):
+        """Rolling p50/p95/p99/max of refresh_mesh_cache cycle time (ms)
+        over the last ~400 sweeps. Empty dict until the worker has run
+        at least once. Used by the driver to log the p95 budget check
+        after a geometry-source switch."""
+        hist = getattr(self, '_mesh_refresh_hist', None)
+        if not hist:
+            return {}
+        s = sorted(hist)
+        n = len(s)
+        def _pct(p):
+            return s[min(n - 1, max(0, int(p * n)))]
+        return {
+            'n':      n,
+            'p50_ms': round(_pct(0.50), 2),
+            'p95_ms': round(_pct(0.95), 2),
+            'p99_ms': round(_pct(0.99), 2),
+            'max_ms': round(s[-1], 2),
+        }
 
     def thresholds_for(self, pair, default_warn_mm, default_stop_mm):
         """Return (warn_mm, stop_mm) for a specific (a, b) pair, honoring
@@ -712,9 +753,11 @@ class CollisionModel:
         #     safely conservative — the worst case is a phantom
         #     warn/stop that the operator clears manually, never a
         #     missed real collision.
-        #   - The worker refreshes mesh cache for any pair whose
-        #     capsule pre-screen is within MESH_CONFIRM_PROXIMITY_MM
-        #     (200 mm) so far-away pairs never pay the mesh cost.
+        #   - The worker refreshes mesh cache for every self-pair with
+        #     meshes every sweep (5 Hz), so `fresh_mesh` normally holds
+        #     an entry per pair. `geometry_source='capsule'` short-
+        #     circuits this to the empty dict so the legacy capsule
+        #     path is exercised end-to-end for one release.
         #
         # Cache read here is under the tick budget — a single dict
         # lookup + freshness check per pair (~µs). No mesh math on
@@ -722,11 +765,14 @@ class CollisionModel:
         mesh_pair_set = {frozenset(p) for p in self.mesh_pairs}
         MAX_AGE_S = 0.5
         now = time.time()
-        with self._mesh_cache_lock:
-            fresh_mesh = {
-                k: v['dist_mm'] for k, v in self._mesh_cache.items()
-                if now - v['ts'] <= MAX_AGE_S
-            }
+        if self.geometry_source == 'capsule':
+            fresh_mesh = {}
+        else:
+            with self._mesh_cache_lock:
+                fresh_mesh = {
+                    k: v['dist_mm'] for k, v in self._mesh_cache.items()
+                    if now - v['ts'] <= MAX_AGE_S
+                }
         for a, b in self.pairs:
             key = frozenset({a, b})
             if a == '__ground__' or b == '__ground__':
