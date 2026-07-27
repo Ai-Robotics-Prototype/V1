@@ -23,6 +23,16 @@ thin_waypoints          = _breadcrumbs.thin_waypoints
 is_stale                = _breadcrumbs.is_stale
 effector_state_at_end   = _breadcrumbs.effector_state_at_end
 
+# Always-on joint flight recorder + excursion analyzer. Isolated
+# modules so a recorder crash never touches the state pipeline.
+try:
+    from . import joint_recorder as _joint_recorder_mod
+    from . import joint_excursions as _joint_excursions_mod
+except ImportError:
+    import joint_recorder as _joint_recorder_mod          # type: ignore
+    import joint_excursions as _joint_excursions_mod       # type: ignore
+JointRecorder = _joint_recorder_mod.JointRecorder
+
 # Dual-import shim — matches inspection_helpers below. The systemd unit
 # runs this file as a script (no parent package), so relative imports
 # fail; the ROS2 entry-point path has a parent package and prefers them.
@@ -39,7 +49,12 @@ try:
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
-    from sensor_msgs.msg import Image, JointState, PointCloud2
+    from sensor_msgs.msg import CameraInfo, Image, JointState, PointCloud2
+    from geometry_msgs.msg import TransformStamped as _TFStamped
+    try:
+        from tf2_ros import StaticTransformBroadcaster as _StaticTFBroadcaster
+    except ImportError:
+        _StaticTFBroadcaster = None
     from std_msgs.msg import Bool, Float32, String
     from std_srvs.srv import Trigger
     RCLPY_AVAILABLE = True
@@ -56,7 +71,7 @@ except ImportError:
 try:
     from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     import uvicorn
     FASTAPI_AVAILABLE = True
@@ -209,6 +224,21 @@ STATE = {
 _cam_frames: dict = {0: None, 1: None}
 _cam_lock = threading.Lock()
 
+# Raw cam0 color bytes + shape + intrinsics — populated by dedicated
+# subscriptions so the AprilTag calibrator can detect on the ACTUAL
+# raw pixels (not the JPEG cache above which discards the bytes after
+# encoding). Only cam0 is captured this way — the calibration flow is
+# cam0-only and we don't want to double the memory footprint just to
+# keep cam1 raw around for the same purpose. Populated on every
+# frame; a stale copy is fine (the operator sees the live JPEG stream
+# and captures on demand).
+#
+# Shape: (H, W, 3) uint8, RGB. Intrinsics: (fx, fy, cx, cy). None
+# until the first frame + first camera_info arrive.
+_cam0_raw:   dict = {'rgb': None, 'ts': 0.0, 'width': 0, 'height': 0}
+_cam0_intr:  dict = {'fx': None, 'fy': None, 'cx': None, 'cy': None}
+_cam0_raw_lock = threading.Lock()
+
 # Latest annotated frame from detector (cam0 + cam1)
 _annotated_frame: bytes = None
 _annotated_frame_cam1: bytes = None
@@ -245,6 +275,74 @@ _ws_lock = threading.Lock()
 # arrives.
 _state_perf = {"acks": [], "inflight_ms_max": 0.0, "sends": 0, "ack_timeouts": 0}
 _state_perf_lock = threading.Lock()
+
+# ── Per-program revision + cross-client change events ────────────────
+# Bug 1 fix (2026-07-27). Before this, program mutations (teach, link,
+# save, rename, point CRUD) never notified other connected clients —
+# a tablet teaching a step left the PC's editor showing the pre-teach
+# state until manual reload. The design here piggybacks a lightweight
+# event ring onto the periodic /ws/state broadcast:
+#   1. Every mutation endpoint calls _bump_prog_rev(prog_id) which
+#      returns a monotonically-increasing integer and stashes it into
+#      prog['rev'] before write.
+#   2. Every mutation endpoint also calls _emit_program_changed(...)
+#      with the source_client id from the X-Client-Id header (or
+#      empty string when the client didn't send one — old builds).
+#   3. _emit_program_changed appends {type, program_id, rev,
+#      source_client, ts_ms} to _prog_event_ring. The next /ws/state
+#      broadcast serialises the last N events (aged out after
+#      _PROG_EVENT_TTL_S) into STATE['program_events'] and clients
+#      match against their local rev + source_client to decide whether
+#      to refetch.
+# Aged-out entries are dropped on each broadcast tick. The ring lives
+# under _prog_event_lock; a state-broadcast reader snapshots the list
+# with the lock held (~2 µs) so mutation writers never contend.
+_prog_revs: dict[str, int] = {}
+_prog_event_ring: list[dict] = []
+_prog_event_lock = threading.Lock()
+_PROG_EVENT_RING_MAX = 64
+_PROG_EVENT_TTL_S    = 15.0
+
+def _bump_prog_rev(prog_id: str) -> int:
+    with _prog_event_lock:
+        r = int(_prog_revs.get(prog_id, 0)) + 1
+        _prog_revs[prog_id] = r
+        return r
+
+def _emit_program_changed(program_id: str, rev: int, source_client: str,
+                          kind: str = "mutation") -> None:
+    """Append a program_changed event to the ring for the next
+    /ws/state broadcast to fan out. Non-blocking. `kind` is a free-
+    form tag (teach / save / points / rename / delete) surfaced to
+    the client for optional finer-grained UI (toast text)."""
+    if not program_id:
+        return
+    entry = {
+        "type":          "program_changed",
+        "program_id":    program_id,
+        "rev":           int(rev),
+        "source_client": str(source_client or ""),
+        "kind":          str(kind or "mutation"),
+        "ts_ms":         int(time.time() * 1000),
+    }
+    with _prog_event_lock:
+        _prog_event_ring.append(entry)
+        if len(_prog_event_ring) > _PROG_EVENT_RING_MAX:
+            del _prog_event_ring[:len(_prog_event_ring) - _PROG_EVENT_RING_MAX]
+
+def _snapshot_program_events() -> list[dict]:
+    """Return non-expired events for inclusion in the STATE broadcast.
+    Copies out under the lock so the broadcaster never holds it across
+    a json.dumps call."""
+    now_ms = time.time() * 1000
+    cutoff = now_ms - (_PROG_EVENT_TTL_S * 1000)
+    with _prog_event_lock:
+        # Age-out in-place so the ring doesn't grow unbounded when
+        # no one is watching. This is the only place we prune; the
+        # append path caps at _PROG_EVENT_RING_MAX as a hard ceiling.
+        while _prog_event_ring and _prog_event_ring[0]["ts_ms"] < cutoff:
+            _prog_event_ring.pop(0)
+        return list(_prog_event_ring)
 
 
 # ── Bounded per-client queue with drop-oldest backpressure ────────────
@@ -788,6 +886,22 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                                  lambda m: self._on_camera(0, m), 2)
         self.create_subscription(Image, "/cam1/cam1/color/image_raw",
                                  lambda m: self._on_camera(1, m), 2)
+        # Raw cam0 tap for AprilTag calibration. Separate sub so the
+        # JPEG-encode drop-latest guard on _on_camera doesn't cost us
+        # detection frames — we take the raw bytes fresh regardless
+        # of the encoder's state. camera_info gives fx/fy/cx/cy the
+        # detector needs.
+        self.create_subscription(Image, "/cam0/cam0/color/image_raw",
+                                 self._on_cam0_raw, 2)
+        self.create_subscription(CameraInfo, "/cam0/cam0/color/camera_info",
+                                 self._on_cam0_info, 2)
+
+        # Static TF broadcaster used by the cam0 extrinsic calibration
+        # save endpoint. Kept as a lazy None until _broadcast_cam0_
+        # extrinsic() first needs it — importing tf2_ros at module
+        # load is optional (typed as None when unavailable) so the
+        # dashboard boots even on a rig without tf2_ros installed.
+        self._static_tf_bcast = None
 
         # LiDAR priority: dense > accumulated > fused > raw. Lower-priority
         # handlers bail out if any higher-priority source produced data in
@@ -1566,6 +1680,106 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
 
         _cam_encode_pool.submit(_encode_task)
 
+    def _on_cam0_raw(self, msg):
+        """Store the latest cam0 color frame as a raw RGB uint8 array
+        for the AprilTag calibrator to consume synchronously. Called
+        at the camera frame rate (~15 Hz). Handles rgb8 and bgr8;
+        anything else is ignored (with a one-time warn) so a mis-
+        configured stream never breaks this path."""
+        if _np is None:
+            return
+        try:
+            enc = msg.encoding
+            w, h = int(msg.width), int(msg.height)
+            n = w * h * 3
+            if n <= 0 or n > len(msg.data):
+                return
+            buf = _np.frombuffer(bytes(msg.data), dtype=_np.uint8, count=n)
+            if enc == 'rgb8':
+                rgb = buf.reshape(h, w, 3)
+            elif enc == 'bgr8':
+                rgb = buf.reshape(h, w, 3)[:, :, ::-1]
+            else:
+                if not getattr(self, '_cam0_raw_enc_warned', False):
+                    self._cam0_raw_enc_warned = True
+                    self.get_logger().warn(
+                        f'cam0 raw tap: unsupported encoding {enc!r} — '
+                        f'calibration will not detect until this is rgb8/bgr8')
+                return
+            with _cam0_raw_lock:
+                _cam0_raw['rgb']    = rgb.copy()
+                _cam0_raw['width']  = w
+                _cam0_raw['height'] = h
+                _cam0_raw['ts']     = time.time()
+        except Exception as e:
+            if not getattr(self, '_cam0_raw_err_logged', False):
+                self._cam0_raw_err_logged = True
+                self.get_logger().warn(f'cam0 raw tap failed: {e}')
+
+    def _on_cam0_info(self, msg):
+        """Latest cam0 intrinsics (fx, fy, cx, cy). The calibrator
+        pulls this at capture time — no per-frame processing here."""
+        try:
+            k = msg.k
+            if len(k) >= 6 and k[0] > 0 and k[4] > 0:
+                with _cam0_raw_lock:
+                    _cam0_intr['fx'] = float(k[0])
+                    _cam0_intr['fy'] = float(k[4])
+                    _cam0_intr['cx'] = float(k[2])
+                    _cam0_intr['cy'] = float(k[5])
+        except Exception:
+            pass
+
+    def _broadcast_cam0_extrinsic(self):
+        """Publish the freshly-saved cam0_extrinsic.yaml as a static
+        TF (cam0_color_optical_frame → base_link) so consumers see it
+        without needing a tf_broadcaster restart. Called by the save
+        endpoint after a successful persist; silent no-op when tf2_ros
+        or the saved YAML is missing."""
+        if _StaticTFBroadcaster is None:
+            return
+        try:
+            from . import cam0_calibration as _cam0_calib_mod
+        except ImportError:
+            import cam0_calibration as _cam0_calib_mod  # type: ignore
+        payload = _cam0_calib_mod.load()
+        if not payload:
+            return
+        R = payload.get('R')
+        t = payload.get('t')
+        if not (isinstance(R, list) and len(R) == 3 and isinstance(t, list) and len(t) == 3):
+            return
+        # Rotation matrix → quaternion (xyzw).
+        try:
+            import numpy as _np2
+            R_mat = _np2.asarray(R, dtype=float).reshape(3, 3)
+            # scipy.spatial.transform.Rotation is already imported
+            # somewhere in the codebase; use it if available.
+            from scipy.spatial.transform import Rotation as _Rot
+            q = _Rot.from_matrix(R_mat).as_quat()   # xyzw
+        except Exception as e:
+            print(f'[calib] cannot build quaternion for TF: {e}',
+                  flush=True)
+            return
+        if self._static_tf_bcast is None:
+            self._static_tf_bcast = _StaticTFBroadcaster(self)
+        msg = _TFStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = str(payload.get('frame_to', 'base_link'))
+        msg.child_frame_id  = str(payload.get('frame_from', 'cam0_color_optical_frame'))
+        msg.transform.translation.x = float(t[0])
+        msg.transform.translation.y = float(t[1])
+        msg.transform.translation.z = float(t[2])
+        msg.transform.rotation.x    = float(q[0])
+        msg.transform.rotation.y    = float(q[1])
+        msg.transform.rotation.z    = float(q[2])
+        msg.transform.rotation.w    = float(q[3])
+        self._static_tf_bcast.sendTransform([msg])
+        self.get_logger().info(
+            f'cam0 extrinsic TF published: {msg.child_frame_id} → '
+            f'{msg.header.frame_id}  t=[{t[0]:+.3f}, {t[1]:+.3f}, {t[2]:+.3f}]  '
+            f'rms={payload.get("rms_mm", "?")} mm')
+
     # ---- LiDAR ----
 
     def _lidar_stale(self, key: str, max_age_s: float = 1.0) -> bool:
@@ -1667,6 +1881,37 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
 
 _ros_node: DashboardServer = None
 
+# Global joint recorder — instantiated at lifespan startup, torn down
+# on shutdown. Stays None on the module until then; endpoints null-
+# check it for the small window between import and startup.
+_joint_recorder = None
+
+def _joint_recorder_snapshot():
+    """Snapshot provider passed into JointRecorder. Reads STATE under
+    _state_lock, returns None when joints haven't been published yet
+    (arm not connected / driver still initialising). The recorder's
+    per-tick loop calls this and skips writes on None."""
+    with _state_lock:
+        joints = STATE.get('joints') or {}
+        positions = list(joints.get('positions') or [])
+        robot = STATE.get('robot') or {}
+        prog = robot.get('program') or {}
+        prog_state = prog.get('state')
+        prog_line  = prog.get('line')
+        prog_id    = prog.get('project_id')
+    if not positions or len(positions) < 6:
+        return None
+    joints_deg = [round((v * 180.0 / math.pi), 3) for v in positions[:6]]
+    return {
+        't':             time.time(),
+        'joints_deg':    joints_deg,
+        'program_id':    prog_id,
+        'program_name':  prog_id,   # name lookup would need file I/O — id is stable
+        'program_state': int(prog_state or 0),
+        'program_line':  prog_line,
+        'is_step':       bool((prog or {}).get('is_step', False)),
+    }
+
 if FASTAPI_AVAILABLE:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1695,10 +1940,28 @@ if FASTAPI_AVAILABLE:
             name='hold-keepalive',
             daemon=True)
         keepalive_thread.start()
+        # Always-on joint flight recorder. Ticks at 25 Hz, gzip'd
+        # segments under /opt/cobot/joint_history/, 2 GB / 14 d hard
+        # retention. Failure-isolated — a recorder crash never
+        # touches STATE or the broadcast loop.
+        global _joint_recorder
+        try:
+            _joint_recorder = JointRecorder(_joint_recorder_snapshot)
+            _joint_recorder.start()   # sync — spawns a native thread
+        except Exception as _e:
+            print(f'[dashboard] joint recorder failed to start: {_e}',
+                  flush=True)
+            _joint_recorder = None
         yield
         task.cancel()
         _keepalive_stop.set()
         keepalive_thread.join(timeout=1.0)
+        if _joint_recorder is not None:
+            try:
+                _joint_recorder.stop()
+            except Exception as _e:
+                print(f'[dashboard] joint recorder shutdown error: {_e}',
+                      flush=True)
         try:
             await task
         except asyncio.CancelledError:
@@ -1791,6 +2054,14 @@ if FASTAPI_AVAILABLE:
                     _state_seq_counter[0] += 1
                     payload["t"]   = now * 1000
                     payload["seq"] = _state_seq_counter[0]
+                    # Program-change events (last _PROG_EVENT_TTL_S sec).
+                    # Latest-wins broadcast means an individual frame
+                    # may be skipped by a slow client, but every event
+                    # rides multiple frames within its TTL so the
+                    # client is guaranteed to see it.
+                    events = _snapshot_program_events()
+                    if events:
+                        payload["program_events"] = events
                     return json.dumps(payload), _state_seq_counter[0]
                 txt, seq = await loop.run_in_executor(None, _snapshot_and_serialize)
                 # Sequence + broadcast time. The seq lets the ACK-gated
@@ -4566,10 +4837,30 @@ if FASTAPI_AVAILABLE:
     # project.
     import re as _prog_re
     _PROG_DIR = '/opt/cobot/programs'
+    # Strict slug rule for CREATION only. New programs authored via POST
+    # /api/programs get a controller-safe slug (lowercase-alphanum, no
+    # underscore) — see the URL-parser-split rationale on that endpoint.
     _PROG_ID_RE = _prog_re.compile(r'^[a-z0-9]+$')
+    # Relaxed regex for read/update/delete routes. Older files may
+    # carry underscores in their slug (the wizard used to produce
+    # `new_program.json`); every route that has to REACH an existing
+    # file must accept those, otherwise the operator gets a 404 on a
+    # program the list is happily showing. Traversal still bounded —
+    # the character class is [a-z0-9_-] with no dots or slashes, so
+    # `_prog_read_path` always returns a path inside _PROG_DIR.
+    _PROG_READ_ID_RE = _prog_re.compile(r'^[a-z0-9_-]+$')
 
     def _prog_path(prog_id: str):
         if not _PROG_ID_RE.match(prog_id or ''):
+            return None
+        return os.path.join(_PROG_DIR, prog_id + '.json')
+
+    def _prog_read_path(prog_id: str):
+        """Read/update/delete path resolver. Accepts the underscore/
+        hyphen shape older files carry so the operator can delete or
+        migrate a legacy `new_program.json` — the strict slug rule
+        stays enforced on creation via _prog_path."""
+        if not _PROG_READ_ID_RE.match(prog_id or ''):
             return None
         return os.path.join(_PROG_DIR, prog_id + '.json')
 
@@ -5282,6 +5573,509 @@ if FASTAPI_AVAILABLE:
             "capped":            capped,
         }
 
+    # ──────────────────────────────────────────────────────────────
+    # Joint-log capture. Bounded high-rate sampler for targeted
+    # investigation only. For NORMAL post-run analysis, prefer the
+    # always-on flight recorder + /api/runs/{run_id}/excursions —
+    # you don't need to pre-arm anything; every run's motion data
+    # is already on disk. Use this endpoint when you need a higher
+    # sample rate (up to 100 Hz) or a labeled ad-hoc window that
+    # doesn't correspond to a program run (jog testing etc.).
+    # Cap at 60 s so a runaway request can't fill disk during a
+    # busy shift.
+    # ──────────────────────────────────────────────────────────────
+    _JOINT_LOG_DIR = '/tmp/joint_logs'
+
+    @app.post("/api/estun/joint_log")
+    async def api_estun_joint_log(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            duration_s = float(body.get('duration_s', 20.0))
+        except (TypeError, ValueError):
+            return JSONResponse({'error': 'duration_s must be a number'},
+                                status_code=400)
+        duration_s = max(1.0, min(60.0, duration_s))
+        try:
+            rate_hz = float(body.get('rate_hz', 50.0))
+        except (TypeError, ValueError):
+            rate_hz = 50.0
+        rate_hz = max(5.0, min(100.0, rate_hz))
+        label = str(body.get('label') or 'joint_log')
+        # Filename-safe: keep letters/digits/dash/underscore only.
+        label_safe = ''.join(c if c.isalnum() or c in '-_' else '_'
+                             for c in label)[:40] or 'joint_log'
+        try:
+            os.makedirs(_JOINT_LOG_DIR, exist_ok=True)
+        except Exception as e:
+            return JSONResponse({'error': f'cannot create log dir: {e}'},
+                                status_code=500)
+        ts = time.strftime('%Y%m%dT%H%M%S')
+        fname = f'{label_safe}_{ts}.jsonl'
+        fpath = os.path.join(_JOINT_LOG_DIR, fname)
+
+        # Fire-and-forget sampler task. Writes an OPEN meta line, then
+        # one sample per period, then a CLOSE meta line so a partial
+        # (server-killed) log is still trivially detectable.
+        period = 1.0 / rate_hz
+        async def _sampler():
+            samples_written = 0
+            t_start = time.time()
+            try:
+                with open(fpath, 'w', buffering=1) as f:
+                    f.write(json.dumps({
+                        'meta':        'open',
+                        'ts':          t_start,
+                        'duration_s':  duration_s,
+                        'rate_hz':     rate_hz,
+                        'label':       label_safe,
+                        'note':        ('joints=degrees, program.line = '
+                                        'controller ProjectState line; '
+                                        'step_index = 0-based when '
+                                        'inferable, else null'),
+                    }) + '\n')
+                    t_stop = t_start + duration_s
+                    prev_line = None
+                    step_index = -1
+                    while True:
+                        now = time.time()
+                        if now >= t_stop:
+                            break
+                        with _state_lock:
+                            joints = STATE.get('joints') or {}
+                            positions = list(joints.get('positions') or [])
+                            robot = STATE.get('robot') or {}
+                            prog = robot.get('program') or {}
+                            prog_line = prog.get('line')
+                            prog_state = prog.get('state')
+                            prog_is_step = prog.get('is_step')
+                        # Radians → degrees for readability.
+                        joints_deg = [
+                            round((v * 180.0 / math.pi), 3)
+                            for v in positions[:6]
+                        ] if positions else []
+                        # Coarse step index: bump on each program.line
+                        # change. Not the true step id (that needs the
+                        # program dict → line-to-step map) but keeps
+                        # the log usable without that lookup.
+                        if prog_line is not None and prog_line != prev_line:
+                            step_index += 1
+                            prev_line = prog_line
+                        f.write(json.dumps({
+                            't':             round(now - t_start, 3),
+                            'joints_deg':    joints_deg,
+                            'program_line':  prog_line,
+                            'program_state': prog_state,
+                            'is_step':       prog_is_step,
+                            'step_index':    step_index if step_index >= 0 else None,
+                        }) + '\n')
+                        samples_written += 1
+                        # Yield to the loop; drift-corrected next-tick.
+                        next_t = t_start + samples_written * period
+                        sleep_s = max(0.0, next_t - time.time())
+                        if sleep_s > 0:
+                            await asyncio.sleep(sleep_s)
+                        else:
+                            await asyncio.sleep(0)
+                    f.write(json.dumps({
+                        'meta':      'close',
+                        'ts':        time.time(),
+                        'samples':   samples_written,
+                        'duration_actual_s': round(time.time() - t_start, 3),
+                    }) + '\n')
+            except Exception as e:
+                print(f'[joint_log] sampler failed: {type(e).__name__}: {e}',
+                      flush=True)
+
+        asyncio.create_task(_sampler())
+        return {
+            'ok': True,
+            'path': fpath,
+            'duration_s': duration_s,
+            'rate_hz': rate_hz,
+            'label': label_safe,
+            'note': ('Sampling started. Poll file mtime or wait '
+                     '`duration_s` seconds, then run '
+                     'scripts/joint_log_excursions.py <path>.'),
+        }
+
+    @app.get("/api/estun/joint_log/list")
+    async def api_estun_joint_log_list():
+        try:
+            entries = []
+            if os.path.isdir(_JOINT_LOG_DIR):
+                for fn in sorted(os.listdir(_JOINT_LOG_DIR), reverse=True):
+                    if not fn.endswith('.jsonl'):
+                        continue
+                    p = os.path.join(_JOINT_LOG_DIR, fn)
+                    try:
+                        st = os.stat(p)
+                        entries.append({
+                            'name': fn, 'path': p,
+                            'size': st.st_size, 'mtime': st.st_mtime,
+                        })
+                    except Exception:
+                        continue
+            return {'ok': True, 'logs': entries}
+        except Exception as e:
+            return JSONResponse({'ok': False, 'error': str(e)},
+                                status_code=500)
+
+    # ──────────────────────────────────────────────────────────────
+    # cam0 → base_link EXTRINSIC CALIBRATION.
+    #
+    # Touch-point correspondence using a printed AprilTag as the
+    # camera-side ground truth. Workflow (see cam0_calibration.py
+    # for the math + persistence contract):
+    #
+    #   1. Operator places the tag anywhere in cam0's view.
+    #   2. Jog the TCP down until the cup touches the tag centre.
+    #   3. POST /api/calib/cam0/capture — records the pair.
+    #   4. Move the tag, jog again, capture again. 4-6 spread.
+    #   5. POST /api/calib/cam0/solve — Umeyama fit + RMS.
+    #   6. RMS < 3 mm → POST /api/calib/cam0/save persists the
+    #      transform to /opt/cobot/calibration/cam0_extrinsic.yaml
+    #      AND publishes a fresh static TF (cam0_color_optical_frame
+    #      → base_link) so consumers see it without restarting
+    #      tf_broadcaster.
+    # ──────────────────────────────────────────────────────────────
+    try:
+        from . import cam0_calibration as _cam0_calib_mod
+    except ImportError:
+        import cam0_calibration as _cam0_calib_mod   # type: ignore
+
+    _calib_session = _cam0_calib_mod.CalibrationSession()
+    _calib_lock = threading.Lock()
+
+    # Import guard: the AprilTag detector may not be installed on
+    # every dev image. Endpoints return a helpful 503 explaining the
+    # missing package rather than blowing up on import at request
+    # time. The rest of the dashboard stays up.
+    try:
+        from dt_apriltags import Detector as _ATDetector
+        _at_detector = _ATDetector(
+            families='tag36h11', nthreads=2,
+            quad_decimate=1.0, refine_edges=True)
+    except Exception as _e:
+        _at_detector = None
+        _at_import_err = str(_e)
+    else:
+        _at_import_err = None
+
+    def _current_tcp_base_m():
+        """Snapshot the arm's TCP position in base_link frame (metres).
+        Returns None when the driver hasn't published yet. Uses
+        STATE['tcp_pose'] which the /estun/status handler keeps
+        current — that field is documented as meters (see the
+        _on_estun_status handler)."""
+        with _state_lock:
+            tcp = STATE.get('tcp_pose')
+        if not (isinstance(tcp, list) and len(tcp) >= 3):
+            return None
+        try:
+            return [float(tcp[0]), float(tcp[1]), float(tcp[2])]
+        except (TypeError, ValueError):
+            return None
+
+    def _detect_apriltag_center():
+        """Detect the largest tag36h11 in the current cam0 raw frame,
+        return (cam_frame_translation_m, corners_px, tag_id). None
+        if no tag, no frame, or detector unavailable."""
+        if _at_detector is None:
+            return None
+        with _cam0_raw_lock:
+            rgb   = _cam0_raw.get('rgb')
+            intr  = dict(_cam0_intr)
+            w, h  = _cam0_raw.get('width'), _cam0_raw.get('height')
+            ts    = _cam0_raw.get('ts')
+        if rgb is None or intr.get('fx') is None:
+            return None
+        # dt_apriltags wants uint8 grayscale.
+        if _np is None:
+            return None
+        rgb_arr = _np.asarray(rgb, dtype=_np.uint8)
+        gray = (0.299 * rgb_arr[:, :, 0]
+                + 0.587 * rgb_arr[:, :, 1]
+                + 0.114 * rgb_arr[:, :, 2]).astype(_np.uint8)
+        # Assume the operator's printed sheet is 100 mm edge — matches
+        # the existing calibrate_extrinsics.py default. Bad tag_size
+        # scales the translation linearly; if the operator prints at
+        # a different size the YAML metadata records what was assumed.
+        dets = _at_detector.detect(
+            gray, estimate_tag_pose=True,
+            camera_params=(intr['fx'], intr['fy'], intr['cx'], intr['cy']),
+            tag_size=float(os.environ.get('CALIB_TAG_SIZE_M', '0.10')))
+        if not dets:
+            return None
+        # Prefer the largest tag (by corner-bbox area) if the operator
+        # somehow has multiple in view; single-tag flow is the norm.
+        def _area(d):
+            c = _np.asarray(d.corners)
+            return (c[:, 0].max() - c[:, 0].min()) * (c[:, 1].max() - c[:, 1].min())
+        d = max(dets, key=_area)
+        cam_t = _np.asarray(d.pose_t, dtype=_np.float64).reshape(3).tolist()
+        corners = _np.asarray(d.corners, dtype=_np.float64).tolist()
+        return {
+            'cam_t':    cam_t,
+            'corners':  corners,
+            'tag_id':   int(d.tag_id),
+            'frame_ts': ts,
+        }
+
+    @app.get("/api/calib/cam0/status")
+    async def api_calib_cam0_status():
+        with _calib_lock:
+            sess = _calib_session.to_dict()
+        # Also surface some liveness for the UI.
+        with _cam0_raw_lock:
+            have_frame = _cam0_raw.get('rgb') is not None
+            have_intr  = _cam0_intr.get('fx') is not None
+            frame_age  = round(time.time() - _cam0_raw.get('ts', 0.0), 2) \
+                         if _cam0_raw.get('ts') else None
+        saved = _cam0_calib_mod.load()
+        return {
+            'ok':           True,
+            'session':      sess,
+            'have_frame':   bool(have_frame),
+            'have_intr':    bool(have_intr),
+            'frame_age_s':  frame_age,
+            'detector_ok':  _at_detector is not None,
+            'detector_err': _at_import_err,
+            'accept_rms_mm': _cam0_calib_mod.RMS_ACCEPT_MM,
+            'min_points':    _cam0_calib_mod.MIN_POINTS,
+            'persisted':     saved,
+        }
+
+    @app.post("/api/calib/cam0/start")
+    async def api_calib_cam0_start():
+        with _calib_lock:
+            _calib_session.clear()
+        return {'ok': True, 'session': _calib_session.to_dict()}
+
+    @app.get("/api/calib/cam0/tag_preview")
+    async def api_calib_cam0_tag_preview():
+        """UI-facing tag detection state — no capture side-effect.
+        Called in a slow poll (~2 Hz) so the operator sees whether
+        the tag is currently detected before pressing Capture."""
+        det = _detect_apriltag_center()
+        if det is None:
+            return {'ok': True, 'detected': False}
+        return {'ok': True, 'detected': True, **det}
+
+    @app.post("/api/calib/cam0/capture")
+    async def api_calib_cam0_capture(request: Request):
+        if _at_detector is None:
+            return JSONResponse({
+                'ok': False,
+                'error': 'AprilTag detector unavailable — dt_apriltags '
+                         'not installed. pip3 install dt-apriltags on '
+                         'the dashboard host.'},
+                status_code=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        label = str(body.get('label') or '')
+        det = _detect_apriltag_center()
+        if det is None:
+            return JSONResponse({
+                'ok': False,
+                'error': 'no AprilTag detected in cam0. Ensure the '
+                         'tag is fully in view and well-lit.'},
+                status_code=400)
+        tcp = _current_tcp_base_m()
+        if tcp is None:
+            return JSONResponse({
+                'ok': False,
+                'error': 'no TCP pose from the arm. Enable the driver '
+                         'and confirm /estun/status is publishing.'},
+                status_code=503)
+        with _calib_lock:
+            p = _calib_session.add_point(
+                tcp_base=tcp, cam_pt=det['cam_t'],
+                label=label or time.strftime('%H:%M:%S'))
+        return {'ok': True,
+                'point': _cam0_calib_mod.asdict(p),
+                'tag': {'id': det['tag_id'], 'corners': det['corners']},
+                'session_count': len(_calib_session.points)}
+
+    @app.get("/api/calib/cam0/points")
+    async def api_calib_cam0_points():
+        with _calib_lock:
+            return {'ok': True, 'session': _calib_session.to_dict()}
+
+    @app.delete("/api/calib/cam0/point/{idx}")
+    async def api_calib_cam0_point_delete(idx: int):
+        with _calib_lock:
+            ok = _calib_session.remove_point(int(idx))
+        if not ok:
+            return JSONResponse({'ok': False, 'error': 'point not found'},
+                                status_code=404)
+        return {'ok': True, 'session': _calib_session.to_dict()}
+
+    @app.post("/api/calib/cam0/solve")
+    async def api_calib_cam0_solve():
+        with _calib_lock:
+            try:
+                res = _cam0_calib_mod.solve(_calib_session)
+            except ValueError as e:
+                return JSONResponse({'ok': False, 'error': str(e)},
+                                    status_code=400)
+            sess = _calib_session.to_dict()
+        return {'ok': True,
+                'result':        _cam0_calib_mod.asdict(res),
+                'session':       sess,
+                'meets_accept':  res.rms_mm < _cam0_calib_mod.RMS_ACCEPT_MM,
+                'accept_rms_mm': _cam0_calib_mod.RMS_ACCEPT_MM}
+
+    @app.post("/api/calib/cam0/save")
+    async def api_calib_cam0_save():
+        with _calib_lock:
+            try:
+                path = _cam0_calib_mod.save(_calib_session)
+            except ValueError as e:
+                return JSONResponse({'ok': False, 'error': str(e)},
+                                    status_code=400)
+        # Publish the fresh TF now so downstream consumers pick it up
+        # without needing to restart tf_broadcaster (the historical
+        # startup-only reader). Non-fatal on failure — the file is
+        # already saved and the next tf_broadcaster start will use it.
+        try:
+            if _ros_node is not None:
+                _ros_node._broadcast_cam0_extrinsic()
+        except Exception as e:
+            print(f'[calib] TF broadcast failed after save: {e}', flush=True)
+        return {'ok': True, 'path': path,
+                'session': _calib_session.to_dict()}
+
+    # ──────────────────────────────────────────────────────────────
+    # Always-on joint recorder — /api/runs endpoints.
+    #
+    # Every program execution the dashboard sees on /joint_states +
+    # ProjectState transitions gets its own run manifest under
+    # /opt/cobot/joint_history/manifests/. GET /api/runs lists them
+    # newest-first. /api/runs/{id}/joints stitches the sample
+    # segments back together for download; /api/runs/{id}/excursions
+    # runs the same analysis the one-shot CLI uses, over the run's
+    # samples. No pre-arming — investigate any past run after the
+    # fact.
+    # ──────────────────────────────────────────────────────────────
+    @app.get("/api/runs")
+    async def api_runs_list():
+        try:
+            manifests = _joint_recorder_mod._list_manifests_sorted()
+        except Exception as e:
+            return JSONResponse({'ok': False, 'error': str(e)},
+                                status_code=500)
+        rec_stats = None
+        if _joint_recorder is not None:
+            try:
+                rec_stats = _joint_recorder.stats()
+            except Exception:
+                rec_stats = None
+        return {'ok': True,
+                'runs':      manifests,
+                'recorder':  rec_stats}
+
+    def _run_segment_paths(run_id):
+        """Resolve a run's manifest → list of absolute paths on disk.
+        Filters entries whose file has been pruned (retention may
+        have swept an old run's early segments while its manifest
+        still records them). Returns (manifest, [paths])."""
+        m = _joint_recorder_mod._load_manifest(run_id)
+        if m is None:
+            return None, None
+        seg_dir = _joint_recorder_mod._segment_dir()
+        paths = []
+        for name in (m.get('segments') or []):
+            p = os.path.join(seg_dir, name)
+            if os.path.isfile(p):
+                paths.append(p)
+        return m, paths
+
+    @app.get("/api/runs/{run_id}/joints")
+    async def api_run_joints(run_id: str, format: str = 'json'):
+        """Return the raw samples from a run. `format=jsonl` streams
+        a decompressed .jsonl download; `format=json` (default)
+        returns a JSON object with meta + samples for the UI."""
+        # Path validation: run_ids come from _start_run's slugifier
+        # so they're already [a-zA-Z0-9_-]. Belt-and-braces here.
+        import re as _re
+        if not _re.match(r'^[A-Za-z0-9_.\-]+$', run_id or ''):
+            return JSONResponse({'ok': False, 'error': 'bad run_id'},
+                                status_code=400)
+        m, paths = _run_segment_paths(run_id)
+        if m is None:
+            return JSONResponse({'ok': False, 'error': 'run not found'},
+                                status_code=404)
+        samples = _joint_excursions_mod.load_samples_from_gzip_segments(paths)
+        # Trim to the run's actual time window — segments may include
+        # samples from adjacent idle time.
+        t0 = m.get('t_start') or 0.0
+        t1 = m.get('t_end')
+        if t1 is not None:
+            samples = [s for s in samples
+                       if s.get('t') is not None
+                       and t0 - 0.5 <= s['t'] <= t1 + 0.5]
+        # Convert absolute timestamps to run-relative for readability
+        # + JSONL output. Keep absolute in a companion field so joint-
+        # log_excursions.py stays a drop-in analyzer.
+        for s in samples:
+            if s.get('t') is not None:
+                s['t_run'] = round(s['t'] - t0, 3)
+        if format == 'jsonl':
+            body = ''.join(json.dumps(s) + '\n' for s in samples)
+            return PlainTextResponse(
+                body,
+                media_type='application/jsonl',
+                headers={'Content-Disposition':
+                         f'attachment; filename="{run_id}.jsonl"'})
+        return {'ok': True,
+                'run':     m,
+                'samples': samples,
+                'count':   len(samples)}
+
+    @app.get("/api/runs/{run_id}/excursions")
+    async def api_run_excursions(run_id: str,
+                                 threshold_deg: float = 10.0):
+        """Per-step per-joint excursion table for a completed run.
+        Uses the same analyzer the one-shot CLI does so the numbers
+        agree byte-for-byte with a parallel /api/estun/joint_log
+        capture over the same window."""
+        import re as _re
+        if not _re.match(r'^[A-Za-z0-9_.\-]+$', run_id or ''):
+            return JSONResponse({'ok': False, 'error': 'bad run_id'},
+                                status_code=400)
+        m, paths = _run_segment_paths(run_id)
+        if m is None:
+            return JSONResponse({'ok': False, 'error': 'run not found'},
+                                status_code=404)
+        samples = _joint_excursions_mod.load_samples_from_gzip_segments(paths)
+        t0 = m.get('t_start') or 0.0
+        t1 = m.get('t_end')
+        if t1 is not None:
+            samples = [s for s in samples
+                       if s.get('t') is not None
+                       and t0 - 0.5 <= s['t'] <= t1 + 0.5]
+        # infer step_index from consecutive program_line changes so
+        # the analyzer's step-grouping works even if the manifest's
+        # segments don't carry step-index metadata (the on-disk
+        # sample schema is program_line only — step_index is a
+        # derived label the excursion table uses).
+        prev_line = None
+        step_idx = -1
+        for s in samples:
+            ln = s.get('program_line')
+            if ln is not None and ln != prev_line:
+                step_idx += 1
+                prev_line = ln
+            s['step_index'] = step_idx if step_idx >= 0 else None
+        analysis = _joint_excursions_mod.analyze(
+            samples, threshold_deg=float(threshold_deg))
+        return {'ok': True, 'run': m, 'analysis': analysis}
+
     @app.post("/api/program/run")
     async def api_program_run(request: Request):
         """Dispatch run/pause/resume/stop/home to the program executor.
@@ -5339,19 +6133,48 @@ if FASTAPI_AVAILABLE:
     async def api_programs_list():
         """List user-created robot programs from /opt/cobot/programs/.
         No built-in templates — every entry corresponds to a file on
-        disk and is fully editable / deletable."""
+        disk and is fully editable / deletable.
+
+        Reconcile pass (2026-07-27): only emit entries whose id can
+        be reached by the read/update/delete routes. A file whose
+        stem fails _PROG_READ_ID_RE would be a listed-but-unreachable
+        ghost — the operator would click Delete and get 404 forever
+        (that WAS the bug that motivated this pass on the underscore
+        case; the read-path regex was tightened here at the same
+        time so the delete route can now reach `new_program`, but
+        the reconcile stays as a belt for future oddballs — dotfiles,
+        weirdly-cased names, whatever).
+        """
         programs = []
+        skipped_unreachable = 0
         try:
             os.makedirs(_PROG_DIR, exist_ok=True)
             for fn in sorted(os.listdir(_PROG_DIR)):
                 if not fn.endswith('.json') or fn.startswith('_'):
                     continue
+                stem = fn[:-5]
+                if not _PROG_READ_ID_RE.match(stem):
+                    # Route-unreachable — dead entry. Print once per
+                    # boot in case there really is something odd on
+                    # disk that the operator wants to see.
+                    if not getattr(api_programs_list, '_warned_stems', set()) or \
+                            stem not in api_programs_list._warned_stems:
+                        try:
+                            if not hasattr(api_programs_list, '_warned_stems'):
+                                api_programs_list._warned_stems = set()
+                            api_programs_list._warned_stems.add(stem)
+                            print(f'[programs] hidden (unreachable) stem: {stem!r}',
+                                  flush=True)
+                        except Exception:
+                            pass
+                    skipped_unreachable += 1
+                    continue
                 try:
                     with open(os.path.join(_PROG_DIR, fn)) as fp:
                         prog = json.load(fp)
                     programs.append({
-                        'id':          fn[:-5],
-                        'name':        prog.get('name') or fn[:-5],
+                        'id':          stem,
+                        'name':        prog.get('name') or stem,
                         'description': prog.get('description') or '',
                         'steps':       len(prog.get('steps') or []),
                         'tags':        prog.get('tags') or [],
@@ -5435,7 +6258,7 @@ if FASTAPI_AVAILABLE:
 
     @app.put("/api/programs/{prog_id}/folder")
     async def api_programs_set_folder(prog_id: str, request: Request):
-        path = _prog_path(prog_id)
+        path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
             return JSONResponse({'error': 'not found'}, status_code=404)
         try:
@@ -5458,7 +6281,7 @@ if FASTAPI_AVAILABLE:
     async def api_programs_duplicate(prog_id: str):
         """Create a copy of an existing program with a new id (slug
         with collision suffix) and " (copy)" appended to the name."""
-        src = _prog_path(prog_id)
+        src = _prog_read_path(prog_id)
         if not src or not os.path.isfile(src):
             return JSONResponse({'error': 'not found'}, status_code=404)
         try:
@@ -5769,7 +6592,7 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/api/programs/{prog_id}")
     async def api_programs_get(prog_id: str):
-        path = _prog_path(prog_id)
+        path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
             return JSONResponse({"error": "not found"}, status_code=404)
         try:
@@ -5793,7 +6616,7 @@ if FASTAPI_AVAILABLE:
         """Merge an update into the existing program file. Preserves the
         original id and created timestamp; bumps updated. Accepts the
         same shape as POST minus the auto-slugging."""
-        path = _prog_path(prog_id)
+        path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
             return JSONResponse({"error": "not found"}, status_code=404)
         try:
@@ -5862,23 +6685,47 @@ if FASTAPI_AVAILABLE:
             tags = prog.get("tags") or []
             prog["tags"] = [t for t in tags if t not in _PBD_TAG_MARKERS]
         try:
-            with open(path, 'w') as f:
-                json.dump(prog, f, indent=2)
+            # Bug 1 fix (2026-07-27): route the PUT write through the
+            # rev+broadcast helper so every step edit, teach, link, or
+            # save is seen by other connected clients within ~1 /ws/state
+            # tick. The originating client's own echo is suppressed via
+            # source_client match on the receive side.
+            new_rev = _save_prog_with_event(
+                prog, path, prog_id,
+                _client_id_of(request), "program_put")
         except Exception as e:
             return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
-        return {"ok": True, "program": prog,
+        return {"ok": True, "program": prog, "rev": new_rev,
                 "warnings": {"move_home_drift": home_warnings_put}
                             if home_warnings_put else {}}
 
     @app.delete("/api/programs/{prog_id}")
-    async def api_programs_delete(prog_id: str):
-        path = _prog_path(prog_id)
+    async def api_programs_delete(prog_id: str, request: Request):
+        # Delete has to reach existing files whose id contains the
+        # underscore/hyphen shape older wizards produced; the strict
+        # slug rule stays on CREATION via _prog_path. Contract: 404
+        # is reserved for "file genuinely doesn't exist on disk" —
+        # never for id-form mismatch on a listed entry.
+        path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
             return JSONResponse({"error": "not found"}, status_code=404)
         try:
             os.remove(path)
         except Exception as e:
             return JSONResponse({"error": f"delete failed: {e}"}, status_code=500)
+        # Fan out to other connected clients so the row disappears
+        # from their library within one /ws/state tick. Uses the
+        # program-changed ring from the 2026-07-27 sync fix.
+        try:
+            rev = _bump_prog_rev(prog_id)
+            _emit_program_changed(prog_id, rev,
+                                  _client_id_of(request), 'deleted')
+        except Exception as e:
+            # Broadcast failure must never block the delete itself —
+            # the file is gone; other clients will notice on next
+            # refresh even without the event.
+            print(f'[programs] delete-broadcast failed for {prog_id!r}: '
+                  f'{type(e).__name__}: {e}', flush=True)
         return {"ok": True}
 
     @app.post("/api/programs/{prog_id}/rename")
@@ -5908,14 +6755,15 @@ if FASTAPI_AVAILABLE:
         if not new_name:
             return JSONResponse({"error": "new_name required"}, status_code=400)
 
-        # Path resolution bypass — allow underscored ids for the
-        # source (we're migrating AWAY from them). Still strict about
-        # traversal: the id must contain only [a-z0-9_] and produce a
-        # path inside _PROG_DIR.
-        _migrate_re = _prog_re.compile(r'^[a-z0-9_]+$')
-        if not _migrate_re.match(prog_id or ''):
+        # Uses the shared _prog_read_path resolver (relaxed regex
+        # ^[a-z0-9_-]+$) so migrating an old underscored slug
+        # traverses the same path validation every read/delete route
+        # uses. Traversal safety: the resolver never emits a path
+        # outside _PROG_DIR since the character class excludes dots
+        # and slashes.
+        src = _prog_read_path(prog_id)
+        if not src:
             return JSONResponse({"error": "invalid source id"}, status_code=400)
-        src = os.path.join(_PROG_DIR, prog_id + '.json')
         if not os.path.isfile(src):
             return JSONResponse({"error": "not found"}, status_code=404)
 
@@ -5999,7 +6847,10 @@ if FASTAPI_AVAILABLE:
         return [float(v) for v in jd], tm
 
     def _load_prog(prog_id):
-        path = _prog_path(prog_id)
+        # Read-path resolver (relaxed regex) so points endpoints reach
+        # existing files whose id contains _ / - from an earlier
+        # naming scheme. Creation still routes through _prog_path.
+        path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
             return None, None
         try:
@@ -6012,6 +6863,40 @@ if FASTAPI_AVAILABLE:
         prog["updated"] = _now_stamp()
         with open(path, 'w') as f:
             json.dump(prog, f, indent=2)
+
+    def _client_id_of(request) -> str:
+        """Read the caller's X-Client-Id header (a UUID minted per page
+        load on the browser). Empty string when older builds are still
+        running. Only used for echo-suppression on the receive side —
+        an empty source_client never matches a real client id so those
+        events fire on every client (worst case: originator refetches
+        once, harmless)."""
+        try:
+            return (request.headers.get("x-client-id") or "").strip()
+        except Exception:
+            return ""
+
+    def _save_prog_with_event(prog, path, prog_id, source_client, kind):
+        """Bump the program's revision, stash it into the file, save,
+        and emit a program_changed event onto the /ws/state ring so
+        every other client sees the mutation. Wire evidence: PUT
+        /programs/{id} + POST/PUT/DELETE /programs/{id}/points all
+        route through this — the editor's cross-client 'tablet teaches,
+        PC updates' contract lives on this call site.
+
+        Seed the in-memory rev counter from the on-disk `rev` field so
+        a service restart doesn't reset a program's revision back to 1
+        when clients still hold higher local revs from before the
+        restart (their `rev > local` check would then never fire even
+        though the file did change)."""
+        with _prog_event_lock:
+            if prog_id not in _prog_revs:
+                _prog_revs[prog_id] = int(prog.get("rev") or 0)
+        rev = _bump_prog_rev(prog_id)
+        prog["rev"] = rev
+        _save_prog(prog, path)
+        _emit_program_changed(prog_id, rev, source_client, kind)
+        return rev
 
     def _next_point_name(points):
         """p1, p2, ... — skip any already taken so a renamed point
@@ -6082,10 +6967,11 @@ if FASTAPI_AVAILABLE:
             "taught_at": datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
         }
         prog["points"] = points
-        _save_prog(prog, path)
+        new_rev = _save_prog_with_event(
+            prog, path, prog_id, _client_id_of(request), "point_teach")
 
         return {"ok": True, "point": points[name] | {"name": name},
-                "program": prog}
+                "program": prog, "rev": new_rev}
 
     @app.put("/api/programs/{prog_id}/points/{name}")
     async def api_program_update_point(prog_id: str, name: str, request: Request):
@@ -6152,12 +7038,13 @@ if FASTAPI_AVAILABLE:
             points[name] = pt
 
         prog["points"] = points
-        _save_prog(prog, path)
+        new_rev = _save_prog_with_event(
+            prog, path, prog_id, _client_id_of(request), "point_put")
         return {"ok": True, "point": points[name] | {"name": name},
-                "program": prog}
+                "program": prog, "rev": new_rev}
 
     @app.delete("/api/programs/{prog_id}/points/{name}")
-    async def api_program_delete_point(prog_id: str, name: str):
+    async def api_program_delete_point(prog_id: str, name: str, request: Request):
         """Delete a taught point. Refuses (409) if any step references
         the point by `point_name` — the operator has to either
         re-target the step first or delete the step. This is the
@@ -6179,8 +7066,9 @@ if FASTAPI_AVAILABLE:
                 status_code=409)
         del points[name]
         prog["points"] = points
-        _save_prog(prog, path)
-        return {"ok": True, "program": prog}
+        new_rev = _save_prog_with_event(
+            prog, path, prog_id, _client_id_of(request), "point_delete")
+        return {"ok": True, "program": prog, "rev": new_rev}
 
     # ------------------------------------------------------------------
     # Programming by Demonstration (/api/pbd/*).
@@ -6469,11 +7357,33 @@ if FASTAPI_AVAILABLE:
     async def api_pbd_correct(demo_id: str, request: Request):
         """Operator accepted the (possibly edited) draft. Body:
             { program: <full program payload — same shape as POST /api/programs>,
+              intent:  <answered structured intent — client folded
+                        clarifications via applyClarifications>,
+              scene:   <corrected scene>,
+              clarifications_answered: {...},
               save_to_library: true }
-        We save through the existing /api/programs path internally so
-        the saved file ends up identical to a wizard-saved program, then
-        write human_corrected.json (the gold training signal) into the
-        learning store."""
+
+        Architectural fix (2026-07-27, PBD answer-application audit):
+        BEFORE this pass, Accept saved `body.program.steps` verbatim.
+        If the operator's answers required a STEP-LIST restructure
+        (effector vacuum→engage/disengage, target_part label refresh,
+        location_hint downstream), the client-side folder didn't
+        rebuild the list — the manual ↻ Regenerate button was the
+        only path that did. Result: "vacuum" answered, "Grip part"
+        saved (whitebowl demo demo_20260727T161927_e475ef).
+
+        Now: whenever `body.intent` carries answered operations, we
+        recompose server-side (same deterministic compose_program_draft
+        the ↻ button uses) and OVERWRITE `program.steps` with the
+        composed output before persisting. Everything else on
+        `program` (name, description, tags, config, and any client-
+        appended `loop` step for cycles) is preserved.
+
+        Fallback: if intent is missing / malformed / the composer
+        raises, we save the client's draft as-is with a `warning`
+        entry in the response so old clients keep working. Better to
+        save what the operator saw than lose their work.
+        """
         try:
             body = await request.json()
         except Exception:
@@ -6485,6 +7395,48 @@ if FASTAPI_AVAILABLE:
         did = safe_demo_id(demo_id)
         if not did:
             return JSONResponse({"ok": False, "error": "bad demo_id"}, status_code=400)
+
+        # Server-side recompose — the actual bug fix.
+        recompose_warning = None
+        recomposed = False
+        intent_in = body.get('intent') if isinstance(body.get('intent'), dict) else None
+        if intent_in and (intent_in.get('operations') or []):
+            try:
+                from programming_by_demonstration.schema import StructuredIntent
+                from programming_by_demonstration.program_composer import compose_program_draft
+                composed = compose_program_draft(
+                    StructuredIntent.from_dict(intent_in), demo_id=did)
+                composed_payload = composed.to_program_payload()
+                composed_steps = list(composed_payload.get('steps') or [])
+                # Preserve the operator's client-appended `loop` step
+                # (cycles > 1). It always sits at the tail; the composer
+                # never emits one, so we can splice safely.
+                client_loop_steps = [
+                    s for s in (program.get('steps') or [])
+                    if isinstance(s, dict) and s.get('action') == 'loop'
+                ]
+                if client_loop_steps:
+                    composed_steps = composed_steps + client_loop_steps
+                # Overwrite steps with the composed output. Renumber
+                # `step` fields to stay contiguous (composer numbers
+                # its own output, but appending the loop can leave a
+                # gap).
+                for i, s in enumerate(composed_steps, 1):
+                    if isinstance(s, dict):
+                        s['step'] = i
+                program = {**program, 'steps': composed_steps}
+                # If the composer produced a description that differs
+                # from the client's, prefer the client's — the operator
+                # may have hand-edited it.
+                recomposed = True
+            except Exception as e:
+                # Fall back to the client's draft; surface the warning
+                # so the client can decide whether to re-try. Never
+                # block Accept — losing the operator's work is worse
+                # than saving a possibly-stale draft.
+                recompose_warning = f'{type(e).__name__}: {e}'
+                print(f'[pbd] server recompose failed for {did}: '
+                      f'{recompose_warning}', flush=True)
 
         program_id = None
         if body.get('save_to_library', True):
@@ -6572,9 +7524,24 @@ if FASTAPI_AVAILABLE:
         except Exception as e:
             print(f'[pbd] correction_diff capture failed for {did}: '
                   f'{type(e).__name__}: {e}', flush=True)
-        out = {"ok": True, "demo_id": did, "program_id": program_id}
+        # Echo back the FINAL program the server actually persisted —
+        # steps, id, everything. The client's accept() replaces its
+        # local draft with this so the review re-renders what got
+        # saved (no more silent divergence between screen and disk).
+        final_program = None
+        if body.get('save_to_library', True):
+            try:
+                final_program = saved   # defined above when we wrote to disk
+            except NameError:
+                final_program = program
+        else:
+            final_program = program
+        out = {"ok": True, "demo_id": did, "program_id": program_id,
+               "program": final_program, "recomposed": recomposed}
         if diff_summary is not None:
             out["diff_summary"] = diff_summary
+        if recompose_warning is not None:
+            out["recompose_warning"] = recompose_warning
         return out
 
     @app.get("/api/pbd/dataset/stats")
@@ -8429,7 +9396,7 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/api/programs/{prog_id}/motion_profile")
     async def api_program_motion_profile_get(prog_id: str):
-        path = _prog_path(prog_id)
+        path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
             return JSONResponse({"error": "program not found"}, status_code=404)
         try:
@@ -8448,7 +9415,7 @@ if FASTAPI_AVAILABLE:
 
     @app.put("/api/programs/{prog_id}/motion_profile")
     async def api_program_motion_profile_set(prog_id: str, request: Request):
-        path = _prog_path(prog_id)
+        path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
             return JSONResponse({"error": "program not found"}, status_code=404)
         try:
