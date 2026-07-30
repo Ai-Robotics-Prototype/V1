@@ -7,6 +7,8 @@ import { useStore } from '../store/useStore'
 import { HoldButton } from './JogControls'
 import NumericField from './NumericField'
 import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
+import { effectorReady, effectorEngage, effectorDisengage,
+         effectorOf } from '../lib/effectorVocab'
 
 /*
  * Conversational Program Wizard
@@ -2901,19 +2903,25 @@ function buildPalletizeSteps(answers) {
   // finger / vacuum / magnetic — 'custom' is mapped to 'magnetic'
   // (single-signal IO) so its branch handles the gripper actuation.
   const stepGripType = gripType === 'custom' ? 'magnetic' : gripType
-  const gripOpen  = (label = 'Open gripper') => gripType === 'finger'
-    ? { action: 'open_gripper', label, width_mm: gripW, speed_pct: spd, io_open: 'DO1', io_open_confirm: 'DI1' }
-    : gripType === 'vacuum'
-      ? { action: 'set_io', label, io_id: 'DO2', value: 0 }
-      : { action: 'set_io', label, io_id: customActivate, value: 0 }
-  const gripClose = (label = 'Close gripper') => gripType === 'finger'
-    ? { action: 'close_gripper', label, force_pct: gripF, io_close: 'DO0', io_close_confirm: 'DI0' }
-    : gripType === 'vacuum'
-      ? { action: 'set_io', label, io_id: 'DO2', value: 1 }
-      : { action: 'set_io', label, io_id: customActivate, value: 1, ...(customConfirm ? { io_close_confirm: customConfirm } : {}) }
+
+  // effector-vocabulary shared with the PBD composer + editor palette.
+  // The old label-taking gripOpen/gripClose closures were the bug —
+  // they used the CALLER's label verbatim (e.g. 'Grip part') even
+  // when the effector was vacuum. See lib/effectorVocab for the
+  // single source of truth (2026-07-30 audit instance #4).
+  const _vocabOpts = { spd, gripW, gripF, customActivate, customConfirm }
+  const engageSteps = (labelOverride) =>
+    effectorEngage({ effector: gripType }, { ..._vocabOpts, labelOverride })
+  const disengageSteps = (labelOverride) =>
+    effectorDisengage({ effector: gripType }, { ..._vocabOpts, labelOverride })
+  const readySteps = () =>
+    effectorReady({ effector: gripType }, _vocabOpts)
 
   const steps = []
   steps.push({ action: 'move_home', label: 'Move to home position' })
+  // Effector-ready state at program start (vacuum off / gripper open /
+  // magnet off). Same shared vocabulary module the PBD composer uses.
+  steps.push(...readySteps())
 
   // Loop start index — step number (1-indexed for the executor's
   // goto-1 convention) of the first inside-loop step we're about to
@@ -2946,8 +2954,10 @@ function buildPalletizeSteps(answers) {
       taught_tcp: pickTcp, position: pickTcp ? pickTcp.slice(0, 3) : null,
       speed_pct: slow, position_role: 'pick',
     })
-    steps.push(gripClose('Grip part'))
-    if (gripType === 'vacuum') steps.push({ action: 'wait', label: 'Wait for vacuum seal', duration_s: 0.5 })
+    // Effector-aware engage (vacuum → "Engage vacuum" + wait for seal;
+    // finger → "Grip part"; magnet → "Engage magnet"). Never emits
+    // gripper-vocabulary when effector is vacuum (2026-07-30 fix).
+    steps.push(...engageSteps())
     steps.push({
       action: 'move_linear', label: 'Retreat above pick',
       speed_pct: medium, offset_z_mm: retH,
@@ -2997,12 +3007,10 @@ function buildPalletizeSteps(answers) {
       taught_joints: placeJoints, joints: placeJoints,
       speed_pct: slow, position_role: 'place',
     })
-    steps.push(gripOpen('Release part'))
-    if (gripType === 'vacuum') {
-      steps.push({ action: 'set_io', label: 'Blow off', io_id: 'DO3', value: 1 })
-      steps.push({ action: 'wait',   label: 'Wait for blow off', duration_s: 0.3 })
-      steps.push({ action: 'set_io', label: 'Blow off stop', io_id: 'DO3', value: 0 })
-    }
+    // Effector-aware disengage. Vacuum emits Disengage vacuum + the
+    // blow-off triplet in one call — no more parallel wizard-side
+    // hardcoded 'Blow off' emissions to drift from the composer.
+    steps.push(...disengageSteps())
     steps.push({
       action: 'move_linear', label: 'Retreat above place',
       speed_pct: medium, offset_z_mm: retH,
@@ -3046,37 +3054,31 @@ function buildSteps(answers) {
   // from the Custom Gripper page. Default to DO3 / no-confirm to match
   // the prior 'magnetic' behaviour for programs that didn't assign IO.
   const customActivate = answers.gripper_activate_signal || 'DO3'
+  const customConfirm  = answers.gripper_confirm_signal  || ''
 
-  if (answers.gripper_type === 'finger') {
-    steps.push({ action: 'open_gripper', label: 'Open gripper', width_mm: gripW, speed_pct: spd, io_open: 'DO1', io_open_confirm: 'DI1' })
-  } else if (answers.gripper_type === 'vacuum') {
-    steps.push({ action: 'set_io', label: 'Vacuum off', io_id: 'DO2', value: 0 })
-  } else if (answers.gripper_type === 'custom') {
-    steps.push({ action: 'set_io', label: 'Gripper off', io_id: customActivate, value: 0 })
-  }
+  // All effector-linked emissions (ready, engage, disengage) route
+  // through lib/effectorVocab. Same source the PBD composer uses on
+  // the backend and the Add Step palette uses in the editor — one
+  // vocabulary, all authoring surfaces (audit instance #4).
+  const _vocabOpts = { spd, gripW, gripF, customActivate, customConfirm }
+  const cfgEffector = { effector: answers.gripper_type }
+
+  steps.push(...effectorReady(cfgEffector, _vocabOpts))
 
   if (answers.source === 'camera_library') {
     steps.push({ action: 'detect', label: 'Find ' + (answers.target_part_name || 'library part'), mode: 'library' })
   }
 
   // Two-taught-poses-per-pair model (matches program_composer.py):
-  //   approach (derived, +appH) → pick contact (TAUGHT) → grip close →
+  //   approach (derived, +appH) → pick contact (TAUGHT) → engage →
   //   retreat (derived, +appH) → approach-place (derived, +appH) →
-  //   place contact (TAUGHT) → grip release → retreat (derived, +appH).
+  //   place contact (TAUGHT) → disengage → retreat (derived, +appH).
   // Only the contact steps carry position_role + taught data; every
   // approach/retreat step is derived_from that role.
   steps.push({ action: 'move_linear', label: 'Approach above pick', offset_z_mm: appH, speed_pct: spd, derived_from: 'pick' })
   steps.push({ action: 'move_linear', label: 'Pick position — contact', speed_pct: slow, position_role: 'pick' })
 
-  if (answers.gripper_type === 'finger') {
-    steps.push({ action: 'close_gripper', label: 'Grip part', force_pct: gripF, io_close: 'DO0', io_close_confirm: 'DI0' })
-  } else if (answers.gripper_type === 'vacuum') {
-    steps.push({ action: 'set_io', label: 'Vacuum on', io_id: 'DO2', value: 1 })
-    steps.push({ action: 'wait', label: 'Wait for vacuum seal', duration_s: 0.5 })
-  } else {
-    // Custom gripper — single-signal toggle on the operator's activate port.
-    steps.push({ action: 'set_io', label: 'Gripper on', io_id: customActivate, value: 1 })
-  }
+  steps.push(...effectorEngage(cfgEffector, _vocabOpts))
 
   // Retreat back above the pick contact.
   steps.push({ action: 'move_linear', label: 'Retreat above pick', offset_z_mm: appH, speed_pct: medium, derived_from: 'pick' })
@@ -3087,22 +3089,23 @@ function buildSteps(answers) {
     // anchor with approach/retreat derived.
     steps.push({ action: 'move_linear', label: 'Approach machine load', offset_z_mm: appH, speed_pct: spd, derived_from: 'machine_load' })
     steps.push({ action: 'move_linear', label: 'Machine load — contact', speed_pct: Math.min(spd, 20), position_role: 'machine_load' })
-    if (answers.gripper_type === 'finger') {
-      steps.push({ action: 'open_gripper', label: 'Release part into machine', width_mm: gripW, io_open: 'DO1' })
-    } else {
-      steps.push({ action: 'set_io', label: 'Release part into machine', io_id: 'DO2', value: 0 })
-    }
+    // Effector-aware release-into-machine (label context override so
+    // the operator sees "into machine" without losing the
+    // engage/disengage vocabulary).
+    steps.push(...effectorDisengage(cfgEffector, {
+      ..._vocabOpts, withBlowOff: false,
+      labelOverride: 'Release part into machine',
+    }))
     steps.push({ action: 'move_linear', label: 'Retreat from machine', offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
     steps.push({ action: 'set_io', label: 'Start machine cycle', io_id: answers.io_cycle_start || 'DO4', value: 1 })
     steps.push({ action: 'wait', label: 'Wait for machine to finish', duration_s: answers.cycle_timeout || 30 })
     steps.push({ action: 'set_io', label: 'Clear cycle start', io_id: answers.io_cycle_start || 'DO4', value: 0 })
     // Re-approach the same fixture to pick up the finished part.
     steps.push({ action: 'move_linear', label: 'Approach finished part', offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
-    if (answers.gripper_type === 'finger') {
-      steps.push({ action: 'close_gripper', label: 'Grip finished part', force_pct: gripF, io_close: 'DO0' })
-    } else {
-      steps.push({ action: 'set_io', label: 'Pick finished part', io_id: 'DO2', value: 1 })
-    }
+    steps.push(...effectorEngage(cfgEffector, {
+      ..._vocabOpts, labelOverride: (effectorOf(cfgEffector) === 'finger'
+        ? 'Grip finished part' : 'Pick finished part'),
+    }))
     steps.push({ action: 'move_linear', label: 'Retreat with finished part', offset_z_mm: appH, speed_pct: medium, derived_from: 'machine_load' })
     // Unload contact — separate taught role.
     steps.push({ action: 'move_linear', label: 'Approach unload', offset_z_mm: appH, speed_pct: spd, derived_from: 'unload' })
@@ -3113,17 +3116,7 @@ function buildSteps(answers) {
     steps.push({ action: 'move_linear', label: 'Place position — contact', speed_pct: slow, position_role: 'place' })
   }
 
-  if (answers.gripper_type === 'finger') {
-    steps.push({ action: 'open_gripper', label: 'Release part', width_mm: gripW, io_open: 'DO1' })
-  } else if (answers.gripper_type === 'vacuum') {
-    steps.push({ action: 'set_io', label: 'Vacuum off — release part', io_id: 'DO2', value: 0 })
-    steps.push({ action: 'set_io', label: 'Blow off', io_id: 'DO3', value: 1 })
-    steps.push({ action: 'wait', label: 'Wait for blow off', duration_s: 0.3 })
-    steps.push({ action: 'set_io', label: 'Blow off stop', io_id: 'DO3', value: 0 })
-  } else {
-    // Custom gripper — release on the operator's activate port.
-    steps.push({ action: 'set_io', label: 'Gripper off — release part', io_id: customActivate, value: 0 })
-  }
+  steps.push(...effectorDisengage(cfgEffector, _vocabOpts))
 
   // Retreat back above the final release contact (place or unload).
   const retreatRole = (op === 'machine_tend') ? 'unload' : 'place'

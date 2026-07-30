@@ -12,6 +12,8 @@ import { useIOPortmap, portmapLabels, portmapToOptions }
 import { isStepTaught, untaughtStepIds, hasFullTaughtPose, verbForStep }
   from '../lib/programTruth'
 import { stepIndexForLine } from '../lib/runState'
+import { paletteLabelForAction, effectorDisplayName, effectorOf }
+  from '../lib/effectorVocab'
 
 // The richer action taxonomy lives in the editor. Each action carries
 // a coarse `type` (matching the existing backend schema: move/gripper/
@@ -1640,9 +1642,18 @@ const STEP_CATEGORIES = [
 
 // Default extras per action so a freshly-added step has sane defaults
 // the inline editor can show without "[object Object]" placeholders.
-function freshStepForAction(action) {
+// `programCfg` is the program's config block — used to look up
+// effector-aware labels via lib/effectorVocab so a freshly-added
+// close_gripper on a vacuum program starts labeled "Engage vacuum",
+// not the generic "Close Gripper" from ACTION_TYPES.
+function freshStepForAction(action, programCfg = null) {
   const def = ACTION_TYPES.find((a) => a.value === action) || ACTION_TYPES[0]
-  const base = { action: def.value, type: def.type, label: def.label, detail: '' }
+  const effectorLabel = paletteLabelForAction(action, programCfg)
+  const base = {
+    action: def.value, type: def.type,
+    label: effectorLabel || def.label,
+    detail: '',
+  }
   switch (action) {
     case 'open_gripper':  return { ...base, width_mm: 85, speed_pct: 80 }
     case 'close_gripper': return { ...base, force_pct: 50 }
@@ -3320,7 +3331,7 @@ export default function ProgramEditor() {
   function handleDragEnd() { clearDrag() }
 
   function handleAdd() {
-    const newStep = freshStepForAction('wait')
+    const newStep = freshStepForAction('wait', currentProgram?.config)
     updateSteps(renumber([...steps, newStep]))
   }
 
@@ -3343,7 +3354,7 @@ export default function ProgramEditor() {
       setShowAddPanel(false)
       return
     }
-    const newStep = freshStepForAction(action)
+    const newStep = freshStepForAction(action, currentProgram?.config)
     const next = renumber([...steps, newStep])
     updateSteps(next)
     setEditingId(next[next.length - 1].id)
@@ -3353,7 +3364,7 @@ export default function ProgramEditor() {
   function completeReuse({ useSame }) {
     if (!pendingReuse) return
     const { action, sourceStep, insertIdx } = pendingReuse
-    let newStep = freshStepForAction(action)
+    let newStep = freshStepForAction(action, currentProgram?.config)
     if (useSame) {
       // Link to the source. Do NOT copy taught_joints / taught_tcp —
       // the executor resolves at runtime via position_ref so the
@@ -3393,7 +3404,7 @@ export default function ProgramEditor() {
       case 'add_above': {
         const src = findPositionReuseSource(steps, 'move_joint')
         if (src) { setPendingReuse({ action: 'move_joint', sourceStep: src, insertIdx: idx }); break }
-        const newStep = freshStepForAction('move_joint')
+        const newStep = freshStepForAction('move_joint', currentProgram?.config)
         const next = renumber([...steps.slice(0, idx), newStep, ...steps.slice(idx)])
         updateSteps(next)
         setEditingId(next[idx].id)
@@ -3402,7 +3413,7 @@ export default function ProgramEditor() {
       case 'add_below': {
         const src = findPositionReuseSource(steps, 'move_joint')
         if (src) { setPendingReuse({ action: 'move_joint', sourceStep: src, insertIdx: idx + 1 }); break }
-        const newStep = freshStepForAction('move_joint')
+        const newStep = freshStepForAction('move_joint', currentProgram?.config)
         const next = renumber([...steps.slice(0, idx + 1), newStep, ...steps.slice(idx + 1)])
         updateSteps(next)
         setEditingId(next[idx + 1].id)
@@ -4570,19 +4581,27 @@ export default function ProgramEditor() {
                   marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.5px',
                 }}>{cat.name}</div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
-                  {cat.actions.map((s) => (
-                    <button key={s.action} onClick={() => handleAddAction(s.action)}
-                      style={{
-                        padding: '10px 12px', textAlign: 'left', cursor: 'pointer',
-                        background: '#fff', border: '1px solid #e5e7eb', borderRadius: 6,
-                        transition: 'all 100ms',
-                      }}
-                      onMouseEnter={(e) => { e.currentTarget.style.borderColor = '#2563EB'; e.currentTarget.style.background = '#eff6ff' }}
-                      onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#e5e7eb'; e.currentTarget.style.background = '#fff' }}>
-                      <div style={{ fontSize: 12, fontWeight: 600, color: '#111' }}>{s.label}</div>
-                      <div style={{ fontSize: 10, color: '#6b7280', marginTop: 2 }}>{s.desc}</div>
-                    </button>
-                  ))}
+                  {cat.actions.map((s) => {
+                    // Effector-aware label (audit instance #4): the
+                    // Add Step palette shows "Engage vacuum" when the
+                    // program's effector is vacuum, "Grip part" when
+                    // finger, etc. Falls back to the category default.
+                    const paletteLabel = paletteLabelForAction(
+                      s.action, currentProgram?.config) || s.label
+                    return (
+                      <button key={s.action} onClick={() => handleAddAction(s.action)}
+                        style={{
+                          padding: '10px 12px', textAlign: 'left', cursor: 'pointer',
+                          background: '#fff', border: '1px solid #e5e7eb', borderRadius: 6,
+                          transition: 'all 100ms',
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.borderColor = '#2563EB'; e.currentTarget.style.background = '#eff6ff' }}
+                        onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#e5e7eb'; e.currentTarget.style.background = '#fff' }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: '#111' }}>{paletteLabel}</div>
+                        <div style={{ fontSize: 10, color: '#6b7280', marginTop: 2 }}>{s.desc}</div>
+                      </button>
+                    )
+                  })}
                 </div>
               </div>
             ))}

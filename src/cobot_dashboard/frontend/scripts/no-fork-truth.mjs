@@ -1,73 +1,108 @@
 #!/usr/bin/env node
 // no-fork-truth — CI guard against the 2026-07-30 UI-truth incidents.
 //
-// Scans every source file under src/components/ and src/pages/ and
-// FAILS the build when a file references any of the sentinel tokens
-// listed in FORK_TOKENS *without* importing from lib/programTruth.js
-// (the one canonical resolver).
+// A file under src/components/ or src/pages/ that references any
+// sentinel token below MUST also import from the corresponding
+// shared resolver module. New code physically can't fork the
+// truth again.
 //
-// The tokens name the exact facts today's incidents forked on:
+// Each guard has:
+//   * name        — reported in the failure output
+//   * tokens      — regex fragments that flag "this file has an
+//                   opinion about the shared truth"
+//   * resolver    — regex that matches the import that shields it
+//   * allowlist   — path suffixes exempt from the check (the
+//                   resolver itself + authoritative tables)
 //
-//   * taught_joints         — taught-state derivation
-//   * point_name            — same
-//   * 'move_linear'/'move_home'/'move_joint' — the step-verb triad
-//     (chip labels, detail lines, ACTION_TYPES table)
-//   * emittedLine           — legacy computeLineMap reference
-//   * has_taught_poses      — server-computed flag; direct read is fine,
-//                             deriving it locally is not — the sentinel
-//                             catches the RE-derivation, not the read
-//
-// The guard is deliberately regex-based (not AST): a component that
-// TOUCHES these tokens must go through the shared resolver, period.
-// Whitelist file: FORK_ALLOWLIST — the resolver itself + the ACTION_TYPES
-// definition file which is the ONE authoring-intent table.
-//
-// Exit codes:
-//   0 — clean
-//   1 — one or more offenders (specifics printed)
-//
-// Run manually: `node frontend/scripts/no-fork-truth.mjs`.
-// CI wiring: add to `npm run lint`.
+// Adding a new fork-class:
+//   1. Extract the truth into a shared lib/xxx.js module.
+//   2. Add a new guard entry below with the sentinel tokens.
+//   3. Everything else works automatically.
 
 import fs from 'node:fs'
 import path from 'node:path'
 import url from 'node:url'
 
-const __dirname = path.dirname(url.fileURLToPath(import.meta.url))
+const __dirname     = path.dirname(url.fileURLToPath(import.meta.url))
 const FRONTEND_ROOT = path.resolve(__dirname, '..')
-const SRC_ROOT = path.join(FRONTEND_ROOT, 'src')
+const SRC_ROOT      = path.join(FRONTEND_ROOT, 'src')
 
-// Files/paths that are ALLOWED to reference the sentinel tokens
-// without going through programTruth. Each entry is a suffix match
-// against the file's path relative to FRONTEND_ROOT.
-const FORK_ALLOWLIST = [
-  'src/lib/programTruth.js',        // the resolver itself
-  'src/lib/programTruth.test.js',   // its tests
-  'src/lib/runState.js',            // sibling resolver (line map + status)
-  'src/lib/runState.test.js',
-  'src/components/ProgramEditor.jsx',   // ACTION_TYPES authoring table lives here
-  'src/components/ProgramWizard.jsx',   // wizard emits authored step objects — allowed
-  'src/components/ProgramFromDemonstration.jsx',  // PBD emits authored steps — allowed
-  'src/components/ProgramErrorModal.jsx',   // error-text mentions verbs by name
-  'src/pages/AdaptivePicking.jsx',      // teach_count/telemetry, unrelated meaning
-  'src/store/useStore.js',              // hydrates authored programs; not a fact-source
-  'src/lib/ioPortmap.js',
+
+const GUARDS = [
+  // ── Guard A: taught-state / step-verb ─────────────────────────
+  // Motivating incidents (all 2026-07-30 audit):
+  //   #P1-1 computeLineMap (retired)
+  //   #P1-2 taught-count forked three ways (Editor / RunModal / Monitor)
+  //   #P1-3 hasPositionData accepted partial arrays
+  //   #P2-1 TypeChip label from step.action, not emitted verb
+  {
+    name:      'programTruth',
+    resolver:  /from\s+['"](\.\.?\/)+lib\/programTruth(\.js)?['"]/,
+    tokens: [
+      { rx: /\btaught_joints\b/,           label: 'taught_joints (raw taught-state key)' },
+      { rx: /\bpoint_name\b/,              label: 'point_name (raw taught-state ref)' },
+      { rx: /'move_linear'|"move_linear"/, label: "'move_linear' string (step-verb literal)" },
+      { rx: /'move_home'|"move_home"/,     label: "'move_home' string (step-verb literal)" },
+      { rx: /'move_joint'|"move_joint"/,   label: "'move_joint' string (step-verb literal)" },
+      { rx: /\bemittedLine\b/,             label: 'emittedLine (retired line-map field)' },
+    ],
+    allowlist: [
+      'src/lib/programTruth.js',        // the resolver itself
+      'src/lib/programTruth.test.js',
+      'src/lib/runState.js',            // sibling resolver (line map + status)
+      'src/lib/runState.test.js',
+      'src/components/ProgramEditor.jsx',   // ACTION_TYPES authoring table lives here
+      'src/components/ProgramWizard.jsx',   // wizard emits authored step objects — allowed
+      'src/components/ProgramFromDemonstration.jsx',  // PBD emits authored steps — allowed
+      'src/components/ProgramErrorModal.jsx',   // error-text mentions verbs by name
+      'src/pages/AdaptivePicking.jsx',      // teach_count/telemetry, unrelated meaning
+      'src/store/useStore.js',              // hydrates authored programs; not a fact-source
+      'src/lib/ioPortmap.js',
+    ],
+  },
+
+  // ── Guard B: effector vocabulary (audit instance #4) ─────────
+  // Wizard used hardcoded "Grip part" / "Release part" labels on a
+  // vacuum program because it had its own step-naming path that
+  // bypassed the PBD composer's effector-aware emitters. This guard
+  // forbids hardcoded gripper/vacuum/magnet vocabulary tokens in
+  // any component that doesn't import lib/effectorVocab.
+  {
+    name:     'effectorVocab',
+    resolver: /from\s+['"](\.\.?\/)+lib\/effectorVocab(\.js)?['"]/,
+    tokens: [
+      { rx: /'Grip part'|"Grip part"/,       label: "'Grip part' hardcoded label" },
+      { rx: /'Release part'|"Release part"/, label: "'Release part' hardcoded label" },
+      { rx: /'Open gripper'|"Open gripper"|'Open Gripper'|"Open Gripper"/,
+        label: "'Open Gripper' hardcoded label" },
+      { rx: /'Close gripper'|"Close gripper"|'Close Gripper'|"Close Gripper"/,
+        label: "'Close Gripper' hardcoded label" },
+      { rx: /'Engage vacuum'|"Engage vacuum"/,       label: "'Engage vacuum' hardcoded label" },
+      { rx: /'Disengage vacuum'|"Disengage vacuum"/, label: "'Disengage vacuum' hardcoded label" },
+      { rx: /'Blow off'|"Blow off"/,                 label: "'Blow off' hardcoded label" },
+      { rx: /'Vacuum on'|"Vacuum on"|'Vacuum off'|"Vacuum off"/,
+        label: "'Vacuum on'/'Vacuum off' hardcoded label" },
+      { rx: /'Engage magnet'|"Engage magnet"|'Disengage magnet'|"Disengage magnet"/,
+        label: "'Engage magnet'/'Disengage magnet' hardcoded label" },
+    ],
+    allowlist: [
+      'src/lib/effectorVocab.js',      // the resolver itself
+      'src/lib/effectorVocab.test.js',
+      // ControlStrip is a direct-actuation UI (toolbar toggle
+      // buttons for manual gripper control); its tooltips name
+      // the raw actuator action, not program-composed steps. If a
+      // future release adds effector-aware direct actuation, it
+      // should import effectorVocab and be removed from here.
+      'src/components/ControlStrip.jsx',
+      // Comment prose only — documents the whitebowl "'vacuum'
+      // answered, 'Grip part' saved" bug in an audit note. The
+      // PBD composer that this file drives ALREADY routes through
+      // the backend effector-aware emitter.
+      'src/components/ProgramFromDemonstration.jsx',
+    ],
+  },
 ]
 
-// Sentinel tokens. Regex fragments — each is matched with word
-// boundaries where relevant.
-const FORK_TOKENS = [
-  { rx: /\btaught_joints\b/,           label: 'taught_joints (raw taught-state key)' },
-  { rx: /\bpoint_name\b/,              label: 'point_name (raw taught-state ref)' },
-  { rx: /'move_linear'|"move_linear"/, label: "'move_linear' string (step-verb literal)" },
-  { rx: /'move_home'|"move_home"/,     label: "'move_home' string (step-verb literal)" },
-  { rx: /'move_joint'|"move_joint"/,   label: "'move_joint' string (step-verb literal)" },
-  { rx: /\bemittedLine\b/,             label: 'emittedLine (retired line-map field)' },
-]
-
-// A file "consumes" the shared resolver when it imports at least one
-// symbol from ../lib/programTruth or the runState sibling.
-const CONSUMER_IMPORT_RX = /from\s+['"](\.\.?\/)+lib\/programTruth(\.js)?['"]/
 
 function walk(dir, out) {
   for (const name of fs.readdirSync(dir)) {
@@ -82,49 +117,61 @@ function walk(dir, out) {
   }
 }
 
-function isAllowed(relPath) {
-  return FORK_ALLOWLIST.some((suf) => relPath.endsWith(suf))
+
+function isAllowed(guard, relPath) {
+  return guard.allowlist.some((suf) => relPath.endsWith(suf))
 }
+
 
 function main() {
   const files = []
   walk(path.join(SRC_ROOT, 'components'), files)
   walk(path.join(SRC_ROOT, 'pages'), files)
 
-  const offenders = []
-  for (const f of files) {
-    const rel = path.relative(FRONTEND_ROOT, f)
-    if (isAllowed(rel)) continue
+  let totalOffenses = 0
 
-    const src = fs.readFileSync(f, 'utf8')
-    const importsResolver = CONSUMER_IMPORT_RX.test(src)
+  for (const guard of GUARDS) {
+    const offenders = []
+    for (const f of files) {
+      const rel = path.relative(FRONTEND_ROOT, f)
+      if (isAllowed(guard, rel)) continue
 
-    const hits = []
-    for (const { rx, label } of FORK_TOKENS) {
-      if (rx.test(src)) hits.push(label)
+      const src = fs.readFileSync(f, 'utf8')
+      const importsResolver = guard.resolver.test(src)
+
+      const hits = []
+      for (const { rx, label } of guard.tokens) {
+        if (rx.test(src)) hits.push(label)
+      }
+      if (hits.length && !importsResolver) {
+        offenders.push({ file: rel, hits })
+      }
     }
-    if (hits.length && !importsResolver) {
-      offenders.push({ file: rel, hits })
+
+    if (offenders.length === 0) {
+      console.log(`no-fork-truth [${guard.name}]: OK`)
+      continue
     }
+
+    console.error(`\nno-fork-truth [${guard.name}]: FAILED`)
+    console.error('  The following files reference tokens managed by')
+    console.error(`  src/lib/${guard.name}.js WITHOUT importing from it.`)
+    console.error(`  Either import the resolver and use its exports, or`)
+    console.error(`  add the file to the guard's allowlist if it is`)
+    console.error(`  authoritative.\n`)
+    for (const o of offenders) {
+      console.error(`    ${o.file}`)
+      for (const h of o.hits) console.error(`      · ${h}`)
+    }
+    totalOffenses += offenders.length
   }
 
-  if (offenders.length === 0) {
-    console.log('no-fork-truth: OK — no unshielded consumers of taught/verb tokens')
-    process.exit(0)
+  if (totalOffenses > 0) {
+    console.error('')
+    process.exit(1)
   }
-
-  console.error('\nno-fork-truth: FAILED — the following files reference')
-  console.error('taught-state / step-verb tokens WITHOUT importing from')
-  console.error('src/lib/programTruth.js. Either import the shared resolver')
-  console.error('and use isStepTaught / verbForStep / hasFullTaughtPose,')
-  console.error('or add the file to FORK_ALLOWLIST if it is authoritative.')
-  console.error('')
-  for (const o of offenders) {
-    console.error(`  ${o.file}`)
-    for (const h of o.hits) console.error(`    · ${h}`)
-  }
-  console.error('')
-  process.exit(1)
+  console.log('no-fork-truth: all guards clean')
+  process.exit(0)
 }
 
 main()
