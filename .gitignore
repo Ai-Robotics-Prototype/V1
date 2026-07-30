@@ -49,3 +49,6 @@ config/estun_s10_140_fitted.urdf
 *.pem
 *.key
 **/credentials.json
+
+# deploy.sh build stamp — regenerated per-machine
+src/cobot_dashboard/frontend/.deploy-src-hash

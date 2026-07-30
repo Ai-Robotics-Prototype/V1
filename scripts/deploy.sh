@@ -55,20 +55,56 @@ command -v sha256sum >/dev/null || { echo "sha256sum required"; exit 2; }
 sha12() { sha256sum "$1" | cut -c1-12; }
 
 # ── 1. Frontend build (if needed) ────────────────────────────────
+#
+# Build-needed decision: CONTENT HASH of the frontend source tree
+# vs the hash stamped by the previous build. Bugs the mtime
+# heuristic hit (2026-07-30, twice in one hour):
+#
+#   * `npm run build` runs during `verify` steps INSIDE the same
+#     script that later checks mtime → served/index.html gets
+#     rewritten SECOND, so its mtime is LATER than any source
+#     file, and the next deploy call sees "served newer than
+#     source, skip build" even when the source has changed since.
+#   * Any file touched between verify-build and commit
+#     (rebase, formatter, IDE autosave, git-stash apply) breaks
+#     the mtime comparison silently.
+#   * `find -newer` and mtime comparisons are noisy on shared
+#     filesystems (docker bind mounts, some COW filesystems).
+#
+# Content hash is the only heuristic that CAN'T be fooled by
+# clock skew, autosaves, or in-script rebuilds. Stamp file at
+# `frontend/.deploy-src-hash` records the hash that produced the
+# current bundle; deploy.sh rebuilds when the current source hash
+# differs.
+#
+# When in doubt, BUILD. A redundant vite build costs ~60s; a
+# skipped one cost the operator an afternoon of "why isn't the
+# new UI showing up?" twice today.
 step "Frontend build check"
 FRONTEND_NEEDS_BUILD=0
+BUILD_STAMP="$FRONTEND_SRC/.deploy-src-hash"
+# Content hash of every JS/JSX/CSS/HTML/JSON under frontend/src
+# (excluding node_modules and build outputs). `find -type f`
+# ordered by path so the hash is deterministic across invocations.
+FRONTEND_SRC_HASH=$(
+    cd "$FRONTEND_SRC" && \
+    find src package.json vite.config.* index.html \
+         -type f 2>/dev/null | sort | xargs sha256sum 2>/dev/null | \
+    sha256sum | cut -c1-16
+)
 if [[ ! -f "$FRONTEND_OUT/index.html" ]]; then
     FRONTEND_NEEDS_BUILD=1
     warn "no served bundle at $FRONTEND_OUT — building"
+elif [[ ! -f "$BUILD_STAMP" ]]; then
+    FRONTEND_NEEDS_BUILD=1
+    warn "no build stamp — treating as source-changed, will rebuild"
 else
-    # Newest source mtime under frontend/src vs served index.html.
-    NEWEST_SRC=$(find "$FRONTEND_SRC/src" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
-    SERVED_MT=$(stat -c '%Y' "$FRONTEND_OUT/index.html")
-    if awk -v a="$NEWEST_SRC" -v b="$SERVED_MT" 'BEGIN { exit !(a > b) }'; then
+    LAST_HASH=$(cat "$BUILD_STAMP" 2>/dev/null | tr -d '[:space:]')
+    if [[ "$FRONTEND_SRC_HASH" != "$LAST_HASH" ]]; then
         FRONTEND_NEEDS_BUILD=1
-        pass "source newer than served bundle — will rebuild"
+        pass "source hash changed ($LAST_HASH → $FRONTEND_SRC_HASH) — will rebuild"
     else
-        pass "served bundle up to date; skipping build"
+        pass "source hash unchanged ($FRONTEND_SRC_HASH); skipping build"
     fi
 fi
 
@@ -82,6 +118,11 @@ if [[ $FRONTEND_NEEDS_BUILD -eq 1 ]]; then
     step "npm run build"
     ( cd "$FRONTEND_SRC" && npm run build 2>&1 | tail -8 )
     pass "vite build complete"
+    # Stamp the source hash the build ran on. Next deploy compares
+    # against this to decide "changed since last build?". Missing
+    # or stale stamp → treated as changed → build. Never skip
+    # unless the hashes match exactly.
+    echo "$FRONTEND_SRC_HASH" > "$BUILD_STAMP"
 fi
 
 # ── 2. Restart services ──────────────────────────────────────────
@@ -122,25 +163,32 @@ else
 Restart may have raced with the fs write; re-run scripts/deploy.sh."
 fi
 
-if [[ $FRONTEND_NEEDS_BUILD -eq 1 ]]; then
-    step "Verify served asset hash changed"
-    POST_SERVED_ASSET=""
-    if [[ -f "$FRONTEND_OUT/index.html" ]]; then
-        POST_SERVED_ASSET=$(grep -oE '/assets/index-[A-Za-z0-9_-]+\.js' \
-                            "$FRONTEND_OUT/index.html" | head -1)
-    fi
+# Served asset check runs regardless of whether we built: the
+# operator wants to see the current asset hash on EVERY deploy so
+# they can compare against their tab's footer and confirm the tab
+# reload will actually change what they see (2026-07-30 the
+# operator hit two false-positive PASSes; showing the hash every
+# time is cheap and rules out the "did it change?" ambiguity).
+step "Served asset hash"
+POST_SERVED_ASSET=""
+if [[ -f "$FRONTEND_OUT/index.html" ]]; then
+    POST_SERVED_ASSET=$(grep -oE '/assets/index-[A-Za-z0-9_-]+\.js' \
+                        "$FRONTEND_OUT/index.html" | head -1)
+fi
+if [[ -z "$POST_SERVED_ASSET" ]]; then
+    fail "no served asset present"
+elif [[ $FRONTEND_NEEDS_BUILD -eq 1 ]]; then
     printf "    pre  : %s\n    post : %s\n" \
-        "${PRE_SERVED_ASSET:-<none>}" "${POST_SERVED_ASSET:-<none>}"
-    if [[ -z "$POST_SERVED_ASSET" ]]; then
-        fail "no served asset present after build"
-    elif [[ "$PRE_SERVED_ASSET" == "$POST_SERVED_ASSET" && -n "$PRE_SERVED_ASSET" ]]; then
-        # Same hash after a rebuild would mean sources hadn't actually
-        # changed (vite is deterministic on identical input). Warn,
-        # don't fail — the deploy is still correct, just a no-op.
-        warn "served asset hash unchanged after rebuild — input identical"
+        "${PRE_SERVED_ASSET:-<none>}" "$POST_SERVED_ASSET"
+    if [[ "$PRE_SERVED_ASSET" == "$POST_SERVED_ASSET" && -n "$PRE_SERVED_ASSET" ]]; then
+        warn "served asset hash unchanged after rebuild — input identical (vite deterministic)"
     else
         pass "served asset hash advanced: $PRE_SERVED_ASSET → $POST_SERVED_ASSET"
     fi
+else
+    printf "    served : %s (build skipped — source hash unchanged)\n" \
+        "$POST_SERVED_ASSET"
+    pass "served asset $POST_SERVED_ASSET"
 fi
 
 # ── 4. Verdict ───────────────────────────────────────────────────
@@ -148,8 +196,9 @@ echo
 if [[ $exit_code -eq 0 ]]; then
     printf "${GRN}════════  DEPLOY: PASS  ════════${RST}\n"
     printf "  program_ops boot=%s\n" "$BOOT_SHA"
-    [[ $FRONTEND_NEEDS_BUILD -eq 1 ]] && \
-        printf "  frontend    asset=%s\n" "${POST_SERVED_ASSET#/assets/index-}"
+    printf "  frontend    asset=%s\n" \
+        "${POST_SERVED_ASSET#/assets/index-}"
+    printf "  frontend    src_hash=%s\n" "$FRONTEND_SRC_HASH"
     printf "  Operator can Run.\n"
 else
     printf "${RED}════════  DEPLOY: FAIL  ════════${RST}\n"
