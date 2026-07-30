@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..schema import (
     AVAILABLE_OPERATIONS,
     IntentOperation,
+    LocationRegion,
     PartReference,
     PoseSlot,
     Scene,
@@ -37,7 +38,9 @@ from ..schema import (
     SOURCE_VIDEO,
     StructuredIntent,
     POSE_AWAITING_PERCEPTION,
+    _locationregion_from_dict,
 )
+from ..fusion import fuse_positions
 from ..understanding_backend import BackendResult, UnderstandingBackend
 from ..utils import read_b64_jpeg
 
@@ -167,6 +170,26 @@ CRITICAL RULES — violating any of these makes the output unusable:
      `affects.path = "effector"` and options ["vacuum", "finger"] so
      the operator can confirm — see the effector example below.
 
+     Every `pick` and `place` slot ALSO carries a `region` descriptor
+     — approximate normalized image location the fusion rule uses to
+     decide whether two events share a physical spot:
+        {{
+          "grid":    "3x3",              // always this value
+          "cell":    "TL"|"TC"|"TR"|
+                     "CL"|"C" |"CR"|
+                     "BL"|"BC"|"BR",     // where the hand terminates
+          "clarity": "clear"|"borderline"  // confidence in the cell
+        }}
+     Assign the cell by dividing the workspace frame into a 3x3 grid
+     (top row = TL/TC/TR from the operator's viewpoint) and asking
+     "which cell does the hand end in?". "clear" = well inside a
+     single cell; "borderline" = near a cell boundary or the frame
+     is uncertain. When two events share the same cell + both are
+     "clear", the fusion rule reads that as evidence of sameness.
+     Do NOT emit numeric coordinates. Do NOT report region as null —
+     always give a best-effort cell + a clarity, and let clarity
+     signal doubt.
+
   6) Surface uncertainty in `ambiguities` as STRUCTURED CLARIFICATIONS,
      not free-form prose. Each item is an OBJECT the dashboard renders
      as an interactive question the operator answers inline. Schema:
@@ -201,9 +224,18 @@ CRITICAL RULES — violating any of these makes the output unusable:
           part_select, `suggested` is a part_id; `options` is a list
           of {{"part_id":"...","name":"..."}}. For count, `suggested`
           is an int. For choice, `suggested` is one of `options`.
+       c) DO NOT emit any clarification asking whether two locations
+          are the same. Position identity is resolved DETERMINISTICALLY
+          by a downstream fusion rule (2026-08-01 §1c) using your
+          per-event `region` descriptor + the transcript's sameness
+          language. Your job is to REPORT the evidence, not to ask.
+          If you feel a merge is uncertain, set `region.clarity` to
+          "borderline" — the fusion rule renders that as a passive
+          "linked — verify" chip, not a blocking question.
      Conflicts between video and narration go in this same list with
      `field:"other"` and a question asking the operator which to
-     trust.
+     trust — EXCEPT sameness/difference of two locations, which
+     belongs in `region` per rule (c) above and is NOT asked.
 
      Examples:
        Vague pallet phrasing:
@@ -225,7 +257,30 @@ CRITICAL RULES — violating any of these makes the output unusable:
          {{"id":"q-count", "field":"count",
            "question":"How many pieces should the robot place?",
            "type":"number", "suggested":1,
-           "affects":{{"scope":"operation","operation_index":0,"path":"count_hint"}}}}
+           "affects":{{"scope":"operation","operation_index":0,"path":"count"}}}}
+       How pick positions are laid out — when count > 1, the composer
+       needs to know whether each pick pose is (a) its own taught
+       contact, (b) derived from a first taught anchor + regular
+       linear spacing, or (c) resolved by vision each cycle. Default
+       suggestion is `individual_taught` (operator teaches each). Use
+       `repeat_offset` when the narration/video shows a straight row
+       or column with visible spacing; use `vision_each` when the
+       narration explicitly says vision picks each cycle:
+         {{"id":"q-pick-pattern", "field":"other",
+           "question":"How should pick positions be set for the 3 bowls?",
+           "type":"choice",
+           "options":["individual_taught","repeat_offset","vision_each"],
+           "suggested":"individual_taught",
+           "affects":{{"scope":"operation","operation_index":0,"path":"pick_pattern"}}}}
+       Place stacks on top of each other — dz per iteration:
+         {{"id":"q-place-dz", "field":"other",
+           "question":"Bowls stack at the place location — height per bowl (mm)?",
+           "type":"number", "suggested":50,
+           "affects":{{"scope":"operation","operation_index":0,"path":"place_stack_dz_mm"}}}}
+       When emitting `q-place-dz`, ALSO set `place_pattern:"stack"` on
+       the operation so the composer's stack path fires; if the demo
+       says "stack" or "on top of the previous" and count > 1, do this
+       automatically (do NOT wait for the operator to answer).
        Place location vague:
          {{"id":"q-place", "field":"location",
            "question":"Describe the place target in a few words.",
@@ -334,10 +389,15 @@ SCHEMA_EXAMPLE = """\
       },
       "sequence_index": 1,
       "count_hint": "all",
+      "count": 1,
+      "pick_pattern":  "individual_taught",
+      "place_pattern": "fixed",
       "source":   "fixed_position",
       "effector": "finger",
-      "pick":  { "location_hint": "from the right bin",  "pose": null, "pose_status": "awaiting_perception" },
-      "place": { "location_hint": "onto the left tray",  "pose": null, "pose_status": "awaiting_perception" },
+      "pick":  { "location_hint": "from the right bin",  "pose": null, "pose_status": "awaiting_perception",
+                 "region": {"grid":"3x3","cell":"CR","clarity":"clear"} },
+      "place": { "location_hint": "onto the left tray",  "pose": null, "pose_status": "awaiting_perception",
+                 "region": {"grid":"3x3","cell":"CL","clarity":"clear"} },
       "notes": "Video shows three brackets at t=0s, tray empty at t=0s, brackets in tray at t=8s."
     }
   ],
@@ -371,6 +431,46 @@ pattern on the right side of the table, snake order":
       "pallet": { "rows": 3, "cols": 4, "layers": 1, "fill_order": "snake", "assumed": false },
       "notes": "Spoken grid: 3 by 4."
     }
+  ]
+}
+
+Multi-pick with stack — operator says "three white bowls in a row on
+the table, pick each and stack them on top of the destination bowl on
+the stool":
+{
+  "operations": [
+    {
+      "operation_type": "pick_and_place",
+      "target_part": { "part_id": "unknown", "name": "white bowl",
+                       "confidence": 0.2, "source": "unmatched" },
+      "sequence_index": 1,
+      "count_hint": 3,
+      "count": 3,
+      "pick_pattern":  "individual_taught",
+      "place_pattern": "stack",
+      "place_stack_dz_mm": 50,
+      "source":   "fixed_position",
+      "effector": "vacuum",
+      "pick":  { "location_hint": "from the row of bowls on the table",   "pose": null, "pose_status": "awaiting_perception" },
+      "place": { "location_hint": "stacked on the destination bowl on the stool", "pose": null, "pose_status": "awaiting_perception" },
+      "notes": "Narration: three bowls, pick each, stack on destination bowl. dz assumed 50mm — clarify."
+    }
+  ],
+  "ambiguities": [
+    {"id":"q-count", "field":"count",
+     "question":"How many bowls should the robot stack?",
+     "type":"number", "suggested":3,
+     "affects":{ "scope":"operation","operation_index":0,"path":"count" }},
+    {"id":"q-pick-pattern", "field":"other",
+     "question":"How should pick positions be set for the 3 bowls?",
+     "type":"choice",
+     "options":["individual_taught","repeat_offset","vision_each"],
+     "suggested":"individual_taught",
+     "affects":{ "scope":"operation","operation_index":0,"path":"pick_pattern" }},
+    {"id":"q-place-dz", "field":"other",
+     "question":"Bowls stack at the place location — height per bowl (mm)?",
+     "type":"number", "suggested":50,
+     "affects":{ "scope":"operation","operation_index":0,"path":"place_stack_dz_mm" }}
   ]
 }
 
@@ -708,6 +808,53 @@ def _parse_intent_json(text: str,
         else:
             pid_eff = pid
             source = str(tp.get('source') or 'matched_to_library')
+        # Count / pattern (Task 1 §2, 2026-07-28). Reconcile the legacy
+        # `count_hint` ('all' | int) with the new canonical `count` (int).
+        # Any positive int wins; 'all' or missing → 1. The from_dict path
+        # in schema.py does the same coercion — this parser mirrors it
+        # exactly because compose_program_draft is called on the in-memory
+        # StructuredIntent this function returns (NOT on a JSON round-
+        # trip), so a field the parser drops is a field the composer
+        # never sees.
+        raw_count = op.get('count')
+        if raw_count is None:
+            raw_count = op.get('count_hint')
+        try:
+            if raw_count is None or (isinstance(raw_count, str)
+                                     and raw_count.strip().lower() == 'all'):
+                count_i = 1
+            else:
+                count_i = max(1, int(raw_count))
+        except (TypeError, ValueError):
+            count_i = 1
+        _PICK_PATTERNS_LOCAL  = {'individual_taught', 'repeat_offset', 'vision_each'}
+        _PLACE_PATTERNS_LOCAL = {'fixed', 'stack', 'repeat_offset'}
+        pp_raw = str(op.get('pick_pattern') or '').strip().lower()
+        pick_pattern_i = pp_raw if pp_raw in _PICK_PATTERNS_LOCAL else 'individual_taught'
+        ppl_raw = str(op.get('place_pattern') or '').strip().lower()
+        place_pattern_i = ppl_raw if ppl_raw in _PLACE_PATTERNS_LOCAL else 'fixed'
+        def _f_or_none(v):
+            if v is None or v == '':
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        # Effector / source / pallet also flow through here (they always
+        # did, but the parser dropped them — legacy composed drafts came
+        # out with defaults instead of the model's choice). Fixed at the
+        # same time as count/pattern so we don't ship a still-partial
+        # parser.
+        _EFFECTORS_LOCAL = {'finger', 'vacuum', 'magnetic'}
+        _SOURCES_LOCAL   = {'fixed_position', 'camera_library'}
+        eff_raw = str(op.get('effector') or '').strip().lower()
+        effector_i = eff_raw if eff_raw in _EFFECTORS_LOCAL else 'finger'
+        src_raw = str(op.get('source') or '').strip().lower()
+        source_i = src_raw if src_raw in _SOURCES_LOCAL else 'fixed_position'
+        pallet_i = None
+        if op_type in ('palletize', 'depalletize') and op.get('pallet'):
+            from ..schema import PalletSpec as _PalletSpec
+            pallet_i = _PalletSpec.from_dict(op.get('pallet'))
         ops_out.append(IntentOperation(
             operation_type=op_type,
             target_part=PartReference(
@@ -718,20 +865,33 @@ def _parse_intent_json(text: str,
             ),
             sequence_index=int(op.get('sequence_index') or (idx + 1)),
             count_hint=op.get('count_hint') if op.get('count_hint') is not None else 'all',
+            count=count_i,
+            pick_pattern=pick_pattern_i,
+            pick_pitch_dx_mm=_f_or_none(op.get('pick_pitch_dx_mm')),
+            pick_pitch_dy_mm=_f_or_none(op.get('pick_pitch_dy_mm')),
+            place_pattern=place_pattern_i,
+            place_stack_dz_mm=_f_or_none(op.get('place_stack_dz_mm')),
+            place_pitch_dx_mm=_f_or_none(op.get('place_pitch_dx_mm')),
+            place_pitch_dy_mm=_f_or_none(op.get('place_pitch_dy_mm')),
             pick=PoseSlot(
                 location_hint=str((op.get('pick') or {}).get('location_hint') or ''),
                 pose=None,
                 pose_status=POSE_AWAITING_PERCEPTION,
+                region=_locationregion_from_dict((op.get('pick') or {}).get('region')),
             ),
             place=PoseSlot(
                 location_hint=str((op.get('place') or {}).get('location_hint') or ''),
                 pose=None,
                 pose_status=POSE_AWAITING_PERCEPTION,
+                region=_locationregion_from_dict((op.get('place') or {}).get('region')),
             ),
+            pallet=pallet_i,
             notes=str(op.get('notes') or ''),
+            source=source_i,
+            effector=effector_i,
         ))
 
-    return StructuredIntent(
+    intent = StructuredIntent(
         task_summary=str(data.get('task_summary') or ''),
         scene=scene,
         operations=ops_out,
@@ -739,3 +899,12 @@ def _parse_intent_json(text: str,
         confidence_overall=float(data.get('confidence_overall') or 0.0),
         raw_understanding_notes=str(data.get('raw_understanding_notes') or ''),
     )
+    # 2026-08-01 §1c: run fusion AFTER the raw parse so the intent
+    # returned to the pipeline already has positions[] populated and
+    # each pick/place's location_ref filled. Fusion is deterministic
+    # and runs pure Python — no model call. A re-invocation on the
+    # stored intent (see fusion.refuse_intent) produces the same
+    # result, so re-composing an older demo picks up the new rules
+    # without a network round-trip.
+    fuse_positions(intent)
+    return intent

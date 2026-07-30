@@ -411,3 +411,179 @@ def test_derived_steps_never_carry_taught_data():
         assert not s.get('taught_joints'), s
         assert not s.get('taught_tcp'), s
         assert not s.get('position_role'), s
+
+
+# ── Task 1 §2: count + pick_pattern + place_pattern unroll ─────────
+#
+# Pin the exact shape the composer's multi-iteration output must take.
+# The three-bowl demo (demo_20260728T140112_4dfa32) was mis-composed as
+# a single pick/place pair despite intent.operations[0].count_hint=3;
+# these tests make the same regression detectable at CI time.
+
+def test_compose_count_three_emits_three_pick_place_iterations():
+    """count=3 pick_and_place → 3 taught pick contacts, 3 taught place
+    contacts (individual_taught default), N approach/retreat pairs per
+    side. Same shape the wizard's multi-pose flow would produce."""
+    intent = _intent_pick_and_place()
+    intent.operations[0].count = 3
+    steps = compose_program_draft(intent, demo_id='demo_c3').to_program_payload()['steps']
+    picks  = [s for s in steps if s.get('position_role') == 'pick']
+    places = [s for s in steps if s.get('position_role') == 'place']
+    assert len(picks)  == 3, [p.get('label') for p in picks]
+    assert len(places) == 3, [p.get('label') for p in places]
+    # Each iteration's pick/place carries iter_index + iter_count for
+    # the frontend grouping renderer.
+    for i, p in enumerate(picks):
+        assert p.get('iter_index') == i, p
+        assert p.get('iter_count') == 3, p
+    for i, p in enumerate(places):
+        assert p.get('iter_index') == i, p
+        assert p.get('iter_count') == 3, p
+
+
+def test_compose_count_one_is_bit_identical_to_pre_unroll():
+    """Load-bearing back-compat: count=1 (or unset) must produce the
+    same step list as the pre-unroll composer. Any label / role / count
+    drift here would silently rewrite every legacy demo's draft."""
+    intent = _intent_pick_and_place()
+    # default count=1
+    steps = compose_program_draft(intent, demo_id='demo_c1').to_program_payload()['steps']
+    picks  = [s for s in steps if s.get('position_role') == 'pick']
+    places = [s for s in steps if s.get('position_role') == 'place']
+    assert len(picks)  == 1
+    assert len(places) == 1
+    # No iter_* fields on any step when count=1 — the frontend renders
+    # single-pair drafts with no iteration badges.
+    for s in steps:
+        assert 'iter_index'   not in s, s
+        assert 'iter_count'   not in s, s
+        assert 'iter_pattern' not in s, s
+    # Labels stay at the pre-unroll wording.
+    pick_labels  = [s.get('label') for s in picks]
+    place_labels = [s.get('label') for s in places]
+    assert pick_labels  == ['Pick position — contact']
+    assert place_labels == ['Place position — contact']
+
+
+def test_compose_place_pattern_stack_derives_iterations_from_first_taught_place():
+    """place_pattern=stack + count=3 + dz=100 → iter 0 taught place,
+    iters 1..N derived_from='place' offset_z_mm = i·dz. The codegen
+    resolver finds iter 0's taught place as the nearest anchor and adds
+    the offset for iters 1..N by construction."""
+    intent = _intent_pick_and_place()
+    intent.operations[0].count = 3
+    intent.operations[0].place_pattern = 'stack'
+    intent.operations[0].place_stack_dz_mm = 100.0
+    steps = compose_program_draft(intent, demo_id='demo_stack3').to_program_payload()['steps']
+    # Exactly ONE taught place across the 3 iterations (iter 0's).
+    taught_place = [s for s in steps if s.get('position_role') == 'place']
+    assert len(taught_place) == 1, taught_place
+    assert taught_place[0].get('iter_index') == 0
+    # Iters 1 and 2 = derived_from='place' with offset_z_mm = i·dz.
+    # Filter to the STACK derived steps (not the approach/retreat ones,
+    # which are also derived_from='place').
+    stack_steps = [s for s in steps
+                   if s.get('iter_pattern') == 'stack' and s.get('iter_index', 0) > 0]
+    assert len(stack_steps) == 2, stack_steps
+    stack_by_iter = {int(s['iter_index']): s for s in stack_steps}
+    assert stack_by_iter[1].get('offset_z_mm') == 100
+    assert stack_by_iter[2].get('offset_z_mm') == 200
+    for s in stack_steps:
+        assert s.get('derived_from') == 'place'
+        assert not s.get('position_role')  # derived, not taught
+
+
+def test_intent_count_hint_string_all_normalizes_to_one():
+    """Legacy `count_hint: 'all'` (the model's placeholder for
+    'unspecified') must land as count=1 so single-pair legacy drafts
+    don't suddenly balloon to N iterations."""
+    d = {
+        'operations': [{
+            'operation_type': 'pick_and_place',
+            'target_part': {'part_id': 'unknown', 'name': 'widget'},
+            'sequence_index': 1,
+            'count_hint': 'all',
+            'pick': {'location_hint': ''},
+            'place': {'location_hint': ''},
+        }],
+    }
+    intent = StructuredIntent.from_dict(d)
+    assert intent.operations[0].count == 1
+
+
+def test_intent_count_hint_int_promotes_to_count():
+    """A legacy intent whose ONLY count carrier is count_hint=3 must
+    parse into count=3 so the composer unrolls correctly on the next
+    re-compose. This is exactly the pre-fix three-bowl case."""
+    d = {
+        'operations': [{
+            'operation_type': 'pick_and_place',
+            'target_part': {'part_id': 'unknown', 'name': 'bowl'},
+            'sequence_index': 1,
+            'count_hint': 3,
+            'pick':  {'location_hint': 'from row on table'},
+            'place': {'location_hint': 'stacked on destination'},
+        }],
+    }
+    intent = StructuredIntent.from_dict(d)
+    assert intent.operations[0].count == 3
+
+
+def test_intent_count_canonical_wins_over_count_hint():
+    """When both fields are present, `count` (canonical) wins — the
+    operator's clarification answer writes count, and re-composing must
+    not fall back to a stale count_hint."""
+    d = {
+        'operations': [{
+            'operation_type': 'pick_and_place',
+            'target_part': {'part_id': 'unknown', 'name': 'bowl'},
+            'sequence_index': 1,
+            'count_hint': 3,   # what the model originally suggested
+            'count':      5,   # what the operator answered
+            'pick':  {'location_hint': ''},
+            'place': {'location_hint': ''},
+        }],
+    }
+    intent = StructuredIntent.from_dict(d)
+    assert intent.operations[0].count == 5
+
+
+def test_compose_pick_pattern_unknown_falls_back_to_individual_taught():
+    """An unrecognized pick_pattern (e.g. an old client that hasn't
+    caught up on the vocabulary) must not crash the composer — it
+    falls back to the safe default so a demo still opens."""
+    d = {
+        'operations': [{
+            'operation_type': 'pick_and_place',
+            'target_part': {'part_id': 'unknown', 'name': 'x'},
+            'sequence_index': 1,
+            'count': 2,
+            'pick_pattern': 'not_a_real_pattern',
+            'pick':  {'location_hint': ''},
+            'place': {'location_hint': ''},
+        }],
+    }
+    intent = StructuredIntent.from_dict(d)
+    assert intent.operations[0].pick_pattern == 'individual_taught'
+    steps = compose_program_draft(intent, demo_id='demo_fallback').to_program_payload()['steps']
+    picks = [s for s in steps if s.get('position_role') == 'pick']
+    assert len(picks) == 2   # two taught anchors (individual_taught)
+
+
+def test_correction_diff_pattern_correction_flags_count_upgrade():
+    """The correction_diff summary must carry a pattern_correction
+    block when the operator's Accept upgraded the count. This is the
+    training signal Task 1 §5 asks for."""
+    from programming_by_demonstration.correction_diff import compute_correction_diff
+    intent1 = _intent_pick_and_place()
+    intent1.operations[0].count = 1
+    draft = compose_program_draft(intent1, demo_id='d1').to_program_payload()
+    intent3 = _intent_pick_and_place()
+    intent3.operations[0].count = 3
+    corrected = compose_program_draft(intent3, demo_id='d1').to_program_payload()
+    diff = compute_correction_diff(draft, corrected)
+    pc = diff['summary'].get('pattern_correction')
+    assert pc is not None, diff['summary']
+    assert pc['draft_iter_count']     == 1
+    assert pc['corrected_iter_count'] == 3
+    assert pc['count_delta']          == 2

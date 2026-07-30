@@ -63,14 +63,96 @@ class PartReference:
 
 
 @dataclass
-class PoseSlot:
-    """Pick / place / approach pose. Always a placeholder in this build."""
-    location_hint: str = ''
-    pose: Optional[List[float]] = None
-    pose_status: str = POSE_AWAITING_PERCEPTION
+class LocationRegion:
+    """Normalized image location for one pick/place event — the video
+    channel's evidence used by the position-identity fusion rule.
+
+    Model-friendly and categorical: a 3×3 grid over the workspace
+    view. Same cell across two events = evidence of the same physical
+    spot; `clarity` records the model's confidence in the cell
+    assignment. None on a slot means the backend did not report a
+    region (older stored demos, or the backend chose not to).
+    """
+    grid:      str           = '3x3'     # grid resolution the backend
+                                         # reported against; only '3x3'
+                                         # is validated by fusion.py.
+    cell:      str           = ''        # 'TL'|'TC'|'TR'|'CL'|'C'|'CR'|
+                                         # 'BL'|'BC'|'BR' — empty = unknown
+    clarity:   str           = 'unknown' # 'clear' | 'borderline' | 'unknown'
+    frame_ref: Optional[str] = None      # optional pointer to a frame
+                                         # timestamp for audit
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class PoseSlot:
+    """Pick / place / approach pose. Always a placeholder in this build.
+
+    2026-08-01 §1 adds:
+      * `location_ref` — string key into StructuredIntent.positions.
+        Identical strings across operations = same physical spot per
+        the fusion rule. Empty on legacy demos (they parse back with
+        no ref; fusion can be re-run to populate).
+      * `region` — LocationRegion the backend reported for this event.
+        Feeds fusion's video channel.
+    """
+    location_hint: str = ''
+    pose: Optional[List[float]] = None
+    pose_status: str = POSE_AWAITING_PERCEPTION
+    location_ref: str = ''
+    region: Optional[LocationRegion] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        # Ensure region round-trips as a dict rather than a nested
+        # dataclass on downstream deserializers.
+        d['region'] = self.region.to_dict() if self.region else None
+        return d
+
+
+_VALID_CELLS = frozenset(('TL', 'TC', 'TR',
+                          'CL', 'C',  'CR',
+                          'BL', 'BC', 'BR'))
+_VALID_CLARITY = frozenset(('clear', 'borderline', 'unknown'))
+
+
+def _locationregion_from_dict(d: Optional[Dict[str, Any]]) -> Optional[LocationRegion]:
+    """Tolerant deserializer for LocationRegion. Returns None when the
+    input is missing or empty; coerces bad values back to 'unknown'."""
+    if not isinstance(d, dict):
+        return None
+    cell    = str(d.get('cell') or '').strip().upper()
+    if cell not in _VALID_CELLS:
+        cell = ''
+    clarity = str(d.get('clarity') or 'unknown').strip().lower()
+    if clarity not in _VALID_CLARITY:
+        clarity = 'unknown'
+    frame_ref = d.get('frame_ref')
+    if not cell and clarity == 'unknown' and not frame_ref:
+        return None
+    return LocationRegion(
+        grid=str(d.get('grid') or '3x3'),
+        cell=cell,
+        clarity=clarity,
+        frame_ref=str(frame_ref) if frame_ref else None,
+    )
+
+
+def _poseslot_from_dict(d: Optional[Dict[str, Any]]) -> PoseSlot:
+    """Deserialize a PoseSlot from an intent-JSON fragment. Handles
+    the 2026-08-01 additions (`location_ref`, `region`) and preserves
+    the legacy shape (`location_hint`, `pose`, `pose_status`)."""
+    if not isinstance(d, dict):
+        return PoseSlot(pose_status=POSE_AWAITING_PERCEPTION)
+    return PoseSlot(
+        location_hint=str(d.get('location_hint') or ''),
+        pose=None,      # every pose in this build is a placeholder
+        pose_status=POSE_AWAITING_PERCEPTION,
+        location_ref=str(d.get('location_ref') or ''),
+        region=_locationregion_from_dict(d.get('region')),
+    )
 
 
 @dataclass
@@ -134,18 +216,167 @@ class PalletSpec:
         )
 
 
+# Repetition patterns (Task 1 §2, 2026-07-28). The composer consults these
+# to unroll operations whose `count` > 1. Kept string-typed so a legacy
+# intent that never mentions repetition still parses; unknown values coerce
+# to the safe default ('individual_taught') at from_dict time.
+PICK_PATTERN_INDIVIDUAL_TAUGHT = 'individual_taught'   # N own taught anchors
+PICK_PATTERN_REPEAT_OFFSET     = 'repeat_offset'       # 1 taught + N-1 derived (i·pitch)
+PICK_PATTERN_VISION_EACH       = 'vision_each'         # detect step per iter
+PLACE_PATTERN_FIXED            = 'fixed'               # all iters place at same taught pose
+PLACE_PATTERN_STACK            = 'stack'               # +i·dz on top of iter 0
+PLACE_PATTERN_REPEAT_OFFSET    = 'repeat_offset'       # 1 taught + N-1 derived (i·pitch)
+# 2026-08-06 §1 addition — pallet_place: teach ONE anchor at the first
+# slot (row=0, col=0, layer=0), derive every other slot from the anchor
+# via operator-entered pitch × row_axis / pitch × col_axis / layer_height.
+# The whole pallet is ONE taught position + N-1 derived contacts —
+# radically fewer teach operations than repeat_offset. Distinct from the
+# existing `palletize` op_type (which delegates slot expansion to the
+# executor at runtime); pallet_place is a PLACE PATTERN on a normal
+# pick_and_place op, so the pick side stays identical to today.
+PLACE_PATTERN_PALLET           = 'pallet_place'
+
+_PICK_PATTERNS  = (PICK_PATTERN_INDIVIDUAL_TAUGHT,
+                   PICK_PATTERN_REPEAT_OFFSET,
+                   PICK_PATTERN_VISION_EACH)
+_PLACE_PATTERNS = (PLACE_PATTERN_FIXED,
+                   PLACE_PATTERN_STACK,
+                   PLACE_PATTERN_REPEAT_OFFSET,
+                   PLACE_PATTERN_PALLET)
+
+
+# Base-frame axis literals for pallet row/col growth directions.
+_PALLET_AXES = ('+X', '-X', '+Y', '-Y')
+_PALLET_ORDERS = ('row_major', 'col_major', 'snake')
+
+
+@dataclass
+class PalletPlaceSpec:
+    """Geometry of a `pallet_place` pattern (2026-08-06 §1).
+
+    ONE teachable position lives on the operation's `place` slot
+    (via `location_ref`, which the composer routes to the anchor
+    step); every other slot is DERIVED via the composer + codegen's
+    seeded-IK machinery from the anchor's taught joints.
+
+    Grid growth axes are base-frame literals (`+X`, `-X`, `+Y`, `-Y`)
+    — the operator picks which way the grid extends from the taught
+    corner. Defaults `+X` (row) / `+Y` (col) match the wizard's 2D
+    diagram convention.
+
+    `order` sets the fill sequence:
+        row_major  — (0,0)(0,1)(0,2)(1,0)(1,1)…  simple raster
+        col_major  — (0,0)(1,0)(2,0)(0,1)(1,1)…  column-first raster
+        snake      — (0,0)(0,1)(0,2)(1,2)(1,1)(1,0)(2,0)…  serpentine
+                     (shortest travel — every other row reverses)
+    Default snake because that minimises inter-slot travel for the
+    typical pallet geometry (pitches ~50 mm, rows ~4 wide).
+    """
+    rows:               int   = 1
+    cols:               int   = 1
+    pitch_row_mm:       float = 0.0
+    pitch_col_mm:       float = 0.0
+    row_axis:           str   = '+X'    # one of _PALLET_AXES
+    col_axis:           str   = '+Y'
+    layers:             int   = 1
+    layer_height_mm:    Optional[float] = None    # ignored when layers == 1
+    order:              str   = 'snake'           # one of _PALLET_ORDERS
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'PalletPlaceSpec':
+        if not isinstance(d, dict):
+            return cls()
+        def _pos_int(v, default=1):
+            try:
+                n = int(v)
+                return n if n > 0 else default
+            except (TypeError, ValueError):
+                return default
+        def _f(v):
+            try:
+                return float(v) if v is not None and v != '' else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+        def _opt_f(v):
+            try:
+                return float(v) if v is not None and v != '' else None
+            except (TypeError, ValueError):
+                return None
+        row_axis = str(d.get('row_axis') or '+X').upper()
+        if row_axis not in _PALLET_AXES:
+            row_axis = '+X'
+        col_axis = str(d.get('col_axis') or '+Y').upper()
+        if col_axis not in _PALLET_AXES:
+            col_axis = '+Y'
+        order = str(d.get('order') or 'snake').lower()
+        if order not in _PALLET_ORDERS:
+            order = 'snake'
+        return cls(
+            rows=_pos_int(d.get('rows'), 1),
+            cols=_pos_int(d.get('cols'), 1),
+            pitch_row_mm=_f(d.get('pitch_row_mm')),
+            pitch_col_mm=_f(d.get('pitch_col_mm')),
+            row_axis=row_axis,
+            col_axis=col_axis,
+            layers=_pos_int(d.get('layers'), 1),
+            layer_height_mm=_opt_f(d.get('layer_height_mm')),
+            order=order,
+        )
+
+    def total_slots(self) -> int:
+        return int(self.rows) * int(self.cols) * int(self.layers)
+
+
 @dataclass
 class IntentOperation:
     """One step of the demonstrated task."""
     operation_type: str                # must be in AVAILABLE_OPERATIONS
     target_part: PartReference
     sequence_index: int
+    # Legacy — the composer used to ignore this. Kept for wire-compat with
+    # stored intents; NEW clarifications write `count` (below). from_dict
+    # accepts either; to_dict emits both so downstream consumers can pick
+    # whichever they already speak.
     count_hint: Any = 'all'            # 'all' | int
+    # Canonical iteration count (Task 1 §2). Composer unrolls this many
+    # pick/place iterations; default 1 keeps every legacy intent's draft
+    # bit-identical.
+    count: int = 1
+    # How iterations 2..N of pick relate to iteration 1's taught anchor.
+    #   individual_taught  — each iteration is its own taught contact (safe
+    #                        default; operator teaches N times).
+    #   repeat_offset      — iteration i's contact = anchor + (i · pitch);
+    #                        pitch supplied by pick_pitch_dx_mm / dy_mm.
+    #                        `derived_from='pick_iter0'` on iters 2..N.
+    #   vision_each        — a `detect` step runs per iteration and the
+    #                        pick pose comes from perception each cycle.
+    pick_pattern:      str   = PICK_PATTERN_INDIVIDUAL_TAUGHT
+    pick_pitch_dx_mm:  Optional[float] = None
+    pick_pitch_dy_mm:  Optional[float] = None
+    # Place iteration policy.
+    #   fixed          — every iter drops at the same taught place pose
+    #                    (overwrites — rarely what the operator wants).
+    #   stack          — iter i places at (place anchor + i · dz Z);
+    #                    dz = place_stack_dz_mm. Default when the transcript
+    #                    mentions stacking / "on top of the previous".
+    #   repeat_offset  — iter i places at (place anchor + i · pitch);
+    #                    dx/dy in place_pitch_*.
+    place_pattern:     str   = PLACE_PATTERN_FIXED
+    place_stack_dz_mm: Optional[float] = None
+    place_pitch_dx_mm: Optional[float] = None
+    place_pitch_dy_mm: Optional[float] = None
     pick: PoseSlot = dc_field(default_factory=PoseSlot)
     place: PoseSlot = dc_field(default_factory=PoseSlot)
     # Only meaningful for palletize / depalletize ops. None on other
     # ops so backward-compat consumers can keep ignoring it.
     pallet: Optional[PalletSpec] = None
+    # 2026-08-06 §1 — pallet_place pattern spec. Only meaningful when
+    # `place_pattern == 'pallet_place'`. None on other ops keeps the
+    # dict shape byte-identical to legacy intents.
+    pallet_place: Optional[PalletPlaceSpec] = None
     notes: str = ''
     # How the robot LOCATES the part each cycle. Mirrors the wizard's
     # `answers.source` discriminator so the composer can gate the
@@ -185,10 +416,11 @@ class IntentOperation:
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        d['target_part'] = self.target_part.to_dict()
-        d['pick']        = self.pick.to_dict()
-        d['place']       = self.place.to_dict()
-        d['pallet']      = self.pallet.to_dict() if self.pallet else None
+        d['target_part']  = self.target_part.to_dict()
+        d['pick']         = self.pick.to_dict()
+        d['place']        = self.place.to_dict()
+        d['pallet']       = self.pallet.to_dict() if self.pallet else None
+        d['pallet_place'] = self.pallet_place.to_dict() if self.pallet_place else None
         return d
 
 
@@ -361,6 +593,52 @@ class Clarification:
 
 
 @dataclass
+class LocationRef:
+    """One resolved position — the SAME across all events that fusion
+    marked as the same physical spot. Every pick/place slot on an
+    operation carries a `location_ref` STRING that points into
+    StructuredIntent.positions; identical strings = same place.
+
+    Fusion is DECIDED, not asked. The `fusion_rule` field records
+    which of the ordered rules (§1c) fired to produce this ref, and
+    `confidence` is the numeric score. `low_confidence=True` renders
+    as a passive 'linked — verify' chip in review; NOT a blocking
+    clarification question.
+
+    The `members` list is the audit trail — every (op_index, slot)
+    that folded into this ref. The learning store records split /
+    merge corrections against the ref, so a training loop can see
+    exactly where fusion was wrong.
+    """
+    ref:            str                     = ''
+    label:          str                     = ''    # 'Tray pick', 'Fixture A'…
+    role:           str                     = ''    # 'pick' | 'place' | 'mixed'
+    fusion_rule:    str                     = ''    # 'speech_same+video_agrees' …
+    confidence:     float                   = 0.0   # 0..1
+    low_confidence: bool                    = False
+    members:        List[Dict[str, Any]]    = dc_field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'LocationRef':
+        if not isinstance(d, dict):
+            return cls()
+        members = d.get('members') or []
+        members = [m for m in members if isinstance(m, dict)]
+        return cls(
+            ref=str(d.get('ref') or ''),
+            label=str(d.get('label') or ''),
+            role=str(d.get('role') or ''),
+            fusion_rule=str(d.get('fusion_rule') or ''),
+            confidence=float(d.get('confidence') or 0.0),
+            low_confidence=bool(d.get('low_confidence') or False),
+            members=[dict(m) for m in members],
+        )
+
+
+@dataclass
 class StructuredIntent:
     """Grounded interpretation of one demonstration."""
     task_summary: str = ''
@@ -370,6 +648,10 @@ class StructuredIntent:
     # /opt/cobot/demonstrations use this) but the type is now
     # Clarification. Legacy plain strings get wrapped on load.
     ambiguities: List[Clarification] = dc_field(default_factory=list)
+    # 2026-08-01 §1 — resolved position identities across operations.
+    # Populated by fusion.fuse_positions after the backend returns.
+    # Legacy stored demos default to [] and re-fuse on demand.
+    positions: List[LocationRef] = dc_field(default_factory=list)
     confidence_overall: float = 0.0
     raw_understanding_notes: str = ''
     # Provenance — populated by the orchestration layer, not the backend.
@@ -403,6 +685,7 @@ class StructuredIntent:
             'scene':                   self.scene.to_dict(),
             'operations':              [op.to_dict() for op in self.operations],
             'ambiguities':             [c.to_dict() for c in self.ambiguities],
+            'positions':               [p.to_dict() for p in self.positions],
             'confidence_overall':      float(self.confidence_overall),
             'raw_understanding_notes': self.raw_understanding_notes,
             'backend_id':              self.backend_id,
@@ -426,6 +709,43 @@ class StructuredIntent:
             pallet_spec: Optional[PalletSpec] = None
             if op_type in ('palletize', 'depalletize'):
                 pallet_spec = PalletSpec.from_dict(raw.get('pallet'))
+            # 2026-08-06 §1 — pallet_place spec sits on any op whose
+            # place_pattern == 'pallet_place'. Legacy intents don't
+            # carry the field and load with pallet_place=None (composer
+            # takes the safe non-pallet branches).
+            pallet_place_spec: Optional[PalletPlaceSpec] = None
+            if raw.get('pallet_place') is not None:
+                pallet_place_spec = PalletPlaceSpec.from_dict(raw.get('pallet_place'))
+            # Count reconciliation (Task 1 §2). Accept either the legacy
+            # `count_hint` ('all' | int) or the canonical `count` (int).
+            # 'all' → 1 iteration in the composer (the operator hasn't
+            # confirmed a repetition yet — the q-count ambiguity is what
+            # upgrades it). Any positive int wins.
+            raw_count = raw.get('count')
+            if raw_count is None:
+                raw_count = raw.get('count_hint')
+            try:
+                if raw_count is None or (isinstance(raw_count, str)
+                                         and raw_count.strip().lower() == 'all'):
+                    count = 1
+                else:
+                    count = max(1, int(raw_count))
+            except (TypeError, ValueError):
+                count = 1
+            # Pattern coercion — unknown strings snap to the safe default.
+            pp_raw = str(raw.get('pick_pattern') or '').strip().lower()
+            pick_pattern = pp_raw if pp_raw in _PICK_PATTERNS \
+                else PICK_PATTERN_INDIVIDUAL_TAUGHT
+            ppl_raw = str(raw.get('place_pattern') or '').strip().lower()
+            place_pattern = ppl_raw if ppl_raw in _PLACE_PATTERNS \
+                else PLACE_PATTERN_FIXED
+            def _f(v):
+                if v is None or v == '':
+                    return None
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
             ops.append(IntentOperation(
                 operation_type=op_type,
                 target_part=PartReference(
@@ -436,17 +756,18 @@ class StructuredIntent:
                 ),
                 sequence_index=int(raw.get('sequence_index') or 0),
                 count_hint=raw.get('count_hint') if raw.get('count_hint') is not None else 'all',
-                pick=PoseSlot(
-                    location_hint=str((raw.get('pick') or {}).get('location_hint') or ''),
-                    pose=None,
-                    pose_status=POSE_AWAITING_PERCEPTION,
-                ),
-                place=PoseSlot(
-                    location_hint=str((raw.get('place') or {}).get('location_hint') or ''),
-                    pose=None,
-                    pose_status=POSE_AWAITING_PERCEPTION,
-                ),
+                count=count,
+                pick_pattern=pick_pattern,
+                pick_pitch_dx_mm=_f(raw.get('pick_pitch_dx_mm')),
+                pick_pitch_dy_mm=_f(raw.get('pick_pitch_dy_mm')),
+                place_pattern=place_pattern,
+                place_stack_dz_mm=_f(raw.get('place_stack_dz_mm')),
+                place_pitch_dx_mm=_f(raw.get('place_pitch_dx_mm')),
+                place_pitch_dy_mm=_f(raw.get('place_pitch_dy_mm')),
+                pick=_poseslot_from_dict(raw.get('pick')),
+                place=_poseslot_from_dict(raw.get('place')),
                 pallet=pallet_spec,
+                pallet_place=pallet_place_spec,
                 notes=str(raw.get('notes') or ''),
                 source=(str(raw.get('source') or 'fixed_position').lower()
                         if str(raw.get('source') or '').lower() in
@@ -465,11 +786,15 @@ class StructuredIntent:
             if not c.id:
                 c.id = fallback
             clarifications.append(c)
+        positions = [LocationRef.from_dict(p)
+                     for p in (d.get('positions') or [])
+                     if isinstance(p, dict)]
         return cls(
             task_summary=str(d.get('task_summary') or ''),
             scene=Scene.from_dict(d.get('scene') or {}),
             operations=ops,
             ambiguities=clarifications,
+            positions=positions,
             confidence_overall=float(d.get('confidence_overall') or 0.0),
             raw_understanding_notes=str(d.get('raw_understanding_notes') or ''),
             backend_id=str(d.get('backend_id') or ''),
@@ -485,6 +810,43 @@ class StructuredIntent:
 # the program as demonstration-generated.
 
 @dataclass
+class Routine:
+    """A REPRESENTATION-LEVEL grouping of a repeated operation
+    sub-sequence (2026-08-02 task §2). The program is still emitted
+    UNROLLED — codegen never sees routines[] and produces byte-
+    identical Lua to a flat-authored equivalent (pinned by
+    test_routine_grouped_lua_bytediff). Routines are what the
+    editor + review UI collapse to render "×3" instead of three
+    copies.
+
+    Fields:
+      id                       — 'routine_1' style, stable within a program.
+      name                     — auto-generated, e.g. "Pick & place ×3".
+      iterations               — number of copies of the sub-sequence.
+      operation_indices        — indices into intent.operations that fold
+                                 into this routine (in order).
+      step_indices_per_iter    — list of [start, end) index ranges into
+                                 ProgramDraft.steps for each iteration —
+                                 the review UI uses these to fold/expand.
+      per_iteration_deltas     — reserved for §415 offset-pattern work.
+                                 Empty list today; a per-iteration override
+                                 would land here as {"iter": int, "delta": {...}}.
+      single_iteration_signature — the shared op-signature tuple that
+                                   identified the routine.
+    """
+    id: str = ''
+    name: str = ''
+    iterations: int = 1
+    operation_indices: List[int]     = dc_field(default_factory=list)
+    step_indices_per_iter: List[List[int]] = dc_field(default_factory=list)
+    per_iteration_deltas: List[Dict[str, Any]] = dc_field(default_factory=list)
+    single_iteration_signature: Dict[str, Any] = dc_field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class ProgramDraft:
     name: str
     description: str
@@ -492,6 +854,11 @@ class ProgramDraft:
     config: Dict[str, Any]
     tags: List[str]
     pbd_metadata: Dict[str, Any]       # source demo_id, intent ref, etc.
+    # 2026-08-02 §2 addition — REPRESENTATION-only routines list.
+    # Codegen ignores this field; the editor/review UI uses it to
+    # render collapsed repeats. Defaults to [] so every legacy caller
+    # constructing a ProgramDraft continues to work.
+    routines: List[Routine] = dc_field(default_factory=list)
 
     def to_program_payload(self) -> Dict[str, Any]:
         """Shape consumed by POST /api/programs (matches the wizard payload)."""
@@ -507,4 +874,5 @@ class ProgramDraft:
             'motion_profile_name':             cfg.get('motion_profile_name', 'Balanced'),
             'motion_profile_override_enabled': False,
             'motion_optimization_enabled':     True,
+            'routines':    [r.to_dict() for r in self.routines],
         }

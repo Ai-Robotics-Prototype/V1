@@ -175,3 +175,49 @@ def test_accept_vacuum_plus_fixed_matches_whitebowl_answers():
     assert actions.count('move_linear') >= 4     # approach/contact × 2 × 2
     assert actions[0]  == 'move_home'
     assert actions[-1] == 'move_home'
+
+
+# ── Task 1 §2/3: count + pick_pattern clarification bindings ──────
+#
+# These pin the three-bowl scenario end-to-end. The operator's answer to
+# q-count writes op.count via applyClarifications (frontend) or the same
+# field write server-side; the composer's step-list unroll fires and the
+# persisted program has N iterations. Regression here = the failing
+# 2026-07-28 bowl demo.
+
+def test_accept_count_three_yields_three_pick_place_iterations():
+    """q-count answered with 3 → composed program has 3 taught pick
+    contacts + 3 taught place contacts (individual_taught default).
+    Mirrors the applyClarifications write path=='count' on the FE."""
+    intent = _gripper_intent()
+    # Operator answers q-count. Same field write as applyClarifications
+    # in ProgramFromDemonstration.jsx (path=='count' or 'count_hint').
+    for op in intent.operations:
+        op.count = 3
+    steps = compose_program_draft(intent, demo_id='demo_c3_accept'
+                                  ).to_program_payload()['steps']
+    picks  = [s for s in steps if s.get('position_role') == 'pick']
+    places = [s for s in steps if s.get('position_role') == 'place']
+    assert len(picks)  == 3, [p.get('label') for p in picks]
+    assert len(places) == 3, [p.get('label') for p in places]
+
+
+def test_accept_count_plus_stack_dz_yields_z_offsets_1x_2x_3x():
+    """Three-bowl-stack scenario. q-count=3, place_pattern=stack,
+    place_stack_dz_mm=50 → iter 0 taught place; iters 1,2 derived_from
+    place with offset_z_mm = 50, 100. First-order verification that the
+    stack pattern lands the way the transcript described."""
+    intent = _gripper_intent()
+    for op in intent.operations:
+        op.count = 3
+        op.place_pattern = 'stack'
+        op.place_stack_dz_mm = 50.0
+    steps = compose_program_draft(intent, demo_id='demo_stack_accept'
+                                  ).to_program_payload()['steps']
+    taught_place = [s for s in steps if s.get('position_role') == 'place']
+    assert len(taught_place) == 1
+    stack_steps = [s for s in steps
+                   if s.get('iter_pattern') == 'stack']
+    stack_by_iter = {int(s['iter_index']): s for s in stack_steps}
+    assert stack_by_iter[1]['offset_z_mm'] == 50
+    assert stack_by_iter[2]['offset_z_mm'] == 100
