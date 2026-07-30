@@ -287,11 +287,21 @@ class EstunCodroidDriver(Node):
         # state broadcast dropped to 8 Hz while a jog hold is active).
         # With the stall source removed the tighter deadman is what we
         # want; the 0.5 loosening was a workaround, not a design
-        # choice. The layered safety chain is UNCHANGED: browser
-        # release → server publishes explicit stopJog (immediate);
-        # server crash → this deadman fires; network stall → this
-        # deadman fires.
-        self.declare_parameter('jog_freshness_timeout_s', 0.3)
+        # choice.
+        # 2026-08-04: tightened 0.3 → 0.2 per continuous-jog task §4
+        # ("no client keepalive for 200 ms → stop, regardless of
+        # jog_stop arriving"). Client ticker cadence is 100 ms via
+        # a Web Worker + rAF hybrid (immune to main-thread throttling
+        # on tablet), so a single missed tick still leaves one full
+        # 100 ms buffer inside 200 ms. Widens the safety margin
+        # against "frozen tab leaves the arm moving" by ~100 ms. If
+        # phantom staleness stops resurface, revert to 0.3 and
+        # diagnose upstream — should now be a client-side issue.
+        # The layered safety chain is UNCHANGED: browser release →
+        # server publishes explicit stopJog (immediate); server
+        # crash → this deadman fires; network stall → this deadman
+        # fires; browser dies → this deadman fires.
+        self.declare_parameter('jog_freshness_timeout_s', 0.2)
         # Latency and safety-factor inputs to the SPEED-SCALED margin
         # formulas below. Values chosen from wire measurements:
         #   - posture RX → guard reaction takes ~150 ms (three 50 ms

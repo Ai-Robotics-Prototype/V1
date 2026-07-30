@@ -93,13 +93,14 @@ estun_driver:
     # operator is permitted to reach today. Effective_cap =
     #   min(jog_speed_cap, operator_speed_limit).
     #
-    # 2026-07-22 raise: operator_speed_limit 0.25 → 0.65 (this file is
+    # 2026-07-22 raise: operator_speed_limit 0.25 → 0.65.
+    # 2026-07-28 raise: operator_speed_limit 0.65 → 1.00 — policy ceiling
+    # is now the controller's own auto-mode ramp (100%). This file is
     # the SINGLE authoritative source — every other clamp point reads
     # this via `/estun/mode` or the ROS param service; there are no
-    # hard-coded 0.25 copies left). Architecturally the controller
-    # supports up to 100% of its own auto-mode ramp; 0.65 is the
-    # current policy ceiling. Jog stays governed by `jog_speed_cap`
-    # via `effective_speed_cap = min(jog_speed_cap, operator_speed_limit)`
+    # hard-coded 0.25 or 0.65 copies left. Jog stays governed by
+    # `jog_speed_cap` via
+    #   effective_speed_cap = min(jog_speed_cap, operator_speed_limit)
     # — raising operator_speed_limit above jog_speed_cap does NOT
     # widen the jog path (0.50 stays the jog ceiling).
     #
@@ -109,12 +110,15 @@ estun_driver:
     #     run faster.
     #   * Mid-run speed INCREASES to > `high_speed_confirm_threshold_pct`
     #     (default 40) require an explicit high-speed confirmation.
+    #     With operator_speed_limit=1.00 the confirm now gates every
+    #     increase-request into the 40–100% band.
+    #   * Speed DECREASES stay instant (asymmetry preserved).
     #   * Jog is NOT affected (see effective_speed_cap above).
     #
     # Do NOT raise the HARDWARE ceiling (jog_speed_cap) without a
     # separate safety-pass margin re-derivation.
     jog_speed_cap:        0.50
-    operator_speed_limit: 0.65
+    operator_speed_limit: 1.00
     # High-speed confirmation threshold. Mid-run INCREASES above this
     # % require an explicit confirm click before the driver publishes
     # `Robot/setAutoMoveRate`. Set anywhere in [1, operator_speed_limit×100].
@@ -139,7 +143,15 @@ estun_driver:
     # holds). The 0.5 loosening was a workaround for the stall, not
     # a design choice — with the underlying stall gone the tighter
     # deadman is what we want.
-    jog_freshness_timeout_s: 0.3
+    # 2026-08-04: tightened 0.3 → 0.2 per continuous-jog task §4
+    # ("no client keepalive for 200 ms → stop"). Client cadence is
+    # 100 ms via the Web Worker + rAF hybrid ticker, so a single
+    # missed tick still leaves one full 100 ms buffer inside the
+    # 200 ms deadman. Widens the margin against the "frozen tab
+    # leaves the arm moving" failure by ~100 ms; if phantom
+    # staleness stops resurface, revert to 0.3 and diagnose
+    # upstream (should be a client-side ticker issue at this point).
+    jog_freshness_timeout_s: 0.2
 
     # ── First-connect logging ────────────────────────────────────
     # Dumps every TX/RX WS frame to

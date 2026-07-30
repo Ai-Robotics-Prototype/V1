@@ -74,19 +74,29 @@ def test_count_1_matches_no_loop_step_output_byte_for_byte():
 def test_count_gte_2_wraps_body_in_for_loop_home_outside():
     """count=3 emits `for i=1,3 do` right AFTER the initial move_home
     and `end` at the loop step. The initial home stays outside; the
-    trailing return-to-home lives inside so each cycle ends safe."""
+    trailing return-to-home lives inside so each cycle ends safe.
+
+    After the 2026-07-29 motion-vocabulary work, setSpeedJ/setSpeedL
+    modal preludes precede the first movJ/movL respectively — the
+    relative ordering of move_home, for-loop opener, and closing
+    `end` is what this test enforces, not the absolute file-line-1
+    position of movJ."""
     prog = _base_program()
     prog['steps'].append({'action': 'loop', 'goto': 1, 'count': 3})
     lua, _, _ = codegen_lua_from_program(prog, operator_speed_limit_pct=65)
     body = _lua_body(lua)
-    # Initial move_home is the first emitted line.
-    assert body[0].startswith('movJ('), body[0]
-    assert 'move_home' in body[0]
-    # `for i=1,3 do` is emitted right after it.
-    assert body[1].startswith('for i=1,3 do'), body[1]
+    # First motion emission is the initial move_home (movJ).  A
+    # setSpeedJ(N) prelude line may precede it — that's the vocabulary
+    # work's modal emission — but the FIRST movJ/movL line in the body
+    # must be the initial home.
+    move_lines = [i for i, ln in enumerate(body)
+                  if ln.startswith('movJ(') or ln.startswith('movL(')]
+    assert move_lines, body
+    assert 'move_home' in body[move_lines[0]], body[move_lines[0]]
     # Two move_home lines emitted (initial + return). The second one
     # sits INSIDE the loop — the `end` line comes after it.
-    home_idxs = [i for i, ln in enumerate(body) if 'move_home' in ln]
+    home_idxs = [i for i, ln in enumerate(body) if 'move_home' in ln
+                 and (ln.startswith('movJ(') or ln.startswith('movL('))]
     assert len(home_idxs) == 2, home_idxs
     end_lines = [i for i, ln in enumerate(body) if ln.strip().startswith('end')]
     assert end_lines, 'end line missing'
