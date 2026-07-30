@@ -2,6 +2,7 @@ import { useEffect, Component } from 'react'
 import { useStore } from './store/useStore'
 import TopBar from './components/TopBar'
 import StatusBar from './components/StatusBar'
+import StaleCodegenBanner from './components/StaleCodegenBanner'
 import ToastContainer from './components/ToastContainer'
 import EStopOverlay from './components/EStopOverlay'
 import AlarmRecoveryModal from './components/AlarmRecoveryModal'
@@ -172,6 +173,7 @@ export default function App() {
           <StatusBar />
         </div>
 
+        <StaleCodegenBanner />
         <ToastContainer />
         <EStopOverlay />
         <AlarmRecoveryModal />

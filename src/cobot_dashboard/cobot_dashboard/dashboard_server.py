@@ -3577,6 +3577,51 @@ if FASTAPI_AVAILABLE:
                           if op_cap_pct is not None else 'Loaded'),
                 'detail': cap_detail}
 
+    def _check_codegen() -> dict:
+        """Report boot-time vs on-disk sha for estun_driver.program_ops.
+        Amber-and-inform when they differ — the running dashboard is
+        emitting Lua from stale in-memory code and a restart of
+        roboai-dashboard + roboai-estun is required to load the disk
+        version. Never blocks — the operator can still Run; but the
+        Program page banner + Run-confirm modal + run-complete toast
+        all surface this state so it can't be silently skipped again
+        (2026-07-30 fourth staleness episode motivated this check)."""
+        try:
+            from estun_driver import program_ops as _po
+        except Exception as e:
+            return {'level': 'red', 'state': 'Import failed',
+                    'detail': f'program_ops import: {e}',
+                    'boot_sha': '', 'disk_sha': '', 'stale': False}
+        boot = (_po.CODEGEN_VERSION.get('src_sha256') or '')[:12]
+        disk = _po.current_disk_src_sha256()[:12]
+        stale = (bool(boot) and bool(disk)
+                 and boot != disk and disk != 'unknown')
+        if stale:
+            return {
+                'level':    'amber',
+                'state':    'Restart required',
+                'detail':   ('Code updated on disk — restart required '
+                             'to apply (roboai-dashboard, roboai-estun). '
+                             f'boot={boot} disk={disk}. '
+                             'Runs pressed in this state will use the OLD '
+                             'in-memory codegen; the run manifest will '
+                             'stamp codegen_stale=true.'),
+                'boot_sha': boot, 'disk_sha': disk, 'stale': True,
+            }
+        return {
+            'level':    'green',
+            'state':    'In sync',
+            'detail':   f'boot={boot} == disk={disk}',
+            'boot_sha': boot, 'disk_sha': disk, 'stale': False,
+        }
+
+    @app.get("/api/codegen/status")
+    async def api_codegen_status():
+        """Cheap poll endpoint for the Program page banner. Returns
+        the same {stale, boot_sha, disk_sha, ...} shape the System
+        Check codegen row carries — one source of truth."""
+        return _check_codegen()
+
     @app.get("/api/systemcheck")
     async def api_systemcheck():
         with _state_lock:
@@ -3585,6 +3630,7 @@ if FASTAPI_AVAILABLE:
             {'key': 'robot',      'label': 'Robot',      **_check_robot(robot)},
             {'key': 'controller', 'label': 'Controller', **_check_controller()},
             {'key': 'software',   'label': 'Software',   **_check_software()},
+            {'key': 'codegen',    'label': 'Codegen',    **_check_codegen()},
             {'key': 'services',   'label': 'Services',   **_check_services()},
             {'key': 'safety',     'label': 'Safety',     **_check_safety(robot)},
         ]

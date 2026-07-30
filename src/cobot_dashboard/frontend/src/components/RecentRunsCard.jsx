@@ -234,6 +234,23 @@ export default function RecentRunsCard() {
                           padding: '1px 6px', borderRadius: 4,
                         }}>⚠ excursion flagged</span>
                       )}
+                      {r.codegen_stale && (
+                        <span
+                          data-testid="run-row-stale-badge"
+                          title={
+                            `Run used STALE codegen. In-memory sha `
+                            + `${((r.codegen_version || {}).src_sha256 || '').slice(0, 12)} `
+                            + `≠ disk sha ${r.codegen_disk_sha || '?'} at push time. `
+                            + `Restart roboai-dashboard + roboai-estun (or use `
+                            + `scripts/deploy.sh) before the next run.`}
+                          style={{
+                            marginLeft: 8, fontSize: 10, fontWeight: 700,
+                            background: '#fef3c7', color: '#92400e',
+                            border: '1px solid #f59e0b',
+                            padding: '1px 6px', borderRadius: 4,
+                            cursor: 'help',
+                          }}>⚠ used STALE codegen</span>
+                      )}
                     </div>
                     <div style={{
                       fontSize: 11, color: '#6b7280',

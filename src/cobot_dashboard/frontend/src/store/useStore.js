@@ -40,6 +40,12 @@ const storeDefinition = (set, get) => ({
   // this session" (freshly-loaded page).
   lastProgramStateTs: 0,
 
+  // Previous robot.program.state value — tracked so we can detect a
+  // 2→0 transition (run completed) and pop a completion toast that
+  // carries the manifest's codegen_stale flag when applicable
+  // (2026-07-30 §3 anti-staleness surfacing).
+  _lastProgramState: null,
+
   // ---- Jog speed (0-100 %) ----
   // Reusable knob. Currently drives ONLY the twin animation speed for
   // quick-orient / home / any future twin-side interpolated moves.
@@ -363,12 +369,54 @@ const storeDefinition = (set, get) => ({
             catch (_) { /* nop */ }
           }
         }
+        // Run-completion toast on program.state 2→0 (running →
+        // stopped). Fires ONCE per transition and, when the most-
+        // recent run manifest carries codegen_stale=true, colors
+        // the toast amber with the "used STALE codegen" call-out.
+        // Non-blocking; failures are silent. See 2026-07-30 §3.
+        const _prevProgState = get()._lastProgramState
+        const _curProgState  = msg?.robot?.program?.state
+        if (_prevProgState === 2 && _curProgState === 0) {
+          // Debounced fetch — the manifest gets written by the
+          // recorder on the same state transition; give it ~200ms
+          // to land before we look, then check codegen_stale.
+          setTimeout(() => {
+            fetch('/api/runs')
+              .then((r) => r.ok ? r.json() : null)
+              .then((body) => {
+                const runs = body?.runs || []
+                const latest = runs[0]
+                if (!latest) return
+                if (latest.codegen_stale) {
+                  try {
+                    get().addToast?.(
+                      `Run completed — used STALE codegen `
+                      + `(boot ${(latest.codegen_version?.src_sha256 || '').slice(0, 12)} `
+                      + `≠ disk ${latest.codegen_disk_sha || '?'}). `
+                      + `Restart services or run scripts/deploy.sh `
+                      + `before the next run.`,
+                      'warning', 12000)
+                  } catch (_) { /* nop */ }
+                } else {
+                  try {
+                    const dur = latest.duration_s
+                      ? `${latest.duration_s.toFixed(1)}s`
+                      : 'complete'
+                    get().addToast?.(`Run ${dur} — codegen fresh`, 'info', 4000)
+                  } catch (_) { /* nop */ }
+                }
+              })
+              .catch(() => {})
+          }, 250)
+        }
+
         set({
           safety: msg.safety ?? get().safety,
           joints: msg.joints ?? get().joints,
           robot: msg.robot ?? get().robot,
           task: msg.task ?? get().task,
           _lastJogRejectTs: _newLastTs,
+          _lastProgramState: (_curProgState ?? _prevProgState),
           lastProgramStateTs: progStateNow,
           detections: msg.detections ?? get().detections,
           // Server publishes detection_mode in STATE; keep the store

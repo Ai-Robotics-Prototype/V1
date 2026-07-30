@@ -39,12 +39,26 @@ export default function RunProgramModal() {
   const [result, setResult] = useState(null)
   const [errorText, setErrorText] = useState('')
 
+  // Codegen staleness — polled once when the modal opens. If the
+  // in-memory sha differs from the disk sha, the run WILL use the
+  // OLD codegen and the manifest will stamp codegen_stale=true. We
+  // never block; we just surface it prominently so the operator
+  // sees it BEFORE the run (2026-07-30 4th-staleness episode).
+  const [codegen, setCodegen] = useState(null)
+
   // Reset local state each time the modal is opened.
   useEffect(() => {
     if (open) {
       setPhase('confirm')
       setResult(null)
       setErrorText('')
+      setCodegen(null)
+      // Fetch fresh state on every open — the operator may have
+      // restarted the service between button presses.
+      fetch('/api/codegen/status')
+        .then((r) => r.ok ? r.json() : null)
+        .then((body) => { if (body) setCodegen(body) })
+        .catch(() => {})
     }
   }, [open])
 
@@ -260,6 +274,25 @@ export default function RunProgramModal() {
                 {!connected ? 'Driver not connected to controller. ' : ''}
                 Pressing Confirm below WILL still send the request — the
                 driver will refuse it, and the refusal reason appears here.
+              </div>
+            )}
+            {codegen && codegen.stale && (
+              <div style={{
+                marginTop: 12, padding: 10, background: '#FEF3C7',
+                border: '1px solid #F59E0B', borderRadius: 6,
+                color: '#92400E', fontSize: 13, lineHeight: 1.5,
+              }}
+                data-testid="run-confirm-stale-warning">
+                <b>⚠ Code updated on disk — restart required to apply.</b>
+                {' '}The dashboard is still running the codegen it loaded
+                at boot ({codegen.boot_sha}); disk is {codegen.disk_sha}.
+                Confirming below WILL still send the request, but the
+                controller will receive Lua from the OLD codegen and the
+                run manifest will stamp <code>codegen_stale=true</code>.
+                {' '}Restart <code>roboai-dashboard</code> +
+                {' '}<code>roboai-estun</code> (or run
+                {' '}<code>scripts/deploy.sh</code>) to apply the fix
+                before pressing Run.
               </div>
             )}
             {taughtCount === 0 && (
