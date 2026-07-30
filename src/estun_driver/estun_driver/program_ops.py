@@ -1524,6 +1524,128 @@ def _finding(step_idx: int, step: dict, severity: str,
     }
 
 
+def _loop_body_bounds(steps: list) -> tuple:
+    """Return `(body_start_idx, body_end_idx_excl)` for the finite for-
+    loop or continuous goto that wraps this program's cycle body, or
+    `(None, None)` when the program has no loop.
+
+    The loop body is [body_start .. body_end_excl) — every step
+    index in that range executes on every iteration. Steps outside
+    the range (initial move_home preamble, the trailing loop marker
+    itself, anything after) run once.
+
+    Definition matches the codegen walker:
+      * finite for-loop (count >= 2): body starts at
+        `_forloop_open_after_idx + 1` (the step right after the
+        first move_home) and ends at the `action:'loop'` step index.
+      * continuous goto (count == 0): body starts at step 0 and
+        ends at the `action:'loop'` step index. The `goto` re-enters
+        at the first step; the "loop-back predecessor" for that
+        first step is the last motion step BEFORE the loop marker.
+      * no loop at all: (None, None).
+
+    This is the ONE place body boundaries are computed. Every
+    downstream helper (loop-back predecessor, rule 2e, arrival
+    detection, blend adjacency, short-segment guard) reads from
+    here so the "predecessor set" is consistent across all rules.
+    """
+    n = len(steps)
+    loop_step_idx = None
+    loop_count = 0
+    for i, s in enumerate(steps):
+        if isinstance(s, dict) and str(s.get('action') or '').lower() == 'loop':
+            loop_step_idx = i
+            try:
+                loop_count = int(s.get('count') or 0)
+            except (TypeError, ValueError):
+                loop_count = 0
+            break
+    if loop_step_idx is None:
+        return (None, None)
+
+    if loop_count == 0:
+        # Continuous goto: whole program is one cycle body.
+        return (0, loop_step_idx)
+
+    if loop_count >= 2:
+        # Finite for-loop: initial move_home preamble stays OUT of
+        # the body (home once at start of program); everything from
+        # the step right after that home up to (not including) the
+        # loop marker IS the body.
+        first_home = None
+        for i, s in enumerate(steps):
+            if isinstance(s, dict) \
+                    and str(s.get('action') or '').lower() == 'move_home':
+                first_home = i
+                break
+        body_start = (first_home + 1) if first_home is not None else 0
+        return (body_start, loop_step_idx)
+
+    # count == 1 → no loop wrapping at all.
+    return (None, None)
+
+
+def _last_body_motion_idx(steps: list, body_start: int, body_end_excl: int
+                          ) -> int | None:
+    """Return the index of the LAST motion step in [body_start,
+    body_end_excl). Motion steps are those the arm actually moves
+    on — set_io / wait / verify_input / loop / gripper are non-motion
+    and skipped. Returns None if no motion step exists in the range."""
+    if body_start is None or body_end_excl is None:
+        return None
+    for i in range(body_end_excl - 1, body_start - 1, -1):
+        if i < 0 or i >= len(steps):
+            continue
+        s = steps[i]
+        if not isinstance(s, dict):
+            continue
+        act = str(s.get('action') or '').lower()
+        if act in ('set_io', 'wait', 'wait_input', 'verify_input',
+                   'loop', 'gripper'):
+            continue
+        return i
+    return None
+
+
+def _loop_back_predecessor_idx(steps: list, idx: int) -> int | None:
+    """Return the step index that arrives at step `idx` on iteration 2+
+    of the loop, or None when there is no loop-back edge for this step
+    (idx is outside the loop body, OR idx is not the first motion step
+    of the body — for interior body steps the loop-back edge is the
+    same as the previous-step edge and doesn't need a separate check).
+
+    Discovered on 2026-07-30 by operator observation: the arrival
+    classifier judged iteration 1 (home→pick, wrist Δ=0°) and stamped
+    the verb for all 5 cycles, but cycles 2-5 arrive from place-retreat
+    with wrist Δ=55°. Rule 2e existed for exactly that case; it just
+    didn't see the loop-back edge. This helper closes the hole for
+    every rule that reads "previous motion step"."""
+    body_start, body_end_excl = _loop_body_bounds(steps)
+    if body_start is None or body_end_excl is None:
+        return None
+    if not (body_start <= idx < body_end_excl):
+        return None
+    # Interior body steps: their "previous step" already IS a body step,
+    # so the loop-back edge coincides with the normal predecessor. Only
+    # the FIRST motion step of the body has a distinct loop-back edge
+    # (its regular predecessor is the initial-home preamble; its
+    # loop-back predecessor is the last body motion step).
+    first_body_motion = None
+    for j in range(body_start, body_end_excl):
+        if j >= len(steps): break
+        s = steps[j]
+        if not isinstance(s, dict): continue
+        act = str(s.get('action') or '').lower()
+        if act in ('set_io', 'wait', 'wait_input', 'verify_input',
+                   'loop', 'gripper'):
+            continue
+        first_body_motion = j
+        break
+    if first_body_motion is None or idx != first_body_motion:
+        return None
+    return _last_body_motion_idx(steps, body_start, body_end_excl)
+
+
 def analyze_program(program: dict, *,
                     motion_config: dict | None = None,
                     analyzer_config: dict | None = None,
@@ -1703,9 +1825,25 @@ def analyze_program(program: dict, *,
         prev_j_for_seg = j
         prev_seg_idx = i
 
+    # ── Loop-back predecessor map — 2026-07-30 loop-back audit ────
+    # Precomputed once so every rule below that reads "previous step"
+    # can consult the loop-back edge in constant time. For a step at
+    # the top of the for-loop body, this returns the LAST motion step
+    # of the body (iterations 2+ arrive from there). For every other
+    # step, this returns None (linear predecessor already covers the
+    # arm's actual arrival on every iteration).
+    _lb_pred = {i: _loop_back_predecessor_idx(steps, i) for i in range(n)}
+
     # ── Rule 2a: blend radius scales to segment length ────────
     # Only meaningful for the SMOOTH profile — we still compute the
     # override so a program that later flips to SMOOTH picks it up.
+    #
+    # Loop-back awareness (2026-07-30): a step at the top of the
+    # loop body has TWO INTO segments — the linear one (into[i])
+    # traversed on iteration 1, and the loop-back one (from the
+    # last body motion) traversed on iterations 2+. Blend radius
+    # must fit BOTH so no cycle overshoots on a short loop-back
+    # segment.
     profile_radius = float(mc['blend_radius_mm'].get(
         str((program.get('config') or {}).get('blend_preset')
             or mc['default_blend_preset']),
@@ -1722,7 +1860,16 @@ def analyze_program(program: dict, *,
             if segment_lengths_mm[k] is not None:
                 out = segment_lengths_mm[k]
                 break
-        candidates = [x for x in (into, out) if x is not None]
+        # Loop-back INTO segment (iterations 2+ of the loop body).
+        loopback_into = None
+        _lb = _lb_pred.get(i)
+        if _lb is not None and resolved_xyz[i] is not None \
+                and resolved_xyz[_lb] is not None:
+            _dx = resolved_xyz[i][0] - resolved_xyz[_lb][0]
+            _dy = resolved_xyz[i][1] - resolved_xyz[_lb][1]
+            _dz = resolved_xyz[i][2] - resolved_xyz[_lb][2]
+            loopback_into = (_dx * _dx + _dy * _dy + _dz * _dz) ** 0.5
+        candidates = [x for x in (into, out, loopback_into) if x is not None]
         if not candidates:
             continue
         shorter = min(candidates)
@@ -1831,30 +1978,83 @@ def analyze_program(program: dict, *,
             metrics={'cartesian_gap_mm': L, 'threshold_mm': micro}))
 
     # ── Rule 2e: awkward-wrist transit → force profile=joint ───
+    #
+    # Two arrival contexts per step (2026-07-30 loop-back audit):
+    #
+    #   (a) LINEAR predecessor — steps[i-1] via wrist_deltas_deg[i].
+    #       The only edge iteration 1 traverses.
+    #
+    #   (b) LOOP-BACK predecessor — for the FIRST motion step inside
+    #       a for-loop body, iterations 2+ arrive from the LAST
+    #       motion step of the body (the arm ends a cycle at
+    #       retreat_place and re-enters at approach_pick with a
+    #       potentially large wrist Δ). Missed by the previous
+    #       classifier which only saw (a). Symptom: 5× bowl program
+    #       ran movL on approach_pick despite a 55° J6 flip on the
+    #       loop-back edge, on cycles 2-5.
+    #
+    # If EITHER context exceeds the threshold, fire the adaptation
+    # with the failing context named — so the reason text in the
+    # emitted Lua tells the operator which edge to fix.
     awk = float(ac['awkward_wrist_delta_deg'])
     for i in range(n):
-        wd = wrist_deltas_deg[i]
-        if wd is None or wd <= awk:
+        wd_linear = wrist_deltas_deg[i]
+        wd_loopback = None
+        lb_idx = _lb_pred.get(i)
+        if lb_idx is not None and resolved_j[i] is not None \
+                and resolved_j[lb_idx] is not None:
+            wd_loopback = max(
+                abs(resolved_j[i][3] - resolved_j[lb_idx][3]),
+                abs(resolved_j[i][4] - resolved_j[lb_idx][4]),
+                abs(resolved_j[i][5] - resolved_j[lb_idx][5]))
+
+        linear_bad   = (wd_linear   is not None and wd_linear   > awk)
+        loopback_bad = (wd_loopback is not None and wd_loopback > awk)
+        if not (linear_bad or loopback_bad):
             continue
         # Only meaningful when the STEP itself is a transit — an
         # already-jointed home-return has nothing to gain.
         action = str(steps[i].get('action') or '').lower()
-        if action == 'move_linear':
-            _add_adapt(i,
-                       force_motion_profile='joint',
-                       rules_applied=['awkward_wrist_transit'],
-                       reasons=[
-                           f'wrist delta {wd:.1f}° > {awk:g}° — a cartesian '
-                           f'movL with a spinning wrist is the worst of both '
-                           f'worlds; forcing joint-space transit'])
-            findings.append(_finding(
-                i, steps[i], 'adapted',
-                'awkward_wrist_transit',
-                f'wrist delta {wd:.1f}° exceeds {awk:g}° threshold — '
-                f'forcing motion_profile=joint for this transit only',
-                'Consider re-teaching so the two endpoints share wrist '
-                'orientation. See the J4-saga writeup in PART_2C_ARCHITECTURE.md.',
-                metrics={'wrist_delta_deg': wd, 'threshold_deg': awk}))
+        if action != 'move_linear':
+            continue
+
+        # Build the reason strings — name each failing context.
+        parts_reason  = []
+        parts_metrics = {'threshold_deg': awk}
+        parts_findmsg = []
+        if linear_bad:
+            parts_reason.append(
+                f'linear predecessor: wrist Δ={wd_linear:.1f}° > {awk:g}°')
+            parts_metrics['wrist_delta_deg'] = wd_linear
+            parts_findmsg.append(f'linear Δ={wd_linear:.1f}°')
+        if loopback_bad:
+            _label = (steps[lb_idx].get('label')
+                      or steps[lb_idx].get('action') or f'step {lb_idx+1}')
+            parts_reason.append(
+                f'loop-back from {_label!r} (step {lb_idx+1}): '
+                f'wrist Δ={wd_loopback:.1f}° > {awk:g}°')
+            parts_metrics['wrist_delta_loopback_deg'] = wd_loopback
+            parts_metrics['loop_back_predecessor_idx'] = lb_idx
+            parts_findmsg.append(
+                f'loop-back Δ={wd_loopback:.1f}° (from step {lb_idx+1})')
+        _reason_text = (
+            'wrist Δ exceeds threshold — a cartesian movL with a '
+            'spinning wrist is the worst of both worlds; forcing '
+            'joint-space transit. ' + '; '.join(parts_reason))
+        _finding_msg = (
+            'wrist Δ exceeds ' + f'{awk:g}° threshold ({"; ".join(parts_findmsg)}) '
+            '— forcing motion_profile=joint for this transit')
+        _add_adapt(i,
+                   force_motion_profile='joint',
+                   rules_applied=['awkward_wrist_transit'],
+                   reasons=[_reason_text])
+        findings.append(_finding(
+            i, steps[i], 'adapted',
+            'awkward_wrist_transit',
+            _finding_msg,
+            'Consider re-teaching so the two endpoints share wrist '
+            'orientation. See the J4-saga writeup in PART_2C_ARCHITECTURE.md.',
+            metrics=parts_metrics))
 
     # ── Rule 3c: inconsistent wrist across program ─────────────
     inc = float(ac['inconsistent_wrist_deg'])
