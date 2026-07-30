@@ -58,6 +58,7 @@ _AXIS_TO_DXYZ_MM_PER_MM = {
 _MIN_ROW_COL_ANGLE_DEG = 60.0   # row·col angle must exceed this
 _MAX_TILT_DEG          = 10.0   # warn beyond
 _PITCH_MISMATCH_MM     = 3.0    # warn when |measured − typed| > this
+_PART_DATUM_MAX_SLOTS  = 1.5    # warn when |part - corner1| > this × max_pitch
 
 
 # ── Vector helpers — no numpy dependency ────────────────────────
@@ -103,21 +104,23 @@ def compute_frame(spec: PalletPlaceSpec) -> Dict[str, Any]:
           'tilt_deg':          angle between plane_normal and world +Z,
                                in degrees — 0 for a perfectly level
                                pallet; > _MAX_TILT_DEG warns,
-          'row_col_angle_deg': angle between raw (B-A) and (C-A) BEFORE
+          'row_col_angle_deg': angle between raw (corner2-corner1)
+                               and (corner3-corner1) BEFORE
                                orthogonalization, in degrees. Below
                                _MIN_ROW_COL_ANGLE_DEG the taught
                                points don't describe two directions
                                and validate_frame emits an error.
-          'source':            'taught' when frame came from A/B/C,
-                               'base_axes' when we fell back to
-                               `spec.row_axis` / `spec.col_axis`
-                               literals for legacy programs.
+          'source':            'taught' when frame came from
+                               corner1/2/3, 'base_axes' when we fell
+                               back to `spec.row_axis` /
+                               `spec.col_axis` literals for legacy
+                               programs.
         }
 
-    When the taught frame is INCOMPLETE (any of A/B/C missing), the
-    function falls back to base-axis literals so pre-2026-07-30
-    programs continue to render at all — with source='base_axes' so
-    the caller can flag the fallback in the UI."""
+    When the taught frame is INCOMPLETE (any of corner1/2/3 missing),
+    the function falls back to base-axis literals so pre-frame
+    programs continue to render at all — with source='base_axes'
+    so the caller can flag the fallback in the UI."""
     if not spec.has_taught_frame():
         rax = _AXIS_TO_DXYZ_MM_PER_MM.get(spec.row_axis.upper(), (1.0, 0.0, 0.0))
         cax = _AXIS_TO_DXYZ_MM_PER_MM.get(spec.col_axis.upper(), (0.0, 1.0, 0.0))
@@ -132,9 +135,9 @@ def compute_frame(spec: PalletPlaceSpec) -> Dict[str, Any]:
             'row_col_angle_deg': raw_angle,
             'source':            'base_axes',
         }
-    A = _xyz(spec.corner_a_tcp)
-    B = _xyz(spec.point_b_tcp)
-    C = _xyz(spec.point_c_tcp)
+    A = _xyz(spec.corner1_tcp)
+    B = _xyz(spec.corner2_tcp)
+    C = _xyz(spec.corner3_tcp)
     ba = _sub(B, A)
     ca = _sub(C, A)
     la, lb = _len(ba), _len(ca)
@@ -170,24 +173,27 @@ def compute_frame(spec: PalletPlaceSpec) -> Dict[str, Any]:
 def measured_pitches(spec: PalletPlaceSpec
                      ) -> Tuple[Optional[float], Optional[float]]:
     """Return (pitch_row_mm, pitch_col_mm) DERIVED from the taught
-    B/C positions per the teach_mode.
+    corner positions.
 
-      * teach_mode == 'far_slot' — B is at [1, cols], C at [rows, 1].
-        pitch_row = |B - A| / (cols - 1)
-        pitch_col = |C - A| / (rows - 1)
-        (Division by 0 for a 1-row or 1-col pallet returns None for
-        that pitch — a 1-slot dimension has no pitch.)
-      * teach_mode == 'edge' — B/C only pin direction, magnitude not
-        measured. Returns (None, None).
+    v2 (2026-07-30): corner2 is the pallet corner at [row 1, col N],
+    corner3 at [row M, col 1]. Corners are ALWAYS at slot boundaries
+    (the operator touched the fixture, not "somewhere along an
+    edge"), so:
 
-    Missing frame → (None, None)."""
+        pitch_row = |corner2 - corner1| / (cols - 1)
+        pitch_col = |corner3 - corner1| / (rows - 1)
+
+    The v1 teach_mode='edge' was retired in v2 — corners are
+    unambiguous. teach_mode is retained on the schema but ignored
+    by v2 math.
+
+    Missing frame → (None, None). 1-row or 1-col pallet → None
+    for that pitch."""
     if not spec.has_taught_frame():
         return (None, None)
-    if spec.teach_mode != 'far_slot':
-        return (None, None)
-    A = _xyz(spec.corner_a_tcp)
-    B = _xyz(spec.point_b_tcp)
-    C = _xyz(spec.point_c_tcp)
+    A = _xyz(spec.corner1_tcp)
+    B = _xyz(spec.corner2_tcp)
+    C = _xyz(spec.corner3_tcp)
     pitch_row = None
     if spec.cols and spec.cols > 1:
         pitch_row = _len(_sub(B, A)) / float(spec.cols - 1)
@@ -252,6 +258,61 @@ def validate_frame(spec: PalletPlaceSpec) -> List[Dict[str, Any]]:
                 f'a different Z than the others.'),
             'tilt_deg': fr['tilt_deg'],
         })
+    # v2 part-datum checks (2026-07-30): the ④ point must be
+    # taught, distinct from corner1, and within ~1 slot of it.
+    # Migration from v1 seeds part_tcp = corner1 but flags
+    # `migrated_from_v1` — that path emits an info finding
+    # regardless of the distance check so the operator sees the
+    # nudge.
+    if spec.migrated_from_v1 and not spec.has_taught_part_datum():
+        out.append({
+            'severity': 'info',
+            'code':     'part_datum_needs_reteach',
+            'message': (
+                'This pallet was migrated from the v1 (3-point) '
+                'model. The first-part position (④) was seeded '
+                'from corner 1 as a temporary starting point — '
+                're-teach ④ with a real part in the first slot so '
+                'the tool contact geometry and orientation carry '
+                'through to every derived slot.'),
+        })
+    elif not spec.has_taught_part_datum() and spec.corner1_tcp is not None:
+        # No v1 migration flag AND no distinct part datum. Either
+        # the operator hasn't reached the ④ teach step yet, or
+        # they taught it at exactly the same pose as ① (unusual
+        # but valid — the tool contacts the corner). Info only.
+        out.append({
+            'severity': 'info',
+            'code':     'part_datum_not_taught',
+            'message': (
+                'First-part position (④) is not distinct from '
+                'corner 1. Teach ④ with a real part in the first '
+                'slot to lock the tool contact geometry.'),
+        })
+    if spec.has_taught_part_datum():
+        A = _xyz(spec.corner1_tcp)
+        P = _xyz(spec.part_tcp)
+        d = _len(_sub(P, A))
+        m_row, m_col = measured_pitches(spec)
+        pitches = [p for p in (m_row, m_col,
+                               spec.pitch_row_mm, spec.pitch_col_mm)
+                   if p and p > 0]
+        max_pitch = max(pitches) if pitches else 0.0
+        if max_pitch > 0 and d > _PART_DATUM_MAX_SLOTS * max_pitch:
+            out.append({
+                'severity': 'warning',
+                'code':     'part_datum_far_from_corner',
+                'message': (
+                    f'First-part position ④ is {d:.1f} mm from '
+                    f'corner 1 — more than '
+                    f'{_PART_DATUM_MAX_SLOTS:g} × max pitch '
+                    f'({max_pitch:.1f} mm). Is the part actually '
+                    f'in the first slot?'),
+                'distance_mm':      d,
+                'max_pitch_mm':     max_pitch,
+                'threshold_slots':  _PART_DATUM_MAX_SLOTS,
+            })
+
     if spec.teach_mode == 'far_slot':
         m_row, m_col = measured_pitches(spec)
         if m_row is not None and spec.pitch_row_mm > 0:
@@ -318,13 +379,14 @@ def _effective_pitches(spec: PalletPlaceSpec
     """Return (pitch_row_mm, pitch_col_mm, layer_height_mm) actually
     used for slot placement.
 
-    In `far_slot` teach mode the MEASURED pitches take precedence over
-    typed values so the derived slots land exactly on B / C. In
-    `edge` mode the typed values are used verbatim. Untaught frame
-    falls back to typed values entirely."""
+    v2 (2026-07-30): MEASURED pitches always take precedence when
+    the frame is taught — corners are unambiguous slot-boundary
+    references, and the typed values only serve as the operator's
+    cross-check (see validate_frame's row/col_pitch_mismatch
+    warnings). Untaught frame falls back to typed values."""
     pr = float(spec.pitch_row_mm)
     pc = float(spec.pitch_col_mm)
-    if spec.has_taught_frame() and spec.teach_mode == 'far_slot':
+    if spec.has_taught_frame():
         m_row, m_col = measured_pitches(spec)
         if m_row is not None:
             pr = m_row
@@ -332,6 +394,30 @@ def _effective_pitches(spec: PalletPlaceSpec
             pc = m_col
     lh = float(spec.layer_height_mm) if spec.layer_height_mm is not None else 0.0
     return (pr, pc, lh)
+
+
+def _part_datum_offset(spec: PalletPlaceSpec
+                       ) -> Tuple[float, float, float]:
+    """Return the (x, y, z) mm offset from corner1 to part_tcp — the
+    v2 part-datum vector applied to every derived slot.
+
+    Rationale: corner1 is the pallet's FIXTURE corner (tool at the
+    physical corner feature, tool tip may be a few mm off the
+    surface). part_tcp is where the tool ACTUALLY sits when
+    presenting a part to slot [1,1] — different Z, potentially
+    different XY inside the cell, and different orientation. Every
+    slot's final pose = frame position + this offset, so all slots
+    share the operator's taught contact geometry.
+
+    Returns (0, 0, 0) when the part datum isn't taught (v1 migration
+    with no re-teach yet, or a program that has corners without a
+    part pose). Callers should still emit a validation info
+    finding — see validate_frame."""
+    if not (spec.has_taught_frame() and spec.part_tcp is not None):
+        return (0.0, 0.0, 0.0)
+    A = _xyz(spec.corner1_tcp)
+    P = _xyz(spec.part_tcp)
+    return (P[0] - A[0], P[1] - A[1], P[2] - A[2])
 
 
 def compute_slot_offsets(spec: PalletPlaceSpec
@@ -373,11 +459,16 @@ def compute_slot_offsets(spec: PalletPlaceSpec
     cax = fr['col_axis']
     nax = fr['plane_normal']
     pr, pc, lh = _effective_pitches(spec)
+    # v2 part-datum offset: every slot in the taught frame carries
+    # part_tcp's XYZ relative to corner1 so slot [0,0] lands where
+    # the operator taught the actual part (not where they touched
+    # the fixture corner). Zero vector when part_tcp isn't taught.
+    px, py, pz = _part_datum_offset(spec)
     out: List[Tuple[Tuple[int, int, int], Tuple[float, float, float]]] = []
     for (r, c, l) in _order_indices(spec.rows, spec.cols, spec.layers, spec.order):
-        dx = c * pr * rax[0] + r * pc * cax[0] + l * lh * nax[0]
-        dy = c * pr * rax[1] + r * pc * cax[1] + l * lh * nax[1]
-        dz = c * pr * rax[2] + r * pc * cax[2] + l * lh * nax[2]
+        dx = c * pr * rax[0] + r * pc * cax[0] + l * lh * nax[0] + px
+        dy = c * pr * rax[1] + r * pc * cax[1] + l * lh * nax[1] + py
+        dz = c * pr * rax[2] + r * pc * cax[2] + l * lh * nax[2] + pz
         out.append(((r, c, l), (dx, dy, dz)))
     return out
 
@@ -387,11 +478,22 @@ def derive_slot_tcps(spec: PalletPlaceSpec,
                      ) -> List[Dict[str, Any]]:
     """Return per-slot absolute TCPs [{index, row, col, layer, tcp_mm}, ...].
 
-    Orientation carries over from the anchor — pallet slots share
-    orientation by construction (every slot is a copy of A rotated
-    by A's own frame). No IK here; use reachability_sweep to add
-    per-slot joint solutions."""
+    Orientation: v2 uses part_tcp's rx/ry/rz when taught, so every
+    slot shares the operator-taught PART orientation (not the
+    fixture-corner orientation). Falls back to anchor_tcp_mm's
+    rx/ry/rz when part_tcp isn't taught yet (v1 migration path).
+
+    Position: computed from compute_slot_offsets, which already
+    applies the corner-frame + part-datum offset. anchor_tcp_mm
+    supplies the origin translation — normally corner1's TCP.
+
+    No IK here; use reachability_sweep to add per-slot joint
+    solutions."""
     ax, ay, az, rx, ry, rz = anchor_tcp_mm
+    # Orientation source: prefer part_tcp when taught (v2). Falls
+    # back to the anchor's own orientation for legacy programs.
+    if spec.part_tcp is not None and len(spec.part_tcp) >= 6:
+        rx, ry, rz = float(spec.part_tcp[3]), float(spec.part_tcp[4]), float(spec.part_tcp[5])
     out: List[Dict[str, Any]] = []
     for i, ((r, c, l), (dx, dy, dz)) in enumerate(compute_slot_offsets(spec)):
         out.append({

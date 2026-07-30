@@ -255,46 +255,66 @@ _PALLET_TEACH_MODES = ('far_slot', 'edge')
 class PalletPlaceSpec:
     """Geometry of a `pallet_place` pattern.
 
-    2026-08-06 §1 shipped assume-base-axes: the operator taught
-    corner_a and the grid extended along literal `+X` / `-X` / `+Y`
-    / `-Y` axes. Broke immediately when the pallet was rotated
-    relative to the robot base — every derived slot landed in the
-    wrong world position because the axes assumed the pallet
-    aligned with the robot.
+    History:
+      2026-08-06 §1 — assume-base-axes (one taught corner + literal
+                      +X/-Y grid growth). Broke on any rotated pallet.
+      2026-07-30 v1 — 3-point taught frame (A/B/C). Rotation OK; but
+                      A conflated "the corner of the pallet" with
+                      "the pose the tool contacts the first part",
+                      forcing the operator to choose one or the other
+                      when the two are actually different geometric
+                      quantities.
+      2026-07-30 v2 — 4-point split. Three CORNERS on the pallet
+                      define the frame (rotation, tilt, pitch); a
+                      separate PART pose captures the tool contact
+                      + orientation for slot [1,1]. Every slot's
+                      position derives its (x,y,z) from the frame
+                      and its OFFSET from corner1, and its
+                      orientation from part_tcp. Corners can be
+                      touched with the tool at the pallet's fixture
+                      corner (no part needed) while the part pose
+                      only needs to be taught ONCE, with a real
+                      part in slot [1,1].
 
-    2026-07-30 rewrite: three taught points define the pallet's
-    OWN frame. `corner_a` is the origin (slot [1,1] / [0,0]);
-    `point_b` sits along the ROW direction; `point_c` sits along
-    the COL direction. Derived from those:
+    Model (v2):
+        corner1_tcp — pallet corner at slot [row=0, col=0]  (①)
+        corner2_tcp — pallet corner at slot [row=0, col=N-1] (②)
+        corner3_tcp — pallet corner at slot [row=M-1, col=0] (③)
+        part_tcp    — actual part pose at slot [0, 0]         (④)
 
-        row_axis   = normalize(B - A)
-        col_axis   = normalize((C - A) - ((C - A) · row_axis) · row_axis)
-                     (Gram-Schmidt orthogonalization against row)
-        normal     = row_axis × col_axis        (plane normal — captures tilt)
+    Frame derivations:
+        row_axis     = normalize(corner2 - corner1)
+        col_axis     = normalize((corner3 - corner1) - proj on row)
+        plane_normal = row_axis × col_axis
+        pitch_row_mm = |corner2 - corner1| / (cols - 1)   (measured)
+        pitch_col_mm = |corner3 - corner1| / (rows - 1)   (measured)
 
     Slot [r, c, l] world position =
-        A + r · pitch_row · row_axis
-          + c · pitch_col · col_axis
-          + l · layer_height · normal
+        corner1 + c · pitch_row · row_axis
+                + r · pitch_col · col_axis
+                + l · layer_height · plane_normal
+                + (part_tcp[xyz] − corner1[xyz])       ← the part-datum
+                                                        offset from ①
 
-    Orientation of every slot = A's taught orientation (task §1).
+    Orientation of every slot = part_tcp's orientation (rx, ry, rz).
 
-    Two teach modes:
-      * 'far_slot' — B is taught AT [1, N] (last column of first row)
-                    and C at [M, 1] (last row of first column).
-                    Pitches are MEASURED: |B-A|/(cols-1) and
-                    |C-A|/(rows-1). Any typed pitch becomes a
-                    cross-check — |measured - typed| > 3mm raises
-                    a validation warning naming both numbers.
-      * 'edge'     — B and C are taught SOMEWHERE along the edges,
-                    not necessarily at the far slot. Typed pitches
-                    are used verbatim; B/C only pin the DIRECTION,
-                    not the pitch magnitude.
+    Backward compatibility:
+      * If corner1/corner2/corner3/part_tcp are all None but v1's
+        corner_a_tcp / point_b_tcp / point_c_tcp are present, the
+        v1 fields migrate: corner1 ← corner_a (and part_tcp ←
+        corner_a as a first guess so slots don't jump), corner2 ←
+        point_b, corner3 ← point_c. A migration finding tells the
+        operator to re-teach ④ so the part-datum offset can be
+        measured properly. Without a re-teach, slot poses remain
+        exactly what v1 produced (part_tcp == corner1 → zero
+        offset).
+      * If the frame is completely untaught, math falls back to
+        base-axis literals in row_axis / col_axis so pre-frame
+        programs keep rendering.
 
-    Backward compatibility: if `corner_a_tcp`, `point_b_tcp`,
-    `point_c_tcp` are all None, math falls back to the old
-    base-axis literals in `row_axis` / `col_axis` (`+X`/`-X`/etc.)
-    so pre-2026-07-30 saved programs continue to work unchanged."""
+    The v1 fields (corner_a_tcp / point_b_tcp / point_c_tcp) are
+    kept on the dataclass for the migration path but new writers
+    (wizard v2, editor) emit the corner1/2/3/part_tcp fields."""
     rows:               int   = 1
     cols:               int   = 1
     pitch_row_mm:       float = 0.0
@@ -305,18 +325,26 @@ class PalletPlaceSpec:
     layer_height_mm:    Optional[float] = None    # ignored when layers == 1
     order:              str   = 'snake'           # one of _PALLET_ORDERS
 
-    # 3-point taught frame (2026-07-30 §1). Each is a 6-vector
-    # [x_mm, y_mm, z_mm, rx_rad, ry_rad, rz_rad] in the robot's
-    # base frame — same shape as taught_tcp elsewhere. None when
-    # not yet taught; the frame math treats a missing B or C as
-    # "fall back to base-axis literals".
+    # 3-point taught frame (v1). Retained for migration into v2 —
+    # from_dict maps these into corner1/2/3 + part_tcp when the v2
+    # fields are absent. New code should NOT read these directly.
     corner_a_tcp:       Optional[List[float]] = None
     point_b_tcp:        Optional[List[float]] = None
     point_c_tcp:        Optional[List[float]] = None
-    # Teach mode: how to interpret B and C.
-    #   'far_slot' — pitches MEASURED from B/C positions
-    #   'edge'     — pitches TYPED; B/C give direction only
     teach_mode:         str   = 'far_slot'         # one of _PALLET_TEACH_MODES
+
+    # 4-point taught frame (v2, 2026-07-30). Three pallet corners +
+    # the actual part pose at slot [1,1]. Each is a 6-vector
+    # [x_mm, y_mm, z_mm, rx_rad, ry_rad, rz_rad] in the robot base.
+    corner1_tcp:        Optional[List[float]] = None
+    corner2_tcp:        Optional[List[float]] = None
+    corner3_tcp:        Optional[List[float]] = None
+    part_tcp:           Optional[List[float]] = None
+    # When True, corner1/part_tcp were seeded from v1's corner_a
+    # via from_dict's migration. UI surfaces this so the operator
+    # sees "re-teach ④" as an info nudge rather than silently
+    # accepting a probably-wrong part datum.
+    migrated_from_v1:   bool  = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -364,6 +392,32 @@ class PalletPlaceSpec:
         teach_mode = str(d.get('teach_mode') or 'far_slot').lower()
         if teach_mode not in _PALLET_TEACH_MODES:
             teach_mode = 'far_slot'
+
+        # v1 fields (read as-is).
+        corner_a = _opt_tcp(d.get('corner_a_tcp'))
+        point_b  = _opt_tcp(d.get('point_b_tcp'))
+        point_c  = _opt_tcp(d.get('point_c_tcp'))
+        # v2 fields — direct read.
+        c1 = _opt_tcp(d.get('corner1_tcp'))
+        c2 = _opt_tcp(d.get('corner2_tcp'))
+        c3 = _opt_tcp(d.get('corner3_tcp'))
+        pt = _opt_tcp(d.get('part_tcp'))
+        migrated = False
+        # v1 → v2 migration: seed corner1/2/3 + part_tcp from the
+        # v1 fields when v2 is absent. corner1 AND part_tcp both
+        # get corner_a — v1 conflated the two, so seeding both
+        # keeps the derived slots byte-identical to the v1 output
+        # (zero part-datum offset). Downstream validation raises
+        # an info finding telling the operator to re-teach ④.
+        if c1 is None and corner_a is not None:
+            c1 = list(corner_a); migrated = True
+        if c2 is None and point_b is not None:
+            c2 = list(point_b);  migrated = True
+        if c3 is None and point_c is not None:
+            c3 = list(point_c);  migrated = True
+        if pt is None and corner_a is not None:
+            pt = list(corner_a); migrated = True
+
         return cls(
             rows=_pos_int(d.get('rows'), 1),
             cols=_pos_int(d.get('cols'), 1),
@@ -374,22 +428,40 @@ class PalletPlaceSpec:
             layers=_pos_int(d.get('layers'), 1),
             layer_height_mm=_opt_f(d.get('layer_height_mm')),
             order=order,
-            corner_a_tcp=_opt_tcp(d.get('corner_a_tcp')),
-            point_b_tcp=_opt_tcp(d.get('point_b_tcp')),
-            point_c_tcp=_opt_tcp(d.get('point_c_tcp')),
+            corner_a_tcp=corner_a,
+            point_b_tcp=point_b,
+            point_c_tcp=point_c,
             teach_mode=teach_mode,
+            corner1_tcp=c1,
+            corner2_tcp=c2,
+            corner3_tcp=c3,
+            part_tcp=pt,
+            migrated_from_v1=migrated,
         )
 
     def total_slots(self) -> int:
         return int(self.rows) * int(self.cols) * int(self.layers)
 
     def has_taught_frame(self) -> bool:
-        """True iff all three frame points are taught. When True the
-        geometry uses the taught frame; when False, math falls back
-        to base-axis literals."""
-        return (self.corner_a_tcp is not None
-                and self.point_b_tcp is not None
-                and self.point_c_tcp is not None)
+        """True iff all three CORNER points are taught. Enough to
+        compute the frame math (axes / pitches / normal). Whether
+        part_tcp is also taught controls the orientation source
+        and the part-datum offset — see has_taught_part_datum."""
+        return (self.corner1_tcp is not None
+                and self.corner2_tcp is not None
+                and self.corner3_tcp is not None)
+
+    def has_taught_part_datum(self) -> bool:
+        """True iff part_tcp is taught AND distinct from corner1_tcp
+        (so the migration seed doesn't count). When True the slot
+        derivation carries a non-zero part-datum offset."""
+        if self.part_tcp is None or self.corner1_tcp is None:
+            return False
+        # Any of x/y/z differs by more than 0.5 mm → truly distinct.
+        for i in range(3):
+            if abs(self.part_tcp[i] - self.corner1_tcp[i]) > 0.5:
+                return True
+        return False
 
 
 @dataclass

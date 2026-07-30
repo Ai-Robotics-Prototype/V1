@@ -163,17 +163,24 @@ def test_measured_pitches_from_far_slot_positions():
     assert abs(m_col - 60.0) < 1e-9   # 120 / (3-1)
 
 
-def test_edge_mode_returns_none_for_measured():
-    """teach_mode='edge' — B/C only pin direction, not pitch
-    magnitude. measured_pitches returns None."""
+def test_v2_measured_pitches_ignore_retired_edge_mode():
+    """v1 had teach_mode='edge' as an escape hatch when B/C weren't
+    at slot boundaries. v2 retired that — corners are ALWAYS at
+    slot boundaries because the operator touches the fixture, not
+    "somewhere along an edge". measured_pitches now returns
+    measured values regardless of the (retained but ignored)
+    teach_mode field on the schema."""
     A = _tcp(0, 0, 0); B = _tcp(999, 0, 0); C = _tcp(0, 999, 0)
     spec = PalletPlaceSpec.from_dict({
         'rows': 3, 'cols': 3,
         'pitch_row_mm': 50.0, 'pitch_col_mm': 60.0,
         'corner_a_tcp': A, 'point_b_tcp': B, 'point_c_tcp': C,
-        'teach_mode': 'edge',
+        'teach_mode': 'edge',        # ignored in v2
     })
-    assert measured_pitches(spec) == (None, None)
+    m_row, m_col = measured_pitches(spec)
+    # |B-A| = 999, cols=3 → pitch_row = 999 / 2 = 499.5
+    assert abs(m_row - 499.5) < 1e-9
+    assert abs(m_col - 499.5) < 1e-9
 
 
 def test_pitch_mismatch_warning_names_both_numbers():

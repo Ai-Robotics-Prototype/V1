@@ -814,24 +814,18 @@ function PalletConfigEditor({ config, onSave, onClose, onGoToTeaching }) {
     { value: 'snake',  label: 'Snake (alternate)' },
   ]
 
-  // Frame-status readout — reads corner_a_tcp / point_b_tcp /
-  // point_c_tcp from the current config.pallet_place. Migrates from
-  // the legacy config.pallet.corner_tcp when the new field isn't
-  // set yet, so a legacy program renders "A taught" honestly
-  // (that's the operator's already-captured data; the pallet_slots
-  // endpoint applies the same migration on read).
-  const _legacyCorner = initialPallet.corner_tcp
-  const _hasLegacyCorner = _legacyCorner
-    && typeof _legacyCorner === 'object'
-    && ['x','y','z'].every((k) => Number.isFinite(Number(_legacyCorner[k])))
-  const cornerATaught = Array.isArray(initialPlace.corner_a_tcp)
-                        && initialPlace.corner_a_tcp.length >= 6
-                        || _hasLegacyCorner
-  const pointBTaught  = Array.isArray(initialPlace.point_b_tcp)
-                        && initialPlace.point_b_tcp.length >= 6
-  const pointCTaught  = Array.isArray(initialPlace.point_c_tcp)
-                        && initialPlace.point_c_tcp.length >= 6
-  const anyMissing    = !(cornerATaught && pointBTaught && pointCTaught)
+  // Frame-status readout — routes through the shared programTruth
+  // resolver so the modal's indicator agrees exactly with the
+  // backend's has_taught_frame / has_taught_part_datum semantics,
+  // including the v1 (3-point A/B/C) → v2 (4-point corners + part)
+  // migration. See lib/programTruth.palletFrameStatus.
+  const _frame = palletFrameStatus({ config: config })
+  const c1Taught   = _frame.corner1
+  const c2Taught   = _frame.corner2
+  const c3Taught   = _frame.corner3
+  const partTaught = _frame.part
+  const migratedFromV1 = _frame.migratedFromV1
+  const anyMissing = !_frame.allTaught
 
   return (
     <div style={{
@@ -965,17 +959,21 @@ function PalletConfigEditor({ config, onSave, onClose, onGoToTeaching }) {
                           flexShrink: 0 }}>
               Pallet frame:
             </div>
-            <div style={{ display: 'flex', gap: 12, flex: 1,
+            <div style={{ display: 'flex', gap: 10, flex: 1,
+                          flexWrap: 'wrap',
                           fontSize: 12, color: '#374151',
                           fontFamily: 'var(--font-mono, monospace)' }}>
-              <span style={{ color: cornerATaught ? '#0f766e' : '#9ca3af' }}>
-                {cornerATaught ? '●' : '○'} A {cornerATaught ? 'taught' : 'not taught'}
+              <span style={{ color: c1Taught ? '#0f766e' : '#9ca3af' }}>
+                {c1Taught ? '●' : '○'} ① C1
               </span>
-              <span style={{ color: pointBTaught ? '#0f766e' : '#9ca3af' }}>
-                {pointBTaught ? '●' : '○'} B {pointBTaught ? 'taught' : 'not taught'}
+              <span style={{ color: c2Taught ? '#0f766e' : '#9ca3af' }}>
+                {c2Taught ? '●' : '○'} ② C2
               </span>
-              <span style={{ color: pointCTaught ? '#0f766e' : '#9ca3af' }}>
-                {pointCTaught ? '●' : '○'} C {pointCTaught ? 'taught' : 'not taught'}
+              <span style={{ color: c3Taught ? '#0f766e' : '#9ca3af' }}>
+                {c3Taught ? '●' : '○'} ③ C3
+              </span>
+              <span style={{ color: partTaught ? '#0f766e' : '#9ca3af' }}>
+                {partTaught ? '●' : '○'} ④ Part
               </span>
             </div>
             <button
@@ -1001,6 +999,21 @@ function PalletConfigEditor({ config, onSave, onClose, onGoToTeaching }) {
             (Teach All or the step's Teach buttons). This modal edits
             parameters only.
           </div>
+          {migratedFromV1 && (
+            <div style={{
+              marginTop: 8, padding: '8px 10px', fontSize: 11,
+              background: '#fefce8', color: '#854d0e',
+              border: '1px solid #fde68a', borderRadius: 6,
+              lineHeight: 1.5,
+            }}
+              data-testid="pallet-frame-migrated-notice">
+              This pallet was created with the older 3-point model
+              (A / B / C). The first-part position (④) was seeded
+              from corner A — re-teach ④ with a real part in slot
+              [1,1] so the tool contact geometry and orientation
+              carry through to every derived slot.
+            </div>
+          )}
         </div>
       </div>
     </div>

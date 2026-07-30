@@ -122,28 +122,57 @@ export function hasFullTaughtPose(step) {
   return false
 }
 
-// Pallet 3-point taught frame — read-only status for the edit
-// modal's frame indicator. Mirrors the backend's PalletPlaceSpec.
-// has_taught_frame + the pallet_slots endpoint's legacy corner_tcp
-// → corner_a_tcp migration, so a legacy program (pre-2026-07-30)
-// renders "A taught" from its already-captured single corner.
+// Pallet 4-point taught frame — read-only status for the edit
+// modal's frame indicator. Mirrors backend
+// PalletPlaceSpec.has_taught_frame + has_taught_part_datum, plus
+// the pallet_slots endpoint's v1→v2 migration.
 //
-// Returns { cornerA, pointB, pointC, allTaught } — booleans per
-// point + a convenience flag for the whole frame. Reads from
-// program.config.pallet_place (canonical) with a fallback to
-// program.config.pallet.corner_tcp (legacy dict shape).
+// Returns { corner1, corner2, corner3, part, allTaught,
+//           migratedFromV1 } — booleans per point + convenience
+// flags. The v2 wire fields are `corner1_tcp` / `corner2_tcp` /
+// `corner3_tcp` / `part_tcp`; the migration reads v1's
+// `corner_a_tcp` / `point_b_tcp` / `point_c_tcp` (or the even-
+// older `config.pallet.corner_tcp` dict) and lights up the
+// migratedFromV1 flag so the UI shows "re-teach ④" instead of
+// pretending the part datum is real.
 export function palletFrameStatus(program) {
   const cfg = (program && program.config) || {}
   const place = cfg.pallet_place || {}
   const pallet = cfg.pallet || {}
   const hasArr6 = (v) => Array.isArray(v) && v.length >= 6
-  const legacyCorner = pallet.corner_tcp
-  const legacyHasXyz = !!(legacyCorner && typeof legacyCorner === 'object'
-    && ['x','y','z'].every((k) => Number.isFinite(Number(legacyCorner[k]))))
-  const cornerA = !!(hasArr6(place.corner_a_tcp) || legacyHasXyz)
-  const pointB  = hasArr6(place.point_b_tcp)
-  const pointC  = hasArr6(place.point_c_tcp)
-  return { cornerA, pointB, pointC, allTaught: cornerA && pointB && pointC }
+  const legacyCornerDict = pallet.corner_tcp
+  const legacyHasXyz = !!(legacyCornerDict
+    && typeof legacyCornerDict === 'object'
+    && ['x','y','z'].every((k) => Number.isFinite(Number(legacyCornerDict[k]))))
+  // v2 fields — canonical.
+  const v2C1 = hasArr6(place.corner1_tcp)
+  const v2C2 = hasArr6(place.corner2_tcp)
+  const v2C3 = hasArr6(place.corner3_tcp)
+  const v2P  = hasArr6(place.part_tcp)
+  // v1 fallback — corner1/2/3 fill from v1's a/b/c; part fills
+  // from a (with the migration flag set so the UI nudges).
+  const v1A = hasArr6(place.corner_a_tcp)
+  const v1B = hasArr6(place.point_b_tcp)
+  const v1C = hasArr6(place.point_c_tcp)
+  const migratedFromV1 = !v2C1 && !v2P && (v1A || legacyHasXyz)
+  const corner1 = v2C1 || v1A || legacyHasXyz
+  const corner2 = v2C2 || v1B
+  const corner3 = v2C3 || v1C
+  // Part is "truly taught" ONLY when v2P is present AND (either
+  // no migration OR the part TCP differs from corner1 by any
+  // measurable amount — matches PalletPlaceSpec.has_taught_part_datum).
+  // For simplicity in the modal indicator, treat "part_tcp present
+  // AND source is v2" as taught; migration path shows part=false
+  // so the operator sees the ○.
+  const part = v2P && !migratedFromV1
+  return {
+    corner1: !!corner1,
+    corner2: !!corner2,
+    corner3: !!corner3,
+    part:    !!part,
+    allTaught:      !!(corner1 && corner2 && corner3 && part),
+    migratedFromV1: !!migratedFromV1,
+  }
 }
 
 

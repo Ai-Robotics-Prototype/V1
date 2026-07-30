@@ -181,58 +181,94 @@ test('verbForStep: falls back to expected verb for uncodegen-ed program', () => 
 })
 
 
-// ── palletFrameStatus — modal frame indicator ────────────────────
+// ── palletFrameStatus — modal frame indicator (v2 4-point) ──────
 
 test('palletFrameStatus: empty program → nothing taught', () => {
   assert.deepEqual(palletFrameStatus({}),
-    { cornerA: false, pointB: false, pointC: false, allTaught: false })
+    { corner1: false, corner2: false, corner3: false, part: false,
+      allTaught: false, migratedFromV1: false })
 })
 
-test('palletFrameStatus: full 3-point frame taught', () => {
+test('palletFrameStatus: v2 4-point fully taught', () => {
+  const prog = { config: { pallet_place: {
+    corner1_tcp: [0, 0, 0, 0, 0, 0],
+    corner2_tcp: [100, 0, 0, 0, 0, 0],
+    corner3_tcp: [0, 100, 0, 0, 0, 0],
+    part_tcp:    [5, 5, -10, 0, 0, 0],
+  }}}
+  const st = palletFrameStatus(prog)
+  assert.equal(st.corner1, true)
+  assert.equal(st.corner2, true)
+  assert.equal(st.corner3, true)
+  assert.equal(st.part, true)
+  assert.equal(st.allTaught, true)
+  assert.equal(st.migratedFromV1, false)
+})
+
+test('palletFrameStatus: v2 only corners taught (no part) → ④ open', () => {
+  const prog = { config: { pallet_place: {
+    corner1_tcp: [0, 0, 0, 0, 0, 0],
+    corner2_tcp: [100, 0, 0, 0, 0, 0],
+    corner3_tcp: [0, 100, 0, 0, 0, 0],
+  }}}
+  const st = palletFrameStatus(prog)
+  assert.equal(st.corner1, true)
+  assert.equal(st.corner2, true)
+  assert.equal(st.corner3, true)
+  assert.equal(st.part, false)
+  assert.equal(st.allTaught, false)
+})
+
+test('palletFrameStatus: v1 program migrates to corners, ④ stays OPEN', () => {
+  // v1 (3-point A/B/C) programs load into a v2 view: corner1/2/3
+  // seed from a/b/c, but part is intentionally NOT lit (the
+  // migration seeded part_tcp = corner_a for math preservation
+  // only — the operator hasn't taught the real part datum yet).
+  // migratedFromV1 flag surfaces the "re-teach ④" nudge.
   const prog = { config: { pallet_place: {
     corner_a_tcp: [0, 0, 0, 0, 0, 0],
     point_b_tcp:  [100, 0, 0, 0, 0, 0],
     point_c_tcp:  [0, 100, 0, 0, 0, 0],
   }}}
-  assert.deepEqual(palletFrameStatus(prog),
-    { cornerA: true, pointB: true, pointC: true, allTaught: true })
-})
-
-test('palletFrameStatus: only A taught', () => {
-  const prog = { config: { pallet_place: {
-    corner_a_tcp: [0, 0, 0, 0, 0, 0],
-  }}}
   const st = palletFrameStatus(prog)
-  assert.equal(st.cornerA, true)
-  assert.equal(st.pointB, false)
-  assert.equal(st.pointC, false)
+  assert.equal(st.corner1, true)
+  assert.equal(st.corner2, true)
+  assert.equal(st.corner3, true)
+  assert.equal(st.part, false, 'v1 migration must not claim part is taught')
   assert.equal(st.allTaught, false)
+  assert.equal(st.migratedFromV1, true)
 })
 
-test('palletFrameStatus: legacy corner_tcp {x,y,z,...} seeds A', () => {
-  // Pre-2026-07-30 programs stored a single corner as a dict on
-  // config.pallet.corner_tcp. The modal cleanup must not drop
-  // this operator-authored data — palletFrameStatus reads the
-  // legacy field so the "A taught" indicator lights up.
+test('palletFrameStatus: legacy config.pallet.corner_tcp dict seeds ①', () => {
+  // Pre-2026-07-30 programs stored a single corner as
+  // {x,y,z,rx,ry,rz} on config.pallet.corner_tcp. Only ① lights
+  // up from this legacy shape; the operator still needs to teach
+  // ②③④ through the wizard.
   const prog = { config: { pallet: {
     corner_tcp: { x: 100, y: 200, z: 50, rx: 0, ry: 0, rz: 0 },
   }}}
   const st = palletFrameStatus(prog)
-  assert.equal(st.cornerA, true, 'legacy corner_tcp dict must seed cornerA')
-  assert.equal(st.pointB, false)
-  assert.equal(st.pointC, false)
-})
-
-test('palletFrameStatus: legacy corner_tcp with missing xyz keys does NOT seed A', () => {
-  const prog = { config: { pallet: {
-    corner_tcp: { rx: 0.1 }, // no x/y/z
-  }}}
-  assert.equal(palletFrameStatus(prog).cornerA, false)
+  assert.equal(st.corner1, true)
+  assert.equal(st.corner2, false)
+  assert.equal(st.corner3, false)
+  assert.equal(st.part, false)
+  assert.equal(st.migratedFromV1, true)
 })
 
 test('palletFrameStatus: partial 6-el array does NOT count as taught', () => {
   const prog = { config: { pallet_place: {
-    corner_a_tcp: [0, 0, 0],   // only 3 elements — malformed
+    corner1_tcp: [0, 0, 0],   // only 3 elements — malformed
   }}}
-  assert.equal(palletFrameStatus(prog).cornerA, false)
+  assert.equal(palletFrameStatus(prog).corner1, false)
+})
+
+test('palletFrameStatus: only ① missing → part stays open, allTaught false', () => {
+  const prog = { config: { pallet_place: {
+    corner2_tcp: [100, 0, 0, 0, 0, 0],
+    corner3_tcp: [0, 100, 0, 0, 0, 0],
+    part_tcp:    [5, 5, -10, 0, 0, 0],
+  }}}
+  const st = palletFrameStatus(prog)
+  assert.equal(st.corner1, false)
+  assert.equal(st.allTaught, false)
 })
