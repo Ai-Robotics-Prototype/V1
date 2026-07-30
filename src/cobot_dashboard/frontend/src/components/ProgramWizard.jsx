@@ -5,6 +5,7 @@ import { STLLoader } from 'three/examples/jsm/loaders/STLLoader'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
 import { HoldButton } from './JogControls'
+import NumericField from './NumericField'
 import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
 
 /*
@@ -2065,21 +2066,21 @@ const PAGES = [
           <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
             <label style={{ flex: 1, minWidth: 90 }}>
               <div style={{ fontSize: 12, fontWeight: 600, color: '#374151', marginBottom: 4 }}>Rows</div>
-              <input type="number" min={1} max={20} value={rows}
-                onChange={(e) => setInt('pallet_rows', e.target.value, 1, 20)}
-                style={inputBox} />
+              <NumericField integer min={1} max={20} value={rows}
+                onCommit={(v) => setAnswer('pallet_rows', v)}
+                aria-label="Pallet rows" style={inputBox} />
             </label>
             <label style={{ flex: 1, minWidth: 90 }}>
               <div style={{ fontSize: 12, fontWeight: 600, color: '#374151', marginBottom: 4 }}>Columns</div>
-              <input type="number" min={1} max={20} value={cols}
-                onChange={(e) => setInt('pallet_cols', e.target.value, 1, 20)}
-                style={inputBox} />
+              <NumericField integer min={1} max={20} value={cols}
+                onCommit={(v) => setAnswer('pallet_cols', v)}
+                aria-label="Pallet columns" style={inputBox} />
             </label>
             <label style={{ flex: 1, minWidth: 90 }}>
               <div style={{ fontSize: 12, fontWeight: 600, color: '#374151', marginBottom: 4 }}>Layers</div>
-              <input type="number" min={1} max={10} value={layers}
-                onChange={(e) => setInt('pallet_layers', e.target.value, 1, 10)}
-                style={inputBox} />
+              <NumericField integer min={1} max={10} value={layers}
+                onCommit={(v) => setAnswer('pallet_layers', v)}
+                aria-label="Pallet layers" style={inputBox} />
             </label>
           </div>
 

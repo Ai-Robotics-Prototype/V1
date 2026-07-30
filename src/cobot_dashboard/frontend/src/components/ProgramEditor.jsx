@@ -4,6 +4,7 @@ import { useStore, CLIENT_ID } from '../store/useStore'
 import ProgramWizard from './ProgramWizard'
 import ProgramFromDemonstration from './ProgramFromDemonstration'
 import { HoldButton } from './JogControls'
+import NumericField from './NumericField'
 import { readPayload, PAYLOAD_UNSET_WARNING, PAYLOAD_INFO_ONLY }
   from '../lib/payload'
 import { useIOPortmap, portmapLabels, portmapToOptions }
@@ -893,16 +894,16 @@ function PalletConfigEditor({ config, onSave, onClose }) {
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
             <Field label="Rows">
-              <input type="number" min={1} max={20} value={rows}
-                onChange={(e) => setRows(parseInt(e.target.value, 10) || 1)} style={inputStyle} />
+              <NumericField integer min={1} max={20} value={rows}
+                onCommit={setRows} style={inputStyle} aria-label="Rows" />
             </Field>
             <Field label="Cols">
-              <input type="number" min={1} max={20} value={cols}
-                onChange={(e) => setCols(parseInt(e.target.value, 10) || 1)} style={inputStyle} />
+              <NumericField integer min={1} max={20} value={cols}
+                onCommit={setCols} style={inputStyle} aria-label="Cols" />
             </Field>
             <Field label="Layers">
-              <input type="number" min={1} max={10} value={layers}
-                onChange={(e) => setLayers(parseInt(e.target.value, 10) || 1)} style={inputStyle} />
+              <NumericField integer min={1} max={10} value={layers}
+                onCommit={setLayers} style={inputStyle} aria-label="Layers" />
             </Field>
           </div>
           <div style={{ marginBottom: 6, fontSize: 11, color: '#0f766e', fontWeight: 600 }}>
@@ -911,16 +912,16 @@ function PalletConfigEditor({ config, onSave, onClose }) {
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
             <Field label="Spacing X (mm)">
-              <input type="number" min={0} value={spacingX}
-                onChange={(e) => setSpacingX(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+              <NumericField integer min={0} value={spacingX}
+                onCommit={setSpacingX} style={inputStyle} aria-label="Spacing X" />
             </Field>
             <Field label="Spacing Y (mm)">
-              <input type="number" min={0} value={spacingY}
-                onChange={(e) => setSpacingY(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+              <NumericField integer min={0} value={spacingY}
+                onCommit={setSpacingY} style={inputStyle} aria-label="Spacing Y" />
             </Field>
             <Field label="Layer height (mm)">
-              <input type="number" min={0} value={layerH}
-                onChange={(e) => setLayerH(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+              <NumericField integer min={0} value={layerH}
+                onCommit={setLayerH} style={inputStyle} aria-label="Layer height" />
             </Field>
           </div>
 
@@ -943,16 +944,16 @@ function PalletConfigEditor({ config, onSave, onClose }) {
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
             <Field label="Approach height (mm)">
-              <input type="number" min={0} value={approachH}
-                onChange={(e) => setApproachH(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+              <NumericField integer min={0} value={approachH}
+                onCommit={setApproachH} style={inputStyle} aria-label="Approach height" />
             </Field>
             <Field label="Retract height (mm)">
-              <input type="number" min={0} value={retractH}
-                onChange={(e) => setRetractH(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+              <NumericField integer min={0} value={retractH}
+                onCommit={setRetractH} style={inputStyle} aria-label="Retract height" />
             </Field>
             <Field label="Speed (%)">
-              <input type="number" min={1} max={100} value={speed}
-                onChange={(e) => setSpeed(parseInt(e.target.value, 10) || 60)} style={inputStyle} />
+              <NumericField integer min={1} max={100} value={speed}
+                onCommit={setSpeed} style={inputStyle} aria-label="Speed percent" />
             </Field>
           </div>
 
@@ -1221,20 +1222,20 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
             {['X (m)', 'Y (m)', 'Z (m)'].map((lbl, i) => (
               <div key={lbl}>
                 <div style={{ fontSize: 10, color: '#6b7280', marginBottom: 2 }}>{lbl}</div>
-                <input type="number" step="0.001"
-                  value={liveTcp ? Number(liveTcp[i] ?? 0).toFixed(4) : ''}
-                  placeholder={liveTcp ? '' : '—'}
-                  onChange={(e) => updatePoseAxis(i, e.target.value)}
+                <NumericField step={0.001}
+                  value={liveTcp ? Number(Number(liveTcp[i] ?? 0).toFixed(4)) : 0}
+                  onCommit={(v) => updatePoseAxis(i, v)}
+                  aria-label={lbl}
                   style={inputStyle} />
               </div>
             ))}
             {['Rx (rad)', 'Ry (rad)', 'Rz (rad)'].map((lbl, i) => (
               <div key={lbl}>
                 <div style={{ fontSize: 10, color: '#6b7280', marginBottom: 2 }}>{lbl}</div>
-                <input type="number" step="0.01"
-                  value={liveTcp ? Number(liveTcp[i + 3] ?? 0).toFixed(4) : ''}
-                  placeholder={liveTcp ? '' : '—'}
-                  onChange={(e) => updatePoseAxis(i + 3, e.target.value)}
+                <NumericField step={0.01}
+                  value={liveTcp ? Number(Number(liveTcp[i + 3] ?? 0).toFixed(4)) : 0}
+                  onCommit={(v) => updatePoseAxis(i + 3, v)}
+                  aria-label={lbl}
                   style={inputStyle} />
               </div>
             ))}
@@ -1254,20 +1255,23 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
 
       {actionDef.fields.includes('width_mm') && (
         <Field label="Gripper Width (mm)">
-          <input type="number" value={draft.width_mm ?? 85}
-            onChange={(e) => update('width_mm', parseInt(e.target.value, 10))} style={inputStyle} />
+          <NumericField integer value={draft.width_mm ?? 85}
+            onCommit={(v) => update('width_mm', v)} style={inputStyle}
+            aria-label="Gripper width" />
         </Field>
       )}
       {actionDef.fields.includes('speed_pct') && (
         <Field label="Speed (%)">
-          <input type="number" min={1} max={100} value={draft.speed_pct ?? 80}
-            onChange={(e) => update('speed_pct', parseInt(e.target.value, 10))} style={inputStyle} />
+          <NumericField integer min={1} max={100} value={draft.speed_pct ?? 80}
+            onCommit={(v) => update('speed_pct', v)} style={inputStyle}
+            aria-label="Speed percent" />
         </Field>
       )}
       {actionDef.fields.includes('force_pct') && (
         <Field label="Force (%)">
-          <input type="number" min={1} max={100} value={draft.force_pct ?? 50}
-            onChange={(e) => update('force_pct', parseInt(e.target.value, 10))} style={inputStyle} />
+          <NumericField integer min={1} max={100} value={draft.force_pct ?? 50}
+            onCommit={(v) => update('force_pct', v)} style={inputStyle}
+            aria-label="Force percent" />
         </Field>
       )}
       {(actionDef.fields.includes('io_open') || actionDef.fields.includes('io_close')) && (
@@ -1326,27 +1330,30 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
       )}
       {actionDef.fields.includes('offset_z_mm') && (
         <Field label="Z Offset (mm above)">
-          <input type="number" value={draft.offset_z_mm ?? 150}
-            onChange={(e) => update('offset_z_mm', parseInt(e.target.value, 10))} style={inputStyle} />
+          <NumericField integer value={draft.offset_z_mm ?? 150}
+            onCommit={(v) => update('offset_z_mm', v)} style={inputStyle}
+            aria-label="Z offset (mm)" />
         </Field>
       )}
       {actionDef.fields.includes('descend_mm') && (
         <Field label="Descend (mm)">
-          <input type="number" value={draft.descend_mm ?? 130}
-            onChange={(e) => update('descend_mm', parseInt(e.target.value, 10))} style={inputStyle} />
+          <NumericField integer value={draft.descend_mm ?? 130}
+            onCommit={(v) => update('descend_mm', v)} style={inputStyle}
+            aria-label="Descend (mm)" />
         </Field>
       )}
       {actionDef.fields.includes('position') && (
         <Field label="Position X, Y, Z (m)">
           <div style={{ display: 'flex', gap: 6 }}>
             {[0, 1, 2].map((i) => (
-              <input key={i} type="number" step="0.01"
+              <NumericField key={i} step={0.01}
                 value={(draft.position || [0.3, -0.2, 0.4])[i]}
-                onChange={(e) => {
+                onCommit={(v) => {
                   const pos = [...(draft.position || [0.3, -0.2, 0.4])]
-                  pos[i] = parseFloat(e.target.value)
+                  pos[i] = v
                   update('position', pos)
                 }}
+                aria-label={['Position X', 'Position Y', 'Position Z'][i]}
                 style={{ ...inputStyle, flex: 1 }} />
             ))}
           </div>
@@ -1356,14 +1363,15 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
         <Field label="Joint Angles (deg)">
           <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
             {[0, 1, 2, 3, 4, 5].map((j) => (
-              <input key={j} type="number" step="1"
+              <NumericField key={j} step={1}
                 value={(draft.joints || [0, -90, 0, -90, 0, 0])[j]}
-                onChange={(e) => {
+                onCommit={(v) => {
                   const jts = [...(draft.joints || [0, -90, 0, -90, 0, 0])]
-                  jts[j] = parseFloat(e.target.value)
+                  jts[j] = v
                   update('joints', jts)
                 }}
                 placeholder={'J' + (j + 1)}
+                aria-label={'J' + (j + 1)}
                 style={{ ...inputStyle, width: 52, padding: '6px 4px', fontSize: 11, textAlign: 'center' }} />
             ))}
           </div>
@@ -1371,8 +1379,9 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
       )}
       {actionDef.fields.includes('duration_s') && (
         <Field label="Duration (seconds)">
-          <input type="number" step="0.5" value={draft.duration_s ?? 1}
-            onChange={(e) => update('duration_s', parseFloat(e.target.value))} style={inputStyle} />
+          <NumericField min={0} step={0.5} value={draft.duration_s ?? 1}
+            onCommit={(v) => update('duration_s', v)} style={inputStyle}
+            aria-label="Duration (seconds)" />
         </Field>
       )}
       {actionDef.fields.includes('target_part') && (
@@ -1440,12 +1449,14 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
       {actionDef.fields.includes('goto') && (
         <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
           <Field label="Go to step" style={{ flex: 1 }}>
-            <input type="number" min={1} value={draft.goto ?? 1}
-              onChange={(e) => update('goto', parseInt(e.target.value, 10))} style={inputStyle} />
+            <NumericField integer min={1} value={draft.goto ?? 1}
+              onCommit={(v) => update('goto', v)} style={inputStyle}
+              aria-label="Go to step" />
           </Field>
           <Field label="Repeat count (0=infinite)" style={{ flex: 1 }}>
-            <input type="number" min={0} value={draft.count ?? 0}
-              onChange={(e) => update('count', parseInt(e.target.value, 10))} style={inputStyle} />
+            <NumericField integer min={0} value={draft.count ?? 0}
+              onCommit={(v) => update('count', v)} style={inputStyle}
+              aria-label="Repeat count" />
           </Field>
         </div>
       )}

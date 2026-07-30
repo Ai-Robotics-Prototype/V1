@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import LiveRecorder from './LiveRecorder'
+import NumericField from './NumericField'
 import { useStore } from '../store/useStore'
 
 /*
@@ -842,12 +843,10 @@ function ReviewPanel({
       <Section title="Run mode">
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <span style={{ fontSize: 14, color: '#111' }}>Run for</span>
-          <input type="number" min={1} step={1}
+          <NumericField integer min={1} step={1}
             value={Number.isFinite(cycles) ? cycles : 1}
-            onChange={(e) => {
-              const raw = parseInt(e.target.value, 10)
-              setCycles(Number.isFinite(raw) && raw >= 1 ? raw : 1)
-            }}
+            onCommit={(v) => setCycles(v)}
+            aria-label="Cycle count"
             style={{ ...inputBox, width: 84, textAlign: 'right' }} />
           <span style={{ fontSize: 14, color: '#111' }}>
             cycle{cycles === 1 ? '' : 's'}
