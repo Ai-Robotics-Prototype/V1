@@ -2324,6 +2324,63 @@ def codegen_lua_from_program(
         return (isinstance(tj, list) and len(tj) == 6
                 and all(isinstance(v, (int, float)) for v in tj))
 
+    def _is_approach_arrival(idx: int) -> bool:
+        """The columns-always-cartesian invariant treats this derived
+        step as an APPROACH ARRIVAL (the last segment before the column
+        contact) when:
+          * step[idx] is a move_linear with derived_from=<station>, AND
+          * the NEXT motion step in the walker is the taught contact
+            of that same station.
+
+        The retreat (derived_from station, following the contact) is
+        NOT an arrival — those stay movJ by default. This matches the
+        operator doctrine "arrive orientation-locked, contact,
+        depart with a wrist re-solve permitted."
+
+        Returns False for any step that isn't in that shape (no
+        derived_from, non-move_linear action, or no matching contact
+        found downstream)."""
+        if idx < 0 or idx >= len(steps):
+            return False
+        s = steps[idx]
+        if str(s.get('action') or '').lower() != 'move_linear':
+            return False
+        role = s.get('derived_from')
+        if not role:
+            return False
+        # Walk forward for the next motion-emitting step (skip
+        # non_motion: set_io/wait/etc).
+        for j in range(idx + 1, len(steps)):
+            nxt = steps[j]
+            act = str(nxt.get('action') or '').lower()
+            if act in ('set_io', 'wait', 'wait_input', 'verify_input',
+                      'loop', 'gripper'):
+                continue
+            if act != 'move_linear':
+                return False
+            # Next motion step must be a taught contact of the same
+            # station role, with 6-el taught_joints and no
+            # derived_from (i.e., the operator-taught pose itself).
+            if nxt.get('derived_from'):
+                return False
+            if str(nxt.get('position_role') or '') != str(role):
+                return False
+            tj = nxt.get('taught_joints')
+            return (isinstance(tj, list) and len(tj) == 6
+                    and all(isinstance(v, (int, float)) for v in tj))
+        return False
+
+    def _wrist_delta_deg(a, b) -> float | None:
+        """max(|a_i - b_i|) over the wrist joints i∈{3,4,5}. Returns
+        None on malformed input — the caller then treats "unknown
+        wrist delta" as "not an exception" (default to the invariant)."""
+        try:
+            return max(abs(float(a[3]) - float(b[3])),
+                       abs(float(a[4]) - float(b[4])),
+                       abs(float(a[5]) - float(b[5])))
+        except Exception:
+            return None
+
     def _emit_motion_prelude(step_idx: int, verb: str, step: dict):
         """Append any needed setSpeedJ/setSpeedL/setAccL/setBlender/
         setNoBlender lines to exec_lines BEFORE the motion emission.
@@ -2852,17 +2909,68 @@ def codegen_lua_from_program(
                         varspoint[name] = _make_jp_point(lifted_deg, name)
                         used_named.add(name)
                         joints_s = ', '.join(f'{v:+.3f}' for v in lifted_deg)
-                        # 2026-07-31 §3 STRAIGHT / STANDARD path-
-                        # feasibility check: on STRAIGHT, sample the
-                        # seeded-IK path along the Z-lift; if the
-                        # inter-sample joint velocity stays bounded
-                        # (no branch flip), emit as movL for cartesian
-                        # interpolation. STANDARD does the same for
-                        # column-approach steps. JOINT / SMOOTH stay
-                        # on the movJ emission.
+                        # ─── Columns-always-cartesian invariant (2026-07-30 §2)
+                        # Approach ARRIVALS (the last segment before the
+                        # column contact) emit movL in every profile so
+                        # the tool enters the column orientation-locked.
+                        # The column effectively grows one step upward:
+                        # the transit ends at the step BEFORE the
+                        # approach, not at the approach itself.
+                        #
+                        # Exception preserved: motion_check rule 2e
+                        # (awkward_wrist_transit, wrist delta > 30° on
+                        # the arrival segment) forces joint-space with
+                        # the reason printed on the preceding
+                        # `-- motion_check ADAPTED` line — a cartesian
+                        # movL through a 55°+ wrist spin is the worst
+                        # of both worlds.
+                        #
+                        # Feasibility floor is preserved: if the
+                        # seeded-IK Z-lift path would require a branch
+                        # flip along the way, we still fall back to
+                        # movJ. That fallback is now honestly labeled
+                        # on the emit line, not just the prelude
+                        # comment.
+                        is_approach = _is_approach_arrival(_step_idx)
                         emit_verb_derived = 'movJ'
                         feas_note = ''
-                        if program_profile == 'straight' or (
+                        divergence_note = ''
+                        # 1. Approach arrivals: columns-always-cartesian.
+                        if is_approach:
+                            _step_adapt = _adapt_map.get(_step_idx) or {}
+                            _step_force = _step_adapt.get('force_motion_profile')
+                            if _step_force == 'joint':
+                                # Rule 2e already fired for this step —
+                                # the ADAPTED comment above states the
+                                # 55°+ reason. Keep movJ.
+                                emit_verb_derived = 'movJ'
+                                divergence_note = (
+                                    ' (emitted movJ — columns-always-cartesian '
+                                    'EXCEPTION: awkward_wrist_transit, '
+                                    'see the ADAPTED line above)')
+                            else:
+                                feas = _path_feasibility_sample(
+                                    anchor_deg, ofs_mm)
+                                if feas['feasible']:
+                                    emit_verb_derived = 'movL'
+                                    feas_note = (
+                                        f'  path_feas=ok worst='
+                                        f'{feas["worst_delta"]:.2f}° on '
+                                        f'J{feas["worst_axis"]} ≤ '
+                                        f'{feas["threshold"]:g}°'
+                                        f'  (columns-always-cartesian: '
+                                        f'approach arrival)')
+                                else:
+                                    emit_verb_derived = 'movJ'
+                                    divergence_note = (
+                                        ' (emitted movJ — columns-always-'
+                                        'cartesian FALLBACK: path infeasible: '
+                                        f'{feas["reason"]})')
+                        # 2. Existing STRAIGHT / STANDARD-column upgrade
+                        #    path — applies to non-approach derived
+                        #    steps (retreats) when the profile asks for
+                        #    cartesian.
+                        elif program_profile == 'straight' or (
                                 program_profile == 'standard'
                                 and _step_idx < len(standard_class)
                                 and standard_class[_step_idx] == 'column'):
@@ -2874,9 +2982,20 @@ def codegen_lua_from_program(
                                     f'  path_feas=ok worst={feas["worst_delta"]:.2f}°'
                                     f' on J{feas["worst_axis"]} ≤ {feas["threshold"]:g}°')
                             else:
-                                exec_lines.append(
-                                    f'-- STRAIGHT/STANDARD path-feasibility '
-                                    f'FALLBACK to movJ ({feas["reason"]})')
+                                emit_verb_derived = 'movJ'
+                                divergence_note = (
+                                    ' (emitted movJ — STRAIGHT/STANDARD '
+                                    f'path-feasibility FALLBACK: '
+                                    f'{feas["reason"]})')
+                        # 3. Default derived (retreat / non-column
+                        #    transit) — movJ. Label the divergence
+                        #    from step action=move_linear.
+                        else:
+                            emit_verb_derived = 'movJ'
+                            if action == 'move_linear':
+                                divergence_note = (
+                                    ' (emitted movJ — derived retreat/'
+                                    'transit, joint-space by design)')
                         # Orientation invariant stamp — FK the seeded
                         # joints vs the anchor's taught joints and
                         # report per-axis delta. Task §3 threshold
@@ -2897,7 +3016,8 @@ def codegen_lua_from_program(
                                 f' max={worst:.2f}°{flag}')
                         _emit_motion_prelude(_step_idx, emit_verb_derived, step)
                         exec_lines.append(
-                            f'{emit_verb_derived}({name})  -- step {action}  '
+                            f'{emit_verb_derived}({name})  -- step {action}'
+                            f'{divergence_note}  '
                             f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
                             f'(FIX C: SEEDED IK Δz={achieved:+.2f} mm; '
                             f'taught J5={anchor_j5:+.2f}° → emitted J5={lifted_deg[4]:+.2f}° '
@@ -2913,9 +3033,12 @@ def codegen_lua_from_program(
                 f'-- SEEDED IK unavailable → falling back to movJCoorRel  '
                 f'{j5_note}')
             _emit_motion_prelude(_step_idx, 'movJCoorRel', step)
+            _divergence = (' (emitted movJCoorRel — seeded IK unavailable, '
+                           'joint-space with cartesian Z-offset)'
+                           if action == 'move_linear' else '')
             exec_lines.append(
                 f'movJCoorRel({{cp={{0,0,{ofs_mm:g},0,0,0}}}},{{coor=0,tool=0}})  '
-                f'-- step {action}  derived_from={role!r} '
+                f'-- step {action}{_divergence}  derived_from={role!r} '
                 f'offset_z_mm={ofs_mm:g}  '
                 f'(FIX B v2 fallback)')
             # movJCoorRel hands wrist branch selection to the
@@ -2973,6 +3096,7 @@ def codegen_lua_from_program(
             # slerped along a cartesian line).
             emit_verb = verb
             wrist_note = ''
+            divergence_note = ''
             if verb == 'movL':
                 chk = _wrist_descend_safety(j, last_move_joints)
                 if chk['safe']:
@@ -2981,12 +3105,16 @@ def codegen_lua_from_program(
                                   f'J6Δ={chk["j6"]:.2f}°) ≤ {_WRIST_LOCK_MAX_DEG:.0f}°')
                 else:
                     emit_verb = 'movJ'
+                    divergence_note = (
+                        f' (emitted movJ — WRIST-LOCK FALLBACK: '
+                        f'{chk["reason"]})')
                     exec_lines.append(
                         f'-- WRIST-LOCK FALLBACK: descend as joint-space movJ  '
                         f'(reason: {chk["reason"]})')
             _emit_motion_prelude(_step_idx, emit_verb, step)
-            exec_lines.append(f'{emit_verb}({pn})  -- step {action}  point={pn}  '
-                              f'{j5_note}  joints=[{joints_s}]{wrist_note}')
+            exec_lines.append(
+                f'{emit_verb}({pn})  -- step {action}{divergence_note}  '
+                f'point={pn}  {j5_note}  joints=[{joints_s}]{wrist_note}')
             last_move_joints = j_list
             continue
         taught = step.get('taught_joints')
@@ -3024,6 +3152,7 @@ def codegen_lua_from_program(
         # emission in the point_name branch above for the rationale.
         emit_verb = verb
         wrist_note = ''
+        inline_divergence_note = ''
         if verb == 'movL':
             chk = _wrist_descend_safety(taught, last_move_joints)
             if chk['safe']:
@@ -3032,6 +3161,9 @@ def codegen_lua_from_program(
                               f'J6Δ={chk["j6"]:.2f}°) ≤ {_WRIST_LOCK_MAX_DEG:.0f}°')
             else:
                 emit_verb = 'movJ'
+                inline_divergence_note = (
+                    f' (emitted movJ — WRIST-LOCK FALLBACK: '
+                    f'{chk["reason"]})')
                 exec_lines.append(
                     f'-- WRIST-LOCK FALLBACK: descend as joint-space movJ  '
                     f'(reason: {chk["reason"]})')
@@ -3085,8 +3217,9 @@ def codegen_lua_from_program(
                     'did not converge for the intermediate pose; falling '
                     'through to single-shot descent')
         _emit_motion_prelude(_step_idx, emit_verb, step)
-        exec_lines.append(f'{emit_verb}({name})  -- step {action}  '
-                          f'{j5_note}  joints=[{joints_s}]{wrist_note}')
+        exec_lines.append(
+            f'{emit_verb}({name})  -- step {action}{inline_divergence_note}  '
+            f'{j5_note}  joints=[{joints_s}]{wrist_note}')
         last_move_joints = taught_list
         # After a descent split, restore default setAccL so the
         # retreat (or next segment) doesn't inherit the gentle value.

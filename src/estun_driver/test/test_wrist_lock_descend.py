@@ -246,10 +246,24 @@ def test_wrist_delta_over_threshold_falls_back():
     assert contact[0].startswith('movJ('), \
         f'expected movJ fallback, got: {contact[0]}'
     lines = _motion_lines(lua)
+    # Two places carry the fallback phrasing now (label-honesty
+    # 2026-07-30 §1):
+    #   1. The `-- WRIST-LOCK FALLBACK: ...` comment before the emit
+    #   2. The `movJ(...)  -- step move_linear (emitted movJ —
+    #      WRIST-LOCK FALLBACK: ...)` emit line — its own inline
+    #      divergence note tells the reader that the emitted verb
+    #      diverges from the step type without needing to scroll up.
     fallbacks = [ln for ln in lines if 'WRIST-LOCK FALLBACK' in ln]
-    assert len(fallbacks) == 1, fallbacks
+    assert len(fallbacks) == 2, fallbacks
+    prelude = [ln for ln in fallbacks if ln.startswith('-- WRIST-LOCK')]
+    inline  = [ln for ln in fallbacks if ln.startswith('movJ(')]
+    assert len(prelude) == 1, fallbacks
+    assert len(inline)  == 1, fallbacks
     # The reason should include the specific 30° delta the check saw.
-    assert '30.00' in fallbacks[0], fallbacks[0]
+    assert '30.00' in prelude[0], prelude[0]
+    # Inline divergence note names the fallback so the reader sees
+    # emitted-verb vs step-type divergence on the emit line itself.
+    assert 'emitted movJ — WRIST-LOCK FALLBACK' in inline[0], inline[0]
 
 
 def test_codegen_is_deterministic():

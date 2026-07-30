@@ -102,32 +102,61 @@ def test_standard_classification_ignores_io_and_wait_steps():
 # ── §3 STANDARD emission (verb selection) ─────────────────────
 
 def test_standard_columns_emit_movL_transits_emit_movJ():
-    """In the STANDARD profile, taught contacts and their derived
-    approach/retreat emit movL (with wrist-lock fallback to movJ);
-    home moves and inter-station transits emit movJ."""
+    """Post 2026-07-30 §2 columns-always-cartesian: taught contacts
+    ALWAYS emit movL (wrist-lock permitting); approach arrivals
+    emit movL when wrist delta ≤ 30° or movJ (labeled EXCEPTION)
+    when the analyzer's rule 2e fires; home moves and inter-station
+    transits emit movJ.
+
+    In this two-station program:
+      * Home wrist [J4=0, J5=90, J6=0] vs PICK wrist [J4=81.85,
+        J5=90.57, J6=-105.28] → 105° wrist delta → the
+        awkward_wrist_transit adaptation forces movJ on the
+        first approach (labeled EXCEPTION).
+      * Pick and Place both share the same wrist orientation
+        [81.85/62.61, 90.57, -105.28] → clean movL on the
+        cross-station approach."""
     prog = _two_station_program()
     lua, _, _ = codegen_lua_from_program(
         prog, operator_speed_limit_pct=100)
     lines = lua.splitlines()
-    # Pick contact must be movL.
-    contact_lines = [ln for ln in lines
-                     if ln.startswith(('movJ(', 'movL('))
-                     and 'Pick contact' not in ln  # comment tokens not in emit
-                     and 'step move_linear' in ln
-                     and "derived_from='pick'" not in ln
-                     and 'move_home' not in ln]
-    # Contacts do not carry step label in the emission comment (label
-    # only in schema); use position matching. First contact index:
-    contact_idxs = []
-    for i, ln in enumerate(lines):
-        if 'joints=[+63.150' in ln:   # pick joints signature
-            contact_idxs.append(i)
-        if 'joints=[-2.820' in ln:    # place joints signature
-            contact_idxs.append(i)
-    assert len(contact_idxs) >= 2, lines
-    for i in contact_idxs:
-        assert lines[i].startswith('movL('), (
-            f'STANDARD contact must emit movL: {lines[i]!r}')
+
+    # Contact lines are TAUGHT (not derived). Their emit comment does
+    # NOT carry `derived_from` and the joints array matches the
+    # taught contact vector exactly.
+    def _contact_line(pick_or_place):
+        j1 = PICK_J[0] if pick_or_place == 'pick' else PLACE_J[0]
+        j2 = PICK_J[1] if pick_or_place == 'pick' else PLACE_J[1]
+        sig = f'joints=[{j1:+.3f}, {j2:+.3f}'
+        for ln in lines:
+            if ln.startswith(('movJ(', 'movL(')) and sig in ln \
+                    and 'derived_from=' not in ln:
+                return ln
+        return None
+
+    pick_contact = _contact_line('pick')
+    place_contact = _contact_line('place')
+    assert pick_contact, lines
+    assert place_contact, lines
+    assert pick_contact.startswith('movL('), pick_contact
+    assert place_contact.startswith('movL('), place_contact
+
+    # Approach above pick — EXCEPTION under rule 2e (wrist delta 105°).
+    approach_pick = [ln for ln in lines
+                     if 'FIX C:' in ln and "derived_from='pick'" in ln]
+    assert approach_pick, lines
+    assert approach_pick[0].startswith('movJ('), approach_pick[0]
+    assert 'EXCEPTION' in approach_pick[0] \
+        or 'awkward_wrist_transit' in approach_pick[0], approach_pick[0]
+
+    # Approach above place — clean arrival, movL.
+    approach_place = [ln for ln in lines
+                      if 'FIX C:' in ln and "derived_from='place'" in ln]
+    assert approach_place, lines
+    # First derived_from='place' step is the approach.
+    assert approach_place[0].startswith('movL('), approach_place[0]
+    assert 'columns-always-cartesian' in approach_place[0], approach_place[0]
+
     # Home moves must be movJ.
     home_lines = [ln for ln in lines if 'move_home' in ln
                   and (ln.startswith('movJ(') or ln.startswith('movL('))]
@@ -226,13 +255,26 @@ def test_straight_profile_emits_movL_when_feasible():
     assert 'path_feas=ok' in derived_lines[0]
 
 
-def test_joint_profile_stays_on_movJ_for_derived_step():
-    """JOINT profile — the current default — keeps the derived step
-    on movJ (existing behavior; regression gate)."""
+def test_joint_profile_approach_arrival_flips_to_movL():
+    """Columns-always-cartesian invariant (2026-07-30 §2 update):
+    approach arrivals emit movL in EVERY profile — the transit ends
+    one segment earlier, the column grows upward by one step. The
+    prior "JOINT keeps derived on movJ" gate is retired for
+    approach arrivals; retreats still fall through to movJ.
+
+    Exception preserved: analyzer rule 2e (awkward_wrist_transit,
+    wrist delta >30°) still forces joint-space with the printed
+    reason. This test uses a clean approach (no wrist spin) so the
+    invariant fires."""
     prog = {
         'id': 'joint-derived',
         'config': {'speed_pct': 50},   # default profile = joint
         'steps': [
+            # Prior taught anchor that shares wrist orientation with
+            # PICK — keeps the wrist delta below the 30° exception.
+            {'id': 0, 'action': 'move_home',
+             'taught_joints': [40.0, 30.0, 130.0, 80.0, 90.0, -105.0],
+             'position_role': 'home'},
             {'id': 1, 'action': 'move_linear',
              'derived_from': 'pick', 'offset_z_mm': 100},
             {'id': 2, 'action': 'move_linear',
@@ -244,7 +286,40 @@ def test_joint_profile_stays_on_movJ_for_derived_step():
     derived_lines = [ln for ln in lua.splitlines()
                      if 'FIX C:' in ln and "derived_from='pick'" in ln]
     assert derived_lines, lua
-    assert derived_lines[0].startswith('movJ('), derived_lines[0]
+    assert derived_lines[0].startswith('movL('), derived_lines[0]
+    assert 'columns-always-cartesian' in derived_lines[0], derived_lines[0]
+
+
+def test_joint_profile_retreat_stays_on_movJ():
+    """Retreats — the derived step AFTER the contact — remain movJ
+    by default (they're departures, not arrivals). Label must be
+    honest: '(emitted movJ — derived retreat/transit, joint-space
+    by design)'."""
+    prog = {
+        'id': 'joint-retreat',
+        'config': {'speed_pct': 50},
+        'steps': [
+            {'id': 0, 'action': 'move_home',
+             'taught_joints': [40.0, 30.0, 130.0, 80.0, 90.0, -105.0],
+             'position_role': 'home'},
+            {'id': 1, 'action': 'move_linear',
+             'derived_from': 'pick', 'offset_z_mm': 100},
+            {'id': 2, 'action': 'move_linear',
+             'taught_joints': list(PICK_J), 'position_role': 'pick',
+             'taught_tcp': [0.4, 0.1, 0.2, 0, 0, 0]},
+            # Retreat — same derived_from but AFTER the contact.
+            {'id': 3, 'action': 'move_linear',
+             'derived_from': 'pick', 'offset_z_mm': 100},
+        ],
+    }
+    lua, _, _ = codegen_lua_from_program(prog, operator_speed_limit_pct=100)
+    derived_lines = [ln for ln in lua.splitlines()
+                     if 'FIX C:' in ln and "derived_from='pick'" in ln]
+    # Two derived_from='pick' lines — approach (movL) then retreat (movJ).
+    assert len(derived_lines) == 2, derived_lines
+    assert derived_lines[0].startswith('movL('), derived_lines[0]
+    assert derived_lines[1].startswith('movJ('), derived_lines[1]
+    assert 'derived retreat/transit' in derived_lines[1], derived_lines[1]
 
 
 # ── §3 Orientation invariant stamp ─────────────────────────────
