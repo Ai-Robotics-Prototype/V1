@@ -6792,6 +6792,84 @@ if FASTAPI_AVAILABLE:
                 })
         return warnings
 
+    _RELEASE_ACTIONS_MACHINE_GUARD = frozenset({'open_gripper'})
+    _RELEASE_IO_ROLES_MACHINE_GUARD = frozenset({'vacuum', 'magnet'})
+    _RELEASE_LABEL_TOKENS_MACHINE_GUARD = (
+        'release', 'gripper off', 'disengage vacuum', 'disengage magnet',
+    )
+
+    def _is_clamp_step(s):
+        if not isinstance(s, dict): return False
+        if str(s.get('io_role') or '').lower() == 'machine_clamp' \
+                and s.get('value') == 1: return True
+        return str(s.get('label') or '').lower() == 'clamp workpiece'
+
+    def _is_clamp_verify(s):
+        if not isinstance(s, dict): return False
+        if str(s.get('action') or '').lower() != 'verify_input': return False
+        return (str(s.get('io_role') or '').lower() == 'clamp_confirmed'
+                and s.get('expect') == 1)
+
+    def _is_release_step_machine_guard(s):
+        if not isinstance(s, dict): return False
+        act = str(s.get('action') or '').lower()
+        if act in _RELEASE_ACTIONS_MACHINE_GUARD: return True
+        if act == 'set_io' and s.get('value') == 0:
+            role = str(s.get('io_role') or '').lower()
+            if role in _RELEASE_IO_ROLES_MACHINE_GUARD: return True
+            lab = str(s.get('label') or '').lower()
+            if any(t in lab for t in _RELEASE_LABEL_TOKENS_MACHINE_GUARD):
+                return True
+        return False
+
+    def _validate_machine_tending_ordering(steps):
+        """Machine-tending clamp→verify→release ordering guard —
+        Python mirror of lib/effectorVocab.validateMachineTendingOrdering.
+        Both sides must agree; a divergence would be exactly the fork
+        the no-fork-truth guard was built to prevent. Kept in this
+        file so the save endpoint can block violations at HTTP time,
+        BEFORE the program lands on disk.
+
+        Rule fires ONLY when a Verify clamp engaged step exists
+        somewhere after the clamp — that's the operator's declared
+        intent that they want a verified clamp. If no verify exists
+        downstream, either the operator opted out (no Clamp
+        confirmed DI assigned) or edited it away; the rule doesn't
+        second-guess that choice.
+
+        Returns a list of {step_index, clamp_step_index, reason}
+        dicts. Empty list = safe."""
+        out = []
+        arr = list(steps or [])
+        for i in range(len(arr)):
+            if not _is_clamp_step(arr[i]):
+                continue
+            verify_idx = -1
+            for j in range(i + 1, len(arr)):
+                if _is_clamp_verify(arr[j]):
+                    verify_idx = j
+                    break
+            if verify_idx < 0:
+                continue
+            for j in range(i + 1, verify_idx):
+                s = arr[j]
+                if _is_release_step_machine_guard(s):
+                    lbl = s.get('label') or s.get('action') or f'step {j+1}'
+                    out.append({
+                        'step_index':       j,
+                        'clamp_step_index': i,
+                        'reason': (
+                            f'Step {j+1} ({lbl!r}) releases the robot\'s '
+                            f'grip AFTER the clamp at step {i+1} but '
+                            f'BEFORE the attached "Verify clamp '
+                            f'engaged" at step {verify_idx+1}. A failed '
+                            f'clamp with the grip released drops the '
+                            f'part — reorder so the verify runs first, '
+                            f'or remove the release from between them.'),
+                    })
+                    break
+        return out
+
     def _validate_step_point_refs(steps, points):
         """Return a per-step message list for any step whose point_name
         doesn't resolve in the program's points table. Empty list on
@@ -6862,6 +6940,20 @@ if FASTAPI_AVAILABLE:
                       "pose then rename) or repoint the steps."
                 ),
                 "step_issues": step_issues,
+            }, status_code=422)
+        # Machine-tending clamp→verify→release ordering guard.
+        # Blocks any program that would release the robot's grip on
+        # a workpiece BEFORE the attached "Verify clamp engaged"
+        # confirms the fixture has actually latched (2026-07-30
+        # machine-tending vocabulary work).
+        machine_issues = _validate_machine_tending_ordering(steps)
+        if machine_issues:
+            return JSONResponse({
+                "error": (
+                    "This program's clamp/verify/release ordering is "
+                    "unsafe: " + "; ".join(it['reason'] for it in machine_issues)
+                ),
+                "machine_tending_issues": machine_issues,
             }, status_code=422)
         # move_home drift: warn (don't block) — codegen silently
         # normalizes to the first move_home, but the operator should
@@ -6990,6 +7082,18 @@ if FASTAPI_AVAILABLE:
                     + ". Teach those points or repoint the steps."
                 ),
                 "step_issues": step_issues,
+            }, status_code=422)
+        # Machine-tending ordering guard — same rule the POST path
+        # applies (block clamp/verify/release out-of-order edits).
+        merged_machine_issues = _validate_machine_tending_ordering(merged_steps)
+        if merged_machine_issues:
+            return JSONResponse({
+                "error": (
+                    "This update would leave the clamp/verify/release "
+                    "ordering unsafe: "
+                    + "; ".join(it['reason'] for it in merged_machine_issues)
+                ),
+                "machine_tending_issues": merged_machine_issues,
             }, status_code=422)
         # move_home drift check on the merged view (same threshold as
         # POST and program_ops FIX C).

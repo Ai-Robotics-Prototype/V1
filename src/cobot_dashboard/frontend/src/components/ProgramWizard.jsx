@@ -8,7 +8,9 @@ import { HoldButton } from './JogControls'
 import NumericField from './NumericField'
 import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
 import { effectorReady, effectorEngage, effectorDisengage,
-         effectorOf } from '../lib/effectorVocab'
+         effectorOf,
+         clampWorkpiece, unclampWorkpiece,
+         startMachineCycle, waitMachineCycle } from '../lib/effectorVocab'
 
 /*
  * Conversational Program Wizard
@@ -3030,7 +3032,7 @@ function buildPalletizeSteps(answers) {
   return steps.map((s, i) => ({ ...s, step: i + 1 }))
 }
 
-function buildSteps(answers) {
+function buildSteps(answers, portmap = null) {
   // Pallet programs follow a totally different shape — their steps
   // come from buildPalletizeSteps so the editor and executor see the
   // move_to_pallet flow rather than the generic pick/place body.
@@ -3084,32 +3086,84 @@ function buildSteps(answers) {
   steps.push({ action: 'move_linear', label: 'Retreat above pick', offset_z_mm: appH, speed_pct: medium, derived_from: 'pick' })
 
   if (op === 'machine_tend') {
-    // Machine-load contact — same two-taught-poses model applied to the
-    // machine-load role. Load, cycle, and unload reuse the machine_load
-    // anchor with approach/retreat derived.
-    steps.push({ action: 'move_linear', label: 'Approach machine load', offset_z_mm: appH, speed_pct: spd, derived_from: 'machine_load' })
-    steps.push({ action: 'move_linear', label: 'Machine load — contact', speed_pct: Math.min(spd, 20), position_role: 'machine_load' })
-    // Effector-aware release-into-machine (label context override so
-    // the operator sees "into machine" without losing the
-    // engage/disengage vocabulary).
+    // ── Machine-tending template (2026-07-30 vocabulary work) ──
+    //
+    // Required taught poses:
+    //   * machine_safe  — safe-outside-machine waypoint (door
+    //                     clearance pose). MUST be reached before/
+    //                     after any fixture motion so the robot
+    //                     doesn't collide with the machine door.
+    //   * machine_load  — fixture pose (part-in-fixture contact).
+    //   * unload        — final drop-off contact.
+    //
+    // Load side:
+    //   safe → fixture pose → disengage → clamp workpiece → (verify)
+    //          → retreat to safe → start machine cycle (pulse)
+    //          → wait for machine cycle done
+    //
+    // Unload side (part is done, robot picks it back up):
+    //   safe → fixture pose → engage finished part → unclamp
+    //          → retreat to safe → unload contact → disengage
+    //
+    // The clamp→verify→release ordering is enforced at save time by
+    // the sequence guard in dashboard_server / effectorVocab; the
+    // wizard emits them in-order here, so the guard fires only if a
+    // subsequent hand-edit reorders them.
+
+    // Move to safe waypoint OUTSIDE the machine door.
+    steps.push({ action: 'move_linear', label: 'Move to safe-outside-machine waypoint',
+                 speed_pct: spd, position_role: 'machine_safe' })
+    // Approach + place in fixture.
+    steps.push({ action: 'move_linear', label: 'Approach machine fixture',
+                 offset_z_mm: appH, speed_pct: spd, derived_from: 'machine_load' })
+    steps.push({ action: 'move_linear', label: 'Place in fixture — contact',
+                 speed_pct: Math.min(spd, 20), position_role: 'machine_load' })
+    // Clamp FIRST (workpiece is still gripped so a failed clamp
+    // doesn't drop the part). Vocab may attach verify_input if the
+    // Clamp confirmed DI is assigned; guard forbids release before
+    // the verify.
+    steps.push(...clampWorkpiece(portmap))
+    // Only NOW release the robot's grip — after clamp+verify.
     steps.push(...effectorDisengage(cfgEffector, {
       ..._vocabOpts, withBlowOff: false,
-      labelOverride: 'Release part into machine',
+      labelOverride: 'Release part into fixture',
     }))
-    steps.push({ action: 'move_linear', label: 'Retreat from machine', offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
-    steps.push({ action: 'set_io', label: 'Start machine cycle', io_id: answers.io_cycle_start || 'DO4', value: 1 })
-    steps.push({ action: 'wait', label: 'Wait for machine to finish', duration_s: answers.cycle_timeout || 30 })
-    steps.push({ action: 'set_io', label: 'Clear cycle start', io_id: answers.io_cycle_start || 'DO4', value: 0 })
-    // Re-approach the same fixture to pick up the finished part.
-    steps.push({ action: 'move_linear', label: 'Approach finished part', offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
+    // Retreat from fixture → back to safe waypoint before starting
+    // the cycle so the robot is out of the machine's workspace.
+    steps.push({ action: 'move_linear', label: 'Retreat from fixture',
+                 offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
+    steps.push({ action: 'move_linear', label: 'Return to safe-outside-machine',
+                 speed_pct: medium, derived_from: 'machine_safe' })
+    // Start the machine cycle — PULSED DO. Vocab handles the
+    // set 1 → wait pulse_ms → set 0 triplet.
+    steps.push(...startMachineCycle(portmap, {
+      pulse_ms: answers.machine_pulse_ms || 500,
+    }))
+    // Wait for machine cycle done — blocking verify_input on the
+    // Cycle done DI with a configurable outer timeout.
+    steps.push(...waitMachineCycle(portmap, {
+      timeout_ms: (answers.cycle_timeout_s || 60) * 1000,
+    }))
+    // ── Unload side ────────────────────────────────────────────
+    // Return to fixture, engage grip, unclamp, retreat.
+    steps.push({ action: 'move_linear', label: 'Approach fixture (finished part)',
+                 offset_z_mm: appH, speed_pct: slow, derived_from: 'machine_load' })
+    steps.push({ action: 'move_linear', label: 'Fixture — contact (finished part)',
+                 speed_pct: Math.min(spd, 20), position_role: 'machine_load' })
     steps.push(...effectorEngage(cfgEffector, {
       ..._vocabOpts, labelOverride: (effectorOf(cfgEffector) === 'finger'
         ? 'Grip finished part' : 'Pick finished part'),
     }))
-    steps.push({ action: 'move_linear', label: 'Retreat with finished part', offset_z_mm: appH, speed_pct: medium, derived_from: 'machine_load' })
+    steps.push(...unclampWorkpiece(portmap))
+    steps.push({ action: 'move_linear', label: 'Retreat with finished part',
+                 offset_z_mm: appH, speed_pct: medium, derived_from: 'machine_load' })
+    steps.push({ action: 'move_linear', label: 'Return to safe-outside-machine',
+                 speed_pct: medium, derived_from: 'machine_safe' })
     // Unload contact — separate taught role.
-    steps.push({ action: 'move_linear', label: 'Approach unload', offset_z_mm: appH, speed_pct: spd, derived_from: 'unload' })
-    steps.push({ action: 'move_linear', label: 'Unload position — contact', speed_pct: slow, position_role: 'unload' })
+    steps.push({ action: 'move_linear', label: 'Approach unload',
+                 offset_z_mm: appH, speed_pct: spd, derived_from: 'unload' })
+    steps.push({ action: 'move_linear', label: 'Unload position — contact',
+                 speed_pct: slow, position_role: 'unload' })
   } else {
     // Default place flow (pick_and_place / sort).
     steps.push({ action: 'move_linear', label: 'Approach above place', offset_z_mm: appH, speed_pct: spd, derived_from: 'place' })
@@ -3188,6 +3242,11 @@ function buildSteps(answers) {
 // ────────────────────────────────────────────────────────
 
 export default function ProgramWizard({ onClose, onSaved }) {
+  // Portmap for machine-tending emitters — clamp / cycle start / cycle
+  // done / clamp confirmed. buildSteps receives it below so those
+  // steps land in the wizard's output only when the operator has
+  // actually assigned the roles on the I/O page.
+  const wizardPortmap = useIOPortmap()
   const [pageIdx, setPageIdx] = useState(0)
   const [answers, setAnswers] = useState({
     // Silently-defaulted: the wizard no longer asks about speed or motion
@@ -3232,7 +3291,7 @@ export default function ProgramWizard({ onClose, onSaved }) {
     }
   }
 
-  const builtSteps = buildSteps(answers)
+  const builtSteps = buildSteps(answers, wizardPortmap)
 
   const handleSave = async () => {
     setSaving(true)
