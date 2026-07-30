@@ -248,39 +248,75 @@ _PLACE_PATTERNS = (PLACE_PATTERN_FIXED,
 # Base-frame axis literals for pallet row/col growth directions.
 _PALLET_AXES = ('+X', '-X', '+Y', '-Y')
 _PALLET_ORDERS = ('row_major', 'col_major', 'snake')
+_PALLET_TEACH_MODES = ('far_slot', 'edge')
 
 
 @dataclass
 class PalletPlaceSpec:
-    """Geometry of a `pallet_place` pattern (2026-08-06 §1).
+    """Geometry of a `pallet_place` pattern.
 
-    ONE teachable position lives on the operation's `place` slot
-    (via `location_ref`, which the composer routes to the anchor
-    step); every other slot is DERIVED via the composer + codegen's
-    seeded-IK machinery from the anchor's taught joints.
+    2026-08-06 §1 shipped assume-base-axes: the operator taught
+    corner_a and the grid extended along literal `+X` / `-X` / `+Y`
+    / `-Y` axes. Broke immediately when the pallet was rotated
+    relative to the robot base — every derived slot landed in the
+    wrong world position because the axes assumed the pallet
+    aligned with the robot.
 
-    Grid growth axes are base-frame literals (`+X`, `-X`, `+Y`, `-Y`)
-    — the operator picks which way the grid extends from the taught
-    corner. Defaults `+X` (row) / `+Y` (col) match the wizard's 2D
-    diagram convention.
+    2026-07-30 rewrite: three taught points define the pallet's
+    OWN frame. `corner_a` is the origin (slot [1,1] / [0,0]);
+    `point_b` sits along the ROW direction; `point_c` sits along
+    the COL direction. Derived from those:
 
-    `order` sets the fill sequence:
-        row_major  — (0,0)(0,1)(0,2)(1,0)(1,1)…  simple raster
-        col_major  — (0,0)(1,0)(2,0)(0,1)(1,1)…  column-first raster
-        snake      — (0,0)(0,1)(0,2)(1,2)(1,1)(1,0)(2,0)…  serpentine
-                     (shortest travel — every other row reverses)
-    Default snake because that minimises inter-slot travel for the
-    typical pallet geometry (pitches ~50 mm, rows ~4 wide).
-    """
+        row_axis   = normalize(B - A)
+        col_axis   = normalize((C - A) - ((C - A) · row_axis) · row_axis)
+                     (Gram-Schmidt orthogonalization against row)
+        normal     = row_axis × col_axis        (plane normal — captures tilt)
+
+    Slot [r, c, l] world position =
+        A + r · pitch_row · row_axis
+          + c · pitch_col · col_axis
+          + l · layer_height · normal
+
+    Orientation of every slot = A's taught orientation (task §1).
+
+    Two teach modes:
+      * 'far_slot' — B is taught AT [1, N] (last column of first row)
+                    and C at [M, 1] (last row of first column).
+                    Pitches are MEASURED: |B-A|/(cols-1) and
+                    |C-A|/(rows-1). Any typed pitch becomes a
+                    cross-check — |measured - typed| > 3mm raises
+                    a validation warning naming both numbers.
+      * 'edge'     — B and C are taught SOMEWHERE along the edges,
+                    not necessarily at the far slot. Typed pitches
+                    are used verbatim; B/C only pin the DIRECTION,
+                    not the pitch magnitude.
+
+    Backward compatibility: if `corner_a_tcp`, `point_b_tcp`,
+    `point_c_tcp` are all None, math falls back to the old
+    base-axis literals in `row_axis` / `col_axis` (`+X`/`-X`/etc.)
+    so pre-2026-07-30 saved programs continue to work unchanged."""
     rows:               int   = 1
     cols:               int   = 1
     pitch_row_mm:       float = 0.0
     pitch_col_mm:       float = 0.0
-    row_axis:           str   = '+X'    # one of _PALLET_AXES
+    row_axis:           str   = '+X'    # legacy fallback — see docstring
     col_axis:           str   = '+Y'
     layers:             int   = 1
     layer_height_mm:    Optional[float] = None    # ignored when layers == 1
     order:              str   = 'snake'           # one of _PALLET_ORDERS
+
+    # 3-point taught frame (2026-07-30 §1). Each is a 6-vector
+    # [x_mm, y_mm, z_mm, rx_rad, ry_rad, rz_rad] in the robot's
+    # base frame — same shape as taught_tcp elsewhere. None when
+    # not yet taught; the frame math treats a missing B or C as
+    # "fall back to base-axis literals".
+    corner_a_tcp:       Optional[List[float]] = None
+    point_b_tcp:        Optional[List[float]] = None
+    point_c_tcp:        Optional[List[float]] = None
+    # Teach mode: how to interpret B and C.
+    #   'far_slot' — pitches MEASURED from B/C positions
+    #   'edge'     — pitches TYPED; B/C give direction only
+    teach_mode:         str   = 'far_slot'         # one of _PALLET_TEACH_MODES
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -305,6 +341,17 @@ class PalletPlaceSpec:
                 return float(v) if v is not None and v != '' else None
             except (TypeError, ValueError):
                 return None
+        def _opt_tcp(v):
+            """Accept a 6-vector list/tuple or None. Malformed → None
+            so the math falls back to base-axis literals rather than
+            crashing on bad input from an out-of-date wizard."""
+            if v is None: return None
+            if not isinstance(v, (list, tuple)): return None
+            if len(v) < 6: return None
+            try:
+                return [float(x) for x in v[:6]]
+            except (TypeError, ValueError):
+                return None
         row_axis = str(d.get('row_axis') or '+X').upper()
         if row_axis not in _PALLET_AXES:
             row_axis = '+X'
@@ -314,6 +361,9 @@ class PalletPlaceSpec:
         order = str(d.get('order') or 'snake').lower()
         if order not in _PALLET_ORDERS:
             order = 'snake'
+        teach_mode = str(d.get('teach_mode') or 'far_slot').lower()
+        if teach_mode not in _PALLET_TEACH_MODES:
+            teach_mode = 'far_slot'
         return cls(
             rows=_pos_int(d.get('rows'), 1),
             cols=_pos_int(d.get('cols'), 1),
@@ -324,10 +374,22 @@ class PalletPlaceSpec:
             layers=_pos_int(d.get('layers'), 1),
             layer_height_mm=_opt_f(d.get('layer_height_mm')),
             order=order,
+            corner_a_tcp=_opt_tcp(d.get('corner_a_tcp')),
+            point_b_tcp=_opt_tcp(d.get('point_b_tcp')),
+            point_c_tcp=_opt_tcp(d.get('point_c_tcp')),
+            teach_mode=teach_mode,
         )
 
     def total_slots(self) -> int:
         return int(self.rows) * int(self.cols) * int(self.layers)
+
+    def has_taught_frame(self) -> bool:
+        """True iff all three frame points are taught. When True the
+        geometry uses the taught frame; when False, math falls back
+        to base-axis literals."""
+        return (self.corner_a_tcp is not None
+                and self.point_b_tcp is not None
+                and self.point_c_tcp is not None)
 
 
 @dataclass

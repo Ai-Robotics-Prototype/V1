@@ -10030,6 +10030,7 @@ if FASTAPI_AVAILABLE:
             from programming_by_demonstration.schema import PalletPlaceSpec
             from programming_by_demonstration.pallet_geometry import (
                 derive_slot_tcps, reachability_sweep,
+                compute_frame, validate_frame, measured_pitches,
             )
         except Exception as e:
             return JSONResponse(
@@ -10048,6 +10049,21 @@ if FASTAPI_AVAILABLE:
                                            [float(v) for v in anchor_joints])
             except Exception:
                 reach = None
+        # 2026-07-30: expose the taught frame + validation findings +
+        # measured pitches so the twin can render slot ghosts in the
+        # actual pallet frame AND the wizard can surface validation
+        # (near-parallel B/C, tilt, pitch mismatch) without
+        # re-implementing the math on the frontend.
+        frame = compute_frame(spec)
+        frame_serialisable = {
+            'row_axis':          list(frame['row_axis']),
+            'col_axis':          list(frame['col_axis']),
+            'plane_normal':      list(frame['plane_normal']),
+            'tilt_deg':          frame['tilt_deg'],
+            'row_col_angle_deg': frame['row_col_angle_deg'],
+            'source':            frame['source'],
+        }
+        m_row, m_col = measured_pitches(spec)
         return {
             "program_id":   prog_id,
             "pallet_place": {
@@ -10055,6 +10071,12 @@ if FASTAPI_AVAILABLE:
                 "anchor_step_id": anchor.get('id') or anchor.get('step'),
                 "anchor_tcp_mm":  list(anchor_tcp) if isinstance(anchor_tcp, list) else None,
                 "spec":           spec.to_dict(),
+                "frame":          frame_serialisable,
+                "frame_validation": validate_frame(spec),
+                "measured_pitches_mm": {
+                    "pitch_row_mm": m_row,
+                    "pitch_col_mm": m_col,
+                },
                 "slots":          slots,
             },
             "reachability": reach,

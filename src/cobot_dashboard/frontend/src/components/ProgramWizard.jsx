@@ -845,14 +845,40 @@ function teachPositionsForAnswers(answers) {
       key: 'taught_pick', label: 'PICK POSITION',
       instr: 'Jog the robot to the pick CONTACT — the pose where the gripper/vacuum touches the part. The approach hover above is computed automatically from your approach-height setting.',
     })
+    // 3-point pallet frame (2026-07-30). Corner A + point B + point C
+    // together define the pallet's OWN frame — pallet rotation
+    // relative to the robot is captured, so derived slot positions
+    // are correct regardless of how the pallet lies in the cell.
     positions.push({
-      key: 'taught_pallet_corner', label: 'PALLET CORNER [row 1, col 1, layer 1]',
-      instr: 'Jog the robot to the centre of the FIRST pallet slot — bottom layer, nearest corner [row 1, col 1, layer 1]. All other grid positions will be calculated automatically.',
+      key: 'taught_pallet_corner', label: 'PALLET CORNER A — [row 1, col 1]',
+      role: 'pallet_a',
+      instr: 'Touch the part position in the FIRST slot — row 1, col 1, bottom layer. This corner anchors the whole pallet frame.',
+    })
+    positions.push({
+      key: 'taught_pallet_b', label: 'PALLET FRAME B — along the ROW direction',
+      role: 'pallet_b',
+      instr: 'Touch a point along the row-direction edge of the pallet. Teaching AT the far column [row 1, col N] lets us measure the column pitch directly — otherwise any point along that edge works and the typed pitch is used verbatim.',
+    })
+    positions.push({
+      key: 'taught_pallet_c', label: 'PALLET FRAME C — along the COLUMN direction',
+      role: 'pallet_c',
+      instr: 'Touch a point along the column-direction edge. Teaching AT the far row [row M, col 1] lets us measure the row pitch directly. All other slots are computed in the taught pallet frame.',
     })
   } else if (op === 'palletize' && mode === 'depalletize') {
     positions.push({
-      key: 'taught_pallet_corner', label: 'PALLET CORNER [row 1, col 1, top layer]',
-      instr: 'Jog the robot to the centre of the FIRST part to pick — top layer, nearest corner [row 1, col 1]. All other grid positions will be calculated automatically.',
+      key: 'taught_pallet_corner', label: 'PALLET CORNER A — [row 1, col 1, top layer]',
+      role: 'pallet_a',
+      instr: 'Touch the FIRST part to pick — top layer, corner [row 1, col 1].',
+    })
+    positions.push({
+      key: 'taught_pallet_b', label: 'PALLET FRAME B — along the ROW direction',
+      role: 'pallet_b',
+      instr: 'Touch a point along the row-direction edge (far column preferred so column pitch is measured directly).',
+    })
+    positions.push({
+      key: 'taught_pallet_c', label: 'PALLET FRAME C — along the COLUMN direction',
+      role: 'pallet_c',
+      instr: 'Touch a point along the column-direction edge (far row preferred so row pitch is measured directly).',
     })
     positions.push({
       key: 'taught_place', label: 'PLACE POSITION',
@@ -911,6 +937,130 @@ function teachPositionsForAnswers(answers) {
   })
   return positions
 }
+
+// Small pallet diagram shown alongside each pallet-frame teach step
+// so the operator sees WHICH corner + WHICH direction they're
+// touching (2026-07-30 rewrite — pre-rewrite assumed base axes so
+// the operator never had to think about direction; now they do).
+// Grid cells for the wizard's rows/cols; A/B/C highlighted per the
+// current teach role.
+function PalletFrameDiagram({ role, rows, cols, fillOrder }) {
+  const R = Math.max(1, Math.min(20, rows || 4))
+  const C = Math.max(1, Math.min(20, cols || 4))
+  const cell = 28
+  const pad = 20
+  const width  = pad * 2 + C * cell
+  const height = pad * 2 + R * cell
+  // Cell coordinates for corner A (0,0), point B (row 1 far end
+  // → col cols-1), point C (col 1 far end → row rows-1).
+  const cellCenter = (r, c) => [pad + c * cell + cell / 2,
+                                pad + r * cell + cell / 2]
+  const [ax, ay] = cellCenter(0, 0)
+  const [bx, by] = cellCenter(0, C - 1)
+  const [cx, cy] = cellCenter(R - 1, 0)
+  const highlightCell = role === 'pallet_a' ? [0, 0]
+                      : role === 'pallet_b' ? [0, C - 1]
+                      : role === 'pallet_c' ? [R - 1, 0]
+                      : null
+  const arrowColor = '#2563EB'
+  return (
+    <div style={{
+      marginTop: 10, padding: 10,
+      background: '#f8fafc', border: '1px solid #e5e7eb',
+      borderRadius: 6, display: 'flex', gap: 14, alignItems: 'center',
+    }}>
+      <svg width={width} height={height} style={{ flexShrink: 0 }}>
+        {/* Grid cells */}
+        {Array.from({ length: R }).map((_, ri) =>
+          Array.from({ length: C }).map((_, ci) => {
+            const isTarget = highlightCell
+              && highlightCell[0] === ri && highlightCell[1] === ci
+            return (
+              <rect key={`${ri}-${ci}`}
+                x={pad + ci * cell} y={pad + ri * cell}
+                width={cell - 2} height={cell - 2} rx={3}
+                fill={isTarget ? '#dbeafe' : '#ffffff'}
+                stroke={isTarget ? '#2563EB' : '#d1d5db'}
+                strokeWidth={isTarget ? 2 : 1}>
+                {isTarget && (
+                  <animate attributeName="opacity"
+                    values="1;0.55;1" dur="1.2s"
+                    repeatCount="indefinite" />
+                )}
+              </rect>
+            )
+          })
+        )}
+        {/* Labels on A/B/C */}
+        <text x={ax} y={ay + 4} fontSize={12} fontWeight={700}
+          fill={role === 'pallet_a' ? '#1e3a8a' : '#6b7280'}
+          textAnchor="middle">A</text>
+        <text x={bx} y={by + 4} fontSize={12} fontWeight={700}
+          fill={role === 'pallet_b' ? '#1e3a8a' : '#6b7280'}
+          textAnchor="middle">B</text>
+        <text x={cx} y={cy + 4} fontSize={12} fontWeight={700}
+          fill={role === 'pallet_c' ? '#1e3a8a' : '#6b7280'}
+          textAnchor="middle">C</text>
+        {/* Directional arrows */}
+        {role === 'pallet_b' && (
+          <>
+            <line x1={ax} y1={ay - 12} x2={bx} y2={by - 12}
+              stroke={arrowColor} strokeWidth={2} markerEnd="url(#arr)" />
+            <text x={(ax + bx) / 2} y={ay - 16} fontSize={11}
+              fill={arrowColor} textAnchor="middle" fontWeight={600}>
+              ② along THIS row
+            </text>
+          </>
+        )}
+        {role === 'pallet_c' && (
+          <>
+            <line x1={ax - 12} y1={ay} x2={cx - 12} y2={cy}
+              stroke={arrowColor} strokeWidth={2} markerEnd="url(#arr)" />
+            <text x={ax - 18} y={(ay + cy) / 2}
+              fontSize={11} fill={arrowColor}
+              transform={`rotate(-90 ${ax - 18} ${(ay + cy) / 2})`}
+              textAnchor="middle" fontWeight={600}>
+              ③ down THIS column
+            </text>
+          </>
+        )}
+        {role === 'pallet_a' && (
+          <text x={ax} y={ay - 12} fontSize={11} fill={arrowColor}
+            textAnchor="middle" fontWeight={600}>
+            ① Teach this corner
+          </text>
+        )}
+        {/* Arrow marker def */}
+        <defs>
+          <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L10,5 L0,10 Z" fill={arrowColor} />
+          </marker>
+        </defs>
+      </svg>
+      <div style={{ fontSize: 12, color: '#374151', lineHeight: 1.5, flex: 1 }}>
+        <div style={{ fontWeight: 700, marginBottom: 4, color: '#111827' }}>
+          {role === 'pallet_a' ? '① Corner A — [row 1, col 1]'
+            : role === 'pallet_b' ? '② Point B — row direction'
+            : '③ Point C — column direction'}
+        </div>
+        <div>
+          {role === 'pallet_a'
+            ? 'Touch the part position in the first slot.'
+            : role === 'pallet_b'
+            ? 'Touch a point along this edge. Far column [1, N] gives measured pitch.'
+            : 'Touch a point along this edge. Far row [M, 1] gives measured pitch.'}
+        </div>
+        {fillOrder && (
+          <div style={{ fontSize: 10, color: '#6b7280', marginTop: 6 }}>
+            Fill order: {fillOrder}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 
 function ProgressDots({ count, currentIdx, statuses }) {
   return (
@@ -1357,6 +1507,16 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
         }}>
           {current.instr}
         </div>
+        {current.role && (current.role === 'pallet_a'
+                          || current.role === 'pallet_b'
+                          || current.role === 'pallet_c') && (
+          <PalletFrameDiagram
+            role={current.role}
+            rows={answers.pallet_rows || 4}
+            cols={answers.pallet_cols || 4}
+            fillOrder={answers.pallet_fill_order || 'row_lr'}
+          />
+        )}
       </div>
 
       {recordErr && (
@@ -2860,6 +3020,8 @@ function readTaught(answers, key) {
 // section of the task spec.
 function buildPalletConfig(answers) {
   const cornerPoint = readTaught(answers, 'taught_pallet_corner')
+  const pointB      = readTaught(answers, 'taught_pallet_b')
+  const pointC      = readTaught(answers, 'taught_pallet_c')
   return {
     rows:            answers.pallet_rows   ?? 4,
     cols:            answers.pallet_cols   ?? 4,
@@ -2871,6 +3033,18 @@ function buildPalletConfig(answers) {
     corner_tcp:      tcpToObj(cornerPoint?.tcp),
     approach_height_mm: answers.pallet_approach_height_mm ?? 100,
     retract_height_mm:  answers.pallet_retract_height_mm  ?? 200,
+    // 3-point taught frame (2026-07-30). Serialized as the shape
+    // PalletPlaceSpec.from_dict expects: 6-element TCP lists
+    // ([x_mm, y_mm, z_mm, rx_rad, ry_rad, rz_rad]) alongside the
+    // grid + pitch fields. When B and C are missing the schema
+    // still loads with corner_a alone and the math falls back to
+    // base-axis literals (legacy behaviour).
+    corner_a_tcp: Array.isArray(cornerPoint?.tcp) ? [...cornerPoint.tcp] : null,
+    point_b_tcp:  Array.isArray(pointB?.tcp)      ? [...pointB.tcp]      : null,
+    point_c_tcp:  Array.isArray(pointC?.tcp)      ? [...pointC.tcp]      : null,
+    teach_mode:   answers.pallet_teach_mode || 'far_slot',
+    pitch_row_mm: answers.pallet_spacing_x_mm   ?? 150,
+    pitch_col_mm: answers.pallet_spacing_y_mm   ?? 150,
   }
 }
 
@@ -3329,6 +3503,28 @@ export default function ProgramWizard({ onClose, onSaved }) {
       if (answers.operation === 'palletize') {
         const pallet = buildPalletConfig(answers)
         config.pallet      = pallet
+        // 2026-07-30: pallet_place spec (the shape PalletPlaceSpec
+        // consumes on the backend) is also stashed under
+        // config.pallet_place so /api/programs/{id}/pallet_slots
+        // reads the 3-point taught frame + measured pitches without
+        // reconstructing from step metadata.
+        config.pallet_place = {
+          rows:            pallet.rows,
+          cols:            pallet.cols,
+          layers:          pallet.layers,
+          pitch_row_mm:    pallet.pitch_row_mm,
+          pitch_col_mm:    pallet.pitch_col_mm,
+          layer_height_mm: pallet.layer_height_mm,
+          order:           (pallet.fill_order === 'col')     ? 'col_major'
+                         : (pallet.fill_order === 'snake')   ? 'snake'
+                         : 'row_major',
+          row_axis:        '+X',
+          col_axis:        '+Y',
+          corner_a_tcp:    pallet.corner_a_tcp,
+          point_b_tcp:     pallet.point_b_tcp,
+          point_c_tcp:     pallet.point_c_tcp,
+          teach_mode:      pallet.teach_mode,
+        }
         config.pallet_mode = answers.pallet_mode === 'depalletize' ? 'depalletize' : 'palletize'
         config.source      = config.pallet_mode === 'palletize' ? 'camera_library' : 'fixed_grid'
         config.speed_pct   = SILENT_SPEED_PCT

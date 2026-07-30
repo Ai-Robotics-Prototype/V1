@@ -1,31 +1,41 @@
-"""Pallet-place slot derivation + reachability sweep (2026-08-06 §3).
+"""Pallet-place slot derivation + reachability sweep.
 
-Pure math on `PalletPlaceSpec` + an anchor pose. Emits:
+2026-08-06 §1 shipped assume-base-axes: derived slots followed
+world-frame literals (`+X`/`-Y`) regardless of how the pallet
+actually lay in the workspace. Any pallet not aligned to the robot
+base — the common case — produced slots at wrong world positions.
+Operator-caught.
 
-  * `compute_slot_offsets(spec)`         → per-slot Δ(x,y,z) in mm
-                                            IN THE ANCHOR'S BASE FRAME,
-                                            ordered per spec.order.
-  * `derive_slot_tcps(spec, anchor_tcp)` → per-slot absolute TCP list
+2026-07-30 rewrite: derive the pallet frame from THREE taught
+points on the pallet itself. Corner A (origin), point B (row
+direction), point C (column direction). Slot positions are then
+world-frame vectors in the taught frame — rotation, tilt, offset
+all captured by construction. Base-axis literals stay as the
+backward-compat fallback for programs that pre-date the taught
+frame.
+
+Public surface:
+
+  * `compute_frame(spec)`                → {row_axis, col_axis,
+                                            plane_normal, tilt_deg,
+                                            row_col_angle_deg,
+                                            source: 'taught' | 'base_axes'}
+  * `measured_pitches(spec)`             → (pitch_row_mm, pitch_col_mm)
+                                            or (None, None) when the
+                                            frame isn't taught
+  * `validate_frame(spec)`                → [{severity, code, message}]
+                                            with row/col-angle, tilt,
+                                            pitch-typed-vs-measured
+                                            cross-check
+  * `compute_slot_offsets(spec)`          → per-slot Δ(x,y,z) in mm in
+                                            the ANCHOR's base frame,
+                                            ordered per spec.order
+  * `derive_slot_tcps(spec, anchor_tcp)`  → per-slot absolute TCP list
                                             (anchor_tcp + offset), same
-                                            order.
-  * `reachability_sweep(spec, anchor_joints_deg)` → seeded-IK sweep
-                                            report: per-joint min/max
-                                            across all slots + list of
-                                            unreachable slot indices +
-                                            the anchor's own joint /
-                                            wrist ambiguity metrics.
-                                            Codegen calls this and
-                                            refuses when any slot fails
-                                            with a name like
-                                            "slot r2,c3 unreachable".
-
-The Δ math is deterministic. Reachability uses the estun_driver's
-seeded-IK z-lift helper for the layer axis and per-slot cartesian
-displacement — same §401 machinery the FIX-C derived approaches use.
-Import is deferred so this module has no hard dependency on
-estun_driver at import time; when the driver isn't on sys.path the
-sweep degrades to "cannot verify" for every slot rather than
-crashing.
+                                            order — orientation copied
+                                            from anchor
+  * `reachability_sweep(spec, anchor_joints_deg)`  → seeded-IK sweep
+                                            report unchanged from §1
 """
 from __future__ import annotations
 
@@ -35,6 +45,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from .schema import PalletPlaceSpec
 
 
+# Base-frame axis literals — the pre-taught-frame fallback. Kept in
+# both directions so old programs specifying '+X'/'-Y' still resolve.
 _AXIS_TO_DXYZ_MM_PER_MM = {
     '+X': (1.0, 0.0, 0.0),
     '-X': (-1.0, 0.0, 0.0),
@@ -42,24 +54,250 @@ _AXIS_TO_DXYZ_MM_PER_MM = {
     '-Y': (0.0, -1.0, 0.0),
 }
 
+# Validation thresholds.
+_MIN_ROW_COL_ANGLE_DEG = 60.0   # row·col angle must exceed this
+_MAX_TILT_DEG          = 10.0   # warn beyond
+_PITCH_MISMATCH_MM     = 3.0    # warn when |measured − typed| > this
+
+
+# ── Vector helpers — no numpy dependency ────────────────────────
+
+def _sub(a, b): return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+def _add(a, b): return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+def _scale(a, s): return (a[0] * s, a[1] * s, a[2] * s)
+def _dot(a, b): return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+def _len(a): return math.sqrt(_dot(a, a))
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+def _norm(a):
+    L = _len(a)
+    if L < 1e-9:
+        return (0.0, 0.0, 0.0)
+    return (a[0] / L, a[1] / L, a[2] / L)
+
+
+def _xyz(tcp):
+    """Extract (x, y, z) mm from a taught_tcp 6-vector. Accepts
+    list/tuple; returns (0,0,0) on malformed input so downstream
+    math doesn't crash — callers must gate on has_taught_frame."""
+    if not isinstance(tcp, (list, tuple)) or len(tcp) < 3:
+        return (0.0, 0.0, 0.0)
+    return (float(tcp[0]), float(tcp[1]), float(tcp[2]))
+
+
+# ── Frame computation ───────────────────────────────────────────
+
+def compute_frame(spec: PalletPlaceSpec) -> Dict[str, Any]:
+    """Return the pallet's local frame:
+
+        {
+          'row_axis':          (x, y, z) unit vector in base frame,
+          'col_axis':          (x, y, z) unit vector, orthogonal to row
+                               (Gram-Schmidt projection removed the
+                               row component so row·col == 0 exactly),
+          'plane_normal':      row_axis × col_axis  (unit vector; the
+                               pallet's up direction; layer_height
+                               offset is applied along this),
+          'tilt_deg':          angle between plane_normal and world +Z,
+                               in degrees — 0 for a perfectly level
+                               pallet; > _MAX_TILT_DEG warns,
+          'row_col_angle_deg': angle between raw (B-A) and (C-A) BEFORE
+                               orthogonalization, in degrees. Below
+                               _MIN_ROW_COL_ANGLE_DEG the taught
+                               points don't describe two directions
+                               and validate_frame emits an error.
+          'source':            'taught' when frame came from A/B/C,
+                               'base_axes' when we fell back to
+                               `spec.row_axis` / `spec.col_axis`
+                               literals for legacy programs.
+        }
+
+    When the taught frame is INCOMPLETE (any of A/B/C missing), the
+    function falls back to base-axis literals so pre-2026-07-30
+    programs continue to render at all — with source='base_axes' so
+    the caller can flag the fallback in the UI."""
+    if not spec.has_taught_frame():
+        rax = _AXIS_TO_DXYZ_MM_PER_MM.get(spec.row_axis.upper(), (1.0, 0.0, 0.0))
+        cax = _AXIS_TO_DXYZ_MM_PER_MM.get(spec.col_axis.upper(), (0.0, 1.0, 0.0))
+        raw_angle = math.degrees(math.acos(max(-1.0, min(1.0, _dot(rax, cax)))))
+        n = _norm(_cross(rax, cax))
+        tilt = math.degrees(math.acos(abs(max(-1.0, min(1.0, _dot(n, (0.0, 0.0, 1.0)))))))
+        return {
+            'row_axis':          rax,
+            'col_axis':          cax,
+            'plane_normal':      n,
+            'tilt_deg':          tilt,
+            'row_col_angle_deg': raw_angle,
+            'source':            'base_axes',
+        }
+    A = _xyz(spec.corner_a_tcp)
+    B = _xyz(spec.point_b_tcp)
+    C = _xyz(spec.point_c_tcp)
+    ba = _sub(B, A)
+    ca = _sub(C, A)
+    la, lb = _len(ba), _len(ca)
+    # Angle BEFORE orthogonalisation — this is what validate_frame
+    # checks: if B and C describe the same direction the operator
+    # gets a specific error saying so.
+    raw_angle_deg = 0.0
+    if la > 1e-6 and lb > 1e-6:
+        cos_t = max(-1.0, min(1.0, _dot(ba, ca) / (la * lb)))
+        raw_angle_deg = math.degrees(math.acos(cos_t))
+    row_axis = _norm(ba)
+    # Gram-Schmidt: subtract the component of C-A along row_axis so
+    # col_axis is exactly orthogonal to row_axis.
+    ca_along_row = _scale(row_axis, _dot(ca, row_axis))
+    col_raw = _sub(ca, ca_along_row)
+    col_axis = _norm(col_raw)
+    plane_normal = _norm(_cross(row_axis, col_axis))
+    # Tilt: angle between plane_normal and +Z (or -Z — same physical
+    # plane). abs() so a normal pointing at -Z on a level pallet reads
+    # tilt=0.
+    tilt_dot = abs(max(-1.0, min(1.0, _dot(plane_normal, (0.0, 0.0, 1.0)))))
+    tilt_deg = math.degrees(math.acos(tilt_dot))
+    return {
+        'row_axis':          row_axis,
+        'col_axis':          col_axis,
+        'plane_normal':      plane_normal,
+        'tilt_deg':          tilt_deg,
+        'row_col_angle_deg': raw_angle_deg,
+        'source':            'taught',
+    }
+
+
+def measured_pitches(spec: PalletPlaceSpec
+                     ) -> Tuple[Optional[float], Optional[float]]:
+    """Return (pitch_row_mm, pitch_col_mm) DERIVED from the taught
+    B/C positions per the teach_mode.
+
+      * teach_mode == 'far_slot' — B is at [1, cols], C at [rows, 1].
+        pitch_row = |B - A| / (cols - 1)
+        pitch_col = |C - A| / (rows - 1)
+        (Division by 0 for a 1-row or 1-col pallet returns None for
+        that pitch — a 1-slot dimension has no pitch.)
+      * teach_mode == 'edge' — B/C only pin direction, magnitude not
+        measured. Returns (None, None).
+
+    Missing frame → (None, None)."""
+    if not spec.has_taught_frame():
+        return (None, None)
+    if spec.teach_mode != 'far_slot':
+        return (None, None)
+    A = _xyz(spec.corner_a_tcp)
+    B = _xyz(spec.point_b_tcp)
+    C = _xyz(spec.point_c_tcp)
+    pitch_row = None
+    if spec.cols and spec.cols > 1:
+        pitch_row = _len(_sub(B, A)) / float(spec.cols - 1)
+    pitch_col = None
+    if spec.rows and spec.rows > 1:
+        pitch_col = _len(_sub(C, A)) / float(spec.rows - 1)
+    return (pitch_row, pitch_col)
+
+
+# ── Frame validation ────────────────────────────────────────────
+
+def validate_frame(spec: PalletPlaceSpec) -> List[Dict[str, Any]]:
+    """Return validation findings ordered by severity (error first).
+    Empty list = frame passes.
+
+    Rules:
+      * row/col angle < _MIN_ROW_COL_ANGLE_DEG        → error
+      * plane tilt > _MAX_TILT_DEG                    → warning
+      * far_slot mode + |typed - measured| > _PITCH_MISMATCH_MM
+                                                      → warning per axis
+      * taught-frame incomplete + non-default axes    → info (falling
+                                                        back to literals)
+
+    Return shape: [{'severity','code','message', metrics...}, ...]."""
+    out: List[Dict[str, Any]] = []
+    if not spec.has_taught_frame():
+        if (spec.row_axis, spec.col_axis) != ('+X', '+Y'):
+            out.append({
+                'severity': 'info',
+                'code':     'taught_frame_missing',
+                'message': (
+                    'Pallet frame is not fully taught (corner A + '
+                    'points B & C). Falling back to base-axis literals '
+                    f'row={spec.row_axis} col={spec.col_axis}. The '
+                    'derived slots assume the pallet is aligned to '
+                    'the robot base; re-teach the three points to '
+                    'get rotation-safe slot positions.'),
+            })
+        return out
+    fr = compute_frame(spec)
+    if fr['row_col_angle_deg'] < _MIN_ROW_COL_ANGLE_DEG:
+        out.append({
+            'severity': 'error',
+            'code':     'row_col_near_parallel',
+            'message': (
+                f'Points B and C describe the same direction '
+                f'(row/col angle {fr["row_col_angle_deg"]:.1f}° < '
+                f'{_MIN_ROW_COL_ANGLE_DEG:g}°). Re-teach C along the '
+                f'OTHER edge — the column direction should run at '
+                f'roughly a right angle to the row direction.'),
+            'row_col_angle_deg': fr['row_col_angle_deg'],
+        })
+    if fr['tilt_deg'] > _MAX_TILT_DEG:
+        out.append({
+            'severity': 'warning',
+            'code':     'pallet_tilted',
+            'message': (
+                f'Pallet plane tilts {fr["tilt_deg"]:.1f}° from '
+                f'horizontal (threshold {_MAX_TILT_DEG:g}°). If the '
+                f'pallet actually sits on a slope this is correct; '
+                f'otherwise one of the teach points was recorded at '
+                f'a different Z than the others.'),
+            'tilt_deg': fr['tilt_deg'],
+        })
+    if spec.teach_mode == 'far_slot':
+        m_row, m_col = measured_pitches(spec)
+        if m_row is not None and spec.pitch_row_mm > 0:
+            diff = abs(m_row - spec.pitch_row_mm)
+            if diff > _PITCH_MISMATCH_MM:
+                out.append({
+                    'severity': 'warning',
+                    'code':     'row_pitch_mismatch',
+                    'message': (
+                        f'Row pitch: typed {spec.pitch_row_mm:.1f}mm '
+                        f'vs measured {m_row:.1f}mm — differ by '
+                        f'{diff:.1f}mm (threshold '
+                        f'{_PITCH_MISMATCH_MM:g}mm). Was point B '
+                        f'taught at the far column [1, N]? If so, '
+                        f'update the typed value to match the '
+                        f'measurement.'),
+                    'typed_mm':    spec.pitch_row_mm,
+                    'measured_mm': m_row,
+                })
+        if m_col is not None and spec.pitch_col_mm > 0:
+            diff = abs(m_col - spec.pitch_col_mm)
+            if diff > _PITCH_MISMATCH_MM:
+                out.append({
+                    'severity': 'warning',
+                    'code':     'col_pitch_mismatch',
+                    'message': (
+                        f'Column pitch: typed {spec.pitch_col_mm:.1f}mm '
+                        f'vs measured {m_col:.1f}mm — differ by '
+                        f'{diff:.1f}mm (threshold '
+                        f'{_PITCH_MISMATCH_MM:g}mm). Was point C '
+                        f'taught at the far row [M, 1]? If so, update '
+                        f'the typed value to match the measurement.'),
+                    'typed_mm':    spec.pitch_col_mm,
+                    'measured_mm': m_col,
+                })
+    return out
+
+
+# ── Slot indexing (fill order) — unchanged from §1 ──────────────
 
 def _order_indices(rows: int, cols: int, layers: int,
                    order: str) -> List[Tuple[int, int, int]]:
-    """Return (row, col, layer) tuples in the fill order.
-
-    row_major : (0,0,0) (0,1,0) … (0,C-1,0) (1,0,0) … then next layer.
-    col_major : (0,0,0) (1,0,0) … (R-1,0,0) (0,1,0) … then next layer.
-    snake     : row_major with every ODD row reversed (0→C-1 then
-                C-1→0 then 0→C-1 …). Layers are always incremented
-                after the whole 2D grid is filled — the operator's
-                "next layer" moment matches the arm resetting to a
-                fresh row-0 position at a raised Z.
-    """
     idx: List[Tuple[int, int, int]] = []
     for l in range(layers):
         for r in range(rows):
             if order == 'col_major':
-                # Emit by column-first for the whole layer, then break.
                 continue
             for c in range(cols):
                 effective_c = c
@@ -73,26 +311,73 @@ def _order_indices(rows: int, cols: int, layers: int,
     return idx
 
 
+# ── Slot Δ math — routes through the taught frame when present ──
+
+def _effective_pitches(spec: PalletPlaceSpec
+                       ) -> Tuple[float, float, float]:
+    """Return (pitch_row_mm, pitch_col_mm, layer_height_mm) actually
+    used for slot placement.
+
+    In `far_slot` teach mode the MEASURED pitches take precedence over
+    typed values so the derived slots land exactly on B / C. In
+    `edge` mode the typed values are used verbatim. Untaught frame
+    falls back to typed values entirely."""
+    pr = float(spec.pitch_row_mm)
+    pc = float(spec.pitch_col_mm)
+    if spec.has_taught_frame() and spec.teach_mode == 'far_slot':
+        m_row, m_col = measured_pitches(spec)
+        if m_row is not None:
+            pr = m_row
+        if m_col is not None:
+            pc = m_col
+    lh = float(spec.layer_height_mm) if spec.layer_height_mm is not None else 0.0
+    return (pr, pc, lh)
+
+
 def compute_slot_offsets(spec: PalletPlaceSpec
                          ) -> List[Tuple[Tuple[int, int, int],
                                           Tuple[float, float, float]]]:
     """Return [((r, c, l), (dx, dy, dz)), ...] in fill order.
 
-    dz uses (spec.layer_height_mm or 0.0) × layer_index — 0 for the
-    default single-layer case. When `layers > 1` and layer_height_mm
-    is None the UI validation should catch it; here we defensively
-    default to 0.0 so the math never produces NaN.
-    """
-    rax = _AXIS_TO_DXYZ_MM_PER_MM.get(spec.row_axis.upper(), (1.0, 0.0, 0.0))
-    cax = _AXIS_TO_DXYZ_MM_PER_MM.get(spec.col_axis.upper(), (0.0, 1.0, 0.0))
-    lh_mm = float(spec.layer_height_mm) if spec.layer_height_mm is not None else 0.0
-    pr = float(spec.pitch_row_mm)
-    pc = float(spec.pitch_col_mm)
+    Δ is in the ANCHOR'S BASE FRAME:
+      Δ = c · pitch_row · row_axis + r · pitch_col · col_axis
+          + l · layer_height · plane_normal
+
+    NAMING (matches operator + wizard vocabulary):
+      * row_axis points from A toward B — the "along-a-row"
+        direction. Walking along a row of cells means advancing
+        the COLUMN index.
+      * col_axis points from A toward C — the "down-a-column"
+        direction. Advancing the ROW index moves along col_axis.
+      * pitch_row = spacing of cells within a row (i.e. between
+                    adjacent columns). Measured as |B-A|/(cols-1)
+                    in far_slot mode.
+      * pitch_col = spacing of cells within a column (i.e. between
+                    adjacent rows). Measured as |C-A|/(rows-1)
+                    in far_slot mode.
+
+    So the row-INDEX r multiplies pitch_col along col_axis, and
+    the col-INDEX c multiplies pitch_row along row_axis. This
+    unpacks the natural language: "pitch_row is the column-to-
+    column distance within a row" and "row_axis is the direction
+    you walk along the row".
+
+    row_axis / col_axis / plane_normal come from compute_frame(),
+    which uses the taught 3-point frame when present and falls back
+    to base-axis literals otherwise. Pitches come from
+    _effective_pitches() (measured in far_slot mode, typed
+    elsewhere). Slot (0,0,0) is always Δ = (0,0,0) — it IS the
+    anchor."""
+    fr = compute_frame(spec)
+    rax = fr['row_axis']
+    cax = fr['col_axis']
+    nax = fr['plane_normal']
+    pr, pc, lh = _effective_pitches(spec)
     out: List[Tuple[Tuple[int, int, int], Tuple[float, float, float]]] = []
     for (r, c, l) in _order_indices(spec.rows, spec.cols, spec.layers, spec.order):
-        dx = r * pr * rax[0] + c * pc * cax[0]
-        dy = r * pr * rax[1] + c * pc * cax[1]
-        dz = r * pr * rax[2] + c * pc * cax[2] + l * lh_mm
+        dx = c * pr * rax[0] + r * pc * cax[0] + l * lh * nax[0]
+        dy = c * pr * rax[1] + r * pc * cax[1] + l * lh * nax[1]
+        dz = c * pr * rax[2] + r * pc * cax[2] + l * lh * nax[2]
         out.append(((r, c, l), (dx, dy, dz)))
     return out
 
@@ -103,9 +388,9 @@ def derive_slot_tcps(spec: PalletPlaceSpec,
     """Return per-slot absolute TCPs [{index, row, col, layer, tcp_mm}, ...].
 
     Orientation carries over from the anchor — pallet slots share
-    orientation by definition (task §1). No IK here; use
-    reachability_sweep to add per-slot joint solutions.
-    """
+    orientation by construction (every slot is a copy of A rotated
+    by A's own frame). No IK here; use reachability_sweep to add
+    per-slot joint solutions."""
     ax, ay, az, rx, ry, rz = anchor_tcp_mm
     out: List[Dict[str, Any]] = []
     for i, ((r, c, l), (dx, dy, dz)) in enumerate(compute_slot_offsets(spec)):
@@ -119,38 +404,18 @@ def derive_slot_tcps(spec: PalletPlaceSpec,
     return out
 
 
+# ── Reachability — unchanged behavior; consumes new offsets ─────
+
 def reachability_sweep(spec: PalletPlaceSpec,
                        anchor_joints_deg: List[float],
                        *,
                        joint_limits_deg: Optional[List[float]] = None,
                        joint_limit_margin_deg: float = 2.0
                        ) -> Dict[str, Any]:
-    """Sweep every slot's seeded-IK solution and report:
-
-        {
-          'total_slots':   int,
-          'reachable':     int,
-          'unreachable':   [{'row','col','layer','reason'}, ...],
-          'per_joint_min': [j1..j6] deg across all reachable slots,
-          'per_joint_max': [j1..j6] deg across all reachable slots,
-          'near_limit':    [{'row','col','layer','axis','margin_deg'}, ...],
-          'ik_available':  bool,   # False when the driver's IK isn't
-                                    # importable — every slot returns
-                                    # reason='ik unavailable'.
-        }
-
-    Slot-i joints are computed by:
-      1. Seeded IK for the pure-Z layer offset (l · layer_height_mm)
-         from the anchor's joints — reuses the driver's
-         seeded_ik_z_lift (holds J4/J5/J6 exactly).
-      2. In-plane (dx, dy) offset: no seeded solver ships today for
-         arbitrary XY, so we approximate by adding the offset in the
-         base frame and running the same seeded_ik_z_lift with the
-         XY-shifted TCP. When the driver exposes an XY-capable seeded
-         IK we swap it in here — the call surface stays the same.
-    """
-    # Deferred import so this module can be used in tests / envs
-    # where the driver package isn't on the path.
+    """Sweep every slot's seeded-IK solution. Same behavior as §1 —
+    the taught-frame rewrite changes only how offsets are computed;
+    the seeded-IK layer lift + XY approximation are unchanged.
+    Failed slots are named by (row, col, layer)."""
     try:
         from estun_driver.program_ops import seeded_ik_z_lift  # noqa
         _ik_ok = True
@@ -172,10 +437,6 @@ def reachability_sweep(spec: PalletPlaceSpec,
             unreachable.append({'row': r, 'col': c, 'layer': l,
                                 'reason': 'ik unavailable'})
             continue
-        # First pass: layer offset only via seeded IK.  In-plane
-        # placement uses the anchor's joints as the seed and lets the
-        # controller resolve XY at run time; a proper XY-seeded IK
-        # would replace this call.
         ik = seeded_ik_z_lift(list(anchor_joints_deg), dz)
         if ik is None:
             unreachable.append({'row': r, 'col': c, 'layer': l,
@@ -208,8 +469,7 @@ def reachability_sweep(spec: PalletPlaceSpec,
 
 def slot_label(row: int, col: int, layer: int, layers: int) -> str:
     """Canonical human-readable slot label used in composer step
-    labels + unreachable-slot refusal messages.
-    Example:  "slot r2,c3"  (single-layer),  "slot r2,c3,l1" (multi-layer)."""
+    labels + unreachable-slot refusal messages."""
     if layers > 1:
         return f'slot r{row},c{col},l{layer}'
     return f'slot r{row},c{col}'

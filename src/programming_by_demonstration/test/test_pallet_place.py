@@ -45,19 +45,29 @@ def test_1x1_grid_is_single_zero_offset_slot():
 
 def test_2x2_grid_default_axes_exact_arithmetic():
     """2×2 grid with pitch_row=100 pitch_col=50, axes +X row / +Y col.
+
+    Convention (2026-07-30 taught-frame rewrite):
+      * row_axis (+X) points along a ROW of cells — the direction
+        you walk when advancing the COLUMN index.
+      * col_axis (+Y) points along a COLUMN of cells — the direction
+        you walk when advancing the ROW index.
+      * pitch_row = column-to-column spacing WITHIN a row (100 mm).
+      * pitch_col = row-to-row spacing WITHIN a column (50 mm).
+      * Slot [r, c] = A + c·pitch_row·row_axis + r·pitch_col·col_axis.
+
     Expected slots in snake order (default):
       (0,0) → dx=0    dy=0
-      (0,1) → dx=0    dy=50
-      (1,1) → dx=100  dy=50   (row 1 snake: reversed cols → c=1 first)
-      (1,0) → dx=100  dy=0
+      (0,1) → dx=100  dy=0     (col_index=1 → +100 along row_axis)
+      (1,1) → dx=100  dy=50    (snake reverses within row 1: 1 then 0)
+      (1,0) → dx=0    dy=50
     """
     spec = PalletPlaceSpec(rows=2, cols=2, pitch_row_mm=100, pitch_col_mm=50)
     offsets = compute_slot_offsets(spec)
     assert offsets == [
-        ((0, 0, 0), (0.0,   0.0, 0.0)),
-        ((0, 1, 0), (0.0,  50.0, 0.0)),
+        ((0, 0, 0), (0.0,    0.0, 0.0)),
+        ((0, 1, 0), (100.0,  0.0, 0.0)),
         ((1, 1, 0), (100.0, 50.0, 0.0)),
-        ((1, 0, 0), (100.0, 0.0, 0.0)),
+        ((1, 0, 0), (0.0,   50.0, 0.0)),
     ]
 
 
@@ -88,8 +98,10 @@ def test_snake_reverses_every_odd_row():
 
 
 def test_axis_sign_negative_x_grows_backward():
-    """row_axis='-X' → dx term is NEGATIVE per row-index."""
-    spec = PalletPlaceSpec(rows=2, cols=1,
+    """row_axis='-X' → advancing COL index moves -X (2026-07-30
+    convention: col index walks along row_axis)."""
+    # Use a 1-row, 2-col grid so advancing col index is the only motion.
+    spec = PalletPlaceSpec(rows=1, cols=2,
                            pitch_row_mm=100, pitch_col_mm=50,
                            row_axis='-X', col_axis='+Y',
                            order='row_major')
@@ -98,18 +110,22 @@ def test_axis_sign_negative_x_grows_backward():
 
 
 def test_axis_sign_swap_x_and_y():
-    """row_axis='+Y' + col_axis='+X' → dx/dy roles swap."""
+    """row_axis='+Y' + col_axis='+X'. Under 2026-07-30 convention,
+    col index c multiplies pitch_row·row_axis (+Y), row index r
+    multiplies pitch_col·col_axis (+X)."""
     spec = PalletPlaceSpec(rows=2, cols=3,
                            pitch_row_mm=10, pitch_col_mm=20,
                            row_axis='+Y', col_axis='+X',
                            order='row_major')
     offs = compute_slot_offsets(spec)
-    # (r=0, c=0) → 0 / 0.  (r=0, c=1) → dy=0 dx=20 (col_axis=+X).
-    # (r=0, c=2) → 40 / 0.  (r=1, c=0) → dx=0 dy=10 (row_axis=+Y).
-    assert offs[0] == ((0, 0, 0), (0.0, 0.0, 0.0))
-    assert offs[1] == ((0, 1, 0), (20.0, 0.0, 0.0))
-    assert offs[2] == ((0, 2, 0), (40.0, 0.0, 0.0))
-    assert offs[3] == ((1, 0, 0), (0.0, 10.0, 0.0))
+    # (r=0, c=0) → 0 / 0.
+    # (r=0, c=1) → c=1 * pitch_row(10) * row_axis(+Y) → dy=10 dx=0.
+    # (r=0, c=2) → dy=20 dx=0.
+    # (r=1, c=0) → r=1 * pitch_col(20) * col_axis(+X) → dx=20 dy=0.
+    assert offs[0] == ((0, 0, 0), (0.0,  0.0, 0.0))
+    assert offs[1] == ((0, 1, 0), (0.0, 10.0, 0.0))
+    assert offs[2] == ((0, 2, 0), (0.0, 20.0, 0.0))
+    assert offs[3] == ((1, 0, 0), (20.0, 0.0, 0.0))
 
 
 def test_layer_math_2_rows_2_cols_2_layers():
