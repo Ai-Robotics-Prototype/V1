@@ -10003,6 +10003,29 @@ if FASTAPI_AVAILABLE:
         # from step count + iter_offset_mm on slot 1 (defensive).
         cfg = prog.get('config') or {}
         spec_dict = cfg.get('pallet_place')
+
+        # Legacy migration (2026-07-30 cleanup): pre-taught-frame
+        # programs stored a single corner_tcp on config.pallet as
+        # a {x,y,z,rx,ry,rz} dict. Seed corner_a_tcp from that so
+        # a legacy program renders "A taught" honestly on the
+        # frame status; the modal cleanup MUST NOT lose the
+        # operator's already-captured corner.
+        legacy_pallet = cfg.get('pallet') or {}
+        legacy_corner = legacy_pallet.get('corner_tcp')
+        def _legacy_corner_as_tcp(d):
+            if not isinstance(d, dict): return None
+            try:
+                return [float(d.get('x') or 0), float(d.get('y') or 0),
+                        float(d.get('z') or 0), float(d.get('rx') or 0),
+                        float(d.get('ry') or 0), float(d.get('rz') or 0)]
+            except (TypeError, ValueError):
+                return None
+        if isinstance(spec_dict, dict):
+            if not spec_dict.get('corner_a_tcp'):
+                migrated = _legacy_corner_as_tcp(legacy_corner)
+                if migrated is not None:
+                    spec_dict = dict(spec_dict)
+                    spec_dict['corner_a_tcp'] = migrated
         if not spec_dict:
             # Legacy path: derive from the highest slot's metadata.
             max_r = max((s['pallet_slot']['row']   for s in slot_steps), default=0)

@@ -19,6 +19,7 @@ import {
   untaughtStepIds,
   hasFullTaughtPose,
   verbForStep,
+  palletFrameStatus,
   NON_MOTION_ACTIONS,
 } from './programTruth.js'
 
@@ -177,4 +178,61 @@ test('verbForStep: falls back to expected verb for uncodegen-ed program', () => 
   assert.deepEqual(verbForStep(prog, 2),
     { verb: 'movJ', expected: true, reason: '' })
   assert.equal(verbForStep(prog, 3).verb, null)
+})
+
+
+// ── palletFrameStatus — modal frame indicator ────────────────────
+
+test('palletFrameStatus: empty program → nothing taught', () => {
+  assert.deepEqual(palletFrameStatus({}),
+    { cornerA: false, pointB: false, pointC: false, allTaught: false })
+})
+
+test('palletFrameStatus: full 3-point frame taught', () => {
+  const prog = { config: { pallet_place: {
+    corner_a_tcp: [0, 0, 0, 0, 0, 0],
+    point_b_tcp:  [100, 0, 0, 0, 0, 0],
+    point_c_tcp:  [0, 100, 0, 0, 0, 0],
+  }}}
+  assert.deepEqual(palletFrameStatus(prog),
+    { cornerA: true, pointB: true, pointC: true, allTaught: true })
+})
+
+test('palletFrameStatus: only A taught', () => {
+  const prog = { config: { pallet_place: {
+    corner_a_tcp: [0, 0, 0, 0, 0, 0],
+  }}}
+  const st = palletFrameStatus(prog)
+  assert.equal(st.cornerA, true)
+  assert.equal(st.pointB, false)
+  assert.equal(st.pointC, false)
+  assert.equal(st.allTaught, false)
+})
+
+test('palletFrameStatus: legacy corner_tcp {x,y,z,...} seeds A', () => {
+  // Pre-2026-07-30 programs stored a single corner as a dict on
+  // config.pallet.corner_tcp. The modal cleanup must not drop
+  // this operator-authored data — palletFrameStatus reads the
+  // legacy field so the "A taught" indicator lights up.
+  const prog = { config: { pallet: {
+    corner_tcp: { x: 100, y: 200, z: 50, rx: 0, ry: 0, rz: 0 },
+  }}}
+  const st = palletFrameStatus(prog)
+  assert.equal(st.cornerA, true, 'legacy corner_tcp dict must seed cornerA')
+  assert.equal(st.pointB, false)
+  assert.equal(st.pointC, false)
+})
+
+test('palletFrameStatus: legacy corner_tcp with missing xyz keys does NOT seed A', () => {
+  const prog = { config: { pallet: {
+    corner_tcp: { rx: 0.1 }, // no x/y/z
+  }}}
+  assert.equal(palletFrameStatus(prog).cornerA, false)
+})
+
+test('palletFrameStatus: partial 6-el array does NOT count as taught', () => {
+  const prog = { config: { pallet_place: {
+    corner_a_tcp: [0, 0, 0],   // only 3 elements — malformed
+  }}}
+  assert.equal(palletFrameStatus(prog).cornerA, false)
 })

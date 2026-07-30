@@ -728,14 +728,25 @@ function PalletCornerIcon({ rows = 4, cols = 4, role = 'corner',
 }
 
 // PalletConfigEditor — modal for editing the program-level pallet
-// block (rows/cols/layers/spacing/fill order/heights + taught
-// corner TCP + taught pick/place TCP). Pre-fills from the program's
-// existing config; "Use current pose" buttons re-record TCPs from the
-// live robot. Save writes back through onSave; the parent regenerates
-// the steps + PUT's the program.
-function PalletConfigEditor({ config, onSave, onClose }) {
+// PARAMETERS: rows/cols/layers/spacing/fill order/heights/speed.
+//
+// 2026-07-30 cleanup: taught positions were removed from this modal.
+// Pre-cleanup the modal carried a "Taught positions" section with
+// raw TCP readouts and "Use current pose" buttons — legacy one-
+// corner teach UI predating the 3-point frame. The corner + pick/
+// place taught data now flows through the wizard's diagram-guided
+// teach flow (corner A + point B + point C in one sequence) OR
+// through the step-row Teach buttons — one teaching surface, per
+// the position-teaching consistency rule.
+//
+// The modal preserves any already-captured corner_tcp on save so
+// legacy programs don't lose data when re-saved through here; the
+// pallet_slots endpoint transparently migrates corner_tcp →
+// corner_a_tcp at read time.
+function PalletConfigEditor({ config, onSave, onClose, onGoToTeaching }) {
   const initialMode = config?.pallet_mode === 'depalletize' ? 'depalletize' : 'palletize'
   const initialPallet = (config?.pallet && typeof config.pallet === 'object') ? config.pallet : {}
+  const initialPlace  = (config?.pallet_place && typeof config.pallet_place === 'object') ? config.pallet_place : {}
   const [mode,       setMode]       = useState(initialMode)
   const [rows,       setRows]       = useState(Number(initialPallet.rows   ?? 4))
   const [cols,       setCols]       = useState(Number(initialPallet.cols   ?? 4))
@@ -747,34 +758,17 @@ function PalletConfigEditor({ config, onSave, onClose }) {
   const [approachH,  setApproachH]  = useState(Number(initialPallet.approach_height_mm ?? config?.pallet_approach_height_mm ?? 100))
   const [retractH,   setRetractH]   = useState(Number(initialPallet.retract_height_mm  ?? config?.pallet_retract_height_mm  ?? 200))
   const [speed,      setSpeed]      = useState(Number(config?.speed_pct ?? config?.speed ?? 60))
-  const [cornerTcp,  setCornerTcp]  = useState(initialPallet.corner_tcp || null)
-  const [pickTcp,    setPickTcp]    = useState(config?.pick_tcp || null)
-  const [placeTcp,   setPlaceTcp]   = useState(config?.place_tcp || null)
-  const [busy,       setBusy]       = useState(null)
-  const [error,      setError]      = useState(null)
 
   const cycles = Math.max(1, rows * cols * layers)
   const isDepal = mode === 'depalletize'
 
-  async function captureTcp(role) {
-    setBusy(role)
-    setError(null)
-    try {
-      const tcp = await fetchTcpFromState()
-      if (!tcp) {
-        setError('Could not read TCP from robot. Is the driver connected?')
-        return
-      }
-      if (role === 'corner') setCornerTcp(tcp)
-      else if (role === 'pick') setPickTcp(tcp)
-      else if (role === 'place') setPlaceTcp(tcp)
-    } finally {
-      setBusy(null)
-    }
-  }
-
   function commit() {
+    // Parameters-only patch. Preserve any 3-point taught frame +
+    // legacy corner_tcp / pick_tcp / place_tcp values that already
+    // sit on config — the modal no longer edits them, and re-
+    // saving here MUST NOT discard operator-authored data.
     const pallet = {
+      ...initialPallet,                                   // preserve corner_tcp + anything else
       rows: Number(rows) || 1,
       cols: Number(cols) || 1,
       layers: Number(layers) || 1,
@@ -782,17 +776,33 @@ function PalletConfigEditor({ config, onSave, onClose }) {
       spacing_y_mm: Number(spacingY) || 0,
       layer_height_mm: Number(layerH) || 0,
       fill_order: fillOrder || 'row_lr',
-      corner_tcp: cornerTcp || { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0 },
       approach_height_mm: Number(approachH) || 0,
       retract_height_mm:  Number(retractH)  || 0,
     }
+    // pallet_place (schema-shape spec consumed by the taught-frame
+    // math) also gets its grid fields updated but its taught frame
+    // (corner_a_tcp / point_b_tcp / point_c_tcp / teach_mode) is
+    // left intact.
+    const palletPlace = {
+      ...initialPlace,
+      rows: Number(rows) || 1,
+      cols: Number(cols) || 1,
+      layers: Number(layers) || 1,
+      pitch_row_mm: Number(spacingX) || 0,
+      pitch_col_mm: Number(spacingY) || 0,
+      layer_height_mm: Number(layerH) || 0,
+      order: (fillOrder === 'col') ? 'col_major'
+           : (fillOrder === 'snake') ? 'snake'
+           : 'row_major',
+    }
     onSave({
       pallet,
+      pallet_place: palletPlace,
       pallet_mode: mode,
       source: mode === 'palletize' ? 'camera_library' : 'fixed_grid',
       speed_pct: Number(speed) || 60,
-      pick_tcp:  pickTcp  || undefined,
-      place_tcp: placeTcp || undefined,
+      // NOTE: pick_tcp / place_tcp intentionally NOT re-emitted —
+      // the parent's config-spread preserves whatever is there.
     })
     onClose()
   }
@@ -804,43 +814,24 @@ function PalletConfigEditor({ config, onSave, onClose }) {
     { value: 'snake',  label: 'Snake (alternate)' },
   ]
 
-  // Hover-title that describes what the icon is showing — useful when
-  // the convention ("robot at front") isn't obvious from the row label.
-  const iconTitle = (role) => {
-    if (mode === 'palletize' && role === 'pick')
-      return 'Pick source (camera feed) · robot R at front'
-    if (mode === 'depalletize' && role === 'place')
-      return 'Place destination (external) · robot R at front'
-    const cell = (mode === 'depalletize' && role === 'pick')
-      ? '[1,1, top layer]' : '[1,1]'
-    return `Reference corner ${cell} · fill order ${fillOrder} · robot R at front (convention)`
-  }
-
-  const tcpRow = (label, tcp, role) => (
-    <div style={{
-      display: 'flex', alignItems: 'center', gap: 8,
-      padding: '8px 10px', marginBottom: 6,
-      background: '#f8fafc', border: '1px solid #e5e7eb', borderRadius: 6,
-    }}>
-      <div title={iconTitle(role)} style={{ flexShrink: 0, lineHeight: 0 }}>
-        <PalletCornerIcon rows={rows} cols={cols}
-          role={role} mode={mode} fillOrder={fillOrder} size={36} />
-      </div>
-      <div style={{ minWidth: 110, fontSize: 11, fontWeight: 600, color: '#374151' }}>{label}</div>
-      <div style={{ flex: 1, fontSize: 11, color: tcp ? '#111' : '#9ca3af', fontFamily: 'var(--font-mono, monospace)' }}>
-        {tcp
-          ? `x=${(+tcp.x).toFixed(1)} y=${(+tcp.y).toFixed(1)} z=${(+tcp.z).toFixed(1)}  rx=${(+tcp.rx).toFixed(2)} ry=${(+tcp.ry).toFixed(2)} rz=${(+tcp.rz).toFixed(2)}`
-          : '— not taught'}
-      </div>
-      <button onClick={() => captureTcp(role)} disabled={busy === role}
-        style={{ padding: '5px 10px', fontSize: 11, fontWeight: 600,
-                 background: '#eff6ff', color: '#2563EB',
-                 border: '1px solid #bfdbfe', borderRadius: 4,
-                 cursor: busy === role ? 'wait' : 'pointer' }}>
-        {busy === role ? '...' : 'Use current pose'}
-      </button>
-    </div>
-  )
+  // Frame-status readout — reads corner_a_tcp / point_b_tcp /
+  // point_c_tcp from the current config.pallet_place. Migrates from
+  // the legacy config.pallet.corner_tcp when the new field isn't
+  // set yet, so a legacy program renders "A taught" honestly
+  // (that's the operator's already-captured data; the pallet_slots
+  // endpoint applies the same migration on read).
+  const _legacyCorner = initialPallet.corner_tcp
+  const _hasLegacyCorner = _legacyCorner
+    && typeof _legacyCorner === 'object'
+    && ['x','y','z'].every((k) => Number.isFinite(Number(_legacyCorner[k])))
+  const cornerATaught = Array.isArray(initialPlace.corner_a_tcp)
+                        && initialPlace.corner_a_tcp.length >= 6
+                        || _hasLegacyCorner
+  const pointBTaught  = Array.isArray(initialPlace.point_b_tcp)
+                        && initialPlace.point_b_tcp.length >= 6
+  const pointCTaught  = Array.isArray(initialPlace.point_c_tcp)
+                        && initialPlace.point_c_tcp.length >= 6
+  const anyMissing    = !(cornerATaught && pointBTaught && pointCTaught)
 
   return (
     <div style={{
@@ -959,24 +950,57 @@ function PalletConfigEditor({ config, onSave, onClose }) {
             </Field>
           </div>
 
-          <div style={{ marginTop: 8, marginBottom: 8, fontSize: 11, fontWeight: 700, color: '#374151' }}>
-            Taught positions
-          </div>
-          {tcpRow(
-            isDepal ? 'Corner [1,1,top]' : 'Corner [1,1,1]',
-            cornerTcp, 'corner',
-          )}
-          {isDepal
-            ? tcpRow('Place TCP', placeTcp, 'place')
-            : tcpRow('Pick TCP',  pickTcp,  'pick')}
-
-          {error && (
-            <div style={{ marginTop: 8, padding: '6px 10px', fontSize: 11,
-              background: '#fef2f2', color: '#DC2626',
-              border: '1px solid #fecaca', borderRadius: 4 }}>
-              {error}
+          {/* Read-only frame status — 2026-07-30 cleanup. Modal
+              is parameters-only; teaching goes through the
+              diagram-guided flow, per the position-teaching
+              consistency rule. Displays taught state; never
+              captures. */}
+          <div style={{
+            marginTop: 12, padding: '10px 12px',
+            background: '#f8fafc', border: '1px solid #e5e7eb',
+            borderRadius: 6, display: 'flex',
+            alignItems: 'center', gap: 12, flexWrap: 'wrap',
+          }} data-testid="pallet-frame-status">
+            <div style={{ fontSize: 11, fontWeight: 700, color: '#374151',
+                          flexShrink: 0 }}>
+              Pallet frame:
             </div>
-          )}
+            <div style={{ display: 'flex', gap: 12, flex: 1,
+                          fontSize: 12, color: '#374151',
+                          fontFamily: 'var(--font-mono, monospace)' }}>
+              <span style={{ color: cornerATaught ? '#0f766e' : '#9ca3af' }}>
+                {cornerATaught ? '●' : '○'} A {cornerATaught ? 'taught' : 'not taught'}
+              </span>
+              <span style={{ color: pointBTaught ? '#0f766e' : '#9ca3af' }}>
+                {pointBTaught ? '●' : '○'} B {pointBTaught ? 'taught' : 'not taught'}
+              </span>
+              <span style={{ color: pointCTaught ? '#0f766e' : '#9ca3af' }}>
+                {pointCTaught ? '●' : '○'} C {pointCTaught ? 'taught' : 'not taught'}
+              </span>
+            </div>
+            <button
+              onClick={() => {
+                if (typeof onGoToTeaching === 'function') {
+                  onGoToTeaching()
+                }
+                onClose()
+              }}
+              style={{
+                padding: '5px 12px', fontSize: 11, fontWeight: 600,
+                background: anyMissing ? '#eff6ff' : '#f3f4f6',
+                color:      anyMissing ? '#2563EB' : '#6b7280',
+                border:     anyMissing ? '1px solid #bfdbfe' : '1px solid #d1d5db',
+                borderRadius: 4, cursor: 'pointer', flexShrink: 0,
+              }}
+              data-testid="pallet-frame-goto-teaching">
+              {anyMissing ? 'Teach via Teach All →' : 'Re-teach frame →'}
+            </button>
+          </div>
+          <div style={{ marginTop: 6, fontSize: 10, color: '#6b7280', lineHeight: 1.4 }}>
+            Frame points teach only through the diagram-guided flow
+            (Teach All or the step's Teach buttons). This modal edits
+            parameters only.
+          </div>
         </div>
       </div>
     </div>
@@ -4715,6 +4739,7 @@ export default function ProgramEditor() {
       {editingPallet && (
         <PalletConfigEditor
           config={currentProgram.config || {}}
+          onGoToTeaching={startTeachAll}
           onSave={(patch) => {
             // patch carries pallet / pallet_mode / source / speed_pct +
             // optional pick_tcp / place_tcp. Merge into program.config,

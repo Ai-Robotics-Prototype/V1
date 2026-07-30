@@ -122,6 +122,31 @@ export function hasFullTaughtPose(step) {
   return false
 }
 
+// Pallet 3-point taught frame — read-only status for the edit
+// modal's frame indicator. Mirrors the backend's PalletPlaceSpec.
+// has_taught_frame + the pallet_slots endpoint's legacy corner_tcp
+// → corner_a_tcp migration, so a legacy program (pre-2026-07-30)
+// renders "A taught" from its already-captured single corner.
+//
+// Returns { cornerA, pointB, pointC, allTaught } — booleans per
+// point + a convenience flag for the whole frame. Reads from
+// program.config.pallet_place (canonical) with a fallback to
+// program.config.pallet.corner_tcp (legacy dict shape).
+export function palletFrameStatus(program) {
+  const cfg = (program && program.config) || {}
+  const place = cfg.pallet_place || {}
+  const pallet = cfg.pallet || {}
+  const hasArr6 = (v) => Array.isArray(v) && v.length >= 6
+  const legacyCorner = pallet.corner_tcp
+  const legacyHasXyz = !!(legacyCorner && typeof legacyCorner === 'object'
+    && ['x','y','z'].every((k) => Number.isFinite(Number(legacyCorner[k]))))
+  const cornerA = !!(hasArr6(place.corner_a_tcp) || legacyHasXyz)
+  const pointB  = hasArr6(place.point_b_tcp)
+  const pointC  = hasArr6(place.point_c_tcp)
+  return { cornerA, pointB, pointC, allTaught: cornerA && pointB && pointC }
+}
+
+
 // Codegen may emit a different verb than the step's action implies.
 // This resolver names the AUTHORITATIVE mapping — approach arrivals
 // under the columns-cartesian invariant, retreats forced to movJ by
