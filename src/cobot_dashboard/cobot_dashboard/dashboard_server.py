@@ -28,9 +28,11 @@ effector_state_at_end   = _breadcrumbs.effector_state_at_end
 try:
     from . import joint_recorder as _joint_recorder_mod
     from . import joint_excursions as _joint_excursions_mod
+    from . import trajectory_fk as _trajectory_fk_mod
 except ImportError:
     import joint_recorder as _joint_recorder_mod          # type: ignore
     import joint_excursions as _joint_excursions_mod       # type: ignore
+    import trajectory_fk as _trajectory_fk_mod             # type: ignore
 JointRecorder = _joint_recorder_mod.JointRecorder
 
 # Dual-import shim — matches inspection_helpers below. The systemd unit
@@ -3460,8 +3462,19 @@ if FASTAPI_AVAILABLE:
                     'served_hash': '', 'built_hash': built[:12],
                     'served_asset_hash': asset_hash}
         if not built:
-            return {'level': 'green', 'state': 'Up to date',
-                    'detail': f'served asset {asset_hash}' if asset_hash else None,
+            # No built dist to compare against → we CANNOT prove the
+            # served bundle is up to date. Do NOT return green. This
+            # closes the gap that let 2026-07-30 land a stale served
+            # bundle while System Check still said "Up to date".
+            return {'level': 'amber', 'state': 'Cannot verify',
+                    'detail': ('served asset present but no built dist '
+                               'on disk to compare against — '
+                               '`npm run build` + rsync then reload '
+                               f'(served asset {asset_hash})'
+                               if asset_hash else
+                               'served asset present but no built dist '
+                               'on disk to compare against — '
+                               '`npm run build` + rsync then reload'),
                     'served_hash': served[:12], 'built_hash': '',
                     'served_asset_hash': asset_hash}
         if served != built:
@@ -5049,6 +5062,37 @@ if FASTAPI_AVAILABLE:
         except Exception as e:
             return JSONResponse({"error": f"codegen: {e}"}, status_code=500)
 
+        # Codegen-source freshness self-check. If program_ops.py on disk
+        # differs from the sha the running module captured at import, the
+        # in-memory codegen is stale relative to disk — a restart would
+        # produce different Lua. The 2026-07-28 bowl-run investigation
+        # burned hours because there was no signal for this. We don't
+        # block the run (the operator may be mid-cycle and expects the
+        # button to work), but we LOG the mismatch and stamp the
+        # comparison into the run manifest so /api/runs makes it visible.
+        codegen_boot_sha  = program_ops.CODEGEN_VERSION.get('src_sha256', '')
+        codegen_disk_sha  = program_ops.current_disk_src_sha256()
+        codegen_is_stale  = (codegen_boot_sha != codegen_disk_sha
+                             and codegen_disk_sha != 'unknown'
+                             and codegen_boot_sha != 'unknown')
+        if codegen_is_stale:
+            print(f'[run] WARN codegen source changed since boot — '
+                  f'in-memory sha={codegen_boot_sha[:12]} '
+                  f'disk sha={codegen_disk_sha[:12]}. '
+                  f'This run uses the IN-MEMORY (boot-time) codegen. '
+                  f'Restart roboai-dashboard to load disk version.',
+                  flush=True)
+
+        # Fresh-Lua identity assertion. The Lua we're about to hash for
+        # the byte-verify below MUST be exactly what codegen just
+        # returned — anything else would mean local corruption between
+        # here and the save publish. This is a hash-of-hash sanity
+        # check rather than a real guard (the two operands come from
+        # the same variable), but a future refactor that splits
+        # regenerate from push would immediately trip this assertion.
+        import hashlib as _hashlib_run_assert
+        _push_sha = _hashlib_run_assert.sha256(lua.encode('utf-8')).hexdigest()
+
         # Empty-program guard. If codegen produced zero varspoint
         # entries, project/run would either (a) reach a Lua source
         # with only skip-comments and complete instantly, or (b) on
@@ -5067,6 +5111,43 @@ if FASTAPI_AVAILABLE:
                 "requested_pct":  int(program.get("config", {}).get(
                     "speed_pct") or program.get("speed_pct") or 10),
                 "effective_pct":  int(eff_pct),
+            }, status_code=400)
+
+        # ── LINT GATE (2026-07-30 §2-§3) ─────────────────────────
+        # Every emitted call is checked against luaenginelib.json
+        # (168-verb authoritative catalogue) BEFORE a single byte
+        # reaches the controller. This is the invariant that lets us
+        # promise "the robot will never again be the first thing to
+        # notice an invalid line" — the waitCondition(false,N) reject
+        # on 2026-07-30 08:40 is the incident that motivates it.
+        # Findings are refused with a structured payload the UI
+        # surfaces per-line.
+        try:
+            lint_findings = program_ops.lint_lua_source(lua)
+        except Exception as _le:
+            return JSONResponse({
+                "ok": False,
+                "error": f"lint failed to run: {type(_le).__name__}: {_le}",
+                "outcome": {"kind": "lint_infrastructure_error",
+                            "reason": str(_le)},
+                "program_id": prog_id,
+            }, status_code=500)
+        if lint_findings:
+            first = lint_findings[0]
+            return JSONResponse({
+                "ok": False,
+                "error": (f"lint blocked push: {len(lint_findings)} finding(s); "
+                          f"first at line {first.get('line')} verb "
+                          f"{first.get('verb')!r}: {first.get('reason')}"),
+                "outcome": {"kind": "lint_failed",
+                            "count": len(lint_findings),
+                            "findings": lint_findings},
+                "program_id": prog_id,
+                "codegen": {
+                    "boot_sha": program_ops.CODEGEN_VERSION.get(
+                        'src_sha256','')[:12],
+                    "disk_sha": program_ops.current_disk_src_sha256()[:12],
+                },
             }, status_code=400)
 
         # Controller-id underscore-split guard. If our program id
@@ -5184,7 +5265,29 @@ if FASTAPI_AVAILABLE:
                             "stored_sha": stored_sha[:12]},
             }, status_code=502)
 
-        # Byte-verify passed — publish the rest of the run sequence.
+        # Byte-verify passed. Stamp the codegen version + push sha into
+        # the recorder so the NEXT run manifest carries the attribution.
+        # Handed off BEFORE publishing the run op — the recorder starts
+        # the manifest on the controller's state=2 transition, which
+        # lands after our publish, so metadata must be pre-staged.
+        try:
+            if _joint_recorder is not None:
+                _joint_recorder.attach_pending_metadata({
+                    'codegen_version':   dict(program_ops.CODEGEN_VERSION),
+                    'codegen_disk_sha':  codegen_disk_sha[:12],
+                    'codegen_stale':     bool(codegen_is_stale),
+                    'pushed_lua_sha256': _push_sha,
+                    'pushed_lua_sha12':  _push_sha[:12],
+                    'stored_lua_sha256': stored_sha,
+                    'stored_lua_sha12':  stored_sha[:12],
+                    'requested_pct':     int(program.get('config', {}).get(
+                        'speed_pct') or program.get('speed_pct') or 10),
+                    'effective_pct':     int(eff_pct),
+                    'operator_cap_pct':  int(operator_cap_pct),
+                })
+        except Exception as e:
+            print(f'[run] attach_pending_metadata failed: {e}', flush=True)
+
         try:
             _ros_node._estun_publish_op("to_auto")
             # at_run_start bypasses the driver's mid-run high-speed
@@ -5241,6 +5344,13 @@ if FASTAPI_AVAILABLE:
             "points":     list(points.keys()),
             "source_hash": src_hash,
             "gate": {"allow_move": allow_move, "monitor_only": monitor_only},
+            "codegen": {
+                "git_sha":    program_ops.CODEGEN_VERSION.get('git_sha'),
+                "git_dirty":  program_ops.CODEGEN_VERSION.get('git_dirty'),
+                "boot_sha":   codegen_boot_sha[:12],
+                "disk_sha":   codegen_disk_sha[:12],
+                "stale":      bool(codegen_is_stale),
+            },
             "outcome": outcome,
         }
 
@@ -5452,6 +5562,29 @@ if FASTAPI_AVAILABLE:
                           f"{_HOME_FILE} taught_joints may be malformed."),
                 "outcome": {"kind": "codegen_empty"},
             }, status_code=500)
+
+        # Lint gate — same permanent check the program run endpoint uses.
+        # Home is a 1-step move_home so findings would be surprising, but
+        # if a future refactor drifts the emission we want the same hard
+        # block here rather than silently pushing an invalid line.
+        try:
+            _home_lint = program_ops.lint_lua_source(lua)
+        except Exception as _le:
+            return JSONResponse({
+                "ok": False,
+                "error": f"lint failed to run: {type(_le).__name__}: {_le}",
+                "outcome": {"kind": "lint_infrastructure_error"},
+            }, status_code=500)
+        if _home_lint:
+            first = _home_lint[0]
+            return JSONResponse({
+                "ok": False,
+                "error": (f"lint blocked home preset: {len(_home_lint)} "
+                          f"finding(s); first at line {first.get('line')} "
+                          f"verb {first.get('verb')!r}: {first.get('reason')}"),
+                "outcome": {"kind": "lint_failed",
+                            "findings": _home_lint},
+            }, status_code=400)
 
         if _ros_node is None:
             return JSONResponse({
@@ -6074,7 +6207,170 @@ if FASTAPI_AVAILABLE:
             s['step_index'] = step_idx if step_idx >= 0 else None
         analysis = _joint_excursions_mod.analyze(
             samples, threshold_deg=float(threshold_deg))
+        # Per-step TCP path deviations. Runs FK over each step's samples
+        # and folds max line-deviation (mm) and max orientation-
+        # deviation (deg) into the matching row so the summary table can
+        # flag a step for PATH wander even when the joint swing is tame.
+        try:
+            _attach_tcp_deviations(samples, analysis)
+        except Exception as e:                                     # noqa: BLE001
+            analysis['tcp_dev_error'] = str(e)
         return {'ok': True, 'run': m, 'analysis': analysis}
+
+    def _attach_tcp_deviations(samples, analysis):
+        """Mutate analysis['rows'] to add tcp_line_dev_max_mm and
+        tcp_orient_dev_max_deg per step (best-effort; missing URDF or a
+        one-sample step leaves the field null)."""
+        import numpy as np
+        if not _trajectory_fk_mod.urdf_available():
+            return
+        rows = analysis.get('rows') or []
+        if not rows:
+            return
+        # Group samples by the same key the analyzer used.
+        key = analysis.get('grouped_by') or 'step_index'
+        buckets = {}
+        for s in samples:
+            k = s.get(key)
+            if k is None:
+                k = '(no-line)'
+            buckets.setdefault(k, []).append(s)
+        chain = _trajectory_fk_mod.get_chain()
+        for row in rows:
+            grp = buckets.get(row.get('step_key')) or []
+            q = np.asarray(
+                [g.get('joints_deg') for g in grp if len(g.get('joints_deg') or []) == 6],
+                dtype=float)
+            if q.shape[0] < 2:
+                row['tcp_line_dev_max_mm']    = None
+                row['tcp_orient_dev_max_deg'] = None
+                continue
+            p, rpy = chain.fk_batch(np.deg2rad(q))
+            _, ld_max, _ = _trajectory_fk_mod.line_deviation(p)
+            _, od_max, _ = _trajectory_fk_mod.orientation_deviation(rpy)
+            row['tcp_line_dev_max_mm']    = round(ld_max * 1000.0, 2)
+            row['tcp_orient_dev_max_deg'] = round(od_max, 2)
+
+    @app.get("/api/runs/{run_id}/trajectory")
+    async def api_run_trajectory(run_id: str, step: str | None = None):
+        """Per-step joint timeseries + FK'd TCP path for a completed run.
+
+        `step` (optional) filters to a single step_index; without it the
+        response includes the full timeseries and a `steps` catalog the
+        UI uses to populate a step selector."""
+        import numpy as np
+        import re as _re
+        if not _re.match(r'^[A-Za-z0-9_.\-]+$', run_id or ''):
+            return JSONResponse({'ok': False, 'error': 'bad run_id'},
+                                status_code=400)
+        m, paths = _run_segment_paths(run_id)
+        if m is None:
+            return JSONResponse({'ok': False, 'error': 'run not found'},
+                                status_code=404)
+        samples = _joint_excursions_mod.load_samples_from_gzip_segments(paths)
+        t0 = m.get('t_start') or 0.0
+        t1 = m.get('t_end')
+        if t1 is not None:
+            samples = [s for s in samples
+                       if s.get('t') is not None
+                       and t0 - 0.5 <= s['t'] <= t1 + 0.5]
+        # Derive step_index the same way the excursions endpoint does.
+        prev_line = None
+        step_idx = -1
+        for s in samples:
+            ln = s.get('program_line')
+            if ln is not None and ln != prev_line:
+                step_idx += 1
+                prev_line = ln
+            s['step_index'] = step_idx if step_idx >= 0 else None
+            if s.get('t') is not None:
+                s['t_run'] = round(s['t'] - t0, 3)
+        # Catalog every step (index + program_line + sample count).
+        steps_catalog = []
+        seen = {}
+        for s in samples:
+            k = s.get('step_index')
+            if k is None:
+                continue
+            if k not in seen:
+                seen[k] = {
+                    'step_index':   k,
+                    'program_line': s.get('program_line'),
+                    'samples':      0,
+                    't_start':      s.get('t_run'),
+                    't_end':        s.get('t_run'),
+                }
+                steps_catalog.append(seen[k])
+            e = seen[k]
+            e['samples']  += 1
+            e['t_end']     = s.get('t_run')
+        if not _trajectory_fk_mod.urdf_available():
+            return JSONResponse({
+                'ok': False,
+                'error': f'URDF not available at {_trajectory_fk_mod.DEFAULT_URDF}',
+            }, status_code=503)
+        # Filter to the requested step, or use everything.
+        step_index = None
+        if step is not None and step != '':
+            try:
+                step_index = int(step)
+            except ValueError:
+                return JSONResponse({'ok': False, 'error': 'bad step'},
+                                    status_code=400)
+            filt = [s for s in samples if s.get('step_index') == step_index]
+        else:
+            filt = list(samples)
+        filt = [s for s in filt if len(s.get('joints_deg') or []) == 6]
+        if not filt:
+            return {'ok': True,
+                    'run':   m,
+                    'step':  step_index,
+                    'steps': steps_catalog,
+                    'samples': 0,
+                    'joints':  {'t': [], 'q_deg': []},
+                    'tcp':     {'t': [], 'xyz': [], 'rpy_deg': []},
+                    'line_deviation':        None,
+                    'orientation_deviation': None}
+        q_deg = np.asarray([s['joints_deg'] for s in filt], dtype=float)
+        t_run = np.asarray([s.get('t_run', 0.0) for s in filt], dtype=float)
+        chain = _trajectory_fk_mod.get_chain()
+        xyz, rpy = chain.fk_batch(np.deg2rad(q_deg))
+        _, ld_max, ld_rms = _trajectory_fk_mod.line_deviation(xyz)
+        _, od_max, od_rms = _trajectory_fk_mod.orientation_deviation(rpy)
+        # Downsample the timeseries for wire economy (25 Hz over a full
+        # run can be a few thousand samples). Keep the deviation
+        # statistics computed on the full-rate signal.
+        MAX_POINTS = 800
+        if q_deg.shape[0] > MAX_POINTS:
+            stride = int(np.ceil(q_deg.shape[0] / MAX_POINTS))
+            sel = np.arange(0, q_deg.shape[0], stride)
+        else:
+            sel = np.arange(q_deg.shape[0])
+        return {
+            'ok':    True,
+            'run':   m,
+            'step':  step_index,
+            'steps': steps_catalog,
+            'samples': int(q_deg.shape[0]),
+            'joints': {
+                't':     [round(float(x), 3) for x in t_run[sel]],
+                'q_deg': [[round(float(v), 3) for v in q_deg[i]] for i in sel],
+            },
+            'tcp': {
+                't':       [round(float(x), 3) for x in t_run[sel]],
+                'xyz':     [[round(float(v), 5) for v in xyz[i]] for i in sel],
+                'rpy_deg': [[round(float(v), 3) for v in np.degrees(rpy[i])] for i in sel],
+            },
+            'line_deviation': {
+                'max_mm': round(ld_max * 1000.0, 3),
+                'rms_mm': round(ld_rms * 1000.0, 3),
+            },
+            'orientation_deviation': {
+                'max_deg': round(od_max, 3),
+                'rms_deg': round(od_rms, 3),
+            },
+            'urdf': _trajectory_fk_mod.DEFAULT_URDF,
+        }
 
     @app.post("/api/program/run")
     async def api_program_run(request: Request):
@@ -9451,6 +9747,169 @@ if FASTAPI_AVAILABLE:
                 "motion_optimization_enabled":
                     prog.get('motion_optimization_enabled', True)}
 
+    @app.get("/api/programs/{prog_id}/motion_check")
+    async def api_program_motion_check(prog_id: str):
+        """Return the analyzer's MotionCheckReport for a program.
+        Consumed by the Motion Check panel in the editor. Pure read
+        endpoint — never mutates the program or /opt/cobot/programs/*.
+        See src/estun_driver/estun_driver/program_ops.py analyze_program
+        for the shape of `findings`, `adaptations`, and `metrics`."""
+        path = _prog_read_path(prog_id)
+        if not path or not os.path.isfile(path):
+            return JSONResponse({"error": "program not found"}, status_code=404)
+        try:
+            with open(path) as fp:
+                prog = json.load(fp)
+        except Exception as e:
+            return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
+        try:
+            from estun_driver import program_ops
+        except Exception as e:
+            return JSONResponse({"error": f"program_ops import: {e}"},
+                                status_code=500)
+        # Best-effort load of the parts library — enables rule 3b
+        # (approach-below-part-height). When missing, the analyzer
+        # simply skips that rule.
+        part_index = None
+        parts_path = '/opt/cobot/parts/index.json'
+        if os.path.isfile(parts_path):
+            try:
+                with open(parts_path) as fp:
+                    part_index = json.load(fp)
+            except Exception:
+                part_index = None
+        try:
+            rep = program_ops.analyze_program(prog, part_index=part_index)
+        except Exception as e:
+            return JSONResponse({"error": f"analyzer: {e}"}, status_code=500)
+        # Adaptation dict has integer keys; JSON needs string keys.
+        rep['adaptations'] = {str(k): v for k, v in rep['adaptations'].items()}
+        rep['program_id'] = prog_id
+        return rep
+
+    @app.get("/api/programs/{prog_id}/pallet_slots")
+    async def api_program_pallet_slots(prog_id: str):
+        """Return per-slot derived TCPs for the 3D twin's ghost
+        markers (2026-08-06 §2). Consumed by the 3D View's pallet
+        overlay; renders slot positions relative to the anchor so an
+        operator SEES the grid where it will land before running.
+
+        Response shape:
+            {
+              "program_id": str,
+              "pallet_place": {                # one block per pallet step;
+                                                # today at most one per program
+                "step_id":     int,
+                "anchor_step_id": int,
+                "anchor_tcp_mm": [x, y, z, rx, ry, rz] | None,
+                                                # None when anchor hasn't been
+                                                # taught yet — 3D can't ghost
+                                                # without a real anchor pose
+                "spec":        PalletPlaceSpec.to_dict(),
+                "slots":       [ {index, row, col, layer, tcp_mm}, ... ]
+              } | null,
+              "reachability": ReachabilitySweepReport | null,
+            }
+        Pure read endpoint. Any pallet_slot step without an anchor pose
+        returns anchor_tcp_mm=null and empty slots — the UI overlays
+        a "teach the anchor first" hint instead of ghost markers.
+        """
+        path = _prog_read_path(prog_id)
+        if not path or not os.path.isfile(path):
+            return JSONResponse({"error": "program not found"}, status_code=404)
+        try:
+            with open(path) as fp:
+                prog = json.load(fp)
+        except Exception as e:
+            return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
+        # Find the pallet anchor step (position_role='place', has
+        # pallet_slot with index=0). Its `taught_tcp` — populated
+        # after the operator teaches — is what we anchor the slot
+        # grid to. Anchor's `pallet_slot` also carries the spec
+        # indirectly (row=0,col=0,layer=0 slot); the SPEC itself lives
+        # on the source intent, but we can reconstruct pitch + axes
+        # from the second slot's iter_offset_mm if the anchor's own
+        # spec isn't stored. For now, we read the spec off the FIRST
+        # linked slot's step (any i>0) since composer stamps
+        # iter_offset_mm there — plus the 'pallet_slot' metadata.
+        steps = prog.get('steps') or []
+        anchor = None
+        for s in steps:
+            ps = s.get('pallet_slot') or {}
+            if ps.get('index') == 0 and s.get('position_role') == 'place':
+                anchor = s
+                break
+        if anchor is None:
+            return {"program_id": prog_id, "pallet_place": None,
+                    "reachability": None}
+
+        # Collect linked slots (index > 0) — each carries iter_offset_mm
+        # already; we still recompute from spec for reachability +
+        # canonical ordering.
+        slot_steps = [s for s in steps if s.get('pallet_slot') is not None]
+
+        # Locate the source spec — programs saved with pallet_place
+        # store it under config.pallet_place; if absent, reconstruct
+        # from step count + iter_offset_mm on slot 1 (defensive).
+        cfg = prog.get('config') or {}
+        spec_dict = cfg.get('pallet_place')
+        if not spec_dict:
+            # Legacy path: derive from the highest slot's metadata.
+            max_r = max((s['pallet_slot']['row']   for s in slot_steps), default=0)
+            max_c = max((s['pallet_slot']['col']   for s in slot_steps), default=0)
+            max_l = max((s['pallet_slot']['layer'] for s in slot_steps), default=0)
+            iter_off = None
+            for s in slot_steps:
+                if s['pallet_slot']['index'] == 1 and 'iter_offset_mm' in s:
+                    iter_off = s['iter_offset_mm']
+                    break
+            spec_dict = {
+                'rows':   max_r + 1,
+                'cols':   max_c + 1,
+                'layers': max_l + 1,
+                'pitch_row_mm': (iter_off or {}).get('dx', 0.0),
+                'pitch_col_mm': (iter_off or {}).get('dy', 0.0),
+                'layer_height_mm': (iter_off or {}).get('dz', 0.0) if max_l else None,
+                'row_axis': '+X', 'col_axis': '+Y', 'order': 'snake',
+            }
+
+        # Anchor TCP — taught contact populates taught_tcp after
+        # perception resolves it; if still awaiting, we return null.
+        anchor_tcp = anchor.get('taught_tcp')
+        try:
+            from programming_by_demonstration.schema import PalletPlaceSpec
+            from programming_by_demonstration.pallet_geometry import (
+                derive_slot_tcps, reachability_sweep,
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"error": f"pallet_geometry import: {e}"}, status_code=500)
+        spec = PalletPlaceSpec.from_dict(spec_dict)
+        slots = []
+        if isinstance(anchor_tcp, list) and len(anchor_tcp) >= 6:
+            anchor_tuple = tuple(float(v) for v in anchor_tcp[:6])
+            slots = derive_slot_tcps(spec, anchor_tuple)
+        reach = None
+        anchor_joints = anchor.get('taught_joints')
+        if (isinstance(anchor_joints, list) and len(anchor_joints) == 6
+                and all(isinstance(v, (int, float)) for v in anchor_joints)):
+            try:
+                reach = reachability_sweep(spec,
+                                           [float(v) for v in anchor_joints])
+            except Exception:
+                reach = None
+        return {
+            "program_id":   prog_id,
+            "pallet_place": {
+                "step_id":        anchor.get('id') or anchor.get('step'),
+                "anchor_step_id": anchor.get('id') or anchor.get('step'),
+                "anchor_tcp_mm":  list(anchor_tcp) if isinstance(anchor_tcp, list) else None,
+                "spec":           spec.to_dict(),
+                "slots":          slots,
+            },
+            "reachability": reach,
+        }
+
     _motion_stats_clients: set = set()
     _motion_setup_clients: set = set()
 
@@ -10149,6 +10608,34 @@ if FASTAPI_AVAILABLE:
             idx['active_cell_id'] = cell_id
             _cells_save_index(idx)
         return {'ok': True, 'active_cell_id': cell_id}
+
+    @app.post("/api/cells/deactivate")
+    async def api_cells_deactivate():
+        """Clear active_cell_id — the cell picker's 'None' option.
+        The driver's next 30s poll of /api/collision/static_zones and
+        the collision_monitor's next /collision/reload will both drop
+        their env-zone lists to []; robot-intrinsic guards (self-
+        collision, ground plane, joint limits) are unaffected. The
+        StatusBar chip flips to the amber 'No cell — environment guard
+        off' state on the next 15s poll."""
+        with _cell_lock:
+            idx = _cells_load_index()
+            was = idx.get('active_cell_id')
+            idx['active_cell_id'] = None
+            _cells_save_index(idx)
+        # Nudge the collision_monitor to reload right away instead of
+        # waiting for its next tick — the driver's 30 s poll still
+        # picks it up naturally on the next cycle.
+        try:
+            if _ros_node is not None:
+                if not hasattr(_ros_node, '_collision_reload_pub'):
+                    _ros_node._collision_reload_pub = _ros_node.create_publisher(
+                        String, '/collision/reload', 5)
+                m = String(); m.data = json.dumps({'reason': 'deactivate'})
+                _ros_node._collision_reload_pub.publish(m)
+        except Exception as e:
+            print(f'[cells] deactivate reload publish failed: {e}', flush=True)
+        return {'ok': True, 'active_cell_id': None, 'was': was}
 
     # Baseline capture — subscribes (read-only) to the latest /lidar/points_dense
     # snapshot accumulated by the dashboard's own LidarNode, accumulates across

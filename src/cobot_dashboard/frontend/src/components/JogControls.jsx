@@ -20,7 +20,7 @@ import { pushJogEvent, pushJogInterval,
 //
 // A release message is sent on: onMouseUp, onMouseLeave, onTouchEnd,
 // onTouchCancel, and component unmount (useEffect cleanup). If the
-// browser or tab dies before release, the driver's 300 ms freshness
+// browser or tab dies before release, the driver's 200 ms freshness
 // deadman fires, and if that also fails the controller's heartbeat
 // starvation is the final backstop.
 //
@@ -56,7 +56,7 @@ export function HoldButton({
   // 2026-07-22 tablet-jitter fix — swap setInterval for a
   // dual-source ticker (Web Worker + rAF with time accounting) so
   // mobile timer throttling can't stretch keepalives past the
-  // driver's 300 ms deadman. Deadman UNCHANGED — this is a
+  // driver's 200 ms deadman. Deadman UNCHANGED — this is a
   // client-side reliability fix (Lesson 102 stands).
   const tickerRef      = useRef(null)
   const pressed        = useRef(false)
@@ -82,7 +82,7 @@ export function HoldButton({
   // it keeps the pending queue capped at 1 so a slow HTTPS pool can't
   // stack a backlog. The old 400 ms abort-and-refire self-heal has been
   // removed — a slow-but-viable HTTP fetch is now allowed to complete,
-  // and the driver's 300 ms freshness deadman is the safety backstop.
+  // and the driver's 200 ms freshness deadman is the safety backstop.
   const refreshInFlight = useRef(false)
   const refreshStartMs  = useRef(0)
 
@@ -96,7 +96,7 @@ export function HoldButton({
     // synchronously and never leaves refreshInFlight true. The previous
     // 400 ms abort-and-refire self-heal was removed: it was killing
     // slow-but-viable HTTP requests on a degraded dashboard, and the
-    // driver's 300 ms freshness deadman is the correct final backstop.
+    // driver's 200 ms freshness deadman is the correct final backstop.
     if (refreshInFlight.current) {
       pushJogEvent('tick_skip_inflight', { hold_id: holdIdRef.current })
       return
@@ -164,7 +164,7 @@ export function HoldButton({
       // Both sources fire; the ticker coalesces so a single 100 ms
       // effective cadence hits the send path. Mobile timer throttling
       // (Lesson-102-adjacent: tablet browsers can stretch setInterval
-      // past the 300 ms deadman when the main thread is jank-y) can't
+      // past the 200 ms deadman when the main thread is jank-y) can't
       // stretch this because the Worker runs off-thread. rAF is the
       // belt-and-braces path and stays foreground-only.
       if (tickerRef.current) tickerRef.current.destroy()
@@ -229,6 +229,75 @@ export function HoldButton({
   useEffect(() => { stopRef.current = stop })
   useEffect(() => () => stopRef.current?.(), [])
 
+  // 2026-08-03 §3: window-level release paths.  The server's 200 ms
+  // freshness deadman catches every one of these anyway, but the
+  // client should ALSO proactively stop on any "the press logically
+  // ended" signal so an offline dashboard doesn't have to fall back
+  // to the driver's timer.  Enumerated release paths (task §3):
+  //   * pointerup     — pointer released on the button (existing).
+  //   * pointercancel — OS/browser interrupted the pointer (existing).
+  //   * pointerleave  — routed via setPointerCapture; existing button
+  //                     handler is a no-op because the pointer stays
+  //                     captured; a truly-off pointer produces
+  //                     pointercancel.
+  //   * blur          — window lost focus (alt-tab, task switcher).
+  //                     A jog is a hands-on gesture; if the operator's
+  //                     attention moved off the tab, releasing motion
+  //                     is the right default.
+  //   * visibilitychange (hidden) — tab hidden or backgrounded.
+  //                     Timer throttling can starve the ticker within
+  //                     ~200 ms on mobile; stop before the driver
+  //                     deadman does.
+  //   * WS drop / disabled — the connected slice went false; parent
+  //                     disables the button. Effect below watches
+  //                     the `disabled` prop and stops.
+  useEffect(() => {
+    if (!pressed.current) return
+    const stopIt = (eventName) => {
+      if (!pressed.current) return
+      pushJogEvent(eventName, {})
+      stopRef.current?.()
+    }
+    const onBlur     = () => stopIt('release_window_blur')
+    const onVis      = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        stopIt('release_visibility_hidden')
+      }
+    }
+    const onPageHide = () => stopIt('release_pagehide')
+    if (typeof window !== 'undefined') {
+      window.addEventListener('blur',     onBlur)
+      window.addEventListener('pagehide', onPageHide)
+    }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVis)
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('blur',     onBlur)
+        window.removeEventListener('pagehide', onPageHide)
+      }
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVis)
+      }
+    }
+    // We deliberately re-attach on every render (empty dep array would
+    // capture a stale `pressed.current`). Cost is a few addEventListener
+    // calls per frame — cheaper than missing a release path.
+  })
+
+  // If the parent disables us mid-hold (WS drop, allow_jog gate closed,
+  // safety zone changed) → stop immediately. `disabled` is the umbrella
+  // signal the JogControls parent uses for "the driver won't accept
+  // motion right now"; treating it as a release keeps the client's
+  // ticker from spinning against a wall.
+  useEffect(() => {
+    if (disabled && pressed.current) {
+      pushJogEvent('release_disabled_midhold', {})
+      stopRef.current?.()
+    }
+  }, [disabled])
+
   // Pointer events replace the earlier mouse + touch pair. Advantages:
   //   * setPointerCapture routes all subsequent move/up/cancel events
   //     to THIS button even if the finger drifts off — no movement
@@ -281,9 +350,20 @@ export function HoldButton({
       onPointerLeave={(e) => {
         e.currentTarget.style.background = bg
         e.currentTarget.style.borderColor = borderColor
-        // With setPointerCapture in place, pointerleave does NOT end
-        // the hold — the pointer still targets this button. Only real
-        // pointerup / pointercancel can end it.
+        // 2026-08-04 §3+§5: slide-off = stop. `setPointerCapture`
+        // ensures small drift (a few mm) keeps the pointer targeting
+        // this element; if a pointerleave STILL fires despite capture,
+        // the finger has moved far enough that the operator's intent
+        // is "not on the button" — treat it as a release. Release
+        // pointer capture too so a subsequent finger-down elsewhere
+        // starts a fresh press cleanly.
+        if (capturedPointerId.current != null) {
+          try { e.currentTarget.releasePointerCapture(capturedPointerId.current) }
+          catch { /* nop */ }
+          capturedPointerId.current = null
+        }
+        pushJogEvent('release_pointerleave', { pointerType: e.pointerType, id: e.pointerId })
+        stop()
       }}
       style={{
         width, height, padding: 0,
@@ -362,7 +442,7 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   // modal reads.
   const alarmModalMinimized = useStore((s) => s.alarmModalMinimized)
   const setAlarmModalMinimized = useStore((s) => s.setAlarmModalMinimized)
-  const jogStyle          = useStore((s) => s.jogStyle) || 'STEP'
+  const jogStyle          = useStore((s) => s.jogStyle) || 'CONTINUOUS'
   const setJogStyle       = useStore((s) => s.setJogStyle)
   const program           = useStore((s) => s.program) || { steps: [] }
   const triggerEstop   = useStore((s) => s.triggerEstop)

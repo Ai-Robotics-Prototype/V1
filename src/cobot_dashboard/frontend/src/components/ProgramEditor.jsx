@@ -2124,13 +2124,22 @@ function radiansToDeg(positions) {
 // Wraps HoldButton with the overlay pendant's larger sizing and the
 // arrow SVG. Same identity-stable callback pattern the main
 // JogControls's ArrowPad uses.
+//
+// 2026-08-05 fix — accepts jogStyle from the caller (drawer reads it
+// from the shared store slice) AND wires onTap for STEP mode.
+// Pre-fix the drawer's arrow buttons only fed the hold-refresh path
+// and never provided onTap, so STEP mode was unreachable in teach
+// flows and a fast tap either produced sustained motion (before the
+// operator released) or nothing visible (server dead-man kicked in).
 function OverlayJogArrow({
-  onPressStart, onPressTick, onPressEnd,
+  jogStyle,
+  onTap, onPressStart, onPressTick, onPressEnd,
   color, label, rotation, size = 140, svgSize = 60, disabled,
 }) {
   return (
     <HoldButton
-      jogStyle="CONTINUOUS"
+      jogStyle={jogStyle}
+      onTap={onTap}
       onPressStart={onPressStart}
       onPressTick={onPressTick}
       onPressEnd={onPressEnd}
@@ -2280,49 +2289,12 @@ function RecordConfirmModal({ stepLabel, onConfirm, onCancel }) {
   )
 }
 
-// Debug HUD for the teach-drawer layout diagnosis (2026-07-23). The
-// operator opens the drawer on tablet + reports the numbers so the
-// layout fix can be justified by real viewport metrics rather than
-// devtools emulation. Once the layout question is settled this can
-// be gated behind a `?debug=1` URL flag — for now it renders on
-// every drawer mount so a passing operator can read it without
-// changing browser state.
-function TeachOverlayDebugHUD({ containerRef }) {
-  const [m, setM] = useState({ innerH: 0, clientH: 0, vvH: 0, sH: 0, cH: 0 })
-  useEffect(() => {
-    const measure = () => setM({
-      innerH:  window.innerHeight,
-      clientH: document.documentElement.clientHeight,
-      vvH:     window.visualViewport ? Math.round(window.visualViewport.height) : 0,
-      sH:      containerRef.current?.scrollHeight || 0,
-      cH:      containerRef.current?.clientHeight || 0,
-    })
-    measure()
-    const onResize = () => measure()
-    window.addEventListener('resize', onResize)
-    window.visualViewport?.addEventListener('resize', onResize)
-    // Poll once more after first paint — scrollHeight/clientHeight
-    // land after layout, not on the same tick as the initial mount.
-    const rafId = requestAnimationFrame(measure)
-    return () => {
-      window.removeEventListener('resize', onResize)
-      window.visualViewport?.removeEventListener('resize', onResize)
-      cancelAnimationFrame(rafId)
-    }
-  }, [containerRef])
-  const overflow = m.sH > m.cH ? ` OVF+${m.sH - m.cH}` : ''
-  return (
-    <div style={{
-      position: 'absolute', top: 4, right: 4, zIndex: 1001,
-      padding: '3px 6px', borderRadius: 4,
-      background: 'rgba(15,23,42,0.72)', color: '#fff',
-      fontFamily: 'monospace', fontSize: 10, lineHeight: 1.3,
-      pointerEvents: 'none',
-    }}>
-      innerH:{m.innerH} clientH:{m.clientH} vv:{m.vvH} drawer:{m.sH}/{m.cH}{overflow}
-    </div>
-  )
-}
+// TeachOverlayDebugHUD (innerH/clientH/vv/drawer scrollH-clientH readout)
+// removed 2026-08-05 per operator request — the tablet-drawer layout
+// question landed in the 100dvh single-anchor fix (see the drawer's
+// height:'100dvh' comment for the resolution) and the HUD was leftover
+// instrumentation. Keep the drawerRef for a possible future re-add;
+// current mounts do not use it.
 
 function TeachOverlay({
   step, currentN, totalM, canBack,
@@ -2337,7 +2309,25 @@ function TeachOverlay({
   const jogHold          = useStore((s) => s.jogHold)
   const jogHoldCartesian = useStore((s) => s.jogHoldCartesian)
   const jogRelease       = useStore((s) => s.jogRelease)
+  // 2026-08-05 unify: use the same STEP dispatch verbs the main
+  // JogControls pendant uses so drawer/pendant/3D View behave
+  // identically for tap-to-step.
+  const jogIncrement      = useStore((s) => s.jogIncrement)
+  const jogPulseCartesian = useStore((s) => s.jogPulseCartesian)
+  // The shared Continuous/Step toggle (from useStore). CONTINUOUS is
+  // the release default (2026-08-03 §2); STEP is a one-click switch
+  // for fine positioning where "1mm button moves 1mm" matters.
+  const jogStyleShared    = useStore((s) => s.jogStyle) || 'CONTINUOUS'
   const homeRobot    = useStore((s) => s.homeRobot)
+  // Live joint stream + driver-computed limit/headroom. Joint mode
+  // reads these to render the per-joint live angle + limit range +
+  // proximity tint. Same slices JogControls (pendant/3D-view) uses so
+  // the two views agree byte-for-byte on what the arm is doing.
+  const joints        = useStore((s) => s.joints)
+  const jointLimits   = useStore((s) => s.robot?.joint_limits)
+  // Taught points on the currently-loaded program feed the optional
+  // Match: selector. Purely display — no motion, no auto-move.
+  const currentProgram = useStore((s) => s.currentProgram)
   // triggerEstop used to be pulled here for a red STOP button in the
   // drawer footer. The button was removed (redundant with TopBar's
   // global E-STOP, and inviting panic-taps mid-hold-to-jog). Motion
@@ -2347,13 +2337,22 @@ function TeachOverlay({
   const [stepSize, setStepSize] = useState(1.0)
   const [speed, setSpeed]       = useState(20)
   const [flash, setFlash]       = useState(false)
+  // Optional Match: target — a taught-point name from the current
+  // program whose joint values render as small grey targets under
+  // each live angle. null (default) = no match; live angle uses the
+  // stock proximity-tint palette. Explicit selection so the operator
+  // opts in — nothing auto-tracks or auto-moves.
+  const [matchName, setMatchName] = useState(null)
+  // Any time the operator switches the target step / cancels, reset
+  // the match so a stale target doesn't linger into the next teach.
+  useEffect(() => { setMatchName(null) }, [step?.id, step?.point_name])
   // Confirm-before-record: opened by the footer Record Position
   // button; RecordConfirmModal fires doRecord() on confirm. Closed on
   // outside-click or Cancel; no capture happens on dismissal.
   const [confirming, setConfirming] = useState(false)
-  // Drawer container ref for the debug HUD's scrollHeight/clientHeight
-  // read-out — a temporary tablet-layout diagnostic (see the
-  // TeachOverlayDebugHUD block).
+  // Drawer container ref — kept for possible future instrumentation
+  // (e.g. re-adding the layout HUD gated behind ?debug=1). Currently
+  // unused after the 2026-08-05 HUD removal; harmless.
   const drawerRef = useRef(null)
   const stepRef  = useRef(stepSize)
   const speedRef = useRef(speed)
@@ -2382,14 +2381,32 @@ function TeachOverlay({
   const holdEnd = useCallback((meta) => {
     return jogRelease(modeRef.current, meta)
   }, [jogRelease])
-  // Wire helper: returns { onPressStart, onPressTick, onPressEnd } for
-  // a given (axis, direction). identity stability comes from the
-  // callbacks above.
+  // 2026-08-05 unify — STEP-mode tap: one increment per tap. Mirrors
+  // main JogControls.tap() (see JogControls.jsx:522) so drawer and
+  // pendant agree byte-for-byte on the STEP dispatch. Joint uses
+  // driver's time-boxed delta_deg path (angle-bounded, arm stops
+  // exactly at the delta); Cartesian uses jogPulseCartesian's fixed
+  // 150 ms mode:2 pulse (distance ≈ speed × 0.15 s; approximate but
+  // matches pendant behavior).
+  const tap = useCallback((axis, direction) => {
+    if (modeRef.current === 'joint') {
+      const deltaDeg = direction * stepRef.current
+      jogIncrement(axis, deltaDeg)
+    } else {
+      jogPulseCartesian(axis, direction, speedRef.current)
+    }
+  }, [jogIncrement, jogPulseCartesian])
+  // Wire helper: returns { onTap, onPressStart, onPressTick, onPressEnd }
+  // for a given (axis, direction). identity stability comes from the
+  // callbacks above. HoldButton fires onTap when jogStyle=='STEP',
+  // and onPressStart/Tick/End when jogStyle=='CONTINUOUS'.
   const wire = useCallback((axis, direction) => ({
+    jogStyle:     jogStyleShared,
+    onTap:        () => tap(axis, direction),
     onPressStart: (meta) => holdStart(axis, direction, meta),
     onPressTick:  (meta) => holdStart(axis, direction, meta),
     onPressEnd:   (meta) => holdEnd(meta),
-  }), [holdStart, holdEnd])
+  }), [holdStart, holdEnd, tap, jogStyleShared])
 
   const recording = useRef(false)
   async function doRecord() {
@@ -2464,6 +2481,34 @@ function TeachOverlay({
   // M and N are 1-based per the spec.
   const progressPct = totalM > 0 ? ((currentN - 1) / totalM) * 100 : 0
 
+  // Match: selector menu. Enumerate the current program's taught
+  // points, sorted by taught_at so the list reads in the order the
+  // operator built the program (most-recent last matches muscle
+  // memory). Exclude the point currently being (re-)taught — matching
+  // to your own step would compare to a stale snapshot of itself.
+  const matchablePoints = (() => {
+    const pts = currentProgram?.points || {}
+    const excludeName = step?.point_name || null
+    const out = []
+    for (const [name, p] of Object.entries(pts)) {
+      if (name === excludeName) continue
+      if (!Array.isArray(p?.joints) || p.joints.length < 6) continue
+      out.push({ name, label: p?.label || name, joints: p.joints, taught_at: p?.taught_at || 0 })
+    }
+    out.sort((a, b) => (a.taught_at || 0) - (b.taught_at || 0))
+    return out
+  })()
+  const matchPoint = matchName
+    ? matchablePoints.find((p) => p.name === matchName) || null
+    : null
+  const showMatchSelector = jogMode === 'joint' && matchablePoints.length > 0
+
+  // Vertical budget check: drop the limits line when the tablet layout
+  // is tight (same threshold that already hides the "Position/Height/
+  // Rotation" section labels in Cartesian mode). Live angle NEVER
+  // drops — that's the operator's primary readout during matching.
+  const showJointLimits = !hideSectionLabels
+
   return (
     <div ref={drawerRef} style={{
       // Anchor the drawer to the visible viewport with a plain
@@ -2483,7 +2528,6 @@ function TeachOverlay({
       userSelect: 'none',
       overflowX: 'hidden',
     }}>
-      <TeachOverlayDebugHUD containerRef={drawerRef} />
       {/* HEADER */}
       <div style={{
         height: 60, flexShrink: 0,
@@ -2551,7 +2595,11 @@ function TeachOverlay({
         padding: isTabletW ? 12 : 20, gap: isTabletW ? 12 : 16,
         overflow: 'hidden',
       }}>
-        {/* Mode toggle row */}
+        {/* Mode toggle row. When Joint mode is active and the program
+            has taught points, an inline Match: selector appears at the
+            right — pick a taught position and its joint values render
+            as small grey targets under each live angle, live angle
+            tints green within 0.5°. No motion; pure display. */}
         <div style={{
           flex: '0 0 auto',
           display: 'flex', gap: 12, alignItems: 'center',
@@ -2561,6 +2609,32 @@ function TeachOverlay({
           <button onClick={() => setJogMode('joint')}     style={modeBtn(jogMode === 'joint')}>Joint</button>
           <button disabled title="Tool frame jogging requires URDF — coming soon"
             style={{ ...modeBtn(false), opacity: 0.45, cursor: 'not-allowed' }}>Tool</button>
+          {showMatchSelector && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              marginLeft: 8, flex: '0 0 auto',
+            }}>
+              <label style={{
+                fontSize: 13, color: '#374151', fontWeight: 600,
+              }}>Match:</label>
+              <select
+                value={matchName || ''}
+                onChange={(e) => setMatchName(e.target.value || null)}
+                style={{
+                  minHeight: modeBtnH, fontSize: 14,
+                  padding: '0 10px', borderRadius: 8,
+                  border: '1px solid #d1d5db', background: '#fff',
+                  color: '#111827', cursor: 'pointer',
+                  maxWidth: 220,
+                }}
+              >
+                <option value="">— none —</option>
+                {matchablePoints.map((p) => (
+                  <option key={p.name} value={p.name}>{p.label}</option>
+                ))}
+              </select>
+            </div>
+          )}
         </div>
 
         {/* Speed + step row */}
@@ -2649,17 +2723,79 @@ function TeachOverlay({
               </div>
             </>
           ) : (
-            [1, 2, 3, 4, 5, 6].map((j) => (
-              <div key={j} style={{
-                flex: '0 1 auto',
-                display: 'flex', flexDirection: 'column',
-                alignItems: 'center', gap: padGap,
-              }}>
-                <div style={{ fontSize: 16, fontWeight: 700, color: '#374151' }}>{'J' + j}</div>
-                <OverlayJogArrow {...wire(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={padBtn} svgSize={svgPx} />
-                <OverlayJogArrow {...wire(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={padBtn} svgSize={svgPx} />
-              </div>
-            ))
+            [1, 2, 3, 4, 5, 6].map((j) => {
+              // Live angle: radians → degrees, one decimal. tabular-
+              // nums keeps digits from jittering at 25 Hz.
+              const posRad = joints?.positions?.[j - 1]
+              const angleDeg = Number.isFinite(posRad)
+                ? (posRad * 180 / Math.PI) : null
+              // Driver-computed per-joint {limit_deg, headroom_deg}
+              // — same slice JogControls (pendant/3D-view) reads.
+              // Never hardcoded; if the driver hasn't broadcast yet
+              // the limits line simply doesn't render.
+              const jl = (jointLimits || []).find((x) => x?.joint === j)
+              const limitDeg = Number.isFinite(jl?.limit_deg)
+                ? jl.limit_deg : null
+              const headroom = Number.isFinite(jl?.headroom_deg)
+                ? jl.headroom_deg : null
+              // Optional Match: target (small grey number under the
+              // live angle). Green tint on the LIVE angle when within
+              // 0.5° of the target — dial-to-green replaces the
+              // photo-and-compare workflow.
+              const targetDeg = matchPoint
+                ? Number(matchPoint.joints?.[j - 1]) : null
+              const hasTarget  = Number.isFinite(targetDeg)
+              const matched    = hasTarget && angleDeg != null
+                && Math.abs(angleDeg - targetDeg) <= 0.5
+              // Proximity tint: red ≤3° headroom, amber ≤10°, green
+              // when Match is on and within tolerance. Match-green
+              // wins over headroom-amber because the operator's
+              // active task is "hit the target"; approaching the
+              // hardware limit is a background caution.
+              let angleColor = '#111827'
+              if (headroom != null) {
+                if (headroom <= 3)       angleColor = '#DC2626'
+                else if (headroom <= 10) angleColor = '#d97706'
+              }
+              if (matched) angleColor = '#16A34A'
+              return (
+                <div key={j} style={{
+                  flex: '0 1 auto',
+                  display: 'flex', flexDirection: 'column',
+                  alignItems: 'center', gap: padGap,
+                }}>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: '#374151' }}>{'J' + j}</div>
+                  <div style={{
+                    fontSize: 18, fontWeight: 700, color: angleColor,
+                    fontVariantNumeric: 'tabular-nums',
+                    minHeight: 20, lineHeight: 1,
+                  }}>
+                    {angleDeg != null ? `${angleDeg.toFixed(1)}°` : '—'}
+                  </div>
+                  {hasTarget && (
+                    <div style={{
+                      fontSize: 12, fontWeight: 600,
+                      color: matched ? '#16A34A' : '#9ca3af',
+                      fontVariantNumeric: 'tabular-nums',
+                      lineHeight: 1,
+                    }}>
+                      {`${targetDeg.toFixed(1)}°`}
+                    </div>
+                  )}
+                  <OverlayJogArrow {...wire(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={padBtn} svgSize={svgPx} />
+                  <OverlayJogArrow {...wire(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={padBtn} svgSize={svgPx} />
+                  {showJointLimits && limitDeg != null && (
+                    <div style={{
+                      fontSize: 11, color: '#9ca3af',
+                      fontVariantNumeric: 'tabular-nums',
+                      whiteSpace: 'nowrap', lineHeight: 1,
+                    }}>
+                      {`−${limitDeg.toFixed(0)}° … +${limitDeg.toFixed(0)}°`}
+                    </div>
+                  )}
+                </div>
+              )
+            })
           )}
         </div>
 

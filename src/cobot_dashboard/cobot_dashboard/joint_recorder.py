@@ -220,6 +220,12 @@ class JointRecorder:
         # run; state=0 (idle) → between runs.
         self._current_run = None       # manifest dict when live
         self._last_program_state = 0
+        # Pending metadata — merged into the NEXT run's manifest when the
+        # controller reports state=2/3. Set by the run endpoint before
+        # publishing the run op so the manifest records which codegen
+        # produced the pushed Lua (see /api/estun/program/run).
+        self._pending_meta = None
+        self._pending_meta_lock = threading.Lock()
         # Statistics — surface via /api/runs top-level for the "runtime
         # cost" report the task asks for.
         self._samples_total = 0
@@ -356,10 +362,33 @@ class JointRecorder:
             'segments':     [self._seg_path.split('/')[-1]]
                             if self._seg_path else [],
         }
+        # Drain any pending metadata attached by the run endpoint (codegen
+        # version, pushed Lua sha, freshness check result). Cleared on
+        # drain so a subsequent operator-initiated run without a
+        # /api/estun/program/run press (e.g. controller resumes a paused
+        # run) doesn't inherit stale attribution.
+        with self._pending_meta_lock:
+            pm = self._pending_meta
+            self._pending_meta = None
+        if pm:
+            for k, v in pm.items():
+                if k not in m:
+                    m[k] = v
         self._current_run = m
         _save_manifest(m)
-        print(f'[joint_recorder] run start: {rid_safe} (prog={program_id})',
+        print(f'[joint_recorder] run start: {rid_safe} (prog={program_id})'
+              + (f' codegen={pm.get("codegen_version",{}).get("git_sha","?")}'
+                 if pm else ''),
               flush=True)
+
+    def attach_pending_metadata(self, meta: dict) -> None:
+        """Merge into the NEXT run's manifest. Call from the run endpoint
+        BEFORE publishing the run op so metadata is in place by the time
+        the controller's state transition triggers _start_run."""
+        if not isinstance(meta, dict):
+            return
+        with self._pending_meta_lock:
+            self._pending_meta = dict(meta)
 
     def _finalize_run(self):
         m = self._current_run

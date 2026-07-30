@@ -53,6 +53,34 @@ export default function StatusBar() {
   // "State" chip can't disagree with what the operator sees above.
   const runState  = deriveRunState({ robot, task, safety })
 
+  // Cell-scoped environment-guard visibility (2026-07-28).
+  //   active_cell_id set  → 'Cell: <name>' in neutral text
+  //   active_cell_id null → 'No cell — environment guard off' in amber
+  //                         (#B45309, matches the FooterBuild stale-
+  //                         bundle warning — deliberately NOT alarm red).
+  // Polls /api/cells/active every 15s so a wizard-side activation flip
+  // (or an operator running `POST /api/cells/{id}/activate` from another
+  // tab) shows up here without a page reload. Silence is not an option:
+  // if this cell around the arm is unmodeled, the operator MUST see it.
+  const [cell, setCell] = useState(null)
+  const [cellLoaded, setCellLoaded] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    async function poll() {
+      try {
+        const r = await fetch('/api/cells/active')
+        if (!r.ok) return
+        const d = await r.json()
+        if (cancelled) return
+        setCell(d && d.cell ? d.cell : null)
+        setCellLoaded(true)
+      } catch { /* keep last known value */ }
+    }
+    poll()
+    const t = setInterval(poll, 15000)
+    return () => { cancelled = true; clearInterval(t) }
+  }, [])
+
   const zoneColor = ZONE_COLORS[safety.zone] ?? '#9A9A9E'
   const dotColor  = wsStatus === 'connected' ? '#22C55E'
                   : wsStatus === 'connecting' ? '#EAB308'
@@ -100,6 +128,27 @@ export default function StatusBar() {
         <span style={{ color: zoneColor, fontWeight: 600 }}>{safety.zone}</span>
         &nbsp;·&nbsp;
         {safety.human_proximity.toFixed(1)} m
+      </Block>
+
+      {/* Cell scope — silence is not an option. When no cell is active
+          the environment-obstacle guard is off (robot-intrinsic guards
+          still enforce: self-collision, ground plane, joint limits).
+          Amber text, not alarm styling. */}
+      <Block
+        title={
+          cell
+            ? `Environment keep-out zones from cell ${cell.name || cell.cell_id} are enforced. `
+              + 'Robot-intrinsic guards (self-collision, ground, joint limits) always on.'
+            : 'No commissioned cell selected — environment keep-out zones are NOT enforced. '
+              + 'Robot-intrinsic guards (self-collision, ground, joint limits) still on. '
+              + 'Configure → Cells to activate a commissioned cell.'
+        }
+        style={{ color: cell ? 'var(--text-secondary)' : '#B45309', fontWeight: cell ? 400 : 600 }}
+      >
+        {cellLoaded
+          ? (cell ? <>Cell&nbsp;<span style={{ fontWeight: 600 }}>{cell.name || cell.cell_id}</span></>
+                  : <>No cell&nbsp;—&nbsp;environment guard off</>)
+          : 'Cell…'}
       </Block>
 
       {/* WS freq + latency */}

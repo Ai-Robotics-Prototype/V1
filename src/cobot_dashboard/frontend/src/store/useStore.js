@@ -161,9 +161,16 @@ const storeDefinition = (set, get) => ({
   // JogControls press style — mirrors the factory pendant's Jogging/
   // Inching split. STEP = one increment per press (no hold-repeat);
   // CONTINUOUS = motion while held. Applies to both Joint and Cartesian.
-  // Default STEP: the conservative one. Persisted in Zustand (memory
-  // only — no localStorage; a fresh page load resets to STEP).
-  jogStyle: 'STEP',
+  //
+  // Default CONTINUOUS (2026-08-03 §2): press-and-hold matches operator
+  // expectation on a pendant, and the client + server dead-man safety
+  // net (Worker+rAF ticker at 100 ms cadence, driver's 200 ms freshness
+  // deadman) has been in production since the CONTINUOUS mode landed —
+  // STEP's "safer" reputation was margin-only. STEP remains a one-click
+  // switch for fine positioning (25 mm/step, mm-precise) and operator
+  // muscle memory. Persisted in Zustand (memory only — no localStorage;
+  // a fresh page load re-defaults to CONTINUOUS).
+  jogStyle: 'CONTINUOUS',
   setJogStyle(style) {
     if (style === 'STEP' || style === 'CONTINUOUS') set({ jogStyle: style })
   },
@@ -229,12 +236,28 @@ const storeDefinition = (set, get) => ({
   jogEnabled: false,
   jogJoint: 0,
   _jogTimer: null,
+  // 2026-08-05 — high-water-mark timestamp of the last jog rejection
+  // we toast'd. Prevents re-toasting the same rejection when the
+  // rejected[] ring buffer re-arrives on subsequent /ws frames.
+  _lastJogRejectTs: 0,
   pendingCommand: null,
   commandError: null,
   toasts: [],
 
   // ---- LiDAR ----
   lidarPoints: [],
+
+  // ---- Trajectory overlay ----
+  // Set by RecentRunsCard's [Trajectory] action so the 3D twin viewer
+  // can draw the swept flange path in the same scene the operator
+  // watches. Cleared when the user closes the trajectory panel.
+  //   points: [[x, y, z], ...]  meters, in the URDF geometry frame
+  //           (Y-up) — same frame ArmViewer3D loads the URDF into, so
+  //           the polyline lands directly on the flange.
+  //   step: integer step_index this path corresponds to (for label)
+  //   runId: source run for the readout badge
+  trajectoryOverlay: null,
+  setTrajectoryOverlay(overlay) { set({ trajectoryOverlay: overlay }) },
 
   // ---- Internal WS refs (not serialised) ----
   _stateWs: null,
@@ -318,11 +341,34 @@ const storeDefinition = (set, get) => ({
             && msg.robot.program.state !== undefined
             && msg.robot.program.state !== null
             ? now : get().lastProgramStateTs
+        // 2026-08-05 A(c): surface driver `jog` family rejections as
+        // a toast so the operator never sees dead-button silence when
+        // the allow_jog / monitor_only gate is closed on the driver.
+        // Rejections stream via robot.rejected (ring buffer, 32
+        // entries, mirrored by dashboard_server._on_estun_rejected).
+        // We track the last-seen jog-rejection timestamp and toast
+        // any newer entry — one toast per new rejection, coalesced by
+        // the store's addToast dedup so a burst doesn't spam.
+        const _incomingRej  = msg.robot?.rejected
+        const _lastJogRejTs = get()._lastJogRejectTs || 0
+        let   _newLastTs    = _lastJogRejTs
+        if (Array.isArray(_incomingRej)) {
+          for (const r of _incomingRej) {
+            if (r?.family !== 'jog') continue
+            const rts = Number(r?.ts) || 0
+            if (rts <= _lastJogRejTs) continue
+            if (rts > _newLastTs) _newLastTs = rts
+            const reason = r?.reason || 'jog rejected (unknown reason)'
+            try { get().addToast?.(`Jog rejected: ${reason}`, 'warning') }
+            catch (_) { /* nop */ }
+          }
+        }
         set({
           safety: msg.safety ?? get().safety,
           joints: msg.joints ?? get().joints,
           robot: msg.robot ?? get().robot,
           task: msg.task ?? get().task,
+          _lastJogRejectTs: _newLastTs,
           lastProgramStateTs: progStateNow,
           detections: msg.detections ?? get().detections,
           // Server publishes detection_mode in STATE; keep the store
@@ -848,7 +894,7 @@ const storeDefinition = (set, get) => ({
   // is OPEN, jog holds/refreshes/releases ride the persistent channel:
   //   - no per-request TLS handshake / TCP connection cost (dashboard
   //     server's degraded event loop was pushing HTTP POST latency past
-  //     the 300 ms driver freshness deadman — this cuts that path out),
+  //     the 200 ms driver freshness deadman — this cuts that path out),
   //   - ordered delivery (HTTP/1.1 parallel connections can reorder;
   //     seq=2-before-seq=1 was showing up in the driver log),
   //   - no in-flight promise to hang, so the doRefresh coalesce guard

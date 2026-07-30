@@ -782,7 +782,17 @@ function ReviewPanel({
                 {op.operation_type}
               </span>
               <span style={{ fontSize: 12, color: '#6b7280' }}>
-                — count: {String(op.count_hint ?? 'all')}
+                — count: {String(
+                  op.count && Number(op.count) > 1
+                    ? op.count
+                    : (op.count_hint ?? 'all')
+                )}
+                {op.pick_pattern && op.pick_pattern !== 'individual_taught'
+                  ? ` · pick=${op.pick_pattern}` : ''}
+                {op.place_pattern && op.place_pattern !== 'fixed'
+                  ? ` · place=${op.place_pattern}${
+                      op.place_pattern === 'stack' && op.place_stack_dz_mm
+                        ? ` (+${op.place_stack_dz_mm}mm)` : ''}` : ''}
               </span>
             </div>
             <Field label="Part">
@@ -903,22 +913,65 @@ function ReviewPanel({
         }}>
           {(draft.steps || []).map((s, i) => {
             const flashed = changedStepIdx && changedStepIdx.has(i)
+            // Task 1 §4: iteration grouping. Steps that carry
+            // iter_index/iter_count sit inside a repeated pick/place
+            // pair; iteration > 0 renders in the derived style (softer
+            // colour, no teach affordance, indent). derived_from-
+            // annotated approach/retreat rows also render derived so
+            // the visual grouping stays consistent.
+            const iterIdx   = Number.isFinite(s.iter_index) ? Number(s.iter_index) : null
+            const iterCount = Number.isFinite(s.iter_count) ? Number(s.iter_count) : null
+            const isDerivedIter = iterIdx !== null && iterIdx > 0
+            const isDerivedApp  = !!s.derived_from
+            const isDerived     = isDerivedIter || isDerivedApp
+            const startsIter    = iterIdx === 0 && !!s.position_role  // first pick contact of a new iteration group
+            const startsIterN   = iterIdx !== null && iterIdx > 0 && !!s.position_role
+            const showBadge = (iterCount && iterCount > 1)
+                             && (startsIter || startsIterN)
             return (
               <div key={i} style={{
                 display: 'flex', alignItems: 'center', gap: 8,
                 padding: '6px 10px',
                 borderBottom: i < draft.steps.length - 1 ? '1px solid #f3f4f6' : 'none',
-                background: i % 2 ? '#fafafa' : '#fff',
+                background: isDerived
+                  ? (i % 2 ? '#f5f7fa' : '#f9fafb')
+                  : (i % 2 ? '#fafafa' : '#fff'),
+                borderLeft: showBadge ? '3px solid #2563EB' : '3px solid transparent',
                 animation: flashed ? 'pbdStepFlash 700ms ease-out' : undefined,
               }}>
                 <span style={{
-                  fontFamily: 'monospace', fontSize: 11, color: '#6b7280',
+                  fontFamily: 'monospace', fontSize: 11,
+                  color: isDerived ? '#9ca3af' : '#6b7280',
                   minWidth: 26, textAlign: 'right',
                 }}>{i + 1}</span>
-                <span style={{ fontSize: 12, fontWeight: 600, color: '#374151', minWidth: 110 }}>
+                <span style={{
+                  fontSize: 12, fontWeight: 600,
+                  color: isDerived ? '#6b7280' : '#374151',
+                  minWidth: 110,
+                }}>
                   {s.action}
                 </span>
-                <span style={{ fontSize: 12, color: '#111', flex: 1 }}>{s.label}</span>
+                <span style={{
+                  fontSize: 12,
+                  color: isDerived ? '#4b5563' : '#111',
+                  fontStyle: isDerivedIter && !s.taught ? 'italic' : 'normal',
+                  flex: 1,
+                }}>{s.label}</span>
+                {showBadge && (
+                  <span style={{
+                    fontSize: 10, fontWeight: 700, padding: '2px 6px',
+                    borderRadius: 4,
+                    color: '#1e40af', background: '#dbeafe',
+                    border: '1px solid #bfdbfe',
+                  }}>iter {iterIdx + 1}/{iterCount}</span>
+                )}
+                {isDerivedIter && s.iter_offset_mm && (
+                  <span style={{
+                    fontSize: 10, fontWeight: 600, padding: '2px 6px',
+                    borderRadius: 4, color: '#6b7280', background: '#f3f4f6',
+                    border: '1px solid #e5e7eb',
+                  }}>derived</span>
+                )}
                 {s.pose_status === POSE_AWAITING && (
                   <span style={{
                     fontSize: 10, fontWeight: 700, padding: '2px 6px',
@@ -1479,9 +1532,29 @@ function applyClarifications(draft, intent, answers) {
               }
             }
           }
-        } else if (path === 'count_hint') {
+        } else if (path === 'count_hint' || path === 'count') {
+          // Canonical field is `count` (Task 1 §2, 2026-07-28). We keep
+          // count_hint set to the same value so old code paths that
+          // still read count_hint see the operator's answer, and the
+          // server-side StructuredIntent.from_dict prefers `count`
+          // when both are present.
           const n = Number(ans)
-          op.count_hint = Number.isFinite(n) && n > 0 ? n : ans
+          const c = Number.isFinite(n) && n > 0 ? n : (typeof ans === 'number' ? ans : 1)
+          op.count = c
+          op.count_hint = c
+        } else if (path === 'pick_pattern') {
+          const allowed = ['individual_taught', 'repeat_offset', 'vision_each']
+          const s = String(ans || '').toLowerCase()
+          op.pick_pattern = allowed.includes(s) ? s : 'individual_taught'
+        } else if (path === 'place_pattern') {
+          const allowed = ['fixed', 'stack', 'repeat_offset']
+          const s = String(ans || '').toLowerCase()
+          op.place_pattern = allowed.includes(s) ? s : 'fixed'
+        } else if (path === 'place_stack_dz_mm'
+                || path === 'pick_pitch_dx_mm' || path === 'pick_pitch_dy_mm'
+                || path === 'place_pitch_dx_mm' || path === 'place_pitch_dy_mm') {
+          const n = Number(ans)
+          if (Number.isFinite(n) && n > 0) op[path] = n
         } else if (path === 'pick.location_hint') {
           op.pick = { ...(op.pick || {}), location_hint: String(ans) }
         } else if (path === 'place.location_hint') {

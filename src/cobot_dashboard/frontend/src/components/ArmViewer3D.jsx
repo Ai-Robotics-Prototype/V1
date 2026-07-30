@@ -1243,6 +1243,57 @@ function BaselineStatusNotice({ status }) {
   )
 }
 
+// ──────────────────────────────────────────────────────────────────
+// TrajectoryPolylineOverlay — reads useStore.trajectoryOverlay and
+// draws the flange path as a polyline in the URDF geometry frame,
+// plus a green sphere at the start and a red one at the end. Set by
+// RecentRunsCard's [Trajectory] action; cleared when the operator
+// closes the panel or picks a different step.
+//
+// Frame handling: the trajectory endpoint FKs joints against the
+// SAME URDF the viewer loads (/robot/urdf → s10-140-full.urdf, Y-up),
+// so points arrive in the same coordinate system as the URDF root
+// group and land directly on the twin flange. No axis swap needed.
+// ──────────────────────────────────────────────────────────────────
+function TrajectoryPolylineOverlay() {
+  const overlay = useStore((s) => s.trajectoryOverlay)
+  if (!overlay || !Array.isArray(overlay.points) || overlay.points.length < 2) {
+    return null
+  }
+  const pts = overlay.points
+  const positions = new Float32Array(pts.length * 3)
+  for (let i = 0; i < pts.length; i++) {
+    positions[i * 3]     = pts[i][0]
+    positions[i * 3 + 1] = pts[i][1]
+    positions[i * 3 + 2] = pts[i][2]
+  }
+  const start = pts[0]
+  const end   = pts[pts.length - 1]
+  return (
+    <group>
+      <line>
+        <bufferGeometry>
+          <bufferAttribute
+            attach="attributes-position"
+            count={pts.length}
+            array={positions}
+            itemSize={3}
+          />
+        </bufferGeometry>
+        <lineBasicMaterial color="#2563eb" linewidth={2} />
+      </line>
+      <mesh position={[start[0], start[1], start[2]]}>
+        <sphereGeometry args={[0.015, 12, 12]} />
+        <meshBasicMaterial color="#16a34a" />
+      </mesh>
+      <mesh position={[end[0], end[1], end[2]]}>
+        <sphereGeometry args={[0.015, 12, 12]} />
+        <meshBasicMaterial color="#dc2626" />
+      </mesh>
+    </group>
+  )
+}
+
 function StaticZonesToggle({ value, onChange }) {
   // Probe the live collision payload for any baseline-built obstacles
   // so we don't dangle an inert toggle when no cell has zones yet.
@@ -1446,6 +1497,7 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
         )}
         <CustomGripperModel url={gripperGlbUrl} flange={flange} />
         <CollisionScene3D showStatic={showStaticZones} />
+        <TrajectoryPolylineOverlay />
         {/* IK gizmo for the URDFArm path (Program tab). Only mounts
             while Cartesian mode is on; unmount disposes the
             TransformControls cleanly. */}
