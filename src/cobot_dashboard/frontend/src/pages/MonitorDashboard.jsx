@@ -15,6 +15,7 @@ import { deriveRunState, isStopButtonEnabled,
          isStateStreamStale as _computeStreamStale,
          STUCK_STOPPING_MS } from '../lib/runState'
 import { readPayload, payloadChipLabel } from '../lib/payload'
+import { runnableStepCount } from '../lib/programTruth'
 
 // Status badge — reads the unified deriveRunState() so pill matches
 // footer matches banner. Rendered from a runState object (color, label,
@@ -895,15 +896,11 @@ export default function MonitorDashboard() {
   // nothing to run; disable the outer Run button so the operator
   // doesn't open the confirm modal only to see it refuse. Mirrors
   // the same rule RunProgramModal + /api/estun/program/run enforce.
-  const runnableStepCount = Array.isArray(currentProgram?.steps)
-    ? currentProgram.steps.filter((s) => {
-        if (!s) return false
-        if (s.point_name
-            && (currentProgram?.points || {})[s.point_name]?.joints?.length === 6) return true
-        return Array.isArray(s?.taught_joints) && s.taught_joints.length === 6
-      }).length
-    : 0
-  const emptyProgram = runnableStepCount === 0
+  // Shared programTruth.runnableStepCount — same resolver Editor's
+  // untaughtCount and the Run modal use.  Mirrors backend
+  // dashboard_server._has_taught_poses (2026-07-30 audit #P1-2).
+  const runnableCount = runnableStepCount(currentProgram)
+  const emptyProgram = runnableCount === 0
   // Restart: enabled from any active state (running/stopping/paused)
   // AND from idle. The `restartProgram` helper below handles the
   // stop-then-run sequence when needed, so this button doubles as a

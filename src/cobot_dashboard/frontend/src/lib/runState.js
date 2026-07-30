@@ -180,43 +180,37 @@ export function restartButtonEnabled({ runStateKind, stoppingSinceTs, safety,
 // step-preview panel can find WHICH step corresponds to a given
 // ProjectState.line value. Matches program_ops.codegen_lua_from_program
 // in the driver — every step (valid or skipped) consumes one file line;
-// executable-line index equals step index + 1 in the emitted Lua.
+// RETIRED (2026-07-30 audit #P1-1). The old assumption was one Lua
+// line per step; codegen actually emits multiple lines per step
+// (setSpeedJ prelude, motion_check ADAPTED comments, WRIST-LOCK
+// FALLBACK comments, seeded-IK descent-split intermediate). The
+// resulting line→step lookup pointed at the wrong step during any
+// program that touched motion-vocab modal state.
 //
-// Returns an array parallel to steps, where each entry is:
-//   { emittedLine: 1-based int, kind: 'movJ' | 'skipped' }
-// A skipped step still gets a line number (the codegen emits a comment
-// on it) but the interpreter's ProjectState.line never lands there —
-// so the step-preview panel treats 'skipped' entries as un-highlightable.
-export function computeLineMap(program) {
-  const steps = (program && Array.isArray(program.steps)) ? program.steps : []
-  const points = (program && program.points) || {}
-  const out = []
-  let line = 1
-  for (const step of steps) {
-    if (!step) { out.push({ emittedLine: line++, kind: 'skipped' }); continue }
-    const pn = step.point_name
-    const hasPointRef = pn && points[pn]
-      && Array.isArray(points[pn].joints) && points[pn].joints.length === 6
-    const hasTaught = Array.isArray(step.taught_joints) && step.taught_joints.length === 6
-    if (hasPointRef || hasTaught) {
-      out.push({ emittedLine: line, kind: 'movJ' })
-    } else {
-      out.push({ emittedLine: line, kind: 'skipped' })
-    }
-    line += 1
-  }
-  return out
+// Current behavior: return an empty map so stepIndexForLine falls
+// through to task.program_step (executor sim path). On the Estun
+// pipeline, task.program_step is not populated — the step-preview
+// panel then simply doesn't highlight, which is HONEST (we don't
+// know) rather than WRONG (pretending to know).
+//
+// Follow-up (queued in docs/ui_truth_audit.md #P1-1): add
+// GET /api/programs/{id}/line_map that dry-runs codegen and returns
+// the authoritative per-step line indices; fetch on Run press and
+// consult here.
+export function computeLineMap(_program) {
+  return []
 }
 
-// stepIndexForLine(program, line) — inverse of computeLineMap. Given the
-// ProjectState.line the driver reports, find the step index (0-based)
-// whose emittedLine matches. Returns -1 when no match (line points at
-// a footer/blank/comment line the driver shouldn't normally report).
+// stepIndexForLine(program, line) — inverse of computeLineMap. Given
+// the ProjectState.line the driver reports, find the step index
+// (0-based). Returns -1 when no map is available so the caller falls
+// through to task.program_step (see StepPreviewPanel + ProgramEditor
+// executingIdx derivation).
 export function stepIndexForLine(program, line) {
   if (line == null || line <= 0) return -1
   const map = computeLineMap(program)
   for (let i = 0; i < map.length; i++) {
-    if (map[i].emittedLine === line) return i
+    if (map[i] && map[i].emittedLine === line) return i
   }
   return -1
 }

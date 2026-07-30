@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useStore } from '../store/useStore'
 import { readPayload, PAYLOAD_UNSET_WARNING, PAYLOAD_INFO_ONLY }
   from '../lib/payload'
+import { runnableStepCount } from '../lib/programTruth'
 
 // Confirm modal for the Monitor "Run Program" button. Reads the same
 // currentProgram + robot.allow_move + robot.operator_speed_limit that
@@ -65,22 +66,12 @@ export default function RunProgramModal() {
   if (!open) return null
 
   const stepCount = Array.isArray(currentProgram?.steps) ? currentProgram.steps.length : 0
-  // Count "runnable" steps: either (a) a step referencing a real
-  // taught point OR (b) legacy taught_joints on the step itself.
-  // Codegen skips anything else with a `-- skipped` comment; if
-  // this count is zero the codegen produces a Lua file with only
-  // skip-comments — no movJ, no varspoint, project/run can't
-  // resolve. Same guard on the backend, mirrored here so Confirm
-  // is disabled instead of the operator waiting for a round-trip
-  // failure.
-  const pointsDict = currentProgram?.points || {}
-  const taughtCount = Array.isArray(currentProgram?.steps)
-    ? currentProgram.steps.filter((s) => {
-        if (!s) return false
-        if (s.point_name && pointsDict[s.point_name]?.joints?.length === 6) return true
-        return Array.isArray(s?.taught_joints) && s.taught_joints.length === 6
-      }).length
-    : 0
+  // Shared programTruth.runnableStepCount — the SAME resolver Editor's
+  // untaughtCount and Monitor's runnableStepCount use.  Mirrors
+  // dashboard_server._has_taught_poses, including derived_from
+  // implicit teaching and non-motion actions (2026-07-30 audit
+  // #P1-2 — see docs/ui_truth_audit.md for the fork history).
+  const taughtCount = runnableStepCount(currentProgram)
   // Controller-id round-trip safety: only [a-z0-9] ids can be
   // resolved by the controller's URL parser (underscore/dash get
   // treated as path separators and break project/run lookup).

@@ -8,6 +8,9 @@ import { readPayload, PAYLOAD_UNSET_WARNING, PAYLOAD_INFO_ONLY }
   from '../lib/payload'
 import { useIOPortmap, portmapLabels, portmapToOptions }
   from '../lib/ioPortmap'
+import { isStepTaught, untaughtStepIds, hasFullTaughtPose, verbForStep }
+  from '../lib/programTruth'
+import { stepIndexForLine } from '../lib/runState'
 
 // The richer action taxonomy lives in the editor. Each action carries
 // a coarse `type` (matching the existing backend schema: move/gripper/
@@ -437,13 +440,18 @@ function detailLine(step, ioLabels) {
 // Does this step have anything worth showing in the collapsible
 // position-data block? Drives whether the "View position data" link
 // is rendered (empty steps don't need a no-op toggle).
+//
+// Uses hasFullTaughtPose from programTruth so only 6-element arrays
+// count — partial arrays are malformed teach data and shouldn't be
+// presented to the operator as if they were captured (2026-07-30
+// audit #P1-3).
 function hasPositionData(step) {
   if (!step) return false
-  if (Array.isArray(step.taught_joints) && step.taught_joints.length) return true
-  if (Array.isArray(step.taught_tcp)    && step.taught_tcp.length)    return true
-  if (Array.isArray(step.joints)        && step.joints.length)        return true
-  if (Array.isArray(step.position)      && step.position.length)      return true
-  if (step.taught_at)                                                  return true
+  if (hasFullTaughtPose(step)) return true
+  // Legacy taught_at breadcrumb (drawer shows just the timestamp) —
+  // preserved so operators inspecting old programs can still see when
+  // a pose WAS taught, even if the payload got corrupted since.
+  if (step.taught_at) return true
   return false
 }
 
@@ -3065,6 +3073,20 @@ export default function ProgramEditor() {
   // the last save.
   const runningSteps       = useStore((s) => s.program.steps ?? [])
   const taskRunning        = useStore((s) => Boolean(s.task?.running || s.task?.paused))
+  // Same precedence lib/runState uses: prefer the controller's
+  // program.line (mapped via stepIndexForLine) over the executor's
+  // step counter. `executingIdx` is -1 when nothing is executing
+  // (also when the run just finished — the bar clears to empty).
+  const _programLine       = useStore((s) => s.robot?.program?.line)
+  const _programStep       = useStore((s) => s.task?.program_step)
+  const executingIdx = (() => {
+    if (Number.isInteger(_programLine) && _programLine > 0) {
+      const idx = stepIndexForLine(currentProgram, _programLine)
+      if (idx >= 0) return idx
+    }
+    if (Number.isInteger(_programStep)) return _programStep
+    return -1
+  })()
 
   // Operator-renamed I/O labels for the detail line + IOPortSelector
   // dropdowns. Fetched once per editor mount.
@@ -3085,9 +3107,20 @@ export default function ProgramEditor() {
   const stepsHaveIds = rawSteps.every((s) => typeof s.id === 'number')
   const steps = stepsHaveIds ? rawSteps : renumber(rawSteps)
   // Untaught steps the operator still needs to teach before the path
-  // is ready to run. Includes gripper open/close and the home pose —
-  // they all happen at a specific robot location.
-  const untaughtCount = steps.filter((s) => isTeachable(s) && !s.taught).length
+  // is ready to run. Uses the shared programTruth.isStepTaught resolver
+  // (mirror of backend _has_taught_poses) so this count agrees with the
+  // Run modal, Monitor's runnable check, AND what codegen accepts.
+  //
+  // Old logic used `step.taught` (client-set boolean) which drifted
+  // from backend truth for derived_from steps (2026-07-30 audit
+  // #P1-2 — see docs/ui_truth_audit.md).
+  const programForTruth = { steps, points: currentProgram.points }
+  const untaughtIds = untaughtStepIds(programForTruth)
+                        .filter((id) => {
+                          const s = steps.find((x) => x.id === id)
+                          return s && isTeachable(s)
+                        })
+  const untaughtCount = untaughtIds.length
   const allTaughtForRun = untaughtCount === 0
 
   // Setters that wrap the store action with the right patch shape.
@@ -3210,12 +3243,25 @@ export default function ProgramEditor() {
   // index alignment is correct as long as the editor matches the last
   // save). If editor has unsaved edits, indices may diverge — the
   // unsaved indicator already warns the operator.
+  // Executing step index — same source lib/runState uses for its
+  // "Step N of M" pill. NO code path writes step.status='done', so
+  // the old `s.status === 'done'` filter was always 0 during a real
+  // run (2026-07-30 audit #P2-2). Derive from task.program_step
+  // (executor sim) or robot.program.line via stepIndexForLine
+  // (Estun pipeline) — the same precedence deriveRunState uses.
+  //
+  // For the progress-bar count, we treat "current step" as N steps
+  // done so the bar advances one-per-step. That matches the visual
+  // convention every operator has learned; the exact done-vs-cursor
+  // distinction is called out in the mouseover title on the bar.
   function statusOf(idx) {
     if (!taskRunning) return null
-    return runningSteps[idx]?.status ?? null
+    if (typeof executingIdx === 'number' && idx < executingIdx) return 'done'
+    if (typeof executingIdx === 'number' && idx === executingIdx) return 'active'
+    return null
   }
-  const doneCount = taskRunning
-    ? Math.min(steps.length, runningSteps.filter((s) => s.status === 'done').length)
+  const doneCount = (taskRunning && typeof executingIdx === 'number')
+    ? Math.max(0, Math.min(steps.length, executingIdx))
     : 0
 
   function handleDragStart(e, id) {
@@ -3544,7 +3590,9 @@ export default function ProgramEditor() {
   // mid-walk record mutates `steps` (the rewrite happens via id, not
   // index).
   function startTeachAll() {
-    const order = steps.filter((s) => isTeachable(s) && !s.taught).map((s) => s.id)
+    // Same resolver the "N untaught" counter uses. Keeps the Teach-
+    // All queue in exact agreement with what the counter surfaces.
+    const order = untaughtIds
     if (order.length === 0) return
     setTeachSingleId(null)
     setTeachAllOrder(order)
