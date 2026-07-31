@@ -5,13 +5,23 @@ import ProgramWizard from './ProgramWizard'
 import ProgramFromDemonstration from './ProgramFromDemonstration'
 import { HoldButton } from './JogControls'
 import NumericField from './NumericField'
-import { readPayload, PAYLOAD_UNSET_WARNING, PAYLOAD_INFO_ONLY }
+import PalletFrameDiagram from './PalletFrameDiagram'
+import { readPayload, PAYLOAD_UNSET_WARNING }
   from '../lib/payload'
+import { computePayloadTruth } from '../lib/payloadTruth'
 import { useIOPortmap, portmapLabels, portmapToOptions }
   from '../lib/ioPortmap'
-import { isStepTaught, untaughtStepIds, hasFullTaughtPose, verbForStep }
+import { isStepTaught, untaughtStepIds, hasFullTaughtPose, verbForStep,
+         palletFrameStatus, firstUntaughtPalletRole, PALLET_ROLE_ORDER,
+         TEACHABLE_ACTIONS, isTeachable, isDerivedOffsetMove }
   from '../lib/programTruth'
+import { PALLET_ROLE_TO_FIELD, modeForRole, taughtCount,
+         validatePalletFrame, backFrom, advanceFrom, jumpTo }
+  from '../lib/palletTeachSequence'
+import { computeProgramFindings } from '../lib/programFindings'
+import { computeTeachingDebt, debtBannerLabel } from '../lib/teachingDebt'
 import { stepIndexForLine } from '../lib/runState'
+import { teachLayoutMetrics } from '../lib/teachLayout'
 import { paletteLabelForAction, effectorDisplayName, effectorOf }
   from '../lib/effectorVocab'
 
@@ -125,39 +135,11 @@ function isPalletDriven(step) {
   return step?.action === 'move_to_pallet'
 }
 
-// Actions that move the robot to a specific pose. Gripper open/close
-// are pure I/O signals — the pose at which they fire is owned by the
-// previous move step, so they don't get their own taught position.
-const TEACHABLE_ACTIONS = [
-  'move_home', 'move_joint', 'move_linear',
-  'approach',  'pick',       'place',
-]
-
-// A derived offset move (descend / lift / retreat / "approach finished
-// part") computes its target at runtime as <source taught_tcp> + Z
-// offset; the operator never teaches it directly. Explicit derived_from
-// tag is the new shape emitted by the wizard; the offset_z_mm heuristic
-// covers older saved programs that were generated before the tag
-// existed (their descend/lift had offset_z_mm set and no taught data of
-// their own, which uniquely identifies them as wizard-derived).
-//
-// Override semantics: a derived step can be manually overridden by the
-// operator (overridden:true + its own taught_tcp). When overridden, we
-// stop treating it as auto-derived so the editor exposes pose inputs
-// and the Teach button works on it directly. The executor also reads
-// the overridden taught_tcp instead of base+offset (see
-// program_executor_node.py _resolve_base_tcp call site).
-function isDerivedOffsetMove(step) {
-  if (!step) return false
-  if (step.overridden) return false
-  if (step.derived_from) return true
-  const isMoveLinear = step.action === 'move_linear' || step.type === 'move'
-  if (!isMoveLinear) return false
-  if (step.offset_z_mm === undefined || step.offset_z_mm === null) return false
-  const hasJoints = Array.isArray(step.taught_joints) && step.taught_joints.length >= 6
-  const hasTcp    = Array.isArray(step.taught_tcp)    && step.taught_tcp.length    >= 3
-  return !hasJoints && !hasTcp
-}
+// TEACHABLE_ACTIONS + isDerivedOffsetMove + isTeachable now live in
+// lib/programTruth so the itinerary + row consult the SAME predicate
+// (2026-07-31 unification, §396 audit). Imported at the top; local
+// re-definitions were retired to close the fork that put non-pose
+// steps like `detect` and `move_to_pallet` into Teach All queues.
 
 // True when this step has been derived but the operator manually
 // overrode the pose. Used by the editor to badge the row and surface
@@ -255,27 +237,11 @@ function resolveDerivedPose(step, allSteps) {
   return null
 }
 
-function isTeachable(step) {
-  if (!step) return false
-  // Derived offset moves resolve at runtime from their source step's
-  // taught pose, so the operator must NOT teach them independently.
-  if (isDerivedOffsetMove(step)) return false
-  // Position-reuse steps also resolve at runtime — the source's
-  // taught_joints/tcp is what actually gets used. Referencing steps
-  // must NOT be teachable; the operator re-teaches the source instead.
-  if (step.position_ref != null) return false
-  // Prefer the explicit action when set (wizard-emitted or PUT'd via
-  // /api/programs). Fall back to deriving an action from the legacy
-  // 'type' field (default STATE.program.steps used 'type' only) — but
-  // only if 'type' actually matches an ACTION_TYPES entry, so we
-  // don't trip a default fallback into "always teachable".
-  if (step.action) return TEACHABLE_ACTIONS.includes(step.action)
-  if (step.type) {
-    const match = ACTION_TYPES.find((a) => a.type === step.type)
-    if (match) return TEACHABLE_ACTIONS.includes(match.value)
-  }
-  return false
-}
+// isTeachable was moved to lib/programTruth (2026-07-31 unification).
+// Imported at the top of this file so the row + itinerary + badges
+// consume ONE predicate. Legacy type-only fallback dropped —
+// ambiguous (`type: 'move'` covers detect / scan_* / move_to_pallet)
+// and unnecessary now that saved programs always carry an action.
 
 // Count steps that reference a named point via `point_name`. Powers
 // the picker's per-point badge and the row's link chip suffix.
@@ -317,11 +283,12 @@ function countStepsSharingStep(steps, srcStepId) {
 // already doing at line ~200 before this refactor).
 function collectPositionSources(steps, points) {
   const out = []
+  const program = { steps, points }
   if (Array.isArray(steps)) {
     for (const s of steps) {
       if (!s) continue
       if (s.position_ref != null || s.linked_to_step_id != null) continue
-      if (!isTeachable(s)) continue
+      if (!isTeachable(s, program)) continue
       if (!s.taught) continue
       const j = Array.isArray(s.taught_joints) ? s.taught_joints
               : Array.isArray(s.joints)        ? s.joints : null
@@ -729,21 +696,22 @@ function PalletCornerIcon({ rows = 4, cols = 4, role = 'corner',
 
 // PalletConfigEditor — modal for editing the program-level pallet
 // PARAMETERS: rows/cols/layers/spacing/fill order/heights/speed.
+// Nothing about teaching lives here.
 //
-// 2026-07-30 cleanup: taught positions were removed from this modal.
-// Pre-cleanup the modal carried a "Taught positions" section with
-// raw TCP readouts and "Use current pose" buttons — legacy one-
-// corner teach UI predating the 3-point frame. The corner + pick/
-// place taught data now flows through the wizard's diagram-guided
-// teach flow (corner A + point B + point C in one sequence) OR
-// through the step-row Teach buttons — one teaching surface, per
-// the position-teaching consistency rule.
+// 2026-07-30 cleanup: taught positions were removed from this
+// modal. 2026-07-31 cleanup: the last vestige — a read-only frame-
+// status chip strip + "Teach via Teach All →" button + legacy-
+// migration notice — was also removed. Frame teach state is shown
+// on the STEP ROW (badge + Teach/Re-teach); the legacy-migration
+// nudge is now a program VALIDATION FINDING (info severity) so it
+// clears when the operator re-teaches ④, not when they read a
+// modal.
 //
 // The modal preserves any already-captured corner_tcp on save so
 // legacy programs don't lose data when re-saved through here; the
 // pallet_slots endpoint transparently migrates corner_tcp →
 // corner_a_tcp at read time.
-function PalletConfigEditor({ config, onSave, onClose, onGoToTeaching }) {
+function PalletConfigEditor({ config, onSave, onClose }) {
   const initialMode = config?.pallet_mode === 'depalletize' ? 'depalletize' : 'palletize'
   const initialPallet = (config?.pallet && typeof config.pallet === 'object') ? config.pallet : {}
   const initialPlace  = (config?.pallet_place && typeof config.pallet_place === 'object') ? config.pallet_place : {}
@@ -813,19 +781,6 @@ function PalletConfigEditor({ config, onSave, onClose, onGoToTeaching }) {
     { value: 'col',    label: 'Columns (front → back)' },
     { value: 'snake',  label: 'Snake (alternate)' },
   ]
-
-  // Frame-status readout — routes through the shared programTruth
-  // resolver so the modal's indicator agrees exactly with the
-  // backend's has_taught_frame / has_taught_part_datum semantics,
-  // including the v1 (3-point A/B/C) → v2 (4-point corners + part)
-  // migration. See lib/programTruth.palletFrameStatus.
-  const _frame = palletFrameStatus({ config: config })
-  const c1Taught   = _frame.corner1
-  const c2Taught   = _frame.corner2
-  const c3Taught   = _frame.corner3
-  const partTaught = _frame.part
-  const migratedFromV1 = _frame.migratedFromV1
-  const anyMissing = !_frame.allTaught
 
   return (
     <div style={{
@@ -944,76 +899,6 @@ function PalletConfigEditor({ config, onSave, onClose, onGoToTeaching }) {
             </Field>
           </div>
 
-          {/* Read-only frame status — 2026-07-30 cleanup. Modal
-              is parameters-only; teaching goes through the
-              diagram-guided flow, per the position-teaching
-              consistency rule. Displays taught state; never
-              captures. */}
-          <div style={{
-            marginTop: 12, padding: '10px 12px',
-            background: '#f8fafc', border: '1px solid #e5e7eb',
-            borderRadius: 6, display: 'flex',
-            alignItems: 'center', gap: 12, flexWrap: 'wrap',
-          }} data-testid="pallet-frame-status">
-            <div style={{ fontSize: 11, fontWeight: 700, color: '#374151',
-                          flexShrink: 0 }}>
-              Pallet frame:
-            </div>
-            <div style={{ display: 'flex', gap: 10, flex: 1,
-                          flexWrap: 'wrap',
-                          fontSize: 12, color: '#374151',
-                          fontFamily: 'var(--font-mono, monospace)' }}>
-              <span style={{ color: c1Taught ? '#0f766e' : '#9ca3af' }}>
-                {c1Taught ? '●' : '○'} ① C1
-              </span>
-              <span style={{ color: c2Taught ? '#0f766e' : '#9ca3af' }}>
-                {c2Taught ? '●' : '○'} ② C2
-              </span>
-              <span style={{ color: c3Taught ? '#0f766e' : '#9ca3af' }}>
-                {c3Taught ? '●' : '○'} ③ C3
-              </span>
-              <span style={{ color: partTaught ? '#0f766e' : '#9ca3af' }}>
-                {partTaught ? '●' : '○'} ④ Part
-              </span>
-            </div>
-            <button
-              onClick={() => {
-                if (typeof onGoToTeaching === 'function') {
-                  onGoToTeaching()
-                }
-                onClose()
-              }}
-              style={{
-                padding: '5px 12px', fontSize: 11, fontWeight: 600,
-                background: anyMissing ? '#eff6ff' : '#f3f4f6',
-                color:      anyMissing ? '#2563EB' : '#6b7280',
-                border:     anyMissing ? '1px solid #bfdbfe' : '1px solid #d1d5db',
-                borderRadius: 4, cursor: 'pointer', flexShrink: 0,
-              }}
-              data-testid="pallet-frame-goto-teaching">
-              {anyMissing ? 'Teach via Teach All →' : 'Re-teach frame →'}
-            </button>
-          </div>
-          <div style={{ marginTop: 6, fontSize: 10, color: '#6b7280', lineHeight: 1.4 }}>
-            Frame points teach only through the diagram-guided flow
-            (Teach All or the step's Teach buttons). This modal edits
-            parameters only.
-          </div>
-          {migratedFromV1 && (
-            <div style={{
-              marginTop: 8, padding: '8px 10px', fontSize: 11,
-              background: '#fefce8', color: '#854d0e',
-              border: '1px solid #fde68a', borderRadius: 6,
-              lineHeight: 1.5,
-            }}
-              data-testid="pallet-frame-migrated-notice">
-              This pallet was created with the older 3-point model
-              (A / B / C). The first-part position (④) was seeded
-              from corner A — re-teach ④ with a real part in slot
-              [1,1] so the tool contact geometry and orientation
-              carry through to every derived slot.
-            </div>
-          )}
         </div>
       </div>
     </div>
@@ -2366,6 +2251,10 @@ function RecordConfirmModal({ stepLabel, onConfirm, onCancel }) {
 function TeachOverlay({
   step, currentN, totalM, canBack,
   onRecord, onSkip, onBack, onCancel,
+  diagram,
+  counterSuffix = '',
+  warnings = [],
+  onDismissWarnings,
 }) {
   // Shared jog transport — WS-first with server-side hold keepalive.
   // Same store actions the main Program-tab JogControls uses; the old
@@ -2505,33 +2394,15 @@ function TeachOverlay({
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
   }, [])
-  const isWide    = vw > 1400
-  const isTabletW = vw <= 1280
-  // Height envelope for the jog grid. Home is now a header chip and
-  // the footer is a slim 48 px-button bar, so the fixed regions add
-  // up to:
-  //   header (60) + instruction (48) + mode row (~56) +
-  //   step/speed row (~60) + slim footer (~76 incl. safe-area pad).
-  // Whatever remains is the vertical budget for 3 button rows and
-  // 2 inter-row gaps. This reclaims ~124 px vs the previous layout,
-  // which is exactly the room the clipped Y-/Rx- rows needed.
-  const gridHeightBudget = Math.max(240, vh - (60 + 48 + 56 + 60 + 76))
-  // Solve for the largest square button that fits three rows plus
-  // two gaps (gap ≈ 12 % of button). Cap at the width-tier ceiling.
-  const gridPadBtnCeil = isTabletW ? 96  : isWide ? 160 : 140
-  const gridPadBtnFit  = Math.floor((gridHeightBudget - 24) / 3)
-  // Touch-target floor per the task: 48 px minimum. Below that,
-  // section labels are hidden (via `hideSectionLabels`) before
-  // buttons are shrunk further.
-  const padBtn = Math.max(56, Math.min(gridPadBtnCeil, gridPadBtnFit))
-  const hideSectionLabels = padBtn < 96
-  // Scale the arrow icon with the button so a 56 px button doesn't
-  // render an oversized SVG. Round to whole pixels.
-  const svgPx    = Math.round(padBtn * 0.44)
-  const padGap   = isTabletW ? 10  : padBtn < 120 ? 12 : 14
-  const groupGap = isTabletW ? 24  : padBtn < 120 ? 24 : 40
-  const modeBtnH    = isTabletW ? 48  : isWide ?  64 :  56
-  const modeBtnFont = isTabletW ? 14  : isWide ?  17 :  16
+  // Layout budget arithmetic — shared with the pinned no-scroll
+  // test at lib/teachLayout.js. Do NOT recompute inline here; the
+  // pin exists precisely to catch drift between what renders and
+  // what the test evaluates.
+  const {
+    isWide, isTabletW, padBtn, hideSectionLabels,
+    svgPx, padGap, groupGap, modeBtnH, modeBtnFont,
+    diagramPanelWidth,
+  } = teachLayoutMetrics({ vw, vh })
 
   const modeBtn = (on) => ({
     padding: '0 26px', minHeight: modeBtnH, fontSize: modeBtnFont, fontWeight: 700,
@@ -2605,7 +2476,7 @@ function TeachOverlay({
       }}>
         <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
           <div style={{ fontSize: 14, fontWeight: 600, color: '#6b7280', letterSpacing: '0.04em' }}>
-            TEACHING  •  Step {currentN} of {totalM}
+            TEACHING  •  Step {currentN} of {totalM}{counterSuffix}
           </div>
           <div style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginTop: 2 }}>
             {stepLabel}
@@ -2648,14 +2519,69 @@ function TeachOverlay({
         </div>
       </div>
 
+      {/* FRAME VALIDATION BANNER — surfaces AFTER a corner record
+          when the frame's geometry disagrees with the flat-pallet
+          assumption. absolute-positioned so it does NOT consume the
+          vertical budget (see teachLayout no-scroll invariant); the
+          operator dismisses it once the numbers have registered.
+          Blocks no motion — Record again or Skip both dismiss it. */}
+      {warnings.length > 0 && (
+        <div
+          data-testid="pallet-frame-warning"
+          style={{
+            position: 'absolute',
+            top: 60 + 48,      // header + instruction band
+            left: 0, right: 0,
+            zIndex: 5,
+            background: '#fef3c7',
+            borderBottom: '1px solid #fde68a',
+            padding: '8px 16px',
+            display: 'flex', flexDirection: 'row', alignItems: 'center',
+            gap: 12, fontSize: 13, color: '#78350f',
+            boxShadow: '0 2px 6px rgba(0,0,0,0.08)',
+          }}>
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 3 }}>
+            {warnings.map((w) => (
+              <div key={w.key}>
+                <strong style={{ marginRight: 6 }}>⚠ Frame check:</strong>{w.message}
+              </div>
+            ))}
+          </div>
+          {typeof onDismissWarnings === 'function' && (
+            <button onClick={onDismissWarnings}
+              data-testid="pallet-frame-warning-dismiss"
+              style={{
+                padding: '4px 12px', fontSize: 12, fontWeight: 600,
+                background: '#fff', color: '#78350f',
+                border: '1px solid #fde68a', borderRadius: 4,
+                cursor: 'pointer', flexShrink: 0,
+              }}>
+              Got it — dismiss
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* JOG + DIAGRAM ROW — flex-row so the diagram docks BESIDE
+          the jog pads, not above them. Keeps every jog button + the
+          footer's Record Position visible without scroll at 1920×1080,
+          1366×768, and the ONN tablet's landscape resolution — the
+          operator-rule invariant. Diagram omitted → jog area takes
+          the full width (non-pallet steps: layout unchanged). */}
+      <div
+        data-testid="teach-body-row"
+        style={{
+          flex: 1, minHeight: 0,
+          display: 'flex', flexDirection: 'row',
+          overflow: 'hidden',
+        }}>
       {/* JOG CONTROLS — no internal scroll (mid-hold scrolling on a
           touch device is how accidental jogs happen), no vertical
           centering (justify-center + tall content clips off the TOP
           of the container in some engines). Content sits top-aligned
           and the height-responsive padBtn above guarantees fit. */}
       <div style={{
-        width: '100%',
-        flex: 1, minHeight: 0,
+        flex: 1, minWidth: 0, minHeight: 0,
         background: '#f8fafc',
         display: 'flex', flexDirection: 'column',
         justifyContent: 'flex-start', alignItems: 'center',
@@ -2867,6 +2793,29 @@ function TeachOverlay({
         </div>
 
       </div>
+      {/* DIAGRAM SIDE PANEL — docked right of the jog pads. Width
+          responsive: 300px on wide desktop, 240px on tablet
+          landscape (vw ≤ 1280). Panel is flex 0 0 auto so its width
+          is fixed and the jog area gets exactly the remaining
+          horizontal space. NEVER pushes any jog button below the
+          viewport — the horizontal split does the work. */}
+      {diagram && (
+        <aside
+          data-testid="pallet-diagram-side"
+          style={{
+            flex: `0 0 ${diagramPanelWidth}px`,
+            minWidth: 0,
+            background: '#fff',
+            borderLeft: '1px solid #e5e7eb',
+            padding: isTabletW ? '10px 12px' : '14px 16px',
+            display: 'flex', flexDirection: 'column',
+            alignItems: 'center', justifyContent: 'flex-start',
+            overflow: 'hidden',
+          }}>
+          {diagram}
+        </aside>
+      )}
+      </div>
 
       {/* STICKY FOOTER — Back (multi-pose only) + Record Position
           + Skip (multi-pose only). Standard slim bar: 48 px button
@@ -2960,20 +2909,40 @@ function TeachOverlay({
   )
 }
 
-// Editable "Tool & Payload" section. Sits between the untaught-
-// positions banner and the step list. Collapsed by default when the
-// value is set (out of the way); AUTO-EXPANDED with an amber banner
-// when unset so the operator sees they need to fill it in. Values
-// live under program.config.{payload_kg, tool_name, payload_cog_mm}.
-function ToolAndPayloadSection({ program, onPatch }) {
+// Editable "Tool & Payload" section — 2026-07-31 rewrite.
+//
+// * COLLAPSED by default; chevron opens.
+// * When unset, the collapsed header still surfaces the amber
+//   "Payload not set" chip so the operator sees the problem
+//   without having to open the section.
+// * Body: MASS + CoG only. The "Tool name (optional)" text field
+//   was retired (see lib/payload — tool_name isn't read anywhere
+//   operator-facing anymore).
+// * The old "Info only" fine-print banner was replaced by a LIVE
+//   truth line comparing program payload to the controller's
+//   active preset (lib/payloadTruth). Three states — match /
+//   mismatch / unreadable — one line, color carries the nuance.
+// * Values live under program.config.{payload_kg, payload_cog_mm}.
+// * FUTURE — per-cycle payload emission at grip/release is
+//   currently gated on the setPayload("") argument-format
+//   stop-condition (see luaenginelib.json). When the format is
+//   resolved, "declare carried mass at grip" becomes a codegen
+//   emission and THIS panel becomes its source of truth.
+function ToolAndPayloadSection({ program, onPatch, controllerPayloadKg }) {
   const payload = readPayload(program)
-  const [expanded, setExpanded] = useState(!payload.isSet)
+  // Collapsed by default per the 2026-07-31 directive. The chip
+  // on the header carries enough signal that the operator can
+  // decide whether to open it.
+  const [expanded, setExpanded] = useState(false)
   const [showCog,  setShowCog]  = useState(
     !!(payload.cog_mm && (payload.cog_mm.x || payload.cog_mm.y || payload.cog_mm.z)))
-  // Keep expansion in sync when the operator jumps between programs.
-  useEffect(() => {
-    if (!payload.isSet) setExpanded(true)
-  }, [payload.isSet, program?.id])
+
+  // Live truth line — reads the shared resolver so mismatch /
+  // unreadable states show consistent copy across surfaces.
+  const truth = computePayloadTruth({
+    programKg: payload.kg,
+    controllerKg: controllerPayloadKg,
+  })
 
   const containerStyle = {
     margin: '10px 12px 0', padding: 0,
@@ -3000,7 +2969,8 @@ function ToolAndPayloadSection({ program, onPatch }) {
   const bodyStyle = { padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 10 }
 
   return (
-    <div style={containerStyle}>
+    <div style={containerStyle} data-testid="payload-section"
+         data-expanded={expanded ? '1' : '0'}>
       <div style={headerStyle} onClick={() => setExpanded((v) => !v)}>
         <span style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
                         transition: 'transform 150ms', color: '#6b7280', fontSize: 11 }}>▶</span>
@@ -3008,37 +2978,63 @@ function ToolAndPayloadSection({ program, onPatch }) {
         <div style={{ flex: 1 }} />
         {payload.isSet
           ? (
-            <span style={{
-              fontSize: 12, fontWeight: 600, color: '#065F46',
-              background: '#ECFDF5', border: '1px solid #059669',
-              padding: '2px 10px', borderRadius: 999,
-            }}>
-              {payload.kg} kg{payload.tool_name ? ` · ${payload.tool_name}` : ''}
+            <span
+              data-testid="payload-chip-set"
+              style={{
+                fontSize: 12, fontWeight: 600, color: '#065F46',
+                background: '#ECFDF5', border: '1px solid #059669',
+                padding: '2px 10px', borderRadius: 999,
+              }}>
+              {payload.kg} kg
             </span>
           )
           : (
-            <span style={{
-              fontSize: 12, fontWeight: 700, color: '#92400E',
-              background: '#FEF3C7', border: '1px solid #F59E0B',
-              padding: '2px 10px', borderRadius: 999,
-            }}>
+            <span
+              data-testid="payload-chip-unset"
+              style={{
+                fontSize: 12, fontWeight: 700, color: '#92400E',
+                background: '#FEF3C7', border: '1px solid #F59E0B',
+                padding: '2px 10px', borderRadius: 999,
+              }}>
               ⚠ Payload not set
             </span>
           )}
       </div>
       {expanded && (
         <div style={bodyStyle}>
-          {!payload.isSet && (
-            <div style={{ fontSize: 12, color: '#92400E', lineHeight: 1.5 }}>
-              {PAYLOAD_UNSET_WARNING}
-            </div>
-          )}
-          {/* Tool mass */}
+          {/* Truth line — live program-vs-controller comparison.
+              Green when they match, amber when they don't OR when
+              we can't read the controller (never implies sync that
+              doesn't exist). Replaces the retired "info only"
+              banner. */}
+          {(() => {
+            const palette = truth.state === 'match'
+              ? { bg: '#ECFDF5', border: '#059669', fg: '#065F46' }
+              : { bg: '#FEF3C7', border: '#F59E0B', fg: '#92400E' }
+            return (
+              <div
+                data-testid="payload-truth"
+                data-state={truth.state}
+                style={{
+                  padding: '8px 10px',
+                  background: palette.bg,
+                  border: `1px solid ${palette.border}`,
+                  borderRadius: 6,
+                  fontSize: 12, color: palette.fg, lineHeight: 1.5,
+                }}>
+                {truth.message}
+              </div>
+            )
+          })()}
+          {/* Tool mass — the whole first-row input, now mass-only.
+              The retired "Tool name (optional)" input lived here
+              alongside the mass field; it was deleted 2026-07-31. */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
             <label style={{ fontSize: 12, color: '#374151', fontWeight: 600, minWidth: 120 }}>
               Tool mass (kg)
             </label>
             <input
+              data-testid="payload-mass-input"
               type="number" step="0.1" min="0" max="30"
               value={payload.kg ?? ''}
               placeholder="e.g. 1.2"
@@ -3049,15 +3045,6 @@ function ToolAndPayloadSection({ program, onPatch }) {
                 if (Number.isFinite(n)) onPatch({ payload_kg: n })
               }}
               style={inputStyle} />
-            <label style={{ fontSize: 12, color: '#374151', fontWeight: 600, marginLeft: 12 }}>
-              Tool name (optional)
-            </label>
-            <input
-              type="text" maxLength={40}
-              placeholder="e.g. vacuum tool"
-              value={payload.tool_name || ''}
-              onChange={(e) => onPatch({ tool_name: e.target.value })}
-              style={{ ...inputStyle, width: 180, textAlign: 'left' }} />
           </div>
           {/* CoG toggle + fields */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -3100,15 +3087,79 @@ function ToolAndPayloadSection({ program, onPatch }) {
               </div>
             )}
           </div>
-          <div style={{
-            padding: '8px 10px', background: '#EFF6FF',
-            border: '1px solid #93C5FD', borderRadius: 6,
-            fontSize: 11, color: '#1E3A8A', lineHeight: 1.5,
-          }}>
-            <b>Info only.</b>{' '}{PAYLOAD_INFO_ONLY}
-          </div>
         </div>
       )}
+    </div>
+  )
+}
+
+// ProgramFindingsPanel — program-level validation findings surfaced
+// between the Tool & Payload section and the step list. Findings
+// live on the program (see lib/programFindings.computeProgramFindings),
+// clear when the underlying condition resolves, and never live in a
+// modal.
+//
+// 2026-07-31 consolidation: teaching-debt findings (e.g. the legacy
+// pallet migration nudge) no longer render here. They're absorbed
+// into the unified teaching-debt banner above the Tool & Payload
+// section — one banner per program, fed by computeTeachingDebt.
+// The findings themselves are kept in computeProgramFindings for the
+// audit record; this panel just filters them out of the visual list.
+const TEACHING_DEBT_FINDING_IDS = new Set([
+  'pallet-legacy-migration',
+])
+
+function ProgramFindingsPanel({ program, onAction }) {
+  const findings = computeProgramFindings(program)
+    .filter((f) => !TEACHING_DEBT_FINDING_IDS.has(f.id))
+  if (findings.length === 0) return null
+  return (
+    <div
+      data-testid="program-findings"
+      style={{
+        margin: '4px 12px 8px', display: 'flex',
+        flexDirection: 'column', gap: 6,
+      }}>
+      {findings.map((f) => {
+        const palette = f.severity === 'error'
+          ? { bg: '#fef2f2', border: '#fecaca', fg: '#991b1b', icon: '✕' }
+          : f.severity === 'warn'
+          ? { bg: '#fef3c7', border: '#fde68a', fg: '#78350f', icon: '⚠' }
+          : { bg: '#eff6ff', border: '#bfdbfe', fg: '#1e40af', icon: 'ℹ' }
+        return (
+          <div key={f.id}
+            data-testid={`program-finding-${f.id}`}
+            data-severity={f.severity}
+            style={{
+              display: 'flex', alignItems: 'flex-start', gap: 10,
+              padding: '10px 12px',
+              background: palette.bg,
+              border: `1px solid ${palette.border}`,
+              borderRadius: 6, fontSize: 13,
+              color: palette.fg, lineHeight: 1.5,
+            }}>
+            <div style={{ fontSize: 15, lineHeight: 1, marginTop: 2 }}>{palette.icon}</div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 700, marginBottom: 2 }}>{f.title}</div>
+              <div>{f.body}</div>
+            </div>
+            {f.action && typeof onAction === 'function' && (
+              <button
+                data-testid={`program-finding-${f.id}-action`}
+                onClick={() => onAction(f)}
+                style={{
+                  flexShrink: 0, alignSelf: 'center',
+                  padding: '6px 12px', fontSize: 12, fontWeight: 600,
+                  background: '#fff', color: palette.fg,
+                  border: `1px solid ${palette.border}`, borderRadius: 5,
+                  cursor: 'pointer',
+                }}>
+                {f.action.label}
+              </button>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -3116,6 +3167,12 @@ function ToolAndPayloadSection({ program, onPatch }) {
 export default function ProgramEditor() {
   const currentProgram     = useStore((s) => s.currentProgram)
   const setCurrentProgram  = useStore((s) => s.setCurrentProgram)
+  // Cross-client sync trust (D10 in the Program Doctrine). When
+  // false: WS is down or reconnect refetch is still pending; the
+  // held taught-state may not reflect what other clients have
+  // written. Taught badges render "state syncing…" instead of a
+  // confident green ✓ during that window.
+  const programRevConfirmed = useStore((s) => s.programRevConfirmed)
   // setProgramSteps mirrors the editor's current steps to STATE.program
   // on Save / Load so the task runner (Run button) sees the same
   // program the editor displays. Edits between saves stay local.
@@ -3177,7 +3234,7 @@ export default function ProgramEditor() {
   const untaughtIds = untaughtStepIds(programForTruth)
                         .filter((id) => {
                           const s = steps.find((x) => x.id === id)
-                          return s && isTeachable(s)
+                          return s && isTeachable(s, programForTruth)
                         })
   const untaughtCount = untaughtIds.length
   const allTaughtForRun = untaughtCount === 0
@@ -3196,6 +3253,11 @@ export default function ProgramEditor() {
   // editor for this program (entry point: Edit button on any
   // move_to_pallet step). Single-instance modal — not per-step.
   const [editingPallet, setEditingPallet]   = useState(false)
+  // 2026-07-30 §430 — routine fold state. Default: collapsed.
+  // Set of routine ids the operator has explicitly expanded. Edits
+  // to a step inside a routine broadcast to sibling iterations
+  // regardless of fold state (see broadcast helper below).
+  const [expandedRoutines, setExpandedRoutines] = useState(() => new Set())
   const [selectedId, setSelectedId]         = useState(null)
   const [dragId, setDragId]                 = useState(null)
   const [dragOverId, setDragOverId]         = useState(null)
@@ -3221,6 +3283,31 @@ export default function ProgramEditor() {
   const [teachAllOrder, setTeachAllOrder]   = useState([])
   const [teachAllPos,   setTeachAllPos]     = useState(-1)
   const [teachSingleId, setTeachSingleId]   = useState(null)
+  // Pallet-frame teach state — one of 'pallet_c1'/'pallet_c2'/
+  // 'pallet_c3'/'pallet_part' when the operator is walking through the
+  // 4-point diagram-guided flow, null otherwise. Distinct from the
+  // teachSingleId/teachAllOrder path because pallet teach writes to
+  // program.config.pallet_place (not to a step's taught_tcp).
+  //
+  // Mode: 'teach' | 're-teach'. Derived from role + program state
+  // via modeForRole(). Back-nav to an already-taught point sets
+  // this to 're-teach' but KEEPS the existing pose until Record.
+  const [palletTeachRole, setPalletTeachRole] = useState(null)
+  const [palletTeachMode, setPalletTeachMode] = useState(null)
+  // Optional per-role caption addendum (e.g. the legacy-migration
+  // reason "seeded from corner A during migration"). Displayed
+  // under the standard instruction when the flow enters via Teach
+  // All chaining an owed re-teach; cleared as soon as the operator
+  // navigates away from that role.
+  const [palletTeachReason, setPalletTeachReason] = useState(null)
+  // Frame-validation warnings surfaced after a corner record. Non-
+  // empty → banner blocks advance until the operator acks OR
+  // records a better pose. See lib/palletTeachSequence.validatePalletFrame.
+  const [palletFrameWarnings, setPalletFrameWarnings] = useState([])
+  // Cancel-confirm modal state — the confirm dialog states the
+  // number of already-recorded teaches so the operator knows what's
+  // preserved before dismissing.
+  const [palletCancelConfirm, setPalletCancelConfirm] = useState(false)
   // Per-step open/closed state for the "View position data" drawer.
   // Stored as a Set of step.id values so the toggle on one row never
   // touches another row.
@@ -3484,12 +3571,129 @@ export default function ProgramEditor() {
     updateSteps(renumber(steps.filter((s) => s.id !== id)))
   }
 
+  // 2026-07-30 §430 — routine metadata resolvers. Reads
+  // currentProgram.routines[] (backend-persisted) and falls back to
+  // scanning per-step routine_id/routine_iteration when the top-level
+  // list is absent (older programs saved before the persist path).
+  const routines = Array.isArray(currentProgram?.routines) ? currentProgram.routines : []
+  const stepRoutineInfo = (() => {
+    const info = {}
+    // Prefer explicit routines[] step_indices_per_iter.
+    for (const r of routines) {
+      const ranges = Array.isArray(r?.step_indices_per_iter) ? r.step_indices_per_iter : []
+      const firstRoutineIdx = ranges.length && Array.isArray(ranges[0]) ? Number(ranges[0][0]) : null
+      for (let iter = 0; iter < ranges.length; iter++) {
+        const rng = ranges[iter]
+        if (!Array.isArray(rng) || rng.length < 2) continue
+        const a = Number(rng[0]), b = Number(rng[1])
+        for (let s_idx = a; s_idx < b; s_idx++) {
+          info[s_idx] = {
+            routineId:       r.id,
+            iteration:       iter,
+            offsetInIter:    s_idx - a,
+            firstOfIteration: s_idx === a,
+            firstOfRoutine:  s_idx === firstRoutineIdx,
+            iterations:      Number(r.iterations || 0),
+            name:            String(r.name || ''),
+          }
+        }
+      }
+    }
+    // Fallback: scan step.routine_id / step.routine_iteration.
+    // (Programs saved before the routines-persist path.)
+    if (Object.keys(info).length === 0) {
+      const groups = {}
+      for (let i = 0; i < steps.length; i++) {
+        const rid = steps[i]?.routine_id
+        if (!rid) continue
+        const iter = Number(steps[i]?.routine_iteration || 0)
+        const key = `${rid}|${iter}`
+        if (!groups[key]) groups[key] = { rid, iter, indices: [] }
+        groups[key].indices.push(i)
+      }
+      const rangesByRid = {}
+      for (const g of Object.values(groups)) {
+        rangesByRid[g.rid] = rangesByRid[g.rid] || []
+        rangesByRid[g.rid].push({ iter: g.iter, indices: g.indices.sort((a, b) => a - b) })
+      }
+      for (const rid of Object.keys(rangesByRid)) {
+        const groupsForRid = rangesByRid[rid].sort((a, b) => a.iter - b.iter)
+        const iterations = groupsForRid.length
+        const firstRoutineIdx = groupsForRid[0]?.indices?.[0]
+        for (const g of groupsForRid) {
+          for (let k = 0; k < g.indices.length; k++) {
+            const s_idx = g.indices[k]
+            info[s_idx] = {
+              routineId: rid, iteration: g.iter,
+              offsetInIter:    k,
+              firstOfIteration: k === 0,
+              firstOfRoutine:  s_idx === firstRoutineIdx,
+              iterations,
+              name: '',
+            }
+          }
+        }
+      }
+    }
+    return info
+  })()
+  const isRoutineExpanded = (rid) => !!(expandedRoutines.has && expandedRoutines.has(rid))
+  const toggleRoutine = (rid) => {
+    setExpandedRoutines((prev) => {
+      const next = new Set(prev || [])
+      if (next.has(rid)) next.delete(rid); else next.add(rid)
+      return next
+    })
+  }
+  // Fields whose meaning is "the same across every iteration" — an
+  // edit to iter 0 should broadcast to iters 1..N. Explicitly EXCLUDES
+  // taught_joints / taught_tcp / taught / joints / position_ref /
+  // point_name / derived_from_step_id / iter_offset_mm since those
+  // are per-iteration (each iteration teaches its own pose OR links
+  // to the anchor's pose via the dedupe pass).
+  const _ROUTINE_BROADCAST_FIELDS = new Set([
+    'label', 'action', 'io_id', 'value', 'duration_s', 'speed_pct',
+    'force_pct', 'width_mm', 'io_open', 'io_open_confirm',
+    'io_close', 'io_close_confirm', 'target_part', 'target',
+    'offset_z_mm', 'scan_height_mm', 'scan_speed_pct',
+    'settle_time_ms', 'capture_frames', 'match_threshold_pct',
+  ])
+  function _broadcastToRoutine(id, patch) {
+    // Find the source step's index + routine info, then apply the
+    // SAFE-fields portion of `patch` to every sibling step at the
+    // matching offset in other iterations of the same routine.
+    // No-op when the source isn't in a routine.
+    const srcIdx = steps.findIndex((s) => s.id === id)
+    if (srcIdx < 0) return steps
+    const src = stepRoutineInfo[srcIdx]
+    if (!src || !src.routineId) return steps
+    const safePatch = {}
+    for (const k of Object.keys(patch)) {
+      if (_ROUTINE_BROADCAST_FIELDS.has(k)) safePatch[k] = patch[k]
+    }
+    if (Object.keys(safePatch).length === 0) return steps
+    // Build sibling-index list from stepRoutineInfo: same routineId,
+    // same offsetInIter, different iteration.
+    const siblings = new Set()
+    for (const [sIdxStr, inf] of Object.entries(stepRoutineInfo)) {
+      const sIdx = Number(sIdxStr)
+      if (sIdx === srcIdx) continue
+      if (inf.routineId !== src.routineId) continue
+      if (inf.offsetInIter !== src.offsetInIter) continue
+      siblings.add(sIdx)
+    }
+    if (siblings.size === 0) return steps
+    return steps.map((s, idx) => siblings.has(idx) ? { ...s, ...safePatch } : s)
+  }
+
   function handleRename(id, newLabel) {
-    updateSteps(renumber(steps.map((s) => s.id === id ? { ...s, label: newLabel } : s)))
+    const nextSteps = _broadcastToRoutine(id, { label: newLabel })
+    updateSteps(renumber(nextSteps.map((s) => s.id === id ? { ...s, label: newLabel } : s)))
   }
 
   function handleEditSave(id, patch) {
-    updateSteps(renumber(steps.map((s) => s.id === id ? { ...s, ...patch } : s)))
+    const nextSteps = _broadcastToRoutine(id, patch)
+    updateSteps(renumber(nextSteps.map((s) => s.id === id ? { ...s, ...patch } : s)))
   }
 
   // Unified link handler — accepts a source descriptor from the
@@ -3644,18 +3848,47 @@ export default function ProgramEditor() {
     })))
   }
 
-  // Teach All — snapshot the ordered list of step IDs that need
-  // teaching and walk through them. The path stays fixed even if a
-  // mid-walk record mutates `steps` (the rewrite happens via id, not
-  // index).
+  // Teach All — walks the unified teaching debt: first every
+  // untaught step, then any owed pallet re-teaches. The step queue
+  // stays fixed once started (rewrite happens via id, not index)
+  // so a mid-walk record can't derail the path. When the step
+  // queue empties, chainToPalletReTeaches() picks up any owed
+  // pallet re-teaches so ④ (legacy migration) becomes an ordinary
+  // stop in the itinerary rather than a separate box.
   function startTeachAll() {
-    // Same resolver the "N untaught" counter uses. Keeps the Teach-
-    // All queue in exact agreement with what the counter surfaces.
-    const order = untaughtIds
-    if (order.length === 0) return
+    const debt = computeTeachingDebt(currentProgram)
+    if (debt.total === 0) return
     setTeachSingleId(null)
-    setTeachAllOrder(order)
-    setTeachAllPos(0)
+    setPalletTeachRole(null)
+    setPalletTeachMode(null)
+    setPalletTeachReason(null)
+    setPalletFrameWarnings([])
+    if (debt.stepIds.length > 0) {
+      // Step queue first — same behavior as before. Chaining runs
+      // after the queue completes.
+      setTeachAllOrder(debt.stepIds)
+      setTeachAllPos(0)
+    } else {
+      // No untaught steps — go straight to the first owed re-teach.
+      chainToPalletReTeaches(debt.palletReTeaches)
+    }
+  }
+
+  // Transition from the step-teach queue into a pallet re-teach.
+  // Called when the step queue empties AND there are owed pallet
+  // re-teaches in the debt. Enters at the first owed role in
+  // re-teach mode with its reason threaded through as the diagram
+  // caption addendum.
+  function chainToPalletReTeaches(palletReTeaches) {
+    setTeachAllOrder([])
+    setTeachAllPos(-1)
+    if (!palletReTeaches || palletReTeaches.length === 0) return
+    const first = palletReTeaches[0]
+    const fs = palletFrameStatus(currentProgram)
+    setPalletTeachRole(first.role)
+    setPalletTeachMode(modeForRole(first.role, fs))
+    setPalletTeachReason(first.reason || null)
+    setPalletFrameWarnings([])
   }
 
   // Resolve the step the overlay is currently teaching (Teach All
@@ -3705,11 +3938,13 @@ export default function ProgramEditor() {
       setTeachSingleId(null)
       return
     }
-    // Teach All: advance to next slot, close when done.
+    // Teach All: advance to next slot; when the step queue empties,
+    // chain into any owed pallet re-teaches (single unified
+    // itinerary — the debt list feeds Teach All entirely).
     const nextPos = teachAllPos + 1
     if (nextPos >= teachAllOrder.length) {
-      setTeachAllOrder([])
-      setTeachAllPos(-1)
+      const remainingDebt = computeTeachingDebt(currentProgram)
+      chainToPalletReTeaches(remainingDebt.palletReTeaches)
     } else {
       setTeachAllPos(nextPos)
     }
@@ -3722,8 +3957,11 @@ export default function ProgramEditor() {
     if (teachSingleId != null) { setTeachSingleId(null); return }
     const nextPos = teachAllPos + 1
     if (nextPos >= teachAllOrder.length) {
-      setTeachAllOrder([])
-      setTeachAllPos(-1)
+      // Same chaining as teachOverlayRecord — the itinerary is
+      // unified, so skipping the last step still hands off to any
+      // owed pallet re-teaches.
+      const remainingDebt = computeTeachingDebt(currentProgram)
+      chainToPalletReTeaches(remainingDebt.palletReTeaches)
     } else {
       setTeachAllPos(nextPos)
     }
@@ -3734,9 +3972,163 @@ export default function ProgramEditor() {
   }
 
   function teachOverlayCancel() {
+    // Pallet teach with any recorded work → route through the
+    // confirm dialog so the operator sees the "N of 4 teaches
+    // will be kept" line. Other overlays: cancel directly.
+    if (palletTeachRole && taughtCount(palletFrameStatus(currentProgram)) > 0) {
+      setPalletCancelConfirm(true)
+      return
+    }
     setTeachSingleId(null)
     setTeachAllOrder([])
     setTeachAllPos(-1)
+    setPalletTeachRole(null)
+    setPalletTeachMode(null)
+    setPalletTeachReason(null)
+    setPalletFrameWarnings([])
+  }
+
+  function palletTeachDiscardConfirm(discard) {
+    setPalletCancelConfirm(false)
+    // Both branches close the overlay. Recorded teaches persist
+    // via setCurrentProgram writes made on each Record; there's no
+    // separate rollback path, so `discard` is currently advisory —
+    // it flips currentProgram.unsaved so the operator remembers to
+    // hit Save (already true) or leaves it as-is on Keep.
+    setPalletTeachRole(null)
+    setPalletTeachMode(null)
+    setPalletTeachReason(null)
+    setPalletFrameWarnings([])
+    if (!discard) {
+      addToast?.(`Teaches preserved — remember to Save`, 'success')
+    }
+  }
+
+  // Pallet Teach button on a pallet-driven step row → open the
+  // fullscreen overlay walking through the 4-point diagram-guided
+  // flow. Mid-flow resume: if some points are already taught (e.g. ①
+  // yes, ②/③ no), start at the first UNTAUGHT role rather than
+  // restarting at ①. All taught → Re-teach from ①.
+  function startPalletTeach() {
+    const first = firstUntaughtPalletRole(currentProgram) || PALLET_ROLE_ORDER[0]
+    const fs = palletFrameStatus(currentProgram)
+    setTeachSingleId(null)
+    setTeachAllOrder([])
+    setTeachAllPos(-1)
+    setPalletTeachRole(first)
+    setPalletTeachMode(modeForRole(first, fs))
+    setPalletFrameWarnings([])
+  }
+
+  // Tap-navigation from the diagram — any role is a legal target.
+  function jumpToPalletRole(nextRole) {
+    const t = jumpTo(nextRole, currentProgram, palletTeachRole)
+    if (!t) return
+    setPalletTeachRole(t.role)
+    setPalletTeachMode(t.mode)
+    // Fresh navigation clears the caption addendum + any previous
+    // warning banner — the operator has moved on; the reason /
+    // numbers no longer apply to what they see.
+    setPalletTeachReason(null)
+    setPalletFrameWarnings([])
+  }
+
+  // Diagram-guided step shape fed to TeachOverlay. Matches the wizard's
+  // taught_pallet_cornerN / taught_pallet_part label + instr strings so
+  // the operator sees the same prompts across creation and re-teach —
+  // ONE flow.
+  const PALLET_TEACH_STEPS = {
+    pallet_c1: {
+      label:  '① PALLET CORNER — slot [1,1]',
+      action: 'pallet_teach_c1',
+      instr:  'Touch the pallet corner at slot [1,1] — fixture corner, tool touching the pallet surface.',
+    },
+    pallet_c2: {
+      label:  '② PALLET CORNER — end of row [1,N]',
+      action: 'pallet_teach_c2',
+      instr:  'Touch the pallet corner at the far end of the first row — locks the row direction and column pitch.',
+    },
+    pallet_c3: {
+      label:  '③ PALLET CORNER — end of column [M,1]',
+      action: 'pallet_teach_c3',
+      instr:  'Touch the pallet corner at the far end of the first column — locks the column direction and row pitch.',
+    },
+    pallet_part: {
+      label:  '④ FIRST PART POSITION — slot [1,1]',
+      action: 'pallet_teach_part',
+      instr:  'Place a real part in slot [1,1] and teach the tool contact pose — Z and orientation carry through to every derived slot.',
+    },
+  }
+
+  // Record the current live pose into program.config.pallet_place
+  // under the field for the active role. Mirror to config.pallet for
+  // consumers that still read the pre-pallet_place shape. On a corner
+  // record, re-run frame validation and surface warnings before
+  // advancing; the ④ record path skips validation (part datum
+  // doesn't affect corner geometry). Sequence closes after ④.
+  async function palletTeachRecord() {
+    const role = palletTeachRole
+    if (!role) return
+    const field = PALLET_ROLE_TO_FIELD[role]
+    if (!field) return
+    const patch = await buildTaughtPatch()
+    const tcp   = patch.taught_tcp
+    if (!Array.isArray(tcp) || tcp.length < 6) {
+      addToast?.('Could not read TCP from robot state', 'error')
+      return
+    }
+    const cfg = currentProgram?.config || {}
+    const nextPlace = { ...(cfg.pallet_place || {}), [field]: [...tcp] }
+    const nextPallet = { ...(cfg.pallet || {}),      [field]: [...tcp] }
+    const nextProgram = {
+      config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet },
+      unsaved: true,
+    }
+    setCurrentProgram(nextProgram)
+    // Frame revalidation runs on the JUST-WRITTEN place, so the
+    // warning reflects the geometry the operator can see right now.
+    const isCorner = role === 'pallet_c1' || role === 'pallet_c2' || role === 'pallet_c3'
+    const warnings = isCorner ? validatePalletFrame(nextPlace) : []
+    setPalletFrameWarnings(warnings)
+    if (warnings.length > 0) {
+      // Hold at the current role so the operator sees the numbers
+      // BEFORE the flow advances. Ack via Skip (accept + move on)
+      // or another Record (overwrite with a better pose).
+      setPalletTeachMode('re-teach')
+      return
+    }
+    const merged = {
+      ...(currentProgram || {}),
+      config: nextProgram.config,
+    }
+    const next = advanceFrom(role, merged)
+    // Advance clears the reason addendum — the current step is done,
+    // whatever justified holding a reason no longer applies.
+    setPalletTeachReason(null)
+    setPalletTeachRole(next ? next.role : null)
+    setPalletTeachMode(next ? next.mode : null)
+  }
+
+  function palletTeachSkip() {
+    // Skip always advances forward, even past taught points.
+    // Clears any warning banner (operator explicitly acking).
+    const next = advanceFrom(palletTeachRole, currentProgram)
+    setPalletFrameWarnings([])
+    setPalletTeachReason(null)
+    setPalletTeachRole(next ? next.role : null)
+    setPalletTeachMode(next ? next.mode : null)
+  }
+
+  function palletTeachBack() {
+    // Back-nav to any earlier role. Sets mode='re-teach' when the
+    // target already has a taught pose — the pose is KEPT until
+    // Record fires, so backing up to look ≠ overwriting.
+    const back = backFrom(palletTeachRole, currentProgram)
+    if (!back) return
+    setPalletTeachRole(back.role)
+    setPalletTeachMode(back.mode)
+    setPalletTeachReason(null)
+    setPalletFrameWarnings([])
   }
 
   async function handleSave() {
@@ -3754,6 +4146,12 @@ export default function ProgramEditor() {
       if (currentProgram.description) payload.description = currentProgram.description
       if (Array.isArray(currentProgram.tags) && currentProgram.tags.length) payload.tags = currentProgram.tags
       if (currentProgram.cell_id) payload.cell_id = currentProgram.cell_id
+      // 2026-07-30 §430 — round-trip routines[] so the fold state
+      // persists across save/reload. Backend accepts + preserves the
+      // list; codegen ignores it (byte-diff pinned).
+      if (Array.isArray(currentProgram.routines) && currentProgram.routines.length) {
+        payload.routines = currentProgram.routines
+      }
       const body = JSON.stringify(payload)
       const res = await fetch(
         programId ? `/api/programs/${encodeURIComponent(programId)}` : '/api/programs',
@@ -4129,32 +4527,57 @@ export default function ProgramEditor() {
         </div>
       )}
 
-      {/* Untaught-positions banner — visible whenever any move step
-          still needs to be taught. Disappears once everything's set. */}
-      {untaughtCount > 0 && teachAllPos < 0 && teachSingleId == null && (
-        <div style={{
-          margin: '8px 12px 0', padding: '8px 12px', fontSize: 12,
-          background: '#fef2f2', color: '#b91c1c',
-          border: '1px solid #fecaca', borderRadius: 6,
-          display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0,
-        }}>
-          <span style={{ fontWeight: 700 }}>
-            {untaughtCount} position{untaughtCount > 1 ? 's' : ''} not taught
-          </span>
-          <span style={{ color: '#9ca3af', fontSize: 11 }}>
-            — jog the robot, then click Teach on each step
-          </span>
-          <div style={{ flex: 1 }} />
-          <button onClick={startTeachAll}
+      {/* Unified teaching-debt banner — 2026-07-31 consolidation.
+          Absorbs the old "N positions not taught" red banner AND
+          the legacy-pallet-migration info banner into ONE display
+          fed by computeTeachingDebt(program). Count = untaught
+          steps + owed re-teaches. Severity: red when required
+          teaches missing (program can't run); amber when only
+          quality re-teaches remain. Hidden mid-flow (teachAllPos ≥ 0
+          or teachSingleId set or pallet teach in progress). */}
+      {(() => {
+        if (teachAllPos >= 0) return null
+        if (teachSingleId != null) return null
+        if (palletTeachRole) return null
+        const debt = computeTeachingDebt(currentProgram)
+        if (!debt.severity) return null
+        const palette = debt.severity === 'error'
+          ? { bg: '#fef2f2', border: '#fecaca', fg: '#b91c1c', btn: '#DC2626' }
+          : { bg: '#fef3c7', border: '#fde68a', fg: '#78350f', btn: '#D97706' }
+        const detail = debt.severity === 'error'
+          ? 'jog the robot, then click Teach on each step'
+          : 'the program will run — clear the owed re-teaches to lock in the quality'
+        return (
+          <div
+            data-testid="teaching-debt-banner"
+            data-severity={debt.severity}
+            data-total={debt.total}
             style={{
-              padding: '6px 14px', fontSize: 11, fontWeight: 700,
-              background: '#2563EB', color: '#fff',
-              border: 'none', borderRadius: 5, cursor: 'pointer',
+              margin: '8px 12px 0', padding: '8px 12px', fontSize: 12,
+              background: palette.bg, color: palette.fg,
+              border: `1px solid ${palette.border}`, borderRadius: 6,
+              display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0,
             }}>
-            Teach All ({untaughtCount})
-          </button>
-        </div>
-      )}
+            <span style={{ fontWeight: 700 }}>
+              {debtBannerLabel(debt)}
+            </span>
+            <span style={{ color: '#6b7280', fontSize: 11 }}>
+              — {detail}
+            </span>
+            <div style={{ flex: 1 }} />
+            <button
+              data-testid="teaching-debt-teach-all"
+              onClick={startTeachAll}
+              style={{
+                padding: '6px 14px', fontSize: 11, fontWeight: 700,
+                background: palette.btn, color: '#fff',
+                border: 'none', borderRadius: 5, cursor: 'pointer',
+              }}>
+              Teach All ({debt.total})
+            </button>
+          </div>
+        )
+      })()}
 
       {/* Tool & Payload — per-program metadata. Not on the wire (see
           codegen; setPayload isn't wire-proven), but the collision
@@ -4169,12 +4592,47 @@ export default function ProgramEditor() {
         })}
       />
 
+      {/* Program-level findings — legacy-migration nudges, etc.
+          Clears automatically when the operator resolves the
+          underlying condition (e.g. re-teaches ④). Never lives in a
+          modal; the operator sees + acts on findings in-flow. */}
+      <ProgramFindingsPanel
+        program={currentProgram}
+        onAction={(f) => {
+          // Route each finding's CTA to the right operator gesture.
+          // Currently: 'teach-pallet-part' jumps into the pallet
+          // teach sequence at ④.
+          if (f.action?.kind === 'teach-pallet-part') {
+            setTeachSingleId(null)
+            setTeachAllOrder([])
+            setTeachAllPos(-1)
+            setPalletTeachRole('pallet_part')
+            setPalletTeachMode(modeForRole('pallet_part',
+              palletFrameStatus(currentProgram)))
+            setPalletFrameWarnings([])
+          }
+        }}
+      />
+
       <div
         // Clicking blank space inside the scroll area (not on a row)
         // clears the selection — file-manager style.
         onClick={(e) => { if (e.target === e.currentTarget) setSelectedId(null) }}
         style={{ flex: 1, overflowY: 'auto', padding: '8px 12px' }}>
         {steps.map((step, idx) => {
+          // Program-level pallet frame status — same value for every
+          // row, cheap to recompute per iteration and keeps the closure
+          // over `currentProgram` fresh across edits.
+          const _palletFrame  = palletFrameStatus(currentProgram)
+          const _isPalletStep = isPalletDriven(step)
+          // 2026-07-30 §430 — routine fold: skip rendering rows in
+          // iteration > 0 of a collapsed routine. The iteration-0
+          // representative row + a "×N ▸ expand" chip stand in for
+          // the whole routine.
+          const _rinfo = stepRoutineInfo[idx]
+          if (_rinfo && _rinfo.iteration > 0 && !isRoutineExpanded(_rinfo.routineId)) {
+            return null
+          }
           // First move_home in the program is the shared "home"
           // fixture. Any later move_home can link to it via the
           // "Use Step 1 home position" control — updates to the first
@@ -4316,23 +4774,115 @@ export default function ProgramEditor() {
                     <span style={{ fontSize: 13, lineHeight: 1 }}>🔗</span>
                     <span>{step.position_ref}</span>
                   </div>
-                ) : (
-                  <div title={isTeachable(step)
-                                ? (step.taught ? `Taught at ${step.taught_at || 'unknown'}` : 'Position not taught — click Teach')
-                                : undefined}
-                    style={{
-                      width: 26, height: 26, borderRadius: '50%',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      flexShrink: 0,
-                      visibility: isTeachable(step) ? 'visible' : 'hidden',
-                      background: step.taught ? '#f0fdf4' : '#fef2f2',
-                      border:     step.taught ? '2px solid #16A34A' : '2px dashed #DC2626',
-                      color:      step.taught ? '#16A34A' : '#DC2626',
-                      fontSize: 11, fontWeight: 700,
-                    }}>
-                    {step.taught ? 'T' : '!'}
-                  </div>
-                )}
+                ) : _isPalletStep ? (() => {
+                  // Pallet step badge tracks FRAME completeness — the
+                  // move_to_pallet step has no per-step taught flag; the
+                  // config's completeness is what the operator needs to
+                  // see at a glance. Three states so partial doesn't
+                  // look like none:
+                  //   4/4 → solid green T
+                  //   1..3/4 → amber solid, shows the count
+                  //   0/4 → red dashed !
+                  //
+                  // D10 (Program Doctrine): while programRevConfirmed
+                  // is false — WS down or post-reconnect refetch
+                  // pending — we don't know if another client changed
+                  // the frame. Render a subtle "syncing" state
+                  // instead of a confident T. The stop-zone modal
+                  // and the safety layer are unaffected; only the
+                  // taught-state assertion softens.
+                  const n = taughtCount(_palletFrame)
+                  const derived = n === 4 ? 'full' : n === 0 ? 'none' : 'partial'
+                  const state = programRevConfirmed ? derived : 'syncing'
+                  const bg = state === 'full'    ? '#f0fdf4'
+                           : state === 'partial' ? '#fef3c7'
+                           : state === 'syncing' ? '#f1f5f9'
+                                                 : '#fef2f2'
+                  const border = state === 'full'    ? '2px solid #16A34A'
+                               : state === 'partial' ? '2px solid #d97706'
+                               : state === 'syncing' ? '2px dashed #64748b'
+                                                     : '2px dashed #DC2626'
+                  const fg = state === 'full'    ? '#16A34A'
+                           : state === 'partial' ? '#92400e'
+                           : state === 'syncing' ? '#475569'
+                                                 : '#DC2626'
+                  const label = state === 'full'    ? 'T'
+                              : state === 'partial' ? `${n}/4`
+                              : state === 'syncing' ? '…'
+                                                    : '!'
+                  const title = state === 'syncing'
+                    ? 'state syncing… — the client\'s taught data is unconfirmed '
+                      + '(WS reconnect pending). Never render green on unconfirmed data.'
+                    : state === 'full'
+                    ? 'Pallet frame taught: ①②③ corners + ④ first-part.'
+                    : state === 'partial'
+                    ? `Pallet frame partially taught: ${n} of 4 points. Click Teach to resume.`
+                    : 'Pallet frame not yet taught — click Teach.'
+                  return (
+                    <div
+                      data-testid="pallet-row-badge"
+                      data-state={state}
+                      title={title}
+                      style={{
+                        // Wider box for the "N/4" partial label.
+                        minWidth: 26, height: 26, borderRadius: 13,
+                        padding: state === 'partial' ? '0 6px' : 0,
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        flexShrink: 0,
+                        background: bg,
+                        border,
+                        color: fg,
+                        fontSize: state === 'partial' ? 10 : 11,
+                        fontWeight: 700,
+                        letterSpacing: state === 'partial' ? 0.5 : 0,
+                        fontFamily: state === 'partial'
+                          ? 'var(--font-mono, monospace)' : undefined,
+                      }}>
+                      {label}
+                    </div>
+                  )
+                })() : (() => {
+                  // Standard row badge — T / ! for teachable steps.
+                  // D10: same "syncing" softening as the pallet badge.
+                  const teachable = isTeachable(step, currentProgram)
+                  const state = !teachable ? null
+                              : !programRevConfirmed ? 'syncing'
+                              : (step.taught ? 'taught' : 'untaught')
+                  const title = state === 'syncing'
+                    ? 'state syncing… — the client\'s taught data is unconfirmed '
+                      + '(WS reconnect pending). Never render green on unconfirmed data.'
+                    : teachable
+                      ? (step.taught
+                        ? `Taught at ${step.taught_at || 'unknown'}`
+                        : 'Position not taught — click Teach')
+                      : undefined
+                  return (
+                    <div
+                      data-testid="step-row-taught-badge"
+                      data-state={state || 'hidden'}
+                      title={title}
+                      style={{
+                        width: 26, height: 26, borderRadius: '50%',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        flexShrink: 0,
+                        visibility: teachable ? 'visible' : 'hidden',
+                        background: state === 'syncing' ? '#f1f5f9'
+                                  : state === 'taught'  ? '#f0fdf4'
+                                                        : '#fef2f2',
+                        border:     state === 'syncing' ? '2px dashed #64748b'
+                                  : state === 'taught'  ? '2px solid #16A34A'
+                                                        : '2px dashed #DC2626',
+                        color:      state === 'syncing' ? '#475569'
+                                  : state === 'taught'  ? '#16A34A'
+                                                        : '#DC2626',
+                        fontSize: 11, fontWeight: 700,
+                      }}>
+                      {state === 'syncing' ? '…'
+                        : state === 'taught' ? 'T'
+                        : '!'}
+                    </div>
+                  )
+                })()}
                 <span style={{
                   display: 'inline-block', flexShrink: 0,
                   minWidth: 70, textAlign: 'center', boxSizing: 'border-box',
@@ -4342,6 +4892,67 @@ export default function ProgramEditor() {
                 }}>
                   {def.tag}
                 </span>
+                {/* Emitted-verb divergence chip (Doctrine D3).
+                    When codegen has written program.emitted_verbs
+                    AND the emitted verb differs from what step.action
+                    implies, surface both plus the reason. Without
+                    this the row would silently show "MOVE LINEAR"
+                    while codegen emitted movJ. */}
+                {(() => {
+                  const v = verbForStep(currentProgram, idx)
+                  if (!v || !v.verb) return null
+                  if (v.expected) return null   // no emitted table → nothing to compare against
+                  const impliedByAction =
+                    step.action === 'move_home'   ? 'movJ'
+                  : step.action === 'move_joint'  ? 'movJ'
+                  : step.action === 'move_linear' ? 'movL'
+                  : step.action === 'approach'    ? 'movL'
+                  : step.action === 'pick'        ? 'movL'
+                  : step.action === 'place'       ? 'movL'
+                  : null
+                  if (impliedByAction == null) return null
+                  if (v.verb === impliedByAction) return null
+                  return (
+                    <span
+                      data-testid="step-emitted-verb-chip"
+                      title={`Codegen emitted ${v.verb} (action implies `
+                        + `${impliedByAction})${v.reason ? ' — ' + v.reason : ''}`}
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 4,
+                        flexShrink: 0, fontSize: 10, fontWeight: 700,
+                        padding: '2px 6px', borderRadius: 4,
+                        background: '#FEF3C7', color: '#92400E',
+                        border: '1px solid #F59E0B',
+                        fontFamily: 'var(--font-mono, monospace)',
+                      }}>
+                      ⚠ {v.verb}
+                    </span>
+                  )
+                })()}
+                {_rinfo && _rinfo.firstOfRoutine && (
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); toggleRoutine(_rinfo.routineId) }}
+                    title={
+                      isRoutineExpanded(_rinfo.routineId)
+                        ? `Fold ${_rinfo.iterations} iterations back to one representative cycle. Edits apply to every iteration regardless of fold state.`
+                        : `Expand to show all ${_rinfo.iterations} iterations. Edits to this cycle apply to every iteration.`
+                    }
+                    style={{
+                      marginLeft: 6, fontSize: 10, fontWeight: 700,
+                      padding: '3px 8px',
+                      borderRadius: 12,
+                      color: '#065f46', background: '#d1fae5',
+                      border: '1px solid #6ee7b7',
+                      display: 'inline-flex', alignItems: 'center', gap: 4,
+                      cursor: 'pointer', flexShrink: 0,
+                    }}>
+                    ×{_rinfo.iterations}
+                    <span style={{ fontSize: 9, fontWeight: 800 }}>
+                      {isRoutineExpanded(_rinfo.routineId) ? '▾ fold' : '▸ expand'}
+                    </span>
+                  </button>
+                )}
               </div>
 
               {/* MIDDLE — title + detail line, fills the remaining width.
@@ -4397,7 +5008,7 @@ export default function ProgramEditor() {
                   }}>
                     {detailLine(step, ioLabels)}
                   </span>
-                  {isTeachable(step) && hasPositionData(step) && (() => {
+                  {isTeachable(step, currentProgram) && hasPositionData(step) && (() => {
                     const open = openPosData.has(step.id)
                     return (
                       <a
@@ -4417,12 +5028,12 @@ export default function ProgramEditor() {
                     )
                   })()}
                 </div>
-                {isTeachable(step) && !step.taught && (
+                {isTeachable(step, currentProgram) && !step.taught && (
                   <div style={{ fontSize: 13, color: '#DC2626', fontWeight: 600 }}>
                     NOT TAUGHT
                   </div>
                 )}
-                {isTeachable(step) && openPosData.has(step.id) && (
+                {isTeachable(step, currentProgram) && openPosData.has(step.id) && (
                   <div style={{
                     marginTop: 2, padding: 8,
                     background: '#f3f4f6', border: '1px solid #e5e7eb',
@@ -4478,7 +5089,7 @@ export default function ProgramEditor() {
                     </button>
                   )
                 )}
-                {!locked && isTeachable(step) && (
+                {!locked && isTeachable(step, currentProgram) && (
                   <button onClick={(e) => { e.stopPropagation(); teachStep(step.id) }}
                     title={step.taught ? 'Re-record this position from the current robot pose' : 'Record the current robot pose as this step\'s position'}
                     style={{
@@ -4489,6 +5100,23 @@ export default function ProgramEditor() {
                       borderRadius: 5, cursor: 'pointer',
                     }}>
                     {step.taught ? 'Re-teach' : 'Teach'}
+                  </button>
+                )}
+                {!locked && _isPalletStep && (
+                  <button
+                    data-testid="pallet-row-teach"
+                    onClick={(e) => { e.stopPropagation(); startPalletTeach() }}
+                    title={_palletFrame.allTaught
+                      ? 'Re-teach the pallet frame — walk through ①②③ corners + ④ first-part.'
+                      : 'Teach the pallet frame — walk through ①②③ corners + ④ first-part. Resumes at the first untaught point.'}
+                    style={{
+                      padding: '6px 14px', fontSize: 12, fontWeight: 600, flexShrink: 0,
+                      background: _palletFrame.allTaught ? '#f0fdf4' : '#eff6ff',
+                      color:      _palletFrame.allTaught ? '#16A34A' : '#2563EB',
+                      border:     _palletFrame.allTaught ? '1px solid #bbf7d0' : '1px solid #bfdbfe',
+                      borderRadius: 5, cursor: 'pointer',
+                    }}>
+                    {_palletFrame.allTaught ? 'Re-teach' : 'Teach'}
                   </button>
                 )}
                 {/* Position-picker gate. Every teachable step that
@@ -4505,14 +5133,14 @@ export default function ProgramEditor() {
                     unified Link/Unlink here hides on those rows so an
                     operator with muscle memory sees the same UI.
                     Gate on TEACHABLE_ACTIONS membership rather than
-                    isTeachable(step) — the latter returns false when
+                    isTeachable(step, currentProgram) — the latter returns false when
                     position_ref is set, which would hide our own
                     Unlink button on ea64950-linked rows. */}
                 {(() => {
                   if (locked || isLaterHome) return null
-                  const isPosStep = TEACHABLE_ACTIONS.includes(step.action)
+                  const isPosStep = TEACHABLE_ACTIONS.has(step.action)
                                  || (step.type && ACTION_TYPES.find((a) => a.type === step.type
-                                                                    && TEACHABLE_ACTIONS.includes(a.value)))
+                                                                    && TEACHABLE_ACTIONS.has(a.value)))
                   if (!isPosStep) return null
                   if (isDerivedOffsetMove(step)) return null
                   const linked = step.point_name || step.position_ref != null
@@ -4752,7 +5380,6 @@ export default function ProgramEditor() {
       {editingPallet && (
         <PalletConfigEditor
           config={currentProgram.config || {}}
-          onGoToTeaching={startTeachAll}
           onSave={(patch) => {
             // patch carries pallet / pallet_mode / source / speed_pct +
             // optional pick_tcp / place_tcp. Merge into program.config,
@@ -4792,9 +5419,72 @@ export default function ProgramEditor() {
 
       {/* Fullscreen teach overlay — replaces the old inline blue banner.
           Open when an individual step's Teach button was clicked
-          (teachSingleId set) OR a Teach All walk is in progress
-          (teachAllPos ≥ 0). */}
+          (teachSingleId set), a Teach All walk is in progress
+          (teachAllPos ≥ 0), OR the pallet Teach walk is active
+          (palletTeachRole set). */}
       {(() => {
+        // Pallet teach path wins if active — its step is synthesized
+        // per-role and points at the diagram-guided flow.
+        if (palletTeachRole) {
+          const synth = PALLET_TEACH_STEPS[palletTeachRole]
+          const roleIdx = PALLET_ROLE_ORDER.indexOf(palletTeachRole)
+          const cfg     = currentProgram?.config || {}
+          const pallet  = cfg.pallet || {}
+          const rows      = pallet.rows       ?? cfg.pallet_rows       ?? 4
+          const cols      = pallet.cols       ?? cfg.pallet_cols       ?? 4
+          const fillOrder = pallet.fill_order ?? cfg.pallet_fill_order ?? 'row_lr'
+          const frameStatus = palletFrameStatus(currentProgram)
+          const nTaught     = taughtCount(frameStatus)
+          // Header modifiers: "· already taught, re-teaching" when
+          // the current role has a pose; "· N taught" counter suffix
+          // that reflects reality regardless of navigation.
+          const labelSuffix = palletTeachMode === 're-teach'
+            ? ' · already taught, re-teaching'
+            : ''
+          const stepLabelForOverlay = synth.label + labelSuffix
+          // Instr composition:
+          //   base + (re-teach nudge if applicable)
+          //   + (reason addendum if Teach All chained an owed
+          //      re-teach here — e.g. the legacy-migration caption)
+          const reTeachNudge = palletTeachMode === 're-teach'
+            ? ' The existing pose stays until you press Record.' : ''
+          const reasonAddendum = palletTeachReason
+            ? ` (${palletTeachReason})` : ''
+          const stepInstrForOverlay = synth.instr + reTeachNudge + reasonAddendum
+          const counterSuffix = ` · ${nTaught} taught`
+          const synthStep = {
+            ...synth,
+            label: stepLabelForOverlay,
+            instr: stepInstrForOverlay,
+          }
+          return (
+            <TeachOverlay
+              step={synthStep}
+              currentN={roleIdx + 1}
+              totalM={PALLET_ROLE_ORDER.length}
+              counterSuffix={counterSuffix}
+              warnings={palletFrameWarnings}
+              onDismissWarnings={() => setPalletFrameWarnings([])}
+              canBack={roleIdx > 0}
+              onRecord={palletTeachRecord}
+              onSkip={palletTeachSkip}
+              onBack={palletTeachBack}
+              onCancel={teachOverlayCancel}
+              diagram={
+                <PalletFrameDiagram
+                  role={palletTeachRole}
+                  rows={rows}
+                  cols={cols}
+                  fillOrder={fillOrder}
+                  frameStatus={frameStatus}
+                  mode={palletTeachMode}
+                  onRoleTap={jumpToPalletRole}
+                  size="large"
+                />
+              }
+            />
+          )
+        }
         const overlayStep = teachOverlayStep()
         if (!overlayStep) return null
         const isSingle = teachSingleId != null
@@ -4811,6 +5501,61 @@ export default function ProgramEditor() {
             onBack={teachOverlayBack}
             onCancel={teachOverlayCancel}
           />
+        )
+      })()}
+
+      {/* Cancel-confirm modal for the pallet teach flow. States the
+          number of already-recorded teaches so the operator knows
+          exactly what's preserved. Recorded teaches persist via
+          setCurrentProgram writes on each Record; this dialog is a
+          safety net for the "I hit Cancel by accident" case. */}
+      {palletCancelConfirm && (() => {
+        const nTaught = taughtCount(palletFrameStatus(currentProgram))
+        return (
+          <div
+            data-testid="pallet-cancel-confirm"
+            onClick={() => setPalletCancelConfirm(false)}
+            style={{
+              position: 'fixed', inset: 0, zIndex: 2000,
+              background: 'rgba(15,23,42,0.55)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}>
+            <div onClick={(e) => e.stopPropagation()}
+              style={{
+                background: '#fff', borderRadius: 10, width: 'min(460px, 92vw)',
+                padding: 20, boxShadow: '0 20px 60px rgba(0,0,0,0.25)',
+              }}>
+              <div style={{ fontSize: 16, fontWeight: 700, color: '#111', marginBottom: 8 }}>
+                Leave pallet teach?
+              </div>
+              <div style={{ fontSize: 14, color: '#374151', lineHeight: 1.55 }}>
+                {nTaught} of 4 pallet frame points {nTaught === 1 ? 'has' : 'have'} been recorded.
+                {' '}<strong>Recorded teaches will be kept</strong> — you can resume from the
+                Teach button on the pallet step row.
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+                <button
+                  onClick={() => setPalletCancelConfirm(false)}
+                  style={{
+                    padding: '6px 14px', fontSize: 13, fontWeight: 600,
+                    background: '#f3f4f6', color: '#374151',
+                    border: '1px solid #d1d5db', borderRadius: 6, cursor: 'pointer',
+                  }}>
+                  Keep teaching
+                </button>
+                <button
+                  data-testid="pallet-cancel-confirm-leave"
+                  onClick={() => palletTeachDiscardConfirm(false)}
+                  style={{
+                    padding: '6px 14px', fontSize: 13, fontWeight: 600,
+                    background: '#2563EB', color: '#fff',
+                    border: 'none', borderRadius: 6, cursor: 'pointer',
+                  }}>
+                  Leave — teaches kept
+                </button>
+              </div>
+            </div>
+          </div>
         )
       })()}
     </div>

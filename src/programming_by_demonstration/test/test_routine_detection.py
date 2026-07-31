@@ -265,3 +265,94 @@ def test_teach_once_within_a_routine():
     # (iteration 1 for pick and for place).
     assert len(anchors) == 2, [s.get('label') for s in anchors]
     assert len(linked)  == 2, [s.get('label') for s in linked]
+
+
+# ── §430 extension: single-op count>=2 → routine ─────────────────
+
+def test_single_op_count_five_becomes_routine_of_five():
+    """The 63-step white bowl demo shape: one pick_and_place op with
+    count=5 that the composer expands into 5 iterations. This ALSO
+    counts as a routine now (§430) so the review/editor can fold
+    to "×5"."""
+    intent = StructuredIntent(operations=[
+        _pnp_op(1, 'loc_1', 'loc_2', count=5),
+    ])
+    routines = detect_routines(intent)
+    assert len(routines) == 1
+    r = routines[0]
+    assert r.iterations == 5, r
+    assert r.operation_indices == [0], r
+    assert r.single_iteration_signature.get('kind') == 'single_op_multi_iter'
+    assert '×5' in r.name
+
+
+def test_single_op_count_one_is_not_a_routine():
+    """count=1 = a single execution → not a routine. Guard for the
+    legacy demo shape (1 op, 1 iter)."""
+    intent = StructuredIntent(operations=[
+        _pnp_op(1, 'loc_1', 'loc_2', count=1),
+    ])
+    assert detect_routines(intent) == []
+
+
+def test_single_op_multi_iter_step_metadata():
+    """Every emitted step from a single-op count>=2 op carries
+    routine_id + routine_iteration matching its iter_index."""
+    intent = StructuredIntent(operations=[
+        _pnp_op(1, 'loc_1', 'loc_2', count=3),
+    ])
+    fuse_positions(intent)  # ensure refs are set as in real path
+    draft = compose_program_draft(intent, demo_id='single-op-5')
+    assert len(draft.routines) == 1
+    r = draft.routines[0]
+    # Iteration ranges: each iteration should be a contiguous span
+    # of steps.  count=3 iterations → 3 ranges.
+    assert len(r.step_indices_per_iter) == 3, r.step_indices_per_iter
+    # Every step in the ranges carries routine_id + a routine_iteration
+    # matching its iter_index (0..2).
+    for iter_i, (a, b) in enumerate(r.step_indices_per_iter):
+        for s in draft.steps[a:b]:
+            assert s.get('routine_id') == r.id, s
+            assert s.get('routine_iteration') == iter_i, s
+    # Steps outside a routine (home wrappers) stay flat.
+    outside = [s for s in draft.steps if 'routine_id' not in s]
+    # Home wrappers are outside the op span (composer prepends home
+    # then appends return home). Both should be routine-free.
+    assert outside, 'expected home wrappers to sit outside the routine'
+    for s in outside:
+        assert 'routine_iteration' not in s
+
+
+def test_single_op_routine_byte_diff_lua_matches_flat():
+    """Codegen invariant, §430 case: a single-op count>=2 routine
+    emits Lua byte-identical to the same steps with routine_id +
+    routine_iteration stripped. Proves the loop-emission is still
+    deferred and that single-op grouping is representation-only."""
+    intent = StructuredIntent(operations=[
+        _pnp_op(1, 'loc_1', 'loc_2', count=4),
+    ])
+    fuse_positions(intent)
+    grouped_draft = compose_program_draft(intent, demo_id='single-op-bytediff')
+    grouped_steps = grouped_draft.steps
+    flat_steps = [
+        {k: v for k, v in s.items()
+         if k not in ('routine_id', 'routine_iteration')}
+        for s in grouped_steps
+    ]
+
+    def _lua(steps):
+        program = {
+            'id':     'byte-diff-single-op',
+            'name':   'byte-diff-single-op',
+            'config': {'speed_pct': 50},
+            'steps':  steps,
+        }
+        lua, _, _ = codegen_lua_from_program(
+            program, operator_speed_limit_pct=100)
+        return '\n'.join(
+            ln for ln in lua.splitlines()
+            if not ln.startswith('--Lua version')
+            and not ln.startswith('-- codegen:'))
+
+    assert _lua(grouped_steps) == _lua(flat_steps), (
+        'single-op routine metadata must not change emitted Lua')

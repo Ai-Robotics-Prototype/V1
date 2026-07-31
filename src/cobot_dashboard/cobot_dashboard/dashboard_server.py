@@ -305,11 +305,73 @@ _prog_event_lock = threading.Lock()
 _PROG_EVENT_RING_MAX = 64
 _PROG_EVENT_TTL_S    = 15.0
 
+# 2026-07-31 CONVERGENCE FIX (operator-hit twice today, both
+# directions): on server restart, _prog_revs was empty. Any client
+# still holding a rev from the previous process saw the first
+# post-restart event's rev come in LOWER than its held cp.rev, so
+# `ev.rev > cp.rev` was FALSE and the refetch never fired. The
+# tablet-vs-PC diverged and stayed diverged.
+#
+# Fix: seed the rev counter from every program's on-disk rev at
+# startup so the first bump after restart always advances beyond
+# what any live client could hold. Every mutation persists rev to
+# disk (see _save_prog_with_event), so on-disk is the source of
+# truth across restarts.
+def _seed_prog_revs_from_disk() -> None:
+    """Walk the programs directory and seed _prog_revs with each
+    program's on-disk rev. Runs once at server startup so post-
+    restart revs never regress below any live client's held value."""
+    try:
+        # The programs dir constant is defined inside the FastAPI
+        # setup function (later in this module); default to the
+        # canonical path used by every deploy.
+        prog_dir = os.environ.get("COBOT_PROG_DIR") or "/opt/cobot/programs"
+        if not os.path.isdir(prog_dir):
+            return
+        seeded = 0
+        for name in os.listdir(prog_dir):
+            if not name.endswith(".json"):
+                continue
+            if name.startswith("_"):
+                continue        # _folders.json etc.
+            path = os.path.join(prog_dir, name)
+            try:
+                with open(path) as f:
+                    p = json.load(f)
+                prog_id = p.get("id") or name[:-5]
+                rev = int(p.get("rev") or 0)
+                with _prog_event_lock:
+                    prev = _prog_revs.get(prog_id)
+                    # Seed even when rev is 0: the revs endpoint must
+                    # report EVERY known program so clients can detect
+                    # a "held rev higher than server-truth" case (which
+                    # happens after a restart resets in-memory state
+                    # while a client still holds a pre-restart rev).
+                    if prev is None or rev > prev:
+                        _prog_revs[prog_id] = rev
+                        seeded += 1
+            except Exception:
+                continue
+        if seeded:
+            # log() may not be initialised yet at import; use print
+            # so the seed count reaches journalctl on startup.
+            print(f"[dashboard] _prog_revs seeded from disk: "
+                  f"{seeded} program(s)")
+    except Exception:
+        pass
+
 def _bump_prog_rev(prog_id: str) -> int:
     with _prog_event_lock:
         r = int(_prog_revs.get(prog_id, 0)) + 1
         _prog_revs[prog_id] = r
         return r
+
+def _snapshot_prog_revs() -> dict:
+    """Copy the full {id: rev} map so the state broadcast can carry
+    it without holding the lock across json.dumps. Small (< 100
+    programs typical) so copying every tick is cheap."""
+    with _prog_event_lock:
+        return dict(_prog_revs)
 
 def _emit_program_changed(program_id: str, rev: int, source_client: str,
                           kind: str = "mutation") -> None:
@@ -1513,6 +1575,12 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 "allow_power", "allow_power_source",
                 "allow_move", "allow_move_source",
                 "jog_heartbeat_s", "jog_freshness_s",
+                # 2026-07-31 jog-stop bench instrumentation. Forward
+                # the driver's per-hold inter-arrival gap histogram
+                # + summary so the client + bench script can build
+                # the "is the channel gapping past 200 ms?" answer.
+                "jog_hold_gaps_ms", "jog_hold_gaps_summary",
+                "jog_last_hold_gaps_ms", "jog_last_hold_gaps_summary",
             ):
                 if k in d:
                     r[k] = d[k]
@@ -1926,6 +1994,17 @@ if FASTAPI_AVAILABLE:
             # Registration function not defined yet (rare — early
             # import failure). Endpoints will just serve empty data.
             pass
+        # 2026-07-31 CONVERGENCE FIX: seed _prog_revs from every
+        # program's on-disk rev BEFORE the /ws/state broadcast loop
+        # starts. Without this, the first post-restart mutation
+        # collapses rev to 1 while clients still hold higher revs
+        # from the previous process — every subsequent event's
+        # `ev.rev > cp.rev` compare fails silently.
+        try:
+            _seed_prog_revs_from_disk()
+        except Exception as _e:
+            print(f'[dashboard] _seed_prog_revs_from_disk failed: {_e}',
+                  flush=True)
         task = asyncio.create_task(_broadcast_loop())
         # Server-side hold keepalive — drives /robot/jog_command at a
         # steady 100 ms cadence. Runs on a dedicated NATIVE thread, not
@@ -2064,6 +2143,17 @@ if FASTAPI_AVAILABLE:
                     events = _snapshot_program_events()
                     if events:
                         payload["program_events"] = events
+                    # 2026-07-31 CONVERGENCE: include the full
+                    # {program_id: rev} snapshot in every state
+                    # frame. Clients rev-gap-check their held
+                    # currentProgram against server-truth on each
+                    # frame and refetch immediately when they're
+                    # behind — heals missed events (event ring
+                    # TTL 15s can age out during long backgrounds)
+                    # without waiting for the next mutation.
+                    revs = _snapshot_prog_revs()
+                    if revs:
+                        payload["program_revs"] = revs
                     return json.dumps(payload), _state_seq_counter[0]
                 txt, seq = await loop.run_in_executor(None, _snapshot_and_serialize)
                 # Sequence + broadcast time. The seq lets the ACK-gated
@@ -6471,6 +6561,150 @@ if FASTAPI_AVAILABLE:
         with open(_FOLDERS_FILE, 'w') as f:
             json.dump(data, f, indent=2)
 
+    @app.get("/api/programs/revs")
+    async def api_programs_revs():
+        """Return {program_id: rev} for every known program — cheap
+        endpoint clients hit on WS (re)connect + visibilitychange
+        resume to detect any program whose held rev is behind
+        server-truth. Complements the /ws/state broadcast's
+        program_revs field for reconciles that can't wait for the
+        next state tick.
+
+        Any program known on disk but not yet in _prog_revs is
+        seeded from its file rev here so a fresh restart doesn't
+        report None for programs that haven't been touched yet
+        this process."""
+        _seed_prog_revs_from_disk()          # idempotent
+        return {"revs": _snapshot_prog_revs()}
+
+    # ── /api/jog_stop_log (2026-07-31 jog-stop instrumentation) ──
+    # Client-side jog-stop cause ring. Every tab's HoldButton pushes
+    # here via fire-and-forget POST when a jog stops. Bench-script
+    # GETs the aggregate to compute the cause distribution across
+    # devices without having to inspect each browser's devtools.
+    #
+    # Ring capped at 1024 entries. Non-persistent (dies with the
+    # dashboard process). Small, cheap, and DELETE clears it for a
+    # fresh bench-test window.
+    _jog_stop_log_ring: list = []
+    _JOG_STOP_LOG_MAX = 1024
+
+    # ── /api/deploy_status (2026-07-31 auto-deploy directive) ─────
+    # Reads /opt/cobot/deploy_log.jsonl and returns a compact view:
+    # the latest entry + whether it's still "waiting" or "building",
+    # plus the previous "ok" for age computation.
+    #
+    # The footer banner reads this to render one of:
+    #   green    "current (hash, age)"
+    #   spinning "deploying…"
+    #   amber    "deploy waiting for idle"
+    #   red      "DEPLOY FAILED: <step>"
+    @app.get("/api/deploy_status")
+    async def api_deploy_status():
+        path = "/opt/cobot/deploy_log.jsonl"
+        try:
+            with open(path) as f:
+                # Tail the last ~64 entries (deploy log grows slowly;
+                # keep the read cheap without loading the whole file).
+                lines = f.readlines()[-64:]
+        except FileNotFoundError:
+            return {"state": "unknown", "detail": "no deploy_log.jsonl yet"}
+        except Exception as e:
+            return {"state": "unknown", "detail": f"read failed: {e}"}
+        entries = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        if not entries:
+            return {"state": "unknown", "detail": "empty log"}
+        # Determine the *current* state:
+        #   * if the latest entry is `ok` OR the process is dormant
+        #     (no `start`/`waiting`/`building` more recent than the
+        #     last `ok`/`fail`) → state = 'current' with the ok hash
+        #   * if latest is `fail` → state = 'failed'
+        #   * if latest is `waiting` → state = 'waiting'
+        #   * if latest is `building` OR `start` → state = 'deploying'
+        latest = entries[-1]
+        phase = latest.get("phase")
+        state = {
+            "ok":       "current",
+            "fail":     "failed",
+            "waiting":  "waiting",
+            "building": "deploying",
+            "start":    "deploying",
+        }.get(phase, "unknown")
+        # Find the most recent successful deploy for the "current
+        # served" hash + age. Even when phase='waiting' or 'failed'
+        # the served bundle still corresponds to the LAST ok entry.
+        last_ok = None
+        for e in reversed(entries):
+            if e.get("phase") == "ok":
+                last_ok = e
+                break
+        return {
+            "state":  state,
+            "latest": latest,
+            "last_ok": last_ok,
+            # Small history slice for the debug panel if the operator
+            # wants to inspect the trail (kept small so this endpoint
+            # stays cheap).
+            "history_tail": entries[-8:],
+        }
+
+    @app.post("/api/jog_stop_log")
+    async def api_jog_stop_log_push(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        entry = {
+            "srv_ts": time.time(),
+            "cause":  str(body.get("cause") or "unknown"),
+            "client_ts": body.get("ts"),
+            "extras": {k: v for k, v in body.items()
+                       if k not in ("ts", "cause")},
+        }
+        _jog_stop_log_ring.append(entry)
+        if len(_jog_stop_log_ring) > _JOG_STOP_LOG_MAX:
+            del _jog_stop_log_ring[:len(_jog_stop_log_ring) - _JOG_STOP_LOG_MAX]
+        return {"ok": True}
+
+    @app.get("/api/jog_stop_log")
+    async def api_jog_stop_log_get():
+        return {"stops": list(_jog_stop_log_ring)}
+
+    @app.delete("/api/jog_stop_log")
+    async def api_jog_stop_log_clear():
+        _jog_stop_log_ring.clear()
+        return {"ok": True, "cleared": True}
+
+    @app.get("/api/build_id")
+    async def api_build_id():
+        """Return the currently-served frontend bundle's asset hash.
+        Client compares to its build-time __BUILD_ID__ and shows a
+        "new version — refresh" toast on mismatch.
+
+        Reads mock_server/static/index.html (the canonical served-
+        bundle location — same directory the deploy script checks)
+        for the /assets/index-<hash>.js link. Falls back to
+        'unknown' when the file isn't present."""
+        try:
+            index = str(_STATIC_DIR / "index.html")
+            if not os.path.isfile(index):
+                return {"bundle_id": "unknown"}
+            with open(index) as f:
+                src = f.read()
+            import re as _rx
+            m = _rx.search(r"/assets/index-([A-Za-z0-9_-]+)\.js", src)
+            return {"bundle_id": (m.group(1) if m else "unknown")}
+        except Exception:
+            return {"bundle_id": "unknown"}
+
     @app.get("/api/programs")
     async def api_programs_list():
         """List user-created robot programs from /opt/cobot/programs/.
@@ -6682,6 +6916,14 @@ if FASTAPI_AVAILABLE:
         'set_io', 'wait', 'wait_input', 'loop', 'gripper',
         'gripper_close', 'gripper_open', 'pause', 'comment', 'end',
         'vacuum_on', 'vacuum_off',
+        # 2026-07-31: camera / config-driven verbs. Added after the
+        # operator caught `detect` showing up in a Teach All queue —
+        # these actions don't take a per-step pose, so `_has_taught_poses`
+        # must not treat them as untaught gaps. Kept in sync with the
+        # frontend's NON_MOTION_ACTIONS set in lib/programTruth.js.
+        'detect',
+        'scan_workspace', 'scan_identify_each', 'sort_scanned', 'remove_defects',
+        'move_to_pallet',
     })
 
     def _has_taught_poses(prog: dict) -> bool:
@@ -7003,6 +7245,29 @@ if FASTAPI_AVAILABLE:
                 cfg_in = {k: v for k, v in cfg_in.items() if k != 'pbd_metadata'}
             tags_in = [t for t in tags_in if t not in _PBD_TAG_MARKERS]
 
+        # 2026-07-30 §430 — persist routines[] alongside steps.
+        # Representation-only (codegen never reads it), but the
+        # editor + review UIs fold on it to render "×N" chips
+        # instead of unrolled iterations. Only well-shaped entries
+        # are accepted; malformed rows are dropped silently.
+        _routines_raw = body.get("routines") or []
+        _routines_clean = []
+        if isinstance(_routines_raw, list):
+            for r in _routines_raw:
+                if not isinstance(r, dict):
+                    continue
+                rid = str(r.get("id") or "").strip()
+                if not rid:
+                    continue
+                _routines_clean.append({
+                    "id":          rid,
+                    "name":        str(r.get("name") or ""),
+                    "iterations":  int(r.get("iterations") or 1),
+                    "operation_indices":     list(r.get("operation_indices") or []),
+                    "step_indices_per_iter": list(r.get("step_indices_per_iter") or []),
+                    "per_iteration_deltas":  list(r.get("per_iteration_deltas") or []),
+                    "single_iteration_signature": dict(r.get("single_iteration_signature") or {}),
+                })
         program = {
             "id":          slug,
             "name":        name,
@@ -7010,6 +7275,7 @@ if FASTAPI_AVAILABLE:
             "tags":        tags_in,
             "config":      cfg_in,
             "steps":       steps,
+            "routines":    _routines_clean,
             "cell_id":     body.get("cell_id") or None,
             "source":      source,
             "created":     ts,
@@ -7043,6 +7309,22 @@ if FASTAPI_AVAILABLE:
         if not prog.get("source"):
             prog["source"] = _infer_source(prog)
         prog["has_taught_poses"] = _has_taught_poses(prog)
+        # Rev normalisation — client always gets a numeric rev, never
+        # None. Read authoritative rev from _prog_revs (seeded from
+        # disk at startup + updated by every _bump_prog_rev). Programs
+        # that have never been mutated report 0, not None, so client-
+        # side ev.rev > cp.rev comparisons behave predictably.
+        with _prog_event_lock:
+            authoritative = _prog_revs.get(prog_id)
+        if authoritative is None:
+            # First read of a program the seeder didn't cover; seed
+            # from the file's own rev (or 0) so subsequent broadcasts
+            # + bumps stay consistent.
+            authoritative = int(prog.get("rev") or 0)
+            with _prog_event_lock:
+                _prog_revs[prog_id] = max(
+                    authoritative, _prog_revs.get(prog_id, 0))
+        prog["rev"] = int(authoritative)
         return prog
 
     @app.put("/api/programs/{prog_id}")
@@ -7098,7 +7380,7 @@ if FASTAPI_AVAILABLE:
         # move_home drift check on the merged view (same threshold as
         # POST and program_ops FIX C).
         home_warnings_put = _validate_move_home_consistency(merged_steps)
-        for k in ("name", "description", "tags", "config", "steps", "cell_id"):
+        for k in ("name", "description", "tags", "config", "steps", "cell_id", "routines"):
             if k in body:
                 prog[k] = body[k]
         # id is owned by the filename — never let a client change it.

@@ -27,6 +27,16 @@ const FRONT_OPTIONS = [
   { label: '←', angle: 270 },
 ]
 
+const OP_COLORS = {
+  pick:          '#2563EB',
+  place:         '#16A34A',
+  palletize:     '#D97706',
+  depalletize:   '#D97706',
+  pick_and_place:'#2563EB',
+  machine_tend:  '#7C3AED',
+  sort:          '#DB2777',
+}
+
 // ── 3D model loaded from STL ─────────────────────────────────────────
 
 function PartModel3D({ url, rotation, frontAngle, onFaceClick }) {

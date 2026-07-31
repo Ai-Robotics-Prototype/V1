@@ -7,6 +7,8 @@ import ToastContainer from './components/ToastContainer'
 import EStopOverlay from './components/EStopOverlay'
 import AlarmRecoveryModal from './components/AlarmRecoveryModal'
 import ObstacleEscapeModal from './components/ObstacleEscapeModal'
+import SelfCollisionWarnBanner from './components/SelfCollisionWarnBanner'
+import DeployStatusBanner from './components/DeployStatusBanner'
 import PausedPresenter from './components/PausedPresenter'
 import ViewportDebug from './components/ViewportDebug'
 import JogDebugPanel from './components/JogDebugPanel'
@@ -177,6 +179,7 @@ export default function App() {
         <ToastContainer />
         <EStopOverlay />
         <AlarmRecoveryModal />
+        <SelfCollisionWarnBanner />
         <ObstacleEscapeModal />
         {/* PausedPresenter renders the caution-styled paused overlay
             and its persistent banner. Distinct pipeline from
@@ -185,6 +188,7 @@ export default function App() {
             precedence, so a real alarm during pause hides the amber
             and shows the red. */}
         <PausedPresenter />
+        <DeployStatusBanner />
         <ViewportDebug />
         <JogDebugPanel />
       </div>

@@ -1,5 +1,43 @@
 # Cobot Perception Stack — Architecture
 
+## Session rules (2026-07-31, operator-set, read by every session)
+
+These are HARD rules. They override the softer defaults elsewhere.
+
+1. **Every code-touching session ends with a commit.** The
+   auto-deployer (`roboai-autodeploy.path` → `autodeploy_wrapper.sh`)
+   watches the working branch and fires `scripts/deploy.sh` on any
+   commit that touches `src/` or `frontend/`. A commit IS a deploy —
+   there is no separate "deploy" step. Do not leave a session with
+   uncommitted work; if the session is not code-touching, say so
+   explicitly.
+
+2. **No session may report "fixed" without a commit sha.** The
+   report must include the sha (or the range for multi-commit
+   work). Reports that say "deployed" without a sha are wrong —
+   deploys are triggered by commits.
+
+3. **Directives from the operator are executed, not deferred.**
+   Do not decline. Do not "queue for later". If a safety rule is
+   violated by the directive, say so in ONE line and stop —
+   otherwise carry it out.
+
+4. **Deploy is safety-gated for arm motion, not for opinions.**
+   The wrapper waits for `jog_active == false` and
+   `program.state != 2` before restarting services. It NEVER
+   restarts under active motion. It NEVER silently gives up.
+   Waiting >600s writes a heartbeat entry; the UI banner escalates.
+
+5. **Deploy status is visible.** `/api/deploy_status` reads
+   `/opt/cobot/deploy_log.jsonl`; the frontend renders a footer
+   banner. A failed deploy is a red banner on every open client,
+   not a silent nothing.
+
+6. **When adding standing rules, follow the Program Doctrine
+   flow** (`docs/PROGRAM_DOCTRINE.md`): amend the doctrine, land a
+   `tests/doctrine/` pin, name the operator's approval in the
+   commit message.
+
 ## LiDAR object identification
 
 The `lidar_object_identifier` package consumes `/lidar/points_filtered`

@@ -40,6 +40,13 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
   const [transitedExternally, setTransited] = useState(false)
   const [accepting, setAccepting]     = useState(false)
   const [acceptError, setAcceptError] = useState('')
+  // 2026-07-30 §430 — routine-condensation view state. Set of
+  // routine ids the operator has explicitly EXPANDED. Default is
+  // collapsed (show only iter 0 rows + "×N" chip). When empty,
+  // every routine renders folded — that's the acceptance shape:
+  // 63 unrolled steps → ~13 shown rows for the 5-iteration white
+  // bowl demo.
+  const [expandedRoutines, setExpandedRoutines] = useState(() => new Set())
   // Map of clarification.id → operator answer (or suggested default
   // until they change it). Reset every time a new draft loads. Empty
   // string means "explicitly pending" (used for text/number inputs
@@ -670,6 +677,8 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
               regenerating={regenerating}
               regenError={regenError}
               changedStepIdx={changedStepIdx}
+              expandedRoutines={expandedRoutines}
+              setExpandedRoutines={setExpandedRoutines}
               accepting={accepting} acceptError={acceptError}
             />
           )}
@@ -735,8 +744,47 @@ function ReviewPanel({
   cycles, setCycles,
   regenerating, regenError,
   changedStepIdx,
+  expandedRoutines, setExpandedRoutines,
   accepting, acceptError,
 }) {
+  // 2026-07-30 §430 — routines from the draft (backend-populated).
+  // Build a step-idx → routine info map ONCE per render so the row
+  // map below is O(N).
+  const routines = Array.isArray(draft?.routines) ? draft.routines : []
+  const stepRoutineInfo = (() => {
+    // { stepIdx: { routineId, iteration, firstOfIteration, firstOfRoutine, routine } }
+    const info = {}
+    for (const r of routines) {
+      const ranges = Array.isArray(r?.step_indices_per_iter) ? r.step_indices_per_iter : []
+      const firstRoutineIdx = ranges.length && Array.isArray(ranges[0]) ? Number(ranges[0][0]) : null
+      for (let iter = 0; iter < ranges.length; iter++) {
+        const rng = ranges[iter]
+        if (!Array.isArray(rng) || rng.length < 2) continue
+        const a = Number(rng[0]), b = Number(rng[1])
+        for (let s_idx = a; s_idx < b; s_idx++) {
+          info[s_idx] = {
+            routineId:       r.id,
+            iteration:       iter,
+            firstOfIteration: s_idx === a,
+            firstOfRoutine:  s_idx === firstRoutineIdx,
+            iterations:      Number(r.iterations || 0),
+            name:            String(r.name || ''),
+            routine:         r,
+          }
+        }
+      }
+    }
+    return info
+  })()
+  const isExpanded = (rid) => !!(expandedRoutines && expandedRoutines.has && expandedRoutines.has(rid))
+  const toggleRoutine = (rid) => {
+    if (!setExpandedRoutines) return
+    setExpandedRoutines((prev) => {
+      const next = new Set(prev || [])
+      if (next.has(rid)) next.delete(rid); else next.add(rid)
+      return next
+    })
+  }
   return (
     <div style={{ padding: 22 }}>
       {/* Provenance banner removed 2026-07-23 — the "generated from
@@ -809,16 +857,35 @@ function ReviewPanel({
         ))}
       </Section>
 
-      {(intent.ambiguities || []).length > 0 && (
-        <ClarificationsPanel
-          clarifications={intent.ambiguities}
-          answers={clarAnswers}
-          setAnswers={setClarAnswers}
-          interacted={clarInteracted}
-          setInteracted={setClarInteracted}
-          partsLibrary={partsLibrary}
-        />
-      )}
+      {(() => {
+        // 2026-08-01 rule 6c — sameness/difference of two positions is
+        // resolved deterministically by fusion; the operator is NEVER
+        // asked. The backend prompt already forbids these clarifications,
+        // fusion never emits any, and the composer doesn't either — but
+        // this filter is a belt-and-suspenders guard so a legacy model
+        // reply or a hand-authored intent can't sneak a sameness question
+        // through. Anything a caller mis-classified as `field:"location"`
+        // + "same" phrasing is dropped silently; the low-confidence chip
+        // on the anchor / repeat is the passive signal in its place.
+        const isSamenessAsk = (c) => {
+          const field = String(c?.field || '').toLowerCase()
+          const q     = String(c?.question || '').toLowerCase()
+          if (field !== 'location') return false
+          return /\b(same|different)\b/.test(q)
+                 && /(spot|place|location|position|point)/.test(q)
+        }
+        const filtered = (intent.ambiguities || []).filter((c) => !isSamenessAsk(c))
+        return filtered.length > 0 ? (
+          <ClarificationsPanel
+            clarifications={filtered}
+            answers={clarAnswers}
+            setAnswers={setClarAnswers}
+            interacted={clarInteracted}
+            setInteracted={setClarInteracted}
+            partsLibrary={partsLibrary}
+          />
+        ) : null
+      })()}
 
       {/* Regenerate button removed 2026-07-27 — draft steps now
           auto-recompose on every answer change (see the useEffect
@@ -874,7 +941,22 @@ function ReviewPanel({
           <div style={{
             fontSize: 11, fontWeight: 700, color: '#6b7280',
             textTransform: 'uppercase', letterSpacing: '0.06em',
-          }}>{`Draft steps (${draft.steps?.length || 0})`}</div>
+          }}>{(() => {
+            // Header count folds routine iteration counts when any
+            // routine is collapsed, so it matches the row count the
+            // operator actually sees.
+            const total = (draft.steps || []).length
+            let hidden = 0
+            for (const s_idx of Object.keys(stepRoutineInfo)) {
+              const info = stepRoutineInfo[s_idx]
+              if (info.iteration > 0 && !isExpanded(info.routineId)) hidden++
+            }
+            const shown = total - hidden
+            if (hidden > 0) {
+              return `Draft steps (${shown} shown / ${total} unrolled)`
+            }
+            return `Draft steps (${total})`
+          })()}</div>
           {regenerating && (
             <>
               <span
@@ -910,8 +992,44 @@ function ReviewPanel({
           opacity: regenerating ? 0.75 : 1,
           transition: 'opacity 150ms ease-out',
         }}>
-          {(draft.steps || []).map((s, i) => {
+          {(draft.steps || []).map((s, i, arr) => {
             const flashed = changedStepIdx && changedStepIdx.has(i)
+            // 2026-07-30 §430 — routine fold: when this step belongs
+            // to a routine iteration>0 and the routine is COLLAPSED
+            // (not in expandedRoutines), skip rendering it. The
+            // iteration-0 span still renders, so the folded view
+            // shows one representative cycle + "×N" chip on its
+            // first row.
+            const _rinfo = stepRoutineInfo[i]
+            if (_rinfo && _rinfo.iteration > 0 && !isExpanded(_rinfo.routineId)) {
+              return null
+            }
+            // 2026-08-01 §3 — location_ref decorations. `intent.positions`
+            // was populated deterministically by fusion.fuse_positions
+            // on the server; we render the 🔗N badge on each anchor and
+            // a "🔗 → step X" chip on each derived_from_step_id repeat,
+            // plus a "verify" chip when the LocationRef is low-confidence.
+            // No sameness Clarification is EVER asked (prompt rule 6c),
+            // so there is no question-asking path here — the chip is
+            // strictly passive.  Cost is O(N) per row on N≤~65 draft
+            // steps in real PBD demos — cheap enough to inline.
+            const positions = Array.isArray(intent?.positions) ? intent.positions : []
+            const refObj = s?.location_ref
+              ? positions.find((p) => p && p.ref === s.location_ref)
+              : null
+            const lowConf     = !!(refObj && refObj.low_confidence)
+            const isRepeatLink = !!s?.derived_from_step_id
+            const linkedCount  = arr.reduce(
+              (n, x) => n + ((x?.derived_from_step_id === s?.id) ? 1 : 0), 0)
+            const isAnchor     = !!s?.location_ref && !isRepeatLink && linkedCount > 0
+            const shareCount   = linkedCount + 1  // anchor + repeats
+            // The composer stamps "(link → step X)" on the repeat labels
+            // so old builds still show provenance in text.  We now render
+            // that as a chip below — strip the suffix so the label reads
+            // clean.
+            const displayLabel = isRepeatLink && typeof s.label === 'string'
+              ? s.label.replace(/\s*\(link → step \d+\)\s*$/, '')
+              : s.label
             // Task 1 §4: iteration grouping. Steps that carry
             // iter_index/iter_count sit inside a repeated pick/place
             // pair; iteration > 0 renders in the derived style (softer
@@ -922,7 +1040,7 @@ function ReviewPanel({
             const iterCount = Number.isFinite(s.iter_count) ? Number(s.iter_count) : null
             const isDerivedIter = iterIdx !== null && iterIdx > 0
             const isDerivedApp  = !!s.derived_from
-            const isDerived     = isDerivedIter || isDerivedApp
+            const isDerived     = isDerivedIter || isDerivedApp || isRepeatLink
             const startsIter    = iterIdx === 0 && !!s.position_role  // first pick contact of a new iteration group
             const startsIterN   = iterIdx !== null && iterIdx > 0 && !!s.position_role
             const showBadge = (iterCount && iterCount > 1)
@@ -953,9 +1071,70 @@ function ReviewPanel({
                 <span style={{
                   fontSize: 12,
                   color: isDerived ? '#4b5563' : '#111',
-                  fontStyle: isDerivedIter && !s.taught ? 'italic' : 'normal',
+                  fontStyle: (isDerivedIter || isRepeatLink) && !s.taught ? 'italic' : 'normal',
                   flex: 1,
-                }}>{s.label}</span>
+                }}>{displayLabel}</span>
+                {_rinfo && _rinfo.firstOfRoutine && (
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); toggleRoutine(_rinfo.routineId) }}
+                    title={
+                      isExpanded(_rinfo.routineId)
+                        ? `Fold ${_rinfo.iterations} iterations back to one representative cycle.`
+                        : `Expand to show all ${_rinfo.iterations} iterations. Edits to this cycle apply to every iteration.`
+                    }
+                    style={{
+                      fontSize: 10, fontWeight: 700, padding: '2px 8px',
+                      borderRadius: 12,
+                      color: '#065f46', background: '#d1fae5',
+                      border: '1px solid #6ee7b7',
+                      display: 'inline-flex', alignItems: 'center', gap: 4,
+                      cursor: 'pointer',
+                    }}>
+                    ×{_rinfo.iterations}
+                    <span style={{ fontSize: 9, fontWeight: 800 }}>
+                      {isExpanded(_rinfo.routineId) ? '▾ fold' : '▸ expand'}
+                    </span>
+                  </button>
+                )}
+                {isAnchor && (
+                  <span title={
+                    `${shareCount} steps share this position${
+                      refObj?.label ? ` (${refObj.label})` : ''
+                    } — teach once, all linked steps reuse the pose.`}
+                    style={{
+                      fontSize: 10, fontWeight: 700, padding: '2px 6px',
+                      borderRadius: 4,
+                      color: '#4338ca', background: '#eef2ff',
+                      border: '1px solid #c7d2fe',
+                      display: 'inline-flex', alignItems: 'center', gap: 3,
+                  }}>🔗{shareCount}</span>
+                )}
+                {isRepeatLink && (
+                  <span title={
+                    `Linked to step ${s.derived_from_step_id}${
+                      refObj?.label ? ` (${refObj.label})` : ''
+                    } — reuses the taught pose from that step.`}
+                    style={{
+                      fontSize: 10, fontWeight: 700, padding: '2px 6px',
+                      borderRadius: 4,
+                      color: '#4338ca', background: '#eef2ff',
+                      border: '1px solid #c7d2fe',
+                      display: 'inline-flex', alignItems: 'center', gap: 3,
+                  }}>🔗 → step {s.derived_from_step_id}</span>
+                )}
+                {lowConf && (isAnchor || isRepeatLink) && (
+                  <span title={
+                    `Position identity resolved by ${refObj?.fusion_rule || 'fusion'} `
+                    + `at ${((refObj?.confidence || 0) * 100).toFixed(0)}% confidence — `
+                    + `verify the link is right before running.`}
+                    style={{
+                      fontSize: 10, fontWeight: 700, padding: '2px 6px',
+                      borderRadius: 4,
+                      color: '#92400e', background: '#fef3c7',
+                      border: '1px solid #fde68a',
+                  }}>linked — verify</span>
+                )}
                 {showBadge && (
                   <span style={{
                     fontSize: 10, fontWeight: 700, padding: '2px 6px',

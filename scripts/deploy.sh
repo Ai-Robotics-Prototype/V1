@@ -115,6 +115,38 @@ if [[ -f "$FRONTEND_OUT/index.html" ]]; then
 fi
 
 if [[ $FRONTEND_NEEDS_BUILD -eq 1 ]]; then
+    # Program Doctrine — the operator's standing rules. See
+    # docs/PROGRAM_DOCTRINE.md. This gate runs BEFORE lint + build
+    # because a doctrine failure is a violation of a hard invariant
+    # (D1 derived-never-taught, D3 shown≠emitted-is-a-lie, etc.),
+    # and shipping past it puts the operator's mental model out of
+    # sync with what the app does.
+    step "Program Doctrine (tests/doctrine/)"
+    if ! bash "$WS/scripts/run_doctrine_suite.sh"; then
+        fail "doctrine violated — refusing to build."
+        printf "${RED}════════  DEPLOY: FAIL  ════════${RST}\n"
+        printf "  Fix the doctrine violation(s) above OR amend the rule\n"
+        printf "  (operator approves rule changes — see docs/PROGRAM_DOCTRINE.md).\n"
+        exit 1
+    fi
+    pass "doctrine clean"
+
+    # Lint FIRST — a ReferenceError in JSX (e.g. an undefined
+    # identifier accidentally referenced in render scope) is a
+    # build-time catchable, not a runtime discovery. The 2026-07-31
+    # `palletFrameStatus` incident shipped because vite tolerates
+    # undefined identifiers at build time; ESLint's `no-undef` does
+    # not. Fail the deploy on ANY lint error before we bother
+    # running vite.
+    step "npm run lint"
+    if ! ( cd "$FRONTEND_SRC" && npm run lint 2>&1 | tail -20 ); then
+        fail "eslint reported errors — refusing to build."
+        printf "${RED}════════  DEPLOY: FAIL  ════════${RST}\n"
+        printf "  Fix the lint errors above and re-run scripts/deploy.sh.\n"
+        exit 1
+    fi
+    pass "eslint clean"
+
     step "npm run build"
     ( cd "$FRONTEND_SRC" && npm run build 2>&1 | tail -8 )
     pass "vite build complete"

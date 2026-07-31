@@ -14,10 +14,18 @@ module.exports = {
     es2022: true,
     node: true,
   },
+  // Vite-injected defines (see vite.config.js `define:` block). Listed
+  // here so `no-undef` doesn't false-flag them.
+  globals: {
+    __COMMIT__:     'readonly',
+    __BUILD_TIME__: 'readonly',
+    __BUILD_ID__:   'readonly',
+  },
   plugins: ['react-hooks'],
   rules: {
     'react-hooks/rules-of-hooks': 'error',
     'react-hooks/exhaustive-deps': 'warn',
+    'no-undef': 'error',
   },
   ignorePatterns: ['build/', 'node_modules/', '../mock_server/static/**'],
 }

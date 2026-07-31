@@ -5,6 +5,8 @@ import { useStore } from '../store/useStore'
 export default function SafetyPage() {
   const safety = useStore((s) => s.safety)
   const { zone, human_proximity, speed_scale, estop } = safety
+  const bannerEnabled = useStore((s) => s.selfCollisionBannerEnabled)
+  const setBannerEnabled = useStore((s) => s.setSelfCollisionBannerEnabled)
 
   const RING_RADII  = [1.2, 0.6, 0.3]
   const RING_COLORS = ['#22C55E', '#EAB308', '#EF4444']
@@ -71,6 +73,41 @@ export default function SafetyPage() {
           <div style={{ fontWeight: 700, fontSize: 15, color: estop ? 'var(--red)' : 'var(--green)' }}>
             {estop ? 'ACTIVE' : 'Clear'}
           </div>
+        </div>
+      </div>
+
+      {/* Self-collision presentation preferences — banner LAYER
+          only. The stop-zone modal is NOT behind this toggle: it's
+          the last line of defense and always fires. See
+          lib/collisionPresentation for the split. */}
+      <div
+        data-testid="self-collision-warning-toggle"
+        style={{
+          marginTop: 24, padding: '10px 14px',
+          background: '#111827', border: '1px solid #1f2937',
+          borderRadius: 6, color: '#e5e7eb', fontSize: 13,
+          display: 'flex', alignItems: 'center', gap: 12,
+          maxWidth: 520,
+        }}>
+        <label style={{
+          display: 'flex', alignItems: 'center', gap: 10,
+          cursor: 'pointer', userSelect: 'none',
+        }}>
+          <input
+            type="checkbox"
+            checked={bannerEnabled}
+            onChange={(e) => setBannerEnabled(e.target.checked)}
+            style={{ width: 16, height: 16, cursor: 'pointer' }}
+          />
+          <span style={{ fontWeight: 700 }}>
+            Self-collision warnings: {bannerEnabled ? 'on' : 'off'}
+          </span>
+        </label>
+        <div style={{
+          flex: 1, fontSize: 11, color: '#9ca3af', lineHeight: 1.45,
+        }}>
+          Non-blocking warn-zone banner. The stop-zone modal + motion
+          block are <b>not</b> affected by this toggle.
         </div>
       </div>
     </div>

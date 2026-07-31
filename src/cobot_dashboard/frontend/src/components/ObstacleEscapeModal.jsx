@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useStore } from '../store/useStore'
+import { presentDecision } from '../lib/collisionPresentation'
 
 // Escape-guidance popup for arm-vs-environment (and self / ground) proximity.
 //
@@ -109,8 +110,21 @@ export default function ObstacleEscapeModal() {
   const [flashClearUntil, setFlashClearUntil] = useState(0)
   const prevInStop = useRef(false)
 
-  const inStop = env_min_mm != null && env_stop_mm != null
-                 && env_min_mm <= env_stop_mm
+  // Route through the shared presentation resolver — same rule the
+  // banner reads, so a drag-active session (or any future flag)
+  // that flips modal→banner in the stop zone doesn't need a
+  // second edit here. Toggle + per-pair mute deliberately do NOT
+  // gate the modal (see collisionPresentation docstring: modal is
+  // the last line of defense).
+  const dragActive = !!robot.drag_active
+  const decision = presentDecision({
+    distMm: env_min_mm, warnMm: env_warn_mm, stopMm: env_stop_mm,
+    pair: env_pair,
+    pairMuted: false,      // never mute the stop-zone modal
+    bannerOn: true,        // never hide the stop-zone modal via toggle
+    dragActive,
+  })
+  const inStop = decision.show === 'modal'
   const isJogCapable = !!enabled && !alarm && !safety?.estop
 
   useEffect(() => {
@@ -260,9 +274,156 @@ export default function ObstacleEscapeModal() {
               blocks any motion that closes clearance further — the buttons above are the only
               directions currently proven to open it.
             </div>
+
+            {/* Operator override — 2026-07-31 directive. The
+                operator standing at the cell outranks the geometry
+                model. Held press (1.5s) dismisses the modal so the
+                normal jog controls come back; the decision is
+                logged to a session ring for the audit trail. The
+                driver's motion-block stays in effect until the
+                operator picks a direction that either opens the
+                pair OR uses the 3% fallback. */}
+            <OverrideAffordance
+              pair={env_pair}
+              distMm={env_min_mm}
+              stopMm={env_stop_mm}
+              onOverride={(entry) => {
+                logOverride(entry)
+                setSessionActive(false)
+              }}
+            />
           </div>
         )}
       </div>
+    </div>
+  )
+}
+
+// Session-local override log — the audit trail for every "operator
+// dismissed the stop-zone modal" decision. Non-persistent; access
+// via window._collisionOverrideLog in devtools.
+if (typeof window !== 'undefined' && !window._collisionOverrideLog) {
+  window._collisionOverrideLog = []
+}
+function logOverride(entry) {
+  try {
+    if (typeof window === 'undefined') return
+    if (!window._collisionOverrideLog) window._collisionOverrideLog = []
+    window._collisionOverrideLog.push({
+      ts:      new Date().toISOString(),
+      pair:    entry.pair,
+      dist_mm: entry.distMm,
+      stop_mm: entry.stopMm,
+    })
+    // Cap at 64 entries — session ring.
+    const buf = window._collisionOverrideLog
+    if (buf.length > 64) buf.splice(0, buf.length - 64)
+  } catch (_) { /* ignore */ }
+}
+
+// Held-press override control. Fires onOverride only after the
+// button is held for OVERRIDE_HOLD_MS. Visual: a progress ring
+// that fills during the press so the operator sees the commitment.
+const OVERRIDE_HOLD_MS = 1500
+
+function OverrideAffordance({ pair, distMm, stopMm, onOverride }) {
+  const [progress, setProgress] = useState(0)   // 0..1
+  const [confirmed, setConfirmed] = useState(false)
+  const rafRef = useRef(0)
+  const startRef = useRef(0)
+
+  const cancel = useCallback(() => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    rafRef.current = 0
+    startRef.current = 0
+    if (!confirmed) setProgress(0)
+  }, [confirmed])
+
+  const tick = useCallback(() => {
+    const elapsed = performance.now() - startRef.current
+    const p = Math.min(1, elapsed / OVERRIDE_HOLD_MS)
+    setProgress(p)
+    if (p >= 1) {
+      setConfirmed(true)
+      // Log + dismiss on the next frame so the operator sees the
+      // ring hit 100%.
+      setTimeout(() => {
+        try {
+          onOverride({ pair, distMm, stopMm })
+        } catch (_) { /* nop */ }
+      }, 120)
+      return
+    }
+    rafRef.current = requestAnimationFrame(tick)
+  }, [onOverride, pair, distMm, stopMm])
+
+  const start = useCallback(() => {
+    if (confirmed) return
+    startRef.current = performance.now()
+    rafRef.current = requestAnimationFrame(tick)
+  }, [tick, confirmed])
+
+  return (
+    <div
+      data-testid="collision-override-affordance"
+      style={{
+        marginTop: 4,
+        padding: '10px 12px',
+        background: '#1F2937',
+        borderRadius: 8,
+        display: 'flex', alignItems: 'center', gap: 12,
+      }}>
+      <div style={{
+        flex: 1,
+        color: '#F3F4F6',
+        fontSize: 12, lineHeight: 1.5,
+      }}>
+        <div style={{ fontWeight: 700, marginBottom: 2 }}>
+          Operator override
+        </div>
+        <div style={{ color: '#9CA3AF' }}>
+          You can see the arm. Hold the button to dismiss this popup
+          — recorded for the audit trail. The driver&apos;s motion-block
+          stays in effect until you jog.
+        </div>
+      </div>
+      <button
+        data-testid="collision-override-hold"
+        onMouseDown={start}
+        onMouseUp={cancel}
+        onMouseLeave={cancel}
+        onTouchStart={(e) => { e.preventDefault(); start() }}
+        onTouchEnd={cancel}
+        onTouchCancel={cancel}
+        disabled={confirmed}
+        style={{
+          position: 'relative',
+          minWidth: 180,
+          height: 48,
+          borderRadius: 8,
+          background: confirmed ? '#065F46' : '#374151',
+          color: '#FFF',
+          border: '2px solid #6B7280',
+          fontSize: 13, fontWeight: 700,
+          cursor: confirmed ? 'default' : 'pointer',
+          overflow: 'hidden',
+          userSelect: 'none',
+        }}>
+        {/* Progress fill */}
+        <div style={{
+          position: 'absolute', left: 0, top: 0, bottom: 0,
+          width: `${progress * 100}%`,
+          background: confirmed ? '#059669' : '#DC2626',
+          transition: 'width 40ms linear',
+        }} />
+        <span style={{ position: 'relative', zIndex: 1 }}>
+          {confirmed
+            ? '✓ Overridden'
+            : progress > 0
+              ? `Hold — ${Math.ceil((OVERRIDE_HOLD_MS - progress * OVERRIDE_HOLD_MS) / 100) / 10}s`
+              : 'Override — I can see the arm'}
+        </span>
+      </button>
     </div>
   )
 }

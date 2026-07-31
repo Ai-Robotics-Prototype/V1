@@ -17,6 +17,24 @@ const state = {
   listeners: new Set(),
   session:   null,
   wsGaps:    [],   // {t, gap_ms} — inter-message spacing on /ws/state
+  // ── ALWAYS-ON jog-stop cause ring (2026-07-31) ────────────────
+  // The main telemetry ring (events / intervals / wsGaps) is gated
+  // behind JOG_DEBUG for cost reasons. The stop ring is NOT — every
+  // jog stop must be logged with its cause regardless, so bench
+  // testing "why did the hold die?" doesn't require flipping a flag
+  // first. Each entry:
+  //   {ts, cause, extras}
+  // where `cause` is one of the operator taxonomy:
+  //   pointer_up | pointer_cancel | blur | visibility |
+  //   ws_drop | keepalive_timeout | server_gate | disabled |
+  //   pagehide | unmount | pointer_leave | server_reject
+  //
+  // Capped at 200 in-memory; every push also POSTs (best-effort)
+  // to /api/jog_stop_log so bench tooling can query the server-
+  // side aggregate across tabs. The POST is fire-and-forget; a
+  // failure means the ring lives only on the client.
+  stops:     [],
+  MAX_STOPS: 200,
 }
 
 function isEnabled() {
@@ -91,6 +109,66 @@ export function pushWsGap(gap_ms) {
   }
   bump()
 }
+
+// Always-on jog-stop taxonomy. Records the cause of every jog stop
+// with a wall-clock timestamp so bench tooling can build the cause
+// distribution the operator directive asks for. NEVER gated on
+// JOG_DEBUG.
+//
+// The recognized causes match the operator taxonomy exactly:
+//   pointer_up      — operator lifted finger
+//   pointer_cancel  — OS/browser cancelled the pointer stream
+//   pointer_leave   — pointer drifted off the button (rare with capture)
+//   blur            — window lost focus
+//   visibility      — tab hidden or pagehide
+//   ws_drop         — WebSocket connection dropped
+//   keepalive_timeout — driver freshness deadman fired
+//   server_gate     — driver refused (allow_jog / alarm / safety)
+//   server_reject   — driver rejected the specific frame
+//   disabled        — parent flipped disabled=true (WS or gate)
+//   unmount         — component unmounted mid-hold
+export function pushJogStop(cause, extras = {}) {
+  const now = (typeof performance !== 'undefined')
+    ? performance.now() : Date.now()
+  const entry = {
+    ts:      Date.now(),
+    perf_ts: now,
+    cause:   String(cause || 'unknown'),
+    ...extras,
+  }
+  state.stops.push(entry)
+  if (state.stops.length > state.MAX_STOPS) {
+    state.stops.splice(0, state.stops.length - state.MAX_STOPS)
+  }
+  bump()
+  // Best-effort server-side aggregate. Bench script reads via
+  // GET /api/jog_stop_log to see EVERY tab's stops in one place.
+  if (typeof fetch !== 'undefined') {
+    try {
+      fetch('/api/jog_stop_log', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(entry),
+        keepalive: true,
+      }).catch(() => { /* silent — client ring is authoritative */ })
+    } catch { /* nop */ }
+  }
+}
+
+// Devtools access — every tab exposes its stop ring via this global
+// so the operator can inspect from the browser console without
+// touching the dashboard's Zustand store.
+if (typeof window !== 'undefined') {
+  Object.defineProperty(window, '_jogStopLog', {
+    get() { return state.stops.slice() },
+    configurable: true,
+  })
+}
+
+export function jogStopLogSnapshot() {
+  return state.stops.slice()
+}
+
 
 export function startJogSession(label = '') {
   if (!isEnabled()) return null

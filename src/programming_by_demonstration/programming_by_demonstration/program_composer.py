@@ -22,7 +22,7 @@ later when the robot is present.
 from __future__ import annotations
 
 import json as _json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .schema import (
     AVAILABLE_OPERATIONS,
@@ -518,11 +518,17 @@ def _effector_disengage(op: IntentOperation) -> List[Dict[str, Any]]:
 #     → grip_release → retreat-place (derived, +appH)
 
 def _build_pick_and_place(op: IntentOperation, appH: int,
-                          spd: int, slow: int, medium: int) -> List[Dict[str, Any]]:
+                          spd: int, slow: int, medium: int) -> Tuple[List[Dict[str, Any]], List[List[int]]]:
     """Emit N pick/place iterations. count=1 → bit-identical to the
     pre-unroll shape (load-bearing back-compat guarantee). count>1 →
     the pair body is emitted N times, with iteration >0 poses derived
     per pick_pattern / place_pattern.
+
+    Returns (steps, iter_ranges) where iter_ranges[i] = [start, end)
+    within the returned steps slice for iteration i. iter_ranges is
+    used by routine_detector.decorate_steps for the single-op
+    multi-iteration routine case; it's empty when n<=1 since the
+    routine detector doesn't group unit-count ops (§430).
 
     Role names stay 'pick' / 'place' across all iterations — the codegen
     nearest-anchor resolver (program_ops._resolve_anchor_step) picks the
@@ -543,9 +549,17 @@ def _build_pick_and_place(op: IntentOperation, appH: int,
         n = max(n, op.pallet_place.total_slots())
     s: List[Dict[str, Any]] = []
     s.extend(_effector_ready(op, spd))
+    iter_ranges: List[List[int]] = []
     for i in range(n):
+        _iter_start = len(s)
         _extend_one_pair(s, op, i, n, appH, spd, slow, medium)
-    return s
+        iter_ranges.append([_iter_start, len(s)])
+    # Single-iteration ops don't need range tracking — the routine
+    # detector treats count=1 as flat and decorate_steps writes
+    # nothing.
+    if n <= 1:
+        iter_ranges = []
+    return s, iter_ranges
 
 
 def _iter_label(base: str, i: int, n: int, part_name: str) -> str:
@@ -721,7 +735,7 @@ def _build_sort(op: IntentOperation, appH: int,
     """Sort = pick + place-by-type. Same body as pick_and_place; the
     place-contact step gets a `sort_bin_hint` from the intent's place
     location for the operator to verify later."""
-    s = _build_pick_and_place(op, appH, spd, slow, medium)
+    s, _iter_ranges = _build_pick_and_place(op, appH, spd, slow, medium)
     for step in s:
         if step.get('position_role') == 'place':
             step['sort_bin_hint'] = op.place.location_hint
@@ -944,13 +958,25 @@ def compose_program_draft(intent: StructuredIntent,
     # Recorded as `steps` grows so decorate_steps knows exactly
     # which slice of the flat step list belongs to each source op.
     op_step_ranges: List[tuple] = []
+    # 2026-07-30 §430 — for single-op multi-iter routines, we also
+    # need per-iteration ranges INSIDE the op's slice so
+    # decorate_steps can stamp routine_iteration per iteration.
+    # Only pick_and_place expansion produces multi-iter shape today
+    # (sort/machine_tend inherit the same builder; palletize is a
+    # single-op single-slice shape by design). Keyed by op_index.
+    op_iter_ranges: Dict[int, List[List[int]]] = {}
 
     for op_index, op in enumerate(sorted_ops):
         _start = len(steps)
         if op.operation_type == 'pick_and_place':
-            steps.extend(_tag_ops_steps(
-                _build_pick_and_place(op, appH, spd, slow, medium),
-                op, op_index))
+            _pnp_steps, _pnp_iters = _build_pick_and_place(op, appH, spd, slow, medium)
+            steps.extend(_tag_ops_steps(_pnp_steps, op, op_index))
+            if _pnp_iters:
+                # Shift the iter_ranges (which are relative to the
+                # op-local slice) into absolute step-list coordinates.
+                op_iter_ranges[op_index] = [
+                    [_start + a, _start + b] for (a, b) in _pnp_iters
+                ]
         elif op.operation_type == 'sort':
             steps.extend(_tag_ops_steps(
                 _build_sort(op, appH, spd, slow, medium), op, op_index))
@@ -1002,7 +1028,8 @@ def compose_program_draft(intent: StructuredIntent,
     # test_routine_grouped_lua_bytediff proves emitted Lua matches.
     from .routine_detector import decorate_steps, detect_routines
     routines = detect_routines(intent)
-    decorate_steps(steps, routines, op_step_ranges)
+    decorate_steps(steps, routines, op_step_ranges,
+                   op_iter_ranges=op_iter_ranges)
 
     numbered = [{**s, 'step': i + 1} for i, s in enumerate(steps)]
 

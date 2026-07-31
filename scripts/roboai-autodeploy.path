@@ -1,0 +1,34 @@
+# roboai-autodeploy.path — systemd path unit that fires the auto-
+# deployer whenever the working branch's HEAD advances.
+#
+# Watches the .git/HEAD file's mtime + the loose ref file for the
+# active branch. Any git commit touches one of these, which is
+# what path units detect. Combined with PathModified, each commit
+# triggers exactly ONE service invocation.
+#
+# Install:
+#   sudo cp scripts/roboai-autodeploy.path    /etc/systemd/system/
+#   sudo cp scripts/roboai-autodeploy.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now roboai-autodeploy.path
+#
+# Uninstall (temporary — this violates the "no skip" directive
+# unless the operator explicitly says so):
+#   sudo systemctl disable --now roboai-autodeploy.path
+
+[Unit]
+Description=RoboAi auto-deploy path watcher
+Documentation=file:///home/teddy/cobot_ws/scripts/autodeploy_wrapper.sh
+
+[Path]
+# The commit itself updates .git/HEAD's reflog + the branch ref
+# file. Watch the whole .git dir so branch switches + commits both
+# trigger. MakeDirectory is off because .git already exists.
+PathChanged=/home/teddy/cobot_ws/.git/HEAD
+PathChanged=/home/teddy/cobot_ws/.git/refs/heads
+# Trigger the service by name (systemd derives ".service" from the
+# stem when Unit= is not set — but be explicit anyway).
+Unit=roboai-autodeploy.service
+
+[Install]
+WantedBy=multi-user.target

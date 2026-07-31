@@ -3511,6 +3511,16 @@ def codegen_lua_from_program(
     # emit any wire-invented verb — see the run-confirm modal's
     # PAYLOAD_INFO_ONLY line for where the operator sets the matching
     # preset on the controller.
+    #
+    # FACTORY-UI SHOPPING LIST (2026-07-31):
+    #   * setPayload — open the Factory UI's doc panel / insert-form
+    #     to resolve the ("") string argument format. When resolved,
+    #     "declare carried mass at grip/release" becomes a codegen
+    #     emission (grip → setPayload(<carried_mass>); release →
+    #     setPayload(<tool_only>)), and the dashboard's Tool & Payload
+    #     panel becomes that emission's source of truth for mass.
+    #     Until then, the payload_kg header line below is the only
+    #     surface — no wire emission.
     payload_kg = cfg.get('payload_kg')
     try:
         pkg = float(payload_kg) if payload_kg not in (None, '') else None

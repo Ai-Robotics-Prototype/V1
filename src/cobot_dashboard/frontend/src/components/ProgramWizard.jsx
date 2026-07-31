@@ -6,6 +6,7 @@ import * as THREE from 'three'
 import { useStore } from '../store/useStore'
 import { HoldButton } from './JogControls'
 import NumericField from './NumericField'
+import PalletFrameDiagram from './PalletFrameDiagram'
 import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
 import { effectorReady, effectorEngage, effectorDisengage,
          effectorOf,
@@ -950,151 +951,6 @@ function teachPositionsForAnswers(answers) {
   return positions
 }
 
-// Pallet diagram shown alongside each pallet-frame teach step so
-// the operator sees WHICH point they're teaching and WHERE it is
-// on the pallet. v2 (2026-07-30) uses four points:
-//   ① CORNER at [1,1]              — fixture corner marker
-//   ② CORNER at [1,N] (row far)    — fixture corner marker + row arrow
-//   ③ CORNER at [M,1] (col far)    — fixture corner marker + col arrow
-//   ④ FIRST PART at [1,1]          — part icon in the slot cell
-//
-// The diagram updates as Teach All advances — the operator always
-// sees which point they're teaching and its position on the pallet.
-function PalletFrameDiagram({ role, rows, cols, fillOrder }) {
-  const R = Math.max(1, Math.min(20, rows || 4))
-  const C = Math.max(1, Math.min(20, cols || 4))
-  const cell = 28
-  const pad = 24
-  const width  = pad * 2 + C * cell
-  const height = pad * 2 + R * cell
-  const cellCenter = (r, c) => [pad + c * cell + cell / 2,
-                                pad + r * cell + cell / 2]
-  // ① at (0,0) — pallet corner   ② at (0, C-1) — row-far corner
-  // ③ at (R-1, 0) — col-far corner   ④ inside cell (0,0)
-  const [c1x, c1y] = [pad, pad]                                    // corner
-  const [c2x, c2y] = [pad + C * cell, pad]                         // corner
-  const [c3x, c3y] = [pad, pad + R * cell]                         // corner
-  const [partCX, partCY] = cellCenter(0, 0)                        // cell center
-  // Which grid cell (if any) pulses on this step — for c1/c2/c3
-  // we highlight the anchor cell adjacent to the corner marker;
-  // for the part step we highlight cell [0,0] and draw the part.
-  const highlightCell = role === 'pallet_c1'   ? [0, 0]
-                      : role === 'pallet_c2'   ? [0, C - 1]
-                      : role === 'pallet_c3'   ? [R - 1, 0]
-                      : role === 'pallet_part' ? [0, 0]
-                      : null
-  const cornerDot = (cx, cy, active) => (
-    <>
-      <circle cx={cx} cy={cy} r={active ? 7 : 5}
-        fill={active ? '#2563EB' : '#94a3b8'}
-        stroke={active ? '#1e3a8a' : '#64748b'}
-        strokeWidth={active ? 2 : 1}>
-        {active && (
-          <animate attributeName="r"
-            values={`${7};${9};${7}`} dur="1.2s"
-            repeatCount="indefinite" />
-        )}
-      </circle>
-    </>
-  )
-  const arrowColor = '#2563EB'
-  const gray       = '#94a3b8'
-  return (
-    <div style={{
-      marginTop: 10, padding: 10,
-      background: '#f8fafc', border: '1px solid #e5e7eb',
-      borderRadius: 6, display: 'flex', gap: 14, alignItems: 'center',
-    }}>
-      <svg width={width} height={height} style={{ flexShrink: 0 }}>
-        {/* Grid cells */}
-        {Array.from({ length: R }).map((_, ri) =>
-          Array.from({ length: C }).map((_, ci) => {
-            const isTarget = highlightCell
-              && highlightCell[0] === ri && highlightCell[1] === ci
-            return (
-              <rect key={`${ri}-${ci}`}
-                x={pad + ci * cell} y={pad + ri * cell}
-                width={cell - 2} height={cell - 2} rx={3}
-                fill={isTarget ? '#dbeafe' : '#ffffff'}
-                stroke={isTarget ? '#2563EB' : '#e5e7eb'}
-                strokeWidth={isTarget ? 2 : 1}>
-                {isTarget && role !== 'pallet_part' && (
-                  <animate attributeName="opacity"
-                    values="1;0.65;1" dur="1.2s"
-                    repeatCount="indefinite" />
-                )}
-              </rect>
-            )
-          })
-        )}
-        {/* Corner markers — dots at pallet fixture corners */}
-        {cornerDot(c1x, c1y, role === 'pallet_c1')}
-        {cornerDot(c2x, c2y, role === 'pallet_c2')}
-        {cornerDot(c3x, c3y, role === 'pallet_c3')}
-        {/* Corner labels */}
-        <text x={c1x - 8} y={c1y - 8} fontSize={11} fontWeight={700}
-          fill={role === 'pallet_c1' ? '#1e3a8a' : gray}
-          textAnchor="end">①</text>
-        <text x={c2x + 8} y={c2y - 8} fontSize={11} fontWeight={700}
-          fill={role === 'pallet_c2' ? '#1e3a8a' : gray}>②</text>
-        <text x={c3x - 8} y={c3y + 12} fontSize={11} fontWeight={700}
-          fill={role === 'pallet_c3' ? '#1e3a8a' : gray}
-          textAnchor="end">③</text>
-        {/* Directional arrows on the outside of the grid */}
-        {role === 'pallet_c2' && (
-          <line x1={c1x} y1={c1y - 14} x2={c2x} y2={c2y - 14}
-            stroke={arrowColor} strokeWidth={2} markerEnd="url(#arrp)" />
-        )}
-        {role === 'pallet_c3' && (
-          <line x1={c1x - 14} y1={c1y} x2={c3x - 14} y2={c3y}
-            stroke={arrowColor} strokeWidth={2} markerEnd="url(#arrp)" />
-        )}
-        {/* Part-position teach: render a stylised part shape in cell [0,0] */}
-        {role === 'pallet_part' && (
-          <g>
-            <circle cx={partCX} cy={partCY} r={cell / 2 - 5}
-              fill="#fde68a" stroke="#b45309" strokeWidth={2}>
-              <animate attributeName="opacity"
-                values="1;0.7;1" dur="1.2s"
-                repeatCount="indefinite" />
-            </circle>
-            <text x={partCX} y={partCY + 4} fontSize={11} fontWeight={700}
-              fill="#7c2d12" textAnchor="middle">④</text>
-          </g>
-        )}
-        {/* Arrow marker def */}
-        <defs>
-          <marker id="arrp" viewBox="0 0 10 10" refX="9" refY="5"
-            markerWidth="6" markerHeight="6" orient="auto">
-            <path d="M0,0 L10,5 L0,10 Z" fill={arrowColor} />
-          </marker>
-        </defs>
-      </svg>
-      <div style={{ fontSize: 12, color: '#374151', lineHeight: 1.5, flex: 1 }}>
-        <div style={{ fontWeight: 700, marginBottom: 4, color: '#111827' }}>
-          {role === 'pallet_c1'   ? '① Corner at slot [1,1]'
-            : role === 'pallet_c2' ? '② Corner at end of row [1,N]'
-            : role === 'pallet_c3' ? '③ Corner at end of column [M,1]'
-            : '④ First part in slot [1,1]'}
-        </div>
-        <div>
-          {role === 'pallet_c1'
-            ? 'Touch the pallet corner (fixture reference).'
-            : role === 'pallet_c2'
-            ? 'Touch the corner at the far end of the first row.'
-            : role === 'pallet_c3'
-            ? 'Touch the corner at the far end of the first column.'
-            : 'Place a real part in slot [1,1] and teach the tool contact.'}
-        </div>
-        {fillOrder && (
-          <div style={{ fontSize: 10, color: '#6b7280', marginTop: 6 }}>
-            Fill order: {fillOrder}
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
 
 
 function ProgressDots({ count, currentIdx, statuses }) {
@@ -2485,6 +2341,10 @@ const PAGES = [
       const kg = answers.payload_kg
       const kgNum = Number(kg)
       const canProceed = kg === 'skip' || (Number.isFinite(kgNum) && kgNum > 0)
+      // render() is always invoked from the wizard's <PageHost> as a
+      // component, so hook order stays stable. Rule flags the lowercase
+      // property name only.
+      // eslint-disable-next-line react-hooks/rules-of-hooks
       const [showCog, setShowCog] = useState(false)
       const cog = answers.payload_cog_mm || {}
       return (

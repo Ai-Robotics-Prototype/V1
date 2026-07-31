@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { pushWsGap as _pushWsGap } from '../lib/jogTelemetry'
+import { pushWsGap as _pushWsGap, pushJogStop }
+  from '../lib/jogTelemetry'
 
 const HOST = typeof window !== 'undefined' ? window.location.host : 'localhost:8080'
 const WS_PROTO =
@@ -33,6 +34,45 @@ const storeDefinition = (set, get) => ({
   lidarWsStatus: 'disconnected',
   wsLatency: 0,
   lastMessageTime: 0,
+  // Cross-client staleness invariant (2026-07-31 §D10 in the
+  // Program Doctrine). programRevConfirmed goes:
+  //   * true  — a fresh /api/programs/<id> fetch confirmed the
+  //             held rev matches the server's, AND the WS is up
+  //             (so any subsequent program_changed event will
+  //             reach us on the next state frame).
+  //   * false — either the WS is down OR the WS just reconnected
+  //             and we haven't yet completed the post-reconnect
+  //             refetch. In this window taught badges MUST render
+  //             a "state syncing…" indicator instead of a confident
+  //             green ✓. Never assert state we can't back with a
+  //             fresh read.
+  // The one place we FLIP this true is at the tail of
+  // _refreshCurrentProgram (successful fetch). We flip it false
+  // on WS onclose AND on WS onopen when this isn't the first
+  // connect (the reconnect path always distrusts pre-drop state).
+  programRevConfirmed: false,
+  // Marker so onopen can tell "first connect" (initial page load)
+  // from "reconnect" (WS came back). First connect: normal load
+  // path is responsible for the initial fetch. Reconnect: the
+  // onopen handler triggers a defensive refetch.
+  _hasConnectedOnce: false,
+  // Reconcile log — session-only ring of {ts, kind, detail}
+  // recording every WS open/close, visibility resume, reconcile
+  // start/done event. Capped at 64. Directive (2026-07-31): "log
+  // reconnect+reconcile events client-side so the next report can
+  // say which device reconciled when." Access via
+  //   useStore.getState()._reconcileLog
+  // in devtools. Not persisted — a page refresh clears it.
+  _reconcileLog: [],
+  // Deploy-aware "new version — refresh" state. serverBundleId is
+  // the asset hash the SERVER is currently serving (fetched via
+  // /api/build_id). __BUILD_ID__ (defined by vite at build time)
+  // is the asset hash this bundle was BUILT with. Mismatch means
+  // the operator's tab is running an obsolete bundle — surface a
+  // standing toast so every-open-tab-invisibly-obsolete-six-times
+  // never happens again.
+  serverBundleId: null,
+  bundleObsolete: false,
   // Same-machine Date.now() of the most recent WS frame carrying a
   // robot.program.state value. Used ONLY by isStateStreamStale so
   // the wedge banner can distinguish a real controller wedge from
@@ -62,6 +102,49 @@ const storeDefinition = (set, get) => ({
 
   // ---- Robot state ----
   safety: { zone: 'GREEN', speed_scale: 1.0, estop: false, human_proximity: 2.4 },
+
+  // Self-collision presentation preferences.
+  //   selfCollisionBannerEnabled — Safety-page toggle for the
+  //     non-blocking warn-zone banner. Persists in localStorage.
+  //     NEVER affects the stop-zone modal — that's the last line
+  //     of defense and always fires.
+  //   mutedCollisionPairs — session-only Set of canonical pair
+  //     keys (see lib/collisionPresentation.pairMuteKey). Cleared
+  //     on refresh, per directive: "per-pair session mute".
+  //
+  // 2026-07-31 OPERATOR DIRECTIVE: default OFF. The fat capsule
+  // model was blocking legitimate jogs and flagging safe poses as
+  // "close"; until the mesh-hull upgrade (§396 follow-up) lands,
+  // the banner is off unless someone opts in for a customer cell.
+  // The toggle stays so it can come back.
+  selfCollisionBannerEnabled: (() => {
+    try {
+      const raw = localStorage.getItem('selfCollisionBannerEnabled')
+      return raw === null ? false : raw === '1'
+    } catch { return false }
+  })(),
+  mutedCollisionPairs: new Set(),
+  setSelfCollisionBannerEnabled: (on) => {
+    try { localStorage.setItem('selfCollisionBannerEnabled', on ? '1' : '0') }
+    catch { /* ignore */ }
+    set({ selfCollisionBannerEnabled: !!on })
+  },
+  muteCollisionPair: (key) => {
+    if (!key) return
+    set((s) => {
+      const next = new Set(s.mutedCollisionPairs)
+      next.add(key)
+      return { mutedCollisionPairs: next }
+    })
+  },
+  unmuteCollisionPair: (key) => {
+    if (!key) return
+    set((s) => {
+      const next = new Set(s.mutedCollisionPairs)
+      next.delete(key)
+      return { mutedCollisionPairs: next }
+    })
+  },
   joints: {
     names: ['J1', 'J2', 'J3', 'J4', 'J5', 'J6'],
     positions: [0, 0, 0, 0, 0, 0],
@@ -278,6 +361,46 @@ const storeDefinition = (set, get) => ({
   connectWS() {
     get()._connectStateWS()
     get()._connectLidarWS()
+    get()._installVisibilityHooks()
+  },
+
+  // Install document.visibilitychange + window.pageshow listeners
+  // so the tablet's "resume from background" ALWAYS triggers a
+  // full reconcile — even when the WS looks connected from the
+  // browser's perspective. Mobile Chrome silently suspends WS
+  // frames while a tab is backgrounded and can appear to seamlessly
+  // resume without ANY onclose firing; that's how a tablet ends
+  // up "connected" but sitting on stale state.
+  //
+  // Idempotent — registers once per page load. Guarded so the SSR
+  // path (unlikely; kept for safety) is a no-op.
+  _visibilityHooksInstalled: false,
+  _installVisibilityHooks() {
+    if (get()._visibilityHooksInstalled) return
+    if (typeof document === 'undefined' || typeof window === 'undefined') return
+    set({ _visibilityHooksInstalled: true })
+    // visibilitychange fires when the tab becomes visible again.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return
+      // Log even when there's no open program — the log is what we
+      // send when the operator asks "what happened on the tablet?"
+      get()._pushReconcileLog('visibility_visible',
+        `wsStatus=${get().wsStatus}`)
+      // If the WS is down, onopen will trigger a reconcile when it
+      // reconnects. If it looks up but we've been backgrounded,
+      // force one anyway — the browser may have silently paused
+      // frame delivery and we can't tell without a fresh fetch.
+      get()._reconcileAll('visibilitychange')
+    })
+    // pageshow with persisted=true fires when the tab comes back
+    // from the bfcache — no fetches ran while it was cached, so
+    // the tab is running arbitrarily-old state.
+    window.addEventListener('pageshow', (e) => {
+      const persisted = !!(e && e.persisted)
+      get()._pushReconcileLog('pageshow',
+        persisted ? 'bfcache_restore' : 'initial')
+      if (persisted) get()._reconcileAll('pageshow_bfcache')
+    })
   },
 
   _connectStateWS() {
@@ -287,7 +410,35 @@ const storeDefinition = (set, get) => ({
     const ws = new WebSocket(`${WS_PROTO}://${HOST}/ws/state`)
 
     ws.onopen = () => {
-      set({ wsStatus: 'connected', _stateWs: ws, _stateRetry: 0 })
+      const wasReconnect = get()._hasConnectedOnce
+      set({
+        wsStatus: 'connected',
+        _stateWs: ws,
+        _stateRetry: 0,
+        _hasConnectedOnce: true,
+      })
+      get()._pushReconcileLog('ws_open',
+        wasReconnect ? 'reconnect' : 'first_connect')
+      // Reconnect path: NEVER trust pre-drop state. During the WS
+      // outage other clients may have mutated programs, deploys may
+      // have restarted the server, mobile Chrome may have suspended
+      // the tab entirely. Full reconcile fetches the {id: rev} map
+      // + refetches the open program before rendering any confident
+      // state again.
+      //
+      // Doctrine tie-in: D10 forbids the screen asserting state it
+      // can't read. Between the WS drop and the reconcile response,
+      // the client's held rev is unconfirmed — badges render the
+      // "state syncing…" indicator via programRevConfirmed=false.
+      if (wasReconnect) {
+        get()._reconcileAll('ws_reconnect')
+      } else {
+        // First-connect path: still run the bundle-id check so an
+        // open tab left through a deploy learns about it now, not
+        // on the next disconnect. No full reconcile — the initial
+        // program load is handled by the normal load path.
+        get()._checkBundleId()
+      }
     }
 
     ws.onmessage = (ev) => {
@@ -446,6 +597,68 @@ const storeDefinition = (set, get) => ({
         if (Array.isArray(msg.program_events) && msg.program_events.length) {
           get()._handleProgramEvents(msg.program_events)
         }
+        // 2026-07-31 jog-stop instrumentation: watch for driver-
+        // emitted stops. The driver publishes robot.last_stop_ts +
+        // robot.last_stop_reason on every _stop_jog_locked call.
+        // When the ts advances, the driver just stopped a jog on
+        // its side; classify the cause from the reason string's
+        // `cause=<tag>` prefix (added driver-side in the same
+        // commit). Frontend-initiated stops also flow through this
+        // path — we suppress those by matching against the client's
+        // most recent pushJogStop timestamp.
+        try {
+          const _stopTs = Number(msg?.robot?.last_stop_ts) || 0
+          const _prev   = get()._lastObservedDriverStopTs || 0
+          if (_stopTs > _prev) {
+            set({ _lastObservedDriverStopTs: _stopTs })
+            const reason = String(msg?.robot?.last_stop_reason || '')
+            // Reason strings are tagged as `cause=<tag>: <human>`
+            // (driver-side change). Parse the tag; default to
+            // 'server_gate' when the tag is missing / unknown.
+            const m = /cause=([a-z_]+)/.exec(reason)
+            const tag = m ? m[1] : 'server_gate'
+            // Skip stops that trace back to a client-initiated
+            // release (release_cmd) — those already got a
+            // pointer_up / pointer_cancel entry from the UI.
+            if (tag !== 'release_cmd') {
+              try { pushJogStop(tag, { reason }) } catch { /* nop */ }
+            }
+          }
+        } catch { /* nop */ }
+        // 2026-07-31 CONVERGENCE: every state frame carries the
+        // server's authoritative {program_id: rev} snapshot. If our
+        // held rev for the OPEN program is behind, refetch now —
+        // this heals missed events (event ring TTL 15s can age out
+        // during long backgrounds) without waiting for the next
+        // mutation to fire a fresh event.
+        const _serverRevs = msg.program_revs
+        if (_serverRevs && typeof _serverRevs === 'object') {
+          const _cp = get().currentProgram
+          if (_cp && _cp.id && _serverRevs[_cp.id] != null) {
+            const serverRev = Number(_serverRevs[_cp.id])
+            const heldRev   = _cp.rev == null ? -1 : Number(_cp.rev)
+            // Two gap directions both trigger a refetch:
+            //   (a) server > held — the normal case (another client
+            //       just mutated). Missed-event heal.
+            //   (b) server < held — the post-restart case (server
+            //       lost its in-memory rev, our held value is now
+            //       impossibly high). The refetch resets us to the
+            //       authoritative server value.
+            const gap = Number.isFinite(serverRev) && serverRev !== heldRev
+            if (gap) {
+              get()._pushReconcileLog('rev_gap_in_frame',
+                `${_cp.id}: held=${_cp.rev} server=${serverRev} `
+                + `(${serverRev > heldRev ? 'behind' : 'ahead-of-server'})`)
+              // Skip the refetch when the operator has unsaved
+              // edits — the existing programChangedByOther banner
+              // path takes precedence to avoid clobbering their
+              // local work.
+              if (!_cp.unsaved) {
+                get()._refreshCurrentProgram()
+              }
+            }
+          }
+        }
       } catch (e) {
         // ignore parse errors
       }
@@ -456,7 +669,23 @@ const storeDefinition = (set, get) => ({
     }
 
     ws.onclose = () => {
-      set({ wsStatus: 'disconnected', _stateWs: null })
+      // WS down → held program state is no longer trustworthy. Any
+      // mutation on another client during the outage will NOT reach
+      // us via program_events until the WS comes back. Flip the
+      // confirmation flag so taught badges surface the "state
+      // syncing…" indicator (D10) rather than a confident green ✓.
+      set({
+        wsStatus: 'disconnected',
+        _stateWs: null,
+        programRevConfirmed: false,
+      })
+      get()._pushReconcileLog('ws_close', 'client-observed close')
+      // 2026-07-31 jog-stop instrumentation: WS drops are a
+      // top-suspect cause of mid-hold cutouts. The jog channel
+      // rides /ws/state — losing the WS forces the fallback
+      // path, and if that also stalls the driver's freshness
+      // deadman fires. Tag so the bench analyzer separates them.
+      try { pushJogStop('ws_drop', {}) } catch { /* nop */ }
       const nextAttempt = get()._stateRetry + 1
       set({ _stateRetry: nextAttempt })
       setTimeout(() => get()._connectStateWS(), backoffDelay(nextAttempt))
@@ -783,6 +1012,106 @@ const storeDefinition = (set, get) => ({
     }
   },
 
+  // Log a reconcile event to the session-local ring. Capped at 64;
+  // detail is a short free-form string. Every reconcile trigger
+  // pushes at least a 'start' and 'done' pair so the operator can
+  // read a linear timeline in devtools:
+  //   useStore.getState()._reconcileLog
+  _pushReconcileLog(kind, detail = '') {
+    const entry = { ts: Date.now(), kind, detail: String(detail || '') }
+    set((s) => {
+      const next = [...(s._reconcileLog || []), entry]
+      if (next.length > 64) next.splice(0, next.length - 64)
+      return { _reconcileLog: next }
+    })
+  },
+
+  // Full reconcile — the convergence guarantee (2026-07-31 §16).
+  // Called on:
+  //   * every WS onopen that isn't the first connect (reconnect)
+  //   * every document visibilitychange to visible (mobile Chrome
+  //     may have silently suspended the WS)
+  //   * every window pageshow (tablet bfcache resume)
+  //   * an in-frame rev-gap detected on program_revs
+  // Fetches server-truth for the program list revs AND the currently
+  // open program's full state before flipping programRevConfirmed
+  // back to true. Never trust pre-reconcile state.
+  async _reconcileAll(trigger = 'unspecified') {
+    get()._pushReconcileLog('reconcile_start', trigger)
+    // Mark state unconfirmed until the reconcile completes — the
+    // badges render "state syncing…" during this window (D10).
+    if (get().programRevConfirmed) {
+      set({ programRevConfirmed: false })
+    }
+    let revsFetchOK = false
+    try {
+      const res = await fetch('/api/programs/revs')
+      if (res.ok) {
+        const body = await res.json()
+        const revs = (body && body.revs) || {}
+        // If the currently-open program's server rev exceeds the
+        // client's held rev, refetch. The subsequent
+        // _refreshCurrentProgram call below covers the same case
+        // for programs with rev=null on the client, so this branch
+        // is belt-and-suspenders for programs the client hasn't
+        // touched yet in this session.
+        const cp = get().currentProgram
+        if (cp && cp.id && revs[cp.id] != null
+            && (cp.rev == null || revs[cp.id] > cp.rev)) {
+          get()._pushReconcileLog('rev_gap_detected',
+            `${cp.id}: held=${cp.rev} server=${revs[cp.id]}`)
+        }
+        revsFetchOK = true
+      }
+    } catch (_) {
+      // Network hiccup during reconcile. Log + don't flip confirmed
+      // → badges stay in syncing state. The next tick's rev-gap
+      // watcher OR the next visibility resume will retry.
+      get()._pushReconcileLog('reconcile_err', 'revs fetch failed')
+    }
+    // Refetch the open program's full state — this is what actually
+    // heals a missed teach/mutation.
+    const cp = get().currentProgram
+    if (cp && cp.id) {
+      await get()._refreshCurrentProgram()
+    } else if (revsFetchOK && get().wsStatus === 'connected') {
+      // No open program to reconcile → nothing to hold syncing on.
+      set({ programRevConfirmed: true })
+    }
+    // Deploy-aware bundle check runs alongside the reconcile so a
+    // tab that was open through a deploy learns about it on the
+    // very next reconcile trigger.
+    get()._checkBundleId()
+    get()._pushReconcileLog('reconcile_done', trigger)
+  },
+
+  // Compare the served bundle hash against this tab's build-time
+  // __BUILD_ID__. Sets bundleObsolete=true on mismatch so the toast
+  // banner renders. Silent when the server can't be reached OR the
+  // ids match. Non-blocking.
+  async _checkBundleId() {
+    try {
+      const res = await fetch('/api/build_id', { cache: 'no-store' })
+      if (!res.ok) return
+      const body = await res.json()
+      const server = String((body && body.bundle_id) || '')
+      const local = typeof __BUILD_ID__ !== 'undefined' ? String(__BUILD_ID__) : ''
+      set({ serverBundleId: server || null })
+      if (server && local && server !== local && !get().bundleObsolete) {
+        set({ bundleObsolete: true })
+        // Standing toast — long dwell (60s) so the operator sees it
+        // even while working. Deduped by content in ToastContainer.
+        try {
+          get().addToast?.(
+            `New app version available (${server.slice(0, 8)}) — `
+            + `refresh to load. This tab is running ${local.slice(0, 8)}.`,
+            'warning',
+            60000)
+        } catch (_) { /* nop */ }
+      }
+    } catch (_) { /* ignore; next reconcile tries again */ }
+  },
+
   async _refreshCurrentProgram() {
     const id = get().currentProgram?.id
     if (!id) return
@@ -807,6 +1136,12 @@ const storeDefinition = (set, get) => ({
           has_taught_poses: full.has_taught_poses,
         })
         get().clearProgramChangedByOther()
+        // Fresh fetch → held rev matches server. Only mark
+        // confirmed while the WS is up (otherwise a subsequent
+        // mutation on another client would slip past us again).
+        if (get().wsStatus === 'connected') {
+          set({ programRevConfirmed: true })
+        }
       }
     } catch (_) { /* silent — next tick refresh, if any, will retry */ }
   },
@@ -1252,6 +1587,15 @@ const storeDefinition = (set, get) => ({
   },
   setCurrentProgram(patch) {
     set((s) => ({ currentProgram: { ...s.currentProgram, ...patch } }))
+    // Whole-program loads from the server carry a `rev`. That's our
+    // "fresh from server" marker — flip programRevConfirmed=true if
+    // the WS is up (an event fanning out after this arrives via
+    // /ws/state will supersede the confirmation). Field-level
+    // {unsaved:true} patches don't carry rev, so they don't flip
+    // the flag — a local edit doesn't confirm cross-client sync.
+    if (patch && patch.rev != null && get().wsStatus === 'connected') {
+      set({ programRevConfirmed: true })
+    }
     // Reset runSpeedPct to whatever the newly-loaded program's config
     // says, clamped 1..100. Only fires when the program's identity
     // OR its config.speed_pct actually changed — editing a step

@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 import { createHoldTicker } from '../lib/holdTicker'
-import { pushJogEvent, pushJogInterval,
+import { pushJogEvent, pushJogInterval, pushJogStop,
          startJogSession, endJogSession } from '../lib/jogTelemetry'
 
 // JogControls — the shared REAL-ARM hold-to-jog panel.
@@ -258,13 +258,20 @@ export function HoldButton({
       pushJogEvent(eventName, {})
       stopRef.current?.()
     }
-    const onBlur     = () => stopIt('release_window_blur')
+    const onBlur     = () => {
+      pushJogStop('blur',       { hold_id: holdIdRef.current })
+      stopIt('release_window_blur')
+    }
     const onVis      = () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        pushJogStop('visibility', { hold_id: holdIdRef.current, kind: 'hidden' })
         stopIt('release_visibility_hidden')
       }
     }
-    const onPageHide = () => stopIt('release_pagehide')
+    const onPageHide = () => {
+      pushJogStop('visibility', { hold_id: holdIdRef.current, kind: 'pagehide' })
+      stopIt('release_pagehide')
+    }
     if (typeof window !== 'undefined') {
       window.addEventListener('blur',     onBlur)
       window.addEventListener('pagehide', onPageHide)
@@ -294,6 +301,13 @@ export function HoldButton({
   useEffect(() => {
     if (disabled && pressed.current) {
       pushJogEvent('release_disabled_midhold', {})
+      // `disabled` toggles for several reasons — WS drop, allow_jog
+      // gate closing, safety zone flip. Tag as `disabled` and let
+      // the bench analyzer cross-reference with driver logs to
+      // narrow down which specific reason. The store's WS drop
+      // handler adds its own `ws_drop` entry too so the log will
+      // typically carry both when the trigger is a WS event.
+      pushJogStop('disabled', { hold_id: holdIdRef.current })
       stopRef.current?.()
     }
   }, [disabled])
@@ -319,6 +333,8 @@ export function HoldButton({
   }, [disabled, start])
   const onPointerUp = useCallback((e) => {
     pushJogEvent('pointerup', { pointerType: e.pointerType, id: e.pointerId })
+    pushJogStop('pointer_up',
+      { hold_id: holdIdRef.current, pointerType: e.pointerType, id: e.pointerId })
     if (capturedPointerId.current != null) {
       try { e.currentTarget.releasePointerCapture(capturedPointerId.current) } catch { /* nop */ }
       capturedPointerId.current = null
@@ -327,6 +343,8 @@ export function HoldButton({
   }, [stop])
   const onPointerCancel = useCallback((e) => {
     pushJogEvent('pointercancel', { pointerType: e.pointerType, id: e.pointerId })
+    pushJogStop('pointer_cancel',
+      { hold_id: holdIdRef.current, pointerType: e.pointerType, id: e.pointerId })
     if (capturedPointerId.current != null) {
       try { e.currentTarget.releasePointerCapture(capturedPointerId.current) } catch { /* nop */ }
       capturedPointerId.current = null
@@ -363,6 +381,8 @@ export function HoldButton({
           capturedPointerId.current = null
         }
         pushJogEvent('release_pointerleave', { pointerType: e.pointerType, id: e.pointerId })
+        pushJogStop('pointer_leave',
+          { hold_id: holdIdRef.current, pointerType: e.pointerType, id: e.pointerId })
         stop()
       }}
       style={{

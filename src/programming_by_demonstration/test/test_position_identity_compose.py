@@ -218,3 +218,124 @@ def test_positions_persist_via_program_pbd_metadata():
     # for provenance survival — and rely on the FE to fetch the
     # intent's positions from /api/demonstrations/<id>/intent.
     assert payload['config']['pbd_metadata']['demo_id'] == 'demo-positions-round-trip'
+
+
+def test_speech_different_overrides_video_same_at_composer():
+    """Rule 5 (speech_different) must beat matching regions all the
+    way through the composer — same TL/BR video regions on both ops,
+    but the transcript declares "a different bin" for the second
+    pick.  Fusion should decide DISTINCT and the composer must emit
+    two anchor picks (no dedupe).  Guards the whole path: fusion +
+    _dedupe_repeated_refs both honouring speech over video."""
+    si = StructuredIntent(
+        task_summary='pick from tray, then from a different bin',
+        raw_understanding_notes=(
+            'pick this from the tray and place on the fixture. '
+            'now pick from a different bin and place on the fixture.'
+        ),
+        operations=[
+            IntentOperation(
+                operation_type='pick_and_place',
+                target_part=PartReference('unknown', 'part'),
+                sequence_index=1,
+                pick=PoseSlot(location_hint='tray',
+                              region=LocationRegion(cell='TL', clarity='clear')),
+                place=PoseSlot(location_hint='fixture',
+                               region=LocationRegion(cell='BR', clarity='clear')),
+            ),
+            IntentOperation(
+                operation_type='pick_and_place',
+                target_part=PartReference('unknown', 'part'),
+                sequence_index=2,
+                # Identical cells to op 1 — video says "same spot".
+                pick=PoseSlot(location_hint='bin',
+                              region=LocationRegion(cell='TL', clarity='clear')),
+                place=PoseSlot(location_hint='fixture',
+                               region=LocationRegion(cell='BR', clarity='clear')),
+            ),
+        ],
+    )
+    fuse_positions(si)
+    # Sanity: pick refs must be DIFFERENT because speech overrode video.
+    pick_refs = {op.pick.location_ref for op in si.operations}
+    assert len(pick_refs) == 2, (
+        f'speech-different must produce 2 distinct pick refs '
+        f'despite identical video regions — got {pick_refs}')
+
+    draft = compose_program_draft(si, demo_id='demo-speech-overrides')
+    anchor_picks = [s for s in draft.steps
+                    if s.get('position_role') == 'pick'
+                    and not s.get('derived_from')
+                    and not s.get('derived_from_step_id')]
+    linked_picks = [s for s in draft.steps
+                    if s.get('position_role') == 'pick'
+                    and s.get('derived_from_step_id')]
+    assert len(anchor_picks) == 2, (
+        f'composer must keep 2 anchor picks when speech says '
+        f'different — got {len(anchor_picks)}: {anchor_picks}')
+    assert linked_picks == [], (
+        f'composer must NOT link picks that speech marked different '
+        f'— got: {linked_picks}')
+
+
+def test_five_ops_same_spot_dedupes_to_one_pick_anchor():
+    """Real-world shape: five pick_and_place ops sharing the same
+    physical pick spot (the white bowl demo). Fusion resolves them
+    to one loc_1 pick + one loc_2 place; composer emits one anchor
+    per role plus N-1=4 linked repeats.  This is the acceptance
+    shape from the 63-step demo — pinned so any regression that
+    over-anchors or under-links surfaces immediately."""
+    ops = []
+    for i in range(1, 6):
+        ops.append(IntentOperation(
+            operation_type='pick_and_place',
+            target_part=PartReference('unknown', 'part'),
+            sequence_index=i,
+            pick=PoseSlot(location_hint='stool',
+                          region=LocationRegion(cell='CR', clarity='clear')),
+            place=PoseSlot(location_hint='table',
+                           region=LocationRegion(cell='CL', clarity='clear')),
+        ))
+    si = StructuredIntent(
+        task_summary='pick five bowls from the stool onto the table',
+        raw_understanding_notes=(
+            'pick these five bowls from the stool and place them on '
+            'the table. same spot each time.'
+        ),
+        operations=ops,
+    )
+    fuse_positions(si)
+    # Every op should share the same two location_refs.
+    pick_refs = {op.pick.location_ref for op in si.operations}
+    place_refs = {op.place.location_ref for op in si.operations}
+    assert len(pick_refs) == 1, pick_refs
+    assert len(place_refs) == 1, place_refs
+
+    draft = compose_program_draft(si, demo_id='demo-five-same-spot')
+    anchor_picks = [s for s in draft.steps
+                    if s.get('position_role') == 'pick'
+                    and not s.get('derived_from')
+                    and not s.get('derived_from_step_id')]
+    linked_picks = [s for s in draft.steps
+                    if s.get('position_role') == 'pick'
+                    and s.get('derived_from_step_id')]
+    anchor_places = [s for s in draft.steps
+                     if s.get('position_role') == 'place'
+                     and not s.get('derived_from')
+                     and not s.get('derived_from_step_id')]
+    linked_places = [s for s in draft.steps
+                     if s.get('position_role') == 'place'
+                     and s.get('derived_from_step_id')]
+    assert len(anchor_picks) == 1, anchor_picks
+    assert len(linked_picks) == 4, linked_picks
+    assert len(anchor_places) == 1, anchor_places
+    assert len(linked_places) == 4, linked_places
+    # Every linked repeat points at THE anchor's step id.
+    anchor_pick_id = anchor_picks[0]['id']
+    anchor_place_id = anchor_places[0]['id']
+    for s in linked_picks:
+        assert s['derived_from_step_id'] == anchor_pick_id, s
+        assert s['offset_z_mm'] == 0, s
+    for s in linked_places:
+        assert s['derived_from_step_id'] == anchor_place_id, s
+        assert s['offset_z_mm'] == 0, s

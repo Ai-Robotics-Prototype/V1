@@ -377,11 +377,22 @@ class EstunCodroidDriver(Node):
         #   warn=80 mm  — surfaces "SELF-COLLISION WARNING" toast;
         #                 amber tint on the offending pair in the twin;
         #                 jog continues.
-        #   stop=30 mm  — stopJog with reason
+        #   stop=15 mm  — stopJog with reason
         #                 'self-collision guard <a>-<b> at <d>mm';
         #                 red tint; recovery copy in the modal.
-        self.declare_parameter('collision_warn_distance_mm', 80.0)
-        self.declare_parameter('collision_stop_distance_mm', 30.0)
+        #
+        # 2026-07-31 OPERATOR DIRECTIVE: shrink stop to 15 mm to
+        # reflect the capsule model's known ~30 mm over-approximation.
+        # Combined with the warn-zone-is-presentation-only change,
+        # this restores teach-time freedom at the cell — the model
+        # was calling 45–50 mm poses "close" and blocking legitimate
+        # jogs. The real fix (mesh convex hulls from viewer GLBs)
+        # is queued as §396's follow-up; when the model stops lying
+        # by 30 mm the guard earns back its authority.
+        # Warn threshold retained at 40 mm as the presentation-only
+        # trigger for the optional banner (default OFF).
+        self.declare_parameter('collision_warn_distance_mm', 40.0)
+        self.declare_parameter('collision_stop_distance_mm', 15.0)  # was 20.0
         # Env thresholds — separate from self/ground so the two can
         # diverge. Wire evidence 2026-07-15: env-guard was firing on
         # phantom geometry because the DH-FK misplaced intermediate
@@ -817,6 +828,18 @@ class EstunCodroidDriver(Node):
         self._jog_last_cmd_ts = 0.0
         self._jog_last_hb_ts = 0.0
         self._jog_increment_end_ts = 0.0
+        # 2026-07-31 jog-stop bench instrumentation. Ring of
+        # inter-arrival gap samples (in ms) between successive
+        # refresh frames on the SAME active hold. Populated by
+        # _on_jog_command's refresh branch, published in the
+        # status blob so the bench script can compute a histogram.
+        self._jog_hold_gaps_ms = []
+        self._JOG_GAP_RING_MAX = 400
+        # "Last session" snapshots — filled at every _stop_jog_locked
+        # so the bench script can query the just-ended hold's gap
+        # distribution even after the ring resets.
+        self._jog_last_hold_gaps_ms = []
+        self._jog_last_hold_gaps_summary = None
         self._jog_increment_delta_deg = 0.0
         self._jog_supervise_timer = None
         # ── Session tracking for release-lag fix ────────────────────
@@ -1927,61 +1950,60 @@ class EstunCodroidDriver(Node):
                         stop_thr = base_stop + max(0.0, effective_frac - self._baseline_speed_frac) \
                                               * self._TIP_SPEED_MMPS * self._safety_latency_s \
                                               * self._safety_factor
-                if cur_min <= warn_thr:
+                # 2026-07-31 OPERATOR DIRECTIVE: the WARN band is
+                # presentation-only. The driver's motion-block applies
+                # ONLY inside the hard-stop zone. Warn-band jogs
+                # (opening AND closing) pass through with zero
+                # interference — no speed cap, no direction block.
+                # The capsule model over-approximates and was blocking
+                # legitimate teach poses at ~45–50 mm clearances. The
+                # operator standing at the cell outranks the model.
+                if cur_min <= stop_thr:
                     # Project the commanded direction 5° ahead.
                     proj = list(self._joint_deg)
                     proj[axis-1] += 5.0 * (1.0 if direction > 0 else -1.0)
                     _, proj_min = self._coll_model.min_distance_at(proj)
                     opening = proj_min > cur_min + 0.5
                     if opening:
-                        # Escape motion. Cap speed at 6% and let it go.
+                        # Escape motion inside stop zone. Cap speed
+                        # at the escape frac and let it go — this is
+                        # the escape-jog path from the modal.
                         cap = self._coll_escape_frac
                         if effective_frac > cap:
                             self.get_logger().info(
-                                f'guard: escape cap {effective_frac:.2f} → {cap:.2f} '
+                                f'guard: stop-zone escape cap {effective_frac:.2f} → {cap:.2f} '
                                 f'(J{axis}{"+" if direction>0 else "-"}, '
                                 f'{cur_min:.0f}mm → {proj_min:.0f}mm, pair={pair})')
                             effective_frac = cap
                             signed_speed = direction * effective_frac
                     else:
-                        # Closing motion.
-                        if cur_min <= stop_thr:
-                            # Delegate the "does any direction open?"
-                            # question to the collision model — it knows
-                            # whether the pair is mesh-mesh (needs a
-                            # wider probe step) or capsule.
-                            has_escape = self._coll_model.has_any_escape(
-                                self._joint_deg, pair)
-                            if has_escape:
-                                self._reject(family,
-                                    f'collision guard: J{axis}{"+" if direction>0 else "-"} '
-                                    f'closes {pair} from {cur_min:.0f}mm '
-                                    f'(current ≤ stop {stop_thr:.0f}mm). '
-                                    f'Use an escape direction from the popup.')
-                                return
-                            # FALLBACK — no direction opens per model; let the
-                            # operator override at 3% cap. This is the "model
-                            # wrong / geometry approximate" safety valve.
-                            cap = self._coll_fallback_frac
-                            if effective_frac > cap:
-                                self.get_logger().warn(
-                                    f'guard FALLBACK OVERRIDE: no escape direction '
-                                    f'per model at {pair} dist={cur_min:.0f}mm — '
-                                    f'allowing J{axis}{"+" if direction>0 else "-"} '
-                                    f'at {cap:.2f} cap (operator has e-stop)')
-                                effective_frac = cap
-                                signed_speed = direction * effective_frac
-                                override_used = True
-                        else:
-                            # In warn zone but not stop. Under the new
-                            # tiered policy (2026-07-16) the warn band
-                            # is presentational only — no speed throttle,
-                            # no direction block. The 3D view chip
-                            # surfaces the proximity; the operator
-                            # decides. Leaving this branch as a no-op
-                            # keeps the gate readable if we ever want
-                            # to reinstate a per-pair throttle.
-                            pass
+                        # Closing motion inside stop zone.
+                        # Delegate the "does any direction open?"
+                        # question to the collision model — it knows
+                        # whether the pair is mesh-mesh (needs a
+                        # wider probe step) or capsule.
+                        has_escape = self._coll_model.has_any_escape(
+                            self._joint_deg, pair)
+                        if has_escape:
+                            self._reject(family,
+                                f'collision guard: J{axis}{"+" if direction>0 else "-"} '
+                                f'closes {pair} from {cur_min:.0f}mm '
+                                f'(current ≤ stop {stop_thr:.0f}mm). '
+                                f'Use an escape direction from the popup.')
+                            return
+                        # FALLBACK — no direction opens per model; let the
+                        # operator override at 3% cap. This is the "model
+                        # wrong / geometry approximate" safety valve.
+                        cap = self._coll_fallback_frac
+                        if effective_frac > cap:
+                            self.get_logger().warn(
+                                f'guard FALLBACK OVERRIDE: no escape direction '
+                                f'per model at {pair} dist={cur_min:.0f}mm — '
+                                f'allowing J{axis}{"+" if direction>0 else "-"} '
+                                f'at {cap:.2f} cap (operator has e-stop)')
+                            effective_frac = cap
+                            signed_speed = direction * effective_frac
+                            override_used = True
             except Exception as e:
                 if not getattr(self, '_coll_warned_bad', False):
                     self._coll_warned_bad = True
@@ -1999,6 +2021,20 @@ class EstunCodroidDriver(Node):
                 and self._jog_mode == target_mode
                 and self._jog_index == axis
                 and self._jog_direction == direction):
+                # 2026-07-31 jog-stop instrumentation: sample the
+                # inter-arrival gap between successive refresh frames
+                # on the SAME hold. Ring capped in _jog_hold_gaps_ms
+                # so the status blob can publish a histogram without
+                # unbounded growth. Bench script uses this to answer
+                # "is the channel gapping past 200 ms?" — the
+                # keepalive contract's threshold.
+                prev = self._jog_last_cmd_ts
+                if prev > 0:
+                    gap_ms = (now - prev) * 1000.0
+                    self._jog_hold_gaps_ms.append(gap_ms)
+                    if len(self._jog_hold_gaps_ms) > self._JOG_GAP_RING_MAX:
+                        del self._jog_hold_gaps_ms[:len(self._jog_hold_gaps_ms)
+                                                    - self._JOG_GAP_RING_MAX]
                 self._jog_last_cmd_ts = now
                 # Latch the highest seq we've processed for this session
                 # so out-of-order refreshes get dropped upstream.
@@ -2687,16 +2723,85 @@ class EstunCodroidDriver(Node):
                     self.get_logger().warn(f'jogHeartbeat send failed: {e}')
                     self._stop_jog_locked(reason='hb send failed')
 
+    _STOP_REASON_PATTERNS = (
+        # (substring, cause_tag). First match wins. Ordered from most
+        # specific to most generic so a "hold staleness" reason doesn't
+        # get swept up by the generic "hb send failed" match.
+        ('release cmd',        'release_cmd'),
+        ('hold staleness',     'freshness_deadman'),
+        ('cart limit',         'joint_limit'),
+        ('limit approach',     'joint_limit'),
+        ('increment complete', 'increment_end'),
+        ('increment freshness','freshness_deadman'),
+        ('collision guard',    'collision_guard'),
+        ('obstacle guard',     'collision_guard'),
+        ('self-collision guard', 'collision_guard'),
+        ('hold transition',    'hold_transition'),
+        ('zero-speed',         'zero_speed'),
+        ('hb send failed',     'hb_send_failed'),
+        ('send failed',        'send_failed'),
+    )
+
+    def _jog_gaps_summary(self):
+        """Compact percentile summary of the current hold's inter-
+        arrival gap samples. Returns None when we have no samples.
+        Used by the bench-script analyzer + optional dashboard
+        readout."""
+        g = list(self._jog_hold_gaps_ms)
+        if not g:
+            return None
+        g_sorted = sorted(g)
+        def pctile(p):
+            i = min(len(g_sorted) - 1, max(0, int(p * len(g_sorted))))
+            return g_sorted[i]
+        return {
+            'n':   len(g),
+            'p50': pctile(0.50),
+            'p95': pctile(0.95),
+            'p99': pctile(0.99),
+            'max': g_sorted[-1],
+            'over_200ms': sum(1 for x in g if x > 200.0),
+        }
+
+    def _tag_stop_reason(self, reason):
+        """Normalize `_stop_jog_locked` reason strings to a
+        machine-parseable `cause=<tag>: <human>` shape (2026-07-31
+        jog-stop instrumentation). The frontend parses `cause=` and
+        routes into its taxonomy for the bench cause distribution.
+
+        Idempotent — reasons that already carry a `cause=` prefix
+        pass through unchanged."""
+        r = str(reason or '')
+        if 'cause=' in r:
+            return r
+        lower = r.lower()
+        for token, tag in self._STOP_REASON_PATTERNS:
+            if token in lower:
+                return f'cause={tag}: {r}'
+        return f'cause=other: {r}' if r else 'cause=other'
+
     def _stop_jog_locked(self, reason=''):
         """Send Robot/stopJog and tear down the supervise timer. Caller
         must hold self._jog_lock. Safe to call when no jog is active."""
         was_active = self._jog_active
+        # Tag the reason with a machine-parseable cause prefix so the
+        # frontend can bucket stops into the operator taxonomy (see
+        # 2026-07-31 jog-stop instrumentation directive).
+        reason = self._tag_stop_reason(reason)
         # Latch the reason regardless of active/inactive — the operator
         # still wants to know when a rejected start or a redundant stop
         # happened. Downstream dashboards decide staleness themselves
         # via _last_stop_ts.
         self._last_stop_reason = reason
         self._last_stop_ts     = time.time()
+        # 2026-07-31 jog-stop bench: preserve the just-ended hold's
+        # gap histogram in a "last session" slot so the bench script
+        # can query AFTER the stop landed (the live ring gets cleared
+        # below so a fresh hold's samples don't mix with the prior
+        # session's).
+        self._jog_last_hold_gaps_ms = list(self._jog_hold_gaps_ms)
+        self._jog_last_hold_gaps_summary = self._jog_gaps_summary()
+        self._jog_hold_gaps_ms = []
         self._jog_active = False
         self._jog_mode = None
         self._jog_index = 0
@@ -2794,6 +2899,18 @@ class EstunCodroidDriver(Node):
             'last_stop_ts':     self._last_stop_ts,
             'last_posture_age_s': (time.time() - self._last_posture_ts) if self._last_posture_ts else None,
             'last_status_age_s':  (time.time() - self._last_status_ts)  if self._last_status_ts  else None,
+            # 2026-07-31 jog-stop bench: inter-arrival gap histogram
+            # for the CURRENT hold session (cleared on _stop_jog_locked).
+            # Bench script consumes to answer "is the channel gapping
+            # past the 200 ms freshness threshold?" — the direct
+            # measure of the keepalive contract's stress.
+            'jog_hold_gaps_ms': list(self._jog_hold_gaps_ms),
+            'jog_hold_gaps_summary': self._jog_gaps_summary(),
+            # Last completed hold's gap histogram + summary. Survives
+            # across stops so the bench script can grab the numbers
+            # after the 30-second hold ends.
+            'jog_last_hold_gaps_ms': list(self._jog_last_hold_gaps_ms),
+            'jog_last_hold_gaps_summary': self._jog_last_hold_gaps_summary,
         }
         m = String(); m.data = json.dumps(body)
         self._pub_mode.publish(m)
