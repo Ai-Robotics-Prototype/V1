@@ -21,13 +21,14 @@ Description=RoboAi auto-deploy path watcher
 Documentation=file:///home/teddy/cobot_ws/scripts/autodeploy_wrapper.sh
 
 [Path]
-# The commit itself updates .git/HEAD's reflog + the branch ref
-# file. Watch the whole .git dir so branch switches + commits both
-# trigger. MakeDirectory is off because .git already exists.
-PathChanged=/home/teddy/cobot_ws/.git/HEAD
-PathChanged=/home/teddy/cobot_ws/.git/refs/heads
-# Trigger the service by name (systemd derives ".service" from the
-# stem when Unit= is not set — but be explicit anyway).
+# `.git/logs/HEAD` is the ONLY file git appends to on every commit
+# regardless of branch — one line per rev-changing event (commit,
+# reset, checkout, merge, pull). Watching a directory doesn't fire
+# on file-content changes (systemd path unit directory watches are
+# "file appeared / disappeared" only). The reflog file is the
+# stable choice: PathModified fires on any write. Symlinks aren't
+# used by git for this file so no follow-symlink concerns.
+PathModified=/home/teddy/cobot_ws/.git/logs/HEAD
 Unit=roboai-autodeploy.service
 
 [Install]
