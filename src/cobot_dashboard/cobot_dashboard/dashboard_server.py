@@ -5508,6 +5508,23 @@ if FASTAPI_AVAILABLE:
         except Exception as e:
             print(f'[run] sidecar refresh failed: {e}', flush=True)
 
+        # Push-only shortcut (2026-08-03) — the LOAD action from the
+        # Program Library reaches this endpoint with `push_only:True`
+        # so a load actually PUSHES the program to the controller
+        # (rather than only setting dashboard state). Everything up
+        # to this point already ran: codegen + save + byte-verify +
+        # STATE mirror + sidecar refresh. Skipping the to_auto/run
+        # publish here means the resident IS updated but the arm
+        # does NOT move — the same guarantee the operator gets from
+        # a manual pre-run push, wired to a normal library click.
+        if bool(body.get("push_only")):
+            return {"ok": True,
+                    "outcome":       {"kind": "pushed"},
+                    "program_id":    prog_id,
+                    "pushed_lua_sha12": _push_sha[:12],
+                    "stored_lua_sha12": stored_sha[:12],
+                    "effective_pct": int(eff_pct)}
+
         try:
             _ros_node._estun_publish_op("to_auto")
             # at_run_start bypasses the driver's mid-run high-speed

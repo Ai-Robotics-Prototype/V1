@@ -758,18 +758,42 @@ export default function MonitorDashboard() {
           steps:       full.steps,
           config:      full.config || {},
         })
-        // Tell the executor about the new active program. action='load'
-        // is treated as a frontend-facing 'set active'; the next Run
-        // picks it up via the normal load+run flow.
+        // PUSH to the controller so the resident program actually
+        // becomes this program (2026-08-03 no-fork fix). Prior
+        // code only set frontend state and published a ROS 'load'
+        // message the executor ignored — the resident controller
+        // program stayed whatever was last RUN, and Run would
+        // execute THAT (not what the operator loaded). With
+        // push_only=true the /run endpoint does codegen + save +
+        // byte-verify + sidecar refresh AND STATE.robot.program
+        // mirror, then stops before publishing run/to_auto — so
+        // the arm doesn't move but the resident becomes current.
         try {
-          await fetch('/api/program/run', {
+          const pushRes = await fetch('/api/estun/program/run', {
             method:  'POST',
             headers: { 'Content-Type': 'application/json' },
-            body:    JSON.stringify({ action: 'load', program_id: full.id }),
+            body:    JSON.stringify({
+              program_id: full.id,
+              push_only:  true,
+            }),
           })
-        } catch {}
-        if (typeof addToast === 'function') {
-          addToast('Loaded "' + (full.name || full.id) + '"', 'success')
+          if (!pushRes.ok) {
+            const err = await pushRes.json().catch(() => ({}))
+            const msg = (err && err.error)
+              || `push failed HTTP ${pushRes.status}`
+            if (typeof addToast === 'function') {
+              addToast('Loaded but push to controller failed: '
+                + msg, 'warning')
+            }
+          } else if (typeof addToast === 'function') {
+            addToast('Loaded and pushed "'
+              + (full.name || full.id) + '"', 'success')
+          }
+        } catch (e) {
+          if (typeof addToast === 'function') {
+            addToast('Loaded but controller push errored: '
+              + String(e), 'warning')
+          }
         }
       }
     } catch (e) {
@@ -846,6 +870,20 @@ export default function MonitorDashboard() {
   const showStreamStale = streamStale
     && ['running', 'stopping', 'paused'].includes(runState.kind)
 
+  // 2026-08-03: display name reflects the RESIDENT program (what
+  // the controller will actually run). robot.program.resident_
+  // program_id is set by save_project on every push — if the
+  // resident matches the dashboard's currentProgram, they're one
+  // and the same and we show currentProgram.name. If they DIVERGE
+  // (dashboard-load-without-push, or a foreign process pushed to
+  // the controller), the divergence banner (below) shows both and
+  // the Run button is gated separately.
+  const residentProgramId = robot?.program?.resident_program_id
+  const residentDivergence = (
+       residentProgramId
+    && currentProgram?.id
+    && residentProgramId !== currentProgram.id
+  )
   const programName    = currentProgram?.name || 'No program loaded'
   const steps          = currentProgram?.steps || []
   const currentStepIdx = task?.running || task?.paused ? (task?.program_step ?? 0) : -1
@@ -942,6 +980,24 @@ export default function MonitorDashboard() {
             <div style={{ fontSize: 24, fontWeight: 700, color: '#111', marginTop: 4 }}>
               {programName}
             </div>
+            {residentDivergence && (
+              <div data-testid="resident-divergence"
+                   style={{
+                     marginTop: 8, padding: '8px 12px',
+                     background: '#FEF3C7', border: '1px solid #F59E0B',
+                     borderRadius: 6, fontSize: 12, color: '#92400E',
+                     lineHeight: 1.4,
+                   }}>
+                <b>Controller resident: {residentProgramId}</b>
+                <br />
+                Dashboard shows{' '}
+                <code>{currentProgram?.id}</code>
+                {' '}but the controller currently holds{' '}
+                <code>{residentProgramId}</code>. Reload the program
+                from the library (Change Program) to push it to the
+                controller — or hit Run, which will push + run.
+              </div>
+            )}
             {currentStepIdx >= 0 && steps.length > 0 && (
               <div style={{ fontSize: 14, color: '#6b7280', marginTop: 4 }}>
                 Step {currentStepIdx + 1} of {steps.length}: {currentStepLabel}
