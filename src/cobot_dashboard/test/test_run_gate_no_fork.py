@@ -123,6 +123,33 @@ def test_all_cartesian_program_passes_the_gate():
     assert counts['total'] == 3
 
 
+def test_push_path_refreshes_line_map_sidecar():
+    """2026-08-03: the push path (POST /api/estun/program/run's
+    save_project) MUST regenerate the sidecar so its codegen_sha
+    matches the wire's newly-mirrored codegen_sha. Prior code
+    mirrored codegen_sha into STATE.robot.program but left the
+    sidecar file pinned to the LAST save's codegen — so after a
+    deploy that bumped codegen_sha, every run tripped the Monitor
+    honesty guard ("resident sha X ≠ running Y")."""
+    import os, re
+    here = os.path.dirname(os.path.abspath(__file__))
+    server_path = os.path.abspath(os.path.join(
+        here, '..', 'cobot_dashboard', 'dashboard_server.py'))
+    with open(server_path) as fh:
+        src = fh.read()
+    # The `_compute_and_save_line_map` call must appear inside the
+    # run/push handler (near the pushed_lua_sha12 mirror), not
+    # only inside POST/PUT /api/programs.
+    push_block = re.search(
+        r'pushed_lua_sha12[\s\S]{0,3000}?_compute_and_save_line_map',
+        src)
+    assert push_block, (
+        'push handler does not refresh the line_map sidecar — '
+        'sidecar codegen_sha will stay pinned to the last save and '
+        'Monitor honesty guard fires after every deploy that bumps '
+        'the codegen sha')
+
+
 def test_dashboard_server_gates_route_through_has_valid_motion():
     """No-fork lint: every motion-emptiness gate in
     dashboard_server.py MUST call `program_ops.has_valid_motion`.

@@ -29,14 +29,20 @@ export default function StepPreviewPanel() {
   const steps = Array.isArray(cp?.steps) ? cp.steps : []
   const total = steps.length
 
-  // D9 line_map fetch (2026-08-03). Rev in the cache key so a save
-  // invalidates. Program id from currentProgram — usually stable
-  // across a run.
+  // D9 line_map fetch (2026-08-03). Cache-key components:
+  //   * program id (obvious)
+  //   * cp.rev — bumps on every /api/programs PUT
+  //   * pushed_lua_sha12 — bumps on every /api/estun/program/run,
+  //     because save_project re-writes the sidecar with the
+  //     currently-running codegen sha. Including it in the key
+  //     forces a refetch as soon as the push mints a new sha,
+  //     even when the operator didn't edit the program.
+  const pushedLuaSha12 = useStore((s) => s.robot?.program?.pushed_lua_sha12)
   const {
     lineMap, codegenSha: mapCodegenSha,
     programId: mapProgramId,
     loading: mapLoading, error: mapError,
-  } = useLineMap(cp?.id, cp?.rev)
+  } = useLineMap(cp?.id, `${cp?.rev ?? ''}#${pushedLuaSha12 ?? ''}`)
 
   // Honesty guard against the resident program's codegen sha.
   const residentSha = robot?.program?.codegen_sha

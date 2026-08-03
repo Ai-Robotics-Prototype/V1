@@ -5492,6 +5492,21 @@ if FASTAPI_AVAILABLE:
         except Exception as e:
             print(f'[run] resident program state mirror failed: {e}',
                   flush=True)
+        # D9 line_map sidecar refresh (2026-08-03) — the push path
+        # was mirroring codegen_sha to STATE.robot.program but NOT
+        # regenerating the sidecar at /opt/cobot/programs/{id}.
+        # line_map.json. After a deploy that bumps codegen_sha,
+        # the sidecar stayed pinned to the sha AT LAST /api/programs
+        # save, so `wire codegen_sha != sidecar codegen_sha` and
+        # the Monitor honesty guard fired every run. The push IS
+        # the moment the resident becomes current — regenerate the
+        # sidecar here so the sha stamp AND the line_map both
+        # reflect the Lua we just pushed. Best-effort — a sidecar
+        # write failure never blocks the run.
+        try:
+            _compute_and_save_line_map(program)
+        except Exception as e:
+            print(f'[run] sidecar refresh failed: {e}', flush=True)
 
         try:
             _ros_node._estun_publish_op("to_auto")

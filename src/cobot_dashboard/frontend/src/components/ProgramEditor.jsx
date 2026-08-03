@@ -3199,9 +3199,15 @@ export default function ProgramEditor() {
   const _residentSha       = useStore((s) => s.robot?.program?.codegen_sha)
   const _residentProgramId = useStore((s) => s.robot?.program?.resident_program_id
                                           ?? s.robot?.program?.project_id)
+  // Same cache-key extension as StepPreviewPanel (2026-08-03) —
+  // the push path refreshes the sidecar with the currently-running
+  // codegen sha; keying on pushed_lua_sha12 forces a refetch as
+  // soon as save_project mints a new push.
+  const _pushedLuaSha12 = useStore((s) => s.robot?.program?.pushed_lua_sha12)
   const {
     lineMap: _lineMap, codegenSha: _mapSha, programId: _mapProgId
-  } = useLineMap(currentProgram?.id, currentProgram?.rev)
+  } = useLineMap(currentProgram?.id,
+    `${currentProgram?.rev ?? ''}#${_pushedLuaSha12 ?? ''}`)
   const _honesty = lineMapHonesty({
     residentSha: _residentSha,
     residentProgramId: _residentProgramId,
