@@ -57,17 +57,26 @@ def test_tracked_systemd_unit_runs_isaac_detection_not_classical():
             f'{line!r}')
 
 
-def test_isaac_detection_launch_forces_engine_update_on_first_boot():
-    """Bench-verified 2026-08-03: the old on-disk `.plan` was silently
-    stale (built ~10 weeks before the current TRT toolchain); it
-    deserialized OK but produced zero output tensors. `force_engine_
-    update=True` triggers a rebuild from ONNX when the plan is
-    missing / stale, so a re-flash never inherits a bad engine."""
+def test_isaac_detection_documents_the_stale_plan_rebuild_path():
+    """Bench-verified 2026-08-03: the original May-27 `.plan` on disk
+    deserialized OK but produced zero output tensors (TRT toolchain
+    drift). A one-time rebuild with `force_engine_update=True`
+    produced a valid 14 MB plan. That flag also deletes the plan
+    on EVERY restart (~8 min rebuild each time), so
+    isaac_detection.launch.py now sets it to False (cached plan
+    reused). If a future plan goes stale again, the operator
+    removes `/opt/cobot/models/yolov8n.plan` and restarts — TRT
+    rebuilds from the ONNX. This test pins the comment path in the
+    launch file so the rebuild recipe stays discoverable in-tree."""
     src = _read('launch/isaac_detection.launch.py')
-    assert re.search(r"'force_engine_update'\s*:\s*True", src), (
-        "isaac_detection.launch.py must set force_engine_update=True — "
-        "otherwise a stale on-disk .plan can deserialize but produce "
-        "no output (silent failure the operator's screenshot caught)")
+    assert re.search(r"'force_engine_update'\s*:\s*False", src), (
+        "isaac_detection.launch.py must set force_engine_update=False "
+        "(cached plan reuse). Leaving it True rebuilds the engine on "
+        "every restart — 8-minute cold start per boot.")
+    assert 'stale' in src.lower(), (
+        'isaac_detection.launch.py comment path around the '
+        'force_engine_update flag must document the stale-plan rebuild '
+        'recipe (delete the .plan + restart)')
 
 
 def test_isaac_detection_publishes_to_the_dashboard_wire():
