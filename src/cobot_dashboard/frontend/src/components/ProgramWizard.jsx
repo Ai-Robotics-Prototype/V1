@@ -1819,6 +1819,31 @@ function CellPickerPage({ answers, setAnswer, goNext }) {
 // component name is what tells the linter this IS a component and
 // makes the hooks legal. The PAGES entries below simply spread these
 // component references into the `render` field.
+// Detection-engine capability list (2026-08-03 architecture directive).
+// The Isaac ROS TensorRT YOLOv8 pipeline ships with COCO weights on
+// day one, so parts whose canonical name matches a COCO class detect
+// immediately. Everything else needs the Phase 2 fine-tune pipeline
+// (CAD → synthetic renders → TensorRT engine) — training takes ~1
+// hour in the cloud, gated on the RunPod account. The wizard surfaces
+// the training requirement per-part so the operator sees the story
+// before they hit Run and get an empty detection.
+const COCO_NATIVE_NAMES = new Set([
+  'bowl', 'cup', 'bottle', 'wine glass', 'fork', 'knife', 'spoon',
+  'banana', 'apple', 'orange', 'book', 'scissors', 'cell phone',
+  'laptop', 'keyboard', 'mouse', 'remote', 'clock',
+])
+
+function partIsCocoNative(part) {
+  const name = String(part?.name || '').toLowerCase().trim()
+  // Match against the canonical name AND any coco_alias the parts
+  // library carries (added when the operator uploads a STEP with a
+  // matching classifier hint).
+  if (COCO_NATIVE_NAMES.has(name)) return true
+  const alias = String(part?.coco_alias || '').toLowerCase().trim()
+  if (alias && COCO_NATIVE_NAMES.has(alias)) return true
+  return false
+}
+
 function WhichPartBody({ answers, setAnswer, goNext }) {
   const [parts, setParts] = useState([])
   useEffect(() => {
@@ -1827,19 +1852,37 @@ function WhichPartBody({ answers, setAnswer, goNext }) {
   return (
     <QuestionCard
       question="Which part should the robot look for?"
-      description="Select a part from the library. The robot will only pick this type."
+      description={
+        "Select a part from the library. The robot will only pick "
+        + "this type. Parts marked “training required” will "
+        + "not be detected until their model is trained — the "
+        + "Isaac ROS engine ships with COCO weights, and custom "
+        + "parts need a ~1-hour fine-tune (Phase 2, gated on the "
+        + "RunPod cloud pilot)."
+      }
     >
       {parts.length === 0 ? (
         <div style={{ padding: 24, textAlign: 'center', color: '#6b7280', border: '2px dashed #d1d5db', borderRadius: 8 }}>
           No parts in the library. Upload STEP files in Part Recognition first.
         </div>
-      ) : parts.map(p => (
-        <ChoiceButton key={p.id} label={p.name}
-          description={`${p.extents_cm?.[0]} x ${p.extents_cm?.[1]} x ${p.extents_cm?.[2]} cm`}
-          selected={answers.target_part === p.id}
-          onClick={() => { setAnswer('target_part', p.id); setAnswer('target_part_name', p.name); goNext() }}
-        />
-      ))}
+      ) : parts.map(p => {
+        const cocoNative = partIsCocoNative(p)
+        const modelTrained = !!p.model_trained
+        const detectable = cocoNative || modelTrained
+        const trainingNote = detectable
+          ? null
+          : ' — training required (~1 hour in the cloud, Phase 2)'
+        return (
+          <ChoiceButton key={p.id} label={p.name + (detectable ? '' : ' ⚠')}
+            description={
+              `${p.extents_cm?.[0]} x ${p.extents_cm?.[1]} x ${p.extents_cm?.[2]} cm`
+              + (trainingNote || '')
+            }
+            selected={answers.target_part === p.id}
+            onClick={() => { setAnswer('target_part', p.id); setAnswer('target_part_name', p.name); goNext() }}
+          />
+        )
+      })}
     </QuestionCard>
   )
 }

@@ -124,6 +124,15 @@ STATE = {
         "paused": False,
     },
     "detections": [],
+    # D10-adjacent (2026-08-03): 3D detection positions come from
+    # cam0's depth sampled at the YOLO bbox centroid, transformed to
+    # base_link via the provisional `cam0→base_link` extrinsic in
+    # config/sensor_transforms.yaml. The extrinsic is un-refined
+    # (no AprilTag calibration yet), so absolute 3D positions carry
+    # a "few centimeters" bias. Camera panel renders an "Extrinsic
+    # uncalibrated" chip while this is False; flips to True when the
+    # AprilTag calibration pipeline lands.
+    "detections_calibrated": False,
     "lidar_objects": [],
     "openvocab": {
         "enabled":      False,            # toggled by frontend; gates ROS publishing of prompts

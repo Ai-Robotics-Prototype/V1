@@ -1,4 +1,5 @@
 import os
+import sys
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument, GroupAction, IncludeLaunchDescription,
@@ -14,6 +15,27 @@ from ament_index_python.packages import get_package_share_directory
 def generate_launch_description():
     bringup_dir = get_package_share_directory('cobot_bringup')
     config_dir = os.path.join(bringup_dir, 'config')
+
+    # Isaac ROS detection actions — extracted 2026-08-03 into
+    # isaac_detection.launch.py so the same block is reachable from
+    # both the assembled `full_stack` and the per-service systemd
+    # `depth_detection.launch.py`. Retires the classical
+    # object_detection/detector_node from the default boot path.
+    launch_dir = os.path.join(bringup_dir, 'launch')
+    sys.path.insert(0, launch_dir)
+    try:
+        from isaac_detection import isaac_detection_actions  # type: ignore
+    except Exception:
+        # Missing extract file → keep the launch parseable so the
+        # rest of the stack still comes up. The default-boot path is
+        # per-service systemd, so this file is a dev bring-up tool.
+        def isaac_detection_actions():
+            return []
+    finally:
+        try:
+            sys.path.remove(launch_dir)
+        except ValueError:
+            pass
 
     return LaunchDescription([
         DeclareLaunchArgument('robot_model',       default_value='generic'),
@@ -46,11 +68,15 @@ def generate_launch_description():
             name='sensor_fusion_node', output='screen',
             parameters=[os.path.join(config_dir, 'perception.yaml')],
         ),
-        Node(
-            package='object_detection', executable='detector_node',
-            name='detector_node', output='screen',
-            parameters=[os.path.join(config_dir, 'detection.yaml')],
-        ),
+        # Object detection (2026-08-03 architecture directive):
+        # Isaac ROS YOLOv8 is the sole part-detection path. The
+        # classical `object_detection/detector_node` line that used
+        # to be here has been retired — the package stays in-tree
+        # (parked) but is no longer started by default. All
+        # detection consumers (dashboard, task_planner, program
+        # detect step) read `/perception/detections_3d` — same
+        # topic, same message shape, new engine.
+        *isaac_detection_actions(),
         Node(
             package='human_safety', executable='human_safety_node',
             name='human_safety_node', output='screen',
