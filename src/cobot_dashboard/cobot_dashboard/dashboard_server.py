@@ -104,6 +104,25 @@ _last_estun_status_ts = [0.0]
 
 _state_lock = threading.Lock()
 
+# COCO class-id → human-readable name (2026-08-03). Populated at
+# import from src/cobot_bringup/config/coco_labels.txt so the file
+# stays the ground truth for both the label list AND anything that
+# needs to name a numeric COCO id (Isaac YOLOv8 decoder emits raw
+# indices). Missing file falls back to the string id — safe, no
+# crash.
+_COCO_CLASS_NAMES: dict[int, str] = {}
+try:
+    _coco_path = '/home/teddy/cobot_ws/src/cobot_bringup/config/coco_labels.txt'
+    if os.path.isfile(_coco_path):
+        with open(_coco_path) as _fh:
+            for _i, _line in enumerate(_fh.read().splitlines()):
+                _name = _line.strip()
+                if _name:
+                    _COCO_CLASS_NAMES[_i] = _name
+except Exception:
+    _COCO_CLASS_NAMES = {}
+
+
 STATE = {
     "safety": {"zone": "GREEN", "speed_scale": 1.0, "estop": False, "human_proximity": 2.4},
     "joints": {
@@ -1202,6 +1221,15 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 continue
             result = det.results[0]
             class_name = str(result.hypothesis.class_id)
+            # 2026-08-03 — Isaac YOLOv8 decoder emits class_id as the
+            # RAW COCO index (e.g. '39'='bottle', '61'='dining table').
+            # The classical `depth_segment_node` we retired used to
+            # emit human-readable strings, so the frontend expects
+            # names. Map numeric ids → COCO string names here so the
+            # overlay reads "bowl" instead of "45".
+            if class_name.isdigit():
+                class_name = _COCO_CLASS_NAMES.get(
+                    int(class_name), class_name)
             score = float(result.hypothesis.score)
             # depth_segment_node encodes part-library matches as
             # "part:NAME:STATUS:YAW_ERR" where STATUS is C (correct),

@@ -116,24 +116,36 @@ def isaac_detection_actions():
             'output_tensor_names':  ['output_tensor'],
             'output_binding_names': ['output0'],
             'verbose':              False,
-            # 2026-08-03 (bench-verified): the stale `.plan` on disk
-            # deserialized OK but produced silent zero-output — TRT
-            # version mismatch, engine built ~10 weeks before the
-            # current TRT toolchain. Setting `force_engine_update=True`
-            # rebuilds the `.plan` from the ONNX on FIRST launch (or
-            # any time the file is missing / stale). Adds ~90s to the
-            # first-boot after a model swap; no cost on subsequent
-            # boots (the plan cache hits).
-            'force_engine_update':  True,
+            # 2026-08-03 (bench-verified): the ORIGINAL May-27 plan
+            # on disk deserialized OK but produced silent zero-output
+            # (TRT toolchain drift). A one-time rebuild with
+            # `force_engine_update=True` produced a valid engine
+            # (verified — /detections_output ran at 6 Hz post-build).
+            # Leaving `force_engine_update=True` deletes-and-rebuilds
+            # the plan on EVERY restart (~8 min on Orin AGX), so we
+            # flip to False now: TRT reuses the newly-good plan on
+            # subsequent boots. If the plan ever gets stale again,
+            # the operator manually removes /opt/cobot/models/
+            # yolov8n.plan and restarts — TRT rebuilds from the ONNX
+            # on that first restart with force_engine_update=False.
+            'force_engine_update':  False,
         }],
     )
 
+    bringup_cfg_dir = os.path.join(
+        get_package_share_directory('cobot_bringup'), 'config')
     yolov8_decoder = ComposableNode(
         name='yolov8_decoder_node',
         package='isaac_ros_yolov8',
         plugin='nvidia::isaac_ros::yolov8::YoloV8DecoderNode',
         parameters=[{
-            'confidence_threshold': 0.20,
+            # 2026-08-03 bench-tune: 0.20 was noisy on an empty
+            # tabletop (dining_table, chair, etc. hovering at
+            # 0.25-0.4). 0.45 keeps day-one detection (bowl on
+            # dark table lit normally hits 0.7+) while dropping
+            # the low-confidence phantom furniture. Operator can
+            # dial down as/when custom parts train.
+            'confidence_threshold': 0.45,
             'nms_threshold':        0.45,
         }],
     )
@@ -179,6 +191,17 @@ def isaac_detection_actions():
         remappings=[
             ('/detections',           '/detections_output'),
             ('/perception/detections','/perception/detections_3d'),
+            # 2026-08-03 (bench-verified): the RealSense2 driver does
+            # NOT publish `/cam0/cam0/aligned_depth_to_color/camera_info`
+            # even though it publishes the aligned depth image on the
+            # sibling topic. The aligned depth stream is registered
+            # to the COLOR intrinsics, so the depth_detector_node's
+            # `camera_info` subscription is remapped to the color's
+            # camera_info here. Without this remap the bridge stalls
+            # on TimeSynchronizer (info never arrives), Isaac's YOLO
+            # runs at 6 Hz but /perception/detections_3d stays silent.
+            ('/cam0/cam0/aligned_depth_to_color/camera_info',
+             '/cam0/cam0/color/camera_info'),
         ],
         output='screen',
     )
