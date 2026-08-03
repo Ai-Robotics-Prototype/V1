@@ -280,6 +280,50 @@ def seeded_ik_z_lift_hold_orientation(anchor_deg, delta_z_mm, *,
 _WRIST_LOCK_MAX_DEG = 15.0
 
 
+_MOTION_VERB_PREFIXES = ('movJ(', 'movL(', 'movC(')
+
+
+def has_valid_motion(lua: str) -> tuple:
+    """Verb-agnostic motion gate — the single source of truth for
+    "does this Lua contain any motion the arm will execute?".
+    Counts the point-referencing motion verbs: movJ, movL, movC.
+    `movJCoorRel` is intentionally EXCLUDED — it's a relative Z-lift
+    the codegen falls back to when the seeded IK has no taught
+    anchor to work from, so its presence alone does not indicate
+    the program has anywhere real to go.
+
+    Returns `(has_motion: bool, counts: dict)` where
+    `counts = {'movJ': N, 'movL': N, 'movC': N, 'movJCoorRel': N,
+               'total_point_motion': N, 'total_all_motion': N}`.
+
+    Consumed by dashboard_server's run-gate + home-set-gate — both
+    sites collapsed to this predicate 2026-08-03 after the operator
+    hit a "codegen produced zero valid movJ steps" refusal on a
+    valid all-cartesian program. Before this predicate the two
+    gates each checked `not varspoint` (which happened to be
+    equivalent to `no movJ+movL` because both verbs populate
+    varspoint), but the REASON STRING said "movJ" — misleading
+    under verb-fidelity. This helper puts the check text and the
+    check logic in one place so a future gate can't drift back
+    into "must have movJ" semantics."""
+    counts = {'movJ': 0, 'movL': 0, 'movC': 0, 'movJCoorRel': 0}
+    for line in (lua or '').splitlines():
+        s = line.strip()
+        # Skip comment-only lines — a `-- foo movJ(x)` in a
+        # comment must not read as a motion emission.
+        if s.startswith('--'):
+            continue
+        for verb in ('movJ(', 'movL(', 'movC(', 'movJCoorRel('):
+            if s.startswith(verb):
+                counts[verb.rstrip('(')] += 1
+                break
+    counts['total_point_motion'] = (
+        counts['movJ'] + counts['movL'] + counts['movC'])
+    counts['total_all_motion'] = (
+        counts['total_point_motion'] + counts['movJCoorRel'])
+    return (counts['total_point_motion'] > 0, counts)
+
+
 def _wrist_descend_safety(target_joints, last_joints):
     """Verify that a movL taught-contact descend won't need a wrist
     re-solve mid-path.

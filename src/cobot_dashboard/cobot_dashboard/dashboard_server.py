@@ -5266,20 +5266,30 @@ if FASTAPI_AVAILABLE:
         import hashlib as _hashlib_run_assert
         _push_sha = _hashlib_run_assert.sha256(lua.encode('utf-8')).hexdigest()
 
-        # Empty-program guard. If codegen produced zero varspoint
-        # entries, project/run would either (a) reach a Lua source
-        # with only skip-comments and complete instantly, or (b) on
-        # some controller firmwares reject with a run-time alarm.
-        # Either way we don't want to publish a run that can't
-        # possibly move the arm — refuse HERE with a clear reason
-        # instead of round-tripping a confusing controller error.
-        if not points:
+        # Empty-program guard — VERB-AGNOSTIC (2026-08-03).
+        # Routes through `program_ops.has_valid_motion` so this gate
+        # and the home-set gate below share ONE predicate. A valid
+        # all-cartesian program (only movL(pN)) MUST pass this
+        # gate; the pre-fix wording was movJ-only, which read
+        # incorrectly under verb-fidelity + all-cartesian columns
+        # (many legal programs emit zero movJ).
+        has_motion, _motion_counts = program_ops.has_valid_motion(lua)
+        if not has_motion:
             return JSONResponse({
-                "error": "program has no taught poses — teach at least "
-                         "one point before running",
+                "error": ("program has no runnable motion — teach at "
+                          "least one point (or bind a pallet frame) "
+                          "before running"),
                 "ok": False,
-                "outcome": {"kind": "empty_program",
-                            "reason": "codegen produced zero valid movJ steps"},
+                "outcome": {
+                    "kind":   "empty_program",
+                    "reason": (f"codegen produced zero point-referencing "
+                               f"motion verbs "
+                               f"(movJ={_motion_counts['movJ']}, "
+                               f"movL={_motion_counts['movL']}, "
+                               f"movC={_motion_counts['movC']}, "
+                               f"movJCoorRel={_motion_counts['movJCoorRel']})"),
+                    "motion_counts": _motion_counts,
+                },
                 "program_id": prog_id,
                 "requested_pct":  int(program.get("config", {}).get(
                     "speed_pct") or program.get("speed_pct") or 10),
@@ -5746,12 +5756,19 @@ if FASTAPI_AVAILABLE:
                 "error": f"codegen failed: {e}",
                 "outcome": {"kind": "codegen_failed"},
             }, status_code=500)
-        if not points:
+        # Shared predicate (2026-08-03): use has_valid_motion so
+        # this home-set gate and the run gate above agree on
+        # "runnable" semantics — verb-agnostic, no fork.
+        _home_has_motion, _home_motion_counts = program_ops.has_valid_motion(lua)
+        if not _home_has_motion:
             return JSONResponse({
                 "ok": False,
-                "error": ("codegen produced no runnable points — "
-                          f"{_HOME_FILE} taught_joints may be malformed."),
-                "outcome": {"kind": "codegen_empty"},
+                "error": (f"codegen produced no runnable motion — "
+                          f"{_HOME_FILE} taught_joints may be "
+                          f"malformed (motion_counts="
+                          f"{_home_motion_counts})."),
+                "outcome": {"kind": "codegen_empty",
+                            "motion_counts": _home_motion_counts},
             }, status_code=500)
 
         # Lint gate — same permanent check the program run endpoint uses.
