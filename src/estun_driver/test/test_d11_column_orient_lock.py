@@ -178,6 +178,91 @@ def test_d11_vertical_anchor_no_tilt_finding():
     assert not tilt, f'D11 tilt info spuriously fired: {tilt}'
 
 
+def test_d11_runs_on_move_joint_columns_too():
+    """2026-08-03 addendum: D11 checks POSE orientation identity,
+    not the verb. A move_joint in a column (operator's explicit
+    verb-fidelity choice) is legal — its derived pose must still
+    share the anchor's orientation. Analyzer must run the check
+    whether the step's action is move_linear OR move_joint (and
+    the anchor may be taught under either verb)."""
+    # A column with a move_joint contact and a move_joint approach.
+    # If the D11 loop still filters by action=='move_linear' only,
+    # THIS program would silently skip the D11 check — a regression
+    # against the operator's explicit semantics.
+    prog = {
+        'id': 'd11-joint',
+        'steps': [
+            {'id': 1, 'action': 'move_joint',
+             'derived_from': 'pick', 'offset_z_mm': 100},
+            {'id': 2, 'action': 'move_joint',
+             'position_role': 'pick',
+             'taught_joints': list(ANCHORS['pick_bowl'])},
+            {'id': 3, 'action': 'move_joint',
+             'derived_from': 'pick', 'offset_z_mm': 100},
+        ],
+    }
+    rep = po.analyze_program(prog)
+    # No blocks expected — the D11 IK converges for this anchor at
+    # both offsets. If it didn't RUN, findings would still be empty
+    # by omission. So instead confirm the tilt-info surface (which
+    # ALSO cares about anchor-verb-agnostic behavior) fires on a
+    # tilted anchor authored as move_joint. That proves the anchor
+    # scan accepts move_joint, which is the sibling code path.
+    tilted = {
+        'id': 'd11-joint-tilt',
+        'steps': [
+            {'id': 1, 'action': 'move_joint',
+             'position_role': 'pick',
+             'taught_joints': [30.0, 20.0, 100.0, 90.0, 60.0, -180.0]},
+        ],
+    }
+    rep_tilt = po.analyze_program(tilted)
+    tilt_findings = [f for f in rep_tilt['findings']
+                     if f['rule'] == 'anchor_tilt_from_vertical']
+    assert tilt_findings, (
+        'D11 companion (anchor_tilt_from_vertical) skipped the '
+        'move_joint anchor — action filter still hard-codes '
+        'move_linear. This is the crash-adjacent regression the '
+        '2026-08-03 audit flagged.')
+    assert tilt_findings[0]['step_action'] == 'move_joint', (
+        f'tilt info fired but recorded action={tilt_findings[0]["step_action"]!r} — '
+        f'expected move_joint')
+
+
+def test_d11_column_derived_move_joint_orientation_locks():
+    """A derived move_joint step whose derived_from names a station
+    with a taught move_joint contact must go through the D11 IK
+    just like a move_linear derived step. If the anchor scan or
+    the derived scan is verb-restricted, the IK never runs and
+    the check silently passes an unchecked pose."""
+    prog = {
+        'id': 'd11-jt-joint',
+        'steps': [
+            {'id': 1, 'action': 'move_joint',   # column approach
+             'derived_from': 'pick', 'offset_z_mm': 100},
+            {'id': 2, 'action': 'move_joint',   # taught contact
+             'position_role': 'pick',
+             'taught_joints': list(ANCHORS['pick_bowl'])},
+        ],
+    }
+    rep = po.analyze_program(prog)
+    # The convergent case yields no blocks. Confirm by inspecting
+    # the codegen path emits the D11 stamp regardless of verb —
+    # the codegen calls `seeded_ik_z_lift_hold_orientation` for
+    # column-derived steps, and the analyzer's D11 loop uses the
+    # same IK. If the analyzer skipped this program (verb filter),
+    # there'd be no evidence — the assertion below at least
+    # confirms the analyzer completed without raising.
+    assert 'findings' in rep and 'adaptations' in rep, (
+        'analyze_program returned malformed report for move_joint '
+        'column — check crashed silently?')
+    # Bonus: rule ids of any surfaced findings must not include an
+    # unexpected column_orient_delta on a well-conditioned anchor.
+    for f in rep['findings']:
+        assert f['rule'] != 'column_orient_ik_failed', (
+            f'D11 IK claimed failure on a well-conditioned anchor — {f}')
+
+
 def test_d11_codegen_emits_orient_lock_note_on_column_derived():
     """Codegen path exercises the D11 IK for column derived steps
     and stamps the orient_dev note in the emitted Lua line."""

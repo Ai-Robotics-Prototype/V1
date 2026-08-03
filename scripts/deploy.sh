@@ -147,6 +147,45 @@ if [[ $FRONTEND_NEEDS_BUILD -eq 1 ]]; then
     fi
     pass "eslint clean"
 
+    # Backend equivalent of the ESLint no-undef gate — pyflakes
+    # catches the NameError-in-waiting class (2026-08-03: operator
+    # hit `name 'program_ops' is not defined` inside the D11 check;
+    # the check crashed and the frontend surfaced OUR bug as a
+    # program-lint failure). Both backend and frontend now share
+    # the same "undefined identifier fails the build" contract.
+    #
+    # Scope: dashboard + estun_driver + programming_by_demonstration
+    # + object_detection — the packages that carry the code the
+    # operator actually edits from the dashboard. Other packages
+    # (perception_fusion, cuda_pointcloud, etc.) build fine via
+    # colcon and their runtime lives outside the dashboard-touched
+    # request path — we can extend the gate to them in a follow-up
+    # if a NameError ever slips through in one of those.
+    #
+    # Pyflakes-only check (not full ruff): pyflakes flags undefined
+    # names deterministically and has no style opinions. Style
+    # cleanups can land in a separate PR without churning the gate.
+    step "pyflakes (backend no-undef gate)"
+    _PYFLAKES_TARGETS=(
+        "$WS/src/cobot_dashboard/cobot_dashboard"
+        "$WS/src/estun_driver/estun_driver"
+        "$WS/src/programming_by_demonstration/programming_by_demonstration"
+        "$WS/src/object_detection/object_detection"
+    )
+    _PYFLAKES_OUT=$(python3 -m pyflakes "${_PYFLAKES_TARGETS[@]}" 2>&1 \
+                       | grep 'undefined name' || true)
+    if [[ -n "$_PYFLAKES_OUT" ]]; then
+        fail "pyflakes reported undefined-name errors — refusing to build."
+        printf "${RED}%s${RST}\n" "$_PYFLAKES_OUT"
+        printf "${RED}════════  DEPLOY: FAIL  ════════${RST}\n"
+        printf "  A NameError-in-waiting shipped once (D11 validator, 2026-08-03).\n"
+        printf "  Fix the undefined identifiers above and re-run scripts/deploy.sh.\n"
+        printf "  Style-only pyflakes findings (unused vars, f-strings without\n"
+        printf "  placeholders) are NOT gated — only undefined names are.\n"
+        exit 1
+    fi
+    pass "pyflakes clean (no undefined names in dashboard/estun/pbd/object_detection)"
+
     step "npm run build"
     ( cd "$FRONTEND_SRC" && npm run build 2>&1 | tail -8 )
     pass "vite build complete"

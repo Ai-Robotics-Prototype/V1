@@ -2284,18 +2284,30 @@ def analyze_program(program: dict, *,
     # or the fallback path emitted a non-orientation-locked pose.
     # Severity 'block' — the dashboard save gate refuses to store a
     # program with any block finding.
+    #
+    # Verb agnostic (2026-08-03 addendum): D11 checks POSE
+    # orientation identity, not the verb. A move_joint in a column
+    # is legal — that's the operator's explicit type choice under
+    # verb-fidelity — and its derived pose must still match the
+    # anchor's orientation. So the action filter accepts any motion
+    # verb the operator can attach `derived_from` to (move_linear,
+    # move_joint, move_home). Non-motion actions (set_io, wait, ...)
+    # never carry a `derived_from` and are skipped naturally.
+    _D11_MOTION_ACTIONS = {'move_linear', 'move_joint', 'move_home'}
+    _D11_ANCHOR_ACTIONS = {'move_linear', 'move_joint'}
     D11_TOL_DEG = 0.1
     for i, s in enumerate(steps):
         if not isinstance(s, dict): continue
-        if str(s.get('action') or '').lower() != 'move_linear': continue
+        if str(s.get('action') or '').lower() not in _D11_MOTION_ACTIONS: continue
         role = s.get('derived_from')
         if not role: continue
         # Only column derived steps — those whose derived_from names
-        # a station role with a taught contact somewhere.
+        # a station role with a taught contact somewhere. Anchor may
+        # be a taught move_linear OR move_joint (verb-agnostic).
         anchor = None
         for j, cand in enumerate(steps):
             if (isinstance(cand, dict)
-                    and str(cand.get('action') or '').lower() == 'move_linear'
+                    and str(cand.get('action') or '').lower() in _D11_ANCHOR_ACTIONS
                     and not cand.get('derived_from')
                     and str(cand.get('position_role') or '') == str(role)):
                 atj = cand.get('taught_joints')
@@ -2351,7 +2363,10 @@ def analyze_program(program: dict, *,
     TILT_INFO_DEG = 3.0
     for i, s in enumerate(steps):
         if not isinstance(s, dict): continue
-        if str(s.get('action') or '').lower() != 'move_linear': continue
+        # Anchors can be taught under either verb; tilt reads the
+        # POSE, not the motion type.
+        if str(s.get('action') or '').lower() not in _D11_ANCHOR_ACTIONS:
+            continue
         if s.get('derived_from'): continue
         tj = s.get('taught_joints')
         if not (isinstance(tj, list) and len(tj) == 6

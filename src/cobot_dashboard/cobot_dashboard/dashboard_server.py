@@ -7182,17 +7182,32 @@ if FASTAPI_AVAILABLE:
         prog_id = str(program.get('id') or '').strip()
         if not prog_id:
             return None
+        # Local import — same pattern as _d11_block_findings (see
+        # commit fd25a67). Owning the import at the call site
+        # eliminates the NameError-in-waiting class of bug.
+        try:
+            from estun_driver import program_ops as _po
+        except Exception as e:
+            return {
+                'program_id':    prog_id,
+                'line_map':      [],
+                'codegen_sha':   '',
+                'codegen_git':   '',
+                'effective_pct': None,
+                'generated_ts':  _now_stamp(),
+                'error':         f'program_ops import: {e}',
+            }
         sink = []
         try:
-            _lua, _pts, eff_pct = program_ops.codegen_lua_from_program(
+            _lua, _pts, eff_pct = _po.codegen_lua_from_program(
                 program, operator_speed_limit_pct=100,
                 line_map_sink=sink)
             sidecar = {
                 'program_id':   prog_id,
                 'line_map':     sink,
-                'codegen_sha':  program_ops.CODEGEN_VERSION.get(
+                'codegen_sha':  _po.CODEGEN_VERSION.get(
                     'src_sha256', '')[:12],
-                'codegen_git':  program_ops.CODEGEN_VERSION.get(
+                'codegen_git':  _po.CODEGEN_VERSION.get(
                     'git_sha', ''),
                 'effective_pct': int(eff_pct),
                 'generated_ts': _now_stamp(),
@@ -7202,9 +7217,9 @@ if FASTAPI_AVAILABLE:
             sidecar = {
                 'program_id':   prog_id,
                 'line_map':     [],
-                'codegen_sha':  program_ops.CODEGEN_VERSION.get(
+                'codegen_sha':  _po.CODEGEN_VERSION.get(
                     'src_sha256', '')[:12],
-                'codegen_git':  program_ops.CODEGEN_VERSION.get(
+                'codegen_git':  _po.CODEGEN_VERSION.get(
                     'git_sha', ''),
                 'effective_pct': None,
                 'generated_ts': _now_stamp(),
@@ -7220,26 +7235,64 @@ if FASTAPI_AVAILABLE:
 
 
     def _d11_block_findings(program):
-        """Run the motion analyzer over `program` and return any
-        findings with severity=='block'. Empty list on success.
+        """Run the motion analyzer over `program` and return
+        (block_findings, validator_error_findings). block findings
+        refuse the save (a program problem); validator_error
+        findings are OUR bug (a check that raised) — the save
+        proceeds and the error is auto-filed alongside the
+        program's findings as 'inconclusive' so the operator sees
+        it but isn't blocked by it.
 
-        Wired into POST /api/programs and PUT /api/programs/{id} so a
-        rotating station column (D11 violation) cannot save. The
-        analyzer's column_orient_ik_failed + column_orient_delta
-        checks are the only 'block' rules today; adding a new one
-        (severity='block') automatically extends this gate."""
+        The distinction matters (2026-08-03 operator directive):
+        never let a validator-crash read as the program being
+        wrong. Prior code stuffed the crash into severity='block',
+        which made a NameError read as a program-lint failure and
+        blocked editing. That is our failure, not the operator's.
+        """
+        # Local import — Python re-imports are near-free after the
+        # first hit; this makes the reference explicit at the call
+        # site so a NameError-in-waiting can never appear again
+        # (each function that touches program_ops owns its import).
         try:
-            rep = program_ops.analyze_program(program)
+            from estun_driver import program_ops as _po
         except Exception as e:
-            # Do not silently swallow — a broken analyzer that can't
-            # even run means we can't validate, so refuse.
-            return [{'rule': 'analyzer_error',
-                     'severity': 'block',
-                     'message': f'analyzer failed to run: {e}',
-                     'step_idx': -1, 'step_label': '', 'step_action': '',
-                     'suggested_action': None, 'metrics': {}}]
-        return [f for f in (rep.get('findings') or [])
-                if str(f.get('severity') or '') == 'block']
+            # Can't import → validator itself is broken. NOT a
+            # program problem; surface as an inconclusive advisory
+            # so the operator can still save/edit.
+            return [], [{
+                'rule':             'validator_import_error',
+                'severity':         'validator_error',
+                'message':          f'validator could not import '
+                                    f'program_ops: {e}. This is a '
+                                    f'BUG in the validator, not a '
+                                    f'problem with your program. '
+                                    f'Save will proceed.',
+                'step_idx':         -1,
+                'step_label':       '',
+                'step_action':      '',
+                'suggested_action': None,
+                'metrics':          {'exception_type': type(e).__name__},
+            }]
+        try:
+            rep = _po.analyze_program(program)
+        except Exception as e:
+            return [], [{
+                'rule':             'validator_check_error',
+                'severity':         'validator_error',
+                'message':          f'analyzer raised '
+                                    f'{type(e).__name__}: {e}. This '
+                                    f'is a BUG in the validator, '
+                                    f'not a problem with your '
+                                    f'program. Save will proceed.',
+                'step_idx':         -1,
+                'step_label':       '',
+                'step_action':      '',
+                'suggested_action': None,
+                'metrics':          {'exception_type': type(e).__name__},
+            }]
+        blocks = [f for f in (rep.get('findings') or [])
+                  if str(f.get('severity') or '') == 'block']
+        return blocks, []
 
 
     def _validate_step_point_refs(steps, points):
@@ -7411,16 +7464,19 @@ if FASTAPI_AVAILABLE:
             "created":     ts,
             "updated":     ts,
         }
-        # D11 save gate (2026-08-03) — any 'block' finding from the
-        # analyzer refuses the save with a specific reason. Currently
-        # fires on column_orient_ik_failed and column_orient_delta —
-        # a rotating station column can never save.
-        block = _d11_block_findings(program)
+        # D11 save gate (2026-08-03) — 'block' findings from the
+        # analyzer refuse the save (program problem). 'validator_
+        # error' findings are OUR bug (analyzer raised) — save
+        # proceeds; the crash is auto-filed as inconclusive so the
+        # operator sees it. Never let a validator crash read as a
+        # program error.
+        block, validator_errors = _d11_block_findings(program)
         if block:
             return JSONResponse({
                 "error": ("D11 column orientation lock: "
                           + "; ".join(f['message'] for f in block)),
                 "d11_block_findings": block,
+                "validator_errors":   validator_errors,
             }, status_code=422)
         try:
             with open(os.path.join(_PROG_DIR, slug + '.json'), 'w') as f:
@@ -7433,6 +7489,7 @@ if FASTAPI_AVAILABLE:
         return {"ok": True, "program": program,
                 "line_map":  (sidecar or {}).get("line_map"),
                 "codegen_sha": (sidecar or {}).get("codegen_sha"),
+                "validator_errors": validator_errors,
                 "warnings": {"move_home_drift": home_warnings}
                             if home_warnings else {}}
 
@@ -7559,12 +7616,14 @@ if FASTAPI_AVAILABLE:
             tags = prog.get("tags") or []
             prog["tags"] = [t for t in tags if t not in _PBD_TAG_MARKERS]
         # D11 save gate (2026-08-03) — see POST path for context.
-        block = _d11_block_findings(prog)
+        # Validator crashes never block; only real 'block' findings do.
+        block, validator_errors = _d11_block_findings(prog)
         if block:
             return JSONResponse({
                 "error": ("D11 column orientation lock: "
                           + "; ".join(f['message'] for f in block)),
                 "d11_block_findings": block,
+                "validator_errors":   validator_errors,
             }, status_code=422)
         try:
             # Bug 1 fix (2026-07-27): route the PUT write through the
@@ -7579,6 +7638,7 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
         sidecar = _compute_and_save_line_map(prog)
         return {"ok": True, "program": prog, "rev": new_rev,
+                "validator_errors": validator_errors,
                 "line_map":  (sidecar or {}).get("line_map"),
                 "codegen_sha": (sidecar or {}).get("codegen_sha"),
                 "warnings": {"move_home_drift": home_warnings_put}
