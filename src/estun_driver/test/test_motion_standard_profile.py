@@ -345,9 +345,18 @@ def test_orientation_stamp_on_derived_step():
         ],
     }
     lua, _, _ = codegen_lua_from_program(prog, operator_speed_limit_pct=100)
+    # D11 stamp shape (2026-08-03): 'orient_dev=X.XXXX°  (D11 column-
+    # orientation-lock, ...)'. The pre-D11 shape 'orient_dev=(rx=...,
+    # ry=..., rz=...)' still emits for NON-column derived steps
+    # (e.g., derived_from that names no station). We just need the
+    # stamp to be present on column derived FIX C emissions.
     derived = [ln for ln in lua.splitlines()
-               if 'orient_dev=(' in ln and 'FIX C:' in ln]
+               if 'orient_dev=' in ln and 'FIX C:' in ln]
     assert derived, lua
+    for ln in derived:
+        # Either the D11 lock stamp or the legacy Euler-delta stamp.
+        assert ('D11 column-orientation-lock' in ln
+                or 'orient_dev=(' in ln), ln
 
 
 def test_orientation_helper_returns_none_on_bad_input():

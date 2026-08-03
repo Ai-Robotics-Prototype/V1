@@ -132,23 +132,37 @@ def test_wrist_check_j6_alone_can_trip():
 # ── End-to-end codegen checks ──────────────────────────────────
 
 def test_seeded_ik_bowl_descend_stays_movL():
-    """SEEDED IK's approach preserves wrist axes → descend movL
-    stays as movL with a wrist_dev=max0.00° comment appended."""
+    """D11 (2026-08-03): the column IK now holds TCP ORIENTATION
+    equal at all three column poses. Joint values differ (arm
+    joints reconfigure to compensate for orientation-preservation),
+    so wrist_dev between approach and taught contact is non-zero —
+    but the controller's movL cartesian interp holds orientation
+    across the segment because the endpoints agree on it. The
+    wrist_lock_descend safety metric measures JOINT delta, still
+    gated at 15° per axis. Under D11 that value is ~10–13° on the
+    bowl anchors — safely under the guard — and the contact stays
+    movL. Prior test asserted wrist_dev=max0.00 which encoded the
+    pre-D11 3-DOF Z-arm-only IK where q4/q5/q6 stayed frozen; that
+    lock was wrong (flange orientation drifted 9°) and D11 replaces
+    it with the correct invariant."""
     pick_j  = [63.15, 38.45, 133.63, 81.85, 90.57, -105.28]
     place_j = [-2.82, 22.14, 130.69, 62.61, 90.57, -105.28]
     lua, _, _ = codegen_lua_from_program(
         _pick_place_program(pick_j, place_j),
         operator_speed_limit_pct=10)
     contact_lines = _contact_emission_lines(lua)
-    # Both taught contacts should be movL, not movJ, and each should
-    # carry the wrist_dev annotation.
     assert len(contact_lines) == 2, contact_lines
+    import re
     for ln in contact_lines:
         assert ln.startswith('movL('), \
             f'expected movL, got: {ln}'
-        assert 'wrist_dev=max0.00' in ln, \
-            f'expected wrist_dev note, got: {ln}'
-    # And zero fallback lines.
+        assert 'wrist_dev=max' in ln, \
+            f'expected wrist_dev annotation, got: {ln}'
+        # Must remain under the wrist-lock threshold (15°).
+        m = re.search(r'wrist_dev=max([0-9.]+)°', ln)
+        assert m, ln
+        assert float(m.group(1)) < 15.0, \
+            f'wrist_dev {m.group(1)}° breaches 15° gate: {ln}'
     lines = _motion_lines(lua)
     assert not [ln for ln in lines if 'WRIST-LOCK FALLBACK' in ln]
 
@@ -166,7 +180,14 @@ def test_upstream_movJCoorRel_triggers_movJ_fallback():
     # solver so the test is deterministic without kinematic tuning.
     import estun_driver.program_ops as po
     original = po.seeded_ik_z_lift
+    original_col = po.seeded_ik_z_lift_hold_orientation
     po.seeded_ik_z_lift = lambda anchor_deg, dz, **kw: None
+    # D11 (2026-08-03) added a column-orientation-lock IK that
+    # runs FIRST for column derived steps; force it None too so
+    # the fallback path we care about here (movJCoorRel) actually
+    # fires.
+    po.seeded_ik_z_lift_hold_orientation = \
+        lambda anchor_deg, dz, **kw: None
     try:
         pick_j  = [63.15, 38.45, 133.63, 81.85, 90.57, -105.28]
         place_j = [-2.82, 22.14, 130.69, 62.61, 90.57, -105.28]
@@ -175,6 +196,7 @@ def test_upstream_movJCoorRel_triggers_movJ_fallback():
             operator_speed_limit_pct=10)
     finally:
         po.seeded_ik_z_lift = original
+        po.seeded_ik_z_lift_hold_orientation = original_col
 
     lines = _motion_lines(lua)
     # Approaches should have gone through movJCoorRel (FIX B v2).

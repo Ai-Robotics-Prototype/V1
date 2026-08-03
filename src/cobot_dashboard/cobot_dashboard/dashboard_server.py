@@ -7112,6 +7112,29 @@ if FASTAPI_AVAILABLE:
                     break
         return out
 
+    def _d11_block_findings(program):
+        """Run the motion analyzer over `program` and return any
+        findings with severity=='block'. Empty list on success.
+
+        Wired into POST /api/programs and PUT /api/programs/{id} so a
+        rotating station column (D11 violation) cannot save. The
+        analyzer's column_orient_ik_failed + column_orient_delta
+        checks are the only 'block' rules today; adding a new one
+        (severity='block') automatically extends this gate."""
+        try:
+            rep = program_ops.analyze_program(program)
+        except Exception as e:
+            # Do not silently swallow — a broken analyzer that can't
+            # even run means we can't validate, so refuse.
+            return [{'rule': 'analyzer_error',
+                     'severity': 'block',
+                     'message': f'analyzer failed to run: {e}',
+                     'step_idx': -1, 'step_label': '', 'step_action': '',
+                     'suggested_action': None, 'metrics': {}}]
+        return [f for f in (rep.get('findings') or [])
+                if str(f.get('severity') or '') == 'block']
+
+
     def _validate_step_point_refs(steps, points):
         """Return a per-step message list for any step whose point_name
         doesn't resolve in the program's points table. Empty list on
@@ -7281,6 +7304,17 @@ if FASTAPI_AVAILABLE:
             "created":     ts,
             "updated":     ts,
         }
+        # D11 save gate (2026-08-03) — any 'block' finding from the
+        # analyzer refuses the save with a specific reason. Currently
+        # fires on column_orient_ik_failed and column_orient_delta —
+        # a rotating station column can never save.
+        block = _d11_block_findings(program)
+        if block:
+            return JSONResponse({
+                "error": ("D11 column orientation lock: "
+                          + "; ".join(f['message'] for f in block)),
+                "d11_block_findings": block,
+            }, status_code=422)
         try:
             with open(os.path.join(_PROG_DIR, slug + '.json'), 'w') as f:
                 json.dump(program, f, indent=2)
@@ -7412,6 +7446,14 @@ if FASTAPI_AVAILABLE:
                 prog["config"] = {k: v for k, v in cfg.items() if k != 'pbd_metadata'}
             tags = prog.get("tags") or []
             prog["tags"] = [t for t in tags if t not in _PBD_TAG_MARKERS]
+        # D11 save gate (2026-08-03) — see POST path for context.
+        block = _d11_block_findings(prog)
+        if block:
+            return JSONResponse({
+                "error": ("D11 column orientation lock: "
+                          + "; ".join(f['message'] for f in block)),
+                "d11_block_findings": block,
+            }, status_code=422)
         try:
             # Bug 1 fix (2026-07-27): route the PUT write through the
             # rev+broadcast helper so every step edit, teach, link, or

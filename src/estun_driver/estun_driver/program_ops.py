@@ -131,6 +131,137 @@ def _jacobian_z_arm_only(q_deg):
     return _np.array(row) * (math.pi / 180.0)
 
 
+def _geometric_jacobian_6(q_deg):
+    """Full 6×6 spatial Jacobian at the flange, in the base frame:
+      [J_v]   (mm/deg for each joint)
+      [J_ω]   (unitless rotation-rate wrt deg for each joint)
+
+    Column i is [z_i × (p_ee − p_i); z_i] where z_i is the i-th joint
+    axis (world) and p_i is that joint's origin (world). Linear rows
+    use mm; angular rows use radians (small-rotation vector). Both
+    scaled by π/180 so `dq` is in DEGREES for consistency with the
+    rest of the codegen.
+    """
+    Ts = _fk_chain(q_deg)
+    p_ee = Ts[6][:3, 3]
+    J = _np.zeros((6, 6))
+    for i in range(6):
+        z_i = Ts[i][:3, 2]        # world-frame joint axis
+        p_i = Ts[i][:3, 3]        # world-frame joint origin (mm)
+        dp = p_ee - p_i           # mm
+        # cross(z_i, dp) — linear component (mm/rad)
+        J[0, i] = z_i[1] * dp[2] - z_i[2] * dp[1]
+        J[1, i] = z_i[2] * dp[0] - z_i[0] * dp[2]
+        J[2, i] = z_i[0] * dp[1] - z_i[1] * dp[0]
+        # angular component (rad/rad → dimensionless rotation vector)
+        J[3, i] = z_i[0]
+        J[4, i] = z_i[1]
+        J[5, i] = z_i[2]
+    return J * (math.pi / 180.0)
+
+
+def _rot_log(R):
+    """Axis-angle rotation vector (3-vec, radians) of a 3×3 rotation
+    matrix. Small-angle safe (clamped acos). No scipy dependency."""
+    tr = float(R[0, 0] + R[1, 1] + R[2, 2])
+    cos_a = max(-1.0, min(1.0, (tr - 1.0) / 2.0))
+    ang = math.acos(cos_a)
+    if ang < 1e-9:
+        return _np.zeros(3)
+    if abs(ang - math.pi) < 1e-6:
+        # Near-π: pick the largest diagonal to build the axis stably.
+        diag = _np.array([R[0, 0], R[1, 1], R[2, 2]])
+        i = int(_np.argmax(diag))
+        axis = _np.zeros(3)
+        axis[i] = math.sqrt(max(0.0, (R[i, i] + 1.0) / 2.0))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        if axis[i] > 1e-9:
+            axis[j] = R[i, j] / (2.0 * axis[i])
+            axis[k] = R[i, k] / (2.0 * axis[i])
+        return axis * ang
+    scale = ang / (2.0 * math.sin(ang))
+    return _np.array([R[2, 1] - R[1, 2],
+                      R[0, 2] - R[2, 0],
+                      R[1, 0] - R[0, 1]]) * scale
+
+
+def seeded_ik_z_lift_hold_orientation(anchor_deg, delta_z_mm, *,
+                                      max_iter: int = 60,
+                                      tol_mm: float = 0.02,
+                                      tol_rad: float = 5e-5,
+                                      max_dq_deg_norm: float = 12.0,
+                                      len_scale_mm: float = 30.0):
+    """D2 column-orientation-lock IK (D11 2026-08-03).
+
+    Solve for joints producing:
+      * flange position = anchor.position + [0, 0, Δz]  (BASE frame)
+      * flange orientation = anchor.orientation  (BASE frame, EXACT)
+
+    Seeded from `anchor_deg`, so the initial orientation error is 0
+    and only the Z-position residual drives the first Newton step.
+    Full 6×6 spatial Jacobian, damped least-squares (Levenberg-
+    Marquardt) fallback near singularities.
+
+    Returns `(lifted_deg, achieved_dz_mm, orient_err_deg)` on success,
+    where `orient_err_deg` is the max component of the axis-angle of
+    R_anchor^T @ R_lifted after convergence (must be ≤ 0.1° per D11).
+    Returns None if the iteration doesn't converge or would need an
+    unsafe joint excursion.
+
+    The prior `seeded_ik_z_lift` (q4/q5/q6 FROZEN, q1/q2/q3 free)
+    was NOT orientation-locked in the base frame — arm-joint changes
+    rotated all downstream frames, so the flange orientation drifted
+    by up to ~9° on a 100 mm lift (bowl program, ry axis). That
+    function is kept for the movJCoorRel fallback path only. Column
+    derived steps now go through this one.
+    """
+    if _np is None:
+        return None
+    q = _np.array([float(v) for v in anchor_deg], dtype=float)
+    if q.shape != (6,):
+        return None
+    Ts0 = _fk_chain(q)
+    p0 = Ts0[6][:3, 3].copy()
+    R_target = Ts0[6][:3, :3].copy()
+    p_target = p0 + _np.array([0.0, 0.0, float(delta_z_mm)])
+    # Row-scale weights: linear rows in mm; angular rows are radians.
+    # Without normalization the LM system is dominated by the linear
+    # rows (arm reach ≫ 1 rad), and orientation-hold converges only
+    # ~10 %/iter. Scaling e_pos by 1/len_scale_mm brings both errors
+    # to the same numerical order of magnitude → geometric-rate
+    # convergence on BOTH channels within ~10 iterations.
+    W = _np.diag([1.0 / len_scale_mm] * 3 + [1.0] * 3)
+    lam = 1e-6   # LM damping, tiny — near-singular directions rare here
+    for _ in range(max_iter):
+        Ts = _fk_chain(q)
+        p_cur = Ts[6][:3, 3]
+        R_cur = Ts[6][:3, :3]
+        e_pos = p_target - p_cur                        # mm
+        e_ori = _rot_log(R_target @ R_cur.T)            # rad
+        if (float(_np.linalg.norm(e_pos)) < tol_mm
+                and float(_np.linalg.norm(e_ori)) < tol_rad):
+            achieved = float(p_cur[2] - p0[2])
+            R_final = _fk_chain(q.tolist())[6][:3, :3]
+            e_final = _rot_log(R_target @ R_final.T)
+            orient_err_deg = float(_np.max(_np.abs(e_final))) * 180.0 / math.pi
+            return q.tolist(), achieved, orient_err_deg
+        J = _geometric_jacobian_6(q.tolist())
+        err = _np.concatenate([e_pos, e_ori])
+        Jw = W @ J
+        ew = W @ err
+        JTJ = Jw.T @ Jw
+        JTe = Jw.T @ ew
+        try:
+            dq = _np.linalg.solve(JTJ + lam * _np.eye(6), JTe)
+        except _np.linalg.LinAlgError:
+            return None
+        step_norm = float(_np.linalg.norm(dq))
+        if step_norm > max_dq_deg_norm:
+            dq = dq * (max_dq_deg_norm / step_norm)
+        q = q + dq
+    return None
+
+
 # Max per-wrist-axis deviation allowed on a taught-contact movL
 # descend before we fall back to a joint-space movJ. Rationale: the
 # controller's cartesian interpolator will re-solve IK at every
@@ -2144,6 +2275,115 @@ def analyze_program(program: dict, *,
     # finding; adapt later when the vocabulary ships.
     # No adaptation is applied — this is pure surfacing.
 
+    # ── D11: column orientation-lock (2026-08-03) ──────────────
+    # Within each station column (approach-above → contact →
+    # retreat-above), TCP orientation MUST be identical to the
+    # taught contact anchor's orientation within 0.1°. Enforced by
+    # construction via `seeded_ik_z_lift_hold_orientation`; this
+    # analyzer check catches the case where the IK didn't converge
+    # or the fallback path emitted a non-orientation-locked pose.
+    # Severity 'block' — the dashboard save gate refuses to store a
+    # program with any block finding.
+    D11_TOL_DEG = 0.1
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict): continue
+        if str(s.get('action') or '').lower() != 'move_linear': continue
+        role = s.get('derived_from')
+        if not role: continue
+        # Only column derived steps — those whose derived_from names
+        # a station role with a taught contact somewhere.
+        anchor = None
+        for j, cand in enumerate(steps):
+            if (isinstance(cand, dict)
+                    and str(cand.get('action') or '').lower() == 'move_linear'
+                    and not cand.get('derived_from')
+                    and str(cand.get('position_role') or '') == str(role)):
+                atj = cand.get('taught_joints')
+                if isinstance(atj, list) and len(atj) == 6 \
+                        and all(isinstance(v, (int, float)) for v in atj):
+                    anchor = cand; break
+        if anchor is None: continue
+        atj = [float(v) for v in anchor['taught_joints']]
+        ofs = float(s.get('offset_z_mm') or 0)
+        if abs(ofs) < 1e-6:
+            # Identity offset — pose IS the anchor; orientation lock
+            # trivially holds. Skip.
+            continue
+        ik = seeded_ik_z_lift_hold_orientation(atj, ofs)
+        if ik is None:
+            findings.append(_finding(
+                i, s, 'block',
+                'column_orient_ik_failed',
+                f'D11 column-orientation-lock IK did not converge for '
+                f'{role!r} derived step (offset_z_mm={ofs:g}). Refusing '
+                f'to save: the derived pose cannot be constructed with '
+                f'the anchor\'s orientation. Re-teach the anchor to a '
+                f'less-singular pose, or reduce the offset.',
+                'Re-teach the anchor with more margin from wrist '
+                'singularity (|J5|=0) or the joint limits.',
+                metrics={'derived_from': role, 'offset_z_mm': ofs}))
+            continue
+        _lifted, _achieved, orient_err_deg = ik
+        if orient_err_deg > D11_TOL_DEG:
+            findings.append(_finding(
+                i, s, 'block',
+                'column_orient_delta',
+                f'D11 column-orientation-lock VIOLATED: derived pose '
+                f'for {role!r} carries orientation {orient_err_deg:.4f}° '
+                f'off the anchor\'s taught orientation (tolerance '
+                f'{D11_TOL_DEG:g}°). Approaches, descents, and ascents '
+                f'within a column MUST share the anchor\'s orientation.',
+                'Fix the codegen orientation solver — the anchor\'s '
+                'orientation is the single source of truth for the '
+                'column.',
+                metrics={'orient_err_deg': orient_err_deg,
+                         'tolerance_deg':  D11_TOL_DEG,
+                         'derived_from':   role,
+                         'offset_z_mm':    ofs}))
+
+    # ── D11 companion: anchor tilt-from-vertical (INFO) ────────
+    # A taught contact whose flange z-axis points more than 3° off
+    # the base -Z direction surfaces as INFO ("taught with tool
+    # tilted N°"). Not a block — the operator may have TAUGHT the
+    # tilt on purpose (a Delrin piece needing 5° of tool tilt) —
+    # but a crooked teach should be visible at teach time, not
+    # discovered on camera during a run.
+    TILT_INFO_DEG = 3.0
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict): continue
+        if str(s.get('action') or '').lower() != 'move_linear': continue
+        if s.get('derived_from'): continue
+        tj = s.get('taught_joints')
+        if not (isinstance(tj, list) and len(tj) == 6
+                and all(isinstance(v, (int, float)) for v in tj)):
+            continue
+        role = s.get('position_role')
+        if not role or str(role).lower() == 'home':
+            continue
+        try:
+            R = _fk_chain([float(v) for v in tj])[-1][:3, :3]
+        except Exception:
+            continue
+        # Flange z-axis (tool approach direction) in the base frame.
+        # Anchor tilt = angle between (-z_base) and the flange's z-axis.
+        # A tool pointing straight down (typical pick/place) has
+        # flange_z aligned with -z_base → tilt ≈ 0°.
+        fz = _np.array([float(R[0, 2]), float(R[1, 2]), float(R[2, 2])])
+        cos_a = float(_np.clip(-fz[2], -1.0, 1.0))
+        tilt_deg = math.degrees(math.acos(cos_a))
+        if tilt_deg > TILT_INFO_DEG:
+            findings.append(_finding(
+                i, s, 'info',
+                'anchor_tilt_from_vertical',
+                f'{role!r} taught with tool tilted {tilt_deg:.1f}° from '
+                f'vertical — intended? (threshold {TILT_INFO_DEG:g}° '
+                f'for surfacing; not a block)',
+                'If tilt is intentional, ignore. If not, re-teach with '
+                'the tool aligned to −Z.',
+                metrics={'tilt_deg':         tilt_deg,
+                         'threshold_deg':    TILT_INFO_DEG,
+                         'flange_z_base':    [float(x) for x in fz]}))
+
     # Sort findings by step index for a stable UI ordering.
     findings.sort(key=lambda f: (f['step_idx'], f['rule']))
 
@@ -2428,6 +2668,15 @@ def codegen_lua_from_program(
     # movL (movJ back-to-back at the same joints is a controller-
     # tolerated no-op).
     last_move_joints: list[float] | None = None
+    # D11 (2026-08-03): True when the previous move emission was a
+    # column-derived step whose joints came from
+    # `seeded_ik_z_lift_hold_orientation`. Under D11 the endpoint TCP
+    # orientations agree by construction, so the controller's movL
+    # cartesian interp holds orientation across the segment even when
+    # ARM joints reconfigure by 10–30° — the joint-delta wrist-lock
+    # guard would fire falsely against a D11 lock. When this flag is
+    # True the guard becomes an annotation, not a fallback trigger.
+    last_move_col_locked: bool = False
     # Loop step handling. There are three cases:
     #   count == 0  (continuous)  — emit `goto ::_prog_start::` at the
     #                               loop step and prepend the label at
@@ -3117,6 +3366,7 @@ def codegen_lua_from_program(
                     + (f'  joints=[{joints_s}]' if joints_s else ''))
                 if len(tj) == 6:
                     last_move_joints = [float(v) for v in tj]
+                last_move_col_locked = False
                 continue
             # FIX C (Part C, 2026-07-22): SEEDED IK at codegen time.
             # Compute the lifted joints from the anchor's taught_joints
@@ -3135,7 +3385,26 @@ def codegen_lua_from_program(
             if len(tj) == 6 and all(isinstance(v, (int, float)) for v in tj):
                 anchor_deg = [float(v) for v in tj]
                 anchor_j5 = anchor_deg[4]
-                ik = seeded_ik_z_lift(anchor_deg, ofs_mm)
+                # D11 column-orientation-lock IK (2026-08-03). Full
+                # 6-DOF Newton solve holding the anchor's BASE-FRAME
+                # orientation exact. Only used when this derived step
+                # is a column derived step (approach/ascent of a
+                # station); non-column derived transits still go
+                # through the prior 3-DOF Z-arm-only solver.
+                _col_side = _is_column_derived(_step_idx)
+                if _col_side is not None:
+                    ik_full = seeded_ik_z_lift_hold_orientation(
+                        anchor_deg, ofs_mm)
+                    if ik_full is not None:
+                        lifted_deg, achieved, orient_err_deg = ik_full
+                        ik = (lifted_deg, achieved)
+                        _col_ori_err_deg = orient_err_deg
+                    else:
+                        ik = seeded_ik_z_lift(anchor_deg, ofs_mm)
+                        _col_ori_err_deg = None
+                else:
+                    ik = seeded_ik_z_lift(anchor_deg, ofs_mm)
+                    _col_ori_err_deg = None
                 if ik is not None:
                     lifted_deg, achieved = ik
                     j5_delta = abs(lifted_deg[4] - anchor_j5)
@@ -3243,24 +3512,34 @@ def codegen_lua_from_program(
                                     ' (emitted movJ — derived transit '
                                     'to a non-station reference, '
                                     'joint-space by design)')
-                        # Orientation invariant stamp — FK the seeded
-                        # joints vs the anchor's taught joints and
-                        # report per-axis delta. Task §3 threshold
-                        # is 1°; deviation above that warrants an
-                        # operator note (still emit; check only
-                        # informational at codegen).
+                        # Orientation invariant stamp — D11 (2026-08-03).
+                        # For column-derived steps the 6-DOF hold-
+                        # orientation solver GUARANTEES the flange
+                        # orientation is equal to the anchor's within
+                        # its convergence tolerance; report the
+                        # solver's own residual so the number the
+                        # operator sees is the number the validator
+                        # checks. For non-column derived transits the
+                        # Euler-delta approximation stands.
                         orient_note = ''
-                        emitted_orient = _tcp_orientation_deg(lifted_deg)
-                        anchor_orient  = _tcp_orientation_deg(anchor_deg)
-                        if emitted_orient is not None and anchor_orient is not None:
-                            drx = abs(emitted_orient[0] - anchor_orient[0])
-                            dry = abs(emitted_orient[1] - anchor_orient[1])
-                            drz = abs(emitted_orient[2] - anchor_orient[2])
-                            worst = max(drx, dry, drz)
-                            flag = ' >1°(!) ' if worst > 1.0 else ''
+                        if column_side is not None and _col_ori_err_deg is not None:
+                            flag = ' >0.1°(!) ' if _col_ori_err_deg > 0.1 else ''
                             orient_note = (
-                                f'  orient_dev=(rx={drx:.2f}°,ry={dry:.2f}°,rz={drz:.2f}°)'
-                                f' max={worst:.2f}°{flag}')
+                                f'  orient_dev={_col_ori_err_deg:.4f}°'
+                                f'  (D11 column-orientation-lock, '
+                                f'max-axis of R_anchor·R_lifted^T){flag}')
+                        else:
+                            emitted_orient = _tcp_orientation_deg(lifted_deg)
+                            anchor_orient  = _tcp_orientation_deg(anchor_deg)
+                            if emitted_orient is not None and anchor_orient is not None:
+                                drx = abs(emitted_orient[0] - anchor_orient[0])
+                                dry = abs(emitted_orient[1] - anchor_orient[1])
+                                drz = abs(emitted_orient[2] - anchor_orient[2])
+                                worst = max(drx, dry, drz)
+                                flag = ' >1°(!) ' if worst > 1.0 else ''
+                                orient_note = (
+                                    f'  orient_dev=(rx={drx:.2f}°,ry={dry:.2f}°,rz={drz:.2f}°)'
+                                    f' max={worst:.2f}°{flag}')
                         _emit_motion_prelude(_step_idx, emit_verb_derived, step)
                         exec_lines.append(
                             f'{emit_verb_derived}({name})  -- step {action}'
@@ -3270,6 +3549,8 @@ def codegen_lua_from_program(
                             f'taught J5={anchor_j5:+.2f}° → emitted J5={lifted_deg[4]:+.2f}° '
                             f'Δ{j5_delta:.3f}°)  joints=[{joints_s}]{feas_note}{orient_note}')
                         last_move_joints = list(lifted_deg)
+                        last_move_col_locked = (column_side is not None
+                                                and _col_ori_err_deg is not None)
                         continue
                     # J5 sanity trip — should NEVER happen (we hold J5)
                     # but the fallback path is safer than emitting a
@@ -3299,6 +3580,7 @@ def codegen_lua_from_program(
             # invariant matters for legacy programs whose approach
             # is still on the movJCoorRel path.
             last_move_joints = None
+            last_move_col_locked = False
             continue
 
         # ---- Motion — movJ/movL via point ref or inline taught_joints
@@ -3346,10 +3628,14 @@ def codegen_lua_from_program(
             divergence_note = ''
             if verb == 'movL':
                 chk = _wrist_descend_safety(j, last_move_joints)
-                if chk['safe']:
+                if chk['safe'] or last_move_col_locked:
+                    _guard = ('  (D11 upstream orientation-locked — '
+                              'joint delta advisory)'
+                              if last_move_col_locked and not chk['safe']
+                              else f' ≤ {_WRIST_LOCK_MAX_DEG:.0f}°')
                     wrist_note = (f'  wrist_dev=max{chk["max"]:.2f}° '
                                   f'(J4Δ={chk["j4"]:.2f}° J5Δ={chk["j5"]:.2f}° '
-                                  f'J6Δ={chk["j6"]:.2f}°) ≤ {_WRIST_LOCK_MAX_DEG:.0f}°')
+                                  f'J6Δ={chk["j6"]:.2f}°){_guard}')
                 else:
                     emit_verb = 'movJ'
                     divergence_note = (
@@ -3363,6 +3649,7 @@ def codegen_lua_from_program(
                 f'{emit_verb}({pn})  -- step {action}{divergence_note}  '
                 f'point={pn}  {j5_note}  joints=[{joints_s}]{wrist_note}')
             last_move_joints = j_list
+            last_move_col_locked = False
             continue
         taught = step.get('taught_joints')
         if not (isinstance(taught, list) and len(taught) == 6
@@ -3402,10 +3689,14 @@ def codegen_lua_from_program(
         inline_divergence_note = ''
         if verb == 'movL':
             chk = _wrist_descend_safety(taught, last_move_joints)
-            if chk['safe']:
+            if chk['safe'] or last_move_col_locked:
+                _guard = ('  (D11 upstream orientation-locked — '
+                          'joint delta advisory)'
+                          if last_move_col_locked and not chk['safe']
+                          else f' ≤ {_WRIST_LOCK_MAX_DEG:.0f}°')
                 wrist_note = (f'  wrist_dev=max{chk["max"]:.2f}° '
                               f'(J4Δ={chk["j4"]:.2f}° J5Δ={chk["j5"]:.2f}° '
-                              f'J6Δ={chk["j6"]:.2f}°) ≤ {_WRIST_LOCK_MAX_DEG:.0f}°')
+                              f'J6Δ={chk["j6"]:.2f}°){_guard}')
             else:
                 emit_verb = 'movJ'
                 inline_divergence_note = (
@@ -3457,6 +3748,7 @@ def codegen_lua_from_program(
                         f'-- RULE 2c gentle descent final approach')
                     _last_accl = gentle_accL
                 last_move_joints = list(inter_joints)
+                last_move_col_locked = False
                 _did_split = True
             else:
                 exec_lines.append(
@@ -3468,6 +3760,7 @@ def codegen_lua_from_program(
             f'{emit_verb}({name})  -- step {action}{inline_divergence_note}  '
             f'{j5_note}  joints=[{joints_s}]{wrist_note}')
         last_move_joints = taught_list
+        last_move_col_locked = False
         # After a descent split, restore default setAccL so the
         # retreat (or next segment) doesn't inherit the gentle value.
         if _did_split:
