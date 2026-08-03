@@ -5423,6 +5423,24 @@ if FASTAPI_AVAILABLE:
                 })
         except Exception as e:
             print(f'[run] attach_pending_metadata failed: {e}', flush=True)
+        # D9 line_map wire (2026-08-03) — mirror the resident program's
+        # codegen sha into STATE.robot.program so the Monitor's live
+        # step highlight can compare against `/api/programs/{id}/
+        # line_map` and honor the honesty guard (mismatch → no
+        # highlight + "line map unavailable" note).
+        try:
+            with _state_lock:
+                pg = STATE.setdefault("robot", {}).setdefault("program", {})
+                pg["codegen_sha"] = program_ops.CODEGEN_VERSION.get(
+                    'src_sha256', '')[:12]
+                pg["codegen_git"] = program_ops.CODEGEN_VERSION.get(
+                    'git_sha', '')
+                pg["pushed_lua_sha12"] = _push_sha[:12]
+                pg["stored_lua_sha12"] = stored_sha[:12]
+                pg["resident_program_id"] = prog_id
+        except Exception as e:
+            print(f'[run] resident program state mirror failed: {e}',
+                  flush=True)
 
         try:
             _ros_node._estun_publish_op("to_auto")
@@ -7112,6 +7130,58 @@ if FASTAPI_AVAILABLE:
                     break
         return out
 
+    def _line_map_sidecar_path(prog_id):
+        return os.path.join(_PROG_DIR, f'{prog_id}.line_map.json')
+
+
+    def _compute_and_save_line_map(program):
+        """Run codegen (dry) with `line_map_sink`, then persist the
+        map + codegen sha to `<prog_id>.line_map.json` alongside the
+        program JSON. Returns the sidecar dict. Best-effort — if the
+        codegen fails (usually a taught-joints gap on a draft), we
+        write an empty map with the failure reason so the frontend's
+        honesty guard still fires. Called from POST and PUT
+        /api/programs so every saved program carries a fresh map."""
+        prog_id = str(program.get('id') or '').strip()
+        if not prog_id:
+            return None
+        sink = []
+        try:
+            _lua, _pts, eff_pct = program_ops.codegen_lua_from_program(
+                program, operator_speed_limit_pct=100,
+                line_map_sink=sink)
+            sidecar = {
+                'program_id':   prog_id,
+                'line_map':     sink,
+                'codegen_sha':  program_ops.CODEGEN_VERSION.get(
+                    'src_sha256', '')[:12],
+                'codegen_git':  program_ops.CODEGEN_VERSION.get(
+                    'git_sha', ''),
+                'effective_pct': int(eff_pct),
+                'generated_ts': _now_stamp(),
+                'error':        None,
+            }
+        except Exception as e:
+            sidecar = {
+                'program_id':   prog_id,
+                'line_map':     [],
+                'codegen_sha':  program_ops.CODEGEN_VERSION.get(
+                    'src_sha256', '')[:12],
+                'codegen_git':  program_ops.CODEGEN_VERSION.get(
+                    'git_sha', ''),
+                'effective_pct': None,
+                'generated_ts': _now_stamp(),
+                'error':        f'{type(e).__name__}: {e}',
+            }
+        try:
+            with open(_line_map_sidecar_path(prog_id), 'w') as f:
+                json.dump(sidecar, f, indent=2)
+        except Exception as e:
+            print(f'[line_map] sidecar write failed for {prog_id}: {e}',
+                  flush=True)
+        return sidecar
+
+
     def _d11_block_findings(program):
         """Run the motion analyzer over `program` and return any
         findings with severity=='block'. Empty list on success.
@@ -7320,7 +7390,12 @@ if FASTAPI_AVAILABLE:
                 json.dump(program, f, indent=2)
         except Exception as e:
             return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
+        # Line-map sidecar (D9 · 2026-08-03) — every saved program
+        # gets a fresh line_map for the Monitor's live step highlight.
+        sidecar = _compute_and_save_line_map(program)
         return {"ok": True, "program": program,
+                "line_map":  (sidecar or {}).get("line_map"),
+                "codegen_sha": (sidecar or {}).get("codegen_sha"),
                 "warnings": {"move_home_drift": home_warnings}
                             if home_warnings else {}}
 
@@ -7465,7 +7540,10 @@ if FASTAPI_AVAILABLE:
                 _client_id_of(request), "program_put")
         except Exception as e:
             return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
+        sidecar = _compute_and_save_line_map(prog)
         return {"ok": True, "program": prog, "rev": new_rev,
+                "line_map":  (sidecar or {}).get("line_map"),
+                "codegen_sha": (sidecar or {}).get("codegen_sha"),
                 "warnings": {"move_home_drift": home_warnings_put}
                             if home_warnings_put else {}}
 
@@ -10260,6 +10338,49 @@ if FASTAPI_AVAILABLE:
         rep['adaptations'] = {str(k): v for k, v in rep['adaptations'].items()}
         rep['program_id'] = prog_id
         return rep
+
+    @app.get("/api/programs/{prog_id}/line_map")
+    async def api_program_line_map(prog_id: str):
+        """Return the D9 line_map for a program: one entry per step
+        with `{step_idx, step_id, action, lua_line_start,
+        lua_line_end}` plus the codegen sha the map was generated
+        against. Consumed by the Monitor's live step-highlight —
+        joins ProjectState.line to step_id without regex heuristics
+        against emitted comments.
+
+        Read path: sidecar `<prog_id>.line_map.json` (written on
+        every save). If the sidecar is missing (older program or
+        a race), regenerate on demand and stash it. Honesty
+        contract: `codegen_sha` in the response is the sha that
+        AUTHORED the map — the client must compare against the
+        RESIDENT program's codegen sha (from the /ws/state
+        robot.program.codegen_sha wire) before highlighting; a
+        mismatch means the resident Lua doesn't match this map."""
+        prog_path = _prog_read_path(prog_id)
+        if not prog_path or not os.path.isfile(prog_path):
+            return JSONResponse({"error": "program not found"},
+                                status_code=404)
+        sc_path = _line_map_sidecar_path(prog_id)
+        # Prefer cached sidecar (written on save).
+        if os.path.isfile(sc_path):
+            try:
+                with open(sc_path) as fp:
+                    return json.load(fp)
+            except Exception:
+                pass  # regenerate below on parse error
+        # Regenerate on demand — first read after a fresh deploy or
+        # for programs saved before the sidecar existed.
+        try:
+            with open(prog_path) as fp:
+                prog = json.load(fp)
+        except Exception as e:
+            return JSONResponse({"error": f"read failed: {e}"},
+                                status_code=500)
+        sidecar = _compute_and_save_line_map(prog)
+        if sidecar is None:
+            return JSONResponse({"error": "cannot compute line_map"},
+                                status_code=500)
+        return sidecar
 
     @app.get("/api/programs/{prog_id}/pallet_slots")
     async def api_program_pallet_slots(prog_id: str):

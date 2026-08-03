@@ -176,41 +176,63 @@ export function restartButtonEnabled({ runStateKind, stoppingSinceTs, safety,
   return true
 }
 
-// Reproduce the codegen's line-emission decision for each step so the
-// step-preview panel can find WHICH step corresponds to a given
-// ProjectState.line value. Matches program_ops.codegen_lua_from_program
-// in the driver — every step (valid or skipped) consumes one file line;
-// RETIRED (2026-07-30 audit #P1-1). The old assumption was one Lua
-// line per step; codegen actually emits multiple lines per step
-// (setSpeedJ prelude, motion_check ADAPTED comments, WRIST-LOCK
-// FALLBACK comments, seeded-IK descent-split intermediate). The
-// resulting line→step lookup pointed at the wrong step during any
-// program that touched motion-vocab modal state.
+// Line-map (D9 · 2026-08-03) — the codegen-emitted step map is the
+// single source of truth. `/api/programs/{id}/line_map` returns a
+// sidecar authored by `program_ops.codegen_lua_from_program`; each
+// entry is `{step_idx, step_id, action, lua_line_start, lua_line_end}`.
+// The prior heuristic that reproduced the walker in JS was retired
+// after the 2026-07-30 audit — codegen emits multi-line preludes
+// (setSpeedJ, ADAPTED comments) that broke the "one Lua line per
+// step" assumption. The sidecar is authored by the same code that
+// emitted the lines, so the map can't drift from the wire.
 //
-// Current behavior: return an empty map so stepIndexForLine falls
-// through to task.program_step (executor sim path). On the Estun
-// pipeline, task.program_step is not populated — the step-preview
-// panel then simply doesn't highlight, which is HONEST (we don't
-// know) rather than WRONG (pretending to know).
-//
-// Follow-up (queued in docs/ui_truth_audit.md #P1-1): add
-// GET /api/programs/{id}/line_map that dry-runs codegen and returns
-// the authoritative per-step line indices; fetch on Run press and
-// consult here.
-export function computeLineMap(_program) {
-  return []
-}
+// stepIndexForLine consumes a fetched line_map (pass as second arg)
+// and does an inclusive-range lookup. Returns -1 when there's no
+// map or the line falls outside every step's range — the caller
+// then either falls through to task.program_step (executor sim
+// path) or renders no highlight (honesty rule).
 
-// stepIndexForLine(program, line) — inverse of computeLineMap. Given
-// the ProjectState.line the driver reports, find the step index
-// (0-based). Returns -1 when no map is available so the caller falls
-// through to task.program_step (see StepPreviewPanel + ProgramEditor
-// executingIdx derivation).
-export function stepIndexForLine(program, line) {
+export function stepIndexForLine(_program, line, lineMap) {
   if (line == null || line <= 0) return -1
-  const map = computeLineMap(program)
-  for (let i = 0; i < map.length; i++) {
-    if (map[i] && map[i].emittedLine === line) return i
+  if (!Array.isArray(lineMap) || lineMap.length === 0) return -1
+  for (let i = 0; i < lineMap.length; i++) {
+    const e = lineMap[i]
+    if (!e) continue
+    const s = e.lua_line_start
+    const t = e.lua_line_end
+    if (!Number.isInteger(s) || !Number.isInteger(t)) continue
+    if (line >= s && line <= t) {
+      return Number.isInteger(e.step_idx) ? e.step_idx : i
+    }
   }
   return -1
+}
+
+// Honesty guard — the wire's `robot.program.codegen_sha` (mirrored
+// by the dashboard on every save_project) MUST equal the line_map
+// sidecar's `codegen_sha`. Mismatch means the resident Lua doesn't
+// match this map (stale resident, foreign program, mid-deploy race)
+// and the caller MUST NOT highlight. Returns:
+//   {ok: true}                         — map matches resident
+//   {ok: false, reason: 'no_resident'} — nothing running to compare
+//   {ok: false, reason: 'no_map'}      — sidecar not fetched yet
+//   {ok: false, reason: 'sha_mismatch',
+//    resident, map}                    — protocol wire disagrees
+//   {ok: false, reason: 'wrong_program',
+//    resident_program_id, map_program_id}
+export function lineMapHonesty({ residentSha, residentProgramId,
+                                 lineMapSha, lineMapProgramId }) {
+  if (!residentSha) return { ok: false, reason: 'no_resident' }
+  if (!lineMapSha)  return { ok: false, reason: 'no_map' }
+  if (lineMapProgramId && residentProgramId
+      && lineMapProgramId !== residentProgramId) {
+    return { ok: false, reason: 'wrong_program',
+             resident_program_id: residentProgramId,
+             map_program_id: lineMapProgramId }
+  }
+  if (residentSha !== lineMapSha) {
+    return { ok: false, reason: 'sha_mismatch',
+             resident: residentSha, map: lineMapSha }
+  }
+  return { ok: true }
 }

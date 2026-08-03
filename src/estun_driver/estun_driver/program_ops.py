@@ -2408,6 +2408,7 @@ def codegen_lua_from_program(
     motion_config: dict | None = None,
     motion_check: dict | None = None,
     part_index: dict | None = None,
+    line_map_sink: list | None = None,
 ) -> tuple[str, dict[str, dict], int]:
     """Turn a taught-program dict into (lua_source, varspoint, effective_pct).
 
@@ -3022,8 +3023,48 @@ def codegen_lua_from_program(
                         f'-- radius mm {tag}')
                     _blender_on = effective_radius
 
+    # D9 line_map stamp (2026-08-03) — for the Monitor live step-
+    # highlight. One entry per walker step iteration so the frontend
+    # can join ProjectState.line → step_id without regex heuristics
+    # against comments. Entry shape:
+    #   {step_idx, step_id, action, lua_line_start, lua_line_end}
+    # Both ends are 1-based, inclusive. The wire's ProjectState.line
+    # always falls within a step's [start, end] range; the frontend
+    # maps ANY line in the range to this step_id.
+    #
+    # Recording pattern: at the top of each iteration we close out
+    # the PREVIOUS iteration's entry using the current exec_lines
+    # length as the end line. After the loop the tail entry is
+    # closed. This avoids having to instrument every `continue` site
+    # in the walker body.
+    line_map: list[dict] = []
+    _lm_pending = None    # (step_idx, step_id, action, start_line)
+
+    def _lm_close_pending():
+        nonlocal _lm_pending
+        if _lm_pending is None:
+            return
+        _s_idx, _s_id, _s_act, _s_start = _lm_pending
+        _s_end = len(exec_lines)
+        # A step that emitted no lines (should be rare — a bare
+        # unrecognised action) still gets an entry so consumers
+        # don't have to distinguish "no map" from "empty map".
+        if _s_end < _s_start:
+            _s_end = _s_start - 1  # inverted range = zero emissions
+        line_map.append({
+            'step_idx':       _s_idx,
+            'step_id':        _s_id,
+            'action':         _s_act,
+            'lua_line_start': _s_start,
+            'lua_line_end':   _s_end,
+        })
+        _lm_pending = None
+
     for _step_idx, step in enumerate(steps):
+        _lm_close_pending()
         action = step.get('action', '?')
+        _lm_pending = (_step_idx, step.get('id'), action,
+                       len(exec_lines) + 1)
 
         # Rule 2d adaptation: coalesce_with_prev — the analyzer
         # flagged this step as a micro-duplicate of the previous
@@ -3897,6 +3938,24 @@ def codegen_lua_from_program(
     # and refuses to publish on any finding; this footer stamp is
     # informational (a mismatch between the stamp and a fresh lint
     # would flag disk/memory corruption).
+    # Close the tail line_map entry — the last iteration didn't get a
+    # top-of-next-iter closer.
+    _lm_close_pending()
+
+    # D9 line_map stamp — embedded in the footer as a single JSON
+    # comment so the resident Lua carries its own step map. The API
+    # endpoint `/api/programs/{id}/line_map` reads this if the
+    # sidecar sidecar hasn't been written yet; the frontend's honesty
+    # guard verifies the codegen_sha embedded here matches the
+    # program artifact's stamp before using the map for highlighting.
+    import json as _json
+    footer_lines.append(
+        '-- line_map (D9 · one entry per step, {step_idx, step_id, '
+        'action, lua_line_start, lua_line_end}): '
+        + _json.dumps(line_map, separators=(',', ':')))
+    if line_map_sink is not None:
+        line_map_sink.extend(line_map)
+
     _lint_source_before_footer = '\r\n'.join(exec_lines) + '\r\n'
     try:
         _lint_findings = lint_lua_source(_lint_source_before_footer)

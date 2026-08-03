@@ -947,27 +947,24 @@ export default function MonitorDashboard() {
                 Step {currentStepIdx + 1} of {steps.length}: {currentStepLabel}
               </div>
             )}
-            {/* Live indicator from the Estun driver's publish/ProjectState
-                mirror (STATE.robot.program). Renders whenever the driver
-                reports state=2 (running) OR the operator is single-stepping.
-                This is the ground truth from the controller, distinct from
-                the sim executor's task.program_step. */}
-            {(robot?.program?.state === 2 || robot?.program?.is_step) && (
-              <div style={{
-                marginTop: 8, padding: '8px 12px',
-                background: '#F0FDF4', border: '1px solid #16A34A',
-                borderRadius: 6, fontSize: 13, color: '#065F46',
-                fontFamily: 'monospace',
+            {/* D10-adjacent (2026-08-03): the raw ProjectState wire line
+                — "state=2 task=main line=15 project=..." — used to
+                render here as a protocol dump. Controller-speak
+                never renders to the operator; the RUNNING pill +
+                program name carry the state, and single-step mode
+                surfaces as a small chip below. Raw wire data
+                lives in the debug/log surface only. */}
+            {robot?.program?.is_step && (
+              <span style={{
+                display: 'inline-block', marginTop: 8,
+                padding: '2px 8px', borderRadius: 999,
+                background: '#FEF3C7', color: '#92400E',
+                border: '1px solid #FCD34D',
+                fontSize: 11, fontWeight: 700, letterSpacing: '0.03em',
+                textTransform: 'uppercase',
               }}>
-                <b>Estun:</b>{' '}
-                state={robot.program.state}{' '}
-                {robot.program.is_step ? '(single-step)' : '(auto)'}{' '}
-                &middot; task={robot.program.task ?? '—'}{' '}
-                &middot; line={robot.program.line ?? '—'}{' '}
-                {robot.program.project_id && (
-                  <> &middot; project={robot.program.project_id}</>
-                )}
-              </div>
+                Single-step
+              </span>
             )}
             {/* Live step-preview panel — highlights the currently-executing
                 step from publish/ProjectState.line. Only appears when

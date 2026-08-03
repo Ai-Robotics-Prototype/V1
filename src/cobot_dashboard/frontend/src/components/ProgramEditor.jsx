@@ -20,7 +20,8 @@ import { PALLET_ROLE_TO_FIELD, modeForRole, taughtCount,
   from '../lib/palletTeachSequence'
 import { computeProgramFindings } from '../lib/programFindings'
 import { computeTeachingDebt, debtBannerLabel } from '../lib/teachingDebt'
-import { stepIndexForLine } from '../lib/runState'
+import { stepIndexForLine, lineMapHonesty } from '../lib/runState'
+import { useLineMap } from '../lib/useLineMap'
 import { teachLayoutMetrics } from '../lib/teachLayout'
 import { paletteLabelForAction, effectorDisplayName, effectorOf }
   from '../lib/effectorVocab'
@@ -3195,12 +3196,28 @@ export default function ProgramEditor() {
   // (also when the run just finished — the bar clears to empty).
   const _programLine       = useStore((s) => s.robot?.program?.line)
   const _programStep       = useStore((s) => s.task?.program_step)
+  const _residentSha       = useStore((s) => s.robot?.program?.codegen_sha)
+  const _residentProgramId = useStore((s) => s.robot?.program?.resident_program_id
+                                          ?? s.robot?.program?.project_id)
+  const {
+    lineMap: _lineMap, codegenSha: _mapSha, programId: _mapProgId
+  } = useLineMap(currentProgram?.id, currentProgram?.rev)
+  const _honesty = lineMapHonesty({
+    residentSha: _residentSha,
+    residentProgramId: _residentProgramId,
+    lineMapSha: _mapSha,
+    lineMapProgramId: _mapProgId,
+  })
   const executingIdx = (() => {
-    if (Number.isInteger(_programLine) && _programLine > 0) {
-      const idx = stepIndexForLine(currentProgram, _programLine)
+    if (Number.isInteger(_programLine) && _programLine > 0 && _honesty.ok) {
+      const idx = stepIndexForLine(currentProgram, _programLine, _lineMap)
       if (idx >= 0) return idx
     }
-    if (Number.isInteger(_programStep)) return _programStep
+    if (Number.isInteger(_programStep)
+        && (_honesty.ok || _honesty.reason === 'no_resident'
+            || _honesty.reason === 'no_map')) {
+      return _programStep
+    }
     return -1
   })()
 

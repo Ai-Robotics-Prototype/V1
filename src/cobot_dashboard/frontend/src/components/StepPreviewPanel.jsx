@@ -1,25 +1,21 @@
+import { useEffect, useRef } from 'react'
 import { useStore } from '../store/useStore'
-import { deriveRunState, stepIndexForLine } from '../lib/runState'
+import { deriveRunState, stepIndexForLine, lineMapHonesty }
+  from '../lib/runState'
+import { useLineMap } from '../lib/useLineMap'
 
-// Live step-preview panel — shows the currently-loaded program's steps
-// with the executing step highlighted from publish/ProjectState
-// scripts.{task}.line.
+// Live step-preview panel — shows the currently-loaded program's
+// steps with the executing step highlighted from publish/ProjectState
+// scripts.{task}.line, JOINED against the D9 line_map sidecar for
+// that program (2026-08-03). No more regex heuristics — the map is
+// authored by the codegen that wrote the resident Lua lines.
 //
-// Display is titles-only: step number, type tag, label. No per-step
-// classifier annotation — the old right-hand column (I/O DO2 · pending
-// capture, wait 0.5s · no delay verb, → pick (taught), etc.) has been
-// removed. Codegen now emits real verbs for every non-motion action
-// (setDO/setAO for set_io, wait() for wait, getDI for wait_input,
-// goto/label for loop), so the "pending" annotations were both noisy
-// and stale. Live state — executing highlight, green checkmark for
-// completed — stays.
-//
-// Line→step mapping (see lib/runState.computeLineMap):
-//   program_ops.codegen_lua_from_program emits ONE Lua line per step.
-//   The interpreter's ProjectState.line reports the FILE-LINE number
-//   for the currently-executing line; skipped comment lines are never
-//   reported (the interpreter skips them). computeLineMap handles the
-//   mapping.
+// Honesty guard: the resident program's codegen_sha (mirrored into
+// STATE.robot.program.codegen_sha by the dashboard on save_project)
+// MUST equal the line_map sidecar's codegen_sha before we highlight.
+// Mismatch = stale resident, foreign program, or mid-deploy race →
+// render no highlight + a small "line map unavailable" note (never
+// highlight the wrong step — truth-audit rule stands).
 
 export default function StepPreviewPanel() {
   const cp = useStore((s) => s.currentProgram)
@@ -33,6 +29,26 @@ export default function StepPreviewPanel() {
   const steps = Array.isArray(cp?.steps) ? cp.steps : []
   const total = steps.length
 
+  // D9 line_map fetch (2026-08-03). Rev in the cache key so a save
+  // invalidates. Program id from currentProgram — usually stable
+  // across a run.
+  const {
+    lineMap, codegenSha: mapCodegenSha,
+    programId: mapProgramId,
+    loading: mapLoading, error: mapError,
+  } = useLineMap(cp?.id, cp?.rev)
+
+  // Honesty guard against the resident program's codegen sha.
+  const residentSha = robot?.program?.codegen_sha
+  const residentProgramId = robot?.program?.resident_program_id
+                            ?? robot?.program?.project_id
+  const honesty = lineMapHonesty({
+    residentSha,
+    residentProgramId,
+    lineMapSha: mapCodegenSha,
+    lineMapProgramId: mapProgramId,
+  })
+
   // Which step is currently executing? Only meaningful in running /
   // stopping / paused states — everything else clears the highlight.
   let currentIdx = -1
@@ -40,13 +56,28 @@ export default function StepPreviewPanel() {
                    || runState.kind === 'paused'
   if (isActive) {
     const line = robot?.program?.line
-    if (Number.isInteger(line) && line > 0) {
-      currentIdx = stepIndexForLine(cp, line)
+    if (Number.isInteger(line) && line > 0 && honesty.ok) {
+      currentIdx = stepIndexForLine(cp, line, lineMap)
     }
-    if (currentIdx < 0 && Number.isInteger(task?.program_step)) {
+    // Fall through to executor sim path only when the line_map path
+    // is BLANK (no resident, no map yet), not on a stamp mismatch —
+    // a mismatch means we KNOW the map is wrong for the wire.
+    if (currentIdx < 0
+        && (honesty.ok || honesty.reason === 'no_resident'
+            || honesty.reason === 'no_map')
+        && Number.isInteger(task?.program_step)) {
       currentIdx = task.program_step
     }
   }
+
+  // Auto-scroll the current step row into view as it advances.
+  const currentRowRef = useRef(null)
+  useEffect(() => {
+    if (open && currentIdx >= 0 && currentRowRef.current) {
+      try { currentRowRef.current.scrollIntoView({
+        block: 'nearest', behavior: 'smooth' }) } catch {}
+    }
+  }, [currentIdx, open])
 
   if (total === 0) return null   // nothing to show; hide the panel
 
@@ -80,6 +111,35 @@ export default function StepPreviewPanel() {
       </div>
       {open && (
         <div style={list}>
+          {isActive && !honesty.ok
+             && honesty.reason === 'sha_mismatch' && (
+            <div data-testid="line-map-unavailable"
+                 style={{
+                   padding: '6px 12px', fontSize: 11,
+                   color: '#92400E', background: '#FEF3C7',
+                   borderBottom: '1px solid #FCD34D',
+                 }}>
+              Line map unavailable — resident codegen sha
+              {' '}(<code>{residentSha}</code>) doesn't match the
+              saved program's map (<code>{mapCodegenSha}</code>).
+              Highlight suppressed until they agree (re-run to push
+              a fresh Lua).
+            </div>
+          )}
+          {isActive && !honesty.ok
+             && honesty.reason === 'wrong_program' && (
+            <div data-testid="line-map-unavailable"
+                 style={{
+                   padding: '6px 12px', fontSize: 11,
+                   color: '#92400E', background: '#FEF3C7',
+                   borderBottom: '1px solid #FCD34D',
+                 }}>
+              Line map unavailable — resident program on the
+              controller is <code>{honesty.resident_program_id}</code>,
+              but this panel is showing <code>{honesty.map_program_id}</code>.
+              Highlight suppressed.
+            </div>
+          )}
           {steps.map((s, i) => {
             const isDone = isActive && currentIdx >= 0 && i < currentIdx
             const isCurrent = isActive && i === currentIdx
@@ -92,6 +152,9 @@ export default function StepPreviewPanel() {
             const type = (s.type || s.action || '').toString().toUpperCase().slice(0, 12)
             return (
               <div key={s.id ?? i}
+                   ref={isCurrent ? currentRowRef : null}
+                   data-testid={isCurrent ? 'step-current' : undefined}
+                   data-step-idx={i}
                    style={{
                      display: 'grid',
                      gridTemplateColumns: '28px 96px 1fr',
