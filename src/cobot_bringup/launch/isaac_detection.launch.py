@@ -116,7 +116,15 @@ def isaac_detection_actions():
             'output_tensor_names':  ['output_tensor'],
             'output_binding_names': ['output0'],
             'verbose':              False,
-            'force_engine_update':  False,
+            # 2026-08-03 (bench-verified): the stale `.plan` on disk
+            # deserialized OK but produced silent zero-output — TRT
+            # version mismatch, engine built ~10 weeks before the
+            # current TRT toolchain. Setting `force_engine_update=True`
+            # rebuilds the `.plan` from the ONNX on FIRST launch (or
+            # any time the file is missing / stale). Adds ~90s to the
+            # first-boot after a model swap; no cost on subsequent
+            # boots (the plan cache hits).
+            'force_engine_update':  True,
         }],
     )
 
