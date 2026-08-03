@@ -5275,6 +5275,14 @@ if FASTAPI_AVAILABLE:
         # (many legal programs emit zero movJ).
         has_motion, _motion_counts = program_ops.has_valid_motion(lua)
         if not has_motion:
+            # Per-verb breakdown from the catalogue set — omit the
+            # verbose full list of 13 zero counts and just show the
+            # non-zero ones (or "all zero" when everything is 0).
+            _nz = {k: v for k, v in _motion_counts.items()
+                   if k not in ('total', 'motion_verbs_checked')
+                   and isinstance(v, int) and v > 0}
+            _detail = (', '.join(f'{k}={v}' for k, v in sorted(_nz.items()))
+                       if _nz else 'all mov* verbs = 0')
             return JSONResponse({
                 "error": ("program has no runnable motion — teach at "
                           "least one point (or bind a pallet frame) "
@@ -5282,12 +5290,8 @@ if FASTAPI_AVAILABLE:
                 "ok": False,
                 "outcome": {
                     "kind":   "empty_program",
-                    "reason": (f"codegen produced zero point-referencing "
-                               f"motion verbs "
-                               f"(movJ={_motion_counts['movJ']}, "
-                               f"movL={_motion_counts['movL']}, "
-                               f"movC={_motion_counts['movC']}, "
-                               f"movJCoorRel={_motion_counts['movJCoorRel']})"),
+                    "reason": (f"codegen produced zero motion-verb "
+                               f"emissions ({_detail})"),
                     "motion_counts": _motion_counts,
                 },
                 "program_id": prog_id,

@@ -21,16 +21,50 @@ from __future__ import annotations
 import os
 import re
 
-from estun_driver.program_ops import has_valid_motion
+from estun_driver.program_ops import (
+    has_valid_motion, motion_verbs, _load_luaenginelib)
 
 
-def test_has_valid_motion_counts_point_motion():
+def test_motion_verbs_sourced_from_luaenginelib_catalogue():
+    """The predicate's verb set is derived from the same 168-entry
+    catalogue the lint gate uses (`luaenginelib.json`) — every
+    entry whose name starts with 'mov' is a motion verb. No
+    hand-typed allowlist to drift."""
+    verbs = motion_verbs()
+    # Sanity floor: the four verbs that MUST exist to declare
+    # motion under any catalogue revision. If any of these
+    # disappears we want to know loudly.
+    for required in ('movJ', 'movL', 'movC', 'movJCoorRel'):
+        assert required in verbs, (
+            f'motion_verbs() missing required verb {required!r} — '
+            f'either the catalogue drifted or the mov-prefix rule '
+            f'stopped matching. Got: {verbs}')
+    # Every returned name must actually exist in the catalogue —
+    # this is what pins the no-fork contract.
+    lib = _load_luaenginelib()
+    for v in verbs:
+        assert v in lib, (
+            f'motion_verbs() returned {v!r} but the catalogue does '
+            f'not know that name — predicate is DRIFTING from the '
+            f'lint catalogue.')
+        assert v.startswith('mov'), (
+            f'motion_verbs() returned non-mov* verb {v!r} — the '
+            f'derivation rule is broken.')
+
+
+def test_has_valid_motion_counts_every_mov_verb():
+    """Every mov* verb from the catalogue counts as motion. Pre-
+    fix (2026-08-03) the predicate hardcoded movJ+movL+movC and
+    rejected movJCoorRel — that discrimination is retired."""
     lua = "\n".join([
         "setSpeedJ(90)",
-        "movJ(p1)  -- home",
-        "movL(p2)  -- pick",
+        "movJ(p1)",
+        "movL(p2)",
+        "movC(p3, p4)",
+        "movJCoorRel({cp={0,0,100,0,0,0}},{coor=0,tool=0})",
+        "movLCoorRel({cp={0,0,50,0,0,0}},{coor=0,tool=0})",
+        "movJToolRel({cp={0,0,-30,0,0,0}},{tool=1})",
         "setDO(2,1)",
-        "movC(p3, p4)  -- arc",
         "-- movJ(fake) in a comment must not count",
     ])
     ok, counts = has_valid_motion(lua)
@@ -38,42 +72,45 @@ def test_has_valid_motion_counts_point_motion():
     assert counts['movJ'] == 1
     assert counts['movL'] == 1
     assert counts['movC'] == 1
-    assert counts['movJCoorRel'] == 0
-    assert counts['total_point_motion'] == 3
+    assert counts['movJCoorRel'] == 1
+    assert counts['movLCoorRel'] == 1
+    assert counts['movJToolRel'] == 1
+    assert counts['total'] == 6
 
 
-def test_has_valid_motion_excludes_movJCoorRel_alone():
-    """A program whose only motion is `movJCoorRel` (base-frame Z
-    relative move — the seeded-IK fallback when the anchor has no
-    taught_joints) is NOT considered runnable. Those lines don't
-    reference a taught point, so the arm has no destination."""
+def test_has_valid_motion_movJCoorRel_alone_is_still_motion():
+    """The operator's 2026-08-03 directive: movJCoorRel commands
+    the arm to move — it IS motion. The gate must not discriminate
+    against relative-move verbs. Pre-fix predicate treated a
+    movJCoorRel-only program as empty (regression).
+
+    Physical meaning: two relative Z-moves from wherever the arm
+    starts. Not tied to a taught point, but still legitimate
+    motion the operator may have authored on purpose."""
     lua = "\n".join([
         "setSpeedJ(90)",
         "movJCoorRel({cp={0,0,100,0,0,0}},{coor=0,tool=0})",
         "movJCoorRel({cp={0,0,200,0,0,0}},{coor=0,tool=0})",
     ])
     ok, counts = has_valid_motion(lua)
-    assert ok is False, (
-        'A program with only movJCoorRel lines must not pass the '
-        'motion gate — those relative moves have no taught anchor '
-        'and would move the arm nowhere meaningful.')
+    assert ok is True, (
+        'movJCoorRel is a motion verb per the catalogue — a program '
+        'consisting only of movJCoorRel lines has motion. Gate '
+        'must not discriminate.')
     assert counts['movJCoorRel'] == 2
-    assert counts['total_point_motion'] == 0
+    assert counts['total'] == 2
 
 
 def test_has_valid_motion_empty_or_comment_only():
     for lua in ("", "-- everything skipped", "\n\n\n"):
         ok, counts = has_valid_motion(lua)
         assert ok is False, f'empty-ish Lua passed: {lua!r} -> {counts}'
-        assert counts['total_point_motion'] == 0
+        assert counts['total'] == 0
 
 
 def test_all_cartesian_program_passes_the_gate():
-    """The regression the operator flagged: a valid all-cartesian
-    program (only movL point references) must pass the motion
-    gate. Pre-fix the gate wording said 'movJ' — the check itself
-    was verb-agnostic (`not points`) but the reason string
-    misled every reader."""
+    """A valid all-cartesian program (only movL point references)
+    must pass the motion gate."""
     lua = "\n".join([
         "movL(p1)  -- pick contact",
         "movL(p2)  -- pallet slot",
@@ -83,7 +120,7 @@ def test_all_cartesian_program_passes_the_gate():
     assert ok is True
     assert counts['movJ'] == 0
     assert counts['movL'] == 3
-    assert counts['total_point_motion'] == 3
+    assert counts['total'] == 3
 
 
 def test_dashboard_server_gates_route_through_has_valid_motion():

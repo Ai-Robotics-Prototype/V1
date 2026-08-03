@@ -280,48 +280,82 @@ def seeded_ik_z_lift_hold_orientation(anchor_deg, delta_z_mm, *,
 _WRIST_LOCK_MAX_DEG = 15.0
 
 
-_MOTION_VERB_PREFIXES = ('movJ(', 'movL(', 'movC(')
+_MOTION_VERBS_CACHE: tuple | None = None
+
+
+def motion_verbs() -> tuple:
+    """Return the tuple of motion verbs sourced from
+    luaenginelib.json — the SAME 168-entry catalogue the linter
+    consults, so "what commands the arm to move?" has ONE source
+    of truth and can't drift between the lint gate and the
+    run/motion gates.
+
+    Convention (2026-08-03, verified against every catalogue
+    version shipped so far): every catalogue entry whose name
+    begins with 'mov' commands robot motion. As of the current
+    catalogue this yields 13 verbs: movAS, movAST, movC, movCW,
+    movCircle, movJ, movJCoorRel, movJJointRel, movJToolRel,
+    movL, movLCoorRel, movLToolRel, movLW. If a future catalogue
+    revision adds new mov* verbs OR renames an existing one, the
+    set updates automatically — no hand-typed allowlist to
+    forget."""
+    global _MOTION_VERBS_CACHE
+    if _MOTION_VERBS_CACHE is not None:
+        return _MOTION_VERBS_CACHE
+    try:
+        lib = _load_luaenginelib()
+    except Exception:
+        # Fall back to the smallest reliable set so a broken
+        # catalogue load doesn't take the motion gate offline.
+        # The lint gate will already have refused before we get
+        # here in the run path.
+        _MOTION_VERBS_CACHE = ('movJ', 'movL', 'movC')
+        return _MOTION_VERBS_CACHE
+    verbs = tuple(sorted(
+        name for name in lib.keys() if str(name).startswith('mov')))
+    if not verbs:
+        verbs = ('movJ', 'movL', 'movC')
+    _MOTION_VERBS_CACHE = verbs
+    return verbs
 
 
 def has_valid_motion(lua: str) -> tuple:
     """Verb-agnostic motion gate — the single source of truth for
     "does this Lua contain any motion the arm will execute?".
-    Counts the point-referencing motion verbs: movJ, movL, movC.
-    `movJCoorRel` is intentionally EXCLUDED — it's a relative Z-lift
-    the codegen falls back to when the seeded IK has no taught
-    anchor to work from, so its presence alone does not indicate
-    the program has anywhere real to go.
 
-    Returns `(has_motion: bool, counts: dict)` where
-    `counts = {'movJ': N, 'movL': N, 'movC': N, 'movJCoorRel': N,
-               'total_point_motion': N, 'total_all_motion': N}`.
+    Every mov* verb from the luaenginelib.json catalogue counts,
+    per the operator's 2026-08-03 directive: movJCoorRel /
+    movLCoorRel / movJToolRel / movLToolRel / movJJointRel /
+    movCircle / movAS / etc. ARE motion — they command the arm
+    to move — and the gate must not discriminate against them.
+
+    Returns `(has_motion: bool, counts: dict)` where `counts` is
+    a per-verb dict plus:
+      * 'total'                 — sum of all mov* hits
+      * 'motion_verbs_checked'  — the exact set the counter
+                                  consulted (for debug + tests)
 
     Consumed by dashboard_server's run-gate + home-set-gate — both
-    sites collapsed to this predicate 2026-08-03 after the operator
-    hit a "codegen produced zero valid movJ steps" refusal on a
-    valid all-cartesian program. Before this predicate the two
-    gates each checked `not varspoint` (which happened to be
-    equivalent to `no movJ+movL` because both verbs populate
-    varspoint), but the REASON STRING said "movJ" — misleading
-    under verb-fidelity. This helper puts the check text and the
-    check logic in one place so a future gate can't drift back
-    into "must have movJ" semantics."""
-    counts = {'movJ': 0, 'movL': 0, 'movC': 0, 'movJCoorRel': 0}
+    sites route here so the two check logics AND the two error
+    strings share ONE truth (2026-08-03). Motion-verb SET sourced
+    from `motion_verbs()`, which sources from the SAME catalogue
+    the lint gate uses — no fork between "is this a motion verb
+    per the linter" and "is this a motion verb per the run gate"."""
+    verbs = motion_verbs()
+    counts = {v: 0 for v in verbs}
     for line in (lua or '').splitlines():
         s = line.strip()
-        # Skip comment-only lines — a `-- foo movJ(x)` in a
-        # comment must not read as a motion emission.
+        # Skip comment-only lines — a `-- foo movJ(x)` in a footer
+        # stamp must not read as an actual emission.
         if s.startswith('--'):
             continue
-        for verb in ('movJ(', 'movL(', 'movC(', 'movJCoorRel('):
-            if s.startswith(verb):
-                counts[verb.rstrip('(')] += 1
+        for v in verbs:
+            if s.startswith(v + '('):
+                counts[v] += 1
                 break
-    counts['total_point_motion'] = (
-        counts['movJ'] + counts['movL'] + counts['movC'])
-    counts['total_all_motion'] = (
-        counts['total_point_motion'] + counts['movJCoorRel'])
-    return (counts['total_point_motion'] > 0, counts)
+    counts['total'] = sum(counts[v] for v in verbs)
+    counts['motion_verbs_checked'] = list(verbs)
+    return (counts['total'] > 0, counts)
 
 
 def _wrist_descend_safety(target_joints, last_joints):
