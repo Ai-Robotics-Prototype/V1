@@ -290,11 +290,14 @@ def test_joint_profile_approach_arrival_flips_to_movL():
     assert 'columns-always-cartesian' in derived_lines[0], derived_lines[0]
 
 
-def test_joint_profile_retreat_stays_on_movJ():
-    """Retreats — the derived step AFTER the contact — remain movJ
-    by default (they're departures, not arrivals). Label must be
-    honest: '(emitted movJ — derived retreat/transit, joint-space
-    by design)'."""
+def test_joint_profile_retreat_emits_movL_ascent():
+    """D2 amendment 2026-08-03: retreats/ascents are columns too.
+    The derived step AFTER the taught contact departs cartesian
+    (movL) in every profile, with the label
+    '(columns-always-cartesian: ascent)'. Only downgrade allowed
+    is a rule-2e awkward_wrist_transit adaptation with a reason.
+    (Prior test asserted the opposite — that was the bug the
+    operator's 09:05 run surfaced.)"""
     prog = {
         'id': 'joint-retreat',
         'config': {'speed_pct': 50},
@@ -315,11 +318,12 @@ def test_joint_profile_retreat_stays_on_movJ():
     lua, _, _ = codegen_lua_from_program(prog, operator_speed_limit_pct=100)
     derived_lines = [ln for ln in lua.splitlines()
                      if 'FIX C:' in ln and "derived_from='pick'" in ln]
-    # Two derived_from='pick' lines — approach (movL) then retreat (movJ).
+    # Two derived_from='pick' lines — approach (movL) then ascent (movL).
     assert len(derived_lines) == 2, derived_lines
     assert derived_lines[0].startswith('movL('), derived_lines[0]
-    assert derived_lines[1].startswith('movJ('), derived_lines[1]
-    assert 'derived retreat/transit' in derived_lines[1], derived_lines[1]
+    assert derived_lines[1].startswith('movL('), derived_lines[1]
+    assert 'columns-always-cartesian: ascent' in derived_lines[1], (
+        derived_lines[1])
 
 
 # ── §3 Orientation invariant stamp ─────────────────────────────

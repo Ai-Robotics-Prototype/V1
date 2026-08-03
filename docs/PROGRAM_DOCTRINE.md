@@ -28,9 +28,22 @@ rules for pose-bearing steps.
 **D2. Station columns emit movL, every profile.**
 The approach→contact→retreat trio at a station emits linear motion
 (`movL`) across every motion profile (Conservative, Balanced,
-Aggressive, custom). Transits between stations emit `movJ` unless
-explicitly overridden. Any deviation must be logged as an analyzer
-adaptation with the reason printed alongside the affected step.
+Aggressive, custom). "Retreat" and "ascent" are the same segment
+named from two sides — the derived move that carries the tool AWAY
+from the taught contact — and it stays cartesian just like the
+approach/descent that arrived. **Approaches, descents, AND ASCENTS
+are cartesian.** Interior IO between contact and ascent (gripper
+close, vacuum wait) does not break the column association. Transits
+between stations, and derived moves whose `derived_from` names no
+known station, emit `movJ`. The only permitted downgrade of a column
+segment to `movJ` is a logged analyzer adaptation
+(`awkward_wrist_transit` and the like) with the reason printed
+alongside the affected step — a bare "depart fast" reading is NOT
+a permitted exception. (2026-08-03 amendment: prior text was read as
+"approach is a column, retreat is a transit"; that reading is wrong.
+Backend codegen tracks the column via `_is_column_derived`, which
+returns `approach` OR `retreat` for any derived step referencing a
+station role with a taught contact anywhere in the program.)
 
 **D3. Shown verb == emitted verb, or the divergence is displayed.**
 The verb shown on a step row (`verbForStep`) must match the verb the

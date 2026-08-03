@@ -2525,21 +2525,13 @@ def codegen_lua_from_program(
                 and all(isinstance(v, (int, float)) for v in tj))
 
     def _is_approach_arrival(idx: int) -> bool:
-        """The columns-always-cartesian invariant treats this derived
-        step as an APPROACH ARRIVAL (the last segment before the column
-        contact) when:
-          * step[idx] is a move_linear with derived_from=<station>, AND
-          * the NEXT motion step in the walker is the taught contact
-            of that same station.
-
-        The retreat (derived_from station, following the contact) is
-        NOT an arrival — those stay movJ by default. This matches the
-        operator doctrine "arrive orientation-locked, contact,
-        depart with a wrist re-solve permitted."
-
-        Returns False for any step that isn't in that shape (no
-        derived_from, non-move_linear action, or no matching contact
-        found downstream)."""
+        """Legacy predicate: derived move_linear whose NEXT motion step
+        is the taught contact of the same station role. Kept for the
+        divergence-note wording only. The columns-always-cartesian
+        invariant NO LONGER hinges on this alone — see
+        `_is_column_derived` below (D2, 2026-08-03 amendment: ascents
+        are columns too, so retreats get movL under the same rule-2e
+        exception path as approaches)."""
         if idx < 0 or idx >= len(steps):
             return False
         s = steps[idx]
@@ -2548,8 +2540,6 @@ def codegen_lua_from_program(
         role = s.get('derived_from')
         if not role:
             return False
-        # Walk forward for the next motion-emitting step (skip
-        # non_motion: set_io/wait/etc).
         for j in range(idx + 1, len(steps)):
             nxt = steps[j]
             act = str(nxt.get('action') or '').lower()
@@ -2558,9 +2548,6 @@ def codegen_lua_from_program(
                 continue
             if act != 'move_linear':
                 return False
-            # Next motion step must be a taught contact of the same
-            # station role, with 6-el taught_joints and no
-            # derived_from (i.e., the operator-taught pose itself).
             if nxt.get('derived_from'):
                 return False
             if str(nxt.get('position_role') or '') != str(role):
@@ -2569,6 +2556,58 @@ def codegen_lua_from_program(
             return (isinstance(tj, list) and len(tj) == 6
                     and all(isinstance(v, (int, float)) for v in tj))
         return False
+
+    def _is_column_derived(idx: int) -> str | None:
+        """D2 (2026-08-03 amendment). A derived move_linear step belongs
+        to a station column iff its `derived_from` names a station role
+        whose taught contact appears somewhere in the program. Approach
+        (contact FOLLOWS this step) and ascent/retreat (contact
+        PRECEDES this step) are BOTH columns — the operator's
+        requirement: "approaches, descents, AND ASCENTS are cartesian".
+
+        Returns 'approach' | 'retreat' | None. None means "not a column
+        derived step" (no derived_from, or no matching taught contact
+        anywhere in the program) — the caller falls through to the
+        transit rules.
+
+        Interior IO between contact and this retreat (set_io / wait /
+        gripper) does not break the column association; the departure
+        stays cartesian regardless of a vacuum-on wait sitting between
+        them."""
+        if idx < 0 or idx >= len(steps):
+            return None
+        s = steps[idx]
+        if str(s.get('action') or '').lower() != 'move_linear':
+            return None
+        role = s.get('derived_from')
+        if not role:
+            return None
+        # Locate the station's taught contact: same position_role,
+        # 6-el taught_joints, no derived_from. There may be more than
+        # one (multi-pair programs); the nearest by index wins.
+        best_dist = None
+        best_side = None
+        for j in range(len(steps)):
+            if j == idx:
+                continue
+            cand = steps[j]
+            if not isinstance(cand, dict):
+                continue
+            if str(cand.get('action') or '').lower() != 'move_linear':
+                continue
+            if cand.get('derived_from'):
+                continue
+            if str(cand.get('position_role') or '') != str(role):
+                continue
+            tj = cand.get('taught_joints')
+            if not (isinstance(tj, list) and len(tj) == 6
+                    and all(isinstance(v, (int, float)) for v in tj)):
+                continue
+            d = abs(j - idx)
+            if best_dist is None or d < best_dist:
+                best_dist = d
+                best_side = 'approach' if j > idx else 'retreat'
+        return best_side
 
     def _wrist_delta_deg(a, b) -> float | None:
         """max(|a_i - b_i|) over the wrist joints i∈{3,4,5}. Returns
@@ -3131,14 +3170,21 @@ def codegen_lua_from_program(
                         # movJ. That fallback is now honestly labeled
                         # on the emit line, not just the prelude
                         # comment.
-                        is_approach = _is_approach_arrival(_step_idx)
+                        column_side = _is_column_derived(_step_idx)
                         emit_verb_derived = 'movJ'
                         feas_note = ''
                         divergence_note = ''
-                        # 1. Approach arrivals: columns-always-cartesian.
-                        if is_approach:
+                        # 1. Station-column derived steps (approach
+                        #    arrival OR ascent/retreat) → cartesian,
+                        #    every profile. Rule 2e exception intact:
+                        #    a wrist-spinning cartesian is still worse
+                        #    than a joint one.
+                        if column_side is not None:
                             _step_adapt = _adapt_map.get(_step_idx) or {}
                             _step_force = _step_adapt.get('force_motion_profile')
+                            _side_label = ('approach arrival'
+                                           if column_side == 'approach'
+                                           else 'ascent')
                             if _step_force == 'joint':
                                 # Rule 2e already fired for this step —
                                 # the ADAPTED comment above states the
@@ -3159,17 +3205,17 @@ def codegen_lua_from_program(
                                         f'J{feas["worst_axis"]} ≤ '
                                         f'{feas["threshold"]:g}°'
                                         f'  (columns-always-cartesian: '
-                                        f'approach arrival)')
+                                        f'{_side_label})')
                                 else:
                                     emit_verb_derived = 'movJ'
                                     divergence_note = (
                                         ' (emitted movJ — columns-always-'
-                                        'cartesian FALLBACK: path infeasible: '
-                                        f'{feas["reason"]})')
-                        # 2. Existing STRAIGHT / STANDARD-column upgrade
-                        #    path — applies to non-approach derived
-                        #    steps (retreats) when the profile asks for
-                        #    cartesian.
+                                        f'cartesian FALLBACK on {_side_label}: '
+                                        f'path infeasible: {feas["reason"]})')
+                        # 2. Non-column derived (no station role
+                        #    attached to derived_from) — legacy
+                        #    STRAIGHT / STANDARD-column upgrade path
+                        #    stays available as an escape hatch.
                         elif program_profile == 'straight' or (
                                 program_profile == 'standard'
                                 and _step_idx < len(standard_class)
@@ -3187,15 +3233,16 @@ def codegen_lua_from_program(
                                     ' (emitted movJ — STRAIGHT/STANDARD '
                                     f'path-feasibility FALLBACK: '
                                     f'{feas["reason"]})')
-                        # 3. Default derived (retreat / non-column
-                        #    transit) — movJ. Label the divergence
-                        #    from step action=move_linear.
+                        # 3. True transit (derived_from does not name
+                        #    any known station) — movJ, joint-space by
+                        #    design.
                         else:
                             emit_verb_derived = 'movJ'
                             if action == 'move_linear':
                                 divergence_note = (
-                                    ' (emitted movJ — derived retreat/'
-                                    'transit, joint-space by design)')
+                                    ' (emitted movJ — derived transit '
+                                    'to a non-station reference, '
+                                    'joint-space by design)')
                         # Orientation invariant stamp — FK the seeded
                         # joints vs the anchor's taught joints and
                         # report per-axis delta. Task §3 threshold
