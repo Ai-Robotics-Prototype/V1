@@ -322,7 +322,9 @@ def test_named_load_error_map_has_all_documented_kinds():
                  'empty_program', 'lint_failed',
                  'byte_verify_mismatch', 'byte_verify_get_failed',
                  'id_not_controller_safe',
-                 'lint_infrastructure_error', 'codegen'):
+                 'lint_infrastructure_error', 'codegen',
+                 # Firmware bug #3 quarantine (2026-08-04):
+                 'pending_poses', 'arity_assertion_failed'):
         assert kind in src, (
             f'namedLoadError has no entry for outcome.kind={kind!r} '
             '— the UI would fall back to a generic message')

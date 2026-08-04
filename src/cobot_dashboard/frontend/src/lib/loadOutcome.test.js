@@ -103,3 +103,42 @@ test('unknown shape: surfaces http status rather than eating the failure', () =>
   assert.equal(named.code, 'unknown')
   assert.match(named.headline, /HTTP 599/)
 })
+
+
+test('pending_poses: quarantine message names the untaught steps', () => {
+  const named = namedLoadError({
+    outcome: {
+      kind: 'pending_poses',
+      count: 3,
+      findings: [
+        { step_idx: 0, action: 'move_home' },
+        { step_idx: 2, action: 'move_linear' },
+        { step_idx: 6, action: 'move_home' },
+      ],
+      // reason strings from check_program_pending_poses; propagated
+      // verbatim into detail so devtools can see the full context.
+      reason: 'motion step has no fully-resolved 6-element pose',
+    },
+  }, 400)
+  assert.equal(named.code, 'pending_poses')
+  assert.match(named.headline, /known controller-crashing codegen/i)
+  assert.match(named.headline, /regenerate required/i)
+  assert.match(named.headline, /3 motion steps/)
+  assert.match(named.headline, /step 1 move_home/)
+  assert.match(named.headline, /step 3 move_linear/)
+  assert.match(named.headline, /step 7 move_home/)
+})
+
+
+test('arity_assertion_failed: cites the firmware assert', () => {
+  const named = namedLoadError({
+    outcome: {
+      kind: 'arity_assertion_failed',
+      reason: 'D14 codegen post-emit assertion — codegen produced 1 mov* line(s) with <6-element pose vectors',
+    },
+  }, 400)
+  assert.equal(named.code, 'arity_assertion_failed')
+  assert.match(named.headline, /mm2mAndDeg2rad/)
+  assert.match(named.headline, /v\.size\(\)>=6/)
+  assert.match(named.detail, /D14/)
+})

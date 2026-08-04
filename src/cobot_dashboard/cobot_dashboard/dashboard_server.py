@@ -5229,9 +5229,64 @@ if FASTAPI_AVAILABLE:
         except Exception as e:
             return JSONResponse({"error": f"program_ops import: {e}"},
                                 status_code=500)
+
+        # D14 pending-pose gate (2026-08-04) — runs BEFORE codegen so
+        # a program with untaught anchors never even reaches Lua
+        # emission. Firmware bug #3 (three holepartpalletize kills
+        # 2026-08-03/04 on movJCoorRel → mm2mAndDeg2rad v.size()>=6
+        # → exitProcess) is silent on the wire: no /rejected frame,
+        # no error toast — the arm just freezes and C2Control dies.
+        # This gate is the operator-facing quarantine: teach the
+        # missing positions in the Program Editor and try again.
+        try:
+            _pending = program_ops.check_program_pending_poses(program)
+        except Exception as _pe:
+            print(f'[run] WARN pending-pose check raised: {_pe}',
+                  flush=True)
+            _pending = []
+        if _pending:
+            _preview = _pending[:5]
+            _step_summary = ', '.join(
+                f'step {p["step_idx"] + 1} ({p.get("action","?")})'
+                for p in _preview)
+            _more = (f' and {len(_pending) - 5} more'
+                     if len(_pending) > 5 else '')
+            return JSONResponse({
+                "ok": False,
+                "error": (
+                    f'known controller-crashing codegen — regenerate '
+                    f'required: {len(_pending)} motion step(s) have '
+                    f'untaught positions ({_step_summary}{_more}). '
+                    f'Teach the missing positions in the Program '
+                    f'Editor before running (firmware bug #3, '
+                    f'mm2mAndDeg2rad v.size()>=6).'),
+                "outcome": {
+                    "kind": "pending_poses",
+                    "count": len(_pending),
+                    "findings": _pending,
+                },
+                "program_id": prog_id,
+            }, status_code=400)
+
         try:
             lua, points, eff_pct = program_ops.codegen_lua_from_program(
                 program, operator_speed_limit_pct=operator_cap_pct)
+        except AssertionError as e:
+            # D14 codegen post-emit assertion tripped. This is defense
+            # in depth behind the pending-pose gate above — a bug that
+            # slipped past the pre-codegen scan would still be caught
+            # here rather than reaching the controller.
+            return JSONResponse({
+                "ok": False,
+                "error": (
+                    f'codegen refused to emit — mov* arity assertion '
+                    f'failed: {e}'),
+                "outcome": {
+                    "kind": "arity_assertion_failed",
+                    "reason": str(e),
+                },
+                "program_id": prog_id,
+            }, status_code=400)
         except Exception as e:
             return JSONResponse({"error": f"codegen: {e}"}, status_code=500)
 

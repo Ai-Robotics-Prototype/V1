@@ -25,6 +25,8 @@ export const LOAD_OUTCOME_KINDS = [
   'id_not_controller_safe',
   'lint_infrastructure_error',
   'codegen',
+  'pending_poses',
+  'arity_assertion_failed',
 ]
 
 function _wireReason(body) {
@@ -58,6 +60,41 @@ export function namedLoadError(body, httpStatus) {
       code:    'empty_program',
       headline: 'Cannot load — this program has no valid motion. '
               + 'Teach positions first' + suffix + '.',
+      detail,
+    }
+  }
+  if (kind === 'pending_poses') {
+    // Firmware bug #3 quarantine (2026-08-04). The controller
+    // asserts v.size()>=6 at mm2mAndDeg2rad and exits process on
+    // failure, so we refuse the push server-side. Named as
+    // "regenerate required" because the fix is authoring-time —
+    // the operator teaches the missing positions in the Program
+    // Editor and the next push passes the gate.
+    const count = Number(body?.outcome?.count || 0)
+    const findings = body?.outcome?.findings || []
+    const preview = findings
+      .slice(0, 3)
+      .map((f) => `step ${Number(f.step_idx || 0) + 1} ${f.action || '?'}`)
+      .join(', ')
+    const more = findings.length > 3 ? '…' : ''
+    return {
+      code:    'pending_poses',
+      headline: 'Cannot load — known controller-crashing codegen. '
+              + `Regenerate required: ${count} motion step`
+              + `${count === 1 ? '' : 's'} have untaught positions`
+              + (preview ? ` (${preview}${more})` : '')
+              + '. Teach the missing positions in the Program '
+              + 'Editor before running.',
+      detail,
+    }
+  }
+  if (kind === 'arity_assertion_failed') {
+    return {
+      code:    'arity_assertion_failed',
+      headline: 'Cannot load — codegen produced a mov* line whose '
+              + 'pose vector is not exactly 6 elements. Refusing '
+              + 'to push (firmware v2.3 asserts v.size()>=6 at '
+              + 'mm2mAndDeg2rad and exits process on failure).',
       detail,
     }
   }

@@ -787,6 +787,210 @@ def _bad_waitCondition_bare_literal_cond(args):
 _KNOWN_BAD_PATTERNS.append(('waitCondition', _bad_waitCondition_bare_literal_cond))
 
 
+# ── D14 (2026-08-04) — mov* pose-vector arity ─────────────────────
+#
+# Firmware bug #3, evidenced by three holepartpalletize kills:
+#     2026-08-03 17:18 CDT, 2026-08-04 08:20 CDT, 2026-08-04 09:10 CDT.
+# Controller call chain on the failure:
+#     movJCoorRel → _setRelativeOffset → mm2mAndDeg2rad
+#     asserts v.size()>=6 → exitProcess (silent, no /rejected frame).
+# The operator sees the arm freeze mid-cycle with no error surface;
+# C2Control's death takes the entire session with it.
+#
+# Root-cause on our side is a pose vector that reaches the wire with
+# fewer than 6 numeric elements. Codegen emits `{cp={0,0,z,0,0,0}}`
+# (well-formed 6-vector) at every current callsite, but nothing HAS
+# been enforcing the arity — a future callsite change or a new
+# mov*Rel variant could regress this silently. D14 is the guard:
+# every mov*Rel emission whose first arg is a table literal MUST
+# carry a 6-element pose vector under one of the recognized keys
+# (cp / jp / tp / pp / tcp / joints). Anything less is rejected at
+# lint time and never reaches the controller.
+
+_POSE_VECTOR_KEYS = ('cp', 'jp', 'tp', 'pp', 'tcp', 'joints')
+
+
+def _extract_pose_vector(arg_text: str):
+    """Parse an outer table-literal like `{cp={0,0,z,0,0,0},…}` and
+    return (key, [raw_token,…]) for the FIRST recognized pose-vector
+    key found in the literal. Returns None when the arg is not a
+    table literal or has no pose-vector key.
+
+    Tokens are the raw text between top-level commas inside the
+    inner `{…}`. Numeric-ness is not asserted here — the D14 gate
+    only cares about arity; the controller-side numeric parse is
+    what asserts on non-numerics."""
+    s = arg_text.strip()
+    if not (s.startswith('{') and s.endswith('}')):
+        return None
+    body = s[1:-1]
+    for key in _POSE_VECTOR_KEYS:
+        m = _re.search(r'(?:^|[,\s\{])' + key + r'\s*=\s*\{', body)
+        if not m:
+            continue
+        depth = 1
+        j = m.end()
+        while j < len(body) and depth > 0:
+            c = body[j]
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+            j += 1
+        if depth != 0:
+            return (key, [])   # unbalanced → treat as empty
+        inner = body[m.end(): j - 1]
+        toks = [t.strip() for t in _split_top_level_commas(inner)
+                if t.strip()]
+        return (key, toks)
+    return None
+
+
+def _bad_mov_pose_vector_arity(args):
+    """D14 — every mov* verb whose first arg is a table literal
+    must carry a 6-element pose vector. Fires the finding that
+    refuses the push."""
+    if not args:
+        return None
+    parsed = _extract_pose_vector(args[0])
+    if parsed is None:
+        # First arg is a point-name ref (e.g. `movJ(p1)`), not a
+        # table literal. The vector lives in the varspoint upload
+        # and is checked separately by codegen when the point is
+        # materialized via _make_jp_point.
+        return None
+    key, toks = parsed
+    if len(toks) == 6:
+        return None
+    return (
+        f'D14 arity — first-arg pose vector has {len(toks)} '
+        f'element(s), controller requires exactly 6 '
+        f'({key}={{{",".join(toks)}}}). Firmware v2.3 asserts '
+        f'v.size()>=6 at mm2mAndDeg2rad and calls exitProcess on '
+        f'failure — this Lua would crash the controller (bug #3, '
+        f'holepartpalletize kills 2026-08-03 17:18, 2026-08-04 '
+        f'08:20, 2026-08-04 09:10).')
+
+
+for _mov_verb in ('movJ', 'movL', 'movC',
+                   'movJCoorRel', 'movLCoorRel',
+                   'movJJointRel', 'movJToolRel', 'movLToolRel',
+                   'movLW'):
+    _KNOWN_BAD_PATTERNS.append((_mov_verb, _bad_mov_pose_vector_arity))
+
+
+# ── Pending-pose gate (D14 companion, 2026-08-04) ─────────────────
+#
+# The other half of firmware bug #3: derived-from steps that emit
+# `movJCoorRel({cp={0,0,z,0,0,0}},{coor=0,tool=0})` from an UNKNOWN
+# starting position. The vector is 6-element (passes D14), but the
+# CURRENT position at the point the controller reads the relative
+# offset is undefined because the anchor step was untaught. Even
+# with correct arity the controller can crash on an internal frame
+# it never fully resolved.
+#
+# Every motion step whose pose is not fully resolved (a) to a
+# 6-element varspoint entry, (b) to inline 6-element taught_joints
+# with taught=True, or (c) to a fully-taught anchor via
+# derived_from, is treated as pending. Programs that fail this gate
+# never reach codegen — the dashboard returns HTTP 400 with
+# outcome.kind='pending_poses' so the operator sees a named error
+# (not a controller freeze) and knows to teach the missing points.
+#
+# This is the runtime quarantine described in the operator
+# directive: "known controller-crashing codegen — regenerate
+# required." No persistent flag is needed — the mark emerges from
+# the pending-pose scan on every push. Teach the poses → next push
+# passes → run is unblocked.
+
+_NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK = frozenset({
+    'set_io', 'wait', 'wait_input', 'loop',
+    'gripper', 'gripper_close', 'gripper_open',
+    'pause', 'comment', 'end',
+    'vacuum_on', 'vacuum_off',
+    'detect',
+    'scan_workspace', 'scan_identify_each',
+    'sort_scanned', 'remove_defects',
+    'move_to_pallet',
+})
+
+
+def check_program_pending_poses(program: dict) -> list:
+    """Return findings for every motion step whose pose is not
+    fully resolved to a 6-element joint vector.
+
+    Findings shape:
+      {'step_idx', 'step_id', 'action', 'label', 'reason'}
+
+    A step is considered RESOLVED when any of the following holds:
+      (a) `point_name` refers to an entry in `program.points` with
+          a 6-element `joints` (or `jp`) array,
+      (b) `taught_joints` is a 6-element list AND `taught` is
+          truthy,
+      (c) `derived_from` refers to an anchor step whose pose is
+          resolved by rule (a) or (b) (recursion terminates because
+          anchor steps carry a `position_role`, not a
+          `derived_from`).
+
+    Any motion step failing all three rules is PENDING and gets a
+    finding. Non-motion actions (set_io, wait, loop, gripper, etc.)
+    are skipped."""
+    findings = []
+    steps = program.get('steps', []) or []
+    points = program.get('points') or {}
+
+    # role → (idx, step) so derived_from can look up its anchor.
+    role_map = {}
+    for i, s in enumerate(steps):
+        r = s.get('position_role')
+        if r and r not in role_map:
+            role_map[r] = (i, s)
+
+    def _anchor_resolved(step: dict) -> bool:
+        pn = step.get('point_name')
+        tj = step.get('taught_joints')
+        taught = bool(step.get('taught'))
+        pt = points.get(pn) if pn else None
+        if pt:
+            joints = pt.get('joints') or pt.get('jp')
+            if isinstance(joints, list) and len(joints) == 6:
+                return True
+        if (isinstance(tj, list) and len(tj) == 6 and taught):
+            return True
+        return False
+
+    for i, s in enumerate(steps):
+        action = s.get('action')
+        if action in _NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK:
+            continue
+        if _anchor_resolved(s):
+            continue
+        derived = s.get('derived_from')
+        if derived and derived in role_map:
+            _ai, anchor = role_map[derived]
+            if _anchor_resolved(anchor):
+                continue
+        tj = s.get('taught_joints')
+        tj_len = len(tj) if isinstance(tj, list) else None
+        findings.append({
+            'step_idx': i,
+            'step_id':  s.get('id'),
+            'action':   action,
+            'label':    s.get('label', ''),
+            'reason': (
+                'motion step has no fully-resolved 6-element pose '
+                f'(taught={bool(s.get("taught"))}, '
+                f'taught_joints_len={tj_len}, '
+                f'point_name={s.get("point_name")!r}, '
+                f'derived_from={derived!r}) — known controller-'
+                'crashing codegen (firmware bug #3, mm2mAndDeg2rad '
+                'asserts v.size()>=6). Regenerate required: teach '
+                'this position in the Program Editor before running.'
+            ),
+        })
+    return findings
+
+
 def lint_lua_source(source: str, lib: dict = None) -> list:
     """Lint every function-call token in `source` against the shipped
     luaenginelib.json catalogue. Returns a list of finding dicts:
@@ -4075,6 +4279,54 @@ def codegen_lua_from_program(
     # CRLF line endings match the controller's own-emitted files (see
     # projectlua_projectluademo/lua/taskluademo.lua as ground truth).
     source = '\r\n'.join(exec_lines + footer_lines) + '\r\n'
+
+    # D14 codegen post-emit assertion (2026-08-04). The lint gate
+    # in /api/estun/program/run runs against the SAME source and
+    # will refuse the push — that's the operator-facing gate — but
+    # any programmatic caller of codegen_lua_from_program that
+    # skips the dashboard flow (integration tests, offline
+    # regeneration scripts, bench tools) would otherwise happily
+    # return a controller-crashing string. Raising here makes the
+    # assertion a language-level invariant: this function CANNOT
+    # produce Lua whose mov* emissions have <6-element pose
+    # vectors. If a future codegen edit regresses that promise the
+    # exception traces the exact line that emitted the bad vector.
+    _arity_findings = [
+        f for f in (lint_lua_source(source) or [])
+        if isinstance(f.get('reason'), str)
+        and f['reason'].startswith('D14 arity')
+    ]
+    if _arity_findings:
+        head = _arity_findings[0]
+        raise AssertionError(
+            f'D14 arity post-emit assertion — codegen produced '
+            f'{len(_arity_findings)} mov* line(s) with <6-element '
+            f'pose vectors. First at line {head.get("line")}, verb '
+            f'{head.get("verb")!r}: {head.get("reason")}'
+        )
+
+    # Varspoint arity — every uploaded joint pose must have exactly
+    # 6 floats. Same firmware invariant, but the check runs on the
+    # HTTP-side payload rather than the Lua text (movJ(pN) doesn't
+    # carry the vector in the Lua — the pN entry does). Raising
+    # keeps a caller that hand-builds points from ever handing the
+    # controller a short jp.
+    for _name, _entry in (varspoint or {}).items():
+        try:
+            _val = _json.loads(_entry.get('val', '') or '{}')
+        except Exception:
+            continue
+        _jp = _val.get('jp')
+        if _jp is None:
+            continue
+        if not isinstance(_jp, list) or len(_jp) != 6:
+            raise AssertionError(
+                f'D14 varspoint arity — point {_name!r} has '
+                f'jp={_jp!r} (len={len(_jp) if isinstance(_jp,list) else "?"}). '
+                f'Controller requires exactly 6 floats — firmware '
+                f'v2.3 asserts v.size()>=6 at mm2mAndDeg2rad.'
+            )
+
     return source, varspoint, eff_pct
 
 
