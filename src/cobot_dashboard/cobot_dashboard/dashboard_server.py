@@ -11026,31 +11026,33 @@ if FASTAPI_AVAILABLE:
             operator = _pallet_finding_operator_copy(f, place)
             findings.append({**f, 'operator': operator})
         # Frame-measured helpers — the client shows these next to
-        # the banner-less operator toast when useful.
-        m_row, m_col = measured_pitches(spec)
+        # the banner-less operator toast when useful. Endpoint
+        # response uses `_mm`-suffixed field names (documented
+        # shape for the twin); pallet_geometry works in METERS
+        # internally, so we convert m→mm at THIS boundary — the
+        # ONLY place mm crosses the wire for this endpoint.
+        m_row_m, m_col_m = measured_pitches(spec)   # meters
         measured = {
             'row_len_mm':   None,
             'col_len_mm':   None,
             'row_col_angle_deg': None,
             'tilt_deg':     None,
-            'pitch_row_mm': m_row,
-            'pitch_col_mm': m_col,
+            'pitch_row_mm': (m_row_m * 1000.0) if m_row_m is not None else None,
+            'pitch_col_mm': (m_col_m * 1000.0) if m_col_m is not None else None,
         }
         if spec.has_taught_frame():
             frame = compute_frame(spec)
             measured['row_col_angle_deg'] = frame['row_col_angle_deg']
             measured['tilt_deg']         = frame['tilt_deg']
-            # Explicit row/col lengths so the client can print
-            # "corner N is 0.6 mm from corner M" without touching
-            # frame math itself.
             from programming_by_demonstration.pallet_geometry import (
                 _xyz as _pg_xyz, _sub as _pg_sub, _len as _pg_len,
             )
-            A = _pg_xyz(spec.corner1_tcp)
-            B = _pg_xyz(spec.corner2_tcp)
-            C = _pg_xyz(spec.corner3_tcp)
-            measured['row_len_mm'] = _pg_len(_pg_sub(B, A))
-            measured['col_len_mm'] = _pg_len(_pg_sub(C, A))
+            A = _pg_xyz(spec.corner1_tcp)   # meters
+            B = _pg_xyz(spec.corner2_tcp)   # meters
+            C = _pg_xyz(spec.corner3_tcp)   # meters
+            # Convert to mm at the response boundary.
+            measured['row_len_mm'] = _pg_len(_pg_sub(B, A)) * 1000.0
+            measured['col_len_mm'] = _pg_len(_pg_sub(C, A)) * 1000.0
         blocking = any(f.get('severity') == 'error' for f in findings)
         return {
             'findings': findings,
