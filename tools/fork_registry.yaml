@@ -425,7 +425,63 @@ capabilities:
           - '**/test_*.py'
     known_debt: []
 
-  # 16. Estun sign inversion (URDF axes).
+  # 16. Pose unit canon — meters + radians internal; mm/deg at UI +
+  #     codegen boundaries only.
+  - id: pose_unit_canon
+    description: >
+      taught_tcp and every pose value transported through the
+      workspace are METERS + RADIANS. Matches driver tcp_m,
+      state.tcp_pose, record-through draft store, ROS convention,
+      and every taught_tcp already on disk. Millimetres +
+      degrees exist ONLY at (a) the operator-facing UI render
+      layer, and (b) the codegen emit boundary in
+      estun_driver.program_ops (which already handles both units
+      via magnitude sniffing at lines 1499-1503, 1985-1990).
+      Any *_mm-named field assigned from taught_tcp or
+      tcp_pose without an explicit *1000.0 conversion in scope
+      is a unit lie of the class fixed on 2026-08-04 (325 mm
+      distances reported as 0.325 mm and refused as coincident).
+    canonical:
+      python:
+        module: programming_by_demonstration.pallet_geometry
+        functions: [validate_frame, compute_slot_offsets,
+                    derive_slot_tcps, measured_pitches]
+    forbidden:
+      - path_glob: src/programming_by_demonstration/programming_by_demonstration/**/*.py
+        patterns:
+          # A variable named *_mm assigned directly from a
+          # taught_tcp or tcp_pose expression, on the same line,
+          # without a * 1000 conversion, is the unit-lie
+          # signature. Best-effort regex — a targeted single-
+          # line check catches the common case (multi-line
+          # assignments will slip through, but those are rare
+          # enough that a code review catches them).
+          - "[a-zA-Z_][a-zA-Z0-9_]*_mm\\s*=\\s*[^\\n]*(?:taught_tcp|tcp_pose)[^\\n*]*$"
+        path_exempt:
+          # Legacy identifier `distance_mm` in the endpoint's
+          # backward-compat fallback lookup, and known
+          # boundary-conversion sites where the * 1000 IS
+          # applied on the same expression.
+          - '**/test_*.py'
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          # Same pattern for the dashboard side (endpoints /
+          # helpers).
+          - "[a-zA-Z_][a-zA-Z0-9_]*_mm\\s*=\\s*[^\\n]*(?:taught_tcp|tcp_pose)[^\\n*]*$"
+        path_exempt:
+          - '**/test_*.py'
+    known_debt:
+      - path: src/estun_driver/estun_driver/program_ops.py
+        line: 1499
+        why: >
+          Codegen has intentional magnitude-sniffing (|value|<10
+          treated as meters and multiplied by 1000; else assumed
+          mm). Legitimate boundary conversion; kept unchanged
+          because the wire (Estun Lua mov*Rel cp={x,y,z,...})
+          takes mm.
+        owner: estun-driver
+
+  # 17. Estun sign inversion (URDF axes).
   - id: estun_axis_sign_inversion
     description: >
       J3 and J5 URDF axes are intentionally sign-inverted vs CAD

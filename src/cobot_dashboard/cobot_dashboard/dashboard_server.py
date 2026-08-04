@@ -10760,10 +10760,33 @@ if FASTAPI_AVAILABLE:
             return JSONResponse(
                 {"error": f"pallet_geometry import: {e}"}, status_code=500)
         spec = PalletPlaceSpec.from_dict(spec_dict)
+        # anchor_tcp is METERS + RADIANS (canonical taught_tcp
+        # unit, matches driver tcp_m). pallet_geometry now works
+        # entirely in meters (unit-mismatch fix, 2026-08-04) —
+        # derive_slot_tcps produces `tcp_m` in the same unit.
+        # This endpoint's DOCUMENTED response shape carries
+        # `tcp_mm` for the 3D twin's rendering layer, so we
+        # convert meters → mm at THIS boundary.
         slots = []
+        slots_mm = []
         if isinstance(anchor_tcp, list) and len(anchor_tcp) >= 6:
             anchor_tuple = tuple(float(v) for v in anchor_tcp[:6])
             slots = derive_slot_tcps(spec, anchor_tuple)
+            for s in slots:
+                tcp_m = s.get('tcp_m') or [0, 0, 0, 0, 0, 0]
+                slots_mm.append({
+                    'index': s['index'],
+                    'row':   s['row'],
+                    'col':   s['col'],
+                    'layer': s['layer'],
+                    # Convert XYZ meters → mm for the twin.
+                    # Orientation (rx/ry/rz) stays radians on the
+                    # wire; the frontend renderer decides display.
+                    'tcp_mm': [tcp_m[0] * 1000.0,
+                               tcp_m[1] * 1000.0,
+                               tcp_m[2] * 1000.0,
+                               tcp_m[3], tcp_m[4], tcp_m[5]],
+                })
         reach = None
         anchor_joints = anchor.get('taught_joints')
         if (isinstance(anchor_joints, list) and len(anchor_joints) == 6
@@ -10787,13 +10810,27 @@ if FASTAPI_AVAILABLE:
             'row_col_angle_deg': frame['row_col_angle_deg'],
             'source':            frame['source'],
         }
-        m_row, m_col = measured_pitches(spec)
+        # measured_pitches returns METERS. Convert to mm at this
+        # endpoint's response boundary — the twin + wizard
+        # readouts label the value in mm.
+        m_row_m, m_col_m = measured_pitches(spec)
+        m_row = (m_row_m * 1000.0) if m_row_m is not None else None
+        m_col = (m_col_m * 1000.0) if m_col_m is not None else None
         return {
             "program_id":   prog_id,
             "pallet_place": {
                 "step_id":        anchor.get('id') or anchor.get('step'),
                 "anchor_step_id": anchor.get('id') or anchor.get('step'),
-                "anchor_tcp_mm":  list(anchor_tcp) if isinstance(anchor_tcp, list) else None,
+                # anchor_tcp_mm is the endpoint's documented shape
+                # (mm on the wire for the 3D twin). anchor_tcp is
+                # meters internally; convert XYZ at the boundary.
+                "anchor_tcp_mm":  ([anchor_tcp[0] * 1000.0,
+                                    anchor_tcp[1] * 1000.0,
+                                    anchor_tcp[2] * 1000.0,
+                                    anchor_tcp[3], anchor_tcp[4], anchor_tcp[5]]
+                                   if isinstance(anchor_tcp, list)
+                                      and len(anchor_tcp) >= 6
+                                   else None),
                 "spec":           spec.to_dict(),
                 "frame":          frame_serialisable,
                 "frame_validation": validate_frame(spec),
@@ -10801,7 +10838,7 @@ if FASTAPI_AVAILABLE:
                     "pitch_row_mm": m_row,
                     "pitch_col_mm": m_col,
                 },
-                "slots":          slots,
+                "slots":          slots_mm,
             },
             "reachability": reach,
         }
@@ -10861,15 +10898,29 @@ if FASTAPI_AVAILABLE:
         """Map a pallet_geometry finding to the 267108a-register
         toast triple {title, detail, technicalDetail}. Raw wire
         text goes to technicalDetail; operator sees the demoted
-        title + detail only."""
+        title + detail only.
+
+        Distance fields on findings are METERS (canon, 2026-08-04
+        unit-mismatch fix). This function renders mm for the
+        operator by multiplying by 1000 — the ONLY place mm
+        appears on the operator surface. Findings with legacy
+        `distance_mm` (from a pre-fix caller) are read as a
+        fallback with an in-place assumption that the value was
+        already meters (matching the pre-fix behavior of the
+        pallet_geometry code that generated it)."""
         code = f.get('code') or ''
         involves = f.get('involves_corners') or []
-        dist = f.get('distance_mm')
+        # Canon: distance_m (meters). Legacy: distance_mm — which
+        # HELD meters values before this commit, so use verbatim.
+        dist_m = f.get('distance_m')
+        if dist_m is None:
+            dist_m = f.get('distance_mm')   # legacy — was meters
         tech = f.get('message', '')
         if code == 'corner_coincident':
             pair = ' and '.join(str(int(c[1:]) or c[1:])
                                 for c in involves) if involves else '?'
-            dmm = f'{dist:.2f} mm' if isinstance(dist, (int, float)) else '?'
+            dmm = (f'{dist_m*1000.0:.2f} mm'
+                   if isinstance(dist_m, (int, float)) else '?')
             return {
                 'title':  f'Corners {pair} are too close.',
                 'detail': (f'Measured {dmm} apart — jog to the actual '
@@ -10913,7 +10964,8 @@ if FASTAPI_AVAILABLE:
                 'technicalDetail': tech,
             }
         if code == 'part_datum_far_from_corner':
-            dmm = f'{dist:.1f} mm' if isinstance(dist, (int, float)) else '?'
+            dmm = (f'{dist_m*1000.0:.1f} mm'
+                   if isinstance(dist_m, (int, float)) else '?')
             return {
                 'title':  'First-part position (④) is far from corner 1.',
                 'detail': (f'Measured {dmm} away — is the part actually '

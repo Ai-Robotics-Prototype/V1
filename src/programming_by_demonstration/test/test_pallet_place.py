@@ -63,11 +63,13 @@ def test_2x2_grid_default_axes_exact_arithmetic():
     """
     spec = PalletPlaceSpec(rows=2, cols=2, pitch_row_mm=100, pitch_col_mm=50)
     offsets = compute_slot_offsets(spec)
+    # compute_slot_offsets returns METERS (canonical unit per
+    # 2026-08-04 pose-unit fix). Schema pitches remain in mm.
     assert offsets == [
-        ((0, 0, 0), (0.0,    0.0, 0.0)),
-        ((0, 1, 0), (100.0,  0.0, 0.0)),
-        ((1, 1, 0), (100.0, 50.0, 0.0)),
-        ((1, 0, 0), (0.0,   50.0, 0.0)),
+        ((0, 0, 0), (0.0,   0.0,  0.0)),
+        ((0, 1, 0), (0.100, 0.0,  0.0)),
+        ((1, 1, 0), (0.100, 0.050, 0.0)),
+        ((1, 0, 0), (0.0,   0.050, 0.0)),
     ]
 
 
@@ -98,34 +100,28 @@ def test_snake_reverses_every_odd_row():
 
 
 def test_axis_sign_negative_x_grows_backward():
-    """row_axis='-X' → advancing COL index moves -X (2026-07-30
-    convention: col index walks along row_axis)."""
-    # Use a 1-row, 2-col grid so advancing col index is the only motion.
+    """row_axis='-X' → advancing COL index moves -X. Offsets in
+    METERS (2026-08-04 canon)."""
     spec = PalletPlaceSpec(rows=1, cols=2,
                            pitch_row_mm=100, pitch_col_mm=50,
                            row_axis='-X', col_axis='+Y',
                            order='row_major')
     offs = [(dx, dy, dz) for ((_r, _c, _l), (dx, dy, dz)) in compute_slot_offsets(spec)]
-    assert offs == [(0.0, 0.0, 0.0), (-100.0, 0.0, 0.0)]
+    # 100 mm typed → 0.100 m emitted.
+    assert offs == [(0.0, 0.0, 0.0), (-0.100, 0.0, 0.0)]
 
 
 def test_axis_sign_swap_x_and_y():
-    """row_axis='+Y' + col_axis='+X'. Under 2026-07-30 convention,
-    col index c multiplies pitch_row·row_axis (+Y), row index r
-    multiplies pitch_col·col_axis (+X)."""
+    """row_axis='+Y' + col_axis='+X'. Offsets in METERS."""
     spec = PalletPlaceSpec(rows=2, cols=3,
                            pitch_row_mm=10, pitch_col_mm=20,
                            row_axis='+Y', col_axis='+X',
                            order='row_major')
     offs = compute_slot_offsets(spec)
-    # (r=0, c=0) → 0 / 0.
-    # (r=0, c=1) → c=1 * pitch_row(10) * row_axis(+Y) → dy=10 dx=0.
-    # (r=0, c=2) → dy=20 dx=0.
-    # (r=1, c=0) → r=1 * pitch_col(20) * col_axis(+X) → dx=20 dy=0.
-    assert offs[0] == ((0, 0, 0), (0.0,  0.0, 0.0))
-    assert offs[1] == ((0, 1, 0), (0.0, 10.0, 0.0))
-    assert offs[2] == ((0, 2, 0), (0.0, 20.0, 0.0))
-    assert offs[3] == ((1, 0, 0), (20.0, 0.0, 0.0))
+    assert offs[0] == ((0, 0, 0), (0.0,   0.0,   0.0))
+    assert offs[1] == ((0, 1, 0), (0.0,   0.010, 0.0))
+    assert offs[2] == ((0, 2, 0), (0.0,   0.020, 0.0))
+    assert offs[3] == ((1, 0, 0), (0.020, 0.0,   0.0))
 
 
 def test_layer_math_2_rows_2_cols_2_layers():
@@ -134,31 +130,31 @@ def test_layer_math_2_rows_2_cols_2_layers():
                            layers=2, layer_height_mm=30,
                            order='row_major')
     offs = compute_slot_offsets(spec)
-    # 8 slots. Layer 0: dz=0 for all 4. Layer 1: dz=30 for all 4.
+    # Offsets in METERS: 30 mm layer height → 0.030 m per layer.
     layer_dz = [dz for ((_r, _c, _l), (_dx, _dy, dz)) in offs]
-    assert layer_dz == [0, 0, 0, 0, 30, 30, 30, 30]
-    # Slot index within each layer preserves the 2D order.
+    assert layer_dz == [0, 0, 0, 0, 0.030, 0.030, 0.030, 0.030]
     slot_2d = [(r, c) for ((r, c, _l), _off) in offs]
     assert slot_2d == [(0, 0), (0, 1), (1, 0), (1, 1)] * 2
 
 
 def test_derive_slot_tcps_adds_offsets_to_anchor_and_preserves_orientation():
-    """Orientation (rx, ry, rz) MUST carry over from anchor unchanged
-    — pallet slots share orientation by definition (task §1)."""
+    """Orientation (rx, ry, rz) carries over from anchor unchanged.
+    XYZ deltas in METERS added to anchor (also meters)."""
     spec = PalletPlaceSpec(rows=2, cols=2,
                            pitch_row_mm=100, pitch_col_mm=50,
                            order='row_major')
-    anchor = (500.0, 250.0, 100.0, 3.14, 0.0, -1.57)
+    # anchor in meters (canonical taught_tcp unit).
+    anchor = (0.500, 0.250, 0.100, 3.14, 0.0, -1.57)
     slots = derive_slot_tcps(spec, anchor)
     assert len(slots) == 4
     for s in slots:
-        tcp = s['tcp_mm']
+        tcp = s['tcp_m']
         # Orientation exact match.
         assert tcp[3:] == [3.14, 0.0, -1.57]
     # First slot equals anchor position.
-    assert slots[0]['tcp_mm'][:3] == [500.0, 250.0, 100.0]
-    # Last slot (row 1 col 1 in row_major) = (600, 300, 100).
-    assert slots[3]['tcp_mm'][:3] == [600.0, 300.0, 100.0]
+    assert slots[0]['tcp_m'][:3] == [0.500, 0.250, 0.100]
+    # Last slot (row 1 col 1 in row_major) → (0.6, 0.3, 0.1) m.
+    assert slots[3]['tcp_m'][:3] == [0.600, 0.300, 0.100]
 
 
 def test_slot_label_convention():

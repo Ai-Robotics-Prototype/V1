@@ -54,12 +54,40 @@ _AXIS_TO_DXYZ_MM_PER_MM = {
     '-Y': (0.0, -1.0, 0.0),
 }
 
-# Validation thresholds.
-_MIN_ROW_COL_ANGLE_DEG = 60.0   # row·col angle must exceed this
-_MAX_TILT_DEG          = 10.0   # warn beyond
-_PITCH_MISMATCH_MM     = 3.0    # warn when |measured − typed| > this
-_PART_DATUM_MAX_SLOTS  = 1.5    # warn when |part - corner1| > this × max_pitch
-_MIN_EDGE_LEN_MM       = 1.0    # coincident-corner threshold (§465 fork-1)
+# ── Canonical pose unit (2026-08-04, unit-mismatch fix) ─────────
+#
+# taught_tcp and every pose value flowing through this module are
+# METERS + RADIANS. This matches:
+#   * the Estun driver's tcp_m field (source of state.tcp_pose),
+#   * the record-through path (state.tcp_pose → draft store),
+#   * every taught_tcp already on disk (e.g. whitebowlpickplace.json
+#     step 0: [0.139152, 0.709405, 0.116923, 3.09, -0.08, 1.45]),
+#   * ROS convention (geometry_msgs/PoseStamped is meters + quat).
+#
+# mm+deg exists ONLY at two boundaries:
+#   1. Operator-facing UI rendering ("325.1 mm apart" in toasts,
+#      pitch fields in the PalletConfigEditor), which callers
+#      convert m→mm at the render layer.
+#   2. Codegen emit boundary (movJCoorRel({cp={0,0,z_mm,0,0,0}}))
+#      lives in estun_driver.program_ops; that path already
+#      handles unit conversion via magnitude sniffing
+#      (program_ops.py:1499-1503, |value|<10 → meters × 1000).
+#
+# Pre-2026-08-04 this module treated taught_tcp as mm, silently
+# dividing every real distance by 1000. Symptom: corners 325 mm
+# apart reported as 0.325 mm apart and refused as coincident.
+
+# Validation thresholds — all in the CANONICAL unit.
+_MIN_ROW_COL_ANGLE_DEG = 60.0    # row·col angle must exceed this
+_MAX_TILT_DEG          = 10.0    # warn beyond
+_MIN_EDGE_LEN_M        = 0.001   # 1 mm coincident-corner threshold
+_PITCH_MISMATCH_M      = 0.003   # 3 mm typed-vs-measured warn
+_PART_DATUM_MAX_SLOTS  = 1.5     # dimensionless — × max_pitch
+
+# The pre-2026-08-04 names `_MIN_EDGE_LEN_MM` and
+# `_PITCH_MISMATCH_MM` are RETIRED (not aliased) — an alias
+# holding a meters value under a mm-suffixed name would be the
+# exact class of unit lie this fix is closing.
 
 
 # ── Vector helpers — no numpy dependency ────────────────────────
@@ -81,9 +109,13 @@ def _norm(a):
 
 
 def _xyz(tcp):
-    """Extract (x, y, z) mm from a taught_tcp 6-vector. Accepts
-    list/tuple; returns (0,0,0) on malformed input so downstream
-    math doesn't crash — callers must gate on has_taught_frame."""
+    """Extract (x, y, z) in METERS from a taught_tcp 6-vector.
+
+    taught_tcp is the canonical pose slot on both saved programs
+    and mid-teach drafts — always meters + radians (see the file
+    header). Callers must gate on `spec.has_taught_frame()`;
+    malformed input returns (0,0,0) so the math doesn't crash on
+    the placeholder branch."""
     if not isinstance(tcp, (list, tuple)) or len(tcp) < 3:
         return (0.0, 0.0, 0.0)
     return (float(tcp[0]), float(tcp[1]), float(tcp[2]))
@@ -173,7 +205,7 @@ def compute_frame(spec: PalletPlaceSpec) -> Dict[str, Any]:
 
 def measured_pitches(spec: PalletPlaceSpec
                      ) -> Tuple[Optional[float], Optional[float]]:
-    """Return (pitch_row_mm, pitch_col_mm) DERIVED from the taught
+    """Return (pitch_row_m, pitch_col_m) DERIVED from the taught
     corner positions.
 
     v2 (2026-07-30): corner2 is the pallet corner at [row 1, col N],
@@ -184,24 +216,23 @@ def measured_pitches(spec: PalletPlaceSpec
         pitch_row = |corner2 - corner1| / (cols - 1)
         pitch_col = |corner3 - corner1| / (rows - 1)
 
-    The v1 teach_mode='edge' was retired in v2 — corners are
-    unambiguous. teach_mode is retained on the schema but ignored
-    by v2 math.
+    Return unit: METERS (matches the canonical taught_tcp unit).
+    Callers rendering to the operator multiply by 1000.
 
     Missing frame → (None, None). 1-row or 1-col pallet → None
     for that pitch."""
     if not spec.has_taught_frame():
         return (None, None)
-    A = _xyz(spec.corner1_tcp)
-    B = _xyz(spec.corner2_tcp)
-    C = _xyz(spec.corner3_tcp)
-    pitch_row = None
+    A = _xyz(spec.corner1_tcp)      # meters
+    B = _xyz(spec.corner2_tcp)      # meters
+    C = _xyz(spec.corner3_tcp)      # meters
+    pitch_row_m = None
     if spec.cols and spec.cols > 1:
-        pitch_row = _len(_sub(B, A)) / float(spec.cols - 1)
-    pitch_col = None
+        pitch_row_m = _len(_sub(B, A)) / float(spec.cols - 1)
+    pitch_col_m = None
     if spec.rows and spec.rows > 1:
-        pitch_col = _len(_sub(C, A)) / float(spec.rows - 1)
-    return (pitch_row, pitch_col)
+        pitch_col_m = _len(_sub(C, A)) / float(spec.rows - 1)
+    return (pitch_row_m, pitch_col_m)
 
 
 # ── Frame validation ────────────────────────────────────────────
@@ -235,44 +266,50 @@ def validate_frame(spec: PalletPlaceSpec) -> List[Dict[str, Any]]:
             })
         return out
     # §465 fork-1 (2026-08-04): coincident-corner check — if either
-    # row (c1→c2) or col (c1→c3) is under _MIN_EDGE_LEN_MM the
+    # row (c1→c2) or col (c1→c3) is under _MIN_EDGE_LEN_M the
     # operator taught two corners at the same pose. Emitted BEFORE
     # the near-parallel angle check because that check reports
     # angle=0 on coincident inputs, and "same direction" is a
     # confusing operator message when the real problem is "same
-    # point". `involves_corners` and `distance_mm` let the UI
-    # (a) suppress findings mentioning the corner currently being
-    # re-taught, and (b) name the exact measurement in the copy.
-    A = _xyz(spec.corner1_tcp)
-    B = _xyz(spec.corner2_tcp)
-    C = _xyz(spec.corner3_tcp)
-    row_len_mm = _len(_sub(B, A))
-    col_len_mm = _len(_sub(C, A))
-    if row_len_mm < _MIN_EDGE_LEN_MM:
+    # point".
+    #
+    # Findings expose `distance_m` (meters) — the canonical unit
+    # throughout this module. Operator copy at the endpoint
+    # boundary converts to mm for display ("325.1 mm apart");
+    # this module NEVER labels a meters value with `_mm` (that
+    # was the pre-2026-08-04 unit-lie bug — 325 mm reported as
+    # 0.325 mm because the field said `distance_mm` while the
+    # code path fed it meters).
+    A = _xyz(spec.corner1_tcp)      # meters
+    B = _xyz(spec.corner2_tcp)      # meters
+    C = _xyz(spec.corner3_tcp)      # meters
+    row_len_m = _len(_sub(B, A))    # meters
+    col_len_m = _len(_sub(C, A))    # meters
+    if row_len_m < _MIN_EDGE_LEN_M:
         out.append({
             'severity':         'error',
             'code':             'corner_coincident',
             'involves_corners': ['c1', 'c2'],
-            'distance_mm':      row_len_mm,
+            'distance_m':       row_len_m,
             'message': (
-                f'Corners 1 and 2 appear coincident ({row_len_mm:.2f} '
-                f'mm apart) — jog to the actual pallet corner and '
-                f're-teach.'),
+                f'Corners 1 and 2 appear coincident '
+                f'({row_len_m*1000.0:.2f} mm apart) — jog to the '
+                f'actual pallet corner and re-teach.'),
         })
-    if col_len_mm < _MIN_EDGE_LEN_MM:
+    if col_len_m < _MIN_EDGE_LEN_M:
         out.append({
             'severity':         'error',
             'code':             'corner_coincident',
             'involves_corners': ['c1', 'c3'],
-            'distance_mm':      col_len_mm,
+            'distance_m':       col_len_m,
             'message': (
-                f'Corners 1 and 3 appear coincident ({col_len_mm:.2f} '
-                f'mm apart) — jog to the actual pallet corner and '
-                f're-teach.'),
+                f'Corners 1 and 3 appear coincident '
+                f'({col_len_m*1000.0:.2f} mm apart) — jog to the '
+                f'actual pallet corner and re-teach.'),
         })
     # If either edge collapsed, skip the angle check — angle math
     # is meaningless without both directions.
-    if row_len_mm < _MIN_EDGE_LEN_MM or col_len_mm < _MIN_EDGE_LEN_MM:
+    if row_len_m < _MIN_EDGE_LEN_M or col_len_m < _MIN_EDGE_LEN_M:
         return out
     fr = compute_frame(spec)
     if fr['row_col_angle_deg'] < _MIN_ROW_COL_ANGLE_DEG:
@@ -335,64 +372,74 @@ def validate_frame(spec: PalletPlaceSpec) -> List[Dict[str, Any]]:
                 'slot to lock the tool contact geometry.'),
         })
     if spec.has_taught_part_datum():
-        A = _xyz(spec.corner1_tcp)
-        P = _xyz(spec.part_tcp)
-        d = _len(_sub(P, A))
-        m_row, m_col = measured_pitches(spec)
-        pitches = [p for p in (m_row, m_col,
-                               spec.pitch_row_mm, spec.pitch_col_mm)
-                   if p and p > 0]
-        max_pitch = max(pitches) if pitches else 0.0
-        if max_pitch > 0 and d > _PART_DATUM_MAX_SLOTS * max_pitch:
+        A = _xyz(spec.corner1_tcp)   # meters
+        P = _xyz(spec.part_tcp)      # meters
+        d_m = _len(_sub(P, A))       # meters
+        m_row_m, m_col_m = measured_pitches(spec)   # meters
+        # Typed pitches from the operator UI arrive on the schema
+        # in mm (PalletConfigEditor field labels use mm). Convert
+        # to meters at THIS consume boundary; the canon in this
+        # module is meters everywhere below.
+        typed_row_m = ((spec.pitch_row_mm or 0.0) / 1000.0) or None
+        typed_col_m = ((spec.pitch_col_mm or 0.0) / 1000.0) or None
+        pitches_m = [p for p in (m_row_m, m_col_m,
+                                 typed_row_m, typed_col_m)
+                     if p and p > 0]
+        max_pitch_m = max(pitches_m) if pitches_m else 0.0
+        if max_pitch_m > 0 and d_m > _PART_DATUM_MAX_SLOTS * max_pitch_m:
             out.append({
                 'severity': 'warning',
                 'code':     'part_datum_far_from_corner',
                 'involves_corners': ['c1', 'c4'],
                 'message': (
-                    f'First-part position ④ is {d:.1f} mm from '
-                    f'corner 1 — more than '
+                    f'First-part position ④ is {d_m*1000.0:.1f} mm '
+                    f'from corner 1 — more than '
                     f'{_PART_DATUM_MAX_SLOTS:g} × max pitch '
-                    f'({max_pitch:.1f} mm). Is the part actually '
-                    f'in the first slot?'),
-                'distance_mm':      d,
-                'max_pitch_mm':     max_pitch,
-                'threshold_slots':  _PART_DATUM_MAX_SLOTS,
+                    f'({max_pitch_m*1000.0:.1f} mm). Is the part '
+                    f'actually in the first slot?'),
+                'distance_m':      d_m,
+                'max_pitch_m':     max_pitch_m,
+                'threshold_slots': _PART_DATUM_MAX_SLOTS,
             })
 
     if spec.teach_mode == 'far_slot':
-        m_row, m_col = measured_pitches(spec)
-        if m_row is not None and spec.pitch_row_mm > 0:
-            diff = abs(m_row - spec.pitch_row_mm)
-            if diff > _PITCH_MISMATCH_MM:
+        m_row_m, m_col_m = measured_pitches(spec)   # meters
+        typed_row_m = (spec.pitch_row_mm or 0.0) / 1000.0
+        typed_col_m = (spec.pitch_col_mm or 0.0) / 1000.0
+        if m_row_m is not None and typed_row_m > 0:
+            diff_m = abs(m_row_m - typed_row_m)
+            if diff_m > _PITCH_MISMATCH_M:
                 out.append({
                     'severity': 'warning',
                     'code':     'row_pitch_mismatch',
                     'message': (
-                        f'Row pitch: typed {spec.pitch_row_mm:.1f}mm '
-                        f'vs measured {m_row:.1f}mm — differ by '
-                        f'{diff:.1f}mm (threshold '
-                        f'{_PITCH_MISMATCH_MM:g}mm). Was point B '
+                        f'Row pitch: typed '
+                        f'{typed_row_m*1000.0:.1f}mm vs measured '
+                        f'{m_row_m*1000.0:.1f}mm — differ by '
+                        f'{diff_m*1000.0:.1f}mm (threshold '
+                        f'{_PITCH_MISMATCH_M*1000.0:g}mm). Was point B '
                         f'taught at the far column [1, N]? If so, '
                         f'update the typed value to match the '
                         f'measurement.'),
-                    'typed_mm':    spec.pitch_row_mm,
-                    'measured_mm': m_row,
+                    'typed_m':    typed_row_m,
+                    'measured_m': m_row_m,
                 })
-        if m_col is not None and spec.pitch_col_mm > 0:
-            diff = abs(m_col - spec.pitch_col_mm)
-            if diff > _PITCH_MISMATCH_MM:
+        if m_col_m is not None and typed_col_m > 0:
+            diff_m = abs(m_col_m - typed_col_m)
+            if diff_m > _PITCH_MISMATCH_M:
                 out.append({
                     'severity': 'warning',
                     'code':     'col_pitch_mismatch',
                     'message': (
-                        f'Column pitch: typed {spec.pitch_col_mm:.1f}mm '
-                        f'vs measured {m_col:.1f}mm — differ by '
-                        f'{diff:.1f}mm (threshold '
-                        f'{_PITCH_MISMATCH_MM:g}mm). Was point C '
+                        f'Column pitch: typed '
+                        f'{typed_col_m*1000.0:.1f}mm vs measured '
+                        f'{m_col_m*1000.0:.1f}mm — differ by '
+                        f'{diff_m*1000.0:.1f}mm (threshold '
+                        f'{_PITCH_MISMATCH_M*1000.0:g}mm). Was point C '
                         f'taught at the far row [M, 1]? If so, update '
                         f'the typed value to match the measurement.'),
-                    'typed_mm':    spec.pitch_col_mm,
-                    'measured_mm': m_col,
+                    'typed_m':    typed_col_m,
+                    'measured_m': m_col_m,
                 })
     return out
 
@@ -422,30 +469,33 @@ def _order_indices(rows: int, cols: int, layers: int,
 
 def _effective_pitches(spec: PalletPlaceSpec
                        ) -> Tuple[float, float, float]:
-    """Return (pitch_row_mm, pitch_col_mm, layer_height_mm) actually
-    used for slot placement.
+    """Return (pitch_row_m, pitch_col_m, layer_height_m) actually
+    used for slot placement — METERS.
 
     v2 (2026-07-30): MEASURED pitches always take precedence when
     the frame is taught — corners are unambiguous slot-boundary
     references, and the typed values only serve as the operator's
     cross-check (see validate_frame's row/col_pitch_mismatch
-    warnings). Untaught frame falls back to typed values."""
-    pr = float(spec.pitch_row_mm)
-    pc = float(spec.pitch_col_mm)
+    warnings). Untaught frame falls back to typed values (the
+    schema stores those in mm — converted here at the consume
+    boundary)."""
+    pr_m = (float(spec.pitch_row_mm) or 0.0) / 1000.0
+    pc_m = (float(spec.pitch_col_mm) or 0.0) / 1000.0
     if spec.has_taught_frame():
-        m_row, m_col = measured_pitches(spec)
-        if m_row is not None:
-            pr = m_row
-        if m_col is not None:
-            pc = m_col
-    lh = float(spec.layer_height_mm) if spec.layer_height_mm is not None else 0.0
-    return (pr, pc, lh)
+        m_row_m, m_col_m = measured_pitches(spec)   # meters
+        if m_row_m is not None:
+            pr_m = m_row_m
+        if m_col_m is not None:
+            pc_m = m_col_m
+    lh_m = (float(spec.layer_height_mm) / 1000.0) \
+        if spec.layer_height_mm is not None else 0.0
+    return (pr_m, pc_m, lh_m)
 
 
 def _part_datum_offset(spec: PalletPlaceSpec
                        ) -> Tuple[float, float, float]:
-    """Return the (x, y, z) mm offset from corner1 to part_tcp — the
-    v2 part-datum vector applied to every derived slot.
+    """Return the (x, y, z) METERS offset from corner1 to part_tcp
+    — the v2 part-datum vector applied to every derived slot.
 
     Rationale: corner1 is the pallet's FIXTURE corner (tool at the
     physical corner feature, tool tip may be a few mm off the
@@ -461,93 +511,89 @@ def _part_datum_offset(spec: PalletPlaceSpec
     finding — see validate_frame."""
     if not (spec.has_taught_frame() and spec.part_tcp is not None):
         return (0.0, 0.0, 0.0)
-    A = _xyz(spec.corner1_tcp)
-    P = _xyz(spec.part_tcp)
+    A = _xyz(spec.corner1_tcp)   # meters
+    P = _xyz(spec.part_tcp)      # meters
     return (P[0] - A[0], P[1] - A[1], P[2] - A[2])
 
 
 def compute_slot_offsets(spec: PalletPlaceSpec
                          ) -> List[Tuple[Tuple[int, int, int],
                                           Tuple[float, float, float]]]:
-    """Return [((r, c, l), (dx, dy, dz)), ...] in fill order.
+    """Return [((r, c, l), (dx_m, dy_m, dz_m)), ...] in fill
+    order. Deltas are METERS in the anchor's base frame.
 
-    Δ is in the ANCHOR'S BASE FRAME:
-      Δ = c · pitch_row · row_axis + r · pitch_col · col_axis
-          + l · layer_height · plane_normal
+    Δ = c · pitch_row · row_axis + r · pitch_col · col_axis
+        + l · layer_height · plane_normal + part_datum_offset
 
-    NAMING (matches operator + wizard vocabulary):
-      * row_axis points from A toward B — the "along-a-row"
-        direction. Walking along a row of cells means advancing
-        the COLUMN index.
-      * col_axis points from A toward C — the "down-a-column"
-        direction. Advancing the ROW index moves along col_axis.
-      * pitch_row = spacing of cells within a row (i.e. between
-                    adjacent columns). Measured as |B-A|/(cols-1)
-                    in far_slot mode.
-      * pitch_col = spacing of cells within a column (i.e. between
-                    adjacent rows). Measured as |C-A|/(rows-1)
-                    in far_slot mode.
+    Every scalar under the sum is meters (pitches from
+    _effective_pitches, part_datum from _part_datum_offset), so
+    Δ is meters. row_axis / col_axis / plane_normal come from
+    compute_frame() (unit vectors, dimensionless).
 
-    So the row-INDEX r multiplies pitch_col along col_axis, and
-    the col-INDEX c multiplies pitch_row along row_axis. This
-    unpacks the natural language: "pitch_row is the column-to-
-    column distance within a row" and "row_axis is the direction
-    you walk along the row".
-
-    row_axis / col_axis / plane_normal come from compute_frame(),
-    which uses the taught 3-point frame when present and falls back
-    to base-axis literals otherwise. Pitches come from
-    _effective_pitches() (measured in far_slot mode, typed
-    elsewhere). Slot (0,0,0) is always Δ = (0,0,0) — it IS the
-    anchor."""
+    NAMING: row_axis points A→B; col_axis points A→C after
+    Gram-Schmidt. pitch_row is the column-to-column spacing
+    within a row; pitch_col is the row-to-row spacing within a
+    column. Slot (0,0,0) has Δ = (part_datum_offset) — the
+    taught part pose relative to corner1."""
     fr = compute_frame(spec)
-    rax = fr['row_axis']
-    cax = fr['col_axis']
+    rax = fr['row_axis']    # unit vector
+    cax = fr['col_axis']    # unit vector
     nax = fr['plane_normal']
-    pr, pc, lh = _effective_pitches(spec)
-    # v2 part-datum offset: every slot in the taught frame carries
-    # part_tcp's XYZ relative to corner1 so slot [0,0] lands where
-    # the operator taught the actual part (not where they touched
-    # the fixture corner). Zero vector when part_tcp isn't taught.
-    px, py, pz = _part_datum_offset(spec)
+    pr_m, pc_m, lh_m = _effective_pitches(spec)
+    # v2 part-datum offset — meters. Every slot in the taught
+    # frame carries part_tcp's XYZ relative to corner1 so slot
+    # [0,0] lands where the operator taught the actual part.
+    px_m, py_m, pz_m = _part_datum_offset(spec)
     out: List[Tuple[Tuple[int, int, int], Tuple[float, float, float]]] = []
     for (r, c, l) in _order_indices(spec.rows, spec.cols, spec.layers, spec.order):
-        dx = c * pr * rax[0] + r * pc * cax[0] + l * lh * nax[0] + px
-        dy = c * pr * rax[1] + r * pc * cax[1] + l * lh * nax[1] + py
-        dz = c * pr * rax[2] + r * pc * cax[2] + l * lh * nax[2] + pz
-        out.append(((r, c, l), (dx, dy, dz)))
+        dx_m = c * pr_m * rax[0] + r * pc_m * cax[0] + l * lh_m * nax[0] + px_m
+        dy_m = c * pr_m * rax[1] + r * pc_m * cax[1] + l * lh_m * nax[1] + py_m
+        dz_m = c * pr_m * rax[2] + r * pc_m * cax[2] + l * lh_m * nax[2] + pz_m
+        out.append(((r, c, l), (dx_m, dy_m, dz_m)))
     return out
 
 
 def derive_slot_tcps(spec: PalletPlaceSpec,
-                     anchor_tcp_mm: Tuple[float, float, float, float, float, float]
+                     anchor_tcp_m: Tuple[float, float, float,
+                                          float, float, float]
                      ) -> List[Dict[str, Any]]:
-    """Return per-slot absolute TCPs [{index, row, col, layer, tcp_mm}, ...].
+    """Return per-slot absolute TCPs
+    `[{index, row, col, layer, tcp_m}, ...]` in METERS + RADIANS.
+
+    Parameter renamed 2026-08-04: `anchor_tcp_m` (was
+    `anchor_tcp_mm`, which held meters — the pre-fix unit lie).
+    Callers convert to mm at the render boundary (the pallet_slots
+    endpoint multiplies XYZ by 1000 to expose `tcp_mm` on the
+    twin-facing response).
 
     Orientation: v2 uses part_tcp's rx/ry/rz when taught, so every
     slot shares the operator-taught PART orientation (not the
-    fixture-corner orientation). Falls back to anchor_tcp_mm's
-    rx/ry/rz when part_tcp isn't taught yet (v1 migration path).
+    fixture-corner orientation). Falls back to anchor's rx/ry/rz
+    when part_tcp isn't taught yet (v1 migration path).
 
     Position: computed from compute_slot_offsets, which already
-    applies the corner-frame + part-datum offset. anchor_tcp_mm
-    supplies the origin translation — normally corner1's TCP.
+    applies the corner-frame + part-datum offset in meters.
+    anchor_tcp_m supplies the origin translation — normally
+    corner1's TCP.
 
     No IK here; use reachability_sweep to add per-slot joint
     solutions."""
-    ax, ay, az, rx, ry, rz = anchor_tcp_mm
+    ax, ay, az, rx, ry, rz = anchor_tcp_m
     # Orientation source: prefer part_tcp when taught (v2). Falls
     # back to the anchor's own orientation for legacy programs.
     if spec.part_tcp is not None and len(spec.part_tcp) >= 6:
-        rx, ry, rz = float(spec.part_tcp[3]), float(spec.part_tcp[4]), float(spec.part_tcp[5])
+        rx = float(spec.part_tcp[3])
+        ry = float(spec.part_tcp[4])
+        rz = float(spec.part_tcp[5])
     out: List[Dict[str, Any]] = []
-    for i, ((r, c, l), (dx, dy, dz)) in enumerate(compute_slot_offsets(spec)):
+    for i, ((r, c, l), (dx_m, dy_m, dz_m)) in enumerate(
+            compute_slot_offsets(spec)):
         out.append({
             'index': i,
             'row':   r,
             'col':   c,
             'layer': l,
-            'tcp_mm': [ax + dx, ay + dy, az + dz, rx, ry, rz],
+            'tcp_m': [ax + dx_m, ay + dy_m, az + dz_m, rx, ry, rz],
         })
     return out
 

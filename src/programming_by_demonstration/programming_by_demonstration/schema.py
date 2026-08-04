@@ -454,12 +454,16 @@ class PalletPlaceSpec:
     def has_taught_part_datum(self) -> bool:
         """True iff part_tcp is taught AND distinct from corner1_tcp
         (so the migration seed doesn't count). When True the slot
-        derivation carries a non-zero part-datum offset."""
+        derivation carries a non-zero part-datum offset.
+
+        Distinctness threshold: 0.5 mm on any XYZ axis. Canonical
+        pose unit is METERS (2026-08-04 pose-unit canon fix), so
+        the threshold is 0.5e-3 = 0.0005 m."""
         if self.part_tcp is None or self.corner1_tcp is None:
             return False
-        # Any of x/y/z differs by more than 0.5 mm → truly distinct.
+        _DISTINCT_THRESHOLD_M = 0.0005
         for i in range(3):
-            if abs(self.part_tcp[i] - self.corner1_tcp[i]) > 0.5:
+            if abs(self.part_tcp[i] - self.corner1_tcp[i]) > _DISTINCT_THRESHOLD_M:
                 return True
         return False
 

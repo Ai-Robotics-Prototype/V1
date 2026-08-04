@@ -31,13 +31,16 @@ def _spec(**place):
     return PalletPlaceSpec.from_dict(base)
 
 
-# ── corner_coincident (row) ────────────────────────────────────
+# ── corner_coincident (row) — METERS canon (2026-08-04) ───────
+# All fixtures in meters + radians (canonical unit). Findings
+# expose distance_m; operator toasts convert to mm at the
+# dashboard endpoint boundary.
 
 def test_corner_coincident_c1_c2_fires_below_threshold():
     s = _spec(
-        corner1_tcp=[100.0, 0.0, 50.0, 0, 0, 0],
-        corner2_tcp=[100.5, 0.0, 50.0, 0, 0, 0],   # 0.5 mm from c1
-        corner3_tcp=[100.0, 100.0, 50.0, 0, 0, 0],
+        corner1_tcp=[0.100, 0.0, 0.050, 0, 0, 0],
+        corner2_tcp=[0.1005, 0.0, 0.050, 0, 0, 0],  # 0.5 mm from c1
+        corner3_tcp=[0.100, 0.100, 0.050, 0, 0, 0],
     )
     findings = validate_frame(s)
     coincidents = [f for f in findings
@@ -46,30 +49,31 @@ def test_corner_coincident_c1_c2_fires_below_threshold():
         f'expected exactly one corner_coincident finding, got: {findings!r}')
     f = coincidents[0]
     assert f['involves_corners'] == ['c1', 'c2']
-    assert 0.4 < f['distance_mm'] < 0.6
+    # distance_m in meters; 0.5 mm → 0.0005 m
+    assert 0.0004 < f['distance_m'] < 0.0006
     assert 'coincident' in f['message'].lower()
 
 
 def test_corner_coincident_c1_c3_fires_below_threshold():
     s = _spec(
-        corner1_tcp=[100.0, 0.0, 50.0, 0, 0, 0],
-        corner2_tcp=[500.0, 0.0, 50.0, 0, 0, 0],
-        corner3_tcp=[100.4, 0.0, 50.0, 0, 0, 0],   # 0.4 mm from c1
+        corner1_tcp=[0.100, 0.0, 0.050, 0, 0, 0],
+        corner2_tcp=[0.500, 0.0, 0.050, 0, 0, 0],
+        corner3_tcp=[0.1004, 0.0, 0.050, 0, 0, 0],  # 0.4 mm from c1
     )
     findings = validate_frame(s)
     coincidents = [f for f in findings
                    if f.get('code') == 'corner_coincident']
     assert len(coincidents) == 1
     assert coincidents[0]['involves_corners'] == ['c1', 'c3']
-    assert 0.3 < coincidents[0]['distance_mm'] < 0.5
+    assert 0.0003 < coincidents[0]['distance_m'] < 0.0005
 
 
 def test_healthy_frame_no_coincident_finding():
     s = _spec(
         corner1_tcp=[0.0, 0.0, 0.0, 0, 0, 0],
-        corner2_tcp=[400.0, 0.0, 0.0, 0, 0, 0],
-        corner3_tcp=[0.0, 300.0, 0.0, 0, 0, 0],
-        part_tcp=[5.0, 5.0, -50.0, 0, 0, 0],
+        corner2_tcp=[0.400, 0.0, 0.0, 0, 0, 0],
+        corner3_tcp=[0.0, 0.300, 0.0, 0, 0, 0],
+        part_tcp=[0.005, 0.005, -0.050, 0, 0, 0],
     )
     findings = validate_frame(s)
     coincidents = [f for f in findings
@@ -80,14 +84,11 @@ def test_healthy_frame_no_coincident_finding():
 def test_coincident_skips_angle_check_to_avoid_double_reporting():
     """When either row or col collapses, the angle math is
     meaningless — validate_frame must NOT also emit
-    row_col_near_parallel (angle=0 on coincident inputs would
-    trip that check). Keeping the two findings from firing
-    together stops the operator from getting a contradictory
-    "same direction" toast on top of "same point"."""
+    row_col_near_parallel."""
     s = _spec(
         corner1_tcp=[0.0, 0.0, 0.0, 0, 0, 0],
-        corner2_tcp=[0.2, 0.0, 0.0, 0, 0, 0],   # 0.2 mm — coincident
-        corner3_tcp=[0.0, 300.0, 0.0, 0, 0, 0],
+        corner2_tcp=[0.0002, 0.0, 0.0, 0, 0, 0],   # 0.2 mm apart — coincident
+        corner3_tcp=[0.0, 0.300, 0.0, 0, 0, 0],
     )
     findings = validate_frame(s)
     codes = [f.get('code') for f in findings]
@@ -105,9 +106,9 @@ def test_v1_shape_migrated_then_validated_not_silently_passed():
     check for v1 programs because it read v2 keys only."""
     s = PalletPlaceSpec.from_dict({
         'rows': 2, 'cols': 2, 'layers': 1,
-        'corner_a_tcp': [100.0, 0.0, 50.0, 0, 0, 0],
-        'point_b_tcp':  [100.3, 0.0, 50.0, 0, 0, 0],   # 0.3 mm from A
-        'point_c_tcp':  [100.0, 100.0, 50.0, 0, 0, 0],
+        'corner_a_tcp': [0.100, 0.0, 0.050, 0, 0, 0],
+        'point_b_tcp':  [0.1003, 0.0, 0.050, 0, 0, 0],  # 0.3 mm from A
+        'point_c_tcp':  [0.100, 0.100, 0.050, 0, 0, 0],
     })
     assert s.migrated_from_v1
     findings = validate_frame(s)
