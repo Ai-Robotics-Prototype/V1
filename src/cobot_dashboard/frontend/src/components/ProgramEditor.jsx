@@ -16,8 +16,10 @@ import { isStepTaught, untaughtStepIds, hasFullTaughtPose, verbForStep,
          TEACHABLE_ACTIONS, isTeachable, isDerivedOffsetMove }
   from '../lib/programTruth'
 import { PALLET_ROLE_TO_FIELD, modeForRole, taughtCount,
-         validatePalletFrame, backFrom, advanceFrom, jumpTo }
+         backFrom, advanceFrom, jumpTo }
   from '../lib/palletTeachSequence'
+import { validatePalletFrameServer, findingsBlockingThisRecord }
+  from '../lib/palletFrameValidator'
 import { computeProgramFindings } from '../lib/programFindings'
 import { computeTeachingDebt, debtBannerLabel } from '../lib/teachingDebt'
 import { stepIndexForLine, lineMapHonesty } from '../lib/runState'
@@ -2254,8 +2256,6 @@ function TeachOverlay({
   onRecord, onSkip, onBack, onCancel,
   diagram,
   counterSuffix = '',
-  warnings = [],
-  onDismissWarnings,
 }) {
   // Shared jog transport — WS-first with server-side hold keepalive.
   // Same store actions the main Program-tab JogControls uses; the old
@@ -2520,48 +2520,11 @@ function TeachOverlay({
         </div>
       </div>
 
-      {/* FRAME VALIDATION BANNER — surfaces AFTER a corner record
-          when the frame's geometry disagrees with the flat-pallet
-          assumption. absolute-positioned so it does NOT consume the
-          vertical budget (see teachLayout no-scroll invariant); the
-          operator dismisses it once the numbers have registered.
-          Blocks no motion — Record again or Skip both dismiss it. */}
-      {warnings.length > 0 && (
-        <div
-          data-testid="pallet-frame-warning"
-          style={{
-            position: 'absolute',
-            top: 60 + 48,      // header + instruction band
-            left: 0, right: 0,
-            zIndex: 5,
-            background: '#fef3c7',
-            borderBottom: '1px solid #fde68a',
-            padding: '8px 16px',
-            display: 'flex', flexDirection: 'row', alignItems: 'center',
-            gap: 12, fontSize: 13, color: '#78350f',
-            boxShadow: '0 2px 6px rgba(0,0,0,0.08)',
-          }}>
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 3 }}>
-            {warnings.map((w) => (
-              <div key={w.key}>
-                <strong style={{ marginRight: 6 }}>⚠ Frame check:</strong>{w.message}
-              </div>
-            ))}
-          </div>
-          {typeof onDismissWarnings === 'function' && (
-            <button onClick={onDismissWarnings}
-              data-testid="pallet-frame-warning-dismiss"
-              style={{
-                padding: '4px 12px', fontSize: 12, fontWeight: 600,
-                background: '#fff', color: '#78350f',
-                border: '1px solid #fde68a', borderRadius: 4,
-                cursor: 'pointer', flexShrink: 0,
-              }}>
-              Got it — dismiss
-            </button>
-          )}
-        </div>
-      )}
+      {/* Passive frame-warning banner retired (§465 fork-1 kill,
+          2026-08-04). Findings surface via toast at (a) Record —
+          via palletTeachRecord's call to validatePalletFrameServer —
+          and (b) teach-complete / handleSave, never as a passive
+          overlay against mid-re-teach state. */}
 
       {/* JOG + DIAGRAM ROW — flex-row so the diagram docks BESIDE
           the jog pads, not above them. Keeps every jog button + the
@@ -3323,10 +3286,14 @@ export default function ProgramEditor() {
   // All chaining an owed re-teach; cleared as soon as the operator
   // navigates away from that role.
   const [palletTeachReason, setPalletTeachReason] = useState(null)
-  // Frame-validation warnings surfaced after a corner record. Non-
-  // empty → banner blocks advance until the operator acks OR
-  // records a better pose. See lib/palletTeachSequence.validatePalletFrame.
-  const [palletFrameWarnings, setPalletFrameWarnings] = useState([])
+  // Frame-validation findings are NOT held as passive banner state
+  // anymore (§465 fork-1 kill, 2026-08-04). The mid-re-teach
+  // passive-banner rendering surfaced findings against half-updated
+  // state (e.g., a stale c2 pose that the operator was actively
+  // replacing) — operator-hostile. Findings are now requested at
+  // two moments only: (a) inside palletTeachRecord after each
+  // Record, surfaced as a toast; (b) at teach-complete / handleSave
+  // as the final gate. See palletFrameValidator.js.
   // Cancel-confirm modal state — the confirm dialog states the
   // number of already-recorded teaches so the operator knows what's
   // preserved before dismissing.
@@ -3885,7 +3852,6 @@ export default function ProgramEditor() {
     setPalletTeachRole(null)
     setPalletTeachMode(null)
     setPalletTeachReason(null)
-    setPalletFrameWarnings([])
     if (debt.stepIds.length > 0) {
       // Step queue first — same behavior as before. Chaining runs
       // after the queue completes.
@@ -3911,7 +3877,6 @@ export default function ProgramEditor() {
     setPalletTeachRole(first.role)
     setPalletTeachMode(modeForRole(first.role, fs))
     setPalletTeachReason(first.reason || null)
-    setPalletFrameWarnings([])
   }
 
   // Resolve the step the overlay is currently teaching (Teach All
@@ -4008,7 +3973,6 @@ export default function ProgramEditor() {
     setPalletTeachRole(null)
     setPalletTeachMode(null)
     setPalletTeachReason(null)
-    setPalletFrameWarnings([])
   }
 
   function palletTeachDiscardConfirm(discard) {
@@ -4021,7 +3985,6 @@ export default function ProgramEditor() {
     setPalletTeachRole(null)
     setPalletTeachMode(null)
     setPalletTeachReason(null)
-    setPalletFrameWarnings([])
     if (!discard) {
       addToast?.(`Teaches preserved — remember to Save`, 'success')
     }
@@ -4040,7 +4003,6 @@ export default function ProgramEditor() {
     setTeachAllPos(-1)
     setPalletTeachRole(first)
     setPalletTeachMode(modeForRole(first, fs))
-    setPalletFrameWarnings([])
   }
 
   // Tap-navigation from the diagram — any role is a legal target.
@@ -4053,7 +4015,6 @@ export default function ProgramEditor() {
     // warning banner — the operator has moved on; the reason /
     // numbers no longer apply to what they see.
     setPalletTeachReason(null)
-    setPalletFrameWarnings([])
   }
 
   // Diagram-guided step shape fed to TeachOverlay. Matches the wizard's
@@ -4084,11 +4045,25 @@ export default function ProgramEditor() {
   }
 
   // Record the current live pose into program.config.pallet_place
-  // under the field for the active role. Mirror to config.pallet for
-  // consumers that still read the pre-pallet_place shape. On a corner
-  // record, re-run frame validation and surface warnings before
-  // advancing; the ④ record path skips validation (part datum
-  // doesn't affect corner geometry). Sequence closes after ④.
+  // under the field for the active role. Mirror to config.pallet
+  // for consumers that still read the pre-pallet_place shape.
+  //
+  // Frame validation (§465 fork-1 kill, 2026-08-04): all frame
+  // geometry runs on the backend via POST /api/pallet/validate_frame.
+  // Timing rules:
+  //   * On Record for a CORNER role, we POST the would-be place
+  //     (including the just-recorded pose) and pass
+  //     re_teaching_role=<this role> so findings mentioning ONLY
+  //     the corner being replaced are suppressed.
+  //   * If any BLOCKING (error-severity) finding involves the
+  //     just-recorded corner, we REFUSE the record: don't commit
+  //     currentProgram, stay at the current role, toast the
+  //     operator with the measured distance in operator copy.
+  //   * Non-blocking findings (or errors involving other corners
+  //     only) surface as an error toast but the record commits
+  //     and the flow advances — the operator can re-teach the
+  //     offending OTHER corner from the itinerary.
+  // No passive banner is rendered from this path.
   async function palletTeachRecord() {
     const role = palletTeachRole
     if (!role) return
@@ -4103,26 +4078,67 @@ export default function ProgramEditor() {
     const cfg = currentProgram?.config || {}
     const nextPlace = { ...(cfg.pallet_place || {}), [field]: [...tcp] }
     const nextPallet = { ...(cfg.pallet || {}),      [field]: [...tcp] }
-    const nextProgram = {
-      config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet },
-      unsaved: true,
-    }
-    setCurrentProgram(nextProgram)
-    // Frame revalidation runs on the JUST-WRITTEN place, so the
-    // warning reflects the geometry the operator can see right now.
     const isCorner = role === 'pallet_c1' || role === 'pallet_c2' || role === 'pallet_c3'
-    const warnings = isCorner ? validatePalletFrame(nextPlace) : []
-    setPalletFrameWarnings(warnings)
-    if (warnings.length > 0) {
-      // Hold at the current role so the operator sees the numbers
-      // BEFORE the flow advances. Ack via Skip (accept + move on)
-      // or another Record (overwrite with a better pose).
-      setPalletTeachMode('re-teach')
-      return
+
+    if (isCorner) {
+      // Ask the shared validator BEFORE committing. Blocking
+      // findings that name the corner we just recorded refuse
+      // the record. Non-blocking findings surface but proceed.
+      const result = await validatePalletFrameServer(nextPlace, {
+        // We are RECORDING this role, not re-teaching a stale
+        // one, so pass null — the finding-with-this-corner is
+        // exactly what we want to see (blocked or advisory).
+        reTeachingRole: null,
+      })
+      const blockers = findingsBlockingThisRecord(result.findings, role)
+      if (blockers.length > 0) {
+        const op = blockers[0].operator || {}
+        addToast?.({
+          title:  op.title  || 'This corner is too close to another taught corner.',
+          detail: op.detail || 'Jog to the pallet corner and record again.',
+          technicalDetail: op.technicalDetail || blockers[0].message || '',
+        }, 'error', 10000)
+        // eslint-disable-next-line no-console
+        console.warn('[pallet-teach] Record refused', {
+          role, findings: result.findings, measured: result.measured,
+        })
+        // Do NOT commit currentProgram; stay at the current role
+        // in re-teach mode so the operator's next Record replaces
+        // the just-refused attempt without navigating.
+        setPalletTeachMode('re-teach')
+        return
+      }
+      // Commit the good record.
+      setCurrentProgram({
+        config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet },
+        unsaved: true,
+      })
+      // Non-blocking findings (or errors involving other corners
+      // only): surface once, let the flow advance.
+      const advisory = (result.findings || []).find(
+        (f) => f?.severity === 'error' || f?.severity === 'warning')
+      if (advisory) {
+        const op = advisory.operator || {}
+        addToast?.({
+          title:  op.title  || 'Pallet frame warning',
+          detail: op.detail || (advisory.message || ''),
+          technicalDetail: op.technicalDetail || advisory.message || '',
+        }, advisory.severity === 'error' ? 'error' : 'warning', 8000)
+      }
+    } else {
+      // ④ record: part-datum doesn't affect corner geometry
+      // math — commit without a validation round-trip. The
+      // teach-complete gate on close catches any lingering
+      // issue.
+      setCurrentProgram({
+        config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet },
+        unsaved: true,
+      })
     }
+
     const merged = {
       ...(currentProgram || {}),
-      config: nextProgram.config,
+      config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet },
     }
     const next = advanceFrom(role, merged)
     // Advance clears the reason addendum — the current step is done,
@@ -4130,13 +4146,34 @@ export default function ProgramEditor() {
     setPalletTeachReason(null)
     setPalletTeachRole(next ? next.role : null)
     setPalletTeachMode(next ? next.mode : null)
+    // Teach-complete gate — when the sequence closes (next===null)
+    // run one final validation against the whole place. Findings
+    // surface via toast; the actual save gate is in handleSave.
+    if (next === null && isCorner) {
+      // isCorner only fires the completion check when a corner
+      // completed the sequence, matching the current guard.
+      _runTeachCompleteGate(nextPlace)
+    }
+  }
+
+  async function _runTeachCompleteGate(place) {
+    const result = await validatePalletFrameServer(place || {}, {
+      reTeachingRole: null,
+    })
+    if (!(result.findings && result.findings.length)) return
+    for (const f of result.findings) {
+      const op = f?.operator || {}
+      addToast?.({
+        title:  op.title  || 'Pallet frame finding',
+        detail: op.detail || (f?.message || ''),
+        technicalDetail: op.technicalDetail || f?.message || '',
+      }, f?.severity === 'error' ? 'error' : 'warning', 8000)
+    }
   }
 
   function palletTeachSkip() {
     // Skip always advances forward, even past taught points.
-    // Clears any warning banner (operator explicitly acking).
     const next = advanceFrom(palletTeachRole, currentProgram)
-    setPalletFrameWarnings([])
     setPalletTeachReason(null)
     setPalletTeachRole(next ? next.role : null)
     setPalletTeachMode(next ? next.mode : null)
@@ -4151,12 +4188,50 @@ export default function ProgramEditor() {
     setPalletTeachRole(back.role)
     setPalletTeachMode(back.mode)
     setPalletTeachReason(null)
-    setPalletFrameWarnings([])
   }
 
   async function handleSave() {
     if (saveStatus === 'saving') return
     const name = programName.trim() || 'Untitled Program'
+    // Teach-complete gate (§465 fork-1 kill, 2026-08-04). If the
+    // program carries a pallet_place with any taught corners,
+    // run one final backend validation before writing to disk.
+    // Any error-severity finding refuses the save with an
+    // operator toast; warnings surface but don't block.
+    const cfgSave = currentProgram?.config || {}
+    const place   = cfgSave.pallet_place || null
+    const hasAnyCorner = place && (place.corner1_tcp || place.corner2_tcp
+      || place.corner3_tcp || place.part_tcp || place.corner_a_tcp
+      || place.point_b_tcp || place.point_c_tcp)
+    if (hasAnyCorner) {
+      const gate = await validatePalletFrameServer(place,
+        { reTeachingRole: null })
+      const errors = (gate.findings || []).filter(
+        (f) => f?.severity === 'error')
+      if (errors.length > 0) {
+        const op = errors[0].operator || {}
+        addToast?.({
+          title:  op.title  || 'Program can\'t save — pallet frame is bad.',
+          detail: op.detail || (errors[0].message || ''),
+          technicalDetail: op.technicalDetail || errors[0].message || '',
+        }, 'error', 10000)
+        setSaveStatus('error')
+        setSaveError(
+          'Pallet frame refused: ' + (op.title || errors[0].message || ''))
+        return
+      }
+      // Non-error findings surface but don't block.
+      const warns = (gate.findings || []).filter(
+        (f) => f?.severity === 'warning' || f?.severity === 'info')
+      for (const w of warns) {
+        const op = w.operator || {}
+        addToast?.({
+          title:  op.title  || 'Pallet frame finding',
+          detail: op.detail || (w.message || ''),
+          technicalDetail: op.technicalDetail || w.message || '',
+        }, w.severity === 'warning' ? 'warning' : 'info', 6000)
+      }
+    }
     setSaveStatus('saving')
     try {
       // Preserve the full config block (gripper, pallet, motion profile,
@@ -4632,8 +4707,7 @@ export default function ProgramEditor() {
             setPalletTeachRole('pallet_part')
             setPalletTeachMode(modeForRole('pallet_part',
               palletFrameStatus(currentProgram)))
-            setPalletFrameWarnings([])
-          }
+                  }
         }}
       />
 
@@ -5486,8 +5560,6 @@ export default function ProgramEditor() {
               currentN={roleIdx + 1}
               totalM={PALLET_ROLE_ORDER.length}
               counterSuffix={counterSuffix}
-              warnings={palletFrameWarnings}
-              onDismissWarnings={() => setPalletFrameWarnings([])}
               canBack={roleIdx > 0}
               onRecord={palletTeachRecord}
               onSkip={palletTeachSkip}

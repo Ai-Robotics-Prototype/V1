@@ -1,6 +1,6 @@
-// Sequence + validation helpers for the pallet 4-point teach flow.
+// Sequence helpers for the pallet 4-point teach flow.
 //
-// Owns three things that BOTH hosts (wizard page teach + editor
+// Owns two things that BOTH hosts (wizard page teach + editor
 // row-button teach) must agree on — never forked:
 //
 //   1. Role order + role↔field mapping — the operator walks
@@ -10,10 +10,14 @@
 //      teach vs re-teach mode a given (role, program-state) pair
 //      resolves to. Re-teach is "the operator revisited a role that
 //      already has a taught pose"; the pose is KEPT until Record.
-//   3. Frame validation — after any ①②③ record, verify the frame
-//      geometry (orthogonality, tilt) and surface a warning when
-//      the numbers get worse. Runs pre-advance so the operator sees
-//      what changed before the flow moves on.
+//
+// Frame validation is intentionally NOT here (§465 fork-1 kill,
+// 2026-08-04). All frame geometry runs on the backend via
+// POST /api/pallet/validate_frame → pallet_geometry.compute_frame
+// / validate_frame — the shared truth surface with v1→v2
+// migration, Gram-Schmidt-orthogonalized frame, and named
+// `involves_corners` metadata for re-teach suppression. See
+// frontend/src/lib/palletFrameValidator.js for the async client.
 
 import { palletFrameStatus, PALLET_ROLE_ORDER } from './programTruth.js'
 
@@ -76,74 +80,6 @@ export function taughtCount(frameStatus) {
   if (frameStatus.corner3) n++
   if (frameStatus.part)    n++
   return n
-}
-
-
-// ── Frame validation ────────────────────────────────────────────
-//
-// Runs any time ①②③ get (re-)recorded. Compares the just-taught
-// frame against two geometric expectations:
-//   * ROW ⊥ COL — the vectors c1→c2 and c1→c3 should be roughly
-//     perpendicular. Deviation > 5° is worth surfacing.
-//   * Frame not tilted — |Z| of each edge relative to its length
-//     should stay small (< 5%). Anything larger means the taught
-//     poses aren't co-planar with the pallet surface, which
-//     invalidates the flat-grid slot derivation.
-//
-// Returns [] when the frame is fine or when fewer than the three
-// corners are taught (nothing to check). Each warning is
-// {key, message, numbers}: `key` lets the UI de-dupe and pin tests
-// look up by name; `numbers` is a compact object the UI can format.
-
-function has6(v) { return Array.isArray(v) && v.length >= 6 }
-
-function sub3(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]] }
-function len3(v)    { return Math.hypot(v[0], v[1], v[2]) }
-function dot3(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2] }
-
-export function validatePalletFrame(place) {
-  const warnings = []
-  if (!place) return warnings
-  const c1 = place.corner1_tcp
-  const c2 = place.corner2_tcp
-  const c3 = place.corner3_tcp
-  if (!(has6(c1) && has6(c2) && has6(c3))) return warnings
-  const row = sub3(c2, c1)   // c1 → c2
-  const col = sub3(c3, c1)   // c1 → c3
-  const rowLen = len3(row)
-  const colLen = len3(col)
-  if (rowLen < 1 || colLen < 1) {
-    warnings.push({
-      key: 'degenerate',
-      message: 'Row or column vector has near-zero length — corners appear coincident.',
-      numbers: { rowLenMm: rowLen, colLenMm: colLen },
-    })
-    return warnings
-  }
-  // ROW ⊥ COL — angular deviation from 90°.
-  const cosA = dot3(row, col) / (rowLen * colLen)
-  const angleDeg = Math.acos(Math.max(-1, Math.min(1, cosA))) * 180 / Math.PI
-  const orthoDev = Math.abs(angleDeg - 90)
-  if (orthoDev > 5) {
-    warnings.push({
-      key: 'orthogonality',
-      message: `Row and column not perpendicular — measured ${angleDeg.toFixed(1)}°, `
-             + `off by ${orthoDev.toFixed(1)}° from 90°.`,
-      numbers: { angleDeg, orthoDev },
-    })
-  }
-  // Tilt — |Z| component vs total edge length. > 5% is worth flagging.
-  const rowTilt = Math.abs(row[2]) / rowLen
-  const colTilt = Math.abs(col[2]) / colLen
-  if (rowTilt > 0.05 || colTilt > 0.05) {
-    warnings.push({
-      key: 'tilt',
-      message: `Frame is tilted off the XY plane — row Z/L=${(rowTilt*100).toFixed(1)}%, `
-             + `col Z/L=${(colTilt*100).toFixed(1)}% (>5% threshold).`,
-      numbers: { rowTilt, colTilt },
-    })
-  }
-  return warnings
 }
 
 

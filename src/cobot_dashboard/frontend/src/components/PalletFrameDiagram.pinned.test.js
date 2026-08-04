@@ -404,17 +404,23 @@ test('editor cancel-confirm modal states the number of preserved teaches', () =>
     + 'the directive\'s explicit assurance')
 })
 
-test('editor frame-validation banner renders when warnings are set', () => {
-  assert.ok(editorSrc.includes('data-testid="pallet-frame-warning"'),
-    'Frame-validation banner must carry a stable testid so tests '
-    + 'can assert the correct warning appears')
-  assert.ok(/warnings\.length > 0/.test(editorSrc),
-    'banner gates on warnings.length so it only shows when '
-    + 'validation actually failed')
-  // The record path must call validatePalletFrame on any corner
-  // teach so the banner is populated with real numbers.
-  assert.ok(/validatePalletFrame\(nextPlace\)/.test(editorSrc),
-    'palletTeachRecord must call validatePalletFrame(nextPlace) '
-    + 'after a corner write so the banner reflects the JUST-WRITTEN '
-    + 'geometry')
+test('editor frame validation goes through the shared backend endpoint (§465 fork-1 kill, 2026-08-04)', () => {
+  // The passive frame-warning banner is retired: it fired against
+  // mid-re-teach state (half-updated) and used its own local math
+  // that skipped the v1→v2 migration. Findings now surface as
+  // toasts at (a) Record and (b) teach-complete, sourced from the
+  // shared POST /api/pallet/validate_frame endpoint.
+  assert.ok(!editorSrc.includes('data-testid="pallet-frame-warning"'),
+    'passive pallet-frame-warning banner must be retired — '
+    + 'findings only surface as toasts at Record and at '
+    + 'teach-complete, never as a passive banner')
+  assert.ok(!/validatePalletFrame\(nextPlace\)/.test(editorSrc),
+    'palletTeachRecord must NOT call the retired local '
+    + 'validatePalletFrame(nextPlace) — geometry runs on the '
+    + 'backend now')
+  // Positive assertion: the record path uses the async validator.
+  assert.ok(/validatePalletFrameServer\(nextPlace/.test(editorSrc),
+    'palletTeachRecord must call validatePalletFrameServer with '
+    + 'the would-be place so the shared endpoint validates the '
+    + 'geometry before the record commits')
 })

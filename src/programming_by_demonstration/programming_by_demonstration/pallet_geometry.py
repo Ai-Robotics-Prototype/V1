@@ -59,6 +59,7 @@ _MIN_ROW_COL_ANGLE_DEG = 60.0   # row·col angle must exceed this
 _MAX_TILT_DEG          = 10.0   # warn beyond
 _PITCH_MISMATCH_MM     = 3.0    # warn when |measured − typed| > this
 _PART_DATUM_MAX_SLOTS  = 1.5    # warn when |part - corner1| > this × max_pitch
+_MIN_EDGE_LEN_MM       = 1.0    # coincident-corner threshold (§465 fork-1)
 
 
 # ── Vector helpers — no numpy dependency ────────────────────────
@@ -233,11 +234,52 @@ def validate_frame(spec: PalletPlaceSpec) -> List[Dict[str, Any]]:
                     'get rotation-safe slot positions.'),
             })
         return out
+    # §465 fork-1 (2026-08-04): coincident-corner check — if either
+    # row (c1→c2) or col (c1→c3) is under _MIN_EDGE_LEN_MM the
+    # operator taught two corners at the same pose. Emitted BEFORE
+    # the near-parallel angle check because that check reports
+    # angle=0 on coincident inputs, and "same direction" is a
+    # confusing operator message when the real problem is "same
+    # point". `involves_corners` and `distance_mm` let the UI
+    # (a) suppress findings mentioning the corner currently being
+    # re-taught, and (b) name the exact measurement in the copy.
+    A = _xyz(spec.corner1_tcp)
+    B = _xyz(spec.corner2_tcp)
+    C = _xyz(spec.corner3_tcp)
+    row_len_mm = _len(_sub(B, A))
+    col_len_mm = _len(_sub(C, A))
+    if row_len_mm < _MIN_EDGE_LEN_MM:
+        out.append({
+            'severity':         'error',
+            'code':             'corner_coincident',
+            'involves_corners': ['c1', 'c2'],
+            'distance_mm':      row_len_mm,
+            'message': (
+                f'Corners 1 and 2 appear coincident ({row_len_mm:.2f} '
+                f'mm apart) — jog to the actual pallet corner and '
+                f're-teach.'),
+        })
+    if col_len_mm < _MIN_EDGE_LEN_MM:
+        out.append({
+            'severity':         'error',
+            'code':             'corner_coincident',
+            'involves_corners': ['c1', 'c3'],
+            'distance_mm':      col_len_mm,
+            'message': (
+                f'Corners 1 and 3 appear coincident ({col_len_mm:.2f} '
+                f'mm apart) — jog to the actual pallet corner and '
+                f're-teach.'),
+        })
+    # If either edge collapsed, skip the angle check — angle math
+    # is meaningless without both directions.
+    if row_len_mm < _MIN_EDGE_LEN_MM or col_len_mm < _MIN_EDGE_LEN_MM:
+        return out
     fr = compute_frame(spec)
     if fr['row_col_angle_deg'] < _MIN_ROW_COL_ANGLE_DEG:
         out.append({
             'severity': 'error',
             'code':     'row_col_near_parallel',
+            'involves_corners': ['c2', 'c3'],
             'message': (
                 f'Points B and C describe the same direction '
                 f'(row/col angle {fr["row_col_angle_deg"]:.1f}° < '
@@ -250,6 +292,7 @@ def validate_frame(spec: PalletPlaceSpec) -> List[Dict[str, Any]]:
         out.append({
             'severity': 'warning',
             'code':     'pallet_tilted',
+            'involves_corners': ['c1', 'c2', 'c3'],
             'message': (
                 f'Pallet plane tilts {fr["tilt_deg"]:.1f}° from '
                 f'horizontal (threshold {_MAX_TILT_DEG:g}°). If the '
@@ -268,6 +311,7 @@ def validate_frame(spec: PalletPlaceSpec) -> List[Dict[str, Any]]:
         out.append({
             'severity': 'info',
             'code':     'part_datum_needs_reteach',
+            'involves_corners': ['c4'],
             'message': (
                 'This pallet was migrated from the v1 (3-point) '
                 'model. The first-part position (④) was seeded '
@@ -284,6 +328,7 @@ def validate_frame(spec: PalletPlaceSpec) -> List[Dict[str, Any]]:
         out.append({
             'severity': 'info',
             'code':     'part_datum_not_taught',
+            'involves_corners': ['c4'],
             'message': (
                 'First-part position (④) is not distinct from '
                 'corner 1. Teach ④ with a real part in the first '
@@ -302,6 +347,7 @@ def validate_frame(spec: PalletPlaceSpec) -> List[Dict[str, Any]]:
             out.append({
                 'severity': 'warning',
                 'code':     'part_datum_far_from_corner',
+                'involves_corners': ['c1', 'c4'],
                 'message': (
                     f'First-part position ④ is {d:.1f} mm from '
                     f'corner 1 — more than '

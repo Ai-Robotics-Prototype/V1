@@ -10806,6 +10806,207 @@ if FASTAPI_AVAILABLE:
             "reachability": reach,
         }
 
+    # ── /api/pallet/validate_frame (§465 fork-1 kill, 2026-08-04) ─
+    #
+    # Shared-truth endpoint the Program Editor calls during and
+    # after the 3-corner pallet teach so the frontend runs NO
+    # frame geometry itself. Prior to this endpoint, the frontend
+    # had its own `validatePalletFrame` in palletTeachSequence.js
+    # that computed row/col vectors, length, orthogonality, and
+    # tilt against RAW stored `place.corner{1,2,3}_tcp` — a fork
+    # of `pallet_geometry.compute_frame/validate_frame` that
+    # (a) skipped the v1→v2 migration (v1 programs got silent
+    # passes), (b) did no Gram-Schmidt projection, and (c) fired
+    # as a passive banner mid-re-teach against half-updated
+    # state. This endpoint is the single frame-truth surface;
+    # the no-fork lint at test/test_no_frontend_frame_math.py
+    # prevents re-introduction.
+    #
+    # Request body:
+    #   {
+    #     "place":            { any subset of PalletPlaceSpec fields
+    #                           — v1 (corner_a_tcp/point_b_tcp/…)
+    #                           or v2 (corner{1,2,3}_tcp/part_tcp);
+    #                           from_dict does the migration },
+    #     "spec_dict":        { optional — merged onto place, wins
+    #                           on conflict; lets the caller nudge
+    #                           rows/cols/pitch without saving },
+    #     "re_teaching_role": "pallet_c1"|"pallet_c2"|"pallet_c3"
+    #                       | "pallet_part"|null (default null),
+    #   }
+    #
+    # Response:
+    #   { findings:[…], blocking:bool, measured:{…}, spec:{…} }
+    #
+    # Findings shape per-item:
+    #   { severity, code, involves_corners, message, distance_mm?,
+    #     operator: { title, detail, technicalDetail } }
+    #
+    # Suppression: findings whose involves_corners contains the
+    # role currently being re-taught are DROPPED — the operator
+    # is about to replace that corner and surfacing findings that
+    # cite it is noise. This is the fix for "passive banner
+    # mid-re-teach against half-updated state." Findings that
+    # only cite the OTHER corners still surface, with copy that
+    # names the actual problem corner (not the one being
+    # re-taught).
+    _ROLE_TO_CORNER = {
+        'pallet_c1':   'c1',
+        'pallet_c2':   'c2',
+        'pallet_c3':   'c3',
+        'pallet_part': 'c4',
+    }
+
+    def _pallet_finding_operator_copy(f: dict, place: dict) -> dict:
+        """Map a pallet_geometry finding to the 267108a-register
+        toast triple {title, detail, technicalDetail}. Raw wire
+        text goes to technicalDetail; operator sees the demoted
+        title + detail only."""
+        code = f.get('code') or ''
+        involves = f.get('involves_corners') or []
+        dist = f.get('distance_mm')
+        tech = f.get('message', '')
+        if code == 'corner_coincident':
+            pair = ' and '.join(str(int(c[1:]) or c[1:])
+                                for c in involves) if involves else '?'
+            dmm = f'{dist:.2f} mm' if isinstance(dist, (int, float)) else '?'
+            return {
+                'title':  f'Corners {pair} are too close.',
+                'detail': (f'Measured {dmm} apart — jog to the actual '
+                           f'pallet corner and record again.'),
+                'technicalDetail': tech,
+            }
+        if code == 'row_col_near_parallel':
+            ang = f.get('row_col_angle_deg')
+            ang_s = f'{ang:.1f}°' if isinstance(ang, (int, float)) else '?'
+            return {
+                'title':  'Corners 2 and 3 point in the same direction.',
+                'detail': (f'Row/column angle is {ang_s} — move corner 3 '
+                           f'to the OTHER pallet edge (roughly 90° from '
+                           f'corner 2) and re-teach.'),
+                'technicalDetail': tech,
+            }
+        if code == 'pallet_tilted':
+            t = f.get('tilt_deg')
+            t_s = f'{t:.1f}°' if isinstance(t, (int, float)) else '?'
+            return {
+                'title':  'Pallet frame is tilted off horizontal.',
+                'detail': (f'Measured {t_s} off — check that all three '
+                           f'corners were recorded on the same surface.'),
+                'technicalDetail': tech,
+            }
+        if code == 'part_datum_needs_reteach':
+            return {
+                'title':  'Teach the first-part position (④).',
+                'detail': ('This pallet was migrated from the older '
+                           '3-point model — the first-part pose was '
+                           'seeded from corner 1 as a placeholder. '
+                           'Re-teach ④ with a real part in the first '
+                           'slot before running.'),
+                'technicalDetail': tech,
+            }
+        if code == 'part_datum_not_taught':
+            return {
+                'title':  'Teach the first-part position (④).',
+                'detail': ('④ is not distinct from corner 1. Place a '
+                           'real part in the first slot and record.'),
+                'technicalDetail': tech,
+            }
+        if code == 'part_datum_far_from_corner':
+            dmm = f'{dist:.1f} mm' if isinstance(dist, (int, float)) else '?'
+            return {
+                'title':  'First-part position (④) is far from corner 1.',
+                'detail': (f'Measured {dmm} away — is the part actually '
+                           f'in the first slot?'),
+                'technicalDetail': tech,
+            }
+        if code == 'taught_frame_missing':
+            return {
+                'title':  'Teach all three pallet corners to lock the frame.',
+                'detail': ('Slot positions currently assume the pallet is '
+                           'aligned to the robot base — re-teach the three '
+                           'corners for a rotation-safe grid.'),
+                'technicalDetail': tech,
+            }
+        # Fallback: keep the raw message as the title so nothing
+        # is silently eaten.
+        return {'title':  tech,
+                'detail': '',
+                'technicalDetail': tech}
+
+    @app.post("/api/pallet/validate_frame")
+    async def api_pallet_validate_frame(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        place = dict(body.get('place') or {})
+        override = body.get('spec_dict') or {}
+        if isinstance(override, dict):
+            place.update(override)
+        role = body.get('re_teaching_role')
+        suppress = _ROLE_TO_CORNER.get(role)
+        try:
+            from programming_by_demonstration.schema import PalletPlaceSpec
+            from programming_by_demonstration.pallet_geometry import (
+                compute_frame, validate_frame, measured_pitches,
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"error": f"pallet_geometry import: {e}"}, status_code=500)
+        spec = PalletPlaceSpec.from_dict(place)
+        raw_findings = validate_frame(spec)
+        # Suppression: drop findings that involve the corner
+        # currently being re-taught. When the operator is
+        # replacing corner N, we do NOT nag them about corner N
+        # being wrong — the very next Record replaces it.
+        # Findings that mention corner N alongside OTHERS still
+        # surface iff at least one non-suppressed corner is
+        # named; the OPERATOR copy is generated from
+        # involves_corners so it already points at the actual
+        # problem corner (not the one being re-taught).
+        findings = []
+        for f in raw_findings:
+            involves = f.get('involves_corners') or []
+            if suppress and involves and all(c == suppress
+                                              for c in involves):
+                continue
+            operator = _pallet_finding_operator_copy(f, place)
+            findings.append({**f, 'operator': operator})
+        # Frame-measured helpers — the client shows these next to
+        # the banner-less operator toast when useful.
+        m_row, m_col = measured_pitches(spec)
+        measured = {
+            'row_len_mm':   None,
+            'col_len_mm':   None,
+            'row_col_angle_deg': None,
+            'tilt_deg':     None,
+            'pitch_row_mm': m_row,
+            'pitch_col_mm': m_col,
+        }
+        if spec.has_taught_frame():
+            frame = compute_frame(spec)
+            measured['row_col_angle_deg'] = frame['row_col_angle_deg']
+            measured['tilt_deg']         = frame['tilt_deg']
+            # Explicit row/col lengths so the client can print
+            # "corner N is 0.6 mm from corner M" without touching
+            # frame math itself.
+            from programming_by_demonstration.pallet_geometry import (
+                _xyz as _pg_xyz, _sub as _pg_sub, _len as _pg_len,
+            )
+            A = _pg_xyz(spec.corner1_tcp)
+            B = _pg_xyz(spec.corner2_tcp)
+            C = _pg_xyz(spec.corner3_tcp)
+            measured['row_len_mm'] = _pg_len(_pg_sub(B, A))
+            measured['col_len_mm'] = _pg_len(_pg_sub(C, A))
+        blocking = any(f.get('severity') == 'error' for f in findings)
+        return {
+            'findings': findings,
+            'blocking': blocking,
+            'measured': measured,
+            'spec':     spec.to_dict(),
+        }
+
     _motion_stats_clients: set = set()
     _motion_setup_clients: set = set()
 

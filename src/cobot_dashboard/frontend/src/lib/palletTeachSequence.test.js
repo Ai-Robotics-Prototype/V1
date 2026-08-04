@@ -1,16 +1,19 @@
-// palletTeachSequence — sequence state machine + frame validation
-// pins. These tests own the behavior contract every host must
-// obey (wizard teach + editor row-button teach both read from
-// this module — see the no-fork rule).
+// palletTeachSequence — sequence state machine pins. These tests
+// own the behavior contract every host must obey (wizard teach +
+// editor row-button teach both read from this module — see the
+// no-fork rule).
 //
 // Coverage:
 //   * role↔field + role↔status-key mappings
 //   * back / next / jump transitions
 //   * modeForRole picks 're-teach' when the target has a taught pose
 //   * taughtCount reflects palletFrameStatus booleans
-//   * validatePalletFrame flags orthogonality + tilt violations
 //   * cancel-persists behavior (Record writes to program; nothing
 //     rolls back on cancel — pinned via the transition math)
+//
+// Frame validation lives in the backend now (§465 fork-1 kill,
+// 2026-08-04) — see palletFrameValidator.js on the client and
+// pallet_geometry.compute_frame/validate_frame on the server.
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -22,7 +25,6 @@ import {
   backRoleFrom,
   modeForRole,
   taughtCount,
-  validatePalletFrame,
   backFrom,
   advanceFrom,
   jumpTo,
@@ -107,58 +109,9 @@ test('taughtCount: mixed states give partial counts', () => {
 })
 
 
-// ── validatePalletFrame — frame geometry checks ────────────────
-
-test('validatePalletFrame: nothing to check when < 3 corners taught', () => {
-  assert.deepEqual(validatePalletFrame({ corner1_tcp: [0,0,0,0,0,0] }), [])
-  assert.deepEqual(validatePalletFrame({}), [])
-  assert.deepEqual(validatePalletFrame(null), [])
-})
-
-test('validatePalletFrame: clean orthogonal flat frame → no warnings', () => {
-  const place = {
-    corner1_tcp: [0,   0,   0, 0, 0, 0],
-    corner2_tcp: [400, 0,   0, 0, 0, 0],   // row along +X, 400 mm
-    corner3_tcp: [0,   300, 0, 0, 0, 0],   // col along +Y, 300 mm
-  }
-  assert.deepEqual(validatePalletFrame(place), [])
-})
-
-test('validatePalletFrame: non-perpendicular row/col → orthogonality warning', () => {
-  const place = {
-    corner1_tcp: [0,   0,   0, 0, 0, 0],
-    corner2_tcp: [400, 0,   0, 0, 0, 0],
-    // Column skewed 20° off the +Y axis into +X — measured angle ≈ 70°.
-    corner3_tcp: [Math.sin(20 * Math.PI / 180) * 300,
-                  Math.cos(20 * Math.PI / 180) * 300, 0, 0, 0, 0],
-  }
-  const warnings = validatePalletFrame(place)
-  const ortho = warnings.find((w) => w.key === 'orthogonality')
-  assert.ok(ortho, 'orthogonality warning must fire when the angle drifts > 5° from 90°')
-  assert.ok(ortho.numbers.orthoDev > 5)
-})
-
-test('validatePalletFrame: significant Z on ROW → tilt warning', () => {
-  const place = {
-    corner1_tcp: [0,   0, 0,  0, 0, 0],
-    // Row has a 30 mm Z drop across 400 mm = 7.5% tilt, over threshold.
-    corner2_tcp: [400, 0, -30, 0, 0, 0],
-    corner3_tcp: [0, 300, 0,  0, 0, 0],
-  }
-  const warnings = validatePalletFrame(place)
-  assert.ok(warnings.find((w) => w.key === 'tilt'),
-    'tilt warning must fire for row Z/L > 5%')
-})
-
-test('validatePalletFrame: coincident corners → degenerate warning', () => {
-  const place = {
-    corner1_tcp: [0, 0, 0, 0, 0, 0],
-    corner2_tcp: [0, 0, 0, 0, 0, 0],
-    corner3_tcp: [0, 300, 0, 0, 0, 0],
-  }
-  const warnings = validatePalletFrame(place)
-  assert.ok(warnings.find((w) => w.key === 'degenerate'))
-})
+// Frame validation lives in POST /api/pallet/validate_frame now;
+// see palletFrameValidator.test.js for the client contract and
+// pallet_geometry Python tests for the geometry.
 
 
 // ── Host-shared action helpers ──────────────────────────────────
