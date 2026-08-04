@@ -134,3 +134,203 @@ def test_no_stale_action_load_in_frontend():
         f'Legacy action:"load" post still exists in {hits} — that '
         f'path is a no-op wrt the controller and re-introducing it '
         f'would restore the load/resident divergence')
+
+
+# ── Rollback invariant (2026-08-04) ───────────────────────────────
+# The pre-rollback fix set currentProgram BEFORE the push, so any
+# refusal (transport down, empty_program, lint, byte-verify)
+# manufactured the exact divergence the resident-mismatch banner
+# was designed to warn about. These tests pin the new invariant:
+# "the UI's current program follows push success, never precedes it."
+
+
+def test_load_verb_returns_410_on_program_run():
+    """The retired /api/program/run action:'load' returns 410 Gone
+    with a pointer at the replacement. Preserves the no-fork rule:
+    program-selection state may only be written by
+    /api/estun/program/run (per push_only:true for a load)."""
+    src = _read(SERVER)
+    # 410 status is explicit in the route handler
+    assert '410' in src or 'status_code=410' in src, (
+        'action:load handler does not return HTTP 410 Gone — '
+        'that verb must be retired, not silently accepted')
+    assert "'load_verb_retired'" in src or '"load_verb_retired"' in src, (
+        'load-verb-retired outcome.kind missing — the frontend '
+        'cannot distinguish this from other 4xx responses')
+    # The old accepting-any-action code path must be gone
+    assert not re.search(
+        r"action not in \('run', 'pause', 'resume', 'stop', 'home', 'load'\)",
+        src), (
+        "The 'load' action is still in the accepted set for "
+        "/api/program/run — retirement was not landed cleanly")
+
+
+def test_monitor_onSelectProgram_pushes_before_setCurrentProgram():
+    """Rollback invariant: in MonitorDashboard.jsx, the load-flow
+    call to setCurrentProgram must come AFTER the push helper's
+    successful response, not before. If setCurrentProgram runs
+    first, ANY push failure (transport down, empty program, lint,
+    byte-verify) creates the exact divergence the banner is
+    designed to warn about — reintroducing the 2026-08-04 report
+    where the operator saw the fix as 'not working'.
+
+    The push itself lives in a shared helper
+    (pushProgramToController) so the load path and the banner
+    Push button use one code path. This test asserts (a) the
+    helper is invoked inside onSelectProgram, and (b) the
+    setCurrentProgram call sits AFTER that invocation."""
+    src = _read(MONITOR)
+    assert 'onSelectProgram' in src, (
+        'onSelectProgram is missing — Program Library click cannot '
+        'run the load path')
+    m = re.search(
+        r"const onSelectProgram\s*=\s*async \(prog\)\s*=>\s*\{",
+        src)
+    assert m, "onSelectProgram signature drifted — cannot pin push order"
+    # Bound the search to the onSelectProgram body only. The next
+    # top-level `const on…` / `const push…` arrow decl at indent 2
+    # ends the function (there is no earlier closing brace at the
+    # same indent).
+    body = src[m.end():]
+    end_m = re.search(
+        r"\n  const (?:on[A-Z]|pushProgramToController)",
+        body)
+    body = body[: end_m.start()] if end_m else body[:6000]
+
+    pos_push_call = body.find('pushProgramToController(')
+    pos_set       = body.find('setCurrentProgram(')
+    assert pos_push_call != -1, (
+        'onSelectProgram does not invoke pushProgramToController — '
+        'load path is not using the shared push helper')
+    assert pos_set != -1, (
+        'onSelectProgram does not call setCurrentProgram at all — '
+        'the load path cannot commit local state')
+    assert pos_push_call < pos_set, (
+        f'setCurrentProgram (at {pos_set}) fires BEFORE the push '
+        f'helper (at {pos_push_call}) — pre-rollback ordering has '
+        f'returned. The UI would manufacture a resident-mismatch '
+        f'on every push refusal.')
+    # Additional invariant: the setCurrentProgram call must sit
+    # AFTER a check on the push result (result.ok / !result.ok
+    # early return). Otherwise the ordering is right but the
+    # gating is missing — currentProgram would still update after
+    # a failed push.
+    pos_ok_check = body.find('result.ok')
+    if pos_ok_check == -1:
+        pos_ok_check = body.find('.ok)')
+    assert pos_ok_check != -1 and pos_ok_check < pos_set, (
+        'setCurrentProgram is not gated on the push result — the '
+        'ordering is right but a failed push still commits local '
+        'state, reintroducing the divergence bug')
+
+
+def test_monitor_uses_named_load_error_map():
+    """Rollback fix requires named errors (transport_down,
+    empty_program, lint_failed, byte_verify_*, codegen) surfaced
+    as error-severity toasts, not a generic warning. The
+    namedLoadError helper is the shared map — every load-path
+    failure toast has to route through it so a new refusal kind
+    added on the server doesn't downgrade to 'push failed HTTP …'
+    silently."""
+    src = _read(MONITOR)
+    assert 'namedLoadError' in src, (
+        "MonitorDashboard.jsx does not import the namedLoadError "
+        "helper — load-path errors will fall back to generic text")
+    assert "from '../lib/loadOutcome'" in src, (
+        'namedLoadError import path drifted from /lib/loadOutcome')
+
+
+def test_monitor_banner_has_push_to_controller_action():
+    """When the mismatch banner DOES render (genuine divergence
+    only, post-rollback fix), the operator needs a one-tap way
+    to converge without navigating. The button must be inside
+    the divergence banner render and call the same push_only
+    endpoint the load path uses."""
+    src = _read(MONITOR)
+    assert 'data-testid="banner-push-to-controller"' in src, (
+        'divergence banner has no push-to-controller action — the '
+        'operator has no one-tap way to converge')
+    # Same handler shape as the load path (push_only:true against
+    # /api/estun/program/run). Assert the handler function exists
+    # and is wired to the button — the actual endpoint call lives
+    # in pushProgramToController, which the load path also uses.
+    assert 'onBannerPushToController' in src, (
+        'banner Push button handler onBannerPushToController is '
+        'missing — the button would be unwired')
+    assert 'pushProgramToController' in src, (
+        'The shared push helper is missing — the load path and '
+        'the banner button should share one code path')
+
+
+def test_dashboard_maps_ws_reject_to_transport_down_outcome():
+    """The dashboard's save-reject relay must upgrade the driver's
+    'ws not connected' reject (or reason_code='transport_down') to
+    outcome.kind='transport_down'. That's what lets the frontend
+    render the operator message 'Controller link down — program
+    NOT loaded' instead of a generic 'save rejected'. This is the
+    server half of the transport_down named-error contract."""
+    src = _read(SERVER)
+    assert '"transport_down"' in src, (
+        'transport_down outcome.kind never appears in the server '
+        '— the driver reject relay cannot signal it to the UI')
+    # Both trigger paths (reason_code AND legacy reason substring)
+    # exist so a driver that predates reason_code still upgrades.
+    assert 'reason_code' in src, (
+        'reason_code plumbing missing — the driver code cannot '
+        'be surfaced upstream')
+    assert '"ws not connected"' in src or "'ws not connected'" in src, (
+        'reason-string fallback for pre-reason_code driver builds '
+        'is missing')
+
+
+def test_driver_ws_gate_carries_reason_code():
+    """The driver's WS gate at estun_driver_node._on_program_command
+    must attach reason_code='transport_down' to the reject frame.
+    The gate itself (safety-correct: refuse program ops when we
+    cannot see controller state) is unchanged; this is only the
+    machine-readable tag the dashboard maps."""
+    driver = os.path.abspath(os.path.join(
+        HERE, '..', '..', 'estun_driver', 'estun_driver',
+        'estun_driver_node.py'))
+    with open(driver) as fh:
+        src = fh.read()
+    # Search near 'ws not connected' — extra dict on the same reject
+    # should carry the reason_code.
+    ws_reject_idx = src.find("'ws not connected'")
+    assert ws_reject_idx != -1, (
+        "driver ws-not-connected reject reason string is gone — "
+        "the gate reason plumbing has drifted")
+    window = src[ws_reject_idx: ws_reject_idx + 400]
+    assert 'transport_down' in window, (
+        'reason_code=transport_down not attached to the ws-not-'
+        'connected reject — the dashboard cannot map the driver '
+        'refusal to the named operator message')
+
+
+def test_named_load_error_map_has_all_documented_kinds():
+    """The frontend's namedLoadError helper must have a mapping for
+    every outcome.kind the server can emit on the load path. If a
+    new server outcome ships without a corresponding named entry
+    the UI silently downgrades to 'push refused HTTP …' — which
+    is exactly the bug that made the operator read the divergence
+    banner as 'the fix isn't working' on 2026-08-04."""
+    helper = os.path.abspath(os.path.join(
+        HERE, '..', 'frontend', 'src', 'lib', 'loadOutcome.js'))
+    with open(helper) as fh:
+        src = fh.read()
+    for kind in ('transport_down', 'save_rejected', 'save_failed',
+                 'empty_program', 'lint_failed',
+                 'byte_verify_mismatch', 'byte_verify_get_failed',
+                 'id_not_controller_safe',
+                 'lint_infrastructure_error', 'codegen'):
+        assert kind in src, (
+            f'namedLoadError has no entry for outcome.kind={kind!r} '
+            '— the UI would fall back to a generic message')
+    # Every named entry must state that the program was NOT
+    # loaded / cannot be loaded so the operator understands the
+    # resident did NOT change. Codegen/lint use "Cannot load".
+    for phrase in ('NOT loaded', 'Cannot load'):
+        assert phrase in src, (
+            f'named-error headlines must include the phrase '
+            f'{phrase!r} so the operator understands the load '
+            f'did not take effect')

@@ -5403,11 +5403,27 @@ if FASTAPI_AVAILABLE:
                 save_event = prog_state.get("last_save")
             program_rejects = [x for x in new_rej if x.get("family") == "program"]
             if program_rejects:
+                rej0 = program_rejects[0]
+                reason = rej0.get("reason") or ""
+                # Reason-code aware kind (2026-08-04). Prefer the
+                # driver-supplied reason_code (added at
+                # estun_driver_node.py:1288 for the WS gate) so the
+                # frontend maps to the operator message "Controller
+                # link down — program NOT loaded" rather than the
+                # generic save-rejected. Fall back to reason-string
+                # match for driver builds that predate the code.
+                rcode = rej0.get("reason_code")
+                if rcode == "transport_down" or "ws not connected" in reason:
+                    kind = "transport_down"
+                else:
+                    kind = "save_rejected"
+                outcome = {"kind": kind, "reason": reason}
+                if rcode:
+                    outcome["reason_code"] = rcode
                 return JSONResponse({
                     "ok": False,
-                    "error": program_rejects[0].get("reason"),
-                    "outcome": {"kind": "save_rejected",
-                                "reason": program_rejects[0].get("reason")},
+                    "error": reason,
+                    "outcome": outcome,
                 }, status_code=400)
             if save_event and all(s.get("http_status") == 200
                                   for s in save_event.get("steps", [])):
@@ -6621,18 +6637,35 @@ if FASTAPI_AVAILABLE:
         """Dispatch run/pause/resume/stop/home to the program executor.
         Body: {action, program_id?}. Without program_id, the executor
         resumes / re-runs whatever it currently has loaded.
-        action='load' is a frontend-facing 'set active program' verb —
-        the executor doesn't currently have a load-only path, so we
-        forward the message (executor ignores unknown actions) and let
-        the Monitor UI take care of displaying the program. The next
-        Run will pick it up via the normal load+run path."""
+
+        action='load' is RETIRED (2026-08-04). It was a frontend-facing
+        'set active program' verb the executor silently ignored — it
+        never reached the controller, and became the fork that let a
+        load appear to succeed while the resident program was
+        something else entirely. Program-selection state may now only
+        be written by /api/estun/program/run (with push_only:true for
+        a load, or without for a full run). Requests with
+        action='load' get 410 Gone with a pointer at the replacement.
+        """
         try:
             body = await request.json()
         except Exception:
             body = {}
         action = str(body.get('action', 'run'))
         prog_id = body.get('program_id')
-        if action not in ('run', 'pause', 'resume', 'stop', 'home', 'load'):
+        if action == 'load':
+            return JSONResponse({
+                'ok': False,
+                'error': ("action='load' on /api/program/run is retired. "
+                          "Use POST /api/estun/program/run with "
+                          "push_only:true instead — that path actually "
+                          "pushes the program to the controller so the "
+                          "resident becomes current."),
+                'outcome': {'kind': 'load_verb_retired',
+                            'replacement':
+                                '/api/estun/program/run push_only=true'},
+            }, status_code=410)
+        if action not in ('run', 'pause', 'resume', 'stop', 'home'):
             return JSONResponse({'error': f'unknown action {action!r}'}, status_code=400)
         if _ros_node is not None:
             try:

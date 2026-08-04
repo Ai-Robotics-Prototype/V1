@@ -16,6 +16,7 @@ import { deriveRunState, isStopButtonEnabled,
          STUCK_STOPPING_MS } from '../lib/runState'
 import { readPayload, payloadChipLabel } from '../lib/payload'
 import { runnableStepCount } from '../lib/programTruth'
+import { namedLoadError } from '../lib/loadOutcome'
 
 // Status badge — reads the unified deriveRunState() so pill matches
 // footer matches banner. Rendered from a runState object (color, label,
@@ -740,67 +741,118 @@ export default function MonitorDashboard() {
   // makes the picked program the active one (without auto-starting).
   const [showLibrary, setShowLibrary] = useState(false)
 
+  // In-flight push indicator. Rendered as "(pushing…)" next to the
+  // current program name while /api/estun/program/run is midway
+  // through codegen + save + byte-verify. UI stays on the PREVIOUS
+  // program until the push acks — the atomic invariant (2026-08-04
+  // §rollback fix) is: the UI's current program follows push
+  // success, never precedes it.
+  const [pushingProgramName, setPushingProgramName] = useState(null)
+
+  // Shared push helper. Used by BOTH the Program Library load flow
+  // AND the divergence banner's one-tap "Push to controller" action
+  // — same wire contract, same rollback semantics, one code path.
+  //
+  // Returns {ok, named?} where named is the operator-language
+  // description of the failure (namedLoadError) when !ok.
+  const pushProgramToController = async (programId, programLabel) => {
+    setPushingProgramName(programLabel || programId)
+    try {
+      const pushRes = await fetch('/api/estun/program/run', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          program_id: programId,
+          push_only:  true,
+        }),
+      })
+      const body = await pushRes.json().catch(() => ({}))
+      if (!pushRes.ok) {
+        const named = namedLoadError(body, pushRes.status)
+        // eslint-disable-next-line no-console
+        console.warn('[load] push refused', {
+          status: pushRes.status, body, named,
+        })
+        return { ok: false, named, body, status: pushRes.status }
+      }
+      return { ok: true, body }
+    } catch (e) {
+      const named = {
+        code: 'network', headline:
+          'Push failed — network error. Program NOT loaded.',
+        detail: String(e && e.message || e),
+      }
+      return { ok: false, named, err: e }
+    } finally {
+      setPushingProgramName(null)
+    }
+  }
+
   const onSelectProgram = async (prog) => {
     setShowLibrary(false)
     if (!prog || !prog.id) return
+    let full
     try {
       const res = await fetch('/api/programs/' + encodeURIComponent(prog.id))
       if (!res.ok) throw new Error('HTTP ' + res.status)
-      const full = await res.json()
-      if (full && Array.isArray(full.steps)) {
-        // Wholesale replace currentProgram so the Monitor (and the
-        // 3D viewer's gripper subscription) re-renders against the
-        // new program immediately.
-        setCurrentProgram({
-          id:          full.id,
-          name:        full.name,
-          description: full.description || '',
-          steps:       full.steps,
-          config:      full.config || {},
-        })
-        // PUSH to the controller so the resident program actually
-        // becomes this program (2026-08-03 no-fork fix). Prior
-        // code only set frontend state and published a ROS 'load'
-        // message the executor ignored — the resident controller
-        // program stayed whatever was last RUN, and Run would
-        // execute THAT (not what the operator loaded). With
-        // push_only=true the /run endpoint does codegen + save +
-        // byte-verify + sidecar refresh AND STATE.robot.program
-        // mirror, then stops before publishing run/to_auto — so
-        // the arm doesn't move but the resident becomes current.
-        try {
-          const pushRes = await fetch('/api/estun/program/run', {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body:    JSON.stringify({
-              program_id: full.id,
-              push_only:  true,
-            }),
-          })
-          if (!pushRes.ok) {
-            const err = await pushRes.json().catch(() => ({}))
-            const msg = (err && err.error)
-              || `push failed HTTP ${pushRes.status}`
-            if (typeof addToast === 'function') {
-              addToast('Loaded but push to controller failed: '
-                + msg, 'warning')
-            }
-          } else if (typeof addToast === 'function') {
-            addToast('Loaded and pushed "'
-              + (full.name || full.id) + '"', 'success')
-          }
-        } catch (e) {
-          if (typeof addToast === 'function') {
-            addToast('Loaded but controller push errored: '
-              + String(e), 'warning')
-          }
-        }
-      }
+      full = await res.json()
     } catch (e) {
-      if (typeof addToast === 'function') {
-        addToast('Load failed: ' + (e?.message || e), 'error')
-      }
+      addToast?.('Load failed: ' + (e?.message || e), 'error')
+      return
     }
+    if (!(full && Array.isArray(full.steps))) return
+
+    // Push FIRST. Only mutate local currentProgram once the
+    // controller has accepted the save + byte-verified back the
+    // same bytes we sent (dashboard_server:5443). Prior code (pre
+    // 2026-08-04) set currentProgram synchronously BEFORE this
+    // call — any push refusal (transport down, empty_program,
+    // lint, byte-verify) manufactured the exact divergence the
+    // resident-mismatch banner was designed to warn about. The
+    // load path IS the moment the resident becomes current; if
+    // the push fails, currentProgram must stay what it was so
+    // the operator's UI matches the controller's actual state.
+    const result = await pushProgramToController(
+      full.id, full.name || full.id)
+    if (!result.ok) {
+      const { headline, detail } = result.named
+      addToast?.(detail ? `${headline} — ${detail}` : headline,
+        'error', 10000)
+      return
+    }
+    // Commit local state — the push succeeded, resident IS this
+    // program, and STATE.robot.program.resident_program_id has
+    // already been mirrored server-side before the response.
+    setCurrentProgram({
+      id:          full.id,
+      name:        full.name,
+      description: full.description || '',
+      steps:       full.steps,
+      config:      full.config || {},
+    })
+    addToast?.('Loaded "' + (full.name || full.id) + '"', 'success')
+  }
+
+  // Banner one-tap "Push to controller" — same push_only endpoint,
+  // same named-error surface, no navigation. Uses currentProgram.id
+  // because the banner only renders when the operator's UI already
+  // shows a program the controller doesn't have resident; the
+  // action is "make the controller catch up." This is the escape
+  // hatch for the (rare, post-rollback-fix) case where a genuine
+  // out-of-band divergence exists (foreign process pushed to the
+  // controller, or a prior push crashed mid-write).
+  const onBannerPushToController = async () => {
+    const id = currentProgram?.id
+    if (!id) return
+    const label = currentProgram?.name || id
+    const result = await pushProgramToController(id, label)
+    if (!result.ok) {
+      const { headline, detail } = result.named
+      addToast?.(detail ? `${headline} — ${detail}` : headline,
+        'error', 10000)
+      return
+    }
+    addToast?.(`Pushed "${label}" to controller`, 'success')
   }
 
   // Cycle bookkeeping lives in local state — the backend doesn't track
@@ -979,6 +1031,13 @@ export default function MonitorDashboard() {
             </div>
             <div style={{ fontSize: 24, fontWeight: 700, color: '#111', marginTop: 4 }}>
               {programName}
+              {pushingProgramName && (
+                <span data-testid="pushing-indicator"
+                      style={{ marginLeft: 10, fontSize: 13,
+                               fontWeight: 500, color: '#6b7280' }}>
+                  (pushing "{pushingProgramName}"…)
+                </span>
+              )}
             </div>
             {residentDivergence && (
               <div data-testid="resident-divergence"
@@ -993,9 +1052,27 @@ export default function MonitorDashboard() {
                 Dashboard shows{' '}
                 <code>{currentProgram?.id}</code>
                 {' '}but the controller currently holds{' '}
-                <code>{residentProgramId}</code>. Reload the program
-                from the library (Change Program) to push it to the
-                controller — or hit Run, which will push + run.
+                <code>{residentProgramId}</code>. Push{' '}
+                <code>{currentProgram?.id}</code> to converge — or
+                open Change Program to load a different one.
+                <div style={{ marginTop: 8 }}>
+                  <button
+                    data-testid="banner-push-to-controller"
+                    onClick={onBannerPushToController}
+                    disabled={!!pushingProgramName}
+                    style={{
+                      padding: '4px 10px',
+                      background: pushingProgramName ? '#F3F4F6' : '#FDE68A',
+                      border: '1px solid #B45309',
+                      borderRadius: 4, fontSize: 12,
+                      color: '#78350F', fontWeight: 600,
+                      cursor: pushingProgramName ? 'default' : 'pointer',
+                    }}>
+                    {pushingProgramName
+                      ? 'Pushing…'
+                      : `Push ${currentProgram?.id} to controller`}
+                  </button>
+                </div>
               </div>
             )}
             {currentStepIdx >= 0 && steps.length > 0 && (

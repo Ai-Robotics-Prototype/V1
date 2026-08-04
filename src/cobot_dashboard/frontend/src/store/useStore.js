@@ -1696,11 +1696,19 @@ const storeDefinition = (set, get) => ({
   // Toast notifications
   // ---------------------------------------------------------------------------
 
-  addToast(message, type = 'info') {
+  addToast(message, type = 'info', durationMs) {
     const id = Date.now() + Math.random()
     const toast = { id, message, type, ts: Date.now() }
     set((s) => ({ toasts: [...s.toasts, toast] }))
-    setTimeout(() => get().removeToast(id), 3000)
+    // Duration override (2026-08-04): error-severity toasts for the
+    // load path need to dwell long enough for the operator to read
+    // "Controller link down — program NOT loaded" without losing it
+    // to the default 3s. 60s bundle-obsolete toast (line ~1109) was
+    // already passing a third arg that was silently ignored — this
+    // wires the ignored parameter without changing any 2-arg caller.
+    const dwellMs = (typeof durationMs === 'number' && durationMs > 0)
+      ? durationMs : 3000
+    setTimeout(() => get().removeToast(id), dwellMs)
     return id
   },
 

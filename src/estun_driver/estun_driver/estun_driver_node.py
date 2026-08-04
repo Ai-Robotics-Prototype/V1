@@ -1171,12 +1171,14 @@ class EstunCodroidDriver(Node):
                          extra={'payload': msg.data[:200]})
             return
         if not self._connected:
-            self._reject(family, 'ws not connected')
+            self._reject(family, 'ws not connected',
+                         extra={'reason_code': 'transport_down'})
             return
         if self._conn_sm.state != self._conn_sm.READY:
             # Writes during INITIALIZING can hit the same joint-vector
             # crash path we're avoiding with the deferred subscribe.
-            self._reject(family, f'controller {self._conn_sm.state} — writes gated until READY')
+            self._reject(family, f'controller {self._conn_sm.state} — writes gated until READY',
+                         extra={'reason_code': 'controller_not_ready'})
             return
 
         try:
@@ -1286,12 +1288,21 @@ class EstunCodroidDriver(Node):
                          extra={'payload': msg.data[:200]})
             return
         if not self._connected:
+            # reason_code (2026-08-04): the dashboard's push endpoint
+            # keys on 'transport_down' to map the refusal to the
+            # operator message "Controller link down — program NOT
+            # loaded" instead of the generic "save rejected". The
+            # WS gate itself is unchanged (safety-correct: refuse
+            # program ops when we cannot see controller state);
+            # this only makes the refusal machine-readable.
             self._reject(family, 'ws not connected',
-                         extra={'payload': msg.data[:200]})
+                         extra={'payload': msg.data[:200],
+                                'reason_code': 'transport_down'})
             return
         if self._conn_sm.state != self._conn_sm.READY:
             self._reject(family, f'controller {self._conn_sm.state} — writes gated until READY',
-                         extra={'payload': msg.data[:200]})
+                         extra={'payload': msg.data[:200],
+                                'reason_code': 'controller_not_ready'})
             return
 
         try:
@@ -1706,12 +1717,14 @@ class EstunCodroidDriver(Node):
                          extra={'payload': msg.data[:200]})
             return
         if not self._connected:
-            self._reject(family, 'ws not connected')
+            self._reject(family, 'ws not connected',
+                         extra={'reason_code': 'transport_down'})
             return
         if self._conn_sm.state != self._conn_sm.READY:
             # Writes during INITIALIZING can hit the same joint-vector
             # crash path we're avoiding with the deferred subscribe.
-            self._reject(family, f'controller {self._conn_sm.state} — writes gated until READY')
+            self._reject(family, f'controller {self._conn_sm.state} — writes gated until READY',
+                         extra={'reason_code': 'controller_not_ready'})
             return
 
         try:
@@ -3189,11 +3202,13 @@ class EstunCodroidDriver(Node):
                          extra={'payload': msg.data[:200]})
             return
         if not self._connected:
-            self._reject(family, 'ws not connected')
+            self._reject(family, 'ws not connected',
+                         extra={'reason_code': 'transport_down'})
             return
         if self._conn_sm.state != self._conn_sm.READY:
             self._reject(family,
-                f'controller {self._conn_sm.state} — writes gated until READY')
+                f'controller {self._conn_sm.state} — writes gated until READY',
+                extra={'reason_code': 'controller_not_ready'})
             return
         try:
             d = json.loads(msg.data)
