@@ -120,15 +120,12 @@ def test_accept_effector_finger_preserves_gripper_steps():
 
 # ── Source binding — locks §382 fix at the compose layer ─────────
 
-def test_accept_source_fixed_removes_detect_step():
+def test_accept_source_fixed_never_emits_detect():
+    """Post 2026-08-04 §determinism directive: the composer NEVER
+    emits `detect` steps regardless of op.source. The vision arc
+    is not wired end-to-end; detect must be impossible by
+    construction, not filtered at runtime."""
     intent = _gripper_intent()
-    # camera_library baseline emits a detect step; recompose after
-    # source=fixed_position must not.
-    baseline = compose_program_draft(intent, demo_id='demo_test_accept_b1'
-                                     ).to_program_payload()['steps']
-    assert any(s['action'] == 'detect' for s in baseline), \
-        'camera_library baseline should include a detect step'
-
     _apply_source(intent, 'fixed_position')
     steps = compose_program_draft(intent, demo_id='demo_test_accept_b2'
                                   ).to_program_payload()['steps']
@@ -136,14 +133,19 @@ def test_accept_source_fixed_removes_detect_step():
     assert 'detect' not in actions, actions
 
 
-def test_accept_source_camera_keeps_detect_step():
-    """Reverse guard — flipping back to camera_library restores detect."""
+def test_accept_source_camera_library_ALSO_never_emits_detect():
+    """The camera_library value survives in the schema for
+    forward compatibility, but the composer treats it identically
+    to fixed_position (same output). This test PINS the
+    invariant: flipping source does not resurrect detect."""
     intent = _gripper_intent()
     _apply_source(intent, 'camera_library')
     steps = compose_program_draft(intent, demo_id='demo_test_accept_b3'
                                   ).to_program_payload()['steps']
-    assert any(s['action'] == 'detect' for s in steps), \
-        [s['action'] for s in steps]
+    assert 'detect' not in [s['action'] for s in steps], (
+        'camera_library must compose to the SAME vision-free '
+        'program as fixed_position; the composer\'s positive-'
+        'list assertion should also refuse detect at emit time.')
 
 
 # ── Combined: both answers at once (whitebowl actual scenario) ────

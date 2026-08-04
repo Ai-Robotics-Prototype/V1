@@ -142,18 +142,19 @@ CRITICAL RULES — violating any of these makes the output unusable:
 
      Every operation carries `source` — how the robot LOCATES the part
      each cycle:
-       "camera_library"  — vision recognises the part every cycle
-                           (composer emits a `detect` step tied to
-                           target_part.part_id). Default.
-       "fixed_position"  — part is always in the same taught spot
-                           (composer emits NO detect; the pick pose
-                           is bound to a fixed taught contact).
-     Choose `fixed_position` ONLY when the demo unambiguously shows a
-     dedicated fixture / feeder / conveyor stop that puts the part at
-     the same spot every cycle. When you're unsure, keep the default
-     `camera_library` and emit a `field:"location"` clarification
-     with `affects.path = "source"` so the operator can flip it — see
-     the fixed-vs-vision clarification example below.
+       "fixed_position"  — part is always in the same taught spot.
+                           The composer binds the pick pose to a
+                           fixed taught contact. This is the DEFAULT
+                           and the only currently-runnable value.
+       "camera_library"  — vision would recognise the part every
+                           cycle. The composer accepts this value in
+                           the schema for forward compatibility but
+                           emits the SAME program as fixed_position
+                           (the vision runtime arc is not wired end-
+                           to-end yet; camera-driven detect steps
+                           would fail on the wire). Do not choose
+                           this value from a demo — leave it for a
+                           future release.
 
      Every operation ALSO carries `effector` — the end-effector type
      that drives which gripper-actuation steps the composer emits:
@@ -260,16 +261,18 @@ CRITICAL RULES — violating any of these makes the output unusable:
            "affects":{{"scope":"operation","operation_index":0,"path":"count"}}}}
        How pick positions are laid out — when count > 1, the composer
        needs to know whether each pick pose is (a) its own taught
-       contact, (b) derived from a first taught anchor + regular
-       linear spacing, or (c) resolved by vision each cycle. Default
-       suggestion is `individual_taught` (operator teaches each). Use
-       `repeat_offset` when the narration/video shows a straight row
-       or column with visible spacing; use `vision_each` when the
-       narration explicitly says vision picks each cycle:
+       contact or (b) derived from a first taught anchor + regular
+       linear spacing. Default suggestion is `individual_taught`
+       (operator teaches each). Use `repeat_offset` when the
+       narration/video shows a straight row or column with visible
+       spacing. `vision_each` is accepted by the schema for forward
+       compatibility but composes to the SAME program as
+       `individual_taught` today (vision runtime not wired) — do NOT
+       suggest it from a demo:
          {{"id":"q-pick-pattern", "field":"other",
            "question":"How should pick positions be set for the 3 bowls?",
            "type":"choice",
-           "options":["individual_taught","repeat_offset","vision_each"],
+           "options":["individual_taught","repeat_offset"],
            "suggested":"individual_taught",
            "affects":{{"scope":"operation","operation_index":0,"path":"pick_pattern"}}}}
        Place stacks on top of each other — dz per iteration:
@@ -286,13 +289,12 @@ CRITICAL RULES — violating any of these makes the output unusable:
            "question":"Describe the place target in a few words.",
            "type":"text", "suggested":"left tray",
            "affects":{{"scope":"operation","operation_index":0,"path":"place.location_hint"}}}}
-       Fixed spot vs vision each cycle (drives the `detect` step):
-         {{"id":"q-part-source", "field":"location",
-           "question":"How should the robot locate the part each cycle?",
-           "type":"choice",
-           "options":["fixed_position","camera_library"],
-           "suggested":"fixed_position",
-           "affects":{{"scope":"operation","operation_index":0,"path":"source"}}}}
+       (Removed 2026-08-04: the vision-vs-fixed clarification was
+       retired along with detect emission. All programs compose as
+       fixed_position until the vision arc lands. If the demo truly
+       requires runtime perception, emit a plain text ambiguity
+       describing the constraint rather than the source-choice
+       clarification — the operator will handle it manually.)
        End-effector type (drives Engage/Disengage vacuum vs
        Open/Grip/Release step naming):
          {{"id":"q-effector", "field":"gripper",

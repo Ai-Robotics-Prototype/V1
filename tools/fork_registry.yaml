@@ -343,7 +343,89 @@ capabilities:
     known_debt: []
 
 
-  # 13. Estun sign inversion (URDF axes).
+  # 13. PBD composer (deterministic intent → program).
+  - id: pbd_composer
+    description: >
+      Programming-by-Demonstration intent → program is a PURE
+      deterministic function. LLM output is limited to the
+      intent JSON (schema-validated). The composer emits steps,
+      labels, and verbs from the intent shape alone — never from
+      transcript strings, never with wall-clock / random IDs.
+    canonical:
+      python:
+        module: programming_by_demonstration.program_composer
+        functions: [compose_program_draft]
+    forbidden:
+      # A second `def compose_program_draft` anywhere else is a
+      # fork by definition — scanned across the whole PBD tree.
+      - path_glob: src/programming_by_demonstration/programming_by_demonstration/**/*.py
+        patterns:
+          - 'def compose_program_draft\('
+        path_exempt:
+          - src/programming_by_demonstration/programming_by_demonstration/program_composer.py
+          - '**/*.test.py'
+          - '**/test_*.py'
+      # Non-determinism sources INSIDE the composer file itself.
+      # Scoped narrowly to program_composer.py so unrelated files
+      # (utils.py's demo-id mint, learning_store's file-name mint)
+      # can still use uuid/random for their own purposes.
+      - path_glob: src/programming_by_demonstration/programming_by_demonstration/program_composer.py
+        patterns:
+          - 'uuid\.uuid'
+          - 'random\.(random|choice|uniform|randint)'
+          - 'time\.time\('
+          - 'datetime\.now\('
+        path_exempt: []
+    known_debt: []
+
+  # 14. PBD label vocabulary (fixed strings, single source of truth).
+  - id: pbd_label_vocabulary
+    description: >
+      Every step label the composer emits routes through
+      `label_vocabulary.LABEL_FOR_ROLE` (§determinism directive,
+      2026-08-04). Inline literal labels in the composer or its
+      helpers are a fork. Adding a label = adding a
+      LABEL_FOR_ROLE entry in the same commit that emits it.
+    canonical:
+      python:
+        module: programming_by_demonstration.label_vocabulary
+        functions: [label_for, check_program_emissions,
+                    assert_action_emittable]
+    forbidden:
+      - path_glob: src/programming_by_demonstration/programming_by_demonstration/**/*.py
+        patterns:
+          # Any hardcoded top-level LABEL_FOR_ROLE-like dict outside
+          # the canonical module is a fork of the vocabulary.
+          - "LABEL_FOR_ROLE\\s*=\\s*\\{"
+        path_exempt:
+          - src/programming_by_demonstration/programming_by_demonstration/label_vocabulary.py
+          - '**/test_*.py'
+    known_debt: []
+
+  # 15. PBD archetype skeletons.
+  - id: pbd_archetype_skeletons
+    description: >
+      Task archetypes (pick_and_place, sort, machine_tend,
+      palletize, depalletize) each have EXACTLY ONE builder
+      function in `program_composer.py`. A second `_build_*` for
+      the same archetype is a fork.
+    canonical:
+      python:
+        module: programming_by_demonstration.program_composer
+        functions: [_build_pick_and_place, _build_sort,
+                    _build_machine_tend, _build_palletize]
+    forbidden:
+      - path_glob: src/programming_by_demonstration/programming_by_demonstration/**/*.py
+        patterns:
+          # A second `def _build_pick_and_place` (or the other
+          # archetypes) anywhere else is a fork.
+          - "def _build_(pick_and_place|sort|machine_tend|palletize)\\b"
+        path_exempt:
+          - src/programming_by_demonstration/programming_by_demonstration/program_composer.py
+          - '**/test_*.py'
+    known_debt: []
+
+  # 16. Estun sign inversion (URDF axes).
   - id: estun_axis_sign_inversion
     description: >
       J3 and J5 URDF axes are intentionally sign-inverted vs CAD

@@ -831,8 +831,28 @@ class StructuredIntent:
 
     # ── Constructors ────────────────────────────────────────────────
 
+    # Known top-level keys — enforced by strict=True (§determinism
+    # directive 2026-08-04). Unknown keys in strict mode raise so a
+    # producer that ships an out-of-band field (e.g. an experimental
+    # LLM output shape) fails at ingest, not silently at compose.
+    _STRICT_TOP_LEVEL_KEYS = frozenset({
+        'task_summary', 'scene', 'operations', 'ambiguities',
+        'positions', 'confidence_overall', 'raw_understanding_notes',
+        'backend_id', 'transited_externally',
+    })
+
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'StructuredIntent':
+    def from_dict(cls, d: Dict[str, Any],
+                  *, strict: bool = False) -> 'StructuredIntent':
+        if strict and isinstance(d, dict):
+            unknown = set(d.keys()) - cls._STRICT_TOP_LEVEL_KEYS
+            if unknown:
+                raise ValueError(
+                    'StructuredIntent.from_dict(strict=True): unknown '
+                    f'top-level keys {sorted(unknown)!r}. Add them to '
+                    'StructuredIntent._STRICT_TOP_LEVEL_KEYS (schema.py) '
+                    'in the same commit that produces them, or drop '
+                    'them from the LLM output shape.')
         ops = []
         for raw in (d.get('operations') or []):
             tp = raw.get('target_part') or {}

@@ -31,13 +31,23 @@ from .schema import (
     POSE_AWAITING_PERCEPTION,
     PICK_PATTERN_INDIVIDUAL_TAUGHT,
     PICK_PATTERN_REPEAT_OFFSET,
-    PICK_PATTERN_VISION_EACH,
+    # PICK_PATTERN_VISION_EACH kept in schema but NOT imported here:
+    # the composer refuses to emit detect steps (§determinism
+    # directive, 2026-08-04). Vision-each intents compose as if
+    # they were individual_taught — the intent shape survives, the
+    # composer output stays runnable-without-vision.
     PLACE_PATTERN_FIXED,
     PLACE_PATTERN_STACK,
     PLACE_PATTERN_REPEAT_OFFSET,
     PLACE_PATTERN_PALLET,
     ProgramDraft,
     StructuredIntent,
+)
+from .label_vocabulary import (
+    COMPOSER_EMITTABLE_ACTIONS,
+    LABEL_FOR_ROLE,
+    check_program_emissions,
+    label_for,
 )
 
 
@@ -234,10 +244,15 @@ def _placeholder(role: str, hint: str) -> Dict[str, Any]:
     }
 
 
-def _move_home(label: str = 'Move to home position') -> Dict[str, Any]:
+def _move_home(label: Optional[str] = None) -> Dict[str, Any]:
+    """Home step. Default label is the canonical
+    LABEL_FOR_ROLE['move_to_home']; pass label_for('return_to_home')
+    when the step is at the END of a cycle to reach the
+    "Return to home" variant. All labels flow through the
+    vocabulary module (§determinism directive, 2026-08-04)."""
     return {
         'action': 'move_home',
-        'label':  label,
+        'label':  label or label_for('move_to_home'),
         **_placeholder('home', ''),
     }
 
@@ -294,18 +309,21 @@ def _place_contact(hint: str, spd: int) -> Dict[str, Any]:
     return _contact('place', 'Place position — contact', hint, spd)
 
 
-def _detect(part_name: str) -> Dict[str, Any]:
-    return {
-        'action': 'detect',
-        'label':  f'Find {part_name or "library part"}',
-        'mode':   'library',
-    }
+# _detect() factory RETIRED (§determinism directive, 2026-08-04). The
+# composer is UNABLE to emit `detect` steps until the vision arc
+# lands. `label_vocabulary.COMPOSER_EMITTABLE_ACTIONS` is the
+# positive-list; `check_program_emissions` raises AssertionError at
+# the end of every compose call if a detect step slips in. Vision-
+# intent fields (operation.source == 'camera_library',
+# pick_pattern == 'vision_each') still parse in the schema but the
+# composer treats them as no-ops — the intent survives, the runnable
+# artifact stays vision-free.
 
 
 def _grip_open(spd: int) -> Dict[str, Any]:
     return {
         'action': 'open_gripper',
-        'label':  'Open gripper',
+        'label':  label_for('open_gripper'),
         'width_mm':       DEFAULT_GRIPPER_WIDTH,
         'speed_pct':      int(spd),
         'io_open':        'DO1',
@@ -316,7 +334,7 @@ def _grip_open(spd: int) -> Dict[str, Any]:
 def _grip_close() -> Dict[str, Any]:
     return {
         'action': 'close_gripper',
-        'label':  'Grip part',
+        'label':  label_for('grip_part'),
         'force_pct':       DEFAULT_GRIP_FORCE,
         'io_close':        'DO0',
         'io_close_confirm': 'DI0',
@@ -326,7 +344,7 @@ def _grip_close() -> Dict[str, Any]:
 def _grip_release() -> Dict[str, Any]:
     return {
         'action': 'open_gripper',
-        'label':  'Release part',
+        'label':  label_for('release_part'),
         'width_mm':  DEFAULT_GRIPPER_WIDTH,
         'io_open':   'DO1',
     }
@@ -584,12 +602,12 @@ def _extend_one_pair(steps: List[Dict[str, Any]],
     pick_pattern  = getattr(op, 'pick_pattern',  PICK_PATTERN_INDIVIDUAL_TAUGHT)
     place_pattern = getattr(op, 'place_pattern', PLACE_PATTERN_FIXED)
 
-    # Detect step per-iteration when vision_each; else once at the top
-    # when op.source==camera_library (legacy behaviour).
-    if pick_pattern == PICK_PATTERN_VISION_EACH:
-        steps.append(_detect(op.target_part.name))
-    elif i == 0 and op.source == 'camera_library':
-        steps.append(_detect(op.target_part.name))
+    # Detect emission RETIRED — the composer does not emit `detect`
+    # steps regardless of pick_pattern or op.source. The vision arc
+    # is not wired end-to-end yet; a detect step in the output would
+    # break the moment the runtime tries to execute it. Vision-
+    # relevant intent fields still round-trip through the schema so
+    # a future re-enable is one label_vocabulary entry away.
 
     # ── pick side ───────────────────────────────────────────────
     steps.append(_above('pick',
@@ -746,9 +764,7 @@ def _build_machine_tend(op: IntentOperation, appH: int,
                         spd: int, slow: int, medium: int) -> List[Dict[str, Any]]:
     s: List[Dict[str, Any]] = []
     s.extend(_effector_ready(op, spd))
-    # See _build_pick_and_place — detect gated on op.source.
-    if op.source == 'camera_library':
-        s.append(_detect(op.target_part.name))
+    # Detect emission RETIRED — see _build_pick_and_place.
     s.append(_above('pick', 'Approach above pick', appH, spd))
     s.append(_pick_contact(op.pick.location_hint, slow))
     s.extend(_effector_engage(op))
@@ -762,11 +778,11 @@ def _build_machine_tend(op: IntentOperation, appH: int,
                       min(spd, 20)))
     s.extend(_effector_disengage(op))
     s.append(_above('machine_load', 'Retreat from machine load', appH, slow))
-    s.append({'action': 'set_io', 'label': 'Start machine cycle',
+    s.append({'action': 'set_io', 'label': label_for('start_machine_cycle'),
               'io_id': 'DO4', 'value': 1})
-    s.append({'action': 'wait', 'label': 'Wait for machine to finish',
+    s.append({'action': 'wait', 'label': label_for('wait_machine_finish'),
               'duration_s': 30})
-    s.append({'action': 'set_io', 'label': 'Clear cycle start',
+    s.append({'action': 'set_io', 'label': label_for('clear_cycle_start'),
               'io_id': 'DO4', 'value': 0})
     # Re-approach the same machine_load anchor to pick up the
     # finished part — reuses the SAME taught contact pose.
@@ -797,9 +813,7 @@ def _build_palletize(op: IntentOperation, mode: str,
     # composer so pallet programs keep the same clearance envelope.
     palletH = 200
     if mode == 'palletize':
-        # See _build_pick_and_place — detect gated on op.source.
-        if op.source == 'camera_library':
-            s.append(_detect(op.target_part.name))
+        # Detect emission RETIRED — see _build_pick_and_place.
         s.append(_above('pick', 'Approach above pick', appH, spd))
         s.append(_pick_contact(op.pick.location_hint, slow))
         s.extend(_effector_engage(op))
@@ -807,7 +821,7 @@ def _build_palletize(op: IntentOperation, mode: str,
         s.append({
             'action': 'move_to_pallet',
             'mode':   'palletize',
-            'label':  'Place at pallet slot [computed at runtime]',
+            'label':  label_for('pallet_place'),
             'pallet_phase': 'place',
             'gripper_type': 'finger',
             'io_open': 'DO1', 'io_close': 'DO0',
@@ -818,7 +832,7 @@ def _build_palletize(op: IntentOperation, mode: str,
         s.append({
             'action': 'move_to_pallet',
             'mode':   'depalletize',
-            'label':  'Pick from pallet slot [computed at runtime]',
+            'label':  label_for('pallet_pick'),
             'pallet_phase': 'pick',
             'gripper_type': 'finger',
             'io_open': 'DO1', 'io_close': 'DO0',
@@ -829,7 +843,7 @@ def _build_palletize(op: IntentOperation, mode: str,
         s.append(_place_contact(op.place.location_hint, slow))
         s.extend(_effector_disengage(op))
         s.append(_above('place', 'Retreat above place', palletH, medium))
-    s.append(_move_home(label='Return to home'))
+    s.append(_move_home(label=label_for('return_to_home')))
     return s
 
 
@@ -1032,6 +1046,15 @@ def compose_program_draft(intent: StructuredIntent,
                    op_iter_ranges=op_iter_ranges)
 
     numbered = [{**s, 'step': i + 1} for i, s in enumerate(steps)]
+
+    # Positive-list assertion (§determinism directive, 2026-08-04).
+    # Every emitted step MUST use an action in
+    # COMPOSER_EMITTABLE_ACTIONS and a label whose base string
+    # appears in LABEL_FOR_ROLE. Any regression that introduces a
+    # `detect` step, an inline literal label, or a new action
+    # without a vocabulary entry fails HERE — not silently on the
+    # wire.
+    check_program_emissions({'steps': numbered})
 
     # Description reflects the ACTUAL state of the draft. The
     # "poses pending perception" caveat is included only while the

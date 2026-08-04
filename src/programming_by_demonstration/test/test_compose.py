@@ -294,12 +294,15 @@ def test_machine_tend_taught_contacts_per_role():
         assert len(dsteps) >= 2, (role, dsteps)
 
 
-def test_detect_step_gated_on_operation_source():
-    """`op.source` is the part-locating discriminator that mirrors the
-    wizard's answers.source. Composer emits `detect` only when the
-    operator wants vision each cycle; 'fixed_position' means the pick
-    pose is bound to the taught contact and the detect step must be
-    absent from the draft."""
+def test_composer_never_emits_detect_regardless_of_source():
+    """§determinism directive (2026-08-04): the composer's positive-
+    list (label_vocabulary.COMPOSER_EMITTABLE_ACTIONS) DOES NOT
+    include `detect`. The vision runtime is not wired end-to-end
+    yet; a detect step would fail on the wire. Vision-relevant
+    intent fields (op.source, pick_pattern) still parse in the
+    schema for forward compatibility — the composer treats them as
+    no-ops. This test proves the invariant for every source value
+    the schema accepts."""
     def _intent(src):
         return StructuredIntent(operations=[IntentOperation(
             operation_type='pick_and_place', sequence_index=1,
@@ -307,22 +310,23 @@ def test_detect_step_gated_on_operation_source():
                                       confidence=0.85, source='matched_to_library'),
             source=src,
         )])
-    # Default (unset source) → NO detect step — the safer default now
-    # that a taught contact pose is treated as authoritative.
     from programming_by_demonstration.schema import StructuredIntent as SI
     intent_default = SI(operations=[IntentOperation(
         operation_type='pick_and_place', sequence_index=1,
         target_part=PartReference(part_id='bt225l24', name='BT225L24 bracket',
                                   confidence=0.85, source='matched_to_library'),
     )])   # source unset → dataclass default kicks in
-    d_default = compose_program_draft(intent_default, demo_id='dsrc1')
-    assert not any(s['action'] == 'detect' for s in d_default.to_program_payload()['steps'])
-    # Vision each cycle → detect present.
-    d_vision = compose_program_draft(_intent('camera_library'), demo_id='dsrc2')
-    assert any(s['action'] == 'detect' for s in d_vision.to_program_payload()['steps'])
-    # Fixed position → NO detect step.
-    d_fixed = compose_program_draft(_intent('fixed_position'), demo_id='dsrc3')
-    assert not any(s['action'] == 'detect' for s in d_fixed.to_program_payload()['steps'])
+    for label, intent in [
+        ('default',        intent_default),
+        ('fixed_position', _intent('fixed_position')),
+        ('camera_library', _intent('camera_library')),
+    ]:
+        draft = compose_program_draft(intent, demo_id='detect_pin_' + label)
+        actions = [s['action'] for s in draft.to_program_payload()['steps']]
+        assert 'detect' not in actions, (
+            f'{label}: composer emitted detect step. detect must be '
+            'impossible by construction. Emissions: '
+            f'{actions!r}')
 
 
 def test_intent_source_round_trip_defaults_fixed_position():
