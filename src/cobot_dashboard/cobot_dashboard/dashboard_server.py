@@ -203,6 +203,19 @@ STATE = {
         "active_alarm": None,
         "last_stop_reason": "",
         "last_stop_ts": 0.0,
+        # 2026-08-04: structured cause snapshot from the driver
+        # (_build_stop_cause_locked). See _jog_stop_cause_operator_copy
+        # for the tag → operator-copy translator. Frontend renders the
+        # translated {title, detail, technical} strings from
+        # `stop_cause_copy`, never re-parsing this dict.
+        "last_stop_cause": None,
+        # Dashboard-composed operator copy for the latest stop. Set by
+        # the /estun/mode subscriber whenever `last_stop_cause` changes.
+        # Shape: {title, detail, technical, tag, ts}.
+        "stop_cause_copy": None,
+        # Live cart-mode joint-limit approach softening state (driver
+        # side). None outside the soft zone; a dict while scaling.
+        "cart_softening": None,
         "joint_limits": [],
         "collision_enabled": False,
         "collision_pair": None,
@@ -829,6 +842,155 @@ def _normalise_scene_graph(raw) -> dict:
             ]
         objs.append(out)
     return {"objects": objs}
+
+# ---------------------------------------------------------------------------
+# Jog stop-cause operator copy (Lesson 165 / directive 2026-08-04)
+# ---------------------------------------------------------------------------
+# Fork registry canonical: this function is the SINGLE translator from
+# the driver's structured `last_stop_cause` dict → operator-language
+# {title, detail, technical} triple. The frontend renders these strings
+# verbatim and MUST NOT re-parse the raw reason text on its own.
+# Registered in `tools/fork_registry.yaml` under
+# `jog_stop_cause_propagation`.
+#
+# 267108a register: title/detail carry operator language only. Banned
+# tokens (dyn margin, cart limit approach, mm2mAndDeg2rad, exitProcess,
+# firmware bug, v.size(), σ_min, sigma_soft, freshness deadman) live
+# in `technical` if anywhere. Positive phrasing tells the operator
+# WHAT to do to recover.
+
+_JOG_STOP_CAUSE_BANNED_TOKENS = (
+    'dyn margin', 'cart limit approach', 'limit approach J',
+    'mm2mAndDeg2rad', 'v.size()', 'exitProcess', 'firmware bug',
+    'σ_min', 'sigma_soft', 'sigma_hard', 'freshness deadman',
+    'hold staleness', 'hb send failed',
+)
+
+
+def _jog_stop_cause_operator_copy(cause: dict, joint_limits: list) -> dict:
+    """Translate the driver's structured stop_cause into operator copy.
+    Returns {title, detail, technical, tag, ts}. The frontend renders
+    title + detail on the jog surface; `technical` is stashed for the
+    log/monitor readout only.
+
+    joint_limits is the driver-published per-joint list (each entry
+    has current_deg / limit_deg / margin_deg / etc.), used to render
+    the absolute joint limit ("of ±200°") the operator sees.
+    """
+    if not isinstance(cause, dict):
+        cause = {}
+    tag = str(cause.get('tag') or 'other')
+    ts  = float(cause.get('ts') or 0.0)
+    raw = str(cause.get('raw') or '')
+    joint_i1 = cause.get('joint_index_1based')
+    joint_deg = cause.get('joint_deg')
+    joint_limit_deg = cause.get('joint_limit_deg')
+    jog_mode = cause.get('jog_mode')
+
+    def _joint_limit_display(idx1):
+        # Prefer the fresh driver-published limit; fall back to the
+        # cause snapshot's limit_deg.
+        try:
+            if isinstance(joint_limits, list) and 1 <= idx1 <= len(joint_limits):
+                jl = joint_limits[idx1 - 1]
+                lim = jl.get('limit_deg')
+                if isinstance(lim, (int, float)) and lim > 0:
+                    return f'±{lim:.0f}°'
+        except Exception:
+            pass
+        if isinstance(joint_limit_deg, (int, float)) and joint_limit_deg > 0:
+            return f'±{joint_limit_deg:.0f}°'
+        return 'its limit'
+
+    def _out(title, detail, technical=None):
+        return {
+            'title':      title,
+            'detail':     detail,
+            'technical':  technical or raw,
+            'tag':        tag,
+            'ts':         ts,
+        }
+
+    # Route by tag. joint_limit gets bespoke operator copy for cart
+    # vs joint mode. release_cmd is suppressed by the frontend (it's
+    # the operator's own gesture), but we still return a triple so a
+    # log reader can see the tag.
+    if tag == 'joint_limit':
+        if joint_i1 and isinstance(joint_deg, (int, float)):
+            lim_s = _joint_limit_display(joint_i1)
+            if jog_mode == 'continuous_cart':
+                return _out(
+                    f'Jog stopped — J{joint_i1} near its limit.',
+                    (f'J{joint_i1} is at {joint_deg:+.0f}° of {lim_s}. '
+                     f'Rotate J{joint_i1} back to give room, or switch '
+                     f'to Joint mode to work near the wall.'),
+                )
+            # Joint-mode approach
+            return _out(
+                f'Jog stopped — J{joint_i1} near its limit.',
+                (f'J{joint_i1} is at {joint_deg:+.0f}° of {lim_s}. '
+                 f'Jog the other direction.'),
+            )
+        return _out(
+            'Jog stopped — a joint is near its limit.',
+            'Jog the other direction, or switch modes to work near the wall.',
+        )
+
+    if tag == 'freshness_deadman':
+        return _out(
+            'Jog stopped — connection jitter.',
+            'The keep-alive from the browser was interrupted. '
+            'Release and press again to continue.',
+        )
+
+    if tag == 'collision_guard':
+        return _out(
+            'Jog stopped — approaching an obstacle.',
+            'Motion got within the safety distance of a nearby '
+            'surface. Jog away from it or check the workspace clearance.',
+        )
+
+    if tag == 'zero_speed':
+        return _out(
+            'Jog stopped — zero speed commanded.',
+            'Speed slider is at 0. Raise it and press again.',
+        )
+
+    if tag == 'hold_transition':
+        return _out(
+            'Jog switched — new direction.',
+            'The previous jog was ended when a different direction '
+            'was pressed. Release and re-press to continue.',
+        )
+
+    if tag == 'send_failed' or tag == 'hb_send_failed':
+        return _out(
+            'Jog stopped — controller unreachable.',
+            'The link to the arm dropped. Wait for the DRIVER '
+            'indicator to turn green, then press again.',
+        )
+
+    if tag == 'increment_end':
+        return _out(
+            'Increment complete.',
+            'The step increment finished normally.',
+        )
+
+    if tag == 'release_cmd':
+        # Frontend suppresses this one (it's the operator's own gesture),
+        # but we still surface it to the log reader.
+        return _out(
+            'Jog released.',
+            'Motion ended when the button was released.',
+        )
+
+    # Fallback — 'other'. Operator sees a generic line; the raw wire
+    # text goes into `technical` for the log.
+    return _out(
+        'Jog stopped.',
+        'Motion ended. Check the driver logs for the specific cause.',
+    )
+
 
 # ---------------------------------------------------------------------------
 # ROS2 node
@@ -1529,8 +1691,31 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             # Passed through untouched — the dashboard banner formats
             # cause + recovery text from these fields.
             r["active_alarm"]      = d.get("active_alarm")
+            prev_stop_ts           = float(r.get("last_stop_ts") or 0.0)
             r["last_stop_reason"]  = d.get("last_stop_reason", "")
             r["last_stop_ts"]      = float(d.get("last_stop_ts") or 0.0)
+            # 2026-08-04 (Lesson 165 propagation): structured cause +
+            # dashboard-composed operator copy. Frontend consumes
+            # `stop_cause_copy` exclusively — no regex fork on the raw
+            # reason string. Fork registry: `jog_stop_cause_propagation`.
+            cause = d.get("last_stop_cause")
+            r["last_stop_cause"] = cause if isinstance(cause, dict) else None
+            r["cart_softening"]  = d.get("cart_softening") \
+                if isinstance(d.get("cart_softening"), dict) else None
+            # Re-translate whenever last_stop_ts advanced OR the tag
+            # changed since the last snapshot. Uses joint_limits (also
+            # driver-side) to compute the absolute limit value the
+            # operator sees ("±200°").
+            _jl = d.get("joint_limits") if isinstance(d.get("joint_limits"), list) else None
+            if r["last_stop_ts"] > 0.0 and (
+                    r["last_stop_ts"] != prev_stop_ts
+                    or r.get("stop_cause_copy") is None):
+                r["stop_cause_copy"] = _jog_stop_cause_operator_copy(
+                    r["last_stop_cause"] or {}, _jl or [])
+                # Persist the raw text as the technicalDetail fallback
+                # if the translator didn't set one (e.g. tag='other').
+                if r["stop_cause_copy"] and not r["stop_cause_copy"].get("technical"):
+                    r["stop_cause_copy"]["technical"] = r["last_stop_reason"]
             # Per-joint limit evaluation — a list of six dicts (one per
             # joint) each with current_deg/limit_deg/out_of_range/etc.
             # Passed through untouched; dashboard interprets to render

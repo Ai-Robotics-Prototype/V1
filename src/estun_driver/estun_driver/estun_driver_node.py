@@ -48,6 +48,7 @@ import datetime
 import json
 import math
 import os
+import re
 import threading
 import time
 
@@ -361,6 +362,19 @@ class EstunCodroidDriver(Node):
         self.declare_parameter('cart_speed_change_min_delta', 0.10)   # 10%
         self.declare_parameter('cart_speed_up_ramp_per_tick', 0.25)   # 25%
 
+        # ── Cartesian-jog joint-limit APPROACH softening (2026-08-04) ───
+        # Diagnosis verdict (f): 52% of teach-mode cart-jog cutouts fire
+        # `joint_limit: cart limit approach J6` — the operator hits the
+        # hard-stop wall with no warning, no ramp, no operator-visible
+        # cause. Softening reshapes the APPROACH (not the hard stop): as
+        # any joint enters `cart_joint_limit_soft_zone_deg` inside the
+        # dynamic safe_edge, the cart speed scales linearly from 1.0
+        # down to `cart_joint_limit_soft_floor_frac`. The hard-stop
+        # threshold (safe_edge) itself does NOT loosen — this is a
+        # cliff → ramp reshape, safety-wise identical.
+        self.declare_parameter('cart_joint_limit_soft_zone_deg', 8.0)
+        self.declare_parameter('cart_joint_limit_soft_floor_frac', 0.10)
+
         # ── Self-collision guard ────────────────────────────────────────
         # Capsule model of the arm + ground plane, distances checked per
         # supervise tick during ANY active jog (joint or cartesian).
@@ -567,6 +581,8 @@ class EstunCodroidDriver(Node):
         self._cart_joint_v_cap  = float(self.get_parameter('cart_joint_velocity_cap_radps').value)
         self._cart_speed_min_delta   = float(self.get_parameter('cart_speed_change_min_delta').value)
         self._cart_speed_up_per_tick = float(self.get_parameter('cart_speed_up_ramp_per_tick').value)
+        self._cart_joint_soft_zone_deg   = float(self.get_parameter('cart_joint_limit_soft_zone_deg').value)
+        self._cart_joint_soft_floor_frac = float(self.get_parameter('cart_joint_limit_soft_floor_frac').value)
 
         self._coll_warn_mm   = float(self.get_parameter('collision_warn_distance_mm').value)
         self._coll_stop_mm   = float(self.get_parameter('collision_stop_distance_mm').value)
@@ -683,6 +699,32 @@ class EstunCodroidDriver(Node):
         # dashboard shows this transiently when last_stop_ts is recent.
         self._last_stop_reason = ''
         self._last_stop_ts     = 0.0
+        # 2026-08-04: structured cause snapshot so the dashboard can render
+        # operator-language copy without regex-parsing the reason string.
+        # Set inside _stop_jog_locked at the same moment as _last_stop_reason.
+        # None until the first stop. Shape:
+        #   {
+        #     'tag':                  str,  # e.g. 'joint_limit', 'freshness_deadman'
+        #     'raw':                  str,  # 'cause=<tag>: <human>' as logged
+        #     'ts':                   float,
+        #     'jog_mode':             'continuous' | 'continuous_cart' | 'increment' | None,
+        #     'joint_index_1based':   int | None,  # extracted from reason if applicable
+        #     'joint_deg':            float | None,
+        #     'joint_limit_deg':      float | None,
+        #   }
+        self._last_stop_cause  = None
+        # 2026-08-04: live cart-mode approach-softening state. Non-None
+        # only while a cart hold is scaled down by joint-limit approach.
+        # Cleared on stop or when the softening zone is exited. Shape:
+        #   {
+        #     'active':               True,
+        #     'limiting_joint_1based': int,
+        #     'current_deg':          float,
+        #     'safe_edge_deg':        float,
+        #     'headroom_deg':         float,  # safe_edge_deg - abs(current_deg)
+        #     'scale':                float,  # 0.10..1.00, clamped floor
+        #   }
+        self._cart_softening   = None
         self._last_posture_ts = 0.0
         self._last_status_ts  = 0.0
         self._last_disabled_log = 0.0
@@ -2534,12 +2576,13 @@ class EstunCodroidDriver(Node):
             reason=f'{kind} guard {a} vs {b} at {d:.0f}mm')
         return True
 
-    def _apply_governor_scale_locked(self, sigma, scale):
-        """Emit a fresh Robot/jog at the governor-scaled speed when the
-        change from the last-sent speed exceeds the hysteresis. Upward
-        ramp is capped per tick so a σ_min that briefly re-opens can't
-        instantly slam us back to full speed. Caller must hold
-        self._jog_lock."""
+    def _apply_cart_speed_scale_locked(self, scale, log_prefix):
+        """Emit a fresh Robot/jog at a scaled magnitude within the SAME
+        cart hold. Hysteresis + up-ramp cap match the governor semantics;
+        both the singularity governor and the joint-limit approach
+        softening call this helper. Returns True if a fresh frame was
+        emitted, False on hysteresis skip / send failure. Caller must
+        hold self._jog_lock."""
         cmd  = self._cart_commanded_frac         # unscaled magnitude
         sign = 1.0 if self._jog_direction >= 0 else -1.0
         target_signed = sign * cmd * scale
@@ -2552,15 +2595,15 @@ class EstunCodroidDriver(Node):
         # Hysteresis — only push a fresh frame when the change is
         # material relative to the commanded magnitude. Avoids spam.
         if abs(target_signed - last) < cmd * self._cart_speed_min_delta:
-            return
+            return False
         # Issue: stopJog + fresh Robot/jog. Preserve session identity —
         # this is a speed change within the SAME hold, not a new one, so
         # hold_id / seq bookkeeping stays put.
         try:
             self._send({'ty': 'Robot/stopJog', 'id': self._new_nonce()})
         except Exception as e:
-            self.get_logger().warn(f'governor: stopJog send failed: {e}')
-            return
+            self.get_logger().warn(f'{log_prefix}: stopJog send failed: {e}')
+            return False
         # Robot/jog with the new signed speed. index / coorType / coorId
         # unchanged — we're only ramping magnitude.
         frame = {
@@ -2576,16 +2619,67 @@ class EstunCodroidDriver(Node):
         }
         try:
             if not self._send(frame):
-                self.get_logger().warn('governor: Robot/jog send returned False')
-                return
+                self.get_logger().warn(f'{log_prefix}: Robot/jog send returned False')
+                return False
         except Exception as e:
-            self.get_logger().warn(f'governor: Robot/jog send failed: {e}')
-            return
+            self.get_logger().warn(f'{log_prefix}: Robot/jog send failed: {e}')
+            return False
         self._cart_last_sent_speed = target_signed
         self._jog_signed_speed = target_signed
-        self.get_logger().info(
-            f'governor scale {scale:.2f}: σ_min={sigma:.4f}  '
-            f'speed {last:+.3f} → {target_signed:+.3f}')
+        return True
+
+    def _apply_governor_scale_locked(self, sigma, scale):
+        """Singularity-governor speed scale. Delegates the actual send
+        to `_apply_cart_speed_scale_locked`. Caller must hold self._jog_lock."""
+        last = self._cart_last_sent_speed
+        if self._apply_cart_speed_scale_locked(scale, 'governor'):
+            self.get_logger().info(
+                f'governor scale {scale:.2f}: σ_min={sigma:.4f}  '
+                f'speed {last:+.3f} → {self._cart_last_sent_speed:+.3f}')
+
+    def _joint_limit_approach_scale_locked(self, cur_frac):
+        """Compute the softening scale that keeps every joint away from
+        its dynamic safe_edge. Returns (scale, limiting_joint_1based,
+        current_deg, safe_edge_deg, headroom_deg). scale is 1.0 when no
+        joint is inside the soft zone. `limiting_joint_1based` is None
+        when scale == 1.0. Caller must hold self._jog_lock.
+
+        This is the ramp portion of the joint-limit clamp; the hard
+        stop lives untouched in _on_jog_supervise's cart-mode branch.
+        """
+        soft_zone = max(0.0, self._cart_joint_soft_zone_deg)
+        soft_floor = max(0.01, min(1.0, self._cart_joint_soft_floor_frac))
+        best_scale = 1.0
+        best_joint = None
+        best_current = None
+        best_safe_edge = None
+        best_headroom = None
+        for i in range(6):
+            current = self._joint_deg[i]
+            limit = self._joint_limit_deg[i]
+            margin = self._dyn_limit_margin_deg(i, cur_frac)
+            safe_edge = limit - margin
+            headroom = safe_edge - abs(current)
+            # Inside the soft zone: 0 <= headroom < soft_zone.
+            # At headroom == soft_zone → scale = 1.0.
+            # At headroom == 0        → scale = soft_floor.
+            if headroom >= soft_zone or soft_zone <= 0.0:
+                continue
+            if headroom <= 0.0:
+                # Past safe_edge — the hard-stop branch will fire; report
+                # floor scale + this joint so the softening telemetry
+                # tells the truth for the one tick before the stop lands.
+                scale_i = soft_floor
+            else:
+                t = headroom / soft_zone            # 0..1
+                scale_i = soft_floor + (1.0 - soft_floor) * t
+            if scale_i < best_scale:
+                best_scale = scale_i
+                best_joint = i + 1
+                best_current = current
+                best_safe_edge = safe_edge
+                best_headroom = headroom
+        return best_scale, best_joint, best_current, best_safe_edge, best_headroom
 
     def _stop_jog_from_expiry(self):
         """Fires from the threading.Timer scheduled by _start_increment_jog.
@@ -2655,6 +2749,11 @@ class EstunCodroidDriver(Node):
                                        f'(-{safe_edge:.2f}°, dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
                             return
                 elif self._jog_mode == 'continuous_cart':
+                    # Hard-stop first (unchanged safety): if any joint is
+                    # AT or PAST its dynamic safe_edge, stop now with the
+                    # existing reason string. The softening ramp below
+                    # runs only when we're still inside the safe_edge.
+                    hard_stop_fired = False
                     for i in range(6):
                         current = self._joint_deg[i]
                         limit = self._joint_limit_deg[i]
@@ -2664,7 +2763,43 @@ class EstunCodroidDriver(Node):
                             self._stop_jog_locked(
                                 reason=f'cart limit approach J{i+1} at {current:+.2f}° '
                                        f'(|>{safe_edge:.2f}°|, dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
-                            return
+                            hard_stop_fired = True
+                            break
+                    if hard_stop_fired:
+                        return
+                    # Progressive softening — ramp speed down as any joint
+                    # approaches its safe_edge. Hard-stop threshold is
+                    # untouched; this only reshapes the last N degrees of
+                    # approach. The operator feels resistance instead of a
+                    # cliff. Directive item 2 (Lesson 165).
+                    (soft_scale, soft_joint, soft_current, soft_safe_edge,
+                     soft_headroom) = self._joint_limit_approach_scale_locked(cur_frac)
+                    if soft_scale < 1.0:
+                        prev = self._cart_softening
+                        self._cart_softening = {
+                            'active': True,
+                            'limiting_joint_1based': soft_joint,
+                            'current_deg':  soft_current,
+                            'safe_edge_deg': soft_safe_edge,
+                            'headroom_deg': soft_headroom,
+                            'scale': soft_scale,
+                        }
+                        emitted = self._apply_cart_speed_scale_locked(
+                            soft_scale, 'joint_limit_soft')
+                        if emitted or prev is None:
+                            self.get_logger().info(
+                                f'joint-limit softening J{soft_joint}: '
+                                f'current={soft_current:+.2f}° '
+                                f'headroom={soft_headroom:+.2f}° '
+                                f'scale={soft_scale:.2f}')
+                    else:
+                        # Left the soft zone. Rate-limited restore back to
+                        # the commanded magnitude runs through the same
+                        # helper (up-ramp cap prevents an instant slam).
+                        if self._cart_softening is not None:
+                            self._apply_cart_speed_scale_locked(
+                                1.0, 'joint_limit_soft_restore')
+                            self._cart_softening = None
                     # ── Singularity + overspeed governor (cart only) ──
                     # Compute σ_min at live joint angles; scale/stop the
                     # cartesian jog before the controller's IK explodes.
@@ -2793,10 +2928,70 @@ class EstunCodroidDriver(Node):
                 return f'cause={tag}: {r}'
         return f'cause=other: {r}' if r else 'cause=other'
 
+    _CAUSE_JOINT_RE = re.compile(r'J([1-6])\s+at\s+([+-]?\d+(?:\.\d+)?)')
+
+    def _build_stop_cause_locked(self, tagged_reason, prev_mode, prev_index):
+        """Extract a structured `stop_cause` dict from a
+        cause=<tag>: <human> string. The dashboard's
+        `_jog_stop_cause_operator_copy` reads this dict — it never
+        re-parses the raw human text. Caller must hold self._jog_lock.
+
+        Fork registry canonical: this method is the single source of
+        `tag`/`joint_index_1based`/`joint_deg`/`joint_limit_deg` values.
+        The dashboard passes them through untouched; the frontend
+        renders the dashboard's translated strings."""
+        raw = str(tagged_reason or '')
+        # Tag lives right after `cause=` and before `:` or end of string.
+        tag = 'other'
+        m = re.match(r'cause=([a-z_]+)', raw)
+        if m:
+            tag = m.group(1)
+        # `J<n> at <deg>` — set by every joint/cart limit-approach reason,
+        # by the singularity/overspeed guards ("joint overspeed guard J3"),
+        # and by the joint clamp on start. If the reason string doesn't
+        # match this shape (freshness_deadman, release_cmd, send_failed,
+        # increment_end etc.), joint_* stay None and the operator copy
+        # uses tag-only phrasing.
+        joint_i1 = None
+        joint_deg = None
+        joint_limit_deg = None
+        jm = self._CAUSE_JOINT_RE.search(raw)
+        if jm:
+            joint_i1 = int(jm.group(1))
+            try:
+                joint_deg = float(jm.group(2))
+            except (TypeError, ValueError):
+                joint_deg = None
+            if 1 <= joint_i1 <= 6:
+                joint_limit_deg = float(self._joint_limit_deg[joint_i1 - 1])
+        # Fallback: if the tag says joint-limit but no `J<n>` matched
+        # (defensive), pull the axis from the prev_index snapshot so the
+        # operator still gets a joint-scoped copy string.
+        if joint_i1 is None and tag == 'joint_limit' and 1 <= int(prev_index or 0) <= 6:
+            joint_i1 = int(prev_index)
+            joint_limit_deg = float(self._joint_limit_deg[joint_i1 - 1])
+            try:
+                joint_deg = float(self._joint_deg[joint_i1 - 1])
+            except (TypeError, IndexError, ValueError):
+                joint_deg = None
+        return {
+            'tag':                 tag,
+            'raw':                 raw,
+            'ts':                  self._last_stop_ts,
+            'jog_mode':            prev_mode,
+            'joint_index_1based':  joint_i1,
+            'joint_deg':           joint_deg,
+            'joint_limit_deg':     joint_limit_deg,
+        }
+
     def _stop_jog_locked(self, reason=''):
         """Send Robot/stopJog and tear down the supervise timer. Caller
         must hold self._jog_lock. Safe to call when no jog is active."""
         was_active = self._jog_active
+        # Snap fields the structured cause needs BEFORE the teardown
+        # below clears them.
+        prev_mode  = self._jog_mode
+        prev_index = self._jog_index
         # Tag the reason with a machine-parseable cause prefix so the
         # frontend can bucket stops into the operator taxonomy (see
         # 2026-07-31 jog-stop instrumentation directive).
@@ -2807,6 +3002,13 @@ class EstunCodroidDriver(Node):
         # via _last_stop_ts.
         self._last_stop_reason = reason
         self._last_stop_ts     = time.time()
+        # 2026-08-04: structured cause snapshot for the dashboard's
+        # operator-copy translator. The frontend renders {title, detail,
+        # technical} strings the dashboard composes from this dict —
+        # never re-parsed from reason text. Fork registry entry
+        # `jog_stop_cause_propagation` forbids frontend regexing.
+        self._last_stop_cause = self._build_stop_cause_locked(
+            reason, prev_mode, prev_index)
         # 2026-07-31 jog-stop bench: preserve the just-ended hold's
         # gap histogram in a "last session" slot so the bench script
         # can query AFTER the stop landed (the live ring gets cleared
@@ -2847,12 +3049,28 @@ class EstunCodroidDriver(Node):
             except Exception:
                 pass
             self._jog_supervise_timer = None
+        # Clear the softening telemetry — the hold is gone.
+        self._cart_softening = None
         if was_active and self._connected and self._ws is not None:
             try:
                 self._send({'ty': 'Robot/stopJog', 'id': self._new_nonce()})
                 self.get_logger().info(f'Robot/stopJog sent ({reason})')
             except Exception as e:
                 self.get_logger().warn(f'Robot/stopJog send failed: {e}')
+        # 2026-08-04 (Lesson 165): mode-gated stops must be loud. Publish
+        # the status blob RIGHT NOW so the dashboard sees the fresh
+        # last_stop_reason + last_stop_cause within one broadcast cycle
+        # (~40 ms), not waiting for the next posture frame (~33 ms) to
+        # naturally trigger it. An invisible stop must be impossible.
+        # Uses _publish_status_blob() specifically because that's the
+        # primary transport for last_stop_reason / last_stop_cause
+        # (see _on_estun_status pass-through in dashboard_server.py).
+        try:
+            self._publish_status_blob()
+        except Exception as e:
+            # Never let a publish exception mask the stopJog itself —
+            # the safety action already happened above.
+            self.get_logger().warn(f'_publish_status_blob after stop failed: {e}')
 
     def _stop_jog(self, reason=''):
         with self._jog_lock:
@@ -2910,6 +3128,17 @@ class EstunCodroidDriver(Node):
             'active_alarm':   self._alarm_active,
             'last_stop_reason': self._last_stop_reason,
             'last_stop_ts':     self._last_stop_ts,
+            # 2026-08-04: structured cause snapshot for the dashboard's
+            # operator-copy translator. The frontend renders operator
+            # language sourced from this dict via
+            # `_jog_stop_cause_operator_copy` in dashboard_server.py.
+            'last_stop_cause':  self._last_stop_cause,
+            # Live cart-mode joint-limit approach softening state
+            # (see _apply_cart_speed_scale_locked + _on_jog_supervise).
+            # None when the hold is unscaled; a dict while inside the
+            # soft zone. Used for the LiveMarginHUD "slowing near
+            # J<n> limit" affordance.
+            'cart_softening':   dict(self._cart_softening) if self._cart_softening else None,
             'last_posture_age_s': (time.time() - self._last_posture_ts) if self._last_posture_ts else None,
             'last_status_age_s':  (time.time() - self._last_status_ts)  if self._last_status_ts  else None,
             # 2026-07-31 jog-stop bench: inter-arrival gap histogram
@@ -3931,6 +4160,13 @@ class EstunCodroidDriver(Node):
             # transient toast/banner line when last_stop_ts is recent.
             'last_stop_reason': self._last_stop_reason,
             'last_stop_ts':     self._last_stop_ts,
+            # 2026-08-04: structured cause snapshot for the operator-copy
+            # translator. See _build_stop_cause_locked.
+            'last_stop_cause':  self._last_stop_cause,
+            # Live cart-mode joint-limit approach softening state
+            # (see _apply_cart_speed_scale_locked). None outside the
+            # soft zone; a dict while scaling to protect a joint limit.
+            'cart_softening':   dict(self._cart_softening) if self._cart_softening else None,
             'allow_power':   self._allow_power,
             'joints_deg':    list(self._joint_deg),
             'joints_rad':    list(self._joint_rad),

@@ -4,6 +4,7 @@ import { useStore, CLIENT_ID } from '../store/useStore'
 import ProgramWizard from './ProgramWizard'
 import ProgramFromDemonstration from './ProgramFromDemonstration'
 import { HoldButton } from './JogControls'
+import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
 import NumericField from './NumericField'
 import PalletFrameDiagram from './PalletFrameDiagram'
 import { readPayload, PAYLOAD_UNSET_WARNING }
@@ -2289,6 +2290,11 @@ function TeachOverlay({
   // the two views agree byte-for-byte on what the arm is doing.
   const joints        = useStore((s) => s.joints)
   const jointLimits   = useStore((s) => s.robot?.joint_limits)
+  // 2026-08-04 (Lesson 165): the whole robot slice for the shared
+  // JogStopBanner + LiveMarginHUD renderers. Zustand selector returns
+  // the same reference across renders when the frame hasn't changed,
+  // so this doesn't churn identity.
+  const robot         = useStore((s) => s.robot)
   // Taught points on the currently-loaded program feed the optional
   // Match: selector. Purely display — no motion, no auto-move.
   const currentProgram = useStore((s) => s.currentProgram)
@@ -2525,6 +2531,14 @@ function TeachOverlay({
         <div style={{ fontSize: 15, color: '#1e40af', textAlign: 'center' }}>
           {stepInstruction}
         </div>
+      </div>
+
+      {/* 2026-08-04 (Lesson 165) — driver-initiated stop cause + live
+          joint-margin HUD, rendered on the teach overlay via the shared
+          canonical components. Fork registry: `jog_stop_cause_propagation`. */}
+      <div style={{ padding: '8px 22px 0 22px', flexShrink: 0 }}>
+        <JogStopBanner robot={robot} />
+        <LiveMarginHUD robot={robot} />
       </div>
 
       {/* Passive frame-warning banner retired (§465 fork-1 kill,

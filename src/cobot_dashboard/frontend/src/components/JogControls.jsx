@@ -3,6 +3,7 @@ import { useStore } from '../store/useStore'
 import { createHoldTicker } from '../lib/holdTicker'
 import { pushJogEvent, pushJogInterval, pushJogStop,
          startJogSession, endJogSession } from '../lib/jogTelemetry'
+import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
 
 // JogControls — the shared REAL-ARM hold-to-jog panel.
 //
@@ -642,46 +643,13 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
     }
   })()
 
-  // Recent driver-side jog stop reason. Rendered as a sub-line under
-  // the banner for a few seconds after last_stop_ts so the operator
-  // can see WHY motion stopped, not just that it did. Silent for
-  // routine "release cmd" and "increment complete" — those are the
-  // operator's own gestures ending normally.
-  const nowSec = Date.now() / 1000
-  const stopAgeS = robot.last_stop_ts ? (nowSec - robot.last_stop_ts) : Infinity
-  const stopReasonRaw = robot.last_stop_reason || ''
-  const routineStop = /^release cmd|^increment complete|^increment expiry|^node shutdown|^ws disconnect/i.test(stopReasonRaw)
-  const showStopReason = stopReasonRaw && stopAgeS < 6 && !routineStop
-  const stopReasonHuman = (() => {
-    if (!showStopReason) return null
-    // "hold staleness 0.31s"  → connection jitter
-    if (/^hold staleness/i.test(stopReasonRaw)) {
-      return 'Connection jitter — release and re-press to continue.'
-    }
-    // "limit approach J3 at +198.20° (+198.00°)" → limit approach
-    let m = /limit approach J(\d) at ([+-]?[\d.]+)°/i.exec(stopReasonRaw)
-    if (m) {
-      return `J${m[1]} near ${m[2]}° limit — jog the other direction.`
-    }
-    // "cart limit approach J2 at +198.20° (|>198.00°|)" (cartesian)
-    m = /cart limit approach J(\d) at ([+-]?[\d.]+)°/i.exec(stopReasonRaw)
-    if (m) {
-      return `J${m[1]} near limit — cartesian jog blocked; jog joints back first.`
-    }
-    // "clamp: J3 target +170.50° exceeds ±164.00° ..."
-    m = /clamp: J(\d) target/i.exec(stopReasonRaw)
-    if (m) {
-      return `J${m[1]} would exceed its safety limit — pick a smaller step or the other direction.`
-    }
-    // "increment freshness fallback 0.35s" — backup stop, still connection-ish
-    if (/freshness fallback/i.test(stopReasonRaw)) {
-      return 'Connection jitter (backup stop) — release and re-press.'
-    }
-    if (/send failed|hb send failed|send returned False/i.test(stopReasonRaw)) {
-      return 'Controller send failed — connection dropped or busy; retry the jog.'
-    }
-    return `Jog stopped: ${stopReasonRaw}`
-  })()
+  // Driver-initiated jog stop cause + live joint-margin HUD are now
+  // rendered by the shared <JogStopBanner /> + <LiveMarginHUD />
+  // components sourced from robot.stop_cause_copy / robot.cart_softening.
+  // The dashboard's `_jog_stop_cause_operator_copy` translator is the
+  // single canonical source of operator-language strings — no regex
+  // fork on the raw reason lives here anymore (fork registry:
+  // `jog_stop_cause_propagation`, 2026-08-04 Lesson 165).
 
   // ── State banner ─────────────────────────────────────────────
   // Explicit reason surface — buttons only grey when banner is not
@@ -985,19 +953,18 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
         ))}
       </div>
 
-      {/* Recovery sub-line — shown UNDER the banner. Three sources, in
+      {/* Recovery sub-line — shown UNDER the banner. Two sources, in
           priority order:
             1. Live joint-limit recovery guide (any joint out_of_range) —
                multi-line with direction + live-degrees readout,
                overrides any static alarm copy.
             2. Static alarm recovery copy (2002/2006/2023/9012/etc.).
-            3. Transient mid-session jog-stop reason.
-          Kept mixed-case (banner is uppercase) so this reads as prose. */}
-      {(recoveryGuideText || alarmCopy?.recovery || stopReasonHuman) && (
+          Kept mixed-case (banner is uppercase) so this reads as prose.
+          Transient mid-session jog-stop reason moved to <JogStopBanner />
+          below (2026-08-04 Lesson 165: fork registry-canonical surface). */}
+      {(recoveryGuideText || alarmCopy?.recovery) && (
         <div style={{
-          background: recoveryGuideText ? '#7F1D1D'
-                    : alarmCopy         ? '#7F1D1D'
-                    :                     '#78350F',
+          background: recoveryGuideText ? '#7F1D1D' : '#7F1D1D',
           color: '#FFF7ED',
           padding: '6px 12px',
           fontSize: 12,
@@ -1006,9 +973,14 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
           whiteSpace: 'pre-wrap',   // preserve the line breaks in the guide
           fontVariantNumeric: 'tabular-nums',   // keep live degrees readable
         }}>
-          {recoveryGuideText || alarmCopy?.recovery || stopReasonHuman}
+          {recoveryGuideText || alarmCopy?.recovery}
         </div>
       )}
+
+      <div style={{ padding: '0 12px', flexShrink: 0 }}>
+        <JogStopBanner robot={robot} />
+        <LiveMarginHUD robot={robot} />
+      </div>
 
       {pendingPower && powerCopy && (
         <div

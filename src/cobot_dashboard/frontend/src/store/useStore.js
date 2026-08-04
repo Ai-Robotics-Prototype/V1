@@ -185,6 +185,25 @@ const storeDefinition = (set, get) => ({
     // recent (see JogControls). Empty until the first stop.
     last_stop_reason: '',
     last_stop_ts: 0,
+    // 2026-08-04 (Lesson 165): dashboard-composed operator copy for
+    // the latest stop. Shape (or null):
+    //   {title, detail, technical, tag, ts}
+    // Frontend renders `title` + `detail` on the jog surface. The raw
+    // `technical` string is stashed but not shown by default. Fork
+    // registry `jog_stop_cause_propagation` forbids re-parsing the
+    // raw reason on the frontend — this is the ONLY approved surface.
+    stop_cause_copy: null,
+    // Structured cause snapshot from the driver (source of truth for
+    // tag / joint index). Frontend does not derive UI copy from this
+    // — the dashboard has already translated it into stop_cause_copy.
+    last_stop_cause: null,
+    // Live cart-mode joint-limit approach softening state. Non-null
+    // while the driver is scaling cart speed to protect a joint limit;
+    // rendered as a compact "slowing near J<n>" HUD in the jog surface.
+    // Shape:
+    //   {active, limiting_joint_1based, current_deg, safe_edge_deg,
+    //    headroom_deg, scale}
+    cart_softening: null,
     // Per-joint limit evaluation — one entry per joint, driver-side.
     // Each: {joint, current_deg, limit_deg, margin_deg, out_of_range,
     //        near_limit, headroom_deg}. Populated by /estun/status.

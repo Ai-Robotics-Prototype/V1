@@ -504,6 +504,54 @@ capabilities:
           - src/estun_driver/estun_driver/estun_driver_node.py
     known_debt: []
 
+  # 18. Jog stop-cause propagation (Lesson 165, 2026-08-04).
+  - id: jog_stop_cause_propagation
+    description: >
+      When the driver stops a jog, the operator must see WHY within one
+      broadcast cycle. Cause taxonomy has a single spine:
+        (a) `_stop_jog_locked` populates `_last_stop_reason` +
+            `_last_stop_cause` (see `_build_stop_cause_locked`); the
+            reason is tagged by `_STOP_REASON_PATTERNS`.
+        (b) The dashboard's `_jog_stop_cause_operator_copy` is the
+            ONE place tags are translated to operator language
+            ({title, detail, technical}). 267108a register — no
+            technical tokens in title/detail.
+        (c) The frontend's `<JogStopBanner />` + `<LiveMarginHUD />`
+            in JogStopSurface.jsx render `robot.stop_cause_copy`
+            verbatim. It does not regex the raw reason.
+      Any second implementation — a frontend regex on `last_stop_reason`,
+      a duplicate translator, a component that parses driver text —
+      is a fork.
+    canonical:
+      python:
+        module: estun_driver.estun_driver_node
+        functions: []
+        note: >
+          _stop_jog_locked, _build_stop_cause_locked, and
+          _tag_stop_reason are methods on the EstunCodroidDriver class
+          — not module-level. See the class definition around line
+          208 for the canonical bodies.
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [_jog_stop_cause_operator_copy]
+      frontend:
+        path: src/cobot_dashboard/frontend/src/components/JogStopSurface.jsx
+        exports: [JogStopBanner, LiveMarginHUD]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Frontend regex that parses driver reason substrings must
+          # not live outside JogStopSurface's log-only surface.
+          - "cart limit approach"
+          - "limit approach J\\("
+          - "hold staleness"
+          - "freshness fallback"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/components/JogStopSurface.jsx
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt: []
+
 
 # ── Heuristic sweep ─────────────────────────────────────────────────
 #
