@@ -333,6 +333,16 @@ const storeDefinition = (set, get) => ({
   commandError: null,
   toasts: [],
 
+  // ── Teach-session record-through cache (2026-08-04) ─────────
+  // Server-truth mirror of every draft under
+  // /opt/cobot/teach_sessions/. Keyed by program_id. Populated
+  // from `msg.teach_sessions` on every WS state frame. The
+  // Jetson is the single store — this slice is a cache; UI
+  // reads it for the "Teaching in progress on <owner>" banner
+  // and for live-view badge fills when observing another
+  // device's teach session.
+  teachSessions: {},
+
   // ---- LiDAR ----
   lidarPoints: [],
 
@@ -582,6 +592,17 @@ const storeDefinition = (set, get) => ({
           grasp_poses: msg.grasp_poses ?? get().grasp_poses,
           gripper: msg.gripper ?? get().gripper,
           program: msg.program ?? get().program,
+          // Teach-session record-through mirror (2026-08-04). The
+          // server broadcasts STATE['teach_sessions'] on every WS
+          // state frame; the client keeps a slice keyed by
+          // program_id so components can (a) render "Teaching in
+          // progress on <owner>" when the current program is
+          // locked to another device, and (b) overlay draft poses
+          // onto currentProgram for live UX responsiveness. The
+          // draft file on the Jetson is the source of truth;
+          // this store slice is a cache that reconciles on every
+          // frame.
+          teachSessions: msg.teach_sessions ?? get().teachSessions,
           wsLatency: latency,
           lastMessageTime: now,
         })
@@ -1714,6 +1735,203 @@ const storeDefinition = (set, get) => ({
   },
 
   // ---------------------------------------------------------------------------
+  // Teach-session record-through actions (2026-08-04)
+  // ---------------------------------------------------------------------------
+  //
+  // The Jetson is the single store for ALL pose state, including
+  // mid-teach. Every Record Position on every teach surface goes
+  // through POST /api/teach_session/{pid}/record here — never
+  // straight to setCurrentProgram. The server persists the pose
+  // to /opt/cobot/teach_sessions/{pid}.draft.json, mirrors it into
+  // STATE['teach_sessions'], and broadcasts on the next WS frame
+  // so every connected UI (tablet + PC) converges without a
+  // refresh. See dashboard_server.py teach-session block for the
+  // wire contract.
+  //
+  // Device identity: crypto.randomUUID() generated once per tab
+  // and stashed in sessionStorage (survives refresh, dies with
+  // tab close). Passed on every request so the server can
+  // enforce single-owner semantics.
+
+  _teachDeviceId: null,
+  _getTeachDeviceId() {
+    let id = get()._teachDeviceId
+    if (id) return id
+    try {
+      id = sessionStorage.getItem('roboai-teach-device-id')
+    } catch (_) { /* no sessionStorage → generate fresh each call */ }
+    if (!id) {
+      try {
+        id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : `dev-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+        sessionStorage.setItem('roboai-teach-device-id', id)
+      } catch (_) {
+        id = `dev-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+      }
+    }
+    set({ _teachDeviceId: id })
+    return id
+  },
+
+  // Read the current draft for a program from the WS-cached slice.
+  // Returns null when no draft is active.
+  teachSessionFor(programId) {
+    if (!programId) return null
+    const s = get().teachSessions || {}
+    return s[programId] || null
+  },
+
+  // True iff a teach session exists AND is owned by another
+  // device. Used by ProgramEditor to render the read-only banner.
+  isTeachingElsewhere(programId) {
+    const s = get().teachSessionFor(programId)
+    if (!s) return false
+    return s.owner_device_id
+      && s.owner_device_id !== get()._getTeachDeviceId()
+  },
+
+  // Optimistically POST a pose to the draft. Returns the ack.
+  // The caller updates local currentProgram AFTER a successful
+  // response so the UI never claims a taught pose the server
+  // rejected.
+  async recordTeachPose(programId, slotKey, patch) {
+    if (!programId || !slotKey || !patch) {
+      return { ok: false, error: 'bad_args' }
+    }
+    const device_id = get()._getTeachDeviceId()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/record`,
+        {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ device_id, slot_key: slotKey, patch }),
+        })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        if (res.status === 403 && body?.error === 'not_owner') {
+          get().addToast?.({
+            title:  'Teach session is owned by another device.',
+            detail: `Ask ${body.owner_label || 'the other device'} to `
+                  + 'save or cancel, or click "Take over" on the '
+                  + 'banner to switch ownership.',
+            technicalDetail: JSON.stringify(body),
+          }, 'error', 8000)
+        } else {
+          get().addToast?.({
+            title:  'Record failed — pose not saved to session.',
+            detail: 'Try again. If it repeats, refresh the page.',
+            technicalDetail: (body && body.error) || `HTTP ${res.status}`,
+          }, 'error', 6000)
+        }
+        return { ok: false, status: res.status, body }
+      }
+      return { ok: true, draft: body.draft }
+    } catch (e) {
+      get().addToast?.({
+        title:  'Record failed — network error.',
+        detail: 'Pose was NOT recorded to the session. Try again.',
+        technicalDetail: String(e && e.message || e),
+      }, 'error', 6000)
+      return { ok: false, error: 'network' }
+    }
+  },
+
+  // Explicit claim — pre-checks whether the current device can
+  // start teaching on this program. On 409, returns the lock info
+  // so the caller can render the "Teaching in progress on X"
+  // banner.
+  async startTeachSession(programId, deviceLabel = '') {
+    if (!programId) return { ok: false, error: 'bad_args' }
+    const device_id = get()._getTeachDeviceId()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/start`,
+        {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({
+            device_id, device_label: deviceLabel }),
+        })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok && res.status !== 409) {
+        return { ok: false, status: res.status, body }
+      }
+      // 409 is not an error at this layer — it's the lock signal.
+      return {
+        ok: res.ok,
+        locked: res.status === 409,
+        owner_device_id: body?.owner_device_id,
+        owner_label:     body?.owner_label,
+        draft:           body?.draft,
+      }
+    } catch (e) {
+      return { ok: false, error: 'network', message: String(e) }
+    }
+  },
+
+  async takeOverTeachSession(programId, deviceLabel = '') {
+    if (!programId) return { ok: false, error: 'bad_args' }
+    const device_id = get()._getTeachDeviceId()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/take_over`,
+        {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({
+            device_id, device_label: deviceLabel }),
+        })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        return { ok: false, status: res.status, body }
+      }
+      get().addToast?.({
+        title: 'You are teaching this program now.',
+        detail: 'The previous device sees a read-only view.',
+      }, 'success', 4000)
+      return { ok: true, draft: body.draft,
+               previous_owner: body.previous_owner }
+    } catch (e) {
+      return { ok: false, error: 'network', message: String(e) }
+    }
+  },
+
+  async cancelTeachSession(programId) {
+    if (!programId) return { ok: false, error: 'bad_args' }
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/cancel`,
+        { method: 'POST' })
+      return { ok: res.ok }
+    } catch (e) {
+      return { ok: false, error: 'network' }
+    }
+  },
+
+  async promoteTeachSession(programId) {
+    if (!programId) return { ok: false, error: 'bad_args' }
+    const device_id = get()._getTeachDeviceId()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/save`,
+        {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ device_id }),
+        })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        return { ok: false, status: res.status, body }
+      }
+      return { ok: true, program: body.program }
+    } catch (e) {
+      return { ok: false, error: 'network', message: String(e) }
+    }
+  },
+
+  // ---------------------------------------------------------------------------
   // Toast notifications
   // ---------------------------------------------------------------------------
 
@@ -1797,7 +2015,19 @@ const storeDefinition = (set, get) => ({
   },
 })
 
-// Wrap with persist for UI prefs only
+// Wrap with persist for UI prefs only.
+//
+// 2026-08-04 — currentProgram is intentionally NOT persisted. The Jetson
+// is the single store for pose state (draft teach sessions live at
+// /opt/cobot/teach_sessions/{id}.draft.json, saved programs at
+// /opt/cobot/programs/{id}.json). Persisting currentProgram to
+// localStorage duplicated that state and re-introduced drift: refresh
+// mid-teach used to resume from a stale local copy that would then
+// clobber whatever the server had. Under the record-through
+// architecture the client rehydrates from the WS state broadcast +
+// GET /api/teach_session/{id} on program open. Fork-registry entry
+// `teach_session_state` refuses reintroduction of currentProgram
+// persistence.
 export const useStore = create(
   persist(storeDefinition, {
     name: 'roboai-ui',
@@ -1805,11 +2035,6 @@ export const useStore = create(
       mode: state.mode,
       activeTab: state.activeTab,
       activeView: state.activeView,
-      // Persist the editor's current draft (id / name / steps / unsaved)
-      // across page reloads. A user mid-edit who accidentally hits F5
-      // shouldn't lose their work — and switching tabs only un-mounts
-      // the component, the store-backed slice survives either way.
-      currentProgram: state.currentProgram,
       // Persist the jog speed % so the operator's chosen speed survives
       // page reloads.
       jogSpeedPct:    state.jogSpeedPct,

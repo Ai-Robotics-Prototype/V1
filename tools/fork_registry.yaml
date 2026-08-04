@@ -298,7 +298,52 @@ capabilities:
           - '**/*.test.js'
     known_debt: []
 
-  # 12. Estun sign inversion (URDF axes).
+  # 12. Teach-session state (record-through, 2026-08-04).
+  - id: teach_session_state
+    description: >
+      Mid-teach pose state (recorded corners, taught step joints
+      not yet promoted to disk) lives ONLY on the Jetson at
+      /opt/cobot/teach_sessions/{pid}.draft.json. STATE
+      ['teach_sessions'] mirrors every draft; the WS state
+      broadcast carries them; every Record Position on every
+      teach surface goes through POST
+      /api/teach_session/{pid}/record — Zustand is a cache of
+      server truth, never the owner. No client-side pose
+      persistence (localStorage, Zustand persist whitelist,
+      per-component copies).
+    canonical:
+      python:
+        module: cobot_dashboard.dashboard_server
+        functions: [_teach_read_draft, _teach_write_draft,
+                    _teach_publish_to_state,
+                    _apply_draft_poses_to_program]
+      route:
+        method: POST
+        path: /api/teach_session/{prog_id}/record
+      javascript:
+        module: src/cobot_dashboard/frontend/src/store/useStore.js
+        exports: [recordTeachPose, startTeachSession,
+                  takeOverTeachSession, cancelTeachSession,
+                  promoteTeachSession]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # localStorage on pose data anywhere is banned — the
+          # server is authoritative.
+          - "localStorage\\.setItem\\([^,)]*['\"](taught|corner_tcp|corner1_tcp|corner2_tcp|corner3_tcp|part_tcp|currentProgram)['\"]"
+          # Reintroducing currentProgram to the Zustand persist
+          # whitelist is a fork of teach_session_state (draft
+          # poses land in currentProgram; persist mirrors them
+          # to localStorage). The specific string 'currentProgram'
+          # inside a `partialize` return is the fork signature.
+          - "partialize:.*currentProgram: state\\.currentProgram"
+        path_exempt:
+          - '**/*.test.js'
+          - '**/*.pinned.test.js'
+    known_debt: []
+
+
+  # 13. Estun sign inversion (URDF axes).
   - id: estun_axis_sign_inversion
     description: >
       J3 and J5 URDF axes are intentionally sign-inverted vs CAD

@@ -12058,6 +12058,375 @@ if FASTAPI_AVAILABLE:
             'zones':    data.get('zones', []),
         }
 
+    # ── Teach-Session record-through store (2026-08-04) ────────────
+    #
+    # Pre-2026-08-04, taught poses recorded during a teach session lived
+    # ONLY in the recording browser's Zustand state until save. Refresh
+    # or a tablet-to-PC switch mid-teach → poses lost; the server could
+    # not validate what it could not see; §406 first-class program sync
+    # never covered teach-time state.
+    #
+    # This module is the single source of truth for teach-time state:
+    #
+    #   * `/opt/cobot/teach_sessions/{program_id}.draft.json` — one
+    #     draft file per program (or per program-id). Contains
+    #     `owner_device_id`, `poses: {slot_key: patch}`. Slot keys:
+    #        step:<step_id>   step teaching (move_home, move_joint, …)
+    #        corner:1|2|3     pallet frame corners
+    #        corner:part      pallet part-datum ④
+    #
+    #   * `STATE['teach_sessions']` mirrors every draft file, keyed
+    #     by program_id. Every WS state broadcast carries the mirror
+    #     — connected clients see draft mutations without any extra
+    #     WS channel, and reconcile-on-reconnect (Addendum 27) picks
+    #     up the teach state via the same snapshot that ships
+    #     currentProgram revs.
+    #
+    #   * Endpoints:
+    #        POST /api/teach_session/{pid}/start       claim (409 if locked)
+    #        POST /api/teach_session/{pid}/record     write one slot
+    #        POST /api/teach_session/{pid}/take_over  atomic ownership swap
+    #        POST /api/teach_session/{pid}/save       promote → validator
+    #        POST /api/teach_session/{pid}/cancel     discard
+    #        GET  /api/teach_session/{pid}            read current draft
+    #
+    # The draft store is the ONE canonical owner of teach-time pose
+    # state. Registered in tools/fork_registry.yaml as
+    # `teach_session_state`; forbidden in the registry: any frontend
+    # localStorage.setItem carrying pose data.
+
+    _TEACH_DIR = '/opt/cobot/teach_sessions'
+    _teach_lock = threading.Lock()
+
+    def _teach_path(prog_id: str):
+        if not _PROG_READ_ID_RE.match(prog_id or ''):
+            return None
+        return os.path.join(_TEACH_DIR, prog_id + '.draft.json')
+
+    def _teach_read_draft(prog_id: str) -> dict | None:
+        p = _teach_path(prog_id)
+        if not p or not os.path.isfile(p):
+            return None
+        try:
+            with open(p) as fh:
+                return json.load(fh)
+        except Exception:
+            return None
+
+    def _teach_write_draft(prog_id: str, draft: dict) -> None:
+        p = _teach_path(prog_id)
+        if not p:
+            return
+        os.makedirs(_TEACH_DIR, exist_ok=True)
+        # Atomic write — rename after fsync so a mid-write kill
+        # cannot leave a half-file on disk (draft survives a
+        # `systemctl restart roboai-dashboard` mid-teach).
+        tmp = p + '.tmp'
+        with open(tmp, 'w') as fh:
+            json.dump(draft, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, p)
+
+    def _teach_delete_draft(prog_id: str) -> None:
+        p = _teach_path(prog_id)
+        if not p:
+            return
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+
+    def _teach_publish_to_state() -> None:
+        """Mirror every draft file on disk into STATE['teach_sessions']
+        so the WS broadcast carries it. Called at boot (hydrate) and
+        after every mutation."""
+        drafts: dict = {}
+        try:
+            for name in os.listdir(_TEACH_DIR):
+                if not name.endswith('.draft.json'):
+                    continue
+                pid = name[:-len('.draft.json')]
+                d = _teach_read_draft(pid)
+                if d is not None:
+                    drafts[pid] = d
+        except FileNotFoundError:
+            pass
+        with _state_lock:
+            STATE['teach_sessions'] = drafts
+
+    # Hydrate at boot so a restart mid-teach resumes the session.
+    os.makedirs(_TEACH_DIR, exist_ok=True)
+    _teach_publish_to_state()
+
+    def _teach_touch(draft: dict) -> dict:
+        draft['updated_ts'] = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                                            time.gmtime())
+        return draft
+
+    def _teach_new_draft(prog_id: str, device_id: str,
+                         device_label: str = '') -> dict:
+        return _teach_touch({
+            'program_id':      prog_id,
+            'owner_device_id': device_id,
+            'owner_label':     device_label or device_id[:8],
+            'started_ts':      time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                                             time.gmtime()),
+            'poses':           {},
+        })
+
+    @app.get("/api/teach_session/{prog_id}")
+    async def api_teach_session_get(prog_id: str):
+        """Return the current draft for prog_id, or {present: false}
+        when none exists. Used by clients on program open + as a
+        belt-and-suspenders reconcile against the WS state stream."""
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+        if draft is None:
+            return {'present': False, 'program_id': prog_id}
+        return {'present': True, 'draft': draft}
+
+    @app.post("/api/teach_session/{prog_id}/start")
+    async def api_teach_session_start(prog_id: str, request: Request):
+        """Claim the teach session for prog_id. Body:
+            {device_id: <str, required>, device_label?: <str>}
+        Returns:
+            {ok:true, draft} on successful claim (new draft OR
+            existing draft owned by THIS device),
+            409 {ok:false, owner_device_id, owner_label, taken_at}
+            when another device owns the session."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        if not device_id:
+            return JSONResponse({'error': 'device_id required'},
+                                status_code=400)
+        device_label = str(body.get('device_label') or '')
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                draft = _teach_new_draft(prog_id, device_id, device_label)
+                _teach_write_draft(prog_id, draft)
+                _teach_publish_to_state()
+                return {'ok': True, 'draft': draft}
+            if draft.get('owner_device_id') == device_id:
+                # Re-claim from the same device (refresh, resume) —
+                # keep the poses, keep ownership.
+                draft = _teach_touch(draft)
+                _teach_write_draft(prog_id, draft)
+                _teach_publish_to_state()
+                return {'ok': True, 'draft': draft}
+            # Another device owns it. 409 lets the client render the
+            # read-only banner with a Take Over button.
+            return JSONResponse({
+                'ok': False,
+                'error': 'teach_session_locked',
+                'owner_device_id': draft.get('owner_device_id'),
+                'owner_label':     draft.get('owner_label'),
+                'taken_at':        draft.get('started_ts'),
+            }, status_code=409)
+
+    @app.post("/api/teach_session/{prog_id}/take_over")
+    async def api_teach_session_take_over(prog_id: str, request: Request):
+        """Atomically transfer ownership from the current owner to
+        the requesting device. Existing poses are preserved."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        if not device_id:
+            return JSONResponse({'error': 'device_id required'},
+                                status_code=400)
+        device_label = str(body.get('device_label') or '')
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                # No existing draft — treat as a start.
+                draft = _teach_new_draft(prog_id, device_id, device_label)
+                _teach_write_draft(prog_id, draft)
+                _teach_publish_to_state()
+                return {'ok': True, 'draft': draft, 'took_over': False}
+            prev_owner = draft.get('owner_device_id')
+            draft = dict(draft)
+            draft['owner_device_id']    = device_id
+            draft['owner_label']        = device_label or device_id[:8]
+            draft['previous_owner']     = prev_owner
+            draft['took_over_at']       = time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            _teach_touch(draft)
+            _teach_write_draft(prog_id, draft)
+            _teach_publish_to_state()
+            return {'ok': True, 'draft': draft, 'took_over': True,
+                    'previous_owner': prev_owner}
+
+    @app.post("/api/teach_session/{prog_id}/record")
+    async def api_teach_session_record(prog_id: str, request: Request):
+        """Write one pose patch into the draft. Body:
+            {device_id: <str, required>,
+             slot_key: <str, required — 'step:<id>' | 'corner:1|2|3|part'>,
+             patch:    <dict, required — the taught_* payload>}
+        Ownership check refuses writes from non-owners with 403 so
+        the second device's Record buttons (which are UI-disabled)
+        cannot bypass via a direct API call."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        slot_key  = str(body.get('slot_key') or '').strip()
+        patch     = body.get('patch')
+        if not device_id:
+            return JSONResponse({'error': 'device_id required'},
+                                status_code=400)
+        if not slot_key:
+            return JSONResponse({'error': 'slot_key required'},
+                                status_code=400)
+        if not isinstance(patch, dict):
+            return JSONResponse({'error': 'patch must be an object'},
+                                status_code=400)
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                # First record implicitly starts the session with
+                # this device as owner. Keeps the client wire
+                # simple (no explicit /start before /record).
+                draft = _teach_new_draft(prog_id, device_id,
+                    str(body.get('device_label') or ''))
+            elif draft.get('owner_device_id') != device_id:
+                return JSONResponse({
+                    'ok': False,
+                    'error': 'not_owner',
+                    'owner_device_id': draft.get('owner_device_id'),
+                    'owner_label':     draft.get('owner_label'),
+                }, status_code=403)
+            poses = dict(draft.get('poses') or {})
+            poses[slot_key] = patch
+            draft['poses'] = poses
+            _teach_touch(draft)
+            _teach_write_draft(prog_id, draft)
+            _teach_publish_to_state()
+            return {'ok': True, 'draft': draft, 'slot_key': slot_key}
+
+    @app.post("/api/teach_session/{prog_id}/cancel")
+    async def api_teach_session_cancel(prog_id: str, request: Request):
+        """Discard the draft. Either the owner OR a take-over
+        confirmation can cancel — no permission check, because
+        cancel is the "back out safely" affordance."""
+        with _teach_lock:
+            _teach_delete_draft(prog_id)
+            _teach_publish_to_state()
+        return {'ok': True, 'program_id': prog_id}
+
+    def _apply_draft_poses_to_program(program: dict, poses: dict) -> dict:
+        """Merge draft poses INTO a program dict (returns the merged
+        program without persisting). Slots:
+          step:<step_id>    → merge patch into the matching step
+          corner:1|2|3      → write .taught_tcp to
+                              config.pallet_place.corner{N}_tcp
+          corner:part       → write .taught_tcp to
+                              config.pallet_place.part_tcp
+        Non-matching slot keys are skipped with a note.
+        """
+        merged = json.loads(json.dumps(program))
+        steps  = merged.setdefault('steps', [])
+        cfg    = merged.setdefault('config', {})
+        place  = cfg.setdefault('pallet_place', {})
+        by_step_id = {}
+        for s in steps:
+            sid = s.get('id')
+            if sid is not None:
+                by_step_id[str(sid)] = s
+        for slot_key, patch in (poses or {}).items():
+            if slot_key.startswith('step:'):
+                sid = slot_key[len('step:'):]
+                target = by_step_id.get(sid)
+                if target is None:
+                    continue
+                for k, v in (patch or {}).items():
+                    target[k] = v
+            elif slot_key.startswith('corner:'):
+                corner = slot_key[len('corner:'):]
+                tcp = (patch or {}).get('taught_tcp')
+                if not (isinstance(tcp, list) and len(tcp) >= 6):
+                    continue
+                key = {
+                    '1':    'corner1_tcp',
+                    '2':    'corner2_tcp',
+                    '3':    'corner3_tcp',
+                    'part': 'part_tcp',
+                }.get(corner)
+                if key:
+                    place[key] = list(tcp[:6])
+        return merged
+
+    @app.post("/api/teach_session/{prog_id}/save")
+    async def api_teach_session_save(prog_id: str, request: Request):
+        """Promote draft → program via the single validator door
+        (check_program_pending_poses). On success: merged program
+        persisted to /opt/cobot/programs/{id}.json AND the draft
+        file deleted. On validation failure: HTTP 400 with the
+        finding list; draft stays intact so the operator can jog
+        + re-teach."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                return JSONResponse({
+                    'ok': False, 'error': 'no_draft'}, status_code=404)
+            if device_id and draft.get('owner_device_id') != device_id:
+                return JSONResponse({
+                    'ok': False, 'error': 'not_owner',
+                    'owner_device_id': draft.get('owner_device_id'),
+                }, status_code=403)
+            path = _prog_read_path(prog_id)
+            if path is None or not os.path.isfile(path):
+                return JSONResponse({
+                    'ok': False, 'error': 'program_not_found'},
+                    status_code=404)
+            with open(path) as fh:
+                program = json.load(fh)
+            merged = _apply_draft_poses_to_program(
+                program, draft.get('poses') or {})
+            # Single validator door: same check used by the
+            # /api/estun/program/run push. Blocking findings refuse
+            # the save so a controller-crashing program never reaches
+            # disk via the teach-session path either.
+            try:
+                from estun_driver import program_ops
+                pending = program_ops.check_program_pending_poses(merged)
+            except Exception as _pe:
+                pending = []
+            if pending:
+                return JSONResponse({
+                    'ok':      False,
+                    'error':   'pending_poses',
+                    'outcome': {
+                        'kind':     'pending_poses',
+                        'count':    len(pending),
+                        'findings': pending,
+                    },
+                    'program_id': prog_id,
+                }, status_code=400)
+            # Persist. Reuse the standard save shape: same fields
+            # the /api/programs PUT would emit.
+            with open(path, 'w') as fh:
+                json.dump(merged, fh, indent=2)
+            _teach_delete_draft(prog_id)
+            _teach_publish_to_state()
+            # Bump the program-rev event so every client refreshes.
+            try:
+                _bump_prog_rev(prog_id)
+            except Exception:
+                pass
+        return {'ok': True, 'program': merged}
+
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         if full_path.startswith(("api/", "cmd/", "ws/", "stream/", "health", "assets/")):

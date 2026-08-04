@@ -20,6 +20,7 @@ import { PALLET_ROLE_TO_FIELD, modeForRole, taughtCount,
   from '../lib/palletTeachSequence'
 import { validatePalletFrameServer, findingsBlockingThisRecord }
   from '../lib/palletFrameValidator'
+import { namedLoadError } from '../lib/loadOutcome'
 import { computeProgramFindings } from '../lib/programFindings'
 import { computeTeachingDebt, debtBannerLabel } from '../lib/teachingDebt'
 import { stepIndexForLine, lineMapHonesty } from '../lib/runState'
@@ -2256,6 +2257,12 @@ function TeachOverlay({
   onRecord, onSkip, onBack, onCancel,
   diagram,
   counterSuffix = '',
+  // 2026-08-04: read-only observer mode. When another device
+  // owns the teach session, the overlay renders normally (so the
+  // observer can watch badges fill live) but Record + Skip are
+  // disabled. Jog is disabled by the banner-level gate elsewhere.
+  recordDisabled = false,
+  disabledReason = '',
 }) {
   // Shared jog transport — WS-first with server-side hold keepalive.
   // Same store actions the main Program-tab JogControls uses; the old
@@ -2822,21 +2829,31 @@ function TeachOverlay({
         </div>
 
         <button
-          onClick={() => setConfirming(true)}
+          data-testid="teach-record-position"
+          disabled={recordDisabled}
+          title={recordDisabled ? disabledReason : undefined}
+          onClick={() => { if (!recordDisabled) setConfirming(true) }}
           onTouchStart={(e) => { e.preventDefault() }}
-          onTouchEnd={(e) => { e.preventDefault(); setConfirming(true) }}
+          onTouchEnd={(e) => {
+            e.preventDefault()
+            if (!recordDisabled) setConfirming(true)
+          }}
           style={{
             height: 48,
             padding: '0 24px',
             fontSize: 15, fontWeight: 700, letterSpacing: '0.3px',
-            background: flash ? '#fff' : '#16A34A',
-            color:      flash ? '#16A34A' : '#fff',
+            background: recordDisabled ? '#e5e7eb'
+                      : flash ? '#fff' : '#16A34A',
+            color:      recordDisabled ? '#9ca3af'
+                      : flash ? '#16A34A' : '#fff',
             border: flash ? '2px solid #16A34A' : 'none',
-            borderRadius: 8, cursor: 'pointer',
+            borderRadius: 8,
+            cursor: recordDisabled ? 'not-allowed' : 'pointer',
             transition: 'background 100ms, color 100ms',
             justifySelf: 'center',
           }}>
-          {flash ? '✓ Recorded' : 'Record Position'}
+          {recordDisabled ? 'Record disabled — observing'
+            : flash ? '✓ Recorded' : 'Record Position'}
         </button>
 
         <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
@@ -3327,6 +3344,24 @@ export default function ProgramEditor() {
   const clearProgramChangedByOther            = useStore((s) => s.clearProgramChangedByOther)
   const refreshCurrentProgram                 = useStore((s) => s._refreshCurrentProgram)
   const addToast                              = useStore((s) => s.addToast)
+  // Teach-session record-through actions (2026-08-04). The
+  // ProgramEditor reads these to POST every Record to the Jetson
+  // BEFORE mutating local state; see teachOverlayRecord +
+  // palletTeachRecord for wiring.
+  const recordTeachPose      = useStore((s) => s.recordTeachPose)
+  const takeOverTeachSession = useStore((s) => s.takeOverTeachSession)
+  const promoteTeachSession  = useStore((s) => s.promoteTeachSession)
+  // Server-truth teach session for the currently-open program.
+  // Populated from the WS state broadcast (see useStore's
+  // ws.onmessage → teachSessions). Null when no draft exists.
+  const teachSession = useStore((s) =>
+    (s.teachSessions || {})[currentProgram?.id] || null)
+  const isTeachingElsewhere = useStore((s) =>
+    !!(s.teachSessions
+       && s.teachSessions[currentProgram?.id]
+       && s.teachSessions[currentProgram?.id].owner_device_id
+       && s.teachSessions[currentProgram?.id].owner_device_id
+          !== s._teachDeviceId))
   const [savedPrograms, setSavedPrograms] = useState([])
 
   // Diagnostic: log what the editor sees on every mount so a future
@@ -3893,6 +3928,15 @@ export default function ProgramEditor() {
   }
 
   // Apply the just-jogged pose to the overlay's current step.
+  //
+  // Record-through (2026-08-04, §406-teach-time-extension). The Jetson
+  // is the single store for pose state, mid-teach included. Every
+  // Record posts the patch to POST /api/teach_session/{id}/record
+  // FIRST. Only on server ack do we update the local Zustand steps —
+  // otherwise a 403 (not owner) or a network hiccup would leave the
+  // UI showing a taught pose the server never accepted. The WS state
+  // broadcast then propagates the new draft to every connected
+  // device (tablet + PC converge without a refresh).
   async function teachOverlayRecord() {
     const target = teachOverlayStep()
     if (!target) return
@@ -3901,6 +3945,14 @@ export default function ProgramEditor() {
     // to an override — the executor will then prefer this taught_tcp
     // over base+offset. Reset-to-auto clears it.
     if (target.derived_from) patch.overridden = true
+    // Record-through: POST to the draft store, wait for ack.
+    // Refuses to advance if the server rejects (403 not_owner or
+    // network error). Local state stays as-is on failure.
+    const pid = currentProgram?.id
+    if (pid) {
+      const ack = await recordTeachPose(pid, `step:${target.id}`, patch)
+      if (!ack.ok) return
+    }
     // Propagate to any step linked to this one (currently: a later
     // move_home linked via "Use Step 1 home position"). Mirrors the
     // taught fields so the persisted JSON always has both source and
@@ -4080,6 +4132,17 @@ export default function ProgramEditor() {
     const nextPallet = { ...(cfg.pallet || {}),      [field]: [...tcp] }
     const isCorner = role === 'pallet_c1' || role === 'pallet_c2' || role === 'pallet_c3'
 
+    // Role → teach-session slot key (2026-08-04 record-through).
+    // Every pallet Record POSTs its slot to the draft store on
+    // the Jetson — same wire contract step teaching uses. Second
+    // devices watching this program see corner badges fill live.
+    const slotKey = {
+      pallet_c1:   'corner:1',
+      pallet_c2:   'corner:2',
+      pallet_c3:   'corner:3',
+      pallet_part: 'corner:part',
+    }[role]
+
     if (isCorner) {
       // Ask the shared validator BEFORE committing. Blocking
       // findings that name the corner we just recorded refuse
@@ -4104,9 +4167,22 @@ export default function ProgramEditor() {
         })
         // Do NOT commit currentProgram; stay at the current role
         // in re-teach mode so the operator's next Record replaces
-        // the just-refused attempt without navigating.
+        // the just-refused attempt without navigating. Also do
+        // NOT record-through — a refused corner never enters the
+        // draft.
         setPalletTeachMode('re-teach')
         return
+      }
+      // Record-through: POST the corner pose to the Jetson's
+      // draft store. A 403 (not_owner) or network error refuses
+      // the commit — otherwise the second device would see a
+      // corner it CAN'T see in the shared draft.
+      const pid = currentProgram?.id
+      if (pid && slotKey) {
+        const ack = await recordTeachPose(pid, slotKey, {
+          taught: true, taught_tcp: [...tcp], taught_at: patch.taught_at,
+        })
+        if (!ack.ok) return
       }
       // Commit the good record.
       setCurrentProgram({
@@ -4127,9 +4203,17 @@ export default function ProgramEditor() {
       }
     } else {
       // ④ record: part-datum doesn't affect corner geometry
-      // math — commit without a validation round-trip. The
-      // teach-complete gate on close catches any lingering
-      // issue.
+      // math — commit without a frame-validation round-trip, BUT
+      // still record-through to the Jetson so the second-device
+      // view sees the ④ badge fill. The teach-complete gate on
+      // close catches any lingering issue.
+      const pid = currentProgram?.id
+      if (pid && slotKey) {
+        const ack = await recordTeachPose(pid, slotKey, {
+          taught: true, taught_tcp: [...tcp], taught_at: patch.taught_at,
+        })
+        if (!ack.ok) return
+      }
       setCurrentProgram({
         config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet },
         unsaved: true,
@@ -4233,6 +4317,34 @@ export default function ProgramEditor() {
       }
     }
     setSaveStatus('saving')
+    // Teach-session promotion (2026-08-04, record-through). If a
+    // draft exists for this program on the Jetson, promote it
+    // through the shared validator door BEFORE the standard PUT.
+    // The server-side promote endpoint merges draft.poses into
+    // the program on disk (via the pending-pose gate), then
+    // deletes the draft. The subsequent PUT below saves the
+    // program-level metadata (steps, config, routines, tags) in
+    // the usual shape — the poses are already on disk after the
+    // promote, so the PUT is idempotent w.r.t. pose data.
+    if (programId && teachSession) {
+      const promote = await promoteTeachSession(programId)
+      if (!promote.ok) {
+        // Route through the shared namedLoadError so operator
+        // copy stays canonical — outcome.kind='pending_poses'
+        // uses the same title/detail the /api/estun/program/run
+        // path emits. Non-fork of load_outcome_operator_copy.
+        const named = namedLoadError(promote.body || {},
+                                     promote.status)
+        addToast?.({
+          title:           named.title,
+          detail:          named.detail,
+          technicalDetail: named.technicalDetail,
+        }, 'error', 10000)
+        setSaveStatus('error')
+        setSaveError('teach-session promote refused')
+        return
+      }
+    }
     try {
       // Preserve the full config block (gripper, pallet, motion profile,
       // etc.) — earlier versions of this save sent only name+steps,
@@ -4378,6 +4490,49 @@ export default function ProgramEditor() {
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#fff' }}>
+      {/* Teach-session concurrency banner (2026-08-04). Renders
+          when another device owns the active teach session for
+          this program. Live badges continue to update from the
+          WS broadcast — this is a READ-ONLY view of the other
+          operator's work in progress. Take Over swaps
+          ownership atomically. */}
+      {isTeachingElsewhere && teachSession && (
+        <div data-testid="teach-session-locked-banner"
+             style={{
+               padding: '8px 16px',
+               background: '#FEF3C7',
+               borderBottom: '1px solid #F59E0B',
+               display: 'flex', alignItems: 'center',
+               gap: 12, fontSize: 13, color: '#78350f',
+             }}>
+          <span style={{ flex: 1 }}>
+            ⚠ Teaching in progress on{' '}
+            <b>{teachSession.owner_label || teachSession.owner_device_id}</b>
+            {' '}— record buttons disabled, badges update live.
+          </span>
+          <button
+            data-testid="teach-session-take-over"
+            onClick={async () => {
+              // eslint-disable-next-line no-alert
+              const ok = window.confirm(
+                'Take over teaching from '
+                + (teachSession.owner_label
+                   || teachSession.owner_device_id)
+                + '? Their record buttons will lock. Poses '
+                + 'already recorded are preserved.')
+              if (!ok) return
+              await takeOverTeachSession(currentProgram?.id, '')
+            }}
+            style={{
+              padding: '4px 12px',
+              background: '#FDE68A', border: '1px solid #B45309',
+              borderRadius: 4, fontSize: 12,
+              color: '#78350f', fontWeight: 600, cursor: 'pointer',
+            }}>
+            Take over teaching →
+          </button>
+        </div>
+      )}
       <div className="no-scrollbar" style={{
         padding: '12px 16px',
         paddingRight: 'calc(16px + env(safe-area-inset-right, 0px))',
@@ -5565,6 +5720,11 @@ export default function ProgramEditor() {
               onSkip={palletTeachSkip}
               onBack={palletTeachBack}
               onCancel={teachOverlayCancel}
+              recordDisabled={isTeachingElsewhere}
+              disabledReason={isTeachingElsewhere
+                ? 'Teaching in progress on ' + (teachSession?.owner_label
+                  || teachSession?.owner_device_id || 'another device')
+                : ''}
               diagram={
                 <PalletFrameDiagram
                   role={palletTeachRole}
@@ -5595,6 +5755,11 @@ export default function ProgramEditor() {
             onSkip={teachOverlaySkip}
             onBack={teachOverlayBack}
             onCancel={teachOverlayCancel}
+            recordDisabled={isTeachingElsewhere}
+            disabledReason={isTeachingElsewhere
+              ? 'Teaching in progress on ' + (teachSession?.owner_label
+                || teachSession?.owner_device_id || 'another device')
+              : ''}
           />
         )
       })()}
