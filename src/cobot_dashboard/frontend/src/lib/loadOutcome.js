@@ -1,18 +1,34 @@
 // Named-outcome mapping for /api/estun/program/run failures.
 //
-// The push endpoint returns a JSON body with `outcome.kind` on refusal.
-// Historically the load handler surfaced a single generic warning
-// "Loaded but push to controller failed: <server text>" — which turned
-// every distinct failure (transport down, empty program, lint,
-// byte-verify, codegen) into the same yellow toast the operator learned
-// to ignore. That's what let the false resident-mismatch banner slip
-// past on 2026-08-04 with :9000 down for 29 minutes.
+// The push endpoint returns a JSON body with `outcome.kind` on
+// refusal. The mapping below produces operator-language content
+// for each named outcome. Toast callers render:
 //
-// This helper maps each named outcome to operator-language: a headline
-// plus a detail line. The driver's raw reason (when present) is
-// propagated verbatim into `detail` so nothing gets swallowed. The
-// dashboard uses these as error-severity toasts, not warnings — because
-// the resident program did NOT change and the operator needs to act.
+//   title           — one operator-language sentence: what
+//                     happened + what to do. Never contains
+//                     technical tokens (no "codegen", no
+//                     "mm2mAndDeg2rad", no firmware bug numbers).
+//   detail          — one operator-language sentence with
+//                     specifics (step numbers, ids, next action).
+//                     Also technical-token-free.
+//   technicalDetail — the raw wire reason from the server
+//                     (firmware bug citations, sha hashes,
+//                     driver reject strings). Shown behind a
+//                     "Details" toggle and logged to console —
+//                     never in the default operator view.
+//
+// Rationale (2026-08-04): the prior mapping put full technical
+// content in the headline AND in detail. Callers concatenated
+// them into a single toast string, so identical phrases —
+// "known controller-crashing codegen", "Regenerate required",
+// "firmware bug #3" — appeared twice in the same toast. The
+// structured shape here plus the ToastContainer's
+// title/detail/details layout guarantees each string renders
+// exactly once, and the technical tokens stay demoted.
+//
+// `headline` and `code` are kept for backwards compat with any
+// call site that still reads them; new callers should prefer
+// `title` + `detail` + `technicalDetail`.
 
 export const LOAD_OUTCOME_KINDS = [
   'transport_down',
@@ -29,152 +45,209 @@ export const LOAD_OUTCOME_KINDS = [
   'arity_assertion_failed',
 ]
 
+// Tokens that must never appear in operator-facing strings
+// (title or detail). Enforced by the pinned tests. If you're
+// tempted to add one, put it in technicalDetail instead.
+export const BANNED_OPERATOR_TOKENS = [
+  'codegen',
+  'mm2mAndDeg2rad',
+  'v.size()',
+  'exitProcess',
+  'firmware bug',
+  'C2Control',
+  'sha256',
+  'HTTP 5', // vague transport codes are for technicalDetail
+]
+
+
 function _wireReason(body) {
-  // Driver-reject strings live in outcome.reason. Codegen/lint infra
-  // errors surface as top-level body.error. Best-effort — never throws.
   return (body && body.outcome && body.outcome.reason)
       || (body && body.error)
       || ''
 }
 
+
+// Short-name map: ProgramEditor labels these actions with
+// user-friendly words. In error copy the action verb goes in
+// parentheses after the step number so the operator can eyeball
+// which step to open.
+const _ACTION_LABEL = {
+  move_home:        'home',
+  move_linear:      'linear',
+  move_joint:       'joint',
+  move_to_position: 'position',
+  move_to_pallet:   'pallet',
+  pick:             'pick',
+  place:            'place',
+  detect:           'detect',
+  set_io:           'I/O',
+  wait:             'wait',
+  loop:             'loop',
+  open_gripper:     'open gripper',
+  close_gripper:    'close gripper',
+}
+
+
+function _formatStepList(findings, max = 5) {
+  const parts = (findings || []).slice(0, max).map((f) => {
+    const n = Number(f.step_idx ?? 0) + 1
+    const label = _ACTION_LABEL[f.action] || f.action || '?'
+    return `step ${n} (${label})`
+  })
+  const more = (findings || []).length - max
+  return parts.join(', ') + (more > 0 ? `, +${more} more` : '')
+}
+
+
+// Legacy adapter — pre-2026-08-04 callers destructured
+// { code, headline, detail } and joined them with " — ". Keep
+// `headline` populated (a concatenation of title + detail sans
+// duplication) so any un-migrated caller still shows the
+// operator-language copy without the technical tail.
+function _shape({ code, title, detail, technicalDetail = '' }) {
+  const headline = detail ? `${title} ${detail}` : title
+  return { code, title, detail, technicalDetail, headline }
+}
+
+
 export function namedLoadError(body, httpStatus) {
   const kind = (body && body.outcome && body.outcome.kind) || null
-  const detail = _wireReason(body)
+  const rawReason = _wireReason(body)
 
-  if (kind === 'transport_down' || /ws not connected/i.test(detail)) {
-    return {
+  if (kind === 'transport_down' || /ws not connected/i.test(rawReason)) {
+    return _shape({
       code:    'transport_down',
-      headline: 'Controller link down — program NOT loaded. The '
-              + 'controller kept the previous resident.',
-      detail,
-    }
+      title:   'Controller link is down — program not loaded.',
+      detail:  'The controller kept the previous program. '
+             + 'Wait for the driver to reconnect, then try again.',
+      technicalDetail: rawReason,
+    })
   }
-  if (kind === 'empty_program') {
-    // The backend attaches motion_counts for the operator.
-    const mc = body?.outcome?.motion_counts || {}
-    const total = Number(mc.total || 0)
-    const suffix = total > 0
-      ? ` (${total} step${total === 1 ? '' : 's'} checked, none produce robot motion)`
-      : ''
-    return {
-      code:    'empty_program',
-      headline: 'Cannot load — this program has no valid motion. '
-              + 'Teach positions first' + suffix + '.',
-      detail,
-    }
-  }
+
   if (kind === 'pending_poses') {
-    // Firmware bug #3 quarantine (2026-08-04). The controller
-    // asserts v.size()>=6 at mm2mAndDeg2rad and exits process on
-    // failure, so we refuse the push server-side. Named as
-    // "regenerate required" because the fix is authoring-time —
-    // the operator teaches the missing positions in the Program
-    // Editor and the next push passes the gate.
-    const count = Number(body?.outcome?.count || 0)
     const findings = body?.outcome?.findings || []
-    const preview = findings
-      .slice(0, 3)
-      .map((f) => `step ${Number(f.step_idx || 0) + 1} ${f.action || '?'}`)
-      .join(', ')
-    const more = findings.length > 3 ? '…' : ''
-    return {
+    const count = Number(body?.outcome?.count || findings.length || 0)
+    const list = _formatStepList(findings)
+    return _shape({
       code:    'pending_poses',
-      headline: 'Cannot load — known controller-crashing codegen. '
-              + `Regenerate required: ${count} motion step`
-              + `${count === 1 ? '' : 's'} have untaught positions`
-              + (preview ? ` (${preview}${more})` : '')
-              + '. Teach the missing positions in the Program '
-              + 'Editor before running.',
-      detail,
-    }
+      title:   'Teach positions first — this program has untaught positions.',
+      detail:  count > 0
+        ? `Untaught: ${list}. Open it in the Program Editor to teach them.`
+        : 'Open it in the Program Editor to teach the missing positions.',
+      technicalDetail: rawReason,
+    })
   }
+
   if (kind === 'arity_assertion_failed') {
-    return {
+    return _shape({
       code:    'arity_assertion_failed',
-      headline: 'Cannot load — codegen produced a mov* line whose '
-              + 'pose vector is not exactly 6 elements. Refusing '
-              + 'to push (firmware v2.3 asserts v.size()>=6 at '
-              + 'mm2mAndDeg2rad and exits process on failure).',
-      detail,
-    }
+      title:   "Program can't run — internal generation error. Report this.",
+      detail:  'The controller was not asked to run anything.',
+      technicalDetail: rawReason,
+    })
   }
+
+  if (kind === 'empty_program') {
+    return _shape({
+      code:    'empty_program',
+      title:   'Nothing to run — this program has no motion.',
+      detail:  'Add a move step (or teach positions on the existing '
+             + 'steps) in the Program Editor.',
+      technicalDetail: rawReason,
+    })
+  }
+
   if (kind === 'lint_failed') {
     const count = Number(body?.outcome?.count || 0)
     const first = body?.outcome?.findings?.[0] || {}
     const at = first.line ? ` at line ${first.line}` : ''
-    const verb = first.verb ? ` (verb ${first.verb})` : ''
-    return {
+    return _shape({
       code:    'lint_failed',
-      headline: `Cannot load — codegen produced ${count} invalid line`
-              + `${count === 1 ? '' : 's'}${at}${verb}.`,
-      detail,
-    }
+      title:   `Program can't run — ${count} invalid line`
+             + `${count === 1 ? '' : 's'}${at}.`,
+      detail:  'Open it in the Program Editor and re-save. '
+             + 'If the problem persists, report this.',
+      technicalDetail: rawReason,
+    })
   }
+
   if (kind === 'byte_verify_mismatch') {
-    const sent   = body?.outcome?.sent_sha   || '?'
-    const stored = body?.outcome?.stored_sha || '?'
-    return {
+    return _shape({
       code:    'byte_verify_mismatch',
-      headline: 'Cannot load — controller stored a program that '
-              + `differs from what codegen produced (sent ${sent}, `
-              + `stored ${stored}). Refusing to run stale bytes.`,
-      detail,
-    }
+      title:   'Controller stored a different program than we sent.',
+      detail:  'Try loading again. If it repeats, report this.',
+      technicalDetail: rawReason,
+    })
   }
+
   if (kind === 'byte_verify_get_failed') {
-    return {
+    return _shape({
       code:    'byte_verify_get_failed',
-      headline: 'Cannot load — could not fetch stored program back '
-              + 'from controller to verify the push. Try again.',
-      detail,
-    }
+      title:   "Couldn't read the program back from the controller.",
+      detail:  'Try again — probably a transient network hiccup.',
+      technicalDetail: rawReason,
+    })
   }
+
   if (kind === 'save_rejected') {
-    return {
+    return _shape({
       code:    'save_rejected',
-      headline: 'Controller refused the save. Program NOT loaded.',
-      detail,
-    }
+      title:   'Controller refused the save — program not loaded.',
+      detail:  'The controller kept the previous program. '
+             + 'Try again; if the refusal persists, report this.',
+      technicalDetail: rawReason,
+    })
   }
+
   if (kind === 'save_failed') {
-    return {
+    return _shape({
       code:    'save_failed',
-      headline: 'Save to controller did not complete cleanly. '
-              + 'Program NOT loaded.',
-      detail,
-    }
+      title:   "Save didn't complete — program not loaded.",
+      detail:  'Try again — probably a transient network hiccup. '
+             + 'If it persists, report this.',
+      technicalDetail: rawReason,
+    })
   }
+
   if (kind === 'id_not_controller_safe') {
-    return {
+    return _shape({
       code:    'id_not_controller_safe',
-      headline: 'Cannot load — this program id contains characters '
-              + 'the controller cannot round-trip. Rename first '
-              + '(letters + digits only).',
-      detail,
-    }
+      title:   "This program's name has characters the "
+             + "controller can't handle.",
+      detail:  'Rename the program using only letters and digits, '
+             + 'then try again.',
+      technicalDetail: rawReason,
+    })
   }
+
   if (kind === 'lint_infrastructure_error') {
-    return {
+    return _shape({
       code:    'lint_infrastructure_error',
-      headline: 'Cannot load — the pre-push lint could not run. '
-              + 'This is a dashboard bug; report it.',
-      detail,
-    }
+      title:   "Program couldn't be checked before push. Report this.",
+      detail:  'The controller was not asked to run anything.',
+      technicalDetail: rawReason,
+    })
   }
-  // codegen: raw 500 with error body.
-  if (httpStatus === 500 || /^codegen:/.test(detail)) {
-    return {
+
+  if (kind === 'codegen'
+      || httpStatus === 500
+      || /^codegen:/.test(rawReason)) {
+    return _shape({
       code:    'codegen',
-      headline: 'Cannot load — codegen failed. Program NOT loaded.',
-      detail,
-    }
+      title:   "Program can't be generated. Report this.",
+      detail:  'The controller was not asked to run anything.',
+      technicalDetail: rawReason,
+    })
   }
-  // Unknown shape. Preserve as much as possible so nothing is
-  // silently eaten.
-  return {
+
+  // Unknown kind: surface enough that nothing gets silently eaten,
+  // but keep the operator-language register — no HTTP codes leak
+  // into the toast; those live in technicalDetail so devtools can
+  // still see them.
+  return _shape({
     code:    'unknown',
-    headline: `Push refused (HTTP ${httpStatus || '?'}). Program NOT `
-            + 'loaded.',
-    detail:  detail || `HTTP ${httpStatus || '?'}`,
-  }
+    title:   'Program not loaded.',
+    detail:  'Try again. If it repeats, report this.',
+    technicalDetail: rawReason || `HTTP ${httpStatus || '?'}`,
+  })
 }

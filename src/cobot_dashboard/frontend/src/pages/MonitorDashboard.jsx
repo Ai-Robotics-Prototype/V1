@@ -815,9 +815,20 @@ export default function MonitorDashboard() {
     const result = await pushProgramToController(
       full.id, full.name || full.id)
     if (!result.ok) {
-      const { headline, detail } = result.named
-      addToast?.(detail ? `${headline} — ${detail}` : headline,
+      const { title, detail, technicalDetail } = result.named
+      // Structured toast (2026-08-04): title + detail render in the
+      // toast; technicalDetail lives behind the Details toggle and
+      // is also logged so devtools grep still surfaces the raw
+      // wire reason.
+      addToast?.({ title, detail, technicalDetail },
         'error', 10000)
+      if (technicalDetail) {
+        // eslint-disable-next-line no-console
+        console.warn('[load] refused', {
+          code: result.named.code, technicalDetail,
+          status: result.status, body: result.body,
+        })
+      }
       return
     }
     // Commit local state — the push succeeded, resident IS this
@@ -847,9 +858,16 @@ export default function MonitorDashboard() {
     const label = currentProgram?.name || id
     const result = await pushProgramToController(id, label)
     if (!result.ok) {
-      const { headline, detail } = result.named
-      addToast?.(detail ? `${headline} — ${detail}` : headline,
+      const { title, detail, technicalDetail } = result.named
+      addToast?.({ title, detail, technicalDetail },
         'error', 10000)
+      if (technicalDetail) {
+        // eslint-disable-next-line no-console
+        console.warn('[banner-push] refused', {
+          code: result.named.code, technicalDetail,
+          status: result.status, body: result.body,
+        })
+      }
       return
     }
     addToast?.(`Pushed "${label}" to controller`, 'success')

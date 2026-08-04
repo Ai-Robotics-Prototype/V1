@@ -1717,9 +1717,40 @@ const storeDefinition = (set, get) => ({
   // Toast notifications
   // ---------------------------------------------------------------------------
 
-  addToast(message, type = 'info', durationMs) {
+  addToast(msgOrObject, type = 'info', durationMs) {
     const id = Date.now() + Math.random()
-    const toast = { id, message, type, ts: Date.now() }
+    // Structured toast (2026-08-04): callers can pass an object
+    // `{title, detail, technicalDetail}` for operator-language
+    // headline + follow-up + hidden technical string. The prior
+    // API — a single `message` string — is preserved unchanged;
+    // legacy 2-arg callers keep working (title only). The
+    // renderer decides how to display each field.
+    //
+    // Duplication root cause (fixed 2026-08-04): pre-fix,
+    // callers concatenated headline+detail into one message
+    // string, and both often contained the same phrases
+    // (namedLoadError's pending_poses headline AND wire-reason
+    // both said "known controller-crashing codegen" +
+    // "Regenerate required" — so the operator saw it twice in
+    // one toast). Structured fields render each string exactly
+    // once, with no cross-field concatenation.
+    let toast
+    if (msgOrObject && typeof msgOrObject === 'object'
+        && !Array.isArray(msgOrObject)) {
+      const t = msgOrObject
+      toast = { id, type, ts: Date.now(),
+                title:  t.title  || t.message || '',
+                detail: t.detail || '',
+                technicalDetail: t.technicalDetail || '',
+                // Preserve `message` for legacy renderers that
+                // haven't been updated. Prefer title in the
+                // Toast component, fall back to message.
+                message: t.title || t.message || '' }
+    } else {
+      toast = { id, type, ts: Date.now(),
+                title: '', detail: '', technicalDetail: '',
+                message: msgOrObject }
+    }
     set((s) => ({ toasts: [...s.toasts, toast] }))
     // Duration override (2026-08-04): error-severity toasts for the
     // load path need to dwell long enough for the operator to read

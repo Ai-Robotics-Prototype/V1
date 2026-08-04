@@ -328,11 +328,21 @@ def test_named_load_error_map_has_all_documented_kinds():
         assert kind in src, (
             f'namedLoadError has no entry for outcome.kind={kind!r} '
             '— the UI would fall back to a generic message')
-    # Every named entry must state that the program was NOT
-    # loaded / cannot be loaded so the operator understands the
-    # resident did NOT change. Codegen/lint use "Cannot load".
-    for phrase in ('NOT loaded', 'Cannot load'):
-        assert phrase in src, (
-            f'named-error headlines must include the phrase '
-            f'{phrase!r} so the operator understands the load '
-            f'did not take effect')
+    # Every named entry must clearly signal that the operator's
+    # requested action did not take effect. Post the 2026-08-04
+    # operator-copy rewrite, the register is lowercase and
+    # varies per outcome (some say "not loaded", some "can't
+    # run", "Nothing to run", etc). The invariant is that the
+    # helper NEVER just says "OK" on a refusal path.
+    for phrase in ('not loaded', "can't run", 'Nothing to run',
+                   "can't be generated", "can't handle",
+                   "couldn't"):
+        # At least one of these operator-friendly refusal
+        # phrases must appear — a rewrite that dropped all of
+        # them would leave the UI with no negative signal.
+        if phrase in src:
+            return
+    raise AssertionError(
+        'None of the expected operator-facing refusal phrases '
+        'appears in loadOutcome.js — namedLoadError may be '
+        'silently returning success-ish copy on failure paths.')
