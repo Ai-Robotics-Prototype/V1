@@ -969,9 +969,20 @@ export default function MonitorDashboard() {
   //     that governs the other motion verbs — STOP works precisely when
   //     things are running or wedged. It is the only recovery affordance
   //     that must NEVER be unavailable while the arm is in motion.
+  // Run gating (2026-08-04): the Run button is now disabled when
+  // the controller link is down (robot.connected === false). Prior
+  // to this the operator could click Run, hit the confirm modal,
+  // and only THEN discover the push would be refused server-side
+  // with outcome.kind='transport_down'. Disabling up front matches
+  // the incremental-jog panel's existing behavior and cuts a wasted
+  // modal cycle out of the operator's flow. The DRIVER DISCONNECTED
+  // banner (JogControls) still communicates the reason.
+  const linkDown = robot?.connected === false
   const runDisabled    = safety?.estop || runState.kind === 'running'
                           || runState.kind === 'stopping'
                           || runState.kind === 'paused'
+                          || runState.kind === 'stale_link_down'
+                          || linkDown
   // Return Home: only disabled by estop. Gate/connection state is
   // surfaced by the confirm dialog so the operator can still ATTEMPT
   // (the driver will refuse with a specific reason if the gate is

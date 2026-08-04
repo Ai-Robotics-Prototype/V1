@@ -227,3 +227,76 @@ test('isStateStreamStale: exactly at threshold counts as stale', () => {
   const boundary = now - STATE_STREAM_STALE_MS
   assert.equal(isStateStreamStale(boundary, now), true)
 })
+
+
+// ── stale_link_down honesty (2026-08-04) ────────────────────────
+//
+// Firmware bug #3 fallout: the RUNNING pill used to lie
+// indefinitely when the driver WS to the controller dropped.
+// Pre-fix, /estun/mode stopped flowing, robot.program.state
+// stayed pinned at 2, and the dashboard→browser WS stayed
+// fresh — so isStateStreamStale returned false and the pill
+// stayed green. The stale_link_down kind is the correct
+// honesty response: preserve the last-known state as context
+// but amber out to make the loss of truth explicit.
+
+test('deriveRunState: state=2 + robot.connected=false → stale_link_down', () => {
+  const s = deriveRunState({
+    robot: { connected: false, enabled: true,
+             program: { state: 2, line: 47, task: 'main' } },
+  })
+  assert.equal(s.kind, 'stale_link_down')
+  assert.match(s.label, /RUNNING\? · LINK DOWN/)
+  assert.match(s.detail, /last known: running/)
+  assert.match(s.detail, /line 47/)
+})
+
+test('deriveRunState: state=3 + robot.connected=false → stale_link_down (STOPPING)', () => {
+  const s = deriveRunState({
+    robot: { connected: false, enabled: true,
+             program: { state: 3, line: 12 } },
+  })
+  assert.equal(s.kind, 'stale_link_down')
+  assert.match(s.label, /STOPPING\? · LINK DOWN/)
+  assert.match(s.detail, /last known: stopping/)
+})
+
+test('deriveRunState: state=2 + connected=true → running (link is up, pill honest)', () => {
+  const s = deriveRunState({
+    robot: { connected: true, enabled: true,
+             program: { state: 2, line: 5, task: 'main' } },
+  })
+  assert.equal(s.kind, 'running')
+  assert.equal(s.label, 'RUNNING')
+})
+
+test('deriveRunState: connected=undefined (older payload) is treated as up, not down', () => {
+  // Defensive: if the server hasn't populated robot.connected
+  // yet, we must NOT show LINK DOWN — that would false-alarm
+  // during the first WS frames of every page load.
+  const s = deriveRunState({
+    robot: { enabled: true, program: { state: 2 } },
+  })
+  assert.equal(s.kind, 'running')
+})
+
+test('deriveRunState: state=0 + connected=false → idle (not stale — no active state to preserve)', () => {
+  // Link-down with the controller idle is not a lie — the pill
+  // can honestly say IDLE even without a live feed. The stale
+  // branch only fires when the last-known state was active.
+  const s = deriveRunState({
+    robot: { connected: false, enabled: true,
+             program: { state: 0 } },
+  })
+  assert.equal(s.kind, 'idle')
+})
+
+test('deriveRunState: estop still beats stale_link_down', () => {
+  // Precedence check — E-STOP has to win over the stale branch
+  // so the operator sees the highest-severity fact.
+  const s = deriveRunState({
+    safety: { estop: true },
+    robot: { connected: false, program: { state: 2 } },
+  })
+  assert.equal(s.kind, 'estop')
+})

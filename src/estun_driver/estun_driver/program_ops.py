@@ -879,6 +879,230 @@ for _mov_verb in ('movJ', 'movL', 'movC',
     _KNOWN_BAD_PATTERNS.append((_mov_verb, _bad_mov_pose_vector_arity))
 
 
+# ── Full-surface argument validation (2026-08-04, post-D14) ──────
+#
+# Firmware bug #3 proved malformed Lua args kill C2Control. The
+# D14 mov* arity D-rule covers 9 mov* verbs. This block extends
+# coverage to every OTHER verb codegen currently emits:
+#     wait, setDO, setAO, setSpeedJ, setSpeedL, setAccL,
+#     setBlender, setNoBlender.
+# Each matcher checks type + range against the wire-verified
+# signature from luaenginelib.json. Any deviation is refused at
+# lint time so no bad Lua reaches the wire even under a codegen
+# regression that would otherwise silently emit garbage.
+#
+# The existing "unknown verb → refuse" positive-list gate lives
+# in lint_lua_source's `if name not in arity_map` branch (line
+# 946): any verb the running codegen emits but that is neither
+# in luaenginelib.json nor in _WIRE_PROVEN_UNDOCUMENTED is
+# already refused. This block adds STRICTER per-verb rules on
+# top of the arity check.
+
+_INT_RE = _re.compile(r'^-?\d+$')
+_FLOAT_RE = _re.compile(r'^-?\d+(?:\.\d+)?$')
+
+
+def _is_int_literal(s: str) -> bool:
+    return bool(_INT_RE.match(s.strip()))
+
+
+def _is_numeric_literal(s: str) -> bool:
+    return bool(_FLOAT_RE.match(s.strip()))
+
+
+def _bad_wait_arg(args):
+    """wait(ms) — the wire-proven pure-delay verb. Firmware v2.3
+    accepts a positive integer millisecond count; a bare `false`
+    or a non-integer literal is a REJECT class. See the
+    waitCondition-bare-literal matcher above for the sibling
+    firmware gap on the truthy-cond form."""
+    if len(args) != 1:
+        return None  # arity already caught by _parse_lib_arity
+    a = args[0].strip()
+    if not _is_int_literal(a):
+        # An expression (e.g. `_ms`) is OK — the check is only for
+        # emitted literal misuses. Codegen currently only emits
+        # integer literals; anything else is a regression.
+        # We DO refuse a bare non-integer LITERAL (float, string,
+        # boolean) to catch the codegen bug in advance.
+        if a in ('true', 'false', 'nil') or a.startswith(("'", '"')):
+            return (f'wait({a}) — first arg must be a positive '
+                    f'integer millisecond count; got {a!r}. '
+                    f'Firmware v2.3 rejects non-int wait payloads '
+                    f'with 10012-class arg parse failure.')
+        if _is_numeric_literal(a) and '.' in a:
+            return (f'wait({a}) — first arg must be an INTEGER '
+                    f'millisecond count; got float {a}. Sub-'
+                    f'millisecond precision is not supported on '
+                    f'v2.3 — codegen rounds to int before emit.')
+        return None
+    try:
+        ms = int(a)
+    except ValueError:
+        return None
+    if ms <= 0:
+        return (f'wait({ms}) — ms must be > 0; a wait(0) or '
+                f'wait(<0) is a codegen bug. Use wait(1) for a '
+                f'minimum tick or drop the verb entirely.')
+    return None
+
+
+_KNOWN_BAD_PATTERNS.append(('wait', _bad_wait_arg))
+
+
+def _bad_setDO_args(args):
+    """setDO(port, level) — port ∈ [1..24], level ∈ {0, 1}."""
+    if len(args) != 2:
+        return None
+    port_s, val_s = args[0].strip(), args[1].strip()
+    if _is_int_literal(port_s):
+        try:
+            port = int(port_s)
+        except ValueError:
+            port = None
+        if port is not None and not (1 <= port <= 24):
+            return (f'setDO({port},{val_s}) — port {port} outside '
+                    f'wire-proven range [1..24]. v2.3 IOManager '
+                    f'rejects out-of-range ports with a 10012.')
+    if _is_int_literal(val_s):
+        v = int(val_s)
+        if v not in (0, 1):
+            return (f'setDO({port_s},{v}) — DO level must be 0 or '
+                    f'1; got {v}. Analog output writes go through '
+                    f'setAO, not setDO.')
+    return None
+
+
+_KNOWN_BAD_PATTERNS.append(('setDO', _bad_setDO_args))
+
+
+def _bad_setAO_args(args):
+    """setAO(port, value). Ports 1..8; value is a numeric
+    percentage 0..100 (or 0..1000 depending on config). Codegen
+    only emits float; this matcher refuses obvious nonsense
+    (negative, huge)."""
+    if len(args) != 2:
+        return None
+    port_s, val_s = args[0].strip(), args[1].strip()
+    if _is_int_literal(port_s):
+        p = int(port_s)
+        if not (1 <= p <= 8):
+            return (f'setAO({p},{val_s}) — port {p} outside wire-'
+                    f'proven range [1..8].')
+    if _is_numeric_literal(val_s):
+        v = float(val_s)
+        if v < 0 or v > 10000:
+            return (f'setAO({port_s},{v}) — value {v} is outside a '
+                    f'sane range for an analog output; a negative '
+                    f'or extreme value is a codegen bug.')
+    return None
+
+
+_KNOWN_BAD_PATTERNS.append(('setAO', _bad_setAO_args))
+
+
+def _bad_setSpeedJ_arg(args):
+    """setSpeedJ(deg_per_s). Wire-proven range: (0..150] on the
+    S10-140; codegen caps at min(requested, operator_cap). A
+    zero or negative value is a codegen regression."""
+    if len(args) != 1:
+        return None
+    a = args[0].strip()
+    if not _is_numeric_literal(a):
+        return None
+    v = float(a)
+    if v <= 0:
+        return (f'setSpeedJ({v}) — joint cruise speed must be > 0. '
+                f'A zero-speed movJ hangs the interpreter — '
+                f'codegen bug.')
+    if v > 200:
+        return (f'setSpeedJ({v}) — value exceeds wire-proven ceiling '
+                f'(150 deg/s on S10-140). Firmware clamps silently, '
+                f'masking a codegen scaling bug — refuse instead.')
+    return None
+
+
+_KNOWN_BAD_PATTERNS.append(('setSpeedJ', _bad_setSpeedJ_arg))
+
+
+def _bad_setSpeedL_arg(args):
+    """setSpeedL(mm_per_s). Positive-only. Codegen caps at
+    min(requested, operator_cap). Zero would hang; negative is
+    a codegen regression."""
+    if len(args) != 1:
+        return None
+    a = args[0].strip()
+    if not _is_numeric_literal(a):
+        return None
+    v = float(a)
+    if v <= 0:
+        return (f'setSpeedL({v}) — linear cruise speed must be > 0. '
+                f'A zero-speed movL hangs the interpreter — '
+                f'codegen bug.')
+    if v > 3000:
+        return (f'setSpeedL({v}) — value exceeds wire-proven ceiling '
+                f'(1500 mm/s canonical, 3000 hard cap). Firmware '
+                f'clamps silently; refuse instead.')
+    return None
+
+
+_KNOWN_BAD_PATTERNS.append(('setSpeedL', _bad_setSpeedL_arg))
+
+
+def _bad_setAccL_arg(args):
+    """setAccL(mm_per_s2). Positive-only; codegen never emits
+    zero."""
+    if len(args) != 1:
+        return None
+    a = args[0].strip()
+    if not _is_numeric_literal(a):
+        return None
+    v = float(a)
+    if v <= 0:
+        return (f'setAccL({v}) — linear accel must be > 0. A zero-'
+                f'accel movL hangs the interpreter — codegen bug.')
+    return None
+
+
+_KNOWN_BAD_PATTERNS.append(('setAccL', _bad_setAccL_arg))
+
+
+# ── D15 (2026-08-04) — zero-length-blend refusal, firmware bug #1
+#
+# Firmware bug #1, Part C evidence (2026-07-22 real-hardware
+# incident): setBlender(0) tickled the blend planner in ways the
+# controller couldn't recover from; a `setBlender` with radius 0
+# is a codegen bug (should have emitted setNoBlender() instead).
+# The zero-length-movL guard in codegen (last_move_joints
+# comparison at 2960 / 3939 / 4004) is the upstream defense; this
+# lint gate is the last-mile catch for a regression that would
+# otherwise emit setBlender(0) into the wire.
+
+def _bad_setBlender_arg(args):
+    if len(args) != 1:
+        return None
+    a = args[0].strip()
+    if not _is_numeric_literal(a):
+        return None
+    v = float(a)
+    if v == 0:
+        return ('D15 zero-length-blend — setBlender(0) is a codegen '
+                'bug (should have emitted setNoBlender() to drop '
+                'blending, not a zero-radius blend). Firmware bug '
+                '#1 (Part C, 2026-07-22): a zero-radius blend or a '
+                'zero-length movL tickles the blend planner into a '
+                'state the controller cannot recover from on real '
+                'hardware. Refusing.')
+    if v < 0:
+        return (f'setBlender({v}) — blend radius must be positive '
+                f'when present; a negative value is meaningless '
+                f'and rejected by the interpreter.')
+    return None
+
+
+_KNOWN_BAD_PATTERNS.append(('setBlender', _bad_setBlender_arg))
+
+
 # ── Pending-pose gate (D14 companion, 2026-08-04) ─────────────────
 #
 # The other half of firmware bug #3: derived-from steps that emit
@@ -1085,22 +1309,33 @@ def lint_lua_source(source: str, lib: dict = None) -> list:
                                        f'{lib[name].get("lua","<?>")!r}'),
                             'source_line': raw_line.rstrip(),
                         })
-                # Signature-vs-runtime gap checks: verbs that pass
-                # arity but that the firmware rejects for specific
-                # arg shapes (2026-07-30 08:40 discovery — see
-                # _bad_waitCondition_bare_literal_cond). These are
-                # bench-recorded gaps between what luaenginelib.json
-                # says is legal and what v2.3 actually accepts.
-                for _kbverb, _kbfn in _KNOWN_BAD_PATTERNS:
-                    if _kbverb != name:
-                        continue
-                    _reason = _kbfn(arg_slots)
-                    if _reason:
-                        findings.append({
-                            'line': lineno, 'verb': name, 'args': argc,
-                            'reason': _reason,
-                            'source_line': raw_line.rstrip(),
-                        })
+            # Signature-vs-runtime gap checks: verbs that pass arity
+            # (or that failed catalogue lookup) but whose SPECIFIC
+            # arg shapes the firmware rejects. These run UNCONDITIONALLY
+            # so:
+            #   * a wire-proven-undocumented verb (e.g. `wait`) still
+            #     gets its type/range check applied (moved outside the
+            #     else branch 2026-08-04);
+            #   * an unknown-catalogue verb (e.g. `setBlender` under
+            #     wire_verified_blender=False) still surfaces its
+            #     D15 zero-length-blend / negative-radius finding in
+            #     ADDITION to the "unknown verb" finding, so the
+            #     operator sees the SPECIFIC hazard, not just the
+            #     generic catalogue miss.
+            # Original discovery: _bad_waitCondition_bare_literal_cond
+            # (2026-07-30 08:40); post-D14 hardening added wait /
+            # setDO / setAO / setSpeedJ / setSpeedL / setAccL /
+            # setBlender matchers here (2026-08-04).
+            for _kbverb, _kbfn in _KNOWN_BAD_PATTERNS:
+                if _kbverb != name:
+                    continue
+                _reason = _kbfn(arg_slots)
+                if _reason:
+                    findings.append({
+                        'line': lineno, 'verb': name, 'args': argc,
+                        'reason': _reason,
+                        'source_line': raw_line.rstrip(),
+                    })
             # Continue scanning INSIDE this call's body for nested
             # calls (e.g., waitCondition(getDI(1)==1, 500) — the
             # getDI(1) inside needs its own validation). Restart the
@@ -4280,29 +4515,50 @@ def codegen_lua_from_program(
     # projectlua_projectluademo/lua/taskluademo.lua as ground truth).
     source = '\r\n'.join(exec_lines + footer_lines) + '\r\n'
 
-    # D14 codegen post-emit assertion (2026-08-04). The lint gate
-    # in /api/estun/program/run runs against the SAME source and
-    # will refuse the push — that's the operator-facing gate — but
-    # any programmatic caller of codegen_lua_from_program that
-    # skips the dashboard flow (integration tests, offline
-    # regeneration scripts, bench tools) would otherwise happily
-    # return a controller-crashing string. Raising here makes the
-    # assertion a language-level invariant: this function CANNOT
-    # produce Lua whose mov* emissions have <6-element pose
-    # vectors. If a future codegen edit regresses that promise the
-    # exception traces the exact line that emitted the bad vector.
-    _arity_findings = [
+    # Codegen post-emit assertion (2026-08-04). The lint gate in
+    # /api/estun/program/run runs against the SAME source and will
+    # refuse the push — that's the operator-facing gate — but any
+    # programmatic caller of codegen_lua_from_program that skips
+    # the dashboard flow (integration tests, offline regeneration
+    # scripts, bench tools) would otherwise happily return a
+    # controller-crashing string. Raising here makes the assertion
+    # a language-level invariant: this function CANNOT produce Lua
+    # whose mov* emissions have <6-element pose vectors OR whose
+    # non-mov verbs violate their per-verb type/range rules. If a
+    # future codegen edit regresses any of these the exception
+    # traces the exact line that emitted the bad call.
+    #
+    # D14 (mov* arity) covers the 9 mov* verbs. Post-D14 extension
+    # covers wait / setDO / setAO / setSpeedJ / setSpeedL / setAccL
+    # / setBlender / setNoBlender / waitCondition per their
+    # matchers in _KNOWN_BAD_PATTERNS. Findings from ANY matcher
+    # raise here.
+    _post_findings = [
         f for f in (lint_lua_source(source) or [])
         if isinstance(f.get('reason'), str)
-        and f['reason'].startswith('D14 arity')
+        and (f['reason'].startswith('D14 arity')
+             or f['reason'].startswith('D15 zero-length-blend')
+             # Per-verb type/range findings — the matchers all
+             # start with the verb name; the arity-mismatch class
+             # from _parse_lib_arity is prefixed 'arity mismatch'.
+             # We include arity-mismatch too so a truly malformed
+             # call (wrong argc) also raises post-emit.
+             or f['reason'].startswith('arity mismatch')
+             or f['reason'].startswith('wait(')
+             or f['reason'].startswith('setDO(')
+             or f['reason'].startswith('setAO(')
+             or f['reason'].startswith('setSpeedJ(')
+             or f['reason'].startswith('setSpeedL(')
+             or f['reason'].startswith('setAccL(')
+             or f['reason'].startswith('setBlender('))
     ]
-    if _arity_findings:
-        head = _arity_findings[0]
+    if _post_findings:
+        head = _post_findings[0]
         raise AssertionError(
-            f'D14 arity post-emit assertion — codegen produced '
-            f'{len(_arity_findings)} mov* line(s) with <6-element '
-            f'pose vectors. First at line {head.get("line")}, verb '
-            f'{head.get("verb")!r}: {head.get("reason")}'
+            f'codegen post-emit assertion — {len(_post_findings)} '
+            f'invalid emission(s). First at line '
+            f'{head.get("line")}, verb {head.get("verb")!r}: '
+            f'{head.get("reason")}'
         )
 
     # Varspoint arity — every uploaded joint pose must have exactly

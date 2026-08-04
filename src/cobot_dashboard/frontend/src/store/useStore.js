@@ -846,10 +846,31 @@ const storeDefinition = (set, get) => ({
     return get()._dispatchProgram('pause')
   },
   async resumeProgram() {
-    try { await fetch('/api/estun/program/run', { method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ program_id: get().currentProgram?.id }) }) }
-    catch (_) { /* fall through to sim */ }
+    // Ladder-verb resume (2026-08-04). Prior to this fix,
+    // resumeProgram called /api/estun/program/run WITHOUT
+    // push_only — which is the FULL run path: codegen + save +
+    // byte-verify + to_auto + run publish. That restarts the
+    // program from step 1, NOT continues from the paused line.
+    // A pause at step 47 in a 100-step program came back at 1;
+    // operators reading the "Resume" button label expected
+    // continuation and got a re-run instead. The dedicated
+    // /api/estun/program/resume endpoint publishes the
+    // project/resume ladder verb (SOURCE-ONLY, mirror of pause)
+    // — the correct semantic action.
+    try {
+      const res = await fetch('/api/estun/program/resume',
+        { method: 'POST' })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        get().addToast?.(
+          `Resume failed: ${(err && err.error) || `HTTP ${res.status}`}`,
+          'error', 8000)
+      }
+    } catch (e) {
+      get().addToast?.(
+        `Resume failed — network error: ${String(e?.message || e)}`,
+        'error', 8000)
+    }
     return get()._dispatchProgram('resume')
   },
   // Return Home — dispatches through /api/robot/home, the wire-

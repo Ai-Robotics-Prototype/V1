@@ -50,6 +50,34 @@ export function deriveRunState({ robot, task, safety } = {}) {
   const prog = robot.program || {}
   const line = prog.line
   const taskName = prog.task
+
+  // Stale-link honesty (2026-08-04). If the driver's WS to the
+  // controller has dropped (robot.connected === false) but the
+  // last-known program.state was 2 or 3, we CANNOT know if the
+  // arm is still running / stopping — the /estun/mode feed that
+  // updated program.state is dark. Prior to this branch the pill
+  // stayed green "RUNNING" indefinitely: the freshness gate was
+  // wired to dashboard→browser WS silence, and the dashboard→
+  // browser stream stays fresh even when the underlying
+  // controller state is stale. Ambering out here IS the honesty
+  // fix: the last-known state is preserved in the detail line
+  // so the operator sees where the controller was when the link
+  // dropped, but the label + amber color make the loss of truth
+  // explicit. Do not treat this as a wedge (the STOP button
+  // still works) — a genuine wedge fires the STOPPING branch
+  // when connectivity returns.
+  if (robot.connected === false && (prog.state === 2 || prog.state === 3)) {
+    const last = prog.state === 3 ? 'STOPPING' : 'RUNNING'
+    const lineTag = line != null ? `line ${line}` : ''
+    return { kind: 'stale_link_down',
+             label: `${last}? · LINK DOWN`,
+             color: '#B45309', bg: '#FEF3C7', border: '#B45309',
+             pulse: false,
+             detail: `last known: ${last.toLowerCase()}`
+                   + (lineTag ? ` · ${lineTag}` : '')
+                   + '. Controller feed dark — actual state unknown.' }
+  }
+
   if (prog.state === 3) {
     return { kind: 'stopping', label: 'STOPPING', color: '#B45309',
              bg: '#FEF3C7', border: '#B45309', pulse: true,

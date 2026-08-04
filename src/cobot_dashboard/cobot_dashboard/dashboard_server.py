@@ -5961,6 +5961,24 @@ if FASTAPI_AVAILABLE:
         _ros_node._estun_publish_op("pause")
         return {"ok": True, "source_only": True}
 
+    @app.post("/api/estun/program/resume")
+    async def api_estun_program_resume():
+        """Ladder-verb resume — publishes op:resume to /estun/program.
+        The driver's _op_resume then sends project/resume on the
+        WS (SOURCE-ONLY, same posture as pause).
+
+        Motivation (2026-08-04): the frontend's resumeProgram()
+        was calling /api/estun/program/run — which does codegen +
+        save + byte-verify + full run publish. That's re-run from
+        step 1, NOT resume from the paused line. A pause at line
+        47 in a 100-step program came back at line 1. This
+        endpoint mirrors pause and gives the frontend a real
+        ladder-verb call site."""
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        _ros_node._estun_publish_op("resume")
+        return {"ok": True, "source_only": True}
+
     @app.post("/api/estun/program/clear_error")
     async def api_estun_program_clear_error():
         if _ros_node is None:
