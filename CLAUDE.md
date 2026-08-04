@@ -38,6 +38,21 @@ These are HARD rules. They override the softer defaults elsewhere.
    `tests/doctrine/` pin, name the operator's approval in the
    commit message.
 
+7. **Fork Registry is authoritative (§465 fork-1 lesson,
+   2026-08-04).** Before implementing any shared capability, grep
+   `tools/fork_registry.yaml`. If the capability exists, route
+   through the canonical owner listed there — do not write a
+   second implementation. Any NEW shared capability lands in the
+   SAME commit as a registry entry (`id`, `canonical`, at least
+   one `forbidden` block). A fix that adds a second
+   implementation of a registered capability is a defect
+   regardless of tests passing. The pre-commit hook + the
+   auto-deploy `phase="lint_failed"` gate refuse forks
+   automatically — `--no-verify` bypasses the local hook but the
+   deploy still blocks. When a duplicate is truly load-bearing,
+   file it as `known_debt` under the capability with a `why:`
+   and an `owner:` — never silent-suppress.
+
 ## LiDAR object identification
 
 The `lidar_object_identifier` package consumes `/lidar/points_filtered`

@@ -114,6 +114,32 @@ if [[ -f "$FRONTEND_OUT/index.html" ]]; then
                        "$FRONTEND_OUT/index.html" | head -1)
 fi
 
+# ── Fork Registry gate (§465 fork-1 lesson, 2026-08-04) ─────────
+# Runs FIRST, UNCONDITIONALLY — before the FRONTEND_NEEDS_BUILD gate
+# — because a fork regression is a defect regardless of the other
+# tests passing, and it can appear in a backend-only commit that
+# would otherwise skip the frontend build path entirely.
+#
+# Registry lives at tools/fork_registry.yaml; the linter is
+# tools/fork_lint.py. On any registered-fork hit, the linter
+# emits a `phase: "lint_failed"` JSONL entry to
+# /opt/cobot/deploy_log.jsonl (via --deploy-phase) BEFORE this
+# script exits — so the deploy log shows a NAMED refusal, not
+# a silent generic fail.
+step "fork_lint (registry gate — tools/fork_registry.yaml)"
+_CURRENT_SHA=$(git -C "$WS" rev-parse HEAD 2>/dev/null || echo unknown)
+if ! python3 "$WS/tools/fork_lint.py" --deploy-phase "$_CURRENT_SHA"; then
+    fail "fork_lint reported forbidden implementations — refusing to build."
+    printf "${RED}════════  DEPLOY: FAIL (lint_failed)  ════════${RST}\n"
+    printf "  A capability registered in tools/fork_registry.yaml has\n"
+    printf "  been duplicated in a forbidden path. Either route the new\n"
+    printf "  code through the canonical owner, or (if the debt is\n"
+    printf "  legitimate) add a known_debt entry with an owner in the\n"
+    printf "  registry — silent suppression is refused.\n"
+    exit 1
+fi
+pass "fork_lint clean (no forbidden-path duplicates)"
+
 if [[ $FRONTEND_NEEDS_BUILD -eq 1 ]]; then
     # Program Doctrine — the operator's standing rules. See
     # docs/PROGRAM_DOCTRINE.md. This gate runs BEFORE lint + build

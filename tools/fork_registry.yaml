@@ -1,0 +1,385 @@
+# tools/fork_registry.yaml — canonical-owner registry (§465 fork-1 lesson,
+# 2026-08-04).
+#
+# ONE FILE, MACHINE-READABLE. Every capability in this workspace that must
+# have exactly one implementation is listed here with:
+#   * `canonical`   — the module/file/route that owns the implementation
+#   * `forbidden`   — where duplicates are refused, by path glob + pattern
+#   * `known_debt`  — historically-tolerated duplicate sites, ticketed and
+#                     owned
+#
+# The registry-driven linter (`tools/fork_lint.py`) reads this file. Its
+# invariants:
+#
+#   (a) Every `canonical` block resolves to real code on disk (test:
+#       `test_fork_registry_resolves.py`).
+#   (b) Every `forbidden` entry whose patterns fire against a matching
+#       forbidden path — outside `known_debt` — is a lint failure.
+#   (c) A `heuristic_sweep` block scans frontend files for numeric math
+#       on domain identifiers even when no exact pattern matches; these
+#       are review-required warnings, not gate failures — but every
+#       heuristic hit either becomes a registry entry (with a real
+#       pattern) OR gets tagged as known_debt with an owner.
+#
+# When adding a new shared capability: put an entry HERE in the same
+# commit that lands the implementation. When killing a fork: move its
+# `known_debt` entry to fully-registered status. Do not silently
+# suppress a hit — either fix the code, register the pattern, or debt
+# the site with a name attached.
+
+# ── Path abbreviations used below ────────────────────────────────────
+# FE  = src/cobot_dashboard/frontend/src
+# BE  = src/cobot_dashboard/cobot_dashboard
+# DRV = src/estun_driver/estun_driver
+# PBD = src/programming_by_demonstration/programming_by_demonstration
+
+# ── Registered capabilities ─────────────────────────────────────────
+
+capabilities:
+
+  # 1. Pallet-frame geometry (§465 fork-1 kill, 3ae0760).
+  - id: pallet_frame_geometry
+    description: >
+      Frame math for the 3-corner pallet teach — row/col vectors,
+      plane normal, tilt, coincident-corner and near-parallel
+      validation. Backend-only via POST /api/pallet/validate_frame.
+    canonical:
+      python:
+        module: programming_by_demonstration.pallet_geometry
+        functions: [compute_frame, validate_frame, measured_pitches]
+      route:
+        method: POST
+        path: /api/pallet/validate_frame
+      javascript:
+        module: src/cobot_dashboard/frontend/src/lib/palletFrameValidator.js
+        exports: [validatePalletFrameServer, findingsBlockingThisRecord]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        context_sentinel: 'corner[123]_tcp|corner_a_tcp|point_[bc]_tcp|part_tcp'
+        patterns:
+          - 'plane_normal'
+          - 'Math\.acos\s*\(.*dot'
+          - 'Math\.abs\s*\(\s*row\s*\[\s*2\s*\]\s*\)\s*/\s*rowLen'
+          - 'Math\.abs\s*\(\s*col\s*\[\s*2\s*\]\s*\)\s*/\s*colLen'
+          # Any `function validatePalletFrame` in a JS/JSX file
+          # outside the async client is the fork returning.
+          - 'function\s+validatePalletFrame\s*\('
+          - 'export\s+function\s+validatePalletFrame\s*\('
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/palletFrameValidator.js
+          - src/cobot_dashboard/frontend/src/lib/palletFrameValidator.test.js
+          - '**/*.test.js'
+          - '**/*.pinned.test.js'
+    known_debt: []
+
+  # 2. Motion-verb classification (D14 backing invariant).
+  - id: motion_verb_catalogue
+    description: >
+      Which Lua verbs count as motion — the empty-motion gate and the
+      arg-arity linter both key on this set. Sourced from the 168-verb
+      luaenginelib.json catalogue; any hard-coded list of mov* verbs
+      elsewhere is a fork.
+    canonical:
+      python:
+        module: estun_driver.program_ops
+        functions: [motion_verbs, has_valid_motion]
+      file:
+        path: src/estun_driver/estun_driver/luaenginelib.json
+        note: 168-verb authoritative catalogue mined from factory UI bundle
+    forbidden:
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          # A hand-written {movJ, movL, movC, ...} literal in the
+          # dashboard is a fork of has_valid_motion / motion_verbs.
+          - "\\{['\"]mov[JLCW]"
+        path_exempt: []
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Frontend has no business classifying motion verbs
+          # against the catalogue — that belongs to the lint gate.
+          - "\\['movJ',\\s*'movL'"
+    known_debt: []
+
+  # 3. Program-selection state (rollback fix, 83f9472).
+  - id: program_selection_write
+    description: >
+      Which endpoint writes STATE.robot.program.resident_program_id.
+      Only /api/estun/program/run (with push_only:true for a load).
+      /api/program/run action:'load' is retired 410.
+    canonical:
+      python:
+        module: cobot_dashboard.dashboard_server
+        functions: [api_estun_program_run]
+      route:
+        method: POST
+        path: /api/estun/program/run
+      javascript:
+        module: src/cobot_dashboard/frontend/src/pages/MonitorDashboard.jsx
+        exports: [pushProgramToController]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Legacy action:'load' — retired.
+          - "action:\\s*['\"]load['\"]"
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          # Only ONE line in the server writes resident_program_id.
+          # Any second write site is a fork. This pattern flags an
+          # ASSIGNMENT — reads (`... = STATE.get(...)['program']`)
+          # don't match.
+          - 'resident_program_id["\\]\\s*=\\s*[a-zA-Z_]'
+        path_exempt:
+          - src/cobot_dashboard/cobot_dashboard/dashboard_server.py
+    known_debt: []
+
+  # 4. Load-outcome operator copy (267108a rewrite).
+  - id: load_outcome_operator_copy
+    description: >
+      Named operator-language messages for /api/estun/program/run
+      refusals (pending_poses, transport_down, arity_assertion_failed,
+      etc). One helper, one BANNED_OPERATOR_TOKENS list.
+    canonical:
+      javascript:
+        module: src/cobot_dashboard/frontend/src/lib/loadOutcome.js
+        exports: [namedLoadError, LOAD_OUTCOME_KINDS,
+                  BANNED_OPERATOR_TOKENS]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # A parallel switch on outcome.kind in another file is a fork.
+          - 'switch\s*\(\s*[a-zA-Z_.?]*outcome\.kind'
+          - 'if\s*\(\s*[a-zA-Z_.?]*kind\s*===\s*[''"]pending_poses'
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/loadOutcome.js
+          - src/cobot_dashboard/frontend/src/lib/loadOutcome.test.js
+          - '**/*.test.js'
+    known_debt: []
+
+  # 5. Toast rendering + structured content (267108a).
+  - id: toast_rendering
+    description: >
+      Structured toast API {title, detail, technicalDetail} and its
+      single render surface. Callers pass structured objects; the
+      ToastContainer renders each field exactly once with technical
+      detail behind a Details toggle.
+    canonical:
+      javascript:
+        module: src/cobot_dashboard/frontend/src/components/ToastContainer.jsx
+        exports: [Toast, ToastContainer]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Manual concatenation of headline+detail into a single
+          # toast string was the pre-267108a duplication class.
+          - "addToast\\?\\.\\(\\s*`\\$\\{[a-zA-Z_.]+\\}\\s*—\\s*\\$\\{[a-zA-Z_.]+\\}`"
+          - "addToast\\(\\s*`\\$\\{[a-zA-Z_.]+\\}\\s*—\\s*\\$\\{[a-zA-Z_.]+\\}`"
+        path_exempt: []
+    known_debt: []
+
+  # 6. Run-state derivation (deriveRunState).
+  - id: run_state_derivation
+    description: >
+      Single deriveRunState() maps {safety, robot, task} to the pill
+      kind + label. stale_link_down + all other kinds live there.
+    canonical:
+      javascript:
+        module: src/cobot_dashboard/frontend/src/lib/runState.js
+        exports: [deriveRunState, isStopButtonEnabled, isStuckStopping,
+                  isStateStreamStale]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Parallel state-kind classification is a fork.
+          - "kind:\\s*['\"](running|stopping|estop|alarm|stale_link_down)['\"]"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/runState.js
+          - src/cobot_dashboard/frontend/src/lib/runState.test.js
+          - '**/*.test.js'
+    known_debt: []
+
+  # 7. Load-must-push contract (a17da6c + 83f9472).
+  - id: load_must_push
+    description: >
+      Program Library click posts /api/estun/program/run push_only=true.
+      No frontend caller may post action:'load' anywhere.
+    canonical:
+      javascript:
+        module: src/cobot_dashboard/frontend/src/pages/MonitorDashboard.jsx
+        exports: [onSelectProgram, pushProgramToController]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          - "action:\\s*['\"]load['\"]"
+        path_exempt: []
+    known_debt: []
+
+  # 8. Pending-pose gate (D14, 60790e8).
+  - id: pending_pose_gate
+    description: >
+      Motion steps with unresolved poses never reach codegen.
+      check_program_pending_poses is the ONE resolver.
+    canonical:
+      python:
+        module: estun_driver.program_ops
+        functions: [check_program_pending_poses]
+    forbidden:
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          # A parallel scan of steps checking taught + taught_joints
+          # + derived_from without going through the shared resolver
+          # is a fork.
+          - "taught_joints[\"\\]].{0,20}?len.{0,10}?==\\s*6.{0,80}?derived_from"
+        path_exempt:
+          - src/cobot_dashboard/cobot_dashboard/dashboard_server.py
+    known_debt: []
+
+  # 9. Mov* pose-vector arity (D14, D15).
+  - id: mov_arity_gate
+    description: >
+      Every mov* verb emitted MUST carry a 6-element pose vector.
+      D14/D15 matchers in program_ops.py's _KNOWN_BAD_PATTERNS.
+    canonical:
+      python:
+        module: estun_driver.program_ops
+        functions: [lint_lua_source, _bad_mov_pose_vector_arity,
+                    _bad_setBlender_arg]
+    forbidden:
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          # A parallel numeric-token count on a mov* emission would
+          # be a fork.
+          - "movJCoorRel.{0,80}?count.{0,20}?==\\s*6"
+        path_exempt: []
+    known_debt: []
+
+  # 10. Codegen line-map (D9).
+  - id: codegen_line_map
+    description: >
+      Line-map JSON is emitted from codegen_lua_from_program and
+      sidecar-refreshed on push. One authoritative producer.
+    canonical:
+      python:
+        module: estun_driver.program_ops
+        functions: [codegen_lua_from_program]
+      file:
+        path: /opt/cobot/programs/*.line_map.json
+        note: sidecar written by dashboard_server._compute_and_save_line_map
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Frontend computes line-map → step-index via useLineMap,
+          # not by re-parsing Lua text. Frame-parsing Lua on the
+          # client would be a fork of codegen's own map. Grouped
+          # alternation so `movJ(name)` in a toast doesn't false-
+          # positive — the fork signature is a mov* MATCH followed
+          # by line-number extraction.
+          - "(?:movJ|movL)\\s*\\([^)]*\\)[^\\n]{0,120}line[Nn]umber"
+    known_debt: []
+
+  # 11. Pallet frame status (taught-state).
+  - id: pallet_frame_status
+    description: >
+      One resolver — palletFrameStatus in programTruth.js — for the
+      corner1/corner2/corner3/part booleans + migratedFromV1 flag.
+      Editor, wizard, findings, teaching-debt all read this.
+    canonical:
+      javascript:
+        module: src/cobot_dashboard/frontend/src/lib/programTruth.js
+        exports: [palletFrameStatus, firstUntaughtPalletRole,
+                  PALLET_ROLE_ORDER]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Any parallel taught-booleans derivation from
+          # place.corner*_tcp checks is a fork.
+          - "corner1_tcp\\s*&&\\s*[a-zA-Z_.]*corner2_tcp\\s*&&\\s*[a-zA-Z_.]*corner3_tcp"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/programTruth.js
+          - '**/*.test.js'
+    known_debt: []
+
+  # 12. Estun sign inversion (URDF axes).
+  - id: estun_axis_sign_inversion
+    description: >
+      J3 and J5 URDF axes are intentionally sign-inverted vs CAD
+      (documented under [[cobot-estun-driver-twin]]). All axis
+      sign changes must happen exactly once, inside the driver's
+      forward/inverse conversion helpers — do not re-flip
+      downstream.
+    canonical:
+      python:
+        module: estun_driver.estun_driver_node
+        functions: []
+        note: sign inversion lives in _rad_from_deg/_deg_from_rad-adjacent helpers; grep _URDF_SIGN before adding a new caller
+    forbidden:
+      - path_glob: src/estun_driver/estun_driver/**/*.py
+        patterns:
+          # Any bare `joints[2] = -joints[2]` or `joints[4] = -joints[4]`
+          # outside the canonical helper is a fork.
+          - "joints\\s*\\[\\s*[24]\\s*\\]\\s*=\\s*-\\s*joints\\s*\\[\\s*[24]\\s*\\]"
+        path_exempt:
+          - src/estun_driver/estun_driver/estun_driver_node.py
+    known_debt: []
+
+
+# ── Heuristic sweep ─────────────────────────────────────────────────
+#
+# For domain math the registry hasn't listed explicitly. Runs on every
+# frontend JS/JSX file. Any hit surfaces as a WARNING (review-required)
+# — not a gate failure — because the false-positive rate is real
+# (general geometry in orient.js / IKGizmo.jsx is legitimate). The
+# reviewer either:
+#
+#   * adds a real registry entry (patterns tuned, path_exempt filled),
+#   * or moves the site to known_debt with an owner and reason.
+#
+# Never leave a heuristic hit unresolved for more than one commit —
+# the whole point is to force a decision.
+
+heuristic_sweep:
+  frontend_numeric_math_on_domain_objects:
+    description: >
+      Frontend code doing vector/pose math on domain identifiers
+      (corner_tcp, taught_joints, jp, cp, tcp, joint_positions,
+      part_tcp) is suspicious. Backend owns these numerics.
+    path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+    # A file matches if it references at least one domain identifier
+    # AND at least one math primitive from the list below.
+    domain_identifiers:
+      - 'corner[123]_tcp'
+      - 'corner_a_tcp'
+      - 'point_[bc]_tcp'
+      - 'part_tcp'
+      - 'taught_joints'
+      - 'taught_tcp'
+      - "'jp'|\"jp\""
+      - "'cp'|\"cp\""
+    math_primitives:
+      - 'Math\.acos'
+      - 'Math\.hypot'
+      - 'Math\.sqrt'
+      - '\bcross\s*\('
+      - '\bdot\s*\('
+      - '\bnorm\s*\('
+    # Files exempt from the sweep — the client that only POSTs to the
+    # backend validator carries these identifiers by necessity but
+    # does no math.
+    path_exempt:
+      - src/cobot_dashboard/frontend/src/lib/palletFrameValidator.js
+      - src/cobot_dashboard/frontend/src/lib/palletFrameValidator.test.js
+      - '**/*.test.js'
+      - '**/*.pinned.test.js'
+    # Files that CURRENTLY carry legitimate frontend math on other
+    # domain objects (Isaac IK gizmo, wrist orient) — grandfathered.
+    known_ok:
+      - path: src/cobot_dashboard/frontend/src/lib/orient.js
+        why: >
+          Wrist orientation math for the operator-visible J5 sanity
+          check — not pallet-frame, not TCP calc. General SE(3) math
+          that the backend does not own separately.
+        owner: robot-driver
+      - path: src/cobot_dashboard/frontend/src/components/IKGizmo.jsx
+        why: >
+          3D-viewer IK preview gizmo — client-side visualization
+          only, no operator verdict, no motion decision.
+        owner: perception-ui
