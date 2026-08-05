@@ -12462,6 +12462,11 @@ if FASTAPI_AVAILABLE:
         except FileNotFoundError:
             pass
 
+    def _teach_touch(draft: dict) -> dict:
+        draft['updated_ts'] = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                                            time.gmtime())
+        return draft
+
     def _teach_updated_epoch(draft: dict) -> float | None:
         """Parse the draft's `updated_ts` (ISO-8601 UTC 'Z') to
         wall-clock epoch. Returns None if unparseable. Uses
@@ -12534,11 +12539,6 @@ if FASTAPI_AVAILABLE:
     # Hydrate at boot so a restart mid-teach resumes the session.
     os.makedirs(_TEACH_DIR, exist_ok=True)
     _teach_publish_to_state()
-
-    def _teach_touch(draft: dict) -> dict:
-        draft['updated_ts'] = time.strftime('%Y-%m-%dT%H:%M:%SZ',
-                                            time.gmtime())
-        return draft
 
     def _teach_new_draft(prog_id: str, device_id: str,
                          device_label: str = '') -> dict:
