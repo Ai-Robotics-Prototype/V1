@@ -1035,6 +1035,41 @@ def compose_program_draft(intent: StructuredIntent,
     # existing per-op resolver.
     _dedupe_repeated_refs(steps)
 
+    # 2026-08-05 OPERATOR DIRECTIVE (home unification): multiple
+    # move_home steps in a single program share ONE taught pose.
+    # Every move_home AFTER the first inherits from the first via
+    # `derived_from: 'home'`, so the backend's pending-pose check
+    # (check_program_pending_poses rule c — resolves against
+    # role_map['home']) treats them as satisfied when the FIRST
+    # home is taught. The operator therefore teaches home ONCE.
+    #
+    # The frontend's isTeachable rule already hides the Teach button
+    # on later move_home steps (programTruth.js); this fix aligns
+    # the DATA model so backend + frontend + record path agree
+    # instead of just the surface.
+    #
+    # Override path preserved: `step.overridden === True` lets an
+    # operator break the share and teach an independent second
+    # home. Backend rule (b) will still resolve that case via the
+    # step's own taught_joints.
+    _first_home_idx = None
+    for _i, _s in enumerate(steps):
+        if _s and str(_s.get('action') or '').lower() == 'move_home':
+            if _first_home_idx is None:
+                _first_home_idx = _i
+                continue
+            # Every subsequent move_home links to the first. Match
+            # the composer's invariant for derived steps: no pose
+            # data of their own (position_role, taught_joints,
+            # taught_tcp, taught, pose all cleared) — the resolver
+            # + role_map covers all reads. This is what
+            # test_derived_steps_never_carry_taught_data pins.
+            _s['derived_from'] = 'home'
+            for _k in ('position_role', 'taught_joints', 'taught_tcp',
+                       'pose', 'pose_status'):
+                _s.pop(_k, None)
+            _s['taught'] = False   # kept explicit for legacy readers
+
     # 2026-08-02 §1 — routine detection over the operation list.
     # Consecutive ops with identical signatures collapse into a
     # single Routine (representation only; steps stay unrolled).

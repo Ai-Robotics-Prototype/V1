@@ -3255,6 +3255,48 @@ export default function ProgramEditor() {
   const rawSteps = currentProgram.steps || []
   const stepsHaveIds = rawSteps.every((s) => typeof s.id === 'number')
   const steps = stepsHaveIds ? rawSteps : renumber(rawSteps)
+  // 2026-08-05 (editor truth, operator directive): when a teach
+  // session exists for THIS program, the DRAFT poses are the
+  // current truth — record-through writes each pose to disk on
+  // Record and mirrors it to STATE.teach_sessions. The pre-fix
+  // untaughtStepIds computation read from the saved currentProgram
+  // only, so the operator would teach five poses in a row and the
+  // banner would still claim six missing while the backend
+  // validator (which reads the draft-merged view) counted one.
+  //
+  // Merge in the draft's step-keyed poses (slot_key = 'step:<id>')
+  // BEFORE running the truth resolver — same honest-display
+  // principle as the line-map and link-status chips.
+  const _draftPoses = useStore((s) =>
+    (s.teachSessions || {})[currentProgram?.id]?.poses || null)
+  const stepsMerged = (() => {
+    if (!_draftPoses || typeof _draftPoses !== 'object') return steps
+    const byKey = _draftPoses
+    let touched = false
+    const out = steps.map((s) => {
+      const patch = byKey['step:' + s.id]
+      if (!patch || typeof patch !== 'object') return s
+      touched = true
+      // The draft patch mirrors the shape the record path writes:
+      // taught_joints, taught_tcp, taught: true. Merge non-null
+      // fields on top of the saved step — the draft is the newer
+      // authoritative pose for this teach session.
+      const merged = { ...s }
+      for (const k of ('taught_joints', 'taught_tcp', 'taught',
+                       'pose', 'pose_status')) {
+        if (patch[k] !== undefined && patch[k] !== null) merged[k] = patch[k]
+      }
+      // Ensure `taught` reflects a resolved 6-vector even if the
+      // patch omitted the flag but supplied the joints.
+      if (Array.isArray(merged.taught_joints)
+          && merged.taught_joints.length === 6
+          && merged.taught !== true) {
+        merged.taught = true
+      }
+      return merged
+    })
+    return touched ? out : steps
+  })()
   // Untaught steps the operator still needs to teach before the path
   // is ready to run. Uses the shared programTruth.isStepTaught resolver
   // (mirror of backend _has_taught_poses) so this count agrees with the
@@ -3263,10 +3305,10 @@ export default function ProgramEditor() {
   // Old logic used `step.taught` (client-set boolean) which drifted
   // from backend truth for derived_from steps (2026-07-30 audit
   // #P1-2 — see docs/ui_truth_audit.md).
-  const programForTruth = { steps, points: currentProgram.points }
+  const programForTruth = { steps: stepsMerged, points: currentProgram.points }
   const untaughtIds = untaughtStepIds(programForTruth)
                         .filter((id) => {
-                          const s = steps.find((x) => x.id === id)
+                          const s = stepsMerged.find((x) => x.id === id)
                           return s && isTeachable(s, programForTruth)
                         })
   const untaughtCount = untaughtIds.length
@@ -5000,7 +5042,15 @@ export default function ProgramEditor() {
         // clears the selection — file-manager style.
         onClick={(e) => { if (e.target === e.currentTarget) setSelectedId(null) }}
         style={{ flex: 1, overflowY: 'auto', padding: '8px 12px' }}>
-        {steps.map((step, idx) => {
+        {steps.map((rawStep, idx) => {
+          // 2026-08-05 (editor truth): the row's DISPLAY should
+          // reflect the draft-merged view (if a teach session
+          // exists), so a fresh Record on a step immediately
+          // clears the NOT TAUGHT badge — same honest-display
+          // principle the banner and Run gate use. All EDIT
+          // operations still mutate `steps` by id — the merge is
+          // a display-only overlay.
+          const step = stepsMerged[idx] || rawStep
           // Program-level pallet frame status — same value for every
           // row, cheap to recompute per iteration and keeps the closure
           // over `currentProgram` fresh across edits.

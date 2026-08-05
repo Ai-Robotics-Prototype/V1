@@ -872,17 +872,17 @@ capabilities:
       # here shift as the file grows; refresh the numbers from the
       # deploy.sh lint output when they move.
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 5713
+        line: 5763
         why: >
           disabledReason string for the pallet-teach flow overlay's
           Record button title tooltip. Grandfathered by the visible
           TeachLockBanner rendered in the same subtree.
         owner: dashboard-frontend
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 5755
+        line: 5805
         why: >
           disabledReason string for the single/all-step teach overlay's
-          Record button title tooltip. Same rationale as line 5713.
+          Record button title tooltip. Same rationale as line 5763.
         owner: dashboard-frontend
 
 
