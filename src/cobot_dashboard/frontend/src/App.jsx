@@ -22,6 +22,7 @@ import AdaptivePicking from './pages/AdaptivePicking'
 import ProgramLibrary from './pages/ProgramLibrary'
 import IOPage from './pages/IOPage'
 import SafetyPage from './pages/SafetyPage'
+import EventLog from './pages/EventLog'
 
 class ErrorBoundary extends Component {
   constructor(props) {
@@ -146,6 +147,7 @@ export default function App() {
     adaptive_picking: <AdaptivePicking />,
     configure:        <ConfigureLayout />,
     safety:           <SafetyPage />,
+    event_log:        <EventLog />,
   }
 
   // Keep the two 3D-heavy tabs persistently mounted, toggled by CSS

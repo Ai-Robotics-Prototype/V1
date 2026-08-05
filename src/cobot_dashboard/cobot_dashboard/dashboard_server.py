@@ -23,6 +23,16 @@ thin_waypoints          = _breadcrumbs.thin_waypoints
 is_stale                = _breadcrumbs.is_stale
 effector_state_at_end   = _breadcrumbs.effector_state_at_end
 
+# 2026-08-05 unified event log — one writer, daily rotation,
+# 90-day retention. Fork registry: `event_log`. Every error/
+# warning/info that the operator sees (or the platform emits
+# internally) routes through `event_log.emit(...)` — no per-
+# component log files.
+try:
+    from . import event_log as _event_log
+except ImportError:
+    import event_log as _event_log  # type: ignore
+
 # Always-on joint flight recorder + excursion analyzer. Isolated
 # modules so a recorder crash never touches the state pipeline.
 try:
@@ -1782,6 +1792,35 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 # if the translator didn't set one (e.g. tag='other').
                 if r["stop_cause_copy"] and not r["stop_cause_copy"].get("technical"):
                     r["stop_cause_copy"]["technical"] = r["last_stop_reason"]
+                # Unified event log — every stop cause lands as one
+                # event. Fires only on last_stop_ts ADVANCE (not on
+                # every state broadcast) so we get one line per
+                # actual driver stop, no duplicates.
+                if r["last_stop_ts"] != prev_stop_ts:
+                    _cause = r["last_stop_cause"] or {}
+                    _tag   = str(_cause.get('tag') or 'unknown')
+                    _sev   = 'error' if _tag in ('joint_limit', 'joint_limit_deeper',
+                                                 'collision_guard', 'send_failed') \
+                                     else 'warning'
+                    try:
+                        _event_log.emit(
+                            severity=_sev,
+                            source='driver',
+                            code=f'stop_jog:{_tag}',
+                            operator_message=(r["stop_cause_copy"] or {}).get(
+                                'title', f'Jog stopped ({_tag})'),
+                            technical_detail=str(r["last_stop_reason"] or ''),
+                            context={
+                                'tag':                _tag,
+                                'joint_index_1based': _cause.get('joint_index_1based'),
+                                'joint_deg':          _cause.get('joint_deg'),
+                                'joint_limit_deg':    _cause.get('joint_limit_deg'),
+                                'jog_mode':           _cause.get('jog_mode'),
+                                'stop_ts':            r["last_stop_ts"],
+                            },
+                        )
+                    except Exception:
+                        pass
             # Per-joint limit evaluation — a list of six dicts (one per
             # joint) each with current_deg/limit_deg/out_of_range/etc.
             # Passed through untouched; dashboard interprets to render
@@ -1964,6 +2003,23 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             rej.append(d)
             if len(rej) > 32:
                 del rej[:-32]
+        # 2026-08-05 unified event log: every driver rejection lands
+        # in /opt/cobot/event_log/events_YYYYMMDD.jsonl. Best-effort
+        # — the emit call NEVER raises, so this can't block the
+        # broadcast pipeline.
+        try:
+            reason = str(d.get('reason') or '')
+            family = str(d.get('family') or 'driver')
+            _event_log.emit(
+                severity='warning' if family == 'jog' else 'error',
+                source='driver',
+                code=f'driver_reject:{family}',
+                operator_message=f'Driver rejected {family}: {reason[:120]}',
+                technical_detail=reason,
+                context={'family': family, 'raw': d},
+            )
+        except Exception:
+            pass
 
     def _on_estun_io(self, msg):
         """Mirror the merged /estun/io snapshot into STATE.io_live so
@@ -7121,6 +7177,128 @@ if FASTAPI_AVAILABLE:
     #
     # The footer banner reads this to render one of:
     #   green    "current (hash, age)"
+    # ── Unified event log (2026-08-05, fork registry: event_log) ──
+    # Every error/warning/info the platform surfaces lands as one
+    # JSONL line in /opt/cobot/event_log/events_YYYYMMDD.jsonl.
+    # These endpoints expose the log to the operator:
+    #   POST /api/event_log/append   → frontend toast capture
+    #   GET  /api/event_log/list     → list available dates
+    #   GET  /api/event_log/day/{d}  → JSON array (interface page)
+    #   GET  /api/event_log/download/{d}.jsonl  → raw JSONL
+    #   GET  /api/event_log/download/{d}.csv    → human CSV
+    #   GET  /api/event_log/download/last7.zip  → 7-day bundle
+    #
+    # Dismissing a toast NEVER deletes the record — the JSONL is
+    # append-only; the interface page reads it as-is.
+    @app.post("/api/event_log/append")
+    async def api_event_log_append(request: Request):
+        """Append a frontend-originated event to the daily JSONL.
+        Body: {severity, source, code, operator_message,
+               technical_detail, context}. All fields optional
+        except severity + code + operator_message.
+        Non-frontend sources (driver, watcher, validator) route
+        through _event_log.emit directly inside the dashboard
+        process — this endpoint is the browser's on-ramp."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        rec = _event_log.emit(
+            severity=str(body.get('severity') or 'info'),
+            source=str(body.get('source') or 'dashboard'),
+            code=str(body.get('code') or ''),
+            operator_message=str(body.get('operator_message') or ''),
+            technical_detail=str(body.get('technical_detail') or ''),
+            context=body.get('context') if isinstance(body.get('context'), dict) else {},
+        )
+        return {'ok': bool(rec), 'record': rec}
+
+    @app.get("/api/event_log/list")
+    async def api_event_log_list():
+        """Return the list of dates available on disk, newest first.
+        Used by the interface page's date picker."""
+        return {'days': _event_log.list_days()}
+
+    @app.get("/api/event_log/day/{date_str}")
+    async def api_event_log_day(date_str: str, limit: int = 2000):
+        """Return one day's records as a JSON array (oldest first).
+        `limit` caps the tail — default 2000, cap 10000 — enough
+        for a busy shift day without exhausting the browser."""
+        if not (date_str.isdigit() and len(date_str) == 8):
+            return JSONResponse({'error': 'date must be YYYYMMDD'},
+                                status_code=400)
+        limit = max(1, min(int(limit), 10000))
+        return {'date': date_str,
+                'records': _event_log.read_day(date_str, limit=limit)}
+
+    @app.get("/api/event_log/download/{filename}")
+    async def api_event_log_download(filename: str):
+        """Downloads: `<YYYYMMDD>.jsonl`, `<YYYYMMDD>.csv`, or
+        `last7.zip`. Anything else → 404."""
+        if filename == 'last7.zip':
+            import io as _io
+            import zipfile as _zf
+            days = _event_log.list_days()[:7]
+            buf = _io.BytesIO()
+            with _zf.ZipFile(buf, 'w', compression=_zf.ZIP_DEFLATED) as zf:
+                for d in days:
+                    path = _event_log.path_for_date(d)
+                    try:
+                        with open(path, 'rb') as fh:
+                            zf.writestr(f'events_{d}.jsonl', fh.read())
+                    except FileNotFoundError:
+                        continue
+            buf.seek(0)
+            filename_out = f'cobot_events_last7_{time.strftime("%Y%m%d")}.zip'
+            return StreamingResponse(
+                buf, media_type='application/zip',
+                headers={'Content-Disposition':
+                         f'attachment; filename="{filename_out}"'})
+        # <YYYYMMDD>.jsonl | .csv
+        if not (len(filename) >= 13 and filename[:8].isdigit()
+                and filename[8] == '.'):
+            return JSONResponse({'error': 'bad filename'}, status_code=404)
+        date_str = filename[:8]
+        ext      = filename[9:]
+        path = _event_log.path_for_date(date_str)
+        if not os.path.exists(path):
+            return JSONResponse({'error': f'no log for {date_str}'},
+                                status_code=404)
+        if ext == 'jsonl':
+            return FileResponse(
+                path, media_type='application/x-ndjson',
+                filename=f'events_{date_str}.jsonl')
+        if ext == 'csv':
+            # Render CSV in-memory from the JSONL. Column order
+            # matches the operator's forensic priority: time first,
+            # severity, source, code, message. technical + context
+            # last (widest). Values are CSV-escaped by the csv
+            # module — no manual quoting.
+            import csv as _csv
+            import io as _io
+            recs = _event_log.read_day(date_str)
+            buf = _io.StringIO()
+            w = _csv.writer(buf)
+            w.writerow(['ts_utc', 'ts_local', 'severity', 'source',
+                        'code', 'operator_message',
+                        'technical_detail', 'context_json'])
+            for r in recs:
+                w.writerow([
+                    r.get('ts_utc', ''), r.get('ts_local', ''),
+                    r.get('severity', ''), r.get('source', ''),
+                    r.get('code', ''), r.get('operator_message', ''),
+                    r.get('technical_detail', ''),
+                    json.dumps(r.get('context') or {},
+                               ensure_ascii=False),
+                ])
+            return StreamingResponse(
+                iter([buf.getvalue()]),
+                media_type='text/csv',
+                headers={'Content-Disposition':
+                         f'attachment; filename="events_{date_str}.csv"'})
+        return JSONResponse({'error': 'unsupported extension'},
+                            status_code=404)
+
     #   spinning "deploying…"
     #   amber    "deploy waiting for idle"
     #   red      "DEPLOY FAILED: <step>"

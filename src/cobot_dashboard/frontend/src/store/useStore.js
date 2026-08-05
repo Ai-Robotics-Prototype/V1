@@ -2095,6 +2095,41 @@ const storeDefinition = (set, get) => ({
       return existing.id
     }
     set((s) => ({ toasts: [...s.toasts, toast] }))
+    // 2026-08-05 unified event log (fork registry: event_log): every
+    // toast the operator sees also lands as a persistent JSONL
+    // record in /opt/cobot/event_log/. Dismissing a toast never
+    // deletes the record — the JSONL is append-only. `warning` and
+    // `error` severities always capture; `info` captures only when
+    // the toast carries a code/message worth reviewing later.
+    try {
+      const severity = type === 'error' || type === 'warning'
+        ? type
+        : 'info'
+      const capture = severity !== 'info' || (toast.title || toast.detail || toast.technicalDetail)
+      if (capture) {
+        // Best-effort POST. Never block on the log path.
+        const payload = {
+          severity,
+          source: 'dashboard',
+          code: (typeof msgOrObject === 'object' && msgOrObject?.code) || '',
+          operator_message: toast.title || toast.message || '',
+          technical_detail: toast.detail
+            ? (toast.detail + (toast.technicalDetail ? ' | ' + toast.technicalDetail : ''))
+            : (toast.technicalDetail || ''),
+          context: {
+            toast_id:   String(id),
+            client_id:  (typeof CLIENT_ID === 'string' && CLIENT_ID) || undefined,
+            device_id:  get()._teachDeviceId || undefined,
+          },
+        }
+        fetch('/api/event_log/append', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify(payload),
+          keepalive: true,   // survive a page unload mid-post
+        }).catch(() => { /* nop — log is best-effort */ })
+      }
+    } catch (_) { /* nop */ }
     // Duration override (2026-08-04): error-severity toasts for the
     // load path need to dwell long enough for the operator to read
     // "Controller link down — program NOT loaded" without losing it

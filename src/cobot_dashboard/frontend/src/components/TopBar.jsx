@@ -10,6 +10,11 @@ const TABS = [
   { id: 'adaptive_picking', label: 'Part Recognition' },
   { id: 'io',               label: 'I/O' },
   { id: 'safety',           label: 'Safety' },
+  // 2026-08-05 unified event log (fork registry: event_log).
+  // Persistent forensic record of every error/warning/info the
+  // platform surfaces. Sits under Safety in nav order so operators
+  // reach for it in the "something went wrong" mental sequence.
+  { id: 'event_log',        label: 'Event Log' },
   { id: 'configure',        label: 'Configure' },
 ]
 
