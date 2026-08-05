@@ -1691,6 +1691,126 @@ const storeDefinition = (set, get) => ({
         set({ runSpeedPct: Math.max(1, Math.min(100, Math.round(raw))) })
       }
     }
+    // 2026-08-05 (refresh persistence, fork registry:
+    // page_context_persistence):
+    //   * `unsaved:true` field-level patch → debounced edit-through
+    //     to /api/teach_session/{pid}/edit so structural edits
+    //     (reorder, add/delete, config change) survive a refresh
+    //     the same way record-through preserves poses.
+    //   * `patch.id` change (whole-program load / open) → record
+    //     the new open_program_id in /api/ui_context/{device_id}
+    //     so refresh restores the last-open program per-device.
+    const next = get().currentProgram
+    if (patch?.unsaved === true && next?.id) {
+      const prevTimer = get()._editThroughTimer
+      if (prevTimer) clearTimeout(prevTimer)
+      const t = setTimeout(() => {
+        try { get().editThroughProgram(next) } catch (_) { /* nop */ }
+      }, 300)
+      set({ _editThroughTimer: t })
+    }
+    if (patch && Object.prototype.hasOwnProperty.call(patch, 'id')
+        && next?.id) {
+      try { get().rememberOpenProgram(next.id) } catch (_) { /* nop */ }
+    }
+  },
+
+  // Timer id for the debounced edit-through fire. Cleared and
+  // reset on every unsaved:true setCurrentProgram call — the
+  // fire only lands 300 ms after the last edit stops. Zustand
+  // never persists this (partialize excludes underscore-prefixed
+  // keys).
+  _editThroughTimer: null,
+
+  // 2026-08-05 (refresh persistence): POST the full current program
+  // to /api/teach_session/{pid}/edit so unsaved structural edits
+  // survive a page reload. Complements recordTeachPose for pose-
+  // level edits; both write through to the same draft file.
+  // Best-effort — network / storage-full errors do NOT toast (the
+  // debounced cadence means the operator would see repeated toasts
+  // on a bad link). The next fire re-attempts.
+  async editThroughProgram(program) {
+    if (!program || !program.id) return { ok: false, error: 'no_id' }
+    const device_id = get()._getTeachDeviceId()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(program.id)}/edit`,
+        { method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ device_id, program }),
+          keepalive: true })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) return { ok: false, status: res.status, body }
+      return { ok: true, draft: body?.draft }
+    } catch (e) {
+      return { ok: false, error: 'network', message: String(e) }
+    }
+  },
+
+  // 2026-08-05 (refresh persistence): record the currently-open
+  // program in the server's per-device UI context store so a
+  // refresh restores it. Fire-and-forget — no toast on failure
+  // because the operator can always pick the program from the
+  // library manually.
+  async rememberOpenProgram(programId) {
+    if (!programId) return
+    const device_id = get()._getTeachDeviceId()
+    try {
+      await fetch(
+        `/api/ui_context/${encodeURIComponent(device_id)}`,
+        { method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({
+            open_program_id: programId,
+            active_tab:      get().activeTab || 'program',
+          }),
+          keepalive: true })
+    } catch (_) { /* nop */ }
+  },
+
+  // 2026-08-05 (refresh persistence): on App mount, fetch the
+  // last-open program for THIS device and rehydrate. If a draft
+  // exists with a staged_program (unsaved structural edits), use
+  // it as the base — pose overlay layers on top via the existing
+  // ProgramEditor stepsMerged path. Called ONCE per fresh page
+  // load; a no-op if the device has no context yet.
+  async restoreOpenProgramOnMount() {
+    const device_id = get()._getTeachDeviceId()
+    let openProgId = null
+    let activeTab  = null
+    try {
+      const r = await fetch(
+        `/api/ui_context/${encodeURIComponent(device_id)}`)
+      const b = await r.json().catch(() => ({}))
+      openProgId = b?.context?.open_program_id || null
+      activeTab  = b?.context?.active_tab || null
+    } catch (_) { /* nop — fall through to blank UI */ }
+    if (activeTab) {
+      try { get().setActiveTab(activeTab) } catch (_) { /* nop */ }
+    }
+    if (!openProgId) return
+    // Prefer draft.staged_program (unsaved edits) over the disk
+    // program. Falls back to the saved copy if no staged_program.
+    let program = null
+    try {
+      const dr = await fetch(
+        `/api/teach_session/${encodeURIComponent(openProgId)}`)
+      const db = await dr.json().catch(() => ({}))
+      if (db?.present && db?.draft?.staged_program?.id) {
+        program = db.draft.staged_program
+        program.unsaved = true   // flag so the operator sees the chip
+      }
+    } catch (_) { /* nop */ }
+    if (!program) {
+      try {
+        const pr = await fetch(
+          `/api/programs/${encodeURIComponent(openProgId)}`)
+        if (pr.ok) program = await pr.json().catch(() => null)
+      } catch (_) { /* nop */ }
+    }
+    if (program && program.id) {
+      set((s) => ({ currentProgram: { ...s.currentProgram, ...program } }))
+    }
   },
 
   // Monitor "Run Program" confirm modal. The button opens this;

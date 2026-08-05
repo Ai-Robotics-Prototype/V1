@@ -33,6 +33,24 @@ try:
 except ImportError:
     import event_log as _event_log  # type: ignore
 
+# 2026-08-05 per-device UI context — refresh-persistence. Fork
+# registry: page_context_persistence. Server-owns which program
+# is open on each device; browser localStorage carries none of
+# this state.
+try:
+    from . import ui_context as _ui_context
+except ImportError:
+    import ui_context as _ui_context  # type: ignore
+
+# 2026-08-05 disk watchdog + enforced retention. Fork registry:
+# disk_watchdog. ONE place that caps every writable directory;
+# ONE surface (/api/disk_status) the footer reads. Started at
+# lifespan bring-up below.
+try:
+    from . import disk_watchdog as _disk_watchdog
+except ImportError:
+    import disk_watchdog as _disk_watchdog  # type: ignore
+
 # Always-on joint flight recorder + excursion analyzer. Isolated
 # modules so a recorder crash never touches the state pipeline.
 try:
@@ -2397,6 +2415,19 @@ if FASTAPI_AVAILABLE:
             print(f'[dashboard] joint recorder failed to start: {_e}',
                   flush=True)
             _joint_recorder = None
+        # 2026-08-05 disk watchdog — enforced retention on
+        # /opt/cobot/logs, joint_history, event_log. Runs a prune
+        # sweep every 60 s. First sweep at boot cleans any pre-
+        # existing overrun.
+        try:
+            _disk_watchdog.enforce_all()
+            _disk_watchdog.start_watchdog_thread(period_s=60.0)
+            print('[dashboard] disk watchdog started (60s cadence, '
+                  '2GB caps on logs/joint_history, 500MB on event_log)',
+                  flush=True)
+        except Exception as _e:
+            print(f'[dashboard] disk watchdog failed to start: {_e}',
+                  flush=True)
         yield
         task.cancel()
         _keepalive_stop.set()
@@ -7201,6 +7232,40 @@ if FASTAPI_AVAILABLE:
     #
     # Dismissing a toast NEVER deletes the record — the JSONL is
     # append-only; the interface page reads it as-is.
+
+    # ── Per-device UI context (refresh persistence, 2026-08-05) ──
+    #   GET  /api/ui_context/{device_id}  → {ok, context}
+    #   POST /api/ui_context/{device_id}  body: {open_program_id?, active_tab?}
+    #                                       → {ok, context}
+    # Fork registry: page_context_persistence. No client-side
+    # localStorage for these fields — the Jetson is the source of
+    # truth for which program is open on each device.
+    @app.get("/api/ui_context/{device_id}")
+    async def api_ui_context_get(device_id: str):
+        ctx = _ui_context.get(device_id) or {}
+        return {'ok': True, 'context': ctx}
+
+    @app.post("/api/ui_context/{device_id}")
+    async def api_ui_context_set(device_id: str, request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        result = _ui_context.set(device_id, body if isinstance(body, dict) else {})
+        if result is None:
+            return JSONResponse({'ok': False,
+                                 'error': 'bad_device_id_or_payload'},
+                                status_code=400)
+        return {'ok': True, 'context': result}
+
+    # ── Disk status (footer widget + operator diagnostics) ─────
+    # 2026-08-05: single source of truth for "how much space is
+    # free" + "how much each capped dir is using". Fork registry:
+    # disk_watchdog.
+    @app.get("/api/disk_status")
+    async def api_disk_status():
+        return _disk_watchdog.status()
+
     @app.post("/api/event_log/append")
     async def api_event_log_append(request: Request):
         """Append a frontend-originated event to the daily JSONL.
@@ -12691,20 +12756,59 @@ if FASTAPI_AVAILABLE:
         except Exception:
             return None
 
+    class _TeachWriteError(OSError):
+        """Structured error the record/heartbeat/end/save endpoints
+        catch and turn into a clean 507 for the operator, instead of
+        letting the raw OSError traceback back through starlette as a
+        500. Preserves the underlying errno for diagnostics.
+
+        2026-08-05 P0: without this wrapper, any fs-level failure
+        (ENOSPC=28, EROFS=30, EIO=5, EDQUOT=122, EACCES=13) crashed
+        every Record press from the tablet as a 500 traceback."""
+        pass
+
+    def _storage_full_response(e):
+        """Shared operator-language body for a 507 storage-full
+        return. Called from every teach-session endpoint that
+        writes to disk (record/end/heartbeat/save/edit)."""
+        errno = e.args[0] if e.args else '?'
+        detail = e.args[1] if len(e.args) > 1 else str(e)
+        return {
+            'ok':    False,
+            'error': 'storage_full',
+            'operator_message': (
+                "Couldn't save — the dashboard's disk is full. "
+                "Free space on /opt/cobot and try again. Earlier "
+                "successful writes are safe on disk."),
+            'technical_detail': f'errno={errno} {detail}',
+        }
+
     def _teach_write_draft(prog_id: str, draft: dict) -> None:
         p = _teach_path(prog_id)
         if not p:
             return
-        os.makedirs(_TEACH_DIR, exist_ok=True)
-        # Atomic write — rename after fsync so a mid-write kill
-        # cannot leave a half-file on disk (draft survives a
-        # `systemctl restart roboai-dashboard` mid-teach).
-        tmp = p + '.tmp'
-        with open(tmp, 'w') as fh:
-            json.dump(draft, fh, indent=2)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, p)
+        tmp = None
+        try:
+            os.makedirs(_TEACH_DIR, exist_ok=True)
+            # Atomic write — rename after fsync so a mid-write kill
+            # cannot leave a half-file on disk (draft survives a
+            # `systemctl restart roboai-dashboard` mid-teach).
+            tmp = p + '.tmp'
+            with open(tmp, 'w') as fh:
+                json.dump(draft, fh, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, p)
+        except OSError as e:
+            # Clean up the .tmp fragment so a subsequent successful
+            # write doesn't blend partial data with fresh state.
+            if tmp is not None:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+            raise _TeachWriteError(e.errno, str(e))
 
     def _teach_delete_draft(prog_id: str) -> None:
         p = _teach_path(prog_id)
@@ -12758,7 +12862,14 @@ if FASTAPI_AVAILABLE:
             draft['ttl_expired_at']  = time.strftime(
                 '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
             _teach_touch(draft)
-            _teach_write_draft(pid, draft)
+            # 2026-08-05 P0: TTL sweep runs on every state broadcast
+            # (25 Hz idle / 8 Hz hold). An ENOSPC here would spam
+            # exceptions through the broadcast pipeline. Swallow —
+            # the caller (state broadcast) does not need a raise.
+            try:
+                _teach_write_draft(pid, draft)
+            except _TeachWriteError:
+                pass
             return draft
         # Draft-TTL: garbage-collect a long-abandoned unowned draft.
         if age > _TEACH_DRAFT_TTL_S and not draft.get('owner_device_id'):
@@ -12837,14 +12948,22 @@ if FASTAPI_AVAILABLE:
             draft = _teach_read_draft(prog_id)
             if draft is None:
                 draft = _teach_new_draft(prog_id, device_id, device_label)
-                _teach_write_draft(prog_id, draft)
+                try:
+                    _teach_write_draft(prog_id, draft)
+                except _TeachWriteError as e:
+                    return JSONResponse(_storage_full_response(e),
+                                        status_code=507)
                 _teach_publish_to_state()
                 return {'ok': True, 'draft': draft}
             if draft.get('owner_device_id') == device_id:
                 # Re-claim from the same device (refresh, resume) —
                 # keep the poses, keep ownership.
                 draft = _teach_touch(draft)
-                _teach_write_draft(prog_id, draft)
+                try:
+                    _teach_write_draft(prog_id, draft)
+                except _TeachWriteError as e:
+                    return JSONResponse(_storage_full_response(e),
+                                        status_code=507)
                 _teach_publish_to_state()
                 return {'ok': True, 'draft': draft}
             # Different device — check the owner's heartbeat age. If
@@ -12865,7 +12984,11 @@ if FASTAPI_AVAILABLE:
                     draft['auto_expired_at']    = time.strftime(
                         '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
                     _teach_touch(draft)
-                    _teach_write_draft(prog_id, draft)
+                    try:
+                        _teach_write_draft(prog_id, draft)
+                    except _TeachWriteError as e:
+                        return JSONResponse(_storage_full_response(e),
+                                            status_code=507)
                     _teach_publish_to_state()
                     return {
                         'ok': True,
@@ -12900,7 +13023,11 @@ if FASTAPI_AVAILABLE:
             if draft is None:
                 # No existing draft — treat as a start.
                 draft = _teach_new_draft(prog_id, device_id, device_label)
-                _teach_write_draft(prog_id, draft)
+                try:
+                    _teach_write_draft(prog_id, draft)
+                except _TeachWriteError as e:
+                    return JSONResponse(_storage_full_response(e),
+                                        status_code=507)
                 _teach_publish_to_state()
                 return {'ok': True, 'draft': draft, 'took_over': False}
             prev_owner = draft.get('owner_device_id')
@@ -12911,10 +13038,76 @@ if FASTAPI_AVAILABLE:
             draft['took_over_at']       = time.strftime(
                 '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
             _teach_touch(draft)
-            _teach_write_draft(prog_id, draft)
+            try:
+                _teach_write_draft(prog_id, draft)
+            except _TeachWriteError as e:
+                return JSONResponse(_storage_full_response(e),
+                                    status_code=507)
             _teach_publish_to_state()
             return {'ok': True, 'draft': draft, 'took_over': True,
                     'previous_owner': prev_owner}
+
+    @app.post("/api/teach_session/{prog_id}/edit")
+    async def api_teach_session_edit(prog_id: str, request: Request):
+        """Record-through for STRUCTURAL edits — step reorder, add/
+        delete, config change, program rename. Body:
+            {device_id: <str, required>,
+             program:  <full program dict, required>}
+        Writes to draft.staged_program. Save merges staged_program
+        as the base (not the disk-saved program), then applies the
+        pose overlay from draft.poses.
+
+        Ownership + self-heal same as /record — a stale-owner
+        (heartbeat > 60 s old) gets auto-swapped. Non-owner with
+        a fresh session → 403. Storage full → 507.
+
+        Fork registry: page_context_persistence — this is the
+        canonical write-through path for non-pose edits."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        program   = body.get('program')
+        if not device_id:
+            return JSONResponse({'error': 'device_id required'},
+                                status_code=400)
+        if not isinstance(program, dict):
+            return JSONResponse({'error': 'program (full dict) required'},
+                                status_code=400)
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                # First edit implicitly starts the session — same
+                # convenience the /record path offers.
+                draft = _teach_new_draft(prog_id, device_id,
+                    str(body.get('device_label') or ''))
+            elif draft.get('owner_device_id') != device_id:
+                _upd = _teach_updated_epoch(draft)
+                if _upd is not None and (time.time() - _upd) > _TEACH_STALE_HEARTBEAT_S:
+                    prev_owner = draft.get('owner_device_id')
+                    draft = dict(draft)
+                    draft['owner_device_id']    = device_id
+                    draft['owner_label']        = str(body.get('device_label') or '') or device_id[:8]
+                    draft['previous_owner']     = prev_owner
+                    draft['auto_expired_at']    = time.strftime(
+                        '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                else:
+                    return JSONResponse({
+                        'ok': False,
+                        'error': 'not_owner',
+                        'owner_device_id': draft.get('owner_device_id'),
+                        'owner_label':     draft.get('owner_label'),
+                    }, status_code=403)
+            draft['staged_program'] = program
+            _teach_touch(draft)
+            try:
+                _teach_write_draft(prog_id, draft)
+            except _TeachWriteError as e:
+                return JSONResponse(_storage_full_response(e),
+                                    status_code=507)
+            _teach_publish_to_state()
+        return {'ok': True, 'draft': draft}
 
     @app.post("/api/teach_session/{prog_id}/record")
     async def api_teach_session_record(prog_id: str, request: Request):
@@ -12976,7 +13169,11 @@ if FASTAPI_AVAILABLE:
             poses[slot_key] = patch
             draft['poses'] = poses
             _teach_touch(draft)
-            _teach_write_draft(prog_id, draft)
+            try:
+                _teach_write_draft(prog_id, draft)
+            except _TeachWriteError as e:
+                return JSONResponse(_storage_full_response(e),
+                                    status_code=507)
             _teach_publish_to_state()
             return {'ok': True, 'draft': draft, 'slot_key': slot_key}
 
@@ -13027,7 +13224,11 @@ if FASTAPI_AVAILABLE:
             draft['ended_ts']        = time.strftime(
                 '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
             _teach_touch(draft)
-            _teach_write_draft(prog_id, draft)
+            try:
+                _teach_write_draft(prog_id, draft)
+            except _TeachWriteError as e:
+                return JSONResponse(_storage_full_response(e),
+                                    status_code=507)
             _teach_publish_to_state()
         return {'ok': True, 'released': True}
 
@@ -13062,7 +13263,11 @@ if FASTAPI_AVAILABLE:
                     'owner_label':     draft.get('owner_label'),
                 }, status_code=403)
             _teach_touch(draft)
-            _teach_write_draft(prog_id, draft)
+            try:
+                _teach_write_draft(prog_id, draft)
+            except _TeachWriteError as e:
+                return JSONResponse(_storage_full_response(e),
+                                    status_code=507)
         return {'ok': True, 'updated_ts': draft.get('updated_ts')}
 
     def _apply_draft_poses_to_program(program: dict, poses: dict) -> dict:
@@ -13136,9 +13341,19 @@ if FASTAPI_AVAILABLE:
                     'ok': False, 'error': 'program_not_found'},
                     status_code=404)
             with open(path) as fh:
-                program = json.load(fh)
+                saved_program = json.load(fh)
+            # 2026-08-05 (edit-through): if the draft carries a
+            # staged_program (structural edits recorded through the
+            # /edit endpoint), use it as the BASE for the merge —
+            # not the disk-saved program. The pose overlay is then
+            # applied on top. Without this, refreshing the tablet
+            # would keep the poses but drop every step reorder /
+            # add / delete / rename since last Save.
+            base_program = (draft.get('staged_program')
+                            if isinstance(draft.get('staged_program'), dict)
+                            else saved_program)
             merged = _apply_draft_poses_to_program(
-                program, draft.get('poses') or {})
+                base_program, draft.get('poses') or {})
             # Single validator door: same check used by the
             # /api/estun/program/run push. Blocking findings refuse
             # the save so a controller-crashing program never reaches
@@ -13160,9 +13375,24 @@ if FASTAPI_AVAILABLE:
                     'program_id': prog_id,
                 }, status_code=400)
             # Persist. Reuse the standard save shape: same fields
-            # the /api/programs PUT would emit.
-            with open(path, 'w') as fh:
-                json.dump(merged, fh, indent=2)
+            # the /api/programs PUT would emit. Wrap in try/except so
+            # a full-disk ENOSPC returns 507 instead of a 500 crash.
+            try:
+                tmp_path = path + '.tmp'
+                with open(tmp_path, 'w') as fh:
+                    json.dump(merged, fh, indent=2)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, path)
+            except OSError as _e:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                return JSONResponse(_storage_full_response(
+                    _TeachWriteError(_e.errno, str(_e))),
+                    status_code=507)
             _teach_delete_draft(prog_id)
             _teach_publish_to_state()
             # Bump the program-rev event so every client refreshes.

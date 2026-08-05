@@ -666,20 +666,19 @@ capabilities:
           - '**/test_*.py'
     known_debt:
       # fork_lint reports lines using its comment-stripped source
-      # (loses ~1 line per stripped comment). At the current source
-      # (438299d + fixes) the canonical routes fall at reported lines
-      # 3192 and 3322. Real @app.post lines are 3297 and 3435.
-      # When the file grows, `deploy.sh` will surface a fresh line
-      # number in the lint output; update these debt entries then.
+      # (loses ~1 line per stripped comment). Real @app.post lines
+      # shift as the file grows — refresh from deploy.sh lint output
+      # when they move. 2026-08-05 bump: ui_context + disk_watchdog
+      # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3259
+        line: 3290
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
           Pinned by test_jog_hold_heartbeat.py.
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3389
+        line: 3420
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Pinned by test_jog_hold_heartbeat.py.
@@ -884,6 +883,111 @@ capabilities:
           disabledReason string for the single/all-step teach overlay's
           Record button title tooltip. Same rationale as line 5763.
         owner: dashboard-frontend
+
+  # 22. Page-context persistence (2026-08-05 refresh-loss P0).
+  - id: page_context_persistence
+    description: >
+      The Jetson owns "which program is open on this device" +
+      "which tab is active". Refreshing the tablet MUST NOT lose
+      the loaded program. Same doctrine as teach-session record-
+      through: server is truth, UIs are views.
+
+      Canonical store: cobot_dashboard.ui_context (one JSON per
+      device_id under /opt/cobot/ui_context/). Endpoints:
+        GET  /api/ui_context/{device_id}   — read
+        POST /api/ui_context/{device_id}   — merge patch
+        POST /api/teach_session/{prog_id}/edit — persist a whole-
+             program structural edit so refresh preserves unsaved
+             changes ("edit-through", extends record-through past
+             pose-only teaches to full program edits).
+
+      Fork rule: NO browser localStorage / sessionStorage / cookie
+      is allowed to persist page state — same-store hazard as the
+      pre-fix localStorage("current_program_id") string that broke
+      on refresh when the program had been renamed or deleted
+      server-side. Session-scoped state (URL query, in-memory
+      Zustand) is fine; anything that survives a reload must round-
+      trip through the ui_context endpoints.
+    canonical:
+      python:
+        module: cobot_dashboard.ui_context
+        functions: [get, set, clear, list_all]
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [api_ui_context_get, api_ui_context_set,
+                    api_teach_session_edit]
+      frontend:
+        path: src/cobot_dashboard/frontend/src/store/useStore.js
+        exports: [restoreOpenProgramOnMount, rememberOpenProgram,
+                  editThroughProgram]
+    forbidden:
+      # No browser-storage persistence of page state.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          - "localStorage\\.(set|get)Item\\(\\s*['\"](current_program_id|open_program_id|active_tab|last_program|programId|last_open_program)"
+          - "sessionStorage\\.(set|get)Item\\(\\s*['\"](current_program_id|open_program_id|active_tab|last_program|programId|last_open_program)"
+        path_exempt:
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt: []
+
+  # 23. Disk watchdog + retention caps (2026-08-05 record-endpoint
+  # ENOSPC P0).
+  - id: disk_watchdog
+    description: >
+      ONE module owns "how much space is free on /opt/cobot", the
+      thresholds for warning/critical/dead, and the enforced
+      per-directory retention caps. Motivated by the 2026-08-05
+      P0 where the record endpoint crashed on ENOSPC because
+      three log domains (driver ws logs, joint_history, event_log)
+      grew unbounded.
+
+      Directory caps (mirrored numerics — the canonical writer for
+      each domain still owns its own prune; disk_watchdog re-runs
+      the sweep at boot + every 60 s so no domain-writer bug
+      leaves us stranded):
+        /opt/cobot/logs           2 GB
+        /opt/cobot/joint_history  2 GB
+        /opt/cobot/event_log      500 MB
+
+      Thresholds (free bytes on the partition):
+        WARN     < 2 GB   — footer widget amber; banner suggestion
+        CRITICAL < 500 MB — non-critical writers stop (event log,
+                            deploy log tail); critical writers
+                            still attempt with 507 on failure
+        DEAD     < 50 MB  — critical writers refuse pre-emptively
+
+      Endpoint: GET /api/disk_status.
+
+      Fork rule: NO other module implements its own free-space
+      check with different thresholds, and NO module defines its
+      own bytes-cap constant for /opt/cobot/logs, /opt/cobot/
+      event_log, or /opt/cobot/joint_history outside disk_watchdog
+      (the canonical domain writers keep their own prune, but the
+      NUMBERS must match disk_watchdog.DIR_CAPS — mirror, don't
+      diverge).
+    canonical:
+      python:
+        module: cobot_dashboard.disk_watchdog
+        functions: [free_bytes, level, should_write, enforce_all,
+                    status, start_watchdog_thread]
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [api_disk_status]
+      frontend:
+        path: src/cobot_dashboard/frontend/src/components/StatusBar.jsx
+        exports: [default]
+    forbidden:
+      # No competing free-space thresholds. `statvfs` calls belong in
+      # disk_watchdog; anyone else calling it directly is a fork.
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          - "os\\.statvfs\\("
+          - "shutil\\.disk_usage\\("
+        path_exempt:
+          - src/cobot_dashboard/cobot_dashboard/disk_watchdog.py
+          - '**/test_*.py'
+    known_debt: []
 
 
 # ── Heuristic sweep ─────────────────────────────────────────────────

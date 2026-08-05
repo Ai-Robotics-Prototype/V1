@@ -98,9 +98,19 @@ export default function App() {
   const activeTab       = useStore((s) => s.activeTab)
   const hydrateCells    = useStore((s) => s.hydrateCells)
   const hydratePrograms = useStore((s) => s.hydratePrograms)
+  const restoreOpenProgramOnMount = useStore(
+    (s) => s.restoreOpenProgramOnMount)
 
   useEffect(() => {
     connectWS()
+    // 2026-08-05 (refresh persistence, fork registry:
+    // page_context_persistence): rehydrate the last-open program
+    // for THIS device from the server. If a draft with a
+    // staged_program exists, that (unsaved edits) wins over the
+    // disk-saved copy — same doctrine as record-through for
+    // poses. Blank state only when the device has never opened
+    // a program.
+    restoreOpenProgramOnMount()
     // Hydrate cells + programs from their respective endpoints at
     // app boot so any tab the operator lands on first — Configure,
     // 3D View, Program, Program Library — sees a populated state on

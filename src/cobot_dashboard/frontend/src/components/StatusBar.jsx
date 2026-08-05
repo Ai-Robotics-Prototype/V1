@@ -81,6 +81,27 @@ export default function StatusBar() {
     return () => { cancelled = true; clearInterval(t) }
   }, [])
 
+  // 2026-08-05 disk watchdog — footer widget shows free space
+  // on /opt/cobot. Amber below 2 GB (WARN), red below 500 MB
+  // (CRITICAL). Polls every 30 s. Same source of truth the
+  // /api/disk_status endpoint exposes (fork registry:
+  // disk_watchdog).
+  const [disk, setDisk] = useState(null)
+  useEffect(() => {
+    let cancelled = false
+    async function pollDisk() {
+      try {
+        const r = await fetch('/api/disk_status')
+        if (!r.ok) return
+        const d = await r.json()
+        if (!cancelled) setDisk(d)
+      } catch { /* keep last known value */ }
+    }
+    pollDisk()
+    const t = setInterval(pollDisk, 30000)
+    return () => { cancelled = true; clearInterval(t) }
+  }, [])
+
   const zoneColor = ZONE_COLORS[safety.zone] ?? '#9A9A9E'
   const dotColor  = wsStatus === 'connected' ? '#22C55E'
                   : wsStatus === 'connecting' ? '#EAB308'
@@ -104,6 +125,35 @@ export default function StatusBar() {
       <Block>ROS2 Humble</Block>
       <Block>Robot Generic TCP</Block>
       <Block>IP&nbsp;192.168.1.246</Block>
+
+      {/* 2026-08-05 disk watchdog widget — ok/warn/critical/dead
+          from /api/disk_status. Amber below 2 GB free, red below
+          500 MB. Same colors runState uses. */}
+      {disk && (
+        <Block
+          data-testid="disk-status-block"
+          style={{
+            color: (disk.level === 'dead' || disk.level === 'critical')
+                       ? '#DC2626'
+                   : disk.level === 'warn'
+                       ? '#B45309'
+                       : 'var(--text-secondary)',
+          }}
+          title={`Disk /opt/cobot: ${disk.free_human} free.\n`
+               + disk.dirs.map((d) =>
+                   `${d.path}: ${d.size_human} / ${d.cap_human}`)
+                   .join('\n')}>
+          Disk&nbsp;
+          <span style={{ fontWeight: 600 }}>{disk.free_human}</span>
+          {disk.level !== 'ok' && (
+            <span style={{ marginLeft: 6, fontSize: 10,
+                           textTransform: 'uppercase',
+                           letterSpacing: '0.05em' }}>
+              {disk.level}
+            </span>
+          )}
+        </Block>
+      )}
 
       {/* Unified run-state (same source as the Monitor pill). Was
           previously reading task.state directly — that only reflected
