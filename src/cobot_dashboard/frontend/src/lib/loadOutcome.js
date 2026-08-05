@@ -251,3 +251,39 @@ export function namedLoadError(body, httpStatus) {
     technicalDetail: rawReason || `HTTP ${httpStatus || '?'}`,
   })
 }
+
+
+// 2026-08-05 registry rule (operator_refusal_copy): every operator-
+// facing refusal renders ONLY through this module. The Run-refused
+// modal, the Monitor restart-refused toast, and the mid-run speed-
+// change refusal all use these named-outcome helpers.
+//
+// `namedSpeedRefusal` handles the /api/estun/program/speed body
+// shape, which differs from the load/run outcome shape:
+//   * top-level `reason` (not nested under `outcome`)
+//   * `needs_confirm` flag for the high-speed-confirm gate
+//   * `effective_pct` / `operator_cap_pct` / `threshold_pct` context
+
+export function namedSpeedRefusal(body, httpStatus) {
+  const rawReason = (body && (body.reason || body.error)) || ''
+  // 409 needs_confirm — a real refusal that's actually a "please
+  // confirm" prompt. Callers that render the confirm UI shouldn't
+  // hit this path; if they do, this copy makes it clear.
+  if (httpStatus === 409 && body?.needs_confirm) {
+    return _shape({
+      code:    'speed_needs_confirm',
+      title:   'High-speed change needs confirmation.',
+      detail:  `Requested speed exceeds the high-speed threshold `
+             + `(${body.threshold_pct}%). Re-submit with the confirm `
+             + `dialog.`,
+      technicalDetail: rawReason,
+    })
+  }
+  return _shape({
+    code:    'speed_refused',
+    title:   "Speed change refused — program speed stayed the same.",
+    detail:  'Try again in a moment. If it persists, check the driver '
+           + 'link and operator cap in Monitor.',
+    technicalDetail: rawReason || `HTTP ${httpStatus || '?'}`,
+  })
+}

@@ -16,7 +16,7 @@ import { deriveRunState, isStopButtonEnabled,
          STUCK_STOPPING_MS } from '../lib/runState'
 import { readPayload, payloadChipLabel } from '../lib/payload'
 import { runnableStepCount } from '../lib/programTruth'
-import { namedLoadError } from '../lib/loadOutcome'
+import { namedLoadError, namedSpeedRefusal } from '../lib/loadOutcome'
 
 // Status badge — reads the unified deriveRunState() so pill matches
 // footer matches banner. Rendered from a runState object (color, label,
@@ -1653,8 +1653,19 @@ async function restartProgram({ cancelProgram, currentProgram, runSpeedPct, robo
     if (body?.ok) {
       if (addToast) addToast(`Restarted "${name}" from step 1`, 'success')
     } else {
-      const reason = body?.outcome?.reason || body?.error || `HTTP ${res.status}`
-      if (addToast) addToast(`Restart refused: ${reason}`, 'error')
+      // 2026-08-05 (operator_refusal_copy fork registry): route
+      // through the shared namedLoadError so the toast shows an
+      // operator-language title/detail with the raw wire reason
+      // demoted to technicalDetail behind the Details toggle.
+      if (addToast) {
+        const named = namedLoadError(body || {}, res.status)
+        addToast({
+          title:           named.title,
+          detail:          named.detail,
+          technicalDetail: named.technicalDetail,
+          code:            'restart_refused:' + (named.code || 'unknown'),
+        }, 'error', 8000)
+      }
     }
   } catch (e) {
     if (addToast) addToast(`Restart failed: ${e}`, 'error')
@@ -1799,7 +1810,19 @@ function MidRunSpeedControl({ robot, addToast }) {
         return
       }
       if (!res.ok || !body?.ok) {
-        addToast(`Speed change refused: ${body?.reason || body?.error || res.status}`, 'error')
+        // 2026-08-05 (operator_refusal_copy fork registry): the
+        // /api/estun/program/speed refusal body carries a top-
+        // level `reason` (not outcome.kind), so we use the
+        // dedicated namedSpeedRefusal helper. Toast renders
+        // structured title/detail/technicalDetail like every
+        // other refusal surface.
+        const named = namedSpeedRefusal(body || {}, res.status)
+        addToast({
+          title:           named.title,
+          detail:          named.detail,
+          technicalDetail: named.technicalDetail,
+          code:            named.code,
+        }, 'error', 6000)
         return
       }
       const applied = body.effective_pct

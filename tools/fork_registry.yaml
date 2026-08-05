@@ -698,6 +698,61 @@ capabilities:
           component") is broader than the immediate regression fix.
         owner: dashboard-transport
 
+  # 23. Operator refusal copy (2026-08-05 operator directive).
+  - id: operator_refusal_copy
+    description: >
+      Every operator-facing refusal surface (Run modal, Load toast,
+      Restart-refused toast, Speed-change-refused toast, and any
+      future one) renders ONLY through the shared copy module at
+      src/cobot_dashboard/frontend/src/lib/loadOutcome.js.
+
+      That module returns a {code, title, detail, technicalDetail,
+      headline} triple where:
+        * title / detail  — operator-language sentences: what
+                            happened + what to do. Never carry
+                            technical tokens (codegen, HTTP
+                            codes, driver reject fragments,
+                            firmware bug citations, sha hashes).
+                            The BANNED_OPERATOR_TOKENS list is
+                            enforced by test_load_outcome pinned
+                            tests.
+        * technicalDetail — the raw wire reason, hidden behind a
+                            "Details" toggle in the modal or
+                            demoted to a details section in the
+                            toast.
+
+      Fork rule: no operator-facing render site may concatenate
+      `outcome.reason || body.error || HTTP status` into a
+      user-visible string. Every site imports namedLoadError or
+      namedSpeedRefusal and renders the structured result. The
+      three canonical call sites are the Run modal, the
+      Monitor Restart-refused toast, and the Monitor Speed-
+      change-refused toast — all pinned by
+      test_operator_refusal_copy.py.
+    canonical:
+      frontend:
+        path: src/cobot_dashboard/frontend/src/lib/loadOutcome.js
+        exports: [namedLoadError, namedSpeedRefusal,
+                  BANNED_OPERATOR_TOKENS, LOAD_OUTCOME_KINDS]
+    forbidden:
+      # A component-scoped raw refusal render — concatenating the
+      # wire reason directly into a user-visible string. The
+      # regex matches the exact anti-pattern the 2026-08-05
+      # sweep found: `outcome?.reason || body?.error` or
+      # `body?.reason || body?.error` used inside a setToast /
+      # setError / setErrorText / render string.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{jsx,js}
+        patterns:
+          - "outcome\\??\\.reason\\s*\\|\\|\\s*body"
+          - "body\\??\\.reason\\s*\\|\\|\\s*body\\??\\.error"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/loadOutcome.js
+          - src/cobot_dashboard/frontend/src/lib/loadOutcome.test.js
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+          - '**/*.pinned.test.js'
+    known_debt: []
+
   # 22. Unified event log (2026-08-05 operator directive).
   - id: event_log
     description: >

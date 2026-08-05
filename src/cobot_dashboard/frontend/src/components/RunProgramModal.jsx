@@ -3,6 +3,7 @@ import { useStore } from '../store/useStore'
 import { readPayload, PAYLOAD_UNSET_WARNING, PAYLOAD_INFO_ONLY }
   from '../lib/payload'
 import { runnableStepCount } from '../lib/programTruth'
+import { namedLoadError } from '../lib/loadOutcome'
 
 // Confirm modal for the Monitor "Run Program" button. Reads the same
 // currentProgram + robot.allow_move + robot.operator_speed_limit that
@@ -38,7 +39,14 @@ export default function RunProgramModal() {
 
   const [phase, setPhase]   = useState('confirm')  // 'confirm' | 'running' | 'error' | 'ok'
   const [result, setResult] = useState(null)
-  const [errorText, setErrorText] = useState('')
+  // 2026-08-05 (operator_refusal_copy fork registry): the refusal
+  // renders as a structured {title, detail, technicalDetail} triple
+  // sourced from namedLoadError, matching the ToastContainer copy
+  // register. The pre-fix `errorText` string dumped raw wire text
+  // into a monospace box — operator saw "codegen:", HTTP codes,
+  // driver reject strings without operator language.
+  const [errorCopy, setErrorCopy] = useState(null)
+  const [showTechnical, setShowTechnical] = useState(false)
 
   // Codegen staleness — polled once when the modal opens. If the
   // in-memory sha differs from the disk sha, the run WILL use the
@@ -52,7 +60,8 @@ export default function RunProgramModal() {
     if (open) {
       setPhase('confirm')
       setResult(null)
-      setErrorText('')
+      setErrorCopy(null)
+      setShowTechnical(false)
       setCodegen(null)
       // Fetch fresh state on every open — the operator may have
       // restarted the service between button presses.
@@ -119,9 +128,16 @@ export default function RunProgramModal() {
 
   async function confirmRun() {
     if (!currentProgram?.id) {
-      setPhase('error'); setErrorText('No program loaded.'); return
+      setPhase('error')
+      setErrorCopy({
+        code: 'no_program',
+        title: 'No program loaded — pick one from Program Library first.',
+        detail: '',
+        technicalDetail: '',
+      })
+      return
     }
-    setPhase('running'); setResult(null); setErrorText('')
+    setPhase('running'); setResult(null); setErrorCopy(null); setShowTechnical(false)
     try {
       const res = await fetch('/api/estun/program/run', {
         method: 'POST',
@@ -145,15 +161,21 @@ export default function RunProgramModal() {
         setTimeout(close, 900)
       } else {
         setPhase('error')
-        // Surface the driver's own reason when the gate rejected.
-        const reason = body?.outcome?.reason
-          || body?.error
-          || `HTTP ${res.status}`
-        setErrorText(reason)
+        // 2026-08-05 (operator_refusal_copy): route through the
+        // shared copy module — {title, detail, technicalDetail}.
+        // Raw wire text (codegen tags, HTTP codes, driver reject
+        // strings) is DEMOTED to technicalDetail, hidden behind
+        // the Details toggle. Fork registry: operator_refusal_copy.
+        setErrorCopy(namedLoadError(body || {}, res.status))
       }
     } catch (e) {
       setPhase('error')
-      setErrorText(String(e))
+      setErrorCopy({
+        code:            'network',
+        title:           "Couldn't reach the dashboard — network hiccup.",
+        detail:          'Try again in a moment.',
+        technicalDetail: String(e && e.message || e),
+      })
     }
   }
 
@@ -359,13 +381,56 @@ export default function RunProgramModal() {
 
         {phase === 'error' && (
           <>
-            <div style={{
+            {/* 2026-08-05 (operator_refusal_copy fork registry): the
+                refusal renders as an operator-language title +
+                detail. Raw wire text lives in `technicalDetail`
+                behind a Details toggle — same register as the
+                ToastContainer (267108a). Pre-fix, this box dumped
+                `outcome.reason` verbatim, so operators saw phrases
+                like "codegen:", "HTTP 5xx", and driver reject
+                fragments with no explanation. */}
+            <div data-testid="run-refused-copy" style={{
               padding: 12, background: '#FEE2E2',
               border: '1px solid #DC2626', borderRadius: 6,
               color: '#7F1D1D', fontSize: 14, marginBottom: 12,
-              fontFamily: 'monospace',
             }}>
-              {errorText || 'Run refused (no details).'}
+              <div style={{ fontWeight: 700, marginBottom: 4 }}>
+                {errorCopy?.title || 'Run refused.'}
+              </div>
+              {errorCopy?.detail && (
+                <div style={{ fontWeight: 400, marginBottom: 4 }}>
+                  {errorCopy.detail}
+                </div>
+              )}
+              {errorCopy?.technicalDetail && (
+                <>
+                  <button
+                    data-testid="run-refused-details-toggle"
+                    onClick={(e) => { e.stopPropagation()
+                                      setShowTechnical((v) => !v) }}
+                    style={{
+                      background: 'none', border: 'none',
+                      color: '#7F1D1D', fontSize: 11,
+                      textDecoration: 'underline', padding: 0,
+                      marginTop: 6, cursor: 'pointer',
+                    }}>
+                    {showTechnical ? 'Hide details' : 'Details'}
+                  </button>
+                  {showTechnical && (
+                    <pre
+                      data-testid="run-refused-technical"
+                      style={{
+                        marginTop: 6, padding: 8,
+                        background: '#FFFFFF',
+                        border: '1px solid #FCA5A5',
+                        borderRadius: 4,
+                        fontSize: 11, fontFamily: 'monospace',
+                        whiteSpace: 'pre-wrap',
+                        color: '#7F1D1D',
+                      }}>{errorCopy.technicalDetail}</pre>
+                  )}
+                </>
+              )}
             </div>
             {result?.outcome?.payload_head && (
               <div style={{ fontSize: 12, color: '#6b7280',
