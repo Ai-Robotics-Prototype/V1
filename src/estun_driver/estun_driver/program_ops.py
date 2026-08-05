@@ -1183,6 +1183,23 @@ def check_program_pending_poses(program: dict) -> list:
             return True
         return False
 
+    # 2026-08-05 (home-share legacy self-heal): mirror of the
+    # frontend's isTeachable sibling-scan — any move_home step
+    # after the FIRST move_home shares the first's pose. Pre-fix,
+    # this check was frontend-only, so legacy programs composed
+    # before the home-unification composer patch (fix 1e4586c)
+    # had NO derived_from on their second move_home and got flagged
+    # here as pending. Operators who taught the first home
+    # correctly then hit pending_poses at Save with no way to
+    # resolve without re-teaching a shared position. Rule mirrors
+    # the frontend + composer semantics exactly: only skips
+    # sibling-scan when `overridden === True`.
+    first_home_idx = None
+    for _hi, _hs in enumerate(steps):
+        if str(_hs.get('action') or '').lower() == 'move_home':
+            first_home_idx = _hi
+            break
+
     for i, s in enumerate(steps):
         action = s.get('action')
         if action in _NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK:
@@ -1193,6 +1210,16 @@ def check_program_pending_poses(program: dict) -> list:
         if derived and derived in role_map:
             _ai, anchor = role_map[derived]
             if _anchor_resolved(anchor):
+                continue
+        # Home-share (legacy shape): later move_home resolves if
+        # the FIRST move_home is taught. Skipped when
+        # step.overridden === True (operator override to teach an
+        # independent second home).
+        if (action == 'move_home'
+                and first_home_idx is not None
+                and i > first_home_idx
+                and not s.get('overridden')):
+            if _anchor_resolved(steps[first_home_idx]):
                 continue
         tj = s.get('taught_joints')
         tj_len = len(tj) if isinstance(tj, list) else None
