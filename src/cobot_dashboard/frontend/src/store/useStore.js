@@ -2002,11 +2002,37 @@ const storeDefinition = (set, get) => ({
                 // Preserve `message` for legacy renderers that
                 // haven't been updated. Prefer title in the
                 // Toast component, fall back to message.
-                message: t.title || t.message || '' }
+                message: t.title || t.message || '',
+                repeatCount: 1 }
     } else {
       toast = { id, type, ts: Date.now(),
                 title: '', detail: '', technicalDetail: '',
-                message: msgOrObject }
+                message: msgOrObject,
+                repeatCount: 1 }
+    }
+    // 2026-08-05 (doctrine: honest messaging, no toast storm): if an
+    // identical toast (same message/title/detail) is already alive
+    // within COALESCE_WINDOW_MS, bump its repeatCount + refresh its
+    // dwell timer instead of stacking a fresh toast. The renderer
+    // shows "(×N)" next to the title once repeatCount > 1. This
+    // works for every caller — the escape-only refuse toast, the
+    // load-path errors, the run-completion pings — because it's
+    // keyed on the text the operator would see repeated.
+    const COALESCE_WINDOW_MS = 5000
+    const key = (toast.title || toast.message || '')
+              + '|' + (toast.detail || '')
+    const now = Date.now()
+    const existing = get().toasts.find((t) =>
+      (t.title || t.message || '') + '|' + (t.detail || '') === key
+      && (now - (t.ts || 0)) < COALESCE_WINDOW_MS
+    )
+    if (existing) {
+      set((s) => ({
+        toasts: s.toasts.map((t) => t.id === existing.id
+          ? { ...t, repeatCount: (t.repeatCount || 1) + 1, ts: now }
+          : t)
+      }))
+      return existing.id
     }
     set((s) => ({ toasts: [...s.toasts, toast] }))
     // Duration override (2026-08-04): error-severity toasts for the

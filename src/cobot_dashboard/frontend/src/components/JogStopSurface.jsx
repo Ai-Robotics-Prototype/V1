@@ -86,7 +86,9 @@ export function LiveMarginHUD({ robot }) {
 
   // Static approach warnings — every joint within APPROACH_HUD_MARGIN_DEG
   // of its safe_edge is listed. Persistent while in the zone (directive
-  // item 3: not a transient toast).
+  // item 3: not a transient toast). 2026-08-05: past-limit joints render
+  // the honest "past its limit — jog {escape} to recover" line; approach
+  // joints render the softer distance-to-edge line.
   const approaching = joints
     .map((j) => {
       const cur   = Number(j?.current_deg)
@@ -95,11 +97,16 @@ export function LiveMarginHUD({ robot }) {
       if (!Number.isFinite(cur) || !Number.isFinite(lim) || !Number.isFinite(mrg)) return null
       const safeEdge = lim - mrg
       const headroom = safeEdge - Math.abs(cur)
-      if (headroom > APPROACH_HUD_MARGIN_DEG || headroom < 0) return null
+      const past     = headroom < 0
+      if (headroom > APPROACH_HUD_MARGIN_DEG) return null
+      const escapeSym = cur >= 0 ? '−' : '+'
       return {
         joint:    Number(j.joint) || 0,
         current:  cur,
+        limit:    lim,
         headroom,
+        past,
+        escapeSym,
       }
     })
     .filter(Boolean)
@@ -135,9 +142,10 @@ export function LiveMarginHUD({ robot }) {
         </div>
       ) : null}
       {approaching.map((r) => (
-        <div key={r.joint} style={{ fontWeight: 400 }}>
-          J{r.joint} at {r.current.toFixed(0)}° — {r.headroom.toFixed(0)}°
-          {' to the safety edge'}
+        <div key={r.joint} style={{ fontWeight: r.past ? 700 : 400 }}>
+          {r.past
+            ? `J${r.joint} past its limit (${r.current.toFixed(0)}° / ±${r.limit.toFixed(0)}°) — jog ${r.escapeSym}J${r.joint} to recover`
+            : `J${r.joint} at ${r.current.toFixed(0)}° — ${r.headroom.toFixed(0)}° to the safety edge`}
         </div>
       ))}
     </div>

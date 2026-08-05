@@ -65,6 +65,20 @@ function Toast({ toast, onRemove }) {
         <div data-testid="toast-title"
              style={{ fontWeight: detail || tech ? 600 : 400 }}>
           {title}
+          {toast.repeatCount > 1 && (
+            <span data-testid="toast-repeat-count"
+                  style={{
+                    marginLeft: 6,
+                    padding: '1px 6px',
+                    borderRadius: 8,
+                    fontSize: 11,
+                    fontWeight: 700,
+                    background: 'var(--surface-muted, #e5e7eb)',
+                    color: 'var(--text-muted, #4b5563)',
+                  }}>
+              ×{toast.repeatCount}
+            </span>
+          )}
         </div>
         {detail && (
           <div data-testid="toast-detail"

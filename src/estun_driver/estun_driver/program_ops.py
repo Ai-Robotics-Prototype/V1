@@ -2038,6 +2038,13 @@ DEFAULT_ANALYZER_CONFIG: dict = {
     # Rule 2b — near-limit / near-singularity speed cap.
     'joint_limit_margin_warn_deg':  5.0,   # rule 3a — warn on taught point
     'joint_limit_margin_cap_deg':  15.0,   # rule 2b — cap segment speed
+    # Rule 3d (2026-08-05) — taught pose has any joint PAST the soft band
+    # (|angle| > limit − soft_margin). At save time this is a BLOCK-level
+    # finding: the pose won't be reachable at run because the driver's
+    # escape-only clamp will refuse the deeper-direction motion the run
+    # trajectory would need. Doctrine: jog now can't trap the operator;
+    # programs shouldn't be able to either.
+    'joint_past_soft_band_deg':     2.0,   # matches driver joint_limit_margin_deg
     'wrist_singularity_deg':       10.0,   # rule 2b — |J5| within N° of 0
     'near_limit_speed_scale':       0.5,   # rule 2b — 50% of commanded
     # Rule 2c — descent split.
@@ -2408,6 +2415,39 @@ def analyze_program(program: dict, *,
                 metrics={
                     'joints_deg':  list(j),
                     'margins_deg': list(margins),
+                }))
+
+    # ── Rule 3d (2026-08-05): pose has any joint PAST the soft band ─
+    # Fires at save time. Doctrine: a limit is a wall, not a cage —
+    # and a program that stores a past-limit taught pose is a program
+    # that will trap the run trajectory just like a jog does. Named
+    # 'joint_past_soft_band' so filters can find and re-teach.
+    past_margin = float(ac['joint_past_soft_band_deg'])
+    for i, j in enumerate(resolved_j):
+        if j is None:
+            continue
+        margins = _joint_limit_margin(j)
+        past = [(k + 1, margins[k]) for k in range(6)
+                if margins[k] == margins[k] and margins[k] < past_margin]
+        if past:
+            worst_axis, worst_margin = min(past, key=lambda pair: pair[1])
+            escape_sym = '−' if j[worst_axis - 1] > 0 else '+'
+            findings.append(_finding(
+                i, steps[i], 'warn',
+                'joint_past_soft_band',
+                f'J{worst_axis} at {j[worst_axis-1]:+.1f}° is past its '
+                f'±{_JOINT_LIMITS_DEG[worst_axis-1]:g}° soft band '
+                f'({worst_margin:+.2f}° from physical limit) — this pose '
+                f'will refuse to run: the escape-only clamp will block '
+                f'the trajectory motion needed to reach it',
+                f'Re-teach the point: jog {escape_sym}J{worst_axis} back '
+                f'inside the soft band, then Record Position again.',
+                metrics={
+                    'joints_deg':      list(j),
+                    'margins_deg':     list(margins),
+                    'past_soft_band':  True,
+                    'worst_joint':     worst_axis,
+                    'escape_symbol':   escape_sym,
                 }))
 
     # ── Rule 2b: speed cap when segment path passes near a limit

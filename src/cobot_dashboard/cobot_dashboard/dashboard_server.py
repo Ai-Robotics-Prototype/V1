@@ -978,25 +978,28 @@ def _jog_stop_cause_operator_copy(cause: dict, joint_limits: list) -> dict:
     # vs joint mode. release_cmd is suppressed by the frontend (it's
     # the operator's own gesture), but we still return a triple so a
     # log reader can see the tag.
-    if tag == 'joint_limit':
+    if tag == 'joint_limit' or tag == 'joint_limit_deeper':
         if joint_i1 and isinstance(joint_deg, (int, float)):
             lim_s = _joint_limit_display(joint_i1)
+            # Escape direction: reduces abs(joint_deg). If joint is at
+            # negative angle, escape is +; if positive, escape is -.
+            escape_sym = '+' if joint_deg < 0 else '-'
             if jog_mode == 'continuous_cart':
                 return _out(
-                    f'Jog stopped — J{joint_i1} near its limit.',
+                    f'Jog stopped — J{joint_i1} past its limit.',
                     (f'J{joint_i1} is at {joint_deg:+.0f}° of {lim_s}. '
-                     f'Rotate J{joint_i1} back to give room, or switch '
-                     f'to Joint mode to work near the wall.'),
+                     f'Switch to Joint mode and jog {escape_sym}J{joint_i1} '
+                     f'to recover, then retry cart.'),
                 )
-            # Joint-mode approach
+            # Joint-mode: name the exact button that works.
             return _out(
-                f'Jog stopped — J{joint_i1} near its limit.',
+                f'Jog stopped — J{joint_i1} past its limit.',
                 (f'J{joint_i1} is at {joint_deg:+.0f}° of {lim_s}. '
-                 f'Jog the other direction.'),
+                 f'Jog {escape_sym}J{joint_i1} to recover.'),
             )
         return _out(
-            'Jog stopped — a joint is near its limit.',
-            'Jog the other direction, or switch modes to work near the wall.',
+            'Jog stopped — a joint is past its limit.',
+            'Jog the opposite direction to recover.',
         )
 
     if tag == 'freshness_deadman':

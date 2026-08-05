@@ -1965,14 +1965,14 @@ class EstunCodroidDriver(Node):
             if current_deg > escape_only_edge and direction > 0:
                 self._reject(family,
                              f'escape_only: J{axis} at {current_deg:+.2f}° past '
-                             f'+{escape_only_edge:.2f}° — deeper-direction hold refused '
-                             f'(jog J{axis} negative to escape)')
+                             f'+{escape_only_edge:.2f}° — J{axis} can\'t go further; '
+                             f'jog -J{axis} instead')
                 return
             if current_deg < -escape_only_edge and direction < 0:
                 self._reject(family,
                              f'escape_only: J{axis} at {current_deg:+.2f}° past '
-                             f'-{escape_only_edge:.2f}° — deeper-direction hold refused '
-                             f'(jog J{axis} positive to escape)')
+                             f'-{escape_only_edge:.2f}° — J{axis} can\'t go further; '
+                             f'jog +J{axis} instead')
                 return
             # Direction-aware check: only reject when we'd be pushing PAST
             # the far edge in the commanded direction.
@@ -2244,15 +2244,22 @@ class EstunCodroidDriver(Node):
         if self._last_posture_ts <= 0.0:
             self._reject(family, 'cart pulse: no posture reading yet')
             return
+        # 2026-08-05 (doctrine: a limit is a wall, not a cage): cart pulse
+        # start-clamp refuses only when a joint is PAST the physical
+        # limit — the soft-edge case is handled by the supervise-tick
+        # velocity-sign check, which permits escape motion. A jog is
+        # rejected ONLY if the commanded motion moves the joint FURTHER
+        # PAST its limit. See _on_jog_supervise's continuous_cart branch
+        # for the mid-motion direction check.
         for i in range(6):
-            margin = self._dyn_limit_margin_deg(i, effective_frac)
-            safe_edge = self._joint_limit_deg[i] - margin
-            if abs(self._joint_deg[i]) >= safe_edge:
+            limit = self._joint_limit_deg[i]
+            if abs(self._joint_deg[i]) >= limit:
                 self._reject(family,
                              f'cart pulse clamp: J{i+1} at {self._joint_deg[i]:+.2f}° '
-                             f'exceeds ±{safe_edge:.2f}° '
-                             f'(dyn margin {margin:.2f}° @ f={effective_frac:.2f}) '
-                             f'— refuse to pulse')
+                             f'past physical ±{limit:.2f}° — '
+                             f'jog J{i+1} '
+                             f'{"-" if self._joint_deg[i] > 0 else "+"} '
+                             f'in Joint mode to recover, then retry cart')
                 return
 
         with self._jog_lock:
@@ -2804,22 +2811,67 @@ class EstunCodroidDriver(Node):
                                        f'(-{safe_edge:.2f}°, dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
                             return
                 elif self._jog_mode == 'continuous_cart':
-                    # Hard-stop first (unchanged safety): if any joint is
-                    # AT or PAST its dynamic safe_edge, stop now with the
-                    # existing reason string. The softening ramp below
-                    # runs only when we're still inside the safe_edge.
+                    # 2026-08-05 (doctrine: a limit is a wall, not a cage):
+                    # cart-mode hard-stop must be DIRECTION-AWARE per joint.
+                    # A joint past its safe_edge whose live velocity is
+                    # ESCAPING (opposite sign from position) is heading
+                    # back inside the band — do NOT stop it. Only stop
+                    # when velocity DEEPENS the violation, or when past
+                    # the physical limit (the true wall).
+                    #
+                    # Finite-difference velocity from the last two posture
+                    # samples. If we don't have two samples yet (fresh
+                    # hold), we skip the deep-check and rely on the next
+                    # tick — 50 ms of grace at crawl speed is negligible
+                    # motion, and softening below already caps speed near
+                    # the edge.
                     hard_stop_fired = False
+                    pj = self._prev_joint_deg
+                    pt = self._prev_joint_ts
+                    dt = None
+                    if pj is not None and pt > 0.0 and self._last_posture_ts > pt:
+                        dt = self._last_posture_ts - pt
                     for i in range(6):
                         current = self._joint_deg[i]
                         limit = self._joint_limit_deg[i]
                         margin = self._dyn_limit_margin_deg(i, cur_frac)
                         safe_edge = limit - margin
-                        if abs(current) >= safe_edge:
+                        if abs(current) < safe_edge:
+                            continue
+                        # Physical wall — always stop when at/past the
+                        # physical limit regardless of direction. This
+                        # is the "the wall is real" case.
+                        if abs(current) >= limit:
                             self._stop_jog_locked(
                                 reason=f'cart limit approach J{i+1} at {current:+.2f}° '
-                                       f'(|>{safe_edge:.2f}°|, dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
+                                       f'(|>{limit:.2f}°| physical, dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
                             hard_stop_fired = True
                             break
+                        # Past soft edge but inside physical — check
+                        # velocity sign. Without a velocity signal, grant
+                        # one tick of grace (the softening ramp already
+                        # caps commanded speed here).
+                        if dt is None or dt < 1e-4:
+                            continue
+                        v = (current - pj[i]) / dt   # deg/s, signed
+                        # Deepening = velocity same sign as position.
+                        # Escape = velocity opposite sign, or nearly zero.
+                        VEL_ESCAPE_MIN_DPS = 0.5
+                        if abs(v) < VEL_ESCAPE_MIN_DPS:
+                            # Motion hasn't clearly started — permit; next
+                            # tick will judge.
+                            continue
+                        if (v > 0 and current > 0) or (v < 0 and current < 0):
+                            # Same sign — deepening the violation.
+                            self._stop_jog_locked(
+                                reason=f'cart limit approach J{i+1} at {current:+.2f}° '
+                                       f'(v={v:+.2f}°/s deeper, |>{safe_edge:.2f}° soft, '
+                                       f'dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
+                            hard_stop_fired = True
+                            break
+                        # Opposite sign — escaping. Do not stop. The
+                        # standard softening ramp still caps speed near
+                        # the edge, which is the right behavior.
                     if hard_stop_fired:
                         return
                     # Progressive softening — ramp speed down as any joint

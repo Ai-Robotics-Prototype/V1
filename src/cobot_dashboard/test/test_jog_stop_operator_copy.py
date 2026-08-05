@@ -102,13 +102,16 @@ def test_joint_limit_cart_j6_names_joint_and_direction():
     }
     copy = _jog_stop_cause_operator_copy(cause, _joint_limits())
     _assert_no_banned_tokens(copy)
-    # Directive example: "Jog stopped — J6 near its limit (-192° of ±200°).
-    # Rotate J6 back or use Joint mode."
+    # 2026-08-05 doctrine copy: "Jog stopped — J6 past its limit. J6 is
+    # at -193° of ±200°. Switch to Joint mode and jog +J6 to recover…"
     assert 'J6' in copy['title']
-    assert 'near its limit' in copy['title'].lower()
+    assert 'past its limit' in copy['title'].lower()
     assert 'J6' in copy['detail']
     assert '±200°' in copy['detail']
     assert 'Joint mode' in copy['detail']
+    # Cart mode names the escape button.
+    assert '+J6' in copy['detail']
+    assert 'recover' in copy['detail'].lower()
     # Raw driver text preserved in technical for the log reader.
     assert 'cart limit approach' in copy['technical']
     assert copy['tag'] == 'joint_limit'
@@ -128,8 +131,9 @@ def test_joint_limit_joint_mode_says_jog_other_direction():
     copy = _jog_stop_cause_operator_copy(cause, _joint_limits())
     _assert_no_banned_tokens(copy)
     assert 'J3' in copy['title']
-    assert 'other direction' in copy['detail'].lower() \
-        or 'jog the other' in copy['detail'].lower()
+    # Names the exact escape button — position positive → -J3.
+    assert '-J3' in copy['detail'] or '−J3' in copy['detail']
+    assert 'recover' in copy['detail'].lower()
 
 
 # ── Positive: freshness_deadman ───────────────────────────────
