@@ -681,6 +681,73 @@ capabilities:
           component") is broader than the immediate regression fix.
         owner: dashboard-transport
 
+  # 21. Teach lock banner (2026-08-05 fork-1 kill).
+  - id: teach_lock_banner
+    description: >
+      Every surface that renders the "teaching in progress on another
+      device" state MUST use the shared `TeachLockBanner` component,
+      which is the single canonical implementation of:
+        * the banner copy: "Teaching in progress on <device>
+          (last active Xm ago) — Take over to teach here."
+        * the Take Over button (fires takeOverTeachSession)
+        * the confirmation dialog before the ownership swap.
+
+      Pre-fix, the editor-tab banner rendered the Take Over button
+      but the fullscreen teach overlay ONLY exposed the lock as a
+      `disabledReason` string passed to the Record button's `title`
+      attribute (an HTML tooltip). The overlay obscured the editor
+      banner, so operators on a locked device had NO discoverable
+      way to take over.
+
+      Fork rule: any component that filters/renders the
+      `robot.teach_sessions[pid]` slice when
+      `owner_device_id !== currentDeviceId` must render
+      TeachLockBanner (or a wrapper that does). No bare
+      "Teaching in progress on" copy elsewhere.
+    canonical:
+      frontend:
+        path: src/cobot_dashboard/frontend/src/components/TeachLockBanner.jsx
+        exports: [default]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{jsx,js}
+        patterns:
+          # The literal copy fragment. New callers rendering the
+          # lock state must import the shared component.
+          - "Teaching in progress on"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/components/TeachLockBanner.jsx
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt:
+      # ProgramEditor.jsx still constructs the disabledReason string
+      # ("Teaching in progress on <owner>") for the TeachOverlay
+      # `disabledReason` prop — that string is used only for the
+      # Record button's HTML title tooltip. The visible banner
+      # comes from the TeachLockBanner slot passed alongside. The
+      # tooltip-string usage is grandfathered because it's a
+      # single-word affordance (not a UI surface competing with the
+      # canonical banner). Same-file duplication is by design.
+      # fork_lint reports these two tooltip-string sites via its
+      # comment-stripped source lines. The visible banner comes
+      # from the TeachLockBanner rendered via the `lockBanner` slot
+      # alongside — the disabledReason string is only used for the
+      # Record button's HTML `title` tooltip. Real @app.post lines
+      # here shift as the file grows; refresh the numbers from the
+      # deploy.sh lint output when they move.
+      - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
+        line: 5690
+        why: >
+          disabledReason string for the pallet-teach flow overlay's
+          Record button title tooltip. Grandfathered by the visible
+          TeachLockBanner rendered in the same subtree.
+        owner: dashboard-frontend
+      - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
+        line: 5732
+        why: >
+          disabledReason string for the single/all-step teach overlay's
+          Record button title tooltip. Same rationale as line 5690.
+        owner: dashboard-frontend
+
 
 # ── Heuristic sweep ─────────────────────────────────────────────────
 #

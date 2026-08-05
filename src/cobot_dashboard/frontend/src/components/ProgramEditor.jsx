@@ -5,6 +5,7 @@ import ProgramWizard from './ProgramWizard'
 import ProgramFromDemonstration from './ProgramFromDemonstration'
 import { HoldButton } from './JogControls'
 import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
+import TeachLockBanner from './TeachLockBanner'
 import NumericField from './NumericField'
 import PalletFrameDiagram from './PalletFrameDiagram'
 import { readPayload, PAYLOAD_UNSET_WARNING }
@@ -2264,6 +2265,11 @@ function TeachOverlay({
   // disabled. Jog is disabled by the banner-level gate elsewhere.
   recordDisabled = false,
   disabledReason = '',
+  // 2026-08-05 (teach_lock_banner): the shared TeachLockBanner
+  // rendered inside the overlay when another device owns the
+  // session. Fixes the fork-1 defect where the fullscreen overlay
+  // hid the editor tab's Take Over button.
+  lockBanner = null,
 }) {
   // Shared jog transport — WS-first with server-side hold keepalive.
   // Same store actions the main Program-tab JogControls uses; the old
@@ -2521,6 +2527,12 @@ function TeachOverlay({
           Cancel
         </button>
       </div>
+
+      {/* 2026-08-05 (teach_lock_banner): sit the lock banner ABOVE
+          the instruction band so it's the first thing the operator
+          sees on entry to a locked session. Renders only when the
+          caller passed a `lockBanner` slot (empty otherwise). */}
+      {lockBanner}
 
       {/* INSTRUCTION BAND */}
       <div style={{
@@ -3337,14 +3349,29 @@ export default function ProgramEditor() {
                        || (teachAllOrder && teachAllOrder.length > 0)
                        || palletTeachRole != null)
   const wasOverlayOpen = useRef(false)
+  // 2026-08-05 (Lesson 179 gap fix): track the PROGRAM ID that owned
+  // the currently-open teach overlay. When the operator navigates to
+  // a different program mid-teach, we must end the session on the
+  // OLD pid — not the new one. Pre-fix, the `pid = currentProgram?.id`
+  // captured the NEW program id after route change, so the /end call
+  // was harmlessly no-op and the old lock persisted until TTL.
+  const openedPidRef = useRef(null)
   useEffect(() => {
     const pid = currentProgram?.id
-    if (!pid) return
-    // Fires on the transition to closed. Uses the previous value in
-    // ref so we don't send /end when the component first mounts with
-    // no overlay open (never was open here).
-    if (wasOverlayOpen.current && !overlayOpen) {
-      try { endTeachSession(pid) } catch (_) { /* nop */ }
+    // Fires on: overlay open→closed transition OR program-id change
+    // (which effectively closes the overlay on the old program).
+    if (wasOverlayOpen.current && !overlayOpen && openedPidRef.current) {
+      try { endTeachSession(openedPidRef.current) } catch (_) { /* nop */ }
+      openedPidRef.current = null
+    } else if (overlayOpen && !wasOverlayOpen.current && pid) {
+      openedPidRef.current = pid
+    } else if (overlayOpen
+               && openedPidRef.current
+               && openedPidRef.current !== pid) {
+      // Program switched while overlay was open — end the OLD one,
+      // adopt the new pid (the overlay just re-parented itself).
+      try { endTeachSession(openedPidRef.current) } catch (_) { /* nop */ }
+      openedPidRef.current = pid
     }
     wasOverlayOpen.current = overlayOpen
   }, [overlayOpen, currentProgram?.id, endTeachSession])
@@ -3354,7 +3381,19 @@ export default function ProgramEditor() {
     if (!pid) return
     // 30 s heartbeat. TTL is 5 min server-side, so we're comfortably
     // inside the deadline even on a stuttering network.
+    //
+    // 2026-08-05 (Lesson 179 gap fix): DON'T heartbeat while the tab
+    // is hidden. Background tabs kept ticking, extending the owner-
+    // TTL indefinitely, so operators on a second device saw the lock
+    // never expire even when the original device was minimized/away.
+    // We keep the interval alive but SKIP the fetch on hidden — so
+    // the moment the tab returns to foreground we heartbeat again
+    // (no re-mount cost).
     const t = setInterval(() => {
+      if (typeof document !== 'undefined'
+          && document.visibilityState === 'hidden') {
+        return
+      }
       try { heartbeatTeachSession(pid) } catch (_) { /* nop */ }
     }, 30000)
     return () => clearInterval(t)
@@ -3362,25 +3401,31 @@ export default function ProgramEditor() {
   useEffect(() => {
     // Window unload — beacon out one last /end before the tab dies.
     // sendBeacon survives a close where fetch would be cancelled.
+    // Uses openedPidRef (not currentProgram?.id) so mid-teach program
+    // switches don't lose the release for the OLD program.
     const onBeforeUnload = () => {
-      const pid = currentProgram?.id
+      const pid = openedPidRef.current
       if (!pid || !wasOverlayOpen.current) return
       try { endTeachSessionBeacon(pid) } catch (_) { /* nop */ }
     }
     if (typeof window !== 'undefined') {
       window.addEventListener('beforeunload', onBeforeUnload)
+      // pagehide covers the iOS/Safari/tablet cases where beforeunload
+      // isn't fired reliably (bfcache, PWA background).
+      window.addEventListener('pagehide', onBeforeUnload)
     }
     return () => {
       if (typeof window !== 'undefined') {
         window.removeEventListener('beforeunload', onBeforeUnload)
+        window.removeEventListener('pagehide', onBeforeUnload)
       }
     }
-  }, [currentProgram?.id, endTeachSessionBeacon])
+  }, [endTeachSessionBeacon])
   useEffect(() => {
     // Component unmount — route change out of ProgramEditor. Same
-    // as close: release the lock.
+    // as close: release the lock on whichever pid was open.
     return () => {
-      const pid = currentProgram?.id
+      const pid = openedPidRef.current
       if (pid && wasOverlayOpen.current) {
         try { endTeachSession(pid) } catch (_) { /* nop */ }
       }
@@ -4580,42 +4625,16 @@ export default function ProgramEditor() {
           WS broadcast — this is a READ-ONLY view of the other
           operator's work in progress. Take Over swaps
           ownership atomically. */}
+      {/* 2026-08-05 (teach_lock_banner fork-1 kill): shared banner
+          + Take Over button — same component the fullscreen teach
+          overlay renders. Both surfaces show the button; the operator
+          can take over from EITHER location. Old inline copy retired. */}
       {isTeachingElsewhere && teachSession && (
-        <div data-testid="teach-session-locked-banner"
-             style={{
-               padding: '8px 16px',
-               background: '#FEF3C7',
-               borderBottom: '1px solid #F59E0B',
-               display: 'flex', alignItems: 'center',
-               gap: 12, fontSize: 13, color: '#78350f',
-             }}>
-          <span style={{ flex: 1 }}>
-            ⚠ Teaching in progress on{' '}
-            <b>{teachSession.owner_label || teachSession.owner_device_id}</b>
-            {' '}— record buttons disabled, badges update live.
-          </span>
-          <button
-            data-testid="teach-session-take-over"
-            onClick={async () => {
-              // eslint-disable-next-line no-alert
-              const ok = window.confirm(
-                'Take over teaching from '
-                + (teachSession.owner_label
-                   || teachSession.owner_device_id)
-                + '? Their record buttons will lock. Poses '
-                + 'already recorded are preserved.')
-              if (!ok) return
-              await takeOverTeachSession(currentProgram?.id, '')
-            }}
-            style={{
-              padding: '4px 12px',
-              background: '#FDE68A', border: '1px solid #B45309',
-              borderRadius: 4, fontSize: 12,
-              color: '#78350f', fontWeight: 600, cursor: 'pointer',
-            }}>
-            Take over teaching →
-          </button>
-        </div>
+        <TeachLockBanner
+          session={teachSession}
+          programId={currentProgram?.id}
+          variant="inline"
+        />
       )}
       <div className="no-scrollbar" style={{
         padding: '12px 16px',
@@ -5809,6 +5828,13 @@ export default function ProgramEditor() {
                 ? 'Teaching in progress on ' + (teachSession?.owner_label
                   || teachSession?.owner_device_id || 'another device')
                 : ''}
+              lockBanner={isTeachingElsewhere && teachSession ? (
+                <TeachLockBanner
+                  session={teachSession}
+                  programId={currentProgram?.id}
+                  variant="overlay"
+                />
+              ) : null}
               diagram={
                 <PalletFrameDiagram
                   role={palletTeachRole}
@@ -5844,6 +5870,13 @@ export default function ProgramEditor() {
               ? 'Teaching in progress on ' + (teachSession?.owner_label
                 || teachSession?.owner_device_id || 'another device')
               : ''}
+            lockBanner={isTeachingElsewhere && teachSession ? (
+              <TeachLockBanner
+                session={teachSession}
+                programId={currentProgram?.id}
+                variant="overlay"
+              />
+            ) : null}
           />
         )
       })()}

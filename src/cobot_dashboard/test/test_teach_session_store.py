@@ -253,13 +253,24 @@ def test_zustand_persist_whitelist_excludes_currentProgram():
 # ── Concurrency banner + Take Over ─────────────────────────────
 
 def test_editor_renders_teach_session_locked_banner():
+    """2026-08-05: the concurrency banner + Take Over button now
+    live inside the shared TeachLockBanner component (fork registry
+    entry `teach_lock_banner`). The editor tab renders the inline
+    variant, the fullscreen TeachOverlay renders the overlay variant
+    via the `lockBanner` slot. Test-ids moved to the shared
+    component."""
     src = _read(EDITOR_JSX)
-    assert 'data-testid="teach-session-locked-banner"' in src, (
+    # Editor tab uses the shared component.
+    assert 'TeachLockBanner' in src, (
         'concurrency banner missing — a second device teaching '
         'the same program would have no visible read-only signal')
-    assert 'data-testid="teach-session-take-over"' in src, (
-        'Take Over button missing — observer cannot switch '
-        'ownership without a full refresh')
+    # Take Over button is defined inside TeachLockBanner.jsx with
+    # test-id 'teach-lock-take-over'. Cross-file check happens in
+    # test_teach_lock_banner_parity.py.
+    lock_banner = _read(WS / 'src' / 'cobot_dashboard' / 'frontend'
+                        / 'src' / 'components' / 'TeachLockBanner.jsx')
+    assert 'data-testid="teach-lock-banner"' in lock_banner
+    assert 'data-testid="teach-lock-take-over"' in lock_banner
 
 
 def test_editor_gates_record_button_when_observing():
