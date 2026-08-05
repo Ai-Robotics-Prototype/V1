@@ -672,14 +672,14 @@ capabilities:
       # When the file grows, `deploy.sh` will surface a fresh line
       # number in the lint output; update these debt entries then.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3248
+        line: 3259
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
           Pinned by test_jog_hold_heartbeat.py.
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3378
+        line: 3389
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Pinned by test_jog_hold_heartbeat.py.
