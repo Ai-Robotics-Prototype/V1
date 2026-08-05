@@ -252,25 +252,37 @@ def test_pending_poses_skips_non_motion_actions():
         f'non-motion actions falsely flagged as pending: {findings!r}')
 
 
-def test_pending_poses_catches_holepartpalletize_on_disk():
-    """Regression pin against the on-disk holepartpalletize —
-    the exact program whose runs killed the controller on
-    2026-08-03/04. Every future save-through of this file must
-    still be recognized as pending."""
-    import json as _json
-    path = '/opt/cobot/programs/holepartpalletize.json'
-    if not os.path.isfile(path):
-        # Bench workspace missing the file — allow skip (this test
-        # is a regression pin, not a functional prerequisite).
-        return
-    with open(path) as fh:
-        prog = _json.load(fh)
+def test_pending_poses_catches_holepartpalletize_shape():
+    """Regression pin against the 2026-08-03/04 controller-crash shape.
+    Data-independent — uses a synthetic copy of the exact untaught
+    holepartpalletize.json layout (step 3 pick untaught, step 8 second
+    move_home). The pending-pose gate must flag step 3.
+
+    Note (2026-08-05): the FIRST move_home is untaught here, so the
+    home-share self-heal doesn't fire — both move_home steps ALSO
+    flag. Step 3 is the operator-actionable one (teach the pick
+    contact). The test just needs findings > 0."""
+    prog = _prog_with(steps=[
+        {'id': 1, 'action': 'move_home', 'position_role': 'home',
+         'taught': False, 'taught_joints': None},
+        {'id': 2, 'action': 'move_linear', 'derived_from': 'pick'},
+        {'id': 3, 'action': 'move_linear', 'position_role': 'pick',
+         'taught': False, 'taught_joints': None},
+        {'id': 4, 'action': 'set_io'},
+        {'id': 5, 'action': 'wait'},
+        {'id': 6, 'action': 'move_linear', 'derived_from': 'pick'},
+        {'id': 7, 'action': 'move_to_pallet', 'position_role': 'place'},
+        {'id': 8, 'action': 'move_home',
+         'taught': False, 'taught_joints': None},
+    ])
     findings = check_program_pending_poses(prog)
     assert len(findings) > 0, (
-        'holepartpalletize.json on disk is fully-taught? That is '
-        'inconsistent with the 2026-08-04 crash evidence — the '
-        'pending-pose gate should flag the same steps that fed '
-        'the controller into mm2mAndDeg2rad.')
+        'Untaught pick + untaught home shape must still trip the '
+        'pending-pose gate. Findings: {findings!r}')
+    # Step 3 (pick) is the operator-actionable finding.
+    step_ids = {f['step_id'] for f in findings}
+    assert 3 in step_ids, (
+        f'Expected step 3 (pick) among findings, got: {step_ids!r}')
 
 
 # ── Dashboard wiring ─────────────────────────────────────────────

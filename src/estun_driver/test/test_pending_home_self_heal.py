@@ -132,6 +132,35 @@ def test_only_the_first_move_home_is_the_anchor():
         f'anchor. Got home findings: {home_findings!r}')
 
 
+def test_codegen_share_home_emits_second_home_movJ():
+    """Companion to the pending-check self-heal: codegen also
+    honors the home-share rule. Pre-fix, codegen skipped a
+    second move_home with no taught_joints, silently dropping
+    the return-to-home. Post-fix, codegen reuses the FIRST
+    move_home's taught_joints, emitting movJ(p<N>) as expected."""
+    from estun_driver.program_ops import codegen_lua_from_program
+    prog = _legacy_hole_part_palletize_shape()
+    prog['steps'][0]['taught_joints'] = _HOME_JOINTS
+    prog['steps'][0]['taught'] = True
+    prog['steps'][2]['taught_joints'] = _PICK_JOINTS
+    prog['steps'][2]['taught'] = True
+    result = codegen_lua_from_program(prog, operator_speed_limit_pct=25)
+    lua = result if isinstance(result, str) else result[0]
+    # No "-- skipped" line for the second move_home (step 8).
+    home_skipped = [ln for ln in lua.splitlines()
+                    if 'skipped' in ln and 'move_home' in ln]
+    assert not home_skipped, (
+        'Codegen skipped a move_home step even though the FIRST '
+        'move_home was taught. Legacy legacy program lost its '
+        'return-to-home. Lines: %r' % home_skipped)
+    # Two movJ emissions for the two move_home steps.
+    movJ_home_lines = [ln for ln in lua.splitlines()
+                       if 'movJ(' in ln and 'move_home' in ln]
+    assert len(movJ_home_lines) >= 2, (
+        f'Expected >=2 movJ emissions for the two move_home '
+        f'steps; got {len(movJ_home_lines)}: {movJ_home_lines!r}')
+
+
 def test_non_home_derived_steps_unaffected():
     """The auto-share rule fires ONLY on move_home. A move_linear
     with position_role='place' still requires its own resolution."""

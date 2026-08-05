@@ -4294,10 +4294,39 @@ def codegen_lua_from_program(
         taught = step.get('taught_joints')
         if not (isinstance(taught, list) and len(taught) == 6
                 and all(isinstance(v, (int, float)) for v in taught)):
-            exec_lines.append(f'-- skipped {action!r}: '
-                              f'no point_name/points ref, no 6-el taught_joints '
-                              f'(got {type(taught).__name__})')
-            continue
+            # 2026-08-05 legacy-shape self-heal for move_home: match
+            # the pending-poses check + the frontend's isTeachable
+            # sibling-scan. Any move_home after the first inherits
+            # the first move_home's taught_joints (unless the step
+            # carries overridden === True). Codegen was previously
+            # skipping the second move_home with a "-- skipped"
+            # comment, silently dropping the return-to-home from
+            # legacy programs after Save. See test_codegen_share_home.
+            if (action == 'move_home' and not step.get('overridden')):
+                first_home_taught = None
+                for _ph in steps:
+                    if (str(_ph.get('action') or '').lower() == 'move_home'
+                            and isinstance(_ph.get('taught_joints'), list)
+                            and len(_ph['taught_joints']) == 6):
+                        first_home_taught = _ph['taught_joints']
+                        break
+                if first_home_taught is not None and _ph is not step:
+                    taught = [float(v) for v in first_home_taught]
+                    # Fall through to the standard taught-joints path
+                    # below (marker set so the emitted comment
+                    # reveals the share).
+                    step = dict(step)   # local copy — don't mutate program
+                    step['taught_joints'] = taught
+                    step['_home_shared_from_step_id'] = _ph.get('id')
+                else:
+                    exec_lines.append(f'-- skipped {action!r}: '
+                                      f'no first-move_home to share from')
+                    continue
+            else:
+                exec_lines.append(f'-- skipped {action!r}: '
+                                  f'no point_name/points ref, no 6-el taught_joints '
+                                  f'(got {type(taught).__name__})')
+                continue
         taught_list = [float(v) for v in taught]
         # Zero-length-movL guard.
         if verb == 'movL' and last_move_joints is not None \
