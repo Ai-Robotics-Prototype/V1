@@ -844,6 +844,69 @@ def _normalise_scene_graph(raw) -> dict:
     return {"objects": objs}
 
 # ---------------------------------------------------------------------------
+# Guided recovery — event journal (Lesson 165 extension, 2026-08-05)
+# ---------------------------------------------------------------------------
+# When a joint enters / exits the escape-only zone, append a JSON line
+# to /opt/cobot/logs/recovery_events.jsonl. Source material for the
+# commissioning wizard: which joint, at what angle, how long the
+# operator lingered, whether they recovered via the dialog or manually.
+#
+# Best-effort. A failed write never blocks the state-message pipeline
+# or the driver's clamp behavior — the safety action already happened.
+
+_RECOVERY_EVENTS_PATH = '/opt/cobot/logs/recovery_events.jsonl'
+
+
+def _write_recovery_events_from_jl(prev_jl, new_jl) -> None:
+    """Emit `past_escape_only_entered` / `past_escape_only_exited`
+    events by comparing successive joint_limits snapshots. `prev_jl`
+    and `new_jl` are both lists of dicts with 'joint',
+    'past_escape_only', 'current_deg', 'limit_deg',
+    'escape_only_edge_deg'. Silently skips when the shapes don't
+    line up."""
+    if not isinstance(new_jl, list) or not new_jl:
+        return
+    prev_by_j = {}
+    if isinstance(prev_jl, list):
+        for j in prev_jl:
+            try:
+                prev_by_j[int(j.get('joint'))] = bool(j.get('past_escape_only'))
+            except (TypeError, ValueError, AttributeError):
+                continue
+    lines = []
+    ts = time.time()
+    for j in new_jl:
+        try:
+            jn = int(j.get('joint'))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        now = bool(j.get('past_escape_only'))
+        was = prev_by_j.get(jn, False)
+        if now == was:
+            continue
+        lines.append({
+            'ts':          ts,
+            'kind':        'past_escape_only_entered' if now else 'past_escape_only_exited',
+            'joint':       jn,
+            'current_deg': j.get('current_deg'),
+            'limit_deg':   j.get('limit_deg'),
+            'escape_only_edge_deg': j.get('escape_only_edge_deg'),
+            'headroom_deg': j.get('headroom_deg'),
+        })
+    if not lines:
+        return
+    try:
+        os.makedirs(os.path.dirname(_RECOVERY_EVENTS_PATH), exist_ok=True)
+        with open(_RECOVERY_EVENTS_PATH, 'a') as fh:
+            for entry in lines:
+                fh.write(json.dumps(entry) + '\n')
+    except Exception:
+        # Recovery journal is best-effort — a full disk or permission
+        # error must not block the state pipeline.
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Jog stop-cause operator copy (Lesson 165 / directive 2026-08-04)
 # ---------------------------------------------------------------------------
 # Fork registry canonical: this function is the SINGLE translator from
@@ -1722,7 +1785,16 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             # the live joint-limit recovery guide.
             jl = d.get("joint_limits")
             if isinstance(jl, list):
+                prev_jl = r.get("joint_limits") or []
                 r["joint_limits"] = jl
+                # 2026-08-05 (guided recovery, Lesson 165 extension):
+                # detect past_escape_only True<->False transitions per
+                # joint and append a JSONL entry to
+                # /opt/cobot/logs/recovery_events.jsonl. Bounded — a
+                # single line per transition, per joint, at driver
+                # publish rate. Non-fatal if the write fails (the
+                # user experience isn't affected).
+                _write_recovery_events_from_jl(prev_jl, jl)
             # Self-collision guard telemetry (pair + distance + thresholds).
             # Dashboard uses these to tint the offending link pair
             # amber/red in the twin and render a live clearance readout.

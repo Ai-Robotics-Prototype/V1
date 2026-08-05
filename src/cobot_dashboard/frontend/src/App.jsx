@@ -6,6 +6,7 @@ import StaleCodegenBanner from './components/StaleCodegenBanner'
 import ToastContainer from './components/ToastContainer'
 import EStopOverlay from './components/EStopOverlay'
 import AlarmRecoveryModal from './components/AlarmRecoveryModal'
+import JointRecoveryModal from './components/JointRecoveryModal'
 import ObstacleEscapeModal from './components/ObstacleEscapeModal'
 import SelfCollisionWarnBanner from './components/SelfCollisionWarnBanner'
 import DeployStatusBanner from './components/DeployStatusBanner'
@@ -179,6 +180,12 @@ export default function App() {
         <ToastContainer />
         <EStopOverlay />
         <AlarmRecoveryModal />
+        {/* 2026-08-05 (guided recovery, Lesson 165 extension) — offers
+            the press-and-hold escape move when a joint is past the
+            escape-only zone. Rendered above the surface-specific
+            layouts so it appears on the teach overlay + Monitor +
+            jog page from a single mount. */}
+        <JointRecoveryModal />
         <SelfCollisionWarnBanner />
         <ObstacleEscapeModal />
         {/* PausedPresenter renders the caution-styled paused overlay

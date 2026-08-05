@@ -332,6 +332,16 @@ class EstunCodroidDriver(Node):
         self.declare_parameter('joint_limit_deg',
                                [200.0, 200.0, 166.0, 200.0, 166.0, 200.0])
         self.declare_parameter('joint_limit_margin_deg', 2.0)
+        # 2026-08-05 (guided recovery, Lesson 165 extension): once a joint
+        # is past `limit - joint_escape_only_margin_deg`, only the escape
+        # direction (the one that REDUCES abs(current_deg)) is permitted.
+        # Speed-invariant — a recovery move at 5% crawl and a fast jog at
+        # 50% both get the same "no deeper" invariant. This is the clamp
+        # the guided-recovery dialog counts on. 12° matches the widest
+        # dynamic margin the standard limit clamp uses (180°/s × f=~0.44
+        # × 0.1 s × 1.5 ≈ 12°) so an operator inside this zone was
+        # already inside the dynamic safe_edge at some plausible jog speed.
+        self.declare_parameter('joint_escape_only_margin_deg', 12.0)
         # Server should already validate |delta_deg| ≤ 5°; this is belt+braces.
         self.declare_parameter('jog_increment_max_delta_deg', 5.0)
 
@@ -570,6 +580,8 @@ class EstunCodroidDriver(Node):
         self._max_joint_speed_degps = list(self.get_parameter('max_joint_speed_degps').value)
         self._joint_limit_deg = list(self.get_parameter('joint_limit_deg').value)
         self._joint_limit_margin_deg = float(self.get_parameter('joint_limit_margin_deg').value)
+        self._joint_escape_only_margin_deg = float(
+            self.get_parameter('joint_escape_only_margin_deg').value)
         self._jog_inc_max_delta_deg = float(self.get_parameter('jog_increment_max_delta_deg').value)
         # Inputs to the SPEED-SCALED margin formulas.
         self._safety_latency_s     = float(self.get_parameter('safety_latency_s').value)
@@ -1940,6 +1952,28 @@ class EstunCodroidDriver(Node):
             limit = self._joint_limit_deg[axis-1]
             margin = self._dyn_limit_margin_deg(axis-1, effective_frac)
             safe_edge = limit - margin
+            # 2026-08-05 (guided recovery): ESCAPE-DIRECTION RULE. When
+            # a joint is already inside the escape-only zone, only the
+            # direction that REDUCES abs(current_deg) is permitted. The
+            # guided-recovery dialog relies on this — a recovery move
+            # must not be rejected by the clamp it's escaping, and a
+            # deeper-direction jog must be refused even at crawl speed
+            # (which would otherwise slip through the dynamic safe_edge
+            # check below). See `_stop_jog_locked`'s cause taxonomy —
+            # 'joint_limit_deeper' is a distinct tag from 'joint_limit'.
+            escape_only_edge = limit - self._joint_escape_only_margin_deg
+            if current_deg > escape_only_edge and direction > 0:
+                self._reject(family,
+                             f'escape_only: J{axis} at {current_deg:+.2f}° past '
+                             f'+{escape_only_edge:.2f}° — deeper-direction hold refused '
+                             f'(jog J{axis} negative to escape)')
+                return
+            if current_deg < -escape_only_edge and direction < 0:
+                self._reject(family,
+                             f'escape_only: J{axis} at {current_deg:+.2f}° past '
+                             f'-{escape_only_edge:.2f}° — deeper-direction hold refused '
+                             f'(jog J{axis} positive to escape)')
+                return
             # Direction-aware check: only reject when we'd be pushing PAST
             # the far edge in the commanded direction.
             if direction > 0 and current_deg >= safe_edge:
@@ -2738,6 +2772,27 @@ class EstunCodroidDriver(Node):
                         limit = self._joint_limit_deg[ax - 1]
                         margin = self._dyn_limit_margin_deg(ax - 1, cur_frac)
                         safe_edge = limit - margin
+                        # 2026-08-05 (guided recovery): escape-only zone
+                        # covers the case where the hold slipped through
+                        # the start clamp (e.g. current was inside safe_edge
+                        # at start, then drifted past it during motion) —
+                        # continue-in-deeper-direction fires with the
+                        # 'joint_limit_deeper' cause tag so the modal
+                        # can distinguish it from the ordinary limit
+                        # approach.
+                        escape_only_edge = limit - self._joint_escape_only_margin_deg
+                        if current > escape_only_edge and self._jog_direction > 0:
+                            self._stop_jog_locked(
+                                reason=f'escape_only J{ax} at {current:+.2f}° past '
+                                       f'+{escape_only_edge:.2f}° — deeper-direction '
+                                       f'refused mid-motion')
+                            return
+                        if current < -escape_only_edge and self._jog_direction < 0:
+                            self._stop_jog_locked(
+                                reason=f'escape_only J{ax} at {current:+.2f}° past '
+                                       f'-{escape_only_edge:.2f}° — deeper-direction '
+                                       f'refused mid-motion')
+                            return
                         if self._jog_direction > 0 and current >= safe_edge:
                             self._stop_jog_locked(
                                 reason=f'limit approach J{ax} at {current:+.2f}° '
@@ -2877,6 +2932,10 @@ class EstunCodroidDriver(Node):
         # get swept up by the generic "hb send failed" match.
         ('release cmd',        'release_cmd'),
         ('hold staleness',     'freshness_deadman'),
+        # 2026-08-05 (guided recovery): the escape-only zone drops a
+        # distinct tag so the frontend's JointRecoveryModal can bind
+        # to it separately from the generic 'joint_limit' cause.
+        ('escape_only',        'joint_limit_deeper'),
         ('cart limit',         'joint_limit'),
         ('limit approach',     'joint_limit'),
         ('increment complete', 'increment_end'),
@@ -4235,6 +4294,13 @@ class EstunCodroidDriver(Node):
                     'margin_deg':    self._joint_limit_margin_deg,
                     'out_of_range':  abs(self._joint_deg[i]) > self._joint_limit_deg[i],
                     'near_limit':    abs(self._joint_deg[i]) > (self._joint_limit_deg[i] - self._joint_limit_margin_deg),
+                    # 2026-08-05 (guided recovery): past_escape_only fires
+                    # when the joint has entered the escape-only zone —
+                    # this is the trigger the JointRecoveryModal binds
+                    # to. escape_only_edge_deg is the operator-visible
+                    # threshold shown in the modal body copy.
+                    'past_escape_only': abs(self._joint_deg[i]) > (self._joint_limit_deg[i] - self._joint_escape_only_margin_deg),
+                    'escape_only_edge_deg': self._joint_limit_deg[i] - self._joint_escape_only_margin_deg,
                     # Signed distance from the edge, for the recovery
                     # progress bar — negative = past limit (magnitude
                     # = degrees to bring the joint back INSIDE), positive

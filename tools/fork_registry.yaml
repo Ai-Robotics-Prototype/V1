@@ -552,6 +552,63 @@ capabilities:
           - '**/*.test.jsx'
     known_debt: []
 
+  # 19. Guided recovery dialog (Lesson 165 extension, 2026-08-05).
+  - id: guided_recovery_dialog
+    description: >
+      When a joint is past its escape-only zone, the operator sees ONE
+      guided-recovery dialog (`JointRecoveryModal`) that offers a
+      press-and-hold escape move. Doctrine: the system OFFERS the
+      recovery move; only an explicit operator press EXECUTES it; no
+      auto-motion ever. The dialog reuses the standard `jogHold` write
+      path — no new motion primitive, no bypass of the dead-man, speed
+      cap, or self-collision guard.
+
+      This is also the PATTERN for guided recovery. Future recovery
+      dialogs (e-stop clear, controller-link recovery, alarm reset)
+      route through the same primitives.
+
+      Enforcement spine:
+        * Driver clamp:  _joint_escape_only_margin_deg is the invariant
+                         threshold; direction opposite the escape is
+                         refused (start-clamp AND supervise tick).
+        * Cause tag:     `joint_limit_deeper` is distinct from
+                         `joint_limit`; frontend can bind to the
+                         specific tag if needed.
+        * Modal:         `JointRecoveryModal` is the sole implementation
+                         of the guided-recovery dialog shell.
+        * Journal:       `_write_recovery_events_from_jl` writes each
+                         True↔False transition to
+                         /opt/cobot/logs/recovery_events.jsonl —
+                         commissioning-wizard source material.
+    canonical:
+      python:
+        module: estun_driver.estun_driver_node
+        functions: []
+        note: >
+          The escape-only rule lives inside _on_jog_command (start
+          clamp) and _on_jog_supervise (mid-motion). No standalone
+          function — the invariant is enforced at the two clamp
+          sites.
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [_write_recovery_events_from_jl]
+      frontend:
+        path: src/cobot_dashboard/frontend/src/components/JointRecoveryModal.jsx
+        exports: [default]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/components/**/*.{jsx,js}
+        patterns:
+          # No second modal that offers "hold to recover" or renames
+          # the primitive. The registered JointRecoveryModal is the
+          # canonical shell; new recovery kinds extend it in place
+          # (add a phase, don't fork a component).
+          - "past_escape_only.*(?:HoldButton|createHoldTicker)"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/components/JointRecoveryModal.jsx
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt: []
+
 
 # ── Heuristic sweep ─────────────────────────────────────────────────
 #

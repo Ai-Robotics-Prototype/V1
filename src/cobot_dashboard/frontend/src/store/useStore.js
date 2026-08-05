@@ -539,12 +539,32 @@ const storeDefinition = (set, get) => ({
         const _lastJogRejTs = get()._lastJogRejectTs || 0
         let   _newLastTs    = _lastJogRejTs
         if (Array.isArray(_incomingRej)) {
+          // 2026-08-05 (guided recovery, Lesson 165 extension): while
+          // the JointRecoveryModal is up for a joint that's inside
+          // the escape-only zone, drop jog-rejection toasts that
+          // mention that joint. The modal IS the message — a toast
+          // storm on top of it just adds noise. Applies to both the
+          // 'escape_only' reason (deeper-direction refused) and the
+          // ordinary 'clamp' reason (approach refused). Suppression
+          // is data-driven off joint_limits.past_escape_only — no
+          // separate registry to keep in sync.
+          const jl = msg?.robot?.joint_limits
+          const _suppressedJoints = new Set()
+          if (Array.isArray(jl)) {
+            for (const j of jl) {
+              if (j?.past_escape_only) _suppressedJoints.add(Number(j.joint))
+            }
+          }
           for (const r of _incomingRej) {
             if (r?.family !== 'jog') continue
             const rts = Number(r?.ts) || 0
             if (rts <= _lastJogRejTs) continue
             if (rts > _newLastTs) _newLastTs = rts
             const reason = r?.reason || 'jog rejected (unknown reason)'
+            // Extract the joint index if the reason names one, and
+            // drop when the modal is claiming that condition.
+            const jm = /J([1-6])\b/.exec(reason)
+            if (jm && _suppressedJoints.has(Number(jm[1]))) continue
             try { get().addToast?.(`Jog rejected: ${reason}`, 'warning') }
             catch (_) { /* nop */ }
           }
