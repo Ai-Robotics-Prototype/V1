@@ -288,6 +288,40 @@ else
     pass "served asset $POST_SERVED_ASSET"
 fi
 
+# 2026-08-05 (teach-lock incident #3, gap #4): live-serve verification.
+# The disk-side POST_SERVED_ASSET check above confirms `index.html`
+# points at the freshly-built asset. This step curls the RUNNING
+# dashboard and confirms the served response matches. Catches:
+#   * a stale uvicorn worker still holding the old index.html
+#   * a reverse proxy caching the pre-deploy bundle
+#   * a permissions issue where the new asset file isn't readable
+# Three false-positive PASSes have been reported in the last week
+# from taking the disk state at face value; this closes that gap.
+step "Live-serve verification (HTTPS /)"
+LIVE_HTML=""
+LIVE_ASSET=""
+LIVE_STATUS="?"
+for i in 1 2 3 4 5; do
+    LIVE_RESP=$(curl -kSs -o /tmp/deploy_live_index.$$ -w "HTTP:%{http_code}" \
+                --max-time 3 https://localhost:8080/ 2>/dev/null || echo "HTTP:000")
+    LIVE_STATUS="${LIVE_RESP#HTTP:}"
+    if [[ "$LIVE_STATUS" == "200" ]]; then
+        LIVE_HTML=$(cat /tmp/deploy_live_index.$$ 2>/dev/null)
+        LIVE_ASSET=$(echo "$LIVE_HTML" | grep -oE '/assets/index-[A-Za-z0-9_-]+\.js' | head -1)
+        break
+    fi
+    sleep 1
+done
+rm -f /tmp/deploy_live_index.$$
+if [[ -z "$LIVE_ASSET" ]]; then
+    fail "live-serve returned no asset (HTTP $LIVE_STATUS); dashboard not serving after restart"
+elif [[ "$LIVE_ASSET" != "$POST_SERVED_ASSET" ]]; then
+    printf "    disk : %s\n    live : %s\n" "$POST_SERVED_ASSET" "$LIVE_ASSET"
+    fail "live-served bundle differs from disk — deploy verify FAILED"
+else
+    pass "live-served == disk == $LIVE_ASSET"
+fi
+
 # ── 4. Verdict ───────────────────────────────────────────────────
 echo
 if [[ $exit_code -eq 0 ]]; then

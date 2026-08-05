@@ -3345,9 +3345,27 @@ export default function ProgramEditor() {
   // uses sendBeacon so a window close still releases. Record-through
   // architecture means poses were already persisted on every Record;
   // releasing the lock loses nothing.
-  const overlayOpen = (teachSingleId != null
-                       || (teachAllOrder && teachAllOrder.length > 0)
-                       || palletTeachRole != null)
+  // 2026-08-05 (teach-lock incident #3): the SPA keeps ProgramLayout
+  // mounted across route changes via CSS `display:none` (see
+  // App.jsx:154 kept3D list — Program + 3D View stay parked to avoid
+  // re-loading GLBs). Consequence: ProgramEditor never unmounts on
+  // route change, its useEffects keep running, and the heartbeat
+  // interval kept refreshing the owner-TTL even after the operator
+  // navigated to Monitor/Programs/Configure — leaving a phantom lock
+  // no one was actively holding.
+  //
+  // Doctrine: session lifecycle = TEACH SURFACE lifecycle. Treat
+  // "not on the Program tab" as "overlay closed" for lifecycle
+  // purposes — the heartbeat halts, the /end path fires. When the
+  // operator returns to Program, the overlay state re-inflates
+  // (teachSingleId etc. are still set), heartbeat resumes, /start
+  // implicitly re-claims via the next Record. Losing nothing:
+  // record-through already persisted every pose.
+  const activeTab = useStore((s) => s.activeTab)
+  const overlayStateOpen = (teachSingleId != null
+                            || (teachAllOrder && teachAllOrder.length > 0)
+                            || palletTeachRole != null)
+  const overlayOpen = overlayStateOpen && activeTab === 'program'
   const wasOverlayOpen = useRef(false)
   // 2026-08-05 (Lesson 179 gap fix): track the PROGRAM ID that owned
   // the currently-open teach overlay. When the operator navigates to

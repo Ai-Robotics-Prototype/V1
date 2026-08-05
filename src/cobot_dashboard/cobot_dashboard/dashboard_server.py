@@ -12470,8 +12470,21 @@ if FASTAPI_AVAILABLE:
     # collected. Both windows are picked to be short enough that a
     # crashed-tab operator doesn't stay locked out, long enough that
     # a slow network doesn't drop a live session mid-teach.
-    _TEACH_OWNER_TTL_S = 300      # 5 min
+    # 2026-08-05 (teach-lock incident #3): TTL shortened 300s → 90s.
+    # Rationale: record-through means every pose is already persisted
+    # on Record; expiry loses nothing but the OWNERSHIP claim. 90s =
+    # 3 client-side heartbeat intervals (30s each) — a live client
+    # comfortably rides through one network hiccup; a phantom owner
+    # (browser tab crashed, laptop closed) drops out fast.
+    _TEACH_OWNER_TTL_S = 90
     _TEACH_DRAFT_TTL_S = 24 * 3600  # 24 h — dropped from disk after this
+    # Self-healing entry threshold (Directive item 6, 2026-08-05):
+    # when a device requests teach entry (/start) and the current
+    # owner's updated_ts is older than 2 heartbeat intervals (60s),
+    # the lock is treated as abandoned — auto-expire and grant to
+    # the requester. Avoids making the operator wait out the full
+    # 90s TTL when the owner has demonstrably gone quiet.
+    _TEACH_STALE_HEARTBEAT_S = 60
     _teach_lock = threading.Lock()
 
     def _teach_path(prog_id: str):
@@ -12645,8 +12658,33 @@ if FASTAPI_AVAILABLE:
                 _teach_write_draft(prog_id, draft)
                 _teach_publish_to_state()
                 return {'ok': True, 'draft': draft}
-            # Another device owns it. 409 lets the client render the
-            # read-only banner with a Take Over button.
+            # Different device — check the owner's heartbeat age. If
+            # they've been silent for > 2 heartbeat intervals (60 s),
+            # the lock is treated as abandoned and we auto-grant it
+            # to the requester (Directive item 6, 2026-08-05 teach-
+            # lock incident #3). Poses stay put — this is a graceful
+            # ownership swap, not a data reset.
+            _upd = _teach_updated_epoch(draft)
+            if _upd is not None:
+                _age = time.time() - _upd
+                if _age > _TEACH_STALE_HEARTBEAT_S:
+                    prev_owner = draft.get('owner_device_id')
+                    draft = dict(draft)
+                    draft['owner_device_id']    = device_id
+                    draft['owner_label']        = device_label or device_id[:8]
+                    draft['previous_owner']     = prev_owner
+                    draft['auto_expired_at']    = time.strftime(
+                        '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                    _teach_touch(draft)
+                    _teach_write_draft(prog_id, draft)
+                    _teach_publish_to_state()
+                    return {
+                        'ok': True,
+                        'draft': draft,
+                        'auto_expired_previous_owner': prev_owner,
+                    }
+            # Another live device owns it. 409 lets the client render
+            # the read-only banner with a Take Over button.
             return JSONResponse({
                 'ok': False,
                 'error': 'teach_session_locked',
@@ -12723,12 +12761,28 @@ if FASTAPI_AVAILABLE:
                 draft = _teach_new_draft(prog_id, device_id,
                     str(body.get('device_label') or ''))
             elif draft.get('owner_device_id') != device_id:
-                return JSONResponse({
-                    'ok': False,
-                    'error': 'not_owner',
-                    'owner_device_id': draft.get('owner_device_id'),
-                    'owner_label':     draft.get('owner_label'),
-                }, status_code=403)
+                # 2026-08-05 (self-healing lock, teach-lock incident
+                # #3): if the current owner's heartbeat is > 2
+                # intervals stale, treat as abandoned and swap
+                # ownership. Same rule as /start — /record inherits
+                # it as defense in depth (record-through means
+                # /record is often the FIRST call the frontend makes).
+                _upd = _teach_updated_epoch(draft)
+                if _upd is not None and (time.time() - _upd) > _TEACH_STALE_HEARTBEAT_S:
+                    prev_owner = draft.get('owner_device_id')
+                    draft = dict(draft)
+                    draft['owner_device_id']    = device_id
+                    draft['owner_label']        = str(body.get('device_label') or '') or device_id[:8]
+                    draft['previous_owner']     = prev_owner
+                    draft['auto_expired_at']    = time.strftime(
+                        '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                else:
+                    return JSONResponse({
+                        'ok': False,
+                        'error': 'not_owner',
+                        'owner_device_id': draft.get('owner_device_id'),
+                        'owner_label':     draft.get('owner_label'),
+                    }, status_code=403)
             poses = dict(draft.get('poses') or {})
             poses[slot_key] = patch
             draft['poses'] = poses
