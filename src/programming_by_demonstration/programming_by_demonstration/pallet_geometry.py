@@ -81,8 +81,17 @@ _AXIS_TO_DXYZ_MM_PER_MM = {
 _MIN_ROW_COL_ANGLE_DEG = 60.0    # row·col angle must exceed this
 _MAX_TILT_DEG          = 10.0    # warn beyond
 _MIN_EDGE_LEN_M        = 0.001   # 1 mm coincident-corner threshold
-_PITCH_MISMATCH_M      = 0.003   # 3 mm typed-vs-measured warn
+_PITCH_MISMATCH_M      = 0.003   # 3 mm typed-vs-measured warn (RETIRED 2026-08-05)
 _PART_DATUM_MAX_SLOTS  = 1.5     # dimensionless — × max_pitch
+# 2026-08-05 (grid-fits-frame check, operator doctrine ruling):
+# Warn when the derived slot grid extent overshoots the taught frame
+# in either axis; error when it wildly overshoots. The frame extent
+# is the length of the corner1→corner2 vector (row axis) or
+# corner1→corner3 (col axis); the grid extent for N slots is
+# (N-1)·pitch. A tolerance of 5 mm avoids nuisance warnings when
+# corners are taught a hair inside the last-slot centers.
+_GRID_FIT_TOLERANCE_M  = 0.005   # 5 mm slack
+_GRID_FIT_ERROR_RATIO  = 1.5     # >1.5× frame extent → error (catches pitch typos)
 
 # The pre-2026-08-04 names `_MIN_EDGE_LEN_MM` and
 # `_PITCH_MISMATCH_MM` are RETIRED (not aliased) — an alias
@@ -402,45 +411,16 @@ def validate_frame(spec: PalletPlaceSpec) -> List[Dict[str, Any]]:
                 'threshold_slots': _PART_DATUM_MAX_SLOTS,
             })
 
-    if spec.teach_mode == 'far_slot':
-        m_row_m, m_col_m = measured_pitches(spec)   # meters
-        typed_row_m = (spec.pitch_row_mm or 0.0) / 1000.0
-        typed_col_m = (spec.pitch_col_mm or 0.0) / 1000.0
-        if m_row_m is not None and typed_row_m > 0:
-            diff_m = abs(m_row_m - typed_row_m)
-            if diff_m > _PITCH_MISMATCH_M:
-                out.append({
-                    'severity': 'warning',
-                    'code':     'row_pitch_mismatch',
-                    'message': (
-                        f'Row pitch: typed '
-                        f'{typed_row_m*1000.0:.1f}mm vs measured '
-                        f'{m_row_m*1000.0:.1f}mm — differ by '
-                        f'{diff_m*1000.0:.1f}mm (threshold '
-                        f'{_PITCH_MISMATCH_M*1000.0:g}mm). Was point B '
-                        f'taught at the far column [1, N]? If so, '
-                        f'update the typed value to match the '
-                        f'measurement.'),
-                    'typed_m':    typed_row_m,
-                    'measured_m': m_row_m,
-                })
-        if m_col_m is not None and typed_col_m > 0:
-            diff_m = abs(m_col_m - typed_col_m)
-            if diff_m > _PITCH_MISMATCH_M:
-                out.append({
-                    'severity': 'warning',
-                    'code':     'col_pitch_mismatch',
-                    'message': (
-                        f'Column pitch: typed '
-                        f'{typed_col_m*1000.0:.1f}mm vs measured '
-                        f'{m_col_m*1000.0:.1f}mm — differ by '
-                        f'{diff_m*1000.0:.1f}mm (threshold '
-                        f'{_PITCH_MISMATCH_M*1000.0:g}mm). Was point C '
-                        f'taught at the far row [M, 1]? If so, update '
-                        f'the typed value to match the measurement.'),
-                    'typed_m':    typed_col_m,
-                    'measured_m': m_col_m,
-                })
+    # 2026-08-05 OPERATOR DOCTRINE RULING (pallet_geometry canonical):
+    # The old pitch typed-vs-measured check is RETIRED. Corners are
+    # frame-only; typed pitch is not derived from corners, so the
+    # comparison was between unrelated quantities. Its replacement
+    # is the "grid fits the frame" check below — it catches the
+    # actual failure mode (a pitch typo like 1500 mm) instead of
+    # rejecting every legitimate configuration where the pallet
+    # corners aren't at the [1,N]/[M,1] extreme slot centers.
+    if spec.has_taught_frame():
+        out.extend(_grid_extent_vs_frame_extent(spec))
     return out
 
 
@@ -467,26 +447,94 @@ def _order_indices(rows: int, cols: int, layers: int,
 
 # ── Slot Δ math — routes through the taught frame when present ──
 
+def _grid_extent_vs_frame_extent(spec: PalletPlaceSpec
+                                  ) -> List[Dict[str, Any]]:
+    """Grid-fits-frame check (2026-08-05 operator doctrine ruling).
+
+    The pallet frame is defined by corners 1-3. The slot grid is
+    defined by the datum (corner 1 origin, part_tcp if taught) plus
+    (N-1)·pitch along each frame axis. If the grid extends beyond
+    the taught frame in either direction, either the pitch is a
+    typo or the corners were taught in the wrong places.
+
+    Findings:
+      * ratio > _GRID_FIT_ERROR_RATIO (default 1.5) → error
+      * grid extent > frame extent + _GRID_FIT_TOLERANCE_M → warning
+
+    Returns a list of findings. Emits at most one per axis (row, col).
+
+    Only fires when the frame is taught (has_taught_frame) AND at
+    least one pitch is nonzero — otherwise there is no meaningful
+    grid extent to compare against."""
+    findings: List[Dict[str, Any]] = []
+    A = _xyz(spec.corner1_tcp)      # meters
+    B = _xyz(spec.corner2_tcp)      # meters
+    C = _xyz(spec.corner3_tcp)      # meters
+    row_frame_m = _len(_sub(B, A))
+    col_frame_m = _len(_sub(C, A))
+    pr_m = (float(spec.pitch_row_mm) or 0.0) / 1000.0
+    pc_m = (float(spec.pitch_col_mm) or 0.0) / 1000.0
+    cols = int(spec.cols) if spec.cols else 1
+    rows = int(spec.rows) if spec.rows else 1
+
+    def _check(axis_name: str, axis_letter: str, corners: list[str],
+               pitch_m: float, N: int, frame_m: float) -> None:
+        if pitch_m <= 0 or N <= 1 or frame_m <= 0:
+            return
+        grid_m = (N - 1) * pitch_m
+        if grid_m <= frame_m + _GRID_FIT_TOLERANCE_M:
+            return
+        ratio = grid_m / frame_m
+        severity = 'error' if ratio > _GRID_FIT_ERROR_RATIO else 'warning'
+        overshoot_m = grid_m - frame_m
+        findings.append({
+            'severity':         severity,
+            'code':             f'{axis_name}_grid_exceeds_frame',
+            'involves_corners': corners,
+            'message': (
+                f'{axis_name.capitalize()} grid needs '
+                f'{grid_m*1000.0:.0f} mm '
+                f'({N} slots × {pitch_m*1000.0:.0f} mm pitch) — taught '
+                f'frame along {axis_letter} is '
+                f'{frame_m*1000.0:.0f} mm '
+                f'(over by {overshoot_m*1000.0:.0f} mm). Check the '
+                f'{axis_name} pitch value or the corner placement.'),
+            'grid_m':           grid_m,
+            'frame_m':          frame_m,
+            'overshoot_m':      overshoot_m,
+            'ratio':            ratio,
+        })
+
+    _check('row', 'row axis (corner 1 → corner 2)',
+           ['c1', 'c2'], pr_m, cols, row_frame_m)
+    _check('col', 'column axis (corner 1 → corner 3)',
+           ['c1', 'c3'], pc_m, rows, col_frame_m)
+    return findings
+
+
 def _effective_pitches(spec: PalletPlaceSpec
                        ) -> Tuple[float, float, float]:
     """Return (pitch_row_m, pitch_col_m, layer_height_m) actually
     used for slot placement — METERS.
 
-    v2 (2026-07-30): MEASURED pitches always take precedence when
-    the frame is taught — corners are unambiguous slot-boundary
-    references, and the typed values only serve as the operator's
-    cross-check (see validate_frame's row/col_pitch_mismatch
-    warnings). Untaught frame falls back to typed values (the
-    schema stores those in mm — converted here at the consume
-    boundary)."""
+    OPERATOR DOCTRINE RULING (2026-08-05, canonical):
+      Corners 1-3 define the pallet FRAME ONLY (origin at corner 1,
+      row axis toward corner 2, column axis toward corner 3, plane
+      from all three). Point 4 is the CENTER of slot [1,1]. Slot
+      spacing comes EXCLUSIVELY from the typed pitch values in the
+      palletizing parameters dialog:
+        slot[i,j] = datum + (i-1)·pitch_row·row_axis
+                          + (j-1)·pitch_col·col_axis
+                          + layer·layer_height·plane_normal
+      Corner-to-corner distance has NO required relationship to
+      pitch. Pre-ruling, this function overrode typed with measured
+      when the frame was taught (v2 2026-07-30 heuristic), which
+      broke every configuration where the pallet corners were not
+      at the [1,N] and [M,1] extreme slot centers — the operator's
+      typo-of-record ("typed 150 mm, measured 341 mm at the physical
+      corner") was NOT a mismatch, it was the design intent."""
     pr_m = (float(spec.pitch_row_mm) or 0.0) / 1000.0
     pc_m = (float(spec.pitch_col_mm) or 0.0) / 1000.0
-    if spec.has_taught_frame():
-        m_row_m, m_col_m = measured_pitches(spec)   # meters
-        if m_row_m is not None:
-            pr_m = m_row_m
-        if m_col_m is not None:
-            pc_m = m_col_m
     lh_m = (float(spec.layer_height_mm) / 1000.0) \
         if spec.layer_height_mm is not None else 0.0
     return (pr_m, pc_m, lh_m)

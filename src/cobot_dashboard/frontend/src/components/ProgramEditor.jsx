@@ -858,14 +858,18 @@ function PalletConfigEditor({ config, onSave, onClose }) {
             Total slots: {cycles}
           </div>
 
+          {/* 2026-08-05 operator doctrine ruling: pitch is
+              center-to-center between parts. Corners are the pallet's
+              physical frame corners — corner-to-corner distance is
+              geometric, not a derived pitch. Labels made explicit. */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
-            <Field label="Spacing X (mm)">
+            <Field label="Row pitch — center-to-center between parts (mm)">
               <NumericField integer min={0} value={spacingX}
-                onCommit={setSpacingX} style={inputStyle} aria-label="Spacing X" />
+                onCommit={setSpacingX} style={inputStyle} aria-label="Row pitch (mm)" />
             </Field>
-            <Field label="Spacing Y (mm)">
+            <Field label="Column pitch — center-to-center between parts (mm)">
               <NumericField integer min={0} value={spacingY}
-                onCommit={setSpacingY} style={inputStyle} aria-label="Spacing Y" />
+                onCommit={setSpacingY} style={inputStyle} aria-label="Column pitch (mm)" />
             </Field>
             <Field label="Layer height (mm)">
               <NumericField integer min={0} value={layerH}
@@ -4216,30 +4220,34 @@ export default function ProgramEditor() {
     setPalletTeachReason(null)
   }
 
-  // Diagram-guided step shape fed to TeachOverlay. Matches the wizard's
-  // taught_pallet_cornerN / taught_pallet_part label + instr strings so
-  // the operator sees the same prompts across creation and re-teach —
-  // ONE flow.
+  // Diagram-guided step shape fed to TeachOverlay. 2026-08-05
+  // operator doctrine ruling: corners 1-3 define the pallet FRAME
+  // ONLY (origin + row axis + column axis + plane). Corner-to-corner
+  // distance has NO required relationship to slot pitch. Slot
+  // spacing comes exclusively from the typed pitch values.
+  // Point 4 is the CENTER of slot [1,1] — the first-part datum.
+  // Prompts updated so the operator never has to infer which
+  // doctrine is in force.
   const PALLET_TEACH_STEPS = {
     pallet_c1: {
-      label:  '① PALLET CORNER — slot [1,1]',
+      label:  '① PALLET CORNER — origin (slot [1,1] corner)',
       action: 'pallet_teach_c1',
-      instr:  'Touch the pallet corner at slot [1,1] — fixture corner, tool touching the pallet surface.',
+      instr:  "Touch the pallet's physical corner at slot [1,1] — this anchors the pallet frame origin.",
     },
     pallet_c2: {
-      label:  '② PALLET CORNER — end of row [1,N]',
+      label:  '② PALLET CORNER — along the first row',
       action: 'pallet_teach_c2',
-      instr:  'Touch the pallet corner at the far end of the first row — locks the row direction and column pitch.',
+      instr:  "Touch the pallet's physical corner at the far end of the first row — locks the ROW DIRECTION only (not pitch).",
     },
     pallet_c3: {
-      label:  '③ PALLET CORNER — end of column [M,1]',
+      label:  '③ PALLET CORNER — along the first column',
       action: 'pallet_teach_c3',
-      instr:  'Touch the pallet corner at the far end of the first column — locks the column direction and row pitch.',
+      instr:  "Touch the pallet's physical corner at the far end of the first column — locks the COLUMN DIRECTION only (not pitch).",
     },
     pallet_part: {
-      label:  '④ FIRST PART POSITION — slot [1,1]',
+      label:  '④ FIRST PART CENTER — slot [1,1] datum',
       action: 'pallet_teach_part',
-      instr:  'Place a real part in slot [1,1] and teach the tool contact pose — Z and orientation carry through to every derived slot.',
+      instr:  'Place a real part in slot [1,1] and touch the CENTER of that first place position — this datum plus your typed row/column pitch determines every other slot.',
     },
   }
 

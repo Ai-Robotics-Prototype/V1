@@ -216,7 +216,11 @@ def test_part_datum_offset_applied_to_every_slot():
     """The part-datum vector (part_tcp - corner1) is applied to
     EVERY derived slot — not just slot [0,0]. Otherwise slots
     would land on the pallet fixture corners, not where the tool
-    actually contacts the parts."""
+    actually contacts the parts.
+
+    2026-08-05 doctrine ruling: slot pitch is TYPED, not corner-
+    derived. This test supplies a typed pitch of 100 mm on each
+    axis so the slot-spread computation is well-defined."""
     C1 = _tcp(0, 0, 0)
     C2 = _tcp(100, 0, 0)
     C3 = _tcp(0, 200, 0)
@@ -227,6 +231,8 @@ def test_part_datum_offset_applied_to_every_slot():
                   C1[2] + part_offset[2])
     spec = PalletPlaceSpec.from_dict({
         'rows': 3, 'cols': 2,
+        'pitch_row_mm': 100.0,   # 2026-08-05 doctrine — typed pitch is authoritative
+        'pitch_col_mm': 100.0,
         'corner1_tcp': C1, 'corner2_tcp': C2, 'corner3_tcp': C3,
         'part_tcp':    part, 'order': 'row_major',
     })

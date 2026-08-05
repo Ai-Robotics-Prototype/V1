@@ -846,52 +846,56 @@ function teachPositionsForAnswers(answers) {
       key: 'taught_pick', label: 'PICK POSITION',
       instr: 'Jog the robot to the pick CONTACT — the pose where the gripper/vacuum touches the part. The approach hover above is computed automatically from your approach-height setting.',
     })
-    // 4-point pallet frame (2026-07-30 v2). Three CORNERS define
-    // frame + pitches; a fourth POINT captures the actual part
-    // pose at slot [1,1]. Corners are unambiguous fixture
-    // references (touch the pallet's physical corner); the part
-    // pose carries tool contact Z + orientation. Every slot =
-    // frame position + (part - corner1) offset, orientation = part.
+    // 4-point pallet frame (2026-08-05 operator doctrine ruling,
+    // canonical): three CORNERS define the pallet FRAME ONLY
+    // (origin at corner 1, row axis toward corner 2, column axis
+    // toward corner 3, plane from all three). Point 4 is the
+    // CENTER of slot [1,1] — the first-part datum. Slot spacing
+    // comes exclusively from the typed row/column pitch in the
+    // parameters dialog: slot[i,j] = datum + (i-1)·pitch_row·rowax
+    // + (j-1)·pitch_col·colax. Corner-to-corner distance has NO
+    // required relationship to pitch — teach at the pallet's
+    // physical corners regardless of grid dimensions.
     positions.push({
-      key: 'taught_pallet_corner1', label: '① PALLET CORNER — slot [1,1]',
+      key: 'taught_pallet_corner1', label: '① PALLET CORNER — origin',
       role: 'pallet_c1',
-      instr: 'Touch the pallet corner at slot [1,1] — the fixture corner, tool touching the pallet surface. This is a geometry-only teach; no part needs to be in the slot.',
+      instr: "Touch the pallet's physical corner at slot [1,1] — this anchors the pallet frame origin. Geometry only; no part needs to be in the slot.",
     })
     positions.push({
-      key: 'taught_pallet_corner2', label: '② PALLET CORNER — end of row [1,N]',
+      key: 'taught_pallet_corner2', label: '② PALLET CORNER — along the first row',
       role: 'pallet_c2',
-      instr: 'Touch the pallet corner at the FAR END of the first row (slot [1,N]). This locks the row direction and column pitch.',
+      instr: "Touch the pallet's physical corner at the far end of the first row. This locks the ROW DIRECTION only — slot pitch comes from the parameters dialog.",
     })
     positions.push({
-      key: 'taught_pallet_corner3', label: '③ PALLET CORNER — end of column [M,1]',
+      key: 'taught_pallet_corner3', label: '③ PALLET CORNER — along the first column',
       role: 'pallet_c3',
-      instr: 'Touch the pallet corner at the FAR END of the first column (slot [M,1]). This locks the column direction and row pitch.',
+      instr: "Touch the pallet's physical corner at the far end of the first column. This locks the COLUMN DIRECTION only — slot pitch comes from the parameters dialog.",
     })
     positions.push({
-      key: 'taught_pallet_part', label: '④ FIRST PART POSITION — slot [1,1]',
+      key: 'taught_pallet_part', label: '④ FIRST PART CENTER — slot [1,1] datum',
       role: 'pallet_part',
-      instr: 'Place a real part in slot [1,1] and teach the tool contact pose — this Z and orientation carry through to every derived slot.',
+      instr: 'Place a real part in slot [1,1] and touch the CENTER of that first place position — this datum plus your typed row/column pitch determines every other slot.',
     })
   } else if (op === 'palletize' && mode === 'depalletize') {
     positions.push({
-      key: 'taught_pallet_corner1', label: '① PALLET CORNER — slot [1,1,top]',
+      key: 'taught_pallet_corner1', label: '① PALLET CORNER — origin (top layer)',
       role: 'pallet_c1',
-      instr: 'Touch the pallet corner at slot [1,1] on the top layer — fixture corner, tool at the pallet surface.',
+      instr: "Touch the pallet's physical corner at slot [1,1] on the top layer — anchors the pallet frame origin.",
     })
     positions.push({
-      key: 'taught_pallet_corner2', label: '② PALLET CORNER — end of row [1,N,top]',
+      key: 'taught_pallet_corner2', label: '② PALLET CORNER — along the first row',
       role: 'pallet_c2',
-      instr: 'Touch the pallet corner at [1,N] on the top layer — locks row direction and column pitch.',
+      instr: "Touch the pallet's physical corner at the far end of the first row on the top layer — locks ROW DIRECTION only; pitch is typed.",
     })
     positions.push({
-      key: 'taught_pallet_corner3', label: '③ PALLET CORNER — end of column [M,1,top]',
+      key: 'taught_pallet_corner3', label: '③ PALLET CORNER — along the first column',
       role: 'pallet_c3',
-      instr: 'Touch the pallet corner at [M,1] on the top layer — locks column direction and row pitch.',
+      instr: "Touch the pallet's physical corner at the far end of the first column on the top layer — locks COLUMN DIRECTION only; pitch is typed.",
     })
     positions.push({
-      key: 'taught_pallet_part', label: '④ FIRST PART POSITION — slot [1,1,top]',
+      key: 'taught_pallet_part', label: '④ FIRST PART CENTER — slot [1,1,top] datum',
       role: 'pallet_part',
-      instr: 'Place a real part at slot [1,1,top] and teach the tool contact pose the robot will use to PICK each part.',
+      instr: 'Place a real part at slot [1,1,top] and touch the CENTER of it — this datum plus the typed pitch determines every pick pose.',
     })
     positions.push({
       key: 'taught_place', label: 'PLACE POSITION',

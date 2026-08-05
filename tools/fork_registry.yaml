@@ -43,6 +43,23 @@ capabilities:
       Frame math for the 3-corner pallet teach — row/col vectors,
       plane normal, tilt, coincident-corner and near-parallel
       validation. Backend-only via POST /api/pallet/validate_frame.
+
+      2026-08-05 OPERATOR DOCTRINE RULING (canonical semantics):
+      Corners 1-3 define the pallet FRAME ONLY (origin at corner 1,
+      row axis toward corner 2, column axis toward corner 3, plane
+      from all three). Point 4 is the CENTER of slot [1,1]
+      (first-part datum). Slot spacing comes EXCLUSIVELY from typed
+      pitch values in the palletizing parameters dialog:
+        slot[i,j] = datum + (i-1)·pitch_row·row_axis
+                          + (j-1)·pitch_col·col_axis
+                          + layer·layer_height·plane_normal
+      Corner-to-corner distance has NO required relationship to
+      pitch. `_effective_pitches` MUST return typed values only.
+      `validate_frame` MUST NOT emit `row_pitch_mismatch` or
+      `col_pitch_mismatch` findings (retired — see doctrine test
+      test_pallet_doctrine_canonical.py). The replacement check is
+      the grid-fits-frame test that catches pitch typos without
+      false positives on legitimate configs.
     canonical:
       python:
         module: programming_by_demonstration.pallet_geometry
@@ -735,17 +752,17 @@ capabilities:
       # here shift as the file grows; refresh the numbers from the
       # deploy.sh lint output when they move.
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 5708
+        line: 5713
         why: >
           disabledReason string for the pallet-teach flow overlay's
           Record button title tooltip. Grandfathered by the visible
           TeachLockBanner rendered in the same subtree.
         owner: dashboard-frontend
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 5750
+        line: 5755
         why: >
           disabledReason string for the single/all-step teach overlay's
-          Record button title tooltip. Same rationale as line 5708.
+          Record button title tooltip. Same rationale as line 5713.
         owner: dashboard-frontend
 
 

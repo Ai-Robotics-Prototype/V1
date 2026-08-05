@@ -200,41 +200,41 @@ def test_v2_measured_pitches_ignore_retired_edge_mode():
     assert abs(m_col - 0.4995) < 1e-9
 
 
-def test_pitch_mismatch_warning_names_both_numbers():
-    """far_slot mode + typed pitch that disagrees with measured by
-    more than 3mm → validation warning naming BOTH the typed and
-    the measured value."""
-    A = _tcp(0, 0, 0)
-    B = _tcp(200, 0, 0)   # cols=3 → measured pitch = 100 mm
-    C = _tcp(0, 100, 0)
-    spec = PalletPlaceSpec.from_dict({
-        'rows': 2, 'cols': 3,
-        # Typed values disagree with measured (100mm on row axis;
-        # typed 90 → 10mm mismatch > 3mm threshold).
-        'pitch_row_mm': 90.0, 'pitch_col_mm': 100.0,
-        'corner_a_tcp': A, 'point_b_tcp': B, 'point_c_tcp': C,
-        'teach_mode': 'far_slot',
-    })
-    issues = validate_frame(spec)
-    row_warn = next((f for f in issues if f['code'] == 'row_pitch_mismatch'), None)
-    assert row_warn is not None, issues
-    assert row_warn['severity'] == 'warning'
-    # Canonical unit is meters (2026-08-04). Typed 90 mm →
-    # 0.090 m; measured 100 mm → 0.100 m.
-    assert abs(row_warn['typed_m'] - 0.090) < 1e-9
-    assert abs(row_warn['measured_m'] - 0.100) < 1e-9
-    assert '90' in row_warn['message'] and '100' in row_warn['message']
-
-
-def test_pitch_within_tolerance_no_warning():
-    """|typed - measured| <= 3mm — no warning fires."""
+def test_pitch_mismatch_warning_is_retired():
+    """2026-08-05 OPERATOR DOCTRINE RULING: corners are frame-only.
+    Typed pitch never gets compared to corner-derived pitch —
+    they're unrelated quantities under the canonical semantics.
+    The `row_pitch_mismatch` / `col_pitch_mismatch` codes must
+    NEVER be emitted, regardless of teach_mode or how mismatched
+    the two would be. See test_pallet_doctrine_canonical.py for
+    the positive test."""
     A = _tcp(0, 0, 0)
     B = _tcp(200, 0, 0)
     C = _tcp(0, 100, 0)
     spec = PalletPlaceSpec.from_dict({
         'rows': 2, 'cols': 3,
-        'pitch_row_mm': 102.0,   # 2mm off → below threshold
-        'pitch_col_mm': 99.0,    # 1mm off → below threshold
+        'pitch_row_mm': 90.0, 'pitch_col_mm': 100.0,
+        'corner_a_tcp': A, 'point_b_tcp': B, 'point_c_tcp': C,
+        'teach_mode': 'far_slot',
+    })
+    codes = [f['code'] for f in validate_frame(spec)]
+    assert 'row_pitch_mismatch' not in codes, (
+        'RETIRED validator fired — pre-ruling behavior returned.')
+    assert 'col_pitch_mismatch' not in codes
+
+
+def test_pitch_within_tolerance_no_warning():
+    """Backward-compatible name for the historical positive case.
+    Post-ruling, NO pitch-mismatch code ever fires regardless of
+    typed vs measured — this test still passes for the same
+    reason it always has, just via a different mechanism."""
+    A = _tcp(0, 0, 0)
+    B = _tcp(200, 0, 0)
+    C = _tcp(0, 100, 0)
+    spec = PalletPlaceSpec.from_dict({
+        'rows': 2, 'cols': 3,
+        'pitch_row_mm': 102.0,
+        'pitch_col_mm': 99.0,
         'corner_a_tcp': A, 'point_b_tcp': B, 'point_c_tcp': C,
         'teach_mode': 'far_slot',
     })
@@ -242,30 +242,38 @@ def test_pitch_within_tolerance_no_warning():
         assert 'pitch_mismatch' not in f['code']
 
 
-def test_far_slot_uses_measured_pitches_for_slot_math():
-    """When teach_mode='far_slot' the slot math must use the MEASURED
-    pitch, not the typed one. Guarantees that slot [1, N-1] lands
-    exactly at point B and [M-1, 1] exactly at point C — no
-    "typed 90mm but actually 100mm" drift accumulating across the
-    grid."""
+def test_far_slot_slot_math_uses_TYPED_pitches_not_measured():
+    """2026-08-05 OPERATOR DOCTRINE RULING (canonical): slot math
+    uses TYPED pitches exclusively — corner-to-corner distance is
+    frame-only and does NOT derive pitch.
+
+    Pre-ruling, teach_mode='far_slot' overrode typed with the
+    measured pitch (this was the pre-ruling test). Post-ruling,
+    the typed value stands regardless. Verify: with typed 50 mm
+    and measured 100 mm, slot [0,1] lands at datum + 50 mm along
+    row (NOT at 100 mm)."""
     A = _tcp(0, 0, 0)
-    B = _tcp(200, 0, 0)   # cols=3 → measured row pitch = 100
-    C = _tcp(0, 100, 0)   # rows=2 → measured col pitch = 100
+    B = _tcp(200, 0, 0)   # measured pitch would be 100 mm
+    C = _tcp(0, 100, 0)
     spec = PalletPlaceSpec.from_dict({
         'rows': 2, 'cols': 3,
-        'pitch_row_mm': 50.0, 'pitch_col_mm': 50.0,  # deliberately wrong
+        'pitch_row_mm': 50.0, 'pitch_col_mm': 50.0,
         'corner_a_tcp': A, 'point_b_tcp': B, 'point_c_tcp': C,
         'teach_mode': 'far_slot',
     })
     tcps = derive_slot_tcps(spec, tuple(A))
-    # Slot [0, 2] must equal B.
-    slot_far_row = next(s for s in tcps if (s['row'], s['col']) == (0, 2))
-    assert abs(slot_far_row['tcp_m'][0] - B[0]) < 1e-6
-    assert abs(slot_far_row['tcp_m'][1] - B[1]) < 1e-6
-    # Slot [1, 0] must equal C.
-    slot_far_col = next(s for s in tcps if (s['row'], s['col']) == (1, 0))
-    assert abs(slot_far_col['tcp_m'][0] - C[0]) < 1e-6
-    assert abs(slot_far_col['tcp_m'][1] - C[1]) < 1e-6
+    # Slot [0, 1] = datum + 1·(50 mm)·row_axis. Row axis is +X
+    # here (A→B along +X), so tcp_m[0] = 0.050.
+    slot_01 = next(s for s in tcps if (s['row'], s['col']) == (0, 1))
+    assert abs(slot_01['tcp_m'][0] - 0.050) < 1e-6, (
+        f'Slot [0,1] should be at datum+50mm along row axis (typed '
+        f'pitch), got {slot_01["tcp_m"]}. Doctrine violation: pitch '
+        f'is being derived from corners.')
+    # Slot [1, 0] = datum + 1·(50 mm)·col_axis, col axis is +Y.
+    slot_10 = next(s for s in tcps if (s['row'], s['col']) == (1, 0))
+    assert abs(slot_10['tcp_m'][1] - 0.050) < 1e-6, (
+        f'Slot [1,0] should be at datum+50mm along col axis (typed '
+        f'pitch), got {slot_10["tcp_m"]}.')
 
 
 # ── Near-parallel B/C rejection ────────────────────────────────
