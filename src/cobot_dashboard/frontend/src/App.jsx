@@ -9,6 +9,7 @@ import AlarmRecoveryModal from './components/AlarmRecoveryModal'
 import JointRecoveryModal from './components/JointRecoveryModal'
 import ObstacleEscapeModal from './components/ObstacleEscapeModal'
 import SelfCollisionWarnBanner from './components/SelfCollisionWarnBanner'
+import HardStopToast from './components/HardStopToast'
 import DeployStatusBanner from './components/DeployStatusBanner'
 import PausedPresenter from './components/PausedPresenter'
 import ViewportDebug from './components/ViewportDebug'
@@ -200,6 +201,12 @@ export default function App() {
         <JointRecoveryModal />
         <SelfCollisionWarnBanner />
         <ObstacleEscapeModal />
+        {/* 2026-08-05 (operator directive: clearance warnings OFF).
+            Global toast-emitter for self/ground hard-stop events.
+            Reads canonical robot.stop_cause_copy (translator lives
+            in dashboard_server _jog_stop_cause_operator_copy) —
+            no re-parsing of driver text, fork-registry-safe. */}
+        <HardStopToast />
         {/* PausedPresenter renders the caution-styled paused overlay
             and its persistent banner. Distinct pipeline from
             AlarmRecoveryModal above (which owns the red alarm

@@ -413,9 +413,16 @@ class EstunCodroidDriver(Node):
         # jogs. The real fix (mesh convex hulls from viewer GLBs)
         # is queued as §396's follow-up; when the model stops lying
         # by 30 mm the guard earns back its authority.
-        # Warn threshold retained at 40 mm as the presentation-only
-        # trigger for the optional banner (default OFF).
-        self.declare_parameter('collision_warn_distance_mm', 40.0)
+        # 2026-08-05 (operator directive: clearance warnings OFF).
+        # The soft warn tier is disabled — 0.0 is the sentinel for
+        # "no warn threshold". The WARNING log line + the frontend
+        # banner both key off collision_warn_mm > 0, so publishing
+        # 0.0 turns the entire soft tier off end to end. The HARD
+        # stop below (15 mm) is unchanged and remains the physical
+        # last-resort guard — the operator's stated plan is "I will
+        # hit the hard limit and it will stop." Raise back to 40.0
+        # to re-enable the warn tier.
+        self.declare_parameter('collision_warn_distance_mm', 0.0)
         self.declare_parameter('collision_stop_distance_mm', 15.0)  # was 20.0
         # Env thresholds — separate from self/ground so the two can
         # diverge. Wire evidence 2026-07-15: env-guard was firing on
@@ -2537,7 +2544,12 @@ class EstunCodroidDriver(Node):
         else:
             dyn_stop_mm = self._dyn_collision_stop_mm(cur_frac)
 
-        in_warn = d <= self._coll_warn_mm
+        # 2026-08-05: warn tier disabled sentinel is
+        # collision_warn_distance_mm == 0. When zero, in_warn is
+        # always False, no WARNING log fires, and the telemetry
+        # bool stays cleared — the frontend banner never lights.
+        # The HARD stop below (dyn_stop_mm) is unaffected.
+        in_warn = self._coll_warn_mm > 0.0 and d <= self._coll_warn_mm
         if in_warn and not self._coll_warning_active:
             self.get_logger().warn(
                 f'SELF-COLLISION WARNING: {a}-{b} at {d:.0f}mm '
@@ -3085,6 +3097,30 @@ class EstunCodroidDriver(Node):
                 joint_deg = float(self._joint_deg[joint_i1 - 1])
             except (TypeError, IndexError, ValueError):
                 joint_deg = None
+        # 2026-08-05 (clearance warnings OFF): the dashboard's
+        # operator copy needs to distinguish self / ground / env
+        # guards to pick the right hard-stop phrasing:
+        #   self   → "arm too close to itself, Nmm"
+        #   ground → "arm too close to the floor, Nmm"
+        #   env    → generic "approaching an obstacle" (unchanged)
+        # The raw reason from _stop_jog_locked carries the kind as
+        # a prefix ("self-collision guard ... at Nmm" /
+        # "ground guard ..." / "obstacle guard ..."), so parse it
+        # once here — the frontend must not re-parse.
+        guard_kind = None
+        dist_mm    = None
+        if tag == 'collision_guard':
+            lower = raw.lower()
+            if 'self-collision guard' in lower:
+                guard_kind = 'self'
+            elif 'ground guard' in lower:
+                guard_kind = 'ground'
+            elif 'obstacle guard' in lower or 'zone#' in lower:
+                guard_kind = 'env'
+            dm = re.search(r'at\s+(\d+)\s*mm', raw)
+            if dm:
+                try: dist_mm = float(dm.group(1))
+                except (TypeError, ValueError): dist_mm = None
         return {
             'tag':                 tag,
             'raw':                 raw,
@@ -3093,6 +3129,8 @@ class EstunCodroidDriver(Node):
             'joint_index_1based':  joint_i1,
             'joint_deg':           joint_deg,
             'joint_limit_deg':     joint_limit_deg,
+            'guard_kind':          guard_kind,
+            'dist_mm':             dist_mm,
         }
 
     def _stop_jog_locked(self, reason=''):

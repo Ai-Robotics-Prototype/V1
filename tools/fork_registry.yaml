@@ -671,14 +671,14 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3290
+        line: 3316
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
           Pinned by test_jog_hold_heartbeat.py.
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3420
+        line: 3446
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Pinned by test_jog_hold_heartbeat.py.
@@ -999,6 +999,65 @@ capabilities:
         path_exempt:
           - src/cobot_dashboard/cobot_dashboard/disk_watchdog.py
           - '**/test_*.py'
+    known_debt: []
+
+  # 24. Clearance warnings OFF (2026-08-05 operator directive).
+  - id: clearance_warn_tier_off
+    description: >
+      The 40 mm soft clearance-warn tier is disabled end to end.
+      Server signals it via collision_warn_distance_mm=0.0 (the
+      "disabled" sentinel); the WARNING log line + telemetry
+      bool + frontend banner all gate on this being > 0. The
+      HARD self-collision stop (15 mm capsule) and ground-plane
+      hard limit remain active as the physical last-resort
+      guard — the operator's stated plan is "I will hit the
+      hard limit and it will stop."
+
+      When the hard stop fires, the ONE signal that remains is
+      a toast composed by _jog_stop_cause_operator_copy
+      (dashboard_server.py) and surfaced globally by
+      HardStopToast (App.jsx). Frontend components:
+        * SelfCollisionWarnBanner renders null unconditionally
+        * ObstacleEscapeModal early-returns null when
+          guard_kind is 'self' or 'ground' (env keeps its
+          guided-escape modal — a distinct hazard)
+        * SafetyPage shows a static "Clearance warnings: OFF"
+          row instead of the pre-directive toggle.
+
+      Fork rule: NO new component may render a warn-tier
+      banner, toast, modal, or advisory stop for self /
+      ground clearance below the hard-stop threshold. Any
+      SECOND surface that reads collision_warn_mm /
+      guard_warn_mm and renders proximity is a fork. Re-
+      enabling the warn tier requires flipping the driver
+      default AND removing the null-returns AND getting the
+      operator directive reversed — three-way gate on purpose.
+    canonical:
+      python:
+        module: estun_driver.estun_driver_node
+        functions: []
+        note: >
+          collision_warn_distance_mm param default is 0.0.
+          _build_stop_cause_locked populates guard_kind + dist_mm
+          on the structured cause dict.
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [_jog_stop_cause_operator_copy]
+      frontend:
+        path: src/cobot_dashboard/frontend/src/components/HardStopToast.jsx
+        exports: [default]
+    forbidden:
+      # No new component may render a proximity warning surface.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          - "SELF-COLLISION WARNING"
+          - "self_collision_warn"
+          - "self-collision warning"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/collisionPresentation.js
+          - src/cobot_dashboard/frontend/src/components/SelfCollisionWarnBanner.jsx
+          - '**/*.test.js'
+          - '**/*.test.jsx'
     known_debt: []
 
 

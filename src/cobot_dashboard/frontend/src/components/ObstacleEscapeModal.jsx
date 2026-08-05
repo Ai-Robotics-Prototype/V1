@@ -164,6 +164,13 @@ export default function ObstacleEscapeModal() {
   if (!sessionActive) return null
   if (!isJogCapable) return null
   if (minimized && flashClearUntil === 0) return null   // banner takes over
+  // 2026-08-05 (operator directive: clearance warnings OFF).
+  // Self and ground hard-stops surface only as the HardStopToast
+  // (canonical copy from _jog_stop_cause_operator_copy). No
+  // screen-blocking modal for those cases. env-obstacle
+  // (workspace LiDAR intrusion) keeps its guided-escape modal —
+  // a distinct hazard the directive did not touch.
+  if (guard_kind === 'self' || guard_kind === 'ground') return null
 
   const flashing = flashClearUntil > 0
   const isStopLevel = !flashing && env_min_mm != null && env_stop_mm != null

@@ -1038,6 +1038,32 @@ def _jog_stop_cause_operator_copy(cause: dict, joint_limits: list) -> dict:
         )
 
     if tag == 'collision_guard':
+        # 2026-08-05 (operator directive: clearance warnings OFF).
+        # Warn tier is disabled everywhere; the ONLY collision
+        # signal left is this hard-stop copy. Split by guard_kind
+        # so the operator sees language that matches what the arm
+        # actually did: bumped itself vs bumped the floor vs
+        # bumped an environment obstacle. Distance is embedded so
+        # the operator gets an at-a-glance sanity read on how
+        # close the arm actually got before halting.
+        guard_kind = str(cause.get('guard_kind') or '')
+        dist_mm    = cause.get('dist_mm')
+        dist_s     = f'{int(dist_mm)} mm' if isinstance(dist_mm, (int, float)) else '—'
+        if guard_kind == 'self':
+            return _out(
+                f'Jog stopped — arm too close to itself, {dist_s}.',
+                'The 15 mm hard-stop guard fired. Jog the arm away '
+                'from itself to continue.',
+            )
+        if guard_kind == 'ground':
+            return _out(
+                f'Jog stopped — arm too close to the floor, {dist_s}.',
+                'The ground-plane hard limit fired. Jog the arm up '
+                'to continue.',
+            )
+        # env / unknown — keep the pre-directive phrasing. The
+        # workspace-obstacle path is a distinct hazard the
+        # operator has not asked to reshape.
         return _out(
             'Jog stopped — approaching an obstacle.',
             'Motion got within the safety distance of a nearby '

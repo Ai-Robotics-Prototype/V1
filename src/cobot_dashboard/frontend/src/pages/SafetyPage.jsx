@@ -5,8 +5,6 @@ import { useStore } from '../store/useStore'
 export default function SafetyPage() {
   const safety = useStore((s) => s.safety)
   const { zone, human_proximity, speed_scale, estop } = safety
-  const bannerEnabled = useStore((s) => s.selfCollisionBannerEnabled)
-  const setBannerEnabled = useStore((s) => s.setSelfCollisionBannerEnabled)
 
   const RING_RADII  = [1.2, 0.6, 0.3]
   const RING_COLORS = ['#22C55E', '#EAB308', '#EF4444']
@@ -76,12 +74,14 @@ export default function SafetyPage() {
         </div>
       </div>
 
-      {/* Self-collision presentation preferences — banner LAYER
-          only. The stop-zone modal is NOT behind this toggle: it's
-          the last line of defense and always fires. See
-          lib/collisionPresentation for the split. */}
+      {/* 2026-08-05 (operator directive: clearance warnings OFF).
+          Warn tier disabled everywhere — no toggle, no per-pair
+          mute, no banner. The 15 mm hard self-collision stop and
+          the ground-plane hard limit remain active as the physical
+          last-resort guard. The only visible collision signal is
+          the hard-stop toast. */}
       <div
-        data-testid="self-collision-warning-toggle"
+        data-testid="clearance-warnings-off-row"
         style={{
           marginTop: 24, padding: '10px 14px',
           background: '#111827', border: '1px solid #1f2937',
@@ -89,25 +89,19 @@ export default function SafetyPage() {
           display: 'flex', alignItems: 'center', gap: 12,
           maxWidth: 520,
         }}>
-        <label style={{
-          display: 'flex', alignItems: 'center', gap: 10,
-          cursor: 'pointer', userSelect: 'none',
-        }}>
-          <input
-            type="checkbox"
-            checked={bannerEnabled}
-            onChange={(e) => setBannerEnabled(e.target.checked)}
-            style={{ width: 16, height: 16, cursor: 'pointer' }}
-          />
-          <span style={{ fontWeight: 700 }}>
-            Self-collision warnings: {bannerEnabled ? 'on' : 'off'}
-          </span>
-        </label>
+        <span aria-hidden="true" style={{
+          display: 'inline-block', width: 10, height: 10,
+          borderRadius: '50%', background: '#6b7280',
+        }} />
+        <span style={{ fontWeight: 700 }}>
+          Clearance warnings: OFF
+        </span>
         <div style={{
           flex: 1, fontSize: 11, color: '#9ca3af', lineHeight: 1.45,
         }}>
-          Non-blocking warn-zone banner. The stop-zone modal + motion
-          block are <b>not</b> affected by this toggle.
+          The 15 mm hard self-collision stop and the ground-plane
+          limit are <b>on</b>. When either fires, jog halts and a
+          toast names the reason.
         </div>
       </div>
     </div>

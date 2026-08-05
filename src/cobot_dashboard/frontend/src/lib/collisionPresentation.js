@@ -1,24 +1,25 @@
-// collisionPresentation — decides HOW self-collision proximity gets
-// shown to the operator. Owns the two-tier presentation rule from
-// §396 (2026-07-31 ships):
+// collisionPresentation — decides HOW proximity gets shown.
+//
+// 2026-08-05 (operator directive: clearance warnings OFF).
+// The soft warn tier is disabled by directive. presentDecision
+// NEVER returns show='banner' anywhere in this codebase; the
+// WARN ZONE path returns show='none' unconditionally. The
+// stop-zone modal path is preserved only for env-obstacle
+// (guard_kind='env'); self and ground hard-stops are surfaced
+// via a global toast keyed off robot.stop_cause_copy (fork
+// registry: jog_stop_cause_propagation — the canonical
+// translator lives in _jog_stop_cause_operator_copy).
+//
+// Pre-directive doctrine (kept here for the archaeology):
 //
 //   WARN ZONE  (dist ≤ warn AND dist > stop)
-//     → slim non-blocking banner with live distance.
-//     → per-pair session mute available.
-//     → toggleable off entirely via the Safety-page switch.
-//     → NEVER a modal. Jog / teach / drag flow unaffected.
+//     → non-blocking banner with live distance. [DISABLED]
 //
 //   STOP ZONE  (dist ≤ stop)
-//     → modal + escape jogs (ObstacleEscapeModal).
-//     → NOT gated by the banner toggle — this is the last line
-//       of defense.
-//     → during drag-active, the modal is suppressed (the driver's
-//       motion-block still applies) — a screen-blocking dialog
-//       mid-hand-guide is worse UX than a jog block.
-//
-// This module owns the DECISION only. The banner + modal components
-// are the RENDERERS. Both consume presentDecision() so a rule change
-// touches one place.
+//     → modal + escape jogs (ObstacleEscapeModal). [ENV ONLY]
+//     → self/ground now surface as a toast, not a modal —
+//       the operator explicitly asked for a single dismissable
+//       signal, not a screen-blocking dialog.
 
 const HYSTERESIS_MM_DEFAULT = 5.0
 
@@ -51,34 +52,31 @@ export function pairMuteKey(pair) {
 //                  bench-verified signal); when true, modal is
 //                  suppressed even in the stop zone.
 export function presentDecision({
-  distMm, warnMm, stopMm, pair,
-  pairMuted = false,
-  bannerOn = true,
-  dragActive = false,
+  distMm, warnMm, stopMm,
+  // Pre-directive params retained for signature stability so the
+  // existing callers (SelfCollisionWarnBanner, ObstacleEscapeModal)
+  // don't need signature edits. They're ignored below: the warn
+  // tier is OFF, so pair / mute / bannerOn / dragActive have no
+  // presentation effect any more.
+  pair,               // eslint-disable-line no-unused-vars
+  pairMuted = false,  // eslint-disable-line no-unused-vars
+  bannerOn = true,    // eslint-disable-line no-unused-vars
+  dragActive = false, // eslint-disable-line no-unused-vars
 }) {
   // Nothing to say when we can't read distance.
-  if (distMm == null || warnMm == null || stopMm == null) {
+  if (distMm == null || stopMm == null) {
     return { show: 'none', level: null, reason: 'unknown' }
   }
+  // Stop zone → modal (env only — self/ground callers gate on
+  // guard_kind themselves; see ObstacleEscapeModal).
   if (distMm <= stopMm) {
-    // Stop zone. Modal owns this — unless the operator is
-    // hand-guiding, in which case the driver's motion-block is
-    // enough and a modal on top is punishment.
-    if (dragActive) {
-      return { show: 'banner', level: 'stop', reason: 'drag-suppresses-modal' }
-    }
     return { show: 'modal', level: 'stop', reason: 'below-stop' }
   }
-  if (distMm <= warnMm) {
-    // Warn zone. Non-blocking banner — unless the operator muted
-    // this pair for the session or turned banners off entirely.
-    if (!bannerOn) {
-      return { show: 'none', level: 'warn', reason: 'banner-off' }
-    }
-    if (pairMuted) {
-      return { show: 'none', level: 'warn', reason: 'muted' }
-    }
-    return { show: 'banner', level: 'warn', reason: 'in-warn' }
+  // 2026-08-05 (clearance warnings OFF): warn band never renders.
+  // Left as an explicit 'warn-off' reason so a pinned test can
+  // assert nothing but 'none' ever falls out of the warn range.
+  if (warnMm != null && distMm <= warnMm) {
+    return { show: 'none', level: 'warn', reason: 'warn-tier-off' }
   }
   return { show: 'none', level: 'near', reason: 'above-warn' }
 }

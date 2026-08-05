@@ -1,12 +1,15 @@
-// collisionPresentation — the decision rule from §396 (2026-07-31).
+// collisionPresentation — 2026-08-05 (operator directive:
+// clearance warnings OFF).
 //
-// Pinned invariants:
-//   * warn zone → banner, never modal
-//   * stop zone → modal (unless drag-active, then banner)
-//   * mute affects banner ONLY, never the modal
-//   * bannerOn=false hides the banner but NEVER the modal
-//   * pairMuteKey is order-independent so [a,b] and [b,a] share
-//     one mute entry
+// Pinned invariants for the disabled-warn-tier era:
+//   * ANY warn-band distance → show='none', reason='warn-tier-off'
+//   * stop-zone → show='modal' (env callers still consume this;
+//     ObstacleEscapeModal early-outs on guard_kind self/ground)
+//   * pair / pairMuted / bannerOn / dragActive have NO
+//     presentation effect any more — every combination collapses
+//     to the same {show,level,reason} for a given distance.
+//   * pairMuteKey remains order-independent (kept for signature
+//     stability; still used by the store's dead-code muted set).
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -18,173 +21,106 @@ import {
 } from './collisionPresentation.js'
 
 
-// ── Warn / stop routing ──────────────────────────────────────
+// ── warn tier is off ─────────────────────────────────────────
 
 test('above warn threshold → show=none, level=near', () => {
-  const d = presentDecision({ distMm: 200, warnMm: 40, stopMm: 20 })
+  const d = presentDecision({ distMm: 200, warnMm: 40, stopMm: 15 })
   assert.equal(d.show, 'none')
   assert.equal(d.level, 'near')
   assert.equal(d.reason, 'above-warn')
 })
 
-test('inside warn band → show=banner, level=warn, NEVER modal', () => {
-  const d = presentDecision({ distMm: 35, warnMm: 40, stopMm: 20 })
-  assert.equal(d.show, 'banner',
-    'directive: warn zone shows banner only, NEVER a modal')
+test('inside warn band → show=none, reason=warn-tier-off (NEVER banner)', () => {
+  const d = presentDecision({ distMm: 30, warnMm: 40, stopMm: 15 })
+  assert.equal(d.show, 'none')
   assert.equal(d.level, 'warn')
-  assert.equal(d.reason, 'in-warn')
+  assert.equal(d.reason, 'warn-tier-off')
 })
 
-test('at stop threshold → show=modal (dist <= stop)', () => {
-  const d = presentDecision({ distMm: 20, warnMm: 40, stopMm: 20 })
-  assert.equal(d.show, 'modal',
-    'exactly at stop threshold is the modal zone')
+test('warn tier is off — pair/mute/bannerOn/dragActive are ignored', () => {
+  const inputs = [
+    { pairMuted: true,  bannerOn: true  },
+    { pairMuted: false, bannerOn: false },
+    { pairMuted: true,  bannerOn: false, dragActive: true  },
+    { pairMuted: false, bannerOn: true,  dragActive: true  },
+  ]
+  for (const opts of inputs) {
+    const d = presentDecision({
+      distMm: 30, warnMm: 40, stopMm: 15,
+      pair: ['a', 'b'], ...opts })
+    assert.equal(d.show, 'none',
+      `warn band must never render regardless of ${JSON.stringify(opts)}`)
+    assert.equal(d.reason, 'warn-tier-off')
+  }
+})
+
+test('warnMm=0 (server-published disabled sentinel) → show=none anywhere', () => {
+  // 2026-08-05 driver publishes collision_warn_mm=0.0 to signal
+  // "warn tier disabled". Even if some caller still passes it
+  // through, the frontend collapses cleanly.
+  const cases = [
+    { distMm: 200, warnMm: 0, stopMm: 15 },
+    { distMm: 30,  warnMm: 0, stopMm: 15 },
+    { distMm: 16,  warnMm: 0, stopMm: 15 },
+  ]
+  for (const c of cases) {
+    const d = presentDecision(c)
+    assert.notEqual(d.show, 'banner',
+      `warnMm=0 must never yield a banner (${JSON.stringify(c)})`)
+  }
+})
+
+
+// ── stop zone: modal path preserved for env callers ─────────
+
+test('stop zone → show=modal, level=stop, reason=below-stop', () => {
+  const d = presentDecision({ distMm: 10, warnMm: 40, stopMm: 15 })
+  assert.equal(d.show, 'modal')
   assert.equal(d.level, 'stop')
   assert.equal(d.reason, 'below-stop')
 })
 
-test('below stop threshold → show=modal', () => {
-  const d = presentDecision({ distMm: 8, warnMm: 40, stopMm: 20 })
+test('stop zone: dragActive no longer changes the decision', () => {
+  // Pre-directive: dragActive returned show='banner' in the stop
+  // band. Post-directive: modal is the sole surface for env-
+  // obstacle stops (self/ground are toast-only via
+  // HardStopToast); no drag-suppress case any more.
+  const d = presentDecision({
+    distMm: 10, warnMm: 40, stopMm: 15,
+    pair: ['link3', 'link5'], dragActive: true,
+  })
   assert.equal(d.show, 'modal')
-  assert.equal(d.level, 'stop')
-})
-
-test('unknown distance → show=none, reason=unknown', () => {
-  for (const bad of [
-    { distMm: null, warnMm: 40, stopMm: 20 },
-    { distMm: 30,   warnMm: null, stopMm: 20 },
-    { distMm: 30,   warnMm: 40, stopMm: null },
-  ]) {
-    const d = presentDecision(bad)
-    assert.equal(d.show, 'none')
-    assert.equal(d.reason, 'unknown')
-  }
+  assert.equal(d.reason, 'below-stop')
 })
 
 
-// ── No modal above stop threshold (the operator rule) ────────
+// ── missing inputs ──────────────────────────────────────────
 
-test('DIRECTIVE — no modal ever above the stop threshold', () => {
-  // Sweep the warn band; the resolver must NEVER emit 'modal'.
-  for (let d = 40; d > 20.0001; d -= 0.5) {
-    const dec = presentDecision({ distMm: d, warnMm: 40, stopMm: 20 })
-    assert.notEqual(dec.show, 'modal',
-      `dist=${d} sits in the warn band — modal must NEVER open here`)
-  }
+test('missing distance → show=none, reason=unknown', () => {
+  const d = presentDecision({ distMm: null, warnMm: 40, stopMm: 15 })
+  assert.equal(d.show, 'none')
+  assert.equal(d.reason, 'unknown')
+})
+
+test('missing stopMm → show=none, reason=unknown', () => {
+  const d = presentDecision({ distMm: 30, warnMm: 40, stopMm: null })
+  assert.equal(d.show, 'none')
+  assert.equal(d.reason, 'unknown')
 })
 
 
-// ── Toggle scope: banner-only, modal untouched ───────────────
-
-test('bannerOn=false hides the banner but NEVER the modal', () => {
-  // Warn zone — banner off → hidden.
-  const warn = presentDecision({
-    distMm: 30, warnMm: 40, stopMm: 20, bannerOn: false,
-  })
-  assert.equal(warn.show, 'none')
-  assert.equal(warn.reason, 'banner-off')
-  // Stop zone — banner off → modal STILL fires.
-  const stop = presentDecision({
-    distMm: 10, warnMm: 40, stopMm: 20, bannerOn: false,
-  })
-  assert.equal(stop.show, 'modal',
-    'DIRECTIVE — the stop-zone block is NOT behind the toggle. '
-    + 'That was the whole point of the "on/off, honest and visible" wording')
-})
-
-
-// ── Per-pair mute scope: banner-only, modal untouched ────────
-
-test('pairMuted=true suppresses the banner but NEVER the modal', () => {
-  const warn = presentDecision({
-    distMm: 30, warnMm: 40, stopMm: 20, pairMuted: true,
-  })
-  assert.equal(warn.show, 'none')
-  assert.equal(warn.reason, 'muted')
-  const stop = presentDecision({
-    distMm: 10, warnMm: 40, stopMm: 20, pairMuted: true,
-  })
-  assert.equal(stop.show, 'modal',
-    'mute never applies to the modal — the operator can\'t mute '
-    + 'the last line of defense')
-})
-
-
-// ── Drag-active edge cases ───────────────────────────────────
-
-test('drag-active in stop zone → banner (modal suppressed)', () => {
-  const d = presentDecision({
-    distMm: 10, warnMm: 40, stopMm: 20, dragActive: true,
-  })
-  assert.equal(d.show, 'banner',
-    'DIRECTIVE — during drag, never a modal mid-hand-guide. '
-    + 'The driver\'s motion-block still applies at the controller.')
-  assert.equal(d.level, 'stop',
-    'level still reports stop so the banner can paint red')
-  assert.equal(d.reason, 'drag-suppresses-modal')
-})
-
-test('drag-active in warn zone → banner (unchanged)', () => {
-  const d = presentDecision({
-    distMm: 30, warnMm: 40, stopMm: 20, dragActive: true,
-  })
-  assert.equal(d.show, 'banner')
-  assert.equal(d.level, 'warn')
-})
-
-test('drag-active + banner off + stop zone → still no modal, but drag-active is enough context', () => {
-  // A wilder combo: operator turned banners off AND is drag-guiding
-  // AND we entered stop. bannerOn=false should NOT re-enable the
-  // modal that drag suppressed — it's the more restrictive rule
-  // (drag) that wins.
-  const d = presentDecision({
-    distMm: 10, warnMm: 40, stopMm: 20,
-    dragActive: true, bannerOn: false,
-  })
-  assert.notEqual(d.show, 'modal',
-    'never a modal mid-drag, regardless of the toggle')
-})
-
-
-// ── Mute key normalization ────────────────────────────────────
+// ── pairMuteKey still order-independent (signature stability) ─
 
 test('pairMuteKey is order-independent', () => {
-  const k1 = pairMuteKey(['link3_forearm', 'link5_wrist2'])
-  const k2 = pairMuteKey(['link5_wrist2', 'link3_forearm'])
-  assert.equal(k1, k2,
-    'muting [a,b] must also mute [b,a] — the driver may report '
-    + 'either ordering on any given tick')
-  assert.ok(k1.includes(PAIR_MUTE_SEPARATOR),
-    'key uses the ↔ separator so it reads naturally in logs')
+  const k1 = pairMuteKey(['link3', 'link5'])
+  const k2 = pairMuteKey(['link5', 'link3'])
+  assert.equal(k1, k2)
+  assert.ok(k1.includes(PAIR_MUTE_SEPARATOR))
 })
 
-test('pairMuteKey handles nonsense input safely', () => {
-  assert.equal(pairMuteKey(null), null)
-  assert.equal(pairMuteKey([]), null)
-  assert.equal(pairMuteKey(['only-one']), null)
-})
-
-
-// ── Banner label copy ────────────────────────────────────────
-
-test('bannerLabel: matches the directive example ("linkA↔linkB: NNmm")', () => {
-  const s = bannerLabel(['link3_forearm', 'link5_wrist2'], 48)
-  // Directive example: "link3↔link5: 48mm" — allow "48 mm" with a
-  // space; the short link names must appear.
-  assert.ok(/link3/.test(s), 'must include the short link3 name')
-  assert.ok(/link5/.test(s), 'must include the short link5 name')
-  assert.ok(/48\s*mm/.test(s), 'must include the distance in mm')
-  assert.ok(s.includes(PAIR_MUTE_SEPARATOR),
-    'must include the ↔ separator so the two links read as a pair')
-})
-
-test('bannerLabel: unknown distance renders as em-dash', () => {
-  const s = bannerLabel(['a', 'b'], null)
-  assert.ok(s.includes('—'), 'unknown distance falls back to em-dash')
-})
-
-test('bannerLabel: __ground__ shortens to "ground"', () => {
-  const s = bannerLabel(['__ground__', 'link6_flange'], 12)
-  assert.ok(/ground/.test(s))
-  assert.ok(/link6/.test(s))
+test('bannerLabel still formats compactly (dead code but exported)', () => {
+  const s = bannerLabel(['link3', 'link5'], 42)
+  assert.ok(s.includes('link3'))
+  assert.ok(s.includes('link5'))
+  assert.ok(s.includes('42 mm'))
 })
