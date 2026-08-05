@@ -3315,11 +3315,20 @@ if FASTAPI_AVAILABLE:
         # Release — no joint/direction required. Forward session
         # metadata (hold_id/seq/client_ts_ms) so the driver can enforce
         # session tracking and drop stale queued refreshes.
+        # 2026-08-05 (jog_hold_heartbeat regression fix): also drop the
+        # server-side _HoldSession so the keepalive thread stops
+        # republishing on release. Pre-fix, HTTP-fallback releases
+        # left ghost sessions in _active_holds that either kept the
+        # motion alive OR only got cleaned up by ws-disconnect / TTL.
         if body.get("hold") is False or body.get("stop") is True:
             payload = {"mode": "joint", "hold": False}
             for k in ("hold_id", "seq", "client_ts_ms"):
                 if body.get(k) is not None: payload[k] = body[k]
             _publish_estun_jog(payload)
+            _hid = body.get("hold_id")
+            if _hid is not None:
+                with _active_holds_lock:
+                    _active_holds.pop(_hid, None)
             return {"ok": True, "action": "release"}
 
         raw_joint = body.get("joint")
@@ -3353,6 +3362,26 @@ if FASTAPI_AVAILABLE:
             }
             for k in ("hold_id", "seq", "client_ts_ms"):
                 if body.get(k) is not None: payload[k] = body[k]
+            # 2026-08-05 (jog_hold_heartbeat regression fix): register
+            # this hold in _active_holds so the keepalive thread
+            # republishes at 60ms cadence — same as the WS path does
+            # in _handle_ws_client_msg. Pre-fix, HTTP-fallback holds
+            # (which fire after any WS drop) published ONE frame and
+            # then the driver's 200ms freshness deadman clamped them
+            # 200-250ms later. Result: 28 spurious freshness_deadman
+            # stops in a 15-minute window on 2026-08-05. See
+            # fork registry entry `jog_hold_heartbeat`.
+            _hid = body.get("hold_id")
+            if _hid is not None:
+                _now = time.monotonic()
+                with _active_holds_lock:
+                    _hs = _active_holds.get(_hid)
+                    if _hs is None:
+                        _hs = _HoldSession(_hid, None, payload, "joint")
+                        _active_holds[_hid] = _hs
+                    else:
+                        _hs.last_browser_ts = _now
+                        _hs.driver_payload_template = payload
             _publish_estun_jog(payload)
             return {"ok": True, "action": "hold"}
 
@@ -3422,6 +3451,13 @@ if FASTAPI_AVAILABLE:
             for k in ("hold_id", "seq", "client_ts_ms"):
                 if body.get(k) is not None: payload[k] = body[k]
             _publish_estun_jog(payload)
+            # 2026-08-05 (jog_hold_heartbeat regression fix, cart side):
+            # drop the ghost _HoldSession so the keepalive thread
+            # stops republishing on release.
+            _hid = body.get("hold_id")
+            if _hid is not None:
+                with _active_holds_lock:
+                    _active_holds.pop(_hid, None)
             return {"ok": True, "action": "release"}
 
         axis_letter = str(body.get("axis", "")).lower()
@@ -3462,6 +3498,21 @@ if FASTAPI_AVAILABLE:
         }
         for k in ("hold_id", "seq", "client_ts_ms"):
             if body.get(k) is not None: payload[k] = body[k]
+        # 2026-08-05 (jog_hold_heartbeat regression fix, cart side):
+        # register the hold in _active_holds so the keepalive thread
+        # republishes at 60ms cadence. Prior to this fix, HTTP-
+        # fallback cart holds died at the 200ms driver deadman.
+        _hid = body.get("hold_id")
+        if _hid is not None:
+            _now = time.monotonic()
+            with _active_holds_lock:
+                _hs = _active_holds.get(_hid)
+                if _hs is None:
+                    _hs = _HoldSession(_hid, None, payload, "cartesian")
+                    _active_holds[_hid] = _hs
+                else:
+                    _hs.last_browser_ts = _now
+                    _hs.driver_payload_template = payload
         _publish_estun_jog(payload)
         return {"ok": True, "action": "hold"}
 

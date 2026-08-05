@@ -609,6 +609,78 @@ capabilities:
           - '**/*.test.jsx'
     known_debt: []
 
+  # 20. Jog hold-heartbeat (2026-08-05 regression fix).
+  - id: jog_hold_heartbeat
+    description: >
+      Every jog hold that expects the driver's freshness deadman to
+      NOT fire must be registered in `_active_holds` on the dashboard.
+      The keepalive thread republishes /robot/jog_command at 60 ms
+      cadence per registered session, and only registered sessions
+      get republished.
+
+      Both transports (WS receive in _handle_ws_client_msg AND HTTP
+      /cmd/jog + /cmd/jog_cartesian) MUST call
+      `_active_holds[hold_id] = _HoldSession(...)` on hold:true, and
+      `_active_holds.pop(hold_id, None)` on hold:false. The two
+      transports mirror each other by design — HTTP fallback fires
+      after every WS drop (deploy restart, network hiccup), and
+      pre-2026-08-05 HTTP holds became step-mode jogs because they
+      skipped the session registration.
+
+      Fork rule: a hold-publishing code path that touches
+      _publish_estun_jog with `hold: True` MUST also touch
+      _active_holds. Any second path that lands hold frames without
+      that pairing is a fork.
+    canonical:
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [_handle_ws_client_msg, cmd_jog, cmd_jog_cartesian]
+    forbidden:
+      # No new HTTP jog endpoints that publish hold:true without
+      # registering _HoldSession. The two canonical routes in
+      # dashboard_server.py are listed in known_debt below so this
+      # pattern (which matches every @app.post starting /cmd/jog)
+      # doesn't flag them. A NEW file (e.g. a route module split-off)
+      # gaining a matching @app.post would be caught.
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          - "@app\\.post\\(.*\"/cmd/jog"
+        path_exempt:
+          - '**/test_*.py'
+    known_debt:
+      # fork_lint reports lines using its comment-stripped source
+      # (loses ~1 line per stripped comment). At the current source
+      # (438299d + fixes) the canonical routes fall at reported lines
+      # 3192 and 3322. Real @app.post lines are 3297 and 3435.
+      # When the file grows, `deploy.sh` will surface a fresh line
+      # number in the lint output; update these debt entries then.
+      - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
+        line: 3192
+        why: >
+          Canonical route /cmd/jog. Registers _HoldSession on
+          hold:true and pops it on hold:false — matches WS parity.
+          Pinned by test_jog_hold_heartbeat.py.
+        owner: dashboard-transport
+      - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
+        line: 3322
+        why: >
+          Canonical route /cmd/jog_cartesian. Same pairing as
+          /cmd/jog. Pinned by test_jog_hold_heartbeat.py.
+        owner: dashboard-transport
+      - path: src/cobot_dashboard/frontend/src/lib/holdTicker.js
+        line: 0
+        why: >
+          Full Worker-side WebSocket isolation (Worker opens its own
+          WS to a dedicated /ws/jog endpoint instead of round-tripping
+          via the main thread's _stateWs) is a bigger refactor that
+          did not land in the 2026-08-05 commit. The Worker+rAF
+          ticker already fires from a worker thread; only the send
+          path still crosses to main. Tracking as known debt because
+          the intent (per operator directive: "dedicated Worker, its
+          own send path, zero shared state with any rendering
+          component") is broader than the immediate regression fix.
+        owner: dashboard-transport
+
 
 # ── Heuristic sweep ─────────────────────────────────────────────────
 #
