@@ -1949,6 +1949,66 @@ const storeDefinition = (set, get) => ({
     }
   },
 
+  // 2026-08-05 (P0-B, stale-lock fix): release OWNERSHIP without
+  // discarding the poses. Any device may re-claim via /start; the
+  // record-through architecture already persisted every pose on the
+  // Record path, so ending the session loses nothing.
+  //
+  // Called on: teach overlay close (done/back/cancel), route change
+  // out of ProgramEditor, and window unload (via sendBeacon for the
+  // last-gasp path).
+  async endTeachSession(programId) {
+    if (!programId) return { ok: false, error: 'bad_args' }
+    const device_id = get()._getTeachDeviceId()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/end`,
+        { method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ device_id }) })
+      return { ok: res.ok }
+    } catch (e) {
+      return { ok: false, error: 'network' }
+    }
+  },
+
+  // Same URL, but issued via navigator.sendBeacon so a window-close
+  // path (which cancels normal fetches) can still deliver it. Best-
+  // effort — the server-side owner-TTL is the guaranteed backstop
+  // after 5 min if this doesn't land.
+  endTeachSessionBeacon(programId) {
+    if (!programId) return false
+    const device_id = get()._getTeachDeviceId()
+    if (typeof navigator === 'undefined' || !navigator.sendBeacon) return false
+    try {
+      const blob = new Blob(
+        [JSON.stringify({ device_id })],
+        { type: 'application/json' })
+      return navigator.sendBeacon(
+        `/api/teach_session/${encodeURIComponent(programId)}/end`, blob)
+    } catch (_) {
+      return false
+    }
+  },
+
+  // Periodic keep-alive from the teach overlay. The server refreshes
+  // updated_ts so the owner-TTL doesn't expire on a slow-network but
+  // still-live device.
+  async heartbeatTeachSession(programId) {
+    if (!programId) return { ok: false, error: 'bad_args' }
+    const device_id = get()._getTeachDeviceId()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/heartbeat`,
+        { method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ device_id }) })
+      return { ok: res.ok, status: res.status }
+    } catch (e) {
+      return { ok: false, error: 'network' }
+    }
+  },
+
   async promoteTeachSession(programId) {
     if (!programId) return { ok: false, error: 'bad_args' }
     const device_id = get()._getTeachDeviceId()

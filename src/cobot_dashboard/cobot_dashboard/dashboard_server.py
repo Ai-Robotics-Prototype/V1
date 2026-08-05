@@ -12410,6 +12410,17 @@ if FASTAPI_AVAILABLE:
     # localStorage.setItem carrying pose data.
 
     _TEACH_DIR = '/opt/cobot/teach_sessions'
+    # 2026-08-05 stale-lock fix (P0-B): a session whose owner_device_id
+    # hasn't heartbeated (or written) for _TEACH_OWNER_TTL_S seconds
+    # gets its ownership released — the tab presumably crashed. The
+    # DRAFT stays (poses safe on disk); another device can re-claim
+    # via /start without a Take Over gesture. If nothing re-claims for
+    # _TEACH_DRAFT_TTL_S beyond that, the whole draft is garbage-
+    # collected. Both windows are picked to be short enough that a
+    # crashed-tab operator doesn't stay locked out, long enough that
+    # a slow network doesn't drop a live session mid-teach.
+    _TEACH_OWNER_TTL_S = 300      # 5 min
+    _TEACH_DRAFT_TTL_S = 24 * 3600  # 24 h — dropped from disk after this
     _teach_lock = threading.Lock()
 
     def _teach_path(prog_id: str):
@@ -12451,10 +12462,58 @@ if FASTAPI_AVAILABLE:
         except FileNotFoundError:
             pass
 
+    def _teach_updated_epoch(draft: dict) -> float | None:
+        """Parse the draft's `updated_ts` (ISO-8601 UTC 'Z') to
+        wall-clock epoch. Returns None if unparseable. Uses
+        calendar.timegm because time.mktime interprets a naive tm as
+        LOCAL and would silently drift by ±3600s across DST."""
+        s = draft.get('updated_ts') if isinstance(draft, dict) else None
+        if not isinstance(s, str) or not s:
+            return None
+        try:
+            import calendar as _cal
+            tm = time.strptime(s, '%Y-%m-%dT%H:%M:%SZ')
+            return float(_cal.timegm(tm))
+        except (ValueError, TypeError):
+            return None
+
+    def _teach_apply_ttl(pid: str, draft: dict) -> dict | None:
+        """Apply the TTL rules to a live draft. Returns the (possibly
+        rewritten) draft, or None if the draft was garbage-collected.
+
+        Two windows:
+          * owner_ttl:  released ownership after N s of silence
+                        (poses preserved, banner clears)
+          * draft_ttl:  drop the file entirely after N s more
+        """
+        if not isinstance(draft, dict):
+            return draft
+        upd_epoch = _teach_updated_epoch(draft)
+        if upd_epoch is None:
+            return draft
+        age = time.time() - upd_epoch
+        # Owner-TTL: release ownership if the live owner has gone silent.
+        if age > _TEACH_OWNER_TTL_S and draft.get('owner_device_id'):
+            draft = dict(draft)
+            draft['owner_device_id'] = None
+            draft['owner_label']     = None
+            draft['ttl_expired_at']  = time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            _teach_touch(draft)
+            _teach_write_draft(pid, draft)
+            return draft
+        # Draft-TTL: garbage-collect a long-abandoned unowned draft.
+        if age > _TEACH_DRAFT_TTL_S and not draft.get('owner_device_id'):
+            _teach_delete_draft(pid)
+            return None
+        return draft
+
     def _teach_publish_to_state() -> None:
         """Mirror every draft file on disk into STATE['teach_sessions']
         so the WS broadcast carries it. Called at boot (hydrate) and
-        after every mutation."""
+        after every mutation. Applies the TTL rules — a stale-owner
+        draft has its ownership released here, and a long-abandoned
+        draft is garbage-collected."""
         drafts: dict = {}
         try:
             for name in os.listdir(_TEACH_DIR):
@@ -12462,6 +12521,9 @@ if FASTAPI_AVAILABLE:
                     continue
                 pid = name[:-len('.draft.json')]
                 d = _teach_read_draft(pid)
+                if d is None:
+                    continue
+                d = _teach_apply_ttl(pid, d)
                 if d is not None:
                     drafts[pid] = d
         except FileNotFoundError:
@@ -12633,6 +12695,81 @@ if FASTAPI_AVAILABLE:
             _teach_delete_draft(prog_id)
             _teach_publish_to_state()
         return {'ok': True, 'program_id': prog_id}
+
+    @app.post("/api/teach_session/{prog_id}/end")
+    async def api_teach_session_end(prog_id: str, request: Request):
+        """Release ownership of the teach session. Body:
+            {device_id: <str, required>}
+        The DRAFT stays on disk (poses safe); the OWNER field clears
+        so the banner drops for every other device, and the session
+        is re-claimable via /start without a Take Over. The record-
+        through architecture already persisted every pose on Record,
+        so ending the session loses nothing (P0-B, 2026-08-05).
+
+        Non-owner callers get 403 — device_B can't force-end
+        device_A's session (Take Over is the collision-case path)."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        if not device_id:
+            return JSONResponse({'error': 'device_id required'},
+                                status_code=400)
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                return {'ok': True, 'already_ended': True}
+            if draft.get('owner_device_id') != device_id:
+                return JSONResponse({
+                    'ok': False,
+                    'error': 'not_owner',
+                    'owner_device_id': draft.get('owner_device_id'),
+                    'owner_label':     draft.get('owner_label'),
+                }, status_code=403)
+            draft = dict(draft)
+            draft['owner_device_id'] = None
+            draft['owner_label']     = None
+            draft['ended_ts']        = time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            _teach_touch(draft)
+            _teach_write_draft(prog_id, draft)
+            _teach_publish_to_state()
+        return {'ok': True, 'released': True}
+
+    @app.post("/api/teach_session/{prog_id}/heartbeat")
+    async def api_teach_session_heartbeat(prog_id: str, request: Request):
+        """Refresh the session's `updated_ts` so the owner-TTL doesn't
+        expire on a slow-network live device. Body:
+            {device_id: <str, required>}
+        Non-owner → 403 (heartbeat is proof of live ownership; another
+        device's heartbeat must not extend the owning device's TTL).
+        No draft → 404 with a canonical "session gone" body so the
+        client can navigate away cleanly."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        if not device_id:
+            return JSONResponse({'error': 'device_id required'},
+                                status_code=400)
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                return JSONResponse({
+                    'ok': False, 'error': 'no_session',
+                }, status_code=404)
+            if draft.get('owner_device_id') != device_id:
+                return JSONResponse({
+                    'ok': False,
+                    'error': 'not_owner',
+                    'owner_device_id': draft.get('owner_device_id'),
+                    'owner_label':     draft.get('owner_label'),
+                }, status_code=403)
+            _teach_touch(draft)
+            _teach_write_draft(prog_id, draft)
+        return {'ok': True, 'updated_ts': draft.get('updated_ts')}
 
     def _apply_draft_poses_to_program(program: dict, poses: dict) -> dict:
         """Merge draft poses INTO a program dict (returns the merged

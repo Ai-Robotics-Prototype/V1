@@ -18,7 +18,7 @@
 // dialogs (e-stop clear, controller-link recovery) route through
 // the same primitives.
 
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { useStore } from '../store/useStore'
 import { HoldButton } from './JogControls'
 
@@ -123,7 +123,6 @@ function RecoveryBody({ jointRow, allRows, jogHold, jogRelease, onDismiss }) {
   const cur     = Number(jointRow.current_deg)
   const limit   = Number(jointRow.limit_deg)
   const edge    = Number(jointRow.escape_only_edge_deg)
-  const head    = Number(jointRow.headroom_deg)  // signed distance from ±limit
   const past    = Math.max(0, edge - Math.abs(cur))   // how deep into the escape zone
   const target  = limit - RECOVERY_TARGET_INSIDE_DEG  // absolute target: come inside by 10°
   // Escape direction: reduce abs(current). If cur is positive, jog -.
@@ -131,20 +130,37 @@ function RecoveryBody({ jointRow, allRows, jogHold, jogRelease, onDismiss }) {
   const escSym  = escDir > 0 ? '+' : '−'
   const softStr = `${limit.toFixed(0)}°`
 
+  // Live-firing indicator so the operator SEES that the press is
+  // dispatching frames. Ticker fires ~10 Hz on the client; we bump
+  // a fires counter so the button label switches to "Recovering — Jn
+  // {escape} 5%" while held. The invisibility of the press was a
+  // real bug (P0-A, 2026-08-05): white-on-white default HoldButton
+  // background + no visual confirmation the frames were flying.
+  const firesRef = useRef(0)
+  const [pressed, setPressed] = useState(false)
+
   const holdStart = useCallback((meta) => {
+    firesRef.current += 1
+    setPressed(true)   // React skips re-render if already true
     return jogHold(j, escDir, RECOVERY_SPEED_PCT, meta)
   }, [j, escDir, jogHold])
   const holdEnd = useCallback((meta) => {
+    setPressed(false)
+    firesRef.current = 0
     return jogRelease('joint', meta)
   }, [jogRelease])
 
-  const wire = {
+  // useMemo the wire object so HoldButton's callback identities stay
+  // stable across state broadcasts (25 Hz idle, 8 Hz mid-hold). A
+  // fresh identity every render doesn't stop the button from firing,
+  // but it churns useCallback deps unnecessarily.
+  const wire = useMemo(() => ({
     jogStyle:     'CONTINUOUS',
     onTap:        undefined,
     onPressStart: holdStart,
     onPressTick:  holdStart,
     onPressEnd:   holdEnd,
-  }
+  }), [holdStart, holdEnd])
 
   return (
     <>
@@ -225,16 +241,31 @@ function RecoveryBody({ jointRow, allRows, jogHold, jogRelease, onDismiss }) {
           {/* The Recover control uses the shared HoldButton primitive
               from JogControls (fork registry canonical for hold-to-jog
               press mechanics). CONTINUOUS style + 100 ms ticker + the
-              driver's 200 ms freshness deadman = release ⇒ stop. */}
+              driver's 200 ms freshness deadman = release ⇒ stop.
+
+              2026-08-05 P0-A contrast fix: HoldButton's default `bg`
+              is white — passing `color="#059669"` gave a colored
+              HOVER state only (see JogControls.jsx onPointerEnter),
+              leaving the resting button white-on-white which the
+              operator literally could not see. Pass `bg="#059669"`
+              (green resting fill) and a darker hover so the button
+              is readable in every state, on both themes. Live-firing
+              indicator swaps the label when the ticker is firing. */}
           <HoldButton
             {...wire}
             color="#059669"
+            bg="#059669"
+            bgHover="#047857"
+            borderColor="#065F46"
             width={260}
             height={68}
             data-testid="joint-recover-hold"
           >
-            <span style={{ color: '#fff', fontSize: 15, fontWeight: 800 }}>
-              Hold to Recover J{j} {escSym}
+            <span style={{ color: '#fff', fontSize: 15, fontWeight: 800,
+                           textShadow: '0 1px 1px rgba(0,0,0,0.25)' }}>
+              {pressed
+                ? `Recovering — J${j} ${escSym} @ ${RECOVERY_SPEED_PCT}%`
+                : `Hold to Recover J${j} ${escSym}`}
             </span>
           </HoldButton>
         </div>

@@ -3300,6 +3300,13 @@ export default function ProgramEditor() {
   const [teachAllOrder, setTeachAllOrder]   = useState([])
   const [teachAllPos,   setTeachAllPos]     = useState(-1)
   const [teachSingleId, setTeachSingleId]   = useState(null)
+  // 2026-08-05 (P0-B, stale-lock fix): store actions for the
+  // session-lifecycle heartbeat + end wire. See the useEffect below
+  // this state block for the exact open/close transitions that
+  // trigger them.
+  const endTeachSession       = useStore((s) => s.endTeachSession)
+  const endTeachSessionBeacon = useStore((s) => s.endTeachSessionBeacon)
+  const heartbeatTeachSession = useStore((s) => s.heartbeatTeachSession)
   // Pallet-frame teach state — one of 'pallet_c1'/'pallet_c2'/
   // 'pallet_c3'/'pallet_part' when the operator is walking through the
   // 4-point diagram-guided flow, null otherwise. Distinct from the
@@ -3317,6 +3324,69 @@ export default function ProgramEditor() {
   // All chaining an owed re-teach; cleared as soon as the operator
   // navigates away from that role.
   const [palletTeachReason, setPalletTeachReason] = useState(null)
+
+  // 2026-08-05 (P0-B): teach-session lifecycle. Overlay is "open"
+  // when any of teachSingleId / teachAllOrder / palletTeachRole is
+  // active. While open, heartbeat every 30 s so the owner-TTL
+  // doesn't age us out. On close (open → not-open transition), OR
+  // on component unmount, call /end to release the lock. beforeunload
+  // uses sendBeacon so a window close still releases. Record-through
+  // architecture means poses were already persisted on every Record;
+  // releasing the lock loses nothing.
+  const overlayOpen = (teachSingleId != null
+                       || (teachAllOrder && teachAllOrder.length > 0)
+                       || palletTeachRole != null)
+  const wasOverlayOpen = useRef(false)
+  useEffect(() => {
+    const pid = currentProgram?.id
+    if (!pid) return
+    // Fires on the transition to closed. Uses the previous value in
+    // ref so we don't send /end when the component first mounts with
+    // no overlay open (never was open here).
+    if (wasOverlayOpen.current && !overlayOpen) {
+      try { endTeachSession(pid) } catch (_) { /* nop */ }
+    }
+    wasOverlayOpen.current = overlayOpen
+  }, [overlayOpen, currentProgram?.id, endTeachSession])
+  useEffect(() => {
+    if (!overlayOpen) return
+    const pid = currentProgram?.id
+    if (!pid) return
+    // 30 s heartbeat. TTL is 5 min server-side, so we're comfortably
+    // inside the deadline even on a stuttering network.
+    const t = setInterval(() => {
+      try { heartbeatTeachSession(pid) } catch (_) { /* nop */ }
+    }, 30000)
+    return () => clearInterval(t)
+  }, [overlayOpen, currentProgram?.id, heartbeatTeachSession])
+  useEffect(() => {
+    // Window unload — beacon out one last /end before the tab dies.
+    // sendBeacon survives a close where fetch would be cancelled.
+    const onBeforeUnload = () => {
+      const pid = currentProgram?.id
+      if (!pid || !wasOverlayOpen.current) return
+      try { endTeachSessionBeacon(pid) } catch (_) { /* nop */ }
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', onBeforeUnload)
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('beforeunload', onBeforeUnload)
+      }
+    }
+  }, [currentProgram?.id, endTeachSessionBeacon])
+  useEffect(() => {
+    // Component unmount — route change out of ProgramEditor. Same
+    // as close: release the lock.
+    return () => {
+      const pid = currentProgram?.id
+      if (pid && wasOverlayOpen.current) {
+        try { endTeachSession(pid) } catch (_) { /* nop */ }
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
   // Frame-validation findings are NOT held as passive banner state
   // anymore (§465 fork-1 kill, 2026-08-04). The mid-re-teach
   // passive-banner rendering surfaced findings against half-updated
