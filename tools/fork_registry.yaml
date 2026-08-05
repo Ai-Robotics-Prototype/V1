@@ -871,17 +871,18 @@ capabilities:
       # here shift as the file grows; refresh the numbers from the
       # deploy.sh lint output when they move.
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 5763
+        line: 5765
         why: >
           disabledReason string for the pallet-teach flow overlay's
           Record button title tooltip. Grandfathered by the visible
-          TeachLockBanner rendered in the same subtree.
+          TeachLockBanner rendered in the same subtree. Line drifts
+          with editor edits — refresh from deploy.sh lint output.
         owner: dashboard-frontend
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 5805
+        line: 5807
         why: >
           disabledReason string for the single/all-step teach overlay's
-          Record button title tooltip. Same rationale as line 5763.
+          Record button title tooltip. Same rationale as line 5765.
         owner: dashboard-frontend
 
   # 22. Page-context persistence (2026-08-05 refresh-loss P0).
@@ -908,6 +909,17 @@ capabilities:
       server-side. Session-scoped state (URL query, in-memory
       Zustand) is fine; anything that survives a reload must round-
       trip through the ui_context endpoints.
+
+      EXCEPTION (2026-08-05 identity root-cause fix): device
+      IDENTITY (not state) is explicitly whitelisted. The
+      'roboai-device-id' localStorage key holds a stable
+      per-machine UUID — one physical device, one identity, all
+      tabs share it. This is the ONE thing browser storage owns
+      canonically; the server never mints it and cannot,
+      because the server can't tell "same device new tab" from
+      "different device" without a stable client-anchored id.
+      Legacy sessionStorage key 'roboai-teach-device-id' is
+      migrated once on read then removed.
     canonical:
       python:
         module: cobot_dashboard.ui_context

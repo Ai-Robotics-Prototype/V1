@@ -364,6 +364,80 @@ function SystemCheckRow({ row, expanded, onToggle, onRestart }) {
   )
 }
 
+// 2026-08-05 (identity root-cause fix, Directive item 2). One
+// physical device = one identity + one human-readable label.
+// The label is stored in ui_context.device_label on the Jetson
+// and shown in every teach-lock banner + event log entry.
+// Default derived from platform sniff on first run ("Tablet"
+// on touch devices, "PC" otherwise); the operator renames it
+// here.
+function DeviceIdentitySection() {
+  const label = useStore((s) => s._teachDeviceLabel)
+  const setLabel = useStore((s) => s.setTeachDeviceLabel)
+  const getDefault = useStore((s) => s._getTeachDeviceLabel)
+  const getId    = useStore((s) => s._getTeachDeviceId)
+  const [draft, setDraft] = useState(label || getDefault())
+  useEffect(() => {
+    // Sync draft when the cached label lands (post-mount fetch).
+    if (label && label !== draft) setDraft(label)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [label])
+  const id = getId()
+  const dirty = draft.trim() && draft.trim() !== (label || '')
+  const onSave = () => {
+    const clean = draft.trim().slice(0, 64)
+    if (!clean) return
+    setLabel(clean)
+  }
+  return (
+    <div style={{
+      background: 'var(--bg-panel)', border: '1px solid var(--border)',
+      borderRadius: 'var(--radius-sm)', padding: '12px 16px',
+      display: 'flex', flexDirection: 'column', gap: 8,
+    }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>
+        This device
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+        The name other devices see in teach-lock banners and the
+        event log. Persists across tabs and refreshes.
+      </div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 4 }}>
+        <input
+          data-testid="device-label-input"
+          type="text"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="e.g. Shop Tablet"
+          maxLength={64}
+          style={{
+            flex: 1, minWidth: 0,
+            background: 'var(--bg-app)', color: 'var(--text-primary)',
+            border: '1px solid var(--border)',
+            borderRadius: 4, padding: '6px 10px', fontSize: 13,
+          }}
+        />
+        <button
+          data-testid="device-label-save"
+          disabled={!dirty}
+          onClick={onSave}
+          style={{
+            padding: '6px 14px',
+            background: dirty ? 'var(--accent)' : 'var(--bg-app)',
+            color: dirty ? '#0C0C0E' : 'var(--text-muted)',
+            border: '1px solid var(--border)',
+            borderRadius: 4, fontSize: 12,
+            cursor: dirty ? 'pointer' : 'default',
+          }}>Save</button>
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--text-muted)',
+                    fontFamily: 'var(--font-mono)' }}>
+        device_id: {id}
+      </div>
+    </div>
+  )
+}
+
 function SystemCheckSection() {
   const [data, setData]           = useState(null)
   const [error, setError]         = useState(null)
@@ -550,6 +624,8 @@ export default function ConfigureLayout() {
       </div>
 
       <SystemCheckSection />
+
+      <DeviceIdentitySection />
 
       <CellSetupSection />
 

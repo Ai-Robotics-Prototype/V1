@@ -59,12 +59,27 @@ def test_non_whitelisted_fields_dropped(tmp_dir):
     r = ui_context.set('dev-1', {
         'open_program_id': 'p',
         'active_tab':      'program',
+        'device_label':    'Shop Tablet',
         'secret_admin':    True,
         '__proto__':       'nope',
     })
     assert 'secret_admin' not in r
     assert '__proto__' not in r
     assert r['open_program_id'] == 'p'
+    assert r['device_label']    == 'Shop Tablet'
+
+
+def test_device_label_round_trip(tmp_dir):
+    """2026-08-05 (identity root-cause fix): device_label is a
+    whitelisted, first-class field alongside open_program_id/
+    active_tab. Banners and event-log entries read from here."""
+    r = ui_context.set('dev-label', {'device_label': 'Office PC'})
+    assert r['device_label'] == 'Office PC'
+    r2 = ui_context.set('dev-label', {'device_label': 'Shop Tablet'})
+    assert r2['device_label'] == 'Shop Tablet'
+    # None clears.
+    r3 = ui_context.set('dev-label', {'device_label': None})
+    assert 'device_label' not in r3
 
 
 def test_null_field_clears(tmp_dir):

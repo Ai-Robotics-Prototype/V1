@@ -3443,8 +3443,10 @@ export default function ProgramEditor() {
     if (!overlayOpen) return
     const pid = currentProgram?.id
     if (!pid) return
-    // 30 s heartbeat. TTL is 5 min server-side, so we're comfortably
-    // inside the deadline even on a stuttering network.
+    // 15 s heartbeat. Server owner-TTL is 90 s (_TEACH_OWNER_TTL_S),
+    // stale-heartbeat auto-swap fires at 60 s (4 missed beats).
+    // Prior 30 s cadence meant one dropped beat + one slow network
+    // frame could tip a live tab into the stale window.
     //
     // 2026-08-05 (Lesson 179 gap fix): DON'T heartbeat while the tab
     // is hidden. Background tabs kept ticking, extending the owner-
@@ -3459,7 +3461,7 @@ export default function ProgramEditor() {
         return
       }
       try { heartbeatTeachSession(pid) } catch (_) { /* nop */ }
-    }, 30000)
+    }, 15000)
     return () => clearInterval(t)
   }, [overlayOpen, currentProgram?.id, heartbeatTeachSession])
   useEffect(() => {

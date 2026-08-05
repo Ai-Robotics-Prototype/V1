@@ -12,6 +12,11 @@ Fields:
   open_program_id   — the program the operator has open in the
                        Program tab. Refresh restores it.
   active_tab        — 'monitor' | 'program' | 'programs' | ...
+  device_label      — human name for this device ("Shop Tablet",
+                       "Office PC"). Shown in every teach-lock
+                       banner + event-log entry. Rename in
+                       Configure. (2026-08-05 identity root-cause
+                       fix.)
   updated_ts        — ISO-8601 UTC, refreshed on every set.
 
 Retention: LRU prune on set — hard cap at _MAX_DEVICES entries.
@@ -110,7 +115,7 @@ def set(device_id: str, patch: dict) -> dict | None:
     except OSError:
         return None
     cur = get(device_id) or {}
-    for k in ('open_program_id', 'active_tab'):
+    for k in ('open_program_id', 'active_tab', 'device_label'):
         if k in patch:
             v = patch[k]
             if v is None:

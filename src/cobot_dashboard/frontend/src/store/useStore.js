@@ -1731,13 +1731,14 @@ const storeDefinition = (set, get) => ({
   // on a bad link). The next fire re-attempts.
   async editThroughProgram(program) {
     if (!program || !program.id) return { ok: false, error: 'no_id' }
-    const device_id = get()._getTeachDeviceId()
+    const device_id    = get()._getTeachDeviceId()
+    const device_label = get()._getTeachDeviceLabel()
     try {
       const res = await fetch(
         `/api/teach_session/${encodeURIComponent(program.id)}/edit`,
         { method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ device_id, program }),
+          body:    JSON.stringify({ device_id, device_label, program }),
           keepalive: true })
       const body = await res.json().catch(() => ({}))
       if (!res.ok) return { ok: false, status: res.status, body }
@@ -1784,6 +1785,27 @@ const storeDefinition = (set, get) => ({
       const b = await r.json().catch(() => ({}))
       openProgId = b?.context?.open_program_id || null
       activeTab  = b?.context?.active_tab || null
+      // 2026-08-05 (human labels): warm the device_label cache so
+      // every teach-session call this session carries the operator-
+      // chosen name ("Shop Tablet") instead of falling back to the
+      // platform default. First-run: no label yet in ui_context —
+      // seed it with the platform sniff so banners on OTHER devices
+      // see something readable immediately.
+      const label = b?.context?.device_label
+      if (label && typeof label === 'string') {
+        set({ _teachDeviceLabel: label })
+      } else {
+        const def = get()._getTeachDeviceLabel()
+        set({ _teachDeviceLabel: def })
+        try {
+          fetch(`/api/ui_context/${encodeURIComponent(device_id)}`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ device_label: def }),
+            keepalive: true,
+          })
+        } catch (_) { /* nop */ }
+      }
     } catch (_) { /* nop — fall through to blank UI */ }
     if (activeTab) {
       try { get().setActiveTab(activeTab) } catch (_) { /* nop */ }
@@ -1907,30 +1929,97 @@ const storeDefinition = (set, get) => ({
   // refresh. See dashboard_server.py teach-session block for the
   // wire contract.
   //
-  // Device identity: crypto.randomUUID() generated once per tab
-  // and stashed in sessionStorage (survives refresh, dies with
-  // tab close). Passed on every request so the server can
-  // enforce single-owner semantics.
-
+  // 2026-08-05 (identity root-cause fix): Device identity is
+  // PER-DEVICE — one physical machine, one id — persisted in
+  // localStorage under 'roboai-device-id'. Prior implementation
+  // stashed it in sessionStorage, which is per-TAB, so every
+  // tab close/reopen minted a fresh UUID. That was the true
+  // root cause of all four teach-lock incidents: an operator's
+  // own previous tab locked them out because the server saw
+  // "different device_id, fresh updated_ts" and refused to
+  // self-heal (which requires 60s heartbeat silence).
+  //
+  // Fork-registry note: page_context_persistence forbids
+  // localStorage for page STATE. Device IDENTITY is explicitly
+  // whitelisted — it's stable identity, not mutable state.
+  //
+  // Migration path: if a sessionStorage id exists (from a tab
+  // that hasn't closed since the deploy), reuse it in
+  // localStorage so the running session's server-side draft
+  // ownership doesn't break the moment we switch.
   _teachDeviceId: null,
   _getTeachDeviceId() {
     let id = get()._teachDeviceId
     if (id) return id
     try {
-      id = sessionStorage.getItem('roboai-teach-device-id')
-    } catch (_) { /* no sessionStorage → generate fresh each call */ }
+      id = localStorage.getItem('roboai-device-id')
+    } catch (_) { /* no localStorage */ }
     if (!id) {
+      // One-shot migration from the pre-fix sessionStorage key —
+      // preserves the current tab's server-side ownership through
+      // the deploy without a forced re-teach. Once migrated the
+      // sessionStorage entry is cleared so a later refresh can't
+      // shadow the localStorage value.
       try {
-        id = (typeof crypto !== 'undefined' && crypto.randomUUID)
-          ? crypto.randomUUID()
-          : `dev-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
-        sessionStorage.setItem('roboai-teach-device-id', id)
-      } catch (_) {
-        id = `dev-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
-      }
+        const legacy = sessionStorage.getItem('roboai-teach-device-id')
+        if (legacy) {
+          id = legacy
+          try {
+            localStorage.setItem('roboai-device-id', id)
+            sessionStorage.removeItem('roboai-teach-device-id')
+          } catch (_) { /* nop */ }
+        }
+      } catch (_) { /* nop */ }
+    }
+    if (!id) {
+      id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : `dev-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+      try { localStorage.setItem('roboai-device-id', id) } catch (_) { /* nop */ }
     }
     set({ _teachDeviceId: id })
     return id
+  },
+
+  // 2026-08-05 (human labels): device_label is server-owned
+  // (ui_context.device_label) but cached client-side for two
+  // reasons: (a) so every teach-session call can pass it as
+  // device_label without an async fetch, (b) so the label the
+  // OPERATOR sees in Configure is the same string used in
+  // banners and event-log entries. Populated at boot by
+  // restoreOpenProgramOnMount from GET /api/ui_context/{id}.
+  // Default derived from platform sniff — "Tablet" on touch
+  // devices, "PC" otherwise — replaced the first time the
+  // operator names the device in Configure.
+  _teachDeviceLabel: null,
+  _getTeachDeviceLabel() {
+    const cached = get()._teachDeviceLabel
+    if (cached) return cached
+    // Platform sniff — coarse but sufficient. maxTouchPoints > 0
+    // catches tablets (Android/iPad) and touchscreen laptops.
+    let def = 'PC'
+    try {
+      if (typeof navigator !== 'undefined'
+          && (navigator.maxTouchPoints || 0) > 0
+          && /(Android|iPad|iPhone|Mobile|Tablet)/i.test(navigator.userAgent || '')) {
+        def = 'Tablet'
+      }
+    } catch (_) { /* nop */ }
+    return def
+  },
+  setTeachDeviceLabel(label) {
+    const clean = String(label || '').trim().slice(0, 64)
+    if (!clean) return
+    set({ _teachDeviceLabel: clean })
+    const device_id = get()._getTeachDeviceId()
+    try {
+      fetch(`/api/ui_context/${encodeURIComponent(device_id)}`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ device_label: clean }),
+        keepalive: true,
+      })
+    } catch (_) { /* nop */ }
   },
 
   // Read the current draft for a program from the WS-cached slice.
@@ -1958,14 +2047,17 @@ const storeDefinition = (set, get) => ({
     if (!programId || !slotKey || !patch) {
       return { ok: false, error: 'bad_args' }
     }
-    const device_id = get()._getTeachDeviceId()
+    const device_id    = get()._getTeachDeviceId()
+    const device_label = get()._getTeachDeviceLabel()
     try {
       const res = await fetch(
         `/api/teach_session/${encodeURIComponent(programId)}/record`,
         {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ device_id, slot_key: slotKey, patch }),
+          body:    JSON.stringify({
+            device_id, device_label,
+            slot_key: slotKey, patch }),
         })
       const body = await res.json().catch(() => ({}))
       if (!res.ok) {
@@ -2004,6 +2096,7 @@ const storeDefinition = (set, get) => ({
   async startTeachSession(programId, deviceLabel = '') {
     if (!programId) return { ok: false, error: 'bad_args' }
     const device_id = get()._getTeachDeviceId()
+    const label     = deviceLabel || get()._getTeachDeviceLabel()
     try {
       const res = await fetch(
         `/api/teach_session/${encodeURIComponent(programId)}/start`,
@@ -2011,7 +2104,7 @@ const storeDefinition = (set, get) => ({
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({
-            device_id, device_label: deviceLabel }),
+            device_id, device_label: label }),
         })
       const body = await res.json().catch(() => ({}))
       if (!res.ok && res.status !== 409) {
@@ -2033,6 +2126,7 @@ const storeDefinition = (set, get) => ({
   async takeOverTeachSession(programId, deviceLabel = '') {
     if (!programId) return { ok: false, error: 'bad_args' }
     const device_id = get()._getTeachDeviceId()
+    const label     = deviceLabel || get()._getTeachDeviceLabel()
     try {
       const res = await fetch(
         `/api/teach_session/${encodeURIComponent(programId)}/take_over`,
@@ -2040,7 +2134,7 @@ const storeDefinition = (set, get) => ({
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({
-            device_id, device_label: deviceLabel }),
+            device_id, device_label: label }),
         })
       const body = await res.json().catch(() => ({}))
       if (!res.ok) {
@@ -2095,7 +2189,7 @@ const storeDefinition = (set, get) => ({
   // Same URL, but issued via navigator.sendBeacon so a window-close
   // path (which cancels normal fetches) can still deliver it. Best-
   // effort — the server-side owner-TTL is the guaranteed backstop
-  // after 5 min if this doesn't land.
+  // after 90 s (_TEACH_OWNER_TTL_S) if this doesn't land.
   endTeachSessionBeacon(programId) {
     if (!programId) return false
     const device_id = get()._getTeachDeviceId()
@@ -2144,7 +2238,23 @@ const storeDefinition = (set, get) => ({
       if (!res.ok) {
         return { ok: false, status: res.status, body }
       }
-      return { ok: true, program: body.program }
+      // 2026-08-05 (silent-drop kill): surface any unmatched-pose
+      // warning the server returned instead of letting it disappear
+      // into the JSON body. Amber toast, dismissible; the event log
+      // holds the forensic detail.
+      if (Array.isArray(body?.warnings) && body.warnings.length > 0) {
+        for (const w of body.warnings) {
+          if (w && w.kind === 'unmatched_poses') {
+            get().addToast?.({
+              title:           'Some recorded poses matched no step.',
+              detail:          w.operator_message
+                             || `${w.count} pose(s) skipped.`,
+              technicalDetail: JSON.stringify(w.unmatched_slot_keys || []),
+            }, 'warning', 8000)
+          }
+        }
+      }
+      return { ok: true, program: body.program, warnings: body.warnings }
     } catch (e) {
       return { ok: false, error: 'network', message: String(e) }
     }

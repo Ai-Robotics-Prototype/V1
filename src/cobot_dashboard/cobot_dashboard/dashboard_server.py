@@ -12724,21 +12724,28 @@ if FASTAPI_AVAILABLE:
     # collected. Both windows are picked to be short enough that a
     # crashed-tab operator doesn't stay locked out, long enough that
     # a slow network doesn't drop a live session mid-teach.
-    # 2026-08-05 (teach-lock incident #3): TTL shortened 300s → 90s.
-    # Rationale: record-through means every pose is already persisted
-    # on Record; expiry loses nothing but the OWNERSHIP claim. 90s =
-    # 3 client-side heartbeat intervals (30s each) — a live client
-    # comfortably rides through one network hiccup; a phantom owner
-    # (browser tab crashed, laptop closed) drops out fast.
+    # 2026-08-05 (teach-lock incident #3 + identity root-cause fix):
+    # TTL 90s = 6 client heartbeat intervals (15s each). Record-through
+    # means every pose is already persisted; expiry loses nothing but
+    # the OWNERSHIP claim. A live client rides through several hiccups;
+    # a phantom owner (crashed tab, closed laptop) drops out fast.
     _TEACH_OWNER_TTL_S = 90
     _TEACH_DRAFT_TTL_S = 24 * 3600  # 24 h — dropped from disk after this
-    # Self-healing entry threshold (Directive item 6, 2026-08-05):
-    # when a device requests teach entry (/start) and the current
-    # owner's updated_ts is older than 2 heartbeat intervals (60s),
-    # the lock is treated as abandoned — auto-expire and grant to
-    # the requester. Avoids making the operator wait out the full
-    # 90s TTL when the owner has demonstrably gone quiet.
+    # Self-healing entry threshold: 60s = 4 missed 15s heartbeats.
+    # Auto-swap the lock to the requester when the owner's updated_ts
+    # is older than this — spares a real operator from waiting the
+    # full 90s TTL when the previous owner has demonstrably gone quiet.
     _TEACH_STALE_HEARTBEAT_S = 60
+    # Ghost-amnesty threshold (2026-08-05 identity root-cause fix).
+    # A one-time sweep at boot clears ownership on drafts where the
+    # owner_device_id is a UUID-shaped string with NO matching
+    # ui_context entry AND updated_ts older than this — kills
+    # orphaned tab-UUIDs from before the localStorage identity fix,
+    # which were the true root cause of every teach-lock incident.
+    # Poses are preserved (draft file stays); another device can
+    # simply /start on it. 10 min gives a live-but-slow ui_context
+    # write ample time to land before we amnesty its owner.
+    _TEACH_GHOST_AMNESTY_S = 10 * 60
     _teach_lock = threading.Lock()
 
     def _teach_path(prog_id: str):
@@ -12877,12 +12884,83 @@ if FASTAPI_AVAILABLE:
             return None
         return draft
 
+    # 2026-08-05 (identity root-cause fix — Directive item 3).
+    # One-time ghost amnesty: any draft whose owner_device_id is a
+    # UUID-shaped string with NO matching ui_context entry AND has
+    # been silent for _TEACH_GHOST_AMNESTY_S has ownership cleared
+    # on next publish. Kills the tablet-real UUID + every orphaned
+    # tab-UUID minted before device identity moved to localStorage.
+    # Poses are preserved; another device can /start on the file.
+    # Runs once per dashboard boot (via _teach_publish_to_state's
+    # first call, gated by _amnesty_done). Idempotent — a false
+    # positive would only require the operator to re-claim via
+    # /start, which is cheap.
+    import re as _amnesty_re
+    _amnesty_uuid_re = _amnesty_re.compile(
+        r'^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-'
+        r'[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$')
+    _amnesty_state = {'done': False}
+
+    def _teach_ghost_amnesty_once() -> None:
+        if _amnesty_state['done']:
+            return
+        _amnesty_state['done'] = True
+        try:
+            names = os.listdir(_TEACH_DIR)
+        except FileNotFoundError:
+            return
+        # Known live device_ids from ui_context — a draft owner
+        # matching any of these is NOT a ghost.
+        try:
+            live_ids = {ctx.get('_device_id')
+                        for ctx in _ui_context.list_all()
+                        if isinstance(ctx, dict) and ctx.get('_device_id')}
+        except Exception:
+            live_ids = set()
+        cleared = 0
+        for name in names:
+            if not name.endswith('.draft.json'):
+                continue
+            pid = name[:-len('.draft.json')]
+            d = _teach_read_draft(pid)
+            if not isinstance(d, dict):
+                continue
+            owner = d.get('owner_device_id')
+            if not owner:
+                continue
+            if not _amnesty_uuid_re.match(str(owner)):
+                # Non-UUID owner — old label-shaped ids from before
+                # the crypto.randomUUID switch. Leave alone.
+                continue
+            if owner in live_ids:
+                continue
+            upd = _teach_updated_epoch(d)
+            if upd is None:
+                continue
+            if (time.time() - upd) < _TEACH_GHOST_AMNESTY_S:
+                continue
+            d = dict(d)
+            d['owner_device_id'] = None
+            d['owner_label']     = None
+            d['ghost_cleared_at'] = time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            _teach_touch(d)
+            try:
+                _teach_write_draft(pid, d)
+                cleared += 1
+            except _TeachWriteError:
+                pass
+        if cleared:
+            print(f'[dashboard] ghost-amnesty cleared {cleared} '
+                  f'orphaned draft owner(s)')
+
     def _teach_publish_to_state() -> None:
         """Mirror every draft file on disk into STATE['teach_sessions']
         so the WS broadcast carries it. Called at boot (hydrate) and
         after every mutation. Applies the TTL rules — a stale-owner
         draft has its ownership released here, and a long-abandoned
         draft is garbage-collected."""
+        _teach_ghost_amnesty_once()
         drafts: dict = {}
         try:
             for name in os.listdir(_TEACH_DIR):
@@ -13270,15 +13348,21 @@ if FASTAPI_AVAILABLE:
                                     status_code=507)
         return {'ok': True, 'updated_ts': draft.get('updated_ts')}
 
-    def _apply_draft_poses_to_program(program: dict, poses: dict) -> dict:
-        """Merge draft poses INTO a program dict (returns the merged
-        program without persisting). Slots:
+    def _apply_draft_poses_to_program(program: dict, poses: dict):
+        """Merge draft poses INTO a program dict (returns
+        (merged_program, unmatched_slot_keys) without persisting).
+        Slots:
           step:<step_id>    → merge patch into the matching step
           corner:1|2|3      → write .taught_tcp to
                               config.pallet_place.corner{N}_tcp
           corner:part       → write .taught_tcp to
                               config.pallet_place.part_tcp
-        Non-matching slot keys are skipped with a note.
+        Slot keys that DON'T match any step or corner target are
+        returned as `unmatched_slot_keys` so the caller can raise a
+        named warning ("N recorded poses matched no step — steps
+        may have been renumbered") instead of silently discarding.
+        Pre-fix: unmatched keys were dropped without a trace, so
+        a step deletion mid-teach silently lost the pose.
         """
         merged = json.loads(json.dumps(program))
         steps  = merged.setdefault('steps', [])
@@ -13289,11 +13373,13 @@ if FASTAPI_AVAILABLE:
             sid = s.get('id')
             if sid is not None:
                 by_step_id[str(sid)] = s
+        unmatched: list = []
         for slot_key, patch in (poses or {}).items():
             if slot_key.startswith('step:'):
                 sid = slot_key[len('step:'):]
                 target = by_step_id.get(sid)
                 if target is None:
+                    unmatched.append(slot_key)
                     continue
                 for k, v in (patch or {}).items():
                     target[k] = v
@@ -13301,6 +13387,7 @@ if FASTAPI_AVAILABLE:
                 corner = slot_key[len('corner:'):]
                 tcp = (patch or {}).get('taught_tcp')
                 if not (isinstance(tcp, list) and len(tcp) >= 6):
+                    unmatched.append(slot_key)
                     continue
                 key = {
                     '1':    'corner1_tcp',
@@ -13310,7 +13397,11 @@ if FASTAPI_AVAILABLE:
                 }.get(corner)
                 if key:
                     place[key] = list(tcp[:6])
-        return merged
+                else:
+                    unmatched.append(slot_key)
+            else:
+                unmatched.append(slot_key)
+        return merged, unmatched
 
     @app.post("/api/teach_session/{prog_id}/save")
     async def api_teach_session_save(prog_id: str, request: Request):
@@ -13352,7 +13443,7 @@ if FASTAPI_AVAILABLE:
             base_program = (draft.get('staged_program')
                             if isinstance(draft.get('staged_program'), dict)
                             else saved_program)
-            merged = _apply_draft_poses_to_program(
+            merged, unmatched_slot_keys = _apply_draft_poses_to_program(
                 base_program, draft.get('poses') or {})
             # Single validator door: same check used by the
             # /api/estun/program/run push. Blocking findings refuse
@@ -13400,7 +13491,39 @@ if FASTAPI_AVAILABLE:
                 _bump_prog_rev(prog_id)
             except Exception:
                 pass
-        return {'ok': True, 'program': merged}
+        response: dict = {'ok': True, 'program': merged}
+        # 2026-08-05 (silent-drop kill — Directive item 5). Every
+        # slot_key that didn't match a step or corner target is
+        # surfaced as a named warning INSTEAD of being silently
+        # discarded. Operator sees "N recorded poses matched no
+        # step — steps may have been renumbered" in the save toast;
+        # the forensic event-log entry keeps the slot keys for
+        # later diagnosis (which pose, which program).
+        if unmatched_slot_keys:
+            response['warnings'] = [{
+                'kind':             'unmatched_poses',
+                'count':            len(unmatched_slot_keys),
+                'unmatched_slot_keys': list(unmatched_slot_keys),
+                'operator_message': (
+                    f'{len(unmatched_slot_keys)} recorded pose'
+                    + ('s' if len(unmatched_slot_keys) != 1 else '')
+                    + ' matched no step — steps may have been '
+                    + 'renumbered. Re-teach if needed.'),
+            }]
+            try:
+                _event_log.emit(
+                    severity='warning',
+                    source='teach_session',
+                    code='unmatched_poses_on_save',
+                    operator_message=response['warnings'][0]['operator_message'],
+                    technical_detail=(
+                        f'program_id={prog_id} '
+                        f'unmatched={list(unmatched_slot_keys)}'),
+                    context={'program_id': prog_id,
+                             'unmatched_slot_keys': list(unmatched_slot_keys)})
+            except Exception:
+                pass
+        return response
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
