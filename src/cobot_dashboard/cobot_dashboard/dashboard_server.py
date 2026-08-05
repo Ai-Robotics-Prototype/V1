@@ -2003,21 +2003,32 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             rej.append(d)
             if len(rej) > 32:
                 del rej[:-32]
-        # 2026-08-05 unified event log: every driver rejection lands
-        # in /opt/cobot/event_log/events_YYYYMMDD.jsonl. Best-effort
-        # — the emit call NEVER raises, so this can't block the
-        # broadcast pipeline.
+        # 2026-08-05 unified event log: every FRESH driver rejection
+        # lands in /opt/cobot/event_log/events_YYYYMMDD.jsonl.
+        # Best-effort — the emit call NEVER raises, so this can't
+        # block the broadcast pipeline.
+        #
+        # Coalescing: the driver already dedupes same-reason bursts
+        # by attaching a `count` field that increments on each
+        # repeat (2, 3, ...). Only emit when count is 1 (fresh
+        # transition) — otherwise we'd write thousands of
+        # duplicate records per shift for background chatter like
+        # "non-jog/power write paths not implemented on this branch"
+        # (2369 records observed in 20 minutes of the first deploy
+        # before this guard landed).
         try:
-            reason = str(d.get('reason') or '')
-            family = str(d.get('family') or 'driver')
-            _event_log.emit(
-                severity='warning' if family == 'jog' else 'error',
-                source='driver',
-                code=f'driver_reject:{family}',
-                operator_message=f'Driver rejected {family}: {reason[:120]}',
-                technical_detail=reason,
-                context={'family': family, 'raw': d},
-            )
+            count = int(d.get('count') or 1)
+            if count == 1:
+                reason = str(d.get('reason') or '')
+                family = str(d.get('family') or 'driver')
+                _event_log.emit(
+                    severity='warning' if family == 'jog' else 'error',
+                    source='driver',
+                    code=f'driver_reject:{family}',
+                    operator_message=f'Driver rejected {family}: {reason[:120]}',
+                    technical_detail=reason,
+                    context={'family': family, 'raw': d},
+                )
         except Exception:
             pass
 
