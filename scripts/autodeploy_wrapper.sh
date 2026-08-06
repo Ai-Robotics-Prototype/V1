@@ -113,27 +113,44 @@ log_entry "building" served_asset_before="${before:-unknown}"
 # Run the deploy. Capture stdout+stderr to a per-run log file so a
 # failure trail is inspectable.
 run_log="/tmp/autodeploy_$(date +%Y%m%d_%H%M%S).log"
-if bash "$DEPLOY_SCRIPT" > "$run_log" 2>&1; then
-    after=$(grep -oE '/assets/index-[A-Za-z0-9_-]+\.js' \
-        "$WS/src/cobot_dashboard/mock_server/static/index.html" 2>/dev/null | head -1)
-    after="${after#/assets/index-}"
-    after="${after%.js}"
-    end_ts=$(date +%s)
+bash "$DEPLOY_SCRIPT" > "$run_log" 2>&1
+code=$?
+after=$(grep -oE '/assets/index-[A-Za-z0-9_-]+\.js' \
+    "$WS/src/cobot_dashboard/mock_server/static/index.html" 2>/dev/null | head -1)
+after="${after#/assets/index-}"
+after="${after%.js}"
+end_ts=$(date +%s)
+if [[ $code -eq 0 ]]; then
     log_entry "ok" \
         served_asset_before="${before:-unknown}" \
         served_asset_after="${after:-unknown}" \
         duration_s="$((end_ts - start_ts))"
     exit 0
+elif [[ $code -eq 3 ]]; then
+    # 2026-08-06 (silent-frontend-rebuild-skip class, operator
+    # directive). deploy.sh exit code 3 = FRONTEND_STALE: source
+    # hash advanced but the served asset did NOT change. Emit
+    # phase=frontend_stale so /api/deploy_status can escalate the
+    # banner to red — this class was silently passing before and
+    # served the old UI to every open tab.
+    step=$(grep -oE 'FRONTEND_STALE[^)]*' "$run_log" | head -1)
+    log_entry "frontend_stale" \
+        step="${step:-frontend_stale}" \
+        exit_code="$code" \
+        served_asset_before="${before:-unknown}" \
+        served_asset_after="${after:-unknown}" \
+        duration_s="$((end_ts - start_ts))" \
+        detail="see $run_log; frontend source changed but vite did not advance the asset hash"
+    exit "$code"
 else
-    code=$?
     # Best-effort: pull the first FAIL line from deploy.sh output so
     # the UI banner shows a specific failing step.
     step=$(grep -oE '(✗ [^—]+|FAIL[A-Z: ]*)' "$run_log" | head -1)
-    end_ts=$(date +%s)
     log_entry "fail" \
         step="${step:-unknown}" \
         exit_code="$code" \
         served_asset_before="${before:-unknown}" \
+        served_asset_after="${after:-unknown}" \
         duration_s="$((end_ts - start_ts))" \
         detail="see $run_log"
     exit "$code"

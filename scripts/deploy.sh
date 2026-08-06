@@ -278,7 +278,36 @@ elif [[ $FRONTEND_NEEDS_BUILD -eq 1 ]]; then
     printf "    pre  : %s\n    post : %s\n" \
         "${PRE_SERVED_ASSET:-<none>}" "$POST_SERVED_ASSET"
     if [[ "$PRE_SERVED_ASSET" == "$POST_SERVED_ASSET" && -n "$PRE_SERVED_ASSET" ]]; then
-        warn "served asset hash unchanged after rebuild — input identical (vite deterministic)"
+        # 2026-08-06 (operator directive — silent-frontend-rebuild-skip
+        # class): when the source hash CHANGED (FRONTEND_NEEDS_BUILD=1)
+        # yet vite produced the SAME asset hash, the served bundle
+        # won't advance. Reasons this fires:
+        #   • vite build succeeded but emitted byte-identical output
+        #     from source that only differs in comments/whitespace
+        #     (rare; usually still shifts the hash).
+        #   • vite build failed and the previous dist/ was left in
+        #     place (the deploy.sh piped `| tail -8` above masked the
+        #     failure).
+        #   • Some other tooling wrote the source but the produced
+        #     asset was cached from a prior build.
+        # Any of these produces the "operator refreshes and sees the
+        # old UI" report. Refuse the deploy with a specific
+        # FRONTEND_STALE exit code (3) so the wrapper can emit
+        # phase=frontend_stale — LOUD, not silent OK.
+        printf "  ${RED}✗${RST} FRONTEND_STALE: source hash advanced but "
+        printf "served asset did NOT ($PRE_SERVED_ASSET == $POST_SERVED_ASSET)\n"
+        printf "${RED}════════  DEPLOY: FAIL (frontend_stale)  ════════${RST}\n"
+        printf "  The frontend source changed since the last stamped\n"
+        printf "  build (%s), but vite did not produce a new asset hash.\n" "$FRONTEND_SRC_HASH"
+        printf "  Likely causes:\n"
+        printf "    • vite build failed silently (dist/ left stale).\n"
+        printf "    • Source change was purely cosmetic (whitespace/comment)\n"
+        printf "      — in which case DO NOT stamp; investigate.\n"
+        printf "  Diagnose: cd %s && npm run build 2>&1 | head -80\n" "$FRONTEND_SRC"
+        # Do NOT stamp — leave the old .deploy-src-hash so the NEXT
+        # deploy also tries to build (otherwise this failure would be
+        # sticky).
+        exit 3
     else
         pass "served asset hash advanced: $PRE_SERVED_ASSET → $POST_SERVED_ASSET"
     fi

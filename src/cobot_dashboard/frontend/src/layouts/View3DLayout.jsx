@@ -24,7 +24,6 @@ import IKGizmo from '../components/IKGizmo'
 const PRESETS = ['Front', 'Side', 'Top', 'Iso']
 
 const REAL_ARM_RED = '#7F1D1D'
-const REAL_ARM_HINT = '#FCA5A5'
 
 // Slim left rail (Part 3b, 2026-07-17). Previous 240 px width was
 // wide enough for a full label column but wasted canvas real estate at
@@ -103,8 +102,91 @@ function LeftPanel({ armRef }) {
 }
 
 // The chrome that wraps JogControls when it's docked (NORMAL) or
-// expanded (EXPANDED). Draws the red REAL ARM band, the state toggle,
-// and the sizing container.
+// expanded (EXPANDED). The 2026-08-06 operator directive retires the
+// full-width red REAL ARM band in favor of a COMPACT STATUS CHIP that
+// shows the arm state and an Enable/Disable toggle. The chip sits in
+// normal layout flow — NOT overlaying the jog panel — so the pendant
+// grid gets the full width the pad expects. Safety behavior of the
+// enable gate is preserved: the toggle uses the SAME sendPowerCommand
+// path JogControls uses and requires a window.confirm() before
+// dispatching, mirroring the JogControls modal's copy exactly.
+function RealArmStatusChip() {
+  const robot = useStore((s) => s.robot) || {}
+  const sendPowerCommand = useStore((s) => s.sendPowerCommand)
+  const enabled  = !!robot.enabled
+  const enabling = !!robot.enabling
+  const alarm    = !!robot.alarm
+  const allowPower = !!robot.allow_power
+  const jogActive  = !!robot.jog_active
+  // Terse state label. Priority: ALARM > ENABLING > JOG (active hold)
+  // > controller state_name > ENABLED > DISABLED.
+  const stateLabel =
+      alarm    ? 'ALARM'
+    : enabling ? 'ENABLING'
+    : (enabled && jogActive)
+             ? `JOG J${robot.jog_index ?? '?'}${robot.jog_direction > 0 ? '+' : robot.jog_direction < 0 ? '−' : ''}`
+    : enabled  ? (robot.state_name || 'READY')
+    :            'DISABLED'
+  const stateColor =
+      alarm    ? '#B91C1C'
+    : enabling ? '#D97706'
+    : enabled  ? '#059669'
+    :            '#6b7280'
+  const wantEnable = !enabled
+  const canToggle  = allowPower && !enabling
+  const onTogglePower = () => {
+    if (!canToggle) return
+    const msg = wantEnable
+      ? 'Enable robot power?\n\nEnsure the cell is clear before applying servo power.'
+      : 'Disable robot power?\n\nServo power will drop. Any active motion is stopped first.'
+    // Same confirmation invariant as the JogControls modal — plain
+    // window.confirm is enough for a safety gate; the operator can't
+    // accidentally click through it.
+    // eslint-disable-next-line no-alert
+    if (window.confirm(msg)) {
+      sendPowerCommand?.(wantEnable ? 'enable' : 'disable')
+    }
+  }
+  return (
+    <div style={{
+      display: 'inline-flex', alignItems: 'center', gap: 6,
+      background: 'rgba(127, 29, 29, 0.08)',
+      border: '1px solid ' + REAL_ARM_RED,
+      borderRadius: 6, padding: '3px 8px',
+      fontSize: 11, fontWeight: 700, letterSpacing: '0.06em',
+      color: REAL_ARM_RED, textTransform: 'uppercase',
+      minHeight: 26,
+    }}>
+      <span>REAL ARM</span>
+      <span style={{
+        width: 6, height: 6, borderRadius: '50%',
+        background: stateColor,
+        boxShadow: `0 0 4px ${stateColor}`,
+      }} />
+      <span style={{ color: stateColor }}>{stateLabel}</span>
+      <button
+        onClick={onTogglePower}
+        disabled={!canToggle}
+        title={enabled
+          ? (allowPower ? 'Disable robot power' : 'Power gate closed — pendant only')
+          : (allowPower ? 'Enable robot power'  : 'Power gate closed — pendant only')}
+        style={{
+          marginLeft: 4, padding: '2px 8px', minHeight: 22,
+          fontSize: 10, fontWeight: 700, letterSpacing: '0.06em',
+          textTransform: 'uppercase',
+          border: '1px solid ' + REAL_ARM_RED,
+          borderRadius: 4,
+          background: enabled ? '#fff' : REAL_ARM_RED,
+          color:      enabled ? REAL_ARM_RED : '#fff',
+          cursor: canToggle ? 'pointer' : 'not-allowed',
+          opacity: canToggle ? 1 : 0.5,
+        }}>
+        {enabled ? 'Disable' : 'Enable'}
+      </button>
+    </div>
+  )
+}
+
 function RealArmChrome({ mode, setMode, children }) {
   const isExpanded = mode === 'EXPANDED'
   return (
@@ -114,21 +196,20 @@ function RealArmChrome({ mode, setMode, children }) {
       borderTop: '2px solid ' + REAL_ARM_RED,
       display: 'flex', flexDirection: 'column',
       overflow: 'hidden',
-      // 440 px NORMAL matches the Program tab's JOG_MIN_HEIGHT (360) after
-      // accounting for the red band (28 px) and a small margin so the
-      // right-column action stack (6× 44 px + gaps + status + Teach ≈
-      // 370 px demand) fits without vertical clipping.
+      // 440 px NORMAL preserves the Program tab's JOG_MIN_HEIGHT (360)
+      // budget after the compact chip header (~34 px w/ borders).
       height: isExpanded ? '100%' : 440,
     }}>
       <div style={{
-        background: REAL_ARM_RED, color: '#fff',
-        padding: '6px 10px',
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        fontSize: 11, fontWeight: 700, letterSpacing: '0.08em',
-        textTransform: 'uppercase',
+        padding: '5px 8px',
+        display: 'flex', alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 8,
         flexShrink: 0,
+        background: 'var(--bg-panel)',
+        borderBottom: '1px solid var(--border)',
       }}>
-        <span>REAL ARM · Hold to Jog</span>
+        <RealArmStatusChip />
         <div style={{ display: 'flex', gap: 6 }}>
           <button
             onClick={() => setMode('MINIMIZED')}
@@ -148,10 +229,11 @@ function RealArmChrome({ mode, setMode, children }) {
 }
 
 const chromeBtn = {
-  width: 24, height: 24, padding: 0,
-  background: 'rgba(255,255,255,0.15)', color: '#fff',
-  border: '1px solid rgba(255,255,255,0.35)', borderRadius: 4,
-  cursor: 'pointer', fontSize: 13, lineHeight: 1,
+  width: 26, height: 26, padding: 0,
+  background: 'var(--bg-surface)',
+  color: 'var(--text-primary)',
+  border: '1px solid var(--border)', borderRadius: 4,
+  cursor: 'pointer', fontSize: 14, lineHeight: 1,
   display: 'flex', alignItems: 'center', justifyContent: 'center',
 }
 
