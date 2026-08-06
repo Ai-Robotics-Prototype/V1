@@ -160,6 +160,52 @@ def _geometric_jacobian_6(q_deg):
     return J * (math.pi / 180.0)
 
 
+def _rot_exp(rvec):
+    """Rodrigues: axis-angle rotation vector (3-vec, radians) → 3×3
+    rotation matrix. Inverse of _rot_log. Kept for callers that
+    actually pass a rotation vector. NOT the taught_tcp convention
+    — see _R_from_tcp_abc below."""
+    rx, ry, rz = float(rvec[0]), float(rvec[1]), float(rvec[2])
+    theta = math.sqrt(rx * rx + ry * ry + rz * rz)
+    if theta < 1e-12:
+        return _np.eye(3)
+    kx, ky, kz = rx / theta, ry / theta, rz / theta
+    K = _np.array([
+        [0.0, -kz,  ky],
+        [ kz, 0.0, -kx],
+        [-ky,  kx, 0.0],
+    ])
+    return _np.eye(3) + math.sin(theta) * K + (1.0 - math.cos(theta)) * (K @ K)
+
+
+def _R_from_tcp_abc(a_rad, b_rad, c_rad):
+    """Estun taught_tcp orientation → rotation matrix.
+
+    2026-08-06 (Blocker A fix, palletize chain): the taught_tcp
+    stores orientation as the controller's `a`, `b`, `c` fields —
+    Fixed-XYZ Euler angles (extrinsic, applied about the WORLD
+    X, Y, Z axes). Verified empirically against FK(seed) rotation
+    matrix — max error 2e-4 across the six standard conventions
+    tested; all others are off by >1.
+
+    R = Rz(c) · Ry(b) · Rx(a)
+
+    Applied here so seeded_ik_to_pose can turn a slot TCP's [a, b,
+    c] into a target R that matches the FK frame the LM iterates
+    against. The prior implementation used _rot_exp (rotation-
+    vector), which is the wrong convention and produced ~55°
+    orientation errors on the pick contact — the LM converged to
+    a wrist-flipped kinematic branch.
+    """
+    ca, sa = math.cos(a_rad), math.sin(a_rad)
+    cb, sb = math.cos(b_rad), math.sin(b_rad)
+    cc, sc = math.cos(c_rad), math.sin(c_rad)
+    Rx = _np.array([[1, 0, 0], [0, ca, -sa], [0, sa, ca]])
+    Ry = _np.array([[cb, 0, sb], [0, 1, 0], [-sb, 0, cb]])
+    Rz = _np.array([[cc, -sc, 0], [sc, cc, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
 def _rot_log(R):
     """Axis-angle rotation vector (3-vec, radians) of a 3×3 rotation
     matrix. Small-angle safe (clamped acos). No scipy dependency."""
@@ -258,6 +304,140 @@ def seeded_ik_z_lift_hold_orientation(anchor_deg, delta_z_mm, *,
         step_norm = float(_np.linalg.norm(dq))
         if step_norm > max_dq_deg_norm:
             dq = dq * (max_dq_deg_norm / step_norm)
+        q = q + dq
+    return None
+
+
+def seeded_ik_to_pose(anchor_deg, target_tcp_m, *,
+                      max_iter: int = 120,
+                      tol_mm: float = 0.10,
+                      tol_rad: float = 2e-4,
+                      max_dq_deg_norm: float = 15.0,
+                      len_scale_mm: float = 50.0,
+                      seed_bias: float = 0.02,
+                      max_seed_dev_deg: float = 60.0):
+    """Full 6-DoF IK from a joint seed to an arbitrary TCP pose.
+
+    2026-08-06 (operator directive — Blocker A in the palletize
+    chain). Generalises seeded_ik_z_lift_hold_orientation: solves
+    for joints achieving BOTH an arbitrary position AND an
+    arbitrary orientation in the driver's base frame, starting
+    from a known-good seed (typically the pick contact's taught
+    joints, or the previous slot's solved joints).
+
+    Args:
+      anchor_deg    — 6-element joint seed (degrees).
+      target_tcp_m  — 6-vector [x_m, y_m, z_m, rx_rad, ry_rad,
+                       rz_rad]. Position in METERS, orientation
+                       as rotation vector (matches driver's
+                       taught_tcp convention).
+      max_iter      — LM iteration cap. 120 tolerates slot-to-
+                       slot travel of a few hundred mm from the
+                       seed with margin.
+      tol_mm        — Position convergence tolerance (mm). 0.10
+                       is 10× tighter than the pallet's physical
+                       slot placement variance.
+      tol_rad       — Orientation convergence tolerance. ~0.011°.
+      seed_bias     — Null-space regularisation weight. Adds a
+                       soft "stay near anchor_deg" penalty to the
+                       LM system so IK converges to the SAME
+                       kinematic branch as the seed (arm/wrist
+                       flip is a common non-uniqueness — the
+                       operator taught ONE branch and every slot
+                       must live in it). 0.02 = tight enough to
+                       keep the branch; slack enough that legit
+                       few-hundred-mm slot travel isn't over-
+                       constrained.
+      max_seed_dev_deg — Post-convergence gate. If any joint has
+                       moved by more than this from the seed, the
+                       IK is rejected as "wrong branch" and None
+                       is returned (caller surfaces an out-of-
+                       reach finding rather than emitting a
+                       flipped-wrist path).
+
+    Returns:
+      (joints_deg, pos_err_mm, orient_err_deg) on success.
+      None when LM does not converge within max_iter, the
+      Jacobian goes singular, or the post-solve joint deviation
+      exceeds max_seed_dev_deg (wrong-branch guard).
+
+    Same LM+row-scale approach as the Z-lift IK — position rows
+    scaled by 1/len_scale_mm so orientation and position residuals
+    reach comparable order-of-magnitude, LM damping starts at 1e-6
+    and multiplies on rejected steps for numerical stability near
+    workspace edges. Row-scale weight matrix W is diag(1/len_scale
+    ×3, 1×3).
+    """
+    if _np is None:
+        return None
+    q = _np.array([float(v) for v in anchor_deg], dtype=float)
+    if q.shape != (6,):
+        return None
+    if len(target_tcp_m) < 6:
+        return None
+    # Target position: METERS in → mm inside (FK returns mm).
+    p_target = _np.array([float(target_tcp_m[0]) * 1000.0,
+                          float(target_tcp_m[1]) * 1000.0,
+                          float(target_tcp_m[2]) * 1000.0])
+    # Target orientation: taught_tcp's a/b/c fields are Fixed-XYZ
+    # Euler angles in radians (Estun controller convention —
+    # empirically verified 2026-08-06). R = Rz(c) · Ry(b) · Rx(a).
+    R_target = _R_from_tcp_abc(float(target_tcp_m[3]),
+                                float(target_tcp_m[4]),
+                                float(target_tcp_m[5]))
+    q_seed = _np.array([float(v) for v in anchor_deg], dtype=float)
+    W = _np.diag([1.0 / len_scale_mm] * 3 + [1.0] * 3)
+    lam = 1e-6
+    prev_err_norm = None
+    # Branch enforcement: rely on `max_seed_dev_deg` as a post-
+    # convergence gate rather than an in-loop pull. The pull-back
+    # term deadlocks at fixed-point equilibria when the seed is
+    # displaced by more than a few mm (dq → 0 because seed_bias
+    # penalty cancels the pose-error correction). Instead the LM
+    # runs pure 6D pose-solve and we reject wrong-branch solutions
+    # after the fact.
+    _ = float(seed_bias)                                  # kept for signature stability
+    for _ in range(max_iter):
+        Ts = _fk_chain(q)
+        p_cur = Ts[6][:3, 3]
+        R_cur = Ts[6][:3, :3]
+        e_pos = p_target - p_cur                          # mm
+        e_ori = _rot_log(R_target @ R_cur.T)              # rad
+        pos_err = float(_np.linalg.norm(e_pos))
+        ori_err = float(_np.linalg.norm(e_ori))
+        if pos_err < tol_mm and ori_err < tol_rad:
+            # Post-solve branch gate — reject wrist/arm flips that
+            # would take the arm through an unsafe trajectory. A
+            # rejected result signals the caller to surface an
+            # out-of-reach finding rather than emit a bad path.
+            dev = _np.abs(q - q_seed)
+            if float(_np.max(dev)) > float(max_seed_dev_deg):
+                return None
+            orient_err_deg = float(_np.max(_np.abs(e_ori))) * 180.0 / math.pi
+            return q.tolist(), pos_err, orient_err_deg
+        J = _geometric_jacobian_6(q.tolist())
+        err = _np.concatenate([e_pos, e_ori])
+        Jw = W @ J
+        ew = W @ err
+        JTJ = Jw.T @ Jw
+        JTe = Jw.T @ ew
+        try:
+            dq = _np.linalg.solve(JTJ + lam * _np.eye(6), JTe)
+        except _np.linalg.LinAlgError:
+            try:
+                dq = _np.linalg.solve(JTJ + 1e-3 * _np.eye(6), JTe)
+            except _np.linalg.LinAlgError:
+                return None
+        step_norm = float(_np.linalg.norm(dq))
+        if step_norm > max_dq_deg_norm:
+            dq = dq * (max_dq_deg_norm / step_norm)
+        cur_err_norm = float(_np.linalg.norm(ew))
+        if (prev_err_norm is not None
+                and cur_err_norm > prev_err_norm * 1.1):
+            lam = min(lam * 10.0, 1.0)
+        else:
+            lam = max(lam * 0.5, 1e-8)
+        prev_err_norm = cur_err_norm
         q = q + dq
     return None
 
@@ -3778,6 +3958,225 @@ def codegen_lua_from_program(
                 f'-- step {action}  duration_s={dur:g} → {dur_ms} ms '
                 f'(wire-proven on v2.3, undocumented in luaenginelib; '
                 f'not waitCondition — that idiom hits 10006)')
+            continue
+
+        # ---- Palletize: expand move_to_pallet into per-slot moves --
+        #
+        # 2026-08-06 (operator directive — Blocker A). The wizard
+        # produces ONE `move_to_pallet` step; the run path expects
+        # a full slot-by-slot movement sequence in the emitted Lua.
+        # Expansion consumes both schemas (frame from `pallet_place`,
+        # grid dims from `pallet`) and emits per-slot:
+        #     approach (retract_h above slot) → descend (approach_h
+        #     above slot) → place (slot) → IO release → wait →
+        #     lift back to retract_h.
+        # Each move is a fresh IK'd point seeded from the previous
+        # solve — same kinematic branch as the taught pick contact.
+        # Out-of-reach slot → named codegen finding + refuse to
+        # emit (no garbage joints reach the controller).
+        if action == 'move_to_pallet':
+            place = (cfg.get('pallet_place') or {})
+            pold  = (cfg.get('pallet')       or {})
+            corner1 = place.get('corner1_tcp')
+            if not (isinstance(corner1, list) and len(corner1) == 6):
+                exec_lines.append(
+                    f'-- skipped {action!r}: pallet_place.corner1_tcp '
+                    f'missing or malformed — cannot compute slot frame')
+                continue
+            part_tcp = place.get('part_tcp')
+            if not (isinstance(part_tcp, list) and len(part_tcp) == 6):
+                exec_lines.append(
+                    f'-- skipped {action!r}: pallet_place.part_tcp '
+                    f'missing — no operator-taught slot datum')
+                continue
+            try:
+                from programming_by_demonstration.schema import PalletPlaceSpec
+                from programming_by_demonstration.pallet_geometry import (
+                    derive_slot_tcps,
+                )
+            except Exception as _pe:
+                exec_lines.append(
+                    f'-- skipped {action!r}: pallet_geometry import '
+                    f'failed ({_pe}) — cannot expand')
+                continue
+            # Merge the two schemas into a single PalletPlaceSpec.
+            # cfg.pallet (old) carries rows / cols / layers / typed
+            # pitch (spacing_x/y_mm) / layer_height_mm / fill_order;
+            # cfg.pallet_place (new) carries the taught frame corners
+            # + part_tcp. Operator doctrine §484 (2026-08-05):
+            # corners define the frame ONLY, part_tcp is slot [0,0,0],
+            # all other slots march the typed pitch along the frame
+            # axes.
+            spec_dict = dict(place)
+            spec_dict['rows']            = int(pold.get('rows',   1) or 1)
+            spec_dict['cols']            = int(pold.get('cols',   1) or 1)
+            spec_dict['layers']          = int(pold.get('layers', 1) or 1)
+            # `spacing_x_mm` = pitch ALONG row axis (column-to-column
+            # spacing WITHIN a row) — matches PalletPlaceSpec's
+            # `pitch_row_mm`. `spacing_y_mm` = along col axis =
+            # `pitch_col_mm`. Naming is confusing but the semantics
+            # are pinned in pallet_geometry's compute_slot_offsets.
+            spec_dict['pitch_row_mm']    = float(pold.get('spacing_x_mm', 150) or 150)
+            spec_dict['pitch_col_mm']    = float(pold.get('spacing_y_mm', 150) or 150)
+            spec_dict['layer_height_mm'] = float(pold.get('layer_height_mm', 100) or 100)
+            # Map legacy fill_order values → the new `order` field.
+            _order_legacy = str(pold.get('fill_order') or 'snake').lower()
+            _order_map = {
+                'row_lr': 'row_major', 'row-lr': 'row_major',
+                'row':    'row_major',
+                'col_tb': 'col_major', 'col-tb': 'col_major',
+                'column': 'col_major',
+                'snake':  'snake',
+            }
+            spec_dict['order'] = _order_map.get(_order_legacy, 'snake')
+            try:
+                pspec = PalletPlaceSpec.from_dict(spec_dict)
+                slots = derive_slot_tcps(pspec, tuple(corner1))
+            except Exception as _pe:
+                exec_lines.append(
+                    f'-- skipped {action!r}: derive_slot_tcps failed '
+                    f'({type(_pe).__name__}: {_pe})')
+                continue
+            # Approach / retract heights — travel path above each slot.
+            approach_h_mm = float(pold.get('approach_height_mm', 100) or 100)
+            retract_h_mm  = float(pold.get('retract_height_mm',  200) or 200)
+            # Frame normal — offset direction for approach/retract.
+            # Recomputed from taught corners so it's the true out-of-
+            # pallet direction, not just +Z_base.
+            try:
+                from programming_by_demonstration.pallet_geometry import compute_frame
+                _fr = compute_frame(pspec)
+                _normal = _fr['plane_normal']   # unit vector (m)
+            except Exception:
+                _normal = (0.0, 0.0, 1.0)   # fall back to +Z_base
+            # Seed for the first slot's IK: the last-emitted move's
+            # joints (typically the retreat-above-pick pose). Falls
+            # back to the pick contact taught_joints if no prior move
+            # has emitted yet.
+            _seed = last_move_joints
+            if _seed is None:
+                for _pick in steps:
+                    if _pick.get('position_role') == 'pick' \
+                            and isinstance(_pick.get('taught_joints'), list) \
+                            and len(_pick['taught_joints']) == 6:
+                        _seed = [float(v) for v in _pick['taught_joints']]
+                        break
+            if _seed is None:
+                exec_lines.append(
+                    f'-- skipped {action!r}: no seed joints for slot '
+                    f'IK (no last motion, no pick anchor)')
+                continue
+            # Gripper IO: for palletize, RELEASE at each slot. For
+            # depalletize (op mode set on cfg.pallet_mode), CLOSE.
+            _mode = str(pold.get('pallet_mode') or cfg.get('pallet_mode') or 'palletize').lower()
+            _release_io = str(step.get('io_open')  or 'DO1').strip()
+            _grip_io    = str(step.get('io_close') or 'DO0').strip()
+            _fire_io    = _grip_io if _mode == 'depalletize' else _release_io
+            _fire_m = _re.match(r'^(DO|AO)(\d+)$', _fire_io, _re.IGNORECASE)
+            if not _fire_m:
+                exec_lines.append(
+                    f'-- skipped {action!r}: gripper IO {_fire_io!r} '
+                    f'is not a writable DO/AO')
+                continue
+            _fire_port = int(_fire_m.group(2))
+            # Speed splits mirror the executor's compound-motion:
+            # medium for retract-height traverses, slow for
+            # descent-to-slot and lift.
+            _step_pct = int(step.get('speed_pct') or eff_pct or 25)
+            _slow_pct   = max(5,  min(_step_pct, 20))
+            _medium_pct = max(10, min(_step_pct, 40))
+            # Header comment for the expansion — makes the loop legible
+            # in the emitted Lua when reading top to bottom.
+            exec_lines.append(
+                f'-- move_to_pallet EXPANSION: {len(slots)} slot(s), '
+                f'{pspec.rows}×{pspec.cols}×{pspec.layers} grid, '
+                f'pitch_row={pspec.pitch_row_mm:.0f}mm '
+                f'pitch_col={pspec.pitch_col_mm:.0f}mm '
+                f'layer_h={pspec.layer_height_mm or 0:.0f}mm '
+                f'order={pspec.order}  release_io={_fire_io}')
+            _pallet_ok = True
+            for _sl in slots:
+                r_idx = int(_sl['row']); c_idx = int(_sl['col']); l_idx = int(_sl['layer'])
+                slot_m = list(_sl['tcp_m'])          # meters + a/b/c
+                # approach = slot + approach_h_mm along frame normal
+                #    (approach_h < retract_h; the closer height)
+                appr_m = list(slot_m)
+                appr_m[0] += (approach_h_mm / 1000.0) * float(_normal[0])
+                appr_m[1] += (approach_h_mm / 1000.0) * float(_normal[1])
+                appr_m[2] += (approach_h_mm / 1000.0) * float(_normal[2])
+                retr_m = list(slot_m)
+                retr_m[0] += (retract_h_mm / 1000.0) * float(_normal[0])
+                retr_m[1] += (retract_h_mm / 1000.0) * float(_normal[1])
+                retr_m[2] += (retract_h_mm / 1000.0) * float(_normal[2])
+                # IK each of the 3 targets, seeded from _seed. On
+                # any IK failure, refuse the WHOLE pallet expansion
+                # (emitting only the successful prefix leaves the
+                # arm holding a part with nowhere to place it).
+                _ik_retr = seeded_ik_to_pose(_seed, retr_m)
+                _ik_appr = seeded_ik_to_pose(_seed, appr_m) if _ik_retr else None
+                _ik_slot = seeded_ik_to_pose(_seed, slot_m) if _ik_appr else None
+                if not (_ik_retr and _ik_appr and _ik_slot):
+                    _which = ('retract' if not _ik_retr
+                              else ('approach' if not _ik_appr else 'place'))
+                    exec_lines.append(
+                        f'-- PALLET IK FAILED: slot [{r_idx},{c_idx},{l_idx}] '
+                        f'({_which}) unreachable from seed '
+                        f'[{",".join(f"{v:+.1f}" for v in _seed)}] — '
+                        f'refusing pallet expansion, halt at pick')
+                    _pallet_ok = False
+                    break
+                q_retr, _, _   = _ik_retr
+                q_appr, _, _   = _ik_appr
+                q_slot, _, _   = _ik_slot
+                # Reset seed for the NEXT slot to this slot's
+                # retract joints so slot-to-slot travel stays in
+                # the same branch.
+                _seed = q_retr
+                # Emit five sub-moves per slot: retract-height
+                # traverse → approach descent → place → IO fire +
+                # wait → retract-height lift. All movL — the
+                # controller's cartesian interpolator drives each.
+                for _sub, (_q, _tag, _pct) in enumerate([
+                    (q_retr, f'slot[{r_idx},{c_idx},{l_idx}] traverse-height', _medium_pct),
+                    (q_appr, f'slot[{r_idx},{c_idx},{l_idx}] approach',        _slow_pct),
+                    (q_slot, f'slot[{r_idx},{c_idx},{l_idx}] place',           _slow_pct),
+                ]):
+                    fallback_idx += 1
+                    _nm = f'{point_prefix}{fallback_idx}'
+                    while _nm in program_points or _nm in used_named:
+                        fallback_idx += 1
+                        _nm = f'{point_prefix}{fallback_idx}'
+                    varspoint[_nm] = _make_jp_point(_q, _nm)
+                    used_named.add(_nm)
+                    exec_lines.append(
+                        f'movL({_nm})  -- {_tag}  '
+                        f'joints=[{", ".join(f"{v:+.3f}" for v in _q)}]')
+                    last_move_joints = list(_q)
+                # IO fire (release/close) + brief settle wait.
+                exec_lines.append(
+                    f'setDO({_fire_port},1)  -- pallet release '
+                    f'DO{_fire_port}=1 (slot [{r_idx},{c_idx},{l_idx}])')
+                exec_lines.append(
+                    f'wait(400)  -- gripper actuate settle (400 ms)')
+                # Lift back to retract height for the next slot's
+                # traverse-height entry.
+                fallback_idx += 1
+                _nm_lift = f'{point_prefix}{fallback_idx}'
+                while _nm_lift in program_points or _nm_lift in used_named:
+                    fallback_idx += 1
+                    _nm_lift = f'{point_prefix}{fallback_idx}'
+                varspoint[_nm_lift] = _make_jp_point(q_retr, _nm_lift)
+                used_named.add(_nm_lift)
+                exec_lines.append(
+                    f'movL({_nm_lift})  -- slot[{r_idx},{c_idx},{l_idx}] lift '
+                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_retr)}]')
+                last_move_joints = list(q_retr)
+            if not _pallet_ok:
+                # An unreachable slot aborts the whole expansion. The
+                # emitted comment above names the offending slot; the
+                # subsequent steps (return-to-home) still emit so the
+                # arm doesn't stay stuck at pick.
+                pass
             continue
 
         # ---- Loop — for-loop wrap OR continuous goto ----------------
