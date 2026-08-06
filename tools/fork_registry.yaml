@@ -665,7 +665,8 @@ capabilities:
           - '**/*.test.jsx'
     known_debt: []
 
-  # 20. Jog hold-heartbeat (2026-08-05 regression fix).
+  # 20. Jog hold-heartbeat (2026-08-05 regression fix + 2026-08-06
+  # lock-isolation reinforcement).
   - id: jog_hold_heartbeat
     description: >
       Every jog hold that expects the driver's freshness deadman to
@@ -687,6 +688,16 @@ capabilities:
       _publish_estun_jog with `hold: True` MUST also touch
       _active_holds. Any second path that lands hold frames without
       that pairing is a fork.
+
+      2026-08-06 (jog-jitter fix — lock isolation): the jog heartbeat
+      path MUST NOT share a mutex or a scheduling loop with teach-
+      session state. Jog uses `_active_holds_lock` + the native
+      `_keepalive_thread`; teach uses `_teach_lock` (for read-modify-
+      write of a single draft file) and `_state_lock` (for the brief
+      STATE mirror swap). Teach housekeeping (`_teach_publish_to_state`)
+      runs on the dedicated `teach-publish-worker` daemon thread —
+      never on the async event loop and never inside any lock the
+      jog path might touch. Pinned by test_teach_no_jog_contention.py.
     canonical:
       dashboard:
         module: cobot_dashboard.dashboard_server

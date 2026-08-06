@@ -13114,33 +13114,142 @@ if FASTAPI_AVAILABLE:
             print(f'[dashboard] ghost-amnesty cleared {cleared} '
                   f'orphaned draft owner(s)')
 
+    # 2026-08-06 (jog-jitter fix — operator directive). The teach-
+    # sessions publish is decoupled from the calling endpoint's
+    # critical section by a single background daemon thread. Callers
+    # only signal the worker; they never block on the disk scan.
+    #
+    # Design:
+    #   * `_teach_publish_event` — coalesces multiple pending publishes
+    #     into one scan. Set by the endpoint; cleared by the worker
+    #     before starting a scan.
+    #   * `_teach_publish_worker` — single thread, single scan at a
+    #     time. If a mutation signals mid-scan the event stays set,
+    #     the worker immediately re-scans. No unbounded thread
+    #     creation.
+    #   * `_teach_publish_to_state()` — public entrypoint. Does the
+    #     idle short-circuit (fix 1) inline (< 1 syscall), then
+    #     signals the worker (fix 2) and returns. Never touches
+    #     _teach_lock. Callers that hold _teach_lock (or any other
+    #     lock) can call this safely; disk I/O runs off-thread.
+    #
+    # Fork registry: `jog_hold_heartbeat` MUST NOT share a lock or
+    # a scheduling loop with teach-session housekeeping (see fork
+    # registry entry landed with this commit).
+    _teach_publish_event = threading.Event()
+    _teach_publish_worker_started = [False]
+    # Test hook — production sets None; test can inject a callback
+    # invoked once at the end of every worker scan for verification.
+    # Never called from the endpoint path.
+    _teach_publish_after_scan_hook = [None]
+
+    def _teach_scan_sync() -> None:
+        """The actual disk scan + STATE mutation. Runs in the daemon
+        worker thread. Never called from any endpoint path — all
+        endpoints go through `_teach_publish_to_state()` which just
+        signals the worker."""
+        try:
+            names = os.listdir(_TEACH_DIR)
+        except FileNotFoundError:
+            names = []
+        draft_names = [n for n in names if n.endswith('.draft.json')]
+        if not draft_names:
+            with _state_lock:
+                if STATE.get('teach_sessions'):
+                    STATE['teach_sessions'] = {}
+            return
+        _teach_ghost_amnesty_once()
+        drafts: dict = {}
+        for name in draft_names:
+            pid = name[:-len('.draft.json')]
+            d = _teach_read_draft(pid)
+            if d is None:
+                continue
+            d = _teach_apply_ttl(pid, d)
+            if d is not None:
+                drafts[pid] = d
+        with _state_lock:
+            STATE['teach_sessions'] = drafts
+
+    def _teach_publish_worker_loop():
+        while True:
+            _teach_publish_event.wait()
+            _teach_publish_event.clear()
+            try:
+                _teach_scan_sync()
+            except Exception as _e:
+                # Never let a scan exception kill the worker — the
+                # next signal will re-fire the scan.
+                print(f'[teach-publish] scan error: {_e}', flush=True)
+            hook = _teach_publish_after_scan_hook[0]
+            if hook is not None:
+                try:
+                    hook()
+                except Exception:
+                    pass
+
     def _teach_publish_to_state() -> None:
         """Mirror every draft file on disk into STATE['teach_sessions']
         so the WS broadcast carries it. Called at boot (hydrate) and
         after every mutation. Applies the TTL rules — a stale-owner
         draft has its ownership released here, and a long-abandoned
-        draft is garbage-collected."""
-        _teach_ghost_amnesty_once()
-        drafts: dict = {}
+        draft is garbage-collected.
+
+        2026-08-06 (jog-jitter fix — operator directive):
+
+          FIX 1 (idle short-circuit). If the draft directory has NO
+          `.draft.json` files, the sweep does NOTHING. No disk scan,
+          no TTL apply, no worker signal. Bounded to ~1 syscall +
+          comparison against a small in-memory dict. Eliminates all
+          lock/disk contention when jogging with no teach session
+          active — the operator's current jitter case.
+
+          FIX 2 (disk I/O off the caller's thread). When drafts DO
+          exist, the actual scan happens in a dedicated daemon
+          thread; the caller signals a threading.Event and returns
+          immediately. This guarantees that a caller holding
+          _teach_lock (or the asyncio event loop) NEVER blocks on
+          disk I/O. State mirror is eventually consistent — the
+          next state broadcast (25 Hz idle / 8 Hz hold) picks up
+          the fresh dict within ~40 ms of the mutation.
+
+          FIX 3 (jog heartbeat isolation). The jog keepalive runs
+          on its own native thread with `_active_holds_lock`; teach
+          housekeeping runs on the publish worker with _state_lock.
+          The two share no mutex. Verified by the fork registry
+          entry `jog_hold_heartbeat`.
+        """
+        # Idle short-circuit — this fast path is what the operator
+        # hits during any jog with no teach session active. Bounded
+        # to ~1 syscall.
         try:
-            for name in os.listdir(_TEACH_DIR):
-                if not name.endswith('.draft.json'):
-                    continue
-                pid = name[:-len('.draft.json')]
-                d = _teach_read_draft(pid)
-                if d is None:
-                    continue
-                d = _teach_apply_ttl(pid, d)
-                if d is not None:
-                    drafts[pid] = d
+            names = os.listdir(_TEACH_DIR)
         except FileNotFoundError:
-            pass
-        with _state_lock:
-            STATE['teach_sessions'] = drafts
+            names = []
+        if not any(n.endswith('.draft.json') for n in names):
+            with _state_lock:
+                if STATE.get('teach_sessions'):
+                    STATE['teach_sessions'] = {}
+            return
+        # Lazy-start the worker on first non-idle call. Subsequent
+        # calls are cheap (already started).
+        if not _teach_publish_worker_started[0]:
+            _teach_publish_worker_started[0] = True
+            threading.Thread(target=_teach_publish_worker_loop,
+                             daemon=True,
+                             name='teach-publish-worker').start()
+        # Signal the worker. Coalescing is automatic: if the event
+        # is already set (worker hasn't started this scan yet), the
+        # set is a no-op — one scan covers both mutations.
+        _teach_publish_event.set()
 
     # Hydrate at boot so a restart mid-teach resumes the session.
+    # Boot path calls _teach_scan_sync directly (bypassing the worker
+    # signal) so STATE['teach_sessions'] is populated before the first
+    # request lands — otherwise the first client would see an empty
+    # mirror for ~50 ms after startup.
     os.makedirs(_TEACH_DIR, exist_ok=True)
-    _teach_publish_to_state()
+    _teach_scan_sync()
 
     def _teach_new_draft(prog_id: str, device_id: str,
                          device_label: str = '') -> dict:
