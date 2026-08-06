@@ -871,7 +871,7 @@ capabilities:
       # here shift as the file grows; refresh the numbers from the
       # deploy.sh lint output when they move.
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 5765
+        line: 5804
         why: >
           disabledReason string for the pallet-teach flow overlay's
           Record button title tooltip. Grandfathered by the visible
@@ -879,10 +879,10 @@ capabilities:
           with editor edits — refresh from deploy.sh lint output.
         owner: dashboard-frontend
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 5807
+        line: 5846
         why: >
           disabledReason string for the single/all-step teach overlay's
-          Record button title tooltip. Same rationale as line 5765.
+          Record button title tooltip. Same rationale as line 5804.
         owner: dashboard-frontend
 
   # 22. Page-context persistence (2026-08-05 refresh-loss P0).

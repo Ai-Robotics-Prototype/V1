@@ -197,10 +197,21 @@ def compute_frame(spec: PalletPlaceSpec) -> Dict[str, Any]:
     col_raw = _sub(ca, ca_along_row)
     col_axis = _norm(col_raw)
     plane_normal = _norm(_cross(row_axis, col_axis))
-    # Tilt: angle between plane_normal and +Z (or -Z — same physical
-    # plane). abs() so a normal pointing at -Z on a level pallet reads
-    # tilt=0.
-    tilt_dot = abs(max(-1.0, min(1.0, _dot(plane_normal, (0.0, 0.0, 1.0)))))
+    # 2026-08-06 (operator directive: layer direction canonical).
+    # Layer N sits ABOVE layer N-1 — layer_height along
+    # plane_normal must move the tool AWAY from the pallet surface
+    # (upward in the base frame). row×col can go either way
+    # depending on corner ordering; sign-adjust here so the normal
+    # always has a non-negative +Z_base component. The pallet is
+    # commissioned on a level (or near-level) surface, so +Z_base
+    # is the physically-up direction the operator expects for
+    # stacking.
+    if plane_normal[2] < 0:
+        plane_normal = (-plane_normal[0], -plane_normal[1], -plane_normal[2])
+    # Tilt: angle between plane_normal and +Z. After the sign fix
+    # above, plane_normal.z >= 0, so a level pallet reads tilt=0
+    # without abs().
+    tilt_dot = max(-1.0, min(1.0, _dot(plane_normal, (0.0, 0.0, 1.0))))
     tilt_deg = math.degrees(math.acos(tilt_dot))
     return {
         'row_axis':          row_axis,

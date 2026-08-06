@@ -351,3 +351,242 @@ def test_out_of_reach_slot_aborts_pallet_not_partial():
         'out-of-reach pallet must emit a PALLET IK FAILED comment '
         'naming the offending slot; instead the codegen emitted:\n'
         + lua)
+
+
+# ── 2026-08-06 operator directive: part_count + layer direction ─
+
+def test_part_count_caps_slots_at_specified_value():
+    """part_count=5 on 2×2×2 (capacity 8) → exactly 5 place cycles.
+    Slot order matches the operator's demo spec: [0,0,0], [0,1,0],
+    [1,0,0], [1,1,0], [0,0,1]. This is the golden fixture."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 5
+    lua, points, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    # Exactly 5 pallet release IO fires.
+    assert lua.count('pallet release') == 5, (
+        f'expected 5 place cycles for part_count=5, got '
+        f'{lua.count("pallet release")}')
+    # Slot 5 must be layer 1 [0,0,1] — NOT [1,1,0] or [0,1,1].
+    # Slots 1..4 are all of layer 0.
+    expected_places = ['slot[0,0,0] place', 'slot[0,1,0] place',
+                       'slot[1,0,0] place', 'slot[1,1,0] place',
+                       'slot[0,0,1] place']
+    lines = lua.splitlines()
+    place_lines_in_order = [ln for ln in lines
+                             if any(p in ln for p in expected_places)
+                             and 'place' in ln]
+    # Filter to just place (excludes traverse-height/approach/lift).
+    place_lines_in_order = [ln for ln in place_lines_in_order
+                             if 'place  joints' in ln]
+    assert len(place_lines_in_order) == 5, (
+        f'expected 5 place lines, got {len(place_lines_in_order)}: '
+        f'{place_lines_in_order}')
+    for i, want in enumerate(expected_places):
+        assert want in place_lines_in_order[i], (
+            f'position {i}: expected "{want}", got "{place_lines_in_order[i]}"')
+
+
+def test_part_count_3_stays_within_layer_0():
+    """part_count=3 → only [0,0,0], [0,1,0], [1,0,0]. Layer 0 has
+    4 slots; 3 partial-fill leaves [1,1,0] and all layer 1 unused."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 3
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    assert lua.count('pallet release') == 3
+    # No layer 1 slot may appear.
+    assert 'slot[0,0,1]' not in lua
+    assert 'slot[1,1,0] place' not in lua   # partial layer 0
+
+
+def test_part_count_over_capacity_caps_and_warns():
+    """part_count=15 on capacity 8 → cap at 8, emit a warning comment."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 15
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    assert lua.count('pallet release') == 8, (
+        'over-capacity must cap at capacity, not emit garbage cycles')
+    assert 'exceeds capacity' in lua, (
+        'operator must see a comment naming the excess')
+    assert 'capping at' in lua
+
+
+def test_part_count_absent_emits_full_capacity():
+    """No part_count field → emit rows*cols*layers (pre-directive
+    behavior; back-compat for saved programs)."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    if 'part_count' in prog['config']['pallet']:
+        del prog['config']['pallet']['part_count']
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    rows   = prog['config']['pallet']['rows']
+    cols   = prog['config']['pallet']['cols']
+    layers = prog['config']['pallet']['layers']
+    assert lua.count('pallet release') == rows * cols * layers
+
+
+def test_layer_index_increases_z():
+    """Layer N sits ABOVE layer N-1 in +Z_base. Slot [0,0,1].z >
+    Slot [0,0,0].z by layer_height_mm. Pre-fix, the derived normal
+    could point downward and stack layers into the pallet — this
+    test pins the sign-adjusted normal."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 5   # includes layer 1
+    lua, points, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    # Find the place point for slot [0,0,0] and [0,0,1] by scanning
+    # the emitted Lua for the slot label. Then FK each.
+    import re
+    slot00_name = None
+    slot01_name = None
+    for ln in lua.splitlines():
+        m = re.search(r'movL\((p\d+)\)\s+--\s+slot\[0,0,0\]\s+place\b', ln)
+        if m: slot00_name = m.group(1)
+        m = re.search(r'movL\((p\d+)\)\s+--\s+slot\[0,0,1\]\s+place\b', ln)
+        if m: slot01_name = m.group(1)
+    assert slot00_name and slot01_name, (
+        f'could not find place lines for [0,0,0] / [0,0,1] in Lua')
+    for nm in (slot00_name, slot01_name):
+        val = points[nm]['val']
+        if isinstance(val, str): val = json.loads(val)
+    def _fk_z(nm):
+        val = points[nm]['val']
+        if isinstance(val, str): val = json.loads(val)
+        return program_ops._fk_chain(val['jp'])[6][2, 3]
+    z00 = _fk_z(slot00_name)
+    z01 = _fk_z(slot01_name)
+    layer_h_mm = float(prog['config']['pallet']['layer_height_mm'])
+    dz = z01 - z00
+    assert dz > 0, (
+        f'layer 1 must sit ABOVE layer 0: got Δz = {dz:.2f} mm '
+        f'(z00={z00:.2f}, z01={z01:.2f}). Layer direction has '
+        f'regressed — plane_normal is pointing INTO the pallet.')
+    assert abs(dz - layer_h_mm) < 2.0, (
+        f'Δz between layers must equal layer_height_mm '
+        f'({layer_h_mm:.1f}); got {dz:.2f}')
+
+
+def test_layer_fully_filled_before_next_layer_starts():
+    """Fill order = layer OUTERMOST. All rows*cols slots on layer L
+    emit before any slot on layer L+1, regardless of the row/col
+    fill order within a layer."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    rows   = prog['config']['pallet']['rows']
+    cols   = prog['config']['pallet']['cols']
+    layers = prog['config']['pallet']['layers']
+    # Emit at full capacity so we see all layer 0 + all layer 1.
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    import re
+    # Find the layer index for each place line, in emission order.
+    layer_seq = []
+    for ln in lua.splitlines():
+        m = re.search(r'slot\[(\d+),(\d+),(\d+)\]\s+place\b', ln)
+        if m:
+            layer_seq.append(int(m.group(3)))
+    # Sequence must be non-decreasing (no layer 1 followed by layer 0).
+    for i in range(1, len(layer_seq)):
+        assert layer_seq[i] >= layer_seq[i-1], (
+            f'layer index went backwards at position {i}: '
+            f'{layer_seq[i-1]} → {layer_seq[i]}. Fill order must be '
+            f'layer-outermost.')
+    # And within each layer we saw exactly rows*cols slots.
+    from collections import Counter
+    counts = Counter(layer_seq)
+    for l in range(layers):
+        assert counts[l] == rows * cols, (
+            f'layer {l} saw {counts[l]} slots, expected {rows*cols}')
+
+
+def test_plane_normal_points_up_after_sign_fix():
+    """compute_frame's plane_normal has non-negative +Z_base
+    component regardless of corner ordering. Pre-fix the raw
+    row×col could point downward; the sign fix flips it."""
+    from programming_by_demonstration.schema import PalletPlaceSpec
+    from programming_by_demonstration.pallet_geometry import compute_frame
+    # Corner ordering that produces row×col in -Z.
+    spec = PalletPlaceSpec.from_dict({
+        'rows': 2, 'cols': 2, 'layers': 2,
+        'pitch_row_mm': 100, 'pitch_col_mm': 100, 'layer_height_mm': 50,
+        'corner1_tcp': [0.5,  0.1, 0.1, 0, 0, 0],
+        'corner2_tcp': [0.5,  0.4, 0.1, 0, 0, 0],
+        'corner3_tcp': [0.8,  0.1, 0.1, 0, 0, 0],
+        'part_tcp':    [0.55, 0.15, 0.1, 0, 0, 0],
+    })
+    fr = compute_frame(spec)
+    assert fr['plane_normal'][2] >= 0, (
+        f'plane_normal must point up (+Z) after sign fix, got '
+        f'{fr["plane_normal"]}')
+    # And the reverse ordering (which naturally gives +Z) also works.
+    spec2 = PalletPlaceSpec.from_dict({
+        'rows': 2, 'cols': 2, 'layers': 2,
+        'pitch_row_mm': 100, 'pitch_col_mm': 100, 'layer_height_mm': 50,
+        'corner1_tcp': [0.5, 0.1, 0.1, 0, 0, 0],
+        'corner2_tcp': [0.8, 0.1, 0.1, 0, 0, 0],
+        'corner3_tcp': [0.5, 0.4, 0.1, 0, 0, 0],
+        'part_tcp':    [0.55, 0.15, 0.1, 0, 0, 0],
+    })
+    fr2 = compute_frame(spec2)
+    assert fr2['plane_normal'][2] >= 0
+
+
+def test_golden_5cycle_slot_positions_holepartpalletize():
+    """The exact golden fixture for the operator's demo:
+    part_count=5 on holepartpalletize's actual saved corners/pitch
+    produces these 5 physical slot positions (mm), verified against
+    the geometry.
+    """
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 5
+    lua, points, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    # Compute the expected positions from geometry (independent
+    # of what codegen emits — this is the truth).
+    from programming_by_demonstration.schema import PalletPlaceSpec
+    from programming_by_demonstration.pallet_geometry import derive_slot_tcps
+    place = prog['config']['pallet_place']; pold = prog['config']['pallet']
+    spec_dict = dict(place)
+    spec_dict.update({
+        'rows': pold['rows'], 'cols': pold['cols'],
+        'layers': pold['layers'],
+        'pitch_row_mm': pold['spacing_x_mm'],
+        'pitch_col_mm': pold['spacing_y_mm'],
+        'layer_height_mm': pold['layer_height_mm'],
+        'order': 'row_major',
+    })
+    spec = PalletPlaceSpec.from_dict(spec_dict)
+    all_slots = derive_slot_tcps(spec, tuple(place['corner1_tcp']))
+    # First 5 in emission order.
+    golden = all_slots[:5]
+    # Assert the exact (r, c, l) tuples matching the operator's spec.
+    expected_rcl = [(0,0,0), (0,1,0), (1,0,0), (1,1,0), (0,0,1)]
+    for i, (want, s) in enumerate(zip(expected_rcl, golden)):
+        got = (s['row'], s['col'], s['layer'])
+        assert got == want, (
+            f'golden slot {i}: expected {want} got {got}')
+    # And the emitted place-joints FK to the golden geometry.
+    import re
+    for i, (r, c, l) in enumerate(expected_rcl):
+        pat = rf'movL\((p\d+)\)\s+--\s+slot\[{r},{c},{l}\]\s+place\b'
+        hit = None
+        for ln in lua.splitlines():
+            m = re.search(pat, ln)
+            if m: hit = m.group(1); break
+        assert hit is not None, f'place line for [{r},{c},{l}] missing'
+        val = points[hit]['val']
+        if isinstance(val, str): val = json.loads(val)
+        fk = program_ops._fk_chain(val['jp'])[6][:3, 3]
+        want_mm = tuple(v * 1000 for v in golden[i]['tcp_m'][:3])
+        for axis in range(3):
+            assert abs(fk[axis] - want_mm[axis]) < 0.1, (
+                f'slot [{r},{c},{l}] axis {axis}: FK={fk[axis]:.2f} mm '
+                f'vs want {want_mm[axis]:.2f} mm')

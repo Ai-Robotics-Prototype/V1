@@ -4037,6 +4037,44 @@ def codegen_lua_from_program(
                     f'-- skipped {action!r}: derive_slot_tcps failed '
                     f'({type(_pe).__name__}: {_pe})')
                 continue
+            # 2026-08-06 (operator directive: part-count termination).
+            # `cfg.pallet.part_count` caps how many pick-place cycles
+            # emit. Autofilled from the PBD demo's stated quantity
+            # (e.g. "5 holes" → default 5). Codegen cap:
+            #   emitted = min(part_count, capacity)
+            # Absent field → no cap (emitted = capacity). > capacity
+            # → cap at capacity + emit a comment naming the excess.
+            # Partial top layer is preferred over empty cycles;
+            # slot order is layer-outermost (all of layer 0, then
+            # layer 1...) so a partial top-layer fill correctly
+            # leaves the upper slots unused.
+            capacity = len(slots)
+            _pc_raw = pold.get('part_count')
+            if _pc_raw is None:
+                part_count = capacity
+                _pc_note = 'no part_count set — emitting full capacity'
+            else:
+                try:
+                    part_count = max(1, int(_pc_raw))
+                except (TypeError, ValueError):
+                    part_count = capacity
+                    _pc_note = (f'invalid part_count={_pc_raw!r} — '
+                                 f'falling back to capacity {capacity}')
+                else:
+                    if part_count > capacity:
+                        exec_lines.append(
+                            f'-- move_to_pallet: part_count={part_count} '
+                            f'exceeds capacity={capacity} — capping at '
+                            f'capacity (only {capacity} placed)')
+                        part_count = capacity
+                        _pc_note = f'capped at capacity {capacity}'
+                    else:
+                        _pc_note = f'part_count={part_count}/capacity={capacity}'
+            # Slice the fill-order slot list to the first part_count.
+            # derive_slot_tcps already returns them in layer-outermost
+            # fill order (all of layer 0 first, then layer 1, ... —
+            # per _order_indices), so a slice truncates cleanly.
+            slots = slots[:part_count]
             # Approach / retract heights — travel path above each slot.
             approach_h_mm = float(pold.get('approach_height_mm', 100) or 100)
             retract_h_mm  = float(pold.get('retract_height_mm',  200) or 200)
@@ -4088,12 +4126,14 @@ def codegen_lua_from_program(
             # Header comment for the expansion — makes the loop legible
             # in the emitted Lua when reading top to bottom.
             exec_lines.append(
-                f'-- move_to_pallet EXPANSION: {len(slots)} slot(s), '
+                f'-- move_to_pallet EXPANSION: {len(slots)} cycle(s) '
+                f'({_pc_note}), '
                 f'{pspec.rows}×{pspec.cols}×{pspec.layers} grid, '
                 f'pitch_row={pspec.pitch_row_mm:.0f}mm '
                 f'pitch_col={pspec.pitch_col_mm:.0f}mm '
                 f'layer_h={pspec.layer_height_mm or 0:.0f}mm '
-                f'order={pspec.order}  release_io={_fire_io}')
+                f'order={pspec.order} (layer-outermost)  '
+                f'release_io={_fire_io}')
             _pallet_ok = True
             for _sl in slots:
                 r_idx = int(_sl['row']); c_idx = int(_sl['col']); l_idx = int(_sl['layer'])

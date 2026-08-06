@@ -732,9 +732,29 @@ function PalletConfigEditor({ config, onSave, onClose }) {
   const [approachH,  setApproachH]  = useState(Number(initialPallet.approach_height_mm ?? config?.pallet_approach_height_mm ?? 100))
   const [retractH,   setRetractH]   = useState(Number(initialPallet.retract_height_mm  ?? config?.pallet_retract_height_mm  ?? 200))
   const [speed,      setSpeed]      = useState(Number(config?.speed_pct ?? config?.speed ?? 60))
+  // 2026-08-06 (operator directive: part-count termination). N pick-
+  // place cycles are emitted, one per part. Autofills from the PBD
+  // demo's stated quantity when the composer set `pallet.part_count`;
+  // otherwise defaults to capacity (all slots filled). Operator-
+  // editable. Warn when > capacity → will be capped at capacity by
+  // codegen; when < capacity → partial fill (fine, preferred over
+  // empty cycles per operator doctrine).
+  const _capacityInit = Math.max(1, Number(initialPallet.rows ?? 4)
+                                   * Number(initialPallet.cols ?? 4)
+                                   * Number(initialPallet.layers ?? 1))
+  const [partCount,  setPartCount]  = useState(
+    Number(initialPallet.part_count ?? _capacityInit))
 
   const cycles = Math.max(1, rows * cols * layers)
   const isDepal = mode === 'depalletize'
+  const partCountWarning =
+    !Number.isFinite(Number(partCount)) || Number(partCount) < 1
+      ? 'Must be ≥ 1'
+      : (Number(partCount) > cycles
+         ? `${partCount} exceeds capacity ${cycles} — codegen will cap at ${cycles}`
+         : (Number(partCount) < cycles
+            ? `${partCount} of ${cycles} slots — top layer partial (fine)`
+            : ''))
 
   function commit() {
     // Parameters-only patch. Preserve any 3-point taught frame +
@@ -752,6 +772,7 @@ function PalletConfigEditor({ config, onSave, onClose }) {
       fill_order: fillOrder || 'row_lr',
       approach_height_mm: Number(approachH) || 0,
       retract_height_mm:  Number(retractH)  || 0,
+      part_count: Math.max(1, Number(partCount) || 1),
     }
     // pallet_place (schema-shape spec consumed by the taught-frame
     // math) also gets its grid fields updated but its taught frame
@@ -855,7 +876,29 @@ function PalletConfigEditor({ config, onSave, onClose }) {
             </Field>
           </div>
           <div style={{ marginBottom: 6, fontSize: 11, color: '#0f766e', fontWeight: 600 }}>
-            Total slots: {cycles}
+            Total slots (capacity): {cycles}
+          </div>
+
+          {/* 2026-08-06 operator directive: part-count termination.
+              N pick-place cycles emit for N available parts — partial
+              top layer preferred over empty cycles. Autofilled from
+              the PBD composer when it captures "5 holes"; otherwise
+              defaults to capacity. */}
+          <div style={{ marginBottom: 12 }}>
+            <Field label={`Parts to place — number of pick-place cycles`}>
+              <NumericField integer min={1} max={999} value={partCount}
+                onCommit={setPartCount} style={inputStyle}
+                aria-label="Part count" data-testid="pallet-part-count" />
+            </Field>
+            {partCountWarning && (
+              <div style={{
+                fontSize: 11,
+                color: Number(partCount) > cycles ? '#B45309' : '#065F46',
+                marginTop: -6,
+              }}>
+                {partCountWarning}
+              </div>
+            )}
           </div>
 
           {/* 2026-08-05 operator doctrine ruling: pitch is
