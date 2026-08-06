@@ -438,6 +438,149 @@ function DeviceIdentitySection() {
   )
 }
 
+// 2026-08-06 (operator directive: ENTIRE self-collision system OFF).
+// Single authoritative kill switch for the self-collision + ground-
+// plane capsule guard, ALL tiers. Default OFF per the directive.
+// This card is intentionally prominent (red when off) so the state
+// is operator-visible, not buried. Every toggle lands in the event
+// log — the boot state, every runtime flip, every observed change.
+function SelfCollisionGuardSection() {
+  const [state, setState]     = useState(null)   // last-known from GET
+  const [busy, setBusy]       = useState(false)
+  const [confirming, setConfirming] = useState(null) // 'on' | 'off' | null
+  const collEnabled = useStore((s) => s.robot?.collision_enabled)
+  const modelLoaded = useStore((s) => s.robot?.collision_model_loaded)
+
+  // Poll once on mount + subscribe to live state via robot.collision_*.
+  // Live state wins — the poll seeds before the WS frame arrives.
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/collision_guard').then((r) => r.ok ? r.json() : null)
+      .then((d) => { if (!cancelled && d) setState(d) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+  const enabled = (collEnabled != null) ? !!collEnabled
+                : (state ? !!state.enabled : false)
+
+  async function apply(target) {
+    if (busy) return
+    setBusy(true)
+    try {
+      const r = await fetch('/api/collision_guard', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !!target }),
+      })
+      if (r.ok) {
+        const d = await r.json().catch(() => ({}))
+        setState((s) => ({ ...(s || {}), enabled: !!d.enabled }))
+      }
+    } finally {
+      setBusy(false)
+      setConfirming(null)
+    }
+  }
+
+  const bg = enabled ? '#052E1C' : '#3F0F0F'
+  const bd = enabled ? '#065F46' : '#DC2626'
+  const fg = enabled ? '#A7F3D0' : '#FCA5A5'
+  return (
+    <div style={{
+      background: bg, border: `2px solid ${bd}`,
+      borderRadius: 'var(--radius-sm)',
+      padding: '14px 16px',
+      display: 'flex', flexDirection: 'column', gap: 8,
+      color: fg,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={{
+          display: 'inline-block', width: 10, height: 10,
+          borderRadius: '50%',
+          background: enabled ? '#22C55E' : '#EF4444',
+        }} />
+        <div style={{ fontSize: 14, fontWeight: 700 }}>
+          Self-collision guard: {enabled ? 'ON' : 'OFF'}
+        </div>
+        <div style={{ flex: 1 }} />
+        <button
+          data-testid="collision-guard-toggle"
+          disabled={busy}
+          onClick={() => setConfirming(enabled ? 'off' : 'on')}
+          style={{
+            padding: '6px 14px', fontSize: 12, fontWeight: 700,
+            background: enabled ? '#7F1D1D' : '#065F46',
+            color: '#fff',
+            border: `1px solid ${enabled ? '#DC2626' : '#059669'}`,
+            borderRadius: 4, cursor: busy ? 'default' : 'pointer',
+            opacity: busy ? 0.6 : 1,
+          }}>
+          {enabled ? 'Turn OFF' : 'Turn ON'}
+        </button>
+      </div>
+      <div style={{ fontSize: 12, lineHeight: 1.5, color: fg }}>
+        {enabled
+          ? ('The 15 mm hard self-collision stop, the 40 mm soft warn '
+             + 'tier, and the ground-plane hard limit are ACTIVE. Motion '
+             + 'that would put a link within stop distance of another '
+             + 'link or the floor will be halted.')
+          : ('ALL software collision guards are OFF. Nothing in software '
+             + 'prevents a link-on-link crash or a link-on-table crash. '
+             + 'This is the operator’s explicit informed choice — flip '
+             + 'ON to re-arm.')}
+      </div>
+      {!modelLoaded && enabled && (
+        <div style={{
+          fontSize: 11, background: '#78350F', color: '#FEF3C7',
+          padding: '6px 10px', borderRadius: 4,
+        }}>
+          Guard is ON but the capsule model failed to load — no
+          pairs are being evaluated. Check
+          /opt/cobot/config/self_collision_capsules.yaml.
+        </div>
+      )}
+      {confirming && (
+        <div style={{
+          marginTop: 4, padding: 10,
+          background: '#111827', border: '1px solid #1F2937',
+          borderRadius: 6, color: '#E5E7EB',
+        }}>
+          <div style={{ fontSize: 12, marginBottom: 8 }}>
+            {confirming === 'off'
+              ? 'Turn the self-collision guard OFF? Nothing in software will prevent link-on-link or link-on-table crashes.'
+              : 'Turn the self-collision guard ON? Motion will be halted when a link comes within stop distance of another link or the floor.'}
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              data-testid="collision-guard-confirm"
+              disabled={busy}
+              onClick={() => apply(confirming === 'on')}
+              style={{
+                padding: '6px 14px', fontSize: 12, fontWeight: 700,
+                background: confirming === 'off' ? '#7F1D1D' : '#065F46',
+                color: '#fff', border: 'none',
+                borderRadius: 4, cursor: 'pointer',
+              }}>
+              Confirm — turn {confirming.toUpperCase()}
+            </button>
+            <button
+              disabled={busy}
+              onClick={() => setConfirming(null)}
+              style={{
+                padding: '6px 14px', fontSize: 12,
+                background: 'transparent', color: '#E5E7EB',
+                border: '1px solid #374151',
+                borderRadius: 4, cursor: 'pointer',
+              }}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function SystemCheckSection() {
   const [data, setData]           = useState(null)
   const [error, setError]         = useState(null)
@@ -626,6 +769,8 @@ export default function ConfigureLayout() {
       <SystemCheckSection />
 
       <DeviceIdentitySection />
+
+      <SelfCollisionGuardSection />
 
       <CellSetupSection />
 

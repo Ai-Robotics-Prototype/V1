@@ -671,14 +671,14 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3316
+        line: 3357
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
           Pinned by test_jog_hold_heartbeat.py.
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3446
+        line: 3487
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Pinned by test_jog_hold_heartbeat.py.
@@ -1002,16 +1002,22 @@ capabilities:
     known_debt: []
 
   # 24. Clearance warnings OFF (2026-08-05 operator directive).
+  #     SUPERSEDED for hard tiers by entry #25 (kill switch) —
+  #     2026-08-06 directive turned OFF the entire self-collision
+  #     system including the 15 mm hard stop and ground plane.
+  #     This entry stays as-is: the 40 mm warn tier remains
+  #     canonically OFF at the driver level via
+  #     collision_warn_distance_mm=0.0 even when the operator
+  #     later re-arms the kill switch.
   - id: clearance_warn_tier_off
     description: >
       The 40 mm soft clearance-warn tier is disabled end to end.
       Server signals it via collision_warn_distance_mm=0.0 (the
       "disabled" sentinel); the WARNING log line + telemetry
-      bool + frontend banner all gate on this being > 0. The
-      HARD self-collision stop (15 mm capsule) and ground-plane
-      hard limit remain active as the physical last-resort
-      guard — the operator's stated plan is "I will hit the
-      hard limit and it will stop."
+      bool + frontend banner all gate on this being > 0. Re-
+      enabling requires flipping the driver default AND flipping
+      the kill switch (entry #25) AND getting the operator
+      directive reversed.
 
       When the hard stop fires, the ONE signal that remains is
       a toast composed by _jog_stop_cause_operator_copy
@@ -1056,6 +1062,82 @@ capabilities:
         path_exempt:
           - src/cobot_dashboard/frontend/src/lib/collisionPresentation.js
           - src/cobot_dashboard/frontend/src/components/SelfCollisionWarnBanner.jsx
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt: []
+
+  # 25. Self-collision guard kill switch (2026-08-06 operator
+  # directive). SINGLE AUTHORITATIVE runtime kill switch for the
+  # entire self-collision + ground-plane capsule guard, ALL tiers
+  # (40 mm warn, 15 mm hard stop, ground plane, cart-mode escape
+  # gate, pre-flight jog check).
+  - id: collision_guard_kill_switch
+    description: >
+      One switch, one truth: the driver's runtime flag
+      `_coll_guard_active` gates every guard call site. When
+      False, no clearance-related message is emitted anywhere in
+      the stack — the tick evaluator, the pre-flight jog check,
+      the cart-mode start guard, and the posture-time min-
+      clearance publisher all no-op. `collision_enabled`
+      parameter is the boot default (also False per this
+      directive). Runtime toggle via /robot/collision_guard_set
+      (Bool); dashboard exposes GET/POST /api/collision_guard.
+
+      Fork rule: any second implementation of "is the collision
+      guard active" — a duplicate flag, a bypass path that
+      evaluates the coll_model without checking
+      `_coll_guard_active`, a frontend component that renders
+      clearance without gating on `robot.collision_enabled` — is
+      a fork. Adding a new guard USE site to the driver requires
+      including `and self._coll_guard_active` in the same
+      predicate (or an equivalent early-return); the pinned
+      tests count gates and refuse a merge that adds a use site
+      without one.
+
+      Event log is the operator's audit trail: every transition
+      of `collision_enabled` (boot observation, runtime toggle,
+      status-blob change) emits an event_log entry with severity
+      warning on OFF, info on ON.
+
+      SAFETY (surfaced by the doctrine, not gated by the code):
+      with the guard OFF nothing in software prevents a link-on-
+      link or link-on-table crash. Operator's explicit informed
+      choice per the 2026-08-06 directive.
+    canonical:
+      python:
+        module: estun_driver.estun_driver_node
+        functions: []
+        note: >
+          `_coll_guard_active` seeded from the `collision_enabled`
+          param. `_on_collision_guard_set` handles the runtime
+          topic. Every _coll_model USE site includes
+          `and self._coll_guard_active`.
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [api_collision_guard_get, api_collision_guard_set,
+                    _publish_collision_guard_set]
+      frontend:
+        path: src/cobot_dashboard/frontend/src/layouts/ConfigureLayout.jsx
+        exports: [default]
+        note: >
+          SelfCollisionGuardSection is the single UI surface for
+          the kill switch. HardStopToast gates on
+          robot.collision_enabled so a stale wire message never
+          surfaces after a toggle.
+    forbidden:
+      # No new component may render clearance without gating on
+      # robot.collision_enabled. Match the two most common
+      # clearance-reading patterns.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          - "robot\\?\\.collision_min_mm"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/layouts/View3DLayout.jsx
+          - src/cobot_dashboard/frontend/src/components/StandaloneRobot.jsx
+          - src/cobot_dashboard/frontend/src/components/HardStopToast.jsx
+          - src/cobot_dashboard/frontend/src/components/ObstacleEscapeModal.jsx
+          - src/cobot_dashboard/frontend/src/components/SelfCollisionWarnBanner.jsx
+          - src/cobot_dashboard/frontend/src/lib/collisionPresentation.js
           - '**/*.test.js'
           - '**/*.test.jsx'
     known_debt: []

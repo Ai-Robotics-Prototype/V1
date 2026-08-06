@@ -1884,12 +1884,53 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             # Self-collision guard telemetry (pair + distance + thresholds).
             # Dashboard uses these to tint the offending link pair
             # amber/red in the twin and render a live clearance readout.
-            r["collision_enabled"] = bool(d.get("collision_enabled", False))
+            # 2026-08-06: `collision_enabled` now means the RUNTIME
+            # kill switch is on. `collision_guard_active` is the
+            # boolean flag; `collision_model_loaded` is whether the
+            # capsule YAML parsed. The Configure surface + the event
+            # log key off `collision_enabled`.
+            prev_coll_en = r.get("collision_enabled")
+            r["collision_enabled"]       = bool(d.get("collision_enabled", False))
+            r["collision_guard_active"]  = bool(d.get("collision_guard_active", False))
+            r["collision_model_loaded"]  = bool(d.get("collision_model_loaded", False))
             r["collision_pair"]    = d.get("collision_pair")
             r["collision_min_mm"]  = d.get("collision_min_mm")
             r["collision_warn_mm"] = float(d.get("collision_warn_mm") or 0.0)
             r["collision_stop_mm"] = float(d.get("collision_stop_mm") or 0.0)
             r["collision_warning"] = bool(d.get("collision_warning", False))
+            # 2026-08-06 (operator directive): every transition of the
+            # runtime kill switch lands in the event log. The initial
+            # observation (prev_coll_en is None) also emits so the
+            # boot state is on record. Warning severity on OFF; info
+            # on ON.
+            if prev_coll_en != r["collision_enabled"]:
+                try:
+                    if r["collision_enabled"]:
+                        _event_log.emit(
+                            severity='info',
+                            source='estun_driver',
+                            code='collision_guard_active',
+                            operator_message='Self-collision guard is ACTIVE.',
+                            technical_detail=(
+                                f'guard_active={r["collision_guard_active"]} '
+                                f'model_loaded={r["collision_model_loaded"]}'),
+                            context={'enabled': True})
+                    else:
+                        _event_log.emit(
+                            severity='warning',
+                            source='estun_driver',
+                            code='collision_guard_inactive',
+                            operator_message=(
+                                'Self-collision guard is OFF. Nothing in '
+                                'software prevents a link-on-link or link-'
+                                'on-table crash.'),
+                            technical_detail=(
+                                f'guard_active={r["collision_guard_active"]} '
+                                f'model_loaded={r["collision_model_loaded"]}'),
+                            context={'enabled': False,
+                                     'first_observation': prev_coll_en is None})
+                except Exception:
+                    pass
             # Environment obstacle guard — separate keys from self-collision.
             # env_pair is [link, "zone#<id>"]; env_escape_dirs is a list of
             # {joint, direction, projected_mm, current_mm} sorted best-first.
@@ -3682,6 +3723,85 @@ if FASTAPI_AVAILABLE:
             )
         _publish_estun_power({"action": action})
         return {"ok": True, "action": action}
+
+    # ── Self-collision guard runtime kill switch ──────────
+    #
+    # 2026-08-06 (operator directive: ENTIRE self-collision +
+    # ground-plane guard OFF). Single authoritative kill switch,
+    # exposed here so Configure can render it. The driver's
+    # `collision_enabled` parameter is the boot default (also
+    # False); this endpoint flips the runtime flag via a
+    # /robot/collision_guard_set publish. Fork registry:
+    # collision_guard_kill_switch.
+
+    def _publish_collision_guard_set(enabled: bool) -> None:
+        """Publish a Bool onto /robot/collision_guard_set. Reliable
+        QoS, depth 5 — single infrequent command like power."""
+        if _ros_node is None:
+            return
+        try:
+            from std_msgs.msg import Bool as _Bool
+            if not hasattr(_ros_node, "_coll_guard_pub"):
+                _ros_node._coll_guard_pub = _ros_node.create_publisher(
+                    _Bool, "/robot/collision_guard_set", 5)
+            m = _Bool(); m.data = bool(enabled)
+            _ros_node._coll_guard_pub.publish(m)
+        except Exception:
+            pass
+
+    @app.get("/api/collision_guard")
+    async def api_collision_guard_get():
+        with _state_lock:
+            r = STATE.get("robot") or {}
+            return {
+                "ok":               True,
+                "enabled":          bool(r.get("collision_enabled")),
+                "guard_active":     bool(r.get("collision_guard_active")),
+                "model_loaded":     bool(r.get("collision_model_loaded")),
+            }
+
+    @app.post("/api/collision_guard")
+    async def api_collision_guard_set(request: Request):
+        """Body: {"enabled": bool}. Publishes to the driver's
+        /robot/collision_guard_set topic and writes an event-log
+        entry so every toggle is on record. Deliberately does NOT
+        gate on any UI confirmation — the Configure surface owns
+        the "are you sure?" prompt; this endpoint is the wire."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        if "enabled" not in body or not isinstance(body["enabled"], bool):
+            return JSONResponse(
+                {"error": "'enabled' (bool) required"}, status_code=400)
+        enabled = bool(body["enabled"])
+        _publish_collision_guard_set(enabled)
+        # Forensic event — operator's explicit informed choice per
+        # the 2026-08-06 directive. Severity=warning on OFF so the
+        # event log makes the disabled state visible at a glance.
+        try:
+            if enabled:
+                _event_log.emit(
+                    severity='info',
+                    source='dashboard',
+                    code='collision_guard_enabled',
+                    operator_message='Self-collision guard turned ON.',
+                    technical_detail='POST /api/collision_guard {enabled:true}',
+                    context={'enabled': True})
+            else:
+                _event_log.emit(
+                    severity='warning',
+                    source='dashboard',
+                    code='collision_guard_disabled',
+                    operator_message=(
+                        'Self-collision guard turned OFF. All software '
+                        'collision guards are disabled — link-on-link '
+                        'and link-on-table crashes are possible.'),
+                    technical_detail='POST /api/collision_guard {enabled:false}',
+                    context={'enabled': False})
+        except Exception:
+            pass
+        return {"ok": True, "enabled": enabled}
 
     @app.post("/cmd/gripper")
     async def cmd_gripper(request: Request):

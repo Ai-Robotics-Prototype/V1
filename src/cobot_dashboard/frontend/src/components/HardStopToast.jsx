@@ -29,6 +29,7 @@ import { useStore } from '../store/useStore'
 export default function HardStopToast() {
   const stopCauseCopy = useStore((s) => s.robot?.stop_cause_copy)
   const lastStopCause = useStore((s) => s.robot?.last_stop_cause)
+  const collEnabled   = useStore((s) => s.robot?.collision_enabled)
   const addToast      = useStore((s) => s.addToast)
   const seenTsRef     = useRef(0)
 
@@ -37,6 +38,15 @@ export default function HardStopToast() {
     const ts = Number(stopCauseCopy.ts || 0)
     if (!ts || ts <= seenTsRef.current) return
     seenTsRef.current = ts
+
+    // 2026-08-06 (operator directive: guards OFF). When the runtime
+    // kill switch is off, no clearance-related toast should surface
+    // even if a stale cause is still in the wire. Belt-and-braces:
+    // the driver won't emit collision_guard stops when
+    // _coll_guard_active is False, but if a race puts one on the
+    // wire the moment after the toggle, this gate ensures the
+    // operator doesn't see it.
+    if (collEnabled === false) return
 
     // Only interested in the collision_guard tag, and only for
     // self/ground kinds (env keeps its ObstacleEscapeModal).
@@ -49,7 +59,7 @@ export default function HardStopToast() {
       detail:          stopCauseCopy.detail,
       technicalDetail: stopCauseCopy.technical,
     }, 'error', 6000)
-  }, [stopCauseCopy, lastStopCause, addToast])
+  }, [stopCauseCopy, lastStopCause, collEnabled, addToast])
 
   return null
 }

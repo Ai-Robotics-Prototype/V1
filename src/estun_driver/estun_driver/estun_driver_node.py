@@ -436,7 +436,18 @@ class EstunCodroidDriver(Node):
         # Config file lives beside the YAML params — resolved at init.
         self.declare_parameter('collision_capsules_yaml',
             '/home/teddy/cobot_ws/config/self_collision_capsules.yaml')
-        self.declare_parameter('collision_enabled', True)
+        # 2026-08-06 (operator directive: ENTIRE self-collision system OFF).
+        # `collision_enabled` is the SINGLE AUTHORITATIVE KILL SWITCH
+        # for the whole self-collision + ground-plane capsule guard,
+        # ALL tiers. Default False per the directive. Runtime toggle
+        # via /robot/collision_guard_set (Bool). When False, every
+        # collision-check call site is a no-op and no "arm too close
+        # to another link" message can be emitted anywhere in the
+        # stack. SAFETY: with the guard OFF nothing in software
+        # prevents a link-on-link or link-on-table crash — this is
+        # the operator's explicit, informed choice, logged on boot
+        # and on every runtime toggle in the event log.
+        self.declare_parameter('collision_enabled', False)
         # Ground plane z (mm) in the driver's base_link frame. The URDF
         # base_link is the base flange; a mounted arm sits some
         # distance above the physical floor. z=0 in base frame is the
@@ -792,24 +803,40 @@ class EstunCodroidDriver(Node):
         # Self-collision guard — loads capsule YAML at init. If the
         # YAML is missing or malformed, we WARN and disable the guard
         # rather than refuse to start the driver.
+        #
+        # 2026-08-06 (operator directive: ENTIRE guard OFF).
+        # The MODEL is always loaded when the YAML is present (so a
+        # runtime re-enable can flip the switch without a restart).
+        # The RUNTIME KILL SWITCH is `_coll_guard_active`, seeded
+        # from `_coll_enabled`. Every guard USE site is gated on
+        # `_coll_guard_active` — when False, no evaluation, no
+        # message, no stop. Default False per the directive.
         self._coll_model = None
-        if self._coll_enabled:
-            try:
-                from .collision import CollisionModel
-                self._coll_model = CollisionModel(self._coll_yaml_path)
-                self._coll_model.ground_z_mm = (
-                    self._ground_z_mm if self._ground_check_enabled else None)
-                self.get_logger().info(
-                    f'Self-collision guard loaded: {len(self._coll_model.capsules)} '
-                    f'capsules, {len(self._coll_model.pairs)} pairs from '
-                    f'{self._coll_yaml_path}  warn={self._coll_warn_mm:.0f}mm '
-                    f'stop={self._coll_stop_mm:.0f}mm  '
-                    f'ground_z={self._ground_z_mm:.0f}mm')
-            except Exception as e:
-                self.get_logger().warn(
-                    f'Self-collision guard DISABLED — could not load '
-                    f'{self._coll_yaml_path}: {e}')
-                self._coll_model = None
+        self._coll_guard_active = bool(self._coll_enabled)
+        try:
+            from .collision import CollisionModel
+            self._coll_model = CollisionModel(self._coll_yaml_path)
+            self._coll_model.ground_z_mm = (
+                self._ground_z_mm if self._ground_check_enabled else None)
+            self.get_logger().info(
+                f'Self-collision guard MODEL loaded: '
+                f'{len(self._coll_model.capsules)} capsules, '
+                f'{len(self._coll_model.pairs)} pairs from '
+                f'{self._coll_yaml_path}  warn={self._coll_warn_mm:.0f}mm '
+                f'stop={self._coll_stop_mm:.0f}mm  '
+                f'ground_z={self._ground_z_mm:.0f}mm  '
+                f'runtime_active={self._coll_guard_active}')
+        except Exception as e:
+            self.get_logger().warn(
+                f'Self-collision guard model could not load '
+                f'{self._coll_yaml_path}: {e}')
+            self._coll_model = None
+        if not self._coll_guard_active:
+            self.get_logger().warn(
+                'Self-collision guard is DISABLED at startup. '
+                'ALL tiers (40 mm warn, 15 mm hard stop, ground plane) '
+                'are off — nothing in software prevents a link-on-link '
+                'or link-on-table crash. Operator-directed 2026-08-06.')
         # Latest guard telemetry — dashboard mirror reads these.
         self._coll_min_pair = None      # tuple (link_a, link_b) or None
         self._coll_min_dist_mm = None   # float or None
@@ -1008,6 +1035,16 @@ class EstunCodroidDriver(Node):
         # KEEP_LAST dropping the head. Depth 5 was too tight — grew to
         # 16 to match the dashboard publisher.
         self.create_subscription(String, '/estun/program', self._on_program_command, 16)
+
+        # 2026-08-06 (operator directive): runtime kill switch for the
+        # entire self-collision + ground-plane capsule guard. When
+        # False, every guard call site is a no-op. Boot state comes
+        # from the `collision_enabled` parameter (default False per
+        # the same directive); this topic lets the operator toggle
+        # without a driver restart. Payload is a plain std_msgs/Bool.
+        self.create_subscription(
+            Bool, '/robot/collision_guard_set',
+            self._on_collision_guard_set, 5)
 
         # ── Timers ─────────────────────────────────────────────
         self._mode_timer    = self.create_timer(1.0, self._publish_mode)
@@ -2013,7 +2050,8 @@ class EstunCodroidDriver(Node):
         # Cartesian is left permissive here — the σ_min governor + the
         # per-tick check handle it after motion begins.
         override_used = False
-        if (self._coll_model is not None and mode_s == 'joint'
+        if (self._coll_model is not None and self._coll_guard_active
+                and mode_s == 'joint'
                 and self._last_posture_ts > 0.0):
             try:
                 (pair, cur_min) = self._coll_model.min_distance_at(self._joint_deg)
@@ -2363,7 +2401,7 @@ class EstunCodroidDriver(Node):
         # the same reason string convention. Continuous jogs run the
         # per-tick guard in supervise; this pre-check is the discrete
         # counterpart so a "tap" can't jump us into contact.
-        if self._coll_model is not None:
+        if self._coll_model is not None and self._coll_guard_active:
             projected = list(self._joint_deg)
             projected[axis-1] = target_deg
             try:
@@ -2516,6 +2554,14 @@ class EstunCodroidDriver(Node):
         threshold — otherwise the operator gets wedged with every
         direction refused. Warning is issued regardless of direction.
         Caller must hold self._jog_lock."""
+        # 2026-08-06 kill switch — belt-and-braces gate. Callers
+        # also gate on `_coll_guard_active`; if any new caller
+        # forgets, the guard still stays silent.
+        if self._coll_model is None or not self._coll_guard_active:
+            self._coll_min_pair = None
+            self._coll_min_dist_mm = None
+            self._coll_warning_active = False
+            return False
         try:
             res = self._coll_model.evaluate(self._joint_deg)
         except Exception as e:
@@ -2977,7 +3023,7 @@ class EstunCodroidDriver(Node):
                 # REDUCING the min-pair distance. Uses a 40 ms look-ahead
                 # from the current joint velocity to project the next
                 # pose and re-evaluate.
-                if (self._coll_model is not None
+                if (self._coll_model is not None and self._coll_guard_active
                         and self._last_posture_ts > 0.0
                         and self._jog_mode in ('continuous', 'continuous_cart')):
                     if self._check_collision_locked():
@@ -4096,7 +4142,11 @@ class EstunCodroidDriver(Node):
         # keeps the posture callback under ~6 ms even at the J3=122°
         # fold. No stop action here; stops only fire in
         # _check_collision_locked (jog-active path).
-        if self._coll_model is not None:
+        # 2026-08-06: gated on _coll_guard_active so the "min
+        # clearance" chip goes blank when the guard is disabled —
+        # no clearance number to render when the guard isn't
+        # protecting anything.
+        if self._coll_model is not None and self._coll_guard_active:
             try:
                 res = self._coll_model.evaluate(self._joint_deg)
                 if res:
@@ -4331,7 +4381,14 @@ class EstunCodroidDriver(Node):
             # + `collision_min_mm` to render an amber/red tint on the two
             # offending links plus a live "min clearance" readout when
             # any pair is under 2× warn.
-            'collision_enabled':   self._coll_model is not None,
+            # `collision_enabled` reflects the RUNTIME kill switch,
+            # not whether the model file loaded. Frontend / event
+            # log key off this. Model-load status is
+            # `collision_model_loaded` (below).
+            'collision_enabled':      (self._coll_model is not None
+                                        and self._coll_guard_active),
+            'collision_model_loaded': self._coll_model is not None,
+            'collision_guard_active': bool(self._coll_guard_active),
             'collision_pair':      (list(self._coll_min_pair)
                                     if self._coll_min_pair else None),
             'collision_min_mm':    self._coll_min_dist_mm,
@@ -4444,6 +4501,44 @@ class EstunCodroidDriver(Node):
 
         s = String(); s.data = json.dumps(blob)
         self._pub_status.publish(s)
+
+    # ── Runtime kill switch for the self-collision guard ──
+    #
+    # 2026-08-06 (operator directive: entire self-collision system
+    # OFF). Flips `_coll_guard_active` in place. Every guard use
+    # site gates on it, so a False here immediately silences the
+    # tick evaluator, the pre-flight jog check, the cart-mode
+    # start guard, and the posture-time min-clearance publisher.
+    # Boot state comes from the `collision_enabled` parameter
+    # (default False). Sends a status blob immediately so the
+    # dashboard's event log records the exact ts of every toggle.
+
+    def _on_collision_guard_set(self, msg):
+        try:
+            new_active = bool(msg.data)
+        except Exception:
+            return
+        prev = self._coll_guard_active
+        if new_active == prev:
+            return
+        self._coll_guard_active = new_active
+        if new_active:
+            self.get_logger().info(
+                'Self-collision guard RE-ENABLED at runtime. Model was '
+                f'{"loaded" if self._coll_model else "NOT loaded (yaml missing)"}.')
+        else:
+            self.get_logger().warn(
+                'Self-collision guard DISABLED at runtime. ALL tiers '
+                '(40 mm warn, 15 mm hard stop, ground plane) are off. '
+                'Nothing in software prevents a link-on-link or link-'
+                'on-table crash.')
+        # Publish a fresh status blob so /estun/status carries the
+        # new state within one broadcast cycle. Dashboard event log
+        # writes on the transition.
+        try:
+            self._publish_status_blob()
+        except Exception as e:
+            self.get_logger().warn(f'status blob after guard toggle failed: {e}')
 
     # ── Shutdown ──────────────────────────────────────────
 
