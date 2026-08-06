@@ -1352,3 +1352,137 @@ def test_completeness_independent_approach_and_retract_distances():
     assert 'linear-up to pick_approach (retract 90mm)' in lua, (
         'retract distance must reach the linear-up comment')
 
+
+# ── 2026-08-06 (inline sub-step edit → regenerate ALL cycles) ─────
+#
+# The palletize expanded view lets the operator edit approach/retract
+# /safety_margin/vacuum/blow-off/seal_wait inline; the sub-steps stay
+# COMPOSER-GENERATED, so every cycle picks up the change deterministically.
+# These pins verify a single-field edit updates every cycle in the emit,
+# not just the first.
+
+
+def test_inline_edit_approach_distance_regenerates_all_cycles():
+    """Approach distance 50 → 75 mm on move_to_pallet propagates to
+    every cycle's linear-up + place_approach + retract comments."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 5
+    N = 5
+    for s in prog['steps']:
+        if s.get('action') == 'move_to_pallet':
+            s['approach_distance_mm'] = 75
+            s['retract_distance_mm']  = 75
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    # Header reflects the new distance.
+    assert 'approach=75mm' in lua, (
+        'expansion header must show approach=75mm after inline edit')
+    # Every cycle's linear-up comment says 75mm — not the default 50.
+    n_retract_pick = lua.count(
+        'linear-up to pick_approach (retract 75mm)')
+    n_retract_place = lua.count(
+        'linear-up to place_approach (retract 75mm)')
+    assert n_retract_pick == N, (
+        f'expected {N} pick-side retract comments at 75mm; got '
+        f'{n_retract_pick}')
+    assert n_retract_place == N, (
+        f'expected {N} place-side retract comments at 75mm; got '
+        f'{n_retract_place}')
+    # No cycle should still be quoting the old default 50mm.
+    assert 'retract 50mm' not in lua, (
+        'a cycle is still quoting retract 50mm after 50→75 edit')
+
+
+def test_inline_edit_safety_margin_regenerates_transit_z_per_cycle():
+    """safety_margin 50 → 200 mm raises transit_Z per layer by
+    +150 mm; every cycle emits the new absolute Z. Rule B still holds
+    (layer 1 > layer 0)."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 8
+    for s in prog['steps']:
+        if s.get('action') == 'move_to_pallet':
+            s['safety_margin_mm'] = 200
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    # Header transit height = layer_h(100) + safety_margin(200) = 300 mm
+    assert 'transit_h_above_slot=300mm' in lua, (
+        'expansion header must show 300mm transit height after '
+        '50→200 safety_margin edit')
+    assert 'safety_margin=200mm' in lua
+    # Layer 0 transit at 458.2mm; Layer 1 at 558.2mm (both +150 vs default).
+    import re
+    ls = set(re.findall(
+        r'traverse-over-slot \[\d+,\d+,(\d+)\] at transit_Z=([\d.]+)mm',
+        lua))
+    zs_by_layer = {}
+    for l, z in ls:
+        zs_by_layer.setdefault(int(l), float(z))
+    assert 0 in zs_by_layer and 1 in zs_by_layer
+    delta = zs_by_layer[1] - zs_by_layer[0]
+    layer_h = float(prog['config']['pallet']['layer_height_mm'])
+    assert abs(delta - layer_h) < 0.5, (
+        f'layer-1 transit_Z minus layer-0 transit_Z should equal '
+        f'layer_height ({layer_h}); got {delta:.2f}')
+
+
+def test_inline_edit_vacuum_port_routes_setDO_every_cycle():
+    """vacuum_port_do 2 → 9 routes every cycle's setDO ON+OFF to DO9."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 4
+    N = 4
+    for s in prog['steps']:
+        if s.get('action') == 'move_to_pallet':
+            s['vacuum_port_do'] = 9
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    import re
+    on = len(re.findall(r'^\s*setDO\(9\s*,\s*1\)\s', lua, re.MULTILINE))
+    off = len(re.findall(r'^\s*setDO\(9\s*,\s*0\)\s', lua, re.MULTILINE))
+    assert on == N and off == N, (
+        f'expected {N} setDO(9,1) + {N} setDO(9,0); got on={on} off={off}')
+    assert 'vacuum_port=DO9' in lua
+
+
+def test_inline_edit_seal_wait_regenerates_every_wait_comment():
+    """seal_wait_ms 500 → 750 lands in every cycle's wait comment."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 3
+    for s in prog['steps']:
+        if s.get('action') == 'move_to_pallet':
+            s['seal_wait_ms'] = 750
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    # 3 cycles × one seal wait = 3 wait(750) lines with 'seal wait 750 ms'
+    n = lua.count('seal wait 750 ms')
+    assert n == 3, f'expected 3 seal-wait comments at 750 ms; got {n}'
+
+
+def test_inline_edit_blow_off_from_none_to_set_adds_pulse_every_cycle():
+    """blow_off_port_do None → 4, pulse 100 ms → every cycle gains
+    the blow-off pulse (setDO(4,1) → wait(100) → setDO(4,0))."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 3
+    for s in prog['steps']:
+        if s.get('action') == 'move_to_pallet':
+            s['blow_off_port_do']  = 4
+            s['blow_off_pulse_ms'] = 100
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    N = 3
+    import re
+    starts = len(re.findall(
+        r'^\s*setDO\(4\s*,\s*1\)\s+--\s+.*blow-off pulse start',
+        lua, re.MULTILINE))
+    ends = len(re.findall(
+        r'^\s*setDO\(4\s*,\s*0\)\s+--\s+.*blow-off pulse end',
+        lua, re.MULTILINE))
+    pulses = lua.count('blow-off pulse 100 ms')
+    assert starts == N and ends == N and pulses == N, (
+        f'expected {N} blow-off pulse triples; got starts={starts} '
+        f'ends={ends} pulses={pulses}')
+

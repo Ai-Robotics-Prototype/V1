@@ -513,10 +513,80 @@ async function fetchTcpFromState() {
 // how the layer-shift works. It is NOT the real Lua — that lives on
 // the driver — but the labels and ordering mirror the codegen 1:1
 // (see program_ops.py::codegen_lua_from_program palletize branch).
-function PalletExpansionPreview({ step, palletCfg }) {
+// PalletSubStepInlineField — a compact numeric input that writes back
+// to `config.pallet.<key>` via the shared `onPatchPallet` handler
+// (the same target `PalletConfigEditor`'s Save uses). Kept minimal so
+// the sub-step row stays visually adjacent to the label; the modal is
+// the fuller edit surface. `unit` is displayed after the number
+// ('mm', 'ms', 'DO'). Blur commits; keydown Enter commits too.
+function PalletSubStepInlineField({
+  value, unit, min, max, onCommit, ariaLabel, testId, width = 68,
+  emptyMeansNull = false,
+}) {
+  const [draft, setDraft] = useState(value === null || value === undefined
+                                     ? '' : String(value))
+  // Sync when the outer value changes (e.g. modal edit landed).
+  useEffect(() => {
+    setDraft(value === null || value === undefined ? '' : String(value))
+  }, [value])
+  const commit = () => {
+    const t = String(draft).trim()
+    if (emptyMeansNull && t === '') { onCommit(null); return }
+    const n = Number(t)
+    if (!Number.isFinite(n)) { setDraft(String(value ?? '')); return }
+    let clamped = n
+    if (min !== undefined) clamped = Math.max(min, clamped)
+    if (max !== undefined) clamped = Math.min(max, clamped)
+    onCommit(clamped)
+    setDraft(String(clamped))
+  }
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+      <input
+        type="text"
+        inputMode="numeric"
+        value={draft}
+        onChange={(e) => setDraft(
+          emptyMeansNull ? e.target.value.replace(/[^0-9]/g, '')
+                         : e.target.value.replace(/[^0-9.-]/g, ''))}
+        onBlur={commit}
+        onKeyDown={(e) => { if (e.key === 'Enter') { e.currentTarget.blur() } }}
+        aria-label={ariaLabel}
+        data-testid={testId}
+        style={{
+          width, padding: '2px 6px', fontSize: 12,
+          fontFamily: 'var(--font-mono, monospace)',
+          border: '1px solid #cbd5e1', borderRadius: 4,
+          background: '#fff', color: '#0f172a',
+          textAlign: 'right',
+        }} />
+      {unit && (
+        <span style={{ fontSize: 11, color: '#64748b' }}>{unit}</span>
+      )}
+    </span>
+  )
+}
+
+// PalletExpansionPreview — nested styled sub-step rows for the parent
+// `move_to_pallet` row. Each sub-step renders with the same layout as
+// the top-level step rows (number + verb badge + label + optional
+// inline editable field). Shaded background + left indent visually
+// group the rows as a subroutine under the PALLET parent.
+//
+// EDITABILITY (operator directive 2026-08-06): fields on relevant sub-
+// step rows write to `config.pallet.<key>` through the SAME
+// `onPatchPallet` handler `PalletConfigEditor.onSave` uses. Fields are
+// grid-parameters (approach distance, retract, safety margin, vacuum
+// port, seal wait, blow-off port + pulse), NOT free-hand pose edits —
+// the sub-steps stay COMPOSER-GENERATED so one edit updates every
+// cycle deterministically. Regeneration goes through the shared
+// `regenerateMoveToPalletSteps` so all cycles reflect the change.
+function PalletExpansionPreview({ step, palletCfg, onPatchPallet }) {
   const grip = String(step?.gripper_type || 'vacuum').toLowerCase()
-  const vacPort = step?.vacuum_port_do ?? palletCfg?.vacuum_port_do ?? 2
-  const blowPort = (step?.blow_off_port_do ?? palletCfg?.blow_off_port_do ?? null)
+  const vacPort = Number(step?.vacuum_port_do ?? palletCfg?.vacuum_port_do ?? 2)
+  const blowPortRaw = (step?.blow_off_port_do ?? palletCfg?.blow_off_port_do)
+  const blowPort = (blowPortRaw === null || blowPortRaw === undefined
+                    || blowPortRaw === '') ? null : Number(blowPortRaw)
   const blowPulse = Number(step?.blow_off_pulse_ms ?? palletCfg?.blow_off_pulse_ms ?? 300)
   const seal = Number(step?.seal_wait_ms ?? palletCfg?.seal_wait_ms ?? 500)
   const approach = Number(step?.approach_distance_mm ?? palletCfg?.approach_distance_mm ?? 50)
@@ -532,66 +602,245 @@ function PalletExpansionPreview({ step, palletCfg }) {
     capacity))
   const pickTaught  = Array.isArray(step?.pick_approach_joints)  && step.pick_approach_joints.length === 6
   const placeTaught = Array.isArray(step?.place_approach_joints) && step.place_approach_joints.length === 6
-  const rowSty = { display: 'flex', gap: 8, alignItems: 'baseline',
-                   padding: '2px 6px', fontSize: 11,
-                   fontFamily: 'var(--font-mono, monospace)',
-                   color: '#0f172a' }
-  const numSty = { color: '#94a3b8', minWidth: 24, textAlign: 'right' }
-  const kindSty = { fontWeight: 700, color: '#0369A1', minWidth: 80 }
-  const lines = [
-    ['movJ',   `pick_approach — ${pickTaught ? 'taught' : `axis-offset ${approach}mm along -pick_tool_Z`}`],
-    ['movL',   'linear-down → pick contact (fixed taught pose)'],
-    ['setDO',  `vacuum ON  (DO${vacPort} = 1)`],
-    ['wait',   `seal wait  (${seal} ms)`],
-    ['movL',   `linear-up → pick_approach (retract ${retract}mm)`],
-    ['movL',   `transit_Z above pick (layer L's transit_Z = slot_Z(L) + ${layerH}+${margin}mm)`],
-    ['movL',   `traverse-over-slot at transit_Z (X,Y of slot[r,c,L])`],
-    ['movL',   `place_approach — ${placeTaught ? `taught + layer×${layerH}mm lift` : `axis-offset ${approach}mm along -slot_tool_Z`}`],
-    ['movL',   'linear-down → slot contact (place)'],
-    ['setDO',  `vacuum OFF  (DO${vacPort} = 0)`],
-  ]
-  if (blowPort !== null && blowPort !== undefined && String(blowPort) !== '') {
-    lines.push(['setDO', `blow-off pulse start (DO${blowPort} = 1)`])
-    lines.push(['wait',  `blow-off pulse  (${blowPulse} ms)`])
-    lines.push(['setDO', `blow-off pulse end   (DO${blowPort} = 0)`])
+
+  // Verb badge palette matches TAG_COLORS to keep the sub-steps
+  // visually consistent with the top-level rows.
+  const VERB_COLOR = {
+    movJ:  TAG_COLORS.MOVE,     // #2563EB
+    movL:  TAG_COLORS.PLACE,    // #0891b2
+    setDO: TAG_COLORS.IO,       // #f97316
+    wait:  TAG_COLORS.WAIT,     // #6b7280
   }
-  lines.push(['movL', `linear-up → place_approach (retract ${retract}mm)`])
-  lines.push(['movL', `transit_Z above slot (over slot at transit_Z; ready for next cycle)`])
+  const patch = (key, val) => {
+    if (!onPatchPallet) return
+    onPatchPallet({ [key]: val })
+  }
+
+  // Build the per-cycle sub-steps. Each entry:
+  //   {verb, label, field?} where field is an optional inline input.
+  const substeps = [
+    { verb: 'movJ',
+      label: pickTaught
+        ? 'Approach pick pose (taught angle)'
+        : 'Approach pick pose',
+      detail: pickTaught
+        ? 'linear from taught angle onto contact'
+        : 'axis-offset along pick tool_Z',
+      field: !pickTaught ? {
+        label: 'approach', value: approach, unit: 'mm', min: 0, max: 500,
+        testId: 'pallet-substep-approach-mm',
+        onCommit: (v) => patch('approach_distance_mm', v),
+      } : null,
+    },
+    { verb: 'movL', label: 'Linear down to pick contact',
+      detail: 'from approach → taught pick pose' },
+    { verb: 'setDO', label: 'Vacuum ON',
+      detail: `DO${vacPort} = 1`,
+      field: { label: 'DO', value: vacPort, unit: '', min: 0, max: 63,
+               width: 42,
+               testId: 'pallet-substep-vacuum-port-do',
+               onCommit: (v) => patch('vacuum_port_do', v) } },
+    { verb: 'wait', label: 'Wait for vacuum seal',
+      detail: `${seal} ms dwell after vacuum ON`,
+      field: { label: 'ms', value: seal, unit: 'ms', min: 0, max: 5000,
+               testId: 'pallet-substep-seal-wait-ms',
+               onCommit: (v) => patch('seal_wait_ms', v) } },
+    { verb: 'movL', label: 'Linear up (retract) to pick approach',
+      detail: `retract along pick tool_Z`,
+      field: { label: 'retract', value: retract, unit: 'mm',
+               min: 0, max: 500,
+               testId: 'pallet-substep-retract-mm',
+               onCommit: (v) => patch('retract_distance_mm', v) } },
+    { verb: 'movL', label: 'Lift to transit_Z above pick',
+      detail: `slot_Z(layer) + layer_h(${layerH}) + safety_margin`,
+      field: { label: 'safety_margin', value: margin, unit: 'mm',
+               min: 0, max: 500,
+               testId: 'pallet-substep-safety-margin-mm',
+               onCommit: (v) => patch('safety_margin_mm', v) } },
+    { verb: 'movL', label: 'Traverse over slot at transit_Z',
+      detail: 'X,Y of slot[r,c,layer]' },
+    { verb: 'movL',
+      label: placeTaught
+        ? 'Approach place pose (taught angle, layer-shifted)'
+        : 'Approach place pose (per layer)',
+      detail: placeTaught
+        ? `taught + layer × ${layerH} mm lift along plane normal`
+        : `axis-offset along slot tool_Z; rises per layer`,
+      // approach and retract are shared with the pick side; edits
+      // propagate to BOTH linear-up/down on each cycle.
+      field: !placeTaught ? {
+        label: 'approach', value: approach, unit: 'mm', min: 0, max: 500,
+        testId: 'pallet-substep-place-approach-mm',
+        onCommit: (v) => patch('approach_distance_mm', v),
+      } : null,
+    },
+    { verb: 'movL', label: 'Linear down to slot (place)',
+      detail: 'from place approach → slot pose' },
+    { verb: 'setDO', label: 'Vacuum OFF (release)',
+      detail: `DO${vacPort} = 0`,
+      // Same field object as vacuum ON — one write, both rows reflect.
+      field: { label: 'DO', value: vacPort, unit: '', min: 0, max: 63,
+               width: 42,
+               testId: 'pallet-substep-vacuum-port-do-off',
+               onCommit: (v) => patch('vacuum_port_do', v) } },
+  ]
+  if (blowPort !== null) {
+    substeps.push({ verb: 'setDO',
+      label: 'Blow-off pulse start',
+      detail: `DO${blowPort} = 1`,
+      field: { label: 'DO', value: blowPort, unit: '', min: 0, max: 63,
+               width: 42,
+               testId: 'pallet-substep-blow-port-do',
+               onCommit: (v) => patch('blow_off_port_do', v),
+               emptyMeansNull: true } })
+    substeps.push({ verb: 'wait',
+      label: 'Blow-off pulse',
+      detail: `${blowPulse} ms pulse to eject part`,
+      field: { label: 'pulse', value: blowPulse, unit: 'ms',
+               min: 0, max: 5000,
+               testId: 'pallet-substep-blow-pulse-ms',
+               onCommit: (v) => patch('blow_off_pulse_ms', v) } })
+    substeps.push({ verb: 'setDO',
+      label: 'Blow-off pulse end',
+      detail: `DO${blowPort} = 0` })
+  }
+  substeps.push({ verb: 'movL',
+    label: 'Linear up (retract) to place approach',
+    detail: 'retract along slot tool_Z' })
+  substeps.push({ verb: 'movL',
+    label: 'Lift to transit_Z above slot',
+    detail: 'ready for next cycle (or return home)' })
+
   return (
     <div
       data-testid="pallet-expansion-preview"
       style={{
-        marginTop: 6, marginBottom: 4, marginLeft: 220,
-        padding: '10px 12px',
-        background: '#f8fafc',
-        border: '1px dashed #cbd5e1', borderRadius: 6,
-        fontSize: 11, color: '#334155',
+        // Nest under the parent PALLET row: indent + shaded tint that
+        // matches the PALLET tag color (#0f766e) so the operator
+        // reads the block as "children of step 7".
+        marginTop: 4, marginBottom: 8,
+        marginLeft: 40,
+        padding: '10px 12px 6px 12px',
+        background: 'rgba(204, 251, 241, 0.5)',  // #ccfbf1 @ 50%
+        borderLeft: '3px solid ' + TAG_COLORS.PALLET,
+        borderRadius: '0 8px 8px 0',
       }}>
-      <div style={{ marginBottom: 6, fontSize: 11, fontWeight: 700,
-                    color: '#0f766e', letterSpacing: 0.4 }}>
-        PER-CYCLE TEMPLATE  ·  {partCount} cycle(s) of {capacity} capacity
-        · gripper={grip}
+      <div style={{
+        display: 'flex', alignItems: 'baseline', gap: 8,
+        marginBottom: 6, paddingLeft: 4,
+      }}>
+        <span style={{
+          fontSize: 10, fontWeight: 700, color: TAG_COLORS.PALLET,
+          letterSpacing: 0.5, textTransform: 'uppercase',
+        }}>
+          Palletize subroutine — {partCount}× per-cycle template
+        </span>
+        <span style={{ fontSize: 11, color: '#475569' }}>
+          {`(${rows}×${cols}×${layers} grid, gripper=${grip}) — edits `}
+          <em>regenerate all cycles</em>
+        </span>
       </div>
-      {lines.map(([kind, text], i) => (
-        <div key={i} style={rowSty}>
-          <span style={numSty}>{String(i + 1).padStart(2, ' ')}.</span>
-          <span style={kindSty}>{kind}</span>
-          <span>{text}</span>
+      {substeps.map((s, i) => (
+        <div
+          key={i}
+          data-testid="pallet-substep-row"
+          style={{
+            display: 'flex', alignItems: 'center', gap: 12,
+            padding: '8px 12px',
+            marginBottom: 3, borderRadius: 6,
+            background: '#fff',
+            border: '1px solid #d1fae5',
+            boxSizing: 'border-box',
+          }}>
+          {/* LEFT — indented number + verb badge (same width as parent
+              row's LEFT column but slightly narrower to signal
+              nesting). */}
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            flexShrink: 0, width: 172,
+          }}>
+            <div style={{
+              width: 26, height: 26, borderRadius: '50%',
+              background: '#e0f2fe', color: '#075985',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 11, fontWeight: 700, flexShrink: 0,
+            }}>
+              7.{i + 1}
+            </div>
+            <span style={{
+              fontSize: 10, fontWeight: 700,
+              padding: '2px 6px', borderRadius: 4,
+              color: '#fff',
+              background: VERB_COLOR[s.verb] || '#64748b',
+              letterSpacing: 0.5, textTransform: 'uppercase',
+              fontFamily: 'var(--font-mono, monospace)',
+              minWidth: 42, textAlign: 'center',
+            }}>
+              {s.verb}
+            </span>
+          </div>
+          {/* MIDDLE — label + detail, mirrors parent row's title/detail. */}
+          <div style={{
+            flex: '1 1 0', minWidth: 0,
+            display: 'flex', flexDirection: 'column', gap: 2,
+          }}>
+            <div style={{
+              fontSize: 13, fontWeight: 500, color: '#111',
+              lineHeight: 1.3,
+            }}>
+              {s.label}
+            </div>
+            {s.detail && (
+              <div style={{
+                fontSize: 11, color: '#64748b', lineHeight: 1.3,
+              }}>
+                {s.detail}
+              </div>
+            )}
+          </div>
+          {/* RIGHT — optional inline editable field. */}
+          {s.field && (
+            <div style={{
+              flexShrink: 0, display: 'flex', alignItems: 'center',
+              gap: 6,
+            }}>
+              <span style={{
+                fontSize: 10, color: '#0f766e', fontWeight: 700,
+                letterSpacing: 0.4, textTransform: 'uppercase',
+              }}>
+                {s.field.label}
+              </span>
+              <PalletSubStepInlineField
+                value={s.field.value}
+                unit={s.field.unit}
+                min={s.field.min}
+                max={s.field.max}
+                width={s.field.width}
+                onCommit={s.field.onCommit}
+                emptyMeansNull={s.field.emptyMeansNull}
+                ariaLabel={s.field.testId}
+                testId={s.field.testId} />
+            </div>
+          )}
         </div>
       ))}
-      <div style={{ marginTop: 6, fontSize: 11, color: '#475569',
-                    lineHeight: 1.4 }}>
-        Rule B: transit_Z(layer) = slot_Z(layer) + {layerH} + {margin} mm
-        along the frame normal. Because slot_Z rises by layer_height
-        per layer, transit_Z rises with it — a layer-{Math.max(0, layers - 1)}
-        placement approaches from above layer {Math.max(0, layers - 1)}
-        and never dips to a lower layer's Z.
+      <div style={{
+        marginTop: 6, paddingLeft: 4,
+        fontSize: 11, color: '#475569', lineHeight: 1.4,
+      }}>
+        <strong>Rule B:</strong> transit_Z(layer) = slot_Z(layer) +{' '}
+        {layerH} + {margin} mm along the frame normal. Layer{' '}
+        {Math.max(0, layers - 1)} approaches from above layer{' '}
+        {Math.max(0, layers - 1)} — never dips to a lower layer.
       </div>
-      <div style={{ marginTop: 4, fontSize: 11, color: '#64748b',
-                    fontStyle: 'italic' }}>
-        Read-only inspection. Edit the boxed fields via the pallet
-        Edit modal — this preview reflects the codegen 1:1 (see
-        program_ops.py::codegen_lua_from_program palletize branch).
+      <div style={{
+        marginTop: 3, paddingLeft: 4,
+        fontSize: 11, color: '#64748b', fontStyle: 'italic',
+      }}>
+        Fields above edit the pallet config directly — one edit
+        regenerates every cycle. For grid, spacing, and taught
+        approach poses, use the full <strong>Edit</strong> modal on
+        step 7.
       </div>
     </div>
   )
@@ -3932,6 +4181,69 @@ export default function ProgramEditor() {
   const clearProgramChangedByOther            = useStore((s) => s.clearProgramChangedByOther)
   const refreshCurrentProgram                 = useStore((s) => s._refreshCurrentProgram)
   const addToast                              = useStore((s) => s.addToast)
+
+  // 2026-08-06 (operator directive — palletize expanded view editable).
+  // ONE canonical write path for pallet config edits. Called by both
+  // the `PalletConfigEditor` modal (whole-config Save) and the inline
+  // sub-step fields in `PalletExpansionPreview` (single-field patches).
+  //
+  // Contract: patch is either a full pallet config bundle
+  //   {pallet, pallet_mode, source, speed_pct, ...}
+  // or a partial per-field update
+  //   {approach_distance_mm: 75}, {vacuum_port_do: 7}, ...
+  // Partial patches are merged into `config.pallet.*`. Full patches
+  // (with a `pallet` key) go through the same merge the modal used.
+  //
+  // Every commit regenerates the move_to_pallet step's fanned-out
+  // fields via regenerateMoveToPalletSteps → one edit, ALL cycles
+  // update deterministically. Sub-steps stay generated (never
+  // free-hand edited) so composer integrity holds.
+  const commitPalletPatch = useCallback((patch) => {
+    if (!patch || typeof patch !== 'object') return
+    const cfgNow = currentProgram.config || {}
+    const palletNow = cfgNow.pallet || {}
+    // Detect the shape: is this a whole-config bundle (has a `pallet`
+    // key) or a partial per-field update?
+    let nextPallet
+    let extraCfgFields = {}
+    let palletMode = cfgNow.pallet_mode
+    if (patch.pallet && typeof patch.pallet === 'object') {
+      nextPallet = { ...palletNow, ...patch.pallet }
+      // Bundle from the modal — also copies mode/source/speed_pct.
+      if (patch.pallet_mode !== undefined) palletMode = patch.pallet_mode
+      for (const k of ['pallet_mode', 'source', 'speed_pct']) {
+        if (patch[k] !== undefined) extraCfgFields[k] = patch[k]
+      }
+      // Legacy pallet_* mirror keys (kept identical to the modal
+      // path so wizard Review round-trips still match).
+      extraCfgFields.pallet_rows           = nextPallet.rows
+      extraCfgFields.pallet_cols           = nextPallet.cols
+      extraCfgFields.pallet_layers         = nextPallet.layers
+      extraCfgFields.pallet_spacing_x_mm   = nextPallet.spacing_x_mm
+      extraCfgFields.pallet_spacing_y_mm   = nextPallet.spacing_y_mm
+      extraCfgFields.pallet_layer_height_mm = nextPallet.layer_height_mm
+      extraCfgFields.pallet_fill_order     = nextPallet.fill_order
+      extraCfgFields.pallet_approach_height_mm = nextPallet.approach_height_mm
+      extraCfgFields.pallet_retract_height_mm  = nextPallet.retract_height_mm
+    } else {
+      // Partial per-field patch from the inline sub-step editor.
+      nextPallet = { ...palletNow, ...patch }
+    }
+    const nextConfig = {
+      ...cfgNow,
+      ...extraCfgFields,
+      pallet: nextPallet,
+      operation: 'palletize',
+    }
+    const regen = regenerateMoveToPalletSteps(steps, nextPallet, palletMode)
+    setCurrentProgram({
+      config:  nextConfig,
+      steps:   renumber(regen),
+      unsaved: true,
+    })
+    addToast?.('Pallet config updated — Save to persist', 'success')
+  }, [currentProgram, steps, setCurrentProgram, addToast])
+
   // Teach-session record-through actions (2026-08-04). The
   // ProgramEditor reads these to POST every Record to the Jetson
   // BEFORE mutating local state; see teachOverlayRecord +
@@ -6083,6 +6395,7 @@ export default function ProgramEditor() {
                 <PalletExpansionPreview
                   step={step}
                   palletCfg={currentProgram?.config?.pallet || {}}
+                  onPatchPallet={commitPalletPatch}
                 />
               )}
 
@@ -6244,39 +6557,7 @@ export default function ProgramEditor() {
       {editingPallet && (
         <PalletConfigEditor
           config={currentProgram.config || {}}
-          onSave={(patch) => {
-            // patch carries pallet / pallet_mode / source / speed_pct +
-            // optional pick_tcp / place_tcp. Merge into program.config,
-            // then regenerate the move_to_pallet + pallet loop steps
-            // so the runtime motion reflects edited grid / spacing /
-            // fill order. Taught poses on other steps stay intact.
-            const nextConfig = {
-              ...(currentProgram.config || {}),
-              ...patch,
-              operation: 'palletize',
-            }
-            // Mirror the typed pallet config back to the legacy
-            // pallet_* answer keys so the wizard's Review path stays
-            // consistent if the operator ever round-trips through it.
-            if (patch.pallet) {
-              nextConfig.pallet_rows           = patch.pallet.rows
-              nextConfig.pallet_cols           = patch.pallet.cols
-              nextConfig.pallet_layers         = patch.pallet.layers
-              nextConfig.pallet_spacing_x_mm   = patch.pallet.spacing_x_mm
-              nextConfig.pallet_spacing_y_mm   = patch.pallet.spacing_y_mm
-              nextConfig.pallet_layer_height_mm = patch.pallet.layer_height_mm
-              nextConfig.pallet_fill_order     = patch.pallet.fill_order
-              nextConfig.pallet_approach_height_mm = patch.pallet.approach_height_mm
-              nextConfig.pallet_retract_height_mm  = patch.pallet.retract_height_mm
-            }
-            const regen = regenerateMoveToPalletSteps(steps, patch.pallet, patch.pallet_mode)
-            setCurrentProgram({
-              config:  nextConfig,
-              steps:   renumber(regen),
-              unsaved: true,
-            })
-            addToast?.('Pallet config updated — Save to persist', 'success')
-          }}
+          onSave={commitPalletPatch}
           onClose={() => setEditingPallet(false)}
         />
       )}
