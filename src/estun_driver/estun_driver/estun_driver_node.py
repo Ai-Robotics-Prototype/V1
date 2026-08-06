@@ -619,7 +619,17 @@ class EstunCodroidDriver(Node):
         self._env_warn_mm    = float(self.get_parameter('env_warn_distance_mm').value)
         self._env_stop_mm    = float(self.get_parameter('env_stop_distance_mm').value)
         self._coll_yaml_path = str(self.get_parameter('collision_capsules_yaml').value)
+        # 2026-08-06 (operator directive): env override for the
+        # single-authoritative kill switch. Mirrors ESTUN_ALLOW_IO /
+        # ESTUN_ALLOW_POWER precedence — env wins over YAML so
+        # systemd can retarget without a rebuild. Values: 1/true/
+        # yes/on → enabled, anything else → disabled.
         self._coll_enabled   = bool(self.get_parameter('collision_enabled').value)
+        self._coll_enabled_source = 'param'
+        _env_coll = os.environ.get('COLLISION_ENABLED')
+        if _env_coll is not None:
+            self._coll_enabled = _env_coll.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._coll_enabled_source = 'COLLISION_ENABLED'
         self._ground_z_mm    = float(self.get_parameter('ground_z_mm').value)
         self._ground_check_enabled = bool(self.get_parameter('ground_check_enabled').value)
         self._coll_fallback_frac = float(self.get_parameter('collision_fallback_speed_frac').value)
@@ -833,7 +843,8 @@ class EstunCodroidDriver(Node):
             self._coll_model = None
         if not self._coll_guard_active:
             self.get_logger().warn(
-                'Self-collision guard is DISABLED at startup. '
+                'Self-collision guard is DISABLED at startup '
+                f'(source: {self._coll_enabled_source}). '
                 'ALL tiers (40 mm warn, 15 mm hard stop, ground plane) '
                 'are off — nothing in software prevents a link-on-link '
                 'or link-on-table crash. Operator-directed 2026-08-06.')
