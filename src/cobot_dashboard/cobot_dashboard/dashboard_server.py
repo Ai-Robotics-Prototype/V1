@@ -7562,15 +7562,17 @@ if FASTAPI_AVAILABLE:
         #   * if latest is `building` OR `start` → state = 'deploying'
         latest = entries[-1]
         phase = latest.get("phase")
-        # 2026-08-06 (silent-frontend-rebuild-skip class): map the new
-        # `frontend_stale` phase to state=failed so the DeployStatusBanner
-        # renders a red banner. This phase fires when the frontend
-        # source hash advanced but vite did not produce a new asset —
-        # every open tab sees the stale bundle until the next commit.
+        # 2026-08-06 (silent-frontend-rebuild-skip class, refined
+        # per operator directive to a WARNING rather than FAILED):
+        # phase=frontend_stale maps to a new state='stale' which the
+        # DeployStatusBanner renders as an amber warning. Build
+        # succeeded and the disk is healthy — the served asset just
+        # didn't advance for a commit that touched frontend/src.
+        # Distinct from state='failed' (deploy actually broke).
         state = {
             "ok":              "current",
             "fail":            "failed",
-            "frontend_stale":  "failed",
+            "frontend_stale":  "stale",
             "waiting":         "waiting",
             "building":        "deploying",
             "start":           "deploying",

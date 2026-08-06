@@ -121,27 +121,39 @@ after="${after#/assets/index-}"
 after="${after%.js}"
 end_ts=$(date +%s)
 if [[ $code -eq 0 ]]; then
+    # 2026-08-06 (silent-frontend-rebuild-skip class — WATCHER
+    # REPORTING ONLY, operator directive). Read-only guard: if this
+    # commit touched any file under frontend/src/ AND the served
+    # asset hash did NOT advance, promote phase=ok to
+    # phase=frontend_stale. This does NOT retry, does NOT block, and
+    # does NOT alter the build itself; it just annotates the log
+    # entry so /api/deploy_status can surface an amber warning
+    # instead of a silent green "ok". The `last_ok` compare is
+    # relative to the PREVIOUS commit (HEAD^..HEAD) because that's
+    # the delta this deploy corresponds to.
+    frontend_touched=0
+    if git -C "$WS" rev-parse HEAD^ >/dev/null 2>&1; then
+        if git -C "$WS" diff --name-only HEAD^..HEAD 2>/dev/null \
+                | grep -q '^src/cobot_dashboard/frontend/src/'; then
+            frontend_touched=1
+        fi
+    fi
+    if (( frontend_touched == 1 )) \
+            && [[ -n "$before" && "$before" == "$after" ]]; then
+        log_entry "frontend_stale" \
+            served_asset_before="${before:-unknown}" \
+            served_asset_after="${after:-unknown}" \
+            duration_s="$((end_ts - start_ts))" \
+            detail="frontend/src changed since prior commit but served asset hash did not advance; see $run_log"
+        # Watcher-only reporting: still exit 0. The deploy itself
+        # succeeded; this is a heads-up, not a failure.
+        exit 0
+    fi
     log_entry "ok" \
         served_asset_before="${before:-unknown}" \
         served_asset_after="${after:-unknown}" \
         duration_s="$((end_ts - start_ts))"
     exit 0
-elif [[ $code -eq 3 ]]; then
-    # 2026-08-06 (silent-frontend-rebuild-skip class, operator
-    # directive). deploy.sh exit code 3 = FRONTEND_STALE: source
-    # hash advanced but the served asset did NOT change. Emit
-    # phase=frontend_stale so /api/deploy_status can escalate the
-    # banner to red — this class was silently passing before and
-    # served the old UI to every open tab.
-    step=$(grep -oE 'FRONTEND_STALE[^)]*' "$run_log" | head -1)
-    log_entry "frontend_stale" \
-        step="${step:-frontend_stale}" \
-        exit_code="$code" \
-        served_asset_before="${before:-unknown}" \
-        served_asset_after="${after:-unknown}" \
-        duration_s="$((end_ts - start_ts))" \
-        detail="see $run_log; frontend source changed but vite did not advance the asset hash"
-    exit "$code"
 else
     # Best-effort: pull the first FAIL line from deploy.sh output so
     # the UI banner shows a specific failing step.

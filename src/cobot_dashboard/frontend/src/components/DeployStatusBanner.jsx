@@ -72,6 +72,20 @@ export default function DeployStatusBanner() {
     bg = '#78350F'; fg = '#FEF3C7'; border = '#F59E0B'
     label = '⏱ deploy waiting for idle'
     title = 'Arm is jogging or running a program; deploy will fire once idle.'
+  } else if (state === 'stale') {
+    // 2026-08-06 (silent-frontend-rebuild-skip class): the last
+    // commit touched frontend/src but the served asset hash did
+    // NOT advance. Build itself succeeded; the tab is running an
+    // old bundle. Amber warning — actionable, not "everything is
+    // broken".
+    bg = '#78350F'; fg = '#FEF3C7'; border = '#F59E0B'
+    const beforeHash = latest.served_asset_before || '?'
+    const afterHash  = latest.served_asset_after || '?'
+    label = `⚠ frontend stale — ${beforeHash} → ${afterHash} unchanged`
+    title = latest.detail
+      ? `${latest.detail} (this tab is running the OLD bundle; force-reload to check)`
+      : 'Frontend source changed since the last deploy but the served ' +
+        'asset hash did not advance. This tab is running the OLD bundle.'
   } else if (state === 'failed') {
     bg = '#7F1D1D'; fg = '#FEE2E2'; border = '#DC2626'
     const step = latest.step || 'unknown step'
