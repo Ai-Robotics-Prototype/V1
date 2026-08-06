@@ -5,6 +5,7 @@ import StandaloneRobot from '../components/StandaloneRobot'
 import JointJogPanel from '../components/JointJogPanel'
 import JogControls from '../components/JogControls'
 import IKGizmo from '../components/IKGizmo'
+import ArmEnableControl from '../components/ArmEnableControl'
 
 // The 3D View tab hosts three separate jog surfaces:
 //   • JointJogPanel  (right-dock sliders, TWIN ONLY)  — no wire traffic.
@@ -103,90 +104,11 @@ function LeftPanel({ armRef }) {
 
 // The chrome that wraps JogControls when it's docked (NORMAL) or
 // expanded (EXPANDED). The 2026-08-06 operator directive retires the
-// full-width red REAL ARM band in favor of a COMPACT STATUS CHIP that
-// shows the arm state and an Enable/Disable toggle. The chip sits in
-// normal layout flow — NOT overlaying the jog panel — so the pendant
-// grid gets the full width the pad expects. Safety behavior of the
-// enable gate is preserved: the toggle uses the SAME sendPowerCommand
-// path JogControls uses and requires a window.confirm() before
-// dispatching, mirroring the JogControls modal's copy exactly.
-function RealArmStatusChip() {
-  const robot = useStore((s) => s.robot) || {}
-  const sendPowerCommand = useStore((s) => s.sendPowerCommand)
-  const enabled  = !!robot.enabled
-  const enabling = !!robot.enabling
-  const alarm    = !!robot.alarm
-  const allowPower = !!robot.allow_power
-  const jogActive  = !!robot.jog_active
-  // Terse state label. Priority: ALARM > ENABLING > JOG (active hold)
-  // > controller state_name > ENABLED > DISABLED.
-  const stateLabel =
-      alarm    ? 'ALARM'
-    : enabling ? 'ENABLING'
-    : (enabled && jogActive)
-             ? `JOG J${robot.jog_index ?? '?'}${robot.jog_direction > 0 ? '+' : robot.jog_direction < 0 ? '−' : ''}`
-    : enabled  ? (robot.state_name || 'READY')
-    :            'DISABLED'
-  const stateColor =
-      alarm    ? '#B91C1C'
-    : enabling ? '#D97706'
-    : enabled  ? '#059669'
-    :            '#6b7280'
-  const wantEnable = !enabled
-  const canToggle  = allowPower && !enabling
-  const onTogglePower = () => {
-    if (!canToggle) return
-    const msg = wantEnable
-      ? 'Enable robot power?\n\nEnsure the cell is clear before applying servo power.'
-      : 'Disable robot power?\n\nServo power will drop. Any active motion is stopped first.'
-    // Same confirmation invariant as the JogControls modal — plain
-    // window.confirm is enough for a safety gate; the operator can't
-    // accidentally click through it.
-    // eslint-disable-next-line no-alert
-    if (window.confirm(msg)) {
-      sendPowerCommand?.(wantEnable ? 'enable' : 'disable')
-    }
-  }
-  return (
-    <div style={{
-      display: 'inline-flex', alignItems: 'center', gap: 6,
-      background: 'rgba(127, 29, 29, 0.08)',
-      border: '1px solid ' + REAL_ARM_RED,
-      borderRadius: 6, padding: '3px 8px',
-      fontSize: 11, fontWeight: 700, letterSpacing: '0.06em',
-      color: REAL_ARM_RED, textTransform: 'uppercase',
-      minHeight: 26,
-    }}>
-      <span>REAL ARM</span>
-      <span style={{
-        width: 6, height: 6, borderRadius: '50%',
-        background: stateColor,
-        boxShadow: `0 0 4px ${stateColor}`,
-      }} />
-      <span style={{ color: stateColor }}>{stateLabel}</span>
-      <button
-        onClick={onTogglePower}
-        disabled={!canToggle}
-        title={enabled
-          ? (allowPower ? 'Disable robot power' : 'Power gate closed — pendant only')
-          : (allowPower ? 'Enable robot power'  : 'Power gate closed — pendant only')}
-        style={{
-          marginLeft: 4, padding: '2px 8px', minHeight: 22,
-          fontSize: 10, fontWeight: 700, letterSpacing: '0.06em',
-          textTransform: 'uppercase',
-          border: '1px solid ' + REAL_ARM_RED,
-          borderRadius: 4,
-          background: enabled ? '#fff' : REAL_ARM_RED,
-          color:      enabled ? REAL_ARM_RED : '#fff',
-          cursor: canToggle ? 'pointer' : 'not-allowed',
-          opacity: canToggle ? 1 : 0.5,
-        }}>
-        {enabled ? 'Disable' : 'Enable'}
-      </button>
-    </div>
-  )
-}
-
+// full-width red REAL ARM band in favor of the shared
+// <ArmEnableControl /> chip (fork registry: arm_enable_control) —
+// the ONE canonical arm-enable surface, rendered here AND on the
+// Monitor page so toggling in either reflects live in the other via
+// the shared useStore state.
 function RealArmChrome({ mode, setMode, children }) {
   const isExpanded = mode === 'EXPANDED'
   return (
@@ -209,7 +131,7 @@ function RealArmChrome({ mode, setMode, children }) {
         background: 'var(--bg-panel)',
         borderBottom: '1px solid var(--border)',
       }}>
-        <RealArmStatusChip />
+        <ArmEnableControl />
         <div style={{ display: 'flex', gap: 6 }}>
           <button
             onClick={() => setMode('MINIMIZED')}

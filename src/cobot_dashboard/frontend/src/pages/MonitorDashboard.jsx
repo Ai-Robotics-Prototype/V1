@@ -10,6 +10,7 @@ import RunProgramModal from '../components/RunProgramModal'
 import ProgramErrorModal from '../components/ProgramErrorModal'
 import StepPreviewPanel from '../components/StepPreviewPanel'
 import RecentRunsCard from '../components/RecentRunsCard'
+import ArmEnableControl from '../components/ArmEnableControl'
 import { deriveRunState, isStopButtonEnabled,
          isStuckStopping as _computeStuckStopping,
          isStateStreamStale as _computeStreamStale,
@@ -1233,6 +1234,17 @@ export default function MonitorDashboard() {
               </button>
             </div>
           )}
+
+          {/* Arm enable/disable — shared control (fork registry:
+              arm_enable_control). SAME component the 3D View renders,
+              SAME useStore selectors — toggling here reflects live on
+              3D View and vice versa. Placed right above the Run/Stop
+              row so the operator sees the arm's power state before
+              committing to motion. */}
+          <div style={{ display: 'flex', gap: 10, marginTop: 16,
+                        flexWrap: 'wrap', alignItems: 'center' }}>
+            <ArmEnableControl />
+          </div>
 
           <div style={{ display: 'flex', gap: 10, marginTop: 20, flexWrap: 'wrap' }}>
             {/* STOP — prominent, always visible when the program is in

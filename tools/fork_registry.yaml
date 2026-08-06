@@ -172,6 +172,45 @@ capabilities:
           - '**/*.test.js'
     known_debt: []
 
+  # 4a. Arm enable/disable chip control (2026-08-06 operator directive).
+  - id: arm_enable_control
+    description: >
+      ONE compact chip surface shows the arm state (ALARM / ENABLING /
+      JOG / READY / DISABLED) and dispatches Enable / Disable via
+      sendPowerCommand behind a window.confirm gate. Rendered on the
+      3D View (RealArmChrome header) AND the Monitor page (above the
+      run controls). Both read the same useStore(`robot.*`) mirror so
+      toggling on either surface reflects live in the other.
+
+      DISTINCT from JogControls' internal power banner + confirm
+      modal (which handles ALARM/DISABLED banner-driven flow) and
+      from AlarmRecoveryModal (which handles guided-recovery). Those
+      TWO callers legitimately use sendPowerCommand for their
+      respective UX flows; the CHIP style — a compact status +
+      window.confirm-gated toggle button — must exist ONLY in
+      ArmEnableControl.jsx.
+    canonical:
+      javascript:
+        module: src/cobot_dashboard/frontend/src/components/ArmEnableControl.jsx
+        exports: [default]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        # Only files that dispatch sendPowerCommand are candidates for
+        # duplicating the chip; unrelated files that mention window
+        # .confirm for other flows are fine.
+        context_sentinel: 'sendPowerCommand'
+        patterns:
+          # The chip's distinguishing signature: window.confirm guarding
+          # sendPowerCommand('enable' | 'disable'). JogControls uses a
+          # React-state confirm modal (pendingPower), NOT window.confirm.
+          # AlarmRecoveryModal has no window.confirm at all — its buttons
+          # are the recovery-modal itself.
+          - "window\\.confirm\\([^)]*[Ee]nable"
+          - "window\\.confirm\\([^)]*[Dd]isable"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/components/ArmEnableControl.jsx
+    known_debt: []
+
   # 5. Toast rendering + structured content (267108a).
   - id: toast_rendering
     description: >
