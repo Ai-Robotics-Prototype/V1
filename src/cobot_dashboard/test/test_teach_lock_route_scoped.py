@@ -106,7 +106,13 @@ def test_server_start_endpoint_applies_self_heal():
 def test_server_record_endpoint_applies_self_heal():
     """/record is the FIRST call the frontend makes (record-through)
     — if the owner is stale, it should self-heal AND continue with
-    the pose write, not 403."""
+    the pose write, not 403.
+
+    2026-08-06 (Lesson 179 fix): the inline stale-swap logic moved
+    into the canonical `_teach_claim_or_refuse` helper. This test
+    now checks the helper is INVOKED from /record + that the helper
+    itself carries the stale-heartbeat check (single source of
+    truth for the ownership doctrine)."""
     src = _read(SERVER_PY)
     m = re.search(
         r'async def api_teach_session_record\(prog_id: str[^:]*:(.+?)'
@@ -114,10 +120,19 @@ def test_server_record_endpoint_applies_self_heal():
         src, re.DOTALL)
     assert m, 'api_teach_session_record signature not found'
     body = m.group(1)
-    assert '_TEACH_STALE_HEARTBEAT_S' in body, (
-        '/record does NOT apply the self-heal check — defense in '
-        'depth missing (record-through means /record is often the '
-        'first call).')
+    assert '_teach_claim_or_refuse' in body, (
+        '/record must route the ownership check through the canonical '
+        '_teach_claim_or_refuse helper (single source of truth for '
+        'the null-owner-claims + stale-heartbeat-auto-swap doctrine).')
+    # And the helper itself must implement the stale-check invariant.
+    helper_match = re.search(
+        r'def _teach_claim_or_refuse\([^)]*\):(.+?)(?=\n    def |\n    @app\.)',
+        src, re.DOTALL)
+    assert helper_match, '_teach_claim_or_refuse helper not found'
+    assert '_TEACH_STALE_HEARTBEAT_S' in helper_match.group(1), (
+        '_teach_claim_or_refuse must check _TEACH_STALE_HEARTBEAT_S — '
+        'the stale-owner auto-swap invariant lives in this single '
+        'helper post-refactor.')
 
 
 # ── Deploy.sh: live-serve verification ─────────────────────────

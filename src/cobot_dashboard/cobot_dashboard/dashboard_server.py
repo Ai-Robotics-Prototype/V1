@@ -13145,6 +13145,53 @@ if FASTAPI_AVAILABLE:
             'poses':           {},
         })
 
+    # 2026-08-06 (Lesson 179 — null-owner refusal bug).
+    #
+    # ONE ownership-resolution rule, one implementation, so a future
+    # endpoint can't bring back the "owner != device_id → 403" bare
+    # pattern that the operator caught twice.
+    #
+    # Doctrine (operator-directed): a null owner_device_id means the
+    # session is CLAIMABLE. The requesting device becomes owner and
+    # proceeds. Refuse ONLY when a DIFFERENT, non-null device owns
+    # it AND its heartbeat is fresh (< _TEACH_STALE_HEARTBEAT_S).
+    # A stale non-null owner triggers an auto-swap (same as /start).
+    #
+    # Returns (draft_after_check, error_body_or_None,
+    #          http_status_or_None). Caller writes draft only when
+    # error is None. draft_after_check may be a fresh dict (claim /
+    # swap) or the same object (already-owner).
+    def _teach_claim_or_refuse(draft: dict, device_id: str,
+                                device_label: str = ''):
+        owner = draft.get('owner_device_id')
+        if owner == device_id:
+            return draft, None, None
+        if owner is None:
+            d = dict(draft)
+            d['owner_device_id'] = device_id
+            d['owner_label']     = (device_label or '').strip() \
+                                    or device_id[:8]
+            d['claimed_at']      = time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            return d, None, None
+        # Owner is a different non-null device — check heartbeat.
+        upd = _teach_updated_epoch(draft)
+        if upd is not None and (time.time() - upd) > _TEACH_STALE_HEARTBEAT_S:
+            d = dict(draft)
+            d['owner_device_id']    = device_id
+            d['owner_label']        = (device_label or '').strip() \
+                                        or device_id[:8]
+            d['previous_owner']     = owner
+            d['auto_expired_at']    = time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            return d, None, None
+        return draft, {
+            'ok':              False,
+            'error':           'not_owner',
+            'owner_device_id': owner,
+            'owner_label':     draft.get('owner_label'),
+        }, 403
+
     @app.get("/api/teach_session/{prog_id}")
     async def api_teach_session_get(prog_id: str):
         """Return the current draft for prog_id, or {present: false}
@@ -13196,6 +13243,24 @@ if FASTAPI_AVAILABLE:
                                         status_code=507)
                 _teach_publish_to_state()
                 return {'ok': True, 'draft': draft}
+            # 2026-08-06 (Lesson 179): null owner → CLAIM.
+            # Ghost-amnesty leaves owner=None on drafts whose
+            # ownership was released. A fresh /start on such a
+            # draft must succeed without a manual take_over.
+            if draft.get('owner_device_id') is None:
+                draft = dict(draft)
+                draft['owner_device_id'] = device_id
+                draft['owner_label']     = device_label or device_id[:8]
+                draft['claimed_at']      = time.strftime(
+                    '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                _teach_touch(draft)
+                try:
+                    _teach_write_draft(prog_id, draft)
+                except _TeachWriteError as e:
+                    return JSONResponse(_storage_full_response(e),
+                                        status_code=507)
+                _teach_publish_to_state()
+                return {'ok': True, 'draft': draft, 'claimed': True}
             # Different device — check the owner's heartbeat age. If
             # they've been silent for > 2 heartbeat intervals (60 s),
             # the lock is treated as abandoned and we auto-grant it
@@ -13312,23 +13377,13 @@ if FASTAPI_AVAILABLE:
                 # convenience the /record path offers.
                 draft = _teach_new_draft(prog_id, device_id,
                     str(body.get('device_label') or ''))
-            elif draft.get('owner_device_id') != device_id:
-                _upd = _teach_updated_epoch(draft)
-                if _upd is not None and (time.time() - _upd) > _TEACH_STALE_HEARTBEAT_S:
-                    prev_owner = draft.get('owner_device_id')
-                    draft = dict(draft)
-                    draft['owner_device_id']    = device_id
-                    draft['owner_label']        = str(body.get('device_label') or '') or device_id[:8]
-                    draft['previous_owner']     = prev_owner
-                    draft['auto_expired_at']    = time.strftime(
-                        '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-                else:
-                    return JSONResponse({
-                        'ok': False,
-                        'error': 'not_owner',
-                        'owner_device_id': draft.get('owner_device_id'),
-                        'owner_label':     draft.get('owner_label'),
-                    }, status_code=403)
+            else:
+                # Single canonical guard — null owner → CLAIM.
+                # Fork registry: teach_ownership_resolution.
+                draft, err_body, err_code = _teach_claim_or_refuse(
+                    draft, device_id, str(body.get('device_label') or ''))
+                if err_body is not None:
+                    return JSONResponse(err_body, status_code=err_code)
             draft['staged_program'] = program
             _teach_touch(draft)
             try:
@@ -13372,29 +13427,14 @@ if FASTAPI_AVAILABLE:
                 # simple (no explicit /start before /record).
                 draft = _teach_new_draft(prog_id, device_id,
                     str(body.get('device_label') or ''))
-            elif draft.get('owner_device_id') != device_id:
-                # 2026-08-05 (self-healing lock, teach-lock incident
-                # #3): if the current owner's heartbeat is > 2
-                # intervals stale, treat as abandoned and swap
-                # ownership. Same rule as /start — /record inherits
-                # it as defense in depth (record-through means
-                # /record is often the FIRST call the frontend makes).
-                _upd = _teach_updated_epoch(draft)
-                if _upd is not None and (time.time() - _upd) > _TEACH_STALE_HEARTBEAT_S:
-                    prev_owner = draft.get('owner_device_id')
-                    draft = dict(draft)
-                    draft['owner_device_id']    = device_id
-                    draft['owner_label']        = str(body.get('device_label') or '') or device_id[:8]
-                    draft['previous_owner']     = prev_owner
-                    draft['auto_expired_at']    = time.strftime(
-                        '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-                else:
-                    return JSONResponse({
-                        'ok': False,
-                        'error': 'not_owner',
-                        'owner_device_id': draft.get('owner_device_id'),
-                        'owner_label':     draft.get('owner_label'),
-                    }, status_code=403)
+            else:
+                # Single canonical guard — null owner → CLAIM, stale
+                # non-null owner → auto-swap, fresh non-null owner
+                # → 403. Fork registry: teach_ownership_resolution.
+                draft, err_body, err_code = _teach_claim_or_refuse(
+                    draft, device_id, str(body.get('device_label') or ''))
+                if err_body is not None:
+                    return JSONResponse(err_body, status_code=err_code)
             poses = dict(draft.get('poses') or {})
             poses[slot_key] = patch
             draft['poses'] = poses
@@ -13441,6 +13481,12 @@ if FASTAPI_AVAILABLE:
             draft = _teach_read_draft(prog_id)
             if draft is None:
                 return {'ok': True, 'already_ended': True}
+            # 2026-08-06 (Lesson 179): null owner → nothing to
+            # release. "End my session" from a device that doesn't
+            # own it is a no-op when the session is unclaimed —
+            # same UX as no draft.
+            if draft.get('owner_device_id') is None:
+                return {'ok': True, 'already_ended': True}
             if draft.get('owner_device_id') != device_id:
                 return JSONResponse({
                     'ok': False,
@@ -13485,13 +13531,14 @@ if FASTAPI_AVAILABLE:
                 return JSONResponse({
                     'ok': False, 'error': 'no_session',
                 }, status_code=404)
-            if draft.get('owner_device_id') != device_id:
-                return JSONResponse({
-                    'ok': False,
-                    'error': 'not_owner',
-                    'owner_device_id': draft.get('owner_device_id'),
-                    'owner_label':     draft.get('owner_label'),
-                }, status_code=403)
+            # 2026-08-06 (Lesson 179): null owner → CLAIM.
+            # Heartbeat from an unclaimed session becomes the claim
+            # itself. Odd but consistent with the doctrine that a
+            # null owner is CLAIMABLE, never refused.
+            draft, err_body, err_code = _teach_claim_or_refuse(
+                draft, device_id, str(body.get('device_label') or ''))
+            if err_body is not None:
+                return JSONResponse(err_body, status_code=err_code)
             _teach_touch(draft)
             try:
                 _teach_write_draft(prog_id, draft)
@@ -13568,16 +13615,20 @@ if FASTAPI_AVAILABLE:
         except Exception:
             body = {}
         device_id = str(body.get('device_id') or '').strip()
+        device_label = str(body.get('device_label') or '')
         with _teach_lock:
             draft = _teach_read_draft(prog_id)
             if draft is None:
                 return JSONResponse({
                     'ok': False, 'error': 'no_draft'}, status_code=404)
-            if device_id and draft.get('owner_device_id') != device_id:
-                return JSONResponse({
-                    'ok': False, 'error': 'not_owner',
-                    'owner_device_id': draft.get('owner_device_id'),
-                }, status_code=403)
+            # 2026-08-06 (Lesson 179): null owner → CLAIM, don't refuse.
+            # Ghost-amnesty leaves owner=None; the promoting device
+            # must be able to save without a manual take_over.
+            if device_id:
+                draft, err_body, err_code = _teach_claim_or_refuse(
+                    draft, device_id, device_label)
+                if err_body is not None:
+                    return JSONResponse(err_body, status_code=err_code)
             path = _prog_read_path(prog_id)
             if path is None or not os.path.isfile(path):
                 return JSONResponse({
