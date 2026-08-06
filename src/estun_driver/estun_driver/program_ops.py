@@ -4239,6 +4239,20 @@ def codegen_lua_from_program(
                 _seal_wait_ms = int(_seal_wait_ms)
             except (TypeError, ValueError):
                 _seal_wait_ms = 500
+            # 2026-08-06 operator directive — palletize completeness:
+            # approach and retract distances (mm) along the pose's OWN
+            # flange Z axis (rule A). approach_distance_mm and
+            # retract_distance_mm default to 50 (editable). Different
+            # names retained so the operator can dial one without
+            # perturbing the other.
+            try:
+                _approach_dist_mm = float(step.get('approach_distance_mm') or 50)
+            except (TypeError, ValueError):
+                _approach_dist_mm = 50.0
+            try:
+                _retract_dist_mm  = float(step.get('retract_distance_mm')  or 50)
+            except (TypeError, ValueError):
+                _retract_dist_mm  = 50.0
             _layer_h_mm = float(pold.get('layer_height_mm') or 100)
             # Transit-lift height ABOVE the current slot along the
             # frame normal. Same offset for every slot, but because
@@ -4280,6 +4294,52 @@ def codegen_lua_from_program(
                 used_named.add(_pick_pt_name)
                 role_point_name['pick'] = _pick_pt_name
             _pick_tcp = _tcp_from_joints_m(_pick_joints)   # (x,y,z,a,b,c)
+            # Pick's flange Z axis in base frame. The approach point
+            # sits BEHIND the tool (opposite tool_z direction), i.e.
+            # contact - approach_dist * tool_z. For a top-down grip
+            # tool_z points down (-world_Z), so `-tool_z` is +world_Z
+            # and the approach point is above the contact.
+            _pick_fk = _fk_chain(_pick_joints)
+            _pick_flange_R = _pick_fk[6][:3, :3]
+            _pick_tool_z = (float(_pick_flange_R[0, 2]),
+                            float(_pick_flange_R[1, 2]),
+                            float(_pick_flange_R[2, 2]))
+            # Slot orientation — all slots share the SAME orientation
+            # (from part_tcp, a single pose). Compute the slot's
+            # flange Z axis once from that shared a/b/c. The rotation
+            # matrix uses the same Fixed-XYZ Euler convention as
+            # _R_from_tcp_abc (R = Rz(c)·Ry(b)·Rx(a)); its third
+            # column is the flange Z axis in base frame.
+            if slots:
+                _s0 = slots[0]['tcp_m']
+                _slot_R = _R_from_tcp_abc(float(_s0[3]),
+                                          float(_s0[4]),
+                                          float(_s0[5]))
+                _slot_tool_z = (float(_slot_R[0, 2]),
+                                float(_slot_R[1, 2]),
+                                float(_slot_R[2, 2]))
+            else:
+                _slot_tool_z = (0.0, 0.0, -1.0)   # top-down default
+            # Optional taught approach poses (rule C). When present,
+            # the approach is linear from the taught point along its
+            # own angle — same as computing a fixed axis-offset would
+            # yield, but with the operator's chosen entry angle.
+            _pick_appr_taught = step.get('pick_approach_joints')
+            if isinstance(_pick_appr_taught, list) and len(_pick_appr_taught) == 6:
+                _pick_appr_joints_taught = [float(v) for v in _pick_appr_taught]
+                _pick_appr_tcp_taught = _tcp_from_joints_m(
+                    _pick_appr_joints_taught)
+            else:
+                _pick_appr_joints_taught = None
+                _pick_appr_tcp_taught = None
+            _place_appr_taught = step.get('place_approach_joints')
+            if isinstance(_place_appr_taught, list) and len(_place_appr_taught) == 6:
+                _place_appr_joints_taught = [float(v) for v in _place_appr_taught]
+                _place_appr_tcp_taught = _tcp_from_joints_m(
+                    _place_appr_joints_taught)
+            else:
+                _place_appr_joints_taught = None
+                _place_appr_tcp_taught = None
             # Speed splits mirror the previous compound-motion policy.
             _step_pct   = int(step.get('speed_pct') or eff_pct or 25)
             _slow_pct   = max(5,  min(_step_pct, 20))
@@ -4299,6 +4359,12 @@ def codegen_lua_from_program(
             _blow_desc = (f'DO{_blow_port_do}+{_blow_pulse_ms}ms'
                           if _blow_port_do is not None
                           else 'none')
+            _pick_appr_kind = ('taught'
+                               if _pick_appr_joints_taught is not None
+                               else f'axis-offset {_approach_dist_mm:.0f}mm')
+            _place_appr_kind = ('taught (layer-shifted)'
+                                if _place_appr_joints_taught is not None
+                                else f'axis-offset {_approach_dist_mm:.0f}mm')
             exec_lines.append(
                 f'-- move_to_pallet EXPANSION: {len(slots)} cycle(s) '
                 f'({_pc_note}), '
@@ -4310,10 +4376,48 @@ def codegen_lua_from_program(
                 f'vacuum_port=DO{_vac_port_do}  '
                 f'blow_off={_blow_desc}  '
                 f'safety_margin={_safety_margin_mm:.0f}mm  '
-                f'transit_h_above_slot={_transit_h_mm:.0f}mm '
-                f'(=layer_h+safety_margin; absolute transit_Z rises '
-                f'per layer)')
+                f'transit_h_above_slot={_transit_h_mm:.0f}mm  '
+                f'approach={_approach_dist_mm:.0f}mm  '
+                f'retract={_retract_dist_mm:.0f}mm  '
+                f'pick_approach={_pick_appr_kind}  '
+                f'place_approach={_place_appr_kind}')
             _pallet_ok = True
+            # ── Pick approach point (rule A / rule C, computed once).
+            # If the operator taught a pick_approach pose, use it; else
+            # offset the pick contact BACK along the pick's own flange
+            # Z axis (opposite tool_z direction) by approach_distance.
+            # The pick pose is FIXED across all cycles so this is
+            # constant.
+            if _pick_appr_tcp_taught is not None:
+                pick_appr_tcp = list(_pick_appr_tcp_taught)
+                _pick_appr_source = 'taught'
+                _pick_appr_seed_j = list(_pick_appr_joints_taught)
+            else:
+                pick_appr_tcp = [
+                    _pick_tcp[0] - (_approach_dist_mm / 1000.0) * _pick_tool_z[0],
+                    _pick_tcp[1] - (_approach_dist_mm / 1000.0) * _pick_tool_z[1],
+                    _pick_tcp[2] - (_approach_dist_mm / 1000.0) * _pick_tool_z[2],
+                    _pick_tcp[3], _pick_tcp[4], _pick_tcp[5],
+                ]
+                _pick_appr_source = 'axis-offset'
+                _pick_appr_seed_j = list(_pick_joints)
+            _ik_pick_appr = seeded_ik_to_pose(list(_pick_joints), pick_appr_tcp)
+            if _ik_pick_appr is None:
+                exec_lines.append(
+                    f'-- PALLET IK FAILED: pick approach unreachable — '
+                    f'refusing pallet expansion')
+                continue
+            q_pick_appr = _ik_pick_appr[0]
+            fallback_idx += 1
+            _nm_pick_appr = f'{point_prefix}{fallback_idx}'
+            while _nm_pick_appr in program_points or _nm_pick_appr in used_named:
+                fallback_idx += 1
+                _nm_pick_appr = f'{point_prefix}{fallback_idx}'
+            varspoint[_nm_pick_appr] = _make_jp_point(q_pick_appr, _nm_pick_appr)
+            used_named.add(_nm_pick_appr)
+            # Save the pick approach's tool-Z retract vector for the
+            # linear-up-from-pick emit. Same source as approach.
+            _pick_retr_dist_mm = _retract_dist_mm
             for _sl_idx, _sl in enumerate(slots):
                 r_idx = int(_sl['row']); c_idx = int(_sl['col']); l_idx = int(_sl['layer'])
                 slot_m = list(_sl['tcp_m'])          # meters + a/b/c
@@ -4323,8 +4427,7 @@ def codegen_lua_from_program(
                 transit_slot_m[1] += (_transit_h_mm / 1000.0) * float(_normal[1])
                 transit_slot_m[2] += (_transit_h_mm / 1000.0) * float(_normal[2])
                 # transit_over_pick shares transit_over_slot's ABSOLUTE
-                # base-frame Z; pick's XY & orientation. This gives the
-                # operator's "up to transit_Z, over, down" path.
+                # base-frame Z; pick's XY & orientation.
                 transit_pick_m = [
                     float(_pick_tcp[0]),
                     float(_pick_tcp[1]),
@@ -4333,33 +4436,89 @@ def codegen_lua_from_program(
                     float(_pick_tcp[4]),
                     float(_pick_tcp[5]),
                 ]
+                # PLACE APPROACH point (rule A + B + optional C).
+                # Rule A: contact - approach_dist * slot_tool_z (opposite
+                #   flange Z of the slot pose).
+                # Rule B: because THIS layer's slot_m already carries the
+                #   layer-shifted Z (via layer * layer_h * plane_normal),
+                #   the approach point automatically rises per layer.
+                #   Layer-2 approach sits ABOVE layer 2 by approach_dist
+                #   along the (typically +Z) opposite-of-tool_z; it
+                #   NEVER dips below layer 2.
+                # Rule C: taught place_approach overrides — the operator
+                #   supplied a taught XYZ+abc; apply the same
+                #   layer_h*normal offset so the taught pose scales up
+                #   through layers correctly.
+                if _place_appr_tcp_taught is not None:
+                    _lift = (l_idx * _layer_h_mm) / 1000.0
+                    place_appr_tcp = [
+                        _place_appr_tcp_taught[0] + _lift * float(_normal[0]),
+                        _place_appr_tcp_taught[1] + _lift * float(_normal[1]),
+                        _place_appr_tcp_taught[2] + _lift * float(_normal[2]),
+                        _place_appr_tcp_taught[3],
+                        _place_appr_tcp_taught[4],
+                        _place_appr_tcp_taught[5],
+                    ]
+                    _place_appr_kind_line = f'taught + layer×{_layer_h_mm:.0f}mm lift'
+                else:
+                    place_appr_tcp = [
+                        slot_m[0] - (_approach_dist_mm / 1000.0) * _slot_tool_z[0],
+                        slot_m[1] - (_approach_dist_mm / 1000.0) * _slot_tool_z[1],
+                        slot_m[2] - (_approach_dist_mm / 1000.0) * _slot_tool_z[2],
+                        slot_m[3], slot_m[4], slot_m[5],
+                    ]
+                    _place_appr_kind_line = (f'axis-offset {_approach_dist_mm:.0f}mm '
+                                             f'along slot -tool_Z')
+                # Cycle header.
                 exec_lines.append(
-                    f'-- cycle {_sl_idx + 1}/{len(slots)}: pick (fixed '
-                    f'taught pose) → vacuum ON → transit_Z (layer {l_idx}, '
-                    f'absolute Z={transit_slot_m[2]*1000:.1f}mm) → '
-                    f'slot({r_idx},{c_idx},{l_idx}) → vacuum OFF'
-                    + (f' + blow-off pulse'
-                       if _blow_port_do is not None else ''))
-                # ── (1) Go to pick pose. movJ to the taught pick point
-                # so every cycle starts from the same known-good
-                # kinematic branch. On cycle 1 this is redundant (the
-                # walker just emitted pick_contact) but kept for cycle
-                # symmetry; on cycles 2..N it's the return-to-pick.
+                    f'-- cycle {_sl_idx + 1}/{len(slots)}: pick_approach '
+                    f'({_pick_appr_source}) → pick → vacuum ON → retract '
+                    f'→ transit_Z (layer {l_idx}, '
+                    f'absolute Z={transit_slot_m[2]*1000:.1f}mm) → over '
+                    f'slot({r_idx},{c_idx},{l_idx}) → place_approach '
+                    f'({_place_appr_kind_line}, absolute Z='
+                    f'{place_appr_tcp[2]*1000:.1f}mm) → place → vacuum OFF'
+                    + (f' + blow-off pulse' if _blow_port_do is not None else '')
+                    + ' → retract → transit_Z')
+                # ── (1) Go to pick approach — always start each cycle
+                # from a known kinematic branch. From cycle 2..N this
+                # comes from prev cycle's transit_over_slot (transit_Z
+                # of prev layer, in base frame). movJ for the first
+                # movement (fresh IK branch); movL for subsequent
+                # in-place descents so the arm follows a straight line.
                 exec_lines.append(
-                    f'movJ({_pick_pt_name})  -- cycle {_sl_idx + 1} '
-                    f'pick (fixed taught pose)  '
+                    f'movJ({_nm_pick_appr})  -- cycle {_sl_idx + 1} '
+                    f'pick_approach ({_pick_appr_source}, offset '
+                    f'{_approach_dist_mm:.0f}mm along -pick_tool_Z)  '
+                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_pick_appr)}]')
+                _seed = list(q_pick_appr)
+                last_move_joints = list(q_pick_appr)
+                # ── (2) LINEAR DOWN to pick contact.
+                exec_lines.append(
+                    f'movL({_pick_pt_name})  -- cycle {_sl_idx + 1} '
+                    f'linear-down to pick contact (fixed taught pose)  '
                     f'joints=[{", ".join(f"{v:+.3f}" for v in _pick_joints)}]')
                 _seed = list(_pick_joints)
-                # ── (2) Vacuum ON.
+                last_move_joints = list(_pick_joints)
+                # ── (3) Vacuum ON.
                 exec_lines.append(
                     f'setDO({_vac_port_do},1)  -- cycle {_sl_idx + 1} '
                     f'vacuum ON  (vacuum_port_do=DO{_vac_port_do})')
-                # ── (3) Seal wait.
+                # ── (4) Seal wait.
                 if _seal_wait_ms > 0:
                     exec_lines.append(
                         f'wait({_seal_wait_ms})  -- cycle {_sl_idx + 1} '
                         f'seal wait {_seal_wait_ms} ms')
-                # ── (4) Lift to transit_Z above pick.
+                # ── (5) LINEAR UP — retract to the pick approach point.
+                # (Retract distance = approach distance; different names
+                # kept so the operator can dial them separately.)
+                exec_lines.append(
+                    f'movL({_nm_pick_appr})  -- cycle {_sl_idx + 1} '
+                    f'linear-up to pick_approach (retract '
+                    f'{_pick_retr_dist_mm:.0f}mm)  '
+                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_pick_appr)}]')
+                _seed = list(q_pick_appr)
+                # ── (6) Transit_Z above pick.
                 _ik_tpick = seeded_ik_to_pose(_seed, transit_pick_m)
                 if _ik_tpick is None:
                     exec_lines.append(
@@ -4378,12 +4537,12 @@ def codegen_lua_from_program(
                 varspoint[_nm_tpick] = _make_jp_point(q_tpick, _nm_tpick)
                 used_named.add(_nm_tpick)
                 exec_lines.append(
-                    f'movJ({_nm_tpick})  -- cycle {_sl_idx + 1} '
+                    f'movL({_nm_tpick})  -- cycle {_sl_idx + 1} '
                     f'lift-to-transit (over pick, absolute Z='
                     f'{transit_pick_m[2]*1000:.1f}mm)  '
                     f'joints=[{", ".join(f"{v:+.3f}" for v in q_tpick)}]')
                 _seed = list(q_tpick)
-                # ── (5) Move over the target slot at transit_Z.
+                # ── (7) Over slot at transit_Z.
                 _ik_tslot = seeded_ik_to_pose(_seed, transit_slot_m)
                 if _ik_tslot is None:
                     exec_lines.append(
@@ -4406,12 +4565,36 @@ def codegen_lua_from_program(
                     f'transit_Z={transit_slot_m[2]*1000:.1f}mm  '
                     f'joints=[{", ".join(f"{v:+.3f}" for v in q_tslot)}]')
                 _seed = list(q_tslot)
-                # ── (6) Lower to place at slot.
+                # ── (8) Descend to place_approach (layer-adjusted).
+                _ik_place_appr = seeded_ik_to_pose(_seed, place_appr_tcp)
+                if _ik_place_appr is None:
+                    exec_lines.append(
+                        f'-- PALLET IK FAILED: place_approach for '
+                        f'[{r_idx},{c_idx},{l_idx}] unreachable at Z='
+                        f'{place_appr_tcp[2]*1000:.1f}mm — refusing')
+                    _pallet_ok = False
+                    break
+                q_place_appr = _ik_place_appr[0]
+                fallback_idx += 1
+                _nm_place_appr = f'{point_prefix}{fallback_idx}'
+                while _nm_place_appr in program_points or _nm_place_appr in used_named:
+                    fallback_idx += 1
+                    _nm_place_appr = f'{point_prefix}{fallback_idx}'
+                varspoint[_nm_place_appr] = _make_jp_point(q_place_appr, _nm_place_appr)
+                used_named.add(_nm_place_appr)
+                exec_lines.append(
+                    f'movL({_nm_place_appr})  -- cycle {_sl_idx + 1} '
+                    f'place_approach [{r_idx},{c_idx},{l_idx}] layer {l_idx} '
+                    f'({_place_appr_kind_line}, absolute Z='
+                    f'{place_appr_tcp[2]*1000:.1f}mm)  '
+                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_place_appr)}]')
+                _seed = list(q_place_appr)
+                # ── (9) LINEAR DOWN to place at slot.
                 _ik_slot = seeded_ik_to_pose(_seed, slot_m)
                 if _ik_slot is None:
                     exec_lines.append(
                         f'-- PALLET IK FAILED: slot [{r_idx},{c_idx},{l_idx}] '
-                        f'place unreachable from transit — refusing')
+                        f'place unreachable from approach — refusing')
                     _pallet_ok = False
                     break
                 q_slot = _ik_slot[0]
@@ -4424,14 +4607,15 @@ def codegen_lua_from_program(
                 used_named.add(_nm_slot)
                 exec_lines.append(
                     f'movL({_nm_slot})  -- slot[{r_idx},{c_idx},{l_idx}] place  '
-                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_slot)}]')
+                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_slot)}]  '
+                    f'(linear-down from approach)')
                 _seed = list(q_slot)
-                # ── (7) Vacuum OFF (release).
+                # ── (10) Vacuum OFF (release).
                 exec_lines.append(
                     f'setDO({_vac_port_do},0)  -- cycle {_sl_idx + 1} '
                     f'vacuum OFF  (pallet release DO{_vac_port_do}=0, '
                     f'slot [{r_idx},{c_idx},{l_idx}])')
-                # ── (8) Optional blow-off pulse.
+                # ── (11) Optional blow-off pulse.
                 if _blow_port_do is not None and _blow_pulse_ms > 0:
                     exec_lines.append(
                         f'setDO({_blow_port_do},1)  -- cycle {_sl_idx + 1} '
@@ -4442,7 +4626,14 @@ def codegen_lua_from_program(
                     exec_lines.append(
                         f'setDO({_blow_port_do},0)  -- cycle {_sl_idx + 1} '
                         f'blow-off pulse end DO{_blow_port_do}=0')
-                # ── (9) Lift back to transit_Z above slot.
+                # ── (12) LINEAR UP — retract to place_approach.
+                exec_lines.append(
+                    f'movL({_nm_place_appr})  -- cycle {_sl_idx + 1} '
+                    f'linear-up to place_approach (retract '
+                    f'{_retract_dist_mm:.0f}mm)  '
+                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_place_appr)}]')
+                _seed = list(q_place_appr)
+                # ── (13) Lift back to transit_Z above slot.
                 exec_lines.append(
                     f'movL({_nm_tslot})  -- cycle {_sl_idx + 1} '
                     f'lift-to-transit (over slot after release, '

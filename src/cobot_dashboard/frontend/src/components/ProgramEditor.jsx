@@ -506,6 +506,98 @@ async function fetchTcpFromState() {
 // from the existing program so taught poses don't get clobbered.
 //
 // Returns the new steps array (renumbered downstream by the caller).
+// 2026-08-06 palletize completeness — the operator directive asks for
+// an expandable read-only preview of the emitted cycle template on
+// the move_to_pallet step. This component renders the 12/13-line
+// per-cycle skeleton the codegen actually emits, plus a note about
+// how the layer-shift works. It is NOT the real Lua — that lives on
+// the driver — but the labels and ordering mirror the codegen 1:1
+// (see program_ops.py::codegen_lua_from_program palletize branch).
+function PalletExpansionPreview({ step, palletCfg }) {
+  const grip = String(step?.gripper_type || 'vacuum').toLowerCase()
+  const vacPort = step?.vacuum_port_do ?? palletCfg?.vacuum_port_do ?? 2
+  const blowPort = (step?.blow_off_port_do ?? palletCfg?.blow_off_port_do ?? null)
+  const blowPulse = Number(step?.blow_off_pulse_ms ?? palletCfg?.blow_off_pulse_ms ?? 300)
+  const seal = Number(step?.seal_wait_ms ?? palletCfg?.seal_wait_ms ?? 500)
+  const approach = Number(step?.approach_distance_mm ?? palletCfg?.approach_distance_mm ?? 50)
+  const retract  = Number(step?.retract_distance_mm  ?? palletCfg?.retract_distance_mm  ?? 50)
+  const margin   = Number(step?.safety_margin_mm     ?? palletCfg?.safety_margin_mm     ?? 50)
+  const layerH   = Number(palletCfg?.layer_height_mm ?? 100)
+  const rows   = Number(palletCfg?.rows ?? 1)
+  const cols   = Number(palletCfg?.cols ?? 1)
+  const layers = Number(palletCfg?.layers ?? 1)
+  const capacity = Math.max(1, rows * cols * layers)
+  const partCount = Math.max(1, Math.min(
+    Number(palletCfg?.part_count ?? capacity),
+    capacity))
+  const pickTaught  = Array.isArray(step?.pick_approach_joints)  && step.pick_approach_joints.length === 6
+  const placeTaught = Array.isArray(step?.place_approach_joints) && step.place_approach_joints.length === 6
+  const rowSty = { display: 'flex', gap: 8, alignItems: 'baseline',
+                   padding: '2px 6px', fontSize: 11,
+                   fontFamily: 'var(--font-mono, monospace)',
+                   color: '#0f172a' }
+  const numSty = { color: '#94a3b8', minWidth: 24, textAlign: 'right' }
+  const kindSty = { fontWeight: 700, color: '#0369A1', minWidth: 80 }
+  const lines = [
+    ['movJ',   `pick_approach — ${pickTaught ? 'taught' : `axis-offset ${approach}mm along -pick_tool_Z`}`],
+    ['movL',   'linear-down → pick contact (fixed taught pose)'],
+    ['setDO',  `vacuum ON  (DO${vacPort} = 1)`],
+    ['wait',   `seal wait  (${seal} ms)`],
+    ['movL',   `linear-up → pick_approach (retract ${retract}mm)`],
+    ['movL',   `transit_Z above pick (layer L's transit_Z = slot_Z(L) + ${layerH}+${margin}mm)`],
+    ['movL',   `traverse-over-slot at transit_Z (X,Y of slot[r,c,L])`],
+    ['movL',   `place_approach — ${placeTaught ? `taught + layer×${layerH}mm lift` : `axis-offset ${approach}mm along -slot_tool_Z`}`],
+    ['movL',   'linear-down → slot contact (place)'],
+    ['setDO',  `vacuum OFF  (DO${vacPort} = 0)`],
+  ]
+  if (blowPort !== null && blowPort !== undefined && String(blowPort) !== '') {
+    lines.push(['setDO', `blow-off pulse start (DO${blowPort} = 1)`])
+    lines.push(['wait',  `blow-off pulse  (${blowPulse} ms)`])
+    lines.push(['setDO', `blow-off pulse end   (DO${blowPort} = 0)`])
+  }
+  lines.push(['movL', `linear-up → place_approach (retract ${retract}mm)`])
+  lines.push(['movL', `transit_Z above slot (over slot at transit_Z; ready for next cycle)`])
+  return (
+    <div
+      data-testid="pallet-expansion-preview"
+      style={{
+        marginTop: 6, marginBottom: 4, marginLeft: 220,
+        padding: '10px 12px',
+        background: '#f8fafc',
+        border: '1px dashed #cbd5e1', borderRadius: 6,
+        fontSize: 11, color: '#334155',
+      }}>
+      <div style={{ marginBottom: 6, fontSize: 11, fontWeight: 700,
+                    color: '#0f766e', letterSpacing: 0.4 }}>
+        PER-CYCLE TEMPLATE  ·  {partCount} cycle(s) of {capacity} capacity
+        · gripper={grip}
+      </div>
+      {lines.map(([kind, text], i) => (
+        <div key={i} style={rowSty}>
+          <span style={numSty}>{String(i + 1).padStart(2, ' ')}.</span>
+          <span style={kindSty}>{kind}</span>
+          <span>{text}</span>
+        </div>
+      ))}
+      <div style={{ marginTop: 6, fontSize: 11, color: '#475569',
+                    lineHeight: 1.4 }}>
+        Rule B: transit_Z(layer) = slot_Z(layer) + {layerH} + {margin} mm
+        along the frame normal. Because slot_Z rises by layer_height
+        per layer, transit_Z rises with it — a layer-{Math.max(0, layers - 1)}
+        placement approaches from above layer {Math.max(0, layers - 1)}
+        and never dips to a lower layer's Z.
+      </div>
+      <div style={{ marginTop: 4, fontSize: 11, color: '#64748b',
+                    fontStyle: 'italic' }}>
+        Read-only inspection. Edit the boxed fields via the pallet
+        Edit modal — this preview reflects the codegen 1:1 (see
+        program_ops.py::codegen_lua_from_program palletize branch).
+      </div>
+    </div>
+  )
+}
+
+
 function regenerateMoveToPalletSteps(steps, palletCfg, palletMode) {
   if (!Array.isArray(steps)) return steps
   const rows   = Number(palletCfg?.rows   ?? 4)
@@ -513,9 +605,45 @@ function regenerateMoveToPalletSteps(steps, palletCfg, palletMode) {
   const layers = Number(palletCfg?.layers ?? 1)
   const cycles = Math.max(1, rows * cols * layers)
   const mode   = palletMode === 'depalletize' ? 'depalletize' : 'palletize'
+  // 2026-08-06 palletize completeness — the modal edits vacuum I/O
+  // + transit + approach fields alongside grid/pitch. Mirror them
+  // onto the move_to_pallet step so the codegen sees them the same
+  // way the composer would have stamped them originally.
+  const _fanOut = {}
+  if (palletCfg?.vacuum_port_do !== undefined && palletCfg.vacuum_port_do !== null) {
+    _fanOut.vacuum_port_do = Number(palletCfg.vacuum_port_do)
+  }
+  if (palletCfg?.blow_off_port_do === null) {
+    _fanOut.blow_off_port_do = null
+  } else if (palletCfg?.blow_off_port_do !== undefined) {
+    const n = Number(palletCfg.blow_off_port_do)
+    _fanOut.blow_off_port_do = Number.isFinite(n) ? n : null
+  }
+  if (palletCfg?.blow_off_pulse_ms !== undefined) {
+    _fanOut.blow_off_pulse_ms = Number(palletCfg.blow_off_pulse_ms) || 300
+  }
+  if (palletCfg?.safety_margin_mm !== undefined) {
+    _fanOut.safety_margin_mm = Number(palletCfg.safety_margin_mm) || 50
+  }
+  if (palletCfg?.seal_wait_ms !== undefined) {
+    _fanOut.seal_wait_ms = Number(palletCfg.seal_wait_ms) || 500
+  }
+  if (palletCfg?.approach_distance_mm !== undefined) {
+    _fanOut.approach_distance_mm = Number(palletCfg.approach_distance_mm) || 50
+  }
+  if (palletCfg?.retract_distance_mm !== undefined) {
+    _fanOut.retract_distance_mm = Number(palletCfg.retract_distance_mm) || 50
+  }
+  if (palletCfg?.pick_approach_joints !== undefined) {
+    _fanOut.pick_approach_joints = palletCfg.pick_approach_joints
+  }
+  if (palletCfg?.place_approach_joints !== undefined) {
+    _fanOut.place_approach_joints = palletCfg.place_approach_joints
+  }
   return steps.map((s) => {
     if (s?.action === 'move_to_pallet') {
-      return { ...s, mode, pallet_phase: mode === 'palletize' ? 'place' : 'pick' }
+      return { ...s, ..._fanOut, mode,
+               pallet_phase: mode === 'palletize' ? 'place' : 'pick' }
     }
     if (s?.action === 'loop' && s.pallet_loop) {
       return {
@@ -732,6 +860,49 @@ function PalletConfigEditor({ config, onSave, onClose }) {
   const [approachH,  setApproachH]  = useState(Number(initialPallet.approach_height_mm ?? config?.pallet_approach_height_mm ?? 100))
   const [retractH,   setRetractH]   = useState(Number(initialPallet.retract_height_mm  ?? config?.pallet_retract_height_mm  ?? 200))
   const [speed,      setSpeed]      = useState(Number(config?.speed_pct ?? config?.speed ?? 60))
+  // 2026-08-06 palletize completeness — vacuum I/O + rule-A approach.
+  // Sourced from move_to_pallet step (composer-stamped from io_map);
+  // reads through initialPallet AND from the step if present, so the
+  // modal shows what the codegen will use.
+  const _stepMTP = Array.isArray(config?.__steps)
+    ? config.__steps.find((s) => s?.action === 'move_to_pallet')
+    : null
+  const _initApproachDist  = Number(initialPallet.approach_distance_mm ?? _stepMTP?.approach_distance_mm ?? 50)
+  const _initRetractDist   = Number(initialPallet.retract_distance_mm  ?? _stepMTP?.retract_distance_mm  ?? 50)
+  const _initSafetyMargin  = Number(initialPallet.safety_margin_mm     ?? _stepMTP?.safety_margin_mm     ?? 50)
+  const _initSealWaitMs    = Number(initialPallet.seal_wait_ms         ?? _stepMTP?.seal_wait_ms         ?? 500)
+  const _initVacPort       = Number(initialPallet.vacuum_port_do       ?? _stepMTP?.vacuum_port_do       ?? 2)
+  const _initBlowRaw       = initialPallet.blow_off_port_do !== undefined
+                              ? initialPallet.blow_off_port_do
+                              : _stepMTP?.blow_off_port_do
+  const _initBlowPort      = _initBlowRaw === null || _initBlowRaw === undefined
+                              ? '' : String(_initBlowRaw)
+  const _initBlowPulseMs   = Number(initialPallet.blow_off_pulse_ms    ?? _stepMTP?.blow_off_pulse_ms    ?? 300)
+  const _initPickApprJ     = Array.isArray(initialPallet.pick_approach_joints)
+                              ? initialPallet.pick_approach_joints
+                              : (Array.isArray(_stepMTP?.pick_approach_joints)
+                                 ? _stepMTP.pick_approach_joints
+                                 : null)
+  const _initPlaceApprJ    = Array.isArray(initialPallet.place_approach_joints)
+                              ? initialPallet.place_approach_joints
+                              : (Array.isArray(_stepMTP?.place_approach_joints)
+                                 ? _stepMTP.place_approach_joints
+                                 : null)
+  const [approachDist, setApproachDist] = useState(_initApproachDist)
+  const [retractDist,  setRetractDist]  = useState(_initRetractDist)
+  const [safetyMargin, setSafetyMargin] = useState(_initSafetyMargin)
+  const [sealWaitMs,   setSealWaitMs]   = useState(_initSealWaitMs)
+  const [vacPort,      setVacPort]      = useState(_initVacPort)
+  const [blowPort,     setBlowPort]     = useState(_initBlowPort)
+  const [blowPulseMs,  setBlowPulseMs]  = useState(_initBlowPulseMs)
+  const [pickApprJ,    setPickApprJ]    = useState(_initPickApprJ)
+  const [placeApprJ,   setPlaceApprJ]   = useState(_initPlaceApprJ)
+  // Current robot joints — snapshot on Teach click for the optional
+  // pick_approach / place_approach poses. The teach model is intentionally
+  // minimal: operator jogs the arm to the desired approach angle then
+  // clicks Teach — we record joints from the store. Clear removes it
+  // (codegen falls back to axis-offset default).
+  const robotJoints = useStore((s) => s.robot?.joints)
   // 2026-08-06 (operator directive: part-count termination). N pick-
   // place cycles are emitted, one per part. Autofills from the PBD
   // demo's stated quantity when the composer set `pallet.part_count`;
@@ -761,6 +932,9 @@ function PalletConfigEditor({ config, onSave, onClose }) {
     // legacy corner_tcp / pick_tcp / place_tcp values that already
     // sit on config — the modal no longer edits them, and re-
     // saving here MUST NOT discard operator-authored data.
+    // Blow-off port: empty string = no pulse (null).
+    const _blowRaw = String(blowPort).trim()
+    const _blowNum = _blowRaw === '' ? null : Number(_blowRaw)
     const pallet = {
       ...initialPallet,                                   // preserve corner_tcp + anything else
       rows: Number(rows) || 1,
@@ -773,6 +947,19 @@ function PalletConfigEditor({ config, onSave, onClose }) {
       approach_height_mm: Number(approachH) || 0,
       retract_height_mm:  Number(retractH)  || 0,
       part_count: Math.max(1, Number(partCount) || 1),
+      // 2026-08-06 palletize completeness — vacuum I/O + rule-A
+      // approach + transit safety margin (fanned out onto the
+      // move_to_pallet step by regenerateMoveToPalletSteps).
+      approach_distance_mm: Math.max(0, Number(approachDist) || 0),
+      retract_distance_mm:  Math.max(0, Number(retractDist)  || 0),
+      safety_margin_mm:     Math.max(0, Number(safetyMargin) || 0),
+      seal_wait_ms:         Math.max(0, Number(sealWaitMs)   || 0),
+      vacuum_port_do:       Number.isFinite(Number(vacPort))
+                             ? Number(vacPort) : 2,
+      blow_off_port_do:     Number.isFinite(_blowNum) ? _blowNum : null,
+      blow_off_pulse_ms:    Math.max(0, Number(blowPulseMs) || 0),
+      pick_approach_joints:  pickApprJ,   // null or 6-el
+      place_approach_joints: placeApprJ,
     }
     // pallet_place (schema-shape spec consumed by the taught-frame
     // math) also gets its grid fields updated but its taught frame
@@ -950,6 +1137,157 @@ function PalletConfigEditor({ config, onSave, onClose }) {
               <NumericField integer min={1} max={100} value={speed}
                 onCommit={setSpeed} style={inputStyle} aria-label="Speed percent" />
             </Field>
+          </div>
+
+          {/* 2026-08-06 operator directive — palletize completeness.
+              Approach distance = mm along the pose's OWN flange Z axis
+              (rule A). Safety margin sizes the transit lift above the
+              CURRENT layer (rule B — transit_Z rises per layer). */}
+          <div style={{ marginTop: 12, marginBottom: 4,
+                        fontSize: 11, fontWeight: 700,
+                        color: '#0f766e', letterSpacing: 0.5 }}>
+            APPROACH + TRANSIT
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr',
+                        gap: 10 }}>
+            <Field label="Approach distance (mm) — along pose axis">
+              <NumericField integer min={0} value={approachDist}
+                onCommit={setApproachDist} style={inputStyle}
+                aria-label="Approach distance mm"
+                data-testid="pallet-approach-distance-mm" />
+            </Field>
+            <Field label="Retract distance (mm) — along pose axis">
+              <NumericField integer min={0} value={retractDist}
+                onCommit={setRetractDist} style={inputStyle}
+                aria-label="Retract distance mm"
+                data-testid="pallet-retract-distance-mm" />
+            </Field>
+            <Field label="Safety margin (mm) — transit clearance">
+              <NumericField integer min={0} value={safetyMargin}
+                onCommit={setSafetyMargin} style={inputStyle}
+                aria-label="Safety margin mm"
+                data-testid="pallet-safety-margin-mm" />
+            </Field>
+          </div>
+
+          {/* Vacuum I/O — sourced from io_map defaults but editable per
+              program. Blow-off is optional; blank = no pulse. */}
+          <div style={{ marginTop: 12, marginBottom: 4,
+                        fontSize: 11, fontWeight: 700,
+                        color: '#0f766e', letterSpacing: 0.5 }}>
+            VACUUM I/O
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr',
+                        gap: 10 }}>
+            <Field label="Vacuum DO port">
+              <NumericField integer min={0} max={63} value={vacPort}
+                onCommit={setVacPort} style={inputStyle}
+                aria-label="Vacuum port DO number"
+                data-testid="pallet-vacuum-port-do" />
+            </Field>
+            <Field label="Seal wait (ms)">
+              <NumericField integer min={0} value={sealWaitMs}
+                onCommit={setSealWaitMs} style={inputStyle}
+                aria-label="Seal wait ms"
+                data-testid="pallet-seal-wait-ms" />
+            </Field>
+            <Field label="Blow-off DO port (blank = none)">
+              <input type="text" value={blowPort}
+                onChange={(e) => setBlowPort(e.target.value.replace(/[^0-9]/g, ''))}
+                style={inputStyle}
+                aria-label="Blow-off port DO number"
+                data-testid="pallet-blow-off-port-do" />
+            </Field>
+            <Field label="Blow-off pulse (ms)">
+              <NumericField integer min={0} value={blowPulseMs}
+                onCommit={setBlowPulseMs} style={inputStyle}
+                aria-label="Blow-off pulse ms"
+                data-testid="pallet-blow-off-pulse-ms" />
+            </Field>
+          </div>
+
+          {/* Optional teachable approach poses (rule C). Operator jogs
+              arm to the desired approach angle, clicks Teach — we
+              snapshot robot.joints. Clear removes it → codegen falls
+              back to the axis-offset default (rule A). Place approach
+              is shifted per layer by layer_height. */}
+          <div style={{ marginTop: 12, marginBottom: 4,
+                        fontSize: 11, fontWeight: 700,
+                        color: '#0f766e', letterSpacing: 0.5 }}>
+            OPTIONAL TAUGHT APPROACH POSES (RULE C)
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr',
+                        gap: 10, marginBottom: 6 }}>
+            <Field label={pickApprJ
+                    ? `Pick approach — taught (6 joints)`
+                    : 'Pick approach — using axis-offset default'}>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button
+                  onClick={() => {
+                    const j = Array.isArray(robotJoints) && robotJoints.length === 6
+                      ? robotJoints.map(Number)
+                      : null
+                    if (j) setPickApprJ(j)
+                  }}
+                  disabled={!(Array.isArray(robotJoints) && robotJoints.length === 6)}
+                  data-testid="pallet-teach-pick-approach"
+                  style={{ flex: 1, padding: '6px 10px', fontSize: 11,
+                           fontWeight: 700,
+                           background: pickApprJ ? '#065F46' : '#0369A1',
+                           color: '#fff', border: 'none',
+                           borderRadius: 4, cursor: 'pointer' }}>
+                  {pickApprJ ? 'Re-teach pick approach' : 'Teach pick approach'}
+                </button>
+                {pickApprJ && (
+                  <button onClick={() => setPickApprJ(null)}
+                    data-testid="pallet-clear-pick-approach"
+                    style={{ padding: '6px 10px', fontSize: 11,
+                             background: '#fff', color: '#B91C1C',
+                             border: '1px solid #B91C1C', borderRadius: 4,
+                             cursor: 'pointer' }}>
+                    Clear
+                  </button>
+                )}
+              </div>
+            </Field>
+            <Field label={placeApprJ
+                    ? 'Place approach — taught (6 joints, layer-shifted)'
+                    : 'Place approach — using axis-offset default'}>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button
+                  onClick={() => {
+                    const j = Array.isArray(robotJoints) && robotJoints.length === 6
+                      ? robotJoints.map(Number)
+                      : null
+                    if (j) setPlaceApprJ(j)
+                  }}
+                  disabled={!(Array.isArray(robotJoints) && robotJoints.length === 6)}
+                  data-testid="pallet-teach-place-approach"
+                  style={{ flex: 1, padding: '6px 10px', fontSize: 11,
+                           fontWeight: 700,
+                           background: placeApprJ ? '#065F46' : '#0369A1',
+                           color: '#fff', border: 'none',
+                           borderRadius: 4, cursor: 'pointer' }}>
+                  {placeApprJ ? 'Re-teach place approach' : 'Teach place approach'}
+                </button>
+                {placeApprJ && (
+                  <button onClick={() => setPlaceApprJ(null)}
+                    data-testid="pallet-clear-place-approach"
+                    style={{ padding: '6px 10px', fontSize: 11,
+                             background: '#fff', color: '#B91C1C',
+                             border: '1px solid #B91C1C', borderRadius: 4,
+                             cursor: 'pointer' }}>
+                    Clear
+                  </button>
+                )}
+              </div>
+            </Field>
+          </div>
+          <div style={{ fontSize: 11, color: '#6b7280', lineHeight: 1.4 }}>
+            Teach captures the CURRENT arm joints as the approach pose.
+            When taught, the arm moves LINEARLY from that angle onto the
+            pick/place; when cleared, the codegen offsets back along the
+            pose's own tool-Z axis by the approach distance above.
           </div>
 
         </div>
@@ -3376,6 +3714,18 @@ export default function ProgramEditor() {
   // to a step inside a routine broadcast to sibling iterations
   // regardless of fold state (see broadcast helper below).
   const [expandedRoutines, setExpandedRoutines] = useState(() => new Set())
+  // 2026-08-06 palletize completeness — inline expand of the
+  // move_to_pallet step to a read-only preview of its cycle template.
+  // Set of step ids currently expanded. Persists only in this
+  // editor's memory (no localStorage — collapsing on remount is fine).
+  const [palletExpandedIds, setPalletExpandedIds] = useState(() => new Set())
+  const togglePalletExpanded = (id) => {
+    setPalletExpandedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }
   const [selectedId, setSelectedId]         = useState(null)
   const [dragId, setDragId]                 = useState(null)
   const [dragOverId, setDragOverId]         = useState(null)
@@ -5429,6 +5779,32 @@ export default function ProgramEditor() {
                     </span>
                   </button>
                 )}
+                {/* 2026-08-06 palletize completeness — expand/fold chip
+                    for the move_to_pallet cycle template preview. The
+                    preview panel itself is rendered OUTSIDE the row
+                    (see the sibling <PalletExpansionPreview /> call
+                    lower in this component tree). */}
+                {_isPalletStep && (
+                  <button
+                    type="button"
+                    data-testid="pallet-step-expand-toggle"
+                    onClick={(e) => { e.stopPropagation(); togglePalletExpanded(step.id) }}
+                    title={
+                      palletExpandedIds.has(step.id)
+                        ? 'Hide the per-cycle template preview'
+                        : 'Show the per-cycle template (approach, pick, vacuum, transit, place, release)'
+                    }
+                    style={{
+                      marginLeft: 6, fontSize: 10, fontWeight: 700,
+                      padding: '3px 8px', borderRadius: 12,
+                      color: '#0f766e', background: '#ccfbf1',
+                      border: '1px solid #5eead4',
+                      display: 'inline-flex', alignItems: 'center', gap: 4,
+                      cursor: 'pointer', flexShrink: 0,
+                    }}>
+                    {palletExpandedIds.has(step.id) ? '▾ fold' : '▸ expand'}
+                  </button>
+                )}
               </div>
 
               {/* MIDDLE — title + detail line, fills the remaining width.
@@ -5697,6 +6073,18 @@ export default function ProgramEditor() {
               {/* /RIGHT */}
               </div>
               {/* /outer row */}
+
+              {/* 2026-08-06 palletize completeness — inline expandable
+                  preview of the move_to_pallet cycle template. Placed
+                  OUTSIDE the draggable row so operating the toggle
+                  never triggers a drag; indented under the row so the
+                  visual "child" relationship is unambiguous. */}
+              {_isPalletStep && palletExpandedIds.has(step.id) && (
+                <PalletExpansionPreview
+                  step={step}
+                  palletCfg={currentProgram?.config?.pallet || {}}
+                />
+              )}
 
               {indicator === 'after' && <InsertionBar />}
             </div>

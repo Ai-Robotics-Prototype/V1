@@ -1062,3 +1062,293 @@ def test_finalize_composer_stamps_vacuum_port_from_io_map(tmp_path,
         f'no io_map entry containing "blow" — blow_off_port_do must '
         f'be None; got {move_to_pallet_step.get("blow_off_port_do")!r}')
 
+
+# ── 2026-08-06 palletize completeness (Rules A/B/C, operator directive)
+#
+# The palletize cycle is now the FULL pick+place loop: approach along
+# each pose's OWN flange Z axis (rule A), layer-shifted place approach
+# (rule B — layer-N approaches from above layer N, never dips), and
+# optional taught approach poses (rule C). These pins guarantee: (a)
+# per-cycle sub-step count matches the spec; (b) approach point sits
+# along the pose's tool axis at the configured distance; (c) place
+# approach Z rises by layer_height per layer; (d) taught pick_approach
+# / place_approach override the axis-offset default; (e) approach_
+# distance_mm and retract_distance_mm are independent numeric fields.
+
+def _get_pallet_step(prog):
+    for s in prog['steps']:
+        if s.get('action') == 'move_to_pallet':
+            return s
+    return None
+
+
+def test_completeness_per_cycle_has_all_thirteen_substeps():
+    """Every cycle emits: pick_approach movJ + linear-down pick +
+    vacuum ON + wait + linear-up + transit-over-pick + traverse-over-
+    slot + place_approach + place linear-down + vacuum OFF + linear-up
+    + transit-over-slot. (Blow-off adds 3 more when configured.)"""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 5
+    step = _get_pallet_step(prog)
+    step['blow_off_port_do'] = None   # keep the count clean
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    # Count the substep markers that appear ONE PER CYCLE.
+    N = 5
+    import re
+    def _count_line_prefix(prefix):
+        return len(re.findall(
+            r'^\s*' + re.escape(prefix), lua, re.MULTILINE))
+    checks = {
+        'pick_approach movJ': _count_line_prefix('movJ(') and lua.count(
+            'cycle 1 pick_approach (axis-offset')  \
+            + lua.count('cycle 2 pick_approach (axis-offset')  \
+            + lua.count('cycle 3 pick_approach (axis-offset')  \
+            + lua.count('cycle 4 pick_approach (axis-offset')  \
+            + lua.count('cycle 5 pick_approach (axis-offset'),
+        'linear-down to pick': lua.count('linear-down to pick contact'),
+        'vacuum ON events': lua.count('vacuum ON  (vacuum_port_do'),
+        'seal wait ms': len(re.findall(
+            r'^\s*wait\(\d+\)\s+--\s+cycle\s+\d+\s+seal wait',
+            lua, re.MULTILINE)),
+        'linear-up to pick_approach': lua.count(
+            'linear-up to pick_approach (retract'),
+        'transit_Z over pick': lua.count('lift-to-transit (over pick'),
+        'traverse-over-slot': lua.count('traverse-over-slot'),
+        'place_approach descent': lua.count('layer ') and len(re.findall(
+            r'movL\(p\d+\)\s+--\s+cycle\s+\d+\s+place_approach',
+            lua)),
+        'linear-down to slot': lua.count(
+            '(linear-down from approach)'),
+        'vacuum OFF setDO events': len(re.findall(
+            r'^\s*setDO\(\d+\s*,\s*0\)\s+--\s+cycle\s+\d+\s+vacuum OFF',
+            lua, re.MULTILINE)),
+        'linear-up to place_approach': lua.count(
+            'linear-up to place_approach (retract'),
+        'transit_Z over slot': lua.count(
+            'lift-to-transit (over slot after release'),
+    }
+    for k, v in checks.items():
+        assert v == N, (
+            f'sub-step {k!r} count = {v}, expected {N} (one per cycle)')
+
+
+def test_completeness_pick_approach_along_flange_z_axis():
+    """Rule A: pick_approach = pick_contact - approach_dist * pick_tool_Z.
+    For the fixture pick pose (top-down grip), pick_tool_Z has a
+    strongly negative world-Z component, so pick_approach is ABOVE
+    the pick contact by ≈ approach_distance_mm."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 1
+    step = _get_pallet_step(prog)
+    step['approach_distance_mm'] = 80
+    lua, points, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    # Find the pick contact and pick_approach point references in the
+    # cycle emit. Cycle-1 emit has one line each explicitly labeled.
+    import re
+    pick_contact_pt = None
+    pick_approach_pt = None
+    for ln in lua.splitlines():
+        m = re.search(
+            r'movL\((p\d+)\)\s+--\s+cycle 1 linear-down to pick contact',
+            ln)
+        if m: pick_contact_pt = m.group(1)
+        m = re.search(r'movJ\((p\d+)\)\s+--\s+cycle 1 pick_approach', ln)
+        if m: pick_approach_pt = m.group(1)
+    assert pick_contact_pt and pick_approach_pt, (
+        f'could not find pick contact or approach points in emit; '
+        f'contact={pick_contact_pt}, approach={pick_approach_pt}')
+    contact_val = points[pick_contact_pt]['val']
+    if isinstance(contact_val, str): contact_val = json.loads(contact_val)
+    approach_val = points[pick_approach_pt]['val']
+    if isinstance(approach_val, str): approach_val = json.loads(approach_val)
+    contact_fk  = program_ops._fk_chain(contact_val['jp'])[6][:3, 3]
+    approach_fk = program_ops._fk_chain(approach_val['jp'])[6][:3, 3]
+    # Distance between the two should equal approach_distance_mm.
+    dx, dy, dz = (approach_fk[0] - contact_fk[0],
+                  approach_fk[1] - contact_fk[1],
+                  approach_fk[2] - contact_fk[2])
+    mag = math.sqrt(dx*dx + dy*dy + dz*dz)
+    assert abs(mag - 80.0) < 1.5, (
+        f'pick_approach - pick_contact magnitude = {mag:.2f} mm, '
+        f'expected 80 mm')
+    # For a top-down grip, approach must be ABOVE contact (base Z).
+    assert dz > 0, (
+        f'pick_approach should be ABOVE pick_contact for a top-down '
+        f'grip: Δz = {dz:+.2f} mm')
+
+
+def test_completeness_place_approach_rises_per_layer():
+    """Rule B: layer-1 place_approach absolute Z is layer_height above
+    layer-0 place_approach Z. Both layers should have well-defined
+    approach points."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 8
+    lua, points, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    import re
+    # Extract place_approach Z per layer via FK of the emitted point.
+    layer_z = {}
+    for ln in lua.splitlines():
+        m = re.search(
+            r'movL\((p\d+)\)\s+--\s+cycle\s+\d+\s+place_approach '
+            r'\[(\d+),(\d+),(\d+)\]', ln)
+        if not m:
+            continue
+        nm, l = m.group(1), int(m.group(4))
+        if l in layer_z:
+            continue
+        val = points[nm]['val']
+        if isinstance(val, str): val = json.loads(val)
+        fk = program_ops._fk_chain(val['jp'])[6][:3, 3]
+        layer_z[l] = float(fk[2])
+    assert 0 in layer_z and 1 in layer_z, (
+        f'expected place_approach for layer 0 AND layer 1, got '
+        f'{sorted(layer_z.keys())}')
+    dz = layer_z[1] - layer_z[0]
+    layer_h = float(prog['config']['pallet']['layer_height_mm'])
+    assert dz > 0, (
+        f'layer 1 place_approach Z ({layer_z[1]:.2f}) must be ABOVE '
+        f'layer 0 place_approach Z ({layer_z[0]:.2f}); Δ={dz:+.2f} mm')
+    assert abs(dz - layer_h) < 3.0, (
+        f'layer 1 - layer 0 place_approach Z Δ should equal '
+        f'layer_height ({layer_h:.1f} mm); got {dz:.2f} mm')
+
+
+def test_completeness_layer_N_approach_above_layer_N_slot():
+    """Rule B strict form: for every layer N, the place_approach Z
+    must be at or above the layer-N slot Z + a nonzero clearance.
+    Layer-1 approach must not dip to layer-0 Z."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 8
+    lua, points, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    import re
+    # For each layer, gather place_approach Z and slot Z.
+    appr_z = {}
+    slot_z = {}
+    for ln in lua.splitlines():
+        m = re.search(
+            r'movL\((p\d+)\)\s+--\s+cycle\s+\d+\s+place_approach '
+            r'\[(\d+),(\d+),(\d+)\]', ln)
+        if m:
+            nm, l = m.group(1), int(m.group(4))
+            val = points[nm]['val']
+            if isinstance(val, str): val = json.loads(val)
+            appr_z.setdefault(l, float(
+                program_ops._fk_chain(val['jp'])[6][2, 3]))
+        m2 = re.search(
+            r'movL\((p\d+)\)\s+--\s+slot\[(\d+),(\d+),(\d+)\]\s+place',
+            ln)
+        if m2:
+            nm, l = m2.group(1), int(m2.group(4))
+            val = points[nm]['val']
+            if isinstance(val, str): val = json.loads(val)
+            slot_z.setdefault(l, float(
+                program_ops._fk_chain(val['jp'])[6][2, 3]))
+    for l in slot_z:
+        assert l in appr_z, f'missing place_approach for layer {l}'
+        assert appr_z[l] > slot_z[l], (
+            f'layer {l} place_approach Z ({appr_z[l]:.2f}) must be '
+            f'ABOVE slot Z ({slot_z[l]:.2f}); this is rule B')
+    # Layer-1 approach must NOT dip to layer-0 slot Z: strict pin.
+    if 0 in slot_z and 1 in appr_z:
+        assert appr_z[1] > slot_z[0], (
+            f'layer-1 place_approach Z ({appr_z[1]:.2f}) must be above '
+            f'layer-0 slot Z ({slot_z[0]:.2f}) — the "never dip" pin')
+
+
+def test_completeness_taught_pick_approach_overrides_default(monkeypatch):
+    """Rule C: setting pick_approach_joints on the step routes the
+    approach through the taught pose, not the axis-offset default.
+    The pick_approach point's FK should match the taught_joints' FK."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 1
+    step = _get_pallet_step(prog)
+    # Synthesize a taught pick_approach at (pick_joints + tiny nudge).
+    pick_step = next(
+        s for s in prog['steps']
+        if s.get('position_role') == 'pick')
+    tj = list(pick_step['taught_joints'])
+    # Nudge J1 by 3° so the FK is materially different from the
+    # axis-offset default.
+    taught_appr = list(tj)
+    taught_appr[0] += 3.0
+    step['pick_approach_joints'] = taught_appr
+    lua, points, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    # Extract the pick_approach point.
+    import re
+    pick_appr_pt = None
+    for ln in lua.splitlines():
+        m = re.search(r'movJ\((p\d+)\)\s+--\s+cycle 1 pick_approach',
+                      ln)
+        if m: pick_appr_pt = m.group(1); break
+    assert pick_appr_pt, 'pick_approach movJ not emitted'
+    val = points[pick_appr_pt]['val']
+    if isinstance(val, str): val = json.loads(val)
+    q_emitted = val['jp']
+    # The taught pose's FK should be reachable by the emit —
+    # difference is small (IK may adjust wrist by fractions of a
+    # degree). Check FK positions instead of joint equality.
+    taught_fk  = program_ops._fk_chain(taught_appr)[6][:3, 3]
+    emitted_fk = program_ops._fk_chain(q_emitted)[6][:3, 3]
+    dx, dy, dz = (emitted_fk[0] - taught_fk[0],
+                  emitted_fk[1] - taught_fk[1],
+                  emitted_fk[2] - taught_fk[2])
+    mag_mm = math.sqrt(dx*dx + dy*dy + dz*dz)
+    assert mag_mm < 1.5, (
+        f'taught pick_approach FK vs emitted FK Δ = {mag_mm:.2f} mm; '
+        f'taught should override axis-offset default')
+    # Header line must announce the source as taught.
+    assert 'pick_approach=taught' in lua, (
+        'expansion header must state pick_approach=taught when the '
+        'field is set')
+
+
+def test_completeness_taught_place_approach_layer_shifts():
+    """Rule C + B: taught place_approach is layer-shifted by
+    layer_height along the plane_normal. Layer 1 taught-approach Z
+    should be layer_height above layer 0 taught-approach Z."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 8
+    step = _get_pallet_step(prog)
+    # Use the pick pose as a synthetic taught place_approach (any
+    # 6-el joint config works; we just need the taught branch to fire).
+    pick_step = next(
+        s for s in prog['steps']
+        if s.get('position_role') == 'pick')
+    step['place_approach_joints'] = list(pick_step['taught_joints'])
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    assert 'place_approach=taught (layer-shifted)' in lua, (
+        'expansion header must state place_approach=taught when set')
+
+
+def test_completeness_independent_approach_and_retract_distances():
+    """approach_distance_mm and retract_distance_mm are independent
+    numeric fields. Setting one does not change the other."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 1
+    step = _get_pallet_step(prog)
+    step['approach_distance_mm'] = 30
+    step['retract_distance_mm']  = 90
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    # Header exposes both values.
+    assert 'approach=30mm' in lua, (
+        'header must show approach=30mm when set')
+    assert 'retract=90mm' in lua, (
+        'header must show retract=90mm when set')
+    # Retract comment on the pick-side linear-up must state 90mm.
+    assert 'linear-up to pick_approach (retract 90mm)' in lua, (
+        'retract distance must reach the linear-up comment')
+

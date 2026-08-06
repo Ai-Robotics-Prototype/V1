@@ -828,6 +828,16 @@ def _build_palletize(op: IntentOperation, mode: str,
         'blow_off_pulse_ms':  300,
         'safety_margin_mm':   50,
         'seal_wait_ms':       500,
+        # 2026-08-06 palletize completeness — rule A/B/C:
+        # approach & retract distances (mm) along the pose's OWN
+        # flange Z axis. Editable per program.
+        'approach_distance_mm': 50,
+        'retract_distance_mm':  50,
+        # Optional taught approach poses (rule C). Absent = axis-
+        # offset default. When taught they carry a 6-element
+        # taught_joints so the codegen can FK to a TCP.
+        'pick_approach_joints':  None,
+        'place_approach_joints': None,
         # Legacy fingers-only fields retained so old codegens (and
         # depalletize's non-vacuum path) still find `io_open` /
         # `io_close`. New codegen prefers vacuum_port_do.
