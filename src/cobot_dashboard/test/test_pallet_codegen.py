@@ -758,3 +758,307 @@ def test_pick_block_replay_repeats_pick_contact_reference():
             f'pick contact point {pick_ref!r} must be referenced '
             f'once per cycle (5 times for part_count=5); got '
             f'{n_refs} references')
+
+
+# ── 2026-08-06 finalize palletize subroutine (operator directive) ──
+#
+# The palletize cycle is now emitted inline per iteration with dynamic
+# transit_Z. These pins guarantee: (a) transit_Z rises per layer as
+# transit_Z(l) = slot_Z(l) + layer_height + safety_margin; (b) blow-off
+# is optional and pulse fires when configured; (c) vacuum port sources
+# from move_to_pallet.vacuum_port_do (which the composer stamps from
+# io_map — NOT hardcoded); (d) OFF matches ON per cycle (vacuum
+# de-energize, not a separate finger release IO); (e) cycle count is
+# driven by part_count.
+
+def _extract_place_layer_z_mm(prog, lua, points):
+    """Given the emitted Lua and points table, extract {layer_l:
+    slot_Z_mm} by FK-ing the joint config from each 'slot[r,c,l] place'
+    line. FK returns mm in base frame; taking [2] gives Z."""
+    import re
+    result = {}
+    for ln in lua.splitlines():
+        m = re.search(
+            r'movL\((p\d+)\)\s+--\s+slot\[(\d+),(\d+),(\d+)\]\s+place\b',
+            ln)
+        if not m:
+            continue
+        nm = m.group(1); l = int(m.group(4))
+        val = points[nm]['val']
+        if isinstance(val, str): val = json.loads(val)
+        fk = program_ops._fk_chain(val['jp'])[6][:3, 3]
+        result.setdefault(l, float(fk[2]))
+    return result
+
+
+def _extract_transit_over_slot_z_mm(prog, lua, points):
+    """Similar to _extract_place_layer_z_mm but for the 'traverse-over-
+    slot' emit line — this is the transit_Z above the slot (before
+    lowering). One per cycle; the first cycle per layer suffices."""
+    import re
+    result = {}
+    for ln in lua.splitlines():
+        m = re.search(
+            r'movL\((p\d+)\)\s+--\s+cycle\s+\d+\s+traverse-over-slot '
+            r'\[(\d+),(\d+),(\d+)\]', ln)
+        if not m:
+            continue
+        nm = m.group(1); l = int(m.group(4))
+        val = points[nm]['val']
+        if isinstance(val, str): val = json.loads(val)
+        fk = program_ops._fk_chain(val['jp'])[6][:3, 3]
+        result.setdefault(l, float(fk[2]))
+    return result
+
+
+def test_finalize_transit_z_rises_per_layer():
+    """transit_Z(layer 1) > transit_Z(layer 0). The delta must equal
+    layer_height_mm within IK convergence tolerance. Guards against
+    a regression where transit_h collapses to a per-cycle constant
+    that doesn't rise per layer."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 8   # full capacity so
+                                                 # we see both layers
+    lua, points, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    layer_z_mm = _extract_transit_over_slot_z_mm(prog, lua, points)
+    assert 0 in layer_z_mm and 1 in layer_z_mm, (
+        f'expected transit_over_slot for layer 0 and 1, got '
+        f'{sorted(layer_z_mm.keys())}')
+    dz = layer_z_mm[1] - layer_z_mm[0]
+    layer_h = float(prog['config']['pallet']['layer_height_mm'])
+    assert dz > 0, (
+        f'transit_Z must rise per layer: layer 0 Z={layer_z_mm[0]:.2f} '
+        f'mm, layer 1 Z={layer_z_mm[1]:.2f} mm, Δ={dz:+.2f} mm')
+    # Δ = layer_height (transit_Z(l) - transit_Z(l-1) = layer_h).
+    assert abs(dz - layer_h) < 2.0, (
+        f'transit_Z should rise by layer_height ({layer_h:.1f} mm) '
+        f'per layer; got Δ={dz:.2f} mm')
+
+
+def test_finalize_transit_z_formula():
+    """transit_Z(layer) = slot_Z(layer) + layer_height + safety_margin.
+    Verified by FK-ing the transit-over-slot emit and comparing to
+    (place slot's FK Z) + (layer_height + safety_margin)."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 8
+    # Explicit safety_margin on the step so we can verify the formula.
+    for s in prog['steps']:
+        if s.get('action') == 'move_to_pallet':
+            s['safety_margin_mm'] = 75   # non-default; forces the
+                                         # test to see the formula, not
+                                         # the default 50
+    lua, points, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    place_z   = _extract_place_layer_z_mm(prog, lua, points)
+    transit_z = _extract_transit_over_slot_z_mm(prog, lua, points)
+    layer_h_mm = float(prog['config']['pallet']['layer_height_mm'])
+    margin_mm  = 75.0
+    for l in (0, 1):
+        assert l in place_z and l in transit_z, (
+            f'missing FK for layer {l}: place_z={place_z}, transit_z={transit_z}')
+        want = place_z[l] + layer_h_mm + margin_mm
+        got  = transit_z[l]
+        # Allow ~1mm slop for IK convergence and plane_normal deviation
+        # from pure +Z (the fixture's corner1/corner2/corner3 span a
+        # near-horizontal plane so plane_normal ≈ +Z, but not exactly).
+        assert abs(got - want) < 3.0, (
+            f'layer {l}: transit_Z should equal slot_Z+layer_h+margin '
+            f'= {place_z[l]:.2f} + {layer_h_mm:.1f} + {margin_mm:.1f} '
+            f'= {want:.2f} mm; got {got:.2f} mm')
+
+
+def test_finalize_safety_margin_editable_default_50():
+    """safety_margin_mm=50 is the default when the field is absent
+    on move_to_pallet. Setting it to a different value shifts the
+    transit_Z by exactly that delta."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 4
+    # Compare emit with default (implicit 50) vs explicit 150.
+    lua_default, pts_default, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    prog2 = json.loads(json.dumps(prog))
+    for s in prog2['steps']:
+        if s.get('action') == 'move_to_pallet':
+            s['safety_margin_mm'] = 150
+    lua_150, pts_150, _ = program_ops.codegen_lua_from_program(
+        prog2, operator_speed_limit_pct=25)
+    z_def = _extract_transit_over_slot_z_mm(prog, lua_default, pts_default)
+    z_150 = _extract_transit_over_slot_z_mm(prog2, lua_150, pts_150)
+    assert 0 in z_def and 0 in z_150, (
+        f'missing layer 0 transit_Z in one emit: default={z_def}, '
+        f'safety_margin=150={z_150}')
+    delta = z_150[0] - z_def[0]
+    assert abs(delta - 100.0) < 3.0, (
+        f'raising safety_margin_mm 50→150 should raise transit_Z by '
+        f'100 mm; got Δ={delta:.2f} mm')
+
+
+def test_finalize_vacuum_off_matches_vacuum_on():
+    """Under the finalize spec, release is vacuum de-energize (setDO
+    vac_port, 0), NOT a separate finger release IO. Every cycle:
+    one setDO(vac,1) at pick paired with one setDO(vac,0) at place."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 5
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    # Extract the vacuum port used by the codegen from the emitted
+    # header comment (which names vacuum_port=DO<N>).
+    import re
+    m = re.search(r'vacuum_port=DO(\d+)', lua)
+    assert m, 'expansion header must name vacuum_port=DO<N>'
+    vac_port = int(m.group(1))
+    n_on  = len(re.findall(rf'^\s*setDO\({vac_port}\s*,\s*1\)\s', lua,
+                           re.MULTILINE))
+    n_off = len(re.findall(rf'^\s*setDO\({vac_port}\s*,\s*0\)\s', lua,
+                           re.MULTILINE))
+    assert n_on == 5 and n_off == 5, (
+        f'expected 5 vacuum-ON and 5 vacuum-OFF (finalize spec: one '
+        f'of each per cycle); got on={n_on}, off={n_off}')
+
+
+def test_finalize_blow_off_optional_absent_by_default_on_holepart():
+    """holepartpalletize's io_map may not define a 'blow' port. In
+    that case the pallet expansion emits only vacuum-off (no pulse).
+    The header line should say `blow_off=none` and no blow-off pulse
+    lines appear."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 3
+    # Force blow_off_port_do = None on the step (composer default when
+    # no 'blow' entry in io_map).
+    for s in prog['steps']:
+        if s.get('action') == 'move_to_pallet':
+            s['blow_off_port_do'] = None
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    assert 'blow_off=none' in lua, (
+        'expansion header must state blow_off=none when no blow port '
+        'configured')
+    assert 'blow-off pulse' not in lua, (
+        'no blow-off pulse should emit when blow_off_port_do is None')
+
+
+def test_finalize_blow_off_present_when_configured():
+    """Setting blow_off_port_do on the step emits a pulse: setDO(N,1)
+    → wait(pulse_ms) → setDO(N,0). One pulse per cycle."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 4
+    for s in prog['steps']:
+        if s.get('action') == 'move_to_pallet':
+            s['blow_off_port_do']   = 3
+            s['blow_off_pulse_ms']  = 250
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    import re
+    n_pulse_start = len(re.findall(
+        r'^\s*setDO\(3\s*,\s*1\)\s+--\s+.*blow-off pulse start',
+        lua, re.MULTILINE))
+    n_pulse_end   = len(re.findall(
+        r'^\s*setDO\(3\s*,\s*0\)\s+--\s+.*blow-off pulse end',
+        lua, re.MULTILINE))
+    n_pulse_wait  = len(re.findall(
+        r'^\s*wait\(250\)\s+--\s+blow-off pulse 250 ms',
+        lua, re.MULTILINE))
+    assert n_pulse_start == 4 and n_pulse_end == 4 and n_pulse_wait == 4, (
+        f'expected 4 blow-off pulses for part_count=4; got start='
+        f'{n_pulse_start} end={n_pulse_end} wait={n_pulse_wait}')
+
+
+def test_finalize_vacuum_port_read_from_composer_field_not_hardcoded():
+    """The vacuum port is stamped on the move_to_pallet step by the
+    composer (from io_map). Changing vacuum_port_do on the step
+    updates the emitted setDO port — proves the codegen is NOT
+    hardcoded to a specific DO."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 3
+    for s in prog['steps']:
+        if s.get('action') == 'move_to_pallet':
+            s['vacuum_port_do'] = 7
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    assert 'vacuum_port=DO7' in lua, (
+        'header must reflect the step\'s vacuum_port_do field')
+    import re
+    n_on  = len(re.findall(r'^\s*setDO\(7\s*,\s*1\)\s', lua, re.MULTILINE))
+    n_off = len(re.findall(r'^\s*setDO\(7\s*,\s*0\)\s', lua, re.MULTILINE))
+    assert n_on == 3 and n_off == 3, (
+        f'setDO(7, ..) count for part_count=3: on={n_on}, off={n_off}')
+
+
+def test_finalize_part_count_drives_cycle_count():
+    """Changing part_count changes the emitted cycle count (already
+    covered by pre-existing tests, but pinned again here as part of
+    the finalize contract)."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    for n in (1, 2, 5, 8):
+        prog['config']['pallet']['part_count'] = n
+        lua, _, _ = program_ops.codegen_lua_from_program(
+            prog, operator_speed_limit_pct=25)
+        assert lua.count('pallet release') == n, (
+            f'part_count={n} must produce {n} pallet release events; '
+            f'got {lua.count("pallet release")}')
+
+
+def test_finalize_composer_stamps_vacuum_port_from_io_map(tmp_path,
+                                                           monkeypatch):
+    """The composer reads /opt/cobot/io_map.json for the vacuum
+    keyword and stamps the port on move_to_pallet. A synthetic io_map
+    with vacuum on DO5 must produce vacuum_port_do=5 — proves the
+    codegen field is NOT hardcoded, it flows from the io_map."""
+    sys.path.insert(0, os.path.abspath(os.path.join(HERE, '..', '..',
+                                                     'programming_by_demonstration')))
+    from programming_by_demonstration import program_composer as pc
+    from programming_by_demonstration.schema import (
+        StructuredIntent, IntentOperation, PoseSlot, PartReference,
+        PalletSpec,
+    )
+    # Point the composer at a temp io_map.json with vacuum on DO5.
+    fake_map = tmp_path / 'io_map.json'
+    fake_map.write_text(json.dumps({
+        'plate': [{
+            'terminals': [
+                {'name': 'DO2', 'kind': 'DO', 'port': 2, 'role': 'signal'},
+                {'name': 'DO5', 'kind': 'DO', 'port': 5, 'role': 'signal'},
+            ],
+        }],
+        'ports': {
+            'DO5': {'assignment': 'Vacuum'},
+            'DO2': {'assignment': 'Unassigned'},
+        },
+    }))
+    monkeypatch.setattr(pc, '_IO_MAP_PATH', str(fake_map))
+    intent = StructuredIntent(
+        task_summary='pallet vacuum test',
+        operations=[IntentOperation(
+            operation_type='palletize',
+            target_part=PartReference(part_id='test-part', name='test-part'),
+            sequence_index=1,
+            effector='vacuum',
+            pick=PoseSlot(location_hint='parts feed'),
+            place=PoseSlot(
+                location_hint='pallet slot [computed at runtime]'),
+            pallet=PalletSpec(rows=2, cols=2, layers=1),
+        )],
+    )
+    draft = pc.compose_program_draft(intent, demo_id='t',
+                                     program_name='t')
+    move_to_pallet_step = next(
+        s for s in draft.steps
+        if s.get('action') == 'move_to_pallet')
+    assert move_to_pallet_step.get('vacuum_port_do') == 5, (
+        f'composer must stamp vacuum_port_do from io_map; got '
+        f'{move_to_pallet_step.get("vacuum_port_do")!r}')
+    # And the same io_map ought to fill (or not) blow_off_port_do.
+    # No 'Blow' entry in fake_map → composer field is None.
+    assert move_to_pallet_step.get('blow_off_port_do') is None, (
+        f'no io_map entry containing "blow" — blow_off_port_do must '
+        f'be None; got {move_to_pallet_step.get("blow_off_port_do")!r}')
+

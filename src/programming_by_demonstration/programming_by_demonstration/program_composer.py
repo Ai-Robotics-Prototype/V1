@@ -812,20 +812,46 @@ def _build_palletize(op: IntentOperation, mode: str,
     # appH — reuses the existing 200 mm literal from the pre-change
     # composer so pallet programs keep the same clearance envelope.
     palletH = 200
+    # 2026-08-06 (finalize palletize subroutine, operator directive):
+    # vacuum + blow-off ports read from the io_map once and stamped
+    # onto move_to_pallet so codegen doesn't fork port meanings.
+    # Absent io_map entries fall back to composer defaults.
+    _eff_type   = _effector_of(op)
+    _vac_port   = _io_map_port_for('vacuum', kind='DO',
+                                   default_port=_VACUUM_DEFAULT_PORT)
+    _blow_port  = _io_map_port_for('blow', kind='DO',
+                                   default_port=None)
+    _pallet_io_block: Dict[str, Any] = {
+        'gripper_type':       _eff_type,
+        'vacuum_port_do':     _vac_port,
+        'blow_off_port_do':   _blow_port,   # None → no pulse
+        'blow_off_pulse_ms':  300,
+        'safety_margin_mm':   50,
+        'seal_wait_ms':       500,
+        # Legacy fingers-only fields retained so old codegens (and
+        # depalletize's non-vacuum path) still find `io_open` /
+        # `io_close`. New codegen prefers vacuum_port_do.
+        'io_open':            'DO1',
+        'io_close':           'DO0',
+    }
     if mode == 'palletize':
-        # Detect emission RETIRED — see _build_pick_and_place.
-        s.append(_above('pick', 'Approach above pick', appH, spd))
+        # Under the 2026-08-06 finalize spec, the palletize cycle
+        # is a single self-contained loop emitted INSIDE the codegen
+        # expansion. The composer now stakes ONLY the taught pick
+        # pose (position_role='pick') so the operator can teach it;
+        # the surrounding motion (approach descent, vacuum ON, seal
+        # wait, transit lift, retreat) is emitted per cycle by the
+        # codegen with dynamic transit heights. This eliminates the
+        # pre-fix "1 vacuum-ON + N releases" I/O pairing bug and
+        # lets transit_Z rise per layer.
         s.append(_pick_contact(op.pick.location_hint, slow))
-        s.extend(_effector_engage(op))
-        s.append(_above('pick', 'Retreat above pick', palletH, medium))
         s.append({
             'action': 'move_to_pallet',
             'mode':   'palletize',
             'label':  label_for('pallet_place'),
             'pallet_phase': 'place',
-            'gripper_type': 'finger',
-            'io_open': 'DO1', 'io_close': 'DO0',
             'speed_pct': slow,
+            **_pallet_io_block,
             **_placeholder('place', op.place.location_hint),
         })
     else:
@@ -834,9 +860,8 @@ def _build_palletize(op: IntentOperation, mode: str,
             'mode':   'depalletize',
             'label':  label_for('pallet_pick'),
             'pallet_phase': 'pick',
-            'gripper_type': 'finger',
-            'io_open': 'DO1', 'io_close': 'DO0',
             'speed_pct': slow,
+            **_pallet_io_block,
             **_placeholder('pick', op.pick.location_hint),
         })
         s.append(_above('place', 'Approach above place', palletH, spd))

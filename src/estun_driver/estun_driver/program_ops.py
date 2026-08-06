@@ -94,6 +94,35 @@ def _dh_transform(theta, d_mm, a_mm, alpha):
     ])
 
 
+def _tcp_from_joints_m(q_deg):
+    """FK a joint config to a 6-vector (x_m, y_m, z_m, a_rad, b_rad,
+    c_rad) matching the driver's taught_tcp convention: position in
+    meters, orientation as Fixed-XYZ Euler radians (R = Rz(c)·Ry(b)·
+    Rx(a); the inverse of _R_from_tcp_abc). Used by the palletize
+    expansion to compute transit poses above the taught pick pose.
+
+    Gimbal lock (b near ±90°) collapses a,c to a single angle;
+    handled by pinning a=0 and solving for c from the top-left 2x2.
+    Palletize pick poses are nowhere near gimbal lock in practice
+    but the branch keeps the helper robust for future callers.
+    """
+    Ts = _fk_chain(q_deg)
+    R = Ts[6][:3, :3]
+    p_mm = Ts[6][:3, 3]
+    b = math.atan2(-float(R[2, 0]),
+                   math.sqrt(float(R[2, 1])**2 + float(R[2, 2])**2))
+    if math.cos(b) > 1e-6:
+        a = math.atan2(float(R[2, 1]), float(R[2, 2]))
+        c = math.atan2(float(R[1, 0]), float(R[0, 0]))
+    else:
+        a = 0.0
+        c = math.atan2(-float(R[0, 1]), float(R[1, 1]))
+    return (float(p_mm[0]) / 1000.0,
+            float(p_mm[1]) / 1000.0,
+            float(p_mm[2]) / 1000.0,
+            a, b, c)
+
+
 def _fk_chain(q_deg):
     """Forward kinematics for the fitted DH. Returns a list T_0..T_6
     (each a 4x4 numpy array). T_6[:3, 3] is the flange (mm) in the
@@ -3839,20 +3868,28 @@ def codegen_lua_from_program(
         })
         _lm_pending = None
 
-    # 2026-08-06 (Blocker A I/O pairing fix): pre-scan for palletize
-    # `move_to_pallet` + its preceding pick block. The composer emits
-    # the pick sequence ONCE before `move_to_pallet` (approach-above-
-    # pick → pick-contact → engage-vacuum → wait → retreat-above-
-    # pick); the expansion then emits N slot places. Pre-fix, this
-    # produced ONE vacuum-ON and N releases — the arm dropped
-    # nothing on releases 2..N. Correct: N full self-contained pick+
-    # place cycles, N vacuum-ONs paired with N releases. We solve
-    # this by SNAPSHOTTING the pick-block's emitted Lua lines the
-    # first time they emit, then interleaving that snapshot before
-    # each subsequent slot's place. The pick pose is ONE fixed
-    # taught pose (single `position_role='pick'` step), so verbatim
-    # replay yields identical arm motion each cycle.
-    _pallet_pick_block = None
+    # 2026-08-06 (finalize palletize subroutine, operator directive):
+    # pre-scan for palletize `move_to_pallet` and mark surrounding
+    # pre-pick and engage/wait/retreat steps for ABSORPTION. Under
+    # the finalize spec, the pallet expansion emits the FULL pick+
+    # place cycle inline per iteration (movJ pick → vacuum ON → seal
+    # wait → transit_Z lift → over slot → down to slot → vacuum OFF
+    # → optional blow-off pulse → transit_Z lift). Standalone
+    # emission of the OLD-shape pre-pick sequence (approach-above-
+    # pick, engage set_io, seal wait, retreat-above-pick) would
+    # duplicate vacuum events, so we suppress them in the walker.
+    # The taught pick_contact step (position_role='pick') is KEPT —
+    # its emission declares the point in varspoint so the expansion
+    # can reference it via `role_point_name['pick']`.
+    #
+    # This also picks up any pre-composer legacy shape where the
+    # engage set_io names a specific DO port (e.g. DO2 on the wire-
+    # verified holepartpalletize fixture); that port is inferred as
+    # the vacuum port when the newer `vacuum_port_do` field isn't
+    # present on move_to_pallet yet.
+    _pallet_absorb_step_ids: set = set()
+    _pallet_inferred_vac_port: int | None = None
+    _pallet_inferred_seal_wait_ms: int | None = None
     for _pmi, _pms in enumerate(steps):
         if str(_pms.get('action') or '').lower() != 'move_to_pallet':
             continue
@@ -3862,44 +3899,44 @@ def codegen_lua_from_program(
                          or 'palletize').lower()
         if _pmode != 'palletize':
             continue
-        # Walk backward through steps to find the pick block. Robust
-        # to variable-length engage (vacuum = set_io + wait; magnet
-        # = set_io only; gripper = close_gripper — treated as set_io/
-        # wait engagement pattern via the composer's helpers).
         _j = _pmi - 1
-        if _j < 0:
+        while _j >= 0:
+            _st = steps[_j]
+            _act = str(_st.get('action') or '').lower()
+            _derived = _st.get('derived_from')
+            # (a) approach/retreat above pick → absorb.
+            if _act == 'move_linear' and _derived == 'pick':
+                _pallet_absorb_step_ids.add(id(_st))
+                _j -= 1
+                continue
+            # (b) engage: set_io / wait / gripper helpers → absorb,
+            # and infer vacuum port/seal wait from the emit metadata
+            # for legacy programs that lack move_to_pallet.
+            # vacuum_port_do.
+            if _act in ('wait', 'set_io', 'close_gripper',
+                        'open_gripper', 'gripper'):
+                _pallet_absorb_step_ids.add(id(_st))
+                if _act == 'set_io' and int(_st.get('value') or 0) == 1:
+                    _iid = str(_st.get('io_id') or '')
+                    _mm = _re.match(r'^DO(\d+)$', _iid, _re.IGNORECASE)
+                    if _mm and _pallet_inferred_vac_port is None:
+                        _pallet_inferred_vac_port = int(_mm.group(1))
+                if _act == 'wait' and _pallet_inferred_seal_wait_ms is None:
+                    try:
+                        _dur = float(_st.get('duration_s') or 0)
+                        _pallet_inferred_seal_wait_ms = int(round(_dur * 1000))
+                    except (TypeError, ValueError):
+                        pass
+                _j -= 1
+                continue
+            # (c) pick_contact (position_role='pick') — KEEP; anchors
+            # the absorb window.
+            if _st.get('position_role') == 'pick' \
+                    and _act == 'move_linear':
+                break
+            # Anything else — stop scanning.
             break
-        _rr = steps[_j]
-        if str(_rr.get('action') or '').lower() != 'move_linear' \
-                or _rr.get('derived_from') != 'pick':
-            break
-        _end = _j
-        _j -= 1
-        while _j >= 0 and str(steps[_j].get('action') or '').lower() in (
-                'wait', 'set_io', 'close_gripper', 'open_gripper', 'gripper'):
-            _j -= 1
-        if _j < 0:
-            break
-        _pc = steps[_j]
-        if _pc.get('position_role') != 'pick' \
-                or str(_pc.get('action') or '').lower() != 'move_linear':
-            break
-        _j -= 1
-        if _j < 0:
-            break
-        _ap = steps[_j]
-        if str(_ap.get('action') or '').lower() != 'move_linear' \
-                or _ap.get('derived_from') != 'pick':
-            break
-        _pallet_pick_block = {
-            'start_idx':         _j,
-            'end_idx':           _end,
-            'move_to_pallet_idx': _pmi,
-        }
         break
-    # Emission-time state for the pick-block hoist.
-    _pallet_pick_line_start: int | None = None
-    _pallet_pick_replay: list[str] | None = None
 
     for _step_idx, step in enumerate(steps):
         _lm_close_pending()
@@ -3907,31 +3944,17 @@ def codegen_lua_from_program(
         _lm_pending = (_step_idx, step.get('id'), action,
                        len(exec_lines) + 1)
 
-        # Pick-block hoist snapshots (2026-08-06). See pre-scan
-        # comment above. Two hooks: reset modal-state trackers +
-        # snapshot the start line when entering the pick block; then
-        # capture exec_lines[start:] when we reach `move_to_pallet`.
-        # Resetting modal state guarantees the snapshot contains the
-        # setSpeedJ/setSpeedL/setBlender/setAccL lines the pick block
-        # needs — otherwise a modal-match at pick emit time would
-        # leave those lines out, and cycles 2..N would run at
-        # whatever speed the previous slot's lift left behind.
-        if _pallet_pick_block is not None:
-            if _step_idx == _pallet_pick_block['start_idx']:
-                _last_speed_j = None
-                _last_speed_l = None
-                _last_accl    = None
-                _blender_on   = None
-                _pallet_pick_line_start = len(exec_lines)
-            if (_step_idx == _pallet_pick_block['move_to_pallet_idx']
-                    and _pallet_pick_replay is None
-                    and _pallet_pick_line_start is not None):
-                _pallet_pick_replay = list(
-                    exec_lines[_pallet_pick_line_start:])
-                _last_speed_j = None
-                _last_speed_l = None
-                _last_accl    = None
-                _blender_on   = None
+        # Absorb pre-pick / engage / retreat steps into the palletize
+        # cycle (2026-08-06 finalize). See pre-scan comment above.
+        # The pallet expansion emits the full cycle inline; the OLD
+        # pre-emitted engage would double the vacuum-ON count.
+        if id(step) in _pallet_absorb_step_ids:
+            exec_lines.append(
+                f'-- absorbed into move_to_pallet cycle: '
+                f'{step.get("label") or action!r}  '
+                f'(action={action!r}; the pallet expansion emits its '
+                f'own vacuum ON/OFF + transit lifts per cycle)')
+            continue
 
         # Rule 2d adaptation: coalesce_with_prev — the analyzer
         # flagged this step as a micro-duplicate of the previous
@@ -4159,60 +4182,123 @@ def codegen_lua_from_program(
                     else:
                         _pc_note = f'part_count={part_count}/capacity={capacity}'
             # Slice the fill-order slot list to the first part_count.
-            # derive_slot_tcps already returns them in layer-outermost
-            # fill order (all of layer 0 first, then layer 1, ... —
-            # per _order_indices), so a slice truncates cleanly.
             slots = slots[:part_count]
-            # Approach / retract heights — travel path above each slot.
-            approach_h_mm = float(pold.get('approach_height_mm', 100) or 100)
-            retract_h_mm  = float(pold.get('retract_height_mm',  200) or 200)
-            # Frame normal — offset direction for approach/retract.
-            # Recomputed from taught corners so it's the true out-of-
-            # pallet direction, not just +Z_base.
+            # Frame normal — offset direction for the transit lifts.
             try:
                 from programming_by_demonstration.pallet_geometry import compute_frame
                 _fr = compute_frame(pspec)
                 _normal = _fr['plane_normal']   # unit vector (m)
             except Exception:
                 _normal = (0.0, 0.0, 1.0)   # fall back to +Z_base
-            # Seed for the first slot's IK: the last-emitted move's
-            # joints (typically the retreat-above-pick pose). Falls
-            # back to the pick contact taught_joints if no prior move
-            # has emitted yet.
-            _seed = last_move_joints
-            if _seed is None:
-                for _pick in steps:
-                    if _pick.get('position_role') == 'pick' \
-                            and isinstance(_pick.get('taught_joints'), list) \
-                            and len(_pick['taught_joints']) == 6:
-                        _seed = [float(v) for v in _pick['taught_joints']]
-                        break
-            if _seed is None:
+            # ── 2026-08-06 finalize palletize subroutine ────────────
+            # Full pick+place cycle inline. Read fields from the
+            # `move_to_pallet` step (composer-emitted; falls back to
+            # inference for legacy programs whose step lacks these):
+            #
+            #   vacuum_port_do    — DO to energize at pick, de-energize
+            #                        at place. Falls back to the port
+            #                        the ABSORBED engage set_io fired
+            #                        on (holepartpalletize legacy: DO2).
+            #   blow_off_port_do  — optional DO for release blow-off
+            #                        pulse. None → no pulse.
+            #   blow_off_pulse_ms — pulse duration for the blow-off.
+            #   safety_margin_mm  — added to layer_height to size the
+            #                        transit lift ABOVE the current
+            #                        slot. transit_Z rises per layer
+            #                        because it's applied above THIS
+            #                        layer's slot along the frame
+            #                        normal.
+            #   seal_wait_ms      — dwell after vacuum ON.
+            _step_grip_type = str(step.get('gripper_type') or 'finger').lower()
+            _vac_port_do = step.get('vacuum_port_do')
+            if _vac_port_do is None:
+                _vac_port_do = _pallet_inferred_vac_port
+            if _vac_port_do is None and _step_grip_type == 'vacuum':
+                _vac_port_do = 2   # io_map default (VACUUM_DEFAULT_PORT)
+            try:
+                _vac_port_do = int(_vac_port_do) if _vac_port_do is not None else None
+            except (TypeError, ValueError):
+                _vac_port_do = None
+            _blow_port_raw = step.get('blow_off_port_do')
+            try:
+                _blow_port_do = int(_blow_port_raw) if _blow_port_raw is not None else None
+            except (TypeError, ValueError):
+                _blow_port_do = None
+            try:
+                _blow_pulse_ms = int(step.get('blow_off_pulse_ms') or 300)
+            except (TypeError, ValueError):
+                _blow_pulse_ms = 300
+            try:
+                _safety_margin_mm = float(step.get('safety_margin_mm') or 50)
+            except (TypeError, ValueError):
+                _safety_margin_mm = 50.0
+            _seal_wait_ms = step.get('seal_wait_ms')
+            if _seal_wait_ms is None:
+                _seal_wait_ms = _pallet_inferred_seal_wait_ms or 500
+            try:
+                _seal_wait_ms = int(_seal_wait_ms)
+            except (TypeError, ValueError):
+                _seal_wait_ms = 500
+            _layer_h_mm = float(pold.get('layer_height_mm') or 100)
+            # Transit-lift height ABOVE the current slot along the
+            # frame normal. Same offset for every slot, but because
+            # slot_Z(l) rises with layer, transit_over_slot's absolute
+            # Z rises with layer too — the "clears the highest
+            # occupied layer" invariant.
+            _transit_h_mm = _layer_h_mm + _safety_margin_mm
+            # Locate the taught pick pose (position_role='pick',
+            # taught_joints). Its point was already declared in
+            # varspoint when the walker processed the pick_contact
+            # step (before this expansion fires); we reference it by
+            # role. `_pick_step` is used for FK → pick TCP.
+            _pick_step = None
+            for _s in steps:
+                if _s.get('position_role') == 'pick' \
+                        and isinstance(_s.get('taught_joints'), list) \
+                        and len(_s['taught_joints']) == 6:
+                    _pick_step = _s
+                    break
+            if _pick_step is None:
                 exec_lines.append(
-                    f'-- skipped {action!r}: no seed joints for slot '
-                    f'IK (no last motion, no pick anchor)')
+                    f'-- skipped {action!r}: no taught pick pose '
+                    f'(position_role=\'pick\' with 6-el taught_joints) '
+                    f'in the program — cannot expand palletize cycles')
                 continue
-            # Gripper IO: for palletize, RELEASE at each slot. For
-            # depalletize (op mode set on cfg.pallet_mode), CLOSE.
-            _mode = str(pold.get('pallet_mode') or cfg.get('pallet_mode') or 'palletize').lower()
-            _release_io = str(step.get('io_open')  or 'DO1').strip()
-            _grip_io    = str(step.get('io_close') or 'DO0').strip()
-            _fire_io    = _grip_io if _mode == 'depalletize' else _release_io
-            _fire_m = _re.match(r'^(DO|AO)(\d+)$', _fire_io, _re.IGNORECASE)
-            if not _fire_m:
-                exec_lines.append(
-                    f'-- skipped {action!r}: gripper IO {_fire_io!r} '
-                    f'is not a writable DO/AO')
-                continue
-            _fire_port = int(_fire_m.group(2))
-            # Speed splits mirror the executor's compound-motion:
-            # medium for retract-height traverses, slow for
-            # descent-to-slot and lift.
-            _step_pct = int(step.get('speed_pct') or eff_pct or 25)
+            _pick_joints = [float(v) for v in _pick_step['taught_joints']]
+            _pick_pt_name = role_point_name.get('pick')
+            if _pick_pt_name is None:
+                # Pick_contact hadn't emitted yet (unusual — the walker
+                # should have processed it before this step). Declare
+                # the point inline as a fallback so the cycle can
+                # still emit.
+                fallback_idx += 1
+                _pick_pt_name = f'{point_prefix}{fallback_idx}'
+                while _pick_pt_name in program_points or _pick_pt_name in used_named:
+                    fallback_idx += 1
+                    _pick_pt_name = f'{point_prefix}{fallback_idx}'
+                varspoint[_pick_pt_name] = _make_jp_point(_pick_joints, _pick_pt_name)
+                used_named.add(_pick_pt_name)
+                role_point_name['pick'] = _pick_pt_name
+            _pick_tcp = _tcp_from_joints_m(_pick_joints)   # (x,y,z,a,b,c)
+            # Speed splits mirror the previous compound-motion policy.
+            _step_pct   = int(step.get('speed_pct') or eff_pct or 25)
             _slow_pct   = max(5,  min(_step_pct, 20))
             _medium_pct = max(10, min(_step_pct, 40))
-            # Header comment for the expansion — makes the loop legible
-            # in the emitted Lua when reading top to bottom.
+            # Vacuum port is required for palletize (release = vacuum
+            # de-energize). If missing, refuse the expansion — a
+            # silent finger-DO fire would strand the arm without a
+            # release on non-finger effectors.
+            if _vac_port_do is None:
+                exec_lines.append(
+                    f'-- skipped {action!r}: no vacuum_port_do on step '
+                    f'and no engage set_io in the pre-pallet block to '
+                    f'infer it from — palletize needs a DO to energize '
+                    f'at pick and de-energize at place')
+                continue
+            # Expansion header.
+            _blow_desc = (f'DO{_blow_port_do}+{_blow_pulse_ms}ms'
+                          if _blow_port_do is not None
+                          else 'none')
             exec_lines.append(
                 f'-- move_to_pallet EXPANSION: {len(slots)} cycle(s) '
                 f'({_pc_note}), '
@@ -4221,125 +4307,151 @@ def codegen_lua_from_program(
                 f'pitch_col={pspec.pitch_col_mm:.0f}mm '
                 f'layer_h={pspec.layer_height_mm or 0:.0f}mm '
                 f'order={pspec.order} (layer-outermost)  '
-                f'release_io={_fire_io}')
+                f'vacuum_port=DO{_vac_port_do}  '
+                f'blow_off={_blow_desc}  '
+                f'safety_margin={_safety_margin_mm:.0f}mm  '
+                f'transit_h_above_slot={_transit_h_mm:.0f}mm '
+                f'(=layer_h+safety_margin; absolute transit_Z rises '
+                f'per layer)')
             _pallet_ok = True
-            # Save the initial seed (= retreat-above-pick joints from
-            # the just-emitted pick block) so cycles 2..N can reset
-            # their IK seed after the pick-block replay physically
-            # returns the arm there. Without this, cycle-2 IK would
-            # seed from slot-1-lift joints and could pick a different
-            # branch than the arm is actually in.
-            _pick_retreat_seed = list(_seed)
             for _sl_idx, _sl in enumerate(slots):
                 r_idx = int(_sl['row']); c_idx = int(_sl['col']); l_idx = int(_sl['layer'])
                 slot_m = list(_sl['tcp_m'])          # meters + a/b/c
-                # ── Cycle header + pick-block replay (I/O pairing
-                # fix, 2026-08-06). Cycle 1's pick was just emitted
-                # by the walker above; cycles 2..N replay the same
-                # captured pick block verbatim so each cycle carries
-                # its own vacuum-ON. Modal-state trackers were reset
-                # in the walker at pick-block start, so the replay
-                # snapshot includes the setSpeed*/setBlender lines
-                # needed to re-establish state each cycle. After
-                # replay we again reset trackers so this slot's
-                # emissions re-establish their own state.
-                if _sl_idx == 0:
+                # transit_over_slot = slot + transit_h * normal (meters).
+                transit_slot_m = list(slot_m)
+                transit_slot_m[0] += (_transit_h_mm / 1000.0) * float(_normal[0])
+                transit_slot_m[1] += (_transit_h_mm / 1000.0) * float(_normal[1])
+                transit_slot_m[2] += (_transit_h_mm / 1000.0) * float(_normal[2])
+                # transit_over_pick shares transit_over_slot's ABSOLUTE
+                # base-frame Z; pick's XY & orientation. This gives the
+                # operator's "up to transit_Z, over, down" path.
+                transit_pick_m = [
+                    float(_pick_tcp[0]),
+                    float(_pick_tcp[1]),
+                    float(transit_slot_m[2]),
+                    float(_pick_tcp[3]),
+                    float(_pick_tcp[4]),
+                    float(_pick_tcp[5]),
+                ]
+                exec_lines.append(
+                    f'-- cycle {_sl_idx + 1}/{len(slots)}: pick (fixed '
+                    f'taught pose) → vacuum ON → transit_Z (layer {l_idx}, '
+                    f'absolute Z={transit_slot_m[2]*1000:.1f}mm) → '
+                    f'slot({r_idx},{c_idx},{l_idx}) → vacuum OFF'
+                    + (f' + blow-off pulse'
+                       if _blow_port_do is not None else ''))
+                # ── (1) Go to pick pose. movJ to the taught pick point
+                # so every cycle starts from the same known-good
+                # kinematic branch. On cycle 1 this is redundant (the
+                # walker just emitted pick_contact) but kept for cycle
+                # symmetry; on cycles 2..N it's the return-to-pick.
+                exec_lines.append(
+                    f'movJ({_pick_pt_name})  -- cycle {_sl_idx + 1} '
+                    f'pick (fixed taught pose)  '
+                    f'joints=[{", ".join(f"{v:+.3f}" for v in _pick_joints)}]')
+                _seed = list(_pick_joints)
+                # ── (2) Vacuum ON.
+                exec_lines.append(
+                    f'setDO({_vac_port_do},1)  -- cycle {_sl_idx + 1} '
+                    f'vacuum ON  (vacuum_port_do=DO{_vac_port_do})')
+                # ── (3) Seal wait.
+                if _seal_wait_ms > 0:
                     exec_lines.append(
-                        f'-- cycle 1/{len(slots)}: pick emitted above '
-                        f'(taught pose); placing slot[{r_idx},{c_idx},{l_idx}]')
-                else:
+                        f'wait({_seal_wait_ms})  -- cycle {_sl_idx + 1} '
+                        f'seal wait {_seal_wait_ms} ms')
+                # ── (4) Lift to transit_Z above pick.
+                _ik_tpick = seeded_ik_to_pose(_seed, transit_pick_m)
+                if _ik_tpick is None:
                     exec_lines.append(
-                        f'-- cycle {_sl_idx + 1}/{len(slots)}: repeat pick '
-                        f'(ONE fixed taught pose) + place '
-                        f'slot[{r_idx},{c_idx},{l_idx}]')
-                    if _pallet_pick_replay is not None:
-                        exec_lines.extend(_pallet_pick_replay)
-                        _last_speed_j = None
-                        _last_speed_l = None
-                        _last_accl    = None
-                        _blender_on   = None
-                        # Arm is physically back at retreat-above-pick
-                        # — reset _seed to match.
-                        _seed = list(_pick_retreat_seed)
-                # approach = slot + approach_h_mm along frame normal
-                #    (approach_h < retract_h; the closer height)
-                appr_m = list(slot_m)
-                appr_m[0] += (approach_h_mm / 1000.0) * float(_normal[0])
-                appr_m[1] += (approach_h_mm / 1000.0) * float(_normal[1])
-                appr_m[2] += (approach_h_mm / 1000.0) * float(_normal[2])
-                retr_m = list(slot_m)
-                retr_m[0] += (retract_h_mm / 1000.0) * float(_normal[0])
-                retr_m[1] += (retract_h_mm / 1000.0) * float(_normal[1])
-                retr_m[2] += (retract_h_mm / 1000.0) * float(_normal[2])
-                # IK each of the 3 targets, seeded from _seed. On
-                # any IK failure, refuse the WHOLE pallet expansion
-                # (emitting only the successful prefix leaves the
-                # arm holding a part with nowhere to place it).
-                _ik_retr = seeded_ik_to_pose(_seed, retr_m)
-                _ik_appr = seeded_ik_to_pose(_seed, appr_m) if _ik_retr else None
-                _ik_slot = seeded_ik_to_pose(_seed, slot_m) if _ik_appr else None
-                if not (_ik_retr and _ik_appr and _ik_slot):
-                    _which = ('retract' if not _ik_retr
-                              else ('approach' if not _ik_appr else 'place'))
-                    exec_lines.append(
-                        f'-- PALLET IK FAILED: slot [{r_idx},{c_idx},{l_idx}] '
-                        f'({_which}) unreachable from seed '
-                        f'[{",".join(f"{v:+.1f}" for v in _seed)}] — '
-                        f'refusing pallet expansion, halt at pick')
+                        f'-- PALLET IK FAILED: transit_over_pick for '
+                        f'slot[{r_idx},{c_idx},{l_idx}] unreachable '
+                        f'(target Z={transit_pick_m[2]*1000:.1f}mm) — '
+                        f'refusing pallet expansion')
                     _pallet_ok = False
                     break
-                q_retr, _, _   = _ik_retr
-                q_appr, _, _   = _ik_appr
-                q_slot, _, _   = _ik_slot
-                # Reset seed for the NEXT slot to this slot's
-                # retract joints so slot-to-slot travel stays in
-                # the same branch.
-                _seed = q_retr
-                # Emit five sub-moves per slot: retract-height
-                # traverse → approach descent → place → IO fire +
-                # wait → retract-height lift. All movL — the
-                # controller's cartesian interpolator drives each.
-                for _sub, (_q, _tag, _pct) in enumerate([
-                    (q_retr, f'slot[{r_idx},{c_idx},{l_idx}] traverse-height', _medium_pct),
-                    (q_appr, f'slot[{r_idx},{c_idx},{l_idx}] approach',        _slow_pct),
-                    (q_slot, f'slot[{r_idx},{c_idx},{l_idx}] place',           _slow_pct),
-                ]):
-                    fallback_idx += 1
-                    _nm = f'{point_prefix}{fallback_idx}'
-                    while _nm in program_points or _nm in used_named:
-                        fallback_idx += 1
-                        _nm = f'{point_prefix}{fallback_idx}'
-                    varspoint[_nm] = _make_jp_point(_q, _nm)
-                    used_named.add(_nm)
-                    exec_lines.append(
-                        f'movL({_nm})  -- {_tag}  '
-                        f'joints=[{", ".join(f"{v:+.3f}" for v in _q)}]')
-                    last_move_joints = list(_q)
-                # IO fire (release/close) + brief settle wait.
-                exec_lines.append(
-                    f'setDO({_fire_port},1)  -- pallet release '
-                    f'DO{_fire_port}=1 (slot [{r_idx},{c_idx},{l_idx}])')
-                exec_lines.append(
-                    f'wait(400)  -- gripper actuate settle (400 ms)')
-                # Lift back to retract height for the next slot's
-                # traverse-height entry.
+                q_tpick = _ik_tpick[0]
                 fallback_idx += 1
-                _nm_lift = f'{point_prefix}{fallback_idx}'
-                while _nm_lift in program_points or _nm_lift in used_named:
+                _nm_tpick = f'{point_prefix}{fallback_idx}'
+                while _nm_tpick in program_points or _nm_tpick in used_named:
                     fallback_idx += 1
-                    _nm_lift = f'{point_prefix}{fallback_idx}'
-                varspoint[_nm_lift] = _make_jp_point(q_retr, _nm_lift)
-                used_named.add(_nm_lift)
+                    _nm_tpick = f'{point_prefix}{fallback_idx}'
+                varspoint[_nm_tpick] = _make_jp_point(q_tpick, _nm_tpick)
+                used_named.add(_nm_tpick)
                 exec_lines.append(
-                    f'movL({_nm_lift})  -- slot[{r_idx},{c_idx},{l_idx}] lift '
-                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_retr)}]')
-                last_move_joints = list(q_retr)
+                    f'movJ({_nm_tpick})  -- cycle {_sl_idx + 1} '
+                    f'lift-to-transit (over pick, absolute Z='
+                    f'{transit_pick_m[2]*1000:.1f}mm)  '
+                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_tpick)}]')
+                _seed = list(q_tpick)
+                # ── (5) Move over the target slot at transit_Z.
+                _ik_tslot = seeded_ik_to_pose(_seed, transit_slot_m)
+                if _ik_tslot is None:
+                    exec_lines.append(
+                        f'-- PALLET IK FAILED: transit_over_slot '
+                        f'[{r_idx},{c_idx},{l_idx}] unreachable at Z='
+                        f'{transit_slot_m[2]*1000:.1f}mm — refusing')
+                    _pallet_ok = False
+                    break
+                q_tslot = _ik_tslot[0]
+                fallback_idx += 1
+                _nm_tslot = f'{point_prefix}{fallback_idx}'
+                while _nm_tslot in program_points or _nm_tslot in used_named:
+                    fallback_idx += 1
+                    _nm_tslot = f'{point_prefix}{fallback_idx}'
+                varspoint[_nm_tslot] = _make_jp_point(q_tslot, _nm_tslot)
+                used_named.add(_nm_tslot)
+                exec_lines.append(
+                    f'movL({_nm_tslot})  -- cycle {_sl_idx + 1} '
+                    f'traverse-over-slot [{r_idx},{c_idx},{l_idx}] at '
+                    f'transit_Z={transit_slot_m[2]*1000:.1f}mm  '
+                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_tslot)}]')
+                _seed = list(q_tslot)
+                # ── (6) Lower to place at slot.
+                _ik_slot = seeded_ik_to_pose(_seed, slot_m)
+                if _ik_slot is None:
+                    exec_lines.append(
+                        f'-- PALLET IK FAILED: slot [{r_idx},{c_idx},{l_idx}] '
+                        f'place unreachable from transit — refusing')
+                    _pallet_ok = False
+                    break
+                q_slot = _ik_slot[0]
+                fallback_idx += 1
+                _nm_slot = f'{point_prefix}{fallback_idx}'
+                while _nm_slot in program_points or _nm_slot in used_named:
+                    fallback_idx += 1
+                    _nm_slot = f'{point_prefix}{fallback_idx}'
+                varspoint[_nm_slot] = _make_jp_point(q_slot, _nm_slot)
+                used_named.add(_nm_slot)
+                exec_lines.append(
+                    f'movL({_nm_slot})  -- slot[{r_idx},{c_idx},{l_idx}] place  '
+                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_slot)}]')
+                _seed = list(q_slot)
+                # ── (7) Vacuum OFF (release).
+                exec_lines.append(
+                    f'setDO({_vac_port_do},0)  -- cycle {_sl_idx + 1} '
+                    f'vacuum OFF  (pallet release DO{_vac_port_do}=0, '
+                    f'slot [{r_idx},{c_idx},{l_idx}])')
+                # ── (8) Optional blow-off pulse.
+                if _blow_port_do is not None and _blow_pulse_ms > 0:
+                    exec_lines.append(
+                        f'setDO({_blow_port_do},1)  -- cycle {_sl_idx + 1} '
+                        f'blow-off pulse start DO{_blow_port_do}=1')
+                    exec_lines.append(
+                        f'wait({_blow_pulse_ms})  -- blow-off pulse '
+                        f'{_blow_pulse_ms} ms')
+                    exec_lines.append(
+                        f'setDO({_blow_port_do},0)  -- cycle {_sl_idx + 1} '
+                        f'blow-off pulse end DO{_blow_port_do}=0')
+                # ── (9) Lift back to transit_Z above slot.
+                exec_lines.append(
+                    f'movL({_nm_tslot})  -- cycle {_sl_idx + 1} '
+                    f'lift-to-transit (over slot after release, '
+                    f'transit_Z={transit_slot_m[2]*1000:.1f}mm)  '
+                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_tslot)}]')
+                _seed = list(q_tslot)
+                last_move_joints = list(q_tslot)
             if not _pallet_ok:
-                # An unreachable slot aborts the whole expansion. The
-                # emitted comment above names the offending slot; the
-                # subsequent steps (return-to-home) still emit so the
-                # arm doesn't stay stuck at pick.
-                pass
+                pass   # partial expansion — halted at first IK failure.
             continue
 
         # ---- Loop — for-loop wrap OR continuous goto ----------------
