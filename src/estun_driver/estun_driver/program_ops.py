@@ -3839,11 +3839,99 @@ def codegen_lua_from_program(
         })
         _lm_pending = None
 
+    # 2026-08-06 (Blocker A I/O pairing fix): pre-scan for palletize
+    # `move_to_pallet` + its preceding pick block. The composer emits
+    # the pick sequence ONCE before `move_to_pallet` (approach-above-
+    # pick → pick-contact → engage-vacuum → wait → retreat-above-
+    # pick); the expansion then emits N slot places. Pre-fix, this
+    # produced ONE vacuum-ON and N releases — the arm dropped
+    # nothing on releases 2..N. Correct: N full self-contained pick+
+    # place cycles, N vacuum-ONs paired with N releases. We solve
+    # this by SNAPSHOTTING the pick-block's emitted Lua lines the
+    # first time they emit, then interleaving that snapshot before
+    # each subsequent slot's place. The pick pose is ONE fixed
+    # taught pose (single `position_role='pick'` step), so verbatim
+    # replay yields identical arm motion each cycle.
+    _pallet_pick_block = None
+    for _pmi, _pms in enumerate(steps):
+        if str(_pms.get('action') or '').lower() != 'move_to_pallet':
+            continue
+        _pmode = str(_pms.get('mode') or '').lower()
+        if not _pmode:
+            _pmode = str((cfg.get('pallet') or {}).get('pallet_mode')
+                         or 'palletize').lower()
+        if _pmode != 'palletize':
+            continue
+        # Walk backward through steps to find the pick block. Robust
+        # to variable-length engage (vacuum = set_io + wait; magnet
+        # = set_io only; gripper = close_gripper — treated as set_io/
+        # wait engagement pattern via the composer's helpers).
+        _j = _pmi - 1
+        if _j < 0:
+            break
+        _rr = steps[_j]
+        if str(_rr.get('action') or '').lower() != 'move_linear' \
+                or _rr.get('derived_from') != 'pick':
+            break
+        _end = _j
+        _j -= 1
+        while _j >= 0 and str(steps[_j].get('action') or '').lower() in (
+                'wait', 'set_io', 'close_gripper', 'open_gripper', 'gripper'):
+            _j -= 1
+        if _j < 0:
+            break
+        _pc = steps[_j]
+        if _pc.get('position_role') != 'pick' \
+                or str(_pc.get('action') or '').lower() != 'move_linear':
+            break
+        _j -= 1
+        if _j < 0:
+            break
+        _ap = steps[_j]
+        if str(_ap.get('action') or '').lower() != 'move_linear' \
+                or _ap.get('derived_from') != 'pick':
+            break
+        _pallet_pick_block = {
+            'start_idx':         _j,
+            'end_idx':           _end,
+            'move_to_pallet_idx': _pmi,
+        }
+        break
+    # Emission-time state for the pick-block hoist.
+    _pallet_pick_line_start: int | None = None
+    _pallet_pick_replay: list[str] | None = None
+
     for _step_idx, step in enumerate(steps):
         _lm_close_pending()
         action = step.get('action', '?')
         _lm_pending = (_step_idx, step.get('id'), action,
                        len(exec_lines) + 1)
+
+        # Pick-block hoist snapshots (2026-08-06). See pre-scan
+        # comment above. Two hooks: reset modal-state trackers +
+        # snapshot the start line when entering the pick block; then
+        # capture exec_lines[start:] when we reach `move_to_pallet`.
+        # Resetting modal state guarantees the snapshot contains the
+        # setSpeedJ/setSpeedL/setBlender/setAccL lines the pick block
+        # needs — otherwise a modal-match at pick emit time would
+        # leave those lines out, and cycles 2..N would run at
+        # whatever speed the previous slot's lift left behind.
+        if _pallet_pick_block is not None:
+            if _step_idx == _pallet_pick_block['start_idx']:
+                _last_speed_j = None
+                _last_speed_l = None
+                _last_accl    = None
+                _blender_on   = None
+                _pallet_pick_line_start = len(exec_lines)
+            if (_step_idx == _pallet_pick_block['move_to_pallet_idx']
+                    and _pallet_pick_replay is None
+                    and _pallet_pick_line_start is not None):
+                _pallet_pick_replay = list(
+                    exec_lines[_pallet_pick_line_start:])
+                _last_speed_j = None
+                _last_speed_l = None
+                _last_accl    = None
+                _blender_on   = None
 
         # Rule 2d adaptation: coalesce_with_prev — the analyzer
         # flagged this step as a micro-duplicate of the previous
@@ -4135,9 +4223,44 @@ def codegen_lua_from_program(
                 f'order={pspec.order} (layer-outermost)  '
                 f'release_io={_fire_io}')
             _pallet_ok = True
-            for _sl in slots:
+            # Save the initial seed (= retreat-above-pick joints from
+            # the just-emitted pick block) so cycles 2..N can reset
+            # their IK seed after the pick-block replay physically
+            # returns the arm there. Without this, cycle-2 IK would
+            # seed from slot-1-lift joints and could pick a different
+            # branch than the arm is actually in.
+            _pick_retreat_seed = list(_seed)
+            for _sl_idx, _sl in enumerate(slots):
                 r_idx = int(_sl['row']); c_idx = int(_sl['col']); l_idx = int(_sl['layer'])
                 slot_m = list(_sl['tcp_m'])          # meters + a/b/c
+                # ── Cycle header + pick-block replay (I/O pairing
+                # fix, 2026-08-06). Cycle 1's pick was just emitted
+                # by the walker above; cycles 2..N replay the same
+                # captured pick block verbatim so each cycle carries
+                # its own vacuum-ON. Modal-state trackers were reset
+                # in the walker at pick-block start, so the replay
+                # snapshot includes the setSpeed*/setBlender lines
+                # needed to re-establish state each cycle. After
+                # replay we again reset trackers so this slot's
+                # emissions re-establish their own state.
+                if _sl_idx == 0:
+                    exec_lines.append(
+                        f'-- cycle 1/{len(slots)}: pick emitted above '
+                        f'(taught pose); placing slot[{r_idx},{c_idx},{l_idx}]')
+                else:
+                    exec_lines.append(
+                        f'-- cycle {_sl_idx + 1}/{len(slots)}: repeat pick '
+                        f'(ONE fixed taught pose) + place '
+                        f'slot[{r_idx},{c_idx},{l_idx}]')
+                    if _pallet_pick_replay is not None:
+                        exec_lines.extend(_pallet_pick_replay)
+                        _last_speed_j = None
+                        _last_speed_l = None
+                        _last_accl    = None
+                        _blender_on   = None
+                        # Arm is physically back at retreat-above-pick
+                        # — reset _seed to match.
+                        _seed = list(_pick_retreat_seed)
                 # approach = slot + approach_h_mm along frame normal
                 #    (approach_h < retract_h; the closer height)
                 appr_m = list(slot_m)

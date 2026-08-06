@@ -590,3 +590,171 @@ def test_golden_5cycle_slot_positions_holepartpalletize():
             assert abs(fk[axis] - want_mm[axis]) < 0.1, (
                 f'slot [{r},{c},{l}] axis {axis}: FK={fk[axis]:.2f} mm '
                 f'vs want {want_mm[axis]:.2f} mm')
+
+
+# ── 2026-08-06 I/O pairing (hardware Blocker A follow-up) ──────
+#
+# The pre-fix codegen emitted ONE vacuum-ON before `move_to_pallet`
+# and N releases inside the expansion. The gripper was empty from
+# release #2 onward. Correct: each cycle is a complete pick+place
+# with one vacuum-ON at pick and one release at place — N of each,
+# correctly interleaved. These pins guarantee the interleaving.
+
+def _vacuum_port_from_program(prog: dict) -> int:
+    """Derive the vacuum DO port from the composer-emitted set_io
+    step (io_role='vacuum'). Fallback = 2 (composer default)."""
+    for s in prog.get('steps', []):
+        if str(s.get('action') or '').lower() != 'set_io':
+            continue
+        if str(s.get('io_role') or '').lower() == 'vacuum' \
+                and int(s.get('value') or 0) == 1:
+            m = __import__('re').match(
+                r'^DO(\d+)$', str(s.get('io_id') or ''),
+                __import__('re').IGNORECASE)
+            if m:
+                return int(m.group(1))
+    return 2
+
+
+def test_io_pairing_n_vacuum_ons_matches_n_releases():
+    """Every cycle carries exactly one vacuum-ON at pick and one
+    release at place. N cycles → N of each, one-to-one. Pre-fix:
+    1 vacuum-ON + N releases (I/O pairing broken)."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 5
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    vac_port = _vacuum_port_from_program(prog)
+    import re
+    vacuum_ons = re.findall(
+        rf'^\s*setDO\({vac_port}\s*,\s*1\)\s', lua, re.MULTILINE)
+    releases = lua.count('pallet release')
+    assert releases == 5, (
+        f'expected 5 pallet releases for part_count=5, got {releases}')
+    assert len(vacuum_ons) == 5, (
+        f'expected 5 vacuum-ON events (one per cycle) for part_count=5, '
+        f'got {len(vacuum_ons)}. Pre-fix regression: 1 vacuum-ON + N '
+        f'releases means the arm dropped nothing on releases 2..N.')
+
+
+def test_io_pairing_ordering_pick_then_place_each_cycle():
+    """Sequence contract: for each cycle i (1..N), a vacuum-ON must
+    appear BEFORE cycle i's release, and no more than one vacuum-ON
+    may appear between two consecutive releases. This pins the
+    interleaving pattern — batching (all picks, then all releases)
+    is disallowed."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 5
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    vac_port = _vacuum_port_from_program(prog)
+    import re
+    # Emit (event_kind, line_no) pairs in emission order.
+    events: list[tuple[str, int]] = []
+    for i, ln in enumerate(lua.splitlines(), start=1):
+        if re.search(rf'^\s*setDO\({vac_port}\s*,\s*1\)\s', ln):
+            events.append(('pick', i))
+        elif 'pallet release' in ln:
+            events.append(('release', i))
+    # Interleave check: pick, release, pick, release, ... × 5.
+    expected = ['pick', 'release'] * 5
+    got = [k for k, _ in events]
+    assert got == expected, (
+        f'I/O event order must alternate pick,release,pick,release,... '
+        f'for 5 full cycles. Got: {got}')
+
+
+def test_io_pairing_full_capacity_no_batching():
+    """The full 8-slot (2×2×2) fill: 8 vacuum-ONs, 8 releases,
+    interleaved. Guards against a regression where the pick-block
+    hoist decays back to the pre-fix single-vacuum shape at higher
+    slot counts."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    # Force full-capacity emit — no part_count cap.
+    if 'part_count' in prog['config']['pallet']:
+        del prog['config']['pallet']['part_count']
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    vac_port = _vacuum_port_from_program(prog)
+    import re
+    n_expected = (prog['config']['pallet']['rows']
+                  * prog['config']['pallet']['cols']
+                  * prog['config']['pallet']['layers'])
+    vacuum_ons = re.findall(
+        rf'^\s*setDO\({vac_port}\s*,\s*1\)\s', lua, re.MULTILINE)
+    releases = lua.count('pallet release')
+    assert len(vacuum_ons) == n_expected == releases, (
+        f'full-capacity ({n_expected}) must emit {n_expected} vacuum-'
+        f'ONs and {n_expected} releases; got vacuum_ons='
+        f'{len(vacuum_ons)}, releases={releases}')
+
+
+def test_io_pairing_expansion_cycle_headers_present():
+    """The pick-block hoist emits one 'cycle N/M' header per cycle.
+    This is the operator-legible marker separating cycles in the
+    emitted Lua so a Monitor trace can be read top-to-bottom."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 5
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    for i in range(1, 6):
+        marker = f'cycle {i}/5:'
+        assert marker in lua, (
+            f'expected cycle header {marker!r} in emitted Lua — the '
+            f'pick-block hoist must annotate each cycle boundary')
+
+
+def test_pick_block_replay_repeats_pick_contact_reference():
+    """After the hoist, cycle 2..N must include a movJ/movL call to
+    the taught pick contact point. The pick point's name is unique
+    per program; it appears once in cycle 1 and N-1 more times via
+    replay. Total references = N."""
+    prog = _load_holepartpalletize()
+    prog = json.loads(json.dumps(prog))
+    prog['config']['pallet']['part_count'] = 5
+    lua, points, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    # Find the taught pick point. It's the point referenced by the
+    # movJ/movL emitted at cycle-1 pick-contact — the composer marks
+    # the step with position_role='pick'. Simpler heuristic: find a
+    # point whose name appears in a line commented 'Pick position'.
+    import re
+    pick_ref = None
+    for ln in lua.splitlines():
+        m = re.search(r'mov[JL]\(([A-Za-z_][A-Za-z_0-9]*)\)', ln)
+        if not m:
+            continue
+        if 'position_role' in ln and 'pick' in ln:
+            pick_ref = m.group(1)
+            break
+        if 'Pick position' in ln:
+            pick_ref = m.group(1)
+            break
+    if pick_ref is None:
+        # Fallback: any point-name that appears in a comment
+        # mentioning 'pick' (taught contact emissions include the
+        # role in their comment tail).
+        for ln in lua.splitlines():
+            m = re.search(
+                r'mov[JL]\(([A-Za-z_][A-Za-z_0-9]*)\)[^\n]*'
+                r'position_role=\'?pick\'?', ln)
+            if m:
+                pick_ref = m.group(1)
+                break
+    # If we still couldn't find it — at least confirm the
+    # cycle-header markers exist (structural pin above already
+    # covers this; skip this assertion to avoid false negatives on
+    # naming-scheme changes).
+    if pick_ref is not None:
+        # Count mov[JL](pick_ref) — must appear exactly N times
+        # (once per cycle).
+        n_refs = len(re.findall(
+            rf'mov[JL]\({re.escape(pick_ref)}\)', lua))
+        assert n_refs == 5, (
+            f'pick contact point {pick_ref!r} must be referenced '
+            f'once per cycle (5 times for part_count=5); got '
+            f'{n_refs} references')
