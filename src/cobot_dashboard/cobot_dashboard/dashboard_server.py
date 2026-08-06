@@ -245,7 +245,13 @@ STATE = {
         # side). None outside the soft zone; a dict while scaling.
         "cart_softening": None,
         "joint_limits": [],
-        "collision_enabled": False,
+        # None sentinel — the first driver-published state is ALWAYS
+        # a transition (None → bool), so the event-log observation
+        # fires on boot regardless of which side of the kill switch
+        # the driver came up on. Any consumer reading this before the
+        # first driver frame must treat None as "unknown, guards NOT
+        # yet observed active" — same UX as boot-time uncertainty.
+        "collision_enabled": None,
         "collision_pair": None,
         "collision_min_mm": None,
         "collision_warn_mm": 80.0,
