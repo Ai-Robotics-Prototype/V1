@@ -125,6 +125,18 @@ _BUILT_FRONTEND_DIR = _THIS_DIR.parent / "frontend" / "dist"
 # via time.time()). Read by /api/systemcheck to compute controller
 # freshness — a stale value means the driver went silent.
 _last_estun_status_ts = [0.0]
+# CRI-proxy state for JOG_BACKEND=ros2: /joint_states arrival is our
+# arm-liveness signal when the WS estun_driver is intentionally down.
+# _on_joint_states stamps this on every message; the proxy path in
+# _on_joint_states populates STATE['robot'] fields the ArmEnableControl
+# chip renders. Fresh > 200 ms = "ENABLED (CRI)", stale = "DISCONNECTED".
+_last_joint_states_mono = [0.0]
+# Read once at module load — matches the pattern used near main() but
+# module-level so callback paths on the DashboardServer class can gate
+# without re-reading env each frame.
+_JOG_BACKEND_ENV = os.environ.get("JOG_BACKEND", "ws").strip().lower()
+if _JOG_BACKEND_ENV not in ("ws", "ros2"):
+    _JOG_BACKEND_ENV = "ws"
 
 # ---------------------------------------------------------------------------
 # Shared state — updated by ROS2 callbacks, read by FastAPI
@@ -1300,7 +1312,61 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self.create_subscription(String, "/reconstruction/mesh_json",
                                  self._on_mesh_json, 2)
 
+        # CRI-proxy staleness watchdog: under JOG_BACKEND=ros2 with the WS
+        # estun_driver intentionally down, _on_joint_states populates the
+        # ArmEnableControl chip fields from JS liveness. But if JS stops
+        # (arm faulted / launch died), no _on_joint_states means no update
+        # — chip would keep showing ENABLED forever. This daemon flips the
+        # chip to DISCONNECTED after 1.0 s of no JS. Silent per §285: a
+        # stopped arm should NEVER read as ENABLED.
+        threading.Thread(target=self._cri_proxy_staleness_loop,
+                          name="cri-proxy-staleness",
+                          daemon=True).start()
+
         self.get_logger().info("DashboardServer ready")
+
+    def _cri_proxy_staleness_loop(self):
+        """Runs at 5 Hz. Under JOG_BACKEND=ros2 + /estun/status stale + JS
+        stale: flip STATE['robot'] to DISCONNECTED so operators see the
+        arm state is unknown, not stuck at last-known ENABLED."""
+        while True:
+            try:
+                if _JOG_BACKEND_ENV == "ros2":
+                    now_mono = time.monotonic()
+                    js_age = now_mono - _last_joint_states_mono[0] \
+                             if _last_joint_states_mono[0] > 0 else 1e9
+                    now_wall = time.time()
+                    estun_stale = (now_wall - _last_estun_status_ts[0]) > 3.0
+                    if estun_stale and js_age > 1.0:
+                        with _state_lock:
+                            r = STATE.setdefault("robot", {})
+                            r["connected"]    = False
+                            r["enabled"]      = False
+                            r["enabling"]     = False
+                            r["mode"]         = "unknown"
+                            r["safety_mode"]  = "unknown"
+                            r["moving"]       = False
+                            r["allow_jog"]    = False
+                            r["allow_cartesian_jog"] = False
+                            r["allow_power"]  = False
+                            r["allow_move"]   = False
+                            r["alarm"]        = False
+                            r["state_code"]   = 0
+                            r["status_flag"]  = 0
+                            # Safe-side: undefined monitor_only defaults to
+                            # "on" in frontend gating, which is what we want
+                            # when the stream is dead. Explicitly True is
+                            # equivalent and clearer for anyone reading state.
+                            r["monitor_only"] = True
+                            r["arm_source"]   = "cri_ros2"
+                            r["arm_source_note"] = (
+                                f"/joint_states stale {js_age:.1f}s — CRI "
+                                "stream absent or arm faulted. Enable "
+                                "managed by the CRI launch; check the "
+                                "launch tmux for errors.")
+            except Exception:
+                pass
+            time.sleep(0.2)
 
     # ---- Safety ----
 
@@ -1711,10 +1777,82 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 _annotated_frame_cam1 = jpeg
 
     def _on_joint_states(self, msg):
+        now_mono = time.monotonic()
+        _last_joint_states_mono[0] = now_mono
         with _state_lock:
             STATE["joints"]["names"]      = list(msg.name)
             STATE["joints"]["positions"]  = list(msg.position)
             STATE["joints"]["velocities"] = list(msg.velocity) if msg.velocity else [0.0] * len(msg.name)
+            # CRI proxy: when JOG_BACKEND=ros2 and the estun_driver isn't
+            # publishing /estun/status (WS driver down by design this session),
+            # the ArmEnableControl chip would otherwise render 'DISCONNECTED'
+            # forever — silent dead control (§285). Populate STATE['robot']
+            # from /joint_states liveness so the chip reads ENABLED. Gated on
+            # /estun/status staleness so this path is a no-op when the WS
+            # driver is genuinely up and authoritative.
+            if _JOG_BACKEND_ENV == "ros2":
+                estun_stale = (time.time() - _last_estun_status_ts[0]) > 3.0
+                if estun_stale:
+                    r = STATE.setdefault("robot", {})
+                    r["connected"]    = True
+                    r["enabled"]      = True
+                    r["enabling"]     = False
+                    r["mode"]         = "AUTO"
+                    r["safety_mode"]  = "normal"
+                    r["moving"]       = False
+                    r["jog_active"]   = False
+                    r["jog_mode"]     = None
+                    r["jog_index"]    = 0
+                    r["jog_direction"] = 0
+                    r["allow_jog"]    = True
+                    r["allow_cartesian_jog"] = False   # F1 scope refuses cartesian
+                    # HYPOTHESIS 2026-08-19 F1.4: frontend HoldButton may
+                    # compute enabled = arm_enabled && allow_power in its
+                    # disabled prop. Setting allow_power=True makes jog
+                    # buttons clickable; /cmd/power endpoint below still
+                    # returns 409 with the CRI-launch-manages-enable
+                    # message so the Enable button click doesn't hang.
+                    r["allow_power"]  = True
+                    r["allow_move"]   = True
+                    r["allow_io"]     = False
+                    r["alarm"]        = False
+                    r["alarm_count"]  = 0
+                    r["state_code"]   = 0
+                    r["status_flag"]  = 0
+                    # Load-bearing for frontend jog-button gating: absent
+                    # (None) is safely interpreted as "monitor mode active,
+                    # do not send commands". Must be explicitly False for
+                    # HoldButton to fire under ros2 backend.
+                    r["monitor_only"] = False
+                    # Deadman + heartbeat semantics the frontend uses to
+                    # decide refresh cadence + freshness. Match jog_bridge's
+                    # Config (silence_ms=300, refresh_ms=100 informational).
+                    r["jog_heartbeat_s"] = 0.100
+                    r["jog_freshness_s"] = 0.300
+                    # Speed-cap trio. The frontend slider's ceiling reads
+                    # from these; a zero/undefined cap would silently
+                    # produce a zero-speed jog payload (server-side no-op).
+                    # 0.15 = jog_bridge's hard session cap; 0.25 = the
+                    # operator UI ceiling. effective = min of the two.
+                    r["jog_speed_cap"]        = 0.15
+                    r["operator_speed_limit"] = 0.25
+                    r["effective_speed_cap"]  = 0.15
+                    # `_source` labels for tooltip strings the UI shows
+                    # next to each allow_* — omitted means "unknown"
+                    # which is fine, but explicit is friendlier.
+                    r["allow_jog_source"]        = "cri_proxy"
+                    r["allow_cart_source"]       = "f1_scope_refuses_cartesian"
+                    r["allow_power_source"]     = "cri_launch_manages_enable"
+                    r["allow_move_source"]      = "cri_proxy"
+                    # Non-ambiguous source tag — new field, harmless if the
+                    # pre-built frontend ignores it, load-bearing for anyone
+                    # inspecting state via /api/state or the ws broadcast.
+                    r["arm_source"]   = "cri_ros2"
+                    r["arm_source_note"] = ("Arm state proxied from "
+                                             "/joint_states liveness — WS "
+                                             "driver inactive under "
+                                             "JOG_BACKEND=ros2; enable is "
+                                             "managed by the CRI launch.")
         # Feed the breadcrumb collector so it can tag each ProjectState
         # transition with the joints the arm was at right then. Fires
         # ~25 Hz; the collector only holds the latest sample so this
@@ -2767,6 +2905,31 @@ if FASTAPI_AVAILABLE:
     HOLD_KEEPALIVE_INTERVAL_S = 0.06
     HOLD_BROWSER_TIMEOUT_S    = 0.4
 
+    # Backend selector — SEAM A of Phase F1 (2026-08-18; see
+    # cobot-cri-planner-intent, jog_bridge package in
+    # ~/cri_eval_ws/CodroidROS2/src/jog_bridge/). Read once at module load —
+    # no runtime switching. §282 gate-banner: announce at startup.
+    #   'ws'   (default) — publish to /robot/jog_command as before;
+    #                       estun_driver runs the jog gate.
+    #   'ros2'          — publish to /dashboard/jog_session_events;
+    #                       jog_bridge runs the JTC-side jog gate; nothing
+    #                       lands on /robot/jog_command (estun_driver stays
+    #                       fully passive).
+    # Mutual exclusion with estun_driver.allow_jog is enforced by
+    # jog_bridge's /estun/mode drift-check at 5 s cadence.
+    # Fanout rate-limits ONLY 'refresh' events at 90 ms/hold_id (the SM's
+    # 200 ms horizon needs ~5 refreshes/sec, so 60 ms keepalive cadence
+    # would otherwise churn the action layer at ~10 preempts/sec).
+    # 'start' and 'stop' always pass immediately (dead-man-by-finger, §286).
+    _JOG_BACKEND = os.environ.get("JOG_BACKEND", "ws").strip().lower()
+    if _JOG_BACKEND not in ("ws", "ros2"):
+        print(f"[dashboard] JOG_BACKEND={_JOG_BACKEND!r} not in {{'ws','ros2'}}; "
+              f"defaulting to 'ws'.", flush=True)
+        _JOG_BACKEND = "ws"
+    print(f"[dashboard] JOG_BACKEND = {_JOG_BACKEND!r}", flush=True)
+    _JOG_REFRESH_COALESCE_S = 0.090   # 90 ms per hold_id (refresh only)
+
+
     class _HoldSession:
         """Bookkeeping for a single active jog hold. Owned by the
         server keepalive loop; refreshed by inbound browser messages."""
@@ -3433,11 +3596,103 @@ if FASTAPI_AVAILABLE:
             return {"ok": True, "status": "generating",
                     "auto_status": copy.deepcopy(STATE.get("auto_status", {}))}
 
+    def _publish_ros2_jog_event(payload):
+        """SEAM A fanout — forward the jog frame to /dashboard/jog_session_events
+        for the jog_bridge node to consume. Called only when JOG_BACKEND='ros2';
+        best-effort (swallows exceptions) matching _publish_estun_jog's contract.
+
+        Emits shape: {kind, hold_id, seq, server_ts, joint, direction, speed_pct, mode}.
+        'kind' derivation:
+          - first frame for a hold_id with hold=true → 'start'
+          - subsequent frames with hold=true → 'refresh'
+          - hold=false → 'stop' (and hold_id removed from seen-set)
+
+        Rate-limiting: 'refresh' events are coalesced at
+        _JOG_REFRESH_COALESCE_S (90 ms) per hold_id. 'start' and 'stop'
+        always pass immediately — never rate-limited (§286 dead-man-by-finger).
+        The SM's silence deadman still measures REAL browser silence because
+        90 ms < 300 ms with 3× margin.
+        """
+        if _ros_node is None:
+            return
+        try:
+            if not hasattr(_ros_node, "_dashboard_jog_events_pub"):
+                # RELIABLE + VOLATILE matches jog_bridge's expected QoS.
+                # Depth 10 is generous vs the coalesced 90 ms refresh cadence.
+                qos = QoSProfile(
+                    depth=10,
+                    reliability=QoSReliabilityPolicy.RELIABLE,
+                    history=QoSHistoryPolicy.KEEP_LAST,
+                    durability=QoSDurabilityPolicy.VOLATILE,
+                )
+                _ros_node._dashboard_jog_events_pub = _ros_node.create_publisher(
+                    String, "/dashboard/jog_session_events", qos)
+            if not hasattr(_ros_node, "_jog_session_seen"):
+                _ros_node._jog_session_seen = set()
+            if not hasattr(_ros_node, "_jog_last_refresh_mono"):
+                _ros_node._jog_last_refresh_mono = {}
+            hold = payload.get("hold", False)
+            hold_id = payload.get("hold_id")
+            if not hold:
+                kind = "stop"
+            elif hold_id and hold_id in _ros_node._jog_session_seen:
+                kind = "refresh"
+            else:
+                kind = "start"
+                if hold_id:
+                    _ros_node._jog_session_seen.add(hold_id)
+            # Rate-limit refresh only. start/stop always pass.
+            if kind == "refresh" and hold_id:
+                _now = time.monotonic()
+                _last = _ros_node._jog_last_refresh_mono.get(hold_id, 0.0)
+                if (_now - _last) < _JOG_REFRESH_COALESCE_S:
+                    return  # coalesce — swallow this refresh
+                _ros_node._jog_last_refresh_mono[hold_id] = _now
+            # Field-name reconciliation: `_build_driver_payload` upstream pops
+            # `joint` and renames it to `axis` for the WS-driver's wire
+            # protocol. jog_bridge (the ros2-side consumer) still expects
+            # `joint`. Read `axis` as a fallback so the event isn't published
+            # with `joint: null` — that crashes jog_bridge on
+            # `int(evt.get("joint", 0))` (default `0` doesn't help when the
+            # value IS the string None). Same fix for `direction` /
+            # `speed_pct` defensively even though the current builder doesn't
+            # rename them, so a future rename doesn't reintroduce this class
+            # of "silently sends null → consumer crashes on int(None)" bug.
+            _joint = payload.get("joint")
+            if _joint is None:
+                _joint = payload.get("axis")
+            _direction = payload.get("direction")
+            _speed_pct = payload.get("speed_pct")
+            evt = {
+                "kind": kind,
+                "hold_id": hold_id,
+                "seq": payload.get("seq"),
+                "server_ts": time.monotonic(),
+                "joint":     _joint if _joint is not None else 0,
+                "direction": _direction if _direction is not None else 0,
+                "speed_pct": _speed_pct if _speed_pct is not None else 0.0,
+                "mode": payload.get("mode", "joint"),
+            }
+            m = String(); m.data = json.dumps(evt, separators=(",", ":"))
+            _ros_node._dashboard_jog_events_pub.publish(m)
+            if kind == "stop" and hold_id:
+                _ros_node._jog_session_seen.discard(hold_id)
+                _ros_node._jog_last_refresh_mono.pop(hold_id, None)
+        except Exception:
+            pass
+
     def _publish_estun_jog(payload):
         """Publish a single frame on /robot/jog_command. Best-effort;
         swallows exceptions so a transient publisher issue doesn't 500
         the HTTP call — the driver's own gates + safety layers are what
         actually decides whether motion happens."""
+        # SEAM A of Phase F1 (2026-08-18): when JOG_BACKEND='ros2', fanout
+        # to /dashboard/jog_session_events and DO NOT publish to
+        # /robot/jog_command — estun_driver stays fully passive on jog.
+        if _JOG_BACKEND == "ros2":
+            _publish_ros2_jog_event(payload)
+            return
+        # Backend 'ws' (default): existing behavior, byte-identical from here.
         if _ros_node is None:
             return
         try:
@@ -3726,6 +3981,24 @@ if FASTAPI_AVAILABLE:
                 {"error": f"unknown action {action!r}; expected one of "
                           f"{sorted(_POWER_ACTIONS)}"},
                 status_code=400,
+            )
+        # Under JOG_BACKEND=ros2, the WS estun_driver is intentionally down
+        # this session. Publishing /robot/power_command goes to a subscriber
+        # that isn't there and the button hangs from the frontend's side.
+        # Honest refusal per §285: no silent dead controls. Arm is already
+        # enabled by cri_tcp_setup_node's Robot/switchOn step 3/5 at launch;
+        # full CRI-TCP wiring of this button is F3-scope.
+        if _JOG_BACKEND == "ros2":
+            msg = ("Enable is managed by the CRI launch this session. "
+                   "The arm is switched on by cri_tcp_setup_node during "
+                   "launch (Robot/switchOn, step 3/5). Under "
+                   "JOG_BACKEND=ros2 the WS estun_driver is inactive by "
+                   "design; this button is not wired to the CRI TCP path "
+                   "in F1 scope (F3 will address).")
+            return JSONResponse(
+                {"ok": False, "action": action, "backend": "ros2",
+                 "no_op": True, "error": msg, "message": msg},
+                status_code=409,
             )
         _publish_estun_power({"action": action})
         return {"ok": True, "action": action}
