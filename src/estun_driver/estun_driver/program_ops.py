@@ -33,6 +33,13 @@ import urllib.error
 import urllib.request
 from typing import Any, Iterable
 
+# 2026-08-19 scoped fix (ledger 2c2e435 pallet regression): the pallet
+# expansion + pre-scan absorb + refuse-on-misconfigured moved into
+# their own module so tests can pin the pallet-specific contract
+# independently. `program_ops` still owns the walker skeleton and the
+# per-step verb-selection.
+from estun_driver import pallet as _pallet
+
 try:
     import numpy as _np
 except ImportError:  # numpy not installed → SeededIK.available() == False
@@ -3868,75 +3875,14 @@ def codegen_lua_from_program(
         })
         _lm_pending = None
 
-    # 2026-08-06 (finalize palletize subroutine, operator directive):
-    # pre-scan for palletize `move_to_pallet` and mark surrounding
-    # pre-pick and engage/wait/retreat steps for ABSORPTION. Under
-    # the finalize spec, the pallet expansion emits the FULL pick+
-    # place cycle inline per iteration (movJ pick → vacuum ON → seal
-    # wait → transit_Z lift → over slot → down to slot → vacuum OFF
-    # → optional blow-off pulse → transit_Z lift). Standalone
-    # emission of the OLD-shape pre-pick sequence (approach-above-
-    # pick, engage set_io, seal wait, retreat-above-pick) would
-    # duplicate vacuum events, so we suppress them in the walker.
-    # The taught pick_contact step (position_role='pick') is KEPT —
-    # its emission declares the point in varspoint so the expansion
-    # can reference it via `role_point_name['pick']`.
-    #
-    # This also picks up any pre-composer legacy shape where the
-    # engage set_io names a specific DO port (e.g. DO2 on the wire-
-    # verified holepartpalletize fixture); that port is inferred as
-    # the vacuum port when the newer `vacuum_port_do` field isn't
-    # present on move_to_pallet yet.
-    _pallet_absorb_step_ids: set = set()
-    _pallet_inferred_vac_port: int | None = None
-    _pallet_inferred_seal_wait_ms: int | None = None
-    for _pmi, _pms in enumerate(steps):
-        if str(_pms.get('action') or '').lower() != 'move_to_pallet':
-            continue
-        _pmode = str(_pms.get('mode') or '').lower()
-        if not _pmode:
-            _pmode = str((cfg.get('pallet') or {}).get('pallet_mode')
-                         or 'palletize').lower()
-        if _pmode != 'palletize':
-            continue
-        _j = _pmi - 1
-        while _j >= 0:
-            _st = steps[_j]
-            _act = str(_st.get('action') or '').lower()
-            _derived = _st.get('derived_from')
-            # (a) approach/retreat above pick → absorb.
-            if _act == 'move_linear' and _derived == 'pick':
-                _pallet_absorb_step_ids.add(id(_st))
-                _j -= 1
-                continue
-            # (b) engage: set_io / wait / gripper helpers → absorb,
-            # and infer vacuum port/seal wait from the emit metadata
-            # for legacy programs that lack move_to_pallet.
-            # vacuum_port_do.
-            if _act in ('wait', 'set_io', 'close_gripper',
-                        'open_gripper', 'gripper'):
-                _pallet_absorb_step_ids.add(id(_st))
-                if _act == 'set_io' and int(_st.get('value') or 0) == 1:
-                    _iid = str(_st.get('io_id') or '')
-                    _mm = _re.match(r'^DO(\d+)$', _iid, _re.IGNORECASE)
-                    if _mm and _pallet_inferred_vac_port is None:
-                        _pallet_inferred_vac_port = int(_mm.group(1))
-                if _act == 'wait' and _pallet_inferred_seal_wait_ms is None:
-                    try:
-                        _dur = float(_st.get('duration_s') or 0)
-                        _pallet_inferred_seal_wait_ms = int(round(_dur * 1000))
-                    except (TypeError, ValueError):
-                        pass
-                _j -= 1
-                continue
-            # (c) pick_contact (position_role='pick') — KEEP; anchors
-            # the absorb window.
-            if _st.get('position_role') == 'pick' \
-                    and _act == 'move_linear':
-                break
-            # Anything else — stop scanning.
-            break
-        break
+    # 2026-08-19 scoped fix (ledger 2c2e435): the pallet pre-scan +
+    # expansion + refuse-on-misconfigured live in estun_driver.pallet.
+    # `plan_absorb` marks the approach, engage set_io, seal wait,
+    # retreat AND taught pick_contact for absorption — the walker
+    # emits `-- absorbed` comments only; the palletize expansion
+    # emits the full pick+place cycle inline.
+    _absorb_plan = _pallet.plan_absorb(steps, cfg)
+    _pallet_refuse_msg = _pallet.should_refuse(steps, cfg)
 
     for _step_idx, step in enumerate(steps):
         _lm_close_pending()
@@ -3944,11 +3890,11 @@ def codegen_lua_from_program(
         _lm_pending = (_step_idx, step.get('id'), action,
                        len(exec_lines) + 1)
 
-        # Absorb pre-pick / engage / retreat steps into the palletize
-        # cycle (2026-08-06 finalize). See pre-scan comment above.
-        # The pallet expansion emits the full cycle inline; the OLD
-        # pre-emitted engage would double the vacuum-ON count.
-        if id(step) in _pallet_absorb_step_ids:
+        # Absorb pre-pick / engage / retreat / pick_contact steps into
+        # the palletize cycle (2026-08-19 scoped fix — see pre-scan
+        # `_absorb_plan` above). The pallet expansion emits the full
+        # cycle inline and self-registers the pick point in varspoint.
+        if id(step) in _absorb_plan.absorb_step_ids:
             exec_lines.append(
                 f'-- absorbed into move_to_pallet cycle: '
                 f'{step.get("label") or action!r}  '
@@ -4071,578 +4017,42 @@ def codegen_lua_from_program(
                 f'not waitCondition — that idiom hits 10006)')
             continue
 
-        # ---- Palletize: expand move_to_pallet into per-slot moves --
-        #
-        # 2026-08-06 (operator directive — Blocker A). The wizard
-        # produces ONE `move_to_pallet` step; the run path expects
-        # a full slot-by-slot movement sequence in the emitted Lua.
-        # Expansion consumes both schemas (frame from `pallet_place`,
-        # grid dims from `pallet`) and emits per-slot:
-        #     approach (retract_h above slot) → descend (approach_h
-        #     above slot) → place (slot) → IO release → wait →
-        #     lift back to retract_h.
-        # Each move is a fresh IK'd point seeded from the previous
-        # solve — same kinematic branch as the taught pick contact.
-        # Out-of-reach slot → named codegen finding + refuse to
-        # emit (no garbage joints reach the controller).
+        # ---- Palletize: expand move_to_pallet via estun_driver.pallet ─
+        # 2026-08-19 scoped fix (ledger 2c2e435 pallet regression). The
+        # expansion lives in `estun_driver.pallet`; the walker just
+        # wires the mutable state into an ExpandCtx and calls expand().
         if action == 'move_to_pallet':
-            place = (cfg.get('pallet_place') or {})
-            pold  = (cfg.get('pallet')       or {})
-            corner1 = place.get('corner1_tcp')
-            if not (isinstance(corner1, list) and len(corner1) == 6):
+            if _pallet_refuse_msg is not None:
                 exec_lines.append(
-                    f'-- skipped {action!r}: pallet_place.corner1_tcp '
-                    f'missing or malformed — cannot compute slot frame')
+                    f'-- REFUSED {action!r}: {_pallet_refuse_msg}')
                 continue
-            part_tcp = place.get('part_tcp')
-            if not (isinstance(part_tcp, list) and len(part_tcp) == 6):
-                exec_lines.append(
-                    f'-- skipped {action!r}: pallet_place.part_tcp '
-                    f'missing — no operator-taught slot datum')
-                continue
-            try:
-                from programming_by_demonstration.schema import PalletPlaceSpec
-                from programming_by_demonstration.pallet_geometry import (
-                    derive_slot_tcps,
-                )
-            except Exception as _pe:
-                exec_lines.append(
-                    f'-- skipped {action!r}: pallet_geometry import '
-                    f'failed ({_pe}) — cannot expand')
-                continue
-            # Merge the two schemas into a single PalletPlaceSpec.
-            # cfg.pallet (old) carries rows / cols / layers / typed
-            # pitch (spacing_x/y_mm) / layer_height_mm / fill_order;
-            # cfg.pallet_place (new) carries the taught frame corners
-            # + part_tcp. Operator doctrine §484 (2026-08-05):
-            # corners define the frame ONLY, part_tcp is slot [0,0,0],
-            # all other slots march the typed pitch along the frame
-            # axes.
-            spec_dict = dict(place)
-            spec_dict['rows']            = int(pold.get('rows',   1) or 1)
-            spec_dict['cols']            = int(pold.get('cols',   1) or 1)
-            spec_dict['layers']          = int(pold.get('layers', 1) or 1)
-            # `spacing_x_mm` = pitch ALONG row axis (column-to-column
-            # spacing WITHIN a row) — matches PalletPlaceSpec's
-            # `pitch_row_mm`. `spacing_y_mm` = along col axis =
-            # `pitch_col_mm`. Naming is confusing but the semantics
-            # are pinned in pallet_geometry's compute_slot_offsets.
-            spec_dict['pitch_row_mm']    = float(pold.get('spacing_x_mm', 150) or 150)
-            spec_dict['pitch_col_mm']    = float(pold.get('spacing_y_mm', 150) or 150)
-            spec_dict['layer_height_mm'] = float(pold.get('layer_height_mm', 100) or 100)
-            # Map legacy fill_order values → the new `order` field.
-            _order_legacy = str(pold.get('fill_order') or 'snake').lower()
-            _order_map = {
-                'row_lr': 'row_major', 'row-lr': 'row_major',
-                'row':    'row_major',
-                'col_tb': 'col_major', 'col-tb': 'col_major',
-                'column': 'col_major',
-                'snake':  'snake',
-            }
-            spec_dict['order'] = _order_map.get(_order_legacy, 'snake')
-            try:
-                pspec = PalletPlaceSpec.from_dict(spec_dict)
-                slots = derive_slot_tcps(pspec, tuple(corner1))
-            except Exception as _pe:
-                exec_lines.append(
-                    f'-- skipped {action!r}: derive_slot_tcps failed '
-                    f'({type(_pe).__name__}: {_pe})')
-                continue
-            # 2026-08-06 (operator directive: part-count termination).
-            # `cfg.pallet.part_count` caps how many pick-place cycles
-            # emit. Autofilled from the PBD demo's stated quantity
-            # (e.g. "5 holes" → default 5). Codegen cap:
-            #   emitted = min(part_count, capacity)
-            # Absent field → no cap (emitted = capacity). > capacity
-            # → cap at capacity + emit a comment naming the excess.
-            # Partial top layer is preferred over empty cycles;
-            # slot order is layer-outermost (all of layer 0, then
-            # layer 1...) so a partial top-layer fill correctly
-            # leaves the upper slots unused.
-            capacity = len(slots)
-            _pc_raw = pold.get('part_count')
-            if _pc_raw is None:
-                part_count = capacity
-                _pc_note = 'no part_count set — emitting full capacity'
-            else:
-                try:
-                    part_count = max(1, int(_pc_raw))
-                except (TypeError, ValueError):
-                    part_count = capacity
-                    _pc_note = (f'invalid part_count={_pc_raw!r} — '
-                                 f'falling back to capacity {capacity}')
-                else:
-                    if part_count > capacity:
-                        exec_lines.append(
-                            f'-- move_to_pallet: part_count={part_count} '
-                            f'exceeds capacity={capacity} — capping at '
-                            f'capacity (only {capacity} placed)')
-                        part_count = capacity
-                        _pc_note = f'capped at capacity {capacity}'
-                    else:
-                        _pc_note = f'part_count={part_count}/capacity={capacity}'
-            # Slice the fill-order slot list to the first part_count.
-            slots = slots[:part_count]
-            # Frame normal — offset direction for the transit lifts.
-            try:
-                from programming_by_demonstration.pallet_geometry import compute_frame
-                _fr = compute_frame(pspec)
-                _normal = _fr['plane_normal']   # unit vector (m)
-            except Exception:
-                _normal = (0.0, 0.0, 1.0)   # fall back to +Z_base
-            # ── 2026-08-06 finalize palletize subroutine ────────────
-            # Full pick+place cycle inline. Read fields from the
-            # `move_to_pallet` step (composer-emitted; falls back to
-            # inference for legacy programs whose step lacks these):
-            #
-            #   vacuum_port_do    — DO to energize at pick, de-energize
-            #                        at place. Falls back to the port
-            #                        the ABSORBED engage set_io fired
-            #                        on (holepartpalletize legacy: DO2).
-            #   blow_off_port_do  — optional DO for release blow-off
-            #                        pulse. None → no pulse.
-            #   blow_off_pulse_ms — pulse duration for the blow-off.
-            #   safety_margin_mm  — added to layer_height to size the
-            #                        transit lift ABOVE the current
-            #                        slot. transit_Z rises per layer
-            #                        because it's applied above THIS
-            #                        layer's slot along the frame
-            #                        normal.
-            #   seal_wait_ms      — dwell after vacuum ON.
-            _step_grip_type = str(step.get('gripper_type') or 'finger').lower()
-            _vac_port_do = step.get('vacuum_port_do')
-            if _vac_port_do is None:
-                _vac_port_do = _pallet_inferred_vac_port
-            if _vac_port_do is None and _step_grip_type == 'vacuum':
-                _vac_port_do = 2   # io_map default (VACUUM_DEFAULT_PORT)
-            try:
-                _vac_port_do = int(_vac_port_do) if _vac_port_do is not None else None
-            except (TypeError, ValueError):
-                _vac_port_do = None
-            _blow_port_raw = step.get('blow_off_port_do')
-            try:
-                _blow_port_do = int(_blow_port_raw) if _blow_port_raw is not None else None
-            except (TypeError, ValueError):
-                _blow_port_do = None
-            try:
-                _blow_pulse_ms = int(step.get('blow_off_pulse_ms') or 300)
-            except (TypeError, ValueError):
-                _blow_pulse_ms = 300
-            try:
-                _safety_margin_mm = float(step.get('safety_margin_mm') or 50)
-            except (TypeError, ValueError):
-                _safety_margin_mm = 50.0
-            _seal_wait_ms = step.get('seal_wait_ms')
-            if _seal_wait_ms is None:
-                _seal_wait_ms = _pallet_inferred_seal_wait_ms or 500
-            try:
-                _seal_wait_ms = int(_seal_wait_ms)
-            except (TypeError, ValueError):
-                _seal_wait_ms = 500
-            # 2026-08-06 operator directive — palletize completeness:
-            # approach and retract distances (mm) along the pose's OWN
-            # flange Z axis (rule A). approach_distance_mm and
-            # retract_distance_mm default to 50 (editable). Different
-            # names retained so the operator can dial one without
-            # perturbing the other.
-            try:
-                _approach_dist_mm = float(step.get('approach_distance_mm') or 50)
-            except (TypeError, ValueError):
-                _approach_dist_mm = 50.0
-            try:
-                _retract_dist_mm  = float(step.get('retract_distance_mm')  or 50)
-            except (TypeError, ValueError):
-                _retract_dist_mm  = 50.0
-            _layer_h_mm = float(pold.get('layer_height_mm') or 100)
-            # Transit-lift height ABOVE the current slot along the
-            # frame normal. Same offset for every slot, but because
-            # slot_Z(l) rises with layer, transit_over_slot's absolute
-            # Z rises with layer too — the "clears the highest
-            # occupied layer" invariant.
-            _transit_h_mm = _layer_h_mm + _safety_margin_mm
-            # Locate the taught pick pose (position_role='pick',
-            # taught_joints). Its point was already declared in
-            # varspoint when the walker processed the pick_contact
-            # step (before this expansion fires); we reference it by
-            # role. `_pick_step` is used for FK → pick TCP.
-            _pick_step = None
-            for _s in steps:
-                if _s.get('position_role') == 'pick' \
-                        and isinstance(_s.get('taught_joints'), list) \
-                        and len(_s['taught_joints']) == 6:
-                    _pick_step = _s
-                    break
-            if _pick_step is None:
-                exec_lines.append(
-                    f'-- skipped {action!r}: no taught pick pose '
-                    f'(position_role=\'pick\' with 6-el taught_joints) '
-                    f'in the program — cannot expand palletize cycles')
-                continue
-            _pick_joints = [float(v) for v in _pick_step['taught_joints']]
-            _pick_pt_name = role_point_name.get('pick')
-            if _pick_pt_name is None:
-                # Pick_contact hadn't emitted yet (unusual — the walker
-                # should have processed it before this step). Declare
-                # the point inline as a fallback so the cycle can
-                # still emit.
-                fallback_idx += 1
-                _pick_pt_name = f'{point_prefix}{fallback_idx}'
-                while _pick_pt_name in program_points or _pick_pt_name in used_named:
-                    fallback_idx += 1
-                    _pick_pt_name = f'{point_prefix}{fallback_idx}'
-                varspoint[_pick_pt_name] = _make_jp_point(_pick_joints, _pick_pt_name)
-                used_named.add(_pick_pt_name)
-                role_point_name['pick'] = _pick_pt_name
-            _pick_tcp = _tcp_from_joints_m(_pick_joints)   # (x,y,z,a,b,c)
-            # Pick's flange Z axis in base frame. The approach point
-            # sits BEHIND the tool (opposite tool_z direction), i.e.
-            # contact - approach_dist * tool_z. For a top-down grip
-            # tool_z points down (-world_Z), so `-tool_z` is +world_Z
-            # and the approach point is above the contact.
-            _pick_fk = _fk_chain(_pick_joints)
-            _pick_flange_R = _pick_fk[6][:3, :3]
-            _pick_tool_z = (float(_pick_flange_R[0, 2]),
-                            float(_pick_flange_R[1, 2]),
-                            float(_pick_flange_R[2, 2]))
-            # Slot orientation — all slots share the SAME orientation
-            # (from part_tcp, a single pose). Compute the slot's
-            # flange Z axis once from that shared a/b/c. The rotation
-            # matrix uses the same Fixed-XYZ Euler convention as
-            # _R_from_tcp_abc (R = Rz(c)·Ry(b)·Rx(a)); its third
-            # column is the flange Z axis in base frame.
-            if slots:
-                _s0 = slots[0]['tcp_m']
-                _slot_R = _R_from_tcp_abc(float(_s0[3]),
-                                          float(_s0[4]),
-                                          float(_s0[5]))
-                _slot_tool_z = (float(_slot_R[0, 2]),
-                                float(_slot_R[1, 2]),
-                                float(_slot_R[2, 2]))
-            else:
-                _slot_tool_z = (0.0, 0.0, -1.0)   # top-down default
-            # Optional taught approach poses (rule C). When present,
-            # the approach is linear from the taught point along its
-            # own angle — same as computing a fixed axis-offset would
-            # yield, but with the operator's chosen entry angle.
-            _pick_appr_taught = step.get('pick_approach_joints')
-            if isinstance(_pick_appr_taught, list) and len(_pick_appr_taught) == 6:
-                _pick_appr_joints_taught = [float(v) for v in _pick_appr_taught]
-                _pick_appr_tcp_taught = _tcp_from_joints_m(
-                    _pick_appr_joints_taught)
-            else:
-                _pick_appr_joints_taught = None
-                _pick_appr_tcp_taught = None
-            _place_appr_taught = step.get('place_approach_joints')
-            if isinstance(_place_appr_taught, list) and len(_place_appr_taught) == 6:
-                _place_appr_joints_taught = [float(v) for v in _place_appr_taught]
-                _place_appr_tcp_taught = _tcp_from_joints_m(
-                    _place_appr_joints_taught)
-            else:
-                _place_appr_joints_taught = None
-                _place_appr_tcp_taught = None
-            # Speed splits mirror the previous compound-motion policy.
-            _step_pct   = int(step.get('speed_pct') or eff_pct or 25)
-            _slow_pct   = max(5,  min(_step_pct, 20))
-            _medium_pct = max(10, min(_step_pct, 40))
-            # Vacuum port is required for palletize (release = vacuum
-            # de-energize). If missing, refuse the expansion — a
-            # silent finger-DO fire would strand the arm without a
-            # release on non-finger effectors.
-            if _vac_port_do is None:
-                exec_lines.append(
-                    f'-- skipped {action!r}: no vacuum_port_do on step '
-                    f'and no engage set_io in the pre-pallet block to '
-                    f'infer it from — palletize needs a DO to energize '
-                    f'at pick and de-energize at place')
-                continue
-            # Expansion header.
-            _blow_desc = (f'DO{_blow_port_do}+{_blow_pulse_ms}ms'
-                          if _blow_port_do is not None
-                          else 'none')
-            _pick_appr_kind = ('taught'
-                               if _pick_appr_joints_taught is not None
-                               else f'axis-offset {_approach_dist_mm:.0f}mm')
-            _place_appr_kind = ('taught (layer-shifted)'
-                                if _place_appr_joints_taught is not None
-                                else f'axis-offset {_approach_dist_mm:.0f}mm')
-            exec_lines.append(
-                f'-- move_to_pallet EXPANSION: {len(slots)} cycle(s) '
-                f'({_pc_note}), '
-                f'{pspec.rows}×{pspec.cols}×{pspec.layers} grid, '
-                f'pitch_row={pspec.pitch_row_mm:.0f}mm '
-                f'pitch_col={pspec.pitch_col_mm:.0f}mm '
-                f'layer_h={pspec.layer_height_mm or 0:.0f}mm '
-                f'order={pspec.order} (layer-outermost)  '
-                f'vacuum_port=DO{_vac_port_do}  '
-                f'blow_off={_blow_desc}  '
-                f'safety_margin={_safety_margin_mm:.0f}mm  '
-                f'transit_h_above_slot={_transit_h_mm:.0f}mm  '
-                f'approach={_approach_dist_mm:.0f}mm  '
-                f'retract={_retract_dist_mm:.0f}mm  '
-                f'pick_approach={_pick_appr_kind}  '
-                f'place_approach={_place_appr_kind}')
-            _pallet_ok = True
-            # ── Pick approach point (rule A / rule C, computed once).
-            # If the operator taught a pick_approach pose, use it; else
-            # offset the pick contact BACK along the pick's own flange
-            # Z axis (opposite tool_z direction) by approach_distance.
-            # The pick pose is FIXED across all cycles so this is
-            # constant.
-            if _pick_appr_tcp_taught is not None:
-                pick_appr_tcp = list(_pick_appr_tcp_taught)
-                _pick_appr_source = 'taught'
-                _pick_appr_seed_j = list(_pick_appr_joints_taught)
-            else:
-                pick_appr_tcp = [
-                    _pick_tcp[0] - (_approach_dist_mm / 1000.0) * _pick_tool_z[0],
-                    _pick_tcp[1] - (_approach_dist_mm / 1000.0) * _pick_tool_z[1],
-                    _pick_tcp[2] - (_approach_dist_mm / 1000.0) * _pick_tool_z[2],
-                    _pick_tcp[3], _pick_tcp[4], _pick_tcp[5],
-                ]
-                _pick_appr_source = 'axis-offset'
-                _pick_appr_seed_j = list(_pick_joints)
-            _ik_pick_appr = seeded_ik_to_pose(list(_pick_joints), pick_appr_tcp)
-            if _ik_pick_appr is None:
-                exec_lines.append(
-                    f'-- PALLET IK FAILED: pick approach unreachable — '
-                    f'refusing pallet expansion')
-                continue
-            q_pick_appr = _ik_pick_appr[0]
-            fallback_idx += 1
-            _nm_pick_appr = f'{point_prefix}{fallback_idx}'
-            while _nm_pick_appr in program_points or _nm_pick_appr in used_named:
-                fallback_idx += 1
-                _nm_pick_appr = f'{point_prefix}{fallback_idx}'
-            varspoint[_nm_pick_appr] = _make_jp_point(q_pick_appr, _nm_pick_appr)
-            used_named.add(_nm_pick_appr)
-            # Save the pick approach's tool-Z retract vector for the
-            # linear-up-from-pick emit. Same source as approach.
-            _pick_retr_dist_mm = _retract_dist_mm
-            for _sl_idx, _sl in enumerate(slots):
-                r_idx = int(_sl['row']); c_idx = int(_sl['col']); l_idx = int(_sl['layer'])
-                slot_m = list(_sl['tcp_m'])          # meters + a/b/c
-                # transit_over_slot = slot + transit_h * normal (meters).
-                transit_slot_m = list(slot_m)
-                transit_slot_m[0] += (_transit_h_mm / 1000.0) * float(_normal[0])
-                transit_slot_m[1] += (_transit_h_mm / 1000.0) * float(_normal[1])
-                transit_slot_m[2] += (_transit_h_mm / 1000.0) * float(_normal[2])
-                # transit_over_pick shares transit_over_slot's ABSOLUTE
-                # base-frame Z; pick's XY & orientation.
-                transit_pick_m = [
-                    float(_pick_tcp[0]),
-                    float(_pick_tcp[1]),
-                    float(transit_slot_m[2]),
-                    float(_pick_tcp[3]),
-                    float(_pick_tcp[4]),
-                    float(_pick_tcp[5]),
-                ]
-                # PLACE APPROACH point (rule A + B + optional C).
-                # Rule A: contact - approach_dist * slot_tool_z (opposite
-                #   flange Z of the slot pose).
-                # Rule B: because THIS layer's slot_m already carries the
-                #   layer-shifted Z (via layer * layer_h * plane_normal),
-                #   the approach point automatically rises per layer.
-                #   Layer-2 approach sits ABOVE layer 2 by approach_dist
-                #   along the (typically +Z) opposite-of-tool_z; it
-                #   NEVER dips below layer 2.
-                # Rule C: taught place_approach overrides — the operator
-                #   supplied a taught XYZ+abc; apply the same
-                #   layer_h*normal offset so the taught pose scales up
-                #   through layers correctly.
-                if _place_appr_tcp_taught is not None:
-                    _lift = (l_idx * _layer_h_mm) / 1000.0
-                    place_appr_tcp = [
-                        _place_appr_tcp_taught[0] + _lift * float(_normal[0]),
-                        _place_appr_tcp_taught[1] + _lift * float(_normal[1]),
-                        _place_appr_tcp_taught[2] + _lift * float(_normal[2]),
-                        _place_appr_tcp_taught[3],
-                        _place_appr_tcp_taught[4],
-                        _place_appr_tcp_taught[5],
-                    ]
-                    _place_appr_kind_line = f'taught + layer×{_layer_h_mm:.0f}mm lift'
-                else:
-                    place_appr_tcp = [
-                        slot_m[0] - (_approach_dist_mm / 1000.0) * _slot_tool_z[0],
-                        slot_m[1] - (_approach_dist_mm / 1000.0) * _slot_tool_z[1],
-                        slot_m[2] - (_approach_dist_mm / 1000.0) * _slot_tool_z[2],
-                        slot_m[3], slot_m[4], slot_m[5],
-                    ]
-                    _place_appr_kind_line = (f'axis-offset {_approach_dist_mm:.0f}mm '
-                                             f'along slot -tool_Z')
-                # Cycle header.
-                exec_lines.append(
-                    f'-- cycle {_sl_idx + 1}/{len(slots)}: pick_approach '
-                    f'({_pick_appr_source}) → pick → vacuum ON → retract '
-                    f'→ transit_Z (layer {l_idx}, '
-                    f'absolute Z={transit_slot_m[2]*1000:.1f}mm) → over '
-                    f'slot({r_idx},{c_idx},{l_idx}) → place_approach '
-                    f'({_place_appr_kind_line}, absolute Z='
-                    f'{place_appr_tcp[2]*1000:.1f}mm) → place → vacuum OFF'
-                    + (f' + blow-off pulse' if _blow_port_do is not None else '')
-                    + ' → retract → transit_Z')
-                # ── (1) Go to pick approach — always start each cycle
-                # from a known kinematic branch. From cycle 2..N this
-                # comes from prev cycle's transit_over_slot (transit_Z
-                # of prev layer, in base frame). movJ for the first
-                # movement (fresh IK branch); movL for subsequent
-                # in-place descents so the arm follows a straight line.
-                exec_lines.append(
-                    f'movJ({_nm_pick_appr})  -- cycle {_sl_idx + 1} '
-                    f'pick_approach ({_pick_appr_source}, offset '
-                    f'{_approach_dist_mm:.0f}mm along -pick_tool_Z)  '
-                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_pick_appr)}]')
-                _seed = list(q_pick_appr)
-                last_move_joints = list(q_pick_appr)
-                # ── (2) LINEAR DOWN to pick contact.
-                exec_lines.append(
-                    f'movL({_pick_pt_name})  -- cycle {_sl_idx + 1} '
-                    f'linear-down to pick contact (fixed taught pose)  '
-                    f'joints=[{", ".join(f"{v:+.3f}" for v in _pick_joints)}]')
-                _seed = list(_pick_joints)
-                last_move_joints = list(_pick_joints)
-                # ── (3) Vacuum ON.
-                exec_lines.append(
-                    f'setDO({_vac_port_do},1)  -- cycle {_sl_idx + 1} '
-                    f'vacuum ON  (vacuum_port_do=DO{_vac_port_do})')
-                # ── (4) Seal wait.
-                if _seal_wait_ms > 0:
-                    exec_lines.append(
-                        f'wait({_seal_wait_ms})  -- cycle {_sl_idx + 1} '
-                        f'seal wait {_seal_wait_ms} ms')
-                # ── (5) LINEAR UP — retract to the pick approach point.
-                # (Retract distance = approach distance; different names
-                # kept so the operator can dial them separately.)
-                exec_lines.append(
-                    f'movL({_nm_pick_appr})  -- cycle {_sl_idx + 1} '
-                    f'linear-up to pick_approach (retract '
-                    f'{_pick_retr_dist_mm:.0f}mm)  '
-                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_pick_appr)}]')
-                _seed = list(q_pick_appr)
-                # ── (6) Transit_Z above pick.
-                _ik_tpick = seeded_ik_to_pose(_seed, transit_pick_m)
-                if _ik_tpick is None:
-                    exec_lines.append(
-                        f'-- PALLET IK FAILED: transit_over_pick for '
-                        f'slot[{r_idx},{c_idx},{l_idx}] unreachable '
-                        f'(target Z={transit_pick_m[2]*1000:.1f}mm) — '
-                        f'refusing pallet expansion')
-                    _pallet_ok = False
-                    break
-                q_tpick = _ik_tpick[0]
-                fallback_idx += 1
-                _nm_tpick = f'{point_prefix}{fallback_idx}'
-                while _nm_tpick in program_points or _nm_tpick in used_named:
-                    fallback_idx += 1
-                    _nm_tpick = f'{point_prefix}{fallback_idx}'
-                varspoint[_nm_tpick] = _make_jp_point(q_tpick, _nm_tpick)
-                used_named.add(_nm_tpick)
-                exec_lines.append(
-                    f'movL({_nm_tpick})  -- cycle {_sl_idx + 1} '
-                    f'lift-to-transit (over pick, absolute Z='
-                    f'{transit_pick_m[2]*1000:.1f}mm)  '
-                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_tpick)}]')
-                _seed = list(q_tpick)
-                # ── (7) Over slot at transit_Z.
-                _ik_tslot = seeded_ik_to_pose(_seed, transit_slot_m)
-                if _ik_tslot is None:
-                    exec_lines.append(
-                        f'-- PALLET IK FAILED: transit_over_slot '
-                        f'[{r_idx},{c_idx},{l_idx}] unreachable at Z='
-                        f'{transit_slot_m[2]*1000:.1f}mm — refusing')
-                    _pallet_ok = False
-                    break
-                q_tslot = _ik_tslot[0]
-                fallback_idx += 1
-                _nm_tslot = f'{point_prefix}{fallback_idx}'
-                while _nm_tslot in program_points or _nm_tslot in used_named:
-                    fallback_idx += 1
-                    _nm_tslot = f'{point_prefix}{fallback_idx}'
-                varspoint[_nm_tslot] = _make_jp_point(q_tslot, _nm_tslot)
-                used_named.add(_nm_tslot)
-                exec_lines.append(
-                    f'movL({_nm_tslot})  -- cycle {_sl_idx + 1} '
-                    f'traverse-over-slot [{r_idx},{c_idx},{l_idx}] at '
-                    f'transit_Z={transit_slot_m[2]*1000:.1f}mm  '
-                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_tslot)}]')
-                _seed = list(q_tslot)
-                # ── (8) Descend to place_approach (layer-adjusted).
-                _ik_place_appr = seeded_ik_to_pose(_seed, place_appr_tcp)
-                if _ik_place_appr is None:
-                    exec_lines.append(
-                        f'-- PALLET IK FAILED: place_approach for '
-                        f'[{r_idx},{c_idx},{l_idx}] unreachable at Z='
-                        f'{place_appr_tcp[2]*1000:.1f}mm — refusing')
-                    _pallet_ok = False
-                    break
-                q_place_appr = _ik_place_appr[0]
-                fallback_idx += 1
-                _nm_place_appr = f'{point_prefix}{fallback_idx}'
-                while _nm_place_appr in program_points or _nm_place_appr in used_named:
-                    fallback_idx += 1
-                    _nm_place_appr = f'{point_prefix}{fallback_idx}'
-                varspoint[_nm_place_appr] = _make_jp_point(q_place_appr, _nm_place_appr)
-                used_named.add(_nm_place_appr)
-                exec_lines.append(
-                    f'movL({_nm_place_appr})  -- cycle {_sl_idx + 1} '
-                    f'place_approach [{r_idx},{c_idx},{l_idx}] layer {l_idx} '
-                    f'({_place_appr_kind_line}, absolute Z='
-                    f'{place_appr_tcp[2]*1000:.1f}mm)  '
-                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_place_appr)}]')
-                _seed = list(q_place_appr)
-                # ── (9) LINEAR DOWN to place at slot.
-                _ik_slot = seeded_ik_to_pose(_seed, slot_m)
-                if _ik_slot is None:
-                    exec_lines.append(
-                        f'-- PALLET IK FAILED: slot [{r_idx},{c_idx},{l_idx}] '
-                        f'place unreachable from approach — refusing')
-                    _pallet_ok = False
-                    break
-                q_slot = _ik_slot[0]
-                fallback_idx += 1
-                _nm_slot = f'{point_prefix}{fallback_idx}'
-                while _nm_slot in program_points or _nm_slot in used_named:
-                    fallback_idx += 1
-                    _nm_slot = f'{point_prefix}{fallback_idx}'
-                varspoint[_nm_slot] = _make_jp_point(q_slot, _nm_slot)
-                used_named.add(_nm_slot)
-                exec_lines.append(
-                    f'movL({_nm_slot})  -- slot[{r_idx},{c_idx},{l_idx}] place  '
-                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_slot)}]  '
-                    f'(linear-down from approach)')
-                _seed = list(q_slot)
-                # ── (10) Vacuum OFF (release).
-                exec_lines.append(
-                    f'setDO({_vac_port_do},0)  -- cycle {_sl_idx + 1} '
-                    f'vacuum OFF  (pallet release DO{_vac_port_do}=0, '
-                    f'slot [{r_idx},{c_idx},{l_idx}])')
-                # ── (11) Optional blow-off pulse.
-                if _blow_port_do is not None and _blow_pulse_ms > 0:
-                    exec_lines.append(
-                        f'setDO({_blow_port_do},1)  -- cycle {_sl_idx + 1} '
-                        f'blow-off pulse start DO{_blow_port_do}=1')
-                    exec_lines.append(
-                        f'wait({_blow_pulse_ms})  -- blow-off pulse '
-                        f'{_blow_pulse_ms} ms')
-                    exec_lines.append(
-                        f'setDO({_blow_port_do},0)  -- cycle {_sl_idx + 1} '
-                        f'blow-off pulse end DO{_blow_port_do}=0')
-                # ── (12) LINEAR UP — retract to place_approach.
-                exec_lines.append(
-                    f'movL({_nm_place_appr})  -- cycle {_sl_idx + 1} '
-                    f'linear-up to place_approach (retract '
-                    f'{_retract_dist_mm:.0f}mm)  '
-                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_place_appr)}]')
-                _seed = list(q_place_appr)
-                # ── (13) Lift back to transit_Z above slot.
-                exec_lines.append(
-                    f'movL({_nm_tslot})  -- cycle {_sl_idx + 1} '
-                    f'lift-to-transit (over slot after release, '
-                    f'transit_Z={transit_slot_m[2]*1000:.1f}mm)  '
-                    f'joints=[{", ".join(f"{v:+.3f}" for v in q_tslot)}]')
-                _seed = list(q_tslot)
-                last_move_joints = list(q_tslot)
-            if not _pallet_ok:
-                pass   # partial expansion — halted at first IK failure.
+            _fbi = [fallback_idx]
+            _ctx = _pallet.ExpandCtx(
+                steps=steps,
+                cfg=cfg,
+                exec_lines=exec_lines,
+                varspoint=varspoint,
+                used_named=used_named,
+                program_points=program_points,
+                role_point_name=role_point_name,
+                step_point_name=step_point_name,
+                eff_pct=eff_pct,
+                point_prefix=point_prefix,
+                absorb_plan=_absorb_plan,
+                seeded_ik_to_pose=seeded_ik_to_pose,
+                fk_chain=_fk_chain,
+                R_from_tcp_abc=_R_from_tcp_abc,
+                tcp_from_joints_m=_tcp_from_joints_m,
+                make_jp_point=_make_jp_point,
+                fallback_idx=_fbi,
+            )
+            _pallet.expand(step, _ctx)
+            fallback_idx = _fbi[0]
+            # Reset last-move tracking — the expansion sets its own
+            # motion history internally; the walker's guard would false-
+            # positive against a stale target after a multi-cycle emit.
+            last_move_joints = None
+            last_move_col_locked = False
             continue
 
         # ---- Loop — for-loop wrap OR continuous goto ----------------

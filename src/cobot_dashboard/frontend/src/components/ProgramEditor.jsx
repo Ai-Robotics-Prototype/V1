@@ -5032,8 +5032,31 @@ export default function ProgramEditor() {
       return
     }
     const cfg = currentProgram?.config || {}
-    const nextPlace = { ...(cfg.pallet_place || {}), [field]: [...tcp] }
-    const nextPallet = { ...(cfg.pallet || {}),      [field]: [...tcp] }
+    // 2026-08-19 scoped fix (ledger 2c2e435 pallet regression, defect A):
+    // pallettest.json was written by this teach path with ONLY
+    // corner1/2/3 + part_tcp — no rows/cols/layers. That produced a
+    // 1×1×1 default in the codegen and a "stuck at slot 1" defect
+    // where the loop wrapper replayed a single-slot cycle N times.
+    // Seed the wizard defaults (4×4×1, 150 mm pitch, 100 mm layer)
+    // when the operator teaches the FIRST corner on a program whose
+    // pallet block has no grid dims. Later edits to rows/cols/layers
+    // via PalletConfigEditor still win (spread order).
+    const _priorPallet = cfg.pallet || {}
+    const _dimsAbsent  =
+      _priorPallet.rows   === undefined &&
+      _priorPallet.cols   === undefined &&
+      _priorPallet.layers === undefined
+    const _dimSeed = _dimsAbsent
+      ? {
+          rows: 4, cols: 4, layers: 1,
+          spacing_x_mm: 150, spacing_y_mm: 150,
+          layer_height_mm: 100,
+          fill_order: 'row_lr',
+          approach_height_mm: 100, retract_height_mm: 200,
+        }
+      : {}
+    const nextPlace = { ..._dimSeed, ...(cfg.pallet_place || {}), [field]: [...tcp] }
+    const nextPallet = { ..._dimSeed, ...(cfg.pallet || {}),      [field]: [...tcp] }
     const isCorner = role === 'pallet_c1' || role === 'pallet_c2' || role === 'pallet_c3'
 
     // Role → teach-session slot key (2026-08-04 record-through).

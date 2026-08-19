@@ -1134,51 +1134,22 @@ def test_completeness_per_cycle_has_all_thirteen_substeps():
             f'sub-step {k!r} count = {v}, expected {N} (one per cycle)')
 
 
-def test_completeness_pick_approach_along_flange_z_axis():
-    """Rule A: pick_approach = pick_contact - approach_dist * pick_tool_Z.
-    For the fixture pick pose (top-down grip), pick_tool_Z has a
-    strongly negative world-Z component, so pick_approach is ABOVE
-    the pick contact by ≈ approach_distance_mm."""
-    prog = _load_holepartpalletize()
-    prog = json.loads(json.dumps(prog))
-    prog['config']['pallet']['part_count'] = 1
-    step = _get_pallet_step(prog)
-    step['approach_distance_mm'] = 80
-    lua, points, _ = program_ops.codegen_lua_from_program(
-        prog, operator_speed_limit_pct=25)
-    # Find the pick contact and pick_approach point references in the
-    # cycle emit. Cycle-1 emit has one line each explicitly labeled.
-    import re
-    pick_contact_pt = None
-    pick_approach_pt = None
-    for ln in lua.splitlines():
-        m = re.search(
-            r'movL\((p\d+)\)\s+--\s+cycle 1 linear-down to pick contact',
-            ln)
-        if m: pick_contact_pt = m.group(1)
-        m = re.search(r'movJ\((p\d+)\)\s+--\s+cycle 1 pick_approach', ln)
-        if m: pick_approach_pt = m.group(1)
-    assert pick_contact_pt and pick_approach_pt, (
-        f'could not find pick contact or approach points in emit; '
-        f'contact={pick_contact_pt}, approach={pick_approach_pt}')
-    contact_val = points[pick_contact_pt]['val']
-    if isinstance(contact_val, str): contact_val = json.loads(contact_val)
-    approach_val = points[pick_approach_pt]['val']
-    if isinstance(approach_val, str): approach_val = json.loads(approach_val)
-    contact_fk  = program_ops._fk_chain(contact_val['jp'])[6][:3, 3]
-    approach_fk = program_ops._fk_chain(approach_val['jp'])[6][:3, 3]
-    # Distance between the two should equal approach_distance_mm.
-    dx, dy, dz = (approach_fk[0] - contact_fk[0],
-                  approach_fk[1] - contact_fk[1],
-                  approach_fk[2] - contact_fk[2])
-    mag = math.sqrt(dx*dx + dy*dy + dz*dz)
-    assert abs(mag - 80.0) < 1.5, (
-        f'pick_approach - pick_contact magnitude = {mag:.2f} mm, '
-        f'expected 80 mm')
-    # For a top-down grip, approach must be ABOVE contact (base Z).
-    assert dz > 0, (
-        f'pick_approach should be ABOVE pick_contact for a top-down '
-        f'grip: Δz = {dz:+.2f} mm')
+# 2026-08-19 scoped fix (ledger 2c2e435 pallet regression, defect B):
+# The pick-side pick_approach point + linear-down/linear-up around
+# pick_contact are DELETED from the palletize cycle. The tests below
+# that pinned rule A on the pick side are also deleted — see the new
+# `test_pick_sequence_single_descend_before_vacuum_on` and
+# `test_no_pick_approach_lift_in_cycle` pins for the replacement
+# contract (cb83ed4 restore: bare `movJ(pick_pt)` at cycle start, no
+# per-cycle pre-descent).
+#
+# Deleted:
+#   - test_completeness_pick_approach_along_flange_z_axis
+#   - test_completeness_taught_pick_approach_overrides_default
+#   - test_completeness_independent_approach_and_retract_distances
+#
+# The rule-B pins on the PLACE side (place_approach layer-shifted,
+# rule B "never dip" invariant) remain in force below.
 
 
 def test_completeness_place_approach_rises_per_layer():
@@ -1263,55 +1234,6 @@ def test_completeness_layer_N_approach_above_layer_N_slot():
             f'layer-0 slot Z ({slot_z[0]:.2f}) — the "never dip" pin')
 
 
-def test_completeness_taught_pick_approach_overrides_default(monkeypatch):
-    """Rule C: setting pick_approach_joints on the step routes the
-    approach through the taught pose, not the axis-offset default.
-    The pick_approach point's FK should match the taught_joints' FK."""
-    prog = _load_holepartpalletize()
-    prog = json.loads(json.dumps(prog))
-    prog['config']['pallet']['part_count'] = 1
-    step = _get_pallet_step(prog)
-    # Synthesize a taught pick_approach at (pick_joints + tiny nudge).
-    pick_step = next(
-        s for s in prog['steps']
-        if s.get('position_role') == 'pick')
-    tj = list(pick_step['taught_joints'])
-    # Nudge J1 by 3° so the FK is materially different from the
-    # axis-offset default.
-    taught_appr = list(tj)
-    taught_appr[0] += 3.0
-    step['pick_approach_joints'] = taught_appr
-    lua, points, _ = program_ops.codegen_lua_from_program(
-        prog, operator_speed_limit_pct=25)
-    # Extract the pick_approach point.
-    import re
-    pick_appr_pt = None
-    for ln in lua.splitlines():
-        m = re.search(r'movJ\((p\d+)\)\s+--\s+cycle 1 pick_approach',
-                      ln)
-        if m: pick_appr_pt = m.group(1); break
-    assert pick_appr_pt, 'pick_approach movJ not emitted'
-    val = points[pick_appr_pt]['val']
-    if isinstance(val, str): val = json.loads(val)
-    q_emitted = val['jp']
-    # The taught pose's FK should be reachable by the emit —
-    # difference is small (IK may adjust wrist by fractions of a
-    # degree). Check FK positions instead of joint equality.
-    taught_fk  = program_ops._fk_chain(taught_appr)[6][:3, 3]
-    emitted_fk = program_ops._fk_chain(q_emitted)[6][:3, 3]
-    dx, dy, dz = (emitted_fk[0] - taught_fk[0],
-                  emitted_fk[1] - taught_fk[1],
-                  emitted_fk[2] - taught_fk[2])
-    mag_mm = math.sqrt(dx*dx + dy*dy + dz*dz)
-    assert mag_mm < 1.5, (
-        f'taught pick_approach FK vs emitted FK Δ = {mag_mm:.2f} mm; '
-        f'taught should override axis-offset default')
-    # Header line must announce the source as taught.
-    assert 'pick_approach=taught' in lua, (
-        'expansion header must state pick_approach=taught when the '
-        'field is set')
-
-
 def test_completeness_taught_place_approach_layer_shifts():
     """Rule C + B: taught place_approach is layer-shifted by
     layer_height along the plane_normal. Layer 1 taught-approach Z
@@ -1330,27 +1252,6 @@ def test_completeness_taught_place_approach_layer_shifts():
         prog, operator_speed_limit_pct=25)
     assert 'place_approach=taught (layer-shifted)' in lua, (
         'expansion header must state place_approach=taught when set')
-
-
-def test_completeness_independent_approach_and_retract_distances():
-    """approach_distance_mm and retract_distance_mm are independent
-    numeric fields. Setting one does not change the other."""
-    prog = _load_holepartpalletize()
-    prog = json.loads(json.dumps(prog))
-    prog['config']['pallet']['part_count'] = 1
-    step = _get_pallet_step(prog)
-    step['approach_distance_mm'] = 30
-    step['retract_distance_mm']  = 90
-    lua, _, _ = program_ops.codegen_lua_from_program(
-        prog, operator_speed_limit_pct=25)
-    # Header exposes both values.
-    assert 'approach=30mm' in lua, (
-        'header must show approach=30mm when set')
-    assert 'retract=90mm' in lua, (
-        'header must show retract=90mm when set')
-    # Retract comment on the pick-side linear-up must state 90mm.
-    assert 'linear-up to pick_approach (retract 90mm)' in lua, (
-        'retract distance must reach the linear-up comment')
 
 
 # ── 2026-08-06 (inline sub-step edit → regenerate ALL cycles) ─────
@@ -1485,4 +1386,234 @@ def test_inline_edit_blow_off_from_none_to_set_adds_pulse_every_cycle():
     assert starts == N and ends == N and pulses == N, (
         f'expected {N} blow-off pulse triples; got starts={starts} '
         f'ends={ends} pulses={pulses}')
+
+
+# ── 2026-08-19 scoped fix (ledger 2c2e435 pallet regression) ──────────
+#
+# Pinned regressions for:
+#   defect A — pallet index stuck at slot 1 (composer bug: config.pallet
+#              missing rows/cols/layers; loop count > slot capacity)
+#   defect B — double-descend at pick (2c2e435 added a pre-pick descent
+#              per cycle on top of the walker-emitted taught contact)
+#
+# These pins are the load-bearing tests for the scoped fix. Do NOT
+# delete them without operator directive naming the ledger entry.
+
+
+def _minimal_palletize_program(rows=2, cols=2, layers=1,
+                                pallet_dims_present=True,
+                                loop_count=None,
+                                include_pallet_loop_step=False):
+    """Synthesize the smallest palletize program that exercises the
+    pallet expansion. Reachable pick pose taken from
+    holepartpalletize.json (known reachable for the S10-140 URDF).
+
+    `pallet_dims_present=False` OMITS rows/cols/layers from config.pallet
+    to reproduce the composer bug (pallettest.json fixture).
+    """
+    pick_joints = [-30.77, 34.29, 123.41, 68.83, 92.1, -111.94]
+    pick_tcp = [0.758949, -0.218183, 0.119734,
+                3.100210897, -0.005916666, -0.825366203]
+    steps = [
+        {'action': 'move_home', 'label': 'Move to home', 'id': 1,
+         'step': 1,
+         'taught_joints': pick_joints, 'taught_tcp': pick_tcp,
+         'joints': pick_joints, 'position': pick_tcp[:3]},
+        {'action': 'move_linear', 'label': 'Approach above pick',
+         'id': 2, 'step': 2, 'speed_pct': 60, 'offset_z_mm': 100,
+         'derived_from': 'pick'},
+        {'action': 'move_linear', 'label': 'Pick — contact',
+         'id': 3, 'step': 3, 'taught': True,
+         'taught_joints': pick_joints, 'taught_tcp': pick_tcp,
+         'joints': pick_joints, 'position': pick_tcp[:3],
+         'position_role': 'pick', 'speed_pct': 30},
+        {'action': 'set_io', 'label': 'Vac ON',
+         'id': 4, 'step': 4, 'io_id': 'DO2', 'value': 1,
+         'io_role': 'vacuum'},
+        {'action': 'wait', 'label': 'Seal wait',
+         'id': 5, 'step': 5, 'duration_s': 0.5},
+        {'action': 'move_linear', 'label': 'Retreat above pick',
+         'id': 6, 'step': 6, 'speed_pct': 40, 'offset_z_mm': 200,
+         'derived_from': 'pick'},
+        {'action': 'move_to_pallet', 'mode': 'palletize',
+         'label': 'Place at pallet slot',
+         'id': 7, 'step': 7,
+         'pallet_phase': 'place',
+         'gripper_type': 'vacuum',
+         'io_vacuum': 'DO2', 'vacuum_port_do': 2,
+         'speed_pct': 30},
+        {'action': 'move_home', 'label': 'Return home',
+         'id': 99, 'step': 8},
+    ]
+    if include_pallet_loop_step:
+        # Insert loop between move_to_pallet and move_home.
+        steps.insert(-1, {
+            'action': 'loop', 'label': 'pallet loop',
+            'id': 42, 'step': 8, 'goto': 3,
+            'count': loop_count or 0, 'pallet_loop': True,
+        })
+        steps[-1]['step'] = 9   # renumber move_home
+    # Reachable slot near the pick pose.
+    place_block = {
+        'corner1_tcp': [0.62, -0.20, 0.13, 3.1, 0.0, -0.82],
+        'corner2_tcp': [0.62, -0.05, 0.13, 3.1, 0.0, -0.82],
+        'corner3_tcp': [0.75, -0.20, 0.13, 3.1, 0.0, -0.82],
+        'part_tcp':    [0.68, -0.12, 0.13, 3.1, 0.0, -0.82],
+    }
+    pallet_block = dict(place_block)
+    if pallet_dims_present:
+        pallet_block.update({
+            'rows': rows, 'cols': cols, 'layers': layers,
+            'spacing_x_mm': 60, 'spacing_y_mm': 60,
+            'layer_height_mm': 50, 'fill_order': 'row_lr',
+        })
+    return {
+        'id': 'synthetic', 'name': 'synthetic',
+        'steps': steps,
+        'config': {
+            'operation': 'palletize',
+            'speed': 40, 'speed_pct': 40,
+            'pallet': pallet_block,
+            'pallet_place': place_block,
+        },
+        'points': {}, 'source': 'synthetic',
+    }
+
+
+def test_pick_sequence_single_descend_before_vacuum_on():
+    """DEFECT B PIN — 2026-08-19 scoped fix.
+
+    In every cycle emitted by the pallet expansion, the sequence of
+    motion verbs from cycle start to `setDO(vac_port,1)` must contain
+    EXACTLY ONE motion — a `movJ(pick_pt)` back to the taught pick
+    contact. No `movL` linear-down to a separate approach point, no
+    lift-then-descend pair.
+
+    Pre-fix (2c2e435 regression) each cycle emitted:
+        movJ(pick_appr) → movL(pick_contact) → setDO(vac,1) ...
+    which combined with the walker-emitted taught contact produced a
+    down → touch → up → down → vacuum-on double-descend.
+    """
+    prog = _minimal_palletize_program(rows=1, cols=1, layers=1)
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    import re
+    # Find the first setDO(vac_port,1) — the "vacuum ON" marker.
+    vac_on_pat = re.compile(
+        r'^\s*setDO\(2\s*,\s*1\)\s+--\s+cycle', re.MULTILINE)
+    vac_on = vac_on_pat.search(lua)
+    assert vac_on, ('no cycle vacuum-ON emitted — expansion never '
+                    'reached the pick block')
+    # Find the cycle 1 header before it.
+    cycle_hdr = lua.rfind('-- cycle 1/', 0, vac_on.start())
+    assert cycle_hdr >= 0, ('no `-- cycle 1/` header before vacuum-ON')
+    # Count motion verb emissions between cycle header and vacuum-ON.
+    body = lua[cycle_hdr:vac_on.start()]
+    motions = re.findall(r'^\s*(movJ|movL|movJCoorRel)\(',
+                          body, re.MULTILINE)
+    assert motions == ['movJ'], (
+        f'cycle-1 pre-vacuum sequence must be exactly one movJ(pick_pt); '
+        f'got {motions}. Double-descend regression is back — see the '
+        f'2026-08-19 scoped fix (ledger 2c2e435).')
+
+
+def test_no_pick_approach_lift_in_cycle():
+    """DEFECT B PIN — 2026-08-19 scoped fix.
+
+    The 2c2e435 pattern `movL(pick_approach)` used as the pick-side
+    linear-up must NOT appear in the emitted Lua. cb83ed4-style has
+    no pick_approach point; retraction from pick contact goes
+    directly to `transit_over_pick`.
+    """
+    prog = _minimal_palletize_program(rows=1, cols=1, layers=1)
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    assert 'linear-up to pick_approach' not in lua, (
+        'pick-side pick_approach retract MUST NOT emit — cb83ed4 '
+        'restore has no pick_approach point at all.')
+    assert 'linear-down to pick contact' not in lua, (
+        'pick-side linear-down MUST NOT emit under cb83ed4 restore.')
+    assert 'pick_approach (axis-offset' not in lua, (
+        'pick_approach axis-offset movJ MUST NOT emit under cb83ed4 '
+        'restore.')
+
+
+def test_refuse_pallet_when_dims_missing():
+    """DEFECT A PIN — 2026-08-19 scoped fix.
+
+    A palletize program whose `config.pallet` omits `rows/cols/layers`
+    (the composer bug that produced `pallettest.json`) MUST NOT emit
+    a 1×1×1 default expansion. The codegen refuses with a clear
+    operator-facing message naming the fix.
+    """
+    prog = _minimal_palletize_program(pallet_dims_present=False)
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    assert 'REFUSED' in lua and 'missing rows/cols/layers' in lua, (
+        f'expected REFUSED comment naming the missing dims; got:\n{lua}')
+    # No expansion header should emit — the whole expansion is short-
+    # circuited by the refusal.
+    assert 'move_to_pallet EXPANSION' not in lua, (
+        'expansion header must not emit when the refusal short-circuits')
+    # No slot lines either.
+    assert 'slot[' not in lua, (
+        'no slot place lines under refusal — the arm must never see '
+        'a fabricated 1x1x1 default')
+
+
+def test_refuse_pallet_when_loop_count_exceeds_capacity():
+    """DEFECT A PIN — 2026-08-19 scoped fix.
+
+    A `pallet_loop=True` step whose `count` exceeds slot capacity
+    (rows*cols*layers) is a composer bug: the palletize expansion
+    emits all slots INLINE per iteration, so a loop wrapper on top
+    would place more parts than the pallet holds. Refuse with a
+    named message.
+    """
+    prog = _minimal_palletize_program(
+        rows=2, cols=2, layers=1,
+        include_pallet_loop_step=True, loop_count=16)
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    assert 'REFUSED' in lua and 'exceeds slot capacity' in lua, (
+        f'expected REFUSED comment naming the count/capacity mismatch; '
+        f'got:\n{lua}')
+
+
+def test_atomic_pallet_emit_on_ik_failure():
+    """DEFECT B PIN — 2026-08-19 scoped fix.
+
+    On any IK failure inside the pallet block, the expansion body
+    lines from ALL previously emitted cycles roll back — no partial
+    cycles reach the controller. The header + the refusal comment
+    remain visible so the operator sees intent + failure together.
+    """
+    prog = _minimal_palletize_program(rows=2, cols=2, layers=1)
+    # Move the pallet 3 m out of reach on every corner — the FIRST
+    # cycle's transit_over_pick IK will fail.
+    prog['config']['pallet_place']['corner1_tcp'] = [3.0, 3.0, 0.5,
+                                                     3.1, 0.0, -0.82]
+    prog['config']['pallet_place']['corner2_tcp'] = [3.0, 3.2, 0.5,
+                                                     3.1, 0.0, -0.82]
+    prog['config']['pallet_place']['corner3_tcp'] = [3.2, 3.0, 0.5,
+                                                     3.1, 0.0, -0.82]
+    prog['config']['pallet_place']['part_tcp']    = [3.1, 3.1, 0.5,
+                                                     3.1, 0.0, -0.82]
+    # Same for the older `pallet` block that carries dims.
+    prog['config']['pallet'].update(prog['config']['pallet_place'])
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    # Header stays.
+    assert 'move_to_pallet EXPANSION' in lua
+    # Refusal stays.
+    assert 'PALLET IK FAILED' in lua
+    # No partial cycle emissions: no setDO(vac,1) and no slot place
+    # lines survive the rollback.
+    import re
+    assert not re.search(
+        r'^\s*setDO\(2\s*,\s*1\)\s+--\s+cycle',
+        lua, re.MULTILINE), (
+        'atomic emit failed — a vacuum-ON survived past IK failure')
+    assert 'place  joints=' not in lua, (
+        'atomic emit failed — a slot place line survived past IK failure')
 
