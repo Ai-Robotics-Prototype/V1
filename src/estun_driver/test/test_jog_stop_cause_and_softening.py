@@ -37,8 +37,12 @@ def _fake_driver(**overrides):
     # Joint limits & margins — match config defaults.
     fake._joint_limit_deg = [200.0, 200.0, 166.0, 200.0, 166.0, 200.0]
     fake._joint_limit_margin_deg = 2.0
+    fake._joint_limit_margin_max_deg = 5.0  # 2026-08-19 retune cap
     fake._max_joint_speed_degps = [150.0, 150.0, 150.0, 180.0, 180.0, 180.0]
     fake._safety_latency_s = 0.100
+    # Legacy fixture value — kept 1.5 to preserve the softening-scale
+    # test's expected margins. New retune (1.2) is pinned in
+    # test_dyn_limit_margin_cap.py.
     fake._safety_factor = 1.5
     fake._baseline_speed_frac = 0.15
     # Live joints — J6 sitting near +192° by default so the softening

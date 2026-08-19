@@ -32,8 +32,12 @@ def _fake_driver(joint_deg, prev_joint_deg=None, cur_frac=0.2):
     fake._joint_rad = [0.0] * 6
     fake._joint_limit_deg = [200.0, 200.0, 166.0, 200.0, 166.0, 200.0]
     fake._joint_limit_margin_deg = 2.0
+    fake._joint_limit_margin_max_deg = 5.0  # 2026-08-19 retune cap
     fake._max_joint_speed_degps = [150.0, 150.0, 150.0, 180.0, 180.0, 180.0]
     fake._safety_latency_s = 0.100
+    # Legacy fixture value — kept 1.5 to match the original test's
+    # expected safe_edge computations (cart direction-aware supervise
+    # logic doesn't depend on the exact margin value, only its shape).
     fake._safety_factor = 1.5
     fake._baseline_speed_frac = 0.15
     fake._joint_escape_only_margin_deg = 12.0

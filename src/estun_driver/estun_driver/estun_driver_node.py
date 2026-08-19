@@ -308,8 +308,14 @@ class EstunCodroidDriver(Node):
         #   - posture RX → guard reaction takes ~150 ms (three 50 ms
         #     supervise ticks worst case)
         #   - safety factor 1.5 as an engineering headroom
+        # 2026-08-19 retune (F1.4 rung-3 fingerprint — dynamic margin
+        # was cutting jog out ~52% into the joint's authored travel
+        # under normal speed_pct). Measured release→stop on F1.4 was
+        # 56-61 ms; 0.150 s keeps generous 90 ms buffer.
         self.declare_parameter('safety_latency_s', 0.150)
-        self.declare_parameter('safety_factor', 1.5)
+        # 1.5 → 1.2 (still >1 for real-world overrun; the previous 1.5
+        # over-amplified with no evidence it was needed).
+        self.declare_parameter('safety_factor', 1.2)
         # Anchor speed_frac at which the STATIC baseline margins (the
         # legacy 2 mm limit margin, 30 mm collision stop, 60 mm sigma
         # soft) were originally tuned. Dynamic margins scale linearly
@@ -332,6 +338,13 @@ class EstunCodroidDriver(Node):
         self.declare_parameter('joint_limit_deg',
                                [200.0, 200.0, 166.0, 200.0, 166.0, 200.0])
         self.declare_parameter('joint_limit_margin_deg', 2.0)
+        # 2026-08-19 retune: dynamic margin is CAPPED. Prior behavior grew
+        # margin without bound at commanded speed (150°/s × 0.5 × 0.15 ×
+        # 1.5 = 16.9° on J1 at 50% — cutting jog out ~10% of the joint's
+        # authored travel). Cap keeps the margin honest: at any speed,
+        # the safe_edge is at most 5° inside the physical limit. Static
+        # base (2.0) is still the floor at crawl speed.
+        self.declare_parameter('joint_limit_margin_max_deg', 5.0)
         # 2026-08-05 (guided recovery, Lesson 165 extension): once a joint
         # is past `limit - joint_escape_only_margin_deg`, only the escape
         # direction (the one that REDUCES abs(current_deg)) is permitted.
@@ -382,7 +395,12 @@ class EstunCodroidDriver(Node):
         # down to `cart_joint_limit_soft_floor_frac`. The hard-stop
         # threshold (safe_edge) itself does NOT loosen — this is a
         # cliff → ramp reshape, safety-wise identical.
-        self.declare_parameter('cart_joint_limit_soft_zone_deg', 8.0)
+        # 2026-08-19 retune: 8.0 → 2.0. With the dynamic margin capped
+        # at 5°, slowdown starts at (margin + soft_zone) = 5 + 2 = 7°
+        # inside the limit — matches "slowdown starts ~7 deg out, not
+        # tens of degrees out" per the F1.4 rung-3 tuning directive.
+        # Prior 8° added to a 20° margin gave a 28° slowdown-zone.
+        self.declare_parameter('cart_joint_limit_soft_zone_deg', 2.0)
         self.declare_parameter('cart_joint_limit_soft_floor_frac', 0.10)
 
         # ── Self-collision guard ────────────────────────────────────────
@@ -598,6 +616,7 @@ class EstunCodroidDriver(Node):
         self._max_joint_speed_degps = list(self.get_parameter('max_joint_speed_degps').value)
         self._joint_limit_deg = list(self.get_parameter('joint_limit_deg').value)
         self._joint_limit_margin_deg = float(self.get_parameter('joint_limit_margin_deg').value)
+        self._joint_limit_margin_max_deg = float(self.get_parameter('joint_limit_margin_max_deg').value)
         self._joint_escape_only_margin_deg = float(
             self.get_parameter('joint_escape_only_margin_deg').value)
         self._jog_inc_max_delta_deg = float(self.get_parameter('jog_increment_max_delta_deg').value)
@@ -1778,11 +1797,26 @@ class EstunCodroidDriver(Node):
 
     def _dyn_limit_margin_deg(self, joint_idx0, speed_frac):
         """Dynamic joint-limit margin (deg) at commanded speed_frac.
-        joint_idx0 is 0..5. Returns MAX(static base, dynamic)."""
+        joint_idx0 is 0..5. Returns min(cap, max(static base, dynamic)).
+
+        2026-08-19 retune (F1.4 rung-3 fingerprint):
+          - safety_factor: 1.5 → 1.2 (less amplification, still >1
+            for real-world overrun).
+          - CAP the total dynamic margin at joint_limit_margin_max_deg
+            (default 5.0°). Prior formula grew unbounded with speed —
+            at 50% speed on a 180°/s joint, margin was 20°, cutting
+            legitimate jog out of ~10% of the joint's authored travel.
+            Cap holds the safe_edge at most 5° inside the physical
+            limit under all commanded speeds.
+          - Static base (default 2.0°) is still the floor at crawl speed.
+        """
         base = self._joint_limit_margin_deg
+        cap = self._joint_limit_margin_max_deg
         vmax = self._max_joint_speed_degps[joint_idx0]
         dyn = vmax * speed_frac * self._safety_latency_s * self._safety_factor
-        return max(base, dyn)
+        # Precedence: base <= result <= cap. If cap < base (misconfigured),
+        # cap wins (a base above cap would defeat the cap).
+        return min(cap, max(base, dyn))
 
     def _dyn_collision_stop_mm(self, speed_frac):
         """Dynamic collision stop distance (mm). At f≤baseline the
