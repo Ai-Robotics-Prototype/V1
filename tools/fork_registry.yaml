@@ -721,17 +721,22 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3363
+        line: 3649
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
-          Pinned by test_jog_hold_heartbeat.py.
+          Pinned by test_jog_hold_heartbeat.py. 2026-08-19: line
+          shifted from 3363→3601 by the CRI-proxy commit (+273
+          lines in _on_joint_states, _cri_proxy_staleness_loop,
+          /cmd/power ros2 branch, and _publish_ros2_jog_event
+          defensive defaults).
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3493
+        line: 3779
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
-          /cmd/jog. Pinned by test_jog_hold_heartbeat.py.
+          /cmd/jog. Pinned by test_jog_hold_heartbeat.py. 2026-08-19:
+          line shifted 3493→3731 (same commit as /cmd/jog above).
         owner: dashboard-transport
       - path: src/cobot_dashboard/frontend/src/lib/holdTicker.js
         line: 0

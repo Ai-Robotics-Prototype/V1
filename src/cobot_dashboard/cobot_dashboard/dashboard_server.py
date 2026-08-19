@@ -137,6 +137,23 @@ _last_joint_states_mono = [0.0]
 _JOG_BACKEND_ENV = os.environ.get("JOG_BACKEND", "ws").strip().lower()
 if _JOG_BACKEND_ENV not in ("ws", "ros2"):
     _JOG_BACKEND_ENV = "ws"
+# Camera opt-out (2026-08-19 F1.4 rung-3 root-cause fix): under
+# CAMERAS_DISABLED=1, skip Image/CameraInfo subscriptions + the PIL
+# encode thread pool. py-spy proved cam-encode is the GIL hog whose
+# ≥1 s stalls used to trigger the CRI-proxy disconnected flip. F1
+# testing sessions don't need camera streams; keep them off. F3 owns
+# the real fix (turbojpeg native / off-process encode).
+_CAMERAS_DISABLED = os.environ.get("CAMERAS_DISABLED", "0").strip() == "1"
+# Flap-detection bookkeeping for the CRI-proxy staleness loop. Exposed
+# on /health so operators can see "arm chip is flapping — GIL stalls"
+# without spelunking through logs. Zero-cost unless the loop fires.
+_cri_proxy_stats = {
+    "flips_down": 0,            # times we flipped connected → disconnected
+    "flips_up":   0,            # times we flipped back to connected
+    "last_flip_ts": 0.0,        # wall time of last flip
+    "last_flip_kind": None,     # 'up' | 'down' | None
+    "consecutive_stale_ticks": 0,  # current stale-tick counter
+}
 
 # ---------------------------------------------------------------------------
 # Shared state — updated by ROS2 callbacks, read by FastAPI
@@ -1265,28 +1282,40 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self.create_subscription(String, "/perception/placed_objects",
                                  self._on_placed_objects, 5)
 
-        # Annotated image from detector (cam0 + cam1)
-        self.create_subscription(Image, "/perception/annotated_image",
-                                 self._on_annotated, 2)
-        self.create_subscription(Image, "/perception/annotated_image_cam1",
-                                 self._on_annotated_cam1, 2)
+        # CAMERAS_DISABLED=1 skips ALL Image/CameraInfo subscriptions +
+        # the PIL encode thread pool never gets work. Root-cause fix
+        # for the F1.4 rung-3 fingerprint: py-spy proved cam-encode is
+        # the GIL hog whose >1 s stalls flipped the CRI proxy to
+        # DISCONNECTED, killing jog. F1 sessions don't need video; F3
+        # will land the real turbojpeg/off-process fix.
+        if _CAMERAS_DISABLED:
+            self.get_logger().warn(
+                "CAMERAS_DISABLED=1 — skipping cam0/cam1 Image subscriptions "
+                "and the /perception/annotated_image* taps. No camera "
+                "streaming this session. F3 owns the real fix.")
+        else:
+            # Annotated image from detector (cam0 + cam1)
+            self.create_subscription(Image, "/perception/annotated_image",
+                                     self._on_annotated, 2)
+            self.create_subscription(Image, "/perception/annotated_image_cam1",
+                                     self._on_annotated_cam1, 2)
 
-        # Cameras — double namespace because realsense2_camera is launched with
-        # name=cam0 inside namespace cam0, producing /cam0/cam0/... topics.
-        # Confirmed from session log May 21 2026.
-        self.create_subscription(Image, "/cam0/cam0/color/image_raw",
-                                 lambda m: self._on_camera(0, m), 2)
-        self.create_subscription(Image, "/cam1/cam1/color/image_raw",
-                                 lambda m: self._on_camera(1, m), 2)
-        # Raw cam0 tap for AprilTag calibration. Separate sub so the
-        # JPEG-encode drop-latest guard on _on_camera doesn't cost us
-        # detection frames — we take the raw bytes fresh regardless
-        # of the encoder's state. camera_info gives fx/fy/cx/cy the
-        # detector needs.
-        self.create_subscription(Image, "/cam0/cam0/color/image_raw",
-                                 self._on_cam0_raw, 2)
-        self.create_subscription(CameraInfo, "/cam0/cam0/color/camera_info",
-                                 self._on_cam0_info, 2)
+            # Cameras — double namespace because realsense2_camera is launched with
+            # name=cam0 inside namespace cam0, producing /cam0/cam0/... topics.
+            # Confirmed from session log May 21 2026.
+            self.create_subscription(Image, "/cam0/cam0/color/image_raw",
+                                     lambda m: self._on_camera(0, m), 2)
+            self.create_subscription(Image, "/cam1/cam1/color/image_raw",
+                                     lambda m: self._on_camera(1, m), 2)
+            # Raw cam0 tap for AprilTag calibration. Separate sub so the
+            # JPEG-encode drop-latest guard on _on_camera doesn't cost us
+            # detection frames — we take the raw bytes fresh regardless
+            # of the encoder's state. camera_info gives fx/fy/cx/cy the
+            # detector needs.
+            self.create_subscription(Image, "/cam0/cam0/color/image_raw",
+                                     self._on_cam0_raw, 2)
+            self.create_subscription(CameraInfo, "/cam0/cam0/color/camera_info",
+                                     self._on_cam0_info, 2)
 
         # Static TF broadcaster used by the cam0 extrinsic calibration
         # save endpoint. Kept as a lazy None until _broadcast_cam0_
@@ -1326,18 +1355,43 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self.get_logger().info("DashboardServer ready")
 
     def _cri_proxy_staleness_loop(self):
-        """Runs at 5 Hz. Under JOG_BACKEND=ros2 + /estun/status stale + JS
-        stale: flip STATE['robot'] to DISCONNECTED so operators see the
-        arm state is unknown, not stuck at last-known ENABLED."""
+        """5 Hz staleness watchdog with HYSTERESIS (2026-08-19 F1.4 fix).
+
+        Pre-fix: single-tick decision at js_age > 1.0 s flipped
+        STATE['robot'] to DISCONNECTED, which the frontend reads as
+        jogGateOk=false — every jog press dies silently in the browser.
+        Under JOG_BACKEND=ros2 estun_stale is ALWAYS true (WS driver
+        down by design), so any single >1 s GIL stall (PIL cam-encode
+        is the known repeat offender, py-spy proven) instantly killed
+        jog until the NEXT fresh JS.
+
+        Post-fix: require 3 CONSECUTIVE stale ticks at threshold=3.0s
+        (~3.6 s sustained silence, not just one bad tick) before
+        flipping DOWN. Any fresh JS resets the counter to 0; the
+        _on_joint_states callback populates the fresh 'connected'/
+        'enabled' state on every message (natural flip-up). This loop
+        only handles the DOWN edge + flap bookkeeping.
+
+        Decision logic is in cobot_dashboard.staleness so unit tests
+        can exercise the state machine with a fake clock.
+        """
+        from .staleness import staleness_decide  # local import — avoid module-time coupling
+        is_disconnected = False
         while True:
             try:
                 if _JOG_BACKEND_ENV == "ros2":
                     now_mono = time.monotonic()
-                    js_age = now_mono - _last_joint_states_mono[0] \
-                             if _last_joint_states_mono[0] > 0 else 1e9
-                    now_wall = time.time()
-                    estun_stale = (now_wall - _last_estun_status_ts[0]) > 3.0
-                    if estun_stale and js_age > 1.0:
+                    js_age = (now_mono - _last_joint_states_mono[0]
+                              if _last_joint_states_mono[0] > 0 else 1e9)
+                    estun_age = time.time() - _last_estun_status_ts[0]
+                    new_stale, new_disc, flip = staleness_decide(
+                        js_age_s=js_age,
+                        estun_age_s=estun_age,
+                        consecutive_stale_ticks=_cri_proxy_stats["consecutive_stale_ticks"],
+                        is_disconnected=is_disconnected,
+                    )
+                    _cri_proxy_stats["consecutive_stale_ticks"] = new_stale
+                    if flip == "down":
                         with _state_lock:
                             r = STATE.setdefault("robot", {})
                             r["connected"]    = False
@@ -1354,16 +1408,27 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                             r["state_code"]   = 0
                             r["status_flag"]  = 0
                             # Safe-side: undefined monitor_only defaults to
-                            # "on" in frontend gating, which is what we want
-                            # when the stream is dead. Explicitly True is
-                            # equivalent and clearer for anyone reading state.
+                            # "on" in frontend gating — explicitly True on
+                            # DOWN keeps the safe-until-proven-live semantic.
                             r["monitor_only"] = True
                             r["arm_source"]   = "cri_ros2"
                             r["arm_source_note"] = (
-                                f"/joint_states stale {js_age:.1f}s — CRI "
-                                "stream absent or arm faulted. Enable "
-                                "managed by the CRI launch; check the "
-                                "launch tmux for errors.")
+                                f"/joint_states stale {js_age:.1f}s — "
+                                f"CRI stream absent or arm faulted (flip "
+                                f"#{_cri_proxy_stats['flips_down'] + 1}). "
+                                "Enable managed by the CRI launch; check "
+                                "the launch tmux for errors.")
+                        _cri_proxy_stats["flips_down"] += 1
+                        _cri_proxy_stats["last_flip_ts"] = time.time()
+                        _cri_proxy_stats["last_flip_kind"] = "down"
+                    elif flip == "up":
+                        # _on_joint_states already populated fresh state on
+                        # the fresh JS callback — this branch is bookkeeping
+                        # only. Flap count is what operators watch.
+                        _cri_proxy_stats["flips_up"] += 1
+                        _cri_proxy_stats["last_flip_ts"] = time.time()
+                        _cri_proxy_stats["last_flip_kind"] = "up"
+                    is_disconnected = new_disc
             except Exception:
                 pass
             time.sleep(0.2)
@@ -4296,6 +4361,16 @@ if FASTAPI_AVAILABLE:
             "state_perf": _state_perf_snapshot(),
             "hold_keepalive": dict(_keepalive_stats),
             "active_holds": len(_active_holds),
+            # CRI-proxy flap surface (F1.4 rung-3 fix). last_flip_age_s
+            # is derived from last_flip_ts so operators / dashboards can
+            # spot flapping without polling the epoch stamp.
+            "cri_proxy": {
+                **dict(_cri_proxy_stats),
+                "last_flip_age_s": (time.time() - _cri_proxy_stats["last_flip_ts"])
+                                    if _cri_proxy_stats["last_flip_ts"] > 0 else None,
+                "backend": _JOG_BACKEND_ENV,
+                "cameras_disabled": _CAMERAS_DISABLED,
+            },
             "motioncam": {
                 "connected":    mc_status["connected"],
                 "mock_enabled": mc_status["mock_enabled"],
