@@ -160,6 +160,16 @@ add-36 §529 — Safety-edge margin retune (measured latency, 5° cap) — VERDI
 add-36 §530 — Recovery modal lifecycle (hold-persistent, Done-gated) — VERDICT: DIRECTED
 add-36 §531 — Palletizing defects scoped (slot-1 regression, double-descend) — VERDICT: DIAGNOSED
 add-36 §532 — Ledger restructure (split into distillates + archive) — VERDICT: SHIPPED
+add-37 §534 — LESSONS extraction methodology audit (heading vs list format) — VERDICT: DOCUMENTED
+add-37 §534 — docs/ATTEMPTS.md + build_full_ledger.sh + ledger_lint.py — VERDICT: SHIPPED
+add-37 §535 — Dashboard drop-in JOG_BACKEND=ros2 + CAMERAS_DISABLED=1 — VERDICT: SHIPPED
+add-37 §535 — Frontend rebuild + served-bundle hash verify (`index-CPjpRuaL`) — VERDICT: SHIPPED
+add-37 §535 — jog_bridge null-tolerance (int(x or 0) × 6 sites) — VERDICT: SHIPPED
+add-37 §536 — Stop roboai-estun to clear jog_bridge two-backend safety refusal — VERDICT: RESOLVED
+add-37 §537 — cri_teardown after SIGSEGV + relaunch — VERDICT: RESOLVED
+add-37 §537 — CRI motion relaunch with use_mock:=false (real hardware) — VERDICT: FIXED
+add-37 §538 — Teach-promote refusal forensics (pending_poses, not ownership) — VERDICT: DIAGNOSED
+add-37 §538 — §490 device-identity fix status audit (localStorage + ghost amnesty + heartbeat) — VERDICT: CONFIRMED
 
 ## Skipped-addendum audit list (initial sweep did not tabulate)
 

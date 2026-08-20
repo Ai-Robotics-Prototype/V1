@@ -1,9 +1,11 @@
 # LESSONS — numbered sections extracted from v46
 
 Source: `cobot_project_conversation_v46.md` (see `tools/ledger_lint.py`) +
-post-v46 addenda 32+. Numbers reset across addenda in v46 — the same N may
-appear in multiple files. **Ledger numbering rule: tail-grep this file
-(LESSONS.md) before assigning a new number.**
+post-v46 addenda 32+. 225 numbered entries: 212 from v46 across addenda
+01–31 + era-01; 13 post-v46 (244–256, add-36 §528–532 and add-37 §535–538).
+Numbers reset across addenda in v46 — the same N may appear in multiple
+files. **Ledger numbering rule: tail-grep this file (LESSONS.md) before
+assigning a new number.**
 
 Format: `N. one-line — file` (addendum slug; era-01 = pre-addendum).
 Duplicates listed with all sites; gaps flagged at the end.
@@ -259,6 +261,12 @@ Counts on current file:
 248. Dialog lifecycle keys on operator intent (explicit Done), not on the metric crossing its threshold. — add-36 §530
 249. The ledger is a transaction log; sessions load a materialized view — STATE.md wins for current truth, ledger wins for history. — add-36 §532
 250. Anything whose death costs work runs in tmux — including the Claude Code session itself. — add-36 §532
+251. A launch file's default is part of the deploy state — read log line 3 (the `[launch.user]:` variant announcement) before trusting any downstream signal. — add-37 §537
+252. "Stopped" is a state, not a promise — doctrine describes intent; `systemctl is-active` is truth. Cross-component safety guards close the gap. — add-37 §536
+253. At JSON-decode boundaries treat `None` the same as missing — `int(evt.get(k) or default)` beats `int(evt.get(k, default))` when explicit `null` is a real input. — add-37 §535
+254. When the frontend looks broken, name the synth flag first — every downstream layer honestly reports whatever the source construction publishes. — add-37 §537
+255. Pull the exact 4xx before speculating on cause — event_log line + server return + frontend composer, in that order; premise is hypothesis, artifact is evidence. — add-37 §538
+256. A tmux pane's window discipline is itself a safety guard — dedicated windows keep same-pane Ctrl-C from killing two things at once. — add-37 §536
 
 ---
 
@@ -325,8 +333,8 @@ Counts on current file:
 - 87: 2 sites — add-08a:L10578, add-08b:L10731
 - 88: 2 sites — add-08a:L10592, add-10:L10817
 
-**Gaps** (numbers 1..304 absent from v46, 143 total). These likely lived in an earlier ledger file not archived to v46 — do NOT reuse until confirmed by the operator. (244–250 no longer gaps: assigned in addendum-36.)
+**Gaps** (numbers 1..304 absent from v46, 137 total). These likely lived in an earlier ledger file not archived to v46 — do NOT reuse until confirmed by the operator. (244–256 no longer gaps: assigned in addendum-36 and addendum-37.)
 
 ```
-146 147 148 149 150 151 152 153 154 155 156 157 158 159 160 161 162 163 164 165 166 167 168 169 170 171 172 173 174 175 176 177 178 179 180 181 182 183 184 185 186 187 188 189 190 191 192 193 194 195 196 197 198 199 200 201 202 203 204 205 206 207 208 209 210 211 212 213 214 215 216 217 218 219 220 221 222 223 224 225 226 227 228 229 230 231 232 233 234 235 236 237 238 239 240 241 242 243 251 252 253 254 255 256 257 258 259 260 261 262 263 264 265 266 267 268 269 270 271 272 273 274 275 276 277 278 279 280 281 282 283 284 285 286 287 288 289 290 291 292 293 294 295
+146 147 148 149 150 151 152 153 154 155 156 157 158 159 160 161 162 163 164 165 166 167 168 169 170 171 172 173 174 175 176 177 178 179 180 181 182 183 184 185 186 187 188 189 190 191 192 193 194 195 196 197 198 199 200 201 202 203 204 205 206 207 208 209 210 211 212 213 214 215 216 217 218 219 220 221 222 223 224 225 226 227 228 229 230 231 232 233 234 235 236 237 238 239 240 241 242 243 257 258 259 260 261 262 263 264 265 266 267 268 269 270 271 272 273 274 275 276 277 278 279 280 281 282 283 284 285 286 287 288 289 290 291 292 293 294 295
 ```

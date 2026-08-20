@@ -58,11 +58,12 @@
 - `addendum-34-aug-18-phase-f1.md` — Phase F opens: hybrid proven, jog bridge built
 - `addendum-35-aug-19-first-human-jog.md` — first human jog over ROS2: 12/12 taps
 - `addendum-36-hold-root-cause-and-restructure.md` — hold defect root-caused off-target; ledger split into distillates + archive
+- `addendum-37-aug-20-f1-pre-rung-setup.md` — ledger self-lint (ATTEMPTS + builder + 4-duty lint); F1 close pre-rung setup (drop-in + rebuild + jog_bridge null-tolerance + use_mock silent-mock discovery)
 
 ## By topic (fast lookup)
 
-- **CRI / write path:** 16, 19, 32, 33, 34, 35, 36
-- **Jog / F1:** 34, 35, 36
+- **CRI / write path:** 16, 19, 32, 33, 34, 35, 36, 37
+- **Jog / F1:** 34, 35, 36, 37
 - **URDF / kinematics:** 3, 8a, 10, 11, 32
 - **Palletize:** 27, 31, 36 (§531)
 - **PBD:** 5, 30
