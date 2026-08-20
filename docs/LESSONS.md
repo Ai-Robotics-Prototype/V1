@@ -1,8 +1,37 @@
 # LESSONS — numbered sections extracted from v46
 
-Source: `cobot_project_conversation_v46.md` (SHA256 in ledger reconstruction test) + post-v46 addenda 32+. 219 numbered entries: 212 from v46 across addenda 01–31 + era-01; 7 post-v46 in addendum-36 (244–250). Numbers reset across addenda in v46 — the same N may appear in multiple files. **Ledger numbering rule: tail-grep this file (LESSONS.md) before assigning a new number.**
+Source: `cobot_project_conversation_v46.md` (see `tools/ledger_lint.py`) +
+post-v46 addenda 32+. Numbers reset across addenda in v46 — the same N may
+appear in multiple files. **Ledger numbering rule: tail-grep this file
+(LESSONS.md) before assigning a new number.**
 
-Format: `N. one-line — file` (addendum slug; era-01 = pre-addendum). Duplicates listed with all sites; gaps flagged at the end.
+Format: `N. one-line — file` (addendum slug; era-01 = pre-addendum).
+Duplicates listed with all sites; gaps flagged at the end.
+
+## Extraction methodology (2026-08-20 audit)
+
+The v46 rows below (212 entries) were extracted from lines matching the
+`## N.` heading pattern — v46's section-title numbering. Post-v46 rows
+(244–250, from addendum-36) are true lessons on a single continuous stream.
+
+**Known extraction miss:** v46 also carries a parallel `N. **Title.**`
+list-item numbering with real lesson content — 383 such items across v46,
+including 65 within the currently-listed "gap" range 146–243. Those are
+not yet reflected in this file. Sample: v46:L12644 `146. **Summary
+statistics hide paths...**`, v46:L13378 `200. **Every investor claim must
+survive a cabinet inspection...**`. Backfill is deferred to a later
+session — flag added here so the lint's LESSONS-gaps-documented check
+(`tools/ledger_lint.py`) passes on the current honest state.
+
+Counts on current file:
+- v46 heading-format `## N.` entries in this file: 212
+- Post-v46 continuous-stream lessons: 7 (244–250)
+- Total entries below: 219
+- Gaps in 1..304 range: 143 (see gap block at bottom)
+- Known-extraction-miss list-format lessons NOT yet in this file: ~65 in
+  146–243 range, plus additional list-format lessons in 1–145 that
+  overlap the heading numbers (not necessarily missing content, just not
+  in this index).
 
 ---
 

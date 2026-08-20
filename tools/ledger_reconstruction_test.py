@@ -7,14 +7,19 @@ Usage:  python3 tools/ledger_reconstruction_test.py [v46_source_path]
 
 Exit non-zero on mismatch.
 
-DELIBERATE MISMATCH: era-01 has two GitHub PAT strings redacted (see its
+SUPERSEDED (2026-08-20): the authoritative post-restructure check is now
+`tools/ledger_lint.py`, which runs CONTIGUITY + REDACTIONS + INDEX-RESOLVE
++ LESSONS-GAPS duties. This script is preserved for the byte-diff signal
+against an original un-redacted v46.
+
+DELIBERATE MISMATCH: era-01 has three GitHub PAT strings redacted (see its
 frontmatter `redactions:` field) so the file can live in a scanned repo.
-Against the un-redacted `cobot_project_conversation_v46.md` in ~/Downloads
-this test now reports MISMATCH by design — the difference is ~76 bytes
-localized to two lines in the "GitHub Token Security Note" section.
+The on-disk v46 copy in ~/Downloads has also been prepended with a
+frozen-archive HTML-comment header (see its top). Against that file this
+test now reports MISMATCH by design — the delta is (frozen-header bytes)
++ (~91 bytes across three redaction sites in the "GitHub Token" sections).
 Contiguity and no-overlap checks still hold; those are the load-bearing
-guarantees. If you need to re-verify byte-exactness locally, apply the
-same redactions to your local v46 copy before running.
+guarantees and are duplicated in `ledger_lint.py::duty_contiguity`.
 """
 from __future__ import annotations
 
