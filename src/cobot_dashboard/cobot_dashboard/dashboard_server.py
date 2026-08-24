@@ -1378,6 +1378,30 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self._estun_program_pub = self.create_publisher(
             String, "/estun/program", 16)
 
+        # SEAM A fanout publisher for JOG_BACKEND='ros2'. Created EAGERLY
+        # here so DDS discovery matches with jog_bridge's subscriber long
+        # before the operator's first press. Previously lazy-created in
+        # _publish_ros2_jog_event on the first jog event — that lost the
+        # DDS discovery race under RELIABLE+VOLATILE, and the first press
+        # after a dashboard or jog_bridge restart silently dropped: no
+        # error, no toast, arm just didn't move. Same eager-init fix that
+        # closed the /estun/program 6-op burst race above; both are
+        # instances of the [[cobot-dds-lazy-publisher-hazard]] class.
+        # QoS matches jog_bridge's expected profile exactly.
+        self._dashboard_jog_events_pub = self.create_publisher(
+            String, "/dashboard/jog_session_events",
+            QoSProfile(
+                depth=10,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            ))
+        # Peer state for _publish_ros2_jog_event's kind derivation +
+        # refresh coalescing. Initialized empty here so the fanout
+        # function can assume they exist without a hasattr dance.
+        self._jog_session_seen = set()          # hold_ids seen at least once
+        self._jog_last_refresh_mono = {}        # hold_id -> monotonic ts of last refresh
+
         # Program executor state (richer than /task/status: step labels,
         # cycle stats, executor-state strings like 'waiting_motion').
         self.create_subscription(String, "/task/state", self._on_task_state, 10)
@@ -3760,21 +3784,9 @@ if FASTAPI_AVAILABLE:
         if _ros_node is None:
             return
         try:
-            if not hasattr(_ros_node, "_dashboard_jog_events_pub"):
-                # RELIABLE + VOLATILE matches jog_bridge's expected QoS.
-                # Depth 10 is generous vs the coalesced 90 ms refresh cadence.
-                qos = QoSProfile(
-                    depth=10,
-                    reliability=QoSReliabilityPolicy.RELIABLE,
-                    history=QoSHistoryPolicy.KEEP_LAST,
-                    durability=QoSDurabilityPolicy.VOLATILE,
-                )
-                _ros_node._dashboard_jog_events_pub = _ros_node.create_publisher(
-                    String, "/dashboard/jog_session_events", qos)
-            if not hasattr(_ros_node, "_jog_session_seen"):
-                _ros_node._jog_session_seen = set()
-            if not hasattr(_ros_node, "_jog_last_refresh_mono"):
-                _ros_node._jog_last_refresh_mono = {}
+            # Publisher + peer state are created eagerly in DashboardServer
+            # __init__ (see comment there), so first-press events never race
+            # with DDS discovery. No hasattr dance here.
             hold = payload.get("hold", False)
             hold_id = payload.get("hold_id")
             if not hold:

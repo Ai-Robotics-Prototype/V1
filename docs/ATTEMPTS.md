@@ -171,6 +171,8 @@ add-37 §537 — CRI motion relaunch with use_mock:=false (real hardware) — VE
 add-37 §538 — Teach-promote refusal forensics (pending_poses, not ownership) — VERDICT: DIAGNOSED
 add-37 §538 — §490 device-identity fix status audit (localStorage + ghost amnesty + heartbeat) — VERDICT: CONFIRMED
 
+session-2026-08-24 — Dashboard fanout publisher `/dashboard/jog_session_events` moved to eager `__init__` (was lazy-created on first fanout, losing DDS discovery race under RELIABLE+VOLATILE, so first press after any restart silently dropped) — VERDICT: SHIPPED (sha 830fc4a..HEAD; closes another instance of the [[cobot-dds-lazy-publisher-hazard]] class, matching the pattern the `/estun/program` publisher already used per its eager-init rationale at dashboard_server.py:1365)
+
 ## Skipped-addendum audit list (initial sweep did not tabulate)
 
 The first pass tabulated the substantive addenda densely and skipped the
