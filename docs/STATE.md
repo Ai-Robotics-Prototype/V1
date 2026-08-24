@@ -1,4 +1,4 @@
-# STATE.md — current truth as of 2026-08-24 (end of Addendum 38)
+# STATE.md — current truth as of 2026-08-24 (end of Addendum 39)
 > If this file contradicts a memory or an addendum, THIS FILE wins for current
 > state; the ledger wins for history. Rewritten at every session end.
 
@@ -19,27 +19,45 @@
   of every goal. Reduces but does NOT eliminate the oscillation
   (throughput 40% at 5%×500 ms, 8.5% at 10%×1500 ms; residual still audible).
   Rungs 3–6 REMAIN OPEN.
-- **Trace captured for next session** at
+- **Trace captured** at
   `~/cri_eval_ws/f1_2_scenarios/evidence/2026-08-24_hunt_trace/hunt_10pct_1500ms/`
   — 6 s bag with `/joint_states` (1491 msgs @ 248 Hz) and
   `/joint_trajectory_controller/controller_state` (876 msgs @ 146 Hz)
-  during a 10% × 1.5 s J6+ hold. See its `README.md` for the
-  next-session analysis plan.
+  during a 10% × 1.5 s J6+ hold.
+- **Hunt-trace verdict = GOAL-SEAM** (addendum-39 §551). `d/dt
+  reference.positions[Joint6]` reverses sign 20× during a monotonic
+  hold — peak +105 °/s, peak −315 °/s vs commanded +18 °/s; reference
+  flat 59 % / jumping 41 % at ~12.7 Hz preempt cadence; realized 9.6 %;
+  `JTC.output == JTC.reference` exactly, so **the fix must land
+  upstream of JTC**, in `jog_bridge`. The velocity-populated fix
+  (80d65dd) removed the vel=0 boundary problem but the position stream
+  the bridge feeds still discontinues on every preempt.
+- **Method gotcha named** (addendum-39 §548). Do NOT read
+  `controller_state.reference.velocities` as a reference-velocity
+  ground truth — it is a *stored echo* of what the bridge stuffed into
+  the trajectory point. Truth lives in `d/dt reference.positions`.
 
 ## Next session opener (exact order)
 
-1. **Analyze the bag** at `~/cri_eval_ws/f1_2_scenarios/evidence/2026-08-24_hunt_trace/`.
-   Plot `/joint_states.position[Joint6]` vs time; plot
-   `controller_state.{reference, feedback, output, error}` per joint.
-   Confirm whether residual oscillation is (a) JTC spline emitting a
-   non-constant velocity within a segment despite the fix, (b)
-   `CriUdpSystem.max_step_rad = 0.002` clamp firing at spline peaks,
-   or (c) something else.
-2. **Only after the trace mechanism is named**, propose the next fix.
-   Options in scope depending on what the trace shows: longer horizon,
-   populated accelerations on the trajectory points, tighter JTC
-   `goal_tolerance` config, plugin `max_step_rad` retune.
-3. Confirming inject at 5% × 500 ms, listen for smooth.
+1. **Targeted-blend attempt on `jog_bridge._do_send_goal`** (per
+   addendum-39 §552, ONE attempt): (a) anchor `p0.positions` to a
+   reference cursor (`last_p1_pos + last_p1_vel × (t_now − t_last_p1)`)
+   instead of to the current feedback, so consecutive preempt goals
+   stitch continuously through the seam; (b) match the goal
+   `header.stamp` to the actual preempt instant and extend the horizon
+   past the next expected refresh. Rebuild `jog_bridge`, restart it in
+   its own tmux (`jog_bridge_own_shell` rule), re-inject the same
+   10% × 1.5 s scenario, re-capture the bag. Pass = `d/dt
+   reference.positions` stays within ±25 °/s and monotonically signed
+   for the whole hold.
+2. **If that fails**, fall back to `moveit_servo` integration
+   (addendum-39 §552 fallback). Reuse `CriUdpSystem` HW interface, add
+   `moveit_servo` node to launch, remap dashboard jog session events
+   onto servo `TwistStamped`/`JointJog` topics, keep bridge as thin
+   deadman/keepalive shim.
+3. Confirming inject only under operator cue (arm-safe, e-stop in hand,
+   counted in). Pass = monotonic full-rate trace AND operator confirms
+   smooth+quiet.
 4. Then rungs 3 (J6+ 3 s), 4 (J6- 3 s), deadman A, deadman B, 60-s soak
    per the original F1.4 script.
 5. Arm safed at session end; before rungs resume, run through OPERATIONS.md
@@ -48,9 +66,12 @@
 
 ## Open defects / directed-not-confirmed
 
-- **Hold-jog residual oscillation** — partial fix shipped (sha `80d65dd`
-  in CodroidROS2); mechanism to be named from the captured bag. Rungs
-  3–6 blocked on this.
+- **Hold-jog residual oscillation** — mechanism NAMED (goal-seam,
+  addendum-39 §551): consecutive 2-point preempt goals anchor `p0` on
+  `fb_pos`, producing position discontinuities that JTC's spline
+  resolves as ±100–315 °/s transients. Rungs 3–6 still blocked; next
+  attempt is bridge-side reference-anchored `p0` + horizon extension
+  (addendum-39 §552).
 - **CriUdpSystem silent-write-accept class** — `rx_ok_` and
   `command_synced_` latched, never reset on remote disconnect; controller
   reboot leaves stale cached feedback. F3 hardening item; workaround for
