@@ -133,14 +133,103 @@ Confirming inject is still the operator's cue in both branches (arm-safe,
 e-stop in hand, counted in). Pass = monotonic full-rate trace **and**
 operator confirms smooth+quiet by ear.
 
-## Summary
+## Section 553: Reference-cursor anchor shipped (CodroidROS2 `113e3f3`)
 
-Trace verdict: **goal-seam.** The bridge's 100-ms preempt cadence produces
-position discontinuities that JTC's spline resolves as ±100–315 °/s
-transients — half of them reversing the commanded sign. Feedback tracks
-the low-frequency mean and realizes 9.6% of commanded. `JTC.output ==
-JTC.reference`, so the fix must land *upstream* of JTC (in `jog_bridge`,
-not in the plugin or the JTC config). One targeted-blend attempt planned
-(anchor `p0` to reference, not feedback; align goal `header.stamp` with
-preempt instant); `moveit_servo` in reserve if that fails. Rungs 3–6
-still blocked pending the confirming inject.
+Targeted-blend attempt landed as `theodoresimpson/CodroidROS2:main` sha
+**`113e3f3`**. `JogStateMachine` grew four fields tracking the last emitted
+goal (`_prev_emit_joint_index`, `_prev_emit_signed_vel`,
+`_prev_emit_p0_target_pos`, `_prev_emit_duration_s`) and a new `_build_goal`
+path that anchors the target joint's `p0.position` on the extrapolated
+JTC reference cursor:
+
+```
+cursor = _prev_emit_p0_target_pos
+       + _prev_emit_signed_vel × min(now − last_emission_mono,
+                                     _prev_emit_duration_s)
+```
+
+Non-target joints still use `fb_pos`. Cursor is invalidated on joint switch,
+direction flip, and any IDLE reset. Operator-directed safety guard: if
+`|cursor − fb_pos| > Config.cursor_max_deviation_rad` (initial 0.0873 rad =
+5°), fall back to `fb_pos` for the cycle and increment
+`sm.cursor_guard_fallbacks` — mirrors the CriUdpSystem "hold-if-far"
+philosophy so cursor and reality can't diverge under a limit strike or
+lost cycle. Also promoted `fb-past-effective-range in commanded direction`
+to an early safety refusal (previously implicit via the actual_delta ≤ 0
+check, which the cursor path shifted). 10 new tests + 50 pre-existing pass.
+
+Verified on the real arm at 2026-08-24 16:07 CDT (fresh bridge, no bag):
+J6+ 10% × 1.5 s inject moved feedback from -33.19° → -4.32° (Δ +28.87°,
+19.24 °/s realized = 106.9 % of commanded). Bridge dispatched 14 send_goal
+actions, 0 rejects. Prior identical inject (before the fix) moved +2.30°
+at 8.5 % realized.
+
+**Bridge-uptime degradation named as a separate hazard.** On the same
+bridge process, injects 3-4 (fired after a ~35-minute-uptime bridge)
+degraded to 13 % and 0 % throughput respectively — SM logged clean
+`_dispatch(send_goal)` at each event but only ONE goal reached JTC
+(reference moved for the horizon then held). Fresh restart cured it
+instantly. Named as its own class in STATE.md; suspected ActionClient
+handle leak; separate follow-up from the seam fix.
+
+## Section 554: Guard-threshold tune (CodroidROS2 `f6d4d53`)
+
+Confirming inject with the 5° guard (v3 bag at 16:08 CDT) uncovered a
+new residual mechanism: the 5° threshold sat *right at* the steady-state
+tracking error under 200 ms horizon × 18 °/s command (~4.7-5.0° peak err
+observed in the CS trace). One tick's err at 4.99° passed → cursor used;
+next tick 5.01° → guard fires, p0 snaps back to fb, reference jumps -5°
+in one sample. Result: **-1272 °/s single-sample step-back at t=21.728 s**,
+with 2 sign reversals across the 1.6 s hold (goal-seam baseline had 28).
+
+Operator called it "not polish, would compound at higher speed / longer
+hold." One-line bump: `cursor_max_deviation_rad` 0.0873 → **0.15 rad**
+(8.6°). Clears the observed err headroom while still catching genuine
+runaway (a real limit strike deviates far more than 8°). Shipped as
+`theodoresimpson/CodroidROS2:main` sha **`f6d4d53`**.
+
+Verified on the real arm at 2026-08-24 16:26 CDT (fresh bridge, v4 bag):
+
+| metric | goal-seam baseline | fix @ 5° threshold | fix @ 8.6° threshold |
+|:---|---:|---:|---:|
+| peak d/dt ref + | +71.89 °/s | +575 °/s | +76.49 °/s |
+| **peak d/dt ref −** | **−449.33 °/s** | **−1272 °/s** | **+0.00 °/s** |
+| sign reversals | 28 | 2 | **0** |
+| samples < −25 °/s (250 Hz uniform grid) | 14 | 1 | **0** |
+| fb net over 1.5 s hold | +2.34° | +18.98° | **+22.97°** |
+| realized | 8.1 % | 66.1 % | **79.5 %** |
+
+Guard-collision is definitively gone: `peak −` reads `+0.00 °/s`, zero
+samples fall below any negative threshold, zero sign reversals. Median
+`d/dt reference` = +18.13 °/s (exactly commanded).
+
+## Section 555: Remaining +76 °/s forward-only spline stitches — Path B deferred
+
+The residual is now purely on the positive side: 41 % of samples land in
+25-40 °/s, with a p99 of +71.5 °/s and single-sample peak +76.49 °/s.
+Every one is forward — not a hunt. Mechanism: JTC's `splines` interpolation
+generates brief cubic-spline overshoots at each 100 ms goal boundary as
+it stitches consecutive constant-velocity segments. Same regime the
+first-successful (inject 2) trace already accepted as "clean." Physical
+impact: 4 ms × 76 °/s = 0.30° positional excursion above nominal ramp,
+gearbox absorbs without reversal.
+
+**Path B — populate `.accelerations = [0.0]*N` on the trajectory points**
+(same slot the velocity-populate fix from 80d65dd uses for velocities).
+JTC's cubic-spline solver would then have a fully-specified boundary
+condition and stop synthesizing the acceleration overshoots. Small change
+inside `jog_bridge_node._do_send_goal`. **Filed as P3 polish** per operator
+direction 2026-08-24 — not blocking F1 rungs 3-6. Track in ATTEMPTS.md as
+`add-39 §555` with VERDICT DEFERRED; revisit if a soak run shows overshoot
+accumulation.
+
+## Summary (updated 2026-08-24 16:30 CDT)
+
+Trace verdict: **goal-seam** (§551). Fix: reference-cursor anchor on
+`jog_bridge` state machine (§553, sha `113e3f3`) + guard-threshold tune
+from 5° → 8.6° after the 5° threshold collided with steady-state err
+(§554, sha `f6d4d53`). Verified on the real arm: sign reversals 28 → 0,
+peak negative excursion −449 °/s → 0 °/s, realized throughput 8.1 % →
+79.5 %. **Path A accepted**; remaining +76 °/s forward spline stitching
+filed as §555 P3 polish (populate `.accelerations`). Rungs 3-6 unblock
+pending the operator's by-eye confirmation on the v4 inject.

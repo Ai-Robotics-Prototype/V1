@@ -1,4 +1,4 @@
-# STATE.md — current truth as of 2026-08-24 (end of Addendum 39)
+# STATE.md — current truth as of 2026-08-24 (end of Addendum 39, F1 rungs 3-6 unblocked)
 > If this file contradicts a memory or an addendum, THIS FILE wins for current
 > state; the ledger wins for history. Rewritten at every session end.
 
@@ -24,54 +24,65 @@
   — 6 s bag with `/joint_states` (1491 msgs @ 248 Hz) and
   `/joint_trajectory_controller/controller_state` (876 msgs @ 146 Hz)
   during a 10% × 1.5 s J6+ hold.
-- **Hunt-trace verdict = GOAL-SEAM** (addendum-39 §551). `d/dt
-  reference.positions[Joint6]` reverses sign 20× during a monotonic
-  hold — peak +105 °/s, peak −315 °/s vs commanded +18 °/s; reference
-  flat 59 % / jumping 41 % at ~12.7 Hz preempt cadence; realized 9.6 %;
-  `JTC.output == JTC.reference` exactly, so **the fix must land
-  upstream of JTC**, in `jog_bridge`. The velocity-populated fix
-  (80d65dd) removed the vel=0 boundary problem but the position stream
-  the bridge feeds still discontinues on every preempt.
+- **Hunt-trace verdict = GOAL-SEAM** (addendum-39 §551). Diagnosis
+  DONE, fix SHIPPED and verified on the real arm this session.
+- **Reference-cursor anchor fix SHIPPED** (addendum-39 §553-§554).
+  `theodoresimpson/CodroidROS2:main` head `f6d4d53` — jog_bridge
+  `_build_goal` anchors target-joint `p0.position` on the extrapolated
+  JTC reference cursor + safety guard at 0.15 rad (8.6°). Verified
+  2026-08-24 16:26 CDT J6+ 10% × 1.5 s on v4 bag: sign reversals
+  28 → 0, peak `d/dt reference −` reads +0.00 °/s exact, realized
+  8.1 % → 79.5 %. Guard-collision (5° threshold vs. ~5° steady-state
+  err) exposed and closed by the 8.6° tune-up.
 - **Method gotcha named** (addendum-39 §548). Do NOT read
   `controller_state.reference.velocities` as a reference-velocity
   ground truth — it is a *stored echo* of what the bridge stuffed into
   the trajectory point. Truth lives in `d/dt reference.positions`.
+- **Bridge-uptime degradation named** (addendum-39 §556). On the same
+  jog_bridge process, fresh injects work at ~100 % throughput but
+  subsequent injects (~30 min uptime) silently degrade to 13 % then
+  0 % — every event dispatches, only one goal reaches JTC per session.
+  Fresh restart cures instantly. F1 workaround: `pkill -f
+  jog_bridge_node` before each formal test. F3 hardening item.
 
 ## Next session opener (exact order)
 
-1. **Targeted-blend attempt on `jog_bridge._do_send_goal`** (per
-   addendum-39 §552, ONE attempt): (a) anchor `p0.positions` to a
-   reference cursor (`last_p1_pos + last_p1_vel × (t_now − t_last_p1)`)
-   instead of to the current feedback, so consecutive preempt goals
-   stitch continuously through the seam; (b) match the goal
-   `header.stamp` to the actual preempt instant and extend the horizon
-   past the next expected refresh. Rebuild `jog_bridge`, restart it in
-   its own tmux (`jog_bridge_own_shell` rule), re-inject the same
-   10% × 1.5 s scenario, re-capture the bag. Pass = `d/dt
-   reference.positions` stays within ±25 °/s and monotonically signed
-   for the whole hold.
-2. **If that fails**, fall back to `moveit_servo` integration
-   (addendum-39 §552 fallback). Reuse `CriUdpSystem` HW interface, add
-   `moveit_servo` node to launch, remap dashboard jog session events
-   onto servo `TwistStamped`/`JointJog` topics, keep bridge as thin
-   deadman/keepalive shim.
-3. Confirming inject only under operator cue (arm-safe, e-stop in hand,
-   counted in). Pass = monotonic full-rate trace AND operator confirms
-   smooth+quiet.
-4. Then rungs 3 (J6+ 3 s), 4 (J6- 3 s), deadman A, deadman B, 60-s soak
-   per the original F1.4 script.
-5. Arm safed at session end; before rungs resume, run through OPERATIONS.md
+1. **Rungs 3-6 per the F1.4 script**, on this session's fix baseline:
+   - `pkill -f jog_bridge_node && sleep 2 && JOG_BACKEND=ros2 ros2 run
+     jog_bridge jog_bridge_node` in its own tmux (fresh-bridge workaround
+     for §556 uptime degradation — do NOT skip).
+   - Rung 3: J6+ 3 s hold at 10 %. Rung 4: J6- 3 s hold at 10 %.
+   - Deadman A: `--no-stop` flag (bridge silence deadman must cancel).
+   - Deadman B: `kill -9 $(pgrep -f jog_bridge_node)` mid-hold (JTC
+     must fall through to a stop within safety margin).
+   - 60-s soak at 10 % (extended hold; watch for guard-fallback count
+     rising in bridge stats — if soak surfaces §555 spline overshoots
+     as accumulation, revisit the deferred `.accelerations` populate).
+   - Pass on each = smooth+quiet by ear AND
+     `d/dt reference.positions` monotonic-signed (no sign reversals)
+     with `peak −` at 0 °/s. Forward spline overshoots up to +80 °/s
+     accepted per §555.
+2. **§555 Path B** (populate `.accelerations = [0.0]*N` on
+   JointTrajectoryPoint p0/p1) is deferred P3 polish. Revisit only if
+   soak surfaces overshoot accumulation.
+3. **§556 bridge-uptime degradation** — separate F3 hardening item;
+   don't debug during rung work, just apply the fresh-restart workaround.
+4. Arm safed at session end; before rungs resume, run through OPERATIONS.md
    §1 (CRI launch) and OPERATIONS.md §3a (`Robot/switchOn` over the wire
    if the controller comes up disabled).
 
 ## Open defects / directed-not-confirmed
 
-- **Hold-jog residual oscillation** — mechanism NAMED (goal-seam,
-  addendum-39 §551): consecutive 2-point preempt goals anchor `p0` on
-  `fb_pos`, producing position discontinuities that JTC's spline
-  resolves as ±100–315 °/s transients. Rungs 3–6 still blocked; next
-  attempt is bridge-side reference-anchored `p0` + horizon extension
-  (addendum-39 §552).
+- **Hold-jog residual oscillation** — CLOSED. Reference-cursor anchor
+  + 8.6° guard threshold (addendum-39 §553-§554, CodroidROS2 sha
+  `f6d4d53`). 28 → 0 sign reversals, peak `d/dt reference −` at
+  +0.00 °/s exact, 79.5 % realized. Rungs 3-6 unblocked pending the
+  operator's by-eye confirmation on the v4 inject.
+- **Bridge-uptime degradation** — DIAGNOSED (addendum-39 §556). Fresh
+  bridge = 100 %; ~30 min uptime bridge silently drops to 13 % then
+  0 % throughput. F1 workaround: fresh restart before each formal test.
+  F3 hardening item (suspected ActionClient handle leak / DDS state
+  drift).
 - **CriUdpSystem silent-write-accept class** — `rx_ok_` and
   `command_synced_` latched, never reset on remote disconnect; controller
   reboot leaves stale cached feedback. F3 hardening item; workaround for
@@ -139,5 +150,5 @@ Controller `192.168.2.136` (`:9000` WS, `:9001` CRI TCP, UDP `9030`/`10086`,
 `:9198` operating UI, `:8080` deploy tool DO NOT USE, fw `2.3.3.43`).
 Jetson eno1 `192.168.2.246`; Wi-Fi lease `.143` (unreserved).
 `max_step_rad 0.002` session override. Repos:
-- `Ai-Robotics-Prototype/V1:feature/estun-write-path` head `1d3bc6d+` (edbfee0/830fc4a/1d3bc6d landed today; addendum-38 + LESSONS + STATE + ATTEMPTS still to commit)
-- `theodoresimpson/CodroidROS2:main` head `80d65dd` (velocity-populated fix, partial)
+- `Ai-Robotics-Prototype/V1:feature/estun-write-path` head `872fdf5+` (addendum-38 + addendum-39 + LESSONS + STATE + ATTEMPTS all landed; §553/§554/§555/§556 pending commit at end-of-session)
+- `theodoresimpson/CodroidROS2:main` head `f6d4d53` (reference-cursor anchor `113e3f3` + guard-threshold tune `f6d4d53`)
