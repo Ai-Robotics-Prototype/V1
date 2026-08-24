@@ -155,6 +155,59 @@ _cri_proxy_stats = {
     "consecutive_stale_ticks": 0,  # current stale-tick counter
 }
 
+
+def _apply_cri_proxy_authority(r):
+    """Under JOG_BACKEND=ros2, cri_proxy owns the arm-authority fields
+    regardless of what estun_driver reports on /estun/status or /estun/mode.
+
+    Called at the end of _on_joint_states, _on_estun_status, and _on_estun_mode
+    so whichever handler ran last, the authority fields stay coherent. Without
+    this, estun_driver in monitor_only (ESTUN_ALLOW_JOG=0, needed so jog_bridge
+    stays authoritative) would leak allow_jog=false into STATE and trip the
+    'JOG GATE CLOSED — set ESTUN_ALLOW_JOG=1' banner on JogControls.jsx:736 —
+    the very banner F1.4 sessions kept hitting.
+
+    No-op under JOG_BACKEND=ws so the legacy WS-authoritative path is
+    unchanged.
+    """
+    if _JOG_BACKEND_ENV != "ros2":
+        return
+    r["connected"]            = True
+    r["enabled"]              = True
+    r["enabling"]             = False
+    r["mode"]                 = "AUTO"
+    r["safety_mode"]          = "normal"
+    r["moving"]               = False
+    r["jog_active"]           = False
+    r["jog_mode"]             = None
+    r["jog_index"]            = 0
+    r["jog_direction"]        = 0
+    r["allow_jog"]            = True
+    r["allow_cartesian_jog"]  = False
+    r["allow_power"]          = True
+    r["allow_move"]           = True
+    r["allow_io"]             = False
+    r["alarm"]                = False
+    r["alarm_count"]          = 0
+    r["state_code"]           = 0
+    r["status_flag"]          = 0
+    r["monitor_only"]         = False
+    r["jog_heartbeat_s"]      = 0.100
+    r["jog_freshness_s"]      = 0.300
+    r["jog_speed_cap"]        = 0.15
+    r["operator_speed_limit"] = 0.25
+    r["effective_speed_cap"]  = 0.15
+    r["allow_jog_source"]     = "cri_proxy"
+    r["allow_cart_source"]    = "f1_scope_refuses_cartesian"
+    r["allow_power_source"]   = "cri_launch_manages_enable"
+    r["allow_move_source"]    = "cri_proxy"
+    r["arm_source"]           = "cri_ros2"
+    r["arm_source_note"]      = ("Arm state proxied from /joint_states "
+                                 "liveness — WS driver inactive under "
+                                 "JOG_BACKEND=ros2; enable is managed "
+                                 "by the CRI launch.")
+
+
 # ---------------------------------------------------------------------------
 # Shared state — updated by ROS2 callbacks, read by FastAPI
 # ---------------------------------------------------------------------------
@@ -1848,76 +1901,15 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             STATE["joints"]["names"]      = list(msg.name)
             STATE["joints"]["positions"]  = list(msg.position)
             STATE["joints"]["velocities"] = list(msg.velocity) if msg.velocity else [0.0] * len(msg.name)
-            # CRI proxy: when JOG_BACKEND=ros2 and the estun_driver isn't
-            # publishing /estun/status (WS driver down by design this session),
-            # the ArmEnableControl chip would otherwise render 'DISCONNECTED'
-            # forever — silent dead control (§285). Populate STATE['robot']
-            # from /joint_states liveness so the chip reads ENABLED. Gated on
-            # /estun/status staleness so this path is a no-op when the WS
-            # driver is genuinely up and authoritative.
-            if _JOG_BACKEND_ENV == "ros2":
-                estun_stale = (time.time() - _last_estun_status_ts[0]) > 3.0
-                if estun_stale:
-                    r = STATE.setdefault("robot", {})
-                    r["connected"]    = True
-                    r["enabled"]      = True
-                    r["enabling"]     = False
-                    r["mode"]         = "AUTO"
-                    r["safety_mode"]  = "normal"
-                    r["moving"]       = False
-                    r["jog_active"]   = False
-                    r["jog_mode"]     = None
-                    r["jog_index"]    = 0
-                    r["jog_direction"] = 0
-                    r["allow_jog"]    = True
-                    r["allow_cartesian_jog"] = False   # F1 scope refuses cartesian
-                    # HYPOTHESIS 2026-08-19 F1.4: frontend HoldButton may
-                    # compute enabled = arm_enabled && allow_power in its
-                    # disabled prop. Setting allow_power=True makes jog
-                    # buttons clickable; /cmd/power endpoint below still
-                    # returns 409 with the CRI-launch-manages-enable
-                    # message so the Enable button click doesn't hang.
-                    r["allow_power"]  = True
-                    r["allow_move"]   = True
-                    r["allow_io"]     = False
-                    r["alarm"]        = False
-                    r["alarm_count"]  = 0
-                    r["state_code"]   = 0
-                    r["status_flag"]  = 0
-                    # Load-bearing for frontend jog-button gating: absent
-                    # (None) is safely interpreted as "monitor mode active,
-                    # do not send commands". Must be explicitly False for
-                    # HoldButton to fire under ros2 backend.
-                    r["monitor_only"] = False
-                    # Deadman + heartbeat semantics the frontend uses to
-                    # decide refresh cadence + freshness. Match jog_bridge's
-                    # Config (silence_ms=300, refresh_ms=100 informational).
-                    r["jog_heartbeat_s"] = 0.100
-                    r["jog_freshness_s"] = 0.300
-                    # Speed-cap trio. The frontend slider's ceiling reads
-                    # from these; a zero/undefined cap would silently
-                    # produce a zero-speed jog payload (server-side no-op).
-                    # 0.15 = jog_bridge's hard session cap; 0.25 = the
-                    # operator UI ceiling. effective = min of the two.
-                    r["jog_speed_cap"]        = 0.15
-                    r["operator_speed_limit"] = 0.25
-                    r["effective_speed_cap"]  = 0.15
-                    # `_source` labels for tooltip strings the UI shows
-                    # next to each allow_* — omitted means "unknown"
-                    # which is fine, but explicit is friendlier.
-                    r["allow_jog_source"]        = "cri_proxy"
-                    r["allow_cart_source"]       = "f1_scope_refuses_cartesian"
-                    r["allow_power_source"]     = "cri_launch_manages_enable"
-                    r["allow_move_source"]      = "cri_proxy"
-                    # Non-ambiguous source tag — new field, harmless if the
-                    # pre-built frontend ignores it, load-bearing for anyone
-                    # inspecting state via /api/state or the ws broadcast.
-                    r["arm_source"]   = "cri_ros2"
-                    r["arm_source_note"] = ("Arm state proxied from "
-                                             "/joint_states liveness — WS "
-                                             "driver inactive under "
-                                             "JOG_BACKEND=ros2; enable is "
-                                             "managed by the CRI launch.")
+            # CRI proxy is authoritative for arm-authority fields whenever
+            # JOG_BACKEND=ros2. Previously gated on /estun/status staleness
+            # (>3s) to avoid stepping on a live WS driver — but under ros2
+            # the WS driver is passive by design and its estun_driver mirror
+            # (allow_jog=false in monitor_only) must not shadow cri_proxy's
+            # allow_jog=true. Helper is idempotent + also called from
+            # _on_estun_status / _on_estun_mode so last-writer-wins races
+            # can't flip authority.
+            _apply_cri_proxy_authority(STATE.setdefault("robot", {}))
         # Feed the breadcrumb collector so it can tag each ProjectState
         # transition with the joints the arm was at right then. Fires
         # ~25 Hz; the collector only holds the latest sample so this
@@ -2184,6 +2176,10 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             # Task running mirror — only when not driven by the project runner
             if r["connected"] and not STATE["task"].get("running", False):
                 STATE["task"]["running"] = bool(d.get("moving", False))
+            # Under JOG_BACKEND=ros2 cri_proxy owns the arm-authority fields;
+            # re-assert after estun mirroring so ESTUN_ALLOW_JOG=0 in
+            # monitor_only can't leak allow_jog=false into the UI.
+            _apply_cri_proxy_authority(r)
 
     # ---- Estun /estun/mode: gates + program live state ----
 
@@ -2222,6 +2218,10 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             prog["task"]       = d.get("program_task")
             prog["line"]       = d.get("program_line")
             prog["is_step"]    = bool(d.get("program_is_step", False))
+            # Under JOG_BACKEND=ros2 cri_proxy owns the arm-authority fields;
+            # re-assert after /estun/mode mirroring so allow_jog=false there
+            # (ESTUN_ALLOW_JOG=0) can't leak into the UI.
+            _apply_cri_proxy_authority(r)
 
     # ---- Estun /estun/program_status: save/status/error events ----
 
