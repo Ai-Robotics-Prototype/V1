@@ -135,7 +135,7 @@ add-30 L489 — Atomic recovery (507-on-ENOSPC + refresh + watchdog) — VERDICT
 add-30 L490 — Code review (device-identity-per-tab root of all locks) — VERDICT: AUDITED
 add-31 L495 — Enable-button blast-radius verification — VERDICT: SHIPPED
 add-31 L496 — Deploy was lying (hashing wrong file) — VERDICT: FIXED
-add-31 L497 — Stale-bundle browser cache — VERDICT: DIRECTED
+add-31 L497 — Stale-bundle browser cache — VERDICT: SHIPPED (2026-08-24, sha edbfee0..: vite outDir + `_STATIC_DIR` unified to `frontend/dist`; `index.html` served with `Cache-Control: no-cache, no-store, must-revalidate`; startup assertion `_assert_frontend_coherent()` refuses to boot if index.html is missing or its referenced `/assets/index-*.js` chunk isn't on disk — fail-loud replaces silent-broken-shell)
 add-31 L498 — Jog jitter (WiFi exonerated, lock contention convicted) — VERDICT: FIXED
 add-31 L499 — Palletize subroutine (real cycle with I/O) — VERDICT: SHIPPED
 add-31 L500 — Performance-drop reckoning + verification gate — VERDICT: ADOPTED

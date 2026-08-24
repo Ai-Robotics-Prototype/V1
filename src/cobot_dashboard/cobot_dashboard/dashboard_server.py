@@ -122,6 +122,60 @@ _STATIC_DIR = _THIS_DIR.parent / "frontend" / "dist"
 # no-op self-check. Legacy field, ripe for retirement in a follow-up.
 _BUILT_FRONTEND_DIR = _STATIC_DIR
 
+
+def _assert_frontend_coherent(static_dir):
+    """Fail loud at module load if the serve dir is present but incoherent.
+
+    Closes the stale-serving class (L497): index.html references a
+    /assets/index-<hash>.js chunk; if that chunk isn't on disk in the
+    same dir, the browser gets 404 for its main JS and shows a stub
+    forever. Better to refuse startup so systemd escalates than to
+    silently serve a broken shell.
+
+    Missing dir → warn only (allows test imports in throwaway checkouts).
+    Present dir + missing index.html → RuntimeError.
+    Present index.html + missing referenced chunk → RuntimeError.
+    All present → log the reconciled asset hash for the boot log.
+    """
+    import re as _re
+    import logging as _lg
+    log = _lg.getLogger("dashboard.bootcheck")
+    if not static_dir.exists():
+        log.warning("frontend dir missing: %s (skipping coherence check)", static_dir)
+        return None
+    index_path = static_dir / "index.html"
+    if not index_path.is_file():
+        raise RuntimeError(
+            f"Frontend coherence FAIL: {index_path} not found. "
+            f"Run `cd frontend && npm run build` before starting the dashboard."
+        )
+    html = index_path.read_text(encoding="utf-8", errors="replace")
+    m = _re.search(r"/assets/(index-[A-Za-z0-9_-]+\.js)", html)
+    if not m:
+        raise RuntimeError(
+            f"Frontend coherence FAIL: {index_path} has no /assets/index-*.js "
+            f"reference. Bundle build produced no entry chunk."
+        )
+    chunk_name = m.group(1)
+    chunk_path = static_dir / "assets" / chunk_name
+    if not chunk_path.is_file():
+        raise RuntimeError(
+            f"Frontend coherence FAIL: index.html references {chunk_name} "
+            f"but {chunk_path} does not exist on disk. Served bundle would 404 "
+            f"on its main chunk. Rebuild: `cd frontend && npm run build`."
+        )
+    log.warning(  # WARN level so it lands in the systemd journal at default filter
+        "frontend coherence OK: %s -> %s", static_dir, chunk_name)
+    print(f"[dashboard] frontend coherence OK: {chunk_name} from {static_dir}",
+          flush=True)
+    return chunk_name
+
+
+# Enforce at import — if the operator managed to install a broken frontend
+# (missing index.html, missing referenced chunk), fail here so systemd's
+# Restart=on-failure loops loudly instead of quietly serving a broken shell.
+_SERVED_ASSET_AT_BOOT = _assert_frontend_coherent(_STATIC_DIR)
+
 # Timestamp of the last /estun/status frame received (monotonic seconds
 # via time.time()). Read by /api/systemcheck to compute controller
 # freshness — a stale value means the driver went silent.
