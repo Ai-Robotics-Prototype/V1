@@ -5,9 +5,24 @@
 ## Distillates (always-loaded tier)
 - `docs/STANDING.md` — session doctrine (rules 1–7, ledger doctrine, tool doctrine)
 - `docs/STATE.md` — current truth (rewritten every session end)
-- `docs/HARDWARE.md` — robot / network / systemd / safety constants
+- `docs/HARDWARE.md` — robot / network / systemd / safety / alarm-code constants
+- `docs/OPERATIONS.md` — every procedure as numbered steps with exact commands
+- `docs/FACTS.md` — ambient truths (silent classes, wire quirks, "enabled" per surface)
 - `docs/LESSONS.md` — one-line lesson index, all N with pointers
 - `docs/INDEX.md` — this file
+- `docs/ATTEMPTS.md` — recent-past attempted-but-failed approaches
+
+## Reference tier by topic
+- **Robot / arm / kinematics:** HARDWARE.md § Robot arm, § DH table; FACTS.md § Kinematics
+- **Network / ports / subnets:** HARDWARE.md § Network (full port table with source citations)
+- **Systemd / env drop-ins:** HARDWARE.md § Systemd unit inventory (Environment vs EnvironmentFile gotcha)
+- **CRI launch + teardown:** OPERATIONS.md §1, §2 (5-step init; teardown reverse sequence)
+- **Enable / servo-on:** OPERATIONS.md §3 (over-the-wire + UI paths)
+- **Alarms + WS status probe:** OPERATIONS.md §5; HARDWARE.md § Alarm codes; FACTS.md § Silent classes
+- **Backend flip (ros2 ↔ ws):** OPERATIONS.md §7 (drop-in + safe-gated restart)
+- **jog_bridge discipline:** OPERATIONS.md §8 (L216/L217/L239)
+- **Frontend serving:** OPERATIONS.md §10 (single vite outDir → dist)
+- **Session ritual:** OPERATIONS.md §12 (three writes + reference-tier update)
 
 ## v46 archive (grep-on-demand, `docs/ledger/`)
 

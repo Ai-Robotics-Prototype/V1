@@ -5,18 +5,37 @@
 > `docs/ledger/addendum-NN-*.md` (grep-on-demand). At session start,
 > read only the small tier below.
 
-## Distillate tier — read these at session start
+## Distillate + reference tier — read these at session start
 
 | File | Purpose |
 |------|---------|
-| `docs/STANDING.md`  | Session doctrine — rules 1–7, ledger doctrine, tool doctrine |
-| `docs/STATE.md`     | Current truth — where we are, next opener, open defects |
-| `docs/HARDWARE.md`  | Robot / network / systemd / safety constants |
-| `docs/LESSONS.md`   | One-line index of all lessons with pointers into the ledger |
-| `docs/INDEX.md`     | Topic map — grep here, then read the pointed-at addendum |
+| `docs/STANDING.md`   | Session doctrine — rules 1–7, ledger doctrine, tool doctrine |
+| `docs/STATE.md`      | Current truth — where we are, next opener, open defects |
+| `docs/HARDWARE.md`   | Robot / network / systemd / safety / alarm-code constants |
+| `docs/OPERATIONS.md` | Every procedure as numbered steps with exact commands + verification |
+| `docs/FACTS.md`      | Ambient truths — silent classes, wire quirks, "enabled" per surface |
+| `docs/LESSONS.md`    | One-line index of all lessons with pointers into the ledger |
+| `docs/INDEX.md`      | Topic map — grep here, then read the pointed-at addendum |
+| `docs/ATTEMPTS.md`   | Recent-past attempts that failed (avoid re-running them) |
 
 **STATE.md wins for current state; the ledger wins for history.** The rest
 of this file is architecture reference (grep-on-demand, not doctrine).
+
+## Reference-tier update rule (session-2026-08-24)
+
+**"Update the ledger" now also updates the reference tier** whenever a
+new hardware / procedure / ambient fact is established. Operational
+reference facts are FIRST-CLASS, captured immediately, never left as
+narrative in an addendum alone:
+
+- New IP / port / protocol / connection fact → HARDWARE.md
+- New procedure or exact command / URL / wire verb → OPERATIONS.md
+- New silent class / ambient truth / gotcha → FACTS.md
+
+The reference-tier patch lands in the SAME COMMIT as the addendum +
+LESSONS.md line, per OPERATIONS.md §12. If a session ends with a new
+fact in a lesson but not in the reference tier, that's an incomplete
+ritual.
 
 ## LiDAR object identification
 
