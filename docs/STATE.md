@@ -1,98 +1,122 @@
-# STATE.md — current truth as of 2026-08-20 (end of Addendum 37)
+# STATE.md — current truth as of 2026-08-24 (end of Addendum 38)
 > If this file contradicts a memory or an addendum, THIS FILE wins for current
 > state; the ledger wins for history. Rewritten at every session end.
 
 ## Where we are
-- **F1.4 pre-rung setup: COMPLETE.** Dashboard on `backend=ros2` +
-  `cameras_disabled=True` (drop-in `campaign-f1.conf`); frontend rebuilt
-  (`index-CPjpRuaL.js`, sha `66f2fab8…`); jog_bridge running in
-  `tmux robot:jog_bridge`, authoritative, null-tolerant (int(x or 0) fix
-  shipped); CRI motion stack up **on real hardware** (`use_mock:=false`),
-  `/joint_states` at 245–247 Hz, JTC action server present, dashboard
-  `robot.connected/enabled/allow_jog=True/True/True`,
-  `cri_proxy.flips=0/0`.
-- **F1.4 rungs 3–6 PENDING operator cue.** Rungs are: J6+ 3s, J6- 3s,
-  deadman A (client keepalive death), deadman B (SIGKILL jog_bridge
-  mid-hold), 60 s soak. Rung 1–2 already PASSED on real arm (addendum-35).
-- **Ledger tier is now linted.** `tools/ledger_lint.py` all-PASS
-  (CONTIGUITY / REDACTIONS / INDEX-RESOLVE / LESSONS-GAPS). ATTEMPTS.md
-  populated; build_full_ledger.sh writes `build/full_ledger.md` (38 files,
-  1.22 MB). LESSONS.md documents the heading-vs-list extraction miss
-  (65 real lessons in the 146–243 "gap" range that extraction never
-  pulled; backfill deferred).
+
+- **F1.4 motion chain PROVEN on the real arm today.** J6+ 15% × 1 s
+  drove the arm from -69.375° → -57.620° (Δ +11.75°, ~12°/s realized).
+  Full path fanout → jog_bridge SM → JTC → CriUdpSystem → UDP → arm
+  end-to-end for the first time on real hardware (per ledger record;
+  addendum-35 §526 had parked "no visible motion" on holds).
+- **Hold-jog HUNTING open (partial fix shipped).** Longer holds
+  (15% × 2 s, 10% × 1.5 s) hunted audibly — mechanical back-and-forth.
+  Mechanism named from source: JTC `splines` applies vel=0 boundary
+  conditions on empty `p0/p1.velocities` → 10 Hz brake-restart cycle
+  on preempt.
+- **Velocity-populated fix shipped** in `theodoresimpson/CodroidROS2:main`
+  as sha `80d65dd`. Constant-velocity boundary conditions on both endpoints
+  of every goal. Reduces but does NOT eliminate the oscillation
+  (throughput 40% at 5%×500 ms, 8.5% at 10%×1500 ms; residual still audible).
+  Rungs 3–6 REMAIN OPEN.
+- **Trace captured for next session** at
+  `~/cri_eval_ws/f1_2_scenarios/evidence/2026-08-24_hunt_trace/hunt_10pct_1500ms/`
+  — 6 s bag with `/joint_states` (1491 msgs @ 248 Hz) and
+  `/joint_trajectory_controller/controller_state` (876 msgs @ 146 Hz)
+  during a 10% × 1.5 s J6+ hold. See its `README.md` for the
+  next-session analysis plan.
 
 ## Next session opener (exact order)
-1. **F5 the dashboard tab.** Loads the new bundle AND re-opens the WS to
-   the restarted dashboard. Without F5 the tab is on the pre-rebuild
-   bundle + a dead WS.
-2. **Cue Rung 3: J6+ 3 s hold.** E-stop in operator's hand; I read
-   `/health` immediately after — `cri_proxy.flips_down/up` must stay 0,
-   `hold_keepalive.expired` must stay 0. Continuous motion the whole hold.
-3. **Cue Rung 4: J6- 3 s hold.** Mirror; same acceptance.
-4. **Cue Deadman A: client keepalive death mid-hold** (close browser tab
-   or kill Wi-Fi ~1.5 s into a hold). Arm stops within ~500 ms; keepalive
-   `expired` increments; no flip.
-5. **Cue Deadman B: SIGKILL jog_bridge mid-hold.** I show pid, operator
-   says go, I `kill -9`. Arm coasts to stop within tens of ms of the
-   last JTC goal end; no runaway.
-6. **60 s soak.** One continuous J6+ hold; I sample /health at
-   t≈15/30/45/60 s. Flip counters 0 throughout, `expired=0`,
-   `max_tick_gap_ms < 300`.
-7. **F1 CLOSED** when all four pass. Then F2 (executor over MoveIt) starts.
+
+1. **Analyze the bag** at `~/cri_eval_ws/f1_2_scenarios/evidence/2026-08-24_hunt_trace/`.
+   Plot `/joint_states.position[Joint6]` vs time; plot
+   `controller_state.{reference, feedback, output, error}` per joint.
+   Confirm whether residual oscillation is (a) JTC spline emitting a
+   non-constant velocity within a segment despite the fix, (b)
+   `CriUdpSystem.max_step_rad = 0.002` clamp firing at spline peaks,
+   or (c) something else.
+2. **Only after the trace mechanism is named**, propose the next fix.
+   Options in scope depending on what the trace shows: longer horizon,
+   populated accelerations on the trajectory points, tighter JTC
+   `goal_tolerance` config, plugin `max_step_rad` retune.
+3. Confirming inject at 5% × 500 ms, listen for smooth.
+4. Then rungs 3 (J6+ 3 s), 4 (J6- 3 s), deadman A, deadman B, 60-s soak
+   per the original F1.4 script.
+5. Arm safed at session end; before rungs resume, run through OPERATIONS.md
+   §1 (CRI launch) and OPERATIONS.md §3a (`Robot/switchOn` over the wire
+   if the controller comes up disabled).
 
 ## Open defects / directed-not-confirmed
-- Safety-edge margin retune (measured-latency term, 5° cap, numbers-in-toast)
-  — directed since addendum-36 §529, completion unconfirmed.
-- Recovery-modal lifecycle (hold-persistent, Done-gated) — directed;
-  needs the frontend rebuild in a client's tab to be real (see opener 1).
-- Palletizing: slot-1 stuck (2c2e435 regression suspect) + double-descend
-  at pick — diagnose-first directive issued in add-36 §531; pending
-  operator running the artifact and verdict.
-- LESSONS heading-vs-list extraction miss — ~65 real lessons in the
-  146–243 gap range are v46's `N. **Title.**` list-format items and are
-  NOT yet in LESSONS.md (documented; backfill deferred).
-- V1 GitHub repo was PUBLIC (addendum-36 flag) — still open; still
-  unbounded credential-rotation debt.
+
+- **Hold-jog residual oscillation** — partial fix shipped (sha `80d65dd`
+  in CodroidROS2); mechanism to be named from the captured bag. Rungs
+  3–6 blocked on this.
+- **CriUdpSystem silent-write-accept class** — `rx_ok_` and
+  `command_synced_` latched, never reset on remote disconnect; controller
+  reboot leaves stale cached feedback. F3 hardening item; workaround for
+  now is teardown+relaunch after any controller state event.
+- **JSB spawner-param root cause** — yaml declares `Joint1..Joint6` but
+  runtime publishes `[Joint2, Joint3, Joint1, Joint4, Joint5, Joint6]`.
+  Server-side normalization is the workaround; F3 investigates why the
+  spawner isn't honoring `-p`.
+- **Version-toast false-fire** — UI compares vite chunk hash (filename)
+  vs `git describe` build-ID (baked constant), which are two identifiers
+  of the same artifact. F3 fix: compare like-for-like.
+- **`cri-proxy-staleness` thread ImportError** at boot — pre-existing
+  `from .staleness import staleness_decide` relative import fails
+  because `dashboard_server.py` runs as `__main__` not as a package.
+  Non-fatal (thread dies, main server continues); flap-detection loop
+  isn't running. F3 item.
+- **DHCP reservation** `50:2e:91:95:b6:15 → .246` — FIFTH bite as of
+  today; Wi-Fi currently at `.143` (unreserved).
+- **V1 GitHub repo still PUBLIC** — long-open credential rotation debt.
+- Safety-edge margin retune, recovery-modal lifecycle, palletize slot-1
+  — from earlier STATE, unchanged this session.
 
 ## Paused / intact
-- **WS/Lua stack (roboai-estun, roboai-executor): STOPPED** (this
-  session actually made it inactive, not just "stated" — see add-37 §536).
-  Fallback path for F1 backend flip-back; `sudo systemctl start
-  roboai-estun` to return to `backend=ws`.
-- **CRI motion stack: LIVE in `tmux robot:0`** running with
-  `use_mock:=false`. Do NOT re-launch without a `cri_teardown.py` first.
-- **jog_bridge: LIVE in `tmux robot:jog_bridge`** (own-shell rule per
-  L217; do not restart from the same pane as the CRI launch).
-- **Cartesian jog over ROS2: out of F1 scope** by design (F2+).
-- Production dashboard service: now running with new drop-in;
-  post-F1-close, the drop-in either lands in the canonical unit
-  (F3 formalization) or gets removed.
+
+- **CRI motion stack: TORN DOWN at session end.**
+  `python3 ~/cri_eval_ws/cri_teardown.py` executed after the trace
+  capture; arm restored to Manual mode. Do not restart without running
+  the OPERATIONS.md §1 recipe (5-step TCP init).
+- **jog_bridge: killed at session end.** Restart per OPERATIONS.md §8
+  (L216/L217/L239 discipline) in `tmux robot:jog_bridge`.
+- **`roboai-estun` STOPPED** (with F1 drop-in
+  `/etc/systemd/system/roboai-estun.service.d/f1_monitor_only.env`
+  forcing `ESTUN_MONITOR_ONLY=true`, `ESTUN_ALLOW_JOG=0`). Fallback:
+  remove drop-in + `systemctl start roboai-estun` for `backend=ws`.
+- **Dashboard: LIVE**, PID varies. Systemd active. `JOG_BACKEND=ros2` +
+  `CAMERAS_DISABLED=1` via `campaign-f1.conf` drop-in. Frontend served
+  from `frontend/dist` (single source of truth). Coherence assertion
+  fires and passes at boot. Fanout publisher created eagerly in
+  `__init__`.
+
+## Reference tier built this session (always-loaded)
+
+Per addendum-38 §545:
+
+- `docs/HARDWARE.md` — full controller port table with role citations,
+  joint/velocity/DH constants, systemd inventory with env-precedence
+  gotcha, alarm code list.
+- `docs/OPERATIONS.md` (NEW) — every procedure as numbered steps with
+  exact commands + verification.
+- `docs/FACTS.md` (NEW) — ambient truths (silent classes, wire quirks,
+  "enabled" per surface).
+- `docs/INDEX.md` — REFERENCE section added.
+- `CLAUDE.md` — session-start load raised 5 → 8 files; new doctrine that
+  "update the ledger" also updates the reference tier.
 
 ## Roadmap after F1
-- **F2**: executor over MoveIt (MoveJ→Pilz PTP, MoveL→Pilz LIN,
-  validate-before-submit, settle-before-next; WS keeps I/O). Programs
-  run over ROS2. Pallet-defect fixes land as F2 prerequisites.
-- **F3**: everything under systemd (kills: env divergence, zombie
-  processes, boot races, stale bundles, manual bring-up). Formalize
-  the campaign-f1.conf drop-in into the canonical unit. Also:
-  move_group pinned to JSB stream; JTC goal_tolerance tighten; camera
-  encode → turbojpeg/off-process; dashboard Enable via CRI switchOn;
-  deploy-watcher env fix.
-- **F4**: white bowl end-to-end over CRI = DONE.
 
-## Standing debts (unchanged, aging)
-- Router DHCP reservation `50:2e:91:95:b6:15` → `.246` (FOURTH bite).
-- `/opt/cobot/logs` retention cap (regrew to 2 GB twice).
-- **V1 GitHub repo — make private + rotate `aicollabs12`-era credentials;
-  check audit log for exposure window.** Long-open, addendum-36 final
-  argument.
-- RunPod account unopened; `/opt/cobot` backup (superseded by fleet-sync
-  design, unbuilt); Synapse trademark counsel; UI rebrand screenshots
-  in deck.
+Unchanged from prior STATE. F2 (executor over MoveIt), F3 (everything
+under systemd + hardening items collected here), F4 (white bowl over
+CRI).
 
 ## Hardware/session constants (details in HARDWARE.md)
+
 Controller `192.168.2.136` (`:9000` WS, `:9001` CRI TCP, UDP `9030`/`10086`,
-fw `2.3.3.43` exact). Jetson eno1 `192.168.2.246`; Wi-Fi lease last seen
-`.143` (unreserved). `max_step_rad 0.002` session override. Repos:
-`Ai-Robotics-Prototype/V1` (`da4caa4+`), `theodoresimpson/CodroidROS2`
-(`f6e4f98+` — jog_bridge null-tolerance patch not yet committed here).
+`:9198` operating UI, `:8080` deploy tool DO NOT USE, fw `2.3.3.43`).
+Jetson eno1 `192.168.2.246`; Wi-Fi lease `.143` (unreserved).
+`max_step_rad 0.002` session override. Repos:
+- `Ai-Robotics-Prototype/V1:feature/estun-write-path` head `1d3bc6d+` (edbfee0/830fc4a/1d3bc6d landed today; addendum-38 + LESSONS + STATE + ATTEMPTS still to commit)
+- `theodoresimpson/CodroidROS2:main` head `80d65dd` (velocity-populated fix, partial)

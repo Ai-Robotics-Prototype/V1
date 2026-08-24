@@ -267,6 +267,14 @@ Counts on current file:
 254. When the frontend looks broken, name the synth flag first — every downstream layer honestly reports whatever the source construction publishes. — add-37 §537
 255. Pull the exact 4xx before speculating on cause — event_log line + server return + frontend composer, in that order; premise is hypothesis, artifact is evidence. — add-37 §538
 256. A tmux pane's window discipline is itself a safety guard — dedicated windows keep same-pane Ctrl-C from killing two things at once. — add-37 §536
+257. Two identifiers of the same artifact aren't the same thing — a vite chunk hash (filename) and a `git describe` build-ID (baked constant) will always disagree even when the tab is on the fresh bundle. Server-vs-tab freshness checks must compare like-for-like. — add-38 §539
+258. `CriUdpSystem` latches `rx_ok_`/`command_synced_` true on first UDP RX and never resets them on remote disconnect. A controller reboot leaves the plugin echoing stale cached feedback into `/joint_states` at rate; JTC reports success on every goal; arm doesn't move. Only plugin init (teardown+relaunch) repairs it. Silent-write-accept class. — add-38 §542
+259. Drop-in `EnvironmentFile=` loads AFTER the base unit's; drop-in `Environment=` is shadowed by any base `EnvironmentFile=`. Use the file approach for overrides late in the systemd env chain. — add-38 §540
+260. JSB with an unhonored spawner `-p` params file falls back to insertion-order joint names (`[Joint2, Joint3, Joint1, …]`, exactly as the yaml's own head comment warns). Frontend indexes by slot; server-side name-map normalization is the workaround. — add-38 §539
+261. First-exposure vs regression matters — before scoping a fix, `git log -S` the exact geometry line to confirm which. Today's hold-jog hunt was first-exposure (jog_bridge geometry unchanged since Aug 19); the operator's memory of smooth motion was Pilz LIN Cartesian (different code path). — add-38 §543
+262. JTC `splines` interpolation applies vel=0 boundary conditions to trajectory points with empty `.velocities`. Under 100 ms preempt cadence + 200 ms horizon that's a 10 Hz brake-restart cycle audible on a real gearbox. Populate p0/p1 velocities to stitch consecutive goals as constant-velocity segments; Pilz LIN already does this (which is why E5 Cartesian was smooth). — add-38 §543
+263. The Codroid Web operating UI is on `:9198` (`<title>Estun Web</title>`), not any standard-scan port. `:8080` on the controller is `部署系统` deploy tool — DO NOT USE for operations. — add-38 §541
+264. Fail-loud startup assertion beats silent-broken-shell. Dashboard now refuses to boot if `index.html` is missing or its referenced `/assets/index-*.js` chunk isn't on disk. systemd `Restart=on-failure` escalates instead of quietly serving stale. Closes L497. — add-38 §539
 
 ---
 
@@ -333,8 +341,8 @@ Counts on current file:
 - 87: 2 sites — add-08a:L10578, add-08b:L10731
 - 88: 2 sites — add-08a:L10592, add-10:L10817
 
-**Gaps** (numbers 1..304 absent from v46, 137 total). These likely lived in an earlier ledger file not archived to v46 — do NOT reuse until confirmed by the operator. (244–256 no longer gaps: assigned in addendum-36 and addendum-37.)
+**Gaps** (numbers 1..304 absent from v46, 137 total). These likely lived in an earlier ledger file not archived to v46 — do NOT reuse until confirmed by the operator. (244–264 no longer gaps: assigned in addendum-36, addendum-37, and addendum-38.)
 
 ```
-146 147 148 149 150 151 152 153 154 155 156 157 158 159 160 161 162 163 164 165 166 167 168 169 170 171 172 173 174 175 176 177 178 179 180 181 182 183 184 185 186 187 188 189 190 191 192 193 194 195 196 197 198 199 200 201 202 203 204 205 206 207 208 209 210 211 212 213 214 215 216 217 218 219 220 221 222 223 224 225 226 227 228 229 230 231 232 233 234 235 236 237 238 239 240 241 242 243 257 258 259 260 261 262 263 264 265 266 267 268 269 270 271 272 273 274 275 276 277 278 279 280 281 282 283 284 285 286 287 288 289 290 291 292 293 294 295
+146 147 148 149 150 151 152 153 154 155 156 157 158 159 160 161 162 163 164 165 166 167 168 169 170 171 172 173 174 175 176 177 178 179 180 181 182 183 184 185 186 187 188 189 190 191 192 193 194 195 196 197 198 199 200 201 202 203 204 205 206 207 208 209 210 211 212 213 214 215 216 217 218 219 220 221 222 223 224 225 226 227 228 229 230 231 232 233 234 235 236 237 238 239 240 241 242 243 265 266 267 268 269 270 271 272 273 274 275 276 277 278 279 280 281 282 283 284 285 286 287 288 289 290 291 292 293 294 295
 ```

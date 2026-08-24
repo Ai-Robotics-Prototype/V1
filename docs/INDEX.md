@@ -74,6 +74,7 @@
 - `addendum-35-aug-19-first-human-jog.md` — first human jog over ROS2: 12/12 taps
 - `addendum-36-hold-root-cause-and-restructure.md` — hold defect root-caused off-target; ledger split into distillates + archive
 - `addendum-37-aug-20-f1-pre-rung-setup.md` — ledger self-lint (ATTEMPTS + builder + 4-duty lint); F1 close pre-rung setup (drop-in + rebuild + jog_bridge null-tolerance + use_mock silent-mock discovery)
+- `addendum-38-aug-24-f1-motion-chain-and-hunt.md` — F1 motion chain proven on real arm (+11.75° J6); hold-jog hunt named + partial-fixed; reference tier built (HARDWARE + OPERATIONS + FACTS); Codroid operating UI on :9198 discovered; CriUdpSystem remote-disconnect state-latching named as its own hazard class
 
 ## By topic (fast lookup)
 

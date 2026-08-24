@@ -173,6 +173,13 @@ add-37 §538 — §490 device-identity fix status audit (localStorage + ghost am
 
 session-2026-08-24 — Dashboard fanout publisher `/dashboard/jog_session_events` moved to eager `__init__` (was lazy-created on first fanout, losing DDS discovery race under RELIABLE+VOLATILE, so first press after any restart silently dropped) — VERDICT: SHIPPED (sha 830fc4a..HEAD; closes another instance of the [[cobot-dds-lazy-publisher-hazard]] class, matching the pattern the `/estun/program` publisher already used per its eager-init rationale at dashboard_server.py:1365)
 
+add-38 §539 — vite outDir + `_STATIC_DIR` unified to `frontend/dist`, `index.html` served with `Cache-Control: no-cache, no-store, must-revalidate`, and startup assertion `_assert_frontend_coherent()` refuses to boot on missing/mismatched chunk — VERDICT: SHIPPED (sha 830fc4a; also flipped L497 DIRECTED→SHIPPED above)
+add-38 §539 — `_on_joint_states` normalizes msg.name/position to canonical `[Joint1..Joint6]` before writing STATE (JSB was publishing insertion-order `[Joint2, Joint3, Joint1, …]`; yaml's own head comment predicts this fallback) — VERDICT: SHIPPED (sha b1729b4; server-side workaround, root-cause spawner-param investigation queued for F3)
+add-38 §540 — `_apply_cri_proxy_authority(r)` extracted from `_on_joint_states` and called from all three of `_on_joint_states`/`_on_estun_status`/`_on_estun_mode` so last-writer-wins races can't flip authority under `JOG_BACKEND=ros2` — VERDICT: SHIPPED (sha f100fc7)
+add-38 §540 — `/etc/systemd/system/roboai-estun.service.d/f1_monitor_only.{conf,env}` drop-in forcing `ESTUN_MONITOR_ONLY=true`, `ESTUN_ALLOW_JOG=0` — VERDICT: SHIPPED (dropin lives on disk on the Jetson; not tracked in git; retire when F3 formalizes)
+add-38 §545 — Reference tier built (HARDWARE.md 3.2K→17.5K, OPERATIONS.md NEW 15K, FACTS.md NEW 9.4K, INDEX.md +REFERENCE section, CLAUDE.md session-start 5→8 files + new doctrine) — VERDICT: SHIPPED (sha edbfee0)
+add-38 §543 — jog_bridge `_do_send_goal` populates `p0.velocities = p1.velocities = signed_vel` on target joint so consecutive JTC goals stitch as constant-velocity segments (empty velocities → vel=0 boundary → 10 Hz brake-restart on preempt → audible hunting on real gearbox) — VERDICT: PARTIAL SHIPPED (CodroidROS2 sha 80d65dd; throughput reduced hunting but residual oscillation still present at 10%×1500 ms, full-rate trace captured at ~/cri_eval_ws/f1_2_scenarios/evidence/2026-08-24_hunt_trace/ for next-session analysis; rungs 3-6 blocked)
+
 ## Skipped-addendum audit list (initial sweep did not tabulate)
 
 The first pass tabulated the substantive addenda densely and skipped the
