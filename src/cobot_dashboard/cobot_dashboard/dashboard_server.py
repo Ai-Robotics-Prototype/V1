@@ -114,12 +114,13 @@ except ImportError:
 
 _START_TIME = time.time()
 _THIS_DIR = Path(__file__).resolve().parent
-_STATIC_DIR = _THIS_DIR.parent / "mock_server" / "static"
-# Location of the last-built frontend on disk. The System Check panel
-# compares the served bundle hash (under _STATIC_DIR) against the built
-# bundle hash here to surface stale-bundle drift — the classic
-# "operator sees old UI after a redeploy" trap.
-_BUILT_FRONTEND_DIR = _THIS_DIR.parent / "frontend" / "dist"
+_STATIC_DIR = _THIS_DIR.parent / "frontend" / "dist"
+# Same path as _STATIC_DIR now — the historic mock_server/static override
+# was retired (vite.config outputs directly to dist/, we serve from dist/).
+# Kept as a named reference because System Check reads both; comparison
+# is now trivially equal, so its stale-drift detection is effectively a
+# no-op self-check. Legacy field, ripe for retirement in a follow-up.
+_BUILT_FRONTEND_DIR = _STATIC_DIR
 
 # Timestamp of the last /estun/status frame received (monotonic seconds
 # via time.time()). Read by /api/systemcheck to compute controller
@@ -1897,10 +1898,25 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
     def _on_joint_states(self, msg):
         now_mono = time.monotonic()
         _last_joint_states_mono[0] = now_mono
+        # Normalize to canonical [Joint1..Joint6] order. JSB in the live CRI
+        # launch is publishing names in [Joint2, Joint3, Joint1, Joint4, Joint5,
+        # Joint6] because the spawner isn't honoring joint_state_broadcaster.
+        # yaml's `joints:` param at runtime (see the yaml's own head comment:
+        # "顺序会变成 2,3,1…"). Frontend indexes joints.positions[] by slot,
+        # not by name — under the raw order, positions[0..2] would go to
+        # Joint1/2/3's twin slots as Joint2/3/1's values, scrambling the
+        # base/shoulder/elbow render. Normalize here so every consumer
+        # (RobotControls, ArmViewer3D, StandaloneRobot) sees the correct
+        # index→joint mapping. Root-cause fix (JSB spawner param) queued for F3.
+        pos_by_name = dict(zip(msg.name, msg.position))
+        vel_by_name = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
+        canonical = ["Joint1", "Joint2", "Joint3", "Joint4", "Joint5", "Joint6"]
+        ordered_pos = [float(pos_by_name.get(n, 0.0)) for n in canonical]
+        ordered_vel = [float(vel_by_name.get(n, 0.0)) for n in canonical]
         with _state_lock:
-            STATE["joints"]["names"]      = list(msg.name)
-            STATE["joints"]["positions"]  = list(msg.position)
-            STATE["joints"]["velocities"] = list(msg.velocity) if msg.velocity else [0.0] * len(msg.name)
+            STATE["joints"]["names"]      = list(canonical)
+            STATE["joints"]["positions"]  = ordered_pos
+            STATE["joints"]["velocities"] = ordered_vel
             # CRI proxy is authoritative for arm-authority fields whenever
             # JOG_BACKEND=ros2. Previously gated on /estun/status staleness
             # (>3s) to avoid stepping on a live WS driver — but under ros2
@@ -1909,13 +1925,22 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             # allow_jog=true. Helper is idempotent + also called from
             # _on_estun_status / _on_estun_mode so last-writer-wins races
             # can't flip authority.
-            _apply_cri_proxy_authority(STATE.setdefault("robot", {}))
+            r = STATE.setdefault("robot", {})
+            _apply_cri_proxy_authority(r)
+            # Under ros2, also keep robot.joints_deg fresh from the same
+            # canonical joint_states — otherwise it stays frozen at whatever
+            # estun_driver last mirrored (potentially before the driver was
+            # stopped), and any UI reading joints_deg instead of joints.
+            # positions renders stale-forever.
+            if _JOG_BACKEND_ENV == "ros2":
+                r["joints_deg"] = [math.degrees(p) for p in ordered_pos]
         # Feed the breadcrumb collector so it can tag each ProjectState
         # transition with the joints the arm was at right then. Fires
         # ~25 Hz; the collector only holds the latest sample so this
-        # is O(1) and cheap.
+        # is O(1) and cheap. Pass the canonical-ordered positions so
+        # breadcrumb timestamps line up with what the UI shows.
         try:
-            self._breadcrumbs.on_joint_states(msg.position)
+            self._breadcrumbs.on_joint_states(ordered_pos)
         except Exception:
             pass
 

@@ -32,7 +32,12 @@ export default defineConfig({
     __BUILD_ID__:   JSON.stringify(buildId),
   },
   build: {
-    outDir: '../mock_server/static',
+    // dist/ is vite's canonical outDir; dashboard_server serves from
+    // frontend/dist directly (see _STATIC_DIR). The prior override
+    // to '../mock_server/static' was a rsync-drift class: build
+    // populated static/, System Check hashed dist/ (empty) and returned
+    // 'Cannot verify'. Single source of truth here closes that class.
+    outDir: 'dist',
     emptyOutDir: true,
   },
   server: {
