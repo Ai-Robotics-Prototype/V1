@@ -152,26 +152,60 @@ Full open-port scan from Jetson-side, 2026-08-24 [session-2026-08-24]:
   NetworkManager profile — NOT netplan; live `ip addr` changes never
   persist; watch for duplicate profiles and /32 masks that silently
   kill the subnet). [addendum-13 §124–125]
-- **Wi-Fi (wlP1p1s0):** `192.168.1.246/24` (house network, SSH path).
-  Last seen at DHCP `.143` (unreserved). MAC `50:2e:91:95:b6:15` →
-  `.246` reservation requested but STILL NOT LANDED (4th bite as of
-  2026-08-20). [addendum-13 §124; STATE.md]
+- **Wi-Fi (wlP1p1s0):** `192.168.1.246/24` (house network — flaky
+  fallback, not the STABLE path). Last seen at DHCP `.143` (unreserved).
+  MAC `50:2e:91:95:b6:15` → `.246` reservation requested but STILL NOT
+  LANDED (5th bite as of 2026-08-25 — see also `.2.x` wired path
+  under Subnet map, which sidesteps the whole class).
+  [addendum-13 §124; STATE.md; session-2026-08-25]
 - **JetPack 6.2.2** (Ubuntu 22.04), CUDA 12.6, L4T R36.5.0. ROS2 Humble
   native (no Docker). Isaac ROS NITROS 3.2.5 via apt. [HARDWARE.md
   legacy]
 
 ### Subnet map / operator access
 
-- **`192.168.2.x` (robot cell):** eno1 side. Robot .136, Jetson .246,
-  Livox on the same TP-Link gigabit unmanaged switch. [addendum-13 §124]
-- **`192.168.1.x` (house / Wi-Fi):** Jetson .246 (Wi-Fi), operator
-  laptop, tablet. [addendum-13 §124]
+**Physical topology — single switch.** TP-Link gigabit unmanaged switch
+sits at the robot cell. On it, wired: Jetson eno1 `192.168.2.246/24`
+(static), controller `192.168.2.136`, Livox LiDAR, operator laptop.
+Jetson ↔ controller ↔ laptop all reachable on `.2.x` directly, no
+tunnel. [session-2026-08-25]
+
+**STABLE path (preferred) — wired `.2.x`:**
+Laptop static IP `192.168.2.50` on its wired NIC (same switch as
+Jetson). Then `ssh teddy@192.168.2.246`. Dashboard reachable at
+`.2.246:8080` (wired) same way. No tunnel needed for factory UI: browse
+the controller directly at `http://192.168.2.136:9198/`. This is the
+recommended path for every operator session — kills the Wi-Fi flake
+class entirely. [session-2026-08-25]
+
+**F3 dashboard bind item:** dashboard currently binds to a single
+interface. Bind to `0.0.0.0` so BOTH NICs (wired `.2.246:8080` and
+Wi-Fi `.1.246:8080`) serve simultaneously — no code change should force
+the operator to pick a network. Tracked in ATTEMPTS.md against F3.
+[session-2026-08-25]
+
+**FLAKY fallback — Wi-Fi `.1.x`:**
+Jetson Wi-Fi `wlP1p1s0` lease `.1.143/24` (unreserved). Signal ~60,
+**flaps on cold boot** — don't rely on it for a session start. DHCP
+reservation for MAC `50:2e:91:95:b6:15` **STILL pending** (5th bite as
+of 2026-08-25 — was requested at addendum-13 §124, not landed in the
+router). Same-`/24`-fight rule below applies whenever Wi-Fi is up.
+[addendum-13 §124; session-2026-08-25]
+
+- **`192.168.2.x` (robot cell):** eno1 side + laptop wired. Robot .136,
+  Jetson .246, Livox, laptop .50 all on the same switch.
+  [addendum-13 §124; session-2026-08-25]
+- **`192.168.1.x` (house / Wi-Fi, fallback):** Jetson .246 (Wi-Fi),
+  tablet, laptop's Wi-Fi. [addendum-13 §124]
 - **CRITICAL:** Wi-Fi laptop on `.1.x` **cannot reach controller on
-  `.2.x` directly.** Two interfaces on same /24 will FIGHT: eno1 held to
-  `.1.x` alongside Wi-Fi's `.246/24` killed SSH instantly and wedged
-  Wi-Fi (power-cycle required). [addendum-13 §125, L75/L76;
-  session-2026-08-24]
-- **Factory UI SSH tunnel** (from `.1.x` laptop):
+  `.2.x` directly** — that's what the wired `.2.50` static path fixes.
+  Two interfaces on same /24 will FIGHT: eno1 held to `.1.x` alongside
+  Wi-Fi's `.246/24` killed SSH instantly and wedged Wi-Fi (power-cycle
+  required). [addendum-13 §125, L75/L76; session-2026-08-24]
+- **Factory UI direct browse (wired path, preferred):**
+  `http://192.168.2.136:9198/` from the laptop's `.2.50` static.
+  [session-2026-08-25]
+- **Factory UI SSH tunnel (Wi-Fi fallback only):**
   `ssh -L 9198:192.168.2.136:9198 -L 9000:192.168.2.136:9000 teddy@192.168.1.246`
   then browse `http://localhost:9198/`. **Both ports must be
   forwarded** or frontend gets "Server network closed!"; nested

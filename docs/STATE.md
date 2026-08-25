@@ -100,7 +100,9 @@
   Non-fatal (thread dies, main server continues); flap-detection loop
   isn't running. F3 item.
 - **DHCP reservation** `50:2e:91:95:b6:15 → .246` — FIFTH bite as of
-  today; Wi-Fi currently at `.143` (unreserved).
+  2026-08-25; Wi-Fi currently at `.1.143` (unreserved). Wired path
+  `.2.50 → .2.246` (HARDWARE.md Subnet map) now sidesteps this class
+  as the STABLE operator path — Wi-Fi is fallback only.
 - **V1 GitHub repo still PUBLIC** — long-open credential rotation debt.
 - Safety-edge margin retune, recovery-modal lifecycle, palletize slot-1
   — from earlier STATE, unchanged this session.
@@ -148,7 +150,8 @@ CRI).
 
 Controller `192.168.2.136` (`:9000` WS, `:9001` CRI TCP, UDP `9030`/`10086`,
 `:9198` operating UI, `:8080` deploy tool DO NOT USE, fw `2.3.3.43`).
-Jetson eno1 `192.168.2.246`; Wi-Fi lease `.143` (unreserved).
+Jetson eno1 `192.168.2.246` (STABLE, laptop wired at `.2.50`);
+Wi-Fi lease `.1.143` (unreserved, flaky fallback).
 `max_step_rad 0.002` session override. Repos:
 - `Ai-Robotics-Prototype/V1:feature/estun-write-path` head `872fdf5+` (addendum-38 + addendum-39 + LESSONS + STATE + ATTEMPTS all landed; §553/§554/§555/§556 pending commit at end-of-session)
 - `theodoresimpson/CodroidROS2:main` head `f6d4d53` (reference-cursor anchor `113e3f3` + guard-threshold tune `f6d4d53`)
