@@ -1,92 +1,87 @@
-# STATE.md — current truth as of 2026-08-26 (end of Addendum 40, jog / moveit_servo / accel-ramp)
+# STATE.md — current truth as of 2026-08-26 (end of Addendum 41, F1 close-out / arm-latency diagnosis)
 > If this file contradicts a memory or an addendum, THIS FILE wins for current
 > state; the ledger wins for history. Rewritten at every session end.
 
 ## Where we are
 
-- **Jog architecture CHANGED.** Goal-replacement bridge RETIRED (tripped
-  J2 drive on a velocity spike, addendum-40 §558). Replaced with the
-  moveit_servo path, then bypassed by an accel-ramp adapter — see below.
-- **35 Hz JTC-spline ring FIXED** (addendum-40 §559) by swapping Servo's
-  termination JTC → `position_controllers/JointGroupPositionController`
-  (no spline). JTC kept loaded-but-inactive for F2 planned motion.
-  CodroidROS2 sha `d6bb65e`.
-- **Continuous-jog root cause FOUND** (addendum-40 §562): CC10-A firmware
-  rejects command velocity change > ~25 rad/s² between cycles (per-cycle
-  acceleration limit; alarm 2015). Neither Servo Butterworth smoothing
-  nor position-controller passthrough accel-limits the OUTPUT →
-  creep-or-trip.
-- **FIX shipped:** accel-ramp integrator inside `jog_servo_adapter`
-  (`max_accel = 18 rad/s²`; ramps `cur_cmd_vel` toward `target_vel`,
-  integrates `cur_cmd_pos`; publishes directly to
-  `/joint_group_position_controller/commands`, bypassing Servo). Mock
-  trace CLEAN: 6-tick ramp-up at +18 rad/s², steady 27 °/s (15 % cap),
-  6-tick ramp-down at −18 rad/s². CodroidROS2 sha `f0e2930` (mock-only).
-- **Real test:** moved SMOOTH + VISIBLE (accel-ramp works) then tripped
-  2015 (addendum-40 §563).
-- **Trip cause named** (addendum-40 §563): phantom stale-tab jog event
-  (`speed_pct=22` — the UI 15 %→22 bug, §565) collided with the
-  adapter's 5° divergence guard SNAPPING (single-tick position step,
-  not ramping) → per-cycle Δv exceeded firmware limit.
-- **Guard fix shipped 2026-08-26**: `jog_servo_adapter` divergence guard
-  rewritten as a sticky two-phase settling state (Phase 1 vel-decel at
-  `max_accel`, Phase 2 pos-slew at bounded `sync_slew_rate`;
-  new hold events rejected during settle). CodroidROS2 sha `cb022d3`.
-  Mock guard-test PASS: max Δref/tick through the entire recovery equals
-  the normal steady-state jog Δref — no spike, no snap, settle ≈ 990 ms
-  for 5° divergence.
-- **Silent-refusal signature named** (addendum-40 §564, L271). JTC
+- **Continuous jog on the real arm PROVEN smooth** at low percentages.
+  Small bite (J6+ 5 % × 0.5 s) and Rung 3 (J6+ 3 s hold @ 10 %) both
+  passed with cmd Δ = actual Δ to 0.000° tracking, no errors,
+  no divergence, no settling triggered. Baseline:
+  `theodoresimpson/CodroidROS2:main` sha `af24198`.
+- **Three pre-flight fixes landed** on top of the addendum-40 accel-ramp
+  + settling baseline (addendum-41 §569):
+  - `c86ca60` — idle re-seed (tracks fb during idle to prevent
+    stale-pose snap), name-map rebuild (JSB order-change guard),
+    saturation invariant (WARN if commanded vel > 80 % of plugin slew).
+  - `e46887c` — idle-track deadband (5e-5 rad ≈ 4 × encoder LSB) so
+    `RobotStatus.isMoving` stays 0 during idle instead of flapping.
+  - `af24198` — divergence_threshold_rad 0.087 → 0.175 (5 ° → 10 °),
+    accommodating the ~250 ms J6 response latency named in §571.
+- **Flicker mechanism diagnosed** (addendum-41 §571): NOT saturation
+  (live `max_step_rad=0.0050` verified), NOT the guard-readopt loop
+  (phantom defense already blocks it), NOT dueling consumers. Actual
+  mechanism: arm response latency (~250 ms) × commanded velocity, at
+  22 % wire speed_pct cmd advanced 7-8 ° during arm response window and
+  tripped the old 5 ° threshold → settling ramped cmd backward → arm
+  overshot the retreating cmd → oscillation.
+- **Rung 3 at 10 % was on the razor's edge**: peak \|cmd-fb\| = +4.47 °,
+  right against the old 5 ° threshold. New 10 ° threshold has
+  headroom.
+- **Retest at 5 % × 0.5 s** after threshold bump: cmd Δ = actual Δ =
+  +2.47 °, \|cmd-fb\| SS = 0.000 °, max \|cmd-fb\| during ramp = +2.27 °
+  (well under 10 °), guard silent (no DIVERGENCE / SETTLE / SILENCE).
+  Evidence: `evidence/2026-08-26_F1_close/retest_5pct_v2/`.
+- **Silent-refusal signature named** (addendum-40 §564, L272). JTC
   returns "Goal successfully reached!" against a Disabled arm (state=0);
   `cod_cri_hardware` `write()` does not propagate arm-side servo state.
-  Feedback flowing (liveness) ≠ drives executing. Always verify
-  `state=2 AND recoveryState=0 AND errors=[]` over WS `:9000` before
-  trusting ROS2-side success.
-- **Phantom source identified + killed** (addendum-40 §565). Browser
-  JS-generated `hold_id` (`JogControls.jsx:91`,
-  `Math.random().toString(36).slice(2, 12)`) from a stale tab on
-  `192.168.1.111` (operator's live tab on `.2.50`). Dashboard restart
-  clears; 30 s idle monitor confirms zero uncommanded events.
-- **Dashboard speed-display BUG** (addendum-40 §565). Slider "15 %"
-  sends `speed_pct=22.0` on the wire (and 22–57 range for other UI
-  values). UI display ≠ wire value. Every prior speed-labelled test may
-  have run at a different actual percentage than believed. FIX PENDING —
-  separate dashboard session.
-- **Post-trip recovery** (addendum-40 §566): `System/ClearError` +
-  `Robot/switchOn` clears errors[] and `state` but NOT `recoveryState`.
-  Physical controller power-cycle is the only path that clears
-  `recoveryState=1 → 0`. Verified in-session.
+  Verify `state=2 AND recoveryState=0 AND errors=[]` over WS `:9000`
+  before trusting ROS2-side success.
+- **Dashboard 15 %→22 UI bug remains OPEN** (addendum-40 §565). Slider
+  "15 %" sends `speed_pct=22.0` on the wire. Named as the operator-
+  experience root cause of the "flicker" the operator saw at "15 %";
+  belongs to a dashboard session.
+- **DDS start-drop race in f14_inject named** (addendum-41 §573). The
+  0.5 s publisher-creation-to-emit gap in `f14_inject.py` occasionally
+  loses the START event to DDS discovery. Workaround:
+  `/tmp/hardened_inject.py` waits on `pub.get_subscription_count() > 0`.
+  Filed as F3 hardening — promote the subscription-match wait into
+  `f14_inject.py` proper.
+- **Rungs 4-6 + deadmans + soak DEFERRED** to the next session on
+  `af24198`'s baseline. Rung 3 passed; the guard-silent regime is now
+  characterized below ~13 % wire (≈ current UI 8-10 %).
 
 ## Next session opener (exact order)
 
-1. **Real-arm guard-fix retest** on the accel-ramp adapter baseline
-   (CodroidROS2 sha `cb022d3`):
-   - OPERATIONS.md §1 (CRI launch, `use_mock:=false use_servo:=true`)
-     — the launch's default is now the moveit_servo + jog_servo_adapter
-     path; goal-replacement bridge is retired (§558).
-   - WS-probe the four-tuple `{state:2, stateName:'Enabled',
-     recoveryState:0, errors:[]}` before touching anything. If the arm
-     comes up disabled or `recoveryState=1`, do NOT wire-recover — a
-     physical controller power-cycle is the only path (§566).
-   - Confirm one dashboard client on `:8080`
-     (`ss -tnp | grep :8080 | awk '{print $5}' | sort -u`); restart
-     `roboai-dashboard` if more than one IP is present; 30 s idle
-     monitor of `/dashboard/jog_session_events` → 0 events.
-   - Small first bite: J6+ 5 % × 0.5 s. Then rung 3 (J6+ 3 s hold @ 10 %),
-     4, 5, 6. E-stop in operator's hand. Watch `publish/Error` inline.
-   - Pass = smooth by ear AND no `publish/Error` frames AND cmd Δref/tick
-     stays at the accel-ramp value throughout (settling never triggers
-     under normal jog).
-2. **§555 Path B** (populate `.accelerations`) — SUPERSEDED. That
-   deferred item was on the retired goal-replacement path. Do not
-   revisit for jog.
-3. **§565 dashboard 15 %→22 UI bug** — separate dashboard session.
-   Named in HARDWARE.md / FACTS.md; blocks trust in any speed-labelled
-   test result until resolved.
-4. **`AccelerationLimitedPlugin` backport check** — is
-   `online_signal_smoothing::AccelerationLimitedPlugin` (moveit_core 2.15)
-   available under Humble 2.14.1? If yes, evaluate replacing the
-   adapter's ramp with it; keep the adapter as event-sink + guard.
-   If not, adapter stays authoritative. Grep-check first before opening.
+1. **Rungs 4-6 + deadmans + soak** on `af24198`'s baseline:
+   - OPERATIONS.md §1 (`use_mock:=false use_servo:=true`).
+   - WS four-tuple `{state:2, stateName:'Enabled', recoveryState:0,
+     errors:[]}`. If `recoveryState=1`, physical power-cycle only
+     (addendum-40 §566).
+   - Dashboard clients = 1 (operator only); 30 s idle monitor = 0
+     events; if any straggler, `systemctl restart roboai-dashboard`.
+   - Rung 4: J6− 3 s hold @ 10 %. Rung 5: J1 or similar range-safe
+     joint. Rung 6: extended hold (30 s) at 10 %.
+   - Deadman A: `--no-stop` flag on `f14_inject.py` — silence deadman
+     must cancel within 300 ms (adapter's `silence_timeout_s`).
+   - Deadman B: `kill -9 $(pgrep -f jog_servo_adapter_node)` mid-hold.
+     Pass = arm HOLDS last commanded position (position controller
+     forward-command semantics); no jump. New adapter should refuse
+     to accept any prior refresh on restart (phantom-defense).
+   - 60 s soak at 10 %; sample stats.divergence_halts and
+     stats.phantom_rejects at 15/30/45/60 s.
+   - Pass criteria unchanged: smooth by ear, zero `publish/Error`,
+     Δref/tick at accel-ramp value throughout, guard silent.
+2. **The dashboard 15 %→22 UI bug** (addendum-40 §565, addendum-41
+   §571) — separate dashboard session. Blocks trust in any speed-
+   labelled test result. The threshold bump in §572 defangs the
+   flicker symptom but the underlying wire-map mismatch remains.
+3. **DDS start-drop race in f14_inject** (addendum-41 §573) — promote
+   the subscription-match wait from `/tmp/hardened_inject.py` into
+   `f14_inject.py` proper before the next inject-driven test.
+4. **`AccelerationLimitedPlugin` backport check** — still pending from
+   addendum-40 §568. Only relevant if the adapter's per-cycle ramp
+   moves out-of-tree; not blocking rungs.
 
 ## Open defects / directed-not-confirmed
 
@@ -183,9 +178,13 @@ Controller `192.168.2.136` (`:9000` WS, `:9001` CRI TCP, UDP `9030`/`10086`,
 `:9198` operating UI, `:8080` deploy tool DO NOT USE, fw `2.3.3.43`).
 Jetson eno1 `192.168.2.246` (STABLE, laptop wired at `.2.50`);
 Wi-Fi lease `.1.143` (unreserved, flaky fallback).
-`max_step_rad 0.002` session override. Repos:
+Live plugin `max_step_rad = 0.005` (session-2026-08-25 bump per
+addendum-40 §561; verify at boot via `[CriUdpSystem]: CRI UDP bind …
+max_step_rad=0.0050`; disk source is
+`cri_tcp_setup.yaml`). Repos:
 - `Ai-Robotics-Prototype/V1:feature/estun-write-path` — unchanged this
   session (all V1 patches for the retired goal-replacement path).
-- `theodoresimpson/CodroidROS2:main` head `cb022d3` — jog moved to
-  moveit_servo + `jog_servo_adapter`; adapter carries accel-ramp
-  (`f0e2930`) + two-phase settling divergence guard (`cb022d3`).
+- `theodoresimpson/CodroidROS2:main` head `af24198` — accel-ramp
+  adapter (`f0e2930`) + settling guard (`cb022d3`) + phantom defense
+  (`9241be5`) + F1 close-out pre-flight (`c86ca60`) + idle deadband
+  (`e46887c`) + divergence-threshold 5°→10° (`af24198`).

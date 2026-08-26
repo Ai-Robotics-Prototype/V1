@@ -88,6 +88,15 @@
 - **DDS lazy-publisher hazard.** Create ROS2 publishers eagerly in
   `__init__` — lazy first-call publish loses to RELIABLE+VOLATILE
   discovery race. [memory `cobot-dds-lazy-publisher-hazard`]
+- **DDS start-drop race in one-shot publishers.** An ephemeral test
+  publisher (e.g., `f14_inject.py` for jog testing) creating pub →
+  sleep 500 ms → emit start/refresh/stop can silently LOSE the START
+  event to DDS discovery even when refreshes and stop arrive at the
+  subscriber cleanly. Distinct from the DDS lazy-publisher hazard —
+  that's publisher-side lazy-init; this is discovery timing on an
+  ephemeral socket. Workaround: wait on
+  `pub.get_subscription_count() > 0` before first emit. Applies to any
+  one-shot inject tool. [addendum-41 §573, L278]
 - **Stopped-vs-active gap.** STATE.md doctrine can say "STOPPED not
   disabled" while `systemctl is-active` says `active`. Doctrine
   describes intent; observation is truth. Every backend flip requires

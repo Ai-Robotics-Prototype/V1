@@ -46,11 +46,19 @@ Companion files: `OPERATIONS.md` (procedures), `FACTS.md` (ambient truths).
 - **Encoder LSB:** 0.343–0.687 mdeg (Phase D characterization; drift
   0.000343° J1–J3 = one LSB, 0.000687° J4–J6 = two LSB).
   [addendum-32 §508]
-- **Session override:** `max_step_rad = 0.002` (~0.5 rad/s equivalent),
-  down from driver default 0.004. [addendum-32 §508]
-- **CriUdpSystem plugin clamps:** `max_step_rad` default 0.002 rad per
-  cycle; `max_err_vs_fb_rad` 0.5 rad clamp of pos_cmd to feedback
-  window. [session-2026-08-24; addendum-32 §506]
+- **Live `max_step_rad = 0.005`** (~1.25 rad/s slew ceiling at the 250 Hz
+  plugin cycle = 71.6 °/s). Bumped from the earlier 0.002 override on
+  2026-08-25 as part of the accel-ramp servo migration (addendum-40 §561)
+  to give the adapter's per-cycle Δref adequate headroom without hitting
+  plugin clamp during normal jog. Xacro `<xacro:arg name="max_step_rad">`
+  default still reads 0.002 — the live value is set by
+  `cri_tcp_setup.yaml`; verify with the plugin's boot line
+  `[CriUdpSystem]: CRI UDP bind :10086 -> …:9030  max_step_rad=0.0050`.
+- **CriUdpSystem plugin clamps:** `max_step_rad` per-cycle position slew
+  cap (live value above); `max_err_vs_fb_rad = 0.5 rad = 28.6°` clamp of
+  pos_cmd to feedback window; `hold_if_cmd_far_from_fb_rad = 0.15 rad =
+  8.6°` holds output when cmd runs far from feedback.
+  [session-2026-08-24 base; addendum-40 §561 update]
 - **Cartesian terminalLimit (configured but DISABLED):** X ±1000,
   Y ±1000, Z −1000..+2500 mm. [addendum-14 §134]
 - **Robot-limit config:** `cartAutoMaxVel = 2600 mm/s` (product ceiling

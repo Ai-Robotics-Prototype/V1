@@ -1,12 +1,12 @@
 # LESSONS — numbered sections extracted from v46
 
 Source: `cobot_project_conversation_v46.md` (see `tools/ledger_lint.py`) +
-post-v46 addenda 32+. 243 numbered entries: 212 from v46 across addenda
-01–31 + era-01; 31 post-v46 (244–274, add-36 §528–532, add-37 §535–538,
-add-38 §539–543, add-39 §548–556, add-40 §562–565). Numbers reset across
-addenda in v46 — the same N may appear in multiple files. **Ledger
-numbering rule: tail-grep this file (LESSONS.md) before assigning a new
-number.**
+post-v46 addenda 32+. 248 numbered entries: 212 from v46 across addenda
+01–31 + era-01; 36 post-v46 (244–279, add-36 §528–532, add-37 §535–538,
+add-38 §539–543, add-39 §548–556, add-40 §562–565, add-41 §571–573).
+Numbers reset across addenda in v46 — the same N may appear in multiple
+files. **Ledger numbering rule: tail-grep this file (LESSONS.md) before
+assigning a new number.**
 
 Format: `N. one-line — file` (addendum slug; era-01 = pre-addendum).
 Duplicates listed with all sites; gaps flagged at the end.
@@ -28,9 +28,9 @@ session — flag added here so the lint's LESSONS-gaps-documented check
 
 Counts on current file:
 - v46 heading-format `## N.` entries in this file: 212
-- Post-v46 continuous-stream lessons: 31 (244–274)
-- Total entries below: 243
-- Gaps in 1..304 range: 119 (see gap block at bottom)
+- Post-v46 continuous-stream lessons: 36 (244–279)
+- Total entries below: 248
+- Gaps in 1..304 range: 114 (see gap block at bottom)
 - Known-extraction-miss list-format lessons NOT yet in this file: ~65 in
   146–243 range, plus additional list-format lessons in 1–145 that
   overlap the heading numbers (not necessarily missing content, just not
@@ -286,6 +286,11 @@ Counts on current file:
 272. SILENT-REFUSAL SIGNATURE — JTC returns `error_string='Goal successfully reached!'` against a DISABLED arm (`state=0`). ROS2 side cannot tell: `cod_cri_hardware::write()` does not propagate arm-side servo state. Feedback flowing (liveness) ≠ drives executing. Always verify `state=2 AND recoveryState=0 AND errors=[]` over WS `:9000/publish/RobotStatus,publish/Error` — never trust ROS2-side "success" on real-arm tests. Extends the silent-write-accept class (add-38 §542 named it inside `CriUdpSystem`; add-40 §564 walks it up through JTC + JointGroupPositionController). — add-40 §564
 273. A divergence / safety guard that SNAPS (step-corrects position in a single tick) is itself a trip source on an accel-limited controller. On CC10-A: adapter's 5° divergence guard did `cur_cmd_pos := fb; cur_cmd_vel := 0` in one tick; Δv/cycle exceeded the firmware's ~25 rad/s² ceiling and tripped 2015 (§563). Rule: a guard must not create the very discontinuity the hardware forbids. Fix pattern: two-phase settling — Phase 1 decels vel to 0 at the same accel limit, Phase 2 slews position toward fb at a bounded rate; new events rejected while settling. Extends L268's "guard must leave the exit open" — a guard must ALSO leave the entry open (the accel-limit invariant). — add-40 §563
 274. Continuous jog is intrinsically the hard motion primitive; it defeated BOTH the Lua/WS path (flicker + multi-press UX) and goal-replacement ROS2 (goal-seam then per-cycle accel trip). Planned motion (Pilz PTP/LIN) is the easy case and works cleanly (E5 signed off with 14 μm TCP round-trip). Jog is NOT on the critical path to the white-bowl demo — it's operator UX on already-solved motion. Do not let jog-hunt sessions block F2 executor / F4 bowl work. — add-40 §568
+275. J6 has ~200-250 ms response latency between position command and encoder-visible motion (motor spool-up + firmware buffer + servo loop). Divergence-threshold sizing MUST accommodate `latency × max_commanded_velocity`; too tight a threshold trips during ramp-up before the arm has time to respond. Rule of thumb: `divergence_threshold ≥ latency × vel_cap_frac × max_joint_vel × 1.5`. For S10-140 J6 at 22 % wire (0.69 rad/s), cmd advances 7-8° during the 250 ms window — the old 5° threshold was at the exact edge (Rung 3 at 10 % peaked at 4.47°, just under 5°). Bumped 5° → 10° in `af24198`. — add-41 §571-§572
+276. Idle re-seed with an encoder-noise deadband: while `hold_id is None` AND `|cur_cmd_vel| < settled_vel_tol`, track fb per-tick bounded by `sync_slew_rate × dt`; but SKIP updates when `|fb - cur_cmd_pos| < deadband`. Without the deadband, adapter's `cur_cmd_pos` random-walks with encoder noise (~1.2e-5 rad = 0.0007° per tick), the plugin sends the tiny changes to the arm, and `RobotStatus.isMoving` flaps to 1 continuously during genuine idle. Deadband ≈ 4× upper-bound encoder LSB (5e-5 rad ≈ 0.003°) — well below any user-observable position change. — add-41 §569
+277. Startup saturation-invariant honesty flag: WARN (don't refuse) when `vel_cap_frac × max_joint_vel > 0.8 × plugin_max_slew_rate`. Above threshold the downstream plugin's per-cycle clamp will throttle the adapter's stream — the arm PLATEAUS at plugin ceiling. Not a safety hazard (the plugin's clamp is what protects the firmware) but a per-jog-% behavioral cliff worth naming at launch time. Current config: `0.5 × π = 1.571 rad/s` commanded vs. `0.8 × 1.25 = 1.000 rad/s` allowed → plateau above ~79.6 % speed_pct. — add-41 §569
+278. DDS start-drop race in ephemeral test publishers: a short-lived publisher (like `f14_inject.py`) creating pub → sleep 500 ms → emit start/refresh/stop can LOSE the START message to DDS discovery, even when refreshes and stop arrive at the subscriber cleanly. Distinct from the DDS lazy-publisher hazard (`cobot-dds-lazy-publisher-hazard`) — that one is publisher-side lazy-init; this one is discovery timing on an ephemeral socket. Workaround: `pub.get_subscription_count() > 0` wait-loop before first emit. Applies to ANY one-shot inject tool. — add-41 §573
+279. Under a real-arm-latency regime with a threshold-vs-latency edge case, the OPERATOR-VISIBLE symptom (arm "flickers back and forth") is diagnostically valuable but INSUFFICIENT for choosing a mechanism — 5 plausible mechanisms produce similar bag traces. Always: (1) verify live config values, not disk (grep the plugin's boot line for `max_step_rad=…`); (2) enumerate ACTUAL publishers/subscribers on the topic (`get_publishers_info_by_topic`); (3) look at the `cmd` and `fb` time-series SIDE-BY-SIDE — a mechanism that stalls fb while advancing cmd looks nothing like a mechanism that also flickers cmd. — add-41 §571
 
 ---
 
