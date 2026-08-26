@@ -78,20 +78,22 @@
 - `addendum-39-aug-24-hunt-trace-verdict.md` — hunt-trace verdict = goal-seam (upstream of JTC); reference-cursor anchor + 8.6° guard-threshold tune shipped (CodroidROS2 `f6d4d53`); realized throughput 8.1 % → 79.5 %, sign reversals 28 → 0
 - `addendum-40-aug-25-jog-moveit-servo-accel-ramp.md` — goal-replacement retired (J2 trip); moveit_servo migration + 35 Hz ring fix via JointGroupPositionController swap; CC10-A per-cycle accel limit (~25 rad/s²) named as continuous-jog root cause; accel-ramp adapter bypassing Servo (CodroidROS2 `f0e2930`); first-motion smooth then 2015 trip; divergence-guard-snap replaced with two-phase settling (`cb022d3`); phantom stale-tab source + 15 %→22 UI bug named
 - `addendum-41-aug-26-f1-close-out-arm-latency-diagnosis.md` — F1 close-out pre-flight (idle re-seed + name-map rebuild + saturation invariant, CodroidROS2 `c86ca60`/`e46887c`); real-arm small bite + Rung 3 PASS; flicker diagnosis — NOT saturation, NOT guard-readopt-loop, NOT dueling consumers — actual mechanism = ~250 ms arm response latency vs 5° divergence threshold; threshold bumped 5°→10° (`af24198`) + retest PASS; DDS start-drop race in `f14_inject` named as F3
+- `addendum-42-aug-26-plugin-accel-clamp-trip.md` — alarm 2015 tripped at 24% wire; bursty-adapter-delivery mechanism confirmed (92 msgs/<1ms bursts after 10-60 ms stalls, peak Δv 9.6 rad/s at adjacent msgs); durable RT-side per-cycle accel clamp in `CriUdpSystem::clamp_accel_step` shipped (10-case unit test PASS); adapter interim max_accel 18→12 rad/s²; recovery gated on power-cycle (CodroidROS2 `c66c8f0`)
 
 ## By topic (fast lookup)
 
-- **CRI / write path:** 16, 19, 32, 33, 34, 35, 36, 37, 40, 41
-- **Jog / F1:** 34, 35, 36, 37, 38, 39, 40, 41
-- **moveit_servo / accel-ramp:** 40 (§558–§563), 41 (§569, §572)
+- **CRI / write path:** 16, 19, 32, 33, 34, 35, 36, 37, 40, 41, 42
+- **Jog / F1:** 34, 35, 36, 37, 38, 39, 40, 41, 42
+- **moveit_servo / accel-ramp:** 40 (§558–§563), 41 (§569, §572), 42 (§578 RT-side clamp)
 - **Silent classes / silent-refusal:** 37 (§537), 38 (§542), 40 (§564)
 - **DDS races / discovery hazards:** 41 (§573)
 - **Dashboard UI bugs:** 40 (§565 15 %→22), 41 (§571 confirms as flicker-symptom root)
+- **RT-side vs upstream invariants:** 42 (§578, L280)
 - **URDF / kinematics:** 3, 8a, 10, 11, 32
 - **Palletize:** 27, 31, 36 (§531)
 - **PBD:** 5, 30
 - **Teach flow:** 27, 30
-- **Safety / limits:** 4, 21, 29, 36 (§529), 40 (§562 CC10-A accel limit), 41 (§572 divergence-threshold vs arm latency)
+- **Safety / limits:** 4, 21, 29, 36 (§529), 40 (§562 CC10-A accel limit), 41 (§572 divergence-threshold vs arm latency), 42 (§578 RT-side accel clamp)
 - **Deploy / systemd:** 14, 24, 29
 - **Ledger doctrine:** 36 (§532)
 - **Fork registry:** 29 (§465), 30

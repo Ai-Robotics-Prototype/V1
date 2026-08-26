@@ -1,9 +1,10 @@
 # LESSONS — numbered sections extracted from v46
 
 Source: `cobot_project_conversation_v46.md` (see `tools/ledger_lint.py`) +
-post-v46 addenda 32+. 248 numbered entries: 212 from v46 across addenda
-01–31 + era-01; 36 post-v46 (244–279, add-36 §528–532, add-37 §535–538,
-add-38 §539–543, add-39 §548–556, add-40 §562–565, add-41 §571–573).
+post-v46 addenda 32+. 249 numbered entries: 212 from v46 across addenda
+01–31 + era-01; 37 post-v46 (244–280, add-36 §528–532, add-37 §535–538,
+add-38 §539–543, add-39 §548–556, add-40 §562–565, add-41 §571–573,
+add-42 §577).
 Numbers reset across addenda in v46 — the same N may appear in multiple
 files. **Ledger numbering rule: tail-grep this file (LESSONS.md) before
 assigning a new number.**
@@ -28,9 +29,9 @@ session — flag added here so the lint's LESSONS-gaps-documented check
 
 Counts on current file:
 - v46 heading-format `## N.` entries in this file: 212
-- Post-v46 continuous-stream lessons: 36 (244–279)
-- Total entries below: 248
-- Gaps in 1..304 range: 114 (see gap block at bottom)
+- Post-v46 continuous-stream lessons: 37 (244–280)
+- Total entries below: 249
+- Gaps in 1..304 range: 113 (see gap block at bottom)
 - Known-extraction-miss list-format lessons NOT yet in this file: ~65 in
   146–243 range, plus additional list-format lessons in 1–145 that
   overlap the heading numbers (not necessarily missing content, just not
@@ -291,6 +292,7 @@ Counts on current file:
 277. Startup saturation-invariant honesty flag: WARN (don't refuse) when `vel_cap_frac × max_joint_vel > 0.8 × plugin_max_slew_rate`. Above threshold the downstream plugin's per-cycle clamp will throttle the adapter's stream — the arm PLATEAUS at plugin ceiling. Not a safety hazard (the plugin's clamp is what protects the firmware) but a per-jog-% behavioral cliff worth naming at launch time. Current config: `0.5 × π = 1.571 rad/s` commanded vs. `0.8 × 1.25 = 1.000 rad/s` allowed → plateau above ~79.6 % speed_pct. — add-41 §569
 278. DDS start-drop race in ephemeral test publishers: a short-lived publisher (like `f14_inject.py`) creating pub → sleep 500 ms → emit start/refresh/stop can LOSE the START message to DDS discovery, even when refreshes and stop arrive at the subscriber cleanly. Distinct from the DDS lazy-publisher hazard (`cobot-dds-lazy-publisher-hazard`) — that one is publisher-side lazy-init; this one is discovery timing on an ephemeral socket. Workaround: `pub.get_subscription_count() > 0` wait-loop before first emit. Applies to ANY one-shot inject tool. — add-41 §573
 279. Under a real-arm-latency regime with a threshold-vs-latency edge case, the OPERATOR-VISIBLE symptom (arm "flickers back and forth") is diagnostically valuable but INSUFFICIENT for choosing a mechanism — 5 plausible mechanisms produce similar bag traces. Always: (1) verify live config values, not disk (grep the plugin's boot line for `max_step_rad=…`); (2) enumerate ACTUAL publishers/subscribers on the topic (`get_publishers_info_by_topic`); (3) look at the `cmd` and `fb` time-series SIDE-BY-SIDE — a mechanism that stalls fb while advancing cmd looks nothing like a mechanism that also flickers cmd. — add-41 §571
+280. Invariants that MUST hold at the wire cannot be enforced only in upstream (Python) layers — schedule jitter will always find a way through. If a firmware constraint is real (CC10-A: |Δv/cycle| ≤ ~25 rad/s²), the CLAMP must live at the RT-side that actually writes to the wire. The pattern: track `prev_step = pos_cmd_sent - pos_cmd_prev_sent`; clamp `this_step = cmd - pos_cmd_sent` to `prev_step ± max_accel_step`; then `cmd = pos_cmd_sent + clamped_step`. Enforced in `write()` after any pre-existing `clamp_step`. Upstream jitter (msgs bunching into a single write() cycle) becomes irrelevant. Unit-testable standalone (no ROS lifecycle needed). Closes L271 as an RT-side invariant, not just an upstream request. — add-42 §577-§578
 
 ---
 
