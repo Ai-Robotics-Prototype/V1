@@ -1,11 +1,12 @@
 # LESSONS — numbered sections extracted from v46
 
 Source: `cobot_project_conversation_v46.md` (see `tools/ledger_lint.py`) +
-post-v46 addenda 32+. 225 numbered entries: 212 from v46 across addenda
-01–31 + era-01; 13 post-v46 (244–256, add-36 §528–532 and add-37 §535–538).
-Numbers reset across addenda in v46 — the same N may appear in multiple
-files. **Ledger numbering rule: tail-grep this file (LESSONS.md) before
-assigning a new number.**
+post-v46 addenda 32+. 243 numbered entries: 212 from v46 across addenda
+01–31 + era-01; 31 post-v46 (244–274, add-36 §528–532, add-37 §535–538,
+add-38 §539–543, add-39 §548–556, add-40 §562–565). Numbers reset across
+addenda in v46 — the same N may appear in multiple files. **Ledger
+numbering rule: tail-grep this file (LESSONS.md) before assigning a new
+number.**
 
 Format: `N. one-line — file` (addendum slug; era-01 = pre-addendum).
 Duplicates listed with all sites; gaps flagged at the end.
@@ -27,9 +28,9 @@ session — flag added here so the lint's LESSONS-gaps-documented check
 
 Counts on current file:
 - v46 heading-format `## N.` entries in this file: 212
-- Post-v46 continuous-stream lessons: 7 (244–250)
-- Total entries below: 219
-- Gaps in 1..304 range: 143 (see gap block at bottom)
+- Post-v46 continuous-stream lessons: 31 (244–274)
+- Total entries below: 243
+- Gaps in 1..304 range: 119 (see gap block at bottom)
 - Known-extraction-miss list-format lessons NOT yet in this file: ~65 in
   146–243 range, plus additional list-format lessons in 1–145 that
   overlap the heading numbers (not necessarily missing content, just not
@@ -281,6 +282,10 @@ Counts on current file:
 268. A hold-if-far safety guard on an extrapolated reference cursor MUST be set well above the loop's steady-state tracking error, or it will flip-flop cycle-to-cycle when err naturally hovers at threshold — producing a fresh violent transient (opposite to the one the cursor was fixing). Rule of thumb: threshold ≥ 1.5 × (peak steady-state |err|). Under 200 ms horizon × 18 °/s command on the S10-140, peak err ~5° → threshold 8.6° (0.15 rad). Verify with a d/dt-reference trace, not by eye: the guard-collision fingerprint is a symmetric single-sample step-back exactly matching the current err magnitude. — add-39 §554
 269. Real-arm test injects on a **freshly-restarted jog_bridge** succeed cleanly; the same identical inject on a bridge that's been up for ~30+ minutes silently degrades (single goal reaches JTC per session even though every event dispatches). Named as a separate hazard class from the seam fix; workaround for formal F1 tests is `pkill -f jog_bridge_node` immediately before the inject. Suspect ActionClient handle leak / DDS state drift; separate F3 hardening item. — add-39 §556
 270. When the wire (`ros2 topic echo`) confirms an event stream landed at the subscriber but the arm doesn't respond, the bridge has *received-and-silently-dropped*, not *missed*. Debug path: `--ros-args --log-level jog_bridge:=debug` won't help (pure-Python SM has no logger); add a temporary `_dispatch` INFO log printing every SM action to see whether goals are being emitted upstream of the ActionClient. — add-39 §553
+271. CC10-A firmware enforces a per-cycle acceleration limit (~25 rad/s² between consecutive command cycles). Any jog command path MUST accel-limit its OUTPUT (ramp between cycles) or the drive trips alarm 2015 ("speed command jump or local acceleration too high"). `moveit_servo` Butterworth smoothing does NOT satisfy this; `JointGroupPositionController` passthrough does NOT either. `moveit_core` 2.15 ships `AccelerationLimitedPlugin` for exactly this constraint; Humble 2.14.1 may need it backported, else an explicit adapter-side ramp (§562's shipping answer). — add-40 §562
+272. SILENT-REFUSAL SIGNATURE — JTC returns `error_string='Goal successfully reached!'` against a DISABLED arm (`state=0`). ROS2 side cannot tell: `cod_cri_hardware::write()` does not propagate arm-side servo state. Feedback flowing (liveness) ≠ drives executing. Always verify `state=2 AND recoveryState=0 AND errors=[]` over WS `:9000/publish/RobotStatus,publish/Error` — never trust ROS2-side "success" on real-arm tests. Extends the silent-write-accept class (add-38 §542 named it inside `CriUdpSystem`; add-40 §564 walks it up through JTC + JointGroupPositionController). — add-40 §564
+273. A divergence / safety guard that SNAPS (step-corrects position in a single tick) is itself a trip source on an accel-limited controller. On CC10-A: adapter's 5° divergence guard did `cur_cmd_pos := fb; cur_cmd_vel := 0` in one tick; Δv/cycle exceeded the firmware's ~25 rad/s² ceiling and tripped 2015 (§563). Rule: a guard must not create the very discontinuity the hardware forbids. Fix pattern: two-phase settling — Phase 1 decels vel to 0 at the same accel limit, Phase 2 slews position toward fb at a bounded rate; new events rejected while settling. Extends L268's "guard must leave the exit open" — a guard must ALSO leave the entry open (the accel-limit invariant). — add-40 §563
+274. Continuous jog is intrinsically the hard motion primitive; it defeated BOTH the Lua/WS path (flicker + multi-press UX) and goal-replacement ROS2 (goal-seam then per-cycle accel trip). Planned motion (Pilz PTP/LIN) is the easy case and works cleanly (E5 signed off with 14 μm TCP round-trip). Jog is NOT on the critical path to the white-bowl demo — it's operator UX on already-solved motion. Do not let jog-hunt sessions block F2 executor / F4 bowl work. — add-40 §568
 
 ---
 

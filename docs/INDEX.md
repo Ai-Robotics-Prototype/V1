@@ -75,16 +75,21 @@
 - `addendum-36-hold-root-cause-and-restructure.md` — hold defect root-caused off-target; ledger split into distillates + archive
 - `addendum-37-aug-20-f1-pre-rung-setup.md` — ledger self-lint (ATTEMPTS + builder + 4-duty lint); F1 close pre-rung setup (drop-in + rebuild + jog_bridge null-tolerance + use_mock silent-mock discovery)
 - `addendum-38-aug-24-f1-motion-chain-and-hunt.md` — F1 motion chain proven on real arm (+11.75° J6); hold-jog hunt named + partial-fixed; reference tier built (HARDWARE + OPERATIONS + FACTS); Codroid operating UI on :9198 discovered; CriUdpSystem remote-disconnect state-latching named as its own hazard class
+- `addendum-39-aug-24-hunt-trace-verdict.md` — hunt-trace verdict = goal-seam (upstream of JTC); reference-cursor anchor + 8.6° guard-threshold tune shipped (CodroidROS2 `f6d4d53`); realized throughput 8.1 % → 79.5 %, sign reversals 28 → 0
+- `addendum-40-aug-25-jog-moveit-servo-accel-ramp.md` — goal-replacement retired (J2 trip); moveit_servo migration + 35 Hz ring fix via JointGroupPositionController swap; CC10-A per-cycle accel limit (~25 rad/s²) named as continuous-jog root cause; accel-ramp adapter bypassing Servo (CodroidROS2 `f0e2930`); first-motion smooth then 2015 trip; divergence-guard-snap replaced with two-phase settling (`cb022d3`); phantom stale-tab source + 15 %→22 UI bug named
 
 ## By topic (fast lookup)
 
-- **CRI / write path:** 16, 19, 32, 33, 34, 35, 36, 37
-- **Jog / F1:** 34, 35, 36, 37
+- **CRI / write path:** 16, 19, 32, 33, 34, 35, 36, 37, 40
+- **Jog / F1:** 34, 35, 36, 37, 38, 39, 40
+- **moveit_servo / accel-ramp:** 40 (§558–§563)
+- **Silent classes / silent-refusal:** 37 (§537), 38 (§542), 40 (§564)
+- **Dashboard UI bugs:** 40 (§565 15 %→22)
 - **URDF / kinematics:** 3, 8a, 10, 11, 32
 - **Palletize:** 27, 31, 36 (§531)
 - **PBD:** 5, 30
 - **Teach flow:** 27, 30
-- **Safety / limits:** 4, 21, 29, 36 (§529)
+- **Safety / limits:** 4, 21, 29, 36 (§529), 40 (§562 CC10-A accel limit)
 - **Deploy / systemd:** 14, 24, 29
 - **Ledger doctrine:** 36 (§532)
 - **Fork registry:** 29 (§465), 30

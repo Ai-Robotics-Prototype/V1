@@ -338,11 +338,27 @@ Under `/etc/systemd/system/`:
   (50% hw / 25% op-limit). Increases confirm; decreases apply instantly.
   [era-01 §Safety Architecture; addendum-21; CLAUDE.md]
 
+## Runtime motion-command constraints
+
+- **Per-cycle acceleration limit ≈ 25 rad/s²** enforced by the CC10-A
+  firmware on the incoming command stream (UDP `9030` in-bound from
+  `CriUdpSystem`). Any command Δv/cycle above this threshold triggers
+  alarm 2015 on the target joint. Applies to any layer feeding position
+  setpoints — `moveit_servo` Butterworth output does NOT respect it;
+  `JointGroupPositionController` passthrough does NOT respect it. The
+  jog path now respects it via `jog_servo_adapter`'s 18 rad/s² accel-ramp
+  (below the ceiling with margin). Pilz PTP/LIN planning respects it
+  natively through the trajectory generator's own accel limits.
+  [addendum-40 §562; STATE 2026-08-26]
+
 ## Alarm codes (observed / documented)
 
 Codes from estun_driver source docstring + session-observed on-wire.
 Severity 4 = latched fault. Full list is not exhaustively documented.
-[session-2026-08-24; estun_driver_node.py L737 comment]
+The 2015 text below corrects the estun_driver docstring's
+"Cartesian velocity / singularity" label — the on-wire message text
+observed 2026-08-25 is the acceleration-discontinuity variant.
+[session-2026-08-24; addendum-40 §562]
 
 | Code  | Text                                          |
 |-------|-----------------------------------------------|
@@ -350,7 +366,7 @@ Severity 4 = latched fault. Full list is not exhaustively documented.
 | 2002  | Joint\<n\> exceeded limit                        |
 | 2006  | Emergency stop button pressed                 |
 | 2009  | Collision detected on Joint\<n\>                 |
-| 2015  | Cartesian velocity / singularity alarm        |
+| 2015  | Joint\<n\> speed command jump or local acceleration too high — accel/step-discontinuity trip; distinct from 2009 (collision) and 2006 (e-stop) [addendum-40 §562] |
 | 2023  | Singular position                             |
 | 9012  | Power disconnection detected                  |
 | 13046 | Emergency stop pressed                        |

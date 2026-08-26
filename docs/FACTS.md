@@ -54,6 +54,26 @@
   reset on plugin init. If the motion controller is disabled or
   alarmed, JTC "Goal reached" reports success but no motion occurs. F3
   hardening item. [session-2026-08-24]
+- **Silent-refusal signature (upstream of CRI UDP, L272).** Extends the
+  above through the ROS2 motion stack. Against a Disabled arm
+  (`RobotStatus.state=0`), three separate command paths all reported
+  success in-session while the arm sat still: `jog_servo_adapter`'s
+  250 Hz position stream to `/joint_group_position_controller/commands`,
+  a direct-write step-publisher to the same topic, and a
+  `FollowJointTrajectory` action call to JTC (returned
+  `error_string='Goal successfully reached!'`). None of the layers has
+  a back-channel for arm-side servo state. **The only wire-truth is
+  `ws://192.168.2.136:9000` `publish/RobotStatus` + `publish/Error`.**
+  Before *any* real-arm jog or planned-motion test, WS-probe
+  `{state, stateName, recoveryState, errors[]}`; treat ROS2-side
+  "success" as evidence of the communication path only.
+  [addendum-40 §564, L272]
+- **`stateName` can lie; `state` wins.** In-session observation
+  2026-08-25: `publish/RobotStatus.db.stateName='Enabled'` while
+  `db.state=0` — the numeric `state` field is authoritative;
+  `stateName` is a stringified display value that can lag or hold a
+  stale value across error transitions. Never gate on `stateName` alone.
+  [addendum-40 §564]
 - **Action SUCCESS ≠ arrival.** JTC declares "Goal reached, success" at
   default `goal_tolerance = 0.01 rad ≈ 0.573°` while servos keep
   converging. Poll-for-settle (per-joint drift ≤ 2 LSB over 500 ms
@@ -160,6 +180,21 @@
   daemon: kill ALL instances, start one fresh, verify banner AND
   `/proc/PID/environ` AND subscriber count. Never trust one of the
   three alone. [addendum-35 §524, L239]
+- **Phantom-source class — stale browser tabs on the dashboard.** Before
+  any real-arm jog test: `ss -tnp | grep :8080 | awk '{print $5}' |
+  sort -u` to enumerate connected client IPs; if more than the operator's
+  known IP is present, `sudo systemctl restart roboai-dashboard` to
+  force all clients to reconnect (queued hold state on the WS is flushed
+  on reconnect and can fire as an uncommanded event ~30 s into the fresh
+  motion stack). Then 30 s idle monitor of
+  `/dashboard/jog_session_events` must return zero events before jog.
+  [addendum-40 §565]
+- **Four-tuple pre-flight (WS `:9000`).** For real-arm gate:
+  `{state:2, stateName:'Enabled', recoveryState:0, errors:[]}` — all
+  four. `state=2` alone is not sufficient (`recoveryState=1` sits under
+  a nominally-enabled state and silently blocks motion). `errors:[]`
+  after clearing an alarm on the wire; if `recoveryState≠0` persists,
+  power-cycle. [addendum-40 §564; addendum-40 §566]
 
 ## Standing debts / known-open
 
@@ -167,6 +202,14 @@ These are AMBIENT ongoing conditions, not per-session state:
 
 - **DHCP reservation** `50:2e:91:95:b6:15` → `.246` — requested since
   addendum-32 §506, still unlanded 4 bites later. [STATE.md]
+- **Dashboard speed-display bug** (addendum-40 §565). Slider label
+  `"15 %"` sends `speed_pct=22.0` on the wire (and other UI values map
+  to 22–57 outputs). UI display ≠ wire value on the `speed_pct` field
+  emitted by `JogControls.jsx` in dashboard events. Every prior
+  speed-labelled test result carries this offset; treat historical
+  "5 %" / "15 %" claims as approximate until the UI-to-wire mapping is
+  corrected. F3 dashboard session; not on the jog critical path but
+  blocks any speed-precision test-report writing. [addendum-40 §565]
 - **`/opt/cobot/logs` retention cap** — regrew to 2.0 GB in <2 weeks
   twice; watchdog alerts but nothing prunes; retention cap unimplemented.
   [addendum-32 §506; STATE.md]
