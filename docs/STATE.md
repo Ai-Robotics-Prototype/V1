@@ -1,4 +1,4 @@
-# STATE.md — current truth as of 2026-08-27 (end of Addendum 43, jog product-requirement stack shipped, real-arm gated on power-cycle)
+# STATE.md — current truth as of 2026-08-27 (end of Addendum 44, small bite clean but clamp counter 196 — WS-fallback escalation)
 > If this file contradicts a memory or an addendum, THIS FILE wins for current
 > state; the ledger wins for history. Rewritten at every session end.
 
@@ -74,6 +74,19 @@
   exposed. UDP-setpoint path is the only jog primitive on this
   controller. Ambiguous-echo pattern distinguished from success and
   404 responses.
+- **Post-power-cycle acceptance session (addendum-44)**: small bite
+  J6+ 5 % × 0.5 s **PASS on motion** — cmd Δ = actual Δ = +1.97 °,
+  \|cmd-fb\| SS = 0.000 °, guard silent, no alarm — but **plugin
+  clamp fired 196 times** during the ~1 s session. Bag inter-msg dt
+  p99 = 18.5 ms, max = 28.1 ms, 34 msgs within <1 ms of prior (jitter
+  bursts). Class named: upstream Python-timer jitter absorbed by RT-
+  side backstop; backstop works, upstream is not RT-clean.
+- **STOPPED per operator directive** ("clamp counter and
+  divergence_halts both must be 0"). Two response classes on the
+  table (addendum-44 §593): accept the clamp as the operational
+  safety net + redefine the SLO, or **escalate to a WS-fallback jog
+  path via `:9000`** (bypasses Python timer entirely; used by the
+  factory UI on `:9198`).
 
 ## Next session opener (exact order)
 

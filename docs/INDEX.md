@@ -80,6 +80,7 @@
 - `addendum-41-aug-26-f1-close-out-arm-latency-diagnosis.md` — F1 close-out pre-flight (idle re-seed + name-map rebuild + saturation invariant, CodroidROS2 `c86ca60`/`e46887c`); real-arm small bite + Rung 3 PASS; flicker diagnosis — NOT saturation, NOT guard-readopt-loop, NOT dueling consumers — actual mechanism = ~250 ms arm response latency vs 5° divergence threshold; threshold bumped 5°→10° (`af24198`) + retest PASS; DDS start-drop race in `f14_inject` named as F3
 - `addendum-42-aug-26-plugin-accel-clamp-trip.md` — alarm 2015 tripped at 24% wire; bursty-adapter-delivery mechanism confirmed (92 msgs/<1ms bursts after 10-60 ms stalls, peak Δv 9.6 rad/s at adjacent msgs); durable RT-side per-cycle accel clamp in `CriUdpSystem::clamp_accel_step` shipped (10-case unit test PASS); adapter interim max_accel 18→12 rad/s²; recovery gated on power-cycle (CodroidROS2 `c66c8f0`)
 - `addendum-43-aug-27-jog-product-requirement-stack.md` — "JOG IS A PRODUCT REQUIREMENT" operator directive; three fixes shipped: clamp engagement counter (14-case unit test PASS), adapter velocity ceiling at 0.8 × plugin slew (shared config source), guard-readopt blacklist (halted hold_ids cannot restart); CRI :9001 enumerated — no native jog verb exposed (CodroidROS2 `8944a4c`); real-arm acceptance gated on power-cycle
+- `addendum-44-aug-27-clamp-nonzero-in-clean-jog.md` — small bite J6+ 5% × 0.5s PASS on motion (cmd=fb to 0.000°, no alarm, guard silent) but plugin clamp fired 196× during ~1 s session; class named: upstream Python-timer jitter absorbed by RT-side backstop; STOPPED + escalating to WS-fallback jog path via `:9000`
 
 ## By topic (fast lookup)
 
@@ -91,6 +92,8 @@
 - **Dashboard UI bugs:** 40 (§565 15 %→22), 41 (§571 confirms as flicker-symptom root)
 - **RT-side vs upstream invariants:** 42 (§578, L280), 43 (§584-§585, L281-L282)
 - **CRI verb enumeration:** 43 (§587 no native jog verb)
+- **RT-cleanliness / Python jitter class:** 42 (§577 first named), 44 (§592-§594 confirmed at real-arm 5%)
+- **WS-fallback jog path (:9000):** 44 (§595 escalation, OPEN)
 - **URDF / kinematics:** 3, 8a, 10, 11, 32
 - **Palletize:** 27, 31, 36 (§531)
 - **PBD:** 5, 30
