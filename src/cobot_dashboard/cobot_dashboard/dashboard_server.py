@@ -192,6 +192,44 @@ _last_joint_states_mono = [0.0]
 _JOG_BACKEND_ENV = os.environ.get("JOG_BACKEND", "ws").strip().lower()
 if _JOG_BACKEND_ENV not in ("ws", "ros2"):
     _JOG_BACKEND_ENV = "ws"
+
+# ── PHANTOM-FEEDBACK CLASS FIX (2026-08-27, twin flicker-to-zero) ──
+# Two writers to STATE.joints.positions can race:
+#   1. _on_joint_states  — ROS /joint_states (canonical Joint1..Joint6)
+#   2. _on_estun_status  — WS driver mirror `joints_rad`
+# Under JOG_BACKEND=ws, roboai-estun publishes /joint_states with
+# joint_1..joint_6 (lowercase). The canonical Joint1..Joint6 lookup in
+# handler #1 misses every slot → `.get(n, 0.0)` fills all zeros → the
+# twin flickers to home when handler #1 fires after handler #2.
+# Structural fix: bind feedback consumption to JOG_BACKEND (each mode
+# has ONE authoritative source; the other feed is IGNORED and counted).
+# Safety net: quarantine ANY exact-all-zeros frame while the wire says
+# the arm is enabled — that pose is impossible telemetry.
+_twin_source_ignored: dict = {}
+_phantom_zero_frames: dict = {}
+
+
+def _is_all_zeros_positions(positions) -> bool:
+    """True iff every joint position is within noise floor of 0.0.
+    Noise floor: 4× upper-bound encoder LSB (5e-5 rad ≈ 0.003°), same
+    threshold as the jog adapter's idle deadband."""
+    try:
+        return all(abs(float(p)) < 5.0e-5 for p in positions)
+    except (TypeError, ValueError):
+        return False
+
+
+def _wire_arm_is_enabled() -> bool:
+    """Read STATE.robot for the driver's most recent wire-observed
+    RobotStatus.state. `state == 2` = physically enabled. Under any
+    state != 2 (idle, disabling, faulted), the driver stops emitting
+    RobotPosture — a zero frame at that point is a stale-frame race,
+    not phantom feedback. Only quarantine when the arm is genuinely
+    enabled per the wire."""
+    with _state_lock:
+        r = STATE.get("robot", {}) or {}
+        st = r.get("state") if isinstance(r.get("state"), int) else None
+    return st == 2
 # Camera opt-out (2026-08-19 F1.4 rung-3 root-cause fix): under
 # CAMERAS_DISABLED=1, skip Image/CameraInfo subscriptions + the PIL
 # encode thread pool. py-spy proved cam-encode is the GIL hog whose
@@ -1976,6 +2014,20 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
     def _on_joint_states(self, msg):
         now_mono = time.monotonic()
         _last_joint_states_mono[0] = now_mono
+        # ── PHANTOM-FEEDBACK CLASS FIX (2026-08-27, twin flicker-to-zero) ──
+        # Under JOG_BACKEND=ws the WS driver's /estun/status mirror is the
+        # authoritative source for STATE.joints.positions (it carries
+        # joints_rad from RobotPosture). The ROS /joint_states topic the
+        # driver ALSO publishes uses lowercase names (joint_1..joint_6);
+        # this handler was originally written for the CRI-JSB naming
+        # convention (Joint1..Joint6, capitalized). Under ws the canonical
+        # lookup misses every slot → the fallback 0.0 fills the twin →
+        # racing with the real writer, the twin flickers to zero.
+        # Structural fix: under ws, IGNORE this feed entirely.
+        if _JOG_BACKEND_ENV == "ws":
+            _twin_source_ignored["ws_joint_states"] = (
+                _twin_source_ignored.get("ws_joint_states", 0) + 1)
+            return
         # Normalize to canonical [Joint1..Joint6] order. JSB in the live CRI
         # launch is publishing names in [Joint2, Joint3, Joint1, Joint4, Joint5,
         # Joint6] because the spawner isn't honoring joint_state_broadcaster.
@@ -1991,6 +2043,13 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         canonical = ["Joint1", "Joint2", "Joint3", "Joint4", "Joint5", "Joint6"]
         ordered_pos = [float(pos_by_name.get(n, 0.0)) for n in canonical]
         ordered_vel = [float(vel_by_name.get(n, 0.0)) for n in canonical]
+        # ── All-zeros quarantine (phantom-feedback safety net). Even under
+        # the CRI-JSB path, an exact-all-zeros frame while the arm is
+        # actually enabled is impossible telemetry — quarantine + count.
+        if _is_all_zeros_positions(ordered_pos) and _wire_arm_is_enabled():
+            _phantom_zero_frames["cri_joint_states"] = (
+                _phantom_zero_frames.get("cri_joint_states", 0) + 1)
+            return
         with _state_lock:
             STATE["joints"]["names"]      = list(canonical)
             STATE["joints"]["positions"]  = ordered_pos
@@ -2255,9 +2314,22 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             r["guard_escapes"] = d.get("guard_escapes") or []
             r["ground_z_mm"]   = d.get("ground_z_mm")
             # Joints (rad) — only overwrite if the driver gave us real data.
+            # ── PHANTOM-FEEDBACK CLASS FIX (2026-08-27, twin flicker-to-zero) ──
+            # Under JOG_BACKEND=ros2 the CRI-JSB /joint_states is the
+            # authoritative source; ignore the WS mirror's joints so the
+            # two writers can't race. Under ws this branch IS the source.
+            # In either mode, quarantine exact-all-zeros while the arm is
+            # actually enabled (impossible telemetry → phantom-feedback).
             jr = d.get("joints_rad")
             if isinstance(jr, list) and len(jr) == 6:
-                STATE["joints"]["positions"] = list(jr)
+                if _JOG_BACKEND_ENV == "ros2":
+                    _twin_source_ignored["ros2_estun_status_joints"] = (
+                        _twin_source_ignored.get("ros2_estun_status_joints", 0) + 1)
+                elif _is_all_zeros_positions(jr) and _wire_arm_is_enabled():
+                    _phantom_zero_frames["ws_estun_status"] = (
+                        _phantom_zero_frames.get("ws_estun_status", 0) + 1)
+                else:
+                    STATE["joints"]["positions"] = list(jr)
             # TCP pose (m / rad)
             tcp = d.get("tcp_m")
             if isinstance(tcp, list) and len(tcp) == 6:
