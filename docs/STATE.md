@@ -105,7 +105,13 @@
   §580). Only physical power-cycle clears the flag. Filed as F3
   investigate.
 - **9012 subcode decoding path** (addendum-45 §601) — `0x2058` decoding
-  needs the Estun ProNet drive manual. Filed as F3.
+  requires the S-Series Gen2 hardware/software PDF or the CN SGS manual
+  (public ProNet A.xx tables DO NOT apply — integrated joints use a
+  different encoding). Full-disk search 2026-08-27: no such manuals on
+  the Jetson (only matplotlib icons + a libreoffice error PDF exist);
+  `estun_driver`'s 2000-code docstring carries no subcode notes.
+  Filed as F3, gated on operator supplying the manual (search terms:
+  `0x2058`, `2058`, `伺服错误`, `欠压`).
 - **Dashboard 15 %→22 UI bug (addendum-40 §565)** — SUPERSEDED / moot
   under WS-jog. The dashboard slider now maps to the driver's
   `speed_pct` and the driver's own motion generator interprets it;
