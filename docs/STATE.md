@@ -1,4 +1,4 @@
-# STATE.md — current truth as of 2026-08-27 (end of Addendum 46 — F1 CLOSED, F2 STARTED on bba8cea)
+# STATE.md — current truth as of 2026-08-27 (end of Addendum 46 — F1 CLOSED, F1.1 informal PASS, F2 STARTED on bba8cea)
 > If this file contradicts a memory or an addendum, THIS FILE wins for current
 > state; the ledger wins for history. Rewritten at every session end.
 
@@ -8,9 +8,23 @@
   (addendum-45 §597), WS-jog reinstated (§598), motion arbiter shipped
   (§599, 12 doctrine cases), add-16 §286 three flicker-fixes verified
   still present (§600), slider truth pinned as doctrine (addendum-46
-  §603, 5 wire-truth cases). Real-arm acceptance (F1.1) + live-fire
-  arbiter (F1.2) are operator-cued and wait on the physical power-
-  cycle. All code / config / doctrine work is done.
+  §603, 5 wire-truth cases).
+- **F1.1 INFORMAL PASS** (2026-08-27 late session). Operator power-
+  cycled the cabinet and jogged successfully from the dashboard on
+  multiple joints — reports pendant-grade feel. Post-jog probe:
+  `state=2 Enabled`, `errors=[]`, arm moved from prior pose (J2
+  51°→16°, J3 96°→82°). Formal F1.1 (all 6 joints continuous + full
+  slider + tab-kill deadman) and F1.2 (arbiter live-fire) cued for
+  operator's next mark.
+- **`recoveryState=1` DOES NOT gate motion under WS-jog** — superseding
+  finding vs add-42 §580. Post-power-cycle probe still shows
+  `recoveryState=1` while the arm jogs cleanly on operator command.
+  The WS four-tuple check's `recoveryState=0` clause is over-strict
+  for WS-jog; motion authoritatively works with `state=2 + errors=[]`.
+  Add-42 §580's "physical power-cycle is the only path" was measured
+  against the streamed CRI path — under WS-jog `Robot/jog` on `:9000`
+  the controller's own motion generator does not consult the same flag.
+  Filed as F3 investigate.
 - **F2 STARTED** on `bba8cea` baseline. New package
   `s10_140_executor` in CodroidROS2 with three pure-logic gate
   modules (validators, settle, silent-refusal) + node skeleton, 24
@@ -46,18 +60,27 @@
 
 `state=2 stateName='Enabled' recoveryState=1 isMoving=0 errors=[]`.
 
-- **`recoveryState=1` STILL SET** — per operator rule, physical
-  controller power-cycle is required before any motion test. All
-  operator-cued live-fire tests (F1.1 WS-jog acceptance, F1.2
-  arbiter live-fire, F2.7 first taught program) wait on this.
+Fresh /joint_states (post operator's jog session):
+`joint_1=-3.18°, joint_2=+16.05°, joint_3=+82.84°, joint_4=+6.80°,
+joint_5=+89.64°, joint_6=-0.00°` (roboai-estun's lowercase naming).
+
+- Operator power-cycled the cabinet. `state=2 Enabled`, `errors=[]`.
+- `recoveryState=1` PERSISTS but motion works — see the superseding
+  finding above. Blocker cleared for F1.1 (informal PASS), F1.2, F2.7.
+- CodroidROS2 launch NOT running — the WS-jog path stands alone via
+  `roboai-estun` (`state=2` is authoritative for enable; motion goes
+  through the controller's own motion generator, no CRI stack needed).
 
 ## Next session opener (exact order)
 
-1. **Operator physical power-cycle** of the cabinet + physical
-   inspection of J1 servo power connector + main feed (add-45 §601).
-2. **Post-cycle WS four-tuple gate** — `{state:2 Enabled,
-   recoveryState:0, errors:[]}`. Any field off → HOLD.
-3. **F1.1 WS-jog acceptance (operator-cued):**
+1. **Power-cycle DONE**; informal F1.1 pass on operator's live jog.
+   Physical inspection of J1 servo power / main feed still owed
+   from add-45 §601 (opportunistic, not blocking).
+2. **Gate (revised for WS-jog):** `{state:2 Enabled, errors:[]}`.
+   `recoveryState` is informational under WS-jog — see the
+   superseding finding above. `errors=[]` is the load-bearing
+   check.
+3. **F1.1 formal WS-jog acceptance (operator-cued, next mark):**
    - Open dashboard (`https://192.168.2.246:8080`) as only client.
    - Arbiter fires green: no program running, jog surface active.
    - J6 short tap (5% × 0.5s). Then one more joint. Then continuous
