@@ -721,22 +721,30 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3649
+        line: 3852
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
           Pinned by test_jog_hold_heartbeat.py. 2026-08-19: line
-          shifted from 3363→3601 by the CRI-proxy commit (+273
-          lines in _on_joint_states, _cri_proxy_staleness_loop,
-          /cmd/power ros2 branch, and _publish_ros2_jog_event
-          defensive defaults).
+          shifted from 3363→3601 by the CRI-proxy commit. 2026-08-27:
+          shifted to 3852 (stripped-comment count; raw grep line 4029)
+          across the session's stack: motion arbiter helpers +
+          refuse-jog/refuse-run wrappers (JOG-11, add-45 §599,
+          ~90 lines), twin phantom-feedback class fix (JOG_BACKEND
+          gating + all-zeros quarantine + module-scope counters +
+          helpers, add-47 §612, ~50 lines), plus intermediate
+          additions from add-46 §603 doctrine setup. Both new gates
+          land BEFORE the route body — the jog_hold_heartbeat pairing
+          invariant is preserved.
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3779
+        line: 3987
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Pinned by test_jog_hold_heartbeat.py. 2026-08-19:
-          line shifted 3493→3731 (same commit as /cmd/jog above).
+          line shifted 3493→3731. 2026-08-27: shifted to 3987
+          (stripped-comment count; raw grep line 4172) — same session
+          stack as /cmd/jog above.
         owner: dashboard-transport
       - path: src/cobot_dashboard/frontend/src/lib/holdTicker.js
         line: 0
