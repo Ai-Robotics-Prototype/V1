@@ -189,29 +189,66 @@ Empty list = no active alarms. Alarm codes: see HARDWARE.md.
 
 ## 7. Backend flip (WS ↔ ros2)
 
-### 7a. Flip to `JOG_BACKEND=ros2`
+**As of 2026-08-27 (addendum-45 §598): `JOG_BACKEND=ws` is the
+DEFAULT operational mode.** `ros2` is retained for archaeology / F2
+regression research only. `use_servo` on the CodroidROS2 launch
+defaults `false` (streamed jog retired at the launch level, §597);
+the adapter code + RT accel clamp remain buildable for F2 edge cases
+but no launch consumes them.
+
+### 7a. Flip to `JOG_BACKEND=ws` (DEFAULT — reinstated 2026-08-27)
+
+1. Set drop-in
+   `/etc/systemd/system/roboai-estun.service.d/f1_monitor_only.env`:
+   ```
+   ESTUN_MONITOR_ONLY=false
+   ESTUN_ALLOW_JOG=1
+   ESTUN_ALLOW_MOVE=0        # F2 program execution rides CRI, not driver WS move verbs
+   ESTUN_ALLOW_CARTESIAN=0   # per operator directive, kept OFF
+   ```
+2. Set drop-in
+   `/etc/systemd/system/roboai-dashboard.service.d/campaign-f1.conf`:
+   ```
+   [Service]
+   Environment=JOG_BACKEND=ws
+   Environment=CAMERAS_DISABLED=1
+   ```
+3. `sudo systemctl daemon-reload`.
+4. `sudo systemctl enable roboai-estun && sudo systemctl start
+   roboai-estun` — verify `systemctl is-active roboai-estun` returns
+   `active`.
+5. Safe-gated restart of dashboard (STANDING.md rule 4): confirm
+   `_active_holds=0` and `program.state != 2` before
+   `sudo systemctl restart roboai-dashboard`.
+6. Verify (WS-mode 3-part check — L239 adapted for the WS-default era):
+   - `pgrep -af jog_bridge_node` → 0 instances (jog_bridge belongs to
+     `ros2` mode; must NOT be running here).
+   - Dashboard MainPID env: `tr '\0' '\n' <
+     /proc/$(systemctl show roboai-dashboard --property=MainPID
+     --value)/environ | grep JOG_BACKEND` → `ws`.
+   - Driver mode topic: `ros2 topic echo /estun/mode --once` shows
+     `allow_jog=true` with `allow_jog_source=ESTUN_ALLOW_JOG`.
+   - Driver banner (journalctl) includes `JOG WRITE PATH ENABLED —
+     monitor_only=false, allow_jog=true`.
+
+### 7b. Flip to `JOG_BACKEND=ros2` (RETIRED — kept for archaeology)
+
+The streamed-jog path is retired per addendum-45 §596. Do not
+enable except for regression research on a session where the
+operator has explicitly opted into the retired path.
 
 1. `sudo systemctl stop roboai-estun` — verify `systemctl is-active`
    returns `inactive` (doctrine "STOPPED not disabled" is intent;
    observation is truth). [addendum-37 §536, L252]
-2. Install drop-in
-   `/etc/systemd/system/roboai-dashboard.service.d/campaign-f1.conf`
-   with `[Service]\nEnvironment=JOG_BACKEND=ros2\nEnvironment=CAMERAS_DISABLED=1`.
-   [addendum-37 §535]
+2. In `campaign-f1.conf`, set `Environment=JOG_BACKEND=ros2`.
 3. `sudo systemctl daemon-reload`.
-4. Safe-gated restart (STANDING.md rule 4): confirm `active_holds=0`
-   and `program.state != 2` before `sudo systemctl restart
-   roboai-dashboard`.
-5. Verify: `tr '\0' '\n' < /proc/$(pgrep -f dashboard_server)/environ |
-   grep JOG_BACKEND` shows `ros2`; `/health.cri_proxy.backend=ros2`.
-
-### 7b. Flip to `JOG_BACKEND=ws` (fallback)
-
-1. `sudo systemctl start roboai-estun` — verify `is-active` = `active`.
-2. Remove/override the `JOG_BACKEND=ros2` drop-in.
-3. `sudo systemctl daemon-reload && sudo systemctl restart
-   roboai-dashboard` (safe-gated).
-4. Verify: `/health` reports `backend=ws`; banner reads WS mode.
+4. Safe-gated restart: confirm `active_holds=0` and `program.state !=
+   2` before `sudo systemctl restart roboai-dashboard`.
+5. Additionally: launch CodroidROS2 with `use_servo:=true
+   use_mock:=false`; L239 3-part check on `jog_bridge` still applies
+   (see §8).
+6. Verify: `/proc/dashboard/environ` shows `JOG_BACKEND=ros2`;
+   `/health.cri_proxy.backend=ros2`.
 
 ---
 

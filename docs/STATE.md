@@ -1,229 +1,186 @@
-# STATE.md — current truth as of 2026-08-27 (end of Addendum 44, small bite clean but clamp counter 196 — WS-fallback escalation)
+# STATE.md — current truth as of 2026-08-27 (end of Addendum 45 — streamed-jog RETIRED, WS-jog reinstated, motion arbiter shipped)
 > If this file contradicts a memory or an addendum, THIS FILE wins for current
 > state; the ledger wins for history. Rewritten at every session end.
 
 ## Where we are
 
-- **Continuous jog on the real arm PROVEN smooth** at low percentages.
-  Small bite (J6+ 5 % × 0.5 s) and Rung 3 (J6+ 3 s hold @ 10 %) both
-  passed with cmd Δ = actual Δ to 0.000° tracking, no errors,
-  no divergence, no settling triggered. Baseline:
-  `theodoresimpson/CodroidROS2:main` sha `af24198`.
-- **Three pre-flight fixes landed** on top of the addendum-40 accel-ramp
-  + settling baseline (addendum-41 §569):
-  - `c86ca60` — idle re-seed (tracks fb during idle to prevent
-    stale-pose snap), name-map rebuild (JSB order-change guard),
-    saturation invariant (WARN if commanded vel > 80 % of plugin slew).
-  - `e46887c` — idle-track deadband (5e-5 rad ≈ 4 × encoder LSB) so
-    `RobotStatus.isMoving` stays 0 during idle instead of flapping.
-  - `af24198` — divergence_threshold_rad 0.087 → 0.175 (5 ° → 10 °),
-    accommodating the ~250 ms J6 response latency named in §571.
-- **Flicker mechanism diagnosed** (addendum-41 §571): NOT saturation
-  (live `max_step_rad=0.0050` verified), NOT the guard-readopt loop
-  (phantom defense already blocks it), NOT dueling consumers. Actual
-  mechanism: arm response latency (~250 ms) × commanded velocity, at
-  22 % wire speed_pct cmd advanced 7-8 ° during arm response window and
-  tripped the old 5 ° threshold → settling ramped cmd backward → arm
-  overshot the retreating cmd → oscillation.
-- **Rung 3 at 10 % was on the razor's edge**: peak \|cmd-fb\| = +4.47 °,
-  right against the old 5 ° threshold. New 10 ° threshold has
-  headroom.
-- **Retest at 5 % × 0.5 s** after threshold bump: cmd Δ = actual Δ =
-  +2.47 °, \|cmd-fb\| SS = 0.000 °, max \|cmd-fb\| during ramp = +2.27 °
-  (well under 10 °), guard silent (no DIVERGENCE / SETTLE / SILENCE).
-  Evidence: `evidence/2026-08-26_F1_close/retest_5pct_v2/`.
-- **Silent-refusal signature named** (addendum-40 §564, L272). JTC
-  returns "Goal successfully reached!" against a Disabled arm (state=0);
-  `cod_cri_hardware` `write()` does not propagate arm-side servo state.
-  Verify `state=2 AND recoveryState=0 AND errors=[]` over WS `:9000`
-  before trusting ROS2-side success.
-- **Dashboard 15 %→22 UI bug remains OPEN** (addendum-40 §565). Slider
-  "15 %" sends `speed_pct=22.0` on the wire. Named as the operator-
-  experience root cause of the "flicker" the operator saw at "15 %";
-  belongs to a dashboard session.
-- **DDS start-drop race in f14_inject named** (addendum-41 §573). The
-  0.5 s publisher-creation-to-emit gap in `f14_inject.py` occasionally
-  loses the START event to DDS discovery. Workaround:
-  `/tmp/hardened_inject.py` waits on `pub.get_subscription_count() > 0`.
-  Filed as F3 hardening — promote the subscription-match wait into
-  `f14_inject.py` proper.
-- **Alarm 2015 tripped AGAIN at 24 % wire** (addendum-42 §576-§578):
-  bursty adapter delivery. Python 250 Hz timer intermittently stalls
-  10-60 ms, then bursts 2-4 msgs within <1 ms; plugin's next write()
-  sees a multi-tick delta as a single pos_cmd_ update. Neither
-  `clamp_step` (per-cycle position slew) nor the upstream adapter's
-  accel-ramp closes this seam.
-- **Durable fix shipped 2026-08-26**: `CriUdpSystem::clamp_accel_step`
-  bounds `|Δv/cycle|` at the RT rate — upstream jitter is now
-  irrelevant. Xacro param `max_accel_step_rad` default 0.00032
-  (= 20 rad/s² × dt²). 10-case unit test PASS. CodroidROS2 sha
-  `c66c8f0`.
-- **Interim adapter accel** lowered 18 → 12 rad/s² as belt-and-
-  suspenders. Revisit upward after plugin-clamp hardware verification.
-- **Recovery gate: recoveryState=1 PERSISTS after ClearError +
-  switchOn** (addendum-42 §580). Physical controller power-cycle
-  required. NO hardware retest until power-cycle.
-- **Rungs 4-6 + deadmans + soak** and **24 % retest** DEFERRED to next
-  session on `8944a4c`'s baseline (adapter interim + plugin clamp +
-  engagement counter + velocity ceiling + guard-readopt blacklist).
-- **JOG-1/2/3 shipped** (addendum-43 §583-§585): plugin clamp gains
-  engagement counter; adapter velocity ceiling caps commanded velocity
-  at 80 % of plugin slew rate (same source as plugin, no cross-repo
-  drift); guard-readopt blacklist rejects halted-hold_id events.
-- **CRI :9001 enumerated** (addendum-43 §587): no native jog verb
-  exposed. UDP-setpoint path is the only jog primitive on this
-  controller. Ambiguous-echo pattern distinguished from success and
-  404 responses.
-- **Post-power-cycle acceptance session (addendum-44)**: small bite
-  J6+ 5 % × 0.5 s **PASS on motion** — cmd Δ = actual Δ = +1.97 °,
-  \|cmd-fb\| SS = 0.000 °, guard silent, no alarm — but **plugin
-  clamp fired 196 times** during the ~1 s session. Bag inter-msg dt
-  p99 = 18.5 ms, max = 28.1 ms, 34 msgs within <1 ms of prior (jitter
-  bursts). Class named: upstream Python-timer jitter absorbed by RT-
-  side backstop; backstop works, upstream is not RT-clean.
-- **STOPPED per operator directive** ("clamp counter and
-  divergence_halts both must be 0"). Two response classes on the
-  table (addendum-44 §593): accept the clamp as the operational
-  safety net + redefine the SLO, or **escalate to a WS-fallback jog
-  path via `:9000`** (bypasses Python timer entirely; used by the
-  factory UI on `:9198`).
+- **Streamed-jog campaign CLOSED architecturally, not by convergence.**
+  Post-JOG-10 real-arm retest at speed_pct=22 (bag `press_trace_bag4`,
+  hids `5m0sbn6z1d` / `69lacogs6d`) — both presses diverged before
+  the arm ever moved. Measured **~500 ms J6 dead time** before any
+  fb motion, exceeds the ~300 ms latency assumption the velocity
+  ceiling was tuned against. Cmd advanced 13.4 ° during dead time,
+  divergence guard fired at 10.03 ° (t=405 ms), settling streamed
+  multi-joint slew, non-jogged **J3 saw −0.82 ° swing**, and the
+  arm's `jointCollisionSensitivity=80` tripped alarm 2009. Class
+  named as architecturally unfixable in software (addendum-45 §596,
+  L296).
+- **Operator directive delivered (2026-08-27 12:40):** jog moves
+  back to the WS `Robot/jog` verb (controller's own motion
+  generator). Streamed-jog development STOPS. CRI remains the
+  program-execution path (F2 unchanged).
+- **Jog architecture (as of end of session):**
+  - **Jog path** = WS `Robot/jog` on `:9000` via `roboai-estun`.
+    Driver banner: `JOG WRITE PATH ENABLED — monitor_only=false,
+    allow_jog=true (source: ESTUN_ALLOW_JOG). /robot/jog_command
+    will emit Robot/jog frames (|speed|≤0.50, heartbeat=0.40s,
+    deadman=0.20s). All other write paths still rejected.`
+  - **Program-execution path** = CRI streamed via `CriUdpSystem`
+    (UDP 10086 ↔ 9030). Unchanged; F2 rides this wire.
+  - **Motion arbiter** (JOG-11, addendum-45 §599, L297,
+    NON-NEGOTIABLE): the dashboard server refuses jog when a program
+    is running (`state ∈ {2, 3}`) and refuses program-run when a jog
+    hold is active (`|_active_holds| > 0`). Refusal returns 409 with
+    `reason_code` + `operator_copy.{title,detail}`. Release / stop
+    ALWAYS pass. Doctrine test `test_motion_arbiter.py` (12 cases,
+    all PASS).
+- **CodroidROS2 launch: streamed jog flag-off.** `use_servo` default
+  `true → false` (SHA `4671c97`). Adapter code + the `CriUdpSystem`
+  RT accel clamp stay in-tree for F2 edge cases; passing
+  `use_servo:=true` re-arms the whole chain (JOG-10 (a)+(d),
+  (b') gated OFF).
+- **roboai-estun UP.** `enable`d + `active`; drop-in
+  `f1_monitor_only.env` flipped to `ESTUN_MONITOR_ONLY=false,
+  ESTUN_ALLOW_JOG=1, ALLOW_MOVE=0, ALLOW_CARTESIAN=0`. Dashboard
+  drop-in `campaign-f1.conf` flipped to `JOG_BACKEND=ws`. Dashboard
+  restarted; MainPID env verified.
+- **WS-mode 3-part check** (adaptation of L239 for the WS-default era)
+  passed at flip time: `jog_bridge=0 instances`, `/estun/mode.allow_jog=true`,
+  dashboard MainPID env `JOG_BACKEND=ws`, driver banner clean.
+- **add-16 §286 three flicker-fixes verified STILL PRESENT** in the
+  current code (addendum-45 §600). Two of three are STRONGER now:
+  F1 mouseleave-`buttons===0` guard replaced by `setPointerCapture`+
+  `onPointerLeave`; F3 keepalive moved from asyncio to a **native
+  thread** at 100 ms, plus `holdTicker.js` runs in a **web worker**
+  (mobile browser throttle-immune).
+- **9012 forensics** (addendum-45 §601, L298): dashboard controller-
+  side proxy had NO disconnect / timeout at 10:37; browser-side WS
+  1001 disconnects are non-diagnostic; `:9198` SPA bundles the
+  log-fetch endpoints in compiled JS (unreachable from Jetson HTTP);
+  WS has no error-history verb. **Verdict LOW-confidence: drive-fault
+  cascading to PSU** (loose-power-after-shake NOT ruled out). Needs
+  browser :9198 log page + the Estun ProNet drive manual to tighten.
+
+## Arm state at session end
+
+`state=2 stateName='Enabled' recoveryState=1 isMoving=0 errors=[]`.
+
+- **`recoveryState=1` set** — per operator rule, physical controller
+  power-cycle is required before any motion test (addendum-40 §566,
+  addendum-42 §580). No enable / no motion until the operator power-
+  cycles the cabinet AND a fresh WS four-tuple reads `recoveryState=0`.
+- errors[] is empty at session end (the historical Joint3-2009 collision
+  cleared out at some point during forensics).
 
 ## Next session opener (exact order)
 
-1. **Rungs 4-6 + deadmans + soak** on `af24198`'s baseline:
-   - OPERATIONS.md §1 (`use_mock:=false use_servo:=true`).
-   - WS four-tuple `{state:2, stateName:'Enabled', recoveryState:0,
-     errors:[]}`. If `recoveryState=1`, physical power-cycle only
-     (addendum-40 §566).
-   - Dashboard clients = 1 (operator only); 30 s idle monitor = 0
-     events; if any straggler, `systemctl restart roboai-dashboard`.
-   - Rung 4: J6− 3 s hold @ 10 %. Rung 5: J1 or similar range-safe
-     joint. Rung 6: extended hold (30 s) at 10 %.
-   - Deadman A: `--no-stop` flag on `f14_inject.py` — silence deadman
-     must cancel within 300 ms (adapter's `silence_timeout_s`).
-   - Deadman B: `kill -9 $(pgrep -f jog_servo_adapter_node)` mid-hold.
-     Pass = arm HOLDS last commanded position (position controller
-     forward-command semantics); no jump. New adapter should refuse
-     to accept any prior refresh on restart (phantom-defense).
-   - 60 s soak at 10 %; sample stats.divergence_halts and
-     stats.phantom_rejects at 15/30/45/60 s.
-   - Pass criteria unchanged: smooth by ear, zero `publish/Error`,
-     Δref/tick at accel-ramp value throughout, guard silent.
-2. **The dashboard 15 %→22 UI bug** (addendum-40 §565, addendum-41
-   §571) — separate dashboard session. Blocks trust in any speed-
-   labelled test result. The threshold bump in §572 defangs the
-   flicker symptom but the underlying wire-map mismatch remains.
-3. **DDS start-drop race in f14_inject** (addendum-41 §573) — promote
-   the subscription-match wait from `/tmp/hardened_inject.py` into
-   `f14_inject.py` proper before the next inject-driven test.
-4. **`AccelerationLimitedPlugin` backport check** — still pending from
-   addendum-40 §568. Only relevant if the adapter's per-cycle ramp
-   moves out-of-tree; not blocking rungs.
+1. **Operator physical power-cycle** of the cabinet + physical
+   inspection of J1 servo power connector + main power feed
+   (addendum-45 §601 open action).
+2. **Post-cycle WS four-tuple gate** — `{state:2 Enabled,
+   recoveryState:0, errors:[]}`. If any field is not clean, HOLD.
+3. **First WS-jog press** (small bite):
+   - Open dashboard (`https://192.168.2.246:8080`) as the only client.
+   - Verify motion arbiter fires green: no program running, jog
+     surface active.
+   - J6 short tap (5 % × 0.5 s). Compare feel-vs-factory-pendant
+     (should be identical — same motion generator).
+   - If clean: one more joint, one more direction. Then continuous
+     hold at low %. Then full-slider soak.
+4. **Program-run + jog arbitration test:** with a program running,
+   attempt jog → dashboard returns 409 `program_running` + toast.
+   With a jog hold active, attempt program-run → dashboard returns
+   409 `jog_active` + toast. Both refusal paths PASS.
+5. **Browser `:9198` log page** — screenshot the alarm history around
+   the 10:37 event, ordered by log-index (NOT wall-clock; the
+   controller clock jumped +14 h → day-behind across the event).
+   If the Estun ProNet drive alarm table is available, decode
+   `0x2058` — an undervoltage-class subcode links the J1 error to a
+   failing power feed and moves §601's verdict from LOW to HIGH
+   confidence.
 
 ## Open defects / directed-not-confirmed
 
-- **Continuous-jog on real arm** — CLOSED-pending-verification. Accel-
-  ramp adapter (`f0e2930`) + settling divergence guard (`cb022d3`).
-  Mock guard-test PASS; real-arm retest gated on §568 sequence.
-- **Goal-replacement bridge** — RETIRED (addendum-40 §558). J2 drive
-  trip on velocity spike. Wrong primitive for jog (stitches preempted
-  trajectory goals). Do not revisit.
-- **Bridge-uptime degradation** — SUPERSEDED. Was on the retired path.
-  Delete workaround from rung procedure.
-- **CriUdpSystem silent-write-accept class** — extended (addendum-40
-  §564): also applies to JTC "success" against Disabled arm, and to
-  direct-write on `/joint_group_position_controller/commands`. WS-probe
-  is authoritative for arm-side state. F3 hardening item
-  (`CriUdpSystem::read` should re-arm `command_synced_` on remote
-  disconnect / arm-state transitions).
-- **Divergence-guard-snap trip cause (addendum-40 §563)** — FIXED. A
-  guard that step-corrects position on an accel-limited controller
-  becomes its own trip source. Settling substate ships in `cb022d3`.
-- **Phantom stale-tab source (addendum-40 §565)** — FIXED
-  operationally (dashboard restart); underlying browser lifecycle
-  (queued hold state on WS reconnect) not yet debounced server-side.
-  F3 item.
-- **Dashboard 15 %→22 UI bug (addendum-40 §565)** — OPEN. Slider display
-  ≠ wire value on `speed_pct`. Blocks trust in any prior speed-labelled
-  result. F3 dashboard session.
-- **JSB spawner-param root cause** — yaml declares `Joint1..Joint6` but
-  runtime publishes `[Joint2, Joint3, Joint1, Joint4, Joint5, Joint6]`.
-  Server-side normalization is the workaround; F3 investigates why the
-  spawner isn't honoring `-p`.
+- **recoveryState=1 wire-recovery insufficiency** — CLASS (addendum-42
+  §580). Only physical power-cycle clears the flag. Filed as F3
+  investigate.
+- **9012 subcode decoding path** (addendum-45 §601) — `0x2058` decoding
+  needs the Estun ProNet drive manual. Filed as F3.
+- **Dashboard 15 %→22 UI bug (addendum-40 §565)** — SUPERSEDED / moot
+  under WS-jog. The dashboard slider now maps to the driver's
+  `speed_pct` and the driver's own motion generator interprets it;
+  any prior wire-map mismatch is on the retired streamed path. If
+  the operator sees the same symptom under WS-jog, it's a fresh
+  investigation.
+- **CriUdpSystem silent-write-accept class** — still applies to F2
+  program execution (streamed poses ride the same wire). WS-probe is
+  authoritative for arm-side state. F3 hardening (`CriUdpSystem::read`
+  should re-arm `command_synced_` on remote disconnect / arm-state
+  transitions).
+- **Divergence-guard settling class + phantom stale-tab hazard** —
+  retired path only; live only under `use_servo:=true`. Not a live
+  defect under WS-jog default.
+- **JSB spawner-param root cause** — yaml declares `Joint1..Joint6`
+  but runtime publishes `[Joint2, Joint3, Joint1, Joint4, Joint5,
+  Joint6]`. Server-side normalization is the workaround; F3
+  investigates why the spawner isn't honoring `-p`. Still open.
 - **Version-toast false-fire** — UI compares vite chunk hash (filename)
-  vs `git describe` build-ID (baked constant), which are two identifiers
-  of the same artifact. F3 fix: compare like-for-like.
+  vs `git describe` build-ID. F3 fix: compare like-for-like. Still
+  open.
 - **`cri-proxy-staleness` thread ImportError** at boot — pre-existing
-  `from .staleness import staleness_decide` relative import fails
-  because `dashboard_server.py` runs as `__main__` not as a package.
-  Non-fatal (thread dies, main server continues); flap-detection loop
-  isn't running. F3 item.
-- **DHCP reservation** `50:2e:91:95:b6:15 → .246` — FIFTH bite as of
-  2026-08-25; Wi-Fi currently at `.1.143` (unreserved). Wired path
-  `.2.50 → .2.246` (HARDWARE.md Subnet map) now sidesteps this class
-  as the STABLE operator path — Wi-Fi is fallback only.
+  `.staleness` relative import fails; non-fatal (thread dies, main
+  server continues). F3 item.
+- **DHCP reservation** `50:2e:91:95:b6:15 → .246` — flaps periodically;
+  Wired path `.2.50 → .2.246` (HARDWARE.md Subnet map) sidesteps this
+  class as the STABLE operator path — Wi-Fi is fallback only.
 - **V1 GitHub repo still PUBLIC** — long-open credential rotation debt.
 - Safety-edge margin retune, recovery-modal lifecycle, palletize slot-1
-  — from earlier STATE, unchanged this session.
+  — unchanged from prior STATE.
 
 ## Paused / intact
 
 - **CRI motion stack: TORN DOWN at session end.**
-  `python3 ~/cri_eval_ws/cri_teardown.py` executed after the guard
-  mock-verification; arm restored to Manual mode. Do not restart without
-  running the OPERATIONS.md §1 recipe (5-step TCP init).
-- **jog_servo_adapter: not running** (the launch spawns it under
-  `use_servo:=true`). Standalone runs during the guard test used a
-  redirected topic (`/jog_test/pos_cmd`) — that mode is gone.
-- **goal-replacement `jog_bridge`: RETIRED (§558).** Not running; not
-  restarted. Code retained in-tree for jog_bridge tests / archaeology
-  but no launch consumes it.
-- **`roboai-estun` STOPPED** (with F1 drop-in
-  `/etc/systemd/system/roboai-estun.service.d/f1_monitor_only.env`
-  forcing `ESTUN_MONITOR_ONLY=true`, `ESTUN_ALLOW_JOG=0`). Fallback:
-  remove drop-in + `systemctl start roboai-estun` for `backend=ws`.
-- **Dashboard: LIVE**, PID varies. Systemd active. `JOG_BACKEND=ros2` +
-  `CAMERAS_DISABLED=1` via `campaign-f1.conf` drop-in. Frontend served
-  from `frontend/dist` (single source of truth). Coherence assertion
-  fires and passes at boot. Fanout publisher created eagerly in
-  `__init__`.
+  Streamed launch killed; `python3 ~/cri_eval_ws/cri_teardown.py`
+  executed. Arm restored to Manual then re-Enabled by the arm-side
+  path (no active ROS2 launcher on the arm now).
+- **jog_servo_adapter: not running.** No launch consumes it (default
+  `use_servo:=false`).
+- **jog_bridge (retired goal-replacement path): not running.** Code
+  retained in-tree for archaeology only. No launch consumes it.
+- **`roboai-estun`: LIVE.** `active`, `enabled`, drop-in
+  `f1_monitor_only.env` in the WS-jog configuration.
+- **Dashboard: LIVE.** `active`, `JOG_BACKEND=ws` + `CAMERAS_DISABLED=1`
+  via `campaign-f1.conf` drop-in. Frontend served from `frontend/dist`.
+  Motion arbiter is the authoritative gate at `/cmd/jog`,
+  `/cmd/jog_cartesian`, and `/api/estun/program/run`.
 
-## Reference tier built this session (always-loaded)
+## Reference tier updates this session
 
-Per addendum-38 §545:
-
-- `docs/HARDWARE.md` — full controller port table with role citations,
-  joint/velocity/DH constants, systemd inventory with env-precedence
-  gotcha, alarm code list.
-- `docs/OPERATIONS.md` (NEW) — every procedure as numbered steps with
-  exact commands + verification.
-- `docs/FACTS.md` (NEW) — ambient truths (silent classes, wire quirks,
-  "enabled" per surface).
-- `docs/INDEX.md` — REFERENCE section added.
-- `CLAUDE.md` — session-start load raised 5 → 8 files; new doctrine that
-  "update the ledger" also updates the reference tier.
-
-## Roadmap after F1
-
-Unchanged from prior STATE. F2 (executor over MoveIt), F3 (everything
-under systemd + hardening items collected here), F4 (white bowl over
-CRI).
+- `docs/FACTS.md` — added "Motion channels (jog + program-run)"
+  section: WS jog + CRI programs + coexistence rule + arbiter refusal
+  shape + post-shake dead-time class named.
+- `docs/OPERATIONS.md` §7 — rewritten. `JOG_BACKEND=ws` is now the
+  DEFAULT (§7a); `ros2` is retained under §7b for archaeology only.
+  WS-mode 3-part check added (adaptation of L239 for the WS-default
+  era).
+- `docs/LESSONS.md` — L296, L297, L298 appended.
+- `docs/ATTEMPTS.md` — add-45 §596–§601 rows appended.
 
 ## Hardware/session constants (details in HARDWARE.md)
 
 Controller `192.168.2.136` (`:9000` WS, `:9001` CRI TCP, UDP `9030`/`10086`,
 `:9198` operating UI, `:8080` deploy tool DO NOT USE, fw `2.3.3.43`).
-Jetson eno1 `192.168.2.246` (STABLE, laptop wired at `.2.50`);
-Wi-Fi lease `.1.143` (unreserved, flaky fallback).
-Live plugin `max_step_rad = 0.005` (session-2026-08-25 bump per
-addendum-40 §561; verify at boot via `[CriUdpSystem]: CRI UDP bind …
-max_step_rad=0.0050`; disk source is
-`cri_tcp_setup.yaml`). Repos:
-- `Ai-Robotics-Prototype/V1:feature/estun-write-path` — unchanged this
-  session (all V1 patches for the retired goal-replacement path).
-- `theodoresimpson/CodroidROS2:main` head `8944a4c` — accel-ramp
-  adapter (`f0e2930`) + settling guard (`cb022d3`) + phantom defense
-  (`9241be5`) + F1 close-out pre-flight (`c86ca60`) + idle deadband
-  (`e46887c`) + divergence-threshold 5°→10° (`af24198`) + plugin-side
-  per-cycle accel clamp + adapter interim 18→12 rad/s² (`c66c8f0`) +
-  JOG-1/2/3 (`8944a4c`).
+Jetson eno1 `192.168.2.246` (STABLE, laptop wired at `.2.50`); Wi-Fi
+lease `.1.143` (unreserved, flaky fallback). Live plugin
+`max_step_rad = 0.005` (session-2026-08-25 bump per addendum-40 §561;
+verify at boot via `[CriUdpSystem]: CRI UDP bind …
+max_step_rad=0.0050`; disk source is `cri_tcp_setup.yaml`). Repos:
+
+- `Ai-Robotics-Prototype/V1:feature/estun-write-path` — cobot_ws head
+  `e02aad3` (dashboard motion arbiter + doctrine test).
+- `theodoresimpson/CodroidROS2:main` — head `4671c97` (streamed jog
+  retirement: `use_servo` default `false`). Preceding commits from
+  this session (all now on the retired path but retained for
+  archaeology): `33d1b60` (JOG-10 (a)+(d), (b') gated OFF), `f736f14`
+  (hold_far bump + ALLOW_MOCK assertion), `df075c2` (JOG-9 latency
+  ceiling), `8944a4c` (JOG-1/2/3), `c66c8f0` (RT-side accel clamp).

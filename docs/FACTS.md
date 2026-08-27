@@ -36,6 +36,33 @@
   so last-writer-wins races cannot flip authority. Under `JOG_BACKEND=ws`
   the helper is a no-op. [session-2026-08-24]
 
+## Motion channels (jog + program-run)
+
+- **Jog path (as of 2026-08-27, addendum-45 §598):** WS `Robot/jog` on
+  `:9000` via `roboai-estun`. The driver's own motion generator handles
+  ramp / accel / dead-time — same primitive the factory UI on `:9198`
+  uses. Streamed jog via `jog_servo_adapter` is RETIRED at the launch
+  level (`use_servo` default `false`); adapter code + the RT accel
+  clamp stay in-tree for F2 program-execution edge cases.
+- **Program-execution path:** CRI streamed via `CriUdpSystem` on
+  UDP `10086 ↔ 9030` — unchanged. F2 rides this wire.
+- **Coexistence rule (STANDING, addendum-45 §599, NON-NEGOTIABLE):**
+  the CRI stack and the WS driver may BOTH be up (F1.0 hybrid) but
+  only ONE may command motion at any instant. The dashboard-server
+  motion arbiter enforces this at `/cmd/jog`, `/cmd/jog_cartesian`,
+  and `/api/estun/program/run`. Release / stop bodies are ALWAYS
+  allowed so an in-flight hold can never be stranded when a program
+  starts. Refusal shape: 409 with `reason_code ∈
+  {"program_running","jog_active"}` + `operator_copy.{title,detail}`.
+  Doctrine test: `cobot_dashboard/test/test_motion_arbiter.py` (12
+  cases pinning D1–D6 + race sanity).
+- **Post-shake dead-time class (addendum-45 §596):** the S10-140's
+  motion generator has ~500 ms dead time before any measurable J6 fb
+  motion. This is what killed the streamed model — no software
+  velocity-ceiling calculation reasoning about arm latency can absorb
+  a 500 ms dead time with a 10 ° divergence budget. Verdict was
+  architectural, not tunable.
+
 ## Silent classes (things that report success but produce nothing)
 
 - **Silent-mock class (L251).** `use_mock:=true` (launch default)
