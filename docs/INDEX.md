@@ -79,16 +79,18 @@
 - `addendum-40-aug-25-jog-moveit-servo-accel-ramp.md` — goal-replacement retired (J2 trip); moveit_servo migration + 35 Hz ring fix via JointGroupPositionController swap; CC10-A per-cycle accel limit (~25 rad/s²) named as continuous-jog root cause; accel-ramp adapter bypassing Servo (CodroidROS2 `f0e2930`); first-motion smooth then 2015 trip; divergence-guard-snap replaced with two-phase settling (`cb022d3`); phantom stale-tab source + 15 %→22 UI bug named
 - `addendum-41-aug-26-f1-close-out-arm-latency-diagnosis.md` — F1 close-out pre-flight (idle re-seed + name-map rebuild + saturation invariant, CodroidROS2 `c86ca60`/`e46887c`); real-arm small bite + Rung 3 PASS; flicker diagnosis — NOT saturation, NOT guard-readopt-loop, NOT dueling consumers — actual mechanism = ~250 ms arm response latency vs 5° divergence threshold; threshold bumped 5°→10° (`af24198`) + retest PASS; DDS start-drop race in `f14_inject` named as F3
 - `addendum-42-aug-26-plugin-accel-clamp-trip.md` — alarm 2015 tripped at 24% wire; bursty-adapter-delivery mechanism confirmed (92 msgs/<1ms bursts after 10-60 ms stalls, peak Δv 9.6 rad/s at adjacent msgs); durable RT-side per-cycle accel clamp in `CriUdpSystem::clamp_accel_step` shipped (10-case unit test PASS); adapter interim max_accel 18→12 rad/s²; recovery gated on power-cycle (CodroidROS2 `c66c8f0`)
+- `addendum-43-aug-27-jog-product-requirement-stack.md` — "JOG IS A PRODUCT REQUIREMENT" operator directive; three fixes shipped: clamp engagement counter (14-case unit test PASS), adapter velocity ceiling at 0.8 × plugin slew (shared config source), guard-readopt blacklist (halted hold_ids cannot restart); CRI :9001 enumerated — no native jog verb exposed (CodroidROS2 `8944a4c`); real-arm acceptance gated on power-cycle
 
 ## By topic (fast lookup)
 
-- **CRI / write path:** 16, 19, 32, 33, 34, 35, 36, 37, 40, 41, 42
-- **Jog / F1:** 34, 35, 36, 37, 38, 39, 40, 41, 42
-- **moveit_servo / accel-ramp:** 40 (§558–§563), 41 (§569, §572), 42 (§578 RT-side clamp)
+- **CRI / write path:** 16, 19, 32, 33, 34, 35, 36, 37, 40, 41, 42, 43
+- **Jog / F1:** 34, 35, 36, 37, 38, 39, 40, 41, 42, 43
+- **moveit_servo / accel-ramp:** 40 (§558–§563), 41 (§569, §572), 42 (§578 RT-side clamp), 43 (§584 velocity ceiling)
 - **Silent classes / silent-refusal:** 37 (§537), 38 (§542), 40 (§564)
 - **DDS races / discovery hazards:** 41 (§573)
 - **Dashboard UI bugs:** 40 (§565 15 %→22), 41 (§571 confirms as flicker-symptom root)
-- **RT-side vs upstream invariants:** 42 (§578, L280)
+- **RT-side vs upstream invariants:** 42 (§578, L280), 43 (§584-§585, L281-L282)
+- **CRI verb enumeration:** 43 (§587 no native jog verb)
 - **URDF / kinematics:** 3, 8a, 10, 11, 32
 - **Palletize:** 27, 31, 36 (§531)
 - **PBD:** 5, 30

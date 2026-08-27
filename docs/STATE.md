@@ -1,4 +1,4 @@
-# STATE.md — current truth as of 2026-08-26 late (end of Addendum 42, plugin-side accel clamp shipped, hardware retest gated on power-cycle)
+# STATE.md — current truth as of 2026-08-27 (end of Addendum 43, jog product-requirement stack shipped, real-arm gated on power-cycle)
 > If this file contradicts a memory or an addendum, THIS FILE wins for current
 > state; the ledger wins for history. Rewritten at every session end.
 
@@ -64,7 +64,16 @@
   switchOn** (addendum-42 §580). Physical controller power-cycle
   required. NO hardware retest until power-cycle.
 - **Rungs 4-6 + deadmans + soak** and **24 % retest** DEFERRED to next
-  session on `c66c8f0`'s baseline (adapter interim + plugin clamp).
+  session on `8944a4c`'s baseline (adapter interim + plugin clamp +
+  engagement counter + velocity ceiling + guard-readopt blacklist).
+- **JOG-1/2/3 shipped** (addendum-43 §583-§585): plugin clamp gains
+  engagement counter; adapter velocity ceiling caps commanded velocity
+  at 80 % of plugin slew rate (same source as plugin, no cross-repo
+  drift); guard-readopt blacklist rejects halted-hold_id events.
+- **CRI :9001 enumerated** (addendum-43 §587): no native jog verb
+  exposed. UDP-setpoint path is the only jog primitive on this
+  controller. Ambiguous-echo pattern distinguished from success and
+  404 responses.
 
 ## Next session opener (exact order)
 
@@ -199,8 +208,9 @@ max_step_rad=0.0050`; disk source is
 `cri_tcp_setup.yaml`). Repos:
 - `Ai-Robotics-Prototype/V1:feature/estun-write-path` — unchanged this
   session (all V1 patches for the retired goal-replacement path).
-- `theodoresimpson/CodroidROS2:main` head `c66c8f0` — accel-ramp
+- `theodoresimpson/CodroidROS2:main` head `8944a4c` — accel-ramp
   adapter (`f0e2930`) + settling guard (`cb022d3`) + phantom defense
   (`9241be5`) + F1 close-out pre-flight (`c86ca60`) + idle deadband
   (`e46887c`) + divergence-threshold 5°→10° (`af24198`) + plugin-side
-  per-cycle accel clamp + adapter interim 18→12 rad/s² (`c66c8f0`).
+  per-cycle accel clamp + adapter interim 18→12 rad/s² (`c66c8f0`) +
+  JOG-1/2/3 (`8944a4c`).
