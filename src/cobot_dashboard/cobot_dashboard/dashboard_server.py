@@ -3117,6 +3117,84 @@ if FASTAPI_AVAILABLE:
     _active_holds = {}          # hold_id -> _HoldSession
     _active_holds_lock = threading.Lock()
 
+    # ------------------------------------------------------------------
+    # Motion arbiter (JOG-11, 2026-08-27) — jog and program-run are
+    # mutually exclusive. Reason: the CRI stack and the WS driver
+    # coexist (F1.0 proved hybrid) but only ONE may command motion at
+    # any instant. Any motion-initiating call MUST be gated on the
+    # other channel being idle. Release / stop calls are ALWAYS
+    # allowed so they can never strand a dangling hold when a
+    # program starts. Doctrine test: test_motion_arbiter.py.
+    # ------------------------------------------------------------------
+    _PROGRAM_RUNNING_STATES = (2, 3)
+
+    def _arbiter_probe_program_running():
+        """Return (running: bool, info: dict). Reads STATE.robot.program.
+        program_state ∈ {2, 3} = running; 0 = idle. info carries the
+        project_id/line for the operator-copy dialog."""
+        with _state_lock:
+            prog = STATE.get("robot", {}).get("program", {}) or {}
+            st = int(prog.get("state", 0) or 0)
+            pid = prog.get("project_id")
+            line = prog.get("line")
+        if st in _PROGRAM_RUNNING_STATES:
+            return True, {
+                "program_state": st,
+                "project_id": pid,
+                "line": line,
+            }
+        return False, {}
+
+    def _arbiter_probe_jog_active():
+        """Return (active: bool, info: dict). Reads _active_holds; ANY
+        hold session counts as active jog. info lists up to 8 hold_ids."""
+        with _active_holds_lock:
+            n = len(_active_holds)
+            hids = list(_active_holds.keys())[:8]
+        if n:
+            return True, {"n_active_holds": n, "hold_ids": hids}
+        return False, {}
+
+    def _arbiter_refuse_jog_if_running(body):
+        """Returns None if the jog request may proceed; else a
+        JSONResponse(409) with reason_code='program_running' and an
+        operator_copy title/detail suitable for the toast. Release /
+        stop bodies are always allowed."""
+        if body.get("hold") is False or body.get("stop") is True:
+            return None
+        running, info = _arbiter_probe_program_running()
+        if not running:
+            return None
+        return JSONResponse(
+            {"error": "Cannot jog: a program is currently running.",
+             "reason_code": "program_running",
+             "program": info,
+             "operator_copy": {
+                 "title": "Program is running",
+                 "detail": ("Stop the program (or wait for it to finish) "
+                            "before jogging."),
+             }},
+            status_code=409,
+        )
+
+    def _arbiter_refuse_run_if_jogging():
+        """Returns None if a program-run may proceed; else a
+        JSONResponse(409) with reason_code='jog_active' + operator_copy."""
+        active, info = _arbiter_probe_jog_active()
+        if not active:
+            return None
+        return JSONResponse(
+            {"error": "Cannot run: a jog session is active.",
+             "reason_code": "jog_active",
+             "jog": info,
+             "operator_copy": {
+                 "title": "Jog session active",
+                 "detail": ("Release the jog control (both button and "
+                            "touch) before starting the program."),
+             }},
+            status_code=409,
+        )
+
     def _build_driver_payload(t, payload):
         """Shared payload shaping — mirrors the HTTP endpoints' translations
         (joint → axis, letter-axis → 1..6). Used by both the initial-hold
@@ -3888,6 +3966,11 @@ if FASTAPI_AVAILABLE:
         Legacy `{joint: 0..5, delta: <rad>}` from now-dead ControlStrip
         callers is still accepted and mapped to an increment."""
         body = await request.json()
+        # JOG-11 arbiter: refuse if a program is running (release/stop
+        # bodies always pass so an in-flight hold can be cleared).
+        _refused = _arbiter_refuse_jog_if_running(body)
+        if _refused is not None:
+            return _refused
         with _state_lock:
             if STATE["safety"]["estop"]:
                 return JSONResponse({"error": "Cannot jog: estop active"}, status_code=400)
@@ -4022,6 +4105,10 @@ if FASTAPI_AVAILABLE:
         continuous-jog state machine handles it (gated by
         allow_cartesian_jog on the driver — refused today by default)."""
         body = await request.json()
+        # JOG-11 arbiter: same refusal as joint jog.
+        _refused = _arbiter_refuse_jog_if_running(body)
+        if _refused is not None:
+            return _refused
         with _state_lock:
             if STATE["safety"]["estop"]:
                 return JSONResponse({"error": "Cannot jog: estop active"}, status_code=400)
@@ -6166,6 +6253,12 @@ if FASTAPI_AVAILABLE:
             body = await request.json()
         except Exception:
             body = {}
+        # JOG-11 arbiter: refuse if a jog session is active. Fires
+        # BEFORE program_id validation so the operator sees the jog
+        # conflict rather than a generic 400.
+        _refused = _arbiter_refuse_run_if_jogging()
+        if _refused is not None:
+            return _refused
         prog_id = str(body.get("program_id") or "").strip()
         if not prog_id:
             return JSONResponse({"error": "program_id required"}, status_code=400)
