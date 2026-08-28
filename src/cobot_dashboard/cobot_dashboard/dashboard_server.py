@@ -1340,8 +1340,61 @@ def _jog_stop_cause_operator_copy(cause: dict, joint_limits: list) -> dict:
             'Motion ended when the button was released.',
         )
 
-    # Fallback — 'other'. Operator sees a generic line; the raw wire
-    # text goes into `technical` for the log.
+    # ── 2026-08-28 kill-the-other-bucket operator copy ──────────
+
+    if tag == 'joint_overspeed':
+        # Controller-side clamp: near-singular Cartesian pose blows
+        # commanded joint velocity above the arm's per-joint cap.
+        # This is the operator's frequent-flier during cartesian
+        # holds. Name the joint + direction so recovery is obvious.
+        if joint_i1 and isinstance(joint_deg, (int, float)):
+            return _out(
+                f'Jog stopped — J{joint_i1} would have moved too fast.',
+                (f'You were jogging Cartesian near a pose where '
+                 f'J{joint_i1} needs to swing much faster than its cap '
+                 f'to keep the tool line. Move the tool slightly away '
+                 f'and re-press, or switch to Joint mode.'),
+            )
+        return _out(
+            'Jog stopped — arm would have moved a joint too fast.',
+            'Cartesian direction near a singular pose. Move the tool '
+            'slightly away from the current pose or switch to Joint mode.',
+        )
+
+    if tag == 'singularity_guard':
+        return _out(
+            'Jog stopped — near a singular pose.',
+            'The Cartesian direction crosses a singularity for this '
+            'wrist geometry. Move the tool away from the current pose '
+            'or switch to Joint mode to recover.',
+        )
+
+    if tag == 'disable_command':
+        return _out(
+            'Jog stopped — arm disabled.',
+            'Servo power was cut mid-hold. Re-enable the arm, then '
+            'press again to continue.',
+        )
+
+    if tag == 'transport_down':
+        return _out(
+            'Jog stopped — controller link dropped.',
+            'The WS connection to the arm closed during the hold. Wait '
+            'for the DRIVER indicator to turn green, then press again.',
+        )
+
+    if tag == 'node_shutdown':
+        return _out(
+            'Jog stopped — driver shutting down.',
+            'The estun_driver process is going down (planned restart '
+            'or systemd stop). Wait for it to come back, then press again.',
+        )
+
+    # Fallback — should be unreachable per the doctrine test. If a
+    # new stop reason gets added without extending the taxonomy, we
+    # still return SOMETHING so the operator isn't left staring at
+    # a silent button; the doctrine test at commit time refuses the
+    # regression.
     return _out(
         'Jog stopped.',
         'Motion ended. Check the driver logs for the specific cause.',

@@ -3276,6 +3276,14 @@ class EstunCodroidDriver(Node):
         # (substring, cause_tag). First match wins. Ordered from most
         # specific to most generic so a "hold staleness" reason doesn't
         # get swept up by the generic "hb send failed" match.
+        #
+        # KILL-THE-OTHER-BUCKET DISCIPLINE (2026-08-28): every reason
+        # string emitted anywhere in this file MUST land on a named
+        # tag. The doctrine test enumerates the reason substrings and
+        # refuses `cause=other` — see test_stop_jog_taxonomy_no_other
+        # in test_provenance_doctrine.py. If you add a new
+        # _stop_jog_locked(reason='...') call site, add its substring
+        # here in the same commit.
         ('release cmd',        'release_cmd'),
         ('hold staleness',     'freshness_deadman'),
         # 2026-08-05 (guided recovery): the escape-only zone drops a
@@ -3289,10 +3297,36 @@ class EstunCodroidDriver(Node):
         ('collision guard',    'collision_guard'),
         ('obstacle guard',     'collision_guard'),
         ('self-collision guard', 'collision_guard'),
+        # 2026-08-28: `_stop_jog_locked` reason
+        # `f'{kind} guard ... at {mm}mm'` with kind ∈
+        # {self-collision, ground, obstacle} means the ground path
+        # emitted `ground guard J6 vs table at 8mm` — bare "guard"
+        # substring didn't match. Named explicitly here.
+        ('ground guard',       'collision_guard'),
         ('hold transition',    'hold_transition'),
         ('zero-speed',         'zero_speed'),
         ('hb send failed',     'hb_send_failed'),
         ('send failed',        'send_failed'),
+        # ── 2026-08-28 kill-the-other-bucket additions ──────────
+        # Controller-side clamp: near-singular Cartesian pose blows
+        # commanded joint velocity above the arm's per-joint cap.
+        # Operator's frequent-flier culprit during cartesian holds.
+        ('joint overspeed guard', 'joint_overspeed'),
+        # Manipulability-based guard: σ_min crossed sigma_hard.
+        # Adjacent-but-distinct from joint_overspeed — the driver
+        # trips this BEFORE the controller clamp fires.
+        ('singularity guard',     'singularity_guard'),
+        # Operator disabled the arm mid-hold. Explicit action; not
+        # a fault. Distinct from the release-cmd path (release_cmd
+        # is the hold-end signal, disable is the servo cut).
+        ('disable command',       'disable_command'),
+        # WS transport disconnect happened mid-hold. Domain wire
+        # loss — distinct from the freshness deadman (which is a
+        # timeout; this is an explicit disconnect event).
+        ('ws disconnect',         'transport_down'),
+        # Node shutdown during hold — systemd stop or SIGTERM.
+        # The stop is a safety teardown, not a fault.
+        ('node shutdown',         'node_shutdown'),
     )
 
     def _jog_gaps_summary(self):

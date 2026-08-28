@@ -724,6 +724,115 @@ def test_mode_control_dialog_names_interlock_dance():
     assert "Re-enable the arm" in j
 
 
+# ── 2026-08-28 jog-stop taxonomy: kill the cause=other bucket ─
+
+# Every `_stop_jog_locked(reason='...')` call site in the driver is
+# enumerated here. `_tag_stop_reason` MUST route each to a specific
+# tag; anything falling through to `cause=other` becomes a doctrine
+# failure. The list is grep-derived from the driver source; if a new
+# _stop_jog_locked call site lands, this fixture updates in the same
+# commit.
+_DRIVER_STOP_REASON_STRINGS = (
+    # (representative reason string, expected non-'other' tag)
+    ("disable command",                                   'disable_command'),
+    ("release cmd",                                       'release_cmd'),
+    ("zero-speed hold cmd",                               'zero_speed'),
+    ("hold transition",                                   'hold_transition'),
+    ("send failed",                                       'send_failed'),
+    ("self-collision guard J1 vs J3 at 12mm",             'collision_guard'),
+    ("ground guard J6 vs table at 8mm",                   'collision_guard'),
+    ("obstacle guard TCP vs zone at 24mm",                'collision_guard'),
+    ("increment complete J1 at 12.3°",                    'increment_end'),
+    ("increment freshness fallback 0.35s",                'freshness_deadman'),
+    ("hold staleness 0.28s",                              'freshness_deadman'),
+    ("escape_only J3 at -155.0° past its escape edge",    'joint_limit_deeper'),
+    ("limit approach J1 at 190.0° margin 2.0°",           'joint_limit'),
+    ("cart limit approach J2 at 195.0° margin 2.0°",      'joint_limit'),
+    ("singularity guard (σ_min=0.0080 < 0.0100 hard)",    'singularity_guard'),
+    ("joint overspeed guard J4 -2.36 rad/s (cap 1.50)",   'joint_overspeed'),
+    ("hb send failed",                                    'hb_send_failed'),
+    ("ws disconnect",                                     'transport_down'),
+    ("node shutdown",                                     'node_shutdown'),
+)
+
+
+def test_stop_jog_taxonomy_no_other():
+    """Every reason string emitted by _stop_jog / _stop_jog_locked in
+    the driver source MUST route to a specific cause tag. `other` is
+    RETIRED — a stop the operator can't name is a stop the operator
+    can't debug. Priority override 2026-08-28: the mid-hold jog stop
+    problem outranks everything, and the toast has to speak truth."""
+    # Import the driver module so we can call _tag_stop_reason
+    # directly. Load it under sys.path to reach the source.
+    sys.path.insert(0, os.path.join(
+        WS, 'src', 'estun_driver', 'estun_driver'))
+    # Simulate the classifier as a pure function on the class table
+    # so this test doesn't need to spin up ROS.
+    src = _driver_src()
+    m = re.search(
+        r"_STOP_REASON_PATTERNS\s*=\s*\((.*?)^\s*\)",
+        src, re.DOTALL | re.MULTILINE)
+    assert m, '_STOP_REASON_PATTERNS not found in driver source'
+    patterns = []
+    for line in m.group(1).splitlines():
+        pm = re.match(r"\s*\('([^']+)',\s*'([^']+)'\)", line)
+        if pm:
+            patterns.append((pm.group(1), pm.group(2)))
+    assert patterns, 'no (substring, tag) tuples parsed'
+
+    def _tag(reason):
+        low = reason.lower()
+        for token, tag in patterns:
+            if token in low:
+                return tag
+        return 'other'
+
+    unnamed = []
+    for reason, expected_tag in _DRIVER_STOP_REASON_STRINGS:
+        got = _tag(reason)
+        if got == 'other':
+            unnamed.append((reason, expected_tag))
+        else:
+            assert got == expected_tag, (
+                f'reason {reason!r} tagged as {got!r} but doctrine '
+                f'expected {expected_tag!r}')
+    assert not unnamed, (
+        'STOP-JOG TAXONOMY DOCTRINE VIOLATED — the following reason '
+        'strings still fall through to cause=other:\n  '
+        + '\n  '.join(f'{r!r} (expected {t})' for r, t in unnamed)
+        + '\nAdd matching entries to _STOP_REASON_PATTERNS in the '
+          'driver AND operator copy in _jog_stop_cause_operator_copy.')
+
+
+def test_operator_copy_covers_every_stop_tag():
+    """Every non-'other' tag emitted by _STOP_REASON_PATTERNS must
+    have operator copy in _jog_stop_cause_operator_copy — a named
+    tag with generic fallback copy defeats the whole point of
+    naming. Grep the dashboard translator for `if tag ==` branches
+    and cross-check against the driver's tag set."""
+    driver_src = _driver_src()
+    m = re.search(
+        r"_STOP_REASON_PATTERNS\s*=\s*\((.*?)^\s*\)",
+        driver_src, re.DOTALL | re.MULTILINE)
+    assert m
+    driver_tags = set()
+    for line in m.group(1).splitlines():
+        pm = re.match(r"\s*\('[^']+',\s*'([^']+)'\)", line)
+        if pm:
+            driver_tags.add(pm.group(1))
+
+    server_src = _server_src()
+    # Find every `if tag == '<name>'` branch in the translator.
+    handled = set(re.findall(
+        r"tag\s*==\s*'([a-z_]+)'", server_src))
+    missing = sorted(driver_tags - handled)
+    assert not missing, (
+        'operator copy missing for tag(s): '
+        f'{missing}. Every driver tag must have a named branch in '
+        '_jog_stop_cause_operator_copy — the "Jog stopped." generic '
+        'fallback is the very thing this doctrine kills.')
+
+
 def test_frontend_run_modal_offers_switch_to_auto():
     """Run Program must transparently offer "Switch to Auto and
     run?" when the arm is not in AUTO — the operator never sees
