@@ -920,6 +920,100 @@ def test_cart_softening_toast_and_wrist_indicator_present():
     assert 'unwind' in wwi.lower()
 
 
+# ── 2026-08-28 addendum-52 ROS2 executor cutover scaffolding ─
+
+def test_run_backend_flag_defaults_legacy_lua():
+    """The RUN_BACKEND env flag must exist AND default to
+    legacy_lua so a fresh deploy stays on the proven path. F2.7
+    first-run acceptance is what flips the default to
+    ros2_executor — see ledger addendum-52 §647 M2."""
+    src = _server_src()
+    m = re.search(
+        r"_RUN_BACKEND_ENV\s*=\s*os\.environ\.get\("
+        r"[\"']RUN_BACKEND[\"'],\s*[\"'](\w+)[\"']", src)
+    assert m, ('_RUN_BACKEND_ENV env-var flag not found in '
+               'dashboard_server.py — regression: the cutover '
+               'scaffolding has been silently removed.')
+    assert m.group(1) == 'legacy_lua', (
+        f'default must be legacy_lua; got {m.group(1)!r}. F2.7 '
+        'first-run acceptance is what flips the default — this '
+        'is not a codegen-time decision.')
+
+
+def test_provenance_publishes_run_backend_and_target_mode():
+    """/api/provenance MUST publish both `run_backend` and
+    `run_backend_target_mode`. The frontend RunProgramModal
+    keys on `run_backend_target_mode` for the auto-offer — a
+    hard-coded 'auto' would break the cutover."""
+    src = _server_src()
+    m = re.search(
+        r'@app\.get\("/api/provenance"\).*?return \{(.*?)\}',
+        src, re.DOTALL)
+    assert m
+    body = m.group(1)
+    assert '"run_backend"' in body, (
+        '/api/provenance must publish run_backend')
+    assert '"run_backend_target_mode"' in body, (
+        '/api/provenance must publish run_backend_target_mode — '
+        'the frontend auto-offer keys on this field')
+    # Target-mode derivation must map legacy_lua → auto and
+    # ros2_executor → remote per HARDWARE.md > Robot-mode code
+    # table. Regression here would target the wrong mode.
+    assert 'legacy_lua' in body and '"auto"' in body
+    assert '"remote"' in body
+
+
+def test_run_endpoint_dispatches_on_run_backend():
+    """/api/estun/program/run must have a top-level dispatcher on
+    _RUN_BACKEND_ENV. Under ros2_executor: quarantined programs
+    still return 423; non-quarantined return 501
+    ros2_executor_not_wired_yet until F2.7 wires the action
+    client. Silent fallthrough to legacy would defeat the F2.7
+    acceptance signal."""
+    src = _server_src()
+    m = re.search(
+        r'@app\.post\("/api/estun/program/run"\)',
+        src)
+    assert m
+    body = src[m.start(): m.start() + 5000]
+    assert '_RUN_BACKEND_ENV' in body, (
+        'run endpoint must consult _RUN_BACKEND_ENV at dispatch')
+    assert 'ros2_executor_not_wired_yet' in body, (
+        'the ros2 branch stub outcome-kind is missing — silent '
+        'fallthrough to legacy would defeat the acceptance signal')
+    # The quarantine check inside the ros2 branch must precede
+    # the not_wired stub (safety before capability).
+    ros2_block = re.search(
+        r'_RUN_BACKEND_ENV\s*==\s*[\"\']ros2_executor[\"\'].*?501',
+        body, re.DOTALL)
+    assert ros2_block
+    assert 'quarantined' in ros2_block.group(0), (
+        'ros2 branch must still refuse quarantined programs — '
+        'the palletize latch class is architecturally impossible '
+        'on CRI, but the safety guard belt-and-braces stays')
+
+
+def test_run_modal_reads_provenance_target_mode():
+    """RunProgramModal.jsx must fetch /api/provenance on open and
+    use the returned target mode (not a hard-coded 'auto') when
+    calling /api/estun/mode. Regression here would keep asking
+    for AUTO under RUN_BACKEND=ros2_executor and defeat the
+    entire cutover."""
+    p = os.path.join(WS, 'src', 'cobot_dashboard', 'frontend',
+                     'src', 'components', 'RunProgramModal.jsx')
+    with open(p) as fh:
+        j = fh.read()
+    assert '/api/provenance' in j, (
+        'modal must fetch /api/provenance to read the run backend')
+    assert 'run_backend_target_mode' in j, (
+        'modal must consume run_backend_target_mode from provenance')
+    # The mode switch call must key on the dynamic target, not
+    # a hard-coded string.
+    assert re.search(r"target:\s*targetModeStr", j), (
+        'POST /api/estun/mode must send `target: targetModeStr` '
+        'so the flag actually drives the auto-offer')
+
+
 # ── 2026-08-28 palletize quarantine (§644 investigation) ─────
 
 def test_palletize_programs_quarantined_server_side():
@@ -1168,17 +1262,20 @@ def test_wsjog_hard_enforce_guards_still_present():
         'firmware cannot detect browser death')
 
 
-def test_frontend_run_modal_offers_switch_to_auto():
-    """Run Program must transparently offer "Switch to Auto and
-    run?" when the arm is not in AUTO — the operator never sees
-    a bare "not in auto mode" refusal (per feature directive §4)."""
+def test_frontend_run_modal_offers_switch_to_target_mode():
+    """Run Program must transparently offer "Switch to <target>
+    and run" when the arm is not in the target mode. Post
+    addendum-52, the target is dynamic (auto for legacy_lua,
+    remote for ros2_executor per provenance)."""
     p = os.path.join(WS, 'src', 'cobot_dashboard', 'frontend', 'src',
                      'components', 'RunProgramModal.jsx')
     with open(p) as fh:
         j = fh.read()
-    assert 'willSwitchToAuto' in j
+    assert 'willSwitchMode' in j
     assert '/api/estun/mode' in j
-    assert 'Switch to Auto and run' in j
+    # Dynamic label + dynamic target — no hard-coded 'Auto'.
+    assert 'Switch to ${targetModeLabel} and run' in j
+    assert 'target: targetModeStr' in j
 
 
 def test_estun_allow_move_env_expected_shape():

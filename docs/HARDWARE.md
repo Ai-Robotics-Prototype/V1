@@ -369,6 +369,24 @@ disable → Manual → Auto → enable clicks against
 | WS-programs (`/api/estun/program/run`, `_op_run`) | **AUTO** (0) | `RunProgramModal.jsx` auto-offers "Switch to Auto and run…" |
 | CRI executor (`s10_140_executor` package, Pilz PTP/LIN) | **REMOTE** (2) | F2 executor precondition — see `test_f2_executor_precondition_is_remote` |
 
+### Cutover flag (2026-08-28 addendum-52)
+
+`RUN_BACKEND=legacy_lua` (default, unchanged) → WS-programs path,
+target mode AUTO. `RUN_BACKEND=ros2_executor` → CRI executor
+path, target mode **REMOTE**. `RunProgramModal.jsx` reads
+`/api/provenance.run_backend_target_mode` and auto-offers
+"Switch to <Auto|Remote> and run" accordingly. Flag flips to
+`ros2_executor` on the F2.7 first-run acceptance commit. Until
+then, the ros2_executor branch of `/api/estun/program/run`
+returns `501 ros2_executor_not_wired_yet` (labeled stub) so the
+acceptance signal is loud.
+
+The Lua-push class of bugs (recoveryState=1 palletize latch,
+add-51 §640) CANNOT exist on the CRI executor path: no Lua, no
+HTTP push, Pilz PTP/LIN trajectories streamed directly. Fixing
+individual palletize codegen elements on the legacy path is
+therefore de-prioritized — the fix IS the cutover.
+
 **Enable-interlock (locked 2026-08-28):** the controller REFUSES
 `Robot/toAuto` / `Robot/toManual` / `Robot/toRemote` while
 `enabled=True`. Ack returns `ok=True` on the WS but

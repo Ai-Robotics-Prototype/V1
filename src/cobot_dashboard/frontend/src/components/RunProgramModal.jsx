@@ -72,6 +72,26 @@ export default function RunProgramModal() {
     }
   }, [open])
 
+  // 2026-08-28 addendum-52 cutover: read the run-backend flag +
+  // target mode from provenance so the modal can auto-target
+  // Remote (ros2_executor) vs Auto (legacy_lua). Hooks must
+  // live above the `if (!open)` guard (rules-of-hooks).
+  const [runBackend,    setRunBackend]    = useState('legacy_lua')
+  const [targetModeStr, setTargetModeStr] = useState('auto')
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    fetch('/api/provenance', { cache: 'no-store' })
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => {
+        if (cancelled || !d) return
+        setRunBackend(String(d.run_backend || 'legacy_lua'))
+        setTargetModeStr(String(d.run_backend_target_mode || 'auto'))
+      })
+      .catch(() => { /* nop */ })
+    return () => { cancelled = true }
+  }, [open])
+
   if (!open) return null
 
   const stepCount = Array.isArray(currentProgram?.steps) ? currentProgram.steps.length : 0
@@ -99,16 +119,20 @@ export default function RunProgramModal() {
   const allowMove   = !!robot.allow_move
   const monitorOnly = !!robot.monitor_only
   const connected   = !!robot.connected
-  // 2026-08-28 mode-switch workflow sugar. Programs run in AUTO
-  // (code 0). If we're not there and the driver's mode gate is
-  // open, the Confirm click first switches to Auto in one step.
-  // No optimistic UI: the /api/estun/mode endpoint returns after
-  // read-back verify against publish/RobotStatus.mode.
+  // 2026-08-28 mode-switch workflow sugar + addendum-52 cutover.
+  // Legacy Lua-push runs in AUTO (code 0). ROS2 executor runs in
+  // REMOTE (code 2, per HARDWARE.md > Robot-mode code table). The
+  // target mode is read from /api/provenance.run_backend_target_mode
+  // — see the fetch below.
   const robotModeCode = Number.isFinite(robot.robot_mode_code)
                           ? robot.robot_mode_code : -1
-  const inAuto        = robotModeCode === 0
   const allowMode     = !!robot.allow_mode
-  const willSwitchToAuto = !inAuto && allowMode
+  const targetModeCode = targetModeStr === 'remote' ? 2 : 0
+  const inTarget       = robotModeCode === targetModeCode
+  const willSwitchMode = !inTarget && allowMode
+  const targetModeLabel = targetModeStr === 'remote' ? 'Remote' : 'Auto'
+  // Kept for message compatibility with the pre-cutover copy.
+  const willSwitchToAuto = willSwitchMode
 
   const backdrop = {
     position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
@@ -157,11 +181,11 @@ export default function RunProgramModal() {
       // becomes the Run's structured error — the operator sees a
       // NAMED reason instead of a downstream "mode refused" from
       // the run itself.
-      if (willSwitchToAuto) {
+      if (willSwitchMode) {
         const mres = await fetch('/api/estun/mode', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ target: 'auto' }),
+          body:    JSON.stringify({ target: targetModeStr }),
         })
         const mbody = await mres.json().catch(() => ({}))
         if (!mres.ok || !mbody.ok) {
@@ -377,9 +401,10 @@ export default function RunProgramModal() {
                 fontSize: 13, color: '#065F46',
               }}>
                 Robot is currently in <b>{
+                  robotModeCode === 0 ? 'Auto' :
                   robotModeCode === 1 ? 'Manual' :
                   robotModeCode === 2 ? 'Remote' : 'an unknown mode'
-                }</b>. Confirm will first switch to <b>Auto</b>, then start
+                }</b>. Confirm will first switch to <b>{targetModeLabel}</b>, then start
                 the program.
                 {robot.enabled && (
                   <div style={{
@@ -387,9 +412,34 @@ export default function RunProgramModal() {
                   }}>
                     Arm is ENABLED — the controller refuses mode switches
                     while enabled. The endpoint will briefly disable the
-                    arm, switch to Auto, then re-enable before starting.
+                    arm, switch to {targetModeLabel}, then re-enable before starting.
                   </div>
                 )}
+              </div>
+            )}
+            {runBackend === 'legacy_lua' && (
+              <div style={{
+                marginTop: 10, padding: '8px 12px',
+                background: 'rgba(148,163,184,0.08)',
+                border: '1px dashed #94A3B8', borderRadius: 6,
+                fontSize: 12, color: '#475569',
+              }}>
+                Executor: <b>legacy Lua-push</b>. F2.7 cutover pending
+                — see ledger addendum-52. Once RUN_BACKEND=ros2_executor
+                is set, this modal will target Remote instead of Auto
+                and dispatch to the s10_140_executor package.
+              </div>
+            )}
+            {runBackend === 'ros2_executor' && (
+              <div style={{
+                marginTop: 10, padding: '8px 12px',
+                background: 'rgba(124, 58, 237, 0.08)',
+                border: '1px solid #7C3AED', borderRadius: 6,
+                fontSize: 12, color: '#5B21B6',
+              }}>
+                Executor: <b>ROS2 (s10_140_executor, Pilz PTP/LIN)</b>.
+                The legacy Lua-push class of bugs (recoveryState=1
+                palletize latch) cannot exist on this path.
               </div>
             )}
             <div style={btnRow}>
@@ -398,8 +448,8 @@ export default function RunProgramModal() {
                 style={btnPrimary('#16A34A', taughtCount === 0 || !idSafe)}
                 onClick={confirmRun}
                 disabled={taughtCount === 0 || !idSafe}>
-                {willSwitchToAuto
-                  ? `Switch to Auto and run at ${effectivePct}%`
+                {willSwitchMode
+                  ? `Switch to ${targetModeLabel} and run at ${effectivePct}%`
                   : `Confirm — Run at ${effectivePct}%`}
               </button>
             </div>

@@ -242,6 +242,19 @@ _JOG_BACKEND_ENV = os.environ.get("JOG_BACKEND", "ws").strip().lower()
 if _JOG_BACKEND_ENV not in ("ws", "ros2"):
     _JOG_BACKEND_ENV = "ws"
 
+# 2026-08-28 ROS2 executor cutover feature flag (addendum-52).
+# When RUN_BACKEND=ros2, /api/estun/program/run dispatches to the
+# s10_140_executor package via ROS2 action goals; RunProgramModal
+# auto-targets REMOTE (the mode CRI needs, per §566 four-tuple)
+# instead of AUTO (the mode the legacy Lua-push needs). Legacy
+# stays default until F2.7 first-run acceptance passes, then flips
+# by env override. The Lua-push class of bugs (recoveryState=1
+# palletize latch, add-51 §640) cannot exist on the CRI path —
+# no Lua, no push, Pilz PTP/LIN trajectories streamed.
+_RUN_BACKEND_ENV = os.environ.get("RUN_BACKEND", "legacy_lua").strip().lower()
+if _RUN_BACKEND_ENV not in ("legacy_lua", "ros2_executor"):
+    _RUN_BACKEND_ENV = "legacy_lua"
+
 # ── PHANTOM-FEEDBACK CLASS FIX (2026-08-27, twin flicker-to-zero) ──
 # Two writers to STATE.joints.positions can race:
 #   1. _on_joint_states  — ROS /joint_states (canonical Joint1..Joint6)
@@ -6521,6 +6534,64 @@ if FASTAPI_AVAILABLE:
         prog_id = str(body.get("program_id") or "").strip()
         if not prog_id:
             return JSONResponse({"error": "program_id required"}, status_code=400)
+        # ── 2026-08-28 addendum-52 RUN dispatcher ─────────────
+        # RUN_BACKEND=ros2_executor routes the run to the
+        # s10_140_executor package via ROS2 (out-of-tree in
+        # CodroidROS2). The Lua-push class of bugs (recoveryState=1
+        # palletize latch) cannot exist there — no Lua, no push,
+        # Pilz PTP/LIN trajectories streamed. Flag stays legacy_lua
+        # until F2.7 first-run acceptance, then flips by env
+        # override. Stub returns not_wired_yet with a specific
+        # reason so operator sees WHY the ROS2 path is chosen but
+        # unavailable; falling back to legacy_lua silently would
+        # defeat the acceptance signal.
+        if _RUN_BACKEND_ENV == "ros2_executor":
+            # Palletize quarantine also blocks ROS2 execution UNTIL
+            # slot computation moves executor-side (§3 of the
+            # cutover directive). Same 423 signal so the frontend
+            # copy renders the same badge.
+            if prog_id in _QUARANTINED_PROGRAM_IDS:
+                return JSONResponse({
+                    "ok": False,
+                    "outcome": {
+                        "kind":  "quarantined",
+                        "reason_code": "program_quarantined",
+                        "reason": _QUARANTINE_REASON,
+                        "detail": (
+                            f"Program {prog_id!r} is quarantined "
+                            "pending §644 + the executor-side slot "
+                            "computation migration. Pick a different "
+                            "program from the library."),
+                        "program_id": prog_id,
+                        "run_backend": "ros2_executor",
+                    },
+                }, status_code=423)
+            # Stub: the real dispatch will publish on
+            # /executor/run_request and await the goal completion
+            # via ROS2 action semantics. Wiring lands in the F2.7
+            # acceptance commit. Response shape kept parallel to
+            # the legacy path so the frontend outcome mapper is
+            # unchanged.
+            return JSONResponse({
+                "ok": False,
+                "outcome": {
+                    "kind": "ros2_executor_not_wired_yet",
+                    "reason_code": "ros2_executor_stub",
+                    "reason": (
+                        "RUN_BACKEND=ros2_executor is set but the "
+                        "s10_140_executor action client is not yet "
+                        "wired into the dashboard. F2.7 acceptance "
+                        "commit will land the wiring."),
+                    "detail": (
+                        "Set RUN_BACKEND=legacy_lua (or unset it) "
+                        "to route through the legacy Lua push path "
+                        "in the interim. Do NOT push quarantined "
+                        "palletize programs — see §640/§644."),
+                    "program_id": prog_id,
+                    "run_backend": "ros2_executor",
+                },
+            }, status_code=501)
+
         # Palletize quarantine — refuse BEFORE opening the file so
         # even a corrupt / deleted quarantined artifact still
         # refuses correctly.
@@ -8972,6 +9043,17 @@ if FASTAPI_AVAILABLE:
             "backend_start_unix": _START_TIME,
             "backend_uptime_s":   round(time.time() - _START_TIME, 1),
             "frontend_sha":       _read_frontend_git_sha(),
+            # 2026-08-28 addendum-52: which execution backend the
+            # dashboard is configured to route Run through. The
+            # frontend uses this to pick the auto-offer mode target
+            # (AUTO for legacy_lua vs REMOTE for ros2_executor per
+            # HARDWARE.md > Robot-mode code table). Flag ships
+            # unchanged (legacy) until F2.7 first-run acceptance;
+            # then flips by env override RUN_BACKEND=ros2_executor.
+            "run_backend":        _RUN_BACKEND_ENV,
+            "run_backend_target_mode":
+                                  "auto"   if _RUN_BACKEND_ENV == "legacy_lua"
+                                  else "remote",
         }
 
     @app.get("/api/programs")
