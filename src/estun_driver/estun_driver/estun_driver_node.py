@@ -3231,14 +3231,65 @@ class EstunCodroidDriver(Node):
                                 and self._last_posture_ts > pt):
                             dt = self._last_posture_ts - pt
                             if dt > 1e-4:
+                                worst_ratio = 0.0
+                                worst_i = -1
+                                worst_dq = 0.0
                                 for i in range(6):
                                     dq_dps = (self._joint_deg[i] - pj[i]) / dt
                                     dq_rps = math.radians(dq_dps)
-                                    if abs(dq_rps) > self._cart_joint_v_cap:
+                                    ratio = abs(dq_rps) / max(1e-6, self._cart_joint_v_cap)
+                                    if ratio > worst_ratio:
+                                        worst_ratio = ratio
+                                        worst_i     = i
+                                        worst_dq    = dq_rps
+                                # 2026-08-28 velocity scaling (not hard stop).
+                                # Operator directive: cartesian holds must
+                                # survive near-limit wrist geometry — scale
+                                # the cart magnitude so the demanded joint
+                                # velocity fits under the per-joint cap
+                                # (factory-pendant behavior). Hard-stop is
+                                # RESERVED for axis-limit contact
+                                # (escape_only path) and true faults. See
+                                # HARDWARE.md > joint-velocity governor.
+                                if worst_ratio > 1.0 and worst_i >= 0:
+                                    # Aim ~15 % below the cap so a small
+                                    # kinematic wiggle doesn't retrigger.
+                                    target_scale = 0.85 / worst_ratio
+                                    target_scale = max(0.05, min(1.0, target_scale))
+                                    prev_soft = self._cart_softening
+                                    self._cart_softening = {
+                                        'active': True,
+                                        'cause':  'joint_overspeed',
+                                        'limiting_joint_1based': worst_i + 1,
+                                        'observed_dq_rps': worst_dq,
+                                        'cap_rps': self._cart_joint_v_cap,
+                                        'scale':  target_scale,
+                                    }
+                                    emitted = self._apply_cart_speed_scale_locked(
+                                        target_scale,
+                                        f'joint_overspeed_J{worst_i+1}')
+                                    if emitted or prev_soft is None \
+                                            or (prev_soft.get('cause') !=
+                                                'joint_overspeed'):
+                                        self.get_logger().warn(
+                                            f'joint-overspeed scaling J{worst_i+1}: '
+                                            f'dq={worst_dq:+.2f} rad/s '
+                                            f'(cap {self._cart_joint_v_cap:.2f}) '
+                                            f'→ scale={target_scale:.2f}')
+                                    # Escape hatch: if scaling exhausted (we
+                                    # asked for near-zero but STILL over cap
+                                    # after a couple of ticks), hard-stop
+                                    # with a NAMED cause so the operator
+                                    # still gets a truthful refusal.
+                                    if (target_scale < 0.08 and worst_ratio > 3.0
+                                            and abs(self._cart_last_sent_speed) < 0.05):
                                         self._stop_jog_locked(
-                                            reason=f'joint overspeed guard J{i+1} '
-                                                   f'{dq_rps:+.2f} rad/s '
-                                                   f'(cap {self._cart_joint_v_cap:.2f})')
+                                            reason=(
+                                                f'joint overspeed guard J{worst_i+1} '
+                                                f'{worst_dq:+.2f} rad/s '
+                                                f'(cap {self._cart_joint_v_cap:.2f}) — '
+                                                'scaling exhausted, kinematics '
+                                                'unrecoverable at this pose'))
                                         return
                         # If σ is in the scaling zone, ramp the commanded
                         # speed. The captured protocol rejects a fresh

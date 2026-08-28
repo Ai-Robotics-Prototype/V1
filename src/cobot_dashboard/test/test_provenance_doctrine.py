@@ -833,6 +833,83 @@ def test_operator_copy_covers_every_stop_tag():
         'fallback is the very thing this doctrine kills.')
 
 
+# ── 2026-08-28 wrist-friendly cart holds ──────────────────────
+
+def test_cart_hold_scales_not_stops_on_joint_overspeed():
+    """Operator directive (2026-08-28): cartesian holds must not
+    hard-stop when a joint's required velocity approaches its cap.
+    The driver SCALES the commanded magnitude via
+    _apply_cart_speed_scale_locked; hard-stop is reserved for true
+    axis-limit contact + scaling-exhausted fault. Regression here
+    would restore the "4 stops in 2 min" wrist-hold class."""
+    src = _driver_src()
+    # Find the joint-overspeed decision block (posture-derivative
+    # backstop inside _on_jog_supervise).
+    m = re.search(
+        r"# 2026-08-28 velocity scaling.*?target_scale\s*=",
+        src, re.DOTALL)
+    assert m, ('velocity-scaling block not found in driver source — '
+               'regression: the "hard-stop on overspeed" path is back.')
+    tail = src[m.start(): m.start() + 4000]
+    # Must call the shared scaling helper.
+    assert '_apply_cart_speed_scale_locked' in tail, (
+        'joint-overspeed block must delegate to '
+        '_apply_cart_speed_scale_locked — do not reimplement the '
+        'stopJog + fresh Robot/jog dance.')
+    # cart_softening carries the cause + limiting joint so the
+    # frontend toast can name them.
+    assert "'cause':" in tail and "joint_overspeed" in tail
+    assert "limiting_joint_1based" in tail
+    # Hard-stop escape hatch must survive but ONLY on
+    # scaling-exhausted conditions (target_scale near 0, ratio
+    # extreme, last-sent speed already tiny).
+    escape = re.search(
+        r"target_scale\s*<\s*0\.08.*?_stop_jog_locked",
+        tail, re.DOTALL)
+    assert escape, (
+        'the exhausted-scaling hard-stop escape hatch must remain '
+        'so a truly unrecoverable pose still produces a named refusal.')
+
+
+def test_cart_softening_toast_and_wrist_indicator_present():
+    """The operator directive requires visible, immediate signaling
+    when the cart governor engages AND a persistent affordance for
+    wound wrists. Two components, both mounted at the App level so
+    they see the state regardless of which page is open."""
+    app_p = os.path.join(WS, 'src', 'cobot_dashboard', 'frontend',
+                         'src', 'App.jsx')
+    with open(app_p) as fh:
+        app = fh.read()
+    assert '<CartSofteningToast' in app
+    assert '<WristWindIndicator' in app
+
+    cst_p = os.path.join(WS, 'src', 'cobot_dashboard', 'frontend',
+                         'src', 'components', 'CartSofteningToast.jsx')
+    assert os.path.isfile(cst_p)
+    with open(cst_p) as fh:
+        cst = fh.read()
+    # Reads robot.cart_softening (the driver's exposed blob).
+    assert 'cart_softening' in cst
+    # Actionable copy for the operator's frequent flier.
+    assert 'joint_overspeed' in cst
+    # 'Slowed' language — the operator's ear expects this pattern.
+    assert 'Slowed' in cst
+
+    wwi_p = os.path.join(WS, 'src', 'cobot_dashboard', 'frontend',
+                         'src', 'components', 'WristWindIndicator.jsx')
+    assert os.path.isfile(wwi_p)
+    with open(wwi_p) as fh:
+        wwi = fh.read()
+    # Watches J4 + J6 explicitly. A silent partial coverage
+    # (e.g., only J6) would still let the operator wind J4
+    # invisibly.
+    assert re.search(r"WRIST_JOINTS\s*=\s*\[\s*4\s*,\s*6\s*\]", wwi)
+    # Threshold matches HARDWARE.md.
+    assert '150' in wwi
+    # Unwind direction is named ("+J6" / "−J6"), not generic.
+    assert 'unwind' in wwi.lower()
+
+
 def test_frontend_run_modal_offers_switch_to_auto():
     """Run Program must transparently offer "Switch to Auto and
     run?" when the arm is not in AUTO — the operator never sees

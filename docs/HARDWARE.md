@@ -383,6 +383,39 @@ confirm; the driver's `_on_mode_command` pre-checks `enabled` and
 refuses standalone with `reason_code=arm_enabled_interlock` so a
 raw call surfaces the rule instead of silently timing out.
 
+## Joint-velocity governor (cartesian holds, 2026-08-28)
+
+`cart_joint_velocity_cap_radps` (default 1.5 rad/s per joint)
+bounds every posture-derivative velocity during a cartesian
+hold. When any joint's observed |dq/dt| approaches the cap, the
+driver **SCALES** the commanded cart magnitude via
+`_apply_cart_speed_scale_locked` — it does NOT hard-stop.
+
+Scaling formula (see `_on_jog_supervise` cart branch):
+
+    worst_ratio = max_i(|dq_i| / cap)
+    if worst_ratio > 1.0:
+        scale = 0.85 / worst_ratio   # 15 % margin under the cap
+        apply(scale)                  # stopJog + fresh Robot/jog
+
+Hard-stop is reserved for:
+- **Axis-limit contact** — joint reached its escape-only or hard
+  limit (existing `joint_limit` / `joint_limit_deeper` path).
+- **Scaling exhausted** — after target_scale ≤ 0.08 AND
+  worst_ratio > 3.0 AND the last-sent speed is already < 0.05,
+  the pose is unrecoverable; the driver hard-stops with the
+  named `joint_overspeed` tag suffixed `— scaling exhausted`.
+
+Frontend surface: `robot.cart_softening.cause` reads either
+`joint_overspeed` (this governor) or `governor` (singularity σ_min
+governor). `CartSofteningToast` fires an operator-visible warning
+on the null→active transition; `WristWindIndicator` renders a
+persistent pill when J4 or J6 exceeds ±150° with a one-tap
+unwind suggestion.
+
+Doctrine tests: `test_cart_hold_scales_not_stops` +
+`test_cart_softening_toast_and_wrist_indicator_present`.
+
 ## Runtime motion-command constraints
 
 - **Per-cycle acceleration limit ≈ 25 rad/s²** enforced by the CC10-A

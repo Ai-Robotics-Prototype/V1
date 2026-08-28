@@ -13,6 +13,8 @@ import HardStopToast from './components/HardStopToast'
 import DeployStatusBanner from './components/DeployStatusBanner'
 import StaleGuard from './components/StaleGuard'
 import StaleOverrideIndicator from './components/StaleOverrideIndicator'
+import CartSofteningToast from './components/CartSofteningToast'
+import WristWindIndicator from './components/WristWindIndicator'
 import PausedPresenter from './components/PausedPresenter'
 import ViewportDebug from './components/ViewportDebug'
 import JogDebugPanel from './components/JogDebugPanel'
@@ -227,6 +229,14 @@ export default function App() {
             running without the guard's guarantee — clear by
             clicking the pill. */}
         <StaleOverrideIndicator />
+        {/* 2026-08-28 wrist-friendly hold: toast the moment
+            cartesian scaling engages so the operator hears
+            "slowed — J6 near its speed limit" without needing
+            the Event Log. */}
+        <CartSofteningToast />
+        {/* Persistent wrist-wind indicator when J4/J6 exceed
+            ±150°. Silent otherwise. */}
+        <WristWindIndicator />
         <ViewportDebug />
         <JogDebugPanel />
       </div>
