@@ -57,6 +57,48 @@ command -v sha256sum >/dev/null || { echo "sha256sum required"; exit 2; }
 
 sha12() { sha256sum "$1" | cut -c1-12; }
 
+# ── Dirty-tree refusal (2026-08-28, stale-class close) ───────────
+# "A deploy without a SHA is not a deploy." Production serving
+# unnamed code violates the entire provenance chain: the deploy_log
+# stamps HEAD, but the running code differs. Every subsequent
+# staleness diagnosis is corrupted by that one anonymity.
+#
+# HARD-FAIL unless ALLOW_DIRTY=1 is explicitly set (ALLOW_MOCK
+# pattern). Refusal is loud, named, and written to /opt/cobot/
+# deploy_log.jsonl so /api/deploy_status renders red with a
+# concrete reason instead of the operator wondering why nothing
+# happened.
+step "Working tree cleanliness"
+DIRTY_FILES=$(cd "$WS" && git status --porcelain 2>/dev/null | head -20)
+if [[ -n "$DIRTY_FILES" ]]; then
+    if [[ "${ALLOW_DIRTY:-0}" == "1" ]]; then
+        warn "working tree is dirty — proceeding under ALLOW_DIRTY=1"
+        printf "    modified files:\n"
+        printf "    %s\n" "$DIRTY_FILES" | sed 's/^/    /'
+    else
+        HEAD_SHA=$(cd "$WS" && git rev-parse HEAD 2>/dev/null || echo "unknown")
+        # Best-effort append to deploy_log so the UI banner shows
+        # a named refusal instead of "deploy just didn't run".
+        {
+            printf '{"ts": "%s", "phase": "fail", "sha": "%s", ' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$HEAD_SHA"
+            printf '"step": "dirty_tree_refused", "exit_code": "2", '
+            printf '"reason": "working tree has uncommitted changes; '
+            printf 'set ALLOW_DIRTY=1 to override (a deploy without a '
+            printf 'SHA is not a deploy)", "detail": "%s"}\n' \
+                "$(printf '%s' "$DIRTY_FILES" | tr '\n' ';' | tr -d '"')"
+        } >> /opt/cobot/deploy_log.jsonl 2>/dev/null || true
+        printf "\n  ${RED}✗${RST} REFUSED: working tree is dirty.\n"
+        printf "    A deploy without a SHA is not a deploy.\n"
+        printf "    Commit or stash first, or set ALLOW_DIRTY=1 to override.\n"
+        printf "    Modified:\n"
+        printf "%s\n" "$DIRTY_FILES" | sed 's/^/      /'
+        exit 2
+    fi
+else
+    pass "working tree clean at $(cd "$WS" && git rev-parse --short HEAD 2>/dev/null)"
+fi
+
 # ── 1. Frontend build (if needed) ────────────────────────────────
 #
 # Build-needed decision: CONTENT HASH of the frontend source tree
@@ -261,6 +303,48 @@ if [[ "$BOOT_SHA" == "$DISK_SHA" && "$API_STALE" == "False" ]]; then
 else
     fail "codegen still stale — boot=$BOOT_SHA disk=$DISK_SHA. \
 Restart may have raced with the fs write; re-run scripts/deploy.sh."
+fi
+
+# ── 3b. Backend provenance: running-process SHA == deployed HEAD ─
+# (2026-08-28 stale-class close) Kills the "surviving-old-worker
+# ghost" — a restart may issue but a stale python3 could still be
+# holding :8080. /api/provenance returns _BACKEND_GIT_SHA baked at
+# import time; must match `git rev-parse HEAD` post-deploy.
+step "Backend provenance == deployed HEAD"
+HEAD_SHA=$(cd "$WS" && git rev-parse HEAD 2>/dev/null || echo "unknown")
+PROVENANCE=$(curl -sk --max-time 3 "$DASHBOARD_URL/api/provenance" || echo '{}')
+RUNNING_SHA=$(echo "$PROVENANCE" | python3 -c \
+    'import sys,json;print(json.load(sys.stdin).get("backend_sha",""))' 2>/dev/null || echo "")
+# Strip -dirty suffix for the equality test (dirty deploys are
+# allowed under ALLOW_DIRTY; provenance still records the -dirty).
+RUNNING_SHA_BARE="${RUNNING_SHA%-dirty}"
+printf "    head    : %s\n    running : %s\n" "$HEAD_SHA" "$RUNNING_SHA"
+if [[ -z "$RUNNING_SHA" ]]; then
+    fail "backend provenance missing — /api/provenance did not return backend_sha"
+elif [[ "$RUNNING_SHA_BARE" == "$HEAD_SHA" ]]; then
+    pass "backend running == deployed HEAD ($HEAD_SHA)"
+else
+    fail "backend still on $RUNNING_SHA — restart did not take (surviving old worker?). \
+Re-run scripts/deploy.sh or investigate systemd status."
+fi
+
+# ── 3c. Frontend provenance: served bundle SHA == deployed HEAD ──
+# The vite writeSidecarPlugin writes dist/.build-sha with the git
+# SHA it was built against. Must match HEAD too — a stale bundle
+# on disk is the exact opposite failure from a stale backend, and
+# both need to be caught.
+step "Frontend provenance == deployed HEAD"
+BUNDLE_ID_RESP=$(curl -sk --max-time 3 "$DASHBOARD_URL/api/build_id" || echo '{}')
+FRONTEND_SHA=$(echo "$BUNDLE_ID_RESP" | python3 -c \
+    'import sys,json;print(json.load(sys.stdin).get("frontend_sha",""))' 2>/dev/null || echo "")
+FRONTEND_SHA_BARE="${FRONTEND_SHA%-dirty}"
+printf "    head     : %s\n    frontend : %s\n" "$HEAD_SHA" "$FRONTEND_SHA"
+if [[ -z "$FRONTEND_SHA" || "$FRONTEND_SHA" == "unknown" ]]; then
+    fail "frontend provenance missing — dist/.build-sha not written by vite build"
+elif [[ "$FRONTEND_SHA_BARE" == "$HEAD_SHA" ]]; then
+    pass "frontend bundle == deployed HEAD ($HEAD_SHA)"
+else
+    fail "frontend bundle SHA $FRONTEND_SHA != HEAD $HEAD_SHA — vite build did not rebuild against the new HEAD."
 fi
 
 # Served asset check runs regardless of whether we built: the

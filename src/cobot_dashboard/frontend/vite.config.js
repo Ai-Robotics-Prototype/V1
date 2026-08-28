@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { execSync } from 'child_process'
+import { writeFileSync } from 'fs'
+import { resolve } from 'path'
 
 // Footer identity — `git describe --always --dirty` at build time. Always
 // emits SOMETHING (falls back to the short hash when no tags exist) and
@@ -16,6 +18,22 @@ const buildId = (() => {
   catch { return 'dev' }
 })()
 
+// Raw git SHA — the L257 like-for-like tell (2026-08-28). __BUILD_ID__
+// above uses `git describe`, which is human-friendly but not equal
+// shape to a bare `git rev-parse HEAD` string. The provenance handshake
+// (WS reconnect / footer verdict) compares SHA-to-SHA between backend
+// and frontend; both sides must emit the same shape or the compare is
+// meaningless. Bake the raw SHA (40 hex) here + write it to a sidecar
+// dist/.build-sha so the backend can read it too. `-dirty` suffix is
+// preserved on dirty builds so a mismatch survives the diff.
+const rawSha = (() => {
+  try {
+    const sha = execSync('git rev-parse HEAD').toString().trim()
+    const dirty = execSync('git status --porcelain').toString().trim() !== ''
+    return dirty ? `${sha}-dirty` : sha
+  } catch { return 'unknown' }
+})()
+
 // Kept for backwards-compat with existing footer code that reads both;
 // same content as buildId now.
 const commitHash = buildId
@@ -24,12 +42,29 @@ const dirtyFlag = ''   // buildId already carries the -dirty suffix
 // Second-precision build time — the per-build freshness signal.
 const buildTime = new Date().toISOString().slice(0, 19).replace('T', ' ')
 
+// Sidecar-write plugin — dist/.build-sha carries the raw git SHA so
+// dashboard_server can read the frontend's SHA at request time (the JS
+// bundle bakes its own copy for the client-side handshake). Written on
+// every build, EMPTY-file safe if git fails.
+const writeSidecarPlugin = {
+  name: 'cobot-build-sha-sidecar',
+  writeBundle(options) {
+    const outDir = options.dir || resolve(process.cwd(), 'dist')
+    try {
+      writeFileSync(resolve(outDir, '.build-sha'), rawSha + '\n')
+    } catch (e) {
+      console.warn('[vite] failed to write .build-sha sidecar:', e.message)
+    }
+  },
+}
+
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), writeSidecarPlugin],
   define: {
     __COMMIT__:     JSON.stringify(commitHash + dirtyFlag),
     __BUILD_TIME__: JSON.stringify(buildTime),
     __BUILD_ID__:   JSON.stringify(buildId),
+    __GIT_SHA__:    JSON.stringify(rawSha),   // 2026-08-28: like-for-like
   },
   build: {
     // dist/ is vite's canonical outDir; dashboard_server serves from

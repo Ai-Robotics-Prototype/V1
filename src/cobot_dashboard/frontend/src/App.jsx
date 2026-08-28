@@ -11,6 +11,7 @@ import ObstacleEscapeModal from './components/ObstacleEscapeModal'
 import SelfCollisionWarnBanner from './components/SelfCollisionWarnBanner'
 import HardStopToast from './components/HardStopToast'
 import DeployStatusBanner from './components/DeployStatusBanner'
+import StaleGuard from './components/StaleGuard'
 import PausedPresenter from './components/PausedPresenter'
 import ViewportDebug from './components/ViewportDebug'
 import JogDebugPanel from './components/JogDebugPanel'
@@ -215,6 +216,11 @@ export default function App() {
             and shows the red. */}
         <PausedPresenter />
         <DeployStatusBanner />
+        {/* StaleGuard is a BLOCKING modal — mounted last so it
+            paints above every other panel/toast/banner. Rendering
+            an empty tree when no mismatch → cost of the mount is
+            a single subscription to useStore.staleProvenance. */}
+        <StaleGuard />
         <ViewportDebug />
         <JogDebugPanel />
       </div>

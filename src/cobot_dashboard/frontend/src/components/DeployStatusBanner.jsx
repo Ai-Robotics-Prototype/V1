@@ -2,11 +2,20 @@
 // (2026-07-31 directive: "a failed deploy is a red banner on
 // every client, not a silent nothing").
 //
-// Reads /api/deploy_status every 3s. Four operator-facing states:
-//   * green   "current (<hash>, <age>)"   — last deploy ok, quiet
-//   * blue    "deploying…"                — start/building in-flight
-//   * amber   "deploy waiting for idle"   — path fired but arm busy
-//   * red     "DEPLOY FAILED: <step>"     — last deploy failed
+// 2026-08-28 stale-class close: verdict is now composed on the
+// server (/api/deploy_status.provenance.verdict) across three
+// layers — deploy_log phase, backend SHA, frontend SHA. Green
+// ONLY when all three agree with the deploy_log's sha; any
+// mismatch renders red with the NAMED failing layer (never green
+// while any layer is drifting).
+//
+// Reads /api/deploy_status every 3s. Operator-facing states:
+//   * green   "current — <hash8> · <age>"   — all three layers ok
+//   * blue    "deploying — <phase>"          — start/building in-flight
+//   * amber   "deploy waiting for idle"     — path fired but arm busy
+//   * amber   "frontend stale — <before>→<after>" — silent rebuild skip
+//   * red     "DEPLOY FAILED: <step>"        — deploy_log fail
+//   * red     "STALE: <layer(s)>"            — layers drift (backend/frontend)
 //
 // Non-blocking. Position: bottom-right, pinned. Height stays under
 // 32px so the tablet footer chrome isn't disrupted.
@@ -53,16 +62,38 @@ export default function DeployStatusBanner() {
   const state = status.state
   const last  = status.last_ok
   const latest = status.latest || {}
+  const prov = status.provenance || {}
+  const verdict = prov.verdict || state
+  const failing = prov.failing_layers || []
 
   let bg, fg, border, label, title
-  if (state === 'current') {
-    const hash = String(last?.served_asset_after
+  // 2026-08-28: layers-drift RED comes BEFORE the state-derived
+  // branches so a backend/frontend SHA mismatch that landed WITHOUT
+  // a deploy_log fail (surviving old worker after ostensibly-ok
+  // deploy) doesn't get papered over with a green pill.
+  if (verdict === 'red' && failing.length > 0 && state === 'current') {
+    bg = '#7F1D1D'; fg = '#FEE2E2'; border = '#DC2626'
+    const layers = failing.join('+')
+    const expected = (prov.deploy_sha || '?').slice(0, 8)
+    const backend  = (prov.backend_sha  || '?').slice(0, 8)
+    const frontend = (prov.frontend_sha || '?').slice(0, 8)
+    label = `✗ STALE: ${layers} (expected ${expected})`
+    title = `Provenance mismatch — deploy_log says ${expected}, `
+          + `backend=${backend}, frontend=${frontend}. `
+          + `Failing layers: ${failing.join(', ')}. `
+          + `Restart may not have taken (surviving old worker) or the frontend rebuild skipped.`
+  } else if (state === 'current') {
+    const hash = String(prov.deploy_sha
+                     || last?.served_asset_after
                      || last?.sha
                      || '?').slice(0, 8)
     const age  = fmtAgeFromIso(last?.ts)
     bg = '#064E3B'; fg = '#D1FAE5'; border = '#065F46'
     label = `✓ current — ${hash} · ${age}`
-    title = `Last successful deploy: served asset ${last?.served_asset_after || '?'} · ${last?.ts || ''}`
+    title = `All three layers agree at ${prov.deploy_sha || '?'} — `
+          + `deploy=ok, backend=${(prov.backend_sha || '?').slice(0, 8)}, `
+          + `frontend=${(prov.frontend_sha || '?').slice(0, 8)}. `
+          + `Last successful deploy: ${last?.ts || ''}`
   } else if (state === 'deploying') {
     bg = '#1E3A8A'; fg = '#DBEAFE'; border = '#3B82F6'
     const phase = latest.phase === 'building' ? 'building…' : 'starting…'

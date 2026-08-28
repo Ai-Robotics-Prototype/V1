@@ -56,6 +56,17 @@ const storeDefinition = (set, get) => ({
   // path is responsible for the initial fetch. Reconnect: the
   // onopen handler triggers a defensive refetch.
   _hasConnectedOnce: false,
+  // ── Provenance handshake state (2026-08-28 stale-class close) ──
+  // `staleProvenance` non-null → StaleGuard renders a BLOCKING
+  // full-screen overlay "reload required" (not dismissible; the
+  // dismissible toast class was ignored). Shape:
+  //   { layer: 'frontend'|'backend', expected, actual, detectedAt }
+  // `_lastSeenBackendSha` tracks the previous hello's backend_sha
+  // so a mid-session backend restart (different SHA on reconnect)
+  // also latches staleProvenance without needing a page reload
+  // to detect.
+  staleProvenance: null,
+  _lastSeenBackendSha: null,
   // Reconcile log — session-only ring of {ts, kind, detail}
   // recording every WS open/close, visibility resume, reconcile
   // start/done event. Capped at 64. Directive (2026-07-31): "log
@@ -473,6 +484,42 @@ const storeDefinition = (set, get) => ({
     ws.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data)
+        // ── Provenance hello (2026-08-28 stale-class close) ──
+        // Server pushes {type:'hello',backend_sha,frontend_sha}
+        // immediately after accept. Compare frontend_sha to our
+        // OWN __GIT_SHA__ (baked at build time by vite). If they
+        // differ → our tab is stale — the server has been redeployed
+        // with a new frontend since this tab loaded. Set
+        // `staleProvenance` so StaleGuard shows a BLOCKING overlay
+        // (not a dismissible toast). Also latch on backend SHA
+        // change across two hellos — a reconnect after backend
+        // restart means the running python3 is a different build.
+        if (msg && msg.type === 'hello') {
+          const mySha = (typeof __GIT_SHA__ !== 'undefined')
+                          ? __GIT_SHA__ : 'unknown'
+          const bareSelf   = String(mySha).replace(/-dirty$/, '')
+          const bareFrontS = String(msg.frontend_sha || '').replace(/-dirty$/, '')
+          const bareBackS  = String(msg.backend_sha  || '').replace(/-dirty$/, '')
+          const prevBack   = get()._lastSeenBackendSha
+          set({ _lastSeenBackendSha: bareBackS })
+          const frontendStale =
+            bareSelf !== 'unknown'
+            && bareFrontS && bareFrontS !== 'unknown'
+            && bareSelf !== bareFrontS
+          const backendChanged =
+            prevBack && bareBackS && prevBack !== bareBackS
+          if (frontendStale || backendChanged) {
+            set({
+              staleProvenance: {
+                layer:    frontendStale ? 'frontend' : 'backend',
+                expected: frontendStale ? bareSelf : prevBack,
+                actual:   frontendStale ? bareFrontS : bareBackS,
+                detectedAt: Date.now(),
+              },
+            })
+          }
+          return   // hello isn't a state frame; nothing else to do
+        }
         const now = Date.now()
         // wsLatency estimates one-way (server-emit → client-receive)
         // delay, but msg.t is the server's Date.now() (Jetson clock)

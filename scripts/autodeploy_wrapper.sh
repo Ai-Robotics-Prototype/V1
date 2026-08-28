@@ -88,6 +88,24 @@ EOF
 start_ts=$(date +%s)
 log_entry "start" trigger=path_unit
 
+# ── Dirty-tree refusal (2026-08-28, stale-class close) ──────────
+# Mirrors deploy.sh's own guard so the wrapper writes a NAMED
+# failure to deploy_log instead of watching deploy.sh exit(2) and
+# reporting step="unknown". ALLOW_DIRTY=1 overrides (ALLOW_MOCK
+# pattern). A deploy without a SHA is not a deploy.
+DIRTY_FILES=$(cd "$WS" && git status --porcelain 2>/dev/null | head -20)
+if [[ -n "$DIRTY_FILES" && "${ALLOW_DIRTY:-0}" != "1" ]]; then
+    dirty_detail=$(printf '%s' "$DIRTY_FILES" | tr '\n' ';' | tr -d '"')
+    log_entry "fail" \
+        step="dirty_tree_refused" \
+        exit_code="2" \
+        reason="working tree has uncommitted changes; set ALLOW_DIRTY=1 to override" \
+        detail="$dirty_detail"
+    echo "REFUSED: dirty working tree. Commit or set ALLOW_DIRTY=1." >&2
+    echo "$DIRTY_FILES" >&2
+    exit 2
+fi
+
 waited=0
 while ! is_idle; do
     if (( waited == 0 )); then

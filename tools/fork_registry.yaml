@@ -721,34 +721,28 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3858
+        line: 3928
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
           Pinned by test_jog_hold_heartbeat.py. 2026-08-19: line
           shifted from 3363→3601 by the CRI-proxy commit. 2026-08-27:
-          shifted to 3852 (stripped-comment count; raw grep line 4029)
-          across the session's stack: motion arbiter helpers +
-          refuse-jog/refuse-run wrappers (JOG-11, add-45 §599,
-          ~90 lines), twin phantom-feedback class fix (JOG_BACKEND
-          gating + all-zeros quarantine + module-scope counters +
-          helpers, add-47 §612, ~50 lines), plus intermediate
-          additions from add-46 §603 doctrine setup. 2026-08-28:
-          shifted to 3858 by the _state_lock RLock fix (dashboard-
-          wide self-deadlock cure — 7-line comment block added at
-          the module-scope lock definition). Both new gates land
+          shifted to 3852. 2026-08-28 morning: shifted to 3858 by
+          the _state_lock RLock fix. 2026-08-28 later: shifted to
+          3928 by the stale-class provenance stack (backend SHA
+          bake + /api/provenance + WS hello frame + deploy_status
+          three-layer verdict — ~70 lines). Both new gates land
           BEFORE the route body — the jog_hold_heartbeat pairing
           invariant is preserved.
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3993
+        line: 4063
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Pinned by test_jog_hold_heartbeat.py. 2026-08-19:
-          line shifted 3493→3731. 2026-08-27: shifted to 3987
-          (stripped-comment count; raw grep line 4172) — same session
-          stack as /cmd/jog above. 2026-08-28: shifted to 3993 by
-          the _state_lock RLock fix (see /cmd/jog entry above).
+          3493→3731. 2026-08-27: 3987. 2026-08-28 morning: 3993 by
+          the RLock fix. 2026-08-28 later: 4063 by the provenance
+          stack (see /cmd/jog entry above).
         owner: dashboard-transport
       - path: src/cobot_dashboard/frontend/src/lib/holdTicker.js
         line: 0
@@ -1219,6 +1213,63 @@ capabilities:
 # frontend JS/JSX file. Any hit surfaces as a WARNING (review-required)
 # — not a gate failure — because the false-positive rate is real
 # (general geometry in orient.js / IKGizmo.jsx is legitimate). The
+
+  # 26. Provenance (2026-08-28 stale-class close). One canonical
+  # source of the running-code identity — backend git SHA, backend
+  # start time, frontend git SHA. Everything the operator sees
+  # about "what's running" reads from this capability.
+  - id: provenance
+    description: >
+      Every layer where "what's running" could diverge from "what
+      the operator believes" reads from ONE provenance source.
+      Baked at import time in dashboard_server:
+        _BACKEND_GIT_SHA     ← COBOT_BACKEND_SHA env or git HEAD
+        _BACKEND_START_ISO   ← time.gmtime(_START_TIME)
+        _read_frontend_git_sha()  ← dist/.build-sha sidecar
+      Exposed at /api/provenance and mirrored on /health.
+      /api/deploy_status composes a three-layer verdict:
+        deploy_log latest.phase + backend_sha + frontend_sha,
+      all compared to the deploy_log latest.sha; any mismatch
+      surfaces failing_layers and verdict='red' — never a false
+      green.
+      /ws/state pushes {type:'hello', backend_sha, frontend_sha}
+      immediately after accept; frontend compares to its own
+      compile-time __GIT_SHA__ and shows the BLOCKING StaleGuard
+      overlay on mismatch (dismissible toast retired).
+      Deploy scripts refuse a dirty working tree unless
+      ALLOW_DIRTY=1; a deploy without a SHA is not a deploy.
+
+      Fork rule: any second "what's the running SHA" surface — a
+      mock provenance module, a second /health handler, a separate
+      frontend build-id file that the WS hello does not consult —
+      is a fork. All three layers (backend, frontend, deploy)
+      compare git-SHA to git-SHA (L257 like-for-like); nothing
+      else.
+    canonical:
+      python:
+        module: cobot_dashboard.dashboard_server
+        functions: [_read_backend_git_sha, _read_frontend_git_sha,
+                    api_provenance, api_deploy_status]
+      javascript:
+        module: src/cobot_dashboard/frontend/src/components/StaleGuard.jsx
+        exports: [StaleGuard]
+      route:
+        method: GET
+        path: /api/provenance
+      file:
+        path: src/cobot_dashboard/frontend/dist/.build-sha
+    forbidden:
+      # No second implementation of the frontend-SHA read. Anything
+      # that greps a git SHA out of a frontend asset OUTSIDE of
+      # _read_frontend_git_sha is a fork of that seam.
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          - "\\.build-sha"
+        path_exempt:
+          - '**/dashboard_server.py'
+          - '**/test_*.py'
+    known_debt: []
+
 # reviewer either:
 #
 #   * adds a real registry entry (patterns tuned, path_exempt filled),

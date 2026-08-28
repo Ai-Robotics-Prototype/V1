@@ -115,6 +115,55 @@ except ImportError:
 _START_TIME = time.time()
 _THIS_DIR = Path(__file__).resolve().parent
 _STATIC_DIR = _THIS_DIR.parent / "frontend" / "dist"
+
+# ── Provenance (2026-08-28, stale-class close) ──────────────────────
+# Every deploy verification, WS handshake, and footer verdict compares
+# git SHA to git SHA — never chunk-hash to git-SHA (L257 like-for-like
+# violation). Two constants baked at import:
+#
+#   _BACKEND_GIT_SHA — from COBOT_BACKEND_SHA env (set by deploy.sh
+#                      or systemd drop-in), else best-effort
+#                      `git rev-parse HEAD` from the workspace tree,
+#                      else 'unknown'. Suffix '-dirty' if the tree
+#                      had uncommitted changes at import time.
+#   _BACKEND_START_ISO — iso8601 UTC, second precision.
+#
+# Exposed on /health and /api/provenance; deploy.sh asserts equality
+# against the just-deployed HEAD after restart to catch the
+# surviving-old-worker ghost.
+def _read_backend_git_sha() -> str:
+    env = os.environ.get("COBOT_BACKEND_SHA", "").strip()
+    if env:
+        return env
+    try:
+        import subprocess as _sp
+        ws = _THIS_DIR.parent.parent.parent  # src/cobot_dashboard/cobot_dashboard/ → ws
+        sha = _sp.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(ws),
+            stderr=_sp.DEVNULL, timeout=2).decode().strip()
+        dirty = _sp.check_output(
+            ["git", "status", "--porcelain"], cwd=str(ws),
+            stderr=_sp.DEVNULL, timeout=2).decode().strip() != ""
+        return f"{sha}-dirty" if dirty else sha
+    except Exception:
+        return "unknown"
+
+_BACKEND_GIT_SHA = _read_backend_git_sha()
+_BACKEND_START_ISO = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_START_TIME))
+
+
+def _read_frontend_git_sha() -> str:
+    """Read the frontend bundle's git SHA from dist/.build-sha (written
+    by the vite writeSidecarPlugin at build time). Returns 'unknown'
+    when the sidecar is missing (dev-mode / fresh checkout)."""
+    try:
+        p = _STATIC_DIR / ".build-sha"
+        if p.is_file():
+            return p.read_text(encoding="utf-8").strip() or "unknown"
+    except Exception:
+        pass
+    return "unknown"
+
 # Same path as _STATIC_DIR now — the historic mock_server/static override
 # was retired (vite.config outputs directly to dist/, we serve from dist/).
 # Kept as a named reference because System Check reads both; comparison
@@ -3488,6 +3537,29 @@ if FASTAPI_AVAILABLE:
     @app.websocket("/ws/state")
     async def ws_state(websocket: WebSocket):
         await websocket.accept()
+        # ── Provenance hello (2026-08-28 stale-class close) ──
+        # First frame after accept carries the backend+frontend SHAs
+        # baked at server import time. Client compares to its own
+        # compile-time __GIT_SHA__; on mismatch a BLOCKING full-
+        # screen overlay fires ("reload required" — not a
+        # dismissible toast the operator learned to ignore). Sent
+        # on every connect so a reconnect after a deploy triggers
+        # the overlay without needing a special reconnect path.
+        try:
+            hello = json.dumps({
+                "type":         "hello",
+                "backend_sha":  _BACKEND_GIT_SHA,
+                "frontend_sha": _read_frontend_git_sha(),
+                "server_ts":    time.time(),
+                "start_iso":    _BACKEND_START_ISO,
+            })
+            await asyncio.wait_for(websocket.send_text(hello),
+                                   timeout=WS_SEND_TIMEOUT_S)
+        except Exception:
+            # Non-fatal — the state broadcaster below still functions
+            # even if the hello frame drops. Older clients ignore
+            # unknown `type` fields.
+            pass
         # ACK-gated per-client sender state — see comment at
         # _state_clients declaration. `new_event` fires when the
         # broadcaster overwrites `latest_txt`; `ack_event` fires when
@@ -4595,6 +4667,10 @@ if FASTAPI_AVAILABLE:
         return {
             "status": "ok", "ros": RCLPY_AVAILABLE, "mock": False,
             "uptime_s": round(time.time() - _START_TIME, 1),
+            # Provenance — like-for-like SHA comparands (2026-08-28).
+            "backend_sha":       _BACKEND_GIT_SHA,
+            "backend_start_iso": _BACKEND_START_ISO,
+            "frontend_sha":      _read_frontend_git_sha(),
             "clients_state": ns, "clients_lidar": nl, "clients_mesh": nm,
             "cam0_live": have_cam0, "cam1_live": have_cam1,
             "lidar_live": lidar_live, "lidar_pts": lidar_pts,
@@ -8224,10 +8300,58 @@ if FASTAPI_AVAILABLE:
             if e.get("phase") == "ok":
                 last_ok = e
                 break
+        # ── Three-layer provenance verdict (2026-08-28) ──────────
+        # Green ONLY when phase=ok AND both provenance layers match
+        # the deploy_log's sha. Any single failure surfaces as red
+        # with a NAMED failing layer, so the banner never renders
+        # green while any layer is drifting.
+        provenance = {
+            "deploy_phase":  phase,
+            "deploy_sha":    latest.get("sha") or "unknown",
+            "backend_sha":   _BACKEND_GIT_SHA,
+            "frontend_sha":  _read_frontend_git_sha(),
+        }
+        def _bare(s):
+            return (s or "").split("-dirty")[0]
+        expected = _bare(provenance["deploy_sha"])
+        backend_ok  = expected != "unknown" \
+                      and _bare(provenance["backend_sha"])  == expected
+        frontend_ok = expected != "unknown" \
+                      and _bare(provenance["frontend_sha"]) == expected
+        deploy_ok   = state == "current"
+        provenance["backend_ok"]  = backend_ok
+        provenance["frontend_ok"] = frontend_ok
+        provenance["deploy_ok"]   = deploy_ok
+        # Compose verdict + failing-layer name. Order the layers
+        # from "most upstream" to "most downstream" so the operator
+        # sees the ROOT failure named (deploy failed → backend
+        # follows; deploy ok + backend stale → surface the stale
+        # backend, not the deploy).
+        failing_layers = []
+        if not deploy_ok:
+            failing_layers.append("deploy")
+        if not backend_ok:
+            failing_layers.append("backend")
+        if not frontend_ok:
+            failing_layers.append("frontend")
+        provenance["failing_layers"] = failing_layers
+        # verdict: 'green' when ALL layers ok AND state=current;
+        # 'red' with named layers otherwise. 'stale', 'waiting',
+        # and 'deploying' pass through as-is — those are in-progress
+        # states, not stale-class failures.
+        if state == "current" and not failing_layers:
+            verdict = "green"
+        elif state in ("waiting", "deploying", "stale"):
+            verdict = state
+        else:
+            verdict = "red"
+        provenance["verdict"] = verdict
+
         return {
             "state":  state,
             "latest": latest,
             "last_ok": last_ok,
+            "provenance": provenance,
             # Small history slice for the debug panel if the operator
             # wants to inspect the trail (kept small so this endpoint
             # stays cheap).
@@ -8263,25 +8387,48 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/api/build_id")
     async def api_build_id():
-        """Return the currently-served frontend bundle's asset hash.
-        Client compares to its build-time __BUILD_ID__ and shows a
-        "new version — refresh" toast on mismatch.
+        """Return the currently-served frontend bundle's asset hash
+        AND its git SHA (2026-08-28 like-for-like refresh — the SHA
+        is the L257-compliant comparand; the chunk hash rides along
+        for the operator diagnostic panel).
 
-        Reads mock_server/static/index.html (the canonical served-
-        bundle location — same directory the deploy script checks)
-        for the /assets/index-<hash>.js link. Falls back to
-        'unknown' when the file isn't present."""
+        Reads _STATIC_DIR/index.html for /assets/index-<hash>.js.
+        Reads _STATIC_DIR/.build-sha (written by the vite
+        writeSidecarPlugin) for the frontend git SHA."""
         try:
             index = str(_STATIC_DIR / "index.html")
             if not os.path.isfile(index):
-                return {"bundle_id": "unknown"}
+                return {"bundle_id": "unknown",
+                        "frontend_sha": _read_frontend_git_sha()}
             with open(index) as f:
                 src = f.read()
             import re as _rx
             m = _rx.search(r"/assets/index-([A-Za-z0-9_-]+)\.js", src)
-            return {"bundle_id": (m.group(1) if m else "unknown")}
+            return {
+                "bundle_id":    (m.group(1) if m else "unknown"),
+                "frontend_sha": _read_frontend_git_sha(),
+            }
         except Exception:
-            return {"bundle_id": "unknown"}
+            return {"bundle_id": "unknown",
+                    "frontend_sha": _read_frontend_git_sha()}
+
+    # ── /api/provenance (2026-08-28 stale-class close) ──────────
+    # Canonical read for the WS handshake, the deploy verifier, and
+    # the footer's three-layer verdict. Cheap: two file reads +
+    # module-level constants; no locks, no ROS. Always returns the
+    # backend SHA + start time + frontend SHA (from dist/.build-sha)
+    # so the client can do like-for-like SHA-to-SHA comparison and
+    # the deploy verifier can assert running-process SHA == deployed
+    # HEAD.
+    @app.get("/api/provenance")
+    async def api_provenance():
+        return {
+            "backend_sha":        _BACKEND_GIT_SHA,
+            "backend_start_iso":  _BACKEND_START_ISO,
+            "backend_start_unix": _START_TIME,
+            "backend_uptime_s":   round(time.time() - _START_TIME, 1),
+            "frontend_sha":       _read_frontend_git_sha(),
+        }
 
     @app.get("/api/programs")
     async def api_programs_list():
