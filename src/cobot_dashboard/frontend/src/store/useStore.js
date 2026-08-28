@@ -67,6 +67,11 @@ const storeDefinition = (set, get) => ({
   // to detect.
   staleProvenance: null,
   _lastSeenBackendSha: null,
+  // Setter used by StaleGuard's override path (2026-08-28
+  // lockout escape hatch). Clears the mismatch record so the
+  // BLOCKING overlay unmounts — kept as a discrete action so a
+  // test can drive it without reaching into the raw set() API.
+  _setStaleProvenance(sp) { set({ staleProvenance: sp }) },
   // Reconcile log — session-only ring of {ts, kind, detail}
   // recording every WS open/close, visibility resume, reconcile
   // start/done event. Capped at 64. Directive (2026-07-31): "log

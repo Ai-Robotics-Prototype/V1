@@ -323,6 +323,98 @@ def test_fork_registry_has_provenance_capability():
 
 # ── Bash-level acceptance: dirty deploy exits 2 ──────────────────
 
+# ── 2026-08-28 lockout close: build-skip must not lie about SHA ──
+
+def test_deploy_sh_does_not_advance_build_sha_on_skip():
+    """The prior sidecar-advance-on-skip locked every open tab out
+    of the dashboard: server reported a frontend SHA the JS bundle
+    could not contain, StaleGuard fired on every fresh tab, and
+    the operator lost access to the deploy control surface used to
+    fix it. The sidecar records "which SHA vite built the bundle
+    against", period. This test refuses any patch that puts the
+    old `echo HEAD > .build-sha` line back."""
+    sh = _deploy_sh()
+    # No `> .build-sha` write in the build-skip branch (or anywhere
+    # in deploy.sh — vite's writeSidecarPlugin is the only writer).
+    assert not re.search(r'>\s*"?\$FRONTEND_OUT/\.build-sha"?', sh), (
+        'deploy.sh must not overwrite dist/.build-sha; only vite '
+        'writeSidecarPlugin (at build time) is allowed to write it. '
+        'Overwriting on build-skip lies about the JS bundle content.')
+
+
+def test_deploy_status_verdict_ignores_frontend_sha():
+    """`frontend_sha != deploy_sha` on a docs-only commit is honest
+    (vite legitimately skipped the build) — not a red-verdict
+    condition. StaleGuard is the correct staleness signal for the
+    operator's tab (client-side compare of baked __GIT_SHA__ to
+    WS-pushed frontend_sha; on docs commits, both are the last-
+    build SHA → no fire). The verdict must NOT include frontend in
+    failing_layers."""
+    src = _server_src()
+    # Find the verdict compose block.
+    m = re.search(
+        r'@app\.get\("/api/deploy_status"\).*?return \{',
+        src, re.DOTALL)
+    assert m
+    tail = src[m.start():m.start() + 6000]
+    # The failing_layers list is built ONLY from deploy and
+    # backend; frontend appears as advisory (frontend_ok) but NOT
+    # in the append list.
+    fl_block = re.search(
+        r'failing_layers\s*=\s*\[\](.*?)provenance\["failing_layers"\]',
+        tail, re.DOTALL)
+    assert fl_block, ('failing_layers compose block not found — the '
+                      'compose logic must be greppable so this rule '
+                      "can't silently regress.")
+    body = fl_block.group(1)
+    assert 'append("deploy")'   in body or "append('deploy')"   in body
+    assert 'append("backend")'  in body or "append('backend')"  in body
+    assert 'append("frontend")' not in body and "append('frontend')" not in body, (
+        'frontend_sha must NOT gate the verdict. Reporting it in '
+        'the provenance blob is fine — appending it to failing_layers '
+        'is what locked the operator out on 2026-08-28.')
+
+
+def test_stale_guard_has_escape_hatch():
+    """After N mount cycles against the same (expected, actual)
+    pair within the TTL window, StaleGuard MUST surface an override
+    button so a guard bug can never again lock the operator out.
+    The dashboard is safety-adjacent; there is no un-bypassable
+    client-side wall."""
+    j = _stale_guard_jsx()
+    assert 'stale-guard-override' in j, (
+        'StaleGuard.jsx must render a data-testid="stale-guard-'
+        'override" button after repeated failed reloads.')
+    assert 'OVERRIDE_AFTER' in j or 'showOverride' in j, (
+        'A repeat-mount counter must decide when to surface the '
+        'override — silent behavior would defeat the point.')
+    # localStorage-backed history so counts survive the reload.
+    assert 'localStorage' in j
+    # Override click must clear the mismatch — otherwise the overlay
+    # keeps re-rendering.
+    assert '_setStaleProvenance' in j or 'staleProvenance: null' in j
+    # An OVERRIDE ACTIVE indicator must exist so the operator SEES
+    # the fact that the tab is running without the guard.
+    p = os.path.join(WS, 'src', 'cobot_dashboard', 'frontend', 'src',
+                     'components', 'StaleOverrideIndicator.jsx')
+    assert os.path.isfile(p), (
+        'StaleOverrideIndicator component must exist — a silent '
+        'bypass is worse than none.')
+    with open(p) as fh:
+        ind = fh.read()
+    assert 'OVERRIDE ACTIVE' in ind
+    assert 'staleguard.override' in ind
+
+
+def test_store_exposes_setStaleProvenance_action():
+    """The override path needs a discrete action to clear the
+    mismatch, both so StaleGuard doesn't reach into raw set() and
+    so a unit test can drive it. Same pattern as _reconcileAll and
+    the other store actions."""
+    js = _use_store_js()
+    assert '_setStaleProvenance' in js
+
+
 def test_deploy_sh_exits_2_on_dirty_tree(tmp_path):
     """Fabricate a tiny bash environment that mirrors deploy.sh's
     dirty-check without spinning up the full deploy. Guarantees the

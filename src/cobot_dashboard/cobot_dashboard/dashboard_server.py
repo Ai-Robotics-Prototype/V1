@@ -8316,24 +8316,29 @@ if FASTAPI_AVAILABLE:
         expected = _bare(provenance["deploy_sha"])
         backend_ok  = expected != "unknown" \
                       and _bare(provenance["backend_sha"])  == expected
+        # 2026-08-28 (StaleGuard-lockout incident): frontend_sha is
+        # reported for transparency but NOT gated in the verdict.
+        # The sidecar records "which SHA vite last built the bundle
+        # against"; on docs-only deploys where vite legitimately
+        # skips, that SHA trails HEAD. Gating on frontend_ok made
+        # the banner red for every docs deploy AND, in concert with
+        # the sidecar-advance-on-skip bug, briefly locked every open
+        # tab out. Client-side, StaleGuard is the correct staleness
+        # signal for the operator's tab: it compares the bundle's
+        # baked __GIT_SHA__ to the WS-pushed frontend_sha — same
+        # bundle, no mismatch, no overlay. Server-side, the verdict
+        # gates on backend_ok + deploy_ok only.
         frontend_ok = expected != "unknown" \
                       and _bare(provenance["frontend_sha"]) == expected
         deploy_ok   = state == "current"
         provenance["backend_ok"]  = backend_ok
-        provenance["frontend_ok"] = frontend_ok
+        provenance["frontend_ok"] = frontend_ok   # advisory only
         provenance["deploy_ok"]   = deploy_ok
-        # Compose verdict + failing-layer name. Order the layers
-        # from "most upstream" to "most downstream" so the operator
-        # sees the ROOT failure named (deploy failed → backend
-        # follows; deploy ok + backend stale → surface the stale
-        # backend, not the deploy).
         failing_layers = []
         if not deploy_ok:
             failing_layers.append("deploy")
         if not backend_ok:
             failing_layers.append("backend")
-        if not frontend_ok:
-            failing_layers.append("frontend")
         provenance["failing_layers"] = failing_layers
         # verdict: 'green' when ALL layers ok AND state=current;
         # 'red' with named layers otherwise. 'stale', 'waiting',

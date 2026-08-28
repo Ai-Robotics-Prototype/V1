@@ -12,6 +12,7 @@ import SelfCollisionWarnBanner from './components/SelfCollisionWarnBanner'
 import HardStopToast from './components/HardStopToast'
 import DeployStatusBanner from './components/DeployStatusBanner'
 import StaleGuard from './components/StaleGuard'
+import StaleOverrideIndicator from './components/StaleOverrideIndicator'
 import PausedPresenter from './components/PausedPresenter'
 import ViewportDebug from './components/ViewportDebug'
 import JogDebugPanel from './components/JogDebugPanel'
@@ -221,6 +222,11 @@ export default function App() {
             an empty tree when no mismatch → cost of the mount is
             a single subscription to useStore.staleProvenance. */}
         <StaleGuard />
+        {/* Persistent pill visible whenever the operator has used
+            the escape hatch. Surfaces the fact that the tab is
+            running without the guard's guarantee — clear by
+            clicking the pill. */}
+        <StaleOverrideIndicator />
         <ViewportDebug />
         <JogDebugPanel />
       </div>

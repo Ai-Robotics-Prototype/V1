@@ -1,25 +1,79 @@
 // StaleGuard — full-screen BLOCKING overlay for provenance
-// mismatch (2026-08-28 stale-class close). Kills the stale-tab
-// class as an operator burden: the UI refuses to operate when
-// its embedded git SHA differs from the server's frontend SHA.
+// mismatch (2026-08-28 stale-class close).
 //
-// The dismissible-toast approach used pre-2026-08-28 taught the
-// operator to click through the warning and keep working on a
-// stale tab. This overlay does NOT have a close button — the
-// only path forward is a hard reload (the button reloads the
-// page with cache bypass).
+// 2026-08-28 lockout incident: a bug in deploy.sh briefly advanced
+// dist/.build-sha on build-skip, making the server always report a
+// frontend SHA the JS bundle could never contain — the guard fired
+// on every fresh tab and the operator was locked out of the whole
+// dashboard including the deploy control surface used to fix it.
+// Escape hatch below prevents that class of self-inflicted lockout:
+// after N mount cycles against the SAME (expected, actual) pair
+// within a short window, an OVERRIDE button surfaces that clears
+// staleProvenance and lets the operator through with a persistent
+// amber "OVERRIDE ACTIVE" indicator (see StaleOverrideIndicator).
 //
-// Trigger source: useStore.staleProvenance is set to
-//   { layer: 'frontend'|'backend', expected, actual, detectedAt }
-// when the /ws/state hello frame's SHAs disagree with our own
-// __GIT_SHA__ (frontend layer) or the previous hello's backend
-// SHA (backend layer). See store/useStore.js onmessage.
+// The BLOCKING semantics are preserved for the normal single-reload
+// case (dismissible-toast pattern retired). The override only appears
+// when the reload strategy is DEMONSTRABLY not working, and it costs
+// the operator a visible indicator until they clear it — never a
+// silent bypass.
 
+import { useEffect, useMemo, useState } from 'react'
 import { useStore } from '../store/useStore'
+
+
+const HISTORY_KEY   = 'staleguard.reload_history'
+const HISTORY_TTL_S = 300            // 5 minutes
+const OVERRIDE_AFTER = 3             // 3 mounts against same pair
+
+
+function _readHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY)
+    if (!raw) return []
+    const arr = JSON.parse(raw)
+    if (!Array.isArray(arr)) return []
+    const cutoff = Date.now() / 1000 - HISTORY_TTL_S
+    return arr.filter((e) => e && e.ts >= cutoff)
+  } catch { return [] }
+}
+
+
+function _writeHistory(arr) {
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(arr)) }
+  catch { /* private-mode / quota — no-op */ }
+}
+
+
+function _sameSpair(a, b) {
+  return a && b && a.expected === b.expected && a.actual === b.actual
+}
 
 
 export default function StaleGuard() {
   const sp = useStore((s) => s.staleProvenance)
+  const setStaleProvenance = useStore((s) => s._setStaleProvenance)
+
+  // Log every mount cycle against a mismatch so we can detect "reload
+  // isn't fixing it". Ephemeral state — history lives in localStorage.
+  useEffect(() => {
+    if (!sp) return
+    const arr = _readHistory()
+    arr.push({ ts: Date.now() / 1000,
+               expected: sp.expected, actual: sp.actual, layer: sp.layer })
+    // Keep the tail bounded even inside the TTL window.
+    const trimmed = arr.slice(-16)
+    _writeHistory(trimmed)
+  }, [sp])
+
+  // Count identical-pair mounts within the TTL. When this reaches
+  // OVERRIDE_AFTER we surface the escape hatch.
+  const historyCount = useMemo(() => {
+    if (!sp) return 0
+    return _readHistory().filter((e) => _sameSpair(e, sp)).length
+  }, [sp])
+  const showOverride = sp && historyCount >= OVERRIDE_AFTER
+
   if (!sp) return null
 
   const isFrontend = sp.layer === 'frontend'
@@ -37,8 +91,6 @@ export default function StaleGuard() {
                + `actual ${(sp.actual || '?').slice(0, 12)}`
 
   const reload = () => {
-    // Cache-bypass reload: query-string cache-buster on top of
-    // location.reload's own cache-bypass semantics.
     try {
       const u = new URL(window.location.href)
       u.searchParams.set('_r', Date.now().toString(36))
@@ -48,10 +100,30 @@ export default function StaleGuard() {
     }
   }
 
+  const override = () => {
+    // Persist the fact that the operator overrode a specific pair so
+    // StaleOverrideIndicator can surface it. Clear staleProvenance
+    // in the store so the overlay unmounts.
+    try {
+      localStorage.setItem('staleguard.override', JSON.stringify({
+        ts: Date.now() / 1000,
+        expected: sp.expected, actual: sp.actual, layer: sp.layer,
+      }))
+    } catch { /* nop */ }
+    if (typeof setStaleProvenance === 'function') {
+      setStaleProvenance(null)
+    } else {
+      // Fallback for older store shapes — reload without cache-bust
+      // to at least drop the mount cycle count.
+      _writeHistory([])
+    }
+  }
+
   return (
     <div
       data-testid="stale-guard-overlay"
       data-layer={sp.layer}
+      data-override-available={showOverride ? 'true' : 'false'}
       role="alertdialog"
       aria-modal="true"
       aria-labelledby="stale-guard-title"
@@ -90,15 +162,43 @@ export default function StaleGuard() {
           fontFamily: 'var(--font-mono, monospace)', fontSize: 11,
           color: '#94A3B8', marginBottom: 18,
         }}>{detail}</div>
-        <button
-          data-testid="stale-guard-reload"
-          onClick={reload}
-          style={{
-            background: '#DC2626', color: '#FFF',
-            border: 'none', borderRadius: 4,
-            padding: '10px 20px', fontSize: 14, fontWeight: 700,
-            cursor: 'pointer', letterSpacing: 0.4,
-          }}>Reload now</button>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+          <button
+            data-testid="stale-guard-reload"
+            onClick={reload}
+            style={{
+              background: '#DC2626', color: '#FFF',
+              border: 'none', borderRadius: 4,
+              padding: '10px 20px', fontSize: 14, fontWeight: 700,
+              cursor: 'pointer', letterSpacing: 0.4,
+            }}>Reload now</button>
+          {showOverride && (
+            <button
+              data-testid="stale-guard-override"
+              onClick={override}
+              style={{
+                background: 'transparent',
+                color: '#FCA5A5',
+                border: '1px solid #7F1D1D',
+                borderRadius: 4,
+                padding: '10px 16px',
+                fontSize: 12, fontWeight: 600,
+                cursor: 'pointer',
+                letterSpacing: 0.3,
+              }}>Continue anyway (report this)</button>
+          )}
+        </div>
+        {showOverride && (
+          <div style={{
+            marginTop: 14, fontSize: 11, lineHeight: 1.4,
+            color: '#FDBA74',
+          }}>
+            Reload has been attempted {historyCount}× against the same
+            SHA pair. The guard may be misfiring. Override lets you
+            through; a persistent OVERRIDE ACTIVE indicator will remain
+            until you clear it, and this event should be reported.
+          </div>
+        )}
       </div>
     </div>
   )

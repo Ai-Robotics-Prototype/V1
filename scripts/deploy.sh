@@ -153,21 +153,18 @@ else
     fi
 fi
 
-# ── frontend/.build-sha metadata refresh (2026-08-28) ────────────
-# When vite is SKIPPED (source hash unchanged), the bundle content
-# is legitimately the last-built build — but the .build-sha
-# sidecar still says "the SHA I was built against was N-1" for
-# any deploy on a fresh HEAD. That reads as a frontend_sha
-# mismatch in /api/deploy_status.verdict (red banner) even though
-# nothing frontend-visible changed. Refresh the sidecar to HEAD
-# so the provenance layer tracks the running-system SHA rather
-# than an out-of-date build-timestamp SHA.
-if [[ $FRONTEND_NEEDS_BUILD -eq 0 && -d "$FRONTEND_OUT" ]]; then
-    _HEAD=$(cd "$WS" && git rev-parse HEAD 2>/dev/null || echo "unknown")
-    if [[ -n "$_HEAD" && "$_HEAD" != "unknown" ]]; then
-        echo "$_HEAD" > "$FRONTEND_OUT/.build-sha"
-    fi
-fi
+# 2026-08-28 (post-incident revert of the same day's build-skip
+# sidecar refresh): .build-sha records THE SHA THAT BUILT THE
+# BUNDLE, not the current HEAD. Advancing the sidecar on a build-
+# skip lies about what the JS bundle contains — the bundle bakes
+# __GIT_SHA__ at vite build time from the SHA that was HEAD then,
+# and no subsequent sidecar edit can change that. The prior
+# refresh-to-HEAD locked every open tab out of the dashboard
+# because the guard compared bundle-baked SHA to sidecar-HEAD and
+# they were guaranteed to differ on any docs-only deploy. The
+# sidecar is now write-once-per-vite-build; on skip we leave it
+# untouched. Verdict's frontend_sha may trail HEAD legitimately —
+# that's honest reporting, not a false red.
 
 PRE_SERVED_ASSET=""
 if [[ -f "$FRONTEND_OUT/index.html" ]]; then
