@@ -20,6 +20,7 @@ module.exports = {
     __COMMIT__:     'readonly',
     __BUILD_TIME__: 'readonly',
     __BUILD_ID__:   'readonly',
+    __GIT_SHA__:    'readonly',
   },
   plugins: ['react-hooks'],
   rules: {
