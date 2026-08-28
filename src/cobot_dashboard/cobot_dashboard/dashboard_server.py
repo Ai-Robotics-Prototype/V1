@@ -1470,6 +1470,13 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         # queue either.
         self._estun_program_pub = self.create_publisher(
             String, "/estun/program", 16)
+        # Mode-switch publisher + status subscriber (2026-08-28).
+        # Eager creation for the same discovery-race reason as the
+        # program publisher above.
+        self._estun_mode_pub = self.create_publisher(
+            String, "/estun/mode_command", 8)
+        self.create_subscription(String, "/estun/mode_status",
+                                 self._on_estun_mode_status, 8)
 
         # SEAM A fanout publisher for JOG_BACKEND='ros2'. Created EAGERLY
         # here so DDS discovery matches with jog_bridge's subscriber long
@@ -2511,6 +2518,23 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 })
                 if len(recent) > 32:
                     del recent[:-32]
+
+    def _on_estun_mode_status(self, msg):
+        """Mirror /estun/mode_status events into STATE.robot.
+        Ring-buffer (32) so /api/estun/mode's wait loop can drain
+        it without racing the ROS callback. Fields: op, ok,
+        requested, observed, reason?, reason_code?, req_id?, ts."""
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        d.setdefault("srv_ts", time.time())
+        with _state_lock:
+            r = STATE.setdefault("robot", {})
+            ring = r.setdefault("mode_status", [])
+            ring.append(d)
+            if len(ring) > 32:
+                del ring[:-32]
 
     def _on_estun_rejected(self, msg):
         """Mirror driver rejections into STATE.robot.rejected (ring buffer).
@@ -7244,6 +7268,175 @@ if FASTAPI_AVAILABLE:
                               "monitor_only": False},
             "effective_pct": int(eff_pct),
             "home_source":   home.get("source"),
+        }
+
+    # ── /api/estun/mode (2026-08-28 mode-switch feature) ────────
+    # Body: {"target": "auto"|"manual"|"remote"}. Arbiter-aware:
+    # refuses under active jog hold (_active_holds non-empty) OR
+    # a running program (STATE.robot.program.state == 2). Publishes
+    # on /estun/mode_command; the driver's _on_mode_command handler
+    # does the WS verb + numeric read-back verify against
+    # publish/RobotStatus.mode (L298), then publishes an envelope
+    # on /estun/mode_status. This endpoint waits up to 4 s for the
+    # envelope with matching req_id and returns the wire-truthful
+    # outcome. Event-log emits on success + failure.
+    _MODE_TARGET_TO_OP = {
+        "auto":   "to_auto",
+        "manual": "to_manual",
+        "remote": "to_remote",
+    }
+    _MODE_CODE_LABEL = {0: "auto", 1: "manual", 2: "remote", -1: "unknown"}
+
+    @app.post("/api/estun/mode")
+    async def api_estun_mode(request: Request):
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"},
+                                status_code=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        target = str(body.get("target") or "").strip().lower()
+        op = _MODE_TARGET_TO_OP.get(target)
+        if op is None:
+            return JSONResponse({
+                "ok": False,
+                "outcome": {"kind": "invalid_target",
+                            "reason": f"target must be one of "
+                                       f"{sorted(_MODE_TARGET_TO_OP.keys())}"},
+            }, status_code=400)
+
+        # Arbiter check (JOG-11 discipline extended to mode ops).
+        # Reasoning: a mode change under a running program interrupts
+        # execution mid-cycle; under an active jog hold it can trip
+        # the driver's freshness deadman mid-motion. Refuse cleanly
+        # with a named reason the frontend can map to a copy path.
+        arbiter_reason = None
+        with _state_lock:
+            r = STATE.get("robot", {}) or {}
+            prog_state = int(((r.get("program") or {}).get("state")) or 0)
+        if len(_active_holds) > 0:
+            arbiter_reason = "jog hold active"
+        elif prog_state == 2:
+            arbiter_reason = "program running"
+        if arbiter_reason:
+            return JSONResponse({
+                "ok": False,
+                "outcome": {"kind": "arbiter_refused",
+                            "reason": arbiter_reason,
+                            "detail": ("Mode switch refused while "
+                                       f"{arbiter_reason}. Release the "
+                                       "jog or stop the program first.")},
+            }, status_code=409)
+
+        # Snapshot mode_status ring so we can attribute the response.
+        with _state_lock:
+            r = STATE.get("robot", {}) or {}
+            ms_before = len(r.get("mode_status") or [])
+            current_code = int(r.get("robot_mode_code") if isinstance(
+                r.get("robot_mode_code"), int) else -1)
+
+        # Publish the mode_command envelope. Use a distinctive req_id
+        # so a concurrent caller can't mistakenly consume our result.
+        import uuid
+        req_id = uuid.uuid4().hex[:12]
+        try:
+            m = String()
+            m.data = json.dumps({"op": op, "req_id": req_id})
+            _ros_node._estun_mode_pub.publish(m)
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "outcome": {"kind": "publish_failed",
+                            "reason": f"publish /estun/mode_command failed: {e}"},
+            }, status_code=502)
+
+        # Wait for the matching envelope (up to 4 s — driver's own
+        # readback is 3 s, plus ~1 s slack for ROS transport +
+        # scheduling).
+        deadline = time.time() + 4.0
+        result = None
+        while time.time() < deadline:
+            await asyncio.sleep(0.05)
+            with _state_lock:
+                r = STATE.get("robot", {}) or {}
+                ring = r.get("mode_status") or []
+                new_events = ring[ms_before:]
+            for ev in new_events:
+                if ev.get("req_id") == req_id:
+                    result = ev
+                    break
+            if result is not None:
+                break
+
+        # Log to the event log — both success and failure so the
+        # operator's timeline shows every mode change attempt.
+        try:
+            if result is not None and result.get("ok"):
+                _event_log.emit(
+                    severity='info',
+                    source='dashboard',
+                    code='mode_switch',
+                    operator_message=(
+                        f"Robot mode → {_MODE_CODE_LABEL.get(int(result.get('requested', -1)), '?')}"
+                        + (" (already there)" if result.get("no_change") else "")),
+                    technical_detail=(
+                        f"op={op} requested={result.get('requested')} "
+                        f"observed={result.get('observed')} "
+                        f"req_id={req_id}"),
+                    context={"requested": result.get("requested"),
+                             "observed":  result.get("observed"),
+                             "op": op, "req_id": req_id})
+            else:
+                reason = (result or {}).get("reason") \
+                         or "mode switch endpoint timed out waiting for driver ack"
+                _event_log.emit(
+                    severity='warning',
+                    source='dashboard',
+                    code='mode_switch_refused',
+                    operator_message=f"Mode switch refused: {reason}",
+                    technical_detail=(
+                        f"op={op} current_code={current_code} "
+                        f"req_id={req_id} result={result!r}"),
+                    context={"op": op, "current_code": current_code,
+                             "req_id": req_id,
+                             "reason": reason,
+                             "reason_code": (result or {}).get("reason_code")})
+        except Exception:
+            # event_log emit must never break the response.
+            pass
+
+        if result is None:
+            return JSONResponse({
+                "ok": False,
+                "outcome": {"kind": "driver_ack_timeout",
+                            "reason": ("mode switch endpoint timed out "
+                                       "waiting for /estun/mode_status "
+                                       "envelope — the driver may be down "
+                                       "OR /estun/mode_command wasn't "
+                                       "subscribed yet")},
+            }, status_code=504)
+
+        if not result.get("ok"):
+            return JSONResponse({
+                "ok": False,
+                "outcome": {"kind": "mode_switch_failed",
+                            "reason": result.get("reason") or "unknown",
+                            "reason_code": result.get("reason_code"),
+                            "requested": result.get("requested"),
+                            "observed":  result.get("observed")},
+            }, status_code=409)
+
+        return {
+            "ok": True,
+            "outcome": {"kind": "mode_switched",
+                        "requested": result.get("requested"),
+                        "observed":  result.get("observed"),
+                        "no_change": bool(result.get("no_change"))},
+            "target": target,
+            "current_code": result.get("observed"),
+            "current_label": _MODE_CODE_LABEL.get(
+                int(result.get("observed", -1)), "unknown"),
         }
 
     @app.post("/api/estun/program/stop")

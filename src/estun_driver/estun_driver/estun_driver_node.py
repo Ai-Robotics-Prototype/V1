@@ -523,6 +523,14 @@ class EstunCodroidDriver(Node):
         #     it appears here because the sequence is start-run-clear-run)
         # monitor_only stays the master gate. See PART_2C_ARCHITECTURE.md.
         self.declare_parameter('allow_move', False)
+        # ── Mode gate (2026-08-28) ───────────────────────────────
+        # Separate from allow_move so an operator (or safety
+        # process) can permit MODE SWITCHING without also opening
+        # program-write. `Robot/toAuto` / `Robot/toManual` /
+        # `Robot/toRemote` ride here. Read-back verified against
+        # numeric `robot_mode_code` (0=AUTO, 1=MANUAL, 2=REMOTE)
+        # per L298 — stateName strings are not ground truth.
+        self.declare_parameter('allow_mode', False)
 
         # Cadence knobs.
         self.declare_parameter('recv_timeout_s', 5.0)   # matches posture.py
@@ -667,6 +675,14 @@ class EstunCodroidDriver(Node):
         if env_move is not None:
             self._allow_move = env_move.strip().lower() in ('1', 'true', 'yes', 'on')
             self._allow_move_source = 'ESTUN_ALLOW_MOVE'
+
+        # Mode-switch gate — separate from move (2026-08-28).
+        self._allow_mode = bool(self.get_parameter('allow_mode').value)
+        self._allow_mode_source = 'param'
+        env_mode = os.environ.get('ESTUN_ALLOW_MODE')
+        if env_mode is not None:
+            self._allow_mode = env_mode.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._allow_mode_source = 'ESTUN_ALLOW_MODE'
 
         self._allow_io = bool(self.get_parameter('allow_io').value)
         self._allow_io_source = 'param'
@@ -1004,6 +1020,14 @@ class EstunCodroidDriver(Node):
         self._pub_status      = self.create_publisher(String, '/estun/status', 10)
         self._pub_mode        = self.create_publisher(String, '/estun/mode', 10)
         self._pub_rejected    = self.create_publisher(String, '/estun/rejected', 10)
+        # Mode-switch result stream (2026-08-28). The dashboard's
+        # /api/estun/mode endpoint sends a request on /estun/mode_command
+        # and waits for a matching envelope here — {op, requested,
+        # observed, ok, reason?, ts}. Latched shape: one publish per
+        # completed attempt (success OR failure); the observer polls
+        # STATE mirror + this stream. Depth 8 so a burst of mode
+        # toggles never drops the tail.
+        self._pub_mode_status = self.create_publisher(String, '/estun/mode_status', 8)
         # Part 2c program-execution status. Updated from publish/ProjectState
         # frames (state, project id, current task, current line, isStep)
         # and from publish/Error transitions (new fault, cleared) after
@@ -1065,6 +1089,15 @@ class EstunCodroidDriver(Node):
         # KEEP_LAST dropping the head. Depth 5 was too tight — grew to
         # 16 to match the dashboard publisher.
         self.create_subscription(String, '/estun/program', self._on_program_command, 16)
+
+        # Mode-switch command channel (2026-08-28). Own gate
+        # (allow_mode / ESTUN_ALLOW_MODE), own topic — the operator
+        # can enable mode switching without also opening program-
+        # writes. Payload: JSON {op: "to_auto"|"to_manual"|"to_remote",
+        # req_id?}. See `_on_mode_command` for the read-back verify
+        # loop.
+        self.create_subscription(
+            String, '/estun/mode_command', self._on_mode_command, 8)
 
         # 2026-08-06 (operator directive): runtime kill switch for the
         # entire self-collision + ground-plane capsule guard. When
@@ -1666,6 +1699,143 @@ class EstunCodroidDriver(Node):
     def _op_to_manual(self, _d):
         ok = self._ws_verb('Robot/toManual')
         self.get_logger().info(f'Robot/toManual ok={ok}')
+
+    # ── Mode-switch subscriber (2026-08-28 feature) ─────────────
+    # Numeric mode code per L298: publish/RobotStatus.mode is
+    # ground truth (0=AUTO, 1=MANUAL, 2=REMOTE). We publish the
+    # verb, then poll self._robot_mode_code up to 3 s for it to
+    # equal the target — that's a "switch". Anything else (still
+    # unknown, still on the previous mode) is a failure with a
+    # named reason on /estun/mode_status.
+
+    _MODE_CODE_FOR_OP = {
+        'to_auto':   0,
+        'to_manual': 1,
+        'to_remote': 2,
+    }
+    _MODE_VERB_FOR_OP = {
+        'to_auto':   'Robot/toAuto',
+        'to_manual': 'Robot/toManual',
+        'to_remote': 'Robot/toRemote',
+    }
+
+    def _publish_mode_status(self, envelope: dict) -> None:
+        try:
+            m = String()
+            m.data = json.dumps(envelope, separators=(',', ':'))
+            self._pub_mode_status.publish(m)
+        except Exception as e:
+            self.get_logger().warn(f'mode_status publish failed: {e}')
+
+    def _on_mode_command(self, msg):
+        """Handle a mode-switch request from the dashboard.
+
+        Gate order (identical to _on_program_command):
+        monitor_only → allow_mode → connected → ready. Read-back
+        via robot_mode_code AFTER the verb; failure is loud on
+        /estun/mode_status with a reason string the dashboard can
+        map to a named refusal.
+        """
+        # Envelope shape shared with the dashboard's endpoint. req_id
+        # rides through so a busy caller can correlate.
+        try:
+            d = json.loads(msg.data)
+        except Exception as e:
+            self._publish_mode_status({
+                'ok': False, 'reason': f'invalid JSON: {e}',
+                'ts': time.time()})
+            return
+        op     = str(d.get('op') or '').strip()
+        req_id = d.get('req_id')
+        target_code = self._MODE_CODE_FOR_OP.get(op)
+        verb        = self._MODE_VERB_FOR_OP.get(op)
+        if target_code is None or verb is None:
+            self._publish_mode_status({
+                'ok': False, 'op': op,
+                'reason': (f'unknown mode op {op!r}; expected one of '
+                           f'{sorted(self._MODE_CODE_FOR_OP.keys())}'),
+                'req_id': req_id, 'ts': time.time()})
+            return
+
+        family = 'mode'
+        if self._monitor_only:
+            self._publish_mode_status({
+                'ok': False, 'op': op,
+                'reason': 'monitor_only active',
+                'req_id': req_id, 'ts': time.time()})
+            self._reject(family, 'monitor_only active',
+                         extra={'op': op})
+            return
+        if not self._allow_mode:
+            self._publish_mode_status({
+                'ok': False, 'op': op,
+                'reason': 'allow_mode gate closed',
+                'reason_code': 'allow_mode_gate_closed',
+                'req_id': req_id, 'ts': time.time()})
+            self._reject(family, 'allow_mode gate closed',
+                         extra={'op': op})
+            return
+        if not self._connected:
+            self._publish_mode_status({
+                'ok': False, 'op': op,
+                'reason': 'ws not connected',
+                'reason_code': 'transport_down',
+                'req_id': req_id, 'ts': time.time()})
+            return
+        if self._conn_sm.state != self._conn_sm.READY:
+            self._publish_mode_status({
+                'ok': False, 'op': op,
+                'reason': (f'controller {self._conn_sm.state} — mode '
+                           'switch gated until READY'),
+                'reason_code': 'controller_not_ready',
+                'req_id': req_id, 'ts': time.time()})
+            return
+
+        # Short-circuit: already in target mode. Still emit an OK
+        # envelope so the dashboard's wait loop returns cleanly.
+        already = self._robot_mode_code
+        if already == target_code:
+            self._publish_mode_status({
+                'ok': True, 'op': op, 'requested': target_code,
+                'observed': already, 'no_change': True,
+                'req_id': req_id, 'ts': time.time()})
+            return
+
+        ok_verb = self._ws_verb(verb)
+        self.get_logger().info(f'{verb} sent ok={ok_verb} '
+                               f'req_id={req_id}')
+        if not ok_verb:
+            self._publish_mode_status({
+                'ok': False, 'op': op, 'requested': target_code,
+                'observed': already,
+                'reason': f'{verb} publish failed on the WS',
+                'reason_code': 'verb_publish_failed',
+                'req_id': req_id, 'ts': time.time()})
+            return
+
+        # Read-back verify (L298): poll robot_mode_code up to 3 s.
+        # The publish/RobotStatus stream refreshes at ~10 Hz — 3 s
+        # is 30 opportunities to observe the change.
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            time.sleep(0.05)
+            observed = self._robot_mode_code
+            if observed == target_code:
+                self._publish_mode_status({
+                    'ok': True, 'op': op,
+                    'requested': target_code, 'observed': observed,
+                    'req_id': req_id, 'ts': time.time()})
+                return
+        # Timed out — the verb published but the controller never
+        # confirmed. Loud + machine-readable.
+        self._publish_mode_status({
+            'ok': False, 'op': op,
+            'requested': target_code, 'observed': self._robot_mode_code,
+            'reason': ('mode read-back timeout — verb was sent but '
+                       'publish/RobotStatus.mode did not reach '
+                       f'{target_code} within 3 s'),
+            'reason_code': 'mode_readback_timeout',
+            'req_id': req_id, 'ts': time.time()})
 
     def _op_set_move_rate(self, d):
         # setManualMoveRate is the MANUAL-mode override (jogs); the
@@ -3327,6 +3497,8 @@ class EstunCodroidDriver(Node):
             'allow_power_source': self._allow_power_source,
             'allow_move':     self._allow_move,
             'allow_move_source': self._allow_move_source,
+            'allow_mode':     self._allow_mode,
+            'allow_mode_source': self._allow_mode_source,
             'program_state':  self._prog_state,
             'program_project_id': self._prog_project_id,
             'program_task':   self._prog_task,

@@ -503,6 +503,142 @@ def test_check_bundle_id_toast_retired():
             f'{banned} state field must be removed.')
 
 
+def _driver_src() -> str:
+    with open(os.path.join(
+        WS, 'src', 'estun_driver', 'estun_driver',
+        'estun_driver_node.py')) as fh:
+        return fh.read()
+
+
+def _mode_control_jsx() -> str:
+    with open(os.path.join(
+        WS, 'src', 'cobot_dashboard', 'frontend', 'src',
+        'components', 'ModeControl.jsx')) as fh:
+        return fh.read()
+
+
+# ── 2026-08-28 mode-switch feature doctrine ──────────────────────
+
+def test_driver_mode_gate_exists_and_wired():
+    """Mode ops must ride behind a SEPARATE gate (allow_mode /
+    ESTUN_ALLOW_MODE) so an operator can permit mode toggling
+    without also opening program-write. The driver subscribes to
+    /estun/mode_command and publishes results on /estun/mode_status."""
+    src = _driver_src()
+    assert re.search(r"declare_parameter\(['\"]allow_mode['\"]", src)
+    assert "ESTUN_ALLOW_MODE" in src
+    assert "/estun/mode_command" in src
+    assert "/estun/mode_status" in src
+    # The subscription must be created eagerly (avoids the DDS
+    # discovery-race class that hit /estun/program).
+    assert "self.create_subscription(\n            String, '/estun/mode_command'," in src \
+        or "'/estun/mode_command', self._on_mode_command" in src
+
+
+def test_driver_mode_readback_uses_numeric_ground_truth():
+    """L298 discipline: publish/RobotStatus.mode is the ONLY ground
+    truth for "did the switch land". State-name strings are not
+    trusted; the driver polls self._robot_mode_code and compares
+    against the numeric target (0=AUTO, 1=MANUAL, 2=REMOTE)."""
+    src = _driver_src()
+    m = re.search(r"def _on_mode_command\(self, msg\)", src)
+    assert m, '_on_mode_command handler not found'
+    # Read the whole handler — bounded by the NEXT top-level def.
+    tail = src[m.start():]
+    end  = re.search(r"\n    def ", tail[100:])
+    body = tail[:100 + (end.start() if end else 4000)]
+    assert "_robot_mode_code" in body, (
+        'read-back must compare against _robot_mode_code (numeric)')
+    assert "_MODE_CODE_FOR_OP" in body or "target_code" in body, (
+        'target must be resolved to a numeric code, not a string')
+    assert re.search(r"mode_readback_timeout", src), (
+        'a timed-out read-back must emit reason_code=mode_readback_timeout '
+        'so the dashboard can classify it correctly')
+
+
+def test_dashboard_mode_endpoint_arbiter_aware():
+    """POST /api/estun/mode must REFUSE with a named reason when
+    a jog hold is active OR a program is running (JOG-11 arbiter
+    discipline extended). Mode ops mid-motion are unsafe: they can
+    interrupt program state or race the jog freshness deadman."""
+    src = _server_src()
+    m = re.search(r'@app\.post\("/api/estun/mode"\).*?async def api_estun_mode\(',
+                  src, re.DOTALL)
+    assert m
+    # The handler body — enough surface to catch the arbiter block.
+    body = src[m.start(): m.start() + 6000]
+    assert "arbiter_refused" in body, (
+        '/api/estun/mode must return outcome.kind="arbiter_refused" '
+        'when the arbiter blocks')
+    assert "_active_holds" in body, (
+        'active jog hold must be checked (mirror of JOG-11 doctrine)')
+    assert 'program' in body and 'state' in body, (
+        'program.state == 2 must be checked before allowing the switch')
+
+
+def test_dashboard_mode_endpoint_event_logs_on_change_and_refusal():
+    """Every mode change attempt must land in the event log so the
+    operator's timeline reflects what was attempted, granted, or
+    refused. Success + failure both emit — silent success is what
+    caused the "what changed?" investigations."""
+    src = _server_src()
+    # api_estun_mode handler window.
+    m = re.search(r'@app\.post\("/api/estun/mode"\).*?return \{',
+                  src, re.DOTALL)
+    assert m
+    body = src[m.start(): m.start() + 6000]
+    assert '_event_log.emit' in body, (
+        '/api/estun/mode must emit event_log entries')
+    assert 'mode_switch' in body
+
+
+def test_dashboard_mode_endpoint_reads_wire_ack():
+    """The endpoint must NOT return "ok" until the driver publishes
+    a matching envelope on /estun/mode_status with the same req_id.
+    Optimistic success is what taught operators to distrust status
+    pills."""
+    src = _server_src()
+    m = re.search(r'@app\.post\("/api/estun/mode"\).*?return \{',
+                  src, re.DOTALL)
+    assert m
+    body = src[m.start(): m.start() + 6000]
+    assert 'req_id' in body
+    assert 'mode_status' in body
+    assert 'uuid' in body
+
+
+def test_mode_control_component_is_canonical_and_guarded():
+    """ModeControl is the ONLY frontend surface that switches
+    mode. Renders current mode ALWAYS (per operator directive:
+    safety-relevant, not a toggle), opens a confirm dialog naming
+    the consequence, and disables the pill when the arbiter would
+    refuse (already-refused hint before the wire trip)."""
+    j = _mode_control_jsx()
+    assert 'data-testid="mode-control"' in j
+    assert 'data-testid="mode-confirm-dialog"' in j
+    assert 'aria-modal="true"' in j
+    # Consequence-text presence — the operator must SEE the effect
+    # named before confirming.
+    assert 'Programs run at their configured speed' in j
+    assert 'Drag-teach + jog only' in j
+    # Arbiter-aware disable — the pill knows before the endpoint
+    # trip that the switch would refuse.
+    assert 'jog_active' in j and 'program' in j
+
+
+def test_frontend_run_modal_offers_switch_to_auto():
+    """Run Program must transparently offer "Switch to Auto and
+    run?" when the arm is not in AUTO — the operator never sees
+    a bare "not in auto mode" refusal (per feature directive §4)."""
+    p = os.path.join(WS, 'src', 'cobot_dashboard', 'frontend', 'src',
+                     'components', 'RunProgramModal.jsx')
+    with open(p) as fh:
+        j = fh.read()
+    assert 'willSwitchToAuto' in j
+    assert '/api/estun/mode' in j
+    assert 'Switch to Auto and run' in j
+
+
 def test_estun_allow_move_env_expected_shape():
     """The systemd drop-in for roboai-estun must remain the ONE
     place ESTUN_ALLOW_MOVE is set. If the file has drifted or a

@@ -99,6 +99,16 @@ export default function RunProgramModal() {
   const allowMove   = !!robot.allow_move
   const monitorOnly = !!robot.monitor_only
   const connected   = !!robot.connected
+  // 2026-08-28 mode-switch workflow sugar. Programs run in AUTO
+  // (code 0). If we're not there and the driver's mode gate is
+  // open, the Confirm click first switches to Auto in one step.
+  // No optimistic UI: the /api/estun/mode endpoint returns after
+  // read-back verify against publish/RobotStatus.mode.
+  const robotModeCode = Number.isFinite(robot.robot_mode_code)
+                          ? robot.robot_mode_code : -1
+  const inAuto        = robotModeCode === 0
+  const allowMode     = !!robot.allow_mode
+  const willSwitchToAuto = !inAuto && allowMode
 
   const backdrop = {
     position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
@@ -139,6 +149,35 @@ export default function RunProgramModal() {
     }
     setPhase('running'); setResult(null); setErrorCopy(null); setShowTechnical(false)
     try {
+      // Mode-switch pre-flight (2026-08-28): if we're not in AUTO
+      // and the mode gate is open, transparently switch to AUTO
+      // first. The endpoint blocks until read-back verify so we
+      // KNOW the controller reached AUTO before we publish the
+      // run op. A refusal here (arbiter, timeout, gate closed)
+      // becomes the Run's structured error — the operator sees a
+      // NAMED reason instead of a downstream "mode refused" from
+      // the run itself.
+      if (willSwitchToAuto) {
+        const mres = await fetch('/api/estun/mode', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ target: 'auto' }),
+        })
+        const mbody = await mres.json().catch(() => ({}))
+        if (!mres.ok || !mbody.ok) {
+          setPhase('error')
+          const reason = mbody?.outcome?.reason
+                       || mbody?.outcome?.detail
+                       || `Mode switch to Auto refused (HTTP ${mres.status}).`
+          setErrorCopy({
+            code: 'mode_switch_refused',
+            title: "Can't start — controller is not in Auto and the switch was refused.",
+            detail: reason,
+            technicalDetail: JSON.stringify(mbody, null, 2),
+          })
+          return
+        }
+      }
       const res = await fetch('/api/estun/program/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -330,13 +369,29 @@ export default function RunProgramModal() {
                 Save this program under a new name (letters + digits only).
               </div>
             )}
+            {willSwitchToAuto && (
+              <div style={{
+                marginTop: 10, padding: '8px 12px',
+                background: 'rgba(5, 150, 105, 0.08)',
+                border: '1px solid #059669', borderRadius: 6,
+                fontSize: 13, color: '#065F46',
+              }}>
+                Robot is currently in <b>{
+                  robotModeCode === 1 ? 'Manual' :
+                  robotModeCode === 2 ? 'Remote' : 'an unknown mode'
+                }</b>. Confirm will first switch to <b>Auto</b>, then start
+                the program.
+              </div>
+            )}
             <div style={btnRow}>
               <button style={btnGhost} onClick={close}>Cancel</button>
               <button
                 style={btnPrimary('#16A34A', taughtCount === 0 || !idSafe)}
                 onClick={confirmRun}
                 disabled={taughtCount === 0 || !idSafe}>
-                Confirm — Run at {effectivePct}%
+                {willSwitchToAuto
+                  ? `Switch to Auto and run at ${effectivePct}%`
+                  : `Confirm — Run at ${effectivePct}%`}
               </button>
             </div>
           </>

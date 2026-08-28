@@ -6,6 +6,7 @@ import JointJogPanel from '../components/JointJogPanel'
 import JogControls from '../components/JogControls'
 import IKGizmo from '../components/IKGizmo'
 import ArmEnableControl from '../components/ArmEnableControl'
+import ModeControl from '../components/ModeControl'
 
 // The 3D View tab hosts three separate jog surfaces:
 //   • JointJogPanel  (right-dock sliders, TWIN ONLY)  — no wire traffic.
@@ -131,7 +132,10 @@ function RealArmChrome({ mode, setMode, children }) {
         background: 'var(--bg-panel)',
         borderBottom: '1px solid var(--border)',
       }}>
-        <ArmEnableControl />
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <ArmEnableControl />
+          <ModeControl />
+        </div>
         <div style={{ display: 'flex', gap: 6 }}>
           <button
             onClick={() => setMode('MINIMIZED')}

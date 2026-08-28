@@ -721,7 +721,7 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3928
+        line: 3949
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
@@ -736,7 +736,7 @@ capabilities:
           invariant is preserved.
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4063
+        line: 4084
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Pinned by test_jog_hold_heartbeat.py. 2026-08-19:
@@ -1213,6 +1213,59 @@ capabilities:
 # frontend JS/JSX file. Any hit surfaces as a WARNING (review-required)
 # — not a gate failure — because the false-positive rate is real
 # (general geometry in orient.js / IKGizmo.jsx is legitimate). The
+
+  # 27. Mode switch (2026-08-28 feature). One canonical way for
+  # the dashboard to switch the arm between Manual / Auto / Remote.
+  - id: mode_switch
+    description: >
+      Robot mode switching lives on ONE control surface end-to-
+      end. Backend seam: POST /api/estun/mode → publish on
+      /estun/mode_command → driver's _on_mode_command runs the
+      WS verb (Robot/toAuto | toManual | toRemote), then polls
+      publish/RobotStatus.mode (NUMERIC, L298) up to 3 s until it
+      matches the target — that's a "switch". Result envelope on
+      /estun/mode_status carries req_id + observed + reason_code.
+      /api/estun/mode blocks up to 4 s waiting for the matching
+      envelope; anything else is a driver-ack timeout.
+
+      Arbiter discipline (JOG-11 extension): mode switch REFUSES
+      under an active jog hold (_active_holds non-empty) OR a
+      running program (STATE.robot.program.state == 2). Returns
+      outcome.kind='arbiter_refused' with a named reason.
+
+      Frontend surface: components/ModeControl.jsx renders the
+      current mode pill ALWAYS (safety-relevant, not a toggle) +
+      a confirm dialog naming the consequence per target. Second
+      surface is workflow sugar — RunProgramModal transparently
+      offers "Switch to Auto and run" when the arm isn't in AUTO
+      and the mode gate is open. No other component may POST to
+      /api/estun/mode.
+
+      Fork rule: any second POST to /api/estun/mode outside of
+      ModeControl or RunProgramModal (the two authorized call
+      sites) is a fork.
+    canonical:
+      python:
+        module: cobot_dashboard.dashboard_server
+        functions: [api_estun_mode]
+      javascript:
+        module: src/cobot_dashboard/frontend/src/components/ModeControl.jsx
+        exports: [ModeControl]
+      route:
+        method: POST
+        path: /api/estun/mode
+    forbidden:
+      # Anything else fetching POST /api/estun/mode is a fork —
+      # the two authorized surfaces are exempted below.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          - "/api/estun/mode"
+        path_exempt:
+          - '**/ModeControl.jsx'
+          - '**/RunProgramModal.jsx'
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt: []
 
   # 26. Provenance (2026-08-28 stale-class close). One canonical
   # source of the running-code identity — backend git SHA, backend
