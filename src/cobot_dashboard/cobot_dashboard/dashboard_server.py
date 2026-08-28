@@ -7409,6 +7409,8 @@ if FASTAPI_AVAILABLE:
             r = STATE.get("robot", {}) or {}
             recovery = r.get("recoveryState")
             errors_now = list(r.get("errors") or [])
+            current_code = int(r.get("robot_mode_code") if isinstance(
+                r.get("robot_mode_code"), int) else -1)
 
         # Rung 1: recoveryState.
         if isinstance(recovery, int) and recovery != 0:
@@ -7488,11 +7490,10 @@ if FASTAPI_AVAILABLE:
                 }, status_code=503)
 
         # Snapshot mode_status ring so we can attribute the response.
+        # current_code was already resolved above for the rungs.
         with _state_lock:
             r = STATE.get("robot", {}) or {}
             ms_before = len(r.get("mode_status") or [])
-            current_code = int(r.get("robot_mode_code") if isinstance(
-                r.get("robot_mode_code"), int) else -1)
 
         import uuid
 
