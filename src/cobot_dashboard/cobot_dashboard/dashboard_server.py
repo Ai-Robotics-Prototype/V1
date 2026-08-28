@@ -7388,6 +7388,105 @@ if FASTAPI_AVAILABLE:
                                        "jog or stop the program first.")},
             }, status_code=409)
 
+        # ── §566 self-healing diagnostic ladder (2026-08-28) ────
+        # Operator directive: "the system must DIAGNOSE AND FIX
+        # this class itself, not report riddles." Before any
+        # mode-switch attempt, probe the §566 four-tuple:
+        #   1) recoveryState != 0  → HARD-STOP with the honest
+        #      power-cycle instruction. §566 pins that no wire
+        #      path clears this state; System/ClearError and
+        #      CRI/StartControl were tried and failed. Physical
+        #      cabinet cycle is the ONLY remedy.
+        #   2) errors[] non-empty  → publish System/ClearError
+        #      via the existing /robot/power_command clear_alarm
+        #      path, poll for errors == [] for up to 2 s, retry.
+        #      Auto-silent success or a named refusal — never a
+        #      raw "mode read-back timeout" if the cause is
+        #      diagnosable.
+        #   3) fall through to the enable-interlock orchestration
+        #      (already built).
+        with _state_lock:
+            r = STATE.get("robot", {}) or {}
+            recovery = r.get("recoveryState")
+            errors_now = list(r.get("errors") or [])
+
+        # Rung 1: recoveryState.
+        if isinstance(recovery, int) and recovery != 0:
+            return JSONResponse({
+                "ok": False,
+                "outcome": {
+                    "kind": "recovery_state_power_cycle_required",
+                    "reason_code": "recovery_state_nonzero",
+                    "reason": ("controller recoveryState=%d — no wire "
+                               "path clears this state (see ledger "
+                               "addendum-40 §566). Physical cabinet "
+                               "power-cycle is required." % recovery),
+                    "detail": ("Cycle CC10-A at the cabinet. After the "
+                               "cycle, the four-tuple must read "
+                               "{state:2, stateName:'Enabled', "
+                               "recoveryState:0, errors:[]} before "
+                               "mode switching or program runs will "
+                               "work."),
+                    "four_tuple": {
+                        "mode":          current_code,
+                        "state_code":    r.get("state_code"),
+                        "state_name":    r.get("state_name"),
+                        "recoveryState": recovery,
+                        "errors":        errors_now,
+                    },
+                },
+            }, status_code=503)
+
+        # Rung 2: errors[] latched. Auto-clear + retry.
+        rung2_subs = []
+        if errors_now:
+            try:
+                _publish_estun_power({"action": "clear_alarm"})
+                rung2_subs.append({"step": "publish_clear_alarm",
+                                   "ok": True,
+                                   "errors_before": errors_now})
+            except Exception as e:
+                rung2_subs.append({"step": "publish_clear_alarm",
+                                   "ok": False, "err": str(e)})
+            # Wait up to 2 s for errors[] to drain.
+            _dl = time.time() + 2.0
+            cleared = False
+            while time.time() < _dl:
+                await asyncio.sleep(0.05)
+                with _state_lock:
+                    rr = STATE.get("robot", {}) or {}
+                    if not (rr.get("errors") or []):
+                        cleared = True
+                        break
+            rung2_subs.append({"step": "await_errors_cleared",
+                               "ok": cleared})
+            if not cleared:
+                with _state_lock:
+                    rr = STATE.get("robot", {}) or {}
+                return JSONResponse({
+                    "ok": False,
+                    "outcome": {
+                        "kind": "errors_latched_uncleared",
+                        "reason_code": "errors_persist",
+                        "reason": ("controller errors[] did not clear "
+                                   "within 2 s of ClearError. Latched "
+                                   "fault the wire cannot dismiss."),
+                        "detail": ("Check the pendant `:9198` alarm "
+                                   "log for a fault requiring a "
+                                   "specific recovery gesture; if "
+                                   "none is visible, power-cycle the "
+                                   "cabinet."),
+                        "subs": rung2_subs,
+                        "four_tuple": {
+                            "mode":          current_code,
+                            "state_code":    rr.get("state_code"),
+                            "state_name":    rr.get("state_name"),
+                            "recoveryState": rr.get("recoveryState"),
+                            "errors":        list(rr.get("errors") or []),
+                        },
+                    },
+                }, status_code=503)
+
         # Snapshot mode_status ring so we can attribute the response.
         with _state_lock:
             r = STATE.get("robot", {}) or {}
@@ -7565,6 +7664,20 @@ if FASTAPI_AVAILABLE:
             # event_log emit must never break the response.
             pass
 
+        # Every terminal response gets the §566 four-tuple dumped
+        # into the payload so a persistent failure is never a
+        # naked "mode read-back timeout" — the operator (or a
+        # future me) sees the wire truth right in the toast.
+        with _state_lock:
+            rr = STATE.get("robot", {}) or {}
+        four_tuple = {
+            "mode":          rr.get("robot_mode_code"),
+            "state_code":    rr.get("state_code"),
+            "state_name":    rr.get("state_name"),
+            "recoveryState": rr.get("recoveryState"),
+            "errors":        list(rr.get("errors") or []),
+        }
+
         if result is None:
             return JSONResponse({
                 "ok": False,
@@ -7575,7 +7688,8 @@ if FASTAPI_AVAILABLE:
                                        "OR /estun/mode_command wasn't "
                                        "subscribed yet"),
                             "orchestrated": orchestrated,
-                            "subs": subs},
+                            "subs": (rung2_subs + subs),
+                            "four_tuple": four_tuple},
             }, status_code=504)
 
         if not result.get("ok"):
@@ -7587,7 +7701,8 @@ if FASTAPI_AVAILABLE:
                             "requested": result.get("requested"),
                             "observed":  result.get("observed"),
                             "orchestrated": orchestrated,
-                            "subs": subs},
+                            "subs": (rung2_subs + subs),
+                            "four_tuple": four_tuple},
             }, status_code=409)
 
         return {

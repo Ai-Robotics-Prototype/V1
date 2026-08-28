@@ -576,7 +576,12 @@ def test_dashboard_mode_endpoint_arbiter_aware():
                   src, re.DOTALL)
     assert m
     # The handler body — enough surface to catch the arbiter block.
-    body = src[m.start(): m.start() + 6000]
+    # Endpoint has grown past 15KB with the diagnostic ladder;
+    # find the next @app.* to bound the search.
+    _next = re.search(r'\n    @app\.(?:get|post|put|delete|websocket)',
+                      src[m.end():])
+    _end = m.end() + (_next.start() if _next else 40000)
+    body = src[m.start(): _end]
     assert "arbiter_refused" in body, (
         '/api/estun/mode must return outcome.kind="arbiter_refused" '
         'when the arbiter blocks')
@@ -595,7 +600,12 @@ def test_dashboard_mode_endpoint_event_logs_on_change_and_refusal():
     m = re.search(r'@app\.post\("/api/estun/mode"\)', src)
     assert m
     # Orchestration expanded the handler past 6 KB; give it room.
-    body = src[m.start(): m.start() + 15000]
+    # Endpoint has grown past 15KB with the diagnostic ladder;
+    # find the next @app.* to bound the search.
+    _next = re.search(r'\n    @app\.(?:get|post|put|delete|websocket)',
+                      src[m.end():])
+    _end = m.end() + (_next.start() if _next else 40000)
+    body = src[m.start(): _end]
     assert '_event_log.emit' in body, (
         '/api/estun/mode must emit event_log entries')
     assert 'mode_switch' in body
@@ -610,7 +620,12 @@ def test_dashboard_mode_endpoint_reads_wire_ack():
     m = re.search(r'@app\.post\("/api/estun/mode"\).*?return \{',
                   src, re.DOTALL)
     assert m
-    body = src[m.start(): m.start() + 6000]
+    # Endpoint has grown past 15KB with the diagnostic ladder;
+    # find the next @app.* to bound the search.
+    _next = re.search(r'\n    @app\.(?:get|post|put|delete|websocket)',
+                      src[m.end():])
+    _end = m.end() + (_next.start() if _next else 40000)
+    body = src[m.start(): _end]
     assert 'req_id' in body
     assert 'mode_status' in body
     assert 'uuid' in body
@@ -698,11 +713,15 @@ def test_dashboard_mode_endpoint_orchestrates_disable_switch_enable():
     src = _server_src()
     m = re.search(r'@app\.post\("/api/estun/mode"\)', src)
     assert m
-    body = src[m.start(): m.start() + 12000]
+    _next = re.search(r'\n    @app\.(?:get|post|put|delete|websocket)',
+                      src[m.end():])
+    _end = m.end() + (_next.start() if _next else 40000)
+    body = src[m.start(): _end]
     assert "arm_enabled_interlock" in body
     # Orchestration must hit disable + enable via power_command.
     assert "_publish_estun_power" in body
-    assert '"disable"' in body and '"enable"' in body
+    assert re.search(r'''["']disable["']''', body), 'orchestration missing disable action'
+    assert re.search(r'''["']enable["']''', body),  'orchestration missing enable action'
     # Sub-step trace must be surfaced in the response, not just
     # logged — the frontend renders progress from `subs`.
     assert '"subs"' in body or "'subs'" in body
@@ -899,6 +918,119 @@ def test_cart_softening_toast_and_wrist_indicator_present():
     assert '150' in wwi
     # Unwind direction is named ("+J6" / "−J6"), not generic.
     assert 'unwind' in wwi.lower()
+
+
+# ── 2026-08-28 §566 self-healing diagnostic ladder ───────────
+
+def test_dashboard_mirrors_errors_and_recoveryState():
+    """L298 / addendum-40 §566 pinned {mode, state, stateName,
+    recoveryState, errors[]} as the four-tuple. Silent absence of
+    the last two was what turned every toAuto refusal into a
+    riddle — the diagnostic ladder can't diagnose what it can't
+    see. The dashboard's _on_estun_mode mirror MUST include both
+    keys; the driver MUST publish them in the status blob."""
+    dash = _server_src()
+    m = re.search(r'def _on_estun_mode\(self, msg\).*?for k in \((.*?)\):',
+                  dash, re.DOTALL)
+    assert m, '_on_estun_mode mirror block not found'
+    keys = m.group(1)
+    assert '"errors"' in keys, (
+        'dashboard _on_estun_mode must mirror "errors" — §566')
+    assert '"recoveryState"' in keys, (
+        'dashboard _on_estun_mode must mirror "recoveryState" — §566')
+
+    drv = _driver_src()
+    assert re.search(r"_last_errors\s*=\s*\[\]", drv), (
+        'driver must initialize _last_errors = [] at construction')
+    assert re.search(r"_recovery_state\s*=\s*0", drv), (
+        'driver must initialize _recovery_state = 0 at construction')
+    assert re.search(r"db\.get\(['\"]errors['\"]\)", drv), (
+        'driver _on_status must parse db.get("errors")')
+    assert re.search(r"db\.get\(['\"]recoveryState['\"]\)", drv), (
+        'driver _on_status must parse db.get("recoveryState")')
+
+
+def test_mode_endpoint_has_recovery_state_rung():
+    """Rung 1: recoveryState != 0 → immediate refuse with
+    reason_code=recovery_state_nonzero AND the operator instruction
+    naming the physical cabinet cycle. §566 pins that no wire path
+    clears this state; a wire-level retry would burn time and mask
+    the required physical action."""
+    src = _server_src()
+    m = re.search(r'@app\.post\("/api/estun/mode"\)', src)
+    assert m
+    # Endpoint has grown past 15KB with the diagnostic ladder;
+    # find the next @app.* to bound the search.
+    _next = re.search(r'\n    @app\.(?:get|post|put|delete|websocket)',
+                      src[m.end():])
+    _end = m.end() + (_next.start() if _next else 40000)
+    body = src[m.start(): _end]
+    assert 'recovery_state_power_cycle_required' in body, (
+        'Rung 1 outcome kind missing')
+    assert 'recovery_state_nonzero' in body, (
+        'reason_code missing — the frontend keys on this to render '
+        'the power-cycle instruction')
+    assert 'power-cycle' in body, (
+        'The instruction must NAME the physical action verbatim — '
+        'no riddle-toast')
+    # Rung 1 must reject BEFORE the orchestration attempts a
+    # switch. Regression here would rerun the "verb ack ok but mode '
+    # never transitions" loop and mask the required physical action.
+    m1 = re.search(
+        r"recovery_state_power_cycle_required.*?return JSONResponse",
+        body, re.DOTALL)
+    assert m1, (
+        'Rung 1 must return immediately — a fall-through into the '
+        'orchestration would waste the 4 s ack window on a state the '
+        'wire cannot fix.')
+
+
+def test_mode_endpoint_has_errors_clear_rung():
+    """Rung 2: errors[] latched → publish clear_alarm, wait 2 s
+    for errors[] to drain, retry mode. Auto-silent success or a
+    named refusal (errors_latched_uncleared) — never a raw
+    "mode read-back timeout" if the cause is diagnosable."""
+    src = _server_src()
+    m = re.search(r'@app\.post\("/api/estun/mode"\)', src)
+    assert m
+    # Endpoint has grown past 15KB with the diagnostic ladder;
+    # find the next @app.* to bound the search.
+    _next = re.search(r'\n    @app\.(?:get|post|put|delete|websocket)',
+                      src[m.end():])
+    _end = m.end() + (_next.start() if _next else 40000)
+    body = src[m.start(): _end]
+    assert 'publish_clear_alarm' in body, 'Rung 2 sub-step name missing'
+    assert 'await_errors_cleared' in body, 'Rung 2 sub-step name missing'
+    assert 'errors_latched_uncleared' in body, (
+        'Rung 2 failure outcome kind missing')
+    assert 'clear_alarm' in body, (
+        'Rung 2 must publish action=clear_alarm — the wire path')
+
+
+def test_mode_endpoint_dumps_four_tuple_on_terminal_failure():
+    """Any terminal failure (driver_ack_timeout, mode_switch_failed,
+    recovery_state_power_cycle_required, errors_latched_uncleared)
+    must carry the §566 four-tuple in the response payload so the
+    operator toast can render wire truth instead of a riddle."""
+    src = _server_src()
+    m = re.search(r'@app\.post\("/api/estun/mode"\)', src)
+    assert m
+    # Endpoint has grown past 15KB with the diagnostic ladder;
+    # find the next @app.* to bound the search.
+    _next = re.search(r'\n    @app\.(?:get|post|put|delete|websocket)',
+                      src[m.end():])
+    _end = m.end() + (_next.start() if _next else 40000)
+    body = src[m.start(): _end]
+    # Every terminal path must include four_tuple.
+    assert body.count('four_tuple') >= 4, (
+        'four_tuple must appear on Rung 1, Rung 2 failure, '
+        'driver_ack_timeout, AND mode_switch_failed responses — '
+        f'found {body.count("four_tuple")} references')
+    # Each tuple must carry the 5 §566 fields.
+    for field in ('mode', 'state_code', 'state_name',
+                  'recoveryState', 'errors'):
+        assert f'"{field}"' in body, (
+            f'four_tuple must include {field} — §566')
 
 
 # ── 2026-08-28 WS-jog guard demotion (verb-era trust) ─────────
