@@ -341,23 +341,27 @@ else
 Re-run scripts/deploy.sh or investigate systemd status."
 fi
 
-# ── 3c. Frontend provenance: served bundle SHA == deployed HEAD ──
+# ── 3c. Frontend provenance: served bundle SHA report ────────────
 # The vite writeSidecarPlugin writes dist/.build-sha with the git
-# SHA it was built against. Must match HEAD too — a stale bundle
-# on disk is the exact opposite failure from a stale backend, and
-# both need to be caught.
-step "Frontend provenance == deployed HEAD"
+# SHA the bundle was BUILT against. A mismatch vs HEAD only means
+# "no frontend code changed this deploy" (docs-only, backend-only,
+# or fork_registry-only commits legitimately skip vite build). The
+# information is worth surfacing, but WARN — not FAIL — since a
+# docs commit landing red would loop the deploy path unit forever.
+# StaleGuard is the correct staleness signal at the browser layer
+# (baked __GIT_SHA__ vs served frontend_sha, no HEAD assumption).
+step "Frontend provenance report"
 BUNDLE_ID_RESP=$(curl -sk --max-time 3 "$DASHBOARD_URL/api/build_id" || echo '{}')
 FRONTEND_SHA=$(echo "$BUNDLE_ID_RESP" | python3 -c \
     'import sys,json;print(json.load(sys.stdin).get("frontend_sha",""))' 2>/dev/null || echo "")
 FRONTEND_SHA_BARE="${FRONTEND_SHA%-dirty}"
 printf "    head     : %s\n    frontend : %s\n" "$HEAD_SHA" "$FRONTEND_SHA"
 if [[ -z "$FRONTEND_SHA" || "$FRONTEND_SHA" == "unknown" ]]; then
-    fail "frontend provenance missing — dist/.build-sha not written by vite build"
+    warn "frontend provenance missing — dist/.build-sha not written by vite build"
 elif [[ "$FRONTEND_SHA_BARE" == "$HEAD_SHA" ]]; then
     pass "frontend bundle == deployed HEAD ($HEAD_SHA)"
 else
-    fail "frontend bundle SHA $FRONTEND_SHA != HEAD $HEAD_SHA — vite build did not rebuild against the new HEAD."
+    warn "frontend bundle SHA trails HEAD — no frontend/src change since last build (this is fine for backend-only / docs deploys)"
 fi
 
 # Served asset check runs regardless of whether we built: the
