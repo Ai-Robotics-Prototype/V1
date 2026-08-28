@@ -6,8 +6,11 @@
 # path of least resistance:
 #
 #   1. Build the frontend if source has changed since the last built
-#      asset (vite emits directly to mock_server/static, so "if
-#      changed" is a git-timestamp check against static/index.html).
+#      asset (vite emits to frontend/dist/, which dashboard_server
+#      serves via _STATIC_DIR; "if changed" is a source-hash check
+#      against dist/index.html). 2026-08-28: comment was stale from
+#      the mock_server/static → dist/ migration (commit b1729b4);
+#      FRONTEND_OUT below refreshed with it.
 #   2. Restart roboai-dashboard AND roboai-estun so their in-memory
 #      program_ops picks up whatever's on disk now.
 #   3. Verify:
@@ -33,7 +36,7 @@ set -euo pipefail
 WS="${WS:-/home/teddy/cobot_ws}"
 DASHBOARD_URL="${DASHBOARD_URL:-https://127.0.0.1:8080}"
 FRONTEND_SRC="$WS/src/cobot_dashboard/frontend"
-FRONTEND_OUT="$WS/src/cobot_dashboard/mock_server/static"
+FRONTEND_OUT="$WS/src/cobot_dashboard/frontend/dist"
 PROGRAM_OPS="$WS/src/estun_driver/estun_driver/program_ops.py"
 
 RED=$'\e[31m'; GRN=$'\e[32m'; AMB=$'\e[33m'; DIM=$'\e[2m'; RST=$'\e[0m'

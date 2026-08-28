@@ -103,8 +103,12 @@ while ! is_idle; do
 done
 
 # Snapshot the served asset hash BEFORE deploy so we can prove it changed.
+# 2026-08-28: path refresh — served bundle now lives under frontend/dist
+# (dashboard_server _STATIC_DIR, commit b1729b4). The prior
+# mock_server/static path was stale and had been silently producing
+# `served_asset_before/after: "unknown"` in every deploy_log entry.
 before=$(grep -oE '/assets/index-[A-Za-z0-9_-]+\.js' \
-    "$WS/src/cobot_dashboard/mock_server/static/index.html" 2>/dev/null | head -1)
+    "$WS/src/cobot_dashboard/frontend/dist/index.html" 2>/dev/null | head -1)
 before="${before#/assets/index-}"
 before="${before%.js}"
 
@@ -116,7 +120,7 @@ run_log="/tmp/autodeploy_$(date +%Y%m%d_%H%M%S).log"
 bash "$DEPLOY_SCRIPT" > "$run_log" 2>&1
 code=$?
 after=$(grep -oE '/assets/index-[A-Za-z0-9_-]+\.js' \
-    "$WS/src/cobot_dashboard/mock_server/static/index.html" 2>/dev/null | head -1)
+    "$WS/src/cobot_dashboard/frontend/dist/index.html" 2>/dev/null | head -1)
 after="${after#/assets/index-}"
 after="${after%.js}"
 end_ts=$(date +%s)

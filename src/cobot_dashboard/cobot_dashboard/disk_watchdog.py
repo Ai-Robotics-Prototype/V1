@@ -12,12 +12,18 @@ crashed. Each is now capped at a well-known number and pruned
 oldest-first when the cap is exceeded.
 
 Directory caps:
-  /opt/cobot/logs           →  2 GB   (driver ws logs)
+  /opt/cobot/logs           →  300 MB (driver ws logs)
   /opt/cobot/joint_history  →  2 GB   (already enforced in
                                         joint_recorder.py; this
                                         module mirrors the number)
   /opt/cobot/event_log      →  500 MB (already enforced in
                                         event_log.py; mirrored)
+
+Retention hazard (2026-08-28): `os.remove` on Linux unlinks the
+directory entry but a writer with the file open keeps writing to
+the now-invisible inode — disk fills without a visible file. The
+prune loop always keeps the newest file to protect the LIVE
+writer. Cap of 300 MB accommodates ~5 rotated 60 MB files.
 
 Watchdog thresholds — free space on the / partition:
   WARN     — < 2 GB free → footer widget goes amber; operator
@@ -46,7 +52,7 @@ COBOT_ROOT = '/opt/cobot'
 # Directory-level caps (bytes). Prune runs on every enforce_all()
 # call, cheap when nothing to do.
 DIR_CAPS = {
-    '/opt/cobot/logs':          2 * 1024 ** 3,   # 2 GB
+    '/opt/cobot/logs':          300 * 1024 ** 2, # 300 MB (2026-08-28: was 2 GB)
     '/opt/cobot/joint_history': 2 * 1024 ** 3,   # 2 GB — mirror of joint_recorder
     '/opt/cobot/event_log':     500 * 1024 ** 2, # 500 MB — mirror of event_log
 }
@@ -131,7 +137,11 @@ def _prune_dir(path: str, cap_bytes: int,
         total = sum(e[1] for e in entries)
         freed = 0
         i = 0
-        while total > cap_bytes and i < len(entries):
+        # Never remove the newest file — a writer likely has it
+        # open, and `os.remove` on an open inode fills the disk
+        # silently (2026-08-28). Cap the loop at len-1.
+        limit = max(0, len(entries) - 1)
+        while total > cap_bytes and i < limit:
             _, size, fp = entries[i]
             try:
                 os.remove(fp)
