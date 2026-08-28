@@ -7412,12 +7412,33 @@ if FASTAPI_AVAILABLE:
             subs.append({"step": "await_disabled",
                          "ok": disabled_ok})
             if disabled_ok:
-                # Retry the mode switch — this is the interlock-
-                # clean state per FACTS: mode-switch-requires-disable.
+                # Controller settle window (2026-08-28 acceptance).
+                # State mirror flipping enabled=False means we saw
+                # the first frame of it; the controller may still be
+                # settling internally. First retry inside 3 s
+                # frequently misses the transition even though the
+                # arm IS disabled. Give the controller 750 ms to
+                # settle, then retry. If THAT still misses, retry
+                # once more — the operator's live-correlated MANUAL→
+                # AUTO transition landed in <100 ms of the actual
+                # click, so two 4 s windows separated by a 500 ms
+                # rest is a comfortable 9-second envelope.
+                await asyncio.sleep(0.75)
+                subs.append({"step": "controller_settle",
+                             "duration_s": 0.75})
                 retry = await _attempt(op)
                 subs.append({"step": "retry_mode_switch",
                              "ok": bool(retry and retry.get("ok")),
                              "reason_code": (retry or {}).get("reason_code")})
+                if retry is not None and not retry.get("ok") \
+                        and retry.get("reason_code") == "mode_readback_timeout":
+                    await asyncio.sleep(0.5)
+                    retry2 = await _attempt(op)
+                    subs.append({"step": "retry_mode_switch_2",
+                                 "ok": bool(retry2 and retry2.get("ok")),
+                                 "reason_code": (retry2 or {}).get("reason_code")})
+                    if retry2 is not None and retry2.get("ok"):
+                        retry = retry2
                 # Re-enable regardless of switch outcome — leaving
                 # the arm disabled after a failed switch is worse
                 # than leaving it in the pre-switch mode.
