@@ -383,6 +383,53 @@ confirm; the driver's `_on_mode_command` pre-checks `enabled` and
 refuses standalone with `reason_code=arm_enabled_interlock` so a
 raw call surfaces the rule instead of silently timing out.
 
+## WS-jog guard demotion (verb-era trust, 2026-08-28)
+
+Streamed-era vs verb-era trust boundary. When we sent 250 Hz
+joint-position setpoints via UDP :9030 (CRI-day, addendum-32
+§506), WE had to enforce every kinematic limit, singularity guard,
+and joint-velocity cap in the driver — the controller received
+raw position commands with no room for it to intervene. On the
+WS `Robot/jog` verb (`{ty:"Robot/jog", db:{mode, speed, index,
+coorType, coorId}}`), the CC10-A firmware is BETWEEN us and the
+motion: it does the IK, clamps commanded joint velocity, refuses
+travel past axis limits, and stops without erroring at wrist
+singularities. The factory pendant proves it — it slows / stops
+the RIGHT axis under identical conditions where our driver used
+to kill the entire hold from outside.
+
+Param `wsjog_trust_firmware_clamps` (default **True**) demotes
+the redundant guards on the cart WS-jog path to observe-only.
+Under observe, `cart_softening.mode='observe'` populates with a
+cause tag; the dashboard toasts an INFO ("firmware is clamping")
+instead of a warning ("Slowed by our scaling").
+
+**Demoted (observe-only, cart mode):**
+- `cart_limit_at_wall` — joint |q| ≥ physical limit
+- `cart_limit_deepening` — joint past soft edge, velocity same sign
+- `joint_limit_soft` — angular limit soft-zone approach
+- `joint_overspeed` — posture-derivative |dq/dt| > cap
+- `singularity_guard` — σ_min ≤ σ_hard
+- `sigma_soft` — σ_min in scaling zone
+
+**Kept enforced (any mode):**
+- Freshness deadman (hold staleness / hb send failed) — firmware
+  cannot detect browser death; our layer must.
+- Arbiter (jog vs running program) — JOG-11 architectural policy.
+- `collision_guard` (self / ground / env) — our unique layer;
+  firmware knows nothing about our capsule model, the ground
+  plane, or the workspace zones.
+- JOINT-mode `escape_only` + JointRecoveryModal — UX-level guard
+  the operator explicitly asked for (add-42).
+- Faults / disable / release / hold-transition / zero-speed /
+  increment-end — protocol semantics + operator gestures.
+
+Regression override: `WSJOG_TRUST_FIRMWARE_CLAMPS=0` on
+`roboai-estun` restores the streamed-era ENFORCE behavior end-
+to-end (all six demoted causes fire their pre-08-28 scale/stop
+paths). Doctrine tests refuse a commit that flips the default OR
+removes any observe branch.
+
 ## Joint-velocity governor (cartesian holds, 2026-08-28)
 
 `cart_joint_velocity_cap_radps` (default 1.5 rad/s per joint)

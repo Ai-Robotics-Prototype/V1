@@ -531,6 +531,21 @@ class EstunCodroidDriver(Node):
         # numeric `robot_mode_code` (0=AUTO, 1=MANUAL, 2=REMOTE)
         # per L298 — stateName strings are not ground truth.
         self.declare_parameter('allow_mode', False)
+        # ── WS-jog guard demotion (2026-08-28) ──────────────────
+        # Streamed-era guards vs verb-era trust boundary. When we
+        # sent 250 Hz joint-position setpoints via UDP, WE had to
+        # enforce every limit ourselves. On the WS Robot/jog verb,
+        # the CC10-A firmware clamps commanded joint velocity,
+        # enforces axis limits, and handles IK degeneracy natively
+        # — the factory pendant proves it (it slows / stops the
+        # right axis without ever killing the hold from outside).
+        # When this param is true (default), the cart-mode
+        # redundant guards (cart_limit_approach, joint_overspeed,
+        # singularity_guard, joint_limit soft scale) DEMOTE to
+        # observe-only: they populate cart_softening for the
+        # dashboard toast but neither stop nor scale the WS verb.
+        # See ledger addendum-50 for the parity rationale.
+        self.declare_parameter('wsjog_trust_firmware_clamps', True)
 
         # Cadence knobs.
         self.declare_parameter('recv_timeout_s', 5.0)   # matches posture.py
@@ -683,6 +698,16 @@ class EstunCodroidDriver(Node):
         if env_mode is not None:
             self._allow_mode = env_mode.strip().lower() in ('1', 'true', 'yes', 'on')
             self._allow_mode_source = 'ESTUN_ALLOW_MODE'
+
+        # WS-jog guard demotion — resolved into a runtime bool. Env
+        # override `WSJOG_TRUST_FIRMWARE_CLAMPS=0` restores the
+        # streamed-era ENFORCE behavior for regression testing.
+        self._wsjog_trust_firmware_clamps = bool(
+            self.get_parameter('wsjog_trust_firmware_clamps').value)
+        env_trust = os.environ.get('WSJOG_TRUST_FIRMWARE_CLAMPS')
+        if env_trust is not None:
+            self._wsjog_trust_firmware_clamps = env_trust.strip().lower() \
+                in ('1', 'true', 'yes', 'on')
 
         self._allow_io = bool(self.get_parameter('allow_io').value)
         self._allow_io_source = 'param'
@@ -3136,6 +3161,17 @@ class EstunCodroidDriver(Node):
                         # physical limit regardless of direction. This
                         # is the "the wall is real" case.
                         if abs(current) >= limit:
+                            if self._wsjog_trust_firmware_clamps:
+                                # 2026-08-28 demoted: the firmware
+                                # clamps at the wall. We just observe.
+                                self._cart_softening = {
+                                    'active': True, 'mode': 'observe',
+                                    'cause': 'cart_limit_at_wall',
+                                    'limiting_joint_1based': i + 1,
+                                    'current_deg': current,
+                                    'limit_deg':   limit,
+                                }
+                                continue
                             self._stop_jog_locked(
                                 reason=f'cart limit approach J{i+1} at {current:+.2f}° '
                                        f'(|>{limit:.2f}°| physical, dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
@@ -3157,6 +3193,18 @@ class EstunCodroidDriver(Node):
                             continue
                         if (v > 0 and current > 0) or (v < 0 and current < 0):
                             # Same sign — deepening the violation.
+                            if self._wsjog_trust_firmware_clamps:
+                                # 2026-08-28 demoted: firmware handles
+                                # the axis clamp; hold survives.
+                                self._cart_softening = {
+                                    'active': True, 'mode': 'observe',
+                                    'cause': 'cart_limit_deepening',
+                                    'limiting_joint_1based': i + 1,
+                                    'current_deg': current,
+                                    'safe_edge_deg': safe_edge,
+                                    'velocity_dps': v,
+                                }
+                                continue
                             self._stop_jog_locked(
                                 reason=f'cart limit approach J{i+1} at {current:+.2f}° '
                                        f'(v={v:+.2f}°/s deeper, |>{safe_edge:.2f}° soft, '
@@ -3177,29 +3225,51 @@ class EstunCodroidDriver(Node):
                      soft_headroom) = self._joint_limit_approach_scale_locked(cur_frac)
                     if soft_scale < 1.0:
                         prev = self._cart_softening
-                        self._cart_softening = {
-                            'active': True,
-                            'limiting_joint_1based': soft_joint,
-                            'current_deg':  soft_current,
-                            'safe_edge_deg': soft_safe_edge,
-                            'headroom_deg': soft_headroom,
-                            'scale': soft_scale,
-                        }
-                        emitted = self._apply_cart_speed_scale_locked(
-                            soft_scale, 'joint_limit_soft')
-                        if emitted or prev is None:
-                            self.get_logger().info(
-                                f'joint-limit softening J{soft_joint}: '
-                                f'current={soft_current:+.2f}° '
-                                f'headroom={soft_headroom:+.2f}° '
-                                f'scale={soft_scale:.2f}')
+                        if self._wsjog_trust_firmware_clamps:
+                            # 2026-08-28 demoted: firmware clamps at
+                            # the axis limit. We observe only.
+                            self._cart_softening = {
+                                'active': True, 'mode': 'observe',
+                                'cause': 'joint_limit_soft',
+                                'limiting_joint_1based': soft_joint,
+                                'current_deg':  soft_current,
+                                'safe_edge_deg': soft_safe_edge,
+                                'headroom_deg': soft_headroom,
+                                'would_have_scaled_to': soft_scale,
+                            }
+                            if prev is None or prev.get('cause') != 'joint_limit_soft':
+                                self.get_logger().info(
+                                    f'joint-limit observe J{soft_joint}: '
+                                    f'current={soft_current:+.2f}° '
+                                    f'headroom={soft_headroom:+.2f}° '
+                                    f'would_have_scaled_to={soft_scale:.2f} '
+                                    f'(firmware clamps)')
+                        else:
+                            self._cart_softening = {
+                                'active': True, 'mode': 'scale',
+                                'cause': 'joint_limit_soft',
+                                'limiting_joint_1based': soft_joint,
+                                'current_deg':  soft_current,
+                                'safe_edge_deg': soft_safe_edge,
+                                'headroom_deg': soft_headroom,
+                                'scale': soft_scale,
+                            }
+                            emitted = self._apply_cart_speed_scale_locked(
+                                soft_scale, 'joint_limit_soft')
+                            if emitted or prev is None:
+                                self.get_logger().info(
+                                    f'joint-limit softening J{soft_joint}: '
+                                    f'current={soft_current:+.2f}° '
+                                    f'headroom={soft_headroom:+.2f}° '
+                                    f'scale={soft_scale:.2f}')
                     else:
                         # Left the soft zone. Rate-limited restore back to
                         # the commanded magnitude runs through the same
                         # helper (up-ramp cap prevents an instant slam).
                         if self._cart_softening is not None:
-                            self._apply_cart_speed_scale_locked(
-                                1.0, 'joint_limit_soft_restore')
+                            if not self._wsjog_trust_firmware_clamps:
+                                self._apply_cart_speed_scale_locked(
+                                    1.0, 'joint_limit_soft_restore')
                             self._cart_softening = None
                     # ── Singularity + overspeed governor (cart only) ──
                     # Compute σ_min at live joint angles; scale/stop the
@@ -3216,10 +3286,20 @@ class EstunCodroidDriver(Node):
                             sigma, dyn_soft, self._cart_sigma_hard)
                         self._last_sing_scale = scale
                         if sigma is not None and sigma <= self._cart_sigma_hard:
-                            self._stop_jog_locked(
-                                reason=f'singularity guard (σ_min={sigma:.4f} '
-                                       f'≤ hard={self._cart_sigma_hard:.3f})')
-                            return
+                            if self._wsjog_trust_firmware_clamps:
+                                # 2026-08-28 demoted: firmware handles
+                                # IK degeneracy natively. Observe only.
+                                self._cart_softening = {
+                                    'active': True, 'mode': 'observe',
+                                    'cause': 'singularity_guard',
+                                    'sigma_min': sigma,
+                                    'sigma_hard': self._cart_sigma_hard,
+                                }
+                            else:
+                                self._stop_jog_locked(
+                                    reason=f'singularity guard (σ_min={sigma:.4f} '
+                                           f'≤ hard={self._cart_sigma_hard:.3f})')
+                                return
                         # Reactive backstop — the sole line of defense
                         # when the DH model is off, or when the incident
                         # is IK-controller-side rather than kinematics-
@@ -3242,16 +3322,36 @@ class EstunCodroidDriver(Node):
                                         worst_ratio = ratio
                                         worst_i     = i
                                         worst_dq    = dq_rps
-                                # 2026-08-28 velocity scaling (not hard stop).
-                                # Operator directive: cartesian holds must
-                                # survive near-limit wrist geometry — scale
-                                # the cart magnitude so the demanded joint
-                                # velocity fits under the per-joint cap
-                                # (factory-pendant behavior). Hard-stop is
-                                # RESERVED for axis-limit contact
-                                # (escape_only path) and true faults. See
-                                # HARDWARE.md > joint-velocity governor.
-                                if worst_ratio > 1.0 and worst_i >= 0:
+                                # 2026-08-28 velocity scaling was the
+                                # first step; final step is the demotion
+                                # to observe-only when firmware clamps
+                                # are trusted (parity with pendant).
+                                # ENFORCE branch below retains the
+                                # scaled behavior for regression testing
+                                # via WSJOG_TRUST_FIRMWARE_CLAMPS=0.
+                                if worst_ratio > 1.0 and worst_i >= 0 \
+                                        and self._wsjog_trust_firmware_clamps:
+                                    # Observe only — firmware clamps
+                                    # per-joint velocity. We track for
+                                    # telemetry + optional operator
+                                    # coach toast.
+                                    prev_soft = self._cart_softening
+                                    self._cart_softening = {
+                                        'active': True, 'mode': 'observe',
+                                        'cause':  'joint_overspeed',
+                                        'limiting_joint_1based': worst_i + 1,
+                                        'observed_dq_rps': worst_dq,
+                                        'cap_rps': self._cart_joint_v_cap,
+                                    }
+                                    if prev_soft is None or (
+                                            prev_soft.get('cause')
+                                            != 'joint_overspeed'):
+                                        self.get_logger().info(
+                                            f'joint-overspeed observe J{worst_i+1}: '
+                                            f'dq={worst_dq:+.2f} rad/s '
+                                            f'(cap {self._cart_joint_v_cap:.2f}) '
+                                            '(firmware clamps)')
+                                elif worst_ratio > 1.0 and worst_i >= 0:
                                     # Aim ~15 % below the cap so a small
                                     # kinematic wiggle doesn't retrigger.
                                     target_scale = 0.85 / worst_ratio
@@ -3301,7 +3401,24 @@ class EstunCodroidDriver(Node):
                         # per tick. If a downward change wanted, apply
                         # immediately; upward changes rate-limit.
                         if scale < 1.0 and sigma is not None:
-                            self._apply_governor_scale_locked(sigma, scale)
+                            if self._wsjog_trust_firmware_clamps:
+                                # 2026-08-28 demoted: firmware IK
+                                # naturally slows the arm through
+                                # singularity approach. Observe only.
+                                # Do not overwrite cart_softening if
+                                # a more-specific cause is already
+                                # populated by an earlier block.
+                                if not self._cart_softening \
+                                        or self._cart_softening.get('cause') \
+                                        == 'sigma_soft':
+                                    self._cart_softening = {
+                                        'active': True, 'mode': 'observe',
+                                        'cause': 'sigma_soft',
+                                        'sigma_min': sigma,
+                                        'would_have_scaled_to': scale,
+                                    }
+                            else:
+                                self._apply_governor_scale_locked(sigma, scale)
 
                 # ── Self-collision guard (both joint and cartesian) ──
                 # Applied AFTER the limit clamp + singularity governor

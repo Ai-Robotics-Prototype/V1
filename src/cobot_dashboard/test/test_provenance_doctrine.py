@@ -835,40 +835,31 @@ def test_operator_copy_covers_every_stop_tag():
 
 # ── 2026-08-28 wrist-friendly cart holds ──────────────────────
 
-def test_cart_hold_scales_not_stops_on_joint_overspeed():
-    """Operator directive (2026-08-28): cartesian holds must not
-    hard-stop when a joint's required velocity approaches its cap.
-    The driver SCALES the commanded magnitude via
-    _apply_cart_speed_scale_locked; hard-stop is reserved for true
-    axis-limit contact + scaling-exhausted fault. Regression here
-    would restore the "4 stops in 2 min" wrist-hold class."""
+def test_cart_hold_does_not_hard_stop_on_joint_overspeed():
+    """Under the verb-era trust default (2026-08-28), cart holds
+    must NOT hard-stop on the joint-overspeed path — the firmware
+    clamps. The observe branch populates cart_softening with
+    cause='joint_overspeed', mode='observe'; the arm slows via
+    firmware clamp, not our stopJog+fresh-Robot/jog dance.
+
+    The ENFORCE branch is retained inside `elif worst_ratio > 1.0
+    ...` for regression testing under
+    WSJOG_TRUST_FIRMWARE_CLAMPS=0, but the default must be observe."""
     src = _driver_src()
-    # Find the joint-overspeed decision block (posture-derivative
-    # backstop inside _on_jog_supervise).
+    # The observe branch: cause=joint_overspeed + mode=observe
+    # inside a wsjog_trust guard. Covered by
+    # test_wsjog_redundant_guards_demoted_to_observe already; here
+    # we specifically pin that observe fires BEFORE the enforce
+    # branch (elif order matters — the elif keeps the ENFORCE
+    # scaling under regression flag).
     m = re.search(
-        r"# 2026-08-28 velocity scaling.*?target_scale\s*=",
-        src, re.DOTALL)
-    assert m, ('velocity-scaling block not found in driver source — '
-               'regression: the "hard-stop on overspeed" path is back.')
-    tail = src[m.start(): m.start() + 4000]
-    # Must call the shared scaling helper.
-    assert '_apply_cart_speed_scale_locked' in tail, (
-        'joint-overspeed block must delegate to '
-        '_apply_cart_speed_scale_locked — do not reimplement the '
-        'stopJog + fresh Robot/jog dance.')
-    # cart_softening carries the cause + limiting joint so the
-    # frontend toast can name them.
-    assert "'cause':" in tail and "joint_overspeed" in tail
-    assert "limiting_joint_1based" in tail
-    # Hard-stop escape hatch must survive but ONLY on
-    # scaling-exhausted conditions (target_scale near 0, ratio
-    # extreme, last-sent speed already tiny).
-    escape = re.search(
-        r"target_scale\s*<\s*0\.08.*?_stop_jog_locked",
-        tail, re.DOTALL)
-    assert escape, (
-        'the exhausted-scaling hard-stop escape hatch must remain '
-        'so a truly unrecoverable pose still produces a named refusal.')
+        r"if worst_ratio\s*>\s*1\.0 and worst_i\s*>=\s*0\s*"
+        r"\\\n?\s*and self\._wsjog_trust_firmware_clamps:",
+        src)
+    assert m, (
+        'observe branch must be the leading if-clause on the '
+        'joint-overspeed decision — regression: hard-stop or scale '
+        'is running before the observe path.')
 
 
 def test_cart_softening_toast_and_wrist_indicator_present():
@@ -908,6 +899,92 @@ def test_cart_softening_toast_and_wrist_indicator_present():
     assert '150' in wwi
     # Unwind direction is named ("+J6" / "−J6"), not generic.
     assert 'unwind' in wwi.lower()
+
+
+# ── 2026-08-28 WS-jog guard demotion (verb-era trust) ─────────
+
+def test_wsjog_trust_firmware_gate_defaults_true():
+    """Streamed-era guards on the WS jog path DEMOTE to observe-
+    only under the `wsjog_trust_firmware_clamps` param (default
+    True). Regression would restore the "our driver kills the
+    hold while the pendant doesn't" class."""
+    src = _driver_src()
+    m = re.search(
+        r"declare_parameter\(['\"]wsjog_trust_firmware_clamps['\"],\s*(\w+)\)",
+        src)
+    assert m, ('wsjog_trust_firmware_clamps parameter must exist — '
+               'this is the feature gate for the verb-era trust '
+               'boundary')
+    assert m.group(1) == 'True', (
+        f'default must be True (observe-only); got {m.group(1)!r}. '
+        'Flipping this back to False regresses to the streamed-era '
+        'guards that killed factory-parity holds.')
+    assert 'WSJOG_TRUST_FIRMWARE_CLAMPS' in src, (
+        'env override must exist so a regression session can '
+        'restore ENFORCE without a source edit')
+
+
+def test_wsjog_redundant_guards_demoted_to_observe():
+    """Each of the five redundant guards on the cart WS-jog path
+    must have an observe branch gated on
+    `self._wsjog_trust_firmware_clamps`. A stop-only or scale-only
+    block for these causes is the regression this doctrine forbids."""
+    src = _driver_src()
+    # The five demoted guards, each identified by its cart_softening
+    # cause tag. Each cause must appear inside an
+    # `if self._wsjog_trust_firmware_clamps:` block AND its
+    # cart_softening entry must carry `mode: 'observe'`.
+    demoted_causes = (
+        'cart_limit_at_wall',
+        'cart_limit_deepening',
+        'joint_limit_soft',
+        'singularity_guard',
+        'joint_overspeed',
+        'sigma_soft',
+    )
+    for cause in demoted_causes:
+        # The cause tag must appear NEAR a `'mode': 'observe'` line
+        # AND inside a wsjog_trust guard.
+        pat = (r"if self\._wsjog_trust_firmware_clamps:"
+               r".*?'cause':\s*'" + re.escape(cause) + r"'"
+               r".*?'mode':\s*'observe'")
+        pat_alt = (r"if self\._wsjog_trust_firmware_clamps:"
+                   r".*?'mode':\s*'observe'"
+                   r".*?'cause':\s*'" + re.escape(cause) + r"'")
+        assert re.search(pat, src, re.DOTALL) \
+            or re.search(pat_alt, src, re.DOTALL), (
+            f'demoted cause {cause!r} must have an observe branch '
+            f'gated on wsjog_trust_firmware_clamps and populate '
+            f"cart_softening with mode='observe'.")
+
+
+def test_wsjog_hard_enforce_guards_still_present():
+    """The KEEP list on the WS-jog path: collision_guard (self /
+    ground / env — our unique layer the firmware knows nothing
+    about), keepalive deadman, faults, disable/release/hold-
+    transition, arbiter refuses, and JOINT-mode escape_only. Any
+    of these disappearing is a safety regression, not a parity
+    improvement."""
+    src = _driver_src()
+    # Collision guard hard-stop must remain — no wsjog_trust gate.
+    # Grep for a _stop_jog_locked with collision-guard reason
+    # NOT inside a trust-gate. Simpler proxy: assert the pattern
+    # `collision_guard` maps to _stop_jog_locked without a
+    # wsjog_trust prefix on that line.
+    m = re.search(r"self\._stop_jog_locked\(\s*\n\s*reason=f?['\"]"
+                  r"\{kind\} guard",
+                  src)
+    assert m, ('collision-guard hard-stop must remain — search for '
+               '_stop_jog_locked(reason=f"{kind} guard ..." expected')
+    # Escape-only (joint mode) must remain enforced.
+    assert re.search(r"reason=f?['\"]escape_only J\{ax\}", src), (
+        'JOINT-mode escape_only enforcement must remain — it is a '
+        'UX-level guard, not firmware-redundant.')
+    # Freshness deadman (keepalive) must remain — firmware cannot
+    # detect browser death.
+    assert re.search(r"hold staleness", src), (
+        'freshness deadman (hold staleness) must remain enforced — '
+        'firmware cannot detect browser death')
 
 
 def test_frontend_run_modal_offers_switch_to_auto():
