@@ -61,6 +61,13 @@ export default function ModeControl() {
   const progRunning = ((robot.program || {}).state === 2)
   const arbiterBlocked = jogActive || progRunning
   const canOpen = allowMode && !pending && !arbiterBlocked
+  // 2026-08-28 enable-interlock: the controller silently refuses
+  // toAuto/toManual/toRemote while enabled=True. /api/estun/mode
+  // orchestrates disable → switch → re-enable behind one confirm;
+  // the dialog surfaces the sub-steps so the operator sees the
+  // consequence before consenting.
+  const enabled = !!robot.enabled
+  const needsInterlockDance = enabled
 
   const openDialog = () => {
     if (!canOpen) return
@@ -145,6 +152,7 @@ export default function ModeControl() {
           onConfirm={() => runSwitch(dialog)}
           onPickOther={(t) => setDialog(t)}
           currentCode={code}
+          needsInterlockDance={needsInterlockDance}
         />
       )}
     </>
@@ -158,7 +166,7 @@ export default function ModeControl() {
 // re-clicking.
 function ModeConfirmDialog({
   currentLabel, currentColor, target, pending, currentCode,
-  onCancel, onConfirm, onPickOther,
+  onCancel, onConfirm, onPickOther, needsInterlockDance,
 }) {
   const targetColor = MODE_COLOR[target.code] || '#6b7280'
   return (
@@ -199,6 +207,24 @@ function ModeConfirmDialog({
           borderLeft: '3px solid ' + targetColor,
           borderRadius: 3, lineHeight: 1.5,
         }}>{target.detail}</div>
+        {needsInterlockDance && (
+          <div style={{
+            fontSize: 12, color: '#FDBA74', marginBottom: 12,
+            padding: '10px 12px',
+            background: 'rgba(251,146,60,0.08)',
+            borderLeft: '3px solid #FB923C',
+            borderRadius: 3, lineHeight: 1.5,
+          }}>
+            <b>Robot is ENABLED.</b> The controller refuses mode switches
+            while enabled, so confirming will run the following sequence
+            behind this dialog:
+            <ol style={{ margin: '6px 0 0 20px', padding: 0, fontSize: 11.5 }}>
+              <li>Disable the arm (servos drop).</li>
+              <li>Switch mode to <b>{target.label}</b>.</li>
+              <li>Re-enable the arm.</li>
+            </ol>
+          </div>
+        )}
         <div style={{
           display: 'flex', gap: 6, flexWrap: 'wrap',
           marginBottom: 16, alignItems: 'center',

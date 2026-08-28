@@ -503,6 +503,16 @@ def test_check_bundle_id_toast_retired():
             f'{banned} state field must be removed.')
 
 
+def _hardware_md() -> str:
+    with open(os.path.join(WS, 'docs', 'HARDWARE.md')) as fh:
+        return fh.read()
+
+
+def _facts_md() -> str:
+    with open(os.path.join(WS, 'docs', 'FACTS.md')) as fh:
+        return fh.read()
+
+
 def _driver_src() -> str:
     with open(os.path.join(
         WS, 'src', 'estun_driver', 'estun_driver',
@@ -582,11 +592,10 @@ def test_dashboard_mode_endpoint_event_logs_on_change_and_refusal():
     refused. Success + failure both emit — silent success is what
     caused the "what changed?" investigations."""
     src = _server_src()
-    # api_estun_mode handler window.
-    m = re.search(r'@app\.post\("/api/estun/mode"\).*?return \{',
-                  src, re.DOTALL)
+    m = re.search(r'@app\.post\("/api/estun/mode"\)', src)
     assert m
-    body = src[m.start(): m.start() + 6000]
+    # Orchestration expanded the handler past 6 KB; give it room.
+    body = src[m.start(): m.start() + 15000]
     assert '_event_log.emit' in body, (
         '/api/estun/mode must emit event_log entries')
     assert 'mode_switch' in body
@@ -624,6 +633,95 @@ def test_mode_control_component_is_canonical_and_guarded():
     # Arbiter-aware disable — the pill knows before the endpoint
     # trip that the switch would refuse.
     assert 'jog_active' in j and 'program' in j
+
+
+# ── 2026-08-28 mode-map correlation + enable-interlock ────────
+
+def test_hardware_md_has_mode_code_table():
+    """HARDWARE.md must carry the numeric-to-label map as a
+    canonical constant table. Any code that gates on mode reads
+    from this table (or a copy that matches). The correlation
+    was locked 2026-08-28 by disable → factory-UI-click → wire
+    observation; the table cites it."""
+    h = _hardware_md()
+    assert "Robot-mode code table" in h
+    # All three rows must be present with numeric ↔ label.
+    for token in ("AUTO", "MANUAL", "REMOTE"):
+        assert token in h, f'HARDWARE.md missing {token} label'
+    # Execution-path cross-reference must be present so the
+    # F2 executor's CRI = REMOTE precondition is discoverable
+    # from the map itself.
+    assert "REMOTE" in h and "CRI" in h
+    assert "AUTO" in h and "WS-programs" in h
+    # Enable-interlock rule must be stated with the exact reason
+    # code the driver emits.
+    assert "arm_enabled_interlock" in h
+    assert "disable" in h.lower() and "re-enable" in h.lower()
+
+
+def test_facts_md_names_mode_header_lies_and_enable_interlock():
+    """FACTS.md must carry two ambient truths so any future
+    session sees them before writing mode-adjacent code:
+    (1) factory-UI mode header can lie (mode-edition of L298),
+    (2) mode switch requires arm disabled first (Codroid
+    interlock)."""
+    f = _facts_md()
+    assert "Factory-UI mode header can lie" in f
+    assert "numeric" in f and "robot_mode_code" in f
+    assert "Mode switch requires arm disabled first" in f
+    assert "arm_enabled_interlock" in f
+
+
+def test_driver_refuses_mode_switch_when_enabled():
+    """The driver's _on_mode_command must pre-check `_enabled`
+    and refuse with reason_code=arm_enabled_interlock. The
+    controller silently refuses the WS verb while enabled — the
+    read-back would time out and the operator would see a stale
+    generic error. Explicit refusal names the rule so the
+    dashboard orchestrator (or a direct caller) can act on it."""
+    src = _driver_src()
+    m = re.search(r"def _on_mode_command\(self, msg\)", src)
+    assert m
+    tail = src[m.start():]
+    end = re.search(r"\n    def ", tail[100:])
+    body = tail[:100 + (end.start() if end else 4000)]
+    assert "_enabled" in body
+    assert "arm_enabled_interlock" in body
+
+
+def test_dashboard_mode_endpoint_orchestrates_disable_switch_enable():
+    """/api/estun/mode must, on arm_enabled_interlock, orchestrate
+    disable → retry mode switch → re-enable behind a single
+    operator confirm. The sub-step trace must ride in the
+    response so the frontend can render it and the event log can
+    record it."""
+    src = _server_src()
+    m = re.search(r'@app\.post\("/api/estun/mode"\)', src)
+    assert m
+    body = src[m.start(): m.start() + 12000]
+    assert "arm_enabled_interlock" in body
+    # Orchestration must hit disable + enable via power_command.
+    assert "_publish_estun_power" in body
+    assert '"disable"' in body and '"enable"' in body
+    # Sub-step trace must be surfaced in the response, not just
+    # logged — the frontend renders progress from `subs`.
+    assert '"subs"' in body or "'subs'" in body
+    # Re-enable must always fire — leaving the arm disabled after
+    # a failed switch is worse than leaving it in the pre-switch
+    # mode.
+    assert "publish_enable" in body
+    assert "await_enabled" in body
+
+
+def test_mode_control_dialog_names_interlock_dance():
+    """When the arm is enabled at dialog time, ModeControl must
+    surface the disable → switch → re-enable sub-steps to the
+    operator BEFORE they confirm. Silent orchestration would
+    surprise the operator when servos drop."""
+    j = _mode_control_jsx()
+    assert "needsInterlockDance" in j
+    assert "Disable the arm" in j
+    assert "Re-enable the arm" in j
 
 
 def test_frontend_run_modal_offers_switch_to_auto():

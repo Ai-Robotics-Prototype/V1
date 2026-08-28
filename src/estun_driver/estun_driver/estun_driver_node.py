@@ -1801,6 +1801,27 @@ class EstunCodroidDriver(Node):
                 'req_id': req_id, 'ts': time.time()})
             return
 
+        # Enable-interlock (2026-08-28, session-correlated). The
+        # controller silently refuses toAuto/toManual/toRemote while
+        # the arm is enabled: the WS verb ack returns ok=True but
+        # publish/RobotStatus.mode never transitions. Rather than let
+        # the read-back time out (3 s of wasted wall-clock), pre-check
+        # `_enabled` and refuse LOUDLY with a reason_code the dashboard
+        # can key off to orchestrate the disable → switch → re-enable
+        # sequence behind a single operator confirm. See HARDWARE.md
+        # > Robot-mode code table and FACTS.md for the map + rule.
+        if self._enabled:
+            self._publish_mode_status({
+                'ok': False, 'op': op, 'requested': target_code,
+                'observed': already,
+                'reason': ('mode switch refused: arm is enabled — '
+                           'controller silently refuses toAuto/toManual/'
+                           'toRemote while state=2. Disable first, then '
+                           'switch, then re-enable.'),
+                'reason_code': 'arm_enabled_interlock',
+                'req_id': req_id, 'ts': time.time()})
+            return
+
         ok_verb = self._ws_verb(verb)
         self.get_logger().info(f'{verb} sent ok={ok_verb} '
                                f'req_id={req_id}')

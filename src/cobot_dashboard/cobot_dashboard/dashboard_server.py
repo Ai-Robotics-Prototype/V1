@@ -7337,41 +7337,112 @@ if FASTAPI_AVAILABLE:
             current_code = int(r.get("robot_mode_code") if isinstance(
                 r.get("robot_mode_code"), int) else -1)
 
-        # Publish the mode_command envelope. Use a distinctive req_id
-        # so a concurrent caller can't mistakenly consume our result.
         import uuid
-        req_id = uuid.uuid4().hex[:12]
-        try:
-            m = String()
-            m.data = json.dumps({"op": op, "req_id": req_id})
-            _ros_node._estun_mode_pub.publish(m)
-        except Exception as e:
-            return JSONResponse({
-                "ok": False,
-                "outcome": {"kind": "publish_failed",
-                            "reason": f"publish /estun/mode_command failed: {e}"},
-            }, status_code=502)
 
-        # Wait for the matching envelope (up to 4 s — driver's own
-        # readback is 3 s, plus ~1 s slack for ROS transport +
-        # scheduling).
-        deadline = time.time() + 4.0
-        result = None
-        while time.time() < deadline:
-            await asyncio.sleep(0.05)
+        # Inner helper — one mode-switch attempt. Returns the
+        # /estun/mode_status envelope or None on driver-ack timeout.
+        async def _attempt(op_name):
+            rid = uuid.uuid4().hex[:12]
             with _state_lock:
-                r = STATE.get("robot", {}) or {}
-                ring = r.get("mode_status") or []
-                new_events = ring[ms_before:]
-            for ev in new_events:
-                if ev.get("req_id") == req_id:
-                    result = ev
-                    break
-            if result is not None:
-                break
+                r0 = STATE.get("robot", {}) or {}
+                ring_before = len(r0.get("mode_status") or [])
+            try:
+                m0 = String()
+                m0.data = json.dumps({"op": op_name, "req_id": rid})
+                _ros_node._estun_mode_pub.publish(m0)
+            except Exception as e:
+                return {"ok": False,
+                        "reason": f"publish /estun/mode_command failed: {e}",
+                        "reason_code": "publish_failed",
+                        "req_id": rid}
+            dl = time.time() + 4.0
+            while time.time() < dl:
+                await asyncio.sleep(0.05)
+                with _state_lock:
+                    rr = STATE.get("robot", {}) or {}
+                    ring = rr.get("mode_status") or []
+                    new_ev = ring[ring_before:]
+                for ev in new_ev:
+                    if ev.get("req_id") == rid:
+                        return ev
+            return None  # driver-ack timeout
+
+        # Wait helper — poll STATE.robot for a predicate up to `secs`
+        # seconds. Returns True on success, False on timeout.
+        async def _wait_for(pred, secs=4.0):
+            dl = time.time() + secs
+            while time.time() < dl:
+                await asyncio.sleep(0.05)
+                with _state_lock:
+                    rr = STATE.get("robot", {}) or {}
+                if pred(rr):
+                    return True
+            return False
+
+        # ── First attempt ───────────────────────────────────────
+        # If the arm is already disabled OR the operator is using
+        # ModeControl / RunProgramModal from the interlock-clean
+        # state, one shot is enough.
+        result = await _attempt(op)
+
+        # ── Enable-interlock orchestration (2026-08-28) ─────────
+        # Driver refuses toAuto/toManual/toRemote while enabled=True
+        # with reason_code=arm_enabled_interlock. Orchestrate the
+        # disable → switch → re-enable dance behind the operator's
+        # single confirm. Only fires when the driver EXPLICITLY
+        # named the interlock — otherwise treat the failure as
+        # domain truth (arbiter, allow_mode gate, transport_down).
+        orchestrated = False
+        subs = []   # sub-step trace, surfaced in the response
+        if result is not None and (result.get("reason_code")
+                                   == "arm_enabled_interlock"):
+            subs.append({"step": "first_attempt",
+                         "outcome": "arm_enabled_interlock"})
+            # Best-effort disable via /robot/power_command. The
+            # driver's allow_power gate is the real safety layer;
+            # we don't second-guess it here.
+            try:
+                _publish_estun_power({"action": "disable"})
+                subs.append({"step": "publish_disable", "ok": True})
+            except Exception as e:
+                subs.append({"step": "publish_disable",
+                             "ok": False, "err": str(e)})
+            disabled_ok = await _wait_for(
+                lambda rr: rr.get("enabled") is False, secs=4.0)
+            subs.append({"step": "await_disabled",
+                         "ok": disabled_ok})
+            if disabled_ok:
+                # Retry the mode switch — this is the interlock-
+                # clean state per FACTS: mode-switch-requires-disable.
+                retry = await _attempt(op)
+                subs.append({"step": "retry_mode_switch",
+                             "ok": bool(retry and retry.get("ok")),
+                             "reason_code": (retry or {}).get("reason_code")})
+                # Re-enable regardless of switch outcome — leaving
+                # the arm disabled after a failed switch is worse
+                # than leaving it in the pre-switch mode.
+                try:
+                    _publish_estun_power({"action": "enable"})
+                    subs.append({"step": "publish_enable", "ok": True})
+                except Exception as e:
+                    subs.append({"step": "publish_enable",
+                                 "ok": False, "err": str(e)})
+                enabled_ok = await _wait_for(
+                    lambda rr: rr.get("enabled") is True, secs=6.0)
+                subs.append({"step": "await_enabled",
+                             "ok": enabled_ok})
+                # The retry outcome is the result the caller sees;
+                # the sub-step trace rides in the response payload.
+                if retry is not None:
+                    result = retry
+                orchestrated = True
+
+        req_id = (result or {}).get("req_id")
 
         # Log to the event log — both success and failure so the
         # operator's timeline shows every mode change attempt.
+        # Orchestrated attempts include the sub-step trace in the
+        # technical_detail so a review-later reader sees the dance.
         try:
             if result is not None and result.get("ok"):
                 _event_log.emit(
@@ -7380,14 +7451,19 @@ if FASTAPI_AVAILABLE:
                     code='mode_switch',
                     operator_message=(
                         f"Robot mode → {_MODE_CODE_LABEL.get(int(result.get('requested', -1)), '?')}"
-                        + (" (already there)" if result.get("no_change") else "")),
+                        + (" (already there)" if result.get("no_change") else "")
+                        + (" (orchestrated: disable → switch → re-enable)"
+                           if orchestrated else "")),
                     technical_detail=(
                         f"op={op} requested={result.get('requested')} "
                         f"observed={result.get('observed')} "
-                        f"req_id={req_id}"),
+                        f"req_id={req_id} orchestrated={orchestrated} "
+                        f"subs={subs!r}"),
                     context={"requested": result.get("requested"),
                              "observed":  result.get("observed"),
-                             "op": op, "req_id": req_id})
+                             "op": op, "req_id": req_id,
+                             "orchestrated": orchestrated,
+                             "subs": subs})
             else:
                 reason = (result or {}).get("reason") \
                          or "mode switch endpoint timed out waiting for driver ack"
@@ -7398,11 +7474,14 @@ if FASTAPI_AVAILABLE:
                     operator_message=f"Mode switch refused: {reason}",
                     technical_detail=(
                         f"op={op} current_code={current_code} "
-                        f"req_id={req_id} result={result!r}"),
+                        f"req_id={req_id} orchestrated={orchestrated} "
+                        f"subs={subs!r} result={result!r}"),
                     context={"op": op, "current_code": current_code,
                              "req_id": req_id,
                              "reason": reason,
-                             "reason_code": (result or {}).get("reason_code")})
+                             "reason_code": (result or {}).get("reason_code"),
+                             "orchestrated": orchestrated,
+                             "subs": subs})
         except Exception:
             # event_log emit must never break the response.
             pass
@@ -7415,7 +7494,9 @@ if FASTAPI_AVAILABLE:
                                        "waiting for /estun/mode_status "
                                        "envelope — the driver may be down "
                                        "OR /estun/mode_command wasn't "
-                                       "subscribed yet")},
+                                       "subscribed yet"),
+                            "orchestrated": orchestrated,
+                            "subs": subs},
             }, status_code=504)
 
         if not result.get("ok"):
@@ -7425,7 +7506,9 @@ if FASTAPI_AVAILABLE:
                             "reason": result.get("reason") or "unknown",
                             "reason_code": result.get("reason_code"),
                             "requested": result.get("requested"),
-                            "observed":  result.get("observed")},
+                            "observed":  result.get("observed"),
+                            "orchestrated": orchestrated,
+                            "subs": subs},
             }, status_code=409)
 
         return {
@@ -7433,7 +7516,9 @@ if FASTAPI_AVAILABLE:
             "outcome": {"kind": "mode_switched",
                         "requested": result.get("requested"),
                         "observed":  result.get("observed"),
-                        "no_change": bool(result.get("no_change"))},
+                        "no_change": bool(result.get("no_change")),
+                        "orchestrated": orchestrated,
+                        "subs": subs},
             "target": target,
             "current_code": result.get("observed"),
             "current_label": _MODE_CODE_LABEL.get(

@@ -101,6 +101,27 @@
   `stateName` is a stringified display value that can lag or hold a
   stale value across error transitions. Never gate on `stateName` alone.
   [addendum-40 §564]
+- **Factory-UI mode header can lie; numeric `mode` wins.** Same class
+  as `stateName`, extended to the AUTO/MANUAL/REMOTE header at
+  `192.168.2.136:9198`. Observed 2026-08-28 11:20: header showed AUTO
+  highlighted while `publish/RobotStatus.mode = 1 (MANUAL)` on the
+  wire; the factory UI's OWN runtime log agreed with the wire ("Robot
+  not in automatic mode"). The header is a display state, not a wire
+  read. Gate every mode-dependent decision on `robot_mode_code`
+  (numeric) — see `HARDWARE.md > Robot-mode code table` for the map.
+  [session-2026-08-28, addendum-49 §630]
+- **Mode switch requires arm disabled first (Codroid interlock).** The
+  controller silently refuses `Robot/toAuto` / `Robot/toManual` /
+  `Robot/toRemote` while `state=2 (Enabled)`. The WS ack returns
+  `ok=True` but `publish/RobotStatus.mode` never transitions — the
+  interlock is enforced by mode field, not by a rejection message.
+  Correlated 2026-08-28 by disable→click→enable sequence: mode stayed
+  at 1 for the full 8 s while enabled=True; flipped 1→0 the instant
+  the click landed with enabled=False. `/api/estun/mode` orchestrates
+  disable→switch→enable behind a single operator confirm; the driver's
+  `_on_mode_command` pre-checks `_enabled` and surfaces the rule as
+  `reason_code=arm_enabled_interlock` for any caller that fires the
+  op directly. [session-2026-08-28, addendum-49 §630]
 - **Action SUCCESS ≠ arrival.** JTC declares "Goal reached, success" at
   default `goal_tolerance = 0.01 rad ≈ 0.573°` while servos keep
   converging. Poll-for-settle (per-joint drift ≤ 2 LSB over 500 ms

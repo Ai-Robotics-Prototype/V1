@@ -381,6 +381,15 @@ export default function RunProgramModal() {
                   robotModeCode === 2 ? 'Remote' : 'an unknown mode'
                 }</b>. Confirm will first switch to <b>Auto</b>, then start
                 the program.
+                {robot.enabled && (
+                  <div style={{
+                    marginTop: 6, fontSize: 12, color: '#7C2D12',
+                  }}>
+                    Arm is ENABLED — the controller refuses mode switches
+                    while enabled. The endpoint will briefly disable the
+                    arm, switch to Auto, then re-enable before starting.
+                  </div>
+                )}
               </div>
             )}
             <div style={btnRow}>

@@ -346,6 +346,43 @@ Under `/etc/systemd/system/`:
   (50% hw / 25% op-limit). Increases confirm; decreases apply instantly.
   [era-01 §Safety Architecture; addendum-21; CLAUDE.md]
 
+## Robot-mode code table (`publish/RobotStatus.mode`)
+
+Numeric ↔ label map for the `mode` field on `publish/RobotStatus`.
+**Numeric is the ONLY ground truth (L298 stateName-lies class);**
+string fields like `stateName` and the factory-UI `:9198` header do
+NOT reliably indicate mode. Correlated on-wire 2026-08-28 by
+disable → Manual → Auto → enable clicks against
+`/api/state.robot.robot_mode_code`.
+
+| Code | Label  | Established by |
+|------|--------|----------------|
+| **0**  | AUTO   | Factory-UI Auto click at 11:24:19.345 correlated wire `1 → 0` (arm disabled at click time). Required by the WS-programs execution path (`toAuto → project/save → project/run`). [session-2026-08-28, addendum-49 §630] |
+| **1**  | MANUAL | Baseline at 11:20:58; factory-UI runtime log agreed ("not in automatic mode"). Required by drag-teach / PBD. [session-2026-08-28] |
+| **2**  | REMOTE | Post-`toAuto → toRemote → StartControl` four-tuple `{mode:2, state:2, stateName:'Enabled', recoveryState:0, errors:[]}`. Required by the CRI execution path (MoveIt / Pilz via `cri_hardware`). [addendum-40 §566; addendum-32 §506] |
+| -1   | UNKNOWN | Driver mirror pre-first-status. |
+
+### Execution path ↔ required mode
+
+| Path | Required mode | Precondition wired at |
+|------|---------------|-----------------------|
+| WS-programs (`/api/estun/program/run`, `_op_run`) | **AUTO** (0) | `RunProgramModal.jsx` auto-offers "Switch to Auto and run…" |
+| CRI executor (`s10_140_executor` package, Pilz PTP/LIN) | **REMOTE** (2) | F2 executor precondition — see `test_f2_executor_precondition_is_remote` |
+
+**Enable-interlock (locked 2026-08-28):** the controller REFUSES
+`Robot/toAuto` / `Robot/toManual` / `Robot/toRemote` while
+`enabled=True`. Ack returns `ok=True` on the WS but
+`publish/RobotStatus.mode` never transitions — surfaces to
+`/api/estun/mode` as `reason_code=mode_readback_timeout`. The
+required sequence is:
+
+    disable → switch mode → re-enable
+
+`/api/estun/mode` orchestrates the three steps behind a single
+confirm; the driver's `_on_mode_command` pre-checks `enabled` and
+refuses standalone with `reason_code=arm_enabled_interlock` so a
+raw call surfaces the rule instead of silently timing out.
+
 ## Runtime motion-command constraints
 
 - **Per-cycle acceleration limit ≈ 25 rad/s²** enforced by the CC10-A
