@@ -305,7 +305,13 @@ def _apply_cri_proxy_authority(r):
 # Shared state — updated by ROS2 callbacks, read by FastAPI
 # ---------------------------------------------------------------------------
 
-_state_lock = threading.Lock()
+_state_lock = threading.RLock()  # 2026-08-28: reentrant to avoid the
+# _on_estun_status (line 2131) → _wire_arm_is_enabled (line 229)
+# self-deadlock introduced by the twin phantom-feedback fix (commit
+# 09f3158). Fires under JOG_BACKEND=ws when the driver reports all-
+# zero joints — deadlock froze the FastAPI event loop, tying up the
+# accept queue on :8080. All 89 sites use `with _state_lock:` and
+# none rely on non-reentrant semantics, so RLock is drop-in safe.
 
 # COCO class-id → human-readable name (2026-08-03). Populated at
 # import from src/cobot_bringup/config/coco_labels.txt so the file

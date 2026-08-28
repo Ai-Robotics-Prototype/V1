@@ -721,7 +721,7 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3852
+        line: 3858
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
@@ -733,18 +733,22 @@ capabilities:
           ~90 lines), twin phantom-feedback class fix (JOG_BACKEND
           gating + all-zeros quarantine + module-scope counters +
           helpers, add-47 §612, ~50 lines), plus intermediate
-          additions from add-46 §603 doctrine setup. Both new gates
-          land BEFORE the route body — the jog_hold_heartbeat pairing
+          additions from add-46 §603 doctrine setup. 2026-08-28:
+          shifted to 3858 by the _state_lock RLock fix (dashboard-
+          wide self-deadlock cure — 7-line comment block added at
+          the module-scope lock definition). Both new gates land
+          BEFORE the route body — the jog_hold_heartbeat pairing
           invariant is preserved.
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 3987
+        line: 3993
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Pinned by test_jog_hold_heartbeat.py. 2026-08-19:
           line shifted 3493→3731. 2026-08-27: shifted to 3987
           (stripped-comment count; raw grep line 4172) — same session
-          stack as /cmd/jog above.
+          stack as /cmd/jog above. 2026-08-28: shifted to 3993 by
+          the _state_lock RLock fix (see /cmd/jog entry above).
         owner: dashboard-transport
       - path: src/cobot_dashboard/frontend/src/lib/holdTicker.js
         line: 0
