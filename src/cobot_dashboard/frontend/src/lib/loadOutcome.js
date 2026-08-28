@@ -184,7 +184,10 @@ export function namedLoadError(body, httpStatus) {
     return _shape({
       code:    'byte_verify_get_failed',
       title:   "Couldn't read the program back from the controller.",
-      detail:  'Try again — probably a transient network hiccup.',
+      detail:  rawReason
+        ? `Controller reason: ${rawReason}. Try again; report if it persists.`
+        : 'The controller did not respond to the byte-verify GET. '
+          + 'Try again; report if it persists.',
       technicalDetail: rawReason,
     })
   }
@@ -200,11 +203,22 @@ export function namedLoadError(body, httpStatus) {
   }
 
   if (kind === 'save_failed') {
+    // 2026-08-28: retired the "transient network hiccup" default.
+    // save_failed only fires when the backend's classifier exhausted
+    // every drain (in-loop reject, post-loop reject, save_event step
+    // reason) and STILL has no named reason. Lying about a network
+    // hiccup taught the operator to click through what was actually
+    // a gate-closed refusal for weeks. Surface the raw reason when
+    // there IS one; otherwise say plainly that we don't know and
+    // ask for a report.
     return _shape({
       code:    'save_failed',
       title:   "Save didn't complete — program not loaded.",
-      detail:  'Try again — probably a transient network hiccup. '
-             + 'If it persists, report this.',
+      detail:  rawReason
+        ? `Controller reason: ${rawReason}. Try again; report if it persists.`
+        : 'The controller did not return a reason for the failure. '
+          + 'Try again; if it persists, report this — the wire may '
+          + 'have dropped a status message.',
       technicalDetail: rawReason,
     })
   }

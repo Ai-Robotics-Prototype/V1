@@ -80,15 +80,15 @@ const storeDefinition = (set, get) => ({
   //   useStore.getState()._reconcileLog
   // in devtools. Not persisted — a page refresh clears it.
   _reconcileLog: [],
-  // Deploy-aware "new version — refresh" state. serverBundleId is
-  // the asset hash the SERVER is currently serving (fetched via
-  // /api/build_id). __BUILD_ID__ (defined by vite at build time)
-  // is the asset hash this bundle was BUILT with. Mismatch means
-  // the operator's tab is running an obsolete bundle — surface a
-  // standing toast so every-open-tab-invisibly-obsolete-six-times
-  // never happens again.
-  serverBundleId: null,
-  bundleObsolete: false,
+  // 2026-08-28: _checkBundleId / serverBundleId / bundleObsolete
+  // retired. Compared /api/build_id.bundle_id (chunk-hash, 8-char
+  // vite asset hash) to __BUILD_ID__ (git-describe SHA) — different
+  // shapes; the strings could never equal each other, so the toast
+  // fired for both true staleness and every deploy where the two
+  // shapes happened to be non-empty. Provenance is now StaleGuard
+  // (SHA-to-SHA compare of __GIT_SHA__ against the WS-pushed
+  // frontend_sha) + DeployStatusBanner (three-layer verdict).
+  // One mechanism, not two disagreeing ones.
   // Same-machine Date.now() of the most recent WS frame carrying a
   // robot.program.state value. Used ONLY by isStateStreamStale so
   // the wedge banner can distinguish a real controller wedge from
@@ -477,13 +477,10 @@ const storeDefinition = (set, get) => ({
       // "state syncing…" indicator via programRevConfirmed=false.
       if (wasReconnect) {
         get()._reconcileAll('ws_reconnect')
-      } else {
-        // First-connect path: still run the bundle-id check so an
-        // open tab left through a deploy learns about it now, not
-        // on the next disconnect. No full reconcile — the initial
-        // program load is handled by the normal load path.
-        get()._checkBundleId()
       }
+      // 2026-08-28: bundle-id check retired. StaleGuard covers the
+      // "tab open through a deploy" case with a SHA-to-SHA compare
+      // fed by the WS hello frame — see onmessage below.
     }
 
     ws.onmessage = (ev) => {
@@ -1211,38 +1208,9 @@ const storeDefinition = (set, get) => ({
       // No open program to reconcile → nothing to hold syncing on.
       set({ programRevConfirmed: true })
     }
-    // Deploy-aware bundle check runs alongside the reconcile so a
-    // tab that was open through a deploy learns about it on the
-    // very next reconcile trigger.
-    get()._checkBundleId()
+    // 2026-08-28: _checkBundleId call removed. Provenance is
+    // StaleGuard's job now — see WS hello frame handler.
     get()._pushReconcileLog('reconcile_done', trigger)
-  },
-
-  // Compare the served bundle hash against this tab's build-time
-  // __BUILD_ID__. Sets bundleObsolete=true on mismatch so the toast
-  // banner renders. Silent when the server can't be reached OR the
-  // ids match. Non-blocking.
-  async _checkBundleId() {
-    try {
-      const res = await fetch('/api/build_id', { cache: 'no-store' })
-      if (!res.ok) return
-      const body = await res.json()
-      const server = String((body && body.bundle_id) || '')
-      const local = typeof __BUILD_ID__ !== 'undefined' ? String(__BUILD_ID__) : ''
-      set({ serverBundleId: server || null })
-      if (server && local && server !== local && !get().bundleObsolete) {
-        set({ bundleObsolete: true })
-        // Standing toast — long dwell (60s) so the operator sees it
-        // even while working. Deduped by content in ToastContainer.
-        try {
-          get().addToast?.(
-            `New app version available (${server.slice(0, 8)}) — `
-            + `refresh to load. This tab is running ${local.slice(0, 8)}.`,
-            'warning',
-            60000)
-        } catch (_) { /* nop */ }
-      }
-    } catch (_) { /* ignore; next reconcile tries again */ }
   },
 
   async _refreshCurrentProgram() {

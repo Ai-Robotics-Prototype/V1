@@ -6761,6 +6761,31 @@ if FASTAPI_AVAILABLE:
                     "error": reason,
                     "outcome": outcome,
                 }, status_code=400)
+            # Second-pass drain (2026-08-28): before defaulting to
+            # save_failed, look INSIDE the save_event's per-step
+            # records for an accompanying `reason` or non-200 status.
+            # Some driver builds populate save_event.steps with a
+            # `reason` field on the failing step even when the
+            # cross-family /estun/rejected topic didn't fire (or
+            # fired outside our polling window). Extract it so the
+            # frontend gets a NAMED refusal — never "network hiccup"
+            # for something the wire actually told us about.
+            step_reason = None
+            for step in (save_event or {}).get("steps", []):
+                if step.get("http_status") != 200:
+                    step_reason = (step.get("reason")
+                                   or step.get("error")
+                                   or step.get("body"))
+                    if step_reason:
+                        break
+            if step_reason:
+                return JSONResponse({
+                    "ok": False,
+                    "error": str(step_reason),
+                    "outcome": {"kind": "save_rejected",
+                                "reason": str(step_reason),
+                                "save": save_event},
+                }, status_code=400)
             return JSONResponse({
                 "ok": False,
                 "error": ("save did not complete cleanly (some POSTs "

@@ -415,6 +415,119 @@ def test_store_exposes_setStaleProvenance_action():
     assert '_setStaleProvenance' in js
 
 
+# ── 2026-08-28 lie-eviction: no "network hiccup" default; no
+#    legacy chunk-vs-git bundle-id toast ───────────────────────
+
+def _load_outcome_js() -> str:
+    with open(os.path.join(
+        WS, 'src', 'cobot_dashboard', 'frontend', 'src', 'lib',
+        'loadOutcome.js')) as fh:
+        return fh.read()
+
+
+def _strip_js_comments(src: str) -> str:
+    src = re.sub(r'/\*.*?\*/', '', src, flags=re.DOTALL)
+    src = re.sub(r'//[^\n]*', '', src)
+    return src
+
+
+def test_save_failed_copy_does_not_lie_about_network():
+    """The save_failed copy used to say "transient network hiccup"
+    as the default detail — after weeks of the operator clicking
+    through what were really driver_reject:program allow_move
+    refusals, the class was named on 2026-08-28 and the copy
+    retired. Retirement comments are allowed to mention the old
+    string; the actual copy strings must not."""
+    j = _strip_js_comments(_load_outcome_js())
+    m = re.search(
+        r"if \(kind === 'save_failed'\).*?\}\s*\)\s*\}",
+        j, re.DOTALL)
+    assert m, 'save_failed branch not found in loadOutcome.js'
+    body = m.group(0)
+    assert 'transient network hiccup' not in body, (
+        'save_failed detail must not default to the retired '
+        '"transient network hiccup" copy. The class was named on '
+        '2026-08-28; see ledger addendum-48 §614.1.')
+    assert 'Controller reason:' in body or 'did not return a reason' in body
+
+
+def test_byte_verify_get_failed_copy_does_not_lie_about_network():
+    """Same rule for byte_verify_get_failed — retired the
+    "network hiccup" default so the wire's real error surfaces."""
+    j = _strip_js_comments(_load_outcome_js())
+    m = re.search(
+        r"if \(kind === 'byte_verify_get_failed'\).*?\}\s*\)\s*\}",
+        j, re.DOTALL)
+    assert m
+    body = m.group(0)
+    assert 'transient network hiccup' not in body
+
+
+def test_backend_drains_save_event_step_reason():
+    """The backend classifier's final fall-through used to jump
+    straight to save_failed if the /estun/rejected topic didn't
+    fire in-window. Now: before defaulting, inspect
+    save_event.steps for a per-step reason. Any non-200 step with
+    a `reason` (or `error`/`body`) classifies as save_rejected so
+    the frontend can surface the wire's actual message."""
+    src = _server_src()
+    # Locate the block that precedes the final save_failed return.
+    idx = src.find(
+        "\"error\": (\"save did not complete cleanly (some POSTs \"")
+    assert idx > 0, 'save_failed fallback string not found'
+    window = src[max(0, idx - 2000): idx]
+    assert 'step_reason' in window or 'save_event' in window
+    assert 'step.get("reason")' in window or "step.get('reason')" in window, (
+        'The pre-fallback drain must probe save_event.steps for a '
+        'reason field — that is where some driver builds put the '
+        'named refusal when the reject topic missed our window.')
+
+
+def test_check_bundle_id_toast_retired():
+    """The chunk-hash-vs-git-SHA legacy toast (`_checkBundleId`
+    comparing /api/build_id.bundle_id (chunk hash) to
+    __BUILD_ID__ (git-describe SHA)) compared different SHAPES —
+    the strings could never equal each other, so the toast fired
+    for every deploy where both fields were non-empty. Provenance
+    is StaleGuard's job now (SHA-to-SHA, WS-pushed). This test
+    refuses any reintroduction of the legacy mechanism."""
+    js = _use_store_js()
+    # No live call, no method definition, no state fields.
+    assert '_checkBundleId' not in re.sub(
+        r'//[^\n]*|/\*.*?\*/', '', js, flags=re.DOTALL), (
+        '_checkBundleId method must be fully removed — comments '
+        'documenting its retirement are fine, live references are not.')
+    for banned in ('serverBundleId:', 'bundleObsolete:'):
+        assert banned not in re.sub(
+            r'//[^\n]*|/\*.*?\*/', '', js, flags=re.DOTALL), (
+            f'{banned} state field must be removed.')
+
+
+def test_estun_allow_move_env_expected_shape():
+    """The systemd drop-in for roboai-estun must remain the ONE
+    place ESTUN_ALLOW_MOVE is set. If the file has drifted or a
+    parallel Environment= line has landed, the operator's
+    understanding of "is program-push allowed" diverges from
+    truth. This test source-inspects the drop-in when present."""
+    p = '/etc/systemd/system/roboai-estun.service.d/f1_monitor_only.env'
+    if not os.path.isfile(p):
+        # CI / fresh checkout — the drop-in doesn't exist. The
+        # invariant is only enforceable on the target Jetson.
+        return
+    with open(p) as fh:
+        env = fh.read()
+    # Any explicit assignment must not silently be zero anymore.
+    m = re.search(r'^ESTUN_ALLOW_MOVE=(\S+)', env, re.MULTILINE)
+    assert m, 'ESTUN_ALLOW_MOVE must be declared in the drop-in.'
+    # Truthy per the driver's parser: 1|true|yes|on (case-insensitive).
+    assert m.group(1).lower() in ('1', 'true', 'yes', 'on'), (
+        f'ESTUN_ALLOW_MOVE={m.group(1)!r} — the drop-in was flipped '
+        'closed. Program change/save is a required product function '
+        'and pushes through this gate; a closed gate returns '
+        '"allow_move gate closed" and the operator sees a refusal '
+        'toast instead of a save. See ledger addendum-48 §614.1.')
+
+
 def test_deploy_sh_exits_2_on_dirty_tree(tmp_path):
     """Fabricate a tiny bash environment that mirrors deploy.sh's
     dirty-check without spinning up the full deploy. Guarantees the
