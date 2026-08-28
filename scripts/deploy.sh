@@ -153,6 +153,22 @@ else
     fi
 fi
 
+# ── frontend/.build-sha metadata refresh (2026-08-28) ────────────
+# When vite is SKIPPED (source hash unchanged), the bundle content
+# is legitimately the last-built build — but the .build-sha
+# sidecar still says "the SHA I was built against was N-1" for
+# any deploy on a fresh HEAD. That reads as a frontend_sha
+# mismatch in /api/deploy_status.verdict (red banner) even though
+# nothing frontend-visible changed. Refresh the sidecar to HEAD
+# so the provenance layer tracks the running-system SHA rather
+# than an out-of-date build-timestamp SHA.
+if [[ $FRONTEND_NEEDS_BUILD -eq 0 && -d "$FRONTEND_OUT" ]]; then
+    _HEAD=$(cd "$WS" && git rev-parse HEAD 2>/dev/null || echo "unknown")
+    if [[ -n "$_HEAD" && "$_HEAD" != "unknown" ]]; then
+        echo "$_HEAD" > "$FRONTEND_OUT/.build-sha"
+    fi
+fi
+
 PRE_SERVED_ASSET=""
 if [[ -f "$FRONTEND_OUT/index.html" ]]; then
     PRE_SERVED_ASSET=$(grep -oE '/assets/index-[A-Za-z0-9_-]+\.js' \
