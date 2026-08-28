@@ -920,6 +920,55 @@ def test_cart_softening_toast_and_wrist_indicator_present():
     assert 'unwind' in wwi.lower()
 
 
+# ── 2026-08-28 palletize quarantine (§644 investigation) ─────
+
+def test_palletize_programs_quarantined_server_side():
+    """The palletize programs latch controller recoveryState=1 on
+    push. Until §644 root-causes which codegen element is the
+    poison, load/run of ANY of the three known palletize IDs must
+    be refused server-side with outcome.kind='quarantined'. GET
+    /api/programs/{id} surfaces the flag so the frontend can badge
+    the entry BEFORE the operator clicks Run.
+
+    Removing a program from the quarantine set should require a
+    ledger-cited §644 root-cause resolution — this test refuses a
+    silent unquarantine."""
+    src = _server_src()
+    m = re.search(
+        r"_QUARANTINED_PROGRAM_IDS\s*=\s*\{(.*?)\}",
+        src, re.DOTALL)
+    assert m, ('_QUARANTINED_PROGRAM_IDS set not found — regression: '
+               'the palletize quarantine has been silently removed.')
+    ids = m.group(1)
+    for expected in ("'holepartpalletize'",
+                     "'pallettest'",
+                     "'pallettest2'"):
+        assert expected in ids, (
+            f'{expected} missing from quarantine set — §644 poison '
+            'has not been root-caused; removing this id must cite '
+            'the fix commit.')
+    # Endpoint must refuse before opening the program file.
+    assert '"program_quarantined"' in src, (
+        'reason_code=program_quarantined missing — frontend keys on '
+        'this to render the quarantine copy')
+    assert 'status_code=423' in src, (
+        'quarantine refusal must use HTTP 423 Locked — the class '
+        'signal for "the resource is temporarily unavailable by '
+        'policy"')
+    # GET /api/programs/{prog_id} must include the flag so the
+    # Library UI can badge the entry before Run.
+    m2 = re.search(
+        r'@app\.get\("/api/programs/\{prog_id\}"\).*?return prog',
+        src, re.DOTALL)
+    assert m2, 'GET /api/programs/{prog_id} handler not found'
+    body = m2.group(0)
+    assert '_QUARANTINED_PROGRAM_IDS' in body, (
+        'the GET handler must consult the quarantine set + surface '
+        'quarantined + quarantine_reason fields')
+    assert '"quarantined"' in body
+    assert '"quarantine_reason"' in body
+
+
 # ── 2026-08-28 §566 self-healing diagnostic ladder ───────────
 
 def test_dashboard_mirrors_errors_and_recoveryState():

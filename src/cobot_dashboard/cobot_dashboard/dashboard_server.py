@@ -6484,6 +6484,28 @@ if FASTAPI_AVAILABLE:
     # projectlist MERGE preserves other projects but always rewrites
     # our entry with the fresh codegen output).
 
+    # ── 2026-08-28 palletize quarantine (§644 investigation) ────
+    # These program IDs latch the CC10-A controller's recoveryState
+    # to 1 on push (mode-switch endpoint diagnosed it, addendum-51
+    # §638-645). Latch survives ClearError + switchOn per §566;
+    # only physical cabinet power-cycle clears it. Until the poison
+    # verb in the palletize codegen is identified and removed, any
+    # save/run/load of these programs is refused SERVER-SIDE with
+    # a named reason. Adding a program here is a two-line change;
+    # removing one should require a §644 root-cause resolution.
+    _QUARANTINED_PROGRAM_IDS = {
+        'holepartpalletize',
+        'pallettest',
+        'pallettest2',
+    }
+    _QUARANTINE_REASON = (
+        "under investigation §644 — this program's push sequence "
+        "latches controller recoveryState=1 (see ledger addendum-51 "
+        "§640). No wire path clears the latch; only a physical "
+        "cabinet power-cycle recovers. Blocked from load/run until "
+        "the root cause is fixed."
+    )
+
     @app.post("/api/estun/program/run")
     async def api_estun_program_run(request: Request):
         try:
@@ -6499,6 +6521,24 @@ if FASTAPI_AVAILABLE:
         prog_id = str(body.get("program_id") or "").strip()
         if not prog_id:
             return JSONResponse({"error": "program_id required"}, status_code=400)
+        # Palletize quarantine — refuse BEFORE opening the file so
+        # even a corrupt / deleted quarantined artifact still
+        # refuses correctly.
+        if prog_id in _QUARANTINED_PROGRAM_IDS:
+            return JSONResponse({
+                "ok": False,
+                "outcome": {
+                    "kind":  "quarantined",
+                    "reason_code": "program_quarantined",
+                    "reason": _QUARANTINE_REASON,
+                    "detail": (
+                        f"Program {prog_id!r} is quarantined pending "
+                        "the §644 palletize-codegen investigation. "
+                        "Pick a different program (e.g., Test100) "
+                        "from the library."),
+                    "program_id": prog_id,
+                },
+            }, status_code=423)   # Locked
         # Task id is fixed to "main" for the B1 shape. Multi-task programs
         # come with the multi-task saveAll flow (deferred, tracked in the
         # architecture doc).
@@ -9702,6 +9742,15 @@ if FASTAPI_AVAILABLE:
                 _prog_revs[prog_id] = max(
                     authoritative, _prog_revs.get(prog_id, 0))
         prog["rev"] = int(authoritative)
+        # 2026-08-28 palletize quarantine flag — surface in the
+        # GET response so the frontend can render the badge +
+        # disable Run BEFORE the operator ever POSTs to
+        # /api/estun/program/run. Backend refusal is still the
+        # actual safety guard (see api_estun_program_run); this
+        # is UX signaling.
+        if prog_id in _QUARANTINED_PROGRAM_IDS:
+            prog["quarantined"] = True
+            prog["quarantine_reason"] = _QUARANTINE_REASON
         return prog
 
     @app.put("/api/programs/{prog_id}")
