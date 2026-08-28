@@ -245,25 +245,62 @@ test('D10(j): reconcile log ring records key transitions', () => {
 })
 
 
-test('D10(k): deploy-aware bundle-id check exists + toasts on mismatch', () => {
+test('D10(k): deploy-aware stale-tab detection exists + BLOCKS on mismatch', () => {
+  // 2026-08-28 doctrine amendment (ledger addendum-48): the
+  // ORIGINAL D10(k) required _checkBundleId — a poll of
+  // /api/build_id.bundle_id (chunk hash) compared to __BUILD_ID__
+  // (git-describe SHA). Two DIFFERENT SHAPES — the strings could
+  // never equal each other, so the "New app version available"
+  // toast fired for every deploy where both fields were non-empty,
+  // AND the operator learned to click through it, defeating the
+  // whole point of the doctrine.
+  //
+  // The invariant D10(k) is meant to enforce ("a tab left open
+  // through a deploy must LEARN about it and BLOCK, not silently
+  // stay on the old bundle") is now enforced by the provenance
+  // stack — StaleGuard + WS hello frame + SHA-to-SHA compare, all
+  // like-for-like (L257). This test now pins the newer mechanism.
   const storeSrc = fs.readFileSync(
     path.resolve(__dirname, '..', '..', 'src', 'store', 'useStore.js'),
     'utf8')
-  assert.ok(/_checkBundleId\(/.test(storeSrc),
-    d10('_checkBundleId must exist — deploys running mid-session made '
-     + 'six tabs invisibly obsolete today'))
-  assert.ok(/\/api\/build_id/.test(storeSrc),
-    d10('_checkBundleId must fetch /api/build_id (the server-side '
-     + 'served-asset hash endpoint)'))
-  assert.ok(/bundleObsolete:\s*true/.test(storeSrc),
-    d10('mismatch must flip bundleObsolete=true so the UI can render '
-     + 'a standing "new version" indicator'))
-  assert.ok(/New app version available/.test(storeSrc),
-    d10('mismatch must toast the operator — a hidden bundle version is '
-     + 'the class of bug that shipped six times today'))
-  assert.ok(/\/api\/build_id/.test(backendSrc),
-    d10('/api/build_id endpoint must be registered on the backend — '
-     + 'reads mock_server/static/index.html for the served asset hash'))
+  const guardSrc = fs.readFileSync(
+    path.resolve(__dirname, '..', '..', 'src', 'components',
+                 'StaleGuard.jsx'),
+    'utf8')
+
+  // 1. Store WS onmessage must intercept the {type:'hello'} frame
+  //    (SHA-to-SHA compare feed).
+  assert.ok(/msg\.type\s*===\s*['"]hello['"]/.test(storeSrc),
+    d10('WS onmessage must intercept the {type:"hello"} frame from '
+     + '/ws/state so backend + frontend SHAs reach the client'))
+
+  // 2. Client-side compare must use the compile-time __GIT_SHA__
+  //    baked by vite — anything else is not like-for-like.
+  assert.ok(/__GIT_SHA__/.test(storeSrc),
+    d10('client-side stale check must compare against __GIT_SHA__ '
+     + '(vite define, baked at build time) — chunk-hash vs git-SHA '
+     + 'is what previously misfired'))
+
+  // 3. Mismatch flips staleProvenance to the mismatch record —
+  //    the store hook StaleGuard subscribes to.
+  assert.ok(/staleProvenance/.test(storeSrc),
+    d10('mismatch must populate staleProvenance so StaleGuard can '
+     + 'react — a hidden bundle version is the class the retired '
+     + 'toast failed to catch six times'))
+
+  // 4. StaleGuard renders a BLOCKING overlay (aria-modal,
+  //    pointerEvents auto, no close/dismiss control by default).
+  //    Dismissible-toast pattern is what taught operators to click
+  //    through the warning.
+  assert.ok(/aria-modal="true"|aria-modal='true'/.test(guardSrc),
+    d10('StaleGuard must render an aria-modal overlay — silent toast '
+     + 'was ignored by operators'))
+  assert.ok(/pointerEvents:\s*['"]auto['"]/.test(guardSrc),
+    d10('StaleGuard must intercept clicks (pointerEvents: auto) — the '
+     + 'overlay is the block, not a hint'))
+  assert.ok(/Reload now/.test(guardSrc),
+    d10('StaleGuard must expose a Reload button — the only path '
+     + 'forward is a fresh load'))
 })
 
 
