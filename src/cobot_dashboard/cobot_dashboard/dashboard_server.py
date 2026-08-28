@@ -2437,6 +2437,7 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 "allow_cartesian_jog", "allow_cart_source",
                 "allow_power", "allow_power_source",
                 "allow_move", "allow_move_source",
+                "allow_mode", "allow_mode_source",
                 "jog_heartbeat_s", "jog_freshness_s",
                 # 2026-07-31 jog-stop bench instrumentation. Forward
                 # the driver's per-hold inter-arrival gap histogram
