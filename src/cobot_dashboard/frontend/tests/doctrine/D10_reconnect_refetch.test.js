@@ -342,8 +342,13 @@ test('D10(l): GET /api/programs/{id} normalises rev — never returns None', () 
   // was serving None to clients. Client compared ev.rev>cp.rev with
   // one side null, JavaScript coerced silently, refetch never fired.
   // Every read path must return a numeric rev.
+  // 2026-08-28: widened from 2000 to 4000 after the palletize
+  // quarantine + cutover flag stubs expanded api_programs_get.
+  // The invariant (prog["rev"] = int(authoritative) before
+  // return prog) is unchanged; the search bound is just a code-
+  // size cushion.
   const getBlock = backendSrc.match(
-    /async def api_programs_get\(prog_id: str\)[\s\S]{0,2000}?return prog/)
+    /async def api_programs_get\(prog_id: str\)[\s\S]{0,4000}?return prog/)
   assert.ok(getBlock, 'api_programs_get must be locatable')
   assert.ok(/prog\["rev"\]\s*=\s*int\(authoritative\)/.test(getBlock[0]),
     d10('GET /api/programs/{id} must set prog["rev"] to an int derived '
