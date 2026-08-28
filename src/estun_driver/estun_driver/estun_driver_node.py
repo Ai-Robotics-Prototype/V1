@@ -769,6 +769,9 @@ class EstunCodroidDriver(Node):
         # the dashboard banner for the "ENABLING…" transition state).
         self._state_code = -1
         self._state_name = ''
+        # 2026-08-28 §566/L298 four-tuple observability.
+        self._last_errors    = []      # list of error entries from RobotStatus.db.errors
+        self._recovery_state = 0       # RobotStatus.db.recoveryState (int)
         self._robot_mode_code = -1   # 0 AUTO, 1 MANUAL, -1 unknown (yet)
         self._enabled    = False
         self._enabling   = False
@@ -3722,6 +3725,9 @@ class EstunCodroidDriver(Node):
             'allow_move_source': self._allow_move_source,
             'allow_mode':     self._allow_mode,
             'allow_mode_source': self._allow_mode_source,
+            # 2026-08-28 §566 four-tuple ground truth.
+            'errors':         list(self._last_errors),
+            'recoveryState':  self._recovery_state,
             'program_state':  self._prog_state,
             'program_project_id': self._prog_project_id,
             'program_task':   self._prog_task,
@@ -4707,6 +4713,29 @@ class EstunCodroidDriver(Node):
         moving = db.get('moving')
         if isinstance(moving, bool):
             self._is_moving = moving
+
+        # 2026-08-28 §566/L298 pinned "errors + recoveryState = the
+        # four-tuple ground truth for recovery state". The driver
+        # had been silent on both — the toAuto refusal ladder
+        # can't diagnose what it can't see. Parse the two fields
+        # here so the diagnostic ladder in /api/estun/mode can key
+        # off them. Both are OPTIONAL in older firmware exports;
+        # defaults preserve the pre-08-28 shape.
+        errors = db.get('errors')
+        if isinstance(errors, list):
+            self._last_errors = errors
+        elif errors is None:
+            # Explicit absence — clear the mirror so a stale entry
+            # from a prior message doesn't survive a controller
+            # ClearError.
+            self._last_errors = []
+        recovery = db.get('recoveryState')
+        if recovery is None:
+            recovery = db.get('recovery_state')
+        try:
+            self._recovery_state = int(recovery) if recovery is not None else 0
+        except Exception:
+            self._recovery_state = 0
 
         # Publish enabled + mode string.
         m = Bool(); m.data = self._enabled
