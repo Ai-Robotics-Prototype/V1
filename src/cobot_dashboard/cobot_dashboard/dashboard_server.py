@@ -6656,6 +6656,35 @@ if FASTAPI_AVAILABLE:
                 break
         if not (save_event and all(s.get("http_status") == 200
                                    for s in save_event.get("steps", []))):
+            # Final drain (2026-08-28): the inner loop can time out
+            # a hair before the driver's reject event lands in
+            # STATE["robot"]["rejected"]. Test100 hit this — driver
+            # rejected at 09:10:29.824 with "allow_move gate closed",
+            # dashboard classified at 09:10:33.874, exactly 4 s later,
+            # and the operator saw the generic "transient network
+            # hiccup" toast for what was really a gate-closed refusal.
+            # Re-check the rejected list once before defaulting.
+            with _state_lock:
+                r = STATE.get("robot", {})
+                new_rej = r.get("rejected", [])[rej_before:]
+            program_rejects = [x for x in new_rej
+                               if x.get("family") == "program"]
+            if program_rejects:
+                rej0 = program_rejects[0]
+                reason = rej0.get("reason") or ""
+                rcode = rej0.get("reason_code")
+                if rcode == "transport_down" or "ws not connected" in reason:
+                    kind = "transport_down"
+                else:
+                    kind = "save_rejected"
+                outcome = {"kind": kind, "reason": reason}
+                if rcode:
+                    outcome["reason_code"] = rcode
+                return JSONResponse({
+                    "ok": False,
+                    "error": reason,
+                    "outcome": outcome,
+                }, status_code=400)
             return JSONResponse({
                 "ok": False,
                 "error": ("save did not complete cleanly (some POSTs "
