@@ -28,7 +28,6 @@ export default function TopBar() {
   const activeTab    = useStore((s) => s.activeTab)
   const setTab       = useStore((s) => s.setTab)
   const wsStatus     = useStore((s) => s.wsStatus)
-  const wsLatency    = useStore((s) => s.wsLatency)
   const estop        = useStore((s) => s.safety.estop)
   const triggerEstop = useStore((s) => s.triggerEstop)
   const releaseEstop = useStore((s) => s.releaseEstop)
@@ -131,20 +130,11 @@ export default function TopBar() {
           </span>
         </div>
 
-        {/* Latency — always rendered (visibility-hidden when disconnected)
-            so its width is reserved and the tabs don't reflow. */}
-        <span style={{
-          fontSize: 11,
-          fontFamily: 'var(--font-mono)',
-          color: 'var(--text-muted)',
-          fontVariantNumeric: 'tabular-nums',
-          display: 'inline-block',
-          minWidth: 52,
-          textAlign: 'right',
-          visibility: wsStatus === 'connected' ? 'visible' : 'hidden',
-        }}>
-          {wsLatency} ms
-        </span>
+        {/* 2026-08-31 directive: latency ms chip retired from the
+            header. wsLatency is still tracked in the store for
+            diagnostics and remains in the footer (StatusBar) at
+            reduced prominence; the header stays as identity /
+            connection dot / E-STOP. */}
 
         {/* E-STOP — fires on first tap (no confirm). Sized large for
             safety: it must be the most prominent control in the row. */}

@@ -24,6 +24,7 @@
 
 import { useState } from 'react'
 import { useStore } from '../store/useStore'
+import { namedModeError } from '../lib/modeOutcome'
 
 
 const MODE_LABEL = { 0: 'AUTO', 1: 'MANUAL', 2: 'REMOTE' }
@@ -94,10 +95,19 @@ export default function ModeControl() {
           'info', 3000)
         setDialog(null)
       } else {
-        const reason = body?.outcome?.reason
-                    || body?.outcome?.detail
-                    || `Mode switch refused (HTTP ${res.status}).`
-        addToast?.(`Mode switch refused: ${reason}`, 'error', 6000)
+        // 2026-08-31: route mode refusals through the shared named-
+        // copy mapper. Prior code flattened outcome.reason ||
+        // outcome.detail into a single toast body, losing the
+        // ladder's per-rung register (recoveryState → physical
+        // cycle, errors_persist → pendant :9198 alarm log,
+        // arm_enabled_interlock → disable-first). Toast body
+        // renders title + detail; wire fields (reason_code +
+        // four_tuple + subs) live in technicalDetail for
+        // devtools grep.
+        const named = namedModeError(body || {}, res.status)
+        addToast?.({ title: named.title, detail: named.detail,
+                     technicalDetail: named.technicalDetail },
+                   'error', 10000)
         // Keep the dialog open so the operator can retry or cancel.
       }
     } catch (e) {

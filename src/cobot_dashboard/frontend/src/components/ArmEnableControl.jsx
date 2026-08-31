@@ -1,114 +1,127 @@
 // components/ArmEnableControl.jsx — the SINGLE canonical arm-enable
 // control surface (fork registry: arm_enable_control).
 //
-// One compact chip that:
-//   1. Renders the arm state (ALARM | ENABLING | JOG J<i>±  | READY |
-//      DISABLED) with a colored status dot.
-//   2. Offers an Enable / Disable toggle button, gated by
-//      `robot.allow_power`.
-//   3. Uses the SAME safety path as JogControls' Enable/Disable
-//      modal: sendPowerCommand('enable'|'disable') behind a
-//      window.confirm() with the same copy the JogControls modal
-//      shows. Hold-to-jog dead-man is unrelated and untouched.
+// 2026-08-31 directive: a SINGLE stateful button — no more
+// chip+button combo, no more state label. Wire state is authority
+// (state === 2 numeric = ENABLED per FACTS.md); the button label
+// flips accordingly ("Disable" when enabled, "Enable" when
+// disabled). In-flight spinner during the transition. Confirm
+// dialog on ENABLE only — motion becomes possible on enable, so
+// the safety gate lives there; disable stops motion and is
+// non-destructive from a "did I mean it" perspective.
 //
-// Rendered on BOTH surfaces that need to change arm power:
+// Rendered on both surfaces that need to change arm power:
 //   • layouts/View3DLayout.jsx (RealArmChrome header)
 //   • pages/MonitorDashboard.jsx (near the run controls)
 //
-// Both instances bind the same `useStore` state (`robot.enabled`,
-// `robot.enabling`, `robot.alarm`, `robot.allow_power`, ...), so
-// toggling on one surface immediately reflects on the other via the
-// existing WS-mirrored store.
+// Both instances bind the same `useStore` state, so toggling on
+// one surface immediately reflects on the other via the existing
+// WS-mirrored store.
 //
 // This component MUST be the ONLY implementation of the enable/
-// disable control. Fork registry entry `arm_enable_control` blocks a
-// second one at deploy time.
+// disable control. Fork registry entry `arm_enable_control` blocks
+// a second one at deploy time.
 
 import { useStore } from '../store/useStore'
 
-const REAL_ARM_RED = '#7F1D1D'
+const ENABLED_GREEN  = '#059669'
+const DISABLED_RED   = '#7F1D1D'
+const ENABLING_AMBER = '#D97706'
 
 export default function ArmEnableControl() {
   const robot = useStore((s) => s.robot) || {}
   const sendPowerCommand = useStore((s) => s.sendPowerCommand)
-  const enabled    = !!robot.enabled
+  // Wire authority: numeric state code (per FACTS.md > silent
+  // classes — enabled ≡ state === 2). Boolean `robot.enabled`
+  // stays as a legacy fallback for older builds / mocks where
+  // `state_code` isn't populated yet.
+  const stateCode  = Number.isFinite(robot.state_code) ? robot.state_code : null
+  const enabled    = stateCode === 2
+                     || (stateCode === null && !!robot.enabled)
   const enabling   = !!robot.enabling
-  const alarm      = !!robot.alarm
   const allowPower = !!robot.allow_power
-  const jogActive  = !!robot.jog_active
-
-  // Terse state label. Priority: ALARM > ENABLING > JOG (active hold)
-  // > controller state_name > ENABLED > DISABLED.
-  const stateLabel =
-      alarm    ? 'ALARM'
-    : enabling ? 'ENABLING'
-    : (enabled && jogActive)
-             ? `JOG J${robot.jog_index ?? '?'}${robot.jog_direction > 0 ? '+' : robot.jog_direction < 0 ? '−' : ''}`
-    : enabled  ? (robot.state_name || 'READY')
-    :            'DISABLED'
-  const stateColor =
-      alarm    ? '#B91C1C'
-    : enabling ? '#D97706'
-    : enabled  ? '#059669'
-    :            '#6b7280'
 
   const wantEnable = !enabled
   const canToggle  = allowPower && !enabling
 
   const onTogglePower = () => {
     if (!canToggle) return
-    const msg = wantEnable
-      ? 'Enable robot power?\n\nEnsure the cell is clear before applying servo power.'
-      : 'Disable robot power?\n\nServo power will drop. Any active motion is stopped first.'
-    // Same confirmation invariant as the JogControls modal — plain
-    // window.confirm is enough for a safety gate; the operator can't
-    // accidentally click through it. Do NOT change this to a bespoke
-    // dialog without also updating the JogControls twin path — the
-    // safety gate lives in the two-step (confirm → dispatch) shape.
-    // eslint-disable-next-line no-alert
-    if (window.confirm(msg)) {
-      sendPowerCommand?.(wantEnable ? 'enable' : 'disable')
+    if (wantEnable) {
+      // Confirm on enable ONLY — motion becomes possible from
+      // this action, so the gate lives here. Disable stops
+      // motion and needs no confirm (the operator has already
+      // decided to remove power).
+      // eslint-disable-next-line no-alert
+      if (!window.confirm(
+        'Enable robot power?\n\n'
+        + 'Ensure the cell is clear before applying servo power.'
+      )) return
+      sendPowerCommand?.('enable')
+    } else {
+      sendPowerCommand?.('disable')
     }
   }
 
+  // Terse label. In-flight state (enabling) spells out ENABLING…
+  // so the operator sees the transition without any dot.
+  const label = enabling
+    ? 'Enabling…'
+    : enabled ? 'Disable' : 'Enable'
+  const accent = enabling
+    ? ENABLING_AMBER
+    : enabled ? DISABLED_RED : ENABLED_GREEN
+  const bg = enabling
+    ? '#fff'
+    : enabled ? DISABLED_RED : ENABLED_GREEN
+  const fg = enabling
+    ? ENABLING_AMBER
+    : '#fff'
+
+  const title =
+      !allowPower ? 'Power gate closed — pendant only'
+    : enabling    ? 'Enable request in flight'
+    : enabled     ? 'Disable robot power'
+    :               'Enable robot power'
+
   return (
-    <div
+    <button
       data-testid="arm-enable-control"
+      data-enabled={enabled ? 'true' : 'false'}
+      data-enabling={enabling ? 'true' : 'false'}
+      onClick={onTogglePower}
+      disabled={!canToggle}
+      title={title}
       style={{
-        display: 'inline-flex', alignItems: 'center', gap: 6,
-        background: 'rgba(127, 29, 29, 0.08)',
-        border: '1px solid ' + REAL_ARM_RED,
-        borderRadius: 6, padding: '3px 8px',
-        fontSize: 11, fontWeight: 700, letterSpacing: '0.06em',
-        color: REAL_ARM_RED, textTransform: 'uppercase',
-        minHeight: 26,
+        display: 'inline-flex', alignItems: 'center', gap: 8,
+        minHeight: 34,
+        padding: '6px 14px',
+        fontSize: 13, fontWeight: 700,
+        letterSpacing: '0.06em', textTransform: 'uppercase',
+        border: `1px solid ${accent}`,
+        borderRadius: 6,
+        background: bg, color: fg,
+        cursor: canToggle ? 'pointer' : 'not-allowed',
+        opacity: canToggle ? 1 : 0.55,
       }}>
-      <span>REAL ARM</span>
-      <span style={{
-        width: 6, height: 6, borderRadius: '50%',
-        background: stateColor,
-        boxShadow: `0 0 4px ${stateColor}`,
-      }} />
-      <span style={{ color: stateColor }}>{stateLabel}</span>
-      <button
-        onClick={onTogglePower}
-        disabled={!canToggle}
-        title={enabled
-          ? (allowPower ? 'Disable robot power' : 'Power gate closed — pendant only')
-          : (allowPower ? 'Enable robot power'  : 'Power gate closed — pendant only')}
-        style={{
-          marginLeft: 4, padding: '2px 8px', minHeight: 22,
-          fontSize: 10, fontWeight: 700, letterSpacing: '0.06em',
-          textTransform: 'uppercase',
-          border: '1px solid ' + REAL_ARM_RED,
-          borderRadius: 4,
-          background: enabled ? '#fff' : REAL_ARM_RED,
-          color:      enabled ? REAL_ARM_RED : '#fff',
-          cursor: canToggle ? 'pointer' : 'not-allowed',
-          opacity: canToggle ? 1 : 0.5,
-        }}>
-        {enabled ? 'Disable' : 'Enable'}
-      </button>
-    </div>
+      {enabling && (
+        <span aria-hidden="true"
+              data-testid="arm-enable-spinner"
+              style={{
+                width: 12, height: 12,
+                border: `2px solid ${ENABLING_AMBER}`,
+                borderTopColor: 'transparent',
+                borderRadius: '50%',
+                animation: 'arm-enable-spin 0.8s linear infinite',
+                display: 'inline-block',
+              }} />
+      )}
+      <span>{label}</span>
+      <style>{`
+        @keyframes arm-enable-spin {
+          from { transform: rotate(0deg); }
+          to   { transform: rotate(360deg); }
+        }
+      `}</style>
+    </button>
   )
 }

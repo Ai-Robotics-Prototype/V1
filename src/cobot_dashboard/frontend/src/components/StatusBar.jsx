@@ -209,64 +209,18 @@ export default function StatusBar() {
 
       <div style={{ flex: 1 }} />
 
-      {/* Right side: SERVED bundle identity.
-          `served <hash>` is Vite's content-hash of index-<HASH>.js — read
-          from the actual <script> element the browser loaded. This is
-          the SAME sha256 that System Check Software row displays
-          (dashboard_server _check_software → bundle_hash_for), so the
-          two ALWAYS agree on which bundle the tab is running.
-          BUILD_TIME is retained as a secondary freshness signal (a
-          rebuild with the same source tree emits the same hash but a
-          new BUILD_TIME).
-          If a newer bundle lands on the server, the footer stays
-          pinned to what THIS tab actually loaded — telling the operator
-          they need to reload. That was the whole point of the fix. */}
-      <FooterBuild />
+      {/* 2026-08-31 directive: FooterBuild "served <hash>" pill
+          retired from the footer. Full SHA + verdict lives in
+          Configure → Provenance (getServedBundleHash still used
+          there). /health continues to expose backend/frontend
+          SHAs. DeployStatusBanner renders only when verdict !=
+          green; StaleGuard overlay is unchanged. Provenance
+          stays enforced end-to-end; it just stops being furniture
+          on every page. */}
     </div>
   )
 }
 
-function FooterBuild() {
-  const [servedHash] = useState(() => getServedBundleHash())
-  const [systemHash, setSystemHash] = useState(null)
-  useEffect(() => {
-    // Fetch System Check ONCE for the "does what this tab loaded
-    // match what the server currently serves?" comparison. Refreshing
-    // won't help if the tab is stale — the operator has to reload.
-    let cancelled = false
-    fetch('/api/systemcheck')
-      .then((r) => r.ok ? r.json() : null)
-      .then((d) => {
-        if (cancelled || !d) return
-        const sw = (d.checks || []).find((c) => c.key === 'software')
-        // Use the Vite content-hash from the JS asset filename (same
-        // hash space as our footer's DOM lookup). Falls back to the
-        // sha256 of index.html for older backends that don't emit
-        // served_asset_hash yet.
-        if (sw) setSystemHash(sw.served_asset_hash || sw.served_hash)
-      }).catch(() => {})
-    return () => { cancelled = true }
-  }, [])
-  const shortHash = servedHash ? servedHash.slice(0, 8) : null
-  const stale = systemHash && servedHash && systemHash !== servedHash
-  return (
-    <Block style={{
-      borderRight: 'none',
-      borderLeft: '1px solid var(--border)',
-      color: stale ? '#B45309' : 'var(--text-muted)',
-    }}>
-      {shortHash
-        ? <>served <span style={{ fontFamily: 'var(--font-mono)' }}>{shortHash}</span></>
-        : 'dev'}
-      {typeof __BUILD_TIME__ !== 'undefined' && (
-        <span style={{ marginLeft: 6, opacity: 0.55 }}>{__BUILD_TIME__}</span>
-      )}
-      {stale && (
-        <span style={{ marginLeft: 6, fontWeight: 700 }}
-              title={`server now serves ${systemHash.slice(0,8)} — reload to pick it up`}>
-          ⟳ RELOAD
-        </span>
-      )}
-    </Block>
-  )
-}
+// Exported for Configure → Provenance to render the same served-hash
+// truth the footer used to show, without duplicating the DOM lookup.
+export { getServedBundleHash }

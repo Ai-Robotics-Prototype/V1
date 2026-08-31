@@ -1,4 +1,4 @@
-"""Load-must-push pinned regression (2026-08-03).
+"""Load-must-push pinned regression (2026-08-03, amended 2026-08-31).
 
 Operator hit a hard divergence: Monitor showed 'white bowl pick &
 place' (dashboard state) while the controller had 'hole part
@@ -19,10 +19,19 @@ Fix, pinned by these tests:
     /api/estun/program/run with push_only=true. On failure the
     UI surfaces a warning toast instead of silently accepting
     the divergence.
-  * MonitorDashboard.jsx: residentDivergence banner renders when
-    robot.program.resident_program_id disagrees with
-    currentProgram.id — so an operator who edited without
-    pushing sees the caveat before hitting Run.
+
+2026-08-31 directive (selection-is-authority): the residentDivergence
+banner + one-tap "Push to controller" button are RETIRED. Selection
+IS the sole push trigger — auto-pushed on Change Program / library
+click, silent success (small transient "Loaded X" toast), honest
+named toast on failure (namedLoadError). NO auto-push on reconnect,
+boot, tab-restore, or ui_context drift. Quarantined programs (423)
+refuse at pick time with the named 'quarantined' outcome so a
+selection never half-succeeds into a mismatch state. Server-side
+mismatch DETECTION is retained as a log/event class only (add-29);
+no banner ever renders. The whole resident-program concept retires
+with RUN_BACKEND=ros2_executor (add-52 §646-654); this is minimal
+glue on the legacy path.
 """
 
 from __future__ import annotations
@@ -94,22 +103,26 @@ def test_load_handler_pushes_via_estun_program_run():
         'present — that path is ignored by the executor')
 
 
-def test_monitor_renders_resident_divergence_banner():
-    """When robot.program.resident_program_id != currentProgram.id
-    the Monitor MUST show a divergence banner. Without it the
-    operator sees ONE name (dashboard's) and has no way to know
-    the controller has a different program resident."""
+def test_monitor_does_not_render_resident_divergence_banner():
+    """2026-08-31 directive: the resident-mismatch banner is retired.
+    Selection is the sole push trigger, so the banner (which
+    depended on stale drift between currentProgram and
+    resident_program_id) can only fire for one of the drift causes
+    the directive explicitly rules out (reconnect / boot / tab-
+    restore / ui_context). Server-side mismatch detection stays as
+    a log/event class only (add-29). Pin the ABSENCE so the banner
+    cannot come back without a directive amendment."""
     src = _read(MONITOR)
-    assert 'residentDivergence' in src, (
-        'Monitor has no residentDivergence derivation — divergence '
-        'is invisible to the operator')
-    assert 'data-testid="resident-divergence"' in src, (
-        'Divergence banner has no data-testid — QA cannot pin its '
-        'render. Reinstate the anchor.')
-    # The banner MUST mention both the resident and the loaded ids
-    # so the operator can act on the disagreement.
-    assert 'Controller resident' in src, (
-        'Divergence banner does not name the controller-resident id')
+    assert 'residentDivergence' not in src, (
+        'residentDivergence derivation is back — the mismatch '
+        'banner was retired by the 2026-08-31 directive '
+        '(selection is authority)')
+    assert 'data-testid="resident-divergence"' not in src, (
+        'resident-divergence testid is back — banner has been '
+        'reintroduced')
+    assert 'Controller resident:' not in src, (
+        'Divergence-banner copy is back — the banner was retired '
+        'by the 2026-08-31 directive')
 
 
 def test_no_stale_action_load_in_frontend():
@@ -240,26 +253,21 @@ def test_monitor_uses_named_load_error_map():
         'namedLoadError import path drifted from /lib/loadOutcome')
 
 
-def test_monitor_banner_has_push_to_controller_action():
-    """When the mismatch banner DOES render (genuine divergence
-    only, post-rollback fix), the operator needs a one-tap way
-    to converge without navigating. The button must be inside
-    the divergence banner render and call the same push_only
-    endpoint the load path uses."""
+def test_monitor_has_no_banner_push_to_controller_button():
+    """2026-08-31 directive: no push button anywhere on Monitor. The
+    only push trigger is explicit program selection. Pin the
+    absence of the banner-affordance testid + handler so a
+    reintroduction fails loudly."""
     src = _read(MONITOR)
-    assert 'data-testid="banner-push-to-controller"' in src, (
-        'divergence banner has no push-to-controller action — the '
-        'operator has no one-tap way to converge')
-    # Same handler shape as the load path (push_only:true against
-    # /api/estun/program/run). Assert the handler function exists
-    # and is wired to the button — the actual endpoint call lives
-    # in pushProgramToController, which the load path also uses.
-    assert 'onBannerPushToController' in src, (
-        'banner Push button handler onBannerPushToController is '
-        'missing — the button would be unwired')
+    assert 'data-testid="banner-push-to-controller"' not in src, (
+        'banner-push-to-controller button is back — the 2026-08-31 '
+        'directive forbids a Monitor push affordance')
+    assert 'onBannerPushToController' not in src, (
+        'onBannerPushToController handler is back — the banner '
+        'was retired')
+    # The shared push helper stays — selection uses it.
     assert 'pushProgramToController' in src, (
-        'The shared push helper is missing — the load path and '
-        'the banner button should share one code path')
+        'shared push helper missing — selection has no way to push')
 
 
 def test_dashboard_maps_ws_reject_to_transport_down_outcome():
@@ -324,7 +332,9 @@ def test_named_load_error_map_has_all_documented_kinds():
                  'id_not_controller_safe',
                  'lint_infrastructure_error', 'codegen',
                  # Firmware bug #3 quarantine (2026-08-04):
-                 'pending_poses', 'arity_assertion_failed'):
+                 'pending_poses', 'arity_assertion_failed',
+                 # Palletize quarantine, 423 at pick time (2026-08-31):
+                 'quarantined'):
         assert kind in src, (
             f'namedLoadError has no entry for outcome.kind={kind!r} '
             '— the UI would fall back to a generic message')

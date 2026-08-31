@@ -813,6 +813,64 @@ capabilities:
           - '**/*.pinned.test.js'
     known_debt: []
 
+  # 23b. Mode-refusal copy (2026-08-31 operator directive).
+  #
+  # Directive: every /api/estun/mode refusal renders ONLY through
+  # namedModeError in the shared module below. Prior code (pre-
+  # 2026-08-31) flattened outcome.reason || outcome.detail into a
+  # single toast body under a hardcoded generic title ("Can't
+  # start — controller is not in Auto..." / "Mode switch refused:
+  # <raw>"), which was wrong for the ladder's Rung 1 (recoveryState
+  # → physical cabinet cycle) and Rung 2 (errors_persist → pendant
+  # :9198 alarm log). The mode-pill acceptance test surfaced the
+  # bug via program-run attempts because both call sites shared
+  # the same flattening pattern.
+  #
+  # Parallel to operator_refusal_copy but scoped to mode-switch
+  # surfaces so failures name the specific broken invariant.
+  - id: mode_refusal_copy
+    description: >
+      Every /api/estun/mode refusal surface routes through
+      namedModeError. The mapper produces the ladder-honest
+      operator-language title + detail per outcome.kind AND per
+      mode_switch_failed reason_code; the raw wire fields
+      (reason_code, reason, four_tuple, subs) survive in
+      technicalDetail for devtools grep.
+
+      Two canonical call sites pinned:
+        * RunProgramModal.jsx        — mode-switch pre-flight for
+                                       "switch to Auto and run"
+        * ModeControl.jsx            — the pill's confirm dialog
+
+      Fork rule: any new frontend file that POSTs to
+      /api/estun/mode MUST import namedModeError and render the
+      structured result. The exhaustive-fetch-site sweep in
+      test_every_estun_mode_call_site_imports_named_mode_error
+      makes drift fail at deploy time.
+    canonical:
+      frontend:
+        path: src/cobot_dashboard/frontend/src/lib/modeOutcome.js
+        exports: [namedModeError, MODE_OUTCOME_KINDS,
+                  MODE_FAILED_REASON_CODES, BANNED_OPERATOR_TOKENS]
+    forbidden:
+      # A file that fetches /api/estun/mode but does NOT import
+      # namedModeError — the exhaustive sweep runs in
+      # test_operator_refusal_copy.py rather than a static regex
+      # because "imports namedModeError" is a positive condition,
+      # not a substring anti-pattern.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{jsx,js}
+        patterns:
+          # The pre-fix concat pattern scoped to mode-switch bodies.
+          # 'mbody' is the local variable name RunProgramModal used;
+          # matching it as a specific hazard keeps the rule tight.
+          - "mbody\\??\\.outcome\\??\\.reason"
+          - "\"Can't start — controller is not in Auto"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/modeOutcome.js
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt: []
+
   # 22. Unified event log (2026-08-05 operator directive).
   - id: event_log
     description: >

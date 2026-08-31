@@ -1697,18 +1697,23 @@ const storeDefinition = (set, get) => ({
     if (patch && patch.rev != null && get().wsStatus === 'connected') {
       set({ programRevConfirmed: true })
     }
-    // Reset runSpeedPct to whatever the newly-loaded program's config
-    // says, clamped 1..100. Only fires when the program's identity
-    // OR its config.speed_pct actually changed — editing a step
-    // without touching speed shouldn't reset the operator's manual
-    // speed selection. `patch.id` is the reliable identity marker
-    // (setCurrentProgram is used both for whole-program loads AND
-    // for {unsaved:true} field-level updates).
+    // Load the newly-loaded program's per-program saved speed.
+    // 2026-08-31 speed model: each program record stores its own
+    // last-set speed under config.speed_pct. Switching programs
+    // loads that program's saved speed; new / never-run programs
+    // default to 25% (the F2.7 first-run rule is now satisfied
+    // by this default, not a hard cap). Only fires when the
+    // program identity OR config.speed_pct actually changed —
+    // editing a non-speed field shouldn't reset the runSpeedPct.
     const cfg = patch?.config
     if (patch?.id !== undefined || (cfg && 'speed_pct' in cfg)) {
       const raw = Number(cfg?.speed_pct ?? patch?.speed_pct)
       if (Number.isFinite(raw) && raw > 0) {
         set({ runSpeedPct: Math.max(1, Math.min(100, Math.round(raw))) })
+      } else if (patch?.id !== undefined) {
+        // Whole-program load with no stored speed → new-program
+        // default (F2.7 first-run rule as default, not cap).
+        set({ runSpeedPct: 25 })
       }
     }
     // 2026-08-05 (refresh persistence, fork registry:
@@ -1871,19 +1876,21 @@ const storeDefinition = (set, get) => ({
   stepPanelOpen: true,
   setStepPanelOpen(v) { set({ stepPanelOpen: !!v }) },
 
-  // Monitor speed entry (integer % 1..100). Truth-in-UI display: the
-  // driver's operator_speed_limit is the HARD cap; whatever the
-  // operator enters here is clamped to [1, 100] first (invalid values
-  // toast a clamp reason), then compared to the cap for display. The
-  // effective % is min(entered, operator_cap_pct). See
-  // RunProgramModal for the render + POST body wiring.
+  // Monitor speed entry (integer % 1..100). 2026-08-31 speed model:
+  // full 1..100 range accepted; controller-side operator_speed_limit
+  // is the true ceiling and refuses via namedSpeedRefusal when
+  // exceeded. Per-program persistence: whenever the value commits,
+  // it debounces-saves to the CURRENT program's config.speed_pct
+  // via PUT /api/programs/{id} (no Save click). Switching programs
+  // loads that program's saved speed (setCurrentProgram wires this
+  // in the patch handler above). New / never-run programs default
+  // to 25% (F2.7 first-run rule as default, not a cap).
   //
-  // Default 10 (safe conservative). Reset to program.config.speed_pct
-  // whenever a program is loaded via setCurrentProgram({config:…}).
-  // NOT persisted to localStorage — the operator's per-session choice
-  // shouldn't leak into a fresh page-load, and program-editor changes
-  // to speed_pct win.
-  runSpeedPct: 10,
+  // Default 25 (was 10). NOT persisted to localStorage — the value
+  // lives on the program record; a fresh page-load re-hydrates from
+  // there.
+  runSpeedPct: 25,
+  _programSpeedSaveTimer: null,
   setRunSpeedPct(rawInput) {
     // Accepts numbers or strings. Non-numeric / empty → falls back to
     // current value with an addToast('warning', …) so the operator
@@ -1906,7 +1913,56 @@ const storeDefinition = (set, get) => ({
       get().addToast(`Speed ${n} clamped to 100%`, 'warning')
       n = 100
     }
-    set({ runSpeedPct: n }); return n
+    set({ runSpeedPct: n })
+    // Debounced auto-save to the current program. Silent — no
+    // "Saved" toast on every commit; if the PUT fails the operator
+    // will see the mismatch on next reload (best-effort persistence,
+    // same shape as rememberOpenProgram + editThroughProgram).
+    const progId = get().currentProgram?.id
+    if (progId) {
+      const prev = get()._programSpeedSaveTimer
+      if (prev) clearTimeout(prev)
+      const t = setTimeout(() => {
+        try { get().persistProgramSpeed(progId, n) } catch (_) { /* nop */ }
+      }, 400)
+      set({ _programSpeedSaveTimer: t })
+    }
+    return n
+  },
+
+  // Persist a per-program speed to the backend. Uses PUT
+  // /api/programs/{id} with a config merge (server preserves
+  // steps, points, tags etc — same shape any editor save uses).
+  // Also mirrors the new value into currentProgram.config.speed_pct
+  // so subsequent reads reflect the debounced write without an
+  // extra GET round-trip.
+  async persistProgramSpeed(programId, speedPct) {
+    if (!programId || !Number.isFinite(speedPct)) return { ok: false }
+    const cp = get().currentProgram
+    const mergedConfig = { ...(cp?.config || {}), speed_pct: speedPct }
+    try {
+      const r = await fetch(
+        `/api/programs/${encodeURIComponent(programId)}`,
+        { method:  'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ config: mergedConfig }),
+          keepalive: true })
+      if (!r.ok) return { ok: false, status: r.status }
+      // Mirror into currentProgram without triggering the reload
+      // path (no `id` in the patch → speed reset guard skips).
+      if (cp?.id === programId) {
+        set((s) => ({
+          currentProgram: {
+            ...s.currentProgram,
+            config: { ...(s.currentProgram?.config || {}),
+                      speed_pct: speedPct },
+          },
+        }))
+      }
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, error: String(e) }
+    }
   },
 
   // Program-tab layout dimensions used to live here (leftWidth /

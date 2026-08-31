@@ -83,17 +83,14 @@ export default function DeployStatusBanner() {
           + `Failing layers: ${failing.join(', ')}. `
           + `Restart may not have taken (surviving old worker) or the frontend rebuild skipped.`
   } else if (state === 'current') {
-    const hash = String(prov.deploy_sha
-                     || last?.served_asset_after
-                     || last?.sha
-                     || '?').slice(0, 8)
-    const age  = fmtAgeFromIso(last?.ts)
-    bg = '#064E3B'; fg = '#D1FAE5'; border = '#065F46'
-    label = `✓ current — ${hash} · ${age}`
-    title = `All three layers agree at ${prov.deploy_sha || '?'} — `
-          + `deploy=ok, backend=${(prov.backend_sha || '?').slice(0, 8)}, `
-          + `frontend=${(prov.frontend_sha || '?').slice(0, 8)}. `
-          + `Last successful deploy: ${last?.ts || ''}`
+    // 2026-08-31 directive: verdict green ⇒ no footer chrome. The
+    // Configure → Provenance section is the operator's canonical
+    // view of "which SHA am I on?" — the footer only surfaces a
+    // banner when verdict != green (this branch bows out silently).
+    // StaleGuard overlay is unaffected. Enforcement chain is
+    // unchanged: /api/deploy_status is still evaluated every 3s;
+    // any non-green verdict raises the banner immediately.
+    return null
   } else if (state === 'deploying') {
     bg = '#1E3A8A'; fg = '#DBEAFE'; border = '#3B82F6'
     const phase = latest.phase === 'building' ? 'building…' : 'starting…'

@@ -43,6 +43,7 @@ export const LOAD_OUTCOME_KINDS = [
   'codegen',
   'pending_poses',
   'arity_assertion_failed',
+  'quarantined',
 ]
 
 // Tokens that must never appear in operator-facing strings
@@ -113,6 +114,20 @@ function _shape({ code, title, detail, technicalDetail = '' }) {
 export function namedLoadError(body, httpStatus) {
   const kind = (body && body.outcome && body.outcome.kind) || null
   const rawReason = _wireReason(body)
+
+  if (kind === 'quarantined') {
+    // 423 Locked — server refuses the pick at load time (palletize
+    // quarantine, add-52 §646-654). Named at pick time so a
+    // selection never half-succeeds into a mismatch state
+    // (2026-08-31 selection-is-authority directive).
+    const opDetail = body?.outcome?.detail
+    return _shape({
+      code:    'quarantined',
+      title:   "Program is quarantined — not loaded.",
+      detail:  opDetail || 'Pick a different program from the library.',
+      technicalDetail: rawReason,
+    })
+  }
 
   if (kind === 'transport_down' || /ws not connected/i.test(rawReason)) {
     return _shape({

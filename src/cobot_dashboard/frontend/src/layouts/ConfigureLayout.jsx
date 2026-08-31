@@ -4,6 +4,7 @@ import SetupWizard from '../components/SetupWizard'
 import CellDetailPanel from '../components/CellDetailPanel'
 import Cam0CalibrationCard from '../components/Cam0CalibrationCard'
 import { useCellWizardStore } from '../store/cellWizardStore'
+import { getServedBundleHash } from '../components/StatusBar'
 
 function CellRow({ c, allCells, busy, onActivate, onDelete, expanded, onToggleExpand, onRefresh }) {
   return (
@@ -751,6 +752,120 @@ function SystemCheckSection() {
   )
 }
 
+// Full SHA + three-layer verdict panel. Replaces the retired
+// footer "served <hash>" pill (2026-08-31 directive). Reads the
+// same /api/deploy_status the footer DeployStatusBanner does,
+// so the two never disagree; also shows the served bundle hash
+// read from the actual <script> element the browser loaded (the
+// Vite content-hash), so an operator can compare it against the
+// deploy_log SHA at a glance.
+//
+// Enforcement chain is unchanged: DeployStatusBanner still
+// surfaces on every non-green verdict, StaleGuard overlay still
+// blocks the app on backend/frontend SHA mismatch. This section
+// is the operator's WELL-LIT view — not a new gate.
+function ProvenanceSection() {
+  const [status, setStatus] = useState(null)
+  const [err, setErr] = useState(null)
+  const [servedHash] = useState(() => getServedBundleHash())
+
+  useEffect(() => {
+    let cancelled = false
+    async function poll() {
+      try {
+        const r = await fetch('/api/deploy_status', { cache: 'no-store' })
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        const d = await r.json()
+        if (cancelled) return
+        setStatus(d); setErr(null)
+      } catch (e) {
+        if (!cancelled) setErr(e.message || 'fetch failed')
+      }
+    }
+    poll()
+    const id = setInterval(poll, 5000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [])
+
+  const prov  = status?.provenance || {}
+  const state = status?.state || (err ? 'unknown' : '…')
+  const verdict = prov.verdict || state
+  const failing = prov.failing_layers || []
+  const verdictColor =
+      verdict === 'green'                       ? DOT_COLORS.green
+    : (verdict === 'red' || state === 'failed') ? DOT_COLORS.red
+    : verdict === 'amber' || state === 'waiting' || state === 'stale'
+                                                ? DOT_COLORS.yellow
+    :                                             'var(--text-muted)'
+
+  const rows = [
+    { label: 'Verdict',      value: verdict.toUpperCase(), color: verdictColor,
+      title: failing.length ? `Failing layers: ${failing.join(', ')}`
+                            : 'All three layers agree.' },
+    { label: 'Deploy SHA',   value: prov.deploy_sha  || '(unknown)' },
+    { label: 'Backend SHA',  value: prov.backend_sha || '(unknown)' },
+    { label: 'Frontend SHA', value: prov.frontend_sha || '(unknown)' },
+    { label: 'Served bundle', value: servedHash || '(dev)' },
+  ]
+
+  return (
+    <div style={{
+      background: 'var(--bg-surface)',
+      border: '1px solid var(--border)',
+      borderRadius: 'var(--radius-lg)',
+      padding: '16px 20px',
+      display: 'flex', flexDirection: 'column', gap: 12,
+    }}>
+      <div style={{
+        fontSize: 11, fontWeight: 600, color: 'var(--text-primary)',
+        textTransform: 'uppercase', letterSpacing: '0.08em',
+        paddingBottom: 8, borderBottom: '1px solid var(--border)',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      }}>
+        <span>Provenance</span>
+        <span style={{
+          fontSize: 10, fontWeight: 400, color: 'var(--text-muted)',
+          textTransform: 'none', letterSpacing: 'normal',
+        }}>
+          {err ? `error: ${err}` : `state: ${state}`}
+        </span>
+      </div>
+
+      <div data-testid="provenance-section"
+           style={{ display: 'grid', gridTemplateColumns: '140px 1fr', rowGap: 6, columnGap: 12 }}>
+        {rows.flatMap((r) => ([
+          <div key={`${r.label}-label`} style={{
+            fontSize: 12, color: 'var(--text-secondary)',
+            fontWeight: 600,
+          }}>
+            {r.label}
+          </div>,
+          <div key={`${r.label}-value`} title={r.title || ''} style={{
+            fontSize: 12,
+            fontFamily: 'var(--font-mono, monospace)',
+            color: r.color || 'var(--text-primary)',
+            fontWeight: r.color ? 700 : 500,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>
+            {r.value}
+          </div>,
+        ]))}
+      </div>
+
+      <div style={{
+        fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5,
+      }}>
+        The footer surfaces a banner only when verdict is not green.
+        Full details also available at{' '}
+        <code style={{ fontFamily: 'var(--font-mono, monospace)' }}>/health</code>
+        {' '}and{' '}
+        <code style={{ fontFamily: 'var(--font-mono, monospace)' }}>/api/deploy_status</code>.
+      </div>
+    </div>
+  )
+}
+
+
 export default function ConfigureLayout() {
   return (
     <div style={{
@@ -767,6 +882,8 @@ export default function ConfigureLayout() {
       </div>
 
       <SystemCheckSection />
+
+      <ProvenanceSection />
 
       <DeviceIdentitySection />
 

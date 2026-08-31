@@ -15,7 +15,6 @@ import { deriveRunState, isStopButtonEnabled,
          isStuckStopping as _computeStuckStopping,
          isStateStreamStale as _computeStreamStale,
          STUCK_STOPPING_MS } from '../lib/runState'
-import { readPayload, payloadChipLabel } from '../lib/payload'
 import { runnableStepCount } from '../lib/programTruth'
 import { namedLoadError, namedSpeedRefusal } from '../lib/loadOutcome'
 
@@ -750,9 +749,10 @@ export default function MonitorDashboard() {
   // success, never precedes it.
   const [pushingProgramName, setPushingProgramName] = useState(null)
 
-  // Shared push helper. Used by BOTH the Program Library load flow
-  // AND the divergence banner's one-tap "Push to controller" action
-  // — same wire contract, same rollback semantics, one code path.
+  // Shared push helper. Used by the Program Library load flow —
+  // selection IS the sole push trigger (2026-08-31 directive:
+  // resident-mismatch banner retired; no auto-push on reconnect /
+  // boot / tab-restore / ui_context drift).
   //
   // Returns {ok, named?} where named is the operator-language
   // description of the failure (namedLoadError) when !ok.
@@ -808,11 +808,14 @@ export default function MonitorDashboard() {
     // same bytes we sent (dashboard_server:5443). Prior code (pre
     // 2026-08-04) set currentProgram synchronously BEFORE this
     // call — any push refusal (transport down, empty_program,
-    // lint, byte-verify) manufactured the exact divergence the
-    // resident-mismatch banner was designed to warn about. The
-    // load path IS the moment the resident becomes current; if
-    // the push fails, currentProgram must stay what it was so
-    // the operator's UI matches the controller's actual state.
+    // lint, byte-verify, quarantined) manufactured a divergence
+    // between UI and controller state. The load path IS the moment
+    // the resident becomes current; if the push fails, currentProgram
+    // must stay what it was so the operator's UI matches the
+    // controller's actual state. Failures render as the named toast
+    // (loadOutcome.namedLoadError); quarantined (423) refuses at
+    // pick time with the operator-language reason so a selection
+    // never half-succeeds into a mismatch state (2026-08-31 directive).
     const result = await pushProgramToController(
       full.id, full.name || full.id)
     if (!result.ok) {
@@ -843,35 +846,6 @@ export default function MonitorDashboard() {
       config:      full.config || {},
     })
     addToast?.('Loaded "' + (full.name || full.id) + '"', 'success')
-  }
-
-  // Banner one-tap "Push to controller" — same push_only endpoint,
-  // same named-error surface, no navigation. Uses currentProgram.id
-  // because the banner only renders when the operator's UI already
-  // shows a program the controller doesn't have resident; the
-  // action is "make the controller catch up." This is the escape
-  // hatch for the (rare, post-rollback-fix) case where a genuine
-  // out-of-band divergence exists (foreign process pushed to the
-  // controller, or a prior push crashed mid-write).
-  const onBannerPushToController = async () => {
-    const id = currentProgram?.id
-    if (!id) return
-    const label = currentProgram?.name || id
-    const result = await pushProgramToController(id, label)
-    if (!result.ok) {
-      const { title, detail, technicalDetail } = result.named
-      addToast?.({ title, detail, technicalDetail },
-        'error', 10000)
-      if (technicalDetail) {
-        // eslint-disable-next-line no-console
-        console.warn('[banner-push] refused', {
-          code: result.named.code, technicalDetail,
-          status: result.status, body: result.body,
-        })
-      }
-      return
-    }
-    addToast?.(`Pushed "${label}" to controller`, 'success')
   }
 
   // Cycle bookkeeping lives in local state — the backend doesn't track
@@ -941,20 +915,17 @@ export default function MonitorDashboard() {
   const showStreamStale = streamStale
     && ['running', 'stopping', 'paused'].includes(runState.kind)
 
-  // 2026-08-03: display name reflects the RESIDENT program (what
-  // the controller will actually run). robot.program.resident_
-  // program_id is set by save_project on every push — if the
-  // resident matches the dashboard's currentProgram, they're one
-  // and the same and we show currentProgram.name. If they DIVERGE
-  // (dashboard-load-without-push, or a foreign process pushed to
-  // the controller), the divergence banner (below) shows both and
-  // the Run button is gated separately.
-  const residentProgramId = robot?.program?.resident_program_id
-  const residentDivergence = (
-       residentProgramId
-    && currentProgram?.id
-    && residentProgramId !== currentProgram.id
-  )
+  // 2026-08-31 directive: selection is the sole push trigger (auto
+  // and silent), so currentProgram is the operator-facing truth.
+  // The mismatch banner + divergence-derivation + one-tap Push
+  // affordance are retired here. The legacy path still mirrors
+  // robot.program.resident_program_id server-side for the D9
+  // line_map honesty check (StepPreviewPanel consumes it) and for
+  // the log/event class in add-29 — a genuine out-of-band mismatch
+  // (foreign push, crashed mid-write) surfaces as a server-side
+  // event, never as a Monitor banner. This whole resident-program
+  // concept retires with RUN_BACKEND=ros2_executor (add-52
+  // §646-654) — no resident under CRI streaming.
   const programName    = currentProgram?.name || 'No program loaded'
   const steps          = currentProgram?.steps || []
   const currentStepIdx = task?.running || task?.paused ? (task?.program_step ?? 0) : -1
@@ -1069,42 +1040,6 @@ export default function MonitorDashboard() {
                 </span>
               )}
             </div>
-            {residentDivergence && (
-              <div data-testid="resident-divergence"
-                   style={{
-                     marginTop: 8, padding: '8px 12px',
-                     background: '#FEF3C7', border: '1px solid #F59E0B',
-                     borderRadius: 6, fontSize: 12, color: '#92400E',
-                     lineHeight: 1.4,
-                   }}>
-                <b>Controller resident: {residentProgramId}</b>
-                <br />
-                Dashboard shows{' '}
-                <code>{currentProgram?.id}</code>
-                {' '}but the controller currently holds{' '}
-                <code>{residentProgramId}</code>. Push{' '}
-                <code>{currentProgram?.id}</code> to converge — or
-                open Change Program to load a different one.
-                <div style={{ marginTop: 8 }}>
-                  <button
-                    data-testid="banner-push-to-controller"
-                    onClick={onBannerPushToController}
-                    disabled={!!pushingProgramName}
-                    style={{
-                      padding: '4px 10px',
-                      background: pushingProgramName ? '#F3F4F6' : '#FDE68A',
-                      border: '1px solid #B45309',
-                      borderRadius: 4, fontSize: 12,
-                      color: '#78350F', fontWeight: 600,
-                      cursor: pushingProgramName ? 'default' : 'pointer',
-                    }}>
-                    {pushingProgramName
-                      ? 'Pushing…'
-                      : `Push ${currentProgram?.id} to controller`}
-                  </button>
-                </div>
-              </div>
-            )}
             {currentStepIdx >= 0 && steps.length > 0 && (
               <div style={{ fontSize: 14, color: '#6b7280', marginTop: 4 }}>
                 Step {currentStepIdx + 1} of {steps.length}: {currentStepLabel}
@@ -1136,15 +1071,14 @@ export default function MonitorDashboard() {
             <StepPreviewPanel />
           </div>
 
-          {/* Speed entry — editable integer % (1-100). Truth-in-UI:
-              driver caps at operator_speed_limit (policy ceiling
-              raised to 65% on 2026-07-22). We show the effective %
-              right next to the box so entering above the cap doesn't
-              silently accept an unhonored value. */}
+          {/* Speed entry — editable integer % (1-100). 2026-08-31
+              directive: full range, no UI cap; controller-side
+              operator_speed_limit is the true ceiling (server
+              refuses via namedSpeedRefusal when exceeded). Value
+              auto-persists per-program (see setRunSpeedPct). */}
           <ProgramSpeedEntry
             value={runSpeedPct}
             setValue={setRunSpeedPct}
-            operatorCapFrac={robot?.operator_speed_limit}
           />
 
           {/* Mid-run speed control — only appears while a program is
@@ -1339,31 +1273,14 @@ export default function MonitorDashboard() {
             </button>
           </div>
 
-          {/* Provenance badge + description below the step indicator.
-              Badge reads from the authoritative `source` field on the
-              stored /opt/cobot/programs/{id}.json (also computed by
-              backend inference for pre-provenance-field files, so
-              older programs still get labeled correctly). Description
-              gets the stale "poses pending perception" caveat filtered
-              OUT when the backend flag has_taught_poses is true. */}
-          <ProgramProvenance program={currentProgram} />
-          {(() => {
-            const desc = currentProgram?.description
-            if (!desc) return null
-            // Strip the stale caveat when poses are actually taught.
-            // The backend sends has_taught_poses on the GET response;
-            // it's a snapshot boolean, not stored persistently.
-            const stripCaveat = currentProgram?.has_taught_poses === true
-            const filtered = stripCaveat
-              ? desc.replace(/^(?:PBD draft — |Generated from demonstration — )?poses pending perception\.\s*/i, '')
-              : desc
-            if (!filtered.trim()) return null
-            return (
-              <div style={{ fontSize: 13, color: '#6b7280', marginTop: 12, lineHeight: 1.4 }}>
-                {filtered.trim()}
-              </div>
-            )
-          })()}
+          {/* 2026-08-31 directive: program-metadata surfaces
+              (Demonstration/weight/demo-id badges + description
+              line) retired from the Monitor run console. Metadata
+              belongs in Program Library detail view — the run
+              console shows only what's needed to run the loaded
+              program. `has_taught_poses === false` still surfaces
+              as a "poses pending" affordance elsewhere (Run modal
+              refusal path via pending_poses named copy). */}
         </div>
 
         {/* Top-right: compact 200×200 target part viewer.
@@ -1720,30 +1637,26 @@ async function forceReset({ addToast }) {
   }
 }
 
-// Editable "Program speed" input + inline truth-in-UI effective %.
-// - Enter/blur commits (uses store.setRunSpeedPct which does the
-//   clamp + toast on invalid).
-// - Displays "X%" plain, OR "X% → effective Y%" if the driver's
-//   operator_speed_limit would cap it. The box's ceiling is 100 but
-//   the operator sees exactly what the driver will honor.
-// - When the driver isn't reporting (fresh page-load / disconnect),
-//   we conservatively assume a 25% cap so the display doesn't lie in
-//   the other direction.
-function ProgramSpeedEntry({ value, setValue, operatorCapFrac }) {
+// Editable "Program speed" input. 2026-08-31 directive removes
+// the artificial UI cap: the input accepts the full 1..100 range;
+// controller-side limits (operator_speed_limit) remain the true
+// ceiling and refuse via the server named-copy path if exceeded.
+// The prior "effective X% (cap Y%)" display presupposed a
+// client-side ceiling that could lie when the driver hadn't
+// reported yet (fell back to 25%).
+//
+// Auto-save: whenever a value commits, we persist it against the
+// CURRENT program (per-program speed model — see
+// `useStore.setRunSpeedPct` for the debounced PUT wiring). New /
+// never-run programs default to 25% (F2.7 first-run rule is now
+// satisfied as a default, not a hard cap).
+function ProgramSpeedEntry({ value, setValue }) {
   const [local, setLocal] = useState(String(value))
 
-  // Keep the input reflecting store changes (program load, toast-
-  // clamp). Only overwrite the visible text when it doesn't match
-  // the store — otherwise the user's mid-typing would flicker.
   useEffect(() => {
     if (String(value) !== local) setLocal(String(value))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value])
-
-  const capFrac = Number.isFinite(operatorCapFrac) ? operatorCapFrac : 0.25
-  const capPct  = Math.max(1, Math.min(100, Math.round(capFrac * 100)))
-  const eff     = Math.max(1, Math.min(capPct, value))
-  const capped  = value > capPct
 
   const commit = () => {
     const applied = setValue(local)
@@ -1762,6 +1675,7 @@ function ProgramSpeedEntry({ value, setValue, operatorCapFrac }) {
         Speed
       </label>
       <input
+        data-testid="program-speed-input"
         type="number"
         min={1}
         max={100}
@@ -1778,15 +1692,6 @@ function ProgramSpeedEntry({ value, setValue, operatorCapFrac }) {
         }}
       />
       <span style={{ fontSize: 13, color: '#6b7280' }}>%</span>
-      <span style={{
-        fontSize: 13, marginLeft: 6,
-        color: capped ? '#B45309' : '#059669',
-        fontWeight: 600,
-      }}>
-        {capped
-          ? `effective ${eff}% (cap ${capPct}%)`
-          : `effective ${eff}% (cap ${capPct}%)`}
-      </span>
     </div>
   )
 }
@@ -1961,71 +1866,3 @@ function HighSpeedConfirmModal({ pct, threshold, cap, onCancel, onConfirm }) {
   )
 }
 
-// Provenance badge + PBD-metadata detail row. Reads the `source`
-// field on the loaded program (backend backfills it via
-// _infer_source() for older files that predate the field). Color-
-// coded so a demonstration-derived program is visually distinct
-// from a hand-built one — matters most during authoring where an
-// operator might have loaded the wrong program.
-function ProgramProvenance({ program }) {
-  if (!program?.id) return null
-  const source = program.source || 'unknown'
-  const badgeStyle = {
-    demonstration: { bg: '#EDE9FE', border: '#7C3AED', text: '#5B21B6', label: 'Demonstration' },
-    manual:        { bg: '#ECFDF5', border: '#059669', text: '#065F46', label: 'Manual build' },
-    imported:      { bg: '#EFF6FF', border: '#2563EB', text: '#1E40AF', label: 'Imported' },
-    unknown:       { bg: '#F3F4F6', border: '#9CA3AF', text: '#4B5563', label: 'Unknown source' },
-  }[source] || { bg: '#F3F4F6', border: '#9CA3AF', text: '#4B5563', label: source }
-
-  const cfg = program.config || {}
-  const pbd = cfg.pbd_metadata || null
-  const detail = pbd?.demo_id ? `demo ${pbd.demo_id}` : null
-
-  const payload = readPayload(program)
-  const payloadChip = payload.isSet
-    ? { bg: '#ECFDF5', border: '#059669', text: '#065F46',
-        label: payloadChipLabel(payload),
-        title: `Payload ${payload.kg} kg — informational only. Set the ` +
-               `matching PayloadId preset on the controller.` }
-    : { bg: '#FFFBEB', border: '#F59E0B', text: '#92400E',
-        label: 'Payload not set',
-        title: 'No payload set — collision detection accuracy on this ' +
-               'program is reduced. Open the program in the editor to set it.' }
-
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
-      <span style={{
-        display: 'inline-block', padding: '3px 10px',
-        background: badgeStyle.bg,
-        border: `1px solid ${badgeStyle.border}`,
-        color: badgeStyle.text, borderRadius: 999,
-        fontSize: 12, fontWeight: 600,
-      }}>
-        {badgeStyle.label}
-      </span>
-      <span title={payloadChip.title} style={{
-        display: 'inline-block', padding: '3px 10px',
-        background: payloadChip.bg,
-        border: `1px solid ${payloadChip.border}`,
-        color: payloadChip.text, borderRadius: 999,
-        fontSize: 12, fontWeight: 600,
-        cursor: 'help',
-      }}>
-        {payloadChip.label}
-      </span>
-      {detail && (
-        <span style={{ fontSize: 12, color: '#6b7280', fontFamily: 'monospace' }}>
-          {detail}
-        </span>
-      )}
-      {program.has_taught_poses === false && (
-        <span style={{
-          fontSize: 12, color: '#B45309', fontWeight: 600,
-          marginLeft: 6,
-        }}>
-          — poses pending
-        </span>
-      )}
-    </div>
-  )
-}

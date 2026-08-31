@@ -194,6 +194,149 @@ def test_no_other_file_uses_the_raw_refusal_concat():
         + '\n  '.join(hits))
 
 
+# ── modeOutcome mapper + mode-switch call sites (2026-08-31) ───
+
+def test_mode_outcome_exports_named_mode_error():
+    src = _read(os.path.join(FRONTEND_SRC, 'lib', 'modeOutcome.js'))
+    assert 'export function namedModeError' in src, (
+        'namedModeError missing — the shared mode-refusal copy '
+        'module is broken.')
+    assert 'export const MODE_OUTCOME_KINDS' in src, (
+        'MODE_OUTCOME_KINDS export missing — coverage sweeps cannot '
+        'iterate the named branches.')
+    assert 'export const MODE_FAILED_REASON_CODES' in src, (
+        'MODE_FAILED_REASON_CODES export missing — mode_switch_'
+        "failed's inner dispatch cannot be exhaustively covered.")
+
+
+def test_named_mode_error_covers_every_documented_outcome_kind():
+    """Every outcome.kind the server's /api/estun/mode handler can
+    emit must have an operator-language branch in namedModeError.
+    A new kind shipping without a corresponding entry would
+    silently downgrade the operator's toast to 'Mode switch was
+    refused' — the exact class the ladder was built to name."""
+    src = _read(os.path.join(FRONTEND_SRC, 'lib', 'modeOutcome.js'))
+    # Every documented kind must appear as a branch (as a quoted
+    # literal in the file — either in MODE_OUTCOME_KINDS list or
+    # in an `if (kind === '...')` guard).
+    for kind in ('invalid_target', 'arbiter_refused',
+                 'recovery_state_power_cycle_required',
+                 'errors_latched_uncleared', 'driver_ack_timeout',
+                 'mode_switch_failed'):
+        assert f"'{kind}'" in src, (
+            f'namedModeError has no branch for outcome.kind='
+            f'{kind!r} — the UI would fall back to a generic '
+            f'"mode switch refused" message.')
+    # Every mode_switch_failed reason_code the driver / server can
+    # attach must also have a named branch. mode_readback_timeout
+    # was the specific case that triggered the 2026-08-31 rewrite.
+    for rc in ('allow_mode_gate_closed', 'transport_down',
+               'controller_not_ready', 'arm_enabled_interlock',
+               'verb_publish_failed', 'mode_readback_timeout',
+               'publish_failed'):
+        assert f"'{rc}'" in src, (
+            f'namedModeError has no reason_code branch for '
+            f'{rc!r} — inner dispatch of mode_switch_failed is '
+            f'incomplete.')
+
+
+def test_named_mode_error_recovery_state_names_physical_cycle():
+    """Rung 1 (recoveryState != 0) has only ONE remedy: physical
+    cabinet cycle. The named branch's TITLE and DETAIL must name
+    that action — not 'try again', not 'controller is not in Auto'.
+    Regression sentinel for the 2026-08-31 report where every
+    program run surfaced the pre-ladder generic copy."""
+    src = _read(os.path.join(FRONTEND_SRC, 'lib', 'modeOutcome.js'))
+    # Isolate the branch body.
+    m = re.search(
+        r"kind === 'recovery_state_power_cycle_required'\)\s*\{(.+?)\}\s*\n\n",
+        src, re.DOTALL)
+    assert m, 'recovery_state_power_cycle_required branch not found'
+    branch = m.group(1)
+    # Title names the physical action.
+    assert 'power-cycle' in branch.lower(), (
+        'Rung 1 title does not name the physical remedy '
+        '(power-cycle). The operator would repeat the wire '
+        'switch fruitlessly.')
+    # Detail cites the cabinet + the target four-tuple.
+    assert 'cabinet' in branch.lower()
+    assert 'four-tuple' in branch.lower() or 'four_tuple' in branch.lower()
+    # The wrong generic copy must NOT be here.
+    assert 'controller is not in Auto' not in branch, (
+        'Rung 1 branch still uses the pre-ladder generic copy — '
+        'the exact bug the 2026-08-31 rewrite closed.')
+
+
+def test_run_program_modal_uses_named_mode_error():
+    """RunProgramModal's mode-switch pre-flight refusal must route
+    through namedModeError. Prior code (pre-2026-08-31) built the
+    errorCopy inline with a hardcoded title 'Can't start —
+    controller is not in Auto and the switch was refused', which
+    was wrong for Rung 1 (physical cycle) and Rung 2 (latched
+    errors)."""
+    src = _read(os.path.join(FRONTEND_SRC, 'components',
+                             'RunProgramModal.jsx'))
+    assert "from '../lib/modeOutcome'" in src, (
+        'RunProgramModal does not import from the mode-refusal '
+        'copy module.')
+    assert 'namedModeError(' in src, (
+        "RunProgramModal does not invoke namedModeError — mode "
+        "refusals will fall back to the pre-ladder generic copy.")
+    # The pre-fix hardcoded title must be gone.
+    assert 'controller is not in Auto and the switch was refused' \
+        not in src, (
+        "RunProgramModal still hardcodes the pre-ladder title "
+        "'Can't start — controller is not in Auto...' — mode-"
+        'refusal copy has not been unified.')
+    # The pre-fix flattening pattern must be gone.
+    assert 'mbody?.outcome?.reason' not in src, (
+        'Raw mbody?.outcome?.reason flattening still present in '
+        'RunProgramModal — the ladder outcome is being smashed.')
+
+
+def test_mode_control_uses_named_mode_error():
+    """ModeControl.runSwitch's refusal path must route through
+    namedModeError. This is the pill dialog operators use to
+    switch mode directly (before any program run) — the surface
+    that has been on the acceptance list for three sessions."""
+    src = _read(os.path.join(FRONTEND_SRC, 'components',
+                             'ModeControl.jsx'))
+    assert "from '../lib/modeOutcome'" in src
+    assert 'namedModeError(' in src, (
+        'ModeControl.runSwitch does not invoke namedModeError — '
+        'mode-pill refusals will fall back to raw flattened text.')
+    # Pre-fix flattening pattern gone.
+    assert 'body?.outcome?.reason' not in src, (
+        'Raw body?.outcome?.reason flattening still present in '
+        'ModeControl.')
+
+
+def test_every_estun_mode_call_site_imports_named_mode_error():
+    """Fork sentinel: any frontend file that POSTs to
+    /api/estun/mode MUST import namedModeError. A new call site
+    that flattens the response silently would reintroduce the
+    exact bug (mode_readback_timeout as the generic bottom on
+    every rung) the 2026-08-31 rewrite closed."""
+    hits = []
+    for root, _, files in os.walk(FRONTEND_SRC):
+        for fn in files:
+            if not fn.endswith(('.js', '.jsx')):
+                continue
+            if fn.endswith('.test.js') or fn.endswith('.test.jsx'):
+                continue
+            path = os.path.join(root, fn)
+            rel = os.path.relpath(path, FRONTEND_SRC).replace(os.sep, '/')
+            src = _read(path)
+            if not re.search(
+                r"fetch\(\s*['\"]/api/estun/mode['\"]", src):
+                continue
+            if 'namedModeError' not in src:
+                hits.append(rel)
+    assert not hits, (
+        'Files POST to /api/estun/mode but do NOT route the '
+        'refusal through namedModeError: ' + ', '.join(hits))
+
+
 # ── Fork registry entry + lint clean ───────────────────────────
 
 def test_fork_registry_has_operator_refusal_copy_entry():

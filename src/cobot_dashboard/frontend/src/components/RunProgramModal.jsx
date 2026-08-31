@@ -4,6 +4,7 @@ import { readPayload, PAYLOAD_UNSET_WARNING, PAYLOAD_INFO_ONLY }
   from '../lib/payload'
 import { runnableStepCount } from '../lib/programTruth'
 import { namedLoadError } from '../lib/loadOutcome'
+import { namedModeError } from '../lib/modeOutcome'
 
 // Confirm modal for the Monitor "Run Program" button. Reads the same
 // currentProgram + robot.allow_move + robot.operator_speed_limit that
@@ -190,15 +191,17 @@ export default function RunProgramModal() {
         const mbody = await mres.json().catch(() => ({}))
         if (!mres.ok || !mbody.ok) {
           setPhase('error')
-          const reason = mbody?.outcome?.reason
-                       || mbody?.outcome?.detail
-                       || `Mode switch to Auto refused (HTTP ${mres.status}).`
-          setErrorCopy({
-            code: 'mode_switch_refused',
-            title: "Can't start — controller is not in Auto and the switch was refused.",
-            detail: reason,
-            technicalDetail: JSON.stringify(mbody, null, 2),
-          })
+          // 2026-08-31: route every mode-refusal through the shared
+          // named-copy mapper (parallel to namedLoadError). Prior
+          // code flattened outcome.reason || outcome.detail into a
+          // generic "Can't start — controller is not in Auto..."
+          // title, which was wrong for Rung 1 (recoveryState=1,
+          // physical cabinet cycle) and Rung 2 (latched errors[]).
+          // The ladder emits per-rung outcome.kind + reason_code +
+          // four_tuple; the mapper produces the operator-language
+          // title + detail per case and preserves the wire fields
+          // in technicalDetail.
+          setErrorCopy(namedModeError(mbody || {}, mres.status))
           return
         }
       }
