@@ -721,28 +721,23 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4021
+        line: 4132
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
-          Pinned by test_jog_hold_heartbeat.py. 2026-08-19: line
-          shifted from 3363→3601 by the CRI-proxy commit. 2026-08-27:
-          shifted to 3852. 2026-08-28 morning: shifted to 3858 by
-          the _state_lock RLock fix. 2026-08-28 later: shifted to
-          3928 by the stale-class provenance stack (backend SHA
-          bake + /api/provenance + WS hello frame + deploy_status
-          three-layer verdict — ~70 lines). Both new gates land
-          BEFORE the route body — the jog_hold_heartbeat pairing
-          invariant is preserved.
+          Pinned by test_jog_hold_heartbeat.py. Line shifts noted
+          on each commit that adds material above; refresh from
+          fork_lint output when it moves. 2026-08-31 F2.7: shifted
+          to 4132 by the executor bridge (_on_executor_status +
+          _register_executor_awaiter + _publish_task_run_program,
+          ~110 lines).
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4156
+        line: 4267
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
-          /cmd/jog. Pinned by test_jog_hold_heartbeat.py. 2026-08-19:
-          3493→3731. 2026-08-27: 3987. 2026-08-28 morning: 3993 by
-          the RLock fix. 2026-08-28 later: 4063 by the provenance
-          stack (see /cmd/jog entry above).
+          /cmd/jog. 2026-08-31 F2.7: shifted from 4156 to 4267 by
+          the same executor bridge above.
         owner: dashboard-transport
       - path: src/cobot_dashboard/frontend/src/lib/holdTicker.js
         line: 0

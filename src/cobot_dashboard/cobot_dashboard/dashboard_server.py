@@ -1544,6 +1544,28 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self.create_subscription(String, "/estun/mode_status",
                                  self._on_estun_mode_status, 8)
 
+        # F2.7 executor bridge (2026-08-31 addendum-54). Publisher for
+        # /task/run_program — the executor's run trigger. Subscriber
+        # for /executor/status — where the F2 executor publishes
+        # program_state / plan_summary / step_verdict / errors. The
+        # dashboard translates program_state → legacy
+        # STATE.robot.program.state (arbiter mirror) AND resolves
+        # per-req_id awaiters that the /api/estun/program/run bridge
+        # uses to make the HTTP response block until terminal.
+        self._task_run_program_pub = self.create_publisher(
+            String, "/task/run_program", 8)
+        self.create_subscription(String, "/executor/status",
+                                 self._on_executor_status, 32)
+        # req_id → dict awaiter state: {"event": threading.Event,
+        # "terminal": {...body...}, "plan_summaries": [...],
+        # "step_verdicts": [...]}. Populated when a bridge caller
+        # registers an awaiter; drained + deleted by the caller.
+        self._executor_awaiters_lock = threading.Lock()
+        self._executor_awaiters: dict = {}
+        # A rolling snapshot of the LAST executor status (any req_id)
+        # for /api/state observability.
+        self._executor_last_status: dict = {}
+
         # SEAM A fanout publisher for JOG_BACKEND='ros2'. Created EAGERLY
         # here so DDS discovery matches with jog_bridge's subscriber long
         # before the operator's first press. Previously lazy-created in
@@ -2590,6 +2612,113 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 })
                 if len(recent) > 32:
                     del recent[:-32]
+
+    def _on_executor_status(self, msg):
+        """Handle F2.7 executor status events on /executor/status.
+
+        Two responsibilities:
+          1. Arbiter mirror: translate `program_state` (0/2/3/4/5) →
+             legacy `STATE.robot.program.state` (0/2/3) so the JOG-11
+             arbiter refuses jog during a running executor program
+             without needing a separate code path.
+          2. Bridge fulfillment: if the body carries a `req_id` that
+             was registered by /api/estun/program/run, append the
+             event to the awaiter's log; on terminal states
+             (COMPLETE=4 or ERROR=5), signal the awaiter's event.
+        """
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        self._executor_last_status = d
+        ev = d.get("event", "")
+        ps = d.get("program_state")
+
+        # Arbiter mirror. F2 executor states: IDLE=0, RUNNING=2,
+        # PAUSED=3, COMPLETE=4, ERROR=5. Arbiter reads
+        # STATE.robot.program.state which is legacy 0/2/3.
+        if ev == "status" and isinstance(ps, int):
+            with _state_lock:
+                r = STATE.setdefault("robot", {})
+                prog = r.setdefault("program", {})
+                if ps in (2, 3):
+                    prog["state"] = ps
+                    prog["source"] = "executor"
+                elif ps in (0, 4, 5):
+                    prog["state"] = 0
+                    prog["source"] = ("executor:complete" if ps == 4
+                                       else ("executor:error" if ps == 5
+                                             else "executor:idle"))
+                # Also mirror program_id + step index for the UI
+                # timeline.
+                if d.get("program_id"):
+                    prog["executor_program_id"] = d.get("program_id")
+                if d.get("current_step_idx") is not None:
+                    prog["executor_step_idx"] = d.get("current_step_idx")
+
+        # Bridge fulfillment.
+        req_id = d.get("req_id")
+        if req_id:
+            with self._executor_awaiters_lock:
+                aw = self._executor_awaiters.get(req_id)
+            if aw is not None:
+                # Log every event for the caller (they surface plan
+                # summaries + step verdicts on dry-run response bodies).
+                aw["events"].append(d)
+                if ev == "plan_summary":
+                    aw["plan_summaries"].append(d)
+                elif ev == "step_verdict":
+                    aw["step_verdicts"].append(d)
+                # Terminal states signal the caller.
+                terminal_kinds = {4, 5}  # COMPLETE, ERROR
+                if ev == "status" and isinstance(ps, int) and ps in terminal_kinds:
+                    aw["terminal"] = d
+                    aw["event"].set()
+
+    def _register_executor_awaiter(self, req_id: str) -> dict:
+        """Create + register a bridge-awaiter for `req_id`. Caller
+        MUST invoke _unregister_executor_awaiter(req_id) in a finally
+        block."""
+        aw = {
+            "event": threading.Event(),
+            "events": [],
+            "plan_summaries": [],
+            "step_verdicts": [],
+            "terminal": None,
+        }
+        with self._executor_awaiters_lock:
+            self._executor_awaiters[req_id] = aw
+        return aw
+
+    def _unregister_executor_awaiter(self, req_id: str) -> None:
+        with self._executor_awaiters_lock:
+            self._executor_awaiters.pop(req_id, None)
+
+    def _publish_task_run_program(self, program_id: str, dry_run: bool,
+                                    req_id: str,
+                                    run_speed_pct: float | None = None) -> bool:
+        """Publish the executor's run trigger. Returns True if the
+        publisher had at least one discovered subscriber at send time
+        (indicative — RELIABLE+VOLATILE means the message MAY still
+        be dropped if the subscriber's queue is full; we don't wait
+        for ack here since the executor's status event is the
+        authoritative reply)."""
+        body = {
+            "action": "run",
+            "program_id": program_id,
+            "dry_run": bool(dry_run),
+            "req_id": req_id,
+        }
+        if run_speed_pct is not None:
+            body["run_speed_pct"] = float(run_speed_pct)
+        n_subs = 0
+        try:
+            n_subs = self._task_run_program_pub.get_subscription_count()
+        except Exception:
+            pass
+        m = String(); m.data = json.dumps(body)
+        self._task_run_program_pub.publish(m)
+        return n_subs > 0
 
     def _on_estun_mode_status(self, msg):
         """Mirror /estun/mode_status events into STATE.robot.
@@ -6575,31 +6704,102 @@ if FASTAPI_AVAILABLE:
                         "run_backend": "ros2_executor",
                     },
                 }, status_code=423)
-            # Stub: the real dispatch will publish on
-            # /executor/run_request and await the goal completion
-            # via ROS2 action semantics. Wiring lands in the F2.7
-            # acceptance commit. Response shape kept parallel to
-            # the legacy path so the frontend outcome mapper is
-            # unchanged.
-            return JSONResponse({
-                "ok": False,
-                "outcome": {
-                    "kind": "ros2_executor_not_wired_yet",
-                    "reason_code": "ros2_executor_stub",
-                    "reason": (
-                        "RUN_BACKEND=ros2_executor is set but the "
-                        "s10_140_executor action client is not yet "
-                        "wired into the dashboard. F2.7 acceptance "
-                        "commit will land the wiring."),
-                    "detail": (
-                        "Set RUN_BACKEND=legacy_lua (or unset it) "
-                        "to route through the legacy Lua push path "
-                        "in the interim. Do NOT push quarantined "
-                        "palletize programs — see §640/§644."),
-                    "program_id": prog_id,
-                    "run_backend": "ros2_executor",
-                },
-            }, status_code=501)
+            # F2.7 acceptance bridge (addendum-54, 2026-08-31): publish
+            # on /task/run_program and await the executor's terminal
+            # /executor/status event via a per-req_id awaiter.
+            # dry_run flag routes through without gating on the WS
+            # four-tuple (executor detail) so operators can validate a
+            # program's plan pipeline before real motion.
+            if _ros_node is None:
+                return JSONResponse(
+                    {"ok": False,
+                     "outcome": {"kind": "ros_unavailable",
+                                 "reason_code": "ros_not_available",
+                                 "reason": "dashboard has no rclpy Node "
+                                           "context; executor cannot be "
+                                           "reached",
+                                 "program_id": prog_id,
+                                 "run_backend": "ros2_executor"}},
+                    status_code=503)
+            import uuid
+            req_id = uuid.uuid4().hex[:12]
+            dry_run = bool(body.get("dry_run", False))
+            run_speed_pct = body.get("run_speed_pct")
+            aw = _ros_node._register_executor_awaiter(req_id)
+            try:
+                had_sub = _ros_node._publish_task_run_program(
+                    prog_id, dry_run=dry_run, req_id=req_id,
+                    run_speed_pct=(float(run_speed_pct)
+                                    if run_speed_pct is not None else None))
+                if not had_sub:
+                    # No discovered subscriber → executor node isn't
+                    # up (or discovery hasn't matched). Bail fast
+                    # with a specific reason rather than waiting the
+                    # full timeout.
+                    return JSONResponse(
+                        {"ok": False,
+                         "outcome": {
+                             "kind": "executor_not_running",
+                             "reason_code": "executor_no_subscriber",
+                             "reason": ("no discovered subscriber for "
+                                        "/task/run_program — the "
+                                        "s10_140_executor node is not "
+                                        "up. Launch via "
+                                        "OPERATIONS §1."),
+                             "program_id": prog_id,
+                             "run_backend": "ros2_executor"}},
+                        status_code=503)
+                # Wait for terminal. Dry-run bound is fast (planning
+                # only); real run bound is longer (motion + settle).
+                bound = float(body.get("timeout_s",
+                                        30.0 if dry_run else 120.0))
+                got = aw["event"].wait(timeout=bound)
+                if not got:
+                    return JSONResponse(
+                        {"ok": False,
+                         "outcome": {
+                             "kind": "executor_timeout",
+                             "reason_code": "executor_awaiter_timeout",
+                             "reason": (f"executor did not reach terminal "
+                                        f"within {bound:.1f}s"),
+                             "program_id": prog_id,
+                             "run_backend": "ros2_executor",
+                             "plan_summaries": aw["plan_summaries"],
+                             "step_verdicts":  aw["step_verdicts"]}},
+                        status_code=504)
+                terminal = aw["terminal"] or {}
+                is_error = int(terminal.get("program_state", 0)) == 5
+                if is_error:
+                    return JSONResponse(
+                        {"ok": False,
+                         "outcome": {
+                             "kind": "executor_error",
+                             "reason_code": terminal.get("reason_code")
+                                             or "executor_unknown_error",
+                             "reason": terminal.get("detail")
+                                        or "executor reported error",
+                             "program_id": prog_id,
+                             "run_backend": "ros2_executor",
+                             "current_step_idx": terminal.get("current_step_idx"),
+                             "plan_summaries": aw["plan_summaries"],
+                             "step_verdicts":  aw["step_verdicts"],
+                             "terminal": terminal}},
+                        status_code=409)
+                # Success — COMPLETE.
+                return {
+                    "ok": True,
+                    "outcome": {
+                        "kind": "executor_complete" if not dry_run
+                                 else "executor_dry_run_complete",
+                        "program_id": prog_id,
+                        "run_backend": "ros2_executor",
+                        "plan_summaries": aw["plan_summaries"],
+                        "step_verdicts":  aw["step_verdicts"],
+                        "dry_run": dry_run,
+                    },
+                }
+            finally:
+                _ros_node._unregister_executor_awaiter(req_id)
 
         # Palletize quarantine — refuse BEFORE opening the file so
         # even a corrupt / deleted quarantined artifact still

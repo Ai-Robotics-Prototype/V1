@@ -66,7 +66,40 @@
 
 ## Next session opener (exact order)
 
-0. **MODE via bound DI — TEST A + operator retry** (2026-08-31,
+0. **F2.7 first-run acceptance — SHIPPED, awaits bring-up + run**
+   (2026-08-31, add-54 §665-671):
+   - **All 7 F2.7 pieces landed atomically.** CRI-side commit on
+     CodroidROS2/main = `62ac884`; cobot_ws-side commit = the next
+     SHA below (`git log --oneline -1`). Drop-in at
+     `src/cobot_bringup/systemd/roboai-dashboard.service.d/`.
+   - **Bring-up (operator):**
+     1. `python3 ~/cri_eval_ws/cri_teardown.py` (idempotent).
+     2. `tmux new -s robot` (or attach).
+     3. `source /opt/ros/humble/setup.bash && source ~/cri_eval_ws/CodroidROS2/install/setup.bash`
+     4. `ros2 launch cod_bringup s10_140_cri_ros2_control.launch.py use_mock:=false`
+        — wait for `首帧 UDP 反馈已对齐关节指令`.
+     5. Second pane: `ros2 run s10_140_executor executor_node`.
+     6. Install drop-in + restart dashboard:
+        `sudo cp ~/cobot_ws/src/cobot_bringup/systemd/roboai-dashboard.service.d/f27-ros2-executor.conf /etc/systemd/system/roboai-dashboard.service.d/ && sudo systemctl daemon-reload && sudo systemctl restart roboai-dashboard`
+     7. Verify: `curl -s :8080/api/provenance | jq .run_backend`
+        → `"ros2_executor"`.
+     8. Fresh WS probe (Jetson): `python3 /tmp/probe_tuple.py`.
+        Expect `state=2, mode=2 (REMOTE), errors=null`. Re-acquire
+        REMOTE via §1's 5-command sequence if mode ≠ 2.
+   - **Test100 dry pass:**
+     `curl -s -X POST http://127.0.0.1:8080/api/estun/program/run
+     -H 'Content-Type: application/json'
+     -d '{"program_id":"test100","dry_run":true,"timeout_s":60}' | jq`
+     Expect `ok:true, outcome.kind:"executor_dry_run_complete"`,
+     10 plan_summaries (2×PTP + 8×LIN).
+   - **Real run (gated, 25% speed):**
+     Same endpoint without `dry_run`, add `"run_speed_pct":25`.
+     E-stop in hand. Watch `/executor/status` for `step_verdict`
+     events per step (§580-on-CRI). Mid-run: press a jog button
+     once → expect 409 arbiter_refused (arbiter direction 2,
+     add-47 §611 close).
+
+1. **[BACKGROUND] MODE via bound DI — TEST A + operator retry** (2026-08-31,
    add-54 pipeline shipped, awaits wire test):
    - Operator binds at `:9198 → Configuration → IO`: DI6 =
      "Switch to Auto Mode" (rising edge), DI7 = "Switch to
@@ -86,7 +119,9 @@
    - On TEST A fail: fall back to TEST B (labeled loopback
      DO_x→DI6 + DO_y→DI7, driver pulses setDO). Doc first;
      don't cut wires yet.
-1. **F2.7 first taught program end-to-end** (operator-cued, real arm):
+2. **F2.7 SHIPPED — this section RETIRED, see step 0 above** (add-54).
+   Historical content follows for reference but is no longer the
+   next opener. Original text kept below to preserve the diff:
    - Flesh out F2.6 skeleton TODO surface (marked in
      `executor_node.py`): `_ws_four_tuple_ok()` real websockets probe;
      MoveGroupInterface Pilz PTP + LIN plans; JTC ExecuteTrajectory

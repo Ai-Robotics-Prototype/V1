@@ -966,31 +966,102 @@ def test_provenance_publishes_run_backend_and_target_mode():
 def test_run_endpoint_dispatches_on_run_backend():
     """/api/estun/program/run must have a top-level dispatcher on
     _RUN_BACKEND_ENV. Under ros2_executor: quarantined programs
-    still return 423; non-quarantined return 501
-    ros2_executor_not_wired_yet until F2.7 wires the action
-    client. Silent fallthrough to legacy would defeat the F2.7
-    acceptance signal."""
+    still return 423; non-quarantined dispatch through the F2.7
+    executor bridge (publish /task/run_program + await
+    /executor/status terminal via per-req_id awaiter). Silent
+    fallthrough to legacy would defeat the acceptance signal.
+
+    2026-08-31 F2.7 (add-54): stub returning 501
+    ros2_executor_not_wired_yet retired; bridge now dispatches
+    for real."""
     src = _server_src()
     m = re.search(
         r'@app\.post\("/api/estun/program/run"\)',
         src)
     assert m
-    body = src[m.start(): m.start() + 5000]
+    body = src[m.start(): m.start() + 8000]
     assert '_RUN_BACKEND_ENV' in body, (
         'run endpoint must consult _RUN_BACKEND_ENV at dispatch')
-    assert 'ros2_executor_not_wired_yet' in body, (
-        'the ros2 branch stub outcome-kind is missing — silent '
-        'fallthrough to legacy would defeat the acceptance signal')
-    # The quarantine check inside the ros2 branch must precede
-    # the not_wired stub (safety before capability).
+    # The retired 501 stub kind MUST be gone from the endpoint body
+    # (still may live in comments elsewhere as historical context).
+    assert '"ros2_executor_not_wired_yet"' not in body \
+        and "'ros2_executor_not_wired_yet'" not in body, (
+        'ros2_executor_not_wired_yet stub is back — F2.7 bridge '
+        'was retired or masked')
+    # The new bridge shape publishes on /task/run_program and
+    # registers a per-req_id awaiter. Regression here would revert
+    # the F2.7 wiring.
+    assert '_publish_task_run_program' in body, (
+        'ros2_executor branch does not publish on /task/run_program '
+        '— executor bridge is not wired')
+    assert '_register_executor_awaiter' in body, (
+        'ros2_executor branch does not register a per-req_id awaiter '
+        '— bridge cannot correlate terminal state')
+    assert '_unregister_executor_awaiter' in body, (
+        'ros2_executor branch does not unregister the awaiter in a '
+        'finally block — leaked awaiters would pile up')
+    # Quarantine check inside the ros2 branch must precede the
+    # bridge dispatch (safety before capability).
     ros2_block = re.search(
-        r'_RUN_BACKEND_ENV\s*==\s*[\"\']ros2_executor[\"\'].*?501',
+        r'_RUN_BACKEND_ENV\s*==\s*[\"\']ros2_executor[\"\'].*?_publish_task_run_program',
         body, re.DOTALL)
     assert ros2_block
     assert 'quarantined' in ros2_block.group(0), (
         'ros2 branch must still refuse quarantined programs — '
         'the palletize latch class is architecturally impossible '
         'on CRI, but the safety guard belt-and-braces stays')
+    # Terminal-state outcomes: executor_complete on success,
+    # executor_error on failure, executor_timeout on awaiter deadline.
+    for kind in ('executor_complete', 'executor_dry_run_complete',
+                 'executor_error', 'executor_timeout',
+                 'executor_not_running'):
+        assert f"'{kind}'" in body or f'"{kind}"' in body, (
+            f'ros2 bridge branch missing terminal-outcome kind '
+            f'{kind!r} — this is a named path the frontend needs')
+
+
+def test_executor_bridge_subscribes_executor_status_topic():
+    """The dashboard must subscribe /executor/status (the F2.7
+    executor's status topic) AND translate program_state into the
+    legacy STATE.robot.program.state field the JOG-11 arbiter
+    reads. Without the mirror, the arbiter would fail to refuse
+    jog while the executor is running a program."""
+    src = _server_src()
+    assert '"/executor/status"' in src or "'/executor/status'" in src, (
+        'dashboard has no /executor/status subscription — the F2.7 '
+        'executor status is never mirrored')
+    assert '_on_executor_status' in src, (
+        'dashboard has no _on_executor_status callback — bridge '
+        'awaiter cannot be signaled on terminal state')
+    # Arbiter mirror: program_state 2 or 3 → prog["state"] = ps.
+    handler_m = re.search(
+        r'def\s+_on_executor_status\s*\(self.*?\n(?=\n    def\s+)',
+        src, re.DOTALL)
+    assert handler_m, '_on_executor_status body not locatable'
+    hbody = handler_m.group(0)
+    assert 'STATE' in hbody and 'prog["state"]' in hbody, (
+        '_on_executor_status does not translate program_state → '
+        'STATE.robot.program.state — arbiter mirror missing')
+
+
+def test_executor_bridge_publisher_topic_and_dropin_present():
+    """The /task/run_program publisher and the F2.7 systemd
+    drop-in must both be present. Missing publisher = executor
+    never receives run events; missing drop-in = the flip
+    procedure has no artifact."""
+    src = _server_src()
+    assert '"/task/run_program"' in src or "'/task/run_program'" in src, (
+        'dashboard has no /task/run_program publisher — executor '
+        'cannot be triggered')
+    dropin = os.path.join(
+        WS, 'src', 'cobot_bringup', 'systemd',
+        'roboai-dashboard.service.d', 'f27-ros2-executor.conf')
+    assert os.path.isfile(dropin), (
+        f'F2.7 systemd drop-in missing at {dropin!r}')
+    with open(dropin) as fh:
+        conf = fh.read()
+    assert 'RUN_BACKEND=ros2_executor' in conf, (
+        'drop-in does not set RUN_BACKEND=ros2_executor')
 
 
 def test_run_modal_reads_provenance_target_mode():
