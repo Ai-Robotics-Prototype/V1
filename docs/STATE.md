@@ -66,8 +66,44 @@
 
 ## Next session opener (exact order)
 
-0. **F2.7 first-run acceptance — SHIPPED, awaits bring-up + run**
-   (2026-08-31, add-54 §665-671):
+0. **F2.7 first-fire retry — J1/J6 CONVENTION DRIFT resolution**
+   (2026-08-31 add-55 §676-678; blocking real fire):
+   - **First-fire attempted today.** Executor + dashboard bridge
+     + drop-in + preflight all worked. Silent-refusal guard
+     caught a mid-motion halt caused by operator e-stop; every
+     guard behaved correctly. 5 latent bugs surfaced + fixed
+     during the fire cycle (per LESSONS §317).
+   - **Retry BLOCKED by discovery**: two concurrent WS
+     clients subscribing to `publish/RobotPosture` return
+     OPPOSITE J1/J6 signs at the same instant on the same
+     physical arm. UDP push sign FLIPS across CRI
+     teardown+relaunch cycles. Details in add-55 §676 and
+     memory `cobot-jsb-j1-j6-convention-drift`.
+   - **Investigation plan for next session** (add-55 §678):
+     1. Fresh boot everything (arm cabinet + Jetson + services).
+     2. Enable `ws_log_raw=true` on estun_driver.
+     3. Capture WS RobotPosture + UDP push + /joint_states
+        signs at each state transition:
+        - Cold boot, no subscribers → single-client WS probe.
+        - Add estun_driver subscription → probe from second client.
+        - Start CRI/StartDataPush → probe UDP push convention.
+        - Start CRI/StartControl → probe again (UDP flipped
+          here this session).
+     4. Determine hypothesis (a) multi-client firmware bug,
+        (b) subscribe-order state binding, or (c) internal
+        transformation in estun_driver's frame-parsing.
+     5. Apply single sign adapter at correct layer.
+     6. Verify FK-vs-physical-TCP consistency BEFORE motion.
+     7. Preflight (arm-preflight charter — fresh probes,
+        single-use auth). Max |delta| from taught home < 5°
+        across all 6 joints on `/joint_states`.
+     8. Real fire.
+   - The reference `kUdpJointSigns` array + SIGN_ADAPTER
+     debug log stay in `cri_udp_system.cpp` (currently no-op)
+     — do NOT re-enable without fresh WS-vs-JSB verification.
+
+1. **F2.7 first-run acceptance — SHIPPED as of 2026-08-31**
+   (add-54 §665-671, superseded as opener by step 0 above):
    - **All 7 F2.7 pieces landed atomically.** CRI-side commit on
      CodroidROS2/main = `62ac884`; cobot_ws-side commit = the next
      SHA below (`git log --oneline -1`). Drop-in at
