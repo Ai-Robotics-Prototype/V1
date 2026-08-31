@@ -25,7 +25,20 @@ export const MODE_OUTCOME_KINDS = [
   // Pre-ladder shape guards
   'invalid_target',
   'arbiter_refused',
-  // Self-healing diagnostic ladder (add-51 §638-645)
+  // Self-healing diagnostic ladder (add-51 §638-645 +
+  // add-53 §655-660 reframe)
+  //   * mode_selector_manual — Rung 0 (2026-08-31): hardware DI16
+  //     'modeSwitch' reads 0; firmware silently no-ops toAuto.
+  //   * recovery_state_power_cycle_required — RETIRED as a Rung 1
+  //     trigger. `recoveryState` is a session-persistent servos-
+  //     were-off flag, not a fault latch. Kept as an outcome kind
+  //     for historical response shapes still on the wire, but the
+  //     server never emits it any more; namedModeError still maps
+  //     it in case an older backend version is queried.
+  //   * errors_latched_uncleared — the real power-cycle-only
+  //     condition (errors[] non-empty AND System/ClearError
+  //     didn't drain within 2 s).
+  'mode_selector_manual',
   'recovery_state_power_cycle_required',
   'errors_latched_uncleared',
   // Bottom-of-ladder terminal shapes
@@ -230,17 +243,43 @@ export function namedModeError(body, httpStatus) {
     })
   }
 
+  if (kind === 'mode_selector_manual') {
+    // Rung 0 (2026-08-31). Hardware DI16 modeSwitch reads 0 →
+    // firmware silently no-ops Robot/toAuto. No wire path helps.
+    // Title names the physical action; detail spells out the fix.
+    // technicalDetail carries the DI16 value verbatim.
+    const di16v = body?.outcome?.di16?.value
+    const detailTech = di16v != null
+      ? `${td} | di16={port:16, name:'modeSwitch', value:${di16v}}`
+      : td
+    return _shape({
+      code:    'mode_selector_manual',
+      title:   "Mode selector at the cabinet is in MANUAL — turn the physical selector to AUTO.",
+      detail:  'The hardware mode-selector DI is open; no wire '
+             + 'command can override it. Turn the cabinet selector '
+             + 'to AUTO and retry.',
+      technicalDetail: detailTech,
+      fourTuple: four,
+    })
+  }
+
   if (kind === 'recovery_state_power_cycle_required') {
-    // Rung 1. Physical cabinet cycle is the ONLY remedy per
-    // addendum-40 §566. Title names the physical action; detail
-    // spells out the tuple the operator must see after the cycle.
+    // RETIRED as an active ladder outcome per addendum-53 §655-660
+    // (2026-08-31). `recoveryState=1` was misdiagnosed as a fault
+    // latch in add-40 §566 and add-51 §640; wire evidence proved
+    // it is a session-persistent flag that latches on every
+    // Robot/switchOff. Kept as a mapped kind ONLY so an older
+    // backend version's response still renders operator-language
+    // copy on this frontend. Copy explicitly names the reframe so
+    // an operator seeing this outcome knows the message is
+    // out-of-date and the current server would not emit it.
     return _shape({
       code:    'recovery_state_power_cycle_required',
-      title:   "Controller needs a physical power-cycle before mode can switch.",
-      detail:  'Cycle CC10-A at the cabinet. After the cycle the '
-             + "four-tuple must read {state:2 Enabled, "
-             + 'recoveryState:0, errors:[]} before mode switching '
-             + 'or program runs will work.',
+      title:   "Legacy refusal — this backend version is out-of-date.",
+      detail:  'Older versions of the mode ladder refused on '
+             + '`recoveryState != 0`. Wire evidence retired that '
+             + 'rule (see ledger addendum-53). Update the backend; '
+             + 'if refusal persists, check the cabinet mode selector.',
       technicalDetail: td,
       fourTuple: four,
     })

@@ -195,12 +195,13 @@ export default function RunProgramModal() {
           // named-copy mapper (parallel to namedLoadError). Prior
           // code flattened outcome.reason || outcome.detail into a
           // generic "Can't start — controller is not in Auto..."
-          // title, which was wrong for Rung 1 (recoveryState=1,
-          // physical cabinet cycle) and Rung 2 (latched errors[]).
-          // The ladder emits per-rung outcome.kind + reason_code +
-          // four_tuple; the mapper produces the operator-language
-          // title + detail per case and preserves the wire fields
-          // in technicalDetail.
+          // title, which was wrong for Rung 0 (DI16 modeSwitch=0,
+          // hardware selector in MANUAL) and Rung 2 (latched
+          // errors[]). The ladder emits per-rung outcome.kind +
+          // reason_code + four_tuple; the mapper produces the
+          // operator-language title + detail per case and preserves
+          // the wire fields in technicalDetail. Add-53 reframe:
+          // Rung 1 (rs != 0) is retired; rs is session-persistent.
           setErrorCopy(namedModeError(mbody || {}, mres.status))
           return
         }
@@ -441,8 +442,10 @@ export default function RunProgramModal() {
                 fontSize: 12, color: '#5B21B6',
               }}>
                 Executor: <b>ROS2 (s10_140_executor, Pilz PTP/LIN)</b>.
-                The legacy Lua-push class of bugs (recoveryState=1
-                palletize latch) cannot exist on this path.
+                The legacy Lua-push palletize codegen defect (§644
+                IK-refuse + partial expansion) cannot exist on this
+                path — L222 pre-submit validation refuses composites
+                before dispatch.
               </div>
             )}
             <div style={btnRow}>

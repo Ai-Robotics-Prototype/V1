@@ -246,12 +246,54 @@
   motion stack). Then 30 s idle monitor of
   `/dashboard/jog_session_events` must return zero events before jog.
   [addendum-40 §565]
-- **Four-tuple pre-flight (WS `:9000`).** For real-arm gate:
-  `{state:2, stateName:'Enabled', recoveryState:0, errors:[]}` — all
-  four. `state=2` alone is not sufficient (`recoveryState=1` sits under
-  a nominally-enabled state and silently blocks motion). `errors:[]`
-  after clearing an alarm on the wire; if `recoveryState≠0` persists,
-  power-cycle. [addendum-40 §564; addendum-40 §566]
+- **Four-tuple pre-flight (WS `:9000`) — REFRAMED 2026-08-31.**
+  For real-arm gate: `{state:2, stateName:'Enabled', errors:[]}` +
+  `mode` matching the target execution path (AUTO=0 for
+  WS-programs, REMOTE=2 for CRI). `recoveryState` is reported
+  for observability but NEVER gates a refusal — it is a
+  session-persistent servos-were-off flag that latches on every
+  `Robot/switchOff` and stays 1 for the rest of the CPU
+  session. The old "if recoveryState≠0 persists, power-cycle"
+  rule (addendum-40 §566) is RETIRED — the real power-cycle
+  case is `errors[] non-empty AND System/ClearError didn't
+  drain within 2 s` (mode-ladder Rung 2). Additionally,
+  `mode==0 AUTO` requires DI16 modeSwitch high (Hand Controller
+  routed; see below). [addendum-53 §655-660]
+- **DI16/17/18 are RESERVED signals, not general DIs.**
+  General-purpose DIs on the CC10-A are DI0–DI15. Higher-
+  numbered "DIs" are routed through dedicated interfaces:
+  - `DI16 = modeSwitch` — Hand Controller (HC) interface;
+    firmware silently no-ops `Robot/toAuto` when this reads 0.
+  - `DI17 = enableButton` — likely HC-interface (co-located).
+  - `DI18 = robotDrag` — flange aviation-plug, not cabinet-side.
+  Do NOT attempt to jumper any of these from the general I/O
+  block — the terminals don't exist there. Forward path for
+  AUTO enablement: check manual §4.2.3 HC-function-key
+  assignment (two definable keys) BEFORE any wiring plan.
+  [add-53 §656-657; 2026-08-31 manual absorb]
+- **Cabinet light strip is a mode indicator.** Blue = Manual
+  mode AND arm enabled; Green = Auto OR Remote mode. If the
+  strip disagrees with a dashboard mode readout, trust the
+  strip — the light is driven directly from the wire.
+  [2026-08-31 manual absorb; HARDWARE.md > light-strip table]
+- **"Power cycle" ≠ ON/OFF rocker.** The cabinet has a
+  ROCKER (servo-power on/off — WS session survives, fires
+  alarm 9012, does NOT reset `recoveryState`) and a POWER
+  KEY (mains-side — true CPU reboot, WS session drops, new
+  `Connected ws://…` line in `journalctl -u roboai-estun`).
+  Only the POWER KEY is a true cabinet cycle. Verification:
+  new `Connected ws` journal line + new
+  `/opt/cobot/logs/estun_ws_*.jsonl` rotation. If neither
+  appeared, the operator cycled the rocker, not the key.
+  This is the exact confusion behind the 2026-08-31 "latch
+  survived power-cycle" incident. [add-53 §655; HARDWARE.md]
+- **Safety-relay factory shorts.** The CC10-A ships with
+  jumper shorts across the safety input pairs so the cabinet
+  runs out of the box. These MUST be removed before shipping
+  any integration — intact factory shorts leave the safety
+  chain permanently satisfied. Factory-short removal is a
+  required deliverable on any Synapse enclosure bench session.
+  [manual §5.2.2; HARDWARE.md > Safety-relay I/O]
 
 ## Standing debts / known-open
 

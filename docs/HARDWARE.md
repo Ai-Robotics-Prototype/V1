@@ -267,10 +267,83 @@ router). Same-`/24`-fight rule below applies whenever Wi-Fi is up.
 
 - **Canonical naming (silkscreen-aligned):** `DO0..DOn`, `DI0..DIn`,
   `AI/AO` — replaces mock-era `X0.0/Y0.0`. [addendum-22 §380]
-- **System-reserved terminals:** modeSwitch @ 16, enableButton @ 17,
-  flangeButtons — excluded from step-editor selection. [addendum-22 §380]
-- **Drag / freedrive:** DI 18 (`robotDrag`, flange button).
-  [addendum-12 §115]
+- **General-purpose DIs are DI0–DI15.** DI16/17/18 are
+  RESERVED signals wired through dedicated interfaces, NOT
+  terminals available on the general I/O block. Do not attempt
+  to jumper them from the general I/O connector. [manual §—; 2026-08-31 absorb]
+  - **DI16 = `modeSwitch`** — routed via the **Hand Controller
+    (HC) interface**. This is a HARDWARE AUTO/MANUAL gate: the
+    firmware silently ACKs `Robot/toAuto` (empty `db` success
+    shape) but does NOT transition mode when DI16 == 0. Wire
+    evidence: 2026-08-31 MODE pill acceptance — two `toAuto`
+    verbs both ACKed empty-db, `mode` stayed at 1, DI16 read 0
+    via `IOManager/GetIOValue`. [add-53 §655-660]
+  - **DI17 = `enableButton`** — likely also HC-interface
+    routed (co-located reserved signals).
+  - **DI18 = `robotDrag`** — the **flange drag / freedrive
+    button**, routed via the **aviation plug on the tool
+    flange**, NOT through cabinet DIs. [addendum-12 §115;
+    2026-08-31 absorb]
+- **Enabling AUTO — the software-binding path (2026-08-31
+  software manual):** the CC10-A firmware supports assigning
+  **function aliases to general-purpose DIs** at
+  `http://192.168.2.136:9198 → Configuration → IO`. A DI
+  bound to "Switch to Auto Mode" or "Switch to Manual Mode"
+  triggers the corresponding mode transition on a **rising
+  edge** — the alias takes effect immediately, no service
+  restart, no separate Save. Combined with the driver's
+  `IOManager/SetIOForcedFlag` write path (wire-proven), this
+  gives us **zero-wire mode switching** without touching the
+  DI16 modeSwitch hardware gate at all.
+
+  **Reserved-DI hunt RETIRED (add-53 follow-up):** since the
+  binding path bypasses DI16 entirely, we no longer need to
+  find or wire the HC-interface modeSwitch input. DI16
+  becomes an observation-only field.
+
+- **DI function-binding table (per software manual,
+  2026-08-31):** a bound DI's rising edge fires the assigned
+  function. Selected assignments relevant to us:
+  - `Switch to Auto Mode` — publishes the same firmware event
+    as the (hardware, unwired) DI16 modeSwitch rising edge.
+  - `Switch to Manual Mode` — inverse of the above.
+  - `System Reset` — clears alarm state (equivalent to
+    `System/ClearError`).
+  - `Program Start` — starts the currently-loaded project
+    (Remote-mode Run affordance).
+  - `Program Pause / Stop` — inverse of Start.
+  - `Protective Stop` — asserts the ch1-2 protective input
+    equivalent (see safety §5.2.2). Do NOT bind lightly.
+  - (More per the manual's alias list — copy the full table
+    in when the manual is next open.)
+
+  **This surface is our PLC-integration story** — external
+  Run/Stop/Reset/Protective-Stop from a customer's PLC are
+  wired to general-purpose DIs on the cabinet, each bound to
+  its function alias in the UI. See Synapse note below.
+
+- **Driver support:** `roboai-estun` env
+  `ESTUN_MODE_VIA_DI=1` (default 0) flips the mode ladder to
+  use the bound-DI pulse instead of `Robot/toAuto` /
+  `Robot/toManual`. Bound-DI ports default DI6 (auto) /
+  DI7 (manual), overridable via `ESTUN_MODE_DI_AUTO` /
+  `ESTUN_MODE_DI_MANUAL`; pulse width via
+  `ESTUN_MODE_DI_PULSE_MS` (default 120 ms). Read-back
+  verify is unchanged (poll `publish/RobotStatus.mode` up to
+  3 s). Dashboard-side Rung 0 (DI16 check) automatically
+  skips when `ESTUN_MODE_VIA_DI=1`. Envelope carries
+  `via='bound_di_<port>'` for observability. [add-54 §—]
+
+- **Synapse enclosure note (controls-engineer deck):**
+  customer-facing mode selection is one line item in a
+  larger PLC-integration story. Cabinet-side general DIs
+  (DI0–DI15) route to customer PLC terminals; each DI is
+  bound to a function alias in the factory UI. Any PLC
+  can then drive Run/Stop/Reset/Protective-Stop without
+  writing a single line of software. This is the product
+  story for controls engineers: **"any DI, any function,
+  bound in the UI, effective immediately."** Add to the
+  deck as a first-class capability slide.
 
 ## Repos
 
@@ -345,6 +418,101 @@ Under `/etc/systemd/system/`:
 - **Operator speed cap asymmetry:** 65% for programs, jog unchanged
   (50% hw / 25% op-limit). Increases confirm; decreases apply instantly.
   [era-01 §Safety Architecture; addendum-21; CLAUDE.md]
+
+## Software-manual constants (2026-08-31 absorb)
+
+- **Factory-UI admin password:** `codroidsafety` — required
+  for the Configuration / IO-binding pages at `:9198` and
+  for other settings gated behind the safety role. Store as
+  a bench credential; NOT a customer credential. Rotate on
+  the Synapse enclosure integration if the manual documents
+  a rotate procedure (TBD — pull from manual on next read).
+- **Simulation / Real Machine switch:** the factory UI
+  exposes a switch that selects whether commanded motion
+  goes to the real servos or to an internal simulator.
+  Bench diagnostics may benefit from Simulation mode; do NOT
+  leave a shipped cabinet in Simulation. Location: TBD from
+  manual on next read.
+- **Error-code appendix:** the manual has a canonical error-
+  code appendix (matches the codes in `HARDWARE.md > Alarm
+  codes`). When a new code surfaces on the wire, look up its
+  operator-facing meaning + recovery gesture in that
+  appendix before writing new ladder branches. Reference:
+  CC10-A software manual, appendix (section-number TBD).
+
+## Cabinet power controls — ON/OFF rocker vs POWER key (2026-08-31 manual absorb)
+
+There are TWO controls on the CC10-A cabinet that look like
+power switches; they are NOT the same thing.
+
+| Control    | Effect | CPU cycle? |
+|------------|--------|------------|
+| **ON/OFF rocker** | Servo / drive power on-off. Fires alarm 9012 "Power disconnection detected" on the WS but the CC10-A CPU stays online (WS session survives). Does NOT clear `recoveryState` (see [[recoveryState reframe]] — rs is session-persistent). | NO |
+| **POWER key** (mains-side, on the cabinet) | True cabinet power cycle. Drops CPU. WS session terminates; the driver logs a new `Connected ws://192.168.2.136:9000/` line on reconnect. This is what the addendum-40 §566 "physical cabinet cycle" doctrine actually required. | YES |
+
+**Diagnostic corollary:** if the operator reports "I power-cycled
+the cabinet" and the driver's journal shows no new WS connect
+line within ~30 s of the report, the ROCKER was cycled, not
+the POWER key. This is the exact confusion behind the 2026-08-31
+"latch persisted through power cycle" incident (add-53 §655).
+
+Verification recipe (before asserting a CPU cycle happened):
+1. `journalctl -u roboai-estun --since "2 minutes ago" | grep "Connected ws"` — expect a new line.
+2. `ls -la /opt/cobot/logs/estun_ws_*.jsonl` — expect a new rotation.
+3. `curl -sI http://192.168.2.136:9198` during the OFF window — expect connection refused (the HTTP page is served by the CPU; if it answers, the CPU is up).
+
+## Cabinet light-strip mode indication (2026-08-31 manual absorb)
+
+The CC10-A light strip encodes the running mode + enable state
+at a glance:
+
+| Color | Meaning |
+|-------|---------|
+| **Blue**  | Manual mode AND arm enabled |
+| **Green** | Auto OR Remote mode |
+| (off / dim) | Arm disabled / no power |
+
+Operator-facing consequence: if the strip is BLUE while the
+dashboard indicates AUTO expected, the wire is telling truth
+(`mode=1`, MANUAL) — trust the strip over any dashboard-mirror
+disagreement, and check DI16 modeSwitch state.
+
+## Safety-relay I/O (manual §5.2.2, 2026-08-31 absorb)
+
+The CC10-A safety-relay block provides:
+
+- **4 dual-channel inputs.** Channels 1–2 are the **protective
+  stop** (guard/interlock category — motion stops, servos may
+  stay energized depending on drive config); channels 3–4 are
+  the **emergency stop** (Cat-1 per EN ISO 13849 — controlled
+  stop then power removal).
+- **Internal safety relays.** The block's outputs drive
+  redundant relay contacts internally; external safety-rated
+  relays are NOT required for the standard integration.
+- **Factory shorts.** Ships with jumper shorts across the safety
+  input pairs so the cabinet runs out of the box with no
+  external safety devices wired. **These shorts MUST be removed
+  before shipping any integration** — an intact factory short
+  means the safety inputs are permanently satisfied, defeating
+  the entire safety chain. Factory-short removal is on the
+  bench session plan (see [safety-relay deck slide 4](safety_relay_deck_slide4.md)).
+- **Category-1 e-stop.** The e-stop inputs (ch3-4) are wired
+  for Cat-1: motion is controlled-stopped, then power is
+  removed via the drop output (below).
+- **24V drop output.** A safety-triggered event drops the 24V
+  rail to the servo enable circuit — this is the hardware
+  path that removes drive power on e-stop, independent of the
+  WS `Robot/switchOff` verb. Design any external logic on the
+  assumption that 24V-present ≡ "safety chain closed."
+
+**What this pins for the bench session:**
+- Behavioral verification of the safety inputs is now a
+  hands-on task (short one pair, verify motion refuses; open a
+  pair, verify motion refuses again once behavior differs from
+  factory-shorted state).
+- Factory-short removal is a required deliverable per the
+  above. Do NOT ship a Synapse enclosure with any factory
+  short still in place.
 
 ## Robot-mode code table (`publish/RobotStatus.mode`)
 

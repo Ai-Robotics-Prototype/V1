@@ -6498,25 +6498,34 @@ if FASTAPI_AVAILABLE:
     # our entry with the fresh codegen output).
 
     # ── 2026-08-28 palletize quarantine (§644 investigation) ────
-    # These program IDs latch the CC10-A controller's recoveryState
-    # to 1 on push (mode-switch endpoint diagnosed it, addendum-51
-    # §638-645). Latch survives ClearError + switchOn per §566;
-    # only physical cabinet power-cycle clears it. Until the poison
-    # verb in the palletize codegen is identified and removed, any
-    # save/run/load of these programs is refused SERVER-SIDE with
-    # a named reason. Adding a program here is a two-line change;
-    # removing one should require a §644 root-cause resolution.
+    # Kept ON as belt-and-braces per add-52 §646-654 (retires with
+    # RUN_BACKEND=ros2_executor). NOTE 2026-08-31 (add-53 §655-660):
+    # the original diagnosis that these programs "latch controller
+    # recoveryState=1" is superseded by wire evidence — rs=1 is a
+    # session-persistent servos-were-off flag, not a fault latch,
+    # and the mode-switch failures that motivated the quarantine
+    # were likely DI16 modeSwitch=0 (hardware selector in MANUAL)
+    # silently no-op'ing Robot/toAuto after the palletize push
+    # tried to switch to Auto. The offline §644 forensic (add-52
+    # M4) still stands as a codegen-hygiene finding
+    # (transit_over_slot IK-refuse + partial expansion), and the
+    # ROS2 executor's L222 pre-submit validation is the real fix.
+    # This quarantine survives regardless of RUN_BACKEND until
+    # palletize is proven on the ros2 path.
     _QUARANTINED_PROGRAM_IDS = {
         'holepartpalletize',
         'pallettest',
         'pallettest2',
     }
     _QUARANTINE_REASON = (
-        "under investigation §644 — this program's push sequence "
-        "latches controller recoveryState=1 (see ledger addendum-51 "
-        "§640). No wire path clears the latch; only a physical "
-        "cabinet power-cycle recovers. Blocked from load/run until "
-        "the root cause is fixed."
+        "under investigation §644 — palletize codegen has an "
+        "IK-refuse + partial-expansion defect (add-52 M4). "
+        "Quarantined on the legacy Lua path until the ROS2 "
+        "executor's pre-submit validation (L222) proves the "
+        "class impossible-by-construction. Reframe note (add-53 "
+        "§655-660): the earlier 'latches recoveryState=1' "
+        "attribution was incorrect; the observed refusals were "
+        "DI16 modeSwitch=0 stacked on rs=1-as-session-normal."
     )
 
     @app.post("/api/estun/program/run")
@@ -7499,56 +7508,93 @@ if FASTAPI_AVAILABLE:
                                        "jog or stop the program first.")},
             }, status_code=409)
 
-        # ── §566 self-healing diagnostic ladder (2026-08-28) ────
-        # Operator directive: "the system must DIAGNOSE AND FIX
-        # this class itself, not report riddles." Before any
-        # mode-switch attempt, probe the §566 four-tuple:
-        #   1) recoveryState != 0  → HARD-STOP with the honest
-        #      power-cycle instruction. §566 pins that no wire
-        #      path clears this state; System/ClearError and
-        #      CRI/StartControl were tried and failed. Physical
-        #      cabinet cycle is the ONLY remedy.
-        #   2) errors[] non-empty  → publish System/ClearError
-        #      via the existing /robot/power_command clear_alarm
-        #      path, poll for errors == [] for up to 2 s, retry.
-        #      Auto-silent success or a named refusal — never a
-        #      raw "mode read-back timeout" if the cause is
-        #      diagnosable.
-        #   3) fall through to the enable-interlock orchestration
-        #      (already built).
+        # ── Self-healing diagnostic ladder (2026-08-31 reframe) ─────
+        # Rung 0 added, Rung 1 semantics rewritten. See ledger
+        # addendum-53 §655-660 for the wire-evidence reframe of
+        # `recoveryState` (session-persistent servos-were-off flag,
+        # NOT a fault latch) and the DI16 modeSwitch discovery.
+        #
+        # New ladder:
+        #   0) DI16 modeSwitch == 0  → hardware mode selector is
+        #      in MANUAL. Firmware silently ACKs Robot/toAuto but
+        #      never transitions mode; no wire remediation helps.
+        #      Only fires when the target IS 'auto'.
+        #   1) errors[] non-empty  → publish System/ClearError,
+        #      poll for drain up to 2 s. If persistent →
+        #      errors_latched_uncleared (the real power-cycle-only
+        #      condition — was misattributed to `recoveryState` in
+        #      addendum-40 §566 / addendum-51 §640 pre-2026-08-31).
+        #   2) fall through to enable-interlock orchestration.
+        #
+        # `recoveryState` is retained in every outcome's four_tuple
+        # for observability, but NEVER gates a refusal on its own.
+        # Historical wire (2026-08-31 acceptance run): recoveryState
+        # transitions 0→1 at the moment of Robot/switchOff and stays
+        # 1 for the rest of the CPU session — every operator session
+        # trivially reaches rs=1 after any disable. A rs-only refusal
+        # would demand a power-cycle after every jog session.
         with _state_lock:
             r = STATE.get("robot", {}) or {}
             recovery = r.get("recoveryState")
             errors_now = list(r.get("errors") or [])
             current_code = int(r.get("robot_mode_code") if isinstance(
                 r.get("robot_mode_code"), int) else -1)
+            io_live = STATE.get("io_live") or {}
 
-        # Rung 1: recoveryState.
-        if isinstance(recovery, int) and recovery != 0:
-            return JSONResponse({
-                "ok": False,
-                "outcome": {
-                    "kind": "recovery_state_power_cycle_required",
-                    "reason_code": "recovery_state_nonzero",
-                    "reason": ("controller recoveryState=%d — no wire "
-                               "path clears this state (see ledger "
-                               "addendum-40 §566). Physical cabinet "
-                               "power-cycle is required." % recovery),
-                    "detail": ("Cycle CC10-A at the cabinet. After the "
-                               "cycle, the four-tuple must read "
-                               "{state:2, stateName:'Enabled', "
-                               "recoveryState:0, errors:[]} before "
-                               "mode switching or program runs will "
-                               "work."),
-                    "four_tuple": {
-                        "mode":          current_code,
-                        "state_code":    r.get("state_code"),
-                        "state_name":    r.get("state_name"),
-                        "recoveryState": recovery,
-                        "errors":        errors_now,
+        # Rung 0: DI16 modeSwitch pre-check. Only gates target=='auto'
+        # (Manual is always reachable). Reads STATE['io_live'] which
+        # the driver refreshes every ~0.5 s via IOManager/GetIOValue.
+        # If the mirror isn't populated yet (fresh boot before first
+        # /estun/io publish), we DO NOT refuse — treat as UNKNOWN
+        # and let the orchestration attempt proceed; a false-block
+        # from a stale mirror would be exactly the "refusal quoting
+        # stale data is a lie" case the freshness doctrine warns
+        # about.
+        #
+        # 2026-08-31 add-54: SKIP this rung entirely when the
+        # driver is running under ESTUN_MODE_VIA_DI=1. Under the
+        # software-binding path (bound DI aliased to "Switch to
+        # Auto Mode"), the DI16 hardware selector is bypassed —
+        # keeping the check would over-fire on a system where the
+        # bound-DI mechanism is the actual mode-switch path.
+        _mode_via_di = os.environ.get(
+            'ESTUN_MODE_VIA_DI', '0').strip().lower() in \
+            ('1', 'true', 'yes', 'on')
+        if target == "auto" and not _mode_via_di:
+            di_val = None
+            di_rows = (io_live or {}).get("DI") or []
+            for row in di_rows:
+                try:
+                    if int(row.get("port")) == 16:
+                        di_val = row.get("value")
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if di_val is not None and int(di_val) == 0:
+                return JSONResponse({
+                    "ok": False,
+                    "outcome": {
+                        "kind": "mode_selector_manual",
+                        "reason_code": "hardware_mode_selector_manual",
+                        "reason": ("hardware mode-selector DI16 "
+                                   "(factory name 'modeSwitch') reads "
+                                   "0 — firmware silently no-ops "
+                                   "Robot/toAuto with this DI open."),
+                        "detail": ("Mode selector at the cabinet is in "
+                                   "MANUAL — turn the physical "
+                                   "selector to AUTO, then retry. "
+                                   "No wire remediation clears this."),
+                        "di16": {"port": 16, "value": int(di_val),
+                                 "name": "modeSwitch"},
+                        "four_tuple": {
+                            "mode":          current_code,
+                            "state_code":    r.get("state_code"),
+                            "state_name":    r.get("state_name"),
+                            "recoveryState": recovery,
+                            "errors":        errors_now,
+                        },
                     },
-                },
-            }, status_code=503)
+                }, status_code=503)
 
         # Rung 2: errors[] latched. Auto-clear + retry.
         rung2_subs = []

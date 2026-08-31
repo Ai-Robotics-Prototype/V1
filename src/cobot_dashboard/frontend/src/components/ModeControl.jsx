@@ -98,12 +98,13 @@ export default function ModeControl() {
         // 2026-08-31: route mode refusals through the shared named-
         // copy mapper. Prior code flattened outcome.reason ||
         // outcome.detail into a single toast body, losing the
-        // ladder's per-rung register (recoveryState → physical
-        // cycle, errors_persist → pendant :9198 alarm log,
+        // ladder's per-rung register (DI16 modeSwitch → physical
+        // selector, errors_persist → pendant :9198 alarm log,
         // arm_enabled_interlock → disable-first). Toast body
         // renders title + detail; wire fields (reason_code +
-        // four_tuple + subs) live in technicalDetail for
-        // devtools grep.
+        // four_tuple + subs + di16) live in technicalDetail for
+        // devtools grep. Add-53 reframe: recoveryState-only
+        // refusals are retired; rs is a session flag, not a latch.
         const named = namedModeError(body || {}, res.status)
         addToast?.({ title: named.title, detail: named.detail,
                      technicalDetail: named.technicalDetail },

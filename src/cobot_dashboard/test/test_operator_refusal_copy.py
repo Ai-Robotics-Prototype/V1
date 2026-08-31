@@ -220,6 +220,7 @@ def test_named_mode_error_covers_every_documented_outcome_kind():
     # literal in the file — either in MODE_OUTCOME_KINDS list or
     # in an `if (kind === '...')` guard).
     for kind in ('invalid_target', 'arbiter_refused',
+                 'mode_selector_manual',
                  'recovery_state_power_cycle_required',
                  'errors_latched_uncleared', 'driver_ack_timeout',
                  'mode_switch_failed'):
@@ -240,31 +241,54 @@ def test_named_mode_error_covers_every_documented_outcome_kind():
             f'incomplete.')
 
 
-def test_named_mode_error_recovery_state_names_physical_cycle():
-    """Rung 1 (recoveryState != 0) has only ONE remedy: physical
-    cabinet cycle. The named branch's TITLE and DETAIL must name
-    that action — not 'try again', not 'controller is not in Auto'.
-    Regression sentinel for the 2026-08-31 report where every
-    program run surfaced the pre-ladder generic copy."""
+def test_named_mode_error_selector_manual_names_physical_selector():
+    """Rung 0 (2026-08-31): DI16 modeSwitch == 0 → the ONLY remedy
+    is turning the hardware selector on the cabinet. Copy must
+    name the physical action (not a wire retry, not a power-
+    cycle instruction). Regression sentinel for the reframe."""
     src = _read(os.path.join(FRONTEND_SRC, 'lib', 'modeOutcome.js'))
-    # Isolate the branch body.
+    m = re.search(
+        r"kind === 'mode_selector_manual'\)\s*\{(.+?)\}\s*\n\n",
+        src, re.DOTALL)
+    assert m, 'mode_selector_manual branch not found'
+    branch = m.group(1)
+    # Title names the physical action.
+    assert 'selector' in branch.lower() or 'manual' in branch.lower(), (
+        'Rung 0 title does not name the physical selector — '
+        'the operator would look for a wire fix.')
+    assert 'auto' in branch.lower(), (
+        'Rung 0 title does not name the direction the operator '
+        'must turn the selector to (AUTO).')
+    # Must NOT prescribe a power-cycle (that was the retired Rung 1
+    # bogus remedy).
+    assert 'power-cycle' not in branch.lower(), (
+        'Rung 0 branch is prescribing power-cycle — that was the '
+        'retired addendum-40 §566 remedy. DI16 is a hardware '
+        'selector; no cabinet cycle will change its state.')
+
+
+def test_named_mode_error_retired_recovery_state_branch_is_marked_legacy():
+    """The recovery_state_power_cycle_required branch is retired
+    (add-53 §655-660) but kept as a mapped kind for backward-
+    compat with older backends. Copy MUST explicitly say the
+    backend version is out-of-date — an operator seeing this
+    outcome should know their server needs updating, not that
+    they need to cycle the cabinet."""
+    src = _read(os.path.join(FRONTEND_SRC, 'lib', 'modeOutcome.js'))
     m = re.search(
         r"kind === 'recovery_state_power_cycle_required'\)\s*\{(.+?)\}\s*\n\n",
         src, re.DOTALL)
-    assert m, 'recovery_state_power_cycle_required branch not found'
+    assert m, 'recovery_state_power_cycle_required branch missing'
     branch = m.group(1)
-    # Title names the physical action.
-    assert 'power-cycle' in branch.lower(), (
-        'Rung 1 title does not name the physical remedy '
-        '(power-cycle). The operator would repeat the wire '
-        'switch fruitlessly.')
-    # Detail cites the cabinet + the target four-tuple.
-    assert 'cabinet' in branch.lower()
-    assert 'four-tuple' in branch.lower() or 'four_tuple' in branch.lower()
-    # The wrong generic copy must NOT be here.
-    assert 'controller is not in Auto' not in branch, (
-        'Rung 1 branch still uses the pre-ladder generic copy — '
-        'the exact bug the 2026-08-31 rewrite closed.')
+    assert 'out-of-date' in branch.lower() or 'legacy' in branch.lower(), (
+        'Retired recovery_state branch copy does not name the '
+        'legacy status — operator would think a power-cycle is '
+        'still the fix.')
+    # Must reference the reframe addendum so anyone auditing the
+    # code can find the wire evidence.
+    assert 'addendum-53' in branch.lower() or 'add-53' in branch.lower(), (
+        'Retired branch does not cite the ledger reframe — the '
+        'why is not documented in place.')
 
 
 def test_run_program_modal_uses_named_mode_error():

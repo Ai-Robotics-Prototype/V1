@@ -699,6 +699,35 @@ class EstunCodroidDriver(Node):
             self._allow_mode = env_mode.strip().lower() in ('1', 'true', 'yes', 'on')
             self._allow_mode_source = 'ESTUN_ALLOW_MODE'
 
+        # Software mode switching via bound DIs (2026-08-31 add-54).
+        # Per the CC10-A software manual, DIs can be assigned function
+        # aliases at :9198 → Configuration → IO ("Switch to Auto
+        # Mode", "Switch to Manual Mode", rising-edge). When the
+        # operator has bound spare DIs (e.g., DI6=to_auto,
+        # DI7=to_manual), setting `ESTUN_MODE_VIA_DI=1` makes this
+        # driver pulse those DIs via IOManager/SetIOForcedFlag
+        # instead of firing Robot/toAuto|toManual. Bypasses the
+        # DI16 modeSwitch hardware gate entirely (bound-DI aliases
+        # take effect immediately per manual — no Save).
+        self._mode_via_di = os.environ.get(
+            'ESTUN_MODE_VIA_DI', '0').strip().lower() in \
+            ('1', 'true', 'yes', 'on')
+        try:
+            self._mode_di_auto = int(os.environ.get(
+                'ESTUN_MODE_DI_AUTO', '6'))
+        except ValueError:
+            self._mode_di_auto = 6
+        try:
+            self._mode_di_manual = int(os.environ.get(
+                'ESTUN_MODE_DI_MANUAL', '7'))
+        except ValueError:
+            self._mode_di_manual = 7
+        try:
+            self._mode_di_pulse_ms = int(os.environ.get(
+                'ESTUN_MODE_DI_PULSE_MS', '120'))
+        except ValueError:
+            self._mode_di_pulse_ms = 120
+
         # WS-jog guard demotion — resolved into a runtime bool. Env
         # override `WSJOG_TRUST_FIRMWARE_CLAMPS=0` restores the
         # streamed-era ENFORCE behavior for regression testing.
@@ -1850,21 +1879,59 @@ class EstunCodroidDriver(Node):
                 'req_id': req_id, 'ts': time.time()})
             return
 
-        ok_verb = self._ws_verb(verb)
-        self.get_logger().info(f'{verb} sent ok={ok_verb} '
-                               f'req_id={req_id}')
-        if not ok_verb:
-            self._publish_mode_status({
-                'ok': False, 'op': op, 'requested': target_code,
-                'observed': already,
-                'reason': f'{verb} publish failed on the WS',
-                'reason_code': 'verb_publish_failed',
-                'req_id': req_id, 'ts': time.time()})
-            return
+        # Software-mode-switch via bound DIs (2026-08-31 add-54).
+        # When ESTUN_MODE_VIA_DI=1 and the op has a bound-DI
+        # mapping, pulse the DI instead of firing the WS verb.
+        # Bypasses the DI16 hardware modeSwitch gate — the operator
+        # bound spare DIs (DI6/DI7 by default) to the "Switch to
+        # Auto Mode" / "Switch to Manual Mode" function aliases at
+        # :9198 → Configuration → IO. Rising-edge triggers the
+        # function; effect is immediate per manual (no Save).
+        #
+        # Reads back through the same _robot_mode_code poll below,
+        # so the timing contract is unchanged. `to_remote` has no
+        # bound-DI alias in the manual — it stays on the WS verb.
+        used_bound_di = False
+        if self._mode_via_di and op in ('to_auto', 'to_manual'):
+            di_port = (self._mode_di_auto if op == 'to_auto'
+                       else self._mode_di_manual)
+            self.get_logger().info(
+                f'mode switch via bound DI (ESTUN_MODE_VIA_DI=1): '
+                f'op={op} pulsing DI{di_port} '
+                f'(pulse={self._mode_di_pulse_ms} ms)')
+            try:
+                self._do_di_force(di_port, 1, family='mode_bound_di')
+                time.sleep(self._mode_di_pulse_ms / 1000.0)
+                self._do_di_force(di_port, 0, family='mode_bound_di')
+                used_bound_di = True
+            except Exception as e:
+                self._publish_mode_status({
+                    'ok': False, 'op': op, 'requested': target_code,
+                    'observed': already,
+                    'reason': f'bound-DI pulse failed: {e}',
+                    'reason_code': 'bound_di_pulse_failed',
+                    'via': f'bound_di_{di_port}',
+                    'req_id': req_id, 'ts': time.time()})
+                return
+
+        if not used_bound_di:
+            ok_verb = self._ws_verb(verb)
+            self.get_logger().info(f'{verb} sent ok={ok_verb} '
+                                   f'req_id={req_id}')
+            if not ok_verb:
+                self._publish_mode_status({
+                    'ok': False, 'op': op, 'requested': target_code,
+                    'observed': already,
+                    'reason': f'{verb} publish failed on the WS',
+                    'reason_code': 'verb_publish_failed',
+                    'req_id': req_id, 'ts': time.time()})
+                return
 
         # Read-back verify (L298): poll robot_mode_code up to 3 s.
         # The publish/RobotStatus stream refreshes at ~10 Hz — 3 s
         # is 30 opportunities to observe the change.
+        via_tag = (f'bound_di_{self._mode_di_auto if op == "to_auto" else self._mode_di_manual}'
+                   if used_bound_di else 'ws_verb')
         deadline = time.time() + 3.0
         while time.time() < deadline:
             time.sleep(0.05)
@@ -1873,17 +1940,20 @@ class EstunCodroidDriver(Node):
                 self._publish_mode_status({
                     'ok': True, 'op': op,
                     'requested': target_code, 'observed': observed,
+                    'via': via_tag,
                     'req_id': req_id, 'ts': time.time()})
                 return
-        # Timed out — the verb published but the controller never
-        # confirmed. Loud + machine-readable.
+        # Timed out — trigger fired (verb or DI pulse) but the
+        # controller never confirmed. Loud + machine-readable.
         self._publish_mode_status({
             'ok': False, 'op': op,
             'requested': target_code, 'observed': self._robot_mode_code,
-            'reason': ('mode read-back timeout — verb was sent but '
-                       'publish/RobotStatus.mode did not reach '
-                       f'{target_code} within 3 s'),
+            'reason': ('mode read-back timeout — '
+                       + ('DI pulse' if used_bound_di else 'verb')
+                       + ' fired but publish/RobotStatus.mode did not '
+                       + f'reach {target_code} within 3 s'),
             'reason_code': 'mode_readback_timeout',
+            'via': via_tag,
             'req_id': req_id, 'ts': time.time()})
 
     def _op_set_move_rate(self, d):

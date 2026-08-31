@@ -66,6 +66,26 @@
 
 ## Next session opener (exact order)
 
+0. **MODE via bound DI — TEST A + operator retry** (2026-08-31,
+   add-54 pipeline shipped, awaits wire test):
+   - Operator binds at `:9198 → Configuration → IO`: DI6 =
+     "Switch to Auto Mode" (rising edge), DI7 = "Switch to
+     Manual Mode" (rising edge). Login pw `codroidsafety`.
+     Alias effect is immediate per manual — no restart.
+   - Run `/tmp/probe_mode_via_di.py` — TEST A. If PHASE 1
+     shows mode `1→0` and PHASE 2 shows mode `0→1`, the
+     bound-DI path is proven.
+   - On TEST A pass: `sudo systemctl edit roboai-estun`
+     drop-in adds `Environment=ESTUN_MODE_VIA_DI=1`;
+     `systemctl daemon-reload && restart roboai-estun`.
+     Rung 0 (DI16 check) auto-skips.
+   - MODE pill acceptance (now firing the new path — the
+     `via` field on `/estun/mode_status` envelope should
+     read `bound_di_6` / `bound_di_7`).
+   - Test100 at 25% → Run.
+   - On TEST A fail: fall back to TEST B (labeled loopback
+     DO_x→DI6 + DO_y→DI7, driver pulses setDO). Doc first;
+     don't cut wires yet.
 1. **F2.7 first taught program end-to-end** (operator-cued, real arm):
    - Flesh out F2.6 skeleton TODO surface (marked in
      `executor_node.py`): `_ws_four_tuple_ok()` real websockets probe;
@@ -92,6 +112,19 @@
      hold.
 3. **9012 forensics tightening** if browser `:9198` log page +
    `0x2058` subcode become available (add-45 §601 open action).
+
+## Outstanding requests (external)
+
+- **Patrick → Estun customer service:** request the "Remote
+  Control Manual" + "Register Protocol Table". The Modbus
+  basic-control registers may be the cleanest long-term
+  integration channel (an external PLC would drive
+  Run/Stop/Reset/mode/status via Modbus TCP registers
+  instead of bound DIs — no factory-UI configuration step
+  per install, no aviation-plug wiring). When these arrive:
+  update `HARDWARE.md > Software-manual constants` with
+  register addresses; consider retiring the bound-DI path
+  in favor of Modbus for shipped units. [2026-08-31]
 
 ## Open defects / directed-not-confirmed
 

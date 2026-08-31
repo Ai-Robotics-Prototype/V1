@@ -1093,39 +1093,75 @@ def test_dashboard_mirrors_errors_and_recoveryState():
         'driver _on_status must parse db.get("recoveryState")')
 
 
-def test_mode_endpoint_has_recovery_state_rung():
-    """Rung 1: recoveryState != 0 → immediate refuse with
-    reason_code=recovery_state_nonzero AND the operator instruction
-    naming the physical cabinet cycle. §566 pins that no wire path
-    clears this state; a wire-level retry would burn time and mask
-    the required physical action."""
+def test_mode_endpoint_has_di16_rung_zero():
+    """Rung 0 (2026-08-31 add-53 §655-660): DI16 modeSwitch pre-
+    check. If hardware selector is in MANUAL (DI16 == 0) and the
+    target is 'auto', refuse immediately with the honest physical
+    action. Firmware silently ACKs Robot/toAuto when DI16=0 but
+    does NOT transition — the ladder must catch this BEFORE the
+    orchestration burns two 4 s ack windows chasing a state no
+    wire verb can move."""
     src = _server_src()
     m = re.search(r'@app\.post\("/api/estun/mode"\)', src)
     assert m
-    # Endpoint has grown past 15KB with the diagnostic ladder;
-    # find the next @app.* to bound the search.
     _next = re.search(r'\n    @app\.(?:get|post|put|delete|websocket)',
                       src[m.end():])
     _end = m.end() + (_next.start() if _next else 40000)
     body = src[m.start(): _end]
-    assert 'recovery_state_power_cycle_required' in body, (
-        'Rung 1 outcome kind missing')
-    assert 'recovery_state_nonzero' in body, (
-        'reason_code missing — the frontend keys on this to render '
-        'the power-cycle instruction')
-    assert 'power-cycle' in body, (
-        'The instruction must NAME the physical action verbatim — '
-        'no riddle-toast')
-    # Rung 1 must reject BEFORE the orchestration attempts a
-    # switch. Regression here would rerun the "verb ack ok but mode '
-    # never transitions" loop and mask the required physical action.
-    m1 = re.search(
-        r"recovery_state_power_cycle_required.*?return JSONResponse",
-        body, re.DOTALL)
-    assert m1, (
-        'Rung 1 must return immediately — a fall-through into the '
-        'orchestration would waste the 4 s ack window on a state the '
-        'wire cannot fix.')
+    assert 'mode_selector_manual' in body, (
+        'Rung 0 outcome kind missing — DI16 hardware precheck is '
+        'not wired')
+    assert 'hardware_mode_selector_manual' in body, (
+        'reason_code missing — the frontend keys on this')
+    # Copy names the physical action.
+    assert 'MANUAL' in body and 'AUTO' in body, (
+        'The instruction must name the physical positions — no '
+        'riddle')
+    # Guard runs only for target=='auto' (Manual is always reachable).
+    assert 'target == "auto"' in body or "target == 'auto'" in body, (
+        'Rung 0 must only gate the auto target — a MANUAL-target '
+        'switch has no reason to check the selector')
+    # Reads STATE['io_live'] (mirror populated by the driver's
+    # IOManager/GetIOValue poll). Direct wire probe here would be
+    # over-engineering; the mirror refreshes every ~0.5 s.
+    assert "STATE.get(\"io_live\")" in body or "STATE.get('io_live')" in body, (
+        'Rung 0 must read STATE.io_live — reading anything else '
+        'would either be stale or add a wire round-trip')
+
+
+def test_mode_endpoint_does_not_gate_on_recovery_state_alone():
+    """2026-08-31 reframe (add-53 §655-660): `recoveryState` is a
+    session-persistent servos-were-off flag, NOT a fault latch.
+    Wire evidence showed rs=1 latches on every Robot/switchOff and
+    persists for the rest of the CPU session; a rs-only refusal
+    would demand a power-cycle after any jog session. The mode
+    endpoint MUST NOT return recovery_state_power_cycle_required
+    with reason_code=recovery_state_nonzero — that was the retired
+    Rung 1 misdiagnosis."""
+    src = _server_src()
+    m = re.search(r'@app\.post\("/api/estun/mode"\)', src)
+    assert m
+    _next = re.search(r'\n    @app\.(?:get|post|put|delete|websocket)',
+                      src[m.end():])
+    _end = m.end() + (_next.start() if _next else 40000)
+    body = src[m.start(): _end]
+    # The retired reason_code must NOT be emitted from this endpoint.
+    assert '"recovery_state_nonzero"' not in body \
+        and "'recovery_state_nonzero'" not in body, (
+        'Retired reason_code=recovery_state_nonzero is back — the '
+        'ladder is again refusing on rs alone, which trivially '
+        'over-fires after any operator disable.')
+    assert '"recovery_state_power_cycle_required"' not in body \
+        and "'recovery_state_power_cycle_required'" not in body, (
+        'Retired outcome.kind=recovery_state_power_cycle_required '
+        'is back in the mode endpoint — rs alone must not gate '
+        'refusals.')
+    # `recoveryState` should still appear in four_tuple output —
+    # observability is retained, only the refusal is retired.
+    assert 'four_tuple' in body and 'recoveryState' in body, (
+        'recoveryState must still be reported in four_tuple output '
+        'for operator observability — the reframe retires the '
+        'refusal, not the observation.')
 
 
 def test_mode_endpoint_has_errors_clear_rung():
@@ -1151,25 +1187,28 @@ def test_mode_endpoint_has_errors_clear_rung():
 
 
 def test_mode_endpoint_dumps_four_tuple_on_terminal_failure():
-    """Any terminal failure (driver_ack_timeout, mode_switch_failed,
-    recovery_state_power_cycle_required, errors_latched_uncleared)
-    must carry the §566 four-tuple in the response payload so the
-    operator toast can render wire truth instead of a riddle."""
+    """Any terminal failure (mode_selector_manual, driver_ack_timeout,
+    mode_switch_failed, errors_latched_uncleared) must carry the
+    §566 four-tuple in the response payload so the operator toast
+    can render wire truth instead of a riddle. Reframed 2026-08-31
+    (add-53 §655-660): the retired Rung 1 recovery_state branch is
+    no longer counted as a terminal path — DI16 Rung 0 replaces it."""
     src = _server_src()
     m = re.search(r'@app\.post\("/api/estun/mode"\)', src)
     assert m
-    # Endpoint has grown past 15KB with the diagnostic ladder;
-    # find the next @app.* to bound the search.
     _next = re.search(r'\n    @app\.(?:get|post|put|delete|websocket)',
                       src[m.end():])
     _end = m.end() + (_next.start() if _next else 40000)
     body = src[m.start(): _end]
-    # Every terminal path must include four_tuple.
+    # Every terminal path must include four_tuple. Rung 0 (DI16),
+    # Rung 2 failure, driver_ack_timeout, mode_switch_failed.
     assert body.count('four_tuple') >= 4, (
-        'four_tuple must appear on Rung 1, Rung 2 failure, '
+        'four_tuple must appear on Rung 0, Rung 2 failure, '
         'driver_ack_timeout, AND mode_switch_failed responses — '
         f'found {body.count("four_tuple")} references')
-    # Each tuple must carry the 5 §566 fields.
+    # Each tuple must carry the 5 §566 fields — reframe kept the
+    # OBSERVATION of recoveryState even though the REFUSAL on it
+    # was retired.
     for field in ('mode', 'state_code', 'state_name',
                   'recoveryState', 'errors'):
         assert f'"{field}"' in body, (
