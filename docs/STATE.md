@@ -50,57 +50,63 @@
 
 ## Arm state at session end
 
-`state=2 stateName='Enabled' recoveryState=1 isMoving=0 errors=[]`.
+`state=2 stateName='Enabled' mode=2 REMOTE errors=None isMoving=0`
+(2026-09-01 close).
 
-- `recoveryState=1` PERSISTS but motion works per the finding logged
-  earlier this session (memory
-  `cobot-recoverystate-not-motion-gate-ws`) — the WS four-tuple
-  check under WS-jog simplifies to `{state:2 Enabled, errors:[]}`.
-- Post-F1 pose (operator's last jog): J1 −3.18°, J2 +51.24° (from
-  the earlier sweep; may have drifted after F1.2 direction 1 hold).
-- `roboai-estun`: LIVE. `active`, `enabled`, `f1_monitor_only.env`
-  restored to WS-jog canonical (`ALLOW_JOG=1, ALLOW_MOVE=0,
-  ALLOW_CARTESIAN=0`) after the F1.2 test window.
+- Arm at intermediate pose after Test100 step 2 halted at
+  `hold_if_cmd_far`: `J1=-10.539° J2=13.706° J3=74.897° J4=-3.607°
+  J5=91.438° J6=-36.188°`. Close to Test100 home but not exact
+  (2026-09-01). Safe pose, no alarms, no e-stop latched.
+- CRI stack (`ros2 launch cod_bringup s10_140_cri_ros2_control.launch.py
+  use_mock:=false`) LIVE in tmux `robot:cri` — cri_tcp_setup passed,
+  UDP push streaming at 250 Hz, SIGN_DIAG shows raw UDP J1=-0.1926
+  matches WS RobotPosture J1=-11.03° (no adapter needed).
+- `s10_140_executor` LIVE in tmux `robot:1` on CodroidROS2 sha (post
+  2026-09-01 JTC-quirk fix — see add-55 §679). Frame-coherence
+  gate + per-step cross-check both armed.
+- `roboai-estun`: LIVE.
 - Dashboard: LIVE. `active`, `JOG_BACKEND=ws` + `CAMERAS_DISABLED=1`.
-  Motion arbiter + twin phantom-feedback fix both live.
 
 ## Next session opener (exact order)
 
-0. **F2.7 first-fire retry — J1/J6 CONVENTION DRIFT resolution**
-   (2026-08-31 add-55 §676-678; blocking real fire):
-   - **First-fire attempted today.** Executor + dashboard bridge
-     + drop-in + preflight all worked. Silent-refusal guard
-     caught a mid-motion halt caused by operator e-stop; every
-     guard behaved correctly. 5 latent bugs surfaced + fixed
-     during the fire cycle (per LESSONS §317).
-   - **Retry BLOCKED by discovery**: two concurrent WS
-     clients subscribing to `publish/RobotPosture` return
-     OPPOSITE J1/J6 signs at the same instant on the same
-     physical arm. UDP push sign FLIPS across CRI
-     teardown+relaunch cycles. Details in add-55 §676 and
-     memory `cobot-jsb-j1-j6-convention-drift`.
-   - **Investigation plan for next session** (add-55 §678):
-     1. Fresh boot everything (arm cabinet + Jetson + services).
-     2. Enable `ws_log_raw=true` on estun_driver.
-     3. Capture WS RobotPosture + UDP push + /joint_states
-        signs at each state transition:
-        - Cold boot, no subscribers → single-client WS probe.
-        - Add estun_driver subscription → probe from second client.
-        - Start CRI/StartDataPush → probe UDP push convention.
-        - Start CRI/StartControl → probe again (UDP flipped
-          here this session).
-     4. Determine hypothesis (a) multi-client firmware bug,
-        (b) subscribe-order state binding, or (c) internal
-        transformation in estun_driver's frame-parsing.
-     5. Apply single sign adapter at correct layer.
-     6. Verify FK-vs-physical-TCP consistency BEFORE motion.
-     7. Preflight (arm-preflight charter — fresh probes,
-        single-use auth). Max |delta| from taught home < 5°
-        across all 6 joints on `/joint_states`.
-     8. Real fire.
-   - The reference `kUdpJointSigns` array + SIGN_ADAPTER
-     debug log stay in `cri_udp_system.cpp` (currently no-op)
-     — do NOT re-enable without fresh WS-vs-JSB verification.
+0. **F2.7 FIRST-FIRE ACHIEVED 2026-09-01** (add-55 §679-680).
+   Arm physically moved via ROS2 executor pipeline: Pilz PTP joint
+   plan → JTC dispatch → Estun motion → arrival at taught_joints
+   [-11.59, 14.46, 73.96, -3.76, 91.56, -37.35] within
+   silent-refusal tolerance.
+   - "J1/J6 convention drift" from §676-678 was a **parser bug**
+     in the ad-hoc probe script (`.strip("- \n")` stripped the
+     leading minus sign). Wire is coherent: WS/JSB/estun_driver
+     agree to 0.001° at same pose. Memory
+     `cobot-jsb-j1-j6-convention-drift` updated to RESOLVED.
+   - **Frame-coherence gate** landed in executor pre-flight:
+     `_frame_coherence_ok()` cross-checks WS RobotPosture vs
+     `/joint_states` (≤ 0.5°) + FK-TCP vs WS end (≤ 25 mm).
+     Refuses `frame_coherence_failed` on breach.
+   - **Per-step post-motion cross-check** halts run with
+     `frame_coherence_diverged` if any step drifts > 0.5°.
+   - **JTC Humble quirk fix**: `status=STATUS_UNKNOWN + rc=0`
+     accepted as success (result_future resolved + not
+     canceled + Result.error_code=0).
+
+1. **[BLOCKING FULL TEST100] cri_hardware cross-step
+   `pos_cmd_sent_` state** (add-55 §679-680):
+   - Step 2 move_l halted at `hold_if_cmd_far_from_fb_rad =
+     0.20 rad (11.5°)` in `cri_udp_system.cpp` — 25% cruise
+     following-error saturated the guard; 15% partial motion
+     failed at cross-step stale-pos_cmd_sent_ catch-up.
+     Silent-refusal + fb_far_from_target_at_start correctly
+     refused both outcomes.
+   - Options for next session:
+     (a) Raise `hold_if_cmd_far_from_fb_rad` to 0.35-0.5 rad in
+         `cod_bringup/bringup/config/cri_tcp_setup.yaml` (WS-jog
+         path has its own adapter, safety net unaffected).
+     (b) Reset `pos_cmd_sent_ = pos_state_` at the start of every
+         new JTC trajectory (add a trajectory-start hook in
+         `cri_udp_system.cpp`).
+     (c) Tune Estun servo following-error param from controller
+         side.
+   - Retry Test100 real (25% or 15%) after fix.
 
 1. **F2.7 first-run acceptance — SHIPPED as of 2026-08-31**
    (add-54 §665-671, superseded as opener by step 0 above):

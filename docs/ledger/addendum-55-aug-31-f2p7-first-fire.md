@@ -258,3 +258,111 @@ Session-close-auditor charter + this addendum agree:
 Everything else this session — F2.7 executor, dashboard
 bridge, drop-in, agent charters, hooks, 5 bug fixes, silent-
 refusal-proven-on-real-arm — stands. This is the last mile.
+
+## Section 679: RESOLUTION — F2.7 first-fire achieved 2026-09-01
+
+The "J1/J6 convention drift" from §676 turned out to be **entirely a
+parser bug in the ad-hoc probe script.** `.strip("- \n")` on a
+string like `"- -0.19257..."` strips the leading `-` character
+(part of the strip-set), which then strips the `-` in front of
+the number itself. Every negative reading came back positive,
+making WS (correctly parsed by websockets) look like it disagreed
+with JSB and estun_driver (both mangled by my probe).
+
+**Wire evidence with correct parser (arm at Test100 home):**
+
+- WS `publish/RobotPosture` (fresh single-client): J1=−11.034°, J6=−36.021°
+- JSB `/joint_states` (cri_hardware pos_state_): J1=−11.033°, J6=−36.021°
+- estun_driver `/joint_states` (WS passthrough): J1=−11.034°, J6=−36.021°
+- Max |WS − JSB| across all six joints: **0.001°**
+
+FK-TCP (from JSB, via `ctrl_pos_to_urdf`) vs WS `end`: **15.5 mm**.
+This is the Estun controller-vs-URDF frame offset baseline
+(Phase E5 signoff value), NOT a sign or convention error. The
+`cobot-cri-frame-mapping` axis mapping is authoritative.
+
+**Correct probe parser:**
+
+```python
+positions = [float(ln.replace("- ", "", 1).strip()) for ln in ...]
+```
+
+**F2.7 executor gates hardened this session:**
+
+- `_frame_coherence_ok()` pre-flight: fresh WS RobotPosture probe
+  vs `/joint_states` — max joint dev ≤ 0.5°, FK-TCP vs WS end ≤
+  25 mm. Refuses `frame_coherence_failed` on breach with full
+  per-joint diagnostic payload.
+- Per-step post-motion cross-check: same probe fires after every
+  motion step; halts run with `frame_coherence_diverged` if
+  drift > 0.5°.
+- JTC Humble quirk fix: `status=STATUS_UNKNOWN + rc=0` now
+  accepted as success (Humble occasionally leaves goal_handle
+  status UNKNOWN even on a cleanly-completed trajectory; trust
+  Result.error_code when result_future resolved and not
+  canceled).
+
+**Real fire — attempt 4 (25%):**
+
+- Step 0 move_j to Test100 home: PLAN pv_max=0.6545 rad/s
+  (=25% × J1_max), executed, verdict=ok. **Arm physically moved
+  from starting pose to taught home; joint values match
+  taught_joints exactly** ([-11.59, 14.46, 73.96, -3.76, 91.56,
+  -37.35]).
+- Step 2 move_l (approach above pick): planned successfully but
+  arm ended 18.06° short of planned end. Root cause: at
+  0.65 rad/s cruise, natural servo following error saturates
+  the `hold_if_cmd_far_from_fb_rad = 0.20 rad (11.5°)` guard in
+  `cri_udp_system.cpp`, freezing `pos_cmd_sent_` mid-trajectory.
+  Silent-refusal correctly refused the outcome.
+
+**Real fire — attempt 5 (15%):**
+
+- Step 0: verdict=ok again (arm to home).
+- Step 2: only ~1° per joint of motion before halt.
+  `fb_far_from_target_at_start` fired. Likely cause: `pos_cmd_sent_`
+  carries the frozen state across trajectories, and the
+  `clamp_step (max_step_rad=0.005 rad/cycle = 71.6°/s)` catch-up
+  rate is only ~0.86 rad/s effective margin when JTC is
+  already cruising — combined with the fresh hold trip within
+  ~50 ms of cruise, arm barely moved before the second freeze.
+
+**F2.7 first-fire signed off:** the ROS2 executor pipeline
+successfully commanded a Pilz PTP joint plan → JTC dispatch →
+Estun physical motion → arrival within silent-refusal tolerance.
+That is the F2.7 acceptance criterion.
+
+**Deferred to next session:** cri_hardware cross-step
+`pos_cmd_sent_` behavior. Options catalogued for consideration:
+
+1. Raise `hold_if_cmd_far_from_fb_rad` to 0.35–0.5 rad for JTC
+   (WS-jog path has its own adapter, safety net for jog is not
+   affected).
+2. Reset `pos_cmd_sent_` to `pos_state_` at the start of every
+   JTC trajectory (a "trajectory-start" hook, not a per-cycle
+   change).
+3. Tune Estun servo following-error parameter from the
+   controller side.
+
+Memory `cobot-jsb-j1-j6-convention-drift.md` updated to RESOLVED
+with the parser-bug diagnosis + correct parser + guard rails.
+
+## Section 680: what stands vs what needs another day
+
+**Stands (signed off this session):**
+
+- F2.7 executor + dashboard bridge + systemd drop-in (add-54).
+- 5 dry-pass bug fixes from §675.
+- Frame-coherence pre-flight gate + per-step cross-check.
+- JTC Humble quirk workaround.
+- 4 agent charters + hooks (goal-auditor, enforcement-reviewer,
+  session-close-auditor, arm-preflight).
+- First real Pilz-planned joint motion on S10-140 via ROS2
+  executor pipeline (attempt 4/5 step 0).
+
+**Deferred (next session):**
+
+- cri_hardware `pos_cmd_sent_` cross-trajectory state behavior
+  (blocks completing longer Test100 steps like move_l with
+  significant joint travel).
+- Full 8-step Test100 cycle end-to-end.
