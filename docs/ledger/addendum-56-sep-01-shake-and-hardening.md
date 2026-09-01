@@ -141,3 +141,77 @@ here address. Operator has this on their list to inspect.
 Recovery sequence (any re-enable + real fire) is a separate operator
 decision after they read this report.
 
+
+## Section 686: self-disable class — CLOSED at hardware 2026-09-01
+
+Hardware conviction test executed post-batch. Setup:
+
+- Off-arm hardening batch landed (cri_hardware sha 75ff3f9).
+- 10 Hz continuous watch of ws://192.168.2.136:9000
+  `publish/RobotStatus`: state, stateName, mode, isMoving,
+  recoveryState, errors, statusFlag, safetyMode (+ any field with
+  a transition). Timer fields runDuration/totalTime filtered as
+  noise.
+- Operator enabled arm at pendant, let it sit IDLE. No motion
+  commanded from any client. `/task/run_program` never fired.
+
+**Phase 1 result — 5 min continuous idle baseline: PASS.**
+Ten 30 s heartbeats, ZERO state transitions. `state=2 Enabled`
+held stable untouched. That killed the "spontaneous cabinet-side
+timer/watchdog dropping state on idle" hypothesis.
+
+**Phase 2 result — deliberate physical manipulation: CONVICTED.**
+Operator wiggled/flexed the operator-station e-stop cable and
+press-released the button deliberately. Wiggling alone produced
+NO wire transitions. The deliberate button press-release produced
+the expected `state 2 → 0` at 10:21:52.201 (silent — no errors[]
+bump, no rs change, only the state pair flipped).
+
+**Root cause:** loose safety-chain connection at the operator-
+station e-stop wiring. Symptom pattern that misled earlier
+sessions:
+
+- `Robot/switchOn` from the WS API is accepted (arm goes state=2
+  briefly), then the loose contact intermittently opens the
+  safety chain, controller reads chain-open, sets state=0.
+- Because it happened between switchOn accept and
+  CRI/StartControl send in the 2026-09-01 CRI relaunch sequence,
+  StartControl was rejected with `"err":"100/Robot is not enabled."`,
+  which cri_tcp_setup was silently declaring "全部 5 步 TCP
+  初始化成功" on (Fix 4 above addresses that failure class).
+- `errors[]` remained null through the whole event because the
+  controller treats the safety-chain-open transition as a
+  disable command, not a fault.
+
+**Convicted-and-cleared 2026-09-01.** Operator reseated the
+connector. Follow-on capture in the same session showed no
+spontaneous transitions across the 5 min extended baseline.
+
+**Synapse BOM note (for the operator-station harness update):**
+
+- Strain relief on the e-stop cable at the enclosure gland.
+- Positive-lock connector (screw-clamp or Push-in) on the
+  operator-station side, replacing whatever intermittent contact
+  was seated there previously.
+
+**Consequence for the fix batch:** the batch's Fix 4
+(`cri_tcp_setup` err propagation) still stands — even with the
+hardware fix, we don't want another "silent StartControl reject"
+class to disappear into a false-positive banner if any future
+condition rejects it. That gate stays.
+
+**Consequence for the shake attribution (Q3):** the self-disable
+transient during 2026-09-01 CRI relaunch (state 2→0 in 200ms after
+switchOn) was the loose-connector event. That was the co-suspect
+alongside the buggy add-55 §681 traj-start reset. Both mechanisms
+are now killed:
+
+- Buggy traj-start reset → rewritten (Fix 1).
+- Self-disable trigger → hardware reseated (this section).
+
+Joint-velocity trace still missing (no rosbag ran at shake
+window); alone-vs-contributor attribution between the two
+mechanisms still not independently proven. But BOTH have been
+removed from the system. That's the operationally load-bearing
+answer.
+
