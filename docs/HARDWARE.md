@@ -440,6 +440,108 @@ Under `/etc/systemd/system/`:
   appendix before writing new ladder branches. Reference:
   CC10-A software manual, appendix (section-number TBD).
 
+## Modbus TCP remote-control map (Estun Remote Control Manual v2.0)
+
+**Provenance:** transcribed 2026-09-02 from
+`docs/manuals/remote_control_v2.pdf` (机器人远程控制 v2.0,
+10 pp, WPS-authored 2026-07-22, `webotl`). Every row below
+is verified against the source PDF §3.1 (pages 6–7). Do NOT
+overwrite this table from dictation — re-open the PDF and
+diff against §3.1 if a re-verification is needed.
+
+**Wire:** Modbus TCP slave at `192.168.2.136:502`
+(HARDWARE.md > Network — enabled since add-12). Unit-ID and
+function-code choices (03/06/16 vs 01/05/15) not specified
+in the manual for the 1000-series addresses; the manual
+uses generic "地址" (address) and the trigger semantics
+"监测状态：0-1 变化生效" ("monitor state: 0-1 rising edge
+takes effect"). 42000/42001 are explicitly holding
+registers (UInt16 rw); the 1000-series is empirically-TBD
+coil-vs-holding-reg — probe with FC03 first and FC01 as
+fallback before writing.
+
+**Preconditions the manual does not spell out but implies:**
+- Arm must be in **Remote mode** (status reg 2015 = 1). The
+  factory UI's top bar has 手动 / 自动 / 远程 buttons;
+  bound-DI or WS toggle can drive the transition. Auto-only
+  (2014=1, 2015=0) is NOT sufficient — this map is under
+  the "远程模式" heading of the top bar, not Auto.
+- Arm must be enabled (2003=1) before `1000 启动工程` will
+  actually start motion. The manual's §1 时序图 shows 使能
+  latched high before 开始信号 rises.
+
+### §3.1.1 System control inputs (address 1000+, rising-edge)
+
+| Address | Function (CN → EN)          | Notes |
+|---------|------------------------------|-------|
+| 1000    | 启动工程 (start project)     | rising 0→1 triggers |
+| 1001    | 停止工程 (stop project)      | rising 0→1 triggers |
+| 1002    | 暂停工程 (pause project)     | rising 0→1 triggers |
+| 1003    | 上使能 (servo on / enable)   | rising 0→1 triggers |
+| 1004    | 下使能 (servo off / disable) | rising 0→1 triggers |
+| 1005    | 清除报警 (clear alarms)      | rising 0→1 triggers |
+| 1006    | 开始拖动 (start drag)        | rising 0→1 triggers |
+| 1007    | 停止拖动 (stop drag)         | rising 0→1 triggers |
+| 1008    | 切自动 (switch to Auto)      | rising 0→1 triggers |
+| 1009    | 切手动 (switch to Manual) [manual prints "切收动" — typo] | rising 0→1 triggers |
+| 1010    | 下发自动速率 (apply auto rate)   | rising edge; latches value pre-written to 42001 |
+| 1011    | 下发手动速率 (apply manual rate) | rising edge; latches value pre-written to 42001 |
+| 42000   | `startProjectNumber` (project-map index) | UInt16 rw. **Requires the index to be pre-bound in `配置→IO→工程映射`; if the slot is empty, `1000 启动工程` is a no-op** (per §2.2.1 note). |
+| 42001   | 设置手/自动速率 (set manual/auto rate) | UInt16 rw, value 1–100 (%). Write value THEN pulse 1010 or 1011 to apply. |
+
+### §3.1.2 System status outputs (address 2000+, level)
+
+| Address | Function (CN → EN)          | Semantics |
+|---------|------------------------------|-----------|
+| 2000 | 运行状态 (running)           | 1 while program is executing |
+| 2001 | 停止状态 (stopped)           | 1 while program is stopped |
+| 2002 | 暂停状态 (paused)            | 1 while program is paused |
+| 2003 | 上使能状态 (enabled)         | 1 while servos on |
+| 2004 | 下使能状态 (disabled)        | 1 while servos off |
+| 2005 | 手动模式 (Manual mode)       | 1 in Manual |
+| 2006 | 拖动模式 (Drag mode)         | 1 in drag/teach |
+| 2007 | 运动中状态 (in motion)       | 1 whenever arm is physically moving (mode-agnostic) |
+| 2008 | 碰撞状态 (collision)         | 1 after collision detected |
+| 2009 | 在安全点状态 (at safe point) | 1 at safe point, 0 otherwise |
+| 2010 | 报警状态 (alarm)             | 1 when an alarm is latched (semantics of 0/1 explicit in manual only for the "1" case) |
+| 2011 | 仿真模式状态 (simulation)    | 1 in Simulation mode |
+| 2012 | 急停按下状态 (E-stop pressed) | 1 while pendant E-stop is depressed |
+| 2013 | 救援模式状态 (rescue mode)   | 1 while in rescue mode |
+| 2014 | 自动模式状态 (Auto mode)     | 1 in Auto |
+| 2015 | 远程模式状态 (Remote mode)   | 1 in Remote (required for this map to take effect) |
+| 45000 | 自动运行速率反馈 (live speed) | UInt16 read, 1–100 (%) |
+
+### §2 工程映射 (project-mapping) — controller-resident selector
+
+Location in factory UI: **配置 → IO → 工程映射** (Configuration → IO → Project Map). Rows carry
+`(索引, 工程)` — index 0..N mapped to an already-existing
+controller project by name. Screenshot in the manual shows
+indices 0–3 bound to `测试0..测试3` with additional empty slots.
+
+The table is a **selector**, not an uploader. It binds
+already-controller-resident projects to numbered slots so
+that external Modbus (`42000`) or IO ("运行程序" alias)
+signals can *choose which pre-existing project runs* by ID.
+The manual's §2.2.1 note is explicit: *"运行程序" 配置，需
+绑定默认程序，如果没有在"工程映射"内绑定程序，下发"运行程
+序"信号，程序是不会启动的* → "Run program" needs a default
+program bound; if no program has been bound in project-map,
+sending "Run program" will NOT start anything. Nothing in the
+Remote Control Manual describes a program-upload mechanism —
+programs must first exist on the controller via the
+teach-pendant / factory-UI 编程 tab (or via the existing
+Lua-codegen push path we already have).
+
+### §3.2 PN/EIP slave (out of scope for the Jetson today)
+
+Manual §3.2 also documents PROFINET / EtherNet-IP with the
+same semantic signal set packed into `controlFlags1/2`
+(bytes 18–19) and `statusFlags1/2` (bytes 56–57) plus
+`autoMoveRateValue` (UInt16 at 58–59). Not needed for our
+Modbus TCP integration — captured for completeness in the
+PDF; do NOT transcribe until a PN/EIP integration is
+actually chosen.
+
 ## Cabinet power controls — ON/OFF rocker vs POWER key (2026-08-31 manual absorb)
 
 There are TWO controls on the CC10-A cabinet that look like
