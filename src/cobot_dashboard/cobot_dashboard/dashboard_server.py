@@ -6663,6 +6663,25 @@ if FASTAPI_AVAILABLE:
             body = await request.json()
         except Exception:
             body = {}
+
+        # The driver's save_event.steps interleaves real HTTP POSTs
+        # (source / varspoint / project / projectlist — http_status=200
+        # on success) with local CHECK gates (lua_syntax_gate,
+        # lua_semantic_roundtrip — http_status=0, code=909 on success,
+        # code='syntax_error'/'semantic_roundtrip_error' on failure).
+        # The prior classifier's `all(http_status == 200)` reads the
+        # passing CHECKs as failed → every Change Program push falsely
+        # classified as save_failed. Widen: pass on HTTP-200, OR on
+        # CHECK with code==909.
+        def _save_step_ok(s):
+            if s.get("http_status") == 200:
+                return True
+            if (s.get("method") == "CHECK"
+                    and s.get("http_status") == 0
+                    and s.get("code") == 909):
+                return True
+            return False
+
         # JOG-11 arbiter: refuse if a jog session is active. Fires
         # BEFORE program_id validation so the operator sees the jog
         # conflict rather than a generic 400.
@@ -7130,10 +7149,10 @@ if FASTAPI_AVAILABLE:
                     "error": reason,
                     "outcome": outcome,
                 }, status_code=400)
-            if save_event and all(s.get("http_status") == 200
+            if save_event and all(_save_step_ok(s)
                                   for s in save_event.get("steps", [])):
                 break
-        if not (save_event and all(s.get("http_status") == 200
+        if not (save_event and all(_save_step_ok(s)
                                    for s in save_event.get("steps", []))):
             # Final drain (2026-08-28): the inner loop can time out
             # a hair before the driver's reject event lands in
@@ -7175,10 +7194,18 @@ if FASTAPI_AVAILABLE:
             # for something the wire actually told us about.
             step_reason = None
             for step in (save_event or {}).get("steps", []):
-                if step.get("http_status") != 200:
+                if not _save_step_ok(step):
+                    # For failed CHECK steps the reason lives in
+                    # `code` (e.g. 'syntax_error') + `body_head`; for
+                    # failed POSTs it may live in `reason`/`error`/`body`.
+                    code = step.get("code")
+                    check_reason = (code if isinstance(code, str) and code != "909"
+                                    else None)
                     step_reason = (step.get("reason")
                                    or step.get("error")
-                                   or step.get("body"))
+                                   or step.get("body")
+                                   or check_reason
+                                   or step.get("body_head"))
                     if step_reason:
                         break
             if step_reason:
@@ -7337,7 +7364,7 @@ if FASTAPI_AVAILABLE:
             # program_state != 0 (2 or 3) or when we've exhausted the
             # window and see no rejection.
             save = prog_state.get("last_save")
-            if save and any(s.get("http_status") != 200 for s in save.get("steps", [])):
+            if save and any(not _save_step_ok(s) for s in save.get("steps", [])):
                 outcome = {"kind": "save_failed", "save": save}
                 break
         if outcome is None:
