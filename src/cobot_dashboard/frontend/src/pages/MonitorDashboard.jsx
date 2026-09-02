@@ -1072,27 +1072,22 @@ export default function MonitorDashboard() {
             <StepPreviewPanel />
           </div>
 
-          {/* Speed entry — editable integer % (1-100). 2026-08-31
-              directive: full range, no UI cap; controller-side
-              operator_speed_limit is the true ceiling (server
-              refuses via namedSpeedRefusal when exceeded). Value
-              auto-persists per-program (see setRunSpeedPct). */}
+          {/* Speed entry — ONE control for both pre-run and mid-run
+              (2026-09-02 operator directive). Idle: setting the value
+              persists for the next run. Running: setting the value
+              also publishes to /api/estun/program/speed for a live
+              update (setAutoMoveRate on the wire), and surfaces the
+              high-speed confirm modal on 409. Full range 1-100;
+              controller-side operator_speed_limit is the true ceiling
+              (server refuses via namedSpeedRefusal when exceeded). */}
           <ProgramSpeedEntry
             value={runSpeedPct}
             setValue={setRunSpeedPct}
+            isRunning={isRunning}
+            robot={robot}
+            addToast={addToast}
           />
 
-          {/* Mid-run speed control — only appears while a program is
-              actively running. Publishes /api/estun/program/speed
-              which clamps via operator_speed_limit and requires an
-              explicit confirm for INCREASES above
-              high_speed_confirm_threshold_pct (default 40). */}
-          {isRunning && (
-            <MidRunSpeedControl
-              robot={robot}
-              addToast={addToast}
-            />
-          )}
 
           {/* Recovery banner — appears when the controller has been
               STOPPING (state=3) for more than 3s. Offers Force stop
@@ -1660,91 +1655,43 @@ async function forceReset({ addToast }) {
 // `useStore.setRunSpeedPct` for the debounced PUT wiring). New /
 // never-run programs default to 25% (F2.7 first-run rule is now
 // satisfied as a default, not a hard cap).
-function ProgramSpeedEntry({ value, setValue }) {
+// Single speed control — pre-run AND mid-run (2026-09-02 unified).
+// - Idle: commit updates the store's runSpeedPct (per-program persist).
+// - Running: commit ALSO POSTs /api/estun/program/speed to update the
+//   live run rate (setAutoMoveRate on the wire). 409 → high-speed
+//   confirm modal; other refusals → toast via namedSpeedRefusal.
+function ProgramSpeedEntry({ value, setValue, isRunning, robot, addToast }) {
   const [local, setLocal] = useState(String(value))
+  const [busy, setBusy]   = useState(false)
+  const [pending, setPending] = useState(null)   // {pct, threshold} on 409
 
   useEffect(() => {
     if (String(value) !== local) setLocal(String(value))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value])
 
-  const commit = () => {
-    const applied = setValue(local)
-    setLocal(String(applied))
-  }
-  return (
-    <div style={{
-      display: 'flex', alignItems: 'center', gap: 10,
-      marginTop: 12,
-    }}>
-      <label style={{
-        fontSize: 12, color: '#6b7280',
-        fontWeight: 600, textTransform: 'uppercase',
-        letterSpacing: '0.05em',
-      }}>
-        Speed
-      </label>
-      <input
-        data-testid="program-speed-input"
-        type="number"
-        min={1}
-        max={100}
-        step={1}
-        value={local}
-        onChange={(e) => setLocal(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commit() } }}
-        style={{
-          width: 72, padding: '6px 10px',
-          fontSize: 15, fontWeight: 600,
-          border: '1px solid #d1d5db', borderRadius: 8,
-          textAlign: 'right',
-        }}
-      />
-      <span style={{ fontSize: 13, color: '#6b7280' }}>%</span>
-    </div>
-  )
-}
-
-// Mid-run auto-mode speed adjustment. Only rendered while
-// deriveRunState says the program is running; posts to
-// /api/estun/program/speed which returns 409 with
-// {needs_confirm:true} when the requested increase exceeds the
-// driver's high_speed_confirm_threshold_pct. On 409 we show the
-// strong "High speed" confirm modal; on OK the local input updates
-// to the effective (possibly-capped) value.
-function MidRunSpeedControl({ robot, addToast }) {
-  const capFrac = Number.isFinite(robot?.operator_speed_limit) ? robot.operator_speed_limit : 0.25
+  const capFrac = Number.isFinite(robot?.operator_speed_limit)
+    ? robot.operator_speed_limit : 0.25
   const capPct  = Math.max(1, Math.min(100, Math.round(capFrac * 100)))
   const threshold = Number.isFinite(robot?.high_speed_confirm_threshold_pct)
-    ? robot.high_speed_confirm_threshold_pct
-    : 40
-  const [input, setInput] = useState(String(Math.min(capPct, 10)))
-  const [busy, setBusy]   = useState(false)
-  const [pending, setPending] = useState(null)   // {pct, threshold} on 409
+    ? robot.high_speed_confirm_threshold_pct : 40
 
-  async function submit(pct, confirmed) {
+  async function pushMidRun(pct, confirmed) {
     setBusy(true)
     try {
       const res = await fetch('/api/estun/program/speed', {
-        method: 'POST',
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pct, confirmed_high_speed: !!confirmed }),
+        body:    JSON.stringify({ pct, confirmed_high_speed: !!confirmed }),
       })
-      const body = await res.json()
+      const body = await res.json().catch(() => ({}))
       if (res.status === 409 && body?.needs_confirm) {
         setPending({ pct: body.effective_pct, threshold: body.threshold_pct })
         return
       }
       if (!res.ok || !body?.ok) {
-        // 2026-08-05 (operator_refusal_copy fork registry): the
-        // /api/estun/program/speed refusal body carries a top-
-        // level `reason` (not outcome.kind), so we use the
-        // dedicated namedSpeedRefusal helper. Toast renders
-        // structured title/detail/technicalDetail like every
-        // other refusal surface.
         const named = namedSpeedRefusal(body || {}, res.status)
-        addToast({
+        addToast?.({
           title:           named.title,
           detail:          named.detail,
           technicalDetail: named.technicalDetail,
@@ -1753,68 +1700,68 @@ function MidRunSpeedControl({ robot, addToast }) {
         return
       }
       const applied = body.effective_pct
-      setInput(String(applied))
-      addToast(
+      setLocal(String(applied))
+      setValue(String(applied))   // keep store in sync with wire truth
+      addToast?.(
         body.capped
-          ? `Program speed set to ${applied}% (capped from ${pct}%)`
-          : `Program speed set to ${applied}%`,
-        'info',
-      )
+          ? `Speed set to ${applied}% (capped from ${pct}%)`
+          : `Speed set to ${applied}%`,
+        'info')
       setPending(null)
     } catch (e) {
-      addToast(`Speed change failed: ${e}`, 'error')
+      addToast?.(`Speed change failed: ${e}`, 'error')
     } finally {
       setBusy(false)
     }
   }
 
-  function onApply() {
-    const n = Number(input)
+  const commit = () => {
+    const n = Number(local)
     if (!Number.isFinite(n) || n < 1) {
-      addToast('Speed must be an integer 1..100', 'warning'); return
+      addToast?.('Speed must be an integer 1..100', 'warning')
+      return
     }
-    submit(Math.round(n), false)
+    const applied = setValue(local)
+    setLocal(String(applied))
+    if (isRunning) pushMidRun(Math.round(Number(applied)), false)
   }
-
   return (
     <>
       <div style={{
         display: 'flex', alignItems: 'center', gap: 10,
-        marginTop: 8, padding: '8px 12px',
-        background: '#FFFBEB', border: '1px solid #F59E0B',
-        borderRadius: 8,
+        marginTop: 12,
       }}>
-        <span style={{
-          fontSize: 12, color: '#92400E', fontWeight: 700,
-          textTransform: 'uppercase', letterSpacing: '0.05em',
+        <label style={{
+          fontSize: 12, color: '#6b7280',
+          fontWeight: 600, textTransform: 'uppercase',
+          letterSpacing: '0.05em',
         }}>
-          Mid-run speed
-        </span>
+          Speed
+        </label>
         <input
-          type="number" min={1} max={100} step={1}
-          value={input}
+          data-testid="program-speed-input"
+          type="number"
+          min={1}
+          max={100}
+          step={1}
+          value={local}
           disabled={busy}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); onApply() } }}
+          onChange={(e) => setLocal(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commit() } }}
           style={{
-            width: 72, padding: '6px 10px', fontSize: 15, fontWeight: 600,
-            border: '1px solid #d1d5db', borderRadius: 8, textAlign: 'right',
+            width: 72, padding: '6px 10px',
+            fontSize: 15, fontWeight: 600,
+            border: '1px solid #d1d5db', borderRadius: 8,
+            textAlign: 'right',
           }}
         />
-        <span style={{ fontSize: 13, color: '#92400E' }}>%</span>
-        <button
-          onClick={onApply}
-          disabled={busy}
-          style={{
-            padding: '6px 14px', fontSize: 14, fontWeight: 600,
-            background: busy ? '#9CA3AF' : '#B45309', color: '#fff',
-            border: 'none', borderRadius: 6, cursor: busy ? 'wait' : 'pointer',
-          }}>
-          Apply
-        </button>
-        <span style={{ marginLeft: 'auto', fontSize: 13, color: '#92400E' }}>
-          cap {capPct}% · high-speed confirm above {threshold}%
-        </span>
+        <span style={{ fontSize: 13, color: '#6b7280' }}>%</span>
+        {isRunning && (
+          <span style={{ marginLeft: 6, fontSize: 12, color: '#92400E' }}>
+            live · cap {capPct}% · confirm above {threshold}%
+          </span>
+        )}
       </div>
 
       {pending && (
@@ -1823,7 +1770,7 @@ function MidRunSpeedControl({ robot, addToast }) {
           threshold={pending.threshold}
           cap={capPct}
           onCancel={() => setPending(null)}
-          onConfirm={() => submit(pending.pct, true)}
+          onConfirm={() => pushMidRun(pending.pct, true)}
         />
       )}
     </>
