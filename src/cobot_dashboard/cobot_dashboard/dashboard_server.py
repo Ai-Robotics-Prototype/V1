@@ -7327,21 +7327,14 @@ if FASTAPI_AVAILABLE:
                     "stored_lua_sha12": stored_sha[:12],
                     "effective_pct": int(eff_pct)}
 
-        # 2026-09-02 (per operator directive): sending Robot/toAuto
-        # while the controller is in Remote mode (code 2) flips the
-        # factory selector to Auto, which EXITS Remote and kills the
-        # external command channel — a self-defeating sequence. In
-        # Remote, project/run works without a mode transition. Detect
-        # the current mode and skip the toAuto publish under Remote;
-        # log the wire-truthful branch we took so a review-later reader
-        # sees why toAuto was or wasn't sent.
-        with _state_lock:
-            _mode_code_pre_run = (STATE.get("robot", {}) or {}).get(
-                "robot_mode_code")
-        _in_remote = (_mode_code_pre_run == 2)
+        # 2026-09-02 (per operator directive, wire-proven): the Run flow
+        # is push-program → project/run → poll ProjectState. NO mode
+        # switch, NO DI16 check, NO orchestration. Wire evidence: bare
+        # {ty:"project/run",db:{id,task}} in Manual mode is accepted by
+        # the controller (verb ack + ProjectState.state=2 transition,
+        # no errors). set_auto_rate/set_breakpoint/clear_start_line are
+        # preserved as program-configuration verbs (not mode switches).
         try:
-            if not _in_remote:
-                _ros_node._estun_publish_op("to_auto")
             # at_run_start bypasses the driver's mid-run high-speed
             # confirm requirement — the Run modal already ran the
             # operator through its own confirm before this op fired.
@@ -7353,8 +7346,7 @@ if FASTAPI_AVAILABLE:
             _ros_node._estun_publish_op(
                 "run", program_id=prog_id, task_id=task_id)
             print(f'[run] published: prog_id={prog_id!r} task={task_id!r} '
-                  f'mode_code={_mode_code_pre_run} in_remote={_in_remote} '
-                  f'skipped_to_auto={_in_remote}',
+                  f'eff_pct={eff_pct} (no mode switch)',
                   flush=True)
         except Exception as e:
             return JSONResponse({"error": f"publish run: {e}"}, status_code=500)
@@ -7656,19 +7648,14 @@ if FASTAPI_AVAILABLE:
                 "outcome": {"kind": "ros_down"},
             }, status_code=503)
 
-        # save → [to_auto if not Remote] → set_auto_rate → set_breakpoint
-        # → clear_start_line → run. Byte-verify is skipped (~4s of latency
-        # vs a one-step program that codegen produces deterministically);
-        # the driver's own save-event stream still surfaces failures via
+        # save → set_auto_rate → set_breakpoint → clear_start_line → run.
+        # Byte-verify is skipped (~4s of latency vs a one-step program
+        # that codegen produces deterministically); the driver's own
+        # save-event stream still surfaces failures via
         # STATE.robot.rejected.
         #
-        # 2026-09-02: skip toAuto under Remote mode — same rationale as
-        # /api/estun/program/run: Robot/toAuto exits Remote and kills the
-        # external command channel.
-        with _state_lock:
-            _mode_code_pre_home = (STATE.get("robot", {}) or {}).get(
-                "robot_mode_code")
-        _in_remote_home = (_mode_code_pre_home == 2)
+        # 2026-09-02: NO mode switch. project/run is accepted from
+        # any mode on the wire (Manual proven, Remote proven prior).
         try:
             _ros_node._estun_publish_op(
                 "save",
@@ -7676,8 +7663,6 @@ if FASTAPI_AVAILABLE:
                 name="Return Home", task_name="main",
                 points=points, lua_source=lua)
             await asyncio.sleep(0.4)   # let the save complete
-            if not _in_remote_home:
-                _ros_node._estun_publish_op("to_auto")
             _ros_node._estun_publish_op(
                 "set_auto_rate", pct=int(eff_pct), at_run_start=True)
             _ros_node._estun_publish_op(
@@ -7685,9 +7670,7 @@ if FASTAPI_AVAILABLE:
             _ros_node._estun_publish_op("clear_start_line")
             _ros_node._estun_publish_op(
                 "run", program_id=_HOME_PROG_ID, task_id=_HOME_TASK_ID)
-            print(f'[home] published: mode_code={_mode_code_pre_home} '
-                  f'in_remote={_in_remote_home} '
-                  f'skipped_to_auto={_in_remote_home}',
+            print(f'[home] published: eff_pct={eff_pct} (no mode switch)',
                   flush=True)
         except Exception as e:
             return JSONResponse({
