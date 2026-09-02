@@ -4,11 +4,11 @@
     "kind": "un_encoded_historical",
     "verb": "movJ",
     "input_lua": null,
-    "note": "Palletize IK-failure \u2014 codegen emits transit_over_slot at [0,0,0] which is unreachable @ Z=273.2mm, then still emits partial movJ(p4). No wire-captured Lua string; recovery requires running the pallet expansion path with a specific tray/pallet fixture.",
+    "note": "Palletize IK-failure \u2014 codegen emits transit_over_slot at [0,0,0] which is unreachable @ Z=273.2mm. As of 2026-09-02: TWO matchers now cover this class: (a) reachability check on every varspoint jp against S10-140 joint limits (J1/2/4/5/6=\u00b1200\u00b0, J3=\u00b1166\u00b0), and (b) codegen-time refusal marker detection (`-- PALLET IK FAILED:` / `-- REFUSED 'move_to_pallet':`) surfaced as `pallet_ik_refused` finding. holepartpalletize + pallettest on the wire (2026-09-02 sweep) both fire this finding cleanly.",
     "expected": "reject",
-    "reject_reason": "requires_ik_precheck_matcher",
-    "stage": "semantic_round_trip_queue",
-    "origin": "hand-entry | docs/ledger/addendum-52-*.md \u00a7644 (grep-verified) | LESSONS.md L311 | matcher NOT YET encoded"
+    "reject_reason": "pallet_ik_refused",
+    "stage": "semantic_round_trip",
+    "origin": "hand-entry | docs/ledger/addendum-52-*.md \u00a7644 (grep-verified) | LESSONS.md L311 | encoded 2026-09-02 via lua_semantic_roundtrip._PALLET_IK_FAIL_RE + _check_reachability"
   },
   {
     "name": "multi-pair-role-map-anchor-mixup",
@@ -30,7 +30,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "bare",
-    "origin": "program_ops.py:978",
+    "origin": "program_ops.py:1011",
     "kind": "auto_derived"
   },
   {
@@ -42,7 +42,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "bare",
-    "origin": "program_ops.py:978",
+    "origin": "program_ops.py:1011",
     "kind": "auto_derived"
   },
   {
@@ -54,7 +54,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "bare",
-    "origin": "program_ops.py:978",
+    "origin": "program_ops.py:1011",
     "kind": "auto_derived"
   },
   {
@@ -66,7 +66,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:978",
+    "origin": "program_ops.py:1011",
     "kind": "auto_derived"
   },
   {
@@ -78,7 +78,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "D14 arity",
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -90,7 +90,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -102,7 +102,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "D14 arity",
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -114,7 +114,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -126,7 +126,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "D14 arity",
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -138,7 +138,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -150,7 +150,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "D14 arity",
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -162,7 +162,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -174,7 +174,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "D14 arity",
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -186,7 +186,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -198,7 +198,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "D14 arity",
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -210,7 +210,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -222,7 +222,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "D14 arity",
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -234,7 +234,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -246,7 +246,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "D14 arity",
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -258,7 +258,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -270,7 +270,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "D14 arity",
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -282,7 +282,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -293,7 +293,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1065 [D14]",
+    "origin": "program_ops.py:1098 [D14]",
     "kind": "auto_derived"
   },
   {
@@ -304,7 +304,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "> 0",
-    "origin": "program_ops.py:1129",
+    "origin": "program_ops.py:1162",
     "kind": "auto_derived"
   },
   {
@@ -315,7 +315,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "> 0",
-    "origin": "program_ops.py:1129",
+    "origin": "program_ops.py:1162",
     "kind": "auto_derived"
   },
   {
@@ -326,7 +326,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "INTEGER",
-    "origin": "program_ops.py:1129",
+    "origin": "program_ops.py:1162",
     "kind": "auto_derived"
   },
   {
@@ -337,7 +337,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "positive",
-    "origin": "program_ops.py:1129",
+    "origin": "program_ops.py:1162",
     "kind": "auto_derived"
   },
   {
@@ -348,7 +348,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1129",
+    "origin": "program_ops.py:1162",
     "kind": "auto_derived"
   },
   {
@@ -359,7 +359,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1129",
+    "origin": "program_ops.py:1162",
     "kind": "auto_derived"
   },
   {
@@ -371,7 +371,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "outside",
-    "origin": "program_ops.py:1169",
+    "origin": "program_ops.py:1202",
     "kind": "auto_derived"
   },
   {
@@ -383,7 +383,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "outside",
-    "origin": "program_ops.py:1169",
+    "origin": "program_ops.py:1202",
     "kind": "auto_derived"
   },
   {
@@ -395,7 +395,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "must be 0 or 1",
-    "origin": "program_ops.py:1169",
+    "origin": "program_ops.py:1202",
     "kind": "auto_derived"
   },
   {
@@ -407,7 +407,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1169",
+    "origin": "program_ops.py:1202",
     "kind": "auto_derived"
   },
   {
@@ -419,7 +419,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1169",
+    "origin": "program_ops.py:1202",
     "kind": "auto_derived"
   },
   {
@@ -431,7 +431,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "outside",
-    "origin": "program_ops.py:1195",
+    "origin": "program_ops.py:1228",
     "kind": "auto_derived"
   },
   {
@@ -443,7 +443,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "outside",
-    "origin": "program_ops.py:1195",
+    "origin": "program_ops.py:1228",
     "kind": "auto_derived"
   },
   {
@@ -455,7 +455,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "sane range",
-    "origin": "program_ops.py:1195",
+    "origin": "program_ops.py:1228",
     "kind": "auto_derived"
   },
   {
@@ -467,7 +467,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "sane range",
-    "origin": "program_ops.py:1195",
+    "origin": "program_ops.py:1228",
     "kind": "auto_derived"
   },
   {
@@ -479,7 +479,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1195",
+    "origin": "program_ops.py:1228",
     "kind": "auto_derived"
   },
   {
@@ -490,7 +490,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "> 0",
-    "origin": "program_ops.py:1220",
+    "origin": "program_ops.py:1253",
     "kind": "auto_derived"
   },
   {
@@ -501,7 +501,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "> 0",
-    "origin": "program_ops.py:1220",
+    "origin": "program_ops.py:1253",
     "kind": "auto_derived"
   },
   {
@@ -512,7 +512,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "wire-proven ceiling",
-    "origin": "program_ops.py:1220",
+    "origin": "program_ops.py:1253",
     "kind": "auto_derived"
   },
   {
@@ -523,7 +523,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1220",
+    "origin": "program_ops.py:1253",
     "kind": "auto_derived"
   },
   {
@@ -534,7 +534,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1220",
+    "origin": "program_ops.py:1253",
     "kind": "auto_derived"
   },
   {
@@ -545,7 +545,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "> 0",
-    "origin": "program_ops.py:1244",
+    "origin": "program_ops.py:1277",
     "kind": "auto_derived"
   },
   {
@@ -556,7 +556,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "wire-proven ceiling",
-    "origin": "program_ops.py:1244",
+    "origin": "program_ops.py:1277",
     "kind": "auto_derived"
   },
   {
@@ -567,7 +567,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1244",
+    "origin": "program_ops.py:1277",
     "kind": "auto_derived"
   },
   {
@@ -578,7 +578,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1244",
+    "origin": "program_ops.py:1277",
     "kind": "auto_derived"
   },
   {
@@ -589,7 +589,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "> 0",
-    "origin": "program_ops.py:1268",
+    "origin": "program_ops.py:1301",
     "kind": "auto_derived"
   },
   {
@@ -600,7 +600,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "> 0",
-    "origin": "program_ops.py:1268",
+    "origin": "program_ops.py:1301",
     "kind": "auto_derived"
   },
   {
@@ -611,7 +611,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1268",
+    "origin": "program_ops.py:1301",
     "kind": "auto_derived"
   },
   {
@@ -622,7 +622,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "D15",
-    "origin": "program_ops.py:1297",
+    "origin": "program_ops.py:1330",
     "kind": "auto_derived"
   },
   {
@@ -633,7 +633,7 @@
     ],
     "expected": "reject",
     "reject_reason_substr": "positive",
-    "origin": "program_ops.py:1297",
+    "origin": "program_ops.py:1330",
     "kind": "auto_derived"
   },
   {
@@ -644,7 +644,7 @@
     ],
     "expected": "accept",
     "reject_reason_substr": null,
-    "origin": "program_ops.py:1297",
+    "origin": "program_ops.py:1330",
     "kind": "auto_derived"
   }
 ]

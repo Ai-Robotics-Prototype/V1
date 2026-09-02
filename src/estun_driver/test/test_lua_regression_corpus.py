@@ -60,10 +60,17 @@ def test_corpus_entry(entry):
 def test_hand_queued_present():
     """Un-encoded historical incidents MUST remain in the corpus as
     a visible queue for future matcher additions. This test fails
-    loud if someone deletes them without landing the matcher."""
+    loud if someone deletes them without landing the matcher.
+
+    An entry can be in one of two states:
+      - stage='semantic_round_trip_queue'  — matcher NOT yet encoded
+      - stage='semantic_round_trip'        — matcher encoded, entry
+        preserved for provenance/audit trail
+    """
     names = {e["name"] for e in HAND_QUEUED}
     assert "palletize-transit-over-slot-unreachable" in names
     assert "multi-pair-role-map-anchor-mixup" in names
     for e in HAND_QUEUED:
-        assert e["stage"] == "semantic_round_trip_queue"
+        assert e["stage"] in ("semantic_round_trip_queue",
+                              "semantic_round_trip")
         assert "grep-verified" in e["origin"]

@@ -185,6 +185,60 @@ def test_taught_program_step_count_mismatch_detected():
 
 
 # ─────────────────────────────────────────────────────────────
+# G1: legacy line_map → UNVERIFIABLE not CAUGHT
+# ─────────────────────────────────────────────────────────────
+
+def test_legacy_program_flagged_unverifiable_not_caught():
+    """A program with no `-- line_map` trailer is pre-D9 legacy;
+    sweep must classify UNVERIFIABLE, not CAUGHT. Reachability
+    still runs (§644 doesn't depend on D9)."""
+    legacy_lua = "movJ(p1)\nmovL(p2)\n"  # no trailer
+    r = check_consistency(legacy_lua, _VARSPOINT)
+    assert r.legacy_no_line_map is True
+    assert r.verifiable is False
+    # No line_map-dependent findings on this legacy program
+    step_dependent = {"step_drop", "reorder", "verb_substitution",
+                     "anchor_mixup", "point_substitution",
+                     "unknown_action"}
+    assert not any(f.kind in step_dependent for f in r.findings), r.findings
+
+
+# ─────────────────────────────────────────────────────────────
+# Reachability matcher (§644 IK-unreachable class)
+# ─────────────────────────────────────────────────────────────
+
+def test_reachability_clean_varspoint_ok():
+    """Real test100 varspoint has every jp within limits — must
+    produce zero unreachable_joint_limit findings."""
+    r = check_consistency(_LUA, _VARSPOINT)
+    assert not any(f.kind == "unreachable_joint_limit" for f in r.findings), r.findings
+
+
+def test_reachability_j3_exceeded():
+    """Mutate p1's jp[2] to +180° (outside J3 soft limit ±166°) —
+    matcher must fire the §644-class unreachable_joint_limit
+    finding."""
+    vp = copy.deepcopy(_VARSPOINT)
+    # p1 original jp: [-11.59, 14.46, 73.96, -3.76, 91.56, -37.35]
+    jp = json.loads(vp["p1"]["val"])
+    jp["jp"][2] = 180.0
+    vp["p1"]["val"] = json.dumps(jp)
+    r = check_consistency(_LUA, vp)
+    kinds = _kinds(r)
+    assert "unreachable_joint_limit" in kinds, kinds
+
+
+def test_reachability_j1_exceeded():
+    """J1 limit is ±200°; try 250°."""
+    vp = copy.deepcopy(_VARSPOINT)
+    jp = json.loads(vp["p1"]["val"])
+    jp["jp"][0] = 250.0
+    vp["p1"]["val"] = json.dumps(jp)
+    r = check_consistency(_LUA, vp)
+    assert "unreachable_joint_limit" in _kinds(r), _kinds(r)
+
+
+# ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
 

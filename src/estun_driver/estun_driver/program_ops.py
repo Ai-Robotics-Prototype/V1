@@ -837,6 +837,17 @@ _WIRE_PROVEN_UNDOCUMENTED: dict = {
                      'from the "should have emitted setNoBlender" branch. '
                      'See docs/lua_contract.md §7.'),
     },
+    'sys.sleep': {
+        'arity':    (1, 1),
+        'evidence': ('Lua 5.3 standard timing verb — wire-observed in '
+                     'resident `stopprobe/main.lua` on 2026-09-02: '
+                     '`sys.sleep(5)` executed cleanly. Namespaced call '
+                     '(namespace.method form) rather than bare identifier; '
+                     'lint regex extended 2026-09-02 to recognize the '
+                     'namespace form. Coexists with `wait(ms)` (wire-'
+                     'proven-undocumented alias, undocumented in manual '
+                     '§C — see docs/lua_contract.md §7 migration).'),
+    },
 }
 
 
@@ -1505,7 +1516,13 @@ def lint_lua_source(source: str, lib: dict = None) -> list:
         clean = _strip_lua_strings_and_comment(raw_line)
         i = 0
         while i < len(clean):
-            m = _re.match(r'([A-Za-z_][A-Za-z_0-9]*)\s*\(', clean[i:])
+            # G2 (2026-09-02): accept both bare identifiers and
+            # namespaced calls (`sys.sleep(...)`, `math.floor(...)`
+            # etc.). Prior regex broke on `.` and mis-classified
+            # `sys.sleep` as an unknown verb `sleep`.
+            m = _re.match(
+                r'([A-Za-z_][A-Za-z_0-9]*(?:\.[A-Za-z_][A-Za-z_0-9]*)*)\s*\(',
+                clean[i:])
             if not m:
                 i += 1
                 continue

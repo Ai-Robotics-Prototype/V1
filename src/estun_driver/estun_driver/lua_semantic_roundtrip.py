@@ -53,21 +53,49 @@ _MOV_CALL_RE = re.compile(r'\b(movJ|movL|movC|movCircle|movLW|movCW|movJCoorRel|
 _SETDO_RE    = re.compile(r'\b(setDO|setAO)\s*\(')
 _WAIT_RE     = re.compile(r'\b(wait|sys\.sleep|waitCondition)\s*\(')
 _GOTO_RE     = re.compile(r'\bgoto\s+\S+')
+# G4 (2026-09-02): counted-loop closer. Codegen has two loop
+# emit styles — labeled goto (uncounted continuous) and for..end
+# (counted N-iteration). Both are valid loop step emissions.
+_FOR_END_RE  = re.compile(r'\b(for\s+\w+\s*=|end\b)')
 _INLINE_JOINTS_RE = re.compile(r'joints\s*=\s*\[\s*([-+0-9.,\s]+)\s*\]')
 _POINT_NAME_RE = re.compile(r'^p(\d+)$')
 
-# action → set of legal verb bases (verb w/o parens)
+# action → set of legal verb bases (verb w/o parens).
+# Source: _NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK + motion actions in
+# program_ops.py:1379-1388 + the movement actions codegen tests
+# for at lines 4063 / 1774 etc. Keep in sync when new actions land.
 _ACTION_TO_LEGAL_VERBS = {
-    "move_home":   {"movJ"},
-    "move_joint":  {"movJ"},
-    "move_linear": {"movJ", "movL", "movJCoorRel", "movLCoorRel"},
-    "move_arc":    {"movC"},
-    "set_io":      {"setDO", "setAO"},
-    "wait":        {"wait", "sys.sleep", "waitCondition"},
-    "loop":        {"goto"},
-    "dwell":       {"movJ", "wait", "sys.sleep"},
-    # gripper/pallet composites (codegen may emit multiple verbs)
-    "gripper":     {"setDO", "wait", "sys.sleep"},
+    # Motion
+    "move_home":         {"movJ"},
+    "move_joint":        {"movJ"},
+    "move_linear":       {"movJ", "movL", "movJCoorRel", "movLCoorRel"},
+    "move_arc":          {"movC"},
+    "move_to_pallet":    {"movJ", "movL", "movJCoorRel"},
+    # IO
+    "set_io":            {"setDO", "setAO"},
+    # Timing
+    "wait":              {"wait", "sys.sleep", "waitCondition"},
+    "dwell":             {"movJ", "wait", "sys.sleep"},
+    # Control flow
+    "loop":              {"goto", "for_end"},
+    "pause":             {"wait", "sys.sleep", "waitCondition"},
+    # Composites (codegen may emit multiple verbs per step)
+    "gripper":           {"setDO", "wait", "sys.sleep"},
+    "gripper_close":     {"setDO", "wait", "sys.sleep"},
+    "gripper_open":      {"setDO", "wait", "sys.sleep"},
+    "vacuum_on":         {"setDO", "wait", "sys.sleep"},
+    "vacuum_off":        {"setDO", "wait", "sys.sleep"},
+    # Input-conditional (G3 addition — pallet detect uses waitCondition/getDI)
+    "wait_input":        {"waitCondition", "getDI"},
+    "verify_input":      {"waitCondition", "getDI"},
+    "detect":            {"waitCondition", "getDI", "setDO"},
+    "scan_workspace":    {"waitCondition", "getDI", "setDO"},
+    "scan_identify_each":{"waitCondition", "getDI", "setDO"},
+    "sort_scanned":      {"waitCondition", "getDI", "setDO", "movJ", "movL"},
+    "remove_defects":    {"waitCondition", "getDI", "setDO", "movJ", "movL"},
+    # No-op step kinds — codegen emits comment-only ranges
+    "comment":           set(),
+    "end":               set(),
 }
 
 
@@ -96,10 +124,21 @@ class RoundTripReport:
     findings: list[RoundTripFinding] = field(default_factory=list)
     line_map: list[LineMapEntry] = field(default_factory=list)
     emitted_mov_count: int = 0
+    # True when the program lacks a D9 line_map trailer entirely
+    # (pre-D9-era legacy program). Callers should treat this as
+    # "unverifiable, not caught" — the semantic RT gate can only
+    # run on codegen-emitted programs from 2026-08-04+.
+    legacy_no_line_map: bool = False
 
     @property
     def ok(self) -> bool:
         return not self.findings
+
+    @property
+    def verifiable(self) -> bool:
+        """False when the program pre-dates the D9 stamp — sweep
+        classifier should route to UNVERIFIABLE, not CAUGHT."""
+        return not self.legacy_no_line_map
 
 
 def _parse_line_map(source: str) -> list[LineMapEntry]:
@@ -124,6 +163,32 @@ def _parse_line_map(source: str) -> list[LineMapEntry]:
 
 
 _LOOP_LABEL_RE = re.compile(r'^::\s*_prog_start\s*::')
+
+# G5 (2026-09-02): codegen-signaled non-emission markers.
+#
+# `-- skipped 'X': no point_name/points ref` — codegen safety-skip
+#   when a step lacks taught data. LEGITIMATE only when the skipped
+#   action is a non-motion class (detect, comment, etc.); a skipped
+#   move_* is a REAL pending-pose defect (D14 companion).
+#
+# `-- absorbed into move_to_pallet cycle` — pallet composite
+#   deferral. The step's actual emit lives downstream in the
+#   move_to_pallet expansion; the individual line_map entry acts
+#   as a placeholder. LEGITIMATE for any action that names the
+#   pallet cycle as its parent.
+_SKIPPED_RE   = re.compile(r"--\s*skipped\s+'([^']+)':")
+_ABSORBED_RE  = re.compile(r"--\s*absorbed\s+into\s+move_to_pallet\s+cycle")
+# G6 (2026-09-02): codegen-time refusal markers for palletize.
+# §644 IK-unreachable class + config-incomplete class. Codegen
+# emits these instead of a bad expansion. Sweep must surface as
+# CAUGHT with the pallet_ik_refused kind, not generic step_drop.
+_PALLET_IK_FAIL_RE = re.compile(r"--\s*PALLET\s+IK\s+FAILED:")
+_PALLET_REFUSED_RE = re.compile(r"--\s*REFUSED\s+'move_to_pallet':")
+
+_MOTION_ACTIONS = frozenset({
+    "move_home", "move_joint", "move_linear", "move_arc",
+    "move_to_pallet",
+})
 
 
 def _split_and_normalize_lines(source: str) -> list[str]:
@@ -176,7 +241,75 @@ def _emitted_action_verbs(lines: list[str]) -> set[str]:
             verbs.add(m.group(1).replace("sys.sleep", "sys.sleep"))
         if _GOTO_RE.search(cut):
             verbs.add("goto")
+        # G4: counted-loop markers count as loop-step emissions.
+        if _FOR_END_RE.search(cut):
+            verbs.add("for_end")
     return verbs
+
+
+# ─────────────────────────────────────────────────────────────
+# Reachability — joint-limit envelope for S10-140
+# ─────────────────────────────────────────────────────────────
+#
+# Source: HARDWARE.md §Joint limits (live from Config→Safety,
+# enforced): J1/J2/J4/J5/J6 = ±200°, J3 = ±166°.
+# Addendum-12 §115, addendum-14 §134.
+#
+# §644 IK-unreachable class: codegen expands a pallet transit_over_
+# slot to a cartesian point that has no valid joint solution within
+# limits. The failing symptom is a jp vector whose components exceed
+# these limits (or that IK couldn't solve and codegen still emitted
+# a partial/garbage jp). This matcher catches both by verifying
+# every varspoint jp element is inside the envelope.
+#
+# NOTE: this is a JOINT-limit check only. True cartesian
+# reachability (does the wrist-decoupled IK have a solution?)
+# requires forward kinematics + IK solver, which is out of scope
+# for a lint-time gate. But since the varspoint IS what goes to
+# the wire, and every taught/computed jp must be inside limits,
+# this catches the on-the-wire manifestation of §644.
+
+_S10_140_JOINT_LIMITS_DEG = [200.0, 200.0, 166.0, 200.0, 200.0, 200.0]
+
+
+def _check_reachability(varspoint: dict[str, dict]) -> list[RoundTripFinding]:
+    """For every apos point in varspoint, verify every jp[i] is
+    inside ±_S10_140_JOINT_LIMITS_DEG[i]. Returns a list of
+    unreachable_joint_limit findings — empty on clean varspoint."""
+    findings: list[RoundTripFinding] = []
+    for pt_name, entry in varspoint.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("postype") not in ("jp", None):
+            # cpos points are checked implicitly through their rj
+            # field if present; skip pure-cartesian for now.
+            pass
+        jp = _varspoint_joints(entry)
+        if jp is None:
+            continue
+        for i, val in enumerate(jp):
+            if i >= len(_S10_140_JOINT_LIMITS_DEG):
+                findings.append(RoundTripFinding(
+                    kind="unreachable_joint_count", step_idx=None,
+                    detail=f"varspoint[{pt_name}].jp has {len(jp)} "
+                           f"axes; S10-140 has 6. "
+                           f"External-axis pose in a wrong slot?",
+                ))
+                break
+            limit = _S10_140_JOINT_LIMITS_DEG[i]
+            if abs(val) > limit:
+                findings.append(RoundTripFinding(
+                    kind="unreachable_joint_limit", step_idx=None,
+                    detail=(
+                        f"varspoint[{pt_name}].jp[{i}] = {val:+.4f}° "
+                        f"exceeds S10-140 J{i+1} soft limit "
+                        f"±{limit:.1f}° (HARDWARE.md §Joint limits, "
+                        f"addendum-12 §115). §644-class hazard: an "
+                        f"unreachable pose reached the wire — either "
+                        f"IK returned garbage or the taught apos was "
+                        f"never validated."),
+                ))
+    return findings
 
 
 # ─────────────────────────────────────────────────────────────
@@ -207,12 +340,12 @@ def check_consistency(
     r.line_map = _parse_line_map(lua_source)
 
     if not r.line_map:
-        r.findings.append(RoundTripFinding(
-            kind="missing_line_map", step_idx=None,
-            detail="No `-- line_map (D9 …)` trailer found — cannot "
-                   "run semantic round-trip. Ship a codegen that "
-                   "emits the D9 stamp.",
-        ))
+        # G1: legacy program pre-D9-stamp (before 2026-08-04). Not
+        # a defect for the RT checks — flag as unverifiable so the
+        # sweep classifier routes to UNVERIFIABLE instead of CAUGHT.
+        # BUT reachability still runs (§644 doesn't depend on D9).
+        r.legacy_no_line_map = True
+        r.findings.extend(_check_reachability(varspoint or {}))
         return r
 
     # Check 2: reorder — step_idx must be exactly [0..N-1] in order.
@@ -242,7 +375,62 @@ def check_consistency(
                        f"_ACTION_TO_LEGAL_VERBS. Update the module.",
             ))
             continue
+        if not legal:
+            # No-op step kinds (comment/end) — codegen legitimately
+            # emits an empty range; skip verb checks.
+            continue
         if not verbs:
+            # G5+G6: recognize codegen-signaled non-emission markers.
+            raw_slice = "\n".join(slice_lines)
+            absorbed = bool(_ABSORBED_RE.search(raw_slice))
+            skipped_m = _SKIPPED_RE.search(raw_slice)
+            ik_fail_m = _PALLET_IK_FAIL_RE.search(raw_slice)
+            pallet_refused_m = _PALLET_REFUSED_RE.search(raw_slice)
+            if ik_fail_m or pallet_refused_m:
+                # G6: codegen-time refusal of a pallet expansion.
+                # This IS the §644 hand-queued class from the
+                # regression corpus — now surfaced with an
+                # explicit finding kind instead of generic
+                # step_drop. The refusing comment carries the
+                # operator-facing reason (unreachable Z, missing
+                # config field, etc.).
+                reason_line = next(
+                    (L.strip() for L in slice_lines
+                     if "-- PALLET IK FAILED" in L
+                     or "-- REFUSED 'move_to_pallet'" in L),
+                    "(marker present)",
+                )
+                r.findings.append(RoundTripFinding(
+                    kind="pallet_ik_refused", step_idx=e.step_idx,
+                    detail=(
+                        f"codegen refused this pallet expansion at "
+                        f"generation time — the program is on the "
+                        f"controller in a run-broken state. Marker: "
+                        f"{reason_line[:180]}"),
+                ))
+                continue
+            if absorbed:
+                # Composite deferral — real emit happens downstream.
+                continue
+            if skipped_m:
+                skipped_action = skipped_m.group(1)
+                if e.action not in _MOTION_ACTIONS:
+                    # Skipping a non-motion action (detect, etc.)
+                    # is a codegen no-op; nothing to run, nothing
+                    # to worry about.
+                    continue
+                # Motion action skipped → real pending-pose defect.
+                r.findings.append(RoundTripFinding(
+                    kind="pending_pose_skip", step_idx=e.step_idx,
+                    detail=f"action={e.action!r} was skipped by "
+                           f"codegen (marker: 'skipped {skipped_action}') "
+                           f"— the step lacks taught data. Program is "
+                           f"unsafe to run: the arm will pass over this "
+                           f"step in silence, likely leaving it in an "
+                           f"unexpected pose for the next motion. Teach "
+                           f"the pose and re-save.",
+                ))
+                continue
             r.findings.append(RoundTripFinding(
                 kind="step_drop", step_idx=e.step_idx,
                 detail=f"line_map claims action={e.action!r} at "
@@ -309,6 +497,11 @@ def check_consistency(
                                f"DIFFERENT point than the one it "
                                f"emitted — anchor-role-map bug class.",
                     ))
+
+    # Reachability — joint-limit envelope over every varspoint jp.
+    # This is the §644 IK-unreachable class matcher; runs whether
+    # or not a D9 line_map is present.
+    r.findings.extend(_check_reachability(varspoint or {}))
 
     r.emitted_mov_count = sum(1 for L in lines for _ in _MOV_CALL_RE.findall(L.split("--", 1)[0]))
     return r

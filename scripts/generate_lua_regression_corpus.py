@@ -259,17 +259,23 @@ HAND_ENTRIES = [
         "input_lua": None,
         "note": (
             "Palletize IK-failure — codegen emits transit_over_slot at "
-            "[0,0,0] which is unreachable @ Z=273.2mm, then still emits "
-            "partial movJ(p4). No wire-captured Lua string; recovery "
-            "requires running the pallet expansion path with a "
-            "specific tray/pallet fixture."
+            "[0,0,0] which is unreachable @ Z=273.2mm. As of 2026-09-02: "
+            "TWO matchers now cover this class: (a) reachability check "
+            "on every varspoint jp against S10-140 joint limits "
+            "(J1/2/4/5/6=±200°, J3=±166°), and (b) codegen-time refusal "
+            "marker detection (`-- PALLET IK FAILED:` / `-- REFUSED "
+            "'move_to_pallet':`) surfaced as `pallet_ik_refused` "
+            "finding. holepartpalletize + pallettest on the wire "
+            "(2026-09-02 sweep) both fire this finding cleanly."
         ),
         "expected": "reject",
-        "reject_reason": "requires_ik_precheck_matcher",
-        "stage": "semantic_round_trip_queue",
+        "reject_reason": "pallet_ik_refused",
+        "stage": "semantic_round_trip",
         "origin": (
             "hand-entry | docs/ledger/addendum-52-*.md §644 (grep-verified) | "
-            "LESSONS.md L311 | matcher NOT YET encoded"
+            "LESSONS.md L311 | encoded 2026-09-02 via "
+            "lua_semantic_roundtrip._PALLET_IK_FAIL_RE + "
+            "_check_reachability"
         ),
     },
     {
@@ -398,12 +404,19 @@ def test_corpus_entry(entry):
 def test_hand_queued_present():
     """Un-encoded historical incidents MUST remain in the corpus as
     a visible queue for future matcher additions. This test fails
-    loud if someone deletes them without landing the matcher."""
+    loud if someone deletes them without landing the matcher.
+
+    An entry can be in one of two states:
+      - stage='semantic_round_trip_queue'  — matcher NOT yet encoded
+      - stage='semantic_round_trip'        — matcher encoded, entry
+        preserved for provenance/audit trail
+    """
     names = {e["name"] for e in HAND_QUEUED}
     assert "palletize-transit-over-slot-unreachable" in names
     assert "multi-pair-role-map-anchor-mixup" in names
     for e in HAND_QUEUED:
-        assert e["stage"] == "semantic_round_trip_queue"
+        assert e["stage"] in ("semantic_round_trip_queue",
+                              "semantic_round_trip")
         assert "grep-verified" in e["origin"]
 '''
     return header
