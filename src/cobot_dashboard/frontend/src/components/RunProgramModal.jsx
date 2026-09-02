@@ -4,7 +4,6 @@ import { readPayload, PAYLOAD_UNSET_WARNING, PAYLOAD_INFO_ONLY }
   from '../lib/payload'
 import { runnableStepCount } from '../lib/programTruth'
 import { namedLoadError } from '../lib/loadOutcome'
-import { namedModeError } from '../lib/modeOutcome'
 
 // Confirm modal for the Monitor "Run Program" button. Reads the same
 // currentProgram + robot.allow_move + robot.operator_speed_limit that
@@ -130,10 +129,16 @@ export default function RunProgramModal() {
   const allowMode     = !!robot.allow_mode
   const targetModeCode = targetModeStr === 'remote' ? 2 : 0
   const inTarget       = robotModeCode === targetModeCode
-  const willSwitchMode = !inTarget && allowMode
+  // 2026-09-02 (per operator directive, wire-proven): the Run button
+  // does ONE thing — push program + project/run + poll ProjectState.
+  // NO mode switch. Bare project/run is accepted by the CC10-A
+  // controller from Manual mode (verb ack + state=2 transition, no
+  // errors). Hard-code willSwitchMode=false so the mode-switch banner
+  // and the mode-switch action are both retired without churning the
+  // derived flags downstream code may still reference.
+  const willSwitchMode = false
   const targetModeLabel = targetModeStr === 'remote' ? 'Remote' : 'Auto'
-  // Kept for message compatibility with the pre-cutover copy.
-  const willSwitchToAuto = willSwitchMode
+  const willSwitchToAuto = false
 
   const backdrop = {
     position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
@@ -174,38 +179,11 @@ export default function RunProgramModal() {
     }
     setPhase('running'); setResult(null); setErrorCopy(null); setShowTechnical(false)
     try {
-      // Mode-switch pre-flight (2026-08-28): if we're not in AUTO
-      // and the mode gate is open, transparently switch to AUTO
-      // first. The endpoint blocks until read-back verify so we
-      // KNOW the controller reached AUTO before we publish the
-      // run op. A refusal here (arbiter, timeout, gate closed)
-      // becomes the Run's structured error — the operator sees a
-      // NAMED reason instead of a downstream "mode refused" from
-      // the run itself.
-      if (willSwitchMode) {
-        const mres = await fetch('/api/estun/mode', {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ target: targetModeStr }),
-        })
-        const mbody = await mres.json().catch(() => ({}))
-        if (!mres.ok || !mbody.ok) {
-          setPhase('error')
-          // 2026-08-31: route every mode-refusal through the shared
-          // named-copy mapper (parallel to namedLoadError). Prior
-          // code flattened outcome.reason || outcome.detail into a
-          // generic "Can't start — controller is not in Auto..."
-          // title, which was wrong for Rung 0 (DI16 modeSwitch=0,
-          // hardware selector in MANUAL) and Rung 2 (latched
-          // errors[]). The ladder emits per-rung outcome.kind +
-          // reason_code + four_tuple; the mapper produces the
-          // operator-language title + detail per case and preserves
-          // the wire fields in technicalDetail. Add-53 reframe:
-          // Rung 1 (rs != 0) is retired; rs is session-persistent.
-          setErrorCopy(namedModeError(mbody || {}, mres.status))
-          return
-        }
-      }
+      // 2026-09-02 (per operator directive): the pre-flight mode
+      // switch has been REMOVED. Bare project/run is accepted by the
+      // controller in Manual (wire-proven). The Run modal now only
+      // POSTs to /api/estun/program/run; the run endpoint pushes the
+      // program and publishes project/run with no mode transition.
       const res = await fetch('/api/estun/program/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
