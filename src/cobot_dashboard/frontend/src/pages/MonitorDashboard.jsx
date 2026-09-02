@@ -870,7 +870,8 @@ export default function MonitorDashboard() {
   // Unified run-state — same helper the StatusBar footer and the
   // StepPreviewPanel consume, so pill / footer / banner never disagree.
   // See lib/runState.js for the precedence rules.
-  const runState = deriveRunState({ robot, task, safety })
+  const programIntent = useStore((s) => s.programIntent)
+  const runState = deriveRunState({ robot, task, safety, programIntent })
   const status = runState.kind   // kept for old code that keyed off the string
   const isRunning = runState.kind === 'running' || runState.kind === 'stopping'
 
@@ -1181,35 +1182,26 @@ export default function MonitorDashboard() {
           </div>
 
           <div style={{ display: 'flex', gap: 10, marginTop: 20, flexWrap: 'wrap' }}>
-            {/* STOP — prominent, always visible when the program is in
-                ANY active state (running / stopping / paused / alarm).
-                Deliberately exempt from the gate-open/estop-clear checks
-                that grey out the other motion verbs; STOP works precisely
-                when things are running or wedged, so its enable-state
-                must never depend on the same conditions that got the
-                arm into trouble. */}
-            {!stopDisabled && (
-              <button onClick={cancelProgram}
-                      title="project/stop — wire-proven rung 1 (always enabled while active)"
-                      style={{
-                        ...primaryBtn('#DC2626', false),
-                        boxShadow: '0 0 0 3px rgba(220,38,38,0.15)',
-                        fontSize: 17, minWidth: 140,
-                      }}>
-                ✕ STOP
+            {/* Primary action for the current state (2026-09-02
+                operator directive):
+                  running → PAUSE + STOP
+                  paused  → RESUME + STOP
+                  idle    → RUN
+                STOP is always visible when the program is active, but
+                now rendered SECOND so PAUSE/RESUME (the operator's
+                normal-flow action) is the leftmost button. */}
+            {status === 'running' && (
+              <button onClick={pauseProgram} disabled={pauseDisabled}
+                title="project/pause — wire-proven; arm holds position, program can resume from this line"
+                style={primaryBtn('#CA8A04', pauseDisabled)}>
+                ⏸ Pause
               </button>
             )}
             {status === 'paused' && (
               <button onClick={resumeProgram} disabled={safety?.estop}
+                title="project/resume — continues from the paused line"
                 style={primaryBtn('#16A34A', safety?.estop)}>
                 ▶ Resume
-              </button>
-            )}
-            {status === 'running' && (
-              <button onClick={pauseProgram} disabled={pauseDisabled}
-                title="project/pause — SOURCE-ONLY (behavior not yet wire-proven)"
-                style={primaryBtn('#CA8A04', pauseDisabled)}>
-                ⏸ Pause*
               </button>
             )}
             {!(status === 'running' || status === 'paused' || status === 'stopping') && (
@@ -1221,6 +1213,24 @@ export default function MonitorDashboard() {
                   : undefined}
                 style={primaryBtn('#16A34A', runDisabled || emptyProgram)}>
                 ▶ Run Program{emptyProgram ? ' (no taught poses)' : ''}
+              </button>
+            )}
+            {/* STOP — always visible while the program is active
+                (running / paused / stopping / alarm). Deliberately
+                exempt from the gate-open/estop-clear checks that grey
+                out the other motion verbs; STOP works precisely when
+                things are running or wedged. Terminates the program
+                — no resume possible after this, only restart from
+                step 1. */}
+            {!stopDisabled && (
+              <button onClick={cancelProgram}
+                      title="project/stop — terminates the program (no resume possible; use Restart to run from step 1)"
+                      style={{
+                        ...primaryBtn('#DC2626', false),
+                        boxShadow: '0 0 0 3px rgba(220,38,38,0.15)',
+                        fontSize: 17, minWidth: 140,
+                      }}>
+                ✕ STOP
               </button>
             )}
             {/* RESTART PROGRAM — stops the running program (project/stop,

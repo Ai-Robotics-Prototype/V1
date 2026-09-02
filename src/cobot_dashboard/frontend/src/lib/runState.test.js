@@ -44,6 +44,26 @@ test('deriveRunState: state=3 → stopping', () => {
   assert.equal(s.kind, 'stopping')
 })
 
+test('deriveRunState: state=3 + programIntent=pause → paused', () => {
+  const s = deriveRunState({
+    robot: { connected: true, enabled: true, program: { state: 3, line: 7 } },
+    programIntent: 'pause',
+  })
+  assert.equal(s.kind, 'paused',
+    'pause intent must classify state=3 as PAUSED, not STOPPING — '
+    + 'the CC10-A controller lands both project/pause and project/stop '
+    + 'at state=3 and this intent is what disambiguates them.')
+  assert.equal(s.label, 'PAUSED')
+})
+
+test('deriveRunState: state=3 + programIntent=stop → stopping', () => {
+  const s = deriveRunState({
+    robot: { connected: true, enabled: true, program: { state: 3, line: 7 } },
+    programIntent: 'stop',
+  })
+  assert.equal(s.kind, 'stopping')
+})
+
 test('deriveRunState: state=2 → running', () => {
   const s = deriveRunState({
     robot: { connected: true, enabled: true, program: { state: 2, line: 4 } },

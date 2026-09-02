@@ -102,6 +102,13 @@ const storeDefinition = (set, get) => ({
   // (2026-07-30 §3 anti-staleness surfacing).
   _lastProgramState: null,
 
+  // Last program command intent — used by deriveRunState to
+  // disambiguate program.state=3 between PAUSED (project/pause) and
+  // STOPPING (project/stop). Set by pauseProgram/resumeProgram/
+  // cancelProgram BEFORE the wire verb fires; cleared on the 2→0
+  // transition (run terminated) and on resume (2026-09-02).
+  programIntent: null,
+
   // ---- Jog speed (0-100 %) ----
   // Reusable knob. Currently drives ONLY the twin animation speed for
   // quick-orient / home / any future twin-side interpolated moves.
@@ -659,6 +666,10 @@ const storeDefinition = (set, get) => ({
           }, 250)
         }
 
+        // Clear programIntent on 2→0 (run terminated) so a subsequent
+        // idle→run→pause cycle classifies state=3 correctly.
+        const _nextIntent = (_prevProgState === 2 && _curProgState === 0)
+          ? null : get().programIntent
         set({
           safety: msg.safety ?? get().safety,
           joints: msg.joints ?? get().joints,
@@ -667,6 +678,7 @@ const storeDefinition = (set, get) => ({
           _lastJogRejectTs: _newLastTs,
           _lastProgramState: (_curProgState ?? _prevProgState),
           lastProgramStateTs: progStateNow,
+          programIntent: _nextIntent,
           detections: msg.detections ?? get().detections,
           // Server publishes detection_mode in STATE; keep the store
           // in sync so a fresh page-load picks up whatever mode was
@@ -946,10 +958,17 @@ const storeDefinition = (set, get) => ({
     return get().openRunModal()
   },
   // Pause / Resume go through the ladder verbs (project/pause,
-  // project/resume). Pause is still SOURCE-ONLY behavior-wise; a future
-  // ladder rung will lift the flag. If the driver refuses (gate closed,
-  // etc.), the rejection surfaces on STATE.robot.rejected.
+  // project/resume). Wire-proven on the CC10-A controller (2026-09-02):
+  // pause holds the interpreter at the current line (state 2→3, arm
+  // decelerates and holds); resume advances (state 3→2, motion
+  // continues from where it stopped). If the driver refuses (gate
+  // closed, etc.), the rejection surfaces on STATE.robot.rejected.
+  //
+  // programIntent is set BEFORE the wire verb so deriveRunState can
+  // disambiguate state=3 as PAUSED vs STOPPING correctly on the next
+  // frame.
   async pauseProgram() {
+    set({ programIntent: 'pause' })
     try { await fetch('/api/estun/program/pause', { method: 'POST' }) }
     catch (_) { /* fall through to sim */ }
     return get()._dispatchProgram('pause')
@@ -964,8 +983,13 @@ const storeDefinition = (set, get) => ({
     // operators reading the "Resume" button label expected
     // continuation and got a re-run instead. The dedicated
     // /api/estun/program/resume endpoint publishes the
-    // project/resume ladder verb (SOURCE-ONLY, mirror of pause)
-    // — the correct semantic action.
+    // project/resume ladder verb — the correct semantic action.
+    // (2026-09-02 SOURCE-ONLY flag lifted; wire-proven.)
+    //
+    // Clear programIntent so the next state=3 frame (if the
+    // operator pauses again, or hits stop mid-move) classifies
+    // correctly. State transitions 3→2 as motion resumes.
+    set({ programIntent: null })
     try {
       const res = await fetch('/api/estun/program/resume',
         { method: 'POST' })
@@ -1012,6 +1036,7 @@ const storeDefinition = (set, get) => ({
   // Stop → project/stop, the wire-proven ladder-rung-1 verb. Falls
   // through to the sim's cancel so both paths land at rest.
   async cancelProgram() {
+    set({ programIntent: 'stop' })
     try { await fetch('/api/estun/program/stop', { method: 'POST' }) }
     catch (_) { /* fall through to sim */ }
     return get()._dispatchProgram('stop')

@@ -8058,18 +8058,20 @@ if FASTAPI_AVAILABLE:
 
     @app.post("/api/estun/program/pause")
     async def api_estun_program_pause():
-        # SOURCE-ONLY behavior — the UI keeps the pause button labelled
-        # as such until pause/resume are wire-proven in a future ladder.
+        # Wire-proven 2026-09-02: project/pause holds the interpreter
+        # at the current line, arm decelerates and holds position.
+        # ProjectState.state transitions 2→3 within a few frames.
         if _ros_node is None:
             return JSONResponse({"error": "ros not available"}, status_code=503)
         _ros_node._estun_publish_op("pause")
-        return {"ok": True, "source_only": True}
+        return {"ok": True}
 
     @app.post("/api/estun/program/resume")
     async def api_estun_program_resume():
         """Ladder-verb resume — publishes op:resume to /estun/program.
-        The driver's _op_resume then sends project/resume on the
-        WS (SOURCE-ONLY, same posture as pause).
+        The driver's _op_resume sends project/resume on the WS. Wire-
+        proven 2026-09-02: ProjectState transitions 3→2 and motion
+        continues from the paused line.
 
         Motivation (2026-08-04): the frontend's resumeProgram()
         was calling /api/estun/program/run — which does codegen +
@@ -8081,7 +8083,7 @@ if FASTAPI_AVAILABLE:
         if _ros_node is None:
             return JSONResponse({"error": "ros not available"}, status_code=503)
         _ros_node._estun_publish_op("resume")
-        return {"ok": True, "source_only": True}
+        return {"ok": True}
 
     @app.post("/api/estun/program/clear_error")
     async def api_estun_program_clear_error():

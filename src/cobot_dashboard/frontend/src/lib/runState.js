@@ -13,7 +13,8 @@
 //   2. robot.active_alarm      → 'alarm'      "ALARM {code}: {text}"
 //   3. robot.enabled === false → 'disabled'   "DISABLED"  (motor power off;
 //                                              programs can't run at all)
-//   4. robot.program.state=3   → 'stopping'   "STOPPING"  (project/stop in flight)
+//   4. robot.program.state=3   → 'paused' or 'stopping' — disambiguated
+//                                by programIntent (see below)
 //   5. robot.program.state=2   → 'running'    "RUNNING · {task} · line {line}"
 //                                              or "SINGLE-STEP · line {line}"
 //   6. task.paused             → 'paused'     "PAUSED"    (executor sim path)
@@ -24,8 +25,18 @@
 // mirror of what's actually happening on the wire). Rules 6-7 are the
 // executor's own state — kept as a fallback so the sim and any
 // non-Estun run paths still light up the pill correctly.
+//
+// programIntent (2026-09-02): on the CC10-A controller, both project/
+// pause and project/stop land at ProjectState.state=3 — the difference
+// is that stop transitions 3→0 within a second while pause holds at 3
+// indefinitely. Since the frame we're reading may be the first 3 after
+// EITHER verb, we disambiguate off the client-tracked intent set by
+// pauseProgram/cancelProgram BEFORE the wire verb fires. Absent
+// intent, we default to 'stopping' — that preserves backwards
+// compatibility with the pre-pause behavior for any state=3 the
+// operator didn't ask for (e.g., driver-side auto-stop).
 
-export function deriveRunState({ robot, task, safety } = {}) {
+export function deriveRunState({ robot, task, safety, programIntent } = {}) {
   robot  = robot  || {}
   task   = task   || {}
   safety = safety || {}
@@ -79,6 +90,11 @@ export function deriveRunState({ robot, task, safety } = {}) {
   }
 
   if (prog.state === 3) {
+    if (programIntent === 'pause') {
+      return { kind: 'paused', label: 'PAUSED', color: '#CA8A04',
+               bg: '#FFFBEB', border: '#CA8A04', pulse: false,
+               detail: line != null ? `line ${line}` : '' }
+    }
     return { kind: 'stopping', label: 'STOPPING', color: '#B45309',
              bg: '#FEF3C7', border: '#B45309', pulse: true,
              detail: line != null ? `line ${line}` : '' }
