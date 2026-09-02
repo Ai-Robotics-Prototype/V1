@@ -813,7 +813,29 @@ _WIRE_PROVEN_UNDOCUMENTED: dict = {
         'evidence': ('2026-07-29 UI screenshot + clean bowl-pickplace '
                      'runs on firmware v2.3 (resident `wait(500)` '
                      'executed without alarm across multiple cycles). '
-                     'Absent from luaenginelib.json 168-verb catalogue.'),
+                     'Absent from luaenginelib.json 168-verb catalogue. '
+                     'Migration target: sys.sleep(n) per docs/lua_contract.md §7.'),
+    },
+    'setBlender': {
+        'arity':    (1, 1),
+        'evidence': ('Documented in S-series Gen2 software manual '
+                     '§C.2 p.76 (docs/manuals/sw_manual_v1.pdf) as '
+                     '`setBlender(b)` where b = blend radius (mm). '
+                     'MISSING from luaenginelib.json 168-verb catalogue — '
+                     'the library snapshot is stale. Local override until '
+                     'a controller-side library patch lands. Zero-radius '
+                     'refused separately by D15 matcher (bug #1, 2026-07-22).'),
+    },
+    'setNoBlender': {
+        'arity':    (0, 0),
+        'evidence': ('Codegen emits modally to clear a prior setBlender '
+                     'radius between motion bursts. Wire-observed '
+                     'acceptance in resident programs (STANDARD profile '
+                     'column steps). UNDOCUMENTED in both manual and '
+                     'luaenginelib.json. Migration target: setBlender(0) '
+                     'once the D15 setBlender(0) refusal is decoupled '
+                     'from the "should have emitted setNoBlender" branch. '
+                     'See docs/lua_contract.md §7.'),
     },
 }
 
@@ -5114,6 +5136,47 @@ def save_project(robot_ip: str, port: int, *,
             'http_status': http_status, 'code': code,
             'body_head': body_head,
         })
+
+    # 0) Syntax gate — see docs/lua_contract.md §9 stage 3.
+    #    Refuse the whole 4-POST sequence if Lua doesn't parse under
+    #    Lua 5.3. Fail-closed: no HTTP call happens on a syntax bug.
+    from .lua_syntax_gate import check_syntax, LuaSyntaxError
+    try:
+        check_syntax(lua_source, source_name=f'{project_id}/{task_id}')
+        record('lua_syntax_gate', 'liblua5.3:luaL_loadstring',
+               'CHECK', 0, {'code': 909}, b'ok')
+    except LuaSyntaxError as e:
+        record('lua_syntax_gate', 'liblua5.3:luaL_loadstring',
+               'CHECK', 0, {'code': 'syntax_error',
+                             'line': e.line, 'col': e.col,
+                             'message': str(e)},
+               e.raw.encode('utf-8', 'replace'))
+        return steps
+
+    # 0.5) Semantic round-trip — see docs/lua_contract.md §9 stage 5.
+    #      Catches step-drop / reorder / anchor-mixup / point-
+    #      substitution BEFORE the wire commit. Consistency-only —
+    #      compares codegen's own D9 line_map trailer against the
+    #      inline comments and varspoint we're about to POST.
+    #      Off-by-default via ESTUN_BYPASS_LUA_CONTRACT=1; the gate
+    #      matches the syntax gate's operator-override contract.
+    if os.environ.get('ESTUN_BYPASS_LUA_CONTRACT') != '1':
+        from .lua_semantic_roundtrip import check_consistency
+        rt = check_consistency(lua_source, varspoint)
+        if not rt.ok:
+            head = rt.findings[0]
+            record('lua_semantic_roundtrip', 'in-process',
+                   'CHECK', 0,
+                   {'code': 'semantic_roundtrip_error',
+                    'finding_count': len(rt.findings),
+                    'first_kind': head.kind,
+                    'first_step_idx': head.step_idx,
+                    'first_detail': head.detail},
+                   str(rt.findings[:3]).encode('utf-8', 'replace'))
+            return steps
+        record('lua_semantic_roundtrip', 'in-process',
+               'CHECK', 0, {'code': 909, 'step_count': len(rt.line_map)},
+               b'ok')
 
     # 1) Lua source under /api/robotcode/
     p = f'/api/robotcode/project{lang}_{project_id}_{lang}/update/{task_id}/'

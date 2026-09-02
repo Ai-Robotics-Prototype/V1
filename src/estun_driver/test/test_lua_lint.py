@@ -59,12 +59,20 @@ def test_lint_clean_program():
 
 
 def test_lint_catches_unknown_verb():
-    src = 'setDO(1,0)\nsetBlender(15)\nmovJ(p1)\r\n'
+    # `noSuchVerb` is neither in luaenginelib.json nor in
+    # _WIRE_PROVEN_UNDOCUMENTED — must be refused.
+    #
+    # Note (2026-09-02): this test previously used setBlender as the
+    # canary "unknown verb"; setBlender has since been documented as
+    # wire-proven-undocumented per docs/lua_contract.md §7 (manual
+    # §C.2 p.76). setBlender is now a KNOWN verb; noSuchVerb is a
+    # regression-safe substitute for the "true unknown" case.
+    src = 'setDO(1,0)\nnoSuchVerb(15)\nmovJ(p1)\r\n'
     findings = lint_lua_source(src)
     verbs = [f['verb'] for f in findings]
-    assert 'setBlender' in verbs, findings
-    # Only setBlender should have been flagged — setDO and movJ are in the library.
-    assert all(f['verb'] == 'setBlender' for f in findings), findings
+    assert 'noSuchVerb' in verbs, findings
+    # Only noSuchVerb should have been flagged — setDO and movJ are in the library.
+    assert all(f['verb'] == 'noSuchVerb' for f in findings), findings
 
 
 def test_lint_catches_arity_mismatch():

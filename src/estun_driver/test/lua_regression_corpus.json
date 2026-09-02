@@ -1,0 +1,650 @@
+[
+  {
+    "name": "palletize-transit-over-slot-unreachable",
+    "kind": "un_encoded_historical",
+    "verb": "movJ",
+    "input_lua": null,
+    "note": "Palletize IK-failure \u2014 codegen emits transit_over_slot at [0,0,0] which is unreachable @ Z=273.2mm, then still emits partial movJ(p4). No wire-captured Lua string; recovery requires running the pallet expansion path with a specific tray/pallet fixture.",
+    "expected": "reject",
+    "reject_reason": "requires_ik_precheck_matcher",
+    "stage": "semantic_round_trip_queue",
+    "origin": "hand-entry | docs/ledger/addendum-52-*.md \u00a7644 (grep-verified) | LESSONS.md L311 | matcher NOT YET encoded"
+  },
+  {
+    "name": "multi-pair-role-map-anchor-mixup",
+    "kind": "un_encoded_historical",
+    "verb": "movJ",
+    "input_lua": null,
+    "note": "Approach/retreat steps in multi-pair pick-place resolved to the WRONG pair's anchor. Fixed at codegen time by `_resolve_anchor_step` distance heuristic \u2014 no lint matcher exists because the bug is upstream of Lua emit. This entry is a semantic-round-trip queue item: verify that emitted movJ(pN) point names match the step's resolved anchor.",
+    "expected": "reject",
+    "reject_reason": "requires_semantic_round_trip",
+    "stage": "semantic_round_trip_queue",
+    "origin": "hand-entry | docs/ledger/addendum-29-*.md \u2014 anchor-resolution commits pre-2026-07-27 (grep-verified) | matcher NOT YET encoded"
+  },
+  {
+    "name": "waitcondition-bare-false",
+    "verb": "waitCondition",
+    "args": [
+      "false",
+      "500"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "bare",
+    "origin": "program_ops.py:978",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "waitcondition-bare-true",
+    "verb": "waitCondition",
+    "args": [
+      "true",
+      "1000"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "bare",
+    "origin": "program_ops.py:978",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "waitcondition-bare-nil",
+    "verb": "waitCondition",
+    "args": [
+      "nil",
+      "500"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "bare",
+    "origin": "program_ops.py:978",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "waitcondition-getdi-ok",
+    "verb": "waitCondition",
+    "args": [
+      "getDI(5)==1",
+      "500"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:978",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movj-arity-4",
+    "verb": "movJ",
+    "args": [
+      "{cp={0,0,100,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "D14 arity",
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movj-arity-6-ok",
+    "verb": "movJ",
+    "args": [
+      "{cp={0,0,100,0,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movl-arity-4",
+    "verb": "movL",
+    "args": [
+      "{cp={0,0,100,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "D14 arity",
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movl-arity-6-ok",
+    "verb": "movL",
+    "args": [
+      "{cp={0,0,100,0,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movc-arity-4",
+    "verb": "movC",
+    "args": [
+      "{cp={0,0,100,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "D14 arity",
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movc-arity-6-ok",
+    "verb": "movC",
+    "args": [
+      "{cp={0,0,100,0,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movjcoorrel-arity-4",
+    "verb": "movJCoorRel",
+    "args": [
+      "{cp={0,0,100,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "D14 arity",
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movjcoorrel-arity-6-ok",
+    "verb": "movJCoorRel",
+    "args": [
+      "{cp={0,0,100,0,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movlcoorrel-arity-4",
+    "verb": "movLCoorRel",
+    "args": [
+      "{cp={0,0,100,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "D14 arity",
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movlcoorrel-arity-6-ok",
+    "verb": "movLCoorRel",
+    "args": [
+      "{cp={0,0,100,0,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movjjointrel-arity-4",
+    "verb": "movJJointRel",
+    "args": [
+      "{cp={0,0,100,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "D14 arity",
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movjjointrel-arity-6-ok",
+    "verb": "movJJointRel",
+    "args": [
+      "{cp={0,0,100,0,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movjtoolrel-arity-4",
+    "verb": "movJToolRel",
+    "args": [
+      "{cp={0,0,100,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "D14 arity",
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movjtoolrel-arity-6-ok",
+    "verb": "movJToolRel",
+    "args": [
+      "{cp={0,0,100,0,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movltoolrel-arity-4",
+    "verb": "movLToolRel",
+    "args": [
+      "{cp={0,0,100,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "D14 arity",
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movltoolrel-arity-6-ok",
+    "verb": "movLToolRel",
+    "args": [
+      "{cp={0,0,100,0,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movlw-arity-4",
+    "verb": "movLW",
+    "args": [
+      "{cp={0,0,100,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "D14 arity",
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movlw-arity-6-ok",
+    "verb": "movLW",
+    "args": [
+      "{cp={0,0,100,0,0,0}}",
+      "{coor=0,tool=0}"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d14-movj-point-name-ok",
+    "verb": "movJ",
+    "args": [
+      "p1"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1065 [D14]",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "wait-zero",
+    "verb": "wait",
+    "args": [
+      "0"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "> 0",
+    "origin": "program_ops.py:1129",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "wait-negative",
+    "verb": "wait",
+    "args": [
+      "-100"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "> 0",
+    "origin": "program_ops.py:1129",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "wait-float-literal",
+    "verb": "wait",
+    "args": [
+      "123.456"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "INTEGER",
+    "origin": "program_ops.py:1129",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "wait-false-literal",
+    "verb": "wait",
+    "args": [
+      "false"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "positive",
+    "origin": "program_ops.py:1129",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "wait-int-500",
+    "verb": "wait",
+    "args": [
+      "500"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1129",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "wait-int-1",
+    "verb": "wait",
+    "args": [
+      "1"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1129",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setdo-port-0-below",
+    "verb": "setDO",
+    "args": [
+      "0",
+      "1"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "outside",
+    "origin": "program_ops.py:1169",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setdo-port-25-above",
+    "verb": "setDO",
+    "args": [
+      "25",
+      "1"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "outside",
+    "origin": "program_ops.py:1169",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setdo-level-2-invalid",
+    "verb": "setDO",
+    "args": [
+      "5",
+      "2"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "must be 0 or 1",
+    "origin": "program_ops.py:1169",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setdo-port-1-boundary",
+    "verb": "setDO",
+    "args": [
+      "1",
+      "0"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1169",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setdo-port-24-boundary",
+    "verb": "setDO",
+    "args": [
+      "24",
+      "1"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1169",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setao-port-0-below",
+    "verb": "setAO",
+    "args": [
+      "0",
+      "50"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "outside",
+    "origin": "program_ops.py:1195",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setao-port-9-above",
+    "verb": "setAO",
+    "args": [
+      "9",
+      "50"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "outside",
+    "origin": "program_ops.py:1195",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setao-value-negative",
+    "verb": "setAO",
+    "args": [
+      "3",
+      "-500"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "sane range",
+    "origin": "program_ops.py:1195",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setao-value-extreme-high",
+    "verb": "setAO",
+    "args": [
+      "3",
+      "20000"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "sane range",
+    "origin": "program_ops.py:1195",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setao-valid-mid",
+    "verb": "setAO",
+    "args": [
+      "4",
+      "75.5"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1195",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setspeedj-zero",
+    "verb": "setSpeedJ",
+    "args": [
+      "0"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "> 0",
+    "origin": "program_ops.py:1220",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setspeedj-negative",
+    "verb": "setSpeedJ",
+    "args": [
+      "-10"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "> 0",
+    "origin": "program_ops.py:1220",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setspeedj-above-200",
+    "verb": "setSpeedJ",
+    "args": [
+      "201"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "wire-proven ceiling",
+    "origin": "program_ops.py:1220",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setspeedj-at-200-ok",
+    "verb": "setSpeedJ",
+    "args": [
+      "200"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1220",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setspeedj-nominal-100",
+    "verb": "setSpeedJ",
+    "args": [
+      "100"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1220",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setspeedl-zero",
+    "verb": "setSpeedL",
+    "args": [
+      "0"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "> 0",
+    "origin": "program_ops.py:1244",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setspeedl-above-3000",
+    "verb": "setSpeedL",
+    "args": [
+      "3001"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "wire-proven ceiling",
+    "origin": "program_ops.py:1244",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setspeedl-at-3000-ok",
+    "verb": "setSpeedL",
+    "args": [
+      "3000"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1244",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setspeedl-nominal-800",
+    "verb": "setSpeedL",
+    "args": [
+      "800"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1244",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setaccl-zero",
+    "verb": "setAccL",
+    "args": [
+      "0"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "> 0",
+    "origin": "program_ops.py:1268",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setaccl-negative",
+    "verb": "setAccL",
+    "args": [
+      "-5"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "> 0",
+    "origin": "program_ops.py:1268",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setaccl-nominal-1200",
+    "verb": "setAccL",
+    "args": [
+      "1200"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1268",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d15-setblender-zero",
+    "verb": "setBlender",
+    "args": [
+      "0"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "D15",
+    "origin": "program_ops.py:1297",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "d15-setblender-negative",
+    "verb": "setBlender",
+    "args": [
+      "-5"
+    ],
+    "expected": "reject",
+    "reject_reason_substr": "positive",
+    "origin": "program_ops.py:1297",
+    "kind": "auto_derived"
+  },
+  {
+    "name": "setblender-valid-12",
+    "verb": "setBlender",
+    "args": [
+      "12"
+    ],
+    "expected": "accept",
+    "reject_reason_substr": null,
+    "origin": "program_ops.py:1297",
+    "kind": "auto_derived"
+  }
+]
