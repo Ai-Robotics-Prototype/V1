@@ -7327,8 +7327,21 @@ if FASTAPI_AVAILABLE:
                     "stored_lua_sha12": stored_sha[:12],
                     "effective_pct": int(eff_pct)}
 
+        # 2026-09-02 (per operator directive): sending Robot/toAuto
+        # while the controller is in Remote mode (code 2) flips the
+        # factory selector to Auto, which EXITS Remote and kills the
+        # external command channel — a self-defeating sequence. In
+        # Remote, project/run works without a mode transition. Detect
+        # the current mode and skip the toAuto publish under Remote;
+        # log the wire-truthful branch we took so a review-later reader
+        # sees why toAuto was or wasn't sent.
+        with _state_lock:
+            _mode_code_pre_run = (STATE.get("robot", {}) or {}).get(
+                "robot_mode_code")
+        _in_remote = (_mode_code_pre_run == 2)
         try:
-            _ros_node._estun_publish_op("to_auto")
+            if not _in_remote:
+                _ros_node._estun_publish_op("to_auto")
             # at_run_start bypasses the driver's mid-run high-speed
             # confirm requirement — the Run modal already ran the
             # operator through its own confirm before this op fired.
@@ -7339,6 +7352,10 @@ if FASTAPI_AVAILABLE:
             _ros_node._estun_publish_op("clear_start_line")
             _ros_node._estun_publish_op(
                 "run", program_id=prog_id, task_id=task_id)
+            print(f'[run] published: prog_id={prog_id!r} task={task_id!r} '
+                  f'mode_code={_mode_code_pre_run} in_remote={_in_remote} '
+                  f'skipped_to_auto={_in_remote}',
+                  flush=True)
         except Exception as e:
             return JSONResponse({"error": f"publish run: {e}"}, status_code=500)
 
@@ -7639,12 +7656,19 @@ if FASTAPI_AVAILABLE:
                 "outcome": {"kind": "ros_down"},
             }, status_code=503)
 
-        # save → to_auto → set_auto_rate → set_breakpoint →
-        # clear_start_line → run — the same sequence /api/estun/program/
-        # run uses. Byte-verify is skipped (~4s of latency vs a one-
-        # step program that codegen produces deterministically); the
-        # driver's own save-event stream still surfaces failures via
+        # save → [to_auto if not Remote] → set_auto_rate → set_breakpoint
+        # → clear_start_line → run. Byte-verify is skipped (~4s of latency
+        # vs a one-step program that codegen produces deterministically);
+        # the driver's own save-event stream still surfaces failures via
         # STATE.robot.rejected.
+        #
+        # 2026-09-02: skip toAuto under Remote mode — same rationale as
+        # /api/estun/program/run: Robot/toAuto exits Remote and kills the
+        # external command channel.
+        with _state_lock:
+            _mode_code_pre_home = (STATE.get("robot", {}) or {}).get(
+                "robot_mode_code")
+        _in_remote_home = (_mode_code_pre_home == 2)
         try:
             _ros_node._estun_publish_op(
                 "save",
@@ -7652,7 +7676,8 @@ if FASTAPI_AVAILABLE:
                 name="Return Home", task_name="main",
                 points=points, lua_source=lua)
             await asyncio.sleep(0.4)   # let the save complete
-            _ros_node._estun_publish_op("to_auto")
+            if not _in_remote_home:
+                _ros_node._estun_publish_op("to_auto")
             _ros_node._estun_publish_op(
                 "set_auto_rate", pct=int(eff_pct), at_run_start=True)
             _ros_node._estun_publish_op(
@@ -7660,6 +7685,10 @@ if FASTAPI_AVAILABLE:
             _ros_node._estun_publish_op("clear_start_line")
             _ros_node._estun_publish_op(
                 "run", program_id=_HOME_PROG_ID, task_id=_HOME_TASK_ID)
+            print(f'[home] published: mode_code={_mode_code_pre_home} '
+                  f'in_remote={_in_remote_home} '
+                  f'skipped_to_auto={_in_remote_home}',
+                  flush=True)
         except Exception as e:
             return JSONResponse({
                 "ok": False,
@@ -7921,84 +7950,17 @@ if FASTAPI_AVAILABLE:
                     return True
             return False
 
-        # ── First attempt ───────────────────────────────────────
-        # If the arm is already disabled OR the operator is using
-        # ModeControl / RunProgramModal from the interlock-clean
-        # state, one shot is enough.
+        # ── Single attempt, no orchestration (2026-09-02 directive) ─
+        # The prior disable → switch → re-enable ladder is REMOVED.
+        # Under Remote mode any auto-switch to Auto exits Remote and
+        # kills the external command channel, so orchestrating a
+        # switch through arm_enabled_interlock is self-defeating.
+        # A caller wanting a mode change while the arm is enabled
+        # must disable the arm explicitly first — the driver's
+        # arm_enabled_interlock refusal is surfaced verbatim.
         result = await _attempt(op)
-
-        # ── Enable-interlock orchestration (2026-08-28) ─────────
-        # Driver refuses toAuto/toManual/toRemote while enabled=True
-        # with reason_code=arm_enabled_interlock. Orchestrate the
-        # disable → switch → re-enable dance behind the operator's
-        # single confirm. Only fires when the driver EXPLICITLY
-        # named the interlock — otherwise treat the failure as
-        # domain truth (arbiter, allow_mode gate, transport_down).
         orchestrated = False
-        subs = []   # sub-step trace, surfaced in the response
-        if result is not None and (result.get("reason_code")
-                                   == "arm_enabled_interlock"):
-            subs.append({"step": "first_attempt",
-                         "outcome": "arm_enabled_interlock"})
-            # Best-effort disable via /robot/power_command. The
-            # driver's allow_power gate is the real safety layer;
-            # we don't second-guess it here.
-            try:
-                _publish_estun_power({"action": "disable"})
-                subs.append({"step": "publish_disable", "ok": True})
-            except Exception as e:
-                subs.append({"step": "publish_disable",
-                             "ok": False, "err": str(e)})
-            disabled_ok = await _wait_for(
-                lambda rr: rr.get("enabled") is False, secs=4.0)
-            subs.append({"step": "await_disabled",
-                         "ok": disabled_ok})
-            if disabled_ok:
-                # Controller settle window (2026-08-28 acceptance).
-                # State mirror flipping enabled=False means we saw
-                # the first frame of it; the controller may still be
-                # settling internally. First retry inside 3 s
-                # frequently misses the transition even though the
-                # arm IS disabled. Give the controller 750 ms to
-                # settle, then retry. If THAT still misses, retry
-                # once more — the operator's live-correlated MANUAL→
-                # AUTO transition landed in <100 ms of the actual
-                # click, so two 4 s windows separated by a 500 ms
-                # rest is a comfortable 9-second envelope.
-                await asyncio.sleep(0.75)
-                subs.append({"step": "controller_settle",
-                             "duration_s": 0.75})
-                retry = await _attempt(op)
-                subs.append({"step": "retry_mode_switch",
-                             "ok": bool(retry and retry.get("ok")),
-                             "reason_code": (retry or {}).get("reason_code")})
-                if retry is not None and not retry.get("ok") \
-                        and retry.get("reason_code") == "mode_readback_timeout":
-                    await asyncio.sleep(0.5)
-                    retry2 = await _attempt(op)
-                    subs.append({"step": "retry_mode_switch_2",
-                                 "ok": bool(retry2 and retry2.get("ok")),
-                                 "reason_code": (retry2 or {}).get("reason_code")})
-                    if retry2 is not None and retry2.get("ok"):
-                        retry = retry2
-                # Re-enable regardless of switch outcome — leaving
-                # the arm disabled after a failed switch is worse
-                # than leaving it in the pre-switch mode.
-                try:
-                    _publish_estun_power({"action": "enable"})
-                    subs.append({"step": "publish_enable", "ok": True})
-                except Exception as e:
-                    subs.append({"step": "publish_enable",
-                                 "ok": False, "err": str(e)})
-                enabled_ok = await _wait_for(
-                    lambda rr: rr.get("enabled") is True, secs=6.0)
-                subs.append({"step": "await_enabled",
-                             "ok": enabled_ok})
-                # The retry outcome is the result the caller sees;
-                # the sub-step trace rides in the response payload.
-                if retry is not None:
-                    result = retry
-                orchestrated = True
+        subs = []
 
         req_id = (result or {}).get("req_id")
 
