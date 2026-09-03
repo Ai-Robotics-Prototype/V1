@@ -2069,7 +2069,7 @@ const PAGES = [
         ].map(g => (
           <ChoiceButton key={g.value} label={g.label} description={g.desc}
             selected={answers.gripper_type === g.value}
-            onClick={() => { setAnswer('gripper_type', g.value); goNext() }}
+            onClick={() => { setAnswer('gripper_type', g.value); goNext({ gripper_type: g.value }) }}
           />
         ))}
       </QuestionCard>
@@ -3398,9 +3398,14 @@ export default function ProgramWizard({ onClose, onSaved }) {
 
   const setAnswer = (key, value) => setAnswers(prev => ({ ...prev, [key]: value }))
 
-  const goNext = () => {
+  const goNext = (overrides) => {
+    // Advance-with-value: React's setAnswer is asynchronous, so if the
+    // caller just set an answer whose value drives the next page's skip
+    // predicate, `answers` here is still stale. Callers pass that new
+    // value via `overrides` so skip() sees the fresh selection.
+    const merged = overrides ? { ...answers, ...overrides } : answers
     let next = pageIdx + 1
-    while (next < PAGES.length && PAGES[next].skip?.(answers)) next++
+    while (next < PAGES.length && PAGES[next].skip?.(merged)) next++
     if (next < PAGES.length) {
       setPageIdx(next)
       setHistory(prev => [...prev, next])
