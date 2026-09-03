@@ -1006,22 +1006,26 @@ const storeDefinition = (set, get) => ({
     }
     return get()._dispatchProgram('resume')
   },
-  // Return Home — dispatches through /api/robot/home, the wire-
-  // verified path that synthesises a one-step move_home program in
-  // memory and drives it through the estun /estun/program save→run
-  // pipeline. The old {action:'home'} path was orphaned: it went via
-  // /task/run_program → program_executor_node → /estun/command, and
-  // /estun/command is bound to the driver's catch-all reject handler
-  // (silent). Every failure mode of the new endpoint surfaces a JSON
-  // body with a specific `outcome.kind` — this handler turns each
-  // into a toast so the operator never sees a silent no-op.
-  async homeRobot() {
+  // Return Home — dispatches through /api/robot/home. The caller
+  // resolves the target pose from the LOADED PROGRAM's first MOVE_HOME
+  // step and passes taught_joints (+ optional taught_tcp / program_id
+  // / program_name / run_speed_pct) in the body. The endpoint refuses
+  // when taught_joints is missing — there is no silent fallback to a
+  // global preset. Every non-ok response carries a specific
+  // `outcome.kind` this handler surfaces as a toast.
+  async homeRobot(payload) {
+    const body = payload && typeof payload === 'object' ? payload : {}
     try {
-      const res  = await fetch('/api/robot/home', { method: 'POST' })
+      const res  = await fetch('/api/robot/home', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(body),
+      })
       const data = await res.json().catch(() => ({}))
       if (data.ok) {
+        const src = data.source_program_id ? ` (${data.source_program_id})` : ''
         get().addToast?.(
-          `Homing at ${data.effective_pct || '?'}%`, 'info')
+          `Homing at ${data.effective_pct || '?'}%${src}`, 'info')
         return { ok: true }
       }
       const msg = data.error || `home failed (HTTP ${res.status})`

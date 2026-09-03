@@ -7505,33 +7505,65 @@ if FASTAPI_AVAILABLE:
         }
 
     @app.post("/api/robot/home")
-    async def api_robot_home():
-        if not os.path.isfile(_HOME_FILE):
-            return JSONResponse({
-                "ok": False,
-                "error": "No home pose configured. Store one at "
-                         + _HOME_FILE + " ({\"taught_joints\": [...] in "
-                         "degrees}).",
-                "outcome": {"kind": "not_configured"},
-            }, status_code=404)
+    async def api_robot_home(request: Request):
+        # Two accepted paths:
+        #  (a) Body carries `taught_joints` — Monitor's Return Home
+        #      resolves the LOADED PROGRAM's first move_home step and
+        #      passes its pose. This is the pose that actually gets
+        #      commanded; there is no silent fallback here.
+        #  (b) No body — legacy callers (jog Home, editor Home,
+        #      wizard Home) still use the global /opt/cobot/home.json
+        #      preset. Monitor's button never lands here (it refuses
+        #      at the UI level when the program's home is unresolvable).
         try:
-            with open(_HOME_FILE) as f:
-                home = json.load(f)
-        except Exception as e:
-            return JSONResponse({
-                "ok": False,
-                "error": f"{_HOME_FILE} read failed: {e}",
-                "outcome": {"kind": "home_read_failed"},
-            }, status_code=500)
-        tj = home.get("taught_joints") or []
-        if not (isinstance(tj, list) and len(tj) == 6
-                and all(isinstance(v, (int, float)) for v in tj)):
-            return JSONResponse({
-                "ok": False,
-                "error": f"{_HOME_FILE} taught_joints missing or invalid "
-                         "(need 6 numeric degrees).",
-                "outcome": {"kind": "home_invalid"},
-            }, status_code=400)
+            body = await request.json()
+        except Exception:
+            body = {}
+        req_tj = body.get("taught_joints")
+        if req_tj is not None:
+            if not (isinstance(req_tj, list) and len(req_tj) == 6
+                    and all(isinstance(v, (int, float)) for v in req_tj)):
+                return JSONResponse({
+                    "ok": False,
+                    "error": "Invalid `taught_joints` in request "
+                             "(need 6 numeric degrees).",
+                    "outcome": {"kind": "no_program_home"},
+                }, status_code=400)
+            tj = req_tj
+            taught_tcp    = body.get("taught_tcp") or None
+            source_pid    = str(body.get("program_id") or "").strip() or None
+            source_pname  = str(body.get("program_name") or "").strip() or None
+        else:
+            if not os.path.isfile(_HOME_FILE):
+                return JSONResponse({
+                    "ok": False,
+                    "error": "No home pose configured. Store one at "
+                             + _HOME_FILE + " ({\"taught_joints\": [...] in "
+                             "degrees}).",
+                    "outcome": {"kind": "not_configured"},
+                }, status_code=404)
+            try:
+                with open(_HOME_FILE) as f:
+                    home = json.load(f)
+            except Exception as e:
+                return JSONResponse({
+                    "ok": False,
+                    "error": f"{_HOME_FILE} read failed: {e}",
+                    "outcome": {"kind": "home_read_failed"},
+                }, status_code=500)
+            tj = home.get("taught_joints") or []
+            if not (isinstance(tj, list) and len(tj) == 6
+                    and all(isinstance(v, (int, float)) for v in tj)):
+                return JSONResponse({
+                    "ok": False,
+                    "error": f"{_HOME_FILE} taught_joints missing or invalid "
+                             "(need 6 numeric degrees).",
+                    "outcome": {"kind": "home_invalid"},
+                }, status_code=400)
+            taught_tcp    = home.get("taught_tcp") or None
+            source_pid    = None
+            source_pname  = None
+        req_speed_pct = body.get("run_speed_pct")
 
         with _state_lock:
             r = STATE.get("robot", {})
@@ -7567,21 +7599,32 @@ if FASTAPI_AVAILABLE:
             }, status_code=403)
 
         operator_cap_pct = max(1, min(100, int(round(op_frac * 100))))
-        # Home is intentionally slow — cap at 25% (or operator's cap,
-        # whichever is lower). Not user-tunable from this endpoint;
-        # rushing home is a known collision mode.
-        home_speed_pct = min(operator_cap_pct, 25)
+        # Speed policy:
+        #  - New path (Monitor Return Home): use req_speed_pct as the
+        #    commanded speed, capped by codegen's operator_speed_limit
+        #    below — same field the run console commits.
+        #  - Legacy path (jog/editor/wizard Home, no run_speed_pct):
+        #    preserve the historic 25% ceiling. Rushing to a global
+        #    preset is a known collision mode; keep the guardrail.
+        try:
+            req_pct_i = int(round(float(req_speed_pct)))
+            home_speed_pct = max(1, min(100, req_pct_i))
+        except (TypeError, ValueError):
+            home_speed_pct = min(operator_cap_pct, 25)
 
+        home_label = (f"Move to {source_pname} home" if source_pname
+                      else "Move to program home")
         program = {
             "id":     _HOME_PROG_ID,
-            "name":   "Return Home",
+            "name":   (f"Return Home ({source_pname})" if source_pname
+                       else "Return Home"),
             "config": {"speed_pct": home_speed_pct},
             "steps": [{
                 "action":        "move_home",
-                "label":         "Move to unified home",
+                "label":         home_label,
                 "taught":        True,
                 "taught_joints": [float(v) for v in tj],
-                "taught_tcp":    home.get("taught_tcp") or None,
+                "taught_tcp":    taught_tcp,
                 "position_role": "home",
                 "step":          1,
             }],
@@ -7611,7 +7654,7 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({
                 "ok": False,
                 "error": (f"codegen produced no runnable motion — "
-                          f"{_HOME_FILE} taught_joints may be "
+                          f"program home taught_joints may be "
                           f"malformed (motion_counts="
                           f"{_home_motion_counts})."),
                 "outcome": {"kind": "codegen_empty",
@@ -7660,7 +7703,7 @@ if FASTAPI_AVAILABLE:
             _ros_node._estun_publish_op(
                 "save",
                 program_id=_HOME_PROG_ID, task_id=_HOME_TASK_ID,
-                name="Return Home", task_name="main",
+                name=program["name"], task_name="main",
                 points=points, lua_source=lua)
             await asyncio.sleep(0.4)   # let the save complete
             _ros_node._estun_publish_op(
@@ -7670,8 +7713,8 @@ if FASTAPI_AVAILABLE:
             _ros_node._estun_publish_op("clear_start_line")
             _ros_node._estun_publish_op(
                 "run", program_id=_HOME_PROG_ID, task_id=_HOME_TASK_ID)
-            print(f'[home] published: eff_pct={eff_pct} (no mode switch)',
-                  flush=True)
+            print(f'[home] published: src_pid={source_pid} '
+                  f'eff_pct={eff_pct} (no mode switch)', flush=True)
         except Exception as e:
             return JSONResponse({
                 "ok": False,
@@ -7680,12 +7723,12 @@ if FASTAPI_AVAILABLE:
             }, status_code=500)
 
         return {
-            "ok":            True,
-            "outcome":       {"kind": "published"},
-            "gate":          {"connected": True, "allow_move": True,
-                              "monitor_only": False},
-            "effective_pct": int(eff_pct),
-            "home_source":   home.get("source"),
+            "ok":                True,
+            "outcome":           {"kind": "published"},
+            "gate":              {"connected": True, "allow_move": True,
+                                  "monitor_only": False},
+            "effective_pct":     int(eff_pct),
+            "source_program_id": source_pid,
         }
 
     # ── /api/estun/mode (2026-08-28 mode-switch feature) ────────

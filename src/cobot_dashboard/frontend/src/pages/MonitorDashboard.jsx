@@ -1245,20 +1245,19 @@ export default function MonitorDashboard() {
                     style={primaryBtn('#0369A1', restartDisabled)}>
               ↻ Restart Program
             </button>
-            {/* RETURN HOME — same store action the Jog panel's Home
-                button uses (homeRobot → /api/program/run action='home'
-                → executor → /cmd/task home). Confirms every press
-                because it commands motion; the confirm surfaces gate/
-                connection state so the operator knows whether the
-                driver will honor it. Enabled during stuck-STOPPING too
-                so the arm can be recovered from a wedged run. */}
+            {/* RETURN HOME — targets the LOADED program's first
+                MOVE_HOME pose (taught_joints resolved from
+                currentProgram.steps, not re-parsed Lua). No program
+                loaded / no MOVE_HOME step → refuses at the UI with
+                named copy rather than falling back to a global preset.
+                Speed follows runSpeedPct like any other commanded move. */}
             <button onClick={() => returnHome({
                               homeRobot, robot, runSpeedPct, safety,
                               runStateKind: runState.kind,
-                              isStuckStopping, addToast,
+                              isStuckStopping, addToast, currentProgram,
                             })}
                     disabled={homeDisabled}
-                    title="/api/program/run action='home' — dispatches to the executor"
+                    title="/api/robot/home — moves to the loaded program's MOVE_HOME pose"
                     style={primaryBtn('#0891B2', homeDisabled)}>
               ⌂ Return Home
             </button>
@@ -1489,13 +1488,60 @@ function primaryBtn(bg, disabled) {
   }
 }
 
-// Return-Home confirm. Reads the driver's advertised operator cap so
-// the operator sees the actual effective speed before pressing OK.
-// Uses window.confirm so it works without adding a modal component —
-// same pattern as other destructive-motion prompts on this dashboard.
+// Return-Home confirm. Resolves the LOADED program's first MOVE_HOME
+// step (taught_joints) and passes that pose to homeRobot, so the arm
+// moves to the program's home rather than a global preset. Reads the
+// driver's advertised operator cap so the operator sees the actual
+// effective speed before pressing OK. Uses window.confirm — same
+// pattern as other destructive-motion prompts on this dashboard.
 // Extra prompt copy when firing from stuck-STOPPING so the operator
 // knows the wedge-recovery flow.
-function returnHome({ homeRobot, robot, runSpeedPct, safety, runStateKind, isStuckStopping, addToast }) {
+//
+// Refusal copy (named, at the UI, before any dispatch):
+//   - No program loaded         → "No program loaded — no program home."
+//   - Program has no MOVE_HOME  → "Loaded program has no MOVE_HOME step
+//                                  — no program home."
+// No silent fallback to the old global home.
+function resolveProgramHome(program) {
+  if (!program || !program.id) {
+    return {
+      ok: false,
+      title: 'Return Home refused',
+      detail: 'No program loaded — no program home.',
+    }
+  }
+  const steps = Array.isArray(program.steps) ? program.steps : []
+  const homeStep = steps.find(
+    (s) => s && String(s.action || '').toLowerCase() === 'move_home'
+        && Array.isArray(s.taught_joints)
+        && s.taught_joints.length === 6
+        && s.taught_joints.every((v) => typeof v === 'number'))
+  if (!homeStep) {
+    const hasAnyHome = steps.some(
+      (s) => s && String(s.action || '').toLowerCase() === 'move_home')
+    return {
+      ok: false,
+      title: 'Return Home refused',
+      detail: hasAnyHome
+        ? `Loaded program "${program.name || program.id}" has a MOVE_HOME step but no taught pose — teach it first.`
+        : `Loaded program "${program.name || program.id}" has no MOVE_HOME step — no program home.`,
+    }
+  }
+  return {
+    ok: true,
+    taught_joints: homeStep.taught_joints,
+    taught_tcp:    homeStep.taught_tcp || null,
+    program_id:    program.id,
+    program_name:  program.name || program.id,
+  }
+}
+
+function returnHome({ homeRobot, robot, runSpeedPct, safety, runStateKind, isStuckStopping, addToast, currentProgram }) {
+  const resolved = resolveProgramHome(currentProgram)
+  if (!resolved.ok) {
+    if (addToast) addToast({ title: resolved.title, detail: resolved.detail }, 'warning', 8000)
+    return
+  }
   const capFrac = Number(robot?.operator_speed_limit ?? 0.25)
   const capPct  = Math.max(1, Math.min(100, Math.round(capFrac * 100)))
   const reqPct  = Math.max(1, Math.min(100, Number(runSpeedPct || capPct)))
@@ -1503,9 +1549,12 @@ function returnHome({ homeRobot, robot, runSpeedPct, safety, runStateKind, isStu
   const gateOK  = !safety?.estop && !!robot?.connected && !!robot?.allow_move
   const lines = [
     isStuckStopping
-      ? 'Move to home from STUCK-STOPPING state?'
-      : (runStateKind === 'stopping' ? 'Move to home from STOPPING state?' : 'Move to home?'),
+      ? `Move to "${resolved.program_name}" home from STUCK-STOPPING state?`
+      : (runStateKind === 'stopping'
+          ? `Move to "${resolved.program_name}" home from STOPPING state?`
+          : `Move to "${resolved.program_name}" home?`),
     '',
+    `Target joints (deg): [${resolved.taught_joints.map((v) => Number(v).toFixed(2)).join(', ')}]`,
     `Effective speed: ${effPct}%${effPct < reqPct ? ` (capped from ${reqPct}%)` : ''}`,
     `Gate: allow_move=${robot?.allow_move ? 'true' : 'false'}, ` +
       `monitor_only=${robot?.monitor_only ? 'true' : 'false'}, ` +
@@ -1527,8 +1576,17 @@ function returnHome({ homeRobot, robot, runSpeedPct, safety, runStateKind, isStu
       : 'Gate is closed — the driver will refuse this. Press OK to try anyway.'
   )
   if (!window.confirm(lines.join('\n'))) return
-  try { homeRobot() }
-  catch (e) { if (addToast) addToast('Home dispatch failed: ' + e, 'error') }
+  try {
+    homeRobot({
+      taught_joints: resolved.taught_joints,
+      taught_tcp:    resolved.taught_tcp,
+      program_id:    resolved.program_id,
+      program_name:  resolved.program_name,
+      run_speed_pct: reqPct,
+    })
+  } catch (e) {
+    if (addToast) addToast('Home dispatch failed: ' + e, 'error')
+  }
 }
 
 // Restart-Program: stop-if-running then re-invoke the same run pipeline
