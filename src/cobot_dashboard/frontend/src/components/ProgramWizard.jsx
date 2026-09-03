@@ -1799,7 +1799,7 @@ function CellPickerPage({ answers, setAnswer, goNext }) {
                 + (c.commissioning_complete ? 'Commissioned' : 'Incomplete')
               }
               selected={answers.cell_id === c.cell_id}
-              onClick={() => { setAnswer('cell_id', c.cell_id); goNext() }}
+              onClick={() => { setAnswer('cell_id', c.cell_id); goNext({ cell_id: c.cell_id }) }}
             />
           ))}
         </div>
@@ -1883,7 +1883,7 @@ function WhichPartBody({ answers, setAnswer, goNext }) {
               + (trainingNote || '')
             }
             selected={answers.target_part === p.id}
-            onClick={() => { setAnswer('target_part', p.id); setAnswer('target_part_name', p.name); goNext() }}
+            onClick={() => { setAnswer('target_part', p.id); setAnswer('target_part_name', p.name); goNext({ target_part: p.id, target_part_name: p.name }) }}
           />
         )
       })}
@@ -1951,7 +1951,7 @@ const PAGES = [
         ].map(op => (
           <ChoiceButton key={op.value} label={op.label} description={op.desc} icon={op.icon}
             selected={answers.operation === op.value}
-            onClick={() => { setAnswer('operation', op.value); goNext() }}
+            onClick={() => { setAnswer('operation', op.value); goNext({ operation: op.value }) }}
           />
         ))}
       </QuestionCard>
@@ -1967,9 +1967,10 @@ const PAGES = [
     skip: (answers) => answers.operation !== 'palletize',
     render: ({ answers, setAnswer, goNext }) => {
       const choose = (mode) => {
+        const source = mode === 'palletize' ? 'camera_library' : 'fixed_grid'
         setAnswer('pallet_mode', mode)
-        setAnswer('source', mode === 'palletize' ? 'camera_library' : 'fixed_grid')
-        goNext()
+        setAnswer('source', source)
+        goNext({ pallet_mode: mode, source })
       }
       const cardStyle = (selected) => ({
         flex: 1, minHeight: 140, padding: '20px 22px', cursor: 'pointer',
@@ -2040,7 +2041,7 @@ const PAGES = [
         ].map(m => (
           <ChoiceButton key={m.value} label={m.label} description={m.desc}
             selected={answers.source === m.value}
-            onClick={() => { setAnswer('source', m.value); goNext() }}
+            onClick={() => { setAnswer('source', m.value); goNext({ source: m.value }) }}
           />
         ))}
       </QuestionCard>
@@ -2484,7 +2485,7 @@ const PAGES = [
           </div>
           <div style={{ marginTop: 16, display: 'flex', gap: 10, alignItems: 'center' }}>
             <button
-              onClick={() => { setAnswer('payload_kg', 'skip'); goNext() }}
+              onClick={() => { setAnswer('payload_kg', 'skip'); goNext({ payload_kg: 'skip' }) }}
               style={{
                 padding: '10px 18px', fontSize: 14, fontWeight: 500,
                 background: 'transparent', color: '#6b7280',
@@ -2523,7 +2524,7 @@ const PAGES = [
         ].map(p => (
           <ChoiceButton key={p.value} label={p.label} description={p.desc}
             selected={answers.place_method === p.value}
-            onClick={() => { setAnswer('place_method', p.value); goNext() }}
+            onClick={() => { setAnswer('place_method', p.value); goNext({ place_method: p.value }) }}
           />
         ))}
       </QuestionCard>
@@ -2590,7 +2591,7 @@ const PAGES = [
           ].map(r => (
             <ChoiceButton key={r.value} label={r.label} description={r.desc}
               selected={answers.repeat === r.value}
-              onClick={() => { setAnswer('repeat', r.value); if (r.value !== 'count') goNext() }}
+              onClick={() => { setAnswer('repeat', r.value); if (r.value !== 'count') goNext({ repeat: r.value }) }}
             />
           ))}
           {answers.repeat === 'count' && (
@@ -3558,6 +3559,30 @@ export default function ProgramWizard({ onClose, onSaved }) {
     while (probe < PAGES.length && PAGES[probe].skip?.(answers)) probe++
     safeIdx = probe < PAGES.length ? probe : PAGES.length - 1
   }
+  // Self-heal: if the render-time remap moved us past pageIdx (because a
+  // handler set state that made pageIdx's page transiently skip-hidden
+  // — the pageIdx/safeIdx desync class that caused the "click once,
+  // select; click twice, advance" bug), sync setPageIdx to what's
+  // actually on screen. Otherwise the NEXT click's goNext walks forward
+  // from the STALE stored pageIdx, lands back on the rendered page, and
+  // the operator sees "no advance" until a second click. Every handler
+  // now passes goNext overrides to avoid this in the first place; the
+  // effect is defense-in-depth so a future handler that forgets can't
+  // silently reintroduce the class.
+  useEffect(() => {
+    if (safeIdx !== pageIdx) {
+      // eslint-disable-next-line no-console
+      console.warn('[ProgramWizard] pageIdx/safeIdx drift:',
+        { pageIdx, safeIdx, page: PAGES[safeIdx]?.id })
+      setPageIdx(safeIdx)
+      setHistory((prev) => {
+        // Replace the tail of history with safeIdx so Back doesn't
+        // re-enter the skip-hidden page.
+        if (prev[prev.length - 1] === safeIdx) return prev
+        return [...prev.slice(0, -1), safeIdx]
+      })
+    }
+  }, [safeIdx, pageIdx])
   const page = PAGES[safeIdx]
   const progressPct = ((history.length - 1) / (PAGES.length - 1)) * 100
 
