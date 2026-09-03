@@ -2085,31 +2085,25 @@ const PAGES = [
     ),
   },
 
-  // 4: Gripper settings
-  //    Vacuum → threshold slider.
-  //    Custom → STEP upload + name + I/O assignment.
-  //    Finger → nothing operator-tunable, page is skipped entirely.
+  // 4: Gripper settings (Custom only)
+  //    Finger → skipped (no operator-tunable settings).
+  //    Vacuum → skipped (see below).
+  //    Custom → STEP upload + name + activate/confirm DO/DI assignment.
+  //
+  // The prior VACUUM branch collected a `vacuum_threshold` slider with
+  // zero downstream consumers (grep-verified: no backend/codegen reads
+  // it). The vacuum output port (DO2) and seal wait time (0.5 s) live
+  // in lib/effectorVocab.js V_DEFAULT_PORT + effectorEngage's wait
+  // step, and every emitted set_io step carries `io_role: 'vacuum'`
+  // so io_map.json remapping in codegen flows through — the wizard
+  // page never had (or needed) a port picker. Removed for finger and
+  // vacuum; custom still needs the panel for STEP + I/O assignment.
   {
     id: 'gripper_settings',
-    skip: (answers) => !(answers.gripper_type === 'vacuum' || answers.gripper_type === 'custom'),
-    render: ({ answers, setAnswer, goNext }) => {
-      if (answers.gripper_type === 'custom') {
-        return (
-          <CustomGripperPanel answers={answers} setAnswer={setAnswer} goNext={goNext} />
-        )
-      }
-      return (
-        <QuestionCard
-          question="Set the vacuum settings"
-          description="These settings control how the gripper picks up parts."
-        >
-          <SliderQuestion label="Vacuum threshold" value={answers.vacuum_threshold || 70}
-            onChange={v => setAnswer('vacuum_threshold', v)} min={30} max={95} step={5} unit="%"
-            description="Minimum vacuum level needed to confirm a successful pick" />
-          <NextButton onClick={goNext} label="Next" />
-        </QuestionCard>
-      )
-    },
+    skip: (answers) => answers.gripper_type !== 'custom',
+    render: ({ answers, setAnswer, goNext }) => (
+      <CustomGripperPanel answers={answers} setAnswer={setAnswer} goNext={goNext} />
+    ),
   },
 
   // ──────────────────────────────────────────────────────────────────
