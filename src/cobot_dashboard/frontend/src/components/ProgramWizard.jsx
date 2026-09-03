@@ -2049,9 +2049,17 @@ const PAGES = [
   },
 
   // 2: Which part? (only if Camera Detection selected on page 1)
+  //   Palletize skips this page: the operator forces source=camera_library
+  //   from the pallet_mode selector for runtime detect emission, but does
+  //   NOT want to pre-select a specific library part during setup — the
+  //   emitted `detect mode:'library'` step scans for any known part, and
+  //   the label falls back to "Find library part" when target_part_name
+  //   is absent. Non-palletize flows (pick_and_place / sort with camera
+  //   detection) still show this page.
   {
     id: 'which_part',
-    skip: (answers) => answers.source !== 'camera_library',
+    skip: (answers) => answers.operation === 'palletize'
+                    || answers.source !== 'camera_library',
     render: WhichPartBody,
   },
 
