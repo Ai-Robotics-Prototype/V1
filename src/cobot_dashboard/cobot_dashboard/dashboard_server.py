@@ -7842,7 +7842,15 @@ if FASTAPI_AVAILABLE:
         _mode_via_di = os.environ.get(
             'ESTUN_MODE_VIA_DI', '0').strip().lower() in \
             ('1', 'true', 'yes', 'on')
-        if target == "auto" and not _mode_via_di:
+        # DISABLED 2026-09-02 — Rung-0 DI16 pre-check retired.
+        # Symptom that prompted the disable: factory UI also cannot
+        # enter Auto with zero external clients on the controller, so
+        # DI16=0 was never causally proven. Our theoretical gate was
+        # refusing /api/estun/mode BEFORE the wire even saw the
+        # attempt, masking whatever the controller's real refusal is.
+        # Let the controller decide. To restore this rung, remove
+        # the leading `False and` from the guard below.
+        if False and target == "auto" and not _mode_via_di:
             di_val = None
             di_rows = (io_live or {}).get("DI") or []
             for row in di_rows:
