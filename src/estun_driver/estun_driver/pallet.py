@@ -58,10 +58,33 @@ class AbsorbPlan:
                               wait step (`duration_s * 1000`). Falls
                               back through if the step lacks
                               `seal_wait_ms`.
+
+    absorbed_approach_step    The `move_linear derived_from='pick'`
+                              step BEFORE pick_contact (walker clause
+                              d). Consumed by expand() to emit a
+                              per-cycle approach lift + descent-split.
+                              Refuses codegen when absent — never
+                              silently emit a bare direct-to-pick.
+
+    absorbed_retreat_step     The `move_linear derived_from='pick'`
+                              step AFTER pick_contact (first backward
+                              encounter, walker clause a). Consumed
+                              by expand() to emit a per-cycle retreat
+                              lift back above pick before the transit
+                              move. Refuses codegen when absent.
+
+    absorbed_pick_step        The taught pick_contact step (walker
+                              clause c). Its speed_pct sets the gentle
+                              final-descent cruise; expand() uses it
+                              for both the descent and the taught
+                              pick emission.
     """
     absorb_step_ids: set = field(default_factory=set)
     inferred_vac_port: int | None = None
     inferred_seal_wait_ms: int | None = None
+    absorbed_approach_step: dict | None = None
+    absorbed_retreat_step: dict | None = None
+    absorbed_pick_step: dict | None = None
 
 
 def plan_absorb(steps: list, cfg: dict) -> AbsorbPlan:
@@ -98,8 +121,11 @@ def plan_absorb(steps: list, cfg: dict) -> AbsorbPlan:
             act = str(st.get('action') or '').lower()
             derived = st.get('derived_from')
             # (a) approach/retreat above pick → absorb.
+            #     First encounter walking backward = RETREAT (post-pick).
             if act == 'move_linear' and derived == 'pick':
                 plan.absorb_step_ids.add(id(st))
+                if plan.absorbed_retreat_step is None:
+                    plan.absorbed_retreat_step = st
                 j -= 1
                 continue
             # (b) engage: set_io / wait / gripper helpers → absorb,
@@ -131,17 +157,19 @@ def plan_absorb(steps: list, cfg: dict) -> AbsorbPlan:
             if st.get('position_role') == 'pick' \
                     and act == 'move_linear':
                 plan.absorb_step_ids.add(id(st))
+                plan.absorbed_pick_step = st
                 # And one more step backward: the approach that sits
                 # BEFORE pick_contact (derived_from='pick', typically
-                # z-lifted). Absorbing it removes the standalone
-                # `movL(approach)` that would otherwise fire before
-                # the expansion's `movJ(pick_pt)`.
+                # z-lifted). Recorded so expand() can consume its
+                # offset_z_mm + speed_pct for the per-cycle approach
+                # lift instead of discarding them.
                 j -= 1
                 if j >= 0:
                     pst = steps[j]
                     if str(pst.get('action') or '').lower() == 'move_linear' \
                             and pst.get('derived_from') == 'pick':
                         plan.absorb_step_ids.add(id(pst))
+                        plan.absorbed_approach_step = pst
                 break
             # Anything else stops the scan.
             break
@@ -233,6 +261,13 @@ class ExpandCtx:
     tcp_from_joints_m: Callable
     make_jp_point: Callable
     fallback_idx: list           # [int], mutable through indexing
+    # Motion constants — mirror the outer emitter's math so per-cycle
+    # setSpeedJ/L/AccL directives inside expand() use the same
+    # % → deg/s / mm/s / mm/s² conversion the walker uses.
+    max_dps: float = 150.0
+    max_mmps: float = 1500.0
+    default_accl_mm_s2: float = 1200.0
+    gentle_accl_mm_s2: float = 150.0
 
 
 def _next_point_name(ctx: ExpandCtx) -> str:
@@ -469,12 +504,90 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             "de-energize at place")
         return
 
+    # ── approach + retreat MUST be present ───────────────────
+    # Codegen used to silently emit a bare `movJ(pick_pt)` per cycle,
+    # discarding the operator's authored approach lift + retreat lift.
+    # That produced a sweep-through-workspace hazard: the arm jumped
+    # directly to the taught pick pose from wherever the previous
+    # cycle left it (cycle 1 = move_home; cycles 2+ = the previous
+    # cycle's transit-over-slot). Now the expansion re-emits an
+    # approach hop, a descent (with analyzer's descent-split when the
+    # authored offset > threshold), and a symmetric retreat — all
+    # driven by the absorbed steps' offset_z_mm + speed_pct. When
+    # either step is missing, refuse rather than fall back to the
+    # bare direct-to-pick.
+    absorbed_approach = ctx.absorb_plan.absorbed_approach_step
+    absorbed_retreat  = ctx.absorb_plan.absorbed_retreat_step
+    if absorbed_approach is None:
+        ctx.exec_lines.append(
+            "-- refused 'move_to_pallet': no absorbed approach step "
+            "(move_linear with derived_from='pick' BEFORE the taught "
+            "pick_contact) — refusing rather than emitting a bare "
+            "direct-to-pick. Add the approach step to the program "
+            "(the wizard's buildPalletizeSteps emits one automatically) "
+            "and re-push.")
+        return
+    if absorbed_retreat is None:
+        ctx.exec_lines.append(
+            "-- refused 'move_to_pallet': no absorbed retreat step "
+            "(move_linear with derived_from='pick' AFTER the taught "
+            "pick_contact) — refusing rather than emitting a bare "
+            "direct-to-pick with no retreat lift.")
+        return
+
+    def _pos_offset_mm(st: dict) -> float | None:
+        try:
+            v = float(st.get('offset_z_mm'))
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
+
+    def _pct(st: dict, default: int) -> int:
+        try:
+            v = int(st.get('speed_pct'))
+            return max(1, min(100, v))
+        except (TypeError, ValueError):
+            return default
+
+    approach_offset_z_mm = _pos_offset_mm(absorbed_approach)
+    retreat_offset_z_mm  = _pos_offset_mm(absorbed_retreat)
+    if approach_offset_z_mm is None:
+        ctx.exec_lines.append(
+            "-- refused 'move_to_pallet': absorbed approach step has "
+            "no positive `offset_z_mm` — cannot compute an approach "
+            "point above the pick.")
+        return
+    if retreat_offset_z_mm is None:
+        ctx.exec_lines.append(
+            "-- refused 'move_to_pallet': absorbed retreat step has "
+            "no positive `offset_z_mm` — cannot compute a retreat "
+            "point above the pick.")
+        return
+    approach_speed_pct = _pct(absorbed_approach, 40)
+    retreat_speed_pct  = _pct(absorbed_retreat, 40)
+    absorbed_pick_step = ctx.absorb_plan.absorbed_pick_step
+    pick_speed_pct = _pct(absorbed_pick_step, 20) if absorbed_pick_step else 20
+
+    # Descent-split constants — mirror analyzer's Rule 2c so the
+    # per-cycle emission gets the same "fast to 50mm above + gentle
+    # final" treatment the operator sees in `motion_check`.
+    DESCENT_SPLIT_THRESHOLD_MM  = 250.0
+    DESCENT_SPLIT_STOP_ABOVE_MM = 50.0
+    descent_split_needed = approach_offset_z_mm > DESCENT_SPLIT_THRESHOLD_MM
+
     # ── header ───────────────────────────────────────────────
     blow_desc = (f'DO{blow_port_do}+{blow_pulse_ms}ms'
                  if blow_port_do is not None else 'none')
     place_appr_kind = ('taught (layer-shifted)'
                        if place_appr_tcp_taught is not None
                        else f'axis-offset {approach_dist_mm:.0f}mm')
+    pick_desc = (
+        f'pick=approach({approach_offset_z_mm:.0f}mm '
+        f'@ {approach_speed_pct}%)→descent-split→pick '
+        f'@ {pick_speed_pct}%'
+        if descent_split_needed
+        else f'pick=approach({approach_offset_z_mm:.0f}mm '
+             f'@ {approach_speed_pct}%)→pick @ {pick_speed_pct}%')
     ctx.exec_lines.append(
         f'-- move_to_pallet EXPANSION: {len(slots)} cycle(s) ({pc_note}), '
         f'{pspec.rows}x{pspec.cols}x{pspec.layers} grid, '
@@ -488,13 +601,23 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         f'transit_h_above_slot={transit_h_mm:.0f}mm  '
         f'approach={approach_dist_mm:.0f}mm  '
         f'retract={retract_dist_mm:.0f}mm  '
-        f'pick=movJ(pick_pt) [cb83ed4 restore, no per-cycle pre-descent]  '
+        f'{pick_desc}  '
+        f'retreat={retreat_offset_z_mm:.0f}mm @ {retreat_speed_pct}%  '
         f'place_approach={place_appr_kind}')
 
     # Set the atomic-rollback mark AFTER the header. Per-cycle body
     # lines below are subject to rollback on IK failure; the header
     # itself remains visible to the operator.
     _abort_mark[0] = len(ctx.exec_lines)
+
+    # Modal setSpeedJ / setSpeedL / setAccL cache local to this
+    # expansion. Reset every time expand() runs (fresh per-cycle
+    # emission). The outer walker also resets its own copies AFTER
+    # expand() returns so a subsequent movJ/movL re-issues its
+    # speed directive.
+    _last_speed_j: float | None = None
+    _last_speed_l: float | None = None
+    _last_accl: float | None = None
 
     # ── per-slot cycles ──────────────────────────────────────
     for sl_idx, sl in enumerate(slots):
@@ -546,19 +669,116 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             + (' + blow-off pulse' if blow_port_do is not None else '')
             + ' -> retract -> transit_Z')
 
-        # (1) movJ(pick_pt) — cb83ed4 restore. No pick_approach, no
-        # pre-descent. Cycle 1 reaches this at whatever pose the walker
-        # left the arm (usually near pick); movJ in joint space handles
-        # it. Cycle 2+ reach this from prev cycle's transit_over_slot;
-        # the joint-space return goes over the pallet safely because
-        # transit_slot Z > pick_Z.
+        # (1a) Approach above pick — consume the absorbed approach's
+        # authored `offset_z_mm` (positive, base +Z). Use movJ so
+        # cycle 1 (arriving from move_home) and cycles 2+ (arriving
+        # from prev transit) don't have to hold a straight-line path
+        # from an unbounded start. Emit setSpeedJ modally.
+        approach_tcp = [
+            float(pick_tcp[0]),
+            float(pick_tcp[1]),
+            float(pick_tcp[2]) + approach_offset_z_mm / 1000.0,
+            float(pick_tcp[3]),
+            float(pick_tcp[4]),
+            float(pick_tcp[5]),
+        ]
+        ik_appr = ctx.seeded_ik_to_pose(list(pick_joints), approach_tcp)
+        if ik_appr is None:
+            _abort(
+                f'-- PALLET IK FAILED: approach above pick '
+                f'({approach_offset_z_mm:.0f}mm) unreachable at Z='
+                f'{approach_tcp[2]*1000:.1f}mm — refusing pallet '
+                f'expansion')
+            return
+        q_appr = ik_appr[0]
+        nm_appr = _next_point_name(ctx)
+        ctx.varspoint[nm_appr] = ctx.make_jp_point(q_appr, nm_appr)
+        ctx.used_named.add(nm_appr)
+        _speed_j_appr = round(approach_speed_pct / 100.0 * ctx.max_dps, 3)
+        if _last_speed_j is None or abs(_speed_j_appr - _last_speed_j) > 1e-4:
+            ctx.exec_lines.append(
+                f'setSpeedJ({_speed_j_appr:g})  -- cycle '
+                f'{sl_idx + 1} approach {approach_speed_pct}% '
+                f'× max {ctx.max_dps:g} deg/s')
+            _last_speed_j = _speed_j_appr
         ctx.exec_lines.append(
-            f'movJ({pick_pt_name})  -- cycle {sl_idx + 1} '
-            f'pick (fixed taught pose)  '
-            f'joints=[{", ".join(f"{v:+.3f}" for v in pick_joints)}]')
+            f'movJ({nm_appr})  -- cycle {sl_idx + 1} approach '
+            f'above pick ({approach_offset_z_mm:.0f}mm above contact, '
+            f'absolute Z={approach_tcp[2]*1000:.1f}mm)  '
+            f'joints=[{", ".join(f"{v:+.3f}" for v in q_appr)}]')
+        seed = list(q_appr)
+
+        # (1b) Descent to pick contact — either single movL (short
+        # descent) or descent-split (long descent > threshold, fast
+        # movL to 50mm above pick + gentle-accel final movL to pick).
+        # Mirrors analyzer Rule 2c so the absorbed adaptation actually
+        # reaches the wire instead of being discarded with the step.
+        _speed_l_pick = round(pick_speed_pct / 100.0 * ctx.max_mmps, 3)
+        _speed_l_appr = round(approach_speed_pct / 100.0 * ctx.max_mmps, 3)
+        if descent_split_needed:
+            split_tcp = [
+                float(pick_tcp[0]),
+                float(pick_tcp[1]),
+                float(pick_tcp[2]) + DESCENT_SPLIT_STOP_ABOVE_MM / 1000.0,
+                float(pick_tcp[3]),
+                float(pick_tcp[4]),
+                float(pick_tcp[5]),
+            ]
+            ik_split = ctx.seeded_ik_to_pose(seed, split_tcp)
+            if ik_split is None:
+                _abort(
+                    f'-- PALLET IK FAILED: descent-split waypoint '
+                    f'({DESCENT_SPLIT_STOP_ABOVE_MM:.0f}mm above pick) '
+                    f'unreachable — refusing pallet expansion')
+                return
+            q_split = ik_split[0]
+            nm_split = _next_point_name(ctx)
+            ctx.varspoint[nm_split] = ctx.make_jp_point(q_split, nm_split)
+            ctx.used_named.add(nm_split)
+            if _last_speed_l is None or abs(_speed_l_appr - _last_speed_l) > 1e-4:
+                ctx.exec_lines.append(
+                    f'setSpeedL({_speed_l_appr:g})  -- cycle '
+                    f'{sl_idx + 1} descent-split fast portion '
+                    f'{approach_speed_pct}% × max {ctx.max_mmps:g} mm/s')
+                _last_speed_l = _speed_l_appr
+            ctx.exec_lines.append(
+                f'movL({nm_split})  -- cycle {sl_idx + 1} '
+                f'descent-split fast to '
+                f'{DESCENT_SPLIT_STOP_ABOVE_MM:.0f}mm above pick '
+                f'(absolute Z={split_tcp[2]*1000:.1f}mm)  '
+                f'joints=[{", ".join(f"{v:+.3f}" for v in q_split)}]')
+            seed = list(q_split)
+            if _last_accl is None or abs(ctx.gentle_accl_mm_s2 - _last_accl) > 1e-4:
+                ctx.exec_lines.append(
+                    f'setAccL({ctx.gentle_accl_mm_s2:g})  -- cycle '
+                    f'{sl_idx + 1} gentle-accel final descent to pick '
+                    f'(descent_split rule 2c mirror)')
+                _last_accl = ctx.gentle_accl_mm_s2
+            if _last_speed_l is None or abs(_speed_l_pick - _last_speed_l) > 1e-4:
+                ctx.exec_lines.append(
+                    f'setSpeedL({_speed_l_pick:g})  -- cycle '
+                    f'{sl_idx + 1} pick descent {pick_speed_pct}% '
+                    f'× max {ctx.max_mmps:g} mm/s')
+                _last_speed_l = _speed_l_pick
+            ctx.exec_lines.append(
+                f'movL({pick_pt_name})  -- cycle {sl_idx + 1} pick '
+                f'(gentle final descent, split at '
+                f'{DESCENT_SPLIT_STOP_ABOVE_MM:.0f}mm above)  '
+                f'joints=[{", ".join(f"{v:+.3f}" for v in pick_joints)}]')
+        else:
+            if _last_speed_l is None or abs(_speed_l_pick - _last_speed_l) > 1e-4:
+                ctx.exec_lines.append(
+                    f'setSpeedL({_speed_l_pick:g})  -- cycle '
+                    f'{sl_idx + 1} pick descent {pick_speed_pct}% '
+                    f'× max {ctx.max_mmps:g} mm/s')
+                _last_speed_l = _speed_l_pick
+            ctx.exec_lines.append(
+                f'movL({pick_pt_name})  -- cycle {sl_idx + 1} pick '
+                f'(descent from {approach_offset_z_mm:.0f}mm above)  '
+                f'joints=[{", ".join(f"{v:+.3f}" for v in pick_joints)}]')
         seed = list(pick_joints)
 
-        # (2) Vacuum ON.
+        # (2) Vacuum ON at pick contact.
         ctx.exec_lines.append(
             f'setDO({vac_port_do},1)  -- cycle {sl_idx + 1} '
             f'vacuum ON  (vacuum_port_do=DO{vac_port_do})')
@@ -569,25 +789,76 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
                 f'wait({seal_wait_ms})  -- cycle {sl_idx + 1} '
                 f'seal wait {seal_wait_ms} ms')
 
-        # (4) Lift to transit_Z above pick.
-        ik_tpick = ctx.seeded_ik_to_pose(seed, transit_pick_m)
-        if ik_tpick is None:
+        # (3.5) Retreat above pick — consume the absorbed retreat's
+        # authored `offset_z_mm` (positive, base +Z). Symmetric with
+        # the approach; use movL so the lift is straight-line above
+        # the pick (no lateral drift while the part settles). Restore
+        # default accL if descent-split bumped it to gentle.
+        if descent_split_needed and _last_accl is not None \
+                and abs(ctx.default_accl_mm_s2 - _last_accl) > 1e-4:
+            ctx.exec_lines.append(
+                f'setAccL({ctx.default_accl_mm_s2:g})  -- cycle '
+                f'{sl_idx + 1} restore default accel after descent-split')
+            _last_accl = ctx.default_accl_mm_s2
+        retreat_tcp = [
+            float(pick_tcp[0]),
+            float(pick_tcp[1]),
+            float(pick_tcp[2]) + retreat_offset_z_mm / 1000.0,
+            float(pick_tcp[3]),
+            float(pick_tcp[4]),
+            float(pick_tcp[5]),
+        ]
+        ik_retreat = ctx.seeded_ik_to_pose(seed, retreat_tcp)
+        if ik_retreat is None:
             _abort(
-                f'-- PALLET IK FAILED: transit_over_pick for slot '
-                f'[{r_idx},{c_idx},{l_idx}] unreachable (target Z='
-                f'{transit_pick_m[2]*1000:.1f}mm) — refusing pallet '
+                f'-- PALLET IK FAILED: retreat above pick '
+                f'({retreat_offset_z_mm:.0f}mm) unreachable at Z='
+                f'{retreat_tcp[2]*1000:.1f}mm — refusing pallet '
                 f'expansion')
             return
-        q_tpick = ik_tpick[0]
-        nm_tpick = _next_point_name(ctx)
-        ctx.varspoint[nm_tpick] = ctx.make_jp_point(q_tpick, nm_tpick)
-        ctx.used_named.add(nm_tpick)
+        q_retreat = ik_retreat[0]
+        nm_retreat = _next_point_name(ctx)
+        ctx.varspoint[nm_retreat] = ctx.make_jp_point(q_retreat, nm_retreat)
+        ctx.used_named.add(nm_retreat)
+        _speed_l_retreat = round(retreat_speed_pct / 100.0 * ctx.max_mmps, 3)
+        if _last_speed_l is None or abs(_speed_l_retreat - _last_speed_l) > 1e-4:
+            ctx.exec_lines.append(
+                f'setSpeedL({_speed_l_retreat:g})  -- cycle '
+                f'{sl_idx + 1} retreat {retreat_speed_pct}% '
+                f'× max {ctx.max_mmps:g} mm/s')
+            _last_speed_l = _speed_l_retreat
         ctx.exec_lines.append(
-            f'movL({nm_tpick})  -- cycle {sl_idx + 1} '
-            f'lift-to-transit (over pick, absolute Z='
-            f'{transit_pick_m[2]*1000:.1f}mm)  '
-            f'joints=[{", ".join(f"{v:+.3f}" for v in q_tpick)}]')
-        seed = list(q_tpick)
+            f'movL({nm_retreat})  -- cycle {sl_idx + 1} retreat '
+            f'above pick ({retreat_offset_z_mm:.0f}mm above contact, '
+            f'absolute Z={retreat_tcp[2]*1000:.1f}mm)  '
+            f'joints=[{", ".join(f"{v:+.3f}" for v in q_retreat)}]')
+        seed = list(q_retreat)
+
+        # (4) Lift to transit_Z above pick — only emit when retreat
+        # left us BELOW the traversal height. If the operator authored
+        # a retreat >= transit height, we're already at (or above) the
+        # traversal Z and this move would go DOWNWARD; skip it and
+        # let (5) traverse straight from retreat over to the slot.
+        retreat_z_abs = float(retreat_tcp[2])
+        if retreat_z_abs < float(transit_pick_m[2]) - 1e-4:
+            ik_tpick = ctx.seeded_ik_to_pose(seed, transit_pick_m)
+            if ik_tpick is None:
+                _abort(
+                    f'-- PALLET IK FAILED: transit_over_pick for slot '
+                    f'[{r_idx},{c_idx},{l_idx}] unreachable (target Z='
+                    f'{transit_pick_m[2]*1000:.1f}mm) — refusing pallet '
+                    f'expansion')
+                return
+            q_tpick = ik_tpick[0]
+            nm_tpick = _next_point_name(ctx)
+            ctx.varspoint[nm_tpick] = ctx.make_jp_point(q_tpick, nm_tpick)
+            ctx.used_named.add(nm_tpick)
+            ctx.exec_lines.append(
+                f'movL({nm_tpick})  -- cycle {sl_idx + 1} '
+                f'lift-to-transit (over pick, absolute Z='
+                f'{transit_pick_m[2]*1000:.1f}mm)  '
+                f'joints=[{", ".join(f"{v:+.3f}" for v in q_tpick)}]')
+            seed = list(q_tpick)
 
         # (5) Traverse over slot at transit_Z.
         ik_tslot = ctx.seeded_ik_to_pose(seed, transit_slot_m)

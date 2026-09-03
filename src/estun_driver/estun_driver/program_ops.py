@@ -4084,6 +4084,10 @@ def codegen_lua_from_program(
                 tcp_from_joints_m=_tcp_from_joints_m,
                 make_jp_point=_make_jp_point,
                 fallback_idx=_fbi,
+                max_dps=float(max_dps),
+                max_mmps=float(max_mmps),
+                default_accl_mm_s2=float(mc['default_accL_mm_per_s2']),
+                gentle_accl_mm_s2=float(mc['gentle_descent_accL_mm_per_s2']),
             )
             _pallet.expand(step, _ctx)
             fallback_idx = _fbi[0]
@@ -4092,6 +4096,14 @@ def codegen_lua_from_program(
             # positive against a stale target after a multi-cycle emit.
             last_move_joints = None
             last_move_col_locked = False
+            # Reset modal speed/accel guards too — expand() emits its
+            # own setSpeedJ/L/AccL for the per-cycle approach/descent-
+            # split/retreat sequence, so the walker's modal cache is
+            # stale after return. Force the next walker-emitted move
+            # to re-issue its speed directive.
+            _last_speed_j = None
+            _last_speed_l = None
+            _last_accl = None
             continue
 
         # ---- Loop — for-loop wrap OR continuous goto ----------------
