@@ -721,7 +721,7 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4187
+        line: 4214
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
@@ -729,17 +729,20 @@ capabilities:
           on each commit that adds material above; refresh from
           fork_lint output when it moves. 2026-08-31 F2.7: shifted
           to 4132 by the executor bridge (~110 lines). 2026-09-04:
-          shifted 4132 → 4187 by the edition-gate middleware
-          (_EDITION_FULL_ONLY_PATTERNS + _edition_gate_middleware,
-          ~55 lines).
+          shifted 4132 → 4187 by the edition-gate middleware.
+          2026-09-04 (later): shifted 4187 → 4214 when the
+          middleware pattern list gained method-aware triples +
+          six cell_commissioning entries (~27 lines).
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4322
+        line: 4349
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. 2026-08-31 F2.7: shifted from 4156 to 4267 by
           the executor bridge; 2026-09-04: shifted 4267 → 4322 by
-          the edition-gate middleware.
+          the edition-gate middleware; 2026-09-04 (later): shifted
+          4322 → 4349 by the same method-aware middleware
+          expansion.
         owner: dashboard-transport
       - path: src/cobot_dashboard/frontend/src/lib/holdTicker.js
         line: 0
