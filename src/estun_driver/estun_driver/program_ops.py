@@ -1376,6 +1376,21 @@ _KNOWN_BAD_PATTERNS.append(('setBlender', _bad_setBlender_arg))
 # the pending-pose scan on every push. Teach the poses → next push
 # passes → run is unblocked.
 
+# Shared blend policy (2026-09-04, SCOPE-EXPANDED from the pallet-
+# only emission to the ENTIRE codegen path). Both this module and
+# `pallet.py` consume `codegen_blend` — the ONE source of truth for
+# the per-waypoint blend radius, the fine/blend classifier, and the
+# whitelist-legal `b=NN` suffix helpers. See `codegen_blend.py` for
+# rationale on why it lives in its own tiny module (circular-import
+# avoidance vs. leaving two drifting copies).
+from .codegen_blend import (
+    BLEND_RADIUS_MM,
+    mov_blend_suffix,
+    mov_blend_kv,
+    step_forces_stop,
+)
+
+
 _NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK = frozenset({
     'set_io', 'wait', 'wait_input', 'loop',
     'gripper', 'gripper_close', 'gripper_open',
@@ -4324,12 +4339,16 @@ def codegen_lua_from_program(
                 joints_s = ', '.join(f'{float(v):+.3f}' for v in tj) if tj else ''
                 j5_note = (f'J5={float(tj[4]):+.2f}°' if len(tj) >= 5 else 'J5=?')
                 _emit_motion_prelude(_step_idx, 'movJ', step)
+                _is_stop = step_forces_stop(steps, _step_idx)
+                _blend  = '' if _is_stop else mov_blend_suffix()
+                _tag    = '[FINE]' if _is_stop else f'[BLEND {int(BLEND_RADIUS_MM)}mm]'
                 exec_lines.append(
-                    f'movJ({ref})  -- step {action}  '
+                    f'movJ({ref}{_blend})  -- step {action}  '
                     f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
                     f'(FIX A: identity offset → reuse anchor jp; no IK)  '
                     f'{j5_note}'
-                    + (f'  joints=[{joints_s}]' if joints_s else ''))
+                    + (f'  joints=[{joints_s}]' if joints_s else '')
+                    + f'  {_tag}')
                 if len(tj) == 6:
                     last_move_joints = [float(v) for v in tj]
                 last_move_col_locked = False
@@ -4507,13 +4526,16 @@ def codegen_lua_from_program(
                                     f'  orient_dev=(rx={drx:.2f}°,ry={dry:.2f}°,rz={drz:.2f}°)'
                                     f' max={worst:.2f}°{flag}')
                         _emit_motion_prelude(_step_idx, emit_verb_derived, step)
+                        _is_stop = step_forces_stop(steps, _step_idx)
+                        _blend   = '' if _is_stop else mov_blend_suffix()
+                        _tag     = '[FINE]' if _is_stop else f'[BLEND {int(BLEND_RADIUS_MM)}mm]'
                         exec_lines.append(
-                            f'{emit_verb_derived}({name})  -- step {action}'
+                            f'{emit_verb_derived}({name}{_blend})  -- step {action}'
                             f'{divergence_note}  '
                             f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
                             f'(FIX C: SEEDED IK Δz={achieved:+.2f} mm; '
                             f'taught J5={anchor_j5:+.2f}° → emitted J5={lifted_deg[4]:+.2f}° '
-                            f'Δ{j5_delta:.3f}°)  joints=[{joints_s}]{feas_note}{orient_note}')
+                            f'Δ{j5_delta:.3f}°)  joints=[{joints_s}]{feas_note}{orient_note}  {_tag}')
                         last_move_joints = list(lifted_deg)
                         last_move_col_locked = (column_side is not None
                                                 and _col_ori_err_deg is not None)
@@ -4530,11 +4552,14 @@ def codegen_lua_from_program(
             _divergence = (' (emitted movJCoorRel — seeded IK unavailable, '
                            'joint-space with cartesian Z-offset)'
                            if action == 'move_linear' else '')
+            _is_stop = step_forces_stop(steps, _step_idx)
+            _blend_kv = '' if _is_stop else ',' + mov_blend_kv()
+            _tag = '[FINE]' if _is_stop else f'[BLEND {int(BLEND_RADIUS_MM)}mm]'
             exec_lines.append(
-                f'movJCoorRel({{cp={{0,0,{ofs_mm:g},0,0,0}}}},{{coor=0,tool=0}})  '
+                f'movJCoorRel({{cp={{0,0,{ofs_mm:g},0,0,0}}}},{{coor=0,tool=0{_blend_kv}}})  '
                 f'-- step {action}{_divergence}  derived_from={role!r} '
                 f'offset_z_mm={ofs_mm:g}  '
-                f'(FIX B v2 fallback)')
+                f'(FIX B v2 fallback)  {_tag}')
             # movJCoorRel hands wrist branch selection to the
             # controller — downstream verifiers (zero-length guard,
             # wrist-deviation check on the next taught contact) must
@@ -4611,9 +4636,12 @@ def codegen_lua_from_program(
                         f'-- WRIST-LOCK FALLBACK: descend as joint-space movJ  '
                         f'(reason: {chk["reason"]})')
             _emit_motion_prelude(_step_idx, emit_verb, step)
+            _is_stop = step_forces_stop(steps, _step_idx)
+            _blend   = '' if _is_stop else mov_blend_suffix()
+            _tag     = '[FINE]' if _is_stop else f'[BLEND {int(BLEND_RADIUS_MM)}mm]'
             exec_lines.append(
-                f'{emit_verb}({pn})  -- step {action}{divergence_note}  '
-                f'point={pn}  {j5_note}  joints=[{joints_s}]{wrist_note}')
+                f'{emit_verb}({pn}{_blend})  -- step {action}{divergence_note}  '
+                f'point={pn}  {j5_note}  joints=[{joints_s}]{wrist_note}  {_tag}')
             last_move_joints = j_list
             last_move_col_locked = False
             continue
@@ -4731,10 +4759,17 @@ def codegen_lua_from_program(
                     f'-- motion_check RULE 2c DESCENT SPLIT: intermediate '
                     f'stop at {split_z:g}mm above taught contact')
                 _emit_motion_prelude(_step_idx, 'movL', step)
+                # RULE 2c intermediate waypoint is BY CONSTRUCTION an
+                # intermediate — it exists to smooth the descent into
+                # the taught contact and is always followed by the
+                # gentle-final movL to the contact itself. Always
+                # BLEND here regardless of the step's overall
+                # classification.
                 exec_lines.append(
-                    f'movL({inter_name})  -- step {action} (RULE 2c intermediate '
+                    f'movL({inter_name}{mov_blend_suffix()})  -- step {action} (RULE 2c intermediate '
                     f'movL Δz={achieved:+.2f}mm above contact)  '
-                    f'joints=[{inter_joints_s}]')
+                    f'joints=[{inter_joints_s}]  '
+                    f'[BLEND {int(BLEND_RADIUS_MM)}mm]')
                 # Emit gentle setAccL for the final descent. Modal —
                 # if we're already at the gentle value it's a no-op.
                 if _last_accl is None or abs(gentle_accL - _last_accl) > 1e-4:
@@ -4751,9 +4786,12 @@ def codegen_lua_from_program(
                     'did not converge for the intermediate pose; falling '
                     'through to single-shot descent')
         _emit_motion_prelude(_step_idx, emit_verb, step)
+        _is_stop = step_forces_stop(steps, _step_idx)
+        _blend   = '' if _is_stop else mov_blend_suffix()
+        _tag     = '[FINE]' if _is_stop else f'[BLEND {int(BLEND_RADIUS_MM)}mm]'
         exec_lines.append(
-            f'{emit_verb}({name})  -- step {action}{inline_divergence_note}  '
-            f'{j5_note}  joints=[{joints_s}]{wrist_note}')
+            f'{emit_verb}({name}{_blend})  -- step {action}{inline_divergence_note}  '
+            f'{j5_note}  joints=[{joints_s}]{wrist_note}  {_tag}')
         last_move_joints = taught_list
         last_move_col_locked = False
         # After a descent split, restore default setAccL so the

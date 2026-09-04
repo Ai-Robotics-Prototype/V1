@@ -301,28 +301,19 @@ def _next_point_name(ctx: ExpandCtx) -> str:
 _NEUTRAL_SEED = [0.0, -45.0, 90.0, 0.0, 90.0, 0.0]
 
 
-# 2026-09-04 — per-waypoint blend radius for INTERMEDIATE pallet-cycle
-# moves. Whitelist-legal via luaenginelib's movJ/movL `b=<mm>` arg
-# (wire-example `movL(p1,{v=1000,a=3000,b=100,coor=1,tool=1})`).
-#
-# 20 mm is deliberately conservative: well under the 100 mm default
-# approach offset so the vertical descent to pick still arrives
-# straight down without the blend curve undercutting into the pick's
-# XY. Applied ONLY to intermediate waypoints (approach, split, retreat,
-# transit_over_pick, transit_over_slot, place_approach, post-release
-# linear-up, post-release lift-to-transit). NEVER emitted on the taught
-# pick contact or the taught slot place — both are fine points followed
-# by setDO+wait steps that force an exact stop for the vacuum
-# transition. Emitting b= on the fine points would let the blender
-# round the corner and trip vacuum ON before actual contact.
-_BLEND_RADIUS_MM = 20.0
-
-
-def _mov_blend_arg() -> str:
-    """Return the `, {b=NN}` suffix for an intermediate movJ/movL call.
-    Kept as a helper so a future radius change (or per-segment tuning)
-    lands in ONE place instead of at every emission site."""
-    return f', {{b={int(_BLEND_RADIUS_MM)}}}'
+# 2026-09-04 — per-waypoint blend radius is now the SHARED codegen
+# primitive from `program_ops`. `pallet.py` used to define its own
+# `_BLEND_RADIUS_MM` + `_mov_blend_arg`; the general codegen path was
+# then extended to blend too (SCOPE CHANGE 2026-09-04), and two
+# copies of the same rule is precisely how the absorber-vs-emitter
+# drift showed up in an earlier session. The pallet expansion still
+# owns its own per-waypoint STOP/BLEND classification because its
+# waypoint roles (approach / pick / retreat / traverse / slot /
+# retract) are fixed by the compound `move_to_pallet` semantics and
+# don't map onto the general step-lookahead classifier. Constants +
+# suffix helpers live in one place.
+from .codegen_blend import BLEND_RADIUS_MM as _BLEND_RADIUS_MM
+from .codegen_blend import mov_blend_suffix as _mov_blend_arg
 
 
 def _multi_seed_ik(ctx: ExpandCtx, primary_seed, target_tcp_m,
