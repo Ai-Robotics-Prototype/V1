@@ -301,6 +301,30 @@ def _next_point_name(ctx: ExpandCtx) -> str:
 _NEUTRAL_SEED = [0.0, -45.0, 90.0, 0.0, 90.0, 0.0]
 
 
+# 2026-09-04 — per-waypoint blend radius for INTERMEDIATE pallet-cycle
+# moves. Whitelist-legal via luaenginelib's movJ/movL `b=<mm>` arg
+# (wire-example `movL(p1,{v=1000,a=3000,b=100,coor=1,tool=1})`).
+#
+# 20 mm is deliberately conservative: well under the 100 mm default
+# approach offset so the vertical descent to pick still arrives
+# straight down without the blend curve undercutting into the pick's
+# XY. Applied ONLY to intermediate waypoints (approach, split, retreat,
+# transit_over_pick, transit_over_slot, place_approach, post-release
+# linear-up, post-release lift-to-transit). NEVER emitted on the taught
+# pick contact or the taught slot place — both are fine points followed
+# by setDO+wait steps that force an exact stop for the vacuum
+# transition. Emitting b= on the fine points would let the blender
+# round the corner and trip vacuum ON before actual contact.
+_BLEND_RADIUS_MM = 20.0
+
+
+def _mov_blend_arg() -> str:
+    """Return the `, {b=NN}` suffix for an intermediate movJ/movL call.
+    Kept as a helper so a future radius change (or per-segment tuning)
+    lands in ONE place instead of at every emission site."""
+    return f', {{b={int(_BLEND_RADIUS_MM)}}}'
+
+
 def _multi_seed_ik(ctx: ExpandCtx, primary_seed, target_tcp_m,
                    pick_joints):
     """Try the primary seed, then the taught pick, then a neutral
@@ -746,10 +770,11 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
                 f'× max {ctx.max_dps:g} deg/s')
             _last_speed_j = _speed_j_appr
         ctx.exec_lines.append(
-            f'movJ({nm_appr})  -- cycle {sl_idx + 1} approach '
+            f'movJ({nm_appr}{_mov_blend_arg()})  -- cycle {sl_idx + 1} approach '
             f'above pick ({approach_offset_z_mm:.0f}mm above contact, '
             f'absolute Z={approach_tcp[2]*1000:.1f}mm)  '
-            f'joints=[{", ".join(f"{v:+.3f}" for v in q_appr)}]')
+            f'joints=[{", ".join(f"{v:+.3f}" for v in q_appr)}]  '
+            f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
         seed = list(q_appr)
 
         # (1b) Descent to pick contact — either single movL (short
@@ -786,11 +811,12 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
                     f'{approach_speed_pct}% × max {ctx.max_mmps:g} mm/s')
                 _last_speed_l = _speed_l_appr
             ctx.exec_lines.append(
-                f'movL({nm_split})  -- cycle {sl_idx + 1} '
+                f'movL({nm_split}{_mov_blend_arg()})  -- cycle {sl_idx + 1} '
                 f'descent-split fast to '
                 f'{DESCENT_SPLIT_STOP_ABOVE_MM:.0f}mm above pick '
                 f'(absolute Z={split_tcp[2]*1000:.1f}mm)  '
-                f'joints=[{", ".join(f"{v:+.3f}" for v in q_split)}]')
+                f'joints=[{", ".join(f"{v:+.3f}" for v in q_split)}]  '
+                f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
             seed = list(q_split)
             if _last_accl is None or abs(ctx.gentle_accl_mm_s2 - _last_accl) > 1e-4:
                 ctx.exec_lines.append(
@@ -808,7 +834,8 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
                 f'movL({pick_pt_name})  -- cycle {sl_idx + 1} pick '
                 f'(gentle final descent, split at '
                 f'{DESCENT_SPLIT_STOP_ABOVE_MM:.0f}mm above)  '
-                f'joints=[{", ".join(f"{v:+.3f}" for v in pick_joints)}]')
+                f'joints=[{", ".join(f"{v:+.3f}" for v in pick_joints)}]  '
+                f'[FINE — setDO+wait force stop]')
         else:
             if _last_speed_l is None or abs(_speed_l_pick - _last_speed_l) > 1e-4:
                 ctx.exec_lines.append(
@@ -819,7 +846,8 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             ctx.exec_lines.append(
                 f'movL({pick_pt_name})  -- cycle {sl_idx + 1} pick '
                 f'(descent from {approach_offset_z_mm:.0f}mm above)  '
-                f'joints=[{", ".join(f"{v:+.3f}" for v in pick_joints)}]')
+                f'joints=[{", ".join(f"{v:+.3f}" for v in pick_joints)}]  '
+                f'[FINE — setDO+wait force stop]')
         seed = list(pick_joints)
 
         # (2) Vacuum ON at pick contact.
@@ -872,10 +900,11 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
                 f'× max {ctx.max_mmps:g} mm/s')
             _last_speed_l = _speed_l_retreat
         ctx.exec_lines.append(
-            f'movL({nm_retreat})  -- cycle {sl_idx + 1} retreat '
+            f'movL({nm_retreat}{_mov_blend_arg()})  -- cycle {sl_idx + 1} retreat '
             f'above pick ({retreat_offset_z_mm:.0f}mm above contact, '
             f'absolute Z={retreat_tcp[2]*1000:.1f}mm)  '
-            f'joints=[{", ".join(f"{v:+.3f}" for v in q_retreat)}]')
+            f'joints=[{", ".join(f"{v:+.3f}" for v in q_retreat)}]  '
+            f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
         seed = list(q_retreat)
 
         # (4) Lift to transit_Z above pick — only emit when retreat
@@ -898,10 +927,11 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             ctx.varspoint[nm_tpick] = ctx.make_jp_point(q_tpick, nm_tpick)
             ctx.used_named.add(nm_tpick)
             ctx.exec_lines.append(
-                f'movL({nm_tpick})  -- cycle {sl_idx + 1} '
+                f'movL({nm_tpick}{_mov_blend_arg()})  -- cycle {sl_idx + 1} '
                 f'lift-to-transit (over pick, absolute Z='
                 f'{transit_pick_m[2]*1000:.1f}mm)  '
-                f'joints=[{", ".join(f"{v:+.3f}" for v in q_tpick)}]')
+                f'joints=[{", ".join(f"{v:+.3f}" for v in q_tpick)}]  '
+                f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
             seed = list(q_tpick)
 
         # (5) Traverse over slot at transit_Z.
@@ -917,10 +947,11 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         ctx.varspoint[nm_tslot] = ctx.make_jp_point(q_tslot, nm_tslot)
         ctx.used_named.add(nm_tslot)
         ctx.exec_lines.append(
-            f'movL({nm_tslot})  -- cycle {sl_idx + 1} '
+            f'movL({nm_tslot}{_mov_blend_arg()})  -- cycle {sl_idx + 1} '
             f'traverse-over-slot [{r_idx},{c_idx},{l_idx}] at '
             f'transit_Z={transit_slot_m[2]*1000:.1f}mm  '
-            f'joints=[{", ".join(f"{v:+.3f}" for v in q_tslot)}]')
+            f'joints=[{", ".join(f"{v:+.3f}" for v in q_tslot)}]  '
+            f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
         seed = list(q_tslot)
 
         # (6) Descend to place_approach (layer-adjusted).
@@ -937,11 +968,12 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             q_place_appr, nm_place_appr)
         ctx.used_named.add(nm_place_appr)
         ctx.exec_lines.append(
-            f'movL({nm_place_appr})  -- cycle {sl_idx + 1} '
+            f'movL({nm_place_appr}{_mov_blend_arg()})  -- cycle {sl_idx + 1} '
             f'place_approach [{r_idx},{c_idx},{l_idx}] layer {l_idx} '
             f'({place_appr_kind_line}, absolute Z='
             f'{place_appr_tcp[2]*1000:.1f}mm)  '
-            f'joints=[{", ".join(f"{v:+.3f}" for v in q_place_appr)}]')
+            f'joints=[{", ".join(f"{v:+.3f}" for v in q_place_appr)}]  '
+            f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
         seed = list(q_place_appr)
 
         # (7) LINEAR DOWN to place at slot.
@@ -958,7 +990,7 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         ctx.exec_lines.append(
             f'movL({nm_slot})  -- slot[{r_idx},{c_idx},{l_idx}] place  '
             f'joints=[{", ".join(f"{v:+.3f}" for v in q_slot)}]  '
-            f'(linear-down from approach)')
+            f'(linear-down from approach)  [FINE — setDO release forces stop]')
         seed = list(q_slot)
 
         # (8) Vacuum OFF (release).
@@ -981,14 +1013,16 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
 
         # (10) LINEAR UP — retract to place_approach.
         ctx.exec_lines.append(
-            f'movL({nm_place_appr})  -- cycle {sl_idx + 1} '
+            f'movL({nm_place_appr}{_mov_blend_arg()})  -- cycle {sl_idx + 1} '
             f'linear-up to place_approach (retract '
             f'{retract_dist_mm:.0f}mm)  '
-            f'joints=[{", ".join(f"{v:+.3f}" for v in q_place_appr)}]')
+            f'joints=[{", ".join(f"{v:+.3f}" for v in q_place_appr)}]  '
+            f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
 
         # (11) Lift back to transit_Z above slot.
         ctx.exec_lines.append(
-            f'movL({nm_tslot})  -- cycle {sl_idx + 1} '
+            f'movL({nm_tslot}{_mov_blend_arg()})  -- cycle {sl_idx + 1} '
             f'lift-to-transit (over slot after release, '
             f'transit_Z={transit_slot_m[2]*1000:.1f}mm)  '
-            f'joints=[{", ".join(f"{v:+.3f}" for v in q_tslot)}]')
+            f'joints=[{", ".join(f"{v:+.3f}" for v in q_tslot)}]  '
+            f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
