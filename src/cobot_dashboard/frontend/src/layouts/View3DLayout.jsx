@@ -6,6 +6,7 @@ import JointJogPanel from '../components/JointJogPanel'
 import JogControls from '../components/JogControls'
 import IKGizmo from '../components/IKGizmo'
 import ArmEnableControl from '../components/ArmEnableControl'
+import JogReadyBadge from '../components/JogReadyBadge'
 import ModeControl from '../components/ModeControl'
 
 // The 3D View tab hosts three separate jog surfaces:
@@ -134,6 +135,12 @@ function RealArmChrome({ mode, setMode, children }) {
       }}>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           <ArmEnableControl />
+          {/* 2026-09-04 operator directive: compact READY / NOT-READY
+              badge replaces the full-width green banner inside
+              JogControls. Placed directly next to the enable button
+              so the operator's pre-jog cue stays visible at a glance
+              without eating banner-height. */}
+          <JogReadyBadge />
           <ModeControl />
         </div>
         <div style={{ display: 'flex', gap: 6 }}>

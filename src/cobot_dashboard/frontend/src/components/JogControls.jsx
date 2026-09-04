@@ -457,12 +457,9 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   const jogPulseCartesian  = useStore((s) => s.jogPulseCartesian)
   const sendPowerCommand   = useStore((s) => s.sendPowerCommand)
   // Banner is the MINIMIZED form of AlarmRecoveryModal. When the modal
-  // is minimized AND a condition still exists, the banner grows a
-  // "Recovery guide" chip that flips minimized back to false to
-  // reopen the modal. Single source of truth: same store slice as the
-  // modal reads.
-  const alarmModalMinimized = useStore((s) => s.alarmModalMinimized)
-  const setAlarmModalMinimized = useStore((s) => s.setAlarmModalMinimized)
+  // 2026-09-04: the banner's "Recovery guide" reopen chip is retired
+  // along with the banner itself. AlarmRecoveryModal owns its own
+  // minimize/restore lifecycle; JogControls no longer participates.
   const jogStyle          = useStore((s) => s.jogStyle) || 'CONTINUOUS'
   const setJogStyle       = useStore((s) => s.setJogStyle)
   const program           = useStore((s) => s.program) || { steps: [] }
@@ -651,20 +648,28 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   // fork on the raw reason lives here anymore (fork registry:
   // `jog_stop_cause_propagation`, 2026-08-04 Lesson 165).
 
-  // ── State banner ─────────────────────────────────────────────
-  // Explicit reason surface — buttons only grey when banner is not
-  // READY. No silent disables. `bannerAction` is a small affordance
-  // rendered inline (Enable / Disable / Clear-Alarm) so the banner
-  // itself is the control point for power transitions. Nothing here
-  // auto-fires — every action goes through a confirm dialog below.
+  // ── Jog-gate state (2026-09-04 banner retirement) ────────────
+  // The full-width banner + inline action pills are retired per
+  // operator directive; the visual "READY / NOT READY" cue lives in
+  // <JogReadyBadge /> up in RealArmChrome's header, next to the
+  // enable button. This block keeps ONLY the internal state we still
+  // need:
+  //   * `bannerLevel` → drives `jogGateOk` (used to grey out pad
+  //     buttons and pick the not-ready tooltip below).
+  //   * `bannerText`  → tooltip on greyed jog buttons ("why can't I
+  //     jog right now"). The badge upstream also shows this, so the
+  //     precedence table here is byte-aligned with the one in
+  //     JogReadyBadge.computeReadyState.
+  //
+  // Actions previously rendered inline in the banner are ALL gone:
+  //   * Enable / Disable        → <ArmEnableControl /> owns power
+  //   * Clear Alarm             → AlarmRecoveryModal owns it
+  //   * ↗ Recovery guide        → AlarmRecoveryModal re-opens itself
+  //                               when its underlying condition
+  //                               re-fires; the escape hatch chip
+  //                               is retired with the banner.
   let bannerLevel = 'ready'
   let bannerText  = 'READY'
-  // Array of {kind, label, appearance, disabled?, tooltip?}. Rendered
-  // inline right-aligned in the banner in array order. Alarm state
-  // gets two entries so the operator sees the intended sequence
-  // (Clear Alarm → then Enable) — the second is disabled while the
-  // alarm is active, so it can't be clicked out of order.
-  let bannerActions = []
   if (estop) {
     bannerLevel = 'error'
     bannerText  = 'E-STOP — release to jog'
@@ -672,63 +677,20 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
     bannerLevel = 'error'
     bannerText  = 'DRIVER DISCONNECTED'
   } else if (anyOutOfRange) {
-    // Joint(s) past controller limit. The AlarmRecoveryModal is the
-    // PRIMARY surface; this banner is the minimized form. When the
-    // operator has minimized the modal, we grow a "Recovery guide"
-    // chip so they can reopen it. Direction/progress live inside the
-    // modal now — not duplicated here.
     bannerLevel = 'error'
     bannerText  = outOfRangeJoints.length > 1
       ? `JOINTS PAST LIMIT: ${outOfRangeJoints.map((j) => 'J' + j.joint).join(', ')}`
       : `J${outOfRangeJoints[0].joint} PAST LIMIT`
-    bannerActions = alarmModalMinimized
-      ? [{ kind: 'reopen_alarm_modal', label: '↗ Recovery guide', appearance: 'danger' }]
-      : []
   } else if (robot.alarm) {
-    // Alarm without out-of-range — same story: modal is primary,
-    // banner is the minimized form. When minimized, offer the reopen
-    // affordance. The Clear Alarm / Enable buttons live in the modal
-    // now; keeping them in the banner would duplicate state and split
-    // the operator's attention.
     bannerLevel = 'error'
     bannerText  = alarmCopy?.headline
       || (robot.alarm_count > 1 ? `ALARM (${robot.alarm_count} active)` : 'ALARM')
-    bannerActions = alarmModalMinimized
-      ? [{ kind: 'reopen_alarm_modal', label: '↗ Recovery guide', appearance: 'danger' }]
-      : []
-  } else if (robot.alarm_count === 0 && robot.joint_limits?.some &&
-             robot.joint_limits.some((j) => j?.near_limit) && !robot.enabled) {
-    // Transitional "back in range" state: the operator has jogged the
-    // joint(s) back below limit but hasn't cleared the alarm yet, OR
-    // the alarm has just cleared and we're still disabled. This is the
-    // amber sweet spot that tells the operator "you're clear, now
-    // Clear Alarm → Enable". Only fires when no joint is out_of_range
-    // AND no active_alarm — safe to click both actions in sequence.
-    // (We check near_limit as a soft indicator; not a gate.)
-    bannerLevel = 'warn'
-    bannerText  = 'BACK IN RANGE — CLEAR ALARM, THEN ENABLE'
-    if (robot.allow_power) {
-      bannerActions = [
-        { kind: 'clear_alarm', label: 'Clear Alarm', appearance: 'danger' },
-        { kind: 'enable', label: 'Enable', appearance: 'primary' },
-      ]
-    }
   } else if (robot.enabling) {
-    // Transient state observed on the wire (state=1 "Enabling"). The
-    // banner shows this until state transitions to 2/3 (enabled) or
-    // back to 0 (failure to enable, which drops us to the disabled case).
     bannerLevel = 'warn'
     bannerText  = 'ENABLING…'
   } else if (!robot.enabled) {
     bannerLevel = 'warn'
-    bannerText  = 'ROBOT DISABLED'
-    if (robot.allow_power) {
-      bannerActions = [{ kind: 'enable', label: 'Enable', appearance: 'primary' }]
-    } else {
-      // Match the previous message for the closed-gate case so the
-      // operator still knows the pendant fallback path.
-      bannerText = 'ROBOT DISABLED — enable on pendant'
-    }
+    bannerText  = robot.allow_power ? 'ROBOT DISABLED' : 'ROBOT DISABLED — enable on pendant'
   } else if (running) {
     const stateLabel = paused ? 'paused' : (state || 'running')
     bannerLevel = 'warn'
@@ -736,17 +698,6 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   } else if (!robot.allow_jog) {
     bannerLevel = 'warn'
     bannerText  = 'JOG GATE CLOSED — set ESTUN_ALLOW_JOG=1 on the driver'
-    // Enabled but jog closed — still offer Disable to safe the arm.
-    if (robot.allow_power) {
-      bannerActions = [{ kind: 'disable', label: 'Disable', appearance: 'subtle' }]
-    }
-  } else {
-    // READY. Subtle Disable button on the right so the operator can
-    // safe the arm without hunting through menus. Present but not
-    // inviting: neutral colour, small target.
-    if (robot.allow_power) {
-      bannerActions = [{ kind: 'disable', label: 'Disable', appearance: 'subtle' }]
-    }
   }
   const jogGateOk = bannerLevel === 'ready'
 
@@ -888,72 +839,18 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
     handleRun()
   }
 
-  const bannerBg = bannerLevel === 'ready' ? '#065F46'
-                 : bannerLevel === 'warn'  ? '#B45309'
-                 : /* error */              '#991B1B'
-
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', position: 'relative' }}>
-      {/* State banner — always visible. Buttons grey only when non-READY. */}
-      <div style={{
-        background: bannerBg,
-        color: '#fff',
-        padding: '4px 10px',
-        fontSize: 11, fontWeight: 700,
-        letterSpacing: '0.06em', textTransform: 'uppercase',
-        flexShrink: 0,
-        display: 'flex', alignItems: 'center', gap: 8,
-      }}>
-        <span style={{
-          width: 8, height: 8, borderRadius: '50%',
-          background: bannerLevel === 'ready' ? '#34D399'
-                    : bannerLevel === 'warn'  ? '#FDE68A'
-                    : '#FCA5A5',
-        }} />
-        <span style={{ flex: 1 }}>{bannerText}</span>
-        {bannerActions.map((a) => (
-          <button
-            key={a.kind}
-            onClick={() => {
-              if (a.disabled) return
-              // `reopen_alarm_modal` is the banner's escape hatch back
-              // into the modal — different action from the power verbs.
-              if (a.kind === 'reopen_alarm_modal') {
-                setAlarmModalMinimized(false)
-                return
-              }
-              openPowerConfirm(a.kind)
-            }}
-            disabled={!!a.disabled}
-            title={a.tooltip || undefined}
-            style={{
-              // Three appearances so DISABLE looks unlike ENABLE.
-              // primary — filled green (invites the transition)
-              // danger  — filled red   (only used for Clear-Alarm)
-              // subtle  — outline over the READY banner (present, not inviting)
-              background:
-                a.appearance === 'primary' ? '#059669'
-                : a.appearance === 'danger'  ? '#B91C1C'
-                :                              'transparent',
-              color:  '#fff',
-              border: a.appearance === 'subtle'
-                ? '1px solid rgba(255,255,255,0.55)'
-                : '1px solid transparent',
-              padding: a.appearance === 'subtle' ? '2px 8px' : '3px 10px',
-              borderRadius: 6,
-              fontSize: 10, fontWeight: 700,
-              letterSpacing: '0.04em',
-              cursor: a.disabled ? 'not-allowed' : 'pointer',
-              opacity: a.disabled ? 0.45 : 1,
-              whiteSpace: 'nowrap',
-            }}
-          >
-            {a.label}
-          </button>
-        ))}
-      </div>
+      {/* 2026-09-04: the full-width State banner is retired. The
+          READY / NOT-READY cue lives in <JogReadyBadge /> up in the
+          RealArmChrome header, next to the enable button. Actions
+          previously in the banner (Enable / Disable / Clear Alarm /
+          Recovery-guide reopen) route through their canonical
+          owners: ArmEnableControl for power, AlarmRecoveryModal for
+          alarms. Vertical space reclaimed for the 3D viewport. */}
 
-      {/* Recovery sub-line — shown UNDER the banner. Two sources, in
+      {/* Recovery sub-line — shown at the top of the pendant. Two
+          sources, in
           priority order:
             1. Live joint-limit recovery guide (any joint out_of_range) —
                multi-line with direction + live-degrees readout,
