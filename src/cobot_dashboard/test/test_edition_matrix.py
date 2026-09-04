@@ -257,6 +257,26 @@ def test_server_ships_edition_endpoints():
     assert 'from cobot_dashboard import edition as _edition_mod' in src
 
 
+# ── Load-to-Monitor button ships in both editions ──────────────
+
+def test_load_to_monitor_button_ships_in_both_editions():
+    """2026-09-04 feature: the "Load to Monitor →" button in the
+    Program Library's detail modal ships in BOTH editions by
+    construction — Program Library is basic-tier and the button has
+    no additional edition wrapper. This smoke check ensures no
+    future edit accidentally gates it (e.g. wrapping the button in
+    a full-only FeatureGate)."""
+    library_src = _read(os.path.abspath(os.path.join(
+        HERE, '..', 'frontend', 'src', 'pages', 'ProgramLibrary.jsx')))
+    # Button label matches directive prose.
+    assert 'Load to Monitor →' in library_src
+    # Handler wired to shared loadProgramFlow.
+    assert 'loadProgramFlow({' in library_src
+    # No isFeatureEnabled or FeatureGate wrapping in the library.
+    assert 'isFeatureEnabled' not in library_src
+    assert 'FeatureGate' not in library_src
+
+
 # ── Repo rule doc in place ──────────────────────────────────────
 
 def test_readme_states_repo_rule():

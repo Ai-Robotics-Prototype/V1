@@ -17,6 +17,7 @@ import { deriveRunState, isStopButtonEnabled,
          STUCK_STOPPING_MS } from '../lib/runState'
 import { runnableStepCount } from '../lib/programTruth'
 import { namedLoadError, namedSpeedRefusal } from '../lib/loadOutcome'
+import { loadProgramFlow } from '../lib/loadProgramFlow'
 
 // Status badge — reads the unified deriveRunState() so pill matches
 // footer matches banner. Rendered from a runState object (color, label,
@@ -749,107 +750,29 @@ export default function MonitorDashboard() {
   // success, never precedes it.
   const [pushingProgramName, setPushingProgramName] = useState(null)
 
-  // Shared push helper. Used by the Program Library load flow —
-  // selection IS the sole push trigger (2026-08-31 directive:
-  // resident-mismatch banner retired; no auto-push on reconnect /
-  // boot / tab-restore / ui_context drift).
-  //
-  // Returns {ok, named?} where named is the operator-language
-  // description of the failure (namedLoadError) when !ok.
-  const pushProgramToController = async (programId, programLabel) => {
-    setPushingProgramName(programLabel || programId)
-    try {
-      const pushRes = await fetch('/api/estun/program/run', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({
-          program_id: programId,
-          push_only:  true,
-        }),
-      })
-      const body = await pushRes.json().catch(() => ({}))
-      if (!pushRes.ok) {
-        const named = namedLoadError(body, pushRes.status)
-        // eslint-disable-next-line no-console
-        console.warn('[load] push refused', {
-          status: pushRes.status, body, named,
-        })
-        return { ok: false, named, body, status: pushRes.status }
-      }
-      return { ok: true, body }
-    } catch (e) {
-      const named = {
-        code: 'network', headline:
-          'Push failed — network error. Program NOT loaded.',
-        detail: String(e && e.message || e),
-      }
-      return { ok: false, named, err: e }
-    } finally {
-      setPushingProgramName(null)
-    }
-  }
+  // Shared load helper lives in lib/loadProgramFlow — see
+  // onSelectProgram below. This file owns only the Monitor-specific
+  // "Pushing…" pill state (setPushingProgramName above); the actual
+  // push_only + commit-regardless-of-outcome loop is in the lib so
+  // the Program Library's "Load to Monitor →" button uses the SAME
+  // code path.
 
   const onSelectProgram = async (prog) => {
     setShowLibrary(false)
     if (!prog || !prog.id) return
-    let full
-    try {
-      const res = await fetch('/api/programs/' + encodeURIComponent(prog.id))
-      if (!res.ok) throw new Error('HTTP ' + res.status)
-      full = await res.json()
-    } catch (e) {
-      addToast?.('Load failed: ' + (e?.message || e), 'error')
-      return
-    }
-    if (!(full && Array.isArray(full.steps))) return
-
-    // 2026-09-04 directive: a refused controller push must NOT
-    // erase the loaded program from the editor. The prior policy
-    // (2026-08-04) held currentProgram back until push succeeded so
-    // the UI matched the controller's resident program exactly. But
-    // when the operator picks a real, on-disk program and the push
-    // refuses (semantic_roundtrip / pallet_ik_refused / etc.), the
-    // editor snapped back to "Untitled Program / no taught poses"
-    // — the operator reasonably concluded the program was lost when
-    // it was really just not-yet-runnable-on-the-controller.
-    //
-    // New policy: commit the local currentProgram from the fetched
-    // JSON regardless of push outcome. The refusal toast explains
-    // WHY the controller doesn't have it yet. `resident_program_id`
-    // stays what the wire says (backend still gates run/execute on
-    // that), so the run button can still enforce "resident matches
-    // current" — the resident-mismatch banner (retired 2026-08-31)
-    // does NOT come back.
-    const result = await pushProgramToController(
-      full.id, full.name || full.id)
-    // Commit local state FIRST, always. Program is loaded into the
-    // editor; the push outcome only decides whether the controller
-    // also has it.
-    setCurrentProgram({
-      id:          full.id,
-      name:        full.name,
-      description: full.description || '',
-      steps:       full.steps,
-      config:      full.config || {},
+    // Route through the shared loadProgramFlow lib so this handler
+    // and the Program Library's "Load to Monitor →" button use the
+    // SAME loader — one flow, not a second parallel implementation.
+    // The lib handles the 184ada3 commit-regardless-of-push-outcome
+    // rule, the named refusal toast, and the "Pushing…" pill via
+    // setPushingProgramName. See lib/loadProgramFlow.js.
+    await loadProgramFlow({
+      programId:             prog.id,
+      programLabel:          prog.name || prog.id,
+      setCurrentProgram,
+      addToast,
+      setPushingProgramName,
     })
-    if (!result.ok) {
-      const { title, detail, technicalDetail } = result.named
-      // Structured toast (2026-08-04): title + detail render in the
-      // toast; technicalDetail lives behind the Details toggle and
-      // is also logged so devtools grep still surfaces the raw
-      // wire reason.
-      addToast?.({ title, detail, technicalDetail },
-        'error', 10000)
-      if (technicalDetail) {
-        // eslint-disable-next-line no-console
-        console.warn('[load] refused', {
-          code: result.named.code, technicalDetail,
-          status: result.status, body: result.body,
-        })
-      }
-      return
-    }
-    addToast?.('Loaded "' + (full.name || full.id) + '"', 'success')
   }
 
   // Cycle bookkeeping lives in local state — the backend doesn't track
