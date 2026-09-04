@@ -36,7 +36,6 @@ function formatWhen(ts) {
 
 export default function RecentRunsCard() {
   const [runs, setRuns]       = useState([])
-  const [recorder, setRec]    = useState(null)
   const [expanded, setExpand] = useState(null)   // run_id currently showing table
   const [tables, setTables]   = useState({})     // run_id -> analysis dict (cached)
   const [loading, setLoading] = useState({})     // run_id -> bool
@@ -70,7 +69,6 @@ export default function RecentRunsCard() {
         if (!alive) return
         if (d.ok) {
           setRuns(Array.isArray(d.runs) ? d.runs : [])
-          setRec(d.recorder || null)
         }
       } catch { /* silent — next tick retries */ }
     }
@@ -179,27 +177,18 @@ export default function RecentRunsCard() {
         display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 10,
       }}>
         <div style={{ fontSize: 15, fontWeight: 700, color: '#111827' }}>
-          Recent runs
+          Motion recordings
         </div>
         <div style={{ fontSize: 12, color: '#6b7280' }}>
           Motion history from every program execution — download raw
           samples or view the per-step per-joint excursion table.
         </div>
       </div>
-      {recorder && (
-        <div style={{
-          fontSize: 11, color: '#9ca3af', marginBottom: 8,
-          fontFamily: 'var(--font-mono, monospace)',
-        }}>
-          recorder: {recorder.samples_total?.toLocaleString?.() || 0} samples ·
-          {' '}{recorder.disk_bytes != null
-                ? (recorder.disk_bytes / 1e6).toFixed(1) + ' MB on disk'
-                : '?'} ·
-          {' '}{recorder.rate_hz} Hz ·
-          {' '}cap {(recorder.retention_bytes / 1e9).toFixed(1)} GB /
-          {' '}{Math.round((recorder.retention_age_s || 0) / 86400)} d
-        </div>
-      )}
+      {/* 2026-09-04: the recorder stats line (samples · MB · Hz ·
+          cap) is retired along with the Monitor Recent-runs
+          section per operator directive. Retention numbers live in
+          joint_recorder.py; runtime stats are still available on
+          /api/runs top-level for anyone who needs them. */}
       {runs.length === 0 ? (
         <div style={{
           padding: '18px 12px', textAlign: 'center',

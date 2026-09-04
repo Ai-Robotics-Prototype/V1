@@ -68,12 +68,19 @@ SEGMENT_DURATION_S   = float(os.environ.get(
 SEGMENT_MAX_BYTES    = int(float(os.environ.get(
     'JOINT_RECORDER_SEGMENT_MAX_BYTES', '20000000')))  # 20 MB safety cap
 RETENTION_BYTES      = int(float(os.environ.get(
-    'JOINT_RECORDER_RETENTION_BYTES', '2000000000')))  # 2 GB
+    'JOINT_RECORDER_RETENTION_BYTES', str(300 * 1024 * 1024))))  # 300 MB
 RETENTION_MAX_AGE_S  = float(os.environ.get(
-    'JOINT_RECORDER_RETENTION_AGE_S', str(14 * 86400)))  # 14 days
+    'JOINT_RECORDER_RETENTION_AGE_S', str(7 * 86400)))  # 7 days
 # Recorder checks retention every N seconds even if no rotation is due
 # so a long-running segment can't drift past the cap silently.
 RETENTION_CHECK_PERIOD_S = 30.0
+# 2026-09-04 operator directive: the size cap must NEVER exceed
+# `RETENTION_FREE_FRACTION` of currently-free disk. Enforced at every
+# retention pass, so a shrinking disk shrinks the effective cap in
+# lockstep. RETENTION_BYTES is the hard MAX; the effective cap is
+# `min(RETENTION_BYTES, free_bytes * RETENTION_FREE_FRACTION)`.
+RETENTION_FREE_FRACTION = float(os.environ.get(
+    'JOINT_RECORDER_FREE_FRACTION', '0.20'))
 
 _MANIFEST_SUBDIR = 'manifests'
 _SEGMENT_SUBDIR  = 'segments'
@@ -153,6 +160,27 @@ def _save_manifest(m):
     os.replace(tmp, p)
 
 
+def _effective_size_cap() -> int:
+    """Return the effective size cap for this pass. Always the MIN of
+    the hard `RETENTION_BYTES` and `RETENTION_FREE_FRACTION` of the
+    partition's currently-free bytes. A shrinking disk shrinks the
+    recorder's effective budget in lockstep — the recorder cannot
+    monopolise more than the configured fraction of remaining free
+    space regardless of its hard cap.
+
+    Free-space read is best-effort; if it fails (path missing,
+    permission denied), fall back to the hard cap and log."""
+    try:
+        st = os.statvfs(JOINT_RECORDER_DIR)
+        free_bytes = st.f_bavail * st.f_frsize
+        fractional = int(free_bytes * RETENTION_FREE_FRACTION)
+        return max(0, min(RETENTION_BYTES, fractional))
+    except Exception as e:
+        print(f'[joint_recorder] free-space read failed ({e}); '
+              f'using hard cap {RETENTION_BYTES}', flush=True)
+        return RETENTION_BYTES
+
+
 def enforce_retention():
     """Drop the oldest segments until we're under BOTH caps. Called
     before each segment rotation AND on a 30 s cadence during long
@@ -172,10 +200,14 @@ def enforce_retention():
                     print(f'[joint_recorder] age-prune failed on {fn}: {e}',
                           flush=True)
         # Size cap: recompute after age prune; drop oldest until under.
+        # Effective cap floors the hard RETENTION_BYTES at
+        # RETENTION_FREE_FRACTION of currently-free disk — see
+        # `_effective_size_cap`.
+        size_cap = _effective_size_cap()
         entries = _list_segments_sorted()
         total = sum(sz for (_, sz, _, _) in entries)
         i = 0
-        while total > RETENTION_BYTES and i < len(entries):
+        while total > size_cap and i < len(entries):
             _, sz, fn, path = entries[i]
             try:
                 os.remove(path)

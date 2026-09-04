@@ -3,6 +3,7 @@ import { useStore } from '../store/useStore'
 import SetupWizard from '../components/SetupWizard'
 import CellDetailPanel from '../components/CellDetailPanel'
 import Cam0CalibrationCard from '../components/Cam0CalibrationCard'
+import RecentRunsCard from '../components/RecentRunsCard'
 import { useCellWizardStore } from '../store/cellWizardStore'
 import { getServedBundleHash } from '../components/StatusBar'
 
@@ -892,6 +893,14 @@ export default function ConfigureLayout() {
       <CellSetupSection />
 
       <Cam0CalibrationCard />
+
+      {/* 2026-09-04 operator directive: Recent runs / motion-recording
+          browser moved off the Monitor screen and rehomed here.
+          RecentRunsCard is self-contained (fetches /api/runs on a
+          4 s poll; Download / Excursions / Trajectory affordances
+          per row). Recorder budget lives in joint_recorder.py —
+          300 MB / 7 d cap + 20 %-of-free-space guard. */}
+      <RecentRunsCard />
 
       <div style={{
         fontSize: 10,

@@ -9,7 +9,6 @@ import IdentifiedObjectsCard from '../components/IdentifiedObjectsCard'
 import RunProgramModal from '../components/RunProgramModal'
 import ProgramErrorModal from '../components/ProgramErrorModal'
 import StepPreviewPanel from '../components/StepPreviewPanel'
-import RecentRunsCard from '../components/RecentRunsCard'
 import ArmEnableControl from '../components/ArmEnableControl'
 import { deriveRunState, isStopButtonEnabled,
          isStuckStopping as _computeStuckStopping,
@@ -1387,15 +1386,14 @@ export default function MonitorDashboard() {
         </div>
       )}
 
-      {/* Recent runs — always-on joint recorder browser. Sits at the
-          bottom of the Monitor scroll area so it never fights with
-          the run-in-progress UI at the top. Cheap to render (only
-          fetches /api/runs on a 4 s poll). */}
-      <div style={{
-        maxWidth: 1200, margin: '0 auto', padding: '0 20px 24px',
-      }}>
-        <RecentRunsCard />
-      </div>
+      {/* 2026-09-04 operator directive: Monitor is for running the
+          CURRENT program, not browsing history. The "Recent runs"
+          section (RecentRunsCard) is retired from Monitor and
+          rehomed in Configure as "Motion recordings" so the
+          Download / Excursions / Trajectory affordances stay
+          reachable. The recorder ITSELF keeps writing on every
+          run — see joint_recorder.py for the new 300 MB / 7 d
+          budget + 20%-of-free-space guard. */}
 
       {/* Run-confirm modal (opens when the operator presses Run) and
           program error modal (opens on driver-side publish/Error
