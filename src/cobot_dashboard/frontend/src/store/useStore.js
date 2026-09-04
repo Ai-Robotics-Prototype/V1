@@ -359,6 +359,65 @@ const storeDefinition = (set, get) => ({
   // ---- UI state ----
   activeTab: 'monitor',
   activeView: 'split',
+
+  // ── Edition (2026-09-04) ────────────────────────────────────
+  // Per-device edition, hydrated from /api/edition on boot. Default
+  // 'basic' matches the server default_edition; unlock via the
+  // StatusBar affordance calls /api/edition/unlock which flips the
+  // device to 'full'. Nav / page / control rendering keys off
+  // isFeatureEnabled from lib/edition.js — features not enabled for
+  // this edition render NOTHING (absent, not disabled-greyed).
+  edition: 'basic',
+  editionHydrated: false,
+  async hydrateEdition() {
+    try {
+      const res = await fetch('/api/edition', {
+        headers: { 'X-Client-Id': CLIENT_ID },
+      })
+      if (!res.ok) return
+      const data = await res.json()
+      if (data && (data.edition === 'basic' || data.edition === 'full')) {
+        set({ edition: data.edition, editionHydrated: true })
+      } else {
+        set({ editionHydrated: true })
+      }
+    } catch { /* keep default */ }
+  },
+  async unlockEdition(passphrase) {
+    try {
+      const res = await fetch('/api/edition/unlock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Client-Id': CLIENT_ID },
+        body: JSON.stringify({ passphrase }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data && data.edition) {
+        set({ edition: data.edition })
+        return { ok: true }
+      }
+      return { ok: false, error: data.error || `HTTP ${res.status}` }
+    } catch (e) {
+      return { ok: false, error: e.message || String(e) }
+    }
+  },
+  async lockEdition() {
+    try {
+      const res = await fetch('/api/edition/lock', {
+        method: 'POST',
+        headers: { 'X-Client-Id': CLIENT_ID },
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data && data.edition) {
+        set({ edition: data.edition })
+        return { ok: true }
+      }
+      return { ok: false, error: data.error || `HTTP ${res.status}` }
+    } catch (e) {
+      return { ok: false, error: e.message || String(e) }
+    }
+  },
+
+
   // Cross-tab signal: the Program editor's detect step sets this to
   // true before switching to the Part Recognition tab; AdaptivePicking
   // reads + clears it on mount and opens the Teach New Part wizard.

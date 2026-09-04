@@ -5834,7 +5834,9 @@ if FASTAPI_AVAILABLE:
         }
 
     @app.get("/api/parts")
-    async def api_parts_list():
+    async def api_parts_list(request: Request):
+        refused = _require_full_edition(request, 'part_recognition')
+        if refused is not None: return refused
         from object_detection.part_library import (
             get_all_parts, identification_basis, has_teach_images,
             get_teach_image_count, has_step_file,
@@ -9183,16 +9185,20 @@ if FASTAPI_AVAILABLE:
         return {'ok': bool(rec), 'record': rec}
 
     @app.get("/api/event_log/list")
-    async def api_event_log_list():
+    async def api_event_log_list(request: Request):
         """Return the list of dates available on disk, newest first.
         Used by the interface page's date picker."""
+        refused = _require_full_edition(request, 'event_log')
+        if refused is not None: return refused
         return {'days': _event_log.list_days()}
 
     @app.get("/api/event_log/day/{date_str}")
-    async def api_event_log_day(date_str: str, limit: int = 2000):
+    async def api_event_log_day(date_str: str, request: Request, limit: int = 2000):
         """Return one day's records as a JSON array (oldest first).
         `limit` caps the tail — default 2000, cap 10000 — enough
         for a busy shift day without exhausting the browser."""
+        refused = _require_full_edition(request, 'event_log')
+        if refused is not None: return refused
         if not (date_str.isdigit() and len(date_str) == 8):
             return JSONResponse({'error': 'date must be YYYYMMDD'},
                                 status_code=400)
@@ -10579,6 +10585,92 @@ if FASTAPI_AVAILABLE:
         except Exception:
             return ""
 
+    # ── edition gating (2026-09-04) ──────────────────────────────
+    # Single source of truth for basic vs full lives in
+    # cobot_dashboard.edition (module-level FEATURE_MAP +
+    # SAFETY_INVARIANT_KEYS rejection at import). This endpoint
+    # answers "what edition am I?" for the calling device; the
+    # unlock/lock endpoints persist per-X-Client-Id overrides.
+    from cobot_dashboard import edition as _edition_mod
+
+    def _require_full_edition(request, feature_key: str):
+        """Return a JSONResponse refusal (or None if allowed). Apply on
+        the FIRST line of any full-only endpoint so a basic device
+        cannot reach the surface via a direct fetch (UI-hiding alone
+        is not a gate)."""
+        client_id = _client_id_of(request)
+        ed = _edition_mod.resolve_edition(client_id)
+        if _edition_mod.is_feature_enabled(feature_key, ed):
+            return None
+        payload = _edition_mod.refusal_payload(feature_key)
+        payload['edition'] = ed
+        return JSONResponse(payload, status_code=403)
+
+    @app.get("/api/edition")
+    async def api_edition_get(request: Request):
+        client_id = _client_id_of(request)
+        ed = _edition_mod.resolve_edition(client_id)
+        return {
+            'edition':          ed,
+            'default':          _edition_mod._load_store().get(
+                                    'default', _edition_mod.EDITION_BASIC),
+            'client_id':        client_id,
+            'is_full':          ed == _edition_mod.EDITION_FULL,
+            'safety_invariant_keys': sorted(_edition_mod.SAFETY_INVARIANT_KEYS),
+        }
+
+    @app.get("/api/edition/features")
+    async def api_edition_features():
+        """Full feature map + editions. The frontend hydrates this on
+        boot so its lib/edition.js mirror can be validated against the
+        server truth at runtime (belt-and-braces to the byte-mirror
+        test at commit time)."""
+        return {
+            'editions': list(_edition_mod.EDITIONS),
+            'features': dict(_edition_mod.FEATURE_MAP),
+            'safety_invariant_keys': sorted(_edition_mod.SAFETY_INVARIANT_KEYS),
+        }
+
+    @app.post("/api/edition/unlock")
+    async def api_edition_unlock(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        client_id = _client_id_of(request)
+        if not client_id:
+            return JSONResponse({
+                'ok': False,
+                'error': 'X-Client-Id header required for edition unlock',
+            }, status_code=400)
+        passphrase = str(body.get('passphrase') or '')
+        ok = _edition_mod.unlock_device(client_id, passphrase)
+        if not ok:
+            return JSONResponse({
+                'ok': False,
+                'error': 'unlock refused',
+                'reason_code': 'bad_passphrase',
+            }, status_code=403)
+        return {
+            'ok': True,
+            'edition': _edition_mod.resolve_edition(client_id),
+            'client_id': client_id,
+        }
+
+    @app.post("/api/edition/lock")
+    async def api_edition_lock(request: Request):
+        client_id = _client_id_of(request)
+        if not client_id:
+            return JSONResponse({
+                'ok': False,
+                'error': 'X-Client-Id header required',
+            }, status_code=400)
+        _edition_mod.lock_device(client_id)
+        return {
+            'ok': True,
+            'edition': _edition_mod.resolve_edition(client_id),
+        }
+
     def _save_prog_with_event(prog, path, prog_id, source_client, kind):
         """Bump the program's revision, stash it into the file, save,
         and emit a program_changed event onto the /ws/state ring so
@@ -11280,7 +11372,9 @@ if FASTAPI_AVAILABLE:
     _IO_STATE: dict = {}
 
     @app.get("/api/io/state")
-    async def api_io_state():
+    async def api_io_state(request: Request):
+        refused = _require_full_edition(request, 'io_panel')
+        if refused is not None: return refused
         return {"io": _IO_STATE}
 
     # Live merged snapshot from the driver's IOManager/GetIOValue +
@@ -11309,6 +11403,8 @@ if FASTAPI_AVAILABLE:
     # (family='io').
     @app.post("/api/io/force")
     async def api_io_force(request: Request):
+        refused = _require_full_edition(request, 'io_panel')
+        if refused is not None: return refused
         try:
             body = await request.json()
         except Exception:
@@ -11355,6 +11451,8 @@ if FASTAPI_AVAILABLE:
 
     @app.post("/api/io/set")
     async def api_io_set(request: Request):
+        refused = _require_full_edition(request, 'io_panel')
+        if refused is not None: return refused
         try:
             body = await request.json()
         except Exception:

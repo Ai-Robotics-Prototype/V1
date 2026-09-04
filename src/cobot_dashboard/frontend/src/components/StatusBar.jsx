@@ -49,6 +49,29 @@ export default function StatusBar() {
   const task      = useStore((s) => s.task)
   const safety    = useStore((s) => s.safety)
   const robot     = useStore((s) => s.robot) || {}
+  // Edition badge — always visible so a basic tablet has an
+  // affordance to unlock, and a Full PC has one to relock. Uses a
+  // window.prompt for the passphrase (deliberately minimal — the
+  // gate is separation, not security, per the 2026-09-04 directive).
+  const edition        = useStore((s) => s.edition)
+  const unlockEdition  = useStore((s) => s.unlockEdition)
+  const lockEdition    = useStore((s) => s.lockEdition)
+  async function onEditionClick() {
+    if (edition === 'full') {
+      if (typeof window !== 'undefined'
+          && !window.confirm('Return this device to Basic edition?')) return
+      await lockEdition()
+      return
+    }
+    const pw = (typeof window !== 'undefined')
+      ? window.prompt('Unlock Full edition — passphrase:')
+      : null
+    if (pw == null) return
+    const res = await unlockEdition(pw)
+    if (!res.ok && typeof window !== 'undefined') {
+      window.alert(`Unlock refused: ${res.error || 'bad passphrase'}`)
+    }
+  }
   // Same unified derivation the Monitor pill uses so the footer
   // "State" chip can't disagree with what the operator sees above.
   const runState  = deriveRunState({ robot, task, safety })
@@ -125,6 +148,27 @@ export default function StatusBar() {
       <Block>ROS2 Humble</Block>
       <Block>Robot Generic TCP</Block>
       <Block>IP&nbsp;192.168.1.246</Block>
+
+      {/* Edition affordance (2026-09-04). Always visible so a basic
+          tablet can find its way to Full and a Full PC can relock.
+          Click opens window.prompt (minimal — the gate is
+          separation, not security). */}
+      <Block
+        data-testid="edition-block"
+        onClick={onEditionClick}
+        style={{
+          cursor: 'pointer',
+          color: edition === 'full' ? 'var(--accent)' : 'var(--text-secondary)',
+          fontWeight: edition === 'full' ? 600 : 400,
+        }}
+        title={edition === 'full'
+          ? 'Click to relock this device to Basic'
+          : 'Click to unlock Full edition on this device'}>
+        Edition&nbsp;<span style={{ textTransform: 'uppercase',
+                                    letterSpacing: '0.05em' }}>
+          {edition}
+        </span>
+      </Block>
 
       {/* 2026-08-05 disk watchdog widget — ok/warn/critical/dead
           from /api/disk_status. Amber below 2 GB free, red below

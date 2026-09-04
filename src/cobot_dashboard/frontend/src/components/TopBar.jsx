@@ -1,5 +1,6 @@
 import { useStore } from '../store/useStore'
 import Brand from './Brand'
+import { isFeatureEnabled, TAB_TO_FEATURE } from '../lib/edition'
 
 const TABS = [
   { id: 'monitor',          label: 'Monitor' },
@@ -31,6 +32,16 @@ export default function TopBar() {
   const estop        = useStore((s) => s.safety.estop)
   const triggerEstop = useStore((s) => s.triggerEstop)
   const releaseEstop = useStore((s) => s.releaseEstop)
+  const edition      = useStore((s) => s.edition)
+
+  // Edition filter (2026-09-04): tabs not in this edition's feature
+  // map render NOTHING (not disabled-greyed — absent). Safety is
+  // edition-INDEPENDENT and left unmapped in TAB_TO_FEATURE, so
+  // isFeatureEnabled returns true for every edition on that key.
+  const visibleTabs = TABS.filter((tab) => {
+    const feature = TAB_TO_FEATURE[tab.id] || tab.id
+    return isFeatureEnabled(feature, edition)
+  })
 
   // Safety: trigger fires on the first tap with no confirmation — an
   // emergency stop must act with zero delay. Release stays guarded by
@@ -82,7 +93,7 @@ export default function TopBar() {
         overflowY: 'hidden',
         WebkitOverflowScrolling: 'touch',
       }}>
-        {TABS.map((tab) => {
+        {visibleTabs.map((tab) => {
           const active = activeTab === tab.id
           return (
             <button

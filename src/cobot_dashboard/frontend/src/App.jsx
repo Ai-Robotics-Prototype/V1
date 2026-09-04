@@ -1,5 +1,6 @@
 import { useEffect, Component } from 'react'
 import { useStore } from './store/useStore'
+import { isFeatureEnabled, TAB_TO_FEATURE } from './lib/edition'
 import TopBar from './components/TopBar'
 import StatusBar from './components/StatusBar'
 import StaleCodegenBanner from './components/StaleCodegenBanner'
@@ -103,11 +104,20 @@ export default function App() {
   const activeTab       = useStore((s) => s.activeTab)
   const hydrateCells    = useStore((s) => s.hydrateCells)
   const hydratePrograms = useStore((s) => s.hydratePrograms)
+  const hydrateEdition  = useStore((s) => s.hydrateEdition)
+  const edition         = useStore((s) => s.edition)
+  const setTab          = useStore((s) => s.setTab)
   const restoreOpenProgramOnMount = useStore(
     (s) => s.restoreOpenProgramOnMount)
 
   useEffect(() => {
     connectWS()
+    // Edition hydrate on boot — the TopBar tab filter, the App
+    // layoutMap gate below, and every FeatureGate inside pages read
+    // useStore.edition, which starts at 'basic' (tablet-safe
+    // default). Hydrating first keeps a Full-only tab from
+    // flash-rendering on a Full PC during the initial paint.
+    hydrateEdition()
     // 2026-08-05 (refresh persistence, fork registry:
     // page_context_persistence): rehydrate the last-open program
     // for THIS device from the server. If a draft with a
@@ -165,12 +175,26 @@ export default function App() {
     event_log:        <EventLog />,
   }
 
+  // Edition gate for the layout switch (2026-09-04). If activeTab
+  // resolves to a Full-only page but this device is on basic, fall
+  // back to Monitor so a stale persisted tab id (from a session
+  // where the device was Full and got re-locked) doesn't render a
+  // dead surface. TopBar already hides the tab; this is defence-in-
+  // depth for the persisted-activeTab class.
+  const _tabFeature = TAB_TO_FEATURE[activeTab] || activeTab
+  const _tabAllowed = isFeatureEnabled(_tabFeature, edition)
+  useEffect(() => {
+    if (!_tabAllowed && activeTab !== 'monitor') setTab('monitor')
+  }, [_tabAllowed, activeTab, setTab])
+
   // Keep the two 3D-heavy tabs persistently mounted, toggled by CSS
   // display, so switching between them doesn't tear down the Canvas +
   // URDFLoader and re-parse all 7 GLBs. Other tabs unmount as before.
   const kept3D  = ['program', '3dview']
   const isKept  = kept3D.includes(activeTab)
-  const other   = !isKept ? (layoutMap[activeTab] ?? <MonitorDashboard />) : null
+  const other   = !isKept
+    ? (_tabAllowed ? (layoutMap[activeTab] ?? <MonitorDashboard />) : <MonitorDashboard />)
+    : null
   const keptStyle = (tab) => ({
     display: activeTab === tab ? 'flex' : 'none',
     flex: 1, minHeight: 0, flexDirection: 'column',
