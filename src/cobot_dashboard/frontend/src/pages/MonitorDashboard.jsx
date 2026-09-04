@@ -803,21 +803,35 @@ export default function MonitorDashboard() {
     }
     if (!(full && Array.isArray(full.steps))) return
 
-    // Push FIRST. Only mutate local currentProgram once the
-    // controller has accepted the save + byte-verified back the
-    // same bytes we sent (dashboard_server:5443). Prior code (pre
-    // 2026-08-04) set currentProgram synchronously BEFORE this
-    // call — any push refusal (transport down, empty_program,
-    // lint, byte-verify, quarantined) manufactured a divergence
-    // between UI and controller state. The load path IS the moment
-    // the resident becomes current; if the push fails, currentProgram
-    // must stay what it was so the operator's UI matches the
-    // controller's actual state. Failures render as the named toast
-    // (loadOutcome.namedLoadError); quarantined (423) refuses at
-    // pick time with the operator-language reason so a selection
-    // never half-succeeds into a mismatch state (2026-08-31 directive).
+    // 2026-09-04 directive: a refused controller push must NOT
+    // erase the loaded program from the editor. The prior policy
+    // (2026-08-04) held currentProgram back until push succeeded so
+    // the UI matched the controller's resident program exactly. But
+    // when the operator picks a real, on-disk program and the push
+    // refuses (semantic_roundtrip / pallet_ik_refused / etc.), the
+    // editor snapped back to "Untitled Program / no taught poses"
+    // — the operator reasonably concluded the program was lost when
+    // it was really just not-yet-runnable-on-the-controller.
+    //
+    // New policy: commit the local currentProgram from the fetched
+    // JSON regardless of push outcome. The refusal toast explains
+    // WHY the controller doesn't have it yet. `resident_program_id`
+    // stays what the wire says (backend still gates run/execute on
+    // that), so the run button can still enforce "resident matches
+    // current" — the resident-mismatch banner (retired 2026-08-31)
+    // does NOT come back.
     const result = await pushProgramToController(
       full.id, full.name || full.id)
+    // Commit local state FIRST, always. Program is loaded into the
+    // editor; the push outcome only decides whether the controller
+    // also has it.
+    setCurrentProgram({
+      id:          full.id,
+      name:        full.name,
+      description: full.description || '',
+      steps:       full.steps,
+      config:      full.config || {},
+    })
     if (!result.ok) {
       const { title, detail, technicalDetail } = result.named
       // Structured toast (2026-08-04): title + detail render in the
@@ -835,16 +849,6 @@ export default function MonitorDashboard() {
       }
       return
     }
-    // Commit local state — the push succeeded, resident IS this
-    // program, and STATE.robot.program.resident_program_id has
-    // already been mirrored server-side before the response.
-    setCurrentProgram({
-      id:          full.id,
-      name:        full.name,
-      description: full.description || '',
-      steps:       full.steps,
-      config:      full.config || {},
-    })
     addToast?.('Loaded "' + (full.name || full.id) + '"', 'success')
   }
 
