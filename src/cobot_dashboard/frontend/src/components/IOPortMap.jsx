@@ -484,14 +484,17 @@ function SafetyRail({ block }) {
           letterSpacing: '0.05em',
           textTransform: 'uppercase',
         }}>SAFETY</span>
-        <span style={{
-          flex: 1, fontSize: 12, fontWeight: 600, color: '#9F1239',
-        }}>
+        <span
+          title="safety-PLC domain · not actuated from this UI"
+          style={{
+            flex: 1, fontSize: 12, fontWeight: 600, color: '#9F1239',
+          }}>
           Safety I/O — {terminals.length} terminals
         </span>
-        <span style={{ fontSize: 10, color: '#9F1239', fontStyle: 'italic' }}>
-          safety-PLC domain · not actuated from this UI
-        </span>
+        {/* 2026-09-04: the italic "safety-PLC domain · not actuated
+            from this UI" note is now a tooltip on the header per
+            operator directive — the read-only domain note shrinks
+            to a tooltip rather than owning its own inline strip. */}
       </button>
       {open && (
         <div style={{
@@ -657,16 +660,9 @@ function PairRowsBlock({ block, ports, specs, onEdit }) {
           flex: 1, fontSize: 11, fontWeight: 600, color: '#374151',
           overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
         }}>{block.label}</span>
-        <span
-          title={block.notes || `${pairRows.length} paired rows — silkscreen exact.`}
-          style={{
-            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-            width: 14, height: 14, borderRadius: '50%',
-            background: '#fff', color: C.textMuted,
-            border: `1px solid ${C.border}`,
-            fontSize: 9, fontWeight: 700, cursor: 'help',
-            flexShrink: 0,
-          }}>i</span>
+        {/* per-card (i) info circle retired 2026-09-04 — content is
+            display-only; block.label + row-level titles carry the
+            same context. */}
       </div>
       <div style={{
         display: 'grid',
@@ -781,15 +777,7 @@ function SectionsBlock({ block, ports, specs, onEdit }) {
         <span style={{
           flex: 1, fontSize: 11, fontWeight: 600, color: '#374151',
         }}>{block.label}</span>
-        <span
-          title={block.notes || ''}
-          style={{
-            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-            width: 14, height: 14, borderRadius: '50%',
-            background: '#fff', color: C.textMuted,
-            border: `1px solid ${C.border}`,
-            fontSize: 9, fontWeight: 700, cursor: 'help', flexShrink: 0,
-          }}>i</span>
+        {/* per-card (i) circle retired 2026-09-04 — see PairRowsBlock */}
       </div>
       <div style={{ padding: 5, display: 'flex', flexDirection: 'column', gap: 6 }}>
         {sections.map((sec, si) => (
@@ -896,18 +884,9 @@ function PlateBlock({ block, ports, specs, onEdit }) {
         }} title={`${terminals.length} terminals · ${nSig} signals`}>
           {terminals.length}t
         </span>
-        {tip && (
-          <span
-            title={tip}
-            style={{
-              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-              width: 14, height: 14, borderRadius: '50%',
-              background: '#fff', color: C.textMuted,
-              border: `1px solid ${C.border}`,
-              fontSize: 9, fontWeight: 700, cursor: 'help',
-              flexShrink: 0,
-            }}>i</span>
-        )}
+        {/* per-card (i) circle retired 2026-09-04 — same rationale
+            as PairRowsBlock. block.label + row-level titles carry
+            the context; tip lives on hover of the wiring-mode chip. */}
       </div>
 
       {/* block.notes was previously rendered here as a subhead
@@ -1251,18 +1230,7 @@ function Block({ block, ports, specs, onEdit }) {
         }}>
           {rows.length} ch
         </span>
-        {tip && (
-          <span
-            title={tip}
-            style={{
-              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-              width: 14, height: 14, borderRadius: '50%',
-              background: '#fff', color: C.textMuted,
-              border: `1px solid ${C.border}`,
-              fontSize: 9, fontWeight: 700, cursor: 'help',
-              flexShrink: 0,
-            }}>i</span>
-        )}
+        {/* per-card (i) circle retired 2026-09-04 */}
       </div>
 
       {/* Terminal legend — kind-level fixed strings (e.g. "24V / COM / DI") */}
@@ -1304,129 +1272,67 @@ function Block({ block, ports, specs, onEdit }) {
 }
 
 // ---------------------------------------------------------------------------
-// Legend / status bar.
+// Advanced disclosure (2026-09-04 operator directive).
+//
+// The previous full-width Legend showed a chip strip (VERIFIED /
+// allow_io / bridge / "live · IOManager poll active"), an assigned/
+// free legend, an "N/M assigned · Saved" counter, and only THEN the
+// two actual controls (Expert force inputs + Reset assignments).
+// Every chip in that strip was pure display and only the two
+// controls need to persist — folded here into a collapsed <details>
+// so the default view is just "cards".
+//
+// `allow_io` and `bridgeUp` are still consumed by row-level toggle-
+// disable logic (see `toggleDisabled` in the pair-row renderer);
+// only the chips were removed, not the state.
 // ---------------------------------------------------------------------------
-function Legend({ assignedCount, totalCount, saving, onReset, source,
-                  allowIo, bridgeUp, expertMode, setExpertMode,
-                  onClearForces, forcedCount }) {
+function AdvancedControls({ onReset, expertMode, setExpertMode,
+                            onClearForces, forcedCount }) {
   return (
-    <div style={{
-      display: 'flex', alignItems: 'center', gap: 14,
-      flexWrap: 'wrap',
-      padding: '8px 12px',
-      background: C.headerBg,
-      border: `1px solid ${C.border}`,
-      borderRadius: 6,
-      fontSize: 11, color: C.textMuted,
+    <details style={{
+      border: `1px solid ${C.border}`, borderRadius: 6,
+      background: C.rowBgDim, padding: '4px 10px', fontSize: 11,
     }}>
-      <span
-        title={`Inventory verified from ${source || 'the factory-controller capture'}.`}
-        style={{
-          display: 'inline-flex', alignItems: 'center', gap: 6,
-          padding: '2px 8px', borderRadius: 4,
-          background: '#DCFCE7', color: '#166534',
-          fontWeight: 600, fontSize: 10,
-          border: '1px solid #BBF7D0',
-        }}>
-        VERIFIED
-      </span>
-      <span
-        title={allowIo
-          ? 'allow_io gate OPEN — DO toggles + DI force writes reach the '
-            + 'controller via IOManager/SetIOForcedFlag.'
-          : 'allow_io gate CLOSED on the driver. Set ESTUN_ALLOW_IO=1 '
-            + 'in /etc/default/roboai-estun (or allow_io:true in '
-            + 'estun.yaml) to enable manual I/O.'}
-        style={{
-          display: 'inline-flex', alignItems: 'center', gap: 6,
-          padding: '2px 8px', borderRadius: 4,
-          background: allowIo ? '#DCFCE7' : '#FEF3C7',
-          color:      allowIo ? '#166534' : '#92400E',
-          fontWeight: 600, fontSize: 10,
-          border: `1px solid ${allowIo ? '#BBF7D0' : '#FDE68A'}`,
-        }}>
-        allow_io: {allowIo ? 'OPEN' : 'CLOSED'}
-      </span>
-      <span
-        title={bridgeUp
-          ? 'Driver I/O bridge is publishing /estun/io — GetIOValue / '
-            + 'GetIOInfo polling live.'
-          : 'Driver has not published /estun/io yet. Live-state pills + '
-            + 'toggles are inert until the bridge is up.'}
-        style={{
-          display: 'inline-flex', alignItems: 'center', gap: 6,
-          padding: '2px 8px', borderRadius: 4,
-          background: bridgeUp ? '#DBEAFE' : '#F3F4F6',
-          color:      bridgeUp ? '#1E40AF' : '#374151',
-          fontWeight: 600, fontSize: 10,
-          border: `1px solid ${bridgeUp ? '#93C5FD' : C.border}`,
-        }}>
-        bridge: {bridgeUp ? 'LIVE' : '—'}
-      </span>
-      <label
-        title="Reveals DI force toggles. Forced inputs LIE to running programs — leave off unless bench-testing."
-        style={{
-          display: 'inline-flex', alignItems: 'center', gap: 6,
-          padding: '2px 8px', borderRadius: 4,
-          background: expertMode ? '#FEF3C7' : '#fff',
-          color:      expertMode ? '#92400E' : C.textMuted,
-          fontWeight: 600, fontSize: 10,
-          border: `1px solid ${expertMode ? '#F59E0B' : C.border}`,
-          cursor: 'pointer',
-        }}>
-        <input
-          type="checkbox"
-          checked={expertMode}
-          onChange={(e) => setExpertMode(e.target.checked)}
-          style={{ margin: 0 }} />
-        Expert: force inputs
-      </label>
-      {expertMode && forcedCount > 0 && (
-        <button
-          onClick={onClearForces}
-          title={`Release ${forcedCount} currently-forced port(s).`}
-          style={{
-            padding: '3px 10px', fontSize: 10, fontWeight: 700,
-            background: '#B45309', color: '#fff',
-            border: 'none', borderRadius: 4, cursor: 'pointer',
-          }}>
-          Clear all {forcedCount} force{forcedCount === 1 ? '' : 's'}
-        </button>
-      )}
-      <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-        <span style={{
-          width: 8, height: 8, borderRadius: '50%',
-          background: '#fff', border: `1px solid ${KIND_META.DI.color}`,
-        }} />
-        assigned
-      </span>
-      <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-        <span style={{
-          width: 8, height: 8, borderRadius: '50%',
-          background: C.rowBgDim, border: `1px solid ${C.border}`,
-          opacity: 0.7,
-        }} />
-        free
-      </span>
-      <span style={{
-        display: 'inline-flex', alignItems: 'center', gap: 4,
-        color: bridgeUp ? '#166534' : C.textDim,
+      <summary style={{
+        cursor: 'pointer', color: C.textMuted, fontWeight: 600,
+        userSelect: 'none', padding: '2px 0',
       }}>
-        <span style={{
-          width: 7, height: 7, borderRadius: '50%',
-          background: bridgeUp ? '#16A34A' : C.textDim,
-          opacity: bridgeUp ? 1 : 0.5,
-          border: bridgeUp ? 'none' : `1px dashed ${C.textDim}`,
-        }} />
-        {bridgeUp ? 'live · IOManager poll active' : 'live state pending'}
-      </span>
-      <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10 }}>
-        <span style={{ fontFamily: 'monospace' }}>
-          {assignedCount}/{totalCount} assigned
-        </span>
-        <span style={{ fontSize: 10, color: saving ? C.accent : C.textDim }}>
-          {saving ? 'Saving…' : 'Saved'}
-        </span>
+        Advanced
+      </summary>
+      <div style={{
+        marginTop: 8, display: 'flex', alignItems: 'center',
+        gap: 10, flexWrap: 'wrap',
+      }}>
+        <label
+          title="Reveals DI force toggles. Forced inputs LIE to running programs — leave off unless bench-testing."
+          style={{
+            display: 'inline-flex', alignItems: 'center', gap: 6,
+            padding: '2px 8px', borderRadius: 4,
+            background: expertMode ? '#FEF3C7' : '#fff',
+            color:      expertMode ? '#92400E' : C.textMuted,
+            fontWeight: 600, fontSize: 10,
+            border: `1px solid ${expertMode ? '#F59E0B' : C.border}`,
+            cursor: 'pointer',
+          }}>
+          <input
+            type="checkbox"
+            checked={expertMode}
+            onChange={(e) => setExpertMode(e.target.checked)}
+            style={{ margin: 0 }} />
+          Expert: force inputs
+        </label>
+        {expertMode && forcedCount > 0 && (
+          <button
+            onClick={onClearForces}
+            title={`Release ${forcedCount} currently-forced port(s).`}
+            style={{
+              padding: '3px 10px', fontSize: 10, fontWeight: 700,
+              background: '#B45309', color: '#fff',
+              border: 'none', borderRadius: 4, cursor: 'pointer',
+            }}>
+            Clear all {forcedCount} force{forcedCount === 1 ? '' : 's'}
+          </button>
+        )}
         <button
           onClick={onReset}
           style={{
@@ -1436,8 +1342,8 @@ function Legend({ assignedCount, totalCount, saving, onReset, source,
           }}>
           Reset assignments
         </button>
-      </span>
-    </div>
+      </div>
+    </details>
   )
 }
 
@@ -1447,7 +1353,12 @@ function Legend({ assignedCount, totalCount, saving, onReset, source,
 export default function IOPortMap() {
   const [data, setData]     = useState(null)
   const [error, setError]   = useState(null)
-  const [saving, setSaving] = useState(false)
+  // 2026-09-04: the "Saving…" chip in the retired Legend was the
+  // only reader of `saving`. The setter stays wired to the save-
+  // debounce; the read is intentionally unused (underscore-prefixed
+  // per project convention).
+  // eslint-disable-next-line no-unused-vars
+  const [_saving, setSaving] = useState(false)
   const saveTimer  = useRef(null)
   const pendingRef = useRef({})   // accumulate per-port patches between debounces
 
@@ -1632,27 +1543,17 @@ export default function IOPortMap() {
 
   const plate     = Array.isArray(data.plate) ? data.plate : []
   const flange    = data.flange || null
-  const nameplate = data.nameplate || {}
-  const sources   = data.sources || {}
   const specs     = data.specs || {}
-  const verbs     = data.verbs || {}
   const ports     = data.ports || {}
-
-  // Assignment tally — walk the plate + flange, count only signal
-  // terminals in operator-assignable groups.
-  let totalCount = 0
-  let assignedCount = 0
-  const walk = [...plate]
-  if (flange) walk.push(flange)
-  for (const blk of walk) {
-    const g = blk.group
-    if (g === 'system' || g === 'safety') continue
-    for (const t of blk.terminals || []) {
-      if (t.role !== 'signal') continue
-      totalCount += 1
-      if (ports[t.name]?.in_use) assignedCount += 1
-    }
-  }
+  // 2026-09-04: data.nameplate, data.sources, data.verbs are still
+  // provided by /api/io/portmap but no longer rendered (nameplate
+  // bar / Sources footer / Verb reference section were retired per
+  // operator directive). Not destructured — no consumer.
+  //
+  // Same story for the assignedCount / totalCount tally: the "N/M
+  // assigned · Saved" counter that displayed them is retired.
+  // Keeping the arithmetic dead-weight would burn a plate-walk on
+  // every render for no operator benefit.
 
   return (
     <IOLiveContext.Provider value={{
@@ -1667,55 +1568,20 @@ export default function IOPortMap() {
       border: `1px solid ${C.border}`,
       borderRadius: 6,
     }}>
-      {/* Header + nameplate strip */}
+      {/* 2026-09-04 operator directive — one clean header, cards
+          start immediately. The full-width nameplate bar
+          (model/serial/voltage), the "Estun S10-140 · silkscreen-
+          verified" suffix, and the entire Legend chip strip
+          (VERIFIED / allow_io / bridge / assigned+free / "live ·
+          IOManager poll active" / N/M assigned · Saved) are
+          retired. `allow_io` and `bridgeUp` state stays live —
+          consumed by row-level toggle-disable logic
+          (`toggleDisabled` in pair-row renderer). */}
       <div style={{ display: 'flex', alignItems: 'center' }}>
         <span style={{ fontSize: 15, fontWeight: 700, color: C.text, flex: 1 }}>
-          I/O Port Map
-        </span>
-        <span style={{ fontSize: 11, color: C.textMuted }}>
-          Estun S10-140 · silkscreen-verified
+          I/O
         </span>
       </div>
-
-      {(nameplate.model || nameplate.serial) && (
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 12,
-          padding: '6px 10px',
-          background: '#0F172A',
-          color: '#E2E8F0',
-          border: `1px solid #1E293B`,
-          borderRadius: 6,
-          fontSize: 11, fontFamily: 'monospace',
-          letterSpacing: '0.02em',
-        }}>
-          <span style={{ color: '#94A3B8', fontSize: 9, textTransform: 'uppercase' }}>
-            Nameplate
-          </span>
-          <span style={{ fontWeight: 700 }}>{nameplate.model}</span>
-          {nameplate.power_w && <span>{nameplate.power_w} W</span>}
-          {nameplate.voltage && <span>{nameplate.voltage}</span>}
-          {nameplate.current_a && <span>{nameplate.current_a} A</span>}
-          {nameplate.serial && (
-            <span style={{ marginLeft: 'auto', color: '#94A3B8' }}>
-              SN {nameplate.serial}
-            </span>
-          )}
-        </div>
-      )}
-
-      <Legend
-        assignedCount={assignedCount}
-        totalCount={totalCount}
-        saving={saving}
-        onReset={onReset}
-        source={sources.physical || sources.software}
-        allowIo={allowIo}
-        bridgeUp={bridgeUp}
-        expertMode={expertMode}
-        setExpertMode={setExpertMode}
-        onClearForces={onClearForces}
-        forcedCount={forcedPorts.length}
-      />
 
       {/* Physical plate — connectors in silkscreen order, left→right.
           Safety block is intercepted and rendered as a single collapsed
@@ -1778,55 +1644,24 @@ export default function IOPortMap() {
         </>
       )}
 
-      {/* IOManager + Lua verb reference — collapsed by default */}
-      <details style={{
-        border: `1px solid ${C.border}`, borderRadius: 6,
-        background: C.rowBgDim, padding: '6px 10px', fontSize: 11,
-      }}>
-        <summary style={{
-          cursor: 'pointer', color: C.textMuted, fontWeight: 600,
-          userSelect: 'none',
-        }}>
-          Verb reference · {Object.keys(verbs).length} documented (ws + lua)
-        </summary>
-        <div style={{
-          marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4,
-        }}>
-          {Object.entries(verbs).map(([slot, v]) => (
-            <div key={slot} style={{
-              display: 'grid',
-              gridTemplateColumns: '80px 40px 220px 1fr',
-              gap: 8, fontSize: 10, alignItems: 'baseline',
-            }}>
-              <span style={{ color: C.textMuted, fontFamily: 'monospace' }}>
-                {slot}
-              </span>
-              <span style={{
-                color: v.layer === 'lua' ? '#6B21A8' : '#075985',
-                fontFamily: 'monospace', fontSize: 9, fontWeight: 700,
-              }}>
-                {(v.layer || '?').toUpperCase()}
-              </span>
-              <span style={{ color: C.text, fontFamily: 'monospace' }}>
-                {v.signature || v.ty}
-              </span>
-              <span style={{ color: C.textMuted }}>
-                {v.notes}
-              </span>
-            </div>
-          ))}
-        </div>
-      </details>
+      {/* 2026-09-04 operator directive: the wire-verb / Lua command
+          reference section is retired from the I/O page. It was a
+          display-only IOManager + Lua verb dump — no downstream
+          consumers on this page. Verb documentation lives in the
+          driver source + the luaenginelib manifest. */}
 
-      {/* Sources footer */}
-      <div style={{
-        fontSize: 10, color: C.textMuted, lineHeight: 1.5,
-      }}>
-        <b>Sources:</b>{' '}
-        {sources.physical && <>physical · <code>{sources.physical}</code>; </>}
-        {sources.software && <>software · <code>{sources.software}</code>; </>}
-        {sources.lua && <>lua · <code>{sources.lua}</code>.</>}
-      </div>
+      {/* Advanced disclosure (2026-09-04). Folds the two load-
+          bearing controls the operator kept:
+            * Expert: force inputs (+ Clear all N forces sub-button)
+            * Reset assignments
+          Collapsed by default so the plate cards dominate the view. */}
+      <AdvancedControls
+        onReset={onReset}
+        expertMode={expertMode}
+        setExpertMode={setExpertMode}
+        onClearForces={onClearForces}
+        forcedCount={forcedPorts.length}
+      />
     </div>
     </IOLiveContext.Provider>
   )
