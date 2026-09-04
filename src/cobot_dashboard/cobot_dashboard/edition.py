@@ -46,24 +46,29 @@ SAFETY_INVARIANT_KEYS = frozenset({
 })
 
 # feature_key -> minimum edition. Unknown keys are treated as basic.
+#
+# 2026-09-04 OPERATOR DIRECTIVE — the split is TEMPORARILY EMPTY: every
+# key sits at EDITION_BASIC so both editions surface everything. The
+# edition machinery, chip, unlock, tests, and safety-invariant loader
+# stay wired so the moment the operator names the future full-only
+# list we flip the relevant values back to EDITION_FULL — no
+# infrastructure re-work required.
 FEATURE_MAP: dict = {
-    # ── basic tier (operator tablet) ─────────────────────────────
-    'monitor':          EDITION_BASIC,
-    'run_controls':     EDITION_BASIC,
-    'program_library':  EDITION_BASIC,
-    'wizard':           EDITION_BASIC,
-    'demonstration':    EDITION_BASIC,
-    'speed_control':    EDITION_BASIC,
-    'corner_smoothing': EDITION_BASIC,
-    # ── full tier (our PC + advanced) ────────────────────────────
-    'deep_editor':        EDITION_FULL,
-    '3d_view':            EDITION_FULL,
-    'cameras_lidar':      EDITION_FULL,
-    'part_recognition':   EDITION_FULL,
-    'io_panel':           EDITION_FULL,
-    'event_log':          EDITION_FULL,
-    'configure':          EDITION_FULL,
-    'per_step_overrides': EDITION_FULL,
+    'monitor':            EDITION_BASIC,
+    'run_controls':       EDITION_BASIC,
+    'program_library':    EDITION_BASIC,
+    'wizard':             EDITION_BASIC,
+    'demonstration':      EDITION_BASIC,
+    'speed_control':      EDITION_BASIC,
+    'corner_smoothing':   EDITION_BASIC,
+    'deep_editor':        EDITION_BASIC,
+    '3d_view':            EDITION_BASIC,
+    'cameras_lidar':      EDITION_BASIC,
+    'part_recognition':   EDITION_BASIC,
+    'io_panel':           EDITION_BASIC,
+    'event_log':          EDITION_BASIC,
+    'configure':          EDITION_BASIC,
+    'per_step_overrides': EDITION_BASIC,
 }
 
 

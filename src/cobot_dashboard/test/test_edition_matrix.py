@@ -57,21 +57,32 @@ def test_safety_invariant_keys_exact():
 
 
 def test_basic_set_exact():
+    """2026-09-04 operator directive — the split is TEMPORARILY EMPTY.
+    Every feature key sits at EDITION_BASIC so both editions surface
+    everything. The safety-invariant loader stays wired (see
+    test_safety_keys_rejected_by_loader); when the operator names the
+    future full-only list we flip the relevant values and refresh both
+    sets in this test."""
     basic = {k for k, v in edition_mod.FEATURE_MAP.items() if v == 'basic'}
     assert basic == {
         'monitor', 'run_controls', 'program_library',
         'wizard', 'demonstration', 'speed_control',
         'corner_smoothing',
-    }
-
-
-def test_full_set_exact():
-    full = {k for k, v in edition_mod.FEATURE_MAP.items() if v == 'full'}
-    assert full == {
+        # These moved from full → basic when the split emptied.
         'deep_editor', '3d_view', 'cameras_lidar',
         'part_recognition', 'io_panel', 'event_log',
         'configure', 'per_step_overrides',
     }
+
+
+def test_full_set_is_empty_until_operator_names_the_list():
+    """Split is empty until the operator names it — no feature key is
+    currently full-only. The set stays empty, not omitted, so a future
+    edit that carelessly promotes a key back to EDITION_FULL trips a
+    review at CI (the assertion fails and the author has to explicitly
+    update this test with the intended new full-only set)."""
+    full = {k for k, v in edition_mod.FEATURE_MAP.items() if v == 'full'}
+    assert full == set()
 
 
 def test_safety_keys_rejected_by_loader():
@@ -93,24 +104,16 @@ def test_safety_keys_rejected_by_loader():
 
 
 def test_is_feature_enabled_matrix():
-    # basic device -> basic features on, full features off
-    assert edition_mod.is_feature_enabled('monitor', 'basic')
-    assert edition_mod.is_feature_enabled('program_library', 'basic')
-    assert edition_mod.is_feature_enabled('wizard', 'basic')
-    assert edition_mod.is_feature_enabled('demonstration', 'basic')
-    assert edition_mod.is_feature_enabled('corner_smoothing', 'basic')
-    assert not edition_mod.is_feature_enabled('deep_editor', 'basic')
-    assert not edition_mod.is_feature_enabled('io_panel', 'basic')
-    assert not edition_mod.is_feature_enabled('event_log', 'basic')
-    assert not edition_mod.is_feature_enabled('configure', 'basic')
-    assert not edition_mod.is_feature_enabled('cameras_lidar', 'basic')
-    assert not edition_mod.is_feature_enabled('part_recognition', 'basic')
-    # full device -> everything on
+    # Split is empty (2026-09-04 directive) — every known key is on
+    # for BOTH editions. When the operator names the full-only list,
+    # add per-key False assertions for the basic side.
     for k in edition_mod.FEATURE_MAP.keys():
+        assert edition_mod.is_feature_enabled(k, 'basic'), k
         assert edition_mod.is_feature_enabled(k, 'full'), k
-    # unknown feature key defaults ENABLED (basic-safe)
+    # Unknown feature key defaults ENABLED (basic-safe).
     assert edition_mod.is_feature_enabled('does_not_exist', 'basic')
-    # unknown edition fails closed
+    assert edition_mod.is_feature_enabled('does_not_exist', 'full')
+    # Unknown edition fails closed.
     assert not edition_mod.is_feature_enabled('monitor', 'enterprise')
 
 

@@ -22,24 +22,28 @@ export const SAFETY_INVARIANT_KEYS = Object.freeze([
 ])
 
 // feature_key -> minimum edition
+//
+// 2026-09-04 OPERATOR DIRECTIVE — split TEMPORARILY EMPTY: every key
+// sits at EDITION_BASIC so both editions surface everything. The
+// edition chip, unlock, tests, and safety invariants stay wired; a
+// future directive names the full-only list and we flip values back.
+// Keep this map byte-mirrored with cobot_dashboard/edition.py.
 export const FEATURE_MAP = Object.freeze({
-  // basic tier (operator tablet)
-  monitor:          EDITION_BASIC,
-  run_controls:     EDITION_BASIC,
-  program_library:  EDITION_BASIC,
-  wizard:           EDITION_BASIC,
-  demonstration:    EDITION_BASIC,
-  speed_control:    EDITION_BASIC,
-  corner_smoothing: EDITION_BASIC,
-  // full tier (our PC + advanced)
-  deep_editor:        EDITION_FULL,
-  '3d_view':          EDITION_FULL,
-  cameras_lidar:      EDITION_FULL,
-  part_recognition:   EDITION_FULL,
-  io_panel:           EDITION_FULL,
-  event_log:          EDITION_FULL,
-  configure:          EDITION_FULL,
-  per_step_overrides: EDITION_FULL,
+  monitor:            EDITION_BASIC,
+  run_controls:       EDITION_BASIC,
+  program_library:    EDITION_BASIC,
+  wizard:             EDITION_BASIC,
+  demonstration:      EDITION_BASIC,
+  speed_control:      EDITION_BASIC,
+  corner_smoothing:   EDITION_BASIC,
+  deep_editor:        EDITION_BASIC,
+  '3d_view':          EDITION_BASIC,
+  cameras_lidar:      EDITION_BASIC,
+  part_recognition:   EDITION_BASIC,
+  io_panel:           EDITION_BASIC,
+  event_log:          EDITION_BASIC,
+  configure:          EDITION_BASIC,
+  per_step_overrides: EDITION_BASIC,
 })
 
 // Load-time validation mirroring backend's _validate_map.
