@@ -268,6 +268,13 @@ class ExpandCtx:
     max_mmps: float = 1500.0
     default_accl_mm_s2: float = 1200.0
     gentle_accl_mm_s2: float = 150.0
+    # 2026-09-04 operator-adjustable corner smoothing (SHARED with the
+    # general codegen path). The pallet expansion honors the same
+    # level ('low' | 'medium' | 'high') via codegen_blend, and the
+    # outer move_to_pallet step's optional `blend_override_mm` (if
+    # set) applies to every intermediate waypoint in the cycle.
+    smoothing_level: str = 'medium'
+    step_blend_override_mm: int | None = None
 
 
 def _next_point_name(ctx: ExpandCtx) -> str:
@@ -794,7 +801,10 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         # authored descent; the approximation is conservative.
         r_appr = blend_radius_for_corner(
             10_000.0, approach_offset_z_mm,
-            cap_mm=0.5 * approach_offset_z_mm)
+            level=ctx.smoothing_level,
+            into_fine=True,
+            next_seg_for_fine_mm=approach_offset_z_mm,
+            step_override_mm=ctx.step_blend_override_mm)
         ctx.exec_lines.append(
             f'movJ({nm_appr}'
             f'{mov_options_suffix(v=v_j_appr, b_mm=r_appr)})'
@@ -834,7 +844,10 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             fast_len_mm = max(0.0, approach_offset_z_mm - DESCENT_SPLIT_STOP_ABOVE_MM)
             r_split = blend_radius_for_corner(
                 fast_len_mm, DESCENT_SPLIT_STOP_ABOVE_MM,
-                cap_mm=0.5 * DESCENT_SPLIT_STOP_ABOVE_MM)
+                level=ctx.smoothing_level,
+                into_fine=True,
+                next_seg_for_fine_mm=DESCENT_SPLIT_STOP_ABOVE_MM,
+                step_override_mm=ctx.step_blend_override_mm)
             ctx.exec_lines.append(
                 f'movL({nm_split}'
                 f'{mov_options_suffix(v=v_l_appr, b_mm=r_split)})'
@@ -912,7 +925,9 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             _seg_retreat_next = _seg_len_mm(retreat_tcp, transit_slot_m)
         r_retreat = blend_radius_for_corner(
             _seg_pick_retreat, _seg_retreat_next,
-            cap_mm=0.5 * retreat_offset_z_mm)
+            level=ctx.smoothing_level,
+            cap_mm=0.5 * retreat_offset_z_mm,
+            step_override_mm=ctx.step_blend_override_mm)
         ctx.exec_lines.append(
             f'movL({nm_retreat}'
             f'{mov_options_suffix(v=v_l_retreat, b_mm=r_retreat)})'
@@ -941,7 +956,10 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             ctx.used_named.add(nm_tpick)
             _seg_prev_tpick = _seg_retreat_next
             _seg_tpick_next = _seg_len_mm(transit_pick_m, transit_slot_m)
-            r_tpick = blend_radius_for_corner(_seg_prev_tpick, _seg_tpick_next)
+            r_tpick = blend_radius_for_corner(
+                _seg_prev_tpick, _seg_tpick_next,
+                level=ctx.smoothing_level,
+                step_override_mm=ctx.step_blend_override_mm)
             ctx.exec_lines.append(
                 f'movL({nm_tpick}'
                 f'{mov_options_suffix(v=v_l_retreat, b_mm=r_tpick)})'
@@ -968,7 +986,10 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         ctx.used_named.add(nm_tslot)
         _seg_tslot_prev = _seg_len_mm(_prev_pos_for_tslot, transit_slot_m)
         _seg_tslot_next = _seg_len_mm(transit_slot_m, place_appr_tcp)
-        r_tslot = blend_radius_for_corner(_seg_tslot_prev, _seg_tslot_next)
+        r_tslot = blend_radius_for_corner(
+            _seg_tslot_prev, _seg_tslot_next,
+            level=ctx.smoothing_level,
+            step_override_mm=ctx.step_blend_override_mm)
         ctx.exec_lines.append(
             f'movL({nm_tslot}'
             f'{mov_options_suffix(v=v_l_retreat, b_mm=r_tslot)})'
@@ -996,7 +1017,10 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         _seg_pappr_next = _seg_len_mm(place_appr_tcp, slot_m)
         r_pappr = blend_radius_for_corner(
             _seg_pappr_prev, _seg_pappr_next,
-            cap_mm=0.5 * _seg_pappr_next)
+            level=ctx.smoothing_level,
+            into_fine=True,
+            next_seg_for_fine_mm=_seg_pappr_next,
+            step_override_mm=ctx.step_blend_override_mm)
         ctx.exec_lines.append(
             f'movL({nm_place_appr}'
             f'{mov_options_suffix(v=v_l_retreat, b_mm=r_pappr)})'
@@ -1050,7 +1074,9 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         # next = place_approach → transit_slot (retract prev-segment).
         r_post_pappr = blend_radius_for_corner(
             _seg_pappr_next, _seg_pappr_prev,
-            cap_mm=0.5 * _seg_pappr_next)
+            level=ctx.smoothing_level,
+            cap_mm=0.5 * _seg_pappr_next,
+            step_override_mm=ctx.step_blend_override_mm)
         ctx.exec_lines.append(
             f'movL({nm_place_appr}'
             f'{mov_options_suffix(v=v_l_retreat, b_mm=r_post_pappr)})'
@@ -1067,7 +1093,9 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         # `end` — the walker's motion prelude for that step forces a
         # setSpeed change, which finalizes this move regardless.
         r_post_tslot = blend_radius_for_corner(
-            _seg_pappr_prev, _seg_tslot_prev)
+            _seg_pappr_prev, _seg_tslot_prev,
+            level=ctx.smoothing_level,
+            step_override_mm=ctx.step_blend_override_mm)
         ctx.exec_lines.append(
             f'movL({nm_tslot}'
             f'{mov_options_suffix(v=v_l_retreat, b_mm=r_post_tslot)})'

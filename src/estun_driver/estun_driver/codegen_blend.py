@@ -28,20 +28,59 @@ from __future__ import annotations
 
 
 # Per-corner blend radius policy (2026-09-04 evidence pass, S-Series
-# SW Manual Appendix C):
-#   radius = min(50% × shorter adjoining segment, 100 mm)
-# Additional caller-supplied cap (e.g. approach_offset_z_mm × 0.5) so
-# a corner leading into a taught contact never lets the blend curve
-# eat more than half the vertical descent — the "genuinely vertical
-# final approach onto pick/slot" invariant.
-#
-# `BLEND_RADIUS_MM` is a legacy fallback used only when segment
-# lengths are unknown; the pallet expansion and general codegen path
-# now both call `blend_radius_for_corner()` with concrete segment
-# lengths.
-BLEND_RADIUS_MAX_MM  = 100.0
-BLEND_RADIUS_FRACTION = 0.5
-BLEND_RADIUS_MM       = 20.0     # legacy fallback / conservative default
+# SW Manual Appendix C). Operator-adjustable via three smoothing
+# levels: the fraction of the shorter adjoining segment the blend
+# curve occupies, and a hard cap so no single corner exceeds a
+# controller-safe ceiling. 200mm (HIGH) exceeds the manual's b=100
+# example but no documented ceiling exists on the `b=` optional-
+# table field in luaenginelib.json (arg schema is `${optional.b}`
+# with no range annotation). Wire refusals surface as
+# `lua_semantic_roundtrip` findings if the controller rejects the
+# larger radius on a given corner; the level cap is the operator-
+# facing shorthand, not a controller invariant.
+SMOOTHING_LEVELS = {
+    'low':    (0.35,  60.0),
+    'medium': (0.50, 100.0),
+    'high':   (0.75, 200.0),
+}
+DEFAULT_SMOOTHING_LEVEL = 'medium'
+
+# VERTICAL-LANDING INVARIANT — always wins over the level cap.
+# The corner leading INTO a FINE waypoint (pick / place / slot
+# contact) keeps at least 40% of that final-approach segment
+# perfectly straight. Blend radius on that corner is capped at
+# `(1 - 0.4) × next_seg_mm` so the straight portion is never less
+# than the invariant; the blend curve occupies the earlier 60% at
+# most. Same rule applies at every smoothing level.
+FINE_APPROACH_STRAIGHT_FRACTION = 0.4
+
+# Legacy fallback used only when segment lengths are unknown at the
+# emission site (movJCoorRel-relative, first move of a program with
+# no prior tracked target). Deliberately below every level's max.
+BLEND_RADIUS_MM       = 20.0
+
+# Legacy names retained so external callers don't break; they map
+# to the MEDIUM defaults.
+BLEND_RADIUS_MAX_MM   = SMOOTHING_LEVELS[DEFAULT_SMOOTHING_LEVEL][1]
+BLEND_RADIUS_FRACTION = SMOOTHING_LEVELS[DEFAULT_SMOOTHING_LEVEL][0]
+
+
+def resolve_smoothing_level(config: dict | None) -> str:
+    """Return the normalised smoothing level string for `config`.
+    Reads `config.corner_smoothing` (case-insensitive), falls back to
+    `DEFAULT_SMOOTHING_LEVEL` for missing / unknown. Callers that
+    already hold the string can call `_level_params()` directly.
+    """
+    if not isinstance(config, dict):
+        return DEFAULT_SMOOTHING_LEVEL
+    v = str(config.get('corner_smoothing') or '').strip().lower()
+    return v if v in SMOOTHING_LEVELS else DEFAULT_SMOOTHING_LEVEL
+
+
+def _level_params(level: str) -> tuple[float, float]:
+    return SMOOTHING_LEVELS.get(
+        str(level or '').strip().lower(),
+        SMOOTHING_LEVELS[DEFAULT_SMOOTHING_LEVEL])
 
 
 # Actions whose emission forces the PREVIOUS motion to be a FINE
@@ -97,14 +136,33 @@ def mov_blend_kv() -> str:
 
 
 def blend_radius_for_corner(prev_seg_mm: float, next_seg_mm: float,
-                            cap_mm: float | None = None) -> int:
+                            *,
+                            level: str = DEFAULT_SMOOTHING_LEVEL,
+                            cap_mm: float | None = None,
+                            into_fine: bool = False,
+                            next_seg_for_fine_mm: float | None = None,
+                            step_override_mm: int | None = None) -> int:
     """Return per-corner blend radius (mm, int).
 
-    Rule (S-Series manual §Appendix C shape): ``radius = min(50% ×
-    shorter adjoining segment, 100 mm)``. Optional ``cap_mm`` bounds
-    the radius further — callers pass e.g. ``approach_offset_z * 0.5``
-    to guarantee at least half of a taught-contact descent stays
-    straight down (no rounding into the taught XY).
+    Level-driven rule:
+        radius = min(level_fraction × shorter adjoining segment,
+                     level_max_mm)
+
+    Additional caps applied in order:
+      * `cap_mm` — caller-supplied geometric cap (e.g. an approach
+        offset's own 0.5× so the corner never eats more than half
+        the operator's chosen descent). Kept for backwards-compat
+        with call sites landed before `into_fine`.
+      * INVARIANT (`into_fine=True`) — the vertical-landing
+        invariant: the final-approach segment into a FINE contact
+        keeps at least FINE_APPROACH_STRAIGHT_FRACTION (=0.4) of
+        its length perfectly straight. Cap =
+        `(1 - 0.4) × next_seg_for_fine_mm` (or `next_seg_mm` when
+        the caller doesn't provide a separate value). Applied at
+        EVERY level; the level cap never overrides this.
+      * `step_override_mm` — operator override on the specific step,
+        still bounded by the level cap AND the vertical-landing
+        invariant.
 
     Returns 0 when either adjoining segment is effectively zero;
     callers treat 0 as "no blend, emit bare" so the classifier and
@@ -113,11 +171,37 @@ def blend_radius_for_corner(prev_seg_mm: float, next_seg_mm: float,
     """
     if prev_seg_mm <= 1e-3 or next_seg_mm <= 1e-3:
         return 0
+    fraction, level_max = _level_params(level)
+    # Level-driven raw radius.
     shorter = min(prev_seg_mm, next_seg_mm)
-    r = BLEND_RADIUS_FRACTION * shorter
-    r = min(r, BLEND_RADIUS_MAX_MM)
+    r = fraction * shorter
+    r = min(r, level_max)
     if cap_mm is not None:
         r = min(r, cap_mm)
+    # Vertical-landing invariant — always applied when into_fine.
+    if into_fine:
+        vertical_seg = (next_seg_for_fine_mm
+                        if next_seg_for_fine_mm is not None
+                        else next_seg_mm)
+        vertical_cap = (1.0 - FINE_APPROACH_STRAIGHT_FRACTION) * vertical_seg
+        r = min(r, vertical_cap)
+    # Operator override — bounded by level max AND (if fine) the
+    # invariant.
+    if step_override_mm is not None:
+        try:
+            ov = int(step_override_mm)
+        except (TypeError, ValueError):
+            ov = None
+        if ov is not None and ov > 0:
+            ov_capped = min(ov, level_max)
+            if into_fine:
+                vertical_seg = (next_seg_for_fine_mm
+                                if next_seg_for_fine_mm is not None
+                                else next_seg_mm)
+                ov_capped = min(
+                    ov_capped,
+                    (1.0 - FINE_APPROACH_STRAIGHT_FRACTION) * vertical_seg)
+            r = ov_capped
     return max(0, int(round(r)))
 
 

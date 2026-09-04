@@ -5465,6 +5465,38 @@ export default function ProgramEditor() {
           {steps.length} step{steps.length === 1 ? '' : 's'}
         </span>
 
+        {/* Corner smoothing — program-level setting. Higher = faster,
+            wider arcs through travel points. Applies to every
+            intermediate move in both pallet and non-pallet paths;
+            never to a taught contact (the classifier keeps those
+            as fine stops for IO transitions). Wizard defaults new
+            programs to MEDIUM; the operator retunes here in the
+            editor.  Value flows through program.config.corner_smoothing
+            and is consumed by codegen_blend at emit time. */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4,
+                      flexShrink: 0 }}
+             title="Corner smoothing (blend radius policy). LOW ≤ 60mm, MEDIUM ≤ 100mm, HIGH ≤ 200mm. Higher = faster, wider arcs through travel points. Taught contacts always stop.">
+          <span style={{ fontSize: 11, color: '#6b7280' }}>Smoothing</span>
+          <select
+            value={String(currentProgram?.config?.corner_smoothing || 'medium').toLowerCase()}
+            onChange={(e) => setCurrentProgram({
+              config: { ...(currentProgram?.config || {}),
+                        corner_smoothing: e.target.value },
+              unsaved: true,
+            })}
+            aria-label="Corner smoothing"
+            style={{
+              padding: '3px 6px', fontSize: 12, fontWeight: 600,
+              background: '#f8fafc', color: '#111',
+              border: '1px solid #d1d5db', borderRadius: 4,
+              cursor: 'pointer',
+            }}>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+          </select>
+        </div>
+
         <button onClick={handleSave} disabled={!unsaved || saveStatus === 'saving'}
           title={saveError || (unsaved ? 'Save the current program' : 'No unsaved changes')}
           style={{
