@@ -1216,11 +1216,25 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   }, [posIdx])
 
   function skipCurrent() {
-    setAnswer(current.key, {
-      tcp: null, joints: null,
-      taught_at: new Date().toISOString(),
-      skipped: true,
-    })
+    // Don't clobber an earlier-taught value that shares this key. The
+    // pallet + pick_and_place flows re-use `taught_home` for the return-
+    // home step at the tail of the sequence; if the operator taught
+    // home at step 1 and hits Skip on the return-home step, we must
+    // NOT overwrite the taught pose with {skipped:true} — otherwise
+    // the review page's Positions Taught list flips `taught_home` to
+    // "required — skipped" and the operator sees a false "home
+    // untaught" verdict after they clearly taught it. Same guard
+    // skipAllRemaining() already uses.
+    const existing = answers[current.key]
+    const alreadyRecorded = !!(existing && !existing.skipped
+      && (Array.isArray(existing.tcp) || Array.isArray(existing.joints)))
+    if (!alreadyRecorded) {
+      setAnswer(current.key, {
+        tcp: null, joints: null,
+        taught_at: new Date().toISOString(),
+        skipped: true,
+      })
+    }
     clearReusedAt(posIdx)
     advanceOrComplete()
   }
@@ -2775,19 +2789,32 @@ const PAGES = [
               {isDepal ? 'Pick' : 'Fill'} order: {isDepal ? `Top layer first, ${orderLabel}` : orderLabel}
             </div>
             <div style={{ color: '#6b7280', marginTop: 6 }}>
-              {isDepal ? (
-                <>
-                  Corner [1,1,top]: {readTaught(answers, 'taught_pallet_corner') ? '✓ Taught' : '— Not taught'}
-                  <br />
-                  Place position: {readTaught(answers, 'taught_place') ? '✓ Taught' : '— Not taught'}
-                </>
-              ) : (
-                <>
-                  Pick position: {readTaught(answers, 'taught_pick') ? '✓ Taught' : '— Not taught'}
-                  <br />
-                  Corner [1,1,1]: {readTaught(answers, 'taught_pallet_corner') ? '✓ Taught' : '— Not taught'}
-                </>
-              )}
+              {/* v2 frame: 3 corners + first-part datum. The old
+                  single-key `taught_pallet_corner` check dates to v1
+                  and always resolves to false against v2 answers,
+                  which made this row read "Not taught" on the
+                  review page even after the operator taught all
+                  four points. Read the v2 keys. */}
+              {(() => {
+                const c1   = readTaught(answers, 'taught_pallet_corner1')
+                const c2   = readTaught(answers, 'taught_pallet_corner2')
+                const c3   = readTaught(answers, 'taught_pallet_corner3')
+                const part = readTaught(answers, 'taught_pallet_part')
+                const allFour = c1 && c2 && c3 && part
+                return isDepal ? (
+                  <>
+                    Pallet frame (①②③ + ④ part): {allFour ? '✓ Taught' : '— Not fully taught'}
+                    <br />
+                    Place position: {readTaught(answers, 'taught_place') ? '✓ Taught' : '— Not taught'}
+                  </>
+                ) : (
+                  <>
+                    Pick position: {readTaught(answers, 'taught_pick') ? '✓ Taught' : '— Not taught'}
+                    <br />
+                    Pallet frame (①②③ + ④ part): {allFour ? '✓ Taught' : '— Not fully taught'}
+                  </>
+                )
+              })()}
             </div>
           </div>
         )}

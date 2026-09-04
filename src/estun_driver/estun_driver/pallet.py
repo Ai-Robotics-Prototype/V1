@@ -279,6 +279,50 @@ def _next_point_name(ctx: ExpandCtx) -> str:
     return nm
 
 
+# 2026-09-04 §13.3 — retry IK across multiple seeds before declaring a
+# pose "unreachable". The prior single-seed policy (feed the previous
+# solved joints as the sole seed) was operator-hostile: LM would get
+# stuck at a local minimum on the wrong kinematic branch for edge
+# slots even though the pose was clearly reachable — verified against
+# slot [0,3,0] on program 'test', which the taught_pick seed solves in
+# 5μm. Refuse ONLY when every seed fails; then the pose really is
+# outside reach and the refusal is a true kinematic impossibility.
+#
+# Seeds are tried in order of "closest to expected branch":
+#   1. `primary_seed`   — the walker's chained seed (previous solve).
+#                         Fast when it works; the traditional path.
+#   2. `pick_joints`    — the operator's taught pick pose. Known
+#                         reachable, known branch; robust for any
+#                         nearby slot / transit.
+#   3. `_NEUTRAL_SEED`  — a wrist-neutral pose commonly reachable
+#                         across the arm's envelope. Last resort;
+#                         also widens `max_seed_dev_deg` so LM can
+#                         cross branches if needed.
+_NEUTRAL_SEED = [0.0, -45.0, 90.0, 0.0, 90.0, 0.0]
+
+
+def _multi_seed_ik(ctx: ExpandCtx, primary_seed, target_tcp_m,
+                   pick_joints):
+    """Try the primary seed, then the taught pick, then a neutral
+    seed with widened branch tolerance. Return the first solve or
+    None if every seed fails.
+
+    Signature matches `ctx.seeded_ik_to_pose(seed, tcp_m)` so callers
+    can drop-in swap; solve success is `(joints, ...)` per the same
+    contract.
+    """
+    r = ctx.seeded_ik_to_pose(list(primary_seed), target_tcp_m)
+    if r is not None:
+        return r
+    if list(pick_joints) != list(primary_seed):
+        r = ctx.seeded_ik_to_pose(list(pick_joints), target_tcp_m)
+        if r is not None:
+            return r
+    r = ctx.seeded_ik_to_pose(list(_NEUTRAL_SEED), target_tcp_m,
+                              max_seed_dev_deg=180.0, max_iter=300)
+    return r
+
+
 # ── Expansion ───────────────────────────────────────────────────────
 
 def expand(step: dict, ctx: ExpandCtx) -> None:
@@ -682,7 +726,7 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             float(pick_tcp[4]),
             float(pick_tcp[5]),
         ]
-        ik_appr = ctx.seeded_ik_to_pose(list(pick_joints), approach_tcp)
+        ik_appr = _multi_seed_ik(ctx, list(pick_joints), approach_tcp, pick_joints)
         if ik_appr is None:
             _abort(
                 f'-- PALLET IK FAILED: approach above pick '
@@ -724,7 +768,7 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
                 float(pick_tcp[4]),
                 float(pick_tcp[5]),
             ]
-            ik_split = ctx.seeded_ik_to_pose(seed, split_tcp)
+            ik_split = _multi_seed_ik(ctx, seed, split_tcp, pick_joints)
             if ik_split is None:
                 _abort(
                     f'-- PALLET IK FAILED: descent-split waypoint '
@@ -808,7 +852,7 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             float(pick_tcp[4]),
             float(pick_tcp[5]),
         ]
-        ik_retreat = ctx.seeded_ik_to_pose(seed, retreat_tcp)
+        ik_retreat = _multi_seed_ik(ctx, seed, retreat_tcp, pick_joints)
         if ik_retreat is None:
             _abort(
                 f'-- PALLET IK FAILED: retreat above pick '
@@ -841,7 +885,7 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         # let (5) traverse straight from retreat over to the slot.
         retreat_z_abs = float(retreat_tcp[2])
         if retreat_z_abs < float(transit_pick_m[2]) - 1e-4:
-            ik_tpick = ctx.seeded_ik_to_pose(seed, transit_pick_m)
+            ik_tpick = _multi_seed_ik(ctx, seed, transit_pick_m, pick_joints)
             if ik_tpick is None:
                 _abort(
                     f'-- PALLET IK FAILED: transit_over_pick for slot '
@@ -861,7 +905,7 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             seed = list(q_tpick)
 
         # (5) Traverse over slot at transit_Z.
-        ik_tslot = ctx.seeded_ik_to_pose(seed, transit_slot_m)
+        ik_tslot = _multi_seed_ik(ctx, seed, transit_slot_m, pick_joints)
         if ik_tslot is None:
             _abort(
                 f'-- PALLET IK FAILED: transit_over_slot '
@@ -880,7 +924,7 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         seed = list(q_tslot)
 
         # (6) Descend to place_approach (layer-adjusted).
-        ik_place_appr = ctx.seeded_ik_to_pose(seed, place_appr_tcp)
+        ik_place_appr = _multi_seed_ik(ctx, seed, place_appr_tcp, pick_joints)
         if ik_place_appr is None:
             _abort(
                 f'-- PALLET IK FAILED: place_approach for '
@@ -901,7 +945,7 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         seed = list(q_place_appr)
 
         # (7) LINEAR DOWN to place at slot.
-        ik_slot = ctx.seeded_ik_to_pose(seed, slot_m)
+        ik_slot = _multi_seed_ik(ctx, seed, slot_m, pick_joints)
         if ik_slot is None:
             _abort(
                 f'-- PALLET IK FAILED: slot [{r_idx},{c_idx},{l_idx}] '

@@ -83,15 +83,12 @@ _MAX_TILT_DEG          = 10.0    # warn beyond
 _MIN_EDGE_LEN_M        = 0.001   # 1 mm coincident-corner threshold
 _PITCH_MISMATCH_M      = 0.003   # 3 mm typed-vs-measured warn (RETIRED 2026-08-05)
 _PART_DATUM_MAX_SLOTS  = 1.5     # dimensionless — × max_pitch
-# 2026-08-05 (grid-fits-frame check, operator doctrine ruling):
-# Warn when the derived slot grid extent overshoots the taught frame
-# in either axis; error when it wildly overshoots. The frame extent
-# is the length of the corner1→corner2 vector (row axis) or
-# corner1→corner3 (col axis); the grid extent for N slots is
-# (N-1)·pitch. A tolerance of 5 mm avoids nuisance warnings when
-# corners are taught a hair inside the last-slot centers.
-_GRID_FIT_TOLERANCE_M  = 0.005   # 5 mm slack
-_GRID_FIT_ERROR_RATIO  = 1.5     # >1.5× frame extent → error (catches pitch typos)
+# 2026-08-05 grid-fits-frame check (RETIRED 2026-09-04 §13.3): the
+# comparison between typed grid extent and taught corner span was an
+# operator-hostile false gate. Model: corners = frame origin +
+# orientation ONLY; typed pitch is the real pitch. Slots extending
+# beyond corner span are normal. `_GRID_FIT_TOLERANCE_M` and
+# `_GRID_FIT_ERROR_RATIO` are removed with the ruling.
 
 # The pre-2026-08-04 names `_MIN_EDGE_LEN_MM` and
 # `_PITCH_MISMATCH_MM` are RETIRED (not aliased) — an alias
@@ -425,13 +422,18 @@ def validate_frame(spec: PalletPlaceSpec) -> List[Dict[str, Any]]:
     # 2026-08-05 OPERATOR DOCTRINE RULING (pallet_geometry canonical):
     # The old pitch typed-vs-measured check is RETIRED. Corners are
     # frame-only; typed pitch is not derived from corners, so the
-    # comparison was between unrelated quantities. Its replacement
-    # is the "grid fits the frame" check below — it catches the
-    # actual failure mode (a pitch typo like 1500 mm) instead of
-    # rejecting every legitimate configuration where the pallet
-    # corners aren't at the [1,N]/[M,1] extreme slot centers.
-    if spec.has_taught_frame():
-        out.extend(_grid_extent_vs_frame_extent(spec))
+    # comparison was between unrelated quantities.
+    #
+    # 2026-09-04 §13.3 (operator-authoritative model): the followup
+    # "grid fits the frame" check that replaced it is also RETIRED.
+    # Model: pallet corners define ORIGIN + ORIENTATION ONLY. Typed
+    # pallet_spacing_{x,y}_mm is the real pitch. Slots extending
+    # beyond corner span are NORMAL and MUST NOT surface as an
+    # error/warning. Reachability is enforced downstream by the
+    # controller's IK, not by comparing typed grid extent to corner
+    # spread. `_grid_extent_vs_frame_extent` and the related
+    # `_GRID_FIT_TOLERANCE_M / _GRID_FIT_ERROR_RATIO` tunables are
+    # removed with this ruling.
     return out
 
 
@@ -457,70 +459,6 @@ def _order_indices(rows: int, cols: int, layers: int,
 
 
 # ── Slot Δ math — routes through the taught frame when present ──
-
-def _grid_extent_vs_frame_extent(spec: PalletPlaceSpec
-                                  ) -> List[Dict[str, Any]]:
-    """Grid-fits-frame check (2026-08-05 operator doctrine ruling).
-
-    The pallet frame is defined by corners 1-3. The slot grid is
-    defined by the datum (corner 1 origin, part_tcp if taught) plus
-    (N-1)·pitch along each frame axis. If the grid extends beyond
-    the taught frame in either direction, either the pitch is a
-    typo or the corners were taught in the wrong places.
-
-    Findings:
-      * ratio > _GRID_FIT_ERROR_RATIO (default 1.5) → error
-      * grid extent > frame extent + _GRID_FIT_TOLERANCE_M → warning
-
-    Returns a list of findings. Emits at most one per axis (row, col).
-
-    Only fires when the frame is taught (has_taught_frame) AND at
-    least one pitch is nonzero — otherwise there is no meaningful
-    grid extent to compare against."""
-    findings: List[Dict[str, Any]] = []
-    A = _xyz(spec.corner1_tcp)      # meters
-    B = _xyz(spec.corner2_tcp)      # meters
-    C = _xyz(spec.corner3_tcp)      # meters
-    row_frame_m = _len(_sub(B, A))
-    col_frame_m = _len(_sub(C, A))
-    pr_m = (float(spec.pitch_row_mm) or 0.0) / 1000.0
-    pc_m = (float(spec.pitch_col_mm) or 0.0) / 1000.0
-    cols = int(spec.cols) if spec.cols else 1
-    rows = int(spec.rows) if spec.rows else 1
-
-    def _check(axis_name: str, axis_letter: str, corners: list[str],
-               pitch_m: float, N: int, frame_m: float) -> None:
-        if pitch_m <= 0 or N <= 1 or frame_m <= 0:
-            return
-        grid_m = (N - 1) * pitch_m
-        if grid_m <= frame_m + _GRID_FIT_TOLERANCE_M:
-            return
-        ratio = grid_m / frame_m
-        severity = 'error' if ratio > _GRID_FIT_ERROR_RATIO else 'warning'
-        overshoot_m = grid_m - frame_m
-        findings.append({
-            'severity':         severity,
-            'code':             f'{axis_name}_grid_exceeds_frame',
-            'involves_corners': corners,
-            'message': (
-                f'{axis_name.capitalize()} grid needs '
-                f'{grid_m*1000.0:.0f} mm '
-                f'({N} slots × {pitch_m*1000.0:.0f} mm pitch) — taught '
-                f'frame along {axis_letter} is '
-                f'{frame_m*1000.0:.0f} mm '
-                f'(over by {overshoot_m*1000.0:.0f} mm). Check the '
-                f'{axis_name} pitch value or the corner placement.'),
-            'grid_m':           grid_m,
-            'frame_m':          frame_m,
-            'overshoot_m':      overshoot_m,
-            'ratio':            ratio,
-        })
-
-    _check('row', 'row axis (corner 1 → corner 2)',
-           ['c1', 'c2'], pr_m, cols, row_frame_m)
-    _check('col', 'column axis (corner 1 → corner 3)',
-           ['c1', 'c3'], pc_m, rows, col_frame_m)
-    return findings
 
 
 def _effective_pitches(spec: PalletPlaceSpec
