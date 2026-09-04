@@ -27,11 +27,21 @@ don't map onto the general step-list lookahead.
 from __future__ import annotations
 
 
-# Per-waypoint blend radius (mm). 20 mm sits well under the 100 mm
-# default approach offset — vertical descents to a taught contact
-# arrive straight down without the blend curve undercutting the
-# contact's XY. Retune point is exactly this constant.
-BLEND_RADIUS_MM = 20.0
+# Per-corner blend radius policy (2026-09-04 evidence pass, S-Series
+# SW Manual Appendix C):
+#   radius = min(50% × shorter adjoining segment, 100 mm)
+# Additional caller-supplied cap (e.g. approach_offset_z_mm × 0.5) so
+# a corner leading into a taught contact never lets the blend curve
+# eat more than half the vertical descent — the "genuinely vertical
+# final approach onto pick/slot" invariant.
+#
+# `BLEND_RADIUS_MM` is a legacy fallback used only when segment
+# lengths are unknown; the pallet expansion and general codegen path
+# now both call `blend_radius_for_corner()` with concrete segment
+# lengths.
+BLEND_RADIUS_MAX_MM  = 100.0
+BLEND_RADIUS_FRACTION = 0.5
+BLEND_RADIUS_MM       = 20.0     # legacy fallback / conservative default
 
 
 # Actions whose emission forces the PREVIOUS motion to be a FINE
@@ -68,8 +78,11 @@ _BLEND_NON_ACTIONABLE = frozenset({'comment', 'end'})
 
 def mov_blend_suffix() -> str:
     """Return the trailing `, {b=NN}` for an INTERMEDIATE motion
-    call like `movL(p3){SUFFIX}` → `movL(p3, {b=20})`. Never emit on
-    a FINE step (see `step_forces_stop`).
+    call like `movL(p3){SUFFIX}` → `movL(p3, {b=20})`. Legacy
+    fallback that uses the conservative flat radius. Prefer
+    `mov_options_suffix(..., b_mm=blend_radius_for_corner(...))` in
+    new call sites — inline v/a and per-corner scaling together are
+    what the S-Series manual §Appendix C sample recipe shows.
     """
     return f', {{b={int(BLEND_RADIUS_MM)}}}'
 
@@ -77,9 +90,69 @@ def mov_blend_suffix() -> str:
 def mov_blend_kv() -> str:
     """Return the `b=NN` key-value (no braces / leading comma) for
     embedding into an existing options table like
-    `movJCoorRel({cp={...}},{coor=0,tool=0,b=20})`.
+    `movJCoorRel({cp={...}},{coor=0,tool=0,b=20})`. Legacy path;
+    prefer `mov_options_suffix()`.
     """
     return f'b={int(BLEND_RADIUS_MM)}'
+
+
+def blend_radius_for_corner(prev_seg_mm: float, next_seg_mm: float,
+                            cap_mm: float | None = None) -> int:
+    """Return per-corner blend radius (mm, int).
+
+    Rule (S-Series manual §Appendix C shape): ``radius = min(50% ×
+    shorter adjoining segment, 100 mm)``. Optional ``cap_mm`` bounds
+    the radius further — callers pass e.g. ``approach_offset_z * 0.5``
+    to guarantee at least half of a taught-contact descent stays
+    straight down (no rounding into the taught XY).
+
+    Returns 0 when either adjoining segment is effectively zero;
+    callers treat 0 as "no blend, emit bare" so the classifier and
+    the geometric guard are consistent (segment length collapses to
+    a fine stop just like the classifier's stop-trigger does).
+    """
+    if prev_seg_mm <= 1e-3 or next_seg_mm <= 1e-3:
+        return 0
+    shorter = min(prev_seg_mm, next_seg_mm)
+    r = BLEND_RADIUS_FRACTION * shorter
+    r = min(r, BLEND_RADIUS_MAX_MM)
+    if cap_mm is not None:
+        r = min(r, cap_mm)
+    return max(0, int(round(r)))
+
+
+def mov_options_suffix(*, v=None, a=None, b_mm=None,
+                        coor=None, tool=None) -> str:
+    """Build the `, {v=…, a=…, b=…, coor=…, tool=…}` option table
+    that trails a movJ/movL/movJCoorRel/etc. call — the wire-legal
+    per-move override path per luaenginelib's arg schema on each
+    of those verbs (`{v=…, a=…, b=…, rb=…, coor=…, tool=…,
+    search=…, onpercent=…}`).
+
+    Only non-None keys emit; a b_mm of 0 is treated as "no blend"
+    (bare fine point) and omits `b=`. Returns '' when no keys are
+    set so callers can append it unconditionally.
+
+    Units follow the manual: v is deg/s for joint verbs and mm/s
+    for linear verbs (caller responsibility to pass the right
+    number); a is deg/s² / mm/s² per the same convention.
+
+    Emitting per-move v (instead of an interleaved setSpeedJ/setSpeedL
+    modal setter between adjacent motions) is what preserves the
+    blend across the corner — a modal speed verb between two blended
+    moves forces the controller to finalize the first move before
+    processing the second (S-Series SW Manual, Appendix C).
+    """
+    parts = []
+    if v    is not None: parts.append(f'v={int(round(v))}')
+    if a    is not None: parts.append(f'a={int(round(a))}')
+    if b_mm is not None and b_mm > 0:
+        parts.append(f'b={int(round(b_mm))}')
+    if coor is not None: parts.append(f'coor={int(coor)}')
+    if tool is not None: parts.append(f'tool={int(tool)}')
+    if not parts:
+        return ''
+    return ', {' + ','.join(parts) + '}'
 
 
 def step_forces_stop(steps: list, i: int) -> bool:

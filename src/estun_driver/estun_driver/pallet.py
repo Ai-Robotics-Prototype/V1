@@ -312,8 +312,25 @@ _NEUTRAL_SEED = [0.0, -45.0, 90.0, 0.0, 90.0, 0.0]
 # retract) are fixed by the compound `move_to_pallet` semantics and
 # don't map onto the general step-lookahead classifier. Constants +
 # suffix helpers live in one place.
-from .codegen_blend import BLEND_RADIUS_MM as _BLEND_RADIUS_MM
-from .codegen_blend import mov_blend_suffix as _mov_blend_arg
+from .codegen_blend import (
+    BLEND_RADIUS_MM,
+    BLEND_RADIUS_MAX_MM,
+    mov_blend_suffix,           # legacy fallback (unused now, kept for API compat)
+    mov_options_suffix,
+    blend_radius_for_corner,
+)
+
+
+def _seg_len_mm(a_m, b_m) -> float:
+    """Euclidean distance between two TCP position triples (meters
+    input; mm output). Uses only the position channels [0..2]; wrist
+    rotation deltas are ignored — the blend rule tracks LINEAR
+    corner geometry, not orientation change.
+    """
+    dx = float(a_m[0]) - float(b_m[0])
+    dy = float(a_m[1]) - float(b_m[1])
+    dz = float(a_m[2]) - float(b_m[2])
+    return (dx * dx + dy * dy + dz * dz) ** 0.5 * 1000.0
 
 
 def _multi_seed_ik(ctx: ExpandCtx, primary_seed, target_tcp_m,
@@ -669,14 +686,28 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
     # itself remains visible to the operator.
     _abort_mark[0] = len(ctx.exec_lines)
 
-    # Modal setSpeedJ / setSpeedL / setAccL cache local to this
-    # expansion. Reset every time expand() runs (fresh per-cycle
-    # emission). The outer walker also resets its own copies AFTER
-    # expand() returns so a subsequent movJ/movL re-issues its
-    # speed directive.
-    _last_speed_j: float | None = None
-    _last_speed_l: float | None = None
-    _last_accl: float | None = None
+    # 2026-09-04 (Appendix-C evidence pass) — interleaved
+    # setSpeedJ/setSpeedL BETWEEN blended movs forces the controller
+    # to finalize the previous move before processing the next
+    # (S-Series manual §Appendix C). The per-cycle body no longer
+    # emits ANY modal setSpeedJ/setSpeedL/setAccL — v/a live on each
+    # motion's own optional table (`movJ(pt, {v=…, a=…, b=…})`) so
+    # adjacent blends see a clean, uninterrupted stream. Modal
+    # setSpeed emissions from the walker's OUTER _emit_motion_prelude
+    # (before/after expand()) are unaffected.
+    #
+    # Concrete v/a values:
+    #   approach movJ  → v = approach_speed_pct × max_dps    (deg/s)
+    #   descent movL   → v = pick_speed_pct     × max_mmps   (mm/s)
+    #     descent-split gentle final → also a = gentle_accl_mm_s2
+    #   retreat / transit / place_approach movL
+    #                  → v = retreat_speed_pct  × max_mmps
+    #   slot place movL → v = pick_speed_pct    × max_mmps
+    #   post-release lifts → v = retreat_speed_pct × max_mmps
+    v_j_appr    = approach_speed_pct / 100.0 * ctx.max_dps
+    v_l_appr    = approach_speed_pct / 100.0 * ctx.max_mmps
+    v_l_pick    = pick_speed_pct     / 100.0 * ctx.max_mmps
+    v_l_retreat = retreat_speed_pct  / 100.0 * ctx.max_mmps
 
     # ── per-slot cycles ──────────────────────────────────────
     for sl_idx, sl in enumerate(slots):
@@ -729,10 +760,11 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             + ' -> retract -> transit_Z')
 
         # (1a) Approach above pick — consume the absorbed approach's
-        # authored `offset_z_mm` (positive, base +Z). Use movJ so
-        # cycle 1 (arriving from move_home) and cycles 2+ (arriving
-        # from prev transit) don't have to hold a straight-line path
-        # from an unbounded start. Emit setSpeedJ modally.
+        # authored offset_z_mm (positive, base +Z). movJ so cycle 1
+        # (from move_home) and cycles 2+ (from prev transit) don't
+        # have to hold a straight-line path from an unbounded start.
+        # v/b travel inline on the movJ call (Appendix C shape); no
+        # setSpeedJ between blended moves.
         approach_tcp = [
             float(pick_tcp[0]),
             float(pick_tcp[1]),
@@ -753,28 +785,29 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         nm_appr = _next_point_name(ctx)
         ctx.varspoint[nm_appr] = ctx.make_jp_point(q_appr, nm_appr)
         ctx.used_named.add(nm_appr)
-        _speed_j_appr = round(approach_speed_pct / 100.0 * ctx.max_dps, 3)
-        if _last_speed_j is None or abs(_speed_j_appr - _last_speed_j) > 1e-4:
-            ctx.exec_lines.append(
-                f'setSpeedJ({_speed_j_appr:g})  -- cycle '
-                f'{sl_idx + 1} approach {approach_speed_pct}% '
-                f'× max {ctx.max_dps:g} deg/s')
-            _last_speed_j = _speed_j_appr
+        # Corner @ approach: prev-seg unknown (cycle 1 = move_home,
+        # cycle N+1 = prev cycle's transit_slot). Approximate with a
+        # large default so `shorter = approach_offset_z_mm` and the
+        # `cap_mm = 0.5 × approach_offset_z_mm` guard keeps the last
+        # half of the descent straight down. For cycle 1 the arm
+        # likely arrives from far away, so the shorter segment IS the
+        # authored descent; the approximation is conservative.
+        r_appr = blend_radius_for_corner(
+            10_000.0, approach_offset_z_mm,
+            cap_mm=0.5 * approach_offset_z_mm)
         ctx.exec_lines.append(
-            f'movJ({nm_appr}{_mov_blend_arg()})  -- cycle {sl_idx + 1} approach '
-            f'above pick ({approach_offset_z_mm:.0f}mm above contact, '
-            f'absolute Z={approach_tcp[2]*1000:.1f}mm)  '
+            f'movJ({nm_appr}'
+            f'{mov_options_suffix(v=v_j_appr, b_mm=r_appr)})'
+            f'  -- cycle {sl_idx + 1} approach above pick '
+            f'({approach_offset_z_mm:.0f}mm above contact, absolute Z='
+            f'{approach_tcp[2]*1000:.1f}mm)  '
             f'joints=[{", ".join(f"{v:+.3f}" for v in q_appr)}]  '
-            f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
+            f'[{"BLEND " + str(r_appr) + "mm" if r_appr > 0 else "FINE"}]')
         seed = list(q_appr)
 
-        # (1b) Descent to pick contact — either single movL (short
-        # descent) or descent-split (long descent > threshold, fast
-        # movL to 50mm above pick + gentle-accel final movL to pick).
-        # Mirrors analyzer Rule 2c so the absorbed adaptation actually
-        # reaches the wire instead of being discarded with the step.
-        _speed_l_pick = round(pick_speed_pct / 100.0 * ctx.max_mmps, 3)
-        _speed_l_appr = round(approach_speed_pct / 100.0 * ctx.max_mmps, 3)
+        # (1b) Descent to pick contact — single movL, or descent-
+        # split for long descents (rule 2c mirror). All v/a travel
+        # inline; no interleaved setSpeedL/setAccL.
         if descent_split_needed:
             split_tcp = [
                 float(pick_tcp[0]),
@@ -795,47 +828,39 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             nm_split = _next_point_name(ctx)
             ctx.varspoint[nm_split] = ctx.make_jp_point(q_split, nm_split)
             ctx.used_named.add(nm_split)
-            if _last_speed_l is None or abs(_speed_l_appr - _last_speed_l) > 1e-4:
-                ctx.exec_lines.append(
-                    f'setSpeedL({_speed_l_appr:g})  -- cycle '
-                    f'{sl_idx + 1} descent-split fast portion '
-                    f'{approach_speed_pct}% × max {ctx.max_mmps:g} mm/s')
-                _last_speed_l = _speed_l_appr
+            # Corner @ split: prev-seg = approach_offset - 50mm (fast
+            # portion), next-seg = 50mm (gentle final). Cap so the
+            # last 25mm of the gentle final stays vertical.
+            fast_len_mm = max(0.0, approach_offset_z_mm - DESCENT_SPLIT_STOP_ABOVE_MM)
+            r_split = blend_radius_for_corner(
+                fast_len_mm, DESCENT_SPLIT_STOP_ABOVE_MM,
+                cap_mm=0.5 * DESCENT_SPLIT_STOP_ABOVE_MM)
             ctx.exec_lines.append(
-                f'movL({nm_split}{_mov_blend_arg()})  -- cycle {sl_idx + 1} '
-                f'descent-split fast to '
+                f'movL({nm_split}'
+                f'{mov_options_suffix(v=v_l_appr, b_mm=r_split)})'
+                f'  -- cycle {sl_idx + 1} descent-split fast to '
                 f'{DESCENT_SPLIT_STOP_ABOVE_MM:.0f}mm above pick '
                 f'(absolute Z={split_tcp[2]*1000:.1f}mm)  '
                 f'joints=[{", ".join(f"{v:+.3f}" for v in q_split)}]  '
-                f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
+                f'[{"BLEND " + str(r_split) + "mm" if r_split > 0 else "FINE"}]')
             seed = list(q_split)
-            if _last_accl is None or abs(ctx.gentle_accl_mm_s2 - _last_accl) > 1e-4:
-                ctx.exec_lines.append(
-                    f'setAccL({ctx.gentle_accl_mm_s2:g})  -- cycle '
-                    f'{sl_idx + 1} gentle-accel final descent to pick '
-                    f'(descent_split rule 2c mirror)')
-                _last_accl = ctx.gentle_accl_mm_s2
-            if _last_speed_l is None or abs(_speed_l_pick - _last_speed_l) > 1e-4:
-                ctx.exec_lines.append(
-                    f'setSpeedL({_speed_l_pick:g})  -- cycle '
-                    f'{sl_idx + 1} pick descent {pick_speed_pct}% '
-                    f'× max {ctx.max_mmps:g} mm/s')
-                _last_speed_l = _speed_l_pick
+            # Gentle-accel final descent — inline a= carries the
+            # gentle value; the movL is FINE (setDO+wait immediately
+            # after forces stop).
             ctx.exec_lines.append(
-                f'movL({pick_pt_name})  -- cycle {sl_idx + 1} pick '
+                f'movL({pick_pt_name}'
+                f'{mov_options_suffix(v=v_l_pick, a=ctx.gentle_accl_mm_s2)})'
+                f'  -- cycle {sl_idx + 1} pick '
                 f'(gentle final descent, split at '
                 f'{DESCENT_SPLIT_STOP_ABOVE_MM:.0f}mm above)  '
                 f'joints=[{", ".join(f"{v:+.3f}" for v in pick_joints)}]  '
-                f'[FINE — setDO+wait force stop]')
+                f'[FINE — setDO+wait force stop; gentle a='
+                f'{int(round(ctx.gentle_accl_mm_s2))}]')
         else:
-            if _last_speed_l is None or abs(_speed_l_pick - _last_speed_l) > 1e-4:
-                ctx.exec_lines.append(
-                    f'setSpeedL({_speed_l_pick:g})  -- cycle '
-                    f'{sl_idx + 1} pick descent {pick_speed_pct}% '
-                    f'× max {ctx.max_mmps:g} mm/s')
-                _last_speed_l = _speed_l_pick
             ctx.exec_lines.append(
-                f'movL({pick_pt_name})  -- cycle {sl_idx + 1} pick '
+                f'movL({pick_pt_name}'
+                f'{mov_options_suffix(v=v_l_pick)})'
+                f'  -- cycle {sl_idx + 1} pick '
                 f'(descent from {approach_offset_z_mm:.0f}mm above)  '
                 f'joints=[{", ".join(f"{v:+.3f}" for v in pick_joints)}]  '
                 f'[FINE — setDO+wait force stop]')
@@ -852,17 +877,9 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
                 f'wait({seal_wait_ms})  -- cycle {sl_idx + 1} '
                 f'seal wait {seal_wait_ms} ms')
 
-        # (3.5) Retreat above pick — consume the absorbed retreat's
-        # authored `offset_z_mm` (positive, base +Z). Symmetric with
-        # the approach; use movL so the lift is straight-line above
-        # the pick (no lateral drift while the part settles). Restore
-        # default accL if descent-split bumped it to gentle.
-        if descent_split_needed and _last_accl is not None \
-                and abs(ctx.default_accl_mm_s2 - _last_accl) > 1e-4:
-            ctx.exec_lines.append(
-                f'setAccL({ctx.default_accl_mm_s2:g})  -- cycle '
-                f'{sl_idx + 1} restore default accel after descent-split')
-            _last_accl = ctx.default_accl_mm_s2
+        # (3.5) Retreat above pick — inline v/a/b, no setAccL restore
+        # needed (each subsequent movL carries its own a= or omits it
+        # to inherit controller default).
         retreat_tcp = [
             float(pick_tcp[0]),
             float(pick_tcp[1]),
@@ -883,27 +900,32 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         nm_retreat = _next_point_name(ctx)
         ctx.varspoint[nm_retreat] = ctx.make_jp_point(q_retreat, nm_retreat)
         ctx.used_named.add(nm_retreat)
-        _speed_l_retreat = round(retreat_speed_pct / 100.0 * ctx.max_mmps, 3)
-        if _last_speed_l is None or abs(_speed_l_retreat - _last_speed_l) > 1e-4:
-            ctx.exec_lines.append(
-                f'setSpeedL({_speed_l_retreat:g})  -- cycle '
-                f'{sl_idx + 1} retreat {retreat_speed_pct}% '
-                f'× max {ctx.max_mmps:g} mm/s')
-            _last_speed_l = _speed_l_retreat
+        # Corner @ retreat: prev-seg = pick → retreat (retreat_offset),
+        # next-seg = retreat → tpick or tslot (compute at emission
+        # time via seg length). Cap so at least half the retreat lift
+        # is straight up from the pick contact.
+        _seg_pick_retreat = _seg_len_mm(pick_tcp, retreat_tcp)
+        retreat_z_abs = float(retreat_tcp[2])
+        if retreat_z_abs < float(transit_pick_m[2]) - 1e-4:
+            _seg_retreat_next = _seg_len_mm(retreat_tcp, transit_pick_m)
+        else:
+            _seg_retreat_next = _seg_len_mm(retreat_tcp, transit_slot_m)
+        r_retreat = blend_radius_for_corner(
+            _seg_pick_retreat, _seg_retreat_next,
+            cap_mm=0.5 * retreat_offset_z_mm)
         ctx.exec_lines.append(
-            f'movL({nm_retreat}{_mov_blend_arg()})  -- cycle {sl_idx + 1} retreat '
-            f'above pick ({retreat_offset_z_mm:.0f}mm above contact, '
-            f'absolute Z={retreat_tcp[2]*1000:.1f}mm)  '
+            f'movL({nm_retreat}'
+            f'{mov_options_suffix(v=v_l_retreat, b_mm=r_retreat)})'
+            f'  -- cycle {sl_idx + 1} retreat above pick '
+            f'({retreat_offset_z_mm:.0f}mm above contact, absolute Z='
+            f'{retreat_tcp[2]*1000:.1f}mm)  '
             f'joints=[{", ".join(f"{v:+.3f}" for v in q_retreat)}]  '
-            f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
+            f'[{"BLEND " + str(r_retreat) + "mm" if r_retreat > 0 else "FINE"}]')
         seed = list(q_retreat)
 
-        # (4) Lift to transit_Z above pick — only emit when retreat
-        # left us BELOW the traversal height. If the operator authored
-        # a retreat >= transit height, we're already at (or above) the
-        # traversal Z and this move would go DOWNWARD; skip it and
-        # let (5) traverse straight from retreat over to the slot.
-        retreat_z_abs = float(retreat_tcp[2])
+        # (4) Lift to transit_Z above pick — only when retreat_Z <
+        # transit_Z (otherwise skip; retreat already at/above
+        # traversal height).
         if retreat_z_abs < float(transit_pick_m[2]) - 1e-4:
             ik_tpick = _multi_seed_ik(ctx, seed, transit_pick_m, pick_joints)
             if ik_tpick is None:
@@ -917,13 +939,20 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
             nm_tpick = _next_point_name(ctx)
             ctx.varspoint[nm_tpick] = ctx.make_jp_point(q_tpick, nm_tpick)
             ctx.used_named.add(nm_tpick)
+            _seg_prev_tpick = _seg_retreat_next
+            _seg_tpick_next = _seg_len_mm(transit_pick_m, transit_slot_m)
+            r_tpick = blend_radius_for_corner(_seg_prev_tpick, _seg_tpick_next)
             ctx.exec_lines.append(
-                f'movL({nm_tpick}{_mov_blend_arg()})  -- cycle {sl_idx + 1} '
-                f'lift-to-transit (over pick, absolute Z='
-                f'{transit_pick_m[2]*1000:.1f}mm)  '
+                f'movL({nm_tpick}'
+                f'{mov_options_suffix(v=v_l_retreat, b_mm=r_tpick)})'
+                f'  -- cycle {sl_idx + 1} lift-to-transit '
+                f'(over pick, absolute Z={transit_pick_m[2]*1000:.1f}mm)  '
                 f'joints=[{", ".join(f"{v:+.3f}" for v in q_tpick)}]  '
-                f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
+                f'[{"BLEND " + str(r_tpick) + "mm" if r_tpick > 0 else "FINE"}]')
             seed = list(q_tpick)
+            _prev_pos_for_tslot = transit_pick_m
+        else:
+            _prev_pos_for_tslot = retreat_tcp
 
         # (5) Traverse over slot at transit_Z.
         ik_tslot = _multi_seed_ik(ctx, seed, transit_slot_m, pick_joints)
@@ -937,12 +966,17 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         nm_tslot = _next_point_name(ctx)
         ctx.varspoint[nm_tslot] = ctx.make_jp_point(q_tslot, nm_tslot)
         ctx.used_named.add(nm_tslot)
+        _seg_tslot_prev = _seg_len_mm(_prev_pos_for_tslot, transit_slot_m)
+        _seg_tslot_next = _seg_len_mm(transit_slot_m, place_appr_tcp)
+        r_tslot = blend_radius_for_corner(_seg_tslot_prev, _seg_tslot_next)
         ctx.exec_lines.append(
-            f'movL({nm_tslot}{_mov_blend_arg()})  -- cycle {sl_idx + 1} '
-            f'traverse-over-slot [{r_idx},{c_idx},{l_idx}] at '
+            f'movL({nm_tslot}'
+            f'{mov_options_suffix(v=v_l_retreat, b_mm=r_tslot)})'
+            f'  -- cycle {sl_idx + 1} traverse-over-slot '
+            f'[{r_idx},{c_idx},{l_idx}] at '
             f'transit_Z={transit_slot_m[2]*1000:.1f}mm  '
             f'joints=[{", ".join(f"{v:+.3f}" for v in q_tslot)}]  '
-            f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
+            f'[{"BLEND " + str(r_tslot) + "mm" if r_tslot > 0 else "FINE"}]')
         seed = list(q_tslot)
 
         # (6) Descend to place_approach (layer-adjusted).
@@ -958,13 +992,20 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         ctx.varspoint[nm_place_appr] = ctx.make_jp_point(
             q_place_appr, nm_place_appr)
         ctx.used_named.add(nm_place_appr)
+        _seg_pappr_prev = _seg_tslot_next
+        _seg_pappr_next = _seg_len_mm(place_appr_tcp, slot_m)
+        r_pappr = blend_radius_for_corner(
+            _seg_pappr_prev, _seg_pappr_next,
+            cap_mm=0.5 * _seg_pappr_next)
         ctx.exec_lines.append(
-            f'movL({nm_place_appr}{_mov_blend_arg()})  -- cycle {sl_idx + 1} '
-            f'place_approach [{r_idx},{c_idx},{l_idx}] layer {l_idx} '
+            f'movL({nm_place_appr}'
+            f'{mov_options_suffix(v=v_l_retreat, b_mm=r_pappr)})'
+            f'  -- cycle {sl_idx + 1} place_approach '
+            f'[{r_idx},{c_idx},{l_idx}] layer {l_idx} '
             f'({place_appr_kind_line}, absolute Z='
             f'{place_appr_tcp[2]*1000:.1f}mm)  '
             f'joints=[{", ".join(f"{v:+.3f}" for v in q_place_appr)}]  '
-            f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
+            f'[{"BLEND " + str(r_pappr) + "mm" if r_pappr > 0 else "FINE"}]')
         seed = list(q_place_appr)
 
         # (7) LINEAR DOWN to place at slot.
@@ -979,7 +1020,9 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         ctx.varspoint[nm_slot] = ctx.make_jp_point(q_slot, nm_slot)
         ctx.used_named.add(nm_slot)
         ctx.exec_lines.append(
-            f'movL({nm_slot})  -- slot[{r_idx},{c_idx},{l_idx}] place  '
+            f'movL({nm_slot}'
+            f'{mov_options_suffix(v=v_l_pick)})'
+            f'  -- slot[{r_idx},{c_idx},{l_idx}] place  '
             f'joints=[{", ".join(f"{v:+.3f}" for v in q_slot)}]  '
             f'(linear-down from approach)  [FINE — setDO release forces stop]')
         seed = list(q_slot)
@@ -1003,17 +1046,33 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
                 f'blow-off pulse end DO{blow_port_do}=0')
 
         # (10) LINEAR UP — retract to place_approach.
+        # Corner: prev = slot → place_approach (retract distance),
+        # next = place_approach → transit_slot (retract prev-segment).
+        r_post_pappr = blend_radius_for_corner(
+            _seg_pappr_next, _seg_pappr_prev,
+            cap_mm=0.5 * _seg_pappr_next)
         ctx.exec_lines.append(
-            f'movL({nm_place_appr}{_mov_blend_arg()})  -- cycle {sl_idx + 1} '
-            f'linear-up to place_approach (retract '
-            f'{retract_dist_mm:.0f}mm)  '
+            f'movL({nm_place_appr}'
+            f'{mov_options_suffix(v=v_l_retreat, b_mm=r_post_pappr)})'
+            f'  -- cycle {sl_idx + 1} linear-up to place_approach '
+            f'(retract {retract_dist_mm:.0f}mm)  '
             f'joints=[{", ".join(f"{v:+.3f}" for v in q_place_appr)}]  '
-            f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
+            f'[{"BLEND " + str(r_post_pappr) + "mm" if r_post_pappr > 0 else "FINE"}]')
 
-        # (11) Lift back to transit_Z above slot.
+        # (11) Lift back to transit_Z above slot. Next cycle's
+        # approach segment is unknown at emission time (varies per
+        # slot), so use the just-emitted place_approach segment as
+        # the shorter proxy. The last cycle's lift-to-transit blends
+        # into the return-to-home the walker emits after the loop
+        # `end` — the walker's motion prelude for that step forces a
+        # setSpeed change, which finalizes this move regardless.
+        r_post_tslot = blend_radius_for_corner(
+            _seg_pappr_prev, _seg_tslot_prev)
         ctx.exec_lines.append(
-            f'movL({nm_tslot}{_mov_blend_arg()})  -- cycle {sl_idx + 1} '
-            f'lift-to-transit (over slot after release, '
+            f'movL({nm_tslot}'
+            f'{mov_options_suffix(v=v_l_retreat, b_mm=r_post_tslot)})'
+            f'  -- cycle {sl_idx + 1} lift-to-transit '
+            f'(over slot after release, '
             f'transit_Z={transit_slot_m[2]*1000:.1f}mm)  '
             f'joints=[{", ".join(f"{v:+.3f}" for v in q_tslot)}]  '
-            f'[BLEND {int(_BLEND_RADIUS_MM)}mm]')
+            f'[{"BLEND " + str(r_post_tslot) + "mm" if r_post_tslot > 0 else "FINE"}]')

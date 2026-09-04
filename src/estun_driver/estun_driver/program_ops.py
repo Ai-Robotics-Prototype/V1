@@ -1385,10 +1385,26 @@ _KNOWN_BAD_PATTERNS.append(('setBlender', _bad_setBlender_arg))
 # avoidance vs. leaving two drifting copies).
 from .codegen_blend import (
     BLEND_RADIUS_MM,
+    BLEND_RADIUS_MAX_MM,
     mov_blend_suffix,
     mov_blend_kv,
+    mov_options_suffix,
+    blend_radius_for_corner,
     step_forces_stop,
 )
+
+
+def _seg_mm_from_tcps(a_m, b_m):
+    """Euclidean XYZ distance in mm between two TCP triples (meters
+    input). Wrist rotation channels ignored — blend radius rule is
+    linear-corner geometry only.
+    """
+    if a_m is None or b_m is None:
+        return None
+    dx = float(a_m[0]) - float(b_m[0])
+    dy = float(a_m[1]) - float(b_m[1])
+    dz = float(a_m[2]) - float(b_m[2])
+    return (dx * dx + dy * dy + dz * dz) ** 0.5 * 1000.0
 
 
 _NON_MOTION_ACTIONS_FOR_TAUGHT_CHECK = frozenset({
@@ -3538,6 +3554,16 @@ def codegen_lua_from_program(
     # movL (movJ back-to-back at the same joints is a controller-
     # tolerated no-op).
     last_move_joints: list[float] | None = None
+    # 2026-09-04: track the previous motion's target TCP (meters) so
+    # per-corner blend radius can consult the previous segment length.
+    # None on program start and after any non-motion emission that
+    # invalidates the running blend chain (loop end, no-op break,
+    # etc.).  Full min(prev,next) rule with forward-lookahead is a
+    # bounded follow-up; the current implementation uses
+    # `blend_radius_for_corner(prev_seg, 10_000)` which reduces to
+    # `min(0.5 × prev_seg, 100 mm)` — safe because it always
+    # under-caps rather than over-blending.
+    _last_motion_target_tcp_m: list[float] | None = None
     # D11 (2026-08-03): True when the previous move emission was a
     # column-derived step whose joints came from
     # `seeded_ik_z_lift_hold_orientation`. Under D11 the endpoint TCP
@@ -3772,21 +3798,41 @@ def codegen_lua_from_program(
         # mm/s for L. NOTE: these units are not yet wire-confirmed on
         # THIS controller — the §5 first-run sheet measures observed
         # cartesian speed against the emitted mm/s value.
+        # 2026-09-04 (Appendix-C evidence pass): setSpeedJ/setSpeedL
+        # emitted BETWEEN two blended moves forces the controller to
+        # finalize the first move before processing the second. To
+        # preserve blends across every corner, we emit setSpeedJ /
+        # setSpeedL EXACTLY ONCE (at the first movJ / movL of the
+        # program) so the wire has a cruise baseline. All subsequent
+        # speed values ride inline on the motion call's optional
+        # table (`v=…` per luaenginelib's arg schema on every mov*
+        # verb). The `_last_speed_*` cache is still updated so the
+        # inline-v emitters can consult it.
         if verb in ('movJ', 'movJCoorRel'):
             target = round(step_pct / 100.0 * max_dps, 3)
-            if _last_speed_j is None or abs(target - _last_speed_j) > 1e-4:
+            if _last_speed_j is None:
                 exec_lines.append(
                     f'setSpeedJ({target:g})  '
                     f'-- {step_pct}% × max {max_dps:g} deg/s = {target:g} deg/s '
-                    f'(setSpeedJ is modal — re-emitted only when value changes)')
+                    f'(bootstrap cruise; subsequent speed changes '
+                    f'ride inline on the motion via v=)')
+                _last_speed_j = target
+            elif abs(target - _last_speed_j) > 1e-4:
+                # Speed changed vs the running modal cruise — track
+                # the new value, but do NOT emit setSpeedJ between
+                # moves (that would kill the blend). The motion's
+                # own `v=` will override for this call.
                 _last_speed_j = target
         elif verb == 'movL':
             target_l = round(step_pct / 100.0 * max_mmps, 3)
-            if _last_speed_l is None or abs(target_l - _last_speed_l) > 1e-4:
+            if _last_speed_l is None:
                 exec_lines.append(
                     f'setSpeedL({target_l:g})  '
                     f'-- {step_pct}% × max {max_mmps:g} mm/s = {target_l:g} mm/s '
-                    f'(setSpeedL is modal — re-emitted only when value changes)')
+                    f'(bootstrap cruise; subsequent speed changes '
+                    f'ride inline on the motion via v=)')
+                _last_speed_l = target_l
+            elif abs(target_l - _last_speed_l) > 1e-4:
                 _last_speed_l = target_l
         # ── ACCEL — gentle-descent bracket ───────────────────────
         # Only interacts with linear (setAccL). Joint accel (setAccJ)
@@ -4340,15 +4386,24 @@ def codegen_lua_from_program(
                 j5_note = (f'J5={float(tj[4]):+.2f}°' if len(tj) >= 5 else 'J5=?')
                 _emit_motion_prelude(_step_idx, 'movJ', step)
                 _is_stop = step_forces_stop(steps, _step_idx)
-                _blend  = '' if _is_stop else mov_blend_suffix()
-                _tag    = '[FINE]' if _is_stop else f'[BLEND {int(BLEND_RADIUS_MM)}mm]'
+                _step_pct = _step_effective_pct(step, _step_idx)
+                _v = _step_pct / 100.0 * max_dps
+                _this_tcp = _tcp_from_joints_m([float(v) for v in tj]) if len(tj) == 6 else None
+                _prev_seg = _seg_mm_from_tcps(_last_motion_target_tcp_m, _this_tcp)
+                _b = 0 if _is_stop else (
+                    blend_radius_for_corner(_prev_seg, 10_000.0)
+                    if _prev_seg is not None else int(BLEND_RADIUS_MM))
+                _tag = '[FINE]' if _is_stop else f'[BLEND {_b}mm]'
                 exec_lines.append(
-                    f'movJ({ref}{_blend})  -- step {action}  '
+                    f'movJ({ref}{mov_options_suffix(v=_v, b_mm=_b)})  '
+                    f'-- step {action}  '
                     f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
                     f'(FIX A: identity offset → reuse anchor jp; no IK)  '
                     f'{j5_note}'
                     + (f'  joints=[{joints_s}]' if joints_s else '')
                     + f'  {_tag}')
+                if _this_tcp is not None:
+                    _last_motion_target_tcp_m = list(_this_tcp)
                 if len(tj) == 6:
                     last_move_joints = [float(v) for v in tj]
                 last_move_col_locked = False
@@ -4527,15 +4582,27 @@ def codegen_lua_from_program(
                                     f' max={worst:.2f}°{flag}')
                         _emit_motion_prelude(_step_idx, emit_verb_derived, step)
                         _is_stop = step_forces_stop(steps, _step_idx)
-                        _blend   = '' if _is_stop else mov_blend_suffix()
-                        _tag     = '[FINE]' if _is_stop else f'[BLEND {int(BLEND_RADIUS_MM)}mm]'
+                        _step_pct = _step_effective_pct(step, _step_idx)
+                        _v = (_step_pct / 100.0 * max_dps
+                              if emit_verb_derived in ('movJ', 'movJCoorRel')
+                              else _step_pct / 100.0 * max_mmps)
+                        _this_tcp = _tcp_from_joints_m(list(lifted_deg))
+                        _prev_seg = _seg_mm_from_tcps(_last_motion_target_tcp_m, _this_tcp)
+                        _b = 0 if _is_stop else (
+                            blend_radius_for_corner(_prev_seg, 10_000.0)
+                            if _prev_seg is not None else int(BLEND_RADIUS_MM))
+                        _tag = '[FINE]' if _is_stop else f'[BLEND {_b}mm]'
                         exec_lines.append(
-                            f'{emit_verb_derived}({name}{_blend})  -- step {action}'
+                            f'{emit_verb_derived}({name}'
+                            f'{mov_options_suffix(v=_v, b_mm=_b)})  '
+                            f'-- step {action}'
                             f'{divergence_note}  '
                             f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
                             f'(FIX C: SEEDED IK Δz={achieved:+.2f} mm; '
                             f'taught J5={anchor_j5:+.2f}° → emitted J5={lifted_deg[4]:+.2f}° '
                             f'Δ{j5_delta:.3f}°)  joints=[{joints_s}]{feas_note}{orient_note}  {_tag}')
+                        if _this_tcp is not None:
+                            _last_motion_target_tcp_m = list(_this_tcp)
                         last_move_joints = list(lifted_deg)
                         last_move_col_locked = (column_side is not None
                                                 and _col_ori_err_deg is not None)
@@ -4553,13 +4620,25 @@ def codegen_lua_from_program(
                            'joint-space with cartesian Z-offset)'
                            if action == 'move_linear' else '')
             _is_stop = step_forces_stop(steps, _step_idx)
-            _blend_kv = '' if _is_stop else ',' + mov_blend_kv()
-            _tag = '[FINE]' if _is_stop else f'[BLEND {int(BLEND_RADIUS_MM)}mm]'
+            _step_pct = _step_effective_pct(step, _step_idx)
+            _v = _step_pct / 100.0 * max_dps
+            # movJCoorRel has no absolute target we can compute
+            # prev-seg to (offset is relative). Fall back to the
+            # flat conservative BLEND_RADIUS_MM when not stopping.
+            _b = 0 if _is_stop else int(BLEND_RADIUS_MM)
+            _kv_parts = [f'coor=0', 'tool=0', f'v={int(round(_v))}']
+            if _b > 0:
+                _kv_parts.append(f'b={_b}')
+            _kv = ','.join(_kv_parts)
+            _tag = '[FINE]' if _is_stop else f'[BLEND {_b}mm]'
             exec_lines.append(
-                f'movJCoorRel({{cp={{0,0,{ofs_mm:g},0,0,0}}}},{{coor=0,tool=0{_blend_kv}}})  '
+                f'movJCoorRel({{cp={{0,0,{ofs_mm:g},0,0,0}}}},{{{_kv}}})  '
                 f'-- step {action}{_divergence}  derived_from={role!r} '
                 f'offset_z_mm={ofs_mm:g}  '
                 f'(FIX B v2 fallback)  {_tag}')
+            # movJCoorRel target is relative — invalidate prev-target
+            # so the next corner won't use a stale absolute point.
+            _last_motion_target_tcp_m = None
             # movJCoorRel hands wrist branch selection to the
             # controller — downstream verifiers (zero-length guard,
             # wrist-deviation check on the next taught contact) must
@@ -4637,11 +4716,22 @@ def codegen_lua_from_program(
                         f'(reason: {chk["reason"]})')
             _emit_motion_prelude(_step_idx, emit_verb, step)
             _is_stop = step_forces_stop(steps, _step_idx)
-            _blend   = '' if _is_stop else mov_blend_suffix()
-            _tag     = '[FINE]' if _is_stop else f'[BLEND {int(BLEND_RADIUS_MM)}mm]'
+            _step_pct = _step_effective_pct(step, _step_idx)
+            _v = (_step_pct / 100.0 * max_dps
+                  if emit_verb in ('movJ', 'movJCoorRel')
+                  else _step_pct / 100.0 * max_mmps)
+            _this_tcp = _tcp_from_joints_m(list(j_list))
+            _prev_seg = _seg_mm_from_tcps(_last_motion_target_tcp_m, _this_tcp)
+            _b = 0 if _is_stop else (
+                blend_radius_for_corner(_prev_seg, 10_000.0)
+                if _prev_seg is not None else int(BLEND_RADIUS_MM))
+            _tag = '[FINE]' if _is_stop else f'[BLEND {_b}mm]'
             exec_lines.append(
-                f'{emit_verb}({pn}{_blend})  -- step {action}{divergence_note}  '
+                f'{emit_verb}({pn}{mov_options_suffix(v=_v, b_mm=_b)})  '
+                f'-- step {action}{divergence_note}  '
                 f'point={pn}  {j5_note}  joints=[{joints_s}]{wrist_note}  {_tag}')
+            if _this_tcp is not None:
+                _last_motion_target_tcp_m = list(_this_tcp)
             last_move_joints = j_list
             last_move_col_locked = False
             continue
@@ -4765,11 +4855,19 @@ def codegen_lua_from_program(
                 # gentle-final movL to the contact itself. Always
                 # BLEND here regardless of the step's overall
                 # classification.
+                _step_pct = _step_effective_pct(step, _step_idx)
+                _v = _step_pct / 100.0 * max_mmps
+                _this_tcp = _tcp_from_joints_m(list(inter_joints))
+                _prev_seg = _seg_mm_from_tcps(_last_motion_target_tcp_m, _this_tcp)
+                _b = (blend_radius_for_corner(_prev_seg, 10_000.0)
+                      if _prev_seg is not None else int(BLEND_RADIUS_MM))
                 exec_lines.append(
-                    f'movL({inter_name}{mov_blend_suffix()})  -- step {action} (RULE 2c intermediate '
+                    f'movL({inter_name}{mov_options_suffix(v=_v, b_mm=_b)})  '
+                    f'-- step {action} (RULE 2c intermediate '
                     f'movL Δz={achieved:+.2f}mm above contact)  '
-                    f'joints=[{inter_joints_s}]  '
-                    f'[BLEND {int(BLEND_RADIUS_MM)}mm]')
+                    f'joints=[{inter_joints_s}]  [BLEND {_b}mm]')
+                if _this_tcp is not None:
+                    _last_motion_target_tcp_m = list(_this_tcp)
                 # Emit gentle setAccL for the final descent. Modal —
                 # if we're already at the gentle value it's a no-op.
                 if _last_accl is None or abs(gentle_accL - _last_accl) > 1e-4:
@@ -4787,11 +4885,22 @@ def codegen_lua_from_program(
                     'through to single-shot descent')
         _emit_motion_prelude(_step_idx, emit_verb, step)
         _is_stop = step_forces_stop(steps, _step_idx)
-        _blend   = '' if _is_stop else mov_blend_suffix()
-        _tag     = '[FINE]' if _is_stop else f'[BLEND {int(BLEND_RADIUS_MM)}mm]'
+        _step_pct = _step_effective_pct(step, _step_idx)
+        _v = (_step_pct / 100.0 * max_dps
+              if emit_verb in ('movJ', 'movJCoorRel')
+              else _step_pct / 100.0 * max_mmps)
+        _this_tcp = _tcp_from_joints_m(list(taught_list))
+        _prev_seg = _seg_mm_from_tcps(_last_motion_target_tcp_m, _this_tcp)
+        _b = 0 if _is_stop else (
+            blend_radius_for_corner(_prev_seg, 10_000.0)
+            if _prev_seg is not None else int(BLEND_RADIUS_MM))
+        _tag = '[FINE]' if _is_stop else f'[BLEND {_b}mm]'
         exec_lines.append(
-            f'{emit_verb}({name}{_blend})  -- step {action}{inline_divergence_note}  '
+            f'{emit_verb}({name}{mov_options_suffix(v=_v, b_mm=_b)})  '
+            f'-- step {action}{inline_divergence_note}  '
             f'{j5_note}  joints=[{joints_s}]{wrist_note}  {_tag}')
+        if _this_tcp is not None:
+            _last_motion_target_tcp_m = list(_this_tcp)
         last_move_joints = taught_list
         last_move_col_locked = False
         # After a descent split, restore default setAccL so the
