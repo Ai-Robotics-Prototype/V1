@@ -520,7 +520,7 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
     absorbed_retreat  = ctx.absorb_plan.absorbed_retreat_step
     if absorbed_approach is None:
         ctx.exec_lines.append(
-            "-- refused 'move_to_pallet': no absorbed approach step "
+            "-- REFUSED 'move_to_pallet': no absorbed approach step "
             "(move_linear with derived_from='pick' BEFORE the taught "
             "pick_contact) — refusing rather than emitting a bare "
             "direct-to-pick. Add the approach step to the program "
@@ -529,7 +529,7 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
         return
     if absorbed_retreat is None:
         ctx.exec_lines.append(
-            "-- refused 'move_to_pallet': no absorbed retreat step "
+            "-- REFUSED 'move_to_pallet': no absorbed retreat step "
             "(move_linear with derived_from='pick' AFTER the taught "
             "pick_contact) — refusing rather than emitting a bare "
             "direct-to-pick with no retreat lift.")
@@ -553,13 +553,13 @@ def expand(step: dict, ctx: ExpandCtx) -> None:
     retreat_offset_z_mm  = _pos_offset_mm(absorbed_retreat)
     if approach_offset_z_mm is None:
         ctx.exec_lines.append(
-            "-- refused 'move_to_pallet': absorbed approach step has "
+            "-- REFUSED 'move_to_pallet': absorbed approach step has "
             "no positive `offset_z_mm` — cannot compute an approach "
             "point above the pick.")
         return
     if retreat_offset_z_mm is None:
         ctx.exec_lines.append(
-            "-- refused 'move_to_pallet': absorbed retreat step has "
+            "-- REFUSED 'move_to_pallet': absorbed retreat step has "
             "no positive `offset_z_mm` — cannot compute a retreat "
             "point above the pick.")
         return
