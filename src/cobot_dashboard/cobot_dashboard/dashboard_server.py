@@ -3195,42 +3195,69 @@ if FASTAPI_AVAILABLE:
     # reading it, MOVE it out of the gated list here — do NOT expect
     # the middleware to know which page requested.
     import re as _edition_re
+    # Pattern entries: (regex, feature_key, methods_or_None). When
+    # methods_or_None is None every HTTP method matching the path
+    # goes through the edition gate. Otherwise only methods in the
+    # tuple are gated — reads on the same path stay open. This is
+    # how /api/cells/* mutations get gated as `cell_commissioning`
+    # while GET /api/cells/active stays reachable for the StatusBar
+    # + Monitor consumers on basic devices.
     _EDITION_FULL_ONLY_PATTERNS = [
         # part_recognition (AdaptivePicking-only)
-        (_edition_re.compile(r'^/api/parts/upload/?$'),          'part_recognition'),
-        (_edition_re.compile(r'^/api/parts/[^/]+/teach($|/)'),   'part_recognition'),
-        (_edition_re.compile(r'^/api/parts/[^/]+/scan($|/)'),    'part_recognition'),
-        (_edition_re.compile(r'^/api/parts/[^/]+/orient_weights$'), 'part_recognition'),
-        (_edition_re.compile(r'^/api/parts/[^/]+/orientation_debug$'), 'part_recognition'),
-        (_edition_re.compile(r'^/api/parts/[^/]+/defects$'),     'part_recognition'),
-        (_edition_re.compile(r'^/api/parts/[^/]+/teach_clear$'), 'part_recognition'),
-        (_edition_re.compile(r'^/api/parts/[^/]+/config$'),      'part_recognition'),
-        (_edition_re.compile(r'^/api/openvocab($|/)'),           'part_recognition'),
-        (_edition_re.compile(r'^/api/teach_mode/(start|stop)$'), 'part_recognition'),
-        (_edition_re.compile(r'^/api/detections$'),              'part_recognition'),
+        (_edition_re.compile(r'^/api/parts/upload/?$'),          'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/teach($|/)'),   'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/scan($|/)'),    'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/orient_weights$'), 'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/orientation_debug$'), 'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/defects$'),     'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/teach_clear$'), 'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/config$'),      'part_recognition', None),
+        (_edition_re.compile(r'^/api/openvocab($|/)'),           'part_recognition', None),
+        (_edition_re.compile(r'^/api/teach_mode/(start|stop)$'), 'part_recognition', None),
+        (_edition_re.compile(r'^/api/detections$'),              'part_recognition', None),
         # cameras_lidar (SensorsLayout-only)
-        (_edition_re.compile(r'^/api/motioncam($|/)'),           'cameras_lidar'),
+        (_edition_re.compile(r'^/api/motioncam($|/)'),           'cameras_lidar', None),
         # safety_page has no dedicated /api/safety config route on this
         # backend; the SafetyPage reads via /ws/state which stays open
         # (state is edition-independent). Tab hiding is the gate.
+        #
+        # cell_commissioning (2026-09-04 Configure additions). Cell
+        # STATE reads stay open for both editions — StatusBar's
+        # environment-guard footer and Monitor's zone display depend
+        # on GET /api/cells + GET /api/cells/active + GET
+        # /api/cells/{id}/... . Only WRITES + activate/deactivate
+        # + baseline/collision_zones BUILDS are gated. Setup Wizard
+        # lives in Configure which itself hides on basic; this is
+        # defence-in-depth so a curl (or a future basic-side surface)
+        # cannot mutate cell state.
+        (_edition_re.compile(r'^/api/cells$'),                        'cell_commissioning', ('POST',)),
+        (_edition_re.compile(r'^/api/cells/deactivate$'),             'cell_commissioning', ('POST',)),
+        (_edition_re.compile(r'^/api/cells/[^/]+$'),                  'cell_commissioning', ('PUT', 'DELETE')),
+        (_edition_re.compile(r'^/api/cells/[^/]+/activate$'),         'cell_commissioning', ('POST',)),
+        (_edition_re.compile(r'^/api/cells/[^/]+/baseline$'),         'cell_commissioning', ('POST',)),
+        (_edition_re.compile(r'^/api/cells/[^/]+/collision_zones($|/)'), 'cell_commissioning', ('POST', 'DELETE')),
     ]
 
     @app.middleware("http")
     async def _edition_gate_middleware(request, call_next):
         path = request.url.path
-        for pat, feature_key in _EDITION_FULL_ONLY_PATTERNS:
-            if pat.match(path):
-                # Deferred import — edition module loaded further down
-                # in this file, but middleware runs at request time
-                # (post-import), so a lazy reference is safe.
-                from cobot_dashboard import edition as _ed
-                client_id = (request.headers.get('x-client-id') or '').strip()
-                ed = _ed.resolve_edition(client_id)
-                if not _ed.is_feature_enabled(feature_key, ed):
-                    payload = _ed.refusal_payload(feature_key)
-                    payload['edition'] = ed
-                    return JSONResponse(payload, status_code=403)
-                break
+        method = request.method
+        for pat, feature_key, methods in _EDITION_FULL_ONLY_PATTERNS:
+            if not pat.match(path):
+                continue
+            if methods is not None and method not in methods:
+                continue
+            # Deferred import — edition module loaded further down
+            # in this file, but middleware runs at request time
+            # (post-import), so a lazy reference is safe.
+            from cobot_dashboard import edition as _ed
+            client_id = (request.headers.get('x-client-id') or '').strip()
+            ed = _ed.resolve_edition(client_id)
+            if not _ed.is_feature_enabled(feature_key, ed):
+                payload = _ed.refusal_payload(feature_key)
+                payload['edition'] = ed
+                return JSONResponse(payload, status_code=403)
+            break
         return await call_next(request)
 
     # ------------------------------------------------------------------

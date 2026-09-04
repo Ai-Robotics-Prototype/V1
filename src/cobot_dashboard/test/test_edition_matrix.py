@@ -57,28 +57,31 @@ def test_safety_invariant_keys_exact():
 
 
 def test_basic_set_exact():
-    """2026-09-04 operator authoritative split — Basic includes every
-    feature EXCEPT the three hidden surfaces (cameras_lidar,
-    part_recognition, safety_page). The safety PAGE is edition-gated
-    here; E-STOP + safety interlocks stay edition-INDEPENDENT via
-    SAFETY_INVARIANT_KEYS (test_safety_keys_rejected_by_loader)."""
+    """2026-09-04 Configure additions — `configure` flipped basic →
+    full so the Configure tab hides on basic (per operator item 10:
+    'hide the Configure tab itself on basic rather than showing a
+    blank page'). The new `cell_commissioning` key gates the Setup
+    Wizard endpoints (POST/PUT/DELETE on /api/cells/*)."""
     basic = {k for k, v in edition_mod.FEATURE_MAP.items() if v == 'basic'}
     assert basic == {
         'monitor', 'run_controls', 'program_library',
         'wizard', 'demonstration', 'speed_control',
         'corner_smoothing',
         'deep_editor', '3d_view', 'io_panel',
-        'event_log', 'configure', 'per_step_overrides',
+        'event_log', 'per_step_overrides',
     }
 
 
-def test_full_set_is_exactly_the_three_hidden_surfaces():
-    """Only three keys are full-only: cameras_lidar, part_recognition,
-    safety_page. Any future promo of a key here trips a review at CI
-    (the assertion fails and the author has to explicitly update this
-    test with the intended new full-only set)."""
+def test_full_set_is_exactly_the_five_hidden_surfaces():
+    """Full-only keys: cameras_lidar, part_recognition, safety_page
+    (Sensors / Part Recognition / Safety tabs) + configure + the
+    cell_commissioning backend gate. Any future promo of a key here
+    trips a review at CI."""
     full = {k for k, v in edition_mod.FEATURE_MAP.items() if v == 'full'}
-    assert full == {'cameras_lidar', 'part_recognition', 'safety_page'}
+    assert full == {
+        'cameras_lidar', 'part_recognition', 'safety_page',
+        'configure', 'cell_commissioning',
+    }
 
 
 def test_safety_keys_rejected_by_loader():
@@ -100,17 +103,17 @@ def test_safety_keys_rejected_by_loader():
 
 
 def test_is_feature_enabled_matrix():
-    # Basic device -> everything on EXCEPT the three hidden surfaces.
+    # Basic device -> everything on EXCEPT the full-only surfaces.
     for k in edition_mod.FEATURE_MAP.keys():
         want = edition_mod.FEATURE_MAP[k] == 'basic'
         assert edition_mod.is_feature_enabled(k, 'basic') is want, k
     # Full device -> everything on.
     for k in edition_mod.FEATURE_MAP.keys():
         assert edition_mod.is_feature_enabled(k, 'full'), k
-    # Three hidden surfaces specifically OFF on basic.
-    assert not edition_mod.is_feature_enabled('cameras_lidar',    'basic')
-    assert not edition_mod.is_feature_enabled('part_recognition', 'basic')
-    assert not edition_mod.is_feature_enabled('safety_page',      'basic')
+    # Explicit fences on the five full-only keys.
+    for k in ('cameras_lidar', 'part_recognition', 'safety_page',
+              'configure', 'cell_commissioning'):
+        assert not edition_mod.is_feature_enabled(k, 'basic'), k
     # Unknown feature key defaults ENABLED (basic-safe).
     assert edition_mod.is_feature_enabled('does_not_exist', 'basic')
     # Unknown edition fails closed.
@@ -203,22 +206,30 @@ def test_tab_to_feature_map_present_and_covers_every_tab():
     # which the loader hard-rejects from FEATURE_MAP entries).
     assert tab_map['safety'] == 'safety_page'
     assert edition_mod.FEATURE_MAP['safety_page'] == 'full'
-    # The three hidden tabs map to the three full-only feature keys.
+    # Full-only tabs → full-only feature keys.
     assert tab_map['sensors']          == 'cameras_lidar'
     assert tab_map['adaptive_picking'] == 'part_recognition'
+    # 2026-09-04 Configure additions: `configure` is now full-only,
+    # so the whole Configure tab hides on basic devices (per item
+    # 10 acceptance). The tab->feature mapping already points at
+    # `configure`; flipping FEATURE_MAP['configure'] to full does
+    # the hiding without touching TAB_TO_FEATURE.
+    assert tab_map['configure'] == 'configure'
+    assert edition_mod.FEATURE_MAP['configure'] == 'full'
 
 
 # ── Backend refusal on a full-only endpoint (via source-string check) ─
 
-def test_server_middleware_gates_the_three_hidden_surfaces():
-    """2026-09-04 operator split: gating moved from per-endpoint
-    _require_full_edition calls into a single middleware +
-    URL-pattern list. The middleware is the ONE audit site and its
-    patterns are what get exercised end-to-end by the headless
-    verify. This test locks the pattern list to the operator's
-    exact three surfaces so a future edit can't silently un-gate
-    (e.g. Part Recognition's /teach) or spread the gate to a
-    still-visible page (e.g. /api/io/set)."""
+def test_server_middleware_gates_the_full_only_surfaces():
+    """2026-09-04 Configure additions: middleware pattern list now
+    also gates cell-commissioning WRITE endpoints. Cell STATE reads
+    (GET /api/cells/*) stay open so StatusBar's environment-guard
+    footer + Monitor's zone display keep working on basic devices.
+
+    The middleware entries are (regex, feature_key, methods_or_None)
+    triples; methods_or_None=None means every method matching the
+    path goes through the gate, otherwise only those methods are
+    gated."""
     src = _read(SERVER)
     assert '_EDITION_FULL_ONLY_PATTERNS' in src
     assert 'async def _edition_gate_middleware' in src
@@ -238,6 +249,20 @@ def test_server_middleware_gates_the_three_hidden_surfaces():
         assert needle in src.replace('\\', ''), f'missing gate pattern: {pat}'
     # cameras_lidar
     assert "/api/motioncam" in src
+    # cell_commissioning (2026-09-04): WRITE-only entries. Method
+    # tuple in each triple prevents GETs from getting gated.
+    for needle in (
+        "'^/api/cells$'",
+        "'cell_commissioning'",
+        "'^/api/cells/deactivate$'",
+        "'^/api/cells/[^/]+$'",
+        "'^/api/cells/[^/]+/activate$'",
+        "'^/api/cells/[^/]+/baseline$'",
+        "'^/api/cells/[^/]+/collision_zones($|/)'",
+    ):
+        assert needle in src, f'missing cell_commissioning gate: {needle}'
+    # Method awareness: the middleware ignores non-listed methods.
+    assert 'if methods is not None and method not in methods:' in src
     # Ensure the previously-mis-gated endpoints are NOT gated again.
     assert "_require_full_edition(request, 'io_panel')"    not in src
     assert "_require_full_edition(request, 'event_log')"   not in src

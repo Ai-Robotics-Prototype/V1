@@ -70,16 +70,27 @@ FEATURE_MAP: dict = {
     '3d_view':            EDITION_BASIC,
     'io_panel':           EDITION_BASIC,
     'event_log':          EDITION_BASIC,
-    'configure':          EDITION_BASIC,
     'per_step_overrides': EDITION_BASIC,
-    # Full-only surfaces (the three tabs the operator directive hides
-    # on Basic). Each has its own backend refusal wired on the
-    # endpoints ONLY consumed by that surface — endpoints that visible
-    # tabs also consume (Monitor's /api/parts list, /api/lidar_objects
-    # /identified) stay open.
+    # Full-only surfaces. Each has its own backend refusal wired on
+    # the endpoints ONLY consumed by that surface — endpoints that
+    # visible tabs also consume (Monitor's /api/parts list,
+    # /api/lidar_objects/identified, GET /api/cells/active for the
+    # StatusBar footer + Monitor zone display) stay open.
     'cameras_lidar':      EDITION_FULL,
     'part_recognition':   EDITION_FULL,
     'safety_page':        EDITION_FULL,
+    # 2026-09-04 Configure additions:
+    #   * `configure` flipped basic → full so the Configure tab is
+    #     hidden entirely on basic devices (per operator item 10:
+    #     "hide the Configure tab itself on basic rather than
+    #     showing a blank page").
+    #   * `cell_commissioning` is the new gate for the Setup Wizard
+    #     cell-management endpoints (POST/PUT/DELETE on /api/cells/*,
+    #     activate/deactivate, baseline/collision_zones builds).
+    #     Cell STATE reads stay open so Monitor + StatusBar keep
+    #     working on basic.
+    'configure':          EDITION_FULL,
+    'cell_commissioning': EDITION_FULL,
 }
 
 

@@ -2,11 +2,14 @@ import { useState, useEffect, useCallback } from 'react'
 import { useStore } from '../store/useStore'
 import SetupWizard from '../components/SetupWizard'
 import CellDetailPanel from '../components/CellDetailPanel'
-import Cam0CalibrationCard from '../components/Cam0CalibrationCard'
-import RecentRunsCard from '../components/RecentRunsCard'
 import { useCellWizardStore } from '../store/cellWizardStore'
-// getServedBundleHash import retired 2026-09-04 alongside
-// ProvenanceSection — no other consumer here.
+// 2026-09-04 Configure additions: Cam0CalibrationCard, RecentRunsCard,
+// and getServedBundleHash imports retired along with the Camera
+// calibration disclosure, Motion recordings, and Provenance card.
+// SystemCheckSection + DeviceIdentitySection function bodies stay
+// as dead code below (safe to remove in a later sweep — leaving
+// them defined avoids touching helpers they share with active
+// sections and keeps the diff surgical).
 
 function CellRow({ c, allCells, busy, onActivate, onDelete, expanded, onToggleExpand, onRefresh }) {
   return (
@@ -259,7 +262,8 @@ function StatusDot({ level }) {
   )
 }
 
-function SystemCheckRow({ row, expanded, onToggle, onRestart }) {
+// eslint-disable-next-line no-unused-vars
+function _SystemCheckRow_UNUSED_20260904({ row, expanded, onToggle, onRestart }) {
   // Green rows normally hide their detail, but Safety carries the
   // operator speed cap in `detail` even when green — always let the
   // row expand so the cap is discoverable.
@@ -374,7 +378,8 @@ function SystemCheckRow({ row, expanded, onToggle, onRestart }) {
 // Default derived from platform sniff on first run ("Tablet"
 // on touch devices, "PC" otherwise); the operator renames it
 // here.
-function DeviceIdentitySection() {
+// eslint-disable-next-line no-unused-vars
+function _DeviceIdentitySection_UNUSED_20260904() {
   const label = useStore((s) => s._teachDeviceLabel)
   const setLabel = useStore((s) => s.setTeachDeviceLabel)
   const getDefault = useStore((s) => s._getTeachDeviceLabel)
@@ -584,7 +589,8 @@ function SelfCollisionGuardSection() {
   )
 }
 
-function SystemCheckSection() {
+// eslint-disable-next-line no-unused-vars
+function _SystemCheckSection_UNUSED_20260904() {
   const [data, setData]           = useState(null)
   const [error, setError]         = useState(null)
   const [expanded, setExpanded]   = useState(null)
@@ -749,81 +755,38 @@ export default function ConfigureLayout() {
         Configure
       </div>
 
-      {/* 2026-09-04 operator directive: retire OPERATOR MODE toggle,
-          PROVENANCE card, and THIS DEVICE card from the default view.
-          SystemCheckSection stripped of the operator toggle and kept
-          (services health + restart affordance is load-bearing for
-          commissioning); Device rename affordance moved into the
-          Advanced disclosure at the bottom. Provenance is retired
-          entirely — the DeployStatusBanner + StaleGuard already
-          surface every non-green verdict and block on SHA
-          mismatch, so the well-lit view was purely informational. */}
+      {/* 2026-09-04 operator directive (Configure additions):
+            * Configure tab flipped to full-only — hidden entirely
+              on basic devices via FEATURE_MAP['configure']=full.
+              App.jsx's tab filter + TAB_TO_FEATURE mapping do the
+              hiding; this file never sees a basic render.
+            * FULL Configure = cell wizard + collision-guard row,
+              nothing else. Advanced disclosure (device rename),
+              Camera calibration disclosure, SystemCheckSection
+              (services health), and RecentRunsCard (motion
+              recordings) are all retired from Configure per item
+              10 acceptance. Their backends live on:
+                  - device_label plumbing still writes via
+                    POST /api/ui_context/{device_id}, called from
+                    useStore.setTeachDeviceLabel (no UI now).
+                  - cam0 calibration endpoints stay dormant on the
+                    backend — re-expose when a camera is remounted.
+                  - service restarts remain reachable via
+                    systemctl + /api/systemcheck/service/restart.
+                  - motion recordings live on /api/runs; no UI. */}
 
-      <SystemCheckSection />
-
-      {/* Cell commissioning is the page's centerpiece. */}
+      {/* Cell commissioning — the page's centerpiece. Gated as
+          `cell_commissioning` at the backend (see middleware); the
+          UI is only reached on full because the whole tab hides
+          on basic. */}
       <CellSetupSection />
 
-      {/* Self-collision guard row — relocated per operator
-          directive INTO the cell / commissioning area as a compact
-          row. The full section (border, confirm dialog, red-when-OFF
-          visuals, event-log wire) is preserved inside its component;
-          only its position on the page changed. The red badge stays
-          visible when OFF — the operator directive explicitly
-          requires guards-off to always be reversible from the
-          page. */}
+      {/* Self-collision guard row — full section preserved (border,
+          confirm dialog, red-when-OFF visuals, event-log wire).
+          Always visible when OFF: the operator directive
+          explicitly requires guards-off to always be reversible
+          from the page. */}
       <SelfCollisionGuardSection />
-
-      {/* Camera calibration — collapsed by default per operator
-          directive. Full tool is inside the disclosure, unchanged
-          when opened. */}
-      <details style={{
-        background: 'var(--bg-panel)', border: '1px solid var(--border)',
-        borderRadius: 'var(--radius-sm)', padding: '10px 14px',
-      }}>
-        <summary style={{
-          cursor: 'pointer', fontSize: 13, fontWeight: 600,
-          color: 'var(--text-primary)', userSelect: 'none',
-        }}>
-          Camera calibration
-        </summary>
-        <div style={{ marginTop: 10 }}>
-          <Cam0CalibrationCard />
-        </div>
-      </details>
-
-      {/* Motion recordings — rehomed here from Monitor per the
-          2026-09-04 directive. Kept out of the "nothing else"
-          acceptance because it IS the recordings surface. */}
-      <RecentRunsCard />
-
-      {/* Advanced disclosure — collapsed by default. Holds the
-          Device name affordance so device_id/name (event log +
-          teach-lock banners depend on it) stays operator-editable
-          without owning a prime card. */}
-      <details style={{
-        background: 'var(--bg-panel)', border: '1px solid var(--border)',
-        borderRadius: 'var(--radius-sm)', padding: '10px 14px',
-      }}>
-        <summary style={{
-          cursor: 'pointer', fontSize: 13, fontWeight: 600,
-          color: 'var(--text-primary)', userSelect: 'none',
-        }}>
-          Advanced
-        </summary>
-        <div style={{ marginTop: 10 }}>
-          <DeviceIdentitySection />
-        </div>
-      </details>
-
-      <div style={{
-        fontSize: 10,
-        color: 'var(--text-muted)',
-        textAlign: 'center',
-        padding: '8px 0 16px',
-      }}>
-        NeuRobots Control v1.0.0
-      </div>
     </div>
   )
 }

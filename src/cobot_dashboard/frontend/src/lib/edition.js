@@ -44,12 +44,18 @@ export const FEATURE_MAP = Object.freeze({
   '3d_view':          EDITION_BASIC,
   io_panel:           EDITION_BASIC,
   event_log:          EDITION_BASIC,
-  configure:          EDITION_BASIC,
   per_step_overrides: EDITION_BASIC,
-  // Full-only (the three surfaces hidden on Basic).
+  // Full-only (six surfaces hidden on Basic).
   cameras_lidar:      EDITION_FULL,
   part_recognition:   EDITION_FULL,
   safety_page:        EDITION_FULL,
+  // 2026-09-04 Configure additions: the Configure tab is hidden
+  // entirely on basic devices, and cell-commissioning endpoints
+  // (POST/PUT/DELETE on /api/cells/*) refuse for basic. Cell STATE
+  // reads (GET /api/cells + GET /api/cells/active) stay open so
+  // Monitor + StatusBar keep working on basic.
+  configure:          EDITION_FULL,
+  cell_commissioning: EDITION_FULL,
 })
 
 // Load-time validation mirroring backend's _validate_map.

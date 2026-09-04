@@ -71,42 +71,45 @@ def test_provenance_section_retired():
     # live surface — Configure no longer duplicates it.
 
 
-def test_device_identity_relocated_into_advanced_disclosure():
-    """DeviceIdentitySection still exists and still renders — but
-    inside the Advanced <details> disclosure, not as a prime card
-    at the top level of Configure."""
+def test_device_identity_and_advanced_disclosure_retired():
+    """2026-09-04 Configure additions (item 7): Advanced disclosure
+    is retired entirely — no UI for device rename anywhere. The
+    plumbing survives at the store layer (_teachDeviceLabel /
+    setTeachDeviceLabel) so event-log tagging + teach-lock
+    banners keep reading the label; this test pins that the UI is
+    gone AND the store hooks are intact."""
     code = _strip_comments(_read(CFG))
-    # Function still defined (rename affordance still available).
-    assert 'function DeviceIdentitySection(' in code
-    # Rendered exactly once — inside a <details> block whose
-    # <summary> reads "Advanced".
-    render_idx = code.find('<DeviceIdentitySection')
-    assert render_idx != -1, 'DeviceIdentitySection must still render'
-    # There should be no SECOND render (would mean the retired
-    # top-level call site slipped back in).
-    assert code.count('<DeviceIdentitySection') == 1
-    # Search backwards ~1500 chars for the <summary> Advanced.
-    window = code[max(0, render_idx - 1500):render_idx]
-    assert '<details' in window
-    assert '>\n          Advanced\n' in window or 'Advanced\n' in window
+    # DeviceIdentitySection is NEVER rendered.
+    assert '<DeviceIdentitySection' not in code, \
+        'DeviceIdentitySection must not render on Configure'
+    # No Advanced disclosure anywhere.
+    assert 'Advanced' not in code, \
+        'Advanced <details> disclosure must be retired'
+    # Store plumbing still present.
+    store_src = _read(os.path.abspath(os.path.join(
+        HERE, '..', 'frontend', 'src', 'store', 'useStore.js')))
+    assert 'setTeachDeviceLabel(label)' in store_src
+    assert '_teachDeviceLabel' in store_src
 
 
-def test_camera_calibration_wrapped_in_closed_disclosure():
-    """Cam0CalibrationCard renders INSIDE a <details> whose
-    <summary> is 'Camera calibration'. Collapsed by default (no
-    `open` attribute on the <details>)."""
+def test_camera_calibration_retired_but_backend_intact():
+    """2026-09-04 Configure additions (item 8): the camera
+    calibration section is retired from the UI entirely. Backend
+    calibration endpoints stay intact (dormant) so the tool can be
+    re-exposed when a camera is remounted; the component file
+    (Cam0CalibrationCard.jsx) also stays on disk for the same
+    reason."""
     code = _strip_comments(_read(CFG))
-    render_idx = code.find('<Cam0CalibrationCard')
-    assert render_idx != -1
-    # ~800 char window looks back to the enclosing <details>.
-    window = code[max(0, render_idx - 800):render_idx]
-    assert '<details' in window
-    m = re.search(r'<details([^>]*)>', window)
-    assert m, 'no <details> tag before <Cam0CalibrationCard />'
-    assert 'open=' not in m.group(1), \
-        'Camera calibration disclosure must be collapsed by default'
-    # Summary text present in the window.
-    assert 'Camera calibration' in window
+    assert '<Cam0CalibrationCard' not in code, \
+        'Cam0CalibrationCard must not render on Configure'
+    assert 'Camera calibration' not in code, \
+        'Camera calibration disclosure retired — no UI'
+    # Component file stays on disk for future re-exposure.
+    card = os.path.abspath(os.path.join(
+        HERE, '..', 'frontend', 'src', 'components',
+        'Cam0CalibrationCard.jsx'))
+    assert os.path.isfile(card), \
+        'Cam0CalibrationCard.jsx must stay on disk (dormant)'
 
 
 def test_self_collision_guard_visible_and_relocated():
@@ -153,6 +156,38 @@ def test_usestore_mode_plumbing_retired():
     assert 'setMode(mode) {' not in code
     # persist partialize no longer lists `mode: state.mode`.
     assert 'mode: state.mode' not in code
+
+
+def test_full_configure_is_exactly_cell_wizard_plus_guard():
+    """2026-09-04 Configure additions item 10 acceptance: FULL
+    Configure = cell wizard + collision guard row, nothing else.
+    SystemCheckSection (services health), RecentRunsCard (motion
+    recordings), Cam0CalibrationCard, and DeviceIdentitySection
+    (Advanced) are all retired from the render tree."""
+    code = _strip_comments(_read(CFG))
+    # The only two rendered sections in the outer render tree:
+    assert '<CellSetupSection' in code
+    assert '<SelfCollisionGuardSection' in code
+    # Retired renders — none of these may appear.
+    for retired in ('<SystemCheckSection', '<RecentRunsCard',
+                    '<Cam0CalibrationCard', '<DeviceIdentitySection',
+                    '<ProvenanceSection'):
+        assert retired not in code, \
+            f'{retired} must be retired from Configure per item 10'
+
+
+def test_configure_tab_flipped_full_only():
+    """Item 10 acceptance: the Configure tab hides on basic devices.
+    Flipped via FEATURE_MAP['configure'] = 'full'; TAB_TO_FEATURE
+    already points at 'configure' so the TopBar tab filter does
+    the hiding without touching the mapping."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.abspath(os.path.join(
+        HERE, '..', 'cobot_dashboard')))
+    import edition as _ed
+    assert _ed.FEATURE_MAP.get('configure') == 'full'
+    assert not _ed.is_feature_enabled('configure', 'basic')
+    assert _ed.is_feature_enabled('configure', 'full')
 
 
 def test_pause_condition_reported_not_violated():
