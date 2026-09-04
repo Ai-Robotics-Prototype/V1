@@ -47,12 +47,17 @@ SAFETY_INVARIANT_KEYS = frozenset({
 
 # feature_key -> minimum edition. Unknown keys are treated as basic.
 #
-# 2026-09-04 OPERATOR DIRECTIVE — the split is TEMPORARILY EMPTY: every
-# key sits at EDITION_BASIC so both editions surface everything. The
-# edition machinery, chip, unlock, tests, and safety-invariant loader
-# stay wired so the moment the operator names the future full-only
-# list we flip the relevant values back to EDITION_FULL — no
-# infrastructure re-work required.
+# 2026-09-04 OPERATOR SPLIT — Basic hides exactly THREE surfaces:
+#   * cameras_lidar     (SensorsLayout — CameraPanel/LidarPanel/MotionCam)
+#   * part_recognition  (AdaptivePicking — parts library + teach)
+#   * safety_page       (SafetyPage — safety configuration surface)
+#
+# The safety PAGE is edition-gated. E-STOP, safety interlocks,
+# refusal gates, delete integrity, and codegen behaviour remain
+# edition-INDEPENDENT — those keys sit in SAFETY_INVARIANT_KEYS and
+# the loader hard-rejects them as FEATURE_MAP entries. The E-STOP
+# button in TopBar renders unconditionally in both editions
+# (regardless of this map).
 FEATURE_MAP: dict = {
     'monitor':            EDITION_BASIC,
     'run_controls':       EDITION_BASIC,
@@ -63,12 +68,18 @@ FEATURE_MAP: dict = {
     'corner_smoothing':   EDITION_BASIC,
     'deep_editor':        EDITION_BASIC,
     '3d_view':            EDITION_BASIC,
-    'cameras_lidar':      EDITION_BASIC,
-    'part_recognition':   EDITION_BASIC,
     'io_panel':           EDITION_BASIC,
     'event_log':          EDITION_BASIC,
     'configure':          EDITION_BASIC,
     'per_step_overrides': EDITION_BASIC,
+    # Full-only surfaces (the three tabs the operator directive hides
+    # on Basic). Each has its own backend refusal wired on the
+    # endpoints ONLY consumed by that surface — endpoints that visible
+    # tabs also consume (Monitor's /api/parts list, /api/lidar_objects
+    # /identified) stay open.
+    'cameras_lidar':      EDITION_FULL,
+    'part_recognition':   EDITION_FULL,
+    'safety_page':        EDITION_FULL,
 }
 
 

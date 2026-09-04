@@ -3178,6 +3178,61 @@ if FASTAPI_AVAILABLE:
     app.add_middleware(CORSMiddleware, allow_origins=["*"],
                        allow_methods=["*"], allow_headers=["*"])
 
+    # Edition gate middleware (2026-09-04). Full-only endpoints are
+    # matched by URL-path regex against the caller's edition (read via
+    # X-Client-Id → dashboard_editions.json). Middleware is used
+    # rather than per-endpoint calls because the surfaces span
+    # ~30 routes; keeping the list here means the gate has ONE audit
+    # site. The GATED_PATH_PATTERNS below are the endpoints that ONLY
+    # the three hidden pages (Cameras & LiDAR, Part Recognition,
+    # Safety Page) consume — routes that any visible tab also
+    # depends on (/api/parts list, /api/lidar_objects/identified,
+    # /api/io/*, /api/event_log/*, /api/detections … wait — see
+    # DETECTIONS_NOTE below) stay open.
+    #
+    # DETECTIONS_NOTE: /api/detections is only consumed by
+    # AdaptivePicking today. If a future Monitor overlay starts
+    # reading it, MOVE it out of the gated list here — do NOT expect
+    # the middleware to know which page requested.
+    import re as _edition_re
+    _EDITION_FULL_ONLY_PATTERNS = [
+        # part_recognition (AdaptivePicking-only)
+        (_edition_re.compile(r'^/api/parts/upload/?$'),          'part_recognition'),
+        (_edition_re.compile(r'^/api/parts/[^/]+/teach($|/)'),   'part_recognition'),
+        (_edition_re.compile(r'^/api/parts/[^/]+/scan($|/)'),    'part_recognition'),
+        (_edition_re.compile(r'^/api/parts/[^/]+/orient_weights$'), 'part_recognition'),
+        (_edition_re.compile(r'^/api/parts/[^/]+/orientation_debug$'), 'part_recognition'),
+        (_edition_re.compile(r'^/api/parts/[^/]+/defects$'),     'part_recognition'),
+        (_edition_re.compile(r'^/api/parts/[^/]+/teach_clear$'), 'part_recognition'),
+        (_edition_re.compile(r'^/api/parts/[^/]+/config$'),      'part_recognition'),
+        (_edition_re.compile(r'^/api/openvocab($|/)'),           'part_recognition'),
+        (_edition_re.compile(r'^/api/teach_mode/(start|stop)$'), 'part_recognition'),
+        (_edition_re.compile(r'^/api/detections$'),              'part_recognition'),
+        # cameras_lidar (SensorsLayout-only)
+        (_edition_re.compile(r'^/api/motioncam($|/)'),           'cameras_lidar'),
+        # safety_page has no dedicated /api/safety config route on this
+        # backend; the SafetyPage reads via /ws/state which stays open
+        # (state is edition-independent). Tab hiding is the gate.
+    ]
+
+    @app.middleware("http")
+    async def _edition_gate_middleware(request, call_next):
+        path = request.url.path
+        for pat, feature_key in _EDITION_FULL_ONLY_PATTERNS:
+            if pat.match(path):
+                # Deferred import — edition module loaded further down
+                # in this file, but middleware runs at request time
+                # (post-import), so a lazy reference is safe.
+                from cobot_dashboard import edition as _ed
+                client_id = (request.headers.get('x-client-id') or '').strip()
+                ed = _ed.resolve_edition(client_id)
+                if not _ed.is_feature_enabled(feature_key, ed):
+                    payload = _ed.refusal_payload(feature_key)
+                    payload['edition'] = ed
+                    return JSONResponse(payload, status_code=403)
+                break
+        return await call_next(request)
+
     # ------------------------------------------------------------------
     # Broadcast loop — pushes state + lidar to WebSocket queues at Hz
     # ------------------------------------------------------------------
@@ -5834,9 +5889,11 @@ if FASTAPI_AVAILABLE:
         }
 
     @app.get("/api/parts")
-    async def api_parts_list(request: Request):
-        refused = _require_full_edition(request, 'part_recognition')
-        if refused is not None: return refused
+    async def api_parts_list():
+        # NOT gated: Monitor + Program editor + Wizard consume this list
+        # (parts library dropdown, part-name resolution for detect
+        # steps). The AdaptivePicking teach/mutation endpoints below
+        # are the part_recognition gates.
         from object_detection.part_library import (
             get_all_parts, identification_basis, has_teach_images,
             get_teach_image_count, has_step_file,
@@ -9185,20 +9242,16 @@ if FASTAPI_AVAILABLE:
         return {'ok': bool(rec), 'record': rec}
 
     @app.get("/api/event_log/list")
-    async def api_event_log_list(request: Request):
+    async def api_event_log_list():
         """Return the list of dates available on disk, newest first.
         Used by the interface page's date picker."""
-        refused = _require_full_edition(request, 'event_log')
-        if refused is not None: return refused
         return {'days': _event_log.list_days()}
 
     @app.get("/api/event_log/day/{date_str}")
-    async def api_event_log_day(date_str: str, request: Request, limit: int = 2000):
+    async def api_event_log_day(date_str: str, limit: int = 2000):
         """Return one day's records as a JSON array (oldest first).
         `limit` caps the tail — default 2000, cap 10000 — enough
         for a busy shift day without exhausting the browser."""
-        refused = _require_full_edition(request, 'event_log')
-        if refused is not None: return refused
         if not (date_str.isdigit() and len(date_str) == 8):
             return JSONResponse({'error': 'date must be YYYYMMDD'},
                                 status_code=400)
@@ -11372,9 +11425,7 @@ if FASTAPI_AVAILABLE:
     _IO_STATE: dict = {}
 
     @app.get("/api/io/state")
-    async def api_io_state(request: Request):
-        refused = _require_full_edition(request, 'io_panel')
-        if refused is not None: return refused
+    async def api_io_state():
         return {"io": _IO_STATE}
 
     # Live merged snapshot from the driver's IOManager/GetIOValue +
@@ -11403,8 +11454,6 @@ if FASTAPI_AVAILABLE:
     # (family='io').
     @app.post("/api/io/force")
     async def api_io_force(request: Request):
-        refused = _require_full_edition(request, 'io_panel')
-        if refused is not None: return refused
         try:
             body = await request.json()
         except Exception:
@@ -11451,8 +11500,6 @@ if FASTAPI_AVAILABLE:
 
     @app.post("/api/io/set")
     async def api_io_set(request: Request):
-        refused = _require_full_edition(request, 'io_panel')
-        if refused is not None: return refused
         try:
             body = await request.json()
         except Exception:

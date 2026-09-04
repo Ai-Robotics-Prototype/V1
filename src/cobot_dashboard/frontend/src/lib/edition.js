@@ -23,11 +23,15 @@ export const SAFETY_INVARIANT_KEYS = Object.freeze([
 
 // feature_key -> minimum edition
 //
-// 2026-09-04 OPERATOR DIRECTIVE — split TEMPORARILY EMPTY: every key
-// sits at EDITION_BASIC so both editions surface everything. The
-// edition chip, unlock, tests, and safety invariants stay wired; a
-// future directive names the full-only list and we flip values back.
-// Keep this map byte-mirrored with cobot_dashboard/edition.py.
+// 2026-09-04 OPERATOR SPLIT — Basic hides exactly THREE tabs:
+//   * cameras_lidar     (SensorsLayout)
+//   * part_recognition  (AdaptivePicking)
+//   * safety_page       (SafetyPage — safety configuration only)
+//
+// The safety PAGE is gated. E-STOP in TopBar renders unconditionally
+// in both editions and is safety-invariant (see
+// SAFETY_INVARIANT_KEYS in edition.py). Keep this map byte-mirrored
+// with cobot_dashboard/edition.py.
 export const FEATURE_MAP = Object.freeze({
   monitor:            EDITION_BASIC,
   run_controls:       EDITION_BASIC,
@@ -38,12 +42,14 @@ export const FEATURE_MAP = Object.freeze({
   corner_smoothing:   EDITION_BASIC,
   deep_editor:        EDITION_BASIC,
   '3d_view':          EDITION_BASIC,
-  cameras_lidar:      EDITION_BASIC,
-  part_recognition:   EDITION_BASIC,
   io_panel:           EDITION_BASIC,
   event_log:          EDITION_BASIC,
   configure:          EDITION_BASIC,
   per_step_overrides: EDITION_BASIC,
+  // Full-only (the three surfaces hidden on Basic).
+  cameras_lidar:      EDITION_FULL,
+  part_recognition:   EDITION_FULL,
+  safety_page:        EDITION_FULL,
 })
 
 // Load-time validation mirroring backend's _validate_map.
@@ -75,6 +81,13 @@ export function isFeatureEnabled(featureKey, edition) {
 
 // Tab id -> feature key. The TopBar filters against this so basic
 // devices don't render Full tabs at all (absent, not disabled-greyed).
+//
+// The 'safety' TAB (SafetyPage — the safety configuration surface)
+// maps to `safety_page` which IS gated to Full. This is distinct
+// from the E-STOP BUTTON in TopBar, which is safety-invariant and
+// renders unconditionally in both editions (see
+// SAFETY_INVARIANT_KEYS in edition.py — no key in that set may
+// appear in FEATURE_MAP).
 export const TAB_TO_FEATURE = Object.freeze({
   monitor:          'monitor',
   programs:         'program_library',
@@ -83,10 +96,7 @@ export const TAB_TO_FEATURE = Object.freeze({
   sensors:          'cameras_lidar',
   adaptive_picking: 'part_recognition',
   io:               'io_panel',
-  // safety is edition-INDEPENDENT — E-STOP + interlocks must always
-  // be reachable. Do NOT add 'safety' to FEATURE_MAP; leaving it
-  // unmapped lets isFeatureEnabled return true for every edition.
-  safety:           'safety',
+  safety:           'safety_page',
   event_log:        'event_log',
   configure:        'configure',
 })

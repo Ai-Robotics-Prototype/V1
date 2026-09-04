@@ -57,32 +57,28 @@ def test_safety_invariant_keys_exact():
 
 
 def test_basic_set_exact():
-    """2026-09-04 operator directive — the split is TEMPORARILY EMPTY.
-    Every feature key sits at EDITION_BASIC so both editions surface
-    everything. The safety-invariant loader stays wired (see
-    test_safety_keys_rejected_by_loader); when the operator names the
-    future full-only list we flip the relevant values and refresh both
-    sets in this test."""
+    """2026-09-04 operator authoritative split — Basic includes every
+    feature EXCEPT the three hidden surfaces (cameras_lidar,
+    part_recognition, safety_page). The safety PAGE is edition-gated
+    here; E-STOP + safety interlocks stay edition-INDEPENDENT via
+    SAFETY_INVARIANT_KEYS (test_safety_keys_rejected_by_loader)."""
     basic = {k for k, v in edition_mod.FEATURE_MAP.items() if v == 'basic'}
     assert basic == {
         'monitor', 'run_controls', 'program_library',
         'wizard', 'demonstration', 'speed_control',
         'corner_smoothing',
-        # These moved from full → basic when the split emptied.
-        'deep_editor', '3d_view', 'cameras_lidar',
-        'part_recognition', 'io_panel', 'event_log',
-        'configure', 'per_step_overrides',
+        'deep_editor', '3d_view', 'io_panel',
+        'event_log', 'configure', 'per_step_overrides',
     }
 
 
-def test_full_set_is_empty_until_operator_names_the_list():
-    """Split is empty until the operator names it — no feature key is
-    currently full-only. The set stays empty, not omitted, so a future
-    edit that carelessly promotes a key back to EDITION_FULL trips a
-    review at CI (the assertion fails and the author has to explicitly
-    update this test with the intended new full-only set)."""
+def test_full_set_is_exactly_the_three_hidden_surfaces():
+    """Only three keys are full-only: cameras_lidar, part_recognition,
+    safety_page. Any future promo of a key here trips a review at CI
+    (the assertion fails and the author has to explicitly update this
+    test with the intended new full-only set)."""
     full = {k for k, v in edition_mod.FEATURE_MAP.items() if v == 'full'}
-    assert full == set()
+    assert full == {'cameras_lidar', 'part_recognition', 'safety_page'}
 
 
 def test_safety_keys_rejected_by_loader():
@@ -104,15 +100,19 @@ def test_safety_keys_rejected_by_loader():
 
 
 def test_is_feature_enabled_matrix():
-    # Split is empty (2026-09-04 directive) — every known key is on
-    # for BOTH editions. When the operator names the full-only list,
-    # add per-key False assertions for the basic side.
+    # Basic device -> everything on EXCEPT the three hidden surfaces.
     for k in edition_mod.FEATURE_MAP.keys():
-        assert edition_mod.is_feature_enabled(k, 'basic'), k
+        want = edition_mod.FEATURE_MAP[k] == 'basic'
+        assert edition_mod.is_feature_enabled(k, 'basic') is want, k
+    # Full device -> everything on.
+    for k in edition_mod.FEATURE_MAP.keys():
         assert edition_mod.is_feature_enabled(k, 'full'), k
+    # Three hidden surfaces specifically OFF on basic.
+    assert not edition_mod.is_feature_enabled('cameras_lidar',    'basic')
+    assert not edition_mod.is_feature_enabled('part_recognition', 'basic')
+    assert not edition_mod.is_feature_enabled('safety_page',      'basic')
     # Unknown feature key defaults ENABLED (basic-safe).
     assert edition_mod.is_feature_enabled('does_not_exist', 'basic')
-    assert edition_mod.is_feature_enabled('does_not_exist', 'full')
     # Unknown edition fails closed.
     assert not edition_mod.is_feature_enabled('monitor', 'enterprise')
 
@@ -196,24 +196,56 @@ def test_tab_to_feature_map_present_and_covers_every_tab():
         'adaptive_picking', 'io', 'safety', 'event_log', 'configure',
     }
     assert set(tab_map.keys()) == expected_tabs
-    # safety mapping deliberately unmapped in FEATURE_MAP so
-    # isFeatureEnabled returns True for every edition on that key —
-    # E-STOP + interlocks must always be reachable.
-    assert tab_map['safety'] == 'safety'
-    assert 'safety' not in edition_mod.FEATURE_MAP
+    # The safety TAB maps to `safety_page` which IS edition-gated.
+    # The E-STOP BUTTON lives in TopBar directly and does NOT go
+    # through TAB_TO_FEATURE — it renders unconditionally in both
+    # editions and is safety-invariant (see SAFETY_INVARIANT_KEYS,
+    # which the loader hard-rejects from FEATURE_MAP entries).
+    assert tab_map['safety'] == 'safety_page'
+    assert edition_mod.FEATURE_MAP['safety_page'] == 'full'
+    # The three hidden tabs map to the three full-only feature keys.
+    assert tab_map['sensors']          == 'cameras_lidar'
+    assert tab_map['adaptive_picking'] == 'part_recognition'
 
 
 # ── Backend refusal on a full-only endpoint (via source-string check) ─
 
-def test_server_gates_event_log_io_and_parts_on_full_edition():
+def test_server_middleware_gates_the_three_hidden_surfaces():
+    """2026-09-04 operator split: gating moved from per-endpoint
+    _require_full_edition calls into a single middleware +
+    URL-pattern list. The middleware is the ONE audit site and its
+    patterns are what get exercised end-to-end by the headless
+    verify. This test locks the pattern list to the operator's
+    exact three surfaces so a future edit can't silently un-gate
+    (e.g. Part Recognition's /teach) or spread the gate to a
+    still-visible page (e.g. /api/io/set)."""
     src = _read(SERVER)
-    # event_log/list gated
-    assert "async def api_event_log_list(request: Request):" in src
-    assert "_require_full_edition(request, 'event_log')" in src
-    # io_panel gated on state + force + set
-    assert "_require_full_edition(request, 'io_panel')" in src
-    # part_recognition gated on list
-    assert "_require_full_edition(request, 'part_recognition')" in src
+    assert '_EDITION_FULL_ONLY_PATTERNS' in src
+    assert 'async def _edition_gate_middleware' in src
+    # part_recognition patterns
+    for pat in (
+        r"'^/api/parts/upload/?\$'",
+        r"'^/api/parts/\[\^/\]\+/teach\(\$\|/\)'",
+        r"'^/api/parts/\[\^/\]\+/scan\(\$\|/\)'",
+        r"'^/api/parts/\[\^/\]\+/orient_weights\$'",
+        r"'^/api/openvocab\(\$\|/\)'",
+        r"'^/api/teach_mode/\(start\|stop\)\$'",
+        r"'^/api/detections\$'",
+    ):
+        # Regex-escape the pattern for a raw substring search; the
+        # source stores it with backslashes intact.
+        needle = pat.replace('\\', '')
+        assert needle in src.replace('\\', ''), f'missing gate pattern: {pat}'
+    # cameras_lidar
+    assert "/api/motioncam" in src
+    # Ensure the previously-mis-gated endpoints are NOT gated again.
+    assert "_require_full_edition(request, 'io_panel')"    not in src
+    assert "_require_full_edition(request, 'event_log')"   not in src
+    # /api/parts LIST must be un-gated (Monitor + editor + wizard).
+    parts_list_body = src[src.find('async def api_parts_list'):
+                          src.find('async def api_parts_list') + 800]
+    assert '_require_full_edition' not in parts_list_body, \
+        '/api/parts list is used by Monitor + editor + wizard — MUST NOT gate'
 
 
 def test_server_ships_edition_endpoints():
