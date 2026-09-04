@@ -422,7 +422,8 @@ const storeDefinition = (set, get) => ({
   // true before switching to the Part Recognition tab; AdaptivePicking
   // reads + clears it on mount and opens the Teach New Part wizard.
   pendingTeachNew: false,
-  mode: 'operator',
+  // 2026-09-04: `mode` slot (operator/engineer) retired along with
+  // the Configure toggle — no live consumer.
   jogEnabled: false,
   jogJoint: 0,
   _jogTimer: null,
@@ -2556,10 +2557,6 @@ const storeDefinition = (set, get) => ({
     set({ activeView: view })
   },
 
-  setMode(mode) {
-    set({ mode })
-  },
-
   setJogJoint(j) {
     set({ jogJoint: j })
   },
@@ -2586,7 +2583,8 @@ export const useStore = create(
   persist(storeDefinition, {
     name: 'roboai-ui',
     partialize: (state) => ({
-      mode: state.mode,
+      // 2026-09-04: `mode` retired from persistence along with the
+      // Configure operator/engineer toggle.
       activeTab: state.activeTab,
       activeView: state.activeView,
       // Persist the jog speed % so the operator's chosen speed survives

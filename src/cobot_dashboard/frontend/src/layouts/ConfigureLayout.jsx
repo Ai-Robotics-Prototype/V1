@@ -5,7 +5,8 @@ import CellDetailPanel from '../components/CellDetailPanel'
 import Cam0CalibrationCard from '../components/Cam0CalibrationCard'
 import RecentRunsCard from '../components/RecentRunsCard'
 import { useCellWizardStore } from '../store/cellWizardStore'
-import { getServedBundleHash } from '../components/StatusBar'
+// getServedBundleHash import retired 2026-09-04 alongside
+// ProvenanceSection — no other consumer here.
 
 function CellRow({ c, allCells, busy, onActivate, onDelete, expanded, onToggleExpand, onRefresh }) {
   return (
@@ -589,8 +590,11 @@ function SystemCheckSection() {
   const [expanded, setExpanded]   = useState(null)
   const [refreshing, setRefresh]  = useState(false)
   const [lastAt, setLastAt]       = useState(null)
-  const mode                      = useStore((s) => s.mode)
-  const setMode                   = useStore((s) => s.setMode)
+  // 2026-09-04: `mode`/`setMode` reads retired. The Operator/Engineer
+  // toggle that used to live at the bottom of this section is
+  // deleted per operator directive — its only downstream consumer
+  // was ControlStrip.jsx (which itself is unmounted). No other code
+  // path reads useStore.mode.
 
   const load = useCallback(async () => {
     setRefresh(true)
@@ -713,158 +717,21 @@ function SystemCheckSection() {
         ))}
       </div>
 
-      {/* Operator / engineer toggle — moved here from the removed
-          Interface panel. ControlStrip.jsx reads useStore.mode to gate
-          the engineer-only gripper controls. */}
-      <div style={{
-        display: 'flex', alignItems: 'center', gap: 12,
-        paddingTop: 10, marginTop: 4,
-        borderTop: '1px solid var(--border)',
-      }}>
-        <span style={{
-          fontSize: 11, color: 'var(--text-secondary)',
-          textTransform: 'uppercase', letterSpacing: '0.08em',
-          fontWeight: 600,
-        }}>
-          Operator Mode
-        </span>
-        <div style={{ display: 'flex', gap: 3 }}>
-          {['operator', 'engineer'].map((m) => (
-            <button
-              key={m}
-              onClick={() => setMode(m)}
-              style={{
-                background: mode === m ? 'var(--accent-dim)' : 'var(--bg-panel)',
-                border: `1px solid ${mode === m ? 'var(--accent-border)' : 'var(--border)'}`,
-                color: mode === m ? 'var(--accent)' : 'var(--text-secondary)',
-                padding: '4px 14px',
-                borderRadius: 'var(--radius-sm)',
-                fontSize: 12,
-                fontWeight: mode === m ? 500 : 400,
-                cursor: 'pointer',
-                textTransform: 'capitalize',
-              }}>
-              {m}
-            </button>
-          ))}
-        </div>
-      </div>
+      {/* 2026-09-04: the Operator / Engineer toggle here is retired.
+          It was vestigial — only ControlStrip.jsx read useStore.mode,
+          and ControlStrip is not mounted anywhere in the active tree.
+          Store slots (`mode`/`setMode`, persist partialize entry) are
+          also removed. */}
     </div>
   )
 }
 
-// Full SHA + three-layer verdict panel. Replaces the retired
-// footer "served <hash>" pill (2026-08-31 directive). Reads the
-// same /api/deploy_status the footer DeployStatusBanner does,
-// so the two never disagree; also shows the served bundle hash
-// read from the actual <script> element the browser loaded (the
-// Vite content-hash), so an operator can compare it against the
-// deploy_log SHA at a glance.
-//
-// Enforcement chain is unchanged: DeployStatusBanner still
-// surfaces on every non-green verdict, StaleGuard overlay still
-// blocks the app on backend/frontend SHA mismatch. This section
-// is the operator's WELL-LIT view — not a new gate.
-function ProvenanceSection() {
-  const [status, setStatus] = useState(null)
-  const [err, setErr] = useState(null)
-  const [servedHash] = useState(() => getServedBundleHash())
-
-  useEffect(() => {
-    let cancelled = false
-    async function poll() {
-      try {
-        const r = await fetch('/api/deploy_status', { cache: 'no-store' })
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
-        const d = await r.json()
-        if (cancelled) return
-        setStatus(d); setErr(null)
-      } catch (e) {
-        if (!cancelled) setErr(e.message || 'fetch failed')
-      }
-    }
-    poll()
-    const id = setInterval(poll, 5000)
-    return () => { cancelled = true; clearInterval(id) }
-  }, [])
-
-  const prov  = status?.provenance || {}
-  const state = status?.state || (err ? 'unknown' : '…')
-  const verdict = prov.verdict || state
-  const failing = prov.failing_layers || []
-  const verdictColor =
-      verdict === 'green'                       ? DOT_COLORS.green
-    : (verdict === 'red' || state === 'failed') ? DOT_COLORS.red
-    : verdict === 'amber' || state === 'waiting' || state === 'stale'
-                                                ? DOT_COLORS.yellow
-    :                                             'var(--text-muted)'
-
-  const rows = [
-    { label: 'Verdict',      value: verdict.toUpperCase(), color: verdictColor,
-      title: failing.length ? `Failing layers: ${failing.join(', ')}`
-                            : 'All three layers agree.' },
-    { label: 'Deploy SHA',   value: prov.deploy_sha  || '(unknown)' },
-    { label: 'Backend SHA',  value: prov.backend_sha || '(unknown)' },
-    { label: 'Frontend SHA', value: prov.frontend_sha || '(unknown)' },
-    { label: 'Served bundle', value: servedHash || '(dev)' },
-  ]
-
-  return (
-    <div style={{
-      background: 'var(--bg-surface)',
-      border: '1px solid var(--border)',
-      borderRadius: 'var(--radius-lg)',
-      padding: '16px 20px',
-      display: 'flex', flexDirection: 'column', gap: 12,
-    }}>
-      <div style={{
-        fontSize: 11, fontWeight: 600, color: 'var(--text-primary)',
-        textTransform: 'uppercase', letterSpacing: '0.08em',
-        paddingBottom: 8, borderBottom: '1px solid var(--border)',
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-      }}>
-        <span>Provenance</span>
-        <span style={{
-          fontSize: 10, fontWeight: 400, color: 'var(--text-muted)',
-          textTransform: 'none', letterSpacing: 'normal',
-        }}>
-          {err ? `error: ${err}` : `state: ${state}`}
-        </span>
-      </div>
-
-      <div data-testid="provenance-section"
-           style={{ display: 'grid', gridTemplateColumns: '140px 1fr', rowGap: 6, columnGap: 12 }}>
-        {rows.flatMap((r) => ([
-          <div key={`${r.label}-label`} style={{
-            fontSize: 12, color: 'var(--text-secondary)',
-            fontWeight: 600,
-          }}>
-            {r.label}
-          </div>,
-          <div key={`${r.label}-value`} title={r.title || ''} style={{
-            fontSize: 12,
-            fontFamily: 'var(--font-mono, monospace)',
-            color: r.color || 'var(--text-primary)',
-            fontWeight: r.color ? 700 : 500,
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-          }}>
-            {r.value}
-          </div>,
-        ]))}
-      </div>
-
-      <div style={{
-        fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5,
-      }}>
-        The footer surfaces a banner only when verdict is not green.
-        Full details also available at{' '}
-        <code style={{ fontFamily: 'var(--font-mono, monospace)' }}>/health</code>
-        {' '}and{' '}
-        <code style={{ fontFamily: 'var(--font-mono, monospace)' }}>/api/deploy_status</code>.
-      </div>
-    </div>
-  )
-}
+// 2026-09-04 operator directive: ProvenanceSection retired. The
+// enforcement chain (DeployStatusBanner surfaces every non-green
+// verdict; StaleGuard blocks the app on SHA mismatch) is unchanged
+// — the well-lit Configure card was purely informational and
+// duplicative. Detail is still reachable at /health +
+// /api/deploy_status for anyone who needs it.
 
 
 export default function ConfigureLayout() {
@@ -882,25 +749,72 @@ export default function ConfigureLayout() {
         Configure
       </div>
 
+      {/* 2026-09-04 operator directive: retire OPERATOR MODE toggle,
+          PROVENANCE card, and THIS DEVICE card from the default view.
+          SystemCheckSection stripped of the operator toggle and kept
+          (services health + restart affordance is load-bearing for
+          commissioning); Device rename affordance moved into the
+          Advanced disclosure at the bottom. Provenance is retired
+          entirely — the DeployStatusBanner + StaleGuard already
+          surface every non-green verdict and block on SHA
+          mismatch, so the well-lit view was purely informational. */}
+
       <SystemCheckSection />
 
-      <ProvenanceSection />
-
-      <DeviceIdentitySection />
-
-      <SelfCollisionGuardSection />
-
+      {/* Cell commissioning is the page's centerpiece. */}
       <CellSetupSection />
 
-      <Cam0CalibrationCard />
+      {/* Self-collision guard row — relocated per operator
+          directive INTO the cell / commissioning area as a compact
+          row. The full section (border, confirm dialog, red-when-OFF
+          visuals, event-log wire) is preserved inside its component;
+          only its position on the page changed. The red badge stays
+          visible when OFF — the operator directive explicitly
+          requires guards-off to always be reversible from the
+          page. */}
+      <SelfCollisionGuardSection />
 
-      {/* 2026-09-04 operator directive: Recent runs / motion-recording
-          browser moved off the Monitor screen and rehomed here.
-          RecentRunsCard is self-contained (fetches /api/runs on a
-          4 s poll; Download / Excursions / Trajectory affordances
-          per row). Recorder budget lives in joint_recorder.py —
-          300 MB / 7 d cap + 20 %-of-free-space guard. */}
+      {/* Camera calibration — collapsed by default per operator
+          directive. Full tool is inside the disclosure, unchanged
+          when opened. */}
+      <details style={{
+        background: 'var(--bg-panel)', border: '1px solid var(--border)',
+        borderRadius: 'var(--radius-sm)', padding: '10px 14px',
+      }}>
+        <summary style={{
+          cursor: 'pointer', fontSize: 13, fontWeight: 600,
+          color: 'var(--text-primary)', userSelect: 'none',
+        }}>
+          Camera calibration
+        </summary>
+        <div style={{ marginTop: 10 }}>
+          <Cam0CalibrationCard />
+        </div>
+      </details>
+
+      {/* Motion recordings — rehomed here from Monitor per the
+          2026-09-04 directive. Kept out of the "nothing else"
+          acceptance because it IS the recordings surface. */}
       <RecentRunsCard />
+
+      {/* Advanced disclosure — collapsed by default. Holds the
+          Device name affordance so device_id/name (event log +
+          teach-lock banners depend on it) stays operator-editable
+          without owning a prime card. */}
+      <details style={{
+        background: 'var(--bg-panel)', border: '1px solid var(--border)',
+        borderRadius: 'var(--radius-sm)', padding: '10px 14px',
+      }}>
+        <summary style={{
+          cursor: 'pointer', fontSize: 13, fontWeight: 600,
+          color: 'var(--text-primary)', userSelect: 'none',
+        }}>
+          Advanced
+        </summary>
+        <div style={{ marginTop: 10 }}>
+          <DeviceIdentitySection />
+        </div>
+      </details>
 
       <div style={{
         fontSize: 10,
