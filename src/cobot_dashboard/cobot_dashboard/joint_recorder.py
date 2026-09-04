@@ -168,12 +168,18 @@ def _effective_size_cap() -> int:
     monopolise more than the configured fraction of remaining free
     space regardless of its hard cap.
 
-    Free-space read is best-effort; if it fails (path missing,
-    permission denied), fall back to the hard cap and log."""
+    Free-space read goes through disk_watchdog.free_bytes() which is
+    the fork-registry-canonical owner of statvfs on this codebase
+    (registry entry: disk_watchdog). Best-effort — a read failure
+    inside disk_watchdog already falls back to a huge sentinel, so
+    the recorder degrades gracefully to the hard cap."""
     try:
-        st = os.statvfs(JOINT_RECORDER_DIR)
-        free_bytes = st.f_bavail * st.f_frsize
-        fractional = int(free_bytes * RETENTION_FREE_FRACTION)
+        # Deferred import: joint_recorder is imported at server-boot
+        # from dashboard_server; disk_watchdog imports resolve at the
+        # same module-graph layer.
+        from cobot_dashboard import disk_watchdog as _dw
+        free_b = _dw.free_bytes()
+        fractional = int(free_b * RETENTION_FREE_FRACTION)
         return max(0, min(RETENTION_BYTES, fractional))
     except Exception as e:
         print(f'[joint_recorder] free-space read failed ({e}); '

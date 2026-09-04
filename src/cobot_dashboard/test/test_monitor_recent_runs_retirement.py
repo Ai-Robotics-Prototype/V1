@@ -98,8 +98,14 @@ def test_recorder_20_percent_free_space_guard():
     assert "'0.20'" in src, \
         'default free-space fraction must be 20 %'
     assert 'def _effective_size_cap() -> int:' in src
-    assert 'st.f_bavail * st.f_frsize' in src, \
-        'must read partition free via statvfs'
+    # Free-space read must go through the fork-registry-canonical
+    # owner (disk_watchdog). Direct os.statvfs in the recorder is
+    # blocked by fork_lint.
+    assert 'from cobot_dashboard import disk_watchdog as _dw' in src
+    assert '_dw.free_bytes()' in src
+    assert 'os.statvfs(' not in src, \
+        ('recorder must not call os.statvfs directly — route through '
+         'disk_watchdog.free_bytes() (fork registry: disk_watchdog)')
     # enforce_retention uses the effective cap, not the raw
     # RETENTION_BYTES.
     er_i = src.find('def enforce_retention')
