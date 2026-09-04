@@ -6519,6 +6519,120 @@ if FASTAPI_AVAILABLE:
     def _now_stamp():
         return time.strftime('%Y-%m-%d %H:%M')
 
+    # ── delete-integrity trash safeguard (2026-09-04) ──────────────
+    # Every DELETE moves the program's main .json + every sidecar
+    # (currently just `<id>.line_map.json`; extend `_prog_sidecar_paths`
+    # when new sidecars land) into `.deleted/<id>.<utc_ts>.<suffix>`
+    # via os.rename, then prunes the trash to `_PROG_TRASH_CAP`
+    # most-recent PROGRAM entries by mtime. Taught poses are hours of
+    # operator labor — deletion stays reversible for at most 20 recent
+    # entries so a wrong tap doesn't vaporise them. The .deleted
+    # directory is hidden from every /api/programs listing (dotfolder
+    # + endswith('.json') filter make it invisible to the four
+    # listdir(_PROG_DIR) sweeps in this file).
+    _PROG_TRASH_DIR = os.path.join(_PROG_DIR, '.deleted')
+    _PROG_TRASH_CAP = 20
+
+    def _prog_sidecar_paths(prog_id: str) -> list:
+        """Every filesystem artefact the program owns EXCLUDING the
+        main <id>.json. Extend this list when new per-program sidecar
+        files land; the delete path picks them up automatically.
+        """
+        return [
+            os.path.join(_PROG_DIR, f'{prog_id}.line_map.json'),
+        ]
+
+    def _trash_program(prog_id: str) -> dict:
+        """Move a program + its sidecars into `.deleted/`. Returns the
+        summary of moved paths so the caller can log or surface them.
+        Prunes the trash to `_PROG_TRASH_CAP` most-recent MAIN entries
+        (their sidecar siblings share a prefix so they get culled
+        together).
+
+        Contract: main .json move is the load-bearing step. If it
+        fails, the whole delete raises OSError and the caller returns
+        500 — the file is still on disk, so a retry can succeed. A
+        successful main-move followed by a sidecar-move failure is
+        logged but not raised: the user-visible truth (program is
+        deleted) already holds, and the orphan sidecar will be
+        harmless (no matching main → hidden from every listing).
+        """
+        main = os.path.join(_PROG_DIR, f'{prog_id}.json')
+        if not os.path.isfile(main):
+            raise FileNotFoundError(main)
+        os.makedirs(_PROG_TRASH_DIR, exist_ok=True)
+        ts = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+        moved = []
+        trash_main = os.path.join(_PROG_TRASH_DIR, f'{prog_id}.{ts}.json')
+        os.rename(main, trash_main)
+        moved.append(('main', trash_main))
+        for sc in _prog_sidecar_paths(prog_id):
+            if not os.path.isfile(sc):
+                continue
+            base = os.path.basename(sc)                 # e.g. foo.line_map.json
+            assert base.startswith(f'{prog_id}.')
+            suffix = base[len(prog_id) + 1:]            # line_map.json
+            dest = os.path.join(_PROG_TRASH_DIR, f'{prog_id}.{ts}.{suffix}')
+            try:
+                os.rename(sc, dest)
+                moved.append((suffix, dest))
+            except OSError as e:
+                print(f'[programs] trash sidecar {sc!r} failed: '
+                      f'{type(e).__name__}: {e}', flush=True)
+        _prune_prog_trash()
+        return {'ts': ts, 'moved': moved}
+
+    def _prune_prog_trash():
+        """Keep at most `_PROG_TRASH_CAP` most-recent MAIN .deleted
+        entries (their sidecars share the `<id>.<ts>.` prefix so they
+        get culled together). Sorts by mtime descending, unlinks
+        every extra main file and every file whose name starts with a
+        pruned main's prefix.
+        """
+        try:
+            if not os.path.isdir(_PROG_TRASH_DIR):
+                return
+            entries = []
+            for fn in os.listdir(_PROG_TRASH_DIR):
+                # Main entries look like `<id>.<ts>.json`. Sidecars
+                # look like `<id>.<ts>.line_map.json`. We key pruning
+                # on the main entries only; sidecars are handled via
+                # prefix match.
+                if not fn.endswith('.json'):
+                    continue
+                # Sidecar suffixes end with `.<sidecar>.json`. The
+                # cheapest fingerprint: mains end with exactly one
+                # `.json` and NOT with `.line_map.json`.
+                if fn.endswith('.line_map.json'):
+                    continue
+                full = os.path.join(_PROG_TRASH_DIR, fn)
+                try:
+                    mt = os.path.getmtime(full)
+                except OSError:
+                    continue
+                entries.append((mt, fn))
+            if len(entries) <= _PROG_TRASH_CAP:
+                return
+            entries.sort(reverse=True)   # newest first
+            prune = entries[_PROG_TRASH_CAP:]
+            for _, fn in prune:
+                # Drop main + every sidecar with the same `<id>.<ts>.`
+                # prefix. Split at the second-to-last '.' from the
+                # end: mains end `.json`, sidecar names end
+                # `.line_map.json`. Strip `.json` first to get the
+                # unique prefix.
+                prefix = fn[:-len('.json')] + '.'   # `<id>.<ts>.`
+                for sibling in os.listdir(_PROG_TRASH_DIR):
+                    if sibling == fn or sibling.startswith(prefix):
+                        try:
+                            os.remove(os.path.join(_PROG_TRASH_DIR, sibling))
+                        except OSError as e:
+                            print(f'[programs] prune {sibling!r} failed: '
+                                  f'{type(e).__name__}: {e}', flush=True)
+        except Exception as e:
+            print(f'[programs] prune sweep failed: '
+                  f'{type(e).__name__}: {e}', flush=True)
+
     # ------------------------------------------------------------------
     # Production-stats endpoints used by MonitorDashboard. Backed by an
     # in-memory dict for now; the real numbers will arrive once the
@@ -6845,6 +6959,37 @@ if FASTAPI_AVAILABLE:
 
         path = _prog_path(prog_id)
         if not os.path.isfile(path):
+            # Named refusal path for the "deleted resident" ghost case
+            # (2026-09-04 delete-integrity fix). If the operator just
+            # deleted a program that was resident-on-controller, the
+            # dashboard's mirror was cleared but the controller keeps
+            # its own copy. Firing Run against the deleted id here
+            # would either invoke the controller's ghost copy (silent
+            # divergence between dashboard and arm) or return a
+            # generic 404. Prefer a NAMED refusal so the frontend can
+            # render the correct copy.
+            with _state_lock:
+                pg = STATE.get("robot", {}).get("program", {}) or {}
+                deleted_resident_id = pg.get("deleted_resident_id")
+                deleted_at          = pg.get("deleted_at")
+            if deleted_resident_id and deleted_resident_id == prog_id:
+                return JSONResponse({
+                    "ok": False,
+                    "outcome": {
+                        "kind":        "resident_deleted",
+                        "reason_code": "resident_program_deleted",
+                        "reason": ("this program was deleted from the "
+                                   "dashboard; the controller may still "
+                                   "hold its previous copy but the "
+                                   "dashboard will not push a run"),
+                        "detail": (f"Program {prog_id!r} was moved to "
+                                   f".deleted at {deleted_at}. Push a "
+                                   f"different program to replace what "
+                                   f"the controller has resident."),
+                        "program_id": prog_id,
+                        "deleted_at": deleted_at,
+                    },
+                }, status_code=410)
             return JSONResponse({"error": f"program {prog_id!r} not on disk"},
                                 status_code=404)
         try:
@@ -9348,7 +9493,13 @@ if FASTAPI_AVAILABLE:
         try:
             os.makedirs(_PROG_DIR, exist_ok=True)
             for fn in sorted(os.listdir(_PROG_DIR)):
-                if not fn.endswith('.json') or fn.startswith('_'):
+                # `.` prefix (2026-09-04 delete-integrity trash safeguard):
+                # `.deleted/` is a dotfolder inside _PROG_DIR; listdir
+                # returns it as `.deleted` which already fails endswith
+                # ('.json'), but keeping the dot-prefix guard explicit
+                # means future dotfolders (e.g. `.cache`) stay invisible
+                # without a second edit.
+                if not fn.endswith('.json') or fn.startswith(('_', '.')):
                     continue
                 stem = fn[:-5]
                 if not _PROG_READ_ID_RE.match(stem):
@@ -9438,7 +9589,7 @@ if FASTAPI_AVAILABLE:
         # deletion doesn't orphan them behind an invalid id.
         try:
             for fn in os.listdir(_PROG_DIR):
-                if not fn.endswith('.json') or fn.startswith('_'):
+                if not fn.endswith('.json') or fn.startswith(('_', '.')):
                     continue
                 p = os.path.join(_PROG_DIR, fn)
                 try:
@@ -10230,10 +10381,34 @@ if FASTAPI_AVAILABLE:
         path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
             return JSONResponse({"error": "not found"}, status_code=404)
+        # Snap resident-program flag under the same lock we clear it
+        # under below, so the run gate's `deleted_resident_id` check
+        # and the operator-visible confirm-copy agree even under a
+        # concurrent push.
+        with _state_lock:
+            pg = STATE.get("robot", {}).get("program", {}) or {}
+            was_resident = (pg.get("resident_program_id") == prog_id)
         try:
-            os.remove(path)
-        except Exception as e:
-            return JSONResponse({"error": f"delete failed: {e}"}, status_code=500)
+            trash = _trash_program(prog_id)
+        except FileNotFoundError:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        except OSError as e:
+            return JSONResponse({"error": f"delete failed: {e}"},
+                                status_code=500)
+        # Clear the dashboard-side resident mirror so Run refuses with
+        # a NAMED reason ('resident_deleted') instead of falling
+        # through to the generic 404 or — worse — running against the
+        # stale mirror. The controller keeps its own resident copy
+        # until another program is pushed; that behaviour is intentional
+        # (operators may want to hit Run on the pendant after deleting
+        # a program on the dashboard). See the run-gate branch in
+        # api_estun_program_run for how this surfaces.
+        if was_resident:
+            with _state_lock:
+                pg = STATE.setdefault("robot", {}).setdefault("program", {})
+                pg["resident_program_id"] = None
+                pg["deleted_resident_id"] = prog_id
+                pg["deleted_at"]          = trash['ts']
         # Fan out to other connected clients so the row disappears
         # from their library within one /ws/state tick. Uses the
         # program-changed ring from the 2026-07-27 sync fix.
@@ -10247,7 +10422,14 @@ if FASTAPI_AVAILABLE:
             # refresh even without the event.
             print(f'[programs] delete-broadcast failed for {prog_id!r}: '
                   f'{type(e).__name__}: {e}', flush=True)
-        return {"ok": True}
+        return {
+            "ok": True,
+            "trashed": {
+                "ts":    trash['ts'],
+                "moved": [suffix for suffix, _dest in trash['moved']],
+            },
+            "was_resident": was_resident,
+        }
 
     @app.post("/api/programs/{prog_id}/rename")
     async def api_programs_rename(prog_id: str, request: Request):
@@ -14024,7 +14206,7 @@ if FASTAPI_AVAILABLE:
             n = 0
             if not os.path.isdir(_PROG_DIR): return 0
             for fn in os.listdir(_PROG_DIR):
-                if not fn.endswith('.json') or fn.startswith('_'):
+                if not fn.endswith('.json') or fn.startswith(('_', '.')):
                     continue
                 try:
                     with open(os.path.join(_PROG_DIR, fn)) as fp:
@@ -14068,7 +14250,7 @@ if FASTAPI_AVAILABLE:
         try:
             if os.path.isdir(_PROG_DIR):
                 for fn in sorted(os.listdir(_PROG_DIR)):
-                    if not fn.endswith('.json') or fn.startswith('_'):
+                    if not fn.endswith('.json') or fn.startswith(('_', '.')):
                         continue
                     try:
                         with open(os.path.join(_PROG_DIR, fn)) as fp:

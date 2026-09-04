@@ -318,6 +318,13 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
   const setLoadedProgram = useStore((s) => s.setLoadedProgram)
   const setTab           = useStore((s) => s.setTab)
   const addToast         = useStore((s) => s.addToast)
+  const currentProgramId = useStore((s) => s.currentProgram?.id)
+  const setCurrentProgram = useStore((s) => s.setCurrentProgram)
+  // Resident-program mirror from the server (D9 line_map wire). If
+  // the deleted program equals this, the confirm dialog surfaces the
+  // controller-keeps-its-copy warning; the run gate then refuses with
+  // outcome.kind='resident_deleted' until another program is pushed.
+  const residentProgramId = useStore((s) => s.robot?.program?.resident_program_id)
 
   // Fetch folders (and refresh programs / cells via the store) on
   // mount. App-level hydration already kicked off programs + cells
@@ -386,10 +393,42 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
   }
 
   async function deleteProgram(progId) {
-    if (!confirm('Delete this program?')) return
+    // Look up the program's display name so the confirm dialog names
+    // it plainly — a generic "Delete this program?" is how operators
+    // vaporise taught poses by tapping the wrong row.
+    const row = (programs || []).find((p) => p.id === progId)
+    const name = (row && row.name) || progId
+    const isResident = residentProgramId && residentProgramId === progId
+    // Resident-on-controller case: the file lives on the arm's flash
+    // until another program is pushed. Delete just clears the
+    // dashboard's row + resets the currentProgram; the controller
+    // keeps its copy. Say so plainly so the operator is not surprised
+    // when the arm still has "the old one" until another push lands.
+    const msg = isResident
+      ? (`Delete "${name}"?\n\n`
+         + `This program is currently loaded on the robot. Deleting `
+         + `removes the .json from the dashboard's disk (moved to a `
+         + `.deleted safeguard). The controller keeps its resident `
+         + `copy until you push a different program; the dashboard's `
+         + `Run button will refuse to fire against the deleted id.`)
+      : (`Delete "${name}"?\n\n`
+         + `This removes the program's .json from disk. It is moved `
+         + `to a .deleted safeguard folder (recoverable only by asking) `
+         + `and disappears from every list.`)
+    if (!confirm(msg)) return
     try {
       const res = await fetch('/api/programs/' + encodeURIComponent(progId), { method: 'DELETE' })
       if (!res.ok) throw new Error('HTTP ' + res.status)
+      // Clear the currentProgram slot if it referred to the deleted
+      // id — otherwise the editor tab keeps showing a ghost that
+      // Save/Push would either re-create the file or 404 against.
+      if (currentProgramId && currentProgramId === progId) {
+        setCurrentProgram({
+          id: null, name: 'Untitled Program', steps: [], unsaved: false,
+          config: {}, description: '', tags: [], cell_id: null,
+          points: {}, source: null, has_taught_poses: false,
+        })
+      }
       load()
     } catch (e) {
       addToast('Delete failed: ' + (e.message || e), 'error')
