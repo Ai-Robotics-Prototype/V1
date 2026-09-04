@@ -19,9 +19,14 @@ Publishes:
   /safety/estop           std_msgs/Bool
 
 Subscribes: /estun/command, /estun/move, /estun/jog, /estun/io,
-            /robot/jog_command, /robot/io_command — ALL rejected in
-            monitor_only mode (the driver's only mode until motion is
-            explicitly gated back on).
+            /robot/jog_command, /robot/io_command, /robot/power_command —
+            ALL rejected in monitor_only mode (the driver's only mode
+            until motion is explicitly gated back on). /robot/power_command
+            has its own second gate (allow_power) independent of allow_jog:
+            power transitions are a distinct privilege from motion, and
+            *safing* the arm (disable / clear_alarm) must never be gated
+            harder than moving it — so those two work whenever allow_power
+            is open, regardless of allow_jog.
 
 Parameter sources — priority high → low:
   1. `-p key:=value` on the CLI
@@ -43,11 +48,18 @@ import datetime
 import json
 import math
 import os
+import re
 import threading
 import time
 
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
+
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
 
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import PoseStamped
@@ -62,11 +74,135 @@ except ImportError:
 
 WS_LOG_DIR = '/opt/cobot/logs'
 
-# v2.3 subscribe burst — matches posture.py exactly.
-SUBSCRIBE_TOPICS = [
+# v2.3 subscribe burst — split into two phases to survive the
+# controller-boot race. See connect_state.ConnectStateMachine.
+#
+# PROBE_TOPICS are safe to subscribe to WHILE the controller is still
+# initializing: they don't touch the Robot plugin's joint-vector state,
+# which is empty until EtherCAT slaves reach OP. Wire evidence (2026-07-
+# controller-boot logs): subscribing to RobotPosture / RobotCoordinate
+# ~16 ms after C2Control opens :9000 crashes firmware in Robot::step()
+# via an empty Vector<double> index. RobotStatus is emitted directly by
+# C2Control from the state machine, not from the RT loop, and is
+# available immediately.
+#
+# FULL_TOPICS are added ONCE the readiness probe answers AND the grace
+# period has elapsed. This is the topic set that used to be blasted
+# unconditionally on connect.
+PROBE_TOPICS = ['RobotStatus']
+FULL_TOPICS = [
     'web', 'WebCommand', 'Error', 'ProjectState',
-    'RobotStatus', 'RobotPosture', 'RobotCoordinate', 'ProjectStatus',
+    'RobotPosture', 'RobotCoordinate', 'ProjectStatus',
 ]
+# Kept for backward-compat with any importer.
+SUBSCRIBE_TOPICS = PROBE_TOPICS + FULL_TOPICS
+
+# ── Fitted DH table (standard convention) — Estun S10-140-ECO-V2 ──────
+# Source: config/dh_fit_report.txt (stage-B fixed-xyz fit, pos RMS 0.025 mm
+# on the held-out test set). Used only by SingularityGuard below to
+# compute σ_min at live joint angles for the Cartesian-jog governor.
+#
+# Row per joint: (a_mm, alpha_deg, d_mm, theta_off_deg).
+_FITTED_DH_STD = [
+    (-0.00002,     90.00058,   325.89611, -179.99989),  # J1
+    (-701.00394,    0.00028,  -579.68908,  -90.00022),  # J2
+    (-538.58526,  180.00313,  -214.01833,   -0.00615),  # J3
+    (-0.00374,    -89.99857, -1000.00000,  -90.00736),  # J4
+    ( 0.00533,     89.99433,  -161.46726,  179.99693),  # J5
+    (-0.00155,     -0.00674,   150.49959,    0.00152),  # J6
+]
+_FITTED_BASE_Z_MM = -139.89595
+
+
+class SingularityGuard:
+    """Computes σ_min of the 6×6 geometric Jacobian from live joint angles,
+    and derives a speed scale for the Cartesian-jog governor.
+
+    σ_min tracks how far the arm is from a singular configuration —
+    smaller = closer to singularity, where a bounded TCP command demands
+    unbounded joint velocity. Concretely, in the current wire capture of
+    alarm 2015 the arm ran σ_min = 0.180 five seconds before the alarm,
+    0.021 at 100 ms before, and 0.003 at the alarm itself — a ~60×
+    degradation. Joint 1 was commanded at 1.57 rad/s (10× our
+    speed_frac=0.15 cap) at that pose. The governor uses σ_min so we can
+    stop the Cartesian jog BEFORE the controller's IK explodes joint
+    velocity past its own acceleration limit and latches the 2015 alarm.
+
+    Thresholds (soft / hard) come from the driver config; scale() returns
+    1.0 when σ_min ≥ soft, 0.0 when σ_min ≤ hard, and a linear
+    interpolation in between."""
+
+    def __init__(self, dh_std=_FITTED_DH_STD, base_z_mm=_FITTED_BASE_Z_MM):
+        self._dh = dh_std
+        self._base_z_mm = base_z_mm
+
+    def _dh_T(self, theta, d_mm, a_mm, alpha):
+        # Standard DH: T = Rz(θ) · Tz(d) · Tx(a) · Rx(α).
+        ct = math.cos(theta); st = math.sin(theta)
+        ca = math.cos(alpha); sa = math.sin(alpha)
+        return [
+            [ct, -st*ca,  st*sa, a_mm*ct],
+            [st,  ct*ca, -ct*sa, a_mm*st],
+            [0.0,    sa,     ca, d_mm  ],
+            [0.0,   0.0,    0.0, 1.0   ],
+        ]
+
+    def _matmul(self, A, B):
+        return [[sum(A[i][k]*B[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+    def _identity_with_base(self):
+        T = [[1.0,0,0,0],[0,1.0,0,0],[0,0,1.0,self._base_z_mm],[0,0,0,1.0]]
+        return T
+
+    def sigma_min(self, q_deg):
+        """Returns σ_min of the 6×6 geometric Jacobian at q_deg. Returns
+        None if numpy isn't available (guard is then disabled — the
+        driver falls back to the reactive joint-velocity backstop)."""
+        if _np is None:
+            return None
+        # Forward-kinematics chain; store intermediate frames T_0..T_6
+        # so we can extract each joint's z axis and origin for the
+        # geometric Jacobian.
+        T = self._identity_with_base()
+        Ts = [T]
+        for i in range(6):
+            a_mm, alpha_deg, d_mm, theta_off_deg = self._dh[i]
+            theta = math.radians(q_deg[i] + theta_off_deg)
+            Ti = self._dh_T(theta, d_mm, a_mm, math.radians(alpha_deg))
+            T = self._matmul(T, Ti)
+            Ts.append(T)
+        # End-effector position (mm)
+        p_ee = [Ts[6][k][3] for k in range(3)]
+        # Build Jacobian in meters (for linear part) and rad (for angular)
+        J = [[0.0]*6 for _ in range(6)]
+        for i in range(6):
+            z  = [Ts[i][k][2] for k in range(3)]
+            p  = [Ts[i][k][3] for k in range(3)]
+            dp = [(p_ee[k] - p[k]) / 1000.0 for k in range(3)]   # to meters
+            # cross(z, dp)
+            J[0][i] = z[1]*dp[2] - z[2]*dp[1]
+            J[1][i] = z[2]*dp[0] - z[0]*dp[2]
+            J[2][i] = z[0]*dp[1] - z[1]*dp[0]
+            J[3][i] = z[0]
+            J[4][i] = z[1]
+            J[5][i] = z[2]
+        try:
+            return float(_np.linalg.svd(_np.asarray(J), compute_uv=False).min())
+        except Exception:
+            return None
+
+    @staticmethod
+    def scale(sigma, soft, hard):
+        """Linear ramp: 1.0 at ≥soft, 0.0 at ≤hard, linear between.
+        Returns 1.0 when sigma is None (guard disabled) so we never
+        accidentally freeze motion because the model can't compute."""
+        if sigma is None:
+            return 1.0
+        if sigma >= soft:
+            return 1.0
+        if sigma <= hard:
+            return 0.0
+        return max(0.0, min(1.0, (sigma - hard) / (soft - hard)))
 
 
 class EstunCodroidDriver(Node):
@@ -89,10 +225,356 @@ class EstunCodroidDriver(Node):
         self.declare_parameter('monitor_only', True)
         self.declare_parameter('ws_log_raw', True)
 
+        # Jog write path — second gate, must be paired with monitor_only=false.
+        # env override ESTUN_ALLOW_JOG=1 wins over YAML (same precedence as IP).
+        # Only the joint-jog subset is implemented here; every other write
+        # path stays hard-rejected regardless of these flags.
+        self.declare_parameter('allow_jog', False)
+        # Cartesian (mode:2) jog stays hard-gated on this build — the shape
+        # is captured but not yet validated. Independent flag so the joint
+        # path can go live without exposing untested Cartesian motion.
+        self.declare_parameter('allow_cartesian_jog', False)
+        # Two-tier speed cap. `jog_speed_cap` is the hardware-derived
+        # upper bound: the point past which the DERIVED safety margins
+        # (limit clamp, collision stop_mm, sigma governor) would no
+        # longer keep worst-case stop-distance under a supervise-tick
+        # budget. `operator_speed_limit` is the operationally-allowed
+        # ceiling that the OPERATOR is permitted to reach today.
+        # Effective_cap (used by JOG) = min(jog_speed_cap,
+        # operator_speed_limit). AUTO-mode / program-run paths use
+        # operator_speed_limit directly (jog_speed_cap is a jog-specific
+        # margin ceiling, not an auto-mode one).
+        #
+        # 2026-07-22 raise: operator_speed_limit 0.25 → 0.65 — see the
+        # YAML for the safeguards paired with the raise. YAML is the
+        # single authoritative source; this default only takes effect
+        # if the config file is missing.
+        self.declare_parameter('jog_speed_cap',        0.50)   # hardware-safe upper bound
+        self.declare_parameter('operator_speed_limit', 0.65)   # operationally-allowed ceiling
+        # Mid-run INCREASE confirm threshold (integer %). A dashboard
+        # request to change the auto-mode rate to a value strictly
+        # above this without an explicit high-speed confirm flag is
+        # rejected. Defaults to 40 (see YAML).
+        self.declare_parameter('high_speed_confirm_threshold_pct', 40)
+
+        # ── I/O bridge (Task 30, 2026-07-22) ─────────────────────────
+        # Wire-proven verbs from data/estun_captures/estun_io_20260721.har
+        # + estun_lua_io_v2_20260721.har:
+        #   IOManager/GetIOInfo     — {} → {DI:[...], DO:[...], AI:[...], AO:[...]}
+        #                             each entry {port, defaultName, name, forced,
+        #                             function}
+        #   IOManager/GetIOValue    — [{type,port}, ...] → same shape + `value`
+        #   IOManager/SetIOForcedFlag — {port, value, type} → null; value=1 asserts
+        #                             the force (DO drives HIGH, DI reads HIGH),
+        #                             value=0 releases (unforced) — proven by the
+        #                             GetIOInfo.forced round-trip on the DI2
+        #                             capture (see PORT-MAP v2 commit body).
+        # Fifth write gate — SEPARATE from allow_jog / allow_power / allow_move.
+        # Env override ESTUN_ALLOW_IO=1 wins over YAML.
+        self.declare_parameter('allow_io', False)
+        # I/O poll cadence — batched GetIOValue every _io_poll_s, GetIOInfo
+        # every _io_info_poll_s (metadata + forced flags change rarely,
+        # values change on every input pulse). Keep both light — the
+        # captured factory UI polls at ~1 Hz.
+        self.declare_parameter('io_poll_s', 0.5)
+        self.declare_parameter('io_info_poll_s', 2.0)
+        self.declare_parameter('jog_heartbeat_s', 0.4)         # Robot/jogHeartbeat cadence
+        # Freshness deadman: no refresh within this window → Robot/stopJog.
+        # 2026-07-17: bumped 0.3 → 0.5 to tolerate observed 672 ms
+        # dashboard-side GIL stalls (json.dumps of the 10 KB state blob
+        # starved the keepalive native thread mid-hold).
+        # 2026-07-20: reverted 0.5 → 0.3 after the source-side fixes
+        # landed (deepcopy+json.dumps offloaded onto a thread executor,
+        # state broadcast dropped to 8 Hz while a jog hold is active).
+        # With the stall source removed the tighter deadman is what we
+        # want; the 0.5 loosening was a workaround, not a design
+        # choice.
+        # 2026-08-04: tightened 0.3 → 0.2 per continuous-jog task §4
+        # ("no client keepalive for 200 ms → stop, regardless of
+        # jog_stop arriving"). Client ticker cadence is 100 ms via
+        # a Web Worker + rAF hybrid (immune to main-thread throttling
+        # on tablet), so a single missed tick still leaves one full
+        # 100 ms buffer inside 200 ms. Widens the safety margin
+        # against "frozen tab leaves the arm moving" by ~100 ms. If
+        # phantom staleness stops resurface, revert to 0.3 and
+        # diagnose upstream — should now be a client-side issue.
+        # The layered safety chain is UNCHANGED: browser release →
+        # server publishes explicit stopJog (immediate); server
+        # crash → this deadman fires; network stall → this deadman
+        # fires; browser dies → this deadman fires.
+        self.declare_parameter('jog_freshness_timeout_s', 0.2)
+        # Latency and safety-factor inputs to the SPEED-SCALED margin
+        # formulas below. Values chosen from wire measurements:
+        #   - posture RX → guard reaction takes ~150 ms (three 50 ms
+        #     supervise ticks worst case)
+        #   - safety factor 1.5 as an engineering headroom
+        # 2026-08-19 retune (F1.4 rung-3 fingerprint — dynamic margin
+        # was cutting jog out ~52% into the joint's authored travel
+        # under normal speed_pct). Measured release→stop on F1.4 was
+        # 56-61 ms; 0.150 s keeps generous 90 ms buffer.
+        self.declare_parameter('safety_latency_s', 0.150)
+        # 1.5 → 1.2 (still >1 for real-world overrun; the previous 1.5
+        # over-amplified with no evidence it was needed).
+        self.declare_parameter('safety_factor', 1.2)
+        # Anchor speed_frac at which the STATIC baseline margins (the
+        # legacy 2 mm limit margin, 30 mm collision stop, 60 mm sigma
+        # soft) were originally tuned. Dynamic margins scale linearly
+        # in (speed_frac - baseline_speed_frac).
+        self.declare_parameter('baseline_speed_frac', 0.15)
+
+        # Incremental (angle-bounded) jog — the driver owns the stop timer
+        # so the browser never controls stop timing. Duration formula:
+        #   duration_s = |delta_deg| / (jog_increment_speed_frac * max_joint_speed_degps[axis-1])
+        # Freshness deadman + heartbeats still run underneath as safety
+        # backups — see _on_jog_supervise.
+        self.declare_parameter('jog_increment_speed_frac', 0.15)
+        # Per-joint max angular speed from the Config→Safety screens.
+        # J1-J3 = 150 °/s, J4-J6 = 180 °/s.
+        self.declare_parameter('max_joint_speed_degps',
+                               [150.0, 150.0, 150.0, 180.0, 180.0, 180.0])
+        # Position clamp. J3 and J5 are ±166° per the safety screens; the
+        # rest are ±200°. Clamp check applies |current + delta| <= limit - margin
+        # so we never *command* motion into the last 2° of travel.
+        self.declare_parameter('joint_limit_deg',
+                               [200.0, 200.0, 166.0, 200.0, 166.0, 200.0])
+        self.declare_parameter('joint_limit_margin_deg', 2.0)
+        # 2026-08-19 retune: dynamic margin is CAPPED. Prior behavior grew
+        # margin without bound at commanded speed (150°/s × 0.5 × 0.15 ×
+        # 1.5 = 16.9° on J1 at 50% — cutting jog out ~10% of the joint's
+        # authored travel). Cap keeps the margin honest: at any speed,
+        # the safe_edge is at most 5° inside the physical limit. Static
+        # base (2.0) is still the floor at crawl speed.
+        self.declare_parameter('joint_limit_margin_max_deg', 5.0)
+        # 2026-08-05 (guided recovery, Lesson 165 extension): once a joint
+        # is past `limit - joint_escape_only_margin_deg`, only the escape
+        # direction (the one that REDUCES abs(current_deg)) is permitted.
+        # Speed-invariant — a recovery move at 5% crawl and a fast jog at
+        # 50% both get the same "no deeper" invariant. This is the clamp
+        # the guided-recovery dialog counts on. 12° matches the widest
+        # dynamic margin the standard limit clamp uses (180°/s × f=~0.44
+        # × 0.1 s × 1.5 ≈ 12°) so an operator inside this zone was
+        # already inside the dynamic safe_edge at some plausible jog speed.
+        self.declare_parameter('joint_escape_only_margin_deg', 12.0)
+        # Server should already validate |delta_deg| ≤ 5°; this is belt+braces.
+        self.declare_parameter('jog_increment_max_delta_deg', 5.0)
+
+        # ── Cartesian-jog singularity + overspeed governor ──────────────
+        # Wire evidence (alarm 2015 on 2026-07-15): a Cartesian X hold at
+        # our speed_frac=0.15 drove the controller's IK to command Joint1
+        # at 1.57 rad/s (≈10× our cap) as the arm approached a wrist
+        # singularity — σ_min collapsed from 0.180 (5 s pre-alarm) → 0.021
+        # (100 ms pre-alarm) → 0.003 (alarm). The governor stops or
+        # scales the Cartesian jog before that final collapse. Applies
+        # to continuous_cart and cart_pulse; joint-mode holds are
+        # untouched (their per-joint cap already governs velocity).
+        # Thresholds are logarithmic-ish (soft ≈ 3× hard); tuned so the
+        # -100 ms danger point lands just above sigma_hard.
+        self.declare_parameter('cart_sigma_soft', 0.060)  # begin scaling
+        self.declare_parameter('cart_sigma_hard', 0.020)  # hard stop
+        # Reactive backstop — if the controller's live joint velocity
+        # spikes past this during OUR Cartesian hold, stop with reason
+        # 'joint overspeed guard J<n>'. 1.5 rad/s is a compromise: below
+        # the 2 rad/s that produced alarm 2015, and above what a bench
+        # Cartesian jog at speed_frac=0.15 in a healthy region produces
+        # (measured 0.3–0.5 rad/s peak-per-joint in the same session).
+        self.declare_parameter('cart_joint_velocity_cap_radps', 1.5)
+        # Mid-hold speed changes ramp, not step. Delta hysteresis avoids
+        # spamming stop+restart cycles; up-ramp is capped per tick so a
+        # pose that briefly re-opens (σ_min bounces back) can't
+        # instantly slam speed to 100%.
+        self.declare_parameter('cart_speed_change_min_delta', 0.10)   # 10%
+        self.declare_parameter('cart_speed_up_ramp_per_tick', 0.25)   # 25%
+
+        # ── Cartesian-jog joint-limit APPROACH softening (2026-08-04) ───
+        # Diagnosis verdict (f): 52% of teach-mode cart-jog cutouts fire
+        # `joint_limit: cart limit approach J6` — the operator hits the
+        # hard-stop wall with no warning, no ramp, no operator-visible
+        # cause. Softening reshapes the APPROACH (not the hard stop): as
+        # any joint enters `cart_joint_limit_soft_zone_deg` inside the
+        # dynamic safe_edge, the cart speed scales linearly from 1.0
+        # down to `cart_joint_limit_soft_floor_frac`. The hard-stop
+        # threshold (safe_edge) itself does NOT loosen — this is a
+        # cliff → ramp reshape, safety-wise identical.
+        # 2026-08-19 retune: 8.0 → 2.0. With the dynamic margin capped
+        # at 5°, slowdown starts at (margin + soft_zone) = 5 + 2 = 7°
+        # inside the limit — matches "slowdown starts ~7 deg out, not
+        # tens of degrees out" per the F1.4 rung-3 tuning directive.
+        # Prior 8° added to a 20° margin gave a 28° slowdown-zone.
+        self.declare_parameter('cart_joint_limit_soft_zone_deg', 2.0)
+        self.declare_parameter('cart_joint_limit_soft_floor_frac', 0.10)
+
+        # ── Self-collision guard ────────────────────────────────────────
+        # Capsule model of the arm + ground plane, distances checked per
+        # supervise tick during ANY active jog (joint or cartesian).
+        # Applied AFTER the per-joint limit clamp and the cartesian
+        # singularity governor — this is the closest-approach guard.
+        # Wire evidence (2026-07-14): the operator-side lockouts we've
+        # seen have all been controller-side alarms; this guard is
+        # preventive so we never even ask the controller to command a
+        # motion that puts two links in contact. Direction-aware: a
+        # jog moving AWAY from the closest pair is NOT stopped —
+        # otherwise the operator gets wedged with every direction
+        # refused when clearance is already thin.
+        # Thresholds calibrated from the random-pose validation:
+        #   warn=80 mm  — surfaces "SELF-COLLISION WARNING" toast;
+        #                 amber tint on the offending pair in the twin;
+        #                 jog continues.
+        #   stop=15 mm  — stopJog with reason
+        #                 'self-collision guard <a>-<b> at <d>mm';
+        #                 red tint; recovery copy in the modal.
+        #
+        # 2026-07-31 OPERATOR DIRECTIVE: shrink stop to 15 mm to
+        # reflect the capsule model's known ~30 mm over-approximation.
+        # Combined with the warn-zone-is-presentation-only change,
+        # this restores teach-time freedom at the cell — the model
+        # was calling 45–50 mm poses "close" and blocking legitimate
+        # jogs. The real fix (mesh convex hulls from viewer GLBs)
+        # is queued as §396's follow-up; when the model stops lying
+        # by 30 mm the guard earns back its authority.
+        # 2026-08-05 (operator directive: clearance warnings OFF).
+        # The soft warn tier is disabled — 0.0 is the sentinel for
+        # "no warn threshold". The WARNING log line + the frontend
+        # banner both key off collision_warn_mm > 0, so publishing
+        # 0.0 turns the entire soft tier off end to end. The HARD
+        # stop below (15 mm) is unchanged and remains the physical
+        # last-resort guard — the operator's stated plan is "I will
+        # hit the hard limit and it will stop." Raise back to 40.0
+        # to re-enable the warn tier.
+        self.declare_parameter('collision_warn_distance_mm', 0.0)
+        self.declare_parameter('collision_stop_distance_mm', 15.0)  # was 20.0
+        # Env thresholds — separate from self/ground so the two can
+        # diverge. Wire evidence 2026-07-15: env-guard was firing on
+        # phantom geometry because the DH-FK misplaced intermediate
+        # link frames; after the URDF-FK fix, env distances agree with
+        # collision_monitor (raw-LiDAR arithmetic) within a few mm.
+        # Tighter thresholds (env warn=50, stop=25) because the arm
+        # moves through the workspace and 80mm was overzealous.
+        self.declare_parameter('env_warn_distance_mm', 50.0)
+        self.declare_parameter('env_stop_distance_mm', 25.0)
+        # Config file lives beside the YAML params — resolved at init.
+        self.declare_parameter('collision_capsules_yaml',
+            '/home/teddy/cobot_ws/config/self_collision_capsules.yaml')
+        # 2026-08-06 (operator directive: ENTIRE self-collision system OFF).
+        # `collision_enabled` is the SINGLE AUTHORITATIVE KILL SWITCH
+        # for the whole self-collision + ground-plane capsule guard,
+        # ALL tiers. Default False per the directive. Runtime toggle
+        # via /robot/collision_guard_set (Bool). When False, every
+        # collision-check call site is a no-op and no "arm too close
+        # to another link" message can be emitted anywhere in the
+        # stack. SAFETY: with the guard OFF nothing in software
+        # prevents a link-on-link or link-on-table crash — this is
+        # the operator's explicit, informed choice, logged on boot
+        # and on every runtime toggle in the event log.
+        self.declare_parameter('collision_enabled', False)
+        # Ground plane z (mm) in the driver's base_link frame. The URDF
+        # base_link is the base flange; a mounted arm sits some
+        # distance above the physical floor. z=0 in base frame is the
+        # flange, NOT the floor — that was today's wedge (the guard
+        # thought every normal pose was at 87 mm from the "ground").
+        # Default -300 mm assumes a 300 mm stand; fit an exact number
+        # for your cell with scripts/fit_ground_plane.py and override
+        # via the YAML params file.
+        self.declare_parameter('ground_z_mm', -300.0)
+        # DISABLE ground plane check by default until the Y-up / Z-up
+        # frame convention mismatch between the URDF (Y-up) and the
+        # ground half-space model (Z-up) is properly resolved. Wire
+        # evidence 2026-07-15: after switching to URDF-native FK, the
+        # startup sanity line reported -80mm ground clearance because
+        # URDF-frame link Z values do not represent "height above the
+        # floor" as the ground model assumed. Env-obstacle checks are
+        # not affected — they compare capsule world coords directly
+        # against zone OBB world coords in the same URDF frame.
+        self.declare_parameter('ground_check_enabled', False)
+        # Fallback override: when the escape-direction model finds NO
+        # single-axis escape (deep pocket, or the model itself is
+        # wrong), allow any joint-mode jog at this reduced speed. The
+        # operator has an e-stop in hand and outranks a geometry model.
+        # Logs LOUDLY on every override so we can review after the fact.
+        self.declare_parameter('collision_fallback_speed_frac', 0.03)
+        # Speed cap while in the warn / stop zone. Escape jogs go
+        # through this cap so a slip never becomes a slam.
+        self.declare_parameter('collision_escape_speed_frac', 0.06)
+
+        # Power write path — third gate, SEPARATE from allow_jog. Power
+        # transitions are a distinct privilege: an operator may be
+        # authorised to command motion under an already-enabled arm
+        # without also holding the key to bring the arm up in the first
+        # place, and vice-versa (safing an arm we shouldn't have brought
+        # up is always allowed to whoever has this key). monitor_only
+        # still master-gates all three commands. Env override
+        # ESTUN_ALLOW_POWER=1 wins over YAML, same precedence as
+        # allow_jog. NO code path anywhere calls enable except the
+        # explicit operator command arriving on /robot/power_command:
+        # no auto-enable-on-startup, no auto-enable-on-reconnect, no
+        # retry-on-failure.
+        self.declare_parameter('allow_power', False)
+
+        # Program-execution write path (Part 2c, B1). Fourth gate,
+        # SEPARATE from allow_jog and allow_power. Opens the family:
+        #   - HTTP save (POST /api/robotcode + /api/robotjson/...)
+        #   - project/run, /stop, /pause, /resume, /runStep,
+        #     /setStartLine, /clearStartLine, /setBreakpoint,
+        #     /clearBreakpoint
+        #   - Robot/toAuto, Robot/toManual, Robot/setManualMoveRate,
+        #     Robot/setAutoMoveRate  (mode switches + program speed cap)
+        #   - System/ClearError  (also allowed under allow_power for the
+        #     jog-side clear_alarm command — clearing an error is a
+        #     safing action, not a moving one, but on the program path
+        #     it appears here because the sequence is start-run-clear-run)
+        # monitor_only stays the master gate. See PART_2C_ARCHITECTURE.md.
+        self.declare_parameter('allow_move', False)
+        # ── Mode gate (2026-08-28) ───────────────────────────────
+        # Separate from allow_move so an operator (or safety
+        # process) can permit MODE SWITCHING without also opening
+        # program-write. `Robot/toAuto` / `Robot/toManual` /
+        # `Robot/toRemote` ride here. Read-back verified against
+        # numeric `robot_mode_code` (0=AUTO, 1=MANUAL, 2=REMOTE)
+        # per L298 — stateName strings are not ground truth.
+        self.declare_parameter('allow_mode', False)
+        # ── WS-jog guard demotion (2026-08-28) ──────────────────
+        # Streamed-era guards vs verb-era trust boundary. When we
+        # sent 250 Hz joint-position setpoints via UDP, WE had to
+        # enforce every limit ourselves. On the WS Robot/jog verb,
+        # the CC10-A firmware clamps commanded joint velocity,
+        # enforces axis limits, and handles IK degeneracy natively
+        # — the factory pendant proves it (it slows / stops the
+        # right axis without ever killing the hold from outside).
+        # When this param is true (default), the cart-mode
+        # redundant guards (cart_limit_approach, joint_overspeed,
+        # singularity_guard, joint_limit soft scale) DEMOTE to
+        # observe-only: they populate cart_softening for the
+        # dashboard toast but neither stop nor scale the WS verb.
+        # See ledger addendum-50 for the parity rationale.
+        self.declare_parameter('wsjog_trust_firmware_clamps', True)
+
         # Cadence knobs.
         self.declare_parameter('recv_timeout_s', 5.0)   # matches posture.py
         self.declare_parameter('ping_on_timeout', True)
         self.declare_parameter('reconnect_backoff_s', 2.0)
+
+        # ── Controller-boot race guards ────────────────────────────
+        # We used to hammer the controller with the full subscribe
+        # burst 16 ms after :9000 opened, which crashed firmware
+        # during its own EtherCAT init — see connect_state.py header
+        # for the full story. These knobs govern the fix:
+        #   * grace_period_s: floor between WS-open and full subscribe
+        #   * probe_interval_s: cadence of the lightweight readiness
+        #     probe DURING the grace window
+        #   * reconnect_backoff_max_s: cap on the exponential retry
+        #     backoff (initial = reconnect_backoff_s above)
+        #   * reconnect_healthy_reset_s: seconds a session must stay
+        #     READY before we reset backoff to initial (short healthy
+        #     sessions don't reset — the whole hazard was that we
+        #     reconnected instantly on every restart)
+        #   * crashloop_threshold / _window_s / _cooldown_s: N cycles
+        #     inside window trigger a longer cool-down and a loud log
+        self.declare_parameter('grace_period_s', 5.0)
+        self.declare_parameter('probe_interval_s', 1.0)
+        self.declare_parameter('reconnect_backoff_max_s', 30.0)
+        self.declare_parameter('reconnect_healthy_reset_s', 60.0)
+        self.declare_parameter('crashloop_threshold', 3)
+        self.declare_parameter('crashloop_window_s', 120.0)
+        self.declare_parameter('crashloop_cooldown_s', 120.0)
 
         # Rate-limit the "waiting for stream" log so a disabled robot
         # doesn't spam. In seconds.
@@ -103,11 +585,167 @@ class EstunCodroidDriver(Node):
         self._ui_origin_port = int(self.get_parameter('ui_origin_port').value)
         self._auto_connect = bool(self.get_parameter('auto_connect').value)
         self._monitor_only = bool(self.get_parameter('monitor_only').value)
+        # Env override — mirrors ESTUN_ALLOW_JOG so the drop-in file at
+        # /etc/default/roboai-estun can drive both gates from one place.
+        # The systemd unit stays DISABLED at boot; when the operator
+        # brings the driver up for a session, the env file supplies
+        # both ESTUN_MONITOR_ONLY=false and ESTUN_ALLOW_JOG=1 and
+        # motion is permitted for that session only.
+        self._monitor_source = 'param'
+        env_monitor = os.environ.get('ESTUN_MONITOR_ONLY')
+        if env_monitor is not None:
+            self._monitor_only = env_monitor.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._monitor_source = 'ESTUN_MONITOR_ONLY'
         self._ws_log_raw   = bool(self.get_parameter('ws_log_raw').value)
         self._recv_timeout = float(self.get_parameter('recv_timeout_s').value)
         self._ping_on_to   = bool(self.get_parameter('ping_on_timeout').value)
         self._reconn_backoff = float(self.get_parameter('reconnect_backoff_s').value)
         self._disabled_log_period = float(self.get_parameter('disabled_log_period_s').value)
+
+        self._grace_period_s        = float(self.get_parameter('grace_period_s').value)
+        self._probe_interval_s      = float(self.get_parameter('probe_interval_s').value)
+        self._reconnect_backoff_max_s = float(self.get_parameter('reconnect_backoff_max_s').value)
+        self._reconnect_healthy_reset_s = float(self.get_parameter('reconnect_healthy_reset_s').value)
+        self._crashloop_threshold   = int(self.get_parameter('crashloop_threshold').value)
+        self._crashloop_window_s    = float(self.get_parameter('crashloop_window_s').value)
+        self._crashloop_cooldown_s  = float(self.get_parameter('crashloop_cooldown_s').value)
+
+        self._allow_jog             = bool(self.get_parameter('allow_jog').value)
+        self._allow_cartesian_jog   = bool(self.get_parameter('allow_cartesian_jog').value)
+        self._allow_jog_source = 'param'
+        self._allow_cart_source = 'param'
+        env_allow = os.environ.get('ESTUN_ALLOW_JOG')
+        if env_allow is not None:
+            self._allow_jog = env_allow.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._allow_jog_source = 'ESTUN_ALLOW_JOG'
+        env_cart = os.environ.get('ESTUN_ALLOW_CARTESIAN')
+        if env_cart is not None:
+            self._allow_cartesian_jog = env_cart.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._allow_cart_source = 'ESTUN_ALLOW_CARTESIAN'
+        self._jog_speed_cap        = float(self.get_parameter('jog_speed_cap').value)
+        self._operator_speed_limit = float(self.get_parameter('operator_speed_limit').value)
+        # Effective ceiling FOR JOG — the operator can never command
+        # past this on the jog path. Auto/program paths clamp against
+        # operator_speed_limit directly via _clamp_program_speed_pct
+        # (jog_speed_cap is a jog-specific margin ceiling, not an
+        # auto-mode one). Displayed as "capped at X%" in the UI slider.
+        self._effective_speed_cap  = min(self._jog_speed_cap,
+                                         self._operator_speed_limit)
+        self._high_speed_confirm_threshold_pct = int(
+            self.get_parameter('high_speed_confirm_threshold_pct').value)
+        self._jog_hb_s        = float(self.get_parameter('jog_heartbeat_s').value)
+        self._jog_freshness_s = float(self.get_parameter('jog_freshness_timeout_s').value)
+        self._jog_inc_speed_frac = float(self.get_parameter('jog_increment_speed_frac').value)
+        self._max_joint_speed_degps = list(self.get_parameter('max_joint_speed_degps').value)
+        self._joint_limit_deg = list(self.get_parameter('joint_limit_deg').value)
+        self._joint_limit_margin_deg = float(self.get_parameter('joint_limit_margin_deg').value)
+        self._joint_limit_margin_max_deg = float(self.get_parameter('joint_limit_margin_max_deg').value)
+        self._joint_escape_only_margin_deg = float(
+            self.get_parameter('joint_escape_only_margin_deg').value)
+        self._jog_inc_max_delta_deg = float(self.get_parameter('jog_increment_max_delta_deg').value)
+        # Inputs to the SPEED-SCALED margin formulas.
+        self._safety_latency_s     = float(self.get_parameter('safety_latency_s').value)
+        self._safety_factor        = float(self.get_parameter('safety_factor').value)
+        self._baseline_speed_frac  = float(self.get_parameter('baseline_speed_frac').value)
+
+        self._cart_sigma_soft   = float(self.get_parameter('cart_sigma_soft').value)
+        self._cart_sigma_hard   = float(self.get_parameter('cart_sigma_hard').value)
+        self._cart_joint_v_cap  = float(self.get_parameter('cart_joint_velocity_cap_radps').value)
+        self._cart_speed_min_delta   = float(self.get_parameter('cart_speed_change_min_delta').value)
+        self._cart_speed_up_per_tick = float(self.get_parameter('cart_speed_up_ramp_per_tick').value)
+        self._cart_joint_soft_zone_deg   = float(self.get_parameter('cart_joint_limit_soft_zone_deg').value)
+        self._cart_joint_soft_floor_frac = float(self.get_parameter('cart_joint_limit_soft_floor_frac').value)
+
+        self._coll_warn_mm   = float(self.get_parameter('collision_warn_distance_mm').value)
+        self._coll_stop_mm   = float(self.get_parameter('collision_stop_distance_mm').value)
+        self._env_warn_mm    = float(self.get_parameter('env_warn_distance_mm').value)
+        self._env_stop_mm    = float(self.get_parameter('env_stop_distance_mm').value)
+        self._coll_yaml_path = str(self.get_parameter('collision_capsules_yaml').value)
+        # 2026-08-06 (operator directive): env override for the
+        # single-authoritative kill switch. Mirrors ESTUN_ALLOW_IO /
+        # ESTUN_ALLOW_POWER precedence — env wins over YAML so
+        # systemd can retarget without a rebuild. Values: 1/true/
+        # yes/on → enabled, anything else → disabled.
+        self._coll_enabled   = bool(self.get_parameter('collision_enabled').value)
+        self._coll_enabled_source = 'param'
+        _env_coll = os.environ.get('COLLISION_ENABLED')
+        if _env_coll is not None:
+            self._coll_enabled = _env_coll.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._coll_enabled_source = 'COLLISION_ENABLED'
+        self._ground_z_mm    = float(self.get_parameter('ground_z_mm').value)
+        self._ground_check_enabled = bool(self.get_parameter('ground_check_enabled').value)
+        self._coll_fallback_frac = float(self.get_parameter('collision_fallback_speed_frac').value)
+        self._coll_escape_frac   = float(self.get_parameter('collision_escape_speed_frac').value)
+
+        self._allow_power = bool(self.get_parameter('allow_power').value)
+        self._allow_power_source = 'param'
+        env_power = os.environ.get('ESTUN_ALLOW_POWER')
+        if env_power is not None:
+            self._allow_power = env_power.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._allow_power_source = 'ESTUN_ALLOW_POWER'
+
+        self._allow_move = bool(self.get_parameter('allow_move').value)
+        self._allow_move_source = 'param'
+        env_move = os.environ.get('ESTUN_ALLOW_MOVE')
+        if env_move is not None:
+            self._allow_move = env_move.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._allow_move_source = 'ESTUN_ALLOW_MOVE'
+
+        # Mode-switch gate — separate from move (2026-08-28).
+        self._allow_mode = bool(self.get_parameter('allow_mode').value)
+        self._allow_mode_source = 'param'
+        env_mode = os.environ.get('ESTUN_ALLOW_MODE')
+        if env_mode is not None:
+            self._allow_mode = env_mode.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._allow_mode_source = 'ESTUN_ALLOW_MODE'
+
+        # Software mode switching via bound DIs (2026-08-31 add-54).
+        # Per the CC10-A software manual, DIs can be assigned function
+        # aliases at :9198 → Configuration → IO ("Switch to Auto
+        # Mode", "Switch to Manual Mode", rising-edge). When the
+        # operator has bound spare DIs (e.g., DI6=to_auto,
+        # DI7=to_manual), setting `ESTUN_MODE_VIA_DI=1` makes this
+        # driver pulse those DIs via IOManager/SetIOForcedFlag
+        # instead of firing Robot/toAuto|toManual. Bypasses the
+        # DI16 modeSwitch hardware gate entirely (bound-DI aliases
+        # take effect immediately per manual — no Save).
+        self._mode_via_di = os.environ.get(
+            'ESTUN_MODE_VIA_DI', '0').strip().lower() in \
+            ('1', 'true', 'yes', 'on')
+        try:
+            self._mode_di_auto = int(os.environ.get(
+                'ESTUN_MODE_DI_AUTO', '6'))
+        except ValueError:
+            self._mode_di_auto = 6
+        try:
+            self._mode_di_manual = int(os.environ.get(
+                'ESTUN_MODE_DI_MANUAL', '7'))
+        except ValueError:
+            self._mode_di_manual = 7
+        try:
+            self._mode_di_pulse_ms = int(os.environ.get(
+                'ESTUN_MODE_DI_PULSE_MS', '120'))
+        except ValueError:
+            self._mode_di_pulse_ms = 120
+
+        # WS-jog guard demotion — resolved into a runtime bool. Env
+        # override `WSJOG_TRUST_FIRMWARE_CLAMPS=0` restores the
+        # streamed-era ENFORCE behavior for regression testing.
+        self._wsjog_trust_firmware_clamps = bool(
+            self.get_parameter('wsjog_trust_firmware_clamps').value)
+        env_trust = os.environ.get('WSJOG_TRUST_FIRMWARE_CLAMPS')
+        if env_trust is not None:
+            self._wsjog_trust_firmware_clamps = env_trust.strip().lower() \
+                in ('1', 'true', 'yes', 'on')
+
+        self._allow_io = bool(self.get_parameter('allow_io').value)
+        self._allow_io_source = 'param'
+        env_io = os.environ.get('ESTUN_ALLOW_IO')
+        if env_io is not None:
+            self._allow_io = env_io.strip().lower() in ('1', 'true', 'yes', 'on')
+            self._allow_io_source = 'ESTUN_ALLOW_IO'
+        self._io_poll_s      = float(self.get_parameter('io_poll_s').value)
+        self._io_info_poll_s = float(self.get_parameter('io_info_poll_s').value)
 
         # Env override — ALWAYS wins so systemd can retarget without rebuild.
         env_ip = os.environ.get('ESTUN_ROBOT_IP')
@@ -129,23 +767,297 @@ class EstunCodroidDriver(Node):
         self._connected = False
         self._recv_thread = None
         self._send_lock = threading.Lock()
+        # Connection-lifecycle state machine. Owns the grace-period /
+        # readiness-probe / exponential-backoff / crash-loop rules
+        # that keep us from re-crashing a controller that's still
+        # coming up. Fully unit-tested in test/test_connect_state.py.
+        from estun_driver.connect_state import ConnectStateMachine
+        self._conn_sm = ConnectStateMachine(
+            grace_period_s=self._grace_period_s,
+            probe_interval_s=self._probe_interval_s,
+            backoff_initial_s=self._reconn_backoff,
+            backoff_max_s=self._reconnect_backoff_max_s,
+            backoff_reset_healthy_s=self._reconnect_healthy_reset_s,
+            crashloop_threshold=self._crashloop_threshold,
+            crashloop_window_s=self._crashloop_window_s,
+            crashloop_cooldown_s=self._crashloop_cooldown_s,
+        )
+        # Rate-limit the "controller appears to be restarting" log so
+        # it fires once per crash-loop entry, not every tick.
+        self._crashloop_logged = False
 
         # ── Robot state ────────────────────────────────────────
         self._joint_deg = [0.0] * 6
         self._joint_rad = [0.0] * 6
         self._tcp_mm    = [0.0] * 6   # x,y,z (mm), a,b,c (deg, fixed-XYZ)
         self._tcp_m     = [0.0] * 6   # x,y,z (m),  a,b,c (rad)
-        self._state_code = -1         # RobotStatus.state; 2 == enabled
+        # RobotStatus.state observed values (2026-07-14 logs):
+        #   0 = Disabled    1 = Enabling (transient)
+        #   2 = Enabled     3 = Enabled (sub-state, still enabled)
+        # 'enabled' is state ∈ {2, 3}; 'enabling' is state == 1 (used by
+        # the dashboard banner for the "ENABLING…" transition state).
+        self._state_code = -1
+        self._state_name = ''
+        # 2026-08-28 §566/L298 four-tuple observability.
+        self._last_errors    = []      # list of error entries from RobotStatus.db.errors
+        self._recovery_state = 0       # RobotStatus.db.recoveryState (int)
+        self._robot_mode_code = -1   # 0 AUTO, 1 MANUAL, -1 unknown (yet)
         self._enabled    = False
+        self._enabling   = False
         self._is_estop   = False
         self._is_moving  = False
+        # Alarm mirror. publish/Error carries db as a list of active
+        # alarms. Each entry (from wire captures) is
+        #   [severity:int, code:int, ts:float, text:str]
+        # Observed codes (2026-07 logs):
+        #   2000  "Joint<n> servo status error, error code: 0x<hex>."
+        #   2002  "Joint<n> exceeded limit."               ← the operator's case
+        #   2006  "Emergency stop button pressed."
+        #   2023  "Singular position."
+        #   9012  "Power disconnection detected."
+        #   13046 "Emergency stop pressed."
+        # _alarms holds the raw list from the last non-empty frame; empty
+        # frames arrive continuously as heartbeats between real alarms
+        # and MUST NOT clear the mirror (the controller re-emits only on
+        # state change, and an empty followed by a non-empty is normal).
+        # _alarm_active is set to the newest non-empty entry so the
+        # status blob can surface a single most-relevant alarm to the
+        # dashboard banner.
+        self._alarms     = []
+        self._alarm_active = None    # dict {severity, code, ts, text} or None
+        # Latest stop reason for the dashboard's "why did jog stop?" line.
+        # Populated by every _stop_jog_locked path (staleness / limit /
+        # release / expiry / send-fail / disconnect / shutdown). The
+        # dashboard shows this transiently when last_stop_ts is recent.
+        self._last_stop_reason = ''
+        self._last_stop_ts     = 0.0
+        # 2026-08-04: structured cause snapshot so the dashboard can render
+        # operator-language copy without regex-parsing the reason string.
+        # Set inside _stop_jog_locked at the same moment as _last_stop_reason.
+        # None until the first stop. Shape:
+        #   {
+        #     'tag':                  str,  # e.g. 'joint_limit', 'freshness_deadman'
+        #     'raw':                  str,  # 'cause=<tag>: <human>' as logged
+        #     'ts':                   float,
+        #     'jog_mode':             'continuous' | 'continuous_cart' | 'increment' | None,
+        #     'joint_index_1based':   int | None,  # extracted from reason if applicable
+        #     'joint_deg':            float | None,
+        #     'joint_limit_deg':      float | None,
+        #   }
+        self._last_stop_cause  = None
+        # 2026-08-04: live cart-mode approach-softening state. Non-None
+        # only while a cart hold is scaled down by joint-limit approach.
+        # Cleared on stop or when the softening zone is exited. Shape:
+        #   {
+        #     'active':               True,
+        #     'limiting_joint_1based': int,
+        #     'current_deg':          float,
+        #     'safe_edge_deg':        float,
+        #     'headroom_deg':         float,  # safe_edge_deg - abs(current_deg)
+        #     'scale':                float,  # 0.10..1.00, clamped floor
+        #   }
+        self._cart_softening   = None
         self._last_posture_ts = 0.0
         self._last_status_ts  = 0.0
         self._last_disabled_log = 0.0
 
+        # Part 2c program-execution state, updated from publish/ProjectState.
+        # None values mean "no info yet"; a state==0 ProjectState frame
+        # after a run clears line/task/is_step but preserves last_project_id
+        # so the dashboard can still show "just ran <that project>".
+        self._prog_state       = 0        # 0=idle, 2=running (wire values)
+        self._prog_project_id  = None
+        self._prog_task        = None
+        self._prog_line        = None
+        self._prog_is_step     = False
+        self._prog_last_update_ts = 0.0
+        # Stop-watchdog state — Amendment 2 (2026-07-24). Tracks
+        # when we sent the most-recent project/stop AND whether we've
+        # already fired the ONE permitted automatic retry. If the
+        # controller doesn't exit state 2/3 within STOP_RETRY_AFTER_S
+        # of the initial send, the watchdog re-issues project/stop
+        # exactly once and increments retry_count. Cleared as soon as
+        # a state==0 ProjectState frame arrives, or another op resets
+        # the sequence. This is exactly what Force-stop does manually
+        # — automating the first retry is safe because stop is a
+        # decrease-risk verb and idempotent by observation.
+        self._prog_stop_sent_ts    = 0.0
+        self._prog_stop_retry_count = 0
+        # Item 3: raw ProjectState frame dump, gated on the env var
+        # ESTUN_DEBUG_STATE_DUMP. Produces a JSONL artifact usable
+        # for the operator's side-by-side dual-observation session
+        # against the factory UI DevTools capture.
+        self._state_dump_enabled = bool(os.environ.get('ESTUN_DEBUG_STATE_DUMP'))
+        self._state_dump_fh      = None
+        self._state_dump_path    = None
+        # publish/Error dedup — the ~3 Hz reflood collapses to one
+        # event per unique (code, unix_ts) key. See program_ops.ErrorDedup.
+        from estun_driver.program_ops import ErrorDedup
+        self._prog_err_dedup = ErrorDedup()
+        self._prog_last_error = None      # last observed entry or None
+
         # Rejection accounting.
         self._rej_counts = {}
         self._rej_warned = set()
+
+        # Cartesian-jog governor state.
+        self._sing_guard = SingularityGuard()
+        # Self-collision guard — loads capsule YAML at init. If the
+        # YAML is missing or malformed, we WARN and disable the guard
+        # rather than refuse to start the driver.
+        #
+        # 2026-08-06 (operator directive: ENTIRE guard OFF).
+        # The MODEL is always loaded when the YAML is present (so a
+        # runtime re-enable can flip the switch without a restart).
+        # The RUNTIME KILL SWITCH is `_coll_guard_active`, seeded
+        # from `_coll_enabled`. Every guard USE site is gated on
+        # `_coll_guard_active` — when False, no evaluation, no
+        # message, no stop. Default False per the directive.
+        self._coll_model = None
+        self._coll_guard_active = bool(self._coll_enabled)
+        try:
+            from .collision import CollisionModel
+            self._coll_model = CollisionModel(self._coll_yaml_path)
+            self._coll_model.ground_z_mm = (
+                self._ground_z_mm if self._ground_check_enabled else None)
+            self.get_logger().info(
+                f'Self-collision guard MODEL loaded: '
+                f'{len(self._coll_model.capsules)} capsules, '
+                f'{len(self._coll_model.pairs)} pairs from '
+                f'{self._coll_yaml_path}  warn={self._coll_warn_mm:.0f}mm '
+                f'stop={self._coll_stop_mm:.0f}mm  '
+                f'ground_z={self._ground_z_mm:.0f}mm  '
+                f'runtime_active={self._coll_guard_active}')
+        except Exception as e:
+            self.get_logger().warn(
+                f'Self-collision guard model could not load '
+                f'{self._coll_yaml_path}: {e}')
+            self._coll_model = None
+        if not self._coll_guard_active:
+            self.get_logger().warn(
+                'Self-collision guard is DISABLED at startup '
+                f'(source: {self._coll_enabled_source}). '
+                'ALL tiers (40 mm warn, 15 mm hard stop, ground plane) '
+                'are off — nothing in software prevents a link-on-link '
+                'or link-on-table crash. Operator-directed 2026-08-06.')
+        # Latest guard telemetry — dashboard mirror reads these.
+        self._coll_min_pair = None      # tuple (link_a, link_b) or None
+        self._coll_min_dist_mm = None   # float or None
+        self._coll_warning_active = False
+        # Environment (static-zone) subscription. We poll the dashboard's
+        # /api/collision/static_zones endpoint at low rate (they're
+        # static — no need for real-time updates). Zone fetch runs on
+        # its own thread to avoid blocking the ROS executor.
+        self._env_zones_url = 'https://127.0.0.1:8080/api/collision/static_zones'
+        self._env_zone_refresh_s = 30.0
+        self._env_last_refresh_ts = 0.0
+        # Escape-direction cache — published only when an env pair is
+        # within warn distance. list of dicts {joint, direction,
+        # projected_mm, current_mm}, sorted best-first.
+        self._env_escape_dirs = []
+        # Latest env pair specifically (self-collision pair can also
+        # be the overall winner; keep them separate so the popup only
+        # fires on environment collision, not self).
+        self._env_min_pair = None
+        self._env_min_dist_mm = None
+        # Unified guard state (drives the guard popup — covers self,
+        # ground, and env in one blob).
+        self._guard_active = False
+        self._guard_kind   = None       # 'self' | 'ground' | 'env' | None
+        self._guard_pair   = None
+        self._guard_min_dist_mm = None
+        self._guard_escapes = []
+        # Rate-limit for the 13× evaluate() escape probe. 0 == never
+        # computed yet; refresh at ≤2 Hz on the posture callback.
+        self._guard_escapes_ts = 0.0
+        self._guard_warn_effective_mm = self._coll_warn_mm
+        self._guard_stop_effective_mm = self._coll_stop_mm
+        # Mesh-refresh worker (~5 Hz on its own thread). Populates
+        # CollisionModel._mesh_cache so posture / supervise ticks read
+        # mesh-mesh distances from cache instead of paying the 6 ms/
+        # query cost inline. The worker is what keeps the 50 ms
+        # supervise budget under 5 ms even at the J3=122° fold.
+        self._mesh_worker_stop = threading.Event()
+        self._mesh_worker = None
+        if self._coll_model is not None and self._coll_model.mesh_pairs:
+            self._mesh_worker = threading.Thread(
+                target=self._mesh_refresh_loop,
+                name='mesh-refresh', daemon=True)
+            self._mesh_worker.start()
+        # Environment-zone refresher thread.
+        self._env_stop = threading.Event()
+        if self._coll_model is not None:
+            self._env_refresh_thread = threading.Thread(
+                target=self._env_refresh_thread_loop,
+                name='env-zone-refresh', daemon=True)
+            self._env_refresh_thread.start()
+        self._prev_joint_deg = None      # for reactive velocity backstop
+        self._prev_joint_ts  = 0.0
+        # Latest σ_min sample and effective scale — surfaced in status.
+        self._last_sigma_min = None
+        self._last_sing_scale = 1.0
+        # For mid-hold ramp: what did we last actually send on the wire?
+        # (Signed fraction, matching Robot/jog's `speed` field.)
+        self._cart_last_sent_speed = 0.0
+        # Commanded (unscaled) magnitude of the current hold, used as
+        # the ceiling the governor scales down from.
+        self._cart_commanded_frac = 0.0
+
+        # Jog write-path state (only used when both monitor_only=false and
+        # allow_jog=true — otherwise every jog message hits _on_write_reject).
+        # _jog_active: a Robot/jog has been sent and stopJog hasn't been sent yet.
+        # _jog_last_cmd_ts: wall-clock of most recent accepted /robot/jog_command;
+        # the supervise tick compares against this for the freshness deadman.
+        # _jog_last_hb_ts: wall-clock of most recent Robot/jogHeartbeat frame;
+        # supervise tick emits a heartbeat when age ≥ _jog_hb_s.
+        self._jog_lock = threading.Lock()
+        self._jog_active = False
+        self._jog_mode = None            # None | 'velocity' | 'increment' | 'continuous' | 'continuous_cart'
+        self._jog_index = 0
+        self._jog_direction = 0          # ±1 for continuous
+        self._jog_signed_speed = 0.0     # last commanded signed speed for continuous
+        self._jog_last_cmd_ts = 0.0
+        self._jog_last_hb_ts = 0.0
+        self._jog_increment_end_ts = 0.0
+        # 2026-07-31 jog-stop bench instrumentation. Ring of
+        # inter-arrival gap samples (in ms) between successive
+        # refresh frames on the SAME active hold. Populated by
+        # _on_jog_command's refresh branch, published in the
+        # status blob so the bench script can compute a histogram.
+        self._jog_hold_gaps_ms = []
+        self._JOG_GAP_RING_MAX = 400
+        # "Last session" snapshots — filled at every _stop_jog_locked
+        # so the bench script can query the just-ended hold's gap
+        # distribution even after the ring resets.
+        self._jog_last_hold_gaps_ms = []
+        self._jog_last_hold_gaps_summary = None
+        self._jog_increment_delta_deg = 0.0
+        self._jog_supervise_timer = None
+        # ── Session tracking for release-lag fix ────────────────────
+        # Every browser press generates a fresh hold_id and increments a
+        # per-session seq. Driver latches the current session's id and
+        # highest seq processed. Any refresh with:
+        #   - hold_id != _jog_active_hold_id  → stale (session was
+        #     released; queued straggler cannot restart motion)
+        #   - seq <= _jog_last_seq             → stale (out-of-order or
+        #     duplicate)
+        # ...is discarded silently and does NOT extend _jog_last_cmd_ts.
+        # On stop, _jog_active_hold_id is cleared so the entire finished
+        # session is dead — even if the very next message on the wire
+        # is another refresh from that session.
+        self._jog_active_hold_id = None
+        self._jog_last_seq = 0
+        # Latched on _stop_jog_locked so a straggler refresh with the
+        # SAME hold_id (which was still in flight when release fired)
+        # cannot resurrect the session on the "session inactive" code
+        # path. Cleared only when a NEW hold_id starts a session.
+        self._jog_released_hold_id = None
+        # Precise one-shot for increment expiry — the primary stop
+        # mechanism. threading.Timer schedules a real wall-clock fire in
+        # its own thread, so the increment stop is not coupled to the
+        # 50 ms supervise polling cadence. Supervise still runs as a
+        # safety backstop (freshness deadman + heartbeats).
+        self._jog_increment_stop_timer = None
 
         # ── WS raw log ─────────────────────────────────────────
         self._ws_log_path = None
@@ -165,28 +1077,203 @@ class EstunCodroidDriver(Node):
         self._pub_status      = self.create_publisher(String, '/estun/status', 10)
         self._pub_mode        = self.create_publisher(String, '/estun/mode', 10)
         self._pub_rejected    = self.create_publisher(String, '/estun/rejected', 10)
+        # Mode-switch result stream (2026-08-28). The dashboard's
+        # /api/estun/mode endpoint sends a request on /estun/mode_command
+        # and waits for a matching envelope here — {op, requested,
+        # observed, ok, reason?, ts}. Latched shape: one publish per
+        # completed attempt (success OR failure); the observer polls
+        # STATE mirror + this stream. Depth 8 so a burst of mode
+        # toggles never drops the tail.
+        self._pub_mode_status = self.create_publisher(String, '/estun/mode_status', 8)
+        # Part 2c program-execution status. Updated from publish/ProjectState
+        # frames (state, project id, current task, current line, isStep)
+        # and from publish/Error transitions (new fault, cleared) after
+        # dedup by (code, unix_ts) — see program_ops.ErrorDedup.
+        self._pub_program     = self.create_publisher(String, '/estun/program_status', 10)
+        # I/O bridge — live merged (info + values) snapshot. Dashboard
+        # subscribes here and re-exposes over /api/io/live.
+        self._pub_io          = self.create_publisher(String, '/estun/io', 10)
 
-        # ── Subscribers — writes are refused in monitor_only ───
-        self.create_subscription(String, '/estun/command',      self._on_write, 10)
-        self.create_subscription(String, '/estun/move',         self._on_write, 10)
-        self.create_subscription(String, '/estun/jog',          self._on_write, 10)
-        self.create_subscription(String, '/estun/io',           self._on_write, 10)
-        self.create_subscription(String, '/robot/jog_command',  self._on_write, 10)
-        self.create_subscription(String, '/robot/io_command',   self._on_write, 10)
+        # ── Subscribers ────────────────────────────────────────
+        # /robot/jog_command has a real handler that emits Robot/jog when
+        # both gates (monitor_only=false AND allow_jog=true) are open;
+        # otherwise it rejects like the others. Every remaining write
+        # topic stays hard-rejected on this build.
+        self.create_subscription(String, '/estun/command',      self._on_write_reject, 10)
+        self.create_subscription(String, '/estun/move',         self._on_write_reject, 10)
+        self.create_subscription(String, '/estun/jog',          self._on_write_reject, 10)
+        # I/O bridge — writes go through /robot/io_set (below); the old
+        # /estun/io broadcast slot has been repurposed as an OUTPUT
+        # publisher, so incoming subscriber duty here belongs to
+        # /robot/io_set (SetIOForcedFlag). Nothing legit should still
+        # publish TO /estun/io — leave a reject listener so a stray
+        # writer surfaces on /estun/rejected.
+        self.create_subscription(String, '/estun/io',           self._on_write_reject, 10)
+        # QoS: best-effort KEEP_LAST with a small buffer. Depth 5 is
+        # enough to ride out ~500 ms of executor jitter (5× 100 ms
+        # publish period) without dropping a run of refreshes that
+        # would starve the 300 ms freshness deadman. Best-effort so
+        # the publisher can't block on a slow subscriber, and
+        # KEEP_LAST so the oldest refresh drops on overflow — the
+        # latest state is always the right state. Combined with the
+        # hold_id / seq guards below, a queued straggler still can't
+        # restart a released session.
+        _jog_qos = QoSProfile(
+            depth=5,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(String, '/robot/jog_command',  self._on_jog_command,  _jog_qos)
+        # Legacy /robot/io_command — the pre-bridge write topic; still
+        # rejected because it never carried the right shape. New writes
+        # go through /robot/io_set (allow_io-gated), which sends
+        # IOManager/SetIOForcedFlag.
+        self.create_subscription(String, '/robot/io_command',   self._on_write_reject, 10)
+        self.create_subscription(String, '/robot/io_set',       self._on_io_set,       5)
+        # Power transitions — one-shot commands (enable/disable/clear_alarm).
+        # Reliable QoS, small depth: these are single infrequent user gestures,
+        # not the ephemeral refresh stream that jog is.
+        self.create_subscription(String, '/robot/power_command', self._on_power_command, 5)
+
+        # Program execution — save (HTTP) + run/stop/pause/... (WS).
+        # Gate = monitor_only=false AND allow_move=true.
+        # Queue depth 16: /api/estun/program/run publishes a 6-op burst
+        # (save → to_auto → set_auto_rate → set_breakpoint →
+        # clear_start_line → project/run) and `save` itself blocks the
+        # executor thread for up to ~12s (four HTTP POSTs at 3s each),
+        # so the queue must hold the whole tail without any risk of
+        # KEEP_LAST dropping the head. Depth 5 was too tight — grew to
+        # 16 to match the dashboard publisher.
+        self.create_subscription(String, '/estun/program', self._on_program_command, 16)
+
+        # Mode-switch command channel (2026-08-28). Own gate
+        # (allow_mode / ESTUN_ALLOW_MODE), own topic — the operator
+        # can enable mode switching without also opening program-
+        # writes. Payload: JSON {op: "to_auto"|"to_manual"|"to_remote",
+        # req_id?}. See `_on_mode_command` for the read-back verify
+        # loop.
+        self.create_subscription(
+            String, '/estun/mode_command', self._on_mode_command, 8)
+
+        # 2026-08-06 (operator directive): runtime kill switch for the
+        # entire self-collision + ground-plane capsule guard. When
+        # False, every guard call site is a no-op. Boot state comes
+        # from the `collision_enabled` parameter (default False per
+        # the same directive); this topic lets the operator toggle
+        # without a driver restart. Payload is a plain std_msgs/Bool.
+        self.create_subscription(
+            Bool, '/robot/collision_guard_set',
+            self._on_collision_guard_set, 5)
 
         # ── Timers ─────────────────────────────────────────────
         self._mode_timer    = self.create_timer(1.0, self._publish_mode)
-        self._connect_timer = self.create_timer(self._reconn_backoff, self._try_connect)
+        # Stop-watchdog — polls the auto-retry state machine at 2 Hz.
+        # See _on_stop_watchdog. Runs unconditionally; the tick is a
+        # cheap early-out when no stop is pending.
+        self._stop_watchdog_timer = self.create_timer(0.5, self._on_stop_watchdog)
+        # Connection lifecycle tick — polls the state machine at 2 Hz
+        # to decide whether to attempt a connect, send a probe, or
+        # promote to the full subscribe burst. Cheap enough to run
+        # constantly; the SM does the actual gating (backoff / grace /
+        # cooldown).
+        self._connect_timer = self.create_timer(0.5, self._conn_tick)
+        # I/O bridge poll — fires GetIOValue every _io_poll_s and
+        # GetIOInfo every _io_info_poll_s. Both are cheap on the
+        # controller (matches factory-UI cadence). Skipped when the
+        # SM isn't READY. See _io_poll.
+        self._io_last_info_ts = 0.0
+        # merged snapshot: {DI:{port -> {name, defaultName, forced, function, value}},
+        #                   DO:..., AI:..., AO:...}
+        self._io_snapshot = {'DI': {}, 'DO': {}, 'AI': {}, 'AO': {}}
+        self._io_last_publish_ts = 0.0
+        self._io_pending_writes = {}  # nonce -> {port, value, type} (for ack log)
+        self._io_timer = self.create_timer(self._io_poll_s, self._io_poll)
 
         self.get_logger().info(
             f'Estun v2.3 driver initialized — '
             f'target ws://{self._robot_ip}:{self._robot_port}  '
             f'origin=http://{self._robot_ip}:{self._ui_origin_port}  '
             f'(ip source: {self._ip_source})')
+        # Announce the operator speed cap loudly at startup — this is
+        # the single-source policy ceiling that every AUTO/program
+        # write path clamps against (jog uses the tighter
+        # effective_speed_cap). Surfaces in /estun/status.op_cap and
+        # the dashboard's System Check Safety row detail.
+        _op_cap_pct = int(round(self._operator_speed_limit * 100))
+        _jog_cap_pct = int(round(self._jog_speed_cap * 100))
+        _eff_cap_pct = int(round(self._effective_speed_cap * 100))
+        self.get_logger().info(
+            f'SPEED CAP: operator_speed_limit={_op_cap_pct}% '
+            f'(policy ceiling for AUTO/program) · '
+            f'jog_speed_cap={_jog_cap_pct}% (jog hardware ceiling) · '
+            f'effective_speed_cap={_eff_cap_pct}% (jog effective) · '
+            f'high_speed_confirm_threshold={self._high_speed_confirm_threshold_pct}%')
         if self._monitor_only:
             self.get_logger().warn(
                 'MONITOR-ONLY mode — all inbound motion/IO/command writes '
                 'are rejected. This is a read-only telemetry mirror.')
+        elif self._allow_jog:
+            cart_note = (f'CARTESIAN ALSO ENABLED (source: {self._allow_cart_source})'
+                         if self._allow_cartesian_jog
+                         else 'Cartesian gate STILL CLOSED — set ESTUN_ALLOW_CARTESIAN=1 to open')
+            self.get_logger().warn(
+                f'JOG WRITE PATH ENABLED — monitor_only=false, '
+                f'allow_jog=true (source: {self._allow_jog_source}). '
+                f'{cart_note}. '
+                f'/robot/jog_command will emit Robot/jog frames '
+                f'(|speed|≤{self._jog_speed_cap:.2f}, heartbeat={self._jog_hb_s:.2f}s, '
+                f'deadman={self._jog_freshness_s:.2f}s). All other write '
+                f'paths still rejected.')
+        else:
+            self.get_logger().warn(
+                'monitor_only=false but allow_jog=false — jog path still '
+                'gated; set ESTUN_ALLOW_JOG=1 or allow_jog:true in YAML to open it.')
+        if self._monitor_only:
+            pass  # already covered by the monitor_only warn above
+        elif self._allow_power:
+            self.get_logger().warn(
+                f'POWER WRITE PATH ENABLED — enable/disable/clear_alarm on '
+                f'/robot/power_command will emit Robot/switchOn, Robot/switchOff, '
+                f'and System/ClearError (source: {self._allow_power_source}). '
+                f'No code path auto-enables — every enable requires an explicit '
+                f'operator command.')
+        else:
+            self.get_logger().warn(
+                'monitor_only=false but allow_power=false — power write path '
+                'still gated; set ESTUN_ALLOW_POWER=1 or allow_power:true in YAML.')
+        if self._monitor_only:
+            pass
+        elif self._allow_move:
+            self.get_logger().warn(
+                f'MOVE WRITE PATH ENABLED — monitor_only=false, '
+                f'allow_move=true (source: {self._allow_move_source}). '
+                f'/estun/program will emit project/* + Robot/toAuto|toManual '
+                f'+ Robot/setManualMoveRate + System/ClearError and HTTP-save '
+                f'to :{self._ui_origin_port}. SOURCE-ONLY verbs (stop/pause/'
+                f'resume/runStep/clearBreakpoint/setAutoMoveRate) are '
+                f'behind-shape-not-behavior — see PART_2C_ARCHITECTURE.md §5.')
+        else:
+            self.get_logger().warn(
+                'monitor_only=false but allow_move=false — program write '
+                'path still gated; set ESTUN_ALLOW_MOVE=1 or allow_move:true '
+                'in YAML.')
+        if self._monitor_only:
+            pass
+        elif self._allow_io:
+            self.get_logger().warn(
+                f'I/O WRITE PATH ENABLED — /robot/io_set will emit '
+                f'IOManager/SetIOForcedFlag frames (source: '
+                f'{self._allow_io_source}). DO toggles drive outputs '
+                f'directly; DI forces are the expert path.')
+        else:
+            self.get_logger().warn(
+                'monitor_only=false but allow_io=false — I/O write path '
+                'still gated; set ESTUN_ALLOW_IO=1 or allow_io:true in YAML.')
+        self.get_logger().info(
+            f'I/O bridge: polling GetIOValue every {self._io_poll_s:.1f}s, '
+            f'GetIOInfo every {self._io_info_poll_s:.1f}s; publishing merged '
+            f'snapshot on /estun/io (allow_io={self._allow_io}).')
         self._publish_mode()
 
     # ── WS raw log ────────────────────────────────────────
@@ -244,21 +1331,2495 @@ class EstunCodroidDriver(Node):
         m = String(); m.data = json.dumps(evt)
         self._pub_rejected.publish(m)
 
-    def _on_write(self, msg):
-        # Every subscription in this driver is a write path.
+    def _on_write_reject(self, msg):
+        # Catch-all reject for every write topic OTHER than /robot/jog_command
+        # and /robot/power_command (each has its own handler). monitor_only
+        # closes the outer gate; no other write paths are implemented on
+        # this branch regardless.
         family = 'write'
         if self._monitor_only:
             self._reject(family, 'monitor_only active',
                          extra={'payload': msg.data[:200]})
             return
-        # Non-monitor path is intentionally not implemented in this build;
-        # motion command paths must be re-added deliberately behind an
-        # explicit safety review before this branch is taken.
-        self._reject(family, 'write paths disabled in v2.3 telemetry mirror')
+        self._reject(family, 'non-jog/power write paths not implemented on this branch')
+
+    # ── Power write path (enable / disable / clear_alarm) ──────────────
+
+    # Captured verbs (single-arm S10-140; see PHASE 0 report):
+    #   enable       →  {"ty": "Robot/switchOn"}
+    #   disable      →  {"ty": "Robot/switchOff"}
+    #   clear_alarm  →  {"ty": "System/ClearError"}
+    # These are the "isarm==false" branches from useMultiarmWs — the
+    # multi-arm shapes ({ty:"RobotCommand/..."} with a db array) do not
+    # apply to this controller.
+    _POWER_FRAMES = {
+        'enable':      {'ty': 'Robot/switchOn'},
+        'disable':     {'ty': 'Robot/switchOff'},
+        'clear_alarm': {'ty': 'System/ClearError'},
+    }
+
+    def _on_power_command(self, msg):
+        """Incoming /robot/power_command JSON: {"action": "enable" | "disable" |
+        "clear_alarm"}.  Each is a one-shot with a fresh nonce.
+
+        Gate matrix (monitor_only is the outer master gate on everything):
+          - enable       : monitor_only=false AND allow_power=true
+          - disable      : monitor_only=false AND allow_power=true
+          - clear_alarm  : monitor_only=false AND allow_power=true
+        Safing (disable, clear_alarm) is intentionally NOT additionally
+        gated by allow_jog — an operator with jog closed but power open
+        must still be able to bring an unexpectedly-enabled arm down and
+        clear an alarm. Enable is the one command with no fallback path.
+
+        Safety invariants (see module docstring):
+          1. This function is the ONLY place that sends Robot/switchOn.
+             No retry, no auto-enable-on-startup, no auto-enable-on-reconnect.
+          2. Disable/clear_alarm reach the wire under the same gate;
+             they are never rejected on jog-gate state.
+          3. If a jog is active when disable arrives, stopJog first,
+             then Robot/switchOff.
+        """
+        family = 'power'
+        if self._monitor_only:
+            self._reject(family, 'monitor_only active',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._allow_power:
+            self._reject(family, 'allow_power gate closed',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._connected:
+            self._reject(family, 'ws not connected',
+                         extra={'reason_code': 'transport_down'})
+            return
+        if self._conn_sm.state != self._conn_sm.READY:
+            # Writes during INITIALIZING can hit the same joint-vector
+            # crash path we're avoiding with the deferred subscribe.
+            self._reject(family, f'controller {self._conn_sm.state} — writes gated until READY',
+                         extra={'reason_code': 'controller_not_ready'})
+            return
+
+        try:
+            d = json.loads(msg.data)
+        except Exception as e:
+            self._reject(family, f'invalid JSON: {e}')
+            return
+
+        action = str(d.get('action', '')).lower()
+        frame_tmpl = self._POWER_FRAMES.get(action)
+        if frame_tmpl is None:
+            self._reject(family, f'unknown action {action!r} '
+                                 f'(expected enable/disable/clear_alarm)')
+            return
+
+        # Invariant #3: safe motion before the disable frame reaches
+        # the wire. stopJog is idempotent (no-op if no jog active).
+        if action == 'disable':
+            self._stop_jog(reason='disable command')
+
+        frame = dict(frame_tmpl)
+        frame['id'] = self._new_nonce()
+        try:
+            if not self._send(frame):
+                self._reject(family, 'send returned False',
+                             extra={'action': action})
+                return
+        except Exception as e:
+            self.get_logger().warn(f'Robot/{action} send failed: {e}')
+            self._reject(family, f'send raised: {e}', extra={'action': action})
+            return
+        self.get_logger().info(
+            f'power {action}: {frame["ty"]} sent (id={frame["id"]}) — '
+            f'state before={self._state_code}({self._state_name!r})')
+
+    # ── Program write path (Part 2c, B1) ───────────────────────
+    #
+    # /estun/program accepts a JSON envelope { "op": "<verb>", ... }.
+    # The gate is monitor_only=false AND allow_move=true (checked FIRST,
+    # before any argument parsing, so a gate-closed run publishes
+    # rejections without touching the wire). See PART_2C_ARCHITECTURE.md
+    # for the full verb catalog and the SOURCE-ONLY status of the
+    # stop/pause/resume/runStep/clearBreakpoint family.
+    #
+    # Verbs whose shape / behavior is confirmed from the HAR are marked
+    # CAPTURED. Verbs mined from assets_entry_as-D2dla8D6.js only are
+    # marked SOURCE-ONLY — their shape matches the confirmed no-db
+    # family but behavior needs live wire proof (see the validation
+    # ladder in PART_2C_ARCHITECTURE.md §5).
+    #
+    # HTTP save (op="save") uses program_ops.save_project — POST to
+    # /api/robotcode/ (Lua source) + /api/robotjson/... (varspoint,
+    # project.json, projectlist). Response codes surface via the
+    # rejection channel on failure.
+
+    def _writes_allowed_for_move(self):
+        return (not self._monitor_only) and self._allow_move
+
+    def _ws_verb(self, ty, db=None):
+        """Send a single ty[/db] envelope, id-tagged. Returns True on
+        wire success (which does NOT mean the controller accepted —
+        only that the frame reached the socket). Rejection surfaces
+        through the family-typed logger + /estun/rejected on the
+        CALLER'S side."""
+        frame = {'ty': ty}
+        if db is not None:
+            frame['db'] = db
+        frame['id'] = self._new_nonce()
+        return self._send(frame)
+
+    def _on_program_command(self, msg):
+        """Program-family command dispatcher. One family per op so
+        rejections stay attributable in /estun/rejected.
+
+        Op catalog (see PART_2C_ARCHITECTURE.md for shape references):
+          save          — HTTP: Lua source + varspoint + project.json + projectlist
+          run           — WS   {ty:"project/run",         db:{id,task}}    (CAPTURED)
+          runStep       — WS   {ty:"project/runStep",     db:{id,task}}    (SOURCE-ONLY)
+          stop          — WS   {ty:"project/stop"}                          (SOURCE-ONLY)
+          pause         — WS   {ty:"project/pause"}                         (SOURCE-ONLY)
+          resume        — WS   {ty:"project/resume"}                        (SOURCE-ONLY)
+          set_start_line   — WS {ty:"project/setStartLine",  db:<int line>} (CAPTURED)
+          clear_start_line — WS {ty:"project/clearStartLine"}               (CAPTURED)
+          set_breakpoint   — WS {ty:"project/setBreakpoint", db:{task:[…]}} (CAPTURED)
+          clear_breakpoint — WS {ty:"project/clearBreakpoint"}              (SOURCE-ONLY)
+          to_auto       — WS   {ty:"Robot/toAuto"}                          (CAPTURED)
+          to_manual     — WS   {ty:"Robot/toManual"}                        (CAPTURED)
+          set_move_rate — WS   {ty:"Robot/setManualMoveRate", db:<int %>}   (CAPTURED)
+          set_auto_rate — WS   {ty:"Robot/setAutoMoveRate",   db:<int %>}   (SOURCE-ONLY)
+          clear_error   — WS   {ty:"System/ClearError"}                     (CAPTURED)
+
+        Every op above requires monitor_only=false AND allow_move=true.
+        (clear_error is available separately on /robot/power_command as
+        'clear_alarm', which is gated on allow_power — that path stays
+        for the jog/power UI and is unchanged.)
+        """
+        family = 'program'
+        # ─ Gate: the FIRST check, before we touch the payload. This
+        #   is what makes the gate-closed proof airtight — a rejected
+        #   op never emits a wire frame.
+        if self._monitor_only:
+            self._reject(family, 'monitor_only active',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._allow_move:
+            self._reject(family, 'allow_move gate closed',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._connected:
+            # reason_code (2026-08-04): the dashboard's push endpoint
+            # keys on 'transport_down' to map the refusal to the
+            # operator message "Controller link down — program NOT
+            # loaded" instead of the generic "save rejected". The
+            # WS gate itself is unchanged (safety-correct: refuse
+            # program ops when we cannot see controller state);
+            # this only makes the refusal machine-readable.
+            self._reject(family, 'ws not connected',
+                         extra={'payload': msg.data[:200],
+                                'reason_code': 'transport_down'})
+            return
+        if self._conn_sm.state != self._conn_sm.READY:
+            self._reject(family, f'controller {self._conn_sm.state} — writes gated until READY',
+                         extra={'payload': msg.data[:200],
+                                'reason_code': 'controller_not_ready'})
+            return
+
+        try:
+            d = json.loads(msg.data)
+        except Exception as e:
+            self._reject(family, f'invalid JSON: {e}')
+            return
+
+        op = str(d.get('op', '')).lower()
+        try:
+            handler = _PROGRAM_OP_HANDLERS.get(op)
+            if handler is None:
+                self._reject(family, f'unknown op {op!r}')
+                return
+            handler(self, d)
+        except Exception as e:
+            self.get_logger().warn(f'program op {op!r} failed: {e}')
+            self._reject(family, f'op {op!r} raised: {e}')
+
+    # ── /estun/program op handlers ─────────────────────────────
+    #
+    # Each handler enforces its own argument shape but assumes the
+    # gate check in _on_program_command has already succeeded — do
+    # NOT call these directly from any other path.
+
+    def _op_save(self, d):
+        """HTTP save. Required fields:
+          program_id, task_id, name, task_name,
+          points: {name: {joint:[6 floats]}}  (POSTed as varspoint)
+          lua_source: <str>
+
+        The caller (usually a codegen script or the dashboard) supplies
+        the FINAL Lua text and points dict; this handler just POSTs
+        them. Codegen lives in program_ops.codegen_lua_from_program
+        so a caller can produce these fields from a taught-program IR
+        without duplicating logic here.
+        """
+        from estun_driver import program_ops
+        required = ('program_id', 'task_id', 'lua_source', 'points')
+        for k in required:
+            if d.get(k) is None:
+                self._reject('program', f'save: missing {k!r}')
+                return
+        try:
+            steps = program_ops.save_project(
+                self._robot_ip, self._ui_origin_port,
+                project_id=str(d['program_id']),
+                task_id=str(d['task_id']),
+                project_display=str(d.get('name', d['program_id'])),
+                task_display=str(d.get('task_name', d['task_id'])),
+                lua_source=str(d['lua_source']),
+                varspoint=dict(d['points']),
+            )
+        except Exception as e:
+            self._reject('program', f'save: HTTP failed: {e}')
+            return
+        # Emit a status frame so the dashboard/test scripts see the
+        # exact per-step response chain. Uses a compact schema.
+        m = String()
+        m.data = json.dumps({
+            'event': 'save',
+            'project_id': d['program_id'],
+            'task_id': d['task_id'],
+            'steps': steps,
+            'ts': time.time(),
+        }, separators=(',', ':'))
+        self._pub_program.publish(m)
+        self.get_logger().info(
+            f'program save: {d["program_id"]}/{d["task_id"]} — '
+            f'{len(steps)} HTTP calls, '
+            f'{sum(1 for s in steps if s.get("http_status")==200)} 200-OK')
+
+    def _op_run(self, d):
+        pid = str(d.get('program_id', ''))
+        tid = str(d.get('task_id', ''))
+        if not pid or not tid:
+            self._reject('program', 'run: missing program_id/task_id')
+            return
+        ok = self._ws_verb('project/run', {'id': pid, 'task': tid})
+        self.get_logger().info(f'project/run sent pid={pid!r} tid={tid!r} ok={ok}')
+
+    def _op_runstep(self, d):
+        # runStep has TWO wire shapes with distinct semantics, mined
+        # from the factory UI bundle:
+        #
+        #   1. Initial step (from idle, with program_id + task_id supplied):
+        #        {ty:"project/runStep", db:{id:<prid>, task:<tkid>}}
+        #      Called from the run popup "Step" button (JS: runSubmit(2)
+        #      → runStep(1)). Enters step mode.
+        #
+        #   2. Advance step (from paused-in-step, no program_id supplied):
+        #        {ty:"project/runStep", id:"1"}   (no db)
+        #      Called from the RunBar "Step" button while isStep=true
+        #      (JS: runStep(0)). Advances one step through the paused
+        #      program.
+        #
+        # We differentiate by presence of program_id in the /estun/program
+        # payload so callers can express both without a new op name.
+        pid = str(d.get('program_id', '')) if d.get('program_id') else ''
+        tid = str(d.get('task_id', '')) if d.get('task_id') else ''
+        if pid and tid:
+            # Initial: full envelope.
+            ok = self._ws_verb('project/runStep', {'id': pid, 'task': tid})
+            self.get_logger().info(
+                f'project/runStep(initial) db={{id:{pid!r},task:{tid!r}}} ok={ok}')
+        else:
+            # Advance: no db, id="1" (matches the wsSend variant used by
+            # the RunBar step button — the id="1" is a literal from the
+            # JS bundle, not our nonce).
+            frame = {'ty': 'project/runStep', 'id': '1'}
+            ok = self._send(frame)
+            self.get_logger().info(
+                f'project/runStep(advance) no-db ok={ok}')
+
+    def _op_stop(self, _d):
+        # SOURCE-ONLY. This is the verb that stops an autonomously-
+        # running program without touching motor power. Behavior
+        # validation is the FIRST live test in the Part 2c ladder
+        # (PART_2C_ARCHITECTURE.md §5).
+        ok = self._ws_verb('project/stop')
+        # Prime the stop watchdog: mark when we sent this stop, and
+        # reset the retry counter to 0 (a fresh manual stop resets
+        # any prior auto-retry sequence). The 0.5-Hz watchdog polls
+        # _on_stop_watchdog and re-issues the verb exactly once if
+        # the controller doesn't exit state 2/3 within
+        # STOP_RETRY_AFTER_S.
+        self._prog_stop_sent_ts     = time.time()
+        self._prog_stop_retry_count = 0
+        self.get_logger().info(f'project/stop sent (SOURCE-ONLY) ok={ok}')
+
+    # Grace period after the ORIGINAL stop send before the watchdog
+    # auto-retries. Chosen to match the client-side wedge banner's
+    # 3 s threshold: if the operator's screen would say "wedged", the
+    # driver's already firing the retry that might resolve it.
+    STOP_RETRY_AFTER_S = 3.0
+
+    def _on_stop_watchdog(self):
+        """0.5-Hz tick. Owns the state machine for the automatic
+        project/stop retry:
+            state==0                → clear (stop landed)
+            elapsed<threshold OR
+              retry_count>=1        → no-op
+            elapsed>=threshold AND
+              retry_count==0        → re-issue project/stop ONCE,
+                                      log with full context, publish
+                                      an event so the client can
+                                      update banner copy
+        Only fires when a stop is actually pending (_prog_stop_sent_ts
+        != 0.0). Safe to call unconditionally."""
+        if self._prog_stop_sent_ts == 0.0:
+            return
+        # Stop confirmed by a state==0 push: clear the pending sequence.
+        if self._prog_state == 0:
+            if self._prog_stop_retry_count > 0:
+                self.get_logger().info(
+                    f'project/stop completed after '
+                    f'{self._prog_stop_retry_count} auto-retry(ies) '
+                    f'— push frame(s) may have been late/lost')
+            self._prog_stop_sent_ts = 0.0
+            self._prog_stop_retry_count = 0
+            return
+        elapsed = time.time() - self._prog_stop_sent_ts
+        if elapsed < self.STOP_RETRY_AFTER_S:
+            return
+        if self._prog_stop_retry_count >= 1:
+            # Already fired the one permitted retry. Do NOT loop —
+            # escalation is now the operator's Force-stop UI, which
+            # the client's wedge banner already surfaces. Nothing to
+            # do here except stay quiet and keep evidence.
+            return
+        # Fire the one permitted auto-retry. Update the send timestamp
+        # so a NEW threshold applies for the eventual banner
+        # transition ("stop sent twice, controller not confirming").
+        ok = self._ws_verb('project/stop')
+        self._prog_stop_retry_count += 1
+        self._prog_stop_sent_ts = time.time()
+        self.get_logger().warn(
+            f'project/stop RE-ISSUED (auto-retry '
+            f'{self._prog_stop_retry_count}/1) — controller has not '
+            f'exited state {self._prog_state} in {elapsed:.1f}s. '
+            f'ok={ok} project={self._prog_project_id!r} '
+            f'task={self._prog_task!r} line={self._prog_line}')
+        # Publish so the dashboard's wedge banner can honestly say
+        # "stop sent twice, controller not confirming" after this
+        # retry also fails to elicit a state==0 within the threshold.
+        self._publish_program_status(source='auto_retry_stop')
+
+    def _op_pause(self, _d):
+        # SOURCE-ONLY.
+        ok = self._ws_verb('project/pause')
+        self.get_logger().info(f'project/pause sent (SOURCE-ONLY) ok={ok}')
+
+    def _op_resume(self, _d):
+        # SOURCE-ONLY.
+        ok = self._ws_verb('project/resume')
+        self.get_logger().info(f'project/resume sent (SOURCE-ONLY) ok={ok}')
+
+    def _op_set_start_line(self, d):
+        try:
+            line = int(d.get('line', 1))
+        except (TypeError, ValueError):
+            self._reject('program', 'set_start_line: invalid line')
+            return
+        ok = self._ws_verb('project/setStartLine', line)
+        self.get_logger().info(f'project/setStartLine db={line} ok={ok}')
+
+    def _op_clear_start_line(self, _d):
+        ok = self._ws_verb('project/clearStartLine')
+        self.get_logger().info(f'project/clearStartLine ok={ok}')
+
+    def _op_set_breakpoint(self, d):
+        task = d.get('task_id') or d.get('task')
+        lines = d.get('lines') or []
+        if not task:
+            self._reject('program', 'set_breakpoint: missing task_id')
+            return
+        db = {str(task): list(lines)}
+        ok = self._ws_verb('project/setBreakpoint', db)
+        self.get_logger().info(f'project/setBreakpoint db={db} ok={ok}')
+
+    def _op_clear_breakpoint(self, _d):
+        # SOURCE-ONLY. (An alternative would be to send
+        # project/setBreakpoint with db={task:[]} — captured behavior
+        # — but this dedicated verb from the JS bundle is a cleaner
+        # global clear.)
+        ok = self._ws_verb('project/clearBreakpoint')
+        self.get_logger().info(f'project/clearBreakpoint sent (SOURCE-ONLY) ok={ok}')
+
+    def _op_to_auto(self, _d):
+        ok = self._ws_verb('Robot/toAuto')
+        self.get_logger().info(f'Robot/toAuto ok={ok}')
+
+    def _op_to_manual(self, _d):
+        ok = self._ws_verb('Robot/toManual')
+        self.get_logger().info(f'Robot/toManual ok={ok}')
+
+    # ── Mode-switch subscriber (2026-08-28 feature) ─────────────
+    # Numeric mode code per L298: publish/RobotStatus.mode is
+    # ground truth (0=AUTO, 1=MANUAL, 2=REMOTE). We publish the
+    # verb, then poll self._robot_mode_code up to 3 s for it to
+    # equal the target — that's a "switch". Anything else (still
+    # unknown, still on the previous mode) is a failure with a
+    # named reason on /estun/mode_status.
+
+    _MODE_CODE_FOR_OP = {
+        'to_auto':   0,
+        'to_manual': 1,
+        'to_remote': 2,
+    }
+    _MODE_VERB_FOR_OP = {
+        'to_auto':   'Robot/toAuto',
+        'to_manual': 'Robot/toManual',
+        'to_remote': 'Robot/toRemote',
+    }
+
+    def _publish_mode_status(self, envelope: dict) -> None:
+        try:
+            m = String()
+            m.data = json.dumps(envelope, separators=(',', ':'))
+            self._pub_mode_status.publish(m)
+        except Exception as e:
+            self.get_logger().warn(f'mode_status publish failed: {e}')
+
+    def _on_mode_command(self, msg):
+        """Handle a mode-switch request from the dashboard.
+
+        Gate order (identical to _on_program_command):
+        monitor_only → allow_mode → connected → ready. Read-back
+        via robot_mode_code AFTER the verb; failure is loud on
+        /estun/mode_status with a reason string the dashboard can
+        map to a named refusal.
+        """
+        # Envelope shape shared with the dashboard's endpoint. req_id
+        # rides through so a busy caller can correlate.
+        try:
+            d = json.loads(msg.data)
+        except Exception as e:
+            self._publish_mode_status({
+                'ok': False, 'reason': f'invalid JSON: {e}',
+                'ts': time.time()})
+            return
+        op     = str(d.get('op') or '').strip()
+        req_id = d.get('req_id')
+        target_code = self._MODE_CODE_FOR_OP.get(op)
+        verb        = self._MODE_VERB_FOR_OP.get(op)
+        if target_code is None or verb is None:
+            self._publish_mode_status({
+                'ok': False, 'op': op,
+                'reason': (f'unknown mode op {op!r}; expected one of '
+                           f'{sorted(self._MODE_CODE_FOR_OP.keys())}'),
+                'req_id': req_id, 'ts': time.time()})
+            return
+
+        family = 'mode'
+        if self._monitor_only:
+            self._publish_mode_status({
+                'ok': False, 'op': op,
+                'reason': 'monitor_only active',
+                'req_id': req_id, 'ts': time.time()})
+            self._reject(family, 'monitor_only active',
+                         extra={'op': op})
+            return
+        if not self._allow_mode:
+            self._publish_mode_status({
+                'ok': False, 'op': op,
+                'reason': 'allow_mode gate closed',
+                'reason_code': 'allow_mode_gate_closed',
+                'req_id': req_id, 'ts': time.time()})
+            self._reject(family, 'allow_mode gate closed',
+                         extra={'op': op})
+            return
+        if not self._connected:
+            self._publish_mode_status({
+                'ok': False, 'op': op,
+                'reason': 'ws not connected',
+                'reason_code': 'transport_down',
+                'req_id': req_id, 'ts': time.time()})
+            return
+        if self._conn_sm.state != self._conn_sm.READY:
+            self._publish_mode_status({
+                'ok': False, 'op': op,
+                'reason': (f'controller {self._conn_sm.state} — mode '
+                           'switch gated until READY'),
+                'reason_code': 'controller_not_ready',
+                'req_id': req_id, 'ts': time.time()})
+            return
+
+        # Short-circuit: already in target mode. Still emit an OK
+        # envelope so the dashboard's wait loop returns cleanly.
+        already = self._robot_mode_code
+        if already == target_code:
+            self._publish_mode_status({
+                'ok': True, 'op': op, 'requested': target_code,
+                'observed': already, 'no_change': True,
+                'req_id': req_id, 'ts': time.time()})
+            return
+
+        # Enable-interlock (2026-08-28, session-correlated). The
+        # controller silently refuses toAuto/toManual/toRemote while
+        # the arm is enabled: the WS verb ack returns ok=True but
+        # publish/RobotStatus.mode never transitions. Rather than let
+        # the read-back time out (3 s of wasted wall-clock), pre-check
+        # `_enabled` and refuse LOUDLY with a reason_code the dashboard
+        # can key off to orchestrate the disable → switch → re-enable
+        # sequence behind a single operator confirm. See HARDWARE.md
+        # > Robot-mode code table and FACTS.md for the map + rule.
+        if self._enabled:
+            self._publish_mode_status({
+                'ok': False, 'op': op, 'requested': target_code,
+                'observed': already,
+                'reason': ('mode switch refused: arm is enabled — '
+                           'controller silently refuses toAuto/toManual/'
+                           'toRemote while state=2. Disable first, then '
+                           'switch, then re-enable.'),
+                'reason_code': 'arm_enabled_interlock',
+                'req_id': req_id, 'ts': time.time()})
+            return
+
+        # Software-mode-switch via bound DIs (2026-08-31 add-54).
+        # When ESTUN_MODE_VIA_DI=1 and the op has a bound-DI
+        # mapping, pulse the DI instead of firing the WS verb.
+        # Bypasses the DI16 hardware modeSwitch gate — the operator
+        # bound spare DIs (DI6/DI7 by default) to the "Switch to
+        # Auto Mode" / "Switch to Manual Mode" function aliases at
+        # :9198 → Configuration → IO. Rising-edge triggers the
+        # function; effect is immediate per manual (no Save).
+        #
+        # Reads back through the same _robot_mode_code poll below,
+        # so the timing contract is unchanged. `to_remote` has no
+        # bound-DI alias in the manual — it stays on the WS verb.
+        used_bound_di = False
+        if self._mode_via_di and op in ('to_auto', 'to_manual'):
+            di_port = (self._mode_di_auto if op == 'to_auto'
+                       else self._mode_di_manual)
+            self.get_logger().info(
+                f'mode switch via bound DI (ESTUN_MODE_VIA_DI=1): '
+                f'op={op} pulsing DI{di_port} '
+                f'(pulse={self._mode_di_pulse_ms} ms)')
+            try:
+                self._do_di_force(di_port, 1, family='mode_bound_di')
+                time.sleep(self._mode_di_pulse_ms / 1000.0)
+                self._do_di_force(di_port, 0, family='mode_bound_di')
+                used_bound_di = True
+            except Exception as e:
+                self._publish_mode_status({
+                    'ok': False, 'op': op, 'requested': target_code,
+                    'observed': already,
+                    'reason': f'bound-DI pulse failed: {e}',
+                    'reason_code': 'bound_di_pulse_failed',
+                    'via': f'bound_di_{di_port}',
+                    'req_id': req_id, 'ts': time.time()})
+                return
+
+        if not used_bound_di:
+            ok_verb = self._ws_verb(verb)
+            self.get_logger().info(f'{verb} sent ok={ok_verb} '
+                                   f'req_id={req_id}')
+            if not ok_verb:
+                self._publish_mode_status({
+                    'ok': False, 'op': op, 'requested': target_code,
+                    'observed': already,
+                    'reason': f'{verb} publish failed on the WS',
+                    'reason_code': 'verb_publish_failed',
+                    'req_id': req_id, 'ts': time.time()})
+                return
+
+        # Read-back verify (L298): poll robot_mode_code up to 3 s.
+        # The publish/RobotStatus stream refreshes at ~10 Hz — 3 s
+        # is 30 opportunities to observe the change.
+        via_tag = (f'bound_di_{self._mode_di_auto if op == "to_auto" else self._mode_di_manual}'
+                   if used_bound_di else 'ws_verb')
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            time.sleep(0.05)
+            observed = self._robot_mode_code
+            if observed == target_code:
+                self._publish_mode_status({
+                    'ok': True, 'op': op,
+                    'requested': target_code, 'observed': observed,
+                    'via': via_tag,
+                    'req_id': req_id, 'ts': time.time()})
+                return
+        # Timed out — trigger fired (verb or DI pulse) but the
+        # controller never confirmed. Loud + machine-readable.
+        self._publish_mode_status({
+            'ok': False, 'op': op,
+            'requested': target_code, 'observed': self._robot_mode_code,
+            'reason': ('mode read-back timeout — '
+                       + ('DI pulse' if used_bound_di else 'verb')
+                       + ' fired but publish/RobotStatus.mode did not '
+                       + f'reach {target_code} within 3 s'),
+            'reason_code': 'mode_readback_timeout',
+            'via': via_tag,
+            'req_id': req_id, 'ts': time.time()})
+
+    def _op_set_move_rate(self, d):
+        # setManualMoveRate is the MANUAL-mode override (jogs); the
+        # AUTO-mode program-speed knob is setAutoMoveRate below. Both
+        # clamp through _clamp_program_speed_pct — single-source
+        # policy cap, no duplicates.
+        pct, capped = self._clamp_program_speed_pct(d.get('pct', d.get('rate', 0)))
+        ok = self._ws_verb('Robot/setManualMoveRate', pct)
+        self.get_logger().info(
+            f'Robot/setManualMoveRate db={pct}%% '
+            f'{"(capped at operator_speed_limit) " if capped else ""}ok={ok}')
+
+    def _op_set_auto_rate(self, d):
+        # High-speed safeguard: the dashboard's mid-run speed control
+        # publishes `set_auto_rate` with an explicit `confirmed_high_speed`
+        # flag when the requested pct is above the driver's
+        # high_speed_confirm_threshold_pct. Program-START set_auto_rate
+        # publishes the initial speed and bypasses the confirm-required
+        # check by passing `at_run_start:true` — the Run modal has
+        # already been through its own confirm at that point.
+        pct, capped = self._clamp_program_speed_pct(d.get('pct', d.get('rate', 0)))
+        threshold = self._high_speed_confirm_threshold_pct
+        at_run_start = bool(d.get('at_run_start', False))
+        confirmed = bool(d.get('confirmed_high_speed', False))
+        if (not at_run_start) and pct > threshold and not confirmed:
+            self._reject('program',
+                f'set_auto_rate: mid-run pct={pct} exceeds high-speed '
+                f'threshold {threshold} without confirmed_high_speed=true')
+            return
+        ok = self._ws_verb('Robot/setAutoMoveRate', pct)
+        self.get_logger().info(
+            f'Robot/setAutoMoveRate db={pct}%% '
+            f'{"(capped) " if capped else ""}'
+            f'{"(HIGH-SPEED confirmed) " if (confirmed and pct > threshold) else ""}'
+            f'ok={ok}')
+
+    def _op_clear_error(self, _d):
+        # CAPTURED via HAR (used to stop the ~3 Hz publish/Error
+        # reflood mid-capture). Symmetric to /robot/power_command
+        # action=clear_alarm, but stays on this move-gate path so
+        # program flows can clear + retry without also being
+        # allowed to switchOn.
+        ok = self._ws_verb('System/ClearError')
+        self.get_logger().info(f'System/ClearError sent (program-path) ok={ok}')
+
+    # ── Jog write path ─────────────────────────────────────────
+
+    def _writes_allowed_for_jog(self):
+        return (not self._monitor_only) and self._allow_jog
+
+    def _new_nonce(self):
+        # UI-style monotonic id: 'mrkno' + base36 ms timestamp + short random.
+        # Fresh per frame; never reused within a session.
+        ts_ms = int(time.time() * 1000)
+        digits = '0123456789abcdefghijklmnopqrstuvwxyz'
+        n, buf = ts_ms, ''
+        while n:
+            n, r = divmod(n, 36)
+            buf = digits[r] + buf
+        return f'mrkno{buf or "0"}{os.urandom(3).hex()}'
+
+    # ── Shared operator-speed clamp (single-source policy cap) ──────
+    #
+    # Every AUTO-mode / program-run write path (set_move_rate,
+    # set_auto_rate, and the dashboard's `program/run` and mid-run
+    # `program/speed` endpoints — the last two through their own layer
+    # calling this via the ROS param service) must run its requested
+    # percent through this method. There is exactly ONE authoritative
+    # cap in the whole stack: `self._operator_speed_limit`, read from
+    # config/estun.yaml. Do NOT re-implement clamping — use this.
+    #
+    # Returns (effective_pct, capped_bool). `capped_bool` is True when
+    # the requested pct exceeded the cap (the value was clamped down).
+    # 1..100 is the hardware-legal range; anything outside that is
+    # first clamped to that range, then to the operator cap.
+
+    def _clamp_program_speed_pct(self, requested_pct):
+        try:
+            req = int(round(float(requested_pct)))
+        except (TypeError, ValueError):
+            req = 1
+        req = max(1, min(100, req))
+        cap_pct = max(1, min(100, int(round(self._operator_speed_limit * 100.0))))
+        eff = min(cap_pct, req)
+        return eff, (req > cap_pct)
+
+    # ── SPEED-SCALED SAFETY MARGINS ─────────────────────────────────
+    #
+    # The static baseline margins (2° limit, 30 mm collision stop,
+    # σ_soft=0.060) were tuned at jog_speed_cap=0.15. Raising the
+    # cap invalidates those numbers: worst-case overrun distance
+    # scales linearly with commanded speed_frac. Below we express
+    # each margin as `base + extra × (speed_frac - baseline)`
+    # (clamped to `base` at low speeds) so the geometry that made
+    # 0.15 safe stays safe at 0.50.
+    #
+    # Values on file (safety_latency_s, safety_factor,
+    # baseline_speed_frac) are declared ROS parameters so a specific
+    # cell can retune from YAML without a code change.
+    #
+    #                       WORKED MATH
+    # ──────────────────────────────────────────────────────────────
+    # Limit clamp margin, per joint j:
+    #   margin_j(f) = max(base,
+    #                     max_joint_speed_degps[j] × f × latency × K)
+    # where K = safety_factor. Example at f=0.15 (J1, 150°/s):
+    #   150 × 0.15 × 0.150 × 1.5 = 5.06° → matches the ~5° we've
+    #   been running as an implicit assumption. At f=0.50:
+    #   150 × 0.50 × 0.150 × 1.5 = 16.9° → the "17°" the safety
+    #   pass calls for.
+    #
+    # Collision guard stop distance:
+    #   stop_mm(f) = base_stop_mm + max(0, f - baseline_speed_frac)
+    #                             × TIP_SPEED_MMPS × latency × K
+    # TIP_SPEED_MMPS is the worst-case link-tip speed at f=1.0.
+    # ~1500 mm/s bounds the flange-tip speed at max joint speed and
+    # a typical 1 m radius from the driving joint on this S10-140.
+    # Result at f=0.15: 30 mm (unchanged). At f=0.50: 30 + 118 = 148 mm.
+    #
+    # Singularity governor:
+    #   sigma_soft(f) = base_soft × max(1.0, f / baseline_speed_frac)
+    # Wire evidence (alarm 2015 on 2026-07-15): IK amplification
+    # collapsed σ from 0.180 → 0.021 over ~5 s at f=0.15. That rate
+    # is proportional to commanded TCP speed; at f=0.50 the same
+    # collapse fits inside ~1.5 s. Scaling σ_soft up (more
+    # conservative) preserves the 5 s reaction window. σ_hard
+    # stays at the physical stop threshold.
+    _TIP_SPEED_MMPS = 1500.0    # worst-case flange-tip speed at f=1.0
+
+    def _dyn_limit_margin_deg(self, joint_idx0, speed_frac):
+        """Dynamic joint-limit margin (deg) at commanded speed_frac.
+        joint_idx0 is 0..5. Returns min(cap, max(static base, dynamic)).
+
+        2026-08-19 retune (F1.4 rung-3 fingerprint):
+          - safety_factor: 1.5 → 1.2 (less amplification, still >1
+            for real-world overrun).
+          - CAP the total dynamic margin at joint_limit_margin_max_deg
+            (default 5.0°). Prior formula grew unbounded with speed —
+            at 50% speed on a 180°/s joint, margin was 20°, cutting
+            legitimate jog out of ~10% of the joint's authored travel.
+            Cap holds the safe_edge at most 5° inside the physical
+            limit under all commanded speeds.
+          - Static base (default 2.0°) is still the floor at crawl speed.
+        """
+        base = self._joint_limit_margin_deg
+        cap = self._joint_limit_margin_max_deg
+        vmax = self._max_joint_speed_degps[joint_idx0]
+        dyn = vmax * speed_frac * self._safety_latency_s * self._safety_factor
+        # Precedence: base <= result <= cap. If cap < base (misconfigured),
+        # cap wins (a base above cap would defeat the cap).
+        return min(cap, max(base, dyn))
+
+    def _dyn_collision_stop_mm(self, speed_frac):
+        """Dynamic collision stop distance (mm). At f≤baseline the
+        returned value equals the static base; above baseline it grows
+        linearly in (f - baseline) × TIP_SPEED_MMPS × latency × K."""
+        base = self._coll_stop_mm
+        extra_f = max(0.0, speed_frac - self._baseline_speed_frac)
+        return base + extra_f * self._TIP_SPEED_MMPS * self._safety_latency_s * self._safety_factor
+
+    def _dyn_env_stop_mm(self, speed_frac):
+        base = self._env_stop_mm
+        extra_f = max(0.0, speed_frac - self._baseline_speed_frac)
+        return base + extra_f * self._TIP_SPEED_MMPS * self._safety_latency_s * self._safety_factor
+
+    def _dyn_sigma_soft(self, speed_frac):
+        """Speed-scaled σ_soft — never drops below the static base."""
+        if self._baseline_speed_frac <= 0:
+            return self._cart_sigma_soft
+        scale = max(1.0, speed_frac / self._baseline_speed_frac)
+        return self._cart_sigma_soft * scale
+
+    def _on_jog_command(self, msg):
+        """Incoming /robot/jog_command JSON. Four shapes accepted:
+        - Incremental (angle-bounded, driver owns stop timing):
+            {"mode":"joint","axis":<1-6>,"delta_deg":<±float, |x|≤5>}
+        - Continuous hold (start OR refresh):
+            {"mode":"joint"|"cartesian","axis":<1-6>,"direction":±1,
+             "speed_pct":<1..100>,"hold":true}
+        - Explicit release (also handled by staleness after 300 ms):
+            {"hold":false}     or    {"stop":true}
+        - Legacy velocity (kept for compat):
+            {"mode":"joint","axis":<1-6>,"direction":±1,"speed":<1..100>,"step":<abs_rad>}
+        Cartesian mode (mode:2) is gated behind allow_cartesian_jog."""
+        family = 'jog'
+        if self._monitor_only:
+            self._reject(family, 'monitor_only active',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._allow_jog:
+            self._reject(family, 'allow_jog gate closed',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._connected:
+            self._reject(family, 'ws not connected',
+                         extra={'reason_code': 'transport_down'})
+            return
+        if self._conn_sm.state != self._conn_sm.READY:
+            # Writes during INITIALIZING can hit the same joint-vector
+            # crash path we're avoiding with the deferred subscribe.
+            self._reject(family, f'controller {self._conn_sm.state} — writes gated until READY',
+                         extra={'reason_code': 'controller_not_ready'})
+            return
+
+        try:
+            d = json.loads(msg.data)
+        except Exception as e:
+            self._reject(family, f'invalid JSON: {e}')
+            return
+
+        # ── Release / stop path takes ABSOLUTE priority ─────────────
+        # No session guards. A release always ends the current jog,
+        # even if the hold_id / seq / client_ts don't parse. This is
+        # the whole point of the "stop must preempt, not queue" fix.
+        if d.get('hold') is False or d.get('stop') is True:
+            with self._jog_lock:
+                self._stop_jog_locked(reason='release cmd')
+            return
+
+        # ── Staleness for refresh messages ──────────────────────────
+        # Client and driver run on different machines (browser vs
+        # Jetson) with un-synchronised clocks — the earlier build
+        # measured ~920 ms skew on the operator's tablet, and any
+        # absolute cross-clock comparison silently drops legitimate
+        # refreshes. Staleness protection is therefore done ONLY on
+        # clock-free evidence:
+        #   1. `seq`     — monotonic per session; ≤ last processed → drop.
+        #   2. `hold_id` — released session's stragglers are dropped.
+        #   3. The driver's own freshness deadman ticks on the driver's
+        #      own clock (inter-arrival gap in _on_jog_supervise) and
+        #      catches genuinely stalled sessions.
+        # `client_ts_ms` is accepted for compatibility but never used
+        # in a comparison against server time.
+        is_hold_refresh = (d.get('hold') is True)
+
+        # ── Session tracking for refresh messages ───────────────────
+        # A refresh whose hold_id ≠ the driver's active hold_id is
+        # from a released session — discard silently. A refresh with
+        # seq ≤ last-processed is out-of-order or a duplicate — also
+        # discard. Only enforced when a session is active AND the
+        # inbound message declares a hold_id.
+        hold_id = d.get('hold_id')
+        try:
+            seq_in = int(d.get('seq') or 0)
+        except (TypeError, ValueError):
+            seq_in = 0
+        if is_hold_refresh and hold_id is not None:
+            with self._jog_lock:
+                active = self._jog_active_hold_id
+                if active is not None and hold_id != active:
+                    # From an old session — the current session was
+                    # started under a different id. Ignore.
+                    return
+                if active is not None and seq_in <= self._jog_last_seq:
+                    # Out-of-order / duplicate. Ignore.
+                    return
+                # Straggler-restart guard: after a session ends, some
+                # refresh POSTs may already be in the frontend's HTTP
+                # queue. When they arrive with the released hold_id
+                # and active is None, the previous logic would treat
+                # them as a fresh session start. Latch the released id
+                # and reject.
+                if active is None and hold_id == self._jog_released_hold_id:
+                    return
+
+        mode_s = str(d.get('mode', 'joint')).lower()
+        if mode_s == 'cartesian':
+            if not self._allow_cartesian_jog:
+                self._reject(family, 'allow_cartesian_jog gate closed — cartesian pending validation')
+                return
+            if d.get('pulse') is True:
+                self._start_cart_pulse(d)
+            else:
+                self._start_or_refresh_continuous(d, mode_s)
+            return
+        if mode_s != 'joint':
+            self._reject(family, f'mode {mode_s!r} not implemented (joint or cartesian only)')
+            return
+
+        try:
+            axis = int(d.get('axis', 0))
+        except (TypeError, ValueError):
+            self._reject(family, f'axis not int: {d.get("axis")!r}')
+            return
+        if not (1 <= axis <= 6):
+            self._reject(family, f'axis out of range [1..6]: {axis}')
+            return
+
+        # Incremental (angle-bounded) path takes precedence when delta_deg
+        # is present — this is what the IncrementalJogPanel publishes.
+        if d.get('delta_deg') is not None:
+            self._start_increment_jog(axis, d)
+            return
+
+        # Continuous hold path — 'hold':true, or the legacy velocity shape
+        # (direction + speed_pct/speed).
+        if d.get('hold') is True or ('direction' in d and ('speed_pct' in d or 'speed' in d)):
+            self._start_or_refresh_continuous(d, mode_s)
+            return
+
+        # If we get here, the message was joint-mode but had neither
+        # delta_deg nor hold/direction+speed — nothing to act on.
+        self._reject(family, 'joint jog cmd missing delta_deg or hold/direction+speed_pct',
+                     extra={'payload': msg.data[:200]})
+
+    def _start_or_refresh_continuous(self, d, mode_s):
+        """Continuous hold-to-jog. First fresh command sends Robot/jog and
+        starts the supervise timer. Same-axis + same-direction refreshes
+        only update _jog_last_cmd_ts (no new Robot/jog per tick). Axis or
+        direction change: stopJog first, then new Robot/jog. Explicit
+        release or 300 ms staleness ends the hold via _on_jog_supervise.
+        mode_s is 'joint' (index 1..6 = J1..J6) or 'cartesian'
+        (index 1..6 = X,Y,Z,RX,RY,RZ; gate-guarded upstream)."""
+        family = 'jog'
+        # Session metadata for stale-drop bookkeeping. Missing values
+        # are fine — the caller may be a legacy client without the
+        # session fields; the seq/hold_id updates below simply skip.
+        hold_id = d.get('hold_id')
+        try:
+            seq_in = int(d.get('seq') or 0)
+        except (TypeError, ValueError):
+            seq_in = 0
+        try:
+            axis = int(d.get('axis', 0))
+        except (TypeError, ValueError):
+            self._reject(family, f'axis not int: {d.get("axis")!r}')
+            return
+        if not (1 <= axis <= 6):
+            self._reject(family, f'axis out of range [1..6]: {axis}')
+            return
+        try:
+            direction = int(d.get('direction', 0))
+        except (TypeError, ValueError):
+            direction = 0
+        if direction not in (-1, 1):
+            self._reject(family, f'direction not in {{-1,+1}}: {direction}')
+            return
+        # Accept both speed_pct (new) and speed (legacy 1..100) alongside
+        # the legacy fractional 0..1 speed field if some future caller
+        # sends it. speed_pct always wins if present.
+        speed_pct = d.get('speed_pct', d.get('speed', 0.0))
+        try:
+            speed_pct = float(speed_pct)
+        except (TypeError, ValueError):
+            speed_pct = 0.0
+        if 0.0 < speed_pct <= 1.0:
+            # Fractional 0..1 → % (legacy quirk).
+            speed_pct *= 100.0
+        speed_pct = max(0.0, min(100.0, speed_pct))
+        if speed_pct <= 0.0:
+            with self._jog_lock:
+                self._stop_jog_locked(reason='zero-speed hold cmd')
+            return
+
+        # Cap: effective speed frac = min(ui_pct/100, effective_cap)
+        # where effective_cap = min(jog_speed_cap, operator_speed_limit).
+        # Two-tier staged cap: jog_speed_cap is the hardware-derived
+        # ceiling (0.50); operator_speed_limit is the operationally
+        # allowed ceiling (0.25 today). See safety pass 2026-07-16 for
+        # margin math backing the raise from 0.15 → 0.50 hardware cap.
+        effective_frac = min(speed_pct / 100.0, self._effective_speed_cap)
+        signed_speed = direction * effective_frac
+
+        # For joint mode: pre-emptive limit clamp using LIVE angle. Stop
+        # commanding motion if this jog would carry us past limit − margin.
+        # Margin is SPEED-SCALED — see _dyn_limit_margin_deg. Formula
+        # derivation lives in the comment block above _on_jog_command.
+        if mode_s == 'joint':
+            if self._last_posture_ts <= 0.0:
+                self._reject(family, 'no posture reading yet — refusing to hold-jog blind')
+                return
+            current_deg = self._joint_deg[axis-1]
+            limit = self._joint_limit_deg[axis-1]
+            margin = self._dyn_limit_margin_deg(axis-1, effective_frac)
+            safe_edge = limit - margin
+            # 2026-08-05 (guided recovery): ESCAPE-DIRECTION RULE. When
+            # a joint is already inside the escape-only zone, only the
+            # direction that REDUCES abs(current_deg) is permitted. The
+            # guided-recovery dialog relies on this — a recovery move
+            # must not be rejected by the clamp it's escaping, and a
+            # deeper-direction jog must be refused even at crawl speed
+            # (which would otherwise slip through the dynamic safe_edge
+            # check below). See `_stop_jog_locked`'s cause taxonomy —
+            # 'joint_limit_deeper' is a distinct tag from 'joint_limit'.
+            escape_only_edge = limit - self._joint_escape_only_margin_deg
+            if current_deg > escape_only_edge and direction > 0:
+                self._reject(family,
+                             f'escape_only: J{axis} at {current_deg:+.2f}° past '
+                             f'+{escape_only_edge:.2f}° — J{axis} can\'t go further; '
+                             f'jog -J{axis} instead')
+                return
+            if current_deg < -escape_only_edge and direction < 0:
+                self._reject(family,
+                             f'escape_only: J{axis} at {current_deg:+.2f}° past '
+                             f'-{escape_only_edge:.2f}° — J{axis} can\'t go further; '
+                             f'jog +J{axis} instead')
+                return
+            # Direction-aware check: only reject when we'd be pushing PAST
+            # the far edge in the commanded direction.
+            if direction > 0 and current_deg >= safe_edge:
+                self._reject(family,
+                             f'clamp: J{axis} at {current_deg:+.2f}° already past '
+                             f'+{safe_edge:.2f}° (dyn margin {margin:.2f}° @ f={effective_frac:.2f}) '
+                             f'— hold rejected')
+                return
+            if direction < 0 and current_deg <= -safe_edge:
+                self._reject(family,
+                             f'clamp: J{axis} at {current_deg:+.2f}° already past '
+                             f'-{safe_edge:.2f}° (dyn margin {margin:.2f}° @ f={effective_frac:.2f}) '
+                             f'— hold rejected')
+                return
+
+        target_mode = 'continuous' if mode_s == 'joint' else 'continuous_cart'
+        robot_jog_mode = 1 if mode_s == 'joint' else 2  # captured protocol values
+
+        # ── Collision guard command-time gate (joint mode) ────────────
+        # THE WEDGE FIX. Evaluate the COMMANDED direction with an FK
+        # projection now (before we send anything), so a fresh command
+        # in the opposite direction from the last one gets a clean
+        # answer. Three cases:
+        #   1. current clearance > warn:            allow full-speed
+        #   2. current ≤ warn, projection OPENS:    escape → cap at 6%
+        #   3. current ≤ stop, projection CLOSES:   REFUSE (with reason)
+        #   4. current ≤ warn (not stop), CLOSES:   allow, log warning
+        #   5. no escape direction found at all AND current ≤ stop:
+        #      fallback → allow at 3% with LOUD log (operator has e-stop)
+        # Cartesian is left permissive here — the σ_min governor + the
+        # per-tick check handle it after motion begins.
+        override_used = False
+        if (self._coll_model is not None and self._coll_guard_active
+                and mode_s == 'joint'
+                and self._last_posture_ts > 0.0):
+            try:
+                (pair, cur_min) = self._coll_model.min_distance_at(self._joint_deg)
+                # Honor per-pair YAML overrides so pairs with a design
+                # floor (link3↔link5, ~46 mm mechanical minimum) don't
+                # trip the closing-throttle every jog. Env pairs stay on
+                # the global env warn/stop.
+                is_env_pair = False
+                if pair and isinstance(pair, tuple):
+                    a, b = pair
+                    is_env_pair = ((isinstance(a, str) and a.startswith('zone#'))
+                                or (isinstance(b, str) and b.startswith('zone#')))
+                if is_env_pair:
+                    warn_thr = self._env_warn_mm
+                    stop_thr = self._dyn_env_stop_mm(effective_frac)
+                else:
+                    warn_thr, base_stop, overridden = \
+                        self._coll_model.thresholds_for_ex(
+                            pair, self._coll_warn_mm, self._coll_stop_mm)
+                    if overridden:
+                        # Per-pair YAML entry is authoritative — represents
+                        # a design-floor number (e.g. link3↔link5's mesh-
+                        # bounded ~46 mm floor) that must NOT be scaled by
+                        # the speed formula. Scaling would push stop_thr
+                        # above the mechanical floor and permanently deny
+                        # jog in a legitimate pose.
+                        stop_thr = base_stop
+                    else:
+                        # Global default — speed-scale as usual.
+                        stop_thr = base_stop + max(0.0, effective_frac - self._baseline_speed_frac) \
+                                              * self._TIP_SPEED_MMPS * self._safety_latency_s \
+                                              * self._safety_factor
+                # 2026-07-31 OPERATOR DIRECTIVE: the WARN band is
+                # presentation-only. The driver's motion-block applies
+                # ONLY inside the hard-stop zone. Warn-band jogs
+                # (opening AND closing) pass through with zero
+                # interference — no speed cap, no direction block.
+                # The capsule model over-approximates and was blocking
+                # legitimate teach poses at ~45–50 mm clearances. The
+                # operator standing at the cell outranks the model.
+                if cur_min <= stop_thr:
+                    # Project the commanded direction 5° ahead.
+                    proj = list(self._joint_deg)
+                    proj[axis-1] += 5.0 * (1.0 if direction > 0 else -1.0)
+                    _, proj_min = self._coll_model.min_distance_at(proj)
+                    opening = proj_min > cur_min + 0.5
+                    if opening:
+                        # Escape motion inside stop zone. Cap speed
+                        # at the escape frac and let it go — this is
+                        # the escape-jog path from the modal.
+                        cap = self._coll_escape_frac
+                        if effective_frac > cap:
+                            self.get_logger().info(
+                                f'guard: stop-zone escape cap {effective_frac:.2f} → {cap:.2f} '
+                                f'(J{axis}{"+" if direction>0 else "-"}, '
+                                f'{cur_min:.0f}mm → {proj_min:.0f}mm, pair={pair})')
+                            effective_frac = cap
+                            signed_speed = direction * effective_frac
+                    else:
+                        # Closing motion inside stop zone.
+                        # Delegate the "does any direction open?"
+                        # question to the collision model — it knows
+                        # whether the pair is mesh-mesh (needs a
+                        # wider probe step) or capsule.
+                        has_escape = self._coll_model.has_any_escape(
+                            self._joint_deg, pair)
+                        if has_escape:
+                            self._reject(family,
+                                f'collision guard: J{axis}{"+" if direction>0 else "-"} '
+                                f'closes {pair} from {cur_min:.0f}mm '
+                                f'(current ≤ stop {stop_thr:.0f}mm). '
+                                f'Use an escape direction from the popup.')
+                            return
+                        # FALLBACK — no direction opens per model; let the
+                        # operator override at 3% cap. This is the "model
+                        # wrong / geometry approximate" safety valve.
+                        cap = self._coll_fallback_frac
+                        if effective_frac > cap:
+                            self.get_logger().warn(
+                                f'guard FALLBACK OVERRIDE: no escape direction '
+                                f'per model at {pair} dist={cur_min:.0f}mm — '
+                                f'allowing J{axis}{"+" if direction>0 else "-"} '
+                                f'at {cap:.2f} cap (operator has e-stop)')
+                            effective_frac = cap
+                            signed_speed = direction * effective_frac
+                            override_used = True
+            except Exception as e:
+                if not getattr(self, '_coll_warned_bad', False):
+                    self._coll_warned_bad = True
+                    self.get_logger().warn(f'guard gate error (suppressed): {e}')
+
+        with self._jog_lock:
+            now = time.time()
+
+            # Refresh path — same mode/axis/direction → keep the jog alive
+            # without re-sending Robot/jog. The captured protocol treats a
+            # duplicate Robot/jog while active as an error ("100/robot
+            # state is not ready" observed 2026-07-14); heartbeats are
+            # what keep motion alive after the first frame.
+            if (self._jog_active
+                and self._jog_mode == target_mode
+                and self._jog_index == axis
+                and self._jog_direction == direction):
+                # 2026-07-31 jog-stop instrumentation: sample the
+                # inter-arrival gap between successive refresh frames
+                # on the SAME hold. Ring capped in _jog_hold_gaps_ms
+                # so the status blob can publish a histogram without
+                # unbounded growth. Bench script uses this to answer
+                # "is the channel gapping past 200 ms?" — the
+                # keepalive contract's threshold.
+                prev = self._jog_last_cmd_ts
+                if prev > 0:
+                    gap_ms = (now - prev) * 1000.0
+                    self._jog_hold_gaps_ms.append(gap_ms)
+                    if len(self._jog_hold_gaps_ms) > self._JOG_GAP_RING_MAX:
+                        del self._jog_hold_gaps_ms[:len(self._jog_hold_gaps_ms)
+                                                    - self._JOG_GAP_RING_MAX]
+                self._jog_last_cmd_ts = now
+                # Latch the highest seq we've processed for this session
+                # so out-of-order refreshes get dropped upstream.
+                if seq_in > self._jog_last_seq:
+                    self._jog_last_seq = seq_in
+                # If the speed slider changed enough to notice, roll it
+                # in on the next frame — but we don't re-send Robot/jog
+                # per tick (protocol constraint), so this only affects a
+                # future direction/axis change.
+                self._jog_signed_speed = signed_speed
+                return
+
+            # Different jog running → stop it first.
+            if self._jog_active:
+                self._stop_jog_locked(reason='hold transition')
+
+            frame = {
+                'ty': 'Robot/jog',
+                'db': {
+                    'mode':     robot_jog_mode,
+                    'speed':    signed_speed,
+                    'index':    axis,
+                    # TODO Tool-frame; 0/0 = User Coord0 (captured default).
+                    'coorType': 0,
+                    'coorId':   0,
+                },
+                'id': self._new_nonce(),
+            }
+            try:
+                if not self._send(frame):
+                    self._reject(family, 'send returned False')
+                    return
+            except Exception as e:
+                self.get_logger().warn(f'Robot/jog send failed: {e}')
+                self._stop_jog_locked(reason='send failed')
+                return
+            self._jog_active = True
+            self._jog_mode = target_mode
+            self._jog_index = axis
+            self._jog_direction = direction
+            self._jog_signed_speed = signed_speed
+            # Governor bookkeeping — commanded magnitude (unscaled) and
+            # the actual speed we last put on the wire. Only meaningful
+            # for continuous_cart, but harmless to set for joint holds.
+            self._cart_commanded_frac  = abs(signed_speed)
+            self._cart_last_sent_speed = signed_speed
+            self._jog_last_cmd_ts = now
+            self._jog_last_hb_ts = now
+            # Latch this session's identity so future refreshes with
+            # this hold_id + increasing seq are accepted, and stragglers
+            # from a previous session (or refreshes arriving after this
+            # session is later stopped) are silently dropped. A NEW
+            # hold_id also clears the released-latch — the operator's
+            # next press regenerates the id.
+            self._jog_active_hold_id = hold_id
+            self._jog_last_seq = seq_in
+            self._jog_released_hold_id = None
+            if self._jog_supervise_timer is None:
+                self._jog_supervise_timer = self.create_timer(0.05, self._on_jog_supervise)
+            self.get_logger().info(
+                f'continuous hold: {mode_s} axis={axis} dir={direction:+d} '
+                f'speed_frac={effective_frac:.3f} '
+                f'(ui {speed_pct:.0f}% capped at {self._effective_speed_cap:.2f} '
+                f'= min(jog_speed_cap={self._jog_speed_cap:.2f}, '
+                f'operator_speed_limit={self._operator_speed_limit:.2f})) '
+                f'hold_id={hold_id} seq={seq_in}')
+
+    def _start_cart_pulse(self, d):
+        """Cartesian tap — fixed 150 ms pulse in mode:2. Justification:
+        we have no measured TCP velocity yet, so mapping a step size (mm
+        or deg) to a duration would compound unknowns. A fixed 150 ms
+        pulse is bounded by driver+controller stopJog and gives a
+        consistent nudge regardless of the UI step selection. The step
+        chip stays visible in the pendant so the pattern is compatible
+        with a future speed-cal upgrade — swap the constant for a
+        step-size-derived duration then.
+
+        Reuses the joint-increment plumbing: one-shot threading.Timer
+        for the stop, supervise timer for heartbeat + freshness backup,
+        and the same _stop_jog_locked teardown. The per-tick joint-
+        limit clamp in _on_jog_supervise applies to 'continuous_cart'
+        already, and this mode ('cart_pulse') shares that dispatch."""
+        family = 'jog'
+        try:
+            axis = int(d.get('axis', 0))
+        except (TypeError, ValueError):
+            self._reject(family, f'axis not int: {d.get("axis")!r}')
+            return
+        if not (1 <= axis <= 6):
+            self._reject(family, f'axis out of range [1..6]: {axis}')
+            return
+        try:
+            direction = int(d.get('direction', 0))
+        except (TypeError, ValueError):
+            direction = 0
+        if direction not in (-1, 1):
+            self._reject(family, f'direction not in {{-1,+1}}: {direction}')
+            return
+        speed_pct = d.get('speed_pct', d.get('speed', 0.0))
+        try:
+            speed_pct = float(speed_pct)
+        except (TypeError, ValueError):
+            speed_pct = 0.0
+        if 0.0 < speed_pct <= 1.0:
+            speed_pct *= 100.0
+        speed_pct = max(0.0, min(100.0, speed_pct))
+        if speed_pct <= 0.0:
+            self._reject(family, 'cart pulse: speed_pct ≤ 0')
+            return
+        effective_frac = min(speed_pct / 100.0, self._effective_speed_cap)
+        signed_speed = direction * effective_frac
+        duration_s = 0.150  # fixed pulse; see method docstring.
+
+        # Pre-emptive limit check across all joints — we can't project
+        # cartesian motion into joint space cheaply, so refuse when any
+        # joint is already at its speed-scaled safe edge. Per-joint
+        # margin because J1-3 (150°/s) and J4-6 (180°/s) differ.
+        if self._last_posture_ts <= 0.0:
+            self._reject(family, 'cart pulse: no posture reading yet')
+            return
+        # 2026-08-05 (doctrine: a limit is a wall, not a cage): cart pulse
+        # start-clamp refuses only when a joint is PAST the physical
+        # limit — the soft-edge case is handled by the supervise-tick
+        # velocity-sign check, which permits escape motion. A jog is
+        # rejected ONLY if the commanded motion moves the joint FURTHER
+        # PAST its limit. See _on_jog_supervise's continuous_cart branch
+        # for the mid-motion direction check.
+        for i in range(6):
+            limit = self._joint_limit_deg[i]
+            if abs(self._joint_deg[i]) >= limit:
+                self._reject(family,
+                             f'cart pulse clamp: J{i+1} at {self._joint_deg[i]:+.2f}° '
+                             f'past physical ±{limit:.2f}° — '
+                             f'jog J{i+1} '
+                             f'{"-" if self._joint_deg[i] > 0 else "+"} '
+                             f'in Joint mode to recover, then retry cart')
+                return
+
+        with self._jog_lock:
+            if self._jog_active:
+                self._reject(family,
+                             f'busy — {self._jog_mode} jog on J{self._jog_index} still in flight')
+                return
+
+            frame = {
+                'ty': 'Robot/jog',
+                'db': {
+                    'mode':     2,           # 2 = cartesian jog
+                    'speed':    signed_speed,
+                    'index':    axis,        # 1..6 = X,Y,Z,RX,RY,RZ
+                    'coorType': 0,           # 0 = User frame
+                    'coorId':   0,           # Coordinate0 (Tool frame TBD)
+                },
+                'id': self._new_nonce(),
+            }
+            now = time.time()
+            try:
+                if not self._send(frame):
+                    self._reject(family, 'send returned False')
+                    return
+            except Exception as e:
+                self.get_logger().warn(f'cart pulse Robot/jog send failed: {e}')
+                self._stop_jog_locked(reason='send failed')
+                return
+            self._jog_active = True
+            # Reuse 'continuous_cart' so the supervise tick's live-limit
+            # clamp for cartesian applies during the pulse too.
+            self._jog_mode = 'continuous_cart'
+            self._jog_index = axis
+            self._jog_direction = direction
+            self._jog_signed_speed = signed_speed
+            self._cart_commanded_frac  = abs(signed_speed)
+            self._cart_last_sent_speed = signed_speed
+            self._jog_last_cmd_ts = now
+            self._jog_last_hb_ts = now
+            self._jog_increment_end_ts = now + duration_s
+            self._jog_increment_delta_deg = 0.0  # unused for cart
+            if self._jog_supervise_timer is None:
+                self._jog_supervise_timer = self.create_timer(0.05, self._on_jog_supervise)
+            self._jog_increment_stop_timer = threading.Timer(
+                duration_s, self._stop_jog_from_expiry)
+            self._jog_increment_stop_timer.daemon = True
+            self._jog_increment_stop_timer.start()
+            axis_label = ['X', 'Y', 'Z', 'RX', 'RY', 'RZ'][axis - 1]
+            self.get_logger().info(
+                f'cart pulse: {axis_label}{"+" if direction > 0 else "-"} @ '
+                f'speed_frac={effective_frac:.3f} for {duration_s*1000:.0f}ms')
+
+    def _start_increment_jog(self, axis, d):
+        """Incremental (angle-bounded) jog. Driver owns the stop timer;
+        if the browser dies mid-move the freshness deadman + heartbeat
+        starvation on the controller side still stop the arm."""
+        family = 'jog'
+        try:
+            delta_deg = float(d.get('delta_deg'))
+        except (TypeError, ValueError):
+            self._reject(family, f'delta_deg not float: {d.get("delta_deg")!r}')
+            return
+        if not (abs(delta_deg) > 1e-3):
+            self._reject(family, f'delta_deg ~ 0: {delta_deg}')
+            return
+        if abs(delta_deg) > self._jog_inc_max_delta_deg:
+            self._reject(family,
+                         f'|delta_deg| exceeds max ({self._jog_inc_max_delta_deg}°): {delta_deg}')
+            return
+
+        # Limit clamp: reject if commanded target would exit the safe
+        # envelope (per-joint ±limit_deg with margin subtracted). The
+        # commanded angle is *current* + delta_deg — reading current from
+        # the most recent RobotPosture frame the mirror captured. If we
+        # haven't seen posture yet (arm was disabled at connect), reject
+        # rather than command blind.
+        if self._last_posture_ts <= 0.0:
+            self._reject(family, 'no posture reading yet — refusing to command blind')
+            return
+        current_deg = self._joint_deg[axis-1]
+        target_deg = current_deg + delta_deg
+        limit = self._joint_limit_deg[axis-1]
+        margin = self._joint_limit_margin_deg
+        if abs(target_deg) > (limit - margin):
+            self._reject(family,
+                         f'clamp: J{axis} target {target_deg:+.2f}° exceeds ±{limit-margin:.2f}° '
+                         f'(limit ±{limit}, margin {margin})',
+                         extra={'current_deg': current_deg, 'delta_deg': delta_deg})
+            return
+
+        # Self-collision pre-check for increments — project the FINAL
+        # pose that the step will land at, reject if it crosses the
+        # stop threshold. Mirrors the joint-limit clamp above, using
+        # the same reason string convention. Continuous jogs run the
+        # per-tick guard in supervise; this pre-check is the discrete
+        # counterpart so a "tap" can't jump us into contact.
+        if self._coll_model is not None and self._coll_guard_active:
+            projected = list(self._joint_deg)
+            projected[axis-1] = target_deg
+            try:
+                pres = self._coll_model.evaluate(projected)
+                if pres:
+                    pa, pb, pd = pres[0]
+                    if pd <= self._coll_stop_mm:
+                        self._reject(family,
+                            f'self-collision guard {pa}-{pb} at {pd:.0f}mm '
+                            f'(projected after J{axis} {delta_deg:+.2f}° step)')
+                        return
+            except Exception as e:
+                if not getattr(self, '_coll_warned_bad', False):
+                    self._coll_warned_bad = True
+                    self.get_logger().warn(
+                        f'collision pre-check error (suppressed): {e}')
+
+        # Busy check — only one jog at a time. Simpler than queueing.
+        with self._jog_lock:
+            if self._jog_active:
+                self._reject(family,
+                             f'busy — {self._jog_mode} jog on J{self._jog_index} still in flight')
+                return
+
+            speed_frac = min(self._jog_inc_speed_frac, self._effective_speed_cap)
+            max_speed = self._max_joint_speed_degps[axis-1]
+            duration_s = abs(delta_deg) / max(1e-3, speed_frac * max_speed)
+            signed_speed = (1.0 if delta_deg > 0.0 else -1.0) * speed_frac
+
+            # NOTE on sign: /joint_states is a straight deg→rad passthrough
+            # of controller angles, and the URDF's J3/J5 axis flips render
+            # the twin to match the physical arm under that convention.
+            # So dashboard "+" ↔ controller "+" ↔ twin "+" — no per-joint
+            # inversion here. (Same reasoning as the velocity path.)
+            frame = {
+                'ty': 'Robot/jog',
+                'db': {
+                    'mode':     1,
+                    'speed':    signed_speed,
+                    'index':    axis,
+                    'coorType': 0,
+                    'coorId':   0,
+                },
+                'id': self._new_nonce(),
+            }
+            now = time.time()
+            try:
+                if not self._send(frame):
+                    self._reject(family, 'send returned False')
+                    return
+            except Exception as e:
+                self.get_logger().warn(f'increment Robot/jog send failed: {e}')
+                self._stop_jog_locked(reason='send failed')
+                return
+            self._jog_active = True
+            self._jog_mode = 'increment'
+            self._jog_index = axis
+            self._jog_last_cmd_ts = now
+            self._jog_last_hb_ts = now
+            self._jog_increment_end_ts = now + duration_s
+            self._jog_increment_delta_deg = delta_deg
+            if self._jog_supervise_timer is None:
+                self._jog_supervise_timer = self.create_timer(0.05, self._on_jog_supervise)
+            # PRIMARY stop mechanism: one-shot wall-clock timer that
+            # unconditionally fires _stop_jog at duration_s regardless
+            # of the supervise tick's phase. The supervise timer's
+            # end-check remains as a fallback in case this thread is
+            # somehow blocked; the controller-side heartbeat starvation
+            # is the third and final backup.
+            self._jog_increment_stop_timer = threading.Timer(
+                duration_s, self._stop_jog_from_expiry)
+            self._jog_increment_stop_timer.daemon = True
+            self._jog_increment_stop_timer.start()
+            self.get_logger().info(
+                f'increment jog: J{axis} {delta_deg:+.2f}° @ speed_frac={speed_frac:.2f} '
+                f'(max {max_speed}°/s) → duration={duration_s*1000:.0f}ms, '
+                f'current={current_deg:+.2f}° → target={target_deg:+.2f}°')
+
+    def _refresh_env_zones(self):
+        """Fetch static-zone OBBs from the dashboard's collision API.
+        Runs on a dedicated thread — never blocks the ROS executor.
+        Static zones don't change at run-time (cell setup only), so
+        we poll infrequently (30 s). Silently no-op on any fetch error;
+        the guard just runs with the previously-known zones. If the
+        model isn't loaded (yaml missing), do nothing."""
+        if self._coll_model is None:
+            return
+        try:
+            import urllib.request, ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(
+                    self._env_zones_url, context=ctx, timeout=3) as r:
+                payload = json.loads(r.read())
+            from .collision import parse_static_zones
+            zones = parse_static_zones(payload)
+            prev_n = self._coll_model.env_zone_count
+            self._coll_model.set_env_zones(zones)
+            self._env_last_refresh_ts = time.time()
+            if len(zones) != prev_n:
+                self.get_logger().info(
+                    f'env zones refreshed: {prev_n} → {len(zones)} '
+                    f'from {self._env_zones_url}')
+        except Exception as e:
+            if not getattr(self, '_env_zone_fetch_warned', False):
+                self._env_zone_fetch_warned = True
+                self.get_logger().warn(
+                    f'env-zone fetch failed (retrying every '
+                    f'{self._env_zone_refresh_s:.0f}s): {e}')
+
+    def _env_refresh_thread_loop(self):
+        """Runs in a daemon thread — polls _refresh_env_zones at the
+        configured interval. Started from __init__ if collision is
+        enabled. Immediate first call so the guard has zones as soon
+        as possible after startup; subsequent calls at the interval."""
+        while not getattr(self, '_env_stop', threading.Event()).is_set():
+            self._refresh_env_zones()
+            # threading.Event.wait is interruptible for clean shutdown.
+            self._env_stop.wait(timeout=self._env_zone_refresh_s)
+
+    def _mesh_refresh_loop(self):
+        """Off-loop mesh-mesh distance refresher. Runs at ~5 Hz
+        (200 ms cadence) so the supervise/posture hot paths can read
+        link3↔link5 mesh-mesh distance from cache instead of paying the
+        3-6 ms/query cost on the single-threaded ROS executor. Skips
+        computation until we have at least one posture sample (nothing
+        to compute against). Terminates cleanly on `_mesh_worker_stop`."""
+        MESH_REFRESH_PERIOD_S = 0.2
+        while not self._mesh_worker_stop.is_set():
+            if self._coll_model is not None and self._last_posture_ts > 0.0:
+                try:
+                    self._coll_model.refresh_mesh_cache(list(self._joint_deg))
+                except Exception as e:
+                    if not getattr(self, '_mesh_worker_warned', False):
+                        self._mesh_worker_warned = True
+                        self.get_logger().warn(
+                            f'mesh-refresh worker error (suppressed after 1st): {e}')
+            self._mesh_worker_stop.wait(timeout=MESH_REFRESH_PERIOD_S)
+
+    def _check_collision_locked(self):
+        """Evaluate self-collision at live joint angles. Returns True
+        iff we stopped the jog. Also updates self._coll_min_pair /
+        self._coll_min_dist_mm / self._coll_warning_active for the
+        status blob so the dashboard can render live clearance.
+
+        Direction-aware: if the current joint-velocity projection
+        shows the closest-pair distance INCREASING (opening up),
+        we suppress the stop even when distance is below the stop
+        threshold — otherwise the operator gets wedged with every
+        direction refused. Warning is issued regardless of direction.
+        Caller must hold self._jog_lock."""
+        # 2026-08-06 kill switch — belt-and-braces gate. Callers
+        # also gate on `_coll_guard_active`; if any new caller
+        # forgets, the guard still stays silent.
+        if self._coll_model is None or not self._coll_guard_active:
+            self._coll_min_pair = None
+            self._coll_min_dist_mm = None
+            self._coll_warning_active = False
+            return False
+        try:
+            res = self._coll_model.evaluate(self._joint_deg)
+        except Exception as e:
+            # Model bug → fall silent, keep motion. Log first hit.
+            if not getattr(self, '_coll_warned_bad', False):
+                self._coll_warned_bad = True
+                self.get_logger().warn(f'collision guard error (suppressed): {e}')
+            return False
+        if not res:
+            return False
+        a, b, d = res[0]
+        self._coll_min_pair = (a, b)
+        self._coll_min_dist_mm = d
+
+        # Warning zone: log once when it becomes active, once when clears.
+        # Dynamic stop-distance for the CURRENT hold's speed_frac.
+        # Higher speed → longer stop distance (see _dyn_collision_stop_mm
+        # math block). Per-pair YAML overrides are authoritative — they
+        # represent design-floor numbers (link3↔link5 mesh floor at
+        # ~46 mm) that must NOT be raised by the speed formula.
+        cur_frac = abs(self._jog_signed_speed) if self._jog_signed_speed else self._effective_speed_cap
+        _, base_stop_for_pair, overridden = self._coll_model.thresholds_for_ex(
+            (a, b), self._coll_warn_mm, self._coll_stop_mm)
+        if overridden:
+            dyn_stop_mm = base_stop_for_pair
+        else:
+            dyn_stop_mm = self._dyn_collision_stop_mm(cur_frac)
+
+        # 2026-08-05: warn tier disabled sentinel is
+        # collision_warn_distance_mm == 0. When zero, in_warn is
+        # always False, no WARNING log fires, and the telemetry
+        # bool stays cleared — the frontend banner never lights.
+        # The HARD stop below (dyn_stop_mm) is unaffected.
+        in_warn = self._coll_warn_mm > 0.0 and d <= self._coll_warn_mm
+        if in_warn and not self._coll_warning_active:
+            self.get_logger().warn(
+                f'SELF-COLLISION WARNING: {a}-{b} at {d:.0f}mm '
+                f'(warn threshold {self._coll_warn_mm:.0f}mm, '
+                f'stop {dyn_stop_mm:.0f}mm dyn @ f={cur_frac:.2f})')
+            self._coll_warning_active = True
+        elif not in_warn and self._coll_warning_active:
+            self.get_logger().info(
+                f'self-collision warning cleared: {a}-{b} now at {d:.0f}mm')
+            self._coll_warning_active = False
+
+        if d > dyn_stop_mm:
+            return False
+
+        # Below stop threshold — check direction using the COMMANDED
+        # jog direction (not observed velocity from posture-diff).
+        # THIS IS THE WEDGE FIX: the old code took (joint_deg -
+        # prev_joint_deg)/dt as the velocity vector, but when the arm
+        # is stopped (right after a guard stop, or on the first tick
+        # of a fresh command that hasn't moved anything yet), that
+        # velocity is ≈ 0. `projected == joint_deg` ⇒ same clearance
+        # ⇒ opening=False ⇒ STOP loops forever. The commanded
+        # direction is what we ACTUALLY intend, so use that.
+        opening = False
+        if self._jog_mode == 'continuous' and 1 <= self._jog_index <= 6:
+            projected = list(self._joint_deg)
+            step = 5.0 * (1.0 if self._jog_direction > 0 else -1.0)
+            projected[self._jog_index - 1] += step
+            try:
+                res2 = self._coll_model.evaluate(projected)
+                for a2, b2, d2 in res2:
+                    if (a2, b2) == (a, b):
+                        opening = d2 > d + 0.5
+                        break
+            except Exception:
+                opening = False
+        # Cartesian mode: we don't have an FK-forward projection for
+        # cartesian direction (that requires IK). Fall back to the
+        # older posture-diff heuristic — but only when we HAVE fresh
+        # posture-derived motion. If posture hasn't moved (freshly
+        # started), assume opening (trust the operator's fresh
+        # command in cartesian mode). The command-time gate in
+        # _start_or_refresh_continuous does the real work for cart.
+        elif self._jog_mode == 'continuous_cart':
+            pj = self._prev_joint_deg
+            pt = self._prev_joint_ts
+            if pj is not None and pt > 0.0 and self._last_posture_ts > pt:
+                dt = self._last_posture_ts - pt
+                if dt > 1e-4:
+                    projected = [self._joint_deg[i]
+                                 + (self._joint_deg[i] - pj[i]) / dt * 0.04
+                                 for i in range(6)]
+                    try:
+                        res2 = self._coll_model.evaluate(projected)
+                        for a2, b2, d2 in res2:
+                            if (a2, b2) == (a, b):
+                                opening = d2 > d + 0.5
+                                break
+                    except Exception:
+                        opening = False
+            else:
+                opening = True   # first-tick trust in commanded cart dir
+
+        if opening:
+            # Motion is moving away — don't stop, but keep the warning.
+            return False
+
+        # STOP. Reason string distinguishes env obstacle from self-
+        # collision so the dashboard can pick the right modal copy.
+        is_env = (isinstance(a, str) and a.startswith('zone#')) or \
+                 (isinstance(b, str) and b.startswith('zone#'))
+        kind = 'obstacle' if is_env else 'self-collision'
+        # Normalize order — put the link name first for readability.
+        if isinstance(a, str) and a.startswith('zone#'):
+            a, b = b, a
+        self._stop_jog_locked(
+            reason=f'{kind} guard {a} vs {b} at {d:.0f}mm')
+        return True
+
+    def _apply_cart_speed_scale_locked(self, scale, log_prefix):
+        """Emit a fresh Robot/jog at a scaled magnitude within the SAME
+        cart hold. Hysteresis + up-ramp cap match the governor semantics;
+        both the singularity governor and the joint-limit approach
+        softening call this helper. Returns True if a fresh frame was
+        emitted, False on hysteresis skip / send failure. Caller must
+        hold self._jog_lock."""
+        cmd  = self._cart_commanded_frac         # unscaled magnitude
+        sign = 1.0 if self._jog_direction >= 0 else -1.0
+        target_signed = sign * cmd * scale
+        last = self._cart_last_sent_speed
+        # Rate-limit upward changes. Downward changes propagate immediately.
+        if abs(target_signed) > abs(last):
+            cap_up = abs(last) + cmd * self._cart_speed_up_per_tick
+            if abs(target_signed) > cap_up:
+                target_signed = sign * min(abs(target_signed), cap_up)
+        # Hysteresis — only push a fresh frame when the change is
+        # material relative to the commanded magnitude. Avoids spam.
+        if abs(target_signed - last) < cmd * self._cart_speed_min_delta:
+            return False
+        # Issue: stopJog + fresh Robot/jog. Preserve session identity —
+        # this is a speed change within the SAME hold, not a new one, so
+        # hold_id / seq bookkeeping stays put.
+        try:
+            self._send({'ty': 'Robot/stopJog', 'id': self._new_nonce()})
+        except Exception as e:
+            self.get_logger().warn(f'{log_prefix}: stopJog send failed: {e}')
+            return False
+        # Robot/jog with the new signed speed. index / coorType / coorId
+        # unchanged — we're only ramping magnitude.
+        frame = {
+            'ty': 'Robot/jog',
+            'db': {
+                'mode':     2,
+                'speed':    target_signed,
+                'index':    self._jog_index,
+                'coorType': 0,
+                'coorId':   0,
+            },
+            'id': self._new_nonce(),
+        }
+        try:
+            if not self._send(frame):
+                self.get_logger().warn(f'{log_prefix}: Robot/jog send returned False')
+                return False
+        except Exception as e:
+            self.get_logger().warn(f'{log_prefix}: Robot/jog send failed: {e}')
+            return False
+        self._cart_last_sent_speed = target_signed
+        self._jog_signed_speed = target_signed
+        return True
+
+    def _apply_governor_scale_locked(self, sigma, scale):
+        """Singularity-governor speed scale. Delegates the actual send
+        to `_apply_cart_speed_scale_locked`. Caller must hold self._jog_lock."""
+        last = self._cart_last_sent_speed
+        if self._apply_cart_speed_scale_locked(scale, 'governor'):
+            self.get_logger().info(
+                f'governor scale {scale:.2f}: σ_min={sigma:.4f}  '
+                f'speed {last:+.3f} → {self._cart_last_sent_speed:+.3f}')
+
+    def _joint_limit_approach_scale_locked(self, cur_frac):
+        """Compute the softening scale that keeps every joint away from
+        its dynamic safe_edge. Returns (scale, limiting_joint_1based,
+        current_deg, safe_edge_deg, headroom_deg). scale is 1.0 when no
+        joint is inside the soft zone. `limiting_joint_1based` is None
+        when scale == 1.0. Caller must hold self._jog_lock.
+
+        This is the ramp portion of the joint-limit clamp; the hard
+        stop lives untouched in _on_jog_supervise's cart-mode branch.
+        """
+        soft_zone = max(0.0, self._cart_joint_soft_zone_deg)
+        soft_floor = max(0.01, min(1.0, self._cart_joint_soft_floor_frac))
+        best_scale = 1.0
+        best_joint = None
+        best_current = None
+        best_safe_edge = None
+        best_headroom = None
+        for i in range(6):
+            current = self._joint_deg[i]
+            limit = self._joint_limit_deg[i]
+            margin = self._dyn_limit_margin_deg(i, cur_frac)
+            safe_edge = limit - margin
+            headroom = safe_edge - abs(current)
+            # Inside the soft zone: 0 <= headroom < soft_zone.
+            # At headroom == soft_zone → scale = 1.0.
+            # At headroom == 0        → scale = soft_floor.
+            if headroom >= soft_zone or soft_zone <= 0.0:
+                continue
+            if headroom <= 0.0:
+                # Past safe_edge — the hard-stop branch will fire; report
+                # floor scale + this joint so the softening telemetry
+                # tells the truth for the one tick before the stop lands.
+                scale_i = soft_floor
+            else:
+                t = headroom / soft_zone            # 0..1
+                scale_i = soft_floor + (1.0 - soft_floor) * t
+            if scale_i < best_scale:
+                best_scale = scale_i
+                best_joint = i + 1
+                best_current = current
+                best_safe_edge = safe_edge
+                best_headroom = headroom
+        return best_scale, best_joint, best_current, best_safe_edge, best_headroom
+
+    def _stop_jog_from_expiry(self):
+        """Fires from the threading.Timer scheduled by _start_increment_jog.
+        Acquires _jog_lock via _stop_jog and sends Robot/stopJog. Safe
+        to call even if _jog_active has already been cleared (double-stop
+        is a no-op)."""
+        self._stop_jog(reason=(f'increment expiry '
+                                f'(J{self._jog_index} {self._jog_increment_delta_deg:+.2f}°)'))
+
+    def _on_jog_supervise(self):
+        """50 ms tick while a jog is active. Behavior depends on mode:
+        - 'increment': primary stop is the wall-clock one-shot timer; this
+          tick is a redundant fallback that also fires on freshness expiry.
+        - 'continuous' / 'continuous_cart': 300 ms freshness deadman is
+          the primary stop when the browser stops refreshing (browser
+          crash / tab close / touch-cancel that didn't fire release).
+          Live limit clamp: for joint mode, if the arm's current angle
+          crosses (±limit − margin) in the commanded direction, stop.
+        - 'velocity' (legacy): same freshness behavior as continuous.
+        Heartbeats fire in all modes when age ≥ jog_heartbeat_s."""
+        with self._jog_lock:
+            if not self._jog_active:
+                return
+            now = time.time()
+            if self._jog_mode == 'increment':
+                if now >= self._jog_increment_end_ts:
+                    self._stop_jog_locked(
+                        reason=f'increment complete '
+                               f'(J{self._jog_index} {self._jog_increment_delta_deg:+.2f}°, '
+                               f'ran {(now - self._jog_last_cmd_ts)*1000:.0f}ms)')
+                    return
+                if (now - self._jog_last_cmd_ts) > self._jog_freshness_s:
+                    self._stop_jog_locked(
+                        reason=f'increment freshness fallback {now - self._jog_last_cmd_ts:.2f}s')
+                    return
+            else:
+                # Continuous / velocity — freshness deadman is primary.
+                if (now - self._jog_last_cmd_ts) > self._jog_freshness_s:
+                    self._stop_jog_locked(
+                        reason=f'hold staleness {now - self._jog_last_cmd_ts:.2f}s')
+                    return
+                # Live limit clamp during a joint or cartesian hold. In
+                # cartesian mode the driver has no idea which joints are
+                # moving, so it stops if ANY joint is within margin of
+                # its ±limit — conservative but safe. /joint_states
+                # streams throughout the motion so this check has fresh
+                # data on every 50 ms tick.
+                # Effective speed_frac for the CURRENT hold — used for
+                # dynamic-margin sizing. Falls back to effective cap
+                # when signed_speed hasn't been set yet.
+                cur_frac = abs(self._jog_signed_speed) if self._jog_signed_speed else self._effective_speed_cap
+                if self._jog_mode == 'continuous':
+                    ax = self._jog_index
+                    if 1 <= ax <= 6:
+                        current = self._joint_deg[ax - 1]
+                        limit = self._joint_limit_deg[ax - 1]
+                        margin = self._dyn_limit_margin_deg(ax - 1, cur_frac)
+                        safe_edge = limit - margin
+                        # 2026-08-05 (guided recovery): escape-only zone
+                        # covers the case where the hold slipped through
+                        # the start clamp (e.g. current was inside safe_edge
+                        # at start, then drifted past it during motion) —
+                        # continue-in-deeper-direction fires with the
+                        # 'joint_limit_deeper' cause tag so the modal
+                        # can distinguish it from the ordinary limit
+                        # approach.
+                        escape_only_edge = limit - self._joint_escape_only_margin_deg
+                        if current > escape_only_edge and self._jog_direction > 0:
+                            self._stop_jog_locked(
+                                reason=f'escape_only J{ax} at {current:+.2f}° past '
+                                       f'+{escape_only_edge:.2f}° — deeper-direction '
+                                       f'refused mid-motion')
+                            return
+                        if current < -escape_only_edge and self._jog_direction < 0:
+                            self._stop_jog_locked(
+                                reason=f'escape_only J{ax} at {current:+.2f}° past '
+                                       f'-{escape_only_edge:.2f}° — deeper-direction '
+                                       f'refused mid-motion')
+                            return
+                        if self._jog_direction > 0 and current >= safe_edge:
+                            self._stop_jog_locked(
+                                reason=f'limit approach J{ax} at {current:+.2f}° '
+                                       f'(+{safe_edge:.2f}°, dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
+                            return
+                        if self._jog_direction < 0 and current <= -safe_edge:
+                            self._stop_jog_locked(
+                                reason=f'limit approach J{ax} at {current:+.2f}° '
+                                       f'(-{safe_edge:.2f}°, dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
+                            return
+                elif self._jog_mode == 'continuous_cart':
+                    # 2026-08-05 (doctrine: a limit is a wall, not a cage):
+                    # cart-mode hard-stop must be DIRECTION-AWARE per joint.
+                    # A joint past its safe_edge whose live velocity is
+                    # ESCAPING (opposite sign from position) is heading
+                    # back inside the band — do NOT stop it. Only stop
+                    # when velocity DEEPENS the violation, or when past
+                    # the physical limit (the true wall).
+                    #
+                    # Finite-difference velocity from the last two posture
+                    # samples. If we don't have two samples yet (fresh
+                    # hold), we skip the deep-check and rely on the next
+                    # tick — 50 ms of grace at crawl speed is negligible
+                    # motion, and softening below already caps speed near
+                    # the edge.
+                    hard_stop_fired = False
+                    pj = self._prev_joint_deg
+                    pt = self._prev_joint_ts
+                    dt = None
+                    if pj is not None and pt > 0.0 and self._last_posture_ts > pt:
+                        dt = self._last_posture_ts - pt
+                    for i in range(6):
+                        current = self._joint_deg[i]
+                        limit = self._joint_limit_deg[i]
+                        margin = self._dyn_limit_margin_deg(i, cur_frac)
+                        safe_edge = limit - margin
+                        if abs(current) < safe_edge:
+                            continue
+                        # Physical wall — always stop when at/past the
+                        # physical limit regardless of direction. This
+                        # is the "the wall is real" case.
+                        if abs(current) >= limit:
+                            if self._wsjog_trust_firmware_clamps:
+                                # 2026-08-28 demoted: the firmware
+                                # clamps at the wall. We just observe.
+                                self._cart_softening = {
+                                    'active': True, 'mode': 'observe',
+                                    'cause': 'cart_limit_at_wall',
+                                    'limiting_joint_1based': i + 1,
+                                    'current_deg': current,
+                                    'limit_deg':   limit,
+                                }
+                                continue
+                            self._stop_jog_locked(
+                                reason=f'cart limit approach J{i+1} at {current:+.2f}° '
+                                       f'(|>{limit:.2f}°| physical, dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
+                            hard_stop_fired = True
+                            break
+                        # Past soft edge but inside physical — check
+                        # velocity sign. Without a velocity signal, grant
+                        # one tick of grace (the softening ramp already
+                        # caps commanded speed here).
+                        if dt is None or dt < 1e-4:
+                            continue
+                        v = (current - pj[i]) / dt   # deg/s, signed
+                        # Deepening = velocity same sign as position.
+                        # Escape = velocity opposite sign, or nearly zero.
+                        VEL_ESCAPE_MIN_DPS = 0.5
+                        if abs(v) < VEL_ESCAPE_MIN_DPS:
+                            # Motion hasn't clearly started — permit; next
+                            # tick will judge.
+                            continue
+                        if (v > 0 and current > 0) or (v < 0 and current < 0):
+                            # Same sign — deepening the violation.
+                            if self._wsjog_trust_firmware_clamps:
+                                # 2026-08-28 demoted: firmware handles
+                                # the axis clamp; hold survives.
+                                self._cart_softening = {
+                                    'active': True, 'mode': 'observe',
+                                    'cause': 'cart_limit_deepening',
+                                    'limiting_joint_1based': i + 1,
+                                    'current_deg': current,
+                                    'safe_edge_deg': safe_edge,
+                                    'velocity_dps': v,
+                                }
+                                continue
+                            self._stop_jog_locked(
+                                reason=f'cart limit approach J{i+1} at {current:+.2f}° '
+                                       f'(v={v:+.2f}°/s deeper, |>{safe_edge:.2f}° soft, '
+                                       f'dyn margin {margin:.2f}° @ f={cur_frac:.2f})')
+                            hard_stop_fired = True
+                            break
+                        # Opposite sign — escaping. Do not stop. The
+                        # standard softening ramp still caps speed near
+                        # the edge, which is the right behavior.
+                    if hard_stop_fired:
+                        return
+                    # Progressive softening — ramp speed down as any joint
+                    # approaches its safe_edge. Hard-stop threshold is
+                    # untouched; this only reshapes the last N degrees of
+                    # approach. The operator feels resistance instead of a
+                    # cliff. Directive item 2 (Lesson 165).
+                    (soft_scale, soft_joint, soft_current, soft_safe_edge,
+                     soft_headroom) = self._joint_limit_approach_scale_locked(cur_frac)
+                    if soft_scale < 1.0:
+                        prev = self._cart_softening
+                        if self._wsjog_trust_firmware_clamps:
+                            # 2026-08-28 demoted: firmware clamps at
+                            # the axis limit. We observe only.
+                            self._cart_softening = {
+                                'active': True, 'mode': 'observe',
+                                'cause': 'joint_limit_soft',
+                                'limiting_joint_1based': soft_joint,
+                                'current_deg':  soft_current,
+                                'safe_edge_deg': soft_safe_edge,
+                                'headroom_deg': soft_headroom,
+                                'would_have_scaled_to': soft_scale,
+                            }
+                            if prev is None or prev.get('cause') != 'joint_limit_soft':
+                                self.get_logger().info(
+                                    f'joint-limit observe J{soft_joint}: '
+                                    f'current={soft_current:+.2f}° '
+                                    f'headroom={soft_headroom:+.2f}° '
+                                    f'would_have_scaled_to={soft_scale:.2f} '
+                                    f'(firmware clamps)')
+                        else:
+                            self._cart_softening = {
+                                'active': True, 'mode': 'scale',
+                                'cause': 'joint_limit_soft',
+                                'limiting_joint_1based': soft_joint,
+                                'current_deg':  soft_current,
+                                'safe_edge_deg': soft_safe_edge,
+                                'headroom_deg': soft_headroom,
+                                'scale': soft_scale,
+                            }
+                            emitted = self._apply_cart_speed_scale_locked(
+                                soft_scale, 'joint_limit_soft')
+                            if emitted or prev is None:
+                                self.get_logger().info(
+                                    f'joint-limit softening J{soft_joint}: '
+                                    f'current={soft_current:+.2f}° '
+                                    f'headroom={soft_headroom:+.2f}° '
+                                    f'scale={soft_scale:.2f}')
+                    else:
+                        # Left the soft zone. Rate-limited restore back to
+                        # the commanded magnitude runs through the same
+                        # helper (up-ramp cap prevents an instant slam).
+                        if self._cart_softening is not None:
+                            if not self._wsjog_trust_firmware_clamps:
+                                self._apply_cart_speed_scale_locked(
+                                    1.0, 'joint_limit_soft_restore')
+                            self._cart_softening = None
+                    # ── Singularity + overspeed governor (cart only) ──
+                    # Compute σ_min at live joint angles; scale/stop the
+                    # cartesian jog before the controller's IK explodes.
+                    # σ_soft is speed-scaled — at higher speed_frac the
+                    # IK amplification arrives sooner in wall time, so
+                    # engage the governor earlier. σ_hard stays at the
+                    # physical stop threshold.
+                    if self._last_posture_ts > 0.0:
+                        sigma = self._sing_guard.sigma_min(self._joint_deg)
+                        self._last_sigma_min = sigma
+                        dyn_soft = self._dyn_sigma_soft(cur_frac)
+                        scale = SingularityGuard.scale(
+                            sigma, dyn_soft, self._cart_sigma_hard)
+                        self._last_sing_scale = scale
+                        if sigma is not None and sigma <= self._cart_sigma_hard:
+                            if self._wsjog_trust_firmware_clamps:
+                                # 2026-08-28 demoted: firmware handles
+                                # IK degeneracy natively. Observe only.
+                                self._cart_softening = {
+                                    'active': True, 'mode': 'observe',
+                                    'cause': 'singularity_guard',
+                                    'sigma_min': sigma,
+                                    'sigma_hard': self._cart_sigma_hard,
+                                }
+                            else:
+                                self._stop_jog_locked(
+                                    reason=f'singularity guard (σ_min={sigma:.4f} '
+                                           f'≤ hard={self._cart_sigma_hard:.3f})')
+                                return
+                        # Reactive backstop — the sole line of defense
+                        # when the DH model is off, or when the incident
+                        # is IK-controller-side rather than kinematics-
+                        # side. Finite-difference velocity from the last
+                        # two posture samples.
+                        pj = self._prev_joint_deg
+                        pt = self._prev_joint_ts
+                        if (pj is not None and pt > 0.0
+                                and self._last_posture_ts > pt):
+                            dt = self._last_posture_ts - pt
+                            if dt > 1e-4:
+                                worst_ratio = 0.0
+                                worst_i = -1
+                                worst_dq = 0.0
+                                for i in range(6):
+                                    dq_dps = (self._joint_deg[i] - pj[i]) / dt
+                                    dq_rps = math.radians(dq_dps)
+                                    ratio = abs(dq_rps) / max(1e-6, self._cart_joint_v_cap)
+                                    if ratio > worst_ratio:
+                                        worst_ratio = ratio
+                                        worst_i     = i
+                                        worst_dq    = dq_rps
+                                # 2026-08-28 velocity scaling was the
+                                # first step; final step is the demotion
+                                # to observe-only when firmware clamps
+                                # are trusted (parity with pendant).
+                                # ENFORCE branch below retains the
+                                # scaled behavior for regression testing
+                                # via WSJOG_TRUST_FIRMWARE_CLAMPS=0.
+                                if worst_ratio > 1.0 and worst_i >= 0 \
+                                        and self._wsjog_trust_firmware_clamps:
+                                    # Observe only — firmware clamps
+                                    # per-joint velocity. We track for
+                                    # telemetry + optional operator
+                                    # coach toast.
+                                    prev_soft = self._cart_softening
+                                    self._cart_softening = {
+                                        'active': True, 'mode': 'observe',
+                                        'cause':  'joint_overspeed',
+                                        'limiting_joint_1based': worst_i + 1,
+                                        'observed_dq_rps': worst_dq,
+                                        'cap_rps': self._cart_joint_v_cap,
+                                    }
+                                    if prev_soft is None or (
+                                            prev_soft.get('cause')
+                                            != 'joint_overspeed'):
+                                        self.get_logger().info(
+                                            f'joint-overspeed observe J{worst_i+1}: '
+                                            f'dq={worst_dq:+.2f} rad/s '
+                                            f'(cap {self._cart_joint_v_cap:.2f}) '
+                                            '(firmware clamps)')
+                                elif worst_ratio > 1.0 and worst_i >= 0:
+                                    # Aim ~15 % below the cap so a small
+                                    # kinematic wiggle doesn't retrigger.
+                                    target_scale = 0.85 / worst_ratio
+                                    target_scale = max(0.05, min(1.0, target_scale))
+                                    prev_soft = self._cart_softening
+                                    self._cart_softening = {
+                                        'active': True,
+                                        'cause':  'joint_overspeed',
+                                        'limiting_joint_1based': worst_i + 1,
+                                        'observed_dq_rps': worst_dq,
+                                        'cap_rps': self._cart_joint_v_cap,
+                                        'scale':  target_scale,
+                                    }
+                                    emitted = self._apply_cart_speed_scale_locked(
+                                        target_scale,
+                                        f'joint_overspeed_J{worst_i+1}')
+                                    if emitted or prev_soft is None \
+                                            or (prev_soft.get('cause') !=
+                                                'joint_overspeed'):
+                                        self.get_logger().warn(
+                                            f'joint-overspeed scaling J{worst_i+1}: '
+                                            f'dq={worst_dq:+.2f} rad/s '
+                                            f'(cap {self._cart_joint_v_cap:.2f}) '
+                                            f'→ scale={target_scale:.2f}')
+                                    # Escape hatch: if scaling exhausted (we
+                                    # asked for near-zero but STILL over cap
+                                    # after a couple of ticks), hard-stop
+                                    # with a NAMED cause so the operator
+                                    # still gets a truthful refusal.
+                                    if (target_scale < 0.08 and worst_ratio > 3.0
+                                            and abs(self._cart_last_sent_speed) < 0.05):
+                                        self._stop_jog_locked(
+                                            reason=(
+                                                f'joint overspeed guard J{worst_i+1} '
+                                                f'{worst_dq:+.2f} rad/s '
+                                                f'(cap {self._cart_joint_v_cap:.2f}) — '
+                                                'scaling exhausted, kinematics '
+                                                'unrecoverable at this pose'))
+                                        return
+                        # If σ is in the scaling zone, ramp the commanded
+                        # speed. The captured protocol rejects a fresh
+                        # Robot/jog while active only sometimes (the
+                        # "100/robot state is not ready" case was seen at
+                        # state=0, not during a good hold), so we go via
+                        # stopJog + fresh Robot/jog when the change is
+                        # meaningful — hysteresis at 10 %, up-ramp capped
+                        # per tick. If a downward change wanted, apply
+                        # immediately; upward changes rate-limit.
+                        if scale < 1.0 and sigma is not None:
+                            if self._wsjog_trust_firmware_clamps:
+                                # 2026-08-28 demoted: firmware IK
+                                # naturally slows the arm through
+                                # singularity approach. Observe only.
+                                # Do not overwrite cart_softening if
+                                # a more-specific cause is already
+                                # populated by an earlier block.
+                                if not self._cart_softening \
+                                        or self._cart_softening.get('cause') \
+                                        == 'sigma_soft':
+                                    self._cart_softening = {
+                                        'active': True, 'mode': 'observe',
+                                        'cause': 'sigma_soft',
+                                        'sigma_min': sigma,
+                                        'would_have_scaled_to': scale,
+                                    }
+                            else:
+                                self._apply_governor_scale_locked(sigma, scale)
+
+                # ── Self-collision guard (both joint and cartesian) ──
+                # Applied AFTER the limit clamp + singularity governor
+                # so those stops keep their existing reason strings.
+                # Direction-aware: only stop if the commanded motion is
+                # REDUCING the min-pair distance. Uses a 40 ms look-ahead
+                # from the current joint velocity to project the next
+                # pose and re-evaluate.
+                if (self._coll_model is not None and self._coll_guard_active
+                        and self._last_posture_ts > 0.0
+                        and self._jog_mode in ('continuous', 'continuous_cart')):
+                    if self._check_collision_locked():
+                        return   # stopped
+            if (now - self._jog_last_hb_ts) >= self._jog_hb_s:
+                try:
+                    self._send({'ty': 'Robot/jogHeartbeat', 'id': self._new_nonce()})
+                    self._jog_last_hb_ts = now
+                except Exception as e:
+                    self.get_logger().warn(f'jogHeartbeat send failed: {e}')
+                    self._stop_jog_locked(reason='hb send failed')
+
+    _STOP_REASON_PATTERNS = (
+        # (substring, cause_tag). First match wins. Ordered from most
+        # specific to most generic so a "hold staleness" reason doesn't
+        # get swept up by the generic "hb send failed" match.
+        #
+        # KILL-THE-OTHER-BUCKET DISCIPLINE (2026-08-28): every reason
+        # string emitted anywhere in this file MUST land on a named
+        # tag. The doctrine test enumerates the reason substrings and
+        # refuses `cause=other` — see test_stop_jog_taxonomy_no_other
+        # in test_provenance_doctrine.py. If you add a new
+        # _stop_jog_locked(reason='...') call site, add its substring
+        # here in the same commit.
+        ('release cmd',        'release_cmd'),
+        ('hold staleness',     'freshness_deadman'),
+        # 2026-08-05 (guided recovery): the escape-only zone drops a
+        # distinct tag so the frontend's JointRecoveryModal can bind
+        # to it separately from the generic 'joint_limit' cause.
+        ('escape_only',        'joint_limit_deeper'),
+        ('cart limit',         'joint_limit'),
+        ('limit approach',     'joint_limit'),
+        ('increment complete', 'increment_end'),
+        ('increment freshness','freshness_deadman'),
+        ('collision guard',    'collision_guard'),
+        ('obstacle guard',     'collision_guard'),
+        ('self-collision guard', 'collision_guard'),
+        # 2026-08-28: `_stop_jog_locked` reason
+        # `f'{kind} guard ... at {mm}mm'` with kind ∈
+        # {self-collision, ground, obstacle} means the ground path
+        # emitted `ground guard J6 vs table at 8mm` — bare "guard"
+        # substring didn't match. Named explicitly here.
+        ('ground guard',       'collision_guard'),
+        ('hold transition',    'hold_transition'),
+        ('zero-speed',         'zero_speed'),
+        ('hb send failed',     'hb_send_failed'),
+        ('send failed',        'send_failed'),
+        # ── 2026-08-28 kill-the-other-bucket additions ──────────
+        # Controller-side clamp: near-singular Cartesian pose blows
+        # commanded joint velocity above the arm's per-joint cap.
+        # Operator's frequent-flier culprit during cartesian holds.
+        ('joint overspeed guard', 'joint_overspeed'),
+        # Manipulability-based guard: σ_min crossed sigma_hard.
+        # Adjacent-but-distinct from joint_overspeed — the driver
+        # trips this BEFORE the controller clamp fires.
+        ('singularity guard',     'singularity_guard'),
+        # Operator disabled the arm mid-hold. Explicit action; not
+        # a fault. Distinct from the release-cmd path (release_cmd
+        # is the hold-end signal, disable is the servo cut).
+        ('disable command',       'disable_command'),
+        # WS transport disconnect happened mid-hold. Domain wire
+        # loss — distinct from the freshness deadman (which is a
+        # timeout; this is an explicit disconnect event).
+        ('ws disconnect',         'transport_down'),
+        # Node shutdown during hold — systemd stop or SIGTERM.
+        # The stop is a safety teardown, not a fault.
+        ('node shutdown',         'node_shutdown'),
+    )
+
+    def _jog_gaps_summary(self):
+        """Compact percentile summary of the current hold's inter-
+        arrival gap samples. Returns None when we have no samples.
+        Used by the bench-script analyzer + optional dashboard
+        readout."""
+        g = list(self._jog_hold_gaps_ms)
+        if not g:
+            return None
+        g_sorted = sorted(g)
+        def pctile(p):
+            i = min(len(g_sorted) - 1, max(0, int(p * len(g_sorted))))
+            return g_sorted[i]
+        return {
+            'n':   len(g),
+            'p50': pctile(0.50),
+            'p95': pctile(0.95),
+            'p99': pctile(0.99),
+            'max': g_sorted[-1],
+            'over_200ms': sum(1 for x in g if x > 200.0),
+        }
+
+    def _tag_stop_reason(self, reason):
+        """Normalize `_stop_jog_locked` reason strings to a
+        machine-parseable `cause=<tag>: <human>` shape (2026-07-31
+        jog-stop instrumentation). The frontend parses `cause=` and
+        routes into its taxonomy for the bench cause distribution.
+
+        Idempotent — reasons that already carry a `cause=` prefix
+        pass through unchanged."""
+        r = str(reason or '')
+        if 'cause=' in r:
+            return r
+        lower = r.lower()
+        for token, tag in self._STOP_REASON_PATTERNS:
+            if token in lower:
+                return f'cause={tag}: {r}'
+        return f'cause=other: {r}' if r else 'cause=other'
+
+    _CAUSE_JOINT_RE = re.compile(r'J([1-6])\s+at\s+([+-]?\d+(?:\.\d+)?)')
+
+    def _build_stop_cause_locked(self, tagged_reason, prev_mode, prev_index):
+        """Extract a structured `stop_cause` dict from a
+        cause=<tag>: <human> string. The dashboard's
+        `_jog_stop_cause_operator_copy` reads this dict — it never
+        re-parses the raw human text. Caller must hold self._jog_lock.
+
+        Fork registry canonical: this method is the single source of
+        `tag`/`joint_index_1based`/`joint_deg`/`joint_limit_deg` values.
+        The dashboard passes them through untouched; the frontend
+        renders the dashboard's translated strings."""
+        raw = str(tagged_reason or '')
+        # Tag lives right after `cause=` and before `:` or end of string.
+        tag = 'other'
+        m = re.match(r'cause=([a-z_]+)', raw)
+        if m:
+            tag = m.group(1)
+        # `J<n> at <deg>` — set by every joint/cart limit-approach reason,
+        # by the singularity/overspeed guards ("joint overspeed guard J3"),
+        # and by the joint clamp on start. If the reason string doesn't
+        # match this shape (freshness_deadman, release_cmd, send_failed,
+        # increment_end etc.), joint_* stay None and the operator copy
+        # uses tag-only phrasing.
+        joint_i1 = None
+        joint_deg = None
+        joint_limit_deg = None
+        jm = self._CAUSE_JOINT_RE.search(raw)
+        if jm:
+            joint_i1 = int(jm.group(1))
+            try:
+                joint_deg = float(jm.group(2))
+            except (TypeError, ValueError):
+                joint_deg = None
+            if 1 <= joint_i1 <= 6:
+                joint_limit_deg = float(self._joint_limit_deg[joint_i1 - 1])
+        # Fallback: if the tag says joint-limit but no `J<n>` matched
+        # (defensive), pull the axis from the prev_index snapshot so the
+        # operator still gets a joint-scoped copy string.
+        if joint_i1 is None and tag == 'joint_limit' and 1 <= int(prev_index or 0) <= 6:
+            joint_i1 = int(prev_index)
+            joint_limit_deg = float(self._joint_limit_deg[joint_i1 - 1])
+            try:
+                joint_deg = float(self._joint_deg[joint_i1 - 1])
+            except (TypeError, IndexError, ValueError):
+                joint_deg = None
+        # 2026-08-05 (clearance warnings OFF): the dashboard's
+        # operator copy needs to distinguish self / ground / env
+        # guards to pick the right hard-stop phrasing:
+        #   self   → "arm too close to itself, Nmm"
+        #   ground → "arm too close to the floor, Nmm"
+        #   env    → generic "approaching an obstacle" (unchanged)
+        # The raw reason from _stop_jog_locked carries the kind as
+        # a prefix ("self-collision guard ... at Nmm" /
+        # "ground guard ..." / "obstacle guard ..."), so parse it
+        # once here — the frontend must not re-parse.
+        guard_kind = None
+        dist_mm    = None
+        if tag == 'collision_guard':
+            lower = raw.lower()
+            if 'self-collision guard' in lower:
+                guard_kind = 'self'
+            elif 'ground guard' in lower:
+                guard_kind = 'ground'
+            elif 'obstacle guard' in lower or 'zone#' in lower:
+                guard_kind = 'env'
+            dm = re.search(r'at\s+(\d+)\s*mm', raw)
+            if dm:
+                try: dist_mm = float(dm.group(1))
+                except (TypeError, ValueError): dist_mm = None
+        return {
+            'tag':                 tag,
+            'raw':                 raw,
+            'ts':                  self._last_stop_ts,
+            'jog_mode':            prev_mode,
+            'joint_index_1based':  joint_i1,
+            'joint_deg':           joint_deg,
+            'joint_limit_deg':     joint_limit_deg,
+            'guard_kind':          guard_kind,
+            'dist_mm':             dist_mm,
+        }
+
+    def _stop_jog_locked(self, reason=''):
+        """Send Robot/stopJog and tear down the supervise timer. Caller
+        must hold self._jog_lock. Safe to call when no jog is active."""
+        was_active = self._jog_active
+        # Snap fields the structured cause needs BEFORE the teardown
+        # below clears them.
+        prev_mode  = self._jog_mode
+        prev_index = self._jog_index
+        # Tag the reason with a machine-parseable cause prefix so the
+        # frontend can bucket stops into the operator taxonomy (see
+        # 2026-07-31 jog-stop instrumentation directive).
+        reason = self._tag_stop_reason(reason)
+        # Latch the reason regardless of active/inactive — the operator
+        # still wants to know when a rejected start or a redundant stop
+        # happened. Downstream dashboards decide staleness themselves
+        # via _last_stop_ts.
+        self._last_stop_reason = reason
+        self._last_stop_ts     = time.time()
+        # 2026-08-04: structured cause snapshot for the dashboard's
+        # operator-copy translator. The frontend renders {title, detail,
+        # technical} strings the dashboard composes from this dict —
+        # never re-parsed from reason text. Fork registry entry
+        # `jog_stop_cause_propagation` forbids frontend regexing.
+        self._last_stop_cause = self._build_stop_cause_locked(
+            reason, prev_mode, prev_index)
+        # 2026-07-31 jog-stop bench: preserve the just-ended hold's
+        # gap histogram in a "last session" slot so the bench script
+        # can query AFTER the stop landed (the live ring gets cleared
+        # below so a fresh hold's samples don't mix with the prior
+        # session's).
+        self._jog_last_hold_gaps_ms = list(self._jog_hold_gaps_ms)
+        self._jog_last_hold_gaps_summary = self._jog_gaps_summary()
+        self._jog_hold_gaps_ms = []
+        self._jog_active = False
+        self._jog_mode = None
+        self._jog_index = 0
+        self._jog_direction = 0
+        self._jog_signed_speed = 0.0
+        self._jog_increment_end_ts = 0.0
+        self._jog_increment_delta_deg = 0.0
+        # Kill the session — any refresh still in flight from this
+        # session that reaches _on_jog_command AFTER this stop is
+        # dropped by the hold_id / seq guards. Latch the just-released
+        # hold_id so a straggler with that id can't restart the session
+        # via the "active is None" code path.
+        if self._jog_active_hold_id is not None:
+            self._jog_released_hold_id = self._jog_active_hold_id
+        self._jog_active_hold_id = None
+        self._jog_last_seq = 0
+        # Cancel the one-shot expiry timer if we're stopping via any
+        # other path (freshness deadman fallback, disconnect, shutdown,
+        # zero-cmd, or a duplicate call). threading.Timer.cancel() is a
+        # no-op if the timer already fired.
+        if self._jog_increment_stop_timer is not None:
+            try:
+                self._jog_increment_stop_timer.cancel()
+            except Exception:
+                pass
+            self._jog_increment_stop_timer = None
+        if self._jog_supervise_timer is not None:
+            try:
+                self._jog_supervise_timer.cancel()
+            except Exception:
+                pass
+            self._jog_supervise_timer = None
+        # Clear the softening telemetry — the hold is gone.
+        self._cart_softening = None
+        if was_active and self._connected and self._ws is not None:
+            try:
+                self._send({'ty': 'Robot/stopJog', 'id': self._new_nonce()})
+                self.get_logger().info(f'Robot/stopJog sent ({reason})')
+            except Exception as e:
+                self.get_logger().warn(f'Robot/stopJog send failed: {e}')
+        # 2026-08-04 (Lesson 165): mode-gated stops must be loud. Publish
+        # the status blob RIGHT NOW so the dashboard sees the fresh
+        # last_stop_reason + last_stop_cause within one broadcast cycle
+        # (~40 ms), not waiting for the next posture frame (~33 ms) to
+        # naturally trigger it. An invisible stop must be impossible.
+        # Uses _publish_status_blob() specifically because that's the
+        # primary transport for last_stop_reason / last_stop_cause
+        # (see _on_estun_status pass-through in dashboard_server.py).
+        try:
+            self._publish_status_blob()
+        except Exception as e:
+            # Never let a publish exception mask the stopJog itself —
+            # the safety action already happened above.
+            self.get_logger().warn(f'_publish_status_blob after stop failed: {e}')
+
+    def _stop_jog(self, reason=''):
+        with self._jog_lock:
+            self._stop_jog_locked(reason=reason)
 
     def _publish_mode(self):
         body = {
             'monitor_only':   self._monitor_only,
+            'allow_jog':      self._allow_jog,
+            'allow_jog_source': self._allow_jog_source,
+            'allow_cartesian_jog': self._allow_cartesian_jog,
+            'allow_cart_source': self._allow_cart_source,
+            'allow_power':    self._allow_power,
+            'allow_power_source': self._allow_power_source,
+            'allow_move':     self._allow_move,
+            'allow_move_source': self._allow_move_source,
+            'allow_mode':     self._allow_mode,
+            'allow_mode_source': self._allow_mode_source,
+            # 2026-08-28 §566 four-tuple ground truth.
+            'errors':         list(self._last_errors),
+            'recoveryState':  self._recovery_state,
+            'program_state':  self._prog_state,
+            'program_project_id': self._prog_project_id,
+            'program_task':   self._prog_task,
+            'program_line':   self._prog_line,
+            'program_is_step': self._prog_is_step,
+            'jog_speed_cap':         self._jog_speed_cap,
+            'operator_speed_limit':  self._operator_speed_limit,
+            'effective_speed_cap':   self._effective_speed_cap,
+            'operator_speed_limit_pct': int(round(self._operator_speed_limit * 100)),
+            'jog_speed_cap_pct':        int(round(self._jog_speed_cap * 100)),
+            'effective_speed_cap_pct':  int(round(self._effective_speed_cap * 100)),
+            'high_speed_confirm_threshold_pct': int(self._high_speed_confirm_threshold_pct),
+            'allow_io':                          self._allow_io,
+            'allow_io_source':                   self._allow_io_source,
+            'io_poll_s':                         self._io_poll_s,
+            'jog_heartbeat_s': self._jog_hb_s,
+            'jog_freshness_s': self._jog_freshness_s,
+            'jog_active':     self._jog_active,
+            'jog_mode':       self._jog_mode,
+            'jog_index':      self._jog_index,
+            'jog_direction':  self._jog_direction,
+            'allow_cartesian_jog': self._allow_cartesian_jog,
             'ws_log_raw':     self._ws_log_raw,
             'ws_log_path':    self._ws_log_path,
             'rejections':     dict(self._rej_counts),
@@ -267,17 +3828,81 @@ class EstunCodroidDriver(Node):
             'origin':         f'http://{self._robot_ip}:{self._ui_origin_port}',
             'ip_source':      self._ip_source,
             'connected':      self._connected,
+            'conn':           self._conn_sm.status_snapshot(),
             'enabled':        self._enabled,
+            'enabling':       self._enabling,
             'state_code':     self._state_code,
+            'state_name':     self._state_name,
+            'robot_mode_code': self._robot_mode_code,  # 0 AUTO / 1 MANUAL / -1 unknown
+            'alarm':          self._alarm_active is not None,
+            'alarm_count':    len(self._alarms),
+            'active_alarm':   self._alarm_active,
+            'last_stop_reason': self._last_stop_reason,
+            'last_stop_ts':     self._last_stop_ts,
+            # 2026-08-04: structured cause snapshot for the dashboard's
+            # operator-copy translator. The frontend renders operator
+            # language sourced from this dict via
+            # `_jog_stop_cause_operator_copy` in dashboard_server.py.
+            'last_stop_cause':  self._last_stop_cause,
+            # Live cart-mode joint-limit approach softening state
+            # (see _apply_cart_speed_scale_locked + _on_jog_supervise).
+            # None when the hold is unscaled; a dict while inside the
+            # soft zone. Used for the LiveMarginHUD "slowing near
+            # J<n> limit" affordance.
+            'cart_softening':   dict(self._cart_softening) if self._cart_softening else None,
             'last_posture_age_s': (time.time() - self._last_posture_ts) if self._last_posture_ts else None,
             'last_status_age_s':  (time.time() - self._last_status_ts)  if self._last_status_ts  else None,
+            # 2026-07-31 jog-stop bench: inter-arrival gap histogram
+            # for the CURRENT hold session (cleared on _stop_jog_locked).
+            # Bench script consumes to answer "is the channel gapping
+            # past the 200 ms freshness threshold?" — the direct
+            # measure of the keepalive contract's stress.
+            'jog_hold_gaps_ms': list(self._jog_hold_gaps_ms),
+            'jog_hold_gaps_summary': self._jog_gaps_summary(),
+            # Last completed hold's gap histogram + summary. Survives
+            # across stops so the bench script can grab the numbers
+            # after the 30-second hold ends.
+            'jog_last_hold_gaps_ms': list(self._jog_last_hold_gaps_ms),
+            'jog_last_hold_gaps_summary': self._jog_last_hold_gaps_summary,
         }
         m = String(); m.data = json.dumps(body)
         self._pub_mode.publish(m)
 
     # ── WebSocket lifecycle ───────────────────────────────
 
+    def _conn_tick(self):
+        """Periodic tick that drives the ConnectStateMachine forward.
+
+        Runs at 2 Hz. Handles three orthogonal responsibilities:
+          1. If DISCONNECTED and backoff/cooldown elapsed → attempt
+             a new WS connection.
+          2. If INITIALIZING and a probe is due → emit one.
+          3. If INITIALIZING and both probe answered + grace elapsed
+             → send the FULL subscribe burst and transition to READY.
+        """
+        sm = self._conn_sm
+
+        # 1) Attempt-connect gate.
+        if sm.state in (sm.DISCONNECTED, sm.COOLDOWN):
+            ok, _reason = sm.can_attempt_connect()
+            if ok:
+                self._try_connect()
+                return  # a successful connect already sent the probe
+
+        # 2) Probe tick during grace.
+        if sm.state == sm.INITIALIZING and self._connected:
+            if sm.should_send_probe():
+                self._send_probe()
+                sm.note_probe_sent()
+            # 3) Promotion to READY.
+            if sm.should_subscribe_full():
+                self._finalize_full_subscribe()
+
     def _try_connect(self):
+        """Open the WS and send the PROBE-ONLY subscribe. This does
+        NOT send the full topic set — that waits on the readiness
+        probe answering. The state-machine handles all timing;
+        callers just invoke this when the SM says an attempt is due."""
         if self._connected:
             return
         if ws_sync is None:
@@ -292,25 +3917,427 @@ class EstunCodroidDriver(Node):
             self.get_logger().warn(f'Cannot connect {url} (origin={origin}): {e}')
             self._ws = None
             self._connected = False
+            self._conn_sm.on_connect_failure()
             return
 
         self._connected = True
+        self._conn_sm.on_connect_success()
+        self._crashloop_logged = False
         self.get_logger().info(
-            f'Connected {url} (origin={origin}) — sending v2.3 subscribe burst')
+            f'Connected {url} (origin={origin}) — INITIALIZING '
+            f'(grace={self._grace_period_s:.1f}s, probe only until '
+            f'controller responds)')
 
-        # Subscribe burst — mirrors posture.py exactly.
+        # PROBE-ONLY subscribe. RobotStatus is safe: emitted by
+        # C2Control directly, not from the crash-prone RT loop.
         try:
-            for t in SUBSCRIBE_TOPICS:
+            for t in PROBE_TOPICS:
                 self._send({'ty': f'publish/{t}'})
         except Exception as e:
-            self.get_logger().warn(f'Subscribe burst failed: {e}')
+            self.get_logger().warn(f'Probe subscribe failed: {e}')
             self._disconnect()
             return
+
+        # First probe fires immediately.
+        try:
+            self._send_probe()
+            self._conn_sm.note_probe_sent()
+        except Exception as e:
+            self.get_logger().warn(f'Readiness probe send failed: {e}')
 
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._recv_thread.start()
 
+    def _send_probe(self):
+        """Send the readiness probe. IOManager/GetIOInfo is the
+        lightweight system query mined from the Codroid UI bundle —
+        we don't have wire-log confirmation it exists on this
+        firmware, so the driver ALSO accepts any well-formed
+        publish/RobotStatus frame as evidence the controller is
+        responsive (see _handle_frame). Either signal graduates us
+        out of the grace state."""
+        try:
+            self._send({'ty': 'IOManager/GetIOInfo',
+                        'id': self._new_nonce()})
+        except Exception as e:
+            self.get_logger().warn(f'probe send failed: {e}')
+
+    def _finalize_full_subscribe(self):
+        """Grace passed + probe answered → send the full topic burst
+        and promote to READY. This is the ONLY path that subscribes
+        to RobotPosture / RobotCoordinate (the topics that crashed
+        the controller when subscribed too early)."""
+        try:
+            for t in FULL_TOPICS:
+                self._send({'ty': f'publish/{t}'})
+        except Exception as e:
+            self.get_logger().warn(f'Full subscribe burst failed: {e}')
+            self._disconnect()
+            return
+        self._conn_sm.on_subscribed_full()
+        self.get_logger().info(
+            f'Controller READY — full subscribe burst sent '
+            f'({len(FULL_TOPICS)} topics). Telemetry mirror active.')
+
+    # ── I/O bridge ──────────────────────────────────────────────
+    #
+    # Wire-proven verbs (see estun_captures/):
+    #   IOManager/GetIOInfo   — {} → {DI:[...], DO:[...], AI:[...], AO:[...]}
+    #                           each entry {port, defaultName, name, forced,
+    #                           function}. Cheap, run at low rate.
+    #   IOManager/GetIOValue  — batched read: db is an array of
+    #                           {type,port} — response same shape with
+    #                           `value` filled in.
+    #   IOManager/SetIOForcedFlag — {port, value, type:"DI"|"DO"};
+    #                           value=1 asserts a force (DO drives HIGH /
+    #                           DI reads HIGH regardless of pin), value=0
+    #                           RELEASES the force. Proven via the
+    #                           GetIOInfo.forced round-trip on the DI2
+    #                           capture (see PORT-MAP v2 commit).
+    _IO_TYPES = ('DI', 'DO', 'AI', 'AO')
+
+    def _io_poll(self):
+        """Periodic I/O poll. Runs at ~2 Hz (configurable). No wire
+        traffic until the SM is READY — the connect-race fix (Part
+        2788ec3) is the whole reason we're careful about this."""
+        if not self._connected:
+            return
+        if self._conn_sm.state != self._conn_sm.READY:
+            return
+        now = time.time()
+        # GetIOInfo — cheap, but low rate is enough (names/forced flags
+        # only change when the operator edits them).
+        if now - self._io_last_info_ts >= self._io_info_poll_s:
+            self._io_last_info_ts = now
+            try:
+                self._send({'ty': 'IOManager/GetIOInfo', 'db': '',
+                            'id': self._new_nonce()})
+            except Exception:
+                pass
+        # GetIOValue — batched request across every known port. We
+        # ask for a stable 32-DI / 32-DO / 8-AI / 8-AO fanout even
+        # before the first Info response so the ChannelRow live pill
+        # can render immediately. GetIOInfo response later trims the
+        # snapshot to real ports.
+        try:
+            batch = []
+            for typ, count in (('DI', 32), ('DO', 32), ('AI', 8), ('AO', 8)):
+                for p in range(count):
+                    batch.append({'type': typ, 'port': p})
+            self._send({'ty': 'IOManager/GetIOValue', 'db': batch,
+                        'id': self._new_nonce()})
+        except Exception:
+            pass
+
+    def _on_io_info(self, db):
+        """publish/IOManager/GetIOInfo response — merge names + forced
+        flags into the snapshot and publish."""
+        if not isinstance(db, dict):
+            return
+        for typ in self._IO_TYPES:
+            entries = db.get(typ) or []
+            if not isinstance(entries, list):
+                continue
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                port = e.get('port')
+                if port is None:
+                    continue
+                slot = self._io_snapshot[typ].setdefault(int(port), {})
+                slot['defaultName'] = e.get('defaultName')
+                slot['name']        = e.get('name')
+                slot['forced']      = int(e.get('forced') or 0)
+                slot['function']    = e.get('function')
+        self._publish_io_snapshot()
+
+    def _on_io_value(self, db):
+        """IOManager/GetIOValue response — merge port values into
+        the snapshot. Skips ports the controller returns errors for
+        (rare, e.g. port index beyond the physical fanout)."""
+        if not isinstance(db, list):
+            return
+        for e in db:
+            if not isinstance(e, dict):
+                continue
+            typ  = e.get('type')
+            port = e.get('port')
+            if typ not in self._IO_TYPES or port is None:
+                continue
+            val = e.get('value')
+            slot = self._io_snapshot[typ].setdefault(int(port), {})
+            slot['value'] = val
+        self._publish_io_snapshot()
+
+    def _publish_io_snapshot(self):
+        """Publish the merged snapshot on /estun/io. Rate-limited to
+        one publish per (io_poll_s / 2) so a burst of frame
+        responses doesn't spam the dashboard. Shape:
+            {"DI":[{port,name,defaultName,value,forced,function}, ...],
+             "DO":[...], "AI":[...], "AO":[...],
+             "ts": <unix>, "allow_io": bool}
+        """
+        now = time.time()
+        if (now - self._io_last_publish_ts) < (self._io_poll_s * 0.5):
+            return
+        self._io_last_publish_ts = now
+        out = {'ts': now, 'allow_io': self._allow_io}
+        for typ in self._IO_TYPES:
+            ports = self._io_snapshot.get(typ) or {}
+            rows = []
+            for port in sorted(ports.keys()):
+                s = ports[port]
+                rows.append({
+                    'port':        port,
+                    'name':        s.get('name'),
+                    'defaultName': s.get('defaultName'),
+                    'value':       s.get('value'),
+                    'forced':      s.get('forced', 0),
+                    'function':    s.get('function'),
+                })
+            out[typ] = rows
+        m = String(); m.data = json.dumps(out, separators=(',', ':'))
+        self._pub_io.publish(m)
+
+    # Two-path DO/DI write dispatcher.
+    #
+    #   DI  → IOManager/SetIOForcedFlag {port, value, type:"DI"}
+    #         WIRE-PROVEN — the factory UI's DI-force capture (2026-07-21
+    #         estun_lua_io_v2_20260721.har). value:1 forces HIGH,
+    #         value:0 releases. GetIOInfo.forced round-trip confirmed.
+    #
+    #   DO  → NOT force-flag. Live capture 2026-07-22:
+    #             TX: {"ty":"IOManager/SetIOForcedFlag","db":{"port":1,"value":1,"type":"DO"}, ...}
+    #             RX: {"id":"...","ty":"IOManager/SetIOForcedFlag","db":null}
+    #         Silent success-shape ACK with NO physical effect —
+    #         subsequent GetIOValue / GetIOInfo report value=0 forced=0.
+    #         Matches the operator's observation that the factory UI
+    #         itself has NO DO force toggle (DI only): this firmware
+    #         doesn't force outputs via SetIOForcedFlag.
+    #         Path we take instead: build a one-line Lua source
+    #             setDO(<port>, <val>)
+    #         upload it as a dedicated `ioconsole` project (idempotent
+    #         reuse of the same project id), switch to AUTO if we
+    #         aren't already, project/run it. setDO is the wire-proven
+    #         Lua verb from luaenginelib.json — the Estun-supported way
+    #         to change a DO. ~200-400 ms latency per toggle, dominated
+    #         by 4 HTTP save posts + toAuto + project/run round-trips.
+
+    _IOCONSOLE_ID   = 'ioconsole'
+    _IOCONSOLE_TASK = 'main'
+
+    def _on_io_set(self, msg):
+        """Handle a /robot/io_set write. Body:
+            {"port": <int>, "value": 0|1, "type": "DO"|"DI"}
+        Gate: monitor_only=false AND allow_io=true AND SM==READY.
+        DI writes go to SetIOForcedFlag; DO writes go through the
+        Lua-runtime `setDO(port, val)` path (see class docstring)."""
+        family = 'io'
+        if self._monitor_only:
+            self._reject(family, 'monitor_only active',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._allow_io:
+            self._reject(family, 'allow_io gate closed',
+                         extra={'payload': msg.data[:200]})
+            return
+        if not self._connected:
+            self._reject(family, 'ws not connected',
+                         extra={'reason_code': 'transport_down'})
+            return
+        if self._conn_sm.state != self._conn_sm.READY:
+            self._reject(family,
+                f'controller {self._conn_sm.state} — writes gated until READY',
+                extra={'reason_code': 'controller_not_ready'})
+            return
+        try:
+            d = json.loads(msg.data)
+        except Exception as e:
+            self._reject(family, f'invalid JSON: {e}')
+            return
+        typ  = str(d.get('type') or '').upper()
+        port = d.get('port')
+        val  = d.get('value')
+        if typ not in ('DI', 'DO'):
+            self._reject(family, f'unsupported type {typ!r} (want DI or DO)')
+            return
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            self._reject(family, f'invalid port {port!r}')
+            return
+        val_int = 1 if val else 0
+        if typ == 'DI':
+            self._do_di_force(port, val_int, family)
+        else:
+            self._do_do_write_lua(port, val_int, family)
+
+    def _do_di_force(self, port, val_int, family):
+        """DI force via wire-proven IOManager/SetIOForcedFlag."""
+        frame = {
+            'ty': 'IOManager/SetIOForcedFlag',
+            'db': {'port': port, 'value': val_int, 'type': 'DI'},
+            'id': self._new_nonce(),
+        }
+        try:
+            ok = self._send(frame)
+        except Exception as e:
+            self._reject(family, f'send raised: {e}')
+            return
+        if not ok:
+            self._reject(family, 'send returned False')
+            return
+        slot = self._io_snapshot['DI'].setdefault(port, {})
+        slot['forced'] = val_int
+        self.get_logger().info(
+            f'IOManager/SetIOForcedFlag sent: type=DI port={port} value={val_int}')
+        self._publish_io_snapshot()
+
+    def _do_do_write_lua(self, port, val_int, family):
+        """DO write via the wire-proven Lua path.
+        Uploads a dedicated `ioconsole` project containing exactly
+        `setDO(<port>, <val>)`, then Robot/toAuto + project/run.
+        Runs on a background thread — the ROS executor callback
+        returns fast so no jog / status frames pile up behind it.
+        The next GetIOValue tick is the authoritative ACK."""
+        # Refuse if there's a REAL project currently running — we'd
+        # hijack its execution otherwise.
+        if self._prog_state == 2:
+            proj = self._prog_project_id or 'unknown'
+            if proj and proj != self._IOCONSOLE_ID:
+                self._reject(family,
+                    f'controller is running project {proj!r} — '
+                    f'refuse to hijack for DO write')
+                return
+        # Serialize DO writes so two rapid toggles don't race the
+        # save + toAuto + run sequence on the wire.
+        if getattr(self, '_io_do_write_lock', None) is None:
+            self._io_do_write_lock = threading.Lock()
+        t = threading.Thread(
+            target=self._do_do_write_lua_worker,
+            args=(port, val_int, family),
+            name=f'io-do-{port}-{val_int}',
+            daemon=True,
+        )
+        t.start()
+
+    def _do_do_write_lua_worker(self, port, val_int, family):
+        from estun_driver import program_ops
+        with self._io_do_write_lock:
+            lua = (
+                f'-- roboai I/O console — driver-owned single-op DO write\n'
+                f'setDO({port}, {val_int})\n'
+                f'-- Lua version 5.3\n'
+            )
+            try:
+                steps = program_ops.save_project(
+                    self._robot_ip, self._ui_origin_port,
+                    project_id=self._IOCONSOLE_ID,
+                    task_id=self._IOCONSOLE_TASK,
+                    project_display='I/O Console',
+                    task_display='main',
+                    lua_source=lua,
+                    varspoint={},
+                    timeout_s=3.0,
+                )
+            except Exception as e:
+                self._reject(family, f'ioconsole save raised: {e}')
+                return
+            bad = [s for s in steps if s.get('http_status') != 200]
+            if bad:
+                self._reject(family,
+                    f'ioconsole save failed: {bad[0].get("step")} '
+                    f'HTTP {bad[0].get("http_status")}')
+                return
+            # Snapshot the alarm state so we can detect a NEW alarm
+            # raised by the run below (10014 is the common one — see
+            # the hardware-mode-key constraint documented in the
+            # class docstring).
+            pre_alarm = self._alarm_active
+            # Best-effort project/stop — clears any prior ioconsole
+            # run that got wedged (alarm 10000 "A project is already
+            # running." on the next attempt). Safe to send when no
+            # project is active — the controller ACKs and no-ops.
+            self._ws_verb('project/stop')
+            # Best-effort mode switch. Robot/toAuto returns success
+            # even when the physical mode key is in MANUAL — the
+            # actual transition needs the operator's cabinet key at
+            # AUTO. If it stays in MANUAL, project/run below will
+            # raise alarm 10014 "Robot not in automatic mode." which
+            # we catch and surface as a clean rejection.
+            self._ws_verb('Robot/toAuto')
+            time.sleep(0.05)   # give the stop + toAuto acks a beat
+            ok = self._ws_verb('project/run', {
+                'id':   self._IOCONSOLE_ID,
+                'task': self._IOCONSOLE_TASK,
+            })
+            self.get_logger().info(
+                f'ioconsole setDO({port}, {val_int}) run ok={ok}')
+            # Wait briefly for the run to complete OR an alarm to fire.
+            # setDO is essentially instantaneous, but the round-trip
+            # through the interpreter adds ~200-400 ms. Alarm 10014
+            # arrives with the same latency when the mode-key blocks
+            # the run.
+            deadline = time.time() + 1.5
+            hit_alarm = None
+            while time.time() < deadline:
+                time.sleep(0.05)
+                aa = self._alarm_active
+                if aa and aa is not pre_alarm:
+                    hit_alarm = aa
+                    break
+            if hit_alarm:
+                code = hit_alarm.get('code')
+                text = hit_alarm.get('text') or ''
+                # Auto-clear the alarm so the next attempt (with the
+                # mode key flipped) starts clean; otherwise the
+                # controller re-floods this alarm at ~3 Hz.
+                try:
+                    self._send({'ty': 'System/ClearError',
+                                'id': self._new_nonce()})
+                except Exception:
+                    pass
+                if int(code) == 10014:
+                    self._reject(family,
+                        'DO write blocked: controller reports "Robot not '
+                        'in automatic mode." The cabinet mode-selector '
+                        'key must be at AUTO for the Lua-runtime setDO() '
+                        'path to run. Flip the key to AUTO and retry — '
+                        'no software override exists on this firmware.')
+                elif int(code) == 10000:
+                    # Prior run wedged — the pre-run project/stop we
+                    # already send should prevent this, but leave a
+                    # readable rejection in case the operator sees it.
+                    self._reject(family,
+                        f'DO write blocked: alarm 10000 "A project is '
+                        f'already running." Retry — the driver clears '
+                        f'this before the next attempt.')
+                else:
+                    self._reject(family,
+                        f'DO write raised alarm {code}: {text}')
+                return
+            # Force a GetIOValue tick soon so the ack lands quickly in
+            # the merged snapshot (default poll is 0.5s; this narrows
+            # the toggle-pending window).
+            self._io_last_info_ts = 0.0
+            try:
+                self._send({'ty': 'IOManager/GetIOValue',
+                            'db': [{'type': 'DO', 'port': port}],
+                            'id': self._new_nonce()})
+            except Exception:
+                pass
+            self._publish_io_snapshot()
+
     def _disconnect(self):
+        # Best-effort stopJog on the still-open socket before we drop it —
+        # if we're mid-motion and the WS dies, the controller's own
+        # heartbeat deadman is the ultimate stop, but sending our own
+        # stopJog shortens the window.
+        try:
+            self._stop_jog(reason='ws disconnect')
+        except Exception:
+            pass
+        was_connected = self._connected
         self._connected = False
         self._enabled = False
         if self._ws:
@@ -319,6 +4346,17 @@ class EstunCodroidDriver(Node):
             except Exception:
                 pass
             self._ws = None
+        if was_connected:
+            result = self._conn_sm.on_disconnect()
+            if result == 'crashloop' and not self._crashloop_logged:
+                self._crashloop_logged = True
+                self.get_logger().warn(
+                    f'controller appears to be restarting — backing off '
+                    f'{self._crashloop_cooldown_s:.0f}s '
+                    f'(≥{self._crashloop_threshold} disconnects inside '
+                    f'{self._crashloop_window_s:.0f}s window). Dashboard '
+                    f'System Check will show Controller: '
+                    f'"initializing — waiting".')
 
     def _send(self, obj):
         """Send a compact JSON frame — matches posture.py serialization."""
@@ -384,6 +4422,26 @@ class EstunCodroidDriver(Node):
     def _handle_frame(self, obj):
         ty = obj.get('ty', '')
         db = obj.get('db')
+        # ANY id-tagged reply during INITIALIZING counts as a valid
+        # readiness answer — this covers the IOManager/GetIOInfo probe
+        # regardless of whether the firmware ships that verb (unknown
+        # verbs still round-trip an id echo on some Codroid builds).
+        if (obj.get('id') is not None
+                and self._conn_sm.state == self._conn_sm.INITIALIZING):
+            self._conn_sm.note_probe_response()
+        # IOManager responses land here as {"ty": "IOManager/GetIOInfo",
+        # "db": {...}, "id": <echo>}. They're id-tagged replies, NOT
+        # publish/ frames, so dispatch before the publish-prefix gate.
+        if ty == 'IOManager/GetIOInfo':
+            self._on_io_info(db)
+            return
+        if ty == 'IOManager/GetIOValue':
+            self._on_io_value(db)
+            return
+        if ty == 'IOManager/SetIOForcedFlag':
+            # Ack of our write; next GetIOValue tick delivers the
+            # authoritative post-force value.
+            return
         if not ty.startswith('publish/'):
             return
         topic = ty[len('publish/'):]
@@ -391,9 +4449,157 @@ class EstunCodroidDriver(Node):
             self._on_posture(db)
         elif topic == 'RobotStatus':
             self._on_status(db)
-        # Other topics (WebCommand, ProjectState, Error, RobotCoordinate,
-        # ProjectStatus, web) are captured in the raw log but not
-        # otherwise processed in this telemetry mirror.
+        elif topic == 'Error':
+            self._on_error(db)
+            # Dedup + publish on transitions. See program_ops.ErrorDedup
+            # docstring — the ~3 Hz reflood collapses to one event per
+            # unique (code, unix_ts) key.
+            evt = self._prog_err_dedup.observe(db)
+            if evt.get('changed'):
+                self._prog_last_error = evt.get('entry')
+                self._publish_program_status(source='error_' + evt['kind'])
+        elif topic == 'ProjectState':
+            self._on_project_state(db)
+        # Other topics (WebCommand, RobotCoordinate, ProjectStatus, web)
+        # are captured in the raw log but not otherwise processed in
+        # this telemetry mirror.
+
+    def _on_project_state(self, db):
+        """publish/ProjectState — see program_ops.parse_project_state
+        for the shape parser. Two frame variants inside state==2:
+        the first carries the project id, subsequent frames blank it
+        and carry scripts.{task}.line instead. We persist the id
+        across the transition so the dashboard sees a stable
+        program_id for the whole run."""
+        from estun_driver.program_ops import parse_project_state
+        parsed, new_prev = parse_project_state(db, self._prog_project_id)
+        # Item 3 — raw dump for the dual-observation session. Runs
+        # BEFORE any parser reject so unparseable frames still land
+        # in the artifact for post-mortem inspection.
+        self._maybe_dump_state_frame(db, parsed)
+        if not parsed:
+            return
+        self._prog_project_id = new_prev
+        prev_state = self._prog_state
+        self._prog_state = parsed['state']
+        self._prog_task = parsed['task'] or self._prog_task
+        self._prog_line = parsed['line'] if parsed['line'] is not None else self._prog_line
+        self._prog_is_step = parsed['is_step']
+        self._prog_last_update_ts = time.time()
+        if prev_state != self._prog_state:
+            self.get_logger().info(
+                f'ProjectState: state {prev_state} → {self._prog_state} '
+                f'(project={self._prog_project_id!r} task={self._prog_task!r} '
+                f'line={self._prog_line} isStep={self._prog_is_step})')
+            # State-transition frames are the interesting ones — line-tick
+            # frames within a running program get published too but as
+            # incremental updates that the dashboard can dedup by line.
+        self._publish_program_status(source='projectstate')
+
+    def _maybe_dump_state_frame(self, db, parsed):
+        """Item 3 — Optional JSONL dump of every incoming ProjectState
+        frame, gated on the env var ESTUN_DEBUG_STATE_DUMP. Produces
+        a Jetson-local artifact the operator can cross-reference
+        against a factory-UI DevTools WS capture in the same wall-
+        clock window. File is opened lazily on the first frame and
+        stays open for the driver's lifetime — one file per driver
+        session, timestamped in the filename."""
+        if not self._state_dump_enabled:
+            return
+        if self._state_dump_fh is None:
+            try:
+                os.makedirs('/opt/cobot/logs', exist_ok=True)
+                ts = time.strftime('%Y%m%dT%H%M%S', time.gmtime())
+                path = f'/opt/cobot/logs/projectstate_dump_{ts}.jsonl'
+                self._state_dump_fh   = open(path, 'a')
+                self._state_dump_path = path
+                self.get_logger().info(
+                    f'ESTUN_DEBUG_STATE_DUMP=1 → dumping ProjectState '
+                    f'frames to {path}')
+            except Exception as e:
+                self.get_logger().warn(f'state dump open failed: {e}')
+                self._state_dump_enabled = False
+                return
+        try:
+            rec = {
+                'recv_ts':     time.time(),
+                'parsed':      parsed,
+                'raw_db':      db if isinstance(db, (dict, list)) else str(db),
+                'prev_state':  self._prog_state,
+            }
+            self._state_dump_fh.write(json.dumps(rec, separators=(',', ':')) + '\n')
+            self._state_dump_fh.flush()
+        except Exception:
+            # Never let dump failure break the state pipeline.
+            pass
+
+    def _publish_program_status(self, source: str = ''):
+        """Emit a snapshot of the program-execution state to
+        /estun/program_status. Called on ProjectState transitions and
+        Error dedup events. `stop_retry_count` and `stop_retry_ts`
+        surface the auto-retry state (Amendment 2) so the client's
+        wedge banner can print evidence-based copy — "stop sent
+        twice, controller not confirming" — once the automated
+        retry has also elapsed its window."""
+        m = String()
+        m.data = json.dumps({
+            'event': 'status',
+            'source': source,
+            'state': self._prog_state,
+            'project_id': self._prog_project_id,
+            'task': self._prog_task,
+            'line': self._prog_line,
+            'is_step': self._prog_is_step,
+            'error': self._prog_last_error,
+            'ts': time.time(),
+            'stop_retry_count': self._prog_stop_retry_count,
+            'stop_retry_ts':    (self._prog_stop_sent_ts
+                                 if self._prog_stop_retry_count > 0 else 0),
+        }, separators=(',', ':'))
+        self._pub_program.publish(m)
+
+    def _on_error(self, db):
+        """publish/Error — db is a list of active alarms (empty when none).
+        Each entry: [severity, code, ts, text] (wire-captured shape).
+        We mirror the raw list AND parse the newest entry into a structured
+        active_alarm blob so the dashboard can render cause + recovery text.
+
+        Note on empty frames: the controller re-emits Error on state
+        change but also keeps publishing at ~3 Hz; empty payloads DO
+        actively mean "no active alarms" once the alarm has cleared.
+        The dashboard's own "recent stop reason" surface is what
+        preserves cause after the alarm goes away."""
+        if not isinstance(db, list):
+            return
+        self._alarms = db
+        newest = None
+        for entry in db:
+            if not isinstance(entry, list) or len(entry) < 4:
+                continue
+            try:
+                sev  = int(entry[0])
+                code = int(entry[1])
+                ts   = float(entry[2])
+                text = str(entry[3])
+            except (TypeError, ValueError):
+                continue
+            if newest is None or ts > newest['ts']:
+                newest = {'severity': sev, 'code': code, 'ts': ts, 'text': text}
+        # Set/clear active alarm. Empty db → active clears immediately;
+        # non-empty → newest entry wins.
+        prev = self._alarm_active
+        self._alarm_active = newest
+        # Log alarm transitions (append + clear) once, don't spam per frame.
+        if newest is not None and (prev is None or prev.get('code') != newest['code']
+                                                 or prev.get('text') != newest['text']):
+            self.get_logger().warn(
+                f'ALARM active: code={newest["code"]} '
+                f'text={newest["text"]!r}')
+        elif newest is None and prev is not None:
+            self.get_logger().info(
+                f'ALARM cleared (was code={prev.get("code")} '
+                f'text={prev.get("text")!r})')
+        self._publish_status_blob()
 
     def _on_posture(self, db):
         """publish/RobotPosture — db.joint[6] (deg), db.end {x,y,z mm, a,b,c deg}."""
@@ -402,7 +4608,13 @@ class EstunCodroidDriver(Node):
         joints = db.get('joint')
         if isinstance(joints, list) and len(joints) >= 6:
             # Vectorized-ish parse: single pass, deg → rad in place.
-            self._joint_deg = [float(joints[i]) for i in range(6)]
+            new_deg = [float(joints[i]) for i in range(6)]
+            # Snapshot the previous sample BEFORE overwriting — the
+            # supervise-tick reactive backstop reads this pair as its
+            # finite-difference joint velocity estimate.
+            self._prev_joint_deg = list(self._joint_deg)
+            self._prev_joint_ts  = self._last_posture_ts
+            self._joint_deg = new_deg
             self._joint_rad = [math.radians(v) for v in self._joint_deg]
 
             js = JointState()
@@ -439,6 +4651,91 @@ class EstunCodroidDriver(Node):
             self._pub_tcp_pose.publish(ps)
 
         self._last_posture_ts = time.time()
+        # Passive collision evaluation — refresh min-pair distance on
+        # EVERY posture update so the 3D view's "min clearance" chip
+        # stays live. mesh-mesh pairs are served from `_mesh_cache`,
+        # populated by the mesh-refresh worker below (5 Hz off-loop) —
+        # keeps the posture callback under ~6 ms even at the J3=122°
+        # fold. No stop action here; stops only fire in
+        # _check_collision_locked (jog-active path).
+        # 2026-08-06: gated on _coll_guard_active so the "min
+        # clearance" chip goes blank when the guard is disabled —
+        # no clearance number to render when the guard isn't
+        # protecting anything.
+        if self._coll_model is not None and self._coll_guard_active:
+            try:
+                res = self._coll_model.evaluate(self._joint_deg)
+                if res:
+                    a, b, d = res[0]
+                    self._coll_min_pair = (a, b)
+                    self._coll_min_dist_mm = d
+                # Separate the closest ENV pair — the escape popup
+                # fires only on environment contact, not self.
+                env = [(a, b, d) for a, b, d in res
+                       if isinstance(a, str) and isinstance(b, str)
+                       and (a.startswith('zone#') or b.startswith('zone#'))]
+                if env:
+                    a, b, d = env[0]
+                    self._env_min_pair = (a, b)
+                    self._env_min_dist_mm = d
+                else:
+                    self._env_min_pair = None
+                    self._env_min_dist_mm = None
+                # ── UNIFIED GUARD STATE ────────────────────────────────
+                # Whichever pair (self / ground / env) is closest wins
+                # and drives the guard popup. `guard_kind` picks the
+                # right modal copy; `guard_escapes` is the operator's
+                # live escape menu regardless of collision type.
+                if res:
+                    a, b, d = res[0]
+                    is_ground = (a == '__ground__' or b == '__ground__')
+                    is_env    = (isinstance(a, str) and a.startswith('zone#')) \
+                              or (isinstance(b, str) and b.startswith('zone#'))
+                    if is_ground: kind = 'ground'
+                    elif is_env:  kind = 'env'
+                    else:         kind = 'self'
+                    self._guard_kind = kind
+                    self._guard_pair = (a, b)
+                    self._guard_min_dist_mm = d
+                    # Threshold selection: env uses env_warn/stop; self+ground
+                    # use collision_warn/stop. Per-pair YAML overrides win
+                    # for pairs with a design floor (link3↔link5).
+                    default_warn = self._env_warn_mm if kind == 'env' else self._coll_warn_mm
+                    default_stop = self._env_stop_mm if kind == 'env' else self._coll_stop_mm
+                    if kind == 'env':
+                        warn_mm, stop_mm = default_warn, default_stop
+                    else:
+                        warn_mm, stop_mm = self._coll_model.thresholds_for(
+                            (a, b), default_warn, default_stop)
+                    self._guard_warn_effective_mm = warn_mm
+                    self._guard_stop_effective_mm = stop_mm
+                    self._guard_active = d <= warn_mm
+                    # Escape probe table is 13× evaluate() (~78 ms). We
+                    # can't afford it in the posture callback (25 Hz).
+                    # Recompute only when d ≤ stop AND at most 2 Hz;
+                    # otherwise reuse the last computed set. Popup UI
+                    # only shows in stop band anyway (tiered policy),
+                    # so this matches when the escapes are needed.
+                    now_t = time.time()
+                    if d <= stop_mm:
+                        if now_t - self._guard_escapes_ts >= 0.5:
+                            self._guard_escapes = \
+                                self._coll_model.escape_directions_any(
+                                    self._joint_deg, (a, b))
+                            self._guard_escapes_ts = now_t
+                    else:
+                        # Cheap path: clear escapes when out of stop band.
+                        if self._guard_escapes:
+                            self._guard_escapes = []
+                        self._guard_escapes_ts = 0.0
+                # Env-specific escape publish (legacy consumers).
+                self._env_escape_dirs = list(self._guard_escapes) if (
+                    self._env_min_dist_mm is not None
+                    and self._env_stop_mm is not None
+                    and self._env_min_dist_mm <= self._env_stop_mm
+                ) else []
+            except Exception:
+                pass
         self._publish_status_blob()
 
     def _on_status(self, db):
@@ -450,9 +4747,31 @@ class EstunCodroidDriver(Node):
             state_int = int(state)
         except Exception:
             state_int = -1
+        # RobotStatus with a parseable state field is our fallback
+        # readiness signal — proves the controller is publishing
+        # state and the WS message pump is alive. The primary probe
+        # (IOManager/GetIOInfo) may or may not be answered by this
+        # firmware; either signal graduates us out of INITIALIZING.
+        if state_int >= 0 and self._conn_sm.state == self._conn_sm.INITIALIZING:
+            self._conn_sm.note_probe_response()
         self._state_code = state_int
+        self._state_name = str(db.get('stateName', ''))
+        # RobotStatus.mode: 0 = AUTO, 1 = MANUAL/TEACH. Governed by the
+        # cabinet's physical mode-selector key — no software override.
+        # DO writes via the Lua-runtime setDO() path require mode == 0;
+        # the UI reads this to grey out DO toggles when the key is in
+        # MANUAL rather than letting the operator toggle into a
+        # guaranteed-refusal round-trip.
+        try:
+            self._robot_mode_code = int(db.get('mode')) if db.get('mode') is not None else -1
+        except Exception:
+            self._robot_mode_code = -1
         was_enabled = self._enabled
-        self._enabled = (state_int == 2)
+        # Both state 2 ("Enabled") and state 3 (sub-state, still enabled)
+        # are treated as enabled. state 1 is "Enabling" — the transient
+        # that the dashboard banner uses to show ENABLING…
+        self._enabled  = (state_int in (2, 3))
+        self._enabling = (state_int == 1)
         self._last_status_ts = time.time()
 
         # Best-effort status field parsing — unknown fields go through
@@ -465,13 +4784,40 @@ class EstunCodroidDriver(Node):
         if isinstance(moving, bool):
             self._is_moving = moving
 
+        # 2026-08-28 §566/L298 pinned "errors + recoveryState = the
+        # four-tuple ground truth for recovery state". The driver
+        # had been silent on both — the toAuto refusal ladder
+        # can't diagnose what it can't see. Parse the two fields
+        # here so the diagnostic ladder in /api/estun/mode can key
+        # off them. Both are OPTIONAL in older firmware exports;
+        # defaults preserve the pre-08-28 shape.
+        errors = db.get('errors')
+        if isinstance(errors, list):
+            self._last_errors = errors
+        elif errors is None:
+            # Explicit absence — clear the mirror so a stale entry
+            # from a prior message doesn't survive a controller
+            # ClearError.
+            self._last_errors = []
+        recovery = db.get('recoveryState')
+        if recovery is None:
+            recovery = db.get('recovery_state')
+        try:
+            self._recovery_state = int(recovery) if recovery is not None else 0
+        except Exception:
+            self._recovery_state = 0
+
         # Publish enabled + mode string.
         m = Bool(); m.data = self._enabled
         self._pub_enabled.publish(m)
         mode_s = String()
-        # Map the state code to something human — 2==enabled, others
-        # collectively 'disabled' until we've documented the full set.
-        mode_s.data = 'enabled' if self._enabled else f'disabled(state={state_int})'
+        # State-code map (observed): 0=Disabled 1=Enabling 2/3=Enabled.
+        if self._enabled:
+            mode_s.data = 'enabled'
+        elif self._enabling:
+            mode_s.data = 'enabling'
+        else:
+            mode_s.data = f'disabled(state={state_int})'
         self._pub_robot_mode.publish(mode_s)
 
         est = Bool(); est.data = self._is_estop
@@ -488,27 +4834,206 @@ class EstunCodroidDriver(Node):
                     'RobotPosture will resume when the operator enables the arm.')
         elif not was_enabled:
             self.get_logger().info('RobotStatus.state=2 — controller ENABLED; posture stream should start.')
+            # Ground-plane sanity check — the first time posture goes
+            # live after enable, compute the minimum ground clearance
+            # implied by the current pose and the configured
+            # ground_z_mm. If ANY ground pair reports a NEGATIVE
+            # distance (i.e. the model thinks a link is below the
+            # physical floor), the configured value is wrong — WARN
+            # loudly. This is the 2026-07-15 wedge signature: with
+            # ground_z=0 default and normal pose, elbow was 87 mm
+            # "above" but really 400+ mm above the actual floor.
+            if (self._coll_model is not None
+                    and self._last_posture_ts > 0.0):
+                try:
+                    res = self._coll_model.evaluate(self._joint_deg)
+                    ground_res = [(a, b, d) for a, b, d in res
+                                  if a == '__ground__' or b == '__ground__']
+                    if ground_res:
+                        _, _, min_d = ground_res[0]
+                        if min_d < -50.0:   # 50 mm below "floor" is impossible
+                            self.get_logger().warn(
+                                f'GROUND SANITY FAIL: min ground clearance '
+                                f'{min_d:.0f} mm at current pose with '
+                                f'ground_z_mm={self._ground_z_mm:.0f}. The '
+                                f'physical floor cannot be above the arm — '
+                                f'check ground_z_mm in estun.yaml (should be '
+                                f'-stand_height_mm).')
+                        else:
+                            self.get_logger().info(
+                                f'ground clearance at enable pose: {min_d:.0f} mm '
+                                f'(configured ground_z_mm={self._ground_z_mm:.0f})')
+                except Exception:
+                    pass
 
         self._publish_status_blob()
 
     def _publish_status_blob(self):
+        if self._enabled:
+            robot_mode = 'enabled'
+        elif self._enabling:
+            robot_mode = 'enabling'
+        else:
+            robot_mode = f'disabled(state={self._state_code})'
         blob = {
             'connected':     self._connected,
-            'robot_mode':    'enabled' if self._enabled else f'disabled(state={self._state_code})',
+            'robot_mode':    robot_mode,
             'safety_mode':   'estop' if self._is_estop else 'normal',
             'status_flag':   self._state_code,
+            'state_code':    self._state_code,
+            'state_name':    self._state_name,
+            'robot_mode_code': self._robot_mode_code,  # 0 AUTO / 1 MANUAL / -1 unknown
             'estop':         self._is_estop,
             'moving':        self._is_moving,
             'enabled':       self._enabled,
+            'enabling':      self._enabling,
+            'alarm':         self._alarm_active is not None,
+            'alarm_count':   len(self._alarms),
+            # Structured active alarm — {severity, code, ts, text} or None.
+            # Dashboard banner uses text + code to render cause + recovery
+            # guidance; specific codes (2002 joint-limit, 2006/13046 e-stop,
+            # 2023 singular, 9012 power) get bespoke copy.
+            'active_alarm':  self._alarm_active,
+            # Latest stop reason surface — dashboard shows this as a
+            # transient toast/banner line when last_stop_ts is recent.
+            'last_stop_reason': self._last_stop_reason,
+            'last_stop_ts':     self._last_stop_ts,
+            # 2026-08-04: structured cause snapshot for the operator-copy
+            # translator. See _build_stop_cause_locked.
+            'last_stop_cause':  self._last_stop_cause,
+            # Live cart-mode joint-limit approach softening state
+            # (see _apply_cart_speed_scale_locked). None outside the
+            # soft zone; a dict while scaling to protect a joint limit.
+            'cart_softening':   dict(self._cart_softening) if self._cart_softening else None,
+            'allow_power':   self._allow_power,
             'joints_deg':    list(self._joint_deg),
             'joints_rad':    list(self._joint_rad),
+            # Cartesian-jog governor telemetry. sigma_min is None when
+            # numpy isn't available (guard disabled — only the reactive
+            # backstop remains). cart_scale is what the last supervise
+            # tick applied to the commanded speed (1.0 = unchanged).
+            'sigma_min':       self._last_sigma_min,
+            'cart_scale':      self._last_sing_scale,
+            'cart_sigma_soft': self._cart_sigma_soft,
+            'cart_sigma_hard': self._cart_sigma_hard,
+            # Self-collision guard telemetry. Dashboard uses `collision_pair`
+            # + `collision_min_mm` to render an amber/red tint on the two
+            # offending links plus a live "min clearance" readout when
+            # any pair is under 2× warn.
+            # `collision_enabled` reflects the RUNTIME kill switch,
+            # not whether the model file loaded. Frontend / event
+            # log key off this. Model-load status is
+            # `collision_model_loaded` (below).
+            'collision_enabled':      (self._coll_model is not None
+                                        and self._coll_guard_active),
+            'collision_model_loaded': self._coll_model is not None,
+            'collision_guard_active': bool(self._coll_guard_active),
+            'collision_pair':      (list(self._coll_min_pair)
+                                    if self._coll_min_pair else None),
+            'collision_min_mm':    self._coll_min_dist_mm,
+            'collision_warn_mm':   self._coll_warn_mm,
+            'collision_stop_mm':   self._coll_stop_mm,
+            'collision_warning':   self._coll_warning_active,
+            # Environment (static-obstacle) telemetry — separate from
+            # self-collision so the dashboard can trigger the escape
+            # popup only on env contact. Same warn/stop thresholds as
+            # self today; keys are separate so they can diverge.
+            'env_zone_count':      (self._coll_model.env_zone_count
+                                    if self._coll_model else 0),
+            'env_pair':            (list(self._env_min_pair)
+                                    if self._env_min_pair else None),
+            'env_min_mm':          self._env_min_dist_mm,
+            'env_escape_dirs':     list(self._env_escape_dirs),
+            # env_warn_mm/env_stop_mm are set in the guard block below;
+            # do not add them here.
+            # Unified guard state — one blob whatever the collision
+            # kind. The frontend popup keys off `guard_active`;
+            # `guard_kind` picks the headline copy.
+            'guard_active':        self._guard_active,
+            'guard_kind':          self._guard_kind,
+            'guard_pair':          (list(self._guard_pair)
+                                    if self._guard_pair else None),
+            'guard_min_mm':        self._guard_min_dist_mm,
+            'guard_warn_mm':       self._guard_warn_effective_mm,
+            'guard_stop_mm':       self._guard_stop_effective_mm,
+            'guard_escapes':       list(self._guard_escapes),
+            # Env-specific thresholds (dashboard reads separately from
+            # self/ground so it can label them).
+            'env_warn_mm':         self._env_warn_mm,
+            'env_stop_mm':         self._env_stop_mm,
+            'ground_z_mm':         self._ground_z_mm,
+            # Per-joint limit evaluation — one dict per joint so the
+            # dashboard can render a live joint-limit recovery guide.
+            # `out_of_range` means the joint is PAST its controller
+            # limit — the state that latches the 2002 alarm. Since our
+            # driver never emits Robot/jog while alarmed / disabled,
+            # the operator must jog the joint back on the factory UI;
+            # this field lets the dashboard render live guidance and
+            # a progress readout as they do so. `near_limit` is the
+            # softer "within margin" warning used pre-emptively by
+            # the jog clamp.
+            'joint_limits':  [
+                {
+                    'joint':         i + 1,
+                    'current_deg':   self._joint_deg[i],
+                    'limit_deg':     self._joint_limit_deg[i],
+                    'margin_deg':    self._joint_limit_margin_deg,
+                    'out_of_range':  abs(self._joint_deg[i]) > self._joint_limit_deg[i],
+                    'near_limit':    abs(self._joint_deg[i]) > (self._joint_limit_deg[i] - self._joint_limit_margin_deg),
+                    # 2026-08-05 (guided recovery): past_escape_only fires
+                    # when the joint has entered the escape-only zone —
+                    # this is the trigger the JointRecoveryModal binds
+                    # to. escape_only_edge_deg is the operator-visible
+                    # threshold shown in the modal body copy.
+                    'past_escape_only': abs(self._joint_deg[i]) > (self._joint_limit_deg[i] - self._joint_escape_only_margin_deg),
+                    'escape_only_edge_deg': self._joint_limit_deg[i] - self._joint_escape_only_margin_deg,
+                    # Signed distance from the edge, for the recovery
+                    # progress bar — negative = past limit (magnitude
+                    # = degrees to bring the joint back INSIDE), positive
+                    # = margin remaining.
+                    'headroom_deg':  self._joint_limit_deg[i] - abs(self._joint_deg[i]),
+                }
+                for i in range(6)
+            ],
             'tcp_mm':        list(self._tcp_mm),
             'tcp_m':         list(self._tcp_m),
             'monitor_only':  self._monitor_only,
+            'allow_jog':     self._allow_jog,
+            'allow_cartesian_jog': self._allow_cartesian_jog,
+            'jog_active':    self._jog_active,
+            'jog_mode':      self._jog_mode,
+            'jog_index':     self._jog_index,
+            'jog_direction': self._jog_direction,
+            # Two-tier speed cap so the UI can render slider ceiling +
+            # "capped" marker without a separate /estun/mode fetch.
+            'jog_speed_cap':        self._jog_speed_cap,
+            'operator_speed_limit': self._operator_speed_limit,
+            'effective_speed_cap':  self._effective_speed_cap,
+            # Integer % views for the System Check Safety row detail
+            # and the dashboard modals — no client-side rounding drift.
+            'operator_speed_limit_pct':  int(round(self._operator_speed_limit * 100)),
+            'jog_speed_cap_pct':         int(round(self._jog_speed_cap * 100)),
+            'effective_speed_cap_pct':   int(round(self._effective_speed_cap * 100)),
+            'high_speed_confirm_threshold_pct': int(self._high_speed_confirm_threshold_pct),
+            'allow_io':                          self._allow_io,
+            'allow_io_source':                   self._allow_io_source,
+            'io_poll_s':                         self._io_poll_s,
             'rejections':    dict(self._rej_counts),
             'ip':            self._robot_ip,
             'ip_source':     self._ip_source,
         }
+        # Controller-boot-race state — dashboard System Check reads
+        # `controller_init` for the "initializing — waiting" copy.
+        # See connect_state.ConnectStateMachine + the driver's boot-race
+        # comment block for the reasons this exists.
+        sm_snap = self._conn_sm.status_snapshot()
+        blob['controller_init'] = (
+            'initializing' if sm_snap['conn_state'] == 'initializing'
+            else 'cooldown'   if sm_snap['conn_state'] == 'cooldown'
+            else 'ready'      if sm_snap['conn_state'] == 'ready'
+            else 'disconnected'
+        )
+        blob['conn'] = sm_snap
         # Also publish a plain safety mode string for legacy consumers.
         sm = String(); sm.data = 'estop' if self._is_estop else 'normal'
         self._pub_safety_mode.publish(sm)
@@ -516,12 +5041,86 @@ class EstunCodroidDriver(Node):
         s = String(); s.data = json.dumps(blob)
         self._pub_status.publish(s)
 
+    # ── Runtime kill switch for the self-collision guard ──
+    #
+    # 2026-08-06 (operator directive: entire self-collision system
+    # OFF). Flips `_coll_guard_active` in place. Every guard use
+    # site gates on it, so a False here immediately silences the
+    # tick evaluator, the pre-flight jog check, the cart-mode
+    # start guard, and the posture-time min-clearance publisher.
+    # Boot state comes from the `collision_enabled` parameter
+    # (default False). Sends a status blob immediately so the
+    # dashboard's event log records the exact ts of every toggle.
+
+    def _on_collision_guard_set(self, msg):
+        try:
+            new_active = bool(msg.data)
+        except Exception:
+            return
+        prev = self._coll_guard_active
+        if new_active == prev:
+            return
+        self._coll_guard_active = new_active
+        if new_active:
+            self.get_logger().info(
+                'Self-collision guard RE-ENABLED at runtime. Model was '
+                f'{"loaded" if self._coll_model else "NOT loaded (yaml missing)"}.')
+        else:
+            self.get_logger().warn(
+                'Self-collision guard DISABLED at runtime. ALL tiers '
+                '(40 mm warn, 15 mm hard stop, ground plane) are off. '
+                'Nothing in software prevents a link-on-link or link-'
+                'on-table crash.')
+        # Publish a fresh status blob so /estun/status carries the
+        # new state within one broadcast cycle. Dashboard event log
+        # writes on the transition.
+        try:
+            self._publish_status_blob()
+        except Exception as e:
+            self.get_logger().warn(f'status blob after guard toggle failed: {e}')
+
     # ── Shutdown ──────────────────────────────────────────
 
     def destroy_node(self):
+        # Stop any live jog before we drop the socket — SIGINT lands here
+        # via rclpy's KeyboardInterrupt path in main().
+        try:
+            self._stop_jog(reason='node shutdown')
+        except Exception:
+            pass
+        try:
+            self._mesh_worker_stop.set()
+        except Exception:
+            pass
         self._disconnect()
         self._close_ws_log()
         super().destroy_node()
+
+
+# Dispatch table for /estun/program ops. Populated after the class is
+# defined so each entry references a bound method on the instance
+# (called as handler(self, d) — see _on_program_command).
+_PROGRAM_OP_HANDLERS = {
+    'save':              EstunCodroidDriver._op_save,
+    'run':               EstunCodroidDriver._op_run,
+    'step':              EstunCodroidDriver._op_runstep,
+    'runstep':           EstunCodroidDriver._op_runstep,
+    'stop':              EstunCodroidDriver._op_stop,
+    'pause':             EstunCodroidDriver._op_pause,
+    'resume':            EstunCodroidDriver._op_resume,
+    'set_start_line':    EstunCodroidDriver._op_set_start_line,
+    'clear_start_line':  EstunCodroidDriver._op_clear_start_line,
+    'set_breakpoint':    EstunCodroidDriver._op_set_breakpoint,
+    'set_breakpoints':   EstunCodroidDriver._op_set_breakpoint,
+    'clear_breakpoint':  EstunCodroidDriver._op_clear_breakpoint,
+    'clear_breakpoints': EstunCodroidDriver._op_clear_breakpoint,
+    'to_auto':           EstunCodroidDriver._op_to_auto,
+    'to_manual':         EstunCodroidDriver._op_to_manual,
+    'set_move_rate':     EstunCodroidDriver._op_set_move_rate,
+    'set_manual_rate':   EstunCodroidDriver._op_set_move_rate,
+    'set_auto_rate':     EstunCodroidDriver._op_set_auto_rate,
+    'clear_error':       EstunCodroidDriver._op_clear_error,
+}
 
 
 def main(args=None):

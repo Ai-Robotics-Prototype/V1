@@ -290,6 +290,81 @@ export default function StandaloneRobot({ onRobotReady } = {}) {
     return () => clearInterval(id)
   }, [])
 
+  // ── Self-collision tint (Phase 3) ────────────────────────────────
+  // Driver publishes {collision_pair:[a,b], collision_min_mm, warn,
+  // stop, warning} in /estun/status; backend mirrors into
+  // robot.collision_*. When the min-pair distance drops into the
+  // warn zone we tint the two offending links amber; below stop,
+  // red. On clear, restore the baked material properties. Twin URDF
+  // uses short link names (link1..link6); driver's capsule YAML uses
+  // long names (link1_shoulder..link6_flange) — LINK_NAME_TWIN maps
+  // one to the other.
+  const collisionPair    = useStore((s) => s.robot?.collision_pair)
+  const collisionMinMm   = useStore((s) => s.robot?.collision_min_mm)
+  const collisionWarnMm  = useStore((s) => s.robot?.collision_warn_mm) || 80
+  const collisionStopMm  = useStore((s) => s.robot?.collision_stop_mm) || 30
+  const tintedLinksRef = useRef({})   // { linkName: [{mesh, origEmissive, origHex}] }
+  useEffect(() => {
+    const LINK_NAME_TWIN = {
+      base_link: 'base_link',
+      link1_shoulder:  'link1', link2_upper_arm: 'link2',
+      link3_forearm:   'link3', link4_wrist1:    'link4',
+      link5_wrist2:    'link5', link6_flange:    'link6',
+    }
+    const robot = robotRef.current
+    if (!robot || !robot.links) return
+    // Determine tint color: below stop → red, else amber. If pair
+    // is null or clearance above warn, restore (no tint).
+    const shouldTint = collisionPair && Array.isArray(collisionPair)
+      && collisionMinMm != null && collisionMinMm <= collisionWarnMm
+    const isStopLevel = shouldTint && collisionMinMm <= collisionStopMm
+    const tintHex     = isStopLevel ? 0xB91C1C : 0xD97706   // red / amber
+    // Restore any previously tinted meshes that aren't in the new pair.
+    const activeShort = shouldTint
+      ? new Set(collisionPair.map((n) => LINK_NAME_TWIN[n]).filter(Boolean))
+      : new Set()
+    Object.keys(tintedLinksRef.current).forEach((linkName) => {
+      if (activeShort.has(linkName)) return
+      const entries = tintedLinksRef.current[linkName] || []
+      entries.forEach(({ mesh, origEmissive, origHex }) => {
+        if (mesh.material && mesh.material.emissive) {
+          mesh.material.emissive.setHex(origHex || 0x000000)
+          mesh.material.emissiveIntensity = origEmissive ?? 0
+        }
+      })
+      delete tintedLinksRef.current[linkName]
+    })
+    if (!shouldTint) return
+    // Apply tint to each active link's meshes.
+    activeShort.forEach((linkName) => {
+      const linkObj = robot.links?.[linkName]
+      if (!linkObj) return
+      if (tintedLinksRef.current[linkName]) {
+        // Already tinted — update color in place (warn → stop transition).
+        tintedLinksRef.current[linkName].forEach(({ mesh }) => {
+          if (mesh.material && mesh.material.emissive) {
+            mesh.material.emissive.setHex(tintHex)
+            mesh.material.emissiveIntensity = 0.55
+          }
+        })
+        return
+      }
+      const entries = []
+      linkObj.traverse((c) => {
+        if (c.isMesh && c.material && c.material.emissive) {
+          entries.push({
+            mesh: c,
+            origHex: c.material.emissive.getHex(),
+            origEmissive: c.material.emissiveIntensity ?? 0,
+          })
+          c.material.emissive.setHex(tintHex)
+          c.material.emissiveIntensity = 0.55
+        }
+      })
+      tintedLinksRef.current[linkName] = entries
+    })
+  }, [collisionPair, collisionMinMm, collisionWarnMm, collisionStopMm])
+
   // Lights ride with the robot so this component is self-contained on
   // any Canvas that mounts it. Hemisphere (sky/ground bounce) is what
   // separates a PBR robot from "flat gray" — the two prior directionals

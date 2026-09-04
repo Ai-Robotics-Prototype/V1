@@ -6,30 +6,45 @@ import { STLLoader } from 'three/examples/jsm/loaders/STLLoader'
 import * as THREE from 'three'
 import ProgramLibrary from './ProgramLibrary'
 import IdentifiedObjectsCard from '../components/IdentifiedObjectsCard'
+import RunProgramModal from '../components/RunProgramModal'
+import ProgramErrorModal from '../components/ProgramErrorModal'
+import StepPreviewPanel from '../components/StepPreviewPanel'
+import ArmEnableControl from '../components/ArmEnableControl'
+import { deriveRunState, isStopButtonEnabled,
+         isStuckStopping as _computeStuckStopping,
+         isStateStreamStale as _computeStreamStale,
+         STUCK_STOPPING_MS } from '../lib/runState'
+import { runnableStepCount } from '../lib/programTruth'
+import { namedLoadError, namedSpeedRefusal } from '../lib/loadOutcome'
+import { loadProgramFlow } from '../lib/loadProgramFlow'
 
-function StatusBadge({ status }) {
-  const colors = {
-    idle:    { bg: '#f3f4f6', border: '#d1d5db', text: '#6b7280', label: 'IDLE' },
-    running: { bg: '#f0fdf4', border: '#16A34A', text: '#16A34A', label: 'RUNNING' },
-    paused:  { bg: '#fffbeb', border: '#CA8A04', text: '#CA8A04', label: 'PAUSED' },
-    estop:   { bg: '#fef2f2', border: '#DC2626', text: '#DC2626', label: 'E-STOP' },
-    homing:  { bg: '#eff6ff', border: '#2563EB', text: '#2563EB', label: 'HOMING' },
-  }
-  const c = colors[status] || colors.idle
+// Status badge — reads the unified deriveRunState() so pill matches
+// footer matches banner. Rendered from a runState object (color, label,
+// detail, pulse) so any future new state variant just needs an entry
+// in runState.js.
+function StatusBadge({ runState }) {
+  const rs = runState || { kind: 'idle', label: 'IDLE', color: '#6b7280',
+                           bg: '#f3f4f6', border: '#d1d5db', pulse: false }
   return (
     <div style={{
       display: 'inline-flex', alignItems: 'center', gap: 10,
       padding: '12px 24px', borderRadius: 12,
-      background: c.bg, border: '2px solid ' + c.border,
+      background: rs.bg, border: '2px solid ' + rs.border,
     }}>
       <div style={{
         width: 14, height: 14, borderRadius: '50%',
-        background: c.text,
-        animation: status === 'running' ? 'pulse-dot 1.5s ease-in-out infinite' : 'none',
+        background: rs.color,
+        animation: rs.pulse ? 'pulse-dot 1.5s ease-in-out infinite' : 'none',
       }} />
-      <span style={{ fontSize: 20, fontWeight: 800, color: c.text, letterSpacing: '0.05em' }}>
-        {c.label}
+      <span style={{ fontSize: 20, fontWeight: 800, color: rs.color, letterSpacing: '0.05em' }}>
+        {rs.label}
       </span>
+      {rs.detail && (
+        <span style={{ fontSize: 12, color: rs.color, opacity: 0.75,
+                       marginLeft: 4, fontVariantNumeric: 'tabular-nums' }}>
+          {rs.detail}
+        </span>
+      )}
     </div>
   )
 }
@@ -716,49 +731,47 @@ export default function MonitorDashboard() {
   const pauseProgram   = useStore((s) => s.pauseProgram)
   const resumeProgram  = useStore((s) => s.resumeProgram)
   const cancelProgram  = useStore((s) => s.cancelProgram)
+  const homeRobot      = useStore((s) => s.homeRobot)
+  const robot          = useStore((s) => s.robot) || {}
+  const runSpeedPct    = useStore((s) => s.runSpeedPct)
+  const setRunSpeedPct = useStore((s) => s.setRunSpeedPct)
 
   // Change Program overlay state. The Program Library is rendered
   // inside a full-viewport modal here; onSelectProgram closes it and
   // makes the picked program the active one (without auto-starting).
   const [showLibrary, setShowLibrary] = useState(false)
 
+  // In-flight push indicator. Rendered as "(pushing…)" next to the
+  // current program name while /api/estun/program/run is midway
+  // through codegen + save + byte-verify. UI stays on the PREVIOUS
+  // program until the push acks — the atomic invariant (2026-08-04
+  // §rollback fix) is: the UI's current program follows push
+  // success, never precedes it.
+  const [pushingProgramName, setPushingProgramName] = useState(null)
+
+  // Shared load helper lives in lib/loadProgramFlow — see
+  // onSelectProgram below. This file owns only the Monitor-specific
+  // "Pushing…" pill state (setPushingProgramName above); the actual
+  // push_only + commit-regardless-of-outcome loop is in the lib so
+  // the Program Library's "Load to Monitor →" button uses the SAME
+  // code path.
+
   const onSelectProgram = async (prog) => {
     setShowLibrary(false)
     if (!prog || !prog.id) return
-    try {
-      const res = await fetch('/api/programs/' + encodeURIComponent(prog.id))
-      if (!res.ok) throw new Error('HTTP ' + res.status)
-      const full = await res.json()
-      if (full && Array.isArray(full.steps)) {
-        // Wholesale replace currentProgram so the Monitor (and the
-        // 3D viewer's gripper subscription) re-renders against the
-        // new program immediately.
-        setCurrentProgram({
-          id:          full.id,
-          name:        full.name,
-          description: full.description || '',
-          steps:       full.steps,
-          config:      full.config || {},
-        })
-        // Tell the executor about the new active program. action='load'
-        // is treated as a frontend-facing 'set active'; the next Run
-        // picks it up via the normal load+run flow.
-        try {
-          await fetch('/api/program/run', {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body:    JSON.stringify({ action: 'load', program_id: full.id }),
-          })
-        } catch {}
-        if (typeof addToast === 'function') {
-          addToast('Loaded "' + (full.name || full.id) + '"', 'success')
-        }
-      }
-    } catch (e) {
-      if (typeof addToast === 'function') {
-        addToast('Load failed: ' + (e?.message || e), 'error')
-      }
-    }
+    // Route through the shared loadProgramFlow lib so this handler
+    // and the Program Library's "Load to Monitor →" button use the
+    // SAME loader — one flow, not a second parallel implementation.
+    // The lib handles the 184ada3 commit-regardless-of-push-outcome
+    // rule, the named refusal toast, and the "Pushing…" pill via
+    // setPushingProgramName. See lib/loadProgramFlow.js.
+    await loadProgramFlow({
+      programId:             prog.id,
+      programLabel:          prog.name || prog.id,
+      setCurrentProgram,
+      addToast,
+      setPushingProgramName,
+    })
   }
 
   // Cycle bookkeeping lives in local state — the backend doesn't track
@@ -780,12 +793,66 @@ export default function MonitorDashboard() {
     }
   }, [task?.running, task?.paused, cycleStart])
 
-  // Derive the badge from real task + safety state.
-  const status = safety?.estop ? 'estop'
-               : task?.paused  ? 'paused'
-               : task?.running ? 'running'
-               :                  'idle'
+  // Unified run-state — same helper the StatusBar footer and the
+  // StepPreviewPanel consume, so pill / footer / banner never disagree.
+  // See lib/runState.js for the precedence rules.
+  const programIntent = useStore((s) => s.programIntent)
+  const runState = deriveRunState({ robot, task, safety, programIntent })
+  const status = runState.kind   // kept for old code that keyed off the string
+  const isRunning = runState.kind === 'running' || runState.kind === 'stopping'
 
+  // Stuck-STOPPING detector. project/stop normally transitions the
+  // controller state 2→3→0 in well under a second; if it sits at 3 for
+  // >3s, either the driver's stop ack got dropped or the interpreter
+  // stalled mid-motion. Surface a "Force stop / reset" affordance so
+  // the operator isn't trapped without a way to unwedge.
+  const [stoppingSince, setStoppingSince] = useState(null)
+  const [nowTs, setNowTs] = useState(Date.now())
+  useEffect(() => {
+    if (runState.kind === 'stopping') {
+      if (stoppingSince === null) setStoppingSince(Date.now())
+    } else if (stoppingSince !== null) {
+      setStoppingSince(null)
+    }
+  }, [runState.kind, stoppingSince])
+  useEffect(() => {
+    if (stoppingSince === null) return undefined
+    const id = setInterval(() => setNowTs(Date.now()), 500)
+    return () => clearInterval(id)
+  }, [stoppingSince])
+  const stuckStoppingMs = stoppingSince ? (nowTs - stoppingSince) : 0
+  // Pure helper — unit-tested in src/lib/runState.test.js
+  const rawStuckStopping = _computeStuckStopping(runState.kind, stoppingSince, nowTs)
+
+  // State-stream freshness gate. A wedge claim requires FRESH
+  // contradicting frames from the controller — a state=3 arriving
+  // within the last ~2.5s. If the WS stream has fallen quiet, we
+  // don't have live evidence to blame the controller; show a
+  // stream-stale banner instead. `lastProgramStateTs` is set on the
+  // client whenever a WS msg carries robot.program.state (see
+  // useStore.js). Both timestamps are same-machine Date.now(), so
+  // this comparison is safe under any clock skew against the server.
+  const lastProgramStateTs = useStore((s) => s.lastProgramStateTs)
+  const streamStale = _computeStreamStale(lastProgramStateTs, nowTs)
+  // Wedge banner fires only when the stream is fresh AND stuck.
+  // Stream-stale banner fires when the stream is quiet during any
+  // active-ish run state — running/stopping/paused (an idle stale
+  // stream is uninteresting).
+  const isStuckStopping = rawStuckStopping && !streamStale
+  const showStreamStale = streamStale
+    && ['running', 'stopping', 'paused'].includes(runState.kind)
+
+  // 2026-08-31 directive: selection is the sole push trigger (auto
+  // and silent), so currentProgram is the operator-facing truth.
+  // The mismatch banner + divergence-derivation + one-tap Push
+  // affordance are retired here. The legacy path still mirrors
+  // robot.program.resident_program_id server-side for the D9
+  // line_map honesty check (StepPreviewPanel consumes it) and for
+  // the log/event class in add-29 — a genuine out-of-band mismatch
+  // (foreign push, crashed mid-write) surfaces as a server-side
+  // event, never as a Monitor banner. This whole resident-program
+  // concept retires with RUN_BACKEND=ros2_executor (add-52
+  // §646-654) — no resident under CRI streaming.
   const programName    = currentProgram?.name || 'No program loaded'
   const steps          = currentProgram?.steps || []
   const currentStepIdx = task?.running || task?.paused ? (task?.program_step ?? 0) : -1
@@ -802,9 +869,73 @@ export default function MonitorDashboard() {
   const targetPartId   = programConfig.target_part || null
   const programIdForStats = currentProgram?.id || null
 
-  const runDisabled    = safety?.estop || (task?.running && !task?.paused)
-  const pauseDisabled  = !task?.running || task?.paused || safety?.estop
-  const stopDisabled   = !task?.running && !task?.paused
+  // Enable/disable state machine — see README block above the button
+  // row for the operator-facing summary.
+  //
+  //  Button      | idle | running | stopping | paused | estop | alarm
+  //  ------------|------|---------|----------|--------|-------|------
+  //  RUN         |  ✓   |    ·    |    ·     |   ·    |   ·   |   ·
+  //  STOP        |  ·   |    ✓    |  ✓ (*)   |   ✓    |   ✓   |   ✓
+  //  PAUSE       |  ·   |    ✓    |    ·     |   ·    |   ·   |   ·
+  //  RESUME      |  ·   |    ·    |    ·     |   ✓    |   ·   |   ·
+  //  RESTART     |  ✓   |    ✓    |    ✓     |   ✓    |   ·   |   ·
+  //  HOME        |  ✓   |    ✓    |    ✓     |   ✓    |   ·   |   ·
+  //  FORCE-STOP  |  ·   |    ·    | ✓ >3s    |   ·    |   ·   |   ·
+  //
+  // (*) STOP is intentionally exempt from the gate/estop/alarm greying
+  //     that governs the other motion verbs — STOP works precisely when
+  //     things are running or wedged. It is the only recovery affordance
+  //     that must NEVER be unavailable while the arm is in motion.
+  // Run gating (2026-08-04): the Run button is now disabled when
+  // the controller link is down (robot.connected === false). Prior
+  // to this the operator could click Run, hit the confirm modal,
+  // and only THEN discover the push would be refused server-side
+  // with outcome.kind='transport_down'. Disabling up front matches
+  // the incremental-jog panel's existing behavior and cuts a wasted
+  // modal cycle out of the operator's flow. The DRIVER DISCONNECTED
+  // banner (JogControls) still communicates the reason.
+  const linkDown = robot?.connected === false
+  const runDisabled    = safety?.estop || runState.kind === 'running'
+                          || runState.kind === 'stopping'
+                          || runState.kind === 'paused'
+                          || runState.kind === 'stale_link_down'
+                          || linkDown
+  // Return Home: only disabled by estop. Gate/connection state is
+  // surfaced by the confirm dialog so the operator can still ATTEMPT
+  // (the driver will refuse with a specific reason if the gate is
+  // closed — that's preferable to a greyed button the operator can't
+  // reason about). Explicitly enabled during 'stopping' so the arm can
+  // be returned home when a run wedges in state=3.
+  const homeDisabled   = !!safety?.estop
+  // Empty-program guard (Part G, 2026-07-22): count RUNNABLE steps
+  // — those that will produce a movJ/movL on the wire. Non-motion
+  // steps (wait, set_io, wait_input, loop) don't count. A program
+  // with only non-motion steps saves fine but the controller has
+  // nothing to run; disable the outer Run button so the operator
+  // doesn't open the confirm modal only to see it refuse. Mirrors
+  // the same rule RunProgramModal + /api/estun/program/run enforce.
+  // Shared programTruth.runnableStepCount — same resolver Editor's
+  // untaughtCount and the Run modal use.  Mirrors backend
+  // dashboard_server._has_taught_poses (2026-07-30 audit #P1-2).
+  const runnableCount = runnableStepCount(currentProgram)
+  const emptyProgram = runnableCount === 0
+  // Restart: enabled from any active state (running/stopping/paused)
+  // AND from idle. The `restartProgram` helper below handles the
+  // stop-then-run sequence when needed, so this button doubles as a
+  // "get me unstuck by starting over" affordance during a wedged
+  // STOPPING. Only estop or no-program disables it.
+  const restartDisabled = !!safety?.estop
+                          || !(currentProgram?.id)
+                          || emptyProgram
+  const pauseDisabled  = runState.kind !== 'running' || safety?.estop
+  // STOP: NEVER disabled by gate/estop — only by "there's nothing to
+  // stop" (idle without a program-execution state). Estop path is
+  // still permitted because the driver's stop verb is safe to send
+  // repeatedly and won't itself move the arm — sending it when the
+  // controller is already halted is a no-op that clears bookkeeping.
+  // Uses the unit-tested isStopButtonEnabled helper so JSX and tests
+  // agree on the rule.
+  const stopDisabled   = !isStopButtonEnabled(runState.kind)
 
   return (
     <div style={{
@@ -821,49 +952,241 @@ export default function MonitorDashboard() {
       {/* Top row: Status + Program info | Live camera */}
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 24, marginBottom: 24, flexWrap: 'wrap' }}>
         <div style={{ flex: 1, minWidth: 360 }}>
-          <StatusBadge status={status} />
+          <StatusBadge runState={runState} />
           <div style={{ marginTop: 16 }}>
             <div style={{ fontSize: 11, color: '#6b7280', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
               Current Program
             </div>
             <div style={{ fontSize: 24, fontWeight: 700, color: '#111', marginTop: 4 }}>
               {programName}
+              {pushingProgramName && (
+                <span data-testid="pushing-indicator"
+                      style={{ marginLeft: 10, fontSize: 13,
+                               fontWeight: 500, color: '#6b7280' }}>
+                  (pushing "{pushingProgramName}"…)
+                </span>
+              )}
             </div>
             {currentStepIdx >= 0 && steps.length > 0 && (
               <div style={{ fontSize: 14, color: '#6b7280', marginTop: 4 }}>
                 Step {currentStepIdx + 1} of {steps.length}: {currentStepLabel}
               </div>
             )}
+            {/* D10-adjacent (2026-08-03): the raw ProjectState wire line
+                — "state=2 task=main line=15 project=..." — used to
+                render here as a protocol dump. Controller-speak
+                never renders to the operator; the RUNNING pill +
+                program name carry the state, and single-step mode
+                surfaces as a small chip below. Raw wire data
+                lives in the debug/log surface only. */}
+            {robot?.program?.is_step && (
+              <span style={{
+                display: 'inline-block', marginTop: 8,
+                padding: '2px 8px', borderRadius: 999,
+                background: '#FEF3C7', color: '#92400E',
+                border: '1px solid #FCD34D',
+                fontSize: 11, fontWeight: 700, letterSpacing: '0.03em',
+                textTransform: 'uppercase',
+              }}>
+                Single-step
+              </span>
+            )}
+            {/* Live step-preview panel — highlights the currently-executing
+                step from publish/ProjectState.line. Only appears when
+                the current program has steps. Collapsible; header shows
+                "Step N / M" summary when collapsed. */}
+            <StepPreviewPanel />
+          </div>
+
+          {/* Speed entry — ONE control for both pre-run and mid-run
+              (2026-09-02 operator directive). Idle: setting the value
+              persists for the next run. Running: setting the value
+              also publishes to /api/estun/program/speed for a live
+              update (setAutoMoveRate on the wire), and surfaces the
+              high-speed confirm modal on 409. Full range 1-100;
+              controller-side operator_speed_limit is the true ceiling
+              (server refuses via namedSpeedRefusal when exceeded). */}
+          <ProgramSpeedEntry
+            value={runSpeedPct}
+            setValue={setRunSpeedPct}
+            isRunning={isRunning}
+            robot={robot}
+            addToast={addToast}
+          />
+
+
+          {/* Recovery banner — appears when the controller has been
+              STOPPING (state=3) for more than 3s. Offers Force stop
+              (re-issues project/stop) + Clear alarms (System/ClearError)
+              so the operator can escape a wedged stop without hunting
+              for the button on another screen. */}
+          {/* State-stream stale — the WS is quiet during an active
+              run. Different diagnosis from a wedged controller: we
+              haven't RECEIVED a state=3 recently, we're just missing
+              updates. Neutral slate palette (no amber controller-
+              blame), no Force stop/Reset buttons (no fresh evidence
+              justifies those verbs). Falls back to wedge / normal
+              rendering as soon as fresh frames resume. */}
+          {showStreamStale && !isStuckStopping && (
+            <div style={{
+              marginTop: 16, padding: 12,
+              background: '#F1F5F9', border: '1px solid #94A3B8',
+              borderRadius: 8, color: '#334155', fontSize: 14,
+              display: 'flex', alignItems: 'center', gap: 12,
+              flexWrap: 'wrap',
+            }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 700, marginBottom: 2 }}>
+                  State stream stale — reconnecting
+                </div>
+                <div style={{ fontSize: 12 }}>
+                  No fresh ProjectState frames from the driver in the last
+                  {' '}{Math.floor((nowTs - (lastProgramStateTs || nowTs)) / 1000)}s.
+                  Reconnecting; the controller's actual state is unknown
+                  until frames resume. Not blaming the controller — could
+                  be a driver restart, WS backpressure, or a subscription
+                  stall. Wedge and recovery affordances will re-appear if
+                  a real wedge is confirmed.
+                </div>
+              </div>
+            </div>
+          )}
+          {isStuckStopping && (
+            <div style={{
+              marginTop: 16, padding: 12,
+              background: '#FEF3C7', border: '1px solid #F59E0B',
+              borderRadius: 8, color: '#92400E', fontSize: 14,
+              display: 'flex', alignItems: 'center', gap: 12,
+              flexWrap: 'wrap',
+            }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 700, marginBottom: 2 }}>
+                  {(robot?.program?.stop_retry_count || 0) > 0
+                    ? `Stop sent twice, controller not confirming — STOPPING for ${Math.floor(stuckStoppingMs / 1000)}s`
+                    : `Controller wedged in STOPPING for ${Math.floor(stuckStoppingMs / 1000)}s`}
+                </div>
+                <div style={{ fontSize: 12 }}>
+                  project/stop should transition 2→3→0 in under a second.
+                  {(robot?.program?.stop_retry_count || 0) > 0
+                    ? ' The driver auto-re-issued project/stop once at the 3-second threshold and the controller still has not confirmed. Force-stop tries again manually; Reset also clears any latched controller error so Home / Restart can proceed.'
+                    : ' Force-stop re-issues the verb; Reset also clears any latched controller error so Home / Restart can proceed.'}
+                </div>
+              </div>
+              <button onClick={() => forceStop({ addToast })}
+                      style={{
+                        padding: '10px 18px', fontSize: 14, fontWeight: 700,
+                        background: '#DC2626', color: '#fff', border: 'none',
+                        borderRadius: 8, cursor: 'pointer',
+                      }}>
+                ✕ Force stop
+              </button>
+              <button onClick={() => forceReset({ addToast })}
+                      style={{
+                        padding: '10px 18px', fontSize: 14, fontWeight: 700,
+                        background: '#B45309', color: '#fff', border: 'none',
+                        borderRadius: 8, cursor: 'pointer',
+                      }}>
+                ⟲ Reset (stop + clear alarms)
+              </button>
+            </div>
+          )}
+
+          {/* Arm enable/disable — shared control (fork registry:
+              arm_enable_control). SAME component the 3D View renders,
+              SAME useStore selectors — toggling here reflects live on
+              3D View and vice versa. Placed right above the Run/Stop
+              row so the operator sees the arm's power state before
+              committing to motion. */}
+          <div style={{ display: 'flex', gap: 10, marginTop: 16,
+                        flexWrap: 'wrap', alignItems: 'center' }}>
+            <ArmEnableControl />
           </div>
 
           <div style={{ display: 'flex', gap: 10, marginTop: 20, flexWrap: 'wrap' }}>
-            {status === 'paused' ? (
-              <>
-                <button onClick={resumeProgram} disabled={safety?.estop}
-                  style={primaryBtn('#16A34A', safety?.estop)}>
-                  ▶ Resume
-                </button>
-                <button onClick={cancelProgram} style={primaryBtn('#DC2626')}>
-                  ✕ Stop
-                </button>
-              </>
-            ) : status === 'running' ? (
-              <>
-                <button onClick={pauseProgram} disabled={pauseDisabled}
-                  style={primaryBtn('#CA8A04', pauseDisabled)}>
-                  ⏸ Pause
-                </button>
-                <button onClick={cancelProgram} disabled={stopDisabled}
-                  style={primaryBtn('#DC2626', stopDisabled)}>
-                  ✕ Stop
-                </button>
-              </>
-            ) : (
-              <button onClick={runProgram} disabled={runDisabled || steps.length === 0}
-                style={primaryBtn('#16A34A', runDisabled || steps.length === 0)}>
-                ▶ Run Program
+            {/* Primary action for the current state (2026-09-02
+                operator directive):
+                  running → PAUSE + STOP
+                  paused  → RESUME + STOP
+                  idle    → RUN
+                STOP is always visible when the program is active, but
+                now rendered SECOND so PAUSE/RESUME (the operator's
+                normal-flow action) is the leftmost button. */}
+            {status === 'running' && (
+              <button onClick={pauseProgram} disabled={pauseDisabled}
+                title="project/pause — wire-proven; arm holds position, program can resume from this line"
+                style={primaryBtn('#CA8A04', pauseDisabled)}>
+                ⏸ Pause
               </button>
             )}
+            {status === 'paused' && (
+              <button onClick={resumeProgram} disabled={safety?.estop}
+                title="project/resume — continues from the paused line"
+                style={primaryBtn('#16A34A', safety?.estop)}>
+                ▶ Resume
+              </button>
+            )}
+            {!(status === 'running' || status === 'paused' || status === 'stopping') && (
+              <button
+                onClick={runProgram}
+                disabled={runDisabled || emptyProgram}
+                title={emptyProgram
+                  ? 'Program has no taught poses — nothing to run. Teach at least one point first.'
+                  : undefined}
+                style={primaryBtn('#16A34A', runDisabled || emptyProgram)}>
+                ▶ Run Program{emptyProgram ? ' (no taught poses)' : ''}
+              </button>
+            )}
+            {/* STOP — always visible while the program is active
+                (running / paused / stopping / alarm). Deliberately
+                exempt from the gate-open/estop-clear checks that grey
+                out the other motion verbs; STOP works precisely when
+                things are running or wedged. Terminates the program
+                — no resume possible after this, only restart from
+                step 1. */}
+            {!stopDisabled && (
+              <button onClick={cancelProgram}
+                      title="project/stop — terminates the program (no resume possible; use Restart to run from step 1)"
+                      style={{
+                        ...primaryBtn('#DC2626', false),
+                        boxShadow: '0 0 0 3px rgba(220,38,38,0.15)',
+                        fontSize: 17, minWidth: 140,
+                      }}>
+                ✕ STOP
+              </button>
+            )}
+            {/* RESTART PROGRAM — stops the running program (project/stop,
+                wire-proven) then re-invokes the same run path the Run
+                button uses (POST /api/estun/program/run — codegen →
+                save → project/run, with clearStartLine already inside
+                that endpoint so it starts at step 1). Also works from
+                stuck-STOPPING: the stop-then-run sequence handles the
+                wedge (and forceReset() from the recovery banner can
+                clear a latched alarm first if needed). */}
+            <button onClick={() => restartProgram({
+                              cancelProgram, currentProgram, runSpeedPct,
+                              robot, isRunning, isStuckStopping, addToast,
+                            })}
+                    disabled={restartDisabled}
+                    title="project/stop (if running) → /api/estun/program/run — restart from step 1"
+                    style={primaryBtn('#0369A1', restartDisabled)}>
+              ↻ Restart Program
+            </button>
+            {/* RETURN HOME — targets the LOADED program's first
+                MOVE_HOME pose (taught_joints resolved from
+                currentProgram.steps, not re-parsed Lua). No program
+                loaded / no MOVE_HOME step → refuses at the UI with
+                named copy rather than falling back to a global preset.
+                Speed follows runSpeedPct like any other commanded move. */}
+            <button onClick={() => returnHome({
+                              homeRobot, robot, runSpeedPct, safety,
+                              runStateKind: runState.kind,
+                              isStuckStopping, addToast, currentProgram,
+                            })}
+                    disabled={homeDisabled}
+                    title="/api/robot/home — moves to the loaded program's MOVE_HOME pose"
+                    style={primaryBtn('#0891B2', homeDisabled)}>
+              ⌂ Return Home
+            </button>
             <button onClick={() => setShowLibrary(true)} style={{
               padding: '14px 24px', fontSize: 14, fontWeight: 600,
               background: '#fff', color: '#374151',
@@ -880,13 +1203,14 @@ export default function MonitorDashboard() {
             </button>
           </div>
 
-          {/* Optional program description, below the step indicator
-              so the button row stays visible above the fold. */}
-          {currentProgram?.description && (
-            <div style={{ fontSize: 13, color: '#6b7280', marginTop: 12, lineHeight: 1.4 }}>
-              {currentProgram.description}
-            </div>
-          )}
+          {/* 2026-08-31 directive: program-metadata surfaces
+              (Demonstration/weight/demo-id badges + description
+              line) retired from the Monitor run console. Metadata
+              belongs in Program Library detail view — the run
+              console shows only what's needed to run the loaded
+              program. `has_taught_poses === false` still surfaces
+              as a "poses pending" affordance elsewhere (Run modal
+              refusal path via pending_poses named copy). */}
         </div>
 
         {/* Top-right: compact 200×200 target part viewer.
@@ -1061,6 +1385,21 @@ export default function MonitorDashboard() {
           </div>
         </div>
       )}
+
+      {/* 2026-09-04 operator directive: Monitor is for running the
+          CURRENT program, not browsing history. The "Recent runs"
+          section (RecentRunsCard) is retired from Monitor and
+          rehomed in Configure as "Motion recordings" so the
+          Download / Excursions / Trajectory affordances stay
+          reachable. The recorder ITSELF keeps writing on every
+          run — see joint_recorder.py for the new 300 MB / 7 d
+          budget + 20%-of-free-space guard. */}
+
+      {/* Run-confirm modal (opens when the operator presses Run) and
+          program error modal (opens on driver-side publish/Error
+          transitions, deduped by the driver's ErrorDedup at ~3 Hz). */}
+      <RunProgramModal />
+      <ProgramErrorModal />
     </div>
   )
 }
@@ -1073,3 +1412,397 @@ function primaryBtn(bg, disabled) {
     opacity: disabled ? 0.45 : 1,
   }
 }
+
+// Return-Home confirm. Resolves the LOADED program's first MOVE_HOME
+// step (taught_joints) and passes that pose to homeRobot, so the arm
+// moves to the program's home rather than a global preset. Reads the
+// driver's advertised operator cap so the operator sees the actual
+// effective speed before pressing OK. Uses window.confirm — same
+// pattern as other destructive-motion prompts on this dashboard.
+// Extra prompt copy when firing from stuck-STOPPING so the operator
+// knows the wedge-recovery flow.
+//
+// Refusal copy (named, at the UI, before any dispatch):
+//   - No program loaded         → "No program loaded — no program home."
+//   - Program has no MOVE_HOME  → "Loaded program has no MOVE_HOME step
+//                                  — no program home."
+// No silent fallback to the old global home.
+function resolveProgramHome(program) {
+  if (!program || !program.id) {
+    return {
+      ok: false,
+      title: 'Return Home refused',
+      detail: 'No program loaded — no program home.',
+    }
+  }
+  const steps = Array.isArray(program.steps) ? program.steps : []
+  const homeStep = steps.find(
+    (s) => s && String(s.action || '').toLowerCase() === 'move_home'
+        && Array.isArray(s.taught_joints)
+        && s.taught_joints.length === 6
+        && s.taught_joints.every((v) => typeof v === 'number'))
+  if (!homeStep) {
+    const hasAnyHome = steps.some(
+      (s) => s && String(s.action || '').toLowerCase() === 'move_home')
+    return {
+      ok: false,
+      title: 'Return Home refused',
+      detail: hasAnyHome
+        ? `Loaded program "${program.name || program.id}" has a MOVE_HOME step but no taught pose — teach it first.`
+        : `Loaded program "${program.name || program.id}" has no MOVE_HOME step — no program home.`,
+    }
+  }
+  return {
+    ok: true,
+    taught_joints: homeStep.taught_joints,
+    taught_tcp:    homeStep.taught_tcp || null,
+    program_id:    program.id,
+    program_name:  program.name || program.id,
+  }
+}
+
+function returnHome({ homeRobot, robot, runSpeedPct, safety, runStateKind, isStuckStopping, addToast, currentProgram }) {
+  const resolved = resolveProgramHome(currentProgram)
+  if (!resolved.ok) {
+    if (addToast) addToast({ title: resolved.title, detail: resolved.detail }, 'warning', 8000)
+    return
+  }
+  const capFrac = Number(robot?.operator_speed_limit ?? 0.25)
+  const capPct  = Math.max(1, Math.min(100, Math.round(capFrac * 100)))
+  const reqPct  = Math.max(1, Math.min(100, Number(runSpeedPct || capPct)))
+  const effPct  = Math.min(capPct, reqPct)
+  const gateOK  = !safety?.estop && !!robot?.connected && !!robot?.allow_move
+  const lines = [
+    isStuckStopping
+      ? `Move to "${resolved.program_name}" home from STUCK-STOPPING state?`
+      : (runStateKind === 'stopping'
+          ? `Move to "${resolved.program_name}" home from STOPPING state?`
+          : `Move to "${resolved.program_name}" home?`),
+    '',
+    `Target joints (deg): [${resolved.taught_joints.map((v) => Number(v).toFixed(2)).join(', ')}]`,
+    `Effective speed: ${effPct}%${effPct < reqPct ? ` (capped from ${reqPct}%)` : ''}`,
+    `Gate: allow_move=${robot?.allow_move ? 'true' : 'false'}, ` +
+      `monitor_only=${robot?.monitor_only ? 'true' : 'false'}, ` +
+      `connected=${robot?.connected ? 'true' : 'false'}` +
+      (safety?.estop ? ', ESTOP ACTIVE' : ''),
+    '',
+  ]
+  if (isStuckStopping) {
+    lines.push(
+      'Controller has been in STOPPING >3s — the previous run may not',
+      'have cleared. If Home is refused with a "state busy" reason, use',
+      'the yellow "Reset" button first to clear alarms, then retry.',
+      ''
+    )
+  }
+  lines.push(
+    gateOK
+      ? 'OK to send home command.'
+      : 'Gate is closed — the driver will refuse this. Press OK to try anyway.'
+  )
+  if (!window.confirm(lines.join('\n'))) return
+  try {
+    homeRobot({
+      taught_joints: resolved.taught_joints,
+      taught_tcp:    resolved.taught_tcp,
+      program_id:    resolved.program_id,
+      program_name:  resolved.program_name,
+      run_speed_pct: reqPct,
+    })
+  } catch (e) {
+    if (addToast) addToast('Home dispatch failed: ' + e, 'error')
+  }
+}
+
+// Restart-Program: stop-if-running then re-invoke the same run pipeline
+// the Run button uses. The /api/estun/program/run endpoint already
+// contains clearStartLine, so this restarts from step 1 by default.
+// Confirms in any active state (running / stopping / paused) — a
+// mid-run restart is destructive. Wedge-recovery: when the controller
+// is stuck in STOPPING, the confirm surfaces that explicitly and the
+// stop-then-run sequence still fires (the second stop is cheap; the
+// run request re-establishes the pipeline from a known state).
+async function restartProgram({ cancelProgram, currentProgram, runSpeedPct, robot, isRunning, isStuckStopping, addToast }) {
+  const name = currentProgram?.name || currentProgram?.id || '(current)'
+  const reqPct = Math.max(1, Math.min(100, Number(runSpeedPct || 10)))
+  const capFrac = Number(robot?.operator_speed_limit ?? 0.25)
+  const capPct  = Math.max(1, Math.min(100, Math.round(capFrac * 100)))
+  const effPct  = Math.min(capPct, reqPct)
+  if (isRunning || isStuckStopping) {
+    const prompt = [
+      isStuckStopping
+        ? `Restart "${name}" from step 1? (recovering STUCK-STOPPING)`
+        : `Restart "${name}" from step 1?`,
+      '',
+      isStuckStopping
+        ? 'The controller has been in STOPPING >3s. Restart will:'
+        : 'The program is currently RUNNING. This will:',
+      '  1. Send project/stop (safe to re-issue if already stopping)',
+      '  2. Re-save + re-run the program from the top',
+      '',
+      `Effective speed: ${effPct}%${effPct < reqPct ? ` (capped from ${reqPct}%)` : ''}`,
+    ]
+    if (isStuckStopping) {
+      prompt.push('',
+        'If restart is refused with a "state busy" reason, use the',
+        'yellow "Reset" button in the recovery banner to clear alarms first.'
+      )
+    }
+    if (!window.confirm(prompt.join('\n'))) return
+  }
+  try {
+    if (isRunning || isStuckStopping) {
+      // project/stop first — wire-proven rung 1. Give the driver a
+      // beat to publish the state=0 transition before re-invoking
+      // run, otherwise the two ops race on the controller.
+      try { await cancelProgram() } catch (_) { /* fall through */ }
+      await new Promise((r) => setTimeout(r, 350))
+    }
+    const res = await fetch('/api/estun/program/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        program_id: currentProgram?.id,
+        run_speed_pct: reqPct,
+      }),
+    })
+    const body = await res.json().catch(() => ({}))
+    if (body?.ok) {
+      if (addToast) addToast(`Restarted "${name}" from step 1`, 'success')
+    } else {
+      // 2026-08-05 (operator_refusal_copy fork registry): route
+      // through the shared namedLoadError so the toast shows an
+      // operator-language title/detail with the raw wire reason
+      // demoted to technicalDetail behind the Details toggle.
+      if (addToast) {
+        const named = namedLoadError(body || {}, res.status)
+        addToast({
+          title:           named.title,
+          detail:          named.detail,
+          technicalDetail: named.technicalDetail,
+          code:            'restart_refused:' + (named.code || 'unknown'),
+        }, 'error', 8000)
+      }
+    }
+  } catch (e) {
+    if (addToast) addToast(`Restart failed: ${e}`, 'error')
+  }
+}
+
+// Recovery from a stuck STOPPING (state=3 > 3s). Force-stop just
+// re-issues project/stop — the driver treats a repeat stop as an ack
+// re-request, which resolves a "the driver's stop ack got dropped by
+// the ROS transport" wedge without any operator side effect.
+async function forceStop({ addToast }) {
+  try {
+    const res = await fetch('/api/estun/program/stop', { method: 'POST' })
+    if (res.ok) {
+      if (addToast) addToast('Force-stop sent (project/stop re-issued)', 'info')
+    } else {
+      if (addToast) addToast(`Force-stop refused: HTTP ${res.status}`, 'error')
+    }
+  } catch (e) {
+    if (addToast) addToast(`Force-stop failed: ${e}`, 'error')
+  }
+}
+
+// Reset = force-stop + clear latched controller alarms. Used when the
+// wedge is caused by a latched error (alarm 10001, ESTOP release, etc.)
+// blocking the 3→0 transition. clear_error is wire-proven; safe to
+// send when there's no active error.
+async function forceReset({ addToast }) {
+  try {
+    await fetch('/api/estun/program/stop', { method: 'POST' })
+    await new Promise((r) => setTimeout(r, 150))
+    const res = await fetch('/api/estun/program/clear_error', { method: 'POST' })
+    if (res.ok) {
+      if (addToast) addToast('Reset: stop re-issued + alarms cleared', 'success')
+    } else {
+      if (addToast) addToast(`Reset partial: clear_error HTTP ${res.status}`, 'error')
+    }
+  } catch (e) {
+    if (addToast) addToast(`Reset failed: ${e}`, 'error')
+  }
+}
+
+// Editable "Program speed" input. 2026-08-31 directive removes
+// the artificial UI cap: the input accepts the full 1..100 range;
+// controller-side limits (operator_speed_limit) remain the true
+// ceiling and refuse via the server named-copy path if exceeded.
+// The prior "effective X% (cap Y%)" display presupposed a
+// client-side ceiling that could lie when the driver hadn't
+// reported yet (fell back to 25%).
+//
+// Auto-save: whenever a value commits, we persist it against the
+// CURRENT program (per-program speed model — see
+// `useStore.setRunSpeedPct` for the debounced PUT wiring). New /
+// never-run programs default to 25% (F2.7 first-run rule is now
+// satisfied as a default, not a hard cap).
+// Single speed control — pre-run AND mid-run (2026-09-02 unified).
+// - Idle: commit updates the store's runSpeedPct (per-program persist).
+// - Running: commit ALSO POSTs /api/estun/program/speed to update the
+//   live run rate (setAutoMoveRate on the wire). 409 → high-speed
+//   confirm modal; other refusals → toast via namedSpeedRefusal.
+function ProgramSpeedEntry({ value, setValue, isRunning, robot, addToast }) {
+  const [local, setLocal] = useState(String(value))
+  const [busy, setBusy]   = useState(false)
+  const [pending, setPending] = useState(null)   // {pct, threshold} on 409
+
+  useEffect(() => {
+    if (String(value) !== local) setLocal(String(value))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value])
+
+  const capFrac = Number.isFinite(robot?.operator_speed_limit)
+    ? robot.operator_speed_limit : 0.25
+  const capPct  = Math.max(1, Math.min(100, Math.round(capFrac * 100)))
+  const threshold = Number.isFinite(robot?.high_speed_confirm_threshold_pct)
+    ? robot.high_speed_confirm_threshold_pct : 40
+
+  async function pushMidRun(pct, confirmed) {
+    setBusy(true)
+    try {
+      const res = await fetch('/api/estun/program/speed', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ pct, confirmed_high_speed: !!confirmed }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (res.status === 409 && body?.needs_confirm) {
+        setPending({ pct: body.effective_pct, threshold: body.threshold_pct })
+        return
+      }
+      if (!res.ok || !body?.ok) {
+        const named = namedSpeedRefusal(body || {}, res.status)
+        addToast?.({
+          title:           named.title,
+          detail:          named.detail,
+          technicalDetail: named.technicalDetail,
+          code:            named.code,
+        }, 'error', 6000)
+        return
+      }
+      const applied = body.effective_pct
+      setLocal(String(applied))
+      setValue(String(applied))   // keep store in sync with wire truth
+      addToast?.(
+        body.capped
+          ? `Speed set to ${applied}% (capped from ${pct}%)`
+          : `Speed set to ${applied}%`,
+        'info')
+      setPending(null)
+    } catch (e) {
+      addToast?.(`Speed change failed: ${e}`, 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const commit = () => {
+    const n = Number(local)
+    if (!Number.isFinite(n) || n < 1) {
+      addToast?.('Speed must be an integer 1..100', 'warning')
+      return
+    }
+    const applied = setValue(local)
+    setLocal(String(applied))
+    if (isRunning) pushMidRun(Math.round(Number(applied)), false)
+  }
+  return (
+    <>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 10,
+        marginTop: 12,
+      }}>
+        <label style={{
+          fontSize: 12, color: '#6b7280',
+          fontWeight: 600, textTransform: 'uppercase',
+          letterSpacing: '0.05em',
+        }}>
+          Speed
+        </label>
+        <input
+          data-testid="program-speed-input"
+          type="number"
+          min={1}
+          max={100}
+          step={1}
+          value={local}
+          disabled={busy}
+          onChange={(e) => setLocal(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commit() } }}
+          style={{
+            width: 72, padding: '6px 10px',
+            fontSize: 15, fontWeight: 600,
+            border: '1px solid #d1d5db', borderRadius: 8,
+            textAlign: 'right',
+          }}
+        />
+        <span style={{ fontSize: 13, color: '#6b7280' }}>%</span>
+        {isRunning && (
+          <span style={{ marginLeft: 6, fontSize: 12, color: '#92400E' }}>
+            live · cap {capPct}% · confirm above {threshold}%
+          </span>
+        )}
+      </div>
+
+      {pending && (
+        <HighSpeedConfirmModal
+          pct={pending.pct}
+          threshold={pending.threshold}
+          cap={capPct}
+          onCancel={() => setPending(null)}
+          onConfirm={() => pushMidRun(pending.pct, true)}
+        />
+      )}
+    </>
+  )
+}
+
+function HighSpeedConfirmModal({ pct, threshold, cap, onCancel, onConfirm }) {
+  const backdrop = {
+    position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)',
+    zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center',
+  }
+  const panel = {
+    background: '#fff', borderRadius: 12, padding: 24,
+    minWidth: 440, maxWidth: 520,
+    boxShadow: '0 20px 40px rgba(0,0,0,0.3)',
+    borderTop: '4px solid #DC2626',
+  }
+  return (
+    <div style={backdrop} onClick={onCancel}>
+      <div style={panel} onClick={(e) => e.stopPropagation()}>
+        <div style={{ fontSize: 20, fontWeight: 800, color: '#7F1D1D', marginBottom: 10 }}>
+          High speed: increase to {pct}%?
+        </div>
+        <div style={{ fontSize: 14, color: '#374151', marginBottom: 12 }}>
+          You are increasing the program's auto-mode speed above the
+          high-speed threshold ({threshold}%). Ensure the cell is
+          clear before confirming.
+        </div>
+        <div style={{
+          padding: 10, background: '#FEE2E2',
+          border: '1px solid #DC2626', borderRadius: 6,
+          fontSize: 13, color: '#7F1D1D', marginBottom: 16,
+        }}>
+          New effective speed: <b>{pct}%</b> &nbsp;·&nbsp; policy cap: {cap}%
+        </div>
+        <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
+          <button onClick={onCancel} style={{
+            padding: '10px 18px', fontSize: 15, fontWeight: 600,
+            background: '#fff', color: '#374151',
+            border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
+          }}>Cancel</button>
+          <button onClick={onConfirm} style={{
+            padding: '10px 18px', fontSize: 15, fontWeight: 700,
+            background: '#DC2626', color: '#fff',
+            border: 'none', borderRadius: 8, cursor: 'pointer',
+          }}>Confirm — Run at {pct}%</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+

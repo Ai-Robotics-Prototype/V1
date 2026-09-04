@@ -11,8 +11,57 @@ import struct
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    from . import breadcrumbs as _breadcrumbs
+except ImportError:
+    import breadcrumbs as _breadcrumbs  # type: ignore
+BreadcrumbCollector     = _breadcrumbs.BreadcrumbCollector
+thin_waypoints          = _breadcrumbs.thin_waypoints
+is_stale                = _breadcrumbs.is_stale
+effector_state_at_end   = _breadcrumbs.effector_state_at_end
+
+# 2026-08-05 unified event log — one writer, daily rotation,
+# 90-day retention. Fork registry: `event_log`. Every error/
+# warning/info that the operator sees (or the platform emits
+# internally) routes through `event_log.emit(...)` — no per-
+# component log files.
+try:
+    from . import event_log as _event_log
+except ImportError:
+    import event_log as _event_log  # type: ignore
+
+# 2026-08-05 per-device UI context — refresh-persistence. Fork
+# registry: page_context_persistence. Server-owns which program
+# is open on each device; browser localStorage carries none of
+# this state.
+try:
+    from . import ui_context as _ui_context
+except ImportError:
+    import ui_context as _ui_context  # type: ignore
+
+# 2026-08-05 disk watchdog + enforced retention. Fork registry:
+# disk_watchdog. ONE place that caps every writable directory;
+# ONE surface (/api/disk_status) the footer reads. Started at
+# lifespan bring-up below.
+try:
+    from . import disk_watchdog as _disk_watchdog
+except ImportError:
+    import disk_watchdog as _disk_watchdog  # type: ignore
+
+# Always-on joint flight recorder + excursion analyzer. Isolated
+# modules so a recorder crash never touches the state pipeline.
+try:
+    from . import joint_recorder as _joint_recorder_mod
+    from . import joint_excursions as _joint_excursions_mod
+    from . import trajectory_fk as _trajectory_fk_mod
+except ImportError:
+    import joint_recorder as _joint_recorder_mod          # type: ignore
+    import joint_excursions as _joint_excursions_mod       # type: ignore
+    import trajectory_fk as _trajectory_fk_mod             # type: ignore
+JointRecorder = _joint_recorder_mod.JointRecorder
 
 # Dual-import shim — matches inspection_helpers below. The systemd unit
 # runs this file as a script (no parent package), so relative imports
@@ -29,7 +78,13 @@ except ImportError:
 try:
     import rclpy
     from rclpy.node import Node
-    from sensor_msgs.msg import Image, JointState, PointCloud2
+    from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+    from sensor_msgs.msg import CameraInfo, Image, JointState, PointCloud2
+    from geometry_msgs.msg import TransformStamped as _TFStamped
+    try:
+        from tf2_ros import StaticTransformBroadcaster as _StaticTFBroadcaster
+    except ImportError:
+        _StaticTFBroadcaster = None
     from std_msgs.msg import Bool, Float32, String
     from std_srvs.srv import Trigger
     RCLPY_AVAILABLE = True
@@ -46,7 +101,7 @@ except ImportError:
 try:
     from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     import uvicorn
     FASTAPI_AVAILABLE = True
@@ -59,13 +114,285 @@ except ImportError:
 
 _START_TIME = time.time()
 _THIS_DIR = Path(__file__).resolve().parent
-_STATIC_DIR = _THIS_DIR.parent / "mock_server" / "static"
+_STATIC_DIR = _THIS_DIR.parent / "frontend" / "dist"
+
+# ── Provenance (2026-08-28, stale-class close) ──────────────────────
+# Every deploy verification, WS handshake, and footer verdict compares
+# git SHA to git SHA — never chunk-hash to git-SHA (L257 like-for-like
+# violation). Two constants baked at import:
+#
+#   _BACKEND_GIT_SHA — from COBOT_BACKEND_SHA env (set by deploy.sh
+#                      or systemd drop-in), else best-effort
+#                      `git rev-parse HEAD` from the workspace tree,
+#                      else 'unknown'. Suffix '-dirty' if the tree
+#                      had uncommitted changes at import time.
+#   _BACKEND_START_ISO — iso8601 UTC, second precision.
+#
+# Exposed on /health and /api/provenance; deploy.sh asserts equality
+# against the just-deployed HEAD after restart to catch the
+# surviving-old-worker ghost.
+def _read_backend_git_sha() -> str:
+    env = os.environ.get("COBOT_BACKEND_SHA", "").strip()
+    if env:
+        return env
+    try:
+        import subprocess as _sp
+        ws = _THIS_DIR.parent.parent.parent  # src/cobot_dashboard/cobot_dashboard/ → ws
+        sha = _sp.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(ws),
+            stderr=_sp.DEVNULL, timeout=2).decode().strip()
+        dirty = _sp.check_output(
+            ["git", "status", "--porcelain"], cwd=str(ws),
+            stderr=_sp.DEVNULL, timeout=2).decode().strip() != ""
+        return f"{sha}-dirty" if dirty else sha
+    except Exception:
+        return "unknown"
+
+_BACKEND_GIT_SHA = _read_backend_git_sha()
+_BACKEND_START_ISO = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_START_TIME))
+
+
+def _read_frontend_git_sha() -> str:
+    """Read the frontend bundle's git SHA from dist/.build-sha (written
+    by the vite writeSidecarPlugin at build time). Returns 'unknown'
+    when the sidecar is missing (dev-mode / fresh checkout)."""
+    try:
+        p = _STATIC_DIR / ".build-sha"
+        if p.is_file():
+            return p.read_text(encoding="utf-8").strip() or "unknown"
+    except Exception:
+        pass
+    return "unknown"
+
+# Same path as _STATIC_DIR now — the historic mock_server/static override
+# was retired (vite.config outputs directly to dist/, we serve from dist/).
+# Kept as a named reference because System Check reads both; comparison
+# is now trivially equal, so its stale-drift detection is effectively a
+# no-op self-check. Legacy field, ripe for retirement in a follow-up.
+_BUILT_FRONTEND_DIR = _STATIC_DIR
+
+
+def _assert_frontend_coherent(static_dir):
+    """Fail loud at module load if the serve dir is present but incoherent.
+
+    Closes the stale-serving class (L497): index.html references a
+    /assets/index-<hash>.js chunk; if that chunk isn't on disk in the
+    same dir, the browser gets 404 for its main JS and shows a stub
+    forever. Better to refuse startup so systemd escalates than to
+    silently serve a broken shell.
+
+    Missing dir → warn only (allows test imports in throwaway checkouts).
+    Present dir + missing index.html → RuntimeError.
+    Present index.html + missing referenced chunk → RuntimeError.
+    All present → log the reconciled asset hash for the boot log.
+    """
+    import re as _re
+    import logging as _lg
+    log = _lg.getLogger("dashboard.bootcheck")
+    if not static_dir.exists():
+        log.warning("frontend dir missing: %s (skipping coherence check)", static_dir)
+        return None
+    index_path = static_dir / "index.html"
+    if not index_path.is_file():
+        raise RuntimeError(
+            f"Frontend coherence FAIL: {index_path} not found. "
+            f"Run `cd frontend && npm run build` before starting the dashboard."
+        )
+    html = index_path.read_text(encoding="utf-8", errors="replace")
+    m = _re.search(r"/assets/(index-[A-Za-z0-9_-]+\.js)", html)
+    if not m:
+        raise RuntimeError(
+            f"Frontend coherence FAIL: {index_path} has no /assets/index-*.js "
+            f"reference. Bundle build produced no entry chunk."
+        )
+    chunk_name = m.group(1)
+    chunk_path = static_dir / "assets" / chunk_name
+    if not chunk_path.is_file():
+        raise RuntimeError(
+            f"Frontend coherence FAIL: index.html references {chunk_name} "
+            f"but {chunk_path} does not exist on disk. Served bundle would 404 "
+            f"on its main chunk. Rebuild: `cd frontend && npm run build`."
+        )
+    log.warning(  # WARN level so it lands in the systemd journal at default filter
+        "frontend coherence OK: %s -> %s", static_dir, chunk_name)
+    print(f"[dashboard] frontend coherence OK: {chunk_name} from {static_dir}",
+          flush=True)
+    return chunk_name
+
+
+# Enforce at import — if the operator managed to install a broken frontend
+# (missing index.html, missing referenced chunk), fail here so systemd's
+# Restart=on-failure loops loudly instead of quietly serving a broken shell.
+_SERVED_ASSET_AT_BOOT = _assert_frontend_coherent(_STATIC_DIR)
+
+# Timestamp of the last /estun/status frame received (monotonic seconds
+# via time.time()). Read by /api/systemcheck to compute controller
+# freshness — a stale value means the driver went silent.
+_last_estun_status_ts = [0.0]
+# CRI-proxy state for JOG_BACKEND=ros2: /joint_states arrival is our
+# arm-liveness signal when the WS estun_driver is intentionally down.
+# _on_joint_states stamps this on every message; the proxy path in
+# _on_joint_states populates STATE['robot'] fields the ArmEnableControl
+# chip renders. Fresh > 200 ms = "ENABLED (CRI)", stale = "DISCONNECTED".
+_last_joint_states_mono = [0.0]
+# Read once at module load — matches the pattern used near main() but
+# module-level so callback paths on the DashboardServer class can gate
+# without re-reading env each frame.
+_JOG_BACKEND_ENV = os.environ.get("JOG_BACKEND", "ws").strip().lower()
+if _JOG_BACKEND_ENV not in ("ws", "ros2"):
+    _JOG_BACKEND_ENV = "ws"
+
+# 2026-08-28 ROS2 executor cutover feature flag (addendum-52).
+# When RUN_BACKEND=ros2, /api/estun/program/run dispatches to the
+# s10_140_executor package via ROS2 action goals; RunProgramModal
+# auto-targets REMOTE (the mode CRI needs, per §566 four-tuple)
+# instead of AUTO (the mode the legacy Lua-push needs). Legacy
+# stays default until F2.7 first-run acceptance passes, then flips
+# by env override. The Lua-push class of bugs (recoveryState=1
+# palletize latch, add-51 §640) cannot exist on the CRI path —
+# no Lua, no push, Pilz PTP/LIN trajectories streamed.
+_RUN_BACKEND_ENV = os.environ.get("RUN_BACKEND", "legacy_lua").strip().lower()
+if _RUN_BACKEND_ENV not in ("legacy_lua", "ros2_executor"):
+    _RUN_BACKEND_ENV = "legacy_lua"
+
+# ── PHANTOM-FEEDBACK CLASS FIX (2026-08-27, twin flicker-to-zero) ──
+# Two writers to STATE.joints.positions can race:
+#   1. _on_joint_states  — ROS /joint_states (canonical Joint1..Joint6)
+#   2. _on_estun_status  — WS driver mirror `joints_rad`
+# Under JOG_BACKEND=ws, roboai-estun publishes /joint_states with
+# joint_1..joint_6 (lowercase). The canonical Joint1..Joint6 lookup in
+# handler #1 misses every slot → `.get(n, 0.0)` fills all zeros → the
+# twin flickers to home when handler #1 fires after handler #2.
+# Structural fix: bind feedback consumption to JOG_BACKEND (each mode
+# has ONE authoritative source; the other feed is IGNORED and counted).
+# Safety net: quarantine ANY exact-all-zeros frame while the wire says
+# the arm is enabled — that pose is impossible telemetry.
+_twin_source_ignored: dict = {}
+_phantom_zero_frames: dict = {}
+
+
+def _is_all_zeros_positions(positions) -> bool:
+    """True iff every joint position is within noise floor of 0.0.
+    Noise floor: 4× upper-bound encoder LSB (5e-5 rad ≈ 0.003°), same
+    threshold as the jog adapter's idle deadband."""
+    try:
+        return all(abs(float(p)) < 5.0e-5 for p in positions)
+    except (TypeError, ValueError):
+        return False
+
+
+def _wire_arm_is_enabled() -> bool:
+    """Read STATE.robot for the driver's most recent wire-observed
+    RobotStatus.state. `state == 2` = physically enabled. Under any
+    state != 2 (idle, disabling, faulted), the driver stops emitting
+    RobotPosture — a zero frame at that point is a stale-frame race,
+    not phantom feedback. Only quarantine when the arm is genuinely
+    enabled per the wire."""
+    with _state_lock:
+        r = STATE.get("robot", {}) or {}
+        st = r.get("state") if isinstance(r.get("state"), int) else None
+    return st == 2
+# Camera opt-out (2026-08-19 F1.4 rung-3 root-cause fix): under
+# CAMERAS_DISABLED=1, skip Image/CameraInfo subscriptions + the PIL
+# encode thread pool. py-spy proved cam-encode is the GIL hog whose
+# ≥1 s stalls used to trigger the CRI-proxy disconnected flip. F1
+# testing sessions don't need camera streams; keep them off. F3 owns
+# the real fix (turbojpeg native / off-process encode).
+_CAMERAS_DISABLED = os.environ.get("CAMERAS_DISABLED", "0").strip() == "1"
+# Flap-detection bookkeeping for the CRI-proxy staleness loop. Exposed
+# on /health so operators can see "arm chip is flapping — GIL stalls"
+# without spelunking through logs. Zero-cost unless the loop fires.
+_cri_proxy_stats = {
+    "flips_down": 0,            # times we flipped connected → disconnected
+    "flips_up":   0,            # times we flipped back to connected
+    "last_flip_ts": 0.0,        # wall time of last flip
+    "last_flip_kind": None,     # 'up' | 'down' | None
+    "consecutive_stale_ticks": 0,  # current stale-tick counter
+}
+
+
+def _apply_cri_proxy_authority(r):
+    """Under JOG_BACKEND=ros2, cri_proxy owns the arm-authority fields
+    regardless of what estun_driver reports on /estun/status or /estun/mode.
+
+    Called at the end of _on_joint_states, _on_estun_status, and _on_estun_mode
+    so whichever handler ran last, the authority fields stay coherent. Without
+    this, estun_driver in monitor_only (ESTUN_ALLOW_JOG=0, needed so jog_bridge
+    stays authoritative) would leak allow_jog=false into STATE and trip the
+    'JOG GATE CLOSED — set ESTUN_ALLOW_JOG=1' banner on JogControls.jsx:736 —
+    the very banner F1.4 sessions kept hitting.
+
+    No-op under JOG_BACKEND=ws so the legacy WS-authoritative path is
+    unchanged.
+    """
+    if _JOG_BACKEND_ENV != "ros2":
+        return
+    r["connected"]            = True
+    r["enabled"]              = True
+    r["enabling"]             = False
+    r["mode"]                 = "AUTO"
+    r["safety_mode"]          = "normal"
+    r["moving"]               = False
+    r["jog_active"]           = False
+    r["jog_mode"]             = None
+    r["jog_index"]            = 0
+    r["jog_direction"]        = 0
+    r["allow_jog"]            = True
+    r["allow_cartesian_jog"]  = False
+    r["allow_power"]          = True
+    r["allow_move"]           = True
+    r["allow_io"]             = False
+    r["alarm"]                = False
+    r["alarm_count"]          = 0
+    r["state_code"]           = 0
+    r["status_flag"]          = 0
+    r["monitor_only"]         = False
+    r["jog_heartbeat_s"]      = 0.100
+    r["jog_freshness_s"]      = 0.300
+    r["jog_speed_cap"]        = 0.15
+    r["operator_speed_limit"] = 0.25
+    r["effective_speed_cap"]  = 0.15
+    r["allow_jog_source"]     = "cri_proxy"
+    r["allow_cart_source"]    = "f1_scope_refuses_cartesian"
+    r["allow_power_source"]   = "cri_launch_manages_enable"
+    r["allow_move_source"]    = "cri_proxy"
+    r["arm_source"]           = "cri_ros2"
+    r["arm_source_note"]      = ("Arm state proxied from /joint_states "
+                                 "liveness — WS driver inactive under "
+                                 "JOG_BACKEND=ros2; enable is managed "
+                                 "by the CRI launch.")
+
 
 # ---------------------------------------------------------------------------
 # Shared state — updated by ROS2 callbacks, read by FastAPI
 # ---------------------------------------------------------------------------
 
-_state_lock = threading.Lock()
+_state_lock = threading.RLock()  # 2026-08-28: reentrant to avoid the
+# _on_estun_status (line 2131) → _wire_arm_is_enabled (line 229)
+# self-deadlock introduced by the twin phantom-feedback fix (commit
+# 09f3158). Fires under JOG_BACKEND=ws when the driver reports all-
+# zero joints — deadlock froze the FastAPI event loop, tying up the
+# accept queue on :8080. All 89 sites use `with _state_lock:` and
+# none rely on non-reentrant semantics, so RLock is drop-in safe.
+
+# COCO class-id → human-readable name (2026-08-03). Populated at
+# import from src/cobot_bringup/config/coco_labels.txt so the file
+# stays the ground truth for both the label list AND anything that
+# needs to name a numeric COCO id (Isaac YOLOv8 decoder emits raw
+# indices). Missing file falls back to the string id — safe, no
+# crash.
+_COCO_CLASS_NAMES: dict[int, str] = {}
+try:
+    _coco_path = '/home/teddy/cobot_ws/src/cobot_bringup/config/coco_labels.txt'
+    if os.path.isfile(_coco_path):
+        with open(_coco_path) as _fh:
+            for _i, _line in enumerate(_fh.read().splitlines()):
+                _name = _line.strip()
+                if _name:
+                    _COCO_CLASS_NAMES[_i] = _name
+except Exception:
+    _COCO_CLASS_NAMES = {}
+
 
 STATE = {
     "safety": {"zone": "GREEN", "speed_scale": 1.0, "estop": False, "human_proximity": 2.4},
@@ -87,6 +414,15 @@ STATE = {
         "paused": False,
     },
     "detections": [],
+    # D10-adjacent (2026-08-03): 3D detection positions come from
+    # cam0's depth sampled at the YOLO bbox centroid, transformed to
+    # base_link via the provisional `cam0→base_link` extrinsic in
+    # config/sensor_transforms.yaml. The extrinsic is un-refined
+    # (no AprilTag calibration yet), so absolute 3D positions carry
+    # a "few centimeters" bias. Camera panel renders an "Extrinsic
+    # uncalibrated" chip while this is False; flips to True when the
+    # AprilTag calibration pipeline lands.
+    "detections_calibrated": False,
     "lidar_objects": [],
     "openvocab": {
         "enabled":      False,            # toggled by frontend; gates ROS publishing of prompts
@@ -128,6 +464,56 @@ STATE = {
         "safety_mode": "unknown",
         "status_flag": 0,
         "moving": False,
+        "allow_power": False,
+        "enabled": False,
+        "enabling": False,
+        "alarm": False,
+        "alarm_count": 0,
+        "state_code": 0,
+        "state_name": "",
+        "active_alarm": None,
+        "last_stop_reason": "",
+        "last_stop_ts": 0.0,
+        # 2026-08-04: structured cause snapshot from the driver
+        # (_build_stop_cause_locked). See _jog_stop_cause_operator_copy
+        # for the tag → operator-copy translator. Frontend renders the
+        # translated {title, detail, technical} strings from
+        # `stop_cause_copy`, never re-parsing this dict.
+        "last_stop_cause": None,
+        # Dashboard-composed operator copy for the latest stop. Set by
+        # the /estun/mode subscriber whenever `last_stop_cause` changes.
+        # Shape: {title, detail, technical, tag, ts}.
+        "stop_cause_copy": None,
+        # Live cart-mode joint-limit approach softening state (driver
+        # side). None outside the soft zone; a dict while scaling.
+        "cart_softening": None,
+        "joint_limits": [],
+        # None sentinel — the first driver-published state is ALWAYS
+        # a transition (None → bool), so the event-log observation
+        # fires on boot regardless of which side of the kill switch
+        # the driver came up on. Any consumer reading this before the
+        # first driver frame must treat None as "unknown, guards NOT
+        # yet observed active" — same UX as boot-time uncertainty.
+        "collision_enabled": None,
+        "collision_pair": None,
+        "collision_min_mm": None,
+        "collision_warn_mm": 80.0,
+        "collision_stop_mm": 30.0,
+        "collision_warning": False,
+        "env_zone_count": 0,
+        "env_pair": None,
+        "env_min_mm": None,
+        "env_warn_mm": 80.0,
+        "env_stop_mm": 30.0,
+        "env_escape_dirs": [],
+        "guard_active": False,
+        "guard_kind": None,
+        "guard_pair": None,
+        "guard_min_mm": None,
+        "guard_warn_mm": 80.0,
+        "guard_stop_mm": 30.0,
+        "guard_escapes": [],
+        "ground_z_mm": -300.0,
     },
     "tcp_pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     "program": {
@@ -158,6 +544,21 @@ STATE = {
 _cam_frames: dict = {0: None, 1: None}
 _cam_lock = threading.Lock()
 
+# Raw cam0 color bytes + shape + intrinsics — populated by dedicated
+# subscriptions so the AprilTag calibrator can detect on the ACTUAL
+# raw pixels (not the JPEG cache above which discards the bytes after
+# encoding). Only cam0 is captured this way — the calibration flow is
+# cam0-only and we don't want to double the memory footprint just to
+# keep cam1 raw around for the same purpose. Populated on every
+# frame; a stale copy is fine (the operator sees the live JPEG stream
+# and captures on demand).
+#
+# Shape: (H, W, 3) uint8, RGB. Intrinsics: (fx, fy, cx, cy). None
+# until the first frame + first camera_info arrive.
+_cam0_raw:   dict = {'rgb': None, 'ts': 0.0, 'width': 0, 'height': 0}
+_cam0_intr:  dict = {'fx': None, 'fy': None, 'cx': None, 'cy': None}
+_cam0_raw_lock = threading.Lock()
+
 # Latest annotated frame from detector (cam0 + cam1)
 _annotated_frame: bytes = None
 _annotated_frame_cam1: bytes = None
@@ -172,14 +573,274 @@ _mesh_state: dict = {"payload": None, "n_tris": 0, "n_vertices": 0,
                      "n_occupied": 0, "t": 0.0}
 _mesh_lock = threading.Lock()
 
-# WebSocket client queues
+# WebSocket client queues. `_state_clients` is now a dict of ws → per-
+# client dict {latest_txt, latest_seq, new_event, ack_event,
+# last_acked_seq, ...}. See the /ws/state sender + broadcast loop for
+# the ACK-gated protocol that bounds in-flight to one frame and
+# prevents OS TCP-buffer backlog on slow tabs. Prior version held an
+# asyncio.Queue per client and did drain-to-latest at put time; that
+# did NOT bound in-flight because send_text returns after starlette
+# accepts the bytes, not after they've been drained by the client.
 _state_clients: dict = {}
+_state_seq_counter = [0]   # single-elem list so nested funcs can bump
 _lidar_clients: dict = {}
 _mesh_clients:  dict = {}
 _insp_clients:  dict = {}   # /ws/inspection — live inspection status
 _motioncam_cloud_clients: dict = {}
 _motioncam_reco_clients:  dict = {}
 _ws_lock = threading.Lock()
+# Rolling latency + inflight histogram for /health. Ring of the last
+# 200 (server_broadcast_ts, client_ack_ts) pairs so ops can spot the
+# growing-queue pattern quickly. Populated by _sender when an ack
+# arrives.
+_state_perf = {"acks": [], "inflight_ms_max": 0.0, "sends": 0, "ack_timeouts": 0}
+_state_perf_lock = threading.Lock()
+
+# ── Per-program revision + cross-client change events ────────────────
+# Bug 1 fix (2026-07-27). Before this, program mutations (teach, link,
+# save, rename, point CRUD) never notified other connected clients —
+# a tablet teaching a step left the PC's editor showing the pre-teach
+# state until manual reload. The design here piggybacks a lightweight
+# event ring onto the periodic /ws/state broadcast:
+#   1. Every mutation endpoint calls _bump_prog_rev(prog_id) which
+#      returns a monotonically-increasing integer and stashes it into
+#      prog['rev'] before write.
+#   2. Every mutation endpoint also calls _emit_program_changed(...)
+#      with the source_client id from the X-Client-Id header (or
+#      empty string when the client didn't send one — old builds).
+#   3. _emit_program_changed appends {type, program_id, rev,
+#      source_client, ts_ms} to _prog_event_ring. The next /ws/state
+#      broadcast serialises the last N events (aged out after
+#      _PROG_EVENT_TTL_S) into STATE['program_events'] and clients
+#      match against their local rev + source_client to decide whether
+#      to refetch.
+# Aged-out entries are dropped on each broadcast tick. The ring lives
+# under _prog_event_lock; a state-broadcast reader snapshots the list
+# with the lock held (~2 µs) so mutation writers never contend.
+_prog_revs: dict[str, int] = {}
+_prog_event_ring: list[dict] = []
+_prog_event_lock = threading.Lock()
+_PROG_EVENT_RING_MAX = 64
+_PROG_EVENT_TTL_S    = 15.0
+
+# 2026-07-31 CONVERGENCE FIX (operator-hit twice today, both
+# directions): on server restart, _prog_revs was empty. Any client
+# still holding a rev from the previous process saw the first
+# post-restart event's rev come in LOWER than its held cp.rev, so
+# `ev.rev > cp.rev` was FALSE and the refetch never fired. The
+# tablet-vs-PC diverged and stayed diverged.
+#
+# Fix: seed the rev counter from every program's on-disk rev at
+# startup so the first bump after restart always advances beyond
+# what any live client could hold. Every mutation persists rev to
+# disk (see _save_prog_with_event), so on-disk is the source of
+# truth across restarts.
+def _seed_prog_revs_from_disk() -> None:
+    """Walk the programs directory and seed _prog_revs with each
+    program's on-disk rev. Runs once at server startup so post-
+    restart revs never regress below any live client's held value."""
+    try:
+        # The programs dir constant is defined inside the FastAPI
+        # setup function (later in this module); default to the
+        # canonical path used by every deploy.
+        prog_dir = os.environ.get("COBOT_PROG_DIR") or "/opt/cobot/programs"
+        if not os.path.isdir(prog_dir):
+            return
+        seeded = 0
+        for name in os.listdir(prog_dir):
+            if not name.endswith(".json"):
+                continue
+            if name.startswith("_"):
+                continue        # _folders.json etc.
+            path = os.path.join(prog_dir, name)
+            try:
+                with open(path) as f:
+                    p = json.load(f)
+                prog_id = p.get("id") or name[:-5]
+                rev = int(p.get("rev") or 0)
+                with _prog_event_lock:
+                    prev = _prog_revs.get(prog_id)
+                    # Seed even when rev is 0: the revs endpoint must
+                    # report EVERY known program so clients can detect
+                    # a "held rev higher than server-truth" case (which
+                    # happens after a restart resets in-memory state
+                    # while a client still holds a pre-restart rev).
+                    if prev is None or rev > prev:
+                        _prog_revs[prog_id] = rev
+                        seeded += 1
+            except Exception:
+                continue
+        if seeded:
+            # log() may not be initialised yet at import; use print
+            # so the seed count reaches journalctl on startup.
+            print(f"[dashboard] _prog_revs seeded from disk: "
+                  f"{seeded} program(s)")
+    except Exception:
+        pass
+
+def _bump_prog_rev(prog_id: str) -> int:
+    with _prog_event_lock:
+        r = int(_prog_revs.get(prog_id, 0)) + 1
+        _prog_revs[prog_id] = r
+        return r
+
+def _snapshot_prog_revs() -> dict:
+    """Copy the full {id: rev} map so the state broadcast can carry
+    it without holding the lock across json.dumps. Small (< 100
+    programs typical) so copying every tick is cheap."""
+    with _prog_event_lock:
+        return dict(_prog_revs)
+
+def _emit_program_changed(program_id: str, rev: int, source_client: str,
+                          kind: str = "mutation") -> None:
+    """Append a program_changed event to the ring for the next
+    /ws/state broadcast to fan out. Non-blocking. `kind` is a free-
+    form tag (teach / save / points / rename / delete) surfaced to
+    the client for optional finer-grained UI (toast text)."""
+    if not program_id:
+        return
+    entry = {
+        "type":          "program_changed",
+        "program_id":    program_id,
+        "rev":           int(rev),
+        "source_client": str(source_client or ""),
+        "kind":          str(kind or "mutation"),
+        "ts_ms":         int(time.time() * 1000),
+    }
+    with _prog_event_lock:
+        _prog_event_ring.append(entry)
+        if len(_prog_event_ring) > _PROG_EVENT_RING_MAX:
+            del _prog_event_ring[:len(_prog_event_ring) - _PROG_EVENT_RING_MAX]
+
+def _snapshot_program_events() -> list[dict]:
+    """Return non-expired events for inclusion in the STATE broadcast.
+    Copies out under the lock so the broadcaster never holds it across
+    a json.dumps call."""
+    now_ms = time.time() * 1000
+    cutoff = now_ms - (_PROG_EVENT_TTL_S * 1000)
+    with _prog_event_lock:
+        # Age-out in-place so the ring doesn't grow unbounded when
+        # no one is watching. This is the only place we prune; the
+        # append path caps at _PROG_EVENT_RING_MAX as a hard ceiling.
+        while _prog_event_ring and _prog_event_ring[0]["ts_ms"] < cutoff:
+            _prog_event_ring.pop(0)
+        return list(_prog_event_ring)
+
+
+# ── Bounded per-client queue with drop-oldest backpressure ────────────
+# Part E fix (2026-07-22). Previous pattern was `if q.qsize() < 2:
+# await q.put(...)` — drop-NEWEST when full, so a slow client saw
+# STALE data while the newest telemetry was silently discarded.
+# Drop-oldest is the correct choice for live streams: whenever the
+# queue is full, evict the oldest queued item to make room for the
+# new one. Freshness beats completeness for telemetry.
+#
+# Records the number of drops per broadcast channel so /health can
+# surface a backpressure trend without needing SIGUSR1 dumps.
+_ws_drops = {"state": 0, "lidar": 0, "mesh": 0,
+             "motioncam_cloud": 0, "motioncam_reco": 0}
+_ws_drops_lock = threading.Lock()
+
+
+def _put_drop_oldest(q, payload, channel: str) -> None:
+    """Enqueue `payload` on `q`, dropping the oldest queued item first
+    if the queue is at its maxsize. Increments `_ws_drops[channel]`
+    when an eviction happens. Never blocks; returns synchronously.
+
+    Called from the async broadcaster where the queue is already an
+    asyncio.Queue on the same event loop, so put_nowait / get_nowait
+    are the right calls (they don't context-switch)."""
+    try:
+        q.put_nowait(payload)
+        return
+    except asyncio.QueueFull:
+        pass
+    # Full — evict oldest, then put. If a concurrent consumer beat us
+    # to it, put_nowait may succeed on the second try; otherwise we
+    # retry the evict+put once more before giving up (avoids an
+    # infinite loop under pathological contention).
+    for _ in range(2):
+        try:
+            q.get_nowait()
+            with _ws_drops_lock:
+                _ws_drops[channel] = _ws_drops.get(channel, 0) + 1
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            q.put_nowait(payload)
+            return
+        except asyncio.QueueFull:
+            continue
+    # Give up rather than block.
+    with _ws_drops_lock:
+        _ws_drops[channel] = _ws_drops.get(channel, 0) + 1
+
+def _state_perf_snapshot():
+    """Read-only snapshot for /health. p50/p95 over the last ~200 acks;
+    inflight_ms_max is the peak broadcast→send-complete gap observed
+    since server start. High p95 with rising inflight_ms_max is the
+    signature the sender's ack gate is falling behind — i.e., the
+    twin will feel laggy on the offending tab."""
+    with _state_perf_lock:
+        acks = list(_state_perf['acks'])
+        sends = _state_perf['sends']
+        ack_timeouts = _state_perf['ack_timeouts']
+        inflight_max = _state_perf['inflight_ms_max']
+    if acks:
+        s = sorted(acks)
+        p50 = s[len(s)//2]
+        p95 = s[min(len(s)-1, int(len(s)*0.95))]
+    else:
+        p50 = p95 = None
+    return {
+        "sends": sends,
+        "ack_timeouts": ack_timeouts,
+        "acks_seen": len(acks),
+        "ack_lat_ms_p50": (round(p50, 1) if p50 is not None else None),
+        "ack_lat_ms_p95": (round(p95, 1) if p95 is not None else None),
+        "inflight_ms_max": round(inflight_max, 1),
+    }
+
+# WS backpressure protection. Prior defect: a slow tablet's TCP send
+# buffer accumulated multi-MB backlogs and the consumer coroutine spent
+# most of its time blocked in `await send_text`, dragging /cmd/jog POST
+# latency past the driver's 300 ms freshness deadman and turning
+# continuous jog into step mode. Fix: every per-client send is wrapped
+# in `asyncio.wait_for(..., timeout=WS_SEND_TIMEOUT_S)`. A client whose
+# send hasn't drained in that window gets its socket closed — the
+# broadcaster stops fanning frames to it and the fast path stays fast.
+# 0.5 s is generous for a state-broadcast frame (~9 KB): loopback sends
+# complete sub-ms, LAN wifi tablets round-trip in <100 ms. Anything past
+# 500 ms means the client's TCP receive window is stuck (tab throttled,
+# laptop closed, wifi dead) — kicking it protects the fast path. The
+# reconnect loop already backs off exponentially, so a truly healthy
+# client that hits a brief blip gets a graceful reconnect.
+WS_SEND_TIMEOUT_S = 0.5
+# Cumulative kicks per stream, exposed on /health for observability.
+_ws_kicked = {"state": 0, "lidar": 0, "mesh": 0,
+              "motioncam_cloud": 0, "motioncam_reco": 0}
+
+# Camera-encode worker pool. Wire evidence (2026-07-15 continuous jog
+# session): the ROS executor thread's synchronous PIL JPEG encode was
+# holding the GIL long enough in bursts that the asyncio loop's WS
+# receive latency crossed the driver's 300 ms freshness deadman about
+# 5 % of intervals, firing "hold staleness" mid-hold. Moving the
+# encode off the ROS callback (encode runs in this pool; the callback
+# returns after the submit) both frees the ROS executor for
+# subsequent frames and reduces GIL contention with the asyncio loop.
+# Small pool (2 workers = one per camera): the encode itself releases
+# GIL inside PIL's native code, so more threads wouldn't help and
+# would only add scheduler churn.
+import concurrent.futures as _futures
+_cam_encode_pool = _futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix='cam-encode')
+# Drop-latest: if a previous encode is still in flight for a camera,
+# skip this frame rather than queue. Freshness > completeness for
+# telemetry cameras; the operator sees the newest frame within one
+# encode wall time. _cam_encode_busy[cam_id] is a bool the ROS thread
+# consults before submitting.
+_cam_encode_busy = {0: False, 1: False}
+_cam_encode_busy_lock = threading.Lock()
 
 # MotionCam state — single shared instance for the dashboard server.
 # The synthetic generator only ticks when STATE.motioncam_state.get_mock()
@@ -460,6 +1121,300 @@ def _normalise_scene_graph(raw) -> dict:
     return {"objects": objs}
 
 # ---------------------------------------------------------------------------
+# Guided recovery — event journal (Lesson 165 extension, 2026-08-05)
+# ---------------------------------------------------------------------------
+# When a joint enters / exits the escape-only zone, append a JSON line
+# to /opt/cobot/logs/recovery_events.jsonl. Source material for the
+# commissioning wizard: which joint, at what angle, how long the
+# operator lingered, whether they recovered via the dialog or manually.
+#
+# Best-effort. A failed write never blocks the state-message pipeline
+# or the driver's clamp behavior — the safety action already happened.
+
+_RECOVERY_EVENTS_PATH = '/opt/cobot/logs/recovery_events.jsonl'
+
+
+def _write_recovery_events_from_jl(prev_jl, new_jl) -> None:
+    """Emit `past_escape_only_entered` / `past_escape_only_exited`
+    events by comparing successive joint_limits snapshots. `prev_jl`
+    and `new_jl` are both lists of dicts with 'joint',
+    'past_escape_only', 'current_deg', 'limit_deg',
+    'escape_only_edge_deg'. Silently skips when the shapes don't
+    line up."""
+    if not isinstance(new_jl, list) or not new_jl:
+        return
+    prev_by_j = {}
+    if isinstance(prev_jl, list):
+        for j in prev_jl:
+            try:
+                prev_by_j[int(j.get('joint'))] = bool(j.get('past_escape_only'))
+            except (TypeError, ValueError, AttributeError):
+                continue
+    lines = []
+    ts = time.time()
+    for j in new_jl:
+        try:
+            jn = int(j.get('joint'))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        now = bool(j.get('past_escape_only'))
+        was = prev_by_j.get(jn, False)
+        if now == was:
+            continue
+        lines.append({
+            'ts':          ts,
+            'kind':        'past_escape_only_entered' if now else 'past_escape_only_exited',
+            'joint':       jn,
+            'current_deg': j.get('current_deg'),
+            'limit_deg':   j.get('limit_deg'),
+            'escape_only_edge_deg': j.get('escape_only_edge_deg'),
+            'headroom_deg': j.get('headroom_deg'),
+        })
+    if not lines:
+        return
+    try:
+        os.makedirs(os.path.dirname(_RECOVERY_EVENTS_PATH), exist_ok=True)
+        with open(_RECOVERY_EVENTS_PATH, 'a') as fh:
+            for entry in lines:
+                fh.write(json.dumps(entry) + '\n')
+    except Exception:
+        # Recovery journal is best-effort — a full disk or permission
+        # error must not block the state pipeline.
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Jog stop-cause operator copy (Lesson 165 / directive 2026-08-04)
+# ---------------------------------------------------------------------------
+# Fork registry canonical: this function is the SINGLE translator from
+# the driver's structured `last_stop_cause` dict → operator-language
+# {title, detail, technical} triple. The frontend renders these strings
+# verbatim and MUST NOT re-parse the raw reason text on its own.
+# Registered in `tools/fork_registry.yaml` under
+# `jog_stop_cause_propagation`.
+#
+# 267108a register: title/detail carry operator language only. Banned
+# tokens (dyn margin, cart limit approach, mm2mAndDeg2rad, exitProcess,
+# firmware bug, v.size(), σ_min, sigma_soft, freshness deadman) live
+# in `technical` if anywhere. Positive phrasing tells the operator
+# WHAT to do to recover.
+
+_JOG_STOP_CAUSE_BANNED_TOKENS = (
+    'dyn margin', 'cart limit approach', 'limit approach J',
+    'mm2mAndDeg2rad', 'v.size()', 'exitProcess', 'firmware bug',
+    'σ_min', 'sigma_soft', 'sigma_hard', 'freshness deadman',
+    'hold staleness', 'hb send failed',
+)
+
+
+def _jog_stop_cause_operator_copy(cause: dict, joint_limits: list) -> dict:
+    """Translate the driver's structured stop_cause into operator copy.
+    Returns {title, detail, technical, tag, ts}. The frontend renders
+    title + detail on the jog surface; `technical` is stashed for the
+    log/monitor readout only.
+
+    joint_limits is the driver-published per-joint list (each entry
+    has current_deg / limit_deg / margin_deg / etc.), used to render
+    the absolute joint limit ("of ±200°") the operator sees.
+    """
+    if not isinstance(cause, dict):
+        cause = {}
+    tag = str(cause.get('tag') or 'other')
+    ts  = float(cause.get('ts') or 0.0)
+    raw = str(cause.get('raw') or '')
+    joint_i1 = cause.get('joint_index_1based')
+    joint_deg = cause.get('joint_deg')
+    joint_limit_deg = cause.get('joint_limit_deg')
+    jog_mode = cause.get('jog_mode')
+
+    def _joint_limit_display(idx1):
+        # Prefer the fresh driver-published limit; fall back to the
+        # cause snapshot's limit_deg.
+        try:
+            if isinstance(joint_limits, list) and 1 <= idx1 <= len(joint_limits):
+                jl = joint_limits[idx1 - 1]
+                lim = jl.get('limit_deg')
+                if isinstance(lim, (int, float)) and lim > 0:
+                    return f'±{lim:.0f}°'
+        except Exception:
+            pass
+        if isinstance(joint_limit_deg, (int, float)) and joint_limit_deg > 0:
+            return f'±{joint_limit_deg:.0f}°'
+        return 'its limit'
+
+    def _out(title, detail, technical=None):
+        return {
+            'title':      title,
+            'detail':     detail,
+            'technical':  technical or raw,
+            'tag':        tag,
+            'ts':         ts,
+        }
+
+    # Route by tag. joint_limit gets bespoke operator copy for cart
+    # vs joint mode. release_cmd is suppressed by the frontend (it's
+    # the operator's own gesture), but we still return a triple so a
+    # log reader can see the tag.
+    if tag == 'joint_limit' or tag == 'joint_limit_deeper':
+        if joint_i1 and isinstance(joint_deg, (int, float)):
+            lim_s = _joint_limit_display(joint_i1)
+            # Escape direction: reduces abs(joint_deg). If joint is at
+            # negative angle, escape is +; if positive, escape is -.
+            escape_sym = '+' if joint_deg < 0 else '-'
+            if jog_mode == 'continuous_cart':
+                return _out(
+                    f'Jog stopped — J{joint_i1} past its limit.',
+                    (f'J{joint_i1} is at {joint_deg:+.0f}° of {lim_s}. '
+                     f'Switch to Joint mode and jog {escape_sym}J{joint_i1} '
+                     f'to recover, then retry cart.'),
+                )
+            # Joint-mode: name the exact button that works.
+            return _out(
+                f'Jog stopped — J{joint_i1} past its limit.',
+                (f'J{joint_i1} is at {joint_deg:+.0f}° of {lim_s}. '
+                 f'Jog {escape_sym}J{joint_i1} to recover.'),
+            )
+        return _out(
+            'Jog stopped — a joint is past its limit.',
+            'Jog the opposite direction to recover.',
+        )
+
+    if tag == 'freshness_deadman':
+        return _out(
+            'Jog stopped — connection jitter.',
+            'The keep-alive from the browser was interrupted. '
+            'Release and press again to continue.',
+        )
+
+    if tag == 'collision_guard':
+        # 2026-08-05 (operator directive: clearance warnings OFF).
+        # Warn tier is disabled everywhere; the ONLY collision
+        # signal left is this hard-stop copy. Split by guard_kind
+        # so the operator sees language that matches what the arm
+        # actually did: bumped itself vs bumped the floor vs
+        # bumped an environment obstacle. Distance is embedded so
+        # the operator gets an at-a-glance sanity read on how
+        # close the arm actually got before halting.
+        guard_kind = str(cause.get('guard_kind') or '')
+        dist_mm    = cause.get('dist_mm')
+        dist_s     = f'{int(dist_mm)} mm' if isinstance(dist_mm, (int, float)) else '—'
+        if guard_kind == 'self':
+            return _out(
+                f'Jog stopped — arm too close to itself, {dist_s}.',
+                'The 15 mm hard-stop guard fired. Jog the arm away '
+                'from itself to continue.',
+            )
+        if guard_kind == 'ground':
+            return _out(
+                f'Jog stopped — arm too close to the floor, {dist_s}.',
+                'The ground-plane hard limit fired. Jog the arm up '
+                'to continue.',
+            )
+        # env / unknown — keep the pre-directive phrasing. The
+        # workspace-obstacle path is a distinct hazard the
+        # operator has not asked to reshape.
+        return _out(
+            'Jog stopped — approaching an obstacle.',
+            'Motion got within the safety distance of a nearby '
+            'surface. Jog away from it or check the workspace clearance.',
+        )
+
+    if tag == 'zero_speed':
+        return _out(
+            'Jog stopped — zero speed commanded.',
+            'Speed slider is at 0. Raise it and press again.',
+        )
+
+    if tag == 'hold_transition':
+        return _out(
+            'Jog switched — new direction.',
+            'The previous jog was ended when a different direction '
+            'was pressed. Release and re-press to continue.',
+        )
+
+    if tag == 'send_failed' or tag == 'hb_send_failed':
+        return _out(
+            'Jog stopped — controller unreachable.',
+            'The link to the arm dropped. Wait for the DRIVER '
+            'indicator to turn green, then press again.',
+        )
+
+    if tag == 'increment_end':
+        return _out(
+            'Increment complete.',
+            'The step increment finished normally.',
+        )
+
+    if tag == 'release_cmd':
+        # Frontend suppresses this one (it's the operator's own gesture),
+        # but we still surface it to the log reader.
+        return _out(
+            'Jog released.',
+            'Motion ended when the button was released.',
+        )
+
+    # ── 2026-08-28 kill-the-other-bucket operator copy ──────────
+
+    if tag == 'joint_overspeed':
+        # Controller-side clamp: near-singular Cartesian pose blows
+        # commanded joint velocity above the arm's per-joint cap.
+        # This is the operator's frequent-flier during cartesian
+        # holds. Name the joint + direction so recovery is obvious.
+        if joint_i1 and isinstance(joint_deg, (int, float)):
+            return _out(
+                f'Jog stopped — J{joint_i1} would have moved too fast.',
+                (f'You were jogging Cartesian near a pose where '
+                 f'J{joint_i1} needs to swing much faster than its cap '
+                 f'to keep the tool line. Move the tool slightly away '
+                 f'and re-press, or switch to Joint mode.'),
+            )
+        return _out(
+            'Jog stopped — arm would have moved a joint too fast.',
+            'Cartesian direction near a singular pose. Move the tool '
+            'slightly away from the current pose or switch to Joint mode.',
+        )
+
+    if tag == 'singularity_guard':
+        return _out(
+            'Jog stopped — near a singular pose.',
+            'The Cartesian direction crosses a singularity for this '
+            'wrist geometry. Move the tool away from the current pose '
+            'or switch to Joint mode to recover.',
+        )
+
+    if tag == 'disable_command':
+        return _out(
+            'Jog stopped — arm disabled.',
+            'Servo power was cut mid-hold. Re-enable the arm, then '
+            'press again to continue.',
+        )
+
+    if tag == 'transport_down':
+        return _out(
+            'Jog stopped — controller link dropped.',
+            'The WS connection to the arm closed during the hold. Wait '
+            'for the DRIVER indicator to turn green, then press again.',
+        )
+
+    if tag == 'node_shutdown':
+        return _out(
+            'Jog stopped — driver shutting down.',
+            'The estun_driver process is going down (planned restart '
+            'or systemd stop). Wait for it to come back, then press again.',
+        )
+
+    # Fallback — should be unreachable per the doctrine test. If a
+    # new stop reason gets added without extending the taxonomy, we
+    # still return SOMETHING so the operator isn't left staring at
+    # a silent button; the doctrine test at commit time refuses the
+    # regression.
+    return _out(
+        'Jog stopped.',
+        'Motion ended. Check the driver logs for the specific cause.',
+    )
+
+
+# ---------------------------------------------------------------------------
 # ROS2 node
 # ---------------------------------------------------------------------------
 
@@ -471,6 +1426,10 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self._task_pub = None
         self._voice_pub = None
         self._estop_client = None
+        # Records program-execution joint waypoints so Return Home
+        # can retrace the proven path rather than improvise a direct
+        # move through unproven space. See breadcrumbs.py.
+        self._breadcrumbs = BreadcrumbCollector()
 
         if not RCLPY_AVAILABLE:
             return
@@ -541,6 +1500,96 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         # When connected, this overwrites the sim joints — real wins.
         self.create_subscription(String, "/estun/status", self._on_estun_status, 10)
 
+        # Driver mode heartbeat — carries the allow_move/allow_jog/allow_power
+        # gates + program-execution live fields (program_state, program_line,
+        # is_step, active project_id). Monitor "Run" needs these to render
+        # the confirm modal's gate warning and the live line indicator.
+        self.create_subscription(String, "/estun/mode", self._on_estun_mode, 5)
+        # Program lifecycle events from the driver — save (HTTP result set),
+        # status (ProjectState snapshots), error (deduped publish/Error).
+        self.create_subscription(String, "/estun/program_status",
+                                 self._on_estun_program_status, 10)
+        # Driver rejections — surface gate-closed and other refusals to the UI
+        # so the Run modal shows exactly WHY nothing happened when it didn't.
+        self.create_subscription(String, "/estun/rejected",
+                                 self._on_estun_rejected, 10)
+        # I/O bridge — driver polls IOManager/GetIOValue + GetIOInfo and
+        # publishes the merged snapshot here. /api/io/live re-exposes it.
+        self.create_subscription(String, "/estun/io",
+                                 self._on_estun_io, 10)
+        # Write path for manual DO / DI-force actions — dashboard's
+        # /api/io/force publishes here and the driver gates on allow_io.
+        self._estun_io_set_pub = self.create_publisher(
+            String, "/robot/io_set", 5)
+        # Publisher for the /estun/program op-envelope. Created EAGERLY at
+        # node construction so DDS discovery completes long before the
+        # operator hits Run. The old lazy-init raced with discovery:
+        # /api/estun/program/run publishes save→to_auto→…→run in a tight
+        # burst, and the FIRST call was the one that created the
+        # publisher — so the driver's subscriber was still being
+        # discovered when the `save` op fired and RELIABLE+VOLATILE
+        # dropped it, while the later ops (to_auto through project/run)
+        # made it. Result: controller received `project/run testwizard`
+        # against a projectlist that had never been updated → alarm
+        # 10001 "Project <testwizard> does not exist." Depth grows from
+        # 5 → 16 so the 6-op burst can never pressure the subscriber's
+        # queue either.
+        self._estun_program_pub = self.create_publisher(
+            String, "/estun/program", 16)
+        # Mode-switch publisher + status subscriber (2026-08-28).
+        # Eager creation for the same discovery-race reason as the
+        # program publisher above.
+        self._estun_mode_pub = self.create_publisher(
+            String, "/estun/mode_command", 8)
+        self.create_subscription(String, "/estun/mode_status",
+                                 self._on_estun_mode_status, 8)
+
+        # F2.7 executor bridge (2026-08-31 addendum-54). Publisher for
+        # /task/run_program — the executor's run trigger. Subscriber
+        # for /executor/status — where the F2 executor publishes
+        # program_state / plan_summary / step_verdict / errors. The
+        # dashboard translates program_state → legacy
+        # STATE.robot.program.state (arbiter mirror) AND resolves
+        # per-req_id awaiters that the /api/estun/program/run bridge
+        # uses to make the HTTP response block until terminal.
+        self._task_run_program_pub = self.create_publisher(
+            String, "/task/run_program", 8)
+        self.create_subscription(String, "/executor/status",
+                                 self._on_executor_status, 32)
+        # req_id → dict awaiter state: {"event": threading.Event,
+        # "terminal": {...body...}, "plan_summaries": [...],
+        # "step_verdicts": [...]}. Populated when a bridge caller
+        # registers an awaiter; drained + deleted by the caller.
+        self._executor_awaiters_lock = threading.Lock()
+        self._executor_awaiters: dict = {}
+        # A rolling snapshot of the LAST executor status (any req_id)
+        # for /api/state observability.
+        self._executor_last_status: dict = {}
+
+        # SEAM A fanout publisher for JOG_BACKEND='ros2'. Created EAGERLY
+        # here so DDS discovery matches with jog_bridge's subscriber long
+        # before the operator's first press. Previously lazy-created in
+        # _publish_ros2_jog_event on the first jog event — that lost the
+        # DDS discovery race under RELIABLE+VOLATILE, and the first press
+        # after a dashboard or jog_bridge restart silently dropped: no
+        # error, no toast, arm just didn't move. Same eager-init fix that
+        # closed the /estun/program 6-op burst race above; both are
+        # instances of the [[cobot-dds-lazy-publisher-hazard]] class.
+        # QoS matches jog_bridge's expected profile exactly.
+        self._dashboard_jog_events_pub = self.create_publisher(
+            String, "/dashboard/jog_session_events",
+            QoSProfile(
+                depth=10,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            ))
+        # Peer state for _publish_ros2_jog_event's kind derivation +
+        # refresh coalescing. Initialized empty here so the fanout
+        # function can assume they exist without a hasattr dance.
+        self._jog_session_seen = set()          # hold_ids seen at least once
+        self._jog_last_refresh_mono = {}        # hold_id -> monotonic ts of last refresh
+
         # Program executor state (richer than /task/status: step labels,
         # cycle stats, executor-state strings like 'waiting_motion').
         self.create_subscription(String, "/task/state", self._on_task_state, 10)
@@ -553,19 +1602,47 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self.create_subscription(String, "/perception/placed_objects",
                                  self._on_placed_objects, 5)
 
-        # Annotated image from detector (cam0 + cam1)
-        self.create_subscription(Image, "/perception/annotated_image",
-                                 self._on_annotated, 2)
-        self.create_subscription(Image, "/perception/annotated_image_cam1",
-                                 self._on_annotated_cam1, 2)
+        # CAMERAS_DISABLED=1 skips ALL Image/CameraInfo subscriptions +
+        # the PIL encode thread pool never gets work. Root-cause fix
+        # for the F1.4 rung-3 fingerprint: py-spy proved cam-encode is
+        # the GIL hog whose >1 s stalls flipped the CRI proxy to
+        # DISCONNECTED, killing jog. F1 sessions don't need video; F3
+        # will land the real turbojpeg/off-process fix.
+        if _CAMERAS_DISABLED:
+            self.get_logger().warn(
+                "CAMERAS_DISABLED=1 — skipping cam0/cam1 Image subscriptions "
+                "and the /perception/annotated_image* taps. No camera "
+                "streaming this session. F3 owns the real fix.")
+        else:
+            # Annotated image from detector (cam0 + cam1)
+            self.create_subscription(Image, "/perception/annotated_image",
+                                     self._on_annotated, 2)
+            self.create_subscription(Image, "/perception/annotated_image_cam1",
+                                     self._on_annotated_cam1, 2)
 
-        # Cameras — double namespace because realsense2_camera is launched with
-        # name=cam0 inside namespace cam0, producing /cam0/cam0/... topics.
-        # Confirmed from session log May 21 2026.
-        self.create_subscription(Image, "/cam0/cam0/color/image_raw",
-                                 lambda m: self._on_camera(0, m), 2)
-        self.create_subscription(Image, "/cam1/cam1/color/image_raw",
-                                 lambda m: self._on_camera(1, m), 2)
+            # Cameras — double namespace because realsense2_camera is launched with
+            # name=cam0 inside namespace cam0, producing /cam0/cam0/... topics.
+            # Confirmed from session log May 21 2026.
+            self.create_subscription(Image, "/cam0/cam0/color/image_raw",
+                                     lambda m: self._on_camera(0, m), 2)
+            self.create_subscription(Image, "/cam1/cam1/color/image_raw",
+                                     lambda m: self._on_camera(1, m), 2)
+            # Raw cam0 tap for AprilTag calibration. Separate sub so the
+            # JPEG-encode drop-latest guard on _on_camera doesn't cost us
+            # detection frames — we take the raw bytes fresh regardless
+            # of the encoder's state. camera_info gives fx/fy/cx/cy the
+            # detector needs.
+            self.create_subscription(Image, "/cam0/cam0/color/image_raw",
+                                     self._on_cam0_raw, 2)
+            self.create_subscription(CameraInfo, "/cam0/cam0/color/camera_info",
+                                     self._on_cam0_info, 2)
+
+        # Static TF broadcaster used by the cam0 extrinsic calibration
+        # save endpoint. Kept as a lazy None until _broadcast_cam0_
+        # extrinsic() first needs it — importing tf2_ros at module
+        # load is optional (typed as None when unavailable) so the
+        # dashboard boots even on a rig without tf2_ros installed.
+        self._static_tf_bcast = None
 
         # LiDAR priority: dense > accumulated > fused > raw. Lower-priority
         # handlers bail out if any higher-priority source produced data in
@@ -584,7 +1661,97 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         self.create_subscription(String, "/reconstruction/mesh_json",
                                  self._on_mesh_json, 2)
 
+        # CRI-proxy staleness watchdog: under JOG_BACKEND=ros2 with the WS
+        # estun_driver intentionally down, _on_joint_states populates the
+        # ArmEnableControl chip fields from JS liveness. But if JS stops
+        # (arm faulted / launch died), no _on_joint_states means no update
+        # — chip would keep showing ENABLED forever. This daemon flips the
+        # chip to DISCONNECTED after 1.0 s of no JS. Silent per §285: a
+        # stopped arm should NEVER read as ENABLED.
+        threading.Thread(target=self._cri_proxy_staleness_loop,
+                          name="cri-proxy-staleness",
+                          daemon=True).start()
+
         self.get_logger().info("DashboardServer ready")
+
+    def _cri_proxy_staleness_loop(self):
+        """5 Hz staleness watchdog with HYSTERESIS (2026-08-19 F1.4 fix).
+
+        Pre-fix: single-tick decision at js_age > 1.0 s flipped
+        STATE['robot'] to DISCONNECTED, which the frontend reads as
+        jogGateOk=false — every jog press dies silently in the browser.
+        Under JOG_BACKEND=ros2 estun_stale is ALWAYS true (WS driver
+        down by design), so any single >1 s GIL stall (PIL cam-encode
+        is the known repeat offender, py-spy proven) instantly killed
+        jog until the NEXT fresh JS.
+
+        Post-fix: require 3 CONSECUTIVE stale ticks at threshold=3.0s
+        (~3.6 s sustained silence, not just one bad tick) before
+        flipping DOWN. Any fresh JS resets the counter to 0; the
+        _on_joint_states callback populates the fresh 'connected'/
+        'enabled' state on every message (natural flip-up). This loop
+        only handles the DOWN edge + flap bookkeeping.
+
+        Decision logic is in cobot_dashboard.staleness so unit tests
+        can exercise the state machine with a fake clock.
+        """
+        from .staleness import staleness_decide  # local import — avoid module-time coupling
+        is_disconnected = False
+        while True:
+            try:
+                if _JOG_BACKEND_ENV == "ros2":
+                    now_mono = time.monotonic()
+                    js_age = (now_mono - _last_joint_states_mono[0]
+                              if _last_joint_states_mono[0] > 0 else 1e9)
+                    estun_age = time.time() - _last_estun_status_ts[0]
+                    new_stale, new_disc, flip = staleness_decide(
+                        js_age_s=js_age,
+                        estun_age_s=estun_age,
+                        consecutive_stale_ticks=_cri_proxy_stats["consecutive_stale_ticks"],
+                        is_disconnected=is_disconnected,
+                    )
+                    _cri_proxy_stats["consecutive_stale_ticks"] = new_stale
+                    if flip == "down":
+                        with _state_lock:
+                            r = STATE.setdefault("robot", {})
+                            r["connected"]    = False
+                            r["enabled"]      = False
+                            r["enabling"]     = False
+                            r["mode"]         = "unknown"
+                            r["safety_mode"]  = "unknown"
+                            r["moving"]       = False
+                            r["allow_jog"]    = False
+                            r["allow_cartesian_jog"] = False
+                            r["allow_power"]  = False
+                            r["allow_move"]   = False
+                            r["alarm"]        = False
+                            r["state_code"]   = 0
+                            r["status_flag"]  = 0
+                            # Safe-side: undefined monitor_only defaults to
+                            # "on" in frontend gating — explicitly True on
+                            # DOWN keeps the safe-until-proven-live semantic.
+                            r["monitor_only"] = True
+                            r["arm_source"]   = "cri_ros2"
+                            r["arm_source_note"] = (
+                                f"/joint_states stale {js_age:.1f}s — "
+                                f"CRI stream absent or arm faulted (flip "
+                                f"#{_cri_proxy_stats['flips_down'] + 1}). "
+                                "Enable managed by the CRI launch; check "
+                                "the launch tmux for errors.")
+                        _cri_proxy_stats["flips_down"] += 1
+                        _cri_proxy_stats["last_flip_ts"] = time.time()
+                        _cri_proxy_stats["last_flip_kind"] = "down"
+                    elif flip == "up":
+                        # _on_joint_states already populated fresh state on
+                        # the fresh JS callback — this branch is bookkeeping
+                        # only. Flap count is what operators watch.
+                        _cri_proxy_stats["flips_up"] += 1
+                        _cri_proxy_stats["last_flip_ts"] = time.time()
+                        _cri_proxy_stats["last_flip_kind"] = "up"
+                    is_disconnected = new_disc
+            except Exception:
+                pass
+            time.sleep(0.2)
 
     # ---- Safety ----
 
@@ -793,6 +1960,15 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 continue
             result = det.results[0]
             class_name = str(result.hypothesis.class_id)
+            # 2026-08-03 — Isaac YOLOv8 decoder emits class_id as the
+            # RAW COCO index (e.g. '39'='bottle', '61'='dining table').
+            # The classical `depth_segment_node` we retired used to
+            # emit human-readable strings, so the frontend expects
+            # names. Map numeric ids → COCO string names here so the
+            # overlay reads "bowl" instead of "45".
+            if class_name.isdigit():
+                class_name = _COCO_CLASS_NAMES.get(
+                    int(class_name), class_name)
             score = float(result.hypothesis.score)
             # depth_segment_node encodes part-library matches as
             # "part:NAME:STATUS:YAW_ERR" where STATUS is C (correct),
@@ -986,10 +2162,74 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                 _annotated_frame_cam1 = jpeg
 
     def _on_joint_states(self, msg):
+        now_mono = time.monotonic()
+        _last_joint_states_mono[0] = now_mono
+        # ── PHANTOM-FEEDBACK CLASS FIX (2026-08-27, twin flicker-to-zero) ──
+        # Under JOG_BACKEND=ws the WS driver's /estun/status mirror is the
+        # authoritative source for STATE.joints.positions (it carries
+        # joints_rad from RobotPosture). The ROS /joint_states topic the
+        # driver ALSO publishes uses lowercase names (joint_1..joint_6);
+        # this handler was originally written for the CRI-JSB naming
+        # convention (Joint1..Joint6, capitalized). Under ws the canonical
+        # lookup misses every slot → the fallback 0.0 fills the twin →
+        # racing with the real writer, the twin flickers to zero.
+        # Structural fix: under ws, IGNORE this feed entirely.
+        if _JOG_BACKEND_ENV == "ws":
+            _twin_source_ignored["ws_joint_states"] = (
+                _twin_source_ignored.get("ws_joint_states", 0) + 1)
+            return
+        # Normalize to canonical [Joint1..Joint6] order. JSB in the live CRI
+        # launch is publishing names in [Joint2, Joint3, Joint1, Joint4, Joint5,
+        # Joint6] because the spawner isn't honoring joint_state_broadcaster.
+        # yaml's `joints:` param at runtime (see the yaml's own head comment:
+        # "顺序会变成 2,3,1…"). Frontend indexes joints.positions[] by slot,
+        # not by name — under the raw order, positions[0..2] would go to
+        # Joint1/2/3's twin slots as Joint2/3/1's values, scrambling the
+        # base/shoulder/elbow render. Normalize here so every consumer
+        # (RobotControls, ArmViewer3D, StandaloneRobot) sees the correct
+        # index→joint mapping. Root-cause fix (JSB spawner param) queued for F3.
+        pos_by_name = dict(zip(msg.name, msg.position))
+        vel_by_name = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
+        canonical = ["Joint1", "Joint2", "Joint3", "Joint4", "Joint5", "Joint6"]
+        ordered_pos = [float(pos_by_name.get(n, 0.0)) for n in canonical]
+        ordered_vel = [float(vel_by_name.get(n, 0.0)) for n in canonical]
+        # ── All-zeros quarantine (phantom-feedback safety net). Even under
+        # the CRI-JSB path, an exact-all-zeros frame while the arm is
+        # actually enabled is impossible telemetry — quarantine + count.
+        if _is_all_zeros_positions(ordered_pos) and _wire_arm_is_enabled():
+            _phantom_zero_frames["cri_joint_states"] = (
+                _phantom_zero_frames.get("cri_joint_states", 0) + 1)
+            return
         with _state_lock:
-            STATE["joints"]["names"]      = list(msg.name)
-            STATE["joints"]["positions"]  = list(msg.position)
-            STATE["joints"]["velocities"] = list(msg.velocity) if msg.velocity else [0.0] * len(msg.name)
+            STATE["joints"]["names"]      = list(canonical)
+            STATE["joints"]["positions"]  = ordered_pos
+            STATE["joints"]["velocities"] = ordered_vel
+            # CRI proxy is authoritative for arm-authority fields whenever
+            # JOG_BACKEND=ros2. Previously gated on /estun/status staleness
+            # (>3s) to avoid stepping on a live WS driver — but under ros2
+            # the WS driver is passive by design and its estun_driver mirror
+            # (allow_jog=false in monitor_only) must not shadow cri_proxy's
+            # allow_jog=true. Helper is idempotent + also called from
+            # _on_estun_status / _on_estun_mode so last-writer-wins races
+            # can't flip authority.
+            r = STATE.setdefault("robot", {})
+            _apply_cri_proxy_authority(r)
+            # Under ros2, also keep robot.joints_deg fresh from the same
+            # canonical joint_states — otherwise it stays frozen at whatever
+            # estun_driver last mirrored (potentially before the driver was
+            # stopped), and any UI reading joints_deg instead of joints.
+            # positions renders stale-forever.
+            if _JOG_BACKEND_ENV == "ros2":
+                r["joints_deg"] = [math.degrees(p) for p in ordered_pos]
+        # Feed the breadcrumb collector so it can tag each ProjectState
+        # transition with the joints the arm was at right then. Fires
+        # ~25 Hz; the collector only holds the latest sample so this
+        # is O(1) and cheap. Pass the canonical-ordered positions so
+        # breadcrumb timestamps line up with what the UI shows.
+        try:
+            self._breadcrumbs.on_joint_states(ordered_pos)
+        except Exception:
+            pass
 
     def _on_task_state(self, msg):
         """Merge the program executor's state into STATE.task. Maps the
@@ -1000,6 +2240,12 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             d = json.loads(msg.data)
         except Exception:
             return
+        # Tell the breadcrumb collector about pause transitions so it
+        # can tag mid-step pauses on the trail's last waypoint.
+        try:
+            self._breadcrumbs.on_task_state(d)
+        except Exception:
+            pass
         exec_state = d.get("state", "idle")
         running_states = {"running", "waiting_motion", "waiting_io",
                           "waiting_detect", "waiting_time"}
@@ -1031,6 +2277,7 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             d = json.loads(msg.data)
         except Exception:
             return
+        _last_estun_status_ts[0] = time.time()
         with _state_lock:
             r = STATE.setdefault("robot", {})
             r["connected"]   = bool(d.get("connected", False))
@@ -1038,45 +2285,683 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             r["safety_mode"] = d.get("safety_mode", "unknown")
             r["status_flag"] = int(d.get("status_flag", 0))
             r["moving"]      = bool(d.get("moving", False))
+            # Jog state — IncrementalJogPanel disables its buttons while
+            # any driver-side jog is in flight.
+            r["jog_active"]  = bool(d.get("jog_active", False))
+            r["jog_mode"]    = d.get("jog_mode")   # None | 'velocity' | 'increment' | 'continuous' | 'continuous_cart'
+            r["jog_index"]   = int(d.get("jog_index", 0))
+            r["jog_direction"] = int(d.get("jog_direction", 0))
+            r["allow_jog"]   = bool(d.get("allow_jog", False))
+            r["allow_cartesian_jog"] = bool(d.get("allow_cartesian_jog", False))
+            # Two-tier speed cap. UI slider ceiling + "capped" marker
+            # both derive from these; passed through untouched so the
+            # driver stays the single source of truth for the limits.
+            for k in ("jog_speed_cap", "operator_speed_limit",
+                      "effective_speed_cap"):
+                if k in d:
+                    r[k] = float(d[k])
+            # Power gate + telemetry — dashboard banner shows Enable/
+            # Disable/Clear-Alarm affordances driven by these fields.
+            r["allow_power"] = bool(d.get("allow_power", False))
+            # I/O bridge gate — /api/io/live and the frontend toggle
+            # switches read this. Driver is authoritative.
+            r["allow_io"]    = bool(d.get("allow_io", False))
+            r["enabled"]     = bool(d.get("enabled", False))
+            r["enabling"]    = bool(d.get("enabling", False))
+            r["alarm"]       = bool(d.get("alarm", False))
+            r["alarm_count"] = int(d.get("alarm_count", 0))
+            r["state_code"]  = int(d.get("state_code", 0))
+            # Cabinet mode-selector key state (0=AUTO, 1=MANUAL, -1=unknown).
+            # DO writes go through project/run → require AUTO. UI reads
+            # this to grey out DO toggles when the key blocks the write
+            # instead of round-tripping through a guaranteed alarm.
+            try:
+                r["robot_mode_code"] = int(d.get("robot_mode_code", -1))
+            except (TypeError, ValueError):
+                r["robot_mode_code"] = -1
+            r["state_name"]  = d.get("state_name", "")
+            # Structured active alarm (or None) + latest stop reason.
+            # Passed through untouched — the dashboard banner formats
+            # cause + recovery text from these fields.
+            r["active_alarm"]      = d.get("active_alarm")
+            prev_stop_ts           = float(r.get("last_stop_ts") or 0.0)
+            r["last_stop_reason"]  = d.get("last_stop_reason", "")
+            r["last_stop_ts"]      = float(d.get("last_stop_ts") or 0.0)
+            # 2026-08-04 (Lesson 165 propagation): structured cause +
+            # dashboard-composed operator copy. Frontend consumes
+            # `stop_cause_copy` exclusively — no regex fork on the raw
+            # reason string. Fork registry: `jog_stop_cause_propagation`.
+            cause = d.get("last_stop_cause")
+            r["last_stop_cause"] = cause if isinstance(cause, dict) else None
+            r["cart_softening"]  = d.get("cart_softening") \
+                if isinstance(d.get("cart_softening"), dict) else None
+            # Re-translate whenever last_stop_ts advanced OR the tag
+            # changed since the last snapshot. Uses joint_limits (also
+            # driver-side) to compute the absolute limit value the
+            # operator sees ("±200°").
+            _jl = d.get("joint_limits") if isinstance(d.get("joint_limits"), list) else None
+            if r["last_stop_ts"] > 0.0 and (
+                    r["last_stop_ts"] != prev_stop_ts
+                    or r.get("stop_cause_copy") is None):
+                r["stop_cause_copy"] = _jog_stop_cause_operator_copy(
+                    r["last_stop_cause"] or {}, _jl or [])
+                # Persist the raw text as the technicalDetail fallback
+                # if the translator didn't set one (e.g. tag='other').
+                if r["stop_cause_copy"] and not r["stop_cause_copy"].get("technical"):
+                    r["stop_cause_copy"]["technical"] = r["last_stop_reason"]
+                # Unified event log — every stop cause lands as one
+                # event. Fires only on last_stop_ts ADVANCE (not on
+                # every state broadcast) so we get one line per
+                # actual driver stop, no duplicates.
+                if r["last_stop_ts"] != prev_stop_ts:
+                    _cause = r["last_stop_cause"] or {}
+                    _tag   = str(_cause.get('tag') or 'unknown')
+                    _sev   = 'error' if _tag in ('joint_limit', 'joint_limit_deeper',
+                                                 'collision_guard', 'send_failed') \
+                                     else 'warning'
+                    try:
+                        _event_log.emit(
+                            severity=_sev,
+                            source='driver',
+                            code=f'stop_jog:{_tag}',
+                            operator_message=(r["stop_cause_copy"] or {}).get(
+                                'title', f'Jog stopped ({_tag})'),
+                            technical_detail=str(r["last_stop_reason"] or ''),
+                            context={
+                                'tag':                _tag,
+                                'joint_index_1based': _cause.get('joint_index_1based'),
+                                'joint_deg':          _cause.get('joint_deg'),
+                                'joint_limit_deg':    _cause.get('joint_limit_deg'),
+                                'jog_mode':           _cause.get('jog_mode'),
+                                'stop_ts':            r["last_stop_ts"],
+                            },
+                        )
+                    except Exception:
+                        pass
+            # Per-joint limit evaluation — a list of six dicts (one per
+            # joint) each with current_deg/limit_deg/out_of_range/etc.
+            # Passed through untouched; dashboard interprets to render
+            # the live joint-limit recovery guide.
+            jl = d.get("joint_limits")
+            if isinstance(jl, list):
+                prev_jl = r.get("joint_limits") or []
+                r["joint_limits"] = jl
+                # 2026-08-05 (guided recovery, Lesson 165 extension):
+                # detect past_escape_only True<->False transitions per
+                # joint and append a JSONL entry to
+                # /opt/cobot/logs/recovery_events.jsonl. Bounded — a
+                # single line per transition, per joint, at driver
+                # publish rate. Non-fatal if the write fails (the
+                # user experience isn't affected).
+                _write_recovery_events_from_jl(prev_jl, jl)
+            # Self-collision guard telemetry (pair + distance + thresholds).
+            # Dashboard uses these to tint the offending link pair
+            # amber/red in the twin and render a live clearance readout.
+            # 2026-08-06: `collision_enabled` now means the RUNTIME
+            # kill switch is on. `collision_guard_active` is the
+            # boolean flag; `collision_model_loaded` is whether the
+            # capsule YAML parsed. The Configure surface + the event
+            # log key off `collision_enabled`.
+            prev_coll_en = r.get("collision_enabled")
+            r["collision_enabled"]       = bool(d.get("collision_enabled", False))
+            r["collision_guard_active"]  = bool(d.get("collision_guard_active", False))
+            r["collision_model_loaded"]  = bool(d.get("collision_model_loaded", False))
+            r["collision_pair"]    = d.get("collision_pair")
+            r["collision_min_mm"]  = d.get("collision_min_mm")
+            r["collision_warn_mm"] = float(d.get("collision_warn_mm") or 0.0)
+            r["collision_stop_mm"] = float(d.get("collision_stop_mm") or 0.0)
+            r["collision_warning"] = bool(d.get("collision_warning", False))
+            # 2026-08-06 (operator directive): every transition of the
+            # runtime kill switch lands in the event log. The initial
+            # observation (prev_coll_en is None) also emits so the
+            # boot state is on record. Warning severity on OFF; info
+            # on ON.
+            if prev_coll_en != r["collision_enabled"]:
+                try:
+                    if r["collision_enabled"]:
+                        _event_log.emit(
+                            severity='info',
+                            source='estun_driver',
+                            code='collision_guard_active',
+                            operator_message='Self-collision guard is ACTIVE.',
+                            technical_detail=(
+                                f'guard_active={r["collision_guard_active"]} '
+                                f'model_loaded={r["collision_model_loaded"]}'),
+                            context={'enabled': True})
+                    else:
+                        _event_log.emit(
+                            severity='warning',
+                            source='estun_driver',
+                            code='collision_guard_inactive',
+                            operator_message=(
+                                'Self-collision guard is OFF. Nothing in '
+                                'software prevents a link-on-link or link-'
+                                'on-table crash.'),
+                            technical_detail=(
+                                f'guard_active={r["collision_guard_active"]} '
+                                f'model_loaded={r["collision_model_loaded"]}'),
+                            context={'enabled': False,
+                                     'first_observation': prev_coll_en is None})
+                except Exception:
+                    pass
+            # Environment obstacle guard — separate keys from self-collision.
+            # env_pair is [link, "zone#<id>"]; env_escape_dirs is a list of
+            # {joint, direction, projected_mm, current_mm} sorted best-first.
+            r["env_zone_count"]  = int(d.get("env_zone_count") or 0)
+            r["env_pair"]        = d.get("env_pair")
+            r["env_min_mm"]      = d.get("env_min_mm")
+            r["env_warn_mm"]     = float(d.get("env_warn_mm") or 0.0)
+            r["env_stop_mm"]     = float(d.get("env_stop_mm") or 0.0)
+            r["env_escape_dirs"] = d.get("env_escape_dirs") or []
+            # Unified guard state — used by the guard popup for any
+            # collision kind (self / ground / env).
+            r["guard_active"]  = bool(d.get("guard_active", False))
+            r["guard_kind"]    = d.get("guard_kind")
+            r["guard_pair"]    = d.get("guard_pair")
+            r["guard_min_mm"]  = d.get("guard_min_mm")
+            r["guard_warn_mm"] = float(d.get("guard_warn_mm") or 0.0)
+            r["guard_stop_mm"] = float(d.get("guard_stop_mm") or 0.0)
+            r["guard_escapes"] = d.get("guard_escapes") or []
+            r["ground_z_mm"]   = d.get("ground_z_mm")
             # Joints (rad) — only overwrite if the driver gave us real data.
+            # ── PHANTOM-FEEDBACK CLASS FIX (2026-08-27, twin flicker-to-zero) ──
+            # Under JOG_BACKEND=ros2 the CRI-JSB /joint_states is the
+            # authoritative source; ignore the WS mirror's joints so the
+            # two writers can't race. Under ws this branch IS the source.
+            # In either mode, quarantine exact-all-zeros while the arm is
+            # actually enabled (impossible telemetry → phantom-feedback).
             jr = d.get("joints_rad")
             if isinstance(jr, list) and len(jr) == 6:
-                STATE["joints"]["positions"] = list(jr)
+                if _JOG_BACKEND_ENV == "ros2":
+                    _twin_source_ignored["ros2_estun_status_joints"] = (
+                        _twin_source_ignored.get("ros2_estun_status_joints", 0) + 1)
+                elif _is_all_zeros_positions(jr) and _wire_arm_is_enabled():
+                    _phantom_zero_frames["ws_estun_status"] = (
+                        _phantom_zero_frames.get("ws_estun_status", 0) + 1)
+                else:
+                    STATE["joints"]["positions"] = list(jr)
             # TCP pose (m / rad)
             tcp = d.get("tcp_m")
             if isinstance(tcp, list) and len(tcp) == 6:
                 STATE["tcp_pose"] = list(tcp)
+            # Mirror the display-friendly units (deg / mm) into STATE.robot
+            # so the frontend Points panel and the Teach-current-pose flow
+            # can read them straight without a rad→deg conversion. Both
+            # are computed driver-side from the same source (fitted DH →
+            # tcp_mm, controller-published joints → joints_deg).
+            jd = d.get("joints_deg")
+            if isinstance(jd, list) and len(jd) == 6:
+                r["joints_deg"] = list(jd)
+            tm = d.get("tcp_mm")
+            if isinstance(tm, list) and len(tm) == 6:
+                r["tcp_mm"] = list(tm)
             # Estop — real robot is authoritative when connected
             if r["connected"] and "estop" in d:
                 STATE["safety"]["estop"] = bool(d["estop"])
             # Task running mirror — only when not driven by the project runner
             if r["connected"] and not STATE["task"].get("running", False):
                 STATE["task"]["running"] = bool(d.get("moving", False))
+            # Under JOG_BACKEND=ros2 cri_proxy owns the arm-authority fields;
+            # re-assert after estun mirroring so ESTUN_ALLOW_JOG=0 in
+            # monitor_only can't leak allow_jog=false into the UI.
+            _apply_cri_proxy_authority(r)
+
+    # ---- Estun /estun/mode: gates + program live state ----
+
+    def _on_estun_mode(self, msg):
+        """Mirror /estun/mode into STATE.robot. Adds the fields /estun/status
+        doesn't carry: the four gates (with sources), the effective jog
+        heartbeat + freshness deadman, and the live program-execution
+        state (from publish/ProjectState) — project_state, task, line,
+        is_step, active project_id."""
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        with _state_lock:
+            r = STATE.setdefault("robot", {})
+            for k in (
+                "monitor_only", "allow_jog", "allow_jog_source",
+                "allow_cartesian_jog", "allow_cart_source",
+                "allow_power", "allow_power_source",
+                "allow_move", "allow_move_source",
+                "allow_mode", "allow_mode_source",
+                # 2026-08-28 §566/L298 four-tuple: numeric errors +
+                # recoveryState are ground truth for the toAuto
+                # refusal ladder (auto ClearError vs power-cycle
+                # required).
+                "errors", "recoveryState",
+                "jog_heartbeat_s", "jog_freshness_s",
+                # 2026-07-31 jog-stop bench instrumentation. Forward
+                # the driver's per-hold inter-arrival gap histogram
+                # + summary so the client + bench script can build
+                # the "is the channel gapping past 200 ms?" answer.
+                "jog_hold_gaps_ms", "jog_hold_gaps_summary",
+                "jog_last_hold_gaps_ms", "jog_last_hold_gaps_summary",
+            ):
+                if k in d:
+                    r[k] = d[k]
+            # Program-execution fields — driven by the driver's
+            # publish/ProjectState mirror.
+            prog = r.setdefault("program", {})
+            prog["state"]      = int(d.get("program_state", 0))
+            prog["project_id"] = d.get("program_project_id")
+            prog["task"]       = d.get("program_task")
+            prog["line"]       = d.get("program_line")
+            prog["is_step"]    = bool(d.get("program_is_step", False))
+            # Under JOG_BACKEND=ros2 cri_proxy owns the arm-authority fields;
+            # re-assert after /estun/mode mirroring so allow_jog=false there
+            # (ESTUN_ALLOW_JOG=0) can't leak into the UI.
+            _apply_cri_proxy_authority(r)
+
+    # ---- Estun /estun/program_status: save/status/error events ----
+
+    def _on_estun_program_status(self, msg):
+        """Bridge the driver's program-status events to STATE.robot.program.
+        Events are one of:
+          event=save   — payload includes steps[] (per-HTTP-call outcomes)
+          event=status — a ProjectState snapshot (state/line/is_step/error)
+          (source prefix "error_" indicates an ErrorDedup transition)
+        We keep the LAST save event under program.last_save, and a small
+        rolling window of status events under program.recent so the UI
+        can render both the confirm modal (post-save) and the live
+        line indicator (post-run) from one place."""
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        with _state_lock:
+            r = STATE.setdefault("robot", {})
+            prog = r.setdefault("program", {})
+            ev = d.get("event")
+            if ev == "save":
+                prog["last_save"] = d
+            elif ev == "status":
+                # Feed the breadcrumb collector so it can snapshot the
+                # arm's joints at each step transition and finalise
+                # the trail on stop/complete. Called under _state_lock
+                # but the collector uses its own lock and doesn't
+                # touch STATE — nesting is safe.
+                try:
+                    self._breadcrumbs.on_program_status(d)
+                except Exception:
+                    pass
+                # Track the latest error tuple (first-appearance, deduped
+                # by the driver's ErrorDedup). Cleared when driver reports
+                # None.
+                err = d.get("error")
+                prog["error"] = err
+                prog["source"] = d.get("source", "")
+                # Amendment 2 — auto-retry counter for project/stop.
+                # Client's wedge banner reads these to switch to
+                # evidence-based copy ("stop sent twice, controller
+                # not confirming") after the retry also fails.
+                prog["stop_retry_count"] = int(d.get("stop_retry_count") or 0)
+                prog["stop_retry_ts"]    = float(d.get("stop_retry_ts") or 0)
+                # Keep the last N status frames for a mini-timeline in the
+                # UI. Cap at 32 — enough to show a run's state trajectory,
+                # small enough to send inline in the /ws/state broadcast.
+                recent = prog.setdefault("recent", [])
+                recent.append({
+                    "ts":       d.get("ts"),
+                    "state":    d.get("state"),
+                    "is_step":  d.get("is_step"),
+                    "task":     d.get("task"),
+                    "line":     d.get("line"),
+                    "source":   d.get("source"),
+                })
+                if len(recent) > 32:
+                    del recent[:-32]
+
+    def _on_executor_status(self, msg):
+        """Handle F2.7 executor status events on /executor/status.
+
+        Two responsibilities:
+          1. Arbiter mirror: translate `program_state` (0/2/3/4/5) →
+             legacy `STATE.robot.program.state` (0/2/3) so the JOG-11
+             arbiter refuses jog during a running executor program
+             without needing a separate code path.
+          2. Bridge fulfillment: if the body carries a `req_id` that
+             was registered by /api/estun/program/run, append the
+             event to the awaiter's log; on terminal states
+             (COMPLETE=4 or ERROR=5), signal the awaiter's event.
+        """
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        self._executor_last_status = d
+        ev = d.get("event", "")
+        ps = d.get("program_state")
+
+        # Arbiter mirror. F2 executor states: IDLE=0, RUNNING=2,
+        # PAUSED=3, COMPLETE=4, ERROR=5. Arbiter reads
+        # STATE.robot.program.state which is legacy 0/2/3.
+        if ev == "status" and isinstance(ps, int):
+            with _state_lock:
+                r = STATE.setdefault("robot", {})
+                prog = r.setdefault("program", {})
+                if ps in (2, 3):
+                    prog["state"] = ps
+                    prog["source"] = "executor"
+                elif ps in (0, 4, 5):
+                    prog["state"] = 0
+                    prog["source"] = ("executor:complete" if ps == 4
+                                       else ("executor:error" if ps == 5
+                                             else "executor:idle"))
+                # Also mirror program_id + step index for the UI
+                # timeline.
+                if d.get("program_id"):
+                    prog["executor_program_id"] = d.get("program_id")
+                if d.get("current_step_idx") is not None:
+                    prog["executor_step_idx"] = d.get("current_step_idx")
+
+        # Bridge fulfillment.
+        req_id = d.get("req_id")
+        if req_id:
+            with self._executor_awaiters_lock:
+                aw = self._executor_awaiters.get(req_id)
+            if aw is not None:
+                # Log every event for the caller (they surface plan
+                # summaries + step verdicts on dry-run response bodies).
+                aw["events"].append(d)
+                if ev == "plan_summary":
+                    aw["plan_summaries"].append(d)
+                elif ev == "step_verdict":
+                    aw["step_verdicts"].append(d)
+                # Terminal states signal the caller.
+                terminal_kinds = {4, 5}  # COMPLETE, ERROR
+                if ev == "status" and isinstance(ps, int) and ps in terminal_kinds:
+                    aw["terminal"] = d
+                    aw["event"].set()
+
+    def _register_executor_awaiter(self, req_id: str) -> dict:
+        """Create + register a bridge-awaiter for `req_id`. Caller
+        MUST invoke _unregister_executor_awaiter(req_id) in a finally
+        block."""
+        aw = {
+            "event": threading.Event(),
+            "events": [],
+            "plan_summaries": [],
+            "step_verdicts": [],
+            "terminal": None,
+        }
+        with self._executor_awaiters_lock:
+            self._executor_awaiters[req_id] = aw
+        return aw
+
+    def _unregister_executor_awaiter(self, req_id: str) -> None:
+        with self._executor_awaiters_lock:
+            self._executor_awaiters.pop(req_id, None)
+
+    def _publish_task_run_program(self, program_id: str, dry_run: bool,
+                                    req_id: str,
+                                    run_speed_pct: float | None = None) -> bool:
+        """Publish the executor's run trigger. Returns True if the
+        publisher had at least one discovered subscriber at send time
+        (indicative — RELIABLE+VOLATILE means the message MAY still
+        be dropped if the subscriber's queue is full; we don't wait
+        for ack here since the executor's status event is the
+        authoritative reply)."""
+        body = {
+            "action": "run",
+            "program_id": program_id,
+            "dry_run": bool(dry_run),
+            "req_id": req_id,
+        }
+        if run_speed_pct is not None:
+            body["run_speed_pct"] = float(run_speed_pct)
+        n_subs = 0
+        try:
+            n_subs = self._task_run_program_pub.get_subscription_count()
+        except Exception:
+            pass
+        m = String(); m.data = json.dumps(body)
+        self._task_run_program_pub.publish(m)
+        return n_subs > 0
+
+    def _on_estun_mode_status(self, msg):
+        """Mirror /estun/mode_status events into STATE.robot.
+        Ring-buffer (32) so /api/estun/mode's wait loop can drain
+        it without racing the ROS callback. Fields: op, ok,
+        requested, observed, reason?, reason_code?, req_id?, ts."""
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        d.setdefault("srv_ts", time.time())
+        with _state_lock:
+            r = STATE.setdefault("robot", {})
+            ring = r.setdefault("mode_status", [])
+            ring.append(d)
+            if len(ring) > 32:
+                del ring[:-32]
+
+    def _on_estun_rejected(self, msg):
+        """Mirror driver rejections into STATE.robot.rejected (ring buffer).
+        The Monitor Run modal reads the newest entry with family='program'
+        to render the exact reason — 'allow_move gate closed', 'ws not
+        connected', etc. — instead of just a generic failure."""
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        with _state_lock:
+            r = STATE.setdefault("robot", {})
+            rej = r.setdefault("rejected", [])
+            rej.append(d)
+            if len(rej) > 32:
+                del rej[:-32]
+        # 2026-08-05 unified event log: every FRESH driver rejection
+        # lands in /opt/cobot/event_log/events_YYYYMMDD.jsonl.
+        # Best-effort — the emit call NEVER raises, so this can't
+        # block the broadcast pipeline.
+        #
+        # Coalescing: the driver already dedupes same-reason bursts
+        # by attaching a `count` field that increments on each
+        # repeat (2, 3, ...). Only emit when count is 1 (fresh
+        # transition) — otherwise we'd write thousands of
+        # duplicate records per shift for background chatter like
+        # "non-jog/power write paths not implemented on this branch"
+        # (2369 records observed in 20 minutes of the first deploy
+        # before this guard landed).
+        try:
+            count = int(d.get('count') or 1)
+            if count == 1:
+                reason = str(d.get('reason') or '')
+                family = str(d.get('family') or 'driver')
+                _event_log.emit(
+                    severity='warning' if family == 'jog' else 'error',
+                    source='driver',
+                    code=f'driver_reject:{family}',
+                    operator_message=f'Driver rejected {family}: {reason[:120]}',
+                    technical_detail=reason,
+                    context={'family': family, 'raw': d},
+                )
+        except Exception:
+            pass
+
+    def _on_estun_io(self, msg):
+        """Mirror the merged /estun/io snapshot into STATE.io_live so
+        the /api/io/live GET returns it without another ROS hop. Shape
+        matches what the driver publishes — see
+        estun_driver_node._publish_io_snapshot."""
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        with _state_lock:
+            STATE['io_live'] = d
+
+    # ---- Estun /estun/program publisher + op helper ----
+
+    def _estun_publish_op(self, op: str, **payload):
+        """Publish a single /estun/program op envelope. Returns True if
+        the frame reached the topic (does NOT mean the driver accepted
+        or ran it — the driver's gate + rejection stream is the source
+        of truth for that). Publisher is created eagerly in __init__.
+        A count_subscribers()==0 check logs a warning so we notice if
+        the driver isn't up — but does NOT block the publish (there's
+        no producer we can hand the message off to)."""
+        if self._estun_program_pub.get_subscription_count() == 0:
+            self.get_logger().warn(
+                f'/estun/program op={op!r} publishing with 0 discovered '
+                f'subscribers — driver may be down; op will be dropped '
+                f'by RELIABLE+VOLATILE QoS')
+        body = dict(payload); body["op"] = op
+        m = String(); m.data = json.dumps(body)
+        self._estun_program_pub.publish(m)
+        return True
 
     # ---- Cameras ----
 
     def _on_camera(self, cam_id: int, msg):
-        jpeg = _ros_image_to_jpeg(msg)
-        if jpeg:
-            with _cam_lock:
-                _cam_frames[cam_id] = jpeg
-            attr = f"_cam{cam_id}_logged"
-            if not getattr(self, attr, False):
-                setattr(self, attr, True)
-                self.get_logger().info(
-                    f"Camera {cam_id} first frame: "
-                    f"{msg.width}x{msg.height} enc={msg.encoding} "
-                    f"jpeg={len(jpeg)}B"
-                )
-        else:
-            attr = f"_cam{cam_id}_fail_logged"
-            if not getattr(self, attr, False):
-                setattr(self, attr, True)
-                self.get_logger().warn(
-                    f"Camera {cam_id} encode failed: "
-                    f"{msg.width}x{msg.height} enc={msg.encoding} "
-                    f"data_len={len(msg.data)}"
-                )
+        # Off-load JPEG encode to the dedicated worker pool so the ROS
+        # executor thread (which holds the GIL through PIL's Python-side
+        # bytecode) returns fast and stops competing with the asyncio
+        # loop for GIL windows. Drop-latest: if the previous frame for
+        # this camera is still encoding, skip this one — freshness
+        # beats completeness for the telemetry viewer, and queuing
+        # would only re-introduce the backlog we're trying to eliminate.
+        with _cam_encode_busy_lock:
+            if _cam_encode_busy.get(cam_id):
+                # Prior encode still in flight; drop this frame.
+                return
+            _cam_encode_busy[cam_id] = True
+        # Freeze the fields the encoder needs — the ROS msg is
+        # thread-safe to read here, but capture them explicitly so the
+        # worker doesn't hold a reference longer than needed.
+        w, h, enc = msg.width, msg.height, msg.encoding
+        raw = bytes(bytearray(msg.data))
+        first = not getattr(self, f"_cam{cam_id}_logged", False)
+
+        class _Msg:
+            width = w; height = h; encoding = enc; data = raw
+        stub = _Msg()
+
+        def _encode_task():
+            try:
+                jpeg = _ros_image_to_jpeg(stub)
+            finally:
+                with _cam_encode_busy_lock:
+                    _cam_encode_busy[cam_id] = False
+            if jpeg:
+                with _cam_lock:
+                    _cam_frames[cam_id] = jpeg
+                if first:
+                    setattr(self, f"_cam{cam_id}_logged", True)
+                    self.get_logger().info(
+                        f"Camera {cam_id} first frame: {w}x{h} enc={enc} "
+                        f"jpeg={len(jpeg)}B (encoded off-loop)")
+            else:
+                attr = f"_cam{cam_id}_fail_logged"
+                if not getattr(self, attr, False):
+                    setattr(self, attr, True)
+                    self.get_logger().warn(
+                        f"Camera {cam_id} encode failed: {w}x{h} enc={enc} "
+                        f"data_len={len(raw)}")
+
+        _cam_encode_pool.submit(_encode_task)
+
+    def _on_cam0_raw(self, msg):
+        """Store the latest cam0 color frame as a raw RGB uint8 array
+        for the AprilTag calibrator to consume synchronously. Called
+        at the camera frame rate (~15 Hz). Handles rgb8 and bgr8;
+        anything else is ignored (with a one-time warn) so a mis-
+        configured stream never breaks this path."""
+        if _np is None:
+            return
+        try:
+            enc = msg.encoding
+            w, h = int(msg.width), int(msg.height)
+            n = w * h * 3
+            if n <= 0 or n > len(msg.data):
+                return
+            buf = _np.frombuffer(bytes(msg.data), dtype=_np.uint8, count=n)
+            if enc == 'rgb8':
+                rgb = buf.reshape(h, w, 3)
+            elif enc == 'bgr8':
+                rgb = buf.reshape(h, w, 3)[:, :, ::-1]
+            else:
+                if not getattr(self, '_cam0_raw_enc_warned', False):
+                    self._cam0_raw_enc_warned = True
+                    self.get_logger().warn(
+                        f'cam0 raw tap: unsupported encoding {enc!r} — '
+                        f'calibration will not detect until this is rgb8/bgr8')
+                return
+            with _cam0_raw_lock:
+                _cam0_raw['rgb']    = rgb.copy()
+                _cam0_raw['width']  = w
+                _cam0_raw['height'] = h
+                _cam0_raw['ts']     = time.time()
+        except Exception as e:
+            if not getattr(self, '_cam0_raw_err_logged', False):
+                self._cam0_raw_err_logged = True
+                self.get_logger().warn(f'cam0 raw tap failed: {e}')
+
+    def _on_cam0_info(self, msg):
+        """Latest cam0 intrinsics (fx, fy, cx, cy). The calibrator
+        pulls this at capture time — no per-frame processing here."""
+        try:
+            k = msg.k
+            if len(k) >= 6 and k[0] > 0 and k[4] > 0:
+                with _cam0_raw_lock:
+                    _cam0_intr['fx'] = float(k[0])
+                    _cam0_intr['fy'] = float(k[4])
+                    _cam0_intr['cx'] = float(k[2])
+                    _cam0_intr['cy'] = float(k[5])
+        except Exception:
+            pass
+
+    def _broadcast_cam0_extrinsic(self):
+        """Publish the freshly-saved cam0_extrinsic.yaml as a static
+        TF (cam0_color_optical_frame → base_link) so consumers see it
+        without needing a tf_broadcaster restart. Called by the save
+        endpoint after a successful persist; silent no-op when tf2_ros
+        or the saved YAML is missing."""
+        if _StaticTFBroadcaster is None:
+            return
+        try:
+            from . import cam0_calibration as _cam0_calib_mod
+        except ImportError:
+            import cam0_calibration as _cam0_calib_mod  # type: ignore
+        payload = _cam0_calib_mod.load()
+        if not payload:
+            return
+        R = payload.get('R')
+        t = payload.get('t')
+        if not (isinstance(R, list) and len(R) == 3 and isinstance(t, list) and len(t) == 3):
+            return
+        # Rotation matrix → quaternion (xyzw).
+        try:
+            import numpy as _np2
+            R_mat = _np2.asarray(R, dtype=float).reshape(3, 3)
+            # scipy.spatial.transform.Rotation is already imported
+            # somewhere in the codebase; use it if available.
+            from scipy.spatial.transform import Rotation as _Rot
+            q = _Rot.from_matrix(R_mat).as_quat()   # xyzw
+        except Exception as e:
+            print(f'[calib] cannot build quaternion for TF: {e}',
+                  flush=True)
+            return
+        if self._static_tf_bcast is None:
+            self._static_tf_bcast = _StaticTFBroadcaster(self)
+        msg = _TFStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = str(payload.get('frame_to', 'base_link'))
+        msg.child_frame_id  = str(payload.get('frame_from', 'cam0_color_optical_frame'))
+        msg.transform.translation.x = float(t[0])
+        msg.transform.translation.y = float(t[1])
+        msg.transform.translation.z = float(t[2])
+        msg.transform.rotation.x    = float(q[0])
+        msg.transform.rotation.y    = float(q[1])
+        msg.transform.rotation.z    = float(q[2])
+        msg.transform.rotation.w    = float(q[3])
+        self._static_tf_bcast.sendTransform([msg])
+        self.get_logger().info(
+            f'cam0 extrinsic TF published: {msg.child_frame_id} → '
+            f'{msg.header.frame_id}  t=[{t[0]:+.3f}, {t[1]:+.3f}, {t[2]:+.3f}]  '
+            f'rms={payload.get("rms_mm", "?")} mm')
 
     # ---- LiDAR ----
 
@@ -1179,6 +3064,37 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
 
 _ros_node: DashboardServer = None
 
+# Global joint recorder — instantiated at lifespan startup, torn down
+# on shutdown. Stays None on the module until then; endpoints null-
+# check it for the small window between import and startup.
+_joint_recorder = None
+
+def _joint_recorder_snapshot():
+    """Snapshot provider passed into JointRecorder. Reads STATE under
+    _state_lock, returns None when joints haven't been published yet
+    (arm not connected / driver still initialising). The recorder's
+    per-tick loop calls this and skips writes on None."""
+    with _state_lock:
+        joints = STATE.get('joints') or {}
+        positions = list(joints.get('positions') or [])
+        robot = STATE.get('robot') or {}
+        prog = robot.get('program') or {}
+        prog_state = prog.get('state')
+        prog_line  = prog.get('line')
+        prog_id    = prog.get('project_id')
+    if not positions or len(positions) < 6:
+        return None
+    joints_deg = [round((v * 180.0 / math.pi), 3) for v in positions[:6]]
+    return {
+        't':             time.time(),
+        'joints_deg':    joints_deg,
+        'program_id':    prog_id,
+        'program_name':  prog_id,   # name lookup would need file I/O — id is stable
+        'program_state': int(prog_state or 0),
+        'program_line':  prog_line,
+        'is_step':       bool((prog or {}).get('is_step', False)),
+    }
+
 if FASTAPI_AVAILABLE:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1191,9 +3107,68 @@ if FASTAPI_AVAILABLE:
             # Registration function not defined yet (rare — early
             # import failure). Endpoints will just serve empty data.
             pass
+        # 2026-07-31 CONVERGENCE FIX: seed _prog_revs from every
+        # program's on-disk rev BEFORE the /ws/state broadcast loop
+        # starts. Without this, the first post-restart mutation
+        # collapses rev to 1 while clients still hold higher revs
+        # from the previous process — every subsequent event's
+        # `ev.rev > cp.rev` compare fails silently.
+        try:
+            _seed_prog_revs_from_disk()
+        except Exception as _e:
+            print(f'[dashboard] _seed_prog_revs_from_disk failed: {_e}',
+                  flush=True)
         task = asyncio.create_task(_broadcast_loop())
+        # Server-side hold keepalive — drives /robot/jog_command at a
+        # steady 100 ms cadence. Runs on a dedicated NATIVE thread, not
+        # the asyncio loop — the loop's callback-dispatch drift measured
+        # 50–300 ms under normal load (camera streams + state broadcast
+        # + WS traffic), and even ONE stack-up of that drift crosses
+        # the driver's freshness deadman. A native thread with
+        # time.sleep-based scheduling is unaffected by loop load;
+        # rclpy publishers are thread-safe so calling _publish_estun_jog
+        # from here is fine.
+        _keepalive_stop.clear()
+        keepalive_thread = threading.Thread(
+            target=_keepalive_thread_loop,
+            name='hold-keepalive',
+            daemon=True)
+        keepalive_thread.start()
+        # Always-on joint flight recorder. Ticks at 25 Hz, gzip'd
+        # segments under /opt/cobot/joint_history/, 2 GB / 14 d hard
+        # retention. Failure-isolated — a recorder crash never
+        # touches STATE or the broadcast loop.
+        global _joint_recorder
+        try:
+            _joint_recorder = JointRecorder(_joint_recorder_snapshot)
+            _joint_recorder.start()   # sync — spawns a native thread
+        except Exception as _e:
+            print(f'[dashboard] joint recorder failed to start: {_e}',
+                  flush=True)
+            _joint_recorder = None
+        # 2026-08-05 disk watchdog — enforced retention on
+        # /opt/cobot/logs, joint_history, event_log. Runs a prune
+        # sweep every 60 s. First sweep at boot cleans any pre-
+        # existing overrun.
+        try:
+            _disk_watchdog.enforce_all()
+            _disk_watchdog.start_watchdog_thread(period_s=60.0)
+            print('[dashboard] disk watchdog started (60s cadence, '
+                  '2GB caps on logs/joint_history, 500MB on event_log)',
+                  flush=True)
+        except Exception as _e:
+            print(f'[dashboard] disk watchdog failed to start: {_e}',
+                  flush=True)
         yield
         task.cancel()
+        _keepalive_stop.set()
+        keepalive_thread.join(timeout=1.0)
+        if _joint_recorder is not None:
+            try:
+                _joint_recorder.stop()
+            except Exception as _e:
+                print(f'[dashboard] joint recorder shutdown error: {_e}',
+                      flush=True)
         try:
             await task
         except asyncio.CancelledError:
@@ -1203,17 +3178,110 @@ if FASTAPI_AVAILABLE:
     app.add_middleware(CORSMiddleware, allow_origins=["*"],
                        allow_methods=["*"], allow_headers=["*"])
 
+    # Edition gate middleware (2026-09-04). Full-only endpoints are
+    # matched by URL-path regex against the caller's edition (read via
+    # X-Client-Id → dashboard_editions.json). Middleware is used
+    # rather than per-endpoint calls because the surfaces span
+    # ~30 routes; keeping the list here means the gate has ONE audit
+    # site. The GATED_PATH_PATTERNS below are the endpoints that ONLY
+    # the three hidden pages (Cameras & LiDAR, Part Recognition,
+    # Safety Page) consume — routes that any visible tab also
+    # depends on (/api/parts list, /api/lidar_objects/identified,
+    # /api/io/*, /api/event_log/*, /api/detections … wait — see
+    # DETECTIONS_NOTE below) stay open.
+    #
+    # DETECTIONS_NOTE: /api/detections is only consumed by
+    # AdaptivePicking today. If a future Monitor overlay starts
+    # reading it, MOVE it out of the gated list here — do NOT expect
+    # the middleware to know which page requested.
+    import re as _edition_re
+    # Pattern entries: (regex, feature_key, methods_or_None). When
+    # methods_or_None is None every HTTP method matching the path
+    # goes through the edition gate. Otherwise only methods in the
+    # tuple are gated — reads on the same path stay open. This is
+    # how /api/cells/* mutations get gated as `cell_commissioning`
+    # while GET /api/cells/active stays reachable for the StatusBar
+    # + Monitor consumers on basic devices.
+    _EDITION_FULL_ONLY_PATTERNS = [
+        # part_recognition (AdaptivePicking-only)
+        (_edition_re.compile(r'^/api/parts/upload/?$'),          'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/teach($|/)'),   'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/scan($|/)'),    'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/orient_weights$'), 'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/orientation_debug$'), 'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/defects$'),     'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/teach_clear$'), 'part_recognition', None),
+        (_edition_re.compile(r'^/api/parts/[^/]+/config$'),      'part_recognition', None),
+        (_edition_re.compile(r'^/api/openvocab($|/)'),           'part_recognition', None),
+        (_edition_re.compile(r'^/api/teach_mode/(start|stop)$'), 'part_recognition', None),
+        (_edition_re.compile(r'^/api/detections$'),              'part_recognition', None),
+        # cameras_lidar (SensorsLayout-only)
+        (_edition_re.compile(r'^/api/motioncam($|/)'),           'cameras_lidar', None),
+        # safety_page has no dedicated /api/safety config route on this
+        # backend; the SafetyPage reads via /ws/state which stays open
+        # (state is edition-independent). Tab hiding is the gate.
+        #
+        # cell_commissioning (2026-09-04 Configure additions). Cell
+        # STATE reads stay open for both editions — StatusBar's
+        # environment-guard footer and Monitor's zone display depend
+        # on GET /api/cells + GET /api/cells/active + GET
+        # /api/cells/{id}/... . Only WRITES + activate/deactivate
+        # + baseline/collision_zones BUILDS are gated. Setup Wizard
+        # lives in Configure which itself hides on basic; this is
+        # defence-in-depth so a curl (or a future basic-side surface)
+        # cannot mutate cell state.
+        (_edition_re.compile(r'^/api/cells$'),                        'cell_commissioning', ('POST',)),
+        (_edition_re.compile(r'^/api/cells/deactivate$'),             'cell_commissioning', ('POST',)),
+        (_edition_re.compile(r'^/api/cells/[^/]+$'),                  'cell_commissioning', ('PUT', 'DELETE')),
+        (_edition_re.compile(r'^/api/cells/[^/]+/activate$'),         'cell_commissioning', ('POST',)),
+        (_edition_re.compile(r'^/api/cells/[^/]+/baseline$'),         'cell_commissioning', ('POST',)),
+        (_edition_re.compile(r'^/api/cells/[^/]+/collision_zones($|/)'), 'cell_commissioning', ('POST', 'DELETE')),
+    ]
+
+    @app.middleware("http")
+    async def _edition_gate_middleware(request, call_next):
+        path = request.url.path
+        method = request.method
+        for pat, feature_key, methods in _EDITION_FULL_ONLY_PATTERNS:
+            if not pat.match(path):
+                continue
+            if methods is not None and method not in methods:
+                continue
+            # Deferred import — edition module loaded further down
+            # in this file, but middleware runs at request time
+            # (post-import), so a lazy reference is safe.
+            from cobot_dashboard import edition as _ed
+            client_id = (request.headers.get('x-client-id') or '').strip()
+            ed = _ed.resolve_edition(client_id)
+            if not _ed.is_feature_enabled(feature_key, ed):
+                payload = _ed.refusal_payload(feature_key)
+                payload['edition'] = ed
+                return JSONResponse(payload, status_code=403)
+            break
+        return await call_next(request)
+
     # ------------------------------------------------------------------
     # Broadcast loop — pushes state + lidar to WebSocket queues at Hz
     # ------------------------------------------------------------------
 
     async def _broadcast_loop():
-        state_hz  = 25
+        # 2026-07-17: state rate is 25 Hz at idle but DROPS to 8 Hz
+        # while any jog hold is active. Rationale: at 25 Hz the loop
+        # spent ~15% of the GIL on deepcopy + json.dumps of the 10 KB
+        # state blob, occasionally starving the native keepalive thread
+        # for up to 672 ms (past the driver's freshness deadman → phantom
+        # staleness stops mid-hold on both the Program tab and 3D View
+        # jog screens). 8 Hz keeps the twin visually responsive (Twin
+        # follower uses exponential smoothing so update rate isn't
+        # visually critical) while freeing GIL for the keepalive.
+        state_hz_idle = 25
+        state_hz_hold = 8
         lidar_hz  = 10
         mesh_hz   = 2
         motioncam_hz = 10
         motioncam_reco_hz = 4
-        state_dt  = 1.0 / state_hz
+        state_dt_idle  = 1.0 / state_hz_idle
+        state_dt_hold  = 1.0 / state_hz_hold
         lidar_dt  = 1.0 / lidar_hz
         mesh_dt   = 1.0 / mesh_hz
         motioncam_dt = 1.0 / motioncam_hz
@@ -1237,36 +3305,80 @@ if FASTAPI_AVAILABLE:
                     with _ws_lock:
                         clients = list(_mesh_clients.items())
                     for ws, q in clients:
-                        if q.qsize() < 2:
-                            try:
-                                await q.put(payload)
-                            except Exception:
-                                pass
+                        _put_drop_oldest(q, payload, 'mesh')
                 next_mesh = now + mesh_dt
 
             if now >= next_state:
-                with _state_lock:
-                    payload = copy.deepcopy(STATE)
-                payload["t"] = now * 1000
-                txt = json.dumps(payload)
+                # Skip the deep-copy + json.dumps (both non-trivial on
+                # a state blob this size) when no one is listening.
+                # The next_state cursor still advances so we don't spin.
+                with _ws_lock:
+                    n_clients = len(_state_clients)
+                # Adaptive rate — 8 Hz while a jog hold is active, 25 Hz otherwise.
+                with _active_holds_lock:
+                    hold_active = len(_active_holds) > 0
+                state_dt = state_dt_hold if hold_active else state_dt_idle
+                if n_clients == 0:
+                    next_state = now + state_dt
+                    await asyncio.sleep(state_dt)
+                    continue
+                # Root-caused 2026-07-17: deepcopy + json.dumps of the
+                # ~10 KB STATE blob was executing inside the asyncio
+                # loop's task and holding the GIL for 5-10 ms per
+                # broadcast. Under 25 Hz that's ~15% GIL occupancy on
+                # THIS thread — enough to starve the native keepalive
+                # thread (max_tick_gap_ms measured at 622 ms in a
+                # single stall, twice the driver's 300 ms freshness
+                # deadman → driver fires stopJog mid-hold → chattery
+                # jog on BOTH the Program and 3D View screens because
+                # they share the same transport). Fix: run the
+                # deepcopy+json.dumps in the default thread executor
+                # (concurrent futures pool) so the asyncio loop
+                # RELEASES the GIL while json runs its C-side work,
+                # and the keepalive native thread gets scheduled.
+                loop = asyncio.get_running_loop()
+                def _snapshot_and_serialize():
+                    with _state_lock:
+                        payload = copy.deepcopy(STATE)
+                    _state_seq_counter[0] += 1
+                    payload["t"]   = now * 1000
+                    payload["seq"] = _state_seq_counter[0]
+                    # Program-change events (last _PROG_EVENT_TTL_S sec).
+                    # Latest-wins broadcast means an individual frame
+                    # may be skipped by a slow client, but every event
+                    # rides multiple frames within its TTL so the
+                    # client is guaranteed to see it.
+                    events = _snapshot_program_events()
+                    if events:
+                        payload["program_events"] = events
+                    # 2026-07-31 CONVERGENCE: include the full
+                    # {program_id: rev} snapshot in every state
+                    # frame. Clients rev-gap-check their held
+                    # currentProgram against server-truth on each
+                    # frame and refetch immediately when they're
+                    # behind — heals missed events (event ring
+                    # TTL 15s can age out during long backgrounds)
+                    # without waiting for the next mutation.
+                    revs = _snapshot_prog_revs()
+                    if revs:
+                        payload["program_revs"] = revs
+                    return json.dumps(payload), _state_seq_counter[0]
+                txt, seq = await loop.run_in_executor(None, _snapshot_and_serialize)
+                # Sequence + broadcast time. The seq lets the ACK-gated
+                # sender coalesce: if the client hasn't yet acked frame
+                # N, we overwrite `latest_payload` in place and only
+                # send AFTER the ack arrives. This bounds in-flight to
+                # one frame regardless of OS TCP send buffer depth.
                 with _ws_lock:
                     clients = list(_state_clients.items())
-                for ws, q in clients:
-                    # Drop-to-latest: drain any stale queued frame before
-                    # inserting the fresh one so slow WS consumers always
-                    # see the newest STATE, never a chain of stale frames.
-                    # Prior "if qsize<2: put" logic held old frames when
-                    # the consumer stalled — that surfaced as twin
-                    # surge-and-lag on wireless clients.
-                    try:
-                        while True:
-                            q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                    try:
-                        q.put_nowait(txt)
-                    except asyncio.QueueFull:
-                        pass
+                for ws, client in clients:
+                    # Latest-wins: overwrite in place. The sender only
+                    # pulls at ack time, so the newest txt at ack time
+                    # is what ships next — never a chain of stale frames.
+                    client['latest_txt'] = txt
+                    client['latest_seq'] = seq
+                    client['latest_broadcast_ts'] = now * 1000
+                    client['new_event'].set()
                 next_state = now + state_dt
 
             if now >= next_lidar:
@@ -1298,11 +3410,7 @@ if FASTAPI_AVAILABLE:
                 with _ws_lock:
                     clients = list(_lidar_clients.items())
                 for ws, q in clients:
-                    if q.qsize() < 2:
-                        try:
-                            await q.put(('binary', lidar_payload))
-                        except Exception:
-                            pass
+                    _put_drop_oldest(q, ('binary', lidar_payload), 'lidar')
                 next_lidar = now + lidar_dt
 
             if now >= next_motioncam:
@@ -1323,11 +3431,7 @@ if FASTAPI_AVAILABLE:
                     with _ws_lock:
                         clients = list(_motioncam_cloud_clients.items())
                     for ws, q in clients:
-                        if q.qsize() < 2:
-                            try:
-                                await q.put(('binary', payload))
-                            except Exception:
-                                pass
+                        _put_drop_oldest(q, ('binary', payload), 'motioncam_cloud')
                 next_motioncam = now + motioncam_dt
 
             if now >= next_motioncam_reco:
@@ -1336,14 +3440,402 @@ if FASTAPI_AVAILABLE:
                 with _ws_lock:
                     clients = list(_motioncam_reco_clients.items())
                 for ws, q in clients:
-                    if q.qsize() < 2:
-                        try:
-                            await q.put(txt)
-                        except Exception:
-                            pass
+                    _put_drop_oldest(q, txt, 'motioncam_reco')
                 next_motioncam_reco = now + motioncam_reco_dt
 
             await asyncio.sleep(0.005)
+
+    # ------------------------------------------------------------------
+    # WS client→server message router
+    # ------------------------------------------------------------------
+    #
+    # /ws/state is now bidirectional. Server → client is the periodic
+    # state broadcast; client → server carries jog + power commands over
+    # the same persistent channel so a single hold session doesn't pay
+    # per-message TLS handshake / TCP connection cost, and messages
+    # arrive in order (which HTTP/1.1 does not guarantee across parallel
+    # connections). The HTTP endpoints (/cmd/jog, /cmd/jog_cartesian,
+    # /cmd/power) remain as-is; the frontend falls back to them if the
+    # WS is down. Every message just funnels back into the same
+    # _publish_estun_jog / _publish_estun_power helpers — the driver
+    # sees identical /robot/jog_command traffic either way, and the
+    # hold_id/seq semantics are unchanged.
+    #
+    # Wire format (JSON, one message per frame):
+    #   {"type": "jog",           "payload": {...jog body as /cmd/jog...}}
+    #   {"type": "jog_cartesian", "payload": {...as /cmd/jog_cartesian...}}
+    #   {"type": "power",         "payload": {"action": "enable"|"disable"|"clear_alarm"}}
+    #
+    # Server does NOT reply — this is fire-and-forget, matching the
+    # HTTP endpoints. Errors are swallowed so a bad message from one
+    # client cannot tear down the connection.
+
+    _WS_JOG_ACTIONS = {"jog", "jog_cartesian", "power"}
+
+    # ── Server-side hold keepalive ────────────────────────────────────
+    #
+    # The dashboard now maintains the freshness heartbeat to the driver
+    # on the server's own event loop. Wire evidence (2026-07-15 cont-jog
+    # session): under normal camera + WS load, browser→server refresh
+    # inter-arrival at the driver hit ~5 % > 300 ms — enough to trip
+    # the driver's freshness deadman mid-hold and turn Cartesian jog
+    # into step. Root cause was GIL-holding JPEG encode; that's fixed
+    # above by moving encode to a worker pool. This keepalive is the
+    # structural fix — the dashboard has all the state (open WS,
+    # hold_id, last browser refresh time), so it can maintain a
+    # rock-steady 100 ms cadence to the driver regardless of browser
+    # jitter, while preserving every safety property:
+    #
+    #   • WS disconnects (browser closed / laptop lid / network lost)
+    #     → keepalive drops the session → driver's 300 ms deadman fires
+    #     → Robot/stopJog on the wire.
+    #   • Explicit release from browser → we send hold:false immediately
+    #     and drop the session.
+    #   • Browser silent > 400 ms (finger genuinely lifted, or all WS
+    #     messages lost) → keepalive drops the session → driver deadman
+    #     ~300 ms later.
+    #
+    # The operator's finger remains the deadman; we just stop network
+    # jitter from impersonating a release. The driver's own 300 ms
+    # deadman remains the ultimate safety backstop.
+    # 60 ms interval (not 100) — the keepalive runs on a native thread
+    # but still shares the GIL with the asyncio loop; measured on-Jetson
+    # under normal load, GIL bursts occasionally hold 200–250 ms, so a
+    # 100 ms interval + one drifted tick can just cross the driver's
+    # 300 ms deadman. At 60 ms we get five ticks per deadman window —
+    # even TWO consecutive drifted ticks stay under 300 ms driver-side.
+    HOLD_KEEPALIVE_INTERVAL_S = 0.06
+    HOLD_BROWSER_TIMEOUT_S    = 0.4
+
+    # Backend selector — SEAM A of Phase F1 (2026-08-18; see
+    # cobot-cri-planner-intent, jog_bridge package in
+    # ~/cri_eval_ws/CodroidROS2/src/jog_bridge/). Read once at module load —
+    # no runtime switching. §282 gate-banner: announce at startup.
+    #   'ws'   (default) — publish to /robot/jog_command as before;
+    #                       estun_driver runs the jog gate.
+    #   'ros2'          — publish to /dashboard/jog_session_events;
+    #                       jog_bridge runs the JTC-side jog gate; nothing
+    #                       lands on /robot/jog_command (estun_driver stays
+    #                       fully passive).
+    # Mutual exclusion with estun_driver.allow_jog is enforced by
+    # jog_bridge's /estun/mode drift-check at 5 s cadence.
+    # Fanout rate-limits ONLY 'refresh' events at 90 ms/hold_id (the SM's
+    # 200 ms horizon needs ~5 refreshes/sec, so 60 ms keepalive cadence
+    # would otherwise churn the action layer at ~10 preempts/sec).
+    # 'start' and 'stop' always pass immediately (dead-man-by-finger, §286).
+    _JOG_BACKEND = os.environ.get("JOG_BACKEND", "ws").strip().lower()
+    if _JOG_BACKEND not in ("ws", "ros2"):
+        print(f"[dashboard] JOG_BACKEND={_JOG_BACKEND!r} not in {{'ws','ros2'}}; "
+              f"defaulting to 'ws'.", flush=True)
+        _JOG_BACKEND = "ws"
+    print(f"[dashboard] JOG_BACKEND = {_JOG_BACKEND!r}", flush=True)
+    _JOG_REFRESH_COALESCE_S = 0.090   # 90 ms per hold_id (refresh only)
+
+
+    class _HoldSession:
+        """Bookkeeping for a single active jog hold. Owned by the
+        server keepalive loop; refreshed by inbound browser messages."""
+        __slots__ = ('hold_id', 'ws', 'driver_payload_template',
+                     'last_browser_ts', 'server_seq', 'mode')
+        def __init__(self, hold_id, ws, tpl, mode):
+            self.hold_id = hold_id
+            self.ws = ws
+            self.driver_payload_template = tpl  # dict WITHOUT seq/hold
+            self.last_browser_ts = time.monotonic()
+            # Start server_seq high (ms since epoch) so it dominates any
+            # browser seq the driver might have latched from an earlier
+            # session — monotonic across the whole day.
+            self.server_seq = int(time.time() * 1000)
+            self.mode = mode
+
+    _active_holds = {}          # hold_id -> _HoldSession
+    _active_holds_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Motion arbiter (JOG-11, 2026-08-27) — jog and program-run are
+    # mutually exclusive. Reason: the CRI stack and the WS driver
+    # coexist (F1.0 proved hybrid) but only ONE may command motion at
+    # any instant. Any motion-initiating call MUST be gated on the
+    # other channel being idle. Release / stop calls are ALWAYS
+    # allowed so they can never strand a dangling hold when a
+    # program starts. Doctrine test: test_motion_arbiter.py.
+    # ------------------------------------------------------------------
+    _PROGRAM_RUNNING_STATES = (2, 3)
+
+    def _arbiter_probe_program_running():
+        """Return (running: bool, info: dict). Reads STATE.robot.program.
+        program_state ∈ {2, 3} = running; 0 = idle. info carries the
+        project_id/line for the operator-copy dialog."""
+        with _state_lock:
+            prog = STATE.get("robot", {}).get("program", {}) or {}
+            st = int(prog.get("state", 0) or 0)
+            pid = prog.get("project_id")
+            line = prog.get("line")
+        if st in _PROGRAM_RUNNING_STATES:
+            return True, {
+                "program_state": st,
+                "project_id": pid,
+                "line": line,
+            }
+        return False, {}
+
+    def _arbiter_probe_jog_active():
+        """Return (active: bool, info: dict). Reads _active_holds; ANY
+        hold session counts as active jog. info lists up to 8 hold_ids."""
+        with _active_holds_lock:
+            n = len(_active_holds)
+            hids = list(_active_holds.keys())[:8]
+        if n:
+            return True, {"n_active_holds": n, "hold_ids": hids}
+        return False, {}
+
+    def _arbiter_refuse_jog_if_running(body):
+        """Returns None if the jog request may proceed; else a
+        JSONResponse(409) with reason_code='program_running' and an
+        operator_copy title/detail suitable for the toast. Release /
+        stop bodies are always allowed."""
+        if body.get("hold") is False or body.get("stop") is True:
+            return None
+        running, info = _arbiter_probe_program_running()
+        if not running:
+            return None
+        return JSONResponse(
+            {"error": "Cannot jog: a program is currently running.",
+             "reason_code": "program_running",
+             "program": info,
+             "operator_copy": {
+                 "title": "Program is running",
+                 "detail": ("Stop the program (or wait for it to finish) "
+                            "before jogging."),
+             }},
+            status_code=409,
+        )
+
+    def _arbiter_refuse_run_if_jogging():
+        """Returns None if a program-run may proceed; else a
+        JSONResponse(409) with reason_code='jog_active' + operator_copy."""
+        active, info = _arbiter_probe_jog_active()
+        if not active:
+            return None
+        return JSONResponse(
+            {"error": "Cannot run: a jog session is active.",
+             "reason_code": "jog_active",
+             "jog": info,
+             "operator_copy": {
+                 "title": "Jog session active",
+                 "detail": ("Release the jog control (both button and "
+                            "touch) before starting the program."),
+             }},
+            status_code=409,
+        )
+
+    def _build_driver_payload(t, payload):
+        """Shared payload shaping — mirrors the HTTP endpoints' translations
+        (joint → axis, letter-axis → 1..6). Used by both the initial-hold
+        publish path and the keepalive loop. Returns the dict WITHOUT
+        seq/hold_id/hold — the caller adds those as appropriate."""
+        mode = "cartesian" if t == "jog_cartesian" else "joint"
+        out = dict(payload)
+        out.setdefault("mode", mode)
+        if "axis" not in out and "joint" in out:
+            try:
+                out["axis"] = int(out.pop("joint"))
+            except (TypeError, ValueError):
+                return None
+        if mode == "cartesian" and isinstance(out.get("axis"), str):
+            axis_map = {"x": 1, "y": 2, "z": 3, "rx": 4, "ry": 5, "rz": 6}
+            n = axis_map.get(out["axis"].lower())
+            if n is not None:
+                out["axis"] = n
+        # Strip fields the keepalive will manage on its own.
+        for k in ("seq", "hold", "client_ts_ms"):
+            out.pop(k, None)
+        return out
+
+    def _handle_ws_client_msg(raw: str, ws=None):
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return
+        # Diagnostic: count every inbound message that hits this router.
+        # Bumps a global so /health can show whether the silence-test
+        # sim is truly silent (bumps stop) or something is coming in.
+        _keepalive_stats.setdefault('ws_msgs_in', 0)
+        _keepalive_stats['ws_msgs_in'] += 1
+        t = msg.get("type")
+        if t not in _WS_JOG_ACTIONS:
+            return
+        payload = msg.get("payload") or {}
+        if not isinstance(payload, dict):
+            return
+        if t == "power":
+            action = str(payload.get("action", "")).lower()
+            if action not in _POWER_ACTIONS:
+                return
+            _publish_estun_power({"action": action})
+            return
+
+        hold_id = payload.get("hold_id")
+        # Release path takes absolute priority. Publish release
+        # immediately and drop any tracked session for this hold_id.
+        if payload.get("hold") is False or payload.get("stop") is True:
+            mode = "cartesian" if t == "jog_cartesian" else "joint"
+            out = {"mode": mode, "hold": False}
+            for k in ("hold_id", "seq", "client_ts_ms"):
+                if payload.get(k) is not None:
+                    out[k] = payload[k]
+            _publish_estun_jog(out)
+            if hold_id is not None:
+                with _active_holds_lock:
+                    _active_holds.pop(hold_id, None)
+            return
+
+        # Non-hold jog shapes (delta_deg increments, cart pulse) — pass
+        # through, no keepalive tracking needed. The driver runs its own
+        # time-boxed stop for those.
+        if payload.get("hold") is not True:
+            tpl = _build_driver_payload(t, payload)
+            if tpl is None: return
+            # For increments: re-attach delta_deg / pulse fields that
+            # _build_driver_payload didn't strip (only seq/hold/client_ts).
+            _publish_estun_jog(tpl)
+            return
+
+        # hold:true — register / refresh the session. The keepalive loop
+        # will drive the actual /robot/jog_command traffic from here on.
+        tpl = _build_driver_payload(t, payload)
+        if tpl is None: return
+        mode = tpl.get("mode", "joint")
+        now = time.monotonic()
+        with _active_holds_lock:
+            hs = _active_holds.get(hold_id) if hold_id is not None else None
+            if hs is None:
+                # New session — publish the first frame IMMEDIATELY so
+                # the driver's session-tracking state gets set up before
+                # our first keepalive tick. Subsequent keepalive ticks
+                # will refresh at 100 ms cadence.
+                hs = _HoldSession(hold_id, ws, tpl, mode)
+                _active_holds[hold_id] = hs
+                initial = True
+            else:
+                # Refresh — just update the freshness timestamp; the
+                # keepalive loop is already publishing.
+                hs.last_browser_ts = now
+                # Guard: if the caller mutated the payload (e.g. cart
+                # direction change on the same hold_id — shouldn't happen
+                # from HoldButton but browsers can surprise us), refresh
+                # the template so the keepalive uses the latest.
+                hs.driver_payload_template = tpl
+                initial = False
+        if initial:
+            frame = dict(tpl); frame['hold'] = True
+            frame['hold_id'] = hold_id
+            frame['seq'] = hs.server_seq
+            _publish_estun_jog(frame)
+
+    # Keepalive runs on a DEDICATED THREAD, not the asyncio loop.
+    # Rationale: measured on-Jetson, `await asyncio.sleep(0.1)` drifts
+    # 50–300 ms under normal load (camera streams, ROS callbacks, state
+    # broadcast, arbitrary WS traffic) — even with drift-corrected
+    # scheduling — because the loop's next-callback dispatch has to
+    # wait for the currently-executing coroutine to `await` again. A
+    # single 300+ ms drift crosses the driver's freshness deadman.
+    # rclpy publishers are thread-safe; `time.sleep()` in a native
+    # thread is scheduled by the kernel and unaffected by asyncio load.
+    # The dashboard's ROS publisher (`_publish_estun_jog`) is invoked
+    # from this thread directly. The only asyncio-touching field is
+    # `ws.client_state`, a simple int enum read that's safe cross-thread.
+    _keepalive_thread = None
+    _keepalive_stop = threading.Event()
+    _keepalive_stats = {"ticks": 0, "publishes": 0, "expired": 0,
+                        "last_tick_gap_ms": 0.0, "max_tick_gap_ms": 0.0}
+    _keepalive_last_tick_mono = 0.0
+
+    def _keepalive_thread_loop():
+        interval = HOLD_KEEPALIVE_INTERVAL_S
+        next_fire = time.monotonic() + interval
+        while not _keepalive_stop.is_set():
+            delay = next_fire - time.monotonic()
+            if delay > 0:
+                # threading.Event.wait is interruptible by set() — clean shutdown.
+                _keepalive_stop.wait(timeout=delay)
+                if _keepalive_stop.is_set():
+                    return
+            now = time.monotonic()
+            next_fire += interval
+            if next_fire < now:
+                next_fire = now + interval
+            try:
+                _keepalive_tick(now)
+            except Exception as e:
+                # Never let a tick exception kill the keepalive thread —
+                # log once and continue.
+                print(f'[keepalive] tick error: {e}', flush=True)
+
+    def _keepalive_tick(now):
+        nonlocal_stats = _keepalive_stats
+        # Track scheduling jitter: gap between successive tick entries.
+        # Useful for confirming the native thread ISN'T being throttled
+        # by GIL (visible on /health under ws_kicked → keepalive_max_ms).
+        global _keepalive_last_tick_mono
+        prev = _keepalive_last_tick_mono
+        _keepalive_last_tick_mono = now
+        if prev > 0:
+            gap_ms = (now - prev) * 1000
+            nonlocal_stats["last_tick_gap_ms"] = gap_ms
+            if gap_ms > nonlocal_stats["max_tick_gap_ms"]:
+                nonlocal_stats["max_tick_gap_ms"] = gap_ms
+        nonlocal_stats["ticks"] += 1
+        expired = []
+        with _active_holds_lock:
+            items = list(_active_holds.items())
+        for hold_id, hs in items:
+            # WS connection health — if the WS is closed / gone,
+            # drop the session. Starlette WebSocket exposes
+            # client_state and application_state; both must be
+            # CONNECTED for the ws to be usable.
+            ws_ok = True
+            if hs.ws is not None:
+                # Compare via `.value` — WebSocketState is a plain Enum,
+                # not IntEnum, so `int(state)` raises TypeError. The
+                # earlier "int(cs) != 1" version was silently expiring
+                # every session (TypeError → except → ws_ok=False) so
+                # keepalive never actually republished — /health showed
+                # publishes=0 while expired grew unbounded.
+                try:
+                    cs = getattr(hs.ws, 'client_state', None)
+                    if cs is not None:
+                        # Treat DISCONNECTED (2) as dead. CONNECTING (0)
+                        # or CONNECTED (1) or RESPONSE (3) → alive.
+                        val = getattr(cs, 'value', None)
+                        if val is not None and val >= 2:
+                            ws_ok = False
+                except Exception:
+                    ws_ok = False
+            if not ws_ok:
+                expired.append((hold_id, 'ws disconnected'))
+                continue
+            # Browser silence — if no refresh in HOLD_BROWSER_TIMEOUT_S,
+            # the finger is genuinely gone (or the last N messages
+            # were lost). Drop; driver deadman is next.
+            if now - hs.last_browser_ts > HOLD_BROWSER_TIMEOUT_S:
+                expired.append((hold_id, 'browser silent >{:.0f}ms'.format(
+                    HOLD_BROWSER_TIMEOUT_S * 1000)))
+                continue
+            # Republish. Advance the server-side seq so the driver's
+            # monotonic check accepts.
+            hs.server_seq += 1
+            frame = dict(hs.driver_payload_template)
+            frame['hold'] = True
+            frame['hold_id'] = hold_id
+            frame['seq'] = hs.server_seq
+            _publish_estun_jog(frame)
+            nonlocal_stats["publishes"] += 1
+        if expired:
+            with _active_holds_lock:
+                for hid, reason in expired:
+                    _active_holds.pop(hid, None)
+            nonlocal_stats["expired"] += len(expired)
 
     # ------------------------------------------------------------------
     # WebSocket endpoints
@@ -1352,18 +3844,140 @@ if FASTAPI_AVAILABLE:
     @app.websocket("/ws/state")
     async def ws_state(websocket: WebSocket):
         await websocket.accept()
-        q: asyncio.Queue = asyncio.Queue(maxsize=2)
-        with _ws_lock:
-            _state_clients[websocket] = q
+        # ── Provenance hello (2026-08-28 stale-class close) ──
+        # First frame after accept carries the backend+frontend SHAs
+        # baked at server import time. Client compares to its own
+        # compile-time __GIT_SHA__; on mismatch a BLOCKING full-
+        # screen overlay fires ("reload required" — not a
+        # dismissible toast the operator learned to ignore). Sent
+        # on every connect so a reconnect after a deploy triggers
+        # the overlay without needing a special reconnect path.
         try:
-            while True:
-                txt = await q.get()
-                await websocket.send_text(txt)
+            hello = json.dumps({
+                "type":         "hello",
+                "backend_sha":  _BACKEND_GIT_SHA,
+                "frontend_sha": _read_frontend_git_sha(),
+                "server_ts":    time.time(),
+                "start_iso":    _BACKEND_START_ISO,
+            })
+            await asyncio.wait_for(websocket.send_text(hello),
+                                   timeout=WS_SEND_TIMEOUT_S)
+        except Exception:
+            # Non-fatal — the state broadcaster below still functions
+            # even if the hello frame drops. Older clients ignore
+            # unknown `type` fields.
+            pass
+        # ACK-gated per-client sender state — see comment at
+        # _state_clients declaration. `new_event` fires when the
+        # broadcaster overwrites `latest_txt`; `ack_event` fires when
+        # the client sends `{type:"state_ack",seq:N}` with N ≥ our
+        # latest_seq. `ACK_TIMEOUT_S` is the fallback so a client that
+        # never acks (older frontend, JS deadlock) still receives
+        # frames — just at a slower rate.
+        ACK_TIMEOUT_S = 0.3
+        client = {
+            'latest_txt':          None,
+            'latest_seq':          0,
+            'latest_broadcast_ts': 0.0,
+            'last_acked_seq':      0,
+            'new_event':           asyncio.Event(),
+            'ack_event':           asyncio.Event(),
+        }
+        with _ws_lock:
+            _state_clients[websocket] = client
+        try:
+            async def _sender():
+                # Send the very first payload immediately when it
+                # arrives — no ack gate on the initial send.
+                while True:
+                    if client['latest_txt'] is None:
+                        await client['new_event'].wait()
+                        client['new_event'].clear()
+                    txt_to_send = client['latest_txt']
+                    seq_to_send = client['latest_seq']
+                    broadcast_ts = client['latest_broadcast_ts']
+                    # Consume the "new" signal (broadcaster may have
+                    # set it repeatedly while we were awaiting ack;
+                    # only the current latest matters).
+                    client['new_event'].clear()
+                    send_start = time.time() * 1000.0
+                    try:
+                        await asyncio.wait_for(
+                            websocket.send_text(txt_to_send),
+                            timeout=WS_SEND_TIMEOUT_S)
+                    except asyncio.TimeoutError:
+                        _ws_kicked["state"] += 1
+                        return
+                    send_done = time.time() * 1000.0
+                    with _state_perf_lock:
+                        _state_perf['sends'] += 1
+                        if send_done - broadcast_ts > _state_perf['inflight_ms_max']:
+                            _state_perf['inflight_ms_max'] = send_done - broadcast_ts
+                    # Wait for the client to ack this seq (bounded).
+                    # After ack, loop; if broadcaster has posted a
+                    # newer payload we send it next iteration.
+                    # Timeout guarantees liveness for pre-ACK frontends.
+                    try:
+                        while client['last_acked_seq'] < seq_to_send:
+                            await asyncio.wait_for(
+                                client['ack_event'].wait(),
+                                timeout=ACK_TIMEOUT_S)
+                            client['ack_event'].clear()
+                    except asyncio.TimeoutError:
+                        with _state_perf_lock:
+                            _state_perf['ack_timeouts'] += 1
+                        # Fall through — send next frame anyway.
+                    # If nothing newer is queued, block until broadcaster
+                    # sets new_event.
+                    if client['latest_seq'] <= seq_to_send:
+                        await client['new_event'].wait()
+                        client['new_event'].clear()
+
+            async def _receiver():
+                while True:
+                    msg = await websocket.receive_text()
+                    # ACK path — never dispatch these to
+                    # _handle_ws_client_msg (they're not commands).
+                    try:
+                        if msg and msg[0] == '{' and 'state_ack' in msg[:40]:
+                            try:
+                                d = json.loads(msg)
+                            except Exception:
+                                d = None
+                            if isinstance(d, dict) and d.get('type') == 'state_ack':
+                                seq = int(d.get('seq') or 0)
+                                if seq > client['last_acked_seq']:
+                                    client['last_acked_seq'] = seq
+                                    # Record ack latency for /health.
+                                    with _state_perf_lock:
+                                        acks = _state_perf['acks']
+                                        acks.append(time.time() * 1000.0 - client['latest_broadcast_ts'])
+                                        if len(acks) > 200:
+                                            del acks[:len(acks) - 200]
+                                client['ack_event'].set()
+                                continue
+                    except Exception:
+                        pass
+                    try:
+                        _handle_ws_client_msg(msg, ws=websocket)
+                    except Exception:
+                        pass
+            done, pending = await asyncio.wait(
+                [asyncio.create_task(_sender()),
+                 asyncio.create_task(_receiver())],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
         except (WebSocketDisconnect, Exception):
             pass
         finally:
             with _ws_lock:
                 _state_clients.pop(websocket, None)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     @app.websocket("/ws/lidar")
     async def ws_lidar(websocket: WebSocket):
@@ -1374,15 +3988,27 @@ if FASTAPI_AVAILABLE:
         try:
             while True:
                 item = await q.get()
-                if isinstance(item, tuple) and item and item[0] == 'binary':
-                    await websocket.send_bytes(item[1])
-                else:
-                    await websocket.send_text(item)
+                try:
+                    if isinstance(item, tuple) and item and item[0] == 'binary':
+                        await asyncio.wait_for(
+                            websocket.send_bytes(item[1]),
+                            timeout=WS_SEND_TIMEOUT_S)
+                    else:
+                        await asyncio.wait_for(
+                            websocket.send_text(item),
+                            timeout=WS_SEND_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    _ws_kicked["lidar"] += 1
+                    break
         except (WebSocketDisconnect, Exception):
             pass
         finally:
             with _ws_lock:
                 _lidar_clients.pop(websocket, None)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     @app.websocket("/ws/motioncam_cloud")
     async def ws_motioncam_cloud(websocket: WebSocket):
@@ -1393,15 +4019,27 @@ if FASTAPI_AVAILABLE:
         try:
             while True:
                 item = await q.get()
-                if isinstance(item, tuple) and item and item[0] == 'binary':
-                    await websocket.send_bytes(item[1])
-                else:
-                    await websocket.send_text(item)
+                try:
+                    if isinstance(item, tuple) and item and item[0] == 'binary':
+                        await asyncio.wait_for(
+                            websocket.send_bytes(item[1]),
+                            timeout=WS_SEND_TIMEOUT_S)
+                    else:
+                        await asyncio.wait_for(
+                            websocket.send_text(item),
+                            timeout=WS_SEND_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    _ws_kicked["motioncam_cloud"] += 1
+                    break
         except (WebSocketDisconnect, Exception):
             pass
         finally:
             with _ws_lock:
                 _motioncam_cloud_clients.pop(websocket, None)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     @app.websocket("/ws/motioncam_recognition")
     async def ws_motioncam_recognition(websocket: WebSocket):
@@ -1412,12 +4050,21 @@ if FASTAPI_AVAILABLE:
         try:
             while True:
                 txt = await q.get()
-                await websocket.send_text(txt)
+                try:
+                    await asyncio.wait_for(websocket.send_text(txt),
+                                           timeout=WS_SEND_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    _ws_kicked["motioncam_reco"] += 1
+                    break
         except (WebSocketDisconnect, Exception):
             pass
         finally:
             with _ws_lock:
                 _motioncam_reco_clients.pop(websocket, None)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     @app.websocket("/ws/mesh")
     async def ws_mesh(websocket: WebSocket):
@@ -1431,18 +4078,28 @@ if FASTAPI_AVAILABLE:
             cached = _mesh_state["payload"]
         if cached:
             try:
-                await websocket.send_text(cached)
+                await asyncio.wait_for(websocket.send_text(cached),
+                                       timeout=WS_SEND_TIMEOUT_S)
             except Exception:
                 pass
         try:
             while True:
                 txt = await q.get()
-                await websocket.send_text(txt)
+                try:
+                    await asyncio.wait_for(websocket.send_text(txt),
+                                           timeout=WS_SEND_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    _ws_kicked["mesh"] += 1
+                    break
         except (WebSocketDisconnect, Exception):
             pass
         finally:
             with _ws_lock:
                 _mesh_clients.pop(websocket, None)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # MJPEG camera streams
@@ -1642,72 +4299,488 @@ if FASTAPI_AVAILABLE:
             return {"ok": True, "status": "generating",
                     "auto_status": copy.deepcopy(STATE.get("auto_status", {}))}
 
+    def _publish_ros2_jog_event(payload):
+        """SEAM A fanout — forward the jog frame to /dashboard/jog_session_events
+        for the jog_bridge node to consume. Called only when JOG_BACKEND='ros2';
+        best-effort (swallows exceptions) matching _publish_estun_jog's contract.
+
+        Emits shape: {kind, hold_id, seq, server_ts, joint, direction, speed_pct, mode}.
+        'kind' derivation:
+          - first frame for a hold_id with hold=true → 'start'
+          - subsequent frames with hold=true → 'refresh'
+          - hold=false → 'stop' (and hold_id removed from seen-set)
+
+        Rate-limiting: 'refresh' events are coalesced at
+        _JOG_REFRESH_COALESCE_S (90 ms) per hold_id. 'start' and 'stop'
+        always pass immediately — never rate-limited (§286 dead-man-by-finger).
+        The SM's silence deadman still measures REAL browser silence because
+        90 ms < 300 ms with 3× margin.
+        """
+        if _ros_node is None:
+            return
+        try:
+            # Publisher + peer state are created eagerly in DashboardServer
+            # __init__ (see comment there), so first-press events never race
+            # with DDS discovery. No hasattr dance here.
+            hold = payload.get("hold", False)
+            hold_id = payload.get("hold_id")
+            if not hold:
+                kind = "stop"
+            elif hold_id and hold_id in _ros_node._jog_session_seen:
+                kind = "refresh"
+            else:
+                kind = "start"
+                if hold_id:
+                    _ros_node._jog_session_seen.add(hold_id)
+            # Rate-limit refresh only. start/stop always pass.
+            if kind == "refresh" and hold_id:
+                _now = time.monotonic()
+                _last = _ros_node._jog_last_refresh_mono.get(hold_id, 0.0)
+                if (_now - _last) < _JOG_REFRESH_COALESCE_S:
+                    return  # coalesce — swallow this refresh
+                _ros_node._jog_last_refresh_mono[hold_id] = _now
+            # Field-name reconciliation: `_build_driver_payload` upstream pops
+            # `joint` and renames it to `axis` for the WS-driver's wire
+            # protocol. jog_bridge (the ros2-side consumer) still expects
+            # `joint`. Read `axis` as a fallback so the event isn't published
+            # with `joint: null` — that crashes jog_bridge on
+            # `int(evt.get("joint", 0))` (default `0` doesn't help when the
+            # value IS the string None). Same fix for `direction` /
+            # `speed_pct` defensively even though the current builder doesn't
+            # rename them, so a future rename doesn't reintroduce this class
+            # of "silently sends null → consumer crashes on int(None)" bug.
+            _joint = payload.get("joint")
+            if _joint is None:
+                _joint = payload.get("axis")
+            _direction = payload.get("direction")
+            _speed_pct = payload.get("speed_pct")
+            evt = {
+                "kind": kind,
+                "hold_id": hold_id,
+                "seq": payload.get("seq"),
+                "server_ts": time.monotonic(),
+                "joint":     _joint if _joint is not None else 0,
+                "direction": _direction if _direction is not None else 0,
+                "speed_pct": _speed_pct if _speed_pct is not None else 0.0,
+                "mode": payload.get("mode", "joint"),
+            }
+            m = String(); m.data = json.dumps(evt, separators=(",", ":"))
+            _ros_node._dashboard_jog_events_pub.publish(m)
+            if kind == "stop" and hold_id:
+                _ros_node._jog_session_seen.discard(hold_id)
+                _ros_node._jog_last_refresh_mono.pop(hold_id, None)
+        except Exception:
+            pass
+
+    def _publish_estun_jog(payload):
+        """Publish a single frame on /robot/jog_command. Best-effort;
+        swallows exceptions so a transient publisher issue doesn't 500
+        the HTTP call — the driver's own gates + safety layers are what
+        actually decides whether motion happens."""
+        # SEAM A of Phase F1 (2026-08-18): when JOG_BACKEND='ros2', fanout
+        # to /dashboard/jog_session_events and DO NOT publish to
+        # /robot/jog_command — estun_driver stays fully passive on jog.
+        if _JOG_BACKEND == "ros2":
+            _publish_ros2_jog_event(payload)
+            return
+        # Backend 'ws' (default): existing behavior, byte-identical from here.
+        if _ros_node is None:
+            return
+        try:
+            if not hasattr(_ros_node, "_estun_jog_pub"):
+                # Depth 5 best-effort — jog refreshes are ephemeral so
+                # KEEP_LAST + best-effort drops old ones rather than
+                # blocking the publisher (which is what the old
+                # depth-10 reliable default did, building the backlog
+                # that caused release lag). Depth 5 gives ~500 ms of
+                # tolerance to subscriber-side jitter so the 300 ms
+                # freshness deadman doesn't fire mid-hold when the
+                # single-threaded driver executor stalls briefly on
+                # a WS heartbeat send. The driver's hold_id + seq
+                # guards handle any straggler that survives the drop.
+                qos = QoSProfile(
+                    depth=5,
+                    reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                    history=QoSHistoryPolicy.KEEP_LAST,
+                    durability=QoSDurabilityPolicy.VOLATILE,
+                )
+                _ros_node._estun_jog_pub = _ros_node.create_publisher(
+                    String, "/robot/jog_command", qos)
+            m = String(); m.data = json.dumps(payload)
+            _ros_node._estun_jog_pub.publish(m)
+        except Exception:
+            pass
+
     @app.post("/cmd/jog")
     async def cmd_jog(request: Request):
+        """Joint jog dispatcher. Three shapes accepted:
+        - Incremental (angle-bounded, driver time-boxes the move):
+            {"joint": 1..6, "delta_deg": ±1..±5}
+        - Continuous hold (start or refresh at ~7 Hz from HoldButton):
+            {"joint": 1..6, "direction": ±1, "speed_pct": 1..100, "hold": true}
+        - Release (also emitted on touch-cancel / mouse-leave / unmount):
+            {"hold": false}
+        Legacy `{joint: 0..5, delta: <rad>}` from now-dead ControlStrip
+        callers is still accepted and mapped to an increment."""
         body = await request.json()
+        # JOG-11 arbiter: refuse if a program is running (release/stop
+        # bodies always pass so an in-flight hold can be cleared).
+        _refused = _arbiter_refuse_jog_if_running(body)
+        if _refused is not None:
+            return _refused
         with _state_lock:
             if STATE["safety"]["estop"]:
                 return JSONResponse({"error": "Cannot jog: estop active"}, status_code=400)
             if STATE["safety"]["zone"] != "GREEN":
                 return JSONResponse({"error": "Cannot jog: zone not GREEN"}, status_code=400)
-        joint = int(body.get("joint", 0))
-        delta = float(body.get("delta", 0.0))
-        if abs(delta) > 0.175:
-            return JSONResponse({"error": "Delta too large (max 10°)"}, status_code=400)
-        if not (0 <= joint <= 5):
-            return JSONResponse({"error": "Invalid joint index"}, status_code=400)
-        with _state_lock:
-            STATE["joints"]["positions"][joint] += delta
-            joints_snapshot = copy.deepcopy(STATE["joints"])
-        # Forward to Estun driver — the sim update above keeps the UI
-        # responsive when the driver isn't connected; when it is, the
-        # driver's /estun/status feedback will overwrite STATE.joints.
-        if _ros_node is not None:
+
+        # Release — no joint/direction required. Forward session
+        # metadata (hold_id/seq/client_ts_ms) so the driver can enforce
+        # session tracking and drop stale queued refreshes.
+        # 2026-08-05 (jog_hold_heartbeat regression fix): also drop the
+        # server-side _HoldSession so the keepalive thread stops
+        # republishing on release. Pre-fix, HTTP-fallback releases
+        # left ghost sessions in _active_holds that either kept the
+        # motion alive OR only got cleaned up by ws-disconnect / TTL.
+        if body.get("hold") is False or body.get("stop") is True:
+            payload = {"mode": "joint", "hold": False}
+            for k in ("hold_id", "seq", "client_ts_ms"):
+                if body.get(k) is not None: payload[k] = body[k]
+            _publish_estun_jog(payload)
+            _hid = body.get("hold_id")
+            if _hid is not None:
+                with _active_holds_lock:
+                    _active_holds.pop(_hid, None)
+            return {"ok": True, "action": "release"}
+
+        raw_joint = body.get("joint")
+        try:
+            joint_int = int(raw_joint)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": f"Invalid joint: {raw_joint!r}"}, status_code=400)
+
+        # Continuous hold path — start or refresh.
+        if body.get("hold") is True:
+            if not (1 <= joint_int <= 6):
+                return JSONResponse({"error": "joint must be 1..6"}, status_code=400)
             try:
-                if not hasattr(_ros_node, "_estun_jog_pub"):
-                    _ros_node._estun_jog_pub = _ros_node.create_publisher(
-                        String, "/robot/jog_command", 10)
-                speed_pct = abs(delta) / 0.175 * 100.0  # delta -> 0..100
-                m = String()
-                m.data = json.dumps({
-                    "mode":      "joint",
-                    "axis":      joint + 1,         # Estun uses 1-indexed joints
-                    "direction": 1 if delta >= 0 else -1,
-                    "speed":     int(max(1, min(100, speed_pct))),
-                    "step":      float(abs(delta)),
-                })
-                _ros_node._estun_jog_pub.publish(m)
-            except Exception:
-                pass
-        return {"ok": True, "joints": joints_snapshot}
+                direction = int(body.get("direction", 0))
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "direction not an int"}, status_code=400)
+            if direction not in (-1, 1):
+                return JSONResponse({"error": "direction must be ±1"}, status_code=400)
+            try:
+                speed_pct = float(body.get("speed_pct", body.get("speed", 0)))
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "speed_pct not a number"}, status_code=400)
+            if not (0 < speed_pct <= 100):
+                return JSONResponse({"error": "speed_pct must be in (0, 100]"}, status_code=400)
+            payload = {
+                "mode":      "joint",
+                "axis":      joint_int,
+                "direction": direction,
+                "speed_pct": speed_pct,
+                "hold":      True,
+            }
+            for k in ("hold_id", "seq", "client_ts_ms"):
+                if body.get(k) is not None: payload[k] = body[k]
+            # 2026-08-05 (jog_hold_heartbeat regression fix): register
+            # this hold in _active_holds so the keepalive thread
+            # republishes at 60ms cadence — same as the WS path does
+            # in _handle_ws_client_msg. Pre-fix, HTTP-fallback holds
+            # (which fire after any WS drop) published ONE frame and
+            # then the driver's 200ms freshness deadman clamped them
+            # 200-250ms later. Result: 28 spurious freshness_deadman
+            # stops in a 15-minute window on 2026-08-05. See
+            # fork registry entry `jog_hold_heartbeat`.
+            _hid = body.get("hold_id")
+            if _hid is not None:
+                _now = time.monotonic()
+                with _active_holds_lock:
+                    _hs = _active_holds.get(_hid)
+                    if _hs is None:
+                        _hs = _HoldSession(_hid, None, payload, "joint")
+                        _active_holds[_hid] = _hs
+                    else:
+                        _hs.last_browser_ts = _now
+                        _hs.driver_payload_template = payload
+            _publish_estun_jog(payload)
+            return {"ok": True, "action": "hold"}
+
+        if "delta_deg" in body:
+            # Incremental path — 1-based joint, degrees.
+            try:
+                delta_deg = float(body.get("delta_deg", 0.0))
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "delta_deg not a number"}, status_code=400)
+            if not (1 <= joint_int <= 6):
+                return JSONResponse({"error": "joint must be 1..6"}, status_code=400)
+            if abs(delta_deg) > 5.0 + 1e-9:
+                return JSONResponse({"error": "|delta_deg| exceeds 5°"}, status_code=400)
+            if abs(delta_deg) < 0.01:
+                return JSONResponse({"error": "delta_deg ~ 0"}, status_code=400)
+            axis_1based = joint_int
+            joint_0based = joint_int - 1
+            step_rad = delta_deg * math.pi / 180.0
+        else:
+            # Legacy shape: joint 0-5, delta in radians.
+            try:
+                delta = float(body.get("delta", 0.0))
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "delta not a number"}, status_code=400)
+            if not (0 <= joint_int <= 5):
+                return JSONResponse({"error": "joint must be 0..5 (legacy)"}, status_code=400)
+            if abs(delta) > 0.175:
+                return JSONResponse({"error": "Delta too large (max 10°)"}, status_code=400)
+            delta_deg = delta * 180.0 / math.pi
+            if abs(delta_deg) > 5.0:
+                return JSONResponse({"error": "|delta| exceeds 5° after conversion"}, status_code=400)
+            axis_1based = joint_int + 1
+            joint_0based = joint_int
+            step_rad = delta
+
+        with _state_lock:
+            # Optimistic sim update so the UI reflects the intended target
+            # even if the driver isn't connected. Real driver feedback via
+            # /estun/status overwrites this once telemetry catches up.
+            STATE["joints"]["positions"][joint_0based] += step_rad
+            joints_snapshot = copy.deepcopy(STATE["joints"])
+
+        _publish_estun_jog({
+            "mode":      "joint",
+            "axis":      axis_1based,
+            "delta_deg": delta_deg,
+        })
+        return {"ok": True, "joints": joints_snapshot, "delta_deg": delta_deg,
+                "action": "increment"}
 
     @app.post("/cmd/jog_cartesian")
     async def cmd_jog_cartesian(request: Request):
-        """Cartesian-space jog. The sim has no IK so the arm doesn't
-        visibly move here — we just publish the command on a ROS topic
-        for a real driver to consume. Same safety gates as joint jog."""
+        """Cartesian-space hold-to-jog. Same shape as /cmd/jog but with a
+        letter axis ('x','y','z','rx','ry','rz'). Publishes to the SAME
+        /robot/jog_command topic with mode:cartesian so the driver's
+        continuous-jog state machine handles it (gated by
+        allow_cartesian_jog on the driver — refused today by default)."""
         body = await request.json()
+        # JOG-11 arbiter: same refusal as joint jog.
+        _refused = _arbiter_refuse_jog_if_running(body)
+        if _refused is not None:
+            return _refused
         with _state_lock:
             if STATE["safety"]["estop"]:
                 return JSONResponse({"error": "Cannot jog: estop active"}, status_code=400)
             if STATE["safety"]["zone"] != "GREEN":
                 return JSONResponse({"error": "Cannot jog: zone not GREEN"}, status_code=400)
-        if _ros_node is not None:
-            try:
-                if not hasattr(_ros_node, '_jog_cart_pub'):
-                    _ros_node._jog_cart_pub = _ros_node.create_publisher(
-                        String, "/robot/jog_cartesian", 10)
-                m = String()
-                m.data = json.dumps({
-                    "axis":      str(body.get("axis", "")),
-                    "direction": int(body.get("direction", 1)),
-                    "step":      float(body.get("step", 1.0)),
-                    "speed":     int(body.get("speed", 20)),
-                })
-                _ros_node._jog_cart_pub.publish(m)
-            except Exception:
-                pass
-        return {"ok": True}
+
+        if body.get("hold") is False or body.get("stop") is True:
+            payload = {"mode": "cartesian", "hold": False}
+            for k in ("hold_id", "seq", "client_ts_ms"):
+                if body.get(k) is not None: payload[k] = body[k]
+            _publish_estun_jog(payload)
+            # 2026-08-05 (jog_hold_heartbeat regression fix, cart side):
+            # drop the ghost _HoldSession so the keepalive thread
+            # stops republishing on release.
+            _hid = body.get("hold_id")
+            if _hid is not None:
+                with _active_holds_lock:
+                    _active_holds.pop(_hid, None)
+            return {"ok": True, "action": "release"}
+
+        axis_letter = str(body.get("axis", "")).lower()
+        axis_map = {"x": 1, "y": 2, "z": 3, "rx": 4, "ry": 5, "rz": 6}
+        axis_1based = axis_map.get(axis_letter)
+        if axis_1based is None:
+            return JSONResponse({"error": f"cartesian axis must be one of {list(axis_map)}"},
+                                status_code=400)
+        try:
+            direction = int(body.get("direction", 0))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "direction not an int"}, status_code=400)
+        if direction not in (-1, 1):
+            return JSONResponse({"error": "direction must be ±1"}, status_code=400)
+        try:
+            speed_pct = float(body.get("speed_pct", body.get("speed", 20)))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "speed_pct not a number"}, status_code=400)
+        if not (0 < speed_pct <= 100):
+            return JSONResponse({"error": "speed_pct must be in (0, 100]"}, status_code=400)
+
+        if body.get("pulse") is True:
+            _publish_estun_jog({
+                "mode":      "cartesian",
+                "axis":      axis_1based,
+                "direction": direction,
+                "speed_pct": speed_pct,
+                "pulse":     True,
+            })
+            return {"ok": True, "action": "pulse"}
+
+        payload = {
+            "mode":      "cartesian",
+            "axis":      axis_1based,
+            "direction": direction,
+            "speed_pct": speed_pct,
+            "hold":      True,
+        }
+        for k in ("hold_id", "seq", "client_ts_ms"):
+            if body.get(k) is not None: payload[k] = body[k]
+        # 2026-08-05 (jog_hold_heartbeat regression fix, cart side):
+        # register the hold in _active_holds so the keepalive thread
+        # republishes at 60ms cadence. Prior to this fix, HTTP-
+        # fallback cart holds died at the 200ms driver deadman.
+        _hid = body.get("hold_id")
+        if _hid is not None:
+            _now = time.monotonic()
+            with _active_holds_lock:
+                _hs = _active_holds.get(_hid)
+                if _hs is None:
+                    _hs = _HoldSession(_hid, None, payload, "cartesian")
+                    _active_holds[_hid] = _hs
+                else:
+                    _hs.last_browser_ts = _now
+                    _hs.driver_payload_template = payload
+        _publish_estun_jog(payload)
+        return {"ok": True, "action": "hold"}
+
+    def _publish_estun_power(payload):
+        """Publish a single frame on /robot/power_command. Reliable QoS,
+        depth 5 — these are single infrequent commands, unlike jog which
+        needs best-effort/volatile. Best-effort try/except keeps the HTTP
+        call from 500-ing on a transient publisher hiccup; the driver's
+        allow_power gate is the real safety layer."""
+        if _ros_node is None:
+            return
+        try:
+            if not hasattr(_ros_node, "_estun_power_pub"):
+                _ros_node._estun_power_pub = _ros_node.create_publisher(
+                    String, "/robot/power_command", 5)
+            m = String(); m.data = json.dumps(payload)
+            _ros_node._estun_power_pub.publish(m)
+        except Exception:
+            pass
+
+    _POWER_ACTIONS = {"enable", "disable", "clear_alarm"}
+
+    @app.post("/cmd/power")
+    async def cmd_power(request: Request):
+        """Robot power transition dispatcher. Body: {"action": "enable" |
+        "disable" | "clear_alarm"}. This endpoint is a thin publisher onto
+        /robot/power_command — every safety decision (monitor_only,
+        allow_power, connection, jog-preempt on disable) is enforced in
+        the driver. Deliberately does NOT check estop or safety zone:
+        (a) disable must always be reachable to safe the arm, and
+        (b) enable is guarded by the driver's allow_power gate + the
+        operator's explicit confirmation in the UI."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        action = str(body.get("action", "")).lower()
+        if action not in _POWER_ACTIONS:
+            return JSONResponse(
+                {"error": f"unknown action {action!r}; expected one of "
+                          f"{sorted(_POWER_ACTIONS)}"},
+                status_code=400,
+            )
+        # Under JOG_BACKEND=ros2, the WS estun_driver is intentionally down
+        # this session. Publishing /robot/power_command goes to a subscriber
+        # that isn't there and the button hangs from the frontend's side.
+        # Honest refusal per §285: no silent dead controls. Arm is already
+        # enabled by cri_tcp_setup_node's Robot/switchOn step 3/5 at launch;
+        # full CRI-TCP wiring of this button is F3-scope.
+        if _JOG_BACKEND == "ros2":
+            msg = ("Enable is managed by the CRI launch this session. "
+                   "The arm is switched on by cri_tcp_setup_node during "
+                   "launch (Robot/switchOn, step 3/5). Under "
+                   "JOG_BACKEND=ros2 the WS estun_driver is inactive by "
+                   "design; this button is not wired to the CRI TCP path "
+                   "in F1 scope (F3 will address).")
+            return JSONResponse(
+                {"ok": False, "action": action, "backend": "ros2",
+                 "no_op": True, "error": msg, "message": msg},
+                status_code=409,
+            )
+        _publish_estun_power({"action": action})
+        return {"ok": True, "action": action}
+
+    # ── Self-collision guard runtime kill switch ──────────
+    #
+    # 2026-08-06 (operator directive: ENTIRE self-collision +
+    # ground-plane guard OFF). Single authoritative kill switch,
+    # exposed here so Configure can render it. The driver's
+    # `collision_enabled` parameter is the boot default (also
+    # False); this endpoint flips the runtime flag via a
+    # /robot/collision_guard_set publish. Fork registry:
+    # collision_guard_kill_switch.
+
+    def _publish_collision_guard_set(enabled: bool) -> None:
+        """Publish a Bool onto /robot/collision_guard_set. Reliable
+        QoS, depth 5 — single infrequent command like power."""
+        if _ros_node is None:
+            return
+        try:
+            from std_msgs.msg import Bool as _Bool
+            if not hasattr(_ros_node, "_coll_guard_pub"):
+                _ros_node._coll_guard_pub = _ros_node.create_publisher(
+                    _Bool, "/robot/collision_guard_set", 5)
+            m = _Bool(); m.data = bool(enabled)
+            _ros_node._coll_guard_pub.publish(m)
+        except Exception:
+            pass
+
+    @app.get("/api/collision_guard")
+    async def api_collision_guard_get():
+        with _state_lock:
+            r = STATE.get("robot") or {}
+            return {
+                "ok":               True,
+                "enabled":          bool(r.get("collision_enabled")),
+                "guard_active":     bool(r.get("collision_guard_active")),
+                "model_loaded":     bool(r.get("collision_model_loaded")),
+            }
+
+    @app.post("/api/collision_guard")
+    async def api_collision_guard_set(request: Request):
+        """Body: {"enabled": bool}. Publishes to the driver's
+        /robot/collision_guard_set topic and writes an event-log
+        entry so every toggle is on record. Deliberately does NOT
+        gate on any UI confirmation — the Configure surface owns
+        the "are you sure?" prompt; this endpoint is the wire."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        if "enabled" not in body or not isinstance(body["enabled"], bool):
+            return JSONResponse(
+                {"error": "'enabled' (bool) required"}, status_code=400)
+        enabled = bool(body["enabled"])
+        _publish_collision_guard_set(enabled)
+        # Forensic event — operator's explicit informed choice per
+        # the 2026-08-06 directive. Severity=warning on OFF so the
+        # event log makes the disabled state visible at a glance.
+        try:
+            if enabled:
+                _event_log.emit(
+                    severity='info',
+                    source='dashboard',
+                    code='collision_guard_enabled',
+                    operator_message='Self-collision guard turned ON.',
+                    technical_detail='POST /api/collision_guard {enabled:true}',
+                    context={'enabled': True})
+            else:
+                _event_log.emit(
+                    severity='warning',
+                    source='dashboard',
+                    code='collision_guard_disabled',
+                    operator_message=(
+                        'Self-collision guard turned OFF. All software '
+                        'collision guards are disabled — link-on-link '
+                        'and link-on-table crashes are possible.'),
+                    technical_detail='POST /api/collision_guard {enabled:false}',
+                    context={'enabled': False})
+        except Exception:
+            pass
+        return {"ok": True, "enabled": enabled}
 
     @app.post("/cmd/gripper")
     async def cmd_gripper(request: Request):
@@ -1861,6 +4934,28 @@ if FASTAPI_AVAILABLE:
             ns  = len(_state_clients)
             nl  = len(_lidar_clients)
             nm  = len(_mesh_clients)
+            # Snapshot per-channel queue depths — sum + max across all
+            # clients on each channel. Used by System Check to spot the
+            # zombie-WS pattern (queues holding steady > 0 while
+            # ws_drops climbs → clients are alive but not draining fast
+            # enough → backpressure is doing its job).
+            def _depth(clients):
+                depths = [c.qsize() for c in clients.values()
+                          if hasattr(c, 'qsize')]
+                return {
+                    'n':    len(depths),
+                    'sum':  sum(depths),
+                    'max':  max(depths) if depths else 0,
+                }
+            ws_depth = {
+                'state':           {'n': ns, 'sum': 0, 'max': 0},  # ACK-gated slot, no queue
+                'lidar':           _depth(_lidar_clients),
+                'mesh':            _depth(_mesh_clients),
+                'motioncam_cloud': _depth(_motioncam_cloud_clients),
+                'motioncam_reco':  _depth(_motioncam_reco_clients),
+            }
+        with _ws_drops_lock:
+            ws_drops_snap = dict(_ws_drops)
         with _cam_lock:
             have_cam0 = _cam_frames[0] is not None
             have_cam1 = _cam_frames[1] is not None
@@ -1879,10 +4974,42 @@ if FASTAPI_AVAILABLE:
         return {
             "status": "ok", "ros": RCLPY_AVAILABLE, "mock": False,
             "uptime_s": round(time.time() - _START_TIME, 1),
+            # Provenance — like-for-like SHA comparands (2026-08-28).
+            "backend_sha":       _BACKEND_GIT_SHA,
+            "backend_start_iso": _BACKEND_START_ISO,
+            "frontend_sha":      _read_frontend_git_sha(),
             "clients_state": ns, "clients_lidar": nl, "clients_mesh": nm,
             "cam0_live": have_cam0, "cam1_live": have_cam1,
             "lidar_live": lidar_live, "lidar_pts": lidar_pts,
             "mesh_age_s": mesh_age, "mesh_tris": mesh_tris,
+            # Cumulative WS backpressure kicks per stream. Nonzero means at
+            # least one client's send stalled past WS_SEND_TIMEOUT_S — the
+            # broadcaster force-closed the socket to protect the event loop.
+            "ws_kicked": dict(_ws_kicked),
+            # Cumulative drop-oldest counter per channel — nonzero means a
+            # bounded queue was full and the oldest payload got evicted to
+            # make room for the fresh one (Part E fix). Steady growth =
+            # a client is alive but not draining fast enough → the
+            # backpressure is working; a client-side lag investigation
+            # is warranted, not an outage.
+            "ws_drops": ws_drops_snap,
+            # Live queue depths per channel — {n=clients, sum, max}. Steady
+            # sum > 0 with rising ws_drops is the zombie-WS signature.
+            "ws_depth": ws_depth,
+            "ws_send_timeout_s": WS_SEND_TIMEOUT_S,
+            "state_perf": _state_perf_snapshot(),
+            "hold_keepalive": dict(_keepalive_stats),
+            "active_holds": len(_active_holds),
+            # CRI-proxy flap surface (F1.4 rung-3 fix). last_flip_age_s
+            # is derived from last_flip_ts so operators / dashboards can
+            # spot flapping without polling the epoch stamp.
+            "cri_proxy": {
+                **dict(_cri_proxy_stats),
+                "last_flip_age_s": (time.time() - _cri_proxy_stats["last_flip_ts"])
+                                    if _cri_proxy_stats["last_flip_ts"] > 0 else None,
+                "backend": _JOG_BACKEND_ENV,
+                "cameras_disabled": _CAMERAS_DISABLED,
+            },
             "motioncam": {
                 "connected":    mc_status["connected"],
                 "mock_enabled": mc_status["mock_enabled"],
@@ -1895,6 +5022,333 @@ if FASTAPI_AVAILABLE:
     async def api_state():
         with _state_lock:
             return copy.deepcopy(STATE)
+
+    # ------------------------------------------------------------------
+    # System Check — read-only readiness aggregator
+    #
+    # Five checks, reported flat: robot / controller / software /
+    # services / safety. Purely observational — never enables the arm,
+    # opens a gate, or restarts anything on its own. The optional
+    # /api/systemcheck/service/restart endpoint is operator-triggered
+    # and restricted to a small allowlist that excludes any
+    # arm-touching service.
+    # ------------------------------------------------------------------
+    _SYSTEMCHECK_SERVICES = ("roboai-estun", "roboai-dashboard")
+    _SYSTEMCHECK_RESTART_ALLOWLIST = {"roboai-dashboard"}
+    _CONTROLLER_STALE_S = 3.0
+
+    def _sha256_file(path: str) -> str:
+        import hashlib
+        try:
+            h = hashlib.sha256()
+            with open(path, 'rb') as fp:
+                for chunk in iter(lambda: fp.read(65536), b''):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return ''
+
+    def _bundle_hash_for(dir_path: Path) -> str:
+        """Hash of the served/built bundle. We hash index.html because
+        every content-hashed asset URL is embedded there — any change
+        to the app forces a new index.html digest even if the assets
+        keep the same names in-flight."""
+        idx = dir_path / "index.html"
+        return _sha256_file(str(idx)) if idx.is_file() else ''
+
+    def _bundle_asset_hash_for(dir_path: Path) -> str:
+        """Extract Vite's content-hash from the served JS asset filename
+        (e.g. `assets/index-CpW0QB4a.js` → `CpW0QB4a`). This is the
+        SAME string the frontend footer reads from
+        document.querySelector('script[src*=\"/assets/index-\"]'), so
+        the two views are directly comparable. Returns '' if the
+        pattern doesn't match."""
+        idx = dir_path / "index.html"
+        if not idx.is_file():
+            return ''
+        try:
+            with open(idx, 'r') as f:
+                html = f.read()
+            import re as _re2
+            m = _re2.search(r'/assets/index-([A-Za-z0-9_-]+)\.js', html)
+            return m.group(1) if m else ''
+        except Exception:
+            return ''
+
+    def _service_active(name: str) -> bool:
+        import subprocess
+        try:
+            r = subprocess.run(
+                ['systemctl', 'is-active', name],
+                capture_output=True, text=True, timeout=1.5)
+            return r.stdout.strip() == 'active'
+        except Exception:
+            return False
+
+    def _check_robot(robot: dict) -> dict:
+        if not robot.get('connected'):
+            return {'level': 'red',   'state': 'Offline',
+                    'detail': 'Driver is not publishing /estun/status. '
+                              'Check the roboai-estun service and the '
+                              'controller network link.'}
+        if robot.get('alarm'):
+            aa = robot.get('active_alarm') or {}
+            code = aa.get('code') if isinstance(aa, dict) else None
+            msg = aa.get('message') if isinstance(aa, dict) else None
+            detail = f"Controller alarm {code}: {msg}" if code else \
+                     "Controller reports an active alarm."
+            return {'level': 'red', 'state': 'Alarm', 'detail': detail}
+        if not robot.get('enabled'):
+            return {'level': 'amber', 'state': 'Disabled',
+                    'detail': 'Arm is connected but disabled. Enable '
+                              'from the toolbar when ready.'}
+        return {'level': 'green', 'state': 'Ready', 'detail': None}
+
+    def _check_controller() -> dict:
+        with _ws_lock:
+            n_state = len(_state_clients)
+        last_ts = _last_estun_status_ts[0]
+        if last_ts <= 0.0:
+            return {'level': 'red', 'state': 'Disconnected',
+                    'detail': 'No /estun/status frame has been received '
+                              'since the dashboard started.'}
+        age = time.time() - last_ts
+        if age > _CONTROLLER_STALE_S:
+            return {'level': 'red', 'state': 'Disconnected',
+                    'detail': f'Last /estun/status was {age:.1f}s ago '
+                              f'(threshold {_CONTROLLER_STALE_S:.0f}s). '
+                              f'Driver has gone silent.'}
+        return {'level': 'green', 'state': 'Connected',
+                'detail': (f'Last frame {age:.1f}s ago · '
+                           f'{n_state} client(s)') if n_state == 0 else None}
+
+    def _check_software() -> dict:
+        served = _bundle_hash_for(_STATIC_DIR)
+        built  = _bundle_hash_for(_BUILT_FRONTEND_DIR)
+        # asset_hash is the Vite content-hash from the JS filename —
+        # this is the SAME string the frontend footer reads at runtime
+        # from document.querySelector('script[src*="/assets/index-"]').
+        # System Check and the footer therefore always agree on which
+        # bundle the tab is running.
+        asset_hash = _bundle_asset_hash_for(_STATIC_DIR)
+        if not served:
+            return {'level': 'red', 'state': 'Missing',
+                    'detail': f'Served bundle not found under {_STATIC_DIR}.',
+                    'served_hash': '', 'built_hash': built[:12],
+                    'served_asset_hash': asset_hash}
+        if not built:
+            # No built dist to compare against → we CANNOT prove the
+            # served bundle is up to date. Do NOT return green. This
+            # closes the gap that let 2026-07-30 land a stale served
+            # bundle while System Check still said "Up to date".
+            return {'level': 'amber', 'state': 'Cannot verify',
+                    'detail': ('served asset present but no built dist '
+                               'on disk to compare against — '
+                               '`npm run build` + rsync then reload '
+                               f'(served asset {asset_hash})'
+                               if asset_hash else
+                               'served asset present but no built dist '
+                               'on disk to compare against — '
+                               '`npm run build` + rsync then reload'),
+                    'served_hash': served[:12], 'built_hash': '',
+                    'served_asset_hash': asset_hash}
+        if served != built:
+            return {'level': 'amber', 'state': 'Refresh needed',
+                    'detail': (f'Served bundle differs from the latest '
+                               f'build on disk. Copy frontend/dist over '
+                               f'mock_server/static and reload the tab.'),
+                    'served_hash': served[:12], 'built_hash': built[:12],
+                    'served_asset_hash': asset_hash}
+        return {'level': 'green', 'state': 'Up to date',
+                'detail': f'served asset {asset_hash}' if asset_hash else None,
+                'served_hash': served[:12], 'built_hash': built[:12],
+                'served_asset_hash': asset_hash}
+
+    def _check_services() -> dict:
+        results = {name: _service_active(name)
+                   for name in _SYSTEMCHECK_SERVICES}
+        down = [n for n, ok in results.items() if not ok]
+        if not down:
+            return {'level': 'green', 'state': 'All running',
+                    'detail': None, 'services': results}
+        return {'level': 'red',
+                'state': f'{len(down)} down',
+                'detail': 'Down: ' + ', '.join(down),
+                'services': results}
+
+    def _check_safety(robot: dict) -> dict:
+        missing = []
+        # Joint limits are considered present if EITHER the operator's
+        # per-cell override (/opt/cobot/motion/config/robot_limits.yaml)
+        # OR the shipped package default (default_robot_limits.yaml
+        # under motion_optimization's share dir) exists — ProfileManager
+        # falls back to the default if the override is missing, so the
+        # cell IS running with valid limits either way.
+        limits_paths = [
+            os.path.join('/opt/cobot/motion/config', 'robot_limits.yaml'),
+            os.path.join(
+                '/home/teddy/cobot_ws/install/motion_optimization/share/'
+                'motion_optimization/config', 'default_robot_limits.yaml'),
+            os.path.join(
+                '/home/teddy/cobot_ws/src/motion_optimization/'
+                'config', 'default_robot_limits.yaml'),
+        ]
+        limits_present = any(os.path.isfile(p) for p in limits_paths)
+        if not limits_present:
+            missing.append('joint limits')
+        # Guards are considered "loaded" when the driver has any
+        # non-zero collision/env stop threshold. Zero on both is the
+        # signature of a driver that never received guard config.
+        guard_stop = float(robot.get('guard_stop_mm') or 0.0)
+        coll_stop  = float(robot.get('collision_stop_mm') or 0.0)
+        env_stop   = float(robot.get('env_stop_mm') or 0.0)
+        if guard_stop <= 0 and coll_stop <= 0 and env_stop <= 0:
+            missing.append('collision guards')
+        if robot.get('ground_z_mm') is None:
+            missing.append('ground_z')
+        # LiDAR zones — the collision monitor loads zone configuration
+        # at boot. If it's not active there's no zone monitoring; if it
+        # IS active, we trust the loaded config.
+        if not _service_active('roboai-collision-monitor'):
+            missing.append('lidar zones')
+        # Safety-row detail always includes the operator speed cap so
+        # the operator has one place to see the ceiling that governs
+        # every AUTO/program write. Doesn't gate the level — the cap
+        # being high isn't itself a safety fault; the row goes amber
+        # only for missing config.
+        op_cap_pct = robot.get('operator_speed_limit_pct')
+        if op_cap_pct is None:
+            op_frac = robot.get('operator_speed_limit')
+            if op_frac is not None:
+                try:
+                    op_cap_pct = int(round(float(op_frac) * 100))
+                except (TypeError, ValueError):
+                    op_cap_pct = None
+        jog_eff_pct = robot.get('effective_speed_cap_pct')
+        if jog_eff_pct is None:
+            eff = robot.get('effective_speed_cap')
+            if eff is not None:
+                try:
+                    jog_eff_pct = int(round(float(eff) * 100))
+                except (TypeError, ValueError):
+                    jog_eff_pct = None
+        hs_thresh = robot.get('high_speed_confirm_threshold_pct')
+        cap_detail_bits = []
+        if op_cap_pct is not None:
+            cap_detail_bits.append(f'operator cap {op_cap_pct}% (AUTO/program ceiling)')
+        if jog_eff_pct is not None:
+            cap_detail_bits.append(f'jog effective {jog_eff_pct}%')
+        if hs_thresh is not None:
+            cap_detail_bits.append(f'mid-run high-speed confirm above {hs_thresh}%')
+        cap_detail = ' · '.join(cap_detail_bits) if cap_detail_bits else None
+
+        if missing:
+            detail = 'Missing: ' + ', '.join(missing)
+            if cap_detail:
+                detail += '. ' + cap_detail
+            return {'level': 'amber', 'state': 'Check config', 'detail': detail}
+        return {'level': 'green',
+                'state': (f'Loaded · cap {op_cap_pct}%'
+                          if op_cap_pct is not None else 'Loaded'),
+                'detail': cap_detail}
+
+    def _check_codegen() -> dict:
+        """Report boot-time vs on-disk sha for estun_driver.program_ops.
+        Amber-and-inform when they differ — the running dashboard is
+        emitting Lua from stale in-memory code and a restart of
+        roboai-dashboard + roboai-estun is required to load the disk
+        version. Never blocks — the operator can still Run; but the
+        Program page banner + Run-confirm modal + run-complete toast
+        all surface this state so it can't be silently skipped again
+        (2026-07-30 fourth staleness episode motivated this check)."""
+        try:
+            from estun_driver import program_ops as _po
+        except Exception as e:
+            return {'level': 'red', 'state': 'Import failed',
+                    'detail': f'program_ops import: {e}',
+                    'boot_sha': '', 'disk_sha': '', 'stale': False}
+        boot = (_po.CODEGEN_VERSION.get('src_sha256') or '')[:12]
+        disk = _po.current_disk_src_sha256()[:12]
+        stale = (bool(boot) and bool(disk)
+                 and boot != disk and disk != 'unknown')
+        if stale:
+            return {
+                'level':    'amber',
+                'state':    'Restart required',
+                'detail':   ('Code updated on disk — restart required '
+                             'to apply (roboai-dashboard, roboai-estun). '
+                             f'boot={boot} disk={disk}. '
+                             'Runs pressed in this state will use the OLD '
+                             'in-memory codegen; the run manifest will '
+                             'stamp codegen_stale=true.'),
+                'boot_sha': boot, 'disk_sha': disk, 'stale': True,
+            }
+        return {
+            'level':    'green',
+            'state':    'In sync',
+            'detail':   f'boot={boot} == disk={disk}',
+            'boot_sha': boot, 'disk_sha': disk, 'stale': False,
+        }
+
+    @app.get("/api/codegen/status")
+    async def api_codegen_status():
+        """Cheap poll endpoint for the Program page banner. Returns
+        the same {stale, boot_sha, disk_sha, ...} shape the System
+        Check codegen row carries — one source of truth."""
+        return _check_codegen()
+
+    @app.get("/api/systemcheck")
+    async def api_systemcheck():
+        with _state_lock:
+            robot = copy.deepcopy(STATE.get('robot') or {})
+        checks = [
+            {'key': 'robot',      'label': 'Robot',      **_check_robot(robot)},
+            {'key': 'controller', 'label': 'Controller', **_check_controller()},
+            {'key': 'software',   'label': 'Software',   **_check_software()},
+            {'key': 'codegen',    'label': 'Codegen',    **_check_codegen()},
+            {'key': 'services',   'label': 'Services',   **_check_services()},
+            {'key': 'safety',     'label': 'Safety',     **_check_safety(robot)},
+        ]
+        levels = {c['level'] for c in checks}
+        ready = 'red' not in levels and 'amber' not in levels
+        return {
+            'ready':   ready,
+            'summary': 'READY' if ready else 'NOT READY',
+            'checks':  checks,
+            't':       round(time.time(), 3),
+        }
+
+    @app.post("/api/systemcheck/service/restart")
+    async def api_systemcheck_service_restart(request: Request):
+        """Operator-initiated systemctl restart for a small allowlist of
+        non-arm services. NEVER touches roboai-estun (motion) — the
+        operator restarts the driver from a different, more deliberate
+        surface. Returns the systemctl exit code + stderr so the UI
+        can surface a permission failure clearly."""
+        import subprocess
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        service = str(body.get('service') or '')
+        if service not in _SYSTEMCHECK_RESTART_ALLOWLIST:
+            return JSONResponse(
+                {'error': f'service {service!r} not in allowlist',
+                 'allowed': sorted(_SYSTEMCHECK_RESTART_ALLOWLIST)},
+                status_code=400,
+            )
+        try:
+            r = subprocess.run(
+                ['systemctl', 'restart', service],
+                capture_output=True, text=True, timeout=8.0)
+        except Exception as e:
+            return JSONResponse({'error': str(e)}, status_code=500)
+        return {
+            'ok':      r.returncode == 0,
+            'service': service,
+            'rc':      r.returncode,
+            'stderr':  (r.stderr or '').strip()[:400],
+        }
 
     # ------------------------------------------------------------------
     # Collision monitor — mock-injection endpoints
@@ -2463,6 +5917,10 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/api/parts")
     async def api_parts_list():
+        # NOT gated: Monitor + Program editor + Wizard consume this list
+        # (parts library dropdown, part-name resolution for detect
+        # steps). The AdaptivePicking teach/mutation endpoints below
+        # are the part_recognition gates.
         from object_detection.part_library import (
             get_all_parts, identification_basis, has_teach_images,
             get_teach_image_count, has_step_file,
@@ -3103,19 +6561,163 @@ if FASTAPI_AVAILABLE:
 
         return {"ok": True, "part": part}
 
-    # Path-traversal guard for /api/programs/{prog_id} routes. Slugs are
-    # produced by the POST endpoint as [a-z0-9_]+ so we mirror that here.
+    # Path-traversal guard for /api/programs/{prog_id} routes. Slugs
+    # produced by POST are LOWERCASE ALPHANUMERIC ONLY — no underscore
+    # or dash — because the Estun controller's URL parser (:9198)
+    # splits `projectlua_<id>` on '_' into nested path segments.
+    # A program id `new_program_2` gets stored at
+    # `projectlua/new/program/2/…` on the controller but projectlist
+    # still keys it as `new_program_2`, so save reports 4×200-OK yet
+    # project/run resolves the id to a non-existent path and emits
+    # controller alarm 10001 "Project <…> does not exist." Wire-proof:
+    # 2026-07-20 13:02:10 log. Fixed by keeping our ids single-segment
+    # so no URL-parser split can turn a valid save into an unrunnable
+    # project.
     import re as _prog_re
     _PROG_DIR = '/opt/cobot/programs'
-    _PROG_ID_RE = _prog_re.compile(r'^[a-z0-9_]+$')
+    # Strict slug rule for CREATION only. New programs authored via POST
+    # /api/programs get a controller-safe slug (lowercase-alphanum, no
+    # underscore) — see the URL-parser-split rationale on that endpoint.
+    _PROG_ID_RE = _prog_re.compile(r'^[a-z0-9]+$')
+    # Relaxed regex for read/update/delete routes. Older files may
+    # carry underscores in their slug (the wizard used to produce
+    # `new_program.json`); every route that has to REACH an existing
+    # file must accept those, otherwise the operator gets a 404 on a
+    # program the list is happily showing. Traversal still bounded —
+    # the character class is [a-z0-9_-] with no dots or slashes, so
+    # `_prog_read_path` always returns a path inside _PROG_DIR.
+    _PROG_READ_ID_RE = _prog_re.compile(r'^[a-z0-9_-]+$')
 
     def _prog_path(prog_id: str):
         if not _PROG_ID_RE.match(prog_id or ''):
             return None
         return os.path.join(_PROG_DIR, prog_id + '.json')
 
+    def _prog_read_path(prog_id: str):
+        """Read/update/delete path resolver. Accepts the underscore/
+        hyphen shape older files carry so the operator can delete or
+        migrate a legacy `new_program.json` — the strict slug rule
+        stays enforced on creation via _prog_path."""
+        if not _PROG_READ_ID_RE.match(prog_id or ''):
+            return None
+        return os.path.join(_PROG_DIR, prog_id + '.json')
+
     def _now_stamp():
         return time.strftime('%Y-%m-%d %H:%M')
+
+    # ── delete-integrity trash safeguard (2026-09-04) ──────────────
+    # Every DELETE moves the program's main .json + every sidecar
+    # (currently just `<id>.line_map.json`; extend `_prog_sidecar_paths`
+    # when new sidecars land) into `.deleted/<id>.<utc_ts>.<suffix>`
+    # via os.rename, then prunes the trash to `_PROG_TRASH_CAP`
+    # most-recent PROGRAM entries by mtime. Taught poses are hours of
+    # operator labor — deletion stays reversible for at most 20 recent
+    # entries so a wrong tap doesn't vaporise them. The .deleted
+    # directory is hidden from every /api/programs listing (dotfolder
+    # + endswith('.json') filter make it invisible to the four
+    # listdir(_PROG_DIR) sweeps in this file).
+    _PROG_TRASH_DIR = os.path.join(_PROG_DIR, '.deleted')
+    _PROG_TRASH_CAP = 20
+
+    def _prog_sidecar_paths(prog_id: str) -> list:
+        """Every filesystem artefact the program owns EXCLUDING the
+        main <id>.json. Extend this list when new per-program sidecar
+        files land; the delete path picks them up automatically.
+        """
+        return [
+            os.path.join(_PROG_DIR, f'{prog_id}.line_map.json'),
+        ]
+
+    def _trash_program(prog_id: str) -> dict:
+        """Move a program + its sidecars into `.deleted/`. Returns the
+        summary of moved paths so the caller can log or surface them.
+        Prunes the trash to `_PROG_TRASH_CAP` most-recent MAIN entries
+        (their sidecar siblings share a prefix so they get culled
+        together).
+
+        Contract: main .json move is the load-bearing step. If it
+        fails, the whole delete raises OSError and the caller returns
+        500 — the file is still on disk, so a retry can succeed. A
+        successful main-move followed by a sidecar-move failure is
+        logged but not raised: the user-visible truth (program is
+        deleted) already holds, and the orphan sidecar will be
+        harmless (no matching main → hidden from every listing).
+        """
+        main = os.path.join(_PROG_DIR, f'{prog_id}.json')
+        if not os.path.isfile(main):
+            raise FileNotFoundError(main)
+        os.makedirs(_PROG_TRASH_DIR, exist_ok=True)
+        ts = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+        moved = []
+        trash_main = os.path.join(_PROG_TRASH_DIR, f'{prog_id}.{ts}.json')
+        os.rename(main, trash_main)
+        moved.append(('main', trash_main))
+        for sc in _prog_sidecar_paths(prog_id):
+            if not os.path.isfile(sc):
+                continue
+            base = os.path.basename(sc)                 # e.g. foo.line_map.json
+            assert base.startswith(f'{prog_id}.')
+            suffix = base[len(prog_id) + 1:]            # line_map.json
+            dest = os.path.join(_PROG_TRASH_DIR, f'{prog_id}.{ts}.{suffix}')
+            try:
+                os.rename(sc, dest)
+                moved.append((suffix, dest))
+            except OSError as e:
+                print(f'[programs] trash sidecar {sc!r} failed: '
+                      f'{type(e).__name__}: {e}', flush=True)
+        _prune_prog_trash()
+        return {'ts': ts, 'moved': moved}
+
+    def _prune_prog_trash():
+        """Keep at most `_PROG_TRASH_CAP` most-recent MAIN .deleted
+        entries (their sidecars share the `<id>.<ts>.` prefix so they
+        get culled together). Sorts by mtime descending, unlinks
+        every extra main file and every file whose name starts with a
+        pruned main's prefix.
+        """
+        try:
+            if not os.path.isdir(_PROG_TRASH_DIR):
+                return
+            entries = []
+            for fn in os.listdir(_PROG_TRASH_DIR):
+                # Main entries look like `<id>.<ts>.json`. Sidecars
+                # look like `<id>.<ts>.line_map.json`. We key pruning
+                # on the main entries only; sidecars are handled via
+                # prefix match.
+                if not fn.endswith('.json'):
+                    continue
+                # Sidecar suffixes end with `.<sidecar>.json`. The
+                # cheapest fingerprint: mains end with exactly one
+                # `.json` and NOT with `.line_map.json`.
+                if fn.endswith('.line_map.json'):
+                    continue
+                full = os.path.join(_PROG_TRASH_DIR, fn)
+                try:
+                    mt = os.path.getmtime(full)
+                except OSError:
+                    continue
+                entries.append((mt, fn))
+            if len(entries) <= _PROG_TRASH_CAP:
+                return
+            entries.sort(reverse=True)   # newest first
+            prune = entries[_PROG_TRASH_CAP:]
+            for _, fn in prune:
+                # Drop main + every sidecar with the same `<id>.<ts>.`
+                # prefix. Split at the second-to-last '.' from the
+                # end: mains end `.json`, sidecar names end
+                # `.line_map.json`. Strip `.json` first to get the
+                # unique prefix.
+                prefix = fn[:-len('.json')] + '.'   # `<id>.<ts>.`
+                for sibling in os.listdir(_PROG_TRASH_DIR):
+                    if sibling == fn or sibling.startswith(prefix):
+                        try:
+                            os.remove(os.path.join(_PROG_TRASH_DIR, sibling))
+                        except OSError as e:
+                            print(f'[programs] prune {sibling!r} failed: '
+                                  f'{type(e).__name__}: {e}', flush=True)
+        except Exception as e:
+            print(f'[programs] prune sweep failed: '
+                  f'{type(e).__name__}: {e}', flush=True)
 
     # ------------------------------------------------------------------
     # Production-stats endpoints used by MonitorDashboard. Backed by an
@@ -3191,23 +6793,2340 @@ if FASTAPI_AVAILABLE:
         s = disk if disk else _program_stats.get(prog_id, {})
         return {'cycle_times': list(s.get('cycle_times', []))}
 
+    # ─── Estun-arm program pipeline (ladder-proven, commit d059207) ─────
+    #
+    # This is the REAL-ARM run path — distinct from /api/program/run
+    # (which dispatches to the sim/executor). Sequence per press:
+    #
+    #   1. Read /opt/cobot/programs/{id}.json   (fresh every press — no
+    #      stale controller-stored copy is trusted; see §Staleness below)
+    #   2. Codegen Lua + varspoint via program_ops.codegen_lua_from_program
+    #      — hard-caps speed_pct at the driver's operator_speed_limit
+    #   3. Publish {op:save, …}                 → driver POSTs 4 HTTP
+    #      calls (source + varspoint + project.json + projectlist)
+    #   4. Publish {op:to_auto}
+    #   5. Publish {op:set_auto_rate, pct:<eff>}
+    #   6. Publish {op:set_breakpoint, task_id:'main', lines:[]}
+    #   7. Publish {op:clear_start_line}
+    #   8. Publish {op:run, program_id, task_id:'main'}
+    #
+    # Each op passes through the driver's monitor_only + allow_move gate.
+    # A closed gate → rejection on /estun/rejected → surfaced to the UI
+    # via STATE.robot.rejected. We DELIBERATELY do NOT pre-check the
+    # gate here: the operator's requirement is that pressing Run with
+    # the gate closed still surfaces the driver's own refusal, proving
+    # the whole pipeline is wired end-to-end.
+    #
+    # Staleness: the frontend re-fetches the program from /api/programs
+    # before opening the confirm modal, and this endpoint re-reads the
+    # disk copy on every call — so a taught-poses edit made in the same
+    # session ships to the controller before run. The controller's
+    # varspoint / robotcode / projectlist are unconditionally OVER-
+    # WRITTEN on every press (see program_ops.save_project — its
+    # projectlist MERGE preserves other projects but always rewrites
+    # our entry with the fresh codegen output).
+
+    # ── 2026-08-28 palletize quarantine (§644 investigation) ────
+    # Kept ON as belt-and-braces per add-52 §646-654 (retires with
+    # RUN_BACKEND=ros2_executor). NOTE 2026-08-31 (add-53 §655-660):
+    # the original diagnosis that these programs "latch controller
+    # recoveryState=1" is superseded by wire evidence — rs=1 is a
+    # session-persistent servos-were-off flag, not a fault latch,
+    # and the mode-switch failures that motivated the quarantine
+    # were likely DI16 modeSwitch=0 (hardware selector in MANUAL)
+    # silently no-op'ing Robot/toAuto after the palletize push
+    # tried to switch to Auto. The offline §644 forensic (add-52
+    # M4) still stands as a codegen-hygiene finding
+    # (transit_over_slot IK-refuse + partial expansion), and the
+    # ROS2 executor's L222 pre-submit validation is the real fix.
+    # This quarantine survives regardless of RUN_BACKEND until
+    # palletize is proven on the ros2 path.
+    _QUARANTINED_PROGRAM_IDS = {
+        'holepartpalletize',
+        'pallettest',
+        'pallettest2',
+    }
+    _QUARANTINE_REASON = (
+        "under investigation §644 — palletize codegen has an "
+        "IK-refuse + partial-expansion defect (add-52 M4). "
+        "Quarantined on the legacy Lua path until the ROS2 "
+        "executor's pre-submit validation (L222) proves the "
+        "class impossible-by-construction. Reframe note (add-53 "
+        "§655-660): the earlier 'latches recoveryState=1' "
+        "attribution was incorrect; the observed refusals were "
+        "DI16 modeSwitch=0 stacked on rs=1-as-session-normal."
+    )
+
+    @app.post("/api/estun/program/run")
+    async def api_estun_program_run(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        # The driver's save_event.steps interleaves real HTTP POSTs
+        # (source / varspoint / project / projectlist — http_status=200
+        # on success) with local CHECK gates (lua_syntax_gate,
+        # lua_semantic_roundtrip — http_status=0, code=909 on success,
+        # code='syntax_error'/'semantic_roundtrip_error' on failure).
+        # The prior classifier's `all(http_status == 200)` reads the
+        # passing CHECKs as failed → every Change Program push falsely
+        # classified as save_failed. Widen: pass on HTTP-200, OR on
+        # CHECK with code==909.
+        def _save_step_ok(s):
+            if s.get("http_status") == 200:
+                return True
+            if (s.get("method") == "CHECK"
+                    and s.get("http_status") == 0
+                    and s.get("code") == 909):
+                return True
+            return False
+
+        # JOG-11 arbiter: refuse if a jog session is active. Fires
+        # BEFORE program_id validation so the operator sees the jog
+        # conflict rather than a generic 400.
+        _refused = _arbiter_refuse_run_if_jogging()
+        if _refused is not None:
+            return _refused
+        prog_id = str(body.get("program_id") or "").strip()
+        if not prog_id:
+            return JSONResponse({"error": "program_id required"}, status_code=400)
+        # ── 2026-08-28 addendum-52 RUN dispatcher ─────────────
+        # RUN_BACKEND=ros2_executor routes the run to the
+        # s10_140_executor package via ROS2 (out-of-tree in
+        # CodroidROS2). The Lua-push class of bugs (recoveryState=1
+        # palletize latch) cannot exist there — no Lua, no push,
+        # Pilz PTP/LIN trajectories streamed. Flag stays legacy_lua
+        # until F2.7 first-run acceptance, then flips by env
+        # override. Stub returns not_wired_yet with a specific
+        # reason so operator sees WHY the ROS2 path is chosen but
+        # unavailable; falling back to legacy_lua silently would
+        # defeat the acceptance signal.
+        if _RUN_BACKEND_ENV == "ros2_executor":
+            # Palletize quarantine also blocks ROS2 execution UNTIL
+            # slot computation moves executor-side (§3 of the
+            # cutover directive). Same 423 signal so the frontend
+            # copy renders the same badge.
+            if prog_id in _QUARANTINED_PROGRAM_IDS:
+                return JSONResponse({
+                    "ok": False,
+                    "outcome": {
+                        "kind":  "quarantined",
+                        "reason_code": "program_quarantined",
+                        "reason": _QUARANTINE_REASON,
+                        "detail": (
+                            f"Program {prog_id!r} is quarantined "
+                            "pending §644 + the executor-side slot "
+                            "computation migration. Pick a different "
+                            "program from the library."),
+                        "program_id": prog_id,
+                        "run_backend": "ros2_executor",
+                    },
+                }, status_code=423)
+            # F2.7 acceptance bridge (addendum-54, 2026-08-31): publish
+            # on /task/run_program and await the executor's terminal
+            # /executor/status event via a per-req_id awaiter.
+            # dry_run flag routes through without gating on the WS
+            # four-tuple (executor detail) so operators can validate a
+            # program's plan pipeline before real motion.
+            if _ros_node is None:
+                return JSONResponse(
+                    {"ok": False,
+                     "outcome": {"kind": "ros_unavailable",
+                                 "reason_code": "ros_not_available",
+                                 "reason": "dashboard has no rclpy Node "
+                                           "context; executor cannot be "
+                                           "reached",
+                                 "program_id": prog_id,
+                                 "run_backend": "ros2_executor"}},
+                    status_code=503)
+            import uuid
+            req_id = uuid.uuid4().hex[:12]
+            dry_run = bool(body.get("dry_run", False))
+            run_speed_pct = body.get("run_speed_pct")
+            aw = _ros_node._register_executor_awaiter(req_id)
+            try:
+                had_sub = _ros_node._publish_task_run_program(
+                    prog_id, dry_run=dry_run, req_id=req_id,
+                    run_speed_pct=(float(run_speed_pct)
+                                    if run_speed_pct is not None else None))
+                if not had_sub:
+                    # No discovered subscriber → executor node isn't
+                    # up (or discovery hasn't matched). Bail fast
+                    # with a specific reason rather than waiting the
+                    # full timeout.
+                    return JSONResponse(
+                        {"ok": False,
+                         "outcome": {
+                             "kind": "executor_not_running",
+                             "reason_code": "executor_no_subscriber",
+                             "reason": ("no discovered subscriber for "
+                                        "/task/run_program — the "
+                                        "s10_140_executor node is not "
+                                        "up. Launch via "
+                                        "OPERATIONS §1."),
+                             "program_id": prog_id,
+                             "run_backend": "ros2_executor"}},
+                        status_code=503)
+                # Wait for terminal. Dry-run bound is fast (planning
+                # only); real run bound is longer (motion + settle).
+                bound = float(body.get("timeout_s",
+                                        30.0 if dry_run else 120.0))
+                got = aw["event"].wait(timeout=bound)
+                if not got:
+                    return JSONResponse(
+                        {"ok": False,
+                         "outcome": {
+                             "kind": "executor_timeout",
+                             "reason_code": "executor_awaiter_timeout",
+                             "reason": (f"executor did not reach terminal "
+                                        f"within {bound:.1f}s"),
+                             "program_id": prog_id,
+                             "run_backend": "ros2_executor",
+                             "plan_summaries": aw["plan_summaries"],
+                             "step_verdicts":  aw["step_verdicts"]}},
+                        status_code=504)
+                terminal = aw["terminal"] or {}
+                is_error = int(terminal.get("program_state", 0)) == 5
+                if is_error:
+                    return JSONResponse(
+                        {"ok": False,
+                         "outcome": {
+                             "kind": "executor_error",
+                             "reason_code": terminal.get("reason_code")
+                                             or "executor_unknown_error",
+                             "reason": terminal.get("detail")
+                                        or "executor reported error",
+                             "program_id": prog_id,
+                             "run_backend": "ros2_executor",
+                             "current_step_idx": terminal.get("current_step_idx"),
+                             "plan_summaries": aw["plan_summaries"],
+                             "step_verdicts":  aw["step_verdicts"],
+                             "terminal": terminal}},
+                        status_code=409)
+                # Success — COMPLETE.
+                return {
+                    "ok": True,
+                    "outcome": {
+                        "kind": "executor_complete" if not dry_run
+                                 else "executor_dry_run_complete",
+                        "program_id": prog_id,
+                        "run_backend": "ros2_executor",
+                        "plan_summaries": aw["plan_summaries"],
+                        "step_verdicts":  aw["step_verdicts"],
+                        "dry_run": dry_run,
+                    },
+                }
+            finally:
+                _ros_node._unregister_executor_awaiter(req_id)
+
+        # Palletize quarantine — refuse BEFORE opening the file so
+        # even a corrupt / deleted quarantined artifact still
+        # refuses correctly.
+        if prog_id in _QUARANTINED_PROGRAM_IDS:
+            return JSONResponse({
+                "ok": False,
+                "outcome": {
+                    "kind":  "quarantined",
+                    "reason_code": "program_quarantined",
+                    "reason": _QUARANTINE_REASON,
+                    "detail": (
+                        f"Program {prog_id!r} is quarantined pending "
+                        "the §644 palletize-codegen investigation. "
+                        "Pick a different program (e.g., Test100) "
+                        "from the library."),
+                    "program_id": prog_id,
+                },
+            }, status_code=423)   # Locked
+        # Task id is fixed to "main" for the B1 shape. Multi-task programs
+        # come with the multi-task saveAll flow (deferred, tracked in the
+        # architecture doc).
+        task_id = "main"
+
+        path = _prog_path(prog_id)
+        if not os.path.isfile(path):
+            # Named refusal path for the "deleted resident" ghost case
+            # (2026-09-04 delete-integrity fix). If the operator just
+            # deleted a program that was resident-on-controller, the
+            # dashboard's mirror was cleared but the controller keeps
+            # its own copy. Firing Run against the deleted id here
+            # would either invoke the controller's ghost copy (silent
+            # divergence between dashboard and arm) or return a
+            # generic 404. Prefer a NAMED refusal so the frontend can
+            # render the correct copy.
+            with _state_lock:
+                pg = STATE.get("robot", {}).get("program", {}) or {}
+                deleted_resident_id = pg.get("deleted_resident_id")
+                deleted_at          = pg.get("deleted_at")
+            if deleted_resident_id and deleted_resident_id == prog_id:
+                return JSONResponse({
+                    "ok": False,
+                    "outcome": {
+                        "kind":        "resident_deleted",
+                        "reason_code": "resident_program_deleted",
+                        "reason": ("this program was deleted from the "
+                                   "dashboard; the controller may still "
+                                   "hold its previous copy but the "
+                                   "dashboard will not push a run"),
+                        "detail": (f"Program {prog_id!r} was moved to "
+                                   f".deleted at {deleted_at}. Push a "
+                                   f"different program to replace what "
+                                   f"the controller has resident."),
+                        "program_id": prog_id,
+                        "deleted_at": deleted_at,
+                    },
+                }, status_code=410)
+            return JSONResponse({"error": f"program {prog_id!r} not on disk"},
+                                status_code=404)
+        try:
+            with open(path) as f:
+                program = json.load(f)
+        except Exception as e:
+            return JSONResponse({"error": f"program read: {e}"}, status_code=500)
+
+        # Codegen. operator_speed_limit is a driver-side parameter — mirrored
+        # into STATE.robot from /estun/mode. It's a FRACTION (0..1) there;
+        # program_ops takes an integer percent. If we don't have a live
+        # /estun/mode snapshot yet (driver not up), fall back to a very
+        # conservative 25% cap.
+        with _state_lock:
+            r = STATE.get("robot", {})
+            op_frac = float(r.get("operator_speed_limit", 0.25))
+            allow_move = bool(r.get("allow_move", False))
+            monitor_only = bool(r.get("monitor_only", True))
+        operator_cap_pct = max(1, min(100, int(round(op_frac * 100))))
+
+        # Speed selection. The Monitor Run box overrides
+        # program.config.speed_pct — we clone the program in-memory and
+        # patch speed_pct so program_ops.codegen_lua_from_program's
+        # capping math (min(requested, operator_cap)) does the rest.
+        # Invalid values clamp to [1..100] with a note; the driver's
+        # operator_speed_limit still enforces the hard cap after that.
+        override_pct = None
+        raw_speed = body.get("run_speed_pct")
+        speed_note = None
+        if raw_speed is not None:
+            try:
+                override_pct = int(raw_speed)
+            except Exception:
+                speed_note = f"run_speed_pct not an integer ({raw_speed!r}); using program default"
+                override_pct = None
+            if override_pct is not None:
+                if override_pct < 1:
+                    speed_note = f"run_speed_pct {override_pct} < 1; clamped to 1"
+                    override_pct = 1
+                elif override_pct > 100:
+                    speed_note = f"run_speed_pct {override_pct} > 100; clamped to 100"
+                    override_pct = 100
+        if override_pct is not None:
+            program = dict(program)  # shallow copy
+            cfg = dict(program.get("config") or {})
+            cfg["speed_pct"] = override_pct
+            program["config"] = cfg
+
+        try:
+            from estun_driver import program_ops  # ladder-proven module
+        except Exception as e:
+            return JSONResponse({"error": f"program_ops import: {e}"},
+                                status_code=500)
+
+        # D14 pending-pose gate (2026-08-04) — runs BEFORE codegen so
+        # a program with untaught anchors never even reaches Lua
+        # emission. Firmware bug #3 (three holepartpalletize kills
+        # 2026-08-03/04 on movJCoorRel → mm2mAndDeg2rad v.size()>=6
+        # → exitProcess) is silent on the wire: no /rejected frame,
+        # no error toast — the arm just freezes and C2Control dies.
+        # This gate is the operator-facing quarantine: teach the
+        # missing positions in the Program Editor and try again.
+        try:
+            _pending = program_ops.check_program_pending_poses(program)
+        except Exception as _pe:
+            print(f'[run] WARN pending-pose check raised: {_pe}',
+                  flush=True)
+            _pending = []
+        if _pending:
+            _preview = _pending[:5]
+            _step_summary = ', '.join(
+                f'step {p["step_idx"] + 1} ({p.get("action","?")})'
+                for p in _preview)
+            _more = (f' and {len(_pending) - 5} more'
+                     if len(_pending) > 5 else '')
+            return JSONResponse({
+                "ok": False,
+                "error": (
+                    f'known controller-crashing codegen — regenerate '
+                    f'required: {len(_pending)} motion step(s) have '
+                    f'untaught positions ({_step_summary}{_more}). '
+                    f'Teach the missing positions in the Program '
+                    f'Editor before running (firmware bug #3, '
+                    f'mm2mAndDeg2rad v.size()>=6).'),
+                "outcome": {
+                    "kind": "pending_poses",
+                    "count": len(_pending),
+                    "findings": _pending,
+                },
+                "program_id": prog_id,
+            }, status_code=400)
+
+        try:
+            lua, points, eff_pct = program_ops.codegen_lua_from_program(
+                program, operator_speed_limit_pct=operator_cap_pct)
+        except AssertionError as e:
+            # D14 codegen post-emit assertion tripped. This is defense
+            # in depth behind the pending-pose gate above — a bug that
+            # slipped past the pre-codegen scan would still be caught
+            # here rather than reaching the controller.
+            return JSONResponse({
+                "ok": False,
+                "error": (
+                    f'codegen refused to emit — mov* arity assertion '
+                    f'failed: {e}'),
+                "outcome": {
+                    "kind": "arity_assertion_failed",
+                    "reason": str(e),
+                },
+                "program_id": prog_id,
+            }, status_code=400)
+        except Exception as e:
+            return JSONResponse({"error": f"codegen: {e}"}, status_code=500)
+
+        # Codegen-source freshness self-check. If program_ops.py on disk
+        # differs from the sha the running module captured at import, the
+        # in-memory codegen is stale relative to disk — a restart would
+        # produce different Lua. The 2026-07-28 bowl-run investigation
+        # burned hours because there was no signal for this. We don't
+        # block the run (the operator may be mid-cycle and expects the
+        # button to work), but we LOG the mismatch and stamp the
+        # comparison into the run manifest so /api/runs makes it visible.
+        codegen_boot_sha  = program_ops.CODEGEN_VERSION.get('src_sha256', '')
+        codegen_disk_sha  = program_ops.current_disk_src_sha256()
+        codegen_is_stale  = (codegen_boot_sha != codegen_disk_sha
+                             and codegen_disk_sha != 'unknown'
+                             and codegen_boot_sha != 'unknown')
+        if codegen_is_stale:
+            print(f'[run] WARN codegen source changed since boot — '
+                  f'in-memory sha={codegen_boot_sha[:12]} '
+                  f'disk sha={codegen_disk_sha[:12]}. '
+                  f'This run uses the IN-MEMORY (boot-time) codegen. '
+                  f'Restart roboai-dashboard to load disk version.',
+                  flush=True)
+
+        # Fresh-Lua identity assertion. The Lua we're about to hash for
+        # the byte-verify below MUST be exactly what codegen just
+        # returned — anything else would mean local corruption between
+        # here and the save publish. This is a hash-of-hash sanity
+        # check rather than a real guard (the two operands come from
+        # the same variable), but a future refactor that splits
+        # regenerate from push would immediately trip this assertion.
+        import hashlib as _hashlib_run_assert
+        _push_sha = _hashlib_run_assert.sha256(lua.encode('utf-8')).hexdigest()
+
+        # Empty-program guard — VERB-AGNOSTIC (2026-08-03).
+        # Routes through `program_ops.has_valid_motion` so this gate
+        # and the home-set gate below share ONE predicate. A valid
+        # all-cartesian program (only movL(pN)) MUST pass this
+        # gate; the pre-fix wording was movJ-only, which read
+        # incorrectly under verb-fidelity + all-cartesian columns
+        # (many legal programs emit zero movJ).
+        has_motion, _motion_counts = program_ops.has_valid_motion(lua)
+        if not has_motion:
+            # Per-verb breakdown from the catalogue set — omit the
+            # verbose full list of 13 zero counts and just show the
+            # non-zero ones (or "all zero" when everything is 0).
+            _nz = {k: v for k, v in _motion_counts.items()
+                   if k not in ('total', 'motion_verbs_checked')
+                   and isinstance(v, int) and v > 0}
+            _detail = (', '.join(f'{k}={v}' for k, v in sorted(_nz.items()))
+                       if _nz else 'all mov* verbs = 0')
+            return JSONResponse({
+                "error": ("program has no runnable motion — teach at "
+                          "least one point (or bind a pallet frame) "
+                          "before running"),
+                "ok": False,
+                "outcome": {
+                    "kind":   "empty_program",
+                    "reason": (f"codegen produced zero motion-verb "
+                               f"emissions ({_detail})"),
+                    "motion_counts": _motion_counts,
+                },
+                "program_id": prog_id,
+                "requested_pct":  int(program.get("config", {}).get(
+                    "speed_pct") or program.get("speed_pct") or 10),
+                "effective_pct":  int(eff_pct),
+            }, status_code=400)
+
+        # ── LINT GATE (2026-07-30 §2-§3) ─────────────────────────
+        # Every emitted call is checked against luaenginelib.json
+        # (168-verb authoritative catalogue) BEFORE a single byte
+        # reaches the controller. This is the invariant that lets us
+        # promise "the robot will never again be the first thing to
+        # notice an invalid line" — the waitCondition(false,N) reject
+        # on 2026-07-30 08:40 is the incident that motivates it.
+        # Findings are refused with a structured payload the UI
+        # surfaces per-line.
+        try:
+            lint_findings = program_ops.lint_lua_source(lua)
+        except Exception as _le:
+            return JSONResponse({
+                "ok": False,
+                "error": f"lint failed to run: {type(_le).__name__}: {_le}",
+                "outcome": {"kind": "lint_infrastructure_error",
+                            "reason": str(_le)},
+                "program_id": prog_id,
+            }, status_code=500)
+        if lint_findings:
+            first = lint_findings[0]
+            return JSONResponse({
+                "ok": False,
+                "error": (f"lint blocked push: {len(lint_findings)} finding(s); "
+                          f"first at line {first.get('line')} verb "
+                          f"{first.get('verb')!r}: {first.get('reason')}"),
+                "outcome": {"kind": "lint_failed",
+                            "count": len(lint_findings),
+                            "findings": lint_findings},
+                "program_id": prog_id,
+                "codegen": {
+                    "boot_sha": program_ops.CODEGEN_VERSION.get(
+                        'src_sha256','')[:12],
+                    "disk_sha": program_ops.current_disk_src_sha256()[:12],
+                },
+            }, status_code=400)
+
+        # Controller-id underscore-split guard. If our program id
+        # contains anything other than [a-z0-9], the controller's
+        # `projectlua_<id>` URL parser will split on the separator
+        # and store the project at a path that doesn't round-trip
+        # (2026-07-20 wire-proof: `new_program_2` → files land at
+        # `projectlua/new/program/2/…`, project/run then can't
+        # resolve back to the id → alarm 10001). Refuse the run
+        # rather than emit a save that runs OK on paper but fails
+        # at start.
+        if not _PROG_ID_RE.match(prog_id):
+            return JSONResponse({
+                "error": f"program id {prog_id!r} contains characters the "
+                         "controller can't round-trip (only [a-z0-9] "
+                         "allowed). Rename the program and try again.",
+                "ok": False,
+                "outcome": {"kind": "id_not_controller_safe",
+                            "reason": f"id {prog_id!r} would collide with "
+                                      "controller URL-parser separator"},
+            }, status_code=400)
+
+        # Hash the source so the UI can display an upload-fingerprint —
+        # helps the operator visually confirm two presses in a row shipped
+        # DIFFERENT programs (or the same one) when they edit between runs.
+        import hashlib
+        src_hash = hashlib.sha256(lua.encode("utf-8")).hexdigest()[:12]
+
+        # Snapshot the rejection ring so we can attribute any refusals
+        # that arrive DURING this endpoint's op sequence back to this
+        # specific press.
+        with _state_lock:
+            r = STATE.get("robot", {})
+            rej_before = len(r.get("rejected", []))
+
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        # Part G byte-verify (2026-07-22): publish `save` FIRST alone,
+        # wait for the driver's save event, GET the stored Lua from the
+        # controller, and compare its sha256 to what codegen emitted.
+        # Only if the two agree do we publish the rest of the run
+        # sequence — otherwise we refuse the run with a readable error.
+        # Prevents the class of failure where a network stall dropped
+        # one of the 4 save POSTs; without this check we'd blindly run
+        # a partially-updated program.
+        try:
+            _ros_node._estun_publish_op(
+                "save",
+                program_id=prog_id, task_id=task_id,
+                name=str(program.get("name") or prog_id),
+                task_name="main",
+                points=points, lua_source=lua)
+        except Exception as e:
+            return JSONResponse({"error": f"publish save: {e}"}, status_code=500)
+
+        # Wait up to 4s for the driver to publish a save event with all
+        # 4 HTTP-POST steps green.
+        save_event = None
+        save_deadline = time.time() + 4.0
+        while time.time() < save_deadline:
+            await asyncio.sleep(0.05)
+            with _state_lock:
+                r = STATE.get("robot", {})
+                new_rej = r.get("rejected", [])[rej_before:]
+                prog_state = r.get("program", {})
+                save_event = prog_state.get("last_save")
+            program_rejects = [x for x in new_rej if x.get("family") == "program"]
+            if program_rejects:
+                rej0 = program_rejects[0]
+                reason = rej0.get("reason") or ""
+                # Reason-code aware kind (2026-08-04). Prefer the
+                # driver-supplied reason_code (added at
+                # estun_driver_node.py:1288 for the WS gate) so the
+                # frontend maps to the operator message "Controller
+                # link down — program NOT loaded" rather than the
+                # generic save-rejected. Fall back to reason-string
+                # match for driver builds that predate the code.
+                rcode = rej0.get("reason_code")
+                if rcode == "transport_down" or "ws not connected" in reason:
+                    kind = "transport_down"
+                else:
+                    kind = "save_rejected"
+                outcome = {"kind": kind, "reason": reason}
+                if rcode:
+                    outcome["reason_code"] = rcode
+                return JSONResponse({
+                    "ok": False,
+                    "error": reason,
+                    "outcome": outcome,
+                }, status_code=400)
+            if save_event and all(_save_step_ok(s)
+                                  for s in save_event.get("steps", [])):
+                break
+        if not (save_event and all(_save_step_ok(s)
+                                   for s in save_event.get("steps", []))):
+            # Final drain (2026-08-28): the inner loop can time out
+            # a hair before the driver's reject event lands in
+            # STATE["robot"]["rejected"]. Test100 hit this — driver
+            # rejected at 09:10:29.824 with "allow_move gate closed",
+            # dashboard classified at 09:10:33.874, exactly 4 s later,
+            # and the operator saw the generic "transient network
+            # hiccup" toast for what was really a gate-closed refusal.
+            # Re-check the rejected list once before defaulting.
+            with _state_lock:
+                r = STATE.get("robot", {})
+                new_rej = r.get("rejected", [])[rej_before:]
+            program_rejects = [x for x in new_rej
+                               if x.get("family") == "program"]
+            if program_rejects:
+                rej0 = program_rejects[0]
+                reason = rej0.get("reason") or ""
+                rcode = rej0.get("reason_code")
+                if rcode == "transport_down" or "ws not connected" in reason:
+                    kind = "transport_down"
+                else:
+                    kind = "save_rejected"
+                outcome = {"kind": kind, "reason": reason}
+                if rcode:
+                    outcome["reason_code"] = rcode
+                return JSONResponse({
+                    "ok": False,
+                    "error": reason,
+                    "outcome": outcome,
+                }, status_code=400)
+            # Second-pass drain (2026-08-28): before defaulting to
+            # save_failed, look INSIDE the save_event's per-step
+            # records for an accompanying `reason` or non-200 status.
+            # Some driver builds populate save_event.steps with a
+            # `reason` field on the failing step even when the
+            # cross-family /estun/rejected topic didn't fire (or
+            # fired outside our polling window). Extract it so the
+            # frontend gets a NAMED refusal — never "network hiccup"
+            # for something the wire actually told us about.
+            step_reason = None
+            for step in (save_event or {}).get("steps", []):
+                if not _save_step_ok(step):
+                    # For failed CHECK steps the reason lives in
+                    # `code` (e.g. 'syntax_error') + `body_head`; for
+                    # failed POSTs it may live in `reason`/`error`/`body`.
+                    code = step.get("code")
+                    check_reason = (code if isinstance(code, str) and code != "909"
+                                    else None)
+                    step_reason = (step.get("reason")
+                                   or step.get("error")
+                                   or step.get("body")
+                                   or check_reason
+                                   or step.get("body_head"))
+                    if step_reason:
+                        break
+            if step_reason:
+                return JSONResponse({
+                    "ok": False,
+                    "error": str(step_reason),
+                    "outcome": {"kind": "save_rejected",
+                                "reason": str(step_reason),
+                                "save": save_event},
+                }, status_code=400)
+            return JSONResponse({
+                "ok": False,
+                "error": ("save did not complete cleanly (some POSTs "
+                          "did not return 200) — refusing to run"),
+                "outcome": {"kind": "save_failed", "save": save_event},
+            }, status_code=502)
+
+        # GET stored Lua + byte-verify. Uses http_get_lua added in
+        # Part B; runs off-loop in a thread so we don't block asyncio.
+        import hashlib
+        sent_sha = hashlib.sha256(lua.encode('utf-8')).hexdigest()
+        try:
+            stored = await asyncio.wait_for(
+                asyncio.to_thread(
+                    program_ops.http_get_lua,
+                    "192.168.2.136", 9198,
+                    project_id=prog_id, task_id=task_id),
+                timeout=4.0)
+            stored_sha = hashlib.sha256(stored.encode('utf-8')).hexdigest()
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"post-save byte-verify GET failed: {e}",
+                "outcome": {"kind": "byte_verify_get_failed",
+                            "reason": str(e)},
+            }, status_code=502)
+        if stored_sha != sent_sha:
+            return JSONResponse({
+                "ok": False,
+                "error": (f"post-save byte-verify MISMATCH: sent "
+                          f"sha256={sent_sha[:12]} but controller "
+                          f"has {stored_sha[:12]}. Refusing to run — "
+                          f"the stored Lua is not what codegen produced."),
+                "outcome": {"kind": "byte_verify_mismatch",
+                            "sent_sha":   sent_sha[:12],
+                            "stored_sha": stored_sha[:12]},
+            }, status_code=502)
+
+        # Byte-verify passed. Stamp the codegen version + push sha into
+        # the recorder so the NEXT run manifest carries the attribution.
+        # Handed off BEFORE publishing the run op — the recorder starts
+        # the manifest on the controller's state=2 transition, which
+        # lands after our publish, so metadata must be pre-staged.
+        try:
+            if _joint_recorder is not None:
+                _joint_recorder.attach_pending_metadata({
+                    'codegen_version':   dict(program_ops.CODEGEN_VERSION),
+                    'codegen_disk_sha':  codegen_disk_sha[:12],
+                    'codegen_stale':     bool(codegen_is_stale),
+                    'pushed_lua_sha256': _push_sha,
+                    'pushed_lua_sha12':  _push_sha[:12],
+                    'stored_lua_sha256': stored_sha,
+                    'stored_lua_sha12':  stored_sha[:12],
+                    'requested_pct':     int(program.get('config', {}).get(
+                        'speed_pct') or program.get('speed_pct') or 10),
+                    'effective_pct':     int(eff_pct),
+                    'operator_cap_pct':  int(operator_cap_pct),
+                })
+        except Exception as e:
+            print(f'[run] attach_pending_metadata failed: {e}', flush=True)
+        # D9 line_map wire (2026-08-03) — mirror the resident program's
+        # codegen sha into STATE.robot.program so the Monitor's live
+        # step highlight can compare against `/api/programs/{id}/
+        # line_map` and honor the honesty guard (mismatch → no
+        # highlight + "line map unavailable" note).
+        try:
+            with _state_lock:
+                pg = STATE.setdefault("robot", {}).setdefault("program", {})
+                pg["codegen_sha"] = program_ops.CODEGEN_VERSION.get(
+                    'src_sha256', '')[:12]
+                pg["codegen_git"] = program_ops.CODEGEN_VERSION.get(
+                    'git_sha', '')
+                pg["pushed_lua_sha12"] = _push_sha[:12]
+                pg["stored_lua_sha12"] = stored_sha[:12]
+                pg["resident_program_id"] = prog_id
+        except Exception as e:
+            print(f'[run] resident program state mirror failed: {e}',
+                  flush=True)
+        # D9 line_map sidecar refresh (2026-08-03) — the push path
+        # was mirroring codegen_sha to STATE.robot.program but NOT
+        # regenerating the sidecar at /opt/cobot/programs/{id}.
+        # line_map.json. After a deploy that bumps codegen_sha,
+        # the sidecar stayed pinned to the sha AT LAST /api/programs
+        # save, so `wire codegen_sha != sidecar codegen_sha` and
+        # the Monitor honesty guard fired every run. The push IS
+        # the moment the resident becomes current — regenerate the
+        # sidecar here so the sha stamp AND the line_map both
+        # reflect the Lua we just pushed. Best-effort — a sidecar
+        # write failure never blocks the run.
+        try:
+            _compute_and_save_line_map(program)
+        except Exception as e:
+            print(f'[run] sidecar refresh failed: {e}', flush=True)
+
+        # Push-only shortcut (2026-08-03) — the LOAD action from the
+        # Program Library reaches this endpoint with `push_only:True`
+        # so a load actually PUSHES the program to the controller
+        # (rather than only setting dashboard state). Everything up
+        # to this point already ran: codegen + save + byte-verify +
+        # STATE mirror + sidecar refresh. Skipping the to_auto/run
+        # publish here means the resident IS updated but the arm
+        # does NOT move — the same guarantee the operator gets from
+        # a manual pre-run push, wired to a normal library click.
+        if bool(body.get("push_only")):
+            return {"ok": True,
+                    "outcome":       {"kind": "pushed"},
+                    "program_id":    prog_id,
+                    "pushed_lua_sha12": _push_sha[:12],
+                    "stored_lua_sha12": stored_sha[:12],
+                    "effective_pct": int(eff_pct)}
+
+        # 2026-09-02 (per operator directive, wire-proven): the Run flow
+        # is push-program → project/run → poll ProjectState. NO mode
+        # switch, NO DI16 check, NO orchestration. Wire evidence: bare
+        # {ty:"project/run",db:{id,task}} in Manual mode is accepted by
+        # the controller (verb ack + ProjectState.state=2 transition,
+        # no errors). set_auto_rate/set_breakpoint/clear_start_line are
+        # preserved as program-configuration verbs (not mode switches).
+        try:
+            # at_run_start bypasses the driver's mid-run high-speed
+            # confirm requirement — the Run modal already ran the
+            # operator through its own confirm before this op fired.
+            _ros_node._estun_publish_op(
+                "set_auto_rate", pct=int(eff_pct), at_run_start=True)
+            _ros_node._estun_publish_op(
+                "set_breakpoint", task_id=task_id, lines=[])
+            _ros_node._estun_publish_op("clear_start_line")
+            _ros_node._estun_publish_op(
+                "run", program_id=prog_id, task_id=task_id)
+            print(f'[run] published: prog_id={prog_id!r} task={task_id!r} '
+                  f'eff_pct={eff_pct} (no mode switch)',
+                  flush=True)
+        except Exception as e:
+            return JSONResponse({"error": f"publish run: {e}"}, status_code=500)
+
+        # Give the driver a short window to publish either a save event
+        # OR a rejection so the response reflects the real outcome, not
+        # just "we published, don't know what happened."
+        deadline = time.time() + 1.5
+        outcome = None
+        while time.time() < deadline:
+            await asyncio.sleep(0.05)
+            with _state_lock:
+                r = STATE.get("robot", {})
+                new_rej = r.get("rejected", [])[rej_before:]
+                prog_state = r.get("program", {})
+            program_rejects = [x for x in new_rej if x.get("family") == "program"]
+            if program_rejects:
+                outcome = {"kind": "rejected",
+                           "reason": program_rejects[0].get("reason"),
+                           "payload_head": program_rejects[0].get("payload", "")[:120]}
+                break
+            # Any save event with a per-step failure counts as save-failed;
+            # otherwise we consider run-published a success once we see
+            # program_state != 0 (2 or 3) or when we've exhausted the
+            # window and see no rejection.
+            save = prog_state.get("last_save")
+            if save and any(not _save_step_ok(s) for s in save.get("steps", [])):
+                outcome = {"kind": "save_failed", "save": save}
+                break
+        if outcome is None:
+            outcome = {"kind": "published"}
+
+        return {
+            "ok": outcome["kind"] in ("published",),
+            "program_id": prog_id,
+            "task_id":    task_id,
+            "requested_pct":  int(program.get("config", {}).get(
+                "speed_pct") or program.get("speed_pct") or 10),
+            "override_pct":   override_pct,
+            "speed_note":     speed_note,
+            "operator_cap_pct": operator_cap_pct,
+            "effective_pct":  int(eff_pct),
+            "points":     list(points.keys()),
+            "source_hash": src_hash,
+            "gate": {"allow_move": allow_move, "monitor_only": monitor_only},
+            "codegen": {
+                "git_sha":    program_ops.CODEGEN_VERSION.get('git_sha'),
+                "git_dirty":  program_ops.CODEGEN_VERSION.get('git_dirty'),
+                "boot_sha":   codegen_boot_sha[:12],
+                "disk_sha":   codegen_disk_sha[:12],
+                "stale":      bool(codegen_is_stale),
+            },
+            "outcome": outcome,
+        }
+
+    # ── Return Home — wire-verified path via /estun/program ────────
+    #
+    # The frontend's homeRobot() used to publish {action:'home'} to
+    # /task/run_program, which the executor forwarded to /estun/command;
+    # /estun/command is bound to _on_write_reject on the driver (see
+    # estun_driver_node.py:851 — "non-jog/power write paths not
+    # implemented on this branch"), so every press was silently
+    # rejected and never reached the arm. On top of that,
+    # roboai-executor.service is inactive on this deployment, so
+    # /task/run_program had no subscriber at all — double break.
+    #
+    # This endpoint bypasses both problems by synthesising a one-step
+    # `move_home` program in memory from /opt/cobot/home.json (the
+    # single-source-of-truth home pose) and dispatching it through
+    # the wire-verified /estun/program save→run pipeline the Run
+    # button already uses. No new controller verbs, no new codegen
+    # syntax; every op emitted here is one the ladder already proves.
+    # Silent failure is impossible — every early exit returns a JSON
+    # body with `ok:false` + a specific `outcome.kind` the UI surfaces
+    # as a toast.
+    _HOME_FILE = '/opt/cobot/home.json'
+    _HOME_PROG_ID = 'roboaihome'
+    _HOME_TASK_ID = 'main'
+
+    @app.get("/api/robot/home/preview")
+    async def api_robot_home_preview():
+        """Return everything the Return Home confirm dialog needs to
+        pick between a proven-path retrace and a direct move: whether
+        a home pose is configured, whether there's a fresh breadcrumb
+        trail from the current or most-recent program run, its
+        thinned length, the effector state at the interruption point,
+        and the current gate. NO side effects — pure read. The
+        frontend fetches this on the confirm dialog's mount."""
+        # Home configured?
+        home_present = os.path.isfile(_HOME_FILE)
+        home_source  = None
+        if home_present:
+            try:
+                with open(_HOME_FILE) as f:
+                    home = json.load(f)
+                home_source = home.get('source')
+            except Exception:
+                home_present = False
+
+        # Trail lookup. Prefer the active trail (in-flight or paused
+        # run); otherwise the last finalised trail (a program that
+        # completed a moment ago is still meaningful).
+        collector = _ros_node._breadcrumbs if _ros_node is not None else None
+        raw_trail = collector.latest_trail() if collector else None
+        current_joints_deg = collector.latest_joints_deg() if collector else None
+        prog_steps = collector.active_program_steps() if collector else None
+
+        trail_payload = {"available": False}
+        if raw_trail and raw_trail.get('waypoints'):
+            wps = raw_trail['waypoints']
+            thinned = thin_waypoints(wps)
+            stale = is_stale(raw_trail, current_joints_deg)
+            # Effector state — walk the program's steps up to the last
+            # completed step. If the collector's cached step list is
+            # gone (finalised trail; steps not reloaded), fall back to
+            # re-reading from disk here.
+            if not prog_steps:
+                pid = raw_trail.get('program_id') or ''
+                try:
+                    with open(os.path.join(_PROG_DIR, f'{pid}.json')) as f:
+                        prog_steps = (json.load(f) or {}).get('steps') or []
+                except Exception:
+                    prog_steps = []
+            eff = effector_state_at_end(raw_trail, prog_steps)
+            trail_payload = {
+                "available":              True,
+                "program_id":             raw_trail.get('program_id'),
+                "program_name":           raw_trail.get('program_name'),
+                "achieved_at":            raw_trail.get('run_finished_at')
+                                          or (wps[-1].get('ts') if wps else None),
+                "waypoint_count":         len(wps),
+                "waypoint_count_thinned": len(thinned),
+                "last_step_index":        wps[-1].get('step_index'),
+                "paused_mid_step":        bool(wps[-1].get('paused_mid_step')),
+                "finalized":              bool(raw_trail.get('finalized')),
+                "finish_reason":          raw_trail.get('finish_reason'),
+                "is_stale":               stale,
+                "effector_state":         eff,
+            }
+
+        with _state_lock:
+            r = STATE.get("robot", {})
+            s = STATE.get("safety", {})
+            gate = {
+                "connected":    bool(r.get("connected", False)),
+                "allow_move":   bool(r.get("allow_move", False)),
+                "monitor_only": bool(r.get("monitor_only", True)),
+                "estop":        bool(s.get("estop", False)),
+            }
+        return {
+            "ok":              True,
+            "home_configured": bool(home_present),
+            "home_source":     home_source,
+            "trail":           trail_payload,
+            "gate":            gate,
+        }
+
+    @app.post("/api/robot/home")
+    async def api_robot_home(request: Request):
+        # Two accepted paths:
+        #  (a) Body carries `taught_joints` — Monitor's Return Home
+        #      resolves the LOADED PROGRAM's first move_home step and
+        #      passes its pose. This is the pose that actually gets
+        #      commanded; there is no silent fallback here.
+        #  (b) No body — legacy callers (jog Home, editor Home,
+        #      wizard Home) still use the global /opt/cobot/home.json
+        #      preset. Monitor's button never lands here (it refuses
+        #      at the UI level when the program's home is unresolvable).
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        req_tj = body.get("taught_joints")
+        if req_tj is not None:
+            if not (isinstance(req_tj, list) and len(req_tj) == 6
+                    and all(isinstance(v, (int, float)) for v in req_tj)):
+                return JSONResponse({
+                    "ok": False,
+                    "error": "Invalid `taught_joints` in request "
+                             "(need 6 numeric degrees).",
+                    "outcome": {"kind": "no_program_home"},
+                }, status_code=400)
+            tj = req_tj
+            taught_tcp    = body.get("taught_tcp") or None
+            source_pid    = str(body.get("program_id") or "").strip() or None
+            source_pname  = str(body.get("program_name") or "").strip() or None
+        else:
+            if not os.path.isfile(_HOME_FILE):
+                return JSONResponse({
+                    "ok": False,
+                    "error": "No home pose configured. Store one at "
+                             + _HOME_FILE + " ({\"taught_joints\": [...] in "
+                             "degrees}).",
+                    "outcome": {"kind": "not_configured"},
+                }, status_code=404)
+            try:
+                with open(_HOME_FILE) as f:
+                    home = json.load(f)
+            except Exception as e:
+                return JSONResponse({
+                    "ok": False,
+                    "error": f"{_HOME_FILE} read failed: {e}",
+                    "outcome": {"kind": "home_read_failed"},
+                }, status_code=500)
+            tj = home.get("taught_joints") or []
+            if not (isinstance(tj, list) and len(tj) == 6
+                    and all(isinstance(v, (int, float)) for v in tj)):
+                return JSONResponse({
+                    "ok": False,
+                    "error": f"{_HOME_FILE} taught_joints missing or invalid "
+                             "(need 6 numeric degrees).",
+                    "outcome": {"kind": "home_invalid"},
+                }, status_code=400)
+            taught_tcp    = home.get("taught_tcp") or None
+            source_pid    = None
+            source_pname  = None
+        req_speed_pct = body.get("run_speed_pct")
+
+        with _state_lock:
+            r = STATE.get("robot", {})
+            op_frac      = float(r.get("operator_speed_limit", 0.25))
+            allow_move   = bool(r.get("allow_move", False))
+            monitor_only = bool(r.get("monitor_only", True))
+            connected    = bool(r.get("connected", False))
+        # Surface every gate on the response so the UI's toast tells
+        # the operator what to fix, instead of a generic "no motion".
+        if not connected:
+            return JSONResponse({
+                "ok": False,
+                "error": "Driver not connected — home refused.",
+                "outcome": {"kind": "gate_closed", "reason": "not_connected"},
+                "gate": {"connected": False, "allow_move": allow_move,
+                         "monitor_only": monitor_only},
+            }, status_code=503)
+        if monitor_only:
+            return JSONResponse({
+                "ok": False,
+                "error": "monitor_only is active — driver refuses moves.",
+                "outcome": {"kind": "gate_closed", "reason": "monitor_only"},
+                "gate": {"connected": True, "allow_move": allow_move,
+                         "monitor_only": True},
+            }, status_code=403)
+        if not allow_move:
+            return JSONResponse({
+                "ok": False,
+                "error": "allow_move is false — driver refuses moves.",
+                "outcome": {"kind": "gate_closed", "reason": "allow_move_off"},
+                "gate": {"connected": True, "allow_move": False,
+                         "monitor_only": False},
+            }, status_code=403)
+
+        operator_cap_pct = max(1, min(100, int(round(op_frac * 100))))
+        # Speed policy:
+        #  - New path (Monitor Return Home): use req_speed_pct as the
+        #    commanded speed, capped by codegen's operator_speed_limit
+        #    below — same field the run console commits.
+        #  - Legacy path (jog/editor/wizard Home, no run_speed_pct):
+        #    preserve the historic 25% ceiling. Rushing to a global
+        #    preset is a known collision mode; keep the guardrail.
+        try:
+            req_pct_i = int(round(float(req_speed_pct)))
+            home_speed_pct = max(1, min(100, req_pct_i))
+        except (TypeError, ValueError):
+            home_speed_pct = min(operator_cap_pct, 25)
+
+        home_label = (f"Move to {source_pname} home" if source_pname
+                      else "Move to program home")
+        program = {
+            "id":     _HOME_PROG_ID,
+            "name":   (f"Return Home ({source_pname})" if source_pname
+                       else "Return Home"),
+            "config": {"speed_pct": home_speed_pct},
+            "steps": [{
+                "action":        "move_home",
+                "label":         home_label,
+                "taught":        True,
+                "taught_joints": [float(v) for v in tj],
+                "taught_tcp":    taught_tcp,
+                "position_role": "home",
+                "step":          1,
+            }],
+        }
+        try:
+            from estun_driver import program_ops
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"program_ops import: {e}",
+                "outcome": {"kind": "codegen_import_failed"},
+            }, status_code=500)
+        try:
+            lua, points, eff_pct = program_ops.codegen_lua_from_program(
+                program, operator_speed_limit_pct=operator_cap_pct)
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"codegen failed: {e}",
+                "outcome": {"kind": "codegen_failed"},
+            }, status_code=500)
+        # Shared predicate (2026-08-03): use has_valid_motion so
+        # this home-set gate and the run gate above agree on
+        # "runnable" semantics — verb-agnostic, no fork.
+        _home_has_motion, _home_motion_counts = program_ops.has_valid_motion(lua)
+        if not _home_has_motion:
+            return JSONResponse({
+                "ok": False,
+                "error": (f"codegen produced no runnable motion — "
+                          f"program home taught_joints may be "
+                          f"malformed (motion_counts="
+                          f"{_home_motion_counts})."),
+                "outcome": {"kind": "codegen_empty",
+                            "motion_counts": _home_motion_counts},
+            }, status_code=500)
+
+        # Lint gate — same permanent check the program run endpoint uses.
+        # Home is a 1-step move_home so findings would be surprising, but
+        # if a future refactor drifts the emission we want the same hard
+        # block here rather than silently pushing an invalid line.
+        try:
+            _home_lint = program_ops.lint_lua_source(lua)
+        except Exception as _le:
+            return JSONResponse({
+                "ok": False,
+                "error": f"lint failed to run: {type(_le).__name__}: {_le}",
+                "outcome": {"kind": "lint_infrastructure_error"},
+            }, status_code=500)
+        if _home_lint:
+            first = _home_lint[0]
+            return JSONResponse({
+                "ok": False,
+                "error": (f"lint blocked home preset: {len(_home_lint)} "
+                          f"finding(s); first at line {first.get('line')} "
+                          f"verb {first.get('verb')!r}: {first.get('reason')}"),
+                "outcome": {"kind": "lint_failed",
+                            "findings": _home_lint},
+            }, status_code=400)
+
+        if _ros_node is None:
+            return JSONResponse({
+                "ok": False,
+                "error": "ros not available",
+                "outcome": {"kind": "ros_down"},
+            }, status_code=503)
+
+        # save → set_auto_rate → set_breakpoint → clear_start_line → run.
+        # Byte-verify is skipped (~4s of latency vs a one-step program
+        # that codegen produces deterministically); the driver's own
+        # save-event stream still surfaces failures via
+        # STATE.robot.rejected.
+        #
+        # 2026-09-02: NO mode switch. project/run is accepted from
+        # any mode on the wire (Manual proven, Remote proven prior).
+        try:
+            _ros_node._estun_publish_op(
+                "save",
+                program_id=_HOME_PROG_ID, task_id=_HOME_TASK_ID,
+                name=program["name"], task_name="main",
+                points=points, lua_source=lua)
+            await asyncio.sleep(0.4)   # let the save complete
+            _ros_node._estun_publish_op(
+                "set_auto_rate", pct=int(eff_pct), at_run_start=True)
+            _ros_node._estun_publish_op(
+                "set_breakpoint", task_id=_HOME_TASK_ID, lines=[])
+            _ros_node._estun_publish_op("clear_start_line")
+            _ros_node._estun_publish_op(
+                "run", program_id=_HOME_PROG_ID, task_id=_HOME_TASK_ID)
+            print(f'[home] published: src_pid={source_pid} '
+                  f'eff_pct={eff_pct} (no mode switch)', flush=True)
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"publish sequence failed: {e}",
+                "outcome": {"kind": "publish_failed"},
+            }, status_code=500)
+
+        return {
+            "ok":                True,
+            "outcome":           {"kind": "published"},
+            "gate":              {"connected": True, "allow_move": True,
+                                  "monitor_only": False},
+            "effective_pct":     int(eff_pct),
+            "source_program_id": source_pid,
+        }
+
+    # ── /api/estun/mode (2026-08-28 mode-switch feature) ────────
+    # Body: {"target": "auto"|"manual"|"remote"}. Arbiter-aware:
+    # refuses under active jog hold (_active_holds non-empty) OR
+    # a running program (STATE.robot.program.state == 2). Publishes
+    # on /estun/mode_command; the driver's _on_mode_command handler
+    # does the WS verb + numeric read-back verify against
+    # publish/RobotStatus.mode (L298), then publishes an envelope
+    # on /estun/mode_status. This endpoint waits up to 4 s for the
+    # envelope with matching req_id and returns the wire-truthful
+    # outcome. Event-log emits on success + failure.
+    _MODE_TARGET_TO_OP = {
+        "auto":   "to_auto",
+        "manual": "to_manual",
+        "remote": "to_remote",
+    }
+    _MODE_CODE_LABEL = {0: "auto", 1: "manual", 2: "remote", -1: "unknown"}
+
+    @app.post("/api/estun/mode")
+    async def api_estun_mode(request: Request):
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"},
+                                status_code=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        target = str(body.get("target") or "").strip().lower()
+        op = _MODE_TARGET_TO_OP.get(target)
+        if op is None:
+            return JSONResponse({
+                "ok": False,
+                "outcome": {"kind": "invalid_target",
+                            "reason": f"target must be one of "
+                                       f"{sorted(_MODE_TARGET_TO_OP.keys())}"},
+            }, status_code=400)
+
+        # Arbiter check (JOG-11 discipline extended to mode ops).
+        # Reasoning: a mode change under a running program interrupts
+        # execution mid-cycle; under an active jog hold it can trip
+        # the driver's freshness deadman mid-motion. Refuse cleanly
+        # with a named reason the frontend can map to a copy path.
+        arbiter_reason = None
+        with _state_lock:
+            r = STATE.get("robot", {}) or {}
+            prog_state = int(((r.get("program") or {}).get("state")) or 0)
+        if len(_active_holds) > 0:
+            arbiter_reason = "jog hold active"
+        elif prog_state == 2:
+            arbiter_reason = "program running"
+        if arbiter_reason:
+            return JSONResponse({
+                "ok": False,
+                "outcome": {"kind": "arbiter_refused",
+                            "reason": arbiter_reason,
+                            "detail": ("Mode switch refused while "
+                                       f"{arbiter_reason}. Release the "
+                                       "jog or stop the program first.")},
+            }, status_code=409)
+
+        # ── Self-healing diagnostic ladder (2026-08-31 reframe) ─────
+        # Rung 0 added, Rung 1 semantics rewritten. See ledger
+        # addendum-53 §655-660 for the wire-evidence reframe of
+        # `recoveryState` (session-persistent servos-were-off flag,
+        # NOT a fault latch) and the DI16 modeSwitch discovery.
+        #
+        # New ladder:
+        #   0) DI16 modeSwitch == 0  → hardware mode selector is
+        #      in MANUAL. Firmware silently ACKs Robot/toAuto but
+        #      never transitions mode; no wire remediation helps.
+        #      Only fires when the target IS 'auto'.
+        #   1) errors[] non-empty  → publish System/ClearError,
+        #      poll for drain up to 2 s. If persistent →
+        #      errors_latched_uncleared (the real power-cycle-only
+        #      condition — was misattributed to `recoveryState` in
+        #      addendum-40 §566 / addendum-51 §640 pre-2026-08-31).
+        #   2) fall through to enable-interlock orchestration.
+        #
+        # `recoveryState` is retained in every outcome's four_tuple
+        # for observability, but NEVER gates a refusal on its own.
+        # Historical wire (2026-08-31 acceptance run): recoveryState
+        # transitions 0→1 at the moment of Robot/switchOff and stays
+        # 1 for the rest of the CPU session — every operator session
+        # trivially reaches rs=1 after any disable. A rs-only refusal
+        # would demand a power-cycle after every jog session.
+        with _state_lock:
+            r = STATE.get("robot", {}) or {}
+            recovery = r.get("recoveryState")
+            errors_now = list(r.get("errors") or [])
+            current_code = int(r.get("robot_mode_code") if isinstance(
+                r.get("robot_mode_code"), int) else -1)
+            io_live = STATE.get("io_live") or {}
+
+        # Rung 0: DI16 modeSwitch pre-check. Only gates target=='auto'
+        # (Manual is always reachable). Reads STATE['io_live'] which
+        # the driver refreshes every ~0.5 s via IOManager/GetIOValue.
+        # If the mirror isn't populated yet (fresh boot before first
+        # /estun/io publish), we DO NOT refuse — treat as UNKNOWN
+        # and let the orchestration attempt proceed; a false-block
+        # from a stale mirror would be exactly the "refusal quoting
+        # stale data is a lie" case the freshness doctrine warns
+        # about.
+        #
+        # 2026-08-31 add-54: SKIP this rung entirely when the
+        # driver is running under ESTUN_MODE_VIA_DI=1. Under the
+        # software-binding path (bound DI aliased to "Switch to
+        # Auto Mode"), the DI16 hardware selector is bypassed —
+        # keeping the check would over-fire on a system where the
+        # bound-DI mechanism is the actual mode-switch path.
+        _mode_via_di = os.environ.get(
+            'ESTUN_MODE_VIA_DI', '0').strip().lower() in \
+            ('1', 'true', 'yes', 'on')
+        # DISABLED 2026-09-02 — Rung-0 DI16 pre-check retired.
+        # Symptom that prompted the disable: factory UI also cannot
+        # enter Auto with zero external clients on the controller, so
+        # DI16=0 was never causally proven. Our theoretical gate was
+        # refusing /api/estun/mode BEFORE the wire even saw the
+        # attempt, masking whatever the controller's real refusal is.
+        # Let the controller decide. To restore this rung, remove
+        # the leading `False and` from the guard below.
+        if False and target == "auto" and not _mode_via_di:
+            di_val = None
+            di_rows = (io_live or {}).get("DI") or []
+            for row in di_rows:
+                try:
+                    if int(row.get("port")) == 16:
+                        di_val = row.get("value")
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if di_val is not None and int(di_val) == 0:
+                return JSONResponse({
+                    "ok": False,
+                    "outcome": {
+                        "kind": "mode_selector_manual",
+                        "reason_code": "hardware_mode_selector_manual",
+                        "reason": ("hardware mode-selector DI16 "
+                                   "(factory name 'modeSwitch') reads "
+                                   "0 — firmware silently no-ops "
+                                   "Robot/toAuto with this DI open."),
+                        "detail": ("Mode selector at the cabinet is in "
+                                   "MANUAL — turn the physical "
+                                   "selector to AUTO, then retry. "
+                                   "No wire remediation clears this."),
+                        "di16": {"port": 16, "value": int(di_val),
+                                 "name": "modeSwitch"},
+                        "four_tuple": {
+                            "mode":          current_code,
+                            "state_code":    r.get("state_code"),
+                            "state_name":    r.get("state_name"),
+                            "recoveryState": recovery,
+                            "errors":        errors_now,
+                        },
+                    },
+                }, status_code=503)
+
+        # Rung 2: errors[] latched. Auto-clear + retry.
+        rung2_subs = []
+        if errors_now:
+            try:
+                _publish_estun_power({"action": "clear_alarm"})
+                rung2_subs.append({"step": "publish_clear_alarm",
+                                   "ok": True,
+                                   "errors_before": errors_now})
+            except Exception as e:
+                rung2_subs.append({"step": "publish_clear_alarm",
+                                   "ok": False, "err": str(e)})
+            # Wait up to 2 s for errors[] to drain.
+            _dl = time.time() + 2.0
+            cleared = False
+            while time.time() < _dl:
+                await asyncio.sleep(0.05)
+                with _state_lock:
+                    rr = STATE.get("robot", {}) or {}
+                    if not (rr.get("errors") or []):
+                        cleared = True
+                        break
+            rung2_subs.append({"step": "await_errors_cleared",
+                               "ok": cleared})
+            if not cleared:
+                with _state_lock:
+                    rr = STATE.get("robot", {}) or {}
+                return JSONResponse({
+                    "ok": False,
+                    "outcome": {
+                        "kind": "errors_latched_uncleared",
+                        "reason_code": "errors_persist",
+                        "reason": ("controller errors[] did not clear "
+                                   "within 2 s of ClearError. Latched "
+                                   "fault the wire cannot dismiss."),
+                        "detail": ("Check the pendant `:9198` alarm "
+                                   "log for a fault requiring a "
+                                   "specific recovery gesture; if "
+                                   "none is visible, power-cycle the "
+                                   "cabinet."),
+                        "subs": rung2_subs,
+                        "four_tuple": {
+                            "mode":          current_code,
+                            "state_code":    rr.get("state_code"),
+                            "state_name":    rr.get("state_name"),
+                            "recoveryState": rr.get("recoveryState"),
+                            "errors":        list(rr.get("errors") or []),
+                        },
+                    },
+                }, status_code=503)
+
+        # Snapshot mode_status ring so we can attribute the response.
+        # current_code was already resolved above for the rungs.
+        with _state_lock:
+            r = STATE.get("robot", {}) or {}
+            ms_before = len(r.get("mode_status") or [])
+
+        import uuid
+
+        # Inner helper — one mode-switch attempt. Returns the
+        # /estun/mode_status envelope or None on driver-ack timeout.
+        async def _attempt(op_name):
+            rid = uuid.uuid4().hex[:12]
+            with _state_lock:
+                r0 = STATE.get("robot", {}) or {}
+                ring_before = len(r0.get("mode_status") or [])
+            try:
+                m0 = String()
+                m0.data = json.dumps({"op": op_name, "req_id": rid})
+                _ros_node._estun_mode_pub.publish(m0)
+            except Exception as e:
+                return {"ok": False,
+                        "reason": f"publish /estun/mode_command failed: {e}",
+                        "reason_code": "publish_failed",
+                        "req_id": rid}
+            dl = time.time() + 4.0
+            while time.time() < dl:
+                await asyncio.sleep(0.05)
+                with _state_lock:
+                    rr = STATE.get("robot", {}) or {}
+                    ring = rr.get("mode_status") or []
+                    new_ev = ring[ring_before:]
+                for ev in new_ev:
+                    if ev.get("req_id") == rid:
+                        return ev
+            return None  # driver-ack timeout
+
+        # Wait helper — poll STATE.robot for a predicate up to `secs`
+        # seconds. Returns True on success, False on timeout.
+        async def _wait_for(pred, secs=4.0):
+            dl = time.time() + secs
+            while time.time() < dl:
+                await asyncio.sleep(0.05)
+                with _state_lock:
+                    rr = STATE.get("robot", {}) or {}
+                if pred(rr):
+                    return True
+            return False
+
+        # ── Single attempt, no orchestration (2026-09-02 directive) ─
+        # The prior disable → switch → re-enable ladder is REMOVED.
+        # Under Remote mode any auto-switch to Auto exits Remote and
+        # kills the external command channel, so orchestrating a
+        # switch through arm_enabled_interlock is self-defeating.
+        # A caller wanting a mode change while the arm is enabled
+        # must disable the arm explicitly first — the driver's
+        # arm_enabled_interlock refusal is surfaced verbatim.
+        result = await _attempt(op)
+        orchestrated = False
+        subs = []
+
+        req_id = (result or {}).get("req_id")
+
+        # Log to the event log — both success and failure so the
+        # operator's timeline shows every mode change attempt.
+        # Orchestrated attempts include the sub-step trace in the
+        # technical_detail so a review-later reader sees the dance.
+        try:
+            if result is not None and result.get("ok"):
+                _event_log.emit(
+                    severity='info',
+                    source='dashboard',
+                    code='mode_switch',
+                    operator_message=(
+                        f"Robot mode → {_MODE_CODE_LABEL.get(int(result.get('requested', -1)), '?')}"
+                        + (" (already there)" if result.get("no_change") else "")
+                        + (" (orchestrated: disable → switch → re-enable)"
+                           if orchestrated else "")),
+                    technical_detail=(
+                        f"op={op} requested={result.get('requested')} "
+                        f"observed={result.get('observed')} "
+                        f"req_id={req_id} orchestrated={orchestrated} "
+                        f"subs={subs!r}"),
+                    context={"requested": result.get("requested"),
+                             "observed":  result.get("observed"),
+                             "op": op, "req_id": req_id,
+                             "orchestrated": orchestrated,
+                             "subs": subs})
+            else:
+                reason = (result or {}).get("reason") \
+                         or "mode switch endpoint timed out waiting for driver ack"
+                _event_log.emit(
+                    severity='warning',
+                    source='dashboard',
+                    code='mode_switch_refused',
+                    operator_message=f"Mode switch refused: {reason}",
+                    technical_detail=(
+                        f"op={op} current_code={current_code} "
+                        f"req_id={req_id} orchestrated={orchestrated} "
+                        f"subs={subs!r} result={result!r}"),
+                    context={"op": op, "current_code": current_code,
+                             "req_id": req_id,
+                             "reason": reason,
+                             "reason_code": (result or {}).get("reason_code"),
+                             "orchestrated": orchestrated,
+                             "subs": subs})
+        except Exception:
+            # event_log emit must never break the response.
+            pass
+
+        # Every terminal response gets the §566 four-tuple dumped
+        # into the payload so a persistent failure is never a
+        # naked "mode read-back timeout" — the operator (or a
+        # future me) sees the wire truth right in the toast.
+        with _state_lock:
+            rr = STATE.get("robot", {}) or {}
+        four_tuple = {
+            "mode":          rr.get("robot_mode_code"),
+            "state_code":    rr.get("state_code"),
+            "state_name":    rr.get("state_name"),
+            "recoveryState": rr.get("recoveryState"),
+            "errors":        list(rr.get("errors") or []),
+        }
+
+        if result is None:
+            return JSONResponse({
+                "ok": False,
+                "outcome": {"kind": "driver_ack_timeout",
+                            "reason": ("mode switch endpoint timed out "
+                                       "waiting for /estun/mode_status "
+                                       "envelope — the driver may be down "
+                                       "OR /estun/mode_command wasn't "
+                                       "subscribed yet"),
+                            "orchestrated": orchestrated,
+                            "subs": (rung2_subs + subs),
+                            "four_tuple": four_tuple},
+            }, status_code=504)
+
+        if not result.get("ok"):
+            return JSONResponse({
+                "ok": False,
+                "outcome": {"kind": "mode_switch_failed",
+                            "reason": result.get("reason") or "unknown",
+                            "reason_code": result.get("reason_code"),
+                            "requested": result.get("requested"),
+                            "observed":  result.get("observed"),
+                            "orchestrated": orchestrated,
+                            "subs": (rung2_subs + subs),
+                            "four_tuple": four_tuple},
+            }, status_code=409)
+
+        return {
+            "ok": True,
+            "outcome": {"kind": "mode_switched",
+                        "requested": result.get("requested"),
+                        "observed":  result.get("observed"),
+                        "no_change": bool(result.get("no_change")),
+                        "orchestrated": orchestrated,
+                        "subs": subs},
+            "target": target,
+            "current_code": result.get("observed"),
+            "current_label": _MODE_CODE_LABEL.get(
+                int(result.get("observed", -1)), "unknown"),
+        }
+
+    @app.post("/api/estun/program/stop")
+    async def api_estun_program_stop():
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        _ros_node._estun_publish_op("stop")
+        return {"ok": True}
+
+    @app.post("/api/estun/program/pause")
+    async def api_estun_program_pause():
+        # Wire-proven 2026-09-02: project/pause holds the interpreter
+        # at the current line, arm decelerates and holds position.
+        # ProjectState.state transitions 2→3 within a few frames.
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        _ros_node._estun_publish_op("pause")
+        return {"ok": True}
+
+    @app.post("/api/estun/program/resume")
+    async def api_estun_program_resume():
+        """Ladder-verb resume — publishes op:resume to /estun/program.
+        The driver's _op_resume sends project/resume on the WS. Wire-
+        proven 2026-09-02: ProjectState transitions 3→2 and motion
+        continues from the paused line.
+
+        Motivation (2026-08-04): the frontend's resumeProgram()
+        was calling /api/estun/program/run — which does codegen +
+        save + byte-verify + full run publish. That's re-run from
+        step 1, NOT resume from the paused line. A pause at line
+        47 in a 100-step program came back at line 1. This
+        endpoint mirrors pause and gives the frontend a real
+        ladder-verb call site."""
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        _ros_node._estun_publish_op("resume")
+        return {"ok": True}
+
+    @app.post("/api/estun/program/clear_error")
+    async def api_estun_program_clear_error():
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        _ros_node._estun_publish_op("clear_error")
+        return {"ok": True}
+
+    # Mid-run auto-mode speed change. The driver clamps against
+    # operator_speed_limit (single-source policy cap in
+    # config/estun.yaml) and rejects an INCREASE above
+    # high_speed_confirm_threshold_pct without confirmed_high_speed=true.
+    # This endpoint mirrors the driver's own contract so the UI can
+    # decide up-front whether it needs to show the strong confirm.
+    # Body: {pct:int 1..100, confirmed_high_speed?:bool}
+    @app.post("/api/estun/program/speed")
+    async def api_estun_program_speed(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            pct = int(body.get("pct"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "pct required (integer 1..100)"},
+                                status_code=400)
+        pct = max(1, min(100, pct))
+        confirmed = bool(body.get("confirmed_high_speed", False))
+        with _state_lock:
+            r = STATE.get("robot", {})
+            op_frac = float(r.get("operator_speed_limit", 0.25))
+            threshold_pct = int(r.get("high_speed_confirm_threshold_pct", 40))
+        operator_cap_pct = max(1, min(100, int(round(op_frac * 100))))
+        eff_pct = max(1, min(operator_cap_pct, pct))
+        capped = pct > operator_cap_pct
+        needs_confirm = (eff_pct > threshold_pct) and not confirmed
+        if needs_confirm:
+            return JSONResponse({
+                "ok": False,
+                "needs_confirm": True,
+                "reason": (f"Mid-run speed {eff_pct}% exceeds high-speed "
+                           f"threshold {threshold_pct}%. Re-submit with "
+                           f"confirmed_high_speed:true."),
+                "effective_pct":     eff_pct,
+                "operator_cap_pct":  operator_cap_pct,
+                "threshold_pct":     threshold_pct,
+                "capped":            capped,
+            }, status_code=409)
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        _ros_node._estun_publish_op(
+            "set_auto_rate", pct=int(eff_pct),
+            confirmed_high_speed=bool(confirmed))
+        return {
+            "ok": True,
+            "effective_pct":     eff_pct,
+            "operator_cap_pct":  operator_cap_pct,
+            "threshold_pct":     threshold_pct,
+            "capped":            capped,
+        }
+
+    # ──────────────────────────────────────────────────────────────
+    # Joint-log capture. Bounded high-rate sampler for targeted
+    # investigation only. For NORMAL post-run analysis, prefer the
+    # always-on flight recorder + /api/runs/{run_id}/excursions —
+    # you don't need to pre-arm anything; every run's motion data
+    # is already on disk. Use this endpoint when you need a higher
+    # sample rate (up to 100 Hz) or a labeled ad-hoc window that
+    # doesn't correspond to a program run (jog testing etc.).
+    # Cap at 60 s so a runaway request can't fill disk during a
+    # busy shift.
+    # ──────────────────────────────────────────────────────────────
+    _JOINT_LOG_DIR = '/tmp/joint_logs'
+
+    @app.post("/api/estun/joint_log")
+    async def api_estun_joint_log(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            duration_s = float(body.get('duration_s', 20.0))
+        except (TypeError, ValueError):
+            return JSONResponse({'error': 'duration_s must be a number'},
+                                status_code=400)
+        duration_s = max(1.0, min(60.0, duration_s))
+        try:
+            rate_hz = float(body.get('rate_hz', 50.0))
+        except (TypeError, ValueError):
+            rate_hz = 50.0
+        rate_hz = max(5.0, min(100.0, rate_hz))
+        label = str(body.get('label') or 'joint_log')
+        # Filename-safe: keep letters/digits/dash/underscore only.
+        label_safe = ''.join(c if c.isalnum() or c in '-_' else '_'
+                             for c in label)[:40] or 'joint_log'
+        try:
+            os.makedirs(_JOINT_LOG_DIR, exist_ok=True)
+        except Exception as e:
+            return JSONResponse({'error': f'cannot create log dir: {e}'},
+                                status_code=500)
+        ts = time.strftime('%Y%m%dT%H%M%S')
+        fname = f'{label_safe}_{ts}.jsonl'
+        fpath = os.path.join(_JOINT_LOG_DIR, fname)
+
+        # Fire-and-forget sampler task. Writes an OPEN meta line, then
+        # one sample per period, then a CLOSE meta line so a partial
+        # (server-killed) log is still trivially detectable.
+        period = 1.0 / rate_hz
+        async def _sampler():
+            samples_written = 0
+            t_start = time.time()
+            try:
+                with open(fpath, 'w', buffering=1) as f:
+                    f.write(json.dumps({
+                        'meta':        'open',
+                        'ts':          t_start,
+                        'duration_s':  duration_s,
+                        'rate_hz':     rate_hz,
+                        'label':       label_safe,
+                        'note':        ('joints=degrees, program.line = '
+                                        'controller ProjectState line; '
+                                        'step_index = 0-based when '
+                                        'inferable, else null'),
+                    }) + '\n')
+                    t_stop = t_start + duration_s
+                    prev_line = None
+                    step_index = -1
+                    while True:
+                        now = time.time()
+                        if now >= t_stop:
+                            break
+                        with _state_lock:
+                            joints = STATE.get('joints') or {}
+                            positions = list(joints.get('positions') or [])
+                            robot = STATE.get('robot') or {}
+                            prog = robot.get('program') or {}
+                            prog_line = prog.get('line')
+                            prog_state = prog.get('state')
+                            prog_is_step = prog.get('is_step')
+                        # Radians → degrees for readability.
+                        joints_deg = [
+                            round((v * 180.0 / math.pi), 3)
+                            for v in positions[:6]
+                        ] if positions else []
+                        # Coarse step index: bump on each program.line
+                        # change. Not the true step id (that needs the
+                        # program dict → line-to-step map) but keeps
+                        # the log usable without that lookup.
+                        if prog_line is not None and prog_line != prev_line:
+                            step_index += 1
+                            prev_line = prog_line
+                        f.write(json.dumps({
+                            't':             round(now - t_start, 3),
+                            'joints_deg':    joints_deg,
+                            'program_line':  prog_line,
+                            'program_state': prog_state,
+                            'is_step':       prog_is_step,
+                            'step_index':    step_index if step_index >= 0 else None,
+                        }) + '\n')
+                        samples_written += 1
+                        # Yield to the loop; drift-corrected next-tick.
+                        next_t = t_start + samples_written * period
+                        sleep_s = max(0.0, next_t - time.time())
+                        if sleep_s > 0:
+                            await asyncio.sleep(sleep_s)
+                        else:
+                            await asyncio.sleep(0)
+                    f.write(json.dumps({
+                        'meta':      'close',
+                        'ts':        time.time(),
+                        'samples':   samples_written,
+                        'duration_actual_s': round(time.time() - t_start, 3),
+                    }) + '\n')
+            except Exception as e:
+                print(f'[joint_log] sampler failed: {type(e).__name__}: {e}',
+                      flush=True)
+
+        asyncio.create_task(_sampler())
+        return {
+            'ok': True,
+            'path': fpath,
+            'duration_s': duration_s,
+            'rate_hz': rate_hz,
+            'label': label_safe,
+            'note': ('Sampling started. Poll file mtime or wait '
+                     '`duration_s` seconds, then run '
+                     'scripts/joint_log_excursions.py <path>.'),
+        }
+
+    @app.get("/api/estun/joint_log/list")
+    async def api_estun_joint_log_list():
+        try:
+            entries = []
+            if os.path.isdir(_JOINT_LOG_DIR):
+                for fn in sorted(os.listdir(_JOINT_LOG_DIR), reverse=True):
+                    if not fn.endswith('.jsonl'):
+                        continue
+                    p = os.path.join(_JOINT_LOG_DIR, fn)
+                    try:
+                        st = os.stat(p)
+                        entries.append({
+                            'name': fn, 'path': p,
+                            'size': st.st_size, 'mtime': st.st_mtime,
+                        })
+                    except Exception:
+                        continue
+            return {'ok': True, 'logs': entries}
+        except Exception as e:
+            return JSONResponse({'ok': False, 'error': str(e)},
+                                status_code=500)
+
+    # ──────────────────────────────────────────────────────────────
+    # cam0 → base_link EXTRINSIC CALIBRATION.
+    #
+    # Touch-point correspondence using a printed AprilTag as the
+    # camera-side ground truth. Workflow (see cam0_calibration.py
+    # for the math + persistence contract):
+    #
+    #   1. Operator places the tag anywhere in cam0's view.
+    #   2. Jog the TCP down until the cup touches the tag centre.
+    #   3. POST /api/calib/cam0/capture — records the pair.
+    #   4. Move the tag, jog again, capture again. 4-6 spread.
+    #   5. POST /api/calib/cam0/solve — Umeyama fit + RMS.
+    #   6. RMS < 3 mm → POST /api/calib/cam0/save persists the
+    #      transform to /opt/cobot/calibration/cam0_extrinsic.yaml
+    #      AND publishes a fresh static TF (cam0_color_optical_frame
+    #      → base_link) so consumers see it without restarting
+    #      tf_broadcaster.
+    # ──────────────────────────────────────────────────────────────
+    try:
+        from . import cam0_calibration as _cam0_calib_mod
+    except ImportError:
+        import cam0_calibration as _cam0_calib_mod   # type: ignore
+
+    _calib_session = _cam0_calib_mod.CalibrationSession()
+    _calib_lock = threading.Lock()
+
+    # Import guard: the AprilTag detector may not be installed on
+    # every dev image. Endpoints return a helpful 503 explaining the
+    # missing package rather than blowing up on import at request
+    # time. The rest of the dashboard stays up.
+    try:
+        from dt_apriltags import Detector as _ATDetector
+        _at_detector = _ATDetector(
+            families='tag36h11', nthreads=2,
+            quad_decimate=1.0, refine_edges=True)
+    except Exception as _e:
+        _at_detector = None
+        _at_import_err = str(_e)
+    else:
+        _at_import_err = None
+
+    def _current_tcp_base_m():
+        """Snapshot the arm's TCP position in base_link frame (metres).
+        Returns None when the driver hasn't published yet. Uses
+        STATE['tcp_pose'] which the /estun/status handler keeps
+        current — that field is documented as meters (see the
+        _on_estun_status handler)."""
+        with _state_lock:
+            tcp = STATE.get('tcp_pose')
+        if not (isinstance(tcp, list) and len(tcp) >= 3):
+            return None
+        try:
+            return [float(tcp[0]), float(tcp[1]), float(tcp[2])]
+        except (TypeError, ValueError):
+            return None
+
+    def _detect_apriltag_center():
+        """Detect the largest tag36h11 in the current cam0 raw frame,
+        return (cam_frame_translation_m, corners_px, tag_id). None
+        if no tag, no frame, or detector unavailable."""
+        if _at_detector is None:
+            return None
+        with _cam0_raw_lock:
+            rgb   = _cam0_raw.get('rgb')
+            intr  = dict(_cam0_intr)
+            w, h  = _cam0_raw.get('width'), _cam0_raw.get('height')
+            ts    = _cam0_raw.get('ts')
+        if rgb is None or intr.get('fx') is None:
+            return None
+        # dt_apriltags wants uint8 grayscale.
+        if _np is None:
+            return None
+        rgb_arr = _np.asarray(rgb, dtype=_np.uint8)
+        gray = (0.299 * rgb_arr[:, :, 0]
+                + 0.587 * rgb_arr[:, :, 1]
+                + 0.114 * rgb_arr[:, :, 2]).astype(_np.uint8)
+        # Assume the operator's printed sheet is 100 mm edge — matches
+        # the existing calibrate_extrinsics.py default. Bad tag_size
+        # scales the translation linearly; if the operator prints at
+        # a different size the YAML metadata records what was assumed.
+        dets = _at_detector.detect(
+            gray, estimate_tag_pose=True,
+            camera_params=(intr['fx'], intr['fy'], intr['cx'], intr['cy']),
+            tag_size=float(os.environ.get('CALIB_TAG_SIZE_M', '0.10')))
+        if not dets:
+            return None
+        # Prefer the largest tag (by corner-bbox area) if the operator
+        # somehow has multiple in view; single-tag flow is the norm.
+        def _area(d):
+            c = _np.asarray(d.corners)
+            return (c[:, 0].max() - c[:, 0].min()) * (c[:, 1].max() - c[:, 1].min())
+        d = max(dets, key=_area)
+        cam_t = _np.asarray(d.pose_t, dtype=_np.float64).reshape(3).tolist()
+        corners = _np.asarray(d.corners, dtype=_np.float64).tolist()
+        return {
+            'cam_t':    cam_t,
+            'corners':  corners,
+            'tag_id':   int(d.tag_id),
+            'frame_ts': ts,
+        }
+
+    @app.get("/api/calib/cam0/status")
+    async def api_calib_cam0_status():
+        with _calib_lock:
+            sess = _calib_session.to_dict()
+        # Also surface some liveness for the UI.
+        with _cam0_raw_lock:
+            have_frame = _cam0_raw.get('rgb') is not None
+            have_intr  = _cam0_intr.get('fx') is not None
+            frame_age  = round(time.time() - _cam0_raw.get('ts', 0.0), 2) \
+                         if _cam0_raw.get('ts') else None
+        saved = _cam0_calib_mod.load()
+        return {
+            'ok':           True,
+            'session':      sess,
+            'have_frame':   bool(have_frame),
+            'have_intr':    bool(have_intr),
+            'frame_age_s':  frame_age,
+            'detector_ok':  _at_detector is not None,
+            'detector_err': _at_import_err,
+            'accept_rms_mm': _cam0_calib_mod.RMS_ACCEPT_MM,
+            'min_points':    _cam0_calib_mod.MIN_POINTS,
+            'persisted':     saved,
+        }
+
+    @app.post("/api/calib/cam0/start")
+    async def api_calib_cam0_start():
+        with _calib_lock:
+            _calib_session.clear()
+        return {'ok': True, 'session': _calib_session.to_dict()}
+
+    @app.get("/api/calib/cam0/tag_preview")
+    async def api_calib_cam0_tag_preview():
+        """UI-facing tag detection state — no capture side-effect.
+        Called in a slow poll (~2 Hz) so the operator sees whether
+        the tag is currently detected before pressing Capture."""
+        det = _detect_apriltag_center()
+        if det is None:
+            return {'ok': True, 'detected': False}
+        return {'ok': True, 'detected': True, **det}
+
+    @app.post("/api/calib/cam0/capture")
+    async def api_calib_cam0_capture(request: Request):
+        if _at_detector is None:
+            return JSONResponse({
+                'ok': False,
+                'error': 'AprilTag detector unavailable — dt_apriltags '
+                         'not installed. pip3 install dt-apriltags on '
+                         'the dashboard host.'},
+                status_code=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        label = str(body.get('label') or '')
+        det = _detect_apriltag_center()
+        if det is None:
+            return JSONResponse({
+                'ok': False,
+                'error': 'no AprilTag detected in cam0. Ensure the '
+                         'tag is fully in view and well-lit.'},
+                status_code=400)
+        tcp = _current_tcp_base_m()
+        if tcp is None:
+            return JSONResponse({
+                'ok': False,
+                'error': 'no TCP pose from the arm. Enable the driver '
+                         'and confirm /estun/status is publishing.'},
+                status_code=503)
+        with _calib_lock:
+            p = _calib_session.add_point(
+                tcp_base=tcp, cam_pt=det['cam_t'],
+                label=label or time.strftime('%H:%M:%S'))
+        return {'ok': True,
+                'point': _cam0_calib_mod.asdict(p),
+                'tag': {'id': det['tag_id'], 'corners': det['corners']},
+                'session_count': len(_calib_session.points)}
+
+    @app.get("/api/calib/cam0/points")
+    async def api_calib_cam0_points():
+        with _calib_lock:
+            return {'ok': True, 'session': _calib_session.to_dict()}
+
+    @app.delete("/api/calib/cam0/point/{idx}")
+    async def api_calib_cam0_point_delete(idx: int):
+        with _calib_lock:
+            ok = _calib_session.remove_point(int(idx))
+        if not ok:
+            return JSONResponse({'ok': False, 'error': 'point not found'},
+                                status_code=404)
+        return {'ok': True, 'session': _calib_session.to_dict()}
+
+    @app.post("/api/calib/cam0/solve")
+    async def api_calib_cam0_solve():
+        with _calib_lock:
+            try:
+                res = _cam0_calib_mod.solve(_calib_session)
+            except ValueError as e:
+                return JSONResponse({'ok': False, 'error': str(e)},
+                                    status_code=400)
+            sess = _calib_session.to_dict()
+        return {'ok': True,
+                'result':        _cam0_calib_mod.asdict(res),
+                'session':       sess,
+                'meets_accept':  res.rms_mm < _cam0_calib_mod.RMS_ACCEPT_MM,
+                'accept_rms_mm': _cam0_calib_mod.RMS_ACCEPT_MM}
+
+    @app.post("/api/calib/cam0/save")
+    async def api_calib_cam0_save():
+        with _calib_lock:
+            try:
+                path = _cam0_calib_mod.save(_calib_session)
+            except ValueError as e:
+                return JSONResponse({'ok': False, 'error': str(e)},
+                                    status_code=400)
+        # Publish the fresh TF now so downstream consumers pick it up
+        # without needing to restart tf_broadcaster (the historical
+        # startup-only reader). Non-fatal on failure — the file is
+        # already saved and the next tf_broadcaster start will use it.
+        try:
+            if _ros_node is not None:
+                _ros_node._broadcast_cam0_extrinsic()
+        except Exception as e:
+            print(f'[calib] TF broadcast failed after save: {e}', flush=True)
+        return {'ok': True, 'path': path,
+                'session': _calib_session.to_dict()}
+
+    # ──────────────────────────────────────────────────────────────
+    # Always-on joint recorder — /api/runs endpoints.
+    #
+    # Every program execution the dashboard sees on /joint_states +
+    # ProjectState transitions gets its own run manifest under
+    # /opt/cobot/joint_history/manifests/. GET /api/runs lists them
+    # newest-first. /api/runs/{id}/joints stitches the sample
+    # segments back together for download; /api/runs/{id}/excursions
+    # runs the same analysis the one-shot CLI uses, over the run's
+    # samples. No pre-arming — investigate any past run after the
+    # fact.
+    # ──────────────────────────────────────────────────────────────
+    @app.get("/api/runs")
+    async def api_runs_list():
+        try:
+            manifests = _joint_recorder_mod._list_manifests_sorted()
+        except Exception as e:
+            return JSONResponse({'ok': False, 'error': str(e)},
+                                status_code=500)
+        rec_stats = None
+        if _joint_recorder is not None:
+            try:
+                rec_stats = _joint_recorder.stats()
+            except Exception:
+                rec_stats = None
+        return {'ok': True,
+                'runs':      manifests,
+                'recorder':  rec_stats}
+
+    def _run_segment_paths(run_id):
+        """Resolve a run's manifest → list of absolute paths on disk.
+        Filters entries whose file has been pruned (retention may
+        have swept an old run's early segments while its manifest
+        still records them). Returns (manifest, [paths])."""
+        m = _joint_recorder_mod._load_manifest(run_id)
+        if m is None:
+            return None, None
+        seg_dir = _joint_recorder_mod._segment_dir()
+        paths = []
+        for name in (m.get('segments') or []):
+            p = os.path.join(seg_dir, name)
+            if os.path.isfile(p):
+                paths.append(p)
+        return m, paths
+
+    @app.get("/api/runs/{run_id}/joints")
+    async def api_run_joints(run_id: str, format: str = 'json'):
+        """Return the raw samples from a run. `format=jsonl` streams
+        a decompressed .jsonl download; `format=json` (default)
+        returns a JSON object with meta + samples for the UI."""
+        # Path validation: run_ids come from _start_run's slugifier
+        # so they're already [a-zA-Z0-9_-]. Belt-and-braces here.
+        import re as _re
+        if not _re.match(r'^[A-Za-z0-9_.\-]+$', run_id or ''):
+            return JSONResponse({'ok': False, 'error': 'bad run_id'},
+                                status_code=400)
+        m, paths = _run_segment_paths(run_id)
+        if m is None:
+            return JSONResponse({'ok': False, 'error': 'run not found'},
+                                status_code=404)
+        samples = _joint_excursions_mod.load_samples_from_gzip_segments(paths)
+        # Trim to the run's actual time window — segments may include
+        # samples from adjacent idle time.
+        t0 = m.get('t_start') or 0.0
+        t1 = m.get('t_end')
+        if t1 is not None:
+            samples = [s for s in samples
+                       if s.get('t') is not None
+                       and t0 - 0.5 <= s['t'] <= t1 + 0.5]
+        # Convert absolute timestamps to run-relative for readability
+        # + JSONL output. Keep absolute in a companion field so joint-
+        # log_excursions.py stays a drop-in analyzer.
+        for s in samples:
+            if s.get('t') is not None:
+                s['t_run'] = round(s['t'] - t0, 3)
+        if format == 'jsonl':
+            body = ''.join(json.dumps(s) + '\n' for s in samples)
+            return PlainTextResponse(
+                body,
+                media_type='application/jsonl',
+                headers={'Content-Disposition':
+                         f'attachment; filename="{run_id}.jsonl"'})
+        return {'ok': True,
+                'run':     m,
+                'samples': samples,
+                'count':   len(samples)}
+
+    @app.get("/api/runs/{run_id}/excursions")
+    async def api_run_excursions(run_id: str,
+                                 threshold_deg: float = 10.0):
+        """Per-step per-joint excursion table for a completed run.
+        Uses the same analyzer the one-shot CLI does so the numbers
+        agree byte-for-byte with a parallel /api/estun/joint_log
+        capture over the same window."""
+        import re as _re
+        if not _re.match(r'^[A-Za-z0-9_.\-]+$', run_id or ''):
+            return JSONResponse({'ok': False, 'error': 'bad run_id'},
+                                status_code=400)
+        m, paths = _run_segment_paths(run_id)
+        if m is None:
+            return JSONResponse({'ok': False, 'error': 'run not found'},
+                                status_code=404)
+        samples = _joint_excursions_mod.load_samples_from_gzip_segments(paths)
+        t0 = m.get('t_start') or 0.0
+        t1 = m.get('t_end')
+        if t1 is not None:
+            samples = [s for s in samples
+                       if s.get('t') is not None
+                       and t0 - 0.5 <= s['t'] <= t1 + 0.5]
+        # infer step_index from consecutive program_line changes so
+        # the analyzer's step-grouping works even if the manifest's
+        # segments don't carry step-index metadata (the on-disk
+        # sample schema is program_line only — step_index is a
+        # derived label the excursion table uses).
+        prev_line = None
+        step_idx = -1
+        for s in samples:
+            ln = s.get('program_line')
+            if ln is not None and ln != prev_line:
+                step_idx += 1
+                prev_line = ln
+            s['step_index'] = step_idx if step_idx >= 0 else None
+        analysis = _joint_excursions_mod.analyze(
+            samples, threshold_deg=float(threshold_deg))
+        # Per-step TCP path deviations. Runs FK over each step's samples
+        # and folds max line-deviation (mm) and max orientation-
+        # deviation (deg) into the matching row so the summary table can
+        # flag a step for PATH wander even when the joint swing is tame.
+        try:
+            _attach_tcp_deviations(samples, analysis)
+        except Exception as e:                                     # noqa: BLE001
+            analysis['tcp_dev_error'] = str(e)
+        return {'ok': True, 'run': m, 'analysis': analysis}
+
+    def _attach_tcp_deviations(samples, analysis):
+        """Mutate analysis['rows'] to add tcp_line_dev_max_mm and
+        tcp_orient_dev_max_deg per step (best-effort; missing URDF or a
+        one-sample step leaves the field null)."""
+        import numpy as np
+        if not _trajectory_fk_mod.urdf_available():
+            return
+        rows = analysis.get('rows') or []
+        if not rows:
+            return
+        # Group samples by the same key the analyzer used.
+        key = analysis.get('grouped_by') or 'step_index'
+        buckets = {}
+        for s in samples:
+            k = s.get(key)
+            if k is None:
+                k = '(no-line)'
+            buckets.setdefault(k, []).append(s)
+        chain = _trajectory_fk_mod.get_chain()
+        for row in rows:
+            grp = buckets.get(row.get('step_key')) or []
+            q = np.asarray(
+                [g.get('joints_deg') for g in grp if len(g.get('joints_deg') or []) == 6],
+                dtype=float)
+            if q.shape[0] < 2:
+                row['tcp_line_dev_max_mm']    = None
+                row['tcp_orient_dev_max_deg'] = None
+                continue
+            p, rpy = chain.fk_batch(np.deg2rad(q))
+            _, ld_max, _ = _trajectory_fk_mod.line_deviation(p)
+            _, od_max, _ = _trajectory_fk_mod.orientation_deviation(rpy)
+            row['tcp_line_dev_max_mm']    = round(ld_max * 1000.0, 2)
+            row['tcp_orient_dev_max_deg'] = round(od_max, 2)
+
+    @app.get("/api/runs/{run_id}/trajectory")
+    async def api_run_trajectory(run_id: str, step: str | None = None):
+        """Per-step joint timeseries + FK'd TCP path for a completed run.
+
+        `step` (optional) filters to a single step_index; without it the
+        response includes the full timeseries and a `steps` catalog the
+        UI uses to populate a step selector."""
+        import numpy as np
+        import re as _re
+        if not _re.match(r'^[A-Za-z0-9_.\-]+$', run_id or ''):
+            return JSONResponse({'ok': False, 'error': 'bad run_id'},
+                                status_code=400)
+        m, paths = _run_segment_paths(run_id)
+        if m is None:
+            return JSONResponse({'ok': False, 'error': 'run not found'},
+                                status_code=404)
+        samples = _joint_excursions_mod.load_samples_from_gzip_segments(paths)
+        t0 = m.get('t_start') or 0.0
+        t1 = m.get('t_end')
+        if t1 is not None:
+            samples = [s for s in samples
+                       if s.get('t') is not None
+                       and t0 - 0.5 <= s['t'] <= t1 + 0.5]
+        # Derive step_index the same way the excursions endpoint does.
+        prev_line = None
+        step_idx = -1
+        for s in samples:
+            ln = s.get('program_line')
+            if ln is not None and ln != prev_line:
+                step_idx += 1
+                prev_line = ln
+            s['step_index'] = step_idx if step_idx >= 0 else None
+            if s.get('t') is not None:
+                s['t_run'] = round(s['t'] - t0, 3)
+        # Catalog every step (index + program_line + sample count).
+        steps_catalog = []
+        seen = {}
+        for s in samples:
+            k = s.get('step_index')
+            if k is None:
+                continue
+            if k not in seen:
+                seen[k] = {
+                    'step_index':   k,
+                    'program_line': s.get('program_line'),
+                    'samples':      0,
+                    't_start':      s.get('t_run'),
+                    't_end':        s.get('t_run'),
+                }
+                steps_catalog.append(seen[k])
+            e = seen[k]
+            e['samples']  += 1
+            e['t_end']     = s.get('t_run')
+        if not _trajectory_fk_mod.urdf_available():
+            return JSONResponse({
+                'ok': False,
+                'error': f'URDF not available at {_trajectory_fk_mod.DEFAULT_URDF}',
+            }, status_code=503)
+        # Filter to the requested step, or use everything.
+        step_index = None
+        if step is not None and step != '':
+            try:
+                step_index = int(step)
+            except ValueError:
+                return JSONResponse({'ok': False, 'error': 'bad step'},
+                                    status_code=400)
+            filt = [s for s in samples if s.get('step_index') == step_index]
+        else:
+            filt = list(samples)
+        filt = [s for s in filt if len(s.get('joints_deg') or []) == 6]
+        if not filt:
+            return {'ok': True,
+                    'run':   m,
+                    'step':  step_index,
+                    'steps': steps_catalog,
+                    'samples': 0,
+                    'joints':  {'t': [], 'q_deg': []},
+                    'tcp':     {'t': [], 'xyz': [], 'rpy_deg': []},
+                    'line_deviation':        None,
+                    'orientation_deviation': None}
+        q_deg = np.asarray([s['joints_deg'] for s in filt], dtype=float)
+        t_run = np.asarray([s.get('t_run', 0.0) for s in filt], dtype=float)
+        chain = _trajectory_fk_mod.get_chain()
+        xyz, rpy = chain.fk_batch(np.deg2rad(q_deg))
+        _, ld_max, ld_rms = _trajectory_fk_mod.line_deviation(xyz)
+        _, od_max, od_rms = _trajectory_fk_mod.orientation_deviation(rpy)
+        # Downsample the timeseries for wire economy (25 Hz over a full
+        # run can be a few thousand samples). Keep the deviation
+        # statistics computed on the full-rate signal.
+        MAX_POINTS = 800
+        if q_deg.shape[0] > MAX_POINTS:
+            stride = int(np.ceil(q_deg.shape[0] / MAX_POINTS))
+            sel = np.arange(0, q_deg.shape[0], stride)
+        else:
+            sel = np.arange(q_deg.shape[0])
+        return {
+            'ok':    True,
+            'run':   m,
+            'step':  step_index,
+            'steps': steps_catalog,
+            'samples': int(q_deg.shape[0]),
+            'joints': {
+                't':     [round(float(x), 3) for x in t_run[sel]],
+                'q_deg': [[round(float(v), 3) for v in q_deg[i]] for i in sel],
+            },
+            'tcp': {
+                't':       [round(float(x), 3) for x in t_run[sel]],
+                'xyz':     [[round(float(v), 5) for v in xyz[i]] for i in sel],
+                'rpy_deg': [[round(float(v), 3) for v in np.degrees(rpy[i])] for i in sel],
+            },
+            'line_deviation': {
+                'max_mm': round(ld_max * 1000.0, 3),
+                'rms_mm': round(ld_rms * 1000.0, 3),
+            },
+            'orientation_deviation': {
+                'max_deg': round(od_max, 3),
+                'rms_deg': round(od_rms, 3),
+            },
+            'urdf': _trajectory_fk_mod.DEFAULT_URDF,
+        }
+
     @app.post("/api/program/run")
     async def api_program_run(request: Request):
         """Dispatch run/pause/resume/stop/home to the program executor.
         Body: {action, program_id?}. Without program_id, the executor
         resumes / re-runs whatever it currently has loaded.
-        action='load' is a frontend-facing 'set active program' verb —
-        the executor doesn't currently have a load-only path, so we
-        forward the message (executor ignores unknown actions) and let
-        the Monitor UI take care of displaying the program. The next
-        Run will pick it up via the normal load+run path."""
+
+        action='load' is RETIRED (2026-08-04). It was a frontend-facing
+        'set active program' verb the executor silently ignored — it
+        never reached the controller, and became the fork that let a
+        load appear to succeed while the resident program was
+        something else entirely. Program-selection state may now only
+        be written by /api/estun/program/run (with push_only:true for
+        a load, or without for a full run). Requests with
+        action='load' get 410 Gone with a pointer at the replacement.
+        """
         try:
             body = await request.json()
         except Exception:
             body = {}
         action = str(body.get('action', 'run'))
         prog_id = body.get('program_id')
-        if action not in ('run', 'pause', 'resume', 'stop', 'home', 'load'):
+        if action == 'load':
+            return JSONResponse({
+                'ok': False,
+                'error': ("action='load' on /api/program/run is retired. "
+                          "Use POST /api/estun/program/run with "
+                          "push_only:true instead — that path actually "
+                          "pushes the program to the controller so the "
+                          "resident becomes current."),
+                'outcome': {'kind': 'load_verb_retired',
+                            'replacement':
+                                '/api/estun/program/run push_only=true'},
+            }, status_code=410)
+        if action not in ('run', 'pause', 'resume', 'stop', 'home'):
             return JSONResponse({'error': f'unknown action {action!r}'}, status_code=400)
         if _ros_node is not None:
             try:
@@ -3244,23 +9163,453 @@ if FASTAPI_AVAILABLE:
         with open(_FOLDERS_FILE, 'w') as f:
             json.dump(data, f, indent=2)
 
+    @app.get("/api/programs/revs")
+    async def api_programs_revs():
+        """Return {program_id: rev} for every known program — cheap
+        endpoint clients hit on WS (re)connect + visibilitychange
+        resume to detect any program whose held rev is behind
+        server-truth. Complements the /ws/state broadcast's
+        program_revs field for reconciles that can't wait for the
+        next state tick.
+
+        Any program known on disk but not yet in _prog_revs is
+        seeded from its file rev here so a fresh restart doesn't
+        report None for programs that haven't been touched yet
+        this process."""
+        _seed_prog_revs_from_disk()          # idempotent
+        return {"revs": _snapshot_prog_revs()}
+
+    # ── /api/jog_stop_log (2026-07-31 jog-stop instrumentation) ──
+    # Client-side jog-stop cause ring. Every tab's HoldButton pushes
+    # here via fire-and-forget POST when a jog stops. Bench-script
+    # GETs the aggregate to compute the cause distribution across
+    # devices without having to inspect each browser's devtools.
+    #
+    # Ring capped at 1024 entries. Non-persistent (dies with the
+    # dashboard process). Small, cheap, and DELETE clears it for a
+    # fresh bench-test window.
+    _jog_stop_log_ring: list = []
+    _JOG_STOP_LOG_MAX = 1024
+
+    # ── /api/deploy_status (2026-07-31 auto-deploy directive) ─────
+    # Reads /opt/cobot/deploy_log.jsonl and returns a compact view:
+    # the latest entry + whether it's still "waiting" or "building",
+    # plus the previous "ok" for age computation.
+    #
+    # The footer banner reads this to render one of:
+    #   green    "current (hash, age)"
+    # ── Unified event log (2026-08-05, fork registry: event_log) ──
+    # Every error/warning/info the platform surfaces lands as one
+    # JSONL line in /opt/cobot/event_log/events_YYYYMMDD.jsonl.
+    # These endpoints expose the log to the operator:
+    #   POST /api/event_log/append   → frontend toast capture
+    #   GET  /api/event_log/list     → list available dates
+    #   GET  /api/event_log/day/{d}  → JSON array (interface page)
+    #   GET  /api/event_log/download/{d}.jsonl  → raw JSONL
+    #   GET  /api/event_log/download/{d}.csv    → human CSV
+    #   GET  /api/event_log/download/last7.zip  → 7-day bundle
+    #
+    # Dismissing a toast NEVER deletes the record — the JSONL is
+    # append-only; the interface page reads it as-is.
+
+    # ── Per-device UI context (refresh persistence, 2026-08-05) ──
+    #   GET  /api/ui_context/{device_id}  → {ok, context}
+    #   POST /api/ui_context/{device_id}  body: {open_program_id?, active_tab?}
+    #                                       → {ok, context}
+    # Fork registry: page_context_persistence. No client-side
+    # localStorage for these fields — the Jetson is the source of
+    # truth for which program is open on each device.
+    @app.get("/api/ui_context/{device_id}")
+    async def api_ui_context_get(device_id: str):
+        ctx = _ui_context.get(device_id) or {}
+        return {'ok': True, 'context': ctx}
+
+    @app.post("/api/ui_context/{device_id}")
+    async def api_ui_context_set(device_id: str, request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        result = _ui_context.set(device_id, body if isinstance(body, dict) else {})
+        if result is None:
+            return JSONResponse({'ok': False,
+                                 'error': 'bad_device_id_or_payload'},
+                                status_code=400)
+        return {'ok': True, 'context': result}
+
+    # ── Disk status (footer widget + operator diagnostics) ─────
+    # 2026-08-05: single source of truth for "how much space is
+    # free" + "how much each capped dir is using". Fork registry:
+    # disk_watchdog.
+    @app.get("/api/disk_status")
+    async def api_disk_status():
+        return _disk_watchdog.status()
+
+    @app.post("/api/event_log/append")
+    async def api_event_log_append(request: Request):
+        """Append a frontend-originated event to the daily JSONL.
+        Body: {severity, source, code, operator_message,
+               technical_detail, context}. All fields optional
+        except severity + code + operator_message.
+        Non-frontend sources (driver, watcher, validator) route
+        through _event_log.emit directly inside the dashboard
+        process — this endpoint is the browser's on-ramp."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        rec = _event_log.emit(
+            severity=str(body.get('severity') or 'info'),
+            source=str(body.get('source') or 'dashboard'),
+            code=str(body.get('code') or ''),
+            operator_message=str(body.get('operator_message') or ''),
+            technical_detail=str(body.get('technical_detail') or ''),
+            context=body.get('context') if isinstance(body.get('context'), dict) else {},
+        )
+        return {'ok': bool(rec), 'record': rec}
+
+    @app.get("/api/event_log/list")
+    async def api_event_log_list():
+        """Return the list of dates available on disk, newest first.
+        Used by the interface page's date picker."""
+        return {'days': _event_log.list_days()}
+
+    @app.get("/api/event_log/day/{date_str}")
+    async def api_event_log_day(date_str: str, limit: int = 2000):
+        """Return one day's records as a JSON array (oldest first).
+        `limit` caps the tail — default 2000, cap 10000 — enough
+        for a busy shift day without exhausting the browser."""
+        if not (date_str.isdigit() and len(date_str) == 8):
+            return JSONResponse({'error': 'date must be YYYYMMDD'},
+                                status_code=400)
+        limit = max(1, min(int(limit), 10000))
+        return {'date': date_str,
+                'records': _event_log.read_day(date_str, limit=limit)}
+
+    @app.get("/api/event_log/download/{filename}")
+    async def api_event_log_download(filename: str):
+        """Downloads: `<YYYYMMDD>.jsonl`, `<YYYYMMDD>.csv`, or
+        `last7.zip`. Anything else → 404."""
+        if filename == 'last7.zip':
+            import io as _io
+            import zipfile as _zf
+            days = _event_log.list_days()[:7]
+            buf = _io.BytesIO()
+            with _zf.ZipFile(buf, 'w', compression=_zf.ZIP_DEFLATED) as zf:
+                for d in days:
+                    path = _event_log.path_for_date(d)
+                    try:
+                        with open(path, 'rb') as fh:
+                            zf.writestr(f'events_{d}.jsonl', fh.read())
+                    except FileNotFoundError:
+                        continue
+            buf.seek(0)
+            filename_out = f'cobot_events_last7_{time.strftime("%Y%m%d")}.zip'
+            return StreamingResponse(
+                buf, media_type='application/zip',
+                headers={'Content-Disposition':
+                         f'attachment; filename="{filename_out}"'})
+        # <YYYYMMDD>.jsonl | .csv
+        if not (len(filename) >= 13 and filename[:8].isdigit()
+                and filename[8] == '.'):
+            return JSONResponse({'error': 'bad filename'}, status_code=404)
+        date_str = filename[:8]
+        ext      = filename[9:]
+        path = _event_log.path_for_date(date_str)
+        if not os.path.exists(path):
+            return JSONResponse({'error': f'no log for {date_str}'},
+                                status_code=404)
+        if ext == 'jsonl':
+            return FileResponse(
+                path, media_type='application/x-ndjson',
+                filename=f'events_{date_str}.jsonl')
+        if ext == 'csv':
+            # Render CSV in-memory from the JSONL. Column order
+            # matches the operator's forensic priority: time first,
+            # severity, source, code, message. technical + context
+            # last (widest). Values are CSV-escaped by the csv
+            # module — no manual quoting.
+            import csv as _csv
+            import io as _io
+            recs = _event_log.read_day(date_str)
+            buf = _io.StringIO()
+            w = _csv.writer(buf)
+            w.writerow(['ts_utc', 'ts_local', 'severity', 'source',
+                        'code', 'operator_message',
+                        'technical_detail', 'context_json'])
+            for r in recs:
+                w.writerow([
+                    r.get('ts_utc', ''), r.get('ts_local', ''),
+                    r.get('severity', ''), r.get('source', ''),
+                    r.get('code', ''), r.get('operator_message', ''),
+                    r.get('technical_detail', ''),
+                    json.dumps(r.get('context') or {},
+                               ensure_ascii=False),
+                ])
+            return StreamingResponse(
+                iter([buf.getvalue()]),
+                media_type='text/csv',
+                headers={'Content-Disposition':
+                         f'attachment; filename="events_{date_str}.csv"'})
+        return JSONResponse({'error': 'unsupported extension'},
+                            status_code=404)
+
+    #   spinning "deploying…"
+    #   amber    "deploy waiting for idle"
+    #   red      "DEPLOY FAILED: <step>"
+    @app.get("/api/deploy_status")
+    async def api_deploy_status():
+        path = "/opt/cobot/deploy_log.jsonl"
+        try:
+            with open(path) as f:
+                # Tail the last ~64 entries (deploy log grows slowly;
+                # keep the read cheap without loading the whole file).
+                lines = f.readlines()[-64:]
+        except FileNotFoundError:
+            return {"state": "unknown", "detail": "no deploy_log.jsonl yet"}
+        except Exception as e:
+            return {"state": "unknown", "detail": f"read failed: {e}"}
+        entries = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        if not entries:
+            return {"state": "unknown", "detail": "empty log"}
+        # Determine the *current* state:
+        #   * if the latest entry is `ok` OR the process is dormant
+        #     (no `start`/`waiting`/`building` more recent than the
+        #     last `ok`/`fail`) → state = 'current' with the ok hash
+        #   * if latest is `fail` → state = 'failed'
+        #   * if latest is `waiting` → state = 'waiting'
+        #   * if latest is `building` OR `start` → state = 'deploying'
+        latest = entries[-1]
+        phase = latest.get("phase")
+        # 2026-08-06 (silent-frontend-rebuild-skip class, refined
+        # per operator directive to a WARNING rather than FAILED):
+        # phase=frontend_stale maps to a new state='stale' which the
+        # DeployStatusBanner renders as an amber warning. Build
+        # succeeded and the disk is healthy — the served asset just
+        # didn't advance for a commit that touched frontend/src.
+        # Distinct from state='failed' (deploy actually broke).
+        state = {
+            "ok":              "current",
+            "fail":            "failed",
+            "frontend_stale":  "stale",
+            "waiting":         "waiting",
+            "building":        "deploying",
+            "start":           "deploying",
+        }.get(phase, "unknown")
+        # Find the most recent successful deploy for the "current
+        # served" hash + age. Even when phase='waiting' or 'failed'
+        # the served bundle still corresponds to the LAST ok entry.
+        last_ok = None
+        for e in reversed(entries):
+            if e.get("phase") == "ok":
+                last_ok = e
+                break
+        # ── Three-layer provenance verdict (2026-08-28) ──────────
+        # Green ONLY when phase=ok AND both provenance layers match
+        # the deploy_log's sha. Any single failure surfaces as red
+        # with a NAMED failing layer, so the banner never renders
+        # green while any layer is drifting.
+        provenance = {
+            "deploy_phase":  phase,
+            "deploy_sha":    latest.get("sha") or "unknown",
+            "backend_sha":   _BACKEND_GIT_SHA,
+            "frontend_sha":  _read_frontend_git_sha(),
+        }
+        def _bare(s):
+            return (s or "").split("-dirty")[0]
+        expected = _bare(provenance["deploy_sha"])
+        backend_ok  = expected != "unknown" \
+                      and _bare(provenance["backend_sha"])  == expected
+        # 2026-08-28 (StaleGuard-lockout incident): frontend_sha is
+        # reported for transparency but NOT gated in the verdict.
+        # The sidecar records "which SHA vite last built the bundle
+        # against"; on docs-only deploys where vite legitimately
+        # skips, that SHA trails HEAD. Gating on frontend_ok made
+        # the banner red for every docs deploy AND, in concert with
+        # the sidecar-advance-on-skip bug, briefly locked every open
+        # tab out. Client-side, StaleGuard is the correct staleness
+        # signal for the operator's tab: it compares the bundle's
+        # baked __GIT_SHA__ to the WS-pushed frontend_sha — same
+        # bundle, no mismatch, no overlay. Server-side, the verdict
+        # gates on backend_ok + deploy_ok only.
+        frontend_ok = expected != "unknown" \
+                      and _bare(provenance["frontend_sha"]) == expected
+        deploy_ok   = state == "current"
+        provenance["backend_ok"]  = backend_ok
+        provenance["frontend_ok"] = frontend_ok   # advisory only
+        provenance["deploy_ok"]   = deploy_ok
+        failing_layers = []
+        if not deploy_ok:
+            failing_layers.append("deploy")
+        if not backend_ok:
+            failing_layers.append("backend")
+        provenance["failing_layers"] = failing_layers
+        # verdict: 'green' when ALL layers ok AND state=current;
+        # 'red' with named layers otherwise. 'stale', 'waiting',
+        # and 'deploying' pass through as-is — those are in-progress
+        # states, not stale-class failures.
+        if state == "current" and not failing_layers:
+            verdict = "green"
+        elif state in ("waiting", "deploying", "stale"):
+            verdict = state
+        else:
+            verdict = "red"
+        provenance["verdict"] = verdict
+
+        return {
+            "state":  state,
+            "latest": latest,
+            "last_ok": last_ok,
+            "provenance": provenance,
+            # Small history slice for the debug panel if the operator
+            # wants to inspect the trail (kept small so this endpoint
+            # stays cheap).
+            "history_tail": entries[-8:],
+        }
+
+    @app.post("/api/jog_stop_log")
+    async def api_jog_stop_log_push(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        entry = {
+            "srv_ts": time.time(),
+            "cause":  str(body.get("cause") or "unknown"),
+            "client_ts": body.get("ts"),
+            "extras": {k: v for k, v in body.items()
+                       if k not in ("ts", "cause")},
+        }
+        _jog_stop_log_ring.append(entry)
+        if len(_jog_stop_log_ring) > _JOG_STOP_LOG_MAX:
+            del _jog_stop_log_ring[:len(_jog_stop_log_ring) - _JOG_STOP_LOG_MAX]
+        return {"ok": True}
+
+    @app.get("/api/jog_stop_log")
+    async def api_jog_stop_log_get():
+        return {"stops": list(_jog_stop_log_ring)}
+
+    @app.delete("/api/jog_stop_log")
+    async def api_jog_stop_log_clear():
+        _jog_stop_log_ring.clear()
+        return {"ok": True, "cleared": True}
+
+    @app.get("/api/build_id")
+    async def api_build_id():
+        """Return the currently-served frontend bundle's asset hash
+        AND its git SHA (2026-08-28 like-for-like refresh — the SHA
+        is the L257-compliant comparand; the chunk hash rides along
+        for the operator diagnostic panel).
+
+        Reads _STATIC_DIR/index.html for /assets/index-<hash>.js.
+        Reads _STATIC_DIR/.build-sha (written by the vite
+        writeSidecarPlugin) for the frontend git SHA."""
+        try:
+            index = str(_STATIC_DIR / "index.html")
+            if not os.path.isfile(index):
+                return {"bundle_id": "unknown",
+                        "frontend_sha": _read_frontend_git_sha()}
+            with open(index) as f:
+                src = f.read()
+            import re as _rx
+            m = _rx.search(r"/assets/index-([A-Za-z0-9_-]+)\.js", src)
+            return {
+                "bundle_id":    (m.group(1) if m else "unknown"),
+                "frontend_sha": _read_frontend_git_sha(),
+            }
+        except Exception:
+            return {"bundle_id": "unknown",
+                    "frontend_sha": _read_frontend_git_sha()}
+
+    # ── /api/provenance (2026-08-28 stale-class close) ──────────
+    # Canonical read for the WS handshake, the deploy verifier, and
+    # the footer's three-layer verdict. Cheap: two file reads +
+    # module-level constants; no locks, no ROS. Always returns the
+    # backend SHA + start time + frontend SHA (from dist/.build-sha)
+    # so the client can do like-for-like SHA-to-SHA comparison and
+    # the deploy verifier can assert running-process SHA == deployed
+    # HEAD.
+    @app.get("/api/provenance")
+    async def api_provenance():
+        return {
+            "backend_sha":        _BACKEND_GIT_SHA,
+            "backend_start_iso":  _BACKEND_START_ISO,
+            "backend_start_unix": _START_TIME,
+            "backend_uptime_s":   round(time.time() - _START_TIME, 1),
+            "frontend_sha":       _read_frontend_git_sha(),
+            # 2026-08-28 addendum-52: which execution backend the
+            # dashboard is configured to route Run through. The
+            # frontend uses this to pick the auto-offer mode target
+            # (AUTO for legacy_lua vs REMOTE for ros2_executor per
+            # HARDWARE.md > Robot-mode code table). Flag ships
+            # unchanged (legacy) until F2.7 first-run acceptance;
+            # then flips by env override RUN_BACKEND=ros2_executor.
+            "run_backend":        _RUN_BACKEND_ENV,
+            "run_backend_target_mode":
+                                  "auto"   if _RUN_BACKEND_ENV == "legacy_lua"
+                                  else "remote",
+        }
+
     @app.get("/api/programs")
     async def api_programs_list():
         """List user-created robot programs from /opt/cobot/programs/.
         No built-in templates — every entry corresponds to a file on
-        disk and is fully editable / deletable."""
+        disk and is fully editable / deletable.
+
+        Reconcile pass (2026-07-27): only emit entries whose id can
+        be reached by the read/update/delete routes. A file whose
+        stem fails _PROG_READ_ID_RE would be a listed-but-unreachable
+        ghost — the operator would click Delete and get 404 forever
+        (that WAS the bug that motivated this pass on the underscore
+        case; the read-path regex was tightened here at the same
+        time so the delete route can now reach `new_program`, but
+        the reconcile stays as a belt for future oddballs — dotfiles,
+        weirdly-cased names, whatever).
+        """
         programs = []
+        skipped_unreachable = 0
         try:
             os.makedirs(_PROG_DIR, exist_ok=True)
             for fn in sorted(os.listdir(_PROG_DIR)):
-                if not fn.endswith('.json') or fn.startswith('_'):
+                # `.` prefix (2026-09-04 delete-integrity trash safeguard):
+                # `.deleted/` is a dotfolder inside _PROG_DIR; listdir
+                # returns it as `.deleted` which already fails endswith
+                # ('.json'), but keeping the dot-prefix guard explicit
+                # means future dotfolders (e.g. `.cache`) stay invisible
+                # without a second edit.
+                if not fn.endswith('.json') or fn.startswith(('_', '.')):
+                    continue
+                stem = fn[:-5]
+                if not _PROG_READ_ID_RE.match(stem):
+                    # Route-unreachable — dead entry. Print once per
+                    # boot in case there really is something odd on
+                    # disk that the operator wants to see.
+                    if not getattr(api_programs_list, '_warned_stems', set()) or \
+                            stem not in api_programs_list._warned_stems:
+                        try:
+                            if not hasattr(api_programs_list, '_warned_stems'):
+                                api_programs_list._warned_stems = set()
+                            api_programs_list._warned_stems.add(stem)
+                            print(f'[programs] hidden (unreachable) stem: {stem!r}',
+                                  flush=True)
+                        except Exception:
+                            pass
+                    skipped_unreachable += 1
                     continue
                 try:
                     with open(os.path.join(_PROG_DIR, fn)) as fp:
                         prog = json.load(fp)
                     programs.append({
-                        'id':          fn[:-5],
-                        'name':        prog.get('name') or fn[:-5],
+                        'id':          stem,
+                        'name':        prog.get('name') or stem,
                         'description': prog.get('description') or '',
                         'steps':       len(prog.get('steps') or []),
                         'tags':        prog.get('tags') or [],
@@ -3326,7 +9675,7 @@ if FASTAPI_AVAILABLE:
         # deletion doesn't orphan them behind an invalid id.
         try:
             for fn in os.listdir(_PROG_DIR):
-                if not fn.endswith('.json') or fn.startswith('_'):
+                if not fn.endswith('.json') or fn.startswith(('_', '.')):
                     continue
                 p = os.path.join(_PROG_DIR, fn)
                 try:
@@ -3344,7 +9693,7 @@ if FASTAPI_AVAILABLE:
 
     @app.put("/api/programs/{prog_id}/folder")
     async def api_programs_set_folder(prog_id: str, request: Request):
-        path = _prog_path(prog_id)
+        path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
             return JSONResponse({'error': 'not found'}, status_code=404)
         try:
@@ -3367,7 +9716,7 @@ if FASTAPI_AVAILABLE:
     async def api_programs_duplicate(prog_id: str):
         """Create a copy of an existing program with a new id (slug
         with collision suffix) and " (copy)" appended to the name."""
-        src = _prog_path(prog_id)
+        src = _prog_read_path(prog_id)
         if not src or not os.path.isfile(src):
             return JSONResponse({'error': 'not found'}, status_code=404)
         try:
@@ -3394,11 +9743,402 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({'error': f'write failed: {e}'}, status_code=500)
         return {'ok': True, 'program': new_prog}
 
+    # Program-provenance canonical values. The `source` field on
+    # /opt/cobot/programs/{id}.json records WHICH write path created
+    # the file — the Monitor screen renders a provenance badge from
+    # this so an operator can tell at a glance whether a program
+    # started life as a PBD demo, a hand-built manual build, or an
+    # imported file. Set at creation and preserved on update. If a
+    # program predates the field, _infer_source() below classifies
+    # it from surviving evidence (config.pbd_metadata, tags).
+    _PROG_SOURCES = ('demonstration', 'manual', 'imported')
+
+    def _infer_source(prog: dict) -> str:
+        """Read-time backfill for programs saved before the `source`
+        field existed. Classification order matters — a program with
+        pbd_metadata was authored by the PBD composer even if it
+        later got hand-edited, so demonstration wins over manual.
+        """
+        cfg = prog.get('config') or {}
+        tags = prog.get('tags') or []
+        if isinstance(cfg.get('pbd_metadata'), dict):
+            return 'demonstration'
+        if any(t in tags for t in ('pbd', 'from_demonstration')):
+            return 'demonstration'
+        return 'manual'
+
+    # Steps whose `action` doesn't require a pose. The wizard authors
+    # programs with these actions alongside motion steps; treating them
+    # as "untaught" was the root cause of testwizard.json falsely
+    # reporting has_taught_poses=false.
+    _NON_MOTION_ACTIONS = frozenset({
+        'set_io', 'wait', 'wait_input', 'loop', 'gripper',
+        'gripper_close', 'gripper_open', 'pause', 'comment', 'end',
+        'vacuum_on', 'vacuum_off',
+        # 2026-07-31: camera / config-driven verbs. Added after the
+        # operator caught `detect` showing up in a Teach All queue —
+        # these actions don't take a per-step pose, so `_has_taught_poses`
+        # must not treat them as untaught gaps. Kept in sync with the
+        # frontend's NON_MOTION_ACTIONS set in lib/programTruth.js.
+        'detect',
+        'scan_workspace', 'scan_identify_each', 'sort_scanned', 'remove_defects',
+        'move_to_pallet',
+    })
+
+    def _has_taught_poses(prog: dict) -> bool:
+        """A program has REAL taught poses when every step's pose
+        requirement is satisfied. Sources counted as taught:
+          (a) `point_name` resolves in program.points with 6-el joints,
+          (b) a 6-element `taught_joints` with `taught=True` (legacy),
+          (c) `derived_from` role referring to another step that IS
+              taught inline (the executor resolves anchor + offset at
+              runtime — the derived step is authored, not a gap),
+          (d) non-motion actions (set_io/wait/loop/gripper/…) which
+              don't take a pose at all,
+          (e) the legacy `type == 'gripper'` marker.
+
+        Used to strip the stale "poses pending perception" caveat from
+        a description when the operator has finished teaching."""
+        steps = prog.get('steps') or []
+        if not steps:
+            # Empty programs with an empty point table aren't
+            # considered "taught" — matches the previous behaviour.
+            return False
+        points = prog.get('points') or {}
+        # Pre-pass: which position roles are taught inline in this
+        # program? A derived step is only counted (c) if its anchor
+        # role is actually present.
+        taught_roles = set()
+        for s in steps:
+            role = s.get('position_role')
+            j = s.get('taught_joints')
+            if role and isinstance(j, list) and len(j) == 6 \
+                    and s.get('taught') is True:
+                taught_roles.add(role)
+        for s in steps:
+            if s.get('type') in ('gripper',):
+                continue
+            action = str(s.get('action') or '').lower()
+            if action in _NON_MOTION_ACTIONS:
+                continue
+            pn = s.get('point_name')
+            if pn and pn in points:
+                p = points[pn]
+                if isinstance(p.get('joints'), list) and len(p['joints']) == 6:
+                    continue
+            j = s.get('taught_joints')
+            if (isinstance(j, list) and len(j) == 6
+                    and s.get('taught') is True):
+                continue
+            df = s.get('derived_from')
+            if df and df in taught_roles:
+                continue
+            return False
+        return True
+
+    def _validate_move_home_consistency(steps):
+        """Return a list of warnings — one per move_home step whose
+        taught_joints differ from the FIRST move_home step's joints by
+        more than 5° in any axis. Returns an empty list when everything
+        is aligned OR when there's only one move_home step.
+
+        Matches the FIX C threshold in
+        program_ops.codegen_lua_from_program — codegen normalizes
+        silently at Lua-emit time, but we warn the operator here so
+        drift shows up at save time rather than being noticed only in
+        the emitted Lua footer.
+
+        Reason to keep as a WARNING (not a save-blocker): the codegen
+        normalization means the arm won't actually visit the drifted
+        pose. The warning is informational + a nudge to re-teach so the
+        on-disk record matches the emitted program.
+        """
+        THRESHOLD_DEG = 5.0
+        warnings = []
+        anchor_idx = None
+        anchor_joints = None
+        for i, s in enumerate(steps):
+            if not isinstance(s, dict):
+                continue
+            if str(s.get('action') or '').lower() != 'move_home':
+                continue
+            tj = s.get('taught_joints')
+            if not (isinstance(tj, list) and len(tj) == 6
+                    and all(isinstance(v, (int, float)) for v in tj)):
+                continue
+            if anchor_joints is None:
+                anchor_idx = i
+                anchor_joints = [float(v) for v in tj]
+                continue
+            deltas = [abs(float(a) - float(b))
+                      for a, b in zip(tj, anchor_joints)]
+            max_d = max(deltas)
+            if max_d > THRESHOLD_DEG:
+                warnings.append({
+                    "step_index": i,
+                    "step_label": s.get("label") or "move_home",
+                    "anchor_step_index": anchor_idx,
+                    "anchor_step_label":
+                        steps[anchor_idx].get("label") or "move_home",
+                    "max_joint_delta_deg": round(max_d, 2),
+                    "per_axis_delta_deg": [round(d, 2) for d in deltas],
+                    "reason": (
+                        f"move_home step {i+1} joints differ from "
+                        f"step {anchor_idx+1} by up to "
+                        f"{max_d:.2f}° (threshold {THRESHOLD_DEG:.1f}°). "
+                        "Codegen normalizes silently to the first "
+                        "move_home, but re-teach one of them so the "
+                        "on-disk record matches."
+                    ),
+                })
+        return warnings
+
+    _RELEASE_ACTIONS_MACHINE_GUARD = frozenset({'open_gripper'})
+    _RELEASE_IO_ROLES_MACHINE_GUARD = frozenset({'vacuum', 'magnet'})
+    _RELEASE_LABEL_TOKENS_MACHINE_GUARD = (
+        'release', 'gripper off', 'disengage vacuum', 'disengage magnet',
+    )
+
+    def _is_clamp_step(s):
+        if not isinstance(s, dict): return False
+        if str(s.get('io_role') or '').lower() == 'machine_clamp' \
+                and s.get('value') == 1: return True
+        return str(s.get('label') or '').lower() == 'clamp workpiece'
+
+    def _is_clamp_verify(s):
+        if not isinstance(s, dict): return False
+        if str(s.get('action') or '').lower() != 'verify_input': return False
+        return (str(s.get('io_role') or '').lower() == 'clamp_confirmed'
+                and s.get('expect') == 1)
+
+    def _is_release_step_machine_guard(s):
+        if not isinstance(s, dict): return False
+        act = str(s.get('action') or '').lower()
+        if act in _RELEASE_ACTIONS_MACHINE_GUARD: return True
+        if act == 'set_io' and s.get('value') == 0:
+            role = str(s.get('io_role') or '').lower()
+            if role in _RELEASE_IO_ROLES_MACHINE_GUARD: return True
+            lab = str(s.get('label') or '').lower()
+            if any(t in lab for t in _RELEASE_LABEL_TOKENS_MACHINE_GUARD):
+                return True
+        return False
+
+    def _validate_machine_tending_ordering(steps):
+        """Machine-tending clamp→verify→release ordering guard —
+        Python mirror of lib/effectorVocab.validateMachineTendingOrdering.
+        Both sides must agree; a divergence would be exactly the fork
+        the no-fork-truth guard was built to prevent. Kept in this
+        file so the save endpoint can block violations at HTTP time,
+        BEFORE the program lands on disk.
+
+        Rule fires ONLY when a Verify clamp engaged step exists
+        somewhere after the clamp — that's the operator's declared
+        intent that they want a verified clamp. If no verify exists
+        downstream, either the operator opted out (no Clamp
+        confirmed DI assigned) or edited it away; the rule doesn't
+        second-guess that choice.
+
+        Returns a list of {step_index, clamp_step_index, reason}
+        dicts. Empty list = safe."""
+        out = []
+        arr = list(steps or [])
+        for i in range(len(arr)):
+            if not _is_clamp_step(arr[i]):
+                continue
+            verify_idx = -1
+            for j in range(i + 1, len(arr)):
+                if _is_clamp_verify(arr[j]):
+                    verify_idx = j
+                    break
+            if verify_idx < 0:
+                continue
+            for j in range(i + 1, verify_idx):
+                s = arr[j]
+                if _is_release_step_machine_guard(s):
+                    lbl = s.get('label') or s.get('action') or f'step {j+1}'
+                    out.append({
+                        'step_index':       j,
+                        'clamp_step_index': i,
+                        'reason': (
+                            f'Step {j+1} ({lbl!r}) releases the robot\'s '
+                            f'grip AFTER the clamp at step {i+1} but '
+                            f'BEFORE the attached "Verify clamp '
+                            f'engaged" at step {verify_idx+1}. A failed '
+                            f'clamp with the grip released drops the '
+                            f'part — reorder so the verify runs first, '
+                            f'or remove the release from between them.'),
+                    })
+                    break
+        return out
+
+    def _line_map_sidecar_path(prog_id):
+        return os.path.join(_PROG_DIR, f'{prog_id}.line_map.json')
+
+
+    def _compute_and_save_line_map(program):
+        """Run codegen (dry) with `line_map_sink`, then persist the
+        map + codegen sha to `<prog_id>.line_map.json` alongside the
+        program JSON. Returns the sidecar dict. Best-effort — if the
+        codegen fails (usually a taught-joints gap on a draft), we
+        write an empty map with the failure reason so the frontend's
+        honesty guard still fires. Called from POST and PUT
+        /api/programs so every saved program carries a fresh map."""
+        prog_id = str(program.get('id') or '').strip()
+        if not prog_id:
+            return None
+        # Local import — same pattern as _d11_block_findings (see
+        # commit fd25a67). Owning the import at the call site
+        # eliminates the NameError-in-waiting class of bug.
+        try:
+            from estun_driver import program_ops as _po
+        except Exception as e:
+            return {
+                'program_id':    prog_id,
+                'line_map':      [],
+                'codegen_sha':   '',
+                'codegen_git':   '',
+                'effective_pct': None,
+                'generated_ts':  _now_stamp(),
+                'error':         f'program_ops import: {e}',
+            }
+        sink = []
+        try:
+            _lua, _pts, eff_pct = _po.codegen_lua_from_program(
+                program, operator_speed_limit_pct=100,
+                line_map_sink=sink)
+            sidecar = {
+                'program_id':   prog_id,
+                'line_map':     sink,
+                'codegen_sha':  _po.CODEGEN_VERSION.get(
+                    'src_sha256', '')[:12],
+                'codegen_git':  _po.CODEGEN_VERSION.get(
+                    'git_sha', ''),
+                'effective_pct': int(eff_pct),
+                'generated_ts': _now_stamp(),
+                'error':        None,
+            }
+        except Exception as e:
+            sidecar = {
+                'program_id':   prog_id,
+                'line_map':     [],
+                'codegen_sha':  _po.CODEGEN_VERSION.get(
+                    'src_sha256', '')[:12],
+                'codegen_git':  _po.CODEGEN_VERSION.get(
+                    'git_sha', ''),
+                'effective_pct': None,
+                'generated_ts': _now_stamp(),
+                'error':        f'{type(e).__name__}: {e}',
+            }
+        try:
+            with open(_line_map_sidecar_path(prog_id), 'w') as f:
+                json.dump(sidecar, f, indent=2)
+        except Exception as e:
+            print(f'[line_map] sidecar write failed for {prog_id}: {e}',
+                  flush=True)
+        return sidecar
+
+
+    def _d11_block_findings(program):
+        """Run the motion analyzer over `program` and return
+        (block_findings, validator_error_findings). block findings
+        refuse the save (a program problem); validator_error
+        findings are OUR bug (a check that raised) — the save
+        proceeds and the error is auto-filed alongside the
+        program's findings as 'inconclusive' so the operator sees
+        it but isn't blocked by it.
+
+        The distinction matters (2026-08-03 operator directive):
+        never let a validator-crash read as the program being
+        wrong. Prior code stuffed the crash into severity='block',
+        which made a NameError read as a program-lint failure and
+        blocked editing. That is our failure, not the operator's.
+        """
+        # Local import — Python re-imports are near-free after the
+        # first hit; this makes the reference explicit at the call
+        # site so a NameError-in-waiting can never appear again
+        # (each function that touches program_ops owns its import).
+        try:
+            from estun_driver import program_ops as _po
+        except Exception as e:
+            # Can't import → validator itself is broken. NOT a
+            # program problem; surface as an inconclusive advisory
+            # so the operator can still save/edit.
+            return [], [{
+                'rule':             'validator_import_error',
+                'severity':         'validator_error',
+                'message':          f'validator could not import '
+                                    f'program_ops: {e}. This is a '
+                                    f'BUG in the validator, not a '
+                                    f'problem with your program. '
+                                    f'Save will proceed.',
+                'step_idx':         -1,
+                'step_label':       '',
+                'step_action':      '',
+                'suggested_action': None,
+                'metrics':          {'exception_type': type(e).__name__},
+            }]
+        try:
+            rep = _po.analyze_program(program)
+        except Exception as e:
+            return [], [{
+                'rule':             'validator_check_error',
+                'severity':         'validator_error',
+                'message':          f'analyzer raised '
+                                    f'{type(e).__name__}: {e}. This '
+                                    f'is a BUG in the validator, '
+                                    f'not a problem with your '
+                                    f'program. Save will proceed.',
+                'step_idx':         -1,
+                'step_label':       '',
+                'step_action':      '',
+                'suggested_action': None,
+                'metrics':          {'exception_type': type(e).__name__},
+            }]
+        blocks = [f for f in (rep.get('findings') or [])
+                  if str(f.get('severity') or '') == 'block']
+        return blocks, []
+
+
+    def _validate_step_point_refs(steps, points):
+        """Return a per-step message list for any step whose point_name
+        doesn't resolve in the program's points table. Empty list on
+        success. Used by BOTH POST and PUT so a save that would produce
+        a program that can't run also can't slip past the write.
+
+        Rule: a step CAN carry a point_name; if it does, that name MUST
+        appear in points with a 6-element joints array. A step with no
+        point_name AND no taught_joints is a legitimate placeholder
+        (operator hasn't taught it yet — that's captured by
+        has_taught_poses:false on read, not blocked here)."""
+        issues = []
+        pts = points or {}
+        for i, s in enumerate(steps):
+            if not isinstance(s, dict):
+                continue
+            pn = s.get("point_name")
+            if not pn:
+                continue
+            p = pts.get(pn)
+            joints = (p or {}).get("joints")
+            if not (isinstance(joints, list) and len(joints) == 6):
+                issues.append({
+                    "step_index": i,
+                    "step_label": s.get("label") or s.get("action") or f"step {i+1}",
+                    "point_name": pn,
+                    "reason": f"references point {pn!r} which is not taught "
+                              f"in this program's points table",
+                    "hint": "Either teach it (Points panel → 📌 Teach current pose "
+                            f"then rename to {pn!r}) OR repoint this step to a "
+                            "taught point.",
+                })
+        return issues
+
     @app.post("/api/programs")
     async def api_programs_save(request: Request):
         """Persist a wizard-generated program to /opt/cobot/programs as a
-        JSON file. Slug is derived from the name; collisions get a _2,
-        _3, ... suffix so we never silently overwrite."""
+        JSON file. Slug is derived from the name; collisions get a 2/3/…
+        digit suffix (NO underscore separator — see _PROG_ID_RE for the
+        controller-underscore-split rationale)."""
         try:
             body = await request.json()
         except Exception:
@@ -3409,7 +10149,51 @@ if FASTAPI_AVAILABLE:
         steps = body.get("steps") or []
         if not isinstance(steps, list):
             return JSONResponse({"error": "steps must be a list"}, status_code=400)
-        base = _prog_re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or 'program'
+        # Step→point reference validation. A step that names a point but
+        # the point isn't in the program's points{} table blocks the save
+        # with a specific, actionable error listing which step + which
+        # missing point + how to fix. The blocked message replaces the
+        # generic frontend "Error" badge with human-readable text.
+        points_in = body.get("points") or {}
+        step_issues = _validate_step_point_refs(steps, points_in)
+        if step_issues:
+            return JSONResponse({
+                "error": (
+                    "This program has steps that reference untaught points. "
+                    + "; ".join(
+                        f"Step {it['step_index']+1} ({it['step_label']}) "
+                        f"references point {it['point_name']!r} which has "
+                        "not been taught"
+                        for it in step_issues)
+                    + ". Teach those points (Points panel → 📌 Teach current "
+                      "pose then rename) or repoint the steps."
+                ),
+                "step_issues": step_issues,
+            }, status_code=422)
+        # Machine-tending clamp→verify→release ordering guard.
+        # Blocks any program that would release the robot's grip on
+        # a workpiece BEFORE the attached "Verify clamp engaged"
+        # confirms the fixture has actually latched (2026-07-30
+        # machine-tending vocabulary work).
+        machine_issues = _validate_machine_tending_ordering(steps)
+        if machine_issues:
+            return JSONResponse({
+                "error": (
+                    "This program's clamp/verify/release ordering is "
+                    "unsafe: " + "; ".join(it['reason'] for it in machine_issues)
+                ),
+                "machine_tending_issues": machine_issues,
+            }, status_code=422)
+        # move_home drift: warn (don't block) — codegen silently
+        # normalizes to the first move_home, but the operator should
+        # know so they can re-teach the on-disk pose to match.
+        home_warnings = _validate_move_home_consistency(steps)
+        # Slug: lowercase alnum only. "New Program" → "newprogram";
+        # "My Palletize Task 3" → "mypalletizetask3". Collisions get
+        # a numeric suffix ("newprogram2") without an underscore
+        # separator — the controller would otherwise treat that
+        # underscore as a path segment boundary and lose the id.
+        base = _prog_re.sub(r'[^a-z0-9]+', '', name.lower()) or 'program'
         try:
             os.makedirs(_PROG_DIR, exist_ok=True)
         except Exception as e:
@@ -3417,44 +10201,154 @@ if FASTAPI_AVAILABLE:
         slug = base
         n = 2
         while os.path.exists(os.path.join(_PROG_DIR, slug + '.json')):
-            slug = f"{base}_{n}"
+            slug = f"{base}{n}"
             n += 1
         ts = _now_stamp()
+        # Provenance: POST /api/programs is the MANUAL builder's write
+        # path (ProgramEditor.jsx handleSave). Stamp source="manual"
+        # unless the caller explicitly supplied one (imports may set
+        # "imported"; the /api/pbd/{demo_id}/correct path stamps
+        # "demonstration" through the branch below).
+        source = str(body.get("source") or "manual")
+        if source not in _PROG_SOURCES:
+            source = "manual"
+
+        # Defense-in-depth against the ProgramEditor "New Program" merge
+        # leak (see 2026-07-20 bug: hand-created programs inherited the
+        # previously-loaded PBD draft's config.pbd_metadata + tags +
+        # description because the frontend's setCurrentProgram is a
+        # partial merge). Any program whose source is NOT "demonstration"
+        # gets its PBD-provenance markers scrubbed at ingress:
+        #   - config.pbd_metadata dropped
+        #   - tags 'pbd' / 'from_demonstration' / 'draft' removed
+        # A frontend already-fixed to send blank tags is unaffected;
+        # an older frontend or an out-of-band POST still can't smuggle
+        # PBD provenance into a manual save.
+        _PBD_TAG_MARKERS = {'pbd', 'from_demonstration', 'draft'}
+        cfg_in = body.get("config") or {}
+        tags_in = list(body.get("tags") or [])
+        if source != "demonstration":
+            if isinstance(cfg_in, dict) and 'pbd_metadata' in cfg_in:
+                cfg_in = {k: v for k, v in cfg_in.items() if k != 'pbd_metadata'}
+            tags_in = [t for t in tags_in if t not in _PBD_TAG_MARKERS]
+
+        # 2026-07-30 §430 — persist routines[] alongside steps.
+        # Representation-only (codegen never reads it), but the
+        # editor + review UIs fold on it to render "×N" chips
+        # instead of unrolled iterations. Only well-shaped entries
+        # are accepted; malformed rows are dropped silently.
+        _routines_raw = body.get("routines") or []
+        _routines_clean = []
+        if isinstance(_routines_raw, list):
+            for r in _routines_raw:
+                if not isinstance(r, dict):
+                    continue
+                rid = str(r.get("id") or "").strip()
+                if not rid:
+                    continue
+                _routines_clean.append({
+                    "id":          rid,
+                    "name":        str(r.get("name") or ""),
+                    "iterations":  int(r.get("iterations") or 1),
+                    "operation_indices":     list(r.get("operation_indices") or []),
+                    "step_indices_per_iter": list(r.get("step_indices_per_iter") or []),
+                    "per_iteration_deltas":  list(r.get("per_iteration_deltas") or []),
+                    "single_iteration_signature": dict(r.get("single_iteration_signature") or {}),
+                })
         program = {
             "id":          slug,
             "name":        name,
             "description": str(body.get("description") or ""),
-            "tags":        list(body.get("tags") or []),
-            "config":      body.get("config") or {},
+            "tags":        tags_in,
+            "config":      cfg_in,
             "steps":       steps,
+            "routines":    _routines_clean,
             "cell_id":     body.get("cell_id") or None,
+            "source":      source,
             "created":     ts,
             "updated":     ts,
         }
+        # D11 save gate (2026-08-03) — 'block' findings from the
+        # analyzer refuse the save (program problem). 'validator_
+        # error' findings are OUR bug (analyzer raised) — save
+        # proceeds; the crash is auto-filed as inconclusive so the
+        # operator sees it. Never let a validator crash read as a
+        # program error.
+        block, validator_errors = _d11_block_findings(program)
+        if block:
+            return JSONResponse({
+                "error": ("D11 column orientation lock: "
+                          + "; ".join(f['message'] for f in block)),
+                "d11_block_findings": block,
+                "validator_errors":   validator_errors,
+            }, status_code=422)
         try:
             with open(os.path.join(_PROG_DIR, slug + '.json'), 'w') as f:
                 json.dump(program, f, indent=2)
         except Exception as e:
             return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
-        return {"ok": True, "program": program}
+        # Line-map sidecar (D9 · 2026-08-03) — every saved program
+        # gets a fresh line_map for the Monitor's live step highlight.
+        sidecar = _compute_and_save_line_map(program)
+        return {"ok": True, "program": program,
+                "line_map":  (sidecar or {}).get("line_map"),
+                "codegen_sha": (sidecar or {}).get("codegen_sha"),
+                "validator_errors": validator_errors,
+                "warnings": {"move_home_drift": home_warnings}
+                            if home_warnings else {}}
 
     @app.get("/api/programs/{prog_id}")
     async def api_programs_get(prog_id: str):
-        path = _prog_path(prog_id)
+        path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
             return JSONResponse({"error": "not found"}, status_code=404)
         try:
             with open(path) as f:
-                return json.load(f)
+                prog = json.load(f)
         except Exception as e:
             return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
+        # Provenance backfill for programs saved before the field
+        # existed. Non-persistent — a subsequent PUT with the correct
+        # source will overwrite it. `has_taught_poses` is a derived
+        # readonly hint the Monitor uses to suppress the stale
+        # "poses pending perception" caveat when the operator has
+        # finished teaching PBD-drafted placeholders.
+        if not prog.get("source"):
+            prog["source"] = _infer_source(prog)
+        prog["has_taught_poses"] = _has_taught_poses(prog)
+        # Rev normalisation — client always gets a numeric rev, never
+        # None. Read authoritative rev from _prog_revs (seeded from
+        # disk at startup + updated by every _bump_prog_rev). Programs
+        # that have never been mutated report 0, not None, so client-
+        # side ev.rev > cp.rev comparisons behave predictably.
+        with _prog_event_lock:
+            authoritative = _prog_revs.get(prog_id)
+        if authoritative is None:
+            # First read of a program the seeder didn't cover; seed
+            # from the file's own rev (or 0) so subsequent broadcasts
+            # + bumps stay consistent.
+            authoritative = int(prog.get("rev") or 0)
+            with _prog_event_lock:
+                _prog_revs[prog_id] = max(
+                    authoritative, _prog_revs.get(prog_id, 0))
+        prog["rev"] = int(authoritative)
+        # 2026-08-28 palletize quarantine flag — surface in the
+        # GET response so the frontend can render the badge +
+        # disable Run BEFORE the operator ever POSTs to
+        # /api/estun/program/run. Backend refusal is still the
+        # actual safety guard (see api_estun_program_run); this
+        # is UX signaling.
+        if prog_id in _QUARANTINED_PROGRAM_IDS:
+            prog["quarantined"] = True
+            prog["quarantine_reason"] = _QUARANTINE_REASON
+        return prog
 
     @app.put("/api/programs/{prog_id}")
     async def api_programs_update(prog_id: str, request: Request):
         """Merge an update into the existing program file. Preserves the
         original id and created timestamp; bumps updated. Accepts the
         same shape as POST minus the auto-slugging."""
-        path = _prog_path(prog_id)
+        path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
             return JSONResponse({"error": "not found"}, status_code=404)
         try:
@@ -3468,7 +10362,41 @@ if FASTAPI_AVAILABLE:
                 prog = json.load(f)
         except Exception as e:
             return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
-        for k in ("name", "description", "tags", "config", "steps", "cell_id"):
+        # Same step→point validation as POST. Uses the merged view of
+        # steps + points (incoming overrides existing) so a PUT that
+        # ADDS a bad point_name reference is blocked with the specific
+        # message.
+        merged_steps  = body.get("steps",  prog.get("steps")  or [])
+        merged_points = body.get("points", prog.get("points") or {})
+        step_issues = _validate_step_point_refs(merged_steps, merged_points)
+        if step_issues:
+            return JSONResponse({
+                "error": (
+                    "This update would leave steps referencing untaught points. "
+                    + "; ".join(
+                        f"Step {it['step_index']+1} ({it['step_label']}) → "
+                        f"point {it['point_name']!r} not taught"
+                        for it in step_issues)
+                    + ". Teach those points or repoint the steps."
+                ),
+                "step_issues": step_issues,
+            }, status_code=422)
+        # Machine-tending ordering guard — same rule the POST path
+        # applies (block clamp/verify/release out-of-order edits).
+        merged_machine_issues = _validate_machine_tending_ordering(merged_steps)
+        if merged_machine_issues:
+            return JSONResponse({
+                "error": (
+                    "This update would leave the clamp/verify/release "
+                    "ordering unsafe: "
+                    + "; ".join(it['reason'] for it in merged_machine_issues)
+                ),
+                "machine_tending_issues": merged_machine_issues,
+            }, status_code=422)
+        # move_home drift check on the merged view (same threshold as
+        # POST and program_ops FIX C).
+        home_warnings_put = _validate_move_home_consistency(merged_steps)
+        for k in ("name", "description", "tags", "config", "steps", "cell_id", "routines"):
             if k in body:
                 prog[k] = body[k]
         # id is owned by the filename — never let a client change it.
@@ -3476,23 +10404,546 @@ if FASTAPI_AVAILABLE:
         prog["updated"] = _now_stamp()
         if "created" not in prog:
             prog["created"] = prog["updated"]
+        # Provenance is preserved across updates. If missing (older
+        # file), backfill from the inference rules. The `source` field
+        # is only WRITABLE via update if the client explicitly sends
+        # one AND it's a canonical value — imports may need to override
+        # from "manual" to "imported", but a stray body field never
+        # relabels a demonstration as manual.
+        incoming_source = body.get("source")
+        if incoming_source and str(incoming_source) in _PROG_SOURCES:
+            prog["source"] = str(incoming_source)
+        elif not prog.get("source"):
+            prog["source"] = _infer_source(prog)
+
+        # Same PBD-marker scrub as POST (see comment there). Fires
+        # when the EFFECTIVE source is not demonstration — preserves
+        # config.pbd_metadata + PBD tags on genuine demo programs
+        # across edits (steps/name/description can still be edited
+        # on a PBD program without losing its provenance).
+        _PBD_TAG_MARKERS = {'pbd', 'from_demonstration', 'draft'}
+        if prog.get("source") != "demonstration":
+            cfg = prog.get("config") or {}
+            if isinstance(cfg, dict) and 'pbd_metadata' in cfg:
+                prog["config"] = {k: v for k, v in cfg.items() if k != 'pbd_metadata'}
+            tags = prog.get("tags") or []
+            prog["tags"] = [t for t in tags if t not in _PBD_TAG_MARKERS]
+        # D11 save gate (2026-08-03) — see POST path for context.
+        # Validator crashes never block; only real 'block' findings do.
+        block, validator_errors = _d11_block_findings(prog)
+        if block:
+            return JSONResponse({
+                "error": ("D11 column orientation lock: "
+                          + "; ".join(f['message'] for f in block)),
+                "d11_block_findings": block,
+                "validator_errors":   validator_errors,
+            }, status_code=422)
         try:
-            with open(path, 'w') as f:
+            # Bug 1 fix (2026-07-27): route the PUT write through the
+            # rev+broadcast helper so every step edit, teach, link, or
+            # save is seen by other connected clients within ~1 /ws/state
+            # tick. The originating client's own echo is suppressed via
+            # source_client match on the receive side.
+            new_rev = _save_prog_with_event(
+                prog, path, prog_id,
+                _client_id_of(request), "program_put")
+        except Exception as e:
+            return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
+        sidecar = _compute_and_save_line_map(prog)
+        return {"ok": True, "program": prog, "rev": new_rev,
+                "validator_errors": validator_errors,
+                "line_map":  (sidecar or {}).get("line_map"),
+                "codegen_sha": (sidecar or {}).get("codegen_sha"),
+                "warnings": {"move_home_drift": home_warnings_put}
+                            if home_warnings_put else {}}
+
+    @app.delete("/api/programs/{prog_id}")
+    async def api_programs_delete(prog_id: str, request: Request):
+        # Delete has to reach existing files whose id contains the
+        # underscore/hyphen shape older wizards produced; the strict
+        # slug rule stays on CREATION via _prog_path. Contract: 404
+        # is reserved for "file genuinely doesn't exist on disk" —
+        # never for id-form mismatch on a listed entry.
+        path = _prog_read_path(prog_id)
+        if not path or not os.path.isfile(path):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        # Snap resident-program flag under the same lock we clear it
+        # under below, so the run gate's `deleted_resident_id` check
+        # and the operator-visible confirm-copy agree even under a
+        # concurrent push.
+        with _state_lock:
+            pg = STATE.get("robot", {}).get("program", {}) or {}
+            was_resident = (pg.get("resident_program_id") == prog_id)
+        try:
+            trash = _trash_program(prog_id)
+        except FileNotFoundError:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        except OSError as e:
+            return JSONResponse({"error": f"delete failed: {e}"},
+                                status_code=500)
+        # Clear the dashboard-side resident mirror so Run refuses with
+        # a NAMED reason ('resident_deleted') instead of falling
+        # through to the generic 404 or — worse — running against the
+        # stale mirror. The controller keeps its own resident copy
+        # until another program is pushed; that behaviour is intentional
+        # (operators may want to hit Run on the pendant after deleting
+        # a program on the dashboard). See the run-gate branch in
+        # api_estun_program_run for how this surfaces.
+        if was_resident:
+            with _state_lock:
+                pg = STATE.setdefault("robot", {}).setdefault("program", {})
+                pg["resident_program_id"] = None
+                pg["deleted_resident_id"] = prog_id
+                pg["deleted_at"]          = trash['ts']
+        # Fan out to other connected clients so the row disappears
+        # from their library within one /ws/state tick. Uses the
+        # program-changed ring from the 2026-07-27 sync fix.
+        try:
+            rev = _bump_prog_rev(prog_id)
+            _emit_program_changed(prog_id, rev,
+                                  _client_id_of(request), 'deleted')
+        except Exception as e:
+            # Broadcast failure must never block the delete itself —
+            # the file is gone; other clients will notice on next
+            # refresh even without the event.
+            print(f'[programs] delete-broadcast failed for {prog_id!r}: '
+                  f'{type(e).__name__}: {e}', flush=True)
+        return {
+            "ok": True,
+            "trashed": {
+                "ts":    trash['ts'],
+                "moved": [suffix for suffix, _dest in trash['moved']],
+            },
+            "was_resident": was_resident,
+        }
+
+    @app.post("/api/programs/{prog_id}/rename")
+    async def api_programs_rename(prog_id: str, request: Request):
+        """Migrate a program to a controller-safe slug. Body: {new_name}.
+        The new slug is derived from new_name via the same regex the
+        POST endpoint uses (lowercase-alnum only, no underscore); the
+        endpoint refuses if the target already exists.
+
+        Preserves steps + points + config + source + tags + created
+        timestamp. Bumps updated. Rewrites the id field. Deletes the
+        old file only on successful new-file write (atomic-ish; a
+        crash between the two calls leaves BOTH files present but
+        with the same content, which is safe to clean up manually).
+
+        Also supports reaching an underscored old file that
+        /api/programs/{id} routes normally can't reach — we bypass
+        _prog_path here and open the raw candidate path so the
+        operator can migrate programs stuck under the old naming
+        scheme (rare cleanup path).
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        new_name = str(body.get("new_name") or "").strip()
+        if not new_name:
+            return JSONResponse({"error": "new_name required"}, status_code=400)
+
+        # Uses the shared _prog_read_path resolver (relaxed regex
+        # ^[a-z0-9_-]+$) so migrating an old underscored slug
+        # traverses the same path validation every read/delete route
+        # uses. Traversal safety: the resolver never emits a path
+        # outside _PROG_DIR since the character class excludes dots
+        # and slashes.
+        src = _prog_read_path(prog_id)
+        if not src:
+            return JSONResponse({"error": "invalid source id"}, status_code=400)
+        if not os.path.isfile(src):
+            return JSONResponse({"error": "not found"}, status_code=404)
+
+        new_slug = _prog_re.sub(r'[^a-z0-9]+', '', new_name.lower()) or 'program'
+        n = 2
+        candidate = new_slug
+        while os.path.exists(os.path.join(_PROG_DIR, candidate + '.json')):
+            if candidate == prog_id:
+                # Target IS the source (name didn't actually change).
+                return JSONResponse({"error": "new_name resolves to the same slug"},
+                                    status_code=409)
+            candidate = f"{new_slug}{n}"
+            n += 1
+        dst = os.path.join(_PROG_DIR, candidate + '.json')
+
+        try:
+            with open(src) as f:
+                prog = json.load(f)
+        except Exception as e:
+            return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
+        prog["id"] = candidate
+        prog["name"] = new_name
+        prog["updated"] = _now_stamp()
+
+        try:
+            with open(dst, 'w') as f:
                 json.dump(prog, f, indent=2)
         except Exception as e:
             return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
-        return {"ok": True, "program": prog}
+        try:
+            os.remove(src)
+        except Exception:
+            # Non-fatal: the new file exists, the operator can clean up
+            # the old one manually. Preferable to a rollback that
+            # deletes the new file after a successful write.
+            pass
+        return {"ok": True, "old_id": prog_id, "new_id": candidate,
+                "program": prog}
 
-    @app.delete("/api/programs/{prog_id}")
-    async def api_programs_delete(prog_id: str):
-        path = _prog_path(prog_id)
+    # ------------------------------------------------------------------
+    # Point table — teach + manage taught poses per program.
+    #
+    # Points live under a new top-level `points` dict on the program
+    # JSON:
+    #   points: {
+    #     "p1": {joints:[6 deg], tcp:[x,y,z,a,b,c mm/deg],
+    #            label:"Home", taught_at:"…Z"},
+    #     ...
+    #   }
+    # Steps can reference points by `point_name`; the ladder-proven
+    # program_ops.codegen_lua_from_program prefers this dict when
+    # present, falling back to steps[].taught_joints for backward
+    # compatibility with programs authored before this schema.
+    #
+    # SAFETY: teaching only RECORDS a pose. It never publishes to
+    # /estun/program, never opens a WS write, never touches the arm.
+    # No allow_move gate is required. The move-gate still governs Run
+    # exclusively — teach and run are separate authorities on purpose,
+    # so an integrator can shape a program with the gate closed and
+    # only open it when the operator is at the cell.
+    _POINT_NAME_RE = _prog_re.compile(r'^[A-Za-z][A-Za-z0-9_]{0,30}$')
+
+    def _snapshot_current_pose():
+        """Atomic pose snapshot from the driver's /estun/status mirror.
+        Returns (joints_deg, tcp_mm) or (None, None) if the driver has
+        never published — the endpoint refuses to teach in that case
+        rather than record zeros as a pose."""
+        with _state_lock:
+            r = STATE.get("robot") or {}
+            jd = r.get("joints_deg")
+            tm = r.get("tcp_mm")
+        if not (isinstance(jd, list) and len(jd) == 6
+                and all(isinstance(v, (int, float)) for v in jd)):
+            return None, None
+        # tcp is optional — the point table stores it for display
+        # only. movJ codegen uses joints only.
+        if not (isinstance(tm, list) and len(tm) == 6):
+            tm = None
+        else:
+            tm = [float(v) for v in tm]
+        return [float(v) for v in jd], tm
+
+    def _load_prog(prog_id):
+        # Read-path resolver (relaxed regex) so points endpoints reach
+        # existing files whose id contains _ / - from an earlier
+        # naming scheme. Creation still routes through _prog_path.
+        path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
+            return None, None
+        try:
+            with open(path) as f:
+                return json.load(f), path
+        except Exception:
+            return None, None
+
+    def _save_prog(prog, path):
+        prog["updated"] = _now_stamp()
+        with open(path, 'w') as f:
+            json.dump(prog, f, indent=2)
+
+    def _client_id_of(request) -> str:
+        """Read the caller's X-Client-Id header (a UUID minted per page
+        load on the browser). Empty string when older builds are still
+        running. Only used for echo-suppression on the receive side —
+        an empty source_client never matches a real client id so those
+        events fire on every client (worst case: originator refetches
+        once, harmless)."""
+        try:
+            return (request.headers.get("x-client-id") or "").strip()
+        except Exception:
+            return ""
+
+    # ── edition gating (2026-09-04) ──────────────────────────────
+    # Single source of truth for basic vs full lives in
+    # cobot_dashboard.edition (module-level FEATURE_MAP +
+    # SAFETY_INVARIANT_KEYS rejection at import). This endpoint
+    # answers "what edition am I?" for the calling device; the
+    # unlock/lock endpoints persist per-X-Client-Id overrides.
+    from cobot_dashboard import edition as _edition_mod
+
+    def _require_full_edition(request, feature_key: str):
+        """Return a JSONResponse refusal (or None if allowed). Apply on
+        the FIRST line of any full-only endpoint so a basic device
+        cannot reach the surface via a direct fetch (UI-hiding alone
+        is not a gate)."""
+        client_id = _client_id_of(request)
+        ed = _edition_mod.resolve_edition(client_id)
+        if _edition_mod.is_feature_enabled(feature_key, ed):
+            return None
+        payload = _edition_mod.refusal_payload(feature_key)
+        payload['edition'] = ed
+        return JSONResponse(payload, status_code=403)
+
+    @app.get("/api/edition")
+    async def api_edition_get(request: Request):
+        client_id = _client_id_of(request)
+        ed = _edition_mod.resolve_edition(client_id)
+        return {
+            'edition':          ed,
+            'default':          _edition_mod._load_store().get(
+                                    'default', _edition_mod.EDITION_BASIC),
+            'client_id':        client_id,
+            'is_full':          ed == _edition_mod.EDITION_FULL,
+            'safety_invariant_keys': sorted(_edition_mod.SAFETY_INVARIANT_KEYS),
+        }
+
+    @app.get("/api/edition/features")
+    async def api_edition_features():
+        """Full feature map + editions. The frontend hydrates this on
+        boot so its lib/edition.js mirror can be validated against the
+        server truth at runtime (belt-and-braces to the byte-mirror
+        test at commit time)."""
+        return {
+            'editions': list(_edition_mod.EDITIONS),
+            'features': dict(_edition_mod.FEATURE_MAP),
+            'safety_invariant_keys': sorted(_edition_mod.SAFETY_INVARIANT_KEYS),
+        }
+
+    @app.post("/api/edition/unlock")
+    async def api_edition_unlock(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        client_id = _client_id_of(request)
+        if not client_id:
+            return JSONResponse({
+                'ok': False,
+                'error': 'X-Client-Id header required for edition unlock',
+            }, status_code=400)
+        passphrase = str(body.get('passphrase') or '')
+        ok = _edition_mod.unlock_device(client_id, passphrase)
+        if not ok:
+            return JSONResponse({
+                'ok': False,
+                'error': 'unlock refused',
+                'reason_code': 'bad_passphrase',
+            }, status_code=403)
+        return {
+            'ok': True,
+            'edition': _edition_mod.resolve_edition(client_id),
+            'client_id': client_id,
+        }
+
+    @app.post("/api/edition/lock")
+    async def api_edition_lock(request: Request):
+        client_id = _client_id_of(request)
+        if not client_id:
+            return JSONResponse({
+                'ok': False,
+                'error': 'X-Client-Id header required',
+            }, status_code=400)
+        _edition_mod.lock_device(client_id)
+        return {
+            'ok': True,
+            'edition': _edition_mod.resolve_edition(client_id),
+        }
+
+    def _save_prog_with_event(prog, path, prog_id, source_client, kind):
+        """Bump the program's revision, stash it into the file, save,
+        and emit a program_changed event onto the /ws/state ring so
+        every other client sees the mutation. Wire evidence: PUT
+        /programs/{id} + POST/PUT/DELETE /programs/{id}/points all
+        route through this — the editor's cross-client 'tablet teaches,
+        PC updates' contract lives on this call site.
+
+        Seed the in-memory rev counter from the on-disk `rev` field so
+        a service restart doesn't reset a program's revision back to 1
+        when clients still hold higher local revs from before the
+        restart (their `rev > local` check would then never fire even
+        though the file did change)."""
+        with _prog_event_lock:
+            if prog_id not in _prog_revs:
+                _prog_revs[prog_id] = int(prog.get("rev") or 0)
+        rev = _bump_prog_rev(prog_id)
+        prog["rev"] = rev
+        _save_prog(prog, path)
+        _emit_program_changed(prog_id, rev, source_client, kind)
+        return rev
+
+    def _next_point_name(points):
+        """p1, p2, ... — skip any already taken so a renamed point
+        doesn't reappear as the next auto-name."""
+        n = 1
+        while f'p{n}' in points:
+            n += 1
+        return f'p{n}'
+
+    def _points_in_use(prog, name):
+        """Return the list of step indices that reference this point by
+        `point_name` (new schema). Used by DELETE to refuse removals
+        that would leave dangling references."""
+        used = []
+        for i, s in enumerate(prog.get("steps") or []):
+            if isinstance(s, dict) and s.get("point_name") == name:
+                used.append(i)
+        return used
+
+    def _bump_has_taught_poses(prog):
+        """No-op — has_taught_poses is a derived read-time flag on GET.
+        Kept as a named function so future authors don't inline
+        recompute-and-store logic here (which would silently drift)."""
+        return
+
+    @app.post("/api/programs/{prog_id}/points")
+    async def api_program_teach_point(prog_id: str, request: Request):
+        """Snapshot the arm's live pose and record it as a taught
+        point on the program. Body:
+            { label?: str, name?: str }
+        `name` auto-mints p1/p2/... if absent. `label` is a human
+        display string (rendered in the Points panel next to the
+        auto-name). If a name collides with an existing point, the
+        response is 409 — retach uses PUT."""
+        prog, path = _load_prog(prog_id)
+        if prog is None:
             return JSONResponse({"error": "not found"}, status_code=404)
         try:
-            os.remove(path)
-        except Exception as e:
-            return JSONResponse({"error": f"delete failed: {e}"}, status_code=500)
-        return {"ok": True}
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        joints, tcp = _snapshot_current_pose()
+        if joints is None:
+            return JSONResponse(
+                {"error": "no live pose — driver hasn't published joints_deg yet"},
+                status_code=503)
+
+        points = dict(prog.get("points") or {})
+        name = str(body.get("name") or "").strip() or _next_point_name(points)
+        if not _POINT_NAME_RE.match(name):
+            return JSONResponse(
+                {"error": f"invalid point name {name!r} — expected letters/digits/_ starting with a letter"},
+                status_code=400)
+        if name in points:
+            return JSONResponse(
+                {"error": f"point {name!r} already exists — use PUT to re-teach"},
+                status_code=409)
+
+        label = body.get("label")
+        if label is not None:
+            label = str(label)[:80]
+
+        points[name] = {
+            "joints":   joints,
+            "tcp":      tcp,           # may be None
+            "label":    label,
+            "taught_at": datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+        }
+        prog["points"] = points
+        new_rev = _save_prog_with_event(
+            prog, path, prog_id, _client_id_of(request), "point_teach")
+
+        return {"ok": True, "point": points[name] | {"name": name},
+                "program": prog, "rev": new_rev}
+
+    @app.put("/api/programs/{prog_id}/points/{name}")
+    async def api_program_update_point(prog_id: str, name: str, request: Request):
+        """Re-teach (snapshot current pose into an existing point) OR
+        rename OR relabel. Body fields (all optional):
+            retach:   true → overwrite joints/tcp with current pose
+            label:    new label
+            new_name: rename (validated + collision-checked; updates
+                      step.point_name references atomically)
+        Sending an empty body is a no-op that just returns the current
+        program.
+        """
+        prog, path = _load_prog(prog_id)
+        if prog is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        points = dict(prog.get("points") or {})
+        if name not in points:
+            return JSONResponse({"error": f"point {name!r} not found"},
+                                status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        pt = dict(points[name])
+
+        if body.get("retach"):
+            j, t = _snapshot_current_pose()
+            if j is None:
+                return JSONResponse(
+                    {"error": "no live pose to retach with"},
+                    status_code=503)
+            pt["joints"] = j
+            pt["tcp"] = t
+            pt["taught_at"] = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
+        if "label" in body:
+            lab = body["label"]
+            pt["label"] = str(lab)[:80] if lab is not None else None
+
+        new_name = body.get("new_name")
+        if new_name is not None:
+            nn = str(new_name).strip()
+            if nn != name:
+                if not _POINT_NAME_RE.match(nn):
+                    return JSONResponse(
+                        {"error": f"invalid new_name {nn!r}"},
+                        status_code=400)
+                if nn in points:
+                    return JSONResponse(
+                        {"error": f"point {nn!r} already exists"},
+                        status_code=409)
+                # Move the entry AND update step references so no step
+                # is left pointing at a dead name. Atomic with the file
+                # write below.
+                del points[name]
+                points[nn] = pt
+                for s in prog.get("steps") or []:
+                    if isinstance(s, dict) and s.get("point_name") == name:
+                        s["point_name"] = nn
+                name = nn
+            else:
+                points[name] = pt
+        else:
+            points[name] = pt
+
+        prog["points"] = points
+        new_rev = _save_prog_with_event(
+            prog, path, prog_id, _client_id_of(request), "point_put")
+        return {"ok": True, "point": points[name] | {"name": name},
+                "program": prog, "rev": new_rev}
+
+    @app.delete("/api/programs/{prog_id}/points/{name}")
+    async def api_program_delete_point(prog_id: str, name: str, request: Request):
+        """Delete a taught point. Refuses (409) if any step references
+        the point by `point_name` — the operator has to either
+        re-target the step first or delete the step. This is the
+        block-or-reassign rule the operator asked for; auto-reassign
+        would be lossy (which point do we pick?) and silent point
+        drop would leave the program broken."""
+        prog, path = _load_prog(prog_id)
+        if prog is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        points = dict(prog.get("points") or {})
+        if name not in points:
+            return JSONResponse({"error": f"point {name!r} not found"},
+                                status_code=404)
+        in_use = _points_in_use(prog, name)
+        if in_use:
+            return JSONResponse(
+                {"error": f"point {name!r} in use by step(s) {in_use}",
+                 "in_use_by": in_use},
+                status_code=409)
+        del points[name]
+        prog["points"] = points
+        new_rev = _save_prog_with_event(
+            prog, path, prog_id, _client_id_of(request), "point_delete")
+        return {"ok": True, "program": prog, "rev": new_rev}
 
     # ------------------------------------------------------------------
     # Programming by Demonstration (/api/pbd/*).
@@ -3700,15 +11151,114 @@ if FASTAPI_AVAILABLE:
             return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
         return store.load_all_files(did)
 
+    @app.post("/api/pbd/{demo_id}/recompose")
+    async def api_pbd_recompose(demo_id: str, request: Request):
+        """Re-run the composer on a stored demo's intent — the fix
+        path for a draft that was generated before an effector /
+        source / other composer-shape flip. Reads structured_intent.
+        json from the demo's directory, applies optional overrides
+        from the request body (currently: effector), calls
+        compose_program_draft, and returns the fresh draft dict. Does
+        NOT overwrite program_draft.json on disk (the operator can
+        still Accept via /correct to persist).
+
+        Body: {effector?: 'vacuum'|'finger'|'magnetic', intent?: <full
+        intent override — the frontend can pass an intent that has
+        already had clarifications applied>}
+
+        This exists because a review screen with the wrong effector-
+        emitted steps can't be repaired by simple relabelling — the
+        step LIST needs to change (vacuum's engage/disengage steps
+        replace grip_close/grip_release entirely, with the blow-off
+        triplet inserted after disengage). Re-invoking the composer
+        deterministic-ally regenerates the whole thing."""
+        did = demo_id.strip()
+        try:
+            store = _pbd_store()
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        demo_dir = store.dir_for(did)
+        intent_path = os.path.join(demo_dir, 'structured_intent.json')
+        if not os.path.isfile(intent_path):
+            return JSONResponse({
+                "ok": False,
+                "error": f"no structured_intent.json for demo {did!r}",
+            }, status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            with open(intent_path) as f:
+                intent_raw = json.load(f)
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"intent read failed: {e}",
+            }, status_code=500)
+        # Full-intent override wins; otherwise apply named overrides.
+        if isinstance(body.get('intent'), dict):
+            intent_raw = body['intent']
+        eff = body.get('effector')
+        if isinstance(eff, str) and eff.lower() in ('finger', 'vacuum', 'magnetic'):
+            for op in (intent_raw.get('operations') or []):
+                if isinstance(op, dict): op['effector'] = eff.lower()
+        # Parse + compose using the same PBD pipeline the initial
+        # generate flow uses.
+        try:
+            from programming_by_demonstration.schema import StructuredIntent
+            from programming_by_demonstration.program_composer import compose_program_draft
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"pbd import failed: {e}",
+            }, status_code=500)
+        try:
+            intent = StructuredIntent.from_dict(intent_raw)
+            draft = compose_program_draft(intent, demo_id=did)
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"compose failed: {e}",
+            }, status_code=500)
+        return {
+            "ok":     True,
+            "demo_id": did,
+            "draft":  draft.to_program_payload(),
+            "intent": intent.to_dict(),
+        }
+
     @app.post("/api/pbd/{demo_id}/correct")
     async def api_pbd_correct(demo_id: str, request: Request):
         """Operator accepted the (possibly edited) draft. Body:
             { program: <full program payload — same shape as POST /api/programs>,
+              intent:  <answered structured intent — client folded
+                        clarifications via applyClarifications>,
+              scene:   <corrected scene>,
+              clarifications_answered: {...},
               save_to_library: true }
-        We save through the existing /api/programs path internally so
-        the saved file ends up identical to a wizard-saved program, then
-        write human_corrected.json (the gold training signal) into the
-        learning store."""
+
+        Architectural fix (2026-07-27, PBD answer-application audit):
+        BEFORE this pass, Accept saved `body.program.steps` verbatim.
+        If the operator's answers required a STEP-LIST restructure
+        (effector vacuum→engage/disengage, target_part label refresh,
+        location_hint downstream), the client-side folder didn't
+        rebuild the list — the manual ↻ Regenerate button was the
+        only path that did. Result: "vacuum" answered, "Grip part"
+        saved (whitebowl demo demo_20260727T161927_e475ef).
+
+        Now: whenever `body.intent` carries answered operations, we
+        recompose server-side (same deterministic compose_program_draft
+        the ↻ button uses) and OVERWRITE `program.steps` with the
+        composed output before persisting. Everything else on
+        `program` (name, description, tags, config, and any client-
+        appended `loop` step for cycles) is preserved.
+
+        Fallback: if intent is missing / malformed / the composer
+        raises, we save the client's draft as-is with a `warning`
+        entry in the response so old clients keep working. Better to
+        save what the operator saw than lose their work.
+        """
         try:
             body = await request.json()
         except Exception:
@@ -3721,11 +11271,55 @@ if FASTAPI_AVAILABLE:
         if not did:
             return JSONResponse({"ok": False, "error": "bad demo_id"}, status_code=400)
 
+        # Server-side recompose — the actual bug fix.
+        recompose_warning = None
+        recomposed = False
+        intent_in = body.get('intent') if isinstance(body.get('intent'), dict) else None
+        if intent_in and (intent_in.get('operations') or []):
+            try:
+                from programming_by_demonstration.schema import StructuredIntent
+                from programming_by_demonstration.program_composer import compose_program_draft
+                composed = compose_program_draft(
+                    StructuredIntent.from_dict(intent_in), demo_id=did)
+                composed_payload = composed.to_program_payload()
+                composed_steps = list(composed_payload.get('steps') or [])
+                # Preserve the operator's client-appended `loop` step
+                # (cycles > 1). It always sits at the tail; the composer
+                # never emits one, so we can splice safely.
+                client_loop_steps = [
+                    s for s in (program.get('steps') or [])
+                    if isinstance(s, dict) and s.get('action') == 'loop'
+                ]
+                if client_loop_steps:
+                    composed_steps = composed_steps + client_loop_steps
+                # Overwrite steps with the composed output. Renumber
+                # `step` fields to stay contiguous (composer numbers
+                # its own output, but appending the loop can leave a
+                # gap).
+                for i, s in enumerate(composed_steps, 1):
+                    if isinstance(s, dict):
+                        s['step'] = i
+                program = {**program, 'steps': composed_steps}
+                # If the composer produced a description that differs
+                # from the client's, prefer the client's — the operator
+                # may have hand-edited it.
+                recomposed = True
+            except Exception as e:
+                # Fall back to the client's draft; surface the warning
+                # so the client can decide whether to re-try. Never
+                # block Accept — losing the operator's work is worse
+                # than saving a possibly-stale draft.
+                recompose_warning = f'{type(e).__name__}: {e}'
+                print(f'[pbd] server recompose failed for {did}: '
+                      f'{recompose_warning}', flush=True)
+
         program_id = None
         if body.get('save_to_library', True):
             # Mint a slug using the same convention as POST /api/programs.
+            # NO underscore — see _PROG_ID_RE comment for the controller-
+            # side URL-parser split rationale.
             name = str(program.get('name')).strip()
-            base = _prog_re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or 'program'
+            base = _prog_re.sub(r'[^a-z0-9]+', '', name.lower()) or 'program'
             try:
                 os.makedirs(_PROG_DIR, exist_ok=True)
             except Exception as e:
@@ -3735,7 +11329,7 @@ if FASTAPI_AVAILABLE:
             slug = base
             n = 2
             while os.path.exists(os.path.join(_PROG_DIR, slug + '.json')):
-                slug = f"{base}_{n}"
+                slug = f"{base}{n}"
                 n += 1
             ts = _now_stamp()
             saved = {
@@ -3745,6 +11339,14 @@ if FASTAPI_AVAILABLE:
                 "tags":        list(program.get('tags') or []) + ['from_demonstration'],
                 "config":      program.get('config') or {},
                 "steps":       list(program.get('steps') or []),
+                # PBD-corrected save path — source is authoritative
+                # here (the program originated from a recorded demo,
+                # even if the operator hand-corrected the intent and
+                # taught real poses afterward). Downstream backfill
+                # rules concur via config.pbd_metadata inference, but
+                # having the field explicit avoids the inference on
+                # every read.
+                "source":      "demonstration",
                 "created":     ts,
                 "updated":     ts,
             }
@@ -3797,9 +11399,24 @@ if FASTAPI_AVAILABLE:
         except Exception as e:
             print(f'[pbd] correction_diff capture failed for {did}: '
                   f'{type(e).__name__}: {e}', flush=True)
-        out = {"ok": True, "demo_id": did, "program_id": program_id}
+        # Echo back the FINAL program the server actually persisted —
+        # steps, id, everything. The client's accept() replaces its
+        # local draft with this so the review re-renders what got
+        # saved (no more silent divergence between screen and disk).
+        final_program = None
+        if body.get('save_to_library', True):
+            try:
+                final_program = saved   # defined above when we wrote to disk
+            except NameError:
+                final_program = program
+        else:
+            final_program = program
+        out = {"ok": True, "demo_id": did, "program_id": program_id,
+               "program": final_program, "recomposed": recomposed}
         if diff_summary is not None:
             out["diff_summary"] = diff_summary
+        if recompose_warning is not None:
+            out["recompose_warning"] = recompose_warning
         return out
 
     @app.get("/api/pbd/dataset/stats")
@@ -3837,6 +11454,76 @@ if FASTAPI_AVAILABLE:
     @app.get("/api/io/state")
     async def api_io_state():
         return {"io": _IO_STATE}
+
+    # Live merged snapshot from the driver's IOManager/GetIOValue +
+    # GetIOInfo poll. Returned verbatim; the frontend renders the
+    # `value` and `forced` fields on each row. `allow_io` mirrors the
+    # driver's gate — the frontend uses it to disable the toggles
+    # when writes would be refused.
+    @app.get("/api/io/live")
+    async def api_io_live():
+        with _state_lock:
+            live = STATE.get('io_live')
+            robot = STATE.get('robot') or {}
+        if not live:
+            return {"ok": False,
+                    "reason": "driver has not published /estun/io yet",
+                    "allow_io": False,
+                    "robot_mode_code": robot.get('robot_mode_code', -1)}
+        return {"ok": True,
+                "robot_mode_code": robot.get('robot_mode_code', -1),
+                **live}
+
+    # Manual DO / DI-force write. Body: {port: int, value: 0|1, type: "DO"|"DI"}.
+    # This publishes onto /robot/io_set; the driver enforces the
+    # monitor_only + allow_io + SM==READY gate and emits
+    # IOManager/SetIOForcedFlag. Refusals surface on /estun/rejected
+    # (family='io').
+    @app.post("/api/io/force")
+    async def api_io_force(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            port = int(body.get('port'))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "port required (integer)"}, status_code=400)
+        typ = str(body.get('type') or '').upper()
+        if typ not in ('DI', 'DO'):
+            return JSONResponse({"error": "type must be 'DI' or 'DO'"}, status_code=400)
+        val = 1 if body.get('value') else 0
+        with _state_lock:
+            r = STATE.get("robot", {})
+            allow_io = bool(r.get('allow_io', False))
+            monitor_only = bool(r.get('monitor_only', True))
+            rej_before = len(r.get('rejected', []))
+        if _ros_node is None:
+            return JSONResponse({"error": "ros not available"}, status_code=503)
+        payload = {"port": port, "value": val, "type": typ}
+        m = String(); m.data = json.dumps(payload)
+        _ros_node._estun_io_set_pub.publish(m)
+        # Give the driver a short window to reject/ack. If the gate is
+        # closed the driver publishes on /estun/rejected; if not, the
+        # next /estun/io snapshot will carry the new forced/value.
+        deadline = time.time() + 0.6
+        outcome = {"kind": "published"}
+        while time.time() < deadline:
+            await asyncio.sleep(0.05)
+            with _state_lock:
+                r = STATE.get('robot', {})
+                new_rej = r.get('rejected', [])[rej_before:]
+                io_rejects = [x for x in new_rej if x.get('family') == 'io']
+                if io_rejects:
+                    outcome = {"kind": "rejected",
+                               "reason": io_rejects[0].get('reason')}
+                    break
+        return {
+            "ok": outcome["kind"] == "published",
+            "outcome": outcome,
+            "request": payload,
+            "gate": {"allow_io": allow_io, "monitor_only": monitor_only},
+        }
 
     @app.post("/api/io/set")
     async def api_io_set(request: Request):
@@ -3929,6 +11616,684 @@ if FASTAPI_AVAILABLE:
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
         return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # I/O Port Map — verified against the factory-controller WS capture
+    # at data/estun_captures/estun_io_20260721.har.
+    #
+    # Schema v3 replaces the earlier provisional block layout with the
+    # authoritative channel inventory reported by IOManager/GetIOInfo:
+    #   DI: 24 channels — general DI0-15 + modeSwitch@16 + enableButton@17
+    #                     + flangeButton0-3@18-21 (flangeButton0 name
+    #                     defaults to "Drag", function ['robotDrag',0,null])
+    #                     + flangeDI0/1@22-23
+    #   DO: 18 channels — general DO0-15 + flangeDO0/1@16-17
+    #   AI: 4 channels  — AI0-3
+    #   AO: 4 channels  — AO0-3
+    #
+    # Layout is organised by functional group (general / system-reserved /
+    # flange / analog) rather than the earlier CC10-A back-panel plug
+    # order — the panel-plug view was provisional and superseded by the
+    # controller's own enumeration.
+    #
+    # Wire verbs (documented in the emitted payload as `verbs`) come
+    # from the same capture:
+    #   IOManager/GetIOInfo      — enumerate, returns names + forced flags
+    #                              + function bindings
+    #   IOManager/GetIOValue     — batch read, request/response
+    #                              [{type,port,value}, ...]
+    #   IOManager/SetIOForcedFlag — force override (test-inject); ONLY
+    #                              type:"DI" seen in this capture; DO
+    #                              force + unforce/release verb are
+    #                              SOURCE-ONLY (unverified on the wire).
+    #
+    # Nothing in this module invokes those verbs. Driver-side bridge +
+    # allow_io gate + codegen extensions land in a follow-up pass, after
+    # a live-first force → GetIOValue round-trip is verified.
+    # ------------------------------------------------------------------
+    _IO_MAP_PATH    = '/opt/cobot/io_map.json'
+    _IO_MAP_VERSION = 5
+
+    # Controller nameplate — captured from the silkscreen label plate on
+    # the back of the CC10-A controller on 2026-07-21.
+    _IO_NAMEPLATE = {
+        'model':     'CC10-A',
+        'power_w':   1500,
+        'voltage':   '1PH AC 100-240V',
+        'current_a': 8,
+        'serial':    '12605280821',
+    }
+
+    # Provenance for every data source that shapes this map. Keeping
+    # these strings on the payload lets the frontend show operators
+    # exactly which capture verified each part of the layout.
+    _IO_SOURCES = {
+        'physical': 'controller back-panel silkscreen label plate (2026-07-21)',
+        'software': 'data/estun_captures/estun_io_20260721.har (IOManager/GetIOInfo)',
+        'lua':      'data/estun_captures/estun_lua_io_v2_20260721.har (luaenginelib.json)',
+    }
+
+    # Kind-level electrical specs — reference tooltips only. Numbers
+    # come from the manual OCR the operator confirmed:
+    #   DI: 24 V typ / 30 V max, ~10 kΩ, PNP or NPN
+    #   DO: 24 V typ / 30 V max, max 125 mA per group, PNP
+    #   External supply: 24 V, 1 A per group
+    _IO_SPECS = {
+        'DI': {
+            'voltage_typ_v': 24, 'voltage_max_v': 30,
+            'impedance_kohm': 10, 'polarity': 'PNP or NPN',
+            'terminals': ['24V', 'COM', 'DI'],
+            'notes': 'External supply 24 V, 1 A per group.',
+        },
+        'DO': {
+            'voltage_typ_v': 24, 'voltage_max_v': 30,
+            'current_max_ma': 125, 'polarity': 'PNP',
+            'terminals': ['24V', 'COM', 'DO'],
+            'notes': 'Max 125 mA per DO group. External supply 24 V, 1 A per group.',
+        },
+        'AI': {
+            'terminals': ['AI+', 'AI-', 'AGND'],
+            'notes': 'Analog inputs, controller-mapped port 0-3.',
+        },
+        'AO': {
+            'terminals': ['AO+', 'AO-'],
+            'notes': 'Analog outputs, controller-mapped port 0-3.',
+        },
+        'SYSTEM': {
+            'notes': ('System-reserved DIs owned by the controller '
+                       '(modeSwitch, enableButton). Read-only from the '
+                       'operator UI — do not force.'),
+        },
+        'FLANGE': {
+            'notes': ('Tool-flange I/O on the end-effector connector. '
+                       'Flange DI is PNP. Flange DO can be PNP signal-only '
+                       '(≤5 mA) or NPN drive. flangeButton0 defaults to '
+                       'the "Drag" function (robotDrag).'),
+            'flange_di_polarity': 'PNP',
+            'flange_do_modes': ['PNP signal-only (≤5 mA)', 'NPN drive'],
+        },
+    }
+
+    # Wire verbs — the operator-visible spec for how I/O is read, forced,
+    # and written. Two layers:
+    #
+    #   1. `ws` verbs: application-facing WebSocket messages the factory
+    #      UI sends to the controller for testing (force override) and
+    #      polling (batch read). Documented from the capture at
+    #      data/estun_captures/estun_io_20260721.har.
+    #
+    #   2. `lua` verbs: names emitted INSIDE a saved Lua project so a
+    #      running program can flip DO / read DI / (etc.). Documented
+    #      verbatim from the controller's own
+    #      /webmodel/cocontrol/luaeditor/luaenginelib.json (168-entry
+    #      Lua template library), captured in
+    #      data/estun_captures/estun_lua_io_v2_20260721.har.
+    #
+    # Every string here is the exact spelling the controller uses.
+    _IO_VERBS = {
+        # -------------------- WebSocket / testing side --------------------
+        'enumerate': {
+            'ty': 'IOManager/GetIOInfo',
+            'layer': 'ws',
+            'request':  {'ty': 'IOManager/GetIOInfo', 'db': '', 'id': '<client_id>'},
+            'response': {'ty': 'IOManager/GetIOInfo', 'db':
+                {'DI': [{'port': 0, 'defaultName': 'DI0', 'name': 'DI0',
+                         'forced': 0, 'function': None}],
+                 'DO': [{'port': 0, 'defaultName': 'DO0', 'name': 'DO0',
+                         'forced': 0, 'function': None}],
+                 'AI': [{'port': 0, 'defaultName': 'AI0', 'name': 'AI0',
+                         'forced': 0, 'function': None}],
+                 'AO': [{'port': 0, 'defaultName': 'AO0', 'name': 'AO0',
+                         'forced': 0, 'function': None}]}},
+            'notes': 'Wire-verified. Full enumeration of all 4 kinds.',
+        },
+        'read': {
+            'ty': 'IOManager/GetIOValue',
+            'layer': 'ws',
+            'request':  {'ty': 'IOManager/GetIOValue',
+                         'db': [{'type': 'DI', 'port': 0}],
+                         'id': '<client_id>'},
+            'response': {'ty': 'IOManager/GetIOValue',
+                         'db': [{'type': 'DI', 'port': 0, 'value': 0}]},
+            'cadence_ms_median': 500,
+            'notes': 'Wire-verified. Batch read; mixed-kind batches legal by shape.',
+        },
+        'force': {
+            'ty': 'IOManager/SetIOForcedFlag',
+            'layer': 'ws',
+            'request':  {'ty': 'IOManager/SetIOForcedFlag',
+                         'db': {'port': 2, 'value': 1, 'type': 'DI'},
+                         'id': '<client_id>'},
+            'response': {'ty': 'IOManager/SetIOForcedFlag', 'db': None},
+            'wire_types_seen': ['DI'],
+            'notes': ('Wire-verified for type:"DI" only. type:"DO" '
+                       'is SPEC-CONSISTENT but unverified; must be '
+                       'exercised live before opening the gate for DO force.'),
+        },
+        'unforce': {
+            'ty': 'IOManager/SetIOForcedFlag?  (unverified)',
+            'layer': 'ws',
+            'notes': 'SOURCE-ONLY — no unforce/release call ever observed.',
+        },
+        # -------------------- Lua / program-execution side ----------------
+        # All entries below are keys in luaenginelib.json — the
+        # controller's Lua template library. Exact spellings.
+        'lua_movJ': {
+            'ty': 'movJ',
+            'layer': 'lua',
+            'signature': 'movJ(p1, {v=..., a=..., b=..., rb=..., coor=..., tool=..., search=..., onpercent=...})',
+            'notes': 'Wire-verified. Emitted by program_ops.codegen_lua_from_program.',
+        },
+        'lua_movL': {
+            'ty': 'movL',
+            'layer': 'lua',
+            'signature': 'movL(p1, {v=..., a=..., b=..., rb=..., coor=..., tool=..., search=..., onpercent=...})',
+            'notes': 'Wire-verified. Not yet emitted (motion codegen only emits movJ).',
+        },
+        'lua_setDO': {
+            'ty': 'setDO',
+            'layer': 'lua',
+            'signature': 'setDO(port, value)',
+            'notes': ('Wire-verified. Emitted for set_io steps whose '
+                       'io_id starts with "DO". value coerced to 0/1.'),
+        },
+        'lua_setAO': {
+            'ty': 'setAO',
+            'layer': 'lua',
+            'signature': 'setAO(port, value)',
+            'notes': ('Wire-verified. Emitted for set_io steps whose '
+                       'io_id starts with "AO".'),
+        },
+        'lua_getDI': {
+            'ty': 'getDI',
+            'layer': 'lua',
+            'signature': 'val = getDI(port)',
+            'notes': ('Wire-verified. Emitted for wait_input steps as '
+                       'a bare read: `_diN = getDI(port)`. A blocking '
+                       'wait-until-value pattern would compose with '
+                       'waitCondition, which has an undocumented timeout '
+                       'unit — not emitted.'),
+        },
+        'lua_getDO': {
+            'ty': 'getDO',
+            'layer': 'lua',
+            'signature': 'val = getDO(port)',
+            'notes': 'Wire-verified. Not yet emitted.',
+        },
+        'lua_getAI': {
+            'ty': 'getAI',
+            'layer': 'lua',
+            'signature': 'val = getAI(port)',
+            'notes': 'Wire-verified. Not yet emitted.',
+        },
+        'lua_delay': {
+            'ty': '<absent>',
+            'layer': 'lua',
+            'signature': 'res = waitCondition(condition, timeout)  (only wait-shaped verb)',
+            'notes': ('DEFINITIVELY ABSENT. Full audit of luadoc.json '
+                       '(11 placeholder keys) and luaenginelib.json '
+                       '(168 verbs) turned up NO plain sleep/wait/'
+                       'delay/pause/tick/timer verb. Zero uses of '
+                       '"ms", "sec", "second", or "millisec" anywhere '
+                       'in any template or example. The only wait-'
+                       'shaped primitives are waitCondition, '
+                       'waitConnectSocketServer, waitConveyorObj — '
+                       'all take a `timeout` whose unit is not '
+                       'documented. codegen emits `-- skipped` for '
+                       '`action == "wait"` until a save-shape capture '
+                       'of the factory UI Wait node lands.'),
+        },
+    }
+
+    # ------------------------------------------------------------------
+    # CC10-A physical plate — silkscreen-accurate terminal layout.
+    #
+    # Each `plate` block is one physical connector on the controller
+    # back panel. Terminals are listed in silkscreen order so the UI
+    # can render them as a real wiring diagram. Terminal `role` field:
+    #   signal   — a channel operators can assign (DI/DO/AI/AO/HDI)
+    #   power    — 24V / 12V rails
+    #   return   — 0V / GND / COM / AGND
+    #   bus      — CAN / RS-485
+    #   control  — ON / OFF / EN
+    #   safety   — VO / ES / CH terminals
+    #   aux      — FUSE, misc
+    # Signal terminals additionally carry `kind` + `port`.
+    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
+    # Physical-plate terminal builders — v3 layout (2026-07-22)
+    #
+    # Every card mirrors the CC10-A back panel silkscreen 1:1 so an
+    # operator at the cabinet can count connectors left→right and
+    # match the screen. Two ordering rules matter:
+    #
+    #   1. DI / DO signal rows carry `pair_tag` = the return terminal
+    #      the operator physically lands the return wire on (0V for
+    #      DI-A / DO-A, 24V for DI-B / DO-B). The frontend renders
+    #      pair_tag as a small right-side chip on each row.
+    #
+    #   2. M-FUNC and PWR banks use `layout: 'pair-rows'` blocks where
+    #      each row is a [left, right] terminal pair — verbatim from
+    #      the silkscreen (not the logical order the earlier v1/v2
+    #      renderer used).
+    # ────────────────────────────────────────────────────────────
+
+    def _mfunc_cell(name, role, **extra):
+        return {'name': name, 'role': role, **extra}
+
+    def _plate_mfunc_pair_rows():
+        """8 rows, 2 columns — silkscreen order left→right, top→bottom.
+        HDI1-4 stay as signal terminals so the toggle + live pill still
+        light up on those cells."""
+        return [
+            [_mfunc_cell('CAN+',   'bus'),     _mfunc_cell('485A1',  'bus')],
+            [_mfunc_cell('CAN-',   'bus'),     _mfunc_cell('485B1',  'bus')],
+            [_mfunc_cell('ON/OFF', 'control'), _mfunc_cell('485A2',  'bus')],
+            [_mfunc_cell('12V',    'power'),   _mfunc_cell('485B2',  'bus')],
+            [_mfunc_cell('COM',    'return'),  _mfunc_cell('EN',     'control')],
+            [_mfunc_cell('HDI1',   'signal', kind='HDI', port=1),
+             _mfunc_cell('HDI2',   'signal', kind='HDI', port=2)],
+            [_mfunc_cell('COM2',   'return'),  _mfunc_cell('COM2',   'return')],
+            [_mfunc_cell('HDI3',   'signal', kind='HDI', port=3),
+             _mfunc_cell('HDI4',   'signal', kind='HDI', port=4)],
+        ]
+
+    def _plate_di_a_terminals():
+        """DI0..DI7 — SINK wiring, each row paired with 0V (rendered as
+        a small right-side tag on each row)."""
+        return [{'name': f'DI{i}', 'role': 'signal', 'kind': 'DI',
+                 'port': i, 'pair_tag': '0V'}
+                for i in range(8)]
+
+    def _plate_di_b_terminals():
+        """DI8..DI15 — SOURCE wiring, each row paired with 24V."""
+        return [{'name': f'DI{i}', 'role': 'signal', 'kind': 'DI',
+                 'port': i, 'pair_tag': '24V'}
+                for i in range(8, 16)]
+
+    def _plate_do_a_terminals():
+        """DO0..DO7 — PNP output, each row's load returns to 0V."""
+        return [{'name': f'DO{i}', 'role': 'signal', 'kind': 'DO',
+                 'port': i, 'pair_tag': '0V'}
+                for i in range(8)]
+
+    def _plate_do_b_terminals():
+        """DO8..DO15 — PNP output, each row's load returns to 24V."""
+        return [{'name': f'DO{i}', 'role': 'signal', 'kind': 'DO',
+                 'port': i, 'pair_tag': '24V'}
+                for i in range(8, 16)]
+
+    def _plate_pwr_rail_pair_rows():
+        """Standalone 24V|0V power connector — 8 rows, 2 columns.
+        Rendered between DI-A / DI-B (slot 3) and between DO-A / DO-B
+        (slot 7) on the physical panel."""
+        return [[
+            _mfunc_cell('24V', 'power'),
+            _mfunc_cell('0V',  'return'),
+        ] for _ in range(8)]
+
+    def _plate_pwrcfg_pair_rows():
+        """PWR CFG connector — 4 rows + FUSE aux."""
+        return [
+            [_mfunc_cell('COM1', 'return'),  _mfunc_cell('0V',  'return')],
+            [_mfunc_cell('24V',  'power'),   _mfunc_cell('0V',  'return')],
+            [_mfunc_cell('24V',  'power'),   _mfunc_cell('0V',  'return')],
+            [_mfunc_cell('GND',  'return'),  _mfunc_cell('0V',  'return')],
+        ]
+
+    def _plate_aio_sections():
+        """One AI/O connector, silkscreened top→bottom: AO 0-3 then AI 0-3.
+        Each row is AOn|AGNDn (or AIn|AGND{n+4}) — a signal terminal
+        paired with its dedicated analog-ground return on the same row."""
+        ao_rows = [[
+            _mfunc_cell(f'AO{i}',    'signal', kind='AO', port=i,
+                        pair_tag=f'AGND{i}'),
+            _mfunc_cell(f'AGND{i}',  'return'),
+        ] for i in range(4)]
+        ai_rows = [[
+            _mfunc_cell(f'AI{i}',        'signal', kind='AI', port=i,
+                        pair_tag=f'AGND{i + 4}'),
+            _mfunc_cell(f'AGND{i + 4}',  'return'),
+        ] for i in range(4)]
+        return [
+            {'label': 'AO 0-3', 'rows': ao_rows},
+            {'label': 'AI 0-3', 'rows': ai_rows},
+        ]
+
+    def _plate_safety_terminals():
+        """Safety I/O terminals — order matches the CC10-A silkscreen
+        top→bottom (v3, 2026-07-22): VO2± / VO1± / ES4B± down to
+        ES1A± / CHA / CHB."""
+        ts = [
+            {'name': 'VO2+', 'role': 'safety'},
+            {'name': 'VO2-', 'role': 'safety'},
+            {'name': 'VO1+', 'role': 'safety'},
+            {'name': 'VO1-', 'role': 'safety'},
+        ]
+        # ES4B, ES4A, ES3B, ES3A, ES2B, ES2A, ES1B, ES1A — descending.
+        for i in (4, 3, 2, 1):
+            for ch in ('B', 'A'):
+                ts.append({'name': f'ES{i}{ch}+', 'role': 'safety'})
+                ts.append({'name': f'ES{i}{ch}-', 'role': 'safety'})
+        ts.append({'name': 'CHA', 'role': 'safety'})
+        ts.append({'name': 'CHB', 'role': 'safety'})
+        return ts
+
+    def _plate_flange_terminals():
+        # Software-enumerated (from IOManager/GetIOInfo) but NOT on the
+        # CC10-A back panel — these ride the tool-flange connector on
+        # the arm end. Kept separate so the plate view stays accurate.
+        return [
+            {'name': 'modeSwitch',    'role': 'signal', 'kind': 'DI', 'port': 16,
+             'default_name': 'modeSwitch',   'sw_group': 'system'},
+            {'name': 'enableButton',  'role': 'signal', 'kind': 'DI', 'port': 17,
+             'default_name': 'enableButton', 'sw_group': 'system'},
+            {'name': 'flangeButton0', 'role': 'signal', 'kind': 'DI', 'port': 18,
+             'default_name': 'Drag', 'function': ['robotDrag', 0, None]},
+            {'name': 'flangeButton1', 'role': 'signal', 'kind': 'DI', 'port': 19,
+             'default_name': 'flangeButton1'},
+            {'name': 'flangeButton2', 'role': 'signal', 'kind': 'DI', 'port': 20,
+             'default_name': 'flangeButton2'},
+            {'name': 'flangeButton3', 'role': 'signal', 'kind': 'DI', 'port': 21,
+             'default_name': 'flangeButton3'},
+            {'name': 'flangeDI0',     'role': 'signal', 'kind': 'DI', 'port': 22,
+             'default_name': 'flangeDI0'},
+            {'name': 'flangeDI1',     'role': 'signal', 'kind': 'DI', 'port': 23,
+             'default_name': 'flangeDI1'},
+            {'name': 'flangeDO0',     'role': 'signal', 'kind': 'DO', 'port': 16,
+             'default_name': 'flangeDO0'},
+            {'name': 'flangeDO1',     'role': 'signal', 'kind': 'DO', 'port': 17,
+             'default_name': 'flangeDO1'},
+        ]
+
+    def _io_map_default_plate():
+        """Physical CC10-A back panel — v3 layout (2026-07-22).
+
+        Nine cards in exact left→right silkscreen order. Each carries
+        a `slot` (1-9) so the frontend can render a position badge —
+        the operator counts connectors at the cabinet and matches to
+        the screen 1:1.
+
+        Layout hints:
+          layout='pair-rows'   → block carries `pair_rows` (list of
+                                  [left_terminal, right_terminal])
+                                  and NO flat `terminals`.
+          layout='sections'    → block carries `sections`
+                                  ([{label, rows}, ...]).
+          default (signals)    → block carries flat `terminals`.
+
+        The SAFETY card is the 10th block (kept below the row per the
+        v2 declutter — safety-PLC domain, not operator-actuated)."""
+        return [
+            {'id': 'MFUNC',  'slot': 1, 'kind': 'M-FUNC', 'group': 'system',
+             'label': 'M-Func',
+             'layout': 'pair-rows',
+             'pair_rows': _plate_mfunc_pair_rows(),
+             'notes': ('High-speed inputs HDI1-4, CAN bus, dual RS-485, '
+                        'ON/OFF, 12V/COM, EN, COM2.')},
+            {'id': 'DI-A',   'slot': 2, 'kind': 'DI', 'group': 'general',
+             'label': 'DI 0-7',
+             'wiring': {'mode': 'sink', 'return_rail': '0V'},
+             'terminals': _plate_di_a_terminals(),
+             'notes': ('Sink wiring — sensor pulls DIn LOW through 0V to signal ON. '
+                       'Manual is PNP/NPN capable; each row lands its return on 0V.')},
+            {'id': 'PWR-A',  'slot': 3, 'kind': 'PWR-CFG', 'group': 'system',
+             'label': 'Power (DI rail)',
+             'layout': 'pair-rows',
+             'pair_rows': _plate_pwr_rail_pair_rows(),
+             'notes': ('Dedicated 24V|0V connector between the two DI banks — '
+                       'silkscreen shows 8 rows of 24V|0V terminals.')},
+            {'id': 'DI-B',   'slot': 4, 'kind': 'DI', 'group': 'general',
+             'label': 'DI 8-15',
+             'wiring': {'mode': 'source', 'return_rail': '24V'},
+             'terminals': _plate_di_b_terminals(),
+             'notes': ('Source wiring — sensor pulls DIn HIGH from 24V to signal ON. '
+                       'Manual is PNP/NPN capable; each row lands its return on 24V.')},
+            {'id': 'PWRCFG', 'slot': 5, 'kind': 'PWR-CFG', 'group': 'system',
+             'label': 'Power / Fuse',
+             'layout': 'pair-rows',
+             'pair_rows': _plate_pwrcfg_pair_rows(),
+             'aux': [{'name': 'FUSE', 'role': 'aux'}],
+             'notes': 'External 24V field supply + system 0V/GND + FUSE lug.'},
+            {'id': 'DO-A',   'slot': 6, 'kind': 'DO', 'group': 'general',
+             'label': 'DO 0-7',
+             'wiring': {'mode': 'sink', 'return_rail': '0V'},
+             'terminals': _plate_do_a_terminals(),
+             'notes': ('PNP outputs, 125 mA per group — load between DOn and 0V rail.')},
+            {'id': 'PWR-B',  'slot': 7, 'kind': 'PWR-CFG', 'group': 'system',
+             'label': 'Power (DO rail)',
+             'layout': 'pair-rows',
+             'pair_rows': _plate_pwr_rail_pair_rows(),
+             'notes': ('Dedicated 24V|0V connector between the two DO banks — '
+                       'silkscreen shows 8 rows of 24V|0V terminals.')},
+            {'id': 'DO-B',   'slot': 8, 'kind': 'DO', 'group': 'general',
+             'label': 'DO 8-15',
+             'wiring': {'mode': 'source', 'return_rail': '24V'},
+             'terminals': _plate_do_b_terminals(),
+             'notes': ('PNP outputs, 125 mA per group — load between DOn and 24V rail.')},
+            {'id': 'AIO',    'slot': 9, 'kind': 'A-IO', 'group': 'analog',
+             'label': 'Analog I/O',
+             'layout': 'sections',
+             'sections': _plate_aio_sections(),
+             'notes': ('One connector, silkscreened AO 0-3 on top, AI 0-3 below. '
+                       'Each row is AOn|AGNDn (or AIn|AGND{n+4}) — signal paired '
+                       'with its own analog ground.')},
+            {'id': 'SAFETY', 'slot': None, 'kind': 'SAFETY', 'group': 'safety',
+             'label': 'Safety I/O',
+             'terminals': _plate_safety_terminals(),
+             'notes': ('VO1± / VO2± voltage-monitored outputs, ES1-ES4 '
+                        'dual-channel A/B E-stop inputs, CHA/CHB charge test.')},
+        ]
+
+    def _io_map_default_flange():
+        return {
+            'id':    'FLANGE',
+            'kind':  'FLANGE',
+            'group': 'flange',
+            'label': 'Tool Flange Connector (arm-end)',
+            'terminals': _plate_flange_terminals(),
+            'notes': ('Software-enumerated via IOManager/GetIOInfo but '
+                       'NOT on the CC10-A back-panel plate — these ride '
+                       'the tool-flange connector on the arm.'),
+        }
+
+    # ------------------------------------------------------------------
+    # Blocks view (derived) — the compact functional-group summary that
+    # the older v3 renderer consumed. Kept alongside the plate so
+    # consumers who only need per-channel data (like computeLineMap in
+    # the frontend) don't need to walk terminals.
+    # ------------------------------------------------------------------
+    def _iter_block_terminals(src: dict):
+        """Yield every terminal in any layout — flat `terminals`,
+        `pair_rows` (M-FUNC + PWR banks), or `sections` (AI/O).
+        Callers that only care about signal ports don't need to
+        branch on block.layout — this hides the shape difference."""
+        if isinstance(src.get('terminals'), list):
+            yield from src['terminals']
+        for row in src.get('pair_rows') or []:
+            for cell in row:
+                if isinstance(cell, dict):
+                    yield cell
+        for section in src.get('sections') or []:
+            for row in section.get('rows') or []:
+                for cell in row:
+                    if isinstance(cell, dict):
+                        yield cell
+                for cell in section.get('terminals') or []:
+                    if isinstance(cell, dict):
+                        yield cell
+
+    def _io_map_derive_blocks(plate: list, flange: dict) -> list:
+        blocks = []
+        for src in list(plate) + [flange]:
+            signals = [t for t in _iter_block_terminals(src) if t.get('role') == 'signal']
+            if not signals:
+                continue
+            rows = [{
+                'port':         t.get('port'),
+                'ch':           t['name'],
+                'default_name': t.get('default_name', t['name']),
+                'function':     t.get('function'),
+                'kind':         t.get('kind', src['kind']),
+            } for t in signals]
+            blocks.append({
+                'id':       src['id'],
+                'kind':     src['kind'],
+                'group':    src.get('group'),
+                'label':    src['label'],
+                'channels': [r['ch'] for r in rows],
+                'rows':     rows,
+                'readonly': src.get('group') == 'system',
+            })
+        return blocks
+
+    def _io_map_default_ports(plate: list, flange: dict) -> dict:
+        ports: dict = {}
+        for src in list(plate) + [flange]:
+            for t in _iter_block_terminals(src):
+                if t.get('role') != 'signal':
+                    continue
+                name = t['name']
+                dn = t.get('default_name', name)
+                sysflg = src.get('group') in ('system', 'flange', 'safety')
+                ports[name] = {
+                    'assignment': dn if sysflg else 'Unassigned',
+                    'in_use':     sysflg,
+                    'notes':      '',
+                }
+        return ports
+
+    def _io_map_default() -> dict:
+        plate  = _io_map_default_plate()
+        flange = _io_map_default_flange()
+        return {
+            'version':     _IO_MAP_VERSION,
+            'provisional': False,
+            'nameplate':   dict(_IO_NAMEPLATE),
+            'sources':     dict(_IO_SOURCES),
+            # `plate` is the primary rendering source (physical view).
+            'plate':       plate,
+            'flange':      flange,
+            # `blocks` is the derived functional-group view (kept for
+            # backward compat with the older frontend renderer).
+            'blocks':      _io_map_derive_blocks(plate, flange),
+            'specs':       copy.deepcopy(_IO_SPECS),
+            'verbs':       copy.deepcopy(_IO_VERBS),
+            'ports':       _io_map_default_ports(plate, flange),
+        }
+
+    def _io_map_reconcile(state: dict) -> dict:
+        """Enforce the current v4 plate/flange/nameplate/specs/verbs on
+        any incoming state. Only per-channel operator metadata
+        (assignment / in_use / notes) is carried forward — everything
+        else is authoritative from the physical plate silkscreen +
+        controller captures."""
+        default = _io_map_default()
+        prior_ports = dict(state.get('ports') or {})
+        state['version']     = _IO_MAP_VERSION
+        state['provisional'] = False
+        state['nameplate']   = default['nameplate']
+        state['sources']     = default['sources']
+        state['plate']       = default['plate']
+        state['flange']      = default['flange']
+        state['blocks']      = default['blocks']
+        state['specs']       = default['specs']
+        state['verbs']       = default['verbs']
+        merged = dict(default['ports'])
+        for ch, row in prior_ports.items():
+            if ch not in merged or not isinstance(row, dict):
+                continue
+            for k in ('assignment', 'in_use', 'notes'):
+                if k in row:
+                    merged[ch][k] = row[k]
+        state['ports'] = merged
+        # Drop legacy fields the older schema emitted.
+        for k in ('analog_input_count', 'analog_output_count', 'source'):
+            state.pop(k, None)
+        return state
+
+    def _io_map_migrate_from_older(old: dict) -> dict:
+        """v1 flat / v2 blocks / v3 functional-group → v4 plate.
+        Preserves operator assignments/notes for any channel whose
+        name still exists in the current plate + flange."""
+        new = _io_map_default()
+        old_ports = old.get('ports') or {}
+        for ch, row in old_ports.items():
+            if ch in new['ports'] and isinstance(row, dict):
+                for k in ('assignment', 'in_use', 'notes'):
+                    if k in row:
+                        new['ports'][ch][k] = row[k]
+        return new
+
+    def _io_map_load() -> dict:
+        if os.path.isfile(_IO_MAP_PATH):
+            try:
+                with open(_IO_MAP_PATH) as f:
+                    d = json.load(f)
+                if isinstance(d, dict):
+                    ver = int(d.get('version') or 1)
+                    if ver >= _IO_MAP_VERSION \
+                            and isinstance(d.get('plate'), list) \
+                            and isinstance(d.get('flange'), dict):
+                        return _io_map_reconcile(d)
+                    return _io_map_migrate_from_older(d)
+            except Exception:
+                pass
+        return _io_map_default()
+
+    def _io_map_save(state: dict) -> tuple:
+        try:
+            os.makedirs(os.path.dirname(_IO_MAP_PATH), exist_ok=True)
+            tmp = _IO_MAP_PATH + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp, _IO_MAP_PATH)
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    @app.get("/api/io/portmap")
+    async def api_io_portmap_get():
+        return _io_map_load()
+
+    @app.put("/api/io/portmap")
+    async def api_io_portmap_put(request: Request):
+        """Accepts per-channel operator metadata patches only.
+        Block structure + channel membership are authoritative from
+        the controller's IOManager/GetIOInfo enumeration and are not
+        editable via this endpoint. Any `blocks` field in the incoming
+        body is silently ignored (older frontend compat)."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        cur = _io_map_load()
+        incoming_ports = body.get('ports')
+        if isinstance(incoming_ports, dict):
+            cur_ports = dict(cur.get('ports') or {})
+            for pid, meta in incoming_ports.items():
+                if not isinstance(meta, dict):
+                    continue
+                # Never let a PUT create a channel that isn't in the
+                # verified inventory — it would be invisible in the UI
+                # and would drift out of sync on the next reconcile.
+                if pid not in cur_ports:
+                    continue
+                row = dict(cur_ports[pid])
+                if 'assignment' in meta:
+                    row['assignment'] = str(meta['assignment'])[:80]
+                if 'in_use' in meta:
+                    row['in_use'] = bool(meta['in_use'])
+                if 'notes' in meta:
+                    row['notes'] = str(meta['notes'])[:400]
+                cur_ports[pid] = row
+            cur['ports'] = cur_ports
+        cur['version'] = _IO_MAP_VERSION
+        cur = _io_map_reconcile(cur)
+        ok, err = _io_map_save(cur)
+        if not ok:
+            return JSONResponse({"error": err}, status_code=500)
+        return {"ok": True, "portmap": cur}
 
     @app.put("/api/parts/{part_id}/config")
     async def api_parts_config(part_id: str, request: Request):
@@ -4906,7 +13271,7 @@ if FASTAPI_AVAILABLE:
 
     @app.get("/api/programs/{prog_id}/motion_profile")
     async def api_program_motion_profile_get(prog_id: str):
-        path = _prog_path(prog_id)
+        path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
             return JSONResponse({"error": "program not found"}, status_code=404)
         try:
@@ -4925,7 +13290,7 @@ if FASTAPI_AVAILABLE:
 
     @app.put("/api/programs/{prog_id}/motion_profile")
     async def api_program_motion_profile_set(prog_id: str, request: Request):
-        path = _prog_path(prog_id)
+        path = _prog_read_path(prog_id)
         if not path or not os.path.isfile(path):
             return JSONResponse({"error": "program not found"}, status_code=404)
         try:
@@ -4960,6 +13325,512 @@ if FASTAPI_AVAILABLE:
                 "profile_name": profile_name,
                 "motion_optimization_enabled":
                     prog.get('motion_optimization_enabled', True)}
+
+    @app.get("/api/programs/{prog_id}/motion_check")
+    async def api_program_motion_check(prog_id: str):
+        """Return the analyzer's MotionCheckReport for a program.
+        Consumed by the Motion Check panel in the editor. Pure read
+        endpoint — never mutates the program or /opt/cobot/programs/*.
+        See src/estun_driver/estun_driver/program_ops.py analyze_program
+        for the shape of `findings`, `adaptations`, and `metrics`."""
+        path = _prog_read_path(prog_id)
+        if not path or not os.path.isfile(path):
+            return JSONResponse({"error": "program not found"}, status_code=404)
+        try:
+            with open(path) as fp:
+                prog = json.load(fp)
+        except Exception as e:
+            return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
+        try:
+            from estun_driver import program_ops
+        except Exception as e:
+            return JSONResponse({"error": f"program_ops import: {e}"},
+                                status_code=500)
+        # Best-effort load of the parts library — enables rule 3b
+        # (approach-below-part-height). When missing, the analyzer
+        # simply skips that rule.
+        part_index = None
+        parts_path = '/opt/cobot/parts/index.json'
+        if os.path.isfile(parts_path):
+            try:
+                with open(parts_path) as fp:
+                    part_index = json.load(fp)
+            except Exception:
+                part_index = None
+        try:
+            rep = program_ops.analyze_program(prog, part_index=part_index)
+        except Exception as e:
+            return JSONResponse({"error": f"analyzer: {e}"}, status_code=500)
+        # Adaptation dict has integer keys; JSON needs string keys.
+        rep['adaptations'] = {str(k): v for k, v in rep['adaptations'].items()}
+        rep['program_id'] = prog_id
+        return rep
+
+    @app.get("/api/programs/{prog_id}/line_map")
+    async def api_program_line_map(prog_id: str):
+        """Return the D9 line_map for a program: one entry per step
+        with `{step_idx, step_id, action, lua_line_start,
+        lua_line_end}` plus the codegen sha the map was generated
+        against. Consumed by the Monitor's live step-highlight —
+        joins ProjectState.line to step_id without regex heuristics
+        against emitted comments.
+
+        Read path: sidecar `<prog_id>.line_map.json` (written on
+        every save). If the sidecar is missing (older program or
+        a race), regenerate on demand and stash it. Honesty
+        contract: `codegen_sha` in the response is the sha that
+        AUTHORED the map — the client must compare against the
+        RESIDENT program's codegen sha (from the /ws/state
+        robot.program.codegen_sha wire) before highlighting; a
+        mismatch means the resident Lua doesn't match this map."""
+        prog_path = _prog_read_path(prog_id)
+        if not prog_path or not os.path.isfile(prog_path):
+            return JSONResponse({"error": "program not found"},
+                                status_code=404)
+        sc_path = _line_map_sidecar_path(prog_id)
+        # Prefer cached sidecar (written on save).
+        if os.path.isfile(sc_path):
+            try:
+                with open(sc_path) as fp:
+                    return json.load(fp)
+            except Exception:
+                pass  # regenerate below on parse error
+        # Regenerate on demand — first read after a fresh deploy or
+        # for programs saved before the sidecar existed.
+        try:
+            with open(prog_path) as fp:
+                prog = json.load(fp)
+        except Exception as e:
+            return JSONResponse({"error": f"read failed: {e}"},
+                                status_code=500)
+        sidecar = _compute_and_save_line_map(prog)
+        if sidecar is None:
+            return JSONResponse({"error": "cannot compute line_map"},
+                                status_code=500)
+        return sidecar
+
+    @app.get("/api/programs/{prog_id}/pallet_slots")
+    async def api_program_pallet_slots(prog_id: str):
+        """Return per-slot derived TCPs for the 3D twin's ghost
+        markers (2026-08-06 §2). Consumed by the 3D View's pallet
+        overlay; renders slot positions relative to the anchor so an
+        operator SEES the grid where it will land before running.
+
+        Response shape:
+            {
+              "program_id": str,
+              "pallet_place": {                # one block per pallet step;
+                                                # today at most one per program
+                "step_id":     int,
+                "anchor_step_id": int,
+                "anchor_tcp_mm": [x, y, z, rx, ry, rz] | None,
+                                                # None when anchor hasn't been
+                                                # taught yet — 3D can't ghost
+                                                # without a real anchor pose
+                "spec":        PalletPlaceSpec.to_dict(),
+                "slots":       [ {index, row, col, layer, tcp_mm}, ... ]
+              } | null,
+              "reachability": ReachabilitySweepReport | null,
+            }
+        Pure read endpoint. Any pallet_slot step without an anchor pose
+        returns anchor_tcp_mm=null and empty slots — the UI overlays
+        a "teach the anchor first" hint instead of ghost markers.
+        """
+        path = _prog_read_path(prog_id)
+        if not path or not os.path.isfile(path):
+            return JSONResponse({"error": "program not found"}, status_code=404)
+        try:
+            with open(path) as fp:
+                prog = json.load(fp)
+        except Exception as e:
+            return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
+        # Find the pallet anchor step (position_role='place', has
+        # pallet_slot with index=0). Its `taught_tcp` — populated
+        # after the operator teaches — is what we anchor the slot
+        # grid to. Anchor's `pallet_slot` also carries the spec
+        # indirectly (row=0,col=0,layer=0 slot); the SPEC itself lives
+        # on the source intent, but we can reconstruct pitch + axes
+        # from the second slot's iter_offset_mm if the anchor's own
+        # spec isn't stored. For now, we read the spec off the FIRST
+        # linked slot's step (any i>0) since composer stamps
+        # iter_offset_mm there — plus the 'pallet_slot' metadata.
+        steps = prog.get('steps') or []
+        anchor = None
+        for s in steps:
+            ps = s.get('pallet_slot') or {}
+            if ps.get('index') == 0 and s.get('position_role') == 'place':
+                anchor = s
+                break
+        if anchor is None:
+            return {"program_id": prog_id, "pallet_place": None,
+                    "reachability": None}
+
+        # Collect linked slots (index > 0) — each carries iter_offset_mm
+        # already; we still recompute from spec for reachability +
+        # canonical ordering.
+        slot_steps = [s for s in steps if s.get('pallet_slot') is not None]
+
+        # Locate the source spec — programs saved with pallet_place
+        # store it under config.pallet_place; if absent, reconstruct
+        # from step count + iter_offset_mm on slot 1 (defensive).
+        cfg = prog.get('config') or {}
+        spec_dict = cfg.get('pallet_place')
+
+        # Legacy migration (2026-07-30 cleanup): pre-taught-frame
+        # programs stored a single corner_tcp on config.pallet as
+        # a {x,y,z,rx,ry,rz} dict. Seed corner_a_tcp from that so
+        # a legacy program renders "A taught" honestly on the
+        # frame status; the modal cleanup MUST NOT lose the
+        # operator's already-captured corner.
+        legacy_pallet = cfg.get('pallet') or {}
+        legacy_corner = legacy_pallet.get('corner_tcp')
+        def _legacy_corner_as_tcp(d):
+            if not isinstance(d, dict): return None
+            try:
+                return [float(d.get('x') or 0), float(d.get('y') or 0),
+                        float(d.get('z') or 0), float(d.get('rx') or 0),
+                        float(d.get('ry') or 0), float(d.get('rz') or 0)]
+            except (TypeError, ValueError):
+                return None
+        if isinstance(spec_dict, dict):
+            if not spec_dict.get('corner_a_tcp'):
+                migrated = _legacy_corner_as_tcp(legacy_corner)
+                if migrated is not None:
+                    spec_dict = dict(spec_dict)
+                    spec_dict['corner_a_tcp'] = migrated
+        if not spec_dict:
+            # Legacy path: derive from the highest slot's metadata.
+            max_r = max((s['pallet_slot']['row']   for s in slot_steps), default=0)
+            max_c = max((s['pallet_slot']['col']   for s in slot_steps), default=0)
+            max_l = max((s['pallet_slot']['layer'] for s in slot_steps), default=0)
+            iter_off = None
+            for s in slot_steps:
+                if s['pallet_slot']['index'] == 1 and 'iter_offset_mm' in s:
+                    iter_off = s['iter_offset_mm']
+                    break
+            spec_dict = {
+                'rows':   max_r + 1,
+                'cols':   max_c + 1,
+                'layers': max_l + 1,
+                'pitch_row_mm': (iter_off or {}).get('dx', 0.0),
+                'pitch_col_mm': (iter_off or {}).get('dy', 0.0),
+                'layer_height_mm': (iter_off or {}).get('dz', 0.0) if max_l else None,
+                'row_axis': '+X', 'col_axis': '+Y', 'order': 'snake',
+            }
+
+        # Anchor TCP — taught contact populates taught_tcp after
+        # perception resolves it; if still awaiting, we return null.
+        anchor_tcp = anchor.get('taught_tcp')
+        try:
+            from programming_by_demonstration.schema import PalletPlaceSpec
+            from programming_by_demonstration.pallet_geometry import (
+                derive_slot_tcps, reachability_sweep,
+                compute_frame, validate_frame, measured_pitches,
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"error": f"pallet_geometry import: {e}"}, status_code=500)
+        spec = PalletPlaceSpec.from_dict(spec_dict)
+        # anchor_tcp is METERS + RADIANS (canonical taught_tcp
+        # unit, matches driver tcp_m). pallet_geometry now works
+        # entirely in meters (unit-mismatch fix, 2026-08-04) —
+        # derive_slot_tcps produces `tcp_m` in the same unit.
+        # This endpoint's DOCUMENTED response shape carries
+        # `tcp_mm` for the 3D twin's rendering layer, so we
+        # convert meters → mm at THIS boundary.
+        slots = []
+        slots_mm = []
+        if isinstance(anchor_tcp, list) and len(anchor_tcp) >= 6:
+            anchor_tuple = tuple(float(v) for v in anchor_tcp[:6])
+            slots = derive_slot_tcps(spec, anchor_tuple)
+            for s in slots:
+                tcp_m = s.get('tcp_m') or [0, 0, 0, 0, 0, 0]
+                slots_mm.append({
+                    'index': s['index'],
+                    'row':   s['row'],
+                    'col':   s['col'],
+                    'layer': s['layer'],
+                    # Convert XYZ meters → mm for the twin.
+                    # Orientation (rx/ry/rz) stays radians on the
+                    # wire; the frontend renderer decides display.
+                    'tcp_mm': [tcp_m[0] * 1000.0,
+                               tcp_m[1] * 1000.0,
+                               tcp_m[2] * 1000.0,
+                               tcp_m[3], tcp_m[4], tcp_m[5]],
+                })
+        reach = None
+        anchor_joints = anchor.get('taught_joints')
+        if (isinstance(anchor_joints, list) and len(anchor_joints) == 6
+                and all(isinstance(v, (int, float)) for v in anchor_joints)):
+            try:
+                reach = reachability_sweep(spec,
+                                           [float(v) for v in anchor_joints])
+            except Exception:
+                reach = None
+        # 2026-07-30: expose the taught frame + validation findings +
+        # measured pitches so the twin can render slot ghosts in the
+        # actual pallet frame AND the wizard can surface validation
+        # (near-parallel B/C, tilt, pitch mismatch) without
+        # re-implementing the math on the frontend.
+        frame = compute_frame(spec)
+        frame_serialisable = {
+            'row_axis':          list(frame['row_axis']),
+            'col_axis':          list(frame['col_axis']),
+            'plane_normal':      list(frame['plane_normal']),
+            'tilt_deg':          frame['tilt_deg'],
+            'row_col_angle_deg': frame['row_col_angle_deg'],
+            'source':            frame['source'],
+        }
+        # measured_pitches returns METERS. Convert to mm at this
+        # endpoint's response boundary — the twin + wizard
+        # readouts label the value in mm.
+        m_row_m, m_col_m = measured_pitches(spec)
+        m_row = (m_row_m * 1000.0) if m_row_m is not None else None
+        m_col = (m_col_m * 1000.0) if m_col_m is not None else None
+        return {
+            "program_id":   prog_id,
+            "pallet_place": {
+                "step_id":        anchor.get('id') or anchor.get('step'),
+                "anchor_step_id": anchor.get('id') or anchor.get('step'),
+                # anchor_tcp_mm is the endpoint's documented shape
+                # (mm on the wire for the 3D twin). anchor_tcp is
+                # meters internally; convert XYZ at the boundary.
+                "anchor_tcp_mm":  ([anchor_tcp[0] * 1000.0,
+                                    anchor_tcp[1] * 1000.0,
+                                    anchor_tcp[2] * 1000.0,
+                                    anchor_tcp[3], anchor_tcp[4], anchor_tcp[5]]
+                                   if isinstance(anchor_tcp, list)
+                                      and len(anchor_tcp) >= 6
+                                   else None),
+                "spec":           spec.to_dict(),
+                "frame":          frame_serialisable,
+                "frame_validation": validate_frame(spec),
+                "measured_pitches_mm": {
+                    "pitch_row_mm": m_row,
+                    "pitch_col_mm": m_col,
+                },
+                "slots":          slots_mm,
+            },
+            "reachability": reach,
+        }
+
+    # ── /api/pallet/validate_frame (§465 fork-1 kill, 2026-08-04) ─
+    #
+    # Shared-truth endpoint the Program Editor calls during and
+    # after the 3-corner pallet teach so the frontend runs NO
+    # frame geometry itself. Prior to this endpoint, the frontend
+    # had its own `validatePalletFrame` in palletTeachSequence.js
+    # that computed row/col vectors, length, orthogonality, and
+    # tilt against RAW stored `place.corner{1,2,3}_tcp` — a fork
+    # of `pallet_geometry.compute_frame/validate_frame` that
+    # (a) skipped the v1→v2 migration (v1 programs got silent
+    # passes), (b) did no Gram-Schmidt projection, and (c) fired
+    # as a passive banner mid-re-teach against half-updated
+    # state. This endpoint is the single frame-truth surface;
+    # the no-fork lint at test/test_no_frontend_frame_math.py
+    # prevents re-introduction.
+    #
+    # Request body:
+    #   {
+    #     "place":            { any subset of PalletPlaceSpec fields
+    #                           — v1 (corner_a_tcp/point_b_tcp/…)
+    #                           or v2 (corner{1,2,3}_tcp/part_tcp);
+    #                           from_dict does the migration },
+    #     "spec_dict":        { optional — merged onto place, wins
+    #                           on conflict; lets the caller nudge
+    #                           rows/cols/pitch without saving },
+    #     "re_teaching_role": "pallet_c1"|"pallet_c2"|"pallet_c3"
+    #                       | "pallet_part"|null (default null),
+    #   }
+    #
+    # Response:
+    #   { findings:[…], blocking:bool, measured:{…}, spec:{…} }
+    #
+    # Findings shape per-item:
+    #   { severity, code, involves_corners, message, distance_mm?,
+    #     operator: { title, detail, technicalDetail } }
+    #
+    # Suppression: findings whose involves_corners contains the
+    # role currently being re-taught are DROPPED — the operator
+    # is about to replace that corner and surfacing findings that
+    # cite it is noise. This is the fix for "passive banner
+    # mid-re-teach against half-updated state." Findings that
+    # only cite the OTHER corners still surface, with copy that
+    # names the actual problem corner (not the one being
+    # re-taught).
+    _ROLE_TO_CORNER = {
+        'pallet_c1':   'c1',
+        'pallet_c2':   'c2',
+        'pallet_c3':   'c3',
+        'pallet_part': 'c4',
+    }
+
+    def _pallet_finding_operator_copy(f: dict, place: dict) -> dict:
+        """Map a pallet_geometry finding to the 267108a-register
+        toast triple {title, detail, technicalDetail}. Raw wire
+        text goes to technicalDetail; operator sees the demoted
+        title + detail only.
+
+        Distance fields on findings are METERS (canon, 2026-08-04
+        unit-mismatch fix). This function renders mm for the
+        operator by multiplying by 1000 — the ONLY place mm
+        appears on the operator surface. Findings with legacy
+        `distance_mm` (from a pre-fix caller) are read as a
+        fallback with an in-place assumption that the value was
+        already meters (matching the pre-fix behavior of the
+        pallet_geometry code that generated it)."""
+        code = f.get('code') or ''
+        involves = f.get('involves_corners') or []
+        # Canon: distance_m (meters). Legacy: distance_mm — which
+        # HELD meters values before this commit, so use verbatim.
+        dist_m = f.get('distance_m')
+        if dist_m is None:
+            dist_m = f.get('distance_mm')   # legacy — was meters
+        tech = f.get('message', '')
+        if code == 'corner_coincident':
+            pair = ' and '.join(str(int(c[1:]) or c[1:])
+                                for c in involves) if involves else '?'
+            dmm = (f'{dist_m*1000.0:.2f} mm'
+                   if isinstance(dist_m, (int, float)) else '?')
+            return {
+                'title':  f'Corners {pair} are too close.',
+                'detail': (f'Measured {dmm} apart — jog to the actual '
+                           f'pallet corner and record again.'),
+                'technicalDetail': tech,
+            }
+        if code == 'row_col_near_parallel':
+            ang = f.get('row_col_angle_deg')
+            ang_s = f'{ang:.1f}°' if isinstance(ang, (int, float)) else '?'
+            return {
+                'title':  'Corners 2 and 3 point in the same direction.',
+                'detail': (f'Row/column angle is {ang_s} — move corner 3 '
+                           f'to the OTHER pallet edge (roughly 90° from '
+                           f'corner 2) and re-teach.'),
+                'technicalDetail': tech,
+            }
+        if code == 'pallet_tilted':
+            t = f.get('tilt_deg')
+            t_s = f'{t:.1f}°' if isinstance(t, (int, float)) else '?'
+            return {
+                'title':  'Pallet frame is tilted off horizontal.',
+                'detail': (f'Measured {t_s} off — check that all three '
+                           f'corners were recorded on the same surface.'),
+                'technicalDetail': tech,
+            }
+        if code == 'part_datum_needs_reteach':
+            return {
+                'title':  'Teach the first-part position (④).',
+                'detail': ('This pallet was migrated from the older '
+                           '3-point model — the first-part pose was '
+                           'seeded from corner 1 as a placeholder. '
+                           'Re-teach ④ with a real part in the first '
+                           'slot before running.'),
+                'technicalDetail': tech,
+            }
+        if code == 'part_datum_not_taught':
+            return {
+                'title':  'Teach the first-part position (④).',
+                'detail': ('④ is not distinct from corner 1. Place a '
+                           'real part in the first slot and record.'),
+                'technicalDetail': tech,
+            }
+        if code == 'part_datum_far_from_corner':
+            dmm = (f'{dist_m*1000.0:.1f} mm'
+                   if isinstance(dist_m, (int, float)) else '?')
+            return {
+                'title':  'First-part position (④) is far from corner 1.',
+                'detail': (f'Measured {dmm} away — is the part actually '
+                           f'in the first slot?'),
+                'technicalDetail': tech,
+            }
+        if code == 'taught_frame_missing':
+            return {
+                'title':  'Teach all three pallet corners to lock the frame.',
+                'detail': ('Slot positions currently assume the pallet is '
+                           'aligned to the robot base — re-teach the three '
+                           'corners for a rotation-safe grid.'),
+                'technicalDetail': tech,
+            }
+        # Fallback: keep the raw message as the title so nothing
+        # is silently eaten.
+        return {'title':  tech,
+                'detail': '',
+                'technicalDetail': tech}
+
+    @app.post("/api/pallet/validate_frame")
+    async def api_pallet_validate_frame(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        place = dict(body.get('place') or {})
+        override = body.get('spec_dict') or {}
+        if isinstance(override, dict):
+            place.update(override)
+        role = body.get('re_teaching_role')
+        suppress = _ROLE_TO_CORNER.get(role)
+        try:
+            from programming_by_demonstration.schema import PalletPlaceSpec
+            from programming_by_demonstration.pallet_geometry import (
+                compute_frame, validate_frame, measured_pitches,
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"error": f"pallet_geometry import: {e}"}, status_code=500)
+        spec = PalletPlaceSpec.from_dict(place)
+        raw_findings = validate_frame(spec)
+        # Suppression: drop findings that involve the corner
+        # currently being re-taught. When the operator is
+        # replacing corner N, we do NOT nag them about corner N
+        # being wrong — the very next Record replaces it.
+        # Findings that mention corner N alongside OTHERS still
+        # surface iff at least one non-suppressed corner is
+        # named; the OPERATOR copy is generated from
+        # involves_corners so it already points at the actual
+        # problem corner (not the one being re-taught).
+        findings = []
+        for f in raw_findings:
+            involves = f.get('involves_corners') or []
+            if suppress and involves and all(c == suppress
+                                              for c in involves):
+                continue
+            operator = _pallet_finding_operator_copy(f, place)
+            findings.append({**f, 'operator': operator})
+        # Frame-measured helpers — the client shows these next to
+        # the banner-less operator toast when useful. Endpoint
+        # response uses `_mm`-suffixed field names (documented
+        # shape for the twin); pallet_geometry works in METERS
+        # internally, so we convert m→mm at THIS boundary — the
+        # ONLY place mm crosses the wire for this endpoint.
+        m_row_m, m_col_m = measured_pitches(spec)   # meters
+        measured = {
+            'row_len_mm':   None,
+            'col_len_mm':   None,
+            'row_col_angle_deg': None,
+            'tilt_deg':     None,
+            'pitch_row_mm': (m_row_m * 1000.0) if m_row_m is not None else None,
+            'pitch_col_mm': (m_col_m * 1000.0) if m_col_m is not None else None,
+        }
+        if spec.has_taught_frame():
+            frame = compute_frame(spec)
+            measured['row_col_angle_deg'] = frame['row_col_angle_deg']
+            measured['tilt_deg']         = frame['tilt_deg']
+            from programming_by_demonstration.pallet_geometry import (
+                _xyz as _pg_xyz, _sub as _pg_sub, _len as _pg_len,
+            )
+            A = _pg_xyz(spec.corner1_tcp)   # meters
+            B = _pg_xyz(spec.corner2_tcp)   # meters
+            C = _pg_xyz(spec.corner3_tcp)   # meters
+            # Convert to mm at the response boundary.
+            measured['row_len_mm'] = _pg_len(_pg_sub(B, A)) * 1000.0
+            measured['col_len_mm'] = _pg_len(_pg_sub(C, A)) * 1000.0
+        blocking = any(f.get('severity') == 'error' for f in findings)
+        return {
+            'findings': findings,
+            'blocking': blocking,
+            'measured': measured,
+            'spec':     spec.to_dict(),
+        }
 
     _motion_stats_clients: set = set()
     _motion_setup_clients: set = set()
@@ -5507,7 +14378,7 @@ if FASTAPI_AVAILABLE:
             n = 0
             if not os.path.isdir(_PROG_DIR): return 0
             for fn in os.listdir(_PROG_DIR):
-                if not fn.endswith('.json') or fn.startswith('_'):
+                if not fn.endswith('.json') or fn.startswith(('_', '.')):
                     continue
                 try:
                     with open(os.path.join(_PROG_DIR, fn)) as fp:
@@ -5551,7 +14422,7 @@ if FASTAPI_AVAILABLE:
         try:
             if os.path.isdir(_PROG_DIR):
                 for fn in sorted(os.listdir(_PROG_DIR)):
-                    if not fn.endswith('.json') or fn.startswith('_'):
+                    if not fn.endswith('.json') or fn.startswith(('_', '.')):
                         continue
                     try:
                         with open(os.path.join(_PROG_DIR, fn)) as fp:
@@ -5659,6 +14530,34 @@ if FASTAPI_AVAILABLE:
             idx['active_cell_id'] = cell_id
             _cells_save_index(idx)
         return {'ok': True, 'active_cell_id': cell_id}
+
+    @app.post("/api/cells/deactivate")
+    async def api_cells_deactivate():
+        """Clear active_cell_id — the cell picker's 'None' option.
+        The driver's next 30s poll of /api/collision/static_zones and
+        the collision_monitor's next /collision/reload will both drop
+        their env-zone lists to []; robot-intrinsic guards (self-
+        collision, ground plane, joint limits) are unaffected. The
+        StatusBar chip flips to the amber 'No cell — environment guard
+        off' state on the next 15s poll."""
+        with _cell_lock:
+            idx = _cells_load_index()
+            was = idx.get('active_cell_id')
+            idx['active_cell_id'] = None
+            _cells_save_index(idx)
+        # Nudge the collision_monitor to reload right away instead of
+        # waiting for its next tick — the driver's 30 s poll still
+        # picks it up naturally on the next cycle.
+        try:
+            if _ros_node is not None:
+                if not hasattr(_ros_node, '_collision_reload_pub'):
+                    _ros_node._collision_reload_pub = _ros_node.create_publisher(
+                        String, '/collision/reload', 5)
+                m = String(); m.data = json.dumps({'reason': 'deactivate'})
+                _ros_node._collision_reload_pub.publish(m)
+        except Exception as e:
+            print(f'[cells] deactivate reload publish failed: {e}', flush=True)
+        return {'ok': True, 'active_cell_id': None, 'was': was}
 
     # Baseline capture — subscribes (read-only) to the latest /lidar/points_dense
     # snapshot accumulated by the dashboard's own LidarNode, accumulates across
@@ -5983,6 +14882,1014 @@ if FASTAPI_AVAILABLE:
             'n_zones':  data.get('n_zones', len(data.get('zones', []))),
             'zones':    data.get('zones', []),
         }
+
+    # ── Teach-Session record-through store (2026-08-04) ────────────
+    #
+    # Pre-2026-08-04, taught poses recorded during a teach session lived
+    # ONLY in the recording browser's Zustand state until save. Refresh
+    # or a tablet-to-PC switch mid-teach → poses lost; the server could
+    # not validate what it could not see; §406 first-class program sync
+    # never covered teach-time state.
+    #
+    # This module is the single source of truth for teach-time state:
+    #
+    #   * `/opt/cobot/teach_sessions/{program_id}.draft.json` — one
+    #     draft file per program (or per program-id). Contains
+    #     `owner_device_id`, `poses: {slot_key: patch}`. Slot keys:
+    #        step:<step_id>   step teaching (move_home, move_joint, …)
+    #        corner:1|2|3     pallet frame corners
+    #        corner:part      pallet part-datum ④
+    #
+    #   * `STATE['teach_sessions']` mirrors every draft file, keyed
+    #     by program_id. Every WS state broadcast carries the mirror
+    #     — connected clients see draft mutations without any extra
+    #     WS channel, and reconcile-on-reconnect (Addendum 27) picks
+    #     up the teach state via the same snapshot that ships
+    #     currentProgram revs.
+    #
+    #   * Endpoints:
+    #        POST /api/teach_session/{pid}/start       claim (409 if locked)
+    #        POST /api/teach_session/{pid}/record     write one slot
+    #        POST /api/teach_session/{pid}/take_over  atomic ownership swap
+    #        POST /api/teach_session/{pid}/save       promote → validator
+    #        POST /api/teach_session/{pid}/cancel     discard
+    #        GET  /api/teach_session/{pid}            read current draft
+    #
+    # The draft store is the ONE canonical owner of teach-time pose
+    # state. Registered in tools/fork_registry.yaml as
+    # `teach_session_state`; forbidden in the registry: any frontend
+    # localStorage.setItem carrying pose data.
+
+    _TEACH_DIR = '/opt/cobot/teach_sessions'
+    # 2026-08-05 stale-lock fix (P0-B): a session whose owner_device_id
+    # hasn't heartbeated (or written) for _TEACH_OWNER_TTL_S seconds
+    # gets its ownership released — the tab presumably crashed. The
+    # DRAFT stays (poses safe on disk); another device can re-claim
+    # via /start without a Take Over gesture. If nothing re-claims for
+    # _TEACH_DRAFT_TTL_S beyond that, the whole draft is garbage-
+    # collected. Both windows are picked to be short enough that a
+    # crashed-tab operator doesn't stay locked out, long enough that
+    # a slow network doesn't drop a live session mid-teach.
+    # 2026-08-05 (teach-lock incident #3 + identity root-cause fix):
+    # TTL 90s = 6 client heartbeat intervals (15s each). Record-through
+    # means every pose is already persisted; expiry loses nothing but
+    # the OWNERSHIP claim. A live client rides through several hiccups;
+    # a phantom owner (crashed tab, closed laptop) drops out fast.
+    _TEACH_OWNER_TTL_S = 90
+    _TEACH_DRAFT_TTL_S = 24 * 3600  # 24 h — dropped from disk after this
+    # Self-healing entry threshold: 60s = 4 missed 15s heartbeats.
+    # Auto-swap the lock to the requester when the owner's updated_ts
+    # is older than this — spares a real operator from waiting the
+    # full 90s TTL when the previous owner has demonstrably gone quiet.
+    _TEACH_STALE_HEARTBEAT_S = 60
+    # Ghost-amnesty threshold (2026-08-05 identity root-cause fix).
+    # A one-time sweep at boot clears ownership on drafts where the
+    # owner_device_id is a UUID-shaped string with NO matching
+    # ui_context entry AND updated_ts older than this — kills
+    # orphaned tab-UUIDs from before the localStorage identity fix,
+    # which were the true root cause of every teach-lock incident.
+    # Poses are preserved (draft file stays); another device can
+    # simply /start on it. 10 min gives a live-but-slow ui_context
+    # write ample time to land before we amnesty its owner.
+    _TEACH_GHOST_AMNESTY_S = 10 * 60
+    _teach_lock = threading.Lock()
+
+    def _teach_path(prog_id: str):
+        if not _PROG_READ_ID_RE.match(prog_id or ''):
+            return None
+        return os.path.join(_TEACH_DIR, prog_id + '.draft.json')
+
+    def _teach_read_draft(prog_id: str) -> dict | None:
+        p = _teach_path(prog_id)
+        if not p or not os.path.isfile(p):
+            return None
+        try:
+            with open(p) as fh:
+                return json.load(fh)
+        except Exception:
+            return None
+
+    class _TeachWriteError(OSError):
+        """Structured error the record/heartbeat/end/save endpoints
+        catch and turn into a clean 507 for the operator, instead of
+        letting the raw OSError traceback back through starlette as a
+        500. Preserves the underlying errno for diagnostics.
+
+        2026-08-05 P0: without this wrapper, any fs-level failure
+        (ENOSPC=28, EROFS=30, EIO=5, EDQUOT=122, EACCES=13) crashed
+        every Record press from the tablet as a 500 traceback."""
+        pass
+
+    def _storage_full_response(e):
+        """Shared operator-language body for a 507 storage-full
+        return. Called from every teach-session endpoint that
+        writes to disk (record/end/heartbeat/save/edit)."""
+        errno = e.args[0] if e.args else '?'
+        detail = e.args[1] if len(e.args) > 1 else str(e)
+        return {
+            'ok':    False,
+            'error': 'storage_full',
+            'operator_message': (
+                "Couldn't save — the dashboard's disk is full. "
+                "Free space on /opt/cobot and try again. Earlier "
+                "successful writes are safe on disk."),
+            'technical_detail': f'errno={errno} {detail}',
+        }
+
+    def _teach_write_draft(prog_id: str, draft: dict) -> None:
+        p = _teach_path(prog_id)
+        if not p:
+            return
+        tmp = None
+        try:
+            os.makedirs(_TEACH_DIR, exist_ok=True)
+            # Atomic write — rename after fsync so a mid-write kill
+            # cannot leave a half-file on disk (draft survives a
+            # `systemctl restart roboai-dashboard` mid-teach).
+            tmp = p + '.tmp'
+            with open(tmp, 'w') as fh:
+                json.dump(draft, fh, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, p)
+        except OSError as e:
+            # Clean up the .tmp fragment so a subsequent successful
+            # write doesn't blend partial data with fresh state.
+            if tmp is not None:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+            raise _TeachWriteError(e.errno, str(e))
+
+    def _teach_delete_draft(prog_id: str) -> None:
+        p = _teach_path(prog_id)
+        if not p:
+            return
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+
+    def _teach_touch(draft: dict) -> dict:
+        draft['updated_ts'] = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                                            time.gmtime())
+        return draft
+
+    def _teach_updated_epoch(draft: dict) -> float | None:
+        """Parse the draft's `updated_ts` (ISO-8601 UTC 'Z') to
+        wall-clock epoch. Returns None if unparseable. Uses
+        calendar.timegm because time.mktime interprets a naive tm as
+        LOCAL and would silently drift by ±3600s across DST."""
+        s = draft.get('updated_ts') if isinstance(draft, dict) else None
+        if not isinstance(s, str) or not s:
+            return None
+        try:
+            import calendar as _cal
+            tm = time.strptime(s, '%Y-%m-%dT%H:%M:%SZ')
+            return float(_cal.timegm(tm))
+        except (ValueError, TypeError):
+            return None
+
+    def _teach_apply_ttl(pid: str, draft: dict) -> dict | None:
+        """Apply the TTL rules to a live draft. Returns the (possibly
+        rewritten) draft, or None if the draft was garbage-collected.
+
+        Two windows:
+          * owner_ttl:  released ownership after N s of silence
+                        (poses preserved, banner clears)
+          * draft_ttl:  drop the file entirely after N s more
+        """
+        if not isinstance(draft, dict):
+            return draft
+        upd_epoch = _teach_updated_epoch(draft)
+        if upd_epoch is None:
+            return draft
+        age = time.time() - upd_epoch
+        # Owner-TTL: release ownership if the live owner has gone silent.
+        if age > _TEACH_OWNER_TTL_S and draft.get('owner_device_id'):
+            draft = dict(draft)
+            draft['owner_device_id'] = None
+            draft['owner_label']     = None
+            draft['ttl_expired_at']  = time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            _teach_touch(draft)
+            # 2026-08-05 P0: TTL sweep runs on every state broadcast
+            # (25 Hz idle / 8 Hz hold). An ENOSPC here would spam
+            # exceptions through the broadcast pipeline. Swallow —
+            # the caller (state broadcast) does not need a raise.
+            try:
+                _teach_write_draft(pid, draft)
+            except _TeachWriteError:
+                pass
+            return draft
+        # Draft-TTL: garbage-collect a long-abandoned unowned draft.
+        if age > _TEACH_DRAFT_TTL_S and not draft.get('owner_device_id'):
+            _teach_delete_draft(pid)
+            return None
+        return draft
+
+    # 2026-08-05 (identity root-cause fix — Directive item 3).
+    # One-time ghost amnesty: any draft whose owner_device_id is a
+    # UUID-shaped string with NO matching ui_context entry AND has
+    # been silent for _TEACH_GHOST_AMNESTY_S has ownership cleared
+    # on next publish. Kills the tablet-real UUID + every orphaned
+    # tab-UUID minted before device identity moved to localStorage.
+    # Poses are preserved; another device can /start on the file.
+    # Runs once per dashboard boot (via _teach_publish_to_state's
+    # first call, gated by _amnesty_done). Idempotent — a false
+    # positive would only require the operator to re-claim via
+    # /start, which is cheap.
+    import re as _amnesty_re
+    _amnesty_uuid_re = _amnesty_re.compile(
+        r'^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-'
+        r'[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$')
+    _amnesty_state = {'done': False}
+
+    def _teach_ghost_amnesty_once() -> None:
+        if _amnesty_state['done']:
+            return
+        _amnesty_state['done'] = True
+        try:
+            names = os.listdir(_TEACH_DIR)
+        except FileNotFoundError:
+            return
+        # Known live device_ids from ui_context — a draft owner
+        # matching any of these is NOT a ghost.
+        try:
+            live_ids = {ctx.get('_device_id')
+                        for ctx in _ui_context.list_all()
+                        if isinstance(ctx, dict) and ctx.get('_device_id')}
+        except Exception:
+            live_ids = set()
+        cleared = 0
+        for name in names:
+            if not name.endswith('.draft.json'):
+                continue
+            pid = name[:-len('.draft.json')]
+            d = _teach_read_draft(pid)
+            if not isinstance(d, dict):
+                continue
+            owner = d.get('owner_device_id')
+            if not owner:
+                continue
+            if not _amnesty_uuid_re.match(str(owner)):
+                # Non-UUID owner — old label-shaped ids from before
+                # the crypto.randomUUID switch. Leave alone.
+                continue
+            if owner in live_ids:
+                continue
+            upd = _teach_updated_epoch(d)
+            if upd is None:
+                continue
+            if (time.time() - upd) < _TEACH_GHOST_AMNESTY_S:
+                continue
+            d = dict(d)
+            d['owner_device_id'] = None
+            d['owner_label']     = None
+            d['ghost_cleared_at'] = time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            _teach_touch(d)
+            try:
+                _teach_write_draft(pid, d)
+                cleared += 1
+            except _TeachWriteError:
+                pass
+        if cleared:
+            print(f'[dashboard] ghost-amnesty cleared {cleared} '
+                  f'orphaned draft owner(s)')
+
+    # 2026-08-06 (jog-jitter fix — operator directive). The teach-
+    # sessions publish is decoupled from the calling endpoint's
+    # critical section by a single background daemon thread. Callers
+    # only signal the worker; they never block on the disk scan.
+    #
+    # Design:
+    #   * `_teach_publish_event` — coalesces multiple pending publishes
+    #     into one scan. Set by the endpoint; cleared by the worker
+    #     before starting a scan.
+    #   * `_teach_publish_worker` — single thread, single scan at a
+    #     time. If a mutation signals mid-scan the event stays set,
+    #     the worker immediately re-scans. No unbounded thread
+    #     creation.
+    #   * `_teach_publish_to_state()` — public entrypoint. Does the
+    #     idle short-circuit (fix 1) inline (< 1 syscall), then
+    #     signals the worker (fix 2) and returns. Never touches
+    #     _teach_lock. Callers that hold _teach_lock (or any other
+    #     lock) can call this safely; disk I/O runs off-thread.
+    #
+    # Fork registry: `jog_hold_heartbeat` MUST NOT share a lock or
+    # a scheduling loop with teach-session housekeeping (see fork
+    # registry entry landed with this commit).
+    _teach_publish_event = threading.Event()
+    _teach_publish_worker_started = [False]
+    # Test hook — production sets None; test can inject a callback
+    # invoked once at the end of every worker scan for verification.
+    # Never called from the endpoint path.
+    _teach_publish_after_scan_hook = [None]
+
+    def _teach_scan_sync() -> None:
+        """The actual disk scan + STATE mutation. Runs in the daemon
+        worker thread. Never called from any endpoint path — all
+        endpoints go through `_teach_publish_to_state()` which just
+        signals the worker."""
+        try:
+            names = os.listdir(_TEACH_DIR)
+        except FileNotFoundError:
+            names = []
+        draft_names = [n for n in names if n.endswith('.draft.json')]
+        if not draft_names:
+            with _state_lock:
+                if STATE.get('teach_sessions'):
+                    STATE['teach_sessions'] = {}
+            return
+        _teach_ghost_amnesty_once()
+        drafts: dict = {}
+        for name in draft_names:
+            pid = name[:-len('.draft.json')]
+            d = _teach_read_draft(pid)
+            if d is None:
+                continue
+            d = _teach_apply_ttl(pid, d)
+            if d is not None:
+                drafts[pid] = d
+        with _state_lock:
+            STATE['teach_sessions'] = drafts
+
+    def _teach_publish_worker_loop():
+        while True:
+            _teach_publish_event.wait()
+            _teach_publish_event.clear()
+            try:
+                _teach_scan_sync()
+            except Exception as _e:
+                # Never let a scan exception kill the worker — the
+                # next signal will re-fire the scan.
+                print(f'[teach-publish] scan error: {_e}', flush=True)
+            hook = _teach_publish_after_scan_hook[0]
+            if hook is not None:
+                try:
+                    hook()
+                except Exception:
+                    pass
+
+    def _teach_publish_to_state() -> None:
+        """Mirror every draft file on disk into STATE['teach_sessions']
+        so the WS broadcast carries it. Called at boot (hydrate) and
+        after every mutation. Applies the TTL rules — a stale-owner
+        draft has its ownership released here, and a long-abandoned
+        draft is garbage-collected.
+
+        2026-08-06 (jog-jitter fix — operator directive):
+
+          FIX 1 (idle short-circuit). If the draft directory has NO
+          `.draft.json` files, the sweep does NOTHING. No disk scan,
+          no TTL apply, no worker signal. Bounded to ~1 syscall +
+          comparison against a small in-memory dict. Eliminates all
+          lock/disk contention when jogging with no teach session
+          active — the operator's current jitter case.
+
+          FIX 2 (disk I/O off the caller's thread). When drafts DO
+          exist, the actual scan happens in a dedicated daemon
+          thread; the caller signals a threading.Event and returns
+          immediately. This guarantees that a caller holding
+          _teach_lock (or the asyncio event loop) NEVER blocks on
+          disk I/O. State mirror is eventually consistent — the
+          next state broadcast (25 Hz idle / 8 Hz hold) picks up
+          the fresh dict within ~40 ms of the mutation.
+
+          FIX 3 (jog heartbeat isolation). The jog keepalive runs
+          on its own native thread with `_active_holds_lock`; teach
+          housekeeping runs on the publish worker with _state_lock.
+          The two share no mutex. Verified by the fork registry
+          entry `jog_hold_heartbeat`.
+        """
+        # Idle short-circuit — this fast path is what the operator
+        # hits during any jog with no teach session active. Bounded
+        # to ~1 syscall.
+        try:
+            names = os.listdir(_TEACH_DIR)
+        except FileNotFoundError:
+            names = []
+        if not any(n.endswith('.draft.json') for n in names):
+            with _state_lock:
+                if STATE.get('teach_sessions'):
+                    STATE['teach_sessions'] = {}
+            return
+        # Lazy-start the worker on first non-idle call. Subsequent
+        # calls are cheap (already started).
+        if not _teach_publish_worker_started[0]:
+            _teach_publish_worker_started[0] = True
+            threading.Thread(target=_teach_publish_worker_loop,
+                             daemon=True,
+                             name='teach-publish-worker').start()
+        # Signal the worker. Coalescing is automatic: if the event
+        # is already set (worker hasn't started this scan yet), the
+        # set is a no-op — one scan covers both mutations.
+        _teach_publish_event.set()
+
+    # Hydrate at boot so a restart mid-teach resumes the session.
+    # Boot path calls _teach_scan_sync directly (bypassing the worker
+    # signal) so STATE['teach_sessions'] is populated before the first
+    # request lands — otherwise the first client would see an empty
+    # mirror for ~50 ms after startup.
+    os.makedirs(_TEACH_DIR, exist_ok=True)
+    _teach_scan_sync()
+
+    def _teach_new_draft(prog_id: str, device_id: str,
+                         device_label: str = '') -> dict:
+        return _teach_touch({
+            'program_id':      prog_id,
+            'owner_device_id': device_id,
+            'owner_label':     device_label or device_id[:8],
+            'started_ts':      time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                                             time.gmtime()),
+            'poses':           {},
+        })
+
+    # 2026-08-06 (Lesson 179 — null-owner refusal bug).
+    #
+    # ONE ownership-resolution rule, one implementation, so a future
+    # endpoint can't bring back the "owner != device_id → 403" bare
+    # pattern that the operator caught twice.
+    #
+    # Doctrine (operator-directed): a null owner_device_id means the
+    # session is CLAIMABLE. The requesting device becomes owner and
+    # proceeds. Refuse ONLY when a DIFFERENT, non-null device owns
+    # it AND its heartbeat is fresh (< _TEACH_STALE_HEARTBEAT_S).
+    # A stale non-null owner triggers an auto-swap (same as /start).
+    #
+    # Returns (draft_after_check, error_body_or_None,
+    #          http_status_or_None). Caller writes draft only when
+    # error is None. draft_after_check may be a fresh dict (claim /
+    # swap) or the same object (already-owner).
+    def _teach_claim_or_refuse(draft: dict, device_id: str,
+                                device_label: str = ''):
+        owner = draft.get('owner_device_id')
+        if owner == device_id:
+            return draft, None, None
+        if owner is None:
+            d = dict(draft)
+            d['owner_device_id'] = device_id
+            d['owner_label']     = (device_label or '').strip() \
+                                    or device_id[:8]
+            d['claimed_at']      = time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            return d, None, None
+        # Owner is a different non-null device — check heartbeat.
+        upd = _teach_updated_epoch(draft)
+        if upd is not None and (time.time() - upd) > _TEACH_STALE_HEARTBEAT_S:
+            d = dict(draft)
+            d['owner_device_id']    = device_id
+            d['owner_label']        = (device_label or '').strip() \
+                                        or device_id[:8]
+            d['previous_owner']     = owner
+            d['auto_expired_at']    = time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            return d, None, None
+        return draft, {
+            'ok':              False,
+            'error':           'not_owner',
+            'owner_device_id': owner,
+            'owner_label':     draft.get('owner_label'),
+        }, 403
+
+    @app.get("/api/teach_session/{prog_id}")
+    async def api_teach_session_get(prog_id: str):
+        """Return the current draft for prog_id, or {present: false}
+        when none exists. Used by clients on program open + as a
+        belt-and-suspenders reconcile against the WS state stream."""
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+        if draft is None:
+            return {'present': False, 'program_id': prog_id}
+        return {'present': True, 'draft': draft}
+
+    @app.post("/api/teach_session/{prog_id}/start")
+    async def api_teach_session_start(prog_id: str, request: Request):
+        """Claim the teach session for prog_id. Body:
+            {device_id: <str, required>, device_label?: <str>}
+        Returns:
+            {ok:true, draft} on successful claim (new draft OR
+            existing draft owned by THIS device),
+            409 {ok:false, owner_device_id, owner_label, taken_at}
+            when another device owns the session."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        if not device_id:
+            return JSONResponse({'error': 'device_id required'},
+                                status_code=400)
+        device_label = str(body.get('device_label') or '')
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                draft = _teach_new_draft(prog_id, device_id, device_label)
+                try:
+                    _teach_write_draft(prog_id, draft)
+                except _TeachWriteError as e:
+                    return JSONResponse(_storage_full_response(e),
+                                        status_code=507)
+                _teach_publish_to_state()
+                return {'ok': True, 'draft': draft}
+            if draft.get('owner_device_id') == device_id:
+                # Re-claim from the same device (refresh, resume) —
+                # keep the poses, keep ownership.
+                draft = _teach_touch(draft)
+                try:
+                    _teach_write_draft(prog_id, draft)
+                except _TeachWriteError as e:
+                    return JSONResponse(_storage_full_response(e),
+                                        status_code=507)
+                _teach_publish_to_state()
+                return {'ok': True, 'draft': draft}
+            # 2026-08-06 (Lesson 179): null owner → CLAIM.
+            # Ghost-amnesty leaves owner=None on drafts whose
+            # ownership was released. A fresh /start on such a
+            # draft must succeed without a manual take_over.
+            if draft.get('owner_device_id') is None:
+                draft = dict(draft)
+                draft['owner_device_id'] = device_id
+                draft['owner_label']     = device_label or device_id[:8]
+                draft['claimed_at']      = time.strftime(
+                    '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                _teach_touch(draft)
+                try:
+                    _teach_write_draft(prog_id, draft)
+                except _TeachWriteError as e:
+                    return JSONResponse(_storage_full_response(e),
+                                        status_code=507)
+                _teach_publish_to_state()
+                return {'ok': True, 'draft': draft, 'claimed': True}
+            # Different device — check the owner's heartbeat age. If
+            # they've been silent for > 2 heartbeat intervals (60 s),
+            # the lock is treated as abandoned and we auto-grant it
+            # to the requester (Directive item 6, 2026-08-05 teach-
+            # lock incident #3). Poses stay put — this is a graceful
+            # ownership swap, not a data reset.
+            _upd = _teach_updated_epoch(draft)
+            if _upd is not None:
+                _age = time.time() - _upd
+                if _age > _TEACH_STALE_HEARTBEAT_S:
+                    prev_owner = draft.get('owner_device_id')
+                    draft = dict(draft)
+                    draft['owner_device_id']    = device_id
+                    draft['owner_label']        = device_label or device_id[:8]
+                    draft['previous_owner']     = prev_owner
+                    draft['auto_expired_at']    = time.strftime(
+                        '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                    _teach_touch(draft)
+                    try:
+                        _teach_write_draft(prog_id, draft)
+                    except _TeachWriteError as e:
+                        return JSONResponse(_storage_full_response(e),
+                                            status_code=507)
+                    _teach_publish_to_state()
+                    return {
+                        'ok': True,
+                        'draft': draft,
+                        'auto_expired_previous_owner': prev_owner,
+                    }
+            # Another live device owns it. 409 lets the client render
+            # the read-only banner with a Take Over button.
+            return JSONResponse({
+                'ok': False,
+                'error': 'teach_session_locked',
+                'owner_device_id': draft.get('owner_device_id'),
+                'owner_label':     draft.get('owner_label'),
+                'taken_at':        draft.get('started_ts'),
+            }, status_code=409)
+
+    @app.post("/api/teach_session/{prog_id}/take_over")
+    async def api_teach_session_take_over(prog_id: str, request: Request):
+        """Atomically transfer ownership from the current owner to
+        the requesting device. Existing poses are preserved."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        if not device_id:
+            return JSONResponse({'error': 'device_id required'},
+                                status_code=400)
+        device_label = str(body.get('device_label') or '')
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                # No existing draft — treat as a start.
+                draft = _teach_new_draft(prog_id, device_id, device_label)
+                try:
+                    _teach_write_draft(prog_id, draft)
+                except _TeachWriteError as e:
+                    return JSONResponse(_storage_full_response(e),
+                                        status_code=507)
+                _teach_publish_to_state()
+                return {'ok': True, 'draft': draft, 'took_over': False}
+            prev_owner = draft.get('owner_device_id')
+            draft = dict(draft)
+            draft['owner_device_id']    = device_id
+            draft['owner_label']        = device_label or device_id[:8]
+            draft['previous_owner']     = prev_owner
+            draft['took_over_at']       = time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            _teach_touch(draft)
+            try:
+                _teach_write_draft(prog_id, draft)
+            except _TeachWriteError as e:
+                return JSONResponse(_storage_full_response(e),
+                                    status_code=507)
+            _teach_publish_to_state()
+            return {'ok': True, 'draft': draft, 'took_over': True,
+                    'previous_owner': prev_owner}
+
+    @app.post("/api/teach_session/{prog_id}/edit")
+    async def api_teach_session_edit(prog_id: str, request: Request):
+        """Record-through for STRUCTURAL edits — step reorder, add/
+        delete, config change, program rename. Body:
+            {device_id: <str, required>,
+             program:  <full program dict, required>}
+        Writes to draft.staged_program. Save merges staged_program
+        as the base (not the disk-saved program), then applies the
+        pose overlay from draft.poses.
+
+        Ownership + self-heal same as /record — a stale-owner
+        (heartbeat > 60 s old) gets auto-swapped. Non-owner with
+        a fresh session → 403. Storage full → 507.
+
+        Fork registry: page_context_persistence — this is the
+        canonical write-through path for non-pose edits."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        program   = body.get('program')
+        if not device_id:
+            return JSONResponse({'error': 'device_id required'},
+                                status_code=400)
+        if not isinstance(program, dict):
+            return JSONResponse({'error': 'program (full dict) required'},
+                                status_code=400)
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                # First edit implicitly starts the session — same
+                # convenience the /record path offers.
+                draft = _teach_new_draft(prog_id, device_id,
+                    str(body.get('device_label') or ''))
+            else:
+                # Single canonical guard — null owner → CLAIM.
+                # Fork registry: teach_ownership_resolution.
+                draft, err_body, err_code = _teach_claim_or_refuse(
+                    draft, device_id, str(body.get('device_label') or ''))
+                if err_body is not None:
+                    return JSONResponse(err_body, status_code=err_code)
+            draft['staged_program'] = program
+            _teach_touch(draft)
+            try:
+                _teach_write_draft(prog_id, draft)
+            except _TeachWriteError as e:
+                return JSONResponse(_storage_full_response(e),
+                                    status_code=507)
+            _teach_publish_to_state()
+        return {'ok': True, 'draft': draft}
+
+    @app.post("/api/teach_session/{prog_id}/record")
+    async def api_teach_session_record(prog_id: str, request: Request):
+        """Write one pose patch into the draft. Body:
+            {device_id: <str, required>,
+             slot_key: <str, required — 'step:<id>' | 'corner:1|2|3|part'>,
+             patch:    <dict, required — the taught_* payload>}
+        Ownership check refuses writes from non-owners with 403 so
+        the second device's Record buttons (which are UI-disabled)
+        cannot bypass via a direct API call."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        slot_key  = str(body.get('slot_key') or '').strip()
+        patch     = body.get('patch')
+        if not device_id:
+            return JSONResponse({'error': 'device_id required'},
+                                status_code=400)
+        if not slot_key:
+            return JSONResponse({'error': 'slot_key required'},
+                                status_code=400)
+        if not isinstance(patch, dict):
+            return JSONResponse({'error': 'patch must be an object'},
+                                status_code=400)
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                # First record implicitly starts the session with
+                # this device as owner. Keeps the client wire
+                # simple (no explicit /start before /record).
+                draft = _teach_new_draft(prog_id, device_id,
+                    str(body.get('device_label') or ''))
+            else:
+                # Single canonical guard — null owner → CLAIM, stale
+                # non-null owner → auto-swap, fresh non-null owner
+                # → 403. Fork registry: teach_ownership_resolution.
+                draft, err_body, err_code = _teach_claim_or_refuse(
+                    draft, device_id, str(body.get('device_label') or ''))
+                if err_body is not None:
+                    return JSONResponse(err_body, status_code=err_code)
+            poses = dict(draft.get('poses') or {})
+            poses[slot_key] = patch
+            draft['poses'] = poses
+            _teach_touch(draft)
+            try:
+                _teach_write_draft(prog_id, draft)
+            except _TeachWriteError as e:
+                return JSONResponse(_storage_full_response(e),
+                                    status_code=507)
+            _teach_publish_to_state()
+            return {'ok': True, 'draft': draft, 'slot_key': slot_key}
+
+    @app.post("/api/teach_session/{prog_id}/cancel")
+    async def api_teach_session_cancel(prog_id: str, request: Request):
+        """Discard the draft. Either the owner OR a take-over
+        confirmation can cancel — no permission check, because
+        cancel is the "back out safely" affordance."""
+        with _teach_lock:
+            _teach_delete_draft(prog_id)
+            _teach_publish_to_state()
+        return {'ok': True, 'program_id': prog_id}
+
+    @app.post("/api/teach_session/{prog_id}/end")
+    async def api_teach_session_end(prog_id: str, request: Request):
+        """Release ownership of the teach session. Body:
+            {device_id: <str, required>}
+        The DRAFT stays on disk (poses safe); the OWNER field clears
+        so the banner drops for every other device, and the session
+        is re-claimable via /start without a Take Over. The record-
+        through architecture already persisted every pose on Record,
+        so ending the session loses nothing (P0-B, 2026-08-05).
+
+        Non-owner callers get 403 — device_B can't force-end
+        device_A's session (Take Over is the collision-case path)."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        if not device_id:
+            return JSONResponse({'error': 'device_id required'},
+                                status_code=400)
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                return {'ok': True, 'already_ended': True}
+            # 2026-08-06 (Lesson 179): null owner → nothing to
+            # release. "End my session" from a device that doesn't
+            # own it is a no-op when the session is unclaimed —
+            # same UX as no draft.
+            if draft.get('owner_device_id') is None:
+                return {'ok': True, 'already_ended': True}
+            if draft.get('owner_device_id') != device_id:
+                return JSONResponse({
+                    'ok': False,
+                    'error': 'not_owner',
+                    'owner_device_id': draft.get('owner_device_id'),
+                    'owner_label':     draft.get('owner_label'),
+                }, status_code=403)
+            draft = dict(draft)
+            draft['owner_device_id'] = None
+            draft['owner_label']     = None
+            draft['ended_ts']        = time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            _teach_touch(draft)
+            try:
+                _teach_write_draft(prog_id, draft)
+            except _TeachWriteError as e:
+                return JSONResponse(_storage_full_response(e),
+                                    status_code=507)
+            _teach_publish_to_state()
+        return {'ok': True, 'released': True}
+
+    @app.post("/api/teach_session/{prog_id}/heartbeat")
+    async def api_teach_session_heartbeat(prog_id: str, request: Request):
+        """Refresh the session's `updated_ts` so the owner-TTL doesn't
+        expire on a slow-network live device. Body:
+            {device_id: <str, required>}
+        Non-owner → 403 (heartbeat is proof of live ownership; another
+        device's heartbeat must not extend the owning device's TTL).
+        No draft → 404 with a canonical "session gone" body so the
+        client can navigate away cleanly."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        if not device_id:
+            return JSONResponse({'error': 'device_id required'},
+                                status_code=400)
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                return JSONResponse({
+                    'ok': False, 'error': 'no_session',
+                }, status_code=404)
+            # 2026-08-06 (Lesson 179): null owner → CLAIM.
+            # Heartbeat from an unclaimed session becomes the claim
+            # itself. Odd but consistent with the doctrine that a
+            # null owner is CLAIMABLE, never refused.
+            draft, err_body, err_code = _teach_claim_or_refuse(
+                draft, device_id, str(body.get('device_label') or ''))
+            if err_body is not None:
+                return JSONResponse(err_body, status_code=err_code)
+            _teach_touch(draft)
+            try:
+                _teach_write_draft(prog_id, draft)
+            except _TeachWriteError as e:
+                return JSONResponse(_storage_full_response(e),
+                                    status_code=507)
+        return {'ok': True, 'updated_ts': draft.get('updated_ts')}
+
+    def _apply_draft_poses_to_program(program: dict, poses: dict):
+        """Merge draft poses INTO a program dict (returns
+        (merged_program, unmatched_slot_keys) without persisting).
+        Slots:
+          step:<step_id>    → merge patch into the matching step
+          corner:1|2|3      → write .taught_tcp to
+                              config.pallet_place.corner{N}_tcp
+          corner:part       → write .taught_tcp to
+                              config.pallet_place.part_tcp
+        Slot keys that DON'T match any step or corner target are
+        returned as `unmatched_slot_keys` so the caller can raise a
+        named warning ("N recorded poses matched no step — steps
+        may have been renumbered") instead of silently discarding.
+        Pre-fix: unmatched keys were dropped without a trace, so
+        a step deletion mid-teach silently lost the pose.
+        """
+        merged = json.loads(json.dumps(program))
+        steps  = merged.setdefault('steps', [])
+        cfg    = merged.setdefault('config', {})
+        place  = cfg.setdefault('pallet_place', {})
+        by_step_id = {}
+        for s in steps:
+            sid = s.get('id')
+            if sid is not None:
+                by_step_id[str(sid)] = s
+        unmatched: list = []
+        for slot_key, patch in (poses or {}).items():
+            if slot_key.startswith('step:'):
+                sid = slot_key[len('step:'):]
+                target = by_step_id.get(sid)
+                if target is None:
+                    unmatched.append(slot_key)
+                    continue
+                for k, v in (patch or {}).items():
+                    target[k] = v
+            elif slot_key.startswith('corner:'):
+                corner = slot_key[len('corner:'):]
+                tcp = (patch or {}).get('taught_tcp')
+                if not (isinstance(tcp, list) and len(tcp) >= 6):
+                    unmatched.append(slot_key)
+                    continue
+                key = {
+                    '1':    'corner1_tcp',
+                    '2':    'corner2_tcp',
+                    '3':    'corner3_tcp',
+                    'part': 'part_tcp',
+                }.get(corner)
+                if key:
+                    place[key] = list(tcp[:6])
+                else:
+                    unmatched.append(slot_key)
+            else:
+                unmatched.append(slot_key)
+        return merged, unmatched
+
+    @app.post("/api/teach_session/{prog_id}/save")
+    async def api_teach_session_save(prog_id: str, request: Request):
+        """Promote draft → program via the single validator door
+        (check_program_pending_poses). On success: merged program
+        persisted to /opt/cobot/programs/{id}.json AND the draft
+        file deleted. On validation failure: HTTP 400 with the
+        finding list; draft stays intact so the operator can jog
+        + re-teach."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str(body.get('device_id') or '').strip()
+        device_label = str(body.get('device_label') or '')
+        with _teach_lock:
+            draft = _teach_read_draft(prog_id)
+            if draft is None:
+                return JSONResponse({
+                    'ok': False, 'error': 'no_draft'}, status_code=404)
+            # 2026-08-06 (Lesson 179): null owner → CLAIM, don't refuse.
+            # Ghost-amnesty leaves owner=None; the promoting device
+            # must be able to save without a manual take_over.
+            if device_id:
+                draft, err_body, err_code = _teach_claim_or_refuse(
+                    draft, device_id, device_label)
+                if err_body is not None:
+                    return JSONResponse(err_body, status_code=err_code)
+            path = _prog_read_path(prog_id)
+            if path is None or not os.path.isfile(path):
+                return JSONResponse({
+                    'ok': False, 'error': 'program_not_found'},
+                    status_code=404)
+            with open(path) as fh:
+                saved_program = json.load(fh)
+            # 2026-08-05 (edit-through): if the draft carries a
+            # staged_program (structural edits recorded through the
+            # /edit endpoint), use it as the BASE for the merge —
+            # not the disk-saved program. The pose overlay is then
+            # applied on top. Without this, refreshing the tablet
+            # would keep the poses but drop every step reorder /
+            # add / delete / rename since last Save.
+            base_program = (draft.get('staged_program')
+                            if isinstance(draft.get('staged_program'), dict)
+                            else saved_program)
+            merged, unmatched_slot_keys = _apply_draft_poses_to_program(
+                base_program, draft.get('poses') or {})
+            # Single validator door: same check used by the
+            # /api/estun/program/run push. Blocking findings refuse
+            # the save so a controller-crashing program never reaches
+            # disk via the teach-session path either.
+            try:
+                from estun_driver import program_ops
+                pending = program_ops.check_program_pending_poses(merged)
+            except Exception as _pe:
+                pending = []
+            if pending:
+                return JSONResponse({
+                    'ok':      False,
+                    'error':   'pending_poses',
+                    'outcome': {
+                        'kind':     'pending_poses',
+                        'count':    len(pending),
+                        'findings': pending,
+                    },
+                    'program_id': prog_id,
+                }, status_code=400)
+            # Persist. Reuse the standard save shape: same fields
+            # the /api/programs PUT would emit. Wrap in try/except so
+            # a full-disk ENOSPC returns 507 instead of a 500 crash.
+            try:
+                tmp_path = path + '.tmp'
+                with open(tmp_path, 'w') as fh:
+                    json.dump(merged, fh, indent=2)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, path)
+            except OSError as _e:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                return JSONResponse(_storage_full_response(
+                    _TeachWriteError(_e.errno, str(_e))),
+                    status_code=507)
+            _teach_delete_draft(prog_id)
+            _teach_publish_to_state()
+            # Bump the program-rev event so every client refreshes.
+            try:
+                _bump_prog_rev(prog_id)
+            except Exception:
+                pass
+        response: dict = {'ok': True, 'program': merged}
+        # 2026-08-05 (silent-drop kill — Directive item 5). Every
+        # slot_key that didn't match a step or corner target is
+        # surfaced as a named warning INSTEAD of being silently
+        # discarded. Operator sees "N recorded poses matched no
+        # step — steps may have been renumbered" in the save toast;
+        # the forensic event-log entry keeps the slot keys for
+        # later diagnosis (which pose, which program).
+        if unmatched_slot_keys:
+            response['warnings'] = [{
+                'kind':             'unmatched_poses',
+                'count':            len(unmatched_slot_keys),
+                'unmatched_slot_keys': list(unmatched_slot_keys),
+                'operator_message': (
+                    f'{len(unmatched_slot_keys)} recorded pose'
+                    + ('s' if len(unmatched_slot_keys) != 1 else '')
+                    + ' matched no step — steps may have been '
+                    + 'renumbered. Re-teach if needed.'),
+            }]
+            try:
+                _event_log.emit(
+                    severity='warning',
+                    source='teach_session',
+                    code='unmatched_poses_on_save',
+                    operator_message=response['warnings'][0]['operator_message'],
+                    technical_detail=(
+                        f'program_id={prog_id} '
+                        f'unmatched={list(unmatched_slot_keys)}'),
+                    context={'program_id': prog_id,
+                             'unmatched_slot_keys': list(unmatched_slot_keys)})
+            except Exception:
+                pass
+        return response
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):

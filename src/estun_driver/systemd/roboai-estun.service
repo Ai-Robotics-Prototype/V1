@@ -1,0 +1,56 @@
+[Unit]
+# RoboAi Estun Codroid driver — telemetry mirror + jog write path.
+#
+# STANDING DECISION: this unit is DISABLED at boot on purpose. The
+# operator brings the driver up per session with an explicit
+#   sudo systemctl start roboai-estun
+# and takes it down with
+#   sudo systemctl stop roboai-estun
+# The `Restart=on-failure` policy below covers crashes during that
+# session; it does NOT bring the driver back after a manual stop.
+# `enabled` remains OFF to prevent boot-time motion enablement.
+#
+# START:   sudo systemctl start roboai-estun
+# STOP:    sudo systemctl stop roboai-estun
+# LOGS:    journalctl -u roboai-estun -f
+# STATUS:  systemctl status roboai-estun
+#
+# Motion gates live in the drop-in env file — see
+# /etc/default/roboai-estun.example for the flags. Motion is REFUSED
+# unless BOTH ESTUN_MONITOR_ONLY=false AND ESTUN_ALLOW_JOG=1 are
+# present when the driver starts.
+Description=RoboAi Estun Codroid Driver
+After=network.target
+
+[Service]
+Type=simple
+User=teddy
+# ROS_DOMAIN_ID stays inline (unlikely to change per site).
+Environment="ROS_DOMAIN_ID=0"
+
+# Optional per-cell overrides for the robot's network location AND
+# for the safety gates. The leading `-` makes the file optional so
+# the service still starts if the operator hasn't dropped one in
+# yet — the YAML default in config/estun.yaml takes over (which is
+# monitor_only=true, jog GATED — telemetry-mirror mode). See
+# /etc/default/roboai-estun.example (versioned in-repo at
+# src/estun_driver/systemd/) for the flags this file carries.
+EnvironmentFile=-/etc/default/roboai-estun
+
+# Launch instead of `ros2 run` so the packaged config/estun.yaml is
+# loaded as --params-file. The driver honors ESTUN_ROBOT_IP /
+# ESTUN_ROBOT_PORT / ESTUN_MONITOR_ONLY / ESTUN_ALLOW_JOG /
+# ESTUN_ALLOW_CARTESIAN / ESTUN_ALLOW_POWER (from the EnvironmentFile)
+# with priority over YAML.
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 launch estun_driver estun_driver.launch.py'
+
+# Restart on CRASH only. `always` would relaunch after a manual stop,
+# which is not what we want given the standing "disabled at boot"
+# decision — a manual stop must stay stopped. `on-failure` covers
+# unclean exits (segfault, exception → non-zero) but respects an
+# operator's `systemctl stop`.
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

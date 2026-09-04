@@ -1,9 +1,23 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
+import { pushWsGap as _pushWsGap, pushJogStop }
+  from '../lib/jogTelemetry'
 
 const HOST = typeof window !== 'undefined' ? window.location.host : 'localhost:8080'
 const WS_PROTO =
   typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws'
+
+// Per-page-load client id, sent as `X-Client-Id` on every program
+// mutation so the server can tag `program_changed` events with the
+// originator and every OTHER client refetches while THIS client
+// ignores its own echo. Regenerated per tab so two tabs on the same
+// device still see each other's edits.
+export const CLIENT_ID = (() => {
+  try {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID()
+  } catch { /* fall through */ }
+  return 'c-' + Math.random().toString(36).slice(2) + Date.now().toString(36)
+})()
 
 // Exponential backoff helper
 function backoffDelay(attempt) {
@@ -20,6 +34,80 @@ const storeDefinition = (set, get) => ({
   lidarWsStatus: 'disconnected',
   wsLatency: 0,
   lastMessageTime: 0,
+  // Cross-client staleness invariant (2026-07-31 §D10 in the
+  // Program Doctrine). programRevConfirmed goes:
+  //   * true  — a fresh /api/programs/<id> fetch confirmed the
+  //             held rev matches the server's, AND the WS is up
+  //             (so any subsequent program_changed event will
+  //             reach us on the next state frame).
+  //   * false — either the WS is down OR the WS just reconnected
+  //             and we haven't yet completed the post-reconnect
+  //             refetch. In this window taught badges MUST render
+  //             a "state syncing…" indicator instead of a confident
+  //             green ✓. Never assert state we can't back with a
+  //             fresh read.
+  // The one place we FLIP this true is at the tail of
+  // _refreshCurrentProgram (successful fetch). We flip it false
+  // on WS onclose AND on WS onopen when this isn't the first
+  // connect (the reconnect path always distrusts pre-drop state).
+  programRevConfirmed: false,
+  // Marker so onopen can tell "first connect" (initial page load)
+  // from "reconnect" (WS came back). First connect: normal load
+  // path is responsible for the initial fetch. Reconnect: the
+  // onopen handler triggers a defensive refetch.
+  _hasConnectedOnce: false,
+  // ── Provenance handshake state (2026-08-28 stale-class close) ──
+  // `staleProvenance` non-null → StaleGuard renders a BLOCKING
+  // full-screen overlay "reload required" (not dismissible; the
+  // dismissible toast class was ignored). Shape:
+  //   { layer: 'frontend'|'backend', expected, actual, detectedAt }
+  // `_lastSeenBackendSha` tracks the previous hello's backend_sha
+  // so a mid-session backend restart (different SHA on reconnect)
+  // also latches staleProvenance without needing a page reload
+  // to detect.
+  staleProvenance: null,
+  _lastSeenBackendSha: null,
+  // Setter used by StaleGuard's override path (2026-08-28
+  // lockout escape hatch). Clears the mismatch record so the
+  // BLOCKING overlay unmounts — kept as a discrete action so a
+  // test can drive it without reaching into the raw set() API.
+  _setStaleProvenance(sp) { set({ staleProvenance: sp }) },
+  // Reconcile log — session-only ring of {ts, kind, detail}
+  // recording every WS open/close, visibility resume, reconcile
+  // start/done event. Capped at 64. Directive (2026-07-31): "log
+  // reconnect+reconcile events client-side so the next report can
+  // say which device reconciled when." Access via
+  //   useStore.getState()._reconcileLog
+  // in devtools. Not persisted — a page refresh clears it.
+  _reconcileLog: [],
+  // 2026-08-28: _checkBundleId / serverBundleId / bundleObsolete
+  // retired. Compared /api/build_id.bundle_id (chunk-hash, 8-char
+  // vite asset hash) to __BUILD_ID__ (git-describe SHA) — different
+  // shapes; the strings could never equal each other, so the toast
+  // fired for both true staleness and every deploy where the two
+  // shapes happened to be non-empty. Provenance is now StaleGuard
+  // (SHA-to-SHA compare of __GIT_SHA__ against the WS-pushed
+  // frontend_sha) + DeployStatusBanner (three-layer verdict).
+  // One mechanism, not two disagreeing ones.
+  // Same-machine Date.now() of the most recent WS frame carrying a
+  // robot.program.state value. Used ONLY by isStateStreamStale so
+  // the wedge banner can distinguish a real controller wedge from
+  // a stale stream. 0 means "never received a program.state frame
+  // this session" (freshly-loaded page).
+  lastProgramStateTs: 0,
+
+  // Previous robot.program.state value — tracked so we can detect a
+  // 2→0 transition (run completed) and pop a completion toast that
+  // carries the manifest's codegen_stale flag when applicable
+  // (2026-07-30 §3 anti-staleness surfacing).
+  _lastProgramState: null,
+
+  // Last program command intent — used by deriveRunState to
+  // disambiguate program.state=3 between PAUSED (project/pause) and
+  // STOPPING (project/stop). Set by pauseProgram/resumeProgram/
+  // cancelProgram BEFORE the wire verb fires; cleared on the 2→0
+  // transition (run terminated) and on resume (2026-09-02).
+  programIntent: null,
 
   // ---- Jog speed (0-100 %) ----
   // Reusable knob. Currently drives ONLY the twin animation speed for
@@ -37,11 +125,187 @@ const storeDefinition = (set, get) => ({
 
   // ---- Robot state ----
   safety: { zone: 'GREEN', speed_scale: 1.0, estop: false, human_proximity: 2.4 },
+
+  // Self-collision presentation preferences.
+  //   selfCollisionBannerEnabled — Safety-page toggle for the
+  //     non-blocking warn-zone banner. Persists in localStorage.
+  //     NEVER affects the stop-zone modal — that's the last line
+  //     of defense and always fires.
+  //   mutedCollisionPairs — session-only Set of canonical pair
+  //     keys (see lib/collisionPresentation.pairMuteKey). Cleared
+  //     on refresh, per directive: "per-pair session mute".
+  //
+  // 2026-07-31 OPERATOR DIRECTIVE: default OFF. The fat capsule
+  // model was blocking legitimate jogs and flagging safe poses as
+  // "close"; until the mesh-hull upgrade (§396 follow-up) lands,
+  // the banner is off unless someone opts in for a customer cell.
+  // The toggle stays so it can come back.
+  selfCollisionBannerEnabled: (() => {
+    try {
+      const raw = localStorage.getItem('selfCollisionBannerEnabled')
+      return raw === null ? false : raw === '1'
+    } catch { return false }
+  })(),
+  mutedCollisionPairs: new Set(),
+  setSelfCollisionBannerEnabled: (on) => {
+    try { localStorage.setItem('selfCollisionBannerEnabled', on ? '1' : '0') }
+    catch { /* ignore */ }
+    set({ selfCollisionBannerEnabled: !!on })
+  },
+  muteCollisionPair: (key) => {
+    if (!key) return
+    set((s) => {
+      const next = new Set(s.mutedCollisionPairs)
+      next.add(key)
+      return { mutedCollisionPairs: next }
+    })
+  },
+  unmuteCollisionPair: (key) => {
+    if (!key) return
+    set((s) => {
+      const next = new Set(s.mutedCollisionPairs)
+      next.delete(key)
+      return { mutedCollisionPairs: next }
+    })
+  },
   joints: {
     names: ['J1', 'J2', 'J3', 'J4', 'J5', 'J6'],
     positions: [0, 0, 0, 0, 0, 0],
     velocities: [0, 0, 0, 0, 0, 0],
   },
+  // Real-arm state — mirrored from dashboard_server, which listens to
+  // /estun/status. IncrementalJogPanel disables its buttons while
+  // jog_active is true or connected is false.
+  robot: {
+    connected: false,
+    mode: 'unknown',
+    safety_mode: 'unknown',
+    status_flag: 0,
+    moving: false,
+    jog_active: false,
+    jog_mode: null,
+    jog_index: 0,
+    jog_direction: 0,
+    allow_jog: false,
+    allow_cartesian_jog: false,
+    // Power transition surface — read-only mirror of the driver's
+    // /estun/status. `allow_power` gates the /cmd/power endpoint; the
+    // banner uses `enabled`, `enabling`, and `alarm` to pick the label.
+    allow_power: false,
+    enabled: false,
+    enabling: false,
+    alarm: false,
+    alarm_count: 0,
+    state_code: 0,
+    state_name: '',
+    // Structured active alarm from the controller. Shape (or null):
+    //   {severity: int, code: int, ts: float, text: string}
+    // Banner interprets `code` to pick recovery copy — 2002 joint-limit
+    // is the operator's most common lockout.
+    active_alarm: null,
+    // Most recent driver-side stop reason string (from _stop_jog_locked).
+    // Rendered as a transient toast/banner line while last_stop_ts is
+    // recent (see JogControls). Empty until the first stop.
+    last_stop_reason: '',
+    last_stop_ts: 0,
+    // 2026-08-04 (Lesson 165): dashboard-composed operator copy for
+    // the latest stop. Shape (or null):
+    //   {title, detail, technical, tag, ts}
+    // Frontend renders `title` + `detail` on the jog surface. The raw
+    // `technical` string is stashed but not shown by default. Fork
+    // registry `jog_stop_cause_propagation` forbids re-parsing the
+    // raw reason on the frontend — this is the ONLY approved surface.
+    stop_cause_copy: null,
+    // Structured cause snapshot from the driver (source of truth for
+    // tag / joint index). Frontend does not derive UI copy from this
+    // — the dashboard has already translated it into stop_cause_copy.
+    last_stop_cause: null,
+    // Live cart-mode joint-limit approach softening state. Non-null
+    // while the driver is scaling cart speed to protect a joint limit;
+    // rendered as a compact "slowing near J<n>" HUD in the jog surface.
+    // Shape:
+    //   {active, limiting_joint_1based, current_deg, safe_edge_deg,
+    //    headroom_deg, scale}
+    cart_softening: null,
+    // Per-joint limit evaluation — one entry per joint, driver-side.
+    // Each: {joint, current_deg, limit_deg, margin_deg, out_of_range,
+    //        near_limit, headroom_deg}. Populated by /estun/status.
+    joint_limits: [],
+    // Self-collision guard mirror. `collision_pair` is [linkA, linkB]
+    // when any capsule pair is under `collision_warn_mm`; the twin uses
+    // it to tint those two links (amber ≤ warn, red ≤ stop). Values
+    // update live at the same cadence as the state broadcast.
+    collision_enabled: false,
+    collision_pair: null,
+    collision_min_mm: null,
+    collision_warn_mm: 80.0,
+    collision_stop_mm: 30.0,
+    collision_warning: false,
+    // Environment (static-obstacle) telemetry — separate from
+    // self-collision because the escape popup is env-specific
+    // (self-collision hands off to Joint mode / open-the-pose copy).
+    env_zone_count: 0,
+    env_pair: null,          // [link, "zone#<id>"] or null
+    env_min_mm: null,
+    env_warn_mm: 80.0,
+    env_stop_mm: 30.0,
+    // Driver-computed escape directions when in the warn zone.
+    // Each: {joint, direction, projected_mm, current_mm}.
+    env_escape_dirs: [],
+    // Unified guard state — used by the guard popup for ANY collision
+    // kind (self / ground / env). Driver publishes whichever pair is
+    // closest into these keys with a `guard_kind` discriminator.
+    guard_active: false,
+    guard_kind: null,          // 'self' | 'ground' | 'env' | null
+    guard_pair: null,
+    guard_min_mm: null,
+    guard_warn_mm: 80.0,
+    guard_stop_mm: 30.0,
+    guard_escapes: [],
+    ground_z_mm: -300.0,
+  },
+
+  // Alarm recovery modal UI state — the modal auto-opens whenever an
+  // alarm or out-of-range condition arises (see AlarmRecoveryModal).
+  // The operator can minimize it to see the 3D twin behind; minimize
+  // sets `alarmModalMinimized: true` and the banner grows a "Recovery
+  // guide" button to re-open. Minimize is the ONLY way to close while
+  // the condition persists — full-close only happens automatically
+  // after a successful enable (2 s READY confirmation).
+  // Reset to false on every fresh alarm transition so the modal
+  // always demands attention when something new arrives.
+  alarmModalMinimized: false,
+  setAlarmModalMinimized(v) { set({ alarmModalMinimized: !!v }) },
+
+  // 3D View tab's REAL-ARM jog panel visibility. Three states —
+  // 'MINIMIZED' shows a dockable pill, 'NORMAL' shows the panel
+  // beside the viewer, 'EXPANDED' fills the tab area (only one
+  // panel can be expanded at a time; if a future viewer panel adopts
+  // the same pattern it toggles this off when it expands).
+  view3dJogPanel: 'NORMAL',
+  setView3dJogPanel(mode) {
+    if (mode === 'MINIMIZED' || mode === 'NORMAL' || mode === 'EXPANDED') {
+      set({ view3dJogPanel: mode })
+    }
+  },
+
+  // JogControls press style — mirrors the factory pendant's Jogging/
+  // Inching split. STEP = one increment per press (no hold-repeat);
+  // CONTINUOUS = motion while held. Applies to both Joint and Cartesian.
+  //
+  // Default CONTINUOUS (2026-08-03 §2): press-and-hold matches operator
+  // expectation on a pendant, and the client + server dead-man safety
+  // net (Worker+rAF ticker at 100 ms cadence, driver's 200 ms freshness
+  // deadman) has been in production since the CONTINUOUS mode landed —
+  // STEP's "safer" reputation was margin-only. STEP remains a one-click
+  // switch for fine positioning (25 mm/step, mm-precise) and operator
+  // muscle memory. Persisted in Zustand (memory only — no localStorage;
+  // a fresh page load re-defaults to CONTINUOUS).
+  jogStyle: 'CONTINUOUS',
+  setJogStyle(style) {
+    if (style === 'STEP' || style === 'CONTINUOUS') set({ jogStyle: style })
+  },
+
   task: {
     state: 'IDLE',
     target: null,
@@ -95,20 +359,106 @@ const storeDefinition = (set, get) => ({
   // ---- UI state ----
   activeTab: 'monitor',
   activeView: 'split',
+
+  // ── Edition (2026-09-04) ────────────────────────────────────
+  // Per-device edition, hydrated from /api/edition on boot. Default
+  // 'basic' matches the server default_edition; unlock via the
+  // StatusBar affordance calls /api/edition/unlock which flips the
+  // device to 'full'. Nav / page / control rendering keys off
+  // isFeatureEnabled from lib/edition.js — features not enabled for
+  // this edition render NOTHING (absent, not disabled-greyed).
+  edition: 'basic',
+  editionHydrated: false,
+  async hydrateEdition() {
+    try {
+      const res = await fetch('/api/edition', {
+        headers: { 'X-Client-Id': CLIENT_ID },
+      })
+      if (!res.ok) return
+      const data = await res.json()
+      if (data && (data.edition === 'basic' || data.edition === 'full')) {
+        set({ edition: data.edition, editionHydrated: true })
+      } else {
+        set({ editionHydrated: true })
+      }
+    } catch { /* keep default */ }
+  },
+  async unlockEdition(passphrase) {
+    try {
+      const res = await fetch('/api/edition/unlock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Client-Id': CLIENT_ID },
+        body: JSON.stringify({ passphrase }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data && data.edition) {
+        set({ edition: data.edition })
+        return { ok: true }
+      }
+      return { ok: false, error: data.error || `HTTP ${res.status}` }
+    } catch (e) {
+      return { ok: false, error: e.message || String(e) }
+    }
+  },
+  async lockEdition() {
+    try {
+      const res = await fetch('/api/edition/lock', {
+        method: 'POST',
+        headers: { 'X-Client-Id': CLIENT_ID },
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data && data.edition) {
+        set({ edition: data.edition })
+        return { ok: true }
+      }
+      return { ok: false, error: data.error || `HTTP ${res.status}` }
+    } catch (e) {
+      return { ok: false, error: e.message || String(e) }
+    }
+  },
+
+
   // Cross-tab signal: the Program editor's detect step sets this to
   // true before switching to the Part Recognition tab; AdaptivePicking
   // reads + clears it on mount and opens the Teach New Part wizard.
   pendingTeachNew: false,
-  mode: 'operator',
+  // 2026-09-04: `mode` slot (operator/engineer) retired along with
+  // the Configure toggle — no live consumer.
   jogEnabled: false,
   jogJoint: 0,
   _jogTimer: null,
+  // 2026-08-05 — high-water-mark timestamp of the last jog rejection
+  // we toast'd. Prevents re-toasting the same rejection when the
+  // rejected[] ring buffer re-arrives on subsequent /ws frames.
+  _lastJogRejectTs: 0,
   pendingCommand: null,
   commandError: null,
   toasts: [],
 
+  // ── Teach-session record-through cache (2026-08-04) ─────────
+  // Server-truth mirror of every draft under
+  // /opt/cobot/teach_sessions/. Keyed by program_id. Populated
+  // from `msg.teach_sessions` on every WS state frame. The
+  // Jetson is the single store — this slice is a cache; UI
+  // reads it for the "Teaching in progress on <owner>" banner
+  // and for live-view badge fills when observing another
+  // device's teach session.
+  teachSessions: {},
+
   // ---- LiDAR ----
   lidarPoints: [],
+
+  // ---- Trajectory overlay ----
+  // Set by RecentRunsCard's [Trajectory] action so the 3D twin viewer
+  // can draw the swept flange path in the same scene the operator
+  // watches. Cleared when the user closes the trajectory panel.
+  //   points: [[x, y, z], ...]  meters, in the URDF geometry frame
+  //           (Y-up) — same frame ArmViewer3D loads the URDF into, so
+  //           the polyline lands directly on the flange.
+  //   step: integer step_index this path corresponds to (for label)
+  //   runId: source run for the readout badge
+  trajectoryOverlay: null,
+  setTrajectoryOverlay(overlay) { set({ trajectoryOverlay: overlay }) },
 
   // ---- Internal WS refs (not serialised) ----
   _stateWs: null,
@@ -123,6 +473,46 @@ const storeDefinition = (set, get) => ({
   connectWS() {
     get()._connectStateWS()
     get()._connectLidarWS()
+    get()._installVisibilityHooks()
+  },
+
+  // Install document.visibilitychange + window.pageshow listeners
+  // so the tablet's "resume from background" ALWAYS triggers a
+  // full reconcile — even when the WS looks connected from the
+  // browser's perspective. Mobile Chrome silently suspends WS
+  // frames while a tab is backgrounded and can appear to seamlessly
+  // resume without ANY onclose firing; that's how a tablet ends
+  // up "connected" but sitting on stale state.
+  //
+  // Idempotent — registers once per page load. Guarded so the SSR
+  // path (unlikely; kept for safety) is a no-op.
+  _visibilityHooksInstalled: false,
+  _installVisibilityHooks() {
+    if (get()._visibilityHooksInstalled) return
+    if (typeof document === 'undefined' || typeof window === 'undefined') return
+    set({ _visibilityHooksInstalled: true })
+    // visibilitychange fires when the tab becomes visible again.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return
+      // Log even when there's no open program — the log is what we
+      // send when the operator asks "what happened on the tablet?"
+      get()._pushReconcileLog('visibility_visible',
+        `wsStatus=${get().wsStatus}`)
+      // If the WS is down, onopen will trigger a reconcile when it
+      // reconnects. If it looks up but we've been backgrounded,
+      // force one anyway — the browser may have silently paused
+      // frame delivery and we can't tell without a fresh fetch.
+      get()._reconcileAll('visibilitychange')
+    })
+    // pageshow with persisted=true fires when the tab comes back
+    // from the bfcache — no fetches ran while it was cached, so
+    // the tab is running arbitrarily-old state.
+    window.addEventListener('pageshow', (e) => {
+      const persisted = !!(e && e.persisted)
+      get()._pushReconcileLog('pageshow',
+        persisted ? 'bfcache_restore' : 'initial')
+      if (persisted) get()._reconcileAll('pageshow_bfcache')
+    })
   },
 
   _connectStateWS() {
@@ -132,18 +522,223 @@ const storeDefinition = (set, get) => ({
     const ws = new WebSocket(`${WS_PROTO}://${HOST}/ws/state`)
 
     ws.onopen = () => {
-      set({ wsStatus: 'connected', _stateWs: ws, _stateRetry: 0 })
+      const wasReconnect = get()._hasConnectedOnce
+      set({
+        wsStatus: 'connected',
+        _stateWs: ws,
+        _stateRetry: 0,
+        _hasConnectedOnce: true,
+      })
+      get()._pushReconcileLog('ws_open',
+        wasReconnect ? 'reconnect' : 'first_connect')
+      // Reconnect path: NEVER trust pre-drop state. During the WS
+      // outage other clients may have mutated programs, deploys may
+      // have restarted the server, mobile Chrome may have suspended
+      // the tab entirely. Full reconcile fetches the {id: rev} map
+      // + refetches the open program before rendering any confident
+      // state again.
+      //
+      // Doctrine tie-in: D10 forbids the screen asserting state it
+      // can't read. Between the WS drop and the reconcile response,
+      // the client's held rev is unconfirmed — badges render the
+      // "state syncing…" indicator via programRevConfirmed=false.
+      if (wasReconnect) {
+        get()._reconcileAll('ws_reconnect')
+      }
+      // 2026-08-28: bundle-id check retired. StaleGuard covers the
+      // "tab open through a deploy" case with a SHA-to-SHA compare
+      // fed by the WS hello frame — see onmessage below.
     }
 
     ws.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data)
+        // ── Provenance hello (2026-08-28 stale-class close) ──
+        // Server pushes {type:'hello',backend_sha,frontend_sha}
+        // immediately after accept. Compare frontend_sha to our
+        // OWN __GIT_SHA__ (baked at build time by vite). If they
+        // differ → our tab is stale — the server has been redeployed
+        // with a new frontend since this tab loaded. Set
+        // `staleProvenance` so StaleGuard shows a BLOCKING overlay
+        // (not a dismissible toast). Also latch on backend SHA
+        // change across two hellos — a reconnect after backend
+        // restart means the running python3 is a different build.
+        if (msg && msg.type === 'hello') {
+          const mySha = (typeof __GIT_SHA__ !== 'undefined')
+                          ? __GIT_SHA__ : 'unknown'
+          const bareSelf   = String(mySha).replace(/-dirty$/, '')
+          const bareFrontS = String(msg.frontend_sha || '').replace(/-dirty$/, '')
+          const bareBackS  = String(msg.backend_sha  || '').replace(/-dirty$/, '')
+          const prevBack   = get()._lastSeenBackendSha
+          set({ _lastSeenBackendSha: bareBackS })
+          const frontendStale =
+            bareSelf !== 'unknown'
+            && bareFrontS && bareFrontS !== 'unknown'
+            && bareSelf !== bareFrontS
+          const backendChanged =
+            prevBack && bareBackS && prevBack !== bareBackS
+          if (frontendStale || backendChanged) {
+            set({
+              staleProvenance: {
+                layer:    frontendStale ? 'frontend' : 'backend',
+                expected: frontendStale ? bareSelf : prevBack,
+                actual:   frontendStale ? bareFrontS : bareBackS,
+                detectedAt: Date.now(),
+              },
+            })
+          }
+          return   // hello isn't a state frame; nothing else to do
+        }
         const now = Date.now()
-        const latency = msg.t ? Math.round(now - msg.t) : 0
+        // wsLatency estimates one-way (server-emit → client-receive)
+        // delay, but msg.t is the server's Date.now() (Jetson clock)
+        // and `now` is the tablet's Date.now() — cross-machine
+        // wall-clock subtraction. Any NTP drift between the two
+        // machines shows up here; on a fresh ONN tablet the browser
+        // clock can drift a few hundred ms behind the Jetson, which
+        // used to print as e.g. "-318 ms" in TopBar. Clamp to 0 so
+        // the display never lies about direction. This value is a
+        // ROUGH estimate under clock skew and MUST NOT be used in
+        // any control-flow decision — wedge staleness, deadman
+        // timers, etc. all use same-clock deltas instead (see
+        // lastProgramStateTs below, `stuckStoppingMs` in
+        // MonitorDashboard, HoldButton's Worker+rAF ticker).
+        const latency = msg.t ? Math.max(0, Math.round(now - msg.t)) : 0
+        // Jog telemetry — record inter-message gap on the state
+        // channel so the tablet-vs-laptop RTT breakdown has real
+        // numbers to look at. pushWsGap is a no-op when telemetry
+        // is off, so this stays free of cost in prod.
+        if (typeof performance !== 'undefined') {
+          const nowP = performance.now()
+          const prev = get()._lastWsMsgTs
+          if (prev) {
+            try { _pushWsGap(nowP - prev) } catch { /* nop */ }
+          }
+          get()._lastWsMsgTs = nowP
+        }
+        // ACK-gated state protocol (2026-07-16). Server sends the next
+        // frame only after we ack this one, which bounds in-flight to
+        // one frame and prevents the OS TCP send buffer from
+        // accumulating multi-second backlogs on slow clients. We ack
+        // BEFORE the set() so the ack is on the wire while React does
+        // the re-render work — that way the server's next frame is
+        // already being prepped and the pipeline is filled cleanly.
+        // Pre-ACK server versions still work: they ignore the ack
+        // (WS receiver treats unknown messages as no-op).
+        if (msg.seq && ws.readyState === WebSocket.OPEN) {
+          try { ws.send(JSON.stringify({ type: 'state_ack', seq: msg.seq })) }
+          catch (_) { /* socket closing — sender falls back to timeout gate */ }
+        }
+        // Track same-machine arrival time of ProjectState frames so
+        // the wedge banner can distinguish a real controller wedge
+        // (fresh state=3 arriving for >3s) from a stale stream
+        // (nothing arriving at all). Client-side Date.now() only —
+        // same clock as `stoppingSince`/`nowTs` in MonitorDashboard.
+        // A `program.state` value of 0/2/3 counts as a live frame;
+        // absence of `program.state` in the message doesn't refresh
+        // the timestamp so a burst of non-program updates can't hide
+        // a wedged stream.
+        const progStateNow =
+          msg.robot && msg.robot.program
+            && msg.robot.program.state !== undefined
+            && msg.robot.program.state !== null
+            ? now : get().lastProgramStateTs
+        // 2026-08-05 A(c): surface driver `jog` family rejections as
+        // a toast so the operator never sees dead-button silence when
+        // the allow_jog / monitor_only gate is closed on the driver.
+        // Rejections stream via robot.rejected (ring buffer, 32
+        // entries, mirrored by dashboard_server._on_estun_rejected).
+        // We track the last-seen jog-rejection timestamp and toast
+        // any newer entry — one toast per new rejection, coalesced by
+        // the store's addToast dedup so a burst doesn't spam.
+        const _incomingRej  = msg.robot?.rejected
+        const _lastJogRejTs = get()._lastJogRejectTs || 0
+        let   _newLastTs    = _lastJogRejTs
+        if (Array.isArray(_incomingRej)) {
+          // 2026-08-05 (guided recovery, Lesson 165 extension): while
+          // the JointRecoveryModal is up for a joint that's inside
+          // the escape-only zone, drop jog-rejection toasts that
+          // mention that joint. The modal IS the message — a toast
+          // storm on top of it just adds noise. Applies to both the
+          // 'escape_only' reason (deeper-direction refused) and the
+          // ordinary 'clamp' reason (approach refused). Suppression
+          // is data-driven off joint_limits.past_escape_only — no
+          // separate registry to keep in sync.
+          const jl = msg?.robot?.joint_limits
+          const _suppressedJoints = new Set()
+          if (Array.isArray(jl)) {
+            for (const j of jl) {
+              if (j?.past_escape_only) _suppressedJoints.add(Number(j.joint))
+            }
+          }
+          for (const r of _incomingRej) {
+            if (r?.family !== 'jog') continue
+            const rts = Number(r?.ts) || 0
+            if (rts <= _lastJogRejTs) continue
+            if (rts > _newLastTs) _newLastTs = rts
+            const reason = r?.reason || 'jog rejected (unknown reason)'
+            // Extract the joint index if the reason names one, and
+            // drop when the modal is claiming that condition.
+            const jm = /J([1-6])\b/.exec(reason)
+            if (jm && _suppressedJoints.has(Number(jm[1]))) continue
+            try { get().addToast?.(`Jog rejected: ${reason}`, 'warning') }
+            catch (_) { /* nop */ }
+          }
+        }
+        // Run-completion toast on program.state 2→0 (running →
+        // stopped). Fires ONCE per transition and, when the most-
+        // recent run manifest carries codegen_stale=true, colors
+        // the toast amber with the "used STALE codegen" call-out.
+        // Non-blocking; failures are silent. See 2026-07-30 §3.
+        const _prevProgState = get()._lastProgramState
+        const _curProgState  = msg?.robot?.program?.state
+        if (_prevProgState === 2 && _curProgState === 0) {
+          // Debounced fetch — the manifest gets written by the
+          // recorder on the same state transition; give it ~200ms
+          // to land before we look, then check codegen_stale.
+          setTimeout(() => {
+            fetch('/api/runs')
+              .then((r) => r.ok ? r.json() : null)
+              .then((body) => {
+                const runs = body?.runs || []
+                const latest = runs[0]
+                if (!latest) return
+                if (latest.codegen_stale) {
+                  try {
+                    get().addToast?.(
+                      `Run completed — used STALE codegen `
+                      + `(boot ${(latest.codegen_version?.src_sha256 || '').slice(0, 12)} `
+                      + `≠ disk ${latest.codegen_disk_sha || '?'}). `
+                      + `Restart services or run scripts/deploy.sh `
+                      + `before the next run.`,
+                      'warning', 12000)
+                  } catch (_) { /* nop */ }
+                } else {
+                  try {
+                    const dur = latest.duration_s
+                      ? `${latest.duration_s.toFixed(1)}s`
+                      : 'complete'
+                    get().addToast?.(`Run ${dur} — codegen fresh`, 'info', 4000)
+                  } catch (_) { /* nop */ }
+                }
+              })
+              .catch(() => {})
+          }, 250)
+        }
+
+        // Clear programIntent on 2→0 (run terminated) so a subsequent
+        // idle→run→pause cycle classifies state=3 correctly.
+        const _nextIntent = (_prevProgState === 2 && _curProgState === 0)
+          ? null : get().programIntent
         set({
           safety: msg.safety ?? get().safety,
           joints: msg.joints ?? get().joints,
+          robot: msg.robot ?? get().robot,
           task: msg.task ?? get().task,
+          _lastJogRejectTs: _newLastTs,
+          _lastProgramState: (_curProgState ?? _prevProgState),
+          lastProgramStateTs: progStateNow,
+          programIntent: _nextIntent,
           detections: msg.detections ?? get().detections,
           // Server publishes detection_mode in STATE; keep the store
           // in sync so a fresh page-load picks up whatever mode was
@@ -157,9 +752,94 @@ const storeDefinition = (set, get) => ({
           grasp_poses: msg.grasp_poses ?? get().grasp_poses,
           gripper: msg.gripper ?? get().gripper,
           program: msg.program ?? get().program,
+          // Teach-session record-through mirror (2026-08-04). The
+          // server broadcasts STATE['teach_sessions'] on every WS
+          // state frame; the client keeps a slice keyed by
+          // program_id so components can (a) render "Teaching in
+          // progress on <owner>" when the current program is
+          // locked to another device, and (b) overlay draft poses
+          // onto currentProgram for live UX responsiveness. The
+          // draft file on the Jetson is the source of truth;
+          // this store slice is a cache that reconciles on every
+          // frame.
+          teachSessions: msg.teach_sessions ?? get().teachSessions,
           wsLatency: latency,
           lastMessageTime: now,
         })
+        // Bug 1 fix (2026-07-27): program_changed events piggyback
+        // on /ws/state as msg.program_events. Each event: {
+        //   type, program_id, rev, source_client, kind, ts_ms }.
+        // We ignore our own echoes (source_client === CLIENT_ID),
+        // ignore events for programs we don't have open, and
+        // dedupe on ts_ms so a single event fanning across
+        // multiple frames only fires once. Cross-client refetch
+        // lives at the bottom of the handler so all state is
+        // already committed by the time we ask for a re-read.
+        if (Array.isArray(msg.program_events) && msg.program_events.length) {
+          get()._handleProgramEvents(msg.program_events)
+        }
+        // 2026-07-31 jog-stop instrumentation: watch for driver-
+        // emitted stops. The driver publishes robot.last_stop_ts +
+        // robot.last_stop_reason on every _stop_jog_locked call.
+        // When the ts advances, the driver just stopped a jog on
+        // its side; classify the cause from the reason string's
+        // `cause=<tag>` prefix (added driver-side in the same
+        // commit). Frontend-initiated stops also flow through this
+        // path — we suppress those by matching against the client's
+        // most recent pushJogStop timestamp.
+        try {
+          const _stopTs = Number(msg?.robot?.last_stop_ts) || 0
+          const _prev   = get()._lastObservedDriverStopTs || 0
+          if (_stopTs > _prev) {
+            set({ _lastObservedDriverStopTs: _stopTs })
+            const reason = String(msg?.robot?.last_stop_reason || '')
+            // Reason strings are tagged as `cause=<tag>: <human>`
+            // (driver-side change). Parse the tag; default to
+            // 'server_gate' when the tag is missing / unknown.
+            const m = /cause=([a-z_]+)/.exec(reason)
+            const tag = m ? m[1] : 'server_gate'
+            // Skip stops that trace back to a client-initiated
+            // release (release_cmd) — those already got a
+            // pointer_up / pointer_cancel entry from the UI.
+            if (tag !== 'release_cmd') {
+              try { pushJogStop(tag, { reason }) } catch { /* nop */ }
+            }
+          }
+        } catch { /* nop */ }
+        // 2026-07-31 CONVERGENCE: every state frame carries the
+        // server's authoritative {program_id: rev} snapshot. If our
+        // held rev for the OPEN program is behind, refetch now —
+        // this heals missed events (event ring TTL 15s can age out
+        // during long backgrounds) without waiting for the next
+        // mutation to fire a fresh event.
+        const _serverRevs = msg.program_revs
+        if (_serverRevs && typeof _serverRevs === 'object') {
+          const _cp = get().currentProgram
+          if (_cp && _cp.id && _serverRevs[_cp.id] != null) {
+            const serverRev = Number(_serverRevs[_cp.id])
+            const heldRev   = _cp.rev == null ? -1 : Number(_cp.rev)
+            // Two gap directions both trigger a refetch:
+            //   (a) server > held — the normal case (another client
+            //       just mutated). Missed-event heal.
+            //   (b) server < held — the post-restart case (server
+            //       lost its in-memory rev, our held value is now
+            //       impossibly high). The refetch resets us to the
+            //       authoritative server value.
+            const gap = Number.isFinite(serverRev) && serverRev !== heldRev
+            if (gap) {
+              get()._pushReconcileLog('rev_gap_in_frame',
+                `${_cp.id}: held=${_cp.rev} server=${serverRev} `
+                + `(${serverRev > heldRev ? 'behind' : 'ahead-of-server'})`)
+              // Skip the refetch when the operator has unsaved
+              // edits — the existing programChangedByOther banner
+              // path takes precedence to avoid clobbering their
+              // local work.
+              if (!_cp.unsaved) {
+                get()._refreshCurrentProgram()
+              }
+            }
+          }
+        }
       } catch (e) {
         // ignore parse errors
       }
@@ -170,7 +850,23 @@ const storeDefinition = (set, get) => ({
     }
 
     ws.onclose = () => {
-      set({ wsStatus: 'disconnected', _stateWs: null })
+      // WS down → held program state is no longer trustworthy. Any
+      // mutation on another client during the outage will NOT reach
+      // us via program_events until the WS comes back. Flip the
+      // confirmation flag so taught badges surface the "state
+      // syncing…" indicator (D10) rather than a confident green ✓.
+      set({
+        wsStatus: 'disconnected',
+        _stateWs: null,
+        programRevConfirmed: false,
+      })
+      get()._pushReconcileLog('ws_close', 'client-observed close')
+      // 2026-07-31 jog-stop instrumentation: WS drops are a
+      // top-suspect cause of mid-hold cutouts. The jog channel
+      // rides /ws/state — losing the WS forces the fallback
+      // path, and if that also stalls the driver's freshness
+      // deadman fires. Tag so the bench analyzer separates them.
+      try { pushJogStop('ws_drop', {}) } catch { /* nop */ }
       const nextAttempt = get()._stateRetry + 1
       set({ _stateRetry: nextAttempt })
       setTimeout(() => get()._connectStateWS(), backoffDelay(nextAttempt))
@@ -260,6 +956,29 @@ const storeDefinition = (set, get) => ({
     get().sendCommand('estop', { active: false, override: true })
   },
 
+  // ── Robot power (enable / disable / clear_alarm) ────────────────────
+  // Distinct from motion: transitions the servo state, not motion state.
+  // The banner's Enable / Disable / Clear-Alarm buttons all funnel here
+  // AFTER an operator confirmation dialog — no auto-callers. Every call
+  // routes through the backend's /cmd/power, which validates the action
+  // string and publishes onto /robot/power_command. The driver's
+  // allow_power gate is the real safety layer; this helper is just the
+  // transport. Returns the parsed response body (or null on error).
+  sendPowerCommand(action) {
+    if (action !== 'enable' && action !== 'disable' && action !== 'clear_alarm') {
+      get().addToast(`Unknown power action: ${action}`, 'error')
+      return Promise.resolve(null)
+    }
+    // WS-first, HTTP fallback — mirror the jog transport. Power gestures
+    // are already gated by a confirmation dialog and are infrequent, so
+    // either path is fine; WS eliminates handshake cost during degraded
+    // dashboards.
+    if (get()._sendJogWS('power', { action })) {
+      return Promise.resolve({ ok: true, action, transport: 'ws' })
+    }
+    return get().sendCommand('power', { action })
+  },
+
   // ---------------------------------------------------------------------------
   // Task commands
   // ---------------------------------------------------------------------------
@@ -286,11 +1005,441 @@ const storeDefinition = (set, get) => ({
     if (legacy) return get().sendCommand('task', { command: legacy })
   },
 
-  runProgram(opts)     { return get()._dispatchProgram('run', opts) },
-  pauseProgram()        { return get()._dispatchProgram('pause') },
-  resumeProgram()       { return get()._dispatchProgram('resume') },
-  homeRobot()           { return get()._dispatchProgram('home') },
-  cancelProgram()       { return get()._dispatchProgram('stop') },
+  // Monitor Run button. Opens the confirm modal instead of firing the
+  // run directly — the ladder-proven pipeline is destructive (overwrites
+  // the controller's stored program on every press) and moves the real
+  // arm, so the operator needs to see program name + step count +
+  // effective speed + move-gate status before proceeding. The actual
+  // POST /api/estun/program/run happens inside RunProgramModal on
+  // Confirm. Passing {sim:true} bypasses the modal for the legacy sim
+  // flow (executor + /task/run_program).
+  runProgram(opts = {}) {
+    if (opts.sim) return get()._dispatchProgram('run', opts)
+    return get().openRunModal()
+  },
+  // Pause / Resume go through the ladder verbs (project/pause,
+  // project/resume). Wire-proven on the CC10-A controller (2026-09-02):
+  // pause holds the interpreter at the current line (state 2→3, arm
+  // decelerates and holds); resume advances (state 3→2, motion
+  // continues from where it stopped). If the driver refuses (gate
+  // closed, etc.), the rejection surfaces on STATE.robot.rejected.
+  //
+  // programIntent is set BEFORE the wire verb so deriveRunState can
+  // disambiguate state=3 as PAUSED vs STOPPING correctly on the next
+  // frame.
+  async pauseProgram() {
+    set({ programIntent: 'pause' })
+    try { await fetch('/api/estun/program/pause', { method: 'POST' }) }
+    catch (_) { /* fall through to sim */ }
+    return get()._dispatchProgram('pause')
+  },
+  async resumeProgram() {
+    // Ladder-verb resume (2026-08-04). Prior to this fix,
+    // resumeProgram called /api/estun/program/run WITHOUT
+    // push_only — which is the FULL run path: codegen + save +
+    // byte-verify + to_auto + run publish. That restarts the
+    // program from step 1, NOT continues from the paused line.
+    // A pause at step 47 in a 100-step program came back at 1;
+    // operators reading the "Resume" button label expected
+    // continuation and got a re-run instead. The dedicated
+    // /api/estun/program/resume endpoint publishes the
+    // project/resume ladder verb — the correct semantic action.
+    // (2026-09-02 SOURCE-ONLY flag lifted; wire-proven.)
+    //
+    // Clear programIntent so the next state=3 frame (if the
+    // operator pauses again, or hits stop mid-move) classifies
+    // correctly. State transitions 3→2 as motion resumes.
+    set({ programIntent: null })
+    try {
+      const res = await fetch('/api/estun/program/resume',
+        { method: 'POST' })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        get().addToast?.(
+          `Resume failed: ${(err && err.error) || `HTTP ${res.status}`}`,
+          'error', 8000)
+      }
+    } catch (e) {
+      get().addToast?.(
+        `Resume failed — network error: ${String(e?.message || e)}`,
+        'error', 8000)
+    }
+    return get()._dispatchProgram('resume')
+  },
+  // Return Home — dispatches through /api/robot/home. The caller
+  // resolves the target pose from the LOADED PROGRAM's first MOVE_HOME
+  // step and passes taught_joints (+ optional taught_tcp / program_id
+  // / program_name / run_speed_pct) in the body. The endpoint refuses
+  // when taught_joints is missing — there is no silent fallback to a
+  // global preset. Every non-ok response carries a specific
+  // `outcome.kind` this handler surfaces as a toast.
+  async homeRobot(payload) {
+    const body = payload && typeof payload === 'object' ? payload : {}
+    try {
+      const res  = await fetch('/api/robot/home', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(body),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (data.ok) {
+        const src = data.source_program_id ? ` (${data.source_program_id})` : ''
+        get().addToast?.(
+          `Homing at ${data.effective_pct || '?'}%${src}`, 'info')
+        return { ok: true }
+      }
+      const msg = data.error || `home failed (HTTP ${res.status})`
+      get().addToast?.(msg, 'warning')
+      return { ok: false, error: msg, outcome: data.outcome }
+    } catch (e) {
+      const msg = `home dispatch failed: ${e?.message || e}`
+      get().addToast?.(msg, 'error')
+      return { ok: false, error: msg }
+    }
+  },
+  // Stop → project/stop, the wire-proven ladder-rung-1 verb. Falls
+  // through to the sim's cancel so both paths land at rest.
+  async cancelProgram() {
+    set({ programIntent: 'stop' })
+    try { await fetch('/api/estun/program/stop', { method: 'POST' }) }
+    catch (_) { /* fall through to sim */ }
+    return get()._dispatchProgram('stop')
+  },
+  // Clear the driver's latched error (also stops the 3 Hz publish/Error
+  // reflood on the controller). Wired to the error modal below.
+  async clearProgramError() {
+    try { await fetch('/api/estun/program/clear_error', { method: 'POST' }) }
+    catch (_) { /* no-op */ }
+  },
+
+  // Point-table teach flow. All calls are same-origin fetches to the
+  // dashboard's /api/programs/{id}/points endpoints; the backend
+  // snapshots the LIVE pose from the driver's /estun/status mirror
+  // atomically at teach time, so we don't have to pass joints from
+  // the client (avoids a client-server race on a fast operator).
+  //
+  // SAFETY: teach never publishes to /estun/program and never touches
+  // allow_move. The gate governs Run only. That separation is
+  // enforced backend-side by the endpoints living outside the
+  // gate check block.
+  // Highest program_event ts_ms this client has already applied. Guards
+  // against the same event firing multiple times as it rides successive
+  // /ws/state frames within its 15 s TTL window on the server.
+  _lastProgramEventTs: 0,
+
+  // Set to {rev, source_client, kind, ts_ms} when the server tells us
+  // OUR currently-open program was mutated on ANOTHER device while we
+  // have local unsaved edits. ProgramEditor renders a banner reading
+  // "Program updated on another device — [Reload] [Keep my edits]".
+  // Cleared by explicit user action (Reload → auto-refetch clears it;
+  // Keep my edits → clears without refetch, next Save will win). null
+  // when there's nothing outstanding.
+  programChangedByOther: null,
+  clearProgramChangedByOther() { set({ programChangedByOther: null }) },
+
+  _handleProgramEvents(events) {
+    const cp = get().currentProgram
+    if (!cp || !cp.id) return
+    let latestSeen = get()._lastProgramEventTs
+    let mustRefetch = null      // last event we WILL apply
+    let mustBanner  = null      // last unsaved-edits-conflict event
+    for (const ev of events) {
+      if (!ev || ev.type !== 'program_changed') continue
+      if (ev.program_id !== cp.id) continue
+      if (ev.source_client && ev.source_client === CLIENT_ID) continue
+      if (!ev.ts_ms || ev.ts_ms <= latestSeen) continue
+      // Compare rev when we have one locally. rev==undefined on
+      // fresh loads means "assume stale" and refetch on any event.
+      if (cp.rev != null && ev.rev != null && ev.rev <= cp.rev) continue
+      latestSeen = ev.ts_ms
+      if (cp.unsaved) mustBanner  = ev
+      else            mustRefetch = ev
+    }
+    if (latestSeen > get()._lastProgramEventTs) {
+      set({ _lastProgramEventTs: latestSeen })
+    }
+    if (mustBanner) {
+      set({ programChangedByOther: {
+        rev:           mustBanner.rev,
+        source_client: mustBanner.source_client,
+        kind:          mustBanner.kind || 'mutation',
+        ts_ms:         mustBanner.ts_ms,
+      } })
+    } else if (mustRefetch) {
+      // No local unsaved edits → refetch quietly. The next state
+      // frame that arrives after refetch clears cp.rev == null so
+      // subsequent events fire the normal >-rev compare.
+      get()._refreshCurrentProgram()
+    }
+  },
+
+  async _pointsFetch(method, path, body = null) {
+    // Every mutation stamps X-Client-Id so the server can tag the
+    // resulting program_changed event with this client's UUID and
+    // OTHER clients see the change while this one skips its echo
+    // (see Bug 1 fix in dashboard_server._emit_program_changed).
+    const headers = { 'X-Client-Id': CLIENT_ID }
+    const opts = { method, headers }
+    if (body !== null) {
+      headers['Content-Type'] = 'application/json'
+      opts.body = JSON.stringify(body)
+    }
+    const res = await fetch(path, opts)
+    const data = await res.json().catch(() => ({}))
+    return { ok: res.ok, status: res.status, data }
+  },
+  // Fetches the current version of the currently-loaded program from
+  // the server and merges into currentProgram (so points + steps +
+  // has_taught_poses stay in sync after any teach/rename/delete).
+  // Rename a program to a controller-safe slug. Server derives the
+  // new id from newName (lowercase-alnum-only). On success, updates
+  // currentProgram so the editor picks up the new id + name without
+  // needing a reload. Used by the "Rename to controller-safe id"
+  // affordance next to Save when currentProgram.id contains an
+  // underscore or otherwise fails the ^[a-z0-9]+$ round-trip test.
+  async renameProgram(oldId, newName) {
+    if (!oldId || !newName) return null
+    try {
+      const res = await fetch(`/api/programs/${encodeURIComponent(oldId)}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ new_name: newName }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || !data.ok) {
+        get().addToast(data?.error || `rename failed (HTTP ${res.status})`, 'warning')
+        return null
+      }
+      // Load the renamed file (which may have gained a numeric suffix
+      // if the target slug already existed) into currentProgram.
+      get().setCurrentProgram({
+        id: data.program.id, name: data.program.name,
+        description: data.program.description || '',
+        steps: data.program.steps || [],
+        config: data.program.config || {}, tags: data.program.tags || [],
+        cell_id: data.program.cell_id || null,
+        points: data.program.points || {},
+        source: data.program.source,
+        unsaved: false,
+      })
+      get().refreshPrograms?.()
+      get().addToast(`Renamed ${oldId} → ${data.program.id}`, 'success')
+      return data.program
+    } catch (e) {
+      get().addToast(`Network error during rename: ${e?.message || e}`, 'warning')
+      return null
+    }
+  },
+
+  // Log a reconcile event to the session-local ring. Capped at 64;
+  // detail is a short free-form string. Every reconcile trigger
+  // pushes at least a 'start' and 'done' pair so the operator can
+  // read a linear timeline in devtools:
+  //   useStore.getState()._reconcileLog
+  _pushReconcileLog(kind, detail = '') {
+    const entry = { ts: Date.now(), kind, detail: String(detail || '') }
+    set((s) => {
+      const next = [...(s._reconcileLog || []), entry]
+      if (next.length > 64) next.splice(0, next.length - 64)
+      return { _reconcileLog: next }
+    })
+  },
+
+  // Full reconcile — the convergence guarantee (2026-07-31 §16).
+  // Called on:
+  //   * every WS onopen that isn't the first connect (reconnect)
+  //   * every document visibilitychange to visible (mobile Chrome
+  //     may have silently suspended the WS)
+  //   * every window pageshow (tablet bfcache resume)
+  //   * an in-frame rev-gap detected on program_revs
+  // Fetches server-truth for the program list revs AND the currently
+  // open program's full state before flipping programRevConfirmed
+  // back to true. Never trust pre-reconcile state.
+  async _reconcileAll(trigger = 'unspecified') {
+    get()._pushReconcileLog('reconcile_start', trigger)
+    // Mark state unconfirmed until the reconcile completes — the
+    // badges render "state syncing…" during this window (D10).
+    if (get().programRevConfirmed) {
+      set({ programRevConfirmed: false })
+    }
+    let revsFetchOK = false
+    try {
+      const res = await fetch('/api/programs/revs')
+      if (res.ok) {
+        const body = await res.json()
+        const revs = (body && body.revs) || {}
+        // If the currently-open program's server rev exceeds the
+        // client's held rev, refetch. The subsequent
+        // _refreshCurrentProgram call below covers the same case
+        // for programs with rev=null on the client, so this branch
+        // is belt-and-suspenders for programs the client hasn't
+        // touched yet in this session.
+        const cp = get().currentProgram
+        if (cp && cp.id && revs[cp.id] != null
+            && (cp.rev == null || revs[cp.id] > cp.rev)) {
+          get()._pushReconcileLog('rev_gap_detected',
+            `${cp.id}: held=${cp.rev} server=${revs[cp.id]}`)
+        }
+        revsFetchOK = true
+      }
+    } catch (_) {
+      // Network hiccup during reconcile. Log + don't flip confirmed
+      // → badges stay in syncing state. The next tick's rev-gap
+      // watcher OR the next visibility resume will retry.
+      get()._pushReconcileLog('reconcile_err', 'revs fetch failed')
+    }
+    // Refetch the open program's full state — this is what actually
+    // heals a missed teach/mutation.
+    const cp = get().currentProgram
+    if (cp && cp.id) {
+      await get()._refreshCurrentProgram()
+    } else if (revsFetchOK && get().wsStatus === 'connected') {
+      // No open program to reconcile → nothing to hold syncing on.
+      set({ programRevConfirmed: true })
+    }
+    // 2026-08-28: _checkBundleId call removed. Provenance is
+    // StaleGuard's job now — see WS hello frame handler.
+    get()._pushReconcileLog('reconcile_done', trigger)
+  },
+
+  async _refreshCurrentProgram() {
+    const id = get().currentProgram?.id
+    if (!id) return
+    try {
+      const res = await fetch('/api/programs/' + encodeURIComponent(id))
+      if (!res.ok) return
+      const full = await res.json()
+      if (full && full.id) {
+        get().setCurrentProgram({
+          id:         full.id,
+          name:       full.name,
+          description: full.description || '',
+          steps:      Array.isArray(full.steps) ? full.steps : get().currentProgram.steps,
+          config:     full.config || {},
+          tags:       Array.isArray(full.tags) ? full.tags : [],
+          points:     full.points || {},
+          source:     full.source,
+          rev:        full.rev,      // Bug 1 fix: pick up rev so future
+                                     // program_events compare correctly.
+          unsaved:    false,         // Refetch clears the dirty flag —
+                                     // we just re-read canonical state.
+          has_taught_poses: full.has_taught_poses,
+        })
+        get().clearProgramChangedByOther()
+        // Fresh fetch → held rev matches server. Only mark
+        // confirmed while the WS is up (otherwise a subsequent
+        // mutation on another client would slip past us again).
+        if (get().wsStatus === 'connected') {
+          set({ programRevConfirmed: true })
+        }
+      }
+    } catch (_) { /* silent — next tick refresh, if any, will retry */ }
+  },
+  async teachCurrentPose({ label } = {}) {
+    const id = get().currentProgram?.id
+    if (!id) {
+      get().addToast('Load or save a program first, then teach', 'warning')
+      return null
+    }
+    const { ok, status, data } = await get()._pointsFetch(
+      'POST', `/api/programs/${encodeURIComponent(id)}/points`,
+      label ? { label } : {})
+    if (!ok) {
+      const msg = data?.error || `teach failed (HTTP ${status})`
+      get().addToast(msg, 'warning')
+      return null
+    }
+    await get()._refreshCurrentProgram()
+    get().addToast(`Taught ${data.point.name}${label ? ' — ' + label : ''}`, 'success')
+    return data.point
+  },
+  async retachPoint(name) {
+    const id = get().currentProgram?.id
+    if (!id) return null
+    const { ok, status, data } = await get()._pointsFetch(
+      'PUT', `/api/programs/${encodeURIComponent(id)}/points/${encodeURIComponent(name)}`,
+      { retach: true })
+    if (!ok) {
+      get().addToast(data?.error || `re-teach failed (HTTP ${status})`, 'warning')
+      return null
+    }
+    await get()._refreshCurrentProgram()
+    get().addToast(`Re-taught ${name}`, 'success')
+    return data.point
+  },
+  async renamePoint(name, newName) {
+    const id = get().currentProgram?.id
+    if (!id) return null
+    if (!newName || newName === name) return null
+    const { ok, status, data } = await get()._pointsFetch(
+      'PUT', `/api/programs/${encodeURIComponent(id)}/points/${encodeURIComponent(name)}`,
+      { new_name: newName })
+    if (!ok) {
+      get().addToast(data?.error || `rename failed (HTTP ${status})`, 'warning')
+      return null
+    }
+    await get()._refreshCurrentProgram()
+    return data.point
+  },
+  async relabelPoint(name, label) {
+    const id = get().currentProgram?.id
+    if (!id) return null
+    const { ok, status, data } = await get()._pointsFetch(
+      'PUT', `/api/programs/${encodeURIComponent(id)}/points/${encodeURIComponent(name)}`,
+      { label: label || null })
+    if (!ok) {
+      get().addToast(data?.error || `relabel failed (HTTP ${status})`, 'warning')
+      return null
+    }
+    await get()._refreshCurrentProgram()
+    return data.point
+  },
+  async deletePoint(name) {
+    const id = get().currentProgram?.id
+    if (!id) return false
+    const { ok, status, data } = await get()._pointsFetch(
+      'DELETE', `/api/programs/${encodeURIComponent(id)}/points/${encodeURIComponent(name)}`)
+    if (!ok) {
+      if (status === 409 && Array.isArray(data?.in_use_by)) {
+        get().addToast(
+          `Can't delete ${name}: step(s) ${data.in_use_by.map(i => '#' + (i + 1)).join(', ')} still use it. Re-target or delete those steps first.`,
+          'warning')
+      } else {
+        get().addToast(data?.error || `delete failed (HTTP ${status})`, 'warning')
+      }
+      return false
+    }
+    await get()._refreshCurrentProgram()
+    return true
+  },
+  // Append a movJ step that references a taught point by name. The
+  // caller usually clicks a "+ Insert step" button next to a point
+  // in the Points panel — the fastest way to author "movJ p1; movJ p2".
+  async addMoveStepForPoint(name) {
+    const cp = get().currentProgram
+    if (!cp?.id) return false
+    const steps = Array.isArray(cp.steps) ? [...cp.steps] : []
+    steps.push({
+      action: 'move',
+      type:   'move',
+      label:  `Move to ${name}`,
+      point_name: name,
+      taught: true,
+      id:     Date.now(),
+    })
+    // Save via PUT so the change is durable AND the backend's
+    // has_taught_poses recomputes for us on the next refresh.
+    const { ok, status, data } = await get()._pointsFetch(
+      'PUT', `/api/programs/${encodeURIComponent(cp.id)}`,
+      { steps, name: cp.name, description: cp.description || '' })
+    if (!ok) {
+      get().addToast(data?.error || `add-step failed (HTTP ${status})`, 'warning')
+      return false
+    }
+    await get()._refreshCurrentProgram()
+    get().addToast(`Added step: movJ(${name})`, 'success')
+    return true
+  },
 
   // ---------------------------------------------------------------------------
   // Jog commands
@@ -302,6 +1451,124 @@ const storeDefinition = (set, get) => ({
       return
     }
     return get().sendCommand('jog', { joint, delta })
+  },
+
+  // ── Continuous hold-to-jog ────────────────────────────────
+  // JogControls calls jogHold on press + every ~150 ms while held,
+  // and jogRelease on release / touchcancel / unmount. The backend
+  // translates hold:true / hold:false into /robot/jog_command frames
+  // consumed by the driver's continuous-jog state machine.
+  //
+  // No jogEnabled toast gate here — the driver enforces gates
+  // (monitor_only, allow_jog); a spurious hold under a closed gate
+  // becomes a rejection log line rather than a UI-side warning.
+
+  // Send a jog frame — WS-first, HTTP fallback. When the state WebSocket
+  // is OPEN, jog holds/refreshes/releases ride the persistent channel:
+  //   - no per-request TLS handshake / TCP connection cost (dashboard
+  //     server's degraded event loop was pushing HTTP POST latency past
+  //     the 200 ms driver freshness deadman — this cuts that path out),
+  //   - ordered delivery (HTTP/1.1 parallel connections can reorder;
+  //     seq=2-before-seq=1 was showing up in the driver log),
+  //   - no in-flight promise to hang, so the doRefresh coalesce guard
+  //     never trips on the WS path.
+  // When the WS is not connected (initial page load / reconnect / server
+  // restart), we fall back to fetch — the driver-side deadman is the
+  // ultimate stop if the fallback stalls.
+  // endpoint ∈ {'jog', 'jog_cartesian', 'power'}. Returns true if a send
+  // was dispatched (WS or HTTP), false only when the WS is closed and
+  // the HTTP fetch also throws — best-effort, no toasts, no retries.
+  _sendJogWS(endpoint, body, meta = {}) {
+    const ws = get()._stateWs
+    if (!ws || ws.readyState !== 1 /* OPEN */) return false
+    const { hold_id, seq, client_ts_ms } = meta
+    const payload = { ...body }
+    if (hold_id != null)      payload.hold_id = hold_id
+    if (seq != null)          payload.seq = seq
+    if (client_ts_ms != null) payload.client_ts_ms = client_ts_ms
+    const type = endpoint === 'jog_cartesian' ? 'jog_cartesian'
+               : endpoint === 'power'         ? 'power'
+               :                                'jog'
+    try {
+      ws.send(JSON.stringify({ type, payload }))
+      return true
+    } catch {
+      return false
+    }
+  },
+
+  // Low-level jog transport — WS first, HTTP fallback. No UI toast on
+  // failure: refresh cadence is 10 Hz and would spam.
+  async _postJog(endpoint, body, meta = {}) {
+    // WS fast path.
+    if (get()._sendJogWS(endpoint, body, meta)) return true
+    // HTTP fallback. Coalescing (skip-if-in-flight) lives one layer up
+    // in HoldButton.doRefresh; the previous 400 ms abort-and-refire
+    // self-heal was killing slow-but-viable requests and has been
+    // removed there — a slow fallback fetch is now allowed to complete.
+    const { signal, hold_id, seq, client_ts_ms } = meta
+    const fullBody = { ...body }
+    if (hold_id != null)      fullBody.hold_id = hold_id
+    if (seq != null)          fullBody.seq = seq
+    if (client_ts_ms != null) fullBody.client_ts_ms = client_ts_ms
+    try {
+      const res = await fetch(`/cmd/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(fullBody),
+        signal,
+      })
+      try { await res.text() } catch { /* nop */ }
+      return res.ok
+    } catch (err) {
+      if (err && (err.name === 'AbortError' || err.code === 20)) return false
+      return false
+    }
+  },
+
+  jogHold(joint1based, direction, speedPct, meta = {}) {
+    return get()._postJog('jog', {
+      joint: joint1based,
+      direction,
+      speed_pct: speedPct,
+      hold: true,
+    }, meta)
+  },
+
+  jogHoldCartesian(axisLetter, direction, speedPct, meta = {}) {
+    return get()._postJog('jog_cartesian', {
+      axis: axisLetter,
+      direction,
+      speed_pct: speedPct,
+      hold: true,
+    }, meta)
+  },
+
+  jogRelease(mode = 'joint', meta = {}) {
+    // Idempotent — safe to call more than once (touchcancel + touchend
+    // etc.). Backend maps to /robot/jog_command with hold:false, which
+    // the driver treats as an explicit stop.
+    const endpoint = mode === 'cartesian' ? 'jog_cartesian' : 'jog'
+    return get()._postJog(endpoint, { hold: false }, meta)
+  },
+
+  // Tap → single-step increment. Joint uses the driver's time-boxed
+  // delta_deg path (angle-bounded, driver owns stop timing). Cartesian
+  // uses the new fixed-duration mode:2 pulse (see driver docstring).
+  jogIncrement(joint1based, deltaDeg) {
+    return get()._postJog('jog', {
+      joint: joint1based,
+      delta_deg: deltaDeg,
+    })
+  },
+
+  jogPulseCartesian(axisLetter, direction, speedPct) {
+    return get()._postJog('jog_cartesian', {
+      axis: axisLetter,
+      direction,
+      speed_pct: speedPct,
+      pulse: true,
+    })
   },
 
   // ---------------------------------------------------------------------------
@@ -501,23 +1768,297 @@ const storeDefinition = (set, get) => ({
     description: '',
     tags: [],
     cell_id: null,
+    // Taught-point table — {name: {joints[6 deg], tcp[6], label, taught_at}}.
+    // Populated by /api/programs/{id}/points endpoints; drives varspoint
+    // codegen when steps reference points by name.
+    points: {},
+    source: null,
+    has_taught_poses: false,
   },
   setCurrentProgram(patch) {
     set((s) => ({ currentProgram: { ...s.currentProgram, ...patch } }))
+    // Whole-program loads from the server carry a `rev`. That's our
+    // "fresh from server" marker — flip programRevConfirmed=true if
+    // the WS is up (an event fanning out after this arrives via
+    // /ws/state will supersede the confirmation). Field-level
+    // {unsaved:true} patches don't carry rev, so they don't flip
+    // the flag — a local edit doesn't confirm cross-client sync.
+    if (patch && patch.rev != null && get().wsStatus === 'connected') {
+      set({ programRevConfirmed: true })
+    }
+    // Load the newly-loaded program's per-program saved speed.
+    // 2026-08-31 speed model: each program record stores its own
+    // last-set speed under config.speed_pct. Switching programs
+    // loads that program's saved speed; new / never-run programs
+    // default to 25% (the F2.7 first-run rule is now satisfied
+    // by this default, not a hard cap). Only fires when the
+    // program identity OR config.speed_pct actually changed —
+    // editing a non-speed field shouldn't reset the runSpeedPct.
+    const cfg = patch?.config
+    if (patch?.id !== undefined || (cfg && 'speed_pct' in cfg)) {
+      const raw = Number(cfg?.speed_pct ?? patch?.speed_pct)
+      if (Number.isFinite(raw) && raw > 0) {
+        set({ runSpeedPct: Math.max(1, Math.min(100, Math.round(raw))) })
+      } else if (patch?.id !== undefined) {
+        // Whole-program load with no stored speed → new-program
+        // default (F2.7 first-run rule as default, not cap).
+        set({ runSpeedPct: 25 })
+      }
+    }
+    // 2026-08-05 (refresh persistence, fork registry:
+    // page_context_persistence):
+    //   * `unsaved:true` field-level patch → debounced edit-through
+    //     to /api/teach_session/{pid}/edit so structural edits
+    //     (reorder, add/delete, config change) survive a refresh
+    //     the same way record-through preserves poses.
+    //   * `patch.id` change (whole-program load / open) → record
+    //     the new open_program_id in /api/ui_context/{device_id}
+    //     so refresh restores the last-open program per-device.
+    const next = get().currentProgram
+    if (patch?.unsaved === true && next?.id) {
+      const prevTimer = get()._editThroughTimer
+      if (prevTimer) clearTimeout(prevTimer)
+      const t = setTimeout(() => {
+        try { get().editThroughProgram(next) } catch (_) { /* nop */ }
+      }, 300)
+      set({ _editThroughTimer: t })
+    }
+    if (patch && Object.prototype.hasOwnProperty.call(patch, 'id')
+        && next?.id) {
+      try { get().rememberOpenProgram(next.id) } catch (_) { /* nop */ }
+    }
   },
 
-  // Program-tab layout dimensions — kept in the store (and persisted)
-  // so switching to another tab and back keeps the panels at the
-  // sizes the operator dragged them to.
-  programLayout: {
-    leftWidth:    560,
-    jogHeight:    500,
-    jogMaximized: false,        // legacy alias — kept for persisted state
-    expandedPanel: null,         // 'steps' | '3d' | 'jog' | null
+  // Timer id for the debounced edit-through fire. Cleared and
+  // reset on every unsaved:true setCurrentProgram call — the
+  // fire only lands 300 ms after the last edit stops. Zustand
+  // never persists this (partialize excludes underscore-prefixed
+  // keys).
+  _editThroughTimer: null,
+
+  // 2026-08-05 (refresh persistence): POST the full current program
+  // to /api/teach_session/{pid}/edit so unsaved structural edits
+  // survive a page reload. Complements recordTeachPose for pose-
+  // level edits; both write through to the same draft file.
+  // Best-effort — network / storage-full errors do NOT toast (the
+  // debounced cadence means the operator would see repeated toasts
+  // on a bad link). The next fire re-attempts.
+  async editThroughProgram(program) {
+    if (!program || !program.id) return { ok: false, error: 'no_id' }
+    const device_id    = get()._getTeachDeviceId()
+    const device_label = get()._getTeachDeviceLabel()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(program.id)}/edit`,
+        { method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ device_id, device_label, program }),
+          keepalive: true })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) return { ok: false, status: res.status, body }
+      return { ok: true, draft: body?.draft }
+    } catch (e) {
+      return { ok: false, error: 'network', message: String(e) }
+    }
   },
-  setProgramLayout(patch) {
-    set((s) => ({ programLayout: { ...s.programLayout, ...patch } }))
+
+  // 2026-08-05 (refresh persistence): record the currently-open
+  // program in the server's per-device UI context store so a
+  // refresh restores it. Fire-and-forget — no toast on failure
+  // because the operator can always pick the program from the
+  // library manually.
+  async rememberOpenProgram(programId) {
+    if (!programId) return
+    const device_id = get()._getTeachDeviceId()
+    try {
+      await fetch(
+        `/api/ui_context/${encodeURIComponent(device_id)}`,
+        { method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({
+            open_program_id: programId,
+            active_tab:      get().activeTab || 'program',
+          }),
+          keepalive: true })
+    } catch (_) { /* nop */ }
   },
+
+  // 2026-08-05 (refresh persistence): on App mount, fetch the
+  // last-open program for THIS device and rehydrate. If a draft
+  // exists with a staged_program (unsaved structural edits), use
+  // it as the base — pose overlay layers on top via the existing
+  // ProgramEditor stepsMerged path. Called ONCE per fresh page
+  // load; a no-op if the device has no context yet.
+  async restoreOpenProgramOnMount() {
+    const device_id = get()._getTeachDeviceId()
+    let openProgId = null
+    let activeTab  = null
+    try {
+      const r = await fetch(
+        `/api/ui_context/${encodeURIComponent(device_id)}`)
+      const b = await r.json().catch(() => ({}))
+      openProgId = b?.context?.open_program_id || null
+      activeTab  = b?.context?.active_tab || null
+      // 2026-08-05 (human labels): warm the device_label cache so
+      // every teach-session call this session carries the operator-
+      // chosen name ("Shop Tablet") instead of falling back to the
+      // platform default. First-run: no label yet in ui_context —
+      // seed it with the platform sniff so banners on OTHER devices
+      // see something readable immediately.
+      const label = b?.context?.device_label
+      if (label && typeof label === 'string') {
+        set({ _teachDeviceLabel: label })
+      } else {
+        const def = get()._getTeachDeviceLabel()
+        set({ _teachDeviceLabel: def })
+        try {
+          fetch(`/api/ui_context/${encodeURIComponent(device_id)}`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ device_label: def }),
+            keepalive: true,
+          })
+        } catch (_) { /* nop */ }
+      }
+    } catch (_) { /* nop — fall through to blank UI */ }
+    if (activeTab) {
+      try { get().setActiveTab(activeTab) } catch (_) { /* nop */ }
+    }
+    if (!openProgId) return
+    // Prefer draft.staged_program (unsaved edits) over the disk
+    // program. Falls back to the saved copy if no staged_program.
+    let program = null
+    try {
+      const dr = await fetch(
+        `/api/teach_session/${encodeURIComponent(openProgId)}`)
+      const db = await dr.json().catch(() => ({}))
+      if (db?.present && db?.draft?.staged_program?.id) {
+        program = db.draft.staged_program
+        program.unsaved = true   // flag so the operator sees the chip
+      }
+    } catch (_) { /* nop */ }
+    if (!program) {
+      try {
+        const pr = await fetch(
+          `/api/programs/${encodeURIComponent(openProgId)}`)
+        if (pr.ok) program = await pr.json().catch(() => null)
+      } catch (_) { /* nop */ }
+    }
+    if (program && program.id) {
+      set((s) => ({ currentProgram: { ...s.currentProgram, ...program } }))
+    }
+  },
+
+  // Monitor "Run Program" confirm modal. The button opens this;
+  // RunProgramModal renders the confirm/error/ok sequence and POSTs
+  // /api/estun/program/run when the operator confirms. See the
+  // RunProgramModal comment header for the full ladder-pipeline flow.
+  runModalOpen: false,
+  openRunModal()  { set({ runModalOpen: true })  },
+  closeRunModal() { set({ runModalOpen: false }) },
+
+  // Live step-preview panel expand/collapse. Session-scoped only —
+  // NOT persisted (see partialize below). Defaults to expanded so a
+  // fresh page load shows the operator step-by-step progress; the
+  // operator can collapse it manually and their choice sticks until
+  // the tab closes.
+  stepPanelOpen: true,
+  setStepPanelOpen(v) { set({ stepPanelOpen: !!v }) },
+
+  // Monitor speed entry (integer % 1..100). 2026-08-31 speed model:
+  // full 1..100 range accepted; controller-side operator_speed_limit
+  // is the true ceiling and refuses via namedSpeedRefusal when
+  // exceeded. Per-program persistence: whenever the value commits,
+  // it debounces-saves to the CURRENT program's config.speed_pct
+  // via PUT /api/programs/{id} (no Save click). Switching programs
+  // loads that program's saved speed (setCurrentProgram wires this
+  // in the patch handler above). New / never-run programs default
+  // to 25% (F2.7 first-run rule as default, not a cap).
+  //
+  // Default 25 (was 10). NOT persisted to localStorage — the value
+  // lives on the program record; a fresh page-load re-hydrates from
+  // there.
+  runSpeedPct: 25,
+  _programSpeedSaveTimer: null,
+  setRunSpeedPct(rawInput) {
+    // Accepts numbers or strings. Non-numeric / empty → falls back to
+    // current value with an addToast('warning', …) so the operator
+    // sees WHY their entry didn't stick.
+    const cur = get().runSpeedPct
+    if (rawInput === '' || rawInput === null || rawInput === undefined) {
+      get().addToast('Speed must be an integer 1–100', 'warning')
+      set({ runSpeedPct: cur }); return cur
+    }
+    let n = Number(rawInput)
+    if (!Number.isFinite(n)) {
+      get().addToast(`Speed ${JSON.stringify(rawInput)} isn't a number (kept ${cur}%)`, 'warning')
+      set({ runSpeedPct: cur }); return cur
+    }
+    n = Math.round(n)
+    if (n < 1) {
+      get().addToast(`Speed ${n} clamped to 1%`, 'warning')
+      n = 1
+    } else if (n > 100) {
+      get().addToast(`Speed ${n} clamped to 100%`, 'warning')
+      n = 100
+    }
+    set({ runSpeedPct: n })
+    // Debounced auto-save to the current program. Silent — no
+    // "Saved" toast on every commit; if the PUT fails the operator
+    // will see the mismatch on next reload (best-effort persistence,
+    // same shape as rememberOpenProgram + editThroughProgram).
+    const progId = get().currentProgram?.id
+    if (progId) {
+      const prev = get()._programSpeedSaveTimer
+      if (prev) clearTimeout(prev)
+      const t = setTimeout(() => {
+        try { get().persistProgramSpeed(progId, n) } catch (_) { /* nop */ }
+      }, 400)
+      set({ _programSpeedSaveTimer: t })
+    }
+    return n
+  },
+
+  // Persist a per-program speed to the backend. Uses PUT
+  // /api/programs/{id} with a config merge (server preserves
+  // steps, points, tags etc — same shape any editor save uses).
+  // Also mirrors the new value into currentProgram.config.speed_pct
+  // so subsequent reads reflect the debounced write without an
+  // extra GET round-trip.
+  async persistProgramSpeed(programId, speedPct) {
+    if (!programId || !Number.isFinite(speedPct)) return { ok: false }
+    const cp = get().currentProgram
+    const mergedConfig = { ...(cp?.config || {}), speed_pct: speedPct }
+    try {
+      const r = await fetch(
+        `/api/programs/${encodeURIComponent(programId)}`,
+        { method:  'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ config: mergedConfig }),
+          keepalive: true })
+      if (!r.ok) return { ok: false, status: r.status }
+      // Mirror into currentProgram without triggering the reload
+      // path (no `id` in the patch → speed reset guard skips).
+      if (cp?.id === programId) {
+        set((s) => ({
+          currentProgram: {
+            ...s.currentProgram,
+            config: { ...(s.currentProgram?.config || {}),
+                      speed_pct: speedPct },
+          },
+        }))
+      }
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, error: String(e) }
+    }
+  },
+
+  // Program-tab layout dimensions used to live here (leftWidth /
+  // jogHeight / expandedPanel) — removed 2026-07-23 when the Program
+  // tab collapsed to a single full-width editor. Any old value in
+  // localStorage is ignored on rehydrate; no migration needed since
+  // the field is unread after this change.
 
   // ---------------------------------------------------------------------------
   // Jog enable/disable
@@ -540,14 +2081,459 @@ const storeDefinition = (set, get) => ({
   },
 
   // ---------------------------------------------------------------------------
+  // Teach-session record-through actions (2026-08-04)
+  // ---------------------------------------------------------------------------
+  //
+  // The Jetson is the single store for ALL pose state, including
+  // mid-teach. Every Record Position on every teach surface goes
+  // through POST /api/teach_session/{pid}/record here — never
+  // straight to setCurrentProgram. The server persists the pose
+  // to /opt/cobot/teach_sessions/{pid}.draft.json, mirrors it into
+  // STATE['teach_sessions'], and broadcasts on the next WS frame
+  // so every connected UI (tablet + PC) converges without a
+  // refresh. See dashboard_server.py teach-session block for the
+  // wire contract.
+  //
+  // 2026-08-05 (identity root-cause fix): Device identity is
+  // PER-DEVICE — one physical machine, one id — persisted in
+  // localStorage under 'roboai-device-id'. Prior implementation
+  // stashed it in sessionStorage, which is per-TAB, so every
+  // tab close/reopen minted a fresh UUID. That was the true
+  // root cause of all four teach-lock incidents: an operator's
+  // own previous tab locked them out because the server saw
+  // "different device_id, fresh updated_ts" and refused to
+  // self-heal (which requires 60s heartbeat silence).
+  //
+  // Fork-registry note: page_context_persistence forbids
+  // localStorage for page STATE. Device IDENTITY is explicitly
+  // whitelisted — it's stable identity, not mutable state.
+  //
+  // Migration path: if a sessionStorage id exists (from a tab
+  // that hasn't closed since the deploy), reuse it in
+  // localStorage so the running session's server-side draft
+  // ownership doesn't break the moment we switch.
+  _teachDeviceId: null,
+  _getTeachDeviceId() {
+    let id = get()._teachDeviceId
+    if (id) return id
+    try {
+      id = localStorage.getItem('roboai-device-id')
+    } catch (_) { /* no localStorage */ }
+    if (!id) {
+      // One-shot migration from the pre-fix sessionStorage key —
+      // preserves the current tab's server-side ownership through
+      // the deploy without a forced re-teach. Once migrated the
+      // sessionStorage entry is cleared so a later refresh can't
+      // shadow the localStorage value.
+      try {
+        const legacy = sessionStorage.getItem('roboai-teach-device-id')
+        if (legacy) {
+          id = legacy
+          try {
+            localStorage.setItem('roboai-device-id', id)
+            sessionStorage.removeItem('roboai-teach-device-id')
+          } catch (_) { /* nop */ }
+        }
+      } catch (_) { /* nop */ }
+    }
+    if (!id) {
+      id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : `dev-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+      try { localStorage.setItem('roboai-device-id', id) } catch (_) { /* nop */ }
+    }
+    set({ _teachDeviceId: id })
+    return id
+  },
+
+  // 2026-08-05 (human labels): device_label is server-owned
+  // (ui_context.device_label) but cached client-side for two
+  // reasons: (a) so every teach-session call can pass it as
+  // device_label without an async fetch, (b) so the label the
+  // OPERATOR sees in Configure is the same string used in
+  // banners and event-log entries. Populated at boot by
+  // restoreOpenProgramOnMount from GET /api/ui_context/{id}.
+  // Default derived from platform sniff — "Tablet" on touch
+  // devices, "PC" otherwise — replaced the first time the
+  // operator names the device in Configure.
+  _teachDeviceLabel: null,
+  _getTeachDeviceLabel() {
+    const cached = get()._teachDeviceLabel
+    if (cached) return cached
+    // Platform sniff — coarse but sufficient. maxTouchPoints > 0
+    // catches tablets (Android/iPad) and touchscreen laptops.
+    let def = 'PC'
+    try {
+      if (typeof navigator !== 'undefined'
+          && (navigator.maxTouchPoints || 0) > 0
+          && /(Android|iPad|iPhone|Mobile|Tablet)/i.test(navigator.userAgent || '')) {
+        def = 'Tablet'
+      }
+    } catch (_) { /* nop */ }
+    return def
+  },
+  setTeachDeviceLabel(label) {
+    const clean = String(label || '').trim().slice(0, 64)
+    if (!clean) return
+    set({ _teachDeviceLabel: clean })
+    const device_id = get()._getTeachDeviceId()
+    try {
+      fetch(`/api/ui_context/${encodeURIComponent(device_id)}`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ device_label: clean }),
+        keepalive: true,
+      })
+    } catch (_) { /* nop */ }
+  },
+
+  // Read the current draft for a program from the WS-cached slice.
+  // Returns null when no draft is active.
+  teachSessionFor(programId) {
+    if (!programId) return null
+    const s = get().teachSessions || {}
+    return s[programId] || null
+  },
+
+  // True iff a teach session exists AND is owned by another
+  // device. Used by ProgramEditor to render the read-only banner.
+  isTeachingElsewhere(programId) {
+    const s = get().teachSessionFor(programId)
+    if (!s) return false
+    return s.owner_device_id
+      && s.owner_device_id !== get()._getTeachDeviceId()
+  },
+
+  // Optimistically POST a pose to the draft. Returns the ack.
+  // The caller updates local currentProgram AFTER a successful
+  // response so the UI never claims a taught pose the server
+  // rejected.
+  async recordTeachPose(programId, slotKey, patch) {
+    if (!programId || !slotKey || !patch) {
+      return { ok: false, error: 'bad_args' }
+    }
+    const device_id    = get()._getTeachDeviceId()
+    const device_label = get()._getTeachDeviceLabel()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/record`,
+        {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({
+            device_id, device_label,
+            slot_key: slotKey, patch }),
+        })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        if (res.status === 403 && body?.error === 'not_owner') {
+          get().addToast?.({
+            title:  'Teach session is owned by another device.',
+            detail: `Ask ${body.owner_label || 'the other device'} to `
+                  + 'save or cancel, or click "Take over" on the '
+                  + 'banner to switch ownership.',
+            technicalDetail: JSON.stringify(body),
+          }, 'error', 8000)
+        } else {
+          get().addToast?.({
+            title:  'Record failed — pose not saved to session.',
+            detail: 'Try again. If it repeats, refresh the page.',
+            technicalDetail: (body && body.error) || `HTTP ${res.status}`,
+          }, 'error', 6000)
+        }
+        return { ok: false, status: res.status, body }
+      }
+      return { ok: true, draft: body.draft }
+    } catch (e) {
+      get().addToast?.({
+        title:  'Record failed — network error.',
+        detail: 'Pose was NOT recorded to the session. Try again.',
+        technicalDetail: String(e && e.message || e),
+      }, 'error', 6000)
+      return { ok: false, error: 'network' }
+    }
+  },
+
+  // Explicit claim — pre-checks whether the current device can
+  // start teaching on this program. On 409, returns the lock info
+  // so the caller can render the "Teaching in progress on X"
+  // banner.
+  async startTeachSession(programId, deviceLabel = '') {
+    if (!programId) return { ok: false, error: 'bad_args' }
+    const device_id = get()._getTeachDeviceId()
+    const label     = deviceLabel || get()._getTeachDeviceLabel()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/start`,
+        {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({
+            device_id, device_label: label }),
+        })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok && res.status !== 409) {
+        return { ok: false, status: res.status, body }
+      }
+      // 409 is not an error at this layer — it's the lock signal.
+      return {
+        ok: res.ok,
+        locked: res.status === 409,
+        owner_device_id: body?.owner_device_id,
+        owner_label:     body?.owner_label,
+        draft:           body?.draft,
+      }
+    } catch (e) {
+      return { ok: false, error: 'network', message: String(e) }
+    }
+  },
+
+  async takeOverTeachSession(programId, deviceLabel = '') {
+    if (!programId) return { ok: false, error: 'bad_args' }
+    const device_id = get()._getTeachDeviceId()
+    const label     = deviceLabel || get()._getTeachDeviceLabel()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/take_over`,
+        {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({
+            device_id, device_label: label }),
+        })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        return { ok: false, status: res.status, body }
+      }
+      get().addToast?.({
+        title: 'You are teaching this program now.',
+        detail: 'The previous device sees a read-only view.',
+      }, 'success', 4000)
+      return { ok: true, draft: body.draft,
+               previous_owner: body.previous_owner }
+    } catch (e) {
+      return { ok: false, error: 'network', message: String(e) }
+    }
+  },
+
+  async cancelTeachSession(programId) {
+    if (!programId) return { ok: false, error: 'bad_args' }
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/cancel`,
+        { method: 'POST' })
+      return { ok: res.ok }
+    } catch (e) {
+      return { ok: false, error: 'network' }
+    }
+  },
+
+  // 2026-08-05 (P0-B, stale-lock fix): release OWNERSHIP without
+  // discarding the poses. Any device may re-claim via /start; the
+  // record-through architecture already persisted every pose on the
+  // Record path, so ending the session loses nothing.
+  //
+  // Called on: teach overlay close (done/back/cancel), route change
+  // out of ProgramEditor, and window unload (via sendBeacon for the
+  // last-gasp path).
+  async endTeachSession(programId) {
+    if (!programId) return { ok: false, error: 'bad_args' }
+    const device_id = get()._getTeachDeviceId()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/end`,
+        { method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ device_id }) })
+      return { ok: res.ok }
+    } catch (e) {
+      return { ok: false, error: 'network' }
+    }
+  },
+
+  // Same URL, but issued via navigator.sendBeacon so a window-close
+  // path (which cancels normal fetches) can still deliver it. Best-
+  // effort — the server-side owner-TTL is the guaranteed backstop
+  // after 90 s (_TEACH_OWNER_TTL_S) if this doesn't land.
+  endTeachSessionBeacon(programId) {
+    if (!programId) return false
+    const device_id = get()._getTeachDeviceId()
+    if (typeof navigator === 'undefined' || !navigator.sendBeacon) return false
+    try {
+      const blob = new Blob(
+        [JSON.stringify({ device_id })],
+        { type: 'application/json' })
+      return navigator.sendBeacon(
+        `/api/teach_session/${encodeURIComponent(programId)}/end`, blob)
+    } catch (_) {
+      return false
+    }
+  },
+
+  // Periodic keep-alive from the teach overlay. The server refreshes
+  // updated_ts so the owner-TTL doesn't expire on a slow-network but
+  // still-live device.
+  async heartbeatTeachSession(programId) {
+    if (!programId) return { ok: false, error: 'bad_args' }
+    const device_id = get()._getTeachDeviceId()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/heartbeat`,
+        { method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ device_id }) })
+      return { ok: res.ok, status: res.status }
+    } catch (e) {
+      return { ok: false, error: 'network' }
+    }
+  },
+
+  async promoteTeachSession(programId) {
+    if (!programId) return { ok: false, error: 'bad_args' }
+    const device_id = get()._getTeachDeviceId()
+    try {
+      const res = await fetch(
+        `/api/teach_session/${encodeURIComponent(programId)}/save`,
+        {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ device_id }),
+        })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        return { ok: false, status: res.status, body }
+      }
+      // 2026-08-05 (silent-drop kill): surface any unmatched-pose
+      // warning the server returned instead of letting it disappear
+      // into the JSON body. Amber toast, dismissible; the event log
+      // holds the forensic detail.
+      if (Array.isArray(body?.warnings) && body.warnings.length > 0) {
+        for (const w of body.warnings) {
+          if (w && w.kind === 'unmatched_poses') {
+            get().addToast?.({
+              title:           'Some recorded poses matched no step.',
+              detail:          w.operator_message
+                             || `${w.count} pose(s) skipped.`,
+              technicalDetail: JSON.stringify(w.unmatched_slot_keys || []),
+            }, 'warning', 8000)
+          }
+        }
+      }
+      return { ok: true, program: body.program, warnings: body.warnings }
+    } catch (e) {
+      return { ok: false, error: 'network', message: String(e) }
+    }
+  },
+
+  // ---------------------------------------------------------------------------
   // Toast notifications
   // ---------------------------------------------------------------------------
 
-  addToast(message, type = 'info') {
+  addToast(msgOrObject, type = 'info', durationMs) {
     const id = Date.now() + Math.random()
-    const toast = { id, message, type, ts: Date.now() }
+    // Structured toast (2026-08-04): callers can pass an object
+    // `{title, detail, technicalDetail}` for operator-language
+    // headline + follow-up + hidden technical string. The prior
+    // API — a single `message` string — is preserved unchanged;
+    // legacy 2-arg callers keep working (title only). The
+    // renderer decides how to display each field.
+    //
+    // Duplication root cause (fixed 2026-08-04): pre-fix,
+    // callers concatenated headline+detail into one message
+    // string, and both often contained the same phrases
+    // (namedLoadError's pending_poses headline AND wire-reason
+    // both said "known controller-crashing codegen" +
+    // "Regenerate required" — so the operator saw it twice in
+    // one toast). Structured fields render each string exactly
+    // once, with no cross-field concatenation.
+    let toast
+    if (msgOrObject && typeof msgOrObject === 'object'
+        && !Array.isArray(msgOrObject)) {
+      const t = msgOrObject
+      toast = { id, type, ts: Date.now(),
+                title:  t.title  || t.message || '',
+                detail: t.detail || '',
+                technicalDetail: t.technicalDetail || '',
+                // Preserve `message` for legacy renderers that
+                // haven't been updated. Prefer title in the
+                // Toast component, fall back to message.
+                message: t.title || t.message || '',
+                repeatCount: 1 }
+    } else {
+      toast = { id, type, ts: Date.now(),
+                title: '', detail: '', technicalDetail: '',
+                message: msgOrObject,
+                repeatCount: 1 }
+    }
+    // 2026-08-05 (doctrine: honest messaging, no toast storm): if an
+    // identical toast (same message/title/detail) is already alive
+    // within COALESCE_WINDOW_MS, bump its repeatCount + refresh its
+    // dwell timer instead of stacking a fresh toast. The renderer
+    // shows "(×N)" next to the title once repeatCount > 1. This
+    // works for every caller — the escape-only refuse toast, the
+    // load-path errors, the run-completion pings — because it's
+    // keyed on the text the operator would see repeated.
+    const COALESCE_WINDOW_MS = 5000
+    const key = (toast.title || toast.message || '')
+              + '|' + (toast.detail || '')
+    const now = Date.now()
+    const existing = get().toasts.find((t) =>
+      (t.title || t.message || '') + '|' + (t.detail || '') === key
+      && (now - (t.ts || 0)) < COALESCE_WINDOW_MS
+    )
+    if (existing) {
+      set((s) => ({
+        toasts: s.toasts.map((t) => t.id === existing.id
+          ? { ...t, repeatCount: (t.repeatCount || 1) + 1, ts: now }
+          : t)
+      }))
+      return existing.id
+    }
     set((s) => ({ toasts: [...s.toasts, toast] }))
-    setTimeout(() => get().removeToast(id), 3000)
+    // 2026-08-05 unified event log (fork registry: event_log): every
+    // toast the operator sees also lands as a persistent JSONL
+    // record in /opt/cobot/event_log/. Dismissing a toast never
+    // deletes the record — the JSONL is append-only. `warning` and
+    // `error` severities always capture; `info` captures only when
+    // the toast carries a code/message worth reviewing later.
+    try {
+      const severity = type === 'error' || type === 'warning'
+        ? type
+        : 'info'
+      const capture = severity !== 'info' || (toast.title || toast.detail || toast.technicalDetail)
+      if (capture) {
+        // Best-effort POST. Never block on the log path.
+        const payload = {
+          severity,
+          source: 'dashboard',
+          code: (typeof msgOrObject === 'object' && msgOrObject?.code) || '',
+          operator_message: toast.title || toast.message || '',
+          technical_detail: toast.detail
+            ? (toast.detail + (toast.technicalDetail ? ' | ' + toast.technicalDetail : ''))
+            : (toast.technicalDetail || ''),
+          context: {
+            toast_id:   String(id),
+            client_id:  (typeof CLIENT_ID === 'string' && CLIENT_ID) || undefined,
+            device_id:  get()._teachDeviceId || undefined,
+          },
+        }
+        fetch('/api/event_log/append', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify(payload),
+          keepalive: true,   // survive a page unload mid-post
+        }).catch(() => { /* nop — log is best-effort */ })
+      }
+    } catch (_) { /* nop */ }
+    // Duration override (2026-08-04): error-severity toasts for the
+    // load path need to dwell long enough for the operator to read
+    // "Controller link down — program NOT loaded" without losing it
+    // to the default 3s. 60s bundle-obsolete toast (line ~1109) was
+    // already passing a third arg that was silently ignored — this
+    // wires the ignored parameter without changing any 2-arg caller.
+    const dwellMs = (typeof durationMs === 'number' && durationMs > 0)
+      ? durationMs : 3000
+    setTimeout(() => get().removeToast(id), dwellMs)
     return id
   },
 
@@ -571,10 +2557,6 @@ const storeDefinition = (set, get) => ({
     set({ activeView: view })
   },
 
-  setMode(mode) {
-    set({ mode })
-  },
-
   setJogJoint(j) {
     set({ jogJoint: j })
   },
@@ -584,22 +2566,27 @@ const storeDefinition = (set, get) => ({
   },
 })
 
-// Wrap with persist for UI prefs only
+// Wrap with persist for UI prefs only.
+//
+// 2026-08-04 — currentProgram is intentionally NOT persisted. The Jetson
+// is the single store for pose state (draft teach sessions live at
+// /opt/cobot/teach_sessions/{id}.draft.json, saved programs at
+// /opt/cobot/programs/{id}.json). Persisting currentProgram to
+// localStorage duplicated that state and re-introduced drift: refresh
+// mid-teach used to resume from a stale local copy that would then
+// clobber whatever the server had. Under the record-through
+// architecture the client rehydrates from the WS state broadcast +
+// GET /api/teach_session/{id} on program open. Fork-registry entry
+// `teach_session_state` refuses reintroduction of currentProgram
+// persistence.
 export const useStore = create(
   persist(storeDefinition, {
     name: 'roboai-ui',
     partialize: (state) => ({
-      mode: state.mode,
+      // 2026-09-04: `mode` retired from persistence along with the
+      // Configure operator/engineer toggle.
       activeTab: state.activeTab,
       activeView: state.activeView,
-      // Persist the editor's current draft (id / name / steps / unsaved)
-      // across page reloads. A user mid-edit who accidentally hits F5
-      // shouldn't lose their work — and switching tabs only un-mounts
-      // the component, the store-backed slice survives either way.
-      currentProgram: state.currentProgram,
-      // Same idea for the Program tab's resizable layout — dragging the
-      // dividers should outlive a tab switch and a page reload.
-      programLayout:  state.programLayout,
       // Persist the jog speed % so the operator's chosen speed survives
       // page reloads.
       jogSpeedPct:    state.jogSpeedPct,

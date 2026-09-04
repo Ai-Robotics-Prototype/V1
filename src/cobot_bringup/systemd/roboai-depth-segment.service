@@ -1,5 +1,13 @@
 [Unit]
-Description=RoboAi Depth-Segmentation Generic Object Detector
+# 2026-08-03 — Isaac ROS TensorRT YOLOv8 becomes the sole part-
+# detection engine. The unit name is preserved for boot-order
+# continuity (dependent units still say After=/Requires=
+# roboai-depth-segment) but the ExecStart now runs
+# isaac_detection.launch.py. Systems already flashed with the older
+# ExecStart get an override in
+# /etc/systemd/system/roboai-depth-segment.service.d/override.conf
+# so a redeploy doesn't require re-flashing systemd files.
+Description=RoboAi Isaac ROS Object Detection (retired class-agnostic depth-segment)
 After=roboai-cameras.service
 Requires=roboai-cameras.service
 
@@ -7,7 +15,7 @@ Requires=roboai-cameras.service
 Type=simple
 User=teddy
 WorkingDirectory=/home/teddy/cobot_ws
-ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 launch cobot_bringup depth_detection.launch.py'
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/teddy/cobot_ws/install/setup.bash && ros2 launch cobot_bringup isaac_detection.launch.py'
 Restart=always
 RestartSec=5
 

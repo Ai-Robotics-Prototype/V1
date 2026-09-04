@@ -1,0 +1,1440 @@
+# tools/fork_registry.yaml — canonical-owner registry (§465 fork-1 lesson,
+# 2026-08-04).
+#
+# ONE FILE, MACHINE-READABLE. Every capability in this workspace that must
+# have exactly one implementation is listed here with:
+#   * `canonical`   — the module/file/route that owns the implementation
+#   * `forbidden`   — where duplicates are refused, by path glob + pattern
+#   * `known_debt`  — historically-tolerated duplicate sites, ticketed and
+#                     owned
+#
+# The registry-driven linter (`tools/fork_lint.py`) reads this file. Its
+# invariants:
+#
+#   (a) Every `canonical` block resolves to real code on disk (test:
+#       `test_fork_registry_resolves.py`).
+#   (b) Every `forbidden` entry whose patterns fire against a matching
+#       forbidden path — outside `known_debt` — is a lint failure.
+#   (c) A `heuristic_sweep` block scans frontend files for numeric math
+#       on domain identifiers even when no exact pattern matches; these
+#       are review-required warnings, not gate failures — but every
+#       heuristic hit either becomes a registry entry (with a real
+#       pattern) OR gets tagged as known_debt with an owner.
+#
+# When adding a new shared capability: put an entry HERE in the same
+# commit that lands the implementation. When killing a fork: move its
+# `known_debt` entry to fully-registered status. Do not silently
+# suppress a hit — either fix the code, register the pattern, or debt
+# the site with a name attached.
+
+# ── Path abbreviations used below ────────────────────────────────────
+# FE  = src/cobot_dashboard/frontend/src
+# BE  = src/cobot_dashboard/cobot_dashboard
+# DRV = src/estun_driver/estun_driver
+# PBD = src/programming_by_demonstration/programming_by_demonstration
+
+# ── Registered capabilities ─────────────────────────────────────────
+
+capabilities:
+
+  # 1. Pallet-frame geometry (§465 fork-1 kill, 3ae0760).
+  - id: pallet_frame_geometry
+    description: >
+      Frame math for the 3-corner pallet teach — row/col vectors,
+      plane normal, tilt, coincident-corner and near-parallel
+      validation. Backend-only via POST /api/pallet/validate_frame.
+
+      2026-08-05 OPERATOR DOCTRINE RULING (canonical semantics):
+      Corners 1-3 define the pallet FRAME ONLY (origin at corner 1,
+      row axis toward corner 2, column axis toward corner 3, plane
+      from all three). Point 4 is the CENTER of slot [1,1]
+      (first-part datum). Slot spacing comes EXCLUSIVELY from typed
+      pitch values in the palletizing parameters dialog:
+        slot[i,j] = datum + (i-1)·pitch_row·row_axis
+                          + (j-1)·pitch_col·col_axis
+                          + layer·layer_height·plane_normal
+      Corner-to-corner distance has NO required relationship to
+      pitch. `_effective_pitches` MUST return typed values only.
+      `validate_frame` MUST NOT emit `row_pitch_mismatch` or
+      `col_pitch_mismatch` findings (retired — see doctrine test
+      test_pallet_doctrine_canonical.py). The replacement check is
+      the grid-fits-frame test that catches pitch typos without
+      false positives on legitimate configs.
+    canonical:
+      python:
+        module: programming_by_demonstration.pallet_geometry
+        functions: [compute_frame, validate_frame, measured_pitches]
+      route:
+        method: POST
+        path: /api/pallet/validate_frame
+      javascript:
+        module: src/cobot_dashboard/frontend/src/lib/palletFrameValidator.js
+        exports: [validatePalletFrameServer, findingsBlockingThisRecord]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        context_sentinel: 'corner[123]_tcp|corner_a_tcp|point_[bc]_tcp|part_tcp'
+        patterns:
+          - 'plane_normal'
+          - 'Math\.acos\s*\(.*dot'
+          - 'Math\.abs\s*\(\s*row\s*\[\s*2\s*\]\s*\)\s*/\s*rowLen'
+          - 'Math\.abs\s*\(\s*col\s*\[\s*2\s*\]\s*\)\s*/\s*colLen'
+          # Any `function validatePalletFrame` in a JS/JSX file
+          # outside the async client is the fork returning.
+          - 'function\s+validatePalletFrame\s*\('
+          - 'export\s+function\s+validatePalletFrame\s*\('
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/palletFrameValidator.js
+          - src/cobot_dashboard/frontend/src/lib/palletFrameValidator.test.js
+          - '**/*.test.js'
+          - '**/*.pinned.test.js'
+    known_debt: []
+
+  # 2. Motion-verb classification (D14 backing invariant).
+  - id: motion_verb_catalogue
+    description: >
+      Which Lua verbs count as motion — the empty-motion gate and the
+      arg-arity linter both key on this set. Sourced from the 168-verb
+      luaenginelib.json catalogue; any hard-coded list of mov* verbs
+      elsewhere is a fork.
+    canonical:
+      python:
+        module: estun_driver.program_ops
+        functions: [motion_verbs, has_valid_motion]
+      file:
+        path: src/estun_driver/estun_driver/luaenginelib.json
+        note: 168-verb authoritative catalogue mined from factory UI bundle
+    forbidden:
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          # A hand-written {movJ, movL, movC, ...} literal in the
+          # dashboard is a fork of has_valid_motion / motion_verbs.
+          - "\\{['\"]mov[JLCW]"
+        path_exempt: []
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Frontend has no business classifying motion verbs
+          # against the catalogue — that belongs to the lint gate.
+          - "\\['movJ',\\s*'movL'"
+    known_debt: []
+
+  # 3. Program-selection state (rollback fix, 83f9472).
+  - id: program_selection_write
+    description: >
+      Which endpoint writes STATE.robot.program.resident_program_id.
+      Only /api/estun/program/run (with push_only:true for a load).
+      /api/program/run action:'load' is retired 410.
+    canonical:
+      python:
+        module: cobot_dashboard.dashboard_server
+        functions: [api_estun_program_run]
+      route:
+        method: POST
+        path: /api/estun/program/run
+      javascript:
+        module: src/cobot_dashboard/frontend/src/pages/MonitorDashboard.jsx
+        exports: [pushProgramToController]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Legacy action:'load' — retired.
+          - "action:\\s*['\"]load['\"]"
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          # Only ONE line in the server writes resident_program_id.
+          # Any second write site is a fork. This pattern flags an
+          # ASSIGNMENT — reads (`... = STATE.get(...)['program']`)
+          # don't match.
+          - 'resident_program_id["\\]\\s*=\\s*[a-zA-Z_]'
+        path_exempt:
+          - src/cobot_dashboard/cobot_dashboard/dashboard_server.py
+    known_debt: []
+
+  # 4. Load-outcome operator copy (267108a rewrite).
+  - id: load_outcome_operator_copy
+    description: >
+      Named operator-language messages for /api/estun/program/run
+      refusals (pending_poses, transport_down, arity_assertion_failed,
+      etc). One helper, one BANNED_OPERATOR_TOKENS list.
+    canonical:
+      javascript:
+        module: src/cobot_dashboard/frontend/src/lib/loadOutcome.js
+        exports: [namedLoadError, LOAD_OUTCOME_KINDS,
+                  BANNED_OPERATOR_TOKENS]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # A parallel switch on outcome.kind in another file is a fork.
+          - 'switch\s*\(\s*[a-zA-Z_.?]*outcome\.kind'
+          - 'if\s*\(\s*[a-zA-Z_.?]*kind\s*===\s*[''"]pending_poses'
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/loadOutcome.js
+          - src/cobot_dashboard/frontend/src/lib/loadOutcome.test.js
+          - '**/*.test.js'
+    known_debt: []
+
+  # 4a. Arm enable/disable chip control (2026-08-06 operator directive).
+  - id: arm_enable_control
+    description: >
+      ONE compact chip surface shows the arm state (ALARM / ENABLING /
+      JOG / READY / DISABLED) and dispatches Enable / Disable via
+      sendPowerCommand behind a window.confirm gate. Rendered on the
+      3D View (RealArmChrome header) AND the Monitor page (above the
+      run controls). Both read the same useStore(`robot.*`) mirror so
+      toggling on either surface reflects live in the other.
+
+      DISTINCT from JogControls' internal power banner + confirm
+      modal (which handles ALARM/DISABLED banner-driven flow) and
+      from AlarmRecoveryModal (which handles guided-recovery). Those
+      TWO callers legitimately use sendPowerCommand for their
+      respective UX flows; the CHIP style — a compact status +
+      window.confirm-gated toggle button — must exist ONLY in
+      ArmEnableControl.jsx.
+    canonical:
+      javascript:
+        module: src/cobot_dashboard/frontend/src/components/ArmEnableControl.jsx
+        exports: [default]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        # Only files that dispatch sendPowerCommand are candidates for
+        # duplicating the chip; unrelated files that mention window
+        # .confirm for other flows are fine.
+        context_sentinel: 'sendPowerCommand'
+        patterns:
+          # The chip's distinguishing signature: window.confirm guarding
+          # sendPowerCommand('enable' | 'disable'). JogControls uses a
+          # React-state confirm modal (pendingPower), NOT window.confirm.
+          # AlarmRecoveryModal has no window.confirm at all — its buttons
+          # are the recovery-modal itself.
+          - "window\\.confirm\\([^)]*[Ee]nable"
+          - "window\\.confirm\\([^)]*[Dd]isable"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/components/ArmEnableControl.jsx
+    known_debt: []
+
+  # 5. Toast rendering + structured content (267108a).
+  - id: toast_rendering
+    description: >
+      Structured toast API {title, detail, technicalDetail} and its
+      single render surface. Callers pass structured objects; the
+      ToastContainer renders each field exactly once with technical
+      detail behind a Details toggle.
+    canonical:
+      javascript:
+        module: src/cobot_dashboard/frontend/src/components/ToastContainer.jsx
+        exports: [Toast, ToastContainer]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Manual concatenation of headline+detail into a single
+          # toast string was the pre-267108a duplication class.
+          - "addToast\\?\\.\\(\\s*`\\$\\{[a-zA-Z_.]+\\}\\s*—\\s*\\$\\{[a-zA-Z_.]+\\}`"
+          - "addToast\\(\\s*`\\$\\{[a-zA-Z_.]+\\}\\s*—\\s*\\$\\{[a-zA-Z_.]+\\}`"
+        path_exempt: []
+    known_debt: []
+
+  # 6. Run-state derivation (deriveRunState).
+  - id: run_state_derivation
+    description: >
+      Single deriveRunState() maps {safety, robot, task} to the pill
+      kind + label. stale_link_down + all other kinds live there.
+    canonical:
+      javascript:
+        module: src/cobot_dashboard/frontend/src/lib/runState.js
+        exports: [deriveRunState, isStopButtonEnabled, isStuckStopping,
+                  isStateStreamStale]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Parallel state-kind classification is a fork.
+          - "kind:\\s*['\"](running|stopping|estop|alarm|stale_link_down)['\"]"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/runState.js
+          - src/cobot_dashboard/frontend/src/lib/runState.test.js
+          - '**/*.test.js'
+    known_debt: []
+
+  # 7. Load-must-push contract (a17da6c + 83f9472).
+  - id: load_must_push
+    description: >
+      Program Library click posts /api/estun/program/run push_only=true.
+      No frontend caller may post action:'load' anywhere.
+    canonical:
+      javascript:
+        module: src/cobot_dashboard/frontend/src/pages/MonitorDashboard.jsx
+        exports: [onSelectProgram, pushProgramToController]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          - "action:\\s*['\"]load['\"]"
+        path_exempt: []
+    known_debt: []
+
+  # 8. Pending-pose gate (D14, 60790e8).
+  - id: pending_pose_gate
+    description: >
+      Motion steps with unresolved poses never reach codegen.
+      check_program_pending_poses is the ONE resolver.
+    canonical:
+      python:
+        module: estun_driver.program_ops
+        functions: [check_program_pending_poses]
+    forbidden:
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          # A parallel scan of steps checking taught + taught_joints
+          # + derived_from without going through the shared resolver
+          # is a fork.
+          - "taught_joints[\"\\]].{0,20}?len.{0,10}?==\\s*6.{0,80}?derived_from"
+        path_exempt:
+          - src/cobot_dashboard/cobot_dashboard/dashboard_server.py
+    known_debt: []
+
+  # 9. Mov* pose-vector arity (D14, D15).
+  - id: mov_arity_gate
+    description: >
+      Every mov* verb emitted MUST carry a 6-element pose vector.
+      D14/D15 matchers in program_ops.py's _KNOWN_BAD_PATTERNS.
+    canonical:
+      python:
+        module: estun_driver.program_ops
+        functions: [lint_lua_source, _bad_mov_pose_vector_arity,
+                    _bad_setBlender_arg]
+    forbidden:
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          # A parallel numeric-token count on a mov* emission would
+          # be a fork.
+          - "movJCoorRel.{0,80}?count.{0,20}?==\\s*6"
+        path_exempt: []
+    known_debt: []
+
+  # 10. Codegen line-map (D9).
+  - id: codegen_line_map
+    description: >
+      Line-map JSON is emitted from codegen_lua_from_program and
+      sidecar-refreshed on push. One authoritative producer.
+    canonical:
+      python:
+        module: estun_driver.program_ops
+        functions: [codegen_lua_from_program]
+      file:
+        path: /opt/cobot/programs/*.line_map.json
+        note: sidecar written by dashboard_server._compute_and_save_line_map
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Frontend computes line-map → step-index via useLineMap,
+          # not by re-parsing Lua text. Frame-parsing Lua on the
+          # client would be a fork of codegen's own map. Grouped
+          # alternation so `movJ(name)` in a toast doesn't false-
+          # positive — the fork signature is a mov* MATCH followed
+          # by line-number extraction.
+          - "(?:movJ|movL)\\s*\\([^)]*\\)[^\\n]{0,120}line[Nn]umber"
+    known_debt: []
+
+  # 11. Pallet frame status (taught-state).
+  - id: pallet_frame_status
+    description: >
+      One resolver — palletFrameStatus in programTruth.js — for the
+      corner1/corner2/corner3/part booleans + migratedFromV1 flag.
+      Editor, wizard, findings, teaching-debt all read this.
+    canonical:
+      javascript:
+        module: src/cobot_dashboard/frontend/src/lib/programTruth.js
+        exports: [palletFrameStatus, firstUntaughtPalletRole,
+                  PALLET_ROLE_ORDER]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Any parallel taught-booleans derivation from
+          # place.corner*_tcp checks is a fork.
+          - "corner1_tcp\\s*&&\\s*[a-zA-Z_.]*corner2_tcp\\s*&&\\s*[a-zA-Z_.]*corner3_tcp"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/programTruth.js
+          - '**/*.test.js'
+    known_debt: []
+
+  # 12. Teach-session state (record-through, 2026-08-04).
+  - id: teach_session_state
+    description: >
+      Mid-teach pose state (recorded corners, taught step joints
+      not yet promoted to disk) lives ONLY on the Jetson at
+      /opt/cobot/teach_sessions/{pid}.draft.json. STATE
+      ['teach_sessions'] mirrors every draft; the WS state
+      broadcast carries them; every Record Position on every
+      teach surface goes through POST
+      /api/teach_session/{pid}/record — Zustand is a cache of
+      server truth, never the owner. No client-side pose
+      persistence (localStorage, Zustand persist whitelist,
+      per-component copies).
+    canonical:
+      python:
+        module: cobot_dashboard.dashboard_server
+        functions: [_teach_read_draft, _teach_write_draft,
+                    _teach_publish_to_state,
+                    _apply_draft_poses_to_program]
+      route:
+        method: POST
+        path: /api/teach_session/{prog_id}/record
+      javascript:
+        module: src/cobot_dashboard/frontend/src/store/useStore.js
+        exports: [recordTeachPose, startTeachSession,
+                  takeOverTeachSession, cancelTeachSession,
+                  promoteTeachSession]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # localStorage on pose data anywhere is banned — the
+          # server is authoritative.
+          - "localStorage\\.setItem\\([^,)]*['\"](taught|corner_tcp|corner1_tcp|corner2_tcp|corner3_tcp|part_tcp|currentProgram)['\"]"
+          # Reintroducing currentProgram to the Zustand persist
+          # whitelist is a fork of teach_session_state (draft
+          # poses land in currentProgram; persist mirrors them
+          # to localStorage). The specific string 'currentProgram'
+          # inside a `partialize` return is the fork signature.
+          - "partialize:.*currentProgram: state\\.currentProgram"
+        path_exempt:
+          - '**/*.test.js'
+          - '**/*.pinned.test.js'
+    known_debt: []
+
+
+  # 13. PBD composer (deterministic intent → program).
+  - id: pbd_composer
+    description: >
+      Programming-by-Demonstration intent → program is a PURE
+      deterministic function. LLM output is limited to the
+      intent JSON (schema-validated). The composer emits steps,
+      labels, and verbs from the intent shape alone — never from
+      transcript strings, never with wall-clock / random IDs.
+    canonical:
+      python:
+        module: programming_by_demonstration.program_composer
+        functions: [compose_program_draft]
+    forbidden:
+      # A second `def compose_program_draft` anywhere else is a
+      # fork by definition — scanned across the whole PBD tree.
+      - path_glob: src/programming_by_demonstration/programming_by_demonstration/**/*.py
+        patterns:
+          - 'def compose_program_draft\('
+        path_exempt:
+          - src/programming_by_demonstration/programming_by_demonstration/program_composer.py
+          - '**/*.test.py'
+          - '**/test_*.py'
+      # Non-determinism sources INSIDE the composer file itself.
+      # Scoped narrowly to program_composer.py so unrelated files
+      # (utils.py's demo-id mint, learning_store's file-name mint)
+      # can still use uuid/random for their own purposes.
+      - path_glob: src/programming_by_demonstration/programming_by_demonstration/program_composer.py
+        patterns:
+          - 'uuid\.uuid'
+          - 'random\.(random|choice|uniform|randint)'
+          - 'time\.time\('
+          - 'datetime\.now\('
+        path_exempt: []
+    known_debt: []
+
+  # 14. PBD label vocabulary (fixed strings, single source of truth).
+  - id: pbd_label_vocabulary
+    description: >
+      Every step label the composer emits routes through
+      `label_vocabulary.LABEL_FOR_ROLE` (§determinism directive,
+      2026-08-04). Inline literal labels in the composer or its
+      helpers are a fork. Adding a label = adding a
+      LABEL_FOR_ROLE entry in the same commit that emits it.
+    canonical:
+      python:
+        module: programming_by_demonstration.label_vocabulary
+        functions: [label_for, check_program_emissions,
+                    assert_action_emittable]
+    forbidden:
+      - path_glob: src/programming_by_demonstration/programming_by_demonstration/**/*.py
+        patterns:
+          # Any hardcoded top-level LABEL_FOR_ROLE-like dict outside
+          # the canonical module is a fork of the vocabulary.
+          - "LABEL_FOR_ROLE\\s*=\\s*\\{"
+        path_exempt:
+          - src/programming_by_demonstration/programming_by_demonstration/label_vocabulary.py
+          - '**/test_*.py'
+    known_debt: []
+
+  # 15. PBD archetype skeletons.
+  - id: pbd_archetype_skeletons
+    description: >
+      Task archetypes (pick_and_place, sort, machine_tend,
+      palletize, depalletize) each have EXACTLY ONE builder
+      function in `program_composer.py`. A second `_build_*` for
+      the same archetype is a fork.
+    canonical:
+      python:
+        module: programming_by_demonstration.program_composer
+        functions: [_build_pick_and_place, _build_sort,
+                    _build_machine_tend, _build_palletize]
+    forbidden:
+      - path_glob: src/programming_by_demonstration/programming_by_demonstration/**/*.py
+        patterns:
+          # A second `def _build_pick_and_place` (or the other
+          # archetypes) anywhere else is a fork.
+          - "def _build_(pick_and_place|sort|machine_tend|palletize)\\b"
+        path_exempt:
+          - src/programming_by_demonstration/programming_by_demonstration/program_composer.py
+          - '**/test_*.py'
+    known_debt: []
+
+  # 16. Pose unit canon — meters + radians internal; mm/deg at UI +
+  #     codegen boundaries only.
+  - id: pose_unit_canon
+    description: >
+      taught_tcp and every pose value transported through the
+      workspace are METERS + RADIANS. Matches driver tcp_m,
+      state.tcp_pose, record-through draft store, ROS convention,
+      and every taught_tcp already on disk. Millimetres +
+      degrees exist ONLY at (a) the operator-facing UI render
+      layer, and (b) the codegen emit boundary in
+      estun_driver.program_ops (which already handles both units
+      via magnitude sniffing at lines 1499-1503, 1985-1990).
+      Any *_mm-named field assigned from taught_tcp or
+      tcp_pose without an explicit *1000.0 conversion in scope
+      is a unit lie of the class fixed on 2026-08-04 (325 mm
+      distances reported as 0.325 mm and refused as coincident).
+    canonical:
+      python:
+        module: programming_by_demonstration.pallet_geometry
+        functions: [validate_frame, compute_slot_offsets,
+                    derive_slot_tcps, measured_pitches]
+    forbidden:
+      - path_glob: src/programming_by_demonstration/programming_by_demonstration/**/*.py
+        patterns:
+          # A variable named *_mm assigned directly from a
+          # taught_tcp or tcp_pose expression, on the same line,
+          # without a * 1000 conversion, is the unit-lie
+          # signature. Best-effort regex — a targeted single-
+          # line check catches the common case (multi-line
+          # assignments will slip through, but those are rare
+          # enough that a code review catches them).
+          - "[a-zA-Z_][a-zA-Z0-9_]*_mm\\s*=\\s*[^\\n]*(?:taught_tcp|tcp_pose)[^\\n*]*$"
+        path_exempt:
+          # Legacy identifier `distance_mm` in the endpoint's
+          # backward-compat fallback lookup, and known
+          # boundary-conversion sites where the * 1000 IS
+          # applied on the same expression.
+          - '**/test_*.py'
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          # Same pattern for the dashboard side (endpoints /
+          # helpers).
+          - "[a-zA-Z_][a-zA-Z0-9_]*_mm\\s*=\\s*[^\\n]*(?:taught_tcp|tcp_pose)[^\\n*]*$"
+        path_exempt:
+          - '**/test_*.py'
+    known_debt:
+      - path: src/estun_driver/estun_driver/program_ops.py
+        line: 1499
+        why: >
+          Codegen has intentional magnitude-sniffing (|value|<10
+          treated as meters and multiplied by 1000; else assumed
+          mm). Legitimate boundary conversion; kept unchanged
+          because the wire (Estun Lua mov*Rel cp={x,y,z,...})
+          takes mm.
+        owner: estun-driver
+
+  # 17. Estun sign inversion (URDF axes).
+  - id: estun_axis_sign_inversion
+    description: >
+      J3 and J5 URDF axes are intentionally sign-inverted vs CAD
+      (documented under [[cobot-estun-driver-twin]]). All axis
+      sign changes must happen exactly once, inside the driver's
+      forward/inverse conversion helpers — do not re-flip
+      downstream.
+    canonical:
+      python:
+        module: estun_driver.estun_driver_node
+        functions: []
+        note: sign inversion lives in _rad_from_deg/_deg_from_rad-adjacent helpers; grep _URDF_SIGN before adding a new caller
+    forbidden:
+      - path_glob: src/estun_driver/estun_driver/**/*.py
+        patterns:
+          # Any bare `joints[2] = -joints[2]` or `joints[4] = -joints[4]`
+          # outside the canonical helper is a fork.
+          - "joints\\s*\\[\\s*[24]\\s*\\]\\s*=\\s*-\\s*joints\\s*\\[\\s*[24]\\s*\\]"
+        path_exempt:
+          - src/estun_driver/estun_driver/estun_driver_node.py
+    known_debt: []
+
+  # 18. Jog stop-cause propagation (Lesson 165, 2026-08-04).
+  - id: jog_stop_cause_propagation
+    description: >
+      When the driver stops a jog, the operator must see WHY within one
+      broadcast cycle. Cause taxonomy has a single spine:
+        (a) `_stop_jog_locked` populates `_last_stop_reason` +
+            `_last_stop_cause` (see `_build_stop_cause_locked`); the
+            reason is tagged by `_STOP_REASON_PATTERNS`.
+        (b) The dashboard's `_jog_stop_cause_operator_copy` is the
+            ONE place tags are translated to operator language
+            ({title, detail, technical}). 267108a register — no
+            technical tokens in title/detail.
+        (c) The frontend's `<JogStopBanner />` + `<LiveMarginHUD />`
+            in JogStopSurface.jsx render `robot.stop_cause_copy`
+            verbatim. It does not regex the raw reason.
+      Any second implementation — a frontend regex on `last_stop_reason`,
+      a duplicate translator, a component that parses driver text —
+      is a fork.
+    canonical:
+      python:
+        module: estun_driver.estun_driver_node
+        functions: []
+        note: >
+          _stop_jog_locked, _build_stop_cause_locked, and
+          _tag_stop_reason are methods on the EstunCodroidDriver class
+          — not module-level. See the class definition around line
+          208 for the canonical bodies.
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [_jog_stop_cause_operator_copy]
+      frontend:
+        path: src/cobot_dashboard/frontend/src/components/JogStopSurface.jsx
+        exports: [JogStopBanner, LiveMarginHUD]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          # Frontend regex that parses driver reason substrings must
+          # not live outside JogStopSurface's log-only surface.
+          - "cart limit approach"
+          - "limit approach J\\("
+          - "hold staleness"
+          - "freshness fallback"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/components/JogStopSurface.jsx
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt: []
+
+  # 19. Guided recovery dialog (Lesson 165 extension, 2026-08-05).
+  - id: guided_recovery_dialog
+    description: >
+      When a joint is past its escape-only zone, the operator sees ONE
+      guided-recovery dialog (`JointRecoveryModal`) that offers a
+      press-and-hold escape move. Doctrine: the system OFFERS the
+      recovery move; only an explicit operator press EXECUTES it; no
+      auto-motion ever. The dialog reuses the standard `jogHold` write
+      path — no new motion primitive, no bypass of the dead-man, speed
+      cap, or self-collision guard.
+
+      This is also the PATTERN for guided recovery. Future recovery
+      dialogs (e-stop clear, controller-link recovery, alarm reset)
+      route through the same primitives.
+
+      Enforcement spine:
+        * Driver clamp:  _joint_escape_only_margin_deg is the invariant
+                         threshold; direction opposite the escape is
+                         refused (start-clamp AND supervise tick).
+        * Cause tag:     `joint_limit_deeper` is distinct from
+                         `joint_limit`; frontend can bind to the
+                         specific tag if needed.
+        * Modal:         `JointRecoveryModal` is the sole implementation
+                         of the guided-recovery dialog shell.
+        * Journal:       `_write_recovery_events_from_jl` writes each
+                         True↔False transition to
+                         /opt/cobot/logs/recovery_events.jsonl —
+                         commissioning-wizard source material.
+    canonical:
+      python:
+        module: estun_driver.estun_driver_node
+        functions: []
+        note: >
+          The escape-only rule lives inside _on_jog_command (start
+          clamp) and _on_jog_supervise (mid-motion). No standalone
+          function — the invariant is enforced at the two clamp
+          sites.
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [_write_recovery_events_from_jl]
+      frontend:
+        path: src/cobot_dashboard/frontend/src/components/JointRecoveryModal.jsx
+        exports: [default]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/components/**/*.{jsx,js}
+        patterns:
+          # No second modal that offers "hold to recover" or renames
+          # the primitive. The registered JointRecoveryModal is the
+          # canonical shell; new recovery kinds extend it in place
+          # (add a phase, don't fork a component).
+          - "past_escape_only.*(?:HoldButton|createHoldTicker)"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/components/JointRecoveryModal.jsx
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt: []
+
+  # 20. Jog hold-heartbeat (2026-08-05 regression fix + 2026-08-06
+  # lock-isolation reinforcement).
+  - id: jog_hold_heartbeat
+    description: >
+      Every jog hold that expects the driver's freshness deadman to
+      NOT fire must be registered in `_active_holds` on the dashboard.
+      The keepalive thread republishes /robot/jog_command at 60 ms
+      cadence per registered session, and only registered sessions
+      get republished.
+
+      Both transports (WS receive in _handle_ws_client_msg AND HTTP
+      /cmd/jog + /cmd/jog_cartesian) MUST call
+      `_active_holds[hold_id] = _HoldSession(...)` on hold:true, and
+      `_active_holds.pop(hold_id, None)` on hold:false. The two
+      transports mirror each other by design — HTTP fallback fires
+      after every WS drop (deploy restart, network hiccup), and
+      pre-2026-08-05 HTTP holds became step-mode jogs because they
+      skipped the session registration.
+
+      Fork rule: a hold-publishing code path that touches
+      _publish_estun_jog with `hold: True` MUST also touch
+      _active_holds. Any second path that lands hold frames without
+      that pairing is a fork.
+
+      2026-08-06 (jog-jitter fix — lock isolation): the jog heartbeat
+      path MUST NOT share a mutex or a scheduling loop with teach-
+      session state. Jog uses `_active_holds_lock` + the native
+      `_keepalive_thread`; teach uses `_teach_lock` (for read-modify-
+      write of a single draft file) and `_state_lock` (for the brief
+      STATE mirror swap). Teach housekeeping (`_teach_publish_to_state`)
+      runs on the dedicated `teach-publish-worker` daemon thread —
+      never on the async event loop and never inside any lock the
+      jog path might touch. Pinned by test_teach_no_jog_contention.py.
+    canonical:
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [_handle_ws_client_msg, cmd_jog, cmd_jog_cartesian]
+    forbidden:
+      # No new HTTP jog endpoints that publish hold:true without
+      # registering _HoldSession. The two canonical routes in
+      # dashboard_server.py are listed in known_debt below so this
+      # pattern (which matches every @app.post starting /cmd/jog)
+      # doesn't flag them. A NEW file (e.g. a route module split-off)
+      # gaining a matching @app.post would be caught.
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          - "@app\\.post\\(.*\"/cmd/jog"
+        path_exempt:
+          - '**/test_*.py'
+    known_debt:
+      # fork_lint reports lines using its comment-stripped source
+      # (loses ~1 line per stripped comment). Real @app.post lines
+      # shift as the file grows — refresh from deploy.sh lint output
+      # when they move. 2026-08-05 bump: ui_context + disk_watchdog
+      # wiring shifted these by ~30 lines each.
+      - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
+        line: 4214
+        why: >
+          Canonical route /cmd/jog. Registers _HoldSession on
+          hold:true and pops it on hold:false — matches WS parity.
+          Pinned by test_jog_hold_heartbeat.py. Line shifts noted
+          on each commit that adds material above; refresh from
+          fork_lint output when it moves. 2026-08-31 F2.7: shifted
+          to 4132 by the executor bridge (~110 lines). 2026-09-04:
+          shifted 4132 → 4187 by the edition-gate middleware.
+          2026-09-04 (later): shifted 4187 → 4214 when the
+          middleware pattern list gained method-aware triples +
+          six cell_commissioning entries (~27 lines).
+        owner: dashboard-transport
+      - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
+        line: 4349
+        why: >
+          Canonical route /cmd/jog_cartesian. Same pairing as
+          /cmd/jog. 2026-08-31 F2.7: shifted from 4156 to 4267 by
+          the executor bridge; 2026-09-04: shifted 4267 → 4322 by
+          the edition-gate middleware; 2026-09-04 (later): shifted
+          4322 → 4349 by the same method-aware middleware
+          expansion.
+        owner: dashboard-transport
+      - path: src/cobot_dashboard/frontend/src/lib/holdTicker.js
+        line: 0
+        why: >
+          Full Worker-side WebSocket isolation (Worker opens its own
+          WS to a dedicated /ws/jog endpoint instead of round-tripping
+          via the main thread's _stateWs) is a bigger refactor that
+          did not land in the 2026-08-05 commit. The Worker+rAF
+          ticker already fires from a worker thread; only the send
+          path still crosses to main. Tracking as known debt because
+          the intent (per operator directive: "dedicated Worker, its
+          own send path, zero shared state with any rendering
+          component") is broader than the immediate regression fix.
+        owner: dashboard-transport
+
+  # 23. Operator refusal copy (2026-08-05 operator directive).
+  - id: operator_refusal_copy
+    description: >
+      Every operator-facing refusal surface (Run modal, Load toast,
+      Restart-refused toast, Speed-change-refused toast, and any
+      future one) renders ONLY through the shared copy module at
+      src/cobot_dashboard/frontend/src/lib/loadOutcome.js.
+
+      That module returns a {code, title, detail, technicalDetail,
+      headline} triple where:
+        * title / detail  — operator-language sentences: what
+                            happened + what to do. Never carry
+                            technical tokens (codegen, HTTP
+                            codes, driver reject fragments,
+                            firmware bug citations, sha hashes).
+                            The BANNED_OPERATOR_TOKENS list is
+                            enforced by test_load_outcome pinned
+                            tests.
+        * technicalDetail — the raw wire reason, hidden behind a
+                            "Details" toggle in the modal or
+                            demoted to a details section in the
+                            toast.
+
+      Fork rule: no operator-facing render site may concatenate
+      `outcome.reason || body.error || HTTP status` into a
+      user-visible string. Every site imports namedLoadError or
+      namedSpeedRefusal and renders the structured result. The
+      three canonical call sites are the Run modal, the
+      Monitor Restart-refused toast, and the Monitor Speed-
+      change-refused toast — all pinned by
+      test_operator_refusal_copy.py.
+    canonical:
+      frontend:
+        path: src/cobot_dashboard/frontend/src/lib/loadOutcome.js
+        exports: [namedLoadError, namedSpeedRefusal,
+                  BANNED_OPERATOR_TOKENS, LOAD_OUTCOME_KINDS]
+    forbidden:
+      # A component-scoped raw refusal render — concatenating the
+      # wire reason directly into a user-visible string. The
+      # regex matches the exact anti-pattern the 2026-08-05
+      # sweep found: `outcome?.reason || body?.error` or
+      # `body?.reason || body?.error` used inside a setToast /
+      # setError / setErrorText / render string.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{jsx,js}
+        patterns:
+          - "outcome\\??\\.reason\\s*\\|\\|\\s*body"
+          - "body\\??\\.reason\\s*\\|\\|\\s*body\\??\\.error"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/loadOutcome.js
+          - src/cobot_dashboard/frontend/src/lib/loadOutcome.test.js
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+          - '**/*.pinned.test.js'
+    known_debt: []
+
+  # 23b. Mode-refusal copy (2026-08-31 operator directive).
+  #
+  # Directive: every /api/estun/mode refusal renders ONLY through
+  # namedModeError in the shared module below. Prior code (pre-
+  # 2026-08-31) flattened outcome.reason || outcome.detail into a
+  # single toast body under a hardcoded generic title ("Can't
+  # start — controller is not in Auto..." / "Mode switch refused:
+  # <raw>"), which was wrong for the ladder's Rung 1 (recoveryState
+  # → physical cabinet cycle) and Rung 2 (errors_persist → pendant
+  # :9198 alarm log). The mode-pill acceptance test surfaced the
+  # bug via program-run attempts because both call sites shared
+  # the same flattening pattern.
+  #
+  # Parallel to operator_refusal_copy but scoped to mode-switch
+  # surfaces so failures name the specific broken invariant.
+  - id: mode_refusal_copy
+    description: >
+      Every /api/estun/mode refusal surface routes through
+      namedModeError. The mapper produces the ladder-honest
+      operator-language title + detail per outcome.kind AND per
+      mode_switch_failed reason_code; the raw wire fields
+      (reason_code, reason, four_tuple, subs) survive in
+      technicalDetail for devtools grep.
+
+      Two canonical call sites pinned:
+        * RunProgramModal.jsx        — mode-switch pre-flight for
+                                       "switch to Auto and run"
+        * ModeControl.jsx            — the pill's confirm dialog
+
+      Fork rule: any new frontend file that POSTs to
+      /api/estun/mode MUST import namedModeError and render the
+      structured result. The exhaustive-fetch-site sweep in
+      test_every_estun_mode_call_site_imports_named_mode_error
+      makes drift fail at deploy time.
+    canonical:
+      frontend:
+        path: src/cobot_dashboard/frontend/src/lib/modeOutcome.js
+        exports: [namedModeError, MODE_OUTCOME_KINDS,
+                  MODE_FAILED_REASON_CODES, BANNED_OPERATOR_TOKENS]
+    forbidden:
+      # A file that fetches /api/estun/mode but does NOT import
+      # namedModeError — the exhaustive sweep runs in
+      # test_operator_refusal_copy.py rather than a static regex
+      # because "imports namedModeError" is a positive condition,
+      # not a substring anti-pattern.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{jsx,js}
+        patterns:
+          # The pre-fix concat pattern scoped to mode-switch bodies.
+          # 'mbody' is the local variable name RunProgramModal used;
+          # matching it as a specific hazard keeps the rule tight.
+          - "mbody\\??\\.outcome\\??\\.reason"
+          - "\"Can't start — controller is not in Auto"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/modeOutcome.js
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt: []
+
+  # 22. Unified event log (2026-08-05 operator directive).
+  - id: event_log
+    description: >
+      ONE writer, ONE persistent forensic store. Every error, warning,
+      or info the platform surfaces routes through
+      `cobot_dashboard.event_log.emit(...)`. Records land as JSONL
+      lines in /opt/cobot/event_log/events_YYYYMMDD.jsonl with daily
+      UTC rotation, 90-day retention, and a size cap. Dismissing a
+      toast NEVER deletes the record.
+
+      Capture points wire the existing chokepoints — no invented new
+      ones:
+        * dashboard `addToast` (frontend → POST /api/event_log/append)
+        * driver `_reject` frames on /estun/rejected (subscribed in
+          the dashboard)
+        * driver stopJog causes (fired on last_stop_ts advance in
+          _on_estun_status)
+        * teach-session lifecycle events (create/end/expire/take-over)
+        * deploy watcher phases from /opt/cobot/deploy_log.jsonl
+        * validator/lint findings at refusal
+
+      The interface page (`EventLog.jsx`) reads via /api/event_log/
+      day/{YYYYMMDD}. Downloads (JSONL, CSV, 7-day zip) serve
+      through /api/event_log/download/.
+
+      Fork rule: NO component writes its own error/event log file
+      elsewhere. Any file matching `*event*log*.jsonl` or a per-
+      component .log file that duplicates the event stream is a fork.
+      Cross-source persistence (breadcrumbs, joint recorder,
+      recovery_events.jsonl) has DIFFERENT semantics — those are
+      structured domain data, not the operator error log — and are
+      grandfathered.
+    canonical:
+      python:
+        module: cobot_dashboard.event_log
+        functions: [emit, read_day, list_days, path_for_date, log_dir]
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [api_event_log_append, api_event_log_list,
+                    api_event_log_day, api_event_log_download]
+      frontend:
+        path: src/cobot_dashboard/frontend/src/pages/EventLog.jsx
+        exports: [default]
+    forbidden:
+      # No per-component event-log file writes outside the canonical
+      # module. Match on the file-name pattern that would surface a
+      # new component-scoped store next to the canonical one.
+      - path_glob: src/**/*.py
+        patterns:
+          - "events_\\d{8}\\.jsonl"
+        path_exempt:
+          - src/cobot_dashboard/cobot_dashboard/event_log.py
+          - '**/test_*.py'
+    known_debt:
+      - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
+        line: 0
+        why: >
+          recovery_events.jsonl (guided_recovery_dialog) and
+          breadcrumbs / joint_recorder produce STRUCTURED DOMAIN
+          data (recovery timelines, joint state trails), not the
+          operator error stream. They coexist by design — the
+          event_log is the human-facing forensic view; the domain
+          files are machine data for later analysis.
+        owner: dashboard-observability
+
+  # 21. Teach lock banner (2026-08-05 fork-1 kill).
+  - id: teach_lock_banner
+    description: >
+      Every surface that renders the "teaching in progress on another
+      device" state MUST use the shared `TeachLockBanner` component,
+      which is the single canonical implementation of:
+        * the banner copy: "Teaching in progress on <device>
+          (last active Xm ago) — Take over to teach here."
+        * the Take Over button (fires takeOverTeachSession)
+        * the confirmation dialog before the ownership swap.
+
+      Pre-fix, the editor-tab banner rendered the Take Over button
+      but the fullscreen teach overlay ONLY exposed the lock as a
+      `disabledReason` string passed to the Record button's `title`
+      attribute (an HTML tooltip). The overlay obscured the editor
+      banner, so operators on a locked device had NO discoverable
+      way to take over.
+
+      Fork rule: any component that filters/renders the
+      `robot.teach_sessions[pid]` slice when
+      `owner_device_id !== currentDeviceId` must render
+      TeachLockBanner (or a wrapper that does). No bare
+      "Teaching in progress on" copy elsewhere.
+    canonical:
+      frontend:
+        path: src/cobot_dashboard/frontend/src/components/TeachLockBanner.jsx
+        exports: [default]
+    forbidden:
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{jsx,js}
+        patterns:
+          # The literal copy fragment. New callers rendering the
+          # lock state must import the shared component.
+          - "Teaching in progress on"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/components/TeachLockBanner.jsx
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt:
+      # ProgramEditor.jsx still constructs the disabledReason string
+      # ("Teaching in progress on <owner>") for the TeachOverlay
+      # `disabledReason` prop — that string is used only for the
+      # Record button's HTML title tooltip. The visible banner
+      # comes from the TeachLockBanner slot passed alongside. The
+      # tooltip-string usage is grandfathered because it's a
+      # single-word affordance (not a UI surface competing with the
+      # canonical banner). Same-file duplication is by design.
+      # fork_lint reports these two tooltip-string sites via its
+      # comment-stripped source lines. The visible banner comes
+      # from the TeachLockBanner rendered via the `lockBanner` slot
+      # alongside — the disabledReason string is only used for the
+      # Record button's HTML `title` tooltip. Real @app.post lines
+      # here shift as the file grows; refresh the numbers from the
+      # deploy.sh lint output when they move.
+      - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
+        line: 6503
+        why: >
+          disabledReason string for the pallet-teach flow overlay's
+          Record button title tooltip. Grandfathered by the visible
+          TeachLockBanner rendered in the same subtree. Line drifts
+          with editor edits — refresh from deploy.sh lint output.
+          (2026-08-19 scoped fix: drifted from 6455 → 6478 when the
+          palletTeachRecord seed-dims-when-absent block landed;
+          2026-09-04: drifted 6478 → 6503 when the corner-smoothing
+          toolbar selector landed.)
+        owner: dashboard-frontend
+      - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
+        line: 6545
+        why: >
+          disabledReason string for the single/all-step teach overlay's
+          Record button title tooltip. Same rationale as line 6478.
+          (2026-08-19 scoped fix: drifted from 6497 → 6520.)
+        owner: dashboard-frontend
+
+  # 22. Page-context persistence (2026-08-05 refresh-loss P0).
+  - id: page_context_persistence
+    description: >
+      The Jetson owns "which program is open on this device" +
+      "which tab is active". Refreshing the tablet MUST NOT lose
+      the loaded program. Same doctrine as teach-session record-
+      through: server is truth, UIs are views.
+
+      Canonical store: cobot_dashboard.ui_context (one JSON per
+      device_id under /opt/cobot/ui_context/). Endpoints:
+        GET  /api/ui_context/{device_id}   — read
+        POST /api/ui_context/{device_id}   — merge patch
+        POST /api/teach_session/{prog_id}/edit — persist a whole-
+             program structural edit so refresh preserves unsaved
+             changes ("edit-through", extends record-through past
+             pose-only teaches to full program edits).
+
+      Fork rule: NO browser localStorage / sessionStorage / cookie
+      is allowed to persist page state — same-store hazard as the
+      pre-fix localStorage("current_program_id") string that broke
+      on refresh when the program had been renamed or deleted
+      server-side. Session-scoped state (URL query, in-memory
+      Zustand) is fine; anything that survives a reload must round-
+      trip through the ui_context endpoints.
+
+      EXCEPTION (2026-08-05 identity root-cause fix): device
+      IDENTITY (not state) is explicitly whitelisted. The
+      'roboai-device-id' localStorage key holds a stable
+      per-machine UUID — one physical device, one identity, all
+      tabs share it. This is the ONE thing browser storage owns
+      canonically; the server never mints it and cannot,
+      because the server can't tell "same device new tab" from
+      "different device" without a stable client-anchored id.
+      Legacy sessionStorage key 'roboai-teach-device-id' is
+      migrated once on read then removed.
+    canonical:
+      python:
+        module: cobot_dashboard.ui_context
+        functions: [get, set, clear, list_all]
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [api_ui_context_get, api_ui_context_set,
+                    api_teach_session_edit]
+      frontend:
+        path: src/cobot_dashboard/frontend/src/store/useStore.js
+        exports: [restoreOpenProgramOnMount, rememberOpenProgram,
+                  editThroughProgram]
+    forbidden:
+      # No browser-storage persistence of page state.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          - "localStorage\\.(set|get)Item\\(\\s*['\"](current_program_id|open_program_id|active_tab|last_program|programId|last_open_program)"
+          - "sessionStorage\\.(set|get)Item\\(\\s*['\"](current_program_id|open_program_id|active_tab|last_program|programId|last_open_program)"
+        path_exempt:
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt: []
+
+  # 23. Disk watchdog + retention caps (2026-08-05 record-endpoint
+  # ENOSPC P0).
+  - id: disk_watchdog
+    description: >
+      ONE module owns "how much space is free on /opt/cobot", the
+      thresholds for warning/critical/dead, and the enforced
+      per-directory retention caps. Motivated by the 2026-08-05
+      P0 where the record endpoint crashed on ENOSPC because
+      three log domains (driver ws logs, joint_history, event_log)
+      grew unbounded.
+
+      Directory caps (mirrored numerics — the canonical writer for
+      each domain still owns its own prune; disk_watchdog re-runs
+      the sweep at boot + every 60 s so no domain-writer bug
+      leaves us stranded):
+        /opt/cobot/logs           2 GB
+        /opt/cobot/joint_history  2 GB
+        /opt/cobot/event_log      500 MB
+
+      Thresholds (free bytes on the partition):
+        WARN     < 2 GB   — footer widget amber; banner suggestion
+        CRITICAL < 500 MB — non-critical writers stop (event log,
+                            deploy log tail); critical writers
+                            still attempt with 507 on failure
+        DEAD     < 50 MB  — critical writers refuse pre-emptively
+
+      Endpoint: GET /api/disk_status.
+
+      Fork rule: NO other module implements its own free-space
+      check with different thresholds, and NO module defines its
+      own bytes-cap constant for /opt/cobot/logs, /opt/cobot/
+      event_log, or /opt/cobot/joint_history outside disk_watchdog
+      (the canonical domain writers keep their own prune, but the
+      NUMBERS must match disk_watchdog.DIR_CAPS — mirror, don't
+      diverge).
+    canonical:
+      python:
+        module: cobot_dashboard.disk_watchdog
+        functions: [free_bytes, level, should_write, enforce_all,
+                    status, start_watchdog_thread]
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [api_disk_status]
+      frontend:
+        path: src/cobot_dashboard/frontend/src/components/StatusBar.jsx
+        exports: [default]
+    forbidden:
+      # No competing free-space thresholds. `statvfs` calls belong in
+      # disk_watchdog; anyone else calling it directly is a fork.
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          - "os\\.statvfs\\("
+          - "shutil\\.disk_usage\\("
+        path_exempt:
+          - src/cobot_dashboard/cobot_dashboard/disk_watchdog.py
+          - '**/test_*.py'
+    known_debt: []
+
+  # 24. Clearance warnings OFF (2026-08-05 operator directive).
+  #     SUPERSEDED for hard tiers by entry #25 (kill switch) —
+  #     2026-08-06 directive turned OFF the entire self-collision
+  #     system including the 15 mm hard stop and ground plane.
+  #     This entry stays as-is: the 40 mm warn tier remains
+  #     canonically OFF at the driver level via
+  #     collision_warn_distance_mm=0.0 even when the operator
+  #     later re-arms the kill switch.
+  - id: clearance_warn_tier_off
+    description: >
+      The 40 mm soft clearance-warn tier is disabled end to end.
+      Server signals it via collision_warn_distance_mm=0.0 (the
+      "disabled" sentinel); the WARNING log line + telemetry
+      bool + frontend banner all gate on this being > 0. Re-
+      enabling requires flipping the driver default AND flipping
+      the kill switch (entry #25) AND getting the operator
+      directive reversed.
+
+      When the hard stop fires, the ONE signal that remains is
+      a toast composed by _jog_stop_cause_operator_copy
+      (dashboard_server.py) and surfaced globally by
+      HardStopToast (App.jsx). Frontend components:
+        * SelfCollisionWarnBanner renders null unconditionally
+        * ObstacleEscapeModal early-returns null when
+          guard_kind is 'self' or 'ground' (env keeps its
+          guided-escape modal — a distinct hazard)
+        * SafetyPage shows a static "Clearance warnings: OFF"
+          row instead of the pre-directive toggle.
+
+      Fork rule: NO new component may render a warn-tier
+      banner, toast, modal, or advisory stop for self /
+      ground clearance below the hard-stop threshold. Any
+      SECOND surface that reads collision_warn_mm /
+      guard_warn_mm and renders proximity is a fork. Re-
+      enabling the warn tier requires flipping the driver
+      default AND removing the null-returns AND getting the
+      operator directive reversed — three-way gate on purpose.
+    canonical:
+      python:
+        module: estun_driver.estun_driver_node
+        functions: []
+        note: >
+          collision_warn_distance_mm param default is 0.0.
+          _build_stop_cause_locked populates guard_kind + dist_mm
+          on the structured cause dict.
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [_jog_stop_cause_operator_copy]
+      frontend:
+        path: src/cobot_dashboard/frontend/src/components/HardStopToast.jsx
+        exports: [default]
+    forbidden:
+      # No new component may render a proximity warning surface.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          - "SELF-COLLISION WARNING"
+          - "self_collision_warn"
+          - "self-collision warning"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/lib/collisionPresentation.js
+          - src/cobot_dashboard/frontend/src/components/SelfCollisionWarnBanner.jsx
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt: []
+
+  # 25. Self-collision guard kill switch (2026-08-06 operator
+  # directive). SINGLE AUTHORITATIVE runtime kill switch for the
+  # entire self-collision + ground-plane capsule guard, ALL tiers
+  # (40 mm warn, 15 mm hard stop, ground plane, cart-mode escape
+  # gate, pre-flight jog check).
+  - id: collision_guard_kill_switch
+    description: >
+      One switch, one truth: the driver's runtime flag
+      `_coll_guard_active` gates every guard call site. When
+      False, no clearance-related message is emitted anywhere in
+      the stack — the tick evaluator, the pre-flight jog check,
+      the cart-mode start guard, and the posture-time min-
+      clearance publisher all no-op. `collision_enabled`
+      parameter is the boot default (also False per this
+      directive). Runtime toggle via /robot/collision_guard_set
+      (Bool); dashboard exposes GET/POST /api/collision_guard.
+
+      Fork rule: any second implementation of "is the collision
+      guard active" — a duplicate flag, a bypass path that
+      evaluates the coll_model without checking
+      `_coll_guard_active`, a frontend component that renders
+      clearance without gating on `robot.collision_enabled` — is
+      a fork. Adding a new guard USE site to the driver requires
+      including `and self._coll_guard_active` in the same
+      predicate (or an equivalent early-return); the pinned
+      tests count gates and refuse a merge that adds a use site
+      without one.
+
+      Event log is the operator's audit trail: every transition
+      of `collision_enabled` (boot observation, runtime toggle,
+      status-blob change) emits an event_log entry with severity
+      warning on OFF, info on ON.
+
+      SAFETY (surfaced by the doctrine, not gated by the code):
+      with the guard OFF nothing in software prevents a link-on-
+      link or link-on-table crash. Operator's explicit informed
+      choice per the 2026-08-06 directive.
+    canonical:
+      python:
+        module: estun_driver.estun_driver_node
+        functions: []
+        note: >
+          `_coll_guard_active` seeded from the `collision_enabled`
+          param. `_on_collision_guard_set` handles the runtime
+          topic. Every _coll_model USE site includes
+          `and self._coll_guard_active`.
+      dashboard:
+        module: cobot_dashboard.dashboard_server
+        functions: [api_collision_guard_get, api_collision_guard_set,
+                    _publish_collision_guard_set]
+      frontend:
+        path: src/cobot_dashboard/frontend/src/layouts/ConfigureLayout.jsx
+        exports: [default]
+        note: >
+          SelfCollisionGuardSection is the single UI surface for
+          the kill switch. HardStopToast gates on
+          robot.collision_enabled so a stale wire message never
+          surfaces after a toggle.
+    forbidden:
+      # No new component may render clearance without gating on
+      # robot.collision_enabled. Match the two most common
+      # clearance-reading patterns.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          - "robot\\?\\.collision_min_mm"
+        path_exempt:
+          - src/cobot_dashboard/frontend/src/layouts/View3DLayout.jsx
+          - src/cobot_dashboard/frontend/src/components/StandaloneRobot.jsx
+          - src/cobot_dashboard/frontend/src/components/HardStopToast.jsx
+          - src/cobot_dashboard/frontend/src/components/ObstacleEscapeModal.jsx
+          - src/cobot_dashboard/frontend/src/components/SelfCollisionWarnBanner.jsx
+          - src/cobot_dashboard/frontend/src/lib/collisionPresentation.js
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt: []
+
+
+# ── Heuristic sweep ─────────────────────────────────────────────────
+#
+# For domain math the registry hasn't listed explicitly. Runs on every
+# frontend JS/JSX file. Any hit surfaces as a WARNING (review-required)
+# — not a gate failure — because the false-positive rate is real
+# (general geometry in orient.js / IKGizmo.jsx is legitimate). The
+
+  # 27. Mode switch (2026-08-28 feature). One canonical way for
+  # the dashboard to switch the arm between Manual / Auto / Remote.
+  - id: mode_switch
+    description: >
+      Robot mode switching lives on ONE control surface end-to-
+      end. Backend seam: POST /api/estun/mode → publish on
+      /estun/mode_command → driver's _on_mode_command runs the
+      WS verb (Robot/toAuto | toManual | toRemote), then polls
+      publish/RobotStatus.mode (NUMERIC, L298) up to 3 s until it
+      matches the target — that's a "switch". Result envelope on
+      /estun/mode_status carries req_id + observed + reason_code.
+      /api/estun/mode blocks up to 4 s waiting for the matching
+      envelope; anything else is a driver-ack timeout.
+
+      Arbiter discipline (JOG-11 extension): mode switch REFUSES
+      under an active jog hold (_active_holds non-empty) OR a
+      running program (STATE.robot.program.state == 2). Returns
+      outcome.kind='arbiter_refused' with a named reason.
+
+      Frontend surface: components/ModeControl.jsx renders the
+      current mode pill ALWAYS (safety-relevant, not a toggle) +
+      a confirm dialog naming the consequence per target. Second
+      surface is workflow sugar — RunProgramModal transparently
+      offers "Switch to Auto and run" when the arm isn't in AUTO
+      and the mode gate is open. No other component may POST to
+      /api/estun/mode.
+
+      Fork rule: any second POST to /api/estun/mode outside of
+      ModeControl or RunProgramModal (the two authorized call
+      sites) is a fork.
+    canonical:
+      python:
+        module: cobot_dashboard.dashboard_server
+        functions: [api_estun_mode]
+      javascript:
+        module: src/cobot_dashboard/frontend/src/components/ModeControl.jsx
+        exports: [ModeControl]
+      route:
+        method: POST
+        path: /api/estun/mode
+    forbidden:
+      # Anything else fetching POST /api/estun/mode is a fork —
+      # the two authorized surfaces are exempted below.
+      - path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+        patterns:
+          - "/api/estun/mode"
+        path_exempt:
+          - '**/ModeControl.jsx'
+          - '**/RunProgramModal.jsx'
+          - '**/*.test.js'
+          - '**/*.test.jsx'
+    known_debt: []
+
+  # 26. Provenance (2026-08-28 stale-class close). One canonical
+  # source of the running-code identity — backend git SHA, backend
+  # start time, frontend git SHA. Everything the operator sees
+  # about "what's running" reads from this capability.
+  - id: provenance
+    description: >
+      Every layer where "what's running" could diverge from "what
+      the operator believes" reads from ONE provenance source.
+      Baked at import time in dashboard_server:
+        _BACKEND_GIT_SHA     ← COBOT_BACKEND_SHA env or git HEAD
+        _BACKEND_START_ISO   ← time.gmtime(_START_TIME)
+        _read_frontend_git_sha()  ← dist/.build-sha sidecar
+      Exposed at /api/provenance and mirrored on /health.
+      /api/deploy_status composes a three-layer verdict:
+        deploy_log latest.phase + backend_sha + frontend_sha,
+      all compared to the deploy_log latest.sha; any mismatch
+      surfaces failing_layers and verdict='red' — never a false
+      green.
+      /ws/state pushes {type:'hello', backend_sha, frontend_sha}
+      immediately after accept; frontend compares to its own
+      compile-time __GIT_SHA__ and shows the BLOCKING StaleGuard
+      overlay on mismatch (dismissible toast retired).
+      Deploy scripts refuse a dirty working tree unless
+      ALLOW_DIRTY=1; a deploy without a SHA is not a deploy.
+
+      Fork rule: any second "what's the running SHA" surface — a
+      mock provenance module, a second /health handler, a separate
+      frontend build-id file that the WS hello does not consult —
+      is a fork. All three layers (backend, frontend, deploy)
+      compare git-SHA to git-SHA (L257 like-for-like); nothing
+      else.
+    canonical:
+      python:
+        module: cobot_dashboard.dashboard_server
+        functions: [_read_backend_git_sha, _read_frontend_git_sha,
+                    api_provenance, api_deploy_status]
+      javascript:
+        module: src/cobot_dashboard/frontend/src/components/StaleGuard.jsx
+        exports: [StaleGuard]
+      route:
+        method: GET
+        path: /api/provenance
+      file:
+        path: src/cobot_dashboard/frontend/dist/.build-sha
+    forbidden:
+      # No second implementation of the frontend-SHA read. Anything
+      # that greps a git SHA out of a frontend asset OUTSIDE of
+      # _read_frontend_git_sha is a fork of that seam.
+      - path_glob: src/cobot_dashboard/cobot_dashboard/**/*.py
+        patterns:
+          - "\\.build-sha"
+        path_exempt:
+          - '**/dashboard_server.py'
+          - '**/test_*.py'
+    known_debt: []
+
+# reviewer either:
+#
+#   * adds a real registry entry (patterns tuned, path_exempt filled),
+#   * or moves the site to known_debt with an owner and reason.
+#
+# Never leave a heuristic hit unresolved for more than one commit —
+# the whole point is to force a decision.
+
+heuristic_sweep:
+  frontend_numeric_math_on_domain_objects:
+    description: >
+      Frontend code doing vector/pose math on domain identifiers
+      (corner_tcp, taught_joints, jp, cp, tcp, joint_positions,
+      part_tcp) is suspicious. Backend owns these numerics.
+    path_glob: src/cobot_dashboard/frontend/src/**/*.{js,jsx}
+    # A file matches if it references at least one domain identifier
+    # AND at least one math primitive from the list below.
+    domain_identifiers:
+      - 'corner[123]_tcp'
+      - 'corner_a_tcp'
+      - 'point_[bc]_tcp'
+      - 'part_tcp'
+      - 'taught_joints'
+      - 'taught_tcp'
+      - "'jp'|\"jp\""
+      - "'cp'|\"cp\""
+    math_primitives:
+      - 'Math\.acos'
+      - 'Math\.hypot'
+      - 'Math\.sqrt'
+      - '\bcross\s*\('
+      - '\bdot\s*\('
+      - '\bnorm\s*\('
+    # Files exempt from the sweep — the client that only POSTs to the
+    # backend validator carries these identifiers by necessity but
+    # does no math.
+    path_exempt:
+      - src/cobot_dashboard/frontend/src/lib/palletFrameValidator.js
+      - src/cobot_dashboard/frontend/src/lib/palletFrameValidator.test.js
+      - '**/*.test.js'
+      - '**/*.pinned.test.js'
+    # Files that CURRENTLY carry legitimate frontend math on other
+    # domain objects (Isaac IK gizmo, wrist orient) — grandfathered.
+    known_ok:
+      - path: src/cobot_dashboard/frontend/src/lib/orient.js
+        why: >
+          Wrist orientation math for the operator-visible J5 sanity
+          check — not pallet-frame, not TCP calc. General SE(3) math
+          that the backend does not own separately.
+        owner: robot-driver
+      - path: src/cobot_dashboard/frontend/src/components/IKGizmo.jsx
+        why: >
+          3D-viewer IK preview gizmo — client-side visualization
+          only, no operator verdict, no motion decision.
+        owner: perception-ui

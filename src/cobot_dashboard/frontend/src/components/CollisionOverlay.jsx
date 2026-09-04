@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Html } from '@react-three/drei'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
+import NumericField from './NumericField'
 
 // LiDAR (ROS) frame:  +X forward, +Y left, +Z up  (right-handed).
 // Three.js scene used by ArmViewer3D: lidarToThree maps
@@ -428,10 +429,11 @@ function NumRow({ label, v, onChange }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
       <label style={{ width: 56, fontSize: 10, color: '#94a3b8' }}>{label}</label>
-      <input
-        type="number" step="0.05"
+      <NumericField
+        step={0.05}
         value={v}
-        onChange={(e) => onChange(Number(e.target.value))}
+        onCommit={onChange}
+        aria-label={label}
         style={{
           flex: 1, padding: '3px 6px', fontSize: 11,
           background: '#0f172a', color: '#e5e7eb',

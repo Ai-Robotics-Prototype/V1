@@ -1,8 +1,35 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
-import { useStore } from '../store/useStore'
+import { useStore, CLIENT_ID } from '../store/useStore'
 import ProgramWizard from './ProgramWizard'
 import ProgramFromDemonstration from './ProgramFromDemonstration'
+import { HoldButton } from './JogControls'
+import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
+import TeachLockBanner from './TeachLockBanner'
+import NumericField from './NumericField'
+import PalletFrameDiagram from './PalletFrameDiagram'
+import { readPayload, PAYLOAD_UNSET_WARNING }
+  from '../lib/payload'
+import { computePayloadTruth } from '../lib/payloadTruth'
+import { useIOPortmap, portmapLabels, portmapToOptions }
+  from '../lib/ioPortmap'
+import { isStepTaught, untaughtStepIds, hasFullTaughtPose, verbForStep,
+         palletFrameStatus, firstUntaughtPalletRole, PALLET_ROLE_ORDER,
+         TEACHABLE_ACTIONS, isTeachable, isDerivedOffsetMove }
+  from '../lib/programTruth'
+import { PALLET_ROLE_TO_FIELD, modeForRole, taughtCount,
+         backFrom, advanceFrom, jumpTo }
+  from '../lib/palletTeachSequence'
+import { validatePalletFrameServer, findingsBlockingThisRecord }
+  from '../lib/palletFrameValidator'
+import { namedLoadError } from '../lib/loadOutcome'
+import { computeProgramFindings } from '../lib/programFindings'
+import { computeTeachingDebt, debtBannerLabel } from '../lib/teachingDebt'
+import { stepIndexForLine, lineMapHonesty } from '../lib/runState'
+import { useLineMap } from '../lib/useLineMap'
+import { teachLayoutMetrics } from '../lib/teachLayout'
+import { paletteLabelForAction, effectorDisplayName, effectorOf }
+  from '../lib/effectorVocab'
 
 // The richer action taxonomy lives in the editor. Each action carries
 // a coarse `type` (matching the existing backend schema: move/gripper/
@@ -114,39 +141,11 @@ function isPalletDriven(step) {
   return step?.action === 'move_to_pallet'
 }
 
-// Actions that move the robot to a specific pose. Gripper open/close
-// are pure I/O signals — the pose at which they fire is owned by the
-// previous move step, so they don't get their own taught position.
-const TEACHABLE_ACTIONS = [
-  'move_home', 'move_joint', 'move_linear',
-  'approach',  'pick',       'place',
-]
-
-// A derived offset move (descend / lift / retreat / "approach finished
-// part") computes its target at runtime as <source taught_tcp> + Z
-// offset; the operator never teaches it directly. Explicit derived_from
-// tag is the new shape emitted by the wizard; the offset_z_mm heuristic
-// covers older saved programs that were generated before the tag
-// existed (their descend/lift had offset_z_mm set and no taught data of
-// their own, which uniquely identifies them as wizard-derived).
-//
-// Override semantics: a derived step can be manually overridden by the
-// operator (overridden:true + its own taught_tcp). When overridden, we
-// stop treating it as auto-derived so the editor exposes pose inputs
-// and the Teach button works on it directly. The executor also reads
-// the overridden taught_tcp instead of base+offset (see
-// program_executor_node.py _resolve_base_tcp call site).
-function isDerivedOffsetMove(step) {
-  if (!step) return false
-  if (step.overridden) return false
-  if (step.derived_from) return true
-  const isMoveLinear = step.action === 'move_linear' || step.type === 'move'
-  if (!isMoveLinear) return false
-  if (step.offset_z_mm === undefined || step.offset_z_mm === null) return false
-  const hasJoints = Array.isArray(step.taught_joints) && step.taught_joints.length >= 6
-  const hasTcp    = Array.isArray(step.taught_tcp)    && step.taught_tcp.length    >= 3
-  return !hasJoints && !hasTcp
-}
+// TEACHABLE_ACTIONS + isDerivedOffsetMove + isTeachable now live in
+// lib/programTruth so the itinerary + row consult the SAME predicate
+// (2026-07-31 unification, §396 audit). Imported at the top; local
+// re-definitions were retired to close the fork that put non-pose
+// steps like `detect` and `move_to_pallet` into Teach All queues.
 
 // True when this step has been derived but the operator manually
 // overrode the pose. Used by the editor to badge the row and surface
@@ -163,6 +162,51 @@ function isPoseSource(step) {
   if (!step) return false
   if (!step.position_role) return false
   return ['pick', 'place', 'home'].includes(step.position_role)
+}
+
+// Actions that carry a taught position AND are eligible for the
+// "reuse an earlier taught position" prompt. Non-motion steps
+// (open_gripper, wait, set_io, detect, etc.) skip the prompt.
+const REUSABLE_POSITION_ACTIONS = new Set([
+  'move_home', 'move_joint', 'move_linear', 'approach', 'pick', 'place',
+])
+
+// Given the current step list and a candidate action, return the
+// FIRST earlier step that (a) has the same `action` or (b) shares a
+// `position_role` derived from the same intent (home ↔ move_home,
+// pick ↔ pick, place ↔ place). The returned step is a valid source
+// for `position_ref` — the reused step live-links to it rather than
+// copying joints. Used by the add-step handler to offer the reuse
+// prompt. Returns null when there is no earlier taught source.
+function findPositionReuseSource(steps, action) {
+  if (!REUSABLE_POSITION_ACTIONS.has(action)) return null
+  // Role inferred from the candidate action.
+  const roleFor = (a) => {
+    if (a === 'move_home')  return 'home'
+    if (a === 'pick')       return 'pick'
+    if (a === 'place')      return 'place'
+    return null
+  }
+  const wantAction = action
+  const wantRole   = roleFor(action)
+  for (const s of steps) {
+    // Skip steps that themselves reuse someone else — chase to the
+    // ORIGINAL taught source so the operator sees "same as step 2"
+    // even when they add a fourth step and the third is a link.
+    if (s.position_ref) continue
+    const sameAction = s.action === wantAction
+    const sameRole   = wantRole && s.position_role === wantRole
+    if (!sameAction && !sameRole) continue
+    // Only offer as source if the step actually carries pose data
+    // OR is a home (home's pose is the fixed all-zeros default —
+    // reuse is meaningful even before "teach").
+    const isHome = wantRole === 'home' || sameRole === 'home' || sameAction && wantAction === 'move_home'
+    const taughtJoints = Array.isArray(s.taught_joints) && s.taught_joints.length >= 6
+    const taughtTcp    = Array.isArray(s.taught_tcp)    && s.taught_tcp.length >= 3
+    if (!isHome && !taughtJoints && !taughtTcp) continue
+    return s
+  }
+  return null
 }
 
 // Resolve the auto-derived pose for a derived step from the surrounding
@@ -199,22 +243,119 @@ function resolveDerivedPose(step, allSteps) {
   return null
 }
 
-function isTeachable(step) {
-  if (!step) return false
-  // Derived offset moves resolve at runtime from their source step's
-  // taught pose, so the operator must NOT teach them independently.
-  if (isDerivedOffsetMove(step)) return false
-  // Prefer the explicit action when set (wizard-emitted or PUT'd via
-  // /api/programs). Fall back to deriving an action from the legacy
-  // 'type' field (default STATE.program.steps used 'type' only) — but
-  // only if 'type' actually matches an ACTION_TYPES entry, so we
-  // don't trip a default fallback into "always teachable".
-  if (step.action) return TEACHABLE_ACTIONS.includes(step.action)
-  if (step.type) {
-    const match = ACTION_TYPES.find((a) => a.type === step.type)
-    if (match) return TEACHABLE_ACTIONS.includes(match.value)
+// isTeachable was moved to lib/programTruth (2026-07-31 unification).
+// Imported at the top of this file so the row + itinerary + badges
+// consume ONE predicate. Legacy type-only fallback dropped —
+// ambiguous (`type: 'move'` covers detect / scan_* / move_to_pallet)
+// and unnecessary now that saved programs always carry an action.
+
+// Count steps that reference a named point via `point_name`. Powers
+// the picker's per-point badge and the row's link chip suffix.
+function countStepsUsingPoint(steps, pointName) {
+  if (!pointName || !Array.isArray(steps)) return 0
+  let n = 0
+  for (const s of steps) if (s && s.point_name === pointName) n += 1
+  return n
+}
+
+// Count steps that link to another step via ea64950 step-id refs
+// (position_ref) or the older linked_to_step_id field. Includes the
+// source step itself in the total so the badge reads intuitively as
+// "3 steps share this pose" (source + 2 refs = 3).
+function countStepsSharingStep(steps, srcStepId) {
+  if (srcStepId == null || !Array.isArray(steps)) return 0
+  let n = 0
+  for (const s of steps) {
+    if (!s) continue
+    if (s.id === srcStepId) { n += 1; continue }
+    if (s.position_ref === srcStepId) n += 1
+    else if (s.linked_to_step_id === srcStepId) n += 1
   }
-  return false
+  return n
+}
+
+// Aggregate every taught position the operator can link to. Two
+// source families sit alongside each other:
+//   • kind:'step'  — a position-type step in this program with taught
+//                    joints. Linking sets step.position_ref (matching
+//                    the ea64950 home-reuse pattern, which was the
+//                    only place this ever worked pre-fix).
+//   • kind:'point' — an entry in program.points, populated by
+//                    /api/programs/{id}/points (Points panel, voice,
+//                    wizard). Linking sets step.point_name.
+// Sorted by taught_at desc — most-recently-touched first. Steps that
+// themselves reference another step are excluded to keep the source
+// list pointing at ORIGINALS (chase-through is what the finder was
+// already doing at line ~200 before this refactor).
+function collectPositionSources(steps, points) {
+  const out = []
+  const program = { steps, points }
+  if (Array.isArray(steps)) {
+    for (const s of steps) {
+      if (!s) continue
+      if (s.position_ref != null || s.linked_to_step_id != null) continue
+      if (!isTeachable(s, program)) continue
+      if (!s.taught) continue
+      const j = Array.isArray(s.taught_joints) ? s.taught_joints
+              : Array.isArray(s.joints)        ? s.joints : null
+      const t = Array.isArray(s.taught_tcp)    ? s.taught_tcp
+              : Array.isArray(s.position)      ? s.position : null
+      if (!Array.isArray(j) || j.length < 6) continue
+      out.push({
+        kind:      'step',
+        id:        s.id,
+        label:     s.label || null,
+        action:    s.action || null,
+        role:      s.position_role || null,
+        joints:    j,
+        tcp:       t,
+        taught_at: s.taught_at || '',
+        refs:      countStepsSharingStep(steps, s.id),
+      })
+    }
+  }
+  if (points && typeof points === 'object') {
+    for (const [name, p] of Object.entries(points)) {
+      if (!p || !Array.isArray(p.joints) || p.joints.length < 6) continue
+      out.push({
+        kind:      'point',
+        name,
+        label:     p.label || null,
+        joints:    p.joints,
+        tcp:       Array.isArray(p.tcp) ? p.tcp : null,
+        taught_at: p.taught_at || '',
+        refs:      countStepsUsingPoint(steps, name),
+      })
+    }
+  }
+  out.sort((a, b) => (b.taught_at || '').localeCompare(a.taught_at || ''))
+  return out
+}
+
+// Compact joint summary for the picker rows — J1..J6 degrees, single
+// line, monospace-friendly.
+function pointJointsLine(joints) {
+  if (!Array.isArray(joints) || joints.length < 6) return ''
+  return joints.slice(0, 6)
+    .map((v, i) => `J${i + 1}:${Number(v).toFixed(1)}°`).join('  ')
+}
+
+// Format a taught_at ISO timestamp as "just now / 3m / 2h / 4d" for
+// the picker's most-recent-first list. Falls back to the raw string
+// on parse failure so a hand-authored program's non-standard stamp
+// still renders something meaningful.
+function formatTaughtAgo(iso) {
+  if (!iso) return ''
+  const t = Date.parse(iso)
+  if (!Number.isFinite(t)) return String(iso).slice(0, 19)
+  const secs = Math.max(0, Math.round((Date.now() - t) / 1000))
+  if (secs < 45)     return 'just now'
+  if (secs < 90)     return '1 min ago'
+  const mins = Math.round(secs / 60)
+  if (mins < 60)     return `${mins} min ago`
+  const hours = Math.round(mins / 60)
+  if (hours < 48)    return `${hours} h ago`
+  return `${Math.round(hours / 24)} d ago`
 }
 
 // /api/state returns joints.positions in radians; the step model
@@ -236,7 +377,13 @@ function actionFor(step) {
 // intentionally NOT included here — that lives in the collapsible
 // "position data" block triggered by the "View position data" link.
 function detailLine(step, ioLabels) {
-  const ioName = (id) => (ioLabels && ioLabels[id]) || id
+  // Match the main I/O page + dropdown format: "DO2 — Vacuum On" when
+  // the operator has renamed the port, plain "DO2" otherwise.
+  const ioName = (id) => {
+    if (!id) return id
+    const lab = ioLabels && ioLabels[id]
+    return lab ? `${id} — ${lab}` : id
+  }
   const bits = [step.action || step.type]
   if (step.target)      bits.push('target: ' + step.target)
   if (step.duration_s)  bits.push(step.duration_s + 's')
@@ -269,13 +416,18 @@ function detailLine(step, ioLabels) {
 // Does this step have anything worth showing in the collapsible
 // position-data block? Drives whether the "View position data" link
 // is rendered (empty steps don't need a no-op toggle).
+//
+// Uses hasFullTaughtPose from programTruth so only 6-element arrays
+// count — partial arrays are malformed teach data and shouldn't be
+// presented to the operator as if they were captured (2026-07-30
+// audit #P1-3).
 function hasPositionData(step) {
   if (!step) return false
-  if (Array.isArray(step.taught_joints) && step.taught_joints.length) return true
-  if (Array.isArray(step.taught_tcp)    && step.taught_tcp.length)    return true
-  if (Array.isArray(step.joints)        && step.joints.length)        return true
-  if (Array.isArray(step.position)      && step.position.length)      return true
-  if (step.taught_at)                                                  return true
+  if (hasFullTaughtPose(step)) return true
+  // Legacy taught_at breadcrumb (drawer shows just the timestamp) —
+  // preserved so operators inspecting old programs can still see when
+  // a pose WAS taught, even if the payload got corrupted since.
+  if (step.taught_at) return true
   return false
 }
 
@@ -297,52 +449,35 @@ function positionDataLines(step) {
   return out
 }
 
-// Shared label fetch — one round-trip per editor mount instead of one
-// per IOPortSelector instance. Backend now always returns factory
-// defaults merged with operator overrides so `labels[id]` is defined
-// for every port.
+// Editor-wide label map for the detail line (fed into detailLine's
+// ioName helper). One fetch per editor mount via useIOPortmap; the
+// helper walks plate + flange terminals and returns the operator
+// assignments as { "DO2": "Vacuum On", ... }. Channels without a
+// user label are omitted so ioName falls back to the raw id.
 function useIOLabels() {
-  const [labels, setLabels] = useState({})
-  useEffect(() => {
-    let alive = true
-    fetch('/api/io/config')
-      .then((r) => r.json())
-      .then((d) => { if (alive && d) setLabels(d.labels || {}) })
-      .catch(() => {})
-    return () => { alive = false }
-  }, [])
-  return labels
+  const pm = useIOPortmap()
+  return portmapLabels(pm)
 }
 
-// Dropdown that lists DO* or DI* ports with their pin numbers and the
-// operator-renamed labels from /api/io/config. Renders an "unassigned"
-// option at the top so a step can opt out of I/O explicitly.
-function IOPortSelector({ label, value, onChange, direction }) {
-  const [labels, setLabels] = useState({})
-
-  useEffect(() => {
-    let alive = true
-    fetch('/api/io/config')
-      .then((r) => r.json())
-      .then((d) => { if (alive && d) setLabels(d.labels || {}) })
-      .catch(() => {})
-    return () => { alive = false }
-  }, [])
-
-  const ports = Array.from({ length: 16 }, (_, i) => {
-    const id  = (direction === 'output' ? 'DO' : 'DI') + i
-    const pin = (direction === 'output' ? 'Y' : 'X') + Math.floor(i / 8) + '.' + (i % 8)
-    return { id, pin, label: labels[id] || id }
-  })
-
+// Dropdown for a step-editor I/O field. Uses the same /api/io/portmap
+// source as the main I/O page so display, port set, and system-reserved
+// exclusions all stay in lockstep with the hardware plate.
+//   direction='output' → writable DOs (+ AOs when analog=true)
+//   direction='input'  → readable DIs (+ AIs when analog=true)
+// System-reserved DIs (modeSwitch, enableButton, flangeButton*) and
+// SAFETY terminals are excluded. Flange DOs/DIs sort to the bottom
+// with a "(flange)" suffix.
+function IOPortSelector({ label, value, onChange, direction, analog }) {
+  const portmap = useIOPortmap()
+  const options = portmapToOptions(portmap, direction, { analog: Boolean(analog) })
   return (
     <div style={{ marginBottom: 8 }}>
       <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 3 }}>{label}</div>
       <select value={value || ''} onChange={(e) => onChange(e.target.value || undefined)}
         style={{ ...selectStyle }}>
         <option value="">Not assigned</option>
-        {ports.map((p) => (
-          <option key={p.id} value={p.id}>{p.pin} — {p.label}</option>
+        {options.map((p) => (
+          <option key={p.id} value={p.id}>{p.display}</option>
         ))}
       </select>
     </div>
@@ -371,6 +506,347 @@ async function fetchTcpFromState() {
 // from the existing program so taught poses don't get clobbered.
 //
 // Returns the new steps array (renumbered downstream by the caller).
+// 2026-08-06 palletize completeness — the operator directive asks for
+// an expandable read-only preview of the emitted cycle template on
+// the move_to_pallet step. This component renders the 12/13-line
+// per-cycle skeleton the codegen actually emits, plus a note about
+// how the layer-shift works. It is NOT the real Lua — that lives on
+// the driver — but the labels and ordering mirror the codegen 1:1
+// (see program_ops.py::codegen_lua_from_program palletize branch).
+// PalletSubStepInlineField — a compact numeric input that writes back
+// to `config.pallet.<key>` via the shared `onPatchPallet` handler
+// (the same target `PalletConfigEditor`'s Save uses). Kept minimal so
+// the sub-step row stays visually adjacent to the label; the modal is
+// the fuller edit surface. `unit` is displayed after the number
+// ('mm', 'ms', 'DO'). Blur commits; keydown Enter commits too.
+function PalletSubStepInlineField({
+  value, unit, min, max, onCommit, ariaLabel, testId, width = 68,
+  emptyMeansNull = false,
+}) {
+  const [draft, setDraft] = useState(value === null || value === undefined
+                                     ? '' : String(value))
+  // Sync when the outer value changes (e.g. modal edit landed).
+  useEffect(() => {
+    setDraft(value === null || value === undefined ? '' : String(value))
+  }, [value])
+  const commit = () => {
+    const t = String(draft).trim()
+    if (emptyMeansNull && t === '') { onCommit(null); return }
+    const n = Number(t)
+    if (!Number.isFinite(n)) { setDraft(String(value ?? '')); return }
+    let clamped = n
+    if (min !== undefined) clamped = Math.max(min, clamped)
+    if (max !== undefined) clamped = Math.min(max, clamped)
+    onCommit(clamped)
+    setDraft(String(clamped))
+  }
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+      <input
+        type="text"
+        inputMode="numeric"
+        value={draft}
+        onChange={(e) => setDraft(
+          emptyMeansNull ? e.target.value.replace(/[^0-9]/g, '')
+                         : e.target.value.replace(/[^0-9.-]/g, ''))}
+        onBlur={commit}
+        onKeyDown={(e) => { if (e.key === 'Enter') { e.currentTarget.blur() } }}
+        aria-label={ariaLabel}
+        data-testid={testId}
+        style={{
+          width, padding: '2px 6px', fontSize: 12,
+          fontFamily: 'var(--font-mono, monospace)',
+          border: '1px solid #cbd5e1', borderRadius: 4,
+          background: '#fff', color: '#0f172a',
+          textAlign: 'right',
+        }} />
+      {unit && (
+        <span style={{ fontSize: 11, color: '#64748b' }}>{unit}</span>
+      )}
+    </span>
+  )
+}
+
+// PalletExpansionPreview — nested styled sub-step rows for the parent
+// `move_to_pallet` row. Each sub-step renders with the same layout as
+// the top-level step rows (number + verb badge + label + optional
+// inline editable field). Shaded background + left indent visually
+// group the rows as a subroutine under the PALLET parent.
+//
+// EDITABILITY (operator directive 2026-08-06): fields on relevant sub-
+// step rows write to `config.pallet.<key>` through the SAME
+// `onPatchPallet` handler `PalletConfigEditor.onSave` uses. Fields are
+// grid-parameters (approach distance, retract, safety margin, vacuum
+// port, seal wait, blow-off port + pulse), NOT free-hand pose edits —
+// the sub-steps stay COMPOSER-GENERATED so one edit updates every
+// cycle deterministically. Regeneration goes through the shared
+// `regenerateMoveToPalletSteps` so all cycles reflect the change.
+function PalletExpansionPreview({ step, palletCfg, onPatchPallet }) {
+  const grip = String(step?.gripper_type || 'vacuum').toLowerCase()
+  const vacPort = Number(step?.vacuum_port_do ?? palletCfg?.vacuum_port_do ?? 2)
+  const blowPortRaw = (step?.blow_off_port_do ?? palletCfg?.blow_off_port_do)
+  const blowPort = (blowPortRaw === null || blowPortRaw === undefined
+                    || blowPortRaw === '') ? null : Number(blowPortRaw)
+  const blowPulse = Number(step?.blow_off_pulse_ms ?? palletCfg?.blow_off_pulse_ms ?? 300)
+  const seal = Number(step?.seal_wait_ms ?? palletCfg?.seal_wait_ms ?? 500)
+  const approach = Number(step?.approach_distance_mm ?? palletCfg?.approach_distance_mm ?? 50)
+  const retract  = Number(step?.retract_distance_mm  ?? palletCfg?.retract_distance_mm  ?? 50)
+  const margin   = Number(step?.safety_margin_mm     ?? palletCfg?.safety_margin_mm     ?? 50)
+  const layerH   = Number(palletCfg?.layer_height_mm ?? 100)
+  const rows   = Number(palletCfg?.rows ?? 1)
+  const cols   = Number(palletCfg?.cols ?? 1)
+  const layers = Number(palletCfg?.layers ?? 1)
+  const capacity = Math.max(1, rows * cols * layers)
+  const partCount = Math.max(1, Math.min(
+    Number(palletCfg?.part_count ?? capacity),
+    capacity))
+  const pickTaught  = Array.isArray(step?.pick_approach_joints)  && step.pick_approach_joints.length === 6
+  const placeTaught = Array.isArray(step?.place_approach_joints) && step.place_approach_joints.length === 6
+
+  // Verb badge palette matches TAG_COLORS to keep the sub-steps
+  // visually consistent with the top-level rows.
+  const VERB_COLOR = {
+    movJ:  TAG_COLORS.MOVE,     // #2563EB
+    movL:  TAG_COLORS.PLACE,    // #0891b2
+    setDO: TAG_COLORS.IO,       // #f97316
+    wait:  TAG_COLORS.WAIT,     // #6b7280
+  }
+  const patch = (key, val) => {
+    if (!onPatchPallet) return
+    onPatchPallet({ [key]: val })
+  }
+
+  // Build the per-cycle sub-steps. Each entry:
+  //   {verb, label, field?} where field is an optional inline input.
+  const substeps = [
+    { verb: 'movJ',
+      label: pickTaught
+        ? 'Approach pick pose (taught angle)'
+        : 'Approach pick pose',
+      detail: pickTaught
+        ? 'linear from taught angle onto contact'
+        : 'axis-offset along pick tool_Z',
+      field: !pickTaught ? {
+        label: 'approach', value: approach, unit: 'mm', min: 0, max: 500,
+        testId: 'pallet-substep-approach-mm',
+        onCommit: (v) => patch('approach_distance_mm', v),
+      } : null,
+    },
+    { verb: 'movL', label: 'Linear down to pick contact',
+      detail: 'from approach → taught pick pose' },
+    { verb: 'setDO', label: 'Vacuum ON',
+      detail: `DO${vacPort} = 1`,
+      field: { label: 'DO', value: vacPort, unit: '', min: 0, max: 63,
+               width: 42,
+               testId: 'pallet-substep-vacuum-port-do',
+               onCommit: (v) => patch('vacuum_port_do', v) } },
+    { verb: 'wait', label: 'Wait for vacuum seal',
+      detail: `${seal} ms dwell after vacuum ON`,
+      field: { label: 'ms', value: seal, unit: 'ms', min: 0, max: 5000,
+               testId: 'pallet-substep-seal-wait-ms',
+               onCommit: (v) => patch('seal_wait_ms', v) } },
+    { verb: 'movL', label: 'Linear up (retract) to pick approach',
+      detail: `retract along pick tool_Z`,
+      field: { label: 'retract', value: retract, unit: 'mm',
+               min: 0, max: 500,
+               testId: 'pallet-substep-retract-mm',
+               onCommit: (v) => patch('retract_distance_mm', v) } },
+    { verb: 'movL', label: 'Lift to transit_Z above pick',
+      detail: `slot_Z(layer) + layer_h(${layerH}) + safety_margin`,
+      field: { label: 'safety_margin', value: margin, unit: 'mm',
+               min: 0, max: 500,
+               testId: 'pallet-substep-safety-margin-mm',
+               onCommit: (v) => patch('safety_margin_mm', v) } },
+    { verb: 'movL', label: 'Traverse over slot at transit_Z',
+      detail: 'X,Y of slot[r,c,layer]' },
+    { verb: 'movL',
+      label: placeTaught
+        ? 'Approach place pose (taught angle, layer-shifted)'
+        : 'Approach place pose (per layer)',
+      detail: placeTaught
+        ? `taught + layer × ${layerH} mm lift along plane normal`
+        : `axis-offset along slot tool_Z; rises per layer`,
+      // approach and retract are shared with the pick side; edits
+      // propagate to BOTH linear-up/down on each cycle.
+      field: !placeTaught ? {
+        label: 'approach', value: approach, unit: 'mm', min: 0, max: 500,
+        testId: 'pallet-substep-place-approach-mm',
+        onCommit: (v) => patch('approach_distance_mm', v),
+      } : null,
+    },
+    { verb: 'movL', label: 'Linear down to slot (place)',
+      detail: 'from place approach → slot pose' },
+    { verb: 'setDO', label: 'Vacuum OFF (release)',
+      detail: `DO${vacPort} = 0`,
+      // Same field object as vacuum ON — one write, both rows reflect.
+      field: { label: 'DO', value: vacPort, unit: '', min: 0, max: 63,
+               width: 42,
+               testId: 'pallet-substep-vacuum-port-do-off',
+               onCommit: (v) => patch('vacuum_port_do', v) } },
+  ]
+  if (blowPort !== null) {
+    substeps.push({ verb: 'setDO',
+      label: 'Blow-off pulse start',
+      detail: `DO${blowPort} = 1`,
+      field: { label: 'DO', value: blowPort, unit: '', min: 0, max: 63,
+               width: 42,
+               testId: 'pallet-substep-blow-port-do',
+               onCommit: (v) => patch('blow_off_port_do', v),
+               emptyMeansNull: true } })
+    substeps.push({ verb: 'wait',
+      label: 'Blow-off pulse',
+      detail: `${blowPulse} ms pulse to eject part`,
+      field: { label: 'pulse', value: blowPulse, unit: 'ms',
+               min: 0, max: 5000,
+               testId: 'pallet-substep-blow-pulse-ms',
+               onCommit: (v) => patch('blow_off_pulse_ms', v) } })
+    substeps.push({ verb: 'setDO',
+      label: 'Blow-off pulse end',
+      detail: `DO${blowPort} = 0` })
+  }
+  substeps.push({ verb: 'movL',
+    label: 'Linear up (retract) to place approach',
+    detail: 'retract along slot tool_Z' })
+  substeps.push({ verb: 'movL',
+    label: 'Lift to transit_Z above slot',
+    detail: 'ready for next cycle (or return home)' })
+
+  return (
+    <div
+      data-testid="pallet-expansion-preview"
+      style={{
+        // Nest under the parent PALLET row: indent + shaded tint that
+        // matches the PALLET tag color (#0f766e) so the operator
+        // reads the block as "children of step 7".
+        marginTop: 4, marginBottom: 8,
+        marginLeft: 40,
+        padding: '10px 12px 6px 12px',
+        background: 'rgba(204, 251, 241, 0.5)',  // #ccfbf1 @ 50%
+        borderLeft: '3px solid ' + TAG_COLORS.PALLET,
+        borderRadius: '0 8px 8px 0',
+      }}>
+      <div style={{
+        display: 'flex', alignItems: 'baseline', gap: 8,
+        marginBottom: 6, paddingLeft: 4,
+      }}>
+        <span style={{
+          fontSize: 10, fontWeight: 700, color: TAG_COLORS.PALLET,
+          letterSpacing: 0.5, textTransform: 'uppercase',
+        }}>
+          Palletize subroutine — {partCount}× per-cycle template
+        </span>
+        <span style={{ fontSize: 11, color: '#475569' }}>
+          {`(${rows}×${cols}×${layers} grid, gripper=${grip}) — edits `}
+          <em>regenerate all cycles</em>
+        </span>
+      </div>
+      {substeps.map((s, i) => (
+        <div
+          key={i}
+          data-testid="pallet-substep-row"
+          style={{
+            display: 'flex', alignItems: 'center', gap: 12,
+            padding: '8px 12px',
+            marginBottom: 3, borderRadius: 6,
+            background: '#fff',
+            border: '1px solid #d1fae5',
+            boxSizing: 'border-box',
+          }}>
+          {/* LEFT — indented number + verb badge (same width as parent
+              row's LEFT column but slightly narrower to signal
+              nesting). */}
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            flexShrink: 0, width: 172,
+          }}>
+            <div style={{
+              width: 26, height: 26, borderRadius: '50%',
+              background: '#e0f2fe', color: '#075985',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 11, fontWeight: 700, flexShrink: 0,
+            }}>
+              7.{i + 1}
+            </div>
+            <span style={{
+              fontSize: 10, fontWeight: 700,
+              padding: '2px 6px', borderRadius: 4,
+              color: '#fff',
+              background: VERB_COLOR[s.verb] || '#64748b',
+              letterSpacing: 0.5, textTransform: 'uppercase',
+              fontFamily: 'var(--font-mono, monospace)',
+              minWidth: 42, textAlign: 'center',
+            }}>
+              {s.verb}
+            </span>
+          </div>
+          {/* MIDDLE — label + detail, mirrors parent row's title/detail. */}
+          <div style={{
+            flex: '1 1 0', minWidth: 0,
+            display: 'flex', flexDirection: 'column', gap: 2,
+          }}>
+            <div style={{
+              fontSize: 13, fontWeight: 500, color: '#111',
+              lineHeight: 1.3,
+            }}>
+              {s.label}
+            </div>
+            {s.detail && (
+              <div style={{
+                fontSize: 11, color: '#64748b', lineHeight: 1.3,
+              }}>
+                {s.detail}
+              </div>
+            )}
+          </div>
+          {/* RIGHT — optional inline editable field. */}
+          {s.field && (
+            <div style={{
+              flexShrink: 0, display: 'flex', alignItems: 'center',
+              gap: 6,
+            }}>
+              <span style={{
+                fontSize: 10, color: '#0f766e', fontWeight: 700,
+                letterSpacing: 0.4, textTransform: 'uppercase',
+              }}>
+                {s.field.label}
+              </span>
+              <PalletSubStepInlineField
+                value={s.field.value}
+                unit={s.field.unit}
+                min={s.field.min}
+                max={s.field.max}
+                width={s.field.width}
+                onCommit={s.field.onCommit}
+                emptyMeansNull={s.field.emptyMeansNull}
+                ariaLabel={s.field.testId}
+                testId={s.field.testId} />
+            </div>
+          )}
+        </div>
+      ))}
+      <div style={{
+        marginTop: 6, paddingLeft: 4,
+        fontSize: 11, color: '#475569', lineHeight: 1.4,
+      }}>
+        <strong>Rule B:</strong> transit_Z(layer) = slot_Z(layer) +{' '}
+        {layerH} + {margin} mm along the frame normal. Layer{' '}
+        {Math.max(0, layers - 1)} approaches from above layer{' '}
+        {Math.max(0, layers - 1)} — never dips to a lower layer.
+      </div>
+      <div style={{
+        marginTop: 3, paddingLeft: 4,
+        fontSize: 11, color: '#64748b', fontStyle: 'italic',
+      }}>
+        Fields above edit the pallet config directly — one edit
+        regenerates every cycle. For grid, spacing, and taught
+        approach poses, use the full <strong>Edit</strong> modal on
+        step 7.
+      </div>
+    </div>
+  )
+}
+
+
 function regenerateMoveToPalletSteps(steps, palletCfg, palletMode) {
   if (!Array.isArray(steps)) return steps
   const rows   = Number(palletCfg?.rows   ?? 4)
@@ -378,9 +854,45 @@ function regenerateMoveToPalletSteps(steps, palletCfg, palletMode) {
   const layers = Number(palletCfg?.layers ?? 1)
   const cycles = Math.max(1, rows * cols * layers)
   const mode   = palletMode === 'depalletize' ? 'depalletize' : 'palletize'
+  // 2026-08-06 palletize completeness — the modal edits vacuum I/O
+  // + transit + approach fields alongside grid/pitch. Mirror them
+  // onto the move_to_pallet step so the codegen sees them the same
+  // way the composer would have stamped them originally.
+  const _fanOut = {}
+  if (palletCfg?.vacuum_port_do !== undefined && palletCfg.vacuum_port_do !== null) {
+    _fanOut.vacuum_port_do = Number(palletCfg.vacuum_port_do)
+  }
+  if (palletCfg?.blow_off_port_do === null) {
+    _fanOut.blow_off_port_do = null
+  } else if (palletCfg?.blow_off_port_do !== undefined) {
+    const n = Number(palletCfg.blow_off_port_do)
+    _fanOut.blow_off_port_do = Number.isFinite(n) ? n : null
+  }
+  if (palletCfg?.blow_off_pulse_ms !== undefined) {
+    _fanOut.blow_off_pulse_ms = Number(palletCfg.blow_off_pulse_ms) || 300
+  }
+  if (palletCfg?.safety_margin_mm !== undefined) {
+    _fanOut.safety_margin_mm = Number(palletCfg.safety_margin_mm) || 50
+  }
+  if (palletCfg?.seal_wait_ms !== undefined) {
+    _fanOut.seal_wait_ms = Number(palletCfg.seal_wait_ms) || 500
+  }
+  if (palletCfg?.approach_distance_mm !== undefined) {
+    _fanOut.approach_distance_mm = Number(palletCfg.approach_distance_mm) || 50
+  }
+  if (palletCfg?.retract_distance_mm !== undefined) {
+    _fanOut.retract_distance_mm = Number(palletCfg.retract_distance_mm) || 50
+  }
+  if (palletCfg?.pick_approach_joints !== undefined) {
+    _fanOut.pick_approach_joints = palletCfg.pick_approach_joints
+  }
+  if (palletCfg?.place_approach_joints !== undefined) {
+    _fanOut.place_approach_joints = palletCfg.place_approach_joints
+  }
   return steps.map((s) => {
     if (s?.action === 'move_to_pallet') {
-      return { ...s, mode, pallet_phase: mode === 'palletize' ? 'place' : 'pick' }
+      return { ...s, ..._fanOut, mode,
+               pallet_phase: mode === 'palletize' ? 'place' : 'pick' }
     }
     if (s?.action === 'loop' && s.pallet_loop) {
       return {
@@ -566,14 +1078,26 @@ function PalletCornerIcon({ rows = 4, cols = 4, role = 'corner',
 }
 
 // PalletConfigEditor — modal for editing the program-level pallet
-// block (rows/cols/layers/spacing/fill order/heights + taught
-// corner TCP + taught pick/place TCP). Pre-fills from the program's
-// existing config; "Use current pose" buttons re-record TCPs from the
-// live robot. Save writes back through onSave; the parent regenerates
-// the steps + PUT's the program.
+// PARAMETERS: rows/cols/layers/spacing/fill order/heights/speed.
+// Nothing about teaching lives here.
+//
+// 2026-07-30 cleanup: taught positions were removed from this
+// modal. 2026-07-31 cleanup: the last vestige — a read-only frame-
+// status chip strip + "Teach via Teach All →" button + legacy-
+// migration notice — was also removed. Frame teach state is shown
+// on the STEP ROW (badge + Teach/Re-teach); the legacy-migration
+// nudge is now a program VALIDATION FINDING (info severity) so it
+// clears when the operator re-teaches ④, not when they read a
+// modal.
+//
+// The modal preserves any already-captured corner_tcp on save so
+// legacy programs don't lose data when re-saved through here; the
+// pallet_slots endpoint transparently migrates corner_tcp →
+// corner_a_tcp at read time.
 function PalletConfigEditor({ config, onSave, onClose }) {
   const initialMode = config?.pallet_mode === 'depalletize' ? 'depalletize' : 'palletize'
   const initialPallet = (config?.pallet && typeof config.pallet === 'object') ? config.pallet : {}
+  const initialPlace  = (config?.pallet_place && typeof config.pallet_place === 'object') ? config.pallet_place : {}
   const [mode,       setMode]       = useState(initialMode)
   const [rows,       setRows]       = useState(Number(initialPallet.rows   ?? 4))
   const [cols,       setCols]       = useState(Number(initialPallet.cols   ?? 4))
@@ -585,34 +1109,83 @@ function PalletConfigEditor({ config, onSave, onClose }) {
   const [approachH,  setApproachH]  = useState(Number(initialPallet.approach_height_mm ?? config?.pallet_approach_height_mm ?? 100))
   const [retractH,   setRetractH]   = useState(Number(initialPallet.retract_height_mm  ?? config?.pallet_retract_height_mm  ?? 200))
   const [speed,      setSpeed]      = useState(Number(config?.speed_pct ?? config?.speed ?? 60))
-  const [cornerTcp,  setCornerTcp]  = useState(initialPallet.corner_tcp || null)
-  const [pickTcp,    setPickTcp]    = useState(config?.pick_tcp || null)
-  const [placeTcp,   setPlaceTcp]   = useState(config?.place_tcp || null)
-  const [busy,       setBusy]       = useState(null)
-  const [error,      setError]      = useState(null)
+  // 2026-08-06 palletize completeness — vacuum I/O + rule-A approach.
+  // Sourced from move_to_pallet step (composer-stamped from io_map);
+  // reads through initialPallet AND from the step if present, so the
+  // modal shows what the codegen will use.
+  const _stepMTP = Array.isArray(config?.__steps)
+    ? config.__steps.find((s) => s?.action === 'move_to_pallet')
+    : null
+  const _initApproachDist  = Number(initialPallet.approach_distance_mm ?? _stepMTP?.approach_distance_mm ?? 50)
+  const _initRetractDist   = Number(initialPallet.retract_distance_mm  ?? _stepMTP?.retract_distance_mm  ?? 50)
+  const _initSafetyMargin  = Number(initialPallet.safety_margin_mm     ?? _stepMTP?.safety_margin_mm     ?? 50)
+  const _initSealWaitMs    = Number(initialPallet.seal_wait_ms         ?? _stepMTP?.seal_wait_ms         ?? 500)
+  const _initVacPort       = Number(initialPallet.vacuum_port_do       ?? _stepMTP?.vacuum_port_do       ?? 2)
+  const _initBlowRaw       = initialPallet.blow_off_port_do !== undefined
+                              ? initialPallet.blow_off_port_do
+                              : _stepMTP?.blow_off_port_do
+  const _initBlowPort      = _initBlowRaw === null || _initBlowRaw === undefined
+                              ? '' : String(_initBlowRaw)
+  const _initBlowPulseMs   = Number(initialPallet.blow_off_pulse_ms    ?? _stepMTP?.blow_off_pulse_ms    ?? 300)
+  const _initPickApprJ     = Array.isArray(initialPallet.pick_approach_joints)
+                              ? initialPallet.pick_approach_joints
+                              : (Array.isArray(_stepMTP?.pick_approach_joints)
+                                 ? _stepMTP.pick_approach_joints
+                                 : null)
+  const _initPlaceApprJ    = Array.isArray(initialPallet.place_approach_joints)
+                              ? initialPallet.place_approach_joints
+                              : (Array.isArray(_stepMTP?.place_approach_joints)
+                                 ? _stepMTP.place_approach_joints
+                                 : null)
+  const [approachDist, setApproachDist] = useState(_initApproachDist)
+  const [retractDist,  setRetractDist]  = useState(_initRetractDist)
+  const [safetyMargin, setSafetyMargin] = useState(_initSafetyMargin)
+  const [sealWaitMs,   setSealWaitMs]   = useState(_initSealWaitMs)
+  const [vacPort,      setVacPort]      = useState(_initVacPort)
+  const [blowPort,     setBlowPort]     = useState(_initBlowPort)
+  const [blowPulseMs,  setBlowPulseMs]  = useState(_initBlowPulseMs)
+  const [pickApprJ,    setPickApprJ]    = useState(_initPickApprJ)
+  const [placeApprJ,   setPlaceApprJ]   = useState(_initPlaceApprJ)
+  // Current robot joints — snapshot on Teach click for the optional
+  // pick_approach / place_approach poses. The teach model is intentionally
+  // minimal: operator jogs the arm to the desired approach angle then
+  // clicks Teach — we record joints from the store. Clear removes it
+  // (codegen falls back to axis-offset default).
+  const robotJoints = useStore((s) => s.robot?.joints)
+  // 2026-08-06 (operator directive: part-count termination). N pick-
+  // place cycles are emitted, one per part. Autofills from the PBD
+  // demo's stated quantity when the composer set `pallet.part_count`;
+  // otherwise defaults to capacity (all slots filled). Operator-
+  // editable. Warn when > capacity → will be capped at capacity by
+  // codegen; when < capacity → partial fill (fine, preferred over
+  // empty cycles per operator doctrine).
+  const _capacityInit = Math.max(1, Number(initialPallet.rows ?? 4)
+                                   * Number(initialPallet.cols ?? 4)
+                                   * Number(initialPallet.layers ?? 1))
+  const [partCount,  setPartCount]  = useState(
+    Number(initialPallet.part_count ?? _capacityInit))
 
   const cycles = Math.max(1, rows * cols * layers)
   const isDepal = mode === 'depalletize'
-
-  async function captureTcp(role) {
-    setBusy(role)
-    setError(null)
-    try {
-      const tcp = await fetchTcpFromState()
-      if (!tcp) {
-        setError('Could not read TCP from robot. Is the driver connected?')
-        return
-      }
-      if (role === 'corner') setCornerTcp(tcp)
-      else if (role === 'pick') setPickTcp(tcp)
-      else if (role === 'place') setPlaceTcp(tcp)
-    } finally {
-      setBusy(null)
-    }
-  }
+  const partCountWarning =
+    !Number.isFinite(Number(partCount)) || Number(partCount) < 1
+      ? 'Must be ≥ 1'
+      : (Number(partCount) > cycles
+         ? `${partCount} exceeds capacity ${cycles} — codegen will cap at ${cycles}`
+         : (Number(partCount) < cycles
+            ? `${partCount} of ${cycles} slots — top layer partial (fine)`
+            : ''))
 
   function commit() {
+    // Parameters-only patch. Preserve any 3-point taught frame +
+    // legacy corner_tcp / pick_tcp / place_tcp values that already
+    // sit on config — the modal no longer edits them, and re-
+    // saving here MUST NOT discard operator-authored data.
+    // Blow-off port: empty string = no pulse (null).
+    const _blowRaw = String(blowPort).trim()
+    const _blowNum = _blowRaw === '' ? null : Number(_blowRaw)
     const pallet = {
+      ...initialPallet,                                   // preserve corner_tcp + anything else
       rows: Number(rows) || 1,
       cols: Number(cols) || 1,
       layers: Number(layers) || 1,
@@ -620,17 +1193,47 @@ function PalletConfigEditor({ config, onSave, onClose }) {
       spacing_y_mm: Number(spacingY) || 0,
       layer_height_mm: Number(layerH) || 0,
       fill_order: fillOrder || 'row_lr',
-      corner_tcp: cornerTcp || { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0 },
       approach_height_mm: Number(approachH) || 0,
       retract_height_mm:  Number(retractH)  || 0,
+      part_count: Math.max(1, Number(partCount) || 1),
+      // 2026-08-06 palletize completeness — vacuum I/O + rule-A
+      // approach + transit safety margin (fanned out onto the
+      // move_to_pallet step by regenerateMoveToPalletSteps).
+      approach_distance_mm: Math.max(0, Number(approachDist) || 0),
+      retract_distance_mm:  Math.max(0, Number(retractDist)  || 0),
+      safety_margin_mm:     Math.max(0, Number(safetyMargin) || 0),
+      seal_wait_ms:         Math.max(0, Number(sealWaitMs)   || 0),
+      vacuum_port_do:       Number.isFinite(Number(vacPort))
+                             ? Number(vacPort) : 2,
+      blow_off_port_do:     Number.isFinite(_blowNum) ? _blowNum : null,
+      blow_off_pulse_ms:    Math.max(0, Number(blowPulseMs) || 0),
+      pick_approach_joints:  pickApprJ,   // null or 6-el
+      place_approach_joints: placeApprJ,
+    }
+    // pallet_place (schema-shape spec consumed by the taught-frame
+    // math) also gets its grid fields updated but its taught frame
+    // (corner_a_tcp / point_b_tcp / point_c_tcp / teach_mode) is
+    // left intact.
+    const palletPlace = {
+      ...initialPlace,
+      rows: Number(rows) || 1,
+      cols: Number(cols) || 1,
+      layers: Number(layers) || 1,
+      pitch_row_mm: Number(spacingX) || 0,
+      pitch_col_mm: Number(spacingY) || 0,
+      layer_height_mm: Number(layerH) || 0,
+      order: (fillOrder === 'col') ? 'col_major'
+           : (fillOrder === 'snake') ? 'snake'
+           : 'row_major',
     }
     onSave({
       pallet,
+      pallet_place: palletPlace,
       pallet_mode: mode,
       source: mode === 'palletize' ? 'camera_library' : 'fixed_grid',
       speed_pct: Number(speed) || 60,
-      pick_tcp:  pickTcp  || undefined,
-      place_tcp: placeTcp || undefined,
+      // NOTE: pick_tcp / place_tcp intentionally NOT re-emitted —
+      // the parent's config-spread preserves whatever is there.
     })
     onClose()
   }
@@ -641,44 +1244,6 @@ function PalletConfigEditor({ config, onSave, onClose }) {
     { value: 'col',    label: 'Columns (front → back)' },
     { value: 'snake',  label: 'Snake (alternate)' },
   ]
-
-  // Hover-title that describes what the icon is showing — useful when
-  // the convention ("robot at front") isn't obvious from the row label.
-  const iconTitle = (role) => {
-    if (mode === 'palletize' && role === 'pick')
-      return 'Pick source (camera feed) · robot R at front'
-    if (mode === 'depalletize' && role === 'place')
-      return 'Place destination (external) · robot R at front'
-    const cell = (mode === 'depalletize' && role === 'pick')
-      ? '[1,1, top layer]' : '[1,1]'
-    return `Reference corner ${cell} · fill order ${fillOrder} · robot R at front (convention)`
-  }
-
-  const tcpRow = (label, tcp, role) => (
-    <div style={{
-      display: 'flex', alignItems: 'center', gap: 8,
-      padding: '8px 10px', marginBottom: 6,
-      background: '#f8fafc', border: '1px solid #e5e7eb', borderRadius: 6,
-    }}>
-      <div title={iconTitle(role)} style={{ flexShrink: 0, lineHeight: 0 }}>
-        <PalletCornerIcon rows={rows} cols={cols}
-          role={role} mode={mode} fillOrder={fillOrder} size={36} />
-      </div>
-      <div style={{ minWidth: 110, fontSize: 11, fontWeight: 600, color: '#374151' }}>{label}</div>
-      <div style={{ flex: 1, fontSize: 11, color: tcp ? '#111' : '#9ca3af', fontFamily: 'var(--font-mono, monospace)' }}>
-        {tcp
-          ? `x=${(+tcp.x).toFixed(1)} y=${(+tcp.y).toFixed(1)} z=${(+tcp.z).toFixed(1)}  rx=${(+tcp.rx).toFixed(2)} ry=${(+tcp.ry).toFixed(2)} rz=${(+tcp.rz).toFixed(2)}`
-          : '— not taught'}
-      </div>
-      <button onClick={() => captureTcp(role)} disabled={busy === role}
-        style={{ padding: '5px 10px', fontSize: 11, fontWeight: 600,
-                 background: '#eff6ff', color: '#2563EB',
-                 border: '1px solid #bfdbfe', borderRadius: 4,
-                 cursor: busy === role ? 'wait' : 'pointer' }}>
-        {busy === role ? '...' : 'Use current pose'}
-      </button>
-    </div>
-  )
 
   return (
     <div style={{
@@ -734,34 +1299,60 @@ function PalletConfigEditor({ config, onSave, onClose }) {
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
             <Field label="Rows">
-              <input type="number" min={1} max={20} value={rows}
-                onChange={(e) => setRows(parseInt(e.target.value, 10) || 1)} style={inputStyle} />
+              <NumericField integer min={1} max={20} value={rows}
+                onCommit={setRows} style={inputStyle} aria-label="Rows" />
             </Field>
             <Field label="Cols">
-              <input type="number" min={1} max={20} value={cols}
-                onChange={(e) => setCols(parseInt(e.target.value, 10) || 1)} style={inputStyle} />
+              <NumericField integer min={1} max={20} value={cols}
+                onCommit={setCols} style={inputStyle} aria-label="Cols" />
             </Field>
             <Field label="Layers">
-              <input type="number" min={1} max={10} value={layers}
-                onChange={(e) => setLayers(parseInt(e.target.value, 10) || 1)} style={inputStyle} />
+              <NumericField integer min={1} max={10} value={layers}
+                onCommit={setLayers} style={inputStyle} aria-label="Layers" />
             </Field>
           </div>
           <div style={{ marginBottom: 6, fontSize: 11, color: '#0f766e', fontWeight: 600 }}>
-            Total slots: {cycles}
+            Total slots (capacity): {cycles}
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
-            <Field label="Spacing X (mm)">
-              <input type="number" min={0} value={spacingX}
-                onChange={(e) => setSpacingX(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+          {/* 2026-08-06 operator directive: part-count termination.
+              N pick-place cycles emit for N available parts — partial
+              top layer preferred over empty cycles. Autofilled from
+              the PBD composer when it captures "5 holes"; otherwise
+              defaults to capacity. */}
+          <div style={{ marginBottom: 12 }}>
+            <Field label={`Parts to place — number of pick-place cycles`}>
+              <NumericField integer min={1} max={999} value={partCount}
+                onCommit={setPartCount} style={inputStyle}
+                aria-label="Part count" data-testid="pallet-part-count" />
             </Field>
-            <Field label="Spacing Y (mm)">
-              <input type="number" min={0} value={spacingY}
-                onChange={(e) => setSpacingY(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+            {partCountWarning && (
+              <div style={{
+                fontSize: 11,
+                color: Number(partCount) > cycles ? '#B45309' : '#065F46',
+                marginTop: -6,
+              }}>
+                {partCountWarning}
+              </div>
+            )}
+          </div>
+
+          {/* 2026-08-05 operator doctrine ruling: pitch is
+              center-to-center between parts. Corners are the pallet's
+              physical frame corners — corner-to-corner distance is
+              geometric, not a derived pitch. Labels made explicit. */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+            <Field label="Row pitch — center-to-center between parts (mm)">
+              <NumericField integer min={0} value={spacingX}
+                onCommit={setSpacingX} style={inputStyle} aria-label="Row pitch (mm)" />
+            </Field>
+            <Field label="Column pitch — center-to-center between parts (mm)">
+              <NumericField integer min={0} value={spacingY}
+                onCommit={setSpacingY} style={inputStyle} aria-label="Column pitch (mm)" />
             </Field>
             <Field label="Layer height (mm)">
-              <input type="number" min={0} value={layerH}
-                onChange={(e) => setLayerH(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+              <NumericField integer min={0} value={layerH}
+                onCommit={setLayerH} style={inputStyle} aria-label="Layer height" />
             </Field>
           </div>
 
@@ -784,37 +1375,170 @@ function PalletConfigEditor({ config, onSave, onClose }) {
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
             <Field label="Approach height (mm)">
-              <input type="number" min={0} value={approachH}
-                onChange={(e) => setApproachH(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+              <NumericField integer min={0} value={approachH}
+                onCommit={setApproachH} style={inputStyle} aria-label="Approach height" />
             </Field>
             <Field label="Retract height (mm)">
-              <input type="number" min={0} value={retractH}
-                onChange={(e) => setRetractH(parseInt(e.target.value, 10) || 0)} style={inputStyle} />
+              <NumericField integer min={0} value={retractH}
+                onCommit={setRetractH} style={inputStyle} aria-label="Retract height" />
             </Field>
             <Field label="Speed (%)">
-              <input type="number" min={1} max={100} value={speed}
-                onChange={(e) => setSpeed(parseInt(e.target.value, 10) || 60)} style={inputStyle} />
+              <NumericField integer min={1} max={100} value={speed}
+                onCommit={setSpeed} style={inputStyle} aria-label="Speed percent" />
             </Field>
           </div>
 
-          <div style={{ marginTop: 8, marginBottom: 8, fontSize: 11, fontWeight: 700, color: '#374151' }}>
-            Taught positions
+          {/* 2026-08-06 operator directive — palletize completeness.
+              Approach distance = mm along the pose's OWN flange Z axis
+              (rule A). Safety margin sizes the transit lift above the
+              CURRENT layer (rule B — transit_Z rises per layer). */}
+          <div style={{ marginTop: 12, marginBottom: 4,
+                        fontSize: 11, fontWeight: 700,
+                        color: '#0f766e', letterSpacing: 0.5 }}>
+            APPROACH + TRANSIT
           </div>
-          {tcpRow(
-            isDepal ? 'Corner [1,1,top]' : 'Corner [1,1,1]',
-            cornerTcp, 'corner',
-          )}
-          {isDepal
-            ? tcpRow('Place TCP', placeTcp, 'place')
-            : tcpRow('Pick TCP',  pickTcp,  'pick')}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr',
+                        gap: 10 }}>
+            <Field label="Approach distance (mm) — along pose axis">
+              <NumericField integer min={0} value={approachDist}
+                onCommit={setApproachDist} style={inputStyle}
+                aria-label="Approach distance mm"
+                data-testid="pallet-approach-distance-mm" />
+            </Field>
+            <Field label="Retract distance (mm) — along pose axis">
+              <NumericField integer min={0} value={retractDist}
+                onCommit={setRetractDist} style={inputStyle}
+                aria-label="Retract distance mm"
+                data-testid="pallet-retract-distance-mm" />
+            </Field>
+            <Field label="Safety margin (mm) — transit clearance">
+              <NumericField integer min={0} value={safetyMargin}
+                onCommit={setSafetyMargin} style={inputStyle}
+                aria-label="Safety margin mm"
+                data-testid="pallet-safety-margin-mm" />
+            </Field>
+          </div>
 
-          {error && (
-            <div style={{ marginTop: 8, padding: '6px 10px', fontSize: 11,
-              background: '#fef2f2', color: '#DC2626',
-              border: '1px solid #fecaca', borderRadius: 4 }}>
-              {error}
-            </div>
-          )}
+          {/* Vacuum I/O — sourced from io_map defaults but editable per
+              program. Blow-off is optional; blank = no pulse. */}
+          <div style={{ marginTop: 12, marginBottom: 4,
+                        fontSize: 11, fontWeight: 700,
+                        color: '#0f766e', letterSpacing: 0.5 }}>
+            VACUUM I/O
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr',
+                        gap: 10 }}>
+            <Field label="Vacuum DO port">
+              <NumericField integer min={0} max={63} value={vacPort}
+                onCommit={setVacPort} style={inputStyle}
+                aria-label="Vacuum port DO number"
+                data-testid="pallet-vacuum-port-do" />
+            </Field>
+            <Field label="Seal wait (ms)">
+              <NumericField integer min={0} value={sealWaitMs}
+                onCommit={setSealWaitMs} style={inputStyle}
+                aria-label="Seal wait ms"
+                data-testid="pallet-seal-wait-ms" />
+            </Field>
+            <Field label="Blow-off DO port (blank = none)">
+              <input type="text" value={blowPort}
+                onChange={(e) => setBlowPort(e.target.value.replace(/[^0-9]/g, ''))}
+                style={inputStyle}
+                aria-label="Blow-off port DO number"
+                data-testid="pallet-blow-off-port-do" />
+            </Field>
+            <Field label="Blow-off pulse (ms)">
+              <NumericField integer min={0} value={blowPulseMs}
+                onCommit={setBlowPulseMs} style={inputStyle}
+                aria-label="Blow-off pulse ms"
+                data-testid="pallet-blow-off-pulse-ms" />
+            </Field>
+          </div>
+
+          {/* Optional teachable approach poses (rule C). Operator jogs
+              arm to the desired approach angle, clicks Teach — we
+              snapshot robot.joints. Clear removes it → codegen falls
+              back to the axis-offset default (rule A). Place approach
+              is shifted per layer by layer_height. */}
+          <div style={{ marginTop: 12, marginBottom: 4,
+                        fontSize: 11, fontWeight: 700,
+                        color: '#0f766e', letterSpacing: 0.5 }}>
+            OPTIONAL TAUGHT APPROACH POSES (RULE C)
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr',
+                        gap: 10, marginBottom: 6 }}>
+            <Field label={pickApprJ
+                    ? `Pick approach — taught (6 joints)`
+                    : 'Pick approach — using axis-offset default'}>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button
+                  onClick={() => {
+                    const j = Array.isArray(robotJoints) && robotJoints.length === 6
+                      ? robotJoints.map(Number)
+                      : null
+                    if (j) setPickApprJ(j)
+                  }}
+                  disabled={!(Array.isArray(robotJoints) && robotJoints.length === 6)}
+                  data-testid="pallet-teach-pick-approach"
+                  style={{ flex: 1, padding: '6px 10px', fontSize: 11,
+                           fontWeight: 700,
+                           background: pickApprJ ? '#065F46' : '#0369A1',
+                           color: '#fff', border: 'none',
+                           borderRadius: 4, cursor: 'pointer' }}>
+                  {pickApprJ ? 'Re-teach pick approach' : 'Teach pick approach'}
+                </button>
+                {pickApprJ && (
+                  <button onClick={() => setPickApprJ(null)}
+                    data-testid="pallet-clear-pick-approach"
+                    style={{ padding: '6px 10px', fontSize: 11,
+                             background: '#fff', color: '#B91C1C',
+                             border: '1px solid #B91C1C', borderRadius: 4,
+                             cursor: 'pointer' }}>
+                    Clear
+                  </button>
+                )}
+              </div>
+            </Field>
+            <Field label={placeApprJ
+                    ? 'Place approach — taught (6 joints, layer-shifted)'
+                    : 'Place approach — using axis-offset default'}>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button
+                  onClick={() => {
+                    const j = Array.isArray(robotJoints) && robotJoints.length === 6
+                      ? robotJoints.map(Number)
+                      : null
+                    if (j) setPlaceApprJ(j)
+                  }}
+                  disabled={!(Array.isArray(robotJoints) && robotJoints.length === 6)}
+                  data-testid="pallet-teach-place-approach"
+                  style={{ flex: 1, padding: '6px 10px', fontSize: 11,
+                           fontWeight: 700,
+                           background: placeApprJ ? '#065F46' : '#0369A1',
+                           color: '#fff', border: 'none',
+                           borderRadius: 4, cursor: 'pointer' }}>
+                  {placeApprJ ? 'Re-teach place approach' : 'Teach place approach'}
+                </button>
+                {placeApprJ && (
+                  <button onClick={() => setPlaceApprJ(null)}
+                    data-testid="pallet-clear-place-approach"
+                    style={{ padding: '6px 10px', fontSize: 11,
+                             background: '#fff', color: '#B91C1C',
+                             border: '1px solid #B91C1C', borderRadius: 4,
+                             cursor: 'pointer' }}>
+                    Clear
+                  </button>
+                )}
+              </div>
+            </Field>
+          </div>
+          <div style={{ fontSize: 11, color: '#6b7280', lineHeight: 1.4 }}>
+            Teach captures the CURRENT arm joints as the approach pose.
+            When taught, the arm moves LINEARLY from that angle onto the
+            pick/place; when cleared, the codegen offsets back along the
+            pose's own tool-Z axis by the approach distance above.
+          </div>
+
         </div>
       </div>
     </div>
@@ -1062,20 +1786,20 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
             {['X (m)', 'Y (m)', 'Z (m)'].map((lbl, i) => (
               <div key={lbl}>
                 <div style={{ fontSize: 10, color: '#6b7280', marginBottom: 2 }}>{lbl}</div>
-                <input type="number" step="0.001"
-                  value={liveTcp ? Number(liveTcp[i] ?? 0).toFixed(4) : ''}
-                  placeholder={liveTcp ? '' : '—'}
-                  onChange={(e) => updatePoseAxis(i, e.target.value)}
+                <NumericField step={0.001}
+                  value={liveTcp ? Number(Number(liveTcp[i] ?? 0).toFixed(4)) : 0}
+                  onCommit={(v) => updatePoseAxis(i, v)}
+                  aria-label={lbl}
                   style={inputStyle} />
               </div>
             ))}
             {['Rx (rad)', 'Ry (rad)', 'Rz (rad)'].map((lbl, i) => (
               <div key={lbl}>
                 <div style={{ fontSize: 10, color: '#6b7280', marginBottom: 2 }}>{lbl}</div>
-                <input type="number" step="0.01"
-                  value={liveTcp ? Number(liveTcp[i + 3] ?? 0).toFixed(4) : ''}
-                  placeholder={liveTcp ? '' : '—'}
-                  onChange={(e) => updatePoseAxis(i + 3, e.target.value)}
+                <NumericField step={0.01}
+                  value={liveTcp ? Number(Number(liveTcp[i + 3] ?? 0).toFixed(4)) : 0}
+                  onCommit={(v) => updatePoseAxis(i + 3, v)}
+                  aria-label={lbl}
                   style={inputStyle} />
               </div>
             ))}
@@ -1095,20 +1819,23 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
 
       {actionDef.fields.includes('width_mm') && (
         <Field label="Gripper Width (mm)">
-          <input type="number" value={draft.width_mm ?? 85}
-            onChange={(e) => update('width_mm', parseInt(e.target.value, 10))} style={inputStyle} />
+          <NumericField integer value={draft.width_mm ?? 85}
+            onCommit={(v) => update('width_mm', v)} style={inputStyle}
+            aria-label="Gripper width" />
         </Field>
       )}
       {actionDef.fields.includes('speed_pct') && (
         <Field label="Speed (%)">
-          <input type="number" min={1} max={100} value={draft.speed_pct ?? 80}
-            onChange={(e) => update('speed_pct', parseInt(e.target.value, 10))} style={inputStyle} />
+          <NumericField integer min={1} max={100} value={draft.speed_pct ?? 80}
+            onCommit={(v) => update('speed_pct', v)} style={inputStyle}
+            aria-label="Speed percent" />
         </Field>
       )}
       {actionDef.fields.includes('force_pct') && (
         <Field label="Force (%)">
-          <input type="number" min={1} max={100} value={draft.force_pct ?? 50}
-            onChange={(e) => update('force_pct', parseInt(e.target.value, 10))} style={inputStyle} />
+          <NumericField integer min={1} max={100} value={draft.force_pct ?? 50}
+            onCommit={(v) => update('force_pct', v)} style={inputStyle}
+            aria-label="Force percent" />
         </Field>
       )}
       {(actionDef.fields.includes('io_open') || actionDef.fields.includes('io_close')) && (
@@ -1167,27 +1894,30 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
       )}
       {actionDef.fields.includes('offset_z_mm') && (
         <Field label="Z Offset (mm above)">
-          <input type="number" value={draft.offset_z_mm ?? 150}
-            onChange={(e) => update('offset_z_mm', parseInt(e.target.value, 10))} style={inputStyle} />
+          <NumericField integer value={draft.offset_z_mm ?? 150}
+            onCommit={(v) => update('offset_z_mm', v)} style={inputStyle}
+            aria-label="Z offset (mm)" />
         </Field>
       )}
       {actionDef.fields.includes('descend_mm') && (
         <Field label="Descend (mm)">
-          <input type="number" value={draft.descend_mm ?? 130}
-            onChange={(e) => update('descend_mm', parseInt(e.target.value, 10))} style={inputStyle} />
+          <NumericField integer value={draft.descend_mm ?? 130}
+            onCommit={(v) => update('descend_mm', v)} style={inputStyle}
+            aria-label="Descend (mm)" />
         </Field>
       )}
       {actionDef.fields.includes('position') && (
         <Field label="Position X, Y, Z (m)">
           <div style={{ display: 'flex', gap: 6 }}>
             {[0, 1, 2].map((i) => (
-              <input key={i} type="number" step="0.01"
+              <NumericField key={i} step={0.01}
                 value={(draft.position || [0.3, -0.2, 0.4])[i]}
-                onChange={(e) => {
+                onCommit={(v) => {
                   const pos = [...(draft.position || [0.3, -0.2, 0.4])]
-                  pos[i] = parseFloat(e.target.value)
+                  pos[i] = v
                   update('position', pos)
                 }}
+                aria-label={['Position X', 'Position Y', 'Position Z'][i]}
                 style={{ ...inputStyle, flex: 1 }} />
             ))}
           </div>
@@ -1197,14 +1927,15 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
         <Field label="Joint Angles (deg)">
           <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
             {[0, 1, 2, 3, 4, 5].map((j) => (
-              <input key={j} type="number" step="1"
+              <NumericField key={j} step={1}
                 value={(draft.joints || [0, -90, 0, -90, 0, 0])[j]}
-                onChange={(e) => {
+                onCommit={(v) => {
                   const jts = [...(draft.joints || [0, -90, 0, -90, 0, 0])]
-                  jts[j] = parseFloat(e.target.value)
+                  jts[j] = v
                   update('joints', jts)
                 }}
                 placeholder={'J' + (j + 1)}
+                aria-label={'J' + (j + 1)}
                 style={{ ...inputStyle, width: 52, padding: '6px 4px', fontSize: 11, textAlign: 'center' }} />
             ))}
           </div>
@@ -1212,8 +1943,9 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
       )}
       {actionDef.fields.includes('duration_s') && (
         <Field label="Duration (seconds)">
-          <input type="number" step="0.5" value={draft.duration_s ?? 1}
-            onChange={(e) => update('duration_s', parseFloat(e.target.value))} style={inputStyle} />
+          <NumericField min={0} step={0.5} value={draft.duration_s ?? 1}
+            onCommit={(v) => update('duration_s', v)} style={inputStyle}
+            aria-label="Duration (seconds)" />
         </Field>
       )}
       {actionDef.fields.includes('target_part') && (
@@ -1281,12 +2013,14 @@ function StepEditor({ step, allSteps, onSave, onClose }) {
       {actionDef.fields.includes('goto') && (
         <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
           <Field label="Go to step" style={{ flex: 1 }}>
-            <input type="number" min={1} value={draft.goto ?? 1}
-              onChange={(e) => update('goto', parseInt(e.target.value, 10))} style={inputStyle} />
+            <NumericField integer min={1} value={draft.goto ?? 1}
+              onCommit={(v) => update('goto', v)} style={inputStyle}
+              aria-label="Go to step" />
           </Field>
           <Field label="Repeat count (0=infinite)" style={{ flex: 1 }}>
-            <input type="number" min={0} value={draft.count ?? 0}
-              onChange={(e) => update('count', parseInt(e.target.value, 10))} style={inputStyle} />
+            <NumericField integer min={0} value={draft.count ?? 0}
+              onCommit={(v) => update('count', v)} style={inputStyle}
+              aria-label="Repeat count" />
           </Field>
         </div>
       )}
@@ -1470,9 +2204,18 @@ const STEP_CATEGORIES = [
 
 // Default extras per action so a freshly-added step has sane defaults
 // the inline editor can show without "[object Object]" placeholders.
-function freshStepForAction(action) {
+// `programCfg` is the program's config block — used to look up
+// effector-aware labels via lib/effectorVocab so a freshly-added
+// close_gripper on a vacuum program starts labeled "Engage vacuum",
+// not the generic "Close Gripper" from ACTION_TYPES.
+function freshStepForAction(action, programCfg = null) {
   const def = ACTION_TYPES.find((a) => a.value === action) || ACTION_TYPES[0]
-  const base = { action: def.value, type: def.type, label: def.label, detail: '' }
+  const effectorLabel = paletteLabelForAction(action, programCfg)
+  const base = {
+    action: def.value, type: def.type,
+    label: effectorLabel || def.label,
+    detail: '',
+  }
   switch (action) {
     case 'open_gripper':  return { ...base, width_mm: 85, speed_pct: 80 }
     case 'close_gripper': return { ...base, force_pct: 50 }
@@ -1496,6 +2239,365 @@ function freshStepForAction(action) {
     case 'remove_defects': return base
     default:              return base
   }
+}
+
+// Modal shown when the operator adds a step whose position could
+// reuse an earlier taught pose. Two-button choice — Use same (creates
+// a linked reference via `position_ref`) or Teach new (independent
+// pose that the operator will teach separately). Both close the modal;
+// Cancel dismisses without adding a step.
+function PositionReuseModal({ action, source, onUseSame, onTeachNew, onCancel }) {
+  const kindLabel = action === 'move_home' ? 'Home'
+                  : action === 'pick'      ? 'Pick'
+                  : action === 'place'     ? 'Place'
+                  : action === 'approach'  ? 'Approach'
+                  : action === 'move_linear' ? 'Move Linear'
+                  :                            'Move'
+  const srcLabel = source?.label
+                   || (source?.action === 'move_home' ? 'Home'
+                       : source?.action || 'position')
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      style={{
+        position: 'fixed', inset: 0, zIndex: 4000,
+        background: 'rgba(15, 23, 42, 0.55)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 24,
+      }}
+      onClick={onCancel}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#fff', color: '#111827',
+          borderRadius: 12, width: '100%', maxWidth: 520,
+          boxShadow: '0 30px 80px rgba(0,0,0,0.45)',
+          overflow: 'hidden',
+        }}
+      >
+        <div style={{
+          padding: '16px 20px 8px 20px',
+          borderBottom: '1px solid #E5E7EB',
+        }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#6B7280',
+                        textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+            Add {kindLabel} step
+          </div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#111827',
+                        marginTop: 4 }}>
+            Use the same {kindLabel} position as Step {source?.id}?
+          </div>
+          <div style={{ fontSize: 13, color: '#6B7280', marginTop: 6, lineHeight: 1.4 }}>
+            &ldquo;{srcLabel}&rdquo; is already taught earlier in this program.
+            Linking the new step shares the taught pose — re-teaching Step {source?.id}
+            updates every linked step at once. Teach new gives you an
+            independent position that you&rsquo;ll teach separately.
+          </div>
+        </div>
+        <div style={{
+          padding: '14px 20px 16px 20px',
+          display: 'flex', gap: 10, justifyContent: 'flex-end',
+        }}>
+          <button
+            onClick={onCancel}
+            style={{
+              minHeight: 44, padding: '0 14px',
+              background: 'transparent', color: '#6B7280',
+              border: '1px solid #E5E7EB', borderRadius: 8,
+              fontSize: 14, fontWeight: 600, cursor: 'pointer',
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onTeachNew}
+            style={{
+              minHeight: 44, padding: '0 14px',
+              background: '#f3f4f6', color: '#111827',
+              border: '1px solid #d1d5db', borderRadius: 8,
+              fontSize: 14, fontWeight: 700, cursor: 'pointer',
+            }}
+          >
+            Teach new
+          </button>
+          <button
+            onClick={onUseSame}
+            style={{
+              minHeight: 44, padding: '0 18px',
+              background: '#2563EB', color: '#fff',
+              border: 'none', borderRadius: 8,
+              fontSize: 14, fontWeight: 700, cursor: 'pointer',
+            }}
+          >
+            Use same as Step {source?.id}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Position picker — generalizes the ea64950 "same as Step N" prompt
+// to every taught pose in the program. Two source families feed the
+// list (see collectPositionSources): taught position-type steps and
+// named entries in program.points. Linking is a SINGLE action;
+// linkStepToSource decides which ref field to set based on the
+// picked source's kind. Home's legacy "Use Step N home position"
+// button on the row still works — it routes through this same
+// linkStepToSource path.
+function PositionPickerModal({
+  step, steps, points,
+  onLink, onDeletePoint, onRenamePoint, onClose,
+}) {
+  const [renamingName, setRenamingName] = useState(null)
+  const [renameDraft, setRenameDraft]   = useState('')
+  const [query, setQuery]               = useState('')
+
+  const all = collectPositionSources(steps, points)
+  const entries = all.filter((e) => {
+    // Never offer THIS step's own position as a source — that would
+    // create a self-reference. Applies only when the picker is
+    // opened on a step-kind source.
+    if (e.kind === 'step' && step?.id != null && e.id === step.id) return false
+    if (!query) return true
+    const q = query.toLowerCase()
+    const hay = e.kind === 'step'
+      ? `${e.label || ''} ${e.action || ''} ${e.role || ''}`.toLowerCase()
+      : `${e.name} ${e.label || ''}`.toLowerCase()
+    return hay.includes(q)
+  })
+
+  // The step's CURRENT link, in whatever family it lives.
+  const currentRefId   = step?.position_ref ?? step?.linked_to_step_id ?? null
+  const currentPointNm = step?.point_name || null
+
+  function isCurrent(e) {
+    if (e.kind === 'step')  return currentRefId   === e.id
+    if (e.kind === 'point') return currentPointNm === e.name
+    return false
+  }
+  function idFor(e) { return e.kind === 'step' ? `s${e.id}` : `p${e.name}` }
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      style={{
+        position: 'fixed', inset: 0, zIndex: 4000,
+        background: 'rgba(15, 23, 42, 0.55)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 24,
+      }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#fff', color: '#111827',
+          borderRadius: 12, width: '100%', maxWidth: 620,
+          maxHeight: 'min(80vh, 720px)',
+          display: 'flex', flexDirection: 'column',
+          boxShadow: '0 30px 80px rgba(0,0,0,0.45)',
+          overflow: 'hidden',
+        }}
+      >
+        <div style={{
+          padding: '16px 20px 12px 20px',
+          borderBottom: '1px solid #E5E7EB',
+        }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#6B7280',
+                        textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+            Link to taught position
+          </div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#111827',
+                        marginTop: 4 }}>
+            Step {step?.id != null ? step.id : ''}
+            {step?.label ? <span style={{ color: '#6b7280', fontWeight: 500 }}>{' — '}{step.label}</span> : null}
+          </div>
+          <div style={{ fontSize: 13, color: '#6B7280', marginTop: 6, lineHeight: 1.4 }}>
+            Pick an existing taught position for this step. Re-teaching that
+            position later updates every step that links to it.
+          </div>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Filter by name or label…"
+            style={{
+              marginTop: 10, width: '100%', boxSizing: 'border-box',
+              padding: '8px 10px', fontSize: 13,
+              border: '1px solid #d1d5db', borderRadius: 6, outline: 'none',
+            }}
+          />
+        </div>
+
+        <div style={{
+          flex: 1, minHeight: 0, overflowY: 'auto',
+          padding: '4px 6px',
+        }}>
+          {entries.length === 0 ? (
+            <div style={{
+              padding: '28px 20px', textAlign: 'center',
+              color: '#6b7280', fontSize: 13, lineHeight: 1.5,
+            }}>
+              {all.length === 0
+                ? 'No taught positions in this program yet. Teach any step first — then every later step can link to it here.'
+                : 'No positions match this filter.'}
+            </div>
+          ) : entries.map((e) => {
+            const cur       = isCurrent(e)
+            const canDelete = e.kind === 'point' && e.refs === 0
+            const canRename = e.kind === 'point'
+            const headline  = e.kind === 'step'
+              ? (e.label || e.action || `Step ${e.id}`)
+              : e.name
+            const tagColor  = e.kind === 'step' ? '#0284c7' : '#4338ca'
+            const tagBg     = e.kind === 'step' ? '#e0f2fe' : '#eef2ff'
+            const tagBorder = e.kind === 'step' ? '#bae6fd' : '#c7d2fe'
+            return (
+              <div key={idFor(e)} style={{
+                margin: '6px 8px', padding: 12,
+                background: cur ? '#eff6ff' : '#fafafa',
+                border:     cur ? '1px solid #93c5fd' : '1px solid #e5e7eb',
+                borderRadius: 8,
+                display: 'flex', flexDirection: 'column', gap: 6,
+              }}>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+                  <span style={{
+                    fontSize: 10, fontWeight: 800,
+                    background: tagBg, color: tagColor,
+                    border: `1px solid ${tagBorder}`,
+                    borderRadius: 4, padding: '2px 6px',
+                    textTransform: 'uppercase', letterSpacing: '0.06em',
+                    flexShrink: 0,
+                  }}>{e.kind === 'step' ? `Step ${e.id}` : 'Point'}</span>
+                  {renamingName === idFor(e) ? (
+                    <input
+                      autoFocus
+                      value={renameDraft}
+                      onChange={(evt) => setRenameDraft(evt.target.value)}
+                      onKeyDown={(evt) => {
+                        if (evt.key === 'Enter') {
+                          const nn = renameDraft.trim()
+                          if (nn && nn !== e.name) onRenamePoint(e.name, nn)
+                          setRenamingName(null)
+                        } else if (evt.key === 'Escape') {
+                          setRenamingName(null)
+                        }
+                      }}
+                      onBlur={() => setRenamingName(null)}
+                      style={{
+                        fontSize: 15, fontWeight: 700,
+                        padding: '2px 8px', minWidth: 140,
+                        border: '1px solid #2563EB', borderRadius: 4,
+                        outline: 'none',
+                      }}
+                    />
+                  ) : (
+                    <span style={{
+                      fontSize: 15, fontWeight: 700, color: '#111827',
+                      fontFamily: e.kind === 'point' ? 'var(--font-mono, monospace)' : undefined,
+                    }}>{headline}</span>
+                  )}
+                  {e.kind === 'point' && e.label && renamingName !== idFor(e) && (
+                    <span style={{ fontSize: 12, color: '#6b7280' }}>
+                      &ldquo;{e.label}&rdquo;
+                    </span>
+                  )}
+                  {e.kind === 'step' && e.role && (
+                    <span style={{ fontSize: 11, color: '#6b7280',
+                                   textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                      {e.role}
+                    </span>
+                  )}
+                  <span style={{
+                    marginLeft: 'auto',
+                    fontSize: 11, fontWeight: 600, color: '#4338ca',
+                    background: '#eef2ff', border: '1px solid #c7d2fe',
+                    borderRadius: 10, padding: '2px 8px',
+                  }}>
+                    {e.refs === 0 ? (e.kind === 'point' ? 'unused' : 'only this one')
+                     : e.refs === 1 ? '1 step'
+                     :                `${e.refs} steps`}
+                  </span>
+                  {e.taught_at && (
+                    <span style={{ fontSize: 11, color: '#9ca3af' }}>
+                      taught {formatTaughtAgo(e.taught_at)}
+                    </span>
+                  )}
+                </div>
+                <div style={{
+                  fontSize: 11, color: '#374151',
+                  fontFamily: 'var(--font-mono, monospace)',
+                  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                }}>
+                  {pointJointsLine(e.joints) || <span style={{ color: '#9ca3af' }}>no joint data</span>}
+                </div>
+                <div style={{ display: 'flex', gap: 8, marginTop: 2 }}>
+                  <button
+                    onClick={() => { if (!cur) onLink(e) }}
+                    disabled={cur}
+                    style={{
+                      padding: '6px 12px', fontSize: 12, fontWeight: 700,
+                      background: cur ? '#dbeafe' : '#2563EB',
+                      color:      cur ? '#1e3a8a' : '#fff',
+                      border: 'none', borderRadius: 5,
+                      cursor: cur ? 'default' : 'pointer',
+                    }}
+                  >
+                    {cur ? '✓ Currently linked' : 'Link this step'}
+                  </button>
+                  {canRename && (
+                    <button
+                      onClick={() => { setRenamingName(idFor(e)); setRenameDraft(e.name) }}
+                      style={{
+                        padding: '6px 12px', fontSize: 12, fontWeight: 600,
+                        background: '#f3f4f6', color: '#374151',
+                        border: '1px solid #e5e7eb', borderRadius: 5, cursor: 'pointer',
+                      }}
+                    >Rename</button>
+                  )}
+                  {e.kind === 'point' && (
+                    <button
+                      onClick={() => { if (canDelete) onDeletePoint(e.name) }}
+                      disabled={!canDelete}
+                      title={canDelete ? 'Remove this taught position' : `${e.refs} step(s) still link to this position — unlink them first`}
+                      style={{
+                        padding: '6px 12px', fontSize: 12, fontWeight: 600,
+                        background: canDelete ? '#fef2f2' : '#f9fafb',
+                        color:      canDelete ? '#DC2626' : '#9ca3af',
+                        border:     canDelete ? '1px solid #fecaca' : '1px solid #e5e7eb',
+                        borderRadius: 5, cursor: canDelete ? 'pointer' : 'not-allowed',
+                      }}
+                    >Delete</button>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+
+        <div style={{
+          padding: '10px 20px 14px 20px',
+          borderTop: '1px solid #E5E7EB',
+          display: 'flex', justifyContent: 'flex-end', gap: 10,
+        }}>
+          <button
+            onClick={onClose}
+            style={{
+              minHeight: 40, padding: '0 16px',
+              background: 'transparent', color: '#6B7280',
+              border: '1px solid #E5E7EB', borderRadius: 8,
+              fontSize: 14, fontWeight: 600, cursor: 'pointer',
+            }}
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 function InsertionBar() {
@@ -1592,12 +2694,18 @@ function renumber(arr) {
 }
 
 // ────────────────────────────────────────────────────────
-// TeachOverlay — dark fullscreen overlay that replaces the prior
-// inline blue "Teaching step N" banner. Opened both by Teach All
-// and by an individual step's Teach button. Reuses the live jog
-// store actions (jog / jogCartesian / homeRobot / triggerEstop)
-// but inlines the pendant markup at the large 140×140 sizing so
-// nothing else has to be exported from ProgramLayout.
+// TeachOverlay — fullscreen overlay for the "Teach All" and per-step
+// Teach flows. Uses the SHARED HoldButton primitive from JogControls
+// (WS transport, hold_id / seq refresh, 100 ms cadence, server-side
+// keepalive with 300 ms deadman). The previous inline pendant fired
+// setInterval(sendJog, 150) → discrete HTTP POSTs to /cmd/jog_cartesian
+// with no hold_id → the driver treated each pulse as a fresh session
+// and the freshness deadman stopped motion between them (the classic
+// chatter symptom). Now routed through the same jogHold / jogRelease
+// path the main Program-tab pendant uses.
+//
+// Styling matches the rest of the app: light theme, same button/panel
+// tokens JogControls uses (white pads, #d1d5db borders, #374151 text).
 // ────────────────────────────────────────────────────────
 
 function radiansToDeg(positions) {
@@ -1605,39 +2713,37 @@ function radiansToDeg(positions) {
   return positions.slice(0, 6).map((rad) => Number(((rad || 0) * 180 / Math.PI).toFixed(2)))
 }
 
-function OverlayJogArrow({ onPress, color, label, rotation, size = 140, svgSize = 60 }) {
-  const timer = useRef(null)
-  const start = useCallback((e) => {
-    if (e && e.preventDefault) e.preventDefault()
-    onPress()
-    if (timer.current) clearInterval(timer.current)
-    timer.current = setInterval(onPress, 150)
-  }, [onPress])
-  const stop = useCallback(() => {
-    if (timer.current) { clearInterval(timer.current); timer.current = null }
-  }, [])
-  useEffect(() => () => stop(), [stop])
+// Wraps HoldButton with the overlay pendant's larger sizing and the
+// arrow SVG. Same identity-stable callback pattern the main
+// JogControls's ArrowPad uses.
+//
+// 2026-08-05 fix — accepts jogStyle from the caller (drawer reads it
+// from the shared store slice) AND wires onTap for STEP mode.
+// Pre-fix the drawer's arrow buttons only fed the hold-refresh path
+// and never provided onTap, so STEP mode was unreachable in teach
+// flows and a fast tap either produced sustained motion (before the
+// operator released) or nothing visible (server dead-man kicked in).
+function OverlayJogArrow({
+  jogStyle,
+  onTap, onPressStart, onPressTick, onPressEnd,
+  color, label, rotation, size = 140, svgSize = 60, disabled,
+}) {
   return (
-    <button
-      onMouseDown={start}
-      onMouseUp={stop}
-      onMouseLeave={(e) => { e.currentTarget.style.background = '#1C1C1F'; e.currentTarget.style.borderColor = '#2a2a30'; stop() }}
-      onMouseEnter={(e) => { e.currentTarget.style.background = color + '22'; e.currentTarget.style.borderColor = color }}
-      onTouchStart={start}
-      onTouchEnd={stop}
-      onTouchCancel={stop}
-      style={{
-        width: size, height: size, padding: 0,
-        background: '#1C1C1F', border: '1px solid #2a2a30', borderRadius: 10,
-        cursor: 'pointer', display: 'flex', flexDirection: 'column',
-        alignItems: 'center', justifyContent: 'center', gap: 4,
-        userSelect: 'none', touchAction: 'none',
-      }}>
-      <svg width={svgSize} height={svgSize} viewBox="0 0 24 24" style={{ transform: `rotate(${rotation}deg)` }}>
+    <HoldButton
+      jogStyle={jogStyle}
+      onTap={onTap}
+      onPressStart={onPressStart}
+      onPressTick={onPressTick}
+      onPressEnd={onPressEnd}
+      color={color}
+      width={size} height={size}
+      disabled={disabled}>
+      <svg width={svgSize} height={svgSize} viewBox="0 0 24 24"
+           style={{ transform: `rotate(${rotation}deg)` }}>
         <path d="M12 4l-8 8h5v8h6v-8h5z" fill={color} />
       </svg>
-      <span style={{ fontSize: 14, fontWeight: 700, color: '#cbd5e1' }}>{label}</span>
-    </button>
+      <span style={{ fontSize: 14, fontWeight: 700, color: '#374151' }}>{label}</span>
+    </HoldButton>
   )
 }
 
@@ -1645,26 +2751,219 @@ function OverlayPadCenter({ label, width = 140, height = 140 }) {
   return (
     <div style={{
       width, height,
-      background: '#0F0F12', borderRadius: 10,
+      background: '#f3f4f6', borderRadius: 8,
       display: 'flex', alignItems: 'center', justifyContent: 'center',
-      fontSize: 14, fontWeight: 700, color: '#525866',
+      fontSize: 14, fontWeight: 700, color: '#9ca3af',
     }}>{label}</div>
   )
 }
 
+// ────────────────────────────────────────────────────────
+// RecordConfirmModal — confirms the current live pose before it's
+// written into the step. The modal displays a live preview of the
+// robot's pose (joints degrees + tcp) — the store's `joints` slice
+// streams from /ws so the display refreshes as the arm moves; tcp
+// polls /api/state at 500 ms cadence.
+//
+// The actual capture happens in teachOverlayRecord which re-reads
+// /api/state at click time — so the pose the modal shows and the
+// pose that lands in the step are the same value ± sub-second
+// WS/HTTP lag. If the operator jogs while the dialog is open the
+// preview updates; when they hit Record the CURRENT live pose is
+// captured (not whatever was live at the moment the dialog opened).
+//
+// Overlay + card styling mirrors PositionReuseModal so the drawer
+// stays visually consistent with the rest of the app's confirms.
+// ────────────────────────────────────────────────────────
+function RecordConfirmModal({ stepLabel, onConfirm, onCancel }) {
+  const jointsRad = useStore((s) => s.joints?.positions) || [0, 0, 0, 0, 0, 0]
+  const jointsDeg = radiansToJointDegrees(jointsRad)
+  const [tcp, setTcp] = useState(null)
+  useEffect(() => {
+    let alive = true
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/state')
+        if (!res.ok) return
+        const d = await res.json()
+        if (alive && Array.isArray(d?.tcp_pose)) setTcp(d.tcp_pose)
+      } catch { /* nop */ }
+    }
+    poll()
+    const id = setInterval(poll, 500)
+    return () => { alive = false; clearInterval(id) }
+  }, [])
+  const jointsLine = jointsDeg.slice(0, 6)
+    .map((v, i) => `J${i + 1}:${Number(v).toFixed(2)}`).join('  ')
+  const tcpKeys = ['x', 'y', 'z', 'rx', 'ry', 'rz']
+  const tcpLine = Array.isArray(tcp)
+    ? tcp.slice(0, 6).map((v, i) => `${tcpKeys[i]}:${Number(v).toFixed(3)}`).join('  ')
+    : null
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      style={{
+        position: 'fixed', inset: 0, zIndex: 4000,
+        background: 'rgba(15, 23, 42, 0.55)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 24,
+      }}
+      onClick={onCancel}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#fff', color: '#111827',
+          borderRadius: 12, width: '100%', maxWidth: 560,
+          boxShadow: '0 30px 80px rgba(0,0,0,0.45)',
+          overflow: 'hidden',
+        }}
+      >
+        <div style={{
+          padding: '16px 20px 8px 20px',
+          borderBottom: '1px solid #E5E7EB',
+        }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#6B7280',
+                        textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+            Confirm capture
+          </div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#111827',
+                        marginTop: 4 }}>
+            Record this position?
+          </div>
+          <div style={{ fontSize: 13, color: '#6B7280', marginTop: 6, lineHeight: 1.4 }}>
+            Step: <span style={{ color: '#111827', fontWeight: 600 }}>{stepLabel}</span>.
+            The pose shown below is the arm's live position — it updates as the
+            arm moves. Pressing Record captures the CURRENT live pose.
+          </div>
+        </div>
+        <div style={{ padding: '14px 20px' }}>
+          <div style={{
+            fontFamily: 'monospace', fontSize: 12, color: '#374151',
+            background: '#f8fafc', border: '1px solid #e5e7eb', borderRadius: 6,
+            padding: '10px 12px', lineHeight: 1.6, whiteSpace: 'pre-wrap',
+          }}>
+            joints: {jointsLine}
+            {'\n'}
+            tcp:    {tcpLine || '(awaiting live tcp…)'}
+          </div>
+        </div>
+        <div style={{
+          padding: '10px 20px 16px 20px',
+          display: 'flex', gap: 10, justifyContent: 'flex-end',
+        }}>
+          <button
+            onClick={onCancel}
+            style={{
+              minHeight: 44, padding: '0 16px',
+              background: 'transparent', color: '#6B7280',
+              border: '1px solid #E5E7EB', borderRadius: 8,
+              fontSize: 14, fontWeight: 600, cursor: 'pointer',
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            style={{
+              minHeight: 44, padding: '0 22px',
+              background: '#16A34A', color: '#fff',
+              border: 'none', borderRadius: 8,
+              fontSize: 14, fontWeight: 700, cursor: 'pointer',
+            }}
+          >
+            Record
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// TeachOverlayDebugHUD (innerH/clientH/vv/drawer scrollH-clientH readout)
+// removed 2026-08-05 per operator request — the tablet-drawer layout
+// question landed in the 100dvh single-anchor fix (see the drawer's
+// height:'100dvh' comment for the resolution) and the HUD was leftover
+// instrumentation. Keep the drawerRef for a possible future re-add;
+// current mounts do not use it.
+
 function TeachOverlay({
   step, currentN, totalM, canBack,
   onRecord, onSkip, onBack, onCancel,
+  diagram,
+  counterSuffix = '',
+  // 2026-08-04: read-only observer mode. When another device
+  // owns the teach session, the overlay renders normally (so the
+  // observer can watch badges fill live) but Record + Skip are
+  // disabled. Jog is disabled by the banner-level gate elsewhere.
+  recordDisabled = false,
+  disabledReason = '',
+  // 2026-08-05 (teach_lock_banner): the shared TeachLockBanner
+  // rendered inside the overlay when another device owns the
+  // session. Fixes the fork-1 defect where the fullscreen overlay
+  // hid the editor tab's Take Over button.
+  lockBanner = null,
 }) {
-  const jog          = useStore((s) => s.jog)
-  const jogCartesian = useStore((s) => s.jogCartesian)
+  // Shared jog transport — WS-first with server-side hold keepalive.
+  // Same store actions the main Program-tab JogControls uses; the old
+  // (`s.jog` / `s.jogCartesian`) HTTP-pulse path was broken (s.jog is
+  // undefined, jogCartesian sent discrete pulses that the driver's
+  // 300 ms freshness deadman treated as start-stop chatter). See the
+  // JogControls docstring for the full rationale.
+  const jogHold          = useStore((s) => s.jogHold)
+  const jogHoldCartesian = useStore((s) => s.jogHoldCartesian)
+  const jogRelease       = useStore((s) => s.jogRelease)
+  // 2026-08-05 unify: use the same STEP dispatch verbs the main
+  // JogControls pendant uses so drawer/pendant/3D View behave
+  // identically for tap-to-step.
+  const jogIncrement      = useStore((s) => s.jogIncrement)
+  const jogPulseCartesian = useStore((s) => s.jogPulseCartesian)
+  // The shared Continuous/Step toggle (from useStore). CONTINUOUS is
+  // the release default (2026-08-03 §2); STEP is a one-click switch
+  // for fine positioning where "1mm button moves 1mm" matters.
+  const jogStyleShared    = useStore((s) => s.jogStyle) || 'CONTINUOUS'
   const homeRobot    = useStore((s) => s.homeRobot)
-  const triggerEstop = useStore((s) => s.triggerEstop)
+  // Live joint stream + driver-computed limit/headroom. Joint mode
+  // reads these to render the per-joint live angle + limit range +
+  // proximity tint. Same slices JogControls (pendant/3D-view) uses so
+  // the two views agree byte-for-byte on what the arm is doing.
+  const joints        = useStore((s) => s.joints)
+  const jointLimits   = useStore((s) => s.robot?.joint_limits)
+  // 2026-08-04 (Lesson 165): the whole robot slice for the shared
+  // JogStopBanner + LiveMarginHUD renderers. Zustand selector returns
+  // the same reference across renders when the frame hasn't changed,
+  // so this doesn't churn identity.
+  const robot         = useStore((s) => s.robot)
+  // Taught points on the currently-loaded program feed the optional
+  // Match: selector. Purely display — no motion, no auto-move.
+  const currentProgram = useStore((s) => s.currentProgram)
+  // triggerEstop used to be pulled here for a red STOP button in the
+  // drawer footer. The button was removed (redundant with TopBar's
+  // global E-STOP, and inviting panic-taps mid-hold-to-jog). Motion
+  // stopping remains release-to-stop + heartbeat deadman.
 
   const [jogMode, setJogMode] = useState('cartesian')
   const [stepSize, setStepSize] = useState(1.0)
   const [speed, setSpeed]       = useState(20)
   const [flash, setFlash]       = useState(false)
+  // Optional Match: target — a taught-point name from the current
+  // program whose joint values render as small grey targets under
+  // each live angle. null (default) = no match; live angle uses the
+  // stock proximity-tint palette. Explicit selection so the operator
+  // opts in — nothing auto-tracks or auto-moves.
+  const [matchName, setMatchName] = useState(null)
+  // Any time the operator switches the target step / cancels, reset
+  // the match so a stale target doesn't linger into the next teach.
+  useEffect(() => { setMatchName(null) }, [step?.id, step?.point_name])
+  // Confirm-before-record: opened by the footer Record Position
+  // button; RecordConfirmModal fires doRecord() on confirm. Closed on
+  // outside-click or Cancel; no capture happens on dismissal.
+  const [confirming, setConfirming] = useState(false)
+  // Drawer container ref — kept for possible future instrumentation
+  // (e.g. re-adding the layout HUD gated behind ?debug=1). Currently
+  // unused after the 2026-08-05 HUD removal; harmless.
+  const drawerRef = useRef(null)
   const stepRef  = useRef(stepSize)
   const speedRef = useRef(speed)
   const modeRef  = useRef(jogMode)
@@ -1679,14 +2978,45 @@ function TeachOverlay({
     return () => { document.body.style.overflow = prev }
   }, [])
 
-  const sendJog = useCallback((axis, direction) => {
+  // Hold callbacks that HoldButton feeds meta {hold_id, seq} into.
+  // press-start AND every 100 ms tick send the same hold:true frame —
+  // the driver interprets a hold with a matching hold_id as a refresh
+  // (no restart); a hold_id change would be a new session.
+  const holdStart = useCallback((axis, direction, meta) => {
     if (modeRef.current === 'joint') {
-      const deltaRad = direction * stepRef.current * Math.PI / 180
-      jog(axis - 1, deltaRad)
-    } else {
-      jogCartesian(axis, direction, stepRef.current, speedRef.current)
+      return jogHold(axis, direction, speedRef.current, meta)
     }
-  }, [jog, jogCartesian])
+    return jogHoldCartesian(axis, direction, speedRef.current, meta)
+  }, [jogHold, jogHoldCartesian])
+  const holdEnd = useCallback((meta) => {
+    return jogRelease(modeRef.current, meta)
+  }, [jogRelease])
+  // 2026-08-05 unify — STEP-mode tap: one increment per tap. Mirrors
+  // main JogControls.tap() (see JogControls.jsx:522) so drawer and
+  // pendant agree byte-for-byte on the STEP dispatch. Joint uses
+  // driver's time-boxed delta_deg path (angle-bounded, arm stops
+  // exactly at the delta); Cartesian uses jogPulseCartesian's fixed
+  // 150 ms mode:2 pulse (distance ≈ speed × 0.15 s; approximate but
+  // matches pendant behavior).
+  const tap = useCallback((axis, direction) => {
+    if (modeRef.current === 'joint') {
+      const deltaDeg = direction * stepRef.current
+      jogIncrement(axis, deltaDeg)
+    } else {
+      jogPulseCartesian(axis, direction, speedRef.current)
+    }
+  }, [jogIncrement, jogPulseCartesian])
+  // Wire helper: returns { onTap, onPressStart, onPressTick, onPressEnd }
+  // for a given (axis, direction). identity stability comes from the
+  // callbacks above. HoldButton fires onTap when jogStyle=='STEP',
+  // and onPressStart/Tick/End when jogStyle=='CONTINUOUS'.
+  const wire = useCallback((axis, direction) => ({
+    jogStyle:     jogStyleShared,
+    onTap:        () => tap(axis, direction),
+    onPressStart: (meta) => holdStart(axis, direction, meta),
+    onPressTick:  (meta) => holdStart(axis, direction, meta),
+    onPressEnd:   (meta) => holdEnd(meta),
+  }), [holdStart, holdEnd, tap, jogStyleShared])
 
   const recording = useRef(false)
   async function doRecord() {
@@ -1700,70 +3030,92 @@ function TeachOverlay({
   }
 
   const stepLabel = step?.label || step?.action || 'Position'
-  const stepInstruction = 'Jog the robot to the desired position, then press Record.'
+  const stepInstruction = 'Jog the robot to the desired position, then press Record Position.'
 
-  // Viewport-driven sizing — the spec asks for larger D-pads on wide
-  // screens (>1400 px) and the existing fullscreen size as the floor on
-  // smaller tablets (<1100 px). Tracking on a single state var means a
-  // window resize re-renders with the right metrics.
+  // Viewport-driven sizing. Width AND height both matter: a landscape
+  // 1840×1080 tablet is not "tablet width" (fits desktop layout) yet
+  // the vertical envelope after header+banner+Home bar+footer leaves
+  // only ~640 px for the jog grid — desktop-size 140 px buttons
+  // stacked 3-high plus gaps blows past that. Sizing therefore falls
+  // back on whichever dimension is tighter. Tracking on state so
+  // resize re-renders with the right metrics.
   const [vw, setVw] = useState(() => (
-    typeof window !== 'undefined' ? window.innerWidth : 1280))
+    typeof window !== 'undefined' ? window.innerWidth  : 1280))
+  const [vh, setVh] = useState(() => (
+    typeof window !== 'undefined' ? window.innerHeight : 800))
   useEffect(() => {
-    const onResize = () => setVw(window.innerWidth)
+    const onResize = () => { setVw(window.innerWidth); setVh(window.innerHeight) }
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
   }, [])
-  // Three tiers — tablet (≤ 1280 CSS px landscape ONN 11"), narrow
-  // laptop, desktop. The previous two-tier scheme bottomed out at a
-  // 140 px d-pad which overflowed the tablet's 1200 px viewport
-  // (three 3×3 grids of 140 px + gaps + padding ≈ 1472 px).
-  const isWide   = vw > 1400
-  const isTabletW = vw <= 1280
-  const padBtn      = isTabletW ? 96  : isWide ? 160 : 140
-  const svgPx       = isTabletW ? 42  : isWide ?  72 :  60
-  const padGap      = isTabletW ? 10  : 14
-  const groupGap    = isTabletW ? 24  : 40
-  const actionH     = isTabletW ? 56  : isWide ?  78 :  68
-  const actionFont  = isTabletW ? 14  : isWide ?  18 :  16
-  const modeBtnH    = isTabletW ? 48  : isWide ?  64 :  56
-  const modeBtnFont = isTabletW ? 14  : isWide ?  17 :  16
+  // Layout budget arithmetic — shared with the pinned no-scroll
+  // test at lib/teachLayout.js. Do NOT recompute inline here; the
+  // pin exists precisely to catch drift between what renders and
+  // what the test evaluates.
+  const {
+    isWide, isTabletW, padBtn, hideSectionLabels,
+    svgPx, padGap, groupGap, modeBtnH, modeBtnFont,
+    diagramPanelWidth,
+  } = teachLayoutMetrics({ vw, vh })
 
   const modeBtn = (on) => ({
     padding: '0 26px', minHeight: modeBtnH, fontSize: modeBtnFont, fontWeight: 700,
-    background: on ? '#2F7FFF' : '#1C1C1F',
-    color:      on ? '#fff'    : '#cbd5e1',
-    border:     on ? 'none'    : '1px solid #2a2a30',
+    background: on ? '#2563EB' : '#fff',
+    color:      on ? '#fff'    : '#374151',
+    border:     on ? 'none'    : '1px solid #d1d5db',
     borderRadius: 8, cursor: 'pointer', flex: '0 0 auto',
   })
 
-  const actionBtn = (variant) => {
-    const base = {
-      minHeight: actionH, padding: '0 22px',
-      fontSize: actionFont, fontWeight: 700,
-      borderRadius: 10, cursor: 'pointer',
-      flex: '1 1 0', minWidth: 120,
-    }
-    if (variant === 'estop') {
-      return {
-        ...base,
-        background: '#DC2626', color: '#fff',
-        border: 'none', fontWeight: 800, letterSpacing: '0.5px',
-      }
-    }
-    return {
-      ...base,
-      background: '#1C1C1F', color: '#cbd5e1',
-      border: '1px solid #2a2a30',
-    }
-  }
+  // actionBtn() lived here for the (removed) STOP + Home row inside
+  // the controls area. Home is now its own in-flow bar and STOP is
+  // gone entirely — no callers left. Deleted.
 
   // M and N are 1-based per the spec.
   const progressPct = totalM > 0 ? ((currentN - 1) / totalM) * 100 : 0
 
+  // Match: selector menu. Enumerate the current program's taught
+  // points, sorted by taught_at so the list reads in the order the
+  // operator built the program (most-recent last matches muscle
+  // memory). Exclude the point currently being (re-)taught — matching
+  // to your own step would compare to a stale snapshot of itself.
+  const matchablePoints = (() => {
+    const pts = currentProgram?.points || {}
+    const excludeName = step?.point_name || null
+    const out = []
+    for (const [name, p] of Object.entries(pts)) {
+      if (name === excludeName) continue
+      if (!Array.isArray(p?.joints) || p.joints.length < 6) continue
+      out.push({ name, label: p?.label || name, joints: p.joints, taught_at: p?.taught_at || 0 })
+    }
+    out.sort((a, b) => (a.taught_at || 0) - (b.taught_at || 0))
+    return out
+  })()
+  const matchPoint = matchName
+    ? matchablePoints.find((p) => p.name === matchName) || null
+    : null
+  const showMatchSelector = jogMode === 'joint' && matchablePoints.length > 0
+
+  // Vertical budget check: drop the limits line when the tablet layout
+  // is tight (same threshold that already hides the "Position/Height/
+  // Rotation" section labels in Cartesian mode). Live angle NEVER
+  // drops — that's the operator's primary readout during matching.
+  const showJointLimits = !hideSectionLabels
+
   return (
-    <div style={{
-      position: 'fixed', inset: 0, zIndex: 1000,
-      background: '#0A0A0B', color: '#e5e7eb',
+    <div ref={drawerRef} style={{
+      // Anchor the drawer to the visible viewport with a plain
+      // `100dvh`. Chromium 108+ (the tablet's Android Chrome) resolves
+      // dvh against the CURRENT visible viewport — URL bar showing OR
+      // collapsed — so the footer stays reachable in either state.
+      // The earlier "vh with dvh maxHeight" pair drifted whenever the
+      // two disagreed; a single dvh anchor is simpler and matches
+      // what the operator sees. viewport-fit=cover in index.html
+      // means bottom:0 is at the physical device edge; the footer's
+      // own padding handles safe-area avoidance below.
+      position: 'fixed', top: 0, left: 0, right: 0,
+      height: '100dvh',
+      zIndex: 1000,
+      background: '#f8fafc', color: '#111827',
       display: 'flex', flexDirection: 'column',
       userSelect: 'none',
       overflowX: 'hidden',
@@ -1771,55 +3123,107 @@ function TeachOverlay({
       {/* HEADER */}
       <div style={{
         height: 60, flexShrink: 0,
-        background: '#141416', borderBottom: '1px solid #2a2a30',
+        background: '#fff', borderBottom: '1px solid #e5e7eb',
         display: 'flex', alignItems: 'center',
         padding: isTabletW ? '0 14px' : '0 22px',
         gap: 16,
       }}>
         <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-          <div style={{ fontSize: 14, fontWeight: 600, color: '#9ca3af', letterSpacing: '0.04em' }}>
-            TEACHING  •  Step {currentN} of {totalM}
+          <div style={{ fontSize: 14, fontWeight: 600, color: '#6b7280', letterSpacing: '0.04em' }}>
+            TEACHING  •  Step {currentN} of {totalM}{counterSuffix}
           </div>
-          <div style={{ fontSize: 18, fontWeight: 700, color: '#fff', marginTop: 2 }}>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginTop: 2 }}>
             {stepLabel}
           </div>
         </div>
         <div style={{ flex: 1 }} />
+        {/* Move to home — top-right beside Cancel. Same store action
+            + safety gates as the pendant's Home; the previous
+            full-width bar between the grid and the footer was
+            reclaiming a whole row of tablet vertical space for a
+            secondary action. Compact chip is enough. */}
+        <button onClick={homeRobot}
+          style={{
+            minHeight: 44, padding: '0 14px',
+            fontSize: 14, fontWeight: 600,
+            background: '#fff', color: '#374151',
+            border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
+          }}>
+          ⌂ Move to home
+        </button>
         <button onClick={onCancel}
           style={{
             minHeight: 44, minWidth: 64, padding: '0 16px',
             fontSize: 14, fontWeight: 600,
-            background: 'transparent', color: '#9ca3af',
+            background: 'transparent', color: '#6b7280',
             border: 'none', cursor: 'pointer',
           }}>
           Cancel
         </button>
       </div>
 
+      {/* 2026-08-05 (teach_lock_banner): sit the lock banner ABOVE
+          the instruction band so it's the first thing the operator
+          sees on entry to a locked session. Renders only when the
+          caller passed a `lockBanner` slot (empty otherwise). */}
+      {lockBanner}
+
       {/* INSTRUCTION BAND */}
       <div style={{
         height: 48, flexShrink: 0,
-        background: '#1C1C1F', borderBottom: '1px solid #0A0A0B',
+        background: '#eff6ff', borderBottom: '1px solid #bfdbfe',
         display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 22px',
       }}>
-        <div style={{ fontSize: 15, color: '#9ca3af', textAlign: 'center' }}>
+        <div style={{ fontSize: 15, color: '#1e40af', textAlign: 'center' }}>
           {stepInstruction}
         </div>
       </div>
 
-      {/* JOG CONTROLS — fills the full area between instruction band and
-          footer. Vertical layout: mode toggle row → speed/step row →
-          main control area (D-pads, takes the rest) → action buttons. */}
+      {/* 2026-08-04 (Lesson 165) — driver-initiated stop cause + live
+          joint-margin HUD, rendered on the teach overlay via the shared
+          canonical components. Fork registry: `jog_stop_cause_propagation`. */}
+      <div style={{ padding: '8px 22px 0 22px', flexShrink: 0 }}>
+        <JogStopBanner robot={robot} />
+        <LiveMarginHUD robot={robot} />
+      </div>
+
+      {/* Passive frame-warning banner retired (§465 fork-1 kill,
+          2026-08-04). Findings surface via toast at (a) Record —
+          via palletTeachRecord's call to validatePalletFrameServer —
+          and (b) teach-complete / handleSave, never as a passive
+          overlay against mid-re-teach state. */}
+
+      {/* JOG + DIAGRAM ROW — flex-row so the diagram docks BESIDE
+          the jog pads, not above them. Keeps every jog button + the
+          footer's Record Position visible without scroll at 1920×1080,
+          1366×768, and the ONN tablet's landscape resolution — the
+          operator-rule invariant. Diagram omitted → jog area takes
+          the full width (non-pallet steps: layout unchanged). */}
+      <div
+        data-testid="teach-body-row"
+        style={{
+          flex: 1, minHeight: 0,
+          display: 'flex', flexDirection: 'row',
+          overflow: 'hidden',
+        }}>
+      {/* JOG CONTROLS — no internal scroll (mid-hold scrolling on a
+          touch device is how accidental jogs happen), no vertical
+          centering (justify-center + tall content clips off the TOP
+          of the container in some engines). Content sits top-aligned
+          and the height-responsive padBtn above guarantees fit. */}
       <div style={{
-        width: '100%', height: '100%',
-        flex: 1, minHeight: 0,
-        background: '#0A0A0B',
+        flex: 1, minWidth: 0, minHeight: 0,
+        background: '#f8fafc',
         display: 'flex', flexDirection: 'column',
-        justifyContent: 'center', alignItems: 'center',
-        padding: isTabletW ? 12 : 24, gap: isTabletW ? 12 : 18,
-        overflowX: 'hidden', overflowY: 'auto',
+        justifyContent: 'flex-start', alignItems: 'center',
+        padding: isTabletW ? 12 : 20, gap: isTabletW ? 12 : 16,
+        overflow: 'hidden',
       }}>
-        {/* Mode toggle row — flex 0 0 auto. */}
+        {/* Mode toggle row. When Joint mode is active and the program
+            has taught points, an inline Match: selector appears at the
+            right — pick a taught position and its joint values render
+            as small grey targets under each live angle, live angle
+            tints green within 0.5°. No motion; pure display. */}
         <div style={{
           flex: '0 0 auto',
           display: 'flex', gap: 12, alignItems: 'center',
@@ -1829,9 +3233,35 @@ function TeachOverlay({
           <button onClick={() => setJogMode('joint')}     style={modeBtn(jogMode === 'joint')}>Joint</button>
           <button disabled title="Tool frame jogging requires URDF — coming soon"
             style={{ ...modeBtn(false), opacity: 0.45, cursor: 'not-allowed' }}>Tool</button>
+          {showMatchSelector && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              marginLeft: 8, flex: '0 0 auto',
+            }}>
+              <label style={{
+                fontSize: 13, color: '#374151', fontWeight: 600,
+              }}>Match:</label>
+              <select
+                value={matchName || ''}
+                onChange={(e) => setMatchName(e.target.value || null)}
+                style={{
+                  minHeight: modeBtnH, fontSize: 14,
+                  padding: '0 10px', borderRadius: 8,
+                  border: '1px solid #d1d5db', background: '#fff',
+                  color: '#111827', cursor: 'pointer',
+                  maxWidth: 220,
+                }}
+              >
+                <option value="">— none —</option>
+                {matchablePoints.map((p) => (
+                  <option key={p.name} value={p.name}>{p.label}</option>
+                ))}
+              </select>
+            </div>
+          )}
         </div>
 
-        {/* Speed + step row — flex 0 0 auto. */}
+        {/* Speed + step row */}
         <div style={{
           flex: '0 0 auto',
           width: '100%',
@@ -1839,19 +3269,19 @@ function TeachOverlay({
           justifyContent: 'space-evenly', flexWrap: 'wrap',
         }}>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-            <span style={{ fontSize: 13, color: '#9ca3af' }}>Step:</span>
+            <span style={{ fontSize: 13, color: '#6b7280' }}>Step:</span>
             {[0.1, 0.5, 1, 5, 10].map((s) => (
               <button key={s} onClick={() => setStepSize(s)} style={{
                 padding: '10px 14px', minHeight: 44,
                 fontSize: 13, fontWeight: 600, borderRadius: 6, cursor: 'pointer',
-                background: stepSize === s ? '#2F7FFF' : '#1C1C1F',
-                color:      stepSize === s ? '#fff'    : '#cbd5e1',
-                border:     stepSize === s ? 'none'    : '1px solid #2a2a30',
+                background: stepSize === s ? '#2563EB' : '#fff',
+                color:      stepSize === s ? '#fff'    : '#374151',
+                border:     stepSize === s ? 'none'    : '1px solid #d1d5db',
               }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
             ))}
           </div>
           <div style={{ flex: 1, minWidth: 240, maxWidth: 520 }}>
-            <div style={{ fontSize: 12, color: '#9ca3af', marginBottom: 2 }}>Speed: {speed}%</div>
+            <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 2 }}>Speed: {speed}%</div>
             <input type="range" min={1} max={100} value={speed}
               onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
               style={{ width: '100%', height: 8 }} />
@@ -1871,7 +3301,9 @@ function TeachOverlay({
           {jogMode === 'cartesian' ? (
             <>
               <div style={{ flex: '0 1 auto' }}>
-                <div style={{ fontSize: 12, color: '#9ca3af', textAlign: 'center', marginBottom: 6 }}>Position</div>
+                {!hideSectionLabels && (
+                  <div style={{ fontSize: 12, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>Position</div>
+                )}
                 <div style={{
                   display: 'grid',
                   gridTemplateColumns: `repeat(3, ${padBtn}px)`,
@@ -1879,22 +3311,26 @@ function TeachOverlay({
                   gridTemplateAreas: '". up ." "left center right" ". down ."',
                   gap: padGap,
                 }}>
-                  <div style={{ gridArea: 'up' }}>    <OverlayJogArrow onPress={() => sendJog('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} svgSize={svgPx} /></div>
-                  <div style={{ gridArea: 'left' }}>  <OverlayJogArrow onPress={() => sendJog('x', -1)} rotation={-90} label="X−" color="#DC2626" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'up' }}>    <OverlayJogArrow {...wire('y',  1)} rotation={0}   label="Y+" color="#16A34A" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'left' }}>  <OverlayJogArrow {...wire('x', -1)} rotation={-90} label="X−" color="#DC2626" size={padBtn} svgSize={svgPx} /></div>
                   <div style={{ gridArea: 'center' }}><OverlayPadCenter label="XY" width={padBtn} height={padBtn} /></div>
-                  <div style={{ gridArea: 'right' }}> <OverlayJogArrow onPress={() => sendJog('x',  1)} rotation={90}  label="X+" color="#DC2626" size={padBtn} svgSize={svgPx} /></div>
-                  <div style={{ gridArea: 'down' }}>  <OverlayJogArrow onPress={() => sendJog('y', -1)} rotation={180} label="Y−" color="#16A34A" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'right' }}> <OverlayJogArrow {...wire('x',  1)} rotation={90}  label="X+" color="#DC2626" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'down' }}>  <OverlayJogArrow {...wire('y', -1)} rotation={180} label="Y−" color="#16A34A" size={padBtn} svgSize={svgPx} /></div>
                 </div>
               </div>
               <div style={{ flex: '0 1 auto' }}>
-                <div style={{ fontSize: 12, color: '#9ca3af', textAlign: 'center', marginBottom: 6 }}>Height</div>
+                {!hideSectionLabels && (
+                  <div style={{ fontSize: 12, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>Height</div>
+                )}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: padGap, width: padBtn }}>
-                  <OverlayJogArrow onPress={() => sendJog('z',  1)} rotation={0}   label="Z+" color="#3B82F6" size={padBtn} svgSize={svgPx} />
-                  <OverlayJogArrow onPress={() => sendJog('z', -1)} rotation={180} label="Z−" color="#3B82F6" size={padBtn} svgSize={svgPx} />
+                  <OverlayJogArrow {...wire('z',  1)} rotation={0}   label="Z+" color="#3B82F6" size={padBtn} svgSize={svgPx} />
+                  <OverlayJogArrow {...wire('z', -1)} rotation={180} label="Z−" color="#3B82F6" size={padBtn} svgSize={svgPx} />
                 </div>
               </div>
               <div style={{ flex: '0 1 auto' }}>
-                <div style={{ fontSize: 12, color: '#9ca3af', textAlign: 'center', marginBottom: 6 }}>Rotation</div>
+                {!hideSectionLabels && (
+                  <div style={{ fontSize: 12, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>Rotation</div>
+                )}
                 <div style={{
                   display: 'grid',
                   gridTemplateColumns: `repeat(3, ${padBtn}px)`,
@@ -1902,98 +3338,469 @@ function TeachOverlay({
                   gridTemplateAreas: '". rxp ." "rzn center rzp" ". rxn ."',
                   gap: padGap,
                 }}>
-                  <div style={{ gridArea: 'rxp' }}>   <OverlayJogArrow onPress={() => sendJog('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} svgSize={svgPx} /></div>
-                  <div style={{ gridArea: 'rzn' }}>   <OverlayJogArrow onPress={() => sendJog('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'rxp' }}>   <OverlayJogArrow {...wire('rx',  1)} rotation={0}   label="Rx+" color="#9333EA" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'rzn' }}>   <OverlayJogArrow {...wire('rz', -1)} rotation={-90} label="Rz−" color="#CA8A04" size={padBtn} svgSize={svgPx} /></div>
                   <div style={{ gridArea: 'center' }}><OverlayPadCenter label="Rot" width={padBtn} height={padBtn} /></div>
-                  <div style={{ gridArea: 'rzp' }}>   <OverlayJogArrow onPress={() => sendJog('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" size={padBtn} svgSize={svgPx} /></div>
-                  <div style={{ gridArea: 'rxn' }}>   <OverlayJogArrow onPress={() => sendJog('rx', -1)} rotation={180} label="Rx−" color="#9333EA" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'rzp' }}>   <OverlayJogArrow {...wire('rz',  1)} rotation={90}  label="Rz+" color="#CA8A04" size={padBtn} svgSize={svgPx} /></div>
+                  <div style={{ gridArea: 'rxn' }}>   <OverlayJogArrow {...wire('rx', -1)} rotation={180} label="Rx−" color="#9333EA" size={padBtn} svgSize={svgPx} /></div>
                 </div>
               </div>
             </>
           ) : (
-            [1, 2, 3, 4, 5, 6].map((j) => (
-              <div key={j} style={{
-                flex: '0 1 auto',
-                display: 'flex', flexDirection: 'column',
-                alignItems: 'center', gap: padGap,
-              }}>
-                <div style={{ fontSize: 16, fontWeight: 700, color: '#cbd5e1' }}>{'J' + j}</div>
-                <OverlayJogArrow onPress={() => sendJog(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={padBtn} svgSize={svgPx} />
-                <OverlayJogArrow onPress={() => sendJog(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={padBtn} svgSize={svgPx} />
-              </div>
-            ))
+            [1, 2, 3, 4, 5, 6].map((j) => {
+              // Live angle: radians → degrees, one decimal. tabular-
+              // nums keeps digits from jittering at 25 Hz.
+              const posRad = joints?.positions?.[j - 1]
+              const angleDeg = Number.isFinite(posRad)
+                ? (posRad * 180 / Math.PI) : null
+              // Driver-computed per-joint {limit_deg, headroom_deg}
+              // — same slice JogControls (pendant/3D-view) reads.
+              // Never hardcoded; if the driver hasn't broadcast yet
+              // the limits line simply doesn't render.
+              const jl = (jointLimits || []).find((x) => x?.joint === j)
+              const limitDeg = Number.isFinite(jl?.limit_deg)
+                ? jl.limit_deg : null
+              const headroom = Number.isFinite(jl?.headroom_deg)
+                ? jl.headroom_deg : null
+              // Optional Match: target (small grey number under the
+              // live angle). Green tint on the LIVE angle when within
+              // 0.5° of the target — dial-to-green replaces the
+              // photo-and-compare workflow.
+              const targetDeg = matchPoint
+                ? Number(matchPoint.joints?.[j - 1]) : null
+              const hasTarget  = Number.isFinite(targetDeg)
+              const matched    = hasTarget && angleDeg != null
+                && Math.abs(angleDeg - targetDeg) <= 0.5
+              // Proximity tint: red ≤3° headroom, amber ≤10°, green
+              // when Match is on and within tolerance. Match-green
+              // wins over headroom-amber because the operator's
+              // active task is "hit the target"; approaching the
+              // hardware limit is a background caution.
+              let angleColor = '#111827'
+              if (headroom != null) {
+                if (headroom <= 3)       angleColor = '#DC2626'
+                else if (headroom <= 10) angleColor = '#d97706'
+              }
+              if (matched) angleColor = '#16A34A'
+              return (
+                <div key={j} style={{
+                  flex: '0 1 auto',
+                  display: 'flex', flexDirection: 'column',
+                  alignItems: 'center', gap: padGap,
+                }}>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: '#374151' }}>{'J' + j}</div>
+                  <div style={{
+                    fontSize: 18, fontWeight: 700, color: angleColor,
+                    fontVariantNumeric: 'tabular-nums',
+                    minHeight: 20, lineHeight: 1,
+                  }}>
+                    {angleDeg != null ? `${angleDeg.toFixed(1)}°` : '—'}
+                  </div>
+                  {hasTarget && (
+                    <div style={{
+                      fontSize: 12, fontWeight: 600,
+                      color: matched ? '#16A34A' : '#9ca3af',
+                      fontVariantNumeric: 'tabular-nums',
+                      lineHeight: 1,
+                    }}>
+                      {`${targetDeg.toFixed(1)}°`}
+                    </div>
+                  )}
+                  <OverlayJogArrow {...wire(j,  1)} rotation={0}   label={'+J' + j} color="#16A34A" size={padBtn} svgSize={svgPx} />
+                  <OverlayJogArrow {...wire(j, -1)} rotation={180} label={'−J' + j} color="#DC2626" size={padBtn} svgSize={svgPx} />
+                  {showJointLimits && limitDeg != null && (
+                    <div style={{
+                      fontSize: 11, color: '#9ca3af',
+                      fontVariantNumeric: 'tabular-nums',
+                      whiteSpace: 'nowrap', lineHeight: 1,
+                    }}>
+                      {`−${limitDeg.toFixed(0)}° … +${limitDeg.toFixed(0)}°`}
+                    </div>
+                  )}
+                </div>
+              )
+            })
           )}
         </div>
 
-        {/* Action buttons row — flex 0 0 auto. Run/Pause/Teach belong on
-            the program tab, not while teaching; here we surface Home and
-            STOP at the larger fullscreen sizing. */}
-        <div style={{
-          flex: '0 0 auto',
-          width: '100%',
-          display: 'flex', gap: 16,
-          justifyContent: 'space-evenly',
-        }}>
-          <button onClick={homeRobot} style={actionBtn('default')}>Home</button>
-          <button onClick={triggerEstop} style={actionBtn('estop')}>STOP</button>
-        </div>
+      </div>
+      {/* DIAGRAM SIDE PANEL — docked right of the jog pads. Width
+          responsive: 300px on wide desktop, 240px on tablet
+          landscape (vw ≤ 1280). Panel is flex 0 0 auto so its width
+          is fixed and the jog area gets exactly the remaining
+          horizontal space. NEVER pushes any jog button below the
+          viewport — the horizontal split does the work. */}
+      {diagram && (
+        <aside
+          data-testid="pallet-diagram-side"
+          style={{
+            flex: `0 0 ${diagramPanelWidth}px`,
+            minWidth: 0,
+            background: '#fff',
+            borderLeft: '1px solid #e5e7eb',
+            padding: isTabletW ? '10px 12px' : '14px 16px',
+            display: 'flex', flexDirection: 'column',
+            alignItems: 'center', justifyContent: 'flex-start',
+            overflow: 'hidden',
+          }}>
+          {diagram}
+        </aside>
+      )}
       </div>
 
-      {/* FOOTER */}
+      {/* STICKY FOOTER — Back (multi-pose only) + Record Position
+          + Skip (multi-pose only). Standard slim bar: 48 px button
+          height, 8 px vertical padding, safe-area padding sized to
+          just clear the Android gesture home indicator (~20 px on
+          the ONN tablet) instead of the earlier 48-px-floor hero
+          band that was consuming close to a quarter of the viewport.
+          No motion-stop button here — motion stopping is release-to-
+          stop + the driver's 300 ms deadman + TopBar's global E-STOP.
+          Progress bar is pinned to the very bottom of this row. */}
+      {/* 3-column grid keeps Record Position horizontally centered
+          regardless of whether Back / Skip are present. Left cell:
+          Back or empty. Center: Record Position (self-justified to
+          center). Right: Skip or empty. Column widths are fluid but
+          the outer two are min-content — the center gets the natural
+          center of the whole row. */}
       <div style={{
-        height: 100, flexShrink: 0,
-        background: '#141416', borderTop: '1px solid #2a2a30',
-        display: 'flex', alignItems: 'center', padding: '0 22px', gap: 16,
+        flexShrink: 0,
+        background: '#fff', borderTop: '1px solid #e5e7eb',
+        display: 'grid',
+        gridTemplateColumns: '1fr auto 1fr',
+        alignItems: 'center',
+        padding: '8px 16px',
+        // Safe-area floor of 12 px is enough for the Android gesture
+        // indicator on the target tablet; iOS notched devices' larger
+        // env value takes over via the max().
+        paddingBottom: 'calc(max(env(safe-area-inset-bottom, 0px), 12px) + 8px)',
+        columnGap: 10,
         position: 'relative',
       }}>
-        <div style={{ flex: 1, display: 'flex', justifyContent: 'flex-start' }}>
-          {canBack ? (
+        <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
+          {canBack && (
             <button onClick={onBack} style={{
-              minHeight: 56, padding: '0 22px',
-              fontSize: 15, fontWeight: 700,
-              background: 'transparent', color: '#cbd5e1',
-              border: '1px solid #2a2a30', borderRadius: 10, cursor: 'pointer',
+              height: 48, padding: '0 16px',
+              fontSize: 14, fontWeight: 600,
+              background: '#fff', color: '#374151',
+              border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
             }}>← Back</button>
-          ) : null}
+          )}
         </div>
 
-        <div style={{ flex: 2, display: 'flex', justifyContent: 'center' }}>
-          <button
-            onClick={doRecord}
-            onTouchStart={(e) => { e.preventDefault() }}
-            onTouchEnd={(e) => { e.preventDefault(); doRecord() }}
-            style={{
-              height: 72, minWidth: 280, padding: '0 36px',
-              fontSize: 20, fontWeight: 800, letterSpacing: '0.5px',
-              background: flash ? '#fff' : '#00C47A',
-              color:      flash ? '#00C47A' : '#fff',
-              border: 'none', borderRadius: 12, cursor: 'pointer',
-              transition: 'background 100ms, color 100ms',
-            }}>
-            {flash ? '✓ RECORDED' : 'RECORD POSITION'}
-          </button>
-        </div>
+        <button
+          data-testid="teach-record-position"
+          disabled={recordDisabled}
+          title={recordDisabled ? disabledReason : undefined}
+          onClick={() => { if (!recordDisabled) setConfirming(true) }}
+          onTouchStart={(e) => { e.preventDefault() }}
+          onTouchEnd={(e) => {
+            e.preventDefault()
+            if (!recordDisabled) setConfirming(true)
+          }}
+          style={{
+            height: 48,
+            padding: '0 24px',
+            fontSize: 15, fontWeight: 700, letterSpacing: '0.3px',
+            background: recordDisabled ? '#e5e7eb'
+                      : flash ? '#fff' : '#16A34A',
+            color:      recordDisabled ? '#9ca3af'
+                      : flash ? '#16A34A' : '#fff',
+            border: flash ? '2px solid #16A34A' : 'none',
+            borderRadius: 8,
+            cursor: recordDisabled ? 'not-allowed' : 'pointer',
+            transition: 'background 100ms, color 100ms',
+            justifySelf: 'center',
+          }}>
+          {recordDisabled ? 'Record disabled — observing'
+            : flash ? '✓ Recorded' : 'Record Position'}
+        </button>
 
-        <div style={{ flex: 1, display: 'flex', justifyContent: 'flex-end' }}>
-          <button onClick={onSkip} style={{
-            minHeight: 56, padding: '0 22px',
-            fontSize: 15, fontWeight: 700,
-            background: 'transparent', color: '#cbd5e1',
-            border: '1px solid #2a2a30', borderRadius: 10, cursor: 'pointer',
-          }}>Skip →</button>
+        <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+          {totalM > 1 && (
+            <button onClick={onSkip} style={{
+              height: 48, padding: '0 16px',
+              fontSize: 14, fontWeight: 600,
+              background: '#fff', color: '#374151',
+              border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
+            }}>Skip this pose →</button>
+          )}
         </div>
 
         {/* Progress bar pinned to the very bottom */}
         <div style={{
           position: 'absolute', left: 0, right: 0, bottom: 0,
-          height: 4, background: '#1C1C1F',
+          height: 4, background: '#e5e7eb',
         }}>
           <div style={{
             height: '100%', width: progressPct + '%',
-            background: '#2F7FFF', transition: 'width 200ms',
+            background: '#2563EB', transition: 'width 200ms',
           }} />
         </div>
       </div>
+
+      {confirming && (
+        <RecordConfirmModal
+          stepLabel={stepLabel}
+          onConfirm={() => { setConfirming(false); doRecord() }}
+          onCancel={()  => { setConfirming(false) }}
+        />
+      )}
+    </div>
+  )
+}
+
+// Editable "Tool & Payload" section — 2026-07-31 rewrite.
+//
+// * COLLAPSED by default; chevron opens.
+// * When unset, the collapsed header still surfaces the amber
+//   "Payload not set" chip so the operator sees the problem
+//   without having to open the section.
+// * Body: MASS + CoG only. The "Tool name (optional)" text field
+//   was retired (see lib/payload — tool_name isn't read anywhere
+//   operator-facing anymore).
+// * The old "Info only" fine-print banner was replaced by a LIVE
+//   truth line comparing program payload to the controller's
+//   active preset (lib/payloadTruth). Three states — match /
+//   mismatch / unreadable — one line, color carries the nuance.
+// * Values live under program.config.{payload_kg, payload_cog_mm}.
+// * FUTURE — per-cycle payload emission at grip/release is
+//   currently gated on the setPayload("") argument-format
+//   stop-condition (see luaenginelib.json). When the format is
+//   resolved, "declare carried mass at grip" becomes a codegen
+//   emission and THIS panel becomes its source of truth.
+function ToolAndPayloadSection({ program, onPatch, controllerPayloadKg }) {
+  const payload = readPayload(program)
+  // Collapsed by default per the 2026-07-31 directive. The chip
+  // on the header carries enough signal that the operator can
+  // decide whether to open it.
+  const [expanded, setExpanded] = useState(false)
+  const [showCog,  setShowCog]  = useState(
+    !!(payload.cog_mm && (payload.cog_mm.x || payload.cog_mm.y || payload.cog_mm.z)))
+
+  // Live truth line — reads the shared resolver so mismatch /
+  // unreadable states show consistent copy across surfaces.
+  const truth = computePayloadTruth({
+    programKg: payload.kg,
+    controllerKg: controllerPayloadKg,
+  })
+
+  const containerStyle = {
+    margin: '10px 12px 0', padding: 0,
+    border: `1px solid ${payload.isSet ? '#e5e7eb' : '#F59E0B'}`,
+    background: payload.isSet ? '#fff' : '#FFFBEB',
+    borderRadius: 8,
+  }
+  const headerStyle = {
+    padding: '8px 12px',
+    display: 'flex', alignItems: 'center', gap: 10,
+    cursor: 'pointer', userSelect: 'none',
+    borderBottom: expanded ? `1px solid ${payload.isSet ? '#e5e7eb' : '#F59E0B'}` : 'none',
+  }
+  const labelStyle = {
+    fontSize: 12, fontWeight: 700, color: payload.isSet ? '#111827' : '#92400E',
+    textTransform: 'uppercase', letterSpacing: '0.06em',
+  }
+  const inputStyle = {
+    padding: '4px 8px', fontSize: 13, fontWeight: 500,
+    border: '1px solid #d1d5db', borderRadius: 5,
+    background: '#fff', color: '#111827', width: 90, textAlign: 'right',
+  }
+  const smallInput = { ...inputStyle, width: 64 }
+  const bodyStyle = { padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 10 }
+
+  return (
+    <div style={containerStyle} data-testid="payload-section"
+         data-expanded={expanded ? '1' : '0'}>
+      <div style={headerStyle} onClick={() => setExpanded((v) => !v)}>
+        <span style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
+                        transition: 'transform 150ms', color: '#6b7280', fontSize: 11 }}>▶</span>
+        <span style={labelStyle}>Tool &amp; Payload</span>
+        <div style={{ flex: 1 }} />
+        {payload.isSet
+          ? (
+            <span
+              data-testid="payload-chip-set"
+              style={{
+                fontSize: 12, fontWeight: 600, color: '#065F46',
+                background: '#ECFDF5', border: '1px solid #059669',
+                padding: '2px 10px', borderRadius: 999,
+              }}>
+              {payload.kg} kg
+            </span>
+          )
+          : (
+            <span
+              data-testid="payload-chip-unset"
+              style={{
+                fontSize: 12, fontWeight: 700, color: '#92400E',
+                background: '#FEF3C7', border: '1px solid #F59E0B',
+                padding: '2px 10px', borderRadius: 999,
+              }}>
+              ⚠ Payload not set
+            </span>
+          )}
+      </div>
+      {expanded && (
+        <div style={bodyStyle}>
+          {/* Truth line — live program-vs-controller comparison.
+              Green when they match, amber when they don't OR when
+              we can't read the controller (never implies sync that
+              doesn't exist). Replaces the retired "info only"
+              banner. */}
+          {(() => {
+            const palette = truth.state === 'match'
+              ? { bg: '#ECFDF5', border: '#059669', fg: '#065F46' }
+              : { bg: '#FEF3C7', border: '#F59E0B', fg: '#92400E' }
+            return (
+              <div
+                data-testid="payload-truth"
+                data-state={truth.state}
+                style={{
+                  padding: '8px 10px',
+                  background: palette.bg,
+                  border: `1px solid ${palette.border}`,
+                  borderRadius: 6,
+                  fontSize: 12, color: palette.fg, lineHeight: 1.5,
+                }}>
+                {truth.message}
+              </div>
+            )
+          })()}
+          {/* Tool mass — the whole first-row input, now mass-only.
+              The retired "Tool name (optional)" input lived here
+              alongside the mass field; it was deleted 2026-07-31. */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <label style={{ fontSize: 12, color: '#374151', fontWeight: 600, minWidth: 120 }}>
+              Tool mass (kg)
+            </label>
+            <input
+              data-testid="payload-mass-input"
+              type="number" step="0.1" min="0" max="30"
+              value={payload.kg ?? ''}
+              placeholder="e.g. 1.2"
+              onChange={(e) => {
+                const v = e.target.value
+                if (v === '') { onPatch({ payload_kg: null }); return }
+                const n = Number(v)
+                if (Number.isFinite(n)) onPatch({ payload_kg: n })
+              }}
+              style={inputStyle} />
+          </div>
+          {/* CoG toggle + fields */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <button
+              onClick={() => setShowCog((v) => !v)}
+              style={{
+                background: 'none', border: 'none', padding: 0,
+                fontSize: 12, color: '#2563EB', cursor: 'pointer',
+                fontWeight: 500, textAlign: 'left', maxWidth: 220,
+              }}>
+              {showCog ? '▾ Hide CoG offset' : '▸ Add CoG offset (advanced)'}
+            </button>
+            {showCog && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                fontSize: 12, color: '#374151',
+              }}>
+                <span style={{ minWidth: 120 }}>CoG (mm from flange)</span>
+                {['x', 'y', 'z'].map((k) => (
+                  <span key={k} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <span style={{ color: '#6b7280', fontWeight: 600, textTransform: 'uppercase' }}>{k}</span>
+                    <input
+                      type="number" step="1"
+                      placeholder="0"
+                      value={payload.cog_mm?.[k] ?? ''}
+                      onChange={(e) => {
+                        const v = e.target.value
+                        const prev = payload.cog_mm || {}
+                        const next = { ...prev }
+                        if (v === '') { delete next[k] }
+                        else {
+                          const n = Number(v)
+                          if (Number.isFinite(n)) next[k] = n
+                        }
+                        onPatch({ payload_cog_mm: Object.keys(next).length ? next : null })
+                      }}
+                      style={smallInput} />
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ProgramFindingsPanel — program-level validation findings surfaced
+// between the Tool & Payload section and the step list. Findings
+// live on the program (see lib/programFindings.computeProgramFindings),
+// clear when the underlying condition resolves, and never live in a
+// modal.
+//
+// 2026-07-31 consolidation: teaching-debt findings (e.g. the legacy
+// pallet migration nudge) no longer render here. They're absorbed
+// into the unified teaching-debt banner above the Tool & Payload
+// section — one banner per program, fed by computeTeachingDebt.
+// The findings themselves are kept in computeProgramFindings for the
+// audit record; this panel just filters them out of the visual list.
+const TEACHING_DEBT_FINDING_IDS = new Set([
+  'pallet-legacy-migration',
+])
+
+function ProgramFindingsPanel({ program, onAction }) {
+  const findings = computeProgramFindings(program)
+    .filter((f) => !TEACHING_DEBT_FINDING_IDS.has(f.id))
+  if (findings.length === 0) return null
+  return (
+    <div
+      data-testid="program-findings"
+      style={{
+        margin: '4px 12px 8px', display: 'flex',
+        flexDirection: 'column', gap: 6,
+      }}>
+      {findings.map((f) => {
+        const palette = f.severity === 'error'
+          ? { bg: '#fef2f2', border: '#fecaca', fg: '#991b1b', icon: '✕' }
+          : f.severity === 'warn'
+          ? { bg: '#fef3c7', border: '#fde68a', fg: '#78350f', icon: '⚠' }
+          : { bg: '#eff6ff', border: '#bfdbfe', fg: '#1e40af', icon: 'ℹ' }
+        return (
+          <div key={f.id}
+            data-testid={`program-finding-${f.id}`}
+            data-severity={f.severity}
+            style={{
+              display: 'flex', alignItems: 'flex-start', gap: 10,
+              padding: '10px 12px',
+              background: palette.bg,
+              border: `1px solid ${palette.border}`,
+              borderRadius: 6, fontSize: 13,
+              color: palette.fg, lineHeight: 1.5,
+            }}>
+            <div style={{ fontSize: 15, lineHeight: 1, marginTop: 2 }}>{palette.icon}</div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 700, marginBottom: 2 }}>{f.title}</div>
+              <div>{f.body}</div>
+            </div>
+            {f.action && typeof onAction === 'function' && (
+              <button
+                data-testid={`program-finding-${f.id}-action`}
+                onClick={() => onAction(f)}
+                style={{
+                  flexShrink: 0, alignSelf: 'center',
+                  padding: '6px 12px', fontSize: 12, fontWeight: 600,
+                  background: '#fff', color: palette.fg,
+                  border: `1px solid ${palette.border}`, borderRadius: 5,
+                  cursor: 'pointer',
+                }}>
+                {f.action.label}
+              </button>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -2001,6 +3808,12 @@ function TeachOverlay({
 export default function ProgramEditor() {
   const currentProgram     = useStore((s) => s.currentProgram)
   const setCurrentProgram  = useStore((s) => s.setCurrentProgram)
+  // Cross-client sync trust (D10 in the Program Doctrine). When
+  // false: WS is down or reconnect refetch is still pending; the
+  // held taught-state may not reflect what other clients have
+  // written. Taught badges render "state syncing…" instead of a
+  // confident green ✓ during that window.
+  const programRevConfirmed = useStore((s) => s.programRevConfirmed)
   // setProgramSteps mirrors the editor's current steps to STATE.program
   // on Save / Load so the task runner (Run button) sees the same
   // program the editor displays. Edits between saves stay local.
@@ -2017,6 +3830,42 @@ export default function ProgramEditor() {
   // the last save.
   const runningSteps       = useStore((s) => s.program.steps ?? [])
   const taskRunning        = useStore((s) => Boolean(s.task?.running || s.task?.paused))
+  // Same precedence lib/runState uses: prefer the controller's
+  // program.line (mapped via stepIndexForLine) over the executor's
+  // step counter. `executingIdx` is -1 when nothing is executing
+  // (also when the run just finished — the bar clears to empty).
+  const _programLine       = useStore((s) => s.robot?.program?.line)
+  const _programStep       = useStore((s) => s.task?.program_step)
+  const _residentSha       = useStore((s) => s.robot?.program?.codegen_sha)
+  const _residentProgramId = useStore((s) => s.robot?.program?.resident_program_id
+                                          ?? s.robot?.program?.project_id)
+  // Same cache-key extension as StepPreviewPanel (2026-08-03) —
+  // the push path refreshes the sidecar with the currently-running
+  // codegen sha; keying on pushed_lua_sha12 forces a refetch as
+  // soon as save_project mints a new push.
+  const _pushedLuaSha12 = useStore((s) => s.robot?.program?.pushed_lua_sha12)
+  const {
+    lineMap: _lineMap, codegenSha: _mapSha, programId: _mapProgId
+  } = useLineMap(currentProgram?.id,
+    `${currentProgram?.rev ?? ''}#${_pushedLuaSha12 ?? ''}`)
+  const _honesty = lineMapHonesty({
+    residentSha: _residentSha,
+    residentProgramId: _residentProgramId,
+    lineMapSha: _mapSha,
+    lineMapProgramId: _mapProgId,
+  })
+  const executingIdx = (() => {
+    if (Number.isInteger(_programLine) && _programLine > 0 && _honesty.ok) {
+      const idx = stepIndexForLine(currentProgram, _programLine, _lineMap)
+      if (idx >= 0) return idx
+    }
+    if (Number.isInteger(_programStep)
+        && (_honesty.ok || _honesty.reason === 'no_resident'
+            || _honesty.reason === 'no_map')) {
+      return _programStep
+    }
+    return -1
+  })()
 
   // Operator-renamed I/O labels for the detail line + IOPortSelector
   // dropdowns. Fetched once per editor mount.
@@ -2036,10 +3885,63 @@ export default function ProgramEditor() {
   const rawSteps = currentProgram.steps || []
   const stepsHaveIds = rawSteps.every((s) => typeof s.id === 'number')
   const steps = stepsHaveIds ? rawSteps : renumber(rawSteps)
+  // 2026-08-05 (editor truth, operator directive): when a teach
+  // session exists for THIS program, the DRAFT poses are the
+  // current truth — record-through writes each pose to disk on
+  // Record and mirrors it to STATE.teach_sessions. The pre-fix
+  // untaughtStepIds computation read from the saved currentProgram
+  // only, so the operator would teach five poses in a row and the
+  // banner would still claim six missing while the backend
+  // validator (which reads the draft-merged view) counted one.
+  //
+  // Merge in the draft's step-keyed poses (slot_key = 'step:<id>')
+  // BEFORE running the truth resolver — same honest-display
+  // principle as the line-map and link-status chips.
+  const _draftPoses = useStore((s) =>
+    (s.teachSessions || {})[currentProgram?.id]?.poses || null)
+  const stepsMerged = (() => {
+    if (!_draftPoses || typeof _draftPoses !== 'object') return steps
+    const byKey = _draftPoses
+    let touched = false
+    const out = steps.map((s) => {
+      const patch = byKey['step:' + s.id]
+      if (!patch || typeof patch !== 'object') return s
+      touched = true
+      // The draft patch mirrors the shape the record path writes:
+      // taught_joints, taught_tcp, taught: true. Merge non-null
+      // fields on top of the saved step — the draft is the newer
+      // authoritative pose for this teach session.
+      const merged = { ...s }
+      for (const k of ('taught_joints', 'taught_tcp', 'taught',
+                       'pose', 'pose_status')) {
+        if (patch[k] !== undefined && patch[k] !== null) merged[k] = patch[k]
+      }
+      // Ensure `taught` reflects a resolved 6-vector even if the
+      // patch omitted the flag but supplied the joints.
+      if (Array.isArray(merged.taught_joints)
+          && merged.taught_joints.length === 6
+          && merged.taught !== true) {
+        merged.taught = true
+      }
+      return merged
+    })
+    return touched ? out : steps
+  })()
   // Untaught steps the operator still needs to teach before the path
-  // is ready to run. Includes gripper open/close and the home pose —
-  // they all happen at a specific robot location.
-  const untaughtCount = steps.filter((s) => isTeachable(s) && !s.taught).length
+  // is ready to run. Uses the shared programTruth.isStepTaught resolver
+  // (mirror of backend _has_taught_poses) so this count agrees with the
+  // Run modal, Monitor's runnable check, AND what codegen accepts.
+  //
+  // Old logic used `step.taught` (client-set boolean) which drifted
+  // from backend truth for derived_from steps (2026-07-30 audit
+  // #P1-2 — see docs/ui_truth_audit.md).
+  const programForTruth = { steps: stepsMerged, points: currentProgram.points }
+  const untaughtIds = untaughtStepIds(programForTruth)
+                        .filter((id) => {
+                          const s = stepsMerged.find((x) => x.id === id)
+                          return s && isTeachable(s, programForTruth)
+                        })
+  const untaughtCount = untaughtIds.length
   const allTaughtForRun = untaughtCount === 0
 
   // Setters that wrap the store action with the right patch shape.
@@ -2056,11 +3958,36 @@ export default function ProgramEditor() {
   // editor for this program (entry point: Edit button on any
   // move_to_pallet step). Single-instance modal — not per-step.
   const [editingPallet, setEditingPallet]   = useState(false)
+  // 2026-07-30 §430 — routine fold state. Default: collapsed.
+  // Set of routine ids the operator has explicitly expanded. Edits
+  // to a step inside a routine broadcast to sibling iterations
+  // regardless of fold state (see broadcast helper below).
+  const [expandedRoutines, setExpandedRoutines] = useState(() => new Set())
+  // 2026-08-06 palletize completeness — inline expand of the
+  // move_to_pallet step to a read-only preview of its cycle template.
+  // Set of step ids currently expanded. Persists only in this
+  // editor's memory (no localStorage — collapsing on remount is fine).
+  const [palletExpandedIds, setPalletExpandedIds] = useState(() => new Set())
+  const togglePalletExpanded = (id) => {
+    setPalletExpandedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }
   const [selectedId, setSelectedId]         = useState(null)
   const [dragId, setDragId]                 = useState(null)
   const [dragOverId, setDragOverId]         = useState(null)
   const [dragOverPos, setDragOverPos]       = useState(null)
   const [saveStatus, setSaveStatus]         = useState(null)
+  // Save-error text. Populated from the backend response body's
+  // `error` field on any non-ok response (was previously discarded —
+  // a 404 or 422 would flash a generic red "Error" badge with no
+  // reason. Now the operator sees the specific message: "Step 2
+  // (Move Linear) references point 'p1' which has not been taught",
+  // "program id 'test_program' can't round-trip on the controller",
+  // etc.).
+  const [saveError, setSaveError] = useState(null)
   const [showLoadMenu, setShowLoadMenu]     = useState(false)
   // Sequential "Teach All" walk-through. -1 = idle, otherwise the
   // index into steps[] the operator is currently teaching.
@@ -2073,6 +4000,158 @@ export default function ProgramEditor() {
   const [teachAllOrder, setTeachAllOrder]   = useState([])
   const [teachAllPos,   setTeachAllPos]     = useState(-1)
   const [teachSingleId, setTeachSingleId]   = useState(null)
+  // 2026-08-05 (P0-B, stale-lock fix): store actions for the
+  // session-lifecycle heartbeat + end wire. See the useEffect below
+  // this state block for the exact open/close transitions that
+  // trigger them.
+  const endTeachSession       = useStore((s) => s.endTeachSession)
+  const endTeachSessionBeacon = useStore((s) => s.endTeachSessionBeacon)
+  const heartbeatTeachSession = useStore((s) => s.heartbeatTeachSession)
+  // Pallet-frame teach state — one of 'pallet_c1'/'pallet_c2'/
+  // 'pallet_c3'/'pallet_part' when the operator is walking through the
+  // 4-point diagram-guided flow, null otherwise. Distinct from the
+  // teachSingleId/teachAllOrder path because pallet teach writes to
+  // program.config.pallet_place (not to a step's taught_tcp).
+  //
+  // Mode: 'teach' | 're-teach'. Derived from role + program state
+  // via modeForRole(). Back-nav to an already-taught point sets
+  // this to 're-teach' but KEEPS the existing pose until Record.
+  const [palletTeachRole, setPalletTeachRole] = useState(null)
+  const [palletTeachMode, setPalletTeachMode] = useState(null)
+  // Optional per-role caption addendum (e.g. the legacy-migration
+  // reason "seeded from corner A during migration"). Displayed
+  // under the standard instruction when the flow enters via Teach
+  // All chaining an owed re-teach; cleared as soon as the operator
+  // navigates away from that role.
+  const [palletTeachReason, setPalletTeachReason] = useState(null)
+
+  // 2026-08-05 (P0-B): teach-session lifecycle. Overlay is "open"
+  // when any of teachSingleId / teachAllOrder / palletTeachRole is
+  // active. While open, heartbeat every 30 s so the owner-TTL
+  // doesn't age us out. On close (open → not-open transition), OR
+  // on component unmount, call /end to release the lock. beforeunload
+  // uses sendBeacon so a window close still releases. Record-through
+  // architecture means poses were already persisted on every Record;
+  // releasing the lock loses nothing.
+  // 2026-08-05 (teach-lock incident #3): the SPA keeps ProgramLayout
+  // mounted across route changes via CSS `display:none` (see
+  // App.jsx:154 kept3D list — Program + 3D View stay parked to avoid
+  // re-loading GLBs). Consequence: ProgramEditor never unmounts on
+  // route change, its useEffects keep running, and the heartbeat
+  // interval kept refreshing the owner-TTL even after the operator
+  // navigated to Monitor/Programs/Configure — leaving a phantom lock
+  // no one was actively holding.
+  //
+  // Doctrine: session lifecycle = TEACH SURFACE lifecycle. Treat
+  // "not on the Program tab" as "overlay closed" for lifecycle
+  // purposes — the heartbeat halts, the /end path fires. When the
+  // operator returns to Program, the overlay state re-inflates
+  // (teachSingleId etc. are still set), heartbeat resumes, /start
+  // implicitly re-claims via the next Record. Losing nothing:
+  // record-through already persisted every pose.
+  const activeTab = useStore((s) => s.activeTab)
+  const overlayStateOpen = (teachSingleId != null
+                            || (teachAllOrder && teachAllOrder.length > 0)
+                            || palletTeachRole != null)
+  const overlayOpen = overlayStateOpen && activeTab === 'program'
+  const wasOverlayOpen = useRef(false)
+  // 2026-08-05 (Lesson 179 gap fix): track the PROGRAM ID that owned
+  // the currently-open teach overlay. When the operator navigates to
+  // a different program mid-teach, we must end the session on the
+  // OLD pid — not the new one. Pre-fix, the `pid = currentProgram?.id`
+  // captured the NEW program id after route change, so the /end call
+  // was harmlessly no-op and the old lock persisted until TTL.
+  const openedPidRef = useRef(null)
+  useEffect(() => {
+    const pid = currentProgram?.id
+    // Fires on: overlay open→closed transition OR program-id change
+    // (which effectively closes the overlay on the old program).
+    if (wasOverlayOpen.current && !overlayOpen && openedPidRef.current) {
+      try { endTeachSession(openedPidRef.current) } catch (_) { /* nop */ }
+      openedPidRef.current = null
+    } else if (overlayOpen && !wasOverlayOpen.current && pid) {
+      openedPidRef.current = pid
+    } else if (overlayOpen
+               && openedPidRef.current
+               && openedPidRef.current !== pid) {
+      // Program switched while overlay was open — end the OLD one,
+      // adopt the new pid (the overlay just re-parented itself).
+      try { endTeachSession(openedPidRef.current) } catch (_) { /* nop */ }
+      openedPidRef.current = pid
+    }
+    wasOverlayOpen.current = overlayOpen
+  }, [overlayOpen, currentProgram?.id, endTeachSession])
+  useEffect(() => {
+    if (!overlayOpen) return
+    const pid = currentProgram?.id
+    if (!pid) return
+    // 15 s heartbeat. Server owner-TTL is 90 s (_TEACH_OWNER_TTL_S),
+    // stale-heartbeat auto-swap fires at 60 s (4 missed beats).
+    // Prior 30 s cadence meant one dropped beat + one slow network
+    // frame could tip a live tab into the stale window.
+    //
+    // 2026-08-05 (Lesson 179 gap fix): DON'T heartbeat while the tab
+    // is hidden. Background tabs kept ticking, extending the owner-
+    // TTL indefinitely, so operators on a second device saw the lock
+    // never expire even when the original device was minimized/away.
+    // We keep the interval alive but SKIP the fetch on hidden — so
+    // the moment the tab returns to foreground we heartbeat again
+    // (no re-mount cost).
+    const t = setInterval(() => {
+      if (typeof document !== 'undefined'
+          && document.visibilityState === 'hidden') {
+        return
+      }
+      try { heartbeatTeachSession(pid) } catch (_) { /* nop */ }
+    }, 15000)
+    return () => clearInterval(t)
+  }, [overlayOpen, currentProgram?.id, heartbeatTeachSession])
+  useEffect(() => {
+    // Window unload — beacon out one last /end before the tab dies.
+    // sendBeacon survives a close where fetch would be cancelled.
+    // Uses openedPidRef (not currentProgram?.id) so mid-teach program
+    // switches don't lose the release for the OLD program.
+    const onBeforeUnload = () => {
+      const pid = openedPidRef.current
+      if (!pid || !wasOverlayOpen.current) return
+      try { endTeachSessionBeacon(pid) } catch (_) { /* nop */ }
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', onBeforeUnload)
+      // pagehide covers the iOS/Safari/tablet cases where beforeunload
+      // isn't fired reliably (bfcache, PWA background).
+      window.addEventListener('pagehide', onBeforeUnload)
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('beforeunload', onBeforeUnload)
+        window.removeEventListener('pagehide', onBeforeUnload)
+      }
+    }
+  }, [endTeachSessionBeacon])
+  useEffect(() => {
+    // Component unmount — route change out of ProgramEditor. Same
+    // as close: release the lock on whichever pid was open.
+    return () => {
+      const pid = openedPidRef.current
+      if (pid && wasOverlayOpen.current) {
+        try { endTeachSession(pid) } catch (_) { /* nop */ }
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  // Frame-validation findings are NOT held as passive banner state
+  // anymore (§465 fork-1 kill, 2026-08-04). The mid-re-teach
+  // passive-banner rendering surfaced findings against half-updated
+  // state (e.g., a stale c2 pose that the operator was actively
+  // replacing) — operator-hostile. Findings are now requested at
+  // two moments only: (a) inside palletTeachRecord after each
+  // Record, surfaced as a toast; (b) at teach-complete / handleSave
+  // as the final gate. See palletFrameValidator.js.
+  // Cancel-confirm modal state — the confirm dialog states the
+  // number of already-recorded teaches so the operator knows what's
+  // preserved before dismissing.
+  const [palletCancelConfirm, setPalletCancelConfirm] = useState(false)
   // Per-step open/closed state for the "View position data" drawer.
   // Stored as a Set of step.id values so the toggle on one row never
   // touches another row.
@@ -2087,7 +4166,102 @@ export default function ProgramEditor() {
   const [contextMenu, setContextMenu]         = useState(null)
   const [showAddPanel, setShowAddPanel]       = useState(false)
   const [locked, setLocked]                   = useState(false)
+  // Position-reuse prompt state. `pendingReuse` is set when the user
+  // adds a step whose position could reuse an already-taught source.
+  // Shape: {action, sourceStep, insertIdx} — insertIdx null = append.
+  const [pendingReuse, setPendingReuse]       = useState(null)
+  // Position picker state — set to a step id when the operator clicks
+  // the chain icon on a row. The picker reads `currentProgram.points`
+  // and mutates the step's `point_name` on selection.
+  const [pickerStepId, setPickerStepId]       = useState(null)
+  const deletePoint                           = useStore((s) => s.deletePoint)
+  const renamePoint                           = useStore((s) => s.renamePoint)
+  // Bug 1 fix wiring — banner state + refresh-on-command.
+  const programChangedByOther                 = useStore((s) => s.programChangedByOther)
+  const clearProgramChangedByOther            = useStore((s) => s.clearProgramChangedByOther)
+  const refreshCurrentProgram                 = useStore((s) => s._refreshCurrentProgram)
   const addToast                              = useStore((s) => s.addToast)
+
+  // 2026-08-06 (operator directive — palletize expanded view editable).
+  // ONE canonical write path for pallet config edits. Called by both
+  // the `PalletConfigEditor` modal (whole-config Save) and the inline
+  // sub-step fields in `PalletExpansionPreview` (single-field patches).
+  //
+  // Contract: patch is either a full pallet config bundle
+  //   {pallet, pallet_mode, source, speed_pct, ...}
+  // or a partial per-field update
+  //   {approach_distance_mm: 75}, {vacuum_port_do: 7}, ...
+  // Partial patches are merged into `config.pallet.*`. Full patches
+  // (with a `pallet` key) go through the same merge the modal used.
+  //
+  // Every commit regenerates the move_to_pallet step's fanned-out
+  // fields via regenerateMoveToPalletSteps → one edit, ALL cycles
+  // update deterministically. Sub-steps stay generated (never
+  // free-hand edited) so composer integrity holds.
+  const commitPalletPatch = useCallback((patch) => {
+    if (!patch || typeof patch !== 'object') return
+    const cfgNow = currentProgram.config || {}
+    const palletNow = cfgNow.pallet || {}
+    // Detect the shape: is this a whole-config bundle (has a `pallet`
+    // key) or a partial per-field update?
+    let nextPallet
+    let extraCfgFields = {}
+    let palletMode = cfgNow.pallet_mode
+    if (patch.pallet && typeof patch.pallet === 'object') {
+      nextPallet = { ...palletNow, ...patch.pallet }
+      // Bundle from the modal — also copies mode/source/speed_pct.
+      if (patch.pallet_mode !== undefined) palletMode = patch.pallet_mode
+      for (const k of ['pallet_mode', 'source', 'speed_pct']) {
+        if (patch[k] !== undefined) extraCfgFields[k] = patch[k]
+      }
+      // Legacy pallet_* mirror keys (kept identical to the modal
+      // path so wizard Review round-trips still match).
+      extraCfgFields.pallet_rows           = nextPallet.rows
+      extraCfgFields.pallet_cols           = nextPallet.cols
+      extraCfgFields.pallet_layers         = nextPallet.layers
+      extraCfgFields.pallet_spacing_x_mm   = nextPallet.spacing_x_mm
+      extraCfgFields.pallet_spacing_y_mm   = nextPallet.spacing_y_mm
+      extraCfgFields.pallet_layer_height_mm = nextPallet.layer_height_mm
+      extraCfgFields.pallet_fill_order     = nextPallet.fill_order
+      extraCfgFields.pallet_approach_height_mm = nextPallet.approach_height_mm
+      extraCfgFields.pallet_retract_height_mm  = nextPallet.retract_height_mm
+    } else {
+      // Partial per-field patch from the inline sub-step editor.
+      nextPallet = { ...palletNow, ...patch }
+    }
+    const nextConfig = {
+      ...cfgNow,
+      ...extraCfgFields,
+      pallet: nextPallet,
+      operation: 'palletize',
+    }
+    const regen = regenerateMoveToPalletSteps(steps, nextPallet, palletMode)
+    setCurrentProgram({
+      config:  nextConfig,
+      steps:   renumber(regen),
+      unsaved: true,
+    })
+    addToast?.('Pallet config updated — Save to persist', 'success')
+  }, [currentProgram, steps, setCurrentProgram, addToast])
+
+  // Teach-session record-through actions (2026-08-04). The
+  // ProgramEditor reads these to POST every Record to the Jetson
+  // BEFORE mutating local state; see teachOverlayRecord +
+  // palletTeachRecord for wiring.
+  const recordTeachPose      = useStore((s) => s.recordTeachPose)
+  const takeOverTeachSession = useStore((s) => s.takeOverTeachSession)
+  const promoteTeachSession  = useStore((s) => s.promoteTeachSession)
+  // Server-truth teach session for the currently-open program.
+  // Populated from the WS state broadcast (see useStore's
+  // ws.onmessage → teachSessions). Null when no draft exists.
+  const teachSession = useStore((s) =>
+    (s.teachSessions || {})[currentProgram?.id] || null)
+  const isTeachingElsewhere = useStore((s) =>
+    !!(s.teachSessions
+       && s.teachSessions[currentProgram?.id]
+       && s.teachSessions[currentProgram?.id].owner_device_id
+       && s.teachSessions[currentProgram?.id].owner_device_id
+          !== s._teachDeviceId))
   const [savedPrograms, setSavedPrograms] = useState([])
 
   // Diagnostic: log what the editor sees on every mount so a future
@@ -2140,12 +4314,25 @@ export default function ProgramEditor() {
   // index alignment is correct as long as the editor matches the last
   // save). If editor has unsaved edits, indices may diverge — the
   // unsaved indicator already warns the operator.
+  // Executing step index — same source lib/runState uses for its
+  // "Step N of M" pill. NO code path writes step.status='done', so
+  // the old `s.status === 'done'` filter was always 0 during a real
+  // run (2026-07-30 audit #P2-2). Derive from task.program_step
+  // (executor sim) or robot.program.line via stepIndexForLine
+  // (Estun pipeline) — the same precedence deriveRunState uses.
+  //
+  // For the progress-bar count, we treat "current step" as N steps
+  // done so the bar advances one-per-step. That matches the visual
+  // convention every operator has learned; the exact done-vs-cursor
+  // distinction is called out in the mouseover title on the bar.
   function statusOf(idx) {
     if (!taskRunning) return null
-    return runningSteps[idx]?.status ?? null
+    if (typeof executingIdx === 'number' && idx < executingIdx) return 'done'
+    if (typeof executingIdx === 'number' && idx === executingIdx) return 'active'
+    return null
   }
-  const doneCount = taskRunning
-    ? Math.min(steps.length, runningSteps.filter((s) => s.status === 'done').length)
+  const doneCount = (taskRunning && typeof executingIdx === 'number')
+    ? Math.max(0, Math.min(steps.length, executingIdx))
     : 0
 
   function handleDragStart(e, id) {
@@ -2193,19 +4380,66 @@ export default function ProgramEditor() {
   function handleDragEnd() { clearDrag() }
 
   function handleAdd() {
-    const newStep = freshStepForAction('wait')
+    const newStep = freshStepForAction('wait', currentProgram?.config)
     updateSteps(renumber([...steps, newStep]))
   }
 
   // Add a step of a specific action — used by the categorized
   // "+ Add Step" panel. Appends to the end and opens the inline editor
   // on the new row so the operator can immediately set parameters.
+  //
+  // Reuse prompt (2026-07-17): when the operator adds a step whose
+  // action could reuse an earlier taught position (move_home,
+  // move_joint, approach, pick, place, move_linear), we check the
+  // existing steps for a matching source. If one is found, defer the
+  // insertion behind a modal offering [Use same] / [Teach new]. Use
+  // same → new step gets `position_ref: <sourceId>` (shared, not
+  // copied — re-teaching the source updates every referencing step
+  // at execution time). Teach new → current behavior.
   function handleAddAction(action) {
-    const newStep = freshStepForAction(action)
+    const source = findPositionReuseSource(steps, action)
+    if (source) {
+      setPendingReuse({ action, sourceStep: source, insertIdx: null })
+      setShowAddPanel(false)
+      return
+    }
+    const newStep = freshStepForAction(action, currentProgram?.config)
     const next = renumber([...steps, newStep])
     updateSteps(next)
     setEditingId(next[next.length - 1].id)
     setShowAddPanel(false)
+  }
+
+  function completeReuse({ useSame }) {
+    if (!pendingReuse) return
+    const { action, sourceStep, insertIdx } = pendingReuse
+    let newStep = freshStepForAction(action, currentProgram?.config)
+    if (useSame) {
+      // Link to the source. Do NOT copy taught_joints / taught_tcp —
+      // the executor resolves at runtime via position_ref so the
+      // operator can re-teach the source and every reference updates.
+      newStep = {
+        ...newStep,
+        position_ref: sourceStep.id,
+        // Nicer default label so the operator sees the link intent.
+        label: `${newStep.label} (from Step ${sourceStep.id})`,
+        // Referencing steps are NOT independently teachable — the
+        // teach panel skips them (see isTeachable).
+        taught: undefined,
+        taught_joints: undefined,
+        taught_tcp: undefined,
+      }
+    }
+    const next = insertIdx == null
+      ? renumber([...steps, newStep])
+      : renumber([...steps.slice(0, insertIdx), newStep, ...steps.slice(insertIdx)])
+    updateSteps(next)
+    // Focus the newly-inserted row.
+    const inserted = insertIdx == null
+      ? next[next.length - 1]
+      : next[insertIdx]
+    setEditingId(inserted.id)
+    setPendingReuse(null)
   }
 
   // Context-menu actions are id-based so they're resilient to a
@@ -2217,14 +4451,18 @@ export default function ProgramEditor() {
       case 'edit':       setEditingId(id); break
       case 'rename':     setSelectedId(id); addToast('Click the step name to rename it', 'info'); break
       case 'add_above': {
-        const newStep = freshStepForAction('move_joint')
+        const src = findPositionReuseSource(steps, 'move_joint')
+        if (src) { setPendingReuse({ action: 'move_joint', sourceStep: src, insertIdx: idx }); break }
+        const newStep = freshStepForAction('move_joint', currentProgram?.config)
         const next = renumber([...steps.slice(0, idx), newStep, ...steps.slice(idx)])
         updateSteps(next)
         setEditingId(next[idx].id)
         break
       }
       case 'add_below': {
-        const newStep = freshStepForAction('move_joint')
+        const src = findPositionReuseSource(steps, 'move_joint')
+        if (src) { setPendingReuse({ action: 'move_joint', sourceStep: src, insertIdx: idx + 1 }); break }
+        const newStep = freshStepForAction('move_joint', currentProgram?.config)
         const next = renumber([...steps.slice(0, idx + 1), newStep, ...steps.slice(idx + 1)])
         updateSteps(next)
         setEditingId(next[idx + 1].id)
@@ -2258,12 +4496,209 @@ export default function ProgramEditor() {
     updateSteps(renumber(steps.filter((s) => s.id !== id)))
   }
 
+  // 2026-07-30 §430 — routine metadata resolvers. Reads
+  // currentProgram.routines[] (backend-persisted) and falls back to
+  // scanning per-step routine_id/routine_iteration when the top-level
+  // list is absent (older programs saved before the persist path).
+  const routines = Array.isArray(currentProgram?.routines) ? currentProgram.routines : []
+  const stepRoutineInfo = (() => {
+    const info = {}
+    // Prefer explicit routines[] step_indices_per_iter.
+    for (const r of routines) {
+      const ranges = Array.isArray(r?.step_indices_per_iter) ? r.step_indices_per_iter : []
+      const firstRoutineIdx = ranges.length && Array.isArray(ranges[0]) ? Number(ranges[0][0]) : null
+      for (let iter = 0; iter < ranges.length; iter++) {
+        const rng = ranges[iter]
+        if (!Array.isArray(rng) || rng.length < 2) continue
+        const a = Number(rng[0]), b = Number(rng[1])
+        for (let s_idx = a; s_idx < b; s_idx++) {
+          info[s_idx] = {
+            routineId:       r.id,
+            iteration:       iter,
+            offsetInIter:    s_idx - a,
+            firstOfIteration: s_idx === a,
+            firstOfRoutine:  s_idx === firstRoutineIdx,
+            iterations:      Number(r.iterations || 0),
+            name:            String(r.name || ''),
+          }
+        }
+      }
+    }
+    // Fallback: scan step.routine_id / step.routine_iteration.
+    // (Programs saved before the routines-persist path.)
+    if (Object.keys(info).length === 0) {
+      const groups = {}
+      for (let i = 0; i < steps.length; i++) {
+        const rid = steps[i]?.routine_id
+        if (!rid) continue
+        const iter = Number(steps[i]?.routine_iteration || 0)
+        const key = `${rid}|${iter}`
+        if (!groups[key]) groups[key] = { rid, iter, indices: [] }
+        groups[key].indices.push(i)
+      }
+      const rangesByRid = {}
+      for (const g of Object.values(groups)) {
+        rangesByRid[g.rid] = rangesByRid[g.rid] || []
+        rangesByRid[g.rid].push({ iter: g.iter, indices: g.indices.sort((a, b) => a - b) })
+      }
+      for (const rid of Object.keys(rangesByRid)) {
+        const groupsForRid = rangesByRid[rid].sort((a, b) => a.iter - b.iter)
+        const iterations = groupsForRid.length
+        const firstRoutineIdx = groupsForRid[0]?.indices?.[0]
+        for (const g of groupsForRid) {
+          for (let k = 0; k < g.indices.length; k++) {
+            const s_idx = g.indices[k]
+            info[s_idx] = {
+              routineId: rid, iteration: g.iter,
+              offsetInIter:    k,
+              firstOfIteration: k === 0,
+              firstOfRoutine:  s_idx === firstRoutineIdx,
+              iterations,
+              name: '',
+            }
+          }
+        }
+      }
+    }
+    return info
+  })()
+  const isRoutineExpanded = (rid) => !!(expandedRoutines.has && expandedRoutines.has(rid))
+  const toggleRoutine = (rid) => {
+    setExpandedRoutines((prev) => {
+      const next = new Set(prev || [])
+      if (next.has(rid)) next.delete(rid); else next.add(rid)
+      return next
+    })
+  }
+  // Fields whose meaning is "the same across every iteration" — an
+  // edit to iter 0 should broadcast to iters 1..N. Explicitly EXCLUDES
+  // taught_joints / taught_tcp / taught / joints / position_ref /
+  // point_name / derived_from_step_id / iter_offset_mm since those
+  // are per-iteration (each iteration teaches its own pose OR links
+  // to the anchor's pose via the dedupe pass).
+  const _ROUTINE_BROADCAST_FIELDS = new Set([
+    'label', 'action', 'io_id', 'value', 'duration_s', 'speed_pct',
+    'force_pct', 'width_mm', 'io_open', 'io_open_confirm',
+    'io_close', 'io_close_confirm', 'target_part', 'target',
+    'offset_z_mm', 'scan_height_mm', 'scan_speed_pct',
+    'settle_time_ms', 'capture_frames', 'match_threshold_pct',
+  ])
+  function _broadcastToRoutine(id, patch) {
+    // Find the source step's index + routine info, then apply the
+    // SAFE-fields portion of `patch` to every sibling step at the
+    // matching offset in other iterations of the same routine.
+    // No-op when the source isn't in a routine.
+    const srcIdx = steps.findIndex((s) => s.id === id)
+    if (srcIdx < 0) return steps
+    const src = stepRoutineInfo[srcIdx]
+    if (!src || !src.routineId) return steps
+    const safePatch = {}
+    for (const k of Object.keys(patch)) {
+      if (_ROUTINE_BROADCAST_FIELDS.has(k)) safePatch[k] = patch[k]
+    }
+    if (Object.keys(safePatch).length === 0) return steps
+    // Build sibling-index list from stepRoutineInfo: same routineId,
+    // same offsetInIter, different iteration.
+    const siblings = new Set()
+    for (const [sIdxStr, inf] of Object.entries(stepRoutineInfo)) {
+      const sIdx = Number(sIdxStr)
+      if (sIdx === srcIdx) continue
+      if (inf.routineId !== src.routineId) continue
+      if (inf.offsetInIter !== src.offsetInIter) continue
+      siblings.add(sIdx)
+    }
+    if (siblings.size === 0) return steps
+    return steps.map((s, idx) => siblings.has(idx) ? { ...s, ...safePatch } : s)
+  }
+
   function handleRename(id, newLabel) {
-    updateSteps(renumber(steps.map((s) => s.id === id ? { ...s, label: newLabel } : s)))
+    const nextSteps = _broadcastToRoutine(id, { label: newLabel })
+    updateSteps(renumber(nextSteps.map((s) => s.id === id ? { ...s, label: newLabel } : s)))
   }
 
   function handleEditSave(id, patch) {
-    updateSteps(renumber(steps.map((s) => s.id === id ? { ...s, ...patch } : s)))
+    const nextSteps = _broadcastToRoutine(id, patch)
+    updateSteps(renumber(nextSteps.map((s) => s.id === id ? { ...s, ...patch } : s)))
+  }
+
+  // Unified link handler — accepts a source descriptor from the
+  // position picker (kind: 'step' | 'point'). One code path for both
+  // families: step sources write `position_ref` (matching ea64950 and
+  // the row's home-mirror behavior), point sources write `point_name`.
+  // The OTHER ref field is always cleared so the two resolvers can't
+  // collide. When we're linking to a step, we mirror its pose fields
+  // onto the linking step too — some downstream consumers (older
+  // codegen paths, monitor cards) inspect step-local taught_joints
+  // directly and would otherwise show the row as stale. Mirrors what
+  // linkHomeToFirst already does for the home flow.
+  function linkStepToSource(stepId, src) {
+    if (!src) return
+    const srcStep = src.kind === 'step'
+      ? (steps.find((s) => s.id === src.id) || null)
+      : null
+    updateSteps(renumber(steps.map((s) => {
+      if (s.id !== stepId) return s
+      const next = { ...s, taught: true }
+      if (src.kind === 'step') {
+        next.position_ref     = src.id
+        next.linked_to_step_id = src.id
+        if ('point_name' in next) delete next.point_name
+        if (srcStep) {
+          if (srcStep.taught_joints) next.taught_joints = [...srcStep.taught_joints]
+          if (srcStep.taught_tcp)    next.taught_tcp    = [...srcStep.taught_tcp]
+          if (srcStep.taught_at)     next.taught_at     = srcStep.taught_at
+          if (srcStep.joints)        next.joints        = [...srcStep.joints]
+          if (srcStep.taught_tcp)    next.position      = srcStep.taught_tcp.slice(0, 3)
+        }
+      } else {
+        next.point_name = src.name
+        if ('position_ref'     in next) delete next.position_ref
+        if ('linked_to_step_id' in next) delete next.linked_to_step_id
+      }
+      return next
+    })))
+    setPickerStepId(null)
+    const target = src.kind === 'step' ? `Step ${src.id}` : `point ${src.name}`
+    addToast(`Step ${stepId} → ${target}`, 'success')
+  }
+
+  // Detach a step from whichever kind of link it currently holds. If
+  // it carries local taught_joints (mirrored from a step source, or
+  // set inline by Teach), `taught` stays true; otherwise it becomes
+  // untaught and the Teach button lights up.
+  function unlinkStepFromSource(stepId) {
+    updateSteps(renumber(steps.map((s) => {
+      if (s.id !== stepId) return s
+      const next = { ...s }
+      let hadLink = false
+      if ('point_name'        in next) { delete next.point_name;        hadLink = true }
+      if ('position_ref'      in next) { delete next.position_ref;      hadLink = true }
+      if ('linked_to_step_id' in next) { delete next.linked_to_step_id; hadLink = true }
+      if (!hadLink) return s
+      const has6 = Array.isArray(next.taught_joints) && next.taught_joints.length >= 6
+      next.taught = !!has6
+      return next
+    })))
+    addToast(
+      'Position link removed. This step now uses its own pose — re-teach if needed.',
+      'info')
+  }
+
+  async function handleDeletePointFromPicker(name) {
+    const ok = await deletePoint(name)
+    if (ok) addToast(`Deleted position ${name}`, 'success')
+  }
+
+  async function handleRenamePointFromPicker(oldName, newName) {
+    const p = await renamePoint(oldName, newName)
+    if (!p) return
+    // Server updates step.point_name references atomically (see
+    // dashboard_server PUT /points/{name}), but the editor's in-memory
+    // steps still carry the old name until refresh — mirror the rename
+    // locally so the row's chip flips without waiting for a round-trip.
+    updateSteps(renumber(steps.map((s) =>
+      s.point_name === oldName ? { ...s, point_name: newName } : s)))
+    addToast(`Renamed ${oldName} → ${newName}`, 'success')
   }
 
   // Pull the live robot pose from /api/state and turn it into the
@@ -2301,16 +4736,82 @@ export default function ProgramEditor() {
     setTeachSingleId(id)
   }
 
-  // Teach All — snapshot the ordered list of step IDs that need
-  // teaching and walk through them. The path stays fixed even if a
-  // mid-walk record mutates `steps` (the rewrite happens via id, not
-  // index).
+  // "Use Step 1 home position" — for any move_home step past the
+  // first, copy the first move_home step's taught pose into this
+  // step AND record the link so future edits to the first step
+  // propagate here automatically (see teachOverlayRecord). This is
+  // the operator-facing form of the wizard's built-in "share home
+  // pose across cycle start + end" intent — brought into the editor
+  // so drift introduced by a later individual re-teach can be
+  // healed with one click.
+  function linkHomeToFirst(id) {
+    const source = steps.find((s) => s.action === 'move_home')
+    if (!source || source.id === id) return
+    updateSteps(renumber(steps.map((s) => {
+      if (s.id !== id) return s
+      const mirrored = {
+        ...s,
+        linked_to_step_id: source.id,
+        taught: !!source.taught,
+        taught_joints: source.taught_joints ? [...source.taught_joints] : s.taught_joints,
+        taught_tcp:    source.taught_tcp    ? [...source.taught_tcp]    : s.taught_tcp,
+        taught_at:     source.taught_at || s.taught_at,
+        joints:        source.joints || source.taught_joints || s.joints,
+      }
+      if (source.taught_tcp) mirrored.position = source.taught_tcp.slice(0, 3)
+      return mirrored
+    })))
+  }
+  // Break the link — the step keeps its currently-mirrored pose but
+  // stops receiving updates from the source. Re-teach afterwards will
+  // give this step its own independent pose.
+  function unlinkHome(id) {
+    updateSteps(renumber(steps.map((s) => {
+      if (s.id !== id) return s
+      const { linked_to_step_id, ...rest } = s
+      return rest
+    })))
+  }
+
+  // Teach All — walks the unified teaching debt: first every
+  // untaught step, then any owed pallet re-teaches. The step queue
+  // stays fixed once started (rewrite happens via id, not index)
+  // so a mid-walk record can't derail the path. When the step
+  // queue empties, chainToPalletReTeaches() picks up any owed
+  // pallet re-teaches so ④ (legacy migration) becomes an ordinary
+  // stop in the itinerary rather than a separate box.
   function startTeachAll() {
-    const order = steps.filter((s) => isTeachable(s) && !s.taught).map((s) => s.id)
-    if (order.length === 0) return
+    const debt = computeTeachingDebt(currentProgram)
+    if (debt.total === 0) return
     setTeachSingleId(null)
-    setTeachAllOrder(order)
-    setTeachAllPos(0)
+    setPalletTeachRole(null)
+    setPalletTeachMode(null)
+    setPalletTeachReason(null)
+    if (debt.stepIds.length > 0) {
+      // Step queue first — same behavior as before. Chaining runs
+      // after the queue completes.
+      setTeachAllOrder(debt.stepIds)
+      setTeachAllPos(0)
+    } else {
+      // No untaught steps — go straight to the first owed re-teach.
+      chainToPalletReTeaches(debt.palletReTeaches)
+    }
+  }
+
+  // Transition from the step-teach queue into a pallet re-teach.
+  // Called when the step queue empties AND there are owed pallet
+  // re-teaches in the debt. Enters at the first owed role in
+  // re-teach mode with its reason threaded through as the diagram
+  // caption addendum.
+  function chainToPalletReTeaches(palletReTeaches) {
+    setTeachAllOrder([])
+    setTeachAllPos(-1)
+    if (!palletReTeaches || palletReTeaches.length === 0) return
+    const first = palletReTeaches[0]
+    const fs = palletFrameStatus(currentProgram)
+    setPalletTeachRole(first.role)
+    setPalletTeachMode(modeForRole(first.role, fs))
+    setPalletTeachReason(first.reason || null)
   }
 
   // Resolve the step the overlay is currently teaching (Teach All
@@ -2327,6 +4828,15 @@ export default function ProgramEditor() {
   }
 
   // Apply the just-jogged pose to the overlay's current step.
+  //
+  // Record-through (2026-08-04, §406-teach-time-extension). The Jetson
+  // is the single store for pose state, mid-teach included. Every
+  // Record posts the patch to POST /api/teach_session/{id}/record
+  // FIRST. Only on server ack do we update the local Zustand steps —
+  // otherwise a 403 (not owner) or a network hiccup would leave the
+  // UI showing a taught pose the server never accepted. The WS state
+  // broadcast then propagates the new draft to every connected
+  // device (tablet + PC converge without a refresh).
   async function teachOverlayRecord() {
     const target = teachOverlayStep()
     if (!target) return
@@ -2335,17 +4845,46 @@ export default function ProgramEditor() {
     // to an override — the executor will then prefer this taught_tcp
     // over base+offset. Reset-to-auto clears it.
     if (target.derived_from) patch.overridden = true
-    updateSteps(renumber(steps.map((s) => s.id === target.id ? { ...s, ...patch } : s)))
+    // Record-through: POST to the draft store, wait for ack.
+    // Refuses to advance if the server rejects (403 not_owner or
+    // network error). Local state stays as-is on failure.
+    const pid = currentProgram?.id
+    if (pid) {
+      const ack = await recordTeachPose(pid, `step:${target.id}`, patch)
+      if (!ack.ok) return
+    }
+    // Propagate to any step linked to this one (currently: a later
+    // move_home linked via "Use Step 1 home position"). Mirrors the
+    // taught fields so the persisted JSON always has both source and
+    // linked-child at identical joints — no drift, no codegen FIX C
+    // normalization ever needs to fire.
+    updateSteps(renumber(steps.map((s) => {
+      if (s.id === target.id) return { ...s, ...patch }
+      if (s.linked_to_step_id === target.id) {
+        const linkedPatch = {
+          taught:        !!patch.taught,
+          taught_joints: patch.taught_joints ? [...patch.taught_joints] : s.taught_joints,
+          taught_tcp:    patch.taught_tcp    ? [...patch.taught_tcp]    : s.taught_tcp,
+          taught_at:     patch.taught_at,
+          joints:        patch.joints || patch.taught_joints || s.joints,
+        }
+        if (patch.taught_tcp) linkedPatch.position = patch.taught_tcp.slice(0, 3)
+        return { ...s, ...linkedPatch }
+      }
+      return s
+    })))
     // Single-step flow: just close.
     if (teachSingleId != null) {
       setTeachSingleId(null)
       return
     }
-    // Teach All: advance to next slot, close when done.
+    // Teach All: advance to next slot; when the step queue empties,
+    // chain into any owed pallet re-teaches (single unified
+    // itinerary — the debt list feeds Teach All entirely).
     const nextPos = teachAllPos + 1
     if (nextPos >= teachAllOrder.length) {
-      setTeachAllOrder([])
-      setTeachAllPos(-1)
+      const remainingDebt = computeTeachingDebt(currentProgram)
+      chainToPalletReTeaches(remainingDebt.palletReTeaches)
     } else {
       setTeachAllPos(nextPos)
     }
@@ -2358,8 +4897,11 @@ export default function ProgramEditor() {
     if (teachSingleId != null) { setTeachSingleId(null); return }
     const nextPos = teachAllPos + 1
     if (nextPos >= teachAllOrder.length) {
-      setTeachAllOrder([])
-      setTeachAllPos(-1)
+      // Same chaining as teachOverlayRecord — the itinerary is
+      // unified, so skipping the last step still hands off to any
+      // owed pallet re-teaches.
+      const remainingDebt = computeTeachingDebt(currentProgram)
+      chainToPalletReTeaches(remainingDebt.palletReTeaches)
     } else {
       setTeachAllPos(nextPos)
     }
@@ -2370,15 +4912,366 @@ export default function ProgramEditor() {
   }
 
   function teachOverlayCancel() {
+    // Pallet teach with any recorded work → route through the
+    // confirm dialog so the operator sees the "N of 4 teaches
+    // will be kept" line. Other overlays: cancel directly.
+    if (palletTeachRole && taughtCount(palletFrameStatus(currentProgram)) > 0) {
+      setPalletCancelConfirm(true)
+      return
+    }
     setTeachSingleId(null)
     setTeachAllOrder([])
     setTeachAllPos(-1)
+    setPalletTeachRole(null)
+    setPalletTeachMode(null)
+    setPalletTeachReason(null)
+  }
+
+  function palletTeachDiscardConfirm(discard) {
+    setPalletCancelConfirm(false)
+    // Both branches close the overlay. Recorded teaches persist
+    // via setCurrentProgram writes made on each Record; there's no
+    // separate rollback path, so `discard` is currently advisory —
+    // it flips currentProgram.unsaved so the operator remembers to
+    // hit Save (already true) or leaves it as-is on Keep.
+    setPalletTeachRole(null)
+    setPalletTeachMode(null)
+    setPalletTeachReason(null)
+    if (!discard) {
+      addToast?.(`Teaches preserved — remember to Save`, 'success')
+    }
+  }
+
+  // Pallet Teach button on a pallet-driven step row → open the
+  // fullscreen overlay walking through the 4-point diagram-guided
+  // flow. Mid-flow resume: if some points are already taught (e.g. ①
+  // yes, ②/③ no), start at the first UNTAUGHT role rather than
+  // restarting at ①. All taught → Re-teach from ①.
+  function startPalletTeach() {
+    const first = firstUntaughtPalletRole(currentProgram) || PALLET_ROLE_ORDER[0]
+    const fs = palletFrameStatus(currentProgram)
+    setTeachSingleId(null)
+    setTeachAllOrder([])
+    setTeachAllPos(-1)
+    setPalletTeachRole(first)
+    setPalletTeachMode(modeForRole(first, fs))
+  }
+
+  // Tap-navigation from the diagram — any role is a legal target.
+  function jumpToPalletRole(nextRole) {
+    const t = jumpTo(nextRole, currentProgram, palletTeachRole)
+    if (!t) return
+    setPalletTeachRole(t.role)
+    setPalletTeachMode(t.mode)
+    // Fresh navigation clears the caption addendum + any previous
+    // warning banner — the operator has moved on; the reason /
+    // numbers no longer apply to what they see.
+    setPalletTeachReason(null)
+  }
+
+  // Diagram-guided step shape fed to TeachOverlay. 2026-08-05
+  // operator doctrine ruling: corners 1-3 define the pallet FRAME
+  // ONLY (origin + row axis + column axis + plane). Corner-to-corner
+  // distance has NO required relationship to slot pitch. Slot
+  // spacing comes exclusively from the typed pitch values.
+  // Point 4 is the CENTER of slot [1,1] — the first-part datum.
+  // Prompts updated so the operator never has to infer which
+  // doctrine is in force.
+  const PALLET_TEACH_STEPS = {
+    pallet_c1: {
+      label:  '① PALLET CORNER — origin (slot [1,1] corner)',
+      action: 'pallet_teach_c1',
+      instr:  "Touch the pallet's physical corner at slot [1,1] — this anchors the pallet frame origin.",
+    },
+    pallet_c2: {
+      label:  '② PALLET CORNER — along the first row',
+      action: 'pallet_teach_c2',
+      instr:  "Touch the pallet's physical corner at the far end of the first row — locks the ROW DIRECTION only (not pitch).",
+    },
+    pallet_c3: {
+      label:  '③ PALLET CORNER — along the first column',
+      action: 'pallet_teach_c3',
+      instr:  "Touch the pallet's physical corner at the far end of the first column — locks the COLUMN DIRECTION only (not pitch).",
+    },
+    pallet_part: {
+      label:  '④ FIRST PART CENTER — slot [1,1] datum',
+      action: 'pallet_teach_part',
+      instr:  'Place a real part in slot [1,1] and touch the CENTER of that first place position — this datum plus your typed row/column pitch determines every other slot.',
+    },
+  }
+
+  // Record the current live pose into program.config.pallet_place
+  // under the field for the active role. Mirror to config.pallet
+  // for consumers that still read the pre-pallet_place shape.
+  //
+  // Frame validation (§465 fork-1 kill, 2026-08-04): all frame
+  // geometry runs on the backend via POST /api/pallet/validate_frame.
+  // Timing rules:
+  //   * On Record for a CORNER role, we POST the would-be place
+  //     (including the just-recorded pose) and pass
+  //     re_teaching_role=<this role> so findings mentioning ONLY
+  //     the corner being replaced are suppressed.
+  //   * If any BLOCKING (error-severity) finding involves the
+  //     just-recorded corner, we REFUSE the record: don't commit
+  //     currentProgram, stay at the current role, toast the
+  //     operator with the measured distance in operator copy.
+  //   * Non-blocking findings (or errors involving other corners
+  //     only) surface as an error toast but the record commits
+  //     and the flow advances — the operator can re-teach the
+  //     offending OTHER corner from the itinerary.
+  // No passive banner is rendered from this path.
+  async function palletTeachRecord() {
+    const role = palletTeachRole
+    if (!role) return
+    const field = PALLET_ROLE_TO_FIELD[role]
+    if (!field) return
+    const patch = await buildTaughtPatch()
+    const tcp   = patch.taught_tcp
+    if (!Array.isArray(tcp) || tcp.length < 6) {
+      addToast?.('Could not read TCP from robot state', 'error')
+      return
+    }
+    const cfg = currentProgram?.config || {}
+    // 2026-08-19 scoped fix (ledger 2c2e435 pallet regression, defect A):
+    // pallettest.json was written by this teach path with ONLY
+    // corner1/2/3 + part_tcp — no rows/cols/layers. That produced a
+    // 1×1×1 default in the codegen and a "stuck at slot 1" defect
+    // where the loop wrapper replayed a single-slot cycle N times.
+    // Seed the wizard defaults (4×4×1, 150 mm pitch, 100 mm layer)
+    // when the operator teaches the FIRST corner on a program whose
+    // pallet block has no grid dims. Later edits to rows/cols/layers
+    // via PalletConfigEditor still win (spread order).
+    const _priorPallet = cfg.pallet || {}
+    const _dimsAbsent  =
+      _priorPallet.rows   === undefined &&
+      _priorPallet.cols   === undefined &&
+      _priorPallet.layers === undefined
+    const _dimSeed = _dimsAbsent
+      ? {
+          rows: 4, cols: 4, layers: 1,
+          spacing_x_mm: 150, spacing_y_mm: 150,
+          layer_height_mm: 100,
+          fill_order: 'row_lr',
+          approach_height_mm: 100, retract_height_mm: 200,
+        }
+      : {}
+    const nextPlace = { ..._dimSeed, ...(cfg.pallet_place || {}), [field]: [...tcp] }
+    const nextPallet = { ..._dimSeed, ...(cfg.pallet || {}),      [field]: [...tcp] }
+    const isCorner = role === 'pallet_c1' || role === 'pallet_c2' || role === 'pallet_c3'
+
+    // Role → teach-session slot key (2026-08-04 record-through).
+    // Every pallet Record POSTs its slot to the draft store on
+    // the Jetson — same wire contract step teaching uses. Second
+    // devices watching this program see corner badges fill live.
+    const slotKey = {
+      pallet_c1:   'corner:1',
+      pallet_c2:   'corner:2',
+      pallet_c3:   'corner:3',
+      pallet_part: 'corner:part',
+    }[role]
+
+    if (isCorner) {
+      // Ask the shared validator BEFORE committing. Blocking
+      // findings that name the corner we just recorded refuse
+      // the record. Non-blocking findings surface but proceed.
+      const result = await validatePalletFrameServer(nextPlace, {
+        // We are RECORDING this role, not re-teaching a stale
+        // one, so pass null — the finding-with-this-corner is
+        // exactly what we want to see (blocked or advisory).
+        reTeachingRole: null,
+      })
+      const blockers = findingsBlockingThisRecord(result.findings, role)
+      if (blockers.length > 0) {
+        const op = blockers[0].operator || {}
+        addToast?.({
+          title:  op.title  || 'This corner is too close to another taught corner.',
+          detail: op.detail || 'Jog to the pallet corner and record again.',
+          technicalDetail: op.technicalDetail || blockers[0].message || '',
+        }, 'error', 10000)
+        // eslint-disable-next-line no-console
+        console.warn('[pallet-teach] Record refused', {
+          role, findings: result.findings, measured: result.measured,
+        })
+        // Do NOT commit currentProgram; stay at the current role
+        // in re-teach mode so the operator's next Record replaces
+        // the just-refused attempt without navigating. Also do
+        // NOT record-through — a refused corner never enters the
+        // draft.
+        setPalletTeachMode('re-teach')
+        return
+      }
+      // Record-through: POST the corner pose to the Jetson's
+      // draft store. A 403 (not_owner) or network error refuses
+      // the commit — otherwise the second device would see a
+      // corner it CAN'T see in the shared draft.
+      const pid = currentProgram?.id
+      if (pid && slotKey) {
+        const ack = await recordTeachPose(pid, slotKey, {
+          taught: true, taught_tcp: [...tcp], taught_at: patch.taught_at,
+        })
+        if (!ack.ok) return
+      }
+      // Commit the good record.
+      setCurrentProgram({
+        config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet },
+        unsaved: true,
+      })
+      // Non-blocking findings (or errors involving other corners
+      // only): surface once, let the flow advance.
+      const advisory = (result.findings || []).find(
+        (f) => f?.severity === 'error' || f?.severity === 'warning')
+      if (advisory) {
+        const op = advisory.operator || {}
+        addToast?.({
+          title:  op.title  || 'Pallet frame warning',
+          detail: op.detail || (advisory.message || ''),
+          technicalDetail: op.technicalDetail || advisory.message || '',
+        }, advisory.severity === 'error' ? 'error' : 'warning', 8000)
+      }
+    } else {
+      // ④ record: part-datum doesn't affect corner geometry
+      // math — commit without a frame-validation round-trip, BUT
+      // still record-through to the Jetson so the second-device
+      // view sees the ④ badge fill. The teach-complete gate on
+      // close catches any lingering issue.
+      const pid = currentProgram?.id
+      if (pid && slotKey) {
+        const ack = await recordTeachPose(pid, slotKey, {
+          taught: true, taught_tcp: [...tcp], taught_at: patch.taught_at,
+        })
+        if (!ack.ok) return
+      }
+      setCurrentProgram({
+        config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet },
+        unsaved: true,
+      })
+    }
+
+    const merged = {
+      ...(currentProgram || {}),
+      config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet },
+    }
+    const next = advanceFrom(role, merged)
+    // Advance clears the reason addendum — the current step is done,
+    // whatever justified holding a reason no longer applies.
+    setPalletTeachReason(null)
+    setPalletTeachRole(next ? next.role : null)
+    setPalletTeachMode(next ? next.mode : null)
+    // Teach-complete gate — when the sequence closes (next===null)
+    // run one final validation against the whole place. Findings
+    // surface via toast; the actual save gate is in handleSave.
+    if (next === null && isCorner) {
+      // isCorner only fires the completion check when a corner
+      // completed the sequence, matching the current guard.
+      _runTeachCompleteGate(nextPlace)
+    }
+  }
+
+  async function _runTeachCompleteGate(place) {
+    const result = await validatePalletFrameServer(place || {}, {
+      reTeachingRole: null,
+    })
+    if (!(result.findings && result.findings.length)) return
+    for (const f of result.findings) {
+      const op = f?.operator || {}
+      addToast?.({
+        title:  op.title  || 'Pallet frame finding',
+        detail: op.detail || (f?.message || ''),
+        technicalDetail: op.technicalDetail || f?.message || '',
+      }, f?.severity === 'error' ? 'error' : 'warning', 8000)
+    }
+  }
+
+  function palletTeachSkip() {
+    // Skip always advances forward, even past taught points.
+    const next = advanceFrom(palletTeachRole, currentProgram)
+    setPalletTeachReason(null)
+    setPalletTeachRole(next ? next.role : null)
+    setPalletTeachMode(next ? next.mode : null)
+  }
+
+  function palletTeachBack() {
+    // Back-nav to any earlier role. Sets mode='re-teach' when the
+    // target already has a taught pose — the pose is KEPT until
+    // Record fires, so backing up to look ≠ overwriting.
+    const back = backFrom(palletTeachRole, currentProgram)
+    if (!back) return
+    setPalletTeachRole(back.role)
+    setPalletTeachMode(back.mode)
+    setPalletTeachReason(null)
   }
 
   async function handleSave() {
     if (saveStatus === 'saving') return
     const name = programName.trim() || 'Untitled Program'
+    // Teach-complete gate (§465 fork-1 kill, 2026-08-04). If the
+    // program carries a pallet_place with any taught corners,
+    // run one final backend validation before writing to disk.
+    // Any error-severity finding refuses the save with an
+    // operator toast; warnings surface but don't block.
+    const cfgSave = currentProgram?.config || {}
+    const place   = cfgSave.pallet_place || null
+    const hasAnyCorner = place && (place.corner1_tcp || place.corner2_tcp
+      || place.corner3_tcp || place.part_tcp || place.corner_a_tcp
+      || place.point_b_tcp || place.point_c_tcp)
+    if (hasAnyCorner) {
+      const gate = await validatePalletFrameServer(place,
+        { reTeachingRole: null })
+      const errors = (gate.findings || []).filter(
+        (f) => f?.severity === 'error')
+      if (errors.length > 0) {
+        const op = errors[0].operator || {}
+        addToast?.({
+          title:  op.title  || 'Program can\'t save — pallet frame is bad.',
+          detail: op.detail || (errors[0].message || ''),
+          technicalDetail: op.technicalDetail || errors[0].message || '',
+        }, 'error', 10000)
+        setSaveStatus('error')
+        setSaveError(
+          'Pallet frame refused: ' + (op.title || errors[0].message || ''))
+        return
+      }
+      // Non-error findings surface but don't block.
+      const warns = (gate.findings || []).filter(
+        (f) => f?.severity === 'warning' || f?.severity === 'info')
+      for (const w of warns) {
+        const op = w.operator || {}
+        addToast?.({
+          title:  op.title  || 'Pallet frame finding',
+          detail: op.detail || (w.message || ''),
+          technicalDetail: op.technicalDetail || w.message || '',
+        }, w.severity === 'warning' ? 'warning' : 'info', 6000)
+      }
+    }
     setSaveStatus('saving')
+    // Teach-session promotion (2026-08-04, record-through). If a
+    // draft exists for this program on the Jetson, promote it
+    // through the shared validator door BEFORE the standard PUT.
+    // The server-side promote endpoint merges draft.poses into
+    // the program on disk (via the pending-pose gate), then
+    // deletes the draft. The subsequent PUT below saves the
+    // program-level metadata (steps, config, routines, tags) in
+    // the usual shape — the poses are already on disk after the
+    // promote, so the PUT is idempotent w.r.t. pose data.
+    if (programId && teachSession) {
+      const promote = await promoteTeachSession(programId)
+      if (!promote.ok) {
+        // Route through the shared namedLoadError so operator
+        // copy stays canonical — outcome.kind='pending_poses'
+        // uses the same title/detail the /api/estun/program/run
+        // path emits. Non-fork of load_outcome_operator_copy.
+        const named = namedLoadError(promote.body || {},
+                                     promote.status)
+        addToast?.({
+          title:           named.title,
+          detail:          named.detail,
+          technicalDetail: named.technicalDetail,
+        }, 'error', 10000)
+        setSaveStatus('error')
+        setSaveError('teach-session promote refused')
+        return
+      }
+    }
     try {
       // Preserve the full config block (gripper, pallet, motion profile,
       // etc.) — earlier versions of this save sent only name+steps,
@@ -2390,33 +5283,65 @@ export default function ProgramEditor() {
       if (currentProgram.description) payload.description = currentProgram.description
       if (Array.isArray(currentProgram.tags) && currentProgram.tags.length) payload.tags = currentProgram.tags
       if (currentProgram.cell_id) payload.cell_id = currentProgram.cell_id
+      // 2026-07-30 §430 — round-trip routines[] so the fold state
+      // persists across save/reload. Backend accepts + preserves the
+      // list; codegen ignores it (byte-diff pinned).
+      if (Array.isArray(currentProgram.routines) && currentProgram.routines.length) {
+        payload.routines = currentProgram.routines
+      }
       const body = JSON.stringify(payload)
       const res = await fetch(
         programId ? `/api/programs/${encodeURIComponent(programId)}` : '/api/programs',
         { method: programId ? 'PUT' : 'POST',
-          headers: { 'Content-Type': 'application/json' }, body },
+          headers: { 'Content-Type': 'application/json', 'X-Client-Id': CLIENT_ID },
+          body },
       )
       const data = await res.json().catch(() => ({}))
       if (res.ok && data && data.ok && data.program) {
         setCurrentProgram({ id: data.program.id, name: data.program.name || name, unsaved: false })
-        // Mirror to backend STATE so the task runner sees the just-
-        // saved program when the user clicks Run.
         setProgramSteps(steps)
-        // Refresh the shared programs list so ProgramLibrary sees
-        // the just-saved program WITHOUT waiting for its next
-        // mount-fetch. The store throttles within 500 ms but
-        // this is a force-refresh — the operator just changed
-        // the backend, we want the cache current immediately.
         refreshPrograms?.()
         setSaveStatus('saved')
+        setSaveError(null)
         setTimeout(() => setSaveStatus(null), 2000)
+      } else if (res.status === 404 && programId) {
+        // Stale-id case: currentProgram carries an id whose file
+        // isn't on disk (deleted OR the id was authored under the
+        // old underscored-slug regime and now fails _PROG_ID_RE).
+        // Auto-fallback: retry as POST so the operator's edits
+        // don't get lost. A fresh slug will be minted from the
+        // current name.
+        const retry = await fetch('/api/programs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Client-Id': CLIENT_ID },
+          body,
+        })
+        const rdata = await retry.json().catch(() => ({}))
+        if (retry.ok && rdata.ok && rdata.program) {
+          setCurrentProgram({
+            id: rdata.program.id, name: rdata.program.name || name,
+            unsaved: false,
+          })
+          setProgramSteps(steps)
+          refreshPrograms?.()
+          setSaveStatus('saved')
+          setSaveError(`Saved as ${rdata.program.id} (previous id ${programId} no longer exists — the file was recreated with a fresh slug).`)
+          setTimeout(() => setSaveStatus(null), 4000)
+        } else {
+          setSaveStatus('error')
+          setSaveError(rdata?.error
+            || `Save-as-new fallback also failed (HTTP ${retry.status})`)
+        }
       } else {
         setSaveStatus('error')
-        setTimeout(() => setSaveStatus(null), 3000)
+        setSaveError(
+          data?.error
+          || `Save failed (HTTP ${res.status}${data?.step_issues ? '; see step details' : ''})`
+        )
       }
-    } catch {
+    } catch (e) {
       setSaveStatus('error')
-      setTimeout(() => setSaveStatus(null), 3000)
+      setSaveError(`Network error: ${e?.message || e}`)
     }
   }
 
@@ -2492,6 +5417,23 @@ export default function ProgramEditor() {
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#fff' }}>
+      {/* Teach-session concurrency banner (2026-08-04). Renders
+          when another device owns the active teach session for
+          this program. Live badges continue to update from the
+          WS broadcast — this is a READ-ONLY view of the other
+          operator's work in progress. Take Over swaps
+          ownership atomically. */}
+      {/* 2026-08-05 (teach_lock_banner fork-1 kill): shared banner
+          + Take Over button — same component the fullscreen teach
+          overlay renders. Both surfaces show the button; the operator
+          can take over from EITHER location. Old inline copy retired. */}
+      {isTeachingElsewhere && teachSession && (
+        <TeachLockBanner
+          session={teachSession}
+          programId={currentProgram?.id}
+          variant="inline"
+        />
+      )}
       <div className="no-scrollbar" style={{
         padding: '12px 16px',
         paddingRight: 'calc(16px + env(safe-area-inset-right, 0px))',
@@ -2523,7 +5465,40 @@ export default function ProgramEditor() {
           {steps.length} step{steps.length === 1 ? '' : 's'}
         </span>
 
+        {/* Corner smoothing — program-level setting. Higher = faster,
+            wider arcs through travel points. Applies to every
+            intermediate move in both pallet and non-pallet paths;
+            never to a taught contact (the classifier keeps those
+            as fine stops for IO transitions). Wizard defaults new
+            programs to MEDIUM; the operator retunes here in the
+            editor.  Value flows through program.config.corner_smoothing
+            and is consumed by codegen_blend at emit time. */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4,
+                      flexShrink: 0 }}
+             title="Corner smoothing (blend radius policy). LOW ≤ 60mm, MEDIUM ≤ 100mm, HIGH ≤ 200mm. Higher = faster, wider arcs through travel points. Taught contacts always stop.">
+          <span style={{ fontSize: 11, color: '#6b7280' }}>Smoothing</span>
+          <select
+            value={String(currentProgram?.config?.corner_smoothing || 'medium').toLowerCase()}
+            onChange={(e) => setCurrentProgram({
+              config: { ...(currentProgram?.config || {}),
+                        corner_smoothing: e.target.value },
+              unsaved: true,
+            })}
+            aria-label="Corner smoothing"
+            style={{
+              padding: '3px 6px', fontSize: 12, fontWeight: 600,
+              background: '#f8fafc', color: '#111',
+              border: '1px solid #d1d5db', borderRadius: 4,
+              cursor: 'pointer',
+            }}>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+          </select>
+        </div>
+
         <button onClick={handleSave} disabled={!unsaved || saveStatus === 'saving'}
+          title={saveError || (unsaved ? 'Save the current program' : 'No unsaved changes')}
           style={{
             padding: '6px 14px', fontSize: 12, fontWeight: 600,
             background: saveStatus === 'saved' ? '#16A34A'
@@ -2539,6 +5514,57 @@ export default function ProgramEditor() {
             : saveStatus === 'error' ? 'Error'
             : unsaved ? 'Save' : 'Saved'}
         </button>
+
+        {/* Rename affordance for programs whose id can't round-trip
+            through the controller (any id containing anything but
+            [a-z0-9] — the controller splits underscores as path
+            separators; see 2026-07-20 alarm 10001 bug). Only shown
+            when the program has actually been saved (has an id) AND
+            the id fails the round-trip test. */}
+        {currentProgram?.id && !/^[a-z0-9]+$/.test(currentProgram.id) && (
+          <button
+            onClick={async () => {
+              const suggested = (currentProgram.name || currentProgram.id)
+                .toLowerCase().replace(/[^a-z0-9]+/g, '')
+              const newName = window.prompt(
+                `Program id "${currentProgram.id}" contains characters the controller ` +
+                `can't round-trip (only [a-z0-9] work). Enter a new name — it will ` +
+                `be re-slugged to a safe id.`,
+                suggested || currentProgram.name || 'newprogram')
+              if (newName) {
+                const result = await useStore.getState().renameProgram(currentProgram.id, newName)
+                if (result) {
+                  setSaveError(null)
+                  setSaveStatus('saved')
+                  setTimeout(() => setSaveStatus(null), 3000)
+                }
+              }
+            }}
+            title="Migrate this program to a controller-safe id (letters + digits only)"
+            style={{
+              padding: '6px 12px', fontSize: 12, fontWeight: 600,
+              background: '#B45309', color: '#fff',
+              border: 'none', borderRadius: 6, cursor: 'pointer', flexShrink: 0,
+            }}>
+            Rename to controller-safe id
+          </button>
+        )}
+
+        {/* Inline save-error text. Replaces the previously-silent
+            "Error" badge with the specific server response (e.g.
+            "Step 2 (Move Linear) references point 'p1' which has
+            not been taught"). Auto-clears when the operator clicks
+            Save successfully. */}
+        {saveError && saveStatus === 'error' && (
+          <div style={{
+            padding: '4px 10px', fontSize: 11, color: '#7F1D1D',
+            background: '#FEE2E2', border: '1px solid #DC2626',
+            borderRadius: 6, maxWidth: 480, lineHeight: 1.4,
+            flexShrink: 1, minWidth: 0,
+          }}>
+            {saveError}
+          </div>
+        )}
 
         <div style={{ flexShrink: 0 }}>
           <button ref={loadBtnRef} onClick={openLoadMenu}
@@ -2565,9 +5591,21 @@ export default function ProgramEditor() {
         </div>
 
         <button onClick={() => setCurrentProgram({
+          // Full blank template — every field explicitly reset so a
+          // previously-loaded PBD program's config.pbd_metadata / tags
+          // / description can't leak into what looks like a fresh
+          // hand-authored program. setCurrentProgram MERGES; passing
+          // the full shape here is what forces a clean slate.
           id: null,
           name: 'New Program',
+          description: '',
           steps: [],
+          config: {},
+          tags: [],
+          cell_id: null,
+          points: {},
+          source: 'manual',
+          has_taught_poses: false,
           unsaved: true,
         })}
           title="Start a blank program — Save creates a new file"
@@ -2641,39 +5679,165 @@ export default function ProgramEditor() {
         </span>
       </div>
 
-      {/* Untaught-positions banner — visible whenever any move step
-          still needs to be taught. Disappears once everything's set. */}
-      {untaughtCount > 0 && teachAllPos < 0 && teachSingleId == null && (
+      {/* Bug 1 banner — the currently-open program was mutated on
+          another device while THIS client has unsaved local edits.
+          The store's _handleProgramEvents sets programChangedByOther
+          only in the conflict case; in the no-unsaved-edits case the
+          store refetches quietly and this banner never appears. */}
+      {programChangedByOther && (
         <div style={{
-          margin: '8px 12px 0', padding: '8px 12px', fontSize: 12,
-          background: '#fef2f2', color: '#b91c1c',
-          border: '1px solid #fecaca', borderRadius: 6,
-          display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0,
+          margin: '8px 12px 0', padding: '10px 14px', fontSize: 13,
+          background: '#fffbeb', color: '#92400e',
+          border: '1px solid #fde68a', borderRadius: 6,
+          display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0,
         }}>
-          <span style={{ fontWeight: 700 }}>
-            {untaughtCount} position{untaughtCount > 1 ? 's' : ''} not taught
-          </span>
-          <span style={{ color: '#9ca3af', fontSize: 11 }}>
-            — jog the robot, then click Teach on each step
+          <span style={{ fontWeight: 700 }}>⚠ Program updated on another device</span>
+          <span style={{ color: '#78716c', fontSize: 12 }}>
+            You have unsaved edits. Reload will lose them; Keep my edits
+            leaves your work in place — the next Save will overwrite the
+            other change.
           </span>
           <div style={{ flex: 1 }} />
-          <button onClick={startTeachAll}
+          <button onClick={() => { refreshCurrentProgram(); }}
             style={{
-              padding: '6px 14px', fontSize: 11, fontWeight: 700,
-              background: '#2563EB', color: '#fff',
+              padding: '6px 14px', fontSize: 12, fontWeight: 700,
+              background: '#f59e0b', color: '#fff',
               border: 'none', borderRadius: 5, cursor: 'pointer',
-            }}>
-            Teach All ({untaughtCount})
-          </button>
+            }}>Reload</button>
+          <button onClick={() => clearProgramChangedByOther()}
+            style={{
+              padding: '6px 14px', fontSize: 12, fontWeight: 600,
+              background: '#fff', color: '#92400e',
+              border: '1px solid #fde68a', borderRadius: 5, cursor: 'pointer',
+            }}>Keep my edits</button>
         </div>
       )}
+
+      {/* Unified teaching-debt banner — 2026-07-31 consolidation.
+          Absorbs the old "N positions not taught" red banner AND
+          the legacy-pallet-migration info banner into ONE display
+          fed by computeTeachingDebt(program). Count = untaught
+          steps + owed re-teaches. Severity: red when required
+          teaches missing (program can't run); amber when only
+          quality re-teaches remain. Hidden mid-flow (teachAllPos ≥ 0
+          or teachSingleId set or pallet teach in progress). */}
+      {(() => {
+        if (teachAllPos >= 0) return null
+        if (teachSingleId != null) return null
+        if (palletTeachRole) return null
+        const debt = computeTeachingDebt(currentProgram)
+        if (!debt.severity) return null
+        const palette = debt.severity === 'error'
+          ? { bg: '#fef2f2', border: '#fecaca', fg: '#b91c1c', btn: '#DC2626' }
+          : { bg: '#fef3c7', border: '#fde68a', fg: '#78350f', btn: '#D97706' }
+        const detail = debt.severity === 'error'
+          ? 'jog the robot, then click Teach on each step'
+          : 'the program will run — clear the owed re-teaches to lock in the quality'
+        return (
+          <div
+            data-testid="teaching-debt-banner"
+            data-severity={debt.severity}
+            data-total={debt.total}
+            style={{
+              margin: '8px 12px 0', padding: '8px 12px', fontSize: 12,
+              background: palette.bg, color: palette.fg,
+              border: `1px solid ${palette.border}`, borderRadius: 6,
+              display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0,
+            }}>
+            <span style={{ fontWeight: 700 }}>
+              {debtBannerLabel(debt)}
+            </span>
+            <span style={{ color: '#6b7280', fontSize: 11 }}>
+              — {detail}
+            </span>
+            <div style={{ flex: 1 }} />
+            <button
+              data-testid="teaching-debt-teach-all"
+              onClick={startTeachAll}
+              style={{
+                padding: '6px 14px', fontSize: 11, fontWeight: 700,
+                background: palette.btn, color: '#fff',
+                border: 'none', borderRadius: 5, cursor: 'pointer',
+              }}>
+              Teach All ({debt.total})
+            </button>
+          </div>
+        )
+      })()}
+
+      {/* Tool & Payload — per-program metadata. Not on the wire (see
+          codegen; setPayload isn't wire-proven), but the collision
+          monitor and the run confirm modal both surface the value.
+          Amber banner when unset to nudge the operator; the fields
+          themselves live inside the collapsible section below. */}
+      <ToolAndPayloadSection
+        program={currentProgram}
+        onPatch={(patch) => setCurrentProgram({
+          config: { ...(currentProgram?.config || {}), ...patch },
+          unsaved: true,
+        })}
+      />
+
+      {/* Program-level findings — legacy-migration nudges, etc.
+          Clears automatically when the operator resolves the
+          underlying condition (e.g. re-teaches ④). Never lives in a
+          modal; the operator sees + acts on findings in-flow. */}
+      <ProgramFindingsPanel
+        program={currentProgram}
+        onAction={(f) => {
+          // Route each finding's CTA to the right operator gesture.
+          // Currently: 'teach-pallet-part' jumps into the pallet
+          // teach sequence at ④.
+          if (f.action?.kind === 'teach-pallet-part') {
+            setTeachSingleId(null)
+            setTeachAllOrder([])
+            setTeachAllPos(-1)
+            setPalletTeachRole('pallet_part')
+            setPalletTeachMode(modeForRole('pallet_part',
+              palletFrameStatus(currentProgram)))
+                  }
+        }}
+      />
 
       <div
         // Clicking blank space inside the scroll area (not on a row)
         // clears the selection — file-manager style.
         onClick={(e) => { if (e.target === e.currentTarget) setSelectedId(null) }}
         style={{ flex: 1, overflowY: 'auto', padding: '8px 12px' }}>
-        {steps.map((step, idx) => {
+        {steps.map((rawStep, idx) => {
+          // 2026-08-05 (editor truth): the row's DISPLAY should
+          // reflect the draft-merged view (if a teach session
+          // exists), so a fresh Record on a step immediately
+          // clears the NOT TAUGHT badge — same honest-display
+          // principle the banner and Run gate use. All EDIT
+          // operations still mutate `steps` by id — the merge is
+          // a display-only overlay.
+          const step = stepsMerged[idx] || rawStep
+          // Program-level pallet frame status — same value for every
+          // row, cheap to recompute per iteration and keeps the closure
+          // over `currentProgram` fresh across edits.
+          const _palletFrame  = palletFrameStatus(currentProgram)
+          const _isPalletStep = isPalletDriven(step)
+          // 2026-07-30 §430 — routine fold: skip rendering rows in
+          // iteration > 0 of a collapsed routine. The iteration-0
+          // representative row + a "×N ▸ expand" chip stand in for
+          // the whole routine.
+          const _rinfo = stepRoutineInfo[idx]
+          if (_rinfo && _rinfo.iteration > 0 && !isRoutineExpanded(_rinfo.routineId)) {
+            return null
+          }
+          // First move_home in the program is the shared "home"
+          // fixture. Any later move_home can link to it via the
+          // "Use Step 1 home position" control — updates to the first
+          // step then propagate through teachOverlayRecord.
+          const firstHomeStep    = steps.find((s) => s.action === 'move_home')
+          const firstHomeStepId  = firstHomeStep ? firstHomeStep.id : null
+          const firstHomeStepNum = firstHomeStep
+            ? (steps.findIndex((s) => s.id === firstHomeStep.id) + 1)
+            : null
+          const isMoveHome     = step.action === 'move_home'
+          const isLaterHome    = isMoveHome && firstHomeStepId != null && step.id !== firstHomeStepId
+          const isLinkedToHome = step.linked_to_step_id === firstHomeStepId && firstHomeStepId != null
           const def = actionFor(step)
           const tagColor = TAG_COLORS[def.tag] || '#6b7280'
 
@@ -2753,23 +5917,165 @@ export default function ProgramEditor() {
                 }}>
                   {isDone ? '✓' : (idx + 1)}
                 </div>
-                {/* Always reserve the T/! slot so the pill's X position is
-                    the same on teachable and non-teachable rows. */}
-                <div title={isTeachable(step)
-                              ? (step.taught ? `Taught at ${step.taught_at || 'unknown'}` : 'Position not taught — click Teach')
-                              : undefined}
-                  style={{
-                    width: 26, height: 26, borderRadius: '50%',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    flexShrink: 0,
-                    visibility: isTeachable(step) ? 'visible' : 'hidden',
-                    background: step.taught ? '#f0fdf4' : '#fef2f2',
-                    border:     step.taught ? '2px solid #16A34A' : '2px dashed #DC2626',
-                    color:      step.taught ? '#16A34A' : '#DC2626',
-                    fontSize: 11, fontWeight: 700,
-                  }}>
-                  {step.taught ? 'T' : '!'}
-                </div>
+                {/* Always reserve the T/!/🔗 slot so the pill's X position
+                    is the same on teachable and non-teachable rows.
+                    position_ref rows render a link chip pointing at the
+                    source step so the operator can see the shared pose
+                    at a glance. `point_name` linkage (the named-points
+                    path — the direction we're generalizing toward) gets
+                    its own chip variant with the point name and the
+                    total number of steps sharing it. */}
+                {step.point_name ? (() => {
+                  const refCount = countStepsUsingPoint(steps, step.point_name)
+                  return (
+                    <div
+                      title={`Uses taught position ${step.point_name}${refCount > 1 ? ` — ${refCount} steps share it` : ''}. Re-teaching the point updates every linked step.`}
+                      onClick={(e) => { e.stopPropagation(); if (!locked) setPickerStepId(step.id) }}
+                      style={{
+                        minWidth: 26, height: 26, borderRadius: 13,
+                        padding: '0 10px',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        gap: 4, flexShrink: 0,
+                        background: '#eef2ff', border: '1px solid #c7d2fe',
+                        color: '#4338ca', fontSize: 11, fontWeight: 700,
+                        cursor: locked ? 'default' : 'pointer',
+                      }}
+                    >
+                      <span style={{ fontSize: 13, lineHeight: 1 }}>🔗</span>
+                      <span style={{ fontFamily: 'var(--font-mono, monospace)' }}>{step.point_name}</span>
+                      {refCount > 1 && (
+                        <span style={{
+                          fontSize: 10, fontWeight: 800,
+                          background: '#4338ca', color: '#fff',
+                          borderRadius: 8, padding: '1px 6px',
+                        }}>×{refCount}</span>
+                      )}
+                    </div>
+                  )
+                })() : step.position_ref != null ? (
+                  <div
+                    title={`Uses the same position as Step ${step.position_ref}`}
+                    style={{
+                      minWidth: 26, height: 26, borderRadius: 13,
+                      padding: '0 8px',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      gap: 3, flexShrink: 0,
+                      background: '#eff6ff', border: '1px solid #93c5fd',
+                      color: '#1D4ED8', fontSize: 11, fontWeight: 700,
+                    }}
+                  >
+                    <span style={{ fontSize: 13, lineHeight: 1 }}>🔗</span>
+                    <span>{step.position_ref}</span>
+                  </div>
+                ) : _isPalletStep ? (() => {
+                  // Pallet step badge tracks FRAME completeness — the
+                  // move_to_pallet step has no per-step taught flag; the
+                  // config's completeness is what the operator needs to
+                  // see at a glance. Three states so partial doesn't
+                  // look like none:
+                  //   4/4 → solid green T
+                  //   1..3/4 → amber solid, shows the count
+                  //   0/4 → red dashed !
+                  //
+                  // D10 (Program Doctrine): while programRevConfirmed
+                  // is false — WS down or post-reconnect refetch
+                  // pending — we don't know if another client changed
+                  // the frame. Render a subtle "syncing" state
+                  // instead of a confident T. The stop-zone modal
+                  // and the safety layer are unaffected; only the
+                  // taught-state assertion softens.
+                  const n = taughtCount(_palletFrame)
+                  const derived = n === 4 ? 'full' : n === 0 ? 'none' : 'partial'
+                  const state = programRevConfirmed ? derived : 'syncing'
+                  const bg = state === 'full'    ? '#f0fdf4'
+                           : state === 'partial' ? '#fef3c7'
+                           : state === 'syncing' ? '#f1f5f9'
+                                                 : '#fef2f2'
+                  const border = state === 'full'    ? '2px solid #16A34A'
+                               : state === 'partial' ? '2px solid #d97706'
+                               : state === 'syncing' ? '2px dashed #64748b'
+                                                     : '2px dashed #DC2626'
+                  const fg = state === 'full'    ? '#16A34A'
+                           : state === 'partial' ? '#92400e'
+                           : state === 'syncing' ? '#475569'
+                                                 : '#DC2626'
+                  const label = state === 'full'    ? 'T'
+                              : state === 'partial' ? `${n}/4`
+                              : state === 'syncing' ? '…'
+                                                    : '!'
+                  const title = state === 'syncing'
+                    ? 'state syncing… — the client\'s taught data is unconfirmed '
+                      + '(WS reconnect pending). Never render green on unconfirmed data.'
+                    : state === 'full'
+                    ? 'Pallet frame taught: ①②③ corners + ④ first-part.'
+                    : state === 'partial'
+                    ? `Pallet frame partially taught: ${n} of 4 points. Click Teach to resume.`
+                    : 'Pallet frame not yet taught — click Teach.'
+                  return (
+                    <div
+                      data-testid="pallet-row-badge"
+                      data-state={state}
+                      title={title}
+                      style={{
+                        // Wider box for the "N/4" partial label.
+                        minWidth: 26, height: 26, borderRadius: 13,
+                        padding: state === 'partial' ? '0 6px' : 0,
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        flexShrink: 0,
+                        background: bg,
+                        border,
+                        color: fg,
+                        fontSize: state === 'partial' ? 10 : 11,
+                        fontWeight: 700,
+                        letterSpacing: state === 'partial' ? 0.5 : 0,
+                        fontFamily: state === 'partial'
+                          ? 'var(--font-mono, monospace)' : undefined,
+                      }}>
+                      {label}
+                    </div>
+                  )
+                })() : (() => {
+                  // Standard row badge — T / ! for teachable steps.
+                  // D10: same "syncing" softening as the pallet badge.
+                  const teachable = isTeachable(step, currentProgram)
+                  const state = !teachable ? null
+                              : !programRevConfirmed ? 'syncing'
+                              : (step.taught ? 'taught' : 'untaught')
+                  const title = state === 'syncing'
+                    ? 'state syncing… — the client\'s taught data is unconfirmed '
+                      + '(WS reconnect pending). Never render green on unconfirmed data.'
+                    : teachable
+                      ? (step.taught
+                        ? `Taught at ${step.taught_at || 'unknown'}`
+                        : 'Position not taught — click Teach')
+                      : undefined
+                  return (
+                    <div
+                      data-testid="step-row-taught-badge"
+                      data-state={state || 'hidden'}
+                      title={title}
+                      style={{
+                        width: 26, height: 26, borderRadius: '50%',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        flexShrink: 0,
+                        visibility: teachable ? 'visible' : 'hidden',
+                        background: state === 'syncing' ? '#f1f5f9'
+                                  : state === 'taught'  ? '#f0fdf4'
+                                                        : '#fef2f2',
+                        border:     state === 'syncing' ? '2px dashed #64748b'
+                                  : state === 'taught'  ? '2px solid #16A34A'
+                                                        : '2px dashed #DC2626',
+                        color:      state === 'syncing' ? '#475569'
+                                  : state === 'taught'  ? '#16A34A'
+                                                        : '#DC2626',
+                        fontSize: 11, fontWeight: 700,
+                      }}>
+                      {state === 'syncing' ? '…'
+                        : state === 'taught' ? 'T'
+                        : '!'}
+                    </div>
+                  )
+                })()}
                 <span style={{
                   display: 'inline-block', flexShrink: 0,
                   minWidth: 70, textAlign: 'center', boxSizing: 'border-box',
@@ -2779,6 +6085,93 @@ export default function ProgramEditor() {
                 }}>
                   {def.tag}
                 </span>
+                {/* Emitted-verb divergence chip (Doctrine D3).
+                    When codegen has written program.emitted_verbs
+                    AND the emitted verb differs from what step.action
+                    implies, surface both plus the reason. Without
+                    this the row would silently show "MOVE LINEAR"
+                    while codegen emitted movJ. */}
+                {(() => {
+                  const v = verbForStep(currentProgram, idx)
+                  if (!v || !v.verb) return null
+                  if (v.expected) return null   // no emitted table → nothing to compare against
+                  const impliedByAction =
+                    step.action === 'move_home'   ? 'movJ'
+                  : step.action === 'move_joint'  ? 'movJ'
+                  : step.action === 'move_linear' ? 'movL'
+                  : step.action === 'approach'    ? 'movL'
+                  : step.action === 'pick'        ? 'movL'
+                  : step.action === 'place'       ? 'movL'
+                  : null
+                  if (impliedByAction == null) return null
+                  if (v.verb === impliedByAction) return null
+                  return (
+                    <span
+                      data-testid="step-emitted-verb-chip"
+                      title={`Codegen emitted ${v.verb} (action implies `
+                        + `${impliedByAction})${v.reason ? ' — ' + v.reason : ''}`}
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 4,
+                        flexShrink: 0, fontSize: 10, fontWeight: 700,
+                        padding: '2px 6px', borderRadius: 4,
+                        background: '#FEF3C7', color: '#92400E',
+                        border: '1px solid #F59E0B',
+                        fontFamily: 'var(--font-mono, monospace)',
+                      }}>
+                      ⚠ {v.verb}
+                    </span>
+                  )
+                })()}
+                {_rinfo && _rinfo.firstOfRoutine && (
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); toggleRoutine(_rinfo.routineId) }}
+                    title={
+                      isRoutineExpanded(_rinfo.routineId)
+                        ? `Fold ${_rinfo.iterations} iterations back to one representative cycle. Edits apply to every iteration regardless of fold state.`
+                        : `Expand to show all ${_rinfo.iterations} iterations. Edits to this cycle apply to every iteration.`
+                    }
+                    style={{
+                      marginLeft: 6, fontSize: 10, fontWeight: 700,
+                      padding: '3px 8px',
+                      borderRadius: 12,
+                      color: '#065f46', background: '#d1fae5',
+                      border: '1px solid #6ee7b7',
+                      display: 'inline-flex', alignItems: 'center', gap: 4,
+                      cursor: 'pointer', flexShrink: 0,
+                    }}>
+                    ×{_rinfo.iterations}
+                    <span style={{ fontSize: 9, fontWeight: 800 }}>
+                      {isRoutineExpanded(_rinfo.routineId) ? '▾ fold' : '▸ expand'}
+                    </span>
+                  </button>
+                )}
+                {/* 2026-08-06 palletize completeness — expand/fold chip
+                    for the move_to_pallet cycle template preview. The
+                    preview panel itself is rendered OUTSIDE the row
+                    (see the sibling <PalletExpansionPreview /> call
+                    lower in this component tree). */}
+                {_isPalletStep && (
+                  <button
+                    type="button"
+                    data-testid="pallet-step-expand-toggle"
+                    onClick={(e) => { e.stopPropagation(); togglePalletExpanded(step.id) }}
+                    title={
+                      palletExpandedIds.has(step.id)
+                        ? 'Hide the per-cycle template preview'
+                        : 'Show the per-cycle template (approach, pick, vacuum, transit, place, release)'
+                    }
+                    style={{
+                      marginLeft: 6, fontSize: 10, fontWeight: 700,
+                      padding: '3px 8px', borderRadius: 12,
+                      color: '#0f766e', background: '#ccfbf1',
+                      border: '1px solid #5eead4',
+                      display: 'inline-flex', alignItems: 'center', gap: 4,
+                      cursor: 'pointer', flexShrink: 0,
+                    }}>
+                    {palletExpandedIds.has(step.id) ? '▾ fold' : '▸ expand'}
+                  </button>
+                )}
               </div>
 
               {/* MIDDLE — title + detail line, fills the remaining width.
@@ -2797,12 +6190,30 @@ export default function ProgramEditor() {
                     wordBreak: 'break-word', whiteSpace: 'normal',
                   }}>
                     {step.label || def.label}
+                    {isLinkedToHome && (
+                      <span style={{
+                        marginLeft: 10, fontSize: 11, fontWeight: 700,
+                        padding: '2px 8px', borderRadius: 10,
+                        background: '#eef2ff', color: '#4338ca',
+                        border: '1px solid #c7d2fe',
+                      }}>🔗 Linked to Step {firstHomeStepNum}</span>
+                    )}
                   </div>
                 ) : (
-                  <EditableStepLabel
-                    value={step.label || def.label}
-                    onSave={(newLabel) => handleRename(step.id, newLabel)}
-                  />
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <EditableStepLabel
+                      value={step.label || def.label}
+                      onSave={(newLabel) => handleRename(step.id, newLabel)}
+                    />
+                    {isLinkedToHome && (
+                      <span style={{
+                        fontSize: 11, fontWeight: 700,
+                        padding: '2px 8px', borderRadius: 10,
+                        background: '#eef2ff', color: '#4338ca',
+                        border: '1px solid #c7d2fe', whiteSpace: 'nowrap',
+                      }}>🔗 Linked to Step {firstHomeStepNum}</span>
+                    )}
+                  </div>
                 )}
                 <div style={{
                   display: 'flex', width: '100%',
@@ -2816,7 +6227,7 @@ export default function ProgramEditor() {
                   }}>
                     {detailLine(step, ioLabels)}
                   </span>
-                  {isTeachable(step) && hasPositionData(step) && (() => {
+                  {isTeachable(step, currentProgram) && hasPositionData(step) && (() => {
                     const open = openPosData.has(step.id)
                     return (
                       <a
@@ -2836,12 +6247,12 @@ export default function ProgramEditor() {
                     )
                   })()}
                 </div>
-                {isTeachable(step) && !step.taught && (
+                {isTeachable(step, currentProgram) && !step.taught && (
                   <div style={{ fontSize: 13, color: '#DC2626', fontWeight: 600 }}>
                     NOT TAUGHT
                   </div>
                 )}
-                {isTeachable(step) && openPosData.has(step.id) && (
+                {isTeachable(step, currentProgram) && openPosData.has(step.id) && (
                   <div style={{
                     marginTop: 2, padding: 8,
                     background: '#f3f4f6', border: '1px solid #e5e7eb',
@@ -2897,7 +6308,7 @@ export default function ProgramEditor() {
                     </button>
                   )
                 )}
-                {!locked && isTeachable(step) && (
+                {!locked && isTeachable(step, currentProgram) && (
                   <button onClick={(e) => { e.stopPropagation(); teachStep(step.id) }}
                     title={step.taught ? 'Re-record this position from the current robot pose' : 'Record the current robot pose as this step\'s position'}
                     style={{
@@ -2908,6 +6319,109 @@ export default function ProgramEditor() {
                       borderRadius: 5, cursor: 'pointer',
                     }}>
                     {step.taught ? 'Re-teach' : 'Teach'}
+                  </button>
+                )}
+                {!locked && _isPalletStep && (
+                  <button
+                    data-testid="pallet-row-teach"
+                    onClick={(e) => { e.stopPropagation(); startPalletTeach() }}
+                    title={_palletFrame.allTaught
+                      ? 'Re-teach the pallet frame — walk through ①②③ corners + ④ first-part.'
+                      : 'Teach the pallet frame — walk through ①②③ corners + ④ first-part. Resumes at the first untaught point.'}
+                    style={{
+                      padding: '6px 14px', fontSize: 12, fontWeight: 600, flexShrink: 0,
+                      background: _palletFrame.allTaught ? '#f0fdf4' : '#eff6ff',
+                      color:      _palletFrame.allTaught ? '#16A34A' : '#2563EB',
+                      border:     _palletFrame.allTaught ? '1px solid #bbf7d0' : '1px solid #bfdbfe',
+                      borderRadius: 5, cursor: 'pointer',
+                    }}>
+                    {_palletFrame.allTaught ? 'Re-teach' : 'Teach'}
+                  </button>
+                )}
+                {/* Position-picker gate. Every teachable step that
+                    isn't already linked can open the picker. Enabled
+                    condition: at least ONE taught position source
+                    exists in the program (either another teachable
+                    step with taught_joints, OR a named point in
+                    program.points). This is the Bug 2 fix — the
+                    previous version gated only on program.points,
+                    which stays empty in the normal editor-teach flow,
+                    so the button was dead on every non-home row. */}
+                {/* The home-specific buttons below still cover later
+                    move_home rows exactly as they did pre-Bug-2 — the
+                    unified Link/Unlink here hides on those rows so an
+                    operator with muscle memory sees the same UI.
+                    Gate on TEACHABLE_ACTIONS membership rather than
+                    isTeachable(step, currentProgram) — the latter returns false when
+                    position_ref is set, which would hide our own
+                    Unlink button on ea64950-linked rows. */}
+                {(() => {
+                  if (locked || isLaterHome) return null
+                  const isPosStep = TEACHABLE_ACTIONS.has(step.action)
+                                 || (step.type && ACTION_TYPES.find((a) => a.type === step.type
+                                                                    && TEACHABLE_ACTIONS.has(a.value)))
+                  if (!isPosStep) return null
+                  if (isDerivedOffsetMove(step)) return null
+                  const linked = step.point_name || step.position_ref != null
+                  if (linked) {
+                    return (
+                      <button onClick={(e) => { e.stopPropagation(); unlinkStepFromSource(step.id) }}
+                        title="Detach this step from its linked position. Keeps any mirrored pose data locally."
+                        style={{
+                          padding: '6px 14px', fontSize: 12, fontWeight: 600, flexShrink: 0,
+                          background: '#f5f3ff', color: '#6d28d9',
+                          border: '1px solid #ddd6fe', borderRadius: 5, cursor: 'pointer',
+                        }}>
+                        ⛓ Unlink
+                      </button>
+                    )
+                  }
+                  const hasAnySource = collectPositionSources(steps, currentProgram?.points)
+                    .some((e) => e.kind !== 'step' || e.id !== step.id)
+                  return (
+                    <button onClick={(e) => { e.stopPropagation(); setPickerStepId(step.id) }}
+                      title={hasAnySource
+                        ? 'Link this step to a previously taught position. Re-teaching the source updates every linked step.'
+                        : 'No other taught positions in this program yet — teach one first.'}
+                      disabled={!hasAnySource}
+                      style={{
+                        padding: '6px 14px', fontSize: 12, fontWeight: 600, flexShrink: 0,
+                        background: '#eef2ff', color: '#4338ca',
+                        border: '1px solid #c7d2fe', borderRadius: 5,
+                        cursor: hasAnySource ? 'pointer' : 'not-allowed',
+                        opacity: hasAnySource ? 1 : 0.5,
+                      }}>
+                      🔗 Link
+                    </button>
+                  )
+                })()}
+                {/* "Use Step N home position" — appears on any move_home
+                    step past the first. Clicking it mirrors the first
+                    move_home's taught pose and records a live link so
+                    future re-teach of the first propagates here. If
+                    already linked, the button flips to "Unlink" so the
+                    operator can break the mirror and give this step
+                    its own pose again. */}
+                {!locked && isLaterHome && !isLinkedToHome && (
+                  <button onClick={(e) => { e.stopPropagation(); linkHomeToFirst(step.id) }}
+                    title={`Mirror the pose taught in Step ${firstHomeStepNum} — future re-teach of Step ${firstHomeStepNum} will update this step too.`}
+                    style={{
+                      padding: '6px 14px', fontSize: 12, fontWeight: 600, flexShrink: 0,
+                      background: '#eef2ff', color: '#4338ca',
+                      border: '1px solid #c7d2fe', borderRadius: 5, cursor: 'pointer',
+                    }}>
+                    🔗 Use Step {firstHomeStepNum} home position
+                  </button>
+                )}
+                {!locked && isLaterHome && isLinkedToHome && (
+                  <button onClick={(e) => { e.stopPropagation(); unlinkHome(step.id) }}
+                    title={`Currently mirroring Step ${firstHomeStepNum}. Click to break the link and let this step hold its own independent pose.`}
+                    style={{
+                      padding: '6px 14px', fontSize: 12, fontWeight: 600, flexShrink: 0,
+                      background: '#f5f3ff', color: '#6d28d9',
+                      border: '1px solid #ddd6fe', borderRadius: 5, cursor: 'pointer',
+                    }}>
+                    ⛓ Unlink from Step {firstHomeStepNum}
                   </button>
                 )}
                 {!locked && (
@@ -2926,6 +6440,19 @@ export default function ProgramEditor() {
               {/* /RIGHT */}
               </div>
               {/* /outer row */}
+
+              {/* 2026-08-06 palletize completeness — inline expandable
+                  preview of the move_to_pallet cycle template. Placed
+                  OUTSIDE the draggable row so operating the toggle
+                  never triggers a drag; indented under the row so the
+                  visual "child" relationship is unambiguous. */}
+              {_isPalletStep && palletExpandedIds.has(step.id) && (
+                <PalletExpansionPreview
+                  step={step}
+                  palletCfg={currentProgram?.config?.pallet || {}}
+                  onPatchPallet={commitPalletPatch}
+                />
+              )}
 
               {indicator === 'after' && <InsertionBar />}
             </div>
@@ -2951,19 +6478,27 @@ export default function ProgramEditor() {
                   marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.5px',
                 }}>{cat.name}</div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
-                  {cat.actions.map((s) => (
-                    <button key={s.action} onClick={() => handleAddAction(s.action)}
-                      style={{
-                        padding: '10px 12px', textAlign: 'left', cursor: 'pointer',
-                        background: '#fff', border: '1px solid #e5e7eb', borderRadius: 6,
-                        transition: 'all 100ms',
-                      }}
-                      onMouseEnter={(e) => { e.currentTarget.style.borderColor = '#2563EB'; e.currentTarget.style.background = '#eff6ff' }}
-                      onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#e5e7eb'; e.currentTarget.style.background = '#fff' }}>
-                      <div style={{ fontSize: 12, fontWeight: 600, color: '#111' }}>{s.label}</div>
-                      <div style={{ fontSize: 10, color: '#6b7280', marginTop: 2 }}>{s.desc}</div>
-                    </button>
-                  ))}
+                  {cat.actions.map((s) => {
+                    // Effector-aware label (audit instance #4): the
+                    // Add Step palette shows "Engage vacuum" when the
+                    // program's effector is vacuum, "Grip part" when
+                    // finger, etc. Falls back to the category default.
+                    const paletteLabel = paletteLabelForAction(
+                      s.action, currentProgram?.config) || s.label
+                    return (
+                      <button key={s.action} onClick={() => handleAddAction(s.action)}
+                        style={{
+                          padding: '10px 12px', textAlign: 'left', cursor: 'pointer',
+                          background: '#fff', border: '1px solid #e5e7eb', borderRadius: 6,
+                          transition: 'all 100ms',
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.borderColor = '#2563EB'; e.currentTarget.style.background = '#eff6ff' }}
+                        onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#e5e7eb'; e.currentTarget.style.background = '#fff' }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: '#111' }}>{paletteLabel}</div>
+                        <div style={{ fontSize: 10, color: '#6b7280', marginTop: 2 }}>{s.desc}</div>
+                      </button>
+                    )
+                  })}
                 </div>
               </div>
             ))}
@@ -2980,6 +6515,32 @@ export default function ProgramEditor() {
       </div>
 
       <VoiceBar />
+
+      {pendingReuse && (
+        <PositionReuseModal
+          action={pendingReuse.action}
+          source={pendingReuse.sourceStep}
+          onUseSame={() => completeReuse({ useSame: true })}
+          onTeachNew={() => completeReuse({ useSame: false })}
+          onCancel={() => setPendingReuse(null)}
+        />
+      )}
+
+      {pickerStepId != null && (() => {
+        const pickerStep = steps.find((s) => s.id === pickerStepId) || null
+        if (!pickerStep) return null
+        return (
+          <PositionPickerModal
+            step={pickerStep}
+            steps={steps}
+            points={currentProgram?.points || {}}
+            onLink={(src) => linkStepToSource(pickerStep.id, src)}
+            onDeletePoint={handleDeletePointFromPicker}
+            onRenamePoint={handleRenamePointFromPicker}
+            onClose={() => setPickerStepId(null)}
+          />
+        )
+      })()}
 
       {contextMenu && (
         <StepContextMenu
@@ -3051,48 +6612,89 @@ export default function ProgramEditor() {
       {editingPallet && (
         <PalletConfigEditor
           config={currentProgram.config || {}}
-          onSave={(patch) => {
-            // patch carries pallet / pallet_mode / source / speed_pct +
-            // optional pick_tcp / place_tcp. Merge into program.config,
-            // then regenerate the move_to_pallet + pallet loop steps
-            // so the runtime motion reflects edited grid / spacing /
-            // fill order. Taught poses on other steps stay intact.
-            const nextConfig = {
-              ...(currentProgram.config || {}),
-              ...patch,
-              operation: 'palletize',
-            }
-            // Mirror the typed pallet config back to the legacy
-            // pallet_* answer keys so the wizard's Review path stays
-            // consistent if the operator ever round-trips through it.
-            if (patch.pallet) {
-              nextConfig.pallet_rows           = patch.pallet.rows
-              nextConfig.pallet_cols           = patch.pallet.cols
-              nextConfig.pallet_layers         = patch.pallet.layers
-              nextConfig.pallet_spacing_x_mm   = patch.pallet.spacing_x_mm
-              nextConfig.pallet_spacing_y_mm   = patch.pallet.spacing_y_mm
-              nextConfig.pallet_layer_height_mm = patch.pallet.layer_height_mm
-              nextConfig.pallet_fill_order     = patch.pallet.fill_order
-              nextConfig.pallet_approach_height_mm = patch.pallet.approach_height_mm
-              nextConfig.pallet_retract_height_mm  = patch.pallet.retract_height_mm
-            }
-            const regen = regenerateMoveToPalletSteps(steps, patch.pallet, patch.pallet_mode)
-            setCurrentProgram({
-              config:  nextConfig,
-              steps:   renumber(regen),
-              unsaved: true,
-            })
-            addToast?.('Pallet config updated — Save to persist', 'success')
-          }}
+          onSave={commitPalletPatch}
           onClose={() => setEditingPallet(false)}
         />
       )}
 
       {/* Fullscreen teach overlay — replaces the old inline blue banner.
           Open when an individual step's Teach button was clicked
-          (teachSingleId set) OR a Teach All walk is in progress
-          (teachAllPos ≥ 0). */}
+          (teachSingleId set), a Teach All walk is in progress
+          (teachAllPos ≥ 0), OR the pallet Teach walk is active
+          (palletTeachRole set). */}
       {(() => {
+        // Pallet teach path wins if active — its step is synthesized
+        // per-role and points at the diagram-guided flow.
+        if (palletTeachRole) {
+          const synth = PALLET_TEACH_STEPS[palletTeachRole]
+          const roleIdx = PALLET_ROLE_ORDER.indexOf(palletTeachRole)
+          const cfg     = currentProgram?.config || {}
+          const pallet  = cfg.pallet || {}
+          const rows      = pallet.rows       ?? cfg.pallet_rows       ?? 4
+          const cols      = pallet.cols       ?? cfg.pallet_cols       ?? 4
+          const fillOrder = pallet.fill_order ?? cfg.pallet_fill_order ?? 'row_lr'
+          const frameStatus = palletFrameStatus(currentProgram)
+          const nTaught     = taughtCount(frameStatus)
+          // Header modifiers: "· already taught, re-teaching" when
+          // the current role has a pose; "· N taught" counter suffix
+          // that reflects reality regardless of navigation.
+          const labelSuffix = palletTeachMode === 're-teach'
+            ? ' · already taught, re-teaching'
+            : ''
+          const stepLabelForOverlay = synth.label + labelSuffix
+          // Instr composition:
+          //   base + (re-teach nudge if applicable)
+          //   + (reason addendum if Teach All chained an owed
+          //      re-teach here — e.g. the legacy-migration caption)
+          const reTeachNudge = palletTeachMode === 're-teach'
+            ? ' The existing pose stays until you press Record.' : ''
+          const reasonAddendum = palletTeachReason
+            ? ` (${palletTeachReason})` : ''
+          const stepInstrForOverlay = synth.instr + reTeachNudge + reasonAddendum
+          const counterSuffix = ` · ${nTaught} taught`
+          const synthStep = {
+            ...synth,
+            label: stepLabelForOverlay,
+            instr: stepInstrForOverlay,
+          }
+          return (
+            <TeachOverlay
+              step={synthStep}
+              currentN={roleIdx + 1}
+              totalM={PALLET_ROLE_ORDER.length}
+              counterSuffix={counterSuffix}
+              canBack={roleIdx > 0}
+              onRecord={palletTeachRecord}
+              onSkip={palletTeachSkip}
+              onBack={palletTeachBack}
+              onCancel={teachOverlayCancel}
+              recordDisabled={isTeachingElsewhere}
+              disabledReason={isTeachingElsewhere
+                ? 'Teaching in progress on ' + (teachSession?.owner_label
+                  || teachSession?.owner_device_id || 'another device')
+                : ''}
+              lockBanner={isTeachingElsewhere && teachSession ? (
+                <TeachLockBanner
+                  session={teachSession}
+                  programId={currentProgram?.id}
+                  variant="overlay"
+                />
+              ) : null}
+              diagram={
+                <PalletFrameDiagram
+                  role={palletTeachRole}
+                  rows={rows}
+                  cols={cols}
+                  fillOrder={fillOrder}
+                  frameStatus={frameStatus}
+                  mode={palletTeachMode}
+                  onRoleTap={jumpToPalletRole}
+                  size="large"
+                />
+              }
+            />
+          )
+        }
         const overlayStep = teachOverlayStep()
         if (!overlayStep) return null
         const isSingle = teachSingleId != null
@@ -3108,7 +6710,74 @@ export default function ProgramEditor() {
             onSkip={teachOverlaySkip}
             onBack={teachOverlayBack}
             onCancel={teachOverlayCancel}
+            recordDisabled={isTeachingElsewhere}
+            disabledReason={isTeachingElsewhere
+              ? 'Teaching in progress on ' + (teachSession?.owner_label
+                || teachSession?.owner_device_id || 'another device')
+              : ''}
+            lockBanner={isTeachingElsewhere && teachSession ? (
+              <TeachLockBanner
+                session={teachSession}
+                programId={currentProgram?.id}
+                variant="overlay"
+              />
+            ) : null}
           />
+        )
+      })()}
+
+      {/* Cancel-confirm modal for the pallet teach flow. States the
+          number of already-recorded teaches so the operator knows
+          exactly what's preserved. Recorded teaches persist via
+          setCurrentProgram writes on each Record; this dialog is a
+          safety net for the "I hit Cancel by accident" case. */}
+      {palletCancelConfirm && (() => {
+        const nTaught = taughtCount(palletFrameStatus(currentProgram))
+        return (
+          <div
+            data-testid="pallet-cancel-confirm"
+            onClick={() => setPalletCancelConfirm(false)}
+            style={{
+              position: 'fixed', inset: 0, zIndex: 2000,
+              background: 'rgba(15,23,42,0.55)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}>
+            <div onClick={(e) => e.stopPropagation()}
+              style={{
+                background: '#fff', borderRadius: 10, width: 'min(460px, 92vw)',
+                padding: 20, boxShadow: '0 20px 60px rgba(0,0,0,0.25)',
+              }}>
+              <div style={{ fontSize: 16, fontWeight: 700, color: '#111', marginBottom: 8 }}>
+                Leave pallet teach?
+              </div>
+              <div style={{ fontSize: 14, color: '#374151', lineHeight: 1.55 }}>
+                {nTaught} of 4 pallet frame points {nTaught === 1 ? 'has' : 'have'} been recorded.
+                {' '}<strong>Recorded teaches will be kept</strong> — you can resume from the
+                Teach button on the pallet step row.
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+                <button
+                  onClick={() => setPalletCancelConfirm(false)}
+                  style={{
+                    padding: '6px 14px', fontSize: 13, fontWeight: 600,
+                    background: '#f3f4f6', color: '#374151',
+                    border: '1px solid #d1d5db', borderRadius: 6, cursor: 'pointer',
+                  }}>
+                  Keep teaching
+                </button>
+                <button
+                  data-testid="pallet-cancel-confirm-leave"
+                  onClick={() => palletTeachDiscardConfirm(false)}
+                  style={{
+                    padding: '6px 14px', fontSize: 13, fontWeight: 600,
+                    background: '#2563EB', color: '#fff',
+                    border: 'none', borderRadius: 6, cursor: 'pointer',
+                  }}>
+                  Leave — teaches kept
+                </button>
+              </div>
+            </div>
+          </div>
         )
       })()}
     </div>

@@ -1,10 +1,24 @@
 import { useEffect, Component } from 'react'
 import { useStore } from './store/useStore'
+import { isFeatureEnabled, TAB_TO_FEATURE } from './lib/edition'
 import TopBar from './components/TopBar'
 import StatusBar from './components/StatusBar'
+import StaleCodegenBanner from './components/StaleCodegenBanner'
 import ToastContainer from './components/ToastContainer'
 import EStopOverlay from './components/EStopOverlay'
+import AlarmRecoveryModal from './components/AlarmRecoveryModal'
+import JointRecoveryModal from './components/JointRecoveryModal'
+import ObstacleEscapeModal from './components/ObstacleEscapeModal'
+import SelfCollisionWarnBanner from './components/SelfCollisionWarnBanner'
+import HardStopToast from './components/HardStopToast'
+import DeployStatusBanner from './components/DeployStatusBanner'
+import StaleGuard from './components/StaleGuard'
+import StaleOverrideIndicator from './components/StaleOverrideIndicator'
+import CartSofteningToast from './components/CartSofteningToast'
+import WristWindIndicator from './components/WristWindIndicator'
+import PausedPresenter from './components/PausedPresenter'
 import ViewportDebug from './components/ViewportDebug'
+import JogDebugPanel from './components/JogDebugPanel'
 import MonitorDashboard from './pages/MonitorDashboard'
 import ProgramLayout from './layouts/ProgramLayout'
 import View3DLayout from './layouts/View3DLayout'
@@ -14,7 +28,7 @@ import AdaptivePicking from './pages/AdaptivePicking'
 import ProgramLibrary from './pages/ProgramLibrary'
 import IOPage from './pages/IOPage'
 import SafetyPage from './pages/SafetyPage'
-import QualityInspectionLayout from './layouts/QualityInspectionLayout'
+import EventLog from './pages/EventLog'
 
 class ErrorBoundary extends Component {
   constructor(props) {
@@ -90,9 +104,28 @@ export default function App() {
   const activeTab       = useStore((s) => s.activeTab)
   const hydrateCells    = useStore((s) => s.hydrateCells)
   const hydratePrograms = useStore((s) => s.hydratePrograms)
+  const hydrateEdition  = useStore((s) => s.hydrateEdition)
+  const edition         = useStore((s) => s.edition)
+  const setTab          = useStore((s) => s.setTab)
+  const restoreOpenProgramOnMount = useStore(
+    (s) => s.restoreOpenProgramOnMount)
 
   useEffect(() => {
     connectWS()
+    // Edition hydrate on boot — the TopBar tab filter, the App
+    // layoutMap gate below, and every FeatureGate inside pages read
+    // useStore.edition, which starts at 'basic' (tablet-safe
+    // default). Hydrating first keeps a Full-only tab from
+    // flash-rendering on a Full PC during the initial paint.
+    hydrateEdition()
+    // 2026-08-05 (refresh persistence, fork registry:
+    // page_context_persistence): rehydrate the last-open program
+    // for THIS device from the server. If a draft with a
+    // staged_program exists, that (unsaved edits) wins over the
+    // disk-saved copy — same doctrine as record-through for
+    // poses. Blank state only when the device has never opened
+    // a program.
+    restoreOpenProgramOnMount()
     // Hydrate cells + programs from their respective endpoints at
     // app boot so any tab the operator lands on first — Configure,
     // 3D View, Program, Program Library — sees a populated state on
@@ -137,17 +170,31 @@ export default function App() {
     sensors:          <SensorsLayout />,
     io:               <IOPage />,
     adaptive_picking: <AdaptivePicking />,
-    quality_inspection: <QualityInspectionLayout />,
     configure:        <ConfigureLayout />,
     safety:           <SafetyPage />,
+    event_log:        <EventLog />,
   }
+
+  // Edition gate for the layout switch (2026-09-04). If activeTab
+  // resolves to a Full-only page but this device is on basic, fall
+  // back to Monitor so a stale persisted tab id (from a session
+  // where the device was Full and got re-locked) doesn't render a
+  // dead surface. TopBar already hides the tab; this is defence-in-
+  // depth for the persisted-activeTab class.
+  const _tabFeature = TAB_TO_FEATURE[activeTab] || activeTab
+  const _tabAllowed = isFeatureEnabled(_tabFeature, edition)
+  useEffect(() => {
+    if (!_tabAllowed && activeTab !== 'monitor') setTab('monitor')
+  }, [_tabAllowed, activeTab, setTab])
 
   // Keep the two 3D-heavy tabs persistently mounted, toggled by CSS
   // display, so switching between them doesn't tear down the Canvas +
   // URDFLoader and re-parse all 7 GLBs. Other tabs unmount as before.
   const kept3D  = ['program', '3dview']
   const isKept  = kept3D.includes(activeTab)
-  const other   = !isKept ? (layoutMap[activeTab] ?? <MonitorDashboard />) : null
+  const other   = !isKept
+    ? (_tabAllowed ? (layoutMap[activeTab] ?? <MonitorDashboard />) : <MonitorDashboard />)
+    : null
   const keptStyle = (tab) => ({
     display: activeTab === tab ? 'flex' : 'none',
     flex: 1, minHeight: 0, flexDirection: 'column',
@@ -170,9 +217,52 @@ export default function App() {
           <StatusBar />
         </div>
 
+        <StaleCodegenBanner />
         <ToastContainer />
         <EStopOverlay />
+        <AlarmRecoveryModal />
+        {/* 2026-08-05 (guided recovery, Lesson 165 extension) — offers
+            the press-and-hold escape move when a joint is past the
+            escape-only zone. Rendered above the surface-specific
+            layouts so it appears on the teach overlay + Monitor +
+            jog page from a single mount. */}
+        <JointRecoveryModal />
+        <SelfCollisionWarnBanner />
+        <ObstacleEscapeModal />
+        {/* 2026-08-05 (operator directive: clearance warnings OFF).
+            Global toast-emitter for self/ground hard-stop events.
+            Reads canonical robot.stop_cause_copy (translator lives
+            in dashboard_server _jog_stop_cause_operator_copy) —
+            no re-parsing of driver text, fork-registry-safe. */}
+        <HardStopToast />
+        {/* PausedPresenter renders the caution-styled paused overlay
+            and its persistent banner. Distinct pipeline from
+            AlarmRecoveryModal above (which owns the red alarm
+            treatment); alarms outrank paused via deriveRunState's
+            precedence, so a real alarm during pause hides the amber
+            and shows the red. */}
+        <PausedPresenter />
+        <DeployStatusBanner />
+        {/* StaleGuard is a BLOCKING modal — mounted last so it
+            paints above every other panel/toast/banner. Rendering
+            an empty tree when no mismatch → cost of the mount is
+            a single subscription to useStore.staleProvenance. */}
+        <StaleGuard />
+        {/* Persistent pill visible whenever the operator has used
+            the escape hatch. Surfaces the fact that the tab is
+            running without the guard's guarantee — clear by
+            clicking the pill. */}
+        <StaleOverrideIndicator />
+        {/* 2026-08-28 wrist-friendly hold: toast the moment
+            cartesian scaling engages so the operator hears
+            "slowed — J6 near its speed limit" without needing
+            the Event Log. */}
+        <CartSofteningToast />
+        {/* Persistent wrist-wind indicator when J4/J6 exceed
+            ±150°. Silent otherwise. */}
+        <WristWindIndicator />
         <ViewportDebug />
+        <JogDebugPanel />
       </div>
     </ErrorBoundary>
   )

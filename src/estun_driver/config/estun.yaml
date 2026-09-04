@@ -39,9 +39,193 @@ estun_driver:
     #   3. deadman + limit clamps exercised on a bench
     monitor_only: true
 
+    # ── Jog write path (second gate) ─────────────────────────────
+    # Both gates must be open for /robot/jog_command to emit Robot/jog
+    # frames: monitor_only:false AND allow_jog:true. Env override
+    # ESTUN_ALLOW_JOG=1 wins over this YAML (same precedence as
+    # ESTUN_ROBOT_IP). Default here is false so a stray YAML flip alone
+    # cannot enable motion; the live test uses the env var only.
+    allow_jog: false
+
+    # Cartesian (mode:2) jog stays hard-gated on this build. The captured
+    # protocol shape is implemented but not exercised on hardware; enabling
+    # this without the joint-mode validation pass first is unsafe.
+    allow_cartesian_jog: false
+
+    # ── Power write path (third gate — SEPARATE from allow_jog) ──────────
+    # /robot/power_command → enable / disable / clear_alarm. Wire verbs
+    # captured from the factory UI at :9198 (single-arm branch of
+    # useMultiarmWs): Robot/switchOn, Robot/switchOff, System/ClearError.
+    # Env override ESTUN_ALLOW_POWER=1 wins over this YAML (same precedence
+    # as ESTUN_ALLOW_JOG). Default false so a stray YAML flip alone cannot
+    # enable a live command surface.
+    #
+    # Safety invariant: nothing in this driver auto-enables. Every
+    # Robot/switchOn on the wire comes from an explicit operator gesture
+    # on /robot/power_command. There is no enable-on-startup, no
+    # enable-on-reconnect, no retry-on-failure. Disable and clear_alarm
+    # are the "safing" path — they run under the same gate but are
+    # *not* additionally gated by allow_jog: safing an arm must never
+    # be gated harder than moving it.
+    allow_power: false
+
+    # ── Program-execution write path (fourth gate — Part 2c, B1) ─────
+    # /estun/program → save (HTTP) + project/run|stop|pause|resume|
+    # runStep|setStartLine|clearStartLine|setBreakpoint|clearBreakpoint,
+    # Robot/toAuto|toManual|setManualMoveRate|setAutoMoveRate,
+    # System/ClearError. Env override ESTUN_ALLOW_MOVE=1 wins over YAML.
+    # monitor_only stays the master gate (closed → all above rejected).
+    # SOURCE-ONLY verbs (stop / pause / resume / runStep / clearBreakpoint /
+    # setAutoMoveRate) have their SHAPE proven by cross-validation
+    # against the captured no-db family but their BEHAVIOR needs a
+    # live wire test — see PART_2C_ARCHITECTURE.md §5 for the ladder
+    # (stop-verb validation FIRST, before any multi-step run).
+    allow_move: false
+
+    # ── Two-tier speed cap (staged raise 2026-07-16 safety pass) ──────
+    #
+    # jog_speed_cap is the HARDWARE-DERIVED ceiling — the point past
+    # which the derived safety margins (limit clamp, collision stop_mm,
+    # sigma governor) can no longer keep worst-case overrun distance
+    # under a supervise-tick budget.
+    #
+    # operator_speed_limit is the OPERATIONALLY-ALLOWED ceiling the
+    # operator is permitted to reach today. Effective_cap =
+    #   min(jog_speed_cap, operator_speed_limit).
+    #
+    # 2026-07-22 raise: operator_speed_limit 0.25 → 0.65.
+    # 2026-07-28 raise: operator_speed_limit 0.65 → 1.00 — policy ceiling
+    # is now the controller's own auto-mode ramp (100%). This file is
+    # the SINGLE authoritative source — every other clamp point reads
+    # this via `/estun/mode` or the ROS param service; there are no
+    # hard-coded 0.25 or 0.65 copies left. Jog stays governed by
+    # `jog_speed_cap` via
+    #   effective_speed_cap = min(jog_speed_cap, operator_speed_limit)
+    # — raising operator_speed_limit above jog_speed_cap does NOT
+    # widen the jog path (0.50 stays the jog ceiling).
+    #
+    # Safeguards paired with the raise (implemented in the dashboard):
+    #   * Program START still defaults `runSpeedPct` to a conservative
+    #     value (10) — raising the cap must not silently make every
+    #     run faster.
+    #   * Mid-run speed INCREASES to > `high_speed_confirm_threshold_pct`
+    #     (default 40) require an explicit high-speed confirmation.
+    #     With operator_speed_limit=1.00 the confirm now gates every
+    #     increase-request into the 40–100% band.
+    #   * Speed DECREASES stay instant (asymmetry preserved).
+    #   * Jog is NOT affected (see effective_speed_cap above).
+    #
+    # Do NOT raise the HARDWARE ceiling (jog_speed_cap) without a
+    # separate safety-pass margin re-derivation.
+    jog_speed_cap:        0.50
+    operator_speed_limit: 1.00
+    # High-speed confirmation threshold. Mid-run INCREASES above this
+    # % require an explicit confirm click before the driver publishes
+    # `Robot/setAutoMoveRate`. Set anywhere in [1, operator_speed_limit×100].
+    high_speed_confirm_threshold_pct: 40
+
+    # Robot/jogHeartbeat cadence. Captured protocol requires ~400 ms; the
+    # controller stops motion when heartbeats stop.
+    jog_heartbeat_s: 0.4
+
+    # Freshness deadman: if /robot/jog_command doesn't refresh within
+    # this window, the driver emits Robot/stopJog and tears down the
+    # supervise timer. Set below jog_heartbeat_s (0.4 s) so a single
+    # missed heartbeat halts motion before the controller notices.
+    #
+    # 2026-07-17: bumped 0.3 → 0.5 to tolerate observed 622 ms
+    # dashboard-side GIL stalls (json.dumps of the 10 KB state blob
+    # under 25 Hz starved the keepalive native thread mid-hold →
+    # phantom staleness stops). Full rationale in the driver's
+    # declare_parameter comment.
+    # 2026-07-20: reverted 0.5 → 0.3 now that the dashboard-side GIL
+    # source is fixed (serialization off-loop + 8 Hz broadcast during
+    # holds). The 0.5 loosening was a workaround for the stall, not
+    # a design choice — with the underlying stall gone the tighter
+    # deadman is what we want.
+    # 2026-08-04: tightened 0.3 → 0.2 per continuous-jog task §4
+    # ("no client keepalive for 200 ms → stop"). Client cadence is
+    # 100 ms via the Web Worker + rAF hybrid ticker, so a single
+    # missed tick still leaves one full 100 ms buffer inside the
+    # 200 ms deadman. Widens the margin against the "frozen tab
+    # leaves the arm moving" failure by ~100 ms; if phantom
+    # staleness stops resurface, revert to 0.3 and diagnose
+    # upstream (should be a client-side ticker issue at this point).
+    jog_freshness_timeout_s: 0.2
+
     # ── First-connect logging ────────────────────────────────────
     # Dumps every TX/RX WS frame to
     #   /opt/cobot/logs/estun_ws_YYYYMMDD_HHMMSS.jsonl
     # One rotated file per driver start. Ground truth for the v2.3
     # protocol shapes — leave on during bring-up.
     ws_log_raw: true
+
+    # ── Collision guard: ground plane ─────────────────────────────
+    # z of the PHYSICAL floor in the driver's base_link frame (mm).
+    # base_link IS the base flange in the URDF — z=0 there is the
+    # flange plane, NOT the floor. A mounted arm sits on some stand;
+    # measure the stand height and set this to  -stand_height_mm.
+    # Default -300 assumes a common 300 mm cell stand. Fit an exact
+    # value with scripts/fit_ground_plane.py against the live LiDAR
+    # cloud when the cell is finalised.
+    # 2026-07-15 wedge: the old default (0) had the model reporting
+    # normal poses as 87 mm from the "ground" and tripping the guard.
+    ground_z_mm: -300.0
+
+    # Collision guard escape / fallback speed caps. When the guard is
+    # in the warn zone and the operator jogs in an OPENING direction,
+    # commanded speed is clamped to escape_speed_frac. When the model
+    # can find NO single-axis escape (deep pocket or bad model), the
+    # driver still permits joint-mode jog at fallback_speed_frac with
+    # a loud log line — the operator has an e-stop and outranks a
+    # geometry model that might be wrong.
+    collision_escape_speed_frac:   0.06
+    collision_fallback_speed_frac: 0.03
+
+    # ── Controller-boot race guards (added 2026-07-22) ──────────────
+    # The problem we're avoiding: C2Control starts its WebSocket
+    # server ~9s into controller boot, BEFORE the Robot plugin's RT
+    # loop has populated its joint vectors (EtherCAT slaves still
+    # reaching OP). Our old driver retried every 2 s and subscribed
+    # to publish/RobotPosture + publish/RobotCoordinate ~16 ms after
+    # the port opened; the publish path indexed an empty
+    # Vector<double> in Robot::step() → firmware exitProcess → the
+    # service died. Because our retry loop reconnected instantly on
+    # every restart, WE re-crashed the controller on EVERY boot.
+    #
+    # These four knobs fix that:
+    #   1. grace_period_s       — floor between WS-open and full
+    #                             subscribe. Only RobotStatus is on
+    #                             during this window (safe: emitted
+    #                             by C2Control directly, not from
+    #                             the RT loop).
+    #   2. probe_interval_s     — cadence of the lightweight
+    #                             IOManager/GetIOInfo readiness probe
+    #                             DURING the grace window.
+    #   3. reconnect_backoff_max_s / reconnect_healthy_reset_s —
+    #                             replace the fixed 2 s retry with
+    #                             exponential backoff (2→4→8→…→cap)
+    #                             that ONLY resets after a session
+    #                             has stayed READY for the reset
+    #                             window. Brief-lived healthy
+    #                             sessions don't reset the backoff.
+    #   4. crashloop_threshold / _window_s / _cooldown_s — if we
+    #                             see N connect→disconnect cycles in
+    #                             the window, enter a longer cool-
+    #                             down and surface it on /estun/status
+    #                             (controller_init:"cooldown"). The
+    #                             dashboard's System Check renders
+    #                             this as Controller: "initializing
+    #                             — waiting".
+    #
+    # NEVER lower grace_period_s below the controller's own EtherCAT-
+    # OP settling time (~2–3 s on this hardware) without live-log
+    # evidence — the 5 s default is what makes it safe for us to
+    # connect at boot without triggering exitProcess again.
+    grace_period_s:              5.0
+    probe_interval_s:            1.0
+    reconnect_backoff_max_s:     30.0
+    reconnect_healthy_reset_s:   60.0
+    crashloop_threshold:         3
+    crashloop_window_s:          120.0
+    crashloop_cooldown_s:        120.0

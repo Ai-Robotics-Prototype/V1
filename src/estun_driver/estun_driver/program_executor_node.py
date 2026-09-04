@@ -448,11 +448,24 @@ class ProgramExecutor(Node):
         # carries any taught_tcp/position. Returns (tcp_list, label).
 
         if action == 'move_home':
-            self._send_cmd({'action': 'home'})
+            # If the step (or its referenced source via position_ref)
+            # carries a custom taught pose, prefer that so the operator's
+            # "Home" is whatever they taught — not the driver's fixed
+            # all-zeros. Fall back to the driver's built-in home for
+            # untaught first-run steps.
+            joints = self._step_taught_joints(step)
+            if joints and len(joints) >= 6:
+                self._send_move({
+                    'type': 'movj',
+                    'joints': joints,
+                    'speed_pct': step.get('speed_pct', 50),
+                })
+            else:
+                self._send_cmd({'action': 'home'})
             self._state = self.WAITING_MOTION
 
         elif action == 'move_joint':
-            joints = step.get('taught_joints') or step.get('joints')
+            joints = self._step_taught_joints(step)
             if joints and len(joints) >= 6:
                 self._send_move({
                     'type': 'movj',
@@ -523,8 +536,8 @@ class ProgramExecutor(Node):
                 self._state = self.WAITING_MOTION
                 return
             # Non-derived: existing behavior — read taught pose directly.
-            tcp = step.get('taught_tcp') or step.get('position')
-            joints = step.get('taught_joints') or step.get('joints')
+            tcp = self._step_taught_tcp(step)
+            joints = self._step_taught_joints(step)
             if tcp and len(tcp) >= 3:
                 # Convert meters to mm for Estun API
                 tcp_mm = [
@@ -554,7 +567,7 @@ class ProgramExecutor(Node):
                 self._advance_step()
 
         elif action == 'approach':
-            joints = step.get('taught_joints') or step.get('joints')
+            joints = self._step_taught_joints(step)
             if joints and len(joints) >= 6:
                 self._send_move({
                     'type': 'movj',
@@ -566,7 +579,7 @@ class ProgramExecutor(Node):
                 self._advance_step()
 
         elif action == 'pick':
-            joints = step.get('taught_joints') or step.get('joints')
+            joints = self._step_taught_joints(step)
             if joints and len(joints) >= 6:
                 self._send_move({
                     'type': 'movj',
@@ -579,8 +592,8 @@ class ProgramExecutor(Node):
                 self._advance_step()
 
         elif action == 'place':
-            joints = step.get('taught_joints') or step.get('joints')
-            tcp = step.get('taught_tcp') or step.get('position')
+            joints = self._step_taught_joints(step)
+            tcp = self._step_taught_tcp(step)
             if joints and len(joints) >= 6:
                 self._send_move({
                     'type': 'movj',
@@ -902,33 +915,132 @@ class ProgramExecutor(Node):
                 return i
         return None
 
+    def _resolve_position_ref(self, step):
+        """Follow `position_ref` to the referenced step's taught pose.
+        Returns the source step (dict) or None. Chases through chains
+        of references (source→source→…) up to a depth of 8 so a
+        pathological cycle can't loop. The editor's add-step flow
+        walks past reference-only steps to the ORIGINAL source, so a
+        chain deeper than 2 shouldn't occur in practice."""
+        ref = step.get('position_ref')
+        seen = set()
+        depth = 0
+        while ref is not None and depth < 8:
+            if ref in seen:
+                return None
+            seen.add(ref)
+            src = next((s for s in self._steps if s.get('id') == ref), None)
+            if src is None:
+                return None
+            if src.get('position_ref') is None:
+                return src
+            ref = src.get('position_ref')
+            depth += 1
+        return None
+
+    def _step_taught_joints(self, step):
+        """Return taught_joints for a step, following position_ref if
+        present. Returns None if no source has taught joints yet."""
+        if step.get('position_ref') is not None:
+            src = self._resolve_position_ref(step)
+            if src is None:
+                return None
+            return src.get('taught_joints') or src.get('joints')
+        return step.get('taught_joints') or step.get('joints')
+
+    def _step_taught_tcp(self, step):
+        if step.get('position_ref') is not None:
+            src = self._resolve_position_ref(step)
+            if src is None:
+                return None
+            return src.get('taught_tcp') or src.get('position')
+        return step.get('taught_tcp') or step.get('position')
+
     def _resolve_base_tcp(self, step):
         """Find the base TCP for a derived offset move.
 
-        Walks backward through self._steps from the current step looking
-        for the source pose:
-          - If `step.derived_from` is set (e.g. 'pick'), find the most
-            recent prior step with `position_role` matching that role
-            and read its taught_tcp.
-          - Otherwise (legacy programs without the tag) take the most
-            recent prior step that carries any taught_tcp / position.
+        Multi-pair bug fix (2026-07-27). The pre-fix version walked
+        backward only, which misgrouped derived steps: pair-1 approach-
+        above-place (which is BEFORE its own place) never found any
+        preceding place and skipped; pair-2 approach-above-place found
+        pair-1's place (the last preceding one) and targeted the wrong
+        pose. Both symptoms matched the CODEGEN last-writer-wins bug
+        that made this multi-pair issue observable.
 
-        Returns (tcp_list_in_meters, source_label) — tcp_list is a list
-        of length 3 or 6 (meters / radians), or (None, label) if no
-        suitable source is found. `source_label` is the human-readable
-        role for warning messages.
+        Resolution order — mirrors program_ops._resolve_anchor_step so
+        codegen and runtime executor never disagree:
+          1. Explicit `derived_from_step_id` on the derived step —
+             unambiguous. Forward-compat with a later composer/wizard
+             fix that stamps step ids at emit time.
+          2. Nearest step (by absolute index distance) whose
+             `position_role` matches `derived_from` AND that carries
+             taught_tcp / position. Ties on either side go to the
+             preceding step (already taught by then).
+          3. Legacy (no derived_from) → nearest preceding taught step
+             (pre-fix behavior, retained).
+
+        Returns (tcp_list_in_meters, source_label) — tcp_list is a
+        list of length 3 or 6 (meters / radians), or (None, label) if
+        no suitable source is found.
         """
         derived_from = step.get('derived_from')
-        # Walk backward from immediately before the current step.
-        for i in range(self._current_step_idx - 1, -1, -1):
-            src = self._steps[i]
-            if derived_from is not None:
+        idx          = self._current_step_idx
+        # 1) Explicit unique-id link.
+        explicit_id = step.get('derived_from_step_id')
+        if explicit_id is not None:
+            for src in self._steps:
+                if isinstance(src, dict) and src.get('id') == explicit_id:
+                    tcp = src.get('taught_tcp') or src.get('position')
+                    if tcp and len(tcp) >= 3:
+                        return list(tcp), (derived_from
+                                           or src.get('position_role')
+                                           or src.get('label')
+                                           or 'linked step')
+            return None, (derived_from or 'linked step')
+        # 2) Role-string with nearest-by-distance scoping.
+        if derived_from is not None:
+            best = None
+            best_dist = None
+            best_precedes = False
+            for j, src in enumerate(self._steps):
+                if j == idx:
+                    continue
+                if not isinstance(src, dict):
+                    continue
                 if src.get('position_role') != derived_from:
                     continue
+                tcp = src.get('taught_tcp') or src.get('position')
+                if not tcp or len(tcp) < 3:
+                    continue
+                dist = abs(j - idx)
+                precedes = j < idx
+                take = False
+                if best is None:
+                    take = True
+                elif dist < best_dist:
+                    take = True
+                elif dist == best_dist and precedes and not best_precedes:
+                    take = True
+                if take:
+                    best = (tcp, src)
+                    best_dist = dist
+                    best_precedes = precedes
+            if best is not None:
+                tcp, src = best
+                return list(tcp), (derived_from
+                                   or src.get('position_role')
+                                   or src.get('label')
+                                   or 'previous taught position')
+            return None, derived_from
+        # 3) Legacy: no derived_from → nearest preceding taught.
+        for i in range(idx - 1, -1, -1):
+            src = self._steps[i]
             tcp = src.get('taught_tcp') or src.get('position')
             if tcp and len(tcp) >= 3:
-                return list(tcp), (derived_from or src.get('position_role') or src.get('label') or 'previous taught position')
-        return None, (derived_from or 'previous taught position')
+                return list(tcp), (src.get('position_role')
+                                   or src.get('label')
+                                   or 'previous taught position')
+        return None, 'previous taught position'
 
     def _advance_step(self):
         """Move to the next step."""

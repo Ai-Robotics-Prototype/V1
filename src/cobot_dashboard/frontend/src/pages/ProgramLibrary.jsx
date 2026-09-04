@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useStore } from '../store/useStore'
+import { loadProgramFlow } from '../lib/loadProgramFlow'
 
 // ---------------------------------------------------------------------------
 // Program Library — file-explorer style grid view
@@ -223,7 +224,8 @@ function ProgramTile({ prog, onClick, folderName, cellName }) {
   )
 }
 
-function ProgramDetailsModal({ prog, onClose, onEdit, onDuplicate, onDelete }) {
+function ProgramDetailsModal({ prog, onClose, onLoadToMonitor, onEdit,
+                               onDuplicate, onDelete, loading }) {
   if (!prog) return null
   return (
     <div
@@ -274,13 +276,28 @@ function ProgramDetailsModal({ prog, onClose, onEdit, onDuplicate, onDelete }) {
         </div>
 
         <div style={{ display: 'flex', gap: 8, marginTop: 24, flexWrap: 'wrap' }}>
-          <button onClick={() => onEdit(prog.id)}
+          {/* Primary action: LOAD (not run) — pushes the program to
+              the controller via push_only and navigates to Monitor.
+              Motion still requires the operator to tap Run on the
+              Monitor screen. Never bare "Run" on a button that
+              doesn't run. */}
+          <button onClick={() => onLoadToMonitor(prog)}
+                  disabled={loading}
+                  style={{
+                    ...modalBtn('#16A34A', '#fff', '#15803d'),
+                    flex: '1 1 100%',
+                    opacity: loading ? 0.7 : 1,
+                    cursor: loading ? 'wait' : 'pointer',
+                  }}>
+            {loading ? 'Loading…' : 'Load to Monitor →'}
+          </button>
+          <button onClick={() => onEdit(prog.id)} disabled={loading}
                   style={modalBtn('#eff6ff', '#2563EB', '#bfdbfe')}>Edit</button>
-          <button onClick={() => onDuplicate(prog.id)}
+          <button onClick={() => onDuplicate(prog.id)} disabled={loading}
                   style={modalBtn('#f3f4f6', '#374151', '#d1d5db')}>Duplicate</button>
-          <button onClick={() => onDelete(prog.id)}
+          <button onClick={() => onDelete(prog.id)} disabled={loading}
                   style={modalBtn('#fef2f2', '#DC2626', '#fecaca')}>Delete</button>
-          <button onClick={onClose}
+          <button onClick={onClose} disabled={loading}
                   style={modalBtn('#fff', '#6b7280', '#d1d5db')}>Close</button>
         </div>
       </div>
@@ -314,10 +331,18 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
   const [rootDragOver, setRootDragOver]     = useState(false)
   const [error, setError]                   = useState(null)
   const [foldersHydrated, setFoldersHydrated] = useState(false)
+  const [loadingToMonitor, setLoadingToMonitor] = useState(false)
 
   const setLoadedProgram = useStore((s) => s.setLoadedProgram)
   const setTab           = useStore((s) => s.setTab)
   const addToast         = useStore((s) => s.addToast)
+  const currentProgramId = useStore((s) => s.currentProgram?.id)
+  const setCurrentProgram = useStore((s) => s.setCurrentProgram)
+  // Resident-program mirror from the server (D9 line_map wire). If
+  // the deleted program equals this, the confirm dialog surfaces the
+  // controller-keeps-its-copy warning; the run gate then refuses with
+  // outcome.kind='resident_deleted' until another program is pushed.
+  const residentProgramId = useStore((s) => s.robot?.program?.resident_program_id)
 
   // Fetch folders (and refresh programs / cells via the store) on
   // mount. App-level hydration already kicked off programs + cells
@@ -359,6 +384,41 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
     }
   }, [programs, selectedProgram])
 
+  // Load-to-Monitor primary action (2026-09-04). Routes through the
+  // SAME lib/loadProgramFlow helper Monitor's Change Program overlay
+  // uses — one loader, not a second parallel implementation. Never
+  // publishes `run` or motion verbs; only push_only:true. On success
+  // we close the detail modal and navigate to the Monitor tab so the
+  // operator sees the loaded program, its steps, taught-pose status,
+  // and speed. Run remains exclusively the Monitor screen's Run
+  // button.
+  async function loadToMonitor(prog) {
+    if (!prog || !prog.id) return
+    setLoadingToMonitor(true)
+    try {
+      const result = await loadProgramFlow({
+        programId:         prog.id,
+        programLabel:      prog.name || prog.id,
+        setCurrentProgram,
+        addToast,
+        // No pushingProgramName setter here — the Monitor tab has its
+        // own local state for that pill. Library-triggered loads
+        // navigate immediately; a subsequent push during Monitor's
+        // mount lifecycle is not what fires it.
+      })
+      // Navigate regardless of push outcome. If refused, the toast
+      // explains why; the program is still loaded locally per the
+      // 184ada3 commit-regardless rule — the operator sees it in
+      // Monitor and can hit Push if the refusal was transient.
+      if (result && (result.ok || result.program)) {
+        setSelectedProgram(null)
+        setTab('monitor')
+      }
+    } finally {
+      setLoadingToMonitor(false)
+    }
+  }
+
   async function editProgram(progId) {
     try {
       const res = await fetch('/api/programs/' + encodeURIComponent(progId))
@@ -386,10 +446,42 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
   }
 
   async function deleteProgram(progId) {
-    if (!confirm('Delete this program?')) return
+    // Look up the program's display name so the confirm dialog names
+    // it plainly — a generic "Delete this program?" is how operators
+    // vaporise taught poses by tapping the wrong row.
+    const row = (programs || []).find((p) => p.id === progId)
+    const name = (row && row.name) || progId
+    const isResident = residentProgramId && residentProgramId === progId
+    // Resident-on-controller case: the file lives on the arm's flash
+    // until another program is pushed. Delete just clears the
+    // dashboard's row + resets the currentProgram; the controller
+    // keeps its copy. Say so plainly so the operator is not surprised
+    // when the arm still has "the old one" until another push lands.
+    const msg = isResident
+      ? (`Delete "${name}"?\n\n`
+         + `This program is currently loaded on the robot. Deleting `
+         + `removes the .json from the dashboard's disk (moved to a `
+         + `.deleted safeguard). The controller keeps its resident `
+         + `copy until you push a different program; the dashboard's `
+         + `Run button will refuse to fire against the deleted id.`)
+      : (`Delete "${name}"?\n\n`
+         + `This removes the program's .json from disk. It is moved `
+         + `to a .deleted safeguard folder (recoverable only by asking) `
+         + `and disappears from every list.`)
+    if (!confirm(msg)) return
     try {
       const res = await fetch('/api/programs/' + encodeURIComponent(progId), { method: 'DELETE' })
       if (!res.ok) throw new Error('HTTP ' + res.status)
+      // Clear the currentProgram slot if it referred to the deleted
+      // id — otherwise the editor tab keeps showing a ghost that
+      // Save/Push would either re-create the file or 404 against.
+      if (currentProgramId && currentProgramId === progId) {
+        setCurrentProgram({
+          id: null, name: 'Untitled Program', steps: [], unsaved: false,
+          config: {}, description: '', tags: [], cell_id: null,
+          points: {}, source: null, has_taught_poses: false,
+        })
+      }
       load()
     } catch (e) {
       addToast('Delete failed: ' + (e.message || e), 'error')
@@ -669,7 +761,9 @@ export default function ProgramLibrary({ onSelectProgram } = {}) {
 
       <ProgramDetailsModal
         prog={selectedProgram}
+        loading={loadingToMonitor}
         onClose={() => setSelectedProgram(null)}
+        onLoadToMonitor={loadToMonitor}
         onEdit={editProgram}
         onDuplicate={duplicateProgram}
         onDelete={deleteProgram}

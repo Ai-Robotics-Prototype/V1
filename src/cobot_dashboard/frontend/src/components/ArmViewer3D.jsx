@@ -74,8 +74,21 @@ function _urlInt(key, alt, fallback, min, max) {
 }
 const RENDER_LAG_MS  = _urlInt('rl', 'renderLag', 200, 0, 1000)
 const SAMPLE_BUF_CAP = _urlInt('bc', 'bufCap',      8, 2,   64)
+// Exponential-smoothing time constant (ms) for the twin follower. Each
+// render tick the twin joint angles move `1 - exp(-dt/τ)` of the way
+// toward the newest received posture. τ=100 ms yields ≈63% recovery
+// per 100 ms — visually smooth AND bounded-lag: the twin can never
+// trail a stable target by more than a fraction of τ regardless of
+// how many posture updates queue while the browser stalls. Replaces
+// the fixed-lag sample-buffer + linear interpolator (which stacked
+// per-frame lag when store updates outran RAF ticks).
+const SMOOTH_TAU_MS  = _urlInt('tau', 'smoothTau', 100, 0, 1000)
+// Legacy interpolation buffer stays available via ?rl=200&smooth=0 for
+// side-by-side comparison during rollout.
+const SMOOTH_ENABLED = _urlInt('smooth', 'smoothEnable', 1, 0, 1) !== 0
 if (typeof console !== 'undefined') {
-  console.log(`[twin] RENDER_LAG_MS=${RENDER_LAG_MS} SAMPLE_BUF_CAP=${SAMPLE_BUF_CAP}`)
+  console.log(`[twin] RENDER_LAG_MS=${RENDER_LAG_MS} SAMPLE_BUF_CAP=${SAMPLE_BUF_CAP} `
+            + `SMOOTH_TAU_MS=${SMOOTH_TAU_MS} SMOOTH_ENABLED=${SMOOTH_ENABLED}`)
 }
 
 // URDF axis convention gate. The URDF variants we serve at /robot/urdf
@@ -457,17 +470,31 @@ function URDFArm({ urdfUrl, onFlangeReady, onStatus, onLoaded, onDragActive, onD
   //                          does NOT affect visual smoothness.
   const sampleBufRef     = useRef([])
   const anchorRef        = useRef(null)
+  // Newest received posture — the exponential-smoothing follower slews
+  // `currentRef` toward this every render tick. Refreshed by the
+  // ingest useEffect on each new /ws/state message. When SMOOTH_ENABLED
+  // is on this replaces sampleBufRef/anchorRef entirely; when it is
+  // off the RAF loop falls back to the legacy fixed-lag interpolator
+  // (kept for A/B comparison during rollout).
+  const targetPoseRef    = useRef(null)   // [j1..j6] rad, latest received
+  const lastStepTsRef    = useRef(0)      // performance.now() at last step
   const rafRef           = useRef(null)
   const storePositions   = useStore((s) => s.joints?.positions)
   const lastMessageTime  = useStore((s) => s.lastMessageTime)
   const { scene, camera, gl } = useThree()
 
-  // Ingest new joint samples into the interpolation ring buffer.
-  // Fires once per /ws/state message (positions is a fresh array each
-  // JSON.parse; lastMessageTime updates in the same set() call).
+  // Ingest new joint samples. In smoothing mode we simply overwrite
+  // `targetPoseRef` with the newest posture (latest-wins by construction:
+  // no history is kept, so any queue growth in the store→ingest hop is
+  // absorbed here). Fixed-lag mode keeps its sample buffer for A/B.
   useEffect(() => {
     if (!Array.isArray(storePositions) || storePositions.length < 6) return
     if (!lastMessageTime) return
+    if (SMOOTH_ENABLED) {
+      // Copy so the follower can't observe a mid-write positions array.
+      targetPoseRef.current = storePositions.slice(0, 6)
+      return
+    }
     const buf = sampleBufRef.current
     const last = buf[buf.length - 1]
     // Dedupe: server broadcasts at 25 Hz but source joints arrive
@@ -862,6 +889,45 @@ function URDFArm({ urdfUrl, onFlangeReady, onStatus, onLoaded, onDragActive, onD
   useEffect(() => {
     const step = () => {
       const robot = robotRef.current
+      if (SMOOTH_ENABLED) {
+        const target = targetPoseRef.current
+        if (robot && robot.joints && Array.isArray(target)) {
+          const cur = currentRef.current
+          const tgt = targetsRef.current
+          const mask = manualMaskRef.current
+          const manualIdx = manualJointRef.current
+          const nowP = performance.now()
+          const last = lastStepTsRef.current || nowP
+          const dt = Math.max(0, Math.min(100, nowP - last))
+          lastStepTsRef.current = nowP
+          // Exponential smoothing: q_new = q_old + (target - q_old) * α
+          // where α = 1 - exp(-dt / τ). At τ=100 ms, α≈0.39 for a 50 ms
+          // frame, ≈0.63 for a 100 ms frame — the follower converges
+          // fast enough to feel responsive, slow enough to hide micro-
+          // jitter, and it's LATEST-WINS by construction because every
+          // step reads the newest targetPoseRef.
+          const alpha = SMOOTH_TAU_MS > 0
+                        ? (1 - Math.exp(-dt / SMOOTH_TAU_MS))
+                        : 1
+          for (let j = 0; j < 6; j++) {
+            if (j === manualIdx) continue
+            if (mask[j]) continue
+            const t = Number(target[j])
+            if (!Number.isFinite(t)) continue
+            const c0 = Number.isFinite(cur[j]) ? cur[j] : t
+            const v = c0 + (t - c0) * alpha
+            cur[j] = v
+            tgt[j] = v
+            const joint = robot.joints[JOINT_NAMES[j]]
+            if (joint && typeof joint.setJointValue === 'function') {
+              joint.setJointValue(v)
+            }
+          }
+        }
+        rafRef.current = requestAnimationFrame(step)
+        return
+      }
+      // ── Legacy fixed-lag interpolator (?smooth=0) ────────────
       const buf   = sampleBufRef.current
       const anchor = anchorRef.current
       if (robot && robot.joints && anchor && buf.length > 0) {
@@ -1177,6 +1243,57 @@ function BaselineStatusNotice({ status }) {
   )
 }
 
+// ──────────────────────────────────────────────────────────────────
+// TrajectoryPolylineOverlay — reads useStore.trajectoryOverlay and
+// draws the flange path as a polyline in the URDF geometry frame,
+// plus a green sphere at the start and a red one at the end. Set by
+// RecentRunsCard's [Trajectory] action; cleared when the operator
+// closes the panel or picks a different step.
+//
+// Frame handling: the trajectory endpoint FKs joints against the
+// SAME URDF the viewer loads (/robot/urdf → s10-140-full.urdf, Y-up),
+// so points arrive in the same coordinate system as the URDF root
+// group and land directly on the twin flange. No axis swap needed.
+// ──────────────────────────────────────────────────────────────────
+function TrajectoryPolylineOverlay() {
+  const overlay = useStore((s) => s.trajectoryOverlay)
+  if (!overlay || !Array.isArray(overlay.points) || overlay.points.length < 2) {
+    return null
+  }
+  const pts = overlay.points
+  const positions = new Float32Array(pts.length * 3)
+  for (let i = 0; i < pts.length; i++) {
+    positions[i * 3]     = pts[i][0]
+    positions[i * 3 + 1] = pts[i][1]
+    positions[i * 3 + 2] = pts[i][2]
+  }
+  const start = pts[0]
+  const end   = pts[pts.length - 1]
+  return (
+    <group>
+      <line>
+        <bufferGeometry>
+          <bufferAttribute
+            attach="attributes-position"
+            count={pts.length}
+            array={positions}
+            itemSize={3}
+          />
+        </bufferGeometry>
+        <lineBasicMaterial color="#2563eb" linewidth={2} />
+      </line>
+      <mesh position={[start[0], start[1], start[2]]}>
+        <sphereGeometry args={[0.015, 12, 12]} />
+        <meshBasicMaterial color="#16a34a" />
+      </mesh>
+      <mesh position={[end[0], end[1], end[2]]}>
+        <sphereGeometry args={[0.015, 12, 12]} />
+        <meshBasicMaterial color="#dc2626" />
+      </mesh>
+    </group>
+  )
+}
+
 function StaticZonesToggle({ value, onChange }) {
   // Probe the live collision payload for any baseline-built obstacles
   // so we don't dangle an inert toggle when no cell has zones yet.
@@ -1380,6 +1497,7 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
         )}
         <CustomGripperModel url={gripperGlbUrl} flange={flange} />
         <CollisionScene3D showStatic={showStaticZones} />
+        <TrajectoryPolylineOverlay />
         {/* IK gizmo for the URDFArm path (Program tab). Only mounts
             while Cartesian mode is on; unmount disposes the
             TransformControls cleanly. */}
