@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 400" preserveAspectRatio="xMidYMid meet">
+  <rect x="0" y="0" width="500" height="400" fill="#111827"/>
+  <text x="250" y="24" fill="#94A3B8" font-size="12" text-anchor="middle" font-family="system-ui, sans-serif">
+    M8 CONNECTOR GRID — placeholder (operator artwork pending)
+  </text>
+  <!-- 4 rows × 5 cols grid, ids aligned with hookup_map.json coordinates.
+       Real panel photo replaces this SVG; SVG highlight overlay from
+       the wizard keeps positioning correct because it uses x_pct/y_pct
+       fractions of the panel image. -->
+  <g stroke="#374151" fill="#1F2937" stroke-width="2">
+    <!-- Row 0: IN1..IN5 (y_pct 15 → y=60) -->
+    <circle cx="50"  cy="60"  r="18"/>
+    <circle cx="140" cy="60"  r="18"/>
+    <circle cx="230" cy="60"  r="18"/>
+    <circle cx="320" cy="60"  r="18"/>
+    <circle cx="410" cy="60"  r="18"/>
+    <!-- Row 1: IN6..IN10 (y_pct 37 → y=148) -->
+    <circle cx="50"  cy="148" r="18"/>
+    <circle cx="140" cy="148" r="18"/>
+    <circle cx="230" cy="148" r="18"/>
+    <circle cx="320" cy="148" r="18"/>
+    <circle cx="410" cy="148" r="18"/>
+    <!-- Row 2: OUT1..OUT5 (y_pct 62 → y=248) -->
+    <circle cx="50"  cy="248" r="18"/>
+    <circle cx="140" cy="248" r="18"/>
+    <circle cx="230" cy="248" r="18"/>
+    <circle cx="320" cy="248" r="18"/>
+    <circle cx="410" cy="248" r="18"/>
+    <!-- Row 3: OUT6..OUT10 (y_pct 84 → y=336) -->
+    <circle cx="50"  cy="336" r="18"/>
+    <circle cx="140" cy="336" r="18"/>
+    <circle cx="230" cy="336" r="18"/>
+    <circle cx="320" cy="336" r="18"/>
+    <circle cx="410" cy="336" r="18"/>
+  </g>
+  <g fill="#94A3B8" font-size="9" font-family="system-ui, sans-serif" text-anchor="middle">
+    <text x="50"  y="63">IN1</text>
+    <text x="140" y="63">IN2</text>
+    <text x="230" y="63">IN3</text>
+    <text x="320" y="63">IN4</text>
+    <text x="410" y="63">IN5</text>
+    <text x="50"  y="151">IN6</text>
+    <text x="140" y="151">IN7</text>
+    <text x="230" y="151">IN8</text>
+    <text x="320" y="151">IN9</text>
+    <text x="410" y="151">IN10</text>
+    <text x="50"  y="251">OUT1</text>
+    <text x="140" y="251">OUT2</text>
+    <text x="230" y="251">OUT3</text>
+    <text x="320" y="251">OUT4</text>
+    <text x="410" y="251">OUT5</text>
+    <text x="50"  y="339">OUT6</text>
+    <text x="140" y="339">OUT7</text>
+    <text x="230" y="339">OUT8</text>
+    <text x="320" y="339">OUT9</text>
+    <text x="410" y="339">OUT10</text>
+  </g>
+  <line x1="0" y1="200" x2="500" y2="200" stroke="#DC2626" stroke-width="1" stroke-dasharray="4 4" opacity="0.5"/>
+  <text x="490" y="196" fill="#DC2626" font-size="8" text-anchor="end" font-family="system-ui, sans-serif">
+    inputs above · outputs below
+  </text>
+</svg>

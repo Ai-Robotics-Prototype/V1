@@ -8,6 +8,7 @@ import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
 import TeachLockBanner from './TeachLockBanner'
 import NumericField from './NumericField'
 import PalletFrameDiagram from './PalletFrameDiagram'
+import HookupGuide from './HookupGuide'
 import { readPayload, PAYLOAD_UNSET_WARNING }
   from '../lib/payload'
 import { computePayloadTruth } from '../lib/payloadTruth'
@@ -3577,6 +3578,11 @@ function ToolAndPayloadSection({ program, onPatch, controllerPayloadKg }) {
   const [expanded, setExpanded] = useState(false)
   const [showCog,  setShowCog]  = useState(
     !!(payload.cog_mm && (payload.cog_mm.x || payload.cog_mm.y || payload.cog_mm.z)))
+  // 2026-09-08 hookup guide: modal open/close for the read-only
+  // reopen path from this section's header button.
+  const [_showHookup, _setShowHookup] = useState(false)
+  const _gripperType = (program && program.config && (
+    program.config.gripper_type || program.config.gripper?.type)) || 'finger'
 
   // Live truth line — reads the shared resolver so mismatch /
   // unreadable states show consistent copy across surfaces.
@@ -3616,6 +3622,28 @@ function ToolAndPayloadSection({ program, onPatch, controllerPayloadKg }) {
         <span style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
                         transition: 'transform 150ms', color: '#6b7280', fontSize: 11 }}>▶</span>
         <span style={labelStyle}>Tool &amp; Payload</span>
+        {/* 2026-09-08 hookup guide: read-only reopen button for
+            the wizard's peripheral-hookup instructions. Same
+            HookupGuide component, mode="editor" (checkboxes
+            disabled). Gripper type comes from program.config.
+            Placed next to the label so operators can reach the
+            wiring reference without leaving the editor. */}
+        <button
+          data-testid="view-hookup-button"
+          onClick={(e) => {
+            e.stopPropagation()
+            _setShowHookup(true)
+          }}
+          title="Reopen the peripheral hookup guide (read-only)"
+          style={{
+            marginLeft: 8, padding: '3px 10px',
+            fontSize: 11, fontWeight: 600,
+            background: '#EEF2FF', color: '#3730A3',
+            border: '1px solid #C7D2FE', borderRadius: 4,
+            cursor: 'pointer',
+          }}>
+          View hookup
+        </button>
         <div style={{ flex: 1 }} />
         {payload.isSet
           ? (
@@ -3730,6 +3758,30 @@ function ToolAndPayloadSection({ program, onPatch, controllerPayloadKg }) {
           </div>
         </div>
       )}
+      {_showHookup && createPortal(
+        <div
+          onClick={(e) => { if (e.target === e.currentTarget) _setShowHookup(false) }}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 300,
+            background: 'rgba(0,0,0,0.5)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            padding: 24,
+          }}>
+          <div style={{
+            background: '#fff', borderRadius: 12,
+            padding: 20, minWidth: 360, maxWidth: 720,
+            maxHeight: '90vh', overflowY: 'auto',
+            boxShadow: '0 12px 40px rgba(0,0,0,0.25)',
+          }}
+               onClick={(e) => e.stopPropagation()}>
+            <HookupGuide
+              gripperType={_gripperType}
+              mode="editor"
+              onClose={() => _setShowHookup(false)}
+            />
+          </div>
+        </div>,
+        document.body)}
     </div>
   )
 }

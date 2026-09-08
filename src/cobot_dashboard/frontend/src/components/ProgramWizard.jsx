@@ -7,6 +7,7 @@ import { useStore } from '../store/useStore'
 import { HoldButton } from './JogControls'
 import NumericField from './NumericField'
 import PalletFrameDiagram from './PalletFrameDiagram'
+import HookupGuide from './HookupGuide'
 import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
 import { effectorReady, effectorEngage, effectorDisengage,
          effectorOf,
@@ -2040,6 +2041,46 @@ const PAGES = [
             onClick={() => { setAnswer('gripper_type', g.value); goNext({ gripper_type: g.value }) }}
           />
         ))}
+      </QuestionCard>
+    ),
+  },
+
+  // 3.5: Hookup guide (2026-09-08 operator directive)
+  //   Data-driven per-gripper-type peripheral hookup instructions.
+  //   Rendered immediately after gripper-type selection so the
+  //   operator wires the physical robot before proceeding to any
+  //   teach step. Skip button ("already connected") advances
+  //   with hookup_skipped: true and hookup_confirmed: false;
+  //   confirm advances with hookup_confirmed: true. Display-only —
+  //   no IO or motion published. Skip predicate honours
+  //   hookup_skipped so navigating back and forth doesn't get
+  //   stuck; hookup_confirmed alone would re-force the page
+  //   after every visit.
+  //
+  //   Custom gripper: the hookup_map has an empty array for
+  //   'custom' (they wire their own I/O in Configure); the guide
+  //   renders a Skip prompt and moves on.
+  {
+    id: 'hookup',
+    skip: (answers) => !!answers.hookup_skipped
+                    || answers.hookup_confirmed === true,
+    render: ({ answers, setAnswer, goNext }) => (
+      <QuestionCard question="Connect your hardware">
+        <HookupGuide
+          gripperType={answers.gripper_type || 'finger'}
+          mode="wizard"
+          confirmed={answers.hookup_confirmed === true}
+          onSkip={() => {
+            setAnswer('hookup_skipped',   true)
+            setAnswer('hookup_confirmed', false)
+            goNext({ hookup_skipped: true, hookup_confirmed: false })
+          }}
+          onConfirm={() => {
+            setAnswer('hookup_skipped',   false)
+            setAnswer('hookup_confirmed', true)
+            goNext({ hookup_skipped: false, hookup_confirmed: true })
+          }}
+        />
       </QuestionCard>
     ),
   },

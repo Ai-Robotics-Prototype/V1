@@ -9245,6 +9245,39 @@ if FASTAPI_AVAILABLE:
     async def api_disk_status():
         return _disk_watchdog.status()
 
+    # ── Peripheral hookup guide (2026-09-08 operator directive) ──
+    # Data-driven per-gripper hookup instructions. The JSON at
+    # /opt/cobot/hookup/hookup_map.json defines a coordinate table
+    # (M8 grid ids + labeled air stations) plus per-gripper
+    # connection lists. The wizard's hookup page and the editor's
+    # "View hookup" button both consume this endpoint.
+    #
+    # Feature-key gate: none. The hookup guide is display-only in
+    # both editions; it sends no IO/motion, only reads.
+    _HOOKUP_MAP_PATH = os.environ.get(
+        'COBOT_HOOKUP_MAP', '/opt/cobot/hookup/hookup_map.json')
+
+    @app.get("/api/hookup_map")
+    async def api_hookup_map():
+        try:
+            with open(_HOOKUP_MAP_PATH) as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return JSONResponse({
+                'ok': False,
+                'error': 'hookup map not configured',
+                'reason_code': 'hookup_map_missing',
+                'detail': (f'Expected {_HOOKUP_MAP_PATH} to define '
+                           f'per-gripper hookup instructions.'),
+            }, status_code=404)
+        except (OSError, ValueError) as e:
+            return JSONResponse({
+                'ok': False,
+                'error': f'hookup map read failed: {e}',
+                'reason_code': 'hookup_map_read_error',
+            }, status_code=500)
+        return {'ok': True, 'map': data}
+
     @app.post("/api/event_log/append")
     async def api_event_log_append(request: Request):
         """Append a frontend-originated event to the daily JSONL.
