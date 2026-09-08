@@ -124,14 +124,24 @@ def test_jog_panel_reset_and_home_buttons_retired():
         'onReset handler must be retired'
 
 
-def test_quick_orient_row_retired():
-    """5c: QuickOrientButtons render + import both removed."""
+def test_quick_orient_row_label_and_side_up_retired():
+    """5c amended 2026-09-08: Face Down retained; row label,
+    Face Side, Face Up retired. The old `QuickOrientButtons`
+    render as a three-button row is gone — the module now exports
+    a single `FaceDownButton` (default export) with no row label
+    around it. Panel renders <FaceDownButton /> directly."""
     src = _read(PANEL)
     code = _strip_line_comments(re.sub(r'\{/\*.*?\*/\}', '', src,
                                         flags=re.DOTALL))
     code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
-    assert 'QuickOrientButtons' not in code, \
-        'QuickOrientButtons import + render must be retired'
+    # Face Down IS rendered.
+    assert '<FaceDownButton' in code
+    # The retired trio names should not appear in code.
+    assert 'Face Side' not in code
+    assert 'Face Up' not in code
+    # Row-label copy from the old QuickOrient trio ("Quick orient
+    # (twin only)") is gone.
+    assert 'Quick orient' not in code
 
 
 def test_tcp_twin_frame_readout_retired():

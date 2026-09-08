@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react'
-// 2026-09-08 operator directive: Reset all / Home / QuickOrient
-// row / TCP (twin frame) box / JogSpeedSlider all retired from
-// this panel. QuickOrientButtons + JogSpeedSlider are no longer
-// imported here; the jog surface (Expand Jog Buttons) hosts the
-// jog-speed control as the ONE authority. `three` is no longer
-// used either — the TCP FK matrix computation went with the box.
+import FaceDownButton from './QuickOrientButtons'
+// 2026-09-08 operator directive: Reset all / Home / Quick Orient
+// row label / Face Side / Face Up / TCP (twin frame) box /
+// JogSpeedSlider all retired. AMENDMENT: Face Down retained as a
+// standalone TCP-preserving button (see QuickOrientButtons.jsx
+// — file kept for git history + import continuity, now exports
+// FaceDownButton default). Jog surface owns jog-speed as the ONE
+// authority; `three` no longer imported here (TCP FK box gone).
 
 // JointJogPanel — right-docked FK verification pane for the S10-140
 // verified twin. Wired to ArmViewer3D via a jogApi handle exposed from
@@ -48,8 +50,9 @@ export default function JointJogPanel({
   onHome,        // 2026-09-08: Home button retired; prop kept so
                  // callers don't break their prop wiring.
   // eslint-disable-next-line no-unused-vars
-  // eslint-disable-next-line no-unused-vars
-  onAtLimit,     // was a callback from the retired orient row.
+  onAtLimit,     // fired by FaceDownButton when IK can't achieve
+                 // the target within tolerance — parents can wire
+                 // it to their own AT-LIMIT indicator.
 }) {
   const [values, setValues] = useState([0, 0, 0, 0, 0, 0])
 
@@ -147,16 +150,16 @@ export default function JointJogPanel({
             )}
           </div>
 
-          {/* 2026-09-08 operator directive: Reset all / Home /
-              QuickOrient row RETIRED. The panel now hosts ONLY the
-              Cartesian mode toggle above + the six joint sliders
-              below. Reasoning:
-                * Reset (twin-only) had no wire consumer; operators
-                  moved joints with the sliders or the jog surface.
-                * Home button drove `jogApi.home()` on the twin only;
-                  the arm's true home lives on the Monitor page.
-                * Quick Orient was a novelty IK preset row with no
-                  downstream consumer. */}
+          {/* 2026-09-08 amendment: Face Down retained from the
+              retired Quick Orient row. TCP-preserving orient to
+              world -Y, slow fixed rate (~10°/s), refuses by name
+              when IK can't achieve the pose without moving the
+              tool point. Twin only in this commit — real-arm path
+              is a follow-up (needs a new coordinated-orient
+              backend endpoint; single-axis /cmd/jog pulses would
+              drift the TCP, which the operator explicitly
+              forbids). */}
+          <FaceDownButton jogApi={jogApi} onAtLimit={onAtLimit} />
           {JOINT_META.map((jm, i) => {
             const joint = jogApi.robot.joints[jm.name]
             const lim = joint?.limit || {}
