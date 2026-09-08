@@ -1361,7 +1361,8 @@ function StaticZonesToggle({ value, onChange }) {
 const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay, noRobot = false }, ref) {
   const controlsRef = useRef(null)
   const [flange, setFlange] = useState(null)
-  const [urdfStatus, setUrdfStatus] = useState({ state: 'idle', detail: '' })
+  // eslint-disable-next-line no-unused-vars
+  const [_urdfStatus, setUrdfStatus] = useState({ state: 'idle', detail: '' })
   // Show baseline-built static keep-out zones by default; the
   // operator can hide them via the StaticZonesToggle.
   const [showStaticZones, setShowStaticZones] = useState(true)
@@ -1385,29 +1386,25 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
     if (controlsRef.current) controlsRef.current.enabled = enabled
   }
 
-  // === DIAGNOSTIC — independent fetch of one per-link GLB so a
-  // network/cert problem appears in orange immediately, before the
-  // URDF loader even runs. Remove after the model is confirmed live.
-  const [diagMsg, setDiagMsg] = useState('GLB: testing…')
+  // 2026-09-08 operator directive: on-screen GLB-fetch diagnostic
+  // strip retired ("delete the element, don't hide it"). The
+  // console.log logging stays so devtools grep still surfaces the
+  // fetch outcome — nothing renders behind the jog button now.
   useEffect(() => {
     const testUrl = '/robot/links/link0_base_light.glb'
     fetch(testUrl)
       .then((r) => {
         const ctype = r.headers.get('content-type') || '(no content-type)'
         const clen  = r.headers.get('content-length') || '?'
-        const info = `GLB fetch: ${r.status} ${r.statusText} (${ctype}, ${clen} B)`
         // eslint-disable-next-line no-console
-        console.log('[DIAG]', info)
-        setDiagMsg(info)
+        console.log('[DIAG]',
+          `GLB fetch: ${r.status} ${r.statusText} (${ctype}, ${clen} B)`)
       })
       .catch((err) => {
-        const info = `GLB fetch ERROR: ${err?.message || err}`
         // eslint-disable-next-line no-console
-        console.error('[DIAG]', info)
-        setDiagMsg(info)
+        console.error('[DIAG]', `GLB fetch ERROR: ${err?.message || err}`)
       })
   }, [])
-  // === END DIAGNOSTIC ===
 
   // Prior versions read `useStore((s) => s.joints?.positions)` here to
   // feed a top-right joint-readout overlay. That overlay was removed
@@ -1586,29 +1583,11 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
           this file (the FK loop uses them); just don't render
           the floating readout chip in the top-right anymore. */}
 
-      {/* Status pill, bottom-right — currently shown ALWAYS so the two
-          tabs (Program vs 3D View) can be compared side-by-side while
-          we chase the "no robot on 3D View" report. Re-gate on
-          ?debug=1 after the tabs are confirmed matching. */}
-      <div style={{
-        position: 'absolute', bottom: 8, right: 8, padding: '6px 10px',
-        borderRadius: 6, fontSize: 11, lineHeight: 1.35,
-        fontFamily: 'var(--font-mono, monospace)', zIndex: 10,
-        maxWidth: 360,
-        boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-        background: urdfStatus.state === 'error'
-          ? 'rgba(220,38,38,0.95)'
-          : urdfStatus.state === 'loaded'
-            ? 'rgba(22,163,74,0.92)'
-            : 'rgba(15,23,42,0.85)',
-        color: '#fff',
-      }}>
-        <div style={{ fontWeight: 700, marginBottom: 2 }}>URDF: {urdfStatus.state}</div>
-        <div style={{ opacity: 0.92, wordBreak: 'break-all' }}>{urdfStatus.detail || '—'}</div>
-        <div style={{
-          fontSize: 11, color: '#ff9900', marginTop: 4, wordBreak: 'break-all',
-        }}>{diagMsg}</div>
-      </div>
+      {/* 2026-09-08 operator directive: URDF + GLB-fetch status
+          pill retired ("nothing may render behind the button").
+          `urdfStatus.state` still tracks locally for future
+          conditional rendering; error surfacing during dev can
+          use the console. */}
 
       {/* FK jog pane, right-docked. Only mounts when URDFArm is active
           (noRobot=false) — the View3D tab uses StandaloneRobot and has

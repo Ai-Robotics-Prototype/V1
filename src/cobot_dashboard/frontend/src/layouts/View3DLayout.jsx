@@ -27,85 +27,18 @@ import JogReadyBadge from '../components/JogReadyBadge'
 // path (/cmd/jog with delta_deg) still works, but the pendant
 // increments are superseded by hold-to-jog + step-size inching.
 
-const PRESETS = ['Front', 'Side', 'Top', 'Iso']
-
 const REAL_ARM_RED = '#7F1D1D'
 
-// Slim left rail (Part 3b, 2026-07-17). Previous 240 px width was
-// wide enough for a full label column but wasted canvas real estate at
-// 1155-1280 px tablet widths where the 3D twin needs every pixel. New:
-// camera presets as a compact segmented row, TASK as a single-line
-// chip. Touch targets stay ≥ 44 px so tablet ops still hit the presets
-// cleanly. Total rail width now ~130 px (borders + padding included).
-const RAIL_W = 130
-function LeftPanel({ armRef }) {
-  const task = useStore((s) => s.task) || {}
-  const taskState = task.state || 'IDLE'
-  const taskColor = taskState === 'IDLE' ? 'var(--text-muted)'
-                  : taskState === 'PAUSED' ? 'var(--yellow)'
-                  : 'var(--accent)'
-  return (
-    <div style={{
-      width: RAIL_W,
-      flexShrink: 0,
-      borderRight: '1px solid var(--border)',
-      background: 'var(--bg-panel)',
-      display: 'flex',
-      flexDirection: 'column',
-      overflow: 'hidden',
-      padding: '10px 8px',
-      gap: 12,
-    }}>
-      <div>
-        <div style={{
-          fontSize: 9, textTransform: 'uppercase',
-          color: 'var(--text-muted)', letterSpacing: '0.06em',
-          marginBottom: 4,
-        }}>
-          Camera
-        </div>
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(2, 1fr)',
-          gap: 3,
-        }}>
-          {PRESETS.map((p) => (
-            <button
-              key={p}
-              onClick={() => armRef.current?.setCameraPreset(p.toLowerCase())}
-              style={{
-                background: 'var(--bg-surface)',
-                border: '1px solid var(--border)',
-                color: 'var(--text-secondary)',
-                padding: 0,
-                minHeight: 44,   // tablet touch target
-                borderRadius: 'var(--radius-sm)',
-                fontSize: 11,
-                fontWeight: 600,
-                cursor: 'pointer',
-                letterSpacing: '0.02em',
-              }}
-            >
-              {p}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div style={{
-        display: 'flex', alignItems: 'center', gap: 6,
-        fontSize: 10, color: 'var(--text-muted)',
-        letterSpacing: '0.06em', textTransform: 'uppercase',
-      }}>
-        <span>Task</span>
-        <span style={{ fontWeight: 700, color: taskColor,
-                       letterSpacing: 0, textTransform: 'none' }}>
-          {taskState}
-        </span>
-      </div>
-    </div>
-  )
-}
+// 2026-09-08 operator directive: left sidebar (Camera preset tiles
+// + Task readout) RETIRED. The single view-switcher lives in the
+// top-left corner overlay of the 3D viewport itself (ArmViewer3D's
+// existing preset pill row at L1632). The 3D canvas expands to
+// use the reclaimed 130 px width.
+//
+// TASK/IDLE readout consumers: LeftPanel was the ONLY renderer;
+// no other surface reads useStore.task from this layout. Dropped
+// per directive item 3 ("otherwise drop it") — task state is
+// already visible on the Monitor page's StatusBadge.
 
 // The chrome that wraps JogControls when it's docked (NORMAL) or
 // expanded (EXPANDED). The 2026-08-06 operator directive retires the
@@ -147,10 +80,23 @@ function RealArmChrome({ mode, setMode, children }) {
           {/* 2026-09-08 operator directive: <ModeControl /> retired. */}
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
+          {/* 2026-09-08 operator directive: coherent pair with the
+              "Expand Jog Buttons" pill — this button reads
+              "Collapse Jog Buttons" when collapsing back to the
+              minimized pill state. Full-width toggle between
+              NORMAL and EXPANDED still uses the ⛶ / ✕ glyph
+              since it's a layout modifier, not the jog-visibility
+              toggle. */}
           <button
+            data-testid="collapse-jog-buttons"
             onClick={() => setMode('MINIMIZED')}
-            title="Minimize"
-            style={chromeBtn}>−</button>
+            title="Collapse Jog Buttons"
+            style={{
+              ...chromeBtn,
+              width: 'auto', padding: '0 12px',
+              fontSize: 11, fontWeight: 600,
+              letterSpacing: '0.02em',
+            }}>Collapse Jog Buttons</button>
           <button
             onClick={() => setMode(isExpanded ? 'NORMAL' : 'EXPANDED')}
             title={isExpanded ? 'Restore split layout' : 'Expand panel'}
@@ -173,39 +119,54 @@ const chromeBtn = {
   display: 'flex', alignItems: 'center', justifyContent: 'center',
 }
 
-// The docked minimized pill — shows a subtle red button that expands
-// the panel back to NORMAL on click.
+// The docked minimized pill — GREEN button labeled "Expand Jog
+// Buttons" (matches the Monitor Run button's #16A34A green, per
+// 2026-09-08 operator directive). When the jog surface is open,
+// the chrome header's collapse control reads "Collapse Jog
+// Buttons" — the pair stays coherent.
+//
+// If a jog hold is live, the button surfaces the joint + direction
+// as a subtitle so a stray tab-switch operator sees the arm is
+// under load; button copy stays "Expand Jog Buttons" so activation
+// language is consistent.
 function RealArmMinimizedPill({ setMode }) {
   const robot = useStore((s) => s.robot) || {}
   const active = !!robot.jog_active
-  const label = active
-    ? `REAL ARM · J${robot.jog_index} ${robot.jog_direction > 0 ? '+' : robot.jog_direction < 0 ? '−' : ''}`
-    : 'REAL ARM · Jog'
+  const holdLabel = active
+    ? `J${robot.jog_index} ${robot.jog_direction > 0 ? '+' : robot.jog_direction < 0 ? '−' : ''}`
+    : ''
   return (
     <button
+      data-testid="expand-jog-buttons"
       onClick={() => setMode('NORMAL')}
-      title="Open the real-arm jog pendant"
+      title="Open the jog pad"
       style={{
         position: 'absolute',
         bottom: 12, right: 12, zIndex: 15,
-        padding: '10px 14px',
-        background: active ? REAL_ARM_RED : '#B91C1C',
-        color: '#fff',
-        border: 'none', borderRadius: 999,
-        fontSize: 12, fontWeight: 700,
-        letterSpacing: '0.06em', textTransform: 'uppercase',
+        padding: '12px 22px',
+        background: '#16A34A', color: '#fff',
+        border: 'none', borderRadius: 10,
+        fontSize: 15, fontWeight: 700,
         cursor: 'pointer',
-        boxShadow: '0 4px 10px rgba(0,0,0,0.35)',
-        display: 'flex', alignItems: 'center', gap: 8,
-        minHeight: 44,   // tablet touch minimum
+        boxShadow: '0 4px 12px rgba(22,163,74,0.35)',
+        display: 'flex', alignItems: 'center', gap: 10,
+        minHeight: 44,
       }}
     >
-      <span style={{
-        width: 8, height: 8, borderRadius: '50%',
-        background: active ? '#FCA5A5' : '#FEE2E2',
-        boxShadow: active ? '0 0 6px #FCA5A5' : 'none',
-      }} />
-      {label}
+      {active && (
+        <span style={{
+          width: 8, height: 8, borderRadius: '50%',
+          background: '#FEE2E2',
+          boxShadow: '0 0 6px #FCA5A5',
+        }} />
+      )}
+      <span>Expand Jog Buttons</span>
+      {holdLabel && (
+        <span style={{
+          fontSize: 11, opacity: 0.85, fontWeight: 600,
+          fontFamily: 'var(--font-mono, monospace)',
+        }}>{holdLabel}</span>
+      )}
     </button>
   )
 }
@@ -226,14 +187,10 @@ export default function View3DLayout() {
 
   return (
     <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
-      {/* Part 3a parity fix (2026-07-17): hide the left rail while the
-          REAL ARM panel is EXPANDED so the shared JogControls receives
-          the SAME width as it does on the Program tab's expanded view.
-          Without this, LeftPanel eats ~130 px and the pad's tablet-
-          breakpoint sizing kicked in one step earlier than on the
-          Program tab, producing a visibly smaller layout for the same
-          `maximized=true` flag. */}
-      {!isExpanded && <LeftPanel armRef={armRef} />}
+      {/* 2026-09-08 operator directive: left sidebar retired. The
+          view-switcher moved into the ArmViewer3D top-left overlay
+          (already there at L1632); the 3D canvas reclaims the
+          ~130 px LeftPanel used to occupy. */}
 
       <div style={{
         flex: 1, overflow: 'hidden', position: 'relative',
