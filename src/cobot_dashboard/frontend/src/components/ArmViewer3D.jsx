@@ -1463,9 +1463,16 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
   const currentProgram = useStore((s) => s.currentProgram)
   const gripperCfg     = currentProgram?.config?.gripper || {}
   const gripperType    = gripperCfg.gripper_type || gripperCfg.type || null
-  const gripperGlbUrl  = gripperType === 'custom' && gripperCfg.gripper_model_id
-    ? (gripperCfg.gripper_glb_url || `/grippers/glb/${gripperCfg.gripper_model_id}.glb`)
-    : null
+  // 2026-09-08 Custom EOAT item 5: parent the tool-library GLB to
+  // the flange (J6) via the CustomGripperModel component below.
+  // Precedence: config.tool_id (new EOAT path) wins over
+  // legacy gripper_model_id / gripper_glb_url (pre-EOAT panels).
+  const _toolId        = currentProgram?.config?.tool_id || null
+  const gripperGlbUrl  = _toolId
+    ? `/api/tools/${encodeURIComponent(_toolId)}/mesh`
+    : (gripperType === 'custom' && gripperCfg.gripper_model_id
+        ? (gripperCfg.gripper_glb_url || `/grippers/glb/${gripperCfg.gripper_model_id}.glb`)
+        : null)
   const gripperName    = gripperCfg.gripper_name || gripperCfg.name || ''
 
   return (

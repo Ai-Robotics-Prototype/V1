@@ -645,63 +645,211 @@ function IOPortDropdown({ label, direction, value, onChange }) {
   )
 }
 
+// 2026-09-08: Custom Tool wizard subflow (operator directive:
+// "Custom End-of-Arm Tool upload — STEP file to flange-mounted
+// tool with real TCP").
+//
+// Sub-steps:
+//   (a) library-pick or upload new
+//   (b) ALIGNMENT — mount transform (90° rotation steps per axis +
+//       mm nudges). Deferred: live 3D preview inside the wizard;
+//       the flange-parented tool mesh in ArmViewer3D (item 5) is
+//       the operator's rendered check.
+//   (c) TCP DEFINITION — MANDATORY. Numeric inputs for x/y/z/rx/ry/rz.
+//       Deferred: raycast pick on the mesh (Phase 3 follow-up); the
+//       backend refusal ("the robot needs to know where this tool
+//       works") still guards missing values.
+//   (d) PAYLOAD — MANDATORY. Config-only path (luaenginelib.json has
+//       no setPayload verb, per operator's 2026-09-08 selection).
+//   (e) confirm — calls PUT /api/tools/{id}/confirm, then goes to
+//       the next wizard step with answers.custom_tool_id set.
+//
+// Program.config.tool_id is set to the confirmed tool_id so codegen
+// picks it up and emits the toolOffset header + tool=__tool suffix
+// on every mov* verb (see program_ops.py _emit_tool_var and item-4
+// pin test_custom_eoat_codegen.py).
+import {
+  listTools as _apiListTools,
+  uploadTool as _apiUploadTool,
+  pollUntilConverted as _apiPollConvert,
+  putMountTransform as _apiPutMount,
+  putTcp as _apiPutTcp,
+  putPayload as _apiPutPayload,
+  confirmTool as _apiConfirmTool,
+  deleteTool as _apiDeleteTool,
+  toolMeshUrl as _apiToolMeshUrl,
+} from '../lib/toolsApi'
+
+const _HALF_PI = Math.PI / 2
+const _ROT_CHOICES = [
+  { label: '0°',    value: 0 },
+  { label: '90°',   value: _HALF_PI },
+  { label: '180°',  value: Math.PI },
+  { label: '270°',  value: 3 * _HALF_PI },
+]
+const _CUSTOM_TOOL_SUBSTEP_STORAGE = 'custom_tool_wizard_substep'
+
 function CustomGripperPanel({ answers, setAnswer, goNext }) {
+  // Sub-step state (a..e). Stored on answers so back/forward through
+  // the wizard preserves position.
+  const initialSubstep = answers.custom_tool_substep || 'pick_or_upload'
+  const [substep, setSubstepState] = useState(initialSubstep)
+  const setSubstep = (s) => { setSubstepState(s); setAnswer('custom_tool_substep', s) }
+
+  // ── (a) pick_or_upload state ─────────────────────────────────
+  const [libraryTools, setLibraryTools] = useState([])
+  const [libraryLoading, setLibraryLoading] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [uploadErr, setUploadErr] = useState('')
   const [dragOver,  setDragOver]  = useState(false)
   const fileInputRef = useRef(null)
 
-  const uploadedModelId  = answers.gripper_model_id  || null
-  const uploadedStlUrl   = answers.gripper_stl_url   || null
-  const uploadedGlbUrl   = answers.gripper_glb_url   || null
-  const uploadedName     = answers.gripper_upload_name || ''
-  const uploadedDims     = answers.gripper_dimensions || null
-  const gripperName      = answers.gripper_name || uploadedName
+  // ── working tool state (populated once picked/uploaded) ──────
+  const activeToolId = answers.custom_tool_id || null
+  const [activeTool, setActiveTool] = useState(null)   // full tool.json doc
+  const [busy, setBusy] = useState(false)
+  const [stepErr, setStepErr] = useState('')
+
+  // Retro-edit guard state — set when PUT /tcp returns 409.
+  const [retroGuard, setRetroGuard] = useState(null)   // {programs, message}
+
+  // Reload the library on mount + when returning to picker.
+  useEffect(() => {
+    if (substep !== 'pick_or_upload') return
+    let alive = true
+    setLibraryLoading(true)
+    _apiListTools()
+      .then((tools) => { if (alive) setLibraryTools(tools.filter((t) => t.confirmed)) })
+      .catch(() => { if (alive) setLibraryTools([]) })
+      .finally(() => { if (alive) setLibraryLoading(false) })
+    return () => { alive = false }
+  }, [substep])
+
+  // Load the active tool.json whenever the id changes.
+  useEffect(() => {
+    if (!activeToolId) { setActiveTool(null); return }
+    let alive = true
+    fetch(`/api/tools/${encodeURIComponent(activeToolId)}`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((doc) => { if (alive) setActiveTool(doc) })
+    return () => { alive = false }
+  }, [activeToolId])
+
+  const gripperName = (activeTool?.name)
+    || answers.gripper_name
+    || ''
   const activateSignal   = answers.gripper_activate_signal || ''
   const confirmSignal    = answers.gripper_confirm_signal  || ''
 
-  const uploadFile = async (file) => {
+  const _startUpload = async (file, name) => {
     if (!file) return
-    const lower = file.name.toLowerCase()
+    const lower = (file.name || '').toLowerCase()
     if (!(lower.endsWith('.step') || lower.endsWith('.stp'))) {
-      setUploadErr('Only .step / .stp files accepted')
+      setUploadErr("this doesn't look like a STEP file (expected .step or .stp)")
+      return
+    }
+    if (!name || !name.trim()) {
+      setUploadErr('Give the tool a name before uploading')
       return
     }
     setUploadErr('')
     setUploading(true)
     try {
-      const form = new FormData()
-      form.append('file', file)
-      const res = await fetch('/api/gripper/upload', { method: 'POST', body: form })
-      const data = await res.json()
-      if (!res.ok || data.error) {
-        setUploadErr(data.error || 'Upload failed')
-      } else {
-        setAnswer('gripper_model_id',   data.id)
-        setAnswer('gripper_glb_url',    data.glb_url || null)
-        setAnswer('gripper_stl_url',    data.stl_url || null)
-        setAnswer('gripper_upload_name', data.name || '')
-        setAnswer('gripper_dimensions', data.dimensions || null)
-        if (!answers.gripper_name && data.name) {
-          setAnswer('gripper_name', data.name)
-        }
-      }
+      const pending = await _apiUploadTool(name.trim(), file)
+      setAnswer('custom_tool_id', pending.id)
+      // Poll for conversion completion (~78ms typical; deadline 30s
+      // so a rare complex STEP still converges).
+      await _apiPollConvert(pending.id)
+      setSubstep('alignment')
     } catch (e) {
-      setUploadErr('Upload error: ' + (e?.message || 'unknown'))
+      setUploadErr(e.message || 'upload failed')
+      // Roll back the tool_id so a retry starts fresh.
+      setAnswer('custom_tool_id', null)
+    } finally {
+      setUploading(false)
     }
-    setUploading(false)
   }
 
-  const removeModel = () => {
-    const id = answers.gripper_model_id
-    if (id) {
-      fetch('/api/gripper/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {})
+  const uploadFile = (file) => _startUpload(file, gripperName || answers.gripper_name || '')
+
+  const _pickExisting = (tool) => {
+    setAnswer('custom_tool_id', tool.id)
+    setAnswer('gripper_name', tool.name)
+    // Existing tool is already confirmed → jump past the flow;
+    // the caller (goNext) advances to the next wizard step and the
+    // program's config.tool_id picks up the id so codegen emits the
+    // tool-frame header.
+    setAnswer('payload_kg', tool.payload_kg ?? '')
+    goNext()
+  }
+
+  const _saveAlignment = async () => {
+    if (!activeToolId) return
+    setBusy(true); setStepErr('')
+    try {
+      const mt = activeTool?.mount_transform || {}
+      const doc = await _apiPutMount(activeToolId, mt)
+      setActiveTool(doc)
+      setSubstep('tcp')
+    } catch (e) { setStepErr(e.message || 'save failed') }
+    finally { setBusy(false) }
+  }
+
+  const _saveTcp = async (confirmedRetro = false) => {
+    if (!activeToolId) return
+    const tcp = activeTool?.tcp_offset || {}
+    // Refuse if all zeros — matches backend refusal but caught
+    // client-side too so the user sees it immediately.
+    const nonZero = ['x','y','z','rx','ry','rz'].some(
+      (k) => Math.abs(Number(tcp[k]) || 0) > 1e-9)
+    if (!nonZero) {
+      setStepErr('the robot needs to know where this tool works')
+      return
     }
-    setAnswer('gripper_model_id',   null)
-    setAnswer('gripper_glb_url',    null)
-    setAnswer('gripper_stl_url',    null)
-    setAnswer('gripper_upload_name', '')
-    setAnswer('gripper_dimensions', null)
+    setBusy(true); setStepErr('')
+    try {
+      const res = await _apiPutTcp(activeToolId, tcp, { confirmed: confirmedRetro })
+      if (res && res.retroEditRequired) {
+        setRetroGuard(res)
+        return
+      }
+      setActiveTool(res)
+      setRetroGuard(null)
+      setSubstep('payload')
+    } catch (e) { setStepErr(e.message || 'save failed') }
+    finally { setBusy(false) }
+  }
+
+  const _savePayloadAndConfirm = async () => {
+    if (!activeToolId) return
+    const kg = Number(activeTool?.payload_kg)
+    if (!Number.isFinite(kg) || kg <= 0) {
+      setStepErr('payload is required so the robot can plan safe motion')
+      return
+    }
+    setBusy(true); setStepErr('')
+    try {
+      await _apiPutPayload(activeToolId, kg)
+      const doc = await _apiConfirmTool(activeToolId)
+      setActiveTool(doc)
+      // Sync payload_kg into wizard answers so the existing payload
+      // step downstream sees it (config-only path).
+      setAnswer('payload_kg', kg)
+      setAnswer('gripper_name', doc.name)
+      goNext()
+    } catch (e) { setStepErr(e.message || 'save failed') }
+    finally { setBusy(false) }
+  }
+
+  const _updateActiveField = (path, value) => {
+    setActiveTool((prev) => {
+      if (!prev) return prev
+      const next = { ...prev }
+      // path like 'tcp_offset.x' or 'mount_transform.rx'
+      const [group, key] = path.split('.')
+      next[group] = { ...(prev[group] || {}), [key]: value }
+      return next
+    })
   }
 
   const onDrop = (e) => {
@@ -711,109 +859,368 @@ function CustomGripperPanel({ answers, setAnswer, goNext }) {
     if (f) uploadFile(f)
   }
 
+  const _pageTitle = () => ({
+    pick_or_upload: 'Custom Tool',
+    alignment:      'Custom Tool · How does it mount?',
+    tcp:            'Custom Tool · Where does it work?',
+    payload:        'Custom Tool · How heavy?',
+  }[substep] || 'Custom Tool')
+
   return (
     <div style={{ padding: 24, maxWidth: 720, margin: '0 auto' }}>
       <div style={{ fontSize: 22, fontWeight: 700, color: '#111', marginBottom: 8, lineHeight: 1.3 }}>
-        Custom Gripper
-      </div>
-      <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 20, lineHeight: 1.5 }}>
-        Optional: upload a STEP file for a 3D preview. Name your gripper and assign any digital I/O it uses.
+        {_pageTitle()}
       </div>
 
-      {/* Section 1 — STEP file */}
-      <div style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 8 }}>STEP File (optional)</div>
-      {uploading ? (
-        <div style={{
-          padding: 28, border: '2px dashed #bfdbfe', borderRadius: 10, background: '#eff6ff',
-          textAlign: 'center', marginBottom: 20,
-        }}>
-          <div style={{
-            width: 28, height: 28, margin: '0 auto 10px',
-            border: '3px solid #bfdbfe', borderTopColor: '#2563EB',
-            borderRadius: '50%', animation: 'spin 1s linear infinite',
-          }} />
-          <div style={{ fontSize: 13, color: '#2563EB', fontWeight: 600 }}>Processing STEP file…</div>
-          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-        </div>
-      ) : uploadedModelId && uploadedStlUrl ? (
-        <div style={{ marginBottom: 20 }}>
-          <GripperPreviewCanvas
-            stlUrl={uploadedStlUrl}
-            name={uploadedName || gripperName}
-            dims={uploadedDims}
-            onRemove={removeModel}
-          />
-        </div>
-      ) : (
-        <div
-          onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
-          onDragLeave={() => setDragOver(false)}
-          onDrop={onDrop}
-          style={{
-            padding: 28, marginBottom: 20,
-            border: '2px dashed ' + (dragOver ? '#2563EB' : '#d1d5db'),
-            background: dragOver ? '#eff6ff' : '#f8fafc',
-            borderRadius: 10, textAlign: 'center',
-            transition: 'all 100ms',
-          }}>
-          <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 10 }}>
-            Upload a STEP file to preview your gripper in 3D (optional)
+      {/* ── sub-step (a): pick from library or upload new ── */}
+      {substep === 'pick_or_upload' && (
+        <>
+          <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 20, lineHeight: 1.5 }}>
+            Pick an existing tool from the library or upload a new STEP file.
           </div>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".step,.stp"
-            style={{ display: 'none' }}
-            onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadFile(f); e.target.value = '' }}
-          />
-          <button onClick={() => fileInputRef.current?.click()}
-            style={{
-              padding: '10px 18px', fontSize: 13, fontWeight: 700,
-              background: '#2563EB', color: '#fff', border: 'none',
-              borderRadius: 8, cursor: 'pointer',
+
+          <div style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 8 }}>
+            Tool library {libraryLoading && '(loading…)'}
+          </div>
+          {libraryTools.length === 0 && !libraryLoading && (
+            <div style={{ fontSize: 12, color: '#9ca3af', marginBottom: 16 }}>
+              No custom tools uploaded yet — upload one below.
+            </div>
+          )}
+          {libraryTools.map((t) => (
+            <button
+              key={t.id}
+              data-testid={`custom-tool-library-${t.id}`}
+              onClick={() => _pickExisting(t)}
+              style={{
+                display: 'flex', width: '100%', gap: 12, alignItems: 'center',
+                padding: '10px 14px', marginBottom: 8,
+                background: '#f8fafc', border: '1px solid #e5e7eb',
+                borderRadius: 8, cursor: 'pointer', textAlign: 'left',
+              }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: '#111' }}>{t.name}</div>
+                <div style={{ fontSize: 11, color: '#6b7280' }}>
+                  TCP z={((t.tcp_offset?.z || 0) * 1000).toFixed(1)} mm ·
+                  {' '}payload {t.payload_kg ?? '?'} kg
+                </div>
+              </div>
+              <div style={{ fontSize: 11, color: '#2563EB', fontWeight: 700 }}>Use</div>
+            </button>
+          ))}
+
+          <div style={{ fontSize: 13, fontWeight: 700, color: '#374151',
+                       marginTop: 24, marginBottom: 8 }}>
+            Or upload a new STEP file
+          </div>
+          <div style={{ marginBottom: 12 }}>
+            <input
+              value={answers.gripper_name || ''}
+              onChange={(e) => setAnswer('gripper_name', e.target.value)}
+              placeholder="Give the tool a name (e.g. Custom Magnetic Gripper)"
+              style={{ ...inputBox, fontSize: 15 }}
+            />
+          </div>
+          {uploading ? (
+            <div style={{
+              padding: 28, border: '2px dashed #bfdbfe', borderRadius: 10, background: '#eff6ff',
+              textAlign: 'center', marginBottom: 20,
             }}>
-            Upload Gripper STEP File
-          </button>
-          <div style={{ fontSize: 11, color: '#9ca3af', marginTop: 8 }}>
-            Or drag and drop a .step / .stp file here.
-          </div>
-        </div>
+              <div style={{
+                width: 28, height: 28, margin: '0 auto 10px',
+                border: '3px solid #bfdbfe', borderTopColor: '#2563EB',
+                borderRadius: '50%', animation: 'spin 1s linear infinite',
+              }} />
+              <div style={{ fontSize: 13, color: '#2563EB', fontWeight: 600 }}>Converting STEP file…</div>
+              <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+            </div>
+          ) : (
+            <div
+              onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={onDrop}
+              style={{
+                padding: 28, marginBottom: 12,
+                border: '2px dashed ' + (dragOver ? '#2563EB' : '#d1d5db'),
+                background: dragOver ? '#eff6ff' : '#f8fafc',
+                borderRadius: 10, textAlign: 'center',
+                transition: 'all 100ms',
+              }}>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".step,.stp"
+                data-testid="custom-tool-file-input"
+                style={{ display: 'none' }}
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadFile(f); e.target.value = '' }}
+              />
+              <button onClick={() => fileInputRef.current?.click()}
+                style={{
+                  padding: '10px 18px', fontSize: 13, fontWeight: 700,
+                  background: '#2563EB', color: '#fff', border: 'none',
+                  borderRadius: 8, cursor: 'pointer',
+                }}>
+                Upload STEP File
+              </button>
+              <div style={{ fontSize: 11, color: '#9ca3af', marginTop: 8 }}>
+                Or drag and drop a .step / .stp file here.
+              </div>
+            </div>
+          )}
+          {uploadErr && (
+            <div data-testid="custom-tool-upload-error" style={{
+              padding: 10, marginBottom: 16, fontSize: 12,
+              background: '#fef2f2', border: '1px solid #fecaca',
+              borderRadius: 6, color: '#DC2626',
+            }}>{uploadErr}</div>
+          )}
+        </>
       )}
-      {uploadErr && (
-        <div style={{
-          padding: 10, marginBottom: 16, fontSize: 12,
+
+      {/* ── sub-step (b): alignment — mount transform ── */}
+      {substep === 'alignment' && activeTool && (
+        <>
+          <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 16, lineHeight: 1.5 }}>
+            How does this tool mount on the flange? Rotations snap to 90° steps.
+            Nudges in millimeters.
+          </div>
+          <MountTransformForm
+            mt={activeTool.mount_transform || {}}
+            onChange={(k, v) => _updateActiveField(`mount_transform.${k}`, v)}
+          />
+          <div style={{ display: 'flex', gap: 8, marginTop: 20 }}>
+            <button onClick={() => setSubstep('pick_or_upload')}
+              style={secondaryBtn}>← Back</button>
+            <button onClick={_saveAlignment} disabled={busy}
+              data-testid="custom-tool-align-next"
+              style={primaryBtn}>{busy ? 'Saving…' : 'Next → TCP'}</button>
+          </div>
+        </>
+      )}
+
+      {/* ── sub-step (c): TCP definition — MANDATORY ── */}
+      {substep === 'tcp' && activeTool && (
+        <>
+          <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 16, lineHeight: 1.5 }}>
+            The <b>tool center point</b> (TCP) is where the tool actually works —
+            the tip of a suction cup, the jaws' center, the electrode tip.
+            Measured from the flange origin.
+          </div>
+          <TcpOffsetForm
+            tcp={activeTool.tcp_offset || {}}
+            onChange={(k, v) => _updateActiveField(`tcp_offset.${k}`, v)}
+          />
+          <div style={{ display: 'flex', gap: 8, marginTop: 20 }}>
+            <button onClick={() => setSubstep('alignment')}
+              style={secondaryBtn}>← Back</button>
+            <button onClick={() => _saveTcp(false)} disabled={busy}
+              data-testid="custom-tool-tcp-next"
+              style={primaryBtn}>{busy ? 'Saving…' : 'Next → payload'}</button>
+          </div>
+          {retroGuard && (
+            <RetroEditConfirmModal
+              programs={retroGuard.programs}
+              message={retroGuard.message}
+              onCancel={() => setRetroGuard(null)}
+              onConfirm={() => _saveTcp(true)}
+            />
+          )}
+        </>
+      )}
+
+      {/* ── sub-step (d): payload_kg — MANDATORY ── */}
+      {substep === 'payload' && activeTool && (
+        <>
+          <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 16, lineHeight: 1.5 }}>
+            How heavy is the tool (plus anything it will hold)? The robot uses
+            this to plan safe motion.
+          </div>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'baseline', marginBottom: 12 }}>
+            <input
+              type="number" step="0.05" min="0"
+              value={activeTool.payload_kg ?? ''}
+              onChange={(e) => setActiveTool((prev) => prev && ({
+                ...prev,
+                payload_kg: e.target.value === '' ? '' : Number(e.target.value),
+              }))}
+              placeholder="1.5"
+              data-testid="custom-tool-payload-input"
+              style={{ ...inputBox, width: 160 }}
+            />
+            <div style={{ fontSize: 13, color: '#6b7280' }}>kg</div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 20 }}>
+            <button onClick={() => setSubstep('tcp')}
+              style={secondaryBtn}>← Back</button>
+            <button onClick={_savePayloadAndConfirm} disabled={busy}
+              data-testid="custom-tool-payload-confirm"
+              style={primaryBtn}>{busy ? 'Saving…' : 'Finish tool setup ✓'}</button>
+          </div>
+        </>
+      )}
+
+      {/* Section — I/O signals — kept from the pre-2026-09-08 panel
+          so the existing effectorVocab hookup path still works while
+          the per-tool-id hookup map extension (item 6) lands as a
+          follow-up. */}
+      {substep === 'pick_or_upload' && (
+        <>
+          <div style={{ fontSize: 13, fontWeight: 700, color: '#374151',
+                        marginTop: 24, marginBottom: 4 }}>
+            I/O signals (optional — assign if your tool uses digital I/O)
+          </div>
+          <IOPortDropdown label="Activate signal" direction="output"
+            value={activateSignal}
+            onChange={(v) => setAnswer('gripper_activate_signal', v)} />
+          <IOPortDropdown label="Confirm signal" direction="input"
+            value={confirmSignal}
+            onChange={(v) => setAnswer('gripper_confirm_signal', v)} />
+        </>
+      )}
+
+      {stepErr && (
+        <div data-testid="custom-tool-step-error" style={{
+          padding: 10, marginTop: 12, fontSize: 12,
           background: '#fef2f2', border: '1px solid #fecaca',
           borderRadius: 6, color: '#DC2626',
-        }}>{uploadErr}</div>
+        }}>{stepErr}</div>
       )}
+    </div>
+  )
+}
 
-      {/* Section 2 — Name */}
-      <div style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 4 }}>Gripper name</div>
-      <input
-        value={gripperName}
-        onChange={(e) => setAnswer('gripper_name', e.target.value)}
-        placeholder="e.g. Custom Magnetic Gripper"
-        style={{ ...inputBox, fontSize: 15, marginBottom: 20 }}
-      />
+// ── Reusable form sections ────────────────────────────────────
 
-      {/* Section 3 — I/O */}
-      <div style={{ fontSize: 13, fontWeight: 700, color: '#374151', marginBottom: 4 }}>
-        I/O signals (optional — assign if your gripper uses digital I/O)
+const primaryBtn = {
+  padding: '10px 18px', fontSize: 13, fontWeight: 700,
+  background: '#2563EB', color: '#fff', border: 'none',
+  borderRadius: 8, cursor: 'pointer',
+}
+const secondaryBtn = {
+  padding: '10px 14px', fontSize: 13, fontWeight: 600,
+  background: '#f3f4f6', color: '#374151',
+  border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
+}
+
+function MountTransformForm({ mt, onChange }) {
+  const nudgeMm = (k) => Math.round(((mt[k] || 0) * 1000) * 10) / 10
+  return (
+    <div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10, marginBottom: 12 }}>
+        {['rx', 'ry', 'rz'].map((k) => (
+          <div key={k}>
+            <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 4 }}>
+              Rotate {k.toUpperCase().replace('R', '')}
+            </div>
+            <select
+              value={_ROT_CHOICES.reduce((best, c) =>
+                Math.abs(c.value - (mt[k] || 0)) < Math.abs(best.value - (mt[k] || 0)) ? c : best,
+                _ROT_CHOICES[0]).value}
+              onChange={(e) => onChange(k, Number(e.target.value))}
+              data-testid={`custom-tool-mount-${k}`}
+              style={{ ...inputBox, width: '100%' }}
+            >
+              {_ROT_CHOICES.map((c) => (
+                <option key={c.label} value={c.value}>{c.label}</option>
+              ))}
+            </select>
+          </div>
+        ))}
       </div>
-      <IOPortDropdown
-        label="Activate signal"
-        direction="output"
-        value={activateSignal}
-        onChange={(v) => setAnswer('gripper_activate_signal', v)}
-      />
-      <IOPortDropdown
-        label="Confirm signal"
-        direction="input"
-        value={confirmSignal}
-        onChange={(v) => setAnswer('gripper_confirm_signal', v)}
-      />
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10 }}>
+        {['tx', 'ty', 'tz'].map((k) => (
+          <div key={k}>
+            <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 4 }}>
+              Nudge {k.slice(1).toUpperCase()} (mm)
+            </div>
+            <input
+              type="number" step="0.5"
+              value={nudgeMm(k)}
+              onChange={(e) => onChange(k, Number(e.target.value) / 1000)}
+              data-testid={`custom-tool-mount-${k}`}
+              style={{ ...inputBox, width: '100%' }}
+            />
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
 
-      <NextButton onClick={goNext} disabled={!gripperName.trim()} label="Next" />
+function TcpOffsetForm({ tcp, onChange }) {
+  const mm = (k) => Math.round(((tcp[k] || 0) * 1000) * 10) / 10
+  const deg = (k) => Math.round(((tcp[k] || 0) * 180 / Math.PI) * 10) / 10
+  return (
+    <div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10, marginBottom: 12 }}>
+        {['x', 'y', 'z'].map((k) => (
+          <div key={k}>
+            <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 4 }}>
+              {k.toUpperCase()} (mm)
+            </div>
+            <input
+              type="number" step="0.5"
+              value={mm(k)}
+              onChange={(e) => onChange(k, Number(e.target.value) / 1000)}
+              data-testid={`custom-tool-tcp-${k}`}
+              style={{ ...inputBox, width: '100%' }}
+            />
+          </div>
+        ))}
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10 }}>
+        {['rx', 'ry', 'rz'].map((k) => (
+          <div key={k}>
+            <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 4 }}>
+              {k.toUpperCase()} (deg)
+            </div>
+            <input
+              type="number" step="1"
+              value={deg(k)}
+              onChange={(e) => onChange(k, Number(e.target.value) * Math.PI / 180)}
+              data-testid={`custom-tool-tcp-${k}`}
+              style={{ ...inputBox, width: '100%' }}
+            />
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function RetroEditConfirmModal({ programs, message, onCancel, onConfirm }) {
+  return (
+    <div
+      data-testid="custom-tool-retro-edit-modal"
+      onClick={onCancel}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 2000,
+        background: 'rgba(0,0,0,0.55)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}>
+      <div onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#fff', border: '1px solid #e5e7eb',
+          borderRadius: 10, padding: 20, maxWidth: 480,
+          boxShadow: '0 10px 30px rgba(0,0,0,0.35)',
+        }}>
+        <div style={{ fontSize: 15, fontWeight: 700, color: '#111', marginBottom: 6 }}>
+          Change the TCP?
+        </div>
+        <div style={{ fontSize: 13, color: '#374151', marginBottom: 12 }}>{message}</div>
+        <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 6 }}>
+          Affected programs:
+        </div>
+        <ul style={{ margin: '0 0 14px 20px', fontSize: 12, color: '#111', padding: 0 }}>
+          {(programs || []).map((p) => (
+            <li key={p.id}>{p.name || p.id}</li>
+          ))}
+        </ul>
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+          <button onClick={onCancel} style={secondaryBtn}>Cancel</button>
+          <button onClick={onConfirm} style={primaryBtn}>Change TCP anyway</button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -3573,6 +3980,15 @@ export default function ProgramWizard({ onClose, onSaved }) {
       if (!config.tool_name || String(config.tool_name).trim() === '') {
         delete config.tool_name
       }
+      // 2026-09-08 Custom EOAT item 4: promote wizard-collected
+      // custom_tool_id to config.tool_id so codegen emits the
+      // toolOffset header + tool=__tool suffix on every mov*.
+      if (answers.custom_tool_id) {
+        config.tool_id = answers.custom_tool_id
+      }
+      // Wizard-internal state that shouldn't ship on config.
+      delete config.custom_tool_substep
+      delete config.custom_tool_id
       if (config.payload_cog_mm && typeof config.payload_cog_mm === 'object'
           && Object.keys(config.payload_cog_mm).length === 0) {
         delete config.payload_cog_mm

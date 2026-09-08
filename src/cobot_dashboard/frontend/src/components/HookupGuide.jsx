@@ -55,6 +55,8 @@ export default function HookupGuide({
   gripperType, mode = 'wizard', confirmed = false,
   noSensor: initialNoSensor = null,
   optionalAnswers: initialOptional = null,
+  program = null,   // 2026-09-08 EOAT item 6: needed to filter
+                    // gripper_hookups.custom by config.tool_id
   onConfirm, onSkip, onClose,
 }) {
   const [map, setMap]     = useState(null)
@@ -82,7 +84,22 @@ export default function HookupGuide({
     return () => { alive = false }
   }, [])
 
-  const rawHookups = (map && map.gripper_hookups && map.gripper_hookups[gripperType]) || []
+  // 2026-09-08 (Custom EOAT item 6): custom-tool hookups are keyed
+  // by tool_id so different custom tools can carry their own IN/OUT
+  // + air-station assignments. Filter the flat `custom` array to
+  // just the entries matching the current program's tool_id (falls
+  // back to entries with no tool_id — the legacy shape — so
+  // pre-EOAT programs still render their operator-assigned signals).
+  let rawHookups = (map && map.gripper_hookups && map.gripper_hookups[gripperType]) || []
+  if (gripperType === 'custom' && Array.isArray(rawHookups)) {
+    const activeToolId = program?.config?.tool_id || null
+    if (activeToolId) {
+      rawHookups = rawHookups.filter(
+        (h) => !h.tool_id || h.tool_id === activeToolId)
+    } else {
+      rawHookups = rawHookups.filter((h) => !h.tool_id)
+    }
+  }
 
   // Seed optional-toggle defaults from the map when it first
   // lands (only for keys the caller didn't pre-set). e.g. the
