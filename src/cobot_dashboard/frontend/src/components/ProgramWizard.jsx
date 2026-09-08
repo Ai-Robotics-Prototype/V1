@@ -1765,68 +1765,10 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
   )
 }
 
-function CellPickerPage({ answers, setAnswer, goNext }) {
-  const [cells, setCells]   = useState([])
-  const [active, setActive] = useState(null)
-  const [loaded, setLoaded] = useState(false)
-  useEffect(() => {
-    let alive = true
-    fetch('/api/cells').then(r => r.json()).then((j) => {
-      if (!alive) return
-      setCells((j.cells || []).filter(c => c.commissioning_complete))
-      setActive(j.active_cell_id || null)
-      setLoaded(true)
-      // Pre-select the active cell on first mount if the user hasn't
-      // already chosen one in this session.
-      if (j.active_cell_id && !answers.cell_id) {
-        setAnswer('cell_id', j.active_cell_id)
-      }
-    }).catch(() => { setLoaded(true) })
-    return () => { alive = false }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+// 2026-09-08: CellPickerPage RETIRED. Cell auto-assign lives in
+// ProgramWizard mount below — one commissioned cell auto-selects,
+// zero or many leaves cell_id null (silent).
 
-  const haveCells = cells.length > 0
-  return (
-    <QuestionCard
-      question="Which workspace is this program for?"
-      description="Programs are scoped to a commissioned cell. The active cell is pre-selected."
-    >
-      {!loaded && <div style={{ color: '#6b7280', fontSize: 13 }}>Loading cells…</div>}
-      {loaded && !haveCells && (
-        <div style={{
-          padding: 14, background: '#fffbeb', border: '1px solid #fde68a',
-          borderRadius: 10, color: '#92400e', fontSize: 13, lineHeight: 1.5,
-          marginBottom: 12,
-        }}>
-          No cells commissioned yet. You can still continue without one, but linking the program to a cell unlocks per-cell baselines and bounds later.
-          {' '}Go to <strong>Configure → Setup Wizard</strong> to commission one.
-        </div>
-      )}
-      {loaded && haveCells && (
-        <div style={{ marginBottom: 12 }}>
-          {cells.map(c => (
-            <ChoiceButton key={c.cell_id}
-              label={c.name + (c.cell_id === active ? '   (Active)' : '')}
-              description={
-                (c.baseline_captured ? `Baseline ${(c.baseline_point_count || 0).toLocaleString()} pts · ` : 'No baseline · ')
-                + (c.commissioning_complete ? 'Commissioned' : 'Incomplete')
-              }
-              selected={answers.cell_id === c.cell_id}
-              onClick={() => { setAnswer('cell_id', c.cell_id); goNext({ cell_id: c.cell_id }) }}
-            />
-          ))}
-        </div>
-      )}
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
-        <NextButton
-          onClick={goNext}
-          label={haveCells ? 'Use selected' : 'Continue without a cell'}
-        />
-      </div>
-    </QuestionCard>
-  )
-}
 
 // ── Page bodies that use hooks — extracted as proper Components so
 // ── React tracks their hook stacks separately from the parent
@@ -1943,11 +1885,22 @@ function MachineIOBody({ answers, setAnswer, goNext }) {
 }
 
 const PAGES = [
-  // 0: Which workspace is this program for?
-  {
-    id: 'cell',
-    render: CellPickerPage,
-  },
+  // 2026-09-08 wizard simplification (operator directive):
+  //   * `cell` page RETIRED. Auto-assigned in ProgramWizard mount
+  //     when exactly one commissioned cell exists; silent null
+  //     otherwise. Cell-less programs load / push / run
+  //     correctly (the footer's "No cell — environment guard off"
+  //     path has been the default when no cell is active for a
+  //     week now).
+  //   * `sort` operation RETIRED from the operation page (codegen
+  //     paths on the backend stay live so existing sort programs
+  //     on disk still load; only the wizard chooser goes).
+  //   * `pick_method` page RETIRED. Source defaults to
+  //     'fixed_position' for pick_and_place + machine_tend; the
+  //     palletize flow still sets its own source via pallet_mode.
+  //     `which_part` skip predicate (`source !== 'camera_library'`)
+  //     handles the source=undefined case as True → page skipped
+  //     with no orphan.
 
   // 1: What operation?
   {
@@ -1959,13 +1912,28 @@ const PAGES = [
       >
         {[
           { value: 'pick_and_place', label: 'Pick and Place', desc: 'Pick an object and move it to another location', icon: 'P' },
-          { value: 'sort', label: 'Sort Parts', desc: 'Identify parts and place them in different locations by type', icon: 'S' },
           { value: 'machine_tend', label: 'Machine Tending', desc: 'Load parts into a machine, wait, then unload', icon: 'M' },
           { value: 'palletize', label: 'Palletize', desc: 'Stack parts onto a pallet or pick them off a pallet', icon: 'G' },
         ].map(op => (
           <ChoiceButton key={op.value} label={op.label} description={op.desc} icon={op.icon}
             selected={answers.operation === op.value}
-            onClick={() => { setAnswer('operation', op.value); goNext({ operation: op.value }) }}
+            onClick={() => {
+              // Default `source` alongside `operation` per the
+              // 2026-09-08 directive: pick_and_place + machine_tend
+              // = fixed-position taught pick (skips the retired
+              // which_part page); palletize sets its own source
+              // in the pallet_mode click handler. Passing both
+              // keys through the goNext override so skip predicates
+              // on downstream pages see the fresh values (per the
+              // desync class fix).
+              const override = { operation: op.value }
+              if (op.value !== 'palletize') {
+                override.source = 'fixed_position'
+              }
+              setAnswer('operation', op.value)
+              if (override.source) setAnswer('source', override.source)
+              goNext(override)
+            }}
           />
         ))}
       </QuestionCard>
@@ -2032,35 +2000,12 @@ const PAGES = [
     },
   },
 
-  // 1: How does the robot find objects?
-  //    Skipped entirely for pallet modes — palletize forces camera_library,
-  //    depalletize forces fixed_grid (selection happens on the
-  //    pallet_mode page above).
-  //    Stores answers.source (the value downstream consumers read).
-  //    'camera_library' — vision detects the part using taught
-  //                       references from the Part Recognition library;
-  //                       requires the which_part page to pick which.
-  //    'fixed_position' — part is always in the same taught spot.
-  {
-    id: 'pick_method',
-    skip: (answers) => answers.operation === 'palletize',
-    render: ({ answers, setAnswer, goNext }) => (
-      <QuestionCard
-        question="How should the robot find the parts?"
-        description="Choose how the robot identifies what to pick up."
-      >
-        {[
-          { value: 'camera_library', label: 'Camera Detection', desc: 'Camera detects parts using taught references from the Part Recognition library' },
-          { value: 'fixed_position', label: 'Fixed Position', desc: 'The part is always in the same spot (e.g. from a feeder or conveyor).' },
-        ].map(m => (
-          <ChoiceButton key={m.value} label={m.label} description={m.desc}
-            selected={answers.source === m.value}
-            onClick={() => { setAnswer('source', m.value); goNext({ source: m.value }) }}
-          />
-        ))}
-      </QuestionCard>
-    ),
-  },
+  // pick_method page RETIRED 2026-09-08. Source now defaults to
+  // 'fixed_position' from the operation page's click handler
+  // (pick_and_place + machine_tend). Palletize continues to set
+  // source in the pallet_mode click handler. Re-adding a
+  // camera-detection option is an editor-level change; do not
+  // reintroduce a wizard page for it without a fresh directive.
 
   // 2: Which part? (only if Camera Detection selected on page 1)
   //   Palletize skips this page: the operator forces source=camera_library
@@ -2612,9 +2557,54 @@ const PAGES = [
           ))}
           {answers.repeat === 'count' && (
             <div style={{ marginTop: 12 }}>
-              <SliderQuestion label="Number of cycles" value={answers.repeat_count || 10}
-                onChange={v => setAnswer('repeat_count', v)} min={2} max={500} step={1} unit="" />
-              <NextButton onClick={goNext} label="Next" />
+              {/* 2026-09-08 wizard simplification: SliderQuestion
+                  replaced with a plain numeric input per operator
+                  directive. Direct typing, min=1, no artificial
+                  max — codegen accepts any positive integer (the
+                  Lua `for i=1,N do … end` loop caps at controller
+                  int range). Validate integer at commit; letting
+                  operator type freely as they go. */}
+              <label style={{
+                display: 'block', fontSize: 13, fontWeight: 600,
+                color: '#111', marginBottom: 6,
+              }}>
+                Number of cycles
+              </label>
+              <input
+                data-testid="wizard-cycles-input"
+                type="number"
+                min={1}
+                step={1}
+                inputMode="numeric"
+                value={answers.repeat_count ?? 10}
+                onChange={(e) => {
+                  const raw = e.target.value
+                  if (raw === '') { setAnswer('repeat_count', ''); return }
+                  const n = parseInt(raw, 10)
+                  if (Number.isFinite(n) && n >= 1) {
+                    setAnswer('repeat_count', n)
+                  }
+                }}
+                style={{
+                  width: 140, padding: '8px 12px',
+                  fontSize: 16, fontFamily: 'var(--font-mono, monospace)',
+                  border: '1px solid #d1d5db', borderRadius: 6,
+                  background: '#fff', color: '#111',
+                }}
+              />
+              <NextButton
+                onClick={() => {
+                  // Belt-and-braces integer validation at commit
+                  // time. Empty / non-integer / <1 clamps to 1.
+                  const n = parseInt(answers.repeat_count, 10)
+                  if (!Number.isFinite(n) || n < 1) {
+                    setAnswer('repeat_count', 1)
+                    goNext({ repeat_count: 1 })
+                  } else {
+                    goNext({ repeat_count: n })
+                  }
+                }}
+                label="Next" />
             </div>
           )}
         </QuestionCard>
@@ -3425,6 +3415,29 @@ export default function ProgramWizard({ onClose, onSaved }) {
   // the Review page can show the distinction after the teach sequence
   // completes — TeachSequence's internal state would be lost on unmount.
   const [reusedSteps, setReusedSteps] = useState({})
+
+  // 2026-09-08 wizard simplification: auto-assign cell_id when
+  // exactly one commissioned cell exists. Silent null otherwise
+  // (no page, no toast — cell-less programs load / push / run
+  // exactly as today per the footer "No cell — environment guard
+  // off" doctrine that's been the running default all week).
+  useEffect(() => {
+    let alive = true
+    fetch('/api/cells').then((r) => r.ok ? r.json() : null)
+      .then((j) => {
+        if (!alive || !j) return
+        const commissioned = (j.cells || []).filter(
+          (c) => c && c.commissioning_complete)
+        if (commissioned.length === 1) {
+          setAnswers((prev) => prev.cell_id
+            ? prev
+            : { ...prev, cell_id: commissioned[0].cell_id })
+        }
+        // 0 or >1: leave cell_id undefined; buildSteps sends null.
+      })
+      .catch(() => { /* silent — cell_id stays null */ })
+    return () => { alive = false }
+  }, [])
 
   const setAnswer = (key, value) => setAnswers(prev => ({ ...prev, [key]: value }))
 
