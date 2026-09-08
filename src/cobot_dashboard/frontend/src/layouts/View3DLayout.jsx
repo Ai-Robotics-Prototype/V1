@@ -246,10 +246,11 @@ export default function View3DLayout() {
         {/* REAL ARM jog dock */}
         {!isMinimized && (
           <RealArmChrome mode={jogPanelMode} setMode={setView3dJogPanel}>
-            {/* runConfirm — 3D View's Run button opens a confirm modal
-                showing the program name + step count, so a stray click
-                on this tab doesn't start motion. Program tab bypasses. */}
-            <JogControls maximized={isExpanded} runConfirm />
+            {/* 2026-09-08: right-column controls (Run/Pause/STOP/Home/
+                E-STOP/Teach) retired from JogControls per operator
+                directive. Program execution lives on Monitor; TopBar
+                owns E-STOP. runConfirm prop retired with them. */}
+            <JogControls maximized={isExpanded} />
           </RealArmChrome>
         )}
       </div>

@@ -445,7 +445,7 @@ function PadCenter({ label, width = 80, height = 80, labelSize = 12 }) {
 // JogControls — the pendant. Prop `maximized` picks the size tier;
 // callers wrap it in whatever chrome / minimize toggle they need.
 // -----------------------------------------------------------------------------
-export default function JogControls({ maximized = false, onTeach, runConfirm = false }) {
+export default function JogControls({ maximized = false }) {
   const winW = (typeof window !== 'undefined') ? window.innerWidth : 1280
   const isTabletW = winW <= 1280
   const isNarrowW = winW <= 1500
@@ -462,13 +462,10 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   // minimize/restore lifecycle; JogControls no longer participates.
   const jogStyle          = useStore((s) => s.jogStyle) || 'CONTINUOUS'
   const setJogStyle       = useStore((s) => s.setJogStyle)
-  const program           = useStore((s) => s.program) || { steps: [] }
-  const triggerEstop   = useStore((s) => s.triggerEstop)
-  const homeRobot      = useStore((s) => s.homeRobot)
-  const runProgram     = useStore((s) => s.runProgram)
-  const pauseProgram   = useStore((s) => s.pauseProgram)
-  const resumeProgram  = useStore((s) => s.resumeProgram)
-  const cancelProgram  = useStore((s) => s.cancelProgram)
+  // 2026-09-08: program / triggerEstop / homeRobot / runProgram /
+  // pauseProgram / resumeProgram / cancelProgram store hooks retired
+  // with the RIGHT column. Program execution lives on Monitor; TopBar
+  // owns E-STOP as the single always-visible surface.
   const task           = useStore((s) => s.task)
   const safety         = useStore((s) => s.safety)
   const robot          = useStore((s) => s.robot) || {}
@@ -547,7 +544,7 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
   }, [jogIncrement, jogPulseCartesian])
 
   const { estop } = safety
-  const { running, paused, state, program_step, program_total, program_name } = task
+  const { running, paused, state, program_step, program_total } = task
 
   // ── Alarm + stop-reason interpreters ──────────────────────────────
   // Map raw driver telemetry to actionable operator text. Codes are
@@ -722,14 +719,8 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
                                  : (isTabletW ? 11 : isNarrowW ? 12 : 13)
   const jointLblMb = maximized ? (isTabletW ? 6 : isNarrowW ? 8 : 10)
                                : (isTabletW ? 4 : isNarrowW ? 5 : 6)
-  const actionMinH = maximized ? (isTabletW ? 56 : isNarrowW ? 60 : 68)
-                               : (isTabletW ? 44 : isNarrowW ? 48 : 52)
-  const actionFont = maximized ? (isTabletW ? 14 : isNarrowW ? 16 : 17)
-                               : (isTabletW ? 12 : isNarrowW ? 13 : 14)
-  const actionMinW = maximized ? (isTabletW ? 84  : isNarrowW ? 92  : 100)
-                               : (isTabletW ? 64  : isNarrowW ? 72  : 80)
-  const actionGap = maximized ? (isTabletW ? 8  : isNarrowW ? 12 : 14)
-                              : (isTabletW ? 6  : isNarrowW ?  8 : 10)
+  // 2026-09-08: actionMinH/actionFont/actionMinW/actionGap retired
+  // with the RIGHT column (Run/Pause/STOP/Home/E-STOP/Teach buttons).
   const modeMinH = maximized ? (isTabletW ? 46 : isNarrowW ? 50 : 56)
                              : (isTabletW ? 40 : isNarrowW ? 42 : 44)
   const modeFont = maximized ? (isTabletW ? 13 : isNarrowW ? 14 : 16)
@@ -748,8 +739,7 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
                                  : (isTabletW ?  8 : isNarrowW ? 10 : 12)
   const leftColW = maximized ? (isTabletW ? 168 : isNarrowW ? 196 : 220)
                              : (isTabletW ? 132 : isNarrowW ? 156 : 180)
-  const rightColW = maximized ? (isTabletW ? 132 : isNarrowW ? 156 : 180)
-                              : (isTabletW ? 108 : isNarrowW ? 128 : 150)
+  // 2026-09-08: rightColW retired with the RIGHT column.
   const rowGap = maximized ? (isTabletW ? 14 : isNarrowW ? 20 : 28)
                            : (isTabletW ?  8 : isNarrowW ? 12 : 16)
 
@@ -766,17 +756,7 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
     width: '100%',
     transition: 'all 100ms',
   })
-  const runBtnBase = (bg, color, disabled, weight = 700) => ({
-    width: '100%',
-    minWidth: actionMinW,
-    padding: maximized ? '16px' : '12px',
-    minHeight: actionMinH,
-    fontSize: actionFont, fontWeight: weight,
-    background: bg, color,
-    border: bg.startsWith('#f') ? '1px solid #d1d5db' : 'none',
-    borderRadius: 8, cursor: disabled ? 'not-allowed' : 'pointer',
-    opacity: disabled ? 0.45 : 1,
-  })
+  // 2026-09-08: runBtnBase retired with the RIGHT column.
   const padLabel = (text) => (
     <div style={{ fontSize: 12, fontWeight: 600, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>{text}</div>
   )
@@ -797,7 +777,6 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
       : (jogMode === 'cartesian' && !cartesianEnabled ? 'Cartesian jog pending validation' : undefined),
   })
 
-  const [confirmingRun, setConfirmingRun] = useState(false)
   // Power-transition confirmation. `kind` is 'enable' | 'disable' |
   // 'clear_alarm'; null = no dialog open. Nothing on this component
   // ever calls sendPowerCommand without going through this state.
@@ -826,19 +805,6 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
         body: 'Alarms will be dismissed on the controller. Enable is offered next if the alarm state clears.',
         cta: 'Clear', cta_bg: '#B91C1C', cta_color: '#fff' }
     : null
-  const stepCount = Array.isArray(program?.steps) ? program.steps.length : 0
-  const programLabel = program_name || 'program'
-
-  const handleRun = paused ? resumeProgram : runProgram
-  const runClick = () => {
-    if (runConfirm) setConfirmingRun(true)
-    else handleRun()
-  }
-  const confirmRun = () => {
-    setConfirmingRun(false)
-    handleRun()
-  }
-
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', position: 'relative' }}>
       {/* 2026-09-04: the full-width State banner is retired. The
@@ -1150,112 +1116,16 @@ export default function JogControls({ maximized = false, onTeach, runConfirm = f
         )}
       </div>
 
-      {/* RIGHT — Run/Pause/Stop/Home + Teach */}
-      <div style={{
-        display: 'flex', flexDirection: 'column', gap: actionGap,
-        width: rightColW, flexShrink: 0,
-        alignSelf: 'stretch', justifyContent: 'center',
-      }}>
-        <button onClick={runClick}
-          disabled={estop || (running && !paused)}
-          style={runBtnBase('#16A34A', '#fff', estop || (running && !paused))}>
-          {paused ? '▶ Resume' : (runConfirm ? '▶ Run…' : '▶ Run')}
-        </button>
-        <button onClick={pauseProgram}
-          disabled={!running || paused || estop}
-          style={runBtnBase('#fef3c7', '#92400e', !running || paused || estop, 600)}>
-          ⏸ Pause
-        </button>
-        <button onClick={cancelProgram}
-          disabled={!running && !paused}
-          style={runBtnBase('#DC2626', '#fff', !running && !paused)}>
-          STOP
-        </button>
-        <button onClick={homeRobot} disabled={estop}
-          style={runBtnBase('#f3f4f6', '#374151', estop, 600)}>
-          ⌂ Home
-        </button>
-
-        <div style={{ fontSize: 11, color: '#6b7280', textAlign: 'center', padding: '4px 0', borderTop: '1px solid #e5e7eb', borderBottom: '1px solid #e5e7eb' }}>
-          {state} · {program_step + 1}/{program_total}
-        </div>
-
-        <button onClick={triggerEstop}
-          title="Emergency stop"
-          style={{
-            width: '100%',
-            minWidth: actionMinW,
-            padding: maximized ? '14px' : '10px',
-            minHeight: actionMinH,
-            fontSize: actionFont, fontWeight: 700,
-            background: '#fff', color: '#DC2626',
-            border: '2px solid #DC2626', borderRadius: 8, cursor: 'pointer',
-          }}>
-          E-STOP
-        </button>
-        <button
-          onClick={onTeach}
-          disabled={!onTeach}
-          title={onTeach ? 'Save current pose as a teach point' : 'Teach not available in this view'}
-          style={{
-            width: '100%',
-            minWidth: actionMinW,
-            padding: maximized ? '16px' : '12px',
-            minHeight: actionMinH,
-            fontSize: actionFont, fontWeight: 700,
-            background: onTeach ? '#2563EB' : '#e5e7eb',
-            color: onTeach ? '#fff' : '#9ca3af',
-            border: 'none', borderRadius: 8,
-            cursor: onTeach ? 'pointer' : 'not-allowed',
-          }}>
-          Teach Position
-        </button>
-      </div>
+      {/* 2026-09-08 operator directive: RIGHT column retired.
+          Program execution controls (Run / Pause / STOP / Home /
+          IDLE·N/M readout) live on Monitor now. TopBar E-STOP is
+          always visible (grid area 'topbar' outside content),
+          reachable even in EXPANDED jog. Teach Position was dead
+          here — only mount site (View3DLayout) never passed
+          onTeach; teach flows use their own bespoke buttons
+          (PointsPanel.onTeach, ProgramEditor RecordPad). */}
     </div>
 
-    {/* Run confirm modal — only used when runConfirm=true (3D View
-        instance). Program tab bypasses this. */}
-    {confirmingRun && (
-      <div
-        onClick={() => setConfirmingRun(false)}
-        style={{
-          position: 'absolute', inset: 0, zIndex: 1000,
-          background: 'rgba(0,0,0,0.55)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}>
-        <div
-          onClick={(e) => e.stopPropagation()}
-          style={{
-            background: '#fff', border: '1px solid #e5e7eb',
-            borderRadius: 10, padding: 20, maxWidth: 420,
-            boxShadow: '0 10px 30px rgba(0,0,0,0.35)',
-          }}>
-          <div style={{ fontSize: 15, fontWeight: 700, color: '#111', marginBottom: 6 }}>
-            Start the program?
-          </div>
-          <div style={{ fontSize: 13, color: '#374151', marginBottom: 14 }}>
-            Run <b>“{programLabel}”</b> — {stepCount} step{stepCount === 1 ? '' : 's'}?
-            The arm will begin moving on your next click.
-          </div>
-          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-            <button
-              onClick={() => setConfirmingRun(false)}
-              style={{
-                padding: '8px 14px', fontSize: 13, fontWeight: 600,
-                background: '#f3f4f6', color: '#374151',
-                border: '1px solid #d1d5db', borderRadius: 6, cursor: 'pointer',
-              }}>Cancel</button>
-            <button
-              onClick={confirmRun}
-              style={{
-                padding: '8px 14px', fontSize: 13, fontWeight: 700,
-                background: '#16A34A', color: '#fff',
-                border: 'none', borderRadius: 6, cursor: 'pointer',
-              }}>Run program</button>
-          </div>
-        </div>
-      </div>
-    )}
     </div>
   )
 }
