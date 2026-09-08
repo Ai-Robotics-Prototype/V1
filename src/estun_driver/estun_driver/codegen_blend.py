@@ -233,7 +233,17 @@ def mov_options_suffix(*, v=None, a=None, b_mm=None,
     if b_mm is not None and b_mm > 0:
         parts.append(f'b={int(round(b_mm))}')
     if coor is not None: parts.append(f'coor={int(coor)}')
-    if tool is not None: parts.append(f'tool={int(tool)}')
+    if tool is not None:
+        # 2026-09-08: accept string (Lua variable name) OR integer
+        # (persisted controller toolCoord slot). Custom EOAT feature
+        # emits `local __tool = toolOffset(getTool(0), {...})` in the
+        # program header and passes tool='__tool' to every mov* so
+        # the same target coords route through the operator-defined
+        # TCP.
+        if isinstance(tool, str):
+            parts.append(f'tool={tool}')
+        else:
+            parts.append(f'tool={int(tool)}')
     if not parts:
         return ''
     return ', {' + ','.join(parts) + '}'

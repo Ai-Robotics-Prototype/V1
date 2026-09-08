@@ -75,6 +75,13 @@ except ImportError:
         _sys_for_mc.path.insert(0, _this_dir)
     import motioncam as _mc
 
+# Custom End-of-Arm Tool library (2026-09-08). Backs /api/tools/*
+# endpoints below. Dual-import shim matches motioncam pattern.
+try:
+    from . import tools_library as _tools_lib
+except ImportError:
+    import tools_library as _tools_lib  # type: ignore
+
 try:
     import rclpy
     from rclpy.node import Node
@@ -99,7 +106,7 @@ except ImportError:
     PIL_AVAILABLE = False
 
 try:
-    from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
@@ -9599,6 +9606,140 @@ if FASTAPI_AVAILABLE:
                                   "auto"   if _RUN_BACKEND_ENV == "legacy_lua"
                                   else "remote",
         }
+
+    # -------------------------------------------------------------
+    # /api/tools/* — Custom End-of-Arm Tool library (2026-09-08).
+    # STEP upload → cascadio conversion (async) → GLB served to the
+    # 3D viewer + wizard alignment editor. TCP + payload are motion-
+    # affecting; the retro-edit guard (/api/tools/{id}/programs)
+    # returns the referring programs so the frontend can name them
+    # in the confirm modal before writing.
+    #
+    # payload_kg is CONFIG-ONLY per operator directive 2026-09-08:
+    # luaenginelib.json has no setPayload verb, so payload flows via
+    # program.config into the collision monitor + motion_profile
+    # scaling — no motion-verb emission.
+    # -------------------------------------------------------------
+    from fastapi import Form  # local import — Form is only used here
+
+    def _tool_or_404(tool_id: str) -> dict:
+        try:
+            return _tools_lib.get_tool(tool_id)
+        except (FileNotFoundError, ValueError) as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.get("/api/tools")
+    async def api_tools_list():
+        return {'tools': _tools_lib.list_tools()}
+
+    @app.get("/api/tools/{tool_id}")
+    async def api_tools_get(tool_id: str):
+        return _tool_or_404(tool_id)
+
+    @app.get("/api/tools/{tool_id}/mesh")
+    async def api_tools_mesh(tool_id: str):
+        try:
+            path = _tools_lib.get_tool_mesh_path(tool_id)
+        except (FileNotFoundError, ValueError):
+            raise HTTPException(status_code=404, detail='mesh not ready')
+        return FileResponse(path, media_type='model/gltf-binary',
+                            filename=f'{tool_id}.glb')
+
+    @app.post("/api/tools/upload")
+    async def api_tools_upload(
+        name: str = Form(...),
+        step_file: UploadFile = File(...),
+    ):
+        try:
+            data = await step_file.read()
+            tool_id = _tools_lib.create_tool_from_step(
+                name=name,
+                step_bytes=data,
+                filename=step_file.filename or '',
+            )
+        except ValueError as e:
+            # Named refusal → 422 with detail = operator copy.
+            raise HTTPException(status_code=422, detail=str(e))
+        return _tools_lib.get_tool(tool_id)
+
+    @app.put("/api/tools/{tool_id}/mount_transform")
+    async def api_tools_put_mount(tool_id: str, request: Request):
+        _tool_or_404(tool_id)
+        body = await request.json()
+        try:
+            return _tools_lib.update_mount_transform(
+                tool_id, body.get('mount_transform') or body)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+    @app.get("/api/tools/{tool_id}/programs")
+    async def api_tools_programs_using(tool_id: str):
+        """Retro-edit guard input — the frontend calls this BEFORE
+        PUT /tcp so it can name the affected programs in the
+        confirm modal."""
+        _tool_or_404(tool_id)
+        return {
+            'tool_id': tool_id,
+            'programs': _tools_lib.programs_referencing_tool(tool_id),
+        }
+
+    @app.put("/api/tools/{tool_id}/tcp")
+    async def api_tools_put_tcp(tool_id: str, request: Request):
+        """Motion-affecting. Retro-edit confirmation is enforced at
+        the endpoint: the caller must POST {tcp_offset, confirmed:
+        true} once they've reviewed programs_referencing_tool.
+        Refuses with 409 if programs use this tool and confirmed
+        isn't set."""
+        _tool_or_404(tool_id)
+        body = await request.json()
+        confirmed = bool(body.get('confirmed'))
+        using = _tools_lib.programs_referencing_tool(tool_id)
+        if using and not confirmed:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    'kind': 'retro_edit_confirm_required',
+                    'programs': using,
+                    'message': (
+                        f'{len(using)} program{"s" if len(using) != 1 else ""} '
+                        f'use{"" if len(using) != 1 else "s"} this tool; '
+                        f'their motion targets will change.'),
+                })
+        tcp = body.get('tcp_offset') or body.get('tcp')
+        if tcp is None:
+            raise HTTPException(status_code=422,
+                                detail='tcp_offset required')
+        try:
+            return _tools_lib.update_tcp(tool_id, tcp)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+    @app.put("/api/tools/{tool_id}/payload")
+    async def api_tools_put_payload(tool_id: str, request: Request):
+        _tool_or_404(tool_id)
+        body = await request.json()
+        try:
+            return _tools_lib.update_payload(
+                tool_id, body.get('payload_kg'))
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+    @app.put("/api/tools/{tool_id}/confirm")
+    async def api_tools_confirm(tool_id: str):
+        _tool_or_404(tool_id)
+        try:
+            return _tools_lib.confirm_tool(tool_id)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+    @app.delete("/api/tools/{tool_id}")
+    async def api_tools_delete(tool_id: str):
+        try:
+            return _tools_lib.delete_tool(tool_id)
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
 
     @app.get("/api/programs")
     async def api_programs_list():

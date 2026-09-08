@@ -3585,6 +3585,73 @@ def codegen_lua_from_program(
     # at codegen time rather than being emitted as `-- skipped`.
     role_map = _build_role_map(steps)
     exec_lines: list[str] = []
+
+    # ── Custom EOAT tool-frame emission (2026-09-08) ─────────────
+    # When the program has `config.tool_id`, we emit a program-header
+    # line that binds a local Lua variable to a toolCoord derived from
+    # the tool's tcp_offset. Every mov* below routes through this
+    # variable via `tool=__tool` in mov_options_suffix.
+    #
+    # Wire-legal per luaenginelib.json:
+    #   toolOffset(${p1}, ${p2}) → returns a toolCoor
+    #   getTool(0) → the flange (identity) toolCoor
+    #   movJ / movL etc. accept optional `tool=<toolCoor>`
+    #
+    # NOTE: this is the "different TCP → different emitted target"
+    # pin surface for item 4 of the 2026-09-08 EOAT directive. Two
+    # programs with the same steps but different tool_id (with
+    # different tcp_offset) produce byte-different Lua sources:
+    # the toolOffset literal differs AND every mov call carries the
+    # tool=__tool suffix.
+    _emit_tool_var: str | None = None
+    _emit_tool_id  = str((program.get('config') or {}).get('tool_id') or '')
+    if _emit_tool_id:
+        _tcp = None
+        try:
+            # Local import — dashboard is the tools store owner;
+            # program_ops runs in the driver process, but this module
+            # is also imported by dashboard_server for pre-push codegen,
+            # so importing tools_library here works in both contexts
+            # when available. Silent fallback keeps driver-side codegen
+            # working even if the tools dir is empty.
+            try:
+                from cobot_dashboard import tools_library as _tl
+            except ImportError:
+                _tl = None  # driver-only environment
+            if _tl is not None:
+                _doc = _tl.get_tool(_emit_tool_id)
+                _tcp = _doc.get('tcp_offset') or None
+        except Exception:
+            _tcp = None
+        if _tcp is not None:
+            # Emit millimeters + degrees on the wire per pose-unit
+            # canon: internal meters/radians → mm/deg at the codegen
+            # boundary (memory [[cobot-pose-unit-canon]]). Round to 3
+            # decimals — the codegen boundary is the operator-render
+            # tier; deeper precision is meaningless at the controller.
+            import math as _m
+            def _mm(v):
+                try: return round(float(v) * 1000.0, 3)
+                except (TypeError, ValueError): return 0.0
+            def _deg(v):
+                try: return round(_m.degrees(float(v)), 3)
+                except (TypeError, ValueError): return 0.0
+            _tx = _mm(_tcp.get('x'));  _ty = _mm(_tcp.get('y'));  _tz = _mm(_tcp.get('z'))
+            _rx = _deg(_tcp.get('rx')); _ry = _deg(_tcp.get('ry')); _rz = _deg(_tcp.get('rz'))
+            _emit_tool_var = '__tool'
+            exec_lines.append(
+                f'-- tool: {_doc.get("name","")!r} (id={_emit_tool_id}) — '
+                f'tcp_offset mm/deg → toolOffset')
+            # luaenginelib.json toolOffset arity: `${var} = toolOffset(
+            # $1,$2,${basetypeTO})` — 3 positional args. basetypeTO=0
+            # means "offset expressed in the base tool frame" (the
+            # flange returned by getTool(0)); this is the standard
+            # idiom for a TCP defined relative to the flange.
+            exec_lines.append(
+                f'local {_emit_tool_var} = toolOffset(getTool(0), '
+                f'{{x={_tx},y={_ty},z={_tz},'
+                f'rx={_rx},ry={_ry},rz={_rz}}}, 0)')
+
     fallback_idx = 0
     di_read_idx  = 0   # counts wait_input steps → _di1, _di2, ... locals
     used_named: set[str] = set()   # named points that got REFERENCED
@@ -4513,7 +4580,7 @@ def codegen_lua_from_program(
                                         _last_motion_target_tcp_m, step)
                 _tag = '[FINE]' if _is_stop else f'[BLEND {_b}mm]'
                 exec_lines.append(
-                    f'movJ({ref}{mov_options_suffix(v=_v, b_mm=_b)})  '
+                    f'movJ({ref}{mov_options_suffix(v=_v, b_mm=_b, tool=_emit_tool_var)})  '
                     f'-- step {action}  '
                     f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
                     f'(FIX A: identity offset → reuse anchor jp; no IK)  '
@@ -4710,7 +4777,7 @@ def codegen_lua_from_program(
                         _tag = '[FINE]' if _is_stop else f'[BLEND {_b}mm]'
                         exec_lines.append(
                             f'{emit_verb_derived}({name}'
-                            f'{mov_options_suffix(v=_v, b_mm=_b)})  '
+                            f'{mov_options_suffix(v=_v, b_mm=_b, tool=_emit_tool_var)})  '
                             f'-- step {action}'
                             f'{divergence_note}  '
                             f'derived_from={role!r} offset_z_mm={ofs_mm:g}  '
@@ -4851,7 +4918,7 @@ def codegen_lua_from_program(
                                     _last_motion_target_tcp_m, step)
             _tag = '[FINE]' if _is_stop else f'[BLEND {_b}mm]'
             exec_lines.append(
-                f'{emit_verb}({pn}{mov_options_suffix(v=_v, b_mm=_b)})  '
+                f'{emit_verb}({pn}{mov_options_suffix(v=_v, b_mm=_b, tool=_emit_tool_var)})  '
                 f'-- step {action}{divergence_note}  '
                 f'point={pn}  {j5_note}  joints=[{joints_s}]{wrist_note}  {_tag}')
             if _this_tcp is not None:
@@ -5000,7 +5067,7 @@ def codegen_lua_from_program(
                     step_override_mm=_ov,
                 )
                 exec_lines.append(
-                    f'movL({inter_name}{mov_options_suffix(v=_v, b_mm=_b)})  '
+                    f'movL({inter_name}{mov_options_suffix(v=_v, b_mm=_b, tool=_emit_tool_var)})  '
                     f'-- step {action} (RULE 2c intermediate '
                     f'movL Δz={achieved:+.2f}mm above contact)  '
                     f'joints=[{inter_joints_s}]  [BLEND {_b}mm]')
@@ -5032,7 +5099,7 @@ def codegen_lua_from_program(
                                 _last_motion_target_tcp_m, step)
         _tag = '[FINE]' if _is_stop else f'[BLEND {_b}mm]'
         exec_lines.append(
-            f'{emit_verb}({name}{mov_options_suffix(v=_v, b_mm=_b)})  '
+            f'{emit_verb}({name}{mov_options_suffix(v=_v, b_mm=_b, tool=_emit_tool_var)})  '
             f'-- step {action}{inline_divergence_note}  '
             f'{j5_note}  joints=[{joints_s}]{wrist_note}  {_tag}')
         if _this_tcp is not None:
