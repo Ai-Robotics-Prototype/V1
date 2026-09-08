@@ -2071,19 +2071,35 @@ const PAGES = [
           mode="wizard"
           confirmed={answers.hookup_confirmed === true}
           noSensor={answers.hookup_no_sensor || {}}
+          optionalAnswers={{
+            // Seed the guide with the answers already in state for
+            // optional toggles (blow_off_enabled etc.) so navigating
+            // back preserves the operator's choice.
+            blow_off_enabled: answers.blow_off_enabled,
+          }}
           onSkip={() => {
             setAnswer('hookup_skipped',   true)
             setAnswer('hookup_confirmed', false)
             goNext({ hookup_skipped: true, hookup_confirmed: false })
           }}
-          onConfirm={(_allChecked, noSensorMap) => {
+          onConfirm={(_allChecked, noSensorMap, optionalMap) => {
             setAnswer('hookup_skipped',    false)
             setAnswer('hookup_confirmed',  true)
             setAnswer('hookup_no_sensor',  noSensorMap || {})
+            // 2026-09-08 blow-off audit: spread the optional-toggle
+            // map onto answers as top-level keys (e.g.
+            // answers.blow_off_enabled). buildSteps' _vocabOpts
+            // reads answers.blow_off_enabled and passes it as
+            // withBlowOff into effectorDisengage.
+            const opt = optionalMap || {}
+            for (const k of Object.keys(opt)) {
+              setAnswer(k, opt[k])
+            }
             goNext({
               hookup_skipped:   false,
               hookup_confirmed: true,
               hookup_no_sensor: noSensorMap || {},
+              ...opt,
             })
           }}
         />
@@ -3102,7 +3118,16 @@ function buildPalletizeSteps(answers) {
   // they used the CALLER's label verbatim (e.g. 'Grip part') even
   // when the effector was vacuum. See lib/effectorVocab for the
   // single source of truth (2026-07-30 audit instance #4).
-  const _vocabOpts = { spd, gripW, gripF, customActivate, customConfirm }
+  //
+  // 2026-09-08 blow-off audit: withBlowOff surfaces to the vocab
+  // as the operator's explicit choice on the hookup page (default
+  // true — preserves prior behavior). Off = effectorDisengage's
+  // vacuum branch skips the blow-off triplet AND the hookup
+  // guide filters out the vacuum-blow-off instruction card.
+  const _vocabOpts = {
+    spd, gripW, gripF, customActivate, customConfirm,
+    withBlowOff: answers.blow_off_enabled !== false,
+  }
   const engageSteps = (labelOverride) =>
     effectorEngage({ effector: gripType }, { ..._vocabOpts, labelOverride })
   const disengageSteps = (labelOverride) =>
@@ -3253,7 +3278,14 @@ function buildSteps(answers, portmap = null) {
   // through lib/effectorVocab. Same source the PBD composer uses on
   // the backend and the Add Step palette uses in the editor — one
   // vocabulary, all authoring surfaces (audit instance #4).
-  const _vocabOpts = { spd, gripW, gripF, customActivate, customConfirm }
+  //
+  // 2026-09-08 blow-off audit: withBlowOff = operator's explicit
+  // choice on the hookup page (default true). See _vocabOpts in
+  // buildPalletizeSteps above for the same wiring.
+  const _vocabOpts = {
+    spd, gripW, gripF, customActivate, customConfirm,
+    withBlowOff: answers.blow_off_enabled !== false,
+  }
   const cfgEffector = { effector: answers.gripper_type }
 
   steps.push(...effectorReady(cfgEffector, _vocabOpts))

@@ -220,8 +220,9 @@ def test_no_sensor_toggle_hides_sensor_card_and_persists():
     the map lands in `answers.hookup_no_sensor` (persisted on
     program.config via handleSave's spread)."""
     src = _read(GUIDE)
-    # Filter drops hidden cards.
-    assert 'const hookups = rawHookups.filter((h) => !noSensor[h.id])' in src
+    # Filter drops hidden cards (multi-branch filter now — handles
+    # noSensor + optional toggles).
+    assert 'if (noSensor[h.id]) return false' in src
     # Summary rendered for hidden entries.
     assert 'data-testid="hookup-no-sensor-note"' in src
     assert 'Re-add sensor' in src

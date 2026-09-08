@@ -12,14 +12,25 @@ import isoPanelUrl   from '../assets/hookup/hookup_panel_iso.svg'
 // panel) so remapping to real panel PNGs requires no code change
 // — just drop the .png and update the JSON asset field.
 //
+// 2026-09-08 blow-off audit: hookup entries with `optional: true`
+// + `toggle_answer_key` render a positive-framing prompt card
+// ("Use blow-off on release? Recommended…"). Selected answer
+// (default = `toggle_default`) flows through onConfirm's
+// optionalToggles map to answers.<toggle_answer_key>, which the
+// buildSteps flow reads to gate codegen emission (e.g.
+// answers.blow_off_enabled → _vocabOpts.withBlowOff →
+// effectorDisengage vacuum-blow-off triplet).
+//
 // Data source: GET /api/hookup_map → /opt/cobot/hookup/hookup_map.json.
 //
 // Props:
-//   gripperType    : 'finger' | 'vacuum' | 'custom'
-//   mode           : 'wizard' | 'editor'
-//   confirmed      : bool                        (checked state per card)
-//   noSensor       : { [connectionId]: true }    (per-connection sensor toggles)
-//   onConfirm(all_checked, noSensorMap)          (wizard confirm)
+//   gripperType       : 'finger' | 'vacuum' | 'custom'
+//   mode              : 'wizard' | 'editor'
+//   confirmed         : bool                            (checked state per card)
+//   noSensor          : { [connectionId]: true }        (per-connection sensor toggles)
+//   optionalAnswers   : { [answer_key]: boolean }       (initial values for optional
+//                                                        connection toggles)
+//   onConfirm(all_checked, noSensorMap, optionalAnswers) (wizard confirm)
 //   onSkip()
 //   onClose()
 
@@ -43,12 +54,17 @@ function usePrefersReducedMotion() {
 export default function HookupGuide({
   gripperType, mode = 'wizard', confirmed = false,
   noSensor: initialNoSensor = null,
+  optionalAnswers: initialOptional = null,
   onConfirm, onSkip, onClose,
 }) {
   const [map, setMap]     = useState(null)
   const [err, setErr]     = useState(null)
   const [checked, setChecked]     = useState({})
   const [noSensor, setNoSensor]   = useState(() => ({ ...(initialNoSensor || {}) }))
+  // Optional-connection toggles (e.g. blow-off). Keyed by
+  // hookup.toggle_answer_key. Seeded from the hookup entries'
+  // toggle_default when the map loads (see the effect below).
+  const [optional, setOptional]   = useState(() => ({ ...(initialOptional || {}) }))
   const reducedMotion = usePrefersReducedMotion()
 
   useEffect(() => {
@@ -67,11 +83,48 @@ export default function HookupGuide({
   }, [])
 
   const rawHookups = (map && map.gripper_hookups && map.gripper_hookups[gripperType]) || []
+
+  // Seed optional-toggle defaults from the map when it first
+  // lands (only for keys the caller didn't pre-set). e.g. the
+  // vacuum blow-off entry ships toggle_default:true so the
+  // toggle mirrors today's silent-default behaviour until the
+  // operator makes a fresh choice.
+  useEffect(() => {
+    if (!map) return
+    setOptional((prev) => {
+      let next = prev
+      for (const h of rawHookups) {
+        if (h.optional && h.toggle_answer_key
+            && !(h.toggle_answer_key in next)) {
+          if (next === prev) next = { ...prev }
+          next[h.toggle_answer_key] = h.toggle_default === true
+        }
+      }
+      return next
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map])
+
   // Filter out sensors the operator marked "no sensor" — the card
   // is hidden AND, downstream, program.config.hookup_no_sensor
   // gates codegen paths that would otherwise wait on a
   // never-connected input.
-  const hookups = rawHookups.filter((h) => !noSensor[h.id])
+  //
+  // Also filter out optional cards the operator has toggled OFF
+  // (e.g. blow-off). Their toggle prompt stays visible above the
+  // filtered card list so the choice is discoverable.
+  const hookups = rawHookups.filter((h) => {
+    if (noSensor[h.id]) return false
+    if (h.optional && h.toggle_answer_key) {
+      return optional[h.toggle_answer_key] === true
+    }
+    return true
+  })
+  // Optional prompts render regardless of current answer so the
+  // operator can flip the toggle back on. Sorted stable — the
+  // JSON order defines display order.
+  const optionalPrompts = rawHookups.filter(
+    (h) => h.optional && h.toggle_answer_key)
   const allChecked = hookups.length > 0 && hookups.every((h) => checked[h.id])
   const readOnly = mode === 'editor'
 
@@ -135,6 +188,62 @@ export default function HookupGuide({
           this page and set up ports on the I/O tab.
         </div>
       )}
+
+      {/* Optional-connection prompt cards (e.g. blow-off).
+          Positive framing per operator directive; toggle drives
+          both card visibility AND codegen emission via the
+          `toggle_answer_key` → answers.<key> spread on confirm. */}
+      {!err && map && optionalPrompts.map((h) => {
+        const on = optional[h.toggle_answer_key] === true
+        return (
+          <div key={`optional-${h.id}`}
+               data-testid="hookup-optional-prompt"
+               data-answer-key={h.toggle_answer_key}
+               data-on={on ? 'true' : 'false'}
+               style={{
+                 padding: 12, borderRadius: 8,
+                 background: on ? '#EEF2FF' : '#F9FAFB',
+                 border: `1px solid ${on ? '#C7D2FE' : '#E5E7EB'}`,
+                 display: 'flex', gap: 10,
+                 alignItems: 'center', justifyContent: 'space-between',
+               }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: '#111' }}>
+                {h.toggle_prompt || h.purpose_text}
+              </div>
+              {!on && (
+                <div style={{ fontSize: 11, color: '#6B7280', marginTop: 4 }}>
+                  Off — no instruction card, no code step.
+                </div>
+              )}
+            </div>
+            {!readOnly && (
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button
+                  data-testid="hookup-optional-btn-on"
+                  data-answer-key={h.toggle_answer_key}
+                  onClick={() => setOptional(
+                    (prev) => ({ ...prev, [h.toggle_answer_key]: true }))}
+                  style={optBtn(on ? '#4F46E5' : '#fff',
+                                on ? '#fff' : '#374151',
+                                on ? '#4338CA' : '#D1D5DB')}>
+                  On
+                </button>
+                <button
+                  data-testid="hookup-optional-btn-off"
+                  data-answer-key={h.toggle_answer_key}
+                  onClick={() => setOptional(
+                    (prev) => ({ ...prev, [h.toggle_answer_key]: false }))}
+                  style={optBtn(!on ? '#6B7280' : '#fff',
+                                !on ? '#fff' : '#374151',
+                                !on ? '#4B5563' : '#D1D5DB')}>
+                  Off
+                </button>
+              </div>
+            )}
+          </div>
+        )
+      })}
 
       {/* Hidden-cards summary — when the operator picks "No sensor"
           for one or more inputs, show a small acknowledgement line
@@ -203,7 +312,7 @@ export default function HookupGuide({
             </button>
             <button
               data-testid="hookup-guide-confirm"
-              onClick={() => onConfirm?.(allChecked, noSensor)}
+              onClick={() => onConfirm?.(allChecked, noSensor, optional)}
               disabled={hookups.length > 0 && !allChecked}
               style={{
                 ...btn('#16A34A', '#fff', '#15803d'),
@@ -227,6 +336,15 @@ function btn(bg, color, border) {
     padding: '10px 16px', fontSize: 14, fontWeight: 600,
     background: bg, color, border: `1px solid ${border || bg}`,
     borderRadius: 8, cursor: 'pointer',
+  }
+}
+
+function optBtn(bg, color, border) {
+  return {
+    minWidth: 52, padding: '6px 12px',
+    fontSize: 12, fontWeight: 700,
+    background: bg, color, border: `1px solid ${border || bg}`,
+    borderRadius: 6, cursor: 'pointer',
   }
 }
 
