@@ -424,6 +424,12 @@ const storeDefinition = (set, get) => ({
   pendingTeachNew: false,
   // 2026-09-04: `mode` slot (operator/engineer) retired along with
   // the Configure toggle — no live consumer.
+  // 2026-09-08: reach-extents dome toggle (3D View overlay). Default
+  // ON; persists per device via zustand persist partialize so the
+  // operator's preference survives page reloads. Same class as
+  // activeTab and jogSpeedPct.
+  reachDomeShown: true,
+  setReachDomeShown(v) { set({ reachDomeShown: !!v }) },
   jogEnabled: false,
   jogJoint: 0,
   _jogTimer: null,
@@ -2601,6 +2607,8 @@ export const useStore = create(
       // Persist the jog speed % so the operator's chosen speed survives
       // page reloads.
       jogSpeedPct:    state.jogSpeedPct,
+      // 2026-09-08 reach dome toggle — per-device preference.
+      reachDomeShown: state.reachDomeShown,
     }),
   })
 )

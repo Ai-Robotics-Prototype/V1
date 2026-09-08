@@ -1,7 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
-import * as THREE from 'three'
-import QuickOrientButtons from './QuickOrientButtons'
-import JogSpeedSlider from './JogSpeedSlider'
+import { useEffect, useState } from 'react'
+// 2026-09-08 operator directive: Reset all / Home / QuickOrient
+// row / TCP (twin frame) box / JogSpeedSlider all retired from
+// this panel. QuickOrientButtons + JogSpeedSlider are no longer
+// imported here; the jog surface (Expand Jog Buttons) hosts the
+// jog-speed control as the ONE authority. `three` is no longer
+// used either — the TCP FK matrix computation went with the box.
 
 // JointJogPanel — right-docked FK verification pane for the S10-140
 // verified twin. Wired to ArmViewer3D via a jogApi handle exposed from
@@ -41,23 +44,17 @@ export default function JointJogPanel({
   onCartesianModeChange,
   gizmoMode = 'translate',
   onGizmoModeChange,
-  onHome,
-  onAtLimit,   // (bool) called by QuickOrientButtons after its solve
+  // eslint-disable-next-line no-unused-vars
+  onHome,        // 2026-09-08: Home button retired; prop kept so
+                 // callers don't break their prop wiring.
+  // eslint-disable-next-line no-unused-vars
+  // eslint-disable-next-line no-unused-vars
+  onAtLimit,     // was a callback from the retired orient row.
 }) {
   const [values, setValues] = useState([0, 0, 0, 0, 0, 0])
-  const [tcp, setTcp] = useState(null)
-  const linkRef = useRef(null)
 
   useEffect(() => {
-    if (!jogApi?.robot?.joints) {
-      linkRef.current = null
-      return
-    }
-    // Prefer tool0 (injected on URDF load); fall back to link6 for
-    // early-mount ordering where the injection hasn't run yet.
-    linkRef.current = jogApi.robot.links?.tool0
-                   || jogApi.robot.links?.link6
-                   || null
+    if (!jogApi?.robot?.joints) return
     const j = jogApi.robot.joints
     const initial = JOINT_META.map((meta) => {
       const v = j[meta.name]?.jointValue
@@ -69,46 +66,26 @@ export default function JointJogPanel({
   }, [jogApi])
 
   useEffect(() => {
+    // Mirror robot joint values into the sliders so IK-driven or
+    // remote-driven motion shows on the fine-tune controls. Skips
+    // sliders under active operator drag by checking magnitude
+    // delta only (no focus tracking needed for this cadence).
     if (!jogApi) return undefined
-    const mat  = new THREE.Matrix4()
-    const pos  = new THREE.Vector3()
-    const quat = new THREE.Quaternion()
-    const scl  = new THREE.Vector3()
-    const eul  = new THREE.Euler()
     const id = setInterval(() => {
-      const link = linkRef.current
-      if (!link) return
-      link.updateWorldMatrix(true, false)
-      mat.copy(link.matrixWorld)
-      mat.decompose(pos, quat, scl)
-      eul.setFromQuaternion(quat, 'ZYX')
-      // Also mirror the robot's current joint values into the sliders
-      // so IK-driven motion shows up on the fine-tune controls without
-      // remounting the panel. Only touches un-focused sliders (avoid
-      // fighting the operator's drag).
       const j = jogApi.robot?.joints
-      if (j) {
-        setValues((prev) => {
-          const next = prev.slice()
-          let changed = false
-          for (let i = 0; i < 6; i++) {
-            const raw = j[JOINT_META[i].name]?.jointValue
-            const n = Number(Array.isArray(raw) ? raw[0] : raw)
-            if (Number.isFinite(n) && Math.abs(n - next[i]) > 1e-5) {
-              next[i] = n
-              changed = true
-            }
+      if (!j) return
+      setValues((prev) => {
+        const next = prev.slice()
+        let changed = false
+        for (let i = 0; i < 6; i++) {
+          const raw = j[JOINT_META[i].name]?.jointValue
+          const n = Number(Array.isArray(raw) ? raw[0] : raw)
+          if (Number.isFinite(n) && Math.abs(n - next[i]) > 1e-5) {
+            next[i] = n
+            changed = true
           }
-          return changed ? next : prev
-        })
-      }
-      setTcp({
-        x_mm: pos.x * 1000,
-        y_mm: pos.y * 1000,
-        z_mm: pos.z * 1000,
-        rz_deg: rad2deg(eul.z),
-        ry_deg: rad2deg(eul.y),
-        rx_deg: rad2deg(eul.x),
+        }
+        return changed ? next : prev
       })
     }, 66)
     return () => clearInterval(id)
@@ -123,11 +100,6 @@ export default function JointJogPanel({
       return next
     })
     jogApi?.setJointRad?.(idx, rad)
-  }
-
-  const onReset = () => {
-    setValues([0, 0, 0, 0, 0, 0])
-    jogApi?.resetAll?.()
   }
 
   const ready = !!jogApi?.robot?.joints
@@ -175,17 +147,16 @@ export default function JointJogPanel({
             )}
           </div>
 
-          <div style={styles.btnRow}>
-            <button style={styles.resetBtn} onClick={onReset}>
-              Reset all → 0°
-            </button>
-            <button style={styles.homeBtn} onClick={() => onHome?.()}>
-              Home
-            </button>
-          </div>
-
-          <QuickOrientButtons jogApi={jogApi} onAtLimit={onAtLimit} />
-
+          {/* 2026-09-08 operator directive: Reset all / Home /
+              QuickOrient row RETIRED. The panel now hosts ONLY the
+              Cartesian mode toggle above + the six joint sliders
+              below. Reasoning:
+                * Reset (twin-only) had no wire consumer; operators
+                  moved joints with the sliders or the jog surface.
+                * Home button drove `jogApi.home()` on the twin only;
+                  the arm's true home lives on the Monitor page.
+                * Quick Orient was a novelty IK preset row with no
+                  downstream consumer. */}
           {JOINT_META.map((jm, i) => {
             const joint = jogApi.robot.joints[jm.name]
             const lim = joint?.limit || {}
@@ -218,30 +189,18 @@ export default function JointJogPanel({
             )
           })}
 
-          <div style={styles.tcpBox}>
-            <div style={styles.tcpTitle}>TCP (TWIN FRAME) · tool0</div>
-            <div style={styles.tcpRow}>
-              <TcpCell k="X"  v={tcp ? `${tcp.x_mm.toFixed(1)} mm` : '—'} />
-              <TcpCell k="Y"  v={tcp ? `${tcp.y_mm.toFixed(1)} mm` : '—'} />
-              <TcpCell k="Z"  v={tcp ? `${tcp.z_mm.toFixed(1)} mm` : '—'} />
-              <TcpCell k="Rz" v={tcp ? `${tcp.rz_deg.toFixed(1)}°` : '—'} />
-              <TcpCell k="Ry" v={tcp ? `${tcp.ry_deg.toFixed(1)}°` : '—'} />
-              <TcpCell k="Rx" v={tcp ? `${tcp.rx_deg.toFixed(1)}°` : '—'} />
-            </div>
-          </div>
-
-          <JogSpeedSlider />
+          {/* 2026-09-08 operator directive: TCP (TWIN FRAME) readout
+              box + JogSpeedSlider RETIRED from this panel.
+                * TCP box was display-only; no consumer.
+                * JogSpeedSlider wrote to the shared store slot
+                  `jogSpeedPct` — the SAME slot the jog surface
+                  (Expand Jog Buttons → JogControls) writes.
+                  Audited pre-removal: both readers/writers unify
+                  to the store field, no hidden speed state
+                  remains. The jog surface is now the ONE
+                  authority. */}
         </>
       )}
-    </div>
-  )
-}
-
-function TcpCell({ k, v }) {
-  return (
-    <div style={styles.tcpCell}>
-      <span style={styles.tcpKey}>{k}</span>
-      <span style={styles.tcpVal}>{v}</span>
     </div>
   )
 }
@@ -309,38 +268,9 @@ const styles = {
   modeBtnActive: {
     background: NAVY, color: '#fff', borderColor: NAVY,
   },
-  btnRow: {
-    display: 'flex', gap: 6, marginBottom: 10,
-  },
-  resetBtn: {
-    flex: 1, padding: '6px 10px',
-    background: '#fff', color: NAVY, border: `1px solid ${NAVY}`,
-    borderRadius: 4, fontSize: 12, fontWeight: 600, cursor: 'pointer',
-  },
-  homeBtn: {
-    flex: 1, padding: '6px 10px',
-    background: AMBER, color: '#fff', border: `1px solid ${AMBER}`,
-    borderRadius: 4, fontSize: 12, fontWeight: 600, cursor: 'pointer',
-  },
-  tcpBox: {
-    marginTop: 8, padding: 8,
-    background: 'var(--bg-surface, #F7F8FA)',
-    border: '1px solid var(--border, rgba(0,0,0,0.09))',
-    borderRadius: 4,
-  },
-  tcpTitle: {
-    fontSize: 10, fontWeight: 700, color: NAVY,
-    letterSpacing: 0.6, marginBottom: 6,
-  },
-  tcpRow: {
-    display: 'grid', gridTemplateColumns: '1fr 1fr 1fr',
-    gap: 6, fontSize: 11,
-    fontFamily: 'var(--font-mono, monospace)',
-    fontVariantNumeric: 'tabular-nums',
-  },
-  tcpCell: { display: 'flex', flexDirection: 'column', gap: 1 },
-  tcpKey:  { fontSize: 9, color: 'var(--text-muted, #8A8F9E)', letterSpacing: 0.4 },
-  tcpVal:  { color: 'var(--text-primary, #111)' },
+  // btnRow / resetBtn / homeBtn / tcpBox / tcpTitle / tcpRow /
+  // tcpCell / tcpKey / tcpVal styles retired 2026-09-08 along with
+  // the Reset / Home / TCP-box render blocks.
   empty: {
     fontSize: 11, color: 'var(--text-muted, #8A8F9E)',
     textAlign: 'center', padding: '18px 0',

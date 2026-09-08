@@ -1366,6 +1366,9 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
   // Show baseline-built static keep-out zones by default; the
   // operator can hide them via the StaticZonesToggle.
   const [showStaticZones, setShowStaticZones] = useState(true)
+  // 2026-09-08 reach dome. Store-persisted (per device); default ON.
+  const reachDomeShown    = useStore((s) => s.reachDomeShown)
+  const setReachDomeShown = useStore((s) => s.setReachDomeShown)
   const autoFittedRef = useRef(false)
 
   // Active click-drag joint (null when not dragging). Populated by
@@ -1493,7 +1496,7 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
           />
         )}
         <CustomGripperModel url={gripperGlbUrl} flange={flange} />
-        <CollisionScene3D showStatic={showStaticZones} />
+        <CollisionScene3D showStatic={showStaticZones} showReachDome={reachDomeShown} />
         <TrajectoryPolylineOverlay />
         {/* IK gizmo for the URDFArm path (Program tab). Only mounts
             while Cartesian mode is on; unmount disposes the
@@ -1608,28 +1611,54 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
         />
       )}
 
-      {/* Camera presets, top-left */}
+      {/* Camera presets + reach-dome toggle, top-left */}
       <div style={{
-        position: 'absolute', top: 8, left: 8, display: 'flex', gap: 4, zIndex: 10,
+        position: 'absolute', top: 8, left: 8, display: 'flex',
+        gap: 8, alignItems: 'center', zIndex: 10,
       }}>
-        {[
-          { label: 'Front', key: 'front' },
-          { label: 'Side',  key: 'side'  },
-          { label: 'Top',   key: 'top'   },
-          { label: 'Iso',   key: 'iso'   },
-        ].map((p) => (
-          <button
-            key={p.key}
-            onClick={() => applyPreset(p.key)}
-            style={{
-              padding: '4px 10px', fontSize: 10, fontWeight: 600,
-              background: 'rgba(255,255,255,0.92)', color: '#374151',
-              border: '1px solid #d1d5db', borderRadius: 4, cursor: 'pointer',
-            }}
-          >
-            {p.label}
-          </button>
-        ))}
+        <div style={{ display: 'flex', gap: 4 }}>
+          {[
+            { label: 'Front', key: 'front' },
+            { label: 'Side',  key: 'side'  },
+            { label: 'Top',   key: 'top'   },
+            { label: 'Iso',   key: 'iso'   },
+          ].map((p) => (
+            <button
+              key={p.key}
+              onClick={() => applyPreset(p.key)}
+              style={{
+                padding: '4px 10px', fontSize: 10, fontWeight: 600,
+                background: 'rgba(255,255,255,0.92)', color: '#374151',
+                border: '1px solid #d1d5db', borderRadius: 4, cursor: 'pointer',
+              }}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+        {/* 2026-09-08 reach-extents toggle. Default ON; persists per
+            device via useStore.reachDomeShown. Small checkbox next
+            to the corner view-switcher so operators can see how
+            much of the workcell the arm can reach at a glance,
+            without the dome cluttering the view when they don't
+            want it. */}
+        <label
+          data-testid="reach-dome-toggle"
+          style={{
+            display: 'inline-flex', alignItems: 'center', gap: 6,
+            padding: '4px 10px', fontSize: 10, fontWeight: 600,
+            background: 'rgba(255,255,255,0.92)', color: '#374151',
+            border: '1px solid #d1d5db', borderRadius: 4,
+            cursor: 'pointer', userSelect: 'none',
+          }}>
+          <input
+            type="checkbox"
+            checked={!!reachDomeShown}
+            onChange={(e) => setReachDomeShown(e.target.checked)}
+            style={{ margin: 0, cursor: 'pointer' }}
+          />
+          Show reach extents
+        </label>
       </div>
     </div>
   )
