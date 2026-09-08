@@ -1921,9 +1921,20 @@ const storeDefinition = (set, get) => ({
         } catch (_) { /* nop */ }
       }
     } catch (_) { /* nop — fall through to blank UI */ }
-    if (activeTab) {
-      try { get().setActiveTab(activeTab) } catch (_) { /* nop */ }
-    }
+    // 2026-09-08 tab-persistence bug fix:
+    //
+    // Do NOT restore active_tab from the server-side ui_context. It
+    // is only written on rememberOpenProgram (program-open events) so
+    // switching to Monitor / I/O / any non-program tab and then
+    // refreshing would land back on Program because the stale
+    // server value overrides the freshly-rehydrated zustand persist
+    // slot. Zustand persist (localStorage `roboai-ui`) owns activeTab
+    // across refreshes — it rehydrates synchronously before React
+    // mounts, so the tab the operator saw before refresh is the tab
+    // that renders first. The edition-guard `useEffect` in App.jsx
+    // still snaps a hidden-on-this-edition persisted tab to Monitor.
+    // eslint-disable-next-line no-unused-vars
+    const _server_active_tab_unused = activeTab
     if (!openProgId) return
     // Prefer draft.staged_program (unsaved edits) over the disk
     // program. Falls back to the saved copy if no staged_program.

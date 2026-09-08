@@ -175,25 +175,41 @@ export default function App() {
     event_log:        <EventLog />,
   }
 
-  // Edition gate for the layout switch (2026-09-04). If activeTab
-  // resolves to a Full-only page but this device is on basic, fall
-  // back to Monitor so a stale persisted tab id (from a session
-  // where the device was Full and got re-locked) doesn't render a
-  // dead surface. TopBar already hides the tab; this is defence-in-
-  // depth for the persisted-activeTab class.
+  // Edition gate for the layout switch (2026-09-04, extended
+  // 2026-09-08). If activeTab resolves to a Full-only page but this
+  // device is on basic, fall back to Monitor so a stale persisted
+  // tab id (from a session where the device was Full and got
+  // re-locked) doesn't render a dead surface. TopBar already
+  // hides the tab; this is defence-in-depth for the persisted-
+  // activeTab class.
+  //
+  // 2026-09-08 tab-persistence race: `edition` starts at its
+  // initial default ('basic') and hydrates async via /api/edition.
+  // If we snap to Monitor on first render (before hydration
+  // completes), a Full device with a persisted full-only tab
+  // would get bounced to Monitor for one tick. Gate the snap on
+  // `editionHydrated` so the guard only fires after the server
+  // has answered.
+  const editionHydrated = useStore((s) => s.editionHydrated)
   const _tabFeature = TAB_TO_FEATURE[activeTab] || activeTab
   const _tabAllowed = isFeatureEnabled(_tabFeature, edition)
   useEffect(() => {
+    if (!editionHydrated) return
     if (!_tabAllowed && activeTab !== 'monitor') setTab('monitor')
-  }, [_tabAllowed, activeTab, setTab])
+  }, [editionHydrated, _tabAllowed, activeTab, setTab])
 
   // Keep the two 3D-heavy tabs persistently mounted, toggled by CSS
   // display, so switching between them doesn't tear down the Canvas +
   // URDFLoader and re-parse all 7 GLBs. Other tabs unmount as before.
   const kept3D  = ['program', '3dview']
   const isKept  = kept3D.includes(activeTab)
+  // Only apply the "not-allowed → Monitor" fallback AFTER edition
+  // hydrates. Before that, the initial default 'basic' would make a
+  // real Full device flash Monitor for one paint before hydrateEdition
+  // corrects the edition and re-renders the intended tab.
+  const _tabPassesGate = _tabAllowed || !editionHydrated
   const other   = !isKept
-    ? (_tabAllowed ? (layoutMap[activeTab] ?? <MonitorDashboard />) : <MonitorDashboard />)
+    ? (_tabPassesGate ? (layoutMap[activeTab] ?? <MonitorDashboard />) : <MonitorDashboard />)
     : null
   const keptStyle = (tab) => ({
     display: activeTab === tab ? 'flex' : 'none',

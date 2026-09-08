@@ -284,6 +284,32 @@ def test_server_ships_edition_endpoints():
 
 # ── Load-to-Monitor button ships in both editions ──────────────
 
+def test_stale_hidden_tab_snaps_to_monitor_on_hydrate():
+    """2026-09-08 tab-persistence bug fix: if the zustand-persisted
+    activeTab is a full-only tab and this device resolves to basic,
+    the App.jsx edition-guard useEffect snaps to Monitor. The
+    snap is gated on `editionHydrated` so it only fires AFTER
+    /api/edition has answered — otherwise a Full device with a
+    persisted full-only tab would flash Monitor for one paint
+    while hydration is in flight."""
+    app_src = _read(os.path.abspath(os.path.join(
+        HERE, '..', 'frontend', 'src', 'App.jsx')))
+    # Guard reads editionHydrated + early-returns before touching
+    # _tabAllowed.
+    assert 'editionHydrated' in app_src
+    m = re.search(
+        r'useEffect\(\s*\(\)\s*=>\s*\{\s*'
+        r'if\s*\(!editionHydrated\)\s*return',
+        app_src)
+    assert m, ('edition-guard useEffect must early-return on '
+               '!editionHydrated')
+    # After hydration, activeTab==configure on basic → snap to
+    # monitor (test the underlying is_feature_enabled).
+    assert not edition_mod.is_feature_enabled('configure', 'basic')
+    # And the guard clause snap-target is 'monitor'.
+    assert "setTab('monitor')" in app_src
+
+
 def test_load_to_monitor_button_ships_in_both_editions():
     """2026-09-04 feature: the "Load to Monitor →" button in the
     Program Library's detail modal ships in BOTH editions by
