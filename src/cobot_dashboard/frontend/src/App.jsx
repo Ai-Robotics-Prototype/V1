@@ -6,6 +6,7 @@ import StatusBar from './components/StatusBar'
 import StaleCodegenBanner from './components/StaleCodegenBanner'
 import ToastContainer from './components/ToastContainer'
 import EStopOverlay from './components/EStopOverlay'
+import SystemBanners from './components/SystemBanners'
 import AlarmRecoveryModal from './components/AlarmRecoveryModal'
 import JointRecoveryModal from './components/JointRecoveryModal'
 import ObstacleEscapeModal from './components/ObstacleEscapeModal'
@@ -234,6 +235,11 @@ export default function App() {
         </div>
 
         <StaleCodegenBanner />
+        {/* 2026-09-08 footer removal: WS-disconnected + guard-off
+            banners only render when the underlying state is bad.
+            Mounted at App level so they surface on every screen —
+            including tabs that don't host the guard row itself. */}
+        <SystemBanners />
         <ToastContainer />
         <EStopOverlay />
         <AlarmRecoveryModal />
