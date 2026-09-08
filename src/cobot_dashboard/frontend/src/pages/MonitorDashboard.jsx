@@ -1330,39 +1330,16 @@ export default function MonitorDashboard() {
         </div>
       )}
 
-      {/* No-program placeholder. The previous "Program Steps" panel
-          (progress bar + numbered step grid) was removed; only the
-          empty-state hint remains so a fresh operator knows where to
-          load a program from. */}
-      {steps.length === 0 && (
-        <div style={{
-          background: '#fff', borderRadius: 12, border: '2px dashed #d1d5db',
-          padding: 40, textAlign: 'center',
-        }}>
-          <div style={{ fontSize: 16, fontWeight: 600, color: '#374151', marginBottom: 8 }}>
-            No program loaded
-          </div>
-          <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 20 }}>
-            Load a program from the library or create a new one with the wizard
-          </div>
-          <div style={{ display: 'flex', gap: 10, justifyContent: 'center' }}>
-            <button onClick={() => setTab('programs')} style={{
-              padding: '12px 24px', fontSize: 14, fontWeight: 600,
-              background: '#2563EB', color: '#fff', border: 'none',
-              borderRadius: 8, cursor: 'pointer',
-            }}>
-              Open Program Library
-            </button>
-            <button onClick={() => setTab('program')} style={{
-              padding: '12px 24px', fontSize: 14, fontWeight: 600,
-              background: '#fff', color: '#374151',
-              border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
-            }}>
-              Create New Program
-            </button>
-          </div>
-        </div>
-      )}
+      {/* 2026-09-08 operator directive: the dashed "No program
+          loaded" placeholder card + Open Program Library / Create
+          New Program buttons are RETIRED from the Monitor. The
+          empty state is a plain inline "No program loaded" string
+          in the current-program name slot at the top of this
+          page (see `programName` fallback in the header block).
+          Loading routes through Program Library's Load-to-Monitor
+          button OR the Change Program overlay. Run's named
+          refusal ('program_not_loaded' / 'no_program_home') stays
+          intact when Run is pressed with nothing loaded. */}
 
       {/* Change Program overlay — full-viewport modal wrapping the
           shared ProgramLibrary component. The onSelectProgram prop
