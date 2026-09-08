@@ -7,7 +7,10 @@ import JogControls from '../components/JogControls'
 import IKGizmo from '../components/IKGizmo'
 import ArmEnableControl from '../components/ArmEnableControl'
 import JogReadyBadge from '../components/JogReadyBadge'
-import ModeControl from '../components/ModeControl'
+// 2026-09-08 operator directive: MODE • MANUAL chip + its confirm
+// dialog RETIRED. Mode switching from the UI is gone; operators
+// route mode via the physical pendant selector. Backend endpoint
+// (POST /api/estun/mode) stays live for CRI / driver internal use.
 
 // The 3D View tab hosts three separate jog surfaces:
 //   • JointJogPanel  (right-dock sliders, TWIN ONLY)  — no wire traffic.
@@ -141,7 +144,7 @@ function RealArmChrome({ mode, setMode, children }) {
               so the operator's pre-jog cue stays visible at a glance
               without eating banner-height. */}
           <JogReadyBadge />
-          <ModeControl />
+          {/* 2026-09-08 operator directive: <ModeControl /> retired. */}
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
           <button
