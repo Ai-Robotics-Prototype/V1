@@ -56,6 +56,12 @@ export const FEATURE_MAP = Object.freeze({
   // Monitor + StatusBar keep working on basic.
   configure:          EDITION_FULL,
   cell_commissioning: EDITION_FULL,
+  // 2026-09-08 banner removal: guard-state visibility (footer
+  // "Guards OFF" text next to disk) is full-only. Basic shows
+  // nothing about guard state anywhere. Enforcement is
+  // edition-INDEPENDENT (safety invariant) — this gates ONLY
+  // operator-visible state, not the enforcement path.
+  guard_visibility:   EDITION_FULL,
 })
 
 // Load-time validation mirroring backend's _validate_map.

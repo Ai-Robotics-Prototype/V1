@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react'
+import { useStore } from '../store/useStore'
+import { isFeatureEnabled } from '../lib/edition'
 
 // SERVED bundle identifier — read at runtime from the actual script
 // URL the browser loaded. This is Vite's content-hashed filename
@@ -25,14 +27,30 @@ export function getServedBundleHash() {
 // CRITICAL/DEAD coloring. Everything else — connection dot,
 // ROS2 tag, Robot Generic TCP, IP, State pill, Zone chip,
 // Cell/environment-guard note, WS rate, Edition affordance — is
-// retired. The two load-bearing pieces are relocated:
-//   * Edition chip/unlock → click the NeuRobots wordmark in
-//     TopBar (Brand.jsx).
-//   * Collision-guard-off + WS-disconnected → global banners
-//     rendered by SystemBanners.jsx, only when bad.
+// retired. Edition chip/unlock relocated to the NeuRobots wordmark
+// in TopBar (Brand.jsx).
+//
+// 2026-09-08 (later same day) BANNER REMOVAL directive:
+//   * SystemBanners entirely retired — no more red top strip
+//     covering the tab bar.
+//   * Guard-state visibility is FULL edition only: compact footer
+//     text next to the disk readout — red dot + "Guards OFF"
+//     when guard.enabled === false, nothing when on. BASIC shows
+//     nothing about the guard anywhere. Enforcement is
+//     edition-INDEPENDENT (safety invariant) — this gates ONLY
+//     operator-visible state.
+//
 // Engineer info still lives at /health.
 export default function StatusBar() {
   const [disk, setDisk] = useState(null)
+  // Guard-state read for the full-only footer text. `collision ===
+  // false` is the strict "guard is OFF" state; null/undefined
+  // means "not yet reported" and renders nothing (same as ON — we
+  // do not want to falsely alert on stale/unknown state).
+  const edition   = useStore((s) => s.edition)
+  const collision = useStore((s) => s.robot?.collision_enabled)
+  const guardVisible   = isFeatureEnabled('guard_visibility', edition)
+  const guardOffShown  = guardVisible && collision === false
   useEffect(() => {
     let cancelled = false
     async function pollDisk() {
@@ -91,6 +109,29 @@ export default function StatusBar() {
           </span>
         )}
       </div>
+      {guardOffShown && (
+        <div
+          data-testid="footer-guards-off"
+          title="Self-collision + ground guards are OFF — link-on-link and ground crashes are not prevented in software. Turn ON in Configure."
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6,
+            marginLeft: 14, paddingLeft: 14,
+            borderLeft: '1px solid var(--border)',
+            fontSize: 10, fontWeight: 700,
+            letterSpacing: '0.06em', textTransform: 'uppercase',
+            color: '#DC2626',
+            whiteSpace: 'nowrap', height: '100%',
+          }}>
+          <span aria-hidden="true"
+                style={{
+                  width: 8, height: 8, borderRadius: '50%',
+                  background: '#DC2626',
+                  boxShadow: '0 0 4px #DC2626',
+                  display: 'inline-block', flexShrink: 0,
+                }} />
+          Guards OFF
+        </div>
+      )}
     </div>
   )
 }

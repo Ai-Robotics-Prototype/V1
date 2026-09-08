@@ -72,15 +72,16 @@ def test_basic_set_exact():
     }
 
 
-def test_full_set_is_exactly_the_five_hidden_surfaces():
+def test_full_set_is_exactly_the_six_full_only_keys():
     """Full-only keys: cameras_lidar, part_recognition, safety_page
     (Sensors / Part Recognition / Safety tabs) + configure + the
-    cell_commissioning backend gate. Any future promo of a key here
-    trips a review at CI."""
+    cell_commissioning backend gate + guard_visibility (footer
+    'Guards OFF' text). Any future promo of a key here trips a
+    review at CI."""
     full = {k for k, v in edition_mod.FEATURE_MAP.items() if v == 'full'}
     assert full == {
         'cameras_lidar', 'part_recognition', 'safety_page',
-        'configure', 'cell_commissioning',
+        'configure', 'cell_commissioning', 'guard_visibility',
     }
 
 
@@ -110,9 +111,9 @@ def test_is_feature_enabled_matrix():
     # Full device -> everything on.
     for k in edition_mod.FEATURE_MAP.keys():
         assert edition_mod.is_feature_enabled(k, 'full'), k
-    # Explicit fences on the five full-only keys.
+    # Explicit fences on the six full-only keys.
     for k in ('cameras_lidar', 'part_recognition', 'safety_page',
-              'configure', 'cell_commissioning'):
+              'configure', 'cell_commissioning', 'guard_visibility'):
         assert not edition_mod.is_feature_enabled(k, 'basic'), k
     # Unknown feature key defaults ENABLED (basic-safe).
     assert edition_mod.is_feature_enabled('does_not_exist', 'basic')

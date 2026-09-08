@@ -91,6 +91,15 @@ FEATURE_MAP: dict = {
     #     working on basic.
     'configure':          EDITION_FULL,
     'cell_commissioning': EDITION_FULL,
+    # 2026-09-08 banner removal directive:
+    #   * `guard_visibility` gates the footer "Guards OFF" text.
+    #     BASIC shows nothing about the guard anywhere; FULL shows
+    #     the compact red-dot "Guards OFF" when guard.enabled ===
+    #     false, and nothing when the guard is on. Enforcement
+    #     is edition-INDEPENDENT (safety invariant) — this key
+    #     ONLY gates operator-visible state, not the enforcement
+    #     path.
+    'guard_visibility':   EDITION_FULL,
 }
 
 
