@@ -62,6 +62,12 @@ export const FEATURE_MAP = Object.freeze({
   // edition-INDEPENDENT (safety invariant) — this gates ONLY
   // operator-visible state, not the enforcement path.
   guard_visibility:   EDITION_FULL,
+  // 2026-09-08 LiDAR removal: gate all LiDAR-fed surfaces. Basic
+  // renders no LiDAR anywhere; full renders the whole set
+  // (Objects Detected stat, IdentifiedObjectsCard, backend
+  // /api/lidar_objects/* endpoints). LiDAR services stay
+  // running on both editions.
+  lidar:              EDITION_FULL,
 })
 
 // Load-time validation mirroring backend's _validate_map.

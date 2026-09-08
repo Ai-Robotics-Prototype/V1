@@ -6,6 +6,7 @@ import { STLLoader } from 'three/examples/jsm/loaders/STLLoader'
 import * as THREE from 'three'
 import ProgramLibrary from './ProgramLibrary'
 import IdentifiedObjectsCard from '../components/IdentifiedObjectsCard'
+import { isFeatureEnabled } from '../lib/edition'
 import RunProgramModal from '../components/RunProgramModal'
 import ProgramErrorModal from '../components/ProgramErrorModal'
 import StepPreviewPanel from '../components/StepPreviewPanel'
@@ -724,6 +725,13 @@ export default function MonitorDashboard() {
   const task               = useStore((s) => s.task)
   const safety             = useStore((s) => s.safety)
   const detectionsFromStore = useStore((s) => s.detections)
+  const edition            = useStore((s) => s.edition)
+  // 2026-09-08 LiDAR removal: Objects Detected stat + Identified
+  // Objects card are LiDAR-fed and hidden on basic edition. Full
+  // renders both. Enforcement lives on the backend middleware too
+  // (see _EDITION_FULL_ONLY_PATTERNS entries for lidar_objects and
+  // lidar_workspace_mask).
+  const lidarVisible       = isFeatureEnabled('lidar', edition)
   const setTab             = useStore((s) => s.setTab)
   const addToast           = useStore((s) => s.addToast)
 
@@ -1219,12 +1227,18 @@ export default function MonitorDashboard() {
         <TopPartViewer partId={targetPartId} />
       </div>
 
-      {/* Stats row */}
+      {/* Stats row. 2026-09-08 LiDAR removal: "Objects Detected"
+          stat card is LiDAR-fed and only renders on full. The
+          flex row auto-reflows when one child is absent —
+          Speed / Cycle Count / Last Cycle Time stay side-by-side
+          with no gap. */}
       <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
         <StatCard label="Speed" value={speedPct} unit="%" color="#2563EB" />
         <StatCard label="Cycle Count" value={cycleCount} color="#16A34A" />
         <StatCard label="Last Cycle Time" value={lastCycleTime ?? '—'} unit={lastCycleTime ? 's' : ''} color="#374151" />
-        <StatCard label="Objects Detected" value={detectionCount} color="#9333EA" />
+        {lidarVisible && (
+          <StatCard label="Objects Detected" value={detectionCount} color="#9333EA" />
+        )}
       </div>
 
       {/* Pallet progress — hidden unless the executor is publishing
@@ -1235,11 +1249,14 @@ export default function MonitorDashboard() {
         lastCycleTime={lastCycleTime}
       />
 
-      {/* Production stats: parts picked + cycle results + LiDAR identifications */}
+      {/* Production stats: parts picked + cycle results + (full-only)
+          LiDAR identifications. 2026-09-08 LiDAR removal:
+          <IdentifiedObjectsCard /> hides on basic; PickCounter +
+          CycleResults reflow to fill the row. */}
       <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
         <PickCounter />
         <CycleResults />
-        <IdentifiedObjectsCard />
+        {lidarVisible && <IdentifiedObjectsCard />}
       </div>
 
       {/* Per-program pick performance (PartViewer moved to the top-right

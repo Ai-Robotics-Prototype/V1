@@ -3236,6 +3236,15 @@ if FASTAPI_AVAILABLE:
         (_edition_re.compile(r'^/api/cells/[^/]+/activate$'),         'cell_commissioning', ('POST',)),
         (_edition_re.compile(r'^/api/cells/[^/]+/baseline$'),         'cell_commissioning', ('POST',)),
         (_edition_re.compile(r'^/api/cells/[^/]+/collision_zones($|/)'), 'cell_commissioning', ('POST', 'DELETE')),
+        # lidar (2026-09-08 LiDAR removal). Basic devices refused
+        # on every LiDAR endpoint — the two Monitor cards
+        # (IdentifiedObjectsCard, Objects Detected stat) are UI-
+        # gated, this is defence-in-depth so a basic-device curl
+        # can't reach LiDAR data either. LiDAR services keep
+        # running; only the operator-visibility class is closed
+        # for basic.
+        (_edition_re.compile(r'^/api/lidar_objects($|/)'),        'lidar', None),
+        (_edition_re.compile(r'^/api/lidar_workspace_mask($|/)'), 'lidar', None),
     ]
 
     @app.middleware("http")

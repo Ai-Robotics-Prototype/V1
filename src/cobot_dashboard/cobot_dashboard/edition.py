@@ -100,6 +100,16 @@ FEATURE_MAP: dict = {
     #     ONLY gates operator-visible state, not the enforcement
     #     path.
     'guard_visibility':   EDITION_FULL,
+    # 2026-09-08 LiDAR removal directive:
+    #   * `lidar` gates ALL LiDAR-fed operator surfaces.
+    #     BASIC renders NO LiDAR surfaces anywhere (Monitor's
+    #     Objects Detected stat + IdentifiedObjectsCard both
+    #     hidden). FULL keeps everything. The LiDAR SERVICES
+    #     themselves stay running for both editions — this is
+    #     visibility + endpoint refusal, not a shutdown. Program
+    #     logic that consumes /api/lidar_objects/* on a full
+    #     device continues to work.
+    'lidar':              EDITION_FULL,
 }
 
 
