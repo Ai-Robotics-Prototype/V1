@@ -87,6 +87,15 @@ export function effectorReady(cfg, opts = {}) {
 }
 
 // ENGAGE after the arm reaches the pick contact.
+//
+// 2026-09-08 no-sensor invariant: when the wizard's hookup guide
+// records program.config.hookup_no_sensor['vacuum-seal-sensor'] =
+// true, the operator has explicitly said no seal input exists.
+// Vacuum engage MUST NOT emit a wait-for-input step in that case —
+// use the timed dwell only. Today's implementation already emits
+// the timed dwell (never an input wait); this comment pins the
+// invariant so a future edit adding a wait-for-input path knows
+// to gate on `cfg.hookup_no_sensor['vacuum-seal-sensor'] !== true`.
 export function effectorEngage(cfg, opts = {}) {
   const { gripF = 50, customActivate = 'DO3',
           // Alternate label for engage-in-context (machine tending

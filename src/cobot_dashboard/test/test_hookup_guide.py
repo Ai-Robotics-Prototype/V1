@@ -72,7 +72,8 @@ def test_hookup_map_data_file_exists_and_conforms_to_operator_convention():
     ]:
         assert m8[i]['row'] == ex_row, i
         assert m8[i]['col'] == ex_col, i
-    # Air-station labels present.
+    # Air-station labels present + v2 schema: two ports per station
+    # (port_a + port_b with x_pct/y_pct fractions on the front render).
     stations = data['coordinates']['air_stations']
     expected = {
         '5/2 SS #1', '5/2 SS #2',
@@ -82,6 +83,29 @@ def test_hookup_map_data_file_exists_and_conforms_to_operator_convention():
     }
     missing = expected - set(stations.keys())
     assert not missing, f'air-station labels missing: {sorted(missing)}'
+    for label, entry in stations.items():
+        assert 'port_a' in entry and 'port_b' in entry, \
+            f'{label} must expose both port_a AND port_b'
+        for k in ('port_a', 'port_b'):
+            p = entry[k]
+            assert 'x_pct' in p and 'y_pct' in p, \
+                f'{label}.{k} missing x_pct/y_pct'
+
+
+def test_hookups_reference_station_plus_port():
+    """v2 schema: air_station hookups reference {station, port}
+    (not the legacy air_station_label field). The wizard resolves
+    the pair to port_a/port_b coordinates on the front render."""
+    with open(HOOKUP_MAP) as fh:
+        data = json.load(fh)
+    for gtype in ('vacuum', 'finger'):
+        for h in data['gripper_hookups'].get(gtype, []):
+            if h['target'] != 'air_station':
+                continue
+            assert 'station' in h and 'port' in h, \
+                f'{gtype}/{h["id"]} must carry station+port (v2 schema)'
+            assert h['port'] in ('A', 'B'), \
+                f'{gtype}/{h["id"]} port must be A or B'
 
 
 def test_placeholder_connections_flagged_for_operator_confirmation():
@@ -98,6 +122,15 @@ def test_placeholder_connections_flagged_for_operator_confirmation():
             assert h.get('needs_operator_confirmation') is True, \
                 (f'{gtype} hookup {h["id"]} must be flagged '
                  f'needs_operator_confirmation until operator confirms')
+            # Every INPUT (sensor) connection carries a
+            # no_sensor_recommendation string — the wizard renders
+            # it as the non-nagging note when the operator picks
+            # "No sensor" AND on the sensor card itself.
+            if h['direction'] == 'input':
+                assert 'no_sensor_recommendation' in h and \
+                       h['no_sensor_recommendation'], \
+                    (f'{gtype} sensor {h["id"]} needs a '
+                     f'no_sensor_recommendation string')
 
 
 def test_backend_endpoint_wired():
@@ -134,18 +167,25 @@ def test_wizard_skip_honours_desync_class_fix():
     # Skip predicate keys off hookup_skipped or hookup_confirmed.
     assert 'skip: (answers) => !!answers.hookup_skipped' in src
     assert 'answers.hookup_confirmed === true' in src
-    # Override discipline.
+    # Override discipline. Skip path passes plain flags; Confirm
+    # path also passes hookup_no_sensor per the 2026-09-08
+    # refinement.
     assert 'goNext({ hookup_skipped: true, hookup_confirmed: false })' in src
-    assert 'goNext({ hookup_skipped: false, hookup_confirmed: true })' in src
+    # Confirm's goNext contains hookup_skipped:false + hookup_confirmed
+    # :true + hookup_no_sensor: <map>. Match on the multi-line form.
+    assert 'hookup_skipped:   false' in src
+    assert 'hookup_confirmed: true' in src
+    assert 'hookup_no_sensor: noSensorMap || {}' in src
 
 
 def test_hookup_guide_component_shape():
     """HookupGuide reads /api/hookup_map, renders one card per
-    hookup with the panel image + SVG highlight overlay. Mode
-    'editor' disables the checkboxes and hides Skip/Confirm."""
+    hookup with the panel image + SVG glow overlay. Mode
+    'editor' disables the checkboxes and hides Skip/Confirm.
+    2026-09-08 refinement: no-sensor toggle + reduced-motion +
+    dim mask + halo + ring stroke all present."""
     src = _read(GUIDE)
     assert "fetch('/api/hookup_map')" in src
-    # Test hooks the headless verifier / edition-matrix relies on.
     for hook in (
         'data-testid="hookup-guide"',
         'data-testid="hookup-card"',
@@ -153,12 +193,76 @@ def test_hookup_guide_component_shape():
         'data-testid="hookup-guide-skip"',
         'data-testid="hookup-guide-confirm"',
         'data-testid="hookup-guide-close"',
+        # 2026-09-08 refinement additions:
+        'data-testid="hookup-no-sensor-btn"',
+        'data-testid="hookup-no-sensor-note"',
+        'data-testid="hookup-glow-overlay"',
     ):
         assert hook in src, f'missing hook {hook}'
-    # SVG overlay is percentage-anchored so remapping requires no
-    # new artwork.
+    # SVG overlay is percentage-anchored.
     assert 'viewBox="0 0 100 100"' in src
     assert 'preserveAspectRatio="none"' in src
+    # Commercial glow: dim mask + halo gradient + ring stroke +
+    # pulse animation.
+    assert 'mask=' in src, 'dim mask overlay required for glow treatment'
+    assert 'radialGradient' in src, 'halo gradient required'
+    assert '@keyframes hookup-glow-pulse' in src, \
+        'pulse animation required (1.5-2s cadence)'
+    # Reduced-motion: honored via matchMedia and conditional class.
+    assert "prefers-reduced-motion: reduce" in src
+    assert 'reducedMotion' in src
+
+
+def test_no_sensor_toggle_hides_sensor_card_and_persists():
+    """Clicking the 'No sensor' button on a sensor card sets the
+    id in `noSensor` state, hides the card, and shows a hidden-
+    cards summary line with the recommendation text. On confirm,
+    the map lands in `answers.hookup_no_sensor` (persisted on
+    program.config via handleSave's spread)."""
+    src = _read(GUIDE)
+    # Filter drops hidden cards.
+    assert 'const hookups = rawHookups.filter((h) => !noSensor[h.id])' in src
+    # Summary rendered for hidden entries.
+    assert 'data-testid="hookup-no-sensor-note"' in src
+    assert 'Re-add sensor' in src
+    # Wizard hands the map back on confirm.
+    wz = _read(os.path.abspath(os.path.join(
+        HERE, '..', 'frontend', 'src', 'components', 'ProgramWizard.jsx')))
+    assert 'hookup_no_sensor' in wz
+    assert 'noSensor={answers.hookup_no_sensor || {}}' in wz
+    assert 'goNext({' in wz  # override discipline preserved
+    # effectorEngage documents the invariant.
+    voc = _read(os.path.abspath(os.path.join(
+        HERE, '..', 'frontend', 'src', 'lib', 'effectorVocab.js')))
+    assert 'no-sensor invariant' in voc
+    assert "hookup_no_sensor['vacuum-seal-sensor']" in voc
+
+
+def test_vacuum_engage_still_timed_dwell_only():
+    """Regression fence: the current vacuum-engage emission stays
+    a timed dwell (action:'wait', duration_s:0.5). No wait-for-
+    input step is emitted. If a future edit adds an input wait,
+    it MUST gate on cfg.hookup_no_sensor per the invariant
+    comment — retire this test alongside that change."""
+    voc = _read(os.path.abspath(os.path.join(
+        HERE, '..', 'frontend', 'src', 'lib', 'effectorVocab.js')))
+    # Locate effectorEngage specifically, then its vacuum branch
+    # (effectorReady also has a `e === 'vacuum'` block that would
+    # false-match a plain search).
+    engage_idx = voc.find('export function effectorEngage(')
+    assert engage_idx != -1
+    engage_body = voc[engage_idx:engage_idx + 1500]
+    vac_idx = engage_body.find("if (e === 'vacuum') return [")
+    assert vac_idx != -1, 'vacuum branch missing from effectorEngage'
+    slice_ = engage_body[vac_idx:vac_idx + 500]
+    assert "action: 'set_io'" in slice_
+    assert "action: 'wait'" in slice_
+    assert "duration_s: 0.5" in slice_
+    # No wait_for_input / waitCondition emitted in the current
+    # vacuum branch.
+    for forbidden in ('wait_for_input', 'waitCondition', 'io_seal_confirm'):
+        assert forbidden not in slice_, \
+            f'vacuum engage must not emit {forbidden} without a hookup_no_sensor gate'
 
 
 def test_editor_view_hookup_button_wired():
@@ -175,12 +279,18 @@ def test_editor_view_hookup_button_wired():
     assert 'config.gripper_type || program.config.gripper?.type' in src
 
 
-def test_panel_svg_placeholders_exist():
-    """Placeholder SVGs land in the assets dir; real PNGs will
-    replace them without any coordinate churn."""
-    for fn in ('panel_m8_placeholder.svg', 'panel_air_placeholder.svg'):
+def test_panel_asset_files_present_with_operator_naming():
+    """2026-09-08 refinement: assets renamed to match operator's
+    filenames: hookup_panel_front.svg (front render, hosts the
+    overlays) + hookup_panel_iso.svg (context view). Real PNGs
+    drop in as .png; only the JSON asset field extension changes."""
+    for fn in ('hookup_panel_front.svg', 'hookup_panel_iso.svg'):
         assert os.path.isfile(os.path.join(ASSETS, fn)), \
             f'{fn} must exist in frontend/src/assets/hookup/'
+    # And the retired placeholder names are gone.
+    for gone in ('panel_m8_placeholder.svg', 'panel_air_placeholder.svg'):
+        assert not os.path.exists(os.path.join(ASSETS, gone)), \
+            f'stale placeholder {gone} must be removed'
 
 
 def test_guide_never_publishes_io_or_motion():

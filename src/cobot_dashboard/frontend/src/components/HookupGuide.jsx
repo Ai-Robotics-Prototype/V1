@@ -1,42 +1,55 @@
 import { useEffect, useState } from 'react'
-import m8PanelUrl from '../assets/hookup/panel_m8_placeholder.svg'
-import airPanelUrl from '../assets/hookup/panel_air_placeholder.svg'
+import frontPanelUrl from '../assets/hookup/hookup_panel_front.svg'
+import isoPanelUrl   from '../assets/hookup/hookup_panel_iso.svg'
 
 // HookupGuide — data-driven peripheral hookup instructions.
 //
-// 2026-09-08 operator directive: display-only guide, gated on
-// gripper type from the wizard OR read-only reopen from the
-// program editor. Sends NO IO or motion; writes only an
-// informational `hookup_confirmed` flag when the caller commits.
+// 2026-09-08 v2 schema: air stations carry two ports (A + B); each
+// input-direction connection can be "no sensor" per operator
+// directive (persisted on program.config.hookup_no_sensor). The
+// glow overlay is percentage-anchored SVG (feGaussianBlur halo +
+// ring stroke + slow pulse animation, dim mask on the rest of the
+// panel) so remapping to real panel PNGs requires no code change
+// — just drop the .png and update the JSON asset field.
 //
-// Data source: /api/hookup_map → /opt/cobot/hookup/hookup_map.json.
-// Panel artwork is placeholder SVG for now (M8 grid + air-station
-// manifold). Real panel photos drop into
-// src/cobot_dashboard/frontend/src/assets/hookup/ and the JSON
-// asset field switches to their filenames — SVG highlight overlay
-// keeps positioning correct because it's computed from x_pct /
-// y_pct fractions of whatever panel image is loaded.
+// Data source: GET /api/hookup_map → /opt/cobot/hookup/hookup_map.json.
 //
 // Props:
-//   gripperType : 'finger' | 'vacuum' | 'custom'
-//   mode        : 'wizard' | 'editor'   (labels + primary button copy)
-//   confirmed   : bool                  (initial checked state per card)
-//   onConfirm(all_checked)              (wizard: goNext override)
-//   onSkip()                            (wizard: 'already connected')
-//   onClose()                           (editor read-only reopen)
+//   gripperType    : 'finger' | 'vacuum' | 'custom'
+//   mode           : 'wizard' | 'editor'
+//   confirmed      : bool                        (checked state per card)
+//   noSensor       : { [connectionId]: true }    (per-connection sensor toggles)
+//   onConfirm(all_checked, noSensorMap)          (wizard confirm)
+//   onSkip()
+//   onClose()
 
-const PANEL_ASSETS = {
-  m8_panel:  m8PanelUrl,
-  air_panel: airPanelUrl,
+const PANEL_ASSETS = { front: frontPanelUrl, iso: isoPanelUrl }
+
+function usePrefersReducedMotion() {
+  const [pref, setPref] = useState(false)
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return
+    const mq = window.matchMedia('(prefers-reduced-motion: reduce)')
+    setPref(mq.matches)
+    const on = (e) => setPref(e.matches)
+    try { mq.addEventListener('change', on) } catch { mq.addListener(on) }
+    return () => {
+      try { mq.removeEventListener('change', on) } catch { mq.removeListener(on) }
+    }
+  }, [])
+  return pref
 }
 
 export default function HookupGuide({
   gripperType, mode = 'wizard', confirmed = false,
+  noSensor: initialNoSensor = null,
   onConfirm, onSkip, onClose,
 }) {
   const [map, setMap]     = useState(null)
   const [err, setErr]     = useState(null)
-  const [checked, setChecked] = useState({})
+  const [checked, setChecked]     = useState({})
+  const [noSensor, setNoSensor]   = useState(() => ({ ...(initialNoSensor || {}) }))
+  const reducedMotion = usePrefersReducedMotion()
 
   useEffect(() => {
     let alive = true
@@ -53,25 +66,40 @@ export default function HookupGuide({
     return () => { alive = false }
   }, [])
 
-  const hookups = (map && map.gripper_hookups && map.gripper_hookups[gripperType]) || []
+  const rawHookups = (map && map.gripper_hookups && map.gripper_hookups[gripperType]) || []
+  // Filter out sensors the operator marked "no sensor" — the card
+  // is hidden AND, downstream, program.config.hookup_no_sensor
+  // gates codegen paths that would otherwise wait on a
+  // never-connected input.
+  const hookups = rawHookups.filter((h) => !noSensor[h.id])
   const allChecked = hookups.length > 0 && hookups.every((h) => checked[h.id])
+  const readOnly = mode === 'editor'
 
-  function toggle(id) {
+  function toggleCheck(id) {
     setChecked((prev) => ({ ...prev, [id]: !prev[id] }))
   }
-
-  // Editor mode: read-only, one Close button, checkboxes render
-  // disabled (mirroring the last-known confirm state).
-  const readOnly = mode === 'editor'
+  function setNoSensorFlag(id, value) {
+    setNoSensor((prev) => {
+      const next = { ...prev, [id]: value }
+      if (!value) delete next[id]
+      return next
+    })
+    // Also drop any check on a hidden card so a re-toggle back
+    // doesn't leave a stale check.
+    if (value) setChecked((prev) => {
+      if (!prev[id]) return prev
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+  }
 
   return (
     <div
       data-testid="hookup-guide"
       data-gripper={gripperType}
       data-mode={mode}
-      style={{
-        display: 'flex', flexDirection: 'column', gap: 12,
-      }}>
+      style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <div>
         <div style={{ fontSize: 18, fontWeight: 700, color: '#111' }}>
           Connect your hardware
@@ -97,7 +125,7 @@ export default function HookupGuide({
         <div style={{ color: '#6b7280', fontSize: 13 }}>Loading hookup map…</div>
       )}
 
-      {!err && map && hookups.length === 0 && (
+      {!err && map && rawHookups.length === 0 && (
         <div style={{
           padding: 14, borderRadius: 8, background: '#F3F4F6',
           color: '#374151', fontSize: 13, lineHeight: 1.5,
@@ -108,15 +136,52 @@ export default function HookupGuide({
         </div>
       )}
 
+      {/* Hidden-cards summary — when the operator picks "No sensor"
+          for one or more inputs, show a small acknowledgement line
+          so it's clear WHICH cards are hidden (auditability). */}
+      {rawHookups.filter((h) => noSensor[h.id]).map((h) => (
+        <div key={`nosensor-${h.id}`}
+             data-testid="hookup-no-sensor-note"
+             data-connection-id={h.id}
+             style={{
+               padding: '6px 10px', fontSize: 11, lineHeight: 1.5,
+               borderRadius: 6, background: '#F3F4F6',
+               color: '#4B5563', display: 'flex', gap: 10,
+               alignItems: 'center', justifyContent: 'space-between',
+             }}>
+          <span>
+            <b>{h.purpose_text.split(' — ')[0]}</b>: no sensor.
+            {' '}<span style={{ color: '#B45309' }}>
+              {h.no_sensor_recommendation || 'Recommended: a sensor lets the robot verify state instead of assuming.'}
+            </span>
+          </span>
+          {!readOnly && (
+            <button
+              onClick={() => setNoSensorFlag(h.id, false)}
+              style={{
+                fontSize: 10, padding: '3px 8px', borderRadius: 4,
+                background: '#fff', color: '#374151',
+                border: '1px solid #D1D5DB', cursor: 'pointer',
+                whiteSpace: 'nowrap',
+              }}>
+              Re-add sensor
+            </button>
+          )}
+        </div>
+      ))}
+
       {!err && map && hookups.map((h) => (
         <HookupCard
           key={h.id}
           hookup={h}
           coords={map.coordinates}
-          images={map.images}
           checked={!!checked[h.id]}
           disabled={readOnly}
-          onToggle={() => !readOnly && toggle(h.id)}
+          reducedMotion={reducedMotion}
+          onToggle={() => !readOnly && toggleCheck(h.id)}
+          onNoSensor={h.direction === 'input' && !readOnly
+            ? () => setNoSensorFlag(h.id, true)
+            : null}
         />
       ))}
 
@@ -138,7 +203,7 @@ export default function HookupGuide({
             </button>
             <button
               data-testid="hookup-guide-confirm"
-              onClick={() => onConfirm?.(allChecked)}
+              onClick={() => onConfirm?.(allChecked, noSensor)}
               disabled={hookups.length > 0 && !allChecked}
               style={{
                 ...btn('#16A34A', '#fff', '#15803d'),
@@ -165,34 +230,46 @@ function btn(bg, color, border) {
   }
 }
 
-function HookupCard({ hookup, coords, images, checked, disabled, onToggle }) {
-  // Resolve the coord entry and panel key by target type. The map
-  // is display-only: if a coord is missing, render the card with an
-  // annotation so the operator sees which id lost its mapping (the
-  // guide never silently drops a connection).
-  let coord = null
-  let idLabel = ''
+// Resolve a hookup entry to {panelKey, x_pct, y_pct, idLabel}.
+function resolveTarget(hookup, coords) {
   if (hookup.target === 'm8') {
-    coord = coords?.m8?.[hookup.m8_id] || null
-    idLabel = hookup.m8_id
-  } else if (hookup.target === 'air_station') {
-    coord = coords?.air_stations?.[hookup.air_station_label] || null
-    idLabel = hookup.air_station_label
+    const c = coords?.m8?.[hookup.m8_id]
+    if (!c) return { idLabel: hookup.m8_id, panelKey: null }
+    return {
+      idLabel: hookup.m8_id,
+      panelKey: c.panel || 'front',
+      x_pct: c.x_pct, y_pct: c.y_pct,
+    }
   }
-  const panelKey = coord?.panel || 'm8_panel'
-  const asset = PANEL_ASSETS[panelKey]
+  if (hookup.target === 'air_station') {
+    const station = coords?.air_stations?.[hookup.station]
+    if (!station) return { idLabel: `${hookup.station} — port ${hookup.port}`, panelKey: null }
+    const portKey = hookup.port === 'B' ? 'port_b' : 'port_a'
+    const p = station[portKey]
+    return {
+      idLabel: `${hookup.station} — port ${hookup.port || 'A'}`,
+      panelKey: station.panel || 'front',
+      x_pct: p?.x_pct, y_pct: p?.y_pct,
+    }
+  }
+  return { idLabel: '?', panelKey: null }
+}
 
+function HookupCard({ hookup, coords, checked, disabled, reducedMotion,
+                     onToggle, onNoSensor }) {
+  const { idLabel, panelKey, x_pct, y_pct } = resolveTarget(hookup, coords)
+  const asset = panelKey ? PANEL_ASSETS[panelKey] : null
   return (
-    <label
+    <div
       data-testid="hookup-card"
       data-connection-id={hookup.id}
+      data-direction={hookup.direction}
       data-needs-confirm={hookup.needs_operator_confirmation ? 'true' : 'false'}
       style={{
         display: 'flex', gap: 14, padding: 12,
         background: checked ? '#F0FDF4' : '#fff',
         border: `2px solid ${checked ? '#16A34A' : '#e5e7eb'}`,
-        borderRadius: 10, cursor: disabled ? 'default' : 'pointer',
-        alignItems: 'flex-start',
+        borderRadius: 10, alignItems: 'flex-start',
         transition: 'background 120ms, border-color 120ms',
       }}>
       <input
@@ -208,14 +285,13 @@ function HookupCard({ hookup, coords, images, checked, disabled, onToggle }) {
       />
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{
-          display: 'flex', alignItems: 'baseline', gap: 8,
+          display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap',
           fontSize: 14, fontWeight: 700, color: '#111',
         }}>
           <span style={{ fontFamily: 'var(--font-mono, monospace)',
                          padding: '2px 6px', background: '#EEF2FF',
-                         color: '#3730A3', borderRadius: 4,
-                         fontSize: 11 }}>
-            {idLabel || '?'}
+                         color: '#3730A3', borderRadius: 4, fontSize: 11 }}>
+            {idLabel}
           </span>
           <span>{hookup.purpose_text}</span>
         </div>
@@ -229,18 +305,55 @@ function HookupCard({ hookup, coords, images, checked, disabled, onToggle }) {
             PLACEHOLDER — operator will confirm this mapping.
           </div>
         )}
+        {hookup.direction === 'input' && onNoSensor && (
+          <div style={{ marginTop: 8 }}>
+            <button
+              data-testid="hookup-no-sensor-btn"
+              data-connection-id={hookup.id}
+              onClick={onNoSensor}
+              style={{
+                fontSize: 11, padding: '4px 10px', borderRadius: 4,
+                background: '#fff', color: '#374151',
+                border: '1px solid #D1D5DB', cursor: 'pointer',
+              }}>
+              No sensor / not using a sensor
+            </button>
+            {hookup.no_sensor_recommendation && (
+              <div style={{
+                marginTop: 4, fontSize: 10, color: '#6B7280',
+                lineHeight: 1.5,
+              }}>
+                {hookup.no_sensor_recommendation}
+              </div>
+            )}
+          </div>
+        )}
         <div style={{ marginTop: 10 }}>
-          <PanelWithHighlight
+          <PanelWithGlow
             asset={asset}
-            highlight={coord}
-            idLabel={idLabel} />
+            x_pct={x_pct}
+            y_pct={y_pct}
+            idLabel={idLabel}
+            reducedMotion={reducedMotion} />
         </div>
       </div>
-    </label>
+    </div>
   )
 }
 
-function PanelWithHighlight({ asset, highlight, idLabel }) {
+// PanelWithGlow — commercial-quality highlight overlay.
+//
+//   * Panel image renders at full opacity.
+//   * A dim mask (~35 % dark) covers the whole panel EXCEPT the
+//     glowing port (mask cut-out).
+//   * A soft radial glow (feGaussianBlur halo + solid ring stroke)
+//     draws the eye. The ring pulses at 1.8 s cadence unless the
+//     user has prefers-reduced-motion set — then static.
+//
+// The overlay is a single SVG absolutely positioned on top of the
+// image; every position is percentage-anchored so remapping =
+// JSON edit, no artwork churn.
+function PanelWithGlow({ asset, x_pct, y_pct, idLabel, reducedMotion }) {
   if (!asset) {
     return (
       <div style={{
@@ -251,54 +364,85 @@ function PanelWithHighlight({ asset, highlight, idLabel }) {
       </div>
     )
   }
-  if (!highlight) {
-    return (
-      <div style={{ position: 'relative', width: '100%', maxWidth: 500 }}>
-        <img src={asset} alt=""
-             style={{ width: '100%', height: 'auto', display: 'block',
-                      background: '#111827', borderRadius: 6 }} />
-        <div style={{
-          padding: '4px 8px', fontSize: 10, color: '#B45309',
-          background: '#FEF3C7', borderTop: '1px solid #FDE68A',
-          borderRadius: '0 0 6px 6px',
-        }}>
-          Highlight coordinates missing for <b>{idLabel}</b>.
-        </div>
-      </div>
-    )
-  }
-  // Position overlay as a percentage-anchored SVG on top of the
-  // panel image. Overlay is intentionally NEVER baked into the
-  // artwork — remapping requires no new art, only a JSON edit.
+  const haveCoord = Number.isFinite(x_pct) && Number.isFinite(y_pct)
   return (
-    <div style={{ position: 'relative', width: '100%', maxWidth: 500 }}>
+    <div style={{
+      position: 'relative', width: '100%', maxWidth: 520,
+      borderRadius: 8, overflow: 'hidden',
+      background: '#0F172A',
+    }}>
       <img src={asset} alt=""
-           style={{ width: '100%', height: 'auto', display: 'block',
-                    background: '#111827', borderRadius: 6 }} />
-      <svg viewBox="0 0 100 100" preserveAspectRatio="none"
            style={{
-             position: 'absolute', inset: 0,
-             width: '100%', height: '100%', pointerEvents: 'none',
-           }}>
-        <circle
-          cx={highlight.x_pct}
-          cy={highlight.y_pct}
-          r={5}
-          fill="none"
-          stroke="#DC2626"
-          strokeWidth={0.8}
-          style={{ filter: 'drop-shadow(0 0 4px rgba(220,38,38,0.7))' }}
-        />
-        <text
-          x={highlight.x_pct}
-          y={Math.max(0, highlight.y_pct - 7)}
-          fill="#FCA5A5"
-          fontSize={4}
-          textAnchor="middle"
-          fontFamily="system-ui, sans-serif">
-          {idLabel}
-        </text>
-      </svg>
+             width: '100%', height: 'auto', display: 'block',
+           }} />
+      {haveCoord && (
+        <svg
+          data-testid="hookup-glow-overlay"
+          data-reduced-motion={reducedMotion ? 'true' : 'false'}
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          style={{
+            position: 'absolute', inset: 0,
+            width: '100%', height: '100%', pointerEvents: 'none',
+          }}>
+          <defs>
+            {/* Soft radial halo around the target port. */}
+            <radialGradient id={`halo-${x_pct}-${y_pct}`} cx="50%" cy="50%" r="50%">
+              <stop offset="0%"   stop-color="#3B82F6" stop-opacity="0.65"/>
+              <stop offset="45%"  stop-color="#3B82F6" stop-opacity="0.25"/>
+              <stop offset="100%" stop-color="#3B82F6" stop-opacity="0"/>
+            </radialGradient>
+            {/* Dim mask — full-panel dark rectangle with a
+                punch-out at the target port so the port renders at
+                full brightness while the rest is quieted. */}
+            <mask id={`dim-${x_pct}-${y_pct}`}>
+              <rect x="0" y="0" width="100" height="100" fill="white"/>
+              <circle cx={x_pct} cy={y_pct} r="6" fill="black"/>
+            </mask>
+            {/* Pulse animation on the ring stroke width. Reduced-
+                motion callers get a static ring (see below). */}
+            <style>{`
+              @keyframes hookup-glow-pulse {
+                0%   { opacity: 0.75; transform: scale(1);   }
+                50%  { opacity: 1;    transform: scale(1.05); }
+                100% { opacity: 0.75; transform: scale(1);   }
+              }
+              .hookup-halo-pulse {
+                transform-origin: ${x_pct}px ${y_pct}px;
+                animation: hookup-glow-pulse 1.8s ease-in-out infinite;
+              }
+            `}</style>
+          </defs>
+          {/* Dim overlay — masks everything except the port cut-out. */}
+          <rect
+            x="0" y="0" width="100" height="100"
+            fill="#000000" opacity="0.35"
+            mask={`url(#dim-${x_pct}-${y_pct})`}
+          />
+          {/* Halo — radial gradient behind the ring. Pulses unless
+              reduced-motion. */}
+          <circle
+            className={reducedMotion ? '' : 'hookup-halo-pulse'}
+            cx={x_pct} cy={y_pct} r="8"
+            fill={`url(#halo-${x_pct}-${y_pct})`}
+          />
+          {/* Ring stroke — the crisp accent outline the eye lands on. */}
+          <circle
+            cx={x_pct} cy={y_pct} r="3.5"
+            fill="none" stroke="#3B82F6" stroke-width="0.6"
+            style={{ filter: 'drop-shadow(0 0 1.2px rgba(59,130,246,0.9))' }}
+          />
+          {/* Id label above the ring. */}
+          <text
+            x={x_pct} y={Math.max(2, y_pct - 5)}
+            fill="#DBEAFE" font-size="3" text-anchor="middle"
+            font-family="system-ui, sans-serif"
+            style={{ paintOrder: 'stroke', stroke: '#0F172A',
+                     strokeWidth: 0.5 }}>
+            {idLabel}
+          </text>
+        </svg>
+      )}
     </div>
   )
 }

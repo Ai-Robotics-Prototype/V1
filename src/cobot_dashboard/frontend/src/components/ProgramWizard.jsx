@@ -2070,15 +2070,21 @@ const PAGES = [
           gripperType={answers.gripper_type || 'finger'}
           mode="wizard"
           confirmed={answers.hookup_confirmed === true}
+          noSensor={answers.hookup_no_sensor || {}}
           onSkip={() => {
             setAnswer('hookup_skipped',   true)
             setAnswer('hookup_confirmed', false)
             goNext({ hookup_skipped: true, hookup_confirmed: false })
           }}
-          onConfirm={() => {
-            setAnswer('hookup_skipped',   false)
-            setAnswer('hookup_confirmed', true)
-            goNext({ hookup_skipped: false, hookup_confirmed: true })
+          onConfirm={(_allChecked, noSensorMap) => {
+            setAnswer('hookup_skipped',    false)
+            setAnswer('hookup_confirmed',  true)
+            setAnswer('hookup_no_sensor',  noSensorMap || {})
+            goNext({
+              hookup_skipped:   false,
+              hookup_confirmed: true,
+              hookup_no_sensor: noSensorMap || {},
+            })
           }}
         />
       </QuestionCard>
