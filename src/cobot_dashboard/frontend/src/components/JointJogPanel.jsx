@@ -55,6 +55,12 @@ export default function JointJogPanel({
                  // it to their own AT-LIMIT indicator.
 }) {
   const [values, setValues] = useState([0, 0, 0, 0, 0, 0])
+  // TWIN-POSING vs LIVE-FOLLOW indicator. `previewing` is true when
+  // ANY of the six joint masks in StandaloneRobot are latched (i.e.,
+  // operator dragged a slider or previewed Face Down). The panel
+  // renders a small chip + Follow-Robot button so the operator always
+  // has an obvious way back to LIVE-FOLLOW — no silent frozen state.
+  const [previewing, setPreviewing] = useState(false)
 
   useEffect(() => {
     if (!jogApi?.robot?.joints) return
@@ -94,6 +100,16 @@ export default function JointJogPanel({
     return () => clearInterval(id)
   }, [jogApi])
 
+  // Subscribe to StandaloneRobot's manual-mask signal so the chip +
+  // Follow-Robot button track TWIN-POSING state without polling.
+  useEffect(() => {
+    if (!jogApi?.onManualMaskChange) return undefined
+    const unsub = jogApi.onManualMaskChange((maskArr) => {
+      setPreviewing(Array.isArray(maskArr) && maskArr.some(Boolean))
+    })
+    return unsub
+  }, [jogApi])
+
   const onSlide = (idx, radStr) => {
     const rad = Number(radStr)
     if (!Number.isFinite(rad)) return
@@ -105,6 +121,15 @@ export default function JointJogPanel({
     jogApi?.setJointRad?.(idx, rad)
   }
 
+  // Slider pointer released → return this joint to LIVE-FOLLOW. Fires
+  // on pointerup AND on any interaction end that surrenders the input
+  // (blur, lost pointer capture). The next store→robot mirror tick
+  // seeds targets from the LATEST /joint_states, so the twin catches
+  // up smoothly from wherever the preview left it.
+  const onSlideEnd = (idx) => {
+    jogApi?.releaseJointMask?.(idx)
+  }
+
   const ready = !!jogApi?.robot?.joints
 
   return (
@@ -112,6 +137,39 @@ export default function JointJogPanel({
       <div style={styles.header}>
         <div style={styles.title}>Joint Jog</div>
         <div style={styles.twinTag}>TWIN ONLY</div>
+      </div>
+
+      {/* LIVE-FOLLOW / TWIN-POSING banner. The twin viewer is either
+          mirroring the real arm at WS stream rate (LIVE-FOLLOW,
+          default) or held on an operator-set preview (TWIN-POSING,
+          triggered by dragging any slider or by Face Down). The chip
+          + Follow-Robot button guarantee there is no silent frozen
+          state — a preview always has an obvious way back to live. */}
+      <div
+        data-testid="follow-state-banner"
+        data-state={previewing ? 'twin-posing' : 'live-follow'}
+        style={previewing ? styles.followBannerPosing : styles.followBannerLive}
+      >
+        <span aria-hidden="true"
+              style={{
+                width: 8, height: 8, borderRadius: '50%',
+                background: previewing ? '#F59E0B' : '#22C55E',
+                boxShadow: `0 0 4px ${previewing ? '#F59E0B' : '#22C55E'}`,
+                marginRight: 6, display: 'inline-block',
+              }} />
+        <span style={{ flex: 1 }}>
+          {previewing ? 'PREVIEWING (twin only)' : 'Live: mirroring real arm'}
+        </span>
+        {previewing && (
+          <button
+            data-testid="follow-robot-btn"
+            type="button"
+            onClick={() => jogApi?.followLive?.()}
+            style={styles.followRobotBtn}
+            title="Return twin to LIVE-FOLLOW — clears any operator-set preview.">
+            Follow robot
+          </button>
+        )}
       </div>
 
       {!ready && (
@@ -182,6 +240,9 @@ export default function JointJogPanel({
                   value={v}
                   onInput={(e) => onSlide(i, e.target.value)}
                   onChange={(e) => onSlide(i, e.target.value)}
+                  onPointerUp={() => onSlideEnd(i)}
+                  onLostPointerCapture={() => onSlideEnd(i)}
+                  onBlur={() => onSlideEnd(i)}
                   style={styles.slider}
                 />
                 <div style={styles.limitStrip}>
@@ -277,5 +338,33 @@ const styles = {
   empty: {
     fontSize: 11, color: 'var(--text-muted, #8A8F9E)',
     textAlign: 'center', padding: '18px 0',
+  },
+  followBannerLive: {
+    display: 'flex', alignItems: 'center',
+    padding: '4px 8px', marginBottom: 8,
+    borderRadius: 4,
+    background: 'rgba(34,197,94,0.10)',
+    border: '1px solid rgba(34,197,94,0.40)',
+    color: '#166534',
+    fontSize: 10, fontWeight: 700,
+    letterSpacing: 0.4, textTransform: 'uppercase',
+  },
+  followBannerPosing: {
+    display: 'flex', alignItems: 'center',
+    padding: '4px 8px', marginBottom: 8,
+    borderRadius: 4,
+    background: 'rgba(245,158,11,0.14)',
+    border: '1px solid rgba(245,158,11,0.55)',
+    color: '#78350F',
+    fontSize: 10, fontWeight: 700,
+    letterSpacing: 0.4, textTransform: 'uppercase',
+  },
+  followRobotBtn: {
+    padding: '2px 8px', marginLeft: 6,
+    fontSize: 10, fontWeight: 700, letterSpacing: 0.3,
+    textTransform: 'uppercase',
+    color: '#fff', background: '#059669',
+    border: '1px solid #047857', borderRadius: 3,
+    cursor: 'pointer', fontFamily: 'inherit',
   },
 }
