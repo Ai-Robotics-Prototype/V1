@@ -31,14 +31,19 @@ import {
 // can be cancelled by any subsequent jog / IK / home command (they
 // share homeAnimRef in StandaloneRobot / ArmViewer3D).
 //
-// Real-arm path: NOT wired in this commit. Real-arm coordinated
-// Cartesian orient needs a new backend endpoint (single-axis /cmd/jog
-// pulses would let joints move independently and drift the TCP —
-// which is exactly what this operation forbids). On real-arm-enabled
-// devices, the button still gates on the same interlock as other jog
-// motions (enabled + allow_jog + !estop + !alarm); a subsequent
-// operator directive is the trigger to wire the backend and lift the
-// twin-only limit.
+// Real-arm path (2026-09-09): wired through POST /api/estun/orient/
+// face_down. Same gate matrix as every real jog motion (E-STOP /
+// zone-GREEN / connected / enabled / !alarm / allow_jog / no program
+// running) plus a server-side 30°-per-joint step guard. The dashboard
+// endpoint enforces the rate cap (≤10°/s) by computing duration_ms
+// server-side from the max per-joint delta so an under-driver-cap
+// speed can't sneak through. The driver-side subscriber on
+// /robot/orient_command is a follow-up wire — until it lands, the
+// endpoint returns outcome.kind='executor_not_wired_yet' with a 503
+// and the frontend surfaces the specific message. Twin preview always
+// runs first; the "Send to real arm" button is a separate deliberate
+// tap so the FIRST REAL PRESS IS THE OPERATOR'S, slow, hand near
+// E-STOP (per the 2026-09-09 safety framing).
 
 // TCP drift tolerance for the achieved-error check. If solveIKToPose
 // returns a joint vector whose FK'd TCP position differs from the
@@ -66,18 +71,33 @@ function fmt(v) {
 
 export default function FaceDownButton({ jogApi, onAtLimit }) {
   const [refusalMsg, setRefusalMsg] = useState('')
+  // Last successful twin preview — the joint target the real-arm
+  // press will send. `null` until the operator taps Face Down and IK
+  // succeeds; cleared on any refusal or on a robot-state change that
+  // would invalidate the pose. The "Send to real arm" button reads
+  // this — no shadow copies of q_target live elsewhere.
+  const [previewedTarget, setPreviewedTarget] = useState(null)
+  const [realArmBusy, setRealArmBusy] = useState(false)
+  const [realArmStatus, setRealArmStatus] = useState(null)   // {ok, kind, reason}
+
   const robot   = useStore((s) => s.robot) || {}
   const safety  = useStore((s) => s.safety) || {}
   // Real-arm interlock: same conditions as JogControls' jogGateOk.
   // Twin path ignores these — the twin is always safe to animate.
-  const realArmReady = !!robot.connected && !!robot.enabled
+  // Wire authority: state_code==2 is the numeric truth per FACTS.md;
+  // boolean `enabled` is a legacy fallback for older builds.
+  const enabledByState = Number.isFinite(robot.state_code)
+    ? robot.state_code === 2 : !!robot.enabled
+  const realArmReady = !!robot.connected && enabledByState
                     && !!robot.allow_jog && !safety.estop
-                    && !robot.alarm
+                    && !robot.alarm && safety.zone === 'GREEN'
 
   const ready = !!jogApi?.robot?.joints && !!jogApi?.runJointAnimation
 
   const handleClick = () => {
     setRefusalMsg('')
+    setPreviewedTarget(null)
+    setRealArmStatus(null)
     if (!ready) return
     const armRobot = jogApi.robot
     const tool = resolveTool(armRobot)
@@ -137,6 +157,71 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
                (angleRad / ORIENT_RATE_RAD_PER_S) * 1000))
 
     jogApi.runJointAnimation(q_target, durationMs)
+
+    // Latch the IK-solved target so the "Send to real arm" button
+    // has something authoritative to POST. Storing the joint vector
+    // (not the pose) means the server can validate a 30°-per-joint
+    // step guard without redoing IK. Array.from() clones so a later
+    // preview overwrite can't mutate this snapshot.
+    setPreviewedTarget(Array.from(q_target))
+  }
+
+  // Send to real arm — separate deliberate press per 2026-09-09
+  // safety framing. Sends the LAST successful twin preview's
+  // q_target. Server runs the full interlock gate matrix (same as
+  // every real jog motion); refusals show inline. Rate cap enforced
+  // server-side. The 3D twin preview is unchanged — this button only
+  // fires the real-arm wire.
+  const sendToRealArm = async () => {
+    if (!realArmReady || !previewedTarget || realArmBusy) return
+    // eslint-disable-next-line no-alert
+    if (!window.confirm(
+      'Send Face Down to real arm?\n\n'
+      + 'The arm will coordinate all six joints to the twin-previewed '
+      + 'pose at ≤10°/s. Keep your hand near E-STOP.'
+    )) return
+    setRealArmBusy(true)
+    setRealArmStatus(null)
+    try {
+      const q_current = Array.isArray(jogApi?.robot?.joints)
+        ? undefined
+        : (jogApi?.robot?.joints
+            ? [1, 2, 3, 4, 5, 6].map((i) => {
+                const j = jogApi.robot.joints[`joint_${i}`]
+                const raw = j?.jointValue
+                const v = Array.isArray(raw) ? raw[0] : raw
+                const n = Number(v)
+                return Number.isFinite(n) ? n : 0
+              })
+            : undefined)
+      const resp = await fetch('/api/estun/orient/face_down', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          q_target: previewedTarget,
+          q_current_snapshot: q_current,
+        }),
+      })
+      const body = await resp.json().catch(() => ({}))
+      if (resp.ok && body.ok) {
+        setRealArmStatus({ ok: true,
+          message: `Command accepted — duration ${body.duration_ms} ms` })
+      } else {
+        const outcome = body.outcome || {}
+        setRealArmStatus({
+          ok: false,
+          kind: outcome.kind || 'unknown',
+          message: outcome.reason || 'Refused by driver',
+        })
+      }
+    } catch (e) {
+      setRealArmStatus({
+        ok: false, kind: 'network',
+        message: 'Network error contacting dashboard',
+      })
+    } finally {
+      setRealArmBusy(false)
+    }
   }
 
   const disabled = !ready
@@ -147,10 +232,11 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
         disabled={disabled}
         title={realArmReady
           ? 'Face Down — TCP stays in place, tool orients to world -Y. '
-            + 'Twin previews the pose (real-arm path pending backend '
-            + 'wiring). Slow by design (~10°/s).'
+            + 'Twin previews the pose; a separate button then commands '
+            + 'the real arm at ≤10°/s (server enforces the interlock).'
           : 'Face Down — TCP-preserving twin orient to world -Y. '
-            + 'Slow by design (~10°/s).'}
+            + 'Slow by design (~10°/s). Real-arm path enabled once the '
+            + 'arm is connected + enabled + jog-gated + zone-green.'}
         onClick={handleClick}
         style={{
           ...styles.btn,
@@ -167,6 +253,40 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
           {refusalMsg}
         </div>
       )}
+      {/* Real-arm button — only rendered after a successful twin
+          preview (previewedTarget != null). Disabled unless the same
+          interlock gates the server enforces are also green on the
+          client, so operators don't tap only to eat a 409. */}
+      {previewedTarget && (
+        <button
+          data-testid="face-down-send-real"
+          type="button"
+          disabled={!realArmReady || realArmBusy}
+          onClick={sendToRealArm}
+          title={realArmReady
+            ? 'Command the real arm to the previewed pose at ≤10°/s. '
+              + 'Keep your hand near E-STOP.'
+            : 'Real arm not ready — check enable / allow_jog / alarm / '
+              + 'zone-green / E-STOP.'}
+          style={{
+            ...styles.btnReal,
+            cursor: (!realArmReady || realArmBusy) ? 'not-allowed' : 'pointer',
+            opacity: (!realArmReady || realArmBusy) ? 0.55 : 1,
+          }}
+        >
+          {realArmBusy ? 'Sending…' : 'Send to real arm'}
+        </button>
+      )}
+      {realArmStatus && (
+        <div
+          data-testid={realArmStatus.ok
+            ? 'face-down-real-ok'
+            : 'face-down-real-refusal'}
+          data-kind={realArmStatus.kind || (realArmStatus.ok ? 'ok' : '')}
+          style={realArmStatus.ok ? styles.okBanner : styles.refusal}>
+          {realArmStatus.message}
+        </div>
+      )}
     </div>
   )
 }
@@ -180,10 +300,24 @@ const styles = {
     fontSize: 12, fontWeight: 700, letterSpacing: 0.4,
     fontFamily: 'inherit',
   },
+  btnReal: {
+    padding: '8px 12px',
+    background: '#B91C1C', color: '#fff',
+    border: '2px solid #7F1D1D', borderRadius: 6,
+    fontSize: 12, fontWeight: 700, letterSpacing: 0.4,
+    textTransform: 'uppercase',
+    fontFamily: 'inherit',
+  },
   refusal: {
     padding: '6px 10px',
     background: '#FEF3C7', color: '#92400E',
     border: '1px solid #FDE68A', borderRadius: 4,
+    fontSize: 11, lineHeight: 1.4,
+  },
+  okBanner: {
+    padding: '6px 10px',
+    background: 'rgba(34,197,94,0.12)', color: '#166534',
+    border: '1px solid rgba(34,197,94,0.55)', borderRadius: 4,
     fontSize: 11, lineHeight: 1.4,
   },
 }

@@ -4658,6 +4658,229 @@ if FASTAPI_AVAILABLE:
         _publish_estun_jog(payload)
         return {"ok": True, "action": "hold"}
 
+    # ── TCP-preserving Face Down (coordinated joint orient) ─────────
+    # Wired 2026-09-09. The frontend's FaceDownButton computes a
+    # q_target via IK that preserves the TCP position and orients the
+    # flange approach to world -Y. This endpoint validates the SAME
+    # gates every real jog motion validates (E-STOP / zone-GREEN /
+    # connected / enabled / !alarm / allow_jog / !program-running)
+    # plus a server-side sanity guard on the requested step, then
+    # publishes a `mode:"coordinated_joint"` frame on
+    # /robot/orient_command for the driver-side handler.
+    #
+    # Rate cap: 10°/s per operator directive — server computes
+    # duration_ms from max per-joint angular delta so the driver's
+    # coordinated interpolator uses a bounded rate. No speed_pct.
+    #
+    # Immediate stop: the top-level E-STOP is always available and is
+    # the ultimate stop. This endpoint also honours a
+    # {"stop": true} body — publishes a release frame on the same
+    # topic so the driver knows to abort any in-flight coordinated
+    # motion.
+    #
+    # SAFETY: sim/logic verified in-session only — the FIRST REAL
+    # PRESS IS THE OPERATOR'S, slow, hand near E-STOP. See lesson
+    # entry cobot-face-down-real-arm-wire (add-55 §NN).
+    _FACE_DOWN_RATE_RAD_PER_S = 0.17453293   # 10°/s in rad
+    _FACE_DOWN_MIN_MS = 400
+    _FACE_DOWN_MAX_MS = 8000
+    _FACE_DOWN_TCP_DRIFT_BUDGET_M = 0.001    # 1 mm per directive
+    # Guard against IK returning a wildly different pose that would
+    # swing joints across the workspace: refuse if ANY joint's
+    # requested step exceeds 30°. The FaceDownButton client-side
+    # already refuses on TCP drift; this is a defence in depth.
+    _FACE_DOWN_MAX_JOINT_STEP_RAD = 30.0 * math.pi / 180.0
+
+    def _publish_orient_command(payload: dict) -> int:
+        """Publish a JSON frame on /robot/orient_command. Returns the
+        subscription count seen at publish time (0 = driver-side
+        handler not wired yet — endpoint returns
+        outcome='executor_not_wired_yet' upstream). RELIABLE QoS,
+        depth 5 — these are single infrequent commands like power,
+        not the 100 Hz jog stream."""
+        if _ros_node is None:
+            return -1
+        try:
+            if not hasattr(_ros_node, "_estun_orient_pub"):
+                _ros_node._estun_orient_pub = _ros_node.create_publisher(
+                    String, "/robot/orient_command", 5)
+            n = 0
+            try:
+                n = _ros_node._estun_orient_pub.get_subscription_count()
+            except Exception:
+                pass
+            m = String(); m.data = json.dumps(payload)
+            _ros_node._estun_orient_pub.publish(m)
+            return n
+        except Exception:
+            return -1
+
+    def _refuse_face_down(kind: str, reason: str, extra: dict | None = None,
+                            status: int = 400):
+        body = {
+            "ok": False,
+            "outcome": {
+                "kind": kind,
+                "reason_code": kind,
+                "reason": reason,
+            },
+        }
+        if extra:
+            body["outcome"].update(extra)
+        return JSONResponse(body, status_code=status)
+
+    @app.post("/api/estun/orient/face_down")
+    async def api_estun_orient_face_down(request: Request):
+        """TCP-preserving Face Down orient to the real arm. See the
+        block-comment above `_publish_orient_command` for the full
+        contract."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        # Immediate-stop path — always allowed, even mid-fault, so the
+        # operator can abort a mis-planned motion without racing an
+        # unrelated gate. Publishes a release frame on the same topic.
+        if body.get("stop") is True:
+            payload = {"mode": "coordinated_joint", "hold": False}
+            _publish_orient_command(payload)
+            return {"ok": True, "action": "stop"}
+
+        # ── Input-shape gate ────────────────────────────────────────
+        q_target = body.get("q_target")
+        if (not isinstance(q_target, list) or len(q_target) != 6
+                or not all(isinstance(v, (int, float))
+                            and math.isfinite(float(v)) for v in q_target)):
+            return _refuse_face_down(
+                "bad_input",
+                "q_target must be a list of 6 finite radians")
+        q_target = [float(v) for v in q_target]
+
+        # Optional inputs — validated only if present so the client
+        # can send a minimal request.
+        q_current_snapshot = body.get("q_current_snapshot")
+        if q_current_snapshot is not None:
+            if (not isinstance(q_current_snapshot, list)
+                    or len(q_current_snapshot) != 6
+                    or not all(isinstance(v, (int, float))
+                                and math.isfinite(float(v))
+                                for v in q_current_snapshot)):
+                return _refuse_face_down(
+                    "bad_input",
+                    "q_current_snapshot, when present, must be 6 finite radians")
+            q_current_snapshot = [float(v) for v in q_current_snapshot]
+        dry_run = bool(body.get("dry_run", False))
+
+        # ── Angular-step sanity guard (defence in depth) ────────────
+        # We refuse a Face Down whose worst per-joint step exceeds
+        # _FACE_DOWN_MAX_JOINT_STEP_RAD. Uses q_current_snapshot if
+        # provided; else falls back to STATE joints.
+        with _state_lock:
+            live_joints = list(STATE.get("joints", {}).get("positions",
+                                                            [0] * 6))
+        q_current = q_current_snapshot or live_joints
+        step_rad = [abs(q_target[i] - q_current[i]) for i in range(6)]
+        max_step = max(step_rad) if step_rad else 0.0
+        if max_step > _FACE_DOWN_MAX_JOINT_STEP_RAD:
+            return _refuse_face_down(
+                "step_too_large",
+                (f"worst per-joint step {math.degrees(max_step):.1f}° "
+                 f"exceeds 30° budget — IK returned a pose that would "
+                 f"swing joints across the workspace"),
+                extra={"max_step_deg": math.degrees(max_step),
+                       "step_deg": [math.degrees(s) for s in step_rad]})
+
+        # ── Duration cap: 10°/s ────────────────────────────────────
+        duration_s = max_step / _FACE_DOWN_RATE_RAD_PER_S if max_step > 0 else 0.0
+        duration_ms = max(_FACE_DOWN_MIN_MS,
+                            min(_FACE_DOWN_MAX_MS,
+                                int(duration_s * 1000)))
+
+        # ── Interlock gates (same order as jog / program-run) ──────
+        with _state_lock:
+            safety = STATE.get("safety", {}) or {}
+            robot  = STATE.get("robot",  {}) or {}
+        if safety.get("estop"):
+            return _refuse_face_down("estop_active",
+                "E-STOP is active — release before commanding motion",
+                status=409)
+        if safety.get("zone") != "GREEN":
+            return _refuse_face_down("zone_not_green",
+                f"Safety zone is {safety.get('zone')!r}, not GREEN",
+                status=409)
+        if not robot.get("connected"):
+            return _refuse_face_down("driver_disconnected",
+                "Estun driver is not connected", status=409)
+        # Wire authority: state_code==2 is authoritative per FACTS.md;
+        # boolean `enabled` is a legacy fallback for older builds.
+        state_code = robot.get("state_code")
+        is_enabled = (state_code == 2) if state_code is not None \
+                        else bool(robot.get("enabled"))
+        if not is_enabled:
+            return _refuse_face_down("not_enabled",
+                "Robot power is not enabled", status=409)
+        if robot.get("alarm"):
+            return _refuse_face_down("alarm_active",
+                "Alarm is active — clear it before commanding motion",
+                status=409)
+        if not robot.get("allow_jog"):
+            return _refuse_face_down("jog_gate_closed",
+                "Driver's allow_jog gate is closed", status=409)
+
+        # ── Program-arbiter — cannot orient during a run ───────────
+        _refused = _arbiter_refuse_run_if_jogging()   # jog session active
+        if _refused is not None:
+            return _refused
+        prog_running, prog_info = _arbiter_probe_program_running()
+        if prog_running:
+            return _refuse_face_down("program_running",
+                "A program is running — stop it before orient",
+                extra={"program": prog_info}, status=409)
+
+        # ── All gates passed. Compose the driver payload. ──────────
+        import uuid
+        req_id = uuid.uuid4().hex[:12]
+        payload = {
+            "mode":              "coordinated_joint",
+            "kind":              "face_down",
+            "q_target":          q_target,
+            "q_current_snapshot": q_current,
+            "rate_rad_per_s":    _FACE_DOWN_RATE_RAD_PER_S,
+            "duration_ms":       duration_ms,
+            "tcp_drift_budget_m": _FACE_DOWN_TCP_DRIFT_BUDGET_M,
+            "req_id":            req_id,
+            "hold":              True,
+        }
+
+        if dry_run:
+            return {"ok": True, "action": "dry_run",
+                    "req_id": req_id, "duration_ms": duration_ms,
+                    "q_target": q_target, "q_current": q_current,
+                    "max_step_deg": math.degrees(max_step)}
+
+        n_subs = _publish_orient_command(payload)
+        if n_subs == 0:
+            # Signal path lands, but driver-side subscriber is not up
+            # yet (F2-follow-up wire). Frontend renders this as a
+            # specific message so the operator knows WHY the real arm
+            # didn't move.
+            return _refuse_face_down(
+                "executor_not_wired_yet",
+                ("Face Down endpoint validated; no subscriber "
+                 "discovered on /robot/orient_command — the driver-"
+                 "side coordinated-orient handler is a follow-up "
+                 "wire. Twin preview still ran; real arm did not "
+                 "move."),
+                extra={"req_id": req_id,
+                       "duration_ms": duration_ms,
+                       "topic": "/robot/orient_command"},
+                status=503)
+
+        return {"ok": True, "action": "publish", "req_id": req_id,
+                "duration_ms": duration_ms,
+                "topic": "/robot/orient_command"}
+
     def _publish_estun_power(payload):
         """Publish a single frame on /robot/power_command. Reliable QoS,
         depth 5 — these are single infrequent commands, unlike jog which
