@@ -4980,9 +4980,15 @@ if FASTAPI_AVAILABLE:
                 "duration_ms": duration_ms,
                 "driver_subs": driver_subs,
                 "topic": "/robot/jog_command",
-                "next": ("Watch /estun/rejected for the driver's "
-                         "verdict on this req_id + the [MOTION-SINK] "
-                         "log at /opt/cobot/logs/estun_ws_*.jsonl.")}
+                "next": ("Driver's _on_coordinated_joint saves a "
+                         "Face Down Lua (setSpeedJ + movJ) and runs "
+                         "it via project/run. Watch [MOTION-SINK] "
+                         "in `journalctl -u roboai-estun` for the "
+                         "recv + publish log lines. Any failure "
+                         "surfaces on /estun/rejected with a named "
+                         "reason_code (bad_q_target, "
+                         "allow_move_closed, orient_save_fail, "
+                         "orient_run_fail).")}
 
     def _publish_estun_power(payload):
         """Publish a single frame on /robot/power_command. Reliable QoS,

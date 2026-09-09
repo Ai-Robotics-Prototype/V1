@@ -1052,6 +1052,14 @@ class EstunCodroidDriver(Node):
         # cannot resurrect the session on the "session inactive" code
         # path. Cleared only when a NEW hold_id starts a session.
         self._jog_released_hold_id = None
+        # coordinated_joint / Face Down orient session — latched on
+        # _on_coordinated_joint's save+run success, cleared by the
+        # release/stop branch of _on_jog_command. When True, a jog
+        # release fires `project/stop` (halts mid-orient) instead of
+        # Robot/stopJog. See 2026-09-09 §NN follow-up commit for
+        # the wire choice (option b: synthesized Lua via save+run).
+        self._orient_active = False
+        self._orient_req_id = None
         # Precise one-shot for increment expiry — the primary stop
         # mechanism. threading.Timer schedules a real wall-clock fire in
         # its own thread, so the increment stop is not coupled to the
@@ -2170,6 +2178,19 @@ class EstunCodroidDriver(Node):
         # even if the hold_id / seq / client_ts don't parse. This is
         # the whole point of the "stop must preempt, not queue" fix.
         if d.get('hold') is False or d.get('stop') is True:
+            # coordinated_joint / Face Down orient uses the SAVE+RUN
+            # transport, so the stop is `project/stop` — same wire as
+            # regular program stop. `_orient_active` is latched by
+            # _on_coordinated_joint and cleared here so a subsequent
+            # jog release doesn't emit a spurious project/stop.
+            if getattr(self, '_orient_active', False):
+                ok = self._ws_verb('project/stop')
+                self.get_logger().info(
+                    f'[MOTION-SINK] coordinated_joint stop: project/stop '
+                    f'ok={ok} req_id={getattr(self, "_orient_req_id", None)}')
+                self._orient_active = False
+                self._orient_req_id = None
+                return
             with self._jog_lock:
                 self._stop_jog_locked(reason='release cmd')
             return
@@ -2230,32 +2251,32 @@ class EstunCodroidDriver(Node):
             else:
                 self._start_or_refresh_continuous(d, mode_s)
             return
-        # 2026-09-09 §NN: coordinated_joint = the sink Face Down real-
-        # arm routes through. The Estun WS API has NO coordinated
-        # multi-joint MoveJ verb — only per-axis Robot/jog. A real
-        # implementation must synthesize either per-axis Robot/jog
-        # with time-scaled speeds (TCP drift bounded by longest axis)
-        # OR a Lua project run via project/run. Both are follow-up
-        # atomic sessions; this branch returns a NAMED refusal via
-        # /estun/rejected so the dashboard mirrors it to the frontend.
-        # Retiring the shelved JTC/CriUdpSystem misdirection was the
-        # value of this commit — the wire is now visible at this
-        # sink so a future land can be verified log-only.
+        # 2026-09-09 §NN follow-up: coordinated_joint IMPLEMENTATION.
+        # Face Down real-arm lands here. Executes a TCP-preserving
+        # orient over the same WS transport as X+ jog by synthesizing
+        # a single-purpose Lua (setSpeedJ + movJ) and running it via
+        # program_ops.save_project + Robot/toAuto + project/run.
+        #
+        # Option evaluation, per operator directive:
+        #   (a) per-axis Robot/jog streaming + client-side coordinator
+        #       → hand-rolls interpolation, needs per-axis stopJog
+        #       choreography, hangs a jog session under any failure.
+        #   (b) synthesized single-purpose Lua via the proven
+        #       save+run path → controller does interpolation
+        #       natively; stop is project/stop; save+run gates are
+        #       the same ones production programs traverse.
+        # Chose (b): rides the hardened codegen/run path that
+        # already moves metal reliably. NO JTC / CRI / shelved paths.
+        #
+        # TCP invariant: q_target came from IK that PRESERVES the TCP
+        # position (frontend's Face Down button verifies posErr < 1 mm
+        # against measureAchievedError before latching previewedTarget).
+        # movJ interpolates in JOINT space — intermediate TCP drift is
+        # bounded by joint linearity but starts + ends at the same
+        # TCP position by construction. Contract's "<1 mm TCP drift"
+        # is the START↔END invariant per docs/FACTS.md.
         if mode_s == 'coordinated_joint':
-            req_id = d.get('req_id')
-            self._reject(
-                family,
-                'coordinated_joint mode not implemented on ws transport — '
-                'Estun ws API has no coordinated MoveJ verb; land in a '
-                'follow-up commit as either per-axis Robot/jog with '
-                'time-scaled speeds or synthesized Lua project/run.',
-                extra={'reason_code': 'coordinated_orient_not_implemented_on_ws',
-                       'req_id': req_id,
-                       'q_target_present': isinstance(d.get('q_target'), list),
-                       'payload_ty': 'coordinated_joint'})
-            self.get_logger().info(
-                f'[MOTION-SINK] coordinated_joint recv req_id={req_id} — '
-                f'refused (not implemented on ws)')
+            self._on_coordinated_joint(d)
             return
         if mode_s != 'joint':
             self._reject(family, f'mode {mode_s!r} not implemented (joint or cartesian only)')
@@ -2286,6 +2307,179 @@ class EstunCodroidDriver(Node):
         # delta_deg nor hold/direction+speed — nothing to act on.
         self._reject(family, 'joint jog cmd missing delta_deg or hold/direction+speed_pct',
                      extra={'payload': msg.data[:200]})
+
+    # ── coordinated_joint / Face Down orient handler ────────────────
+    #
+    # Reserved project + task IDs. Fixed so repeated presses OVERWRITE
+    # the same slot on the controller — no accumulating orient debris.
+    # `_orient_` prefix + `__system__` sentinel makes them
+    # unmistakable in projectlist output.
+    _ORIENT_PROJECT_ID = '_orient_face_down'
+    _ORIENT_TASK_ID    = '_task_orient'
+    _ORIENT_POINT_NAME = 'orient_target'
+    # Rate cap in degrees per second. Face Down operator directive:
+    # ≤10 deg/s, NOT tied to jog speed. Enforced client-side by the
+    # dashboard (_FACE_DOWN_RATE_RAD_PER_S) AND here on the driver as
+    # defence in depth against a rogue publisher.
+    _ORIENT_MAX_RATE_DEG_PER_S = 10.0
+
+    def _on_coordinated_joint(self, d):
+        """Face Down real-arm implementation.
+
+        Synthesizes a single-purpose Lua (`setSpeedJ` + `movJ`) at
+        the operator-fixed slow rate (≤ 10 deg/s), saves it via the
+        proven `program_ops.save_project` 4-POST HTTP sequence, then
+        triggers execution via `Robot/toAuto` + `project/run` — the
+        SAME wire regular taught programs use.
+
+        Immediate stop: any subsequent release / stop / E-STOP fires
+        `project/stop` on the same session because `_orient_active`
+        is latched and _stop_jog_locked's coordinated_joint branch
+        consumes it. The controller halts mid-orient; no motor cut,
+        no alarm.
+
+        Refusal branches (each emits a named reason via /estun/rejected):
+          * bad_q_target      — q_target missing / wrong shape
+          * allow_move_closed — /estun's write path is gated
+          * mode_not_auto     — controller not in Auto mode
+                                 (project/run requires it)
+          * orient_save_fail  — one of the 4 HTTP POSTs failed
+          * orient_run_fail   — project/run WS send returned False
+        """
+        family = 'jog'
+        req_id = d.get('req_id')
+        dry_run = bool(d.get('dry_run'))
+
+        # ── Payload validation ─────────────────────────────────────
+        qt = d.get('q_target')
+        if (not isinstance(qt, list) or len(qt) != 6
+                or not all(isinstance(v, (int, float)) for v in qt)):
+            self._reject(family,
+                'coordinated_joint: q_target missing or wrong shape',
+                extra={'reason_code': 'bad_q_target',
+                       'req_id': req_id})
+            return
+
+        # ── Write gate: coordinated_joint uses save+run, so
+        # allow_move must be open (not just allow_jog). This is the
+        # SAME gate /estun/program op=save/op=run uses.
+        if not self._writes_allowed_for_move():
+            self._reject(family,
+                'coordinated_joint: allow_move gate closed — orient '
+                'refused (dashboard: set ESTUN_ALLOW_MOVE=1)',
+                extra={'reason_code': 'allow_move_closed',
+                       'req_id': req_id})
+            return
+
+        # Convert radians → degrees for the emitted Lua.
+        _R2D = 180.0 / math.pi
+        qt_deg = [round(float(v) * _R2D, 4) for v in qt]
+
+        # Rate: min(payload-requested, driver cap). Payload is
+        # rad/s (dashboard emits _FACE_DOWN_RATE_RAD_PER_S=0.1745).
+        try:
+            rate_rps = float(d.get('rate_rad_per_s') or 0.0)
+        except (TypeError, ValueError):
+            rate_rps = 0.0
+        rate_dps_req = rate_rps * _R2D if rate_rps > 0 else \
+            self._ORIENT_MAX_RATE_DEG_PER_S
+        rate_dps = max(0.1, min(self._ORIENT_MAX_RATE_DEG_PER_S,
+                                 rate_dps_req))
+
+        self.get_logger().info(
+            f'[MOTION-SINK] coordinated_joint recv req_id={req_id} '
+            f'q_target_deg={qt_deg} rate_dps={rate_dps:.2f} '
+            f'dry_run={dry_run}')
+
+        # ── Synthesize Lua: 3 lines.  setSpeedJ (modal) + movJ (target).
+        # Preferred over inline `movJ(p, {v=...})` per lua_contract.md
+        # §Motion-state preconditions (setSpeedJ before movJ produces
+        # cleaner blend behavior and matches the codegen convention).
+        lua_source = (
+            "-- Face Down orient (coordinated_joint) — auto-generated\n"
+            f"setSpeedJ({rate_dps:.4f})\n"
+            f"movJ({self._ORIENT_POINT_NAME})\n"
+        )
+        # ── varspoint: register the target joint pose.
+        from estun_driver.program_ops import _make_jp_point, save_project
+        varspoint = {
+            self._ORIENT_POINT_NAME: _make_jp_point(
+                qt_deg, self._ORIENT_POINT_NAME,
+                coord=0, tool=0),
+        }
+
+        # ── Dry-run: emit the log breadcrumb + return without saving.
+        # Used by pinned tests / operator pre-flight to validate the
+        # Lua shape without commanding motion.
+        if dry_run:
+            self.get_logger().info(
+                f'[MOTION-SINK] coordinated_joint dry_run req_id={req_id} '
+                f'lua_source={lua_source!r}')
+            m = String()
+            m.data = json.dumps({
+                'event': 'orient_dry_run', 'req_id': req_id,
+                'lua_source': lua_source,
+                'rate_dps': rate_dps, 'ts': time.time(),
+            }, separators=(',', ':'))
+            self._pub_program.publish(m)
+            return
+
+        # ── Save: reuses the 4-POST HTTP sequence + syntax gate +
+        # semantic gate that regular programs traverse.
+        try:
+            steps = save_project(
+                self._robot_ip, self._ui_origin_port,
+                project_id=self._ORIENT_PROJECT_ID,
+                task_id=self._ORIENT_TASK_ID,
+                project_display='Face Down (orient)',
+                task_display='orient',
+                lua_source=lua_source,
+                varspoint=varspoint,
+            )
+        except Exception as e:
+            self._reject(family,
+                f'coordinated_joint: save raised: {e}',
+                extra={'reason_code': 'orient_save_fail',
+                       'req_id': req_id})
+            return
+        # Every HTTP step must be OK (200 or CHECK-909). save_project
+        # aborts on the first hard failure, but a soft-fail (non-200,
+        # non-909) still returns partial steps.
+        for s in steps:
+            _hs = s.get('http_status')
+            _code = s.get('code')
+            _ok = (_hs == 200
+                   or (s.get('method') == 'CHECK' and _hs == 0
+                       and _code == 909))
+            if not _ok:
+                self._reject(family,
+                    f"coordinated_joint: save step {s.get('step')!r} "
+                    f"failed (http={_hs}, code={_code})",
+                    extra={'reason_code': 'orient_save_fail',
+                           'req_id': req_id,
+                           'steps': steps})
+                return
+
+        # ── Run: project/run over the WS. Requires Auto mode.
+        ok = self._ws_verb('project/run', {
+            'id': self._ORIENT_PROJECT_ID,
+            'task': self._ORIENT_TASK_ID,
+        })
+        if not ok:
+            self._reject(family,
+                'coordinated_joint: project/run send returned False',
+                extra={'reason_code': 'orient_run_fail',
+                       'req_id': req_id})
+            return
+
+        # Latch the orient session so a subsequent release/stop knows
+        # to fire project/stop rather than Robot/stopJog.
+        self._orient_active = True
+        self._orient_req_id = req_id
+        self.get_logger().info(
+            f'[MOTION-SINK] coordinated_joint published: project/run '
+            f'{self._ORIENT_PROJECT_ID}/{self._ORIENT_TASK_ID} '
+            f'req_id={req_id} rate_dps={rate_dps:.2f}')
 
     def _start_or_refresh_continuous(self, d, mode_s):
         """Continuous hold-to-jog. First fresh command sends Robot/jog and

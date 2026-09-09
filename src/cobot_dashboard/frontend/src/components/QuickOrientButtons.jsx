@@ -211,10 +211,34 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
             + ` (duration ${body.duration_ms} ms${drv})${nxt}` })
       } else if (body && body.outcome) {
         const outcome = body.outcome
+        // Plain-language rewrites for the known refusal kinds
+        // (snapshot_stale copy lesson: "no debug-speak"). Server's
+        // outcome.reason is the technical narrative — surfaced in
+        // the tooltip / debug pane, not the operator banner.
+        const OP_COPY = {
+          bad_input:          "The face-down target didn't reach the arm cleanly. Try Face Down again.",
+          step_too_large:     "That orientation would swing joints too far from the current pose. Reposition and retry.",
+          estop_active:       "E-STOP is active. Release the E-STOP button, then try Face Down again.",
+          zone_not_green:     "Safety zone isn't clear. Step away from the cell and try again.",
+          driver_disconnected: "The robot controller is offline. Check the arm connection and retry.",
+          not_enabled:        "The arm isn't enabled. Press Enable, then try Face Down.",
+          alarm_active:       "An alarm is active. Clear it, then try Face Down.",
+          jog_gate_closed:    "Manual jog is disabled on the controller. Enable jog and try again.",
+          program_running:    "A program is running. Stop it before commanding Face Down.",
+          no_live_joint_state: "The arm isn't reporting its pose yet. Wait a moment and try again.",
+          driver_not_discovered: "The estun driver isn't up yet. Wait a few seconds and retry.",
+          bad_q_target:       "The face-down target didn't reach the driver cleanly. Try Face Down again.",
+          allow_move_closed:  "The controller's motion write path is closed. Ask a supervisor to open it.",
+          orient_save_fail:   "The controller refused to save the face-down move. Try again; if it persists, the controller may need a restart.",
+          orient_run_fail:    "The controller accepted the face-down move but refused to run it. Check controller mode + alarms.",
+        }
         setRealArmStatus({
           ok: false,
           kind: outcome.kind || 'unknown',
-          message: outcome.reason || `Refused (HTTP ${resp.status})`,
+          message: OP_COPY[outcome.kind]
+                || outcome.reason
+                || `Refused (HTTP ${resp.status})`,
+          technicalDetail: outcome.reason,
         })
       } else {
         // Non-JSON error OR fully-empty body — synthesize a message
