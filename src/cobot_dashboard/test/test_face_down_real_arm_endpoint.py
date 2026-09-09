@@ -227,6 +227,44 @@ def test_step_guard_uses_live_state_never_client_input():
     assert _has_refusal(ep, 'no_live_joint_state')
 
 
+def test_stale_joint_state_gate_uses_last_posture_ts():
+    """2026-09-09 §NN stale-seed fix: hard freshness gate on the
+    driver's RobotPosture cache. If time.time() - last_posture_ts >
+    250 ms, refuse with kind='stale_joint_state' and plain-copy
+    operator message. RobotPosture push is ~17 Hz on this
+    controller (verified via WS log) — 250 ms = 4× period."""
+    ep = _endpoint_slice(_src())
+    assert '_POSTURE_MAX_AGE_S = 0.25' in ep
+    assert 'last_posture_ts' in ep
+    assert _has_refusal(ep, 'stale_joint_state')
+
+
+def test_tcp_fk_cross_check_against_live_joints():
+    """2026-09-09 §NN stale-seed fix: server FKs BOTH live_joints
+    AND client q_target and refuses if their TCP positions differ
+    by more than 5 mm. Client q_target was computed on the frontend
+    using the TWIN URDF as the IK seed; if the twin was stale
+    (mid-LERP or masked) q_target preserves the OLD TCP position,
+    not the CURRENT one. The server's fresh FK is the authority.
+    Reuses cobot_dashboard.trajectory_fk (same chain the run
+    analyzer uses)."""
+    ep = _endpoint_slice(_src())
+    assert 'from cobot_dashboard.trajectory_fk import get_chain' in ep
+    assert 'chain.fk_batch' in ep or '_chain.fk_batch' in ep
+    assert '_STALE_IK_TCP_TOL_MM = 5.0' in ep
+    assert _has_refusal(ep, 'stale_ik_seed')
+
+
+def test_last_posture_ts_mirrored_from_driver_status_blob():
+    """Dashboard's _on_estun_status handler must mirror the driver's
+    last_posture_ts field into STATE.robot so the freshness gate has
+    a value to check. Driver-side pin lives in the estun_driver
+    sink test suite."""
+    src = _src()
+    assert 'r["last_posture_ts"]' in src
+    assert 'd.get("last_posture_ts")' in src
+
+
 def test_payload_carries_live_joints_as_trajectory_anchor():
     """The eventual driver-side coordinated_joint handler uses
     q_current_live as its trajectory anchor. Sourced ONLY from

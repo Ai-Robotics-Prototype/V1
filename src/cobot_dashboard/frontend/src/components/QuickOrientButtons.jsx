@@ -82,6 +82,15 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
 
   const robot   = useStore((s) => s.robot) || {}
   const safety  = useStore((s) => s.safety) || {}
+  // Live joint state from the WS stream — the ONLY authoritative
+  // seed for IK. StandaloneRobot's twin URDF lags (25 Hz LERP with
+  // 0.3/tick converges asymptotically; 100+ ms to catch a rapid
+  // manual move) so using twin.joints as the IK seed reintroduces
+  // the stale-pose bug (2026-09-09 §NN operator report: Face Down
+  // levels at a PAST pose because the twin was mid-lerp when the
+  // press fired). The store slice is populated from
+  // publish/RobotPosture at controller rate (~17 Hz, <60 ms old).
+  const liveJointsRad = useStore((s) => s.joints?.positions) || []
   // Real-arm interlock: same conditions as JogControls' jogGateOk.
   // Twin path ignores these — the twin is always safe to animate.
   // Wire authority: state_code==2 is the numeric truth per FACTS.md;
@@ -104,6 +113,30 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
     if (!tool) {
       setRefusalMsg('twin not fully loaded — try again in a moment')
       return
+    }
+    // 2026-09-09 §NN stale-seed fix. Force-sync the twin URDF to
+    // the LIVE WS joint state RIGHT BEFORE IK. Bypasses jogApi.
+    // setJointsRad (which latches masks) — we call setJointValue on
+    // each URDFJoint directly so LIVE-FOLLOW keeps working after
+    // this press. This closes the class of bug where twin's LERP
+    // (StandaloneRobot line 275 useEffect) hadn't caught up to a
+    // rapid manual move, and IK computed q_target relative to a
+    // stale pose.
+    if (Array.isArray(liveJointsRad) && liveJointsRad.length >= 6) {
+      const JN = ['joint_1', 'joint_2', 'joint_3',
+                    'joint_4', 'joint_5', 'joint_6']
+      for (let i = 0; i < 6; i++) {
+        const v = Number(liveJointsRad[i])
+        if (!Number.isFinite(v)) continue
+        const j = armRobot?.joints?.[JN[i]]
+        if (j && typeof j.setJointValue === 'function') {
+          j.setJointValue(v)
+        }
+      }
+      // Touch scene matrixes so TCP FK samples off the freshly-
+      // written joint values (URDFLoader defers matrix update to
+      // the render loop; IK reads world matrices).
+      try { armRobot.updateMatrixWorld?.(true) } catch { /* nop */ }
     }
 
     // Snapshot current TCP pose + world approach direction.
@@ -233,6 +266,8 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
           orient_run_fail:    "The controller accepted the face-down move but refused to run it. Check controller mode + alarms.",
           orient_slot_malformed: "The controller stored the face-down move in the wrong place and can't run it. Report this to support — it's a driver-side bug guard, not an operator condition.",
           orient_verify_saved_fail: "The controller didn't respond when the driver checked the saved face-down move. Check the controller connection and try again.",
+          stale_joint_state: "Couldn't read the robot's current position — try again.",
+          stale_ik_seed:     "The arm moved after Face Down was pressed. Press it again to re-level from the current position.",
         }
         setRealArmStatus({
           ok: false,

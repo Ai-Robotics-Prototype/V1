@@ -5225,6 +5225,13 @@ class EstunCodroidDriver(Node):
             'allow_power':   self._allow_power,
             'joints_deg':    list(self._joint_deg),
             'joints_rad':    list(self._joint_rad),
+            # 2026-09-09 §NN stale-seed fix: expose the age of the
+            # RobotPosture cache so the dashboard's Face Down endpoint
+            # can enforce a hard max-age gate on the IK seed. Wall-
+            # clock timestamp of the most recent publish/RobotPosture
+            # frame the mirror captured; 0.0 while no posture has been
+            # received yet.
+            'last_posture_ts': self._last_posture_ts,
             # Cartesian-jog governor telemetry. sigma_min is None when
             # numpy isn't available (guard disabled — only the reactive
             # backstop remains). cart_scale is what the last supervise

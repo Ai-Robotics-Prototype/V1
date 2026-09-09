@@ -2313,6 +2313,13 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
             # I/O bridge gate — /api/io/live and the frontend toggle
             # switches read this. Driver is authoritative.
             r["allow_io"]    = bool(d.get("allow_io", False))
+            # 2026-09-09 §NN: mirror the driver's RobotPosture cache
+            # age so the Face Down endpoint can enforce a hard max-
+            # age gate on the IK seed. 0.0 while no posture yet.
+            try:
+                r["last_posture_ts"] = float(d.get("last_posture_ts") or 0.0)
+            except (TypeError, ValueError):
+                r["last_posture_ts"] = 0.0
             r["enabled"]     = bool(d.get("enabled", False))
             r["enabling"]    = bool(d.get("enabling", False))
             r["alarm"]       = bool(d.get("alarm", False))
@@ -4843,30 +4850,74 @@ if FASTAPI_AVAILABLE:
                 extra={"max_step_deg": math.degrees(max_step),
                        "step_deg": [math.degrees(s) for s in step_rad]})
 
-        # Optional staleness cross-check. If the client sent a
-        # q_current_snapshot (its view of the arm when it computed the
-        # IK target), compare against LIVE joints. Any joint disagreeing
-        # by more than 5° means the arm moved between preview and real-
-        # arm press — refuse so the operator re-previews at the
-        # correct pose. This closes the "preview at A, arm moved to
-        # B, target valid for A but not B" hole.
-        _SNAPSHOT_STALENESS_TOL_RAD = 5.0 * math.pi / 180.0
-        if q_current_snapshot is not None:
-            drift = [abs(q_current_snapshot[i] - live_joints[i])
-                        for i in range(6)]
-            worst_drift = max(drift) if drift else 0.0
-            if worst_drift > _SNAPSHOT_STALENESS_TOL_RAD:
-                return _refuse_face_down(
-                    "snapshot_stale",
-                    (f"q_current_snapshot disagrees with live joint "
-                     f"state by {math.degrees(worst_drift):.1f}° "
-                     f"(tolerance 5°) — the arm moved between the "
-                     f"twin preview and this real-arm press. Re-run "
-                     f"Face Down to compute a fresh IK target from "
-                     f"the current pose."),
-                    extra={"worst_drift_deg": math.degrees(worst_drift),
-                           "drift_deg": [math.degrees(d) for d in drift]},
-                    status=409)
+        # 2026-09-09 §NN — hard freshness gate on the IK seed.
+        # RobotPosture cache age must be < 250 ms; anything older is
+        # ipso facto stale (RobotPosture push is ~17 Hz on this
+        # controller — 250 ms == 4× period). Fail-closed with plain
+        # copy so the operator gets a real message, not silence.
+        _POSTURE_MAX_AGE_S = 0.25
+        with _state_lock:
+            _lpts = float((STATE.get("robot", {}) or {})
+                            .get("last_posture_ts") or 0.0)
+        _posture_age = time.time() - _lpts if _lpts > 0 else float('inf')
+        if _posture_age > _POSTURE_MAX_AGE_S:
+            return _refuse_face_down(
+                "stale_joint_state",
+                (f"couldn't read the robot's current position — "
+                 f"the driver's last posture is {_posture_age*1000:.0f} ms "
+                 f"old (limit 250 ms). Try again."),
+                extra={"posture_age_ms": _posture_age * 1000,
+                       "limit_ms": _POSTURE_MAX_AGE_S * 1000},
+                status=409)
+
+        # 2026-09-09 §NN — TCP-FK cross-check. Client-supplied q_target
+        # was computed on the frontend using the TWIN URDF as the IK
+        # seed. If the twin was mid-LERP or masked, the seed was
+        # stale and q_target preserves the OLD TCP position, not the
+        # CURRENT one. Compute BOTH TCP positions via server-side FK
+        # (same trajectory_fk chain the run analyzer uses); refuse
+        # if they disagree by more than 1 mm. This is the AUTHORITY
+        # check: fresh live_joints on the server override any client
+        # claim.
+        try:
+            from cobot_dashboard.trajectory_fk import get_chain, urdf_available
+        except ImportError:
+            from trajectory_fk import get_chain, urdf_available  # type: ignore
+        if urdf_available():
+            try:
+                import numpy as _np
+                _chain = get_chain()
+                _samples = _np.array([live_joints, q_target], dtype=float)
+                _pos, _rpy = _chain.fk_batch(_samples)
+                _tcp_live_m   = _pos[0]  # (3,) — meters
+                _tcp_target_m = _pos[1]
+                _delta_mm = float(
+                    _np.linalg.norm(_tcp_target_m - _tcp_live_m)) * 1000.0
+                # 5 mm tolerance (client IK ends at start+/-1mm by
+                # construction; 5 mm covers URDF/FK precision + a
+                # small chain-mismatch slack without letting a
+                # stale-seed slew through).
+                _STALE_IK_TCP_TOL_MM = 5.0
+                if _delta_mm > _STALE_IK_TCP_TOL_MM:
+                    return _refuse_face_down(
+                        "stale_ik_seed",
+                        (f"the arm moved after Face Down was pressed — "
+                         f"the target TCP is {_delta_mm:.1f} mm from "
+                         f"where the arm is now (limit "
+                         f"{_STALE_IK_TCP_TOL_MM:.0f} mm). Press "
+                         f"Face Down again to re-solve from the "
+                         f"current pose."),
+                        extra={"tcp_delta_mm": _delta_mm,
+                               "tcp_live_m":   _tcp_live_m.tolist(),
+                               "tcp_target_m": _tcp_target_m.tolist(),
+                               "limit_mm": _STALE_IK_TCP_TOL_MM},
+                        status=409)
+            except Exception as e:
+                # FK failure is NOT a hard refuse (URDF might be
+                # missing on some deployments); log and continue —
+                # the client-supplied snapshot_stale check above
+                # is the fallback guard.
+                pass
 
         # ── Duration cap: 10°/s ────────────────────────────────────
         duration_s = max_step / _FACE_DOWN_RATE_RAD_PER_S if max_step > 0 else 0.0

@@ -316,6 +316,15 @@ def test_send_wraps_motion_verbs_with_motion_sink_log():
     assert '[MOTION-SINK] tx' in body
 
 
+def test_status_blob_exposes_last_posture_ts():
+    """2026-09-09 §NN stale-seed fix: the driver's _publish_status_
+    blob MUST include the RobotPosture cache age so the dashboard's
+    Face Down endpoint can enforce a hard max-age gate on the IK
+    seed. Fail-safe when no posture yet (0.0)."""
+    src = _src()
+    assert "'last_posture_ts': self._last_posture_ts" in src
+
+
 def test_no_silent_return_on_send():
     """_send must return True/False on completion — never raise
     silently or drop a motion frame without a log. Regression fence."""
