@@ -545,7 +545,23 @@ class EstunCodroidDriver(Node):
         # observe-only: they populate cart_softening for the
         # dashboard toast but neither stop nor scale the WS verb.
         # See ledger addendum-50 for the parity rationale.
-        self.declare_parameter('wsjog_trust_firmware_clamps', True)
+        #
+        # 2026-09-09 §NN — DEFAULT FLIPPED True → False after a J3
+        # snap through an elbow-extension singularity during a
+        # Cartesian Z jog. Firmware alarm 2015 fired AFTER the
+        # commanded J3 velocity reached 3.1 rad/s (~178°/s); it
+        # did NOT scale approaching. Driver had the evidence
+        # (`joint-overspeed observe J3: dq=+7.47 rad/s (cap 1.50)
+        # (firmware clamps)` at 13:58:36, then dq=+3.95, then
+        # dq=-6.06 at 13:58:39 — each observation was passive
+        # because this flag was True). Re-enabling ENFORCE means:
+        #   * cart_limit_at_wall / cart_limit_deepening → stopJog
+        #   * joint_limit_soft / joint_overspeed → scale via
+        #     _apply_cart_speed_scale_locked
+        #   * singularity_guard (σ_min ≤ hard) → stopJog
+        # WSJOG_TRUST_FIRMWARE_CLAMPS=1 env override remains for
+        # regression-test / bench-debug.
+        self.declare_parameter('wsjog_trust_firmware_clamps', False)
 
         # Cadence knobs.
         self.declare_parameter('recv_timeout_s', 5.0)   # matches posture.py
@@ -2382,6 +2398,30 @@ class EstunCodroidDriver(Node):
                 extra={'reason_code': 'allow_move_closed',
                        'req_id': req_id})
             return
+
+        # ── Shared singularity guard (2026-09-09 §NN, incident+2015)
+        # Face Down runs a coordinated joint move via movJ — even
+        # though movJ interpolates in joint-space (not through IK),
+        # STARTING near a singular pose and moving even a little
+        # can still amplify per-joint velocities catastrophically
+        # depending on the wrist state. Refuse at the SAME σ_min
+        # hard threshold the Cartesian jog governor enforces so
+        # every Cartesian-solving path (jog + orient) shares one
+        # guard. Reason plainly-named + rendered on the frontend.
+        if self._last_posture_ts > 0.0:
+            _sigma_now = self._sing_guard.sigma_min(self._joint_deg)
+            if (_sigma_now is not None
+                    and _sigma_now <= self._cart_sigma_hard):
+                self._reject(family,
+                    (f'coordinated_joint: too close to a stretched-'
+                     f'out pose (σ_min={_sigma_now:.4f} ≤ hard='
+                     f'{self._cart_sigma_hard:.3f}). Use joint jog '
+                     f'to move away first, then retry Face Down.'),
+                    extra={'reason_code': 'orient_near_singularity',
+                           'req_id':      req_id,
+                           'sigma_min':   _sigma_now,
+                           'sigma_hard':  self._cart_sigma_hard})
+                return
 
         # Convert radians → degrees for the emitted Lua.
         _R2D = 180.0 / math.pi

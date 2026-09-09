@@ -134,11 +134,33 @@ export function LiveMarginHUD({ robot }) {
     >
       {soft ? (
         <div style={{ fontWeight: 600 }}>
-          Slowing down — J{soft.limiting_joint_1based} approaching its limit
-          {Number.isFinite(soft.headroom_deg)
-            ? ` (${soft.headroom_deg.toFixed(1)}° to safe edge)`
-            : ''}
-          .
+          {/* 2026-09-09 §NN singularity governor — plain-language
+              copy per operator directive item 4. Every `cause` the
+              driver emits gets its own rewrite; unknown causes fall
+              through to the legacy joint-limit line so a new sink
+              still renders something readable. */}
+          {(() => {
+            const cause = String(soft.cause || '')
+            const j = soft.limiting_joint_1based
+            if (cause === 'singularity_guard') {
+              return 'Slowing down — arm approaching a stretched-out pose.'
+            }
+            if (cause === 'joint_overspeed' && j) {
+              return `Slowing down — J${j} would move faster than its safe rate.`
+            }
+            if (cause === 'cart_limit_at_wall' && j) {
+              return `Stopping — J${j} is at its physical limit.`
+            }
+            if (cause === 'cart_limit_deepening' && j) {
+              return `Stopping — J${j} would push past its safe edge.`
+            }
+            // Legacy joint_limit_soft (and unknown causes) — keep the
+            // existing copy so nothing regresses.
+            const headroomTail = Number.isFinite(soft.headroom_deg)
+              ? ` (${soft.headroom_deg.toFixed(1)}° to safe edge)`
+              : ''
+            return `Slowing down — J${j || '?'} approaching its limit${headroomTail}.`
+          })()}
         </div>
       ) : null}
       {approaching.map((r) => (

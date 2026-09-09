@@ -268,6 +268,7 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
           orient_verify_saved_fail: "The controller didn't respond when the driver checked the saved face-down move. Check the controller connection and try again.",
           stale_joint_state: "Couldn't read the robot's current position — try again.",
           stale_ik_seed:     "The arm moved after Face Down was pressed. Press it again to re-level from the current position.",
+          orient_near_singularity: "Too close to a stretched-out pose. Use joint jog to move away from the extension, then try Face Down again.",
         }
         setRealArmStatus({
           ok: false,
