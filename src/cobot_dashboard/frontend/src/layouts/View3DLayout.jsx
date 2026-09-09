@@ -59,6 +59,12 @@ function RealArmChrome({ mode, setMode, children }) {
       // 440 px NORMAL preserves the Program tab's JOG_MIN_HEIGHT (360)
       // budget after the compact chip header (~34 px w/ borders).
       height: isExpanded ? '100%' : 440,
+      // flexShrink:0 so on tablet-height viewports the whole surface
+      // never gets squeezed by the flex parent — the twin viewer above
+      // shrinks first. Prior default (flex-shrink:1) let the chrome
+      // shrink below 440 on some tablet aspects, which is what pushed
+      // the LEFT column's XYZ button up into the header band.
+      flexShrink: 0,
     }}>
       <div style={{
         padding: '5px 8px',
@@ -66,6 +72,11 @@ function RealArmChrome({ mode, setMode, children }) {
         justifyContent: 'space-between',
         gap: 8,
         flexShrink: 0,
+        // Header owns 44px minimum so it can never collapse below its
+        // control heights even if a parent under-allocates space at a
+        // narrow tablet width — the DISABLE/READY row is the anchor
+        // controls below flow from.
+        minHeight: 44,
         background: 'var(--bg-panel)',
         borderBottom: '1px solid var(--border)',
       }}>
@@ -218,7 +229,12 @@ export default function View3DLayout() {
             </ArmViewer3D>
             {cartMode && ikAtLimit && (
               <div style={{
-                position: 'absolute', top: 8, right: 8, zIndex: 20,
+                // JointJogPanel occupies the top-right corner (top:8
+                // right:8 width:300 zIndex:11). Drop the AT-LIMIT chip
+                // beneath the panel so it doesn't collide with the
+                // panel's header at tablet widths where the panel
+                // reaches the top edge.
+                position: 'absolute', top: 8, right: 316, zIndex: 20,
                 padding: '4px 10px', borderRadius: 4,
                 background: '#DC2626', color: '#fff',
                 fontSize: 12, fontFamily: 'var(--font-mono, monospace)',
@@ -303,7 +319,11 @@ function MinClearanceReadout() {
     .replace(/^zone#/, 'zone:')
   return (
     <div style={{
-      position: 'absolute', top: 8, left: 8, zIndex: 20,
+      // ArmViewer3D owns the top-left corner (view-switcher pills +
+      // reach-dome toggle) — drop the clearance chip below that row so
+      // the two never overlap when the guard band trips. Row is ~28px
+      // tall (padding + font), so top:44 keeps a small gap.
+      position: 'absolute', top: 44, left: 8, zIndex: 20,
       padding: '4px 10px', borderRadius: 4,
       background: bg, color: '#fff',
       fontSize: 12, fontFamily: 'var(--font-mono, monospace)',

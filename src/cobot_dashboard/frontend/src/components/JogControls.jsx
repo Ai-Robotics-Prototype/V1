@@ -907,7 +907,18 @@ export default function JogControls({ maximized = false }) {
       <div style={{
         display: 'flex', flexDirection: 'column', gap: 10,
         width: leftColW, flexShrink: 0,
-        alignSelf: 'stretch', justifyContent: 'center',
+        alignSelf: 'stretch',
+        // justifyContent:flex-start (not center) so the XYZ button
+        // sits directly under the surface's DISABLE/READY header band
+        // at every viewport width. With justifyContent:center, any
+        // time the column's stacked controls exceeded the available
+        // height (short landscape tablet ~440-header-banners), the
+        // centering pushed the top of the stack above the row's
+        // scrollable top edge — the XYZ button then rendered partly
+        // under the header banner. Anchor to the top instead so
+        // overflow spills at the bottom where the row's overflow-y:auto
+        // can scroll to reach it.
+        justifyContent: 'flex-start',
       }}>
         <div style={{ fontSize: maximized ? 16 : 14, fontWeight: 700, color: '#111' }}>Jog</div>
 
