@@ -200,10 +200,10 @@ def test_endpoint_publishes_two_point_trajectory_to_live_jtc():
     Publish contract:
       * joint_names = ('joint_1' .. 'joint_6') — matches the s10_140
         controllers.yaml order.
-      * Two JointTrajectoryPoints: p0 at q_current with time_from_start
-        = 0, p1 at q_target with time_from_start = duration_ms. JTC
-        interpolates between the two at the server-computed
-        rate-capped duration.
+      * Two JointTrajectoryPoints: p0 at q_current_live with
+        time_from_start = 0, p1 at q_target with time_from_start =
+        duration_ms. JTC interpolates between the two at the server-
+        computed rate-capped duration.
       * Direct topic publish (not the FollowJointTrajectory ACTION):
         async goal-handles from a FastAPI request path are awkward
         and the JTC's own limits + preemption are enough.
@@ -220,6 +220,63 @@ def test_endpoint_publishes_two_point_trajectory_to_live_jtc():
     assert 'p0.positions = [float(v) for v in q_current]' in src
     assert 'p1.positions = [float(v) for v in q_target]' in src
     assert 'p0.time_from_start = _DurationMsg(sec=0, nanosec=0)' in src
+
+
+def test_p0_anchor_is_server_live_state_never_client_input():
+    """SAFETY-CRITICAL: the JTC trajectory anchor p0 (t=0) MUST
+    come from the LIVE joint state on the server, NEVER from the
+    client's q_current_snapshot. A client that lies about its
+    current pose (or is stale) would otherwise cause the JTC to
+    teleport-interpolate from a bogus anchor to the target in
+    duration_ms — effectively a fast slew.
+
+    Regression source (2026-09-09 §NN): initial land used client's
+    q_current_snapshot as p0. A curl test with snapshot=[0]*6 and
+    target=[0]*6 (delta 0, step guard passed) command-fired a slew
+    from the ACTUAL live pose to zeros in 400 ms. Fixed by:
+      1. Endpoint reads live_joints from STATE unconditionally.
+      2. Payload carries q_current_live (from live_joints).
+      3. _publish_orient_command reads q_current_live for p0.
+      4. Step guard runs against live_joints, not client body.
+      5. Optional q_current_snapshot cross-checks staleness only.
+    """
+    src = _src()
+    # Payload carries q_current_live sourced from live_joints.
+    assert '"q_current_live":    live_joints' in src
+    # Publisher reads q_current_live (NOT q_current_snapshot).
+    assert 'q_current = payload.get("q_current_live") or []' in src
+    # The old bug pattern (using client's q_current_snapshot as p0)
+    # must not return. Pin that the publisher does NOT read the
+    # snapshot for the trajectory anchor.
+    assert 'payload.get("q_current_snapshot")' not in src.split(
+        'def _publish_orient_command')[1].split('def _refuse_face_down')[0], (
+        "publisher must not use client's q_current_snapshot as the "
+        "JTC anchor — that reintroduces the teleport risk")
+
+
+def test_step_guard_uses_live_state_never_client_input():
+    """The 30° step guard MUST compute against live_joints. Prior
+    code allowed the client to bypass by sending a
+    q_current_snapshot matching q_target (delta 0 → passes). Fix:
+    step is always live_joints → q_target."""
+    ep = _endpoint_slice(_src())
+    # Step computation reads live_joints.
+    assert 'step_rad = [abs(q_target[i] - live_joints[i]) for i in range(6)]' in ep
+    # Refuses when no live state available (fail closed).
+    assert _has_refusal(ep, 'no_live_joint_state')
+
+
+def test_snapshot_staleness_cross_check():
+    """When the client sends q_current_snapshot, compare it to live
+    joints. Any joint disagreeing by >5° means the arm moved between
+    twin preview and real-arm press — refuse with kind='snapshot_stale'
+    so the operator re-runs Face Down at the current pose. This
+    closes the 'preview at A, arm moved to B, target valid for A but
+    not for B' hole."""
+    ep = _endpoint_slice(_src())
+    assert '_SNAPSHOT_STALENESS_TOL_RAD = 5.0 * math.pi / 180.0' in ep
+    assert 'if q_current_snapshot is not None:' in ep
+    assert _has_refusal(ep, 'snapshot_stale')
 
 
 def test_endpoint_refuses_when_jtc_not_discovered():

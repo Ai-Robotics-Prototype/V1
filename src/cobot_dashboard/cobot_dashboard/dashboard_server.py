@@ -4745,7 +4745,13 @@ if FASTAPI_AVAILABLE:
         # (2) Real motion command on the JTC topic. Skipped if we're
         # missing required fields — the observability breadcrumb has
         # still gone out so a caller can see what came in.
-        q_current = payload.get("q_current_snapshot") or []
+        # SAFETY: p0 comes from `q_current_live` — the server-side
+        # LIVE joint state at gate-check time. NEVER from
+        # q_current_snapshot (which is client input, only used for
+        # the staleness cross-check upstream). Prior code let the
+        # client control p0 → JTC teleport risk if the client lied
+        # or was stale. (2026-09-09 §NN safety pass.)
+        q_current = payload.get("q_current_live") or []
         q_target  = payload.get("q_target") or []
         duration_ms = int(payload.get("duration_ms") or 0)
         if (len(q_current) == 6 and len(q_target) == 6 and duration_ms > 0):
@@ -4856,13 +4862,22 @@ if FASTAPI_AVAILABLE:
 
         # ── Angular-step sanity guard (defence in depth) ────────────
         # We refuse a Face Down whose worst per-joint step exceeds
-        # _FACE_DOWN_MAX_JOINT_STEP_RAD. Uses q_current_snapshot if
-        # provided; else falls back to STATE joints.
+        # _FACE_DOWN_MAX_JOINT_STEP_RAD. ALWAYS uses the LIVE joint
+        # state as the authority — the client's q_current_snapshot
+        # is used ONLY for a staleness cross-check below (never as
+        # the step-guard input, never as the JTC trajectory anchor).
+        # Prior code let the client bypass the guard by lying about
+        # its current pose (2026-09-09 §NN safety pass).
         with _state_lock:
             live_joints = list(STATE.get("joints", {}).get("positions",
                                                             [0] * 6))
-        q_current = q_current_snapshot or live_joints
-        step_rad = [abs(q_target[i] - q_current[i]) for i in range(6)]
+        if len(live_joints) < 6:
+            return _refuse_face_down(
+                "no_live_joint_state",
+                "server has no live joint state — cannot compute a "
+                "trajectory anchor. Wait for /joint_states to publish "
+                "then retry.", status=503)
+        step_rad = [abs(q_target[i] - live_joints[i]) for i in range(6)]
         max_step = max(step_rad) if step_rad else 0.0
         if max_step > _FACE_DOWN_MAX_JOINT_STEP_RAD:
             return _refuse_face_down(
@@ -4872,6 +4887,31 @@ if FASTAPI_AVAILABLE:
                  f"swing joints across the workspace"),
                 extra={"max_step_deg": math.degrees(max_step),
                        "step_deg": [math.degrees(s) for s in step_rad]})
+
+        # Optional staleness cross-check. If the client sent a
+        # q_current_snapshot (its view of the arm when it computed the
+        # IK target), compare against LIVE joints. Any joint disagreeing
+        # by more than 5° means the arm moved between preview and real-
+        # arm press — refuse so the operator re-previews at the
+        # correct pose. This closes the "preview at A, arm moved to
+        # B, target valid for A but not B" hole.
+        _SNAPSHOT_STALENESS_TOL_RAD = 5.0 * math.pi / 180.0
+        if q_current_snapshot is not None:
+            drift = [abs(q_current_snapshot[i] - live_joints[i])
+                        for i in range(6)]
+            worst_drift = max(drift) if drift else 0.0
+            if worst_drift > _SNAPSHOT_STALENESS_TOL_RAD:
+                return _refuse_face_down(
+                    "snapshot_stale",
+                    (f"q_current_snapshot disagrees with live joint "
+                     f"state by {math.degrees(worst_drift):.1f}° "
+                     f"(tolerance 5°) — the arm moved between the "
+                     f"twin preview and this real-arm press. Re-run "
+                     f"Face Down to compute a fresh IK target from "
+                     f"the current pose."),
+                    extra={"worst_drift_deg": math.degrees(worst_drift),
+                           "drift_deg": [math.degrees(d) for d in drift]},
+                    status=409)
 
         # ── Duration cap: 10°/s ────────────────────────────────────
         duration_s = max_step / _FACE_DOWN_RATE_RAD_PER_S if max_step > 0 else 0.0
@@ -4921,13 +4961,20 @@ if FASTAPI_AVAILABLE:
                 extra={"program": prog_info}, status=409)
 
         # ── All gates passed. Compose the driver payload. ──────────
+        # `q_current_live` is the JTC trajectory anchor (p0 at t=0)
+        # and comes ONLY from live_joints — NEVER from the client.
+        # This is the safety-critical field; if it were client-supplied
+        # a lying / stale client could make the JTC teleport-interpolate
+        # from a bogus anchor to the target in duration_ms, effectively
+        # a fast slew. (2026-09-09 §NN safety pass caught + fixed.)
         import uuid
         req_id = uuid.uuid4().hex[:12]
         payload = {
             "mode":              "coordinated_joint",
             "kind":              "face_down",
             "q_target":          q_target,
-            "q_current_snapshot": q_current,
+            "q_current_live":    live_joints,
+            "q_current_snapshot": q_current_snapshot,   # None if omitted
             "rate_rad_per_s":    _FACE_DOWN_RATE_RAD_PER_S,
             "duration_ms":       duration_ms,
             "tcp_drift_budget_m": _FACE_DOWN_TCP_DRIFT_BUDGET_M,
