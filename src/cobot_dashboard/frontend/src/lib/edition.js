@@ -68,6 +68,16 @@ export const FEATURE_MAP = Object.freeze({
   // /api/lidar_objects/* endpoints). LiDAR services stay
   // running on both editions.
   lidar:              EDITION_FULL,
+  // 2026-09-09 SCAN removal: gate operator-facing scan controls.
+  // Basic renders zero scan surfaces (ProgramEditor's Scan step-
+  // picker group + detect/scan_workspace/scan_identify_each/
+  // sort_scanned/remove_defects palette actions, MonitorDashboard's
+  // Scan Results card). Program EXECUTION untouched — an existing
+  // program with detect/scan steps still loads and runs on basic
+  // (codegen invariants + executor dispatch are edition-
+  // independent). No new backend gates: scan-only backends are
+  // already gated behind part_recognition / cameras_lidar.
+  scan:               EDITION_FULL,
 })
 
 // Load-time validation mirroring backend's _validate_map.

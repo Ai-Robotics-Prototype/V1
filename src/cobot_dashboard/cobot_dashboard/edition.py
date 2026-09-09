@@ -110,6 +110,26 @@ FEATURE_MAP: dict = {
     #     logic that consumes /api/lidar_objects/* on a full
     #     device continues to work.
     'lidar':              EDITION_FULL,
+    # 2026-09-09 SCAN removal directive:
+    #   * `scan` gates operator-facing SCAN CONTROLS anywhere
+    #     that's basic-visible today. BASIC renders zero scan
+    #     surfaces (ProgramEditor's Scan step-picker group +
+    #     detect/scan_workspace/scan_identify_each/sort_scanned/
+    #     remove_defects palette actions, MonitorDashboard's Scan
+    #     Results card). FULL keeps everything.
+    #   * Program EXECUTION is NOT touched: an existing program
+    #     whose steps use detection still runs identically on a
+    #     basic device. Codegen invariants + executor dispatch are
+    #     edition-independent. This key is a VISIBILITY gate for
+    #     controls that OFFER scan actions to the operator, not a
+    #     shutdown of the underlying detection service.
+    #   * Backend endpoints that exist purely for scan are already
+    #     gated behind `part_recognition` (/api/parts/{id}/scan/*,
+    #     /api/detections, /api/openvocab) and `cameras_lidar`
+    #     (/api/motioncam/*). This key adds no NEW backend gates;
+    #     the frontend-only scan surfaces have no dedicated backend
+    #     endpoints that only they consume.
+    'scan':               EDITION_FULL,
 }
 
 

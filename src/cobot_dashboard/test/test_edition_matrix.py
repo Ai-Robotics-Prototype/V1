@@ -72,19 +72,22 @@ def test_basic_set_exact():
     }
 
 
-def test_full_set_is_exactly_the_seven_full_only_keys():
+def test_full_set_is_exactly_the_eight_full_only_keys():
     """Full-only keys: cameras_lidar, part_recognition, safety_page
     (Sensors / Part Recognition / Safety tabs) + configure + the
     cell_commissioning backend gate + guard_visibility (footer
     'Guards OFF' text) + lidar (2026-09-08 removal — Monitor's
     Objects Detected stat + IdentifiedObjectsCard + backend
-    /api/lidar_objects/* + /api/lidar_workspace_mask*). Any
+    /api/lidar_objects/* + /api/lidar_workspace_mask*) + scan
+    (2026-09-09 removal — ProgramEditor's Scan step-picker group
+    + detect palette action + MonitorDashboard Scan Results card;
+    scan-only backends stay gated behind part_recognition). Any
     future promo of a key here trips a review at CI."""
     full = {k for k, v in edition_mod.FEATURE_MAP.items() if v == 'full'}
     assert full == {
         'cameras_lidar', 'part_recognition', 'safety_page',
         'configure', 'cell_commissioning', 'guard_visibility',
-        'lidar',
+        'lidar', 'scan',
     }
 
 

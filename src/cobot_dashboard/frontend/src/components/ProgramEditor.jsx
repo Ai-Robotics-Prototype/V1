@@ -18,6 +18,7 @@ import { isStepTaught, untaughtStepIds, hasFullTaughtPose, verbForStep,
          palletFrameStatus, firstUntaughtPalletRole, PALLET_ROLE_ORDER,
          TEACHABLE_ACTIONS, isTeachable, isDerivedOffsetMove }
   from '../lib/programTruth'
+import { isFeatureEnabled } from '../lib/edition'
 import { PALLET_ROLE_TO_FIELD, modeForRole, taughtCount,
          backFrom, advanceFrom, jumpTo }
   from '../lib/palletTeachSequence'
@@ -3857,8 +3858,40 @@ function ProgramFindingsPanel({ program, onAction }) {
   )
 }
 
+// SCAN_ACTIONS — the operator-facing scan/detect step actions gated
+// behind the 'scan' feature key on basic devices (add-XX 2026-09-09).
+// Basic hides these from the "+ Add Step" palette so operators can't
+// author new detect/scan steps; existing programs whose steps use
+// them still load + render + run identically (codegen invariants +
+// executor dispatch are edition-independent — this is a visibility
+// gate on the authoring surface, never on execution).
+const SCAN_ACTIONS = new Set([
+  'detect',
+  'scan_workspace',
+  'scan_identify_each',
+  'sort_scanned',
+  'remove_defects',
+])
+
+// Filter STEP_CATEGORIES for the "+ Add Step" palette on a basic
+// device. Removes the entire 'Scan' category, and prunes 'detect'
+// from the 'Control' category. If a category empties, it drops out.
+function filterCategoriesForEdition(categories, edition) {
+  if (isFeatureEnabled('scan', edition)) return categories
+  return categories
+    .map((cat) => ({
+      ...cat,
+      actions: (cat.actions || []).filter((a) => !SCAN_ACTIONS.has(a.action)),
+    }))
+    .filter((cat) => cat.actions.length > 0)
+}
+
 export default function ProgramEditor() {
   const currentProgram     = useStore((s) => s.currentProgram)
+  // Edition gate for the "+ Add Step" palette's scan surfaces. Read
+  // once per render; the palette re-renders naturally when edition
+  // hydrates from /api/edition.
+  const edition            = useStore((s) => s.edition)
   const setCurrentProgram  = useStore((s) => s.setCurrentProgram)
   // Cross-client sync trust (D10 in the Program Doctrine). When
   // false: WS is down or reconnect refetch is still pending; the
@@ -6523,7 +6556,7 @@ export default function ProgramEditor() {
                 style={{ background: 'none', border: 'none', cursor: 'pointer',
                          fontSize: 16, color: '#9ca3af', padding: '2px 6px' }}>✕</button>
             </div>
-            {STEP_CATEGORIES.map((cat) => (
+            {filterCategoriesForEdition(STEP_CATEGORIES, edition).map((cat) => (
               <div key={cat.name} style={{ marginBottom: 12 }}>
                 <div style={{
                   fontSize: 11, fontWeight: 600, color: '#6b7280',

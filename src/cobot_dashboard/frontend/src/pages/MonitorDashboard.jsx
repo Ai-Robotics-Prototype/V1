@@ -732,6 +732,13 @@ export default function MonitorDashboard() {
   // (see _EDITION_FULL_ONLY_PATTERNS entries for lidar_objects and
   // lidar_workspace_mask).
   const lidarVisible       = isFeatureEnabled('lidar', edition)
+  // 2026-09-09 SCAN removal: the "Scan Results" card renders task
+  // state (scan_results / scan_count / identified_count) surfaced by
+  // the executor mid-scan-program. Basic hides the card entirely
+  // even when task state carries scan_* fields — the program still
+  // runs (executor + codegen are edition-independent), the operator
+  // just doesn't see live scan-result cards on basic.
+  const scanVisible        = isFeatureEnabled('scan', edition)
   const setTab             = useStore((s) => s.setTab)
   const addToast           = useStore((s) => s.addToast)
 
@@ -1281,8 +1288,12 @@ export default function MonitorDashboard() {
 
       {/* Scan & Identify results — only visible while a scan program
           is running (or has just finished). The executor publishes
-          scan_results / scan_count / identified_count on /task/state. */}
-      {(task?.scan_results?.length > 0 || task?.scan_count > 0) && (
+          scan_results / scan_count / identified_count on /task/state.
+          2026-09-09: gated behind the `scan` feature key so basic
+          devices don't render the card. Program still runs unchanged;
+          executor still publishes the fields on /task/state. */}
+      {scanVisible
+        && (task?.scan_results?.length > 0 || task?.scan_count > 0) && (
         <div style={{
           background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb',
           padding: 20, marginBottom: 24,
