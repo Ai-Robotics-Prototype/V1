@@ -231,6 +231,8 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
           allow_move_closed:  "The controller's motion write path is closed. Ask a supervisor to open it.",
           orient_save_fail:   "The controller refused to save the face-down move. Try again; if it persists, the controller may need a restart.",
           orient_run_fail:    "The controller accepted the face-down move but refused to run it. Check controller mode + alarms.",
+          orient_slot_malformed: "The controller stored the face-down move in the wrong place and can't run it. Report this to support — it's a driver-side bug guard, not an operator condition.",
+          orient_verify_saved_fail: "The controller didn't respond when the driver checked the saved face-down move. Check the controller connection and try again.",
         }
         setRealArmStatus({
           ok: false,

@@ -115,6 +115,82 @@ def test_orient_handler_reuses_save_project_pipeline():
     assert '_ORIENT_TASK_ID' in body
 
 
+def test_orient_slot_names_have_no_underscore_class_hazards():
+    """2026-09-09 §NN alarm-10001 trace: the controller SPLITS
+    underscores in project_id as PATH SEPARATORS during HTTP save.
+    The prior `_orient_face_down` / `_task_orient` names landed at
+    `projectlua//orient/face/down/project.json` (double slash from
+    the leading `_`) — `project/run` alarmed 10001 because the
+    runner couldn't find the mangled entry. Reserve names MUST be
+    single lowercase tokens with NO underscores, matching healthy
+    programs like `roboaitest`. Task = 'main' matches convention."""
+    src = _src()
+    def _extract(k):
+        m = re.search(rf"{k}\s*=\s*'([^']+)'", src)
+        assert m, f'{k} not defined'
+        return m.group(1)
+    for k in ('_ORIENT_PROJECT_ID', '_ORIENT_TASK_ID',
+                '_ORIENT_POINT_NAME'):
+        v = _extract(k)
+        assert '_' not in v, (
+            f'{k}={v!r} contains "_" — controller splits underscores '
+            f'as path separators during save (see alarm-10001 trace)')
+        assert not v.startswith('_'), (
+            f'{k}={v!r} starts with "_" — collides with dashboard '
+            f'startswith("_") guards AND the underscore-path-split '
+            f'controller bug')
+
+
+def test_orient_handler_publishes_save_steps_for_visibility():
+    """Prior handler swallowed the save step chain. Alarm 10001
+    fired on project/run with no matching /estun/rejected because
+    HTTP save reported 200 for all steps (even though files landed
+    at a mangled path). Fix: publish an `orient_save` event on
+    /estun/program_status carrying the full step chain — same
+    schema _op_save uses — so every save is loud."""
+    src = _src()
+    m = re.search(
+        r'def _on_coordinated_joint\(self, d\):(.+?)def _start_or_refresh_continuous',
+        src, re.DOTALL)
+    assert m
+    body = m.group(1)
+    assert "'event': 'orient_save'" in body
+    assert 'self._pub_program.publish(' in body
+
+
+def test_orient_handler_verifies_saved_slot_before_run():
+    """2026-09-09 §NN alarm-10001 trace: HTTP save returned 200 even
+    with a mangled storage path — the swallow that let project/run
+    fire against a phantom. Fix: after save, GET the project.json
+    back and verify its `name` field is EXACTLY
+    `projectlua/<pid>/project.json` (single directory segment).
+    Refuse with kind='orient_slot_malformed' if the shape is
+    wrong. This closes the class-of-bug where the controller
+    silently mishandles a project_id."""
+    src = _src()
+    m = re.search(
+        r'def _on_coordinated_joint\(self, d\):(.+?)def _start_or_refresh_continuous',
+        src, re.DOTALL)
+    assert m
+    body = m.group(1)
+    # Verify-saved GET is issued.
+    assert 'verify-saved' in body.lower() or 'select/project' in body
+    # Expected shape check.
+    assert '_expect_name' in body
+    assert 'projectlua/{self._ORIENT_PROJECT_ID}/project.json' in body
+    # Refusal for malformed slot.
+    assert "'reason_code': 'orient_slot_malformed'" in body
+    # Verify-saved-fail (GET raised) has its own kind.
+    assert "'reason_code': 'orient_verify_saved_fail'" in body
+    # Gate sits BEFORE project/run (otherwise it can't guard).
+    idx_verify = body.find("orient_slot_malformed")
+    idx_run = body.find("self._ws_verb('project/run',")
+    assert idx_verify != -1 and idx_run != -1
+    assert idx_verify < idx_run, (
+        "verify-saved gate MUST refuse BEFORE project/run fires — "
+        "otherwise the alarm-10001 class-of-bug reopens")
+
+
 def test_orient_handler_latches_orient_active_for_stop_routing():
     """After project/run success, `_orient_active = True` so the
     NEXT release/stop on /robot/jog_command routes to project/stop

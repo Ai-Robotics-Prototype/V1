@@ -2312,11 +2312,23 @@ class EstunCodroidDriver(Node):
     #
     # Reserved project + task IDs. Fixed so repeated presses OVERWRITE
     # the same slot on the controller — no accumulating orient debris.
-    # `_orient_` prefix + `__system__` sentinel makes them
-    # unmistakable in projectlist output.
-    _ORIENT_PROJECT_ID = '_orient_face_down'
-    _ORIENT_TASK_ID    = '_task_orient'
-    _ORIENT_POINT_NAME = 'orient_target'
+    #
+    # 2026-09-09 §NN alarm-10001 trace: the controller SPLITS
+    # underscores in project_id as PATH SEPARATORS during HTTP save
+    # (e.g. `_orient_face_down` → stored at
+    # `projectlua//orient/face/down/project.json`, double-slash from
+    # the leading `_`). Files land but `project/run` can't locate the
+    # project → alarm 10001 "Project <_orient_face_down> does not
+    # exist". Healthy programs use single-token names (`roboaitest`
+    # → `projectlua/roboaitest/project.json`). Rename to the same
+    # convention: single lowercase token, NO underscores, NO leading
+    # `_` (which would also collide with the dashboard's
+    # startswith('_') filesystem guards even though the driver
+    # save path bypasses those). Task = `main` to match the healthy
+    # convention (see `roboaitest`).
+    _ORIENT_PROJECT_ID = 'orientfacedown'
+    _ORIENT_TASK_ID    = 'main'
+    _ORIENT_POINT_NAME = 'orienttarget'
     # Rate cap in degrees per second. Face Down operator directive:
     # ≤10 deg/s, NOT tied to jog speed. Enforced client-side by the
     # dashboard (_FACE_DOWN_RATE_RAD_PER_S) AND here on the driver as
@@ -2432,7 +2444,7 @@ class EstunCodroidDriver(Node):
                 project_id=self._ORIENT_PROJECT_ID,
                 task_id=self._ORIENT_TASK_ID,
                 project_display='Face Down (orient)',
-                task_display='orient',
+                task_display=self._ORIENT_TASK_ID,
                 lua_source=lua_source,
                 varspoint=varspoint,
             )
@@ -2442,6 +2454,18 @@ class EstunCodroidDriver(Node):
                 extra={'reason_code': 'orient_save_fail',
                        'req_id': req_id})
             return
+        # Publish the save step chain on /estun/program_status so
+        # a swallow is impossible — same schema as _op_save.
+        _m = String()
+        _m.data = json.dumps({
+            'event': 'orient_save',
+            'project_id': self._ORIENT_PROJECT_ID,
+            'task_id': self._ORIENT_TASK_ID,
+            'req_id': req_id,
+            'steps': steps,
+            'ts': time.time(),
+        }, separators=(',', ':'))
+        self._pub_program.publish(_m)
         # Every HTTP step must be OK (200 or CHECK-909). save_project
         # aborts on the first hard failure, but a soft-fail (non-200,
         # non-909) still returns partial steps.
@@ -2459,6 +2483,54 @@ class EstunCodroidDriver(Node):
                            'req_id': req_id,
                            'steps': steps})
                 return
+
+        # ── Verify-saved gate ─────────────────────────────────────
+        # 2026-09-09 §NN alarm-10001 lesson: the controller RETURNS
+        # HTTP 200 on save even when it stored the files at a
+        # mangled path (e.g. leading-underscore project_id gets
+        # split as path separators, files land under
+        # `projectlua//x/y/z/…` instead of `projectlua/pid/…`).
+        # `project/run` then fires alarm 10001 "Project <pid> does
+        # not exist" because the runner can't find the mangled
+        # entry.  Guard: GET the saved project.json back and check
+        # that its `name` field is `projectlua/<pid>/project.json`
+        # exactly (single directory segment). Any other shape means
+        # the controller mishandled the pid — refuse BEFORE running.
+        from estun_driver.program_ops import _origin, _http_request
+        _pjurl = (f'{_origin(self._robot_ip, self._ui_origin_port)}'
+                    f'/api/robotjson/projectlua_'
+                    f'{self._ORIENT_PROJECT_ID}/select/project/')
+        try:
+            _st, _pj, _raw = _http_request('GET', _pjurl, None, '', 3.0)
+        except Exception as e:
+            self._reject(family,
+                f'coordinated_joint: verify-saved GET raised: {e}',
+                extra={'reason_code': 'orient_verify_saved_fail',
+                       'req_id': req_id})
+            return
+        _expect_name = f'projectlua/{self._ORIENT_PROJECT_ID}/project.json'
+        _got_name = ''
+        try:
+            _got_name = (_pj.get('data') or [{}])[0].get('name', '')
+        except Exception:
+            pass
+        if _st != 200 or _got_name != _expect_name:
+            self._reject(family,
+                (f'coordinated_joint: controller stored project at '
+                 f'{_got_name!r} — expected {_expect_name!r}. Save '
+                 f'reported HTTP 200 but the storage path is '
+                 f'mangled (leading-underscore / underscore-split '
+                 f'class-of-bug — see 2026-09-09 §NN alarm 10001 '
+                 f'trace).'),
+                extra={'reason_code': 'orient_slot_malformed',
+                       'req_id': req_id,
+                       'expected_name': _expect_name,
+                       'got_name': _got_name,
+                       'http_status': _st})
+            return
+        self.get_logger().info(
+            f'[MOTION-SINK] coordinated_joint verify-saved OK: '
+            f'name={_got_name!r} req_id={req_id}')
 
         # ── Run: project/run over the WS. Requires Auto mode.
         ok = self._ws_verb('project/run', {
