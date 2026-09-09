@@ -94,6 +94,15 @@ try:
         _StaticTFBroadcaster = None
     from std_msgs.msg import Bool, Float32, String
     from std_srvs.srv import Trigger
+    # Coordinated-orient wire (2026-09-09 Face Down land): the live
+    # JTC (/joint_trajectory_controller/joint_trajectory) accepts a
+    # two-point JointTrajectory as fire-and-forget input, sidestepping
+    # the Estun WS API's lack of a coordinated MoveJ verb. Direct topic
+    # publish is deliberate over the FollowJointTrajectory ACTION path
+    # (async goal handles are awkward from a FastAPI request handler;
+    # the JTC still enforces safety internally per its own gate list).
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    from builtin_interfaces.msg import Duration as _DurationMsg
     RCLPY_AVAILABLE = True
 except ImportError:
     RCLPY_AVAILABLE = False
@@ -4691,29 +4700,89 @@ if FASTAPI_AVAILABLE:
     # already refuses on TCP drift; this is a defence in depth.
     _FACE_DOWN_MAX_JOINT_STEP_RAD = 30.0 * math.pi / 180.0
 
-    def _publish_orient_command(payload: dict) -> int:
-        """Publish a JSON frame on /robot/orient_command. Returns the
-        subscription count seen at publish time (0 = driver-side
-        handler not wired yet — endpoint returns
-        outcome='executor_not_wired_yet' upstream). RELIABLE QoS,
-        depth 5 — these are single infrequent commands like power,
-        not the 100 Hz jog stream."""
+    # JTC joint names for the s10-140 URDF — the JTC ingests this
+    # exact 6-name ordering; controller_manager was configured with
+    # joint_1..joint_6 (see s10_140_moveit_config controllers.yaml).
+    _JTC_TOPIC       = "/joint_trajectory_controller/joint_trajectory"
+    _JTC_JOINT_NAMES = ('joint_1', 'joint_2', 'joint_3',
+                         'joint_4', 'joint_5', 'joint_6')
+
+    def _publish_orient_command(payload: dict) -> tuple[int, int]:
+        """Two-sink publish for the coordinated-orient command:
+          1. /robot/orient_command JSON — the observability breadcrumb.
+             Anyone can subscribe (drivers, loggers, tests) to see
+             the exact request; this topic does NOT command motion.
+          2. /joint_trajectory_controller/joint_trajectory — the
+             actual motion command. The live JTC is subscribed and
+             executes a two-point JointTrajectory (q_current at t=0,
+             q_target at t=duration_ms). This is deliberately the
+             TOPIC path (fire-and-forget), not the FollowJointTrajectory
+             ACTION — async goal handles from a FastAPI request path
+             are awkward, and the JTC enforces its own limits.
+
+        Returns (breadcrumb_subs, jtc_subs). jtc_subs > 0 is the
+        "wired" signal — the endpoint returns
+        outcome='executor_not_wired_yet' upstream when jtc_subs == 0
+        (JTC not running / discovery not settled). The breadcrumb
+        sub count is informational only.
+        """
         if _ros_node is None:
-            return -1
+            return (-1, -1)
+        # (1) Breadcrumb JSON on /robot/orient_command.
         try:
             if not hasattr(_ros_node, "_estun_orient_pub"):
                 _ros_node._estun_orient_pub = _ros_node.create_publisher(
                     String, "/robot/orient_command", 5)
-            n = 0
+            breadcrumb_n = 0
             try:
-                n = _ros_node._estun_orient_pub.get_subscription_count()
+                breadcrumb_n = _ros_node._estun_orient_pub.get_subscription_count()
             except Exception:
                 pass
             m = String(); m.data = json.dumps(payload)
             _ros_node._estun_orient_pub.publish(m)
-            return n
         except Exception:
-            return -1
+            breadcrumb_n = -1
+        # (2) Real motion command on the JTC topic. Skipped if we're
+        # missing required fields — the observability breadcrumb has
+        # still gone out so a caller can see what came in.
+        q_current = payload.get("q_current_snapshot") or []
+        q_target  = payload.get("q_target") or []
+        duration_ms = int(payload.get("duration_ms") or 0)
+        if (len(q_current) == 6 and len(q_target) == 6 and duration_ms > 0):
+            try:
+                if not hasattr(_ros_node, "_jtc_pub"):
+                    _ros_node._jtc_pub = _ros_node.create_publisher(
+                        JointTrajectory, _JTC_TOPIC, 5)
+                jtc_n = 0
+                try:
+                    jtc_n = _ros_node._jtc_pub.get_subscription_count()
+                except Exception:
+                    pass
+                if jtc_n > 0:
+                    traj = JointTrajectory()
+                    traj.joint_names = list(_JTC_JOINT_NAMES)
+                    # Point 0: q_current at t=0 so the JTC has a clean
+                    # anchor. Redundant with the live state but the
+                    # explicit start-point avoids any interpretation
+                    # ambiguity across JTC versions.
+                    p0 = JointTrajectoryPoint()
+                    p0.positions = [float(v) for v in q_current]
+                    p0.time_from_start = _DurationMsg(sec=0, nanosec=0)
+                    # Point 1: q_target at t=duration_ms. The JTC
+                    # interpolates smoothly between the two points at
+                    # the server-computed rate-capped duration.
+                    p1 = JointTrajectoryPoint()
+                    p1.positions = [float(v) for v in q_target]
+                    _sec = duration_ms // 1000
+                    _nsec = (duration_ms % 1000) * 1_000_000
+                    p1.time_from_start = _DurationMsg(
+                        sec=int(_sec), nanosec=int(_nsec))
+                    traj.points = [p0, p1]
+                    _ros_node._jtc_pub.publish(traj)
+                return (breadcrumb_n, jtc_n)
+            except Exception:
+                return (breadcrumb_n, -1)
+        return (breadcrumb_n, 0)
 
     def _refuse_face_down(kind: str, reason: str, extra: dict | None = None,
                             status: int = 400):
@@ -4741,10 +4810,23 @@ if FASTAPI_AVAILABLE:
 
         # Immediate-stop path — always allowed, even mid-fault, so the
         # operator can abort a mis-planned motion without racing an
-        # unrelated gate. Publishes a release frame on the same topic.
+        # unrelated gate. Publishes a release breadcrumb AND sends an
+        # empty JointTrajectory to the JTC, which preempts any active
+        # goal. The ultimate stop remains the TopBar E-STOP.
         if body.get("stop") is True:
             payload = {"mode": "coordinated_joint", "hold": False}
             _publish_orient_command(payload)
+            try:
+                if _ros_node is not None:
+                    if not hasattr(_ros_node, "_jtc_pub"):
+                        _ros_node._jtc_pub = _ros_node.create_publisher(
+                            JointTrajectory, _JTC_TOPIC, 5)
+                    empty = JointTrajectory()
+                    empty.joint_names = list(_JTC_JOINT_NAMES)
+                    empty.points = []
+                    _ros_node._jtc_pub.publish(empty)
+            except Exception:
+                pass
             return {"ok": True, "action": "stop"}
 
         # ── Input-shape gate ────────────────────────────────────────
@@ -4859,27 +4941,33 @@ if FASTAPI_AVAILABLE:
                     "q_target": q_target, "q_current": q_current,
                     "max_step_deg": math.degrees(max_step)}
 
-        n_subs = _publish_orient_command(payload)
-        if n_subs == 0:
-            # Signal path lands, but driver-side subscriber is not up
-            # yet (F2-follow-up wire). Frontend renders this as a
-            # specific message so the operator knows WHY the real arm
-            # didn't move.
+        breadcrumb_subs, jtc_subs = _publish_orient_command(payload)
+        # jtc_subs is the WIRED signal. 0 = JTC not running / discovery
+        # hasn't settled — real arm cannot move. Refuse with a named
+        # reason so the operator sees WHY (frontend renders this
+        # inline via data-testid="face-down-real-refusal").
+        if jtc_subs == 0:
             return _refuse_face_down(
-                "executor_not_wired_yet",
-                ("Face Down endpoint validated; no subscriber "
-                 "discovered on /robot/orient_command — the driver-"
-                 "side coordinated-orient handler is a follow-up "
-                 "wire. Twin preview still ran; real arm did not "
-                 "move."),
+                "jtc_not_discovered",
+                ("Face Down endpoint validated and observability "
+                 "breadcrumb published on /robot/orient_command, but "
+                 "the joint_trajectory_controller has zero discovered "
+                 "subscribers on /joint_trajectory_controller/"
+                 "joint_trajectory — arm cannot move. Confirm the "
+                 "controller_manager + JTC are running (see "
+                 "OPERATIONS §1 CRI launch)."),
                 extra={"req_id": req_id,
                        "duration_ms": duration_ms,
-                       "topic": "/robot/orient_command"},
+                       "breadcrumb_subs": breadcrumb_subs,
+                       "jtc_subs": jtc_subs,
+                       "topic": _JTC_TOPIC},
                 status=503)
 
         return {"ok": True, "action": "publish", "req_id": req_id,
                 "duration_ms": duration_ms,
-                "topic": "/robot/orient_command"}
+                "breadcrumb_subs": breadcrumb_subs,
+                "jtc_subs": jtc_subs,
+                "topic": _JTC_TOPIC}
 
     def _publish_estun_power(payload):
         """Publish a single frame on /robot/power_command. Reliable QoS,

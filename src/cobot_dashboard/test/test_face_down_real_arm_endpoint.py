@@ -193,15 +193,81 @@ def test_publishes_mode_coordinated_joint_on_orient_command_topic():
     assert '"rate_rad_per_s":    _FACE_DOWN_RATE_RAD_PER_S' in ep
 
 
-def test_executor_not_wired_yet_when_no_subscriber():
-    """Until the driver-side subscriber lands, publish returns
-    n_subs=0 and the endpoint 503s with kind='executor_not_wired_yet'
-    so the frontend can render a specific message (twin preview ran,
-    real arm did not move). Distinct from ros_unavailable (dashboard
-    has no rclpy context)."""
+def test_endpoint_publishes_two_point_trajectory_to_live_jtc():
+    """Real motion command lands on /joint_trajectory_controller/
+    joint_trajectory (the live JTC topic — controller_manager +
+    joint_trajectory_controller are already running on the host).
+    Publish contract:
+      * joint_names = ('joint_1' .. 'joint_6') — matches the s10_140
+        controllers.yaml order.
+      * Two JointTrajectoryPoints: p0 at q_current with time_from_start
+        = 0, p1 at q_target with time_from_start = duration_ms. JTC
+        interpolates between the two at the server-computed
+        rate-capped duration.
+      * Direct topic publish (not the FollowJointTrajectory ACTION):
+        async goal-handles from a FastAPI request path are awkward
+        and the JTC's own limits + preemption are enough.
+      * /robot/orient_command remains as an OBSERVABILITY BREADCRUMB
+        so drivers / loggers / tests can see the exact request.
+    """
+    src = _src()
+    assert '_JTC_TOPIC       = "/joint_trajectory_controller/joint_trajectory"' in src
+    assert "_JTC_JOINT_NAMES = ('joint_1', 'joint_2', 'joint_3'," in src
+    assert 'from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint' in src
+    # Two-point trajectory constructed inside _publish_orient_command.
+    assert 'traj = JointTrajectory()' in src
+    assert 'traj.joint_names = list(_JTC_JOINT_NAMES)' in src
+    assert 'p0.positions = [float(v) for v in q_current]' in src
+    assert 'p1.positions = [float(v) for v in q_target]' in src
+    assert 'p0.time_from_start = _DurationMsg(sec=0, nanosec=0)' in src
+
+
+def test_endpoint_refuses_when_jtc_not_discovered():
+    """If the JTC isn't up / discovery hasn't settled, publish records
+    jtc_subs=0 and the endpoint 503s with kind='jtc_not_discovered'
+    so the frontend renders a specific "arm cannot move" message via
+    data-testid='face-down-real-refusal'. Distinct from
+    'ros_unavailable' (dashboard has no rclpy context) and
+    'executor_not_wired_yet' (retired 2026-09-09 when the wire moved
+    from a placeholder JSON topic to the live JTC topic)."""
     ep = _endpoint_slice(_src())
-    assert 'if n_subs == 0:' in ep
-    assert _has_refusal(ep, 'executor_not_wired_yet')
+    assert 'if jtc_subs == 0:' in ep
+    assert _has_refusal(ep, 'jtc_not_discovered')
+    # Retired branch — the placeholder JSON-subscriber gate is gone
+    # now that the JTC is the actual sink.
+    assert 'executor_not_wired_yet' not in ep
+
+
+def test_orient_command_topic_is_breadcrumb_only():
+    """/robot/orient_command is retained as an OBSERVABILITY breadcrumb
+    — drivers/loggers/tests can subscribe to see the exact request —
+    but does NOT command motion. Pin the two-sink split so a future
+    refactor can't accidentally regress the JTC path back to a
+    JSON-topic contract."""
+    src = _src()
+    # The breadcrumb topic still exists so subscribers of the older
+    # contract keep seeing frames.
+    assert '"/robot/orient_command"' in src
+    # But the endpoint's wired-signal check reads JTC subs, not the
+    # breadcrumb subs.
+    ep = _endpoint_slice(src)
+    assert 'breadcrumb_subs, jtc_subs = _publish_orient_command(payload)' in ep
+
+
+def test_stop_path_preempts_live_jtc_with_empty_trajectory():
+    """{stop: true} publishes an empty JointTrajectory to the JTC —
+    JTC treats an empty points list as "preempt the active goal",
+    which halts an in-flight orient. The ultimate stop remains
+    TopBar E-STOP; this is the endpoint's own immediate stop."""
+    ep = _endpoint_slice(_src())
+    m = re.search(r'if body\.get\("stop"\) is True:\s*(.+?)(?=# ── Input-shape)',
+                    ep, re.DOTALL)
+    assert m, 'stop:true branch not found'
+    branch = m.group(1)
+    assert 'empty = JointTrajectory()' in branch
+    assert 'empty.joint_names = list(_JTC_JOINT_NAMES)' in branch
+    assert 'empty.points = []' in branch
+    assert '_ros_node._jtc_pub.publish(empty)' in branch
 
 
 # ── Dry-run + req_id + response shape ─────────────────────────────
@@ -222,14 +288,14 @@ def test_every_success_and_refusal_carries_a_req_id():
     """Every accepted publish or dry_run mints a req_id so the
     driver-side terminal event (settled / aborted / drift_exceeded)
     can be correlated back to this call. Refusals for
-    executor_not_wired_yet carry req_id too so a subsequent driver-
-    wire commit can retry a specific request."""
+    jtc_not_discovered carry req_id too so a subsequent retry can
+    reference a specific request."""
     ep = _endpoint_slice(_src())
     assert 'import uuid' in ep
     assert 'req_id = uuid.uuid4().hex[:12]' in ep
     # Success case
     assert '"req_id": req_id' in ep
-    # not-wired-yet case
+    # jtc_not_discovered case (via _refuse_face_down + extra kwargs)
     assert '"req_id": req_id,' in ep
 
 
