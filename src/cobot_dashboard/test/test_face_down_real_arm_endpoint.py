@@ -67,6 +67,25 @@ def test_tcp_drift_budget_is_1_mm():
     assert '"tcp_drift_budget_m": _FACE_DOWN_TCP_DRIFT_BUDGET_M' in ep
 
 
+def test_publishes_to_working_jog_transport():
+    """The Face Down publish now lands on the SAME ROS topic
+    /robot/jog_command that estun_driver_node subscribes to for
+    every real jog motion — the working reference path. Driver's
+    _on_jog_command decides mode-based dispatch; coordinated_joint
+    lands in a NAMED refusal branch until the coordinated-motion
+    driver implementation lands (a follow-up atomic session)."""
+    src = _src()
+    # Publisher target: /robot/jog_command with BEST_EFFORT QoS
+    # matching the driver's subscription (see estun_driver_node's
+    # _jog_qos block).
+    assert '"/robot/jog_command"' in src
+    # The publisher helper is defined + used by the endpoint.
+    assert 'def _publish_orient_command(payload: dict) -> int:' in src
+    # Endpoint's refusal for missing driver names it explicitly.
+    ep = _endpoint_slice(src)
+    assert _has_refusal(ep, 'driver_not_discovered')
+
+
 def test_step_guard_is_30_degrees():
     """Defence in depth: refuse if IK returns a wildly different
     pose whose worst per-joint step exceeds 30°."""
@@ -169,23 +188,25 @@ def test_immediate_stop_short_circuits_every_gate():
                     ep, re.DOTALL)
     assert m, 'stop:true branch not found at the top of the handler'
     branch = m.group(1)
-    # Publishes a release frame.
+    # Publishes a release frame through the working jog transport.
     assert '"mode": "coordinated_joint"' in branch
     assert '"hold": False' in branch
-    assert '_publish_orient_command(payload)' in branch
+    assert '_publish_orient_command(' in branch
     # Returns success (does NOT enter the gate matrix).
     assert 'return {"ok": True, "action": "stop"}' in branch
 
 
 # ── Wire target — coordinated-joint frame shape ───────────────────
 
-def test_publishes_mode_coordinated_joint_on_orient_command_topic():
-    """The driver-side handler subscribes to /robot/orient_command
-    (RELIABLE QoS, distinct from the 100 Hz jog stream) and expects
-    mode=coordinated_joint frames carrying q_target + rate. If the
-    topic name changes, the driver-side wire breaks — pin it."""
+def test_publishes_mode_coordinated_joint_on_jog_command_topic():
+    """The Face Down real-arm publish now lands on /robot/jog_command
+    (the SAME topic estun_driver_node subscribes to for regular jog —
+    the working reference transport). Driver's _on_jog_command reads
+    `mode` and dispatches: 'joint' / 'cartesian' → existing paths;
+    'coordinated_joint' → NAMED refusal branch (this atomic session)
+    until the coordinated-motion driver-side handler lands."""
     src = _src()
-    assert '"/robot/orient_command"' in src
+    assert '"/robot/jog_command"' in src
     ep = _endpoint_slice(src)
     assert '"mode":              "coordinated_joint"' in ep
     assert '"kind":              "face_down"' in ep
@@ -193,72 +214,12 @@ def test_publishes_mode_coordinated_joint_on_orient_command_topic():
     assert '"rate_rad_per_s":    _FACE_DOWN_RATE_RAD_PER_S' in ep
 
 
-def test_endpoint_publishes_two_point_trajectory_to_live_jtc():
-    """Real motion command lands on /joint_trajectory_controller/
-    joint_trajectory (the live JTC topic — controller_manager +
-    joint_trajectory_controller are already running on the host).
-    Publish contract:
-      * joint_names = ('joint_1' .. 'joint_6') — matches the s10_140
-        controllers.yaml order.
-      * Two JointTrajectoryPoints: p0 at q_current_live with
-        time_from_start = 0, p1 at q_target with time_from_start =
-        duration_ms. JTC interpolates between the two at the server-
-        computed rate-capped duration.
-      * Direct topic publish (not the FollowJointTrajectory ACTION):
-        async goal-handles from a FastAPI request path are awkward
-        and the JTC's own limits + preemption are enough.
-      * /robot/orient_command remains as an OBSERVABILITY BREADCRUMB
-        so drivers / loggers / tests can see the exact request.
-    """
-    src = _src()
-    assert '_JTC_TOPIC       = "/joint_trajectory_controller/joint_trajectory"' in src
-    assert "_JTC_JOINT_NAMES = ('joint_1', 'joint_2', 'joint_3'," in src
-    assert 'from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint' in src
-    # Two-point trajectory constructed inside _publish_orient_command.
-    assert 'traj = JointTrajectory()' in src
-    assert 'traj.joint_names = list(_JTC_JOINT_NAMES)' in src
-    assert 'p0.positions = [float(v) for v in q_current]' in src
-    assert 'p1.positions = [float(v) for v in q_target]' in src
-    assert 'p0.time_from_start = _DurationMsg(sec=0, nanosec=0)' in src
-
-
-def test_p0_anchor_is_server_live_state_never_client_input():
-    """SAFETY-CRITICAL: the JTC trajectory anchor p0 (t=0) MUST
-    come from the LIVE joint state on the server, NEVER from the
-    client's q_current_snapshot. A client that lies about its
-    current pose (or is stale) would otherwise cause the JTC to
-    teleport-interpolate from a bogus anchor to the target in
-    duration_ms — effectively a fast slew.
-
-    Regression source (2026-09-09 §NN): initial land used client's
-    q_current_snapshot as p0. A curl test with snapshot=[0]*6 and
-    target=[0]*6 (delta 0, step guard passed) command-fired a slew
-    from the ACTUAL live pose to zeros in 400 ms. Fixed by:
-      1. Endpoint reads live_joints from STATE unconditionally.
-      2. Payload carries q_current_live (from live_joints).
-      3. _publish_orient_command reads q_current_live for p0.
-      4. Step guard runs against live_joints, not client body.
-      5. Optional q_current_snapshot cross-checks staleness only.
-    """
-    src = _src()
-    # Payload carries q_current_live sourced from live_joints.
-    assert '"q_current_live":    live_joints' in src
-    # Publisher reads q_current_live (NOT q_current_snapshot).
-    assert 'q_current = payload.get("q_current_live") or []' in src
-    # The old bug pattern (using client's q_current_snapshot as p0)
-    # must not return. Pin that the publisher does NOT read the
-    # snapshot for the trajectory anchor.
-    assert 'payload.get("q_current_snapshot")' not in src.split(
-        'def _publish_orient_command')[1].split('def _refuse_face_down')[0], (
-        "publisher must not use client's q_current_snapshot as the "
-        "JTC anchor — that reintroduces the teleport risk")
-
-
 def test_step_guard_uses_live_state_never_client_input():
-    """The 30° step guard MUST compute against live_joints. Prior
-    code allowed the client to bypass by sending a
-    q_current_snapshot matching q_target (delta 0 → passes). Fix:
-    step is always live_joints → q_target."""
+    """The 30° step guard MUST compute against live_joints (from
+    STATE.joints under _state_lock), NEVER from client body. Prior
+    code allowed the client to bypass by sending q_current_snapshot
+    matching q_target (delta 0 → passes). Fix: step is always
+    live_joints → q_target."""
     ep = _endpoint_slice(_src())
     # Step computation reads live_joints.
     assert 'step_rad = [abs(q_target[i] - live_joints[i]) for i in range(6)]' in ep
@@ -266,65 +227,75 @@ def test_step_guard_uses_live_state_never_client_input():
     assert _has_refusal(ep, 'no_live_joint_state')
 
 
-def test_snapshot_staleness_cross_check():
-    """When the client sends q_current_snapshot, compare it to live
-    joints. Any joint disagreeing by >5° means the arm moved between
-    twin preview and real-arm press — refuse with kind='snapshot_stale'
-    so the operator re-runs Face Down at the current pose. This
-    closes the 'preview at A, arm moved to B, target valid for A but
-    not for B' hole."""
-    ep = _endpoint_slice(_src())
-    assert '_SNAPSHOT_STALENESS_TOL_RAD = 5.0 * math.pi / 180.0' in ep
-    assert 'if q_current_snapshot is not None:' in ep
-    assert _has_refusal(ep, 'snapshot_stale')
-
-
-def test_endpoint_refuses_when_jtc_not_discovered():
-    """If the JTC isn't up / discovery hasn't settled, publish records
-    jtc_subs=0 and the endpoint 503s with kind='jtc_not_discovered'
-    so the frontend renders a specific "arm cannot move" message via
-    data-testid='face-down-real-refusal'. Distinct from
-    'ros_unavailable' (dashboard has no rclpy context) and
-    'executor_not_wired_yet' (retired 2026-09-09 when the wire moved
-    from a placeholder JSON topic to the live JTC topic)."""
-    ep = _endpoint_slice(_src())
-    assert 'if jtc_subs == 0:' in ep
-    assert _has_refusal(ep, 'jtc_not_discovered')
-    # Retired branch — the placeholder JSON-subscriber gate is gone
-    # now that the JTC is the actual sink.
-    assert 'executor_not_wired_yet' not in ep
-
-
-def test_orient_command_topic_is_breadcrumb_only():
-    """/robot/orient_command is retained as an OBSERVABILITY breadcrumb
-    — drivers/loggers/tests can subscribe to see the exact request —
-    but does NOT command motion. Pin the two-sink split so a future
-    refactor can't accidentally regress the JTC path back to a
-    JSON-topic contract."""
+def test_payload_carries_live_joints_as_trajectory_anchor():
+    """The eventual driver-side coordinated_joint handler uses
+    q_current_live as its trajectory anchor. Sourced ONLY from
+    server-side live_joints; NEVER echoed from client body. This
+    pin survives the JTC retirement — the same safety invariant
+    applies to whatever transport the driver-side handler picks
+    (per-axis Robot/jog with time-scaled speeds OR project/run
+    Lua synth)."""
     src = _src()
-    # The breadcrumb topic still exists so subscribers of the older
-    # contract keep seeing frames.
-    assert '"/robot/orient_command"' in src
-    # But the endpoint's wired-signal check reads JTC subs, not the
-    # breadcrumb subs.
-    ep = _endpoint_slice(src)
-    assert 'breadcrumb_subs, jtc_subs = _publish_orient_command(payload)' in ep
+    assert '"q_current_live":    live_joints' in src
+    # Publisher forwards the payload verbatim — no client-input
+    # echo into the trajectory anchor.
+    pub_slice = src.split(
+        'def _publish_orient_command')[1].split(
+        'def _refuse_face_down')[0]
+    # Publisher slice must not reference q_current_snapshot.
+    assert 'q_current_snapshot' not in pub_slice, (
+        "publisher must not reference client q_current_snapshot")
 
 
-def test_stop_path_preempts_live_jtc_with_empty_trajectory():
-    """{stop: true} publishes an empty JointTrajectory to the JTC —
-    JTC treats an empty points list as "preempt the active goal",
-    which halts an in-flight orient. The ultimate stop remains
-    TopBar E-STOP; this is the endpoint's own immediate stop."""
+def test_endpoint_refuses_when_driver_not_discovered():
+    """If estun_driver isn't up (or discovery hasn't settled),
+    /robot/jog_command reports 0 subscribers and the endpoint 503s
+    with kind='driver_not_discovered' so the frontend renders a
+    specific message via data-testid='face-down-real-refusal'."""
+    ep = _endpoint_slice(_src())
+    assert 'driver_subs = _publish_orient_command(payload)' in ep
+    assert 'if driver_subs == 0:' in ep
+    assert _has_refusal(ep, 'driver_not_discovered')
+
+
+def test_stop_path_uses_same_transport_as_jog_release():
+    """{stop: true} routes through /robot/jog_command with hold:false
+    — the SAME shape /cmd/jog's release uses. Driver's
+    _on_jog_command handles the release path (release/stop takes
+    absolute priority, no session guards). No separate topic; no
+    separate ACTION goal-handles."""
     ep = _endpoint_slice(_src())
     m = re.search(r'if body\.get\("stop"\) is True:\s*(.+?)(?=# ── Input-shape)',
                     ep, re.DOTALL)
     assert m, 'stop:true branch not found'
     branch = m.group(1)
-    assert 'empty = JointTrajectory()' in branch
-    assert 'empty.joint_names = list(_JTC_JOINT_NAMES)' in branch
-    assert 'empty.points = []' in branch
-    assert '_ros_node._jtc_pub.publish(empty)' in branch
+    assert '"mode": "coordinated_joint"' in branch
+    assert '"hold": False' in branch
+    assert '_publish_orient_command(' in branch
+    assert 'return {"ok": True, "action": "stop"}' in branch
+
+
+def test_jtc_wire_retired():
+    """2026-09-09 §NN retirement — the JTC / cri_hardware/CriUdpSystem
+    sink was the WRONG SINK per HARDWARE.md §Cutover flag (only live
+    under RUN_BACKEND=ros2_executor + REMOTE mode). On the operator's
+    default legacy_lua backend trajectories vanished into cri_hardware
+    without commanding servos — third failed fix. Pin the retirement
+    so a future refactor can't quietly re-add the shelved wire.
+
+    Strip Python comments before the check — the retirement doctrine
+    is INTENTIONALLY explained in a comment above _publish_orient_
+    command that mentions the retired names."""
+    src = _src()
+    # Strip full-line + inline # comments; keep executable code.
+    stripped = re.sub(r'#[^\n]*', '', src)
+    for banned in ('_JTC_TOPIC ', '_JTC_JOINT_NAMES', 'trajectory_msgs',
+                    '/joint_trajectory_controller',
+                    'JointTrajectoryPoint',
+                    'jtc_not_discovered', 'executor_not_wired_yet'):
+        assert banned not in stripped, (
+            f'{banned!r} reappeared in executable code — retired sink '
+            f'was re-added, third-failed-fix regression class open')
 
 
 # ── Dry-run + req_id + response shape ─────────────────────────────
@@ -367,15 +338,28 @@ def test_frontend_button_posts_to_endpoint_when_real_arm_ready():
     """FaceDownButton must POST to /api/estun/orient/face_down —
     the endpoint owns the gate matrix, not the button. Client-side
     gating is a UX hint only (disables the button when
-    realArmReady is false), never a security boundary."""
+    realArmReady is false), never a security boundary. Body is
+    q_target ONLY — server-side live_joints is the authority for
+    both the step guard AND the trajectory anchor (client can't
+    influence either)."""
     with open(FRONTEND_BUTTON) as fh:
         src = fh.read()
     assert "fetch('/api/estun/orient/face_down'" in src
     assert "method: 'POST'" in src
     # q_target from the LAST successful twin preview (not a shadow
-    # copy). Server also gets q_current_snapshot for the step guard.
+    # copy).
     assert 'q_target: previewedTarget' in src
-    assert 'q_current_snapshot' in src
+    # Retirement: client no longer sends q_current_snapshot. The
+    # server ignored it as of the JTC-safety pass, and the frontend
+    # sending the twin's post-animation joints as "snapshot" caused
+    # every real-arm press to refuse with kind='snapshot_stale'
+    # (silence bug — see 2026-09-09 §NN commit body).
+    # Strip line comments before the guard — the retirement doctrine
+    # is intentionally documented in a block comment above the fetch.
+    code_only = re.sub(r'//[^\n]*', '', src)
+    assert 'q_current_snapshot' not in code_only, (
+        'frontend regressed: q_current_snapshot re-added to the '
+        'request body; server would refuse with snapshot_stale')
 
 
 def test_frontend_uses_state_code_authority():

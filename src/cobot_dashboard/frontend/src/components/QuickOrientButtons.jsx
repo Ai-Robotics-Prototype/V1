@@ -183,41 +183,53 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
     setRealArmBusy(true)
     setRealArmStatus(null)
     try {
-      const q_current = Array.isArray(jogApi?.robot?.joints)
-        ? undefined
-        : (jogApi?.robot?.joints
-            ? [1, 2, 3, 4, 5, 6].map((i) => {
-                const j = jogApi.robot.joints[`joint_${i}`]
-                const raw = j?.jointValue
-                const v = Array.isArray(raw) ? raw[0] : raw
-                const n = Number(v)
-                return Number.isFinite(n) ? n : 0
-              })
-            : undefined)
+      // Do NOT send q_current_snapshot: the server uses live_joints
+      // (STATE.joints from /joint_states via WS) as its own authority
+      // for BOTH the step guard AND the trajectory anchor — client
+      // input can't influence either. Prior versions sent the twin's
+      // post-animation URDF joints (which equal q_target) as the
+      // snapshot; the server's staleness cross-check then refused
+      // every real-arm press with kind='snapshot_stale', which
+      // rendered as a yellow banner the operator missed. Stripping
+      // the field kills that class outright.
       const resp = await fetch('/api/estun/orient/face_down', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          q_target: previewedTarget,
-          q_current_snapshot: q_current,
-        }),
+        body: JSON.stringify({ q_target: previewedTarget }),
       })
-      const body = await resp.json().catch(() => ({}))
-      if (resp.ok && body.ok) {
+      // Belt+braces JSON parse — some infra returns text on 500;
+      // fall back to a synthetic outcome so realArmStatus is
+      // NEVER null after this branch (silence bug fence).
+      let body = null
+      try { body = await resp.json() } catch { body = null }
+      if (resp.ok && body && body.ok) {
+        const drv = (typeof body.driver_subs === 'number')
+          ? ` · driver_subs=${body.driver_subs}` : ''
+        const nxt = body.next ? ` — ${body.next}` : ''
         setRealArmStatus({ ok: true,
-          message: `Command accepted — duration ${body.duration_ms} ms` })
-      } else {
-        const outcome = body.outcome || {}
+          message: `Command published to /robot/jog_command`
+            + ` (duration ${body.duration_ms} ms${drv})${nxt}` })
+      } else if (body && body.outcome) {
+        const outcome = body.outcome
         setRealArmStatus({
           ok: false,
           kind: outcome.kind || 'unknown',
-          message: outcome.reason || 'Refused by driver',
+          message: outcome.reason || `Refused (HTTP ${resp.status})`,
+        })
+      } else {
+        // Non-JSON error OR fully-empty body — synthesize a message
+        // so the operator never gets silence.
+        setRealArmStatus({
+          ok: false,
+          kind: 'response_unparseable',
+          message: `Server returned HTTP ${resp.status} without a `
+            + `parseable outcome. Check dashboard journal for the request.`,
         })
       }
     } catch (e) {
       setRealArmStatus({
         ok: false, kind: 'network',
-        message: 'Network error contacting dashboard',
+        message: `Network error contacting dashboard: ${e?.message || e}`,
       })
     } finally {
       setRealArmBusy(false)

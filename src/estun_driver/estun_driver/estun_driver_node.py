@@ -2230,6 +2230,33 @@ class EstunCodroidDriver(Node):
             else:
                 self._start_or_refresh_continuous(d, mode_s)
             return
+        # 2026-09-09 §NN: coordinated_joint = the sink Face Down real-
+        # arm routes through. The Estun WS API has NO coordinated
+        # multi-joint MoveJ verb — only per-axis Robot/jog. A real
+        # implementation must synthesize either per-axis Robot/jog
+        # with time-scaled speeds (TCP drift bounded by longest axis)
+        # OR a Lua project run via project/run. Both are follow-up
+        # atomic sessions; this branch returns a NAMED refusal via
+        # /estun/rejected so the dashboard mirrors it to the frontend.
+        # Retiring the shelved JTC/CriUdpSystem misdirection was the
+        # value of this commit — the wire is now visible at this
+        # sink so a future land can be verified log-only.
+        if mode_s == 'coordinated_joint':
+            req_id = d.get('req_id')
+            self._reject(
+                family,
+                'coordinated_joint mode not implemented on ws transport — '
+                'Estun ws API has no coordinated MoveJ verb; land in a '
+                'follow-up commit as either per-axis Robot/jog with '
+                'time-scaled speeds or synthesized Lua project/run.',
+                extra={'reason_code': 'coordinated_orient_not_implemented_on_ws',
+                       'req_id': req_id,
+                       'q_target_present': isinstance(d.get('q_target'), list),
+                       'payload_ty': 'coordinated_joint'})
+            self.get_logger().info(
+                f'[MOTION-SINK] coordinated_joint recv req_id={req_id} — '
+                f'refused (not implemented on ws)')
+            return
         if mode_s != 'joint':
             self._reject(family, f'mode {mode_s!r} not implemented (joint or cartesian only)')
             return
@@ -4359,13 +4386,37 @@ class EstunCodroidDriver(Node):
                     f'"initializing — waiting".')
 
     def _send(self, obj):
-        """Send a compact JSON frame — matches posture.py serialization."""
+        """Send a compact JSON frame — matches posture.py serialization.
+
+        2026-09-09 §NN — MOTION-SINK instrumentation. Every motion
+        frame reaching this sink logs a `[MOTION-SINK]` line so the
+        wire can be audited log-only during a dry invocation (item
+        4 of the operator directive). Motion verbs: Robot/jog,
+        Robot/stopJog, Robot/jogHeartbeat, project/run,
+        project/runStep, Robot/switchOn/Off. Non-motion verbs
+        (IOManager/*, publish/*, ping) are skipped to keep the log
+        signal:noise low. This is a diagnostic — do NOT remove
+        without the operator's sign-off; the Face Down real-arm
+        wire relies on it for end-to-end verification."""
         if not self._ws:
             return False
         text = json.dumps(obj, separators=(',', ':'))
         with self._send_lock:
             self._ws.send(text)
         self._log_ws('tx', text)
+        _ty = ''
+        if isinstance(obj, dict):
+            _ty = str(obj.get('ty', ''))
+        if _ty.startswith('Robot/') or _ty.startswith('project/'):
+            try:
+                _db = obj.get('db') if isinstance(obj, dict) else None
+                _id = obj.get('id', '') if isinstance(obj, dict) else ''
+                _db_compact = (json.dumps(_db, separators=(',', ':'))
+                                if _db is not None else '')
+                self.get_logger().info(
+                    f'[MOTION-SINK] tx {_ty} id={_id} db={_db_compact[:200]}')
+            except Exception:
+                pass
         return True
 
     def _send_raw(self, text):
