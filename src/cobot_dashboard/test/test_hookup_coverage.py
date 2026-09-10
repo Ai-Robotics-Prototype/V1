@@ -149,18 +149,25 @@ def test_hookupguide_renders_optional_toggle_from_map():
     assert 'onConfirm?.(allChecked, noSensor, optional)' in src
 
 
-def test_wizard_spreads_optional_answers_onto_answers():
-    """The wizard's confirm handler spreads the optional-map keys
-    onto answers as top-level fields (e.g. answers.blow_off_enabled)
-    so buildSteps' _vocabOpts.withBlowOff = answers.blow_off_enabled
-    reads the operator's choice."""
+def test_optional_answers_reach_program_config():
+    """2026-09-10 restructure: the wizard's inline hookup page
+    is retired. The HardwareSetupWizard collects optional-toggle
+    answers (e.g. blow_off_enabled) via HookupGuide's onConfirm
+    and POSTs them to /api/tool_hookup/<key>. The Program Wizard's
+    handleSave then snapshots the tool's `optional` map back
+    onto program.config as top-level keys, so buildSteps'
+    `_vocabOpts.withBlowOff = answers.blow_off_enabled !== false`
+    reads the operator's choice — same shape as before, new
+    persistence path."""
+    hs = _read(os.path.join(
+        FRONTEND_ROOT, 'components', 'HardwareSetupWizard.jsx'))
+    # HardwareSetupWizard forwards the map through confirmToolHookup.
+    assert 'onConfirm={handleConfirm}' in hs
+    assert 'optional: optionalMap' in hs
+    # Program Wizard snapshot at save time.
     wz = _read(os.path.join(
         FRONTEND_ROOT, 'components', 'ProgramWizard.jsx'))
-    # onConfirm receives the optional map.
-    assert 'onConfirm={(_allChecked, noSensorMap, optionalMap) =>' in wz
-    # Spread into answers.
-    assert 'for (const k of Object.keys(opt)) {' in wz
-    assert 'setAnswer(k, opt[k])' in wz
+    assert 'config[k] = rec.optional[k]' in wz
     # _vocabOpts wires withBlowOff from answers.blow_off_enabled.
     assert 'withBlowOff: answers.blow_off_enabled !== false' in wz
 

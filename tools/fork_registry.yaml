@@ -721,7 +721,7 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4237
+        line: 4238
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
@@ -733,17 +733,20 @@ capabilities:
           2026-09-09 Face Down JTC wire → 4239 (imports for
           trajectory_msgs); SAME DAY retirement of JTC wire →
           4230; 2026-09-09 §NN stale-seed fix → 4237 (+7 lines
-          for last_posture_ts mirror in _on_estun_status).
+          for last_posture_ts mirror in _on_estun_status);
+          2026-09-10 hookup restructure → 4238 (+1 for the
+          `import tempfile` added by the tool_hookup endpoints).
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4372
+        line: 4373
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Drift history: 4156 → 4267 → 4322 → 4349 →
           4358 → 4365 (2026-09-08 custom EOAT tool_library import);
           2026-09-09 Face Down JTC wire → 4374; SAME DAY retirement
           → 4365; 2026-09-09 §NN stale-seed fix → 4372 (last_
-          posture_ts mirror).
+          posture_ts mirror); 2026-09-10 hookup restructure → 4373
+          (+1 for `import tempfile` for the tool_hookup endpoints).
         owner: dashboard-transport
       - path: src/cobot_dashboard/frontend/src/lib/holdTicker.js
         line: 0
@@ -991,7 +994,7 @@ capabilities:
       # here shift as the file grows; refresh the numbers from the
       # deploy.sh lint output when they move.
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 6583
+        line: 6588
         why: >
           disabledReason string for the pallet-teach flow overlay's
           Record button title tooltip. Grandfathered by the visible
@@ -1004,15 +1007,18 @@ capabilities:
           when the peripheral hookup View-hookup button + modal
           landed in ToolAndPayloadSection; 2026-09-09: 6550 → 6583
           when the scan-gate SCAN_ACTIONS + filterCategoriesForEdition
-          helper landed above the ProgramEditor component body.)
+          helper landed above the ProgramEditor component body;
+          2026-09-10: 6583 → 6588 when the Hardware Setup wizard
+          launcher button + state + modal landed as part of the
+          hookup-guide restructure.)
         owner: dashboard-frontend
       - path: src/cobot_dashboard/frontend/src/components/ProgramEditor.jsx
-        line: 6625
+        line: 6630
         why: >
           disabledReason string for the single/all-step teach overlay's
           Record button title tooltip. Same rationale as the line
-          above. Drift history: 6497 → 6520 → 6545 → 6592 → 6625
-          (scan-gate helper block).
+          above. Drift history: 6497 → 6520 → 6545 → 6592 → 6625 →
+          6630 (Hardware Setup restructure — 2026-09-10).
         owner: dashboard-frontend
 
   # 22. Page-context persistence (2026-08-05 refresh-loss P0).

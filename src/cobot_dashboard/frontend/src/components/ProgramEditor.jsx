@@ -8,7 +8,7 @@ import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
 import TeachLockBanner from './TeachLockBanner'
 import NumericField from './NumericField'
 import PalletFrameDiagram from './PalletFrameDiagram'
-import HookupGuide from './HookupGuide'
+import HardwareSetupWizard from './HardwareSetupWizard'
 import { readPayload, PAYLOAD_UNSET_WARNING }
   from '../lib/payload'
 import { computePayloadTruth } from '../lib/payloadTruth'
@@ -3760,28 +3760,15 @@ function ToolAndPayloadSection({ program, onPatch, controllerPayloadKg }) {
         </div>
       )}
       {_showHookup && createPortal(
-        <div
-          onClick={(e) => { if (e.target === e.currentTarget) _setShowHookup(false) }}
-          style={{
-            position: 'fixed', inset: 0, zIndex: 300,
-            background: 'rgba(0,0,0,0.5)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            padding: 24,
-          }}>
-          <div style={{
-            background: '#fff', borderRadius: 12,
-            padding: 20, minWidth: 360, maxWidth: 720,
-            maxHeight: '90vh', overflowY: 'auto',
-            boxShadow: '0 12px 40px rgba(0,0,0,0.25)',
-          }}
-               onClick={(e) => e.stopPropagation()}>
-            <HookupGuide
-              gripperType={_gripperType}
-              mode="editor"
-              onClose={() => _setShowHookup(false)}
-            />
-          </div>
-        </div>,
+        <HardwareSetupWizard
+          onClose={() => _setShowHookup(false)}
+          initialToolKey={
+            _gripperType === 'custom' && program?.config?.tool_id
+              ? `custom:${program.config.tool_id}`
+              : _gripperType
+          }
+          readOnly
+        />,
         document.body)}
     </div>
   )
@@ -4038,6 +4025,7 @@ export default function ProgramEditor() {
   // expected behaviour, file-manager style.
   const [showWizard, setShowWizard]         = useState(false)
   const [showPbd,    setShowPbd]            = useState(false)
+  const [showHardwareSetup, setShowHardwareSetup] = useState(false)
   const [editingId, setEditingId]           = useState(null)
   // True when the operator has opened the dedicated pallet config
   // editor for this program (entry point: Edit button on any
@@ -5712,6 +5700,17 @@ export default function ProgramEditor() {
           New Program Wizard
         </button>
 
+        <button onClick={() => setShowHardwareSetup(true)}
+          data-testid="hardware-setup-launcher"
+          title="Confirm the wiring for a tool. Persists per-tool; New programs read this state."
+          style={{
+            padding: '6px 12px', fontSize: 12, fontWeight: 600,
+            background: '#0EA5E9', color: '#fff', border: 'none',
+            borderRadius: 6, cursor: 'pointer', flexShrink: 0,
+          }}>
+          Hardware Setup
+        </button>
+
         <button onClick={() => setShowPbd(true)}
           title="Generate a draft program from a demonstration video + voice narration"
           style={{
@@ -6672,6 +6671,12 @@ export default function ProgramEditor() {
             }
             setShowWizard(false)
           }}
+        />
+      )}
+
+      {showHardwareSetup && (
+        <HardwareSetupWizard
+          onClose={() => setShowHardwareSetup(false)}
         />
       )}
 

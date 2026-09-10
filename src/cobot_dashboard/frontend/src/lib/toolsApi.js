@@ -152,3 +152,49 @@ export async function deleteTool(toolId) {
 export function toolMeshUrl(toolId) {
   return `/api/tools/${encodeURIComponent(toolId)}/mesh`
 }
+
+// ── Tool-hookup confirmation (per-tool, not per-program) ────────
+// The Program Wizard used to walk hookup inline. It's now a
+// standalone Hardware Setup wizard; the record persists per-tool
+// keyed by "vacuum" / "finger" / "custom:<tool_id>".
+//
+// Wire shape (server side):
+//   GET  /api/tool_hookup            → {ok, records: {[key]: rec}}
+//   GET  /api/tool_hookup/<key>      → {ok, tool_key, record|null}
+//   POST /api/tool_hookup/<key>      → body {no_sensor, optional}
+
+export function toolHookupKey(gripperType, toolId = null) {
+  if (gripperType === 'custom' && toolId) return `custom:${toolId}`
+  return gripperType || 'finger'
+}
+
+export async function listToolHookups() {
+  const res = await fetch('/api/tool_hookup')
+  if (!res.ok) return _refuseByName(res)
+  const body = await _json(res)
+  return (body && body.records) || {}
+}
+
+export async function getToolHookup(toolKey) {
+  const res = await fetch(
+    `/api/tool_hookup/${encodeURIComponent(toolKey)}`)
+  if (!res.ok) return _refuseByName(res)
+  const body = await _json(res)
+  return (body && body.record) || null
+}
+
+export async function confirmToolHookup(toolKey, { noSensor, optional } = {}) {
+  const res = await fetch(
+    `/api/tool_hookup/${encodeURIComponent(toolKey)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        no_sensor: noSensor || {},
+        optional:  optional  || {},
+      }),
+    })
+  if (!res.ok) return _refuseByName(res)
+  const body = await _json(res)
+  return (body && body.record) || null
+}

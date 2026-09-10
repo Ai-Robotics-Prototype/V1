@@ -1,26 +1,19 @@
-"""Peripheral hookup guide pinned regression (2026-09-08).
+"""Peripheral hookup guide pinned regression.
 
-Directive:
-  1. New wizard page immediately after gripper-type selection —
-     'Connect your hardware' — with a Skip ('already connected').
-     Editor Tool & Payload strip carries a "View hookup" button
-     that reopens the same guide read-only.
-  2. Data-driven from /opt/cobot/hookup/hookup_map.json:
-     coordinate table for the M8 grid (4×5 rows/cols, IN1–IN10
-     top two rows, OUT1–OUT10 bottom two rows) + labeled air
-     stations + per-gripper connection lists.
-     Placeholder connections carry needs_operator_confirmation:
-     true — the wizard renders WHATEVER the file says.
-  3. Panel artwork lives in frontend/src/assets/hookup/ — SVG
-     placeholders now; PNG replacements drop in without any
-     coordinate churn (highlights are computed from x_pct/y_pct
-     fractions of whatever image is loaded).
-  4. Display-only: no IO / motion published. Only writes
-     hookup_confirmed + hookup_skipped onto answers (which land
-     in the saved program config).
-  5. safeIdx self-heal preserved — page skip predicate honours
-     hookup_skipped so navigating back doesn't get stuck; every
-     setAnswer that gates a skip goes through goNext(override).
+2026-09-10 restructure: HookupGuide is no longer a New Program
+Wizard page. It's hosted by the standalone HardwareSetupWizard
+launched from the Program Library header; confirmation persists
+PER-TOOL (via /api/tool_hookup) rather than per-program. The
+wizard's gripper-type page still records the tool AND renders
+an inline thread line reporting the tool's hookup-confirmation
+status — informational only, never blocks program creation.
+The editor's "View hookup" button opens the Hardware Setup
+wizard read-only for the program's tool.
+
+What stays untouched: the map file schema, coordinate overlays,
+io_role coverage test, needs_operator_confirmation placeholders,
+no-sensor codegen invariant. See test_hookup_coverage.py for the
+class-fence walker that keeps codegen and hookup_map in sync.
 """
 
 from __future__ import annotations
@@ -39,6 +32,8 @@ EDITOR = os.path.abspath(os.path.join(
     HERE, '..', 'frontend', 'src', 'components', 'ProgramEditor.jsx'))
 GUIDE = os.path.abspath(os.path.join(
     HERE, '..', 'frontend', 'src', 'components', 'HookupGuide.jsx'))
+HW_SETUP = os.path.abspath(os.path.join(
+    HERE, '..', 'frontend', 'src', 'components', 'HardwareSetupWizard.jsx'))
 HOOKUP_MAP = '/opt/cobot/hookup/hookup_map.json'
 ASSETS = os.path.abspath(os.path.join(
     HERE, '..', 'frontend', 'src', 'assets', 'hookup'))
@@ -143,39 +138,63 @@ def test_backend_endpoint_wired():
     assert "'hookup_map_missing'" in src
 
 
-def test_wizard_page_inserted_after_gripper_type():
-    """New PAGES entry id='hookup' lands immediately after
-    id='gripper_type' and before id='gripper_settings' — the
-    natural post-selection slot per operator directive."""
+def test_program_wizard_has_no_hookup_page():
+    """2026-09-10 restructure: the New Program Wizard no longer
+    hosts the hookup guide. The 'hookup' PAGES entry is gone;
+    HookupGuide is not imported by ProgramWizard.jsx; the wizard
+    persists no hookup_confirmed / hookup_skipped answers.
+
+    Skip-pattern doctrine still applies for OTHER pages (see
+    test_wizard_simplification.py) — this test just enforces the
+    absence of the retired page. desync suite stays green because
+    the page count only drops by one and no new skip predicate
+    was introduced."""
     src = _read(WZ)
-    i_type = src.find("id: 'gripper_type',")
-    i_hook = src.find("id: 'hookup',")
-    i_set  = src.find("id: 'gripper_settings',")
-    assert i_type != -1 and i_hook != -1 and i_set != -1
-    assert i_type < i_hook < i_set, \
-        (f'hookup must sit between gripper_type ({i_type}) and '
-         f'gripper_settings ({i_set}); got hookup at {i_hook}')
+    assert "id: 'hookup'," not in src, \
+        'hookup PAGES entry must be retired from the program wizard'
+    assert "import HookupGuide" not in src, \
+        'HookupGuide import must be gone from ProgramWizard'
+    # The retired-in-wizard machinery (hookup_skipped / setAnswer
+    # for hookup_confirmed) should not persist in the wizard.
+    assert 'setAnswer(\'hookup_skipped\'' not in src
+    assert 'setAnswer(\'hookup_confirmed\'' not in src
 
 
-def test_wizard_skip_honours_desync_class_fix():
-    """Skip button seeds BOTH hookup_skipped:true and
-    hookup_confirmed:false and goes through the goNext(override)
-    pattern so the skip predicate sees the fresh values on the
-    same tick. Same for the confirm button (hookup_skipped:false
-    + hookup_confirmed:true)."""
+def test_program_wizard_shows_thread_line_after_gripper_type():
+    """Item 3: after gripper selection, the wizard renders a
+    quiet inline line reporting per-tool hookup-confirmation
+    status. Reads /api/tool_hookup/<key> via toolsApi's
+    getToolHookup(). Informational only — never blocks."""
     src = _read(WZ)
-    # Skip predicate keys off hookup_skipped or hookup_confirmed.
-    assert 'skip: (answers) => !!answers.hookup_skipped' in src
-    assert 'answers.hookup_confirmed === true' in src
-    # Override discipline. Skip path passes plain flags; Confirm
-    # path also passes hookup_no_sensor per the 2026-09-08
-    # refinement.
-    assert 'goNext({ hookup_skipped: true, hookup_confirmed: false })' in src
-    # Confirm's goNext contains hookup_skipped:false + hookup_confirmed
-    # :true + hookup_no_sensor: <map>. Match on the multi-line form.
-    assert 'hookup_skipped:   false' in src
-    assert 'hookup_confirmed: true' in src
-    assert 'hookup_no_sensor: noSensorMap || {}' in src
+    assert 'function HookupThreadLine' in src, \
+        'inline thread-line component must exist'
+    assert 'data-testid="wizard-hookup-thread"' in src
+    # Consumes the per-tool API (not per-program state).
+    assert 'getToolHookup' in src, \
+        'thread line must fetch tool-hookup record from /api/tool_hookup'
+    assert 'toolHookupKey' in src
+    # Rendered inside the gripper_type page body.
+    gt_idx = src.find("id: 'gripper_type',")
+    assert gt_idx != -1
+    tail = src[gt_idx:gt_idx + 2000]
+    assert '<HookupThreadLine' in tail, \
+        'HookupThreadLine must render on the gripper_type page'
+
+
+def test_program_wizard_snapshots_tool_hookup_at_save():
+    """Item 5: hookup machinery carries over untouched. At save
+    time the wizard reads the tool's confirmation record and
+    snapshots no_sensor + optional-answers into program.config
+    so downstream codegen consumers (effectorVocab withBlowOff,
+    hookup_no_sensor invariant) behave identically to the
+    pre-restructure per-program wizard."""
+    src = _read(WZ)
+    assert 'const rec = await getToolHookup(key)' in src
+    assert 'config.hookup_no_sensor = { ...rec.no_sensor }' in src
+    # optional-toggle keys spread onto config as top-level keys
+    # (matches the retired wizard's `for k of optionalMap` spread
+    # so answers.blow_off_enabled etc. still land on config).
+    assert 'config[k] = rec.optional[k]' in src
 
 
 def test_hookup_guide_component_shape():
@@ -217,8 +236,13 @@ def test_no_sensor_toggle_hides_sensor_card_and_persists():
     """Clicking the 'No sensor' button on a sensor card sets the
     id in `noSensor` state, hides the card, and shows a hidden-
     cards summary line with the recommendation text. On confirm,
-    the map lands in `answers.hookup_no_sensor` (persisted on
-    program.config via handleSave's spread)."""
+    the map now lands on the PER-TOOL record (via
+    /api/tool_hookup/<key>) — HardwareSetupWizard is the host.
+
+    Program-side plumbing carries over: wizard's handleSave
+    snapshots the tool record's no_sensor into
+    program.config.hookup_no_sensor so effectorVocab keeps
+    behaving as before."""
     src = _read(GUIDE)
     # Filter drops hidden cards (multi-branch filter now — handles
     # noSensor + optional toggles).
@@ -226,12 +250,16 @@ def test_no_sensor_toggle_hides_sensor_card_and_persists():
     # Summary rendered for hidden entries.
     assert 'data-testid="hookup-no-sensor-note"' in src
     assert 'Re-add sensor' in src
-    # Wizard hands the map back on confirm.
+    # Standalone Hardware Setup wizard hosts the guide and hands
+    # the map back via confirmToolHookup() POST — the per-tool
+    # persistence path.
+    hs = _read(HW_SETUP)
+    assert 'confirmToolHookup' in hs
+    assert 'noSensor: noSensorMap' in hs
+    # Wizard-side snapshot lands on program.config.
     wz = _read(os.path.abspath(os.path.join(
         HERE, '..', 'frontend', 'src', 'components', 'ProgramWizard.jsx')))
-    assert 'hookup_no_sensor' in wz
-    assert 'noSensor={answers.hookup_no_sensor || {}}' in wz
-    assert 'goNext({' in wz  # override discipline preserved
+    assert 'config.hookup_no_sensor = { ...rec.no_sensor }' in wz
     # effectorEngage documents the invariant.
     voc = _read(os.path.abspath(os.path.join(
         HERE, '..', 'frontend', 'src', 'lib', 'effectorVocab.js')))
@@ -268,16 +296,72 @@ def test_vacuum_engage_still_timed_dwell_only():
 
 def test_editor_view_hookup_button_wired():
     """Program editor's Tool & Payload strip carries the View
-    hookup button; opening it renders <HookupGuide mode='editor'>
-    inside a portal modal."""
+    hookup button; opening it now renders the HardwareSetupWizard
+    read-only (mount pre-scoped to the program's tool via
+    initialToolKey). Same behavior, new home per the 2026-09-10
+    restructure."""
     src = _read(EDITOR)
-    assert "import HookupGuide from './HookupGuide'" in src
+    # View hookup button still exists in the Tool & Payload strip.
     assert 'data-testid="view-hookup-button"' in src
-    # Modal renders in editor mode.
-    assert 'mode="editor"' in src
+    # The read-only jump-in mounts HardwareSetupWizard (not
+    # HookupGuide directly any more).
+    assert "import HardwareSetupWizard from './HardwareSetupWizard'" in src
+    assert '<HardwareSetupWizard' in src
+    assert 'readOnly' in src
     # Gripper type is resolved from program.config.gripper_type
     # (or gripper.type as fallback).
     assert 'config.gripper_type || program.config.gripper?.type' in src
+    # And the editor no longer imports HookupGuide directly.
+    assert "import HookupGuide from './HookupGuide'" not in src, \
+        'HookupGuide import must be replaced by HardwareSetupWizard'
+
+
+def test_program_library_header_has_hardware_setup_launcher():
+    """Item 2: the Hardware Setup wizard launches from the Program
+    Library header, beside 'New Program Wizard'."""
+    src = _read(EDITOR)
+    assert 'data-testid="hardware-setup-launcher"' in src
+    # Modal render entry present.
+    assert 'setShowHardwareSetup(true)' in src
+    assert '{showHardwareSetup && (' in src
+
+
+def test_hardware_setup_wizard_component_shape():
+    """The standalone wizard exposes the tool-picker → guide flow
+    with a Close control; jumps straight to a tool when
+    initialToolKey is passed; renders the per-tool confirmation
+    status line; and POSTs the record via confirmToolHookup."""
+    src = _read(HW_SETUP)
+    for hook in (
+        'data-testid="hardware-setup-wizard"',
+        'data-testid="hardware-setup-close"',
+        'data-testid="hardware-setup-picker"',
+        'data-testid="hardware-setup-tool-choice"',
+        'data-testid="hardware-setup-body"',
+        'data-testid="hardware-setup-status"',
+    ):
+        assert hook in src, f'missing hook {hook}'
+    # Uses HookupGuide underneath — no fork of the guide component.
+    assert "import HookupGuide from './HookupGuide'" in src
+    # POST persistence.
+    assert 'confirmToolHookup' in src
+    # Read on open + refresh after confirm.
+    assert 'getToolHookup' in src
+
+
+def test_backend_tool_hookup_endpoints_wired():
+    """Item 2: per-tool confirmation state lives at
+    /api/tool_hookup/<tool_key>. GET returns the record (or null),
+    POST persists with a confirmed_at timestamp."""
+    src = _read(SERVER)
+    assert '@app.get("/api/tool_hookup")' in src
+    assert '@app.get("/api/tool_hookup/{tool_key:path}")' in src
+    assert '@app.post("/api/tool_hookup/{tool_key:path}")' in src
+    assert '_TOOL_HOOKUP_PATH' in src
+    # Tool-key validator enforces vacuum/finger/custom:<hex>.
+    assert "_validate_tool_key" in src
+    # Timestamped record.
+    assert "'confirmed_at'" in src
 
 
 def test_panel_asset_files_present_with_operator_naming():

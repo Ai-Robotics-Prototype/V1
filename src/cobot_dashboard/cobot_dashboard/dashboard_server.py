@@ -8,6 +8,7 @@ import math
 import os
 import random
 import struct
+import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -9676,6 +9677,129 @@ if FASTAPI_AVAILABLE:
                 'reason_code': 'hookup_map_read_error',
             }, status_code=500)
         return {'ok': True, 'map': data}
+
+    # ── Per-tool hookup confirmation state ────────────────────
+    # The Program Wizard used to walk the operator through
+    # HookupGuide inline. That's now a standalone Hardware Setup
+    # wizard launched from the Program Library header; when the
+    # operator finishes a tool's hookup, we persist per-tool
+    # (not per-program) with a confirmed_at timestamp + the
+    # no-sensor map + optional-toggle answers, keyed by:
+    #   - "vacuum"  or "finger"      (built-in gripper types)
+    #   - "custom:<tool_id>"         (EOAT-library custom tool)
+    #
+    # The wizard reads GET to render the thread line
+    # ("Hardware for this tool was confirmed <date>" vs "Not yet
+    # confirmed — run Hardware Setup"); the wizard's handleSave
+    # snapshots the record's no_sensor + optional into
+    # program.config so codegen consumers (effectorVocab
+    # withBlowOff, hookup_no_sensor invariant) stay unchanged.
+    _TOOL_HOOKUP_PATH = os.environ.get(
+        'COBOT_TOOL_HOOKUP',
+        '/opt/cobot/hookup/tool_hookup.json')
+    _TOOL_HOOKUP_LOCK = threading.RLock()
+
+    def _validate_tool_key(tool_key: str) -> None:
+        if not isinstance(tool_key, str) or not tool_key:
+            raise ValueError('tool_key required')
+        if tool_key in ('vacuum', 'finger'):
+            return
+        if not tool_key.startswith('custom:'):
+            raise ValueError(f'invalid tool_key: {tool_key!r}')
+        tid = tool_key[len('custom:'):]
+        # Reuse tools_library's hex-id shape check to prevent
+        # path-traversal or garbage keys.
+        if (not tid or not all(c in '0123456789abcdef' for c in tid)
+                or not (8 <= len(tid) <= 32)):
+            raise ValueError(f'invalid tool_key: {tool_key!r}')
+
+    def _read_tool_hookup_all() -> dict:
+        try:
+            with open(_TOOL_HOOKUP_PATH) as fh:
+                d = json.load(fh)
+            if isinstance(d, dict):
+                return d
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            return {}
+        return {}
+
+    def _write_tool_hookup_all(records: dict) -> None:
+        os.makedirs(os.path.dirname(_TOOL_HOOKUP_PATH),
+                    exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            prefix='.tool_hookup_', suffix='.tmp',
+            dir=os.path.dirname(_TOOL_HOOKUP_PATH))
+        try:
+            with os.fdopen(fd, 'w') as fh:
+                json.dump(records, fh, indent=2, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, _TOOL_HOOKUP_PATH)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    @app.get("/api/tool_hookup")
+    async def api_tool_hookup_list():
+        with _TOOL_HOOKUP_LOCK:
+            records = _read_tool_hookup_all()
+        return {'ok': True, 'records': records}
+
+    @app.get("/api/tool_hookup/{tool_key:path}")
+    async def api_tool_hookup_get(tool_key: str):
+        try:
+            _validate_tool_key(tool_key)
+        except ValueError as e:
+            return JSONResponse({
+                'ok': False,
+                'reason_code': 'invalid_tool_key',
+                'detail': str(e),
+            }, status_code=400)
+        with _TOOL_HOOKUP_LOCK:
+            rec = _read_tool_hookup_all().get(tool_key)
+        return {'ok': True, 'tool_key': tool_key, 'record': rec}
+
+    @app.post("/api/tool_hookup/{tool_key:path}")
+    async def api_tool_hookup_confirm(tool_key: str,
+                                      request: Request):
+        try:
+            _validate_tool_key(tool_key)
+        except ValueError as e:
+            return JSONResponse({
+                'ok': False,
+                'reason_code': 'invalid_tool_key',
+                'detail': str(e),
+            }, status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        no_sensor = body.get('no_sensor') or {}
+        optional  = body.get('optional')  or {}
+        if not isinstance(no_sensor, dict) or not isinstance(optional, dict):
+            return JSONResponse({
+                'ok': False,
+                'reason_code': 'invalid_body',
+                'detail': 'no_sensor and optional must be objects',
+            }, status_code=400)
+        rec = {
+            'confirmed_at': time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            'no_sensor': {str(k): bool(v)
+                          for k, v in no_sensor.items() if v},
+            'optional':  {str(k): bool(v)
+                          for k, v in optional.items()},
+        }
+        with _TOOL_HOOKUP_LOCK:
+            records = _read_tool_hookup_all()
+            records[tool_key] = rec
+            _write_tool_hookup_all(records)
+        return {'ok': True, 'tool_key': tool_key, 'record': rec}
 
     @app.post("/api/event_log/append")
     async def api_event_log_append(request: Request):

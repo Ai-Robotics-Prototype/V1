@@ -7,7 +7,7 @@ import { useStore } from '../store/useStore'
 import { HoldButton } from './JogControls'
 import NumericField from './NumericField'
 import PalletFrameDiagram from './PalletFrameDiagram'
-import HookupGuide from './HookupGuide'
+import { getToolHookup, toolHookupKey } from '../lib/toolsApi'
 import { useIOPortmap, portmapToOptions } from '../lib/ioPortmap'
 import { effectorReady, effectorEngage, effectorDisengage,
          effectorOf,
@@ -2292,6 +2292,59 @@ function MachineIOBody({ answers, setAnswer, goNext }) {
   )
 }
 
+// Inline hookup-status line for the gripper_type wizard page —
+// reads /api/tool_hookup/<key> and renders a quiet one-liner:
+// "Hardware for this tool was confirmed <date>" or "Hardware not
+// yet confirmed — run Hardware Setup from the Program Library".
+// Informational only; never blocks program creation. Placed here
+// (near PAGES) so the page render body stays terse.
+function HookupThreadLine({ gripperType, toolId }) {
+  const [rec, setRec] = useState(null)
+  const [loaded, setLoaded] = useState(false)
+  useEffect(() => {
+    if (!gripperType) { setRec(null); setLoaded(false); return }
+    let alive = true
+    const key = toolHookupKey(gripperType, toolId)
+    setLoaded(false)
+    getToolHookup(key)
+      .then((r) => { if (alive) { setRec(r); setLoaded(true) } })
+      .catch(() => { if (alive) { setRec(null); setLoaded(true) } })
+    return () => { alive = false }
+  }, [gripperType, toolId])
+  if (!gripperType) return null
+  if (!loaded) return null
+  const at = rec && rec.confirmed_at
+  const style = {
+    marginTop: 12, padding: '8px 12px',
+    borderRadius: 6, fontSize: 12,
+    background: at ? '#F0FDF4' : '#FFFBEB',
+    border: `1px solid ${at ? '#BBF7D0' : '#FDE68A'}`,
+    color:  at ? '#065F46' : '#92400E',
+  }
+  let text
+  try {
+    const d = at ? new Date(at) : null
+    const nice = d && !Number.isNaN(d.getTime())
+      ? d.toLocaleDateString(undefined,
+          { year: 'numeric', month: 'short', day: 'numeric' })
+      : at
+    text = at
+      ? `Hardware for this tool was confirmed ${nice}.`
+      : 'Hardware not yet confirmed — run Hardware Setup from the Program Library.'
+  } catch {
+    text = at
+      ? `Hardware for this tool was confirmed ${at}.`
+      : 'Hardware not yet confirmed — run Hardware Setup from the Program Library.'
+  }
+  return (
+    <div data-testid="wizard-hookup-thread"
+         data-confirmed={at ? 'true' : 'false'}
+         style={style}>
+      {text}
+    </div>
+  )
+}
+
 const PAGES = [
   // 2026-09-08 wizard simplification (operator directive):
   //   * `cell` page RETIRED. Auto-assigned in ProgramWizard mount
@@ -2431,6 +2484,15 @@ const PAGES = [
   },
 
   // 3: What gripper type?
+  //
+  // Hookup guidance moved OUT of this wizard (2026-09-10 operator
+  // directive): the "Connect your hardware" page is retired here.
+  // Hookup is now per-tool via the standalone Hardware Setup
+  // wizard launched from the Program Library header. This page
+  // still records the gripper type (programs need to know the
+  // tool) AND renders a quiet inline thread line reporting the
+  // tool's hookup-confirmation status — informational only,
+  // never blocks program creation.
   {
     id: 'gripper_type',
     render: ({ answers, setAnswer, goNext }) => (
@@ -2448,67 +2510,9 @@ const PAGES = [
             onClick={() => { setAnswer('gripper_type', g.value); goNext({ gripper_type: g.value }) }}
           />
         ))}
-      </QuestionCard>
-    ),
-  },
-
-  // 3.5: Hookup guide (2026-09-08 operator directive)
-  //   Data-driven per-gripper-type peripheral hookup instructions.
-  //   Rendered immediately after gripper-type selection so the
-  //   operator wires the physical robot before proceeding to any
-  //   teach step. Skip button ("already connected") advances
-  //   with hookup_skipped: true and hookup_confirmed: false;
-  //   confirm advances with hookup_confirmed: true. Display-only —
-  //   no IO or motion published. Skip predicate honours
-  //   hookup_skipped so navigating back and forth doesn't get
-  //   stuck; hookup_confirmed alone would re-force the page
-  //   after every visit.
-  //
-  //   Custom gripper: the hookup_map has an empty array for
-  //   'custom' (they wire their own I/O in Configure); the guide
-  //   renders a Skip prompt and moves on.
-  {
-    id: 'hookup',
-    skip: (answers) => !!answers.hookup_skipped
-                    || answers.hookup_confirmed === true,
-    render: ({ answers, setAnswer, goNext }) => (
-      <QuestionCard question="Connect your hardware">
-        <HookupGuide
-          gripperType={answers.gripper_type || 'finger'}
-          mode="wizard"
-          confirmed={answers.hookup_confirmed === true}
-          noSensor={answers.hookup_no_sensor || {}}
-          optionalAnswers={{
-            // Seed the guide with the answers already in state for
-            // optional toggles (blow_off_enabled etc.) so navigating
-            // back preserves the operator's choice.
-            blow_off_enabled: answers.blow_off_enabled,
-          }}
-          onSkip={() => {
-            setAnswer('hookup_skipped',   true)
-            setAnswer('hookup_confirmed', false)
-            goNext({ hookup_skipped: true, hookup_confirmed: false })
-          }}
-          onConfirm={(_allChecked, noSensorMap, optionalMap) => {
-            setAnswer('hookup_skipped',    false)
-            setAnswer('hookup_confirmed',  true)
-            setAnswer('hookup_no_sensor',  noSensorMap || {})
-            // 2026-09-08 blow-off audit: spread the optional-toggle
-            // map onto answers as top-level keys (e.g.
-            // answers.blow_off_enabled). buildSteps' _vocabOpts
-            // reads answers.blow_off_enabled and passes it as
-            // withBlowOff into effectorDisengage.
-            const opt = optionalMap || {}
-            for (const k of Object.keys(opt)) {
-              setAnswer(k, opt[k])
-            }
-            goNext({
-              hookup_skipped:   false,
-              hookup_confirmed: true,
-              hookup_no_sensor: noSensorMap || {},
-              ...opt,
-            })
-          }}
+        <HookupThreadLine
+          gripperType={answers.gripper_type}
+          toolId={answers.custom_tool_id || null}
         />
       </QuestionCard>
     ),
@@ -3989,6 +3993,32 @@ export default function ProgramWizard({ onClose, onSaved }) {
       // Wizard-internal state that shouldn't ship on config.
       delete config.custom_tool_substep
       delete config.custom_tool_id
+
+      // 2026-09-10 hookup restructure: hookup guidance now lives in
+      // the standalone Hardware Setup wizard (per-tool, not per-
+      // program). Snapshot the tool's confirmation record onto
+      // program.config so downstream codegen consumers (effectorVocab
+      // `withBlowOff`, `hookup_no_sensor` invariant) stay unchanged.
+      // Failure to read → leave config untouched (blow-off default
+      // remains opt-out true, matching prior silent-default behavior).
+      try {
+        const gt = answers.gripper_type || 'finger'
+        const key = toolHookupKey(gt, answers.custom_tool_id || config.tool_id || null)
+        const rec = await getToolHookup(key)
+        if (rec) {
+          if (rec.no_sensor && typeof rec.no_sensor === 'object') {
+            config.hookup_no_sensor = { ...rec.no_sensor }
+          }
+          if (rec.optional && typeof rec.optional === 'object') {
+            for (const k of Object.keys(rec.optional)) {
+              config[k] = rec.optional[k]
+            }
+          }
+          if (rec.confirmed_at) {
+            config.hookup_confirmed_at = rec.confirmed_at
+          }
+        }
+      } catch { /* thread line already advertises status; do not block save */ }
       if (config.payload_cog_mm && typeof config.payload_cog_mm === 'object'
           && Object.keys(config.payload_cog_mm).length === 0) {
         delete config.payload_cog_mm
