@@ -166,6 +166,121 @@ def test_face_down_operator_copy_covers_singularity_refusal():
     assert 'stretched-out pose' in src.lower()
 
 
+# ── Item 3 sweep: no new Cartesian-solving path may ship ungoverned
+
+def test_every_mode2_emit_site_routes_through_the_guard():
+    """Item 3 pin (2026-09-10 re-issue): every function in the
+    driver that builds a Robot/jog Cartesian frame (`'mode': 2`)
+    MUST either (a) call `self._sing_guard.sigma_min(` in the
+    same function body — the direct guard path — or (b) set
+    `self._jog_mode = 'continuous_cart'` inside the emit block,
+    which delegates the σ_min check to `_on_jog_supervise`'s
+    continuous_cart branch (already governed, line-audited).
+
+    A NEW handler that emits `mode:2` without doing either is
+    exactly the 'ungoverned Cartesian path' the operator directive
+    forbids. This test enumerates every emit site by grep, resolves
+    each to its enclosing `def`, and asserts one of the two
+    conditions. If a new site shows up, this test fails until the
+    guard wiring lands."""
+    src = _src()
+    # Every Cartesian emit site: `'mode':` `2` (with optional
+    # comment / whitespace) inside a Robot/jog frame body.
+    emit_line_indices = [
+        i for i, line in enumerate(src.splitlines())
+        if re.search(r"'mode':\s*2\s*,", line)
+        # exclude comments about the shape (line 233, 2165, 2907)
+        and 'gated behind' not in line
+        and 'fixed 150 ms pulse' not in line
+        and 'mode:2' not in line
+    ]
+    assert emit_line_indices, (
+        "no `'mode': 2,` emit sites found — grep pattern drifted or "
+        "Cartesian emission moved. Update the pin so it keeps "
+        "catching new emit sites, not disable it")
+
+    # Resolve each emit line to its enclosing `def`, then check
+    # the function body for the two acceptable guard patterns.
+    lines = src.splitlines()
+    def_starts = [
+        (i, ln) for i, ln in enumerate(lines)
+        if re.match(r'\s{4}def\s+\w+\(', ln)
+        or re.match(r'^def\s+\w+\(', ln)
+    ]
+    def _enclosing(idx):
+        # last `def` that begins strictly before idx
+        chosen = None
+        for i, ln in def_starts:
+            if i <= idx:
+                chosen = (i, ln.strip())
+            else:
+                break
+        return chosen
+    def _body(start_i):
+        end = len(lines)
+        for j, ln in def_starts:
+            if j > start_i:
+                end = j
+                break
+        return '\n'.join(lines[start_i:end])
+    # Governor-internal emit helpers are called ONLY after the
+    # guard has already run in the caller's frame — they do not
+    # need their own σ_min check. Enumerated explicitly so a NEW
+    # helper never gets a free pass just by matching the name shape.
+    GUARD_INTERNAL_HELPERS = {
+        'def _apply_cart_speed_scale_locked',
+    }
+    for emit_i in emit_line_indices:
+        enc = _enclosing(emit_i)
+        assert enc, f'no enclosing def for mode:2 emit at line {emit_i+1}'
+        fn_start, fn_sig = enc
+        if any(fn_sig.startswith(h) for h in GUARD_INTERNAL_HELPERS):
+            # Whitelisted governor-internal emitter — the σ_min
+            # check happens in every caller before invoking this
+            # helper. Docstring of the helper documents the
+            # invariant; adding a redundant σ_min check here would
+            # only race the caller's already-locked evaluation.
+            continue
+        body = _body(fn_start)
+        has_sigma = 'self._sing_guard.sigma_min(' in body
+        delegates_to_supervise = (
+            "self._jog_mode = 'continuous_cart'" in body)
+        assert has_sigma or delegates_to_supervise, (
+            f'Cartesian emit at line {emit_i+1} (in {fn_sig!r}) has '
+            f'NEITHER an in-function σ_min check NOR a delegation to '
+            f'continuous_cart supervise. This is exactly the '
+            f'ungoverned-new-path class the operator directive '
+            f'forbids. Either call `self._sing_guard.sigma_min(...)` '
+            f'against `_cart_sigma_hard` before the emit, OR set '
+            f'`self._jog_mode = \'continuous_cart\'` so the supervise '
+            f'tick governs it. If this is a genuine governor-internal '
+            f'emitter (like _apply_cart_speed_scale_locked), add it '
+            f'to GUARD_INTERNAL_HELPERS with a why-comment.')
+
+
+def test_supervise_continuous_cart_calls_sigma_min():
+    """Fence for the delegation branch: `_on_jog_supervise`'s
+    continuous_cart branch MUST call `_sing_guard.sigma_min` per
+    tick. If a refactor moves the σ_min call out of the supervise
+    body, the delegation half of the sweep above becomes a lie.
+    Pin the invariant so both halves stay honest."""
+    src = _src()
+    m = re.search(
+        r'def _on_jog_supervise\(self\):(.+?)(?:\n    def |\Z)',
+        src, re.DOTALL)
+    assert m, '_on_jog_supervise not found'
+    body = m.group(1)
+    # σ_min is computed per tick in the continuous_cart branch.
+    assert 'self._sing_guard.sigma_min(self._joint_deg)' in body, (
+        'supervise loop must compute σ_min per tick — this is what '
+        'the delegation branch of the every-emit-site sweep relies '
+        'on. Do not move the σ_min call out of supervise.')
+    # And ENFORCE (not just observe) is the default posture.
+    assert 'self._stop_jog_locked(' in body, (
+        'supervise loop must STOP jog on σ ≤ hard — observe-only '
+        'mode is the 2026-08-28 demotion falsified by the incident')
+
+
 # ── Frontend HUD: distinguishes the softening causes ──────────────
 
 def test_live_margin_hud_renders_singularity_cause():
