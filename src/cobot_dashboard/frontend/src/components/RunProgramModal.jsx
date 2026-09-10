@@ -1,34 +1,20 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store/useStore'
-import { readPayload, PAYLOAD_UNSET_WARNING, PAYLOAD_INFO_ONLY }
-  from '../lib/payload'
 import { runnableStepCount } from '../lib/programTruth'
 import { namedLoadError } from '../lib/loadOutcome'
 
-// Confirm modal for the Monitor "Run Program" button. Reads the same
-// currentProgram + robot.allow_move + robot.operator_speed_limit that
-// the ladder pipeline gates on — so the modal shows the OPERATOR
-// EXACTLY what will happen (which program, how many steps, what speed
-// after the cap, whether the gate is even open).
+// Confirm modal for the Monitor "Run Program" button.
 //
-// Behavior:
-//   - Opens when store.runModalOpen === true (set by MonitorDashboard's
-//     Run button handler).
-//   - Confirm → POST /api/estun/program/run — the ladder-proven pipeline
-//     kicks off (codegen → HTTP save → run) end-to-end. The response
-//     surfaces:
-//       ok=true  → run published, modal closes and Monitor's live line
-//                  indicator takes over.
-//       ok=false → gate closed or save failed. Modal stays open,
-//                  showing the driver's OWN rejection reason (from
-//                  STATE.robot.rejected's newest entry). Never a
-//                  generic "something went wrong".
-//   - Cancel or backdrop click → close, no wire traffic.
+// Confirm-view surface is intentionally minimal (operator directive):
+// program name, steps taught/total, requested speed, effective speed,
+// Cancel / Confirm — nothing else. No payload row, no payload
+// warning, no executor/backend info note, no gate/staleness banners.
+// Pinned by RunProgramModal.pinned.test.js so a future modal rebuild
+// can't resurrect the removed strings.
 //
-// The modal does NOT pre-check the gate. Per the operator's requirement
-// (Lesson 97 follow-up), pressing Run with the gate closed must still
-// attempt and surface the DRIVER'S rejection — proves the pipeline is
-// wired end-to-end even when nothing moves.
+// Confirm → POST /api/estun/program/run; ok=true closes the modal and
+// hands off to Monitor's live line indicator; ok=false stays open
+// with the driver's rejection routed through namedLoadError.
 
 export default function RunProgramModal() {
   const open           = useStore((s) => s.runModalOpen)
@@ -48,13 +34,6 @@ export default function RunProgramModal() {
   const [errorCopy, setErrorCopy] = useState(null)
   const [showTechnical, setShowTechnical] = useState(false)
 
-  // Codegen staleness — polled once when the modal opens. If the
-  // in-memory sha differs from the disk sha, the run WILL use the
-  // OLD codegen and the manifest will stamp codegen_stale=true. We
-  // never block; we just surface it prominently so the operator
-  // sees it BEFORE the run (2026-07-30 4th-staleness episode).
-  const [codegen, setCodegen] = useState(null)
-
   // Reset local state each time the modal is opened.
   useEffect(() => {
     if (open) {
@@ -62,34 +41,7 @@ export default function RunProgramModal() {
       setResult(null)
       setErrorCopy(null)
       setShowTechnical(false)
-      setCodegen(null)
-      // Fetch fresh state on every open — the operator may have
-      // restarted the service between button presses.
-      fetch('/api/codegen/status')
-        .then((r) => r.ok ? r.json() : null)
-        .then((body) => { if (body) setCodegen(body) })
-        .catch(() => {})
     }
-  }, [open])
-
-  // 2026-08-28 addendum-52 cutover: read the run-backend flag +
-  // target mode from provenance so the modal can auto-target
-  // Remote (ros2_executor) vs Auto (legacy_lua). Hooks must
-  // live above the `if (!open)` guard (rules-of-hooks).
-  const [runBackend,    setRunBackend]    = useState('legacy_lua')
-  const [targetModeStr, setTargetModeStr] = useState('auto')
-  useEffect(() => {
-    if (!open) return
-    let cancelled = false
-    fetch('/api/provenance', { cache: 'no-store' })
-      .then((r) => r.ok ? r.json() : null)
-      .then((d) => {
-        if (cancelled || !d) return
-        setRunBackend(String(d.run_backend || 'legacy_lua'))
-        setTargetModeStr(String(d.run_backend_target_mode || 'auto'))
-      })
-      .catch(() => { /* nop */ })
-    return () => { cancelled = true }
   }, [open])
 
   if (!open) return null
@@ -116,30 +68,6 @@ export default function RunProgramModal() {
   const effectivePct    = Math.max(1, Math.min(operatorCapPct, requestedPct))
   const isCapped        = requestedPct > operatorCapPct
 
-  const allowMove   = !!robot.allow_move
-  const monitorOnly = !!robot.monitor_only
-  const connected   = !!robot.connected
-  // 2026-08-28 mode-switch workflow sugar + addendum-52 cutover.
-  // Legacy Lua-push runs in AUTO (code 0). ROS2 executor runs in
-  // REMOTE (code 2, per HARDWARE.md > Robot-mode code table). The
-  // target mode is read from /api/provenance.run_backend_target_mode
-  // — see the fetch below.
-  const robotModeCode = Number.isFinite(robot.robot_mode_code)
-                          ? robot.robot_mode_code : -1
-  const allowMode     = !!robot.allow_mode
-  const targetModeCode = targetModeStr === 'remote' ? 2 : 0
-  const inTarget       = robotModeCode === targetModeCode
-  // 2026-09-02 (per operator directive, wire-proven): the Run button
-  // does ONE thing — push program + project/run + poll ProjectState.
-  // NO mode switch. Bare project/run is accepted by the CC10-A
-  // controller from Manual mode (verb ack + state=2 transition, no
-  // errors). Hard-code willSwitchMode=false so the mode-switch banner
-  // and the mode-switch action are both retired without churning the
-  // derived flags downstream code may still reference.
-  const willSwitchMode = false
-  const targetModeLabel = targetModeStr === 'remote' ? 'Remote' : 'Auto'
-  const willSwitchToAuto = false
-
   const backdrop = {
     position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
     zIndex: 9998, display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -163,8 +91,6 @@ export default function RunProgramModal() {
     background: '#fff', color: '#374151',
     border: '1px solid #d1d5db', borderRadius: 8, cursor: 'pointer',
   }
-
-  const gateOK = allowMove && !monitorOnly && connected
 
   async function confirmRun() {
     if (!currentProgram?.id) {
@@ -235,12 +161,7 @@ export default function RunProgramModal() {
         </div>
 
         {phase === 'confirm' && (
-          <>
-            <div style={{ fontSize: 14, color: '#6b7280', marginBottom: 12 }}>
-              This will overwrite the controller's stored copy of the
-              program (fresh codegen every press — no stale points),
-              then run it autonomously.
-            </div>
+          <div data-testid="run-confirm-body">
             <div style={rowStyle}>
               <span style={{ color: '#6b7280' }}>Program</span>
               <span style={{ fontWeight: 600 }}>
@@ -255,11 +176,7 @@ export default function RunProgramModal() {
             </div>
             <div style={rowStyle}>
               <span style={{ color: '#6b7280' }}>Requested speed</span>
-              <span>{requestedPct}%{isCapped ? ' (from Monitor input)' : ''}</span>
-            </div>
-            <div style={rowStyle}>
-              <span style={{ color: '#6b7280' }}>Operator cap</span>
-              <span>{operatorCapPct}%</span>
+              <span>{requestedPct}%</span>
             </div>
             <div style={rowStyle}>
               <span style={{ color: '#6b7280', fontWeight: 600 }}>
@@ -269,175 +186,18 @@ export default function RunProgramModal() {
                 {isCapped
                   ? `${effectivePct}% (capped from ${requestedPct}%)`
                   : `${effectivePct}%`}
-                {' — runs on REAL ARM'}
               </span>
             </div>
-            {/* Payload row — always shown so the operator sees whether
-                a program was authored with a payload value. When unset
-                a prominent warning appears below; when set an info
-                line clarifies that this is metadata only (we do NOT
-                emit setPayload — the verb isn't wire-proven; the
-                controller selects payload via PayloadId preset). */}
-            {(() => {
-              const p = readPayload(currentProgram)
-              return (
-                <div style={rowStyle}>
-                  <span style={{ color: '#6b7280' }}>Payload</span>
-                  <span style={{
-                    fontWeight: 700,
-                    color: p.isSet ? '#065F46' : '#B45309',
-                  }}>
-                    {p.isSet
-                      ? `${p.kg} kg${p.tool_name ? ` · ${p.tool_name}` : ''} (info only)`
-                      : 'not set — see warning below'}
-                  </span>
-                </div>
-              )
-            })()}
-            {(() => {
-              const p = readPayload(currentProgram)
-              if (p.isSet) {
-                return (
-                  <div style={{
-                    marginTop: 12, padding: 10, background: '#EFF6FF',
-                    border: '1px solid #93C5FD', borderRadius: 6,
-                    color: '#1E3A8A', fontSize: 12, lineHeight: 1.5,
-                  }}>
-                    <b>Payload {p.kg} kg</b>{p.tool_name ? ` · ${p.tool_name}` : ''}.
-                    {' '}{PAYLOAD_INFO_ONLY}
-                  </div>
-                )
-              }
-              return (
-                <div style={{
-                  marginTop: 12, padding: 10, background: '#FEF3C7',
-                  border: '1px solid #F59E0B', borderRadius: 6,
-                  color: '#92400E', fontSize: 13,
-                }}>
-                  <b>⚠ {PAYLOAD_UNSET_WARNING}</b>
-                  {' '}Run is allowed — but every run without a payload
-                  will keep showing this warning.
-                </div>
-              )
-            })()}
-            {!gateOK && (
-              <div style={{
-                marginTop: 12, padding: 10, background: '#FEF3C7',
-                border: '1px solid #F59E0B', borderRadius: 6,
-                color: '#92400E', fontSize: 13,
-              }}>
-                <b>Move gate closed.</b>{' '}
-                {monitorOnly ? 'Driver is in MONITOR-ONLY mode. ' : ''}
-                {!allowMove ? 'allow_move is FALSE. ' : ''}
-                {!connected ? 'Driver not connected to controller. ' : ''}
-                Pressing Confirm below WILL still send the request — the
-                driver will refuse it, and the refusal reason appears here.
-              </div>
-            )}
-            {codegen && codegen.stale && (
-              <div style={{
-                marginTop: 12, padding: 10, background: '#FEF3C7',
-                border: '1px solid #F59E0B', borderRadius: 6,
-                color: '#92400E', fontSize: 13, lineHeight: 1.5,
-              }}
-                data-testid="run-confirm-stale-warning">
-                <b>⚠ Code updated on disk — restart required to apply.</b>
-                {' '}The dashboard is still running the codegen it loaded
-                at boot ({codegen.boot_sha}); disk is {codegen.disk_sha}.
-                Confirming below WILL still send the request, but the
-                controller will receive Lua from the OLD codegen and the
-                run manifest will stamp <code>codegen_stale=true</code>.
-                {' '}Restart <code>roboai-dashboard</code> +
-                {' '}<code>roboai-estun</code> (or run
-                {' '}<code>scripts/deploy.sh</code>) to apply the fix
-                before pressing Run.
-              </div>
-            )}
-            {taughtCount === 0 && (
-              <div style={{
-                marginTop: 12, padding: 10, background: '#FEE2E2',
-                border: '1px solid #DC2626', borderRadius: 6,
-                color: '#7F1D1D', fontSize: 13,
-              }}>
-                <b>Program has no taught poses.</b> Teach at least one
-                point (Program tab → Teach current pose) or add
-                taught steps before running.
-              </div>
-            )}
-            {!idSafe && (
-              <div style={{
-                marginTop: 12, padding: 10, background: '#FEE2E2',
-                border: '1px solid #DC2626', borderRadius: 6,
-                color: '#7F1D1D', fontSize: 13,
-              }}>
-                <b>Program id <code>{currentProgram?.id}</code> can't round-trip on the controller.</b>{' '}
-                Underscores and dashes are treated as path separators.
-                Save this program under a new name (letters + digits only).
-              </div>
-            )}
-            {willSwitchToAuto && (
-              <div style={{
-                marginTop: 10, padding: '8px 12px',
-                background: 'rgba(5, 150, 105, 0.08)',
-                border: '1px solid #059669', borderRadius: 6,
-                fontSize: 13, color: '#065F46',
-              }}>
-                Robot is currently in <b>{
-                  robotModeCode === 0 ? 'Auto' :
-                  robotModeCode === 1 ? 'Manual' :
-                  robotModeCode === 2 ? 'Remote' : 'an unknown mode'
-                }</b>. Confirm will first switch to <b>{targetModeLabel}</b>, then start
-                the program.
-                {robot.enabled && (
-                  <div style={{
-                    marginTop: 6, fontSize: 12, color: '#7C2D12',
-                  }}>
-                    Arm is ENABLED — the controller refuses mode switches
-                    while enabled. The endpoint will briefly disable the
-                    arm, switch to {targetModeLabel}, then re-enable before starting.
-                  </div>
-                )}
-              </div>
-            )}
-            {runBackend === 'legacy_lua' && (
-              <div style={{
-                marginTop: 10, padding: '8px 12px',
-                background: 'rgba(148,163,184,0.08)',
-                border: '1px dashed #94A3B8', borderRadius: 6,
-                fontSize: 12, color: '#475569',
-              }}>
-                Executor: <b>legacy Lua-push</b>. F2.7 cutover pending
-                — see ledger addendum-52. Once RUN_BACKEND=ros2_executor
-                is set, this modal will target Remote instead of Auto
-                and dispatch to the s10_140_executor package.
-              </div>
-            )}
-            {runBackend === 'ros2_executor' && (
-              <div style={{
-                marginTop: 10, padding: '8px 12px',
-                background: 'rgba(124, 58, 237, 0.08)',
-                border: '1px solid #7C3AED', borderRadius: 6,
-                fontSize: 12, color: '#5B21B6',
-              }}>
-                Executor: <b>ROS2 (s10_140_executor, Pilz PTP/LIN)</b>.
-                The legacy Lua-push palletize codegen defect (§644
-                IK-refuse + partial expansion) cannot exist on this
-                path — L222 pre-submit validation refuses composites
-                before dispatch.
-              </div>
-            )}
             <div style={btnRow}>
               <button style={btnGhost} onClick={close}>Cancel</button>
               <button
                 style={btnPrimary('#16A34A', taughtCount === 0 || !idSafe)}
                 onClick={confirmRun}
                 disabled={taughtCount === 0 || !idSafe}>
-                {willSwitchMode
-                  ? `Switch to ${targetModeLabel} and run at ${effectivePct}%`
-                  : `Confirm — Run at ${effectivePct}%`}
+                {`Confirm — Run at ${effectivePct}%`}
               </button>
             </div>
-          </>
+          </div>
         )}
 
         {phase === 'running' && (
