@@ -378,6 +378,24 @@ class EstunCodroidDriver(Node):
         # Cartesian jog at speed_frac=0.15 in a healthy region produces
         # (measured 0.3–0.5 rad/s peak-per-joint in the same session).
         self.declare_parameter('cart_joint_velocity_cap_radps', 1.5)
+        # 2026-09-11 governor-noise audit: the flat 1.5 rad/s cap is
+        # 57.3% of J1/J2/J3's rated 2.618 rad/s but only 47.7% of
+        # J4/J5/J6's rated 3.142 rad/s (S10-140 Config→Safety:
+        # J1/J2/J3=150°/s, J4/J5/J6=180°/s per HARDWARE.md L39-40).
+        # The wrist joints were being flagged during normal jog because
+        # the flat cap strangled their rated envelope. Per-joint list
+        # holds each joint at ~65% of its rated speed — enough
+        # headroom for normal jog dynamics without changing the
+        # near-singularity behavior (a genuine spike still trips the
+        # governor because 65% of rated is still well under the alarm-
+        # 2015 divergence). Values in rad/s:
+        #   J1..J3: 2.618 × 0.65 ≈ 1.70
+        #   J4..J6: 3.142 × 0.65 ≈ 2.04
+        # Set to an empty list to fall back to the flat scalar above
+        # (bench regression path). Any list length ≠ 6 also falls back.
+        self.declare_parameter(
+            'cart_joint_velocity_cap_per_joint_radps',
+            [1.70, 1.70, 1.70, 2.04, 2.04, 2.04])
         # Mid-hold speed changes ramp, not step. Delta hysteresis avoids
         # spamming stop+restart cycles; up-ramp is capped per tick so a
         # pose that briefly re-opens (σ_min bounces back) can't
@@ -667,6 +685,13 @@ class EstunCodroidDriver(Node):
         self._cart_sigma_soft   = float(self.get_parameter('cart_sigma_soft').value)
         self._cart_sigma_hard   = float(self.get_parameter('cart_sigma_hard').value)
         self._cart_joint_v_cap  = float(self.get_parameter('cart_joint_velocity_cap_radps').value)
+        # Per-joint cap: list of 6 floats or empty (falls back to flat).
+        _pj = list(self.get_parameter(
+            'cart_joint_velocity_cap_per_joint_radps').value or [])
+        if len(_pj) == 6 and all(float(v) > 0 for v in _pj):
+            self._cart_joint_v_cap_per = [float(v) for v in _pj]
+        else:
+            self._cart_joint_v_cap_per = [self._cart_joint_v_cap] * 6
         self._cart_speed_min_delta   = float(self.get_parameter('cart_speed_change_min_delta').value)
         self._cart_speed_up_per_tick = float(self.get_parameter('cart_speed_up_ramp_per_tick').value)
         self._cart_joint_soft_zone_deg   = float(self.get_parameter('cart_joint_limit_soft_zone_deg').value)
@@ -3720,14 +3745,26 @@ class EstunCodroidDriver(Node):
                                 worst_ratio = 0.0
                                 worst_i = -1
                                 worst_dq = 0.0
+                                worst_cap = self._cart_joint_v_cap
                                 for i in range(6):
                                     dq_dps = (self._joint_deg[i] - pj[i]) / dt
                                     dq_rps = math.radians(dq_dps)
-                                    ratio = abs(dq_rps) / max(1e-6, self._cart_joint_v_cap)
+                                    # 2026-09-11: per-joint cap. S10-140
+                                    # rated velocities differ between the
+                                    # shoulder (J1..J3 = 2.618 rad/s) and
+                                    # wrist (J4..J6 = 3.142 rad/s); a flat
+                                    # 1.5 rad/s cap strangled the wrist at
+                                    # ~48% of rated and generated warnings
+                                    # during normal jog. Each joint now
+                                    # compares against its own cap
+                                    # (default ~65% of rated).
+                                    cap_i = self._cart_joint_v_cap_per[i]
+                                    ratio = abs(dq_rps) / max(1e-6, cap_i)
                                     if ratio > worst_ratio:
                                         worst_ratio = ratio
                                         worst_i     = i
                                         worst_dq    = dq_rps
+                                        worst_cap   = cap_i
                                 # 2026-08-28 velocity scaling was the
                                 # first step; final step is the demotion
                                 # to observe-only when firmware clamps
@@ -3747,7 +3784,7 @@ class EstunCodroidDriver(Node):
                                         'cause':  'joint_overspeed',
                                         'limiting_joint_1based': worst_i + 1,
                                         'observed_dq_rps': worst_dq,
-                                        'cap_rps': self._cart_joint_v_cap,
+                                        'cap_rps': worst_cap,
                                     }
                                     if prev_soft is None or (
                                             prev_soft.get('cause')
@@ -3755,7 +3792,7 @@ class EstunCodroidDriver(Node):
                                         self.get_logger().info(
                                             f'joint-overspeed observe J{worst_i+1}: '
                                             f'dq={worst_dq:+.2f} rad/s '
-                                            f'(cap {self._cart_joint_v_cap:.2f}) '
+                                            f'(cap {worst_cap:.2f}) '
                                             '(firmware clamps)')
                                 elif worst_ratio > 1.0 and worst_i >= 0:
                                     # Aim ~15 % below the cap so a small
@@ -3768,7 +3805,7 @@ class EstunCodroidDriver(Node):
                                         'cause':  'joint_overspeed',
                                         'limiting_joint_1based': worst_i + 1,
                                         'observed_dq_rps': worst_dq,
-                                        'cap_rps': self._cart_joint_v_cap,
+                                        'cap_rps': worst_cap,
                                         'scale':  target_scale,
                                     }
                                     emitted = self._apply_cart_speed_scale_locked(
@@ -3780,7 +3817,7 @@ class EstunCodroidDriver(Node):
                                         self.get_logger().warn(
                                             f'joint-overspeed scaling J{worst_i+1}: '
                                             f'dq={worst_dq:+.2f} rad/s '
-                                            f'(cap {self._cart_joint_v_cap:.2f}) '
+                                            f'(cap {worst_cap:.2f}) '
                                             f'→ scale={target_scale:.2f}')
                                     # Escape hatch: if scaling exhausted (we
                                     # asked for near-zero but STILL over cap
@@ -3793,7 +3830,7 @@ class EstunCodroidDriver(Node):
                                             reason=(
                                                 f'joint overspeed guard J{worst_i+1} '
                                                 f'{worst_dq:+.2f} rad/s '
-                                                f'(cap {self._cart_joint_v_cap:.2f}) — '
+                                                f'(cap {worst_cap:.2f}) — '
                                                 'scaling exhausted, kinematics '
                                                 'unrecoverable at this pose'))
                                         return

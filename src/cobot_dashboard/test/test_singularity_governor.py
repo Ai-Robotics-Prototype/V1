@@ -296,3 +296,88 @@ def test_live_margin_hud_renders_singularity_cause():
     assert "cause === 'joint_overspeed'" in src
     assert "cause === 'cart_limit_at_wall'" in src
     assert "cause === 'cart_limit_deepening'" in src
+
+
+# ── Noise audit (2026-09-11 operator directive) ───────────────────
+
+def test_per_joint_velocity_cap_matches_rated_fraction():
+    """Item 4 pin: the flat 1.5 rad/s cap strangled the wrist joints
+    (rated 3.142 rad/s = 47.7% of rated); operator got joint-speed
+    warnings during normal jog because the cap was hit routinely on
+    J4/J5/J6. New default: per-joint list at ~65% of each joint's
+    rated speed. S10-140 rated speeds from HARDWARE.md L39-40:
+      J1/J2/J3 = 150°/s = 2.618 rad/s → 65% ≈ 1.70 rad/s
+      J4/J5/J6 = 180°/s = 3.142 rad/s → 65% ≈ 2.04 rad/s
+    This test locks the parameter shape + values."""
+    src = _src()
+    assert "'cart_joint_velocity_cap_per_joint_radps'" in src, (
+        "per-joint cap parameter must be declared")
+    # Default values pinned. If the fraction is tuned, update both
+    # here and the parameter declaration in the same commit.
+    assert '[1.70, 1.70, 1.70, 2.04, 2.04, 2.04]' in src
+    # The runtime slot MUST be a length-6 list (not a scalar) so
+    # every ratio computes against the correct joint's cap.
+    assert 'self._cart_joint_v_cap_per' in src, (
+        'runtime per-joint cap array missing')
+    # Fallback to the legacy scalar when the list is empty or wrong
+    # length — bench regression path.
+    assert 'if len(_pj) == 6 and all(float(v) > 0 for v in _pj):' in src
+
+
+def test_reactive_backstop_uses_per_joint_cap_not_scalar():
+    """The reactive backstop's worst-ratio loop MUST index the per-
+    joint cap array. If a refactor puts back the scalar
+    `self._cart_joint_v_cap`, J4/J5/J6 go back to being clamped at
+    48% of their rated speed and the noise returns."""
+    src = _src()
+    # Locate the loop that computes worst_ratio in supervise.
+    m = re.search(
+        r'if dt > 1e-4:\s*\n\s*worst_ratio = 0\.0(.+?)if worst_ratio > 1\.0',
+        src, re.DOTALL)
+    assert m, 'reactive-backstop worst_ratio loop not found'
+    loop = m.group(1)
+    assert 'self._cart_joint_v_cap_per[i]' in loop, (
+        'per-joint cap must index the loop — otherwise the flat cap '
+        'is back and the noise returns')
+    # The scalar attribute is fine as a fallback / for legacy log
+    # strings, but the ratio math MUST use the per-joint value.
+    assert 'ratio = abs(dq_rps) / max(1e-6, cap_i)' in loop
+
+
+def test_hud_gates_softening_by_meaningful_scale():
+    """Item 2 pin: LiveMarginHUD must render only when the governor
+    is MEANINGFULLY intervening (scale < 0.90 = TCP slowed >10%).
+    Shallow scaling / momentary transients never reach the DOM.
+    This is the frontend half of the noise fix — the driver-side
+    per-joint cap is the other half."""
+    with open(HUD) as fh:
+        src = fh.read()
+    assert 'SCALE_MEANINGFUL' in src
+    assert '0.90' in src, "0.90 gate must be a named constant"
+    assert 'useGatedSoftening' in src, (
+        "the softening frame must pass through the gate hook — "
+        "raw `softening.active` is not enough on its own")
+    # Stop causes must NOT be gated (they should render immediately —
+    # the arm has stopped, no debounce needed).
+    assert 'SCALED_CAUSES' in src
+    # LiveMarginHUD consumes the gated result, not the raw prop.
+    m = re.search(r'export function LiveMarginHUD\(.+?\n\}', src, re.DOTALL)
+    assert m, 'LiveMarginHUD not found'
+    body = m.group(0)
+    assert 'const soft = useGatedSoftening(softening)' in body, (
+        'LiveMarginHUD must run cart_softening through the gate hook')
+
+
+def test_hud_hysteresis_and_debounce_pinned():
+    """Item 3 pin: once shown, the note persists until scale ≥ 0.95
+    for 500 ms (no flicker); transients <300 ms never render at all.
+    Both timers plus the two threshold constants MUST be present so
+    a future refactor can't quietly remove one half of the pair."""
+    with open(HUD) as fh:
+        src = fh.read()
+    assert 'SCALE_CLEAR_HYSTERESIS'  in src
+    assert '0.95'                    in src
+    assert 'SCALE_CLEAR_DEBOUNCE_MS' in src
+    assert '500'                     in src
+    assert 'SCALE_ENTER_DEBOUNCE_MS' in src
+    assert '300'                     in src

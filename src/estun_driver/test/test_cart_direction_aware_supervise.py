@@ -89,6 +89,7 @@ def _fake_driver(joint_deg, prev_joint_deg=None, cur_frac=0.2):
     fake._cart_sigma_soft = 0.06
     fake._cart_sigma_hard = 0.02
     fake._cart_joint_v_cap = 1.5
+    fake._cart_joint_v_cap_per = [1.5] * 6
     fake._new_nonce = lambda: 'nonce'
     fake._send = MagicMock(return_value=True)
     fake.get_logger = MagicMock(return_value=MagicMock())
