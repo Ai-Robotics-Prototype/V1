@@ -1,0 +1,449 @@
+#!/usr/bin/env bash
+# scripts/deploy.sh — one-command atomic deploy for the roboai stack.
+#
+# Motivated by the FOURTH staleness episode on 2026-07-30. Manual
+# restart is skippable; a script makes the correct sequence the
+# path of least resistance:
+#
+#   1. Build the frontend if source has changed since the last built
+#      asset (vite emits to frontend/dist/, which dashboard_server
+#      serves via _STATIC_DIR; "if changed" is a source-hash check
+#      against dist/index.html). 2026-08-28: comment was stale from
+#      the mock_server/static → dist/ migration (commit b1729b4);
+#      FRONTEND_OUT below refreshed with it.
+#   2. Restart roboai-dashboard AND roboai-estun so their in-memory
+#      program_ops picks up whatever's on disk now.
+#   3. Verify:
+#        (a) boot_sha == disk_sha for the codegen module (the
+#            /api/codegen/status endpoint's fresh view),
+#        (b) served_asset_hash changed vs the pre-restart snapshot
+#            (only checked when the build ran).
+#   4. Print PASS or FAIL with a concrete pointer to what to fix.
+#
+# Never touches the operator's Run flow. Idempotent — a second run
+# with no source changes still restarts services (that's the whole
+# point — you can trust "did the deploy work?" without inspecting).
+#
+# Exit codes:
+#   0  PASS  — services live, boot sha matches disk, and (if the
+#              frontend was rebuilt) served asset hash changed.
+#   1  FAIL  — one of the verifications did not pass; report says which.
+#   2  usage/setup error — pre-flight blocked (bad workspace, no sudo,
+#              service files missing).
+
+set -euo pipefail
+
+WS="${WS:-/home/teddy/cobot_ws}"
+DASHBOARD_URL="${DASHBOARD_URL:-https://127.0.0.1:8080}"
+FRONTEND_SRC="$WS/src/cobot_dashboard/frontend"
+FRONTEND_OUT="$WS/src/cobot_dashboard/frontend/dist"
+PROGRAM_OPS="$WS/src/estun_driver/estun_driver/program_ops.py"
+
+RED=$'\e[31m'; GRN=$'\e[32m'; AMB=$'\e[33m'; DIM=$'\e[2m'; RST=$'\e[0m'
+
+step() { printf "\n${DIM}▸${RST} %s\n" "$*"; }
+pass() { printf "  ${GRN}✓${RST} %s\n" "$*"; }
+warn() { printf "  ${AMB}⚠${RST} %s\n" "$*"; }
+fail() { printf "  ${RED}✗${RST} %s\n" "$*"; exit_code=1; }
+
+exit_code=0
+
+# ── Pre-flight ────────────────────────────────────────────────────
+[[ -d "$WS" ]] || { echo "workspace not found: $WS"; exit 2; }
+[[ -f "$PROGRAM_OPS" ]] || { echo "program_ops.py not found: $PROGRAM_OPS"; exit 2; }
+command -v systemctl >/dev/null || { echo "systemctl required"; exit 2; }
+command -v curl >/dev/null || { echo "curl required"; exit 2; }
+command -v sha256sum >/dev/null || { echo "sha256sum required"; exit 2; }
+
+sha12() { sha256sum "$1" | cut -c1-12; }
+
+# ── Dirty-tree refusal (2026-08-28, stale-class close) ───────────
+# "A deploy without a SHA is not a deploy." Production serving
+# unnamed code violates the entire provenance chain: the deploy_log
+# stamps HEAD, but the running code differs. Every subsequent
+# staleness diagnosis is corrupted by that one anonymity.
+#
+# HARD-FAIL unless ALLOW_DIRTY=1 is explicitly set (ALLOW_MOCK
+# pattern). Refusal is loud, named, and written to /opt/cobot/
+# deploy_log.jsonl so /api/deploy_status renders red with a
+# concrete reason instead of the operator wondering why nothing
+# happened.
+step "Working tree cleanliness"
+DIRTY_FILES=$(cd "$WS" && git status --porcelain 2>/dev/null | head -20)
+if [[ -n "$DIRTY_FILES" ]]; then
+    if [[ "${ALLOW_DIRTY:-0}" == "1" ]]; then
+        warn "working tree is dirty — proceeding under ALLOW_DIRTY=1"
+        printf "    modified files:\n"
+        printf "    %s\n" "$DIRTY_FILES" | sed 's/^/    /'
+    else
+        HEAD_SHA=$(cd "$WS" && git rev-parse HEAD 2>/dev/null || echo "unknown")
+        # Best-effort append to deploy_log so the UI banner shows
+        # a named refusal instead of "deploy just didn't run".
+        {
+            printf '{"ts": "%s", "phase": "fail", "sha": "%s", ' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$HEAD_SHA"
+            printf '"step": "dirty_tree_refused", "exit_code": "2", '
+            printf '"reason": "working tree has uncommitted changes; '
+            printf 'set ALLOW_DIRTY=1 to override (a deploy without a '
+            printf 'SHA is not a deploy)", "detail": "%s"}\n' \
+                "$(printf '%s' "$DIRTY_FILES" | tr '\n' ';' | tr -d '"')"
+        } >> /opt/cobot/deploy_log.jsonl 2>/dev/null || true
+        printf "\n  ${RED}✗${RST} REFUSED: working tree is dirty.\n"
+        printf "    A deploy without a SHA is not a deploy.\n"
+        printf "    Commit or stash first, or set ALLOW_DIRTY=1 to override.\n"
+        printf "    Modified:\n"
+        printf "%s\n" "$DIRTY_FILES" | sed 's/^/      /'
+        exit 2
+    fi
+else
+    pass "working tree clean at $(cd "$WS" && git rev-parse --short HEAD 2>/dev/null)"
+fi
+
+# ── 1. Frontend build (if needed) ────────────────────────────────
+#
+# Build-needed decision: CONTENT HASH of the frontend source tree
+# vs the hash stamped by the previous build. Bugs the mtime
+# heuristic hit (2026-07-30, twice in one hour):
+#
+#   * `npm run build` runs during `verify` steps INSIDE the same
+#     script that later checks mtime → served/index.html gets
+#     rewritten SECOND, so its mtime is LATER than any source
+#     file, and the next deploy call sees "served newer than
+#     source, skip build" even when the source has changed since.
+#   * Any file touched between verify-build and commit
+#     (rebase, formatter, IDE autosave, git-stash apply) breaks
+#     the mtime comparison silently.
+#   * `find -newer` and mtime comparisons are noisy on shared
+#     filesystems (docker bind mounts, some COW filesystems).
+#
+# Content hash is the only heuristic that CAN'T be fooled by
+# clock skew, autosaves, or in-script rebuilds. Stamp file at
+# `frontend/.deploy-src-hash` records the hash that produced the
+# current bundle; deploy.sh rebuilds when the current source hash
+# differs.
+#
+# When in doubt, BUILD. A redundant vite build costs ~60s; a
+# skipped one cost the operator an afternoon of "why isn't the
+# new UI showing up?" twice today.
+step "Frontend build check"
+FRONTEND_NEEDS_BUILD=0
+BUILD_STAMP="$FRONTEND_SRC/.deploy-src-hash"
+# Content hash of every JS/JSX/CSS/HTML/JSON under frontend/src
+# (excluding node_modules and build outputs). `find -type f`
+# ordered by path so the hash is deterministic across invocations.
+FRONTEND_SRC_HASH=$(
+    cd "$FRONTEND_SRC" && \
+    find src package.json vite.config.* index.html \
+         -type f 2>/dev/null | sort | xargs sha256sum 2>/dev/null | \
+    sha256sum | cut -c1-16
+)
+if [[ ! -f "$FRONTEND_OUT/index.html" ]]; then
+    FRONTEND_NEEDS_BUILD=1
+    warn "no served bundle at $FRONTEND_OUT — building"
+elif [[ ! -f "$BUILD_STAMP" ]]; then
+    FRONTEND_NEEDS_BUILD=1
+    warn "no build stamp — treating as source-changed, will rebuild"
+else
+    LAST_HASH=$(cat "$BUILD_STAMP" 2>/dev/null | tr -d '[:space:]')
+    if [[ "$FRONTEND_SRC_HASH" != "$LAST_HASH" ]]; then
+        FRONTEND_NEEDS_BUILD=1
+        pass "source hash changed ($LAST_HASH → $FRONTEND_SRC_HASH) — will rebuild"
+    else
+        pass "source hash unchanged ($FRONTEND_SRC_HASH); skipping build"
+    fi
+fi
+
+# 2026-08-28 (post-incident revert of the same day's build-skip
+# sidecar refresh): .build-sha records THE SHA THAT BUILT THE
+# BUNDLE, not the current HEAD. Advancing the sidecar on a build-
+# skip lies about what the JS bundle contains — the bundle bakes
+# __GIT_SHA__ at vite build time from the SHA that was HEAD then,
+# and no subsequent sidecar edit can change that. The prior
+# refresh-to-HEAD locked every open tab out of the dashboard
+# because the guard compared bundle-baked SHA to sidecar-HEAD and
+# they were guaranteed to differ on any docs-only deploy. The
+# sidecar is now write-once-per-vite-build; on skip we leave it
+# untouched. Verdict's frontend_sha may trail HEAD legitimately —
+# that's honest reporting, not a false red.
+
+PRE_SERVED_ASSET=""
+if [[ -f "$FRONTEND_OUT/index.html" ]]; then
+    PRE_SERVED_ASSET=$(grep -oE '/assets/index-[A-Za-z0-9_-]+\.js' \
+                       "$FRONTEND_OUT/index.html" | head -1)
+fi
+
+# ── Fork Registry gate (§465 fork-1 lesson, 2026-08-04) ─────────
+# Runs FIRST, UNCONDITIONALLY — before the FRONTEND_NEEDS_BUILD gate
+# — because a fork regression is a defect regardless of the other
+# tests passing, and it can appear in a backend-only commit that
+# would otherwise skip the frontend build path entirely.
+#
+# Registry lives at tools/fork_registry.yaml; the linter is
+# tools/fork_lint.py. On any registered-fork hit, the linter
+# emits a `phase: "lint_failed"` JSONL entry to
+# /opt/cobot/deploy_log.jsonl (via --deploy-phase) BEFORE this
+# script exits — so the deploy log shows a NAMED refusal, not
+# a silent generic fail.
+step "fork_lint (registry gate — tools/fork_registry.yaml)"
+_CURRENT_SHA=$(git -C "$WS" rev-parse HEAD 2>/dev/null || echo unknown)
+if ! python3 "$WS/tools/fork_lint.py" --deploy-phase "$_CURRENT_SHA"; then
+    fail "fork_lint reported forbidden implementations — refusing to build."
+    printf "${RED}════════  DEPLOY: FAIL (lint_failed)  ════════${RST}\n"
+    printf "  A capability registered in tools/fork_registry.yaml has\n"
+    printf "  been duplicated in a forbidden path. Either route the new\n"
+    printf "  code through the canonical owner, or (if the debt is\n"
+    printf "  legitimate) add a known_debt entry with an owner in the\n"
+    printf "  registry — silent suppression is refused.\n"
+    exit 1
+fi
+pass "fork_lint clean (no forbidden-path duplicates)"
+
+if [[ $FRONTEND_NEEDS_BUILD -eq 1 ]]; then
+    # Program Doctrine — the operator's standing rules. See
+    # docs/PROGRAM_DOCTRINE.md. This gate runs BEFORE lint + build
+    # because a doctrine failure is a violation of a hard invariant
+    # (D1 derived-never-taught, D3 shown≠emitted-is-a-lie, etc.),
+    # and shipping past it puts the operator's mental model out of
+    # sync with what the app does.
+    step "Program Doctrine (tests/doctrine/)"
+    if ! bash "$WS/scripts/run_doctrine_suite.sh"; then
+        fail "doctrine violated — refusing to build."
+        printf "${RED}════════  DEPLOY: FAIL  ════════${RST}\n"
+        printf "  Fix the doctrine violation(s) above OR amend the rule\n"
+        printf "  (operator approves rule changes — see docs/PROGRAM_DOCTRINE.md).\n"
+        exit 1
+    fi
+    pass "doctrine clean"
+
+    # Lint FIRST — a ReferenceError in JSX (e.g. an undefined
+    # identifier accidentally referenced in render scope) is a
+    # build-time catchable, not a runtime discovery. The 2026-07-31
+    # `palletFrameStatus` incident shipped because vite tolerates
+    # undefined identifiers at build time; ESLint's `no-undef` does
+    # not. Fail the deploy on ANY lint error before we bother
+    # running vite.
+    step "npm run lint"
+    if ! ( cd "$FRONTEND_SRC" && npm run lint 2>&1 | tail -20 ); then
+        fail "eslint reported errors — refusing to build."
+        printf "${RED}════════  DEPLOY: FAIL  ════════${RST}\n"
+        printf "  Fix the lint errors above and re-run scripts/deploy.sh.\n"
+        exit 1
+    fi
+    pass "eslint clean"
+
+    # Backend equivalent of the ESLint no-undef gate — pyflakes
+    # catches the NameError-in-waiting class (2026-08-03: operator
+    # hit `name 'program_ops' is not defined` inside the D11 check;
+    # the check crashed and the frontend surfaced OUR bug as a
+    # program-lint failure). Both backend and frontend now share
+    # the same "undefined identifier fails the build" contract.
+    #
+    # Scope: dashboard + estun_driver + programming_by_demonstration
+    # + object_detection — the packages that carry the code the
+    # operator actually edits from the dashboard. Other packages
+    # (perception_fusion, cuda_pointcloud, etc.) build fine via
+    # colcon and their runtime lives outside the dashboard-touched
+    # request path — we can extend the gate to them in a follow-up
+    # if a NameError ever slips through in one of those.
+    #
+    # Pyflakes-only check (not full ruff): pyflakes flags undefined
+    # names deterministically and has no style opinions. Style
+    # cleanups can land in a separate PR without churning the gate.
+    step "pyflakes (backend no-undef gate)"
+    _PYFLAKES_TARGETS=(
+        "$WS/src/cobot_dashboard/cobot_dashboard"
+        "$WS/src/estun_driver/estun_driver"
+        "$WS/src/programming_by_demonstration/programming_by_demonstration"
+        "$WS/src/object_detection/object_detection"
+    )
+    _PYFLAKES_OUT=$(python3 -m pyflakes "${_PYFLAKES_TARGETS[@]}" 2>&1 \
+                       | grep 'undefined name' || true)
+    if [[ -n "$_PYFLAKES_OUT" ]]; then
+        fail "pyflakes reported undefined-name errors — refusing to build."
+        printf "${RED}%s${RST}\n" "$_PYFLAKES_OUT"
+        printf "${RED}════════  DEPLOY: FAIL  ════════${RST}\n"
+        printf "  A NameError-in-waiting shipped once (D11 validator, 2026-08-03).\n"
+        printf "  Fix the undefined identifiers above and re-run scripts/deploy.sh.\n"
+        printf "  Style-only pyflakes findings (unused vars, f-strings without\n"
+        printf "  placeholders) are NOT gated — only undefined names are.\n"
+        exit 1
+    fi
+    pass "pyflakes clean (no undefined names in dashboard/estun/pbd/object_detection)"
+
+    step "npm run build"
+    ( cd "$FRONTEND_SRC" && npm run build 2>&1 | tail -8 )
+    pass "vite build complete"
+    # Stamp the source hash the build ran on. Next deploy compares
+    # against this to decide "changed since last build?". Missing
+    # or stale stamp → treated as changed → build. Never skip
+    # unless the hashes match exactly.
+    echo "$FRONTEND_SRC_HASH" > "$BUILD_STAMP"
+fi
+
+# ── 2. Restart services ──────────────────────────────────────────
+step "Restart services (roboai-dashboard, roboai-estun)"
+DISK_SHA=$(sha12 "$PROGRAM_OPS")
+pass "disk program_ops sha=$DISK_SHA"
+
+sudo systemctl restart roboai-dashboard roboai-estun
+pass "systemctl restart issued"
+
+# Wait for the HTTPS endpoint to come back — up to 30s.
+step "Wait for dashboard readiness"
+DEADLINE=$(($(date +%s) + 30))
+while true; do
+    if curl -sk --max-time 2 "$DASHBOARD_URL/api/systemcheck" >/dev/null 2>&1; then
+        pass "dashboard responding"
+        break
+    fi
+    if [[ $(date +%s) -ge $DEADLINE ]]; then
+        fail "dashboard did not respond within 30s after restart"
+        break
+    fi
+    sleep 0.5
+done
+
+# ── 3. Verify ────────────────────────────────────────────────────
+step "Verify codegen boot_sha == disk_sha"
+CODEGEN_STATUS=$(curl -sk "$DASHBOARD_URL/api/codegen/status")
+BOOT_SHA=$(echo "$CODEGEN_STATUS" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("boot_sha",""))')
+API_DISK=$(echo "$CODEGEN_STATUS" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("disk_sha",""))')
+API_STALE=$(echo "$CODEGEN_STATUS" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("stale",False))')
+printf "    boot_sha : %s\n    disk_sha : %s (API) / %s (fs)\n    stale    : %s\n" \
+    "$BOOT_SHA" "$API_DISK" "$DISK_SHA" "$API_STALE"
+if [[ "$BOOT_SHA" == "$DISK_SHA" && "$API_STALE" == "False" ]]; then
+    pass "codegen boot == disk ($BOOT_SHA)"
+else
+    fail "codegen still stale — boot=$BOOT_SHA disk=$DISK_SHA. \
+Restart may have raced with the fs write; re-run scripts/deploy.sh."
+fi
+
+# ── 3b. Backend provenance: running-process SHA == deployed HEAD ─
+# (2026-08-28 stale-class close) Kills the "surviving-old-worker
+# ghost" — a restart may issue but a stale python3 could still be
+# holding :8080. /api/provenance returns _BACKEND_GIT_SHA baked at
+# import time; must match `git rev-parse HEAD` post-deploy.
+step "Backend provenance == deployed HEAD"
+HEAD_SHA=$(cd "$WS" && git rev-parse HEAD 2>/dev/null || echo "unknown")
+PROVENANCE=$(curl -sk --max-time 3 "$DASHBOARD_URL/api/provenance" || echo '{}')
+RUNNING_SHA=$(echo "$PROVENANCE" | python3 -c \
+    'import sys,json;print(json.load(sys.stdin).get("backend_sha",""))' 2>/dev/null || echo "")
+# Strip -dirty suffix for the equality test (dirty deploys are
+# allowed under ALLOW_DIRTY; provenance still records the -dirty).
+RUNNING_SHA_BARE="${RUNNING_SHA%-dirty}"
+printf "    head    : %s\n    running : %s\n" "$HEAD_SHA" "$RUNNING_SHA"
+if [[ -z "$RUNNING_SHA" ]]; then
+    fail "backend provenance missing — /api/provenance did not return backend_sha"
+elif [[ "$RUNNING_SHA_BARE" == "$HEAD_SHA" ]]; then
+    pass "backend running == deployed HEAD ($HEAD_SHA)"
+else
+    fail "backend still on $RUNNING_SHA — restart did not take (surviving old worker?). \
+Re-run scripts/deploy.sh or investigate systemd status."
+fi
+
+# ── 3c. Frontend provenance: served bundle SHA report ────────────
+# The vite writeSidecarPlugin writes dist/.build-sha with the git
+# SHA the bundle was BUILT against. A mismatch vs HEAD only means
+# "no frontend code changed this deploy" (docs-only, backend-only,
+# or fork_registry-only commits legitimately skip vite build). The
+# information is worth surfacing, but WARN — not FAIL — since a
+# docs commit landing red would loop the deploy path unit forever.
+# StaleGuard is the correct staleness signal at the browser layer
+# (baked __GIT_SHA__ vs served frontend_sha, no HEAD assumption).
+step "Frontend provenance report"
+BUNDLE_ID_RESP=$(curl -sk --max-time 3 "$DASHBOARD_URL/api/build_id" || echo '{}')
+FRONTEND_SHA=$(echo "$BUNDLE_ID_RESP" | python3 -c \
+    'import sys,json;print(json.load(sys.stdin).get("frontend_sha",""))' 2>/dev/null || echo "")
+FRONTEND_SHA_BARE="${FRONTEND_SHA%-dirty}"
+printf "    head     : %s\n    frontend : %s\n" "$HEAD_SHA" "$FRONTEND_SHA"
+if [[ -z "$FRONTEND_SHA" || "$FRONTEND_SHA" == "unknown" ]]; then
+    warn "frontend provenance missing — dist/.build-sha not written by vite build"
+elif [[ "$FRONTEND_SHA_BARE" == "$HEAD_SHA" ]]; then
+    pass "frontend bundle == deployed HEAD ($HEAD_SHA)"
+else
+    warn "frontend bundle SHA trails HEAD — no frontend/src change since last build (this is fine for backend-only / docs deploys)"
+fi
+
+# Served asset check runs regardless of whether we built: the
+# operator wants to see the current asset hash on EVERY deploy so
+# they can compare against their tab's footer and confirm the tab
+# reload will actually change what they see (2026-07-30 the
+# operator hit two false-positive PASSes; showing the hash every
+# time is cheap and rules out the "did it change?" ambiguity).
+step "Served asset hash"
+POST_SERVED_ASSET=""
+if [[ -f "$FRONTEND_OUT/index.html" ]]; then
+    POST_SERVED_ASSET=$(grep -oE '/assets/index-[A-Za-z0-9_-]+\.js' \
+                        "$FRONTEND_OUT/index.html" | head -1)
+fi
+if [[ -z "$POST_SERVED_ASSET" ]]; then
+    fail "no served asset present"
+elif [[ $FRONTEND_NEEDS_BUILD -eq 1 ]]; then
+    printf "    pre  : %s\n    post : %s\n" \
+        "${PRE_SERVED_ASSET:-<none>}" "$POST_SERVED_ASSET"
+    if [[ "$PRE_SERVED_ASSET" == "$POST_SERVED_ASSET" && -n "$PRE_SERVED_ASSET" ]]; then
+        # 2026-08-06 (silent-frontend-rebuild-skip class): the source
+        # hash advanced but vite produced the same asset. deploy.sh
+        # STAYS informational here — the watcher (autodeploy_wrapper.sh)
+        # is the one that promotes this to phase=frontend_stale in the
+        # deploy log. Deploy still exits ok; build behavior unchanged.
+        warn "served asset hash unchanged after rebuild — watcher will \
+report phase=frontend_stale"
+    else
+        pass "served asset hash advanced: $PRE_SERVED_ASSET → $POST_SERVED_ASSET"
+    fi
+else
+    printf "    served : %s (build skipped — source hash unchanged)\n" \
+        "$POST_SERVED_ASSET"
+    pass "served asset $POST_SERVED_ASSET"
+fi
+
+# 2026-08-05 (teach-lock incident #3, gap #4): live-serve verification.
+# The disk-side POST_SERVED_ASSET check above confirms `index.html`
+# points at the freshly-built asset. This step curls the RUNNING
+# dashboard and confirms the served response matches. Catches:
+#   * a stale uvicorn worker still holding the old index.html
+#   * a reverse proxy caching the pre-deploy bundle
+#   * a permissions issue where the new asset file isn't readable
+# Three false-positive PASSes have been reported in the last week
+# from taking the disk state at face value; this closes that gap.
+step "Live-serve verification (HTTPS /)"
+LIVE_HTML=""
+LIVE_ASSET=""
+LIVE_STATUS="?"
+for i in 1 2 3 4 5; do
+    LIVE_RESP=$(curl -kSs -o /tmp/deploy_live_index.$$ -w "HTTP:%{http_code}" \
+                --max-time 3 https://localhost:8080/ 2>/dev/null || echo "HTTP:000")
+    LIVE_STATUS="${LIVE_RESP#HTTP:}"
+    if [[ "$LIVE_STATUS" == "200" ]]; then
+        LIVE_HTML=$(cat /tmp/deploy_live_index.$$ 2>/dev/null)
+        LIVE_ASSET=$(echo "$LIVE_HTML" | grep -oE '/assets/index-[A-Za-z0-9_-]+\.js' | head -1)
+        break
+    fi
+    sleep 1
+done
+rm -f /tmp/deploy_live_index.$$
+if [[ -z "$LIVE_ASSET" ]]; then
+    fail "live-serve returned no asset (HTTP $LIVE_STATUS); dashboard not serving after restart"
+elif [[ "$LIVE_ASSET" != "$POST_SERVED_ASSET" ]]; then
+    printf "    disk : %s\n    live : %s\n" "$POST_SERVED_ASSET" "$LIVE_ASSET"
+    fail "live-served bundle differs from disk — deploy verify FAILED"
+else
+    pass "live-served == disk == $LIVE_ASSET"
+fi
+
+# ── 4. Verdict ───────────────────────────────────────────────────
+echo
+if [[ $exit_code -eq 0 ]]; then
+    printf "${GRN}════════  DEPLOY: PASS  ════════${RST}\n"
+    printf "  program_ops boot=%s\n" "$BOOT_SHA"
+    printf "  frontend    asset=%s\n" \
+        "${POST_SERVED_ASSET#/assets/index-}"
+    printf "  frontend    src_hash=%s\n" "$FRONTEND_SRC_HASH"
+    printf "  Operator can Run.\n"
+else
+    printf "${RED}════════  DEPLOY: FAIL  ════════${RST}\n"
+    printf "  See errors above. The dashboard may still be running the OLD\n"
+    printf "  codegen; do NOT let the operator Run until this is clean.\n"
+fi
+exit $exit_code

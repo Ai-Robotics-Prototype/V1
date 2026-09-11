@@ -1,7 +1,12 @@
-import { useEffect, useRef, useState } from 'react'
-import * as THREE from 'three'
-import QuickOrientButtons from './QuickOrientButtons'
-import JogSpeedSlider from './JogSpeedSlider'
+import { useEffect, useState } from 'react'
+import FaceDownButton from './QuickOrientButtons'
+// 2026-09-08 operator directive: Reset all / Home / Quick Orient
+// row label / Face Side / Face Up / TCP (twin frame) box /
+// JogSpeedSlider all retired. AMENDMENT: Face Down retained as a
+// standalone TCP-preserving button (see QuickOrientButtons.jsx
+// — file kept for git history + import continuity, now exports
+// FaceDownButton default). Jog surface owns jog-speed as the ONE
+// authority; `three` no longer imported here (TCP FK box gone).
 
 // JointJogPanel — right-docked FK verification pane for the S10-140
 // verified twin. Wired to ArmViewer3D via a jogApi handle exposed from
@@ -41,23 +46,24 @@ export default function JointJogPanel({
   onCartesianModeChange,
   gizmoMode = 'translate',
   onGizmoModeChange,
-  onHome,
-  onAtLimit,   // (bool) called by QuickOrientButtons after its solve
+  // eslint-disable-next-line no-unused-vars
+  onHome,        // 2026-09-08: Home button retired; prop kept so
+                 // callers don't break their prop wiring.
+  // eslint-disable-next-line no-unused-vars
+  onAtLimit,     // fired by FaceDownButton when IK can't achieve
+                 // the target within tolerance — parents can wire
+                 // it to their own AT-LIMIT indicator.
 }) {
   const [values, setValues] = useState([0, 0, 0, 0, 0, 0])
-  const [tcp, setTcp] = useState(null)
-  const linkRef = useRef(null)
+  // TWIN-POSING vs LIVE-FOLLOW indicator. `previewing` is true when
+  // ANY of the six joint masks in StandaloneRobot are latched (i.e.,
+  // operator dragged a slider or previewed Face Down). The panel
+  // renders a small chip + Follow-Robot button so the operator always
+  // has an obvious way back to LIVE-FOLLOW — no silent frozen state.
+  const [previewing, setPreviewing] = useState(false)
 
   useEffect(() => {
-    if (!jogApi?.robot?.joints) {
-      linkRef.current = null
-      return
-    }
-    // Prefer tool0 (injected on URDF load); fall back to link6 for
-    // early-mount ordering where the injection hasn't run yet.
-    linkRef.current = jogApi.robot.links?.tool0
-                   || jogApi.robot.links?.link6
-                   || null
+    if (!jogApi?.robot?.joints) return
     const j = jogApi.robot.joints
     const initial = JOINT_META.map((meta) => {
       const v = j[meta.name]?.jointValue
@@ -69,49 +75,39 @@ export default function JointJogPanel({
   }, [jogApi])
 
   useEffect(() => {
+    // Mirror robot joint values into the sliders so IK-driven or
+    // remote-driven motion shows on the fine-tune controls. Skips
+    // sliders under active operator drag by checking magnitude
+    // delta only (no focus tracking needed for this cadence).
     if (!jogApi) return undefined
-    const mat  = new THREE.Matrix4()
-    const pos  = new THREE.Vector3()
-    const quat = new THREE.Quaternion()
-    const scl  = new THREE.Vector3()
-    const eul  = new THREE.Euler()
     const id = setInterval(() => {
-      const link = linkRef.current
-      if (!link) return
-      link.updateWorldMatrix(true, false)
-      mat.copy(link.matrixWorld)
-      mat.decompose(pos, quat, scl)
-      eul.setFromQuaternion(quat, 'ZYX')
-      // Also mirror the robot's current joint values into the sliders
-      // so IK-driven motion shows up on the fine-tune controls without
-      // remounting the panel. Only touches un-focused sliders (avoid
-      // fighting the operator's drag).
       const j = jogApi.robot?.joints
-      if (j) {
-        setValues((prev) => {
-          const next = prev.slice()
-          let changed = false
-          for (let i = 0; i < 6; i++) {
-            const raw = j[JOINT_META[i].name]?.jointValue
-            const n = Number(Array.isArray(raw) ? raw[0] : raw)
-            if (Number.isFinite(n) && Math.abs(n - next[i]) > 1e-5) {
-              next[i] = n
-              changed = true
-            }
+      if (!j) return
+      setValues((prev) => {
+        const next = prev.slice()
+        let changed = false
+        for (let i = 0; i < 6; i++) {
+          const raw = j[JOINT_META[i].name]?.jointValue
+          const n = Number(Array.isArray(raw) ? raw[0] : raw)
+          if (Number.isFinite(n) && Math.abs(n - next[i]) > 1e-5) {
+            next[i] = n
+            changed = true
           }
-          return changed ? next : prev
-        })
-      }
-      setTcp({
-        x_mm: pos.x * 1000,
-        y_mm: pos.y * 1000,
-        z_mm: pos.z * 1000,
-        rz_deg: rad2deg(eul.z),
-        ry_deg: rad2deg(eul.y),
-        rx_deg: rad2deg(eul.x),
+        }
+        return changed ? next : prev
       })
     }, 66)
     return () => clearInterval(id)
+  }, [jogApi])
+
+  // Subscribe to StandaloneRobot's manual-mask signal so the chip +
+  // Follow-Robot button track TWIN-POSING state without polling.
+  useEffect(() => {
+    if (!jogApi?.onManualMaskChange) return undefined
+    const unsub = jogApi.onManualMaskChange((maskArr) => {
+      setPreviewing(Array.isArray(maskArr) && maskArr.some(Boolean))
+    })
+    return unsub
   }, [jogApi])
 
   const onSlide = (idx, radStr) => {
@@ -125,9 +121,13 @@ export default function JointJogPanel({
     jogApi?.setJointRad?.(idx, rad)
   }
 
-  const onReset = () => {
-    setValues([0, 0, 0, 0, 0, 0])
-    jogApi?.resetAll?.()
+  // Slider pointer released → return this joint to LIVE-FOLLOW. Fires
+  // on pointerup AND on any interaction end that surrenders the input
+  // (blur, lost pointer capture). The next store→robot mirror tick
+  // seeds targets from the LATEST /joint_states, so the twin catches
+  // up smoothly from wherever the preview left it.
+  const onSlideEnd = (idx) => {
+    jogApi?.releaseJointMask?.(idx)
   }
 
   const ready = !!jogApi?.robot?.joints
@@ -136,7 +136,40 @@ export default function JointJogPanel({
     <div style={styles.panel}>
       <div style={styles.header}>
         <div style={styles.title}>Joint Jog</div>
-        <div style={styles.twinTag}>TWIN</div>
+        <div style={styles.twinTag}>TWIN ONLY</div>
+      </div>
+
+      {/* LIVE-FOLLOW / TWIN-POSING banner. The twin viewer is either
+          mirroring the real arm at WS stream rate (LIVE-FOLLOW,
+          default) or held on an operator-set preview (TWIN-POSING,
+          triggered by dragging any slider or by Face Down). The chip
+          + Follow-Robot button guarantee there is no silent frozen
+          state — a preview always has an obvious way back to live. */}
+      <div
+        data-testid="follow-state-banner"
+        data-state={previewing ? 'twin-posing' : 'live-follow'}
+        style={previewing ? styles.followBannerPosing : styles.followBannerLive}
+      >
+        <span aria-hidden="true"
+              style={{
+                width: 8, height: 8, borderRadius: '50%',
+                background: previewing ? '#F59E0B' : '#22C55E',
+                boxShadow: `0 0 4px ${previewing ? '#F59E0B' : '#22C55E'}`,
+                marginRight: 6, display: 'inline-block',
+              }} />
+        <span style={{ flex: 1 }}>
+          {previewing ? 'PREVIEWING (twin only)' : 'Live: mirroring real arm'}
+        </span>
+        {previewing && (
+          <button
+            data-testid="follow-robot-btn"
+            type="button"
+            onClick={() => jogApi?.followLive?.()}
+            style={styles.followRobotBtn}
+            title="Return twin to LIVE-FOLLOW — clears any operator-set preview.">
+            Follow robot
+          </button>
+        )}
       </div>
 
       {!ready && (
@@ -175,17 +208,16 @@ export default function JointJogPanel({
             )}
           </div>
 
-          <div style={styles.btnRow}>
-            <button style={styles.resetBtn} onClick={onReset}>
-              Reset all → 0°
-            </button>
-            <button style={styles.homeBtn} onClick={() => onHome?.()}>
-              Home
-            </button>
-          </div>
-
-          <QuickOrientButtons jogApi={jogApi} onAtLimit={onAtLimit} />
-
+          {/* 2026-09-08 amendment: Face Down retained from the
+              retired Quick Orient row. TCP-preserving orient to
+              world -Y, slow fixed rate (~10°/s), refuses by name
+              when IK can't achieve the pose without moving the
+              tool point. Twin only in this commit — real-arm path
+              is a follow-up (needs a new coordinated-orient
+              backend endpoint; single-axis /cmd/jog pulses would
+              drift the TCP, which the operator explicitly
+              forbids). */}
+          <FaceDownButton jogApi={jogApi} onAtLimit={onAtLimit} />
           {JOINT_META.map((jm, i) => {
             const joint = jogApi.robot.joints[jm.name]
             const lim = joint?.limit || {}
@@ -208,6 +240,9 @@ export default function JointJogPanel({
                   value={v}
                   onInput={(e) => onSlide(i, e.target.value)}
                   onChange={(e) => onSlide(i, e.target.value)}
+                  onPointerUp={() => onSlideEnd(i)}
+                  onLostPointerCapture={() => onSlideEnd(i)}
+                  onBlur={() => onSlideEnd(i)}
                   style={styles.slider}
                 />
                 <div style={styles.limitStrip}>
@@ -218,30 +253,18 @@ export default function JointJogPanel({
             )
           })}
 
-          <div style={styles.tcpBox}>
-            <div style={styles.tcpTitle}>TCP (TWIN FRAME) · tool0</div>
-            <div style={styles.tcpRow}>
-              <TcpCell k="X"  v={tcp ? `${tcp.x_mm.toFixed(1)} mm` : '—'} />
-              <TcpCell k="Y"  v={tcp ? `${tcp.y_mm.toFixed(1)} mm` : '—'} />
-              <TcpCell k="Z"  v={tcp ? `${tcp.z_mm.toFixed(1)} mm` : '—'} />
-              <TcpCell k="Rz" v={tcp ? `${tcp.rz_deg.toFixed(1)}°` : '—'} />
-              <TcpCell k="Ry" v={tcp ? `${tcp.ry_deg.toFixed(1)}°` : '—'} />
-              <TcpCell k="Rx" v={tcp ? `${tcp.rx_deg.toFixed(1)}°` : '—'} />
-            </div>
-          </div>
-
-          <JogSpeedSlider />
+          {/* 2026-09-08 operator directive: TCP (TWIN FRAME) readout
+              box + JogSpeedSlider RETIRED from this panel.
+                * TCP box was display-only; no consumer.
+                * JogSpeedSlider wrote to the shared store slot
+                  `jogSpeedPct` — the SAME slot the jog surface
+                  (Expand Jog Buttons → JogControls) writes.
+                  Audited pre-removal: both readers/writers unify
+                  to the store field, no hidden speed state
+                  remains. The jog surface is now the ONE
+                  authority. */}
         </>
       )}
-    </div>
-  )
-}
-
-function TcpCell({ k, v }) {
-  return (
-    <div style={styles.tcpCell}>
-      <span style={styles.tcpKey}>{k}</span>
-      <span style={styles.tcpVal}>{v}</span>
     </div>
   )
 }
@@ -309,40 +332,39 @@ const styles = {
   modeBtnActive: {
     background: NAVY, color: '#fff', borderColor: NAVY,
   },
-  btnRow: {
-    display: 'flex', gap: 6, marginBottom: 10,
-  },
-  resetBtn: {
-    flex: 1, padding: '6px 10px',
-    background: '#fff', color: NAVY, border: `1px solid ${NAVY}`,
-    borderRadius: 4, fontSize: 12, fontWeight: 600, cursor: 'pointer',
-  },
-  homeBtn: {
-    flex: 1, padding: '6px 10px',
-    background: AMBER, color: '#fff', border: `1px solid ${AMBER}`,
-    borderRadius: 4, fontSize: 12, fontWeight: 600, cursor: 'pointer',
-  },
-  tcpBox: {
-    marginTop: 8, padding: 8,
-    background: 'var(--bg-surface, #F7F8FA)',
-    border: '1px solid var(--border, rgba(0,0,0,0.09))',
-    borderRadius: 4,
-  },
-  tcpTitle: {
-    fontSize: 10, fontWeight: 700, color: NAVY,
-    letterSpacing: 0.6, marginBottom: 6,
-  },
-  tcpRow: {
-    display: 'grid', gridTemplateColumns: '1fr 1fr 1fr',
-    gap: 6, fontSize: 11,
-    fontFamily: 'var(--font-mono, monospace)',
-    fontVariantNumeric: 'tabular-nums',
-  },
-  tcpCell: { display: 'flex', flexDirection: 'column', gap: 1 },
-  tcpKey:  { fontSize: 9, color: 'var(--text-muted, #8A8F9E)', letterSpacing: 0.4 },
-  tcpVal:  { color: 'var(--text-primary, #111)' },
+  // btnRow / resetBtn / homeBtn / tcpBox / tcpTitle / tcpRow /
+  // tcpCell / tcpKey / tcpVal styles retired 2026-09-08 along with
+  // the Reset / Home / TCP-box render blocks.
   empty: {
     fontSize: 11, color: 'var(--text-muted, #8A8F9E)',
     textAlign: 'center', padding: '18px 0',
+  },
+  followBannerLive: {
+    display: 'flex', alignItems: 'center',
+    padding: '4px 8px', marginBottom: 8,
+    borderRadius: 4,
+    background: 'rgba(34,197,94,0.10)',
+    border: '1px solid rgba(34,197,94,0.40)',
+    color: '#166534',
+    fontSize: 10, fontWeight: 700,
+    letterSpacing: 0.4, textTransform: 'uppercase',
+  },
+  followBannerPosing: {
+    display: 'flex', alignItems: 'center',
+    padding: '4px 8px', marginBottom: 8,
+    borderRadius: 4,
+    background: 'rgba(245,158,11,0.14)',
+    border: '1px solid rgba(245,158,11,0.55)',
+    color: '#78350F',
+    fontSize: 10, fontWeight: 700,
+    letterSpacing: 0.4, textTransform: 'uppercase',
+  },
+  followRobotBtn: {
+    padding: '2px 8px', marginLeft: 6,
+    fontSize: 10, fontWeight: 700, letterSpacing: 0.3,
+    textTransform: 'uppercase',
+    color: '#fff', background: '#059669',
+    border: '1px solid #047857', borderRadius: 3,
+    cursor: 'pointer', fontFamily: 'inherit',
   },
 }

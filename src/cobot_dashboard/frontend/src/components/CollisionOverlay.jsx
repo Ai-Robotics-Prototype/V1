@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Html } from '@react-three/drei'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
+import NumericField from './NumericField'
 
 // LiDAR (ROS) frame:  +X forward, +Y left, +Z up  (right-handed).
 // Three.js scene used by ArmViewer3D: lidarToThree maps
@@ -28,40 +29,68 @@ function statusColors(status) {
 // 3D pieces — mount inside <Canvas>{ ... }</Canvas>
 // ────────────────────────────────────────────────────────────────────────
 
-function ReachCylinder({ radius }) {
-  // Dashed circle at the floor (z=0) + at a sensible head-height plane to
-  // make the cylindrical reach volume obvious without occluding objects.
-  // Three.js cylinder geometry would block the points behind it, so use
-  // line loops + a faint floor disc instead.
-  const segs = 96
-  const z0 = 0.0
-  const zUpper = 1.6
-  const pointsFloor = []
-  const pointsTop   = []
-  for (let i = 0; i <= segs; i++) {
-    const t = (i / segs) * Math.PI * 2
-    const x = Math.cos(t) * radius
-    const y = Math.sin(t) * radius
-    const [tx, ty, tz] = lidarToThree(x, y, z0)
-    pointsFloor.push(new THREE.Vector3(tx, ty, tz))
-    const [tx2, ty2, tz2] = lidarToThree(x, y, zUpper)
-    pointsTop.push(new THREE.Vector3(tx2, ty2, tz2))
-  }
-  const geoFloor = useMemo(() => new THREE.BufferGeometry().setFromPoints(pointsFloor), [radius])
-  const geoTop   = useMemo(() => new THREE.BufferGeometry().setFromPoints(pointsTop),   [radius])
+// 2026-09-08 operator directive: the two flat rings (floor +
+// head-height) were replaced by a single hemispherical reach dome
+// centered on the base at the robot's real kinematic reach (S10-140
+// = 1.4 m per the manual's SR 1400 spec + BoundsTopDownEditor
+// annotation "Estun S10-140: 1400mm horizontal reach"). Clipped at
+// the floor plane by the SphereGeometry's phi range (0..π/2).
+//
+// Style: light + translucent so the arm reads through it. A soft
+// blue-tinted BackSide pass gives the "bubble" impression; a faint
+// horizon ring anchors the dome to the floor. depthWrite:false
+// prevents z-fighting with the arm on the transparent pass.
+function ReachDome({ radius }) {
+  // Hemisphere geometry: phi 0..π/2 renders only the top half.
+  // Segments tuned so the silhouette reads clean at tablet DPI
+  // without paying for excess triangles.
+  const geo = useMemo(
+    () => new THREE.SphereGeometry(radius, 64, 32, 0, Math.PI * 2, 0, Math.PI / 2),
+    [radius])
+  // Horizon ring — a subtle line loop at the base y=0 plane.
+  const horizonGeo = useMemo(() => {
+    const segs = 96
+    const pts = []
+    for (let i = 0; i <= segs; i++) {
+      const t = (i / segs) * Math.PI * 2
+      const x = Math.cos(t) * radius
+      const y = Math.sin(t) * radius
+      const [tx, ty, tz] = lidarToThree(x, y, 0)
+      pts.push(new THREE.Vector3(tx, ty, tz))
+    }
+    return new THREE.BufferGeometry().setFromPoints(pts)
+  }, [radius])
   return (
     <group>
-      <lineSegments>
-        <primitive object={geoFloor} attach="geometry" />
-        <lineDashedMaterial color="#a3a3a3" dashSize={0.08} gapSize={0.05} transparent opacity={0.55} />
-      </lineSegments>
+      {/* Outer surface — BackSide gives the "looking-into-a-bubble"
+          fresnel-adjacent read. Rendered after opaque geometry with
+          depthWrite:false so it never z-fights the arm. */}
+      <mesh geometry={geo} renderOrder={2}>
+        <meshBasicMaterial
+          color="#4C9AFF"
+          transparent
+          opacity={0.10}
+          side={THREE.BackSide}
+          depthWrite={false}
+        />
+      </mesh>
+      {/* Inner surface — same material, FrontSide, half opacity.
+          Accumulates transparency at the silhouette edge, reading as
+          a soft rim. */}
+      <mesh geometry={geo} renderOrder={3}>
+        <meshBasicMaterial
+          color="#4C9AFF"
+          transparent
+          opacity={0.06}
+          side={THREE.FrontSide}
+          depthWrite={false}
+        />
+      </mesh>
+      {/* Faint horizon ring at the floor plane. */}
       <line>
-        <primitive object={geoFloor} attach="geometry" />
-        <lineBasicMaterial color="#a3a3a3" transparent opacity={0.65} />
-      </line>
-      <line>
-        <primitive object={geoTop} attach="geometry" />
-        <lineBasicMaterial color="#a3a3a3" transparent opacity={0.35} />
+        <primitive object={horizonGeo} attach="geometry" />
+        <lineBasicMaterial color="#4C9AFF" transparent opacity={0.35}
+                           depthWrite={false} />
       </line>
     </group>
   )
@@ -228,7 +257,7 @@ function ObjectBox({ obj, showLabel }) {
   )
 }
 
-export function CollisionScene3D({ showLabels = true, showStatic = true, showDynamic = true }) {
+export function CollisionScene3D({ showLabels = true, showStatic = true, showDynamic = true, showReachDome = true }) {
   const collision = useStore((s) => s.collision)
   // Mesh data is persisted in collision_zones.json on the dashboard
   // side — too heavy for the 10 Hz /collision/objects feed but stable
@@ -268,7 +297,7 @@ export function CollisionScene3D({ showLabels = true, showStatic = true, showDyn
   })
   return (
     <group>
-      <ReachCylinder radius={reach} />
+      {showReachDome && <ReachDome radius={reach} />}
       {filtered.map((o, i) => {
         // Join: per-tick payload is small, mesh data comes from the
         // persisted-zones fetch above. Both must be present for the
@@ -428,10 +457,11 @@ function NumRow({ label, v, onChange }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
       <label style={{ width: 56, fontSize: 10, color: '#94a3b8' }}>{label}</label>
-      <input
-        type="number" step="0.05"
+      <NumericField
+        step={0.05}
         value={v}
-        onChange={(e) => onChange(Number(e.target.value))}
+        onCommit={onChange}
+        aria-label={label}
         style={{
           flex: 1, padding: '3px 6px', fontSize: 11,
           background: '#0f172a', color: '#e5e7eb',

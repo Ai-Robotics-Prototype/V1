@@ -11,7 +11,11 @@ __pycache__/
 
 # Large Isaac ROS quickstart assets (e.g. 1.6 GB visual_slam rosbag) — not source
 isaac_ros_assets/
-# Generated frontend build output (produced by `npm run build`)
+# Generated frontend build output (produced by `npm run build`).
+# vite.config outputs to dist/ (canonical). mock_server/static/ was the
+# legacy override path — retired; kept in the ignore list transitionally
+# so any leftover checkout with the old dir doesn't clutter git status.
+src/cobot_dashboard/frontend/dist/
 src/cobot_dashboard/mock_server/static/
 
 # Third-party Livox driver + SDK — cloned and configured by
@@ -49,3 +53,6 @@ config/estun_s10_140_fitted.urdf
 *.pem
 *.key
 **/credentials.json
+
+# deploy.sh build stamp — regenerated per-machine
+src/cobot_dashboard/frontend/.deploy-src-hash

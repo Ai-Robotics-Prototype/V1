@@ -1,5 +1,6 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import LiveRecorder from './LiveRecorder'
+import NumericField from './NumericField'
 import { useStore } from '../store/useStore'
 
 /*
@@ -39,11 +40,35 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
   const [transitedExternally, setTransited] = useState(false)
   const [accepting, setAccepting]     = useState(false)
   const [acceptError, setAcceptError] = useState('')
+  // 2026-07-30 §430 — routine-condensation view state. Set of
+  // routine ids the operator has explicitly EXPANDED. Default is
+  // collapsed (show only iter 0 rows + "×N" chip). When empty,
+  // every routine renders folded — that's the acceptance shape:
+  // 63 unrolled steps → ~13 shown rows for the 5-iteration white
+  // bowl demo.
+  const [expandedRoutines, setExpandedRoutines] = useState(() => new Set())
   // Map of clarification.id → operator answer (or suggested default
   // until they change it). Reset every time a new draft loads. Empty
   // string means "explicitly pending" (used for text/number inputs
   // the operator hasn't touched yet when no suggested existed).
   const [clarAnswers, setClarAnswers] = useState({})
+  // Set of clarification ids the operator has EXPLICITLY interacted
+  // with — clicked a choice, edited a text/number, picked a part.
+  // Deliberately independent from clarAnswers: seeding the answer to
+  // `c.suggested` on draft-load pre-fills the value but does NOT count
+  // as an operator interaction, so the chip stays PENDING (or SUGGESTED
+  // if we want to display that) until the operator does something.
+  // "Accept all suggested defaults" ALSO does not mark anything as
+  // interacted — that's an implicit-accept path, treated in the
+  // learning store as answered=false / chose_suggested=true.
+  const [clarInteracted, setClarInteracted] = useState(() => new Set())
+  // How many times the composed program should cycle (default 1 —
+  // matches the pre-cycles behaviour, byte-identical Lua). Set > 1 to
+  // wrap the composed body in a Lua for-loop at codegen time
+  // (initial move_home outside, body + return-to-home inside).
+  // Continuous (count=0) is not offered here — the operator can flip
+  // that in the ProgramEditor after Accept if they want it.
+  const [cycles, setCycles] = useState(1)
   // Editable mirrors of the draft fields — operator corrections.
   const [editName, setEditName]       = useState('')
   const [editDesc, setEditDesc]       = useState('')
@@ -189,6 +214,8 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
         }
       }
       setClarAnswers(seed)
+      setClarInteracted(new Set())
+      setCycles(1)
       setPhase(PHASE_REVIEW)
     } catch (e) {
       setGenError(`generate error: ${e?.message || e}`)
@@ -196,6 +223,119 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
     }
     setGenerating(false)
   }
+
+  // Re-invoke the server-side composer on the CURRENT (in-memory,
+  // Auto-recompose (2026-07-27). Every clarification answer flows
+  // into the intent client-side via applyClarifications, then a POST
+  // to /recompose swaps in the fresh draft. Same server path Accept
+  // uses, so screen and eventually-persisted artifact stay one and
+  // the same. Debounced 400 ms so rapid-toggling coalesces; each
+  // dispatch bumps recomposeSeqRef and only the latest response
+  // applies its state — an older reply's setDraft would be a stale
+  // clobber that the seq check discards.
+  //
+  // Manual "Regenerate draft" button removed — the review is
+  // read-only (no step-level edits available today, see line ~810),
+  // so there is no operator-authored draft state to preserve across
+  // a rebuild, hence no manual-edit guard needed. If step editing
+  // ever ships in the review, gate the auto-fire on a "dirty" flag.
+  const [regenerating, setRegenerating] = useState(false)
+  const [regenError,   setRegenError]   = useState('')
+  const [changedStepIdx, setChangedStepIdx] = useState(new Set())
+  const recomposeSeqRef      = useRef(0)
+  const recomposeInitialRef  = useRef(true)   // skip the initial seed
+  const recomposeAbortRef    = useRef(null)   // supersede in-flight
+
+  const runRecompose = useCallback(async () => {
+    if (!demoId || !intent || !draft) return
+    // Bump the seq FIRST so any older in-flight response fails the
+    // staleness check when it lands. Abort the previous fetch too —
+    // no point letting a superseded request tie up the network.
+    const mySeq = ++recomposeSeqRef.current
+    if (recomposeAbortRef.current) {
+      try { recomposeAbortRef.current.abort() } catch { /* nop */ }
+    }
+    const ac = new AbortController()
+    recomposeAbortRef.current = ac
+    setRegenerating(true)
+    setRegenError('')
+    // Snapshot the pre-recompose step signatures for the changed-
+    // row highlight when the new draft lands.
+    const prevSteps = Array.isArray(draft.steps) ? draft.steps : []
+    const prevSig = prevSteps.map((s) => `${s?.action || ''}|${s?.label || ''}`)
+    try {
+      const applied = applyClarifications(draft, intent, clarAnswers)
+      const res = await fetch(`/api/pbd/${demoId}/recompose`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ intent: applied.intent }),
+        signal:  ac.signal,
+      })
+      const data = await res.json().catch(() => ({}))
+      // Staleness guard — a newer request superseded us while we
+      // were on the wire. Silent drop; the newer response will
+      // handle UI state.
+      if (mySeq !== recomposeSeqRef.current) return
+      if (!data.ok) {
+        // Keep the previous draft on the screen — never blank the
+        // list. The inline error is visible in the header.
+        setRegenError(data.error || `recompose failed (HTTP ${res.status})`)
+        return
+      }
+      // Server returns { draft, intent }. Compute the changed-row
+      // set (by index against prevSig) so the UI can flash amber
+      // on rows whose action/label just changed — the moment the
+      // product teaches the operator it listened.
+      const newSteps = Array.isArray(data.draft?.steps) ? data.draft.steps : []
+      const newSig   = newSteps.map((s) => `${s?.action || ''}|${s?.label || ''}`)
+      const changed  = new Set()
+      const maxN = Math.max(prevSig.length, newSig.length)
+      for (let i = 0; i < maxN; i++) {
+        if (prevSig[i] !== newSig[i]) changed.add(i)
+      }
+      if (data.draft)  setDraft(data.draft)
+      if (data.intent) setIntent(data.intent)
+      if (data.draft?.name) setEditName(data.draft.name)
+      if (changed.size > 0) {
+        setChangedStepIdx(changed)
+        // Fade the highlight after ~700 ms so a subsequent recompose
+        // starts from a clean slate.
+        setTimeout(() => {
+          // Only clear if we're still the latest — a NEW recompose
+          // will set its own changed set and we don't want to stomp.
+          if (recomposeSeqRef.current === mySeq) setChangedStepIdx(new Set())
+        }, 700)
+      }
+    } catch (e) {
+      if (e?.name === 'AbortError') return   // superseded — ignore
+      if (mySeq !== recomposeSeqRef.current) return
+      setRegenError(`recompose error: ${e?.message || e}`)
+    } finally {
+      if (mySeq === recomposeSeqRef.current) setRegenerating(false)
+    }
+  }, [demoId, intent, draft, clarAnswers])
+
+  // Fire recompose whenever the answer set changes. Skip the first
+  // run — that's the seed applied by the initial fetch (setClarAnswers
+  // called immediately after setDraft/setIntent). Recomposing on the
+  // seed would round-trip the same intent that just produced this
+  // draft — wasted request + a spurious "changed" flash on every
+  // rebuild-triggered answer echo. Resetting the initial-ref when
+  // demoId changes covers the "operator loads a different demo
+  // without unmounting the review" path.
+  useEffect(() => {
+    recomposeInitialRef.current = true
+  }, [demoId])
+  useEffect(() => {
+    if (recomposeInitialRef.current) {
+      recomposeInitialRef.current = false
+      return
+    }
+    if (!intent || !draft) return
+    const t = setTimeout(() => { runRecompose() }, 400)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clarAnswers])
 
   async function accept() {
     if (!draft || !demoId) return
@@ -207,8 +347,28 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
       // question (no second round-trip). The applied intent is what
       // gets persisted as the training target.
       const applied = applyClarifications(draft, intent, clarAnswers)
+      // Cycles: 1 = no loop step (byte-identical to today). N ≥ 2
+      // appends a loop step at the tail; codegen wraps the body in
+      // `for i=1,N do ... end` with the initial move_home outside.
+      // Strip any pre-existing loop step first so a re-accept doesn't
+      // double up (shouldn't happen — the composer never emits one —
+      // but defensive against a legacy PBD draft that already has
+      // one on disk).
+      const cyclesN = Math.max(1, Math.min(9999, Number.isFinite(cycles) ? cycles : 1))
+      let outSteps = Array.isArray(applied.draft.steps)
+        ? applied.draft.steps.filter((s) => s?.action !== 'loop')
+        : []
+      if (cyclesN > 1) {
+        outSteps = outSteps.concat([{
+          action: 'loop',
+          label: 'Repeat ' + cyclesN + ' times',
+          goto: 1,
+          count: cyclesN,
+        }])
+      }
       const program = {
         ...applied.draft,
+        steps:       outSteps,
         name:        editName.trim() || applied.draft.name,
         description: editDesc,
       }
@@ -233,7 +393,41 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
           // as a separate file (clarifications_answered.json) so the
           // learning loop can see which questions the AI needed to
           // ask and how the human answered them.
-          clarifications_answered: clarAnswers,
+          //
+          // Richer per-id shape: {answered, chose_suggested, value}.
+          //   answered         = operator explicitly interacted with
+          //                      this clarification (clicked / edited).
+          //   chose_suggested  = the final value equals the AI's
+          //                      suggested default (regardless of
+          //                      whether the operator interacted).
+          //   value            = the final answer stored on the draft.
+          // Both signals matter for training: explicit-accept and
+          // implicit-accept-of-default are DIFFERENT signals — one
+          // means "the operator agreed", the other means "the operator
+          // never looked". The backend also accepts the older flat
+          // {id: value} shape for back-compat.
+          clarifications_answered: (() => {
+            const out = {}
+            const byId = {}
+            for (const c of (intent?.ambiguities || [])) {
+              if (c && c.id) byId[c.id] = c
+            }
+            for (const [cid, v] of Object.entries(clarAnswers || {})) {
+              const c = byId[cid]
+              const suggested = c ? c.suggested : undefined
+              let choseSuggested = false
+              try {
+                choseSuggested = (suggested !== undefined && suggested !== null)
+                                 && JSON.stringify(v) === JSON.stringify(suggested)
+              } catch { choseSuggested = false }
+              out[cid] = {
+                answered: clarInteracted.has(cid),
+                chose_suggested: choseSuggested,
+                value: v,
+              }
+            }
+            return out
+          })(),
           save_to_library: true,
         }),
       })
@@ -243,10 +437,30 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
         setAccepting(false)
         return
       }
+      // Bug fix (2026-07-27): server now recomposes the program from
+      // the answered intent BEFORE persisting (see
+      // dashboard_server.api_pbd_correct's recompose block). The
+      // response echoes back the final saved program — adopt it into
+      // local state so the review re-renders whatever actually got
+      // saved. This closes the "answers recorded but not applied"
+      // hole where an effector-clarification answer stayed on the
+      // intent but the draft's step list was frozen from before the
+      // answer (whitebowl symptom: 'vacuum' answered, 'Grip part'
+      // saved because the client-side folder never restructures the
+      // step list on effector changes — only the ↻ Regenerate button
+      // did before this fix).
+      if (data.program) {
+        setDraft(data.program)
+        if (data.program.name) setEditName(data.program.name)
+      }
+      if (data.recompose_warning) {
+        console.warn('[PBD] server recompose failed:', data.recompose_warning)
+      }
       // Refresh the shared programs list so ProgramLibrary reflects
       // the new draft program immediately (no mount-fetch lag).
       try { useStore.getState().refreshPrograms?.() } catch {}
-      onSaved?.({ id: data.program_id, name: program.name, ...program })
+      onSaved?.({ id: data.program_id, name: program.name,
+                  ...(data.program || program) })
       onClose?.()
     } catch (e) {
       setAcceptError(`save error: ${e?.message || e}`)
@@ -457,6 +671,14 @@ export default function ProgramFromDemonstration({ onClose, onSaved }) {
               editScene={editScene} setEditScene={setEditScene}
               partsLibrary={partsLibrary}
               clarAnswers={clarAnswers} setClarAnswers={setClarAnswers}
+              clarInteracted={clarInteracted}
+              setClarInteracted={setClarInteracted}
+              cycles={cycles} setCycles={setCycles}
+              regenerating={regenerating}
+              regenError={regenError}
+              changedStepIdx={changedStepIdx}
+              expandedRoutines={expandedRoutines}
+              setExpandedRoutines={setExpandedRoutines}
               accepting={accepting} acceptError={acceptError}
             />
           )}
@@ -518,19 +740,59 @@ function ReviewPanel({
   editName, setEditName, editDesc, setEditDesc,
   editScene, setEditScene, partsLibrary,
   clarAnswers, setClarAnswers,
+  clarInteracted, setClarInteracted,
+  cycles, setCycles,
+  regenerating, regenError,
+  changedStepIdx,
+  expandedRoutines, setExpandedRoutines,
   accepting, acceptError,
 }) {
+  // 2026-07-30 §430 — routines from the draft (backend-populated).
+  // Build a step-idx → routine info map ONCE per render so the row
+  // map below is O(N).
+  const routines = Array.isArray(draft?.routines) ? draft.routines : []
+  const stepRoutineInfo = (() => {
+    // { stepIdx: { routineId, iteration, firstOfIteration, firstOfRoutine, routine } }
+    const info = {}
+    for (const r of routines) {
+      const ranges = Array.isArray(r?.step_indices_per_iter) ? r.step_indices_per_iter : []
+      const firstRoutineIdx = ranges.length && Array.isArray(ranges[0]) ? Number(ranges[0][0]) : null
+      for (let iter = 0; iter < ranges.length; iter++) {
+        const rng = ranges[iter]
+        if (!Array.isArray(rng) || rng.length < 2) continue
+        const a = Number(rng[0]), b = Number(rng[1])
+        for (let s_idx = a; s_idx < b; s_idx++) {
+          info[s_idx] = {
+            routineId:       r.id,
+            iteration:       iter,
+            firstOfIteration: s_idx === a,
+            firstOfRoutine:  s_idx === firstRoutineIdx,
+            iterations:      Number(r.iterations || 0),
+            name:            String(r.name || ''),
+            routine:         r,
+          }
+        }
+      }
+    }
+    return info
+  })()
+  const isExpanded = (rid) => !!(expandedRoutines && expandedRoutines.has && expandedRoutines.has(rid))
+  const toggleRoutine = (rid) => {
+    if (!setExpandedRoutines) return
+    setExpandedRoutines((prev) => {
+      const next = new Set(prev || [])
+      if (next.has(rid)) next.delete(rid); else next.add(rid)
+      return next
+    })
+  }
   return (
     <div style={{ padding: 22 }}>
-      <Banner
-        kind={transitedExternally ? 'warn' : 'info'}
-        title="Generated from demonstration — poses pending perception"
-        body={
-          `${transitedExternally
-            ? 'Interpreted by external API (' + backendId + '); your demonstration data and the human-corrected program are stored locally only.'
-            : 'Interpreted by the on-device backend (' + backendId + ').'}`
-        }
-      />
+      {/* Provenance banner removed 2026-07-23 — the "generated from
+          demonstration — poses pending perception" block was
+          review-screen clutter (backendId still logged in
+          metadata.json / backend_used.json for provenance). The
+          transitedExternally flag remains available on props for any
+          future warning; it just no longer renders here. */}
 
       <Section title="Task summary">
         <div style={{ fontSize: 14, color: '#111', marginBottom: 8 }}>
@@ -569,7 +831,17 @@ function ReviewPanel({
                 {op.operation_type}
               </span>
               <span style={{ fontSize: 12, color: '#6b7280' }}>
-                — count: {String(op.count_hint ?? 'all')}
+                — count: {String(
+                  op.count && Number(op.count) > 1
+                    ? op.count
+                    : (op.count_hint ?? 'all')
+                )}
+                {op.pick_pattern && op.pick_pattern !== 'individual_taught'
+                  ? ` · pick=${op.pick_pattern}` : ''}
+                {op.place_pattern && op.place_pattern !== 'fixed'
+                  ? ` · place=${op.place_pattern}${
+                      op.place_pattern === 'stack' && op.place_stack_dz_mm
+                        ? ` (+${op.place_stack_dz_mm}mm)` : ''}` : ''}
               </span>
             </div>
             <Field label="Part">
@@ -585,30 +857,48 @@ function ReviewPanel({
         ))}
       </Section>
 
-      {(intent.ambiguities || []).length > 0 && (
-        <ClarificationsPanel
-          clarifications={intent.ambiguities}
-          answers={clarAnswers}
-          setAnswers={setClarAnswers}
-          partsLibrary={partsLibrary}
-        />
-      )}
+      {(() => {
+        // 2026-08-01 rule 6c — sameness/difference of two positions is
+        // resolved deterministically by fusion; the operator is NEVER
+        // asked. The backend prompt already forbids these clarifications,
+        // fusion never emits any, and the composer doesn't either — but
+        // this filter is a belt-and-suspenders guard so a legacy model
+        // reply or a hand-authored intent can't sneak a sameness question
+        // through. Anything a caller mis-classified as `field:"location"`
+        // + "same" phrasing is dropped silently; the low-confidence chip
+        // on the anchor / repeat is the passive signal in its place.
+        const isSamenessAsk = (c) => {
+          const field = String(c?.field || '').toLowerCase()
+          const q     = String(c?.question || '').toLowerCase()
+          if (field !== 'location') return false
+          return /\b(same|different)\b/.test(q)
+                 && /(spot|place|location|position|point)/.test(q)
+        }
+        const filtered = (intent.ambiguities || []).filter((c) => !isSamenessAsk(c))
+        return filtered.length > 0 ? (
+          <ClarificationsPanel
+            clarifications={filtered}
+            answers={clarAnswers}
+            setAnswers={setClarAnswers}
+            interacted={clarInteracted}
+            setInteracted={setClarInteracted}
+            partsLibrary={partsLibrary}
+          />
+        ) : null
+      })()}
 
-      {(usedExamples || []).length > 0 && (
-        <Section title={`Informed by ${usedExamples.length} similar past demo${usedExamples.length === 1 ? '' : 's'}`}>
-          {usedExamples.map((ex, i) => (
-            <div key={i} style={{
-              padding: 8, marginBottom: 4, borderRadius: 6,
-              background: '#eff6ff', border: '1px solid #bfdbfe',
-              fontSize: 12, color: '#1e3a8a', display: 'flex', gap: 8,
-            }}>
-              <span style={{ fontFamily: 'monospace' }}>{ex.demo_id}</span>
-              <span style={{ flex: 1 }}>{ex.task_summary || ''}</span>
-              <span>score {ex._score}</span>
-            </div>
-          ))}
-        </Section>
-      )}
+      {/* Regenerate button removed 2026-07-27 — draft steps now
+          auto-recompose on every answer change (see the useEffect
+          on clarAnswers above). The spinner + inline error live in
+          the Draft steps header. Accept still runs its own server-
+          side recompose as the belt-AND-suspenders final authority
+          for the persisted artifact. */}
+
+      {/* Retrieval-augment few-shot examples are still fetched, logged
+          to metadata.retrieval.used_examples, and shape the AI's draft
+          — the operator-facing "Informed by N past demos" indicator
+          was removed as review-screen clutter. The retrieval mechanism
+          itself and its provenance record are unchanged. */}
 
       <Section title="Program name (editable)">
         <input value={editName} onChange={(e) => setEditName(e.target.value)}
@@ -617,47 +907,267 @@ function ReviewPanel({
           rows={2} style={{ ...inputBox, marginTop: 6, resize: 'vertical' }} />
       </Section>
 
-      <Section title={`Draft steps (${draft.steps?.length || 0})`}>
-        <div style={{
-          maxHeight: 220, overflowY: 'auto', borderRadius: 8,
-          border: '1px solid #e5e7eb',
-        }}>
-          {(draft.steps || []).map((s, i) => (
-            <div key={i} style={{
-              display: 'flex', alignItems: 'center', gap: 8,
-              padding: '6px 10px',
-              borderBottom: i < draft.steps.length - 1 ? '1px solid #f3f4f6' : 'none',
-              background: i % 2 ? '#fafafa' : '#fff',
-            }}>
-              <span style={{
-                fontFamily: 'monospace', fontSize: 11, color: '#6b7280',
-                minWidth: 26, textAlign: 'right',
-              }}>{i + 1}</span>
-              <span style={{ fontSize: 12, fontWeight: 600, color: '#374151', minWidth: 110 }}>
-                {s.action}
-              </span>
-              <span style={{ fontSize: 12, color: '#111', flex: 1 }}>{s.label}</span>
-              {s.pose_status === POSE_AWAITING && (
-                <span style={{
-                  fontSize: 10, fontWeight: 700, padding: '2px 6px',
-                  borderRadius: 4, color: '#92400e', background: '#fef3c7',
-                  border: '1px solid #fde68a',
-                }}>awaiting perception</span>
-              )}
-            </div>
-          ))}
+      <Section title="Run mode">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 14, color: '#111' }}>Run for</span>
+          <NumericField integer min={1} step={1}
+            value={Number.isFinite(cycles) ? cycles : 1}
+            onCommit={(v) => setCycles(v)}
+            aria-label="Cycle count"
+            style={{ ...inputBox, width: 84, textAlign: 'right' }} />
+          <span style={{ fontSize: 14, color: '#111' }}>
+            cycle{cycles === 1 ? '' : 's'}
+          </span>
+        </div>
+        <div style={{ fontSize: 12, color: '#6b7280', marginTop: 6 }}>
+          The initial move-to-home runs once at program start; the
+          pick/place body then cycles the number of times you set here.
+          Continuous (run-forever) programs can be enabled in the
+          Program editor after saving.
         </div>
       </Section>
 
-      {transcript && (
-        <Section title="Voice transcript">
+      {/* Draft steps — auto-recomposes as answers change. Header
+          shows a small spinner during rebuild; rows that changed
+          from the previous draft flash amber for ~700 ms so the
+          operator can see WHICH steps their answer moved. The
+          previous ↻ Regenerate button is gone — Accept keeps its
+          server-side recompose as the belt-AND-suspenders final
+          authority. */}
+      <div style={{ marginBottom: 14 }}>
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6,
+        }}>
           <div style={{
-            padding: 10, fontSize: 12, color: '#374151',
-            background: '#f8fafc', border: '1px solid #e5e7eb',
-            borderRadius: 6, lineHeight: 1.5, whiteSpace: 'pre-wrap',
-          }}>{transcript}</div>
-        </Section>
-      )}
+            fontSize: 11, fontWeight: 700, color: '#6b7280',
+            textTransform: 'uppercase', letterSpacing: '0.06em',
+          }}>{(() => {
+            // Header count folds routine iteration counts when any
+            // routine is collapsed, so it matches the row count the
+            // operator actually sees.
+            const total = (draft.steps || []).length
+            let hidden = 0
+            for (const s_idx of Object.keys(stepRoutineInfo)) {
+              const info = stepRoutineInfo[s_idx]
+              if (info.iteration > 0 && !isExpanded(info.routineId)) hidden++
+            }
+            const shown = total - hidden
+            if (hidden > 0) {
+              return `Draft steps (${shown} shown / ${total} unrolled)`
+            }
+            return `Draft steps (${total})`
+          })()}</div>
+          {regenerating && (
+            <>
+              <span
+                aria-label="Rebuilding steps"
+                style={{
+                  display: 'inline-block', width: 12, height: 12,
+                  border: '2px solid #bfdbfe', borderTopColor: '#2563EB',
+                  borderRadius: '50%',
+                  animation: 'pbdRecomposeSpin 0.7s linear infinite',
+                }}
+              />
+              <span style={{ fontSize: 11, color: '#6b7280' }}>rebuilding…</span>
+            </>
+          )}
+          {regenError && !regenerating && (
+            <span style={{ fontSize: 11, color: '#DC2626',
+                           marginLeft: 6, fontWeight: 600 }}>
+              recompose failed — showing previous draft; {regenError}
+            </span>
+          )}
+        </div>
+        <style>{`
+          @keyframes pbdRecomposeSpin { to { transform: rotate(360deg); } }
+          @keyframes pbdStepFlash {
+            0%   { background: #fde68a; }
+            60%  { background: #fef3c7; }
+            100% { background: transparent; }
+          }
+        `}</style>
+        <div style={{
+          maxHeight: 220, overflowY: 'auto', borderRadius: 8,
+          border: '1px solid #e5e7eb',
+          opacity: regenerating ? 0.75 : 1,
+          transition: 'opacity 150ms ease-out',
+        }}>
+          {(draft.steps || []).map((s, i, arr) => {
+            const flashed = changedStepIdx && changedStepIdx.has(i)
+            // 2026-07-30 §430 — routine fold: when this step belongs
+            // to a routine iteration>0 and the routine is COLLAPSED
+            // (not in expandedRoutines), skip rendering it. The
+            // iteration-0 span still renders, so the folded view
+            // shows one representative cycle + "×N" chip on its
+            // first row.
+            const _rinfo = stepRoutineInfo[i]
+            if (_rinfo && _rinfo.iteration > 0 && !isExpanded(_rinfo.routineId)) {
+              return null
+            }
+            // 2026-08-01 §3 — location_ref decorations. `intent.positions`
+            // was populated deterministically by fusion.fuse_positions
+            // on the server; we render the 🔗N badge on each anchor and
+            // a "🔗 → step X" chip on each derived_from_step_id repeat,
+            // plus a "verify" chip when the LocationRef is low-confidence.
+            // No sameness Clarification is EVER asked (prompt rule 6c),
+            // so there is no question-asking path here — the chip is
+            // strictly passive.  Cost is O(N) per row on N≤~65 draft
+            // steps in real PBD demos — cheap enough to inline.
+            const positions = Array.isArray(intent?.positions) ? intent.positions : []
+            const refObj = s?.location_ref
+              ? positions.find((p) => p && p.ref === s.location_ref)
+              : null
+            const lowConf     = !!(refObj && refObj.low_confidence)
+            const isRepeatLink = !!s?.derived_from_step_id
+            const linkedCount  = arr.reduce(
+              (n, x) => n + ((x?.derived_from_step_id === s?.id) ? 1 : 0), 0)
+            const isAnchor     = !!s?.location_ref && !isRepeatLink && linkedCount > 0
+            const shareCount   = linkedCount + 1  // anchor + repeats
+            // The composer stamps "(link → step X)" on the repeat labels
+            // so old builds still show provenance in text.  We now render
+            // that as a chip below — strip the suffix so the label reads
+            // clean.
+            const displayLabel = isRepeatLink && typeof s.label === 'string'
+              ? s.label.replace(/\s*\(link → step \d+\)\s*$/, '')
+              : s.label
+            // Task 1 §4: iteration grouping. Steps that carry
+            // iter_index/iter_count sit inside a repeated pick/place
+            // pair; iteration > 0 renders in the derived style (softer
+            // colour, no teach affordance, indent). derived_from-
+            // annotated approach/retreat rows also render derived so
+            // the visual grouping stays consistent.
+            const iterIdx   = Number.isFinite(s.iter_index) ? Number(s.iter_index) : null
+            const iterCount = Number.isFinite(s.iter_count) ? Number(s.iter_count) : null
+            const isDerivedIter = iterIdx !== null && iterIdx > 0
+            const isDerivedApp  = !!s.derived_from
+            const isDerived     = isDerivedIter || isDerivedApp || isRepeatLink
+            const startsIter    = iterIdx === 0 && !!s.position_role  // first pick contact of a new iteration group
+            const startsIterN   = iterIdx !== null && iterIdx > 0 && !!s.position_role
+            const showBadge = (iterCount && iterCount > 1)
+                             && (startsIter || startsIterN)
+            return (
+              <div key={i} style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                padding: '6px 10px',
+                borderBottom: i < draft.steps.length - 1 ? '1px solid #f3f4f6' : 'none',
+                background: isDerived
+                  ? (i % 2 ? '#f5f7fa' : '#f9fafb')
+                  : (i % 2 ? '#fafafa' : '#fff'),
+                borderLeft: showBadge ? '3px solid #2563EB' : '3px solid transparent',
+                animation: flashed ? 'pbdStepFlash 700ms ease-out' : undefined,
+              }}>
+                <span style={{
+                  fontFamily: 'monospace', fontSize: 11,
+                  color: isDerived ? '#9ca3af' : '#6b7280',
+                  minWidth: 26, textAlign: 'right',
+                }}>{i + 1}</span>
+                <span style={{
+                  fontSize: 12, fontWeight: 600,
+                  color: isDerived ? '#6b7280' : '#374151',
+                  minWidth: 110,
+                }}>
+                  {s.action}
+                </span>
+                <span style={{
+                  fontSize: 12,
+                  color: isDerived ? '#4b5563' : '#111',
+                  fontStyle: (isDerivedIter || isRepeatLink) && !s.taught ? 'italic' : 'normal',
+                  flex: 1,
+                }}>{displayLabel}</span>
+                {_rinfo && _rinfo.firstOfRoutine && (
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); toggleRoutine(_rinfo.routineId) }}
+                    title={
+                      isExpanded(_rinfo.routineId)
+                        ? `Fold ${_rinfo.iterations} iterations back to one representative cycle.`
+                        : `Expand to show all ${_rinfo.iterations} iterations. Edits to this cycle apply to every iteration.`
+                    }
+                    style={{
+                      fontSize: 10, fontWeight: 700, padding: '2px 8px',
+                      borderRadius: 12,
+                      color: '#065f46', background: '#d1fae5',
+                      border: '1px solid #6ee7b7',
+                      display: 'inline-flex', alignItems: 'center', gap: 4,
+                      cursor: 'pointer',
+                    }}>
+                    ×{_rinfo.iterations}
+                    <span style={{ fontSize: 9, fontWeight: 800 }}>
+                      {isExpanded(_rinfo.routineId) ? '▾ fold' : '▸ expand'}
+                    </span>
+                  </button>
+                )}
+                {isAnchor && (
+                  <span title={
+                    `${shareCount} steps share this position${
+                      refObj?.label ? ` (${refObj.label})` : ''
+                    } — teach once, all linked steps reuse the pose.`}
+                    style={{
+                      fontSize: 10, fontWeight: 700, padding: '2px 6px',
+                      borderRadius: 4,
+                      color: '#4338ca', background: '#eef2ff',
+                      border: '1px solid #c7d2fe',
+                      display: 'inline-flex', alignItems: 'center', gap: 3,
+                  }}>🔗{shareCount}</span>
+                )}
+                {isRepeatLink && (
+                  <span title={
+                    `Linked to step ${s.derived_from_step_id}${
+                      refObj?.label ? ` (${refObj.label})` : ''
+                    } — reuses the taught pose from that step.`}
+                    style={{
+                      fontSize: 10, fontWeight: 700, padding: '2px 6px',
+                      borderRadius: 4,
+                      color: '#4338ca', background: '#eef2ff',
+                      border: '1px solid #c7d2fe',
+                      display: 'inline-flex', alignItems: 'center', gap: 3,
+                  }}>🔗 → step {s.derived_from_step_id}</span>
+                )}
+                {lowConf && (isAnchor || isRepeatLink) && (
+                  <span title={
+                    `Position identity resolved by ${refObj?.fusion_rule || 'fusion'} `
+                    + `at ${((refObj?.confidence || 0) * 100).toFixed(0)}% confidence — `
+                    + `verify the link is right before running.`}
+                    style={{
+                      fontSize: 10, fontWeight: 700, padding: '2px 6px',
+                      borderRadius: 4,
+                      color: '#92400e', background: '#fef3c7',
+                      border: '1px solid #fde68a',
+                  }}>linked — verify</span>
+                )}
+                {showBadge && (
+                  <span style={{
+                    fontSize: 10, fontWeight: 700, padding: '2px 6px',
+                    borderRadius: 4,
+                    color: '#1e40af', background: '#dbeafe',
+                    border: '1px solid #bfdbfe',
+                  }}>iter {iterIdx + 1}/{iterCount}</span>
+                )}
+                {isDerivedIter && s.iter_offset_mm && (
+                  <span style={{
+                    fontSize: 10, fontWeight: 600, padding: '2px 6px',
+                    borderRadius: 4, color: '#6b7280', background: '#f3f4f6',
+                    border: '1px solid #e5e7eb',
+                  }}>derived</span>
+                )}
+                {s.pose_status === POSE_AWAITING && (
+                  <span style={{
+                    fontSize: 10, fontWeight: 700, padding: '2px 6px',
+                    borderRadius: 4, color: '#92400e', background: '#fef3c7',
+                    border: '1px solid #fde68a',
+                  }}>awaiting perception</span>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* Voice transcript display removed 2026-07-23. The transcript
+          is still parsed, persisted (audio_transcript.json), and fed
+          to the understanding backend — the read-only review-screen
+          echo was clutter. The `transcript` prop is still received in
+          case a future placement wants it. */}
 
       {acceptError && <ErrorBanner msg={acceptError} />}
       {/* Cancel + Accept buttons live in the wizard's sticky footer
@@ -673,29 +1183,79 @@ function ReviewPanel({
 // Renders each structured clarification with the right input for its
 // `type`, pre-filled from `suggested`. Legacy plain-string ambiguities
 // (answerable=false after schema wrapping) render as read-only chips
-// so old demos still display. The panel reports unanswered vs
-// answered + lets the operator "Accept all suggested defaults" in one
-// click; that's just a no-op since the seed already populated
-// suggested values into answers, but the button makes the implicit
-// behaviour explicit.
-function ClarificationsPanel({ clarifications, answers, setAnswers, partsLibrary }) {
+// so old demos still display.
+//
+// STATUS MODEL — three visible states:
+//   PENDING   — operator has not interacted AND no seeded value.
+//   SUGGESTED — operator has not interacted BUT a suggested default
+//               is pre-loaded (accept-as-is is one click of the button
+//               below or an explicit click on the highlighted option).
+//   ANSWERED  — operator explicitly interacted with the input, regardless
+//               of whether the chosen value equals the suggested default.
+//
+// This distinguishes "the AI proposed X and the operator agreed" from
+// "the AI proposed X and the operator never looked" — both are useful
+// training signals, but they're not the same signal. The prior
+// implementation derived status from (value === suggested), so
+// explicitly clicking the option that matched the default kept the
+// chip stuck on SUGGESTED — the bug this panel now fixes.
+//
+// The "Accept all suggested defaults" button ONLY populates values;
+// it does NOT mark the entry as interacted. That preserves the
+// implicit-accept-of-default signal in the learning store.
+function ClarificationsPanel({
+  clarifications, answers, setAnswers,
+  interacted, setInteracted,
+  partsLibrary,
+}) {
   const list = Array.isArray(clarifications) ? clarifications : []
   const interactive = list.filter((c) => c && c.answerable !== false && c.id)
   const passive     = list.filter((c) => c && (c.answerable === false || !c.id))
 
-  // "Pending" = answer is empty string AND no suggested default lined
-  // up to back-fill it (so it would actually go in as empty). An
-  // answer that still equals the suggested default is considered
-  // "answered" — accepting the suggestion is a real choice.
-  const pendingCount = interactive.reduce((n, c) => {
-    const v = answers ? answers[c.id] : undefined
-    const empty = (v === undefined || v === null || v === '')
-    return n + (empty ? 1 : 0)
-  }, 0)
-  const answeredCount = interactive.length - pendingCount
+  // Defensive default: if the parent didn't thread the interaction set
+  // through (a prop-drilling regression like the one this file already
+  // crashed on before this guard landed), fall back to an empty Set so
+  // the review screen still renders with every chip PENDING/SUGGESTED —
+  // it will never white-screen over chip state. Warn once per mount so
+  // the drop stays visible without spamming the console. A no-op setter
+  // keeps the choice buttons clickable even when interaction tracking
+  // is disconnected — the answer still writes through to `answers`,
+  // just without a learning-store answered flag.
+  const noopSet = (fn) => { if (typeof fn === 'function') fn(new Set()) }
+  const interactedSet = interacted instanceof Set ? interacted : null
+  const _setInteracted = typeof setInteracted === 'function' ? setInteracted : noopSet
+  if (!interactedSet) {
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    // (Intentionally not a hook — a one-shot render-time warn is enough
+    // for the operator/dev-console breadcrumb.)
+    if (typeof console !== 'undefined' && console.warn) {
+      console.warn('[PBD] ClarificationsPanel: `interacted` prop missing or not a Set — falling back to empty; chips will read as SUGGESTED/PENDING only.')
+    }
+  }
 
-  function setOne(id, v) { setAnswers((prev) => ({ ...(prev || {}), [id]: v })) }
+  // Answered = explicitly interacted. Pending = not interacted (whether
+  // or not a suggested default is pre-loaded — the operator hasn't
+  // confirmed anything yet).
+  const answeredCount = interactive.reduce(
+    (n, c) => n + (interactedSet && interactedSet.has(c.id) ? 1 : 0), 0)
+  const pendingCount = interactive.length - answeredCount
+
+  function markInteracted(id) {
+    _setInteracted((prev) => {
+      if (prev && prev.has(id)) return prev
+      const next = new Set(prev || [])
+      next.add(id)
+      return next
+    })
+  }
+  function setOne(id, v) {
+    setAnswers((prev) => ({ ...(prev || {}), [id]: v }))
+    markInteracted(id)
+  }
   function acceptAllSuggested() {
+    // Populate values only — deliberately does NOT touch the interacted
+    // set, so the learning store still records these as implicit
+    // accepts (answered:false, chose_suggested:true).
     const next = { ...(answers || {}) }
     for (const c of interactive) {
       if (next[c.id] === undefined || next[c.id] === '') {
@@ -730,15 +1290,22 @@ function ClarificationsPanel({ clarifications, answers, setAnswers, partsLibrary
       {interactive.map((c) => {
         const v = answers ? answers[c.id] : undefined
         const isEmpty = (v === undefined || v === null || v === '')
-        const isPending = isEmpty
-        const isSuggested = !isEmpty && JSON.stringify(v) === JSON.stringify(c.suggested)
+        const isInteracted = !!(interactedSet && interactedSet.has(c.id))
+        const isPending = !isInteracted && isEmpty
+        // Not interacted but a seeded suggestion is pre-loaded — the
+        // AI proposed something and the operator hasn't confirmed it
+        // yet. Rendered distinctly from PENDING (empty) so the review
+        // screen makes the "seeded default is here for you to confirm"
+        // read at a glance.
+        const isSuggestedOnly = !isInteracted && !isEmpty
         return (
           <ClarificationRow
             key={c.id}
             c={c}
             value={v}
             isPending={isPending}
-            isSuggested={isSuggested}
+            isSuggestedOnly={isSuggestedOnly}
+            isAnswered={isInteracted}
             onChange={(next) => setOne(c.id, next)}
             partsLibrary={partsLibrary}
           />
@@ -763,13 +1330,25 @@ function ClarificationsPanel({ clarifications, answers, setAnswers, partsLibrary
   )
 }
 
-function ClarificationRow({ c, value, isPending, isSuggested, onChange, partsLibrary }) {
-  const borderColor = isPending ? '#fde68a' : (isSuggested ? '#bfdbfe' : '#86efac')
-  const tintColor   = isPending ? '#fffbeb' : (isSuggested ? '#eff6ff' : '#f0fdf4')
-  const statusText  = isPending
-    ? 'PENDING'
-    : (isSuggested ? 'SUGGESTED' : 'ANSWERED')
-  const statusColor = isPending ? '#92400e' : (isSuggested ? '#1d4ed8' : '#166534')
+function ClarificationRow({
+  c, value,
+  isPending, isSuggestedOnly, isAnswered,
+  onChange, partsLibrary,
+}) {
+  // Colour by state, not by value: an interacted answer that happens
+  // to equal the suggested default still reads as ANSWERED.
+  const borderColor = isAnswered
+    ? '#86efac'
+    : (isSuggestedOnly ? '#bfdbfe' : '#fde68a')
+  const tintColor = isAnswered
+    ? '#f0fdf4'
+    : (isSuggestedOnly ? '#eff6ff' : '#fffbeb')
+  const statusText = isAnswered
+    ? 'ANSWERED'
+    : (isSuggestedOnly ? 'SUGGESTED' : 'PENDING')
+  const statusColor = isAnswered
+    ? '#166534'
+    : (isSuggestedOnly ? '#1d4ed8' : '#92400e')
 
   return (
     <div style={{
@@ -846,6 +1425,13 @@ function ClarificationInput({ c, value, onChange, partsLibrary }) {
     // every taught library part — the operator may know it's actually
     // a different taught part the AI ignored. Untaught parts stay
     // hidden, mirroring the program editor's Detect Part dropdown.
+    // A trailing "New part — not in library" option lets the operator
+    // record a match against a part that has not been taught yet;
+    // applyClarifications stores part_id=null with part_source='new'
+    // so downstream consumers can render the demo-derived descriptor
+    // instead of dereferencing a library entry that isn't there.
+    // TODO: hook this into an add-to-library flow when one exists —
+    // right now it just leaves the descriptor as the display name.
     const seen = new Set()
     const merged = []
     for (const opt of (Array.isArray(c.options) ? c.options : [])) {
@@ -863,11 +1449,20 @@ function ClarificationInput({ c, value, onChange, partsLibrary }) {
       seen.add(p.id)
       merged.push({ part_id: p.id, name: p.name || p.id })
     }
-    const current = typeof value === 'string' ? value : (value?.part_id || '')
+    const NEW_PART = '__new_part__'
+    const current = typeof value === 'string'
+      ? value
+      : (value?.part_id === null ? NEW_PART : (value?.part_id || ''))
     return (
       <select value={current}
         onChange={(e) => {
           const pid = e.target.value
+          if (pid === NEW_PART) {
+            // Sentinel — applyClarifications interprets this as
+            // "part_id: null, part_source: 'new'".
+            onChange(NEW_PART)
+            return
+          }
           const hit = merged.find((p) => p.part_id === pid)
           onChange(hit ? { part_id: pid, name: hit.name } : pid)
         }}
@@ -876,6 +1471,7 @@ function ClarificationInput({ c, value, onChange, partsLibrary }) {
         {merged.map((p) => (
           <option key={p.part_id} value={p.part_id}>{p.name} ({p.part_id})</option>
         ))}
+        <option value={NEW_PART}>New part — not in library</option>
       </select>
     )
   }
@@ -948,6 +1544,22 @@ function applyClarifications(draft, intent, answers) {
     const scope = aff.scope || 'other'
     const path  = String(aff.path || '')
     try {
+      // Legacy config.gripper clarification (older AI outputs) routes
+      // to op.effector — the composer's new discriminator that drives
+      // Engage/Disengage vacuum vs Open/Grip/Release step naming.
+      // Options "Suction cup" / "Vacuum" → 'vacuum'; anything with
+      // "finger", "parallel", "jaw", or "gripper" → 'finger'; magnet
+      // variants → 'magnetic'. Route AND recompose (the operator sees
+      // a "Regenerate draft" prompt after answering — see the footer).
+      if (scope === 'config' && path === 'config.gripper'
+          && Array.isArray(i.operations)) {
+        const s = String(ans || '').toLowerCase()
+        const chosen = /vacuum|suction/.test(s) ? 'vacuum'
+                     : /magnet/.test(s) ? 'magnetic'
+                     : 'finger'
+        for (const op of i.operations) op.effector = chosen
+        continue   // draft-step restructuring happens via recompose
+      }
       if (scope === 'config' && path === 'config.pallet') {
         // Expected shape: { rows, cols, layers, fill_order? }. Falls
         // back to the AI's existing config.pallet for missing keys so
@@ -981,21 +1593,146 @@ function applyClarifications(draft, intent, answers) {
         const opIdx = Number(aff.operation_index ?? 0)
         const op = i.operations[opIdx]
         if (!op) continue
-        if (path === 'target_part') {
-          // ans can be a part_id string or {part_id, name}.
-          const pid  = typeof ans === 'string' ? ans : ans?.part_id
-          const name = typeof ans === 'string' ? '' : (ans?.name || '')
-          if (pid) {
-            op.target_part = {
-              ...(op.target_part || {}),
-              part_id: pid,
-              name: name || op.target_part?.name || pid,
-              source: 'matched_to_library',
+        // Legacy-compat routing: older AI outputs put the fixed-vs-
+        // vision clarification on `place.location_hint` (or occasionally
+        // `pick.location_hint`) with the option strings themselves
+        // describing the choice. Detect that specific pattern — options
+        // containing "fixed" AND ("vision" OR "detect") — and route the
+        // answer to `op.source` PLUS restructure the draft's steps.
+        // Anything that doesn't match this narrow pattern keeps the
+        // pre-existing text-field behaviour so unrelated multi-choice
+        // location clarifications aren't hijacked.
+        const optStrs = Array.isArray(c.options)
+          ? c.options.map((o) => typeof o === 'string' ? o : (o?.label || ''))
+          : []
+        const looksLikeFixedVsVision =
+             optStrs.length === 2
+          && optStrs.some((s) => /fixed/i.test(s))
+          && optStrs.some((s) => /vision|detect|camera/i.test(s))
+        const isSourcePath = path === 'source'
+          || ((path === 'place.location_hint' || path === 'pick.location_hint')
+              && looksLikeFixedVsVision)
+
+        if (isSourcePath) {
+          // Normalise the answer to one of the two canonical values.
+          const s = String(ans || '').toLowerCase()
+          const chosen = (s === 'fixed_position' || /fixed/i.test(s))
+            ? 'fixed_position'
+            : 'camera_library'
+          op.source = chosen
+          // Restructure the DRAFT's steps to match — the composer
+          // already gates its detect emission on op.source, but this
+          // draft was built once and won't be re-composed unless we
+          // splice the step list. Bidirectional so flipping the
+          // answer restores the previous shape cleanly.
+          if (Array.isArray(d.steps)) {
+            if (chosen === 'fixed_position') {
+              d.steps = d.steps.filter((st) => st?.action !== 'detect')
+            } else {
+              // Add a detect step back if none exists. Canonical
+              // position is right after the opening grip-open step
+              // (or at the top if there isn't one) and before the
+              // first derived-from='pick' approach. Uses the current
+              // target_part.name for the label so the operator sees
+              // the same wording the composer would emit.
+              const hasDetect = d.steps.some((st) => st?.action === 'detect')
+              if (!hasDetect) {
+                const partName = op.target_part?.name || 'library part'
+                const detectStep = {
+                  action: 'detect',
+                  label:  'Find ' + partName,
+                  mode:   'library',
+                }
+                // Insert just before the first pick-approach step; if
+                // that can't be found, drop the detect right after the
+                // first gripper-open (or at index 0).
+                let insertAt = d.steps.findIndex(
+                  (st) => st?.action === 'move_linear' && st?.derived_from === 'pick')
+                if (insertAt < 0) {
+                  const gripIdx = d.steps.findIndex((st) => st?.action === 'open_gripper')
+                  insertAt = gripIdx >= 0 ? gripIdx + 1 : 0
+                }
+                d.steps = [
+                  ...d.steps.slice(0, insertAt),
+                  detectStep,
+                  ...d.steps.slice(insertAt),
+                ]
+              }
             }
           }
-        } else if (path === 'count_hint') {
+          // Fall through — don't run any of the other operation-scope
+          // handlers on this answer.
+          continue
+        }
+        if (path === 'effector') {
+          // Value is one of 'vacuum' | 'finger' | 'magnetic'
+          // (canonical). Route to op.effector; the server recomposes
+          // the step list from the intent when the operator hits
+          // Accept (see dashboard_server.api_pbd_correct), so we no
+          // longer need to make Regenerate the mandatory intermediate
+          // step for this answer to actually take effect. The old
+          // client-only path used to require ↻ Regenerate before
+          // Accept, which was the whitebowl bug.
+          const s = String(ans || '').toLowerCase()
+          op.effector = /vacuum|suction/.test(s) ? 'vacuum'
+                      : /magnet/.test(s) ? 'magnetic'
+                      : 'finger'
+          continue
+        }
+        if (path === 'target_part') {
+          // ans is one of:
+          //   • '__new_part__' sentinel  → part_id:null, part_source:'new'
+          //   • a part_id string
+          //   • { part_id, name } object
+          if (ans === '__new_part__') {
+            // Descriptor stays whatever the AI/operator already put
+            // in target_part.name — the scene section is the single
+            // source of truth for the descriptor.
+            op.target_part = {
+              ...(op.target_part || {}),
+              part_id: null,
+              part_source: 'new',
+              // Preserve the current name; if unset, drop back to a
+              // generic placeholder so downstream renderers never see
+              // an empty label.
+              name: op.target_part?.name || 'new part',
+            }
+          } else {
+            const pid  = typeof ans === 'string' ? ans : ans?.part_id
+            const name = typeof ans === 'string' ? '' : (ans?.name || '')
+            if (pid) {
+              op.target_part = {
+                ...(op.target_part || {}),
+                part_id: pid,
+                name: name || op.target_part?.name || pid,
+                source: 'matched_to_library',
+                part_source: 'library',
+              }
+            }
+          }
+        } else if (path === 'count_hint' || path === 'count') {
+          // Canonical field is `count` (Task 1 §2, 2026-07-28). We keep
+          // count_hint set to the same value so old code paths that
+          // still read count_hint see the operator's answer, and the
+          // server-side StructuredIntent.from_dict prefers `count`
+          // when both are present.
           const n = Number(ans)
-          op.count_hint = Number.isFinite(n) && n > 0 ? n : ans
+          const c = Number.isFinite(n) && n > 0 ? n : (typeof ans === 'number' ? ans : 1)
+          op.count = c
+          op.count_hint = c
+        } else if (path === 'pick_pattern') {
+          const allowed = ['individual_taught', 'repeat_offset', 'vision_each']
+          const s = String(ans || '').toLowerCase()
+          op.pick_pattern = allowed.includes(s) ? s : 'individual_taught'
+        } else if (path === 'place_pattern') {
+          const allowed = ['fixed', 'stack', 'repeat_offset']
+          const s = String(ans || '').toLowerCase()
+          op.place_pattern = allowed.includes(s) ? s : 'fixed'
+        } else if (path === 'place_stack_dz_mm'
+                || path === 'pick_pitch_dx_mm' || path === 'pick_pitch_dy_mm'
+                || path === 'place_pitch_dx_mm' || path === 'place_pitch_dy_mm') {
+          const n = Number(ans)
+          if (Number.isFinite(n) && n > 0) op[path] = n
         } else if (path === 'pick.location_hint') {
           op.pick = { ...(op.pick || {}), location_hint: String(ans) }
         } else if (path === 'place.location_hint') {
@@ -1220,7 +1957,7 @@ function SceneSection({ scene, onChange, partsLibrary }) {
         onChange={(e) => updateSummary(e.target.value)}
         placeholder="e.g. A bin of brackets on the right; an empty tray on the left."
         rows={2}
-        style={{ ...inputBox, marginBottom: 14, resize: 'vertical', fontSize: 13 }} />
+        style={{ ...inputBox, marginBottom: 14, resize: 'vertical' }} />
 
       {/* Objects */}
       <SubTitle text={`Objects detected (${objects.length})`} />

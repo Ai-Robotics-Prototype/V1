@@ -1,5 +1,6 @@
 import { useStore } from '../store/useStore'
 import Brand from './Brand'
+import { isFeatureEnabled, TAB_TO_FEATURE } from '../lib/edition'
 
 const TABS = [
   { id: 'monitor',          label: 'Monitor' },
@@ -8,9 +9,13 @@ const TABS = [
   { id: '3dview',           label: '3D View' },
   { id: 'sensors',          label: 'Cameras & LiDAR' },
   { id: 'adaptive_picking', label: 'Part Recognition' },
-  { id: 'quality_inspection', label: 'Quality Inspection' },
   { id: 'io',               label: 'I/O' },
   { id: 'safety',           label: 'Safety' },
+  // 2026-08-05 unified event log (fork registry: event_log).
+  // Persistent forensic record of every error/warning/info the
+  // platform surfaces. Sits under Safety in nav order so operators
+  // reach for it in the "something went wrong" mental sequence.
+  { id: 'event_log',        label: 'Event Log' },
   { id: 'configure',        label: 'Configure' },
 ]
 
@@ -24,10 +29,19 @@ export default function TopBar() {
   const activeTab    = useStore((s) => s.activeTab)
   const setTab       = useStore((s) => s.setTab)
   const wsStatus     = useStore((s) => s.wsStatus)
-  const wsLatency    = useStore((s) => s.wsLatency)
   const estop        = useStore((s) => s.safety.estop)
   const triggerEstop = useStore((s) => s.triggerEstop)
   const releaseEstop = useStore((s) => s.releaseEstop)
+  const edition      = useStore((s) => s.edition)
+
+  // Edition filter (2026-09-04): tabs not in this edition's feature
+  // map render NOTHING (not disabled-greyed — absent). Safety is
+  // edition-INDEPENDENT and left unmapped in TAB_TO_FEATURE, so
+  // isFeatureEnabled returns true for every edition on that key.
+  const visibleTabs = TABS.filter((tab) => {
+    const feature = TAB_TO_FEATURE[tab.id] || tab.id
+    return isFeatureEnabled(feature, edition)
+  })
 
   // Safety: trigger fires on the first tap with no confirmation — an
   // emergency stop must act with zero delay. Release stays guarded by
@@ -79,7 +93,7 @@ export default function TopBar() {
         overflowY: 'hidden',
         WebkitOverflowScrolling: 'touch',
       }}>
-        {TABS.map((tab) => {
+        {visibleTabs.map((tab) => {
           const active = activeTab === tab.id
           return (
             <button
@@ -127,20 +141,11 @@ export default function TopBar() {
           </span>
         </div>
 
-        {/* Latency — always rendered (visibility-hidden when disconnected)
-            so its width is reserved and the tabs don't reflow. */}
-        <span style={{
-          fontSize: 11,
-          fontFamily: 'var(--font-mono)',
-          color: 'var(--text-muted)',
-          fontVariantNumeric: 'tabular-nums',
-          display: 'inline-block',
-          minWidth: 52,
-          textAlign: 'right',
-          visibility: wsStatus === 'connected' ? 'visible' : 'hidden',
-        }}>
-          {wsLatency} ms
-        </span>
+        {/* 2026-08-31 directive: latency ms chip retired from the
+            header. wsLatency is still tracked in the store for
+            diagnostics and remains in the footer (StatusBar) at
+            reduced prominence; the header stays as identity /
+            connection dot / E-STOP. */}
 
         {/* E-STOP — fires on first tap (no confirm). Sized large for
             safety: it must be the most prominent control in the row. */}

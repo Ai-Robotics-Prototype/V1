@@ -158,6 +158,14 @@ export default function CameraPanel({ cam = 0 }) {
   const detections    = useStore((s) => s.detections) || []
   const setView       = useStore((s) => s.setView)
   const detectionMode = useStore((s) => s.detectionMode) || 'all'
+  // D10-adjacent (2026-08-03) — surface the extrinsic-calibration
+  // state as a small chip on cam0. `detections_calibrated=false`
+  // means the cam0→base_link transform is provisional (no AprilTag
+  // calibration yet), so absolute 3D positions from the Isaac
+  // pipeline carry a few-centimeters bias. Chip flips to hidden
+  // when the AprilTag pipeline lands and sets the flag True.
+  const detectionsCalibrated = useStore(
+    (s) => s.detections_calibrated ?? false)
 
   const visibleDetections = detectionMode === 'library'
     ? detections.filter(d => d?.part_name && Number(d?.match_score) >= 0.48)
@@ -228,6 +236,29 @@ export default function CameraPanel({ cam = 0 }) {
           {/* Detection mode toggle (rendered on cam0 only so the two panels
               don't both stack the same control on top of each other). */}
           {cam === 0 && <DetectionModeToggle />}
+
+          {/* Extrinsic-uncalibrated chip (D10-adjacent, 2026-08-03).
+              Cam0 only. Hidden once the AprilTag calibration flips
+              STATE.detections_calibrated true. */}
+          {cam === 0 && !detectionsCalibrated && (
+            <div data-testid="extrinsic-uncalibrated-chip"
+                 style={{
+                   position: 'absolute', top: 44, right: 8,
+                   background: 'rgba(120,53,15,0.85)', color: '#FEF3C7',
+                   fontSize: 10, fontWeight: 700, letterSpacing: '0.04em',
+                   padding: '3px 8px', borderRadius: 999,
+                   border: '1px solid rgba(251,191,36,0.7)',
+                   pointerEvents: 'none', zIndex: 5,
+                   textTransform: 'uppercase',
+                 }}
+                 title={
+                   'The cam0→base_link extrinsic is provisional. '
+                   + '3D detection positions carry a few centimeters '
+                   + 'of bias until the AprilTag calibration lands.'
+                 }>
+              Extrinsic uncalibrated
+            </div>
+          )}
 
           {/* Library-mode banner */}
           {detectionMode === 'library' && (

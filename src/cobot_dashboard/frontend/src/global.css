@@ -45,6 +45,19 @@ button {
   border-radius: var(--radius-btn);
   transition: opacity 0.15s, background 0.15s;
 }
+
+/* Form elements don't inherit typography from body by default in
+   browsers — they render in the user-agent's form font (typically a
+   platform sans, not Inter). That was the subtle mismatch between
+   text blocks (spatial summary, program description) and the
+   surrounding div/span body copy on the PBD review screen. Forcing
+   inherit here means every input/textarea/select renders in Inter at
+   the body size unless an explicit override says otherwise. */
+input, textarea, select {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
 button:disabled {
   opacity: 0.35;
   cursor: not-allowed;

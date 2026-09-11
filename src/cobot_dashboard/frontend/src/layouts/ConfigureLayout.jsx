@@ -1,108 +1,15 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useStore } from '../store/useStore'
-// WorkspaceMaskSection removed from the Configure UI — the component
-// file + backend endpoints are intentionally kept in the repo so
-// the feature can be re-surfaced without re-implementation.
 import SetupWizard from '../components/SetupWizard'
 import CellDetailPanel from '../components/CellDetailPanel'
 import { useCellWizardStore } from '../store/cellWizardStore'
-
-const LS_KEY = 'roboai-config'
-
-const BRANDS = ['xarm', 'jaka', 'dobot', 'generic']
-
-function Section({ title, children }) {
-  return (
-    <div style={{
-      background: 'var(--bg-surface)',
-      border: '1px solid var(--border)',
-      borderRadius: 'var(--radius-lg)',
-      padding: '16px 20px',
-      display: 'flex',
-      flexDirection: 'column',
-      gap: 12,
-    }}>
-      <div style={{
-        fontSize: 11,
-        fontWeight: 600,
-        color: 'var(--text-primary)',
-        textTransform: 'uppercase',
-        letterSpacing: '0.08em',
-        paddingBottom: 8,
-        borderBottom: '1px solid var(--border)',
-      }}>
-        {title}
-      </div>
-      {children}
-    </div>
-  )
-}
-
-function Field({ label, children, note }) {
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-      <label style={{ fontSize: 12, color: 'var(--text-secondary)', width: 140, flexShrink: 0 }}>
-        {label}
-      </label>
-      <div style={{ flex: 1 }}>
-        {children}
-        {note && (
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{note}</div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-const inputStyle = {
-  background: 'var(--bg-panel)',
-  border: '1px solid var(--border)',
-  borderRadius: 'var(--radius-sm)',
-  color: 'var(--text-primary)',
-  padding: '5px 9px',
-  fontSize: 12,
-  width: '100%',
-  outline: 'none',
-  transition: 'border-color 150ms',
-}
-
-const selectStyle = {
-  ...inputStyle,
-  cursor: 'pointer',
-}
-
-// SVG concentric rings for zone visualisation
-function ZoneRingSVG({ green, yellow, red }) {
-  const size = 180
-  const cx   = size / 2
-  const cy   = size / 2
-  const maxR = 2.5
-  const SCALE = (size / 2 - 10) / maxR
-
-  const rings = [
-    { r: parseFloat(green)  || 2.0, color: '#22C55E', label: 'Green' },
-    { r: parseFloat(yellow) || 1.2, color: '#EAB308', label: 'Yellow' },
-    { r: parseFloat(red)    || 0.6, color: '#EF4444', label: 'Red' },
-  ]
-
-  return (
-    <svg width={size} height={size} style={{ display: 'block' }}>
-      {rings.map(({ r, color, label }) => {
-        const pxR = Math.min(r * SCALE, size / 2 - 4)
-        return (
-          <g key={label}>
-            <circle cx={cx} cy={cy} r={pxR} fill={`${color}10`} stroke={color} strokeWidth={1.5} strokeDasharray="4 3" />
-            <text x={cx + pxR + 3} y={cy + 4} fontSize={8} fill={color} opacity={0.8}>
-              {r}m
-            </text>
-          </g>
-        )
-      })}
-      {/* Robot */}
-      <rect x={cx - 6} y={cy - 8} width={12} height={16} rx={3} fill="#3B82F6" opacity={0.9} />
-    </svg>
-  )
-}
+// 2026-09-04 Configure additions: Cam0CalibrationCard, RecentRunsCard,
+// and getServedBundleHash imports retired along with the Camera
+// calibration disclosure, Motion recordings, and Provenance card.
+// SystemCheckSection + DeviceIdentitySection function bodies stay
+// as dead code below (safe to remove in a later sweep — leaving
+// them defined avoids touching helpers they share with active
+// sections and keeps the diff surgical).
 
 function CellRow({ c, allCells, busy, onActivate, onDelete, expanded, onToggleExpand, onRefresh }) {
   return (
@@ -329,52 +236,511 @@ function cellBtn(color) {
   }
 }
 
-export default function ConfigureLayout() {
-  const setMode = useStore((s) => s.setMode)
-  const mode    = useStore((s) => s.mode)
+// ---------------------------------------------------------------------------
+// System Check
+//
+// Read-only readiness summary. Five rows, one dot + one short state each.
+// No live-graph clutter. Details appear only when a row is amber/red and
+// the operator expands it. Never auto-remediates: any per-row action is
+// operator-initiated and behind a confirm.
+// ---------------------------------------------------------------------------
 
-  const [cfg, setCfg] = useState(() => {
-    try {
-      return JSON.parse(localStorage.getItem(LS_KEY) || '{}')
-    } catch {
-      return {}
-    }
-  })
-  const [apiConfig, setApiConfig]   = useState(null)
-  const [connResult, setConnResult] = useState(null)
-  const [connTesting, setConnTesting] = useState(false)
+const DOT_COLORS = {
+  green: '#22C55E',
+  amber: '#EAB308',
+  red:   '#EF4444',
+}
 
+function StatusDot({ level }) {
+  return (
+    <span style={{
+      display: 'inline-block',
+      width: 10, height: 10, borderRadius: '50%',
+      background: DOT_COLORS[level] || '#475569',
+      flexShrink: 0,
+    }} />
+  )
+}
+
+// eslint-disable-next-line no-unused-vars
+function _SystemCheckRow_UNUSED_20260904({ row, expanded, onToggle, onRestart }) {
+  // Green rows normally hide their detail, but Safety carries the
+  // operator speed cap in `detail` even when green — always let the
+  // row expand so the cap is discoverable.
+  const canExpand = (row.detail || row.services) &&
+    (row.level !== 'green' || row.key === 'safety')
+  return (
+    <div style={{
+      background: 'var(--bg-panel)',
+      border: '1px solid var(--border)',
+      borderRadius: 'var(--radius-sm)',
+      overflow: 'hidden',
+    }}>
+      <div
+        onClick={canExpand ? onToggle : undefined}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 10,
+          padding: '8px 12px',
+          cursor: canExpand ? 'pointer' : 'default',
+          background: expanded ? 'rgba(37,99,235,0.06)' : 'transparent',
+          transition: 'background 120ms',
+        }}>
+        <span
+          style={{
+            color: 'var(--text-muted)', fontSize: 13,
+            width: 12, display: 'inline-block',
+            visibility: canExpand ? 'visible' : 'hidden',
+            transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
+            transition: 'transform 180ms',
+          }}>▶</span>
+        <StatusDot level={row.level} />
+        <div style={{
+          fontSize: 13, fontWeight: 500, color: 'var(--text-primary)',
+          flex: 1, minWidth: 0,
+        }}>
+          {row.label}
+        </div>
+        <div style={{
+          fontSize: 12,
+          color: row.level === 'green'
+            ? 'var(--text-secondary)'
+            : DOT_COLORS[row.level],
+          fontFamily: 'var(--font-mono)',
+        }}>
+          {row.state}
+        </div>
+      </div>
+      {expanded && canExpand && (
+        <div style={{
+          padding: '8px 12px 12px 34px',
+          borderTop: '1px solid var(--border)',
+          fontSize: 11, color: 'var(--text-secondary)',
+          display: 'flex', flexDirection: 'column', gap: 8,
+        }}>
+          {row.detail && (
+            <div style={{ lineHeight: 1.5 }}>{row.detail}</div>
+          )}
+          {row.key === 'services' && row.services && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {Object.entries(row.services).map(([name, ok]) => (
+                <div key={name} style={{
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  fontFamily: 'var(--font-mono)',
+                }}>
+                  <StatusDot level={ok ? 'green' : 'red'} />
+                  <span>{name}</span>
+                  <span style={{ color: 'var(--text-muted)' }}>
+                    {ok ? 'active' : 'inactive'}
+                  </span>
+                  {!ok && name === 'roboai-dashboard' && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); onRestart(name) }}
+                      style={{
+                        background: '#DC2626', color: '#fff', border: 'none',
+                        padding: '3px 10px', borderRadius: 4,
+                        fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                        marginLeft: 'auto',
+                      }}>
+                      Restart…
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {row.key === 'software' && row.level === 'amber' && (
+            <div style={{ color: 'var(--text-muted)', lineHeight: 1.5 }}>
+              How to refresh:
+              <ol style={{ margin: '4px 0 0 20px', padding: 0 }}>
+                <li>Rebuild the frontend: <code>cd frontend &amp;&amp; npm run build</code></li>
+                <li>Copy <code>frontend/dist/</code> over <code>mock_server/static/</code></li>
+                <li>Reload this browser tab (hard-refresh to bypass any cache)</li>
+              </ol>
+              {(row.served_hash || row.built_hash) && (
+                <div style={{ marginTop: 6, fontFamily: 'var(--font-mono)' }}>
+                  served <b>{row.served_hash || '—'}</b>
+                  {' · '}
+                  built <b>{row.built_hash || '—'}</b>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// 2026-08-05 (identity root-cause fix, Directive item 2). One
+// physical device = one identity + one human-readable label.
+// The label is stored in ui_context.device_label on the Jetson
+// and shown in every teach-lock banner + event log entry.
+// Default derived from platform sniff on first run ("Tablet"
+// on touch devices, "PC" otherwise); the operator renames it
+// here.
+// eslint-disable-next-line no-unused-vars
+function _DeviceIdentitySection_UNUSED_20260904() {
+  const label = useStore((s) => s._teachDeviceLabel)
+  const setLabel = useStore((s) => s.setTeachDeviceLabel)
+  const getDefault = useStore((s) => s._getTeachDeviceLabel)
+  const getId    = useStore((s) => s._getTeachDeviceId)
+  const [draft, setDraft] = useState(label || getDefault())
   useEffect(() => {
-    fetch('/api/config')
-      .then((r) => r.json())
-      .then(setApiConfig)
+    // Sync draft when the cached label lands (post-mount fetch).
+    if (label && label !== draft) setDraft(label)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [label])
+  const id = getId()
+  const dirty = draft.trim() && draft.trim() !== (label || '')
+  const onSave = () => {
+    const clean = draft.trim().slice(0, 64)
+    if (!clean) return
+    setLabel(clean)
+  }
+  return (
+    <div style={{
+      background: 'var(--bg-panel)', border: '1px solid var(--border)',
+      borderRadius: 'var(--radius-sm)', padding: '12px 16px',
+      display: 'flex', flexDirection: 'column', gap: 8,
+    }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>
+        This device
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+        The name other devices see in teach-lock banners and the
+        event log. Persists across tabs and refreshes.
+      </div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 4 }}>
+        <input
+          data-testid="device-label-input"
+          type="text"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="e.g. Shop Tablet"
+          maxLength={64}
+          style={{
+            flex: 1, minWidth: 0,
+            background: 'var(--bg-app)', color: 'var(--text-primary)',
+            border: '1px solid var(--border)',
+            borderRadius: 4, padding: '6px 10px', fontSize: 13,
+          }}
+        />
+        <button
+          data-testid="device-label-save"
+          disabled={!dirty}
+          onClick={onSave}
+          style={{
+            padding: '6px 14px',
+            background: dirty ? 'var(--accent)' : 'var(--bg-app)',
+            color: dirty ? '#0C0C0E' : 'var(--text-muted)',
+            border: '1px solid var(--border)',
+            borderRadius: 4, fontSize: 12,
+            cursor: dirty ? 'pointer' : 'default',
+          }}>Save</button>
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--text-muted)',
+                    fontFamily: 'var(--font-mono)' }}>
+        device_id: {id}
+      </div>
+    </div>
+  )
+}
+
+// 2026-08-06 (operator directive: ENTIRE self-collision system OFF).
+// Single authoritative kill switch for the self-collision + ground-
+// plane capsule guard, ALL tiers. Default OFF per the directive.
+// This card is intentionally prominent (red when off) so the state
+// is operator-visible, not buried. Every toggle lands in the event
+// log — the boot state, every runtime flip, every observed change.
+function SelfCollisionGuardSection() {
+  const [state, setState]     = useState(null)   // last-known from GET
+  const [busy, setBusy]       = useState(false)
+  const [confirming, setConfirming] = useState(null) // 'on' | 'off' | null
+  const collEnabled = useStore((s) => s.robot?.collision_enabled)
+  const modelLoaded = useStore((s) => s.robot?.collision_model_loaded)
+
+  // Poll once on mount + subscribe to live state via robot.collision_*.
+  // Live state wins — the poll seeds before the WS frame arrives.
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/collision_guard').then((r) => r.ok ? r.json() : null)
+      .then((d) => { if (!cancelled && d) setState(d) })
       .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+  const enabled = (collEnabled != null) ? !!collEnabled
+                : (state ? !!state.enabled : false)
+
+  async function apply(target) {
+    if (busy) return
+    setBusy(true)
+    try {
+      const r = await fetch('/api/collision_guard', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !!target }),
+      })
+      if (r.ok) {
+        const d = await r.json().catch(() => ({}))
+        setState((s) => ({ ...(s || {}), enabled: !!d.enabled }))
+      }
+    } finally {
+      setBusy(false)
+      setConfirming(null)
+    }
+  }
+
+  const bg = enabled ? '#052E1C' : '#3F0F0F'
+  const bd = enabled ? '#065F46' : '#DC2626'
+  const fg = enabled ? '#A7F3D0' : '#FCA5A5'
+  return (
+    <div style={{
+      background: bg, border: `2px solid ${bd}`,
+      borderRadius: 'var(--radius-sm)',
+      padding: '14px 16px',
+      display: 'flex', flexDirection: 'column', gap: 8,
+      color: fg,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={{
+          display: 'inline-block', width: 10, height: 10,
+          borderRadius: '50%',
+          background: enabled ? '#22C55E' : '#EF4444',
+        }} />
+        <div style={{ fontSize: 14, fontWeight: 700 }}>
+          Self-collision guard: {enabled ? 'ON' : 'OFF'}
+        </div>
+        <div style={{ flex: 1 }} />
+        <button
+          data-testid="collision-guard-toggle"
+          disabled={busy}
+          onClick={() => setConfirming(enabled ? 'off' : 'on')}
+          style={{
+            padding: '6px 14px', fontSize: 12, fontWeight: 700,
+            background: enabled ? '#7F1D1D' : '#065F46',
+            color: '#fff',
+            border: `1px solid ${enabled ? '#DC2626' : '#059669'}`,
+            borderRadius: 4, cursor: busy ? 'default' : 'pointer',
+            opacity: busy ? 0.6 : 1,
+          }}>
+          {enabled ? 'Turn OFF' : 'Turn ON'}
+        </button>
+      </div>
+      <div style={{ fontSize: 12, lineHeight: 1.5, color: fg }}>
+        {enabled
+          ? ('The 15 mm hard self-collision stop, the 40 mm soft warn '
+             + 'tier, and the ground-plane hard limit are ACTIVE. Motion '
+             + 'that would put a link within stop distance of another '
+             + 'link or the floor will be halted.')
+          : ('ALL software collision guards are OFF. Nothing in software '
+             + 'prevents a link-on-link crash or a link-on-table crash. '
+             + 'This is the operator’s explicit informed choice — flip '
+             + 'ON to re-arm.')}
+      </div>
+      {!modelLoaded && enabled && (
+        <div style={{
+          fontSize: 11, background: '#78350F', color: '#FEF3C7',
+          padding: '6px 10px', borderRadius: 4,
+        }}>
+          Guard is ON but the capsule model failed to load — no
+          pairs are being evaluated. Check
+          /opt/cobot/config/self_collision_capsules.yaml.
+        </div>
+      )}
+      {confirming && (
+        <div style={{
+          marginTop: 4, padding: 10,
+          background: '#111827', border: '1px solid #1F2937',
+          borderRadius: 6, color: '#E5E7EB',
+        }}>
+          <div style={{ fontSize: 12, marginBottom: 8 }}>
+            {confirming === 'off'
+              ? 'Turn the self-collision guard OFF? Nothing in software will prevent link-on-link or link-on-table crashes.'
+              : 'Turn the self-collision guard ON? Motion will be halted when a link comes within stop distance of another link or the floor.'}
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              data-testid="collision-guard-confirm"
+              disabled={busy}
+              onClick={() => apply(confirming === 'on')}
+              style={{
+                padding: '6px 14px', fontSize: 12, fontWeight: 700,
+                background: confirming === 'off' ? '#7F1D1D' : '#065F46',
+                color: '#fff', border: 'none',
+                borderRadius: 4, cursor: 'pointer',
+              }}>
+              Confirm — turn {confirming.toUpperCase()}
+            </button>
+            <button
+              disabled={busy}
+              onClick={() => setConfirming(null)}
+              style={{
+                padding: '6px 14px', fontSize: 12,
+                background: 'transparent', color: '#E5E7EB',
+                border: '1px solid #374151',
+                borderRadius: 4, cursor: 'pointer',
+              }}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// eslint-disable-next-line no-unused-vars
+function _SystemCheckSection_UNUSED_20260904() {
+  const [data, setData]           = useState(null)
+  const [error, setError]         = useState(null)
+  const [expanded, setExpanded]   = useState(null)
+  const [refreshing, setRefresh]  = useState(false)
+  const [lastAt, setLastAt]       = useState(null)
+  // 2026-09-04: `mode`/`setMode` reads retired. The Operator/Engineer
+  // toggle that used to live at the bottom of this section is
+  // deleted per operator directive — its only downstream consumer
+  // was ControlStrip.jsx (which itself is unmounted). No other code
+  // path reads useStore.mode.
+
+  const load = useCallback(async () => {
+    setRefresh(true)
+    try {
+      const r = await fetch('/api/systemcheck')
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const d = await r.json()
+      setData(d)
+      setError(null)
+      setLastAt(Date.now())
+    } catch (e) {
+      setError(e.message || 'fetch failed')
+    } finally {
+      setRefresh(false)
+    }
   }, [])
 
-  function update(key, value) {
-    const next = { ...cfg, [key]: value }
-    setCfg(next)
-    localStorage.setItem(LS_KEY, JSON.stringify(next))
-  }
+  useEffect(() => {
+    load()
+    const id = setInterval(load, 4000)
+    return () => clearInterval(id)
+  }, [load])
 
-  async function testConnection() {
-    setConnTesting(true)
-    setConnResult(null)
+  const onRestart = async (service) => {
+    if (!confirm(`Restart ${service}?\n\nThis will interrupt the dashboard briefly. The arm is not affected.`)) return
     try {
-      const r = await fetch('/health')
-      const d = await r.json()
-      setConnResult({ ok: d.status === 'ok', msg: `Status: ${d.status} | Uptime: ${d.uptime_s}s | Mock: ${d.mock}` })
+      const r = await fetch('/api/systemcheck/service/restart', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ service }),
+      })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok || d.ok === false) {
+        alert(`Restart failed (rc=${d.rc ?? '?'}):\n${d.stderr || d.error || 'unknown error'}`)
+      }
+      load()
     } catch (e) {
-      setConnResult({ ok: false, msg: `Connection failed: ${e.message}` })
-    } finally {
-      setConnTesting(false)
+      alert(`Restart failed: ${e.message}`)
     }
   }
 
-  const zoneGreen  = cfg.zone_green  ?? apiConfig?.safety?.zone_green_m  ?? '2.0'
-  const zoneYellow = cfg.zone_yellow ?? apiConfig?.safety?.zone_yellow_m ?? '1.2'
-  const zoneRed    = cfg.zone_red    ?? apiConfig?.safety?.zone_red_m    ?? '0.6'
+  const ready   = data?.ready
+  const summary = data?.summary || (error ? 'CHECK FAILED' : 'Checking…')
+  const summaryColor =
+    ready === true  ? DOT_COLORS.green :
+    ready === false ? DOT_COLORS.red   : 'var(--text-muted)'
 
+  return (
+    <div style={{
+      background: 'var(--bg-surface)',
+      border: '1px solid var(--border)',
+      borderRadius: 'var(--radius-lg)',
+      padding: '16px 20px',
+      display: 'flex', flexDirection: 'column', gap: 12,
+    }}>
+      <div style={{
+        fontSize: 11, fontWeight: 600, color: 'var(--text-primary)',
+        textTransform: 'uppercase', letterSpacing: '0.08em',
+        paddingBottom: 8, borderBottom: '1px solid var(--border)',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      }}>
+        <span>System Check</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {lastAt && (
+            <span style={{
+              fontSize: 10, fontWeight: 400, color: 'var(--text-muted)',
+              textTransform: 'none', letterSpacing: 'normal',
+            }}>
+              {refreshing ? 'checking…' : `updated ${Math.round((Date.now() - lastAt) / 1000)}s ago`}
+            </span>
+          )}
+          <button
+            onClick={load}
+            disabled={refreshing}
+            style={{
+              background: 'var(--accent)', border: 'none', color: '#fff',
+              padding: '4px 12px', borderRadius: 'var(--radius-sm)',
+              fontSize: 11, fontWeight: 500, cursor: 'pointer',
+              textTransform: 'none', letterSpacing: 'normal',
+              opacity: refreshing ? 0.6 : 1,
+            }}>
+            Re-run
+          </button>
+        </div>
+      </div>
+
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 12,
+        padding: '4px 0 8px',
+      }}>
+        <span style={{
+          width: 14, height: 14, borderRadius: '50%',
+          background: summaryColor,
+          boxShadow: `0 0 0 4px ${summaryColor}22`,
+        }} />
+        <div style={{
+          fontSize: 18, fontWeight: 600,
+          color: summaryColor,
+          letterSpacing: '0.02em',
+        }}>
+          {ready ? 'System Ready' : summary}
+        </div>
+      </div>
+
+      {error && !data && (
+        <div style={{ fontSize: 12, color: 'var(--red)' }}>
+          Failed to load system check: {error}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {(data?.checks || []).map((row) => (
+          <SystemCheckRow
+            key={row.key}
+            row={row}
+            expanded={expanded === row.key}
+            onToggle={() => setExpanded(expanded === row.key ? null : row.key)}
+            onRestart={onRestart}
+          />
+        ))}
+      </div>
+
+      {/* 2026-09-04: the Operator / Engineer toggle here is retired.
+          It was vestigial — only ControlStrip.jsx read useStore.mode,
+          and ControlStrip is not mounted anywhere in the active tree.
+          Store slots (`mode`/`setMode`, persist partialize entry) are
+          also removed. */}
+    </div>
+  )
+}
+
+// 2026-09-04 operator directive: ProvenanceSection retired. The
+// enforcement chain (DeployStatusBanner surfaces every non-green
+// verdict; StaleGuard blocks the app on SHA mismatch) is unchanged
+// — the well-lit Configure card was purely informational and
+// duplicative. Detail is still reachable at /health +
+// /api/deploy_status for anyone who needs it.
+
+
+export default function ConfigureLayout() {
   return (
     <div style={{
       height: '100%',
@@ -389,178 +755,38 @@ export default function ConfigureLayout() {
         Configure
       </div>
 
+      {/* 2026-09-04 operator directive (Configure additions):
+            * Configure tab flipped to full-only — hidden entirely
+              on basic devices via FEATURE_MAP['configure']=full.
+              App.jsx's tab filter + TAB_TO_FEATURE mapping do the
+              hiding; this file never sees a basic render.
+            * FULL Configure = cell wizard + collision-guard row,
+              nothing else. Advanced disclosure (device rename),
+              Camera calibration disclosure, SystemCheckSection
+              (services health), and RecentRunsCard (motion
+              recordings) are all retired from Configure per item
+              10 acceptance. Their backends live on:
+                  - device_label plumbing still writes via
+                    POST /api/ui_context/{device_id}, called from
+                    useStore.setTeachDeviceLabel (no UI now).
+                  - cam0 calibration endpoints stay dormant on the
+                    backend — re-expose when a camera is remounted.
+                  - service restarts remain reachable via
+                    systemctl + /api/systemcheck/service/restart.
+                  - motion recordings live on /api/runs; no UI. */}
+
+      {/* Cell commissioning — the page's centerpiece. Gated as
+          `cell_commissioning` at the backend (see middleware); the
+          UI is only reached on full because the whole tab hides
+          on basic. */}
       <CellSetupSection />
 
-      {/* Robot Connection */}
-      <Section title="Robot Connection">
-        <Field label="Brand">
-          <select
-            style={selectStyle}
-            value={cfg.brand ?? apiConfig?.robot?.brand ?? 'generic'}
-            onChange={(e) => update('brand', e.target.value)}
-          >
-            {BRANDS.map((b) => (
-              <option key={b} value={b}>{b}</option>
-            ))}
-          </select>
-        </Field>
-        <Field label="IP Address">
-          <input
-            style={inputStyle}
-            type="text"
-            value={cfg.ip ?? apiConfig?.robot?.ip ?? '192.168.1.246'}
-            onChange={(e) => update('ip', e.target.value)}
-            placeholder="192.168.1.246"
-          />
-        </Field>
-        <Field label="Port">
-          <input
-            style={inputStyle}
-            type="number"
-            value={cfg.port ?? apiConfig?.robot?.port ?? 502}
-            onChange={(e) => update('port', parseInt(e.target.value, 10))}
-            placeholder="502"
-          />
-        </Field>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <button
-            onClick={testConnection}
-            disabled={connTesting}
-            style={{
-              background: 'var(--accent)',
-              border: 'none',
-              color: '#fff',
-              padding: '6px 14px',
-              borderRadius: 'var(--radius-sm)',
-              fontSize: 12,
-              fontWeight: 500,
-              cursor: 'pointer',
-            }}
-          >
-            {connTesting ? 'Testing…' : 'Test Connection'}
-          </button>
-          {connResult && (
-            <span style={{
-              fontSize: 11,
-              color: connResult.ok ? 'var(--green)' : 'var(--red)',
-              fontFamily: 'var(--font-mono)',
-            }}>
-              {connResult.ok ? '✓' : '✗'} {connResult.msg}
-            </span>
-          )}
-        </div>
-      </Section>
-
-      {/* Safety Zones */}
-      <Section title="Safety Zones">
-        <div style={{ display: 'flex', gap: 20, alignItems: 'flex-start' }}>
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <Field label="Green zone (m)" note="Max speed — > this radius">
-              <input
-                style={inputStyle}
-                type="number"
-                step="0.1"
-                min="0.1"
-                max="5"
-                value={zoneGreen}
-                onChange={(e) => update('zone_green', e.target.value)}
-              />
-            </Field>
-            <Field label="Yellow zone (m)" note="Slow speed — between yellow and green">
-              <input
-                style={inputStyle}
-                type="number"
-                step="0.1"
-                min="0.1"
-                max="5"
-                value={zoneYellow}
-                onChange={(e) => update('zone_yellow', e.target.value)}
-              />
-            </Field>
-            <Field label="Red zone (m)" note="Stop — within this radius">
-              <input
-                style={inputStyle}
-                type="number"
-                step="0.05"
-                min="0.1"
-                max="5"
-                value={zoneRed}
-                onChange={(e) => update('zone_red', e.target.value)}
-              />
-            </Field>
-          </div>
-          <ZoneRingSVG green={zoneGreen} yellow={zoneYellow} red={zoneRed} />
-        </div>
-      </Section>
-
-      {/* Camera Settings */}
-      <Section title="Camera Settings">
-        {(apiConfig?.cameras ?? []).map((cam) => (
-          <Field key={cam.id} label={`Camera ${cam.id} Topic`} note={`Stream FPS: ${cam.fps} (read-only)`}>
-            <input
-              style={{ ...inputStyle, color: 'var(--text-muted)' }}
-              value={cam.topic}
-              readOnly
-            />
-          </Field>
-        ))}
-        {!apiConfig?.cameras?.length && (
-          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Loading camera config…</div>
-        )}
-      </Section>
-
-      {/* Interface */}
-      <Section title="Interface">
-        <Field label="Operator Mode">
-          <div style={{ display: 'flex', gap: 3 }}>
-            {['operator', 'engineer'].map((m) => (
-              <button
-                key={m}
-                onClick={() => { setMode(m); update('mode', m) }}
-                style={{
-                  background: mode === m ? 'var(--accent-dim)' : 'var(--bg-panel)',
-                  border: `1px solid ${mode === m ? 'var(--accent-border)' : 'var(--border)'}`,
-                  color: mode === m ? 'var(--accent)' : 'var(--text-secondary)',
-                  padding: '4px 14px',
-                  borderRadius: 'var(--radius-sm)',
-                  fontSize: 12,
-                  fontWeight: mode === m ? 500 : 400,
-                  cursor: 'pointer',
-                  textTransform: 'capitalize',
-                }}
-              >
-                {m}
-              </button>
-            ))}
-          </div>
-        </Field>
-        <Field label="Theme" note="Only dark theme supported">
-          <button
-            style={{
-              background: 'var(--accent-dim)',
-              border: '1px solid var(--accent-border)',
-              color: 'var(--accent)',
-              padding: '4px 14px',
-              borderRadius: 'var(--radius-sm)',
-              fontSize: 12,
-              fontWeight: 500,
-              cursor: 'default',
-            }}
-          >
-            Dark
-          </button>
-        </Field>
-      </Section>
-
-      {/* Version info */}
-      <div style={{
-        fontSize: 10,
-        color: 'var(--text-muted)',
-        textAlign: 'center',
-        padding: '8px 0 16px',
-      }}>
-        NeuRobots Control v1.0.0-mock — Settings saved to localStorage
-      </div>
+      {/* Self-collision guard row — full section preserved (border,
+          confirm dialog, red-when-OFF visuals, event-log wire).
+          Always visible when OFF: the operator directive
+          explicitly requires guards-off to always be reversible
+          from the page. */}
+      <SelfCollisionGuardSection />
     </div>
   )
 }

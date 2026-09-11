@@ -3,154 +3,335 @@ import { useStore } from '../store/useStore'
 import ArmViewer3D from '../components/ArmViewer3D'
 import StandaloneRobot from '../components/StandaloneRobot'
 import JointJogPanel from '../components/JointJogPanel'
+import JogControls from '../components/JogControls'
 import IKGizmo from '../components/IKGizmo'
+import ArmEnableControl from '../components/ArmEnableControl'
+import JogReadyBadge from '../components/JogReadyBadge'
+// 2026-09-08 operator directive: MODE • MANUAL chip + its confirm
+// dialog RETIRED. Mode switching from the UI is gone; operators
+// route mode via the physical pendant selector. Backend endpoint
+// (POST /api/estun/mode) stays live for CRI / driver internal use.
 
-// The LiDAR identified-objects overlay previously mounted here has
-// been removed from the 3D twin scene — the floating labels + boxes
-// cluttered the twin view. The identification pipeline still runs
-// (roboai-lidar-identifier publishes /lidar_objects/identified) and
-// the data is consumed by the Monitor tab's IdentifiedObjectsCard,
-// PartsLibrary, WorkspaceMaskSection, and /api/lidar_objects/*. This
-// twin viewer is now robot + collision + IK gizmo only.
+// The 3D View tab hosts three separate jog surfaces:
+//   • JointJogPanel  (right-dock sliders, TWIN ONLY)  — no wire traffic.
+//   • JogControls    (bottom dock, REAL ARM)          — hold-to-jog via
+//                                                        /cmd/jog → driver.
+//   • IKGizmo        (cartesian drag when cartMode)    — twin-only IK.
+//
+// The REAL ARM panel is the same component the Program tab renders —
+// one source of truth. Its three-state visibility (MINIMIZED / NORMAL /
+// EXPANDED) lives in the Zustand store so it survives tab-switches
+// without persisting to localStorage.
+//
+// The retired IncrementalJogPanel used to live in LeftPanel; its API
+// path (/cmd/jog with delta_deg) still works, but the pendant
+// increments are superseded by hold-to-jog + step-size inching.
 
-const PRESETS = ['Front', 'Side', 'Top', 'Iso']
+const REAL_ARM_RED = '#7F1D1D'
 
-function LeftPanel({ armRef }) {
-  // Joint angles + Gripper + TCP-pose readouts were intentionally
-  // removed: the joint table duplicated the (since-removed) top-right
-  // chip in the canvas, the TCP "pose" was a rough analytic-FK
-  // approximation that didn't match the URDF, and the gripper state
-  // is already surfaced on the Monitor + Program tabs. The LiDAR
-  // identified-objects section was removed with the overlay itself —
-  // see the top-of-file note. The panel now hosts only camera presets
-  // and the current task state.
-  const task = useStore((s) => s.task)
+// 2026-09-08 operator directive: left sidebar (Camera preset tiles
+// + Task readout) RETIRED. The single view-switcher lives in the
+// top-left corner overlay of the 3D viewport itself (ArmViewer3D's
+// existing preset pill row at L1632). The 3D canvas expands to
+// use the reclaimed 130 px width.
+//
+// TASK/IDLE readout consumers: LeftPanel was the ONLY renderer;
+// no other surface reads useStore.task from this layout. Dropped
+// per directive item 3 ("otherwise drop it") — task state is
+// already visible on the Monitor page's StatusBadge.
 
+// The chrome that wraps JogControls when it's docked (NORMAL) or
+// expanded (EXPANDED). The 2026-08-06 operator directive retires the
+// full-width red REAL ARM band in favor of the shared
+// <ArmEnableControl /> chip (fork registry: arm_enable_control) —
+// the ONE canonical arm-enable surface, rendered here AND on the
+// Monitor page so toggling in either reflects live in the other via
+// the shared useStore state.
+function RealArmChrome({ mode, setMode, children }) {
+  const isExpanded = mode === 'EXPANDED'
   return (
     <div style={{
-      width: 240,
-      flexShrink: 0,
-      borderRight: '1px solid var(--border)',
       background: 'var(--bg-panel)',
-      display: 'flex',
-      flexDirection: 'column',
+      border: '1px solid var(--border)',
+      borderTop: '2px solid ' + REAL_ARM_RED,
+      display: 'flex', flexDirection: 'column',
       overflow: 'hidden',
-      padding: '12px 14px',
-      gap: 14,
+      // 440 px NORMAL preserves the Program tab's JOG_MIN_HEIGHT (360)
+      // budget after the compact chip header (~34 px w/ borders).
+      height: isExpanded ? '100%' : 440,
+      // flexShrink:0 so on tablet-height viewports the whole surface
+      // never gets squeezed by the flex parent — the twin viewer above
+      // shrinks first. Prior default (flex-shrink:1) let the chrome
+      // shrink below 440 on some tablet aspects, which is what pushed
+      // the LEFT column's XYZ button up into the header band.
+      flexShrink: 0,
     }}>
-      <div>
-        <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 8 }}>
-          3D Robot View
+      <div style={{
+        padding: '5px 8px',
+        display: 'flex', alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 8,
+        flexShrink: 0,
+        // Header owns 44px minimum so it can never collapse below its
+        // control heights even if a parent under-allocates space at a
+        // narrow tablet width — the DISABLE/READY row is the anchor
+        // controls below flow from.
+        minHeight: 44,
+        background: 'var(--bg-panel)',
+        borderBottom: '1px solid var(--border)',
+      }}>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <ArmEnableControl />
+          {/* 2026-09-04 operator directive: compact READY / NOT-READY
+              badge replaces the full-width green banner inside
+              JogControls. Placed directly next to the enable button
+              so the operator's pre-jog cue stays visible at a glance
+              without eating banner-height. */}
+          <JogReadyBadge />
+          {/* 2026-09-08 operator directive: <ModeControl /> retired. */}
         </div>
-
-        {/* Camera presets */}
-        <div>
-          <div style={{ fontSize: 9, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.06em', marginBottom: 4 }}>
-            Camera
-          </div>
-          <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
-            {PRESETS.map((p) => (
-              <button
-                key={p}
-                onClick={() => armRef.current?.setCameraPreset(p.toLowerCase())}
-                style={{
-                  background: 'var(--bg-surface)',
-                  border: '1px solid var(--border)',
-                  color: 'var(--text-secondary)',
-                  padding: '3px 10px',
-                  borderRadius: 'var(--radius-sm)',
-                  fontSize: 11,
-                  cursor: 'pointer',
-                }}
-              >
-                {p}
-              </button>
-            ))}
-          </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {/* 2026-09-08 operator directive: coherent pair with the
+              "Expand Jog Buttons" pill — this button reads
+              "Collapse Jog Buttons" when collapsing back to the
+              minimized pill state. Full-width toggle between
+              NORMAL and EXPANDED still uses the ⛶ / ✕ glyph
+              since it's a layout modifier, not the jog-visibility
+              toggle. */}
+          <button
+            data-testid="collapse-jog-buttons"
+            onClick={() => setMode('MINIMIZED')}
+            title="Collapse Jog Buttons"
+            style={{
+              ...chromeBtn,
+              width: 'auto', padding: '0 12px',
+              fontSize: 11, fontWeight: 600,
+              letterSpacing: '0.02em',
+            }}>Collapse Jog Buttons</button>
+          <button
+            onClick={() => setMode(isExpanded ? 'NORMAL' : 'EXPANDED')}
+            title={isExpanded ? 'Restore split layout' : 'Expand panel'}
+            style={chromeBtn}>{isExpanded ? '✕' : '⛶'}</button>
         </div>
       </div>
-
-      {/* Task state */}
-      <div>
-        <div style={{ fontSize: 9, textTransform: 'uppercase', color: 'var(--text-muted)', letterSpacing: '0.06em', marginBottom: 4 }}>
-          Task
-        </div>
-        <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
-          State:&nbsp;
-          <span style={{
-            fontWeight: 600,
-            color: task.state === 'IDLE' ? 'var(--text-muted)'
-                : task.state === 'PAUSED' ? 'var(--yellow)'
-                : 'var(--accent)',
-          }}>
-            {task.state}
-          </span>
-        </div>
+      <div style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
+        {children}
       </div>
-
     </div>
+  )
+}
+
+const chromeBtn = {
+  width: 26, height: 26, padding: 0,
+  background: 'var(--bg-surface)',
+  color: 'var(--text-primary)',
+  border: '1px solid var(--border)', borderRadius: 4,
+  cursor: 'pointer', fontSize: 14, lineHeight: 1,
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+}
+
+// The docked minimized pill — GREEN button labeled "Expand Jog
+// Buttons" (matches the Monitor Run button's #16A34A green, per
+// 2026-09-08 operator directive). When the jog surface is open,
+// the chrome header's collapse control reads "Collapse Jog
+// Buttons" — the pair stays coherent.
+//
+// If a jog hold is live, the button surfaces the joint + direction
+// as a subtitle so a stray tab-switch operator sees the arm is
+// under load; button copy stays "Expand Jog Buttons" so activation
+// language is consistent.
+function RealArmMinimizedPill({ setMode }) {
+  const robot = useStore((s) => s.robot) || {}
+  const active = !!robot.jog_active
+  const holdLabel = active
+    ? `J${robot.jog_index} ${robot.jog_direction > 0 ? '+' : robot.jog_direction < 0 ? '−' : ''}`
+    : ''
+  return (
+    <button
+      data-testid="expand-jog-buttons"
+      onClick={() => setMode('NORMAL')}
+      title="Open the jog pad"
+      style={{
+        position: 'absolute',
+        bottom: 12, right: 12, zIndex: 15,
+        padding: '12px 22px',
+        background: '#16A34A', color: '#fff',
+        border: 'none', borderRadius: 10,
+        fontSize: 15, fontWeight: 700,
+        cursor: 'pointer',
+        boxShadow: '0 4px 12px rgba(22,163,74,0.35)',
+        display: 'flex', alignItems: 'center', gap: 10,
+        minHeight: 44,
+      }}
+    >
+      {active && (
+        <span style={{
+          width: 8, height: 8, borderRadius: '50%',
+          background: '#FEE2E2',
+          boxShadow: '0 0 6px #FCA5A5',
+        }} />
+      )}
+      <span>Expand Jog Buttons</span>
+      {holdLabel && (
+        <span style={{
+          fontSize: 11, opacity: 0.85, fontWeight: 600,
+          fontFamily: 'var(--font-mono, monospace)',
+        }}>{holdLabel}</span>
+      )}
+    </button>
   )
 }
 
 export default function View3DLayout() {
   const armRef = useRef(null)
-  // FK jog handle exposed by StandaloneRobot once its URDF resolves.
-  // Drives JointJogPanel below without re-parsing anything.
   const [jogApi, setJogApi] = useState(null)
-  // Cartesian-drag state for the 3D View tab's gizmo. Program tab has
-  // its own copy inside ArmViewer3D; the two viewers don't share.
   const [cartMode, setCartMode]     = useState(false)
   const [gizmoMode, setGizmoMode]   = useState('translate')
-  // AT LIMIT indicator — IKGizmo emits atLimit each frame the drag
-  // advances, cleared on drag-release. Ref-not-state to avoid a re-
-  // render every RAF; a small ticker below flips the visible state
-  // only when the flag changes.
   const [ikAtLimit, setIkAtLimit] = useState(false)
+
+  const view3dJogPanel   = useStore((s) => s.view3dJogPanel)
+  const setView3dJogPanel = useStore((s) => s.setView3dJogPanel)
+  const jogPanelMode = view3dJogPanel || 'NORMAL'
+
+  const isExpanded = jogPanelMode === 'EXPANDED'
+  const isMinimized = jogPanelMode === 'MINIMIZED'
 
   return (
     <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
-      <LeftPanel armRef={armRef} />
-      <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
-        <ArmViewer3D ref={armRef} noRobot>
-          <StandaloneRobot onRobotReady={setJogApi} />
-          {cartMode && (
-            <IKGizmo
+      {/* 2026-09-08 operator directive: left sidebar retired. The
+          view-switcher moved into the ArmViewer3D top-left overlay
+          (already there at L1632); the 3D canvas reclaims the
+          ~130 px LeftPanel used to occupy. */}
+
+      <div style={{
+        flex: 1, overflow: 'hidden', position: 'relative',
+        display: 'flex', flexDirection: 'column', minWidth: 0,
+      }}>
+        {/* Twin viewer — hidden when the REAL ARM panel is expanded. */}
+        {!isExpanded && (
+          <div style={{ flex: 1, position: 'relative', minHeight: 0 }}>
+            <ArmViewer3D ref={armRef} noRobot>
+              <StandaloneRobot onRobotReady={setJogApi} />
+              {cartMode && (
+                <IKGizmo
+                  jogApi={jogApi}
+                  enabled
+                  mode={gizmoMode}
+                  onDragChange={(d) => {
+                    armRef.current?.setOrbitEnabled?.(!d)
+                    if (!d) setIkAtLimit(false)
+                  }}
+                  onTargetPose={(p) => {
+                    if (!!p.atLimit !== ikAtLimit) setIkAtLimit(!!p.atLimit)
+                  }}
+                />
+              )}
+            </ArmViewer3D>
+            {cartMode && ikAtLimit && (
+              <div style={{
+                // JointJogPanel occupies the top-right corner (top:8
+                // right:8 width:300 zIndex:11). Drop the AT-LIMIT chip
+                // beneath the panel so it doesn't collide with the
+                // panel's header at tablet widths where the panel
+                // reaches the top edge.
+                position: 'absolute', top: 8, right: 316, zIndex: 20,
+                padding: '4px 10px', borderRadius: 4,
+                background: '#DC2626', color: '#fff',
+                fontSize: 12, fontFamily: 'var(--font-mono, monospace)',
+                fontWeight: 700, letterSpacing: 0.6,
+                boxShadow: '0 1px 4px rgba(0,0,0,0.35)',
+                pointerEvents: 'none',
+              }}>
+                AT LIMIT
+              </div>
+            )}
+            <MinClearanceReadout />
+            <JointJogPanel
               jogApi={jogApi}
-              enabled
-              mode={gizmoMode}
-              onDragChange={(d) => {
-                armRef.current?.setOrbitEnabled?.(!d)
-                if (!d) setIkAtLimit(false)   // clear on release
-              }}
-              onTargetPose={(p) => {
-                if (!!p.atLimit !== ikAtLimit) setIkAtLimit(!!p.atLimit)
-              }}
+              cartesianMode={cartMode}
+              onCartesianModeChange={setCartMode}
+              gizmoMode={gizmoMode}
+              onGizmoModeChange={setGizmoMode}
+              onHome={() => jogApi?.home?.()}
+              onAtLimit={(atLimit) => setIkAtLimit(!!atLimit)}
             />
-          )}
-        </ArmViewer3D>
-        {cartMode && ikAtLimit && (
-          <div style={{
-            position: 'absolute', top: 8, right: 8, zIndex: 20,
-            padding: '4px 10px', borderRadius: 4,
-            background: '#DC2626', color: '#fff',
-            fontSize: 12, fontFamily: 'var(--font-mono, monospace)',
-            fontWeight: 700, letterSpacing: 0.6,
-            boxShadow: '0 1px 4px rgba(0,0,0,0.35)',
-            pointerEvents: 'none',
-          }}>
-            AT LIMIT
+            {isMinimized && <RealArmMinimizedPill setMode={setView3dJogPanel} />}
           </div>
         )}
-        <JointJogPanel
-          jogApi={jogApi}
-          cartesianMode={cartMode}
-          onCartesianModeChange={setCartMode}
-          gizmoMode={gizmoMode}
-          onGizmoModeChange={setGizmoMode}
-          onHome={() => jogApi?.home?.()}
-          onAtLimit={(atLimit) => setIkAtLimit(!!atLimit)}
-        />
+
+        {/* REAL ARM jog dock */}
+        {!isMinimized && (
+          <RealArmChrome mode={jogPanelMode} setMode={setView3dJogPanel}>
+            {/* 2026-09-08: right-column controls (Run/Pause/STOP/Home/
+                E-STOP/Teach) retired from JogControls per operator
+                directive. Program execution lives on Monitor; TopBar
+                owns E-STOP. runConfirm prop retired with them. */}
+            <JogControls maximized={isExpanded} />
+          </RealArmChrome>
+        )}
       </div>
+    </div>
+  )
+}
+
+// Live min-clearance chip — appears in the 3D View top-left whenever
+// the unified guard reports any pair closer than 2× warn distance. This
+// is the NON-BLOCKING presentation for the warn band; the popup only
+// takes over at stop. Amber in warn, red in stop. Renders under the
+// AT-LIMIT chip so both stay visible when they co-occur.
+function MinClearanceReadout() {
+  // Prefer the unified guard state (self / ground / env aggregated by
+  // the driver) so a self-collision fold surfaces the same way as an
+  // env obstacle. Fall back to the legacy self-collision keys for
+  // driver builds pre-guard-unification. ALL useStore hooks are called
+  // unconditionally at the top of the component — the fallback merge
+  // happens in plain JS below (previously used `||`/`??` between hook
+  // calls, which broke hook-order on any state transition where the
+  // primary key flipped truthiness → React #300).
+  const guardPair    = useStore((s) => s.robot?.guard_pair)
+  const collisionPair = useStore((s) => s.robot?.collision_pair)
+  const guardMin     = useStore((s) => s.robot?.guard_min_mm)
+  const collisionMin = useStore((s) => s.robot?.collision_min_mm)
+  const guardWarn    = useStore((s) => s.robot?.guard_warn_mm)
+  const collisionWarn = useStore((s) => s.robot?.collision_warn_mm)
+  const guardStop    = useStore((s) => s.robot?.guard_stop_mm)
+  const collisionStop = useStore((s) => s.robot?.collision_stop_mm)
+  const enabled      = useStore((s) => s.robot?.collision_enabled)
+
+  const pair = guardPair || collisionPair
+  const dist = guardMin != null ? guardMin : collisionMin
+  const warn = (guardWarn || collisionWarn || 80)
+  const stop = (guardStop || collisionStop || 30)
+  if (!enabled || dist == null || !pair) return null
+  if (dist > 2 * warn) return null   // only show when actually close
+  const level = dist <= stop ? 'stop' : (dist <= warn ? 'warn' : 'near')
+  const bg = level === 'stop' ? '#B91C1C'
+           : level === 'warn' ? '#D97706'
+           :                    '#0f172a'
+  const label = level === 'stop' ? 'CONTACT'
+              : level === 'warn' ? 'CLEARANCE'
+              :                    'clearance'
+  const shorten = (n) => n
+    .replace('_shoulder', '').replace('_upper_arm', '')
+    .replace('_forearm',  '').replace('_wrist1',    '')
+    .replace('_wrist2',   '').replace('_flange',    '')
+    .replace('__ground__', 'ground')
+    .replace(/^zone#/, 'zone:')
+  return (
+    <div style={{
+      // ArmViewer3D owns the top-left corner (view-switcher pills +
+      // reach-dome toggle) — drop the clearance chip below that row so
+      // the two never overlap when the guard band trips. Row is ~28px
+      // tall (padding + font), so top:44 keeps a small gap.
+      position: 'absolute', top: 44, left: 8, zIndex: 20,
+      padding: '4px 10px', borderRadius: 4,
+      background: bg, color: '#fff',
+      fontSize: 12, fontFamily: 'var(--font-mono, monospace)',
+      fontWeight: 700, letterSpacing: 0.5,
+      boxShadow: '0 1px 4px rgba(0,0,0,0.35)',
+      pointerEvents: 'none',
+    }}>
+      {label}: {dist.toFixed(0)} mm  {shorten(pair[0])}↔{shorten(pair[1])}
     </div>
   )
 }

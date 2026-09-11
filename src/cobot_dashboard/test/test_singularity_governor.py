@@ -1,0 +1,661 @@
+"""Singularity governor + ENFORCE default (2026-09-09 §NN).
+
+Root incident: Cartesian Z-jog approached an elbow-extension
+singularity; controller alarm 2015 fired AFTER J3 velocity spiked
+to 3.111 → 3.216 rad/s (~178 → 184°/s). Driver had the evidence
+(`joint-overspeed observe J3: dq=+7.47 rad/s (cap 1.50)`) but every
+guard was in OBSERVE mode because `wsjog_trust_firmware_clamps`
+defaulted to True. Firmware demonstrably does NOT slow J3 down
+approaching singularity — only alarms after the acceleration jump.
+
+This file pins:
+  1. `wsjog_trust_firmware_clamps` defaults FALSE (ENFORCE re-
+     enabled after the 2026-08-28 demotion).
+  2. SingularityGuard.scale ramps: 1.0 at σ ≥ soft, 0.0 at σ ≤
+     hard, linear between.
+  3. SingularityGuard.sigma_min collapses at known singular
+     configurations (elbow J3≈0 extension, wrist J5≈0), stays
+     healthy in the mid-workspace.
+  4. Face Down orient handler routes through the SAME σ_min gate
+     before save+run — one shared governor for every Cartesian-
+     solving path.
+  5. Frontend LiveMarginHUD renders a plain-language line per
+     softening cause (singularity_guard / joint_overspeed /
+     cart_limit_at_wall / cart_limit_deepening).
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import re
+import sys
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DRIVER = os.path.abspath(os.path.join(
+    HERE, '..', '..', 'estun_driver',
+    'estun_driver', 'estun_driver_node.py'))
+HUD = os.path.abspath(os.path.join(
+    HERE, '..', 'frontend', 'src', 'components', 'JogStopSurface.jsx'))
+BUTTON = os.path.abspath(os.path.join(
+    HERE, '..', 'frontend', 'src', 'components', 'QuickOrientButtons.jsx'))
+
+sys.path.insert(0, os.path.abspath(os.path.join(
+    HERE, '..', '..', 'estun_driver')))
+from estun_driver.estun_driver_node import (  # noqa: E402
+    SingularityGuard, ESCAPE_TIE_EPS)
+
+
+def _src():
+    with open(DRIVER) as fh:
+        return fh.read()
+
+
+# ── Governor default: ENFORCE, not observe ────────────────────────
+
+def test_wsjog_trust_firmware_clamps_defaults_enforce():
+    """2026-09-09 §NN: flag was True (all guards observe-only) →
+    False (ENFORCE). The incident is the counter-example to the
+    firmware-clamps claim; this pin is the regression fence."""
+    src = _src()
+    assert "declare_parameter('wsjog_trust_firmware_clamps', False)" in src, (
+        "wsjog_trust_firmware_clamps default reverted to True — "
+        "singularity governor is back in observe-only mode. This "
+        "is the exact regression that produced alarm 2015 (J3 speed "
+        "jump 3.111 → 3.216 rad/s during Cartesian Z-jog).")
+    # The env override (WSJOG_TRUST_FIRMWARE_CLAMPS=1) MUST stay
+    # available so bench-debug can restore the observe behavior.
+    assert "os.environ.get('WSJOG_TRUST_FIRMWARE_CLAMPS')" in src
+
+
+def test_governor_scale_ramp_is_monotone_and_bounded():
+    """SingularityGuard.scale: 1.0 at σ ≥ soft, 0.0 at σ ≤ hard,
+    linear between. Verified across the full range."""
+    soft, hard = 0.060, 0.020
+    scale = SingularityGuard.scale
+    # At and above soft: full speed.
+    assert scale(0.10, soft, hard) == 1.0
+    assert scale(0.06, soft, hard) == 1.0
+    # At and below hard: full stop.
+    assert scale(0.02, soft, hard) == 0.0
+    assert scale(0.00, soft, hard) == 0.0
+    # Linear in between.
+    mid = scale(0.04, soft, hard)
+    assert 0.4 < mid < 0.6, f'midpoint scale={mid}'
+    # Monotone non-decreasing.
+    prev = 0.0
+    for x in np.linspace(0.0, 0.10, 21):
+        v = scale(float(x), soft, hard)
+        assert v >= prev, f'scale not monotone at σ={x}: {v} < {prev}'
+        prev = v
+    # Guard-disabled (numpy missing) path returns 1.0 so motion never
+    # freezes because the model can't compute.
+    assert scale(None, soft, hard) == 1.0
+
+
+def test_sigma_min_detects_elbow_extension_singularity():
+    """The classic elbow singularity for a 6R arm: J3 ≈ 0 (link3
+    fully extended). σ_min should collapse close to zero. Healthy
+    mid-workspace (moderate bends on J2/J3/J5) should read well
+    above the hard threshold."""
+    g = SingularityGuard()
+    healthy = [0.0, 45.0, 45.0, 0.0, 45.0, 0.0]   # bent elbow + bent wrist
+    stretched = [0.0, 45.0, 0.0, 0.0, 0.0, 0.0]   # elbow flat + wrist flat
+    s_healthy = g.sigma_min(healthy)
+    s_stretched = g.sigma_min(stretched)
+    assert s_healthy is not None, 'sigma_min None — numpy missing?'
+    assert s_stretched is not None
+    # Elbow-flat + wrist-flat drives σ_min far below the healthy pose.
+    assert s_stretched < s_healthy, (
+        f'stretched σ_min={s_stretched:.4f} should be < healthy '
+        f'{s_healthy:.4f} (extension singularity)')
+    # And the stretched pose lands at or under the hard threshold
+    # the driver uses (_cart_sigma_hard = 0.020).
+    assert s_stretched <= 0.020, (
+        f'stretched σ_min={s_stretched:.4f} should be ≤ 0.020 '
+        f'(hard threshold) — elbow+wrist extension is the exact '
+        f'class the governor must catch')
+
+
+def test_sigma_min_detects_wrist_singularity():
+    """Wrist singularity: J5 ≈ 0 (link5 axis colinear with link4/
+    link6 axes) — σ_min collapses regardless of the arm's overall
+    reach."""
+    g = SingularityGuard()
+    healthy_wrist = [0.0, 30.0, 60.0, 0.0, 45.0, 0.0]
+    flat_wrist    = [0.0, 30.0, 60.0, 0.0,  0.0, 0.0]
+    s_h = g.sigma_min(healthy_wrist)
+    s_f = g.sigma_min(flat_wrist)
+    assert s_h is not None and s_f is not None
+    assert s_f < s_h, (
+        f'flat-wrist σ_min={s_f:.4f} should be < healthy-wrist '
+        f'{s_h:.4f}')
+
+
+# ── Shared governor: Face Down orient reuses the same σ_min ──────
+
+def test_face_down_orient_reuses_singularity_guard():
+    """Operator directive item 3: every Cartesian-solving path
+    routes through ONE shared governor. Face Down's orient handler
+    checks σ_min against the same _cart_sigma_hard threshold that
+    guards the Cartesian jog path, and refuses with named kind
+    `orient_near_singularity` when too close."""
+    src = _src()
+    m = re.search(
+        r'def _on_coordinated_joint\(self, d\):(.+?)def _start_or_refresh_continuous',
+        src, re.DOTALL)
+    assert m, '_on_coordinated_joint not found'
+    body = m.group(1)
+    # Reads the shared guard instance (same one Cartesian jog uses).
+    assert 'self._sing_guard.sigma_min(self._joint_deg)' in body
+    # Refuses at the SAME hard threshold Cartesian jog enforces.
+    assert 'self._cart_sigma_hard' in body
+    # Named refusal.
+    assert "'reason_code': 'orient_near_singularity'" in body
+
+
+def test_face_down_operator_copy_covers_singularity_refusal():
+    """The named refusal `orient_near_singularity` MUST render in
+    plain language on the operator banner — snapshot_stale copy
+    lesson. Technical detail (σ values, threshold) stays in the
+    outcome.reason field for support."""
+    with open(BUTTON) as fh:
+        src = fh.read()
+    assert 'orient_near_singularity:' in src
+    assert 'stretched-out pose' in src.lower()
+
+
+# ── Item 3 sweep: no new Cartesian-solving path may ship ungoverned
+
+def test_every_mode2_emit_site_routes_through_the_guard():
+    """Item 3 pin (2026-09-10 re-issue): every function in the
+    driver that builds a Robot/jog Cartesian frame (`'mode': 2`)
+    MUST either (a) call `self._sing_guard.sigma_min(` in the
+    same function body — the direct guard path — or (b) set
+    `self._jog_mode = 'continuous_cart'` inside the emit block,
+    which delegates the σ_min check to `_on_jog_supervise`'s
+    continuous_cart branch (already governed, line-audited).
+
+    A NEW handler that emits `mode:2` without doing either is
+    exactly the 'ungoverned Cartesian path' the operator directive
+    forbids. This test enumerates every emit site by grep, resolves
+    each to its enclosing `def`, and asserts one of the two
+    conditions. If a new site shows up, this test fails until the
+    guard wiring lands."""
+    src = _src()
+    # Every Cartesian emit site: `'mode':` `2` (with optional
+    # comment / whitespace) inside a Robot/jog frame body.
+    emit_line_indices = [
+        i for i, line in enumerate(src.splitlines())
+        if re.search(r"'mode':\s*2\s*,", line)
+        # exclude comments about the shape (line 233, 2165, 2907)
+        and 'gated behind' not in line
+        and 'fixed 150 ms pulse' not in line
+        and 'mode:2' not in line
+    ]
+    assert emit_line_indices, (
+        "no `'mode': 2,` emit sites found — grep pattern drifted or "
+        "Cartesian emission moved. Update the pin so it keeps "
+        "catching new emit sites, not disable it")
+
+    # Resolve each emit line to its enclosing `def`, then check
+    # the function body for the two acceptable guard patterns.
+    lines = src.splitlines()
+    def_starts = [
+        (i, ln) for i, ln in enumerate(lines)
+        if re.match(r'\s{4}def\s+\w+\(', ln)
+        or re.match(r'^def\s+\w+\(', ln)
+    ]
+    def _enclosing(idx):
+        # last `def` that begins strictly before idx
+        chosen = None
+        for i, ln in def_starts:
+            if i <= idx:
+                chosen = (i, ln.strip())
+            else:
+                break
+        return chosen
+    def _body(start_i):
+        end = len(lines)
+        for j, ln in def_starts:
+            if j > start_i:
+                end = j
+                break
+        return '\n'.join(lines[start_i:end])
+    # Governor-internal emit helpers are called ONLY after the
+    # guard has already run in the caller's frame — they do not
+    # need their own σ_min check. Enumerated explicitly so a NEW
+    # helper never gets a free pass just by matching the name shape.
+    GUARD_INTERNAL_HELPERS = {
+        'def _apply_cart_speed_scale_locked',
+    }
+    for emit_i in emit_line_indices:
+        enc = _enclosing(emit_i)
+        assert enc, f'no enclosing def for mode:2 emit at line {emit_i+1}'
+        fn_start, fn_sig = enc
+        if any(fn_sig.startswith(h) for h in GUARD_INTERNAL_HELPERS):
+            # Whitelisted governor-internal emitter — the σ_min
+            # check happens in every caller before invoking this
+            # helper. Docstring of the helper documents the
+            # invariant; adding a redundant σ_min check here would
+            # only race the caller's already-locked evaluation.
+            continue
+        body = _body(fn_start)
+        has_sigma = 'self._sing_guard.sigma_min(' in body
+        delegates_to_supervise = (
+            "self._jog_mode = 'continuous_cart'" in body)
+        assert has_sigma or delegates_to_supervise, (
+            f'Cartesian emit at line {emit_i+1} (in {fn_sig!r}) has '
+            f'NEITHER an in-function σ_min check NOR a delegation to '
+            f'continuous_cart supervise. This is exactly the '
+            f'ungoverned-new-path class the operator directive '
+            f'forbids. Either call `self._sing_guard.sigma_min(...)` '
+            f'against `_cart_sigma_hard` before the emit, OR set '
+            f'`self._jog_mode = \'continuous_cart\'` so the supervise '
+            f'tick governs it. If this is a genuine governor-internal '
+            f'emitter (like _apply_cart_speed_scale_locked), add it '
+            f'to GUARD_INTERNAL_HELPERS with a why-comment.')
+
+
+def test_supervise_continuous_cart_calls_sigma_min():
+    """Fence for the delegation branch: `_on_jog_supervise`'s
+    continuous_cart branch MUST call `_sing_guard.sigma_min` per
+    tick. If a refactor moves the σ_min call out of the supervise
+    body, the delegation half of the sweep above becomes a lie.
+    Pin the invariant so both halves stay honest."""
+    src = _src()
+    m = re.search(
+        r'def _on_jog_supervise\(self\):(.+?)(?:\n    def |\Z)',
+        src, re.DOTALL)
+    assert m, '_on_jog_supervise not found'
+    body = m.group(1)
+    # σ_min is computed per tick in the continuous_cart branch.
+    assert 'self._sing_guard.sigma_min(self._joint_deg)' in body, (
+        'supervise loop must compute σ_min per tick — this is what '
+        'the delegation branch of the every-emit-site sweep relies '
+        'on. Do not move the σ_min call out of supervise.')
+    # And ENFORCE (not just observe) is the default posture.
+    assert 'self._stop_jog_locked(' in body, (
+        'supervise loop must STOP jog on σ ≤ hard — observe-only '
+        'mode is the 2026-08-28 demotion falsified by the incident')
+
+
+# ── Direction-aware escape (2026-09-11 field-report fix) ──────────
+
+def test_escape_score_is_positive_moving_out_of_singularity():
+    """SingularityGuard.escape_score MUST return dσ > ESCAPE_TIE_EPS
+    for at least one Cartesian axis+sign from every near-singular
+    pose. That's the freedom-guarantee kernel.
+
+    Directional-asymmetry pose (elbow slightly bent, wrist off-
+    manifold): jog in one axis clearly INCREASES σ_min (positive
+    dσ), jog in the opposite direction clearly DECREASES (negative
+    dσ). Confirms the score has real signal — not just noise around
+    zero — when the pose isn't a σ_min minimum along the tested
+    axis. The exactly-symmetric pose test (both signs → escape,
+    which is fine for the operator) lives in the incident-pose
+    exhaustive test below."""
+    g = SingularityGuard()
+    # Off-manifold pose: elbow at 20° (near-flat but not at the
+    # local σ minimum along Z), wrist at 0° (still near singular
+    # but with an asymmetric σ landscape).
+    off_manifold = [0.0, 30.0, 20.0, 0.0, 15.0, 0.0]
+    d_out = g.escape_score(off_manifold, cart_index=3, sign_frac=-1.0)
+    d_in  = g.escape_score(off_manifold, cart_index=3, sign_frac=+1.0)
+    assert d_out is not None and d_in is not None
+    escape = max(d_out, d_in)
+    approach = min(d_out, d_in)
+    assert escape >  ESCAPE_TIE_EPS, (
+        f'no clear escape direction from off-manifold pose '
+        f'(out={d_out}, in={d_in}) — score has no signal')
+    assert approach < -ESCAPE_TIE_EPS, (
+        f'no clear approach direction from off-manifold pose '
+        f'(out={d_out}, in={d_in}) — score has no signal in the '
+        f'opposite direction')
+
+
+def test_escape_score_incident_pose_permits_at_least_one_axis():
+    """Sep-9 incident pose (elbow flat J3≈0 + wrist flat J5≈0). The
+    freedom guarantee says at least one Cartesian axis must be
+    escape from ANY singular pose. Exhaustive over the 6 axes both
+    signed — proves the doctrine holds at the original incident."""
+    g = SingularityGuard()
+    incident = [0.0, 45.0, 0.0, 0.0, 0.0, 0.0]
+    positive_escape_found = False
+    for axis in range(1, 7):
+        for sign in (+1.0, -1.0):
+            d = g.escape_score(incident, cart_index=axis, sign_frac=sign)
+            if d > ESCAPE_TIE_EPS:
+                positive_escape_found = True
+                break
+        if positive_escape_found:
+            break
+    assert positive_escape_found, (
+        'no escape direction found at the Sep-9 incident pose — '
+        'freedom guarantee fails; operator would be trapped inside '
+        'the singularity manifold')
+
+
+def test_escape_gate_fires_below_the_hard_floor():
+    """Doctrine: escape motion is permitted EVEN BELOW σ_hard. The
+    supervise tick sequences the escape check BEFORE the σ ≤ hard
+    hard-stop — if the operator is jogging away, the hard-stop is
+    skipped. This test locates the code that enforces the order."""
+    src = _src()
+    body = _src()
+    # `is_escaping` variable exists and gates the σ-hard branch.
+    assert 'is_escaping = escape_dsigma > ESCAPE_TIE_EPS' in body, (
+        'the is_escaping variable + tie-break comparison must be '
+        'present in the supervise tick')
+    # is_escaping must gate the σ-hard-stop branch. Grep for the
+    # `elif sigma is not None and sigma <= self._cart_sigma_hard`
+    # form — the `elif` proves the escape branch runs first.
+    assert 'elif sigma is not None and sigma <= self._cart_sigma_hard' in body, (
+        'σ-hard-stop must be behind an `elif` after the is_escaping '
+        'permit branch — otherwise escape jog is stopped at the hard '
+        'floor and the operator is trapped')
+    # is_escaping must also gate the sigma-soft ramp (line ~3986).
+    assert 'if scale < 1.0 and sigma is not None and not is_escaping:' in body, (
+        'sigma-soft scaling must skip on is_escaping — otherwise the '
+        'HUD keeps showing "slowing down" while the operator is '
+        'actively escaping')
+    # And the reactive backstop MUST also skip when escaping (the
+    # previous-tick joint velocity measured the APPROACH, not the
+    # current reversal).
+    assert 'if not is_escaping and (pj is not None' in body, (
+        'reactive backstop must skip when is_escaping — otherwise a '
+        'reversal spikes dq from the prior approach and the backstop '
+        'scales down the escape')
+
+
+def test_joint_jog_never_touches_governor():
+    """Standing guarantee (2026-08-04 doctrine): joint jog is
+    NEVER inhibited by the Cartesian σ_min governor. The supervise
+    tick's σ/escape/reactive-backstop code lives inside the
+    `elif self._jog_mode == 'continuous_cart':` branch. Joint jog
+    dispatches to the `if self._jog_mode == 'continuous':` branch
+    upstream, which handles ONLY joint-limit clamps.
+
+    A refactor that hoists σ_min above the mode dispatch would
+    silently start governing joint jog — this test catches that
+    class."""
+    src = _src()
+    m = re.search(
+        r'def _on_jog_supervise\(self\):(.+?)(?:\n    def |\Z)',
+        src, re.DOTALL)
+    body = m.group(1)
+    # The joint-jog branch header.
+    idx_joint = body.find("if self._jog_mode == 'continuous':")
+    assert idx_joint >= 0, 'joint-jog supervise branch not found'
+    # The cart-jog branch header — σ code must be strictly after.
+    idx_cart = body.find("elif self._jog_mode == 'continuous_cart':")
+    assert idx_cart > idx_joint, 'cart-jog branch missing / mis-ordered'
+    # σ_min appears only AFTER the cart-jog branch header.
+    idx_sigma = body.find('self._sing_guard.sigma_min(self._joint_deg)')
+    assert idx_sigma > idx_cart, (
+        'σ_min call must be inside the continuous_cart branch, not '
+        'above the mode dispatch — otherwise joint jog gets governed')
+    # And there is NO call to sigma_min or escape_score between
+    # idx_joint and idx_cart (the joint-jog body).
+    joint_body = body[idx_joint:idx_cart]
+    assert 'sigma_min' not in joint_body, (
+        'joint-jog branch must not call sigma_min — standing '
+        'guarantee "joint jog never touches the governor" broken')
+    assert 'escape_score' not in joint_body, (
+        'joint-jog branch must not call escape_score — same doctrine')
+
+
+def test_hud_names_the_escape_direction_on_sigma_causes():
+    """Item 7: when motion is inhibited by a σ-class cause, the HUD
+    line names the allowed way out ("Reverse this axis or switch to
+    Joint mode to exit"). Applies to singularity_guard / sigma_soft
+    / joint_overspeed (the three σ-class inhibition tags). Applies
+    to BOTH editions: JogStopSurface has no edition gate — same DOM
+    renders in Basic and Full via JogControls and ProgramEditor's
+    teach overlay."""
+    with open(HUD) as fh:
+        src = fh.read()
+    # The hint constant is shared across all σ-class branches.
+    assert 'Reverse this axis or switch to Joint mode to exit' in src, (
+        'HUD must name the escape direction in plain language for '
+        'σ-class inhibitions — operator gets protection AND a way out')
+    # Confirm the hint is appended to each σ-class branch (not just
+    # the constant sitting unused).
+    assert "cause === 'singularity_guard'" in src
+    assert "cause === 'sigma_soft'" in src
+    assert "escapeHint" in src, (
+        'the escapeHint variable must be concatenated into the σ-'
+        'class copy — a hint that sits declared but unused is a lie')
+    # No edition gate around the copy — freedom guarantee is edition-
+    # independent.
+    m = re.search(r'export function LiveMarginHUD\(.+?\n\}', src, re.DOTALL)
+    assert m, 'LiveMarginHUD not found'
+    body = m.group(0)
+    # Strip JSX block comments before checking — a docblock that
+    # explains edition-independence is fine; a runtime gate is not.
+    body_code = re.sub(r'\{/\*[\s\S]*?\*/\}', '', body)
+    body_code = re.sub(r'//.*$',              '', body_code, flags=re.MULTILINE)
+    assert 'isFeatureEnabled' not in body_code, (
+        'LiveMarginHUD must not gate on edition via isFeatureEnabled '
+        '— the escape hint renders in both Basic and Full')
+    assert 's.edition' not in body_code and 'useStore((s) => s.edition' not in body_code, (
+        'LiveMarginHUD must not read the edition slice')
+
+
+def test_sim_table_escape_at_full_speed_three_classes():
+    """Item 6 pin (3-class sim table): from INSIDE the soft zone
+    AND BELOW the hard floor, at least one Cartesian axis produces
+    escape_score > 0 at full commanded speed for every singularity
+    class. Sim table below — a regression that shrinks any row's
+    escape space to zero breaks the freedom guarantee."""
+    g = SingularityGuard()
+    # Three canonical singularity classes:
+    #   1. Elbow full-extension (J3 ≈ 0)
+    #   2. Wrist flat (J5 ≈ 0)
+    #   3. Sep-9 incident (both — elbow + wrist)
+    classes = {
+        'elbow_extension': [0.0, 45.0,  0.0, 0.0, 45.0, 0.0],
+        'wrist_flat':      [0.0, 30.0, 60.0, 0.0,  0.0, 0.0],
+        'incident_pose':   [0.0, 45.0,  0.0, 0.0,  0.0, 0.0],
+    }
+    for name, q in classes.items():
+        sigma = g.sigma_min(q)
+        # Verify each is actually in the soft-or-below zone
+        # (soft=0.06 in the driver — pin here to catch a soft
+        # threshold change).
+        assert sigma is not None and sigma < 0.06, (
+            f'{name} σ_min={sigma} should be inside soft zone')
+        # Find any escape axis at full speed (sign_frac=±1.0).
+        escape_axes = []
+        for axis in range(1, 7):
+            for sign in (+1.0, -1.0):
+                d = g.escape_score(q, cart_index=axis, sign_frac=sign)
+                if d > ESCAPE_TIE_EPS:
+                    escape_axes.append((axis, int(sign), d))
+        assert escape_axes, (
+            f'{name}: no escape axis at full speed — freedom '
+            f'guarantee broken for this singularity class')
+
+
+# ── Frontend HUD: distinguishes the softening causes ──────────────
+
+def test_live_margin_hud_renders_singularity_cause():
+    """The `LiveMarginHUD` component MUST branch on
+    `soft.cause` so a singularity slowdown reads as
+    'approaching a stretched-out pose' — not 'approaching its
+    limit' (which would confuse the operator into thinking it's
+    a joint-limit issue). One plain-language line per cause."""
+    with open(HUD) as fh:
+        src = fh.read()
+    assert "cause === 'singularity_guard'" in src
+    assert 'stretched-out pose' in src.lower()
+    assert "cause === 'joint_overspeed'" in src
+    assert "cause === 'cart_limit_at_wall'" in src
+    assert "cause === 'cart_limit_deepening'" in src
+
+
+# ── Noise audit (2026-09-11 operator directive) ───────────────────
+
+def test_per_joint_velocity_cap_matches_rated_fraction():
+    """Item 4 pin: raised 2026-09-11 speed-unlock from ~65% to
+    ~92% of rated per joint. S10-140 rated (HARDWARE.md L39-40):
+      J1/J2/J3 = 150°/s = 2.618 rad/s → 92% ≈ 2.41 rad/s
+      J4/J5/J6 = 180°/s = 3.142 rad/s → 92% ≈ 2.89 rad/s
+    The 8% headroom below rated is the SCALE-TO-COMPLY margin vs
+    controller alarm 2015 ("Joint speed command jump or local
+    acceleration too high"). Below 92% our reactive backstop can
+    still scale down before the arm's own guard trips; at 100%
+    we'd be racing the controller.
+
+    Prior 65% (1.70/2.04) was over-conservative: at 50% Cartesian
+    slider on moderate poses the wrist demanded 2.0-2.8 rad/s
+    (68-89% of J4/5/6 rated) as pure Jacobian amplification, not
+    a singular spike."""
+    src = _src()
+    assert "'cart_joint_velocity_cap_per_joint_radps'" in src, (
+        "per-joint cap parameter must be declared")
+    assert '[2.41, 2.41, 2.41, 2.89, 2.89, 2.89]' in src, (
+        "per-joint caps must be [2.41 × 3, 2.89 × 3] rad/s "
+        "(~92% of rated). If lower, the reactive backstop scales "
+        "during normal jog — the noise-audit fix regresses.")
+    assert 'self._cart_joint_v_cap_per' in src, (
+        'runtime per-joint cap array missing')
+    assert 'if len(_pj) == 6 and all(float(v) > 0 for v in _pj):' in src
+
+
+def test_jog_speed_cap_is_fifty_percent_per_operator_order():
+    """OPERATOR ORDER (2026-09-11, supersedes the same-day speed-
+    unlock directive): cap jog speed at 50%. Deliberate reversal,
+    not a regression. `jog_speed_cap` default returns to 0.50; the
+    `min(speed_pct/100, effective_cap)` clamp at the three jog
+    sites (continuous, cart pulse, increment) becomes an active
+    ceiling again — 100% slider → 0.50 wire, 50% slider → 0.50
+    wire.
+
+    `operator_speed_limit` stays 1.00 because program-run / AUTO
+    paths read only `operator_speed_limit` (jog_speed_cap is
+    jog-specific by construction; the run-path independence is
+    proven by test_run_path_independent_of_jog_speed_cap below).
+
+    Any future change to the 0.50 value requires an explicit
+    operator directive — this pin is load-bearing. A refactor that
+    silently raises jog_speed_cap fails at push time and reopens
+    the operator order."""
+    src = _src()
+    assert "declare_parameter('jog_speed_cap',        0.50)" in src, (
+        'jog_speed_cap default must be 0.50 per the 2026-09-11 '
+        'operator order (supersedes the same-day unlock). Any change '
+        'requires an explicit operator directive; do not silently '
+        'raise this value.')
+    assert "declare_parameter('operator_speed_limit', 1.00)" in src, (
+        'operator_speed_limit stays 1.00 — AUTO/program ceiling is '
+        'unchanged by the jog cap operator order.')
+
+
+def test_run_path_independent_of_jog_speed_cap():
+    """Scope check (item 4): program-run + AUTO paths do NOT flow
+    through `jog_speed_cap`. The driver publishes cap fields
+    (jog_speed_cap, operator_speed_limit, effective_speed_cap) on
+    the status blob, but the RUN path clamps against
+    `operator_speed_limit` alone via a dedicated helper. If a
+    refactor accidentally routes run-speed through the jog cap,
+    the operator's mid-run speed would drop from 100% (per AUTO
+    ceiling) to 50% (per jog cap) — a silent regression.
+
+    Enforced structurally:
+      * The run-path clamp helper (`_clamp_program_speed_pct`)
+        references `operator_speed_limit` NOT `jog_speed_cap`.
+      * The two jog-relevant clamps (continuous jog + cart pulse +
+        increment) reference `effective_speed_cap`, which is
+        min(jog_speed_cap, operator_speed_limit) — bounded by the
+        jog cap.
+      * The distinction lives in a comment block at the parameter
+        declaration ("jog_speed_cap is a jog-specific margin
+        ceiling, not an auto-mode one").
+    """
+    src = _src()
+    # The run-path helper exists AND references operator_speed_limit.
+    # Match only the function BODY (from `def` to the first `return`
+    # at the outer indent) — the file-level docblocks below the
+    # helper legitimately reference `jog_speed_cap` in explanatory
+    # text and would false-match a wider slice.
+    m = re.search(
+        r'def _clamp_program_speed_pct\(self.*?\):\n(.+?)\n        return .+?\n',
+        src, re.DOTALL)
+    assert m, ('_clamp_program_speed_pct helper missing or shape '
+               'changed — run-path independence cannot be verified '
+               'structurally')
+    body = m.group(1)
+    assert 'operator_speed_limit' in body, (
+        'run-path clamp must reference operator_speed_limit')
+    assert 'jog_speed_cap' not in body and '_effective_speed_cap' not in body, (
+        'run-path clamp must NOT reference jog_speed_cap / '
+        '_effective_speed_cap — a jog cap regression would silently '
+        'affect program-run speed. Route AUTO through '
+        'operator_speed_limit alone.')
+    # The distinction is documented at the parameter declaration.
+    assert ('jog_speed_cap is a jog-specific margin ceiling' in src
+            or 'jog_speed_cap is jog-specific' in src.lower()
+            or 'AUTO/program ceiling' in src), (
+        'parameter comment must state jog_speed_cap is jog-only')
+
+
+def test_reactive_backstop_uses_per_joint_cap_not_scalar():
+    """The reactive backstop's worst-ratio loop MUST index the per-
+    joint cap array. If a refactor puts back the scalar
+    `self._cart_joint_v_cap`, J4/J5/J6 go back to being clamped at
+    48% of their rated speed and the noise returns."""
+    src = _src()
+    # Locate the loop that computes worst_ratio in supervise.
+    m = re.search(
+        r'if dt > 1e-4:\s*\n\s*worst_ratio = 0\.0(.+?)if worst_ratio > 1\.0',
+        src, re.DOTALL)
+    assert m, 'reactive-backstop worst_ratio loop not found'
+    loop = m.group(1)
+    assert 'self._cart_joint_v_cap_per[i]' in loop, (
+        'per-joint cap must index the loop — otherwise the flat cap '
+        'is back and the noise returns')
+    # The scalar attribute is fine as a fallback / for legacy log
+    # strings, but the ratio math MUST use the per-joint value.
+    assert 'ratio = abs(dq_rps) / max(1e-6, cap_i)' in loop
+
+
+def test_hud_gates_softening_by_meaningful_scale():
+    """Item 2 pin: LiveMarginHUD must render only when the governor
+    is MEANINGFULLY intervening (scale < 0.90 = TCP slowed >10%).
+    Shallow scaling / momentary transients never reach the DOM.
+    This is the frontend half of the noise fix — the driver-side
+    per-joint cap is the other half."""
+    with open(HUD) as fh:
+        src = fh.read()
+    assert 'SCALE_MEANINGFUL' in src
+    assert '0.90' in src, "0.90 gate must be a named constant"
+    assert 'useGatedSoftening' in src, (
+        "the softening frame must pass through the gate hook — "
+        "raw `softening.active` is not enough on its own")
+    # Stop causes must NOT be gated (they should render immediately —
+    # the arm has stopped, no debounce needed).
+    assert 'SCALED_CAUSES' in src
+    # LiveMarginHUD consumes the gated result, not the raw prop.
+    m = re.search(r'export function LiveMarginHUD\(.+?\n\}', src, re.DOTALL)
+    assert m, 'LiveMarginHUD not found'
+    body = m.group(0)
+    assert 'const soft = useGatedSoftening(softening)' in body, (
+        'LiveMarginHUD must run cart_softening through the gate hook')
+
+
+def test_hud_hysteresis_and_debounce_pinned():
+    """Item 3 pin: once shown, the note persists until scale ≥ 0.95
+    for 500 ms (no flicker); transients <300 ms never render at all.
+    Both timers plus the two threshold constants MUST be present so
+    a future refactor can't quietly remove one half of the pair."""
+    with open(HUD) as fh:
+        src = fh.read()
+    assert 'SCALE_CLEAR_HYSTERESIS'  in src
+    assert '0.95'                    in src
+    assert 'SCALE_CLEAR_DEBOUNCE_MS' in src
+    assert '500'                     in src
+    assert 'SCALE_ENTER_DEBOUNCE_MS' in src
+    assert '300'                     in src
