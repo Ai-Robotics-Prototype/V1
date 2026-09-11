@@ -166,15 +166,26 @@ export function LiveMarginHUD({ robot }) {
               copy per operator directive item 4. Every `cause` the
               driver emits gets its own rewrite; unknown causes fall
               through to the legacy joint-limit line so a new sink
-              still renders something readable. */}
+              still renders something readable.
+              2026-09-11: escape-direction hint appended when the
+              inhibition is a σ_min class (singularity_guard /
+              sigma_soft / joint_overspeed). Names the way out in
+              plain language so slowdown reads as protection with a
+              path forward, not a dead end. Edition-independent —
+              this HUD renders in JogControls and via ProgramEditor's
+              teach overlay in both Basic and Full editions. */}
           {(() => {
             const cause = String(soft.cause || '')
             const j = soft.limiting_joint_1based
+            const escapeHint = ' Reverse this axis or switch to Joint mode to exit.'
             if (cause === 'singularity_guard') {
-              return 'Slowing down — arm approaching a stretched-out pose.'
+              return 'Arm near a stretched-out pose.' + escapeHint
+            }
+            if (cause === 'sigma_soft') {
+              return 'Slowing down — arm approaching a stretched-out pose.' + escapeHint
             }
             if (cause === 'joint_overspeed' && j) {
-              return `Slowing down — J${j} would move faster than its safe rate.`
+              return `Slowing down — J${j} would move faster than its safe rate.` + escapeHint
             }
             if (cause === 'cart_limit_at_wall' && j) {
               return `Stopping — J${j} is at its physical limit.`

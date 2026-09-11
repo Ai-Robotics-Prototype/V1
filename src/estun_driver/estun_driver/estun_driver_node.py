@@ -204,6 +204,92 @@ class SingularityGuard:
             return 0.0
         return max(0.0, min(1.0, (sigma - hard) / (soft - hard)))
 
+    # 2026-09-11 direction-aware escape (freedom guarantee "jog-away
+    # always permitted"): the σ_min scale + hard-stop are computed
+    # from CURRENT joint angles alone, direction-blind. If the
+    # operator is jogging AWAY from a near-singular pose, the
+    # governor still throttled (or stopped) their motion at the
+    # same threshold as approach — violating the pinned guarantee.
+    #
+    # escape_score(q, index, sign) returns dσ = σ(q + qdot·dt) − σ(q)
+    # for a short lookahead along the commanded twist. qdot is the
+    # damped-least-squares inverse of the geometric Jacobian applied
+    # to a unit twist along cart index k ∈ {1..6} (X, Y, Z, RX, RY,
+    # RZ per the Robot/jog frame convention). Damping (λ² · I) is
+    # required for stability at low σ_min: without it, J·J^T is
+    # near-singular and the qdot vector blows up so much that
+    # q_next ends up on the far side of the manifold, producing a
+    # bogus "escape" signal from what is actually approach motion.
+    # λ = 0.05 is small enough to leave healthy poses unaffected
+    # (qdot ≈ true pseudoinverse) and large enough to keep the DLS
+    # solve numerically well-conditioned all the way through σ→0.
+    #
+    # Tie-break: dσ ≤ ESCAPE_TIE_EPS treats motion as APPROACH.
+    # Tangential motion (dσ ≈ 0 within numerical noise) keeps the
+    # governor engaged. Operator can flip axis (guaranteed dσ > 0
+    # if the current direction was approach) or switch to Joint mode
+    # (never governed) to force escape. Positive dσ, however small,
+    # always earns full scale — the doctrine is "any away is enough".
+    def escape_score(self, q_deg, cart_index, sign_frac,
+                     dt_probe=0.02, damping=0.05):
+        if _np is None:
+            return 0.0
+        if not (1 <= int(cart_index) <= 6):
+            return 0.0
+        # Rebuild J at current q (mirrors sigma_min's loop; kept
+        # inline so the two probes stay independent).
+        T = self._identity_with_base()
+        Ts = [T]
+        for i in range(6):
+            a_mm, alpha_deg, d_mm, theta_off_deg = self._dh[i]
+            theta = math.radians(q_deg[i] + theta_off_deg)
+            Ti = self._dh_T(theta, d_mm, a_mm, math.radians(alpha_deg))
+            T = self._matmul(T, Ti)
+            Ts.append(T)
+        p_ee = [Ts[6][k][3] for k in range(3)]
+        J = [[0.0]*6 for _ in range(6)]
+        for i in range(6):
+            z  = [Ts[i][k][2] for k in range(3)]
+            p  = [Ts[i][k][3] for k in range(3)]
+            dp = [(p_ee[k] - p[k]) / 1000.0 for k in range(3)]
+            J[0][i] = z[1]*dp[2] - z[2]*dp[1]
+            J[1][i] = z[2]*dp[0] - z[0]*dp[2]
+            J[2][i] = z[0]*dp[1] - z[1]*dp[0]
+            J[3][i] = z[0]
+            J[4][i] = z[1]
+            J[5][i] = z[2]
+        Jm = _np.asarray(J)
+        # Commanded twist: unit along the picked axis, signed by
+        # the operator's direction. Sign matters — jogging +Z and
+        # −Z reach different next-poses and therefore different σ.
+        twist = _np.zeros(6)
+        twist[int(cart_index) - 1] = 1.0 if float(sign_frac) >= 0 else -1.0
+        try:
+            JJt = Jm @ Jm.T
+            reg = JJt + (damping * damping) * _np.eye(6)
+            qdot = Jm.T @ _np.linalg.solve(reg, twist)   # rad/s per unit twist
+        except Exception:
+            return 0.0
+        # Forward-step joint angles. Unit twist has |v|=1 (m/s pos
+        # entries, rad/s orient entries); dt_probe=0.02 keeps the
+        # step small so linearization holds. Convert rad → deg
+        # to match sigma_min's degree-based input.
+        q_next_deg = list(q_deg)
+        for i in range(6):
+            q_next_deg[i] = q_deg[i] + math.degrees(float(qdot[i]) * dt_probe)
+        sigma_now  = self.sigma_min(q_deg)
+        sigma_next = self.sigma_min(q_next_deg)
+        if sigma_now is None or sigma_next is None:
+            return 0.0
+        return sigma_next - sigma_now
+
+
+# 2026-09-11: tie-break constant for direction-aware escape. dσ
+# strictly greater than this is "escape" (full scale); anything at
+# or below is "approach" (existing scale + hard-stop apply). Named
+# so a future audit can find it without regex.
+ESCAPE_TIE_EPS = 1e-6
+
 
 class EstunCodroidDriver(Node):
     """v2.3 telemetry mirror driver for Estun Codroid controllers."""
@@ -3735,7 +3821,35 @@ class EstunCodroidDriver(Node):
                         scale = SingularityGuard.scale(
                             sigma, dyn_soft, self._cart_sigma_hard)
                         self._last_sing_scale = scale
-                        if sigma is not None and sigma <= self._cart_sigma_hard:
+                        # 2026-09-11 direction-aware escape (freedom
+                        # guarantee: "jog-away always permitted").
+                        # Compute σ lookahead along the commanded
+                        # twist. Positive dσ → motion is escaping;
+                        # bypass BOTH the σ hard-stop AND the reactive
+                        # backstop, restore any prior softening. Even
+                        # at σ ≤ sigma_hard we permit escape motion —
+                        # the ONLY way out of the manifold is a jog
+                        # against the guard, and stopping it strands
+                        # the operator inside the hard floor.
+                        escape_dsigma = self._sing_guard.escape_score(
+                            self._joint_deg,
+                            self._jog_index,
+                            self._jog_signed_speed or 0.0)
+                        is_escaping = escape_dsigma > ESCAPE_TIE_EPS
+                        if is_escaping:
+                            # Full permit. Clear any active softening
+                            # so the HUD stops showing the "slowing"
+                            # copy — the arm is now free.
+                            if self._cart_softening is not None:
+                                if not self._wsjog_trust_firmware_clamps:
+                                    self._apply_cart_speed_scale_locked(
+                                        1.0, 'singularity_escape_restore')
+                                self._cart_softening = None
+                            self._last_sing_scale = 1.0
+                            # Fall through to the collision guard
+                            # (below); skip σ hard-stop + reactive
+                            # backstop.
+                        elif sigma is not None and sigma <= self._cart_sigma_hard:
                             if self._wsjog_trust_firmware_clamps:
                                 # 2026-08-28 demoted: firmware handles
                                 # IK degeneracy natively. Observe only.
@@ -3744,6 +3858,7 @@ class EstunCodroidDriver(Node):
                                     'cause': 'singularity_guard',
                                     'sigma_min': sigma,
                                     'sigma_hard': self._cart_sigma_hard,
+                                    'escape_hint': 'reverse this axis or use Joint mode to exit',
                                 }
                             else:
                                 self._stop_jog_locked(
@@ -3755,9 +3870,15 @@ class EstunCodroidDriver(Node):
                         # is IK-controller-side rather than kinematics-
                         # side. Finite-difference velocity from the last
                         # two posture samples.
+                        # 2026-09-11: skip the reactive backstop when
+                        # the direction-aware escape check says we're
+                        # jogging AWAY — the previous-tick velocity
+                        # measurement is stale evidence of the prior
+                        # approach; the operator has since reversed and
+                        # the σ-lookahead confirms it.
                         pj = self._prev_joint_deg
                         pt = self._prev_joint_ts
-                        if (pj is not None and pt > 0.0
+                        if not is_escaping and (pj is not None and pt > 0.0
                                 and self._last_posture_ts > pt):
                             dt = self._last_posture_ts - pt
                             if dt > 1e-4:
@@ -3862,7 +3983,11 @@ class EstunCodroidDriver(Node):
                         # meaningful — hysteresis at 10 %, up-ramp capped
                         # per tick. If a downward change wanted, apply
                         # immediately; upward changes rate-limit.
-                        if scale < 1.0 and sigma is not None:
+                        # 2026-09-11: skip sigma-soft scaling when
+                        # the operator is jogging AWAY. `is_escaping`
+                        # was computed above from the σ-lookahead and
+                        # is authoritative for this tick.
+                        if scale < 1.0 and sigma is not None and not is_escaping:
                             if self._wsjog_trust_firmware_clamps:
                                 # 2026-08-28 demoted: firmware IK
                                 # naturally slows the arm through

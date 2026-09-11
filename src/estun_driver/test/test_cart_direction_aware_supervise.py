@@ -83,6 +83,11 @@ def _fake_driver(joint_deg, prev_joint_deg=None, cur_frac=0.2):
     _sg = SimpleNamespace()
     _sg.sigma_min = MagicMock(return_value=None)
     _sg.scale = staticmethod(lambda sigma, soft, hard: 1.0)
+    # 2026-09-11 direction-aware escape: default 0.0 (no clear
+    # escape) so the guard behaves as it did before this fixture
+    # existed. Individual tests that want to exercise the escape
+    # branch override this MagicMock with a positive return.
+    _sg.escape_score = MagicMock(return_value=0.0)
     fake._sing_guard = _sg
     fake._last_sigma_min = None
     fake._last_sing_scale = 1.0
@@ -90,6 +95,14 @@ def _fake_driver(joint_deg, prev_joint_deg=None, cur_frac=0.2):
     fake._cart_sigma_hard = 0.02
     fake._cart_joint_v_cap = 1.5
     fake._cart_joint_v_cap_per = [1.5] * 6
+    # 2026-09-11: mock the ENFORCE default (matches
+    # `declare_parameter('wsjog_trust_firmware_clamps', False)` in
+    # the driver — the 2026-09-09 re-enforce fix). Fixture omitted
+    # this attribute since the governor landed on Sep 9; the tests
+    # that hit the σ + reactive-backstop branch have been red as
+    # AttributeError ever since. That's the class of "long-standing
+    # red waved off as pre-existing" the operator's directive names.
+    fake._wsjog_trust_firmware_clamps = False
     fake._new_nonce = lambda: 'nonce'
     fake._send = MagicMock(return_value=True)
     fake.get_logger = MagicMock(return_value=MagicMock())

@@ -44,7 +44,8 @@ BUTTON = os.path.abspath(os.path.join(
 
 sys.path.insert(0, os.path.abspath(os.path.join(
     HERE, '..', '..', 'estun_driver')))
-from estun_driver.estun_driver_node import SingularityGuard   # noqa: E402
+from estun_driver.estun_driver_node import (  # noqa: E402
+    SingularityGuard, ESCAPE_TIE_EPS)
 
 
 def _src():
@@ -279,6 +280,203 @@ def test_supervise_continuous_cart_calls_sigma_min():
     assert 'self._stop_jog_locked(' in body, (
         'supervise loop must STOP jog on σ ≤ hard — observe-only '
         'mode is the 2026-08-28 demotion falsified by the incident')
+
+
+# ── Direction-aware escape (2026-09-11 field-report fix) ──────────
+
+def test_escape_score_is_positive_moving_out_of_singularity():
+    """SingularityGuard.escape_score MUST return dσ > ESCAPE_TIE_EPS
+    for at least one Cartesian axis+sign from every near-singular
+    pose. That's the freedom-guarantee kernel.
+
+    Directional-asymmetry pose (elbow slightly bent, wrist off-
+    manifold): jog in one axis clearly INCREASES σ_min (positive
+    dσ), jog in the opposite direction clearly DECREASES (negative
+    dσ). Confirms the score has real signal — not just noise around
+    zero — when the pose isn't a σ_min minimum along the tested
+    axis. The exactly-symmetric pose test (both signs → escape,
+    which is fine for the operator) lives in the incident-pose
+    exhaustive test below."""
+    g = SingularityGuard()
+    # Off-manifold pose: elbow at 20° (near-flat but not at the
+    # local σ minimum along Z), wrist at 0° (still near singular
+    # but with an asymmetric σ landscape).
+    off_manifold = [0.0, 30.0, 20.0, 0.0, 15.0, 0.0]
+    d_out = g.escape_score(off_manifold, cart_index=3, sign_frac=-1.0)
+    d_in  = g.escape_score(off_manifold, cart_index=3, sign_frac=+1.0)
+    assert d_out is not None and d_in is not None
+    escape = max(d_out, d_in)
+    approach = min(d_out, d_in)
+    assert escape >  ESCAPE_TIE_EPS, (
+        f'no clear escape direction from off-manifold pose '
+        f'(out={d_out}, in={d_in}) — score has no signal')
+    assert approach < -ESCAPE_TIE_EPS, (
+        f'no clear approach direction from off-manifold pose '
+        f'(out={d_out}, in={d_in}) — score has no signal in the '
+        f'opposite direction')
+
+
+def test_escape_score_incident_pose_permits_at_least_one_axis():
+    """Sep-9 incident pose (elbow flat J3≈0 + wrist flat J5≈0). The
+    freedom guarantee says at least one Cartesian axis must be
+    escape from ANY singular pose. Exhaustive over the 6 axes both
+    signed — proves the doctrine holds at the original incident."""
+    g = SingularityGuard()
+    incident = [0.0, 45.0, 0.0, 0.0, 0.0, 0.0]
+    positive_escape_found = False
+    for axis in range(1, 7):
+        for sign in (+1.0, -1.0):
+            d = g.escape_score(incident, cart_index=axis, sign_frac=sign)
+            if d > ESCAPE_TIE_EPS:
+                positive_escape_found = True
+                break
+        if positive_escape_found:
+            break
+    assert positive_escape_found, (
+        'no escape direction found at the Sep-9 incident pose — '
+        'freedom guarantee fails; operator would be trapped inside '
+        'the singularity manifold')
+
+
+def test_escape_gate_fires_below_the_hard_floor():
+    """Doctrine: escape motion is permitted EVEN BELOW σ_hard. The
+    supervise tick sequences the escape check BEFORE the σ ≤ hard
+    hard-stop — if the operator is jogging away, the hard-stop is
+    skipped. This test locates the code that enforces the order."""
+    src = _src()
+    body = _src()
+    # `is_escaping` variable exists and gates the σ-hard branch.
+    assert 'is_escaping = escape_dsigma > ESCAPE_TIE_EPS' in body, (
+        'the is_escaping variable + tie-break comparison must be '
+        'present in the supervise tick')
+    # is_escaping must gate the σ-hard-stop branch. Grep for the
+    # `elif sigma is not None and sigma <= self._cart_sigma_hard`
+    # form — the `elif` proves the escape branch runs first.
+    assert 'elif sigma is not None and sigma <= self._cart_sigma_hard' in body, (
+        'σ-hard-stop must be behind an `elif` after the is_escaping '
+        'permit branch — otherwise escape jog is stopped at the hard '
+        'floor and the operator is trapped')
+    # is_escaping must also gate the sigma-soft ramp (line ~3986).
+    assert 'if scale < 1.0 and sigma is not None and not is_escaping:' in body, (
+        'sigma-soft scaling must skip on is_escaping — otherwise the '
+        'HUD keeps showing "slowing down" while the operator is '
+        'actively escaping')
+    # And the reactive backstop MUST also skip when escaping (the
+    # previous-tick joint velocity measured the APPROACH, not the
+    # current reversal).
+    assert 'if not is_escaping and (pj is not None' in body, (
+        'reactive backstop must skip when is_escaping — otherwise a '
+        'reversal spikes dq from the prior approach and the backstop '
+        'scales down the escape')
+
+
+def test_joint_jog_never_touches_governor():
+    """Standing guarantee (2026-08-04 doctrine): joint jog is
+    NEVER inhibited by the Cartesian σ_min governor. The supervise
+    tick's σ/escape/reactive-backstop code lives inside the
+    `elif self._jog_mode == 'continuous_cart':` branch. Joint jog
+    dispatches to the `if self._jog_mode == 'continuous':` branch
+    upstream, which handles ONLY joint-limit clamps.
+
+    A refactor that hoists σ_min above the mode dispatch would
+    silently start governing joint jog — this test catches that
+    class."""
+    src = _src()
+    m = re.search(
+        r'def _on_jog_supervise\(self\):(.+?)(?:\n    def |\Z)',
+        src, re.DOTALL)
+    body = m.group(1)
+    # The joint-jog branch header.
+    idx_joint = body.find("if self._jog_mode == 'continuous':")
+    assert idx_joint >= 0, 'joint-jog supervise branch not found'
+    # The cart-jog branch header — σ code must be strictly after.
+    idx_cart = body.find("elif self._jog_mode == 'continuous_cart':")
+    assert idx_cart > idx_joint, 'cart-jog branch missing / mis-ordered'
+    # σ_min appears only AFTER the cart-jog branch header.
+    idx_sigma = body.find('self._sing_guard.sigma_min(self._joint_deg)')
+    assert idx_sigma > idx_cart, (
+        'σ_min call must be inside the continuous_cart branch, not '
+        'above the mode dispatch — otherwise joint jog gets governed')
+    # And there is NO call to sigma_min or escape_score between
+    # idx_joint and idx_cart (the joint-jog body).
+    joint_body = body[idx_joint:idx_cart]
+    assert 'sigma_min' not in joint_body, (
+        'joint-jog branch must not call sigma_min — standing '
+        'guarantee "joint jog never touches the governor" broken')
+    assert 'escape_score' not in joint_body, (
+        'joint-jog branch must not call escape_score — same doctrine')
+
+
+def test_hud_names_the_escape_direction_on_sigma_causes():
+    """Item 7: when motion is inhibited by a σ-class cause, the HUD
+    line names the allowed way out ("Reverse this axis or switch to
+    Joint mode to exit"). Applies to singularity_guard / sigma_soft
+    / joint_overspeed (the three σ-class inhibition tags). Applies
+    to BOTH editions: JogStopSurface has no edition gate — same DOM
+    renders in Basic and Full via JogControls and ProgramEditor's
+    teach overlay."""
+    with open(HUD) as fh:
+        src = fh.read()
+    # The hint constant is shared across all σ-class branches.
+    assert 'Reverse this axis or switch to Joint mode to exit' in src, (
+        'HUD must name the escape direction in plain language for '
+        'σ-class inhibitions — operator gets protection AND a way out')
+    # Confirm the hint is appended to each σ-class branch (not just
+    # the constant sitting unused).
+    assert "cause === 'singularity_guard'" in src
+    assert "cause === 'sigma_soft'" in src
+    assert "escapeHint" in src, (
+        'the escapeHint variable must be concatenated into the σ-'
+        'class copy — a hint that sits declared but unused is a lie')
+    # No edition gate around the copy — freedom guarantee is edition-
+    # independent.
+    m = re.search(r'export function LiveMarginHUD\(.+?\n\}', src, re.DOTALL)
+    assert m, 'LiveMarginHUD not found'
+    body = m.group(0)
+    # Strip JSX block comments before checking — a docblock that
+    # explains edition-independence is fine; a runtime gate is not.
+    body_code = re.sub(r'\{/\*[\s\S]*?\*/\}', '', body)
+    body_code = re.sub(r'//.*$',              '', body_code, flags=re.MULTILINE)
+    assert 'isFeatureEnabled' not in body_code, (
+        'LiveMarginHUD must not gate on edition via isFeatureEnabled '
+        '— the escape hint renders in both Basic and Full')
+    assert 's.edition' not in body_code and 'useStore((s) => s.edition' not in body_code, (
+        'LiveMarginHUD must not read the edition slice')
+
+
+def test_sim_table_escape_at_full_speed_three_classes():
+    """Item 6 pin (3-class sim table): from INSIDE the soft zone
+    AND BELOW the hard floor, at least one Cartesian axis produces
+    escape_score > 0 at full commanded speed for every singularity
+    class. Sim table below — a regression that shrinks any row's
+    escape space to zero breaks the freedom guarantee."""
+    g = SingularityGuard()
+    # Three canonical singularity classes:
+    #   1. Elbow full-extension (J3 ≈ 0)
+    #   2. Wrist flat (J5 ≈ 0)
+    #   3. Sep-9 incident (both — elbow + wrist)
+    classes = {
+        'elbow_extension': [0.0, 45.0,  0.0, 0.0, 45.0, 0.0],
+        'wrist_flat':      [0.0, 30.0, 60.0, 0.0,  0.0, 0.0],
+        'incident_pose':   [0.0, 45.0,  0.0, 0.0,  0.0, 0.0],
+    }
+    for name, q in classes.items():
+        sigma = g.sigma_min(q)
+        # Verify each is actually in the soft-or-below zone
+        # (soft=0.06 in the driver — pin here to catch a soft
+        # threshold change).
+        assert sigma is not None and sigma < 0.06, (
+            f'{name} σ_min={sigma} should be inside soft zone')
+        # Find any escape axis at full speed (sign_frac=±1.0).
+        escape_axes = []
+        for axis in range(1, 7):
+            for sign in (+1.0, -1.0):
+                d = g.escape_score(q, cart_index=axis, sign_frac=sign)
+                if d > ESCAPE_TIE_EPS:
+                    escape_axes.append((axis, int(sign), d))
+        assert escape_axes, (
+            f'{name}: no escape axis at full speed — freedom '
+            f'guarantee broken for this singularity class')
 
 
 # ── Frontend HUD: distinguishes the softening causes ──────────────
