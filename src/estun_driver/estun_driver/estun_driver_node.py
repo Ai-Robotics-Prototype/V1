@@ -302,7 +302,16 @@ class EstunCodroidDriver(Node):
         # server publishes explicit stopJog (immediate); server
         # crash → this deadman fires; network stall → this deadman
         # fires; browser dies → this deadman fires.
-        self.declare_parameter('jog_freshness_timeout_s', 0.2)
+        # 2026-09-11 standing-debt #6: one missed keepalive at the
+        # 100 ms client cadence is normal-jitter noise, not a
+        # connection loss — a 200 ms deadman fires on every
+        # 150-200 ms gap and produces spurious "release_cmd"-adjacent
+        # stops. Extended to 300 ms so a single missed beat is
+        # tolerated; 3 consecutive misses (≈ 300 ms wallclock silence)
+        # still fire the deadman with tag `keepalive_timeout`.
+        # Safety unchanged: sustained silence still stops the arm; we
+        # only stop refusing to invent releases from healthy jitter.
+        self.declare_parameter('jog_freshness_timeout_s', 0.3)
         # Latency and safety-factor inputs to the SPEED-SCALED margin
         # formulas below. Values chosen from wire measurements:
         #   - posture RX → guard reaction takes ~150 ms (three 50 ms
@@ -3896,7 +3905,15 @@ class EstunCodroidDriver(Node):
         # _stop_jog_locked(reason='...') call site, add its substring
         # here in the same commit.
         ('release cmd',        'release_cmd'),
-        ('hold staleness',     'freshness_deadman'),
+        # 2026-09-11 standing-debt #6 split: keepalive_timeout is a
+        # DISTINCT tag from release_cmd. `release_cmd` = a `hold:false`
+        # frame arrived (operator's explicit gesture). `keepalive_timeout`
+        # = frames stopped arriving for > jog_freshness_timeout_s (the
+        # connection-hiccup class — jitter, closed tab, wedged Worker,
+        # or the driver-side one-beat grace window elapsed). The two
+        # need different operator copy (release = expected; timeout =
+        # "hiccup — reconnect"), so they never share a tag.
+        ('hold staleness',     'keepalive_timeout'),
         # 2026-08-05 (guided recovery): the escape-only zone drops a
         # distinct tag so the frontend's JointRecoveryModal can bind
         # to it separately from the generic 'joint_limit' cause.

@@ -1287,11 +1287,17 @@ def _jog_stop_cause_operator_copy(cause: dict, joint_limits: list) -> dict:
             'Jog the opposite direction to recover.',
         )
 
-    if tag == 'freshness_deadman':
+    if tag == 'freshness_deadman' or tag == 'keepalive_timeout':
+        # 2026-09-11 standing-debt #6 split: keepalive_timeout is the
+        # renamed tag for continuous-hold staleness (the "connection
+        # hiccup" class — jitter, wedged Worker, dropped tab). Still
+        # produces the same operator copy; freshness_deadman remains
+        # for legacy increment-freshness fallbacks so historical logs
+        # keep the tag they were written with.
         return _out(
-            'Jog stopped — connection jitter.',
-            'The keep-alive from the browser was interrupted. '
-            'Release and press again to continue.',
+            'Connection hiccup — jog stopped for safety.',
+            'Keep-alive from the browser was interrupted. Release the '
+            'button and press again to continue.',
         )
 
     if tag == 'collision_guard':

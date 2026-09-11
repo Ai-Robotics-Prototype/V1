@@ -763,7 +763,11 @@ _DRIVER_STOP_REASON_STRINGS = (
     ("obstacle guard TCP vs zone at 24mm",                'collision_guard'),
     ("increment complete J1 at 12.3°",                    'increment_end'),
     ("increment freshness fallback 0.35s",                'freshness_deadman'),
-    ("hold staleness 0.28s",                              'freshness_deadman'),
+    # 2026-09-11 standing-debt #6 split: continuous-hold staleness
+    # now maps to `keepalive_timeout` (distinct from `release_cmd`
+    # and from the increment-freshness fallback). Same underlying
+    # deadman, distinct operator copy — see _jog_stop_cause_operator_copy.
+    ("hold staleness 0.28s",                              'keepalive_timeout'),
     ("escape_only J3 at -155.0° past its escape edge",    'joint_limit_deeper'),
     ("limit approach J1 at 190.0° margin 2.0°",           'joint_limit'),
     ("cart limit approach J2 at 195.0° margin 2.0°",      'joint_limit'),

@@ -19,11 +19,17 @@ import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
 //   release        → POST /cmd/jog {hold: false}
 //   any transition → POST /cmd/jog {hold: false} first, then new hold
 //
-// A release message is sent on: onMouseUp, onMouseLeave, onTouchEnd,
-// onTouchCancel, and component unmount (useEffect cleanup). If the
-// browser or tab dies before release, the driver's 200 ms freshness
-// deadman fires, and if that also fails the controller's heartbeat
-// starvation is the final backstop.
+// A release message is sent on: onPointerUp, onPointerCancel,
+// window blur / visibilitychange (hidden) / pagehide, disabled-mid-
+// hold, and component unmount (useEffect cleanup). If the browser
+// or tab dies before release, the driver's 300 ms freshness deadman
+// fires with tag `keepalive_timeout`, and if that also fails the
+// controller's heartbeat starvation is the final backstop.
+// pointerleave is deliberately NOT a release path (2026-09-11
+// standing-debt #6 fix): setPointerCapture routes true drift to
+// pointercancel, so pointerleave firing during a captured hold is
+// a re-render / hit-test / synthetic-event artefact — treating it
+// as a release produced spurious mid-hold stops.
 //
 // Cartesian mode: the UI stays visible so the operator sees the full
 // pendant surface, but every XYZ/RXYZ button is disabled behind a
@@ -38,12 +44,13 @@ import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
 //                              Press-and-hold does NOT repeat.
 //
 //   • jogStyle='CONTINUOUS' → onPressStart fires on press, onPressTick
-//                              fires every 150 ms while held, onPressEnd
+//                              fires every 100 ms while held, onPressEnd
 //                              fires on release. Release handlers:
-//                              onMouseUp, onMouseLeave (pointer-leave),
-//                              onTouchEnd, onTouchCancel, and useEffect
-//                              cleanup on unmount. NO latching — every
-//                              path that ends the press calls stop(),
+//                              onPointerUp, onPointerCancel (OS
+//                              interrupt), window blur / visibility
+//                              (hidden) / pagehide, disabled-mid-hold,
+//                              and useEffect cleanup on unmount. NO
+//                              pointerleave — see file docblock above.
 //                              and stop() always cancels the interval
 //                              and fires onPressEnd exactly once.
 // -----------------------------------------------------------------------------
@@ -230,17 +237,21 @@ export function HoldButton({
   useEffect(() => { stopRef.current = stop })
   useEffect(() => () => stopRef.current?.(), [])
 
-  // 2026-08-03 §3: window-level release paths.  The server's 200 ms
+  // 2026-08-03 §3: window-level release paths.  The server's 300 ms
   // freshness deadman catches every one of these anyway, but the
   // client should ALSO proactively stop on any "the press logically
   // ended" signal so an offline dashboard doesn't have to fall back
   // to the driver's timer.  Enumerated release paths (task §3):
   //   * pointerup     — pointer released on the button (existing).
   //   * pointercancel — OS/browser interrupted the pointer (existing).
-  //   * pointerleave  — routed via setPointerCapture; existing button
-  //                     handler is a no-op because the pointer stays
-  //                     captured; a truly-off pointer produces
-  //                     pointercancel.
+  //     Genuine finger-off-screen or OS-level interrupt (scroll,
+  //     notification, contextmenu, alt-tab into another app).
+  //   * pointerleave  — NOT a release. 2026-09-11 standing-debt #6:
+  //                     setPointerCapture routes true drift-off to
+  //                     pointercancel; any pointerleave that STILL
+  //                     fires with the pointer captured is a re-
+  //                     render / hit-test artefact and must not
+  //                     stop the hold.
   //   * blur          — window lost focus (alt-tab, task switcher).
   //                     A jog is a hands-on gesture; if the operator's
   //                     attention moved off the tab, releasing motion
@@ -367,24 +378,23 @@ export function HoldButton({
         e.currentTarget.style.borderColor = color
       }}
       onPointerLeave={(e) => {
+        // 2026-09-11 standing-debt #6 fix: cosmetic ONLY. Do NOT stop
+        // the hold. Prior behavior: any pointerleave (even while the
+        // pointer was captured) released the hold, on the theory that
+        // "capture-still-firing = intentional drift-off". That theory
+        // was wrong: pointerleave also fires when a re-render swaps
+        // the button element (React key change, memoization miss, an
+        // in-render style change that triggers a layout/hit-test),
+        // producing spurious `release_cmd` stops mid-hold — the
+        // documented standing-debt #6 class. Genuine release paths
+        // remain: pointerup, pointercancel (OS interrupt), blur,
+        // visibilitychange (hidden), pagehide, disabled-mid-hold.
         e.currentTarget.style.background = bg
         e.currentTarget.style.borderColor = borderColor
-        // 2026-08-04 §3+§5: slide-off = stop. `setPointerCapture`
-        // ensures small drift (a few mm) keeps the pointer targeting
-        // this element; if a pointerleave STILL fires despite capture,
-        // the finger has moved far enough that the operator's intent
-        // is "not on the button" — treat it as a release. Release
-        // pointer capture too so a subsequent finger-down elsewhere
-        // starts a fresh press cleanly.
-        if (capturedPointerId.current != null) {
-          try { e.currentTarget.releasePointerCapture(capturedPointerId.current) }
-          catch { /* nop */ }
-          capturedPointerId.current = null
-        }
-        pushJogEvent('release_pointerleave', { pointerType: e.pointerType, id: e.pointerId })
-        pushJogStop('pointer_leave',
-          { hold_id: holdIdRef.current, pointerType: e.pointerType, id: e.pointerId })
-        stop()
+        pushJogEvent('pointerleave_ignored',
+          { pointerType: e.pointerType, id: e.pointerId,
+            captured: capturedPointerId.current != null,
+            pressed: pressed.current })
       }}
       style={{
         width, height, padding: 0,

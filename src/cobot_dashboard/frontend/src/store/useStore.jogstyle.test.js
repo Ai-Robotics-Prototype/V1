@@ -56,14 +56,20 @@ test('release-path event names cover blur, visibility, pagehide, disabled', () =
     'release_visibility_hidden',
     'release_pagehide',
     'release_disabled_midhold',
-    // 2026-08-04 §3+§5: slide-off = stop. pointerleave now emits
-    // an explicit release rather than relying on setPointerCapture
-    // to keep events flowing on the button.
-    'release_pointerleave',
   ]) {
     assert.ok(holdButtonSrc.includes("'" + evt + "'"),
       `expected HoldButton to emit '${evt}' — did the §3 release path get removed?`)
   }
+  // 2026-09-11 standing-debt #6: pointerleave-as-release RETIRED.
+  // The button's pointerleave handler now emits `pointerleave_ignored`
+  // (cosmetic-only) instead of `release_pointerleave`. If any future
+  // refactor re-introduces the old release-on-leave behavior, both
+  // halves of this pin fail loudly.
+  assert.ok(!holdButtonSrc.includes("'release_pointerleave'"),
+    'pointerleave must NOT emit a release event — standing-debt #6')
+  assert.ok(holdButtonSrc.includes("'pointerleave_ignored'"),
+    "pointerleave handler must emit the 'pointerleave_ignored' " +
+    "telemetry event so bench logs still show the DOM event fired")
 })
 
 
