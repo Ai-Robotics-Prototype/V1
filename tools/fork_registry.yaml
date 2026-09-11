@@ -721,7 +721,7 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4238
+        line: 4244
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
@@ -735,10 +735,13 @@ capabilities:
           4230; 2026-09-09 §NN stale-seed fix → 4237 (+7 lines
           for last_posture_ts mirror in _on_estun_status);
           2026-09-10 hookup restructure → 4238 (+1 for the
-          `import tempfile` added by the tool_hookup endpoints).
+          `import tempfile` added by the tool_hookup endpoints);
+          2026-09-11 standing-debt #6 → 4244 (+6 for the extended
+          freshness_deadman/keepalive_timeout copy block in
+          _jog_stop_cause_operator_copy).
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4373
+        line: 4379
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Drift history: 4156 → 4267 → 4322 → 4349 →
@@ -746,7 +749,9 @@ capabilities:
           2026-09-09 Face Down JTC wire → 4374; SAME DAY retirement
           → 4365; 2026-09-09 §NN stale-seed fix → 4372 (last_
           posture_ts mirror); 2026-09-10 hookup restructure → 4373
-          (+1 for `import tempfile` for the tool_hookup endpoints).
+          (+1 for `import tempfile` for the tool_hookup endpoints);
+          2026-09-11 standing-debt #6 → 4379 (+6 for the extended
+          freshness_deadman/keepalive_timeout copy block).
         owner: dashboard-transport
       - path: src/cobot_dashboard/frontend/src/lib/holdTicker.js
         line: 0
