@@ -36,6 +36,14 @@ import { JogStopBanner, LiveMarginHUD } from './JogStopSurface'
 // "pending validation" tooltip while allow_cartesian_jog is false on
 // the driver. Joint mode is the only mode that commands motion today.
 
+// 2026-09-11 OPERATOR ORDER (supersedes same-day speed-unlock):
+// jog slider ceiling is 50 %. Wire the display max to this value so
+// the DOM never promises speed the driver won't deliver. Any future
+// change requires an explicit operator directive — mirrored on the
+// driver by pin
+// test_jog_speed_cap_is_fifty_percent_per_operator_order.
+const JOG_SLIDER_MAX_PCT = 50
+
 // -----------------------------------------------------------------------------
 // HoldButton — mode is EXPLICIT via `jogStyle`. No timing heuristic.
 //
@@ -1006,39 +1014,29 @@ export default function JogControls({ maximized = false }) {
 
         <div>
           <div style={{ fontSize: speedFont, fontWeight: 600, color: '#6b7280', marginBottom: 4 }}>
-            Speed: {speed}%
-            {speed > effectivePct && (
-              <span style={{ color: '#d97706', fontWeight: 700, marginLeft: 6 }}>
-                → {effectivePct}% (driver capped)
-              </span>
-            )}
+            Speed: {Math.min(speed, JOG_SLIDER_MAX_PCT)}%
           </div>
-          <input type="range" min={1} max={100} value={speed}
+          {/* 2026-09-11 OPERATOR ORDER (supersedes same-day unlock):
+              slider max = 50 % so the display never promises speed
+              the wire won't deliver. Edition-independent — reads no
+              edition slice, calls no isFeatureEnabled; the same DOM
+              renders in Basic and Full. If the driver later publishes
+              a stricter effective_cap (< 50), the wire-hint line
+              names it, but the slider ceiling stays at 50 unless a
+              new operator directive raises it. */}
+          <input type="range" min={1} max={JOG_SLIDER_MAX_PCT} value={Math.min(speed, JOG_SLIDER_MAX_PCT)}
             onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
+            data-testid="jog-speed-slider"
             style={{ width: '100%', height: maximized ? 10 : 6 }} />
-          {effectivePct < 100 && (
-            <div style={{ position: 'relative', width: '100%', height: 6, marginTop: 2 }}>
-              <div style={{
-                position: 'absolute',
-                left: `calc(${effectivePct}% - 1px)`,
-                top: 0, width: 2, height: 6, background: '#d97706',
-              }} />
-            </div>
-          )}
           <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 2 }}
                data-testid="jog-speed-wire-hint">
-            {/* 2026-09-11 speed-unlock (item 4 truth line): slider →
-                wire 1:1 by default; only mention the driver ceiling
-                if one is actually set (< 100%). Above 50 % slider,
-                the controller's Manual/Auto rate is the remaining
-                wall — say so plainly. */}
-            {effectivePct >= 100
-              ? (speed >= 50
-                   ? `wire ${(speed / 100).toFixed(2)} — controller wall: ${_ctrlWall}`
-                   : `wire ${(speed / 100).toFixed(2)}`)
-              : (speed <= effectivePct
-                  ? `wire ${(Math.min(speed, effectivePct) / 100).toFixed(2)} — driver ceiling ${effectivePct}%`
-                  : `wire ${(effectivePct / 100).toFixed(2)} — driver ceiling ${effectivePct}% (hw ${hwPct}% / op-limit ${opPct}%)`)}
+            {(() => {
+              const clampedSpeed = Math.min(speed, JOG_SLIDER_MAX_PCT)
+              const effClampedPct = Math.min(effectivePct, JOG_SLIDER_MAX_PCT)
+              const wireFrac = Math.min(clampedSpeed, effClampedPct) / 100
+              const ctrlTail = clampedSpeed >= 50 ? ` — controller wall: ${_ctrlWall}` : ''
+              return `wire ${wireFrac.toFixed(2)} — jog ceiling ${effClampedPct}% (operator order)${ctrlTail}`
+            })()}
           </div>
         </div>
 

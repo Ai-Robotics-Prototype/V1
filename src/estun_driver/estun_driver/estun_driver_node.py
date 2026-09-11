@@ -320,28 +320,26 @@ class EstunCodroidDriver(Node):
         # is captured but not yet validated. Independent flag so the joint
         # path can go live without exposing untested Cartesian motion.
         self.declare_parameter('allow_cartesian_jog', False)
-        # 2026-09-11 speed-unlock (operator directive, third repeat):
-        # OUR software-side jog speed cap is retired. The slider's
-        # value maps 1:1 to the wire; the controller's Manual/Auto
-        # rate applies its own ceiling on the far side (Manual jog:
-        # 250 mm/s Cartesian / 30 °/s joint; Auto: 2600 mm/s). Per-
-        # joint velocity governor (2026-09-11 [2.41/2.89] rad/s) is
-        # the joint-level safety net; σ_min governor is the pose-
-        # class net; controller alarm 2015 is the final wall.
-        # `jog_speed_cap` and `operator_speed_limit` remain declared
-        # as parameters for wire-shape compatibility (the /estun/status
-        # blob still publishes them), but both default to 1.0 so
-        # `min(speed_pct/100, effective_speed_cap)` is a no-op.
-        # Historical staging (retired):
+        # 2026-09-11 OPERATOR ORDER (supersedes the same-day speed-
+        # unlock directive): cap jog speed at 50 %. Deliberate
+        # reversal, not a regression. `jog_speed_cap = 0.50` is
+        # authoritative; `operator_speed_limit = 1.00` stays because
+        # program-run / AUTO paths read only `operator_speed_limit`
+        # (jog_speed_cap is jog-specific by construction). Any
+        # future change to the 0.50 cap requires an explicit
+        # operator directive — pin
+        # `test_jog_speed_cap_is_fifty_percent_per_operator_order`
+        # is load-bearing.
+        # History:
         #   * 2026-07-22 raise: operator_speed_limit 0.25 → 0.65
         #   * 2026-07-28 raise: operator_speed_limit → 1.00 (jog
-        #     kept behind jog_speed_cap=0.50).
-        #   * 2026-09-11 unlock: jog_speed_cap 0.50 → 1.00 —
-        #     directive re-issued three times (Sep 8 speed-cap,
-        #     Sep 10 trust recount 7-8, Sep 10 speed-unlock 2)
-        #     before landing here.
-        self.declare_parameter('jog_speed_cap',        1.00)   # RETIRED — kept for wire shape
-        self.declare_parameter('operator_speed_limit', 1.00)   # RETIRED — kept for wire shape
+        #     kept behind jog_speed_cap=0.50)
+        #   * 2026-09-11 unlock (retired same day): jog_speed_cap
+        #     0.50 → 1.00
+        #   * 2026-09-11 REVERSAL (this directive): jog_speed_cap
+        #     1.00 → 0.50; slider maxes at 50%; wire ceiling honest
+        self.declare_parameter('jog_speed_cap',        0.50)   # OPERATOR ORDER 2026-09-11
+        self.declare_parameter('operator_speed_limit', 1.00)   # AUTO/program ceiling
         # Mid-run INCREASE confirm threshold (integer %). A dashboard
         # request to change the auto-mode rate to a value strictly
         # above this without an explicit high-speed confirm flag is

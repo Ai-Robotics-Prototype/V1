@@ -525,33 +525,81 @@ def test_per_joint_velocity_cap_matches_rated_fraction():
     assert 'if len(_pj) == 6 and all(float(v) > 0 for v in _pj):' in src
 
 
-def test_jog_speed_cap_is_unlocked_no_software_ceiling():
-    """Item 1 pin (speed-unlock, 2026-09-11 — three-times-ordered):
-    OUR software jog cap is retired. Parameters `jog_speed_cap` and
-    `operator_speed_limit` remain declared for wire-shape
-    compatibility with the status blob, but both default to 1.00 so
-    `min(speed_pct/100, effective_speed_cap)` becomes a no-op. The
-    slider commands 1:1 to the wire.
+def test_jog_speed_cap_is_fifty_percent_per_operator_order():
+    """OPERATOR ORDER (2026-09-11, supersedes the same-day speed-
+    unlock directive): cap jog speed at 50%. Deliberate reversal,
+    not a regression. `jog_speed_cap` default returns to 0.50; the
+    `min(speed_pct/100, effective_cap)` clamp at the three jog
+    sites (continuous, cart pulse, increment) becomes an active
+    ceiling again — 100% slider → 0.50 wire, 50% slider → 0.50
+    wire.
 
-    The controller's Manual/Auto rate is the remaining ceiling:
-      * Manual: 250 mm/s Cartesian / 30 °/s joint
-      * Auto:   2600 mm/s Cartesian (1500 product ceiling)
-    See HARDWARE.md L64-66. The UI names the Manual wall at
-    slider ≥ 50%.
+    `operator_speed_limit` stays 1.00 because program-run / AUTO
+    paths read only `operator_speed_limit` (jog_speed_cap is
+    jog-specific by construction; the run-path independence is
+    proven by test_run_path_independent_of_jog_speed_cap below).
 
-    Safety layers below this cap remain intact:
-      1. Per-joint velocity governor ([2.41 × 3, 2.89 × 3] rad/s)
-      2. σ_min governor (0.060 soft / 0.020 hard)
-      3. Controller alarm 2015 (final wall).
-
-    If any refactor puts back `jog_speed_cap=0.50` the operator's
-    directive is dropped for a fourth time — this pin catches it."""
+    Any future change to the 0.50 value requires an explicit
+    operator directive — this pin is load-bearing. A refactor that
+    silently raises jog_speed_cap fails at push time and reopens
+    the operator order."""
     src = _src()
-    assert "declare_parameter('jog_speed_cap',        1.00)" in src, (
-        'jog_speed_cap default must be 1.00 — the software jog cap '
-        'is retired per the 2026-09-11 speed-unlock directive.')
+    assert "declare_parameter('jog_speed_cap',        0.50)" in src, (
+        'jog_speed_cap default must be 0.50 per the 2026-09-11 '
+        'operator order (supersedes the same-day unlock). Any change '
+        'requires an explicit operator directive; do not silently '
+        'raise this value.')
     assert "declare_parameter('operator_speed_limit', 1.00)" in src, (
-        'operator_speed_limit default must be 1.00.')
+        'operator_speed_limit stays 1.00 — AUTO/program ceiling is '
+        'unchanged by the jog cap operator order.')
+
+
+def test_run_path_independent_of_jog_speed_cap():
+    """Scope check (item 4): program-run + AUTO paths do NOT flow
+    through `jog_speed_cap`. The driver publishes cap fields
+    (jog_speed_cap, operator_speed_limit, effective_speed_cap) on
+    the status blob, but the RUN path clamps against
+    `operator_speed_limit` alone via a dedicated helper. If a
+    refactor accidentally routes run-speed through the jog cap,
+    the operator's mid-run speed would drop from 100% (per AUTO
+    ceiling) to 50% (per jog cap) — a silent regression.
+
+    Enforced structurally:
+      * The run-path clamp helper (`_clamp_program_speed_pct`)
+        references `operator_speed_limit` NOT `jog_speed_cap`.
+      * The two jog-relevant clamps (continuous jog + cart pulse +
+        increment) reference `effective_speed_cap`, which is
+        min(jog_speed_cap, operator_speed_limit) — bounded by the
+        jog cap.
+      * The distinction lives in a comment block at the parameter
+        declaration ("jog_speed_cap is a jog-specific margin
+        ceiling, not an auto-mode one").
+    """
+    src = _src()
+    # The run-path helper exists AND references operator_speed_limit.
+    # Match only the function BODY (from `def` to the first `return`
+    # at the outer indent) — the file-level docblocks below the
+    # helper legitimately reference `jog_speed_cap` in explanatory
+    # text and would false-match a wider slice.
+    m = re.search(
+        r'def _clamp_program_speed_pct\(self.*?\):\n(.+?)\n        return .+?\n',
+        src, re.DOTALL)
+    assert m, ('_clamp_program_speed_pct helper missing or shape '
+               'changed — run-path independence cannot be verified '
+               'structurally')
+    body = m.group(1)
+    assert 'operator_speed_limit' in body, (
+        'run-path clamp must reference operator_speed_limit')
+    assert 'jog_speed_cap' not in body and '_effective_speed_cap' not in body, (
+        'run-path clamp must NOT reference jog_speed_cap / '
+        '_effective_speed_cap — a jog cap regression would silently '
+        'affect program-run speed. Route AUTO through '
+        'operator_speed_limit alone.')
+    # The distinction is documented at the parameter declaration.
+    assert ('jog_speed_cap is a jog-specific margin ceiling' in src
+            or 'jog_speed_cap is jog-specific' in src.lower()
+            or 'AUTO/program ceiling' in src), (
+        'parameter comment must state jog_speed_cap is jog-only')
 
 
 def test_reactive_backstop_uses_per_joint_cap_not_scalar():
