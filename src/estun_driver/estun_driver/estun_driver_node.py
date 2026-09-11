@@ -234,23 +234,28 @@ class EstunCodroidDriver(Node):
         # is captured but not yet validated. Independent flag so the joint
         # path can go live without exposing untested Cartesian motion.
         self.declare_parameter('allow_cartesian_jog', False)
-        # Two-tier speed cap. `jog_speed_cap` is the hardware-derived
-        # upper bound: the point past which the DERIVED safety margins
-        # (limit clamp, collision stop_mm, sigma governor) would no
-        # longer keep worst-case stop-distance under a supervise-tick
-        # budget. `operator_speed_limit` is the operationally-allowed
-        # ceiling that the OPERATOR is permitted to reach today.
-        # Effective_cap (used by JOG) = min(jog_speed_cap,
-        # operator_speed_limit). AUTO-mode / program-run paths use
-        # operator_speed_limit directly (jog_speed_cap is a jog-specific
-        # margin ceiling, not an auto-mode one).
-        #
-        # 2026-07-22 raise: operator_speed_limit 0.25 → 0.65 — see the
-        # YAML for the safeguards paired with the raise. YAML is the
-        # single authoritative source; this default only takes effect
-        # if the config file is missing.
-        self.declare_parameter('jog_speed_cap',        0.50)   # hardware-safe upper bound
-        self.declare_parameter('operator_speed_limit', 0.65)   # operationally-allowed ceiling
+        # 2026-09-11 speed-unlock (operator directive, third repeat):
+        # OUR software-side jog speed cap is retired. The slider's
+        # value maps 1:1 to the wire; the controller's Manual/Auto
+        # rate applies its own ceiling on the far side (Manual jog:
+        # 250 mm/s Cartesian / 30 °/s joint; Auto: 2600 mm/s). Per-
+        # joint velocity governor (2026-09-11 [2.41/2.89] rad/s) is
+        # the joint-level safety net; σ_min governor is the pose-
+        # class net; controller alarm 2015 is the final wall.
+        # `jog_speed_cap` and `operator_speed_limit` remain declared
+        # as parameters for wire-shape compatibility (the /estun/status
+        # blob still publishes them), but both default to 1.0 so
+        # `min(speed_pct/100, effective_speed_cap)` is a no-op.
+        # Historical staging (retired):
+        #   * 2026-07-22 raise: operator_speed_limit 0.25 → 0.65
+        #   * 2026-07-28 raise: operator_speed_limit → 1.00 (jog
+        #     kept behind jog_speed_cap=0.50).
+        #   * 2026-09-11 unlock: jog_speed_cap 0.50 → 1.00 —
+        #     directive re-issued three times (Sep 8 speed-cap,
+        #     Sep 10 trust recount 7-8, Sep 10 speed-unlock 2)
+        #     before landing here.
+        self.declare_parameter('jog_speed_cap',        1.00)   # RETIRED — kept for wire shape
+        self.declare_parameter('operator_speed_limit', 1.00)   # RETIRED — kept for wire shape
         # Mid-run INCREASE confirm threshold (integer %). A dashboard
         # request to change the auto-mode rate to a value strictly
         # above this without an explicit high-speed confirm flag is
@@ -387,24 +392,29 @@ class EstunCodroidDriver(Node):
         # Cartesian jog at speed_frac=0.15 in a healthy region produces
         # (measured 0.3–0.5 rad/s peak-per-joint in the same session).
         self.declare_parameter('cart_joint_velocity_cap_radps', 1.5)
-        # 2026-09-11 governor-noise audit: the flat 1.5 rad/s cap is
-        # 57.3% of J1/J2/J3's rated 2.618 rad/s but only 47.7% of
-        # J4/J5/J6's rated 3.142 rad/s (S10-140 Config→Safety:
-        # J1/J2/J3=150°/s, J4/J5/J6=180°/s per HARDWARE.md L39-40).
-        # The wrist joints were being flagged during normal jog because
-        # the flat cap strangled their rated envelope. Per-joint list
-        # holds each joint at ~65% of its rated speed — enough
-        # headroom for normal jog dynamics without changing the
-        # near-singularity behavior (a genuine spike still trips the
-        # governor because 65% of rated is still well under the alarm-
-        # 2015 divergence). Values in rad/s:
-        #   J1..J3: 2.618 × 0.65 ≈ 1.70
-        #   J4..J6: 3.142 × 0.65 ≈ 2.04
-        # Set to an empty list to fall back to the flat scalar above
-        # (bench regression path). Any list length ≠ 6 also falls back.
+        # 2026-09-11 governor-noise audit + speed-unlock (same day):
+        # per-joint list raised to ~92% of each joint's rated speed
+        # (S10-140 Config→Safety: J1/J2/J3=150°/s=2.618 rad/s,
+        # J4/J5/J6=180°/s=3.142 rad/s per HARDWARE.md L39-40).
+        # Values in rad/s:
+        #   J1..J3: 2.618 × 0.92 ≈ 2.41
+        #   J4..J6: 3.142 × 0.92 ≈ 2.89
+        # The 8 % headroom below rated is the **scale-to-comply**
+        # margin vs controller alarm 2015 ("Joint speed command jump
+        # or local acceleration too high"). Below 92% our governor
+        # can still scale down before the arm's own guard trips —
+        # at 100% we'd be racing the controller and any tiny
+        # overshoot would alarm. Prior 65% (1.70/2.04) was
+        # over-conservative: at 50% Cartesian slider on moderate
+        # poses the wrist routinely demanded 2.0-2.8 rad/s (68-89%
+        # of J4/5/6 rated), tripping the reactive backstop as pure
+        # Jacobian amplification, not a genuine near-singular spike.
+        # See the journal replay in the commit body for the
+        # symptom-to-cap mapping. Empty list falls back to the flat
+        # scalar above (bench regression path).
         self.declare_parameter(
             'cart_joint_velocity_cap_per_joint_radps',
-            [1.70, 1.70, 1.70, 2.04, 2.04, 2.04])
+            [2.41, 2.41, 2.41, 2.89, 2.89, 2.89])
         # Mid-hold speed changes ramp, not step. Delta hysteresis avoids
         # spamming stop+restart cycles; up-ramp is capped per tick so a
         # pose that briefly re-opens (σ_min bounces back) can't

@@ -117,7 +117,15 @@ estun_driver:
     #
     # Do NOT raise the HARDWARE ceiling (jog_speed_cap) without a
     # separate safety-pass margin re-derivation.
-    jog_speed_cap:        0.50
+    # 2026-09-11 speed-unlock (operator directive, third repeat):
+    # OUR software-side caps are retired. `jog_speed_cap = 1.00`
+    # (was 0.50) so the slider commands 1:1 to the wire. Controller-
+    # side Manual/Auto rate is the remaining ceiling — Manual jog
+    # enforces 250 mm/s Cartesian / 30 °/s joint regardless of the
+    # signed_speed fraction we send. Per-joint velocity governor
+    # ([2.41×3, 2.89×3] rad/s at ~92% of rated) + σ_min governor +
+    # controller alarm 2015 remain as safety layers below this cap.
+    jog_speed_cap:        1.00
     operator_speed_limit: 1.00
     # High-speed confirmation threshold. Mid-run INCREASES above this
     # % require an explicit confirm click before the driver publishes

@@ -513,18 +513,35 @@ export default function JogControls({ maximized = false }) {
   // /estun/status mirror. Default false until validated on hardware.
   const cartesianEnabled = !!robot.allow_cartesian_jog
 
-  // Two-tier speed cap surfaced by the driver in the status blob
-  // (2026-07-16 safety pass):
-  //   effective_speed_cap = min(jog_speed_cap, operator_speed_limit)
-  // Fallback 0.15 for pre-pass builds / cold boot so the UI is
-  // conservative when the driver hasn't reported yet. Slider visual +
-  // "capped" marker + `wire N` hint all read this.
-  const _effCap = Number.isFinite(robot.effective_speed_cap) ? robot.effective_speed_cap : 0.15
-  const _hwCap  = Number.isFinite(robot.jog_speed_cap)        ? robot.jog_speed_cap        : 0.15
-  const _opLim  = Number.isFinite(robot.operator_speed_limit) ? robot.operator_speed_limit : 0.15
+  // 2026-09-11 speed-unlock (operator directive, third repeat).
+  // OUR software-side jog cap is retired. Slider commands 1:1 to
+  // the wire. The controller's Manual/Auto rate applies its own
+  // ceiling on the far side (Manual: 250 mm/s Cartesian / 30 °/s
+  // joint; Auto: 2600 mm/s) — the UI names that wall explicitly
+  // at slider ≥ 50% so operators know where the actual limit lives.
+  //
+  // Fallback 1.00 for pre-report builds / cold boot: absence of
+  // driver report is NOT permission to invent a soft cap. Real
+  // safety layers below this UI cap: per-joint velocity governor
+  // ([2.41×3, 2.89×3] rad/s at ~92% of rated), σ_min governor,
+  // controller alarm 2015. Removing our soft cap does not remove
+  // any of those.
+  const _effCap = Number.isFinite(robot.effective_speed_cap) ? robot.effective_speed_cap : 1.00
+  const _hwCap  = Number.isFinite(robot.jog_speed_cap)        ? robot.jog_speed_cap        : 1.00
+  const _opLim  = Number.isFinite(robot.operator_speed_limit) ? robot.operator_speed_limit : 1.00
   const effectivePct = Math.round(_effCap * 100)
   const hwPct        = Math.round(_hwCap  * 100)
   const opPct        = Math.round(_opLim  * 100)
+  // Robot mode from the driver's mode mirror. 0 = Auto, 1 = Manual,
+  // 2 = Remote (per HARDWARE.md > Robot-mode code table). Manual is
+  // the default for jog. The UI hint tells the operator which wall
+  // is enforcing high-slider values on the far side.
+  const _robotModeCode = Number.isFinite(robot.robot_mode_code)
+                          ? robot.robot_mode_code : 1
+  const _isManual      = _robotModeCode === 1
+  const _ctrlWall      = _isManual
+    ? '250 mm/s / 30 °/s (Manual mode wall)'
+    : '2600 mm/s (Auto)'
 
   const holdStart = useCallback((axis, direction, meta) => {
     if (modeRef.current === 'joint') {
@@ -992,24 +1009,36 @@ export default function JogControls({ maximized = false }) {
             Speed: {speed}%
             {speed > effectivePct && (
               <span style={{ color: '#d97706', fontWeight: 700, marginLeft: 6 }}>
-                → {effectivePct}% (capped)
+                → {effectivePct}% (driver capped)
               </span>
             )}
           </div>
           <input type="range" min={1} max={100} value={speed}
             onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
             style={{ width: '100%', height: maximized ? 10 : 6 }} />
-          <div style={{ position: 'relative', width: '100%', height: 6, marginTop: 2 }}>
-            <div style={{
-              position: 'absolute',
-              left: `calc(${effectivePct}% - 1px)`,
-              top: 0, width: 2, height: 6, background: '#d97706',
-            }} />
-          </div>
-          <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 2 }}>
-            {speed <= effectivePct
-              ? `wire ${(Math.min(speed, effectivePct) / 100).toFixed(2)} — driver ceiling ${effectivePct}%`
-              : `wire ${(effectivePct / 100).toFixed(2)} — driver ceiling ${effectivePct}% (hw ${hwPct}% / op-limit ${opPct}%)`}
+          {effectivePct < 100 && (
+            <div style={{ position: 'relative', width: '100%', height: 6, marginTop: 2 }}>
+              <div style={{
+                position: 'absolute',
+                left: `calc(${effectivePct}% - 1px)`,
+                top: 0, width: 2, height: 6, background: '#d97706',
+              }} />
+            </div>
+          )}
+          <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 2 }}
+               data-testid="jog-speed-wire-hint">
+            {/* 2026-09-11 speed-unlock (item 4 truth line): slider →
+                wire 1:1 by default; only mention the driver ceiling
+                if one is actually set (< 100%). Above 50 % slider,
+                the controller's Manual/Auto rate is the remaining
+                wall — say so plainly. */}
+            {effectivePct >= 100
+              ? (speed >= 50
+                   ? `wire ${(speed / 100).toFixed(2)} — controller wall: ${_ctrlWall}`
+                   : `wire ${(speed / 100).toFixed(2)}`)
+              : (speed <= effectivePct
+                  ? `wire ${(Math.min(speed, effectivePct) / 100).toFixed(2)} — driver ceiling ${effectivePct}%`
+                  : `wire ${(effectivePct / 100).toFixed(2)} — driver ceiling ${effectivePct}% (hw ${hwPct}% / op-limit ${opPct}%)`)}
           </div>
         </div>
 

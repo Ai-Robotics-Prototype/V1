@@ -301,27 +301,59 @@ def test_live_margin_hud_renders_singularity_cause():
 # ── Noise audit (2026-09-11 operator directive) ───────────────────
 
 def test_per_joint_velocity_cap_matches_rated_fraction():
-    """Item 4 pin: the flat 1.5 rad/s cap strangled the wrist joints
-    (rated 3.142 rad/s = 47.7% of rated); operator got joint-speed
-    warnings during normal jog because the cap was hit routinely on
-    J4/J5/J6. New default: per-joint list at ~65% of each joint's
-    rated speed. S10-140 rated speeds from HARDWARE.md L39-40:
-      J1/J2/J3 = 150°/s = 2.618 rad/s → 65% ≈ 1.70 rad/s
-      J4/J5/J6 = 180°/s = 3.142 rad/s → 65% ≈ 2.04 rad/s
-    This test locks the parameter shape + values."""
+    """Item 4 pin: raised 2026-09-11 speed-unlock from ~65% to
+    ~92% of rated per joint. S10-140 rated (HARDWARE.md L39-40):
+      J1/J2/J3 = 150°/s = 2.618 rad/s → 92% ≈ 2.41 rad/s
+      J4/J5/J6 = 180°/s = 3.142 rad/s → 92% ≈ 2.89 rad/s
+    The 8% headroom below rated is the SCALE-TO-COMPLY margin vs
+    controller alarm 2015 ("Joint speed command jump or local
+    acceleration too high"). Below 92% our reactive backstop can
+    still scale down before the arm's own guard trips; at 100%
+    we'd be racing the controller.
+
+    Prior 65% (1.70/2.04) was over-conservative: at 50% Cartesian
+    slider on moderate poses the wrist demanded 2.0-2.8 rad/s
+    (68-89% of J4/5/6 rated) as pure Jacobian amplification, not
+    a singular spike."""
     src = _src()
     assert "'cart_joint_velocity_cap_per_joint_radps'" in src, (
         "per-joint cap parameter must be declared")
-    # Default values pinned. If the fraction is tuned, update both
-    # here and the parameter declaration in the same commit.
-    assert '[1.70, 1.70, 1.70, 2.04, 2.04, 2.04]' in src
-    # The runtime slot MUST be a length-6 list (not a scalar) so
-    # every ratio computes against the correct joint's cap.
+    assert '[2.41, 2.41, 2.41, 2.89, 2.89, 2.89]' in src, (
+        "per-joint caps must be [2.41 × 3, 2.89 × 3] rad/s "
+        "(~92% of rated). If lower, the reactive backstop scales "
+        "during normal jog — the noise-audit fix regresses.")
     assert 'self._cart_joint_v_cap_per' in src, (
         'runtime per-joint cap array missing')
-    # Fallback to the legacy scalar when the list is empty or wrong
-    # length — bench regression path.
     assert 'if len(_pj) == 6 and all(float(v) > 0 for v in _pj):' in src
+
+
+def test_jog_speed_cap_is_unlocked_no_software_ceiling():
+    """Item 1 pin (speed-unlock, 2026-09-11 — three-times-ordered):
+    OUR software jog cap is retired. Parameters `jog_speed_cap` and
+    `operator_speed_limit` remain declared for wire-shape
+    compatibility with the status blob, but both default to 1.00 so
+    `min(speed_pct/100, effective_speed_cap)` becomes a no-op. The
+    slider commands 1:1 to the wire.
+
+    The controller's Manual/Auto rate is the remaining ceiling:
+      * Manual: 250 mm/s Cartesian / 30 °/s joint
+      * Auto:   2600 mm/s Cartesian (1500 product ceiling)
+    See HARDWARE.md L64-66. The UI names the Manual wall at
+    slider ≥ 50%.
+
+    Safety layers below this cap remain intact:
+      1. Per-joint velocity governor ([2.41 × 3, 2.89 × 3] rad/s)
+      2. σ_min governor (0.060 soft / 0.020 hard)
+      3. Controller alarm 2015 (final wall).
+
+    If any refactor puts back `jog_speed_cap=0.50` the operator's
+    directive is dropped for a fourth time — this pin catches it."""
+    src = _src()
+    assert "declare_parameter('jog_speed_cap',        1.00)" in src, (
+        'jog_speed_cap default must be 1.00 — the software jog cap '
+        'is retired per the 2026-09-11 speed-unlock directive.')
+    assert "declare_parameter('operator_speed_limit', 1.00)" in src, (
+        'operator_speed_limit default must be 1.00.')
 
 
 def test_reactive_backstop_uses_per_joint_cap_not_scalar():
