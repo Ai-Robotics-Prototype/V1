@@ -214,18 +214,23 @@ test('follow(i): StandaloneRobot exposes the LIVE-FOLLOW API surface',
 })
 
 
-test('follow(j): JointJogPanel wires slider release + Follow-Robot button',
+test('follow(j): JointJogPanel is retired (2026-09-14 operator order)',
 () => {
-  const src = readSrc('components/JointJogPanel.jsx')
-  assert.match(src, /onPointerUp=\{\(\) => onSlideEnd\(i\)\}/,
-    v('slider must call onSlideEnd on pointerup (auto-release path)'))
-  assert.match(src, /jogApi\?\.releaseJointMask\?\.\(idx\)/,
-    v('onSlideEnd must call jogApi.releaseJointMask'))
-  assert.match(src, /jogApi\?\.followLive\?\.\(\)/,
-    v('Follow-Robot button must call jogApi.followLive'))
-  assert.match(src, /data-testid="follow-state-banner"/,
-    v('follow-state-banner test hook missing — E2E cannot assert '
-      + 'the PREVIEWING / LIVE banner'))
-  assert.match(src, /data-testid="follow-robot-btn"/,
-    v('follow-robot-btn test hook missing'))
+  // Pre-2026-09-14 this test asserted the panel's slider release +
+  // Follow-Robot button wired the twinFollowState primitives. That
+  // panel was retired entirely by the 2026-09-14 operator directive
+  // (single "Orient Flange Down" button + modal replaces it). The
+  // primitives (follow(a)-(h) above) and their StandaloneRobot
+  // jogApi surface (follow(i) above) remain — no live UI consumer
+  // wires them anymore, but the API is kept for a hypothetical
+  // future preview control. The retirement itself is pinned here.
+  //
+  // Regression fence: if a future edit resurrects JointJogPanel.jsx
+  // without a paired operator directive, this test trips.
+  const path = join(FRONT_ROOT, 'src', 'components', 'JointJogPanel.jsx')
+  let exists = false
+  try { readFileSync(path); exists = true } catch { exists = false }
+  assert.equal(exists, false,
+    v('JointJogPanel.jsx resurrected — 2026-09-14 retirement was '
+      + 'reverted or the file was re-added without an operator order'))
 })

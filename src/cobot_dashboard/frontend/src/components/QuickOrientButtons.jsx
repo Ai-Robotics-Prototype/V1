@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store/useStore'
 import * as THREE from 'three'
 import {
@@ -10,389 +10,423 @@ import {
   measureAchievedError,
 } from '../lib/orient'
 
-// 2026-09-08 amendment: retained "Face Down" only from the original
-// QuickOrient trio. Row label + Face Side + Face Up stayed retired.
+// 2026-09-14 operator directive — Orient Flange Down control.
 //
-// Face Down = TCP-preserving reorientation:
-//   * SAME xyz position (< 1 mm drift through the motion — enforced
-//     by the achieved-error check below; if solveIKToPose can't
-//     achieve the pose within tolerance, we REFUSE by name instead
-//     of approximating).
-//   * Flange approach axis aligned with world -Y (scene "down"; see
-//     lib/orient.js:readApproachWorld for the frame contract).
-//   * Slow by design: fixed orient rate ≤10°/s, computed from the
-//     angular distance between current and target orientation. NOT
-//     tied to jog speed.
-//   * Refusal copy (plain text, no jargon):
-//       "Too far from flat for an automatic move. Jog the flange
-//        closer to flat, then press Face Down again."
+// Retired in this session:
+//   * JointJogPanel (J1..J6 sliders, PREVIEWING banner, Cartesian
+//     checkbox, Send-to-real-arm button) from the 3D View.
 //
-// Twin path: always available. jogApi.runJointAnimation() interpolates
-// the six joint values over the computed slow duration; the animation
-// can be cancelled by any subsequent jog / IK / home command (they
-// share homeAnimRef in StandaloneRobot / ArmViewer3D).
+// Kept + reshaped: ONE button labeled "Orient Flange Down" that
+// opens a centered confirm modal. Continue fires the SAME guarded
+// real-arm endpoint (/api/estun/orient/face_down) — fresh live
+// joints server-side, 30° step guard, dry-run preflight, immediate-
+// stop latch. Cancel / Escape closes with no motion.
 //
-// Real-arm path (2026-09-09): wired through POST /api/estun/orient/
-// face_down. Same gate matrix as every real jog motion (E-STOP /
-// zone-GREEN / connected / enabled / !alarm / allow_jog / no program
-// running) plus a server-side 30°-per-joint step guard. The dashboard
-// endpoint enforces the rate cap (≤10°/s) by computing duration_ms
-// server-side from the max per-joint delta so an under-driver-cap
-// speed can't sneak through. The driver-side subscriber on
-// /robot/orient_command is a follow-up wire — until it lands, the
-// endpoint returns outcome.kind='executor_not_wired_yet' with a 503
-// and the frontend surfaces the specific message. Twin preview always
-// runs first; the "Send to real arm" button is a separate deliberate
-// tap so the FIRST REAL PRESS IS THE OPERATOR'S, slow, hand near
-// E-STOP (per the 2026-09-09 safety framing).
+// Refusal copy: reuses the 2026-09-14 plain-copy OP_COPY table —
+// step_too_large + IK-drift refusals render:
+//   "Too far from flat for an automatic move. Jog the flange
+//    closer to flat, then press Orient Flange Down again."
+//
+// The filename stays QuickOrientButtons.jsx to preserve git
+// history (grep-follow), even though only ONE control lives here
+// now. Default export renamed to OrientFlangeDownControl.
+//
+// Contract for the caller: pass `jogApi` from StandaloneRobot's
+// onRobotReady callback. We need jogApi.robot for the URDF handle
+// to run IK against; if it's not ready, the button is disabled.
+// No twin animation runs on Continue — the WS mirror updates the
+// twin once the real arm moves. If the real-arm interlocks refuse,
+// the refusal renders inline; no motion, no twin drift.
 
-// TCP drift tolerance for the achieved-error check. If solveIKToPose
-// returns a joint vector whose FK'd TCP position differs from the
-// input `currentPos` by more than this, we refuse. 1 mm per operator
-// directive item 1.
+// TCP drift tolerance for the achieved-error check. Same 1 mm
+// budget the endpoint's server-side FK cross-check uses.
 const TCP_DRIFT_TOL_M = 0.001
 
-// Orientation rate cap: 10°/s = 0.1745 rad/s. Duration for the
-// animation = angular_distance / rate, floored at a minimum so a
-// near-noop rotation still animates visibly.
-const ORIENT_RATE_RAD_PER_S = (10 * Math.PI) / 180
-const MIN_DURATION_MS = 400
-const MAX_DURATION_MS = 8000
+// Rotation-residual tolerance for the achieved-error check.
+const ROT_ERR_TOL_RAD = 0.05
 
-function angleBetweenQuats(q1, q2) {
-  // 2 * acos(|q1.dot(q2)|). Clamp for FP safety.
-  const dot = Math.min(1, Math.max(-1, Math.abs(q1.dot(q2))))
-  return 2 * Math.acos(dot)
+// Named refusal copy — mapped from server outcome.kind to plain
+// operator language. Same table shape the prior FaceDownButton
+// used; the two IK-refusal classes (client can't solve, server
+// says step_too_large) share the same too-tilted operator string.
+const REFUSAL_COPY = {
+  // Client-side IK could not preserve the TCP or converge on the
+  // face-down orientation — same operator situation as the
+  // server's step_too_large refusal (the flange is too tilted for
+  // an automatic reorient from here).
+  ik_unreachable:      "Too far from flat for an automatic move. Jog the flange closer to flat, then press Orient Flange Down again.",
+  bad_input:           "The face-down target didn't reach the arm cleanly. Try Orient Flange Down again.",
+  step_too_large:      "Too far from flat for an automatic move. Jog the flange closer to flat, then press Orient Flange Down again.",
+  estop_active:        "E-STOP is active. Release the E-STOP button, then try Orient Flange Down again.",
+  zone_not_green:      "Safety zone isn't clear. Step away from the cell and try again.",
+  driver_disconnected: "The robot controller is offline. Check the arm connection and retry.",
+  not_enabled:         "The arm isn't enabled. Press Enable, then try Orient Flange Down.",
+  alarm_active:        "An alarm is active. Clear it, then try Orient Flange Down.",
+  jog_gate_closed:     "Manual jog is disabled on the controller. Enable jog and try again.",
+  program_running:     "A program is running. Stop it before commanding Orient Flange Down.",
+  no_live_joint_state: "The arm isn't reporting its pose yet. Wait a moment and try again.",
+  driver_not_discovered: "The estun driver isn't up yet. Wait a few seconds and retry.",
+  bad_q_target:        "The face-down target didn't reach the driver cleanly. Try Orient Flange Down again.",
+  allow_move_closed:   "The controller's motion write path is closed. Ask a supervisor to open it.",
+  orient_save_fail:    "The controller refused to save the face-down move. Try again; if it persists, the controller may need a restart.",
+  orient_run_fail:     "The controller accepted the face-down move but refused to run it. Check controller mode + alarms.",
+  orient_slot_malformed: "The controller stored the face-down move in the wrong place and can't run it. Report this to support — it's a driver-side bug guard, not an operator condition.",
+  orient_verify_saved_fail: "The controller didn't respond when the driver checked the saved face-down move. Check the controller connection and try again.",
+  stale_joint_state:   "Couldn't read the robot's current position — try again.",
+  stale_ik_seed:       "The arm moved after Orient Flange Down was pressed. Press it again to re-level from the current position.",
+  orient_near_singularity: "Too close to a stretched-out pose. Use joint jog to move away from the extension, then try Orient Flange Down again.",
 }
 
-function fmt(v) {
-  if (!v || typeof v.x !== 'number') return String(v)
-  return `[${v.x.toFixed(3)}, ${v.y.toFixed(3)}, ${v.z.toFixed(3)}]`
+// One IK compute per Continue press. Reads LIVE joint state from
+// the store as the seed (bypasses the twin's LERP mask — same
+// stale-seed fix the 2026-09-09 pass landed for the prior two-
+// step flow). Writes the live seed onto the URDF joints, samples
+// current TCP + approach, then solves IK for the same TCP at a
+// world-down approach. Returns q_target or null on any failure.
+function computeFaceDownTarget(armRobot, liveJointsRad) {
+  if (!armRobot?.joints) return null
+  const tool = resolveTool(armRobot)
+  if (!tool) return null
+
+  const JN = ['joint_1', 'joint_2', 'joint_3',
+              'joint_4', 'joint_5', 'joint_6']
+  if (Array.isArray(liveJointsRad) && liveJointsRad.length >= 6) {
+    for (let i = 0; i < 6; i++) {
+      const v = Number(liveJointsRad[i])
+      if (!Number.isFinite(v)) continue
+      const j = armRobot.joints[JN[i]]
+      if (j && typeof j.setJointValue === 'function') {
+        j.setJointValue(v)
+      }
+    }
+    try { armRobot.updateMatrixWorld?.(true) } catch { /* nop */ }
+  }
+
+  const { pos: currentPos, quat: currentQuat } = readToolWorldPose(tool)
+  const currentApproachWorld = readApproachWorld(armRobot)
+  const targetApproachWorld = new THREE.Vector3(0, -1, 0)
+  const targetQuat = orientApproachTo(
+    currentQuat, currentApproachWorld, targetApproachWorld)
+
+  const q_target = solveIKToPose(armRobot, tool, currentPos, targetQuat)
+  if (!q_target || q_target.length !== 6) return null
+
+  const { posErr, rotErr } = measureAchievedError(
+    armRobot, tool, q_target, currentPos, targetQuat)
+  if (posErr > TCP_DRIFT_TOL_M) return null
+  if (rotErr > ROT_ERR_TOL_RAD) return null
+
+  return Array.from(q_target)
 }
 
-export default function FaceDownButton({ jogApi, onAtLimit }) {
-  const [refusalMsg, setRefusalMsg] = useState('')
-  // Last successful twin preview — the joint target the real-arm
-  // press will send. `null` until the operator taps Face Down and IK
-  // succeeds; cleared on any refusal or on a robot-state change that
-  // would invalidate the pose. The "Send to real arm" button reads
-  // this — no shadow copies of q_target live elsewhere.
-  const [previewedTarget, setPreviewedTarget] = useState(null)
-  const [realArmBusy, setRealArmBusy] = useState(false)
-  const [realArmStatus, setRealArmStatus] = useState(null)   // {ok, kind, reason}
+export default function OrientFlangeDownControl({ jogApi }) {
+  const [modalOpen, setModalOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [status, setStatus] = useState(null)   // {ok, kind, message}
+  const continueBtnRef = useRef(null)
 
   const robot   = useStore((s) => s.robot) || {}
   const safety  = useStore((s) => s.safety) || {}
-  // Live joint state from the WS stream — the ONLY authoritative
-  // seed for IK. StandaloneRobot's twin URDF lags (25 Hz LERP with
-  // 0.3/tick converges asymptotically; 100+ ms to catch a rapid
-  // manual move) so using twin.joints as the IK seed reintroduces
-  // the stale-pose bug (2026-09-09 §NN operator report: Face Down
-  // levels at a PAST pose because the twin was mid-lerp when the
-  // press fired). The store slice is populated from
-  // publish/RobotPosture at controller rate (~17 Hz, <60 ms old).
   const liveJointsRad = useStore((s) => s.joints?.positions) || []
-  // Real-arm interlock: same conditions as JogControls' jogGateOk.
-  // Twin path ignores these — the twin is always safe to animate.
+
   // Wire authority: state_code==2 is the numeric truth per FACTS.md;
-  // boolean `enabled` is a legacy fallback for older builds.
+  // boolean `enabled` is a legacy fallback for older builds. Same
+  // shape the retired two-step control used.
   const enabledByState = Number.isFinite(robot.state_code)
     ? robot.state_code === 2 : !!robot.enabled
   const realArmReady = !!robot.connected && enabledByState
                     && !!robot.allow_jog && !safety.estop
                     && !robot.alarm && safety.zone === 'GREEN'
 
-  const ready = !!jogApi?.robot?.joints && !!jogApi?.runJointAnimation
+  const twinReady = !!jogApi?.robot?.joints
+  const disabled = !twinReady
 
-  const handleClick = () => {
-    setRefusalMsg('')
-    setPreviewedTarget(null)
-    setRealArmStatus(null)
-    if (!ready) return
-    const armRobot = jogApi.robot
-    const tool = resolveTool(armRobot)
-    if (!tool) {
-      setRefusalMsg('twin not fully loaded — try again in a moment')
-      return
-    }
-    // 2026-09-09 §NN stale-seed fix. Force-sync the twin URDF to
-    // the LIVE WS joint state RIGHT BEFORE IK. Bypasses jogApi.
-    // setJointsRad (which latches masks) — we call setJointValue on
-    // each URDFJoint directly so LIVE-FOLLOW keeps working after
-    // this press. This closes the class of bug where twin's LERP
-    // (StandaloneRobot line 275 useEffect) hadn't caught up to a
-    // rapid manual move, and IK computed q_target relative to a
-    // stale pose.
-    if (Array.isArray(liveJointsRad) && liveJointsRad.length >= 6) {
-      const JN = ['joint_1', 'joint_2', 'joint_3',
-                    'joint_4', 'joint_5', 'joint_6']
-      for (let i = 0; i < 6; i++) {
-        const v = Number(liveJointsRad[i])
-        if (!Number.isFinite(v)) continue
-        const j = armRobot?.joints?.[JN[i]]
-        if (j && typeof j.setJointValue === 'function') {
-          j.setJointValue(v)
-        }
+  // Escape / Cancel close the modal without firing any request.
+  // No click-through — the backdrop is a full-viewport overlay that
+  // captures clicks (see backdropStyle). Only Cancel and Escape
+  // dismiss; clicks on the backdrop are inert per the operator
+  // order ("dismissible via Cancel/Escape only — no click-through").
+  useEffect(() => {
+    if (!modalOpen) return undefined
+    const onKey = (e) => {
+      if (e.key === 'Escape' && !busy) {
+        setModalOpen(false)
       }
-      // Touch scene matrixes so TCP FK samples off the freshly-
-      // written joint values (URDFLoader defers matrix update to
-      // the render loop; IK reads world matrices).
-      try { armRobot.updateMatrixWorld?.(true) } catch { /* nop */ }
     }
+    window.addEventListener('keydown', onKey)
+    // Autofocus Continue so keyboard-only operators reach it first
+    // (Enter fires Continue, Escape cancels).
+    try { continueBtnRef.current?.focus() } catch { /* nop */ }
+    return () => window.removeEventListener('keydown', onKey)
+  }, [modalOpen, busy])
 
-    // Snapshot current TCP pose + world approach direction.
-    const { pos: currentPos, quat: currentQuat } = readToolWorldPose(tool)
-    const currentApproachWorld = readApproachWorld(armRobot)
-
-    // Target: flange approach → scene -Y (down).
-    const targetApproachWorld = new THREE.Vector3(0, -1, 0)
-    const targetQuat = orientApproachTo(
-      currentQuat, currentApproachWorld, targetApproachWorld)
-
-    // One-shot IK at the SAME TCP position + new orientation.
-    const q_target = solveIKToPose(armRobot, tool, currentPos, targetQuat)
-    if (!q_target || q_target.length !== 6) {
-      setRefusalMsg("Too far from flat for an automatic move. Jog the flange closer to flat, then press Face Down again.")
-      return
-    }
-
-    // Verify the achieved solution keeps the TCP within tolerance.
-    const { posErr, rotErr } = measureAchievedError(
-      armRobot, tool, q_target, currentPos, targetQuat)
-    // eslint-disable-next-line no-console
-    console.log(
-      `[face-down] posErr=${posErr.toExponential(2)} m  `
-      + `rotErr=${rotErr.toExponential(2)} rad  `
-      + `currentApproach=${fmt(currentApproachWorld)}`)
-
-    if (posErr > TCP_DRIFT_TOL_M) {
-      setRefusalMsg("Too far from flat for an automatic move. Jog the flange closer to flat, then press Face Down again.")
-      onAtLimit?.(true)
-      return
-    }
-    // rotErr = achieved-vs-target orientation residual. If it's large
-    // (joint-clamped), IK didn't converge to the intended pose. Same
-    // refusal — no approximation.
-    if (rotErr > 0.05) {
-      setRefusalMsg("Too far from flat for an automatic move. Jog the flange closer to flat, then press Face Down again.")
-      onAtLimit?.(true)
-      return
-    }
-
-    onAtLimit?.(false)
-
-    // Slow fixed-rate duration. angle_between(current, target) /
-    // (10°/s), clamped to [MIN, MAX] so tiny rotations still animate
-    // visibly and huge rotations don't run for minutes.
-    const angleRad = angleBetweenQuats(currentQuat, targetQuat)
-    const durationMs = Math.max(
-      MIN_DURATION_MS,
-      Math.min(MAX_DURATION_MS,
-               (angleRad / ORIENT_RATE_RAD_PER_S) * 1000))
-
-    jogApi.runJointAnimation(q_target, durationMs)
-
-    // Latch the IK-solved target so the "Send to real arm" button
-    // has something authoritative to POST. Storing the joint vector
-    // (not the pose) means the server can validate a 30°-per-joint
-    // step guard without redoing IK. Array.from() clones so a later
-    // preview overwrite can't mutate this snapshot.
-    setPreviewedTarget(Array.from(q_target))
+  const openModal = () => {
+    if (disabled) return
+    setStatus(null)
+    setModalOpen(true)
   }
 
-  // Send to real arm — separate deliberate press per 2026-09-09
-  // safety framing. Sends the LAST successful twin preview's
-  // q_target. Server runs the full interlock gate matrix (same as
-  // every real jog motion); refusals show inline. Rate cap enforced
-  // server-side. The 3D twin preview is unchanged — this button only
-  // fires the real-arm wire.
-  const sendToRealArm = async () => {
-    if (!realArmReady || !previewedTarget || realArmBusy) return
-    // eslint-disable-next-line no-alert
-    if (!window.confirm(
-      'Send Face Down to real arm?\n\n'
-      + 'The arm will coordinate all six joints to the twin-previewed '
-      + 'pose at ≤10°/s. Keep your hand near E-STOP.'
-    )) return
-    setRealArmBusy(true)
-    setRealArmStatus(null)
+  const onCancel = () => {
+    if (busy) return
+    setModalOpen(false)
+  }
+
+  const onContinue = async () => {
+    if (busy || !twinReady) return
+    setBusy(true)
+    setStatus(null)
     try {
-      // Do NOT send q_current_snapshot: the server uses live_joints
-      // (STATE.joints from /joint_states via WS) as its own authority
-      // for BOTH the step guard AND the trajectory anchor — client
-      // input can't influence either. Prior versions sent the twin's
-      // post-animation URDF joints (which equal q_target) as the
-      // snapshot; the server's staleness cross-check then refused
-      // every real-arm press with kind='snapshot_stale', which
-      // rendered as a yellow banner the operator missed. Stripping
-      // the field kills that class outright.
+      // Client-side IK is a preflight so we can name the ik_unreachable
+      // class in plain operator copy WITHOUT waiting on the endpoint's
+      // step_too_large fallback (server refuses too, but the round trip
+      // is slower and less specific). Server remains the authority for
+      // the interlock gate matrix + the 30°-per-joint step guard.
+      const q_target = computeFaceDownTarget(
+        jogApi?.robot, liveJointsRad)
+      if (!q_target) {
+        setStatus({
+          ok: false,
+          kind: 'ik_unreachable',
+          message: REFUSAL_COPY.ik_unreachable,
+        })
+        return
+      }
+
+      // Real-arm gate stays authoritative on the server — but we hint
+      // via a client-side check so the modal doesn't POST an obviously-
+      // doomed request. If the arm isn't ready, close the modal and
+      // render an inline refusal named to the failing gate. This mirrors
+      // the retired two-step control's realArmReady derivation.
+      if (!realArmReady) {
+        const kind = safety.estop      ? 'estop_active'
+                   : safety.zone !== 'GREEN' ? 'zone_not_green'
+                   : !robot.connected  ? 'driver_disconnected'
+                   : !enabledByState   ? 'not_enabled'
+                   : robot.alarm       ? 'alarm_active'
+                   : !robot.allow_jog  ? 'jog_gate_closed'
+                   :                     'not_enabled'
+        setStatus({
+          ok: false,
+          kind,
+          message: REFUSAL_COPY[kind] || 'Arm not ready.',
+        })
+        return
+      }
+
       const resp = await fetch('/api/estun/orient/face_down', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ q_target: previewedTarget }),
+        body: JSON.stringify({ q_target }),
       })
-      // Belt+braces JSON parse — some infra returns text on 500;
-      // fall back to a synthetic outcome so realArmStatus is
-      // NEVER null after this branch (silence bug fence).
       let body = null
       try { body = await resp.json() } catch { body = null }
+
       if (resp.ok && body && body.ok) {
-        const drv = (typeof body.driver_subs === 'number')
-          ? ` · driver_subs=${body.driver_subs}` : ''
-        const nxt = body.next ? ` — ${body.next}` : ''
-        setRealArmStatus({ ok: true,
-          message: `Command published to /robot/jog_command`
-            + ` (duration ${body.duration_ms} ms${drv})${nxt}` })
-      } else if (body && body.outcome) {
-        const outcome = body.outcome
-        // Plain-language rewrites for the known refusal kinds
-        // (snapshot_stale copy lesson: "no debug-speak"). Server's
-        // outcome.reason is the technical narrative — surfaced in
-        // the tooltip / debug pane, not the operator banner.
-        const OP_COPY = {
-          bad_input:          "The face-down target didn't reach the arm cleanly. Try Face Down again.",
-          step_too_large:     "Too far from flat for an automatic move. Jog the flange closer to flat, then press Face Down again.",
-          estop_active:       "E-STOP is active. Release the E-STOP button, then try Face Down again.",
-          zone_not_green:     "Safety zone isn't clear. Step away from the cell and try again.",
-          driver_disconnected: "The robot controller is offline. Check the arm connection and retry.",
-          not_enabled:        "The arm isn't enabled. Press Enable, then try Face Down.",
-          alarm_active:       "An alarm is active. Clear it, then try Face Down.",
-          jog_gate_closed:    "Manual jog is disabled on the controller. Enable jog and try again.",
-          program_running:    "A program is running. Stop it before commanding Face Down.",
-          no_live_joint_state: "The arm isn't reporting its pose yet. Wait a moment and try again.",
-          driver_not_discovered: "The estun driver isn't up yet. Wait a few seconds and retry.",
-          bad_q_target:       "The face-down target didn't reach the driver cleanly. Try Face Down again.",
-          allow_move_closed:  "The controller's motion write path is closed. Ask a supervisor to open it.",
-          orient_save_fail:   "The controller refused to save the face-down move. Try again; if it persists, the controller may need a restart.",
-          orient_run_fail:    "The controller accepted the face-down move but refused to run it. Check controller mode + alarms.",
-          orient_slot_malformed: "The controller stored the face-down move in the wrong place and can't run it. Report this to support — it's a driver-side bug guard, not an operator condition.",
-          orient_verify_saved_fail: "The controller didn't respond when the driver checked the saved face-down move. Check the controller connection and try again.",
-          stale_joint_state: "Couldn't read the robot's current position — try again.",
-          stale_ik_seed:     "The arm moved after Face Down was pressed. Press it again to re-level from the current position.",
-          orient_near_singularity: "Too close to a stretched-out pose. Use joint jog to move away from the extension, then try Face Down again.",
-        }
-        setRealArmStatus({
+        setStatus({
+          ok: true,
+          message: `Command published (duration ${body.duration_ms} ms).`,
+        })
+        setModalOpen(false)
+        return
+      }
+
+      const outcome = body && body.outcome
+      if (outcome) {
+        setStatus({
           ok: false,
           kind: outcome.kind || 'unknown',
-          message: OP_COPY[outcome.kind]
+          message: REFUSAL_COPY[outcome.kind]
                 || outcome.reason
                 || `Refused (HTTP ${resp.status})`,
           technicalDetail: outcome.reason,
         })
       } else {
-        // Non-JSON error OR fully-empty body — synthesize a message
-        // so the operator never gets silence.
-        setRealArmStatus({
+        setStatus({
           ok: false,
           kind: 'response_unparseable',
           message: `Server returned HTTP ${resp.status} without a `
-            + `parseable outcome. Check dashboard journal for the request.`,
+            + `parseable outcome. Check dashboard journal.`,
         })
       }
     } catch (e) {
-      setRealArmStatus({
-        ok: false, kind: 'network',
+      setStatus({
+        ok: false,
+        kind: 'network',
         message: `Network error contacting dashboard: ${e?.message || e}`,
       })
     } finally {
-      setRealArmBusy(false)
+      setBusy(false)
     }
   }
 
-  const disabled = !ready
   return (
-    <div style={styles.wrap} data-testid="face-down-button">
-      <button
-        type="button"
-        disabled={disabled}
-        title={realArmReady
-          ? 'Face Down — TCP stays in place, tool orients to world -Y. '
-            + 'Twin previews the pose; a separate button then commands '
-            + 'the real arm at ≤10°/s (server enforces the interlock).'
-          : 'Face Down — TCP-preserving twin orient to world -Y. '
-            + 'Slow by design (~10°/s). Real-arm path enabled once the '
-            + 'arm is connected + enabled + jog-gated + zone-green.'}
-        onClick={handleClick}
-        style={{
-          ...styles.btn,
-          cursor: disabled ? 'not-allowed' : 'pointer',
-          opacity: disabled ? 0.55 : 1,
-        }}
-      >
-        Face Down
-      </button>
-      {refusalMsg && (
-        <div
-          data-testid="face-down-refusal"
-          style={styles.refusal}>
-          {refusalMsg}
-        </div>
-      )}
-      {/* Real-arm button — only rendered after a successful twin
-          preview (previewedTarget != null). Disabled unless the same
-          interlock gates the server enforces are also green on the
-          client, so operators don't tap only to eat a 409. */}
-      {previewedTarget && (
+    <>
+      <div style={styles.wrap} data-testid="orient-flange-down-control">
         <button
-          data-testid="face-down-send-real"
           type="button"
-          disabled={!realArmReady || realArmBusy}
-          onClick={sendToRealArm}
+          data-testid="orient-flange-down-button"
+          disabled={disabled}
+          onClick={openModal}
           title={realArmReady
-            ? 'Command the real arm to the previewed pose at ≤10°/s. '
-              + 'Keep your hand near E-STOP.'
-            : 'Real arm not ready — check enable / allow_jog / alarm / '
-              + 'zone-green / E-STOP.'}
+            ? 'Orient the flange straight down at the current TCP '
+              + 'position. Opens a confirmation modal; Continue '
+              + 'commands the real arm through the guarded Face '
+              + 'Down endpoint.'
+            : 'Orient Flange Down — the arm must be connected, '
+              + 'enabled, jog-gated, alarm-free, and in a green '
+              + 'safety zone before Continue will command motion.'}
           style={{
-            ...styles.btnReal,
-            cursor: (!realArmReady || realArmBusy) ? 'not-allowed' : 'pointer',
-            opacity: (!realArmReady || realArmBusy) ? 0.55 : 1,
+            ...styles.btn,
+            cursor: disabled ? 'not-allowed' : 'pointer',
+            opacity: disabled ? 0.55 : 1,
           }}
         >
-          {realArmBusy ? 'Sending…' : 'Send to real arm'}
+          Orient Flange Down
         </button>
-      )}
-      {realArmStatus && (
+        {status && !modalOpen && (
+          <div
+            data-testid={status.ok
+              ? 'orient-flange-down-ok'
+              : 'orient-flange-down-refusal'}
+            data-kind={status.kind || (status.ok ? 'ok' : '')}
+            style={status.ok ? styles.okBanner : styles.refusal}>
+            {status.message}
+          </div>
+        )}
+      </div>
+
+      {modalOpen && (
         <div
-          data-testid={realArmStatus.ok
-            ? 'face-down-real-ok'
-            : 'face-down-real-refusal'}
-          data-kind={realArmStatus.kind || (realArmStatus.ok ? 'ok' : '')}
-          style={realArmStatus.ok ? styles.okBanner : styles.refusal}>
-          {realArmStatus.message}
+          data-testid="orient-flange-down-backdrop"
+          style={styles.backdrop}
+          role="presentation"
+        >
+          <div
+            data-testid="orient-flange-down-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="orient-flange-down-title"
+            style={styles.modal}
+          >
+            <div id="orient-flange-down-title" style={styles.modalTitle}>
+              Orient flange down?
+            </div>
+            <div style={styles.modalBody}>
+              The arm will rotate the flange to point straight down at
+              its current position.
+            </div>
+            {status && !status.ok && (
+              <div
+                data-testid="orient-flange-down-modal-refusal"
+                data-kind={status.kind || ''}
+                style={styles.refusal}>
+                {status.message}
+              </div>
+            )}
+            <div style={styles.modalButtons}>
+              <button
+                type="button"
+                data-testid="orient-flange-down-cancel"
+                onClick={onCancel}
+                disabled={busy}
+                style={{
+                  ...styles.btnSecondary,
+                  cursor: busy ? 'not-allowed' : 'pointer',
+                  opacity: busy ? 0.55 : 1,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                ref={continueBtnRef}
+                data-testid="orient-flange-down-continue"
+                onClick={onContinue}
+                disabled={busy}
+                style={{
+                  ...styles.btnPrimary,
+                  cursor: busy ? 'not-allowed' : 'pointer',
+                  opacity: busy ? 0.55 : 1,
+                }}
+              >
+                {busy ? 'Sending…' : 'Continue'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
-    </div>
+    </>
   )
 }
 
 const styles = {
-  wrap: { display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 10 },
+  wrap: {
+    position: 'absolute', top: 8, right: 8, zIndex: 11,
+    display: 'flex', flexDirection: 'column', gap: 6,
+    maxWidth: 320,
+    fontFamily: 'var(--font, system-ui)',
+  },
   btn: {
-    padding: '8px 12px',
+    padding: '10px 16px',
     background: '#0284c7', color: '#fff',
     border: '1px solid #0369a1', borderRadius: 6,
     fontSize: 12, fontWeight: 700, letterSpacing: 0.4,
     fontFamily: 'inherit',
-  },
-  btnReal: {
-    padding: '8px 12px',
-    background: '#B91C1C', color: '#fff',
-    border: '2px solid #7F1D1D', borderRadius: 6,
-    fontSize: 12, fontWeight: 700, letterSpacing: 0.4,
-    textTransform: 'uppercase',
-    fontFamily: 'inherit',
+    boxShadow: '0 2px 6px rgba(0,0,0,0.18)',
   },
   refusal: {
-    padding: '6px 10px',
+    padding: '8px 12px',
     background: '#FEF3C7', color: '#92400E',
     border: '1px solid #FDE68A', borderRadius: 4,
-    fontSize: 11, lineHeight: 1.4,
+    fontSize: 12, lineHeight: 1.4,
   },
   okBanner: {
-    padding: '6px 10px',
+    padding: '8px 12px',
     background: 'rgba(34,197,94,0.12)', color: '#166534',
     border: '1px solid rgba(34,197,94,0.55)', borderRadius: 4,
-    fontSize: 11, lineHeight: 1.4,
+    fontSize: 12, lineHeight: 1.4,
+  },
+  // Full-viewport backdrop. Click-through is intentionally NOT
+  // wired — the operator directive forbids backdrop dismissal.
+  // pointerEvents:'auto' keeps the dark overlay from letting
+  // clicks fall through to the twin viewer beneath.
+  backdrop: {
+    position: 'fixed', inset: 0, zIndex: 1000,
+    background: 'rgba(15, 23, 42, 0.55)',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    pointerEvents: 'auto',
+  },
+  modal: {
+    background: '#fff', color: '#111318',
+    border: '1px solid rgba(0,0,0,0.10)', borderRadius: 8,
+    boxShadow: '0 12px 32px rgba(0,0,0,0.25)',
+    padding: 20, minWidth: 320, maxWidth: 440,
+    display: 'flex', flexDirection: 'column', gap: 12,
+    fontFamily: 'var(--font, system-ui)', fontSize: 13,
+  },
+  modalTitle: {
+    fontSize: 16, fontWeight: 700, color: '#0f172a',
+    letterSpacing: 0.2,
+  },
+  modalBody: {
+    fontSize: 13, lineHeight: 1.5, color: '#334155',
+  },
+  modalButtons: {
+    display: 'flex', justifyContent: 'flex-end', gap: 8,
+    marginTop: 4,
+  },
+  btnPrimary: {
+    padding: '8px 16px',
+    background: '#0284c7', color: '#fff',
+    border: '1px solid #0369a1', borderRadius: 6,
+    fontSize: 13, fontWeight: 700, letterSpacing: 0.3,
+    fontFamily: 'inherit',
+  },
+  btnSecondary: {
+    padding: '8px 16px',
+    background: '#fff', color: '#334155',
+    border: '1px solid #cbd5e1', borderRadius: 6,
+    fontSize: 13, fontWeight: 600, letterSpacing: 0.3,
+    fontFamily: 'inherit',
   },
 }

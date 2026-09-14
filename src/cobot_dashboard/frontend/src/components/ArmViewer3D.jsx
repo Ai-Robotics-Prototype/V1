@@ -8,7 +8,11 @@ import URDFLoader from 'urdf-loader'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
 import { CollisionScene3D, CollisionBanner } from './CollisionOverlay'
-import JointJogPanel from './JointJogPanel'
+// 2026-09-14 operator directive: JointJogPanel retired from the 3D
+// View. This file used to mount it in the !noRobot branch, but that
+// branch never fired (View3DLayout is the only ArmViewer3D consumer
+// and passes noRobot=true). The dead import + mount were removed to
+// avoid a silent dead reference in a build the bundler still traces.
 import IKGizmo from './IKGizmo'
 import { startHomeMove } from '../lib/homeAnim'
 import { startJointAnimation } from '../lib/jointAnim'
@@ -1599,24 +1603,12 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
           conditional rendering; error surfacing during dev can
           use the console. */}
 
-      {/* FK jog pane, right-docked. Only mounts when URDFArm is active
-          (noRobot=false) — the View3D tab uses StandaloneRobot and has
-          no jogApi, so the panel is intentionally hidden there. */}
-      {!noRobot && (
-        <JointJogPanel
-          jogApi={jogApi}
-          cartesianMode={cartMode}
-          onCartesianModeChange={setCartMode}
-          gizmoMode={gizmoMode}
-          onGizmoModeChange={setGizmoMode}
-          onHome={() => {
-            // Smooth coordinated 2-second return to all-zeros (see
-            // lib/homeAnim.js). Interrupt with any slider / IK write.
-            jogApi?.home?.()
-          }}
-          onAtLimit={(atLimit) => setIkAtLimit(!!atLimit)}
-        />
-      )}
+      {/* 2026-09-14 operator directive: right-docked FK jog pane
+          retired from the 3D View. This block used to mount
+          JointJogPanel behind `!noRobot`, but the only ArmViewer3D
+          consumer (View3DLayout) always passes noRobot=true, so the
+          branch never fired. The 3D View now hosts the modal-gated
+          OrientFlangeDownControl instead. */}
 
       {/* Camera presets + reach-dome toggle, top-left */}
       <div style={{

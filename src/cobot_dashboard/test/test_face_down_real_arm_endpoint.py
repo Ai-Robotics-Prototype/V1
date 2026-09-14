@@ -366,38 +366,44 @@ def test_every_success_and_refusal_carries_a_req_id():
 
 
 # ── Client-side wire (regression fence) ───────────────────────────
+#
+# 2026-09-14 operator order: two-step "twin preview + Send to real
+# arm" flow retired. Replaced with a single "Orient Flange Down"
+# button that opens a centered confirm modal; Continue POSTs to the
+# same endpoint. Cancel/Escape close with no fetch. The pins below
+# lock the new shape.
 
 FRONTEND_BUTTON = os.path.abspath(os.path.join(
     HERE, '..', 'frontend', 'src', 'components',
     'QuickOrientButtons.jsx'))
 
 
-def test_frontend_button_posts_to_endpoint_when_real_arm_ready():
-    """FaceDownButton must POST to /api/estun/orient/face_down —
-    the endpoint owns the gate matrix, not the button. Client-side
-    gating is a UX hint only (disables the button when
-    realArmReady is false), never a security boundary. Body is
-    q_target ONLY — server-side live_joints is the authority for
-    both the step guard AND the trajectory anchor (client can't
-    influence either)."""
+def test_frontend_button_posts_to_endpoint_via_continue_only():
+    """OrientFlangeDownControl POSTs to /api/estun/orient/face_down
+    ONLY from the modal's Continue handler — the endpoint owns the
+    gate matrix, not the button. Client-side gating is a UX hint
+    only (disables the button when the twin URDF isn't ready),
+    never a security boundary. Body is q_target ONLY — server-side
+    live_joints is the authority for both the step guard AND the
+    trajectory anchor (client can't influence either)."""
     with open(FRONTEND_BUTTON) as fh:
         src = fh.read()
     assert "fetch('/api/estun/orient/face_down'" in src
     assert "method: 'POST'" in src
-    # q_target from the LAST successful twin preview (not a shadow
-    # copy).
-    assert 'q_target: previewedTarget' in src
-    # Retirement: client no longer sends q_current_snapshot. The
-    # server ignored it as of the JTC-safety pass, and the frontend
-    # sending the twin's post-animation joints as "snapshot" caused
-    # every real-arm press to refuse with kind='snapshot_stale'
-    # (silence bug — see 2026-09-09 §NN commit body).
-    # Strip line comments before the guard — the retirement doctrine
-    # is intentionally documented in a block comment above the fetch.
+    # q_target is a freshly-computed IK result from the Continue
+    # handler (not a shadowed preview state — that state retired).
+    assert 'JSON.stringify({ q_target })' in src, (
+        'Continue must POST q_target computed at fire time, not '
+        'a stale preview snapshot.')
+    # Retirement doctrine: client no longer sends q_current_snapshot.
     code_only = re.sub(r'//[^\n]*', '', src)
     assert 'q_current_snapshot' not in code_only, (
         'frontend regressed: q_current_snapshot re-added to the '
         'request body; server would refuse with snapshot_stale')
+    # The retired two-step "previewedTarget" latch is gone.
+    assert 'previewedTarget' not in code_only, (
+        'previewedTarget state resurfaced — the 2026-09-14 '
+        'modal-gated rewrite retired the two-step preview flow.')
 
 
 def test_frontend_uses_state_code_authority():
@@ -410,22 +416,108 @@ def test_frontend_uses_state_code_authority():
     assert "safety.zone === 'GREEN'" in src
 
 
-def test_frontend_confirms_before_first_real_press():
-    """SAFETY framing: FIRST REAL PRESS is the operator's, slow, hand
-    near E-STOP. window.confirm gate keeps a stray tap from
-    commanding motion."""
+def test_frontend_confirm_modal_gates_the_endpoint_fetch():
+    """2026-09-14 operator directive: the ONLY fetch in this file
+    lives inside the onContinue handler; Cancel + Escape close the
+    modal WITHOUT firing the request. Structure guard:
+      * Exactly one fetch site.
+      * The fetch lives inside the async onContinue handler (its
+        lexical block starts before the fetch and closes after).
+      * A separate onCancel handler exists and does NOT call fetch.
+      * Escape key handler wires setModalOpen(false), not fetch.
+    """
     with open(FRONTEND_BUTTON) as fh:
         src = fh.read()
-    assert 'window.confirm' in src
-    assert 'Keep your hand near E-STOP' in src
+
+    # Exactly one fetch call to the face_down endpoint.
+    fetch_hits = re.findall(
+        r"fetch\('/api/estun/orient/face_down'", src)
+    assert len(fetch_hits) == 1, (
+        f'expected exactly one fetch to /api/estun/orient/face_down; '
+        f'got {len(fetch_hits)}. Two fetch sites means Cancel could '
+        f'inadvertently POST — the modal must gate every fire.')
+
+    # onContinue lexical block contains the fetch; onCancel does not.
+    m_cont = re.search(
+        r'const onContinue = async \(\) => \{(.+?)\n  \}',
+        src, re.DOTALL)
+    assert m_cont, 'onContinue handler not found — file structure drifted'
+    cont_body = m_cont.group(1)
+    assert "fetch('/api/estun/orient/face_down'" in cont_body, (
+        'fetch is not inside onContinue — Cancel or the modal '
+        'could bypass the confirm gate.')
+
+    m_cancel = re.search(
+        r'const onCancel = \(\) => \{(.+?)\n  \}',
+        src, re.DOTALL)
+    assert m_cancel, 'onCancel handler not found — file structure drifted'
+    cancel_body = m_cancel.group(1)
+    assert 'fetch(' not in cancel_body, (
+        'onCancel invokes fetch — Cancel must be a pure close, '
+        'no request sent.')
+    assert 'setModalOpen(false)' in cancel_body, (
+        'onCancel must close the modal (setModalOpen(false)).')
+
+    # Escape-key handler closes the modal but does NOT fetch.
+    m_esc = re.search(
+        r"if \(e\.key === 'Escape'.*?\)\s*\{(.+?)\}", src, re.DOTALL)
+    assert m_esc, 'Escape-key handler not found — no-click-through path missing'
+    esc_body = m_esc.group(1)
+    assert 'setModalOpen(false)' in esc_body
+    assert 'fetch(' not in esc_body, (
+        'Escape handler invokes fetch — Escape must be a pure close.')
 
 
-def test_frontend_send_button_only_after_twin_preview():
-    """The "Send to real arm" button only renders after a successful
-    twin preview (previewedTarget != null). Order: preview → observe
-    → deliberate commit. No one-tap real-arm command."""
+def test_frontend_modal_carries_operator_copy_and_testids():
+    """The confirm modal must render the operator-plain title/body
+    from the 2026-09-14 directive, and expose the deterministic
+    test hooks the acceptance test relies on."""
     with open(FRONTEND_BUTTON) as fh:
         src = fh.read()
-    # Real-arm button is guarded by previewedTarget.
-    assert '{previewedTarget && (' in src
-    assert "data-testid=\"face-down-send-real\"" in src
+    # Title + body strings (verbatim from operator order). JSX
+    # splits the body across two lines for readability; the browser
+    # normalises the whitespace so the operator sees a single
+    # sentence. Assert against the whitespace-normalised source so
+    # a source-inspection pin matches the rendered copy.
+    assert 'Orient flange down?' in src
+    body_expected = ('The arm will rotate the flange to point straight '
+                     'down at its current position.')
+    body_normalised = re.sub(r'\s+', ' ', src)
+    assert body_expected in body_normalised, (
+        f'modal body sentence not present verbatim (whitespace-'
+        f'normalised) — operator copy drifted from the directive.')
+    # Test hooks for E2E + this suite.
+    for testid in (
+        'orient-flange-down-button',
+        'orient-flange-down-modal',
+        'orient-flange-down-continue',
+        'orient-flange-down-cancel',
+    ):
+        assert f'data-testid="{testid}"' in src, (
+            f'test hook {testid!r} missing from OrientFlangeDownControl')
+    # No click-through: modal is dismissible via Cancel/Escape only.
+    # Backdrop has no onClick close wiring. Scan the backdrop's
+    # opening-tag attribute block for onClick.
+    m = re.search(
+        r'data-testid="orient-flange-down-backdrop"(.+?)>\s*\n\s*<div',
+        src, re.DOTALL)
+    assert m, 'backdrop element opening-tag block not found'
+    backdrop_attrs = m.group(1)
+    assert 'onClick' not in backdrop_attrs, (
+        'backdrop wires onClick — that would let click-through '
+        'dismiss the modal (operator forbid this).')
+
+
+def test_frontend_send_to_real_arm_button_is_retired():
+    """The retired two-step Send-to-real-arm path must NOT be
+    resurrected. Regression fence for the 2026-09-14 rewrite."""
+    with open(FRONTEND_BUTTON) as fh:
+        src = fh.read()
+    code_only = re.sub(r'//[^\n]*', '', src)
+    assert 'face-down-send-real' not in code_only, (
+        'face-down-send-real testid resurfaced — the two-step '
+        'preview + send flow was retired 2026-09-14.')
+    assert 'Send to real arm' not in code_only, (
+        '"Send to real arm" button copy resurfaced.')
+    assert 'window.confirm' not in code_only, (
+        'window.confirm resurfaced — the modal replaces it.')

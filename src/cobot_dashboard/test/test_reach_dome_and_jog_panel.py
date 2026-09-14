@@ -1,6 +1,6 @@
-"""Reach dome + jog panel cleanup pinned regression (2026-09-08).
+"""Reach dome (2026-09-08) + JointJogPanel retirement (2026-09-14).
 
-Directive:
+Reach-dome directive (2026-09-08 — still authoritative):
   1. Two flat reach rings (floor + head-height loops in
      ReachCylinder) replaced by a single hemisphere at the S10-140
      real kinematic reach (1.4 m per SR 1400 in the manual).
@@ -10,14 +10,16 @@ Directive:
      corner view-switcher; default ON; persists per device via
      useStore.reachDomeShown + zustand persist partialize.
   4. Old two-ring rendering entirely retired.
-  5. JointJogPanel retires:
-       a. "Reset all → 0°" button
-       b. "Home" button in the panel header
-       c. Quick Orient row (label + Face Down/Side/Up)
-       d. TCP (TWIN FRAME) readout box
-       e. JogSpeedSlider — unified to jog surface's `jogSpeedPct`
-          store slot (audited pre-removal; single source of truth).
-     Kept: Cartesian mode checkbox + six joint sliders.
+
+JointJogPanel retirement (2026-09-14 operator order):
+  * The whole panel — J1..J6 sliders, PREVIEWING banner,
+    Cartesian-mode checkbox, Send-to-real-arm — was retired from
+    the 3D View. The file itself was deleted (no other mount
+    survived; see the mount survey in the session report).
+  * The panel-body pins that used to live in this file (5a-5e +
+    Cartesian toggle) are RETIRED. The retirement itself is now
+    pinned by test_face_down.test_joint_jog_panel_is_retired_from_
+    the_repo. This file keeps only the reach-dome tests.
 """
 
 from __future__ import annotations
@@ -31,8 +33,6 @@ COLLISION = os.path.abspath(os.path.join(
     HERE, '..', 'frontend', 'src', 'components', 'CollisionOverlay.jsx'))
 VIEWER = os.path.abspath(os.path.join(
     HERE, '..', 'frontend', 'src', 'components', 'ArmViewer3D.jsx'))
-PANEL = os.path.abspath(os.path.join(
-    HERE, '..', 'frontend', 'src', 'components', 'JointJogPanel.jsx'))
 STORE = os.path.abspath(os.path.join(
     HERE, '..', 'frontend', 'src', 'store', 'useStore.js'))
 
@@ -110,79 +110,14 @@ def test_toggle_checkbox_lives_next_to_view_switcher_in_viewer():
     assert 'showReachDome={reachDomeShown}' in src
 
 
-def test_jog_panel_reset_and_home_buttons_retired():
-    """5a + 5b: Reset all / Home buttons retired from the panel
-    render. Comments in the retirement block may reference them
-    (block-comment stripped for this assertion)."""
-    src = _read(PANEL)
-    code = _strip_line_comments(re.sub(r'\{/\*.*?\*/\}', '', src,
-                                        flags=re.DOTALL))
-    code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
-    assert 'Reset all → 0°' not in code
-    assert 'onClick={() => onHome?.()}' not in code
-    assert 'onReset' not in code, \
-        'onReset handler must be retired'
-
-
-def test_quick_orient_row_label_and_side_up_retired():
-    """5c amended 2026-09-08: Face Down retained; row label,
-    Face Side, Face Up retired. The old `QuickOrientButtons`
-    render as a three-button row is gone — the module now exports
-    a single `FaceDownButton` (default export) with no row label
-    around it. Panel renders <FaceDownButton /> directly."""
-    src = _read(PANEL)
-    code = _strip_line_comments(re.sub(r'\{/\*.*?\*/\}', '', src,
-                                        flags=re.DOTALL))
-    code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
-    # Face Down IS rendered.
-    assert '<FaceDownButton' in code
-    # The retired trio names should not appear in code.
-    assert 'Face Side' not in code
-    assert 'Face Up' not in code
-    # Row-label copy from the old QuickOrient trio ("Quick orient
-    # (twin only)") is gone.
-    assert 'Quick orient' not in code
-
-
-def test_tcp_twin_frame_readout_retired():
-    """5d: TCP (twin frame) box + TcpCell helper + FK matrix
-    computation retired. THREE import no longer needed."""
-    src = _read(PANEL)
-    code = _strip_line_comments(re.sub(r'\{/\*.*?\*/\}', '', src,
-                                        flags=re.DOTALL))
-    code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
-    assert 'TCP (TWIN FRAME)' not in code
-    assert 'function TcpCell(' not in code
-    assert "import * as THREE from 'three'" not in code, \
-        'three import retired with the FK matrix computation'
-
-
-def test_jog_speed_slider_retired_and_unified_to_jog_surface():
-    """5e: JogSpeedSlider retired from JointJogPanel. Pre-removal
-    audit locked in the invariant that both the panel slider AND
-    the jog surface's control write to the SAME store slot
-    (`jogSpeedPct`) — this test asserts the panel no longer reads
-    it (the jog surface, JogControls.jsx, is the ONE authority)."""
-    src = _read(PANEL)
-    code = _strip_line_comments(re.sub(r'\{/\*.*?\*/\}', '', src,
-                                        flags=re.DOTALL))
-    code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
-    assert 'JogSpeedSlider' not in code, \
-        'JogSpeedSlider must be retired from JointJogPanel'
-    # And the jog surface (JogControls.jsx) still reads jogSpeedPct.
+def test_jog_speed_slider_authority_still_on_the_jog_surface():
+    """Post-JointJogPanel-retirement, the jog surface (JogControls.jsx)
+    remains the ONE authority for jog-speed. Pre-2026-09-14 audit
+    locked in the invariant that both the panel slider AND the jog
+    surface's control wrote to the SAME store slot; with the panel
+    gone the jog surface is the only writer AND reader. This
+    regression fence keeps the jog-surface reads intact."""
     jc = _read(os.path.abspath(os.path.join(
         HERE, '..', 'frontend', 'src', 'components', 'JogControls.jsx')))
     assert 'useStore((s) => s.jogSpeedPct)' in jc
     assert 'useStore((s) => s.setJogSpeedPct)' in jc
-
-
-def test_cartesian_toggle_and_sliders_kept():
-    """The panel keeps ONLY: Cartesian mode checkbox + six joint
-    sliders. Regression fence."""
-    src = _read(PANEL)
-    # Cartesian toggle wired.
-    assert 'checked={cartesianMode}' in src
-    assert 'Cartesian mode' in src
-    # Joint slider loop over the six-joint META still there.
-    assert 'JOINT_META.map(' in src
-    assert 'type="range"' in src

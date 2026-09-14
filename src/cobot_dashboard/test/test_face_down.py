@@ -1,23 +1,31 @@
-"""Face Down button pinned regression (2026-09-08 amendment).
+"""Orient Flange Down (formerly Face Down) button pinned regression.
 
-Directive:
-  1. TCP-preserving: same xyz position + tool-down orientation
-     (flange -Z aligned with world -Y in the scene's Y-up
-     convention). TCP drift tolerance < 1 mm.
-  2. Slow by design: fixed orient rate ≤ 10°/s, NOT tied to
-     jog speed.
-  3. Twin: always available. Real arm: same enabled/manual-jog
-     context, same E-STOP / interlock paths, press-and-observe.
-     (Twin path lands in this commit; real-arm coordinated
-     orient needs a new backend endpoint — flagged.)
-  4. Refusal by name on unreachable pose (2026-09-14 operator order —
-     plain-copy rewrite):
-       "Too far from flat for an automatic move. Jog the flange closer
-        to flat, then press Face Down again."
-     Never approximate by moving the TCP. The operator-facing string
-     carries NO joint/degree/IK/step/budget/limit jargon; the
-     server's reason_code + max_step_deg diagnostic detail is
-     preserved on the wire, only the rendered string changed.
+Directive lineage:
+  * 2026-09-08 — Face Down retained as a TCP-preserving twin preset
+    inside JointJogPanel with a companion "Send to real arm" step.
+  * 2026-09-14 — JointJogPanel retired from the 3D View entirely.
+    The button becomes the ONLY orient control, renamed "Orient
+    Flange Down", and a centered confirm modal gates every real-arm
+    fire. Cancel/Escape close with no motion.
+
+Contract this suite pins:
+  1. TCP-preserving: same xyz position + tool-down orientation,
+     computed via the shared orient lib (readToolWorldPose →
+     orientApproachTo → solveIKToPose). TCP drift budget < 1 mm.
+  2. Modal-gated real-arm fire: Continue POSTs to
+     /api/estun/orient/face_down; Cancel closes without fetch;
+     Escape closes without fetch. NO click-through backdrop
+     dismissal (per operator order).
+  3. Refusal by name (2026-09-14 operator order — plain-copy
+     rewrite): the too-far-from-flat refusal (client IK or server
+     step_too_large) renders:
+       "Too far from flat for an automatic move. Jog the flange
+        closer to flat, then press Orient Flange Down again."
+     No joint / degree / IK / step / budget / limit jargon.
+  4. Interlock check on the client is a UX hint; server owns the
+     authoritative gate matrix (same E-STOP / zone-GREEN /
+     connected / enabled / !alarm / allow_jog / no program running
+     conditions as every real jog motion).
 """
 
 from __future__ import annotations
@@ -30,10 +38,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BUTTON = os.path.abspath(os.path.join(
     HERE, '..', 'frontend', 'src', 'components',
     'QuickOrientButtons.jsx'))
-PANEL = os.path.abspath(os.path.join(
-    HERE, '..', 'frontend', 'src', 'components', 'JointJogPanel.jsx'))
+LAYOUT = os.path.abspath(os.path.join(
+    HERE, '..', 'frontend', 'src', 'layouts', 'View3DLayout.jsx'))
 LIB = os.path.abspath(os.path.join(
     HERE, '..', 'frontend', 'src', 'lib', 'orient.js'))
+RETIRED_PANEL = os.path.abspath(os.path.join(
+    HERE, '..', 'frontend', 'src', 'components', 'JointJogPanel.jsx'))
 
 
 def _read(path):
@@ -41,37 +51,49 @@ def _read(path):
         return fh.read()
 
 
-def test_only_face_down_survives():
-    """Face Side + Face Up + row label all retired from the
-    button module; Face Down is the ONLY orient control. Strip
-    line comments first — retirement notes reference the names
-    intentionally so future readers can see what was removed."""
+def test_joint_jog_panel_is_retired_from_the_repo():
+    """2026-09-14 operator order: the whole panel goes away. This
+    session removes it from the 3D View AND deletes the file
+    (no other mount survived — see the mount survey in the
+    session report). If a later session needs the sliders back,
+    they can live in a fresh component; do NOT resurrect this
+    file without a paired operator directive."""
+    assert not os.path.exists(RETIRED_PANEL), (
+        'JointJogPanel.jsx still exists — the 2026-09-14 retirement '
+        'was reverted or the file was resurrected. See test_face_down.py '
+        'docstring for the operator order.')
+
+
+def test_only_orient_flange_down_survives():
+    """QuickOrientButtons.jsx exports ONE default: the modal-gated
+    orient control. The retired trio names (Face Side / Face Up)
+    must not appear in executable code; retirement notes in line
+    comments are allowed."""
     src = _read(BUTTON)
     code = '\n'.join(
         line for line in src.splitlines()
         if not line.lstrip().startswith('//'))
-    # Face Down copy present in code.
-    assert 'Face Down' in code
-    # Face Side / Face Up presets gone from executable code.
+    # New button copy is present in executable code.
+    assert 'Orient Flange Down' in code
+    # Retired presets gone from executable code.
     assert 'Face Side' not in code
     assert 'Face Up' not in code
-    # No PRESETS array (the old trio driver).
     assert 'const PRESETS' not in code
-    # Default export renamed FaceDownButton.
-    assert 'export default function FaceDownButton(' in code
+    # Default export is the new modal-gated control.
+    assert 'export default function OrientFlangeDownControl(' in code
 
 
 def test_tcp_preserving_with_named_refusal():
-    """The IK path computes solveIKToPose at the SAME currentPos
-    + a target orientation. If solveIKToPose returns nothing OR
-    the achieved TCP position drifts more than TCP_DRIFT_TOL_M
-    (1 mm), the button refuses with the exact plain-text copy —
-    it does NOT approximate by moving the TCP.
+    """The IK path computes solveIKToPose at the SAME currentPos +
+    a target orientation. If solveIKToPose returns nothing OR the
+    achieved TCP position drifts more than TCP_DRIFT_TOL_M (1 mm),
+    the button refuses with the exact plain-text copy — it does
+    NOT approximate by moving the TCP.
 
-    2026-09-14 operator order: the twin-preview refusal shares the
-    step_too_large plain copy — the too-tilted situation is the same
-    class from the operator's point of view. No "tool point" / "pose"
-    jargon in the rendered string."""
+    2026-09-14 operator order: the refusal shares the
+    step_too_large plain copy — the too-tilted situation is the
+    same class from the operator's point of view. No "tool point"
+    / "pose" jargon in the rendered string."""
     src = _read(BUTTON)
     # Tolerance constant matches directive item 1.
     assert 'const TCP_DRIFT_TOL_M = 0.001' in src
@@ -79,42 +101,38 @@ def test_tcp_preserving_with_named_refusal():
     # 2026-09-14 operator order (verbatim, single source of truth).
     refusal = ("Too far from flat for an automatic move. "
                "Jog the flange closer to flat, then press "
-               "Face Down again.")
+               "Orient Flange Down again.")
     assert refusal in src
     # Solve site passes currentPos (not a translated position).
     assert 'solveIKToPose(armRobot, tool, currentPos, targetQuat)' in src
-    # Achieved-error gate: posErr > TCP_DRIFT_TOL_M → refuse.
-    assert 'if (posErr > TCP_DRIFT_TOL_M) {' in src
 
 
 def test_step_too_large_operator_copy_is_plain_2026_09_14():
-    """2026-09-14 operator order: the step_too_large OP_COPY entry
-    must render exactly the plain-copy string — no joint-jargon, no
-    degrees, no IK/step/budget/limit. The server's reason_code +
-    max_step_deg detail stays on the wire (see
+    """2026-09-14 operator order: the step_too_large REFUSAL_COPY
+    entry must render exactly the plain-copy string — no joint-
+    jargon, no degrees, no IK / step / budget / limit. Server-side
+    reason_code + max_step_deg detail stays on the wire (see
     test_face_down_real_arm_endpoint.test_gate_step_too_large and
     the _refuse_face_down 'extra' pin); only the operator-facing
     string is plain. Same rendered copy in BASIC and FULL editions
     (QuickOrientButtons.jsx reads no isFeatureEnabled / s.edition
     slice)."""
     src = _read(BUTTON)
-    expected = ('step_too_large:     '
+    expected = ('step_too_large:      '
                 '"Too far from flat for an automatic move. '
                 'Jog the flange closer to flat, then press '
-                'Face Down again."')
+                'Orient Flange Down again."')
     assert expected in src, (
         'step_too_large operator string drifted from the '
-        '2026-09-14 order — the OP_COPY entry must be the exact '
-        'plain-copy sentence.')
+        '2026-09-14 order — the REFUSAL_COPY entry must be the '
+        'exact plain-copy sentence.')
 
-    # The OP_COPY slice must carry the new string too, so the check
-    # above proves both the entry AND the rendered path. Now the
-    # banned-jargon fence: scan the OP_COPY step_too_large VALUE
-    # (the JS string literal on the same line) for the forbidden
-    # tokens per the 2026-09-14 order.
+    # Scan the REFUSAL_COPY step_too_large VALUE (the JS string
+    # literal on the same line) for forbidden tokens per the
+    # 2026-09-14 operator order.
     m = re.search(
         r'step_too_large:\s*"([^"]+)"', src)
-    assert m, 'step_too_large OP_COPY entry not found in QuickOrientButtons'
+    assert m, 'step_too_large REFUSAL_COPY entry not found'
     op_string = m.group(1)
     banned = ('joint', 'deg', '°', 'ik', 'step', 'budget', 'limit')
     lowered = op_string.lower()
@@ -122,61 +140,94 @@ def test_step_too_large_operator_copy_is_plain_2026_09_14():
         assert token not in lowered, (
             f'step_too_large operator string contains banned '
             f'jargon {token!r} (per 2026-09-14 operator order — '
-            f'no joints/deg/IK/step/budget/limit in operator copy).'
-            f' Got: {op_string!r}')
+            f'no joints/deg/IK/step/budget/limit in operator '
+            f'copy). Got: {op_string!r}')
 
-    # Regression fence — the pre-order string must be gone.
+    # Regression fence — pre-order strings must be gone.
     assert 'swing joints too far' not in src, (
-        'legacy joint-jargon step_too_large copy still present — '
-        'the 2026-09-14 operator order was reverted.')
+        'legacy joint-jargon step_too_large copy still present.')
+
+    # The ik_unreachable client-side refusal shares the same
+    # plain-copy sentence (same operator situation).
+    m2 = re.search(
+        r'ik_unreachable:\s*"([^"]+)"', src)
+    assert m2, 'ik_unreachable REFUSAL_COPY entry missing'
+    ik_string = m2.group(1)
+    lowered2 = ik_string.lower()
+    for token in banned:
+        assert token not in lowered2, (
+            f'ik_unreachable operator string contains banned '
+            f'jargon {token!r}. Got: {ik_string!r}')
 
 
-def test_slow_fixed_rate_not_jog_speed():
-    """Duration is angular_distance / ORIENT_RATE_RAD_PER_S,
-    NOT tied to jogSpeedPct. Rate cap = 10°/s per directive."""
+def test_no_client_side_animation_rate_cap():
+    """2026-09-14 operator order: no twin preview on Continue. The
+    server enforces the 10°/s rate cap by computing duration_ms
+    from the max per-joint delta. Client-side animation constants
+    (ORIENT_RATE_RAD_PER_S, MIN_DURATION_MS, MAX_DURATION_MS) and
+    the runJointAnimation call are all retired from this control."""
     src = _read(BUTTON)
-    # Rate constant present.
-    assert '(10 * Math.PI) / 180' in src
-    assert 'ORIENT_RATE_RAD_PER_S' in src
-    # angle-between helper is what drives duration.
-    assert 'angleBetweenQuats(currentQuat, targetQuat)' in src
-    # jogSpeedPct is NOT read by this button (that would tie the
-    # orient rate to jog speed).
-    assert "useStore((s) => s.jogSpeedPct)" not in src
-    assert 'durationForJogSpeed' not in src
+    # No pre-fire twin animation.
+    assert 'runJointAnimation' not in src, (
+        'twin runJointAnimation reappeared — Continue must fire '
+        'the real arm directly, WS mirror updates the twin.')
+    # No client-side rate cap (server owns it).
+    assert 'ORIENT_RATE_RAD_PER_S' not in src, (
+        'client rate-cap constant reappeared — the server enforces '
+        'the 10°/s cap by computing duration_ms.')
+    assert 'angleBetweenQuats' not in src, (
+        'client angle-between helper reappeared — no client-side '
+        'animation math should remain.')
 
 
-def test_real_arm_interlock_is_computed_even_if_action_is_deferred():
-    """Directive item 3: real-arm gating on enabled + allow_jog +
-    !estop + !alarm. This commit lands twin-only (real-arm
-    coordinated orient endpoint pending); the interlock check is
-    still wired so a future real-arm hookup only needs to add the
-    publish path — not repeat the gate."""
+def test_real_arm_interlock_reads_state_code_authority():
+    """FACTS.md: state_code==2 is the authoritative ENABLED signal.
+    Boolean `enabled` is a legacy fallback only. Same shape the
+    retired two-step control used — verifies the interlock derivation
+    survives the modal rewrite."""
     src = _read(BUTTON)
     # Store reads for the interlock fields.
     assert 'useStore((s) => s.robot)' in src
     assert 'useStore((s) => s.safety)' in src
-    # And the gate expression matches the same class JogControls
-    # bannerLevel keys off: enabled + allow_jog + !estop + !alarm.
+    # And the gate expression reads the four-tuple + auxiliaries.
     assert 'robot.connected' in src
-    assert 'robot.enabled' in src
+    assert 'robot.state_code === 2' in src
     assert 'robot.allow_jog' in src
     assert 'safety.estop' in src
     assert 'robot.alarm' in src
+    assert "safety.zone === 'GREEN'" in src
 
 
-def test_panel_mounts_face_down_button():
-    """JointJogPanel imports the module's default (`FaceDownButton`)
-    and renders it directly — no row label around it."""
-    src = _read(PANEL)
-    assert "import FaceDownButton from './QuickOrientButtons'" in src
-    assert '<FaceDownButton jogApi={jogApi} onAtLimit={onAtLimit} />' in src
+def test_layout_mounts_orient_control_and_not_the_retired_panel():
+    """The 3D View layout renders the modal-gated
+    OrientFlangeDownControl exactly ONCE and does NOT import or
+    render the retired JointJogPanel. If a future edit resurrects
+    the panel on this page, this pin trips. Retirement-note
+    comments naming the panel are allowed — the guard scans only
+    executable code."""
+    src = _read(LAYOUT)
+    # Import of the new control (source module preserved as
+    # QuickOrientButtons for git history; alias handled at import).
+    assert re.search(
+        r"import OrientFlangeDownControl from '\.\./components/"
+        r"QuickOrientButtons'",
+        src), 'OrientFlangeDownControl import missing from View3DLayout'
+    # Renders the new control.
+    assert '<OrientFlangeDownControl' in src
+    # Retired panel absent from executable code (strip line + block
+    # comments — retirement notes intentionally mention the name).
+    code = re.sub(r'//[^\n]*', '', src)
+    code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
+    code = re.sub(r'\{/\*.*?\*/\}', '', code, flags=re.DOTALL)
+    assert 'JointJogPanel' not in code, (
+        'JointJogPanel resurrected in View3DLayout executable code '
+        '— the 2026-09-14 retirement was reverted.')
 
 
 def test_orient_lib_still_exports_solve_and_measure():
     """Regression fence: the shared orient lib still exports the
-    functions Face Down consumes. Prevents a future edit from
-    removing them without noticing this consumer."""
+    functions the modal-gated control consumes. Prevents a future
+    edit from removing them without noticing this consumer."""
     src = _read(LIB)
     for fn in ('resolveTool', 'readToolWorldPose', 'readApproachWorld',
                'orientApproachTo', 'solveIKToPose',

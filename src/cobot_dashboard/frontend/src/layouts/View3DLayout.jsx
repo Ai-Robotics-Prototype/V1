@@ -2,21 +2,28 @@ import { useRef, useState } from 'react'
 import { useStore } from '../store/useStore'
 import ArmViewer3D from '../components/ArmViewer3D'
 import StandaloneRobot from '../components/StandaloneRobot'
-import JointJogPanel from '../components/JointJogPanel'
+import OrientFlangeDownControl from '../components/QuickOrientButtons'
 import JogControls from '../components/JogControls'
-import IKGizmo from '../components/IKGizmo'
 import ArmEnableControl from '../components/ArmEnableControl'
 import JogReadyBadge from '../components/JogReadyBadge'
 // 2026-09-08 operator directive: MODE • MANUAL chip + its confirm
 // dialog RETIRED. Mode switching from the UI is gone; operators
 // route mode via the physical pendant selector. Backend endpoint
 // (POST /api/estun/mode) stays live for CRI / driver internal use.
+//
+// 2026-09-14 operator directive: JointJogPanel (right-dock J1..J6
+// sliders + PREVIEWING banner + Cartesian mode checkbox +
+// Send-to-real-arm button) and IKGizmo (Cartesian-drag twin IK,
+// only ever activated by that checkbox) RETIRED from the 3D View.
+// Replaced by a single "Orient Flange Down" button in the top-right
+// corner region — clicking it opens a confirm modal; Continue fires
+// the SAME guarded /api/estun/orient/face_down endpoint.
 
-// The 3D View tab hosts three separate jog surfaces:
-//   • JointJogPanel  (right-dock sliders, TWIN ONLY)  — no wire traffic.
-//   • JogControls    (bottom dock, REAL ARM)          — hold-to-jog via
-//                                                        /cmd/jog → driver.
-//   • IKGizmo        (cartesian drag when cartMode)    — twin-only IK.
+// The 3D View tab now hosts two jog surfaces:
+//   • OrientFlangeDownControl (top-right, TWIN + REAL) — modal-gated,
+//                                                        one-tap orient.
+//   • JogControls             (bottom dock, REAL ARM)  — hold-to-jog
+//                                                        via /cmd/jog.
 //
 // The REAL ARM panel is the same component the Program tab renders —
 // one source of truth. Its three-state visibility (MINIMIZED / NORMAL /
@@ -185,9 +192,6 @@ function RealArmMinimizedPill({ setMode }) {
 export default function View3DLayout() {
   const armRef = useRef(null)
   const [jogApi, setJogApi] = useState(null)
-  const [cartMode, setCartMode]     = useState(false)
-  const [gizmoMode, setGizmoMode]   = useState('translate')
-  const [ikAtLimit, setIkAtLimit] = useState(false)
 
   const view3dJogPanel   = useStore((s) => s.view3dJogPanel)
   const setView3dJogPanel = useStore((s) => s.setView3dJogPanel)
@@ -212,49 +216,13 @@ export default function View3DLayout() {
           <div style={{ flex: 1, position: 'relative', minHeight: 0 }}>
             <ArmViewer3D ref={armRef} noRobot>
               <StandaloneRobot onRobotReady={setJogApi} />
-              {cartMode && (
-                <IKGizmo
-                  jogApi={jogApi}
-                  enabled
-                  mode={gizmoMode}
-                  onDragChange={(d) => {
-                    armRef.current?.setOrbitEnabled?.(!d)
-                    if (!d) setIkAtLimit(false)
-                  }}
-                  onTargetPose={(p) => {
-                    if (!!p.atLimit !== ikAtLimit) setIkAtLimit(!!p.atLimit)
-                  }}
-                />
-              )}
+              {/* 2026-09-14 operator directive: IKGizmo (Cartesian-drag
+                  twin IK) retired along with the JointJogPanel that
+                  hosted its checkbox. No twin-only motion path
+                  remains on this page. */}
             </ArmViewer3D>
-            {cartMode && ikAtLimit && (
-              <div style={{
-                // JointJogPanel occupies the top-right corner (top:8
-                // right:8 width:300 zIndex:11). Drop the AT-LIMIT chip
-                // beneath the panel so it doesn't collide with the
-                // panel's header at tablet widths where the panel
-                // reaches the top edge.
-                position: 'absolute', top: 8, right: 316, zIndex: 20,
-                padding: '4px 10px', borderRadius: 4,
-                background: '#DC2626', color: '#fff',
-                fontSize: 12, fontFamily: 'var(--font-mono, monospace)',
-                fontWeight: 700, letterSpacing: 0.6,
-                boxShadow: '0 1px 4px rgba(0,0,0,0.35)',
-                pointerEvents: 'none',
-              }}>
-                AT LIMIT
-              </div>
-            )}
             <MinClearanceReadout />
-            <JointJogPanel
-              jogApi={jogApi}
-              cartesianMode={cartMode}
-              onCartesianModeChange={setCartMode}
-              gizmoMode={gizmoMode}
-              onGizmoModeChange={setGizmoMode}
-              onHome={() => jogApi?.home?.()}
-              onAtLimit={(atLimit) => setIkAtLimit(!!atLimit)}
-            />
+            <OrientFlangeDownControl jogApi={jogApi} />
             {isMinimized && <RealArmMinimizedPill setMode={setView3dJogPanel} />}
           </div>
         )}

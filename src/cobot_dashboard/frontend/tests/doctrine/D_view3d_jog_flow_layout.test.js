@@ -109,36 +109,25 @@ test('flow(c): JogControls LEFT column anchors to the top (not center)', () => {
 
 test('flow(d): no two absolute overlays share the same top-left anchor', () => {
   // The 3D-twin container (`<div style={{ flex: 1, position: 'relative' }}>`
-  // in View3DLayout, inside `!isExpanded`) hosts these absolute overlays:
-  //   * AT-LIMIT chip  (top:8 right:316) — offset LEFT of JointJogPanel
+  // in View3DLayout, inside `!isExpanded`) hosts these absolute overlays
+  // AFTER the 2026-09-14 JointJogPanel retirement:
+  //   * OrientFlangeDownControl (top:8 right:8) — modal-gated button,
+  //                              its wrap owns the top-right corner
   //   * MinClearanceReadout (top:44 left:8) — offset BELOW view-switcher
-  //   * JointJogPanel  (top:8 right:8) — top-right dock
   //   * RealArmMinimizedPill (bottom:12 right:12) — pill (MINIMIZED only)
   // Plus the corner view-switcher inside ArmViewer3D (top:8 left:8).
   //
-  // The invariant this test pins: no two overlays inside the 3D twin
-  // container share the same (edge_x, edge_y) pair with both offsets
-  // equal to 8 (i.e., "same corner, no offset"). The AT-LIMIT chip and
-  // MinClearanceReadout were both anchored top:8, right:8 / left:8 before
-  // this fix.
+  // AT-LIMIT chip retired 2026-09-14 (was gated on Cartesian mode
+  // which no longer has a toggle). MinClearanceReadout still lives
+  // at top:44 left:8; the pin below preserves that placement.
 
   const layout = readSrc('layouts/View3DLayout.jsx')
 
-  // AT-LIMIT: pinned to top:8 right:316 (offset left of JointJogPanel).
-  // Strip line-comments so an explanatory `right:8` in a comment does
-  // not shadow the actual style property value.
-  const stripComments = (s) => s.replace(/\/\/[^\n]*/g, '')
-  const atLimitIdx = layout.indexOf('AT LIMIT')
-  assert.notEqual(atLimitIdx, -1, v('AT-LIMIT chip block not found'))
-  const atLimitStyleOpen = layout.lastIndexOf('style={{', atLimitIdx)
-  const atLimitStyleClose = layout.indexOf('}}', atLimitStyleOpen)
-  const atLimitBlock = stripComments(
-    layout.slice(atLimitStyleOpen, atLimitStyleClose))
-  assert.match(atLimitBlock, /right:\s*316/,
-    v('AT-LIMIT chip must be offset right:316 to clear the 300-wide '
-      + 'JointJogPanel that occupies the top-right corner'))
-  assert.doesNotMatch(atLimitBlock, /right:\s*8\b/,
-    v('AT-LIMIT chip regressed to right:8 — collides with JointJogPanel'))
+  // AT-LIMIT chip must be gone from the layout — the Cartesian-mode
+  // check that gated its render is retired.
+  assert.doesNotMatch(layout, /AT LIMIT/,
+    v('AT-LIMIT chip resurfaced in View3DLayout — it was retired '
+      + 'with the JointJogPanel Cartesian-mode toggle on 2026-09-14'))
 
   // MinClearanceReadout: pinned to top:44 left:8 (below view-switcher).
   const clrIdx = layout.indexOf('function MinClearanceReadout')
@@ -151,5 +140,5 @@ test('flow(d): no two absolute overlays share the same top-left anchor', () => {
       + 'view-switcher (Front/Side/Top/Iso + reach-dome) at top:8 left:8'))
   assert.match(clrPos[0], /left:\s*8/,
     v('MinClearanceReadout should stay left-aligned to keep the chip out '
-      + 'of the JointJogPanel column on the right side'))
+      + 'of the OrientFlangeDownControl column on the right side'))
 })
