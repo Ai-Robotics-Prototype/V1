@@ -56,7 +56,8 @@ from estun_driver.estun_driver_node import (
     EstunCodroidDriver, ESCAPE_TIE_EPS, SingularityGuard)
 
 
-def _fake_driver(sigma_at_start, escape_dsigma=-1e-3, baseline=0.15):
+def _fake_driver(sigma_at_start, escape_dsigma=-1e-3, baseline=0.15,
+                 sigma_wall=0.035):
     """Cart-start scenario fixture. sigma_at_start pins the σ_min the
     SingularityGuard returns; escape_dsigma pins the direction-aware
     lookahead score. Negative = approach, positive = escape."""
@@ -65,6 +66,7 @@ def _fake_driver(sigma_at_start, escape_dsigma=-1e-3, baseline=0.15):
     fake._joint_rad = [0.0] * 6
     fake._last_posture_ts = 1.0
     fake._cart_sigma_soft = 0.06
+    fake._cart_sigma_wall = sigma_wall
     fake._cart_sigma_hard = 0.02
     fake._baseline_speed_frac = baseline
 
@@ -82,66 +84,137 @@ def _fake_driver(sigma_at_start, escape_dsigma=-1e-3, baseline=0.15):
     return fake
 
 
-# ── (1) σ ≤ hard + APPROACH → refuse ──────────────────────────────
+# ── (1) σ ≤ wall + APPROACH → refuse ──────────────────────────────
 
-def test_cart_start_refuses_below_hard_on_approach():
-    """The incident case: σ already at/below 0.020 at press time,
-    commanded direction is APPROACH → refuse with named reason
-    code before the first Robot/jog frame goes on the wire."""
-    fake = _fake_driver(sigma_at_start=0.015, escape_dsigma=-1e-3)
+def test_cart_start_refuses_below_wall_on_approach():
+    """2026-09-14 §2: σ ≤ σ_wall (0.035) on APPROACH → REFUSE with
+    reason_code='sing_wall'. Approach never gets a scaled crawl
+    below the wall — the anti-creep invariant."""
+    fake = _fake_driver(sigma_at_start=0.030, escape_dsigma=-1e-3)
     speed_out, refusal = fake._cart_start_sing_clamp(
         axis=3, direction=+1, signed_speed=+0.21)
     assert refusal is not None, (
-        'σ=0.015 ≤ hard on APPROACH must refuse; guard let the fresh '
-        'frame through — the incident class is open again.')
-    assert refusal['reason_code'] == 'sing_start_clamp'
+        'σ=0.030 ≤ wall on APPROACH must refuse; guard let the '
+        'fresh frame through — the creep-in-by-repeated-presses '
+        'class is open again.')
+    assert refusal['reason_code'] == 'sing_wall'
+    assert refusal['sigma_min'] == pytest.approx(0.030)
+    assert refusal['sigma_wall'] == pytest.approx(0.035)
+    # Plain operator copy per Sep-14 directive item 4 — no σ, no
+    # jargon, no "joint jog" instruction (HUD keeps the escape hint).
+    assert refusal['reason'] == (
+        'Arm is at its reach limit. Jog back toward the workspace '
+        'to continue.')
+
+
+def test_cart_start_refuses_below_hard_on_approach():
+    """Deep interior of the wall zone: σ ≤ σ_hard on APPROACH also
+    refuses with sing_wall (same class). Kept as a separate pin so
+    a future retune of σ_wall doesn't quietly re-open the below-
+    hard path."""
+    fake = _fake_driver(sigma_at_start=0.015, escape_dsigma=-1e-3)
+    speed_out, refusal = fake._cart_start_sing_clamp(
+        axis=3, direction=+1, signed_speed=+0.21)
+    assert refusal is not None
+    assert refusal['reason_code'] == 'sing_wall'
     assert refusal['sigma_min'] == pytest.approx(0.015)
-    assert refusal['sigma_hard'] == pytest.approx(0.02)
-    # Reason string is operator-facing on the wire → must name the
-    # remedy plainly (joint jog / reverse this axis).
-    assert 'joint jog' in refusal['reason'].lower()
-    assert 'reverse this axis' in refusal['reason'].lower()
 
 
-# ── (2) σ ≤ hard + ESCAPE → full speed permit ─────────────────────
+# ── (2) σ ≤ wall + ESCAPE → full speed permit ─────────────────────
 
-def test_cart_start_permits_escape_below_hard():
+def test_cart_start_permits_escape_below_wall():
     """Freedom guarantee: jogging AWAY from a near-singular pose is
-    ALWAYS permitted, even at σ ≤ hard. Otherwise the operator has
-    no way out of the manifold except joint jog + full recovery."""
+    ALWAYS permitted, even at σ ≤ wall AND σ ≤ hard. Escape
+    direction is the ONLY way out of the manifold; refusing it
+    strands the operator."""
     fake = _fake_driver(sigma_at_start=0.010, escape_dsigma=+1e-3)
     speed_out, refusal = fake._cart_start_sing_clamp(
         axis=3, direction=-1, signed_speed=-0.21)
     assert refusal is None, (
-        'escape_score positive at σ ≤ hard must pass full-speed '
+        'escape_score positive at σ ≤ wall must pass full-speed '
         '(jog-away always permitted) — refusal breaks the freedom '
         'guarantee (see doctrine at estun_driver_node.py:209).')
     assert speed_out == pytest.approx(-0.21), (
         'escape direction must NOT be scaled')
 
 
-# ── (3) σ_hard < σ ≤ σ_soft AND APPROACH → scale down ─────────────
+def test_cart_start_permits_escape_at_incident_pose():
+    """Incident replay: σ=0.023 (the approach transient in the
+    Sep-14 log ~85 ms pre-alarm). Approach at 21% MUST refuse now.
+    Escape at 21% MUST permit full speed."""
+    fake = _fake_driver(sigma_at_start=0.023, escape_dsigma=-1e-3)
+    speed_out, refusal = fake._cart_start_sing_clamp(
+        axis=3, direction=+1, signed_speed=+0.21)
+    assert refusal is not None
+    assert refusal['reason_code'] == 'sing_wall', (
+        'incident-pose σ=0.023 approach press must refuse; the '
+        'Sep-14 creep symptom (repeat-press crawl deeper) is the '
+        'class this pin guards against')
 
-def test_cart_start_scales_in_soft_band_on_approach():
-    """σ in the soft ramp band with APPROACH → initial frame ships
-    at the SAME cap the supervise tick would apply (no ~50 ms window
-    of uncapped commanded speed). Scale uses SingularityGuard.scale
-    with the DYNAMIC soft threshold, mirroring the supervise tick."""
-    # σ_min=0.030, σ_soft(base)=0.06, σ_hard=0.02. speed_frac=0.21
-    # → dyn_soft = 0.06 * max(1, 0.21/0.15) = 0.084. Scale
-    # = (0.030 - 0.02) / (0.084 - 0.02) = 0.010/0.064 = 0.15625.
-    fake = _fake_driver(sigma_at_start=0.030, escape_dsigma=-1e-3,
+    # Same pose, escape direction.
+    fake2 = _fake_driver(sigma_at_start=0.023, escape_dsigma=+1e-3)
+    speed_out, refusal = fake2._cart_start_sing_clamp(
+        axis=3, direction=-1, signed_speed=-0.21)
+    assert refusal is None
+    assert speed_out == pytest.approx(-0.21)
+
+
+# ── Anti-creep: N approach presses at the wall stay refused ──────
+
+def test_anti_creep_repeated_presses_all_refused_and_sigma_stays_put():
+    """The Sep-14 §2 field report: pressing the jog button
+    repeatedly at the wall walks the arm deeper. Under WALL
+    semantics, N successive approach presses at σ ≤ wall must all
+    refuse — no frame on the wire, so the arm cannot move, so σ
+    cannot decrease. Simulate 10 presses; assert every one is
+    refused with reason_code='sing_wall' and σ is unchanged (the
+    fixture doesn't move the arm; motion would require a frame
+    reaching the controller)."""
+    N = 10
+    fake = _fake_driver(sigma_at_start=0.028, escape_dsigma=-1e-3)
+    sigmas_seen = []
+    refusals = []
+    for _ in range(N):
+        # Each simulated press: fresh sigma_min call. Since no frame
+        # went on the wire, the fake's sigma_at_start remains fixed.
+        speed_out, refusal = fake._cart_start_sing_clamp(
+            axis=3, direction=+1, signed_speed=+0.21)
+        refusals.append(refusal)
+        sigmas_seen.append(fake._sing_guard.sigma_min.return_value)
+    assert all(r is not None for r in refusals), (
+        f'anti-creep VIOLATED: only {sum(1 for r in refusals if r is not None)}'
+        f'/{N} presses refused')
+    assert all(r['reason_code'] == 'sing_wall' for r in refusals), (
+        'refusal code drifted from sing_wall — surface parity broken')
+    assert len(set(sigmas_seen)) == 1, (
+        f'σ drifted across N presses: {sigmas_seen[0]:.4f} → '
+        f'{sigmas_seen[-1]:.4f} — the wall let motion through')
+
+
+# ── (3) σ_wall < σ ≤ σ_soft AND APPROACH → scale down ─────────────
+
+def test_cart_start_scales_between_wall_and_soft_on_approach():
+    """σ above the wall but below dynamic soft → initial frame
+    scales via the same SingularityGuard.scale(σ, dyn_soft, hard)
+    formula the supervise tick uses. Ramp keeps σ_hard as the
+    formula floor so approach FEELS progressive up to the wall
+    (per 2026-09-14 §2 operator directive: "Soft band above the
+    wall keeps today's ramp so approach still feels progressive
+    up to the wall")."""
+    # σ_min=0.040 > σ_wall=0.035. speed_frac=0.21, dyn_soft
+    # = 0.06 * max(1, 0.21/0.15) = 0.084.  scale
+    # = (0.040 - 0.020) / (0.084 - 0.020) = 0.020 / 0.064 = 0.3125.
+    fake = _fake_driver(sigma_at_start=0.040, escape_dsigma=-1e-3,
                         baseline=0.15)
     speed_out, refusal = fake._cart_start_sing_clamp(
         axis=3, direction=+1, signed_speed=+0.21)
     assert refusal is None, (
-        'soft-band σ must scale, not refuse')
-    # Expected scale ≈ 0.15625; expected scaled speed ≈ 0.033.
+        'σ above wall must scale, not refuse — ramp continues to '
+        'operate above the wall')
     dyn_soft = 0.06 * max(1.0, 0.21 / 0.15)
-    expected_scale = (0.030 - 0.02) / (dyn_soft - 0.02)
+    expected_scale = (0.040 - 0.020) / (dyn_soft - 0.020)
     assert speed_out == pytest.approx(0.21 * expected_scale, rel=1e-3), (
-        f'expected initial frame to scale to '
-        f'{0.21 * expected_scale:.3f}; got {speed_out:.3f}')
+        f'expected {0.21 * expected_scale:.4f}; got {speed_out:.4f}')
 
 
 # ── (4) σ > σ_soft → pass-through ─────────────────────────────────
@@ -250,3 +323,96 @@ def test_wsjog_trust_firmware_clamps_default_is_false():
         'wsjog_trust_firmware_clamps default flipped away from False '
         '— σ hard-stop + reactive backstop are demoted to observe-'
         'only; field-incident class is open again.')
+
+
+# ── (8) Wall value + wall > hard invariant + supervise stop ──────
+
+def test_wall_value_pinned_and_justified():
+    """2026-09-14 §2: σ_wall default = 0.035. Value derivation is
+    documented in the driver source near the declare_parameter call
+    AND recapped here so a future retune has to touch this pin:
+
+      Latency budget: 50 ms supervise period + ~20 ms stopJog
+      round-trip = 70 ms window between σ crossing the wall and
+      motion actually stopping.
+      Worst-case dσ/dt at approach transient (pre-governor, from
+      Sep-14 log): ~0.2 σ_units/s at 21% cart command.
+      σ margin needed: 0.2 * 0.07 = 0.014 σ_units.
+      σ_wall − σ_hard = 0.035 − 0.020 = 0.015 σ_units → covers the
+      latency window with headroom.
+      Reach cost at incident pose (Sep-14, J3≈90°): the log-derived
+      dσ/dz ≈ 0.0027 σ/mm → 0.015 σ / 0.0027 σ/mm ≈ 5.5 mm shy of
+      the alarm floor. Acceptable trade for eliminating the creep-
+      in-by-repeated-presses hole entirely."""
+    src = _read(DRIVER_SRC)
+    assert "self.declare_parameter('cart_sigma_wall', 0.035)" in src, (
+        'σ_wall default drifted from 0.035 — retune must also '
+        'update the latency + reach-loss justification here.')
+
+
+def test_wall_greater_than_hard_invariant_enforced():
+    """The constructor must clamp σ_wall > σ_hard so a misconfigured
+    yaml can never demote wall to or below the alarm floor (which
+    would be equivalent to the pre-2026-09-14 behavior)."""
+    src = _read(DRIVER_SRC)
+    assert 'self._cart_sigma_wall <= self._cart_sigma_hard' in src, (
+        'wall > hard invariant clamp missing — a yaml override '
+        'could put σ_wall at 0.010 and the wall becomes a floor '
+        'below the alarm floor.')
+    assert 'self._cart_sigma_wall >= self._cart_sigma_soft' in src, (
+        'wall < soft invariant clamp missing — a yaml override '
+        'could put σ_wall above σ_soft and the ramp band collapses.')
+
+
+def test_supervise_tick_stops_at_wall_not_hard():
+    """The supervise tick's cart-mode hard-stop branch MUST compare
+    σ against σ_wall (not σ_hard). Anti-creep depends on this: if
+    the supervise stop still fires at σ_hard, an approach hold can
+    still ride down to the alarm floor between two release+resume
+    cycles because the start clamp fires only at press time."""
+    src = _read(DRIVER_SRC)
+    # Locate the cart-branch stop check.
+    m = re.search(
+        r'elif sigma is not None and sigma <= self\._cart_sigma_(\w+):',
+        src)
+    assert m is not None, (
+        'cart-branch supervise stop check pattern not found — file '
+        'drifted, this pin needs updating')
+    which = m.group(1)
+    assert which == 'wall', (
+        f'supervise tick still stops at σ_{which}, not σ_wall — the '
+        f'anti-creep invariant is broken (approach holds can crawl '
+        f'below the wall until they hit hard)')
+    # Reason string uses the new 'sing_wall:' cause prefix so the
+    # STOP_REASON_PATTERNS tag routes correctly.
+    assert 'sing_wall: σ_min=' in src, (
+        'supervise stop reason missing the sing_wall: prefix — the '
+        'STOP_REASON_PATTERNS tagger will fall through to legacy')
+
+
+def test_stop_reason_patterns_include_sing_wall():
+    """The STOP_REASON_PATTERNS table must tag both the new
+    'sing_wall' and the legacy 'singularity guard' strings so the
+    frontend cause distribution stays stable across the transition
+    without a coordinated frontend deploy."""
+    src = _read(DRIVER_SRC)
+    m = re.search(
+        r"_STOP_REASON_PATTERNS = \((.+?)\n    \)\s*\n",
+        src, re.DOTALL)
+    assert m is not None, 'STOP_REASON_PATTERNS block not found'
+    table = m.group(1)
+    assert "('sing_wall'" in table, (
+        'sing_wall is not in STOP_REASON_PATTERNS — the new stop '
+        'cause will fall through to cause=other')
+    # Legacy string retained as an alias for old-build replay.
+    assert "('singularity guard'" in table
+
+
+def test_status_blob_exposes_wall():
+    """Dashboard / frontend needs the wall value in the status
+    telemetry so tests + HUD can render it. Regression fence: the
+    key must be present alongside cart_sigma_hard / cart_sigma_soft."""
+    src = _read(DRIVER_SRC)
+    assert "'cart_sigma_wall':" in src, (
+        'status blob missing cart_sigma_wall — dashboard cannot '
+        'render wall-position telemetry')

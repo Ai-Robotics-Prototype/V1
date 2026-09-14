@@ -468,7 +468,24 @@ class EstunCodroidDriver(Node):
         # Thresholds are logarithmic-ish (soft ≈ 3× hard); tuned so the
         # -100 ms danger point lands just above sigma_hard.
         self.declare_parameter('cart_sigma_soft', 0.060)  # begin scaling
-        self.declare_parameter('cart_sigma_hard', 0.020)  # hard stop
+        self.declare_parameter('cart_sigma_hard', 0.020)  # controller-alarm floor
+        # 2026-09-14 FIELD-INCIDENT §2 (creep-in-by-repeated-presses):
+        # σ_wall is the ACTIONABLE stop/refuse threshold above σ_hard.
+        # cart_start clamp REFUSES approach starts here; supervise tick
+        # STOPS approach holds here. σ_hard remains only as the ramp
+        # formula's floor (SingularityGuard.scale). Escape direction is
+        # always permitted below σ_wall (freedom guarantee).
+        # Value 0.035 derivation (see test_cart_start_singularity_
+        # clamp.py::test_wall_value_justified for the recap):
+        #   * margin σ_wall − σ_hard = 0.015 covers one supervise
+        #     period (50 ms) + stopJog latency (~20 ms) even at the
+        #     approach-transient worst-case dσ/dt (~0.2 σ/s pre-
+        #     governor at 21% commanded).
+        #   * reach loss at the incident pose (Sep-14, J3≈90°) from
+        #     the log-derived dσ/dz ≈ 0.0027 σ/mm: 0.015/0.0027 ≈
+        #     5.5 mm shy of hard. Acceptable trade for eliminating
+        #     the creep-in-by-repeated-presses hole entirely.
+        self.declare_parameter('cart_sigma_wall', 0.035)  # actionable stop
         # Reactive backstop — if the controller's live joint velocity
         # spikes past this during OUR Cartesian hold, stop with reason
         # 'joint overspeed guard J<n>'. 1.5 rad/s is a compromise: below
@@ -787,6 +804,24 @@ class EstunCodroidDriver(Node):
 
         self._cart_sigma_soft   = float(self.get_parameter('cart_sigma_soft').value)
         self._cart_sigma_hard   = float(self.get_parameter('cart_sigma_hard').value)
+        self._cart_sigma_wall   = float(self.get_parameter('cart_sigma_wall').value)
+        # Invariant: soft > wall > hard. If misconfigured, clamp
+        # rather than reject — the wall must never sit at or below
+        # the alarm floor, and must never sit above the soft ramp
+        # ceiling (which would leave the arm unable to reach the
+        # wall through the soft band).
+        if self._cart_sigma_wall <= self._cart_sigma_hard:
+            self._cart_sigma_wall = self._cart_sigma_hard + 0.005
+            self.get_logger().warn(
+                f'cart_sigma_wall <= cart_sigma_hard: clamped wall '
+                f'to {self._cart_sigma_wall:.3f} (hard+0.005)')
+        if self._cart_sigma_wall >= self._cart_sigma_soft:
+            self._cart_sigma_wall = max(
+                self._cart_sigma_hard + 0.005,
+                self._cart_sigma_soft - 0.005)
+            self.get_logger().warn(
+                f'cart_sigma_wall >= cart_sigma_soft: clamped wall '
+                f'to {self._cart_sigma_wall:.3f} (soft-0.005)')
         self._cart_joint_v_cap  = float(self.get_parameter('cart_joint_velocity_cap_radps').value)
         # Per-joint cap: list of 6 floats or empty (falls back to flat).
         _pj = list(self.get_parameter(
@@ -3611,29 +3646,31 @@ class EstunCodroidDriver(Node):
 
     # ── Cartesian start-time singularity clamp ──────────────────────
     #
-    # Field-incident triage 2026-09-14 (alarm 2015 on J3 after
-    # repeated Z/Y+ presses at full extension): the continuous
-    # cartesian start path (_start_or_refresh_continuous cart branch
-    # + _start_cart_pulse) commits the initial Robot/jog frame at
-    # the operator's UNSCALED commanded speed before the supervise
-    # tick evaluates σ. When σ is already at/near the hard threshold
-    # from a prior press's residual approach, the ~50 ms window
-    # between the initial frame and the first supervise tick is
-    # enough for the controller's IK to amplify per-joint velocity
-    # into an acceleration-jump alarm.
+    # Field-incident lineage:
+    #   2026-09-14 alarm 2015 (bf5fb87): initial-frame gap let a
+    #     UNSCALED speed ride out to the wire for one supervise
+    #     interval before σ was evaluated. Fix: start-time σ scaling
+    #     using the same ramp the supervise tick uses.
+    #   2026-09-14 §2 creep-in-by-repeated-presses (this commit):
+    #     scaling wasn't enough. Each successive press was a legal
+    #     crawl deeper into the manifold — arm walked to singularity
+    #     over N brief presses. Fix: WALL semantics. Start path
+    #     REFUSES approach when σ ≤ σ_wall; supervise tick STOPS
+    #     approach holds at σ ≤ σ_wall. No creep.
     #
-    # The fix (defence in depth, mirrors _on_jog_supervise's cart
-    # branch):
-    #   * σ ≤ σ_hard AND not jogging away → REFUSE with named
-    #     reason_code='sing_start_clamp'. Operator gets a plain-
-    #     copy refusal via the dashboard, same rendering path as
-    #     the supervise-tick hard-stop.
-    #   * σ_hard < σ ≤ σ_soft (dyn) AND not jogging away → scale
-    #     the initial signed_speed via SingularityGuard.scale so
-    #     the first frame ships at the SAME cap the supervise tick
-    #     would apply 50 ms later. No motion at an uncapped speed.
-    #   * dσ > ESCAPE_TIE_EPS (jogging AWAY) → permit full speed.
-    #     Freedom guarantee "jog-away always permitted" holds.
+    # Behavior (matches _on_jog_supervise's cart branch by design):
+    #   * dσ > ESCAPE_TIE_EPS (jogging AWAY): FULL commanded speed.
+    #     Applies below σ_wall too — freedom guarantee "jog-away
+    #     always permitted" holds absolutely.
+    #   * σ ≤ σ_wall AND not escaping: REFUSE with reason_code=
+    #     'sing_wall'. Operator-facing string is plain per the
+    #     2026-09-14 §2 operator directive.
+    #   * σ_wall < σ ≤ σ_soft(dyn) AND not escaping: SCALE the
+    #     initial signed_speed via SingularityGuard.scale so the
+    #     first frame ships at the same cap the supervise tick
+    #     would apply. Ramp still uses σ_hard as the ramp floor so
+    #     the operator feels progressive slowing all the way to
+    #     the wall (see cart_sigma_wall docstring).
     #
     # Returns (signed_speed_out, refusal_or_None):
     #   * refusal_or_None is None   → caller sends signed_speed_out
@@ -3651,15 +3688,14 @@ class EstunCodroidDriver(Node):
             self._joint_deg, axis, signed_speed)
         if escape_dsigma > ESCAPE_TIE_EPS:
             return signed_speed, None
-        if sigma <= self._cart_sigma_hard:
+        if sigma <= self._cart_sigma_wall:
             refusal = {
-                'reason_code': 'sing_start_clamp',
+                'reason_code': 'sing_wall',
                 'reason': (
-                    f'cart start clamp: too close to a stretched-out '
-                    f'pose (σ_min={sigma:.4f} ≤ hard='
-                    f'{self._cart_sigma_hard:.3f}). Use joint jog to '
-                    f'move away first, or reverse this axis to escape.'),
+                    'Arm is at its reach limit. Jog back toward the '
+                    'workspace to continue.'),
                 'sigma_min': float(sigma),
+                'sigma_wall': float(self._cart_sigma_wall),
                 'sigma_hard': float(self._cart_sigma_hard),
                 'cart_axis': int(axis),
                 'cart_direction': int(direction),
@@ -3949,21 +3985,30 @@ class EstunCodroidDriver(Node):
                             # Fall through to the collision guard
                             # (below); skip σ hard-stop + reactive
                             # backstop.
-                        elif sigma is not None and sigma <= self._cart_sigma_hard:
+                        elif sigma is not None and sigma <= self._cart_sigma_wall:
                             if self._wsjog_trust_firmware_clamps:
                                 # 2026-08-28 demoted: firmware handles
                                 # IK degeneracy natively. Observe only.
                                 self._cart_softening = {
                                     'active': True, 'mode': 'observe',
-                                    'cause': 'singularity_guard',
+                                    'cause': 'sing_wall',
                                     'sigma_min': sigma,
+                                    'sigma_wall': self._cart_sigma_wall,
                                     'sigma_hard': self._cart_sigma_hard,
                                     'escape_hint': 'reverse this axis or use Joint mode to exit',
                                 }
                             else:
+                                # 2026-09-14 §2 WALL semantics: latched
+                                # sing_wall event. Distinct from the
+                                # retired 'singularity_guard' hard-stop
+                                # (which fired at σ_hard AFTER the
+                                # controller had already alarmed). The
+                                # wall stops motion above σ_hard so the
+                                # controller alarm floor is never
+                                # reached during Cartesian jog.
                                 self._stop_jog_locked(
-                                    reason=f'singularity guard (σ_min={sigma:.4f} '
-                                           f'≤ hard={self._cart_sigma_hard:.3f})')
+                                    reason=f'sing_wall: σ_min={sigma:.4f} '
+                                           f'≤ wall={self._cart_sigma_wall:.3f}')
                                 return
                         # Reactive backstop — the sole line of defense
                         # when the DH model is off, or when the incident
@@ -4175,10 +4220,14 @@ class EstunCodroidDriver(Node):
         # commanded joint velocity above the arm's per-joint cap.
         # Operator's frequent-flier culprit during cartesian holds.
         ('joint overspeed guard', 'joint_overspeed'),
-        # Manipulability-based guard: σ_min crossed sigma_hard.
+        # Manipulability-based guard: σ_min crossed sigma_wall.
         # Adjacent-but-distinct from joint_overspeed — the driver
-        # trips this BEFORE the controller clamp fires.
-        ('singularity guard',     'singularity_guard'),
+        # trips this BEFORE the controller alarm floor (σ_hard).
+        # 2026-09-14 §2: 'sing_wall' supersedes 'singularity_guard'
+        # as the stop cause; the legacy string pattern is kept so
+        # older reason messages still match a known tag on replay.
+        ('sing_wall',             'sing_wall'),
+        ('singularity guard',     'sing_wall'),
         # Operator disabled the arm mid-hold. Explicit action; not
         # a fault. Distinct from the release-cmd path (release_cmd
         # is the hold-end signal, disable is the servo cut).
@@ -5568,6 +5617,7 @@ class EstunCodroidDriver(Node):
             'sigma_min':       self._last_sigma_min,
             'cart_scale':      self._last_sing_scale,
             'cart_sigma_soft': self._cart_sigma_soft,
+            'cart_sigma_wall': self._cart_sigma_wall,
             'cart_sigma_hard': self._cart_sigma_hard,
             # Self-collision guard telemetry. Dashboard uses `collision_pair`
             # + `collision_min_mm` to render an amber/red tint on the two

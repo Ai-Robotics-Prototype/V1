@@ -36,6 +36,13 @@ const OBSERVE_COPY = {
     `J${j} past its safe edge and deepening — firmware is clamping.`,
   singularity_guard: () =>
     'Near a singular pose — firmware is clamping the wrist geometry.',
+  // 2026-09-14 §2: sing_wall is the enforce-mode analog of the
+  // legacy singularity_guard observe copy. Renders when the driver
+  // is trusting firmware clamps (rare) AND σ ≤ σ_wall; the enforce
+  // path routes the stop through JogStopSurface's sing_wall branch
+  // instead. Operator copy stays plain per the Sep-14 directive.
+  sing_wall: () =>
+    'Arm is at its reach limit — firmware is holding here.',
   sigma_soft: () =>
     'Approaching a singular pose — firmware IK is slowing the arm.',
 }

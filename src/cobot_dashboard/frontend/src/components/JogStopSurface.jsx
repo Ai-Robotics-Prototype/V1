@@ -178,8 +178,21 @@ export function LiveMarginHUD({ robot }) {
             const cause = String(soft.cause || '')
             const j = soft.limiting_joint_1based
             const escapeHint = ' Reverse this axis or switch to Joint mode to exit.'
+            // 2026-09-14 §2 WALL semantics: the driver stops
+            // Cartesian jog at σ_wall (above σ_hard) with cause
+            // 'sing_wall'. Operator-facing copy is plain per the
+            // Sep-14 directive item 4 — no σ, no jargon; escape
+            // hint stays. Edition-independent.
+            if (cause === 'sing_wall') {
+              return 'Arm is at its reach limit. Jog back toward '
+                   + 'the workspace to continue.' + escapeHint
+            }
             if (cause === 'singularity_guard') {
-              return 'Arm near a stretched-out pose.' + escapeHint
+              // Legacy cause: retained for compatibility with the
+              // pre-2026-09-14 driver builds. Same operator copy
+              // as sing_wall so the transition is invisible.
+              return 'Arm is at its reach limit. Jog back toward '
+                   + 'the workspace to continue.' + escapeHint
             }
             if (cause === 'sigma_soft') {
               return 'Slowing down — arm approaching a stretched-out pose.' + escapeHint
