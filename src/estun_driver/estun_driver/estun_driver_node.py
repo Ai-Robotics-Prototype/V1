@@ -1175,6 +1175,31 @@ class EstunCodroidDriver(Node):
         # Latest σ_min sample and effective scale — surfaced in status.
         self._last_sigma_min = None
         self._last_sing_scale = 1.0
+        # 2026-09-14 §3 field-regression fix (post-d902583): SESSION-
+        # PERSISTENT wall latch. Without it, each release+repress
+        # re-evaluates σ fresh from posture and — because σ_min may
+        # drift marginally above σ_wall between ticks — grants a
+        # scaled soft-band pass, walking the arm deeper across
+        # successive brief presses (Suspect C in the operator field
+        # report).
+        #
+        # Semantics:
+        #   * Set to True when the supervise tick sees σ ≤ σ_wall
+        #     with a non-escaping commanded direction.
+        #   * Cleared when supervise OR the start-clamp sees σ >
+        #     (σ_wall + WALL_LATCH_HYSTERESIS). Only real σ recovery
+        #     unlocks the latch — a release alone cannot.
+        #   * When latched, the start-clamp refuses ANY approach
+        #     press until σ climbs above (σ_wall + hysteresis).
+        #     Escape direction ALWAYS passes (freedom guarantee).
+        #
+        # HYSTERESIS = 0.005 σ_units (≈2 mm of Y-extension at the
+        # incident pose per the log-derived dσ/dz ≈ 0.0027 σ/mm) —
+        # enough to require a real, measured escape motion before
+        # re-arming approach; small enough that once the operator
+        # escapes even slightly, they regain control immediately.
+        self._cart_wall_latched = False
+        self._WALL_LATCH_HYSTERESIS = 0.005
         # For mid-hold ramp: what did we last actually send on the wire?
         # (Signed fraction, matching Robot/jog's `speed` field.)
         self._cart_last_sent_speed = 0.0
@@ -3686,9 +3711,29 @@ class EstunCodroidDriver(Node):
         # speed and skip both refuse and scale branches.
         escape_dsigma = self._sing_guard.escape_score(
             self._joint_deg, axis, signed_speed)
-        if escape_dsigma > ESCAPE_TIE_EPS:
+        is_escaping = escape_dsigma > ESCAPE_TIE_EPS
+        if is_escaping:
             return signed_speed, None
-        if sigma <= self._cart_sigma_wall:
+        # 2026-09-14 §3 field-regression fix: wall latch clear-check.
+        # A fresh press can only clear the latch by DEMONSTRATED σ
+        # recovery — the current σ read is what the operator got by
+        # moving away (typically via joint jog since cart approach is
+        # refused while latched). Threshold has to be *strictly above*
+        # wall + hysteresis so tie cases keep latching.
+        release_thresh = self._cart_sigma_wall + self._WALL_LATCH_HYSTERESIS
+        if sigma > release_thresh:
+            if self._cart_wall_latched:
+                self.get_logger().info(
+                    f'cart wall latch CLEARED (start): σ_min={sigma:.4f} '
+                    f'> wall+hyst={release_thresh:.4f}')
+                self._cart_wall_latched = False
+        # Approach + at/below the wall OR still latched from a prior
+        # supervise crossing → REFUSE. Same operator-facing reason
+        # code and copy either way; the latch is invisible to the
+        # operator by design (they just see "reach limit").
+        latched_refuse = (
+            self._cart_wall_latched and sigma <= release_thresh)
+        if sigma <= self._cart_sigma_wall or latched_refuse:
             refusal = {
                 'reason_code': 'sing_wall',
                 'reason': (
@@ -3697,6 +3742,7 @@ class EstunCodroidDriver(Node):
                 'sigma_min': float(sigma),
                 'sigma_wall': float(self._cart_sigma_wall),
                 'sigma_hard': float(self._cart_sigma_hard),
+                'wall_latched': bool(latched_refuse),
                 'cart_axis': int(axis),
                 'cart_direction': int(direction),
             }
@@ -3986,6 +4032,15 @@ class EstunCodroidDriver(Node):
                             # (below); skip σ hard-stop + reactive
                             # backstop.
                         elif sigma is not None and sigma <= self._cart_sigma_wall:
+                            # 2026-09-14 §3: SET the session wall latch.
+                            # Anti-creep: subsequent approach presses
+                            # are refused until an escape motion has
+                            # measurably raised σ above wall + hyst.
+                            if not self._cart_wall_latched:
+                                self.get_logger().info(
+                                    f'cart wall latch SET: σ_min={sigma:.4f} '
+                                    f'≤ wall={self._cart_sigma_wall:.3f}')
+                            self._cart_wall_latched = True
                             if self._wsjog_trust_firmware_clamps:
                                 # 2026-08-28 demoted: firmware handles
                                 # IK degeneracy natively. Observe only.
@@ -4010,6 +4065,19 @@ class EstunCodroidDriver(Node):
                                     reason=f'sing_wall: σ_min={sigma:.4f} '
                                            f'≤ wall={self._cart_sigma_wall:.3f}')
                                 return
+                        # 2026-09-14 §3: latch CLEAR path. When
+                        # supervise sees σ recover above wall + hyst,
+                        # release the latch so approach re-arms. Only
+                        # meaningful σ climb clears — a spurious tick
+                        # at (wall + tiny epsilon) doesn't re-arm.
+                        elif (sigma is not None and self._cart_wall_latched
+                                and sigma > (self._cart_sigma_wall
+                                             + self._WALL_LATCH_HYSTERESIS)):
+                            self.get_logger().info(
+                                f'cart wall latch CLEARED (supervise): '
+                                f'σ_min={sigma:.4f} > wall+hyst='
+                                f'{self._cart_sigma_wall + self._WALL_LATCH_HYSTERESIS:.4f}')
+                            self._cart_wall_latched = False
                         # Reactive backstop — the sole line of defense
                         # when the DH model is off, or when the incident
                         # is IK-controller-side rather than kinematics-
@@ -5619,6 +5687,9 @@ class EstunCodroidDriver(Node):
             'cart_sigma_soft': self._cart_sigma_soft,
             'cart_sigma_wall': self._cart_sigma_wall,
             'cart_sigma_hard': self._cart_sigma_hard,
+            # 2026-09-14 §3: session wall latch. True while approach
+            # is locked out; cleared only by σ recovery above wall+hyst.
+            'cart_wall_latched': bool(self._cart_wall_latched),
             # Self-collision guard telemetry. Dashboard uses `collision_pair`
             # + `collision_min_mm` to render an amber/red tint on the two
             # offending links plus a live "min clearance" readout when

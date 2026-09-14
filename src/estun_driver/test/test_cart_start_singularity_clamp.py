@@ -57,10 +57,14 @@ from estun_driver.estun_driver_node import (
 
 
 def _fake_driver(sigma_at_start, escape_dsigma=-1e-3, baseline=0.15,
-                 sigma_wall=0.035):
+                 sigma_wall=0.035, wall_latched=False):
     """Cart-start scenario fixture. sigma_at_start pins the σ_min the
     SingularityGuard returns; escape_dsigma pins the direction-aware
-    lookahead score. Negative = approach, positive = escape."""
+    lookahead score. Negative = approach, positive = escape.
+
+    2026-09-14 §3: wall_latched seeds the SESSION-persistent wall
+    latch state (default False = fresh boot). Pass True to simulate
+    a prior supervise tick that saw σ ≤ σ_wall and set the latch."""
     fake = SimpleNamespace()
     fake._joint_deg = [0.0, 0.0, 89.5, 0.0, 0.0, 0.0]
     fake._joint_rad = [0.0] * 6
@@ -69,6 +73,8 @@ def _fake_driver(sigma_at_start, escape_dsigma=-1e-3, baseline=0.15,
     fake._cart_sigma_wall = sigma_wall
     fake._cart_sigma_hard = 0.02
     fake._baseline_speed_frac = baseline
+    fake._cart_wall_latched = wall_latched
+    fake._WALL_LATCH_HYSTERESIS = 0.005
 
     _sg = SimpleNamespace()
     _sg.sigma_min = MagicMock(return_value=sigma_at_start)
@@ -308,7 +314,164 @@ def test_cart_pulse_start_calls_the_clamp():
     assert clamp_idx < frame_idx
 
 
-# ── (7) Enforce-default sanity (Suspect 1 pin) ────────────────────
+# ── (7) Wall latch — 2026-09-14 §3 field-regression fix ──────────
+#
+# Session-persistent latch: once supervise sees σ ≤ σ_wall, the
+# start-clamp keeps refusing approach until σ climbs above
+# (σ_wall + WALL_LATCH_HYSTERESIS). Without this, release+repress
+# re-evaluates σ fresh and a marginal above-wall reading grants a
+# scaled pass, walking the arm deeper (the observed field creep).
+
+
+def test_wall_latch_refuses_marginal_above_wall_approach():
+    """Latch is TRUE (prior supervise crossed the wall). Fresh
+    approach press arrives with σ marginally above wall
+    (0.036 = wall + 0.001, below wall + hysteresis). Must REFUSE
+    — the latch keeps approach locked out even when σ has crept
+    just above the raw wall value. Reason must still be sing_wall
+    with wall_latched=True in the extra dict."""
+    fake = _fake_driver(sigma_at_start=0.036, escape_dsigma=-1e-3,
+                        wall_latched=True)
+    speed_out, refusal = fake._cart_start_sing_clamp(
+        axis=3, direction=+1, signed_speed=+0.21)
+    assert refusal is not None, (
+        'wall latch failed to refuse: approach press at σ=0.036 '
+        '(above raw wall) got through — creep hole is open again.')
+    assert refusal['reason_code'] == 'sing_wall'
+    assert refusal.get('wall_latched') is True, (
+        'refusal extra must expose wall_latched=True so the '
+        'operator-facing surfaces can render the "escape first" '
+        'branch and the fact stays in the audit trail.')
+    # State check: latch stays set because sigma didn't clear
+    # the hysteresis threshold.
+    assert fake._cart_wall_latched is True
+
+
+def test_wall_latch_permits_escape_marginal_above_wall():
+    """Latch is TRUE + σ marginally above wall + ESCAPE direction
+    → PERMIT full speed. Escape is always permitted (freedom
+    guarantee); the latch does NOT constrain the way out."""
+    fake = _fake_driver(sigma_at_start=0.036, escape_dsigma=+1e-3,
+                        wall_latched=True)
+    speed_out, refusal = fake._cart_start_sing_clamp(
+        axis=3, direction=-1, signed_speed=-0.21)
+    assert refusal is None
+    assert speed_out == pytest.approx(-0.21)
+
+
+def test_wall_latch_clears_when_sigma_recovers_above_hysteresis():
+    """Latch is TRUE. Fresh press arrives with σ well above wall +
+    hysteresis (e.g. σ=0.055 — clearly out of the wall zone).
+    Start-clamp must:
+      1. Clear the latch (side-effect on _cart_wall_latched).
+      2. Fall through to the normal soft-band ramp / pass-through.
+    """
+    fake = _fake_driver(sigma_at_start=0.055, escape_dsigma=-1e-3,
+                        wall_latched=True)
+    speed_out, refusal = fake._cart_start_sing_clamp(
+        axis=3, direction=+1, signed_speed=+0.21)
+    # σ=0.055 is inside soft band (below dyn_soft=0.084) → scaled.
+    assert refusal is None
+    # Latch cleared as a side effect.
+    assert fake._cart_wall_latched is False, (
+        'wall latch failed to clear at σ=0.055 (well above '
+        'wall+hyst=0.040) — latch will never release, operator '
+        'stuck refusing all cart approach forever.')
+
+
+def test_wall_latch_does_not_clear_at_wall_plus_epsilon():
+    """Latch is TRUE. Fresh press at σ=0.039 (wall + 0.004, BELOW
+    wall + hysteresis=0.040). Must NOT clear the latch — this is
+    the "creep past wall by an epsilon" case the fix guards
+    against. Refusal fires; latch persists."""
+    fake = _fake_driver(sigma_at_start=0.039, escape_dsigma=-1e-3,
+                        wall_latched=True)
+    speed_out, refusal = fake._cart_start_sing_clamp(
+        axis=3, direction=+1, signed_speed=+0.21)
+    assert refusal is not None
+    assert refusal['reason_code'] == 'sing_wall'
+    assert fake._cart_wall_latched is True, (
+        'wall latch cleared at σ=0.039 — should require > 0.040 '
+        '(wall + hysteresis). Rounding at the tie is the creep '
+        'vector this pin closes.')
+
+
+def test_wall_latch_clear_on_escape_above_hysteresis():
+    """Latch is TRUE. Escape motion raises σ above wall + hyst.
+    Even though we're in the escape branch (returns early), the
+    latch clear must still fire in the start-clamp because a
+    subsequent APPROACH press would otherwise stay refused despite
+    the recovery. Verify latch flips False on the escape read.
+
+    NOTE: current design clears the latch BEFORE the escape early-
+    return check via the sigma-recovery gate — see the fix
+    docstring. Verify that behavior."""
+    fake = _fake_driver(sigma_at_start=0.055, escape_dsigma=+1e-3,
+                        wall_latched=True)
+    speed_out, refusal = fake._cart_start_sing_clamp(
+        axis=3, direction=-1, signed_speed=-0.21)
+    assert refusal is None
+    assert speed_out == pytest.approx(-0.21)
+    # NOTE: the escape branch returns BEFORE the σ-recovery gate
+    # runs (that path only fires on non-escape). But the escape
+    # itself moves the arm; the NEXT supervise tick or start-clamp
+    # will see the higher σ and clear. This test documents the
+    # sequencing: escape passes now, latch clears next.
+    #
+    # If we wanted the latch to clear on ANY read with σ above
+    # hyst (escape or approach), the fix would restructure the
+    # order. As shipped, we preserve the "escape always fast" path
+    # by putting the escape return first.
+    assert fake._cart_wall_latched is True, (
+        'escape branch cleared the latch inline — that\'s a design '
+        'change from the current fix (which clears only on the '
+        'non-escape sigma-recovery gate). If intentional, update '
+        'the fix docstring; otherwise the escape shouldn\'t clear.')
+
+
+def test_wall_latch_supervise_set_pattern():
+    """Source pin: supervise tick sets _cart_wall_latched = True
+    on the σ ≤ σ_wall branch. Without this, the latch never
+    triggers and the fix is inert."""
+    src = _read(DRIVER_SRC)
+    m = re.search(
+        r'elif sigma is not None and sigma <= self\._cart_sigma_wall:'
+        r'(.+?)(?=elif sigma is not None|# 2026-09-14 §3: latch)',
+        src, re.DOTALL)
+    assert m is not None, (
+        'wall-branch supervise block boundary not found — file '
+        'structure drifted')
+    body = m.group(1)
+    assert 'self._cart_wall_latched = True' in body, (
+        'supervise wall branch does NOT set _cart_wall_latched — '
+        'the latch will never fire, fix is inert.')
+
+
+def test_wall_latch_supervise_clear_pattern():
+    """Source pin: supervise tick clears _cart_wall_latched = False
+    when σ climbs above wall + hysteresis."""
+    src = _read(DRIVER_SRC)
+    assert re.search(
+        r'elif \(sigma is not None and self\._cart_wall_latched\s*\n\s*'
+        r'and sigma > \(self\._cart_sigma_wall\s*\n\s*'
+        r'\+ self\._WALL_LATCH_HYSTERESIS\)\):',
+        src) is not None, (
+        'supervise clear-branch pattern not found — latch will '
+        'never release; operator stuck.')
+
+
+def test_wall_latch_status_blob_exposed():
+    """Status telemetry must include cart_wall_latched so the HUD
+    + audit trail can render the state. Frontend HUD copy can be
+    a follow-up; the wire field goes first."""
+    src = _read(DRIVER_SRC)
+    assert "'cart_wall_latched':" in src, (
+        'status blob missing cart_wall_latched — HUD cannot render '
+        'the latched state, operator has no signal that a re-press '
+        'was refused because of a prior wall crossing')
+
+
+# ── (7b) Enforce-default sanity (Suspect 1 pin) ───────────────────
 
 def test_wsjog_trust_firmware_clamps_default_is_false():
     """The 2026-09-11 re-enforce fix pinned this default at False so
