@@ -222,7 +222,10 @@ export default function View3DLayout() {
                   remains on this page. */}
             </ArmViewer3D>
             <MinClearanceReadout />
-            <OrientFlangeDownControl jogApi={jogApi} />
+            {/* 2026-09-14 operator directive: "Orient Flange Down"
+                moved out of this top-right viewer overlay and into
+                the jog surface (JogControls rightSlot). See the
+                RealArmChrome block below. */}
             {isMinimized && <RealArmMinimizedPill setMode={setView3dJogPanel} />}
           </div>
         )}
@@ -233,8 +236,16 @@ export default function View3DLayout() {
             {/* 2026-09-08: right-column controls (Run/Pause/STOP/Home/
                 E-STOP/Teach) retired from JogControls per operator
                 directive. Program execution lives on Monitor; TopBar
-                owns E-STOP. runConfirm prop retired with them. */}
-            <JogControls maximized={isExpanded} />
+                owns E-STOP. runConfirm prop retired with them.
+                2026-09-14: rightSlot repurposed for the modal-gated
+                Orient Flange Down control — moved out of the twin-
+                viewer overlay per screenshot review. */}
+            <JogControls
+              maximized={isExpanded}
+              rightSlot={jogApi
+                ? <OrientFlangeDownControl jogApi={jogApi} />
+                : null}
+            />
           </RealArmChrome>
         )}
       </div>

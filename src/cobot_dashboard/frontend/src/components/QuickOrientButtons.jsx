@@ -222,10 +222,12 @@ export default function OrientFlangeDownControl({ jogApi }) {
       try { body = await resp.json() } catch { body = null }
 
       if (resp.ok && body && body.ok) {
-        setStatus({
-          ok: true,
-          message: `Command published (duration ${body.duration_ms} ms).`,
-        })
+        // 2026-09-14 operator directive: no dev-confirmation toast
+        // on success. The arm moving is the confirmation. Prior
+        // build leaked "Command published (duration N ms)." here —
+        // topic / req_id / duration_ms are diagnostic-only. Failures
+        // still render plain operator copy (setStatus below).
+        setStatus(null)
         setModalOpen(false)
         return
       }
@@ -283,13 +285,11 @@ export default function OrientFlangeDownControl({ jogApi }) {
         >
           Orient Flange Down
         </button>
-        {status && !modalOpen && (
+        {status && !status.ok && !modalOpen && (
           <div
-            data-testid={status.ok
-              ? 'orient-flange-down-ok'
-              : 'orient-flange-down-refusal'}
-            data-kind={status.kind || (status.ok ? 'ok' : '')}
-            style={status.ok ? styles.okBanner : styles.refusal}>
+            data-testid="orient-flange-down-refusal"
+            data-kind={status.kind || ''}
+            style={styles.refusal}>
             {status.message}
           </div>
         )}
@@ -360,19 +360,25 @@ export default function OrientFlangeDownControl({ jogApi }) {
 }
 
 const styles = {
+  // 2026-09-14 operator directive: control lives INSIDE the jog
+  // surface (right of the Rotation cluster in the bottom pad row),
+  // not as a top-right absolute-positioned overlay on the twin.
+  // The parent's flex layout controls placement; the wrap is a
+  // vertical stack (button + optional inline refusal) with no
+  // fixed positioning.
   wrap: {
-    position: 'absolute', top: 8, right: 8, zIndex: 11,
-    display: 'flex', flexDirection: 'column', gap: 6,
-    maxWidth: 320,
+    display: 'flex', flexDirection: 'column', gap: 8,
+    minWidth: 160, maxWidth: 240,
     fontFamily: 'var(--font, system-ui)',
   },
   btn: {
-    padding: '10px 16px',
+    padding: '12px 18px',
     background: '#0284c7', color: '#fff',
     border: '1px solid #0369a1', borderRadius: 6,
-    fontSize: 12, fontWeight: 700, letterSpacing: 0.4,
+    fontSize: 13, fontWeight: 700, letterSpacing: 0.4,
     fontFamily: 'inherit',
     boxShadow: '0 2px 6px rgba(0,0,0,0.18)',
+    whiteSpace: 'nowrap',
   },
   refusal: {
     padding: '8px 12px',
@@ -380,12 +386,8 @@ const styles = {
     border: '1px solid #FDE68A', borderRadius: 4,
     fontSize: 12, lineHeight: 1.4,
   },
-  okBanner: {
-    padding: '8px 12px',
-    background: 'rgba(34,197,94,0.12)', color: '#166534',
-    border: '1px solid rgba(34,197,94,0.55)', borderRadius: 4,
-    fontSize: 12, lineHeight: 1.4,
-  },
+  // 2026-09-14: okBanner style retired with the "Command published"
+  // dev-confirmation toast (topic / req_id / duration_ms leak).
   // Full-viewport backdrop. Click-through is intentionally NOT
   // wired — the operator directive forbids backdrop dismissal.
   // pointerEvents:'auto' keeps the dark overlay from letting

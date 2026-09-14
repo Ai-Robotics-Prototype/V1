@@ -463,7 +463,7 @@ function PadCenter({ label, width = 80, height = 80, labelSize = 12 }) {
 // JogControls — the pendant. Prop `maximized` picks the size tier;
 // callers wrap it in whatever chrome / minimize toggle they need.
 // -----------------------------------------------------------------------------
-export default function JogControls({ maximized = false }) {
+export default function JogControls({ maximized = false, rightSlot = null }) {
   const winW = (typeof window !== 'undefined') ? window.innerWidth : 1280
   const isTabletW = winW <= 1280
   const isNarrowW = winW <= 1500
@@ -744,12 +744,19 @@ export default function JogControls({ maximized = false }) {
                           : (isTabletW ? 32 : isNarrowW ? 38 : 42)
   const lblPx = maximized ? (isTabletW ? 12 : isNarrowW ? 14 : 16)
                           : (isTabletW ? 11 : isNarrowW ? 12 : 13)
-  const padInner = maximized ? (isTabletW ? 8  : isNarrowW ? 10 : 14)
-                             : (isTabletW ? 6  : isNarrowW ? 8  : 10)
-  const padGroup = maximized ? (isTabletW ? 16 : isNarrowW ? 24 : 40)
-                             : (isTabletW ? 12 : isNarrowW ? 20 : 28)
-  const jointColGap = maximized ? (isTabletW ? 12 : isNarrowW ? 18 : 24)
-                                : (isTabletW ?  8 : isNarrowW ? 12 : 16)
+  // 2026-09-14 operator directive: spread the clusters. Prior values
+  // were too tight — Position / Height / Rotation ran together and
+  // individual pad buttons touched at wider viewports. New tokens are
+  // bumped ~40% at padInner (within-cluster) and ~50% at padGroup
+  // (between clusters); jointColGap follows the same scale for XYZ /
+  // Joint parity. Container is overflowX:'hidden' + the pad row uses
+  // flexWrap so nothing scrolls horizontally at any breakpoint.
+  const padInner = maximized ? (isTabletW ? 12 : isNarrowW ? 16 : 20)
+                             : (isTabletW ?  8 : isNarrowW ? 12 : 14)
+  const padGroup = maximized ? (isTabletW ? 24 : isNarrowW ? 36 : 60)
+                             : (isTabletW ? 20 : isNarrowW ? 30 : 44)
+  const jointColGap = maximized ? (isTabletW ? 20 : isNarrowW ? 28 : 40)
+                                : (isTabletW ? 14 : isNarrowW ? 20 : 28)
   const jointLblFont = maximized ? (isTabletW ? 12 : isNarrowW ? 14 : 16)
                                  : (isTabletW ? 11 : isNarrowW ? 12 : 13)
   const jointLblMb = maximized ? (isTabletW ? 6 : isNarrowW ? 8 : 10)
@@ -1164,14 +1171,28 @@ export default function JogControls({ maximized = false }) {
         )}
       </div>
 
-      {/* 2026-09-08 operator directive: RIGHT column retired.
-          Program execution controls (Run / Pause / STOP / Home /
-          IDLE·N/M readout) live on Monitor now. TopBar E-STOP is
-          always visible (grid area 'topbar' outside content),
-          reachable even in EXPANDED jog. Teach Position was dead
-          here — only mount site (View3DLayout) never passed
-          onTeach; teach flows use their own bespoke buttons
-          (PointsPanel.onTeach, ProgramEditor RecordPad). */}
+      {/* RIGHT — auxiliary control slot. 2026-09-08 retired the
+          program-execution column; 2026-09-14 reintroduced this
+          slot as a general-purpose right column for the 3D View's
+          "Orient Flange Down" control (see rightSlot prop). Empty
+          on the Program tab (where JogControls is also mounted).
+          padGroup gap keeps it visually separated from the
+          Rotation cluster. */}
+      {rightSlot && (
+        <div
+          data-testid="jog-right-slot"
+          style={{
+            display: 'flex', flexDirection: 'column',
+            alignSelf: 'stretch',
+            justifyContent: 'flex-start',
+            alignItems: 'flex-start',
+            flexShrink: 0,
+            paddingLeft: 4,
+            minHeight: 0,
+          }}>
+          {rightSlot}
+        </div>
+      )}
     </div>
 
     </div>

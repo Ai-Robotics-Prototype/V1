@@ -198,12 +198,13 @@ def test_real_arm_interlock_reads_state_code_authority():
     assert "safety.zone === 'GREEN'" in src
 
 
-def test_layout_mounts_orient_control_and_not_the_retired_panel():
-    """The 3D View layout renders the modal-gated
-    OrientFlangeDownControl exactly ONCE and does NOT import or
-    render the retired JointJogPanel. If a future edit resurrects
-    the panel on this page, this pin trips. Retirement-note
-    comments naming the panel are allowed — the guard scans only
+def test_layout_mounts_orient_control_inside_jog_surface():
+    """2026-09-14 operator directive (screenshot-review pass):
+    "Orient Flange Down" moved OUT of the twin-viewer top-right
+    absolute overlay and INTO the jog surface, right of the
+    Rotation cluster (JogControls' rightSlot prop). The retired
+    JointJogPanel must still be absent. Retirement-note comments
+    naming either surface are allowed — the guard scans only
     executable code."""
     src = _read(LAYOUT)
     # Import of the new control (source module preserved as
@@ -212,16 +213,77 @@ def test_layout_mounts_orient_control_and_not_the_retired_panel():
         r"import OrientFlangeDownControl from '\.\./components/"
         r"QuickOrientButtons'",
         src), 'OrientFlangeDownControl import missing from View3DLayout'
-    # Renders the new control.
-    assert '<OrientFlangeDownControl' in src
-    # Retired panel absent from executable code (strip line + block
-    # comments — retirement notes intentionally mention the name).
+
+    # Executable-only slice (strip line + block comments).
     code = re.sub(r'//[^\n]*', '', src)
     code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
     code = re.sub(r'\{/\*.*?\*/\}', '', code, flags=re.DOTALL)
+
+    # The control mounts via JogControls' rightSlot — not as a free
+    # child of the viewer container.
+    assert '<OrientFlangeDownControl' in code, (
+        'OrientFlangeDownControl mount missing from executable code.')
+    assert re.search(
+        r'rightSlot=\{[^}]*<OrientFlangeDownControl',
+        code, re.DOTALL), (
+        'OrientFlangeDownControl must be passed as JogControls '
+        'rightSlot — moving it back to a viewer-top-right overlay '
+        'reverts the 2026-09-14 layout order.')
+
+    # Retired panel absent.
     assert 'JointJogPanel' not in code, (
         'JointJogPanel resurrected in View3DLayout executable code '
         '— the 2026-09-14 retirement was reverted.')
+
+
+def test_orient_control_wrap_is_not_a_floating_overlay():
+    """The wrap style used to position the control at
+    position:absolute top:8 right:8 as a viewer overlay. Once moved
+    into the jog surface it must flow with the parent's flex layout
+    — no absolute positioning, no viewer-corner offset. Regression
+    fence for the 2026-09-14 screenshot-review order."""
+    src = _read(BUTTON)
+    # Locate the wrap style block.
+    m = re.search(r'wrap:\s*\{(.+?)\n\s*\},', src, re.DOTALL)
+    assert m, 'styles.wrap block not found — QuickOrientButtons drifted'
+    wrap_block = m.group(1)
+    assert 'position:' not in wrap_block, (
+        'styles.wrap sets `position:` — the control was a floating '
+        'overlay again. Move it back into the jog surface.')
+    assert 'zIndex' not in wrap_block, (
+        'styles.wrap sets zIndex — overlay-only concern; parent flex '
+        'layout owns stacking now.')
+    # No top:8 / right:8 anchors either.
+    assert re.search(r'\btop:\s*\d', wrap_block) is None, (
+        'wrap has a `top:` offset — that\'s the retired viewer-'
+        'corner style.')
+    assert re.search(r'\bright:\s*\d', wrap_block) is None, (
+        'wrap has a `right:` offset — that\'s the retired viewer-'
+        'corner style.')
+
+
+def test_dev_confirmation_toast_is_gone():
+    """2026-09-14 operator directive: no green "Command published
+    (duration N ms)." dev-confirmation toast under the Orient
+    button. Success is signalled by the arm moving; failures still
+    render plain operator copy. Sweep the source for the leak
+    string + the topic/req_id/duration_ms tokens in operator-facing
+    strings (code comments explaining the retirement are allowed)."""
+    src = _read(BUTTON)
+    # Strip line comments so retirement notes don't shadow the guard.
+    code = re.sub(r'//[^\n]*', '', src)
+    # The literal toast string is gone.
+    assert 'Command published' not in code, (
+        'dev-confirmation toast string "Command published (duration '
+        'N ms)." resurfaced in executable code — retire per '
+        '2026-09-14 screenshot review.')
+    # No operator-facing template literal that embeds duration_ms
+    # or driver_subs or req_id from the response body.
+    for token in ('body.duration_ms', 'body.driver_subs',
+                  'body.req_id', 'body.next'):
+        assert token not in code, (
+            f'operator-facing template embeds {token!r} — that\'s a '
+            f'dev-diagnostic leak, use REFUSAL_COPY-only strings.')
 
 
 def test_orient_lib_still_exports_solve_and_measure():
