@@ -292,10 +292,17 @@ class SingularityGuard:
     # damped-LS solve escape_score uses, so the two guards agree on
     # kinematics.
     def qdot_component(self, q_deg, cart_index, sign_frac, joint_idx0=2,
-                       damping=0.05):
+                       damping=0.05, twist_vec=None):
+        """Component `joint_idx0` of the damped-LS qdot at q_deg for
+        a commanded Cartesian twist. Two calling shapes:
+          * cart_index in 1..6 + sign_frac: constructs a unit twist
+            on the picked axis (X,Y,Z,RX,RY,RZ).
+          * twist_vec: an explicit 6-vector (used by the sweep pin
+            to test diagonal combos and RZ). Overrides cart_index /
+            sign_frac when provided."""
         if _np is None:
             return 0.0
-        if not (1 <= int(cart_index) <= 6):
+        if twist_vec is None and not (1 <= int(cart_index) <= 6):
             return 0.0
         T = self._identity_with_base()
         Ts = [T]
@@ -318,8 +325,14 @@ class SingularityGuard:
             J[4][i] = z[1]
             J[5][i] = z[2]
         Jm = _np.asarray(J)
-        twist = _np.zeros(6)
-        twist[int(cart_index) - 1] = 1.0 if float(sign_frac) >= 0 else -1.0
+        if twist_vec is not None:
+            twist = _np.asarray(twist_vec, dtype=float)
+            if twist.shape != (6,):
+                return 0.0
+        else:
+            twist = _np.zeros(6)
+            twist[int(cart_index) - 1] = (
+                1.0 if float(sign_frac) >= 0 else -1.0)
         try:
             JJt = Jm @ Jm.T
             reg = JJt + (damping * damping) * _np.eye(6)
@@ -3909,8 +3922,15 @@ class EstunCodroidDriver(Node):
             return margin, False
         qdot_j3 = self._sing_guard.qdot_component(
             self._joint_deg, axis, signed_speed, joint_idx0=2)
+        # 2026-09-14 §5c TIE-BREAK-TO-REFUSE. Near a wrist singularity
+        # (J5 ≈ 0) the damped-LS solve can return a very small
+        # qdot_J3 whose sign is numerical noise. Operator directive
+        # item 7 (whole-bubble sweep): never permit a closing motion
+        # at the wall on an ambiguous sign — if we can't tell, and
+        # we're inside the wall, refuse. Outside the wall the
+        # ambiguity is harmless (no motion consequence either way).
         if abs(qdot_j3) < 1e-9:
-            return margin, False
+            return margin, (margin <= self._elbow_wall_deg)
         # Closing = qdot_J3 has OPPOSITE sign to J3 (pulls toward 0).
         is_closing = (j3 * qdot_j3) < 0.0
         return margin, is_closing
