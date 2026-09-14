@@ -178,6 +178,15 @@ export function LiveMarginHUD({ robot }) {
             const cause = String(soft.cause || '')
             const j = soft.limiting_joint_1based
             const escapeHint = ' Reverse this axis or switch to Joint mode to exit.'
+            // 2026-09-14 §5 ELBOW WALL — first-line geometric guard
+            // for the extension singularity. Different plain copy
+            // per operator directive item 6 ("nearly straight" +
+            // "bend the elbow"). Same escape hint.
+            if (cause === 'elbow_wall') {
+              return 'Arm is nearly straight — reach limit. Jog '
+                   + 'back or down to bend the elbow, then continue.'
+                   + escapeHint
+            }
             // 2026-09-14 §2 WALL semantics: the driver stops
             // Cartesian jog at σ_wall (above σ_hard) with cause
             // 'sing_wall'. Operator-facing copy is plain per the

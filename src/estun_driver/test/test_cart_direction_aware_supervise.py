@@ -96,6 +96,11 @@ def _fake_driver(joint_deg, prev_joint_deg=None, cur_frac=0.2):
     fake._cart_sigma_wall = 0.035
     fake._cart_wall_latched = False
     fake._WALL_LATCH_HYSTERESIS = 0.005
+    # 2026-09-14 §5 elbow-wall attrs — supervise cart branch reads
+    # these; the fixture supplies them + the bound helper so the
+    # tests that don't care about elbow behavior still compile.
+    fake._elbow_wall_deg = 10.0
+    fake._cart_elbow_latched = False
     fake._cart_joint_v_cap = 1.5
     fake._cart_joint_v_cap_per = [1.5] * 6
     # 2026-09-14 §4 dq-artifact filter attrs — fixture must supply
@@ -128,7 +133,8 @@ def _fake_driver(joint_deg, prev_joint_deg=None, cur_frac=0.2):
                  '_joint_limit_approach_scale_locked', '_jog_gaps_summary',
                  '_on_jog_supervise', '_dyn_sigma_soft',
                  '_dyn_collision_stop_mm', '_dyn_env_stop_mm',
-                 '_check_collision_locked'):
+                 '_check_collision_locked',
+                 '_elbow_margin_and_closure'):
         method = getattr(EstunCodroidDriver, name, None)
         if method is not None:
             setattr(fake, name, types.MethodType(method, fake))

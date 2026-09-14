@@ -283,12 +283,68 @@ class SingularityGuard:
             return 0.0
         return sigma_next - sigma_now
 
+    # 2026-09-14 §5 elbow-wall companion of escape_score. Returns the
+    # sign of the predicted J3-component of qdot for a commanded
+    # Cartesian twist at q_deg. Positive means J3 is moving in the +
+    # direction; combined with the sign of (q_deg[2] − J3_collinear)
+    # the caller decides "closing" (opposite signs → margin shrinks)
+    # vs "opening" (same signs → margin grows). Reuses the same
+    # damped-LS solve escape_score uses, so the two guards agree on
+    # kinematics.
+    def qdot_component(self, q_deg, cart_index, sign_frac, joint_idx0=2,
+                       damping=0.05):
+        if _np is None:
+            return 0.0
+        if not (1 <= int(cart_index) <= 6):
+            return 0.0
+        T = self._identity_with_base()
+        Ts = [T]
+        for i in range(6):
+            a_mm, alpha_deg, d_mm, theta_off_deg = self._dh[i]
+            theta = math.radians(q_deg[i] + theta_off_deg)
+            Ti = self._dh_T(theta, d_mm, a_mm, math.radians(alpha_deg))
+            T = self._matmul(T, Ti)
+            Ts.append(T)
+        p_ee = [Ts[6][k][3] for k in range(3)]
+        J = [[0.0]*6 for _ in range(6)]
+        for i in range(6):
+            z  = [Ts[i][k][2] for k in range(3)]
+            p  = [Ts[i][k][3] for k in range(3)]
+            dp = [(p_ee[k] - p[k]) / 1000.0 for k in range(3)]
+            J[0][i] = z[1]*dp[2] - z[2]*dp[1]
+            J[1][i] = z[2]*dp[0] - z[0]*dp[2]
+            J[2][i] = z[0]*dp[1] - z[1]*dp[0]
+            J[3][i] = z[0]
+            J[4][i] = z[1]
+            J[5][i] = z[2]
+        Jm = _np.asarray(J)
+        twist = _np.zeros(6)
+        twist[int(cart_index) - 1] = 1.0 if float(sign_frac) >= 0 else -1.0
+        try:
+            JJt = Jm @ Jm.T
+            reg = JJt + (damping * damping) * _np.eye(6)
+            qdot = Jm.T @ _np.linalg.solve(reg, twist)
+        except Exception:
+            return 0.0
+        return float(qdot[joint_idx0])
+
 
 # 2026-09-11: tie-break constant for direction-aware escape. dσ
 # strictly greater than this is "escape" (full scale); anything at
 # or below is "approach" (existing scale + hard-stop apply). Named
 # so a future audit can find it without regex.
 ESCAPE_TIE_EPS = 1e-6
+
+# 2026-09-14 §5 elbow-wall: the S10-140's extension singularity is
+# when upper-arm (J2→J3) and forearm (J3→J4) are collinear. FK sweep
+# with the fitted DH shows radial reach is maximal at J3 = 0° (the
+# theta_off_deg for J3 is +0.006° from the fit; ignoring the sub-
+# arcmin offset the collinear pose is J3 = 0°). See the derivation
+# in test_elbow_wall.py::test_elbow_collinear_derivation_pinned.
+ELBOW_COLLINEAR_J3_DEG = 0.0
+# Hysteresis (degrees) added to elbow_wall_deg before an approach
+# press re-arms — mirrors the σ-wall's WALL_LATCH_HYSTERESIS.
+ELBOW_LATCH_HYSTERESIS_DEG = 2.0
 
 
 class EstunCodroidDriver(Node):
@@ -550,6 +606,17 @@ class EstunCodroidDriver(Node):
                                [2.618, 2.618, 2.618, 3.142, 3.142, 3.142])
         self.declare_parameter('cart_dq_min_dt_s', 0.020)
         self.declare_parameter('cart_dq_artifact_ratio', 1.2)
+        # 2026-09-14 §5 ELBOW WALL — geometric extension guard, first
+        # line of defence in front of the σ_wall. Refuses / stops
+        # Cartesian approach when |J3 − collinear| ≤ elbow_wall_deg
+        # AND the commanded twist closes the margin. Default 10°:
+        # FK-derived reach cost at incident pose = 6.20 mm; σ_min
+        # at margin 10° ≈ 0.042 (well above σ_wall=0.035), so the
+        # elbow wall fires FIRST — the σ-wall stays as the last-
+        # line-of-defence for arms whose fitted DH we don't
+        # characterise as well. See test_elbow_wall.py for the
+        # derivation and the cross-check table.
+        self.declare_parameter('elbow_wall_deg', 10.0)
         # Mid-hold speed changes ramp, not step. Delta hysteresis avoids
         # spamming stop+restart cycles; up-ramp is capped per tick so a
         # pose that briefly re-opens (σ_min bounces back) can't
@@ -884,6 +951,28 @@ class EstunCodroidDriver(Node):
         # Rate-limited "one line per continuous artifact burst" log
         # counter — resets when a good tick is observed.
         self._cart_dq_artifact_streak = 0
+        # 2026-09-14 §5 elbow-wall state.
+        self._elbow_wall_deg = float(
+            self.get_parameter('elbow_wall_deg').value)
+        if self._elbow_wall_deg <= 0.0:
+            self._elbow_wall_deg = 10.0
+            self.get_logger().warn(
+                'elbow_wall_deg was ≤ 0, clamped to 10° default')
+        # Session-persistent elbow latch. Set when supervise fires the
+        # elbow-wall stop; cleared when supervise / start-clamp sees
+        # elbow margin > elbow_wall_deg + ELBOW_LATCH_HYSTERESIS_DEG.
+        self._cart_elbow_latched = False
+        # 2026-09-14 §5 HOLD-DEAD LATCH — the resume-under-hold fix.
+        # Set to the active hold_id whenever a guard-caused stop
+        # fires _stop_jog_locked. Cleared on explicit release
+        # (hold=false frame) so the SAME hold_id cannot resume
+        # motion under a continuously-pressed button. A new press
+        # generates a new hold_id and goes through the start-clamps
+        # (elbow + σ wall) as normal.
+        self._jog_dead_hold_id = None
+        # Once-per-dead-session log gate for hold_dead drops so the
+        # journal shows the class without spamming per-frame.
+        self._jog_dead_logged = False
         self._cart_speed_min_delta   = float(self.get_parameter('cart_speed_change_min_delta').value)
         self._cart_speed_up_per_tick = float(self.get_parameter('cart_speed_up_ramp_per_tick').value)
         self._cart_joint_soft_zone_deg   = float(self.get_parameter('cart_joint_limit_soft_zone_deg').value)
@@ -2451,6 +2540,12 @@ class EstunCodroidDriver(Node):
                 return
             with self._jog_lock:
                 self._stop_jog_locked(reason='release cmd')
+                # 2026-09-14 §5 hold-dead latch cleared ONLY on
+                # explicit release. A refresh (hold=true) with the
+                # same hold_id remains refused until the operator
+                # lets go of the button. This is the "hold is DEAD
+                # until you release" contract.
+                self._jog_dead_hold_id = None
             return
 
         # ── Staleness for refresh messages ──────────────────────────
@@ -2482,6 +2577,40 @@ class EstunCodroidDriver(Node):
             seq_in = 0
         if is_hold_refresh and hold_id is not None:
             with self._jog_lock:
+                # 2026-09-14 §5 HOLD-DEAD LATCH check. If the current
+                # hold_id has been marked dead by a guard-caused stop,
+                # drop ALL further hold=true frames for it. Persists
+                # across explicit release (cleared in the release
+                # branch above). This is what stops motion from
+                # RESUMING under a continuously-pressed button after
+                # the wall / elbow-wall / any other guard has fired.
+                # Log ONCE per dead session (first drop only) so the
+                # journal shows the class without spam.
+                if hold_id == self._jog_dead_hold_id:
+                    if not getattr(self, '_jog_dead_logged', False):
+                        self.get_logger().info(
+                            f'hold_dead: dropped refresh hold_id='
+                            f'{hold_id} seq={seq_in} — hold marked '
+                            f'dead by guard stop, release the button '
+                            f'to re-arm')
+                        self._jog_dead_logged = True
+                        # Publish ONE named rejection to /estun/rejected
+                        # so the frontend can render a plain-copy
+                        # toast for this class. Subsequent drops in
+                        # the same dead session are silent.
+                        self._reject(family,
+                            'Jog stopped. Release the button, then '
+                            'jog in a different direction.',
+                            extra={
+                                'reason_code': 'hold_dead',
+                                'hold_id':     hold_id,
+                                'seq':         seq_in,
+                            })
+                    return
+                # Reset the once-per-session log gate whenever the
+                # dead-hold_id is not the one being refused (new
+                # session, or the latch has been cleared).
+                self._jog_dead_logged = False
                 active = self._jog_active_hold_id
                 if active is not None and hold_id != active:
                     # From an old session — the current session was
@@ -3754,6 +3883,38 @@ class EstunCodroidDriver(Node):
     # Returns (signed_speed_out, refusal_or_None):
     #   * refusal_or_None is None   → caller sends signed_speed_out
     #   * refusal_or_None is a dict → caller must _reject and return
+    # ── Elbow-wall geometric guard (2026-09-14 §5) ──────────────────
+    #
+    # Refuses / stops Cartesian motion when the elbow is within
+    # elbow_wall_deg of collinear AND the commanded twist would
+    # close the margin. Fires BEFORE the σ_wall (σ ≈ 0.042 at
+    # margin=10°; σ_wall = 0.035), so the elbow wall is the first
+    # line of defence for approach; σ_wall stays as backup.
+    #
+    # Returns tuple (margin_deg, is_closing):
+    #   * margin_deg: |J3 − ELBOW_COLLINEAR_J3_DEG| in degrees
+    #     — positive; smaller = closer to collinear.
+    #   * is_closing: True iff a unit twist along the commanded
+    #     axis/sign predicts a qdot_J3 with sign OPPOSITE to J3's
+    #     sign (i.e. motion pulls J3 toward 0). False if the twist
+    #     opens the margin OR J3 is at exactly 0 (ambiguous — treat
+    #     as opening so the operator can always jog away).
+    def _elbow_margin_and_closure(self, axis, direction, signed_speed):
+        j3 = self._joint_deg[2] - ELBOW_COLLINEAR_J3_DEG
+        margin = abs(j3)
+        # Escape / opening in ambiguous cases: at exactly collinear
+        # any motion opens by symmetry — permit and let σ_wall
+        # backstop handle any weird case.
+        if abs(j3) < 1e-6:
+            return margin, False
+        qdot_j3 = self._sing_guard.qdot_component(
+            self._joint_deg, axis, signed_speed, joint_idx0=2)
+        if abs(qdot_j3) < 1e-9:
+            return margin, False
+        # Closing = qdot_J3 has OPPOSITE sign to J3 (pulls toward 0).
+        is_closing = (j3 * qdot_j3) < 0.0
+        return margin, is_closing
+
     def _cart_start_sing_clamp(self, axis, direction, signed_speed):
         if self._last_posture_ts <= 0.0:
             return signed_speed, None
@@ -3768,6 +3929,42 @@ class EstunCodroidDriver(Node):
         is_escaping = escape_dsigma > ESCAPE_TIE_EPS
         if is_escaping:
             return signed_speed, None
+
+        # 2026-09-14 §5 ELBOW WALL — first-line geometric guard.
+        # Latch clear on demonstrated elbow recovery (margin above
+        # elbow_wall_deg + hysteresis).
+        elbow_margin, elbow_closing = self._elbow_margin_and_closure(
+            axis, direction, signed_speed)
+        elbow_release_thresh = (self._elbow_wall_deg
+                                + ELBOW_LATCH_HYSTERESIS_DEG)
+        if elbow_margin > elbow_release_thresh:
+            if self._cart_elbow_latched:
+                self.get_logger().info(
+                    f'elbow wall latch CLEARED (start): '
+                    f'margin={elbow_margin:.2f}° > wall+hyst='
+                    f'{elbow_release_thresh:.2f}°')
+                self._cart_elbow_latched = False
+        # Approach + at/inside the elbow wall OR latched → REFUSE.
+        # Elbow-opening presses always pass (escape guarantee).
+        elbow_latched_refuse = (
+            self._cart_elbow_latched
+            and elbow_margin <= elbow_release_thresh)
+        if elbow_closing and (
+                elbow_margin <= self._elbow_wall_deg
+                or elbow_latched_refuse):
+            refusal = {
+                'reason_code': 'elbow_wall',
+                'reason': (
+                    'Arm is nearly straight — reach limit. Jog back '
+                    'or down to bend the elbow, then continue.'),
+                'elbow_margin_deg': float(elbow_margin),
+                'elbow_wall_deg':   float(self._elbow_wall_deg),
+                'elbow_latched':    bool(elbow_latched_refuse),
+                'cart_axis':      int(axis),
+                'cart_direction': int(direction),
+            }
+            return signed_speed, refusal
+
         # 2026-09-14 §3 field-regression fix: wall latch clear-check.
         # A fresh press can only clear the latch by DEMONSTRATED σ
         # recovery — the current σ read is what the operator got by
@@ -4072,6 +4269,33 @@ class EstunCodroidDriver(Node):
                             self._jog_index,
                             self._jog_signed_speed or 0.0)
                         is_escaping = escape_dsigma > ESCAPE_TIE_EPS
+                        # 2026-09-14 §5 ELBOW WALL — geometric first-
+                        # line stop, evaluated BEFORE the σ_wall. Fires
+                        # ONLY when the commanded direction closes the
+                        # elbow margin; elbow-opening motion is always
+                        # permitted (freedom guarantee).
+                        elbow_margin_cur, elbow_closing_cur = (
+                            self._elbow_margin_and_closure(
+                                self._jog_index,
+                                self._jog_direction,
+                                self._jog_signed_speed or 0.0))
+                        elbow_release_cur = (
+                            self._elbow_wall_deg
+                            + ELBOW_LATCH_HYSTERESIS_DEG)
+                        # Latch CLEAR path — supervise sees margin
+                        # recover above wall + hyst. Doubles as the
+                        # first-tick clear when the operator escapes
+                        # via joint jog (which we don't supervise but
+                        # which does change J3 → next cart tick reads
+                        # a healthy margin).
+                        if elbow_margin_cur > elbow_release_cur:
+                            if self._cart_elbow_latched:
+                                self.get_logger().info(
+                                    f'elbow wall latch CLEARED '
+                                    f'(supervise): margin='
+                                    f'{elbow_margin_cur:.2f}° > '
+                                    f'wall+hyst={elbow_release_cur:.2f}°')
+                                self._cart_elbow_latched = False
                         if is_escaping:
                             # Full permit. Clear any active softening
                             # so the HUD stops showing the "slowing"
@@ -4085,6 +4309,33 @@ class EstunCodroidDriver(Node):
                             # Fall through to the collision guard
                             # (below); skip σ hard-stop + reactive
                             # backstop.
+                        elif elbow_closing_cur and (
+                                elbow_margin_cur <= self._elbow_wall_deg
+                                or self._cart_elbow_latched):
+                            # Elbow-wall stop. Set the latch so start-
+                            # clamp refuses subsequent approach presses
+                            # under the SAME session and after release.
+                            if not self._cart_elbow_latched:
+                                self.get_logger().info(
+                                    f'elbow wall latch SET: margin='
+                                    f'{elbow_margin_cur:.2f}° ≤ wall='
+                                    f'{self._elbow_wall_deg:.2f}°')
+                            self._cart_elbow_latched = True
+                            if self._wsjog_trust_firmware_clamps:
+                                self._cart_softening = {
+                                    'active': True, 'mode': 'observe',
+                                    'cause': 'elbow_wall',
+                                    'elbow_margin_deg': elbow_margin_cur,
+                                    'elbow_wall_deg': self._elbow_wall_deg,
+                                    'escape_hint':
+                                        'jog back or down to bend the elbow',
+                                }
+                            else:
+                                self._stop_jog_locked(
+                                    reason=(f'elbow_wall: J3 margin='
+                                            f'{elbow_margin_cur:.2f}° ≤ '
+                                            f'wall={self._elbow_wall_deg:.2f}°'))
+                                return
                         elif sigma is not None and sigma <= self._cart_sigma_wall:
                             # 2026-09-14 §3: SET the session wall latch.
                             # Anti-creep: subsequent approach presses
@@ -4415,6 +4666,9 @@ class EstunCodroidDriver(Node):
         # older reason messages still match a known tag on replay.
         ('sing_wall',             'sing_wall'),
         ('singularity guard',     'sing_wall'),
+        # 2026-09-14 §5 elbow-wall geometric guard (fires ahead of
+        # sing_wall for the S10-140's extension singularity).
+        ('elbow_wall',            'elbow_wall'),
         # Operator disabled the arm mid-hold. Explicit action; not
         # a fault. Distinct from the release-cmd path (release_cmd
         # is the hold-end signal, disable is the servo cut).
@@ -4595,6 +4849,16 @@ class EstunCodroidDriver(Node):
         # via the "active is None" code path.
         if self._jog_active_hold_id is not None:
             self._jog_released_hold_id = self._jog_active_hold_id
+            # 2026-09-14 §5 HOLD-DEAD LATCH. Distinct from the
+            # released-latch (which clears when a NEW start-frame
+            # arrives — a hole under continuously-held button because
+            # the frontend keeps the same hold_id across ticks and
+            # only regenerates on release). This latch keeps the
+            # SAME hold_id refused until explicit release (hold=false
+            # frame) so motion never resumes under a held button.
+            # See operator field report 2026-09-14 §5 for the resume
+            # symptom that motivated this.
+            self._jog_dead_hold_id = self._jog_active_hold_id
         self._jog_active_hold_id = None
         self._jog_last_seq = 0
         # Cancel the one-shot expiry timer if we're stopping via any
@@ -5809,6 +6073,13 @@ class EstunCodroidDriver(Node):
             # 2026-09-14 §3: session wall latch. True while approach
             # is locked out; cleared only by σ recovery above wall+hyst.
             'cart_wall_latched': bool(self._cart_wall_latched),
+            # 2026-09-14 §5: elbow-wall state.
+            'elbow_wall_deg':    float(self._elbow_wall_deg),
+            'cart_elbow_latched': bool(self._cart_elbow_latched),
+            # 2026-09-14 §5: hold-dead latch. Non-None hold_id means
+            # a guard stopped the current hold and any refresh with
+            # this hold_id is being dropped until explicit release.
+            'jog_dead_hold_id':  self._jog_dead_hold_id,
             # 2026-09-14 §4: dq artifact filter counter. Increments
             # on any tick where the reactive backstop skipped an
             # over-cap dq reading as burst-packet (dt < min_dt) or

@@ -43,6 +43,9 @@ const OBSERVE_COPY = {
   // instead. Operator copy stays plain per the Sep-14 directive.
   sing_wall: () =>
     'Arm is at its reach limit — firmware is holding here.',
+  // 2026-09-14 §5: elbow-wall observe copy (trust-firmware mode).
+  elbow_wall: () =>
+    'Arm is nearly straight — reach limit is holding here.',
   sigma_soft: () =>
     'Approaching a singular pose — firmware IK is slowing the arm.',
 }

@@ -75,16 +75,26 @@ def _fake_driver(sigma_at_start, escape_dsigma=-1e-3, baseline=0.15,
     fake._baseline_speed_frac = baseline
     fake._cart_wall_latched = wall_latched
     fake._WALL_LATCH_HYSTERESIS = 0.005
+    # 2026-09-14 §5 elbow-wall attrs — default to "far from
+    # collinear + latch clear" so σ pins don't need to model the
+    # elbow guard. Dedicated elbow behavior is covered in
+    # test_elbow_wall_and_hold_dead.py.
+    fake._elbow_wall_deg = 10.0
+    fake._cart_elbow_latched = False
 
     _sg = SimpleNamespace()
     _sg.sigma_min = MagicMock(return_value=sigma_at_start)
     _sg.escape_score = MagicMock(return_value=escape_dsigma)
     _sg.scale = staticmethod(SingularityGuard.scale)
+    # Elbow closure signal: 0 → ambiguous → treated as opening,
+    # so the elbow branch never refuses in these σ pins.
+    _sg.qdot_component = MagicMock(return_value=0.0)
     fake._sing_guard = _sg
 
     fake.get_logger = MagicMock(return_value=MagicMock())
     # Bind the methods under test.
-    for name in ('_cart_start_sing_clamp', '_dyn_sigma_soft'):
+    for name in ('_cart_start_sing_clamp', '_dyn_sigma_soft',
+                 '_elbow_margin_and_closure'):
         m = getattr(EstunCodroidDriver, name)
         setattr(fake, name, types.MethodType(m, fake))
     return fake
