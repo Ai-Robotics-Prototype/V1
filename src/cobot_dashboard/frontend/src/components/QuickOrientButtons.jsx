@@ -24,7 +24,8 @@ import {
 //     angular distance between current and target orientation. NOT
 //     tied to jog speed.
 //   * Refusal copy (plain text, no jargon):
-//       "can't face down from this pose without moving the tool point"
+//       "Too far from flat for an automatic move. Jog the flange
+//        closer to flat, then press Face Down again."
 //
 // Twin path: always available. jogApi.runJointAnimation() interpolates
 // the six joint values over the computed slow duration; the animation
@@ -151,7 +152,7 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
     // One-shot IK at the SAME TCP position + new orientation.
     const q_target = solveIKToPose(armRobot, tool, currentPos, targetQuat)
     if (!q_target || q_target.length !== 6) {
-      setRefusalMsg("can't face down from this pose without moving the tool point")
+      setRefusalMsg("Too far from flat for an automatic move. Jog the flange closer to flat, then press Face Down again.")
       return
     }
 
@@ -165,7 +166,7 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
       + `currentApproach=${fmt(currentApproachWorld)}`)
 
     if (posErr > TCP_DRIFT_TOL_M) {
-      setRefusalMsg("can't face down from this pose without moving the tool point")
+      setRefusalMsg("Too far from flat for an automatic move. Jog the flange closer to flat, then press Face Down again.")
       onAtLimit?.(true)
       return
     }
@@ -173,7 +174,7 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
     // (joint-clamped), IK didn't converge to the intended pose. Same
     // refusal — no approximation.
     if (rotErr > 0.05) {
-      setRefusalMsg("can't face down from this pose without moving the tool point")
+      setRefusalMsg("Too far from flat for an automatic move. Jog the flange closer to flat, then press Face Down again.")
       onAtLimit?.(true)
       return
     }
@@ -250,7 +251,7 @@ export default function FaceDownButton({ jogApi, onAtLimit }) {
         // the tooltip / debug pane, not the operator banner.
         const OP_COPY = {
           bad_input:          "The face-down target didn't reach the arm cleanly. Try Face Down again.",
-          step_too_large:     "That orientation would swing joints too far from the current pose. Reposition and retry.",
+          step_too_large:     "Too far from flat for an automatic move. Jog the flange closer to flat, then press Face Down again.",
           estop_active:       "E-STOP is active. Release the E-STOP button, then try Face Down again.",
           zone_not_green:     "Safety zone isn't clear. Step away from the cell and try again.",
           driver_disconnected: "The robot controller is offline. Check the arm connection and retry.",
