@@ -2980,6 +2980,28 @@ class EstunCodroidDriver(Node):
             if self._jog_active:
                 self._stop_jog_locked(reason='hold transition')
 
+            # 2026-09-14 FIELD-INCIDENT FIX (alarm 2015 on J3 after
+            # repeated cart Y+/Z+ presses at full extension): apply
+            # the SAME σ hard-stop + soft-ramp the supervise tick
+            # applies, BEFORE we send the initial Robot/jog frame.
+            # Otherwise the first frame ships at operator-requested
+            # speed for one supervise interval (~50 ms) and can
+            # amplify per-joint velocity into an accel alarm when
+            # σ was already at/near hard from a prior press.
+            if mode_s == 'cartesian':
+                signed_speed, refusal = self._cart_start_sing_clamp(
+                    axis, direction, signed_speed)
+                if refusal is not None:
+                    self._reject(family, refusal['reason'],
+                                 extra=refusal)
+                    return
+                # Refresh commanded/last-sent to reflect the scaled
+                # first frame so the supervise tick's up-ramp logic
+                # doesn't slam back to the unscaled value.
+                effective_frac = abs(signed_speed)
+                self._cart_commanded_frac = effective_frac
+                self._cart_last_sent_speed = signed_speed
+
             frame = {
                 'ty': 'Robot/jog',
                 'db': {
@@ -3107,6 +3129,18 @@ class EstunCodroidDriver(Node):
                 self._reject(family,
                              f'busy — {self._jog_mode} jog on J{self._jog_index} still in flight')
                 return
+
+            # 2026-09-14 FIELD-INCIDENT FIX: same σ start-clamp as
+            # continuous cart. Pulse duration is 150 ms — long enough
+            # that an uncapped commanded speed at near-singular σ can
+            # amplify per-joint velocity into an accel alarm before
+            # the wall-clock stop timer fires.
+            signed_speed, refusal = self._cart_start_sing_clamp(
+                axis, direction, signed_speed)
+            if refusal is not None:
+                self._reject(family, refusal['reason'], extra=refusal)
+                return
+            effective_frac = abs(signed_speed)
 
             frame = {
                 'ty': 'Robot/jog',
@@ -3574,6 +3608,74 @@ class EstunCodroidDriver(Node):
                 best_safe_edge = safe_edge
                 best_headroom = headroom
         return best_scale, best_joint, best_current, best_safe_edge, best_headroom
+
+    # ── Cartesian start-time singularity clamp ──────────────────────
+    #
+    # Field-incident triage 2026-09-14 (alarm 2015 on J3 after
+    # repeated Z/Y+ presses at full extension): the continuous
+    # cartesian start path (_start_or_refresh_continuous cart branch
+    # + _start_cart_pulse) commits the initial Robot/jog frame at
+    # the operator's UNSCALED commanded speed before the supervise
+    # tick evaluates σ. When σ is already at/near the hard threshold
+    # from a prior press's residual approach, the ~50 ms window
+    # between the initial frame and the first supervise tick is
+    # enough for the controller's IK to amplify per-joint velocity
+    # into an acceleration-jump alarm.
+    #
+    # The fix (defence in depth, mirrors _on_jog_supervise's cart
+    # branch):
+    #   * σ ≤ σ_hard AND not jogging away → REFUSE with named
+    #     reason_code='sing_start_clamp'. Operator gets a plain-
+    #     copy refusal via the dashboard, same rendering path as
+    #     the supervise-tick hard-stop.
+    #   * σ_hard < σ ≤ σ_soft (dyn) AND not jogging away → scale
+    #     the initial signed_speed via SingularityGuard.scale so
+    #     the first frame ships at the SAME cap the supervise tick
+    #     would apply 50 ms later. No motion at an uncapped speed.
+    #   * dσ > ESCAPE_TIE_EPS (jogging AWAY) → permit full speed.
+    #     Freedom guarantee "jog-away always permitted" holds.
+    #
+    # Returns (signed_speed_out, refusal_or_None):
+    #   * refusal_or_None is None   → caller sends signed_speed_out
+    #   * refusal_or_None is a dict → caller must _reject and return
+    def _cart_start_sing_clamp(self, axis, direction, signed_speed):
+        if self._last_posture_ts <= 0.0:
+            return signed_speed, None
+        sigma = self._sing_guard.sigma_min(self._joint_deg)
+        if sigma is None:
+            return signed_speed, None
+        # Direction-aware escape lookahead — the SAME check
+        # _on_jog_supervise runs. If jogging away, permit full
+        # speed and skip both refuse and scale branches.
+        escape_dsigma = self._sing_guard.escape_score(
+            self._joint_deg, axis, signed_speed)
+        if escape_dsigma > ESCAPE_TIE_EPS:
+            return signed_speed, None
+        if sigma <= self._cart_sigma_hard:
+            refusal = {
+                'reason_code': 'sing_start_clamp',
+                'reason': (
+                    f'cart start clamp: too close to a stretched-out '
+                    f'pose (σ_min={sigma:.4f} ≤ hard='
+                    f'{self._cart_sigma_hard:.3f}). Use joint jog to '
+                    f'move away first, or reverse this axis to escape.'),
+                'sigma_min': float(sigma),
+                'sigma_hard': float(self._cart_sigma_hard),
+                'cart_axis': int(axis),
+                'cart_direction': int(direction),
+            }
+            return signed_speed, refusal
+        dyn_soft = self._dyn_sigma_soft(abs(signed_speed))
+        scale = SingularityGuard.scale(
+            sigma, dyn_soft, self._cart_sigma_hard)
+        if scale < 1.0:
+            scaled = signed_speed * scale
+            self.get_logger().info(
+                f'cart start clamp: σ_min={sigma:.4f} '
+                f'σ_soft(dyn)={dyn_soft:.4f} → scale={scale:.2f} '
+                f'  speed {signed_speed:+.3f} → {scaled:+.3f}')
+            return scaled, None
+        return signed_speed, None
 
     def _stop_jog_from_expiry(self):
         """Fires from the threading.Timer scheduled by _start_increment_jog.
