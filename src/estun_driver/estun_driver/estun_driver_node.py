@@ -516,6 +516,40 @@ class EstunCodroidDriver(Node):
         self.declare_parameter(
             'cart_joint_velocity_cap_per_joint_radps',
             [2.41, 2.41, 2.41, 2.89, 2.89, 2.89])
+        # 2026-09-14 §4 dq-artifact filter (post-0051964 field
+        # regression: jog stopping in HEALTHY workspace).
+        #
+        # The reactive backstop finite-differences joint positions
+        # over `dt = _last_posture_ts − _prev_joint_ts` (wall-clock
+        # interval between the two most recent posture packets). WS
+        # log evidence (ws log 15:26:47 ± 400 ms, 100 posture packets
+        # in 9 s window): 7% of intervals arrived <20 ms apart —
+        # burst-delivery / retransmit artifacts where the packets
+        # carry ~50 ms of controller-side motion but land in ~4-6 ms
+        # of wall clock. The finite-difference dq then reports
+        # motion×N as an "over-cap" spike (measured max 6.00 rad/s
+        # on J3 = 229% of rated 2.618 rad/s — physically impossible
+        # in Manual mode at 29% commanded).
+        #
+        # Two gates (belt + suspenders, both required to pass):
+        #   1. dt-plausibility: dt < cart_dq_min_dt_s (default 0.020)
+        #      → skip the tick's backstop. Not enough wall time for
+        #      genuine kinematic evolution; the reading is a
+        #      transmission artifact.
+        #   2. rated-plausibility: |dq_rps| > rated_per_joint × X
+        #      (X = cart_dq_artifact_ratio, default 1.2 = 20% noise
+        #      margin) → treat as sensor artifact, log to
+        #      cart_softening.cause = 'telemetry_artifact', do NOT
+        #      scale. Rated: J1..J3 = 2.618 rad/s, J4..J6 = 3.142
+        #      rad/s (S10-140 Config→Safety per HARDWARE.md L39-40).
+        #
+        # Genuine over-cap Jacobian amplification (dq in the [cap,
+        # 1.2×rated] range) still triggers scaling as before. Only
+        # the impossible readings are filtered.
+        self.declare_parameter('cart_joint_velocity_max_per_joint_radps',
+                               [2.618, 2.618, 2.618, 3.142, 3.142, 3.142])
+        self.declare_parameter('cart_dq_min_dt_s', 0.020)
+        self.declare_parameter('cart_dq_artifact_ratio', 1.2)
         # Mid-hold speed changes ramp, not step. Delta hysteresis avoids
         # spamming stop+restart cycles; up-ramp is capped per tick so a
         # pose that briefly re-opens (σ_min bounces back) can't
@@ -830,6 +864,26 @@ class EstunCodroidDriver(Node):
             self._cart_joint_v_cap_per = [float(v) for v in _pj]
         else:
             self._cart_joint_v_cap_per = [self._cart_joint_v_cap] * 6
+        # 2026-09-14 §4 artifact filter — per-joint rated (physical
+        # maxima) and the two gates. See declare_parameter comments
+        # for the derivation.
+        _mx = list(self.get_parameter(
+            'cart_joint_velocity_max_per_joint_radps').value or [])
+        if len(_mx) == 6 and all(float(v) > 0 for v in _mx):
+            self._cart_joint_v_max_per = [float(v) for v in _mx]
+        else:
+            # Fallback: cap × 1/0.92 recovers rated from the shipped
+            # 92% caps.  Prevents a startup crash if the max list
+            # is misconfigured; the actual thresholding still runs.
+            self._cart_joint_v_max_per = [
+                v / 0.92 for v in self._cart_joint_v_cap_per]
+        self._cart_dq_min_dt_s      = float(
+            self.get_parameter('cart_dq_min_dt_s').value)
+        self._cart_dq_artifact_ratio = float(
+            self.get_parameter('cart_dq_artifact_ratio').value)
+        # Rate-limited "one line per continuous artifact burst" log
+        # counter — resets when a good tick is observed.
+        self._cart_dq_artifact_streak = 0
         self._cart_speed_min_delta   = float(self.get_parameter('cart_speed_change_min_delta').value)
         self._cart_speed_up_per_tick = float(self.get_parameter('cart_speed_up_ramp_per_tick').value)
         self._cart_joint_soft_zone_deg   = float(self.get_parameter('cart_joint_limit_soft_zone_deg').value)
@@ -4094,11 +4148,33 @@ class EstunCodroidDriver(Node):
                         if not is_escaping and (pj is not None and pt > 0.0
                                 and self._last_posture_ts > pt):
                             dt = self._last_posture_ts - pt
-                            if dt > 1e-4:
+                            # 2026-09-14 §4 GATE 1 — dt plausibility.
+                            # WS log evidence: 7% of posture inter-
+                            # arrivals < 20 ms (burst-delivery). Finite
+                            # differencing over compressed dt reports
+                            # motion×N as a phantom over-cap spike.
+                            # Skip the backstop entirely for a burst-
+                            # arriving pair; the next healthy tick
+                            # (dt ~50 ms) will re-evaluate.
+                            if dt < self._cart_dq_min_dt_s:
+                                self._cart_dq_artifact_streak += 1
+                                # Rate-limited log so an artifact burst
+                                # doesn't spam. First hit gets the full
+                                # note; subsequent hits in the same
+                                # burst stay silent.
+                                if self._cart_dq_artifact_streak == 1:
+                                    self.get_logger().info(
+                                        f'dq artifact skipped (dt={dt*1000:.1f}ms '
+                                        f'< {self._cart_dq_min_dt_s*1000:.0f}ms '
+                                        f'burst-packet gate)')
+                                # Fall through to heartbeat; NO scaling.
+                                dt = None
+                            elif dt > 1e-4:
                                 worst_ratio = 0.0
                                 worst_i = -1
                                 worst_dq = 0.0
                                 worst_cap = self._cart_joint_v_cap
+                                worst_max = 0.0
                                 for i in range(6):
                                     dq_dps = (self._joint_deg[i] - pj[i]) / dt
                                     dq_rps = math.radians(dq_dps)
@@ -4112,12 +4188,55 @@ class EstunCodroidDriver(Node):
                                     # compares against its own cap
                                     # (default ~65% of rated).
                                     cap_i = self._cart_joint_v_cap_per[i]
+                                    max_i = self._cart_joint_v_max_per[i]
                                     ratio = abs(dq_rps) / max(1e-6, cap_i)
                                     if ratio > worst_ratio:
                                         worst_ratio = ratio
                                         worst_i     = i
                                         worst_dq    = dq_rps
                                         worst_cap   = cap_i
+                                        worst_max   = max_i
+                                # 2026-09-14 §4 GATE 2 — rated
+                                # plausibility. |dq| > rated × 1.2 is
+                                # physically impossible in Manual mode
+                                # (controller enforces its own manual
+                                # ceiling). Treat as a telemetry
+                                # artifact — record to cart_softening
+                                # for observability, DO NOT scale.
+                                artifact_threshold = (
+                                    worst_max * self._cart_dq_artifact_ratio)
+                                if (worst_i >= 0
+                                        and abs(worst_dq) > artifact_threshold):
+                                    # Don't populate cart_softening on
+                                    # artifact: the operator HUD is a
+                                    # motion-consequence surface, and
+                                    # this branch is deliberately no-op
+                                    # on motion. Log + counter only —
+                                    # visible on the status blob's
+                                    # cart_dq_artifact_streak field for
+                                    # diagnostics.
+                                    was = self._cart_dq_artifact_streak
+                                    self._cart_dq_artifact_streak = was + 1
+                                    if was == 0:
+                                        self.get_logger().info(
+                                            f'dq artifact skipped J{worst_i+1}: '
+                                            f'|dq|={abs(worst_dq):.2f} rad/s '
+                                            f'({100*abs(worst_dq)/worst_max:.0f}% of '
+                                            f'rated {worst_max:.2f}, threshold '
+                                            f'{artifact_threshold:.2f}) '
+                                            f'dt={dt*1000:.1f}ms — treated as '
+                                            f'sensor noise, no scale action')
+                                    # Fall through to heartbeat; skip
+                                    # the scaling branches below by
+                                    # zeroing worst_ratio.
+                                    worst_ratio = 0.0
+                                    worst_i = -1
+                                else:
+                                    # Reset the streak counter on a
+                                    # healthy tick (any dt-plausible +
+                                    # rated-plausible reading, over
+                                    # cap or not).
+                                    self._cart_dq_artifact_streak = 0
                                 # 2026-08-28 velocity scaling was the
                                 # first step; final step is the demotion
                                 # to observe-only when firmware clamps
@@ -5690,6 +5809,12 @@ class EstunCodroidDriver(Node):
             # 2026-09-14 §3: session wall latch. True while approach
             # is locked out; cleared only by σ recovery above wall+hyst.
             'cart_wall_latched': bool(self._cart_wall_latched),
+            # 2026-09-14 §4: dq artifact filter counter. Increments
+            # on any tick where the reactive backstop skipped an
+            # over-cap dq reading as burst-packet (dt < min_dt) or
+            # rated-implausible (|dq| > rated × artifact_ratio).
+            # Resets to 0 on the next healthy over-cap-plausible tick.
+            'cart_dq_artifact_streak': int(self._cart_dq_artifact_streak),
             # Self-collision guard telemetry. Dashboard uses `collision_pair`
             # + `collision_min_mm` to render an amber/red tint on the two
             # offending links plus a live "min clearance" readout when

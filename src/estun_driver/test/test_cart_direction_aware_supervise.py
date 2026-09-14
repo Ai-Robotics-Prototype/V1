@@ -93,8 +93,20 @@ def _fake_driver(joint_deg, prev_joint_deg=None, cur_frac=0.2):
     fake._last_sing_scale = 1.0
     fake._cart_sigma_soft = 0.06
     fake._cart_sigma_hard = 0.02
+    fake._cart_sigma_wall = 0.035
+    fake._cart_wall_latched = False
+    fake._WALL_LATCH_HYSTERESIS = 0.005
     fake._cart_joint_v_cap = 1.5
     fake._cart_joint_v_cap_per = [1.5] * 6
+    # 2026-09-14 §4 dq-artifact filter attrs — fixture must supply
+    # so the reactive-backstop block can dereference them. Values
+    # match the driver's declare_parameter defaults; the physically
+    # rated maxima follow the S10-140 spec.
+    fake._cart_joint_v_max_per = [2.618, 2.618, 2.618,
+                                   3.142, 3.142, 3.142]
+    fake._cart_dq_min_dt_s      = 0.020
+    fake._cart_dq_artifact_ratio = 1.2
+    fake._cart_dq_artifact_streak = 0
     # 2026-09-11: mock the ENFORCE default (matches
     # `declare_parameter('wsjog_trust_firmware_clamps', False)` in
     # the driver — the 2026-09-09 re-enforce fix). Fixture omitted
