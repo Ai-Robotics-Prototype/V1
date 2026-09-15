@@ -5133,6 +5133,32 @@ export default function ProgramEditor() {
       : {}
     const nextPlace = { ..._dimSeed, ...(cfg.pallet_place || {}), [field]: [...tcp] }
     const nextPallet = { ..._dimSeed, ...(cfg.pallet || {}),      [field]: [...tcp] }
+    // 2026-09-15 mirror-write fix: ALSO stamp the wizard-marker key
+    // (config.taught_pallet_corner{1,2,3} / taught_pallet_part) with
+    // the same tcp + timestamp. Prior code only wrote the geometry
+    // stores (pallet_place[field] + pallet[field]), which left the
+    // wizard-side validator (readTaught / Review card) reading an
+    // absent key and claiming "not taught" — see the Sep 15 field
+    // report on teest.json (config.pallet.corner*_tcp present,
+    // config.taught_pallet_corner* absent). ProgramWizard's
+    // readTaughtWithConfig also falls back to the geometry store to
+    // repair any program taught under the pre-fix code; this mirror
+    // makes the two stores agree going forward.
+    const _wizardMarkerKey = {
+      pallet_c1:   'taught_pallet_corner1',
+      pallet_c2:   'taught_pallet_corner2',
+      pallet_c3:   'taught_pallet_corner3',
+      pallet_part: 'taught_pallet_part',
+    }[role]
+    const _wizardMarkerPatch = _wizardMarkerKey ? {
+      [_wizardMarkerKey]: {
+        tcp:       [...tcp],
+        joints:    Array.isArray(patch.taught_joints) ? [...patch.taught_joints] : null,
+        taught_at: patch.taught_at,
+        source:    'editor_overlay',
+        skipped:   false,
+      },
+    } : {}
     const isCorner = role === 'pallet_c1' || role === 'pallet_c2' || role === 'pallet_c3'
 
     // Role → teach-session slot key (2026-08-04 record-through).
@@ -5189,7 +5215,8 @@ export default function ProgramEditor() {
       }
       // Commit the good record.
       setCurrentProgram({
-        config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet },
+        config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet,
+                  ..._wizardMarkerPatch },
         unsaved: true,
       })
       // Non-blocking findings (or errors involving other corners
@@ -5218,14 +5245,16 @@ export default function ProgramEditor() {
         if (!ack.ok) return
       }
       setCurrentProgram({
-        config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet },
+        config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet,
+                  ..._wizardMarkerPatch },
         unsaved: true,
       })
     }
 
     const merged = {
       ...(currentProgram || {}),
-      config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet },
+      config: { ...cfg, pallet_place: nextPlace, pallet: nextPallet,
+                ..._wizardMarkerPatch },
     }
     const next = advanceFrom(role, merged)
     // Advance clears the reason addendum — the current step is done,

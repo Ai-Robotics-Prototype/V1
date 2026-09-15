@@ -3310,10 +3310,16 @@ const PAGES = [
                   review page even after the operator taught all
                   four points. Read the v2 keys. */}
               {(() => {
-                const c1   = readTaught(answers, 'taught_pallet_corner1')
-                const c2   = readTaught(answers, 'taught_pallet_corner2')
-                const c3   = readTaught(answers, 'taught_pallet_corner3')
-                const part = readTaught(answers, 'taught_pallet_part')
+                // 2026-09-15 widened validator: prefer wizard-marker
+                // key; fall back to config.pallet.corner*_tcp so a
+                // program taught via the editor overlay reads as
+                // "taught" (both stores are truth — geometry is the
+                // authority codegen uses).
+                const _cfg  = buildPalletConfig(answers) ? { pallet: buildPalletConfig(answers) } : {}
+                const c1   = readTaughtWithConfig(answers, _cfg, 'taught_pallet_corner1')
+                const c2   = readTaughtWithConfig(answers, _cfg, 'taught_pallet_corner2')
+                const c3   = readTaughtWithConfig(answers, _cfg, 'taught_pallet_corner3')
+                const part = readTaughtWithConfig(answers, _cfg, 'taught_pallet_part')
                 const allFour = c1 && c2 && c3 && part
                 return isDepal ? (
                   <>
@@ -3515,6 +3521,39 @@ function readTaught(answers, key) {
   if (v.skipped) return null
   if (!Array.isArray(v.tcp) && !Array.isArray(v.joints)) return null
   return v
+}
+
+// 2026-09-15 field-triage fix: for pallet corner / part keys, ALSO
+// consult the geometry store (config.pallet.corner*_tcp + part_tcp).
+// The editor's palletTeachRecord writes only the geometry keys, so a
+// program taught via the editor overlay had config.pallet.corner*_tcp
+// populated but config.taught_pallet_corner* empty. The wizard Review
+// card was then reading the empty wizard-marker key and claiming the
+// pallet was "not fully taught" even though geometry authority (used
+// by codegen) held the operator's pose. Widen the reader here — the
+// mirror-write fix in ProgramEditor.jsx now stamps both stores going
+// forward, but this fallback repairs any program that was taught
+// under the old code.
+const PALLET_TAUGHT_KEY_TO_GEOMETRY_FIELD = {
+  taught_pallet_corner1: 'corner1_tcp',
+  taught_pallet_corner2: 'corner2_tcp',
+  taught_pallet_corner3: 'corner3_tcp',
+  taught_pallet_part:    'part_tcp',
+}
+function readTaughtWithConfig(answers, config, key) {
+  const direct = readTaught(answers, key)
+  if (direct) return direct
+  const geom = PALLET_TAUGHT_KEY_TO_GEOMETRY_FIELD[key]
+  if (!geom) return null
+  const tcp = config?.pallet?.[geom] || config?.pallet_place?.[geom]
+  if (!Array.isArray(tcp) || tcp.length < 6) return null
+  return {
+    tcp:       [...tcp],
+    joints:    null,
+    taught_at: null,
+    source:    'editor_overlay',
+    skipped:   false,
+  }
 }
 
 // Build the typed pallet config block saved into program.config.pallet.
