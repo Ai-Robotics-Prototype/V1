@@ -3647,11 +3647,13 @@ function buildPalletizeSteps(answers) {
     })
   }
 
-  // Loop back to the first inside-loop step. count = total slots.
+  // Palletize marker. count is fixed at 1 — pallet.py::expand inlines
+  // every slot per iteration; count>1 would multiply the emission
+  // (Sep 15 field bug: rows*cols*layers count → capacity² placements).
   steps.push({
     action: 'loop',
-    label: `Pallet loop — ${cycles} cycles (${rows} × ${cols} × ${layers})`,
-    goto: loopStart, count: cycles,
+    label: `Palletize marker — inline ${cycles} slots (${rows} × ${cols} × ${layers})`,
+    goto: loopStart, count: 1,
     pallet_loop: true,
   })
 

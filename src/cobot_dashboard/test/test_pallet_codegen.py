@@ -1580,6 +1580,46 @@ def test_refuse_pallet_when_loop_count_exceeds_capacity():
         f'got:\n{lua}')
 
 
+def test_pallet_loop_does_not_multiply_inline_expansion():
+    """FIELD BUG PIN — 2026-09-15 (teest.json).
+
+    The Sep 15 operator ran `teest.json`, a saved palletize with
+    rows=2, cols=2, layers=2 (capacity 8), and observed the arm
+    "keep running continuously" instead of stopping after 2 layers.
+    Root cause: the wizard/editor wrote a `pallet_loop=True` step
+    with `count = rows*cols*layers`, and the walker wrapped the
+    pallet expansion in a `for i=1,N` — pallet.py::expand already
+    inlines EVERY slot per iteration, so the outer loop multiplied
+    the emission to capacity² (8→64 place cycles).
+
+    Fix: the walker coerces pallet_loop count to 1 at emit time so
+    on-disk programs stop multiplying; the wizard/editor now write
+    count=1 directly. This pin asserts BOTH:
+      (a) the emitted Lua contains EXACTLY `rows*cols*layers` place
+          release events (no multiplication), and
+      (b) no `for i=1,N do` opener wraps the body when N > 1.
+    """
+    prog = _minimal_palletize_program(
+        rows=2, cols=2, layers=2,
+        include_pallet_loop_step=True, loop_count=8)  # count == capacity
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    import re
+    releases = re.findall(
+        r'setDO\(2\s*,\s*0\).*pallet release', lua)
+    assert len(releases) == 8, (
+        f'expected exactly 8 place releases (rows*cols*layers=8); got '
+        f'{len(releases)}. The pallet_loop multiplier regression is '
+        f'back — see the 2026-09-15 field bug.')
+    fors = re.findall(r'^\s*for\s+i\s*=\s*1\s*,\s*(\d+)',
+                       lua, re.MULTILINE)
+    multiplier_opens = [int(n) for n in fors if int(n) > 1]
+    assert not multiplier_opens, (
+        f'no `for i=1,N` opener with N>1 should wrap a pallet_loop; '
+        f'got {multiplier_opens}. The walker must coerce pallet_loop '
+        f'count to 1 because the palletize expansion is already inline.')
+
+
 def test_atomic_pallet_emit_on_ik_failure():
     """DEFECT B PIN — 2026-08-19 scoped fix.
 

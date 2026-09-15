@@ -897,11 +897,14 @@ function regenerateMoveToPalletSteps(steps, palletCfg, palletMode) {
                pallet_phase: mode === 'palletize' ? 'place' : 'pick' }
     }
     if (s?.action === 'loop' && s.pallet_loop) {
+      // count fixed at 1 — pallet.py::expand inlines every slot per
+      // iteration; count>1 multiplied placements to capacity²
+      // (Sep 15 field bug on teest.json).
       return {
         ...s,
         goto: s.goto || 2,
-        count: cycles,
-        label: `Pallet loop — ${cycles} cycles (${rows} × ${cols} × ${layers})`,
+        count: 1,
+        label: `Palletize marker — inline ${cycles} slots (${rows} × ${cols} × ${layers})`,
       }
     }
     return s

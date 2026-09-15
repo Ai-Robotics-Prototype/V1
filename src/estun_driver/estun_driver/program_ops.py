@@ -3714,6 +3714,17 @@ def codegen_lua_from_program(
                           if str(s.get('action') or '').lower() == 'loop'),
                         None)
     _loop_count  = int((_loop_step.get('count') if _loop_step else 0) or 0)
+    # 2026-09-15 field bug (teest.json): a `pallet_loop=True` step wrote
+    # by the wizard/editor with count=rows*cols*layers multiplied the
+    # inline pallet expansion (see estun_driver/pallet.py::expand — it
+    # already emits ALL slots INLINE per iteration). Runtime placements
+    # became capacity² instead of capacity (8→64 on the operator's
+    # 2×2×2). Force pallet_loop count to 1 at the walker so existing
+    # on-disk programs stop multiplying — the wizard/editor fix
+    # prevents new programs from writing count>1.
+    if _loop_step is not None and _loop_step.get('pallet_loop') is True \
+            and _loop_count != 1:
+        _loop_count = 1
     _use_forloop = _loop_step is not None and _loop_count >= 2
     _use_goto    = _loop_step is not None and _loop_count == 0
     needs_start_label = _use_goto
@@ -4373,6 +4384,11 @@ def codegen_lua_from_program(
         # inside the loop keeps each cycle ending at a safe pose.
         if action == 'loop':
             count = int(step.get('count') or 0)
+            # 2026-09-15: pallet_loop is a marker only — pallet.py::expand
+            # inlines every slot. Coerce to no-op so on-disk programs
+            # with count>1 stop multiplying at the closer too.
+            if step.get('pallet_loop') is True and count != 1:
+                count = 1
             if count == 0:
                 exec_lines.append(f'goto _prog_start  -- step {action}  '
                                   f'continuous (count=0)')
