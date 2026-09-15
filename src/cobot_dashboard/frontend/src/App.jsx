@@ -4,6 +4,7 @@ import { isFeatureEnabled, TAB_TO_FEATURE } from './lib/edition'
 import TopBar from './components/TopBar'
 import StatusBar from './components/StatusBar'
 import StaleCodegenBanner from './components/StaleCodegenBanner'
+import ControllerOfflineBanner from './components/ControllerOfflineBanner'
 import ToastContainer from './components/ToastContainer'
 import EStopOverlay from './components/EStopOverlay'
 import AlarmRecoveryModal from './components/AlarmRecoveryModal'
@@ -234,6 +235,7 @@ export default function App() {
         </div>
 
         <StaleCodegenBanner />
+        <ControllerOfflineBanner />
         {/* 2026-09-08 (revised, later same day): SystemBanners retired
             per operator directive. Guard-state visibility moves into
             the StatusBar footer as compact full-only text; disconnect

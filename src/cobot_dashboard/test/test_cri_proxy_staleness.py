@@ -180,3 +180,46 @@ def test_boundary_exactly_three_seconds_is_not_stale():
     _tick(s, js_age_s=3.0)
     assert s["is_disconnected"] is False
     assert s["consecutive_stale_ticks"] == 0
+
+
+# ── 2026-09-15 AUTO-RECOVERY PIN ──────────────────────────────────
+#
+# The staleness watchdog now runs for both JOG_BACKEND=ws and ros2.
+# Under ws, /estun/status silence is the authoritative offline signal:
+# when the controller drops (power-cycle, network partition), the WS
+# estun_driver stops publishing both /joint_states (from RobotPosture)
+# and /estun/status until it reconnects. These pins protect the
+# decision helper being fed from either backend without the
+# JOG_BACKEND=='ros2' gate that used to wrap the watchdog loop.
+def test_auto_recovery_ws_backend_outage_flips_down():
+    """WS-mode controller power-cycle: /estun/status + /joint_states
+    both stop; three consecutive stale ticks past 3.0 s flip DOWN so
+    the dashboard's operator-facing banner fires without a page
+    refresh. Pre-2026-09-15 this scenario stayed forever fresh (the
+    loop's JOG_BACKEND=='ros2' gate skipped the whole body under
+    ws)."""
+    s = _fresh_state()
+    # 200 ms cadence × 3 ticks after 3 s of silence → both signals
+    # cross the 3.0 s threshold together.
+    assert _tick(s, js_age_s=3.2, estun_age_s=3.2) is None
+    assert _tick(s, js_age_s=3.4, estun_age_s=3.4) is None
+    assert _tick(s, js_age_s=3.6, estun_age_s=3.6) == "down"
+    assert s["is_disconnected"] is True
+    assert s["flips_down"] == 1
+
+
+def test_auto_recovery_ws_backend_recovery_flips_up():
+    """WS-mode reconnect: driver's WS to the controller comes back,
+    /joint_states + /estun/status resume, single fresh tick flips
+    UP. This is what unblocks the operator without a refresh."""
+    s = _fresh_state()
+    _tick(s, js_age_s=3.2, estun_age_s=3.2)
+    _tick(s, js_age_s=3.4, estun_age_s=3.4)
+    _tick(s, js_age_s=3.6, estun_age_s=3.6)  # down
+    assert s["is_disconnected"] is True
+    # Driver's reconnect fires — RobotPosture / RobotStatus start
+    # arriving again → js_age drops to ~4 ms.
+    flip = _tick(s, js_age_s=0.004, estun_age_s=0.05)
+    assert flip == "up"
+    assert s["is_disconnected"] is False
+    assert s["flips_up"] == 1

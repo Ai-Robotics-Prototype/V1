@@ -1706,45 +1706,59 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         'enabled' state on every message (natural flip-up). This loop
         only handles the DOWN edge + flap bookkeeping.
 
-        Decision logic is in cobot_dashboard.staleness so unit tests
-        can exercise the state machine with a fake clock.
+        2026-09-15 AUTO-RECOVERY: watchdog now runs for BOTH backends.
+        Prior version was gated `if _JOG_BACKEND_ENV == "ros2":` so under
+        JOG_BACKEND=ws (the live config) a silent driver never flipped
+        STATE.robot.connected=False — dashboard held the pre-outage state
+        forever, so the operator had to hit refresh after a controller
+        power-cycle. Under ws the WS estun_driver publishes both
+        /joint_states (from RobotPosture) and /estun/status — both stamps
+        stop when the controller drops, so the same two-signal AND-stale
+        decision applies.
         """
         from .staleness import staleness_decide  # local import — avoid module-time coupling
         is_disconnected = False
         while True:
             try:
-                if _JOG_BACKEND_ENV == "ros2":
-                    now_mono = time.monotonic()
-                    js_age = (now_mono - _last_joint_states_mono[0]
-                              if _last_joint_states_mono[0] > 0 else 1e9)
-                    estun_age = time.time() - _last_estun_status_ts[0]
-                    new_stale, new_disc, flip = staleness_decide(
-                        js_age_s=js_age,
-                        estun_age_s=estun_age,
-                        consecutive_stale_ticks=_cri_proxy_stats["consecutive_stale_ticks"],
-                        is_disconnected=is_disconnected,
-                    )
-                    _cri_proxy_stats["consecutive_stale_ticks"] = new_stale
-                    if flip == "down":
-                        with _state_lock:
-                            r = STATE.setdefault("robot", {})
-                            r["connected"]    = False
-                            r["enabled"]      = False
-                            r["enabling"]     = False
-                            r["mode"]         = "unknown"
-                            r["safety_mode"]  = "unknown"
-                            r["moving"]       = False
-                            r["allow_jog"]    = False
-                            r["allow_cartesian_jog"] = False
-                            r["allow_power"]  = False
-                            r["allow_move"]   = False
-                            r["alarm"]        = False
-                            r["state_code"]   = 0
-                            r["status_flag"]  = 0
-                            # Safe-side: undefined monitor_only defaults to
-                            # "on" in frontend gating — explicitly True on
-                            # DOWN keeps the safe-until-proven-live semantic.
-                            r["monitor_only"] = True
+                now_mono = time.monotonic()
+                js_age = (now_mono - _last_joint_states_mono[0]
+                          if _last_joint_states_mono[0] > 0 else 1e9)
+                estun_age = time.time() - _last_estun_status_ts[0]
+                new_stale, new_disc, flip = staleness_decide(
+                    js_age_s=js_age,
+                    estun_age_s=estun_age,
+                    consecutive_stale_ticks=_cri_proxy_stats["consecutive_stale_ticks"],
+                    is_disconnected=is_disconnected,
+                )
+                _cri_proxy_stats["consecutive_stale_ticks"] = new_stale
+                if flip == "down":
+                    with _state_lock:
+                        r = STATE.setdefault("robot", {})
+                        r["connected"]    = False
+                        r["enabled"]      = False
+                        r["enabling"]     = False
+                        r["mode"]         = "unknown"
+                        r["safety_mode"]  = "unknown"
+                        r["moving"]       = False
+                        r["allow_jog"]    = False
+                        r["allow_cartesian_jog"] = False
+                        r["allow_power"]  = False
+                        r["allow_move"]   = False
+                        r["alarm"]        = False
+                        r["state_code"]   = 0
+                        r["status_flag"]  = 0
+                        # Safe-side: undefined monitor_only defaults to
+                        # "on" in frontend gating — explicitly True on
+                        # DOWN keeps the safe-until-proven-live semantic.
+                        r["monitor_only"] = True
+                        # 2026-09-15 AUTO-RECOVERY: operator-visible offline
+                        # flag. Frontend banner keys off this + the wall-
+                        # clock stamp so it can render "Controller offline
+                        # — reconnecting…" (amber) during the outage and
+                        # briefly "Reconnected" (green) after recovery.
+                        r["controller_offline"]       = True
+                        r["controller_offline_since"] = time.time()
+                        if _JOG_BACKEND_ENV == "ros2":
                             r["arm_source"]   = "cri_ros2"
                             r["arm_source_note"] = (
                                 f"/joint_states stale {js_age:.1f}s — "
@@ -1752,17 +1766,33 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
                                 f"#{_cri_proxy_stats['flips_down'] + 1}). "
                                 "Enable managed by the CRI launch; check "
                                 "the launch tmux for errors.")
-                        _cri_proxy_stats["flips_down"] += 1
-                        _cri_proxy_stats["last_flip_ts"] = time.time()
-                        _cri_proxy_stats["last_flip_kind"] = "down"
-                    elif flip == "up":
-                        # _on_joint_states already populated fresh state on
-                        # the fresh JS callback — this branch is bookkeeping
-                        # only. Flap count is what operators watch.
-                        _cri_proxy_stats["flips_up"] += 1
-                        _cri_proxy_stats["last_flip_ts"] = time.time()
-                        _cri_proxy_stats["last_flip_kind"] = "up"
-                    is_disconnected = new_disc
+                        else:
+                            # WS backend: /estun/status silence is the
+                            # authoritative offline signal.
+                            r["arm_source"]   = "ws_estun"
+                            r["arm_source_note"] = (
+                                f"/estun/status stale {estun_age:.1f}s — "
+                                f"controller link down (flip "
+                                f"#{_cri_proxy_stats['flips_down'] + 1}). "
+                                "Driver is reconnecting on its own; controls "
+                                "will re-arm automatically when the link returns.")
+                    _cri_proxy_stats["flips_down"] += 1
+                    _cri_proxy_stats["last_flip_ts"] = time.time()
+                    _cri_proxy_stats["last_flip_kind"] = "down"
+                elif flip == "up":
+                    # _on_joint_states / _on_estun_status already populated
+                    # fresh state on the fresh callback — this branch is
+                    # bookkeeping + clears the offline flag so the frontend
+                    # transitions from amber "offline" to a brief green
+                    # "reconnected" toast (banner reads the ts + flip_kind).
+                    with _state_lock:
+                        r = STATE.setdefault("robot", {})
+                        r["controller_offline"]      = False
+                        r["controller_recovered_ts"] = time.time()
+                    _cri_proxy_stats["flips_up"] += 1
+                    _cri_proxy_stats["last_flip_ts"] = time.time()
+                    _cri_proxy_stats["last_flip_kind"] = "up"
+                is_disconnected = new_disc
             except Exception:
                 pass
             time.sleep(0.2)
@@ -2295,6 +2325,22 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         with _state_lock:
             r = STATE.setdefault("robot", {})
             r["connected"]   = bool(d.get("connected", False))
+            # 2026-09-15 AUTO-RECOVERY: content-authoritative offline flag.
+            # The staleness watchdog sets controller_offline=True purely
+            # from silence. When a fresh /estun/status arrives we sync
+            # the flag to the driver's own `connected` field — if the
+            # driver says the controller link is up, clear the offline
+            # latch (frontend banner transitions from amber to a brief
+            # green "reconnected" toast); if the driver still reports
+            # connected=false, keep it set so the banner remains up.
+            if r["connected"]:
+                if r.get("controller_offline"):
+                    r["controller_recovered_ts"] = time.time()
+                r["controller_offline"] = False
+            else:
+                r["controller_offline"] = True
+                if r.get("controller_offline_since") in (None, 0, 0.0):
+                    r["controller_offline_since"] = time.time()
             r["mode"]        = d.get("robot_mode", "unknown")
             r["safety_mode"] = d.get("safety_mode", "unknown")
             r["status_flag"] = int(d.get("status_flag", 0))
