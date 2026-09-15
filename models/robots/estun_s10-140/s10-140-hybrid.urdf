@@ -1,0 +1,50 @@
+<?xml version="1.0"?>
+<robot name="estun_s10_140">
+  <!-- Hybrid: REAL colored meshes for base_link+link_1 (from CS0/CS1 STEP exports), primitives for link_2..6 pending export. Exact calibrated-DH kinematics. Z-up (viewer applies rotation.x=-90). -->
+  <material name="mp"><color rgba="0.55 0.6 0.72 1"/></material>
+  <link name="base_link">
+    <visual><origin xyz="0.000000 0.000000 0.000000" rpy="0.000000 -0.000000 0.000000"/>
+      <geometry><mesh filename="links/link0_base.glb"/></geometry></visual>
+  </link>
+  <link name="link_1">
+    <visual><origin xyz="0.000000 0.000000 -0.186000" rpy="0.000000 -0.000000 0.000000"/>
+      <geometry><mesh filename="links/link1_shoulder.glb"/></geometry></visual>
+  </link>
+  <link name="link_2"><visual><origin xyz="0.00000 -0.08750 -0.00000" rpy="1.57080 -0.00000 0.00000"/><geometry><cylinder radius="0.04" length="0.17500"/></geometry><material name="mp"/></visual></link>
+  <link name="link_3"><visual><origin xyz="0.35042 0.00000 -0.08075" rpy="3.14159 1.34431 3.14159"/><geometry><cylinder radius="0.04" length="0.71921"/></geometry><material name="mp"/></visual></link>
+  <link name="link_4"><visual><origin xyz="0.26909 0.00000 0.08066" rpy="-0.00000 1.27958 -0.00000"/><geometry><cylinder radius="0.04" length="0.56184"/></geometry><material name="mp"/></visual></link>
+  <link name="link_5"><visual><origin xyz="0.00000 -0.08475 0.00000" rpy="1.57080 -0.00000 0.00000"/><geometry><cylinder radius="0.04" length="0.16950"/></geometry><material name="mp"/></visual></link>
+  <link name="link_6"><visual><origin xyz="0 0 0"/><geometry><sphere radius="0.04"/></geometry><material name="mp"/></visual></link>
+  <link name="tool0"/>
+  <joint name="joint_1" type="revolute">
+    <parent link="base_link"/><child link="link_1"/>
+    <origin xyz="0.000000 0.000000 0.186000" rpy="0.000000 -0.000000 0.000000"/>
+    <axis xyz="0 0 1"/><limit lower="-6.2832" upper="6.2832" effort="200" velocity="3.14"/>
+  </joint>
+  <joint name="joint_2" type="revolute">
+    <parent link="link_1"/><child link="link_2"/>
+    <origin xyz="0.000000 0.000000 0.220052" rpy="0.000000 -0.000000 -1.570796"/>
+    <axis xyz="0 0 1"/><limit lower="-6.2832" upper="6.2832" effort="200" velocity="3.14"/>
+  </joint>
+  <joint name="joint_3" type="revolute">
+    <parent link="link_2"/><child link="link_3"/>
+    <origin xyz="0.000000 -0.175000 -0.000000" rpy="-1.570796 -0.000000 0.000000"/>
+    <axis xyz="0 0 1"/><limit lower="-2.7925" upper="2.7925" effort="200" velocity="3.14"/>
+  </joint>
+  <joint name="joint_4" type="revolute">
+    <parent link="link_3"/><child link="link_4"/>
+    <origin xyz="0.700845 0.000000 -0.161500" rpy="0.000000 -0.000000 -1.570796"/>
+    <axis xyz="0 0 1"/><limit lower="-6.2832" upper="6.2832" effort="200" velocity="3.14"/>
+  </joint>
+  <joint name="joint_5" type="revolute">
+    <parent link="link_4"/><child link="link_5"/>
+    <origin xyz="0.538179 0.000000 0.161314" rpy="3.141593 -0.000000 0.000000"/>
+    <axis xyz="0 0 1"/><limit lower="-6.2832" upper="6.2832" effort="200" velocity="3.14"/>
+  </joint>
+  <joint name="joint_6" type="revolute">
+    <parent link="link_5"/><child link="link_6"/>
+    <origin xyz="0.000000 -0.169500 0.000000" rpy="1.570796 -0.000000 0.000000"/>
+    <axis xyz="0 0 1"/><limit lower="-6.2832" upper="6.2832" effort="200" velocity="3.14"/>
+  </joint>
+  <joint name="flange_to_tool0" type="fixed"><parent link="link_6"/><child link="tool0"/><origin xyz="0.000000 0.000000 0.000000" rpy="1.570796 -0.000000 0.000000"/></joint>
+</robot>

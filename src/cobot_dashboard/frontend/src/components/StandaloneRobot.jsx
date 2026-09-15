@@ -8,6 +8,9 @@ import * as THREE from 'three'
 import { useStore } from '../store/useStore'
 import { startHomeMove } from '../lib/homeAnim'
 import { startJointAnimation } from '../lib/jointAnim'
+import {
+  applyStoreTick, poseJoint, releaseJoint, followLiveAll, anyPosing,
+} from '../lib/twinFollowState'
 
 // Shared DRACOLoader — registered once for the app lifetime. Twin GLBs
 // are Draco-compressed now (see models/robots/estun_s10-140/links/),
@@ -47,11 +50,25 @@ export default function StandaloneRobot({ onRobotReady } = {}) {
   const robotRef   = useRef(null)
   const targetsRef = useRef([0, 0, 0, 0, 0, 0])
   const currentRef = useRef([0, 0, 0, 0, 0, 0])
-  // Per-joint manual-jog override. When mask[i] is true the store→
-  // targets mirror skips joint i, so the slider write is the single
-  // source of truth for that joint until Reset. Other joints keep
-  // tracking the store (per instruction 6 of the fix).
+  // Per-joint TWIN-POSING mask. `mask[i] === true` means the operator
+  // is actively posing joint i (dragging its slider, or previewing a
+  // Face Down orient) — the store→targets mirror skips that joint so
+  // the operator's write is the single source of truth. `false` on all
+  // six joints is LIVE-FOLLOW: the twin mirrors the real arm at WS
+  // stream rate.
+  //
+  // Release paths back to LIVE-FOLLOW:
+  //   * releaseJointMask(i) — per-joint (slider pointerup fires this).
+  //   * followLive()        — all six (Follow-Robot button fires this).
+  // Neither path yanks joints anywhere — the next store mirror tick
+  // seeds targets from the LATEST /joint_states value, so the twin
+  // smoothly catches up from wherever the preview left it.
   const manualMaskRef = useRef([false, false, false, false, false, false])
+  // Change-listeners for the mask — parents subscribe via
+  // jogApi.onManualMaskChange to render the PREVIEWING chip + the
+  // Follow-Robot button without polling. Every write to manualMaskRef
+  // must call _notifyMaskChange() so listeners stay coherent.
+  const maskListenersRef = useRef([])
   // Active Home animation handle (see lib/homeAnim.js).
   const homeAnimRef   = useRef(null)
 
@@ -75,18 +92,11 @@ export default function StandaloneRobot({ onRobotReady } = {}) {
   const storePositions = useStore((s) => s.joints?.positions)
 
   useEffect(() => {
-    if (!Array.isArray(storePositions) || storePositions.length < 6) return
-    const mask = manualMaskRef.current
-    const t    = targetsRef.current
-    // In-place mutation (not array replacement) so that
-    // JointJogPanel writes to targetsRef.current[i] between mirror
-    // ticks survive when mask[i] is false — and are protected
-    // outright when mask[i] is true.
-    for (let i = 0; i < 6; i++) {
-      if (mask[i]) continue
-      const v = Number(storePositions[i])
-      t[i] = Number.isFinite(v) ? v : 0
-    }
+    // Delegates to lib/twinFollowState.applyStoreTick so the mirror
+    // rule (skip masked joints, seed the rest from WS positions) is
+    // unit-testable without a browser. In-place mutation on the ref
+    // array is preserved.
+    applyStoreTick(manualMaskRef.current, targetsRef.current, storePositions)
   }, [storePositions])
 
   useEffect(() => {
@@ -175,6 +185,12 @@ export default function StandaloneRobot({ onRobotReady } = {}) {
             homeAnimRef.current = null
           }
         }
+        const notifyMaskChange = () => {
+          const snapshot = manualMaskRef.current.slice()
+          for (const cb of maskListenersRef.current) {
+            try { cb(snapshot) } catch { /* nop */ }
+          }
+        }
         const jogApi = {
           robot,
           setJointRad: (idx, rad) => {
@@ -182,23 +198,58 @@ export default function StandaloneRobot({ onRobotReady } = {}) {
             const j = robot.joints?.[JOINT_NAMES[idx]]
             if (!j || typeof j.setJointValue !== 'function') return
             cancelHome()
-            manualMaskRef.current[idx] = true
+            const transitioned = poseJoint(manualMaskRef.current, idx)
             j.setJointValue(rad)
             currentRef.current[idx] = rad
             targetsRef.current[idx] = rad
+            if (transitioned) notifyMaskChange()
           },
           resetAll: () => {
             cancelHome()
+            const anyWasSet = anyPosing(manualMaskRef.current)
+            followLiveAll(manualMaskRef.current)
             for (let i = 0; i < 6; i++) {
-              manualMaskRef.current[i] = false
               robot.joints?.[JOINT_NAMES[i]]?.setJointValue?.(0)
               currentRef.current[i] = 0
               targetsRef.current[i] = 0
+            }
+            if (anyWasSet) notifyMaskChange()
+          },
+          // Release ONE joint's TWIN-POSING mask back to LIVE-FOLLOW.
+          // Called by JointJogPanel on slider pointerup — the operator
+          // stopped dragging, resume live tracking of that joint. Does
+          // NOT force the joint anywhere — the next store mirror tick
+          // seeds targets from the latest /joint_states so the twin
+          // catches up smoothly from wherever the preview left it.
+          releaseJointMask: (idx) => {
+            if (releaseJoint(manualMaskRef.current, idx)) notifyMaskChange()
+          },
+          // LIVE-FOLLOW reset — clear ALL six masks so the twin resumes
+          // mirroring the real arm at stream rate. Distinct from
+          // resetAll(): does NOT yank joints to zero, only clears the
+          // masks. Bound to the "Follow robot" button.
+          followLive: () => {
+            cancelHome()
+            if (followLiveAll(manualMaskRef.current)) notifyMaskChange()
+          },
+          // Subscribe to TWIN-POSING mask changes. Fires once
+          // synchronously on register with the current snapshot, then
+          // again on every write to manualMaskRef. Returns an
+          // unsubscribe fn — the panel unmount effect calls it.
+          onManualMaskChange: (cb) => {
+            if (typeof cb !== 'function') return () => {}
+            maskListenersRef.current.push(cb)
+            try { cb(manualMaskRef.current.slice()) } catch { /* nop */ }
+            return () => {
+              const arr = maskListenersRef.current
+              const i = arr.indexOf(cb)
+              if (i >= 0) arr.splice(i, 1)
             }
           },
           setJointsRad: (rads) => {
             if (!Array.isArray(rads) || rads.length < 6) return
             cancelHome()
+            const wasAllClear = !manualMaskRef.current.some(Boolean)
             for (let i = 0; i < 6; i++) {
               const rad = Number(rads[i])
               if (!Number.isFinite(rad)) continue
@@ -209,16 +260,25 @@ export default function StandaloneRobot({ onRobotReady } = {}) {
               currentRef.current[i] = rad
               targetsRef.current[i] = rad
             }
+            if (wasAllClear) notifyMaskChange()
           },
           // Smooth coordinated return to all-zeros. Same behavior as
           // URDFArm's home(); see lib/homeAnim.js for the animation.
           home: () => {
             cancelHome()
+            const wasAllClear = !manualMaskRef.current.some(Boolean)
             homeAnimRef.current = startHomeMove({
               robot,
               currentRef, targetsRef, manualMaskRef,
-              onComplete: () => { homeAnimRef.current = null },
+              onComplete: () => {
+                homeAnimRef.current = null
+                // homeAnim releases all masks on natural completion;
+                // notify so the PREVIEWING chip clears and live-follow
+                // resumes.
+                notifyMaskChange()
+              },
             })
+            if (wasAllClear) notifyMaskChange()
           },
           // Twin-only interpolated move to an arbitrary target joint
           // vector. Used by QuickOrientButtons. Masks stay latched at
@@ -226,6 +286,7 @@ export default function StandaloneRobot({ onRobotReady } = {}) {
           // the homeAnimRef slot with home() so cancels are unified.
           runJointAnimation: (q_target, durationMs) => {
             cancelHome()
+            const wasAllClear = !manualMaskRef.current.some(Boolean)
             homeAnimRef.current = startJointAnimation({
               robot,
               q_target,
@@ -233,6 +294,7 @@ export default function StandaloneRobot({ onRobotReady } = {}) {
               currentRef, targetsRef, manualMaskRef,
               onComplete: () => { homeAnimRef.current = null },
             })
+            if (wasAllClear) notifyMaskChange()
           },
         }
         onRobotReady?.(jogApi)
@@ -289,6 +351,81 @@ export default function StandaloneRobot({ onRobotReady } = {}) {
     }, 40)
     return () => clearInterval(id)
   }, [])
+
+  // ── Self-collision tint (Phase 3) ────────────────────────────────
+  // Driver publishes {collision_pair:[a,b], collision_min_mm, warn,
+  // stop, warning} in /estun/status; backend mirrors into
+  // robot.collision_*. When the min-pair distance drops into the
+  // warn zone we tint the two offending links amber; below stop,
+  // red. On clear, restore the baked material properties. Twin URDF
+  // uses short link names (link1..link6); driver's capsule YAML uses
+  // long names (link1_shoulder..link6_flange) — LINK_NAME_TWIN maps
+  // one to the other.
+  const collisionPair    = useStore((s) => s.robot?.collision_pair)
+  const collisionMinMm   = useStore((s) => s.robot?.collision_min_mm)
+  const collisionWarnMm  = useStore((s) => s.robot?.collision_warn_mm) || 80
+  const collisionStopMm  = useStore((s) => s.robot?.collision_stop_mm) || 30
+  const tintedLinksRef = useRef({})   // { linkName: [{mesh, origEmissive, origHex}] }
+  useEffect(() => {
+    const LINK_NAME_TWIN = {
+      base_link: 'base_link',
+      link1_shoulder:  'link1', link2_upper_arm: 'link2',
+      link3_forearm:   'link3', link4_wrist1:    'link4',
+      link5_wrist2:    'link5', link6_flange:    'link6',
+    }
+    const robot = robotRef.current
+    if (!robot || !robot.links) return
+    // Determine tint color: below stop → red, else amber. If pair
+    // is null or clearance above warn, restore (no tint).
+    const shouldTint = collisionPair && Array.isArray(collisionPair)
+      && collisionMinMm != null && collisionMinMm <= collisionWarnMm
+    const isStopLevel = shouldTint && collisionMinMm <= collisionStopMm
+    const tintHex     = isStopLevel ? 0xB91C1C : 0xD97706   // red / amber
+    // Restore any previously tinted meshes that aren't in the new pair.
+    const activeShort = shouldTint
+      ? new Set(collisionPair.map((n) => LINK_NAME_TWIN[n]).filter(Boolean))
+      : new Set()
+    Object.keys(tintedLinksRef.current).forEach((linkName) => {
+      if (activeShort.has(linkName)) return
+      const entries = tintedLinksRef.current[linkName] || []
+      entries.forEach(({ mesh, origEmissive, origHex }) => {
+        if (mesh.material && mesh.material.emissive) {
+          mesh.material.emissive.setHex(origHex || 0x000000)
+          mesh.material.emissiveIntensity = origEmissive ?? 0
+        }
+      })
+      delete tintedLinksRef.current[linkName]
+    })
+    if (!shouldTint) return
+    // Apply tint to each active link's meshes.
+    activeShort.forEach((linkName) => {
+      const linkObj = robot.links?.[linkName]
+      if (!linkObj) return
+      if (tintedLinksRef.current[linkName]) {
+        // Already tinted — update color in place (warn → stop transition).
+        tintedLinksRef.current[linkName].forEach(({ mesh }) => {
+          if (mesh.material && mesh.material.emissive) {
+            mesh.material.emissive.setHex(tintHex)
+            mesh.material.emissiveIntensity = 0.55
+          }
+        })
+        return
+      }
+      const entries = []
+      linkObj.traverse((c) => {
+        if (c.isMesh && c.material && c.material.emissive) {
+          entries.push({
+            mesh: c,
+            origHex: c.material.emissive.getHex(),
+            origEmissive: c.material.emissiveIntensity ?? 0,
+          })
+          c.material.emissive.setHex(tintHex)
+          c.material.emissiveIntensity = 0.55
+        }
+      })
+      tintedLinksRef.current[linkName] = entries
+    })
+  }, [collisionPair, collisionMinMm, collisionWarnMm, collisionStopMm])
 
   // Lights ride with the robot so this component is self-contained on
   // any Canvas that mounts it. Hemisphere (sky/ground bounce) is what

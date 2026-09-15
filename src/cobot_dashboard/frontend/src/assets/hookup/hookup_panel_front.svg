@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 550" preserveAspectRatio="xMidYMid meet">
+  <!-- Placeholder for operator's hookup_panel_front.png. Coordinates
+       in /opt/cobot/hookup/hookup_map.json are percentage-anchored;
+       replacing this SVG with the real photo requires zero code
+       changes. Layout mirrors the target: top half = valve manifold
+       (2 rows × 5 columns, each station has upper + lower port
+       fitting), bottom half = M8 grid (rows 0-1 = IN1..IN10,
+       rows 2-3 = OUT1..OUT10, left→right per row). -->
+  <defs>
+    <linearGradient id="chassis" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1E293B"/>
+      <stop offset="1" stop-color="#0F172A"/>
+    </linearGradient>
+    <linearGradient id="valve" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#334155"/>
+      <stop offset="1" stop-color="#1E293B"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="500" height="550" fill="url(#chassis)"/>
+
+  <!-- Valve manifold header -->
+  <text x="250" y="18" fill="#64748B" font-size="10" text-anchor="middle"
+        font-family="system-ui, sans-serif" letter-spacing="2">
+    AIR-STATION MANIFOLD
+  </text>
+
+  <!-- Row 1: 5/2 SS #1 · 5/2 SS #2 · HIFLO 3/2 N/C #1 · HIFLO 3/2 N/C #2 · 5/3
+       Each station is a rounded block with two port fittings (A above, B below). -->
+  <g>
+    <g><rect x="20"  y="30" width="60" height="90" rx="6" fill="url(#valve)"
+             stroke="#475569" stroke-width="1"/>
+       <text x="50" y="70" fill="#94A3B8" font-size="8" text-anchor="middle" font-family="system-ui, sans-serif">5/2 SS #1</text>
+       <circle cx="45" cy="66"  r="6" fill="#0F172A" stroke="#94A3B8"/>
+       <circle cx="45" cy="132" r="6" fill="#0F172A" stroke="#94A3B8"/>
+    </g>
+    <g><rect x="115" y="30" width="60" height="90" rx="6" fill="url(#valve)"
+             stroke="#475569" stroke-width="1"/>
+       <text x="145" y="70" fill="#94A3B8" font-size="8" text-anchor="middle" font-family="system-ui, sans-serif">5/2 SS #2</text>
+       <circle cx="140" cy="66"  r="6" fill="#0F172A" stroke="#94A3B8"/>
+       <circle cx="140" cy="132" r="6" fill="#0F172A" stroke="#94A3B8"/>
+    </g>
+    <g><rect x="210" y="30" width="60" height="90" rx="6" fill="url(#valve)"
+             stroke="#475569" stroke-width="1"/>
+       <text x="240" y="66" fill="#94A3B8" font-size="7" text-anchor="middle" font-family="system-ui, sans-serif">HIFLO 3/2</text>
+       <text x="240" y="76" fill="#94A3B8" font-size="7" text-anchor="middle" font-family="system-ui, sans-serif">N/C #1</text>
+       <circle cx="235" cy="66"  r="6" fill="#0F172A" stroke="#94A3B8"/>
+       <circle cx="235" cy="132" r="6" fill="#0F172A" stroke="#94A3B8"/>
+    </g>
+    <g><rect x="305" y="30" width="60" height="90" rx="6" fill="url(#valve)"
+             stroke="#475569" stroke-width="1"/>
+       <text x="335" y="66" fill="#94A3B8" font-size="7" text-anchor="middle" font-family="system-ui, sans-serif">HIFLO 3/2</text>
+       <text x="335" y="76" fill="#94A3B8" font-size="7" text-anchor="middle" font-family="system-ui, sans-serif">N/C #2</text>
+       <circle cx="330" cy="66"  r="6" fill="#0F172A" stroke="#94A3B8"/>
+       <circle cx="330" cy="132" r="6" fill="#0F172A" stroke="#94A3B8"/>
+    </g>
+    <g><rect x="400" y="30" width="60" height="90" rx="6" fill="url(#valve)"
+             stroke="#475569" stroke-width="1"/>
+       <text x="425" y="70" fill="#94A3B8" font-size="9" text-anchor="middle" font-family="system-ui, sans-serif">5/3</text>
+       <circle cx="425" cy="66"  r="6" fill="#0F172A" stroke="#94A3B8"/>
+       <circle cx="425" cy="132" r="6" fill="#0F172A" stroke="#94A3B8"/>
+    </g>
+  </g>
+
+  <!-- Row 2: HIFLO 3/2 NO · HIFLO 3/2 NC · 5/2 DS · SPARE 1 · SPARE 2 -->
+  <g>
+    <g><rect x="20"  y="150" width="60" height="90" rx="6" fill="url(#valve)"
+             stroke="#475569" stroke-width="1"/>
+       <text x="50" y="186" fill="#94A3B8" font-size="7" text-anchor="middle" font-family="system-ui, sans-serif">HIFLO 3/2</text>
+       <text x="50" y="196" fill="#94A3B8" font-size="7" text-anchor="middle" font-family="system-ui, sans-serif">NO</text>
+       <circle cx="45" cy="186" r="6" fill="#0F172A" stroke="#94A3B8"/>
+       <circle cx="45" cy="252" r="6" fill="#0F172A" stroke="#94A3B8"/>
+    </g>
+    <g><rect x="115" y="150" width="60" height="90" rx="6" fill="url(#valve)"
+             stroke="#475569" stroke-width="1"/>
+       <text x="145" y="186" fill="#94A3B8" font-size="7" text-anchor="middle" font-family="system-ui, sans-serif">HIFLO 3/2</text>
+       <text x="145" y="196" fill="#94A3B8" font-size="7" text-anchor="middle" font-family="system-ui, sans-serif">NC</text>
+       <circle cx="140" cy="186" r="6" fill="#0F172A" stroke="#94A3B8"/>
+       <circle cx="140" cy="252" r="6" fill="#0F172A" stroke="#94A3B8"/>
+    </g>
+    <g><rect x="210" y="150" width="60" height="90" rx="6" fill="url(#valve)"
+             stroke="#475569" stroke-width="1"/>
+       <text x="240" y="190" fill="#94A3B8" font-size="8" text-anchor="middle" font-family="system-ui, sans-serif">5/2 DS</text>
+       <circle cx="235" cy="186" r="6" fill="#0F172A" stroke="#94A3B8"/>
+       <circle cx="235" cy="252" r="6" fill="#0F172A" stroke="#94A3B8"/>
+    </g>
+    <g><rect x="305" y="150" width="60" height="90" rx="6" fill="url(#valve)"
+             stroke="#475569" stroke-width="1"/>
+       <text x="335" y="190" fill="#94A3B8" font-size="8" text-anchor="middle" font-family="system-ui, sans-serif">SPARE 1</text>
+       <circle cx="330" cy="186" r="6" fill="#0F172A" stroke="#94A3B8"/>
+       <circle cx="330" cy="252" r="6" fill="#0F172A" stroke="#94A3B8"/>
+    </g>
+    <g><rect x="400" y="150" width="60" height="90" rx="6" fill="url(#valve)"
+             stroke="#475569" stroke-width="1"/>
+       <text x="425" y="190" fill="#94A3B8" font-size="8" text-anchor="middle" font-family="system-ui, sans-serif">SPARE 2</text>
+       <circle cx="425" cy="186" r="6" fill="#0F172A" stroke="#94A3B8"/>
+       <circle cx="425" cy="252" r="6" fill="#0F172A" stroke="#94A3B8"/>
+    </g>
+  </g>
+
+  <!-- Divider -->
+  <line x1="20" y1="280" x2="480" y2="280" stroke="#334155" stroke-dasharray="4 4" stroke-width="1"/>
+  <text x="250" y="298" fill="#64748B" font-size="10" text-anchor="middle"
+        font-family="system-ui, sans-serif" letter-spacing="2">
+    M8 CONNECTOR GRID · TOP TWO ROWS = INPUTS · BOTTOM TWO = OUTPUTS
+  </text>
+
+  <!-- M8 grid: 4 rows × 5 cols. Coordinates in JSON's coordinates.m8 map to
+       these positions (y_pct 62/71/84/93 = y = 341/391/462/512 in this SVG).
+       Circles are the physical M8 plug faces. -->
+  <g stroke="#475569" fill="#1E293B" stroke-width="1.5">
+    <circle cx="45"  cy="341" r="16"/>
+    <circle cx="140" cy="341" r="16"/>
+    <circle cx="235" cy="341" r="16"/>
+    <circle cx="330" cy="341" r="16"/>
+    <circle cx="425" cy="341" r="16"/>
+    <circle cx="45"  cy="391" r="16"/>
+    <circle cx="140" cy="391" r="16"/>
+    <circle cx="235" cy="391" r="16"/>
+    <circle cx="330" cy="391" r="16"/>
+    <circle cx="425" cy="391" r="16"/>
+    <circle cx="45"  cy="462" r="16"/>
+    <circle cx="140" cy="462" r="16"/>
+    <circle cx="235" cy="462" r="16"/>
+    <circle cx="330" cy="462" r="16"/>
+    <circle cx="425" cy="462" r="16"/>
+    <circle cx="45"  cy="512" r="16"/>
+    <circle cx="140" cy="512" r="16"/>
+    <circle cx="235" cy="512" r="16"/>
+    <circle cx="330" cy="512" r="16"/>
+    <circle cx="425" cy="512" r="16"/>
+  </g>
+  <g fill="#64748B" font-size="8" font-family="system-ui, sans-serif" text-anchor="middle">
+    <text x="45"  y="344">IN1</text>  <text x="140" y="344">IN2</text>  <text x="235" y="344">IN3</text>
+    <text x="330" y="344">IN4</text>  <text x="425" y="344">IN5</text>
+    <text x="45"  y="394">IN6</text>  <text x="140" y="394">IN7</text>  <text x="235" y="394">IN8</text>
+    <text x="330" y="394">IN9</text>  <text x="425" y="394">IN10</text>
+    <text x="45"  y="465">OUT1</text> <text x="140" y="465">OUT2</text> <text x="235" y="465">OUT3</text>
+    <text x="330" y="465">OUT4</text> <text x="425" y="465">OUT5</text>
+    <text x="45"  y="515">OUT6</text> <text x="140" y="515">OUT7</text> <text x="235" y="515">OUT8</text>
+    <text x="330" y="515">OUT9</text> <text x="425" y="515">OUT10</text>
+  </g>
+  <line x1="20" y1="428" x2="480" y2="428" stroke="#DC2626" stroke-width="0.5" stroke-dasharray="3 3" opacity="0.4"/>
+
+  <text x="250" y="540" fill="#475569" font-size="9" text-anchor="middle"
+        font-family="system-ui, sans-serif">
+    placeholder — replace with hookup_panel_front.png
+  </text>
+</svg>
