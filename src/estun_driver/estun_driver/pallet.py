@@ -213,6 +213,22 @@ def should_refuse(steps: list, cfg: dict) -> str | None:
             "1x1x1 default that would produce single-slot cycles "
             "(stuck-at-slot-1 defect). Fix the composer to persist the "
             "grid dimensions alongside the pallet frame.")
+    # 2026-09-15 refusal-uniformity fix: refuse per-missing-dim too. The
+    # ALL-missing case above catches the pallettest composer bug, but a
+    # program with e.g. only `layers` absent (rows + cols present) would
+    # silently default the missing dim to 1 — a program the operator
+    # authored expecting 2 layers would emit rows*cols*1 place cycles
+    # with no visible failure. Enforce that every required dim is
+    # present; the message names the missing key so the operator's fix
+    # is obvious.
+    for _dim in ('rows', 'cols', 'layers'):
+        if _dim not in pallet_cfg:
+            return (
+                f"config.pallet is missing required field '{_dim}' — "
+                f"codegen refuses to silently default this to 1. The "
+                f"operator's expected placement count depends on all "
+                f"three dims (rows*cols*layers); persist the missing "
+                f"field in the pallet config and re-save the program.")
     rows   = int(pallet_cfg.get('rows',   1) or 1)
     cols   = int(pallet_cfg.get('cols',   1) or 1)
     layers = int(pallet_cfg.get('layers', 1) or 1)

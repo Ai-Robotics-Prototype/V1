@@ -1460,6 +1460,41 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
     return () => { alive = false; clearInterval(iv) }
   }, [])
 
+  // 2026-09-15 reuse UX: on mount, if THIS program has no locally
+  // taught home yet, consult the program-independent global home
+  // (/opt/cobot/home.json). When present, seed answers.taught_home
+  // with source='global' so the existing reuse-choice screen fires
+  // when the wizard reaches the HOME POSITION step. Never auto-
+  // applied — operator must click "Reuse This Position" (default
+  // action stays "Teach now"). If the global home is absent this
+  // is a no-op; if the program already carries a local taught_home
+  // (edit-mode, or the wizard back-navigated) we don't overwrite.
+  useEffect(() => {
+    let alive = true
+    const th = answers?.taught_home
+    const alreadyTaughtLocally = th && !th.skipped &&
+      (Array.isArray(th.joints) || Array.isArray(th.tcp))
+    if (alreadyTaughtLocally) return
+    ;(async () => {
+      try {
+        const res = await fetch('/api/robot/home')
+        if (!alive || !res.ok) return
+        const g = await res.json()
+        if (!g?.present) return
+        if (!Array.isArray(g.joints) && !Array.isArray(g.tcp)) return
+        setAnswer('taught_home', {
+          joints:    g.joints || null,
+          tcp:       Array.isArray(g.tcp) ? g.tcp : null,
+          taught_at: g.taught_at || null,
+          source:    'global',
+          skipped:   false,
+        })
+      } catch {}
+    })()
+    return () => { alive = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // Migrated 2026-07-22 from the discrete HTTP-pulse `s.jog` /
   // `s.jogCartesian` pattern (see TeachWithJog above for the full
   // rationale). Same HoldButton-driven WS transport TeachOverlay uses.
@@ -1971,7 +2006,22 @@ function TeachSequence({ answers, setAnswer, onComplete, onBackToName, reusedSte
                 ) : null}
               </div>
               <div style={{ fontSize: 13, color: '#6b7280' }}>
-                Taught earlier in this setup.
+                {(() => {
+                  const src = existingForCurrent?.source
+                  const at  = existingForCurrent?.taught_at
+                  let when = null
+                  if (at) {
+                    try { when = new Date(at).toLocaleString() } catch { when = at }
+                  }
+                  if (src === 'global') {
+                    return when
+                      ? `From your saved home position (taught ${when}).`
+                      : 'From your saved home position.'
+                  }
+                  return when
+                    ? `Taught earlier in this setup on ${when}.`
+                    : 'Taught earlier in this setup.'
+                })()}
               </div>
             </div>
             <div style={{ fontSize: 16, color: '#374151', marginBottom: 18, textAlign: 'center' }}>
@@ -3340,15 +3390,31 @@ const PAGES = [
                 // Build the trailing label. For reused entries point at
                 // the earlier step that taught this key (when one exists)
                 // so the operator knows where the value came from.
+                // 2026-09-15: append the source pose's timestamp / origin
+                // per operator directive ("reused from <date>") — for
+                // globally-seeded home, name the origin ("saved home
+                // position") rather than a bare date.
                 let trailing
                 if (isReused) {
                   const firstIdx = seenKeyAt[p.key]
                   const primary  = (firstIdx !== undefined && firstIdx !== i)
                     ? positions[firstIdx]?.label
                     : null
-                  trailing = primary
-                    ? `reused (same as ${primary.toLowerCase()})`
-                    : 'reused'
+                  const v = answers[p.key]
+                  let origin = null
+                  if (v?.source === 'global') {
+                    origin = 'saved home position'
+                  } else if (v?.taught_at) {
+                    try { origin = new Date(v.taught_at).toLocaleDateString() }
+                    catch { origin = v.taught_at }
+                  }
+                  if (primary) {
+                    trailing = origin
+                      ? `reused (same as ${primary.toLowerCase()}, from ${origin})`
+                      : `reused (same as ${primary.toLowerCase()})`
+                  } else {
+                    trailing = origin ? `reused from ${origin}` : 'reused'
+                  }
                 } else {
                   trailing = s === 'recorded' ? 'recorded'
                            : isWarn         ? 'required — skipped'

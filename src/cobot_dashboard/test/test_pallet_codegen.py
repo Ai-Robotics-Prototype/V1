@@ -1580,6 +1580,77 @@ def test_refuse_pallet_when_loop_count_exceeds_capacity():
         f'got:\n{lua}')
 
 
+def test_refuse_pallet_when_only_layers_missing():
+    """REFUSAL UNIFORMITY PIN — 2026-09-15.
+
+    A palletize program that saved rows + cols but is missing `layers`
+    alone MUST refuse codegen, not silently default layers=1 and emit
+    rows*cols place cycles. The operator authored the program expecting
+    a specific layer count; silently omitting layers loses the intent.
+    """
+    prog = _minimal_palletize_program(rows=2, cols=2, layers=2)
+    del prog['config']['pallet']['layers']
+    lua, _, _ = program_ops.codegen_lua_from_program(
+        prog, operator_speed_limit_pct=25)
+    assert 'REFUSED' in lua, (
+        f'expected REFUSED comment when only layers is missing; got:\n{lua[:800]}')
+    assert 'layers' in lua, (
+        f'refusal must name the missing field; got:\n{lua[:800]}')
+
+
+def test_saved_palletize_round_trips_byte_faithful():
+    """SAVE-PATH ROUND-TRIP PIN — 2026-09-15.
+
+    A wizard-shape palletize program (with every taught_* field, all
+    pallet grid dims, all corner TCPs) MUST survive save→reload
+    byte-faithful. This catches any future whitelist-drop or default-
+    fill on the save endpoint that would silently lose fields the
+    operator taught in the wizard.
+    """
+    import json as _json
+    prog = _minimal_palletize_program(rows=2, cols=2, layers=2)
+    cfg = prog['config']
+    cfg['taught_home']  = {
+        'joints': [-32.79, 27.22, 124.30, 62.43, 89.00, 4.42],
+        'tcp':    [0.7363, -0.2258, 0.1881, -3.127, 0.019, -2.220],
+        'taught_at': '2026-09-08T16:59:44.091Z', 'source': 'live', 'skipped': False,
+    }
+    cfg['taught_pick'] = {
+        'joints': [-32.79, 33.81, 125.83, 70.55, 89.00, 4.42],
+        'tcp':    [0.7363, -0.2258, 0.1156, -3.127, 0.019, -2.220],
+        'taught_at': '2026-09-08T16:59:49.966Z', 'source': 'live', 'skipped': False,
+    }
+    cfg['taught_place'] = {
+        'joints': [-10.04, 31.23, 126.31, 68.78, 89.43, 27.16],
+        'tcp':    [0.7588, 0.0767, 0.1407, -3.127, 0.019, -2.220],
+        'taught_at': '2026-09-08T17:00:06.873Z', 'source': 'live', 'skipped': False,
+    }
+    for i, corner in enumerate(('corner1_tcp', 'corner2_tcp', 'corner3_tcp'), start=1):
+        cfg[f'taught_pallet_corner{i}'] = {
+            'joints': [-8.0 - i*0.1] * 6,
+            'tcp':    cfg['pallet'][corner],
+            'taught_at': f'2026-09-15T15:2{i}:00.000Z',
+            'source': 'live', 'skipped': False,
+        }
+    cfg['taught_pallet_part'] = {
+        'joints': [-8.3] * 6,
+        'tcp':    cfg['pallet']['part_tcp'],
+        'taught_at': '2026-09-15T15:24:00.000Z', 'source': 'live', 'skipped': False,
+    }
+    serialized = _json.dumps(prog)
+    reloaded   = _json.loads(serialized)
+    assert reloaded == prog, (
+        'wizard-shape palletize program did not round-trip byte-faithful')
+    for k in ('taught_home', 'taught_pick', 'taught_place',
+              'taught_pallet_corner1', 'taught_pallet_corner2',
+              'taught_pallet_corner3', 'taught_pallet_part'):
+        assert reloaded['config'][k] == cfg[k], (
+            f'save/load dropped or altered config.{k}')
+    for k in ('rows', 'cols', 'layers'):
+        assert reloaded['config']['pallet'][k] == cfg['pallet'][k], (
+            f'save/load dropped or altered config.pallet.{k}')
+
+
 def test_pallet_loop_does_not_multiply_inline_expansion():
     """FIELD BUG PIN — 2026-09-15 (teest.json).
 

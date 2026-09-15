@@ -8200,6 +8200,35 @@ if FASTAPI_AVAILABLE:
             "gate":            gate,
         }
 
+    @app.get("/api/robot/home")
+    async def api_robot_home_get():
+        """Return the stored program-independent home pose, or None if
+        no global home has ever been taught. Read-only. Fed by the
+        wizard's TeachSequence reuse offer: when a new program's home
+        step is reached and the program has no local taught_home yet,
+        offer to reuse this pose instead of re-teaching. See
+        [[cobot-pallet-io-pairing]] for the pallet-side reuse pattern
+        this mirrors on the home side.
+        """
+        if not os.path.isfile(_HOME_FILE):
+            return {"ok": False, "present": False}
+        try:
+            with open(_HOME_FILE) as f:
+                home = json.load(f)
+        except Exception as _e:
+            return {"ok": False, "present": False, "error": str(_e)}
+        # Normalize to the same shape the wizard's answers.taught_*
+        # entries use: {joints, tcp, taught_at, source, skipped}.
+        return {
+            "ok":         True,
+            "present":    True,
+            "joints":     home.get("taught_joints"),
+            "tcp":        home.get("taught_tcp"),
+            "taught_at":  home.get("updated") or home.get("created"),
+            "source":     home.get("source") or "global",
+            "skipped":    False,
+        }
+
     @app.post("/api/robot/home")
     async def api_robot_home(request: Request):
         # Two accepted paths:
