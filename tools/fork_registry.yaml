@@ -721,7 +721,7 @@ capabilities:
       # when they move. 2026-08-05 bump: ui_context + disk_watchdog
       # wiring shifted these by ~30 lines each.
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4283
+        line: 4296
         why: >
           Canonical route /cmd/jog. Registers _HoldSession on
           hold:true and pops it on hold:false — matches WS parity.
@@ -744,7 +744,7 @@ capabilities:
           and _on_estun_status).
         owner: dashboard-transport
       - path: src/cobot_dashboard/cobot_dashboard/dashboard_server.py
-        line: 4418
+        line: 4431
         why: >
           Canonical route /cmd/jog_cartesian. Same pairing as
           /cmd/jog. Drift history: 4156 → 4267 → 4322 → 4349 →

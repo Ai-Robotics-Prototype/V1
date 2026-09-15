@@ -1716,7 +1716,20 @@ class DashboardServer(Node if RCLPY_AVAILABLE else object):
         stop when the controller drops, so the same two-signal AND-stale
         decision applies.
         """
-        from .staleness import staleness_decide  # local import — avoid module-time coupling
+        # Local import — avoid module-time coupling. Script vs
+        # package invocation compatibility: dashboard_server.py is
+        # started by systemd as a plain script (no parent package),
+        # so `from .staleness import ...` raises ImportError. Fall
+        # back to sibling-directory absolute import in that case;
+        # both paths land the same staleness_decide symbol.
+        # 2026-09-15 auto-recovery: pre-fix the ros2-gate hid this
+        # ImportError under JOG_BACKEND=ws — the whole loop body
+        # was skipped so the raise never surfaced. Now that the
+        # loop runs unconditionally the import must too.
+        try:
+            from .staleness import staleness_decide
+        except ImportError:
+            from staleness import staleness_decide  # type: ignore
         is_disconnected = False
         while True:
             try:
