@@ -254,10 +254,27 @@ function IOToggle({ kind, port, disabled, disabledReason }) {
   const onFlip = async (e) => {
     e.stopPropagation()
     if (disabled || pending) return
-    if (kind === 'DO' && bumpConfirm()) {
-      const ok = window.confirm(
-        'Manual I/O control energizes connected hardware. Continue?')
-      if (!ok) return
+    // 2026-09-15 field-bug directive: turning a DO from ON→OFF may
+    // release a held part (vacuum, gripper close, blow-off). If a
+    // program set the output ON before Stop, the operator is now
+    // overriding — surface the consequence in plain copy every time
+    // (no bumpConfirm gate, no once-per-session skip). Turning a DO
+    // OFF→ON still uses the generic energize warning.
+    if (kind === 'DO') {
+      if (shownPosition) {
+        // ON → OFF: release-a-held-part warning, always shown.
+        const ok = window.confirm(
+          `Turn DO${port} OFF?\n\nIf a program set this output to hold `
+          + `a part (vacuum, gripper close), turning it off may release `
+          + `the part. Continue?`)
+        if (!ok) return
+      } else if (bumpConfirm()) {
+        // OFF → ON: energize warning, once-per-session (existing gate).
+        const ok = window.confirm(
+          `Turn DO${port} ON?\n\nManual I/O control energizes connected `
+          + `hardware. Continue?`)
+        if (!ok) return
+      }
     }
     const target = shownPosition ? 0 : 1
     setPending({ targetValue: target, sentTs: Date.now() })

@@ -5385,11 +5385,33 @@ class EstunCodroidDriver(Node):
             except Exception as e:
                 self._reject(family, f'ioconsole save raised: {e}')
                 return
-            bad = [s for s in steps if s.get('http_status') != 200]
+            # 2026-09-15 field bug: save_project interleaves real HTTP
+            # POSTs (source/varspoint/project/projectlist, http=200 on
+            # success) with LOCAL in-process CHECK gates
+            # (lua_syntax_gate, lua_semantic_roundtrip — http_status=0,
+            # code=909 on success, code='syntax_error' /
+            # 'semantic_roundtrip_error' on failure). The prior
+            # classifier `http_status != 200` flagged the passing
+            # CHECKs as failed, so every I/O-page DO toggle rejected
+            # with "ioconsole save failed: lua_syntax_gate HTTP 0"
+            # — the operator saw the toggle flip back and no wire
+            # frame ever reached the controller. Mirror the correct
+            # filter used at line ~2900 (coordinated_joint save) and
+            # in dashboard_server._save_step_ok at line ~7341.
+            def _save_step_ok(s):
+                if s.get('http_status') == 200:
+                    return True
+                if (s.get('method') == 'CHECK'
+                        and s.get('http_status') == 0
+                        and s.get('code') == 909):
+                    return True
+                return False
+            bad = [s for s in steps if not _save_step_ok(s)]
             if bad:
                 self._reject(family,
                     f'ioconsole save failed: {bad[0].get("step")} '
-                    f'HTTP {bad[0].get("http_status")}')
+                    f'HTTP {bad[0].get("http_status")} '
+                    f'code={bad[0].get("code")}')
                 return
             # Snapshot the alarm state so we can detect a NEW alarm
             # raised by the run below (10014 is the common one — see
