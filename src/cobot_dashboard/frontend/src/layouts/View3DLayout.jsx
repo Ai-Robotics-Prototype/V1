@@ -218,6 +218,45 @@ export default function View3DLayout() {
   const isExpanded = jogPanelMode === 'EXPANDED'
   const isMinimized = jogPanelMode === 'MINIMIZED'
 
+  // 2026-09-16 default-framing — compute the fraction of the
+  // viewport height that stays visible ABOVE the jog panel. The
+  // arm renders inside this top slice so it's not overlapped by
+  // the button clusters. Recomputes on every render (cheap) and
+  // via the resize effect below when window.innerHeight changes.
+  // Values match the immersive layout's bands:
+  //   MINIMIZED  — pill only, ~60 px, ~0.94 visible
+  //   NORMAL     — 440 px jog band at bottom
+  //   EXPANDED   — viewer hidden, framing is moot; pick 1.0 so
+  //                the value stays sensible if the mode toggles.
+  const [viewportH, setViewportH] = useState(
+    () => (typeof window !== 'undefined' ? window.innerHeight : 900))
+  useEffect(() => {
+    const onResize = () => setViewportH(window.innerHeight || 900)
+    window.addEventListener('resize', onResize)
+    onResize()
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+  const jogBandPx = isExpanded ? 0
+                  : isMinimized ? 60
+                  : 440
+  const visibleTopFrac = Math.max(
+    0.35, Math.min(1.0, (viewportH - jogBandPx) / viewportH))
+  const framing = { visibleTopFrac }
+
+  // 2026-09-16 default-framing — re-apply the last preset (via
+  // armRef.reframe()) whenever the visibleTopFrac changes: window
+  // resize AND Collapse/Expand Jog Buttons transitions. Does NOT
+  // fire on joint state updates (framing prop only depends on
+  // viewport dims + panel mode, never robot pose), so live motion
+  // never yanks the camera. Prop-change reframe is also handled
+  // inside ArmViewer3D as belt-and-braces.
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => {
+      armRef.current?.reframe?.()
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [visibleTopFrac])
+
   // 2026-09-16 zoom-capture — suppress browser page-zoom on the 3D
   // View screen only. Three input classes leak page-zoom without
   // this: (a) touch pinch on the tablet (browsers escalate to page-
@@ -279,7 +318,7 @@ export default function View3DLayout() {
         style={{
           position: 'absolute', inset: 0, zIndex: 0, minWidth: 0,
         }}>
-        <ArmViewer3D ref={armRef} noRobot>
+        <ArmViewer3D ref={armRef} noRobot framing={framing}>
           <StandaloneRobot onRobotReady={setJogApi} />
           {/* 2026-09-14 operator directive: IKGizmo (Cartesian-drag
               twin IK) retired along with the JointJogPanel that

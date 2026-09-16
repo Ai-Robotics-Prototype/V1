@@ -507,6 +507,114 @@ def test_speed_slider_opts_back_in_to_touch_drag():
         "touch-action:none")
 
 
+def test_default_camera_frames_arm_above_jog_surface():
+    """2026-09-16 default-framing — the immersive View3D layout must
+    pass a `framing` prop with a computed visibleTopFrac to the
+    ArmViewer3D so the arm renders in the clear upper region above
+    the jog panel. The bbox is fitted into visibleTopFrac of viewport
+    height (see _framedPreset math in ArmViewer3D.jsx).
+    """
+    src = _read(LAYOUT)
+    assert re.search(
+        r"const\s+framing\s*=\s*\{\s*visibleTopFrac\s*\}", src), (
+        'View3DLayout must derive a `framing` object with '
+        'visibleTopFrac from viewport dims + jog panel mode')
+    assert re.search(
+        r"<ArmViewer3D[^>]*framing=\{framing\}", src, re.DOTALL), (
+        'ArmViewer3D must receive the framing prop so its applyPreset '
+        'can shift the target for the top-region fit')
+    # visibleTopFrac must reflect the jog panel mode — NORMAL band
+    # ~440 px, MINIMIZED ~60 px, EXPANDED 0 (hidden). If a future
+    # edit hardcodes a single value the "arm above surface" contract
+    # regresses on Collapse / resize.
+    assert 'isMinimized ? 60' in src, (
+        'MINIMIZED jogBandPx must be ~60 (only the pill visible)')
+    assert '\n                  : 440' in src or '440' in src, (
+        'NORMAL jogBandPx must be 440 (matches RealArmChrome height)')
+
+
+def test_preset_click_and_reframe_use_framed_preset_math():
+    """2026-09-16 default-framing — every preset click AND every
+    reframe() call routes through applyPreset → _framedPreset(),
+    so Front/Side/Top/Iso all share the top-region framing math.
+    Also pin: the imperative reframe() method exists (called by
+    View3DLayout on resize / jog panel mode change).
+    """
+    viewer = _read(os.path.join(
+        HERE, '..', 'frontend', 'src', 'components', 'ArmViewer3D.jsx'))
+    # _framedPreset helper must exist AND accept (name, bbox,
+    # visibleTopFrac). If a future refactor drops the framing math
+    # into a hardcoded position the top-region behavior breaks.
+    assert 'function _framedPreset(name, bbox, visibleTopFrac)' in viewer, (
+        '_framedPreset(name, bbox, visibleTopFrac) helper missing')
+    # applyPreset routes ALL preset applications through the helper.
+    ap_idx = viewer.find('const applyPreset = (name) =>')
+    assert ap_idx != -1
+    end = viewer.find('\n  }', ap_idx + 30)
+    ap_body = viewer[ap_idx:end]
+    assert '_framedPreset(name, bbox, visibleTopFrac)' in ap_body, (
+        'applyPreset must call _framedPreset so every preset click '
+        'uses the top-region framing math')
+    # Imperative reframe() exists on the ref.
+    assert 'reframe() { applyPreset(currentPresetRef.current) }' in viewer, (
+        'ArmViewer3D must expose reframe() so the layout can '
+        're-apply the current preset on resize / panel-mode change')
+
+
+def test_no_reframe_during_jog_state_updates():
+    """2026-09-16 default-framing — the reframe useEffect in
+    View3DLayout MUST depend ONLY on visibleTopFrac (viewport dims
+    + jog panel mode). It MUST NOT depend on joint states or any
+    robot-pose store slice, so live motion never yanks the camera.
+    """
+    src = _read(LAYOUT)
+    # Locate the reframe effect (comment anchor).
+    idx = src.find('re-apply the last preset (via')
+    assert idx != -1, 'reframe useEffect comment anchor missing'
+    # Grab the block through the useEffect deps array.
+    block = src[idx:idx + 1200]
+    m = re.search(r"\}\s*,\s*\[([^\]]*)\]\s*\)\s*", block)
+    assert m is not None, 'reframe useEffect deps array not found'
+    deps = m.group(1).strip()
+    assert deps == 'visibleTopFrac', (
+        f'reframe useEffect deps must be exactly [visibleTopFrac]; '
+        f'got [{deps}]. Any additional dep that changes on jog / '
+        f'joint updates would auto-recenter the camera mid-motion.')
+
+
+def test_framed_preset_math_shifts_target_and_pulls_camera_back():
+    """2026-09-16 default-framing math sanity pin — the framing
+    helper must (a) increase camera distance as visibleTopFrac
+    shrinks (arm fits in a smaller slice → camera further back to
+    keep bbox inside), and (b) shift the world target Y DOWN when
+    jogFrac > 0 so the arm renders UP on screen. Skip Y-shift for
+    TOP preset.
+    """
+    viewer = _read(os.path.join(
+        HERE, '..', 'frontend', 'src', 'components', 'ArmViewer3D.jsx'))
+    idx = viewer.find('function _framedPreset(name, bbox, visibleTopFrac)')
+    end = viewer.find('\n}', idx + 30)
+    body = viewer[idx:end]
+    # Distance formula must reference visibleTopFrac.
+    assert re.search(
+        r"dist\s*=\s*\(bbox\.maxDim[^\n]*\)\s*/\s*\n?\s*"
+        r"\(clampedFrac\s*\*",
+        body), (
+        'distance formula must divide by clampedFrac (visibleTopFrac) '
+        '— smaller slice → larger distance → arm fits in the slice')
+    # Vertical Y offset math + TOP-preset skip.
+    assert "name === 'top'" in body, (
+        "TOP preset must skip the Y-shift (world Y is aligned with "
+        "the view axis so the shift would push the arm out of frame)")
+    assert 'worldYOffset' in body and 'jogFrac * dist * Math.tan(fov / 2)' in body, (
+        'Y-shift formula missing — arm must move UP on screen by '
+        'shifting target DOWN in world Y')
+    # Target Y assembled with the offset subtracted (not added):
+    assert 'bbox.centerY - worldYOffset' in body, (
+        'target.y must be bbox.centerY - worldYOffset (subtract to '
+        'shift world DOWN → arm renders UP on screen)')
+
+
 def test_no_new_handler_or_gate_added_in_layout():
     """The immersive refactor touches CSS + testid attributes only.
     No new fetch / onClick / gate predicate should appear in the

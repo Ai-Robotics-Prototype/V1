@@ -114,6 +114,58 @@ const DEFAULT_PRESETS = {
   iso:   [2.5, 1.6, 2.5],
 }
 const DEFAULT_ORBIT_TARGET = [0, 0.7, 0]
+// 2026-09-16 immersive framing — used when URDFArm hasn't emitted a
+// bbox yet (noRobot mode with StandaloneRobot doesn't fire the URDF
+// onLoaded callback). Rough S10-140 envelope; the URDF bbox
+// overrides this via bboxRef the moment it lands.
+const ARM_BBOX_APPROX = { centerY: 0.7, maxDim: 1.4 }
+// 2026-09-16 immersive framing — vertical FOV of the R3F Canvas
+// (see the `camera={{ fov: 45 }}` prop on <Canvas> below). Kept as
+// a constant so the framing math and the Canvas prop stay in sync.
+const CAMERA_FOV_DEG = 45
+
+// 2026-09-16 immersive framing — compute a (camera position, orbit
+// target) pair that puts the arm bbox inside a `visibleTopFrac`
+// slice of the viewport, matching the preset's viewing angle. The
+// slice sits at the TOP of the screen so the arm is visible above
+// the jog-panel band without needing manual zoom.
+//
+// Math:
+//   * Bbox fits into visibleTopFrac of viewport height with 15%
+//     padding: dist = (maxDim * 1.15) / (visibleTopFrac * 2 * tan(fov/2)).
+//   * Vertical world offset shifts the target DOWN in world Y so
+//     the arm renders UP in screen space by (jogFrac / 2) of the
+//     viewport. worldYOffset = jogFrac * dist * tan(fov/2). Skipped
+//     for the TOP preset (world Y is aligned with the view axis).
+//   * Camera position = target + preset-direction * dist. Preset
+//     direction is derived from DEFAULT_PRESETS relative to the
+//     legacy target so the visual angle is preserved.
+function _framedPreset(name, bbox, visibleTopFrac) {
+  const fov = CAMERA_FOV_DEG * Math.PI / 180
+  const clampedFrac = Math.max(0.35, Math.min(1.0, visibleTopFrac))
+  const jogFrac = 1 - clampedFrac
+  const dist = (bbox.maxDim * 1.15) /
+    (clampedFrac * 2 * Math.tan(fov / 2))
+  const legacyPos = DEFAULT_PRESETS[name] || DEFAULT_PRESETS.iso
+  const dir = new THREE.Vector3(
+    legacyPos[0] - DEFAULT_ORBIT_TARGET[0],
+    legacyPos[1] - DEFAULT_ORBIT_TARGET[1],
+    legacyPos[2] - DEFAULT_ORBIT_TARGET[2],
+  ).normalize()
+  const worldYOffset = (name === 'top') ? 0
+    : jogFrac * dist * Math.tan(fov / 2)
+  const target = new THREE.Vector3(
+    DEFAULT_ORBIT_TARGET[0],
+    bbox.centerY - worldYOffset,
+    DEFAULT_ORBIT_TARGET[2],
+  )
+  const pos = new THREE.Vector3(
+    target.x + dir.x * dist,
+    target.y + dir.y * dist,
+    target.z + dir.z * dist,
+  )
+  return { pos, target }
+}
 
 const ROBOT_MATERIAL = new THREE.MeshPhongMaterial({
   color: 0xC0C8D4, specular: 0x4a4a4a, shininess: 30,
@@ -1362,7 +1414,7 @@ function StaticZonesToggle({ value, onChange }) {
   )
 }
 
-const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay, noRobot = false }, ref) {
+const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay, noRobot = false, framing }, ref) {
   const controlsRef = useRef(null)
   const [flange, setFlange] = useState(null)
   // eslint-disable-next-line no-unused-vars
@@ -1423,16 +1475,38 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
   // subscribes internally (line ~414) so live telemetry keeps flowing
   // to the FK loop.
 
+  // 2026-09-16 immersive framing — remember the last preset the
+  // operator picked so resize / jog-panel-mode changes can re-apply
+  // it. Falls back to 'iso' if nothing has been chosen yet.
+  const currentPresetRef = useRef('iso')
+  // Latest bbox from URDFArm (Program tab) — noRobot mode (View3D
+  // page with StandaloneRobot) falls back to ARM_BBOX_APPROX.
+  const armBboxRef = useRef(null)
+
   const applyPreset = (name) => {
-    const pos = DEFAULT_PRESETS[name] ?? DEFAULT_PRESETS.iso
     const c = controlsRef.current
     if (!c) return
-    c.object.position.set(pos[0], pos[1], pos[2])
-    c.target.set(DEFAULT_ORBIT_TARGET[0], DEFAULT_ORBIT_TARGET[1], DEFAULT_ORBIT_TARGET[2])
+    currentPresetRef.current = name
+    // Prefer the real URDF bbox (Program tab), fall back to the
+    // static S10-140 envelope when StandaloneRobot is the mount
+    // (View3D immersive layout).
+    const bbox = armBboxRef.current || ARM_BBOX_APPROX
+    // Framing target region: caller-supplied visibleTopFrac (in the
+    // range 0.35..1.0) shrinks the effective viewport height the
+    // bbox is fitted into, so the arm sits above the jog surface.
+    // Default 1.0 = legacy full-viewport framing (Program tab).
+    const visibleTopFrac = framing?.visibleTopFrac ?? 1.0
+    const { pos, target } = _framedPreset(name, bbox, visibleTopFrac)
+    c.object.position.set(pos.x, pos.y, pos.z)
+    c.target.set(target.x, target.y, target.z)
     c.update()
   }
   useImperativeHandle(ref, () => ({
     setCameraPreset(name) { applyPreset(name) },
+    // 2026-09-16 immersive framing — re-apply the current preset
+    // with fresh framing (used by View3DLayout on window resize
+    // and jog-panel-mode change).
+    reframe() { applyPreset(currentPresetRef.current) },
     // Expose OrbitControls enable/disable so a sibling in the same
     // Canvas (an IKGizmo mounted from View3DLayout's JSX children) can
     // freeze the orbit while dragging the gizmo.
@@ -1440,29 +1514,38 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
   }))
 
   // One-shot auto-fit on first load. After that the operator's
-  // manual orbit + presets win.
+  // manual orbit + presets win. 2026-09-16 immersive framing —
+  // routes through applyPreset('iso') so the URDF bbox is used AND
+  // the top-region visibleTopFrac shift is applied consistently.
   const handleUrdfLoaded = (_robot, bbox) => {
     if (autoFittedRef.current) return
-    const c = controlsRef.current
-    if (!c) return
     const sz     = bbox.getSize(new THREE.Vector3())
     const center = bbox.getCenter(new THREE.Vector3())
     const maxDim = Math.max(sz.x, sz.y, sz.z)
     if (!Number.isFinite(maxDim) || maxDim < 0.01) return
     autoFittedRef.current = true
-    c.object.position.set(
-      center.x + maxDim * 1.5,
-      center.y + maxDim * 0.5,
-      center.z + maxDim * 1.5,
-    )
-    c.target.copy(center)
-    c.update()
+    armBboxRef.current = { centerY: center.y, maxDim }
+    applyPreset(currentPresetRef.current)
     // eslint-disable-next-line no-console
     console.info('[URDF] camera auto-fit', {
       size:   { x: sz.x, y: sz.y, z: sz.z },
       center: { x: center.x, y: center.y, z: center.z },
     })
   }
+
+  // 2026-09-16 immersive framing — apply the default frame once
+  // the OrbitControls ref is available (noRobot mode with
+  // StandaloneRobot never triggers handleUrdfLoaded, so this is
+  // the only initial-frame path in the View3D layout). Also
+  // re-frames when the `framing` prop changes (jog-panel-mode
+  // change from the parent).
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => {
+      if (controlsRef.current) applyPreset(currentPresetRef.current)
+    })
+    return () => cancelAnimationFrame(raf)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [framing?.visibleTopFrac])
 
   const currentProgram = useStore((s) => s.currentProgram)
   const gripperCfg     = currentProgram?.config?.gripper || {}
