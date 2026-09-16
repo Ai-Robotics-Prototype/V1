@@ -57,22 +57,37 @@ const REAL_ARM_RED = '#7F1D1D'
 function RealArmChrome({ mode, setMode, children }) {
   const isExpanded = mode === 'EXPANDED'
   return (
-    <div style={{
-      background: 'var(--bg-panel)',
-      border: '1px solid var(--border)',
-      borderTop: '2px solid ' + REAL_ARM_RED,
-      display: 'flex', flexDirection: 'column',
-      overflow: 'hidden',
-      // 440 px NORMAL preserves the Program tab's JOG_MIN_HEIGHT (360)
-      // budget after the compact chip header (~34 px w/ borders).
-      height: isExpanded ? '100%' : 440,
-      // flexShrink:0 so on tablet-height viewports the whole surface
-      // never gets squeezed by the flex parent — the twin viewer above
-      // shrinks first. Prior default (flex-shrink:1) let the chrome
-      // shrink below 440 on some tablet aspects, which is what pushed
-      // the LEFT column's XYZ button up into the header band.
-      flexShrink: 0,
-    }}>
+    <div
+      data-testid="jog-floating-panel"
+      style={{
+        // 2026-09-16 immersive layout — the 3D canvas is the full-page
+        // background; JogControls is now a floating overlay panel with
+        // a semi-opaque background so the robot stays visible behind
+        // the ambient panel edges without control text losing contrast.
+        // Semi-opaque + backdrop-blur is cheap on modern browsers; on
+        // any that skip filter support we still land at ~92 % opacity
+        // which reads cleanly.
+        background: 'rgba(255, 255, 255, 0.92)',
+        backdropFilter: 'blur(6px)',
+        WebkitBackdropFilter: 'blur(6px)',
+        border: '1px solid var(--border)',
+        borderTop: '2px solid ' + REAL_ARM_RED,
+        borderRadius: 12,
+        boxShadow: '0 6px 22px rgba(0,0,0,0.25)',
+        display: 'flex', flexDirection: 'column',
+        overflow: 'hidden',
+        // 440 px NORMAL preserves the Program tab's JOG_MIN_HEIGHT (360)
+        // budget after the compact chip header (~34 px w/ borders).
+        // EXPANDED still fills the container so operators who want the
+        // full-height pendant get it; NORMAL stays a bounded panel that
+        // never eats the whole viewport.
+        height: isExpanded ? 'calc(100% - 24px)' : 440,
+        maxWidth: isExpanded ? 'calc(100% - 24px)' : 'min(1240px, calc(100% - 24px))',
+        // Panel owns its own pointer events; the surrounding transparent
+        // area of the parent lets the 3D canvas orbit/zoom through.
+        pointerEvents: 'auto',
+        flexShrink: 0,
+      }}>
       <div style={{
         padding: '5px 8px',
         display: 'flex', alignItems: 'center',
@@ -84,7 +99,7 @@ function RealArmChrome({ mode, setMode, children }) {
         // narrow tablet width — the DISABLE/READY row is the anchor
         // controls below flow from.
         minHeight: 44,
-        background: 'var(--bg-panel)',
+        background: 'transparent',
         borderBottom: '1px solid var(--border)',
       }}>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
@@ -201,45 +216,61 @@ export default function View3DLayout() {
   const isMinimized = jogPanelMode === 'MINIMIZED'
 
   return (
-    <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
-      {/* 2026-09-08 operator directive: left sidebar retired. The
-          view-switcher moved into the ArmViewer3D top-left overlay
-          (already there at L1632); the 3D canvas reclaims the
-          ~130 px LeftPanel used to occupy. */}
+    // 2026-09-16 IMMERSIVE LAYOUT — the 3D canvas is the full-page
+    // background. All controls float over it as overlay panels. Left
+    // sidebar retired 2026-09-08; view-switcher lives inside the
+    // ArmViewer3D top-left overlay (L1632).
+    <div
+      data-testid="view3d-immersive-root"
+      style={{ position: 'relative', height: '100%', overflow: 'hidden' }}>
+      {/* Full-bleed 3D canvas — lowest layer. Absolute-positioned so
+          the robot viewer fills the entire content region under the
+          top nav, edge to edge. */}
+      <div
+        data-testid="view3d-canvas-fill"
+        style={{
+          position: 'absolute', inset: 0, zIndex: 0, minWidth: 0,
+        }}>
+        <ArmViewer3D ref={armRef} noRobot>
+          <StandaloneRobot onRobotReady={setJogApi} />
+          {/* 2026-09-14 operator directive: IKGizmo (Cartesian-drag
+              twin IK) retired along with the JointJogPanel that
+              hosted its checkbox. No twin-only motion path remains
+              on this page. */}
+        </ArmViewer3D>
+      </div>
 
-      <div style={{
-        flex: 1, overflow: 'hidden', position: 'relative',
-        display: 'flex', flexDirection: 'column', minWidth: 0,
-      }}>
-        {/* Twin viewer — hidden when the REAL ARM panel is expanded. */}
-        {!isExpanded && (
-          <div style={{ flex: 1, position: 'relative', minHeight: 0 }}>
-            <ArmViewer3D ref={armRef} noRobot>
-              <StandaloneRobot onRobotReady={setJogApi} />
-              {/* 2026-09-14 operator directive: IKGizmo (Cartesian-drag
-                  twin IK) retired along with the JointJogPanel that
-                  hosted its checkbox. No twin-only motion path
-                  remains on this page. */}
-            </ArmViewer3D>
-            <MinClearanceReadout />
-            {/* 2026-09-14 operator directive: "Orient Flange Down"
-                moved out of this top-right viewer overlay and into
-                the jog surface (JogControls rightSlot). See the
-                RealArmChrome block below. */}
-            {isMinimized && <RealArmMinimizedPill setMode={setView3dJogPanel} />}
-          </div>
-        )}
+      {/* MIN-CLEARANCE readout — top-center overlay chip, kept above
+          the canvas so it can render CONTACT / CLEARANCE without
+          being obscured by the robot mesh. Its own pointerEvents:
+          none keeps orbit unaffected. */}
+      <MinClearanceReadout />
 
-        {/* REAL ARM jog dock */}
-        {!isMinimized && (
+      {/* MINIMIZED — floating "Expand Jog Buttons" pill only; 3D
+          canvas fully unobstructed. */}
+      {isMinimized && <RealArmMinimizedPill setMode={setView3dJogPanel} />}
+
+      {/* NORMAL / EXPANDED — floating jog-panel overlay pinned to
+          bottom-center. Wrapper is pointerEvents:none so the empty
+          margin around the panel passes clicks through to the 3D
+          canvas for orbit/zoom; the panel itself (jog-floating-panel)
+          re-enables pointer events for its own controls. */}
+      {!isMinimized && (
+        <div
+          data-testid="jog-overlay-wrapper"
+          style={{
+            position: 'absolute',
+            left: 0, right: 0, bottom: 12,
+            display: 'flex',
+            justifyContent: 'center',
+            padding: '0 12px',
+            zIndex: 10,
+            pointerEvents: 'none',
+          }}>
           <RealArmChrome mode={jogPanelMode} setMode={setView3dJogPanel}>
-            {/* 2026-09-08: right-column controls (Run/Pause/STOP/Home/
-                E-STOP/Teach) retired from JogControls per operator
-                directive. Program execution lives on Monitor; TopBar
-                owns E-STOP. runConfirm prop retired with them.
-                2026-09-14: rightSlot repurposed for the modal-gated
-                Orient Flange Down control — moved out of the twin-
-                viewer overlay per screenshot review. */}
+            {/* 2026-09-14: rightSlot for the modal-gated Orient Flange
+                Down control (moved out of the twin-viewer overlay per
+                screenshot review). */}
             <JogControls
               maximized={isExpanded}
               rightSlot={jogApi
@@ -247,8 +278,8 @@ export default function View3DLayout() {
                 : null}
             />
           </RealArmChrome>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   )
 }

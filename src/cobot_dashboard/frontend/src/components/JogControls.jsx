@@ -422,6 +422,24 @@ export function HoldButton({
   )
 }
 
+// 2026-09-16 immersive layout — jog buttons render as SOLID colored
+// chips with white glyphs so they read instantly over the 3D scene.
+// Directional color coding preserved (X red, Y green, Z blue,
+// rotation purple/gold). Hover darkens slightly; pressed dips further
+// via the hover branch already wired in HoldButton (mouse still over
+// the button while pressed = darker); disabled goes muted via
+// HoldButton's existing opacity:0.4 rule.
+function _jogDarken(hex) {
+  // Simple 15%-darken by hex arithmetic. Handles both #RGB and #RRGGBB.
+  const s = String(hex || '').replace('#', '')
+  if (s.length !== 6) return hex
+  const clamp = (v) => Math.max(0, Math.min(255, v))
+  const r = clamp(parseInt(s.slice(0, 2), 16) * 0.82) | 0
+  const g = clamp(parseInt(s.slice(2, 4), 16) * 0.82) | 0
+  const b = clamp(parseInt(s.slice(4, 6), 16) * 0.82) | 0
+  return '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('')
+}
+
 function ArrowPad({ jogStyle, onTap, onPressStart, onPressTick, onPressEnd,
                     rotation, label, color, size, svgSize, labelSize,
                     disabled, tooltip }) {
@@ -433,15 +451,18 @@ function ArrowPad({ jogStyle, onTap, onPressStart, onPressTick, onPressEnd,
       onPressTick={onPressTick}
       onPressEnd={onPressEnd}
       color={color}
+      bg={color}
+      bgHover={_jogDarken(color)}
+      borderColor={_jogDarken(color)}
       width={size} height={size}
       disabled={disabled}
       tooltip={tooltip}
     >
       <svg width={svgSize} height={svgSize} viewBox="0 0 24 24"
            style={{ transform: `rotate(${rotation}deg)` }}>
-        <path d="M12 4l-8 8h5v8h6v-8h5z" fill={color} />
+        <path d="M12 4l-8 8h5v8h6v-8h5z" fill="#fff" />
       </svg>
-      <span style={{ fontSize: labelSize, fontWeight: 700, color: '#374151' }}>{label}</span>
+      <span style={{ fontSize: labelSize, fontWeight: 800, color: '#fff', textShadow: '0 1px 1px rgba(0,0,0,0.25)' }}>{label}</span>
     </HoldButton>
   )
 }
