@@ -119,7 +119,12 @@ def _elbow_fake(j3_deg, cart_axis=3, direction=+1, speed=+0.21,
     # sweep the elbow margin.
     fake._joint_deg = [15.0, 45.0, float(j3_deg), 0.0, -30.0, 0.0]
     fake._joint_rad = [math.radians(v) for v in fake._joint_deg]
-    fake._last_posture_ts = 1.0
+    # 2026-09-16 boundary-anti-creep: _cart_start_sing_clamp now
+    # gates approach presses in the elbow danger band on posture
+    # freshness (POSTURE_STALE_MAX_S). Use time.time() so tests are
+    # stable regardless of clock skew from the epoch.
+    import time as _time
+    fake._last_posture_ts = _time.time()
     fake._cart_sigma_soft = 0.06
     fake._cart_sigma_wall = 0.035
     fake._cart_sigma_hard = 0.02
@@ -251,6 +256,179 @@ def test_elbow_latch_does_not_clear_at_wall_plus_epsilon():
     assert fake._cart_elbow_latched is True, (
         'elbow latch cleared at margin=11.5° < wall+hyst=12° — '
         'creep vector open')
+
+
+# ── (2b) BOUNDARY ANTI-CREEP — 2026-09-16 field bug ─────────────
+#
+# Operator report (Sep 15): extension jog stops at the elbow wall as
+# designed, but a re-press in the SAME direction moves the arm
+# slightly each time. Operator spec: after the wall stop, approach
+# presses must produce ZERO motion — not one tick's worth.
+#
+# Fix is a BAND, not a line: refuse every approach press in
+# [wall, wall+hysteresis] while latched, close all of a/b/c/d:
+#   (a) stop lands above the wall → margin ~10.05° at rest → widened
+#       tie-break inside danger band treats ambiguous qdot as closing
+#   (b) stale posture at press time → posture-age gate refuses in-
+#       band presses with `posture_stale` when |now − posture_ts| >
+#       POSTURE_STALE_MAX_S = 0.5 s
+#   (c) latch cleared on release → verified in source: no release/
+#       stop path writes _cart_elbow_latched = False; only margin >
+#       wall+hyst clears it
+#   (d) direction misclassification via ambiguous qdot_J3 → widened
+#       ELBOW_QDOT_ESCAPE_EPS (1e-4, was 1e-9) catches float noise
+
+
+def test_boundary_anti_creep_replay_at_wall_edge():
+    """Replay: latched + resting margin=10.05° (just above wall by
+    0.05°, exactly the "stop-lands-above-the-wall" case). Ten
+    successive approach presses at the SAME angle must ALL refuse.
+    Margin is never mutated in these tests (start-clamp doesn't
+    move the arm) — the pin is: refusal fires every time and the
+    latch stays set across all N presses.
+    """
+    fake = _elbow_fake(j3_deg=10.05, elbow_latched=True)
+    # Pick the closing direction (opposite qdot polarity).
+    q_pos = fake._sing_guard.qdot_component(
+        fake._joint_deg, 3, +1.0, joint_idx0=2)
+    closing_sign = -1 if (q_pos > 0) else +1
+    refusals = 0
+    for _ in range(10):
+        _, refusal = fake._cart_start_sing_clamp(
+            axis=3, direction=closing_sign,
+            signed_speed=closing_sign * 0.21)
+        assert refusal is not None, (
+            'boundary anti-creep pin: latched approach press at '
+            'margin=10.05° (wall+0.05°) must refuse — not permit '
+            'one tick of motion')
+        assert refusal['reason_code'] in ('elbow_wall', 'posture_stale')
+        assert fake._cart_elbow_latched is True, (
+            'latch cleared under a refused press — creep vector open')
+        refusals += 1
+    assert refusals == 10
+
+
+def test_ambiguous_qdot_refused_when_latched_in_hyst_band():
+    """Direction misclassification (mechanism d): synthesize a
+    twist whose qdot_J3 is exactly zero (perfect tie). Old tie-
+    break returned closing=(margin<=wall) which permitted at
+    margin=10.5° > wall=10°. New widened tie-break also refuses
+    when latched AND margin<=wall+hyst.
+    """
+    fake = _elbow_fake(j3_deg=10.5, elbow_latched=True)
+    # Force a zero qdot by mocking the guard's qdot_component to
+    # return exactly zero — reproduces the wrist-near-singular
+    # numerical-noise case regardless of the fixture's pose.
+    fake._sing_guard.qdot_component = (
+        lambda q, axis, s, joint_idx0=2, _v=0.0: _v)
+    _, refusal = fake._cart_start_sing_clamp(
+        axis=3, direction=+1, signed_speed=+0.21)
+    assert refusal is not None, (
+        'ambiguous qdot_J3 at margin=10.5° with latch set must '
+        'refuse — mechanism (d) closes here')
+    assert refusal['reason_code'] in ('elbow_wall', 'posture_stale')
+
+
+def test_ambiguous_qdot_permits_outside_hyst_band():
+    """Symmetric guarantee: ambiguous qdot_J3 with margin ABOVE
+    wall+hysteresis and latch clear → permit. The widened tie-
+    break must not over-fire outside the danger band.
+    """
+    fake = _elbow_fake(j3_deg=15.0, elbow_latched=False)
+    fake._sing_guard.qdot_component = (
+        lambda q, axis, s, joint_idx0=2, _v=0.0: _v)
+    _, refusal = fake._cart_start_sing_clamp(
+        axis=3, direction=+1, signed_speed=+0.21)
+    # Outside danger band + not latched → no elbow refusal (σ path
+    # may still scale, but that's a different reason_code).
+    assert (refusal is None
+            or refusal.get('reason_code') not in
+                ('elbow_wall', 'posture_stale'))
+
+
+def test_stale_posture_refused_in_band():
+    """Mechanism (b): posture backing margin/qdot is 0.8 s old — the
+    press decision must refuse with `posture_stale` rather than
+    resolve on stale data.
+    """
+    fake = _elbow_fake(j3_deg=10.5, elbow_latched=True)
+    import time as _time
+    fake._last_posture_ts = _time.time() - 0.8   # 800 ms stale
+    q_pos = fake._sing_guard.qdot_component(
+        fake._joint_deg, 3, +1.0, joint_idx0=2)
+    closing_sign = -1 if (q_pos > 0) else +1
+    _, refusal = fake._cart_start_sing_clamp(
+        axis=3, direction=closing_sign,
+        signed_speed=closing_sign * 0.21)
+    assert refusal is not None
+    assert refusal['reason_code'] == 'posture_stale', (
+        f"expected posture_stale refusal at 0.8s stale posture; "
+        f"got {refusal.get('reason_code')}")
+    assert 'position updating' in refusal['reason'].lower()
+
+
+def test_stale_posture_permits_opening_direction():
+    """Escape guarantee (unchanged by the fix): even with stale
+    posture, the OPENING direction must pass. The stale-posture
+    gate fires only on closing/ambiguous presses in the danger band.
+    """
+    fake = _elbow_fake(j3_deg=10.5, elbow_latched=True)
+    import time as _time
+    fake._last_posture_ts = _time.time() - 0.8
+    q_pos = fake._sing_guard.qdot_component(
+        fake._joint_deg, 3, +1.0, joint_idx0=2)
+    opening_sign = +1 if (q_pos > 0) else -1
+    _, refusal = fake._cart_start_sing_clamp(
+        axis=3, direction=opening_sign,
+        signed_speed=opening_sign * 0.21)
+    assert (refusal is None
+            or refusal.get('reason_code') not in
+                ('elbow_wall', 'posture_stale')), (
+        'opening motion refused under stale posture — escape '
+        'guarantee broken')
+
+
+def test_latch_survives_release_source_scan():
+    """Mechanism (c): no release/stop path may write
+    `_cart_elbow_latched = False`. Only the two clear-on-recovery
+    sites (start-clamp @ margin>wall+hyst and supervise @ same)
+    may clear it. This pin scans the driver source: exactly THREE
+    write sites (init to False + two clear-on-recovery) and ONE
+    set site (supervise wall-stop).
+    """
+    src = _read(DRIVER_SRC)
+    # False assignments (init + two recovery clears).
+    false_writes = re.findall(
+        r'self\._cart_elbow_latched\s*=\s*False', src)
+    assert len(false_writes) == 3, (
+        f'expected exactly 3 False writes to _cart_elbow_latched '
+        f'(init + two clear-on-recovery); got {len(false_writes)}. '
+        f'A new clear site (release_cmd, stopJog, hold-end, etc.) '
+        f'would let the latch drop on release and re-open the '
+        f'creep vector.')
+    # True assignment (supervise wall-stop set).
+    true_writes = re.findall(
+        r'self\._cart_elbow_latched\s*=\s*True', src)
+    assert len(true_writes) == 1, (
+        f'expected exactly 1 True write to _cart_elbow_latched '
+        f'(supervise stop); got {len(true_writes)}')
+
+
+def test_widened_qdot_escape_epsilon_present():
+    """The 2026-09-16 boundary-anti-creep constants must exist and
+    carry non-trivial magnitudes. ELBOW_QDOT_ESCAPE_EPS must be at
+    least 1e-6 (numerical-noise floor of the damped-LS solver on
+    this DH); POSTURE_STALE_MAX_S must be > 0.2 s (posture bursts
+    lag by up to ~800 ms).
+    """
+    from estun_driver.estun_driver_node import (
+        ELBOW_QDOT_ESCAPE_EPS, POSTURE_STALE_MAX_S)
+    assert ELBOW_QDOT_ESCAPE_EPS >= 1e-6, (
+        f'ELBOW_QDOT_ESCAPE_EPS={ELBOW_QDOT_ESCAPE_EPS} too tight — '
+        f'the old 1e-9 admitted numerical noise as a valid escape sign')
+    assert POSTURE_STALE_MAX_S >= 0.2, (
+        f'POSTURE_STALE_MAX_S={POSTURE_STALE_MAX_S} too aggressive — '
+        f'posture packets can lag by ~800 ms per §18.4')
 
 
 # ── (3) Source-inspection: elbow-wall precedes σ-wall in both paths

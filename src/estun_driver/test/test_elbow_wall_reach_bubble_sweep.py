@@ -310,8 +310,13 @@ def test_elbow_margin_is_pure_joint_function():
 
 
 def test_tie_break_to_refuse_present_in_helper():
-    """Source pin: the ambiguous-qdot branch must refuse (return
-    is_closing=True) when margin ≤ elbow_wall_deg — never permit."""
+    """Source pin: the ambiguous-qdot branch must refuse when in the
+    elbow danger band. 2026-09-16 boundary-anti-creep widened this
+    from the original `|qdot_j3| < 1e-9 → margin<=wall` to include
+    the latched-and-in-hyst-band case, so a re-press at margin=10.05°
+    with the latch set (which is exactly the field-report scenario)
+    is refused instead of admitting a tick of motion.
+    """
     import os, re
     HERE = os.path.dirname(os.path.abspath(__file__))
     DRIVER_SRC = os.path.abspath(os.path.join(
@@ -323,12 +328,19 @@ def test_tie_break_to_refuse_present_in_helper():
         r'return margin, is_closing',
         src, re.DOTALL)
     body = m.group(1)
-    # Ambiguous branch: |qdot_j3| < 1e-9 → margin <= wall → refuse.
+    # Widened ambiguous branch: |qdot_j3| < ELBOW_QDOT_ESCAPE_EPS,
+    # danger band = (margin<=wall) OR (latched AND margin<=wall+hyst).
+    assert 'ELBOW_QDOT_ESCAPE_EPS' in body, (
+        'widened tie-break must use ELBOW_QDOT_ESCAPE_EPS — the old '
+        '1e-9 admitted floating-point noise as a valid escape sign')
     assert re.search(
-        r'if abs\(qdot_j3\) < 1e-9:\s*\n'
-        r'(?:\s*#[^\n]*\n)*'
-        r'\s*return margin, \(margin <= self\._elbow_wall_deg\)',
-        body) is not None, (
-        'tie-break-to-refuse missing from _elbow_margin_and_closure '
-        '— ambiguous qdot at the wall could still permit a closing '
-        'motion')
+        r'in_hyst_band\s*=\s*margin\s*<=\s*\(?\s*self\._elbow_wall_deg',
+        body), (
+        'widened tie-break must compute in_hyst_band = margin '
+        '<= wall + hysteresis')
+    assert re.search(
+        r'self\._cart_elbow_latched\s+and\s+in_hyst_band',
+        body), (
+        'widened tie-break must refuse ambiguous qdot when latched '
+        'AND in the hysteresis band — closes the field-report '
+        'creep vector (mechanism d)')

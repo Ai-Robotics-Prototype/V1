@@ -359,6 +359,21 @@ ELBOW_COLLINEAR_J3_DEG = 0.0
 # press re-arms — mirrors the σ-wall's WALL_LATCH_HYSTERESIS.
 ELBOW_LATCH_HYSTERESIS_DEG = 2.0
 
+# 2026-09-16 boundary-anti-creep: minimum |qdot_J3| (rad/s per unit
+# cart twist) that counts as a CLEAR escape signal. Below this the
+# damped-LS sign is numerical noise at wrist-near-singular poses —
+# treat as ambiguous. Previously the tie-break used 1e-9 which
+# admitted floating-point garbage sign for values like 3e-6.
+ELBOW_QDOT_ESCAPE_EPS = 1.0e-4
+
+# 2026-09-16 boundary-anti-creep: press-decision refuses when the
+# posture packet backing the elbow-margin / qdot_J3 read is older
+# than this threshold. Posture bursts in the CC10-A can leave the
+# driver reading a margin up to ~800 ms out of date; a re-press
+# decided on that stale read can permit a tick's worth of motion
+# past the wall.
+POSTURE_STALE_MAX_S = 0.5
+
 
 class EstunCodroidDriver(Node):
     """v2.3 telemetry mirror driver for Estun Codroid controllers."""
@@ -3922,15 +3937,26 @@ class EstunCodroidDriver(Node):
             return margin, False
         qdot_j3 = self._sing_guard.qdot_component(
             self._joint_deg, axis, signed_speed, joint_idx0=2)
-        # 2026-09-14 §5c TIE-BREAK-TO-REFUSE. Near a wrist singularity
-        # (J5 ≈ 0) the damped-LS solve can return a very small
-        # qdot_J3 whose sign is numerical noise. Operator directive
-        # item 7 (whole-bubble sweep): never permit a closing motion
-        # at the wall on an ambiguous sign — if we can't tell, and
-        # we're inside the wall, refuse. Outside the wall the
-        # ambiguity is harmless (no motion consequence either way).
-        if abs(qdot_j3) < 1e-9:
-            return margin, (margin <= self._elbow_wall_deg)
+        # 2026-09-14 §5c TIE-BREAK-TO-REFUSE + 2026-09-16 boundary
+        # anti-creep widening. Near a wrist singularity (J5 ≈ 0) the
+        # damped-LS solve can return a small qdot_J3 whose sign is
+        # numerical noise; and after a wall stop the arm can rest at
+        # margin ~10.05° (just above wall) where the old tie-break
+        # (only fired inside the wall) permitted a re-press to move
+        # a tick further in. Widen: when |qdot_J3| is below the
+        # ESCAPE_EPS threshold, treat the press as closing across
+        # the whole in-band zone (below wall OR latched-and-in-hyst-
+        # band). Outside that danger band, ambiguity stays harmless
+        # (permit as before). This closes mechanism (d) — direction
+        # misclassification at the resting pose — and hardens
+        # mechanism (a) — stops landing just above the wall.
+        if abs(qdot_j3) < ELBOW_QDOT_ESCAPE_EPS:
+            in_hyst_band = margin <= (self._elbow_wall_deg
+                                      + ELBOW_LATCH_HYSTERESIS_DEG)
+            dangerous = (
+                margin <= self._elbow_wall_deg
+                or (self._cart_elbow_latched and in_hyst_band))
+            return margin, dangerous
         # Closing = qdot_J3 has OPPOSITE sign to J3 (pulls toward 0).
         is_closing = (j3 * qdot_j3) < 0.0
         return margin, is_closing
@@ -3957,6 +3983,40 @@ class EstunCodroidDriver(Node):
             axis, direction, signed_speed)
         elbow_release_thresh = (self._elbow_wall_deg
                                 + ELBOW_LATCH_HYSTERESIS_DEG)
+        # 2026-09-16 boundary-anti-creep POSTURE-AGE GATE. When the
+        # arm is in the elbow danger band (below wall OR latched-and-
+        # in-hyst-band) the press decision MUST NOT resolve on a stale
+        # posture packet — the true margin can be a full degree lower
+        # than the last-known read (CC10-A posture bursts leave the
+        # driver with ~800 ms lag under load per §18.4). Refuse the
+        # press with a plain "position updating" copy and let the
+        # operator retry once a fresh packet lands. Outside the danger
+        # band, staleness is harmless (margin is far from the wall).
+        _in_danger_band = (
+            elbow_margin <= self._elbow_wall_deg
+            or (self._cart_elbow_latched
+                and elbow_margin <= elbow_release_thresh))
+        # Opening presses are always permitted — escape guarantee.
+        # Only gate stale posture when the press could be closing
+        # (elbow_closing True per the widened tie-break) OR the
+        # direction reads as opening but the posture read itself is
+        # too old to trust.
+        if _in_danger_band and elbow_closing:
+            _posture_age = time.time() - self._last_posture_ts
+            if _posture_age > POSTURE_STALE_MAX_S:
+                refusal = {
+                    'reason_code': 'posture_stale',
+                    'reason': ('Robot position updating — try again '
+                               'in a moment.'),
+                    'posture_age_s':   float(_posture_age),
+                    'posture_stale_max_s': float(POSTURE_STALE_MAX_S),
+                    'elbow_margin_deg': float(elbow_margin),
+                    'elbow_wall_deg':   float(self._elbow_wall_deg),
+                    'elbow_latched':    bool(self._cart_elbow_latched),
+                    'cart_axis':      int(axis),
+                    'cart_direction': int(direction),
+                }
+                return signed_speed, refusal
         if elbow_margin > elbow_release_thresh:
             if self._cart_elbow_latched:
                 self.get_logger().info(
