@@ -387,11 +387,14 @@ POSTURE_STALE_MAX_S = 0.5
 # moving. Fix: when the σ scale for a CLOSING press would be at/
 # below this threshold, refuse with a plain "reach limit" copy
 # rather than emit a heavily-scaled frame. Opening presses always
-# permitted (escape guarantee). Value chosen from the operator's
-# captured session — 0.60 refuses σ_min ≤ 0.077, matching the deep-
-# soft-band creep zone; raise it (0.70) to catch shallower cases,
-# lower it (0.50) to permit more approach speed.
-CART_APPROACH_SIGMA_SCALE_MIN = 0.60
+# permitted (escape guarantee).
+#
+# Value evolution: initial 0.60 (session 4594d5d) missed the fresh
+# repro at scales 0.60–0.62 (arm still moved). Raised to 0.70 based
+# on the second capture — the observed creep zone is scale 0.48–0.66
+# and 0.70 gives a safety margin. This threshold plus the mirror in
+# the supervise-tick governor closes the mid-hold re-emit path too.
+CART_APPROACH_SIGMA_SCALE_MIN = 0.70
 
 
 class EstunCodroidDriver(Node):
@@ -4693,7 +4696,51 @@ class EstunCodroidDriver(Node):
                         # was computed above from the σ-lookahead and
                         # is authoritative for this tick.
                         if scale < 1.0 and sigma is not None and not is_escaping:
-                            if self._wsjog_trust_firmware_clamps:
+                            # 2026-09-16 SUPERVISE MIRROR of the σ-scale
+                            # approach refusal that lives in
+                            # _cart_start_sing_clamp. Fresh capture on
+                            # SHA 4594d5d proved the start-clamp
+                            # refusal alone leaves a gap: during a
+                            # short continuous hold, start-clamp fires
+                            # once at press-start (e.g. permitted at
+                            # scale=0.62 with the 0.60 threshold), but
+                            # then supervise runs the governor and
+                            # re-emits Robot/jog at even lower speeds
+                            # (0.38 scale seen). Each re-emit is one
+                            # tick of motion; combined with rapid
+                            # release/press cycles the operator sees
+                            # steady creep. Fix: when the governor
+                            # would scale to at/below
+                            # CART_APPROACH_SIGMA_SCALE_MIN AND the
+                            # commanded motion is CLOSING the elbow
+                            # margin (is_escaping is already handled
+                            # above and skipped this whole block),
+                            # STOP the jog instead of re-emitting.
+                            # Threshold value is the same one gating
+                            # the start-clamp — one knob, both paths.
+                            if (scale <= CART_APPROACH_SIGMA_SCALE_MIN
+                                    and elbow_closing_cur):
+                                if self._wsjog_trust_firmware_clamps:
+                                    self._cart_softening = {
+                                        'active': True, 'mode': 'observe',
+                                        'cause': 'elbow_approach_scale',
+                                        'sigma_min': sigma,
+                                        'sigma_scale': scale,
+                                        'sigma_scale_min':
+                                            CART_APPROACH_SIGMA_SCALE_MIN,
+                                        'elbow_margin_deg': elbow_margin_cur,
+                                    }
+                                else:
+                                    self._stop_jog_locked(
+                                        reason=(
+                                            f'elbow_approach_scale: '
+                                            f'σ_min={sigma:.4f} → '
+                                            f'scale={scale:.2f} ≤ '
+                                            f'{CART_APPROACH_SIGMA_SCALE_MIN:.2f} '
+                                            f'and closing — refusing '
+                                            f'the attenuated re-emit'))
+                                    return
+                            elif self._wsjog_trust_firmware_clamps:
                                 # 2026-08-28 demoted: firmware IK
                                 # naturally slows the arm through
                                 # singularity approach. Observe only.

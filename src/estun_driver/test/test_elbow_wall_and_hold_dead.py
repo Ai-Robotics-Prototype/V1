@@ -432,16 +432,25 @@ def test_sigma_scale_approach_refusal_replays_captured_creep():
     'elbow_approach_scale') for the ones that were creeping.
     """
     from estun_driver.estun_driver_node import CART_APPROACH_SIGMA_SCALE_MIN
-    # Exact captured session values (journalctl 2026-09-16 09:31:13-17,
-    # SHA 1aacf1d TEMP capture). All presses axis=1 dir=+1 speed=+0.29
-    # (closing). Column: (j3_deg, sigma_min). Six deep-creep presses.
+    # Captured sessions — deep-creep presses from two operator repros:
+    # (1) SHA 1aacf1d journalctl 09:31:13–17, scales 0.48–0.55; and
+    # (2) SHA 4594d5d journalctl 09:45:05–07, scales 0.60–0.62 (the
+    # scales that missed the initial 0.60 threshold). All axis=1
+    # dir=+1 speed=+0.29 (closing). Column: (j3_deg, sigma_min).
     captured_presses = [
+        # SHA 1aacf1d — first repro
         (17.481, 0.0728),
         (16.272, 0.0679),
         (16.149, 0.0674),
         (16.026, 0.0668),
         (15.904, 0.0663),
         (15.782, 0.0658),
+        # SHA 4594d5d — second repro (the presses that leaked at 0.60)
+        (19.20,  0.0798),
+        (19.06,  0.0793),
+        (18.93,  0.0788),
+        (18.80,  0.0782),
+        (17.48,  0.0777),  # scale=0.60 exactly — boundary case
     ]
     refusals = []
     for j3, sigma in captured_presses:
@@ -506,7 +515,8 @@ def test_sigma_scale_refusal_permits_scale_above_threshold():
     a closing press is permitted (may still be scaled, not refused).
     """
     fake = _elbow_fake(j3_deg=20.0, elbow_latched=False)
-    fake._sing_guard.sigma_min = lambda q: 0.11
+    # σ well ABOVE σ_soft (0.116) → scale ~1.0 → no refusal.
+    fake._sing_guard.sigma_min = lambda q: 0.13
     q_pos = fake._sing_guard.qdot_component(
         fake._joint_deg, 3, +1.0, joint_idx0=2)
     closing_sign = -1 if (q_pos > 0) else +1
