@@ -108,36 +108,54 @@ def test_jog_overlay_wrapper_swallows_only_its_own_pointer_events():
         'receive taps')
 
 
-def test_overlay_panel_has_opaque_readable_background():
-    """The floating jog panel MUST have a non-transparent background
-    so control text stays readable against any 3D content
-    (dark shadows / bright light-floor / robot mesh).
-
-    Requirement: rgba(...) at >= 0.85 alpha OR a solid var(--bg-*)
-    color. Fully-transparent panels would leave text illegible on
-    busy scenes.
+def test_overlay_panel_container_is_transparent():
+    """2026-09-16 correction: the jog surface container MUST be fully
+    transparent (no bg, no border, no shadow, no radius, no blur) so
+    the 3D scene shows THROUGH the whole surface. Only the
+    buttons / controls themselves carry chip backgrounds. Prior
+    rgba(255,255,255,0.92) card was the mistake the operator called
+    out — pin so it can't come back.
     """
     src = _read(LAYOUT)
     idx = src.find('data-testid="jog-floating-panel"')
     assert idx != -1
     block = src[idx:idx + 1500]
-    m = re.search(r"background:\s*'rgba\(255,\s*255,\s*255,\s*([0-9.]+)\)'",
-                   block)
-    assert m is not None, (
-        'jog-floating-panel background must be rgba(255,255,255,α) — '
-        'the immersive layout wants a semi-opaque light chip so the '
-        'robot silhouette bleeds around the edges without erasing '
-        'control legibility')
-    alpha = float(m.group(1))
-    assert alpha >= 0.85, (
-        f'panel background alpha {alpha} < 0.85 — text over 3D would '
-        f'lose contrast on busy scenes')
-    # Backdrop blur is nice-to-have (browsers that skip it still get
-    # the 0.92 alpha), but pin the intent so a future edit doesn't
-    # silently drop the polish.
-    assert 'backdropFilter' in block, (
-        'panel should apply backdropFilter (blur) for extra polish '
-        'when the browser supports it')
+    assert re.search(r"background:\s*'transparent'", block), (
+        'jog-floating-panel MUST be background:transparent so the 3D '
+        'scene shows through between controls — no white card')
+    # Reject the retired card treatments explicitly so a partial
+    # revert stands out.
+    for banned in ('backdropFilter', 'borderRadius', 'boxShadow',
+                   'rgba(255, 255, 255,'):
+        assert banned not in block, (
+            f'jog-floating-panel container must not carry `{banned}` — '
+            f'the transparent-surface directive forbids the "floating '
+            f'card" treatment')
+
+
+def test_overlay_panel_has_no_internal_scroll():
+    """The scrollable children container inside the jog panel used
+    overflow:auto — it produced an internal scrollbar when the pad
+    body exceeded 440 px on the operator's viewport. The correction
+    changes overflow to 'visible' so content lays out at its natural
+    size over the canvas with NO scrollbar.
+    """
+    src = _read(LAYOUT)
+    # The children wrapper sits directly before the {children} render
+    # inside RealArmChrome — grep for the specific comment-anchored
+    # style.
+    chrome_start = src.find('function RealArmChrome(')
+    body_end = src.find('function ', chrome_start + 20)
+    body = src[chrome_start:body_end]
+    assert re.search(
+        r"flex:\s*1,\s*minHeight:\s*0,\s*overflow:\s*'visible'",
+        body), (
+        'RealArmChrome children wrapper must use overflow:visible so '
+        'no internal scrollbar appears on the transparent surface')
+    # And the scroll variant must be gone.
+    assert "overflow: 'auto'" not in body, (
+        'overflow:auto is retired from RealArmChrome — it was the '
+        'source of the operator-reported internal scrollbar')
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -268,6 +286,38 @@ def test_directional_color_map_preserved():
             f'directional color {hex_color} appears {cnt} times, '
             f'expected at least {min_count} — a direction lost its '
             f'color coding')
+
+
+def test_loose_labels_have_text_shadow_for_over_3d_readability():
+    """2026-09-16 correction: labels that sit directly over the 3D
+    scene ('Jog', 'Position/Height/Rotation', 'Step Size', 'Speed:',
+    'moves while held' / 'one step per press') carry a compact
+    white text-shadow so they stay readable on any floor tone
+    without needing a large panel behind them. Shared constant
+    LABEL_TEXT_SHADOW pins the treatment so future edits can't
+    silently drop the shadow.
+    """
+    src = _read(JOG)
+    assert 'const LABEL_TEXT_SHADOW' in src, (
+        'shared LABEL_TEXT_SHADOW constant missing — its purpose is '
+        'to keep the loose-label shadow treatment consistent across '
+        'every text sitting over the 3D scene')
+    # padLabel (Position / Height / Rotation) must apply it.
+    pad_idx = src.find('const padLabel = (text) =>')
+    assert pad_idx != -1
+    pad_body = src[pad_idx:pad_idx + 500]
+    assert 'LABEL_TEXT_SHADOW' in pad_body, (
+        'padLabel (Position / Height / Rotation) must render with '
+        'LABEL_TEXT_SHADOW')
+    # Other loose labels must reference it too. Count occurrences:
+    # padLabel + 'Jog' heading + 'moves while held/one step per press'
+    # + 'Step Size' + 'Speed:' = at least 5 usages.
+    uses = src.count('LABEL_TEXT_SHADOW')
+    # 1 declaration + at least 5 applications = >= 6.
+    assert uses >= 6, (
+        f'LABEL_TEXT_SHADOW referenced only {uses} times — expected '
+        f'>= 6 (declaration + Jog heading + padLabel + hint + '
+        f'Step Size + Speed:); a loose label lost its treatment')
 
 
 def test_disabled_state_still_dimmed_via_hold_button():

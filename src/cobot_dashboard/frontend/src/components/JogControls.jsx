@@ -422,6 +422,13 @@ export function HoldButton({
   )
 }
 
+// 2026-09-16 immersive layout — loose labels rendered directly over
+// the 3D scene get a compact white text-shadow so they read on any
+// floor tone (dark shadow OR bright light-floor). Kept subtle per
+// operator directive (no large chips behind labels).
+const LABEL_TEXT_SHADOW =
+  '0 1px 2px rgba(255,255,255,0.9), 0 0 3px rgba(255,255,255,0.7)'
+
 // 2026-09-16 immersive layout — jog buttons render as SOLID colored
 // chips with white glyphs so they read instantly over the 3D scene.
 // Directional color coding preserved (X red, Y green, Z blue,
@@ -820,8 +827,16 @@ export default function JogControls({ maximized = false, rightSlot = null }) {
     transition: 'all 100ms',
   })
   // 2026-09-08: runBtnBase retired with the RIGHT column.
+  // 2026-09-16 immersive correction: loose labels sit directly over
+  // the 3D scene now — add a compact white text-shadow chip so
+  // "Position" / "Height" / "Rotation" stay readable on any floor
+  // tone. No large card behind the label; the shadow does the work.
   const padLabel = (text) => (
-    <div style={{ fontSize: 12, fontWeight: 600, color: '#6b7280', textAlign: 'center', marginBottom: 6 }}>{text}</div>
+    <div style={{
+      fontSize: 12, fontWeight: 700, color: '#111',
+      textAlign: 'center', marginBottom: 6,
+      textShadow: LABEL_TEXT_SHADOW,
+    }}>{text}</div>
   )
 
   // Wire a directional pad button. Joint mode uses 1..6; cartesian
@@ -983,7 +998,7 @@ export default function JogControls({ maximized = false, rightSlot = null }) {
         // can scroll to reach it.
         justifyContent: 'flex-start',
       }}>
-        <div style={{ fontSize: maximized ? 16 : 14, fontWeight: 700, color: '#111' }}>Jog</div>
+        <div style={{ fontSize: maximized ? 16 : 14, fontWeight: 700, color: '#111', textShadow: LABEL_TEXT_SHADOW }}>Jog</div>
 
         {/* Frame: Joint vs Cartesian */}
         <button
@@ -1013,14 +1028,14 @@ export default function JogControls({ maximized = false, rightSlot = null }) {
               fontSize: modeFont - 1,
             }}>Continuous</button>
         </div>
-        <div style={{ fontSize: 10, color: '#6b7280', marginTop: -4 }}>
+        <div style={{ fontSize: 10, color: '#374151', marginTop: -4, fontWeight: 600, textShadow: LABEL_TEXT_SHADOW }}>
           {jogStyle === 'STEP' ? 'one step per press' : 'moves while held'}
         </div>
 
         {/* Step Size — only interactive in STEP mode; greyed in CONTINUOUS. */}
         <div style={{ marginTop: 4, opacity: jogStyle === 'STEP' ? 1 : 0.4 }}>
-          <div style={{ fontSize: sectionLabelFont, fontWeight: 600, color: '#6b7280', marginBottom: 4 }}>
-            Step Size {jogStyle === 'CONTINUOUS' && <span style={{ fontWeight: 400 }}>· speed controls motion</span>}
+          <div style={{ fontSize: sectionLabelFont, fontWeight: 700, color: '#111', marginBottom: 4, textShadow: LABEL_TEXT_SHADOW }}>
+            Step Size {jogStyle === 'CONTINUOUS' && <span style={{ fontWeight: 500 }}>· speed controls motion</span>}
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
             {[0.1, 0.5, 1, 5, 10].map((s) => (
@@ -1041,7 +1056,7 @@ export default function JogControls({ maximized = false, rightSlot = null }) {
         </div>
 
         <div>
-          <div style={{ fontSize: speedFont, fontWeight: 600, color: '#6b7280', marginBottom: 4 }}>
+          <div style={{ fontSize: speedFont, fontWeight: 700, color: '#111', marginBottom: 4, textShadow: LABEL_TEXT_SHADOW }}>
             Speed: {Math.min(speed, JOG_SLIDER_MAX_PCT)}%
           </div>
           {/* 2026-09-11 OPERATOR ORDER (supersedes same-day unlock):

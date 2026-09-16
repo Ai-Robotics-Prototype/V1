@@ -60,32 +60,25 @@ function RealArmChrome({ mode, setMode, children }) {
     <div
       data-testid="jog-floating-panel"
       style={{
-        // 2026-09-16 immersive layout — the 3D canvas is the full-page
-        // background; JogControls is now a floating overlay panel with
-        // a semi-opaque background so the robot stays visible behind
-        // the ambient panel edges without control text losing contrast.
-        // Semi-opaque + backdrop-blur is cheap on modern browsers; on
-        // any that skip filter support we still land at ~92 % opacity
-        // which reads cleanly.
-        background: 'rgba(255, 255, 255, 0.92)',
-        backdropFilter: 'blur(6px)',
-        WebkitBackdropFilter: 'blur(6px)',
-        border: '1px solid var(--border)',
-        borderTop: '2px solid ' + REAL_ARM_RED,
-        borderRadius: 12,
-        boxShadow: '0 6px 22px rgba(0,0,0,0.25)',
+        // 2026-09-16 immersive correction — the previous 0.92-alpha
+        // white card was wrong. Container is now fully TRANSPARENT
+        // (no bg, no border, no blur, no shadow, no radius): the 3D
+        // scene shows THROUGH the whole surface and only the
+        // buttons/controls themselves carry chip backgrounds.
+        background: 'transparent',
         display: 'flex', flexDirection: 'column',
-        overflow: 'hidden',
-        // 440 px NORMAL preserves the Program tab's JOG_MIN_HEIGHT (360)
-        // budget after the compact chip header (~34 px w/ borders).
-        // EXPANDED fills the wrapper (which itself provides the outer
-        // gutter for the immersive layout — see the wrapper style
-        // in View3DLayout's return).
+        // Content that would have scrolled inside a bounded panel
+        // now lays out at its natural height over the canvas — no
+        // internal scrollbar.
+        overflow: 'visible',
+        // 440 px NORMAL preserves the Program tab's JOG_MIN_HEIGHT
+        // (360) budget after the compact chip header. Doctrine pin
+        // D_view3d_jog_flow_layout::flow(a) locks this contract.
         height: isExpanded ? '100%' : 440,
-        maxWidth: isExpanded ? '100%' : 'min(1240px, calc(100% - 24px))',
-        width: isExpanded ? '100%' : undefined,
-        // Panel owns its own pointer events; the surrounding transparent
-        // area of the parent lets the 3D canvas orbit/zoom through.
+        width: '100%',
+        // Panel owns its own pointer events; the surrounding wrapper
+        // is pointerEvents:'none' so orbit works BETWEEN controls,
+        // in every gap where the 3D scene shows through.
         pointerEvents: 'auto',
         flexShrink: 0,
       }}>
@@ -100,8 +93,9 @@ function RealArmChrome({ mode, setMode, children }) {
         // narrow tablet width — the DISABLE/READY row is the anchor
         // controls below flow from.
         minHeight: 44,
+        // Transparent header — DISABLE/READY badge + Collapse button
+        // carry their own chip backgrounds; no rail behind them.
         background: 'transparent',
-        borderBottom: '1px solid var(--border)',
       }}>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           <ArmEnableControl />
@@ -137,7 +131,10 @@ function RealArmChrome({ mode, setMode, children }) {
             style={chromeBtn}>{isExpanded ? '✕' : '⛶'}</button>
         </div>
       </div>
-      <div style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
+      {/* 2026-09-16 correction: no internal scrollbar. Children lay
+          out at their natural size over the canvas — the 3D scene
+          shows THROUGH every gap between controls. */}
+      <div style={{ flex: 1, minHeight: 0, overflow: 'visible' }}>
         {children}
       </div>
     </div>
@@ -261,20 +258,19 @@ export default function View3DLayout() {
           data-testid="jog-overlay-wrapper"
           style={{
             position: 'absolute',
-            // NORMAL: pinned to the bottom-center, height auto (grows
-            // up to fit the 440 px panel above `bottom:12`).
-            // EXPANDED: full-bleed container with a 12 px gutter on
-            // every side so the panel's height:'100%' produces a
-            // panel that spans the region cleanly without eating the
-            // E-STOP margin at the top nav boundary.
-            left:   isExpanded ? 12 : 0,
-            right:  isExpanded ? 12 : 0,
-            top:    isExpanded ? 12 : 'auto',
-            bottom: 12,
+            // 2026-09-16 correction — the jog surface sits at its
+            // ORIGINAL bottom position, full width. No floating card,
+            // no centered narrow panel. NORMAL: 440 px band at the
+            // bottom (panel height owns this). EXPANDED: full-height
+            // (panel takes 100% via the RealArmChrome height rule).
+            left: 0, right: 0,
+            top:    isExpanded ? 0 : 'auto',
+            bottom: 0,
             display: 'flex',
-            justifyContent: 'center',
-            padding: isExpanded ? 0 : '0 12px',
+            justifyContent: 'stretch',
             zIndex: 10,
+            // Wrapper passes clicks to the 3D canvas — panel children
+            // re-enable pointer events on their own controls only.
             pointerEvents: 'none',
           }}>
           <RealArmChrome mode={jogPanelMode} setMode={setView3dJogPanel}>
