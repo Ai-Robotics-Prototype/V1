@@ -509,14 +509,19 @@ def test_sigma_scale_refusal_permits_opening_direction():
         f'refusal must never gate an escape')
 
 
-def test_sigma_scale_refusal_permits_scale_above_threshold():
-    """The refusal must NOT over-fire when the σ scale is above the
-    threshold. Sanity: at σ=0.11 (near σ_soft=0.116 → scale ~0.9)
-    a closing press is permitted (may still be scaled, not refused).
+def test_sigma_scale_refusal_permits_only_at_scale_1_0():
+    """2026-09-16 operator policy: refuse ANY closing press while
+    the σ scale is < 1.0 (strict less-than). Only scale == 1.0
+    (no soft-band scaling at all) permits a closing press. This
+    turns the σ soft-band into a refusal zone for cart approach.
+    Escape stays free.
+
+    Sanity that the permit path still exists: σ well ABOVE σ_soft
+    (0.116 at low speeds) → SingularityGuard.scale returns 1.0 →
+    no refusal fires.
     """
     fake = _elbow_fake(j3_deg=20.0, elbow_latched=False)
-    # σ well ABOVE σ_soft (0.116) → scale ~1.0 → no refusal.
-    fake._sing_guard.sigma_min = lambda q: 0.13
+    fake._sing_guard.sigma_min = lambda q: 0.30   # >> σ_soft
     q_pos = fake._sing_guard.qdot_component(
         fake._joint_deg, 3, +1.0, joint_idx0=2)
     closing_sign = -1 if (q_pos > 0) else +1
@@ -525,8 +530,40 @@ def test_sigma_scale_refusal_permits_scale_above_threshold():
         signed_speed=closing_sign * 0.29)
     assert (refusal is None
             or refusal.get('reason_code') != 'elbow_approach_scale'), (
-        f'closing press at σ=0.11 (scale ~0.9) refused with '
-        f'elbow_approach_scale — the threshold is over-firing')
+        f'closing press at σ=0.30 (scale = 1.0, outside soft band) '
+        f'refused — the invariant should permit at scale == 1.0')
+
+
+def test_sigma_scale_refusal_covers_shallow_soft_band():
+    """2026-09-16 operator policy repro (third session): scales
+    0.74–0.99 in the shallow σ soft-band were creeping through the
+    prior 0.70 threshold. The strict-less-than 1.0 threshold must
+    refuse ANY scale < 1.0 on a closing press — including shallow
+    scales like 0.90 or 0.99.
+    """
+    # Cover the shallow soft-band scales seen in the 74aba12 repro
+    # (10:10:38–10:11:05 CDT): σ_min 0.15–0.19 at speed=0.5 gave
+    # scales 0.74–0.99 in the log. Test scales that would have
+    # leaked under the old threshold.
+    for shallow_sigma in (0.15, 0.17, 0.18, 0.19):
+        fake = _elbow_fake(j3_deg=20.0, elbow_latched=False)
+        fake._sing_guard.sigma_min = lambda q, _s=shallow_sigma: _s
+        q_pos = fake._sing_guard.qdot_component(
+            fake._joint_deg, 3, +1.0, joint_idx0=2)
+        closing_sign = -1 if (q_pos > 0) else +1
+        # Match the 74aba12 repro speed (50%) — _dyn_sigma_soft
+        # scales up with speed to 0.20 at 0.5, so σ=0.15–0.19 falls
+        # inside the dynamic soft band and produces scale < 1.0.
+        _, refusal = fake._cart_start_sing_clamp(
+            axis=3, direction=closing_sign,
+            signed_speed=closing_sign * 0.50)
+        assert refusal is not None, (
+            f'shallow-soft-band press (σ={shallow_sigma}) permitted — '
+            f'the strict-less-than 1.0 threshold should have refused')
+        assert refusal.get('reason_code') in (
+            'elbow_approach_scale', 'elbow_wall'), (
+            f'shallow-soft-band press (σ={shallow_sigma}) refused with '
+            f'wrong reason_code {refusal.get("reason_code")}')
 
 
 def test_widened_qdot_escape_epsilon_present():

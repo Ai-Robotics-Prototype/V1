@@ -377,24 +377,24 @@ POSTURE_STALE_MAX_S = 0.5
 # 2026-09-16 sigma-soft-band approach refusal. Live capture (operator
 # reproduction on this branch) showed the "creep past the wall" the
 # operator reports is not the elbow_wall guard firing — it's the σ
-# soft-band SCALING. In that session the elbow margin never went
-# below 15.78° (5.78° above elbow_wall_deg=10°), so the geometric
-# elbow_wall guard correctly permits every press; but σ_min is deep
-# in the soft band (0.066–0.083 vs σ_soft≈0.116) so the scale drops
-# to 0.48–0.66 → the driver emits Robot/jog at ~0.14 speed_frac →
-# each ~0.5s hold nets ~0.12° of J3 motion. Operator perceives it as
-# "hitting the wall then creeping past" because the arm is barely
-# moving. Fix: when the σ scale for a CLOSING press would be at/
-# below this threshold, refuse with a plain "reach limit" copy
-# rather than emit a heavily-scaled frame. Opening presses always
-# permitted (escape guarantee).
+# soft-band SCALING. The σ soft-band exists to slow the arm as it
+# approaches a singularity, but for the operator ANY motion while in
+# the soft band on a closing press is creep-past-the-wall.
 #
-# Value evolution: initial 0.60 (session 4594d5d) missed the fresh
-# repro at scales 0.60–0.62 (arm still moved). Raised to 0.70 based
-# on the second capture — the observed creep zone is scale 0.48–0.66
-# and 0.70 gives a safety margin. This threshold plus the mirror in
-# the supervise-tick governor closes the mid-hold re-emit path too.
-CART_APPROACH_SIGMA_SCALE_MIN = 0.70
+# Operator policy (2026-09-16, third repro): REFUSE ANY closing
+# press while the σ scale is < 1.0. If the soft-band would scale
+# the emit at all, that press must not go out. The comparison is
+# strict less-than so scale == 1.0 (nothing was going to be scaled)
+# still permits. Escape (elbow-opening) is always permitted.
+#
+# Threshold history: 0.60 (session 4594d5d) missed the mid-range
+# 0.60–0.62 zone. Raised to 0.70 (session 74aba12), still missed
+# scales 0.74–0.99 in a shallower approach. Third repro directive:
+# any soft-band scaling on closing = refuse (threshold 1.0 strict-
+# less-than). This makes the σ soft-band a REFUSAL zone for cart
+# approach, not a slowdown zone. Operator switches to Joint mode
+# for the last inches near the reach edge.
+CART_APPROACH_SIGMA_SCALE_MIN = 1.0
 
 
 class EstunCodroidDriver(Node):
@@ -4110,12 +4110,13 @@ class EstunCodroidDriver(Node):
         # the closing scale would be at/below
         # CART_APPROACH_SIGMA_SCALE_MIN. Escape (elbow-opening) is
         # never gated — the guard preserves the freedom guarantee.
-        if elbow_closing and scale <= CART_APPROACH_SIGMA_SCALE_MIN:
+        if elbow_closing and scale < CART_APPROACH_SIGMA_SCALE_MIN:
             refusal = {
                 'reason_code': 'elbow_approach_scale',
                 'reason': (
                     'Arm is close to its reach limit — jog back to a '
-                    'more central pose before continuing.'),
+                    'more central pose, or switch to Joint mode for '
+                    'the last inches.'),
                 'sigma_min':          float(sigma),
                 'sigma_soft_dyn':     float(dyn_soft),
                 'sigma_scale':        float(scale),
@@ -4718,7 +4719,7 @@ class EstunCodroidDriver(Node):
                             # STOP the jog instead of re-emitting.
                             # Threshold value is the same one gating
                             # the start-clamp — one knob, both paths.
-                            if (scale <= CART_APPROACH_SIGMA_SCALE_MIN
+                            if (scale < CART_APPROACH_SIGMA_SCALE_MIN
                                     and elbow_closing_cur):
                                 if self._wsjog_trust_firmware_clamps:
                                     self._cart_softening = {
