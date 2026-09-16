@@ -193,6 +193,22 @@ export default function StandaloneRobot({ onRobotReady } = {}) {
         }
         const jogApi = {
           robot,
+          // 2026-09-16 live-bbox framing — expose a live bounding box
+          // getter so the immersive-layout framing math can fit the
+          // ACTUAL arm at its current joint pose. Prior code used a
+          // hardcoded {maxDim:1.4, centerY:0.7} envelope which
+          // overflowed on tall/extended poses (arm bottom clipped
+          // into the jog surface). Traverses the URDF root at call
+          // time — cheap enough for the once-per-reframe cadence
+          // (mount / preset / resize / orientation), never called
+          // during jog. Returns null if the robot isn't ready.
+          getBBox: () => {
+            const r = robotRef.current
+            if (!r) return null
+            const box = new THREE.Box3().setFromObject(r)
+            if (box.isEmpty()) return null
+            return box
+          },
           setJointRad: (idx, rad) => {
             if (idx < 0 || idx >= 6) return
             const j = robot.joints?.[JOINT_NAMES[idx]]

@@ -269,9 +269,17 @@ export default function View3DLayout() {
       setVisibleTopFrac((prev) =>
         Math.abs(prev - topFrac) > 0.005 ? topFrac : prev)
     }
-    // Initial measure — deferred one RAF so React has committed the
-    // layout and the panel has real bounds (mount-race guard).
-    let raf = requestAnimationFrame(recompute)
+    // 2026-09-16 refresh-timing fix — double-RAF so React has
+    // committed AND the browser has painted before we call
+    // getBoundingClientRect. Refresh-time hydration + web-font load
+    // could leave the panel with a stale zero-top on the first RAF,
+    // which anchored visibleTopFrac at the MAX clamp and framed the
+    // arm too big → clip into buttons. Two frames land after all
+    // layout work.
+    let rafInner = null
+    let raf = requestAnimationFrame(() => {
+      rafInner = requestAnimationFrame(recompute)
+    })
     // ResizeObserver on the panel catches: panel-mode change
     // (NORMAL <-> MINIMIZED <-> EXPANDED), any inner-layout resize.
     let ro = null
@@ -301,6 +309,7 @@ export default function View3DLayout() {
     document.addEventListener('visibilitychange', onVisible)
     return () => {
       cancelAnimationFrame(raf)
+      if (rafInner) cancelAnimationFrame(rafInner)
       if (ro) ro.disconnect()
       window.removeEventListener('resize', onResize)
       window.removeEventListener('orientationchange', onResize)
@@ -386,7 +395,8 @@ export default function View3DLayout() {
           position: 'absolute', inset: 0, zIndex: 0, minWidth: 0,
           touchAction: 'none',
         }}>
-        <ArmViewer3D ref={armRef} noRobot framing={framing}>
+        <ArmViewer3D ref={armRef} noRobot framing={framing}
+                     getLiveBbox={jogApi?.getBBox}>
           <StandaloneRobot onRobotReady={setJogApi} />
           {/* 2026-09-14 operator directive: IKGizmo (Cartesian-drag
               twin IK) retired along with the JointJogPanel that

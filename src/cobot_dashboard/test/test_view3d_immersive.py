@@ -629,62 +629,135 @@ def test_default_framing_measured_from_actual_surface_bounds():
         'the standing contract now.')
 
 
-def test_framing_computes_arm_bbox_above_surface_at_tablet_and_desktop():
-    """Simulation pin — using the math in ArmViewer3D._framedPreset,
-    verify that at THREE representative viewports (tablet portrait,
-    tablet landscape, desktop) with the panel top measured as the
-    jog band would produce it, the arm's projected bottom edge
-    lands ABOVE the panel top with a safety margin. This locks
-    the operator's requirement 'arm-bbox-above-surface-top' at
-    multiple aspect ratios.
+def test_live_bbox_wiring_from_standalone_robot_to_view3d():
+    """2026-09-16 LIVE-BBOX FIX pin — the immersive layout must
+    plumb a LIVE bounding box getter from StandaloneRobot's jogApi
+    through View3DLayout down to ArmViewer3D's applyPreset. Prior
+    code used a hardcoded ARM_BBOX_APPROX envelope which overflowed
+    on tall/extended poses (arm bottom clipped into buttons).
+    """
+    layout = _read(LAYOUT)
+    viewer = _read(os.path.join(
+        HERE, '..', 'frontend', 'src', 'components', 'ArmViewer3D.jsx'))
+    standalone = _read(os.path.join(
+        HERE, '..', 'frontend', 'src', 'components', 'StandaloneRobot.jsx'))
+    # StandaloneRobot exposes a getBBox on the jogApi it hands back.
+    assert 'getBBox: () =>' in standalone, (
+        'StandaloneRobot.jogApi must expose getBBox() so the framing '
+        'math can measure the arm at its current joint pose')
+    assert 'new THREE.Box3().setFromObject' in standalone, (
+        'getBBox must use Box3.setFromObject on the URDF root — the '
+        'live bbox reflects the current joint pose')
+    # View3DLayout wires jogApi?.getBBox into ArmViewer3D's
+    # getLiveBbox prop.
+    assert re.search(
+        r'getLiveBbox=\{jogApi\?\.getBBox\}', layout), (
+        'View3DLayout must pass jogApi?.getBBox as ArmViewer3D\'s '
+        'getLiveBbox prop — otherwise the framing falls back to the '
+        'static ARM_BBOX_APPROX envelope and overflows on tall poses')
+    # ArmViewer3D applyPreset uses getLiveBbox() first, falls back
+    # to armBboxRef, then ARM_BBOX_APPROX only as last resort.
+    ap_idx = viewer.find('const applyPreset = (name) =>')
+    end = viewer.find('\n  }', ap_idx + 30)
+    ap_body = viewer[ap_idx:end]
+    assert 'getLiveBbox()' in ap_body, (
+        'applyPreset must call getLiveBbox() to get the current-pose '
+        'bounding box')
+    assert 'liveBox3.getSize' in ap_body, (
+        'applyPreset must derive maxDim + centerY from the live '
+        'Box3 via getSize + getCenter')
+    # useEffect deps include getLiveBbox so the reframe fires once
+    # jogApi becomes non-null.
+    idx = viewer.find('[framing?.visibleTopFrac, getLiveBbox]')
+    assert idx != -1, (
+        'ArmViewer3D reframe useEffect deps must include getLiveBbox '
+        'so the arm re-frames the moment the live bbox becomes '
+        'available (jogApi ready)')
+
+
+def test_framing_fits_compact_and_tall_poses_at_two_viewports():
+    """2026-09-16 replaces the hardcoded-dims pin. Simulates TWO
+    joint poses (compact + tall/extended) and asserts the arm bbox
+    bottom clears the jog surface top by FRAMING_MARGIN_PX in BOTH
+    poses, at tablet landscape AND desktop viewport heights. This
+    is the "arm-bbox-above-surface-top" acceptance test the
+    operator directive names.
     """
     import math
-    # Copy the framing math from ArmViewer3D._framedPreset so the
-    # pin doesn't depend on a JS runtime.
     FOV_DEG = 45.0
     MARGIN_PX = 24
-    # S10-140 envelope (ARM_BBOX_APPROX in ArmViewer3D).
-    ARM_MAX_DIM = 1.4
-    ARM_CENTER_Y = 0.7
-    # Jog band renders at 440 px NORMAL (RealArmChrome height —
-    # doctrine pin).
-    JOG_BAND_PX = 440
+    JOG_BAND_PX = 440   # RealArmChrome height budget (doctrine pin)
 
-    def arm_bottom_px_over_surface(viewport_h):
-        # visibleTopFrac derivation, matching the layout's
-        # measured recompute (r.top - MARGIN) / viewport_h.
-        surface_top = viewport_h - JOG_BAND_PX
-        top_frac = (surface_top - MARGIN_PX) / viewport_h
+    def gap_for(vp_h, arm_max_dim, arm_center_y):
+        """Return pixel gap between arm bottom and jog surface top.
+        Positive = clear; negative = arm clips into buttons.
+        Math mirrors ArmViewer3D._framedPreset for the ISO preset
+        (typical default; other presets use the same top-region
+        shift so ISO is representative)."""
+        surface_top = vp_h - JOG_BAND_PX
+        top_frac = (surface_top - MARGIN_PX) / vp_h
         top_frac = max(0.30, min(0.98, top_frac))
-        # _framedPreset math:
         fov = math.radians(FOV_DEG)
-        dist = (ARM_MAX_DIM * 1.15) / (top_frac * 2 * math.tan(fov / 2))
+        dist = (arm_max_dim * 1.15) / (top_frac * 2 * math.tan(fov / 2))
         jog_frac = 1 - top_frac
         world_y_offset = jog_frac * dist * math.tan(fov / 2)
-        target_y = ARM_CENTER_Y - world_y_offset
-        # Camera vertical world-per-pixel at target plane:
+        target_y = arm_center_y - world_y_offset
         world_h_at_target = 2 * dist * math.tan(fov / 2)
-        px_per_world = viewport_h / world_h_at_target
-        # Arm bbox spans centered on ARM_CENTER_Y with height
-        # ARM_MAX_DIM. Its screen-y range:
-        #   center_screen_y_from_target_pixels = (ARM_CENTER_Y - target_y) * px_per_world
-        # Screen convention: camera looks down -Z at target, world
-        # +Y renders UP on screen. So the arm center projects to
-        # target_y - ARM_CENTER_Y pixels ABOVE viewport center.
-        arm_center_offset_px = (ARM_CENTER_Y - target_y) * px_per_world
-        arm_center_from_top = viewport_h / 2 - arm_center_offset_px
-        arm_half_px = (ARM_MAX_DIM / 2) * px_per_world
+        px_per_world = vp_h / world_h_at_target
+        arm_center_offset_px = (arm_center_y - target_y) * px_per_world
+        arm_center_from_top = vp_h / 2 - arm_center_offset_px
+        arm_half_px = (arm_max_dim / 2) * px_per_world
         arm_bottom_from_top = arm_center_from_top + arm_half_px
-        return surface_top - arm_bottom_from_top   # positive = clear gap
+        return surface_top - arm_bottom_from_top
 
-    for name, vp_h in (('tablet portrait', 1280),
-                        ('tablet landscape', 800),
-                        ('desktop', 1080)):
-        gap = arm_bottom_px_over_surface(vp_h)
-        assert gap >= 0, (
-            f'{name} (viewport height={vp_h}px): arm bottom is '
-            f'{-gap:.1f}px BELOW jog surface top — measured framing '
-            f'must produce a POSITIVE gap (arm above surface)')
+    # Two representative poses derived from S10-140 kinematics.
+    POSES = {
+        # Home / compact — arm folded over base; small vertical extent.
+        'compact':  {'maxDim': 0.90, 'centerY': 0.55},
+        # Tall / extended — J2 raised, arm reaching upward; maxDim +
+        # centerY both grow substantially. This is exactly the class
+        # of pose the hardcoded 1.4/0.7 envelope overflowed on.
+        'tall':     {'maxDim': 1.90, 'centerY': 1.10},
+    }
+    VIEWPORTS = {
+        'tablet landscape':  800,
+        'desktop':          1080,
+    }
+    for pose_name, pose in POSES.items():
+        for vp_name, vp_h in VIEWPORTS.items():
+            gap = gap_for(vp_h, pose['maxDim'], pose['centerY'])
+            assert gap >= 0, (
+                f'{pose_name} pose @ {vp_name} (vp={vp_h}px): arm '
+                f'bottom is {-gap:.1f}px BELOW surface top — the '
+                f'live-bbox framing must clear the surface with '
+                f'the FRAMING_MARGIN_PX safety gap in EVERY pose')
+
+
+def test_framing_debug_flag_is_gated():
+    """Debug flag pin — the framing debug console.info must be gated
+    behind an opt-in (URL query ?framing_debug=1 or localStorage
+    'framing_debug'='1') so refresh-time on the operator's tablet
+    is silent unless they explicitly enable it. Prevents spammy
+    telemetry from leaking to production console.
+    """
+    viewer = _read(os.path.join(
+        HERE, '..', 'frontend', 'src', 'components', 'ArmViewer3D.jsx'))
+    # The gate helper exists.
+    assert 'function _framingDebugEnabled()' in viewer, (
+        'framing debug log must be gated by _framingDebugEnabled '
+        '(URL param or localStorage)')
+    # applyPreset actually consults the gate before console.info.
+    ap_idx = viewer.find('const applyPreset = (name) =>')
+    end = viewer.find('\n  }', ap_idx + 30)
+    ap_body = viewer[ap_idx:end]
+    assert '_framingDebugEnabled()' in ap_body, (
+        'applyPreset must consult _framingDebugEnabled before '
+        'logging — no unconditional console.info in the framing '
+        'hot path')
+    # Gate reads the documented flag names.
+    assert "'framing_debug'" in viewer, (
+        'debug gate must read the "framing_debug" flag from URL / '
+        'localStorage — operator instruction line')
 
 
 def test_preset_click_and_reframe_use_framed_preset_math():

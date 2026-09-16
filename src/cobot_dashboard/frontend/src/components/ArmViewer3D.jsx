@@ -140,6 +140,17 @@ const CAMERA_FOV_DEG = 45
 //   * Camera position = target + preset-direction * dist. Preset
 //     direction is derived from DEFAULT_PRESETS relative to the
 //     legacy target so the visual angle is preserved.
+function _framingDebugEnabled() {
+  if (typeof window === 'undefined') return false
+  try {
+    const q = new URLSearchParams(window.location.search)
+    if (q.get('framing_debug') === '1') return true
+    if (window.localStorage && window.localStorage.getItem(
+      'framing_debug') === '1') return true
+  } catch { /* localStorage may throw in strict privacy modes */ }
+  return false
+}
+
 function _framedPreset(name, bbox, visibleTopFrac) {
   const fov = CAMERA_FOV_DEG * Math.PI / 180
   const clampedFrac = Math.max(0.35, Math.min(1.0, visibleTopFrac))
@@ -1414,7 +1425,7 @@ function StaticZonesToggle({ value, onChange }) {
   )
 }
 
-const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay, noRobot = false, framing }, ref) {
+const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay, noRobot = false, framing, getLiveBbox }, ref) {
   const controlsRef = useRef(null)
   const [flange, setFlange] = useState(null)
   // eslint-disable-next-line no-unused-vars
@@ -1487,12 +1498,33 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
     const c = controlsRef.current
     if (!c) return
     currentPresetRef.current = name
-    // Prefer the real URDF bbox (Program tab), fall back to the
-    // static S10-140 envelope when StandaloneRobot is the mount
-    // (View3D immersive layout).
-    const bbox = armBboxRef.current || ARM_BBOX_APPROX
+    // 2026-09-16 LIVE-BBOX FIX — bbox precedence (best signal first):
+    //   1. getLiveBbox()   — Box3 from setFromObject on the actual
+    //                        robot group at the CURRENT joint pose.
+    //                        View3D immersive layout wires this
+    //                        via StandaloneRobot.jogApi.getBBox().
+    //   2. armBboxRef.current — bbox emitted by URDFArm's onLoaded
+    //                        callback (Program tab, one-shot).
+    //   3. ARM_BBOX_APPROX — static S10-140 envelope. Only if both
+    //                        of the above are absent (mount race
+    //                        before jogApi is ready).
+    // The prior code stopped at (2) which meant View3D never got a
+    // real bbox — it always fell to the static envelope and
+    // overflowed on tall/extended poses.
+    let bbox = ARM_BBOX_APPROX
+    const liveBox3 = (typeof getLiveBbox === 'function') ? getLiveBbox() : null
+    if (liveBox3) {
+      const size = liveBox3.getSize(new THREE.Vector3())
+      const center = liveBox3.getCenter(new THREE.Vector3())
+      const maxDim = Math.max(size.x, size.y, size.z)
+      if (Number.isFinite(maxDim) && maxDim > 0.01) {
+        bbox = { centerY: center.y, maxDim }
+      }
+    } else if (armBboxRef.current) {
+      bbox = armBboxRef.current
+    }
     // Framing target region: caller-supplied visibleTopFrac (in the
-    // range 0.35..1.0) shrinks the effective viewport height the
+    // range 0.30..0.98) shrinks the effective viewport height the
     // bbox is fitted into, so the arm sits above the jog surface.
     // Default 1.0 = legacy full-viewport framing (Program tab).
     const visibleTopFrac = framing?.visibleTopFrac ?? 1.0
@@ -1500,6 +1532,20 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
     c.object.position.set(pos.x, pos.y, pos.z)
     c.target.set(target.x, target.y, target.z)
     c.update()
+    // 2026-09-16 debug flag — set URL query ?framing_debug=1 (or
+    // localStorage 'framing_debug' = '1') to log one line per
+    // reframe with the actual bbox + surface fraction used. Lets
+    // the operator confirm on the real tablet that the LIVE bbox
+    // was used (not the static ARM_BBOX_APPROX).
+    if (_framingDebugEnabled()) {
+      // eslint-disable-next-line no-console
+      console.info('[framing]', {
+        preset: name,
+        source: liveBox3 ? 'live' : (armBboxRef.current ? 'urdf' : 'approx'),
+        maxDim: bbox.maxDim, centerY: bbox.centerY,
+        visibleTopFrac,
+      })
+    }
   }
   useImperativeHandle(ref, () => ({
     setCameraPreset(name) { applyPreset(name) },
@@ -1537,15 +1583,27 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
   // the OrbitControls ref is available (noRobot mode with
   // StandaloneRobot never triggers handleUrdfLoaded, so this is
   // the only initial-frame path in the View3D layout). Also
-  // re-frames when the `framing` prop changes (jog-panel-mode
-  // change from the parent).
+  // re-frames when the `framing` prop OR the `getLiveBbox` prop
+  // changes — the latter becomes non-null once StandaloneRobot's
+  // jogApi lands, which is the point at which we can measure the
+  // ACTUAL current pose bbox instead of the static envelope.
   useEffect(() => {
-    const raf = requestAnimationFrame(() => {
-      if (controlsRef.current) applyPreset(currentPresetRef.current)
+    // Double-RAF so React has committed AND the browser has painted
+    // before we measure — refresh-time hydration + font load can
+    // leave getBoundingClientRect returning stale zero-top values
+    // on the first RAF.
+    let raf2 = null
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        if (controlsRef.current) applyPreset(currentPresetRef.current)
+      })
     })
-    return () => cancelAnimationFrame(raf)
+    return () => {
+      cancelAnimationFrame(raf1)
+      if (raf2) cancelAnimationFrame(raf2)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [framing?.visibleTopFrac])
+  }, [framing?.visibleTopFrac, getLiveBbox])
 
   const currentProgram = useStore((s) => s.currentProgram)
   const gripperCfg     = currentProgram?.config?.gripper || {}
