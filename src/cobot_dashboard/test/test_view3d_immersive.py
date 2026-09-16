@@ -263,8 +263,12 @@ def test_minimized_collapses_to_expand_pill_only():
         src), (
         'MINIMIZED must render ONLY the RealArmMinimizedPill — no '
         'chrome, no jog overlay wrapper')
+    # Allow any inline props between <div and the testid (a ref was
+    # added when framing switched to measured DOM); the load-bearing
+    # invariant is the !isMinimized guard AND the wrapper testid.
     assert re.search(
-        r'\{!isMinimized\s*&&\s*\(\s*\n\s*<div\s*\n\s*data-testid="jog-overlay-wrapper"',
+        r'\{!isMinimized\s*&&\s*\(\s*\n\s*<div\b[\s\S]{0,200}'
+        r'data-testid="jog-overlay-wrapper"',
         src), (
         'the jog overlay wrapper must be guarded by !isMinimized so '
         'a collapse fully clears the panel from the canvas')
@@ -561,49 +565,126 @@ def test_speed_slider_opts_back_in_to_touch_drag():
         "touch-action:none")
 
 
-def test_default_framing_is_persisted_constant_across_viewports():
-    """2026-09-16 default-framing PERSISTENCE — the operator's
-    captured desktop framing (arm bbox ~60 % of viewport, target
-    shifted to render arm in the top region) MUST apply at every
-    viewport (tablet, desktop, PWA). Prior viewport-derived
-    computation `(viewportH - jogBandPx) / viewportH` produced
-    smaller fractions on tablet (~0.45) and pushed the arm lower
-    into the jog band. Persistence = constant DEFAULT_VISIBLE_TOP_FRAC.
+def test_default_framing_measured_from_actual_surface_bounds():
+    """2026-09-16 default-framing MEASURED (supersedes the fixed-
+    constant attempt). Operator field-fail: arm still sat partly
+    under the jog buttons at default framing on the tablet because
+    the fixed 0.60 assumed a desktop-sized jog band. Correct
+    approach: MEASURE the actual rendered jog-surface top edge via
+    getBoundingClientRect at runtime, fit the arm bbox into the
+    region above it with a safety margin. Recompute on load,
+    resize, orientationchange, visibilitychange (PWA), and every
+    jog-panel-mode change.
     """
     src = _read(LAYOUT)
-    m = re.search(
-        r"const\s+DEFAULT_VISIBLE_TOP_FRAC\s*=\s*([0-9.]+)", src)
-    assert m is not None, (
-        'DEFAULT_VISIBLE_TOP_FRAC constant missing from View3DLayout '
-        '— the persistence contract requires a viewport-independent '
-        'framing value')
-    val = float(m.group(1))
-    assert 0.55 <= val <= 0.65, (
-        f'DEFAULT_VISIBLE_TOP_FRAC={val} outside operator envelope '
-        f'[0.55, 0.65] — the captured desktop framing sits ~0.60')
-    # Framing prop must use the constant, not a viewport-derived
-    # value. Any partial revert to `(viewportH - jogBandPx) /
-    # viewportH` trips here.
+    # Constants pinned so a future edit doesn't silently drop the
+    # safety margin or the clamps.
+    assert re.search(r'const\s+FRAMING_MARGIN_PX\s*=\s*\d+', src), (
+        'FRAMING_MARGIN_PX constant missing — the arm bottom must '
+        'have a safety gap above the surface top')
+    assert re.search(r'const\s+FRAMING_MIN_TOP_FRAC\s*=', src), (
+        'FRAMING_MIN_TOP_FRAC clamp missing — extreme aspect '
+        'ratios would collapse framing to zero')
+    assert re.search(r'const\s+FRAMING_MAX_TOP_FRAC\s*=', src), (
+        'FRAMING_MAX_TOP_FRAC clamp missing — full-viewport '
+        'framing needs a tiny gutter so the reach dome does not '
+        'clip against the browser chrome')
+    # The recompute path uses getBoundingClientRect on the panel
+    # ref — this is the load-bearing signal.
+    assert 'getBoundingClientRect' in src, (
+        'framing recompute must call getBoundingClientRect on the '
+        'panel ref — the operator directive is explicit: measure '
+        'the actual rendered surface, do not hardcode a fraction')
+    # Fraction derives from (r.top - MARGIN) / viewportH.
     assert re.search(
-        r"const\s+framing\s*=\s*\{\s*visibleTopFrac:\s*DEFAULT_VISIBLE_TOP_FRAC\s*\}",
+        r'\(r\.top\s*-\s*FRAMING_MARGIN_PX\)\s*/\s*viewportH', src), (
+        'visibleTopFrac must be (panel.top - FRAMING_MARGIN_PX) / '
+        'viewportH — the arm bbox bottom edge lands MARGIN_PX above '
+        'the panel top')
+    # Recompute triggers cover every entry point named in the
+    # operator directive.
+    for trigger in ('ResizeObserver', "'resize'",
+                    "'orientationchange'", "'visibilitychange'"):
+        assert trigger in src, (
+            f'framing recompute must trigger on {trigger} — the '
+            f'operator directive lists load, resize, orientation '
+            f'change, and PWA standalone launch (visibilitychange)')
+    # Panel ref attached to the jog overlay wrapper (measured
+    # element).
+    assert re.search(
+        r'ref=\{panelRef\}\s*\n\s*data-testid="jog-overlay-wrapper"',
         src), (
-        'framing object must use DEFAULT_VISIBLE_TOP_FRAC constant '
-        '(not viewport-derived) so tablet lands on the same framing '
-        'as desktop')
-    # Two-viewport check: the constant is the SAME regardless of
-    # viewport. Pin the absence of window.innerHeight math in the
-    # framing derivation.
-    idx = src.find('const framing')
-    block = src[max(0, idx - 200):idx + 300]
-    assert 'window.innerHeight' not in block, (
-        'framing derivation must NOT read window.innerHeight — the '
-        'persistence directive requires the tablet to land on the '
-        'same value as desktop')
+        'panelRef must attach to jog-overlay-wrapper so its top '
+        'edge drives the measured fraction')
     # ArmViewer3D still receives the framing prop.
     assert re.search(
         r"<ArmViewer3D[^>]*framing=\{framing\}", src, re.DOTALL), (
         'ArmViewer3D must receive the framing prop so applyPreset '
-        'can apply the persistent top-region shift')
+        'can apply the measured top-region shift')
+    # Rejects the retired fixed-0.60 constant so a partial revert
+    # is caught.
+    assert 'DEFAULT_VISIBLE_TOP_FRAC' not in src, (
+        'DEFAULT_VISIBLE_TOP_FRAC retired — the constant approach '
+        'produced the tablet field-fail. Runtime measurement is '
+        'the standing contract now.')
+
+
+def test_framing_computes_arm_bbox_above_surface_at_tablet_and_desktop():
+    """Simulation pin — using the math in ArmViewer3D._framedPreset,
+    verify that at THREE representative viewports (tablet portrait,
+    tablet landscape, desktop) with the panel top measured as the
+    jog band would produce it, the arm's projected bottom edge
+    lands ABOVE the panel top with a safety margin. This locks
+    the operator's requirement 'arm-bbox-above-surface-top' at
+    multiple aspect ratios.
+    """
+    import math
+    # Copy the framing math from ArmViewer3D._framedPreset so the
+    # pin doesn't depend on a JS runtime.
+    FOV_DEG = 45.0
+    MARGIN_PX = 24
+    # S10-140 envelope (ARM_BBOX_APPROX in ArmViewer3D).
+    ARM_MAX_DIM = 1.4
+    ARM_CENTER_Y = 0.7
+    # Jog band renders at 440 px NORMAL (RealArmChrome height —
+    # doctrine pin).
+    JOG_BAND_PX = 440
+
+    def arm_bottom_px_over_surface(viewport_h):
+        # visibleTopFrac derivation, matching the layout's
+        # measured recompute (r.top - MARGIN) / viewport_h.
+        surface_top = viewport_h - JOG_BAND_PX
+        top_frac = (surface_top - MARGIN_PX) / viewport_h
+        top_frac = max(0.30, min(0.98, top_frac))
+        # _framedPreset math:
+        fov = math.radians(FOV_DEG)
+        dist = (ARM_MAX_DIM * 1.15) / (top_frac * 2 * math.tan(fov / 2))
+        jog_frac = 1 - top_frac
+        world_y_offset = jog_frac * dist * math.tan(fov / 2)
+        target_y = ARM_CENTER_Y - world_y_offset
+        # Camera vertical world-per-pixel at target plane:
+        world_h_at_target = 2 * dist * math.tan(fov / 2)
+        px_per_world = viewport_h / world_h_at_target
+        # Arm bbox spans centered on ARM_CENTER_Y with height
+        # ARM_MAX_DIM. Its screen-y range:
+        #   center_screen_y_from_target_pixels = (ARM_CENTER_Y - target_y) * px_per_world
+        # Screen convention: camera looks down -Z at target, world
+        # +Y renders UP on screen. So the arm center projects to
+        # target_y - ARM_CENTER_Y pixels ABOVE viewport center.
+        arm_center_offset_px = (ARM_CENTER_Y - target_y) * px_per_world
+        arm_center_from_top = viewport_h / 2 - arm_center_offset_px
+        arm_half_px = (ARM_MAX_DIM / 2) * px_per_world
+        arm_bottom_from_top = arm_center_from_top + arm_half_px
+        return surface_top - arm_bottom_from_top   # positive = clear gap
+
+    for name, vp_h in (('tablet portrait', 1280),
+                        ('tablet landscape', 800),
+                        ('desktop', 1080)):
+        gap = arm_bottom_px_over_surface(vp_h)
+        assert gap >= 0, (
+            f'{name} (viewport height={vp_h}px): arm bottom is '
+            f'{-gap:.1f}px BELOW jog surface top — measured framing '
+            f'must produce a POSITIVE gap (arm above surface)')
 
 
 def test_preset_click_and_reframe_use_framed_preset_math():
@@ -645,14 +726,14 @@ def test_no_reframe_during_jog_state_updates():
     """
     src = _read(LAYOUT)
     # Locate the reframe effect (comment anchor).
-    idx = src.find('re-apply the CURRENT preset')
+    idx = src.find('reframe whenever visibleTopFrac')
     assert idx != -1, 'reframe useEffect comment anchor missing'
     block = src[idx:idx + 1200]
     m = re.search(r"\}\s*,\s*\[([^\]]*)\]\s*\)\s*", block)
     assert m is not None, 'reframe useEffect deps array not found'
     deps = m.group(1).strip()
-    # Allowed: empty (mount-only, matches the persistence directive)
-    # OR a specific whitelist of layout-only signals.
+    # Allowed: empty (mount-only) OR `visibleTopFrac` (layout signal,
+    # updates on resize / panel change / orientation / visibility).
     ALLOWED = {'', 'visibleTopFrac'}
     assert deps in ALLOWED, (
         f'reframe useEffect deps must be empty (mount-only under the '

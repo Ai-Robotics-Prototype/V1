@@ -35,14 +35,24 @@ import JogReadyBadge from '../components/JogReadyBadge'
 // increments are superseded by hold-to-jog + step-size inching.
 
 const REAL_ARM_RED = '#7F1D1D'
-// 2026-09-16 default-framing persistence — the operator's captured
-// desktop framing (arm bbox fills ~60 % of viewport height, target
-// shifted so arm renders in the clear top region). Applied AT EVERY
-// viewport (tablet, desktop, PWA) so page load / preset re-click /
-// reload all land here. Do NOT tie this to viewport height —
-// per operator directive, framing is the SAME on tablet as desktop
-// even though the tablet's absolute pixels are fewer.
-const DEFAULT_VISIBLE_TOP_FRAC = 0.60
+// 2026-09-16 default-framing (measured, superseding the fixed-0.60
+// attempt). Operator field-fail: arm still sat partly under the
+// jog buttons at default framing on the tablet because the fixed
+// 0.60 assumed a desktop-height jog band. Correct approach: measure
+// the ACTUAL rendered jog-surface top edge via
+// getBoundingClientRect at runtime, fit the arm bbox into the
+// region above it with a safety margin, and recompute on load,
+// resize, orientationchange, visibilitychange (PWA standalone
+// launch differs from the browser tab viewport), and every jog-
+// panel-mode change.
+const FRAMING_MARGIN_PX = 24  // safe air gap between arm bottom
+                              // and surface top so the reach dome
+                              // has breathing room
+const FRAMING_MIN_TOP_FRAC = 0.30  // clamp so extreme aspect
+                                    // ratios don't collapse framing
+const FRAMING_MAX_TOP_FRAC = 0.98  // never fill entire viewport
+                                    // — a tiny bottom gutter helps
+                                    // the reach dome not clip
 
 // 2026-09-08 operator directive: left sidebar (Camera preset tiles
 // + Task readout) RETIRED. The single view-switcher lives in the
@@ -226,33 +236,90 @@ export default function View3DLayout() {
   const isExpanded = jogPanelMode === 'EXPANDED'
   const isMinimized = jogPanelMode === 'MINIMIZED'
 
-  // 2026-09-16 default-framing (persistence directive) — the
-  // operator wants the SAME desktop framing on EVERY viewport,
-  // tablet included. Prior implementation computed
-  // visibleTopFrac from (viewportH - jogBandPx) / viewportH,
-  // which produced a different (smaller) fraction on shorter
-  // tablet viewports and pushed the arm lower in frame. The new
-  // constant matches the ~0.60 desktop framing the operator
-  // captured — arm fills roughly the top 60 % of the canvas at
-  // every viewport size. Collapse Jog Buttons doesn't re-frame
-  // any more (the whole point of the persistence directive) —
-  // the operator sees the same arm size on the pill state as on
-  // the normal band.
-  const framing = { visibleTopFrac: DEFAULT_VISIBLE_TOP_FRAC }
+  // 2026-09-16 default-framing (measured) — visibleTopFrac derived
+  // from the REAL jog-surface bounds at runtime. `panelRef` points
+  // at the jog-floating-panel <div> (or the expand pill when
+  // MINIMIZED); a ResizeObserver + orientationchange +
+  // visibilitychange listener keep the fraction current across
+  // load, resize, tablet rotate, and PWA standalone launch.
+  const panelRef = useRef(null)
+  const [visibleTopFrac, setVisibleTopFrac] = useState(
+    () => FRAMING_MAX_TOP_FRAC)
+  useEffect(() => {
+    // Recompute visibleTopFrac from the panel's top edge minus a
+    // safety margin. When the panel is absent (EXPANDED hides the
+    // viewer entirely, or brief mount race) we fall back to full
+    // viewport so the arm still renders.
+    const recompute = () => {
+      const viewportH = (typeof window !== 'undefined'
+                          && window.innerHeight) || 900
+      let topFrac = FRAMING_MAX_TOP_FRAC
+      const el = panelRef.current
+      if (el) {
+        const r = el.getBoundingClientRect()
+        // `top` is the panel's distance from the viewport top.
+        // Subtract the margin so the arm's projected bottom edge
+        // ends `FRAMING_MARGIN_PX` above the panel top.
+        if (r && Number.isFinite(r.top) && r.top > 0) {
+          topFrac = (r.top - FRAMING_MARGIN_PX) / viewportH
+        }
+      }
+      topFrac = Math.max(FRAMING_MIN_TOP_FRAC,
+                          Math.min(FRAMING_MAX_TOP_FRAC, topFrac))
+      setVisibleTopFrac((prev) =>
+        Math.abs(prev - topFrac) > 0.005 ? topFrac : prev)
+    }
+    // Initial measure — deferred one RAF so React has committed the
+    // layout and the panel has real bounds (mount-race guard).
+    let raf = requestAnimationFrame(recompute)
+    // ResizeObserver on the panel catches: panel-mode change
+    // (NORMAL <-> MINIMIZED <-> EXPANDED), any inner-layout resize.
+    let ro = null
+    if (typeof ResizeObserver !== 'undefined' && panelRef.current) {
+      ro = new ResizeObserver(() => {
+        cancelAnimationFrame(raf)
+        raf = requestAnimationFrame(recompute)
+      })
+      ro.observe(panelRef.current)
+    }
+    // Window resize covers viewport-height changes (tablet rotate,
+    // browser window drag, desktop DPR toggle).
+    const onResize = () => {
+      cancelAnimationFrame(raf)
+      raf = requestAnimationFrame(recompute)
+    }
+    window.addEventListener('resize', onResize)
+    // Orientationchange — some tablets fire this INSTEAD of resize
+    // on rotate; belt-and-braces.
+    window.addEventListener('orientationchange', onResize)
+    // Visibility change — PWA standalone launch fires this when the
+    // app becomes visible; the viewport may differ from the tab
+    // that computed the initial framing.
+    const onVisible = () => {
+      if (!document.hidden) onResize()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      cancelAnimationFrame(raf)
+      if (ro) ro.disconnect()
+      window.removeEventListener('resize', onResize)
+      window.removeEventListener('orientationchange', onResize)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [jogPanelMode])   // panel-mode change swaps panelRef target
+  const framing = { visibleTopFrac }
 
-  // 2026-09-16 default-framing — re-apply the CURRENT preset
-  // ONCE on mount so the initial camera lands on the framed
-  // default (Canvas' one-shot `camera={{ position: ... }}` prop
-  // doesn't honor our framing math). Never fires on joint state
-  // updates — the framing constant is fixed, so live motion
-  // cannot yank the camera. Deps are intentionally empty so
-  // panel-mode toggles don't reframe either (persistence).
+  // 2026-09-16 default-framing — reframe whenever visibleTopFrac
+  // changes (mount, resize, orientationchange, visibilitychange,
+  // jog-panel-mode change all funnel through the state update
+  // above). Deps are ONLY visibleTopFrac (a layout signal), NEVER
+  // joint / robot / task, so live motion never yanks the camera.
   useEffect(() => {
     const raf = requestAnimationFrame(() => {
       armRef.current?.reframe?.()
     })
     return () => cancelAnimationFrame(raf)
-  }, [])
+  }, [visibleTopFrac])
 
   // 2026-09-16 zoom-capture — suppress browser page-zoom on the 3D
   // View screen only. Three input classes leak page-zoom without
@@ -345,6 +412,7 @@ export default function View3DLayout() {
           re-enables pointer events for its own controls. */}
       {!isMinimized && (
         <div
+          ref={panelRef}
           data-testid="jog-overlay-wrapper"
           style={{
             position: 'absolute',
