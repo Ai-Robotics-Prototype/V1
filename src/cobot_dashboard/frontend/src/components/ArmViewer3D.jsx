@@ -1576,6 +1576,17 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
           target={DEFAULT_ORBIT_TARGET}
           minDistance={0.5}
           maxDistance={20}
+          // 2026-09-16 tablet-gesture fix — pin the touch mapping
+          // explicitly so a drei-version bump can't silently regress
+          // to DOLLY_ROTATE (or worse, NONE). ONE finger = rotate,
+          // TWO fingers = pinch-zoom + pan simultaneously (DOLLY_PAN
+          // is the two-finger gesture operators reported broken on
+          // tablet). Desktop mouse behavior is unaffected (mouse
+          // uses mouseButtons config, not touches).
+          touches={{
+            ONE: THREE.TOUCH.ROTATE,
+            TWO: THREE.TOUCH.DOLLY_PAN,
+          }}
         />
         <gridHelper args={[4, 20, '#cccccc', '#e5e5e5']} />
         {!noRobot && (

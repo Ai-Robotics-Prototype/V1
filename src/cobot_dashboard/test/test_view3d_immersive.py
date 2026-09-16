@@ -488,6 +488,60 @@ def test_viewport_meta_preserves_zoom_on_other_pages():
         'at 100 % — accessibility violation for other tabs')
 
 
+def test_orbit_controls_touch_mapping_pinned():
+    """2026-09-16 tablet-gesture fix — OrbitControls must explicitly
+    pin the touch mapping (ONE=ROTATE, TWO=DOLLY_PAN). Prior code
+    relied on drei defaults; a version bump could silently drop
+    two-finger pan (operator reported it broken on tablet). Pinning
+    the mapping in the component prevents that regression.
+    """
+    viewer = _read(os.path.join(
+        HERE, '..', 'frontend', 'src', 'components', 'ArmViewer3D.jsx'))
+    # OrbitControls block must set touches with both handlers.
+    assert re.search(
+        r"touches=\{\{\s*ONE:\s*THREE\.TOUCH\.ROTATE,\s*"
+        r"TWO:\s*THREE\.TOUCH\.DOLLY_PAN",
+        viewer, re.DOTALL), (
+        'OrbitControls must pin touches={{ ONE: THREE.TOUCH.ROTATE, '
+        'TWO: THREE.TOUCH.DOLLY_PAN }} — the two-finger pan/dolly '
+        'gesture depends on TOUCH.DOLLY_PAN being explicitly set '
+        'so a drei version bump cannot regress it')
+
+
+def test_canvas_fill_carries_touch_action_none():
+    """2026-09-16 tablet-gesture fix — the canvas-fill wrapper
+    ALSO carries touchAction:'none' (not just the immersive root),
+    reinforcing that touchmove is delivered to OrbitControls without
+    the browser intercepting for page pan/zoom. Belt-and-braces
+    against browsers where touch-action doesn't cleanly propagate.
+    """
+    src = _read(LAYOUT)
+    idx = src.find('data-testid="view3d-canvas-fill"')
+    assert idx != -1
+    block = src[idx:idx + 800]
+    assert re.search(r"touchAction:\s*'none'", block), (
+        "view3d-canvas-fill must set touchAction:'none' — reinforces "
+        "the root-scoped zoom capture on the canvas layer itself so "
+        "OrbitControls always sees the touch")
+
+
+def test_jog_overlay_wrapper_still_pointer_events_none_for_multi_touch():
+    """2026-09-16 tablet-gesture fix — the jog overlay wrapper MUST
+    remain pointerEvents:'none' so multi-touch gestures starting in
+    the gaps between jog buttons reach the canvas below. A partial
+    revert that sets pointerEvents:'auto' on the wrapper (even
+    briefly) would eat the second finger of a pan gesture.
+    """
+    src = _read(LAYOUT)
+    idx = src.find('data-testid="jog-overlay-wrapper"')
+    assert idx != -1
+    block = src[idx:idx + 1600]
+    assert re.search(r"pointerEvents:\s*'none'", block), (
+        "jog-overlay-wrapper must be pointerEvents:'none' so the "
+        "empty transparent margin doesn't swallow multi-touch bound "
+        "for the canvas below")
+
+
 def test_speed_slider_opts_back_in_to_touch_drag():
     """2026-09-16 zoom-capture — the root's touchAction:none
     propagates to descendants, which can block native
@@ -507,30 +561,49 @@ def test_speed_slider_opts_back_in_to_touch_drag():
         "touch-action:none")
 
 
-def test_default_camera_frames_arm_above_jog_surface():
-    """2026-09-16 default-framing — the immersive View3D layout must
-    pass a `framing` prop with a computed visibleTopFrac to the
-    ArmViewer3D so the arm renders in the clear upper region above
-    the jog panel. The bbox is fitted into visibleTopFrac of viewport
-    height (see _framedPreset math in ArmViewer3D.jsx).
+def test_default_framing_is_persisted_constant_across_viewports():
+    """2026-09-16 default-framing PERSISTENCE — the operator's
+    captured desktop framing (arm bbox ~60 % of viewport, target
+    shifted to render arm in the top region) MUST apply at every
+    viewport (tablet, desktop, PWA). Prior viewport-derived
+    computation `(viewportH - jogBandPx) / viewportH` produced
+    smaller fractions on tablet (~0.45) and pushed the arm lower
+    into the jog band. Persistence = constant DEFAULT_VISIBLE_TOP_FRAC.
     """
     src = _read(LAYOUT)
+    m = re.search(
+        r"const\s+DEFAULT_VISIBLE_TOP_FRAC\s*=\s*([0-9.]+)", src)
+    assert m is not None, (
+        'DEFAULT_VISIBLE_TOP_FRAC constant missing from View3DLayout '
+        '— the persistence contract requires a viewport-independent '
+        'framing value')
+    val = float(m.group(1))
+    assert 0.55 <= val <= 0.65, (
+        f'DEFAULT_VISIBLE_TOP_FRAC={val} outside operator envelope '
+        f'[0.55, 0.65] — the captured desktop framing sits ~0.60')
+    # Framing prop must use the constant, not a viewport-derived
+    # value. Any partial revert to `(viewportH - jogBandPx) /
+    # viewportH` trips here.
     assert re.search(
-        r"const\s+framing\s*=\s*\{\s*visibleTopFrac\s*\}", src), (
-        'View3DLayout must derive a `framing` object with '
-        'visibleTopFrac from viewport dims + jog panel mode')
+        r"const\s+framing\s*=\s*\{\s*visibleTopFrac:\s*DEFAULT_VISIBLE_TOP_FRAC\s*\}",
+        src), (
+        'framing object must use DEFAULT_VISIBLE_TOP_FRAC constant '
+        '(not viewport-derived) so tablet lands on the same framing '
+        'as desktop')
+    # Two-viewport check: the constant is the SAME regardless of
+    # viewport. Pin the absence of window.innerHeight math in the
+    # framing derivation.
+    idx = src.find('const framing')
+    block = src[max(0, idx - 200):idx + 300]
+    assert 'window.innerHeight' not in block, (
+        'framing derivation must NOT read window.innerHeight — the '
+        'persistence directive requires the tablet to land on the '
+        'same value as desktop')
+    # ArmViewer3D still receives the framing prop.
     assert re.search(
         r"<ArmViewer3D[^>]*framing=\{framing\}", src, re.DOTALL), (
-        'ArmViewer3D must receive the framing prop so its applyPreset '
-        'can shift the target for the top-region fit')
-    # visibleTopFrac must reflect the jog panel mode — NORMAL band
-    # ~440 px, MINIMIZED ~60 px, EXPANDED 0 (hidden). If a future
-    # edit hardcodes a single value the "arm above surface" contract
-    # regresses on Collapse / resize.
-    assert 'isMinimized ? 60' in src, (
-        'MINIMIZED jogBandPx must be ~60 (only the pill visible)')
-    assert '\n                  : 440' in src or '440' in src, (
-        'NORMAL jogBandPx must be 440 (matches RealArmChrome height)')
+        'ArmViewer3D must receive the framing prop so applyPreset '
+        'can apply the persistent top-region shift')
 
 
 def test_preset_click_and_reframe_use_framed_preset_math():
@@ -563,23 +636,34 @@ def test_preset_click_and_reframe_use_framed_preset_math():
 
 def test_no_reframe_during_jog_state_updates():
     """2026-09-16 default-framing — the reframe useEffect in
-    View3DLayout MUST depend ONLY on visibleTopFrac (viewport dims
-    + jog panel mode). It MUST NOT depend on joint states or any
-    robot-pose store slice, so live motion never yanks the camera.
+    View3DLayout MUST NOT depend on any store slice that changes
+    during jog / joint updates. Under the persistence directive
+    the framing is a constant, so the effect deps should be empty
+    (fires once on mount to seed the camera) OR only depend on
+    static layout signals. It MUST NEVER include joints / robot /
+    jog_active / task — any of those would auto-recenter mid-motion.
     """
     src = _read(LAYOUT)
     # Locate the reframe effect (comment anchor).
-    idx = src.find('re-apply the last preset (via')
+    idx = src.find('re-apply the CURRENT preset')
     assert idx != -1, 'reframe useEffect comment anchor missing'
-    # Grab the block through the useEffect deps array.
     block = src[idx:idx + 1200]
     m = re.search(r"\}\s*,\s*\[([^\]]*)\]\s*\)\s*", block)
     assert m is not None, 'reframe useEffect deps array not found'
     deps = m.group(1).strip()
-    assert deps == 'visibleTopFrac', (
-        f'reframe useEffect deps must be exactly [visibleTopFrac]; '
-        f'got [{deps}]. Any additional dep that changes on jog / '
-        f'joint updates would auto-recenter the camera mid-motion.')
+    # Allowed: empty (mount-only, matches the persistence directive)
+    # OR a specific whitelist of layout-only signals.
+    ALLOWED = {'', 'visibleTopFrac'}
+    assert deps in ALLOWED, (
+        f'reframe useEffect deps must be empty (mount-only under the '
+        f'persistence directive) or [visibleTopFrac] at most; got '
+        f'[{deps}]. Any store slice that changes on jog / joint '
+        f'updates would auto-recenter the camera mid-motion.')
+    # Belt-and-braces: reject specific store hooks by name.
+    for banned in ('joints', 'robot?.jog_active', 'task', 'positions'):
+        assert banned not in deps, (
+            f'reframe useEffect deps include `{banned}` which changes '
+            f'during motion — camera would auto-recenter mid-jog')
 
 
 def test_framed_preset_math_shifts_target_and_pulls_camera_back():

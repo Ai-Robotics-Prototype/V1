@@ -35,6 +35,14 @@ import JogReadyBadge from '../components/JogReadyBadge'
 // increments are superseded by hold-to-jog + step-size inching.
 
 const REAL_ARM_RED = '#7F1D1D'
+// 2026-09-16 default-framing persistence — the operator's captured
+// desktop framing (arm bbox fills ~60 % of viewport height, target
+// shifted so arm renders in the clear top region). Applied AT EVERY
+// viewport (tablet, desktop, PWA) so page load / preset re-click /
+// reload all land here. Do NOT tie this to viewport height —
+// per operator directive, framing is the SAME on tablet as desktop
+// even though the tablet's absolute pixels are fewer.
+const DEFAULT_VISIBLE_TOP_FRAC = 0.60
 
 // 2026-09-08 operator directive: left sidebar (Camera preset tiles
 // + Task readout) RETIRED. The single view-switcher lives in the
@@ -218,44 +226,33 @@ export default function View3DLayout() {
   const isExpanded = jogPanelMode === 'EXPANDED'
   const isMinimized = jogPanelMode === 'MINIMIZED'
 
-  // 2026-09-16 default-framing — compute the fraction of the
-  // viewport height that stays visible ABOVE the jog panel. The
-  // arm renders inside this top slice so it's not overlapped by
-  // the button clusters. Recomputes on every render (cheap) and
-  // via the resize effect below when window.innerHeight changes.
-  // Values match the immersive layout's bands:
-  //   MINIMIZED  — pill only, ~60 px, ~0.94 visible
-  //   NORMAL     — 440 px jog band at bottom
-  //   EXPANDED   — viewer hidden, framing is moot; pick 1.0 so
-  //                the value stays sensible if the mode toggles.
-  const [viewportH, setViewportH] = useState(
-    () => (typeof window !== 'undefined' ? window.innerHeight : 900))
-  useEffect(() => {
-    const onResize = () => setViewportH(window.innerHeight || 900)
-    window.addEventListener('resize', onResize)
-    onResize()
-    return () => window.removeEventListener('resize', onResize)
-  }, [])
-  const jogBandPx = isExpanded ? 0
-                  : isMinimized ? 60
-                  : 440
-  const visibleTopFrac = Math.max(
-    0.35, Math.min(1.0, (viewportH - jogBandPx) / viewportH))
-  const framing = { visibleTopFrac }
+  // 2026-09-16 default-framing (persistence directive) — the
+  // operator wants the SAME desktop framing on EVERY viewport,
+  // tablet included. Prior implementation computed
+  // visibleTopFrac from (viewportH - jogBandPx) / viewportH,
+  // which produced a different (smaller) fraction on shorter
+  // tablet viewports and pushed the arm lower in frame. The new
+  // constant matches the ~0.60 desktop framing the operator
+  // captured — arm fills roughly the top 60 % of the canvas at
+  // every viewport size. Collapse Jog Buttons doesn't re-frame
+  // any more (the whole point of the persistence directive) —
+  // the operator sees the same arm size on the pill state as on
+  // the normal band.
+  const framing = { visibleTopFrac: DEFAULT_VISIBLE_TOP_FRAC }
 
-  // 2026-09-16 default-framing — re-apply the last preset (via
-  // armRef.reframe()) whenever the visibleTopFrac changes: window
-  // resize AND Collapse/Expand Jog Buttons transitions. Does NOT
-  // fire on joint state updates (framing prop only depends on
-  // viewport dims + panel mode, never robot pose), so live motion
-  // never yanks the camera. Prop-change reframe is also handled
-  // inside ArmViewer3D as belt-and-braces.
+  // 2026-09-16 default-framing — re-apply the CURRENT preset
+  // ONCE on mount so the initial camera lands on the framed
+  // default (Canvas' one-shot `camera={{ position: ... }}` prop
+  // doesn't honor our framing math). Never fires on joint state
+  // updates — the framing constant is fixed, so live motion
+  // cannot yank the camera. Deps are intentionally empty so
+  // panel-mode toggles don't reframe either (persistence).
   useEffect(() => {
     const raf = requestAnimationFrame(() => {
       armRef.current?.reframe?.()
     })
     return () => cancelAnimationFrame(raf)
-  }, [visibleTopFrac])
+  }, [])
 
   // 2026-09-16 zoom-capture — suppress browser page-zoom on the 3D
   // View screen only. Three input classes leak page-zoom without
@@ -312,11 +309,15 @@ export default function View3DLayout() {
       }}>
       {/* Full-bleed 3D canvas — lowest layer. Absolute-positioned so
           the robot viewer fills the entire content region under the
-          top nav, edge to edge. */}
+          top nav, edge to edge. touch-action:none reinforces the
+          root-scoped zoom capture on the canvas layer itself so
+          OrbitControls receives touchmove without the browser
+          intercepting for page pan/zoom (tablet gesture fix). */}
       <div
         data-testid="view3d-canvas-fill"
         style={{
           position: 'absolute', inset: 0, zIndex: 0, minWidth: 0,
+          touchAction: 'none',
         }}>
         <ArmViewer3D ref={armRef} noRobot framing={framing}>
           <StandaloneRobot onRobotReady={setJogApi} />
