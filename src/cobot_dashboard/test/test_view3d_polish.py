@@ -65,17 +65,28 @@ def test_expand_jog_button_is_green_and_relabeled():
 
 
 def test_collapse_jog_button_is_coherent_pair():
-    """Chrome header's minimize control (formerly '−' glyph) reads
-    "Collapse Jog Buttons" — coherent pair with the expand pill.
-    The full-width expand/restore ⛶/✕ glyph stays; that's a
-    layout modifier, not the jog-visibility toggle."""
+    """The Collapse control reads "Collapse Jog Buttons" — coherent
+    pair with the "Expand Jog Buttons" pill.
+
+    2026-09-16 side-column directive relocated the button from the
+    RealArmChrome header into JogControls.collapseSlot (bottom of
+    the RIGHT column, adjacent to Orient Flange Down). It's now
+    composed inline in View3DLayout with the setView3dJogPanel
+    callback the layout already owns, so the setter identifier
+    changed from setMode to setView3dJogPanel.
+    """
     src = _read(LAYOUT)
     assert 'data-testid="collapse-jog-buttons"' in src
     idx = src.find('data-testid="collapse-jog-buttons"')
     slice_ = src[max(0, idx - 200):idx + 400]
     assert 'Collapse Jog Buttons' in slice_
-    assert "setMode('MINIMIZED')" in slice_, \
-        'collapse button must set MINIMIZED, mirroring the expand pill'
+    # Post-relocation the callback name is setView3dJogPanel; the
+    # previous setMode alias was scoped to the retired header
+    # branch of RealArmChrome.
+    assert "setView3dJogPanel('MINIMIZED')" in slice_, (
+        'collapse button must set view3dJogPanel to MINIMIZED, '
+        'mirroring the expand pill (relocated 2026-09-16 from the '
+        'chrome header to JogControls.collapseSlot)')
 
 
 def test_debug_strip_removed_from_arm_viewer():

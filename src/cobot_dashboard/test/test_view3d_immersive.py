@@ -906,6 +906,134 @@ def test_collision_banner_pill_absent_from_3d_view():
         'of the collision store slice on the 3D View')
 
 
+def test_side_column_layout_spread_and_collapse_relocation():
+    """2026-09-16 side-column directive — the operator wants the
+    LEFT stack (DISABLE/READY + Jog + mode toggles + step + speed)
+    spread up the LEFT edge, and the RIGHT column (Orient +
+    Collapse + Fullscreen) spread up the RIGHT edge. Pins here:
+      (a) RealArmChrome accepts a panelHeight prop and applies it
+          with a 440 floor (viewport-aware height).
+      (b) JogControls LEFT column uses justifyContent:'space-around'
+          (spread), not flex-start.
+      (c) JogControls accepts a collapseSlot prop that renders in
+          the RIGHT column area at the bottom.
+      (d) View3DLayout passes the collapseSlot with the Collapse
+          Jog Buttons + fullscreen icon (moved out of the chrome
+          header).
+      (e) The chrome header no longer contains the Collapse or
+          fullscreen buttons.
+    """
+    layout = _read(LAYOUT)
+    jog    = _read(JOG)
+
+    # (a) RealArmChrome viewport-aware height + floor.
+    assert re.search(
+        r"function RealArmChrome\(\{\s*mode,\s*setMode,\s*children,\s*panelHeight\s*\}\)",
+        layout), (
+        'RealArmChrome must accept a panelHeight prop for the '
+        'viewport-aware NORMAL height (side-column spread needs '
+        'room)')
+    assert re.search(
+        r"height:\s*isExpanded\s*\?\s*'100%'\s*:\s*\(panelHeight\s*\|\|\s*440\)",
+        layout), (
+        'RealArmChrome height must be isExpanded ? "100%" : '
+        '(panelHeight || 440) — viewport-aware NORMAL with the '
+        '440 doctrine floor')
+    # (a) View3DLayout computes panelHeight from window.innerHeight.
+    assert re.search(
+        r"setPanelHeight\s*\(\s*Math\.min\(780,\s*Math\.max\(440",
+        layout), (
+        'View3DLayout must compute panelHeight = min(780, max(440, '
+        '~70% of window.innerHeight)) so tablet + desktop both get '
+        'room to spread while keeping the doctrine 440 floor')
+    # Resize + orientation change re-compute panelHeight.
+    assert re.search(
+        r"recomputePanelH", layout), (
+        'panelHeight must recompute on window resize + orientation '
+        'change — side-column spread must track viewport dims')
+
+    # (b) LEFT column spread (space-around or space-between).
+    left_idx = jog.find('LEFT — mode, step, speed')
+    assert left_idx != -1
+    style_open  = jog.rfind('style={{', 0, left_idx + 200)
+    # Nothing — the marker is a comment; find the style AFTER it.
+    style_open = jog.find('style={{', left_idx)
+    style_close = jog.find('}}', style_open)
+    left_style = jog[style_open:style_close]
+    assert re.search(
+        r"justifyContent:\s*'space-around'", left_style), (
+        "LEFT column must use justifyContent:'space-around' for "
+        'vertical spread up the left edge (was flex-start)')
+
+    # (c) JogControls accepts collapseSlot.
+    assert 'collapseSlot = null' in jog, (
+        'JogControls signature must accept a collapseSlot prop for '
+        'the Collapse + fullscreen buttons moved out of the chrome '
+        'header')
+    # (c) collapse slot renders at bottom of right column with a
+    # marginTop:auto pin.
+    assert 'data-testid="jog-collapse-slot"' in jog, (
+        'JogControls must render the collapseSlot inside a testid-'
+        'anchored div so future pins can find it')
+    assert re.search(
+        r"marginTop:\s*'auto'", jog), (
+        'collapse slot must use marginTop:auto so Collapse pins to '
+        'the bottom of the RIGHT column (adjacent to Orient)')
+
+    # (d) View3DLayout passes collapseSlot with the two buttons.
+    assert re.search(
+        r"collapseSlot=\{", layout), (
+        'View3DLayout must pass a collapseSlot to JogControls '
+        '(containing Collapse + fullscreen buttons)')
+    # The Collapse button testid is still present (relocation, not
+    # deletion) so downstream pins on the testid keep working.
+    assert 'data-testid="collapse-jog-buttons"' in layout, (
+        'collapse-jog-buttons testid must survive the header→'
+        'collapseSlot relocation')
+
+    # (e) Header no longer contains Collapse or the fullscreen icon.
+    header_start = layout.find("padding: '5px 8px'")
+    header_end = layout.find('</div>', header_start)
+    header_block = layout[header_start:header_end + 100]
+    # The two retired buttons: assert their inline JSX is gone from
+    # the header block.
+    assert "'Collapse Jog Buttons'" not in header_block, (
+        'Collapse Jog Buttons button retired from the header — '
+        'moved to JogControls.collapseSlot')
+    assert "isExpanded ? '✕' : '⛶'" not in header_block, (
+        'Fullscreen ⛶/✕ button retired from the header — moved '
+        'to JogControls.collapseSlot alongside Collapse')
+
+
+def test_framing_measures_center_pads_not_full_surface():
+    """2026-09-16 side-column directive — with the LEFT/RIGHT
+    columns spreading up the edges, the framing must NOT measure
+    the whole panel wrapper (that would shrink the arm region as
+    the side columns get taller). Instead measure the CENTER pad
+    container by its testid, so the arm bottom only needs to
+    clear the pads, not the tall side columns.
+    """
+    jog = _read(JOG)
+    layout = _read(LAYOUT)
+    # JogControls tags the center-pads div with the testid.
+    assert 'data-testid="jog-center-pads"' in jog, (
+        'CENTER pad container must carry data-testid="jog-center-pads" '
+        'so View3DLayout can measure it directly for framing')
+    # View3DLayout looks up the pads via document.querySelector on the
+    # testid and falls back to panelRef if not present.
+    assert re.search(
+        r"document\.querySelector\('\[data-testid=\"jog-center-pads\"\]'\)",
+        layout), (
+        'View3DLayout framing must query the jog-center-pads element '
+        'directly and use its top edge for the visibleTopFrac '
+        'derivation')
+    # The fallback pattern (padsEl || panelRef.current) must remain
+    # so MINIMIZED / mount race still resolve to a valid element.
+    assert 'padsEl || panelRef.current' in layout, (
+        'framing must fall back to panelRef.current when the pads '
+        'are not in the DOM (MINIMIZED / mount race)')
+
+
 def test_no_new_handler_or_gate_added_in_layout():
     """The immersive refactor touches CSS + testid attributes only.
     No new fetch / onClick / gate predicate should appear in the

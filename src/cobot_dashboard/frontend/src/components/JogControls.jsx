@@ -508,7 +508,17 @@ function PadCenter({ label, width = 80, height = 80, labelSize = 12 }) {
 // JogControls — the pendant. Prop `maximized` picks the size tier;
 // callers wrap it in whatever chrome / minimize toggle they need.
 // -----------------------------------------------------------------------------
-export default function JogControls({ maximized = false, rightSlot = null }) {
+export default function JogControls({
+  maximized = false,
+  rightSlot = null,
+  // 2026-09-16 side-column directive: Collapse Jog Buttons (+
+  // fullscreen icon) move DOWN from the RealArmChrome header to
+  // sit adjacent to Orient Flange Down at the bottom of the RIGHT
+  // column. Prop is opaque JSX so JogControls doesn't have to know
+  // about panel-mode state — View3DLayout composes the buttons
+  // with the setView3dJogPanel callback it already owns.
+  collapseSlot = null,
+}) {
   const winW = (typeof window !== 'undefined') ? window.innerWidth : 1280
   const isTabletW = winW <= 1280
   const isNarrowW = winW <= 1500
@@ -1007,22 +1017,21 @@ export default function JogControls({ maximized = false, rightSlot = null }) {
         gap: rowGap,
         boxSizing: 'border-box',
       }}>
-      {/* LEFT — mode, step, speed */}
+      {/* LEFT — mode, step, speed. 2026-09-16 immersive side-column
+          directive: distribute the stack vertically along the left
+          edge instead of packing at the top. justifyContent:
+          space-around gives even gaps between groups; the taller
+          RealArmChrome (viewport-aware) provides the room to
+          spread. flex-start is retired — it was the 2026-09-09
+          fix for the tablet-XYZ-clip bug at 440-height, but the
+          spread layout + taller chrome eliminates that clip class
+          because the LEFT column now owns the full panel height
+          and never overflows past its own top edge. */}
       <div style={{
         display: 'flex', flexDirection: 'column', gap: 10,
         width: leftColW, flexShrink: 0,
         alignSelf: 'stretch',
-        // justifyContent:flex-start (not center) so the XYZ button
-        // sits directly under the surface's DISABLE/READY header band
-        // at every viewport width. With justifyContent:center, any
-        // time the column's stacked controls exceeded the available
-        // height (short landscape tablet ~440-header-banners), the
-        // centering pushed the top of the stack above the row's
-        // scrollable top edge — the XYZ button then rendered partly
-        // under the header banner. Anchor to the top instead so
-        // overflow spills at the bottom where the row's overflow-y:auto
-        // can scroll to reach it.
-        justifyContent: 'flex-start',
+        justifyContent: 'space-around',
       }}>
         <div style={{ fontSize: maximized ? 16 : 14, fontWeight: 700, color: '#111', textShadow: LABEL_TEXT_SHADOW }}>Jog</div>
 
@@ -1119,8 +1128,16 @@ export default function JogControls({ maximized = false, rightSlot = null }) {
         <div style={{ flex: 1 }} />
       </div>
 
-      {/* CENTER — jog arrow pads */}
-      <div style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', minWidth: 0, alignSelf: 'stretch' }}>
+      {/* CENTER — jog arrow pads. 2026-09-16 testid added so
+          View3DLayout's framing measurement targets THIS element
+          (not the whole surface wrapper). The LEFT/RIGHT side
+          columns spread up the edges under the new immersive
+          side-column layout; measuring the wrapper would shrink
+          the arm region unnecessarily. The center-pads box tells
+          the framing exactly where the arm bottom must clear to. */}
+      <div
+        data-testid="jog-center-pads"
+        style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', minWidth: 0, alignSelf: 'stretch' }}>
         {jogMode === 'cartesian' ? (
           <div style={{ display: 'flex', gap: padGroup, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'center' }}>
             <div>
@@ -1247,19 +1264,34 @@ export default function JogControls({ maximized = false, rightSlot = null }) {
           on the Program tab (where JogControls is also mounted).
           padGroup gap keeps it visually separated from the
           Rotation cluster. */}
-      {rightSlot && (
+      {(rightSlot || collapseSlot) && (
         <div
           data-testid="jog-right-slot"
           style={{
             display: 'flex', flexDirection: 'column',
             alignSelf: 'stretch',
-            justifyContent: 'flex-start',
+            // 2026-09-16 side-column: Orient Flange Down + Collapse
+            // spread vertically along the right edge. space-between
+            // pushes Orient to the top and Collapse to the bottom so
+            // both are easy to reach without hunting.
+            justifyContent: 'space-between',
             alignItems: 'flex-start',
             flexShrink: 0,
             paddingLeft: 4,
             minHeight: 0,
           }}>
-          {rightSlot}
+          <div style={{ flexShrink: 0 }}>{rightSlot}</div>
+          {collapseSlot && (
+            <div
+              data-testid="jog-collapse-slot"
+              style={{
+                flexShrink: 0,
+                display: 'flex', gap: 6,
+                marginTop: 'auto',   // belt-and-braces: pins to bottom
+              }}>
+              {collapseSlot}
+            </div>
+          )}
         </div>
       )}
     </div>

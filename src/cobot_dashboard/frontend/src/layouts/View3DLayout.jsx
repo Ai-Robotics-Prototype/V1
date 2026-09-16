@@ -72,31 +72,26 @@ const FRAMING_MAX_TOP_FRAC = 0.98  // never fill entire viewport
 // the ONE canonical arm-enable surface, rendered here AND on the
 // Monitor page so toggling in either reflects live in the other via
 // the shared useStore state.
-function RealArmChrome({ mode, setMode, children }) {
+function RealArmChrome({ mode, setMode, children, panelHeight }) {
   const isExpanded = mode === 'EXPANDED'
   return (
     <div
       data-testid="jog-floating-panel"
       style={{
-        // 2026-09-16 immersive correction — the previous 0.92-alpha
-        // white card was wrong. Container is now fully TRANSPARENT
-        // (no bg, no border, no blur, no shadow, no radius): the 3D
-        // scene shows THROUGH the whole surface and only the
-        // buttons/controls themselves carry chip backgrounds.
+        // 2026-09-16 immersive: transparent container, 3D scene
+        // shows through. Only buttons/controls carry chip backgrounds.
         background: 'transparent',
         display: 'flex', flexDirection: 'column',
-        // Content that would have scrolled inside a bounded panel
-        // now lays out at its natural height over the canvas — no
-        // internal scrollbar.
         overflow: 'visible',
-        // 440 px NORMAL preserves the Program tab's JOG_MIN_HEIGHT
-        // (360) budget after the compact chip header. Doctrine pin
-        // D_view3d_jog_flow_layout::flow(a) locks this contract.
-        height: isExpanded ? '100%' : 440,
+        // 2026-09-16 side-column directive: NORMAL height is now
+        // viewport-aware (View3DLayout computes it from
+        // window.innerHeight) so the LEFT/RIGHT columns have room
+        // to spread vertically along the edges. Floor stays at 440
+        // (doctrine flow(a) contract) so short tablet aspects still
+        // don't clip the CENTER pads. Legacy Program-tab consumer
+        // passes no panelHeight and lands on 440.
+        height: isExpanded ? '100%' : (panelHeight || 440),
         width: '100%',
-        // Panel owns its own pointer events; the surrounding wrapper
-        // is pointerEvents:'none' so orbit works BETWEEN controls,
-        // in every gap where the 3D scene shows through.
         pointerEvents: 'auto',
         flexShrink: 0,
       }}>
@@ -111,43 +106,20 @@ function RealArmChrome({ mode, setMode, children }) {
         // narrow tablet width — the DISABLE/READY row is the anchor
         // controls below flow from.
         minHeight: 44,
-        // Transparent header — DISABLE/READY badge + Collapse button
-        // carry their own chip backgrounds; no rail behind them.
         background: 'transparent',
       }}>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           <ArmEnableControl />
-          {/* 2026-09-04 operator directive: compact READY / NOT-READY
-              badge replaces the full-width green banner inside
-              JogControls. Placed directly next to the enable button
-              so the operator's pre-jog cue stays visible at a glance
-              without eating banner-height. */}
+          {/* Compact READY / NOT-READY badge next to the enable
+              button — pre-jog cue at a glance. */}
           <JogReadyBadge />
-          {/* 2026-09-08 operator directive: <ModeControl /> retired. */}
         </div>
-        <div style={{ display: 'flex', gap: 6 }}>
-          {/* 2026-09-08 operator directive: coherent pair with the
-              "Expand Jog Buttons" pill — this button reads
-              "Collapse Jog Buttons" when collapsing back to the
-              minimized pill state. Full-width toggle between
-              NORMAL and EXPANDED still uses the ⛶ / ✕ glyph
-              since it's a layout modifier, not the jog-visibility
-              toggle. */}
-          <button
-            data-testid="collapse-jog-buttons"
-            onClick={() => setMode('MINIMIZED')}
-            title="Collapse Jog Buttons"
-            style={{
-              ...chromeBtn,
-              width: 'auto', padding: '0 12px',
-              fontSize: 11, fontWeight: 600,
-              letterSpacing: '0.02em',
-            }}>Collapse Jog Buttons</button>
-          <button
-            onClick={() => setMode(isExpanded ? 'NORMAL' : 'EXPANDED')}
-            title={isExpanded ? 'Restore split layout' : 'Expand panel'}
-            style={chromeBtn}>{isExpanded ? '✕' : '⛶'}</button>
-        </div>
+        {/* 2026-09-16 side-column directive: Collapse Jog Buttons +
+            fullscreen icon MOVED OUT of this header. They now sit at
+            the bottom of the RIGHT column inside JogControls, adjacent
+            to Orient Flange Down (see JogControls.collapseSlot). The
+            header keeps its 44 px minHeight so DISABLE/READY have
+            room; the right slot of the header stays empty. */}
       </div>
       {/* 2026-09-16 correction: no internal scrollbar. Children lay
           out at their natural size over the canvas — the 3D scene
@@ -236,6 +208,30 @@ export default function View3DLayout() {
   const isExpanded = jogPanelMode === 'EXPANDED'
   const isMinimized = jogPanelMode === 'MINIMIZED'
 
+  // 2026-09-16 side-column directive — RealArmChrome height is now
+  // viewport-aware so the LEFT/RIGHT columns have room to spread
+  // along the edges. Value = 70 % of window height, floored at the
+  // 440 doctrine minimum (flow(a) guarantees the CENTER pads
+  // never clip on short tablet viewports) and ceilinged at 780 px
+  // (keeps a comfortable top gutter for the view-preset pills +
+  // MinClearanceReadout). Recomputes on window resize +
+  // orientation change so tablet rotate lands cleanly.
+  const [panelHeight, setPanelHeight] = useState(
+    () => Math.min(780, Math.max(440,
+      Math.round(((typeof window !== 'undefined'
+                    && window.innerHeight) || 900) * 0.70))))
+  useEffect(() => {
+    const recomputePanelH = () => setPanelHeight(
+      Math.min(780, Math.max(440,
+        Math.round((window.innerHeight || 900) * 0.70))))
+    window.addEventListener('resize', recomputePanelH)
+    window.addEventListener('orientationchange', recomputePanelH)
+    return () => {
+      window.removeEventListener('resize', recomputePanelH)
+      window.removeEventListener('orientationchange', recomputePanelH)
+    }
+  }, [])
+
   // 2026-09-16 default-framing (measured) — visibleTopFrac derived
   // from the REAL jog-surface bounds at runtime. `panelRef` points
   // at the jog-floating-panel <div> (or the expand pill when
@@ -254,12 +250,22 @@ export default function View3DLayout() {
       const viewportH = (typeof window !== 'undefined'
                           && window.innerHeight) || 900
       let topFrac = FRAMING_MAX_TOP_FRAC
-      const el = panelRef.current
+      // 2026-09-16 side-column directive: the LEFT/RIGHT columns
+      // now spread up the edges taller than the CENTER pads. If we
+      // measured the whole panel (which extends to the tall column
+      // tops), the arm region would shrink unnecessarily. Instead
+      // measure the CENTER pads specifically (via the
+      // jog-center-pads testid on the pad container inside
+      // JogControls) — the arm bottom only needs to clear the
+      // pads, not the side columns. Falls back to the panel
+      // wrapper if the pads aren't in the DOM yet (mount race /
+      // MINIMIZED).
+      const padsEl = (typeof document !== 'undefined')
+        ? document.querySelector('[data-testid="jog-center-pads"]')
+        : null
+      const el = padsEl || panelRef.current
       if (el) {
         const r = el.getBoundingClientRect()
-        // `top` is the panel's distance from the viewport top.
-        // Subtract the margin so the arm's projected bottom edge
-        // ends `FRAMING_MARGIN_PX` above the panel top.
         if (r && Number.isFinite(r.top) && r.top > 0) {
           topFrac = (r.top - FRAMING_MARGIN_PX) / viewportH
         }
@@ -441,7 +447,8 @@ export default function View3DLayout() {
             // re-enable pointer events on their own controls only.
             pointerEvents: 'none',
           }}>
-          <RealArmChrome mode={jogPanelMode} setMode={setView3dJogPanel}>
+          <RealArmChrome mode={jogPanelMode} setMode={setView3dJogPanel}
+                          panelHeight={panelHeight}>
             {/* 2026-09-14: rightSlot for the modal-gated Orient Flange
                 Down control (moved out of the twin-viewer overlay per
                 screenshot review). */}
@@ -450,6 +457,27 @@ export default function View3DLayout() {
               rightSlot={jogApi
                 ? <OrientFlangeDownControl jogApi={jogApi} />
                 : null}
+              collapseSlot={
+                <>
+                  <button
+                    data-testid="collapse-jog-buttons"
+                    onClick={() => setView3dJogPanel('MINIMIZED')}
+                    title="Collapse Jog Buttons"
+                    style={{
+                      ...chromeBtn,
+                      width: 'auto', padding: '0 12px',
+                      fontSize: 11, fontWeight: 600,
+                      letterSpacing: '0.02em',
+                    }}>Collapse Jog Buttons</button>
+                  <button
+                    onClick={() => setView3dJogPanel(
+                      isExpanded ? 'NORMAL' : 'EXPANDED')}
+                    title={isExpanded ? 'Restore split layout' : 'Expand panel'}
+                    style={chromeBtn}>
+                    {isExpanded ? '✕' : '⛶'}
+                  </button>
+                </>
+              }
             />
           </RealArmChrome>
         </div>

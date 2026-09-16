@@ -37,11 +37,15 @@ const readSrc = (rel) => readFileSync(join(FRONT_ROOT, 'src', rel), 'utf8')
 function v(msg) { return `DOCTRINE VIEW3D_JOG_FLOW VIOLATED: ${msg}` }
 
 
-test('flow(a): RealArmChrome outer never shrinks below its 440 budget', () => {
+test('flow(a): RealArmChrome outer honors a viewport-aware height with a 440 floor', () => {
   const src = readSrc('layouts/View3DLayout.jsx')
 
   // Locate the RealArmChrome function body — its outer div is the first
-  // returned element and carries `height: isExpanded ? '100%' : 440`.
+  // returned element. 2026-09-16 side-column directive: NORMAL height is
+  // now viewport-aware (`panelHeight || 440`) so the LEFT/RIGHT columns
+  // can spread up the edges; the 440 floor stays for short-tablet
+  // safety (tablet-XYZ-clip class), served by the fallback and the
+  // Program-tab consumer that passes no panelHeight.
   const chromeStart = src.indexOf('function RealArmChrome(')
   assert.notEqual(chromeStart, -1,
     v('RealArmChrome no longer defined in View3DLayout — this pin is stale'))
@@ -50,11 +54,17 @@ test('flow(a): RealArmChrome outer never shrinks below its 440 budget', () => {
   const headerStart = src.indexOf('padding: \'5px 8px\'', returnStart)
   const outerBlock  = src.slice(returnStart, headerStart)
 
-  assert.match(outerBlock, /height:\s*isExpanded\s*\?\s*'100%'\s*:\s*440/,
-    v('RealArmChrome outer height budget changed — was 440 NORMAL / 100% EXPANDED'))
+  // NORMAL: either panelHeight (viewport-aware) with a 440 fallback,
+  // or the legacy plain 440 for consumers that don't pass panelHeight.
+  assert.match(outerBlock,
+    /height:\s*isExpanded\s*\?\s*'100%'\s*:\s*\(panelHeight\s*\|\|\s*440\)/,
+    v('RealArmChrome outer height must be `isExpanded ? "100%" '
+      + ': (panelHeight || 440)` — the viewport-aware NORMAL '
+      + 'height + 440 floor let the side-column layout spread '
+      + 'while keeping short-tablet safety.'))
   assert.match(outerBlock, /flexShrink:\s*0/,
     v('RealArmChrome outer MUST set flexShrink:0 so a short flex parent '
-      + 'cannot squeeze the surface below 440px (the twin viewer must '
+      + 'cannot squeeze the surface below its budget (the twin viewer must '
       + 'shrink first).'))
 })
 
@@ -83,7 +93,7 @@ test('flow(b): jog surface header reserves an explicit minimum height', () => {
 })
 
 
-test('flow(c): JogControls LEFT column anchors to the top (not center)', () => {
+test('flow(c): JogControls LEFT column spreads vertically (not center, not top-packed)', () => {
   const src = readSrc('components/JogControls.jsx')
 
   // Locate the LEFT column marker comment then read its style object.
@@ -97,11 +107,16 @@ test('flow(c): JogControls LEFT column anchors to the top (not center)', () => {
 
   assert.match(leftStyle, /alignSelf:\s*'stretch'/,
     v('LEFT column must alignSelf:stretch to inherit the row height'))
-  assert.match(leftStyle, /justifyContent:\s*'flex-start'/,
-    v('LEFT column MUST use justifyContent:flex-start. justifyContent:center '
-      + 'caused the XYZ button top to spill above the row\'s overflow:auto '
-      + 'top edge on tablet heights where content > column height — the '
-      + 'XYZ button then rendered partly under the DISABLE/READY header band.'))
+  // 2026-09-16 side-column directive: distribute the stack vertically
+  // (space-around) instead of packing at the top. The tablet-XYZ-clip
+  // safety of the previous flex-start fix is replaced by the
+  // viewport-aware panel height (flow(a)) which gives the column
+  // enough room to spread without spilling past its top.
+  assert.match(leftStyle, /justifyContent:\s*'space-(around|between)'/,
+    v('LEFT column MUST use justifyContent:space-around (or '
+      + 'space-between) so groups spread up the edge. flex-start '
+      + 'packs them at the top which contradicts the side-column '
+      + 'directive.'))
   assert.doesNotMatch(leftStyle, /justifyContent:\s*'center'/,
     v('LEFT column regressed to justifyContent:center — see fix note'))
 })
