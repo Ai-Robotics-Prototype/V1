@@ -409,6 +409,104 @@ def test_disabled_state_still_dimmed_via_hold_button():
 # 6. Zero behavior diff — layout only
 # ─────────────────────────────────────────────────────────────────
 
+def test_view3d_root_scopes_touch_action_none():
+    """2026-09-16 zoom-capture — the 3D View root MUST set
+    touchAction:'none' so browser pinch-zoom / double-tap-zoom
+    is suppressed on THIS page only. Element-scoped, so Monitor /
+    Program / I/O pages keep default browser zoom.
+    """
+    src = _read(LAYOUT)
+    idx = src.find('data-testid="view3d-immersive-root"')
+    assert idx != -1
+    block = src[idx:idx + 1200]
+    assert re.search(r"touchAction:\s*'none'", block), (
+        "view3d-immersive-root MUST set touchAction:'none' to block "
+        "browser page-zoom on this screen without touching the "
+        "viewport meta (which would leak to every other tab)")
+
+
+def test_view3d_root_attaches_non_passive_wheel_and_gesture_handlers():
+    """2026-09-16 zoom-capture — a useEffect on the 3D View root
+    MUST attach non-passive wheel + Safari gesture* listeners that
+    preventDefault, so ctrl+wheel (desktop / trackpad pinch) and
+    iOS Safari pinch don't page-zoom over button gaps above the
+    canvas. Listeners live on the ELEMENT (not window / document)
+    so other tabs are unaffected.
+    """
+    src = _read(LAYOUT)
+    # Non-passive wheel listener on the root ref.
+    assert re.search(
+        r"el\.addEventListener\('wheel',\s*onWheel,\s*\{\s*passive:\s*false\s*\}\)",
+        src), (
+        'root must attach a non-passive wheel listener so '
+        'preventDefault (needed to block ctrl+wheel page zoom) '
+        'is honored')
+    # Wheel handler must preventDefault on ctrlKey (browser zoom
+    # trigger — also fires for trackpad pinch on macOS / Windows).
+    assert re.search(
+        r"if\s*\(\s*e\.ctrlKey\s*\)\s*e\.preventDefault\(\)",
+        src), (
+        'wheel handler must preventDefault when e.ctrlKey — that is '
+        'the desktop trackpad-pinch / ctrl+wheel signature')
+    # Safari gesture* listeners.
+    for evt in ('gesturestart', 'gesturechange', 'gestureend'):
+        assert re.search(
+            r"el\.addEventListener\('" + evt + r"',\s*onGesture",
+            src), (
+            f'root must attach {evt} listener for iOS Safari pinch — '
+            f'touch-action:none does not cover Safari gesture* events')
+    # Global-scope leak check: handlers must be on the root element,
+    # never on window / document (that would kill zoom on other tabs).
+    assert not re.search(r"window\.addEventListener\('wheel'", src), (
+        'wheel handler must NOT attach to window — that would '
+        'suppress zoom on Monitor / Program / I/O too')
+    assert not re.search(r"document\.addEventListener\('wheel'", src), (
+        'wheel handler must NOT attach to document — that would '
+        'suppress zoom on Monitor / Program / I/O too')
+
+
+def test_viewport_meta_preserves_zoom_on_other_pages():
+    """2026-09-16 zoom-capture — the page-level viewport meta MUST
+    NOT set user-scalable=no or maximum-scale, since that would
+    globally kill browser zoom on Monitor / Program / I/O too. The
+    3D View zoom suppression is element-scoped, not viewport-wide.
+    """
+    idx_path = os.path.abspath(os.path.join(
+        HERE, '..', 'frontend', 'index.html'))
+    with open(idx_path) as fh:
+        idx_html = fh.read()
+    m = re.search(r'<meta name="viewport"\s+content="([^"]+)"', idx_html)
+    assert m is not None, 'viewport meta tag missing from index.html'
+    content = m.group(1)
+    assert 'user-scalable=no' not in content, (
+        'viewport meta user-scalable=no would globally disable browser '
+        'zoom — other tabs (Monitor / Program / I/O) require default '
+        'browser accessibility zoom. The 3D View zoom suppression is '
+        'element-scoped, not viewport-wide.')
+    assert 'maximum-scale=1' not in content, (
+        'viewport meta maximum-scale=1 would globally cap browser zoom '
+        'at 100 % — accessibility violation for other tabs')
+
+
+def test_speed_slider_opts_back_in_to_touch_drag():
+    """2026-09-16 zoom-capture — the root's touchAction:none
+    propagates to descendants, which can block native
+    <input type=range> touch drag on the tablet. The speed slider
+    explicitly opts back in with touchAction:'pan-x' so the thumb
+    stays draggable.
+    """
+    src = _read(JOG)
+    slider_idx = src.find('data-testid="jog-speed-slider"')
+    assert slider_idx != -1
+    # The style is applied on the same <input> element; look up
+    # a small window in either direction.
+    block = src[max(0, slider_idx - 400):slider_idx + 600]
+    assert re.search(r"touchAction:\s*'pan-x'", block), (
+        "jog-speed-slider must set touchAction:'pan-x' so the native "
+        "range-input thumb is still draggable under the root's "
+        "touch-action:none")
+
+
 def test_no_new_handler_or_gate_added_in_layout():
     """The immersive refactor touches CSS + testid attributes only.
     No new fetch / onClick / gate predicate should appear in the

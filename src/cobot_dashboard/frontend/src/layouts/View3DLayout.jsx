@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store/useStore'
 import ArmViewer3D from '../components/ArmViewer3D'
 import StandaloneRobot from '../components/StandaloneRobot'
@@ -205,6 +205,11 @@ function RealArmMinimizedPill({ setMode }) {
 export default function View3DLayout() {
   const armRef = useRef(null)
   const [jogApi, setJogApi] = useState(null)
+  // 2026-09-16 zoom-capture — root element ref for non-passive wheel
+  // and Safari gesture listeners. Handlers attach only to THIS root,
+  // never to window/document, so Monitor / Program / I/O keep their
+  // native browser zoom behavior on the same session.
+  const rootRef = useRef(null)
 
   const view3dJogPanel   = useStore((s) => s.view3dJogPanel)
   const setView3dJogPanel = useStore((s) => s.setView3dJogPanel)
@@ -213,14 +218,59 @@ export default function View3DLayout() {
   const isExpanded = jogPanelMode === 'EXPANDED'
   const isMinimized = jogPanelMode === 'MINIMIZED'
 
+  // 2026-09-16 zoom-capture — suppress browser page-zoom on the 3D
+  // View screen only. Three input classes leak page-zoom without
+  // this: (a) touch pinch on the tablet (browsers escalate to page-
+  // zoom when no touch-action opt-out is set); (b) ctrl+wheel or
+  // trackpad pinch on desktop (fires wheel with ctrlKey=true, which
+  // browsers translate to zoom unless preventDefault'd); (c) Safari
+  // pinch (gesture* events, iOS/iPadOS specific). Element-scoped:
+  // handlers live on THIS root element, so Monitor / Program / I/O
+  // pages keep their default browser zoom.
+  useEffect(() => {
+    const el = rootRef.current
+    if (!el) return undefined
+    // Ctrl+wheel = browser zoom trigger on desktop (and trackpad
+    // pinch). OrbitControls captures wheel over the canvas and
+    // preventDefaults there; here we cover the overlay / button
+    // regions above the canvas so ctrl+wheel over them doesn't
+    // page-zoom. Non-passive so preventDefault is honored.
+    const onWheel = (e) => {
+      if (e.ctrlKey) e.preventDefault()
+    }
+    // Safari-specific pinch API. touch-action:none covers most
+    // browsers, but iOS Safari still fires gesture* — preventDefault
+    // is the only way to block page-zoom in that engine.
+    const onGesture = (e) => e.preventDefault()
+    el.addEventListener('wheel',        onWheel,   { passive: false })
+    el.addEventListener('gesturestart', onGesture, { passive: false })
+    el.addEventListener('gesturechange', onGesture, { passive: false })
+    el.addEventListener('gestureend',   onGesture, { passive: false })
+    return () => {
+      el.removeEventListener('wheel',        onWheel)
+      el.removeEventListener('gesturestart', onGesture)
+      el.removeEventListener('gesturechange', onGesture)
+      el.removeEventListener('gestureend',   onGesture)
+    }
+  }, [])
+
   return (
     // 2026-09-16 IMMERSIVE LAYOUT — the 3D canvas is the full-page
     // background. All controls float over it as overlay panels. Left
     // sidebar retired 2026-09-08; view-switcher lives inside the
     // ArmViewer3D top-left overlay (L1632).
     <div
+      ref={rootRef}
       data-testid="view3d-immersive-root"
-      style={{ position: 'relative', height: '100%', overflow: 'hidden' }}>
+      style={{
+        position: 'relative', height: '100%', overflow: 'hidden',
+        // 2026-09-16 zoom-capture — root-scoped touch-action:none
+        // blocks browser pinch-zoom and double-tap-zoom on THIS
+        // page only. Buttons still receive pointer events (this
+        // only suppresses default BROWSER gestures). Other pages
+        // don't share this root, so their zoom stays default.
+        touchAction: 'none',
+      }}>
       {/* Full-bleed 3D canvas — lowest layer. Absolute-positioned so
           the robot viewer fills the entire content region under the
           top nav, edge to edge. */}

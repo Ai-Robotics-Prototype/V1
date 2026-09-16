@@ -1096,7 +1096,14 @@ export default function JogControls({ maximized = false, rightSlot = null }) {
           <input type="range" min={1} max={JOG_SLIDER_MAX_PCT} value={Math.min(speed, JOG_SLIDER_MAX_PCT)}
             onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
             data-testid="jog-speed-slider"
-            style={{ width: '100%', height: maximized ? 10 : 6 }} />
+            style={{
+              width: '100%', height: maximized ? 10 : 6,
+              // 2026-09-16 zoom-capture — parent immersive root sets
+              // touch-action:none to block browser pinch/double-tap-
+              // zoom. Native range inputs need pan-x to keep touch-
+              // drag on the thumb, so opt back in for THIS element.
+              touchAction: 'pan-x',
+            }} />
           <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 2 }}
                data-testid="jog-speed-wire-hint">
             {(() => {
