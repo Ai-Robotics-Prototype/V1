@@ -125,12 +125,73 @@ def test_overlay_panel_container_is_transparent():
         'scene shows through between controls — no white card')
     # Reject the retired card treatments explicitly so a partial
     # revert stands out.
-    for banned in ('backdropFilter', 'borderRadius', 'boxShadow',
-                   'rgba(255, 255, 255,'):
+    for banned in ('borderRadius', 'boxShadow', 'rgba(255, 255, 255,'):
         assert banned not in block, (
             f'jog-floating-panel container must not carry `{banned}` — '
             f'the transparent-surface directive forbids the "floating '
             f'card" treatment')
+
+
+def test_jog_surface_row_uses_translucent_gray_tint():
+    """2026-09-16 tint correction: the jog surface ROW (the div that
+    holds LEFT/CENTER/RIGHT control columns inside JogControls)
+    MUST use a translucent gray tint — solid #fff was hiding the 3D
+    scene behind every gap between controls. Value envelope per
+    operator directive: rgba(0..255, 0..255, 0..255, alpha) with
+    alpha in [0.10, 0.30] — light enough that the robot / grid /
+    reach dome is clearly visible through it. Backdrop-filter blur
+    is nice-to-have.
+    """
+    src = _read(JOG)
+    idx = src.find('data-testid="jog-surface-row"')
+    assert idx != -1, (
+        'jog-surface-row testid missing — the tint pin needs this '
+        'anchor to inspect the correct div')
+    block = src[idx:idx + 1500]
+    m = re.search(
+        r"background:\s*'rgba\(\s*(\d+),\s*(\d+),\s*(\d+),\s*([0-9.]+)\s*\)'",
+        block)
+    assert m is not None, (
+        'jog-surface-row background MUST be an rgba() value — solid '
+        '#fff was the mistake that hid the 3D scene')
+    r, g, b, alpha = int(m.group(1)), int(m.group(2)), int(m.group(3)), float(m.group(4))
+    assert 0.10 <= alpha <= 0.30, (
+        f'jog-surface-row background alpha {alpha} outside translucent '
+        f'window [0.10, 0.30]. Too high (>=0.30) hides the scene; too '
+        f'low (<0.10) leaves labels unreadable on bright floors')
+    # The tint MUST NOT be pure white. Reject any (255,255,255,α)
+    # value regardless of alpha — the operator wants a slightly gray
+    # scrim, not a bleached-out card.
+    assert not (r == 255 and g == 255 and b == 255), (
+        f'jog-surface-row tint is white ({r},{g},{b}) — operator '
+        f'directive says translucent GRAY (gray-shaded scrim)')
+    # Backdrop-filter is nice-to-have, but pin the intent so a future
+    # edit that drops it surfaces here.
+    assert 'backdropFilter' in block, (
+        'jog-surface-row should apply backdropFilter (blur) for polish '
+        'when the browser supports it')
+
+
+def test_jog_surface_row_has_no_internal_overflow_scroll():
+    """The row wrapper's prior overflowY:'auto' was the source of
+    the operator-reported scrollbar on the immersive surface. Pin
+    that overflowY is visible (or hidden) — never auto/scroll.
+    """
+    src = _read(JOG)
+    idx = src.find('data-testid="jog-surface-row"')
+    block = src[idx:idx + 1500]
+    # Skip block comments so the retirement note ("previous
+    # overflowY:'auto' was the source of…") doesn't false-match. The
+    # style declaration lives outside the comment on its own line.
+    block_no_comments = re.sub(r'//[^\n]*', '', block)
+    m = re.search(
+        r"overflowY:\s*'([a-zA-Z]+)'", block_no_comments)
+    assert m is not None, 'jog-surface-row missing overflowY declaration'
+    val = m.group(1)
+    assert val in ('visible', 'hidden'), (
+        f"jog-surface-row overflowY='{val}' — must be 'visible' or "
+        f"'hidden'. 'auto' / 'scroll' would reintroduce the internal "
+        f"scrollbar the operator called out")
 
 
 def test_overlay_panel_has_no_internal_scroll():

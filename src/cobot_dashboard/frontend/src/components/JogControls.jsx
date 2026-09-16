@@ -968,19 +968,31 @@ export default function JogControls({ maximized = false, rightSlot = null }) {
         </div>
       )}
 
-    <div style={{
-      padding: containerPad, background: '#fff',
-      width: '100%', flex: 1, minHeight: 0,
-      overflowX: 'hidden', overflowY: 'auto',
-      display: 'flex', flexDirection: 'row',
-      // flex-start (not center) so any vertical overflow scrolls from
-      // the top. With alignItems:center overflow clips symmetrically,
-      // hiding the "Jog" title and top of the action column under the
-      // panel band — that was the reported clipping.
-      alignItems: 'flex-start', justifyContent: 'space-evenly',
-      gap: rowGap,
-      boxSizing: 'border-box',
-    }}>
+    <div
+      data-testid="jog-surface-row"
+      style={{
+        padding: containerPad,
+        // 2026-09-16 immersive tint correction — the row background
+        // was solid #fff, which hid the 3D scene behind every gap
+        // between controls. Switch to a translucent gray so the
+        // canvas (robot / grid / reach dome) is clearly visible
+        // through the surface while buttons/labels stay readable.
+        // Backdrop-blur is cheap on modern browsers; browsers that
+        // skip it still get a lightly-tinted scrim.
+        background: 'rgba(107, 114, 128, 0.18)',
+        backdropFilter: 'blur(3px)',
+        WebkitBackdropFilter: 'blur(3px)',
+        width: '100%', flex: 1, minHeight: 0,
+        // 2026-09-16 tint correction — no internal scrollbar on the
+        // translucent surface. Content lays out at its natural size
+        // over the canvas (previous overflowY:'auto' was the source
+        // of the operator-reported scrollbar).
+        overflowX: 'hidden', overflowY: 'visible',
+        display: 'flex', flexDirection: 'row',
+        alignItems: 'flex-start', justifyContent: 'space-evenly',
+        gap: rowGap,
+        boxSizing: 'border-box',
+      }}>
       {/* LEFT — mode, step, speed */}
       <div style={{
         display: 'flex', flexDirection: 'column', gap: 10,
