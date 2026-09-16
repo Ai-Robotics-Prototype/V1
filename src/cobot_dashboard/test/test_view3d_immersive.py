@@ -1057,3 +1057,213 @@ def test_no_new_handler_or_gate_added_in_layout():
     assert 'fetch(' not in src, (
         'View3DLayout must not introduce a fetch — behavior stays in '
         'components / store, layout is presentation only')
+
+
+def test_side_columns_portal_out_to_page_level():
+    """2026-09-16 SIDE-COLUMN OWNERSHIP directive — the operator
+    requires that the LEFT column (mode/step/speed stack) and the
+    RIGHT column (Orient + Collapse + Fullscreen) render as PAGE-
+    LEVEL overlays of the 3D View, NOT as descendants of the jog
+    window/surface container.
+
+    Implementation contract pinned:
+      (a) JogControls imports React.createPortal and accepts an
+          `immersive` prop.
+      (b) JogControls calls createPortal to relocate the LEFT +
+          RIGHT column subtrees when `immersive` is true.
+      (c) JogControls resolves the target slots by DOM id
+          (`jog-left-column-slot` + `jog-right-column-slot`) inside
+          a useEffect — the direct DOM ids are the stable API.
+      (d) View3DLayout renders the two slot divs as direct children
+          of the 3D View root (view3d-immersive-root), NOT nested
+          inside the jog-overlay-wrapper / jog-floating-panel.
+      (e) View3DLayout passes `immersive` to JogControls.
+    """
+    jog    = _read(JOG)
+    layout = _read(LAYOUT)
+
+    # (a) createPortal import + immersive prop wiring.
+    assert re.search(
+        r"import\s*\{\s*createPortal\s*\}\s*from\s*'react-dom'", jog), (
+        'JogControls must import { createPortal } from react-dom '
+        'for the LEFT/RIGHT page-level portal (2026-09-16 '
+        'SIDE-COLUMN OWNERSHIP directive)')
+    assert 'immersive = false' in jog, (
+        'JogControls signature must declare `immersive = false` so '
+        'the Program-tab consumer (no prop) keeps the in-row layout')
+
+    # (b) createPortal is INVOKED — the portal isn't just imported.
+    assert jog.count('createPortal(') >= 2, (
+        'createPortal must be called at least twice — one call for '
+        'the LEFT column, one for the RIGHT column')
+
+    # (c) Slot resolution keys off the two documented DOM ids.
+    assert "document.getElementById('jog-left-column-slot')" in jog, (
+        'LEFT column portal target must be resolved via '
+        "document.getElementById('jog-left-column-slot')")
+    assert "document.getElementById('jog-right-column-slot')" in jog, (
+        'RIGHT column portal target must be resolved via '
+        "document.getElementById('jog-right-column-slot')")
+
+    # (d) View3DLayout renders the slot divs at page level (direct
+    # child of the 3D View root, NOT nested inside the jog surface).
+    # Locate each slot's id attribute; assert it appears BEFORE the
+    # jog-overlay-wrapper block in source order (siblings of the
+    # panel, not descendants).
+    left_slot_idx  = layout.find('id="jog-left-column-slot"')
+    right_slot_idx = layout.find('id="jog-right-column-slot"')
+    wrapper_idx    = layout.find('data-testid="jog-overlay-wrapper"')
+    assert left_slot_idx != -1, (
+        'View3DLayout must render an id="jog-left-column-slot" div '
+        'as a page-level portal target for the LEFT column')
+    assert right_slot_idx != -1, (
+        'View3DLayout must render an id="jog-right-column-slot" div '
+        'as a page-level portal target for the RIGHT column')
+    assert wrapper_idx != -1
+    assert left_slot_idx  < wrapper_idx, (
+        'jog-left-column-slot must be rendered BEFORE the '
+        'jog-overlay-wrapper (i.e., as a sibling under the 3D View '
+        'root, not nested inside the panel container)')
+    assert right_slot_idx < wrapper_idx, (
+        'jog-right-column-slot must be rendered BEFORE the '
+        'jog-overlay-wrapper (page-level sibling, not descendant)')
+
+    # (e) View3DLayout passes immersive to JogControls. Grab a
+    # window around the <JogControls open tag and assert.
+    jc_idx = layout.find('<JogControls')
+    assert jc_idx != -1
+    jc_block = layout[jc_idx:jc_idx + 800]
+    assert re.search(r'\bimmersive\b', jc_block), (
+        'View3DLayout must pass the `immersive` prop to <JogControls> '
+        'to activate the page-level portal (default false = inline '
+        'legacy layout for the Program tab consumer)')
+
+
+def test_expand_scales_only_center_cluster():
+    """2026-09-16 EXPAND MODE — the operator directive is that the
+    center pad clusters keep EXACTLY the same arrangement, they
+    just render LARGER (1.4-1.8×). Not a re-layout.
+
+    Implementation:
+      * JogControls accepts an `expanded` prop.
+      * A wrapper INSIDE the CENTER container (jog-center-pads)
+        applies a CSS transform:scale(1.6) when expanded — no
+        rearrangement of pads, no change to LEFT/RIGHT sizing.
+      * The scaler wrapper carries testid jog-center-cluster-scaler
+        so future pins can target the exact node.
+      * View3DLayout passes `expanded={isExpanded}` to JogControls.
+    """
+    jog    = _read(JOG)
+    layout = _read(LAYOUT)
+
+    # `expanded` prop present.
+    assert 'expanded = false' in jog, (
+        'JogControls must declare an `expanded = false` prop for '
+        'the EXPAND MODE center-scaler (default false = normal size)')
+
+    # Scaler wrapper testid present + scale transform gated on prop.
+    assert 'data-testid="jog-center-cluster-scaler"' in jog, (
+        'CENTER pad cluster must wrap in a testid-anchored div '
+        '(jog-center-cluster-scaler) so pins can pin the scaler')
+
+    # Scale value gated on the `expanded` prop. Accept 1.4-1.8× per
+    # operator range.
+    scaler_idx = jog.find('data-testid="jog-center-cluster-scaler"')
+    scaler_block = jog[scaler_idx:scaler_idx + 400]
+    assert re.search(
+        r"transform:\s*expanded\s*\?\s*'scale\(1\.[4-8]\)'\s*:\s*'none'",
+        scaler_block), (
+        'scaler transform must be `expanded ? scale(1.4-1.8) : none` '
+        '— arrangement preserved, exit restores exactly')
+    assert re.search(
+        r"transformOrigin:\s*'center", scaler_block), (
+        "scaler transformOrigin must anchor at 'center' so pads "
+        'grow symmetrically inside the CENTER container')
+
+    # View3DLayout wires the prop from its isExpanded state.
+    jc_idx = layout.find('<JogControls')
+    jc_block = layout[jc_idx:jc_idx + 800]
+    assert re.search(r'expanded=\{isExpanded\}', jc_block), (
+        'View3DLayout must pass expanded={isExpanded} so the CENTER '
+        'scaler tracks the panel mode toggle')
+
+
+def test_expand_dims_canvas_and_exit_restores():
+    """2026-09-16 EXPAND MODE canvas dim — the operator allows the
+    3D canvas to be hidden/dimmed in expand mode. The wash sits
+    ABOVE the canvas but BELOW the jog panel + side-column slots,
+    with pointerEvents:none so it doesn't intercept clicks. It
+    UNMOUNTS when isExpanded is false so exiting restores the
+    canvas exactly (no lingering state).
+    """
+    layout = _read(LAYOUT)
+    # The dim overlay must be conditional on isExpanded (so exit
+    # restores exactly by unmounting).
+    dim_idx = layout.find('data-testid="view3d-expand-canvas-dim"')
+    assert dim_idx != -1, (
+        'View3DLayout must render a testid-tagged dim overlay '
+        'when isExpanded (view3d-expand-canvas-dim)')
+    # Gate: the JSX block surrounding this testid must be inside a
+    # `{isExpanded && ...}` conditional. Search backward for the
+    # gate token.
+    prefix = layout[max(0, dim_idx - 400):dim_idx]
+    assert re.search(r'\{isExpanded\s*&&', prefix), (
+        'dim overlay MUST be gated on isExpanded so it unmounts on '
+        'exit — the canvas restores exactly by mounting/unmounting, '
+        'not by opacity toggle (avoids the framing recompute race)')
+
+    # Overlay style contract: absolute inset:0, zIndex between the
+    # canvas (0) and the jog panel (10) / slots (12), and
+    # pointerEvents:none so orbit is unaffected on any edges the
+    # panel doesn't cover.
+    dim_block = layout[dim_idx:dim_idx + 500]
+    assert re.search(r"position:\s*'absolute'", dim_block)
+    assert re.search(r"inset:\s*0", dim_block)
+    # zIndex must be > 0 (canvas) and < 10 (jog panel).
+    z = re.search(r"zIndex:\s*(\d+)", dim_block)
+    assert z is not None, 'dim overlay must declare an explicit zIndex'
+    assert 0 < int(z.group(1)) < 10, (
+        f'dim overlay zIndex must sit between the canvas (0) and '
+        f'the jog panel (10) — got {z.group(1)}')
+    assert re.search(r"pointerEvents:\s*'none'", dim_block), (
+        'dim overlay pointerEvents must be none so orbit control '
+        'still receives peripheral drag events on any uncovered edge')
+
+
+def test_page_level_slot_dims_track_panel_height():
+    """2026-09-16 slot geometry — the LEFT + RIGHT slot divs sit
+    at the bottom edge with height = panelHeight in NORMAL and
+    calc(100% - 16px) in EXPANDED so they cover the full vertical
+    span the operator can reach. Both slots have pointerEvents:
+    auto (their contents must be interactive) and stay mounted
+    whenever the jog panel is open — i.e., NOT under MINIMIZED
+    (JogControls tree not rendered → nothing to portal into).
+    """
+    layout = _read(LAYOUT)
+    for side in ('left', 'right'):
+        slot_id = f'id="jog-{side}-column-slot"'
+        idx = layout.find(slot_id)
+        assert idx != -1, f'slot {slot_id} must be present'
+        block = layout[idx:idx + 700]
+        assert re.search(r"position:\s*'absolute'", block), (
+            f'{side} slot must be absolute-positioned')
+        assert re.search(r"pointerEvents:\s*'auto'", block), (
+            f'{side} slot must have pointerEvents:auto so its '
+            f'contents receive clicks')
+        # Height tracks panelHeight (with the 424 default fallback +
+        # calc for expanded).
+        assert 'panelHeight' in block, (
+            f'{side} slot height must key off panelHeight so it '
+            f'tracks the viewport-aware NORMAL height')
+        assert 'isExpanded' in block, (
+            f'{side} slot must switch height on isExpanded (full '
+            f'span in EXPANDED, panelHeight in NORMAL)')
+
+    # Slots gated on !isMinimized (nothing to portal into when the
+    # panel is collapsed).
+    left_idx = layout.find('id="jog-left-column-slot"')
+    prefix = layout[max(0, left_idx - 400):left_idx]
+    assert re.search(r'\{!isMinimized\s*&&', prefix), (
+        'slot divs MUST be gated on !isMinimized so they only exist '
+        'while the JogControls tree is mounted (otherwise the '
+        'portal targets are unreachable and React logs warnings)')

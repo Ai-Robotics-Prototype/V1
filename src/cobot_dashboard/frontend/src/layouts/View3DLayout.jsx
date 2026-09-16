@@ -421,6 +421,80 @@ export default function View3DLayout() {
           canvas fully unobstructed. */}
       {isMinimized && <RealArmMinimizedPill setMode={setView3dJogPanel} />}
 
+      {/* 2026-09-16 EXPAND MODE canvas dim — optional per operator
+          directive: "In expand mode the 3D canvas may be hidden/
+          dimmed." A translucent slate wash sits ABOVE the canvas
+          (zIndex 5) and BELOW the jog panel + side-column slots
+          (zIndex 10+12), softening the twin so the pad cluster reads
+          as the focus without unmounting the canvas (unmounting
+          would drop the URDF pose + framing state on toggle). Exit
+          expand → the wash unmounts and the canvas restores exactly.
+          pointerEvents:none so orbit is unaffected on the peripheral
+          edges the panel doesn't cover. */}
+      {isExpanded && !isMinimized && (
+        <div
+          data-testid="view3d-expand-canvas-dim"
+          style={{
+            position: 'absolute', inset: 0, zIndex: 5,
+            background: 'rgba(15, 23, 42, 0.75)',
+            pointerEvents: 'none',
+          }}
+        />
+      )}
+
+      {/* 2026-09-16 SIDE-COLUMN OWNERSHIP — page-level slot divs the
+          LEFT + RIGHT columns of JogControls portal into. They are
+          NOT children of the jog window/surface container; they are
+          direct children of the 3D View root. Positioned as absolute
+          overlays anchored to the bottom edge, sized to the panel
+          height so their contents (mode/step/speed on the left,
+          Orient + Collapse on the right) stack naturally along the
+          full edge. Both slots stay mounted whenever the jog panel
+          is open (NORMAL or EXPANDED) so JogControls can resolve
+          them via document.getElementById on mount. Under
+          MINIMIZED the JogControls tree isn't rendered, so the
+          slots don't need to exist either. zIndex above the panel
+          wrapper so the columns render on top of any residual
+          center-panel background. pointerEvents:auto so their
+          buttons are clickable. */}
+      {!isMinimized && (
+        <>
+          <div
+            id="jog-left-column-slot"
+            data-testid="jog-left-column-slot"
+            style={{
+              position: 'absolute',
+              left: 8, bottom: 8,
+              width: 220,
+              height: isExpanded
+                ? 'calc(100% - 16px)'
+                : (panelHeight ? panelHeight - 16 : 424),
+              zIndex: 12,
+              pointerEvents: 'auto',
+              display: 'flex',
+              boxSizing: 'border-box',
+            }}
+          />
+          <div
+            id="jog-right-column-slot"
+            data-testid="jog-right-column-slot"
+            style={{
+              position: 'absolute',
+              right: 8, bottom: 8,
+              width: 220,
+              height: isExpanded
+                ? 'calc(100% - 16px)'
+                : (panelHeight ? panelHeight - 16 : 424),
+              zIndex: 12,
+              pointerEvents: 'auto',
+              display: 'flex',
+              justifyContent: 'flex-end',
+              boxSizing: 'border-box',
+            }}
+          />
+        </>
+      )}
+
       {/* NORMAL / EXPANDED — floating jog-panel overlay pinned to
           bottom-center. Wrapper is pointerEvents:none so the empty
           margin around the panel passes clicks through to the 3D
@@ -454,6 +528,16 @@ export default function View3DLayout() {
                 screenshot review). */}
             <JogControls
               maximized={isExpanded}
+              // 2026-09-16 SIDE-COLUMN OWNERSHIP + EXPAND MODE:
+              //   * `immersive` portals the LEFT + RIGHT columns
+              //     into the page-level slot divs above; the
+              //     surface container hosts only the CENTER pads.
+              //   * `expanded` scales the CENTER pad cluster up
+              //     1.6× via CSS transform (arrangement unchanged,
+              //     just bigger). Exiting restores exactly because
+              //     the transform is inert when `expanded=false`.
+              immersive
+              expanded={isExpanded}
               rightSlot={jogApi
                 ? <OrientFlangeDownControl jogApi={jogApi} />
                 : null}

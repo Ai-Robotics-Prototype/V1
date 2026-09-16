@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
+import { createPortal } from 'react-dom'
 import { useStore } from '../store/useStore'
 import { createHoldTicker } from '../lib/holdTicker'
 import { pushJogEvent, pushJogInterval, pushJogStop,
@@ -518,6 +519,21 @@ export default function JogControls({
   // about panel-mode state — View3DLayout composes the buttons
   // with the setView3dJogPanel callback it already owns.
   collapseSlot = null,
+  // 2026-09-16 EXPAND-mode + SIDE-COLUMN OWNERSHIP directive:
+  //   * `immersive=true` — portal the LEFT column (mode/step/speed
+  //     stack) AND the RIGHT column (Orient + Collapse) OUT of the
+  //     jog surface container into page-level slots identified by
+  //     `#jog-left-column-slot` + `#jog-right-column-slot`. State
+  //     stays owned by JogControls (React tree unchanged) but the
+  //     DOM hierarchy has the side columns as page-level overlays
+  //     — no longer descendants of the jog window/surface.
+  //   * `expanded=true` — scale ONLY the CENTER pad container up
+  //     via CSS transform. Side columns stay at their portaled
+  //     positions and normal size (still usable while expanded).
+  //     Program tab consumer passes neither prop → row layout is
+  //     unchanged.
+  immersive = false,
+  expanded = false,
 }) {
   const winW = (typeof window !== 'undefined') ? window.innerWidth : 1280
   const isTabletW = winW <= 1280
@@ -910,6 +926,30 @@ export default function JogControls({
         body: 'Alarms will be dismissed on the controller. Enable is offered next if the alarm state clears.',
         cta: 'Clear', cta_bg: '#B91C1C', cta_color: '#fff' }
     : null
+  // 2026-09-16 side-column ownership — resolve the page-level portal
+  // targets when immersive mode is on. Slots are absolute-positioned
+  // <div>s owned by View3DLayout at `#jog-left-column-slot` +
+  // `#jog-right-column-slot`. Names carry an "El" suffix so they
+  // don't shadow the caller-supplied `rightSlot` React-node prop.
+  const [leftSlotEl,  setLeftSlotEl]  = useState(null)
+  const [rightSlotEl, setRightSlotEl] = useState(null)
+  useEffect(() => {
+    if (!immersive || typeof document === 'undefined') return undefined
+    const resolve = () => {
+      setLeftSlotEl(document.getElementById('jog-left-column-slot'))
+      setRightSlotEl(document.getElementById('jog-right-column-slot'))
+    }
+    // Double-RAF so React has committed AND the slot <div>s are in
+    // the DOM before we grab them.
+    let raf2 = null
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(resolve)
+    })
+    return () => {
+      cancelAnimationFrame(raf1)
+      if (raf2) cancelAnimationFrame(raf2)
+    }
+  }, [immersive, maximized])
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', position: 'relative' }}>
       {/* 2026-09-04: the full-width State banner is retired. The
@@ -1026,7 +1066,21 @@ export default function JogControls({
           fix for the tablet-XYZ-clip bug at 440-height, but the
           spread layout + taller chrome eliminates that clip class
           because the LEFT column now owns the full panel height
-          and never overflows past its own top edge. */}
+          and never overflows past its own top edge.
+
+          IMMERSIVE portal (2026-09-16 SIDE-COLUMN OWNERSHIP): the
+          operator directive is that in the 3D View, the LEFT
+          column is a PAGE-LEVEL overlay — NOT a descendant of the
+          jog surface container. The IIFE below keeps the JSX in
+          ONE place (no duplication) and returns it either portaled
+          to `#jog-left-column-slot` (immersive mode) or inline
+          (Program tab default). React state ownership is
+          unaffected — the tree is unchanged, only the DOM
+          placement differs. Rendering `null` if the slot hasn't
+          mounted yet is safe: the double-RAF in the effect above
+          re-resolves the slot on next paint. */}
+      {(() => {
+        const leftEl = (
       <div style={{
         display: 'flex', flexDirection: 'column', gap: 10,
         width: leftColW, flexShrink: 0,
@@ -1127,6 +1181,11 @@ export default function JogControls({
 
         <div style={{ flex: 1 }} />
       </div>
+        )
+        return immersive
+          ? (leftSlotEl ? createPortal(leftEl, leftSlotEl) : null)
+          : leftEl
+      })()}
 
       {/* CENTER — jog arrow pads. 2026-09-16 testid added so
           View3DLayout's framing measurement targets THIS element
@@ -1138,6 +1197,23 @@ export default function JogControls({
       <div
         data-testid="jog-center-pads"
         style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', minWidth: 0, alignSelf: 'stretch' }}>
+        {/* 2026-09-16 EXPAND MODE — when `expanded` is true the pad
+            CLUSTER scales up (1.5×) via CSS transform so the SAME
+            arrangement (Position pad + Height + Rotation, joint tiles)
+            just renders larger. transformOrigin:center keeps it
+            centered inside the CENTER container; the container's
+            layout size is unchanged (transforms don't affect layout),
+            which preserves the framing anchor and keeps the LEFT/
+            RIGHT portaled columns at normal size. In non-expand mode
+            the wrapper is a passthrough — style is inert. */}
+        <div
+          data-testid="jog-center-cluster-scaler"
+          style={{
+            transform: expanded ? 'scale(1.6)' : 'none',
+            transformOrigin: 'center center',
+            transition: 'transform 120ms ease-out',
+            display: 'flex', justifyContent: 'center', alignItems: 'center',
+          }}>
         {jogMode === 'cartesian' ? (
           <div style={{ display: 'flex', gap: padGroup, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'center' }}>
             <div>
@@ -1255,6 +1331,7 @@ export default function JogControls({
             })}
           </div>
         )}
+        </div>
       </div>
 
       {/* RIGHT — auxiliary control slot. 2026-09-08 retired the
@@ -1263,8 +1340,16 @@ export default function JogControls({
           "Orient Flange Down" control (see rightSlot prop). Empty
           on the Program tab (where JogControls is also mounted).
           padGroup gap keeps it visually separated from the
-          Rotation cluster. */}
-      {(rightSlot || collapseSlot) && (
+          Rotation cluster.
+
+          IMMERSIVE portal (2026-09-16): mirrors the LEFT-column
+          treatment. When `immersive=true`, this JSX is portaled to
+          the page-level `#jog-right-column-slot` div owned by
+          View3DLayout, so the column sits OUTSIDE the jog surface
+          container. The Program tab (which passes neither immersive
+          nor rightSlot) renders nothing here. */}
+      {(rightSlot || collapseSlot) && (() => {
+        const rightEl = (
         <div
           data-testid="jog-right-slot"
           style={{
@@ -1293,7 +1378,11 @@ export default function JogControls({
             </div>
           )}
         </div>
-      )}
+        )
+        return immersive
+          ? (rightSlotEl ? createPortal(rightEl, rightSlotEl) : null)
+          : rightEl
+      })()}
     </div>
 
     </div>
