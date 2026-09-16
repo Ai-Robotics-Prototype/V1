@@ -7,7 +7,7 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import URDFLoader from 'urdf-loader'
 import * as THREE from 'three'
 import { useStore } from '../store/useStore'
-import { CollisionScene3D, CollisionBanner } from './CollisionOverlay'
+import { CollisionScene3D } from './CollisionOverlay'
 // 2026-09-14 operator directive: JointJogPanel retired from the 3D
 // View. This file used to mount it in the !noRobot branch, but that
 // branch never fired (View3DLayout is the only ArmViewer3D consumer
@@ -1642,17 +1642,19 @@ const ArmViewer3D = forwardRef(function ArmViewer3D({ joints, children, overlay,
         </div>
       )}
 
-      {/* Collision banner — centered at top */}
-      <div style={{
-        position: 'absolute', top: 8, left: '50%', transform: 'translateX(-50%)',
-        zIndex: 12, pointerEvents: 'none',
-      }}>
-        <CollisionBanner />
-      </div>
+      {/* 2026-09-16 operator directive: the top-center CLEAR ·
+          N in-reach pill (CollisionBanner) was retired from the 3D
+          View. The underlying reach / clearance store slice
+          (collision.*, guard_*) still feeds MinClearanceReadout
+          (View3DLayout top-left chip when the arm is within 2x warn
+          distance of any zone) and the CollisionScene3D reach-dome +
+          object-box render (inside <Canvas>). The pill's dead
+          component + statusToBanner helper have been deleted from
+          CollisionOverlay.jsx — no orphan exports. */}
 
       {/* Drag-manipulation status — shows only while the operator is
-          click-dragging a joint. Below the collision banner so both
-          can coexist. */}
+          click-dragging a joint. Was 'below the collision banner';
+          now the ONLY top-center overlay when active. */}
       {dragInfo && (
         <div style={{
           position: 'absolute', top: 36, left: '50%',

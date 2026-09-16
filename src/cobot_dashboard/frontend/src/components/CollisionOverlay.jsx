@@ -316,36 +316,15 @@ export function CollisionScene3D({ showLabels = true, showStatic = true, showDyn
 // HTML pieces — render OUTSIDE <Canvas>
 // ────────────────────────────────────────────────────────────────────────
 
-function statusToBanner(status) {
-  if (status === 'collision') return { color: '#fff', bg: '#dc2626', label: 'COLLISION RISK' }
-  if (status === 'warning')   return { color: '#1f2937', bg: '#facc15', label: 'PROXIMITY WARNING' }
-  return                              { color: '#fff', bg: '#16a34a', label: 'CLEAR' }
-}
-
-export function CollisionBanner({ style }) {
-  const status   = useStore((s) => s.collision?.status || 'clear')
-  const minDist  = useStore((s) => s.collision?.min_distance_m)
-  const count    = useStore((s) => (s.collision?.objects || []).length)
-  const b = statusToBanner(status)
-  return (
-    <div style={{
-      display: 'inline-flex', alignItems: 'center', gap: 10,
-      padding: '6px 14px', borderRadius: 999,
-      background: b.bg, color: b.color,
-      fontSize: 12, fontWeight: 700, letterSpacing: '0.05em',
-      textTransform: 'uppercase',
-      boxShadow: '0 1px 2px rgba(0,0,0,0.2)',
-      ...style,
-    }}>
-      <span style={{ width: 10, height: 10, borderRadius: '50%', background: b.color, opacity: 0.85 }} />
-      <span>{b.label}</span>
-      <span style={{ opacity: 0.85, fontWeight: 500 }}>
-        · {count} in-reach
-        {Number.isFinite(minDist) && `, nearest ${(minDist * 1000).toFixed(0)} mm`}
-      </span>
-    </div>
-  )
-}
+// 2026-09-16 operator directive: `CollisionBanner` (the top-center
+// green "CLEAR · N in-reach" pill on the 3D View) is RETIRED. Its
+// only mount site was ArmViewer3D.jsx (which is used only by
+// View3DLayout), and there are no other consumers. `statusToBanner`
+// (its color / label helper) went with it. The underlying store
+// slice (collision.status / min_distance_m / objects) still feeds
+// MinClearanceReadout (View3DLayout close-proximity chip) and
+// CollisionScene3D (reach-dome + object-box render inside
+// <Canvas>), both untouched.
 
 export function CollisionSidePanel({ style }) {
   const collision = useStore((s) => s.collision)

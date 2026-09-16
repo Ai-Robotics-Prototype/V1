@@ -780,6 +780,59 @@ def test_framed_preset_math_shifts_target_and_pulls_camera_back():
         'shift world DOWN → arm renders UP on screen)')
 
 
+def test_collision_banner_pill_absent_from_3d_view():
+    """2026-09-16 operator directive — the top-center "CLEAR · N
+    in-reach" pill (CollisionBanner) is RETIRED from the 3D View.
+    Pin: ArmViewer3D no longer mounts or imports CollisionBanner,
+    and CollisionOverlay no longer exports it. The underlying
+    reach / collision store slice (collision.*) still feeds
+    MinClearanceReadout + CollisionScene3D — both untouched.
+    """
+    viewer_path = os.path.join(
+        HERE, '..', 'frontend', 'src', 'components', 'ArmViewer3D.jsx')
+    overlay_path = os.path.join(
+        HERE, '..', 'frontend', 'src', 'components', 'CollisionOverlay.jsx')
+    viewer  = _read(viewer_path)
+    overlay = _read(overlay_path)
+    # No JSX mount + no import of CollisionBanner in ArmViewer3D.
+    assert '<CollisionBanner' not in viewer, (
+        '<CollisionBanner /> mount must be retired from ArmViewer3D — '
+        'the top-center pill is gone per operator directive')
+    # Reject any live code reference — imports, function calls, JSX.
+    # A comment mentioning the retirement is allowed (in fact the
+    # retirement-note anchor helps future readers).
+    viewer_no_line_comments = re.sub(r'//[^\n]*', '', viewer)
+    viewer_no_comments = re.sub(
+        r'\{/\*.*?\*/\}', '', viewer_no_line_comments, flags=re.DOTALL)
+    viewer_no_comments = re.sub(
+        r'/\*.*?\*/', '', viewer_no_comments, flags=re.DOTALL)
+    assert 'CollisionBanner' not in viewer_no_comments, (
+        'ArmViewer3D must not carry any live CollisionBanner reference '
+        '(import / JSX / function call) — silent dead import is '
+        'exactly what the directive forbids. Retirement-note '
+        'comments are allowed.')
+    # Component + helper deleted from CollisionOverlay.
+    assert 'export function CollisionBanner' not in overlay, (
+        'CollisionBanner component must be deleted from CollisionOverlay '
+        '(no orphan export)')
+    assert 'function statusToBanner' not in overlay, (
+        'statusToBanner helper (only used by CollisionBanner) must '
+        'be deleted too')
+    # Sibling consumers of the collision store slice stay intact.
+    assert 'CollisionScene3D' in overlay, (
+        'CollisionScene3D (reach-dome + object-box 3D render) must '
+        'remain — the reach data still drives the in-Canvas overlay')
+    assert 'export function CollisionSidePanel' in overlay, (
+        'CollisionSidePanel (dev diagnostic surface) must remain — '
+        'not the pill we retired')
+    # MinClearanceReadout (the close-proximity top-left chip on the
+    # 3D View) still consumes the same reach data.
+    layout = _read(LAYOUT)
+    assert 'function MinClearanceReadout' in layout, (
+        'MinClearanceReadout must remain — it is the other consumer '
+        'of the collision store slice on the 3D View')
+
+
 def test_no_new_handler_or_gate_added_in_layout():
     """The immersive refactor touches CSS + testid attributes only.
     No new fetch / onClick / gate predicate should appear in the
