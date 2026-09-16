@@ -429,6 +429,15 @@ export function HoldButton({
 const LABEL_TEXT_SHADOW =
   '0 1px 2px rgba(255,255,255,0.9), 0 0 3px rgba(255,255,255,0.7)'
 
+// 2026-09-16 operator directive: every jog direction button uses
+// the app's PRIMARY BLUE, replacing the per-axis red/green/blue/
+// purple/gold. Same #2563EB the mode toggles + step-size chips use
+// when active. Callers of ArrowPad still pass a `color` prop (kept
+// for potential future re-tinting) but the button chip renders in
+// this uniform blue; hover/held dims via _jogDarken; disabled
+// dims 40 % via HoldButton's existing opacity rule.
+const JOG_BUTTON_BLUE = '#2563EB'
+
 // 2026-09-16 immersive layout — jog buttons render as SOLID colored
 // chips with white glyphs so they read instantly over the 3D scene.
 // Directional color coding preserved (X red, Y green, Z blue,
@@ -450,6 +459,14 @@ function _jogDarken(hex) {
 function ArrowPad({ jogStyle, onTap, onPressStart, onPressTick, onPressEnd,
                     rotation, label, color, size, svgSize, labelSize,
                     disabled, tooltip }) {
+  // 2026-09-16 operator directive: uniform blue for every direction.
+  // The caller-provided `color` is ignored for the chip fill — kept
+  // in the signature so a future re-tint (per-axis colored variant)
+  // is a one-liner rather than a call-site sweep. Held-state and
+  // hover use _jogDarken(blue); disabled uses HoldButton's opacity.
+  void color   // eslint: mark as intentionally unused for the fill
+  const chipBg = JOG_BUTTON_BLUE
+  const chipDim = _jogDarken(chipBg)
   return (
     <HoldButton
       jogStyle={jogStyle}
@@ -457,10 +474,10 @@ function ArrowPad({ jogStyle, onTap, onPressStart, onPressTick, onPressEnd,
       onPressStart={onPressStart}
       onPressTick={onPressTick}
       onPressEnd={onPressEnd}
-      color={color}
-      bg={color}
-      bgHover={_jogDarken(color)}
-      borderColor={_jogDarken(color)}
+      color={chipBg}
+      bg={chipBg}
+      bgHover={chipDim}
+      borderColor={chipDim}
       width={size} height={size}
       disabled={disabled}
       tooltip={tooltip}
@@ -972,16 +989,13 @@ export default function JogControls({ maximized = false, rightSlot = null }) {
       data-testid="jog-surface-row"
       style={{
         padding: containerPad,
-        // 2026-09-16 immersive tint correction — the row background
-        // was solid #fff, which hid the 3D scene behind every gap
-        // between controls. Switch to a translucent gray so the
-        // canvas (robot / grid / reach dome) is clearly visible
-        // through the surface while buttons/labels stay readable.
-        // Backdrop-blur is cheap on modern browsers; browsers that
-        // skip it still get a lightly-tinted scrim.
-        background: 'rgba(107, 114, 128, 0.18)',
-        backdropFilter: 'blur(3px)',
-        WebkitBackdropFilter: 'blur(3px)',
+        // 2026-09-16 operator directive: surface fully TRANSPARENT.
+        // No tint, no blur — the 3D scene shows through at 100 %
+        // between and around controls. Prior translucent gray scrim
+        // + backdrop-blur retired: canvas full-bleed behind the
+        // surface handles the "readability by contrast" case; loose
+        // labels carry LABEL_TEXT_SHADOW for their own contrast.
+        background: 'transparent',
         width: '100%', flex: 1, minHeight: 0,
         // 2026-09-16 tint correction — no internal scrollbar on the
         // translucent surface. Content lays out at its natural size

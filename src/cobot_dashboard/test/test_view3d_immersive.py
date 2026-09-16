@@ -132,44 +132,32 @@ def test_overlay_panel_container_is_transparent():
             f'card" treatment')
 
 
-def test_jog_surface_row_uses_translucent_gray_tint():
-    """2026-09-16 tint correction: the jog surface ROW (the div that
-    holds LEFT/CENTER/RIGHT control columns inside JogControls)
-    MUST use a translucent gray tint — solid #fff was hiding the 3D
-    scene behind every gap between controls. Value envelope per
-    operator directive: rgba(0..255, 0..255, 0..255, alpha) with
-    alpha in [0.10, 0.30] — light enough that the robot / grid /
-    reach dome is clearly visible through it. Backdrop-filter blur
-    is nice-to-have.
+def test_jog_surface_row_is_fully_transparent():
+    """2026-09-16 operator directive: the jog surface row MUST be
+    fully transparent — no color tint, no blur. The 3D scene shows
+    through at 100 % between and around controls. Prior translucent
+    gray scrim (rgba(107,114,128,0.18)) + backdrop-blur retired;
+    canvas full-bleed behind the surface handles the "readability
+    by contrast" case, and loose labels carry their own text-shadow.
     """
     src = _read(JOG)
     idx = src.find('data-testid="jog-surface-row"')
     assert idx != -1, (
-        'jog-surface-row testid missing — the tint pin needs this '
-        'anchor to inspect the correct div')
+        'jog-surface-row testid missing — the transparency pin needs '
+        'this anchor to inspect the correct div')
     block = src[idx:idx + 1500]
-    m = re.search(
-        r"background:\s*'rgba\(\s*(\d+),\s*(\d+),\s*(\d+),\s*([0-9.]+)\s*\)'",
-        block)
-    assert m is not None, (
-        'jog-surface-row background MUST be an rgba() value — solid '
-        '#fff was the mistake that hid the 3D scene')
-    r, g, b, alpha = int(m.group(1)), int(m.group(2)), int(m.group(3)), float(m.group(4))
-    assert 0.10 <= alpha <= 0.30, (
-        f'jog-surface-row background alpha {alpha} outside translucent '
-        f'window [0.10, 0.30]. Too high (>=0.30) hides the scene; too '
-        f'low (<0.10) leaves labels unreadable on bright floors')
-    # The tint MUST NOT be pure white. Reject any (255,255,255,α)
-    # value regardless of alpha — the operator wants a slightly gray
-    # scrim, not a bleached-out card.
-    assert not (r == 255 and g == 255 and b == 255), (
-        f'jog-surface-row tint is white ({r},{g},{b}) — operator '
-        f'directive says translucent GRAY (gray-shaded scrim)')
-    # Backdrop-filter is nice-to-have, but pin the intent so a future
-    # edit that drops it surfaces here.
-    assert 'backdropFilter' in block, (
-        'jog-surface-row should apply backdropFilter (blur) for polish '
-        'when the browser supports it')
+    assert re.search(r"background:\s*'transparent'", block), (
+        'jog-surface-row MUST be background:transparent — every prior '
+        'tint (rgba(107,114,128,0.18), #fff, backdropFilter) is '
+        'retired per the operator directive')
+    # Reject the retired treatments explicitly so a partial revert
+    # to any of them surfaces here.
+    for banned in ('backdropFilter', 'rgba(107, 114, 128',
+                   'rgba(255, 255, 255,', "'#fff'"):
+        assert banned not in block, (
+            f'jog-surface-row style must not carry `{banned}` — the '
+            f'transparency directive forbids any tint or backdrop '
+            f'treatment on the surface itself')
 
 
 def test_jog_surface_row_has_no_internal_overflow_scroll():
@@ -308,12 +296,15 @@ def test_arrow_pad_renders_solid_color_chip():
     # Body ends at the next top-level function.
     body_end = src.find('\nfunction ', idx + 10)
     body = src[idx:body_end] if body_end != -1 else src[idx:]
-    # HoldButton receives bg=color, bgHover=darken(color) — that's
-    # the "solid chip" contract.
-    assert 'bg={color}' in body, (
-        'ArrowPad must pass bg={color} to HoldButton so the button '
-        'background is the directional color (solid chip)')
-    assert 'bgHover={_jogDarken(color)}' in body, (
+    # 2026-09-16 uniform-blue directive: the "solid chip" contract
+    # is now bg=JOG_BUTTON_BLUE, bgHover=_jogDarken(that). Prior
+    # per-axis bg={color} / bgHover={_jogDarken(color)} pins retired
+    # (see test_jog_buttons_use_uniform_primary_blue for the new pin).
+    assert 'bg={chipBg}' in body, (
+        'ArrowPad must pass bg={chipBg} (derived from JOG_BUTTON_BLUE) '
+        'to HoldButton so every direction renders in the uniform '
+        'primary blue')
+    assert 'bgHover={chipDim}' in body, (
         'ArrowPad must pass a darker bgHover so pressed / hover state '
         'is visibly distinct from idle')
     # SVG arrow and label are now white (contrast over the color chip).
@@ -323,30 +314,45 @@ def test_arrow_pad_renders_solid_color_chip():
         'ArrowPad label must be white over the color chip')
 
 
-def test_directional_color_map_preserved():
-    """The X/Y/Z/Rx/Rz color code did NOT change — only the fill
-    treatment did. Prior operator convention (X red / Y green /
-    Z blue / Rx purple / Rz gold) stays.
+def test_jog_buttons_use_uniform_primary_blue():
+    """2026-09-16 operator directive: every jog direction button
+    renders in the app's PRIMARY BLUE (#2563EB, same token the
+    mode toggles + step-size chips use when active). Per-axis
+    red/green/blue/purple/gold color code retired.
+
+    Pins:
+      (a) JOG_BUTTON_BLUE constant exists and equals #2563EB.
+      (b) ArrowPad chip fill uses JOG_BUTTON_BLUE (not the caller-
+          passed `color` prop) — so every axis gets the same blue
+          regardless of the historical per-axis color literals still
+          appearing at call sites for archival intent.
+      (c) modeBtnStyle continues to use the same #2563EB token when
+          active, so the visual language is coherent (chips + jog
+          buttons share the primary-blue token).
     """
     src = _read(JOG)
-    # Count each directional color hex — expected minimum occurrences
-    # cover the two ArrowPad call sites per axis (X±, Y±, Z± in the
-    # cartesian pad; Rx±, Rz± in the rotation pad; joint mode uses
-    # green + red as well). If any hex disappears, a direction lost
-    # its color coding.
-    color_min = {
-        '#DC2626': 3,   # X± cartesian + joint −
-        '#16A34A': 3,   # Y± cartesian + joint +
-        '#3B82F6': 2,   # Z± cartesian
-        '#9333EA': 2,   # Rx± rotation
-        '#CA8A04': 2,   # Rz± rotation
-    }
-    for hex_color, min_count in color_min.items():
-        cnt = len(re.findall(r'color="' + re.escape(hex_color) + '"', src))
-        assert cnt >= min_count, (
-            f'directional color {hex_color} appears {cnt} times, '
-            f'expected at least {min_count} — a direction lost its '
-            f'color coding')
+    assert "const JOG_BUTTON_BLUE = '#2563EB'" in src, (
+        'JOG_BUTTON_BLUE token missing or wrong value — every jog '
+        'button must use the app primary blue #2563EB')
+    # ArrowPad body must render via JOG_BUTTON_BLUE, not the caller
+    # `color` prop.
+    idx = src.find('function ArrowPad(')
+    end = src.find('\nfunction ', idx + 10)
+    body = src[idx:end] if end != -1 else src[idx:]
+    assert 'const chipBg = JOG_BUTTON_BLUE' in body, (
+        'ArrowPad must derive its chip background from JOG_BUTTON_BLUE '
+        '(one token, one blue, every direction)')
+    # And the color prop must NOT reach the chip background — a
+    # partial revert would re-introduce `bg={color}` (per-axis).
+    assert 'bg={color}' not in body, (
+        'ArrowPad `bg={color}` (per-axis fill) is retired — every '
+        'button must render in the uniform JOG_BUTTON_BLUE')
+    # modeBtnStyle uses the same primary-blue token when active —
+    # locks the visual language across chips + buttons.
+    assert re.search(
+        r"background:\s*on\s*\?\s*'#2563EB'", src), (
+        'modeBtnStyle active fill must remain #2563EB — the jog '
+        'buttons and mode toggles share this primary-blue token')
 
 
 def test_loose_labels_have_text_shadow_for_over_3d_readability():
