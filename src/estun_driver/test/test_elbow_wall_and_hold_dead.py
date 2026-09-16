@@ -46,6 +46,7 @@ sys.path.insert(0, '/home/teddy/cobot_ws/src/estun_driver')
 from estun_driver.estun_driver_node import (
     EstunCodroidDriver, ESCAPE_TIE_EPS, SingularityGuard,
     ELBOW_COLLINEAR_J3_DEG, ELBOW_LATCH_HYSTERESIS_DEG,
+    CART_APPROACH_SIGMA_SCALE_MIN,
     _FITTED_DH_STD, _FITTED_BASE_Z_MM)
 
 
@@ -412,6 +413,110 @@ def test_latch_survives_release_source_scan():
     assert len(true_writes) == 1, (
         f'expected exactly 1 True write to _cart_elbow_latched '
         f'(supervise stop); got {len(true_writes)}')
+
+
+def test_sigma_scale_approach_refusal_replays_captured_creep():
+    """LIVE CAPTURE REPLAY PIN — 2026-09-16.
+
+    Operator's real reproduction (journalctl 09:31:13–17) showed the
+    "creep past the wall" that three prior fixes missed was NOT the
+    elbow_wall guard permitting motion — the elbow margin never went
+    below 15.78° (well above wall=10°). The mechanism was σ soft-band
+    SCALING: presses at σ_min ≈ 0.066–0.083 (inside σ_soft=0.116)
+    were permitted at scale 0.48–0.66, emitting Robot/jog at heavily
+    attenuated speed, giving ~0.12° per press.
+
+    Fix: CART_APPROACH_SIGMA_SCALE_MIN refuses CLOSING presses whose
+    σ scale would be at/below the threshold. This pin replays every
+    captured press and asserts the refusal fires (reason_code =
+    'elbow_approach_scale') for the ones that were creeping.
+    """
+    from estun_driver.estun_driver_node import CART_APPROACH_SIGMA_SCALE_MIN
+    # Exact captured session values (journalctl 2026-09-16 09:31:13-17,
+    # SHA 1aacf1d TEMP capture). All presses axis=1 dir=+1 speed=+0.29
+    # (closing). Column: (j3_deg, sigma_min). Six deep-creep presses.
+    captured_presses = [
+        (17.481, 0.0728),
+        (16.272, 0.0679),
+        (16.149, 0.0674),
+        (16.026, 0.0668),
+        (15.904, 0.0663),
+        (15.782, 0.0658),
+    ]
+    refusals = []
+    for j3, sigma in captured_presses:
+        fake = _elbow_fake(j3_deg=j3, elbow_latched=False)
+        # Mock σ_min so the driver's clamp sees the captured σ regardless
+        # of the fixture pose's actual singularity structure.
+        fake._sing_guard.sigma_min = lambda q, _s=sigma: _s
+        # Pick the closing direction — captured qdot_j3 was negative
+        # for dir=+1 at these poses (see the log's margin_closure lines).
+        q_pos = fake._sing_guard.qdot_component(
+            fake._joint_deg, 3, +1.0, joint_idx0=2)
+        closing_sign = -1 if (q_pos > 0) else +1
+        _, refusal = fake._cart_start_sing_clamp(
+            axis=3, direction=closing_sign,
+            signed_speed=closing_sign * 0.29)
+        refusals.append((j3, sigma, refusal))
+    # Every captured press must be refused with elbow_approach_scale
+    # (or elbow_wall / posture_stale — any refusal that yields ZERO
+    # motion frames). The invariant is "no wire frame under closing
+    # press at these σ values", not the specific reason code.
+    for j3, sigma, refusal in refusals:
+        assert refusal is not None, (
+            f'captured creep press at j3={j3}° σ={sigma} was PERMITTED '
+            f'— the σ-scale approach refusal did not fire. Replay would '
+            f'reproduce the operator report.')
+    # Pin: at least one refusal must carry the elbow_approach_scale
+    # code, proving the NEW branch is the one catching this class.
+    codes = {r.get('reason_code') for _, _, r in refusals}
+    assert 'elbow_approach_scale' in codes, (
+        f'no captured press caught by the elbow_approach_scale branch — '
+        f'got refusals {codes}. Fix path did not fire on the replay.')
+
+
+def test_sigma_scale_refusal_permits_opening_direction():
+    """Escape guarantee: the σ-scale approach refusal must NEVER fire
+    for opening presses. Even inside the σ soft-band, elbow-opening
+    motion clears the zone at full speed (subject to the existing
+    scale, not refused).
+    """
+    fake = _elbow_fake(j3_deg=15.78, elbow_latched=False)
+    # Force σ into the danger zone by mocking sigma_min.
+    fake._sing_guard.sigma_min = lambda q: 0.0658
+    # Find the OPENING direction: qdot_j3 same sign as j3 (moves j3
+    # further from 0 → margin grows). For j3 > 0 pick the direction
+    # that yields positive qdot_j3.
+    q_pos = fake._sing_guard.qdot_component(
+        fake._joint_deg, 3, +1.0, joint_idx0=2)
+    opening_sign = +1 if q_pos > 0 else -1
+    _, refusal = fake._cart_start_sing_clamp(
+        axis=3, direction=opening_sign,
+        signed_speed=opening_sign * 0.29)
+    # No elbow_approach_scale refusal in the opening direction.
+    assert (refusal is None
+            or refusal.get('reason_code') != 'elbow_approach_scale'), (
+        f'opening press refused with {refusal!r} — the σ-scale approach '
+        f'refusal must never gate an escape')
+
+
+def test_sigma_scale_refusal_permits_scale_above_threshold():
+    """The refusal must NOT over-fire when the σ scale is above the
+    threshold. Sanity: at σ=0.11 (near σ_soft=0.116 → scale ~0.9)
+    a closing press is permitted (may still be scaled, not refused).
+    """
+    fake = _elbow_fake(j3_deg=20.0, elbow_latched=False)
+    fake._sing_guard.sigma_min = lambda q: 0.11
+    q_pos = fake._sing_guard.qdot_component(
+        fake._joint_deg, 3, +1.0, joint_idx0=2)
+    closing_sign = -1 if (q_pos > 0) else +1
+    _, refusal = fake._cart_start_sing_clamp(
+        axis=3, direction=closing_sign,
+        signed_speed=closing_sign * 0.29)
+    assert (refusal is None
+            or refusal.get('reason_code') != 'elbow_approach_scale'), (
+        f'closing press at σ=0.11 (scale ~0.9) refused with '
+        f'elbow_approach_scale — the threshold is over-firing')
 
 
 def test_widened_qdot_escape_epsilon_present():

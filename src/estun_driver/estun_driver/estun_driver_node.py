@@ -49,7 +49,6 @@ import json
 import math
 import os
 import re
-import sys
 import threading
 import time
 
@@ -374,6 +373,25 @@ ELBOW_QDOT_ESCAPE_EPS = 1.0e-4
 # decided on that stale read can permit a tick's worth of motion
 # past the wall.
 POSTURE_STALE_MAX_S = 0.5
+
+# 2026-09-16 sigma-soft-band approach refusal. Live capture (operator
+# reproduction on this branch) showed the "creep past the wall" the
+# operator reports is not the elbow_wall guard firing — it's the σ
+# soft-band SCALING. In that session the elbow margin never went
+# below 15.78° (5.78° above elbow_wall_deg=10°), so the geometric
+# elbow_wall guard correctly permits every press; but σ_min is deep
+# in the soft band (0.066–0.083 vs σ_soft≈0.116) so the scale drops
+# to 0.48–0.66 → the driver emits Robot/jog at ~0.14 speed_frac →
+# each ~0.5s hold nets ~0.12° of J3 motion. Operator perceives it as
+# "hitting the wall then creeping past" because the arm is barely
+# moving. Fix: when the σ scale for a CLOSING press would be at/
+# below this threshold, refuse with a plain "reach limit" copy
+# rather than emit a heavily-scaled frame. Opening presses always
+# permitted (escape guarantee). Value chosen from the operator's
+# captured session — 0.60 refuses σ_min ≤ 0.077, matching the deep-
+# soft-band creep zone; raise it (0.70) to catch shallower cases,
+# lower it (0.50) to permit more approach speed.
+CART_APPROACH_SIGMA_SCALE_MIN = 0.60
 
 
 class EstunCodroidDriver(Node):
@@ -2523,16 +2541,6 @@ class EstunCodroidDriver(Node):
         - Legacy velocity (kept for compat):
             {"mode":"joint","axis":<1-6>,"direction":±1,"speed":<1..100>,"step":<abs_rad>}
         Cartesian mode (mode:2) is gated behind allow_cartesian_jog."""
-        # TEMP-ELBOW-CAPTURE-2026-09-16
-        try:
-            self.get_logger().warn(
-                f'[TEMP-ELBOW-CAPTURE] _on_jog_command RX: '
-                f'raw={msg.data[:200]} '
-                f'j3={self._joint_deg[2]:+.4f}° '
-                f'latched={self._cart_elbow_latched} '
-                f'jog_active={self._jog_active}')
-        except Exception:
-            pass
         family = 'jog'
         if self._monitor_only:
             self._reject(family, 'monitor_only active',
@@ -3350,11 +3358,6 @@ class EstunCodroidDriver(Node):
         and the same _stop_jog_locked teardown. The per-tick joint-
         limit clamp in _on_jog_supervise applies to 'continuous_cart'
         already, and this mode ('cart_pulse') shares that dispatch."""
-        # TEMP-ELBOW-CAPTURE-2026-09-16
-        self.get_logger().warn(
-            f'[TEMP-ELBOW-CAPTURE] _start_cart_pulse ENTRY: '
-            f'payload={d} j3={self._joint_deg[2]:+.4f}° '
-            f'latched={self._cart_elbow_latched}')
         family = 'jog'
         try:
             axis = int(d.get('axis', 0))
@@ -3441,11 +3444,6 @@ class EstunCodroidDriver(Node):
                 'id': self._new_nonce(),
             }
             now = time.time()
-            # TEMP-ELBOW-CAPTURE-2026-09-16
-            self.get_logger().warn(
-                f'[TEMP-ELBOW-CAPTURE] _start_cart_pulse EMIT: '
-                f'ty=Robot/jog mode=2 axis={axis} dir={direction} '
-                f'speed={signed_speed:+.4f} j3_pre={self._joint_deg[2]:+.4f}°')
             try:
                 if not self._send(frame):
                     self._reject(family, 'send returned False')
@@ -3977,40 +3975,13 @@ class EstunCodroidDriver(Node):
             dangerous = (
                 margin <= self._elbow_wall_deg
                 or (self._cart_elbow_latched and in_hyst_band))
-            # TEMP-ELBOW-CAPTURE-2026-09-16
-            self.get_logger().warn(
-                f'[TEMP-ELBOW-CAPTURE] margin_closure TIE: '
-                f'j3={j3:+.4f}° qdot_j3={qdot_j3:+.2e} '
-                f'margin={margin:.4f}° wall={self._elbow_wall_deg:.2f}° '
-                f'latched={self._cart_elbow_latched} '
-                f'in_hyst_band={in_hyst_band} DECISION={"CLOSING" if dangerous else "OPENING"}')
             return margin, dangerous
         # Closing = qdot_J3 has OPPOSITE sign to J3 (pulls toward 0).
         is_closing = (j3 * qdot_j3) < 0.0
-        # TEMP-ELBOW-CAPTURE-2026-09-16
-        self.get_logger().warn(
-            f'[TEMP-ELBOW-CAPTURE] margin_closure: '
-            f'j3={j3:+.4f}° qdot_j3={qdot_j3:+.4e} '
-            f'margin={margin:.4f}° wall={self._elbow_wall_deg:.2f}° '
-            f'latched={self._cart_elbow_latched} '
-            f'axis={axis} dir={direction} DECISION={"CLOSING" if is_closing else "OPENING"}')
         return margin, is_closing
 
     def _cart_start_sing_clamp(self, axis, direction, signed_speed):
-        # TEMP-ELBOW-CAPTURE-2026-09-16
-        _t_now = time.time()
-        _p_age = (_t_now - self._last_posture_ts) if self._last_posture_ts else -1.0
-        self.get_logger().warn(
-            f'[TEMP-ELBOW-CAPTURE] start_sing_clamp ENTRY: '
-            f'axis={axis} dir={direction} speed={signed_speed:+.4f} '
-            f'j3={self._joint_deg[2]:+.4f}° J5={self._joint_deg[4]:+.4f}° '
-            f'latched={self._cart_elbow_latched} '
-            f'posture_age={_p_age*1000:.0f}ms '
-            f'caller={sys._getframe(1).f_code.co_name}')
         if self._last_posture_ts <= 0.0:
-            self.get_logger().warn(
-                '[TEMP-ELBOW-CAPTURE] start_sing_clamp EXIT: '
-                'no posture — permit (returns unchanged speed)')
             return signed_speed, None
         sigma = self._sing_guard.sigma_min(self._joint_deg)
         if sigma is None:
@@ -4077,14 +4048,6 @@ class EstunCodroidDriver(Node):
         elbow_latched_refuse = (
             self._cart_elbow_latched
             and elbow_margin <= elbow_release_thresh)
-        # TEMP-ELBOW-CAPTURE-2026-09-16
-        self.get_logger().warn(
-            f'[TEMP-ELBOW-CAPTURE] elbow_gate_pre: '
-            f'margin={elbow_margin:.4f}° wall={self._elbow_wall_deg:.2f}° '
-            f'release_thresh={elbow_release_thresh:.2f}° '
-            f'elbow_closing={elbow_closing} '
-            f'elbow_latched_refuse={elbow_latched_refuse} '
-            f'latched={self._cart_elbow_latched}')
         if elbow_closing and (
                 elbow_margin <= self._elbow_wall_deg
                 or elbow_latched_refuse):
@@ -4099,18 +4062,7 @@ class EstunCodroidDriver(Node):
                 'cart_axis':      int(axis),
                 'cart_direction': int(direction),
             }
-            # TEMP-ELBOW-CAPTURE-2026-09-16
-            self.get_logger().warn(
-                f'[TEMP-ELBOW-CAPTURE] start_sing_clamp EXIT: '
-                f'REFUSED reason=elbow_wall '
-                f'margin={elbow_margin:.4f}° latched={elbow_latched_refuse}')
             return signed_speed, refusal
-        # TEMP-ELBOW-CAPTURE-2026-09-16: reached here means elbow gate
-        # PASSED. Record why (elbow_closing false OR margin > wall).
-        self.get_logger().warn(
-            f'[TEMP-ELBOW-CAPTURE] elbow_gate PASSED: '
-            f'reason={"opening" if not elbow_closing else "margin_above_wall_and_not_latched"} '
-            f'→ falling through to sigma_wall check')
 
         # 2026-09-14 §3 field-regression fix: wall latch clear-check.
         # A fresh press can only clear the latch by DEMONSTRATED σ
@@ -4144,31 +4096,40 @@ class EstunCodroidDriver(Node):
                 'cart_axis': int(axis),
                 'cart_direction': int(direction),
             }
-            # TEMP-ELBOW-CAPTURE-2026-09-16
-            self.get_logger().warn(
-                f'[TEMP-ELBOW-CAPTURE] start_sing_clamp EXIT: '
-                f'REFUSED reason=sing_wall sigma={sigma:.4f} '
-                f'wall_latched={latched_refuse}')
             return signed_speed, refusal
         dyn_soft = self._dyn_sigma_soft(abs(signed_speed))
         scale = SingularityGuard.scale(
             sigma, dyn_soft, self._cart_sigma_hard)
+        # 2026-09-16 sigma-scale approach refusal — see the constant
+        # doc block. Live capture proved the operator's "creep past
+        # the wall" is the σ soft-band scaling emitting heavily-
+        # attenuated Robot/jog frames; refuse instead of emit when
+        # the closing scale would be at/below
+        # CART_APPROACH_SIGMA_SCALE_MIN. Escape (elbow-opening) is
+        # never gated — the guard preserves the freedom guarantee.
+        if elbow_closing and scale <= CART_APPROACH_SIGMA_SCALE_MIN:
+            refusal = {
+                'reason_code': 'elbow_approach_scale',
+                'reason': (
+                    'Arm is close to its reach limit — jog back to a '
+                    'more central pose before continuing.'),
+                'sigma_min':          float(sigma),
+                'sigma_soft_dyn':     float(dyn_soft),
+                'sigma_scale':        float(scale),
+                'sigma_scale_min':    float(CART_APPROACH_SIGMA_SCALE_MIN),
+                'elbow_margin_deg':   float(elbow_margin),
+                'elbow_wall_deg':     float(self._elbow_wall_deg),
+                'cart_axis':      int(axis),
+                'cart_direction': int(direction),
+            }
+            return signed_speed, refusal
         if scale < 1.0:
             scaled = signed_speed * scale
             self.get_logger().info(
                 f'cart start clamp: σ_min={sigma:.4f} '
                 f'σ_soft(dyn)={dyn_soft:.4f} → scale={scale:.2f} '
                 f'  speed {signed_speed:+.3f} → {scaled:+.3f}')
-            # TEMP-ELBOW-CAPTURE-2026-09-16
-            self.get_logger().warn(
-                f'[TEMP-ELBOW-CAPTURE] start_sing_clamp EXIT: '
-                f'PERMITTED_SCALED sigma={sigma:.4f} scale={scale:.2f} '
-                f'speed_out={scaled:+.4f}')
             return scaled, None
-        # TEMP-ELBOW-CAPTURE-2026-09-16
-        self.get_logger().warn(
-            f'[TEMP-ELBOW-CAPTURE] start_sing_clamp EXIT: '
-            f'PERMITTED_FULL sigma={sigma:.4f} speed_out={signed_speed:+.4f}')
         return signed_speed, None
 
     def _stop_jog_from_expiry(self):
