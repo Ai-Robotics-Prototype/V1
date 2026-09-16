@@ -78,11 +78,12 @@ function RealArmChrome({ mode, setMode, children }) {
         overflow: 'hidden',
         // 440 px NORMAL preserves the Program tab's JOG_MIN_HEIGHT (360)
         // budget after the compact chip header (~34 px w/ borders).
-        // EXPANDED still fills the container so operators who want the
-        // full-height pendant get it; NORMAL stays a bounded panel that
-        // never eats the whole viewport.
-        height: isExpanded ? 'calc(100% - 24px)' : 440,
-        maxWidth: isExpanded ? 'calc(100% - 24px)' : 'min(1240px, calc(100% - 24px))',
+        // EXPANDED fills the wrapper (which itself provides the outer
+        // gutter for the immersive layout — see the wrapper style
+        // in View3DLayout's return).
+        height: isExpanded ? '100%' : 440,
+        maxWidth: isExpanded ? '100%' : 'min(1240px, calc(100% - 24px))',
+        width: isExpanded ? '100%' : undefined,
         // Panel owns its own pointer events; the surrounding transparent
         // area of the parent lets the 3D canvas orbit/zoom through.
         pointerEvents: 'auto',
@@ -260,10 +261,19 @@ export default function View3DLayout() {
           data-testid="jog-overlay-wrapper"
           style={{
             position: 'absolute',
-            left: 0, right: 0, bottom: 12,
+            // NORMAL: pinned to the bottom-center, height auto (grows
+            // up to fit the 440 px panel above `bottom:12`).
+            // EXPANDED: full-bleed container with a 12 px gutter on
+            // every side so the panel's height:'100%' produces a
+            // panel that spans the region cleanly without eating the
+            // E-STOP margin at the top nav boundary.
+            left:   isExpanded ? 12 : 0,
+            right:  isExpanded ? 12 : 0,
+            top:    isExpanded ? 12 : 'auto',
+            bottom: 12,
             display: 'flex',
             justifyContent: 'center',
-            padding: '0 12px',
+            padding: isExpanded ? 0 : '0 12px',
             zIndex: 10,
             pointerEvents: 'none',
           }}>

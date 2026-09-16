@@ -90,7 +90,9 @@ def test_jog_overlay_wrapper_swallows_only_its_own_pointer_events():
     src = _read(LAYOUT)
     idx = src.find('data-testid="jog-overlay-wrapper"')
     assert idx != -1
-    wrapper_block = src[idx:idx + 500]
+    # The wrapper style block includes NORMAL/EXPANDED-conditional
+    # positioning + comments, ~1500 chars end-to-end.
+    wrapper_block = src[idx:idx + 1600]
     assert re.search(r"pointerEvents:\s*'none'", wrapper_block), (
         'jog-overlay-wrapper must be pointerEvents:none so it does '
         'not block 3D orbit outside the panel body')
@@ -167,7 +169,7 @@ def test_overlay_zindex_is_scoped_below_topbar_stacking():
     """
     src = _read(LAYOUT)
     idx = src.find('data-testid="jog-overlay-wrapper"')
-    block = src[idx:idx + 500]
+    block = src[idx:idx + 1600]
     m = re.search(r'zIndex:\s*(\d+)', block)
     assert m is not None, 'overlay wrapper missing zIndex declaration'
     z = int(m.group(1))
