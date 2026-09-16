@@ -95,32 +95,24 @@ function RealArmChrome({ mode, setMode, children, panelHeight }) {
         pointerEvents: 'auto',
         flexShrink: 0,
       }}>
+      {/* 2026-09-16 LEFT-column cleanup: DISABLE + READY moved OUT
+          of this chrome header INTO the LEFT column's top slot
+          (JogControls.leftTopSlot). Doing so kills the z-overlap
+          the operator flagged (the "Jog" heading rendering under
+          the DISABLE button in the old header). The chrome header
+          is now empty and collapses to 0 — the panel body owns
+          the full panelHeight. flow(b) doctrine pin (44 px header
+          minHeight) is superseded by this order and retired at
+          the same time. */}
       <div style={{
-        padding: '5px 8px',
+        padding: 0,
         display: 'flex', alignItems: 'center',
         justifyContent: 'space-between',
-        gap: 8,
+        gap: 0,
         flexShrink: 0,
-        // Header owns 44px minimum so it can never collapse below its
-        // control heights even if a parent under-allocates space at a
-        // narrow tablet width — the DISABLE/READY row is the anchor
-        // controls below flow from.
-        minHeight: 44,
+        minHeight: 0,
         background: 'transparent',
-      }}>
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-          <ArmEnableControl />
-          {/* Compact READY / NOT-READY badge next to the enable
-              button — pre-jog cue at a glance. */}
-          <JogReadyBadge />
-        </div>
-        {/* 2026-09-16 side-column directive: Collapse Jog Buttons +
-            fullscreen icon MOVED OUT of this header. They now sit at
-            the bottom of the RIGHT column inside JogControls, adjacent
-            to Orient Flange Down (see JogControls.collapseSlot). The
-            header keeps its 44 px minHeight so DISABLE/READY have
-            room; the right slot of the header stays empty. */}
-      </div>
+      }} data-testid="jog-chrome-header-empty" />
       {/* 2026-09-16 correction: no internal scrollbar. Children lay
           out at their natural size over the canvas — the 3D scene
           shows THROUGH every gap between controls. */}
@@ -464,11 +456,20 @@ export default function View3DLayout() {
             data-testid="jog-left-column-slot"
             style={{
               position: 'absolute',
-              left: 8, bottom: 8,
-              width: 220,
+              // 2026-09-16 LEFT column clip fix: bump inset from 8
+              // to 16 (24 on tablet-wide screens is comfortable but
+              // 16 keeps parity with the RIGHT slot) so step-size
+              // chips and Speed slider never touch x=0. Screenshot
+              // showed 'Step', 'Speed', 'moves while held', chips
+              // clipped at the viewport left edge — root cause was
+              // insufficient inset + the middle groups being pushed
+              // top by the 'Jog' heading before space-around could
+              // spread them.
+              left: 16, bottom: 16,
+              width: 240,
               height: isExpanded
-                ? 'calc(100% - 16px)'
-                : (panelHeight ? panelHeight - 16 : 424),
+                ? 'calc(100% - 32px)'
+                : (panelHeight ? panelHeight - 32 : 408),
               zIndex: 12,
               pointerEvents: 'auto',
               display: 'flex',
@@ -480,11 +481,11 @@ export default function View3DLayout() {
             data-testid="jog-right-column-slot"
             style={{
               position: 'absolute',
-              right: 8, bottom: 8,
-              width: 220,
+              right: 16, bottom: 16,
+              width: 240,
               height: isExpanded
-                ? 'calc(100% - 16px)'
-                : (panelHeight ? panelHeight - 16 : 424),
+                ? 'calc(100% - 32px)'
+                : (panelHeight ? panelHeight - 32 : 408),
               zIndex: 12,
               pointerEvents: 'auto',
               display: 'flex',
@@ -538,6 +539,16 @@ export default function View3DLayout() {
               //     the transform is inert when `expanded=false`.
               immersive
               expanded={isExpanded}
+              // 2026-09-16 LEFT column top slot: DISABLE + READY
+              // row moves here from the chrome header so it sits
+              // at the top of the LEFT column (mirrored by Orient
+              // Flange Down at the top of the RIGHT column).
+              leftTopSlot={
+                <>
+                  <ArmEnableControl />
+                  <JogReadyBadge />
+                </>
+              }
               rightSlot={jogApi
                 ? <OrientFlangeDownControl jogApi={jogApi} />
                 : null}

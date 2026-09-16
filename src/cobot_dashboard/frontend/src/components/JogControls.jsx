@@ -534,6 +534,13 @@ export default function JogControls({
   //     unchanged.
   immersive = false,
   expanded = false,
+  // 2026-09-16 LEFT-column cleanup directive: caller supplies the
+  // DISABLE/READY row (typically ArmEnableControl + JogReadyBadge)
+  // so it lives INSIDE the LEFT column top instead of the panel
+  // chrome header (which was creating a z-overlap with the "Jog"
+  // heading beneath it). Program-tab consumer passes null → the
+  // top slot slot renders nothing and the middle groups float up.
+  leftTopSlot = null,
 }) {
   const winW = (typeof window !== 'undefined') ? window.innerWidth : 1280
   const isTabletW = winW <= 1280
@@ -1079,86 +1086,117 @@ export default function JogControls({
           placement differs. Rendering `null` if the slot hasn't
           mounted yet is safe: the double-RAF in the effect above
           re-resolves the slot on next paint. */}
+      {/* 2026-09-16 LEFT column cleanup — 3-section flex layout so
+          the DISABLE/READY row pins to the top, the mode / step /
+          step-size groups spread with generous even spacing in the
+          middle, and the Speed slider pins to the bottom. Retired
+          from THIS surface (per operator order Sep-16):
+            * The 'Jog' heading — the controls below are self-
+              evident, and the heading was rendering z-under the
+              DISABLE button in the chrome header.
+            * The 'moves while held' / 'one step per press' caption
+              — inferable from Step/Continuous button selection.
+            * The 'wire N.NN — jog ceiling N% (operator order)'
+              hint line — kept as a `title` (tooltip) on the slider
+              for cheap discoverability; not rendered. */}
       {(() => {
+        const speedClamped = Math.min(speed, JOG_SLIDER_MAX_PCT)
+        const effClampedPct = Math.min(effectivePct, JOG_SLIDER_MAX_PCT)
+        const wireFrac = Math.min(speedClamped, effClampedPct) / 100
+        const wireHintTitle = `wire ${wireFrac.toFixed(2)} — jog ceiling ${effClampedPct}% (operator order)`
+                            + (speedClamped >= 50 ? ` — controller wall: ${_ctrlWall}` : '')
         const leftEl = (
       <div style={{
-        display: 'flex', flexDirection: 'column', gap: 10,
-        width: leftColW, flexShrink: 0,
+        display: 'flex', flexDirection: 'column',
+        width: leftColW,
+        // 2026-09-16 side-column FILL — inside the page-level slot
+        // (immersive) we want the column to occupy the slot's full
+        // height so top/middle/bottom pinning is meaningful. In the
+        // Program-tab inline layout, alignSelf:stretch inherits the
+        // parent flex-row height.
+        flex: immersive ? 1 : undefined,
         alignSelf: 'stretch',
-        justifyContent: 'space-around',
+        justifyContent: 'space-between',
+        boxSizing: 'border-box',
+        paddingLeft: 4, paddingRight: 4,
       }}>
-        <div style={{ fontSize: maximized ? 16 : 14, fontWeight: 700, color: '#111', textShadow: LABEL_TEXT_SHADOW }}>Jog</div>
-
-        {/* Frame: Joint vs Cartesian */}
-        <button
-          onClick={() => cartesianEnabled && setJogMode('cartesian')}
-          disabled={!cartesianEnabled}
-          title={cartesianEnabled ? undefined : 'Cartesian jog pending validation'}
-          style={modeBtnStyle(jogMode === 'cartesian', !cartesianEnabled)}
-        >
-          XYZ {cartesianEnabled ? '' : '(TBD)'}
-        </button>
-        <button onClick={() => setJogMode('joint')} style={modeBtnStyle(jogMode === 'joint')}>Joint</button>
-
-        {/* Press style: STEP vs CONTINUOUS. Applies to both frames. */}
-        <div style={{ marginTop: 2, display: 'flex', gap: 4 }}>
-          <button
-            onClick={() => setJogStyle('STEP')}
-            style={{
-              ...modeBtnStyle(jogStyle === 'STEP'),
-              minHeight: Math.max(36, modeMinH - 8),
-              fontSize: modeFont - 1,
-            }}>Step</button>
-          <button
-            onClick={() => setJogStyle('CONTINUOUS')}
-            style={{
-              ...modeBtnStyle(jogStyle === 'CONTINUOUS'),
-              minHeight: Math.max(36, modeMinH - 8),
-              fontSize: modeFont - 1,
-            }}>Continuous</button>
+        {/* TOP — caller-provided DISABLE + READY row. Program-tab
+            consumer passes null; slot then renders nothing and
+            middle groups float up. minHeight:44 mirrors the RIGHT
+            column Orient block for equal top-row heights. */}
+        <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6, minHeight: 44 }}>
+          {leftTopSlot}
         </div>
-        <div style={{ fontSize: 10, color: '#374151', marginTop: -4, fontWeight: 600, textShadow: LABEL_TEXT_SHADOW }}>
-          {jogStyle === 'STEP' ? 'one step per press' : 'moves while held'}
+        {/* MIDDLE — jog mode / press style / step size, distributed
+            evenly along the column's middle band. space-around gives
+            operator's requested generous even spacing via flex
+            distribution — the taller the slot, the wider the gaps. */}
+        <div style={{
+          flex: 1, minHeight: 0,
+          display: 'flex', flexDirection: 'column',
+          justifyContent: 'space-around',
+          paddingTop: 12, paddingBottom: 12,
+        }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <button
+              onClick={() => cartesianEnabled && setJogMode('cartesian')}
+              disabled={!cartesianEnabled}
+              title={cartesianEnabled ? undefined : 'Cartesian jog pending validation'}
+              style={modeBtnStyle(jogMode === 'cartesian', !cartesianEnabled)}
+            >
+              XYZ {cartesianEnabled ? '' : '(TBD)'}
+            </button>
+            <button onClick={() => setJogMode('joint')} style={modeBtnStyle(jogMode === 'joint')}>Joint</button>
+          </div>
+          <div style={{ display: 'flex', gap: 4 }}>
+            <button
+              onClick={() => setJogStyle('STEP')}
+              style={{
+                ...modeBtnStyle(jogStyle === 'STEP'),
+                minHeight: Math.max(36, modeMinH - 8),
+                fontSize: modeFont - 1,
+              }}>Step</button>
+            <button
+              onClick={() => setJogStyle('CONTINUOUS')}
+              style={{
+                ...modeBtnStyle(jogStyle === 'CONTINUOUS'),
+                minHeight: Math.max(36, modeMinH - 8),
+                fontSize: modeFont - 1,
+              }}>Continuous</button>
+          </div>
+          <div style={{ opacity: jogStyle === 'STEP' ? 1 : 0.4 }}>
+            <div style={{ fontSize: sectionLabelFont, fontWeight: 700, color: '#111', marginBottom: 6, textShadow: LABEL_TEXT_SHADOW }}>
+              Step Size {jogStyle === 'CONTINUOUS' && <span style={{ fontWeight: 500 }}>· speed controls motion</span>}
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {[0.1, 0.5, 1, 5, 10].map((s) => (
+                <button key={s}
+                  onClick={() => { if (jogStyle === 'STEP') setStep(s) }}
+                  disabled={jogStyle !== 'STEP'}
+                  style={{
+                    padding: maximized ? '10px 14px' : '8px 12px',
+                    fontSize: stepBtnFont, fontWeight: 600, borderRadius: 4,
+                    cursor: jogStyle === 'STEP' ? 'pointer' : 'not-allowed',
+                    minHeight: stepBtnH,
+                    background: step === s ? '#2563EB' : '#f3f4f6',
+                    color:      step === s ? '#fff'    : '#6b7280',
+                    border:     step === s ? 'none'    : '1px solid #e5e7eb',
+                  }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
+              ))}
+            </div>
+          </div>
         </div>
-
-        {/* Step Size — only interactive in STEP mode; greyed in CONTINUOUS. */}
-        <div style={{ marginTop: 4, opacity: jogStyle === 'STEP' ? 1 : 0.4 }}>
-          <div style={{ fontSize: sectionLabelFont, fontWeight: 700, color: '#111', marginBottom: 4, textShadow: LABEL_TEXT_SHADOW }}>
-            Step Size {jogStyle === 'CONTINUOUS' && <span style={{ fontWeight: 500 }}>· speed controls motion</span>}
+        {/* BOTTOM — Speed slider pinned to bottom edge with margin.
+            Speed:N% label stays; wire-hint line retired to slider
+            `title` (tooltip) per 2026-09-16 operator order. */}
+        <div style={{ flexShrink: 0, paddingBottom: 4 }} data-testid="jog-speed-group">
+          <div style={{ fontSize: speedFont, fontWeight: 700, color: '#111', marginBottom: 6, textShadow: LABEL_TEXT_SHADOW }}>
+            Speed: {speedClamped}%
           </div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-            {[0.1, 0.5, 1, 5, 10].map((s) => (
-              <button key={s}
-                onClick={() => { if (jogStyle === 'STEP') setStep(s) }}
-                disabled={jogStyle !== 'STEP'}
-                style={{
-                  padding: maximized ? '12px 16px' : '8px 12px',
-                  fontSize: stepBtnFont, fontWeight: 600, borderRadius: 4,
-                  cursor: jogStyle === 'STEP' ? 'pointer' : 'not-allowed',
-                  minHeight: stepBtnH,
-                  background: step === s ? '#2563EB' : '#f3f4f6',
-                  color:      step === s ? '#fff'    : '#6b7280',
-                  border:     step === s ? 'none'    : '1px solid #e5e7eb',
-                }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
-            ))}
-          </div>
-        </div>
-
-        <div>
-          <div style={{ fontSize: speedFont, fontWeight: 700, color: '#111', marginBottom: 4, textShadow: LABEL_TEXT_SHADOW }}>
-            Speed: {Math.min(speed, JOG_SLIDER_MAX_PCT)}%
-          </div>
-          {/* 2026-09-11 OPERATOR ORDER (supersedes same-day unlock):
-              slider max = 50 % so the display never promises speed
-              the wire won't deliver. Edition-independent — reads no
-              edition slice, calls no isFeatureEnabled; the same DOM
-              renders in Basic and Full. If the driver later publishes
-              a stricter effective_cap (< 50), the wire-hint line
-              names it, but the slider ceiling stays at 50 unless a
-              new operator directive raises it. */}
-          <input type="range" min={1} max={JOG_SLIDER_MAX_PCT} value={Math.min(speed, JOG_SLIDER_MAX_PCT)}
+          <input type="range" min={1} max={JOG_SLIDER_MAX_PCT} value={speedClamped}
             onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
             data-testid="jog-speed-slider"
+            title={wireHintTitle}
             style={{
               width: '100%', height: maximized ? 10 : 6,
               // 2026-09-16 zoom-capture — parent immersive root sets
@@ -1167,19 +1205,7 @@ export default function JogControls({
               // drag on the thumb, so opt back in for THIS element.
               touchAction: 'pan-x',
             }} />
-          <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 2 }}
-               data-testid="jog-speed-wire-hint">
-            {(() => {
-              const clampedSpeed = Math.min(speed, JOG_SLIDER_MAX_PCT)
-              const effClampedPct = Math.min(effectivePct, JOG_SLIDER_MAX_PCT)
-              const wireFrac = Math.min(clampedSpeed, effClampedPct) / 100
-              const ctrlTail = clampedSpeed >= 50 ? ` — controller wall: ${_ctrlWall}` : ''
-              return `wire ${wireFrac.toFixed(2)} — jog ceiling ${effClampedPct}% (operator order)${ctrlTail}`
-            })()}
-          </div>
         </div>
-
-        <div style={{ flex: 1 }} />
       </div>
         )
         return immersive

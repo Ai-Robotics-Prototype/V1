@@ -361,12 +361,18 @@ def test_jog_buttons_use_uniform_primary_blue():
 
 def test_loose_labels_have_text_shadow_for_over_3d_readability():
     """2026-09-16 correction: labels that sit directly over the 3D
-    scene ('Jog', 'Position/Height/Rotation', 'Step Size', 'Speed:',
-    'moves while held' / 'one step per press') carry a compact
-    white text-shadow so they stay readable on any floor tone
-    without needing a large panel behind them. Shared constant
-    LABEL_TEXT_SHADOW pins the treatment so future edits can't
-    silently drop the shadow.
+    scene ('Position/Height/Rotation', 'Step Size', 'Speed:')
+    carry a compact white text-shadow so they stay readable on any
+    floor tone without needing a large panel behind them. Shared
+    constant LABEL_TEXT_SHADOW pins the treatment so future edits
+    can't silently drop the shadow.
+
+    2026-09-16 LEFT-column cleanup UPDATE (operator order): the
+    'Jog' heading, the 'moves while held' / 'one step per press'
+    caption, and the wire-hint line below the Speed slider are
+    RETIRED from this surface — they were the 4th/5th/6th
+    LABEL_TEXT_SHADOW consumers. The threshold below is lowered
+    to match: declaration + padLabel + Step Size + Speed: = 4.
     """
     src = _read(JOG)
     assert 'const LABEL_TEXT_SHADOW' in src, (
@@ -380,15 +386,12 @@ def test_loose_labels_have_text_shadow_for_over_3d_readability():
     assert 'LABEL_TEXT_SHADOW' in pad_body, (
         'padLabel (Position / Height / Rotation) must render with '
         'LABEL_TEXT_SHADOW')
-    # Other loose labels must reference it too. Count occurrences:
-    # padLabel + 'Jog' heading + 'moves while held/one step per press'
-    # + 'Step Size' + 'Speed:' = at least 5 usages.
+    # Remaining loose-label consumers: padLabel + Step Size + Speed:
     uses = src.count('LABEL_TEXT_SHADOW')
-    # 1 declaration + at least 5 applications = >= 6.
-    assert uses >= 6, (
+    assert uses >= 4, (
         f'LABEL_TEXT_SHADOW referenced only {uses} times — expected '
-        f'>= 6 (declaration + Jog heading + padLabel + hint + '
-        f'Step Size + Speed:); a loose label lost its treatment')
+        f'>= 4 (declaration + padLabel + Step Size + Speed:); a '
+        f'loose label lost its treatment')
 
 
 def test_disabled_state_still_dimmed_via_hold_button():
@@ -952,18 +955,21 @@ def test_side_column_layout_spread_and_collapse_relocation():
         'panelHeight must recompute on window resize + orientation '
         'change — side-column spread must track viewport dims')
 
-    # (b) LEFT column spread (space-around or space-between).
+    # (b) LEFT column spread. 2026-09-16 LEFT-column-cleanup UPDATE:
+    # the OUTER LEFT column is now a 3-section flex (TOP slot /
+    # MIDDLE groups / BOTTOM speed) using space-BETWEEN so DISABLE/
+    # READY pin to the top and Speed slider pins to the bottom;
+    # the MIDDLE wrapper uses space-around for the operator's
+    # generous even spacing. Accept either at the outer level.
     left_idx = jog.find('LEFT — mode, step, speed')
     assert left_idx != -1
-    style_open  = jog.rfind('style={{', 0, left_idx + 200)
-    # Nothing — the marker is a comment; find the style AFTER it.
     style_open = jog.find('style={{', left_idx)
     style_close = jog.find('}}', style_open)
     left_style = jog[style_open:style_close]
     assert re.search(
-        r"justifyContent:\s*'space-around'", left_style), (
-        "LEFT column must use justifyContent:'space-around' for "
-        'vertical spread up the left edge (was flex-start)')
+        r"justifyContent:\s*'space-(around|between)'", left_style), (
+        "LEFT column outer must use space-around or space-between "
+        'for the 3-section pin (top / middle-distributed / bottom)')
 
     # (c) JogControls accepts collapseSlot.
     assert 'collapseSlot = null' in jog, (
@@ -1244,7 +1250,9 @@ def test_page_level_slot_dims_track_panel_height():
         slot_id = f'id="jog-{side}-column-slot"'
         idx = layout.find(slot_id)
         assert idx != -1, f'slot {slot_id} must be present'
-        block = layout[idx:idx + 700]
+        # Window wide enough to cover the style block + any inline
+        # documentation comments interleaved with the CSS keys.
+        block = layout[idx:idx + 1400]
         assert re.search(r"position:\s*'absolute'", block), (
             f'{side} slot must be absolute-positioned')
         assert re.search(r"pointerEvents:\s*'auto'", block), (
@@ -1267,3 +1275,185 @@ def test_page_level_slot_dims_track_panel_height():
         'slot divs MUST be gated on !isMinimized so they only exist '
         'while the JogControls tree is mounted (otherwise the '
         'portal targets are unreachable and React logs warnings)')
+
+
+def test_jog_heading_and_captions_retired_from_left_column():
+    """2026-09-16 LEFT-column-cleanup operator order: the 'Jog'
+    heading (which rendered z-under the DISABLE button in the old
+    chrome header), the 'moves while held' / 'one step per press'
+    caption, and the wire-hint line below the Speed slider are
+    RETIRED from the LEFT column. Kept: 'Step Size' + 'Speed:'
+    (these ARE the labels operator explicitly preserved).
+    """
+    src = _read(JOG)
+    # Retired renders. Strip JSX block comments and //-line comments
+    # before searching so the retirement-note documentation (which
+    # deliberately names the retired strings) doesn't false-positive.
+    left_marker = src.find('LEFT — mode, step, speed')
+    assert left_marker != -1
+    center_marker = src.find('CENTER — jog arrow pads', left_marker)
+    assert center_marker != -1
+    raw_block = src[left_marker:center_marker]
+    left_block = re.sub(r'\{/\*.*?\*/\}', '', raw_block, flags=re.DOTALL)
+    left_block = re.sub(r'/\*.*?\*/', '', left_block, flags=re.DOTALL)
+    left_block = '\n'.join(
+        line for line in left_block.splitlines()
+        if not line.lstrip().startswith('//'))
+    assert '>Jog<' not in left_block, (
+        "'Jog' heading must be retired from the LEFT column per "
+        '2026-09-16 operator order (it was z-clashing with the '
+        'DISABLE button in the old chrome header)')
+    assert 'moves while held' not in left_block, (
+        "'moves while held' caption retired — inferable from "
+        'Step / Continuous button selection')
+    assert 'one step per press' not in left_block, (
+        "'one step per press' caption retired — inferable from "
+        'Step / Continuous button selection')
+    # Kept labels — pin so a future edit doesn't accidentally
+    # collapse the whole label vocabulary.
+    assert 'Step Size' in left_block, (
+        "'Step Size' label kept — operator directive to preserve "
+        'the section labels that name what the chips do')
+    assert 'Speed:' in left_block, (
+        "'Speed:' slider label kept above the slider — operator "
+        'directive')
+
+
+def test_wire_hint_retired_from_surface_moved_to_slider_title():
+    """The wire-hint line (`wire N.NN — jog ceiling N% (operator
+    order)`) is no longer rendered on the surface. It survives as
+    the slider's `title` attribute so devtools + hover still
+    surface the calculation without cluttering the panel.
+    """
+    src = _read(JOG)
+    # The old testid MUST be gone from the render — nothing may
+    # carry data-testid="jog-speed-wire-hint" as a rendered node.
+    assert 'data-testid="jog-speed-wire-hint"' not in src, (
+        'jog-speed-wire-hint testid must be RETIRED — the operator '
+        'order deletes the on-surface hint line entirely')
+    # The wireHintTitle string must still be computed and attached
+    # to the slider as a title attribute.
+    assert 'const wireHintTitle' in src, (
+        'wireHintTitle must still be computed — even though the '
+        'render site retired, the string is now attached to the '
+        'slider as title="" for tooltip / devtools discoverability')
+    slider_idx = src.find('data-testid="jog-speed-slider"')
+    assert slider_idx != -1
+    slider_block = src[max(0, slider_idx - 300):slider_idx + 300]
+    assert 'title={wireHintTitle}' in slider_block, (
+        'Speed slider must carry title={wireHintTitle} so the hint '
+        'is still discoverable via tooltip / hover')
+
+
+def test_disable_ready_row_moved_from_header_to_left_top_slot():
+    """2026-09-16 LEFT-column-cleanup: DISABLE + READY move OUT of
+    the RealArmChrome header (which now collapses to 0) INTO the
+    LEFT column top slot via JogControls.leftTopSlot. This mirrors
+    the RIGHT column's Orient Flange Down (which is already at the
+    top via rightSlot), per operator order that top-row heights
+    match across the two columns.
+    """
+    jog    = _read(JOG)
+    layout = _read(LAYOUT)
+
+    # JogControls signature accepts leftTopSlot.
+    assert 'leftTopSlot = null' in jog, (
+        'JogControls must declare leftTopSlot=null prop — the LEFT '
+        'column caller-supplied top row')
+    # LEFT column renders leftTopSlot inside its TOP wrapper (with
+    # a 44 px min height so DISABLE/READY have the same visual
+    # height as the RIGHT column's Orient block).
+    left_marker = jog.find('LEFT — mode, step, speed')
+    center_marker = jog.find('CENTER — jog arrow pads', left_marker)
+    left_block = jog[left_marker:center_marker]
+    assert '{leftTopSlot}' in left_block, (
+        'LEFT column TOP wrapper must render {leftTopSlot} so the '
+        'caller (View3DLayout) can inject DISABLE + READY')
+    assert re.search(r"minHeight:\s*44", left_block), (
+        'LEFT column TOP wrapper must set minHeight:44 so it '
+        'matches the RIGHT column Orient block height '
+        '(mirrored top rows per operator directive)')
+
+    # View3DLayout passes leftTopSlot with ArmEnableControl + Badge.
+    jc_idx = layout.find('<JogControls')
+    jc_block = layout[jc_idx:jc_idx + 1200]
+    assert 'leftTopSlot={' in jc_block, (
+        'View3DLayout must pass leftTopSlot to JogControls '
+        '(containing ArmEnableControl + JogReadyBadge)')
+    assert '<ArmEnableControl' in jc_block, (
+        'leftTopSlot must contain <ArmEnableControl /> (moved from '
+        'the chrome header)')
+    assert '<JogReadyBadge' in jc_block, (
+        'leftTopSlot must contain <JogReadyBadge /> (moved from '
+        'the chrome header)')
+
+    # The chrome header (now empty) must NOT still render either
+    # component. The chrome-header-empty testid marks the retired
+    # container.
+    assert 'data-testid="jog-chrome-header-empty"' in layout, (
+        'chrome header must render an empty div with the '
+        'jog-chrome-header-empty testid — the marker that DISABLE '
+        'moved out and no controls remain')
+
+
+def test_left_column_pins_speed_slider_to_bottom():
+    """Speed slider is the LAST element of the LEFT column and
+    pins to the bottom edge (space-between at the outer level +
+    Speed inside a flexShrink:0 BOTTOM wrapper). This gives the
+    slider a stable position operator can reach without hunting.
+    """
+    jog = _read(JOG)
+    left_marker = jog.find('LEFT — mode, step, speed')
+    center_marker = jog.find('CENTER — jog arrow pads', left_marker)
+    left_block = jog[left_marker:center_marker]
+
+    # jog-speed-group testid marks the BOTTOM wrapper.
+    assert 'data-testid="jog-speed-group"' in left_block, (
+        'Speed group must carry data-testid="jog-speed-group" so '
+        'pins can find the bottom-pinned block')
+    # Bottom wrapper is a flexShrink:0 div right before the outer
+    # closing tag. Assert the speed group renders AFTER the middle
+    # wrapper's step-size chips in source order (i.e., the pin-to-
+    # bottom order).
+    step_size_idx = left_block.find("'Step Size'")
+    speed_group_idx = left_block.find('data-testid="jog-speed-group"')
+    # 'Step Size' as text lives inline; if that lookup misses use
+    # the stepBtnH landmark instead.
+    if step_size_idx == -1:
+        step_size_idx = left_block.find('Step Size ')
+    assert step_size_idx != -1
+    assert speed_group_idx > step_size_idx, (
+        'Speed group must render AFTER the step-size chips in source '
+        'order so the outer flex space-between pins it to the '
+        'bottom of the LEFT column')
+
+
+def test_slot_insets_widen_to_prevent_left_edge_clip():
+    """2026-09-16 LEFT-column-cleanup: slot inset bumped from
+    left:8 / bottom:8 / width:220 to left:16 / bottom:16 /
+    width:240 so step-size chips + Speed slider never touch x=0
+    (screenshot showed the chips clipped at the viewport left
+    edge). RIGHT slot mirrors the same widened inset.
+    """
+    layout = _read(LAYOUT)
+    for side in ('left', 'right'):
+        slot_id = f'id="jog-{side}-column-slot"'
+        idx = layout.find(slot_id)
+        assert idx != -1
+        block = layout[idx:idx + 800]
+        # Inset MUST be >= 16 px (widened per operator screenshot).
+        edge = 'left' if side == 'left' else 'right'
+        m = re.search(fr"{edge}:\s*(\d+)", block)
+        assert m is not None and int(m.group(1)) >= 16, (
+            f'{side} slot {edge} inset must be >= 16 px (was 8) '
+            f'per 2026-09-16 clip fix')
+        # Bottom inset >= 16.
+        mb = re.search(r"bottom:\s*(\d+)", block)
+        assert mb is not None and int(mb.group(1)) >= 16, (
+            f'{side} slot bottom inset must be >= 16 px')
+        # Width >= 240 so the chip row fits without wrapping past
+        # the visible area.
+        mw = re.search(r"width:\s*(\d+)", block)
+        assert mw is not None and int(mw.group(1)) >= 240, (
+            f'{side} slot width must be >= 240 px so the LEFT '
+            f'chip row and RIGHT Orient button never overflow')

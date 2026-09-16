@@ -69,27 +69,32 @@ test('flow(a): RealArmChrome outer honors a viewport-aware height with a 440 flo
 })
 
 
-test('flow(b): jog surface header reserves an explicit minimum height', () => {
+test('flow(b): chrome header collapses to 0 — DISABLE/READY moved to LEFT top slot', () => {
+  // 2026-09-16 LEFT-column-cleanup operator order: DISABLE + READY
+  // moved OUT of the RealArmChrome header INTO the LEFT column top
+  // slot (JogControls.leftTopSlot). The chrome header now has no
+  // content and collapses to 0. The 44 px minHeight anchor from
+  // the previous version of this pin is superseded — the DISABLE
+  // row is now anchored by the LEFT column's `minHeight: 44` top
+  // wrapper instead. This pin ensures the header doesn't quietly
+  // regain child controls in a future edit (which would re-create
+  // the z-overlap that motivated this cleanup).
   const src = readSrc('layouts/View3DLayout.jsx')
 
-  // The header row lives inside RealArmChrome and uses padding '5px 8px'
-  // as a stable landmark. Snip out that div's inline style object.
-  const headerAnchor = src.indexOf('padding: \'5px 8px\'')
-  assert.notEqual(headerAnchor, -1,
-    v('RealArmChrome header row landmark not found'))
-
-  // Grab the surrounding style object braces.
-  const styleOpen = src.lastIndexOf('style={{', headerAnchor)
-  const styleClose = src.indexOf('}}', headerAnchor)
-  const styleBlock = src.slice(styleOpen, styleClose)
-
-  assert.match(styleBlock, /flexShrink:\s*0/,
-    v('jog surface header must be flex-shrink:0 to reserve its own space '
-      + 'in the RealArmChrome flex column'))
-  assert.match(styleBlock, /minHeight:\s*44/,
-    v('jog surface header must declare an explicit minHeight (44px) so '
-      + 'it never collapses below its control heights on narrow tablets '
-      + '— the DISABLE/READY row is the anchor controls below flow from'))
+  assert.match(src, /data-testid="jog-chrome-header-empty"/,
+    v('chrome header must render an empty div with the '
+      + 'jog-chrome-header-empty testid — the marker for the '
+      + 'DISABLE-moved-out-of-header contract'))
+  // Header block must NOT reference ArmEnableControl or JogReadyBadge
+  // any more (they now live inside JogControls.leftTopSlot).
+  const emptyIdx = src.indexOf('data-testid="jog-chrome-header-empty"')
+  const before = src.slice(Math.max(0, emptyIdx - 800), emptyIdx)
+  assert.doesNotMatch(before, /<ArmEnableControl\s*\/>/,
+    v('ArmEnableControl must not render inside the chrome header any '
+      + 'more — it moved to JogControls.leftTopSlot'))
+  assert.doesNotMatch(before, /<JogReadyBadge\s*\/>/,
+    v('JogReadyBadge must not render inside the chrome header any '
+      + 'more — it moved to JogControls.leftTopSlot'))
 })
 
 
