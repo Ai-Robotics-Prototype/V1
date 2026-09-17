@@ -144,34 +144,37 @@ export default function View3DLayout() {
     }
   }, [])
 
-  // 2026-09-17 tablet-field-report — MEASURED fitScale for the pad
-  // cluster. The prior width-matrix pin passed while the tablet
-  // clipped: the model was wrong (assumed 150/200 slot widths,
-  // symmetric centering, isTabletPortrait breakpoint firing on
-  // mount — any one broken assumption ⇒ silent clip). This
-  // measured approach computes the ACTUAL space between the LEFT
-  // and RIGHT slot elements at runtime and derives a transform
-  // scale that guarantees the natural cluster width fits inside
-  // it. Clipping becomes STRUCTURALLY IMPOSSIBLE at any viewport,
-  // regardless of which breakpoint fires or whether the slots
-  // rendered at their nominal widths.
+  // 2026-09-17 UNIFIED FIT — normal AND expand modes use the SAME
+  // measurement rule (operator directive #3, tablet field report):
   //
-  // Asymmetric variant: the pad-cluster overlay is positioned at
-  // viewport-center (left:50%), so the natural cluster is centered
-  // on viewportW/2, NOT on the midpoint of the available inter-
-  // column space. Compute independent left/right permissible
-  // scales and take the min:
+  //   scale = max(MIN_FIT_SCALE,
+  //               min(cap, availW/naturalW, availH/naturalH))
+  //
+  // where cap = 1 in normal, EXPAND_MAX (1.6) in expand mode.
+  // Clipping becomes MATHEMATICALLY IMPOSSIBLE because the scale
+  // is derived from the same rects the browser paints. No modeled
+  // widths, no breakpoints — three prior modeled attempts each
+  // clipped on a device the pin claimed was fine.
+  //
+  // Asymmetric width: the overlay is centered on viewport-center
+  // (left:50% translateX(-50%)), so the natural cluster centers on
+  // viewportW/2, NOT on the midpoint of available inter-column
+  // space. Independent left/right permissible scales, min wins:
   //   halfLeft  = viewportW/2 − leftSlot.right  − margin
   //   halfRight = rightSlot.left − viewportW/2  − margin
-  //   fitScale = min(1, 2·halfLeft/naturalW, 2·halfRight/naturalW)
+  //   sWidth    = min(2·halfLeft/naturalW, 2·halfRight/naturalW)
+  // Height: naturalH bounded by (viewport − top headroom − bottom margin):
+  //   sHeight   = availableH / naturalH
+  const EXPAND_MAX = 1.6
   const [fitScale, setFitScale] = useState(1)
   const [dbg, setDbg] = useState(null)   // debug chip payload
   const debugCluster = (typeof window !== 'undefined'
       && window.location && window.location.search
-      && window.location.search.indexOf('debug=cluster') >= 0)
+      && window.location.search.indexOf('debug=1') >= 0)
   useEffect(() => {
     const FIT_MARGIN_PX = 8
-    const MIN_FIT_SCALE = 0.3    // floor so buttons stay usable
+    const TOP_HEADROOM  = 80   // below view-preset row + MinClearanceReadout
+    const MIN_FIT_SCALE = 0.3  // floor so buttons stay usable
     let raf1 = null
     let raf2 = null
     const measure = () => {
@@ -182,25 +185,32 @@ export default function View3DLayout() {
       if (!leftSlot || !rightSlot || !scaler) return
       const lr = leftSlot.getBoundingClientRect()
       const rr = rightSlot.getBoundingClientRect()
-      const naturalW = scaler.offsetWidth   // LAYOUT width — transforms don't affect this
-      const viewportW = window.innerWidth || 1280
+      const naturalW = scaler.offsetWidth    // LAYOUT — unaffected by transform
+      const naturalH = scaler.offsetHeight
+      const viewportW = window.innerWidth  || 1280
+      const viewportH = window.innerHeight || 800
       const vc = viewportW / 2
-      if (naturalW <= 0) return
+      if (naturalW <= 0 || naturalH <= 0) return
       const halfLeft  = vc - lr.right - FIT_MARGIN_PX
       const halfRight = rr.left - FIT_MARGIN_PX - vc
+      const availableH = viewportH - TOP_HEADROOM - FIT_MARGIN_PX * 2
       const sLeft  = (halfLeft  * 2) / naturalW
       const sRight = (halfRight * 2) / naturalW
+      const sHeight = availableH / naturalH
+      const cap = isExpanded ? EXPAND_MAX : 1
       const next = Math.max(MIN_FIT_SCALE,
-        Math.min(1, sLeft, sRight))
+        Math.min(cap, sLeft, sRight, sHeight))
       setFitScale((prev) => (Math.abs(prev - next) > 0.005 ? next : prev))
       if (debugCluster) {
         setDbg({
-          viewportW,
+          innerW: viewportW, innerH: viewportH,
           leftSlotRight: Math.round(lr.right),
           rightSlotLeft: Math.round(rr.left),
-          available: Math.round(rr.left - lr.right - 2 * FIT_MARGIN_PX),
+          availableW: Math.round(rr.left - lr.right - 2 * FIT_MARGIN_PX),
+          availableH: Math.round(availableH),
           naturalW: Math.round(naturalW),
-          scale: next.toFixed(3),
+          naturalH: Math.round(naturalH),
+          cap, scale: next.toFixed(3),
         })
       }
     }
@@ -215,15 +225,21 @@ export default function View3DLayout() {
       })
     }
     schedule()
+    // PWA standalone launch fires visibilitychange when the page
+    // reveals; recompute so the launch-time viewport is measured
+    // (not the pre-launch cached numbers).
+    const onVis = () => { if (!document.hidden) schedule() }
+    document.addEventListener('visibilitychange', onVis)
     window.addEventListener('resize', schedule)
     window.addEventListener('orientationchange', schedule)
     return () => {
+      document.removeEventListener('visibilitychange', onVis)
       if (raf1) cancelAnimationFrame(raf1)
       if (raf2) cancelAnimationFrame(raf2)
       window.removeEventListener('resize', schedule)
       window.removeEventListener('orientationchange', schedule)
     }
-  }, [debugCluster])
+  }, [debugCluster, isExpanded])   // recompute when expand toggles → cap flips 1↔1.6
 
   // 2026-09-16 default-framing (measured) — visibleTopFrac derived
   // from the REAL jog-surface bounds at runtime. `panelRef` points
@@ -413,12 +429,14 @@ export default function View3DLayout() {
           none keeps orbit unaffected. */}
       <MinClearanceReadout />
 
-      {/* 2026-09-17 tablet-field-report DEBUG chip — enable with
-          `?debug=cluster` in the URL. Small top-center overlay
-          shows the real numbers the fitScale computation reads
-          from the device (viewport, slot rects, cluster natural
-          width, computed scale). Retire this chip once operator
-          confirms both orientations are clip-free on the tablet. */}
+      {/* 2026-09-17 UNIFIED FIT DEBUG chip — enable with `?debug=1`
+          in the URL. Top-center overlay reports the numbers the
+          fit-formula reads from the device (innerW/H, slot rects,
+          available W/H, natural W/H, cap, applied scale). Retire
+          once operator confirms tablet portrait+landscape AND
+          desktop normal+expand. Flag renamed cluster → 1 per
+          2026-09-17 UNIFIED FIT directive (session convention:
+          `?debug=1` for the ONE debug surface). */}
       {debugCluster && dbg && (
         <div
           data-testid="cluster-fit-debug"
@@ -432,8 +450,9 @@ export default function View3DLayout() {
             borderRadius: 4, pointerEvents: 'none',
             whiteSpace: 'nowrap',
           }}>
-          vw={dbg.viewportW}  L.r={dbg.leftSlotRight}  R.l={dbg.rightSlotLeft}
-          {' '}avail={dbg.available}  natural={dbg.naturalW}  scale={dbg.scale}
+          inner={dbg.innerW}×{dbg.innerH}  L.r={dbg.leftSlotRight}  R.l={dbg.rightSlotLeft}
+          {' '}availW={dbg.availableW}  availH={dbg.availableH}
+          {' '}nat={dbg.naturalW}×{dbg.naturalH}  cap={dbg.cap}  scale={dbg.scale}
         </div>
       )}
 

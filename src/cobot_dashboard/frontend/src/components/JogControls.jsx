@@ -1333,15 +1333,19 @@ export default function JogControls({
         <div
           data-testid="jog-center-cluster-scaler"
           style={{
-            // 2026-09-17 composed scale: fitScale (measured, ≤1)
-            // × expandScale (1.6 when EXPANDED, else 1). fitScale
-            // guarantees the visual cluster fits between the
-            // rendered LEFT/RIGHT columns at any viewport width.
-            // Passthrough when both are neutral to preserve the
-            // Program-tab consumer's zero-transform layout.
-            transform: (fitScale === 1 && !expanded)
+            // 2026-09-17 UNIFIED FIT: fitScale is now the ONE
+            // authoritative scale, computed by View3DLayout as
+            //   max(MIN_FIT_SCALE, min(cap, sLeft, sRight, sHeight))
+            // where cap = 1 (normal) or EXPAND_MAX 1.6 (expand).
+            // No more composition with expand — the caller has
+            // already folded the mode cap into the measurement,
+            // guaranteeing the visual cluster fits at BOTH modes.
+            // Passthrough (transform:none) when fitScale is
+            // exactly 1 (Program-tab consumer with fitScale=1
+            // default, and desktop normal at natural size).
+            transform: fitScale === 1
               ? 'none'
-              : `scale(${(fitScale * (expanded ? 1.6 : 1)).toFixed(4)})`,
+              : `scale(${fitScale.toFixed(4)})`,
             transformOrigin: 'center bottom',
             transition: 'transform 120ms ease-out',
             display: 'flex', justifyContent: 'center', alignItems: 'center',

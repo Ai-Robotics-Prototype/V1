@@ -1177,17 +1177,25 @@ def test_expand_scales_only_center_cluster():
         'CENTER pad cluster must wrap in a testid-anchored div '
         '(jog-center-cluster-scaler) so pins can pin the scaler')
 
-    # 2026-09-17 UPDATE: scale is now composed — fitScale (measured)
-    # × expandScale (1.6 when EXPANDED, else 1). The static
-    # `expanded ? scale(1.6) : none` pattern is superseded by the
-    # measured template literal, but the load-bearing invariant
-    # (expand multiplier = 1.6 gated on expanded) is preserved.
+    # 2026-09-17 UNIFIED FIT UPDATE (supersedes the composed
+    # `fitScale × (expanded ? 1.6 : 1)` variant): the mode cap
+    # (EXPAND_MAX = 1.6 for expand, 1 for normal) is now folded
+    # into fitScale by View3DLayout's Math.min. The scaler
+    # transform is `scale(fitScale)` directly. The load-bearing
+    # invariant — cap = 1.6 in expand mode — is pinned in
+    # View3DLayout via test_pad_cluster_fits_viewport_at_tablet_widths.
     scaler_idx = jog.rfind('data-testid="jog-center-cluster-scaler"')
-    scaler_block = jog[scaler_idx:scaler_idx + 1200]
+    scaler_block = jog[scaler_idx:scaler_idx + 1600]
     assert re.search(
-        r"expanded\s*\?\s*1\.6\s*:\s*1", scaler_block), (
-        'scaler transform must include an `expanded ? 1.6 : 1` '
-        'multiplier — arrangement preserved, exit restores exactly')
+        r"transform:\s*fitScale\s*===\s*1\s*\?\s*'none'\s*:\s*"
+        r"`scale\(\$\{fitScale\.toFixed\(4\)\}\)`",
+        scaler_block), (
+        'scaler transform must be scale(fitScale) directly (no '
+        'expand composition after min) per 2026-09-17 UNIFIED FIT')
+    assert 'const EXPAND_MAX = 1.6' in layout, (
+        'EXPAND_MAX = 1.6 constant must be declared in View3DLayout — '
+        'the expand-mode cap in the unified-fit formula (arrangement '
+        'preserved, exit restores exactly)')
     assert re.search(
         r"transformOrigin:\s*'center", scaler_block), (
         "scaler transformOrigin must anchor at 'center' so pads "
@@ -1768,100 +1776,150 @@ def test_collapsed_expanded_style_parity():
 
 
 def test_pad_cluster_fits_viewport_at_tablet_widths():
-    """2026-09-17 tablet-field-report SECOND PASS: the previous
-    computed-width pin passed while the tablet clipped in the
-    field, proving the model was wrong (assumed slot widths /
-    breakpoint firing / symmetric centering — any one broken
-    ⇒ silent clip). Retired the modeled matrix; replaced with a
-    MEASURED-FORMULA pin. The load-bearing invariant is now that
-    View3DLayout runs a runtime measurement using
-    getBoundingClientRect on the LEFT + RIGHT slot elements + the
-    scaler's offsetWidth, derives a fitScale, and JogControls
-    composes it into the scaler transform. Clipping becomes
-    STRUCTURALLY IMPOSSIBLE regardless of viewport / breakpoint.
+    """2026-09-17 UNIFIED FIT (third pass — supersedes prior
+    modeled matrices AND the composed fitScale×cap approach that
+    overflowed on desktop-expand). Operator directive after three
+    device failures — ONE rule, both modes:
+
+      scale = max(MIN_FIT_SCALE,
+                  min(cap, sLeft, sRight, sHeight))
+
+    where cap = 1 in normal, EXPAND_MAX (1.6) in expand, and every
+    ratio comes from getBoundingClientRect / offsetWidth. No
+    modeled widths, no breakpoints. Scaler transform uses
+    `scale(fitScale)` DIRECTLY — the mode cap is folded into
+    fitScale, never multiplied on top afterwards.
     """
     jog = _read(JOG)
     layout = _read(LAYOUT)
 
-    # 1. JogControls accepts fitScale prop, defaults 1.
-    assert 'fitScale = 1' in jog, (
-        'JogControls must declare fitScale=1 default — the caller '
-        'passes a measured value in [MIN_FIT_SCALE, 1]')
+    # 1. JogControls accepts fitScale prop, default 1.
+    assert 'fitScale = 1' in jog
 
-    # 2. Scaler transform composes fitScale × expand scale.
+    # 2. Scaler transform uses fitScale DIRECTLY (no × cap).
     scaler_idx = jog.rfind('data-testid="jog-center-cluster-scaler"')
     assert scaler_idx != -1
-    scaler_block = jog[scaler_idx:scaler_idx + 1200]
+    scaler_block = jog[scaler_idx:scaler_idx + 1600]
     assert re.search(
-        r"scale\(\$\{\(fitScale\s*\*\s*\(expanded\s*\?\s*1\.6\s*:\s*1\)\)",
+        r"transform:\s*fitScale\s*===\s*1\s*\?\s*'none'\s*:\s*"
+        r"`scale\(\$\{fitScale\.toFixed\(4\)\}\)`",
         scaler_block), (
-        'scaler transform must compose fitScale × expandScale — '
-        "`scale(${(fitScale * (expanded ? 1.6 : 1)).toFixed(4)})`")
+        'scaler transform must be `fitScale === 1 ? none : '
+        'scale(${fitScale.toFixed(4)})` — no `* (expanded ? 1.6 : 1)` '
+        'composition (the composition was the desktop-expand-overflow '
+        'root cause)')
 
-    # 3. View3DLayout runs the measured fitScale computation and
-    # passes it to JogControls.
-    assert 'fitScale={fitScale}' in layout, (
-        'View3DLayout must pass fitScale={fitScale} to JogControls '
-        '(the MEASURED-not-modeled seam)')
-    # The measurement reads bounding boxes of the two slots + scaler.
-    assert re.search(
-        r"document\.querySelector\('\[data-testid=\"jog-left-column-slot\"\]'\)",
-        layout), (
-        'fitScale measurement must querySelector the LEFT slot at runtime — '
-        "not model its width")
-    assert re.search(
-        r"document\.querySelector\('\[data-testid=\"jog-right-column-slot\"\]'\)",
-        layout), (
-        'fitScale measurement must querySelector the RIGHT slot at runtime')
-    assert re.search(
-        r"document\.querySelector\('\[data-testid=\"jog-center-cluster-scaler\"\]'\)",
-        layout), (
-        'fitScale measurement must querySelector the scaler at runtime')
+    # 3. View3DLayout passes fitScale to JogControls + measures via
+    # querySelector on the three anchors.
+    assert 'fitScale={fitScale}' in layout
+    for testid in ('jog-left-column-slot', 'jog-right-column-slot',
+                   'jog-center-cluster-scaler'):
+        assert re.search(
+            r"document\.querySelector\('\[data-testid=\"" + testid + r"\"\]'\)",
+            layout), f'measurement must querySelector [{testid}]'
     assert 'getBoundingClientRect()' in layout
-    assert 'offsetWidth' in layout, (
-        'natural cluster width must be read via scaler.offsetWidth — '
-        'this is layout width unaffected by the transform')
+    assert 'offsetWidth' in layout and 'offsetHeight' in layout, (
+        'natural cluster W AND H must be read via scaler.offsetWidth / '
+        '.offsetHeight (layout dims, unaffected by transform)')
 
-    # 4. Asymmetric permissible-scale formula (independent left/right
-    # since the overlay is centered on viewport-center, not the
-    # midpoint of the available inter-column space).
+    # 4. Asymmetric width halves + height availability.
     assert 'halfLeft' in layout and 'halfRight' in layout, (
-        'measurement must compute halfLeft + halfRight around the '
-        'viewport center so the fitScale respects an off-center '
-        'available space (e.g., when the RIGHT column extends further '
-        'in from the edge than the LEFT does)')
-    assert re.search(
-        r"Math\.min\(1,\s*sLeft,\s*sRight\)", layout), (
-        'fitScale must be `Math.min(1, sLeft, sRight)` where sLeft = '
-        '2·halfLeft/naturalW and sRight = 2·halfRight/naturalW — this '
-        'is the ONLY value that guarantees no clip at either edge')
+        'width must use halfLeft + halfRight around viewport-center')
+    for var in ('naturalH', 'availableH', 'sHeight'):
+        assert var in layout, (
+            f'unified-fit formula must include `{var}` — the height '
+            f'ratio guarantees the cluster fits vertically')
 
-    # 5. Recompute on resize + orientationchange (tablet rotate).
-    fit_effect_idx = layout.find('MEASURED fitScale')
+    # 5. Cap declaration + ONE Math.min across cap + all four ratios.
+    assert 'const EXPAND_MAX = 1.6' in layout, (
+        'EXPAND_MAX constant (1.6) must be declared')
+    assert re.search(
+        r"cap\s*=\s*isExpanded\s*\?\s*EXPAND_MAX\s*:\s*1", layout), (
+        'cap must be `isExpanded ? EXPAND_MAX : 1`')
+    assert re.search(
+        r"Math\.min\(\s*cap\s*,\s*sLeft\s*,\s*sRight\s*,\s*sHeight\s*\)",
+        layout), (
+        'fitScale MUST be Math.min(cap, sLeft, sRight, sHeight) — '
+        'ONE min across the mode cap AND all four measured ratios. '
+        'Composition after min is forbidden.')
+
+    # 6. Recompute triggers: resize + orientationchange +
+    # visibilitychange (PWA standalone) + expand toggle (deps).
+    fit_effect_idx = layout.find('UNIFIED FIT')
     assert fit_effect_idx != -1
-    fit_effect_block = layout[fit_effect_idx:fit_effect_idx + 4000]
+    fit_effect_block = layout[fit_effect_idx:fit_effect_idx + 6000]
     assert "'resize'" in fit_effect_block
-    assert "'orientationchange'" in fit_effect_block, (
-        'fitScale MUST recompute on orientationchange — tablet rotate '
-        'flips innerWidth from portrait to landscape')
+    assert "'orientationchange'" in fit_effect_block
+    assert 'visibilitychange' in fit_effect_block, (
+        'must recompute on visibilitychange (PWA standalone launch)')
+    assert re.search(r'\[debugCluster,\s*isExpanded\]', layout), (
+        'useEffect deps must include isExpanded so cap flips '
+        '1 ↔ EXPAND_MAX immediately on expand toggle')
+
+
+def test_expand_scales_only_center_cluster_not_left_column():
+    """2026-09-17 UNIFIED FIT — operator's second-bug clause: the
+    expand mode must scale ONLY the CENTER pad cluster, NEVER the
+    LEFT column. Regressing this yields the "step-size chips
+    overlapping" symptom the operator screenshotted (the LEFT
+    column's chip vocabulary is thin at 150px; scaling it up by
+    1.6× would collide with the pad cluster).
+
+    Structural pin: the `expanded` prop MUST NOT appear in any
+    style value inside the LEFT column subtree (marker: "LEFT —
+    mode, step, speed" up to "CENTER — jog arrow pads"). The
+    prop's only styling references are inside the CENTER container
+    (paddingBottom + the scaler's transform comment).
+    """
+    jog = _read(JOG)
+    left_marker   = jog.find('LEFT — mode, step, speed')
+    center_marker = jog.find('CENTER — jog arrow pads', left_marker)
+    assert left_marker != -1 and center_marker != -1
+    left_block = jog[left_marker:center_marker]
+
+    # Strip comments — retirement notes may mention the word 'expand'.
+    left_code = re.sub(r'/\*.*?\*/', '', left_block, flags=re.DOTALL)
+    left_code = re.sub(r'\{/\*.*?\*/\}', '', left_code, flags=re.DOTALL)
+    left_code = '\n'.join(
+        line for line in left_code.splitlines()
+        if not line.lstrip().startswith('//'))
+
+    # No `expanded` reference anywhere in the LEFT column body (all
+    # elements between the two markers). If a future edit adds
+    # `transform: expanded ? …` or `padding: expanded ? …` to the
+    # LEFT column, this pin trips.
+    assert 'expanded' not in left_code, (
+        "the `expanded` prop MUST NOT appear anywhere in the LEFT "
+        "column subtree — expand scales ONLY the CENTER cluster "
+        '(operator directive: expand-preserves-arrangement). Prior '
+        "regression symptom: 'step-size chips overlapping' when the "
+        'LEFT column grew 1.6× with the center.')
+
+    # And: no transform style at all applied to the LEFT column
+    # outer wrapper or its 5 group children. transforms inside the
+    # LEFT column would fight the expand contract even if unrelated
+    # to `expanded`. Grep for `transform:` in the LEFT block.
+    assert 'transform:' not in left_code, (
+        'no CSS transform is allowed inside the LEFT column — the '
+        'scaler transform is scoped to the CENTER cluster only. Any '
+        'LEFT-column transform would fight the expand contract.')
 
 
 def test_cluster_fit_debug_chip_available_behind_flag():
-    """Diagnostic surface: with `?debug=cluster` in the URL, a small
-    top-center overlay shows the exact numbers the fitScale
-    measurement reads from the device (viewport, slot rects,
-    cluster natural width, computed scale). This is the operator
-    verification channel — retire the chip once both tablet
-    orientations are confirmed clip-free.
+    """Diagnostic surface: with `?debug=1` in the URL, a top-center
+    overlay reports the numbers the unified-fit formula reads from
+    the device (innerW/H, slot rects, availableW/H, naturalW/H,
+    cap, applied scale). Operator verification channel — retire
+    once tablet portrait+landscape AND desktop normal+expand
+    confirm clip-free.
     """
     layout = _read(LAYOUT)
-    assert "'debug=cluster'" in layout, (
-        'debug flag literal `debug=cluster` must appear so the '
-        'operator can enable the diagnostic chip via URL param')
+    assert "'debug=1'" in layout, (
+        "debug flag literal `debug=1` must appear so the operator "
+        "can enable the diagnostic chip via URL param (2026-09-17 "
+        "UNIFIED FIT rename from debug=cluster)")
     assert 'data-testid="cluster-fit-debug"' in layout, (
-        'the debug chip must carry data-testid="cluster-fit-debug" '
-        'so pins + operator can find it')
-    # Chip only renders when the flag is set — never in prod default.
+        'the debug chip must carry data-testid="cluster-fit-debug"')
     chip_idx = layout.find('data-testid="cluster-fit-debug"')
     prefix = layout[max(0, chip_idx - 400):chip_idx]
     assert 'debugCluster' in prefix, (
