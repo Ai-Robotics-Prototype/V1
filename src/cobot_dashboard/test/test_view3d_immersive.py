@@ -170,7 +170,8 @@ def test_jog_surface_row_has_no_internal_overflow_scroll():
     """
     src = _read(JOG)
     idx = src.rfind('data-testid="jog-surface-row"')
-    block = src[idx:idx + 1500]
+    # 2026-09-17 widened past the interior-clip retirement note.
+    block = src[idx:idx + 3000]
     # Skip block comments so the retirement note ("previous
     # overflowY:'auto' was the source of…") doesn't false-match. The
     # style declaration lives outside the comment on its own line.
@@ -1567,27 +1568,38 @@ def test_chip_buttons_share_equal_width_and_left_edge():
 
 
 def test_step_size_chips_render_as_five_column_grid():
-    """2026-09-16 chip alignment operator directive #2: step-size
-    chips render as ONE aligned row (grid, 5 equal columns) — no
-    more ragged 3+2 flex-wrap.
+    """2026-09-17 chip readability UPDATE (supersedes the 2026-09-16
+    grid(5,1fr) directive after operator screenshot showed the
+    labels truncating — "0.1m", "10m" — because a 150-px LEFT
+    column split 5 ways only gives each chip ~28 px of interior).
+    New rule: chips sized to CONTENT with wrap; labels never
+    truncate; shared font size + padding across all five.
     """
     jog = _read(JOG)
     left_idx = jog.find('LEFT — mode, step, speed')
     center_marker = jog.find('CENTER — jog arrow pads', left_idx)
     left_block = jog[left_idx:center_marker]
-    # Find the step-size grid wrapper: it wraps the .map over the
-    # step-size values [0.1, 0.5, 1, 5, 10]. Locate that anchor.
     map_idx = left_block.find('[0.1, 0.5, 1, 5, 10]')
     assert map_idx != -1
-    prefix = left_block[max(0, map_idx - 300):map_idx]
-    # Must be display:grid with 5 equal fr columns.
-    assert re.search(r"display:\s*'grid'", prefix), (
-        'step-size chips wrapper must be display:grid (operator '
-        'directive #2 — one aligned row)')
-    assert re.search(
-        r"gridTemplateColumns:\s*'repeat\(5,\s*1fr\)'", prefix), (
-        'step-size chips must use gridTemplateColumns: repeat(5, 1fr) '
-        'so all 5 chips share identical widths and align in one row')
+    prefix = left_block[max(0, map_idx - 400):map_idx]
+    # Chip wrapper is flex + wrap (allows 5-in-a-row when there's
+    # room, 3+2 or 2+2+1 when there isn't — no truncation either way).
+    assert re.search(r"display:\s*'flex'", prefix), (
+        'step-size chips wrapper must be display:flex + flexWrap '
+        '(2026-09-17 readability fix: grid(5,1fr) truncated labels '
+        'in the 150px column)')
+    assert re.search(r"flexWrap:\s*'wrap'", prefix), (
+        'step-size chips wrapper must use flexWrap:wrap so a narrow '
+        'column reflows to 3+2 rows instead of truncating labels')
+    # Chip button uses fit-content + nowrap so each button sizes to
+    # its own label; grep the map body for the two required styles.
+    map_body = left_block[map_idx:map_idx + 1200]
+    assert re.search(r"minWidth:\s*'fit-content'", map_body), (
+        "step-size chip must set minWidth:'fit-content' so the "
+        "chip sizes to its label — no truncation")
+    assert re.search(r"whiteSpace:\s*'nowrap'", map_body), (
+        "step-size chip must set whiteSpace:'nowrap' so labels "
+        'render on a single line inside the chip')
 
 
 def test_step_size_speed_controls_motion_caption_retired():
@@ -1967,6 +1979,43 @@ def test_immersive_cartesian_row_does_not_wrap():
         "immersive cartesian row must use `flexWrap: immersive ? "
         "'nowrap' : 'wrap'` — wrap would hide overflow from the "
         'fit-scale measurement')
+
+
+def test_immersive_row_overflow_visible_both_axes():
+    """2026-09-17 INTERIOR-CLIP FIX (operator screenshot at 2cc41d2,
+    desktop expand ~1900w): X- and Rz+ rendered as slivers at
+    ~397/1508 with Y+/Rx+ clipped at top. Root cause: jog-surface-
+    row carried overflowX:'hidden' unconditionally. In immersive
+    mode the row is content-sized (width:auto) and the scaler
+    applies transform:scale up to EXPAND_MAX (1.6). CSS transforms
+    extend the VISUAL past the layout box; overflowX:hidden then
+    clips the scaled pads at the row's natural bounds. CSS also
+    COERCES overflowY:visible → auto when overflowX is hidden
+    (Y-axis clip appears with the X-axis one).
+
+    Fix: in immersive mode, jog-surface-row uses
+    `overflowX: 'visible'` (Y stays visible too, no coercion).
+    Program-tab consumer keeps overflowX:'hidden' — its layout
+    doesn't scale and needs the horizontal overflow clip.
+    """
+    jog = _read(JOG)
+    row_idx = jog.rfind('data-testid="jog-surface-row"')
+    assert row_idx != -1
+    row_block = jog[row_idx:row_idx + 3000]
+    # Immersive ternary on overflowX.
+    assert re.search(
+        r"overflowX:\s*immersive\s*\?\s*'visible'\s*:\s*'hidden'",
+        row_block), (
+        "jog-surface-row overflowX must be `immersive ? 'visible' "
+        ": 'hidden'` — 2026-09-17 interior-clip fix (scale>1 "
+        'visual is bounded by the fit-scale formula, not by the '
+        'row-level clip)')
+    # Y-axis stays visible (never auto/scroll/hidden — the coerce
+    # rule doesn't trip when both axes are visible).
+    assert re.search(r"overflowY:\s*'visible'", row_block), (
+        "jog-surface-row overflowY must stay 'visible' — CSS "
+        "coerces to 'auto' when the other axis is hidden, which "
+        'would break the vertical expand clearance too')
 
 
 def test_cluster_fit_debug_chip_available_behind_flag():

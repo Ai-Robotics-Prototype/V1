@@ -1101,7 +1101,22 @@ export default function JogControls({
         // translucent surface. Content lays out at its natural size
         // over the canvas (previous overflowY:'auto' was the source
         // of the operator-reported scrollbar).
-        overflowX: 'hidden', overflowY: 'visible',
+        // 2026-09-17 INTERIOR-CLIP FIX: in immersive mode the row is
+        // content-sized (auto width) and the scaler applies
+        // transform:scale up to EXPAND_MAX (1.6). CSS transforms
+        // extend the VISUAL past the layout box; overflowX:'hidden'
+        // then clips the scaled pads at the row's natural bounds
+        // (operator screenshot: X- at ~397, Rz+ at ~1508, Y+/Rx+
+        // clipped at top because CSS coerces overflowY:visible →
+        // auto when overflowX is hidden). Immersive must be
+        // overflow:'visible' both axes — the fit-scale formula
+        // already bounds the scaled visual within the measured
+        // column space; row-level clipping is redundant AND breaks
+        // expand. Program-tab consumer keeps the original overflow
+        // treatment (its width:100% + flex:1 layout doesn't need
+        // room for a scaled child).
+        overflowX: immersive ? 'visible' : 'hidden',
+        overflowY: 'visible',
         display: 'flex', flexDirection: 'row',
         alignItems: 'flex-start', justifyContent: 'space-evenly',
         gap: immersive ? 0 : rowGap,
@@ -1228,29 +1243,33 @@ export default function JogControls({
             Continuous
           </button>
         </div>
-        {/* Step Size — 5-column grid so all chips have identical
-            width and align in ONE row (no ragged 3+2 wrap). Caption
-            "· speed controls motion" retired per 2026-09-16 order:
-            the chips grey out in Continuous mode, communicating the
-            same fact without extra text. */}
+        {/* Step Size — 2026-09-17 chip readability fix: previous
+            grid(5, 1fr) at 150px column gave each chip ~28px of
+            interior which truncated "10mm" / "0.5mm". Switched to
+            flex-wrap with fit-content chips (comfortable horizontal
+            padding, shared font size). At 150px the row wraps to
+            3+2 or 2+2+1 depending on unit ('mm' vs '°'); labels
+            never truncate. Same active/disabled treatment. */}
         <div style={{ opacity: jogStyle === 'STEP' ? 1 : 0.4, pointerEvents: immersive ? 'auto' : undefined }}>
           <div style={{ fontSize: sectionLabelFont, fontWeight: 700, color: '#111', marginBottom: 6, textShadow: LABEL_TEXT_SHADOW }}>
             Step Size
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 4 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
             {[0.1, 0.5, 1, 5, 10].map((s) => (
               <button key={s}
                 onClick={() => { if (jogStyle === 'STEP') setStep(s) }}
                 disabled={jogStyle !== 'STEP'}
                 style={{
-                  padding: '8px 0',
+                  padding: '8px 10px',
                   fontSize: stepBtnFont, fontWeight: 600, borderRadius: 4,
                   cursor: jogStyle === 'STEP' ? 'pointer' : 'not-allowed',
                   minHeight: stepBtnH,
                   background: step === s ? '#2563EB' : '#f3f4f6',
                   color:      step === s ? '#fff'    : '#6b7280',
                   border:     step === s ? 'none'    : '1px solid #e5e7eb',
-                  minWidth: 0,
+                  // Chip sizes to content — no truncation.
+                  minWidth: 'fit-content',
+                  whiteSpace: 'nowrap',
                 }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
             ))}
           </div>
