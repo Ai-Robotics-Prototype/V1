@@ -339,24 +339,34 @@ def test_escape_score_incident_pose_permits_at_least_one_axis():
 
 
 def test_escape_gate_fires_below_the_hard_floor():
-    """Doctrine: escape motion is permitted EVEN BELOW σ_hard. The
-    supervise tick sequences the escape check BEFORE the σ ≤ hard
-    hard-stop — if the operator is jogging away, the hard-stop is
-    skipped. This test locates the code that enforces the order."""
-    src = _src()
+    """Doctrine: escape motion is permitted EVEN BELOW σ_wall (the
+    hard floor was renamed to σ_wall on 2026-09-14 §3 when the
+    session-latch layer landed). The supervise tick sequences the
+    escape check BEFORE the σ ≤ wall stop — if the operator is
+    jogging away, the wall stop is skipped. This test locates the
+    code that enforces the order.
+
+    2026-09-17 fixture-rot fix: attribute was `_cart_sigma_hard`
+    → renamed to `_cart_sigma_wall` when the elbow-wall + session-
+    latch layer landed. The escape-first ordering (the actual
+    safety guarantee) is intact — is_escaping still runs BEFORE
+    the wall-stop `elif` branch (verified at
+    estun_driver_node.py:4425 → 4465).
+    """
     body = _src()
-    # `is_escaping` variable exists and gates the σ-hard branch.
+    # `is_escaping` variable exists and gates the σ-wall branch.
     assert 'is_escaping = escape_dsigma > ESCAPE_TIE_EPS' in body, (
         'the is_escaping variable + tie-break comparison must be '
         'present in the supervise tick')
-    # is_escaping must gate the σ-hard-stop branch. Grep for the
-    # `elif sigma is not None and sigma <= self._cart_sigma_hard`
-    # form — the `elif` proves the escape branch runs first.
-    assert 'elif sigma is not None and sigma <= self._cart_sigma_hard' in body, (
-        'σ-hard-stop must be behind an `elif` after the is_escaping '
-        'permit branch — otherwise escape jog is stopped at the hard '
-        'floor and the operator is trapped')
-    # is_escaping must also gate the sigma-soft ramp (line ~3986).
+    # is_escaping must gate the σ-wall-stop branch. The `elif` proves
+    # the escape branch runs first — an intervening branch (elbow
+    # wall, added 2026-09-14) is fine as long as the wall-stop stays
+    # behind an `elif` (i.e., is skipped when is_escaping is true).
+    assert 'elif sigma is not None and sigma <= self._cart_sigma_wall' in body, (
+        'σ-wall-stop must be behind an `elif` after the is_escaping '
+        'permit branch — otherwise escape jog is stopped at the '
+        'wall floor and the operator is trapped')
+    # is_escaping must also gate the sigma-soft ramp.
     assert 'if scale < 1.0 and sigma is not None and not is_escaping:' in body, (
         'sigma-soft scaling must skip on is_escaping — otherwise the '
         'HUD keeps showing "slowing down" while the operator is '
@@ -368,6 +378,17 @@ def test_escape_gate_fires_below_the_hard_floor():
         'reactive backstop must skip when is_escaping — otherwise a '
         'reversal spikes dq from the prior approach and the backstop '
         'scales down the escape')
+
+    # Structural invariant: the is_escaping check appears BEFORE the
+    # σ-wall check in source order — proves branch ordering even if
+    # the wall attribute is renamed again in the future.
+    escape_idx = body.rfind('if is_escaping:')
+    wall_idx = body.find('elif sigma is not None and sigma <= self._cart_sigma_wall')
+    assert escape_idx != -1 and wall_idx != -1
+    assert escape_idx < wall_idx, (
+        'escape branch (if is_escaping:) MUST appear before the '
+        'wall-stop branch (elif sigma <= _cart_sigma_wall) in source '
+        'order — this is the load-bearing safety invariant')
 
 
 def test_joint_jog_never_touches_governor():
