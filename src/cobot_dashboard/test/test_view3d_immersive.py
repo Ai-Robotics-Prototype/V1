@@ -1192,10 +1192,14 @@ def test_expand_scales_only_center_cluster():
         scaler_block), (
         'scaler transform must be scale(fitScale) directly (no '
         'expand composition after min) per 2026-09-17 UNIFIED FIT')
-    assert 'const EXPAND_MAX = 1.6' in layout, (
-        'EXPAND_MAX = 1.6 constant must be declared in View3DLayout — '
-        'the expand-mode cap in the unified-fit formula (arrangement '
-        'preserved, exit restores exactly)')
+    # 2026-09-17 expand-rollback: EXPAND_MAX retired; cap = 1 always.
+    # Pin the retirement here too (belt-and-braces with the
+    # test_pad_cluster_fits_viewport_at_tablet_widths cap assertion).
+    assert 'const EXPAND_MAX' not in layout, (
+        'EXPAND_MAX constant must be RETIRED (2026-09-17 expand-'
+        'rollback — scale>1 clipped in the overflow:hidden ancestor)')
+    assert 'const CAP = 1' in layout, (
+        'cap constant must be `const CAP = 1` (both modes)')
     assert re.search(
         r"transformOrigin:\s*'center", scaler_block), (
         "scaler transformOrigin must anchor at 'center' so pads "
@@ -1831,20 +1835,27 @@ def test_pad_cluster_fits_viewport_at_tablet_widths():
             f'ratio guarantees the cluster fits vertically')
 
     # 5. Cap declaration + ONE Math.min across cap + all four ratios.
-    assert 'const EXPAND_MAX = 1.6' in layout, (
-        'EXPAND_MAX constant (1.6) must be declared')
-    assert re.search(
-        r"cap\s*=\s*isExpanded\s*\?\s*EXPAND_MAX\s*:\s*1", layout), (
-        'cap must be `isExpanded ? EXPAND_MAX : 1`')
+    # 2026-09-17 EXPAND-ROLLBACK (operator directive after desktop
+    # screenshot showed X-, Y+, Rz+ clipped as slivers): EXPAND_MAX
+    # RETIRED because scale>1 spills the visual past the overlay's
+    # LAYOUT box and the ancestor tree (view3d-immersive-root
+    # overflow:hidden + jog-surface-row overflowX:hidden) clips it.
+    # Cap = 1 in BOTH modes. Operator directive was explicit:
+    # roll back the expand implementation, do NOT patch the wrapper.
+    assert 'const EXPAND_MAX' not in layout, (
+        'EXPAND_MAX constant must be RETIRED (2026-09-17 expand-'
+        'rollback) — scale>1 clipped in the overflow:hidden ancestor')
+    assert 'const CAP = 1' in layout, (
+        'cap must be a plain constant `const CAP = 1` — both modes '
+        'use the same natural size (no >1 scaling)')
     assert re.search(
         r"Math\.min\(\s*cap\s*,\s*sLeft\s*,\s*sRight\s*,\s*sHeight\s*\)",
         layout), (
-        'fitScale MUST be Math.min(cap, sLeft, sRight, sHeight) — '
-        'ONE min across the mode cap AND all four measured ratios. '
-        'Composition after min is forbidden.')
+        'fitScale MUST be Math.min(cap, sLeft, sRight, sHeight)')
 
     # 6. Recompute triggers: resize + orientationchange +
-    # visibilitychange (PWA standalone) + expand toggle (deps).
+    # visibilitychange (PWA standalone). isExpanded dep DROPPED
+    # in 2026-09-17 expand-rollback (cap constant, not mode-varying).
     fit_effect_idx = layout.find('UNIFIED FIT')
     assert fit_effect_idx != -1
     fit_effect_block = layout[fit_effect_idx:fit_effect_idx + 6000]
@@ -1852,9 +1863,6 @@ def test_pad_cluster_fits_viewport_at_tablet_widths():
     assert "'orientationchange'" in fit_effect_block
     assert 'visibilitychange' in fit_effect_block, (
         'must recompute on visibilitychange (PWA standalone launch)')
-    assert re.search(r'\[debugCluster,\s*isExpanded\]', layout), (
-        'useEffect deps must include isExpanded so cap flips '
-        '1 ↔ EXPAND_MAX immediately on expand toggle')
 
 
 def test_expand_scales_only_center_cluster_not_left_column():

@@ -150,11 +150,14 @@ export default function View3DLayout() {
   //   scale = max(MIN_FIT_SCALE,
   //               min(cap, availW/naturalW, availH/naturalH))
   //
-  // where cap = 1 in normal, EXPAND_MAX (1.6) in expand mode.
-  // Clipping becomes MATHEMATICALLY IMPOSSIBLE because the scale
-  // is derived from the same rects the browser paints. No modeled
-  // widths, no breakpoints — three prior modeled attempts each
-  // clipped on a device the pin claimed was fine.
+  // Cap is 1 in BOTH modes as of 2026-09-17 expand-rollback: the
+  // prior EXPAND_MAX=1.6 attempt clipped in the desktop screenshot
+  // (X-, Y+, Rz+ rendered as slivers) because scale>1 pushes the
+  // visual past the overlay's LAYOUT box, and the ancestor tree
+  // (view3d-immersive-root at overflow:hidden; jog-surface-row at
+  // overflowX:hidden) clips the overflow. Operator directive: roll
+  // BACK the scale, do NOT patch the wrapper. So cap = 1 always;
+  // expand toggle now only controls canvas-dim + collapse label.
   //
   // Asymmetric width: the overlay is centered on viewport-center
   // (left:50% translateX(-50%)), so the natural cluster centers on
@@ -165,7 +168,7 @@ export default function View3DLayout() {
   //   sWidth    = min(2·halfLeft/naturalW, 2·halfRight/naturalW)
   // Height: naturalH bounded by (viewport − top headroom − bottom margin):
   //   sHeight   = availableH / naturalH
-  const EXPAND_MAX = 1.6
+  const CAP = 1   // 2026-09-17 expand-rollback: EXPAND_MAX (1.6) retired
   const [fitScale, setFitScale] = useState(1)
   const [dbg, setDbg] = useState(null)   // debug chip payload
   const debugCluster = (typeof window !== 'undefined'
@@ -197,7 +200,10 @@ export default function View3DLayout() {
       const sLeft  = (halfLeft  * 2) / naturalW
       const sRight = (halfRight * 2) / naturalW
       const sHeight = availableH / naturalH
-      const cap = isExpanded ? EXPAND_MAX : 1
+      // 2026-09-17 expand-rollback: cap is 1 in both modes. isExpanded
+      // no longer affects the pad-cluster scale — only the canvas dim
+      // wash + the Collapse chip label swap.
+      const cap = CAP
       const next = Math.max(MIN_FIT_SCALE,
         Math.min(cap, sLeft, sRight, sHeight))
       setFitScale((prev) => (Math.abs(prev - next) > 0.005 ? next : prev))
@@ -239,7 +245,7 @@ export default function View3DLayout() {
       window.removeEventListener('resize', schedule)
       window.removeEventListener('orientationchange', schedule)
     }
-  }, [debugCluster, isExpanded])   // recompute when expand toggles → cap flips 1↔1.6
+  }, [debugCluster])   // 2026-09-17 expand-rollback: cap no longer depends on isExpanded
 
   // 2026-09-16 default-framing (measured) — visibleTopFrac derived
   // from the REAL jog-surface bounds at runtime. `panelRef` points
