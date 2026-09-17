@@ -1105,6 +1105,16 @@ export default function JogControls({
         const wireFrac = Math.min(speedClamped, effClampedPct) / 100
         const wireHintTitle = `wire ${wireFrac.toFixed(2)} — jog ceiling ${effClampedPct}% (operator order)`
                             + (speedClamped >= 50 ? ` — controller wall: ${_ctrlWall}` : '')
+        // 2026-09-16 LEFT column layout #2 — equal-width chip
+        // vocabulary. All 4 button groups (XYZ/Joint/Step/Continuous)
+        // and the step-size chip row use `width:100%` so they align
+        // on the left edge and share identical widths. Step and
+        // Continuous stack vertically like XYZ/Joint (were side-by-
+        // side, breaking the equal-width contract).
+        const chipBtnStyle = (on, disabled = false) => ({
+          ...modeBtnStyle(on, disabled),
+          width: '100%',
+        })
         const leftEl = (
       <div style={{
         display: 'flex', flexDirection: 'column',
@@ -1116,80 +1126,83 @@ export default function JogControls({
         // parent flex-row height.
         flex: immersive ? 1 : undefined,
         alignSelf: 'stretch',
+        // 2026-09-16 layout #2 — single column, space-between so the
+        // 4 upper groups (DISABLE+READY, XYZ+Joint, Step+Continuous,
+        // step-size chips) get uniform even gaps computed from
+        // available height, with Speed pinned at the bottom. The
+        // outer wrapper hosts 5 children; space-between then puts
+        // DISABLE at top, Speed at bottom, and distributes the mid-3
+        // with equal residual gaps.
         justifyContent: 'space-between',
         boxSizing: 'border-box',
-        paddingLeft: 4, paddingRight: 4,
+        paddingLeft: 4, paddingRight: 4, paddingTop: 4, paddingBottom: 4,
       }}>
         {/* TOP — caller-provided DISABLE + READY row. Program-tab
             consumer passes null; slot then renders nothing and
-            middle groups float up. minHeight:44 mirrors the RIGHT
-            column Orient block for equal top-row heights. */}
+            other groups take its share of the space. minHeight:44
+            mirrors the RIGHT column Orient block for equal top-row
+            heights. */}
         <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6, minHeight: 44 }}>
           {leftTopSlot}
         </div>
-        {/* MIDDLE — jog mode / press style / step size, distributed
-            evenly along the column's middle band. space-around gives
-            operator's requested generous even spacing via flex
-            distribution — the taller the slot, the wider the gaps. */}
-        <div style={{
-          flex: 1, minHeight: 0,
-          display: 'flex', flexDirection: 'column',
-          justifyContent: 'space-around',
-          paddingTop: 12, paddingBottom: 12,
-        }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <button
-              onClick={() => cartesianEnabled && setJogMode('cartesian')}
-              disabled={!cartesianEnabled}
-              title={cartesianEnabled ? undefined : 'Cartesian jog pending validation'}
-              style={modeBtnStyle(jogMode === 'cartesian', !cartesianEnabled)}
-            >
-              XYZ {cartesianEnabled ? '' : '(TBD)'}
-            </button>
-            <button onClick={() => setJogMode('joint')} style={modeBtnStyle(jogMode === 'joint')}>Joint</button>
+        {/* Frame: XYZ / Joint (equal-width, stacked). */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <button
+            onClick={() => cartesianEnabled && setJogMode('cartesian')}
+            disabled={!cartesianEnabled}
+            title={cartesianEnabled ? undefined : 'Cartesian jog pending validation'}
+            style={chipBtnStyle(jogMode === 'cartesian', !cartesianEnabled)}
+          >
+            XYZ {cartesianEnabled ? '' : '(TBD)'}
+          </button>
+          <button onClick={() => setJogMode('joint')} style={chipBtnStyle(jogMode === 'joint')}>Joint</button>
+        </div>
+        {/* Press style: Step / Continuous (equal-width, stacked so
+            they match XYZ/Joint widths). */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <button
+            onClick={() => setJogStyle('STEP')}
+            style={{ ...chipBtnStyle(jogStyle === 'STEP'), minHeight: Math.max(36, modeMinH - 8), fontSize: modeFont - 1 }}>
+            Step
+          </button>
+          <button
+            onClick={() => setJogStyle('CONTINUOUS')}
+            style={{ ...chipBtnStyle(jogStyle === 'CONTINUOUS'), minHeight: Math.max(36, modeMinH - 8), fontSize: modeFont - 1 }}>
+            Continuous
+          </button>
+        </div>
+        {/* Step Size — 5-column grid so all chips have identical
+            width and align in ONE row (no ragged 3+2 wrap). Caption
+            "· speed controls motion" retired per 2026-09-16 order:
+            the chips grey out in Continuous mode, communicating the
+            same fact without extra text. */}
+        <div style={{ opacity: jogStyle === 'STEP' ? 1 : 0.4 }}>
+          <div style={{ fontSize: sectionLabelFont, fontWeight: 700, color: '#111', marginBottom: 6, textShadow: LABEL_TEXT_SHADOW }}>
+            Step Size
           </div>
-          <div style={{ display: 'flex', gap: 4 }}>
-            <button
-              onClick={() => setJogStyle('STEP')}
-              style={{
-                ...modeBtnStyle(jogStyle === 'STEP'),
-                minHeight: Math.max(36, modeMinH - 8),
-                fontSize: modeFont - 1,
-              }}>Step</button>
-            <button
-              onClick={() => setJogStyle('CONTINUOUS')}
-              style={{
-                ...modeBtnStyle(jogStyle === 'CONTINUOUS'),
-                minHeight: Math.max(36, modeMinH - 8),
-                fontSize: modeFont - 1,
-              }}>Continuous</button>
-          </div>
-          <div style={{ opacity: jogStyle === 'STEP' ? 1 : 0.4 }}>
-            <div style={{ fontSize: sectionLabelFont, fontWeight: 700, color: '#111', marginBottom: 6, textShadow: LABEL_TEXT_SHADOW }}>
-              Step Size {jogStyle === 'CONTINUOUS' && <span style={{ fontWeight: 500 }}>· speed controls motion</span>}
-            </div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-              {[0.1, 0.5, 1, 5, 10].map((s) => (
-                <button key={s}
-                  onClick={() => { if (jogStyle === 'STEP') setStep(s) }}
-                  disabled={jogStyle !== 'STEP'}
-                  style={{
-                    padding: maximized ? '10px 14px' : '8px 12px',
-                    fontSize: stepBtnFont, fontWeight: 600, borderRadius: 4,
-                    cursor: jogStyle === 'STEP' ? 'pointer' : 'not-allowed',
-                    minHeight: stepBtnH,
-                    background: step === s ? '#2563EB' : '#f3f4f6',
-                    color:      step === s ? '#fff'    : '#6b7280',
-                    border:     step === s ? 'none'    : '1px solid #e5e7eb',
-                  }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
-              ))}
-            </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 4 }}>
+            {[0.1, 0.5, 1, 5, 10].map((s) => (
+              <button key={s}
+                onClick={() => { if (jogStyle === 'STEP') setStep(s) }}
+                disabled={jogStyle !== 'STEP'}
+                style={{
+                  padding: '8px 0',
+                  fontSize: stepBtnFont, fontWeight: 600, borderRadius: 4,
+                  cursor: jogStyle === 'STEP' ? 'pointer' : 'not-allowed',
+                  minHeight: stepBtnH,
+                  background: step === s ? '#2563EB' : '#f3f4f6',
+                  color:      step === s ? '#fff'    : '#6b7280',
+                  border:     step === s ? 'none'    : '1px solid #e5e7eb',
+                  minWidth: 0,
+                }}>{s}{jogMode === 'joint' ? '°' : 'mm'}</button>
+            ))}
           </div>
         </div>
-        {/* BOTTOM — Speed slider pinned to bottom edge with margin.
-            Speed:N% label stays; wire-hint line retired to slider
-            `title` (tooltip) per 2026-09-16 operator order. */}
-        <div style={{ flexShrink: 0, paddingBottom: 4 }} data-testid="jog-speed-group">
+        {/* BOTTOM — Speed slider pinned to bottom edge (last child
+            in the space-between distribution). Speed:N% label stays;
+            wire-hint line retired to slider `title` tooltip per
+            2026-09-16 operator order. */}
+        <div style={{ flexShrink: 0 }} data-testid="jog-speed-group">
           <div style={{ fontSize: speedFont, fontWeight: 700, color: '#111', marginBottom: 6, textShadow: LABEL_TEXT_SHADOW }}>
             Speed: {speedClamped}%
           </div>
@@ -1220,23 +1233,37 @@ export default function JogControls({
           side-column layout; measuring the wrapper would shrink
           the arm region unnecessarily. The center-pads box tells
           the framing exactly where the arm bottom must clear to. */}
+      {/* 2026-09-16 PAD ANCHORING — operator screenshot #2: the pad
+          clusters were floating mid-page; anchor them toward the
+          BASE of the viewport so the arm region gains vertical
+          room. alignItems:'flex-end' bottom-aligns the scaler
+          cluster inside the full-height CENTER container; padding-
+          bottom keeps a comfortable margin above the Collapse row.
+          Framing (View3DLayout) targets the scaler element directly
+          so surfaceTop reflects the ACTUAL pad-top position (lower
+          now → larger arm region above), not the empty container
+          top. */}
       <div
         data-testid="jog-center-pads"
-        style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', minWidth: 0, alignSelf: 'stretch' }}>
+        style={{
+          flex: 1,
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'flex-end',
+          minWidth: 0, alignSelf: 'stretch',
+          paddingBottom: expanded ? 40 : 20,
+        }}>
         {/* 2026-09-16 EXPAND MODE — when `expanded` is true the pad
-            CLUSTER scales up (1.5×) via CSS transform so the SAME
+            CLUSTER scales up (1.6×) via CSS transform so the SAME
             arrangement (Position pad + Height + Rotation, joint tiles)
-            just renders larger. transformOrigin:center keeps it
-            centered inside the CENTER container; the container's
-            layout size is unchanged (transforms don't affect layout),
-            which preserves the framing anchor and keeps the LEFT/
-            RIGHT portaled columns at normal size. In non-expand mode
-            the wrapper is a passthrough — style is inert. */}
+            just renders larger. transformOrigin:'bottom' keeps the
+            growth anchored at the base — the cluster grows UP from
+            its bottom edge without needing to move down first. */}
         <div
           data-testid="jog-center-cluster-scaler"
           style={{
             transform: expanded ? 'scale(1.6)' : 'none',
-            transformOrigin: 'center center',
+            transformOrigin: 'center bottom',
             transition: 'transform 120ms ease-out',
             display: 'flex', justifyContent: 'center', alignItems: 'center',
           }}>

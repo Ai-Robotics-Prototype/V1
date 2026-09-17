@@ -242,20 +242,23 @@ export default function View3DLayout() {
       const viewportH = (typeof window !== 'undefined'
                           && window.innerHeight) || 900
       let topFrac = FRAMING_MAX_TOP_FRAC
-      // 2026-09-16 side-column directive: the LEFT/RIGHT columns
-      // now spread up the edges taller than the CENTER pads. If we
-      // measured the whole panel (which extends to the tall column
-      // tops), the arm region would shrink unnecessarily. Instead
-      // measure the CENTER pads specifically (via the
-      // jog-center-pads testid on the pad container inside
-      // JogControls) — the arm bottom only needs to clear the
-      // pads, not the side columns. Falls back to the panel
-      // wrapper if the pads aren't in the DOM yet (mount race /
-      // MINIMIZED).
+      // 2026-09-16 pad-anchoring directive #2: the CENTER pad cluster
+      // is now bottom-aligned inside the CENTER container so the
+      // container's top edge no longer reflects where the pads
+      // actually sit. Prefer the scaler element (which wraps the
+      // ACTUAL pad cluster and bottom-aligns with it) — its top edge
+      // is where the arm region must clear to, giving us a LARGER
+      // arm region above (framing gains the vacated vertical space
+      // between container-top and pads-top). Falls back to the
+      // container (jog-center-pads) if the scaler is not in the DOM
+      // yet, then to the panel wrapper for MINIMIZED / mount race.
+      const scalerEl = (typeof document !== 'undefined')
+        ? document.querySelector('[data-testid="jog-center-cluster-scaler"]')
+        : null
       const padsEl = (typeof document !== 'undefined')
         ? document.querySelector('[data-testid="jog-center-pads"]')
         : null
-      const el = padsEl || panelRef.current
+      const el = scalerEl || padsEl || panelRef.current
       if (el) {
         const r = el.getBoundingClientRect()
         if (r && Number.isFinite(r.top) && r.top > 0) {

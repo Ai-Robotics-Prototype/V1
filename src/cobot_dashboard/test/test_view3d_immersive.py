@@ -1015,29 +1015,47 @@ def test_framing_measures_center_pads_not_full_surface():
     """2026-09-16 side-column directive — with the LEFT/RIGHT
     columns spreading up the edges, the framing must NOT measure
     the whole panel wrapper (that would shrink the arm region as
-    the side columns get taller). Instead measure the CENTER pad
-    container by its testid, so the arm bottom only needs to
-    clear the pads, not the tall side columns.
+    the side columns get taller). Measure the CENTER pads instead.
+
+    2026-09-16 pad-anchoring UPDATE (operator screenshot #2): the
+    CENTER pad cluster is now BOTTOM-aligned inside the container
+    (alignItems:'flex-end'), so the container's top edge no longer
+    reflects where the pads actually sit. Framing must PREFER the
+    scaler element (jog-center-cluster-scaler) which bottom-aligns
+    with the actual pad cluster and reports a LOWER top edge —
+    surfaceTop drops → arm region gains vertical space.
     """
     jog = _read(JOG)
     layout = _read(LAYOUT)
-    # JogControls tags the center-pads div with the testid.
+    # JogControls tags both the container and the scaler with
+    # test-ids so framing can prefer whichever is more accurate.
     assert 'data-testid="jog-center-pads"' in jog, (
         'CENTER pad container must carry data-testid="jog-center-pads" '
-        'so View3DLayout can measure it directly for framing')
-    # View3DLayout looks up the pads via document.querySelector on the
-    # testid and falls back to panelRef if not present.
+        'so View3DLayout has a stable framing target (fallback)')
+    assert 'data-testid="jog-center-cluster-scaler"' in jog, (
+        'CENTER pad SCALER must carry '
+        'data-testid="jog-center-cluster-scaler" — the bottom-aligned '
+        'inner wrapper whose top edge is where the arm must clear to')
+    # View3DLayout must query BOTH elements — prefer the scaler for
+    # the LOWER top edge (pad-anchoring gain), fall back to the
+    # container if the scaler isn't in the DOM yet.
+    assert re.search(
+        r"document\.querySelector\('\[data-testid=\"jog-center-cluster-scaler\"\]'\)",
+        layout), (
+        'View3DLayout framing must query jog-center-cluster-scaler — '
+        'this is the LOWER anchor after pad-anchoring #2 (bigger arm '
+        'region above)')
     assert re.search(
         r"document\.querySelector\('\[data-testid=\"jog-center-pads\"\]'\)",
         layout), (
-        'View3DLayout framing must query the jog-center-pads element '
-        'directly and use its top edge for the visibleTopFrac '
-        'derivation')
-    # The fallback pattern (padsEl || panelRef.current) must remain
-    # so MINIMIZED / mount race still resolve to a valid element.
-    assert 'padsEl || panelRef.current' in layout, (
-        'framing must fall back to panelRef.current when the pads '
-        'are not in the DOM (MINIMIZED / mount race)')
+        'View3DLayout framing must retain the jog-center-pads query '
+        'as the fallback (scaler mount race / MINIMIZED)')
+    # Framing target chain: scaler → padsEl → panelRef. Assert the
+    # exact fallback expression stays.
+    assert 'scalerEl || padsEl || panelRef.current' in layout, (
+        'framing must fall through scalerEl → padsEl → '
+        'panelRef.current in that order so pad-anchoring gain is '
+        'realized when the scaler is in the DOM')
 
 
 def test_no_new_handler_or_gate_added_in_layout():
@@ -1426,6 +1444,168 @@ def test_left_column_pins_speed_slider_to_bottom():
         'Speed group must render AFTER the step-size chips in source '
         'order so the outer flex space-between pins it to the '
         'bottom of the LEFT column')
+
+
+def test_center_pads_anchor_to_bottom_of_container():
+    """2026-09-16 pad-anchoring operator directive #2: the CENTER
+    pad clusters float mid-page today; anchor them toward the BASE
+    of the viewport so the arm region gains vertical space.
+
+    Implementation contract:
+      * jog-center-pads uses alignItems:'flex-end' (not 'center').
+      * jog-center-pads has a paddingBottom margin (16-40 px) so
+        the cluster sits above the RIGHT-column Collapse row.
+      * The scaler wrapper (jog-center-cluster-scaler) uses
+        transformOrigin:'center bottom' so EXPAND scaling grows
+        UP from the base — pads don't jump up when expanded.
+    """
+    jog = _read(JOG)
+    # Locate the container by testid, then read its inline style.
+    pads_idx = jog.find('data-testid="jog-center-pads"')
+    assert pads_idx != -1
+    pads_block = jog[pads_idx:pads_idx + 500]
+    assert re.search(r"alignItems:\s*'flex-end'", pads_block), (
+        'jog-center-pads container must use alignItems:flex-end so '
+        'the pad cluster bottom-aligns inside the full-height '
+        'container (arm region above gains vertical space)')
+    assert re.search(r"paddingBottom:", pads_block), (
+        'jog-center-pads must declare paddingBottom so the anchored '
+        'cluster keeps a comfortable margin above the Collapse row')
+    # Scaler transformOrigin: 'center bottom' so EXPAND scale grows
+    # up from the base (not center) — no visual jump on expand.
+    scaler_idx = jog.find('data-testid="jog-center-cluster-scaler"')
+    assert scaler_idx != -1
+    scaler_block = jog[scaler_idx:scaler_idx + 500]
+    assert re.search(r"transformOrigin:\s*'center bottom'", scaler_block), (
+        "scaler transformOrigin must be 'center bottom' so EXPAND "
+        'grows upward from the anchored bottom edge (pad-anchoring '
+        'contract)')
+
+
+def test_left_column_distributes_evenly_with_space_between():
+    """2026-09-16 LEFT column distribution operator directive #2:
+    the four upper groups (DISABLE+READY / XYZ+Joint / Step+
+    Continuous / step-size chips) plus the Speed slider at bottom
+    are distributed by a SINGLE outer flex column using
+    space-between — uniform gaps computed from the column height,
+    no intermediate wrapper.
+    """
+    jog = _read(JOG)
+    # Outer LEFT column style. Located as the first `style={{` after
+    # the "LEFT — mode, step, speed" marker.
+    left_idx = jog.find('LEFT — mode, step, speed')
+    assert left_idx != -1
+    style_open  = jog.find('style={{', left_idx)
+    style_close = jog.find('}}', style_open)
+    outer_style = jog[style_open:style_close]
+    # Outer must be flex column with space-between.
+    assert re.search(r"flexDirection:\s*'column'", outer_style), (
+        'LEFT column outer must be flexDirection:column')
+    assert re.search(r"justifyContent:\s*'space-between'", outer_style), (
+        'LEFT column outer must use space-between so DISABLE+READY '
+        'pins to top, Speed to bottom, and the 3 mid-groups get '
+        'uniform residual gaps (operator directive #2)')
+    # No intermediate MIDDLE wrapper — the previous
+    # "flex:1 minHeight:0 space-around" middle band is retired. Grep
+    # for its distinctive combination inside the LEFT block.
+    center_marker = jog.find('CENTER — jog arrow pads', left_idx)
+    left_block = jog[left_idx:center_marker]
+    assert not re.search(
+        r"flex:\s*1,\s*minHeight:\s*0,\s*[\s\S]{0,80}justifyContent:\s*'space-around'",
+        left_block), (
+        'the intermediate MIDDLE wrapper (flex:1 minHeight:0 '
+        'space-around) is retired — single outer space-between now '
+        'handles distribution directly')
+
+
+def test_chip_buttons_share_equal_width_and_left_edge():
+    """2026-09-16 chip alignment operator directive #2: XYZ / Joint
+    / Step / Continuous all render as full-column-width buttons so
+    they share equal widths and align on the left edge.
+    Implementation:
+      * A `chipBtnStyle` helper adds width:100% to the base
+        modeBtnStyle so every chip fills the column.
+      * Step + Continuous stack vertically (like XYZ + Joint) —
+        NOT side-by-side, which broke the equal-width contract.
+    """
+    jog = _read(JOG)
+    left_idx = jog.find('LEFT — mode, step, speed')
+    center_marker = jog.find('CENTER — jog arrow pads', left_idx)
+    left_block = jog[left_idx:center_marker]
+    # chipBtnStyle helper defined inside the IIFE.
+    assert 'chipBtnStyle' in left_block, (
+        'chipBtnStyle helper must be defined so XYZ/Joint/Step/'
+        'Continuous share width:100% via a single style shim')
+    # All four chip buttons use chipBtnStyle at their style prop.
+    for chip in ('XYZ', 'Joint', 'Step', 'Continuous'):
+        assert re.search(
+            fr">\s*{re.escape(chip)}",
+            left_block), f'{chip} chip must render in the LEFT column'
+    # Step + Continuous no longer sit inside a `display:flex, gap:4`
+    # ROW — they now stack in the same column pattern XYZ/Joint use.
+    step_idx = left_block.find(">\n            Step\n")
+    if step_idx == -1:
+        step_idx = left_block.find('>Step<')
+    # Grab a wider window and confirm the wrapper around Step +
+    # Continuous is flexDirection:'column'.
+    step_button_idx = left_block.find("setJogStyle('STEP')")
+    assert step_button_idx != -1
+    around_step = left_block[max(0, step_button_idx - 400):step_button_idx]
+    assert re.search(r"flexDirection:\s*'column'", around_step), (
+        'Step + Continuous wrapper must be flexDirection:column so '
+        'they stack (matching XYZ/Joint widths). The previous '
+        'side-by-side row broke the equal-width contract.')
+
+
+def test_step_size_chips_render_as_five_column_grid():
+    """2026-09-16 chip alignment operator directive #2: step-size
+    chips render as ONE aligned row (grid, 5 equal columns) — no
+    more ragged 3+2 flex-wrap.
+    """
+    jog = _read(JOG)
+    left_idx = jog.find('LEFT — mode, step, speed')
+    center_marker = jog.find('CENTER — jog arrow pads', left_idx)
+    left_block = jog[left_idx:center_marker]
+    # Find the step-size grid wrapper: it wraps the .map over the
+    # step-size values [0.1, 0.5, 1, 5, 10]. Locate that anchor.
+    map_idx = left_block.find('[0.1, 0.5, 1, 5, 10]')
+    assert map_idx != -1
+    prefix = left_block[max(0, map_idx - 300):map_idx]
+    # Must be display:grid with 5 equal fr columns.
+    assert re.search(r"display:\s*'grid'", prefix), (
+        'step-size chips wrapper must be display:grid (operator '
+        'directive #2 — one aligned row)')
+    assert re.search(
+        r"gridTemplateColumns:\s*'repeat\(5,\s*1fr\)'", prefix), (
+        'step-size chips must use gridTemplateColumns: repeat(5, 1fr) '
+        'so all 5 chips share identical widths and align in one row')
+
+
+def test_step_size_speed_controls_motion_caption_retired():
+    """2026-09-16 caption removal operator directive #2: the
+    "· speed controls motion" span next to the Step Size label is
+    RETIRED — the chips grey out in CONTINUOUS mode, which already
+    communicates the same fact without extra text.
+    """
+    jog = _read(JOG)
+    left_idx = jog.find('LEFT — mode, step, speed')
+    center_marker = jog.find('CENTER — jog arrow pads', left_idx)
+    raw_block = jog[left_idx:center_marker]
+    # Strip JSX + //-line comments so retirement-note documentation
+    # (which may reference the retired text) doesn't false-positive.
+    left_block = re.sub(r'\{/\*.*?\*/\}', '', raw_block, flags=re.DOTALL)
+    left_block = re.sub(r'/\*.*?\*/', '', left_block, flags=re.DOTALL)
+    left_block = '\n'.join(
+        line for line in left_block.splitlines()
+        if not line.lstrip().startswith('//'))
+    assert 'speed controls motion' not in left_block, (
+        "'· speed controls motion' caption must be RETIRED — the "
+        'greyed-out chip state in CONTINUOUS mode communicates the '
+        'same fact without extra text (operator directive #2)')
+    # 'Step Size' label itself stays.
+    assert 'Step Size' in left_block, (
+        "'Step Size' label kept — only the parenthetical caption is "
+        'retired')
 
 
 def test_slot_insets_widen_to_prevent_left_edge_clip():
