@@ -144,6 +144,87 @@ export default function View3DLayout() {
     }
   }, [])
 
+  // 2026-09-17 tablet-field-report — MEASURED fitScale for the pad
+  // cluster. The prior width-matrix pin passed while the tablet
+  // clipped: the model was wrong (assumed 150/200 slot widths,
+  // symmetric centering, isTabletPortrait breakpoint firing on
+  // mount — any one broken assumption ⇒ silent clip). This
+  // measured approach computes the ACTUAL space between the LEFT
+  // and RIGHT slot elements at runtime and derives a transform
+  // scale that guarantees the natural cluster width fits inside
+  // it. Clipping becomes STRUCTURALLY IMPOSSIBLE at any viewport,
+  // regardless of which breakpoint fires or whether the slots
+  // rendered at their nominal widths.
+  //
+  // Asymmetric variant: the pad-cluster overlay is positioned at
+  // viewport-center (left:50%), so the natural cluster is centered
+  // on viewportW/2, NOT on the midpoint of the available inter-
+  // column space. Compute independent left/right permissible
+  // scales and take the min:
+  //   halfLeft  = viewportW/2 − leftSlot.right  − margin
+  //   halfRight = rightSlot.left − viewportW/2  − margin
+  //   fitScale = min(1, 2·halfLeft/naturalW, 2·halfRight/naturalW)
+  const [fitScale, setFitScale] = useState(1)
+  const [dbg, setDbg] = useState(null)   // debug chip payload
+  const debugCluster = (typeof window !== 'undefined'
+      && window.location && window.location.search
+      && window.location.search.indexOf('debug=cluster') >= 0)
+  useEffect(() => {
+    const FIT_MARGIN_PX = 8
+    const MIN_FIT_SCALE = 0.3    // floor so buttons stay usable
+    let raf1 = null
+    let raf2 = null
+    const measure = () => {
+      if (typeof document === 'undefined' || typeof window === 'undefined') return
+      const leftSlot  = document.querySelector('[data-testid="jog-left-column-slot"]')
+      const rightSlot = document.querySelector('[data-testid="jog-right-column-slot"]')
+      const scaler    = document.querySelector('[data-testid="jog-center-cluster-scaler"]')
+      if (!leftSlot || !rightSlot || !scaler) return
+      const lr = leftSlot.getBoundingClientRect()
+      const rr = rightSlot.getBoundingClientRect()
+      const naturalW = scaler.offsetWidth   // LAYOUT width — transforms don't affect this
+      const viewportW = window.innerWidth || 1280
+      const vc = viewportW / 2
+      if (naturalW <= 0) return
+      const halfLeft  = vc - lr.right - FIT_MARGIN_PX
+      const halfRight = rr.left - FIT_MARGIN_PX - vc
+      const sLeft  = (halfLeft  * 2) / naturalW
+      const sRight = (halfRight * 2) / naturalW
+      const next = Math.max(MIN_FIT_SCALE,
+        Math.min(1, sLeft, sRight))
+      setFitScale((prev) => (Math.abs(prev - next) > 0.005 ? next : prev))
+      if (debugCluster) {
+        setDbg({
+          viewportW,
+          leftSlotRight: Math.round(lr.right),
+          rightSlotLeft: Math.round(rr.left),
+          available: Math.round(rr.left - lr.right - 2 * FIT_MARGIN_PX),
+          naturalW: Math.round(naturalW),
+          scale: next.toFixed(3),
+        })
+      }
+    }
+    // Double-RAF so the browser has committed layout AND painted
+    // before we measure — otherwise the initial pass returns
+    // zero-width rects for the just-mounted slots.
+    const schedule = () => {
+      if (raf1) cancelAnimationFrame(raf1)
+      if (raf2) cancelAnimationFrame(raf2)
+      raf1 = requestAnimationFrame(() => {
+        raf2 = requestAnimationFrame(measure)
+      })
+    }
+    schedule()
+    window.addEventListener('resize', schedule)
+    window.addEventListener('orientationchange', schedule)
+    return () => {
+      if (raf1) cancelAnimationFrame(raf1)
+      if (raf2) cancelAnimationFrame(raf2)
+      window.removeEventListener('resize', schedule)
+      window.removeEventListener('orientationchange', schedule)
+    }
+  }, [debugCluster])
+
   // 2026-09-16 default-framing (measured) — visibleTopFrac derived
   // from the REAL jog-surface bounds at runtime. `panelRef` points
   // at the jog-floating-panel <div> (or the expand pill when
@@ -332,6 +413,30 @@ export default function View3DLayout() {
           none keeps orbit unaffected. */}
       <MinClearanceReadout />
 
+      {/* 2026-09-17 tablet-field-report DEBUG chip — enable with
+          `?debug=cluster` in the URL. Small top-center overlay
+          shows the real numbers the fitScale computation reads
+          from the device (viewport, slot rects, cluster natural
+          width, computed scale). Retire this chip once operator
+          confirms both orientations are clip-free on the tablet. */}
+      {debugCluster && dbg && (
+        <div
+          data-testid="cluster-fit-debug"
+          style={{
+            position: 'absolute', top: 8, left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 20,
+            padding: '6px 10px',
+            background: 'rgba(15,23,42,0.85)', color: '#fff',
+            fontSize: 11, fontFamily: 'var(--font-mono, monospace)',
+            borderRadius: 4, pointerEvents: 'none',
+            whiteSpace: 'nowrap',
+          }}>
+          vw={dbg.viewportW}  L.r={dbg.leftSlotRight}  R.l={dbg.rightSlotLeft}
+          {' '}avail={dbg.available}  natural={dbg.naturalW}  scale={dbg.scale}
+        </div>
+      )}
+
       {/* 2026-09-17 tablet-field-report — MinimizedPill retired.
           MINIMIZED now hides ONLY the CENTER pad cluster; the
           LEFT column (DISABLE/READY + jog mode + step + speed),
@@ -452,6 +557,7 @@ export default function View3DLayout() {
           immersive
           expanded={isExpanded}
           hidePads={isMinimized}
+          fitScale={fitScale}
           leftTopSlot={
             <>
               <ArmEnableControl />

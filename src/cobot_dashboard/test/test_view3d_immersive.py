@@ -92,7 +92,7 @@ def test_jog_overlay_wrapper_swallows_only_its_own_pointer_events():
     so taps land on buttons and orbit passes through elsewhere.
     """
     src = _read(LAYOUT)
-    idx = src.find('data-testid="jog-pad-cluster-overlay"')
+    idx = src.rfind('data-testid="jog-pad-cluster-overlay"')
     assert idx != -1, (
         'jog-pad-cluster-overlay testid must exist — it replaces '
         'the retired jog-overlay-wrapper + jog-floating-panel '
@@ -123,7 +123,7 @@ def test_overlay_panel_container_is_transparent():
     the successor overlay.
     """
     src = _read(LAYOUT)
-    idx = src.find('data-testid="jog-pad-cluster-overlay"')
+    idx = src.rfind('data-testid="jog-pad-cluster-overlay"')
     assert idx != -1
     block = src[idx:idx + 1500]
     # No explicit background declared → default is transparent.
@@ -144,7 +144,7 @@ def test_jog_surface_row_is_fully_transparent():
     by contrast" case, and loose labels carry their own text-shadow.
     """
     src = _read(JOG)
-    idx = src.find('data-testid="jog-surface-row"')
+    idx = src.rfind('data-testid="jog-surface-row"')
     assert idx != -1, (
         'jog-surface-row testid missing — the transparency pin needs '
         'this anchor to inspect the correct div')
@@ -169,7 +169,7 @@ def test_jog_surface_row_has_no_internal_overflow_scroll():
     that overflowY is visible (or hidden) — never auto/scroll.
     """
     src = _read(JOG)
-    idx = src.find('data-testid="jog-surface-row"')
+    idx = src.rfind('data-testid="jog-surface-row"')
     block = src[idx:idx + 1500]
     # Skip block comments so the retirement note ("previous
     # overflowY:'auto' was the source of…") doesn't false-match. The
@@ -236,7 +236,7 @@ def test_overlay_zindex_is_scoped_below_topbar_stacking():
     for testid in ('jog-pad-cluster-overlay',
                    'jog-left-column-slot',
                    'jog-right-column-slot'):
-        idx = src.find(f'data-testid="{testid}"')
+        idx = src.rfind(f'data-testid="{testid}"')
         assert idx != -1, f'{testid} testid missing'
         block = src[idx:idx + 1600]
         m = re.search(r'zIndex:\s*(\d+)', block)
@@ -542,7 +542,7 @@ def test_jog_overlay_wrapper_still_pointer_events_none_for_multi_touch():
     for testid in ('jog-pad-cluster-overlay',
                    'jog-left-column-slot',
                    'jog-right-column-slot'):
-        idx = src.find(f'data-testid="{testid}"')
+        idx = src.rfind(f'data-testid="{testid}"')
         assert idx != -1, f'{testid} testid missing'
         block = src[idx:idx + 1600]
         assert re.search(r"pointerEvents:\s*'none'", block), (
@@ -1117,13 +1117,13 @@ def test_side_columns_portal_out_to_page_level():
     # Locate each slot's id attribute; assert it appears BEFORE the
     # jog-overlay-wrapper block in source order (siblings of the
     # panel, not descendants).
-    left_slot_idx  = layout.find('id="jog-left-column-slot"')
-    right_slot_idx = layout.find('id="jog-right-column-slot"')
+    left_slot_idx  = layout.rfind('id="jog-left-column-slot"')
+    right_slot_idx = layout.rfind('id="jog-right-column-slot"')
     # 2026-09-17 SINGLE-WINDOW UPDATE: pad-cluster overlay
     # supersedes the retired jog-overlay-wrapper as the sibling
     # anchor. Slots must render as siblings of the pad overlay
     # under the 3D View root (page-level), not nested inside it.
-    pad_idx    = layout.find('data-testid="jog-pad-cluster-overlay"')
+    pad_idx    = layout.rfind('data-testid="jog-pad-cluster-overlay"')
     assert left_slot_idx != -1, (
         'View3DLayout must render an id="jog-left-column-slot" div '
         'as a page-level portal target for the LEFT column')
@@ -1177,15 +1177,17 @@ def test_expand_scales_only_center_cluster():
         'CENTER pad cluster must wrap in a testid-anchored div '
         '(jog-center-cluster-scaler) so pins can pin the scaler')
 
-    # Scale value gated on the `expanded` prop. Accept 1.4-1.8× per
-    # operator range.
-    scaler_idx = jog.find('data-testid="jog-center-cluster-scaler"')
-    scaler_block = jog[scaler_idx:scaler_idx + 400]
+    # 2026-09-17 UPDATE: scale is now composed — fitScale (measured)
+    # × expandScale (1.6 when EXPANDED, else 1). The static
+    # `expanded ? scale(1.6) : none` pattern is superseded by the
+    # measured template literal, but the load-bearing invariant
+    # (expand multiplier = 1.6 gated on expanded) is preserved.
+    scaler_idx = jog.rfind('data-testid="jog-center-cluster-scaler"')
+    scaler_block = jog[scaler_idx:scaler_idx + 1200]
     assert re.search(
-        r"transform:\s*expanded\s*\?\s*'scale\(1\.[4-8]\)'\s*:\s*'none'",
-        scaler_block), (
-        'scaler transform must be `expanded ? scale(1.4-1.8) : none` '
-        '— arrangement preserved, exit restores exactly')
+        r"expanded\s*\?\s*1\.6\s*:\s*1", scaler_block), (
+        'scaler transform must include an `expanded ? 1.6 : 1` '
+        'multiplier — arrangement preserved, exit restores exactly')
     assert re.search(
         r"transformOrigin:\s*'center", scaler_block), (
         "scaler transformOrigin must anchor at 'center' so pads "
@@ -1254,7 +1256,7 @@ def test_page_level_slot_dims_track_panel_height():
     layout = _read(LAYOUT)
     for side in ('left', 'right'):
         slot_id = f'id="jog-{side}-column-slot"'
-        idx = layout.find(slot_id)
+        idx = layout.rfind(slot_id)
         assert idx != -1, f'slot {slot_id} must be present'
         block = layout[idx:idx + 1400]
         assert re.search(r"position:\s*'absolute'", block), (
@@ -1279,7 +1281,7 @@ def test_page_level_slot_dims_track_panel_height():
     # step + speed) and RIGHT (Orient + Collapse) stay reachable
     # while the pad cluster is collapsed. JogControls itself stays
     # mounted too; MINIMIZED nulls only the CENTER via hidePads.
-    left_idx = layout.find('id="jog-left-column-slot"')
+    left_idx = layout.rfind('id="jog-left-column-slot"')
     prefix = layout[max(0, left_idx - 600):left_idx]
     assert not re.search(r'\{!isMinimized\s*&&\s*\(?\s*<>', prefix), (
         'slot divs must NOT be gated on !isMinimized (2026-09-17 '
@@ -1451,7 +1453,7 @@ def test_center_pads_anchor_to_bottom_of_container():
     layout = _read(LAYOUT)
     jog = _read(JOG)
     # Pad-cluster overlay anchors bottom + horizontally-centered.
-    overlay_idx = layout.find('data-testid="jog-pad-cluster-overlay"')
+    overlay_idx = layout.rfind('data-testid="jog-pad-cluster-overlay"')
     assert overlay_idx != -1
     overlay_block = layout[overlay_idx:overlay_idx + 1200]
     assert re.search(r"bottom:\s*16", overlay_block), (
@@ -1465,9 +1467,11 @@ def test_center_pads_anchor_to_bottom_of_container():
         'jog-pad-cluster-overlay must translateX(-50%) to center '
         'the variable-width pad cluster horizontally')
     # Scaler still declares transformOrigin:'center bottom'.
-    scaler_idx = jog.find('data-testid="jog-center-cluster-scaler"')
+    scaler_idx = jog.rfind('data-testid="jog-center-cluster-scaler"')
     assert scaler_idx != -1
-    scaler_block = jog[scaler_idx:scaler_idx + 500]
+    # 2026-09-17 UPDATE: window widened past the composed fitScale
+    # transform + retirement notes (~1600 chars end-to-end).
+    scaler_block = jog[scaler_idx:scaler_idx + 1600]
     assert re.search(r"transformOrigin:\s*'center bottom'", scaler_block), (
         "scaler transformOrigin must be 'center bottom' so EXPAND "
         'grows upward from the anchored bottom edge')
@@ -1610,7 +1614,7 @@ def test_slot_insets_widen_to_prevent_left_edge_clip():
     layout = _read(LAYOUT)
     for side, min_width in (('left', 128), ('right', 160)):
         slot_id = f'id="jog-{side}-column-slot"'
-        idx = layout.find(slot_id)
+        idx = layout.rfind(slot_id)
         assert idx != -1
         block = layout[idx:idx + 1000]
         edge = 'left' if side == 'left' else 'right'
@@ -1663,7 +1667,15 @@ def test_collapse_scope_leaves_left_and_right_mounted():
     for testid in ('jog-left-column-slot',
                    'jog-right-column-slot',
                    'jog-pad-cluster-overlay'):
-        idx = layout.find(f'data-testid="{testid}"')
+        # 2026-09-17 disambiguation: querySelector strings inside
+        # the useEffect body match the same data-testid substring.
+        # Prefer the id= attribute for slots (unique to their JSX
+        # element); fall back to rfind for the pad-cluster overlay
+        # (only testid'd, no id).
+        if 'slot' in testid and testid.endswith('-slot'):
+            idx = layout.find(f'id="{testid}"')
+        else:
+            idx = layout.rfind(f'data-testid="{testid}"')
         assert idx != -1, f'{testid} testid missing'
         prefix = layout[max(0, idx - 800):idx]
         # No `{!isMinimized &&` gate immediately before the div.
@@ -1756,77 +1768,104 @@ def test_collapsed_expanded_style_parity():
 
 
 def test_pad_cluster_fits_viewport_at_tablet_widths():
-    """The pad cluster (Position + Height + Rotation) must fit
-    inside the CENTER available width (viewport − LEFT slot 150 −
-    RIGHT slot 200 − 32 insets) at every supported width. The Rz+
-    button on the Rotation cluster's right edge is the operator-
-    reported clip witness at portrait tablet (768w).
-
-    Compute CENTER available width at each breakpoint and assert
-    the pad-cluster width (7*padBtn + 4*padInner + 2*padGroup) fits.
+    """2026-09-17 tablet-field-report SECOND PASS: the previous
+    computed-width pin passed while the tablet clipped in the
+    field, proving the model was wrong (assumed slot widths /
+    breakpoint firing / symmetric centering — any one broken
+    ⇒ silent clip). Retired the modeled matrix; replaced with a
+    MEASURED-FORMULA pin. The load-bearing invariant is now that
+    View3DLayout runs a runtime measurement using
+    getBoundingClientRect on the LEFT + RIGHT slot elements + the
+    scaler's offsetWidth, derives a fitScale, and JogControls
+    composes it into the scaler transform. Clipping becomes
+    STRUCTURALLY IMPOSSIBLE regardless of viewport / breakpoint.
     """
     jog = _read(JOG)
+    layout = _read(LAYOUT)
 
-    # Extract the padBtn tier declaration for non-maximized (NORMAL
-    # mode — collapse chip active, no EXPAND scale).
-    padbtn_line = re.search(
-        r"const padBtn = maximized[\s\S]{0,400}?:\s*\(([^)]+)\)",
-        jog)
-    assert padbtn_line is not None, 'padBtn tier declaration not found'
-    non_maximized_tiers = padbtn_line.group(1)
+    # 1. JogControls accepts fitScale prop, defaults 1.
+    assert 'fitScale = 1' in jog, (
+        'JogControls must declare fitScale=1 default — the caller '
+        'passes a measured value in [MIN_FIT_SCALE, 1]')
 
-    # Same for padInner + padGroup.
-    padinner_line = re.search(
-        r"const padInner = maximized[\s\S]{0,400}?:\s*\(([^)]+)\)",
-        jog)
-    padgroup_line = re.search(
-        r"const padGroup = maximized[\s\S]{0,400}?:\s*\(([^)]+)\)",
-        jog)
-    assert padinner_line and padgroup_line
+    # 2. Scaler transform composes fitScale × expand scale.
+    scaler_idx = jog.rfind('data-testid="jog-center-cluster-scaler"')
+    assert scaler_idx != -1
+    scaler_block = jog[scaler_idx:scaler_idx + 1200]
+    assert re.search(
+        r"scale\(\$\{\(fitScale\s*\*\s*\(expanded\s*\?\s*1\.6\s*:\s*1\)\)",
+        scaler_block), (
+        'scaler transform must compose fitScale × expandScale — '
+        "`scale(${(fitScale * (expanded ? 1.6 : 1)).toFixed(4)})`")
 
-    def tier_at(tiers, breakpoint):
-        """breakpoint ∈ {'portrait', 'tablet', 'narrow', 'desktop'}."""
-        # Ternary chain: isTabletPortrait ? P : isTabletW ? T : isNarrowW ? N : D
-        m = re.match(
-            r"\s*isTabletPortrait\s*\?\s*(\d+)\s*:\s*"
-            r"isTabletW\s*\?\s*(\d+)\s*:\s*"
-            r"isNarrowW\s*\?\s*(\d+)\s*:\s*(\d+)",
-            tiers)
-        assert m is not None, f'tier chain shape mismatch: {tiers!r}'
-        idx = {'portrait': 1, 'tablet': 2, 'narrow': 3, 'desktop': 4}[breakpoint]
-        return int(m.group(idx))
+    # 3. View3DLayout runs the measured fitScale computation and
+    # passes it to JogControls.
+    assert 'fitScale={fitScale}' in layout, (
+        'View3DLayout must pass fitScale={fitScale} to JogControls '
+        '(the MEASURED-not-modeled seam)')
+    # The measurement reads bounding boxes of the two slots + scaler.
+    assert re.search(
+        r"document\.querySelector\('\[data-testid=\"jog-left-column-slot\"\]'\)",
+        layout), (
+        'fitScale measurement must querySelector the LEFT slot at runtime — '
+        "not model its width")
+    assert re.search(
+        r"document\.querySelector\('\[data-testid=\"jog-right-column-slot\"\]'\)",
+        layout), (
+        'fitScale measurement must querySelector the RIGHT slot at runtime')
+    assert re.search(
+        r"document\.querySelector\('\[data-testid=\"jog-center-cluster-scaler\"\]'\)",
+        layout), (
+        'fitScale measurement must querySelector the scaler at runtime')
+    assert 'getBoundingClientRect()' in layout
+    assert 'offsetWidth' in layout, (
+        'natural cluster width must be read via scaler.offsetWidth — '
+        'this is layout width unaffected by the transform')
 
-    # Available CENTER width at each viewport.
-    # 32 = 16 LEFT inset + 16 RIGHT inset. 150/200 = slot widths.
-    available = {
-        768:  768  - 32 - 150 - 200,   # 386  (portrait tablet)
-        1024: 1024 - 32 - 150 - 200,   # 642  (landscape tablet)
-        1280: 1280 - 32 - 150 - 200,   # 898  (desktop)
-    }
-    # Map viewport → breakpoint tier.
-    tier_for = {
-        768:  'portrait',   # winW ≤ 900
-        1024: 'tablet',     # winW ≤ 1280 & > 900
-        1280: 'tablet',     # winW ≤ 1280
-    }
+    # 4. Asymmetric permissible-scale formula (independent left/right
+    # since the overlay is centered on viewport-center, not the
+    # midpoint of the available inter-column space).
+    assert 'halfLeft' in layout and 'halfRight' in layout, (
+        'measurement must compute halfLeft + halfRight around the '
+        'viewport center so the fitScale respects an off-center '
+        'available space (e.g., when the RIGHT column extends further '
+        'in from the edge than the LEFT does)')
+    assert re.search(
+        r"Math\.min\(1,\s*sLeft,\s*sRight\)", layout), (
+        'fitScale must be `Math.min(1, sLeft, sRight)` where sLeft = '
+        '2·halfLeft/naturalW and sRight = 2·halfRight/naturalW — this '
+        'is the ONLY value that guarantees no clip at either edge')
 
-    for width_px, breakpoint in tier_for.items():
-        padBtn   = tier_at(non_maximized_tiers, breakpoint)
-        padInner = tier_at(padinner_line.group(1), breakpoint)
-        padGroup = tier_at(padgroup_line.group(1), breakpoint)
-        # Position cluster: 3×padBtn + 2×padInner (grid gaps)
-        pos_w = 3 * padBtn + 2 * padInner
-        # Height cluster: padBtn (single column)
-        h_w = padBtn
-        # Rotation cluster: same as Position
-        rot_w = pos_w
-        total = pos_w + padGroup + h_w + padGroup + rot_w
-        assert total <= available[width_px], (
-            f'pad cluster width {total}px > available {available[width_px]}px '
-            f'at viewport {width_px}w (breakpoint={breakpoint}, '
-            f'padBtn={padBtn}, padInner={padInner}, padGroup={padGroup}) — '
-            f'Rz+ button will clip off-screen (operator field report '
-            f'2026-09-17)')
+    # 5. Recompute on resize + orientationchange (tablet rotate).
+    fit_effect_idx = layout.find('MEASURED fitScale')
+    assert fit_effect_idx != -1
+    fit_effect_block = layout[fit_effect_idx:fit_effect_idx + 4000]
+    assert "'resize'" in fit_effect_block
+    assert "'orientationchange'" in fit_effect_block, (
+        'fitScale MUST recompute on orientationchange — tablet rotate '
+        'flips innerWidth from portrait to landscape')
+
+
+def test_cluster_fit_debug_chip_available_behind_flag():
+    """Diagnostic surface: with `?debug=cluster` in the URL, a small
+    top-center overlay shows the exact numbers the fitScale
+    measurement reads from the device (viewport, slot rects,
+    cluster natural width, computed scale). This is the operator
+    verification channel — retire the chip once both tablet
+    orientations are confirmed clip-free.
+    """
+    layout = _read(LAYOUT)
+    assert "'debug=cluster'" in layout, (
+        'debug flag literal `debug=cluster` must appear so the '
+        'operator can enable the diagnostic chip via URL param')
+    assert 'data-testid="cluster-fit-debug"' in layout, (
+        'the debug chip must carry data-testid="cluster-fit-debug" '
+        'so pins + operator can find it')
+    # Chip only renders when the flag is set — never in prod default.
+    chip_idx = layout.find('data-testid="cluster-fit-debug"')
+    prefix = layout[max(0, chip_idx - 400):chip_idx]
+    assert 'debugCluster' in prefix, (
+        'debug chip render must be gated on the debugCluster flag')
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1893,7 +1932,7 @@ def test_collapse_toggles_only_pad_cluster():
     # Both slot divs live inside the SAME !isMinimized fragment as
     # the pad overlay (three siblings). Assert the pad overlay is
     # gated separately and NOT nested inside the slot fragment.
-    pad_idx = src.find('data-testid="jog-pad-cluster-overlay"')
+    pad_idx = src.rfind('data-testid="jog-pad-cluster-overlay"')
     left_idx = src.find('id="jog-left-column-slot"')
     right_idx = src.find('id="jog-right-column-slot"')
     assert pad_idx != -1 and left_idx != -1 and right_idx != -1
@@ -1923,7 +1962,7 @@ def test_left_column_is_page_level_not_inside_pad_overlay():
     src = _read(LAYOUT)
     left_idx  = src.find('id="jog-left-column-slot"')
     right_idx = src.find('id="jog-right-column-slot"')
-    pad_idx   = src.find('data-testid="jog-pad-cluster-overlay"')
+    pad_idx   = src.rfind('data-testid="jog-pad-cluster-overlay"')
     assert -1 not in (left_idx, right_idx, pad_idx)
     assert left_idx < pad_idx, (
         'jog-left-column-slot must render BEFORE '
@@ -1951,7 +1990,7 @@ def test_pointer_events_walk_over_canvas():
         'jog-right-column-slot',
         'view3d-expand-canvas-dim',
     ):
-        idx = src.find(f'data-testid="{testid}"')
+        idx = src.rfind(f'data-testid="{testid}"')
         # dim overlay may be conditional — only require pointer-events
         # none when the testid IS present.
         if idx == -1:
@@ -1983,8 +2022,8 @@ def test_jog_controls_immersive_outer_is_pointer_events_none():
         'JogControls outer div must declare '
         "pointerEvents: immersive ? 'none' : undefined")
     # Scaler opts back in.
-    scaler_idx = src.find('data-testid="jog-center-cluster-scaler"')
-    scaler_block = src[scaler_idx:scaler_idx + 800]
+    scaler_idx = src.rfind('data-testid="jog-center-cluster-scaler"')
+    scaler_block = src[scaler_idx:scaler_idx + 1600]
     assert re.search(
         r"pointerEvents:\s*immersive\s*\?\s*'auto'", scaler_block), (
         'jog-center-cluster-scaler must declare '

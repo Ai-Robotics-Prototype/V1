@@ -548,6 +548,14 @@ export default function JogControls({
   // reachable. Program-tab consumer (immersive=false) passes no
   // prop and gets the legacy fill layout.
   hidePads = false,
+  // 2026-09-17 tablet-clip fix (measured): the caller (View3DLayout)
+  // measures the actual space between the LEFT/RIGHT slots and
+  // the scaler's natural width, then passes a fitScale in
+  // [MIN_FIT_SCALE, 1]. The scaler transform composes fitScale
+  // with the expand scale so the cluster NEVER exceeds the space
+  // between the rendered columns — clipping becomes structurally
+  // impossible. Default 1 for the Program-tab consumer.
+  fitScale = 1,
 }) {
   const winW = (typeof window !== 'undefined') ? window.innerWidth : 1280
   // 2026-09-17 tablet-portrait breakpoint — the previous isTabletW
@@ -1325,7 +1333,15 @@ export default function JogControls({
         <div
           data-testid="jog-center-cluster-scaler"
           style={{
-            transform: expanded ? 'scale(1.6)' : 'none',
+            // 2026-09-17 composed scale: fitScale (measured, ≤1)
+            // × expandScale (1.6 when EXPANDED, else 1). fitScale
+            // guarantees the visual cluster fits between the
+            // rendered LEFT/RIGHT columns at any viewport width.
+            // Passthrough when both are neutral to preserve the
+            // Program-tab consumer's zero-transform layout.
+            transform: (fitScale === 1 && !expanded)
+              ? 'none'
+              : `scale(${(fitScale * (expanded ? 1.6 : 1)).toFixed(4)})`,
             transformOrigin: 'center bottom',
             transition: 'transform 120ms ease-out',
             display: 'flex', justifyContent: 'center', alignItems: 'center',
